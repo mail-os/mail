@@ -507,28 +507,28 @@ pub const AlertManager = struct {
     fn sendToChannel(self: *AlertManager, channel: AlertChannel, alert: Alert) !void {
         _ = self;
         switch (channel) {
-            .slack, .discord => |_| {
+            .slack, .discord => {
                 // Would send HTTP POST to webhook URL with JSON payload
                 // For now, just log
                 logger.info("Would send to Slack/Discord: {s}", .{alert.title});
             },
-            .pagerduty => |_| {
+            .pagerduty => {
                 // Would send to PagerDuty Events API v2
                 logger.info("Would send to PagerDuty: {s}", .{alert.title});
             },
-            .opsgenie => |_| {
+            .opsgenie => {
                 // Would send to OpsGenie Alert API
                 logger.info("Would send to OpsGenie: {s}", .{alert.title});
             },
-            .email => |_| {
+            .email => {
                 // Would send email via SMTP
                 logger.info("Would send email alert: {s}", .{alert.title});
             },
-            .webhook => |_| {
+            .webhook => {
                 // Would send to generic webhook
                 logger.info("Would send to webhook: {s}", .{alert.title});
             },
-            .alertmanager => |_| {
+            .alertmanager => {
                 // Would send to Prometheus Alertmanager
                 logger.info("Would send to Alertmanager: {s}", .{alert.title});
             },
@@ -549,11 +549,11 @@ pub const AlertManager = struct {
                     .neq => value != t.value,
                 };
             },
-            .rate_of_change => |_| {
+            .rate_of_change => {
                 // Would compare with historical data
                 return false;
             },
-            .anomaly => |_| {
+            .anomaly => {
                 // Would use statistical analysis
                 return false;
             },

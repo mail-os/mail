@@ -24,7 +24,7 @@ pub const Args = struct {
 
 pub fn parseArgs(allocator: std.mem.Allocator) !Args {
     var args = Args{};
-    var arg_it = std.process.argsWithAllocator(allocator) catch |err| {
+    var arg_it = std.process.args(allocator) catch |err| {
         std.debug.print("Failed to get command-line arguments: {}\n", .{err});
         return err;
     };

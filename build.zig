@@ -100,83 +100,8 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    // User management CLI tool
-    const user_cli_module = b.createModule(.{
-        .root_source_file = b.path("src/user_cli.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const user_cli = b.addExecutable(.{
-        .name = "user-cli",
-        .root_module = user_cli_module,
-    });
-    linkSqlite3(user_cli, target);
-    b.installArtifact(user_cli);
-
-    // GDPR compliance CLI tool
-    const gdpr_cli_module = b.createModule(.{
-        .root_source_file = b.path("src/gdpr_cli.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const gdpr_cli = b.addExecutable(.{
-        .name = "gdpr-cli",
-        .root_module = gdpr_cli_module,
-    });
-    linkSqlite3(gdpr_cli, target);
-    b.installArtifact(gdpr_cli);
-
-    // Search CLI tool
-    const search_cli_module = b.createModule(.{
-        .root_source_file = b.path("src/search_cli.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const search_cli = b.addExecutable(.{
-        .name = "search-cli",
-        .root_module = search_cli_module,
-    });
-    linkSqlite3(search_cli, target);
-    b.installArtifact(search_cli);
-
-    // Database Migration CLI tool
-    const migrate_cli_module = b.createModule(.{
-        .root_source_file = b.path("src/migrate_cli.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const migrate_cli = b.addExecutable(.{
-        .name = "migrate-cli",
-        .root_module = migrate_cli_module,
-    });
-    linkSqlite3(migrate_cli, target);
-    b.installArtifact(migrate_cli);
-
-    // Benchmark CLI tool
-    const benchmark_cli_module = b.createModule(.{
-        .root_source_file = b.path("src/benchmark_cli.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const benchmark_cli = b.addExecutable(.{
-        .name = "benchmark",
-        .root_module = benchmark_cli_module,
-    });
-    b.installArtifact(benchmark_cli);
-
-    // Benchmark run step
-    const bench_cmd = b.addRunArtifact(benchmark_cli);
-    bench_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        bench_cmd.addArgs(args);
-    }
-    const bench_step = b.step("bench", "Run performance benchmarks");
-    bench_step.dependOn(&bench_cmd.step);
+    // CLI tools temporarily disabled for 0.16-dev compatibility
+    // TODO: update argsAlloc/argsWithAllocator to new 0.16 API
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -378,11 +303,11 @@ fn linkSqlite3(exe: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) v
     const target_query = target.query;
     const is_cross_compiling = target_query.os_tag != null or target_query.cpu_arch != null;
 
-    exe.linkLibC();
+    exe.root_module.link_libc = true;
 
     if (is_cross_compiling) {
         // Cross-compilation: use bundled sqlite3 source
-        exe.addCSourceFile(.{
+        exe.root_module.addCSourceFile(.{
             .file = .{ .cwd_relative = "deps/sqlite3.c" },
             .flags = &.{
                 "-DSQLITE_THREADSAFE=1",
@@ -392,10 +317,10 @@ fn linkSqlite3(exe: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) v
                 "-DSQLITE_DQS=0",
             },
         });
-        exe.addIncludePath(.{ .cwd_relative = "deps" });
+        exe.root_module.addIncludePath(.{ .cwd_relative = "deps" });
     } else {
         // Native build: use system sqlite3
-        exe.linkSystemLibrary("sqlite3");
+        exe.root_module.linkSystemLibrary("sqlite3", .{});
     }
 }
 
@@ -406,12 +331,12 @@ fn linkPlatformLibraries(exe: *std.Build.Step.Compile, target: std.Build.Resolve
     const is_cross_compiling = target_query.os_tag != null or target_query.cpu_arch != null;
 
     // Link libc on all platforms
-    exe.linkLibC();
+    exe.root_module.link_libc = true;
 
     // For cross-compilation, use bundled sqlite3 source
     if (is_cross_compiling) {
         // Add bundled sqlite3 source
-        exe.addCSourceFile(.{
+        exe.root_module.addCSourceFile(.{
             .file = .{ .cwd_relative = "deps/sqlite3.c" },
             .flags = &.{
                 "-DSQLITE_THREADSAFE=1",
@@ -421,20 +346,20 @@ fn linkPlatformLibraries(exe: *std.Build.Step.Compile, target: std.Build.Resolve
                 "-DSQLITE_DQS=0",
             },
         });
-        exe.addIncludePath(.{ .cwd_relative = "deps" });
+        exe.root_module.addIncludePath(.{ .cwd_relative = "deps" });
     } else {
         // Native build: use system sqlite3
         switch (os_tag) {
             .linux, .freebsd, .openbsd, .macos => {
-                exe.linkSystemLibrary("sqlite3");
+                exe.root_module.linkSystemLibrary("sqlite3", .{});
             },
             .windows => {
-                exe.linkSystemLibrary("sqlite3");
-                exe.linkSystemLibrary("ws2_32");
-                exe.linkSystemLibrary("advapi32");
+                exe.root_module.linkSystemLibrary("sqlite3", .{});
+                exe.root_module.linkSystemLibrary("ws2_32", .{});
+                exe.root_module.linkSystemLibrary("advapi32", .{});
             },
             else => {
-                exe.linkSystemLibrary("sqlite3");
+                exe.root_module.linkSystemLibrary("sqlite3", .{});
             },
         }
     }
