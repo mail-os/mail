@@ -50,6 +50,24 @@ pub const Config = struct {
     tracing_service_name: []const u8,
     enable_json_logging: bool,
 
+    // Feature flags for new modules
+    enable_dkim_rotation: bool = false,
+    dkim_rotation_interval_days: u32 = 90,
+    enable_sieve: bool = false,
+    enable_dane: bool = false,
+    enable_mta_sts: bool = false,
+    enable_acme: bool = false,
+    acme_email: ?[]const u8 = null,
+    enable_tls_rpt: bool = false,
+    enable_arc: bool = false,
+    enable_bimi: bool = false,
+    enable_list_unsubscribe: bool = false,
+    list_unsubscribe_url: ?[]const u8 = null,
+    enable_autoconfig: bool = false,
+    enable_managesieve: bool = false,
+    managesieve_port: u16 = 4190,
+    enable_milter: bool = false,
+
     pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
         allocator.free(self.tracing_service_name);
         allocator.free(self.host);
@@ -57,6 +75,8 @@ pub const Config = struct {
         if (self.tls_cert_path) |path| allocator.free(path);
         if (self.tls_key_path) |path| allocator.free(path);
         if (self.webhook_url) |url| allocator.free(url);
+        if (self.acme_email) |email| allocator.free(email);
+        if (self.list_unsubscribe_url) |url| allocator.free(url);
     }
 
     /// Validates the configuration and returns detailed error messages
@@ -282,6 +302,22 @@ fn loadDefaultsFromProfile(allocator: std.mem.Allocator, profile: config_profile
         .enable_tracing = profile_config.enable_tracing,
         .tracing_service_name = try allocator.dupe(u8, "smtp-server"),
         .enable_json_logging = profile_config.enable_json_logging,
+        .enable_dkim_rotation = false,
+        .dkim_rotation_interval_days = 90,
+        .enable_sieve = false,
+        .enable_dane = false,
+        .enable_mta_sts = false,
+        .enable_acme = false,
+        .acme_email = null,
+        .enable_tls_rpt = false,
+        .enable_arc = false,
+        .enable_bimi = false,
+        .enable_list_unsubscribe = false,
+        .list_unsubscribe_url = null,
+        .enable_autoconfig = false,
+        .enable_managesieve = false,
+        .managesieve_port = 4190,
+        .enable_milter = false,
     };
 }
 
@@ -411,6 +447,58 @@ fn applyEnvironmentVariables(allocator: std.mem.Allocator, cfg: *Config) !void {
     // SMTP_ENABLE_JSON_LOGGING
     if (env.get("SMTP_ENABLE_JSON_LOGGING")) |value| {
         cfg.enable_json_logging = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+
+    // Feature flags for new modules
+    if (env.get("SMTP_ENABLE_DKIM_ROTATION")) |value| {
+        cfg.enable_dkim_rotation = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+    if (env.get("SMTP_DKIM_ROTATION_INTERVAL_DAYS")) |value| {
+        cfg.dkim_rotation_interval_days = std.fmt.parseInt(u32, value, 10) catch cfg.dkim_rotation_interval_days;
+    }
+    if (env.get("SMTP_ENABLE_SIEVE")) |value| {
+        cfg.enable_sieve = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+    if (env.get("SMTP_ENABLE_DANE")) |value| {
+        cfg.enable_dane = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+    if (env.get("SMTP_ENABLE_MTA_STS")) |value| {
+        cfg.enable_mta_sts = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+    if (env.get("SMTP_ENABLE_ACME")) |value| {
+        cfg.enable_acme = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+    if (env.get("SMTP_ACME_EMAIL")) |value| {
+        if (cfg.acme_email) |old| allocator.free(old);
+        cfg.acme_email = try allocator.dupe(u8, value);
+    }
+    if (env.get("SMTP_ENABLE_TLS_RPT")) |value| {
+        cfg.enable_tls_rpt = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+    if (env.get("SMTP_ENABLE_ARC")) |value| {
+        cfg.enable_arc = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+    if (env.get("SMTP_ENABLE_BIMI")) |value| {
+        cfg.enable_bimi = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+    if (env.get("SMTP_ENABLE_LIST_UNSUBSCRIBE")) |value| {
+        cfg.enable_list_unsubscribe = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+    if (env.get("SMTP_LIST_UNSUBSCRIBE_URL")) |value| {
+        if (cfg.list_unsubscribe_url) |old| allocator.free(old);
+        cfg.list_unsubscribe_url = try allocator.dupe(u8, value);
+    }
+    if (env.get("SMTP_ENABLE_AUTOCONFIG")) |value| {
+        cfg.enable_autoconfig = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+    if (env.get("SMTP_ENABLE_MANAGESIEVE")) |value| {
+        cfg.enable_managesieve = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+    if (env.get("SMTP_MANAGESIEVE_PORT")) |value| {
+        cfg.managesieve_port = std.fmt.parseInt(u16, value, 10) catch cfg.managesieve_port;
+    }
+    if (env.get("SMTP_ENABLE_MILTER")) |value| {
+        cfg.enable_milter = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
     }
 }
 
@@ -552,6 +640,104 @@ fn applyConfigFile(allocator: std.mem.Allocator, cfg: *Config, path: []const u8)
         }
         if (obs.getBool("json_logging")) |value| {
             cfg.enable_json_logging = value;
+        }
+    }
+
+    // Apply [dkim] section
+    if (doc.getSection("dkim")) |section| {
+        if (section.getBool("rotation_enabled")) |value| {
+            cfg.enable_dkim_rotation = value;
+        }
+        if (section.getInt("rotation_interval_days")) |value| {
+            cfg.dkim_rotation_interval_days = @intCast(value);
+        }
+    }
+
+    // Apply [sieve] section
+    if (doc.getSection("sieve")) |section| {
+        if (section.getBool("enabled")) |value| {
+            cfg.enable_sieve = value;
+        }
+    }
+
+    // Apply [dane] section
+    if (doc.getSection("dane")) |section| {
+        if (section.getBool("enabled")) |value| {
+            cfg.enable_dane = value;
+        }
+    }
+
+    // Apply [mta_sts] section
+    if (doc.getSection("mta_sts")) |section| {
+        if (section.getBool("enabled")) |value| {
+            cfg.enable_mta_sts = value;
+        }
+    }
+
+    // Apply [acme] section
+    if (doc.getSection("acme")) |section| {
+        if (section.getBool("enabled")) |value| {
+            cfg.enable_acme = value;
+        }
+        if (section.getString("email")) |value| {
+            if (cfg.acme_email) |old| allocator.free(old);
+            cfg.acme_email = try allocator.dupe(u8, value);
+        }
+    }
+
+    // Apply [tls_rpt] section
+    if (doc.getSection("tls_rpt")) |section| {
+        if (section.getBool("enabled")) |value| {
+            cfg.enable_tls_rpt = value;
+        }
+    }
+
+    // Apply [arc] section
+    if (doc.getSection("arc")) |section| {
+        if (section.getBool("enabled")) |value| {
+            cfg.enable_arc = value;
+        }
+    }
+
+    // Apply [bimi] section
+    if (doc.getSection("bimi")) |section| {
+        if (section.getBool("enabled")) |value| {
+            cfg.enable_bimi = value;
+        }
+    }
+
+    // Apply [list_unsubscribe] section
+    if (doc.getSection("list_unsubscribe")) |section| {
+        if (section.getBool("enabled")) |value| {
+            cfg.enable_list_unsubscribe = value;
+        }
+        if (section.getString("url_base")) |value| {
+            if (cfg.list_unsubscribe_url) |old| allocator.free(old);
+            cfg.list_unsubscribe_url = try allocator.dupe(u8, value);
+        }
+    }
+
+    // Apply [autoconfig] section
+    if (doc.getSection("autoconfig")) |section| {
+        if (section.getBool("enabled")) |value| {
+            cfg.enable_autoconfig = value;
+        }
+    }
+
+    // Apply [managesieve] section
+    if (doc.getSection("managesieve")) |section| {
+        if (section.getBool("enabled")) |value| {
+            cfg.enable_managesieve = value;
+        }
+        if (section.getInt("port")) |value| {
+            cfg.managesieve_port = @intCast(value);
+        }
+    }
+
+    // Apply [milter] section
+    if (doc.getSection("milter")) |section| {
+        if (section.getBool("enabled")) |value| {
+            cfg.enable_milter = value;
         }
     }
 }

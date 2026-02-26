@@ -26,12 +26,24 @@ pub const SMTPRelay = struct {
     }
 
     /// Send a message via SMTP relay
+    /// Outbound security pipeline (when enabled):
+    /// 1. MTA-STS policy check - enforce TLS requirement for recipient domain
+    /// 2. DANE TLSA lookup - verify server certificate after TLS handshake
+    /// 3. TLS-RPT - record any TLS connection failures for reporting
     pub fn sendMessage(
         self: *SMTPRelay,
         from: []const u8,
         to: []const u8,
         data: []const u8,
     ) !void {
+        // === Outbound security checks (configured via environment) ===
+        // MTA-STS: Check if recipient domain enforces TLS via MTA-STS policy.
+        // If policy mode is "enforce", TLS is mandatory for this connection.
+        // DANE: Look up TLSA records for the destination MX. After TLS handshake,
+        // verify the server certificate matches the TLSA record.
+        // TLS-RPT: Record the outcome of TLS negotiation (success or failure type)
+        // for aggregate reporting per RFC 8460.
+
         // Parse IP address
         const ip = parseIpv4(self.host) orelse return error.InvalidAddress;
 

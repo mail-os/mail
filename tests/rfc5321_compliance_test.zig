@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const testing = std.testing;
-const net = std.net;
+const posix = std.posix;
 
 // Test configuration
 const TestConfig = struct {
@@ -17,47 +17,59 @@ const config = TestConfig{};
 
 // SMTP test client
 const SmtpTestClient = struct {
-    stream: net.Stream,
+    fd: posix.socket_t,
     allocator: std.mem.Allocator,
 
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator) !Self {
-        const address = try net.Address.parseIp(config.host, config.port);
-        const stream = net.tcpConnectToAddress(address) catch |err| {
-            std.debug.print("Failed to connect to {s}:{d}. Is the server running?\n", .{ config.host, config.port });
-            return err;
+        const raw_fd = std.c.socket(posix.AF.INET, @intCast(@as(u32, posix.SOCK.STREAM | posix.SOCK.CLOEXEC)), 0);
+        if (raw_fd < 0) return error.ConnectionRefused;
+        const fd: posix.socket_t = @intCast(raw_fd);
+        errdefer posix.close(fd);
+
+        var addr: std.posix.sockaddr.in = .{
+            .port = @byteSwap(@as(u16, config.port)),
+            .addr = @byteSwap(@as(u32, 0x7f000001)), // 127.0.0.1
         };
+        const rc = std.c.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
+        if (rc < 0) {
+            std.debug.print("Failed to connect to {s}:{d}. Is the server running?\n", .{ config.host, config.port });
+            return error.ConnectionRefused;
+        }
 
         return Self{
-            .stream = stream,
+            .fd = fd,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.stream.close();
+        posix.close(self.fd);
     }
 
     pub fn readResponse(self: *Self) ![]u8 {
-        var buffer = std.ArrayList(u8).init(self.allocator);
-        errdefer buffer.deinit();
+        var buffer: std.ArrayList(u8) = .{};
+        errdefer buffer.deinit(self.allocator);
 
         var read_buffer: [4096]u8 = undefined;
-        const bytes_read = try self.stream.read(&read_buffer);
+        const bytes_read = posix.read(self.fd, &read_buffer) catch return error.ConnectionClosed;
 
         if (bytes_read == 0) {
             return error.ConnectionClosed;
         }
 
-        try buffer.appendSlice(read_buffer[0..bytes_read]);
-        return buffer.toOwnedSlice();
+        try buffer.appendSlice(self.allocator, read_buffer[0..bytes_read]);
+        return buffer.toOwnedSlice(self.allocator);
     }
 
     pub fn sendCommand(self: *Self, command: []const u8) !void {
-        _ = try self.stream.write(command);
+        const r1 = std.c.write(self.fd, command.ptr, command.len);
+        if (r1 < 0) return error.WriteFailed;
         if (!std.mem.endsWith(u8, command, "\r\n")) {
-            _ = try self.stream.write("\r\n");
+            const crlf = "\r\n";
+            const r2 = std.c.write(self.fd, crlf.ptr, crlf.len);
+            if (r2 < 0) return error.WriteFailed;
         }
     }
 
@@ -409,7 +421,7 @@ test "RFC 5321 Section 4.5.3.1.10: QUIT closes connection gracefully" {
 
     // Connection should close
     var buffer: [10]u8 = undefined;
-    const bytes = client.stream.read(&buffer) catch 0;
+    const bytes = posix.read(client.fd, &buffer) catch 0;
     try testing.expect(bytes == 0); // EOF
 }
 
@@ -462,7 +474,8 @@ test "RFC 5321 Section 7.1: Connection remains open during valid session" {
     _ = try client.sendAndRead("EHLO test.example.com");
 
     // Wait a bit (but not longer than timeout)
-    std.time.sleep(1 * std.time.ns_per_s);
+    var ts: std.c.timespec = .{ .sec = 1, .nsec = 0 };
+    _ = std.c.nanosleep(&ts, null);
 
     // Connection should still work
     const noop_resp = try client.sendAndRead("NOOP");

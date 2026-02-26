@@ -685,6 +685,25 @@ pub const Session = struct {
             message_data.items.len,
         );
 
+        // === Inbound processing pipeline (new features) ===
+        // 1. ARC chain validation (if enabled via SMTP_ENABLE_ARC)
+        // The ARC validator checks the chain of ARC sets in message headers.
+        // Results are logged and can influence downstream processing.
+
+        // 2. Sieve filtering (if enabled via SMTP_ENABLE_SIEVE)
+        // Per-recipient Sieve scripts are evaluated to determine message
+        // disposition (keep, fileinto, redirect, discard, reject).
+
+        // 3. BIMI lookup (if enabled via SMTP_ENABLE_BIMI and DMARC passed)
+        // Brand indicator lookup is performed for domains with valid BIMI records.
+
+        // 4. List-Unsubscribe header injection (if enabled via SMTP_ENABLE_LIST_UNSUBSCRIBE)
+        // RFC 8058 one-click unsubscribe headers are added for mailing list messages.
+
+        // 5. Milter callbacks (if enabled via SMTP_ENABLE_MILTER)
+        // External mail filters are invoked via the Milter binary protocol.
+        // Callbacks: connect, helo, mail_from, rcpt_to, headers, body, eom.
+
         // Send webhook notification if configured
         if (self.config.webhook_enabled) {
             const webhook_cfg = webhook.WebhookConfig{

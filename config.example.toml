@@ -51,6 +51,46 @@ tracing = false                    # OpenTelemetry tracing
 service_name = "smtp-server"       # Service name for traces
 json_logging = false               # JSON format for log output
 
+[dkim]
+rotation_enabled = false
+rotation_interval_days = 90
+
+[sieve]
+enabled = false
+
+[dane]
+enabled = false
+
+[mta_sts]
+enabled = false
+
+[acme]
+enabled = false
+email = ""
+
+[tls_rpt]
+enabled = false
+
+[arc]
+enabled = false
+
+[bimi]
+enabled = false
+
+[list_unsubscribe]
+enabled = false
+url_base = "https://mail.example.com/unsubscribe"
+
+[autoconfig]
+enabled = false
+
+[managesieve]
+enabled = false
+port = 4190
+
+[milter]
+enabled = false
+
 # Profile-specific overrides can be set via environment:
 # SMTP_PROFILE=production  (uses production defaults)
 # SMTP_PROFILE=development (uses development defaults)

@@ -149,6 +149,18 @@ pub fn build(b: *std.Build) void {
     const rfc_compliance_tests = [_][]const u8{
         "tests/rfc5321_compliance_test.zig",
         "tests/rfc5322_compliance_test.zig",
+        "tests/rfc6376_dkim_rotation_test.zig",
+        "tests/rfc5228_sieve_test.zig",
+        "tests/rfc7672_dane_test.zig",
+        "tests/rfc8461_mta_sts_test.zig",
+        "tests/acme_test.zig",
+        "tests/rfc8460_tls_rpt_test.zig",
+        "tests/rfc8617_arc_test.zig",
+        "tests/bimi_test.zig",
+        "tests/rfc8058_unsubscribe_test.zig",
+        "tests/autoconfig_test.zig",
+        "tests/rfc5804_managesieve_test.zig",
+        "tests/milter_test.zig",
     };
 
     for (test_files) |test_file| {
@@ -169,12 +181,22 @@ pub fn build(b: *std.Build) void {
 
     // RFC compliance tests
     const rfc_test_step = b.step("test-rfc", "Run RFC compliance tests");
+
+    // Single source module rooted in src/ so all relative imports resolve
+    const mail_module = b.createModule(.{
+        .root_source_file = b.path("src/test_exports.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     for (rfc_compliance_tests) |test_file| {
         const test_module = b.createModule(.{
             .root_source_file = b.path(test_file),
             .target = target,
             .optimize = optimize,
         });
+
+        test_module.addImport("mail", mail_module);
 
         const compliance_tests = b.addTest(.{
             .root_module = test_module,

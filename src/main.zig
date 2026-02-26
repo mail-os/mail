@@ -18,6 +18,20 @@ const alerting = @import("observability/alerting.zig");
 const secrets = @import("security/secrets.zig");
 const hot_reload = @import("core/hot_reload.zig");
 
+// New feature modules
+const dkim_rotation = @import("features/dkim_rotation.zig");
+const sieve = @import("features/sieve.zig");
+const dane = @import("antispam/dane.zig");
+const mta_sts = @import("antispam/mta_sts.zig");
+const acme = @import("security/acme.zig");
+const tls_rpt = @import("delivery/tls_rpt.zig");
+const arc = @import("antispam/arc.zig");
+const bimi = @import("antispam/bimi.zig");
+const list_unsub = @import("features/list_unsubscribe.zig");
+const autoconfig_mod = @import("api/autoconfig.zig");
+const managesieve = @import("protocol/managesieve.zig");
+const milter = @import("protocol/milter.zig");
+
 // Global shutdown flag
 var shutdown_requested = std.atomic.Value(bool).init(false);
 
@@ -270,6 +284,110 @@ pub fn main(init: std.process.Init) !void {
     }
     // tenant_manager is used in logging below
 
+    // Initialize DKIM key rotation scheduler
+    var dkim_key_manager: ?dkim_rotation.dkim.DKIMKeyManager = null;
+    var rotation_scheduler: ?dkim_rotation.DKIMRotationScheduler = null;
+    if (cfg.enable_dkim_rotation) {
+        dkim_key_manager = try dkim_rotation.dkim.DKIMKeyManager.init(allocator, null);
+        rotation_scheduler = dkim_rotation.DKIMRotationScheduler.init(
+            allocator,
+            &dkim_key_manager.?,
+            .{ .rotation_interval_days = cfg.dkim_rotation_interval_days },
+        );
+        log.info("DKIM key rotation enabled (interval: {d} days)", .{cfg.dkim_rotation_interval_days});
+    }
+    defer if (rotation_scheduler) |*rs| rs.deinit();
+    defer if (dkim_key_manager) |*km| km.deinit();
+
+    // Initialize Sieve filtering
+    var sieve_manager: ?sieve.SieveScriptManager = null;
+    if (cfg.enable_sieve) {
+        sieve_manager = sieve.SieveScriptManager.init(allocator);
+        log.info("Sieve filtering enabled", .{});
+    }
+    defer if (sieve_manager) |*sm| sm.deinit();
+
+    // Initialize DANE validator
+    var dane_validator: ?dane.DANEValidator = null;
+    if (cfg.enable_dane) {
+        dane_validator = dane.DANEValidator.init(allocator);
+        log.info("DANE (TLSA) validation enabled", .{});
+    }
+    defer if (dane_validator) |*dv| dv.deinit();
+
+    // Initialize MTA-STS validator
+    var mta_sts_validator: ?mta_sts.MTASTSValidator = null;
+    if (cfg.enable_mta_sts) {
+        mta_sts_validator = mta_sts.MTASTSValidator.init(allocator);
+        log.info("MTA-STS policy enforcement enabled", .{});
+    }
+    defer if (mta_sts_validator) |*mv| mv.deinit();
+
+    // Initialize ACME certificate manager
+    var cert_manager: ?acme.CertificateManager = null;
+    if (cfg.enable_acme) {
+        const acme_config = acme.ACMEConfig{
+            .email = cfg.acme_email orelse "",
+        };
+        cert_manager = acme.CertificateManager.init(allocator, acme_config);
+        log.info("ACME/Let's Encrypt auto-provisioning enabled", .{});
+    }
+    defer if (cert_manager) |*cm| cm.deinit();
+
+    // Initialize TLS-RPT aggregator
+    var tls_rpt_aggregator: ?tls_rpt.TLSReportAggregator = null;
+    if (cfg.enable_tls_rpt) {
+        tls_rpt_aggregator = tls_rpt.TLSReportAggregator.init(allocator);
+        log.info("TLS-RPT reporting enabled", .{});
+    }
+    defer if (tls_rpt_aggregator) |*ta| ta.deinit();
+
+    // Initialize ARC validator
+    var arc_validator: ?arc.ARCValidator = null;
+    if (cfg.enable_arc) {
+        arc_validator = arc.ARCValidator.init(allocator);
+        log.info("ARC chain validation enabled", .{});
+    }
+    defer if (arc_validator) |*av| av.deinit();
+
+    // Initialize BIMI validator
+    var bimi_validator: ?bimi.BIMIValidator = null;
+    if (cfg.enable_bimi) {
+        bimi_validator = bimi.BIMIValidator.init(allocator);
+        log.info("BIMI brand indicator support enabled", .{});
+    }
+    defer if (bimi_validator) |*bv| bv.deinit();
+
+    // Initialize List-Unsubscribe handler
+    _ = cfg.enable_list_unsubscribe; // Used by protocol.zig hooks
+    if (cfg.enable_list_unsubscribe) {
+        log.info("RFC 8058 List-Unsubscribe One-Click enabled", .{});
+    }
+
+    // Initialize autoconfig handler
+    _ = cfg.enable_autoconfig; // Used by api.zig route handler
+    if (cfg.enable_autoconfig) {
+        log.info("Email autoconfiguration enabled (Thunderbird/Outlook/Apple)", .{});
+    }
+
+    // Initialize ManageSieve server
+    var managesieve_server: ?managesieve.ManageSieveServer = null;
+    var managesieve_thread: ?std.Thread = null;
+    if (cfg.enable_managesieve) {
+        const ms_config = managesieve.ManageSieveConfig{
+            .port = cfg.managesieve_port,
+        };
+        managesieve_server = managesieve.ManageSieveServer.init(allocator, ms_config, null);
+        log.info("ManageSieve server configured on port {d}", .{cfg.managesieve_port});
+    }
+    defer if (managesieve_server) |*ms| ms.deinit();
+
+    // Initialize Milter support
+    _ = cfg.enable_milter; // Used by protocol.zig hooks
+    if (cfg.enable_milter) {
+        log.info("Milter protocol support enabled", .{});
+    }
+
     // Create and start SMTP server
     var server = try smtp.Server.init(allocator, cfg, &log, db_ptr, auth_ptr, greylist_ptr);
     defer server.deinit();
@@ -330,14 +448,35 @@ pub fn main(init: std.process.Init) !void {
     }
     defer if (caldav_server) |*cs| cs.deinit();
 
+    // Start ManageSieve server in a separate thread
+    if (managesieve_server) |*ms| {
+        managesieve_thread = try std.Thread.spawn(.{}, struct {
+            fn run(ms_srv: *managesieve.ManageSieveServer) void {
+                ms_srv.start() catch |err| {
+                    std.log.err("ManageSieve server error: {}", .{err});
+                };
+            }
+        }.run, .{ms});
+        log.info("ManageSieve Server listening on 0.0.0.0:{d}", .{cfg.managesieve_port});
+    }
+
     // Log startup summary
     log.info("Starting SMTP server...", .{});
     log.info("  IMAP enabled: {}", .{imap_server != null});
     log.info("  CalDAV enabled: {}", .{caldav_server != null});
+    log.info("  ManageSieve enabled: {}", .{managesieve_server != null});
     log.info("  Cluster mode: {}", .{enable_cluster});
     log.info("  Multi-tenancy: {}", .{tenant_manager != null});
     log.info("  Metrics: {}", .{smtp_metrics != null});
     log.info("  Alerting: {}", .{alert_manager != null});
+    log.info("  DKIM rotation: {}", .{rotation_scheduler != null});
+    log.info("  Sieve: {}", .{sieve_manager != null});
+    log.info("  DANE: {}", .{dane_validator != null});
+    log.info("  MTA-STS: {}", .{mta_sts_validator != null});
+    log.info("  ACME: {}", .{cert_manager != null});
+    log.info("  TLS-RPT: {}", .{tls_rpt_aggregator != null});
+    log.info("  ARC: {}", .{arc_validator != null});
+    log.info("  BIMI: {}", .{bimi_validator != null});
 
     // Start IMAP server in a separate thread
     if (imap_server) |*is| {
@@ -382,6 +521,13 @@ pub fn main(init: std.process.Init) !void {
         if (caldav_thread) |t| {
             t.join();
         }
+        // Stop ManageSieve server on error
+        if (managesieve_server) |*ms| {
+            ms.stop();
+        }
+        if (managesieve_thread) |t| {
+            t.join();
+        }
         return err;
     };
 
@@ -400,6 +546,15 @@ pub fn main(init: std.process.Init) !void {
         log.info("CalDAV server stopped", .{});
     }
     if (caldav_thread) |t| {
+        t.join();
+    }
+
+    // Stop ManageSieve server on shutdown
+    if (managesieve_server) |*ms| {
+        ms.stop();
+        log.info("ManageSieve server stopped", .{});
+    }
+    if (managesieve_thread) |t| {
         t.join();
     }
 

@@ -125,7 +125,7 @@ test "RFC 5322 Section 2.2.3: Long headers can be folded with whitespace" {
     ;
 
     // Should contain continuation (whitespace at start of line)
-    const lines = std.mem.split(u8, folded_header, "\n");
+    const lines = std.mem.splitSequence(u8, folded_header, "\n");
     var line_count: usize = 0;
     var has_continuation = false;
 

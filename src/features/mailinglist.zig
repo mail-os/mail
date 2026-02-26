@@ -142,6 +142,11 @@ pub const MailingList = struct {
         try std.fmt.format(headers.writer(), "List-Subscribe: <mailto:{s}?subject=subscribe>\r\n", .{self.address});
         try std.fmt.format(headers.writer(), "List-Unsubscribe: <mailto:{s}?subject=unsubscribe>\r\n", .{self.address});
 
+        // RFC 8058: One-Click List-Unsubscribe (Gmail/Yahoo requirement)
+        // When List-Unsubscribe-Post is present, mail clients can unsubscribe
+        // with a single click without opening a browser or composing an email.
+        try std.fmt.format(headers.writer(), "List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n", .{});
+
         // Subject prefix
         if (self.settings.subject_prefix) |prefix| {
             // Would need to parse and modify Subject header

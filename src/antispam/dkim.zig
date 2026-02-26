@@ -169,19 +169,19 @@ pub const DKIMValidator = struct {
         // Find DKIM-Signature header
         var lines = std.mem.splitSequence(u8, headers, "\r\n");
         var in_dkim_sig = false;
-        var sig_value = std.ArrayList(u8).init(self.allocator);
-        defer sig_value.deinit();
+        var sig_value: std.ArrayList(u8) = .{};
+        defer sig_value.deinit(self.allocator);
 
         while (lines.next()) |line| {
             if (std.mem.startsWith(u8, line, "DKIM-Signature:")) {
                 in_dkim_sig = true;
                 const value = std.mem.trim(u8, line[15..], " \t");
-                sig_value.appendSlice(value) catch return null;
+                sig_value.appendSlice(self.allocator, value) catch return null;
             } else if (in_dkim_sig) {
                 // Continuation line
                 if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) {
                     const value = std.mem.trim(u8, line, " \t");
-                    sig_value.appendSlice(value) catch return null;
+                    sig_value.appendSlice(self.allocator, value) catch return null;
                 } else {
                     break;
                 }
@@ -189,7 +189,7 @@ pub const DKIMValidator = struct {
         }
 
         if (sig_value.items.len == 0) return null;
-        return sig_value.toOwnedSlice() catch return null;
+        return sig_value.toOwnedSlice(self.allocator) catch return null;
     }
 
     fn queryPublicKey(self: *DKIMValidator, domain: []const u8, selector: []const u8) !?[]const u8 {
@@ -419,7 +419,7 @@ pub const DKIMKeyManager = struct {
     pub fn init(allocator: std.mem.Allocator, storage_path: ?[]const u8) !DKIMKeyManager {
         return .{
             .allocator = allocator,
-            .keys = std.ArrayList(DKIMKeyPair).init(allocator),
+            .keys = .{},
             .key_storage_path = if (storage_path) |p| try allocator.dupe(u8, p) else null,
         };
     }
@@ -428,7 +428,7 @@ pub const DKIMKeyManager = struct {
         for (self.keys.items) |*key| {
             key.deinit();
         }
-        self.keys.deinit();
+        self.keys.deinit(self.allocator);
         if (self.key_storage_path) |p| self.allocator.free(p);
     }
 
@@ -466,7 +466,7 @@ pub const DKIMKeyManager = struct {
             .allocator = self.allocator,
         };
 
-        try self.keys.append(key);
+        try self.keys.append(self.allocator, key);
 
         return &self.keys.items[self.keys.items.len - 1];
     }
@@ -488,7 +488,7 @@ pub const DKIMKeyManager = struct {
 
     /// Execute scheduled rotations
     pub fn executeScheduledRotations(self: *DKIMKeyManager) ![]const RotationResult {
-        var results = std.ArrayList(RotationResult).init(self.allocator);
+        var results: std.ArrayList(RotationResult) = .{};
         const now = time_compat.timestamp();
 
         for (self.keys.items) |*key| {
@@ -509,7 +509,7 @@ pub const DKIMKeyManager = struct {
                     key.is_active = false;
                     key.rotation_scheduled = null;
 
-                    try results.append(.{
+                    try results.append(self.allocator, .{
                         .old_key_id = key.id,
                         .new_key_id = new_key.id,
                         .domain = key.domain,
@@ -522,7 +522,7 @@ pub const DKIMKeyManager = struct {
             }
         }
 
-        return results.toOwnedSlice();
+        return results.toOwnedSlice(self.allocator);
     }
 
     /// Get active key for domain
@@ -539,13 +539,13 @@ pub const DKIMKeyManager = struct {
     /// List all keys for domain
     pub fn listKeys(self: *DKIMKeyManager, domain: ?[]const u8) []DKIMKeyPair {
         if (domain) |d| {
-            var filtered = std.ArrayList(DKIMKeyPair).init(self.allocator);
+            var filtered: std.ArrayList(DKIMKeyPair) = .{};
             for (self.keys.items) |key| {
                 if (std.mem.eql(u8, key.domain, d)) {
-                    filtered.append(key) catch continue;
+                    filtered.append(self.allocator, key) catch continue;
                 }
             }
-            return filtered.toOwnedSlice() catch return &[_]DKIMKeyPair{};
+            return filtered.toOwnedSlice(self.allocator) catch return &[_]DKIMKeyPair{};
         }
         return self.keys.items;
     }
@@ -555,29 +555,29 @@ pub const DKIMKeyManager = struct {
         for (self.keys.items) |*key| {
             if (std.mem.eql(u8, key.id, key_id)) {
                 const now = time_compat.timestamp();
-                var issues = std.ArrayList([]const u8).init(self.allocator);
+                var issues: std.ArrayList([]const u8) = .{};
 
                 if (!key.is_active) {
-                    try issues.append("Key is inactive");
+                    try issues.append(self.allocator, "Key is inactive");
                 }
 
                 if (key.expires_at) |expiry| {
                     if (now > expiry) {
-                        try issues.append("Key has expired");
+                        try issues.append(self.allocator, "Key has expired");
                     } else if (key.isExpiringSoon(30)) {
-                        try issues.append("Key expires within 30 days");
+                        try issues.append(self.allocator, "Key expires within 30 days");
                     }
                 }
 
                 // Check algorithm strength
                 if (key.algorithm == .rsa_2048) {
-                    try issues.append("Consider upgrading to RSA-4096 or Ed25519");
+                    try issues.append(self.allocator, "Consider upgrading to RSA-4096 or Ed25519");
                 }
 
                 return KeyValidation{
                     .key_id = key.id,
                     .is_valid = key.isValidAt(now),
-                    .issues = issues.toOwnedSlice() catch &[_][]const u8{},
+                    .issues = issues.toOwnedSlice(self.allocator) catch &[_][]const u8{},
                     .days_until_expiry = if (key.expires_at) |exp|
                         @as(i32, @intCast(@divFloor(exp - now, 24 * 60 * 60)))
                     else
@@ -778,18 +778,17 @@ pub const DKIMCli = struct {
             };
         }
 
-        var output = std.ArrayList(u8).init(self.allocator);
-        const writer = output.writer();
+        var output: std.ArrayList(u8) = .{};
 
-        try writer.print("DKIM Keys:\n", .{});
-        try writer.print("{s:<40} {s:<20} {s:<15} {s:<10} {s:<10}\n", .{
+        try output.print(self.allocator, "DKIM Keys:\n", .{});
+        try output.print(self.allocator, "{s:<40} {s:<20} {s:<15} {s:<10} {s:<10}\n", .{
             "ID", "Domain", "Selector", "Algorithm", "Status",
         });
-        try writer.print("{s}\n", .{"-" ** 95});
+        try output.print(self.allocator, "{s}\n", .{"-" ** 95});
 
         for (keys) |key| {
             const status = if (key.is_active) "active" else "inactive";
-            try writer.print("{s:<40} {s:<20} {s:<15} {s:<10} {s:<10}\n", .{
+            try output.print(self.allocator, "{s:<40} {s:<20} {s:<15} {s:<10} {s:<10}\n", .{
                 key.id,
                 key.domain,
                 key.selector,
@@ -801,7 +800,7 @@ pub const DKIMCli = struct {
         return .{
             .success = true,
             .message = try std.fmt.allocPrint(self.allocator, "Found {d} key(s)", .{keys.len}),
-            .data = try output.toOwnedSlice(),
+            .data = try output.toOwnedSlice(self.allocator),
         };
     }
 
@@ -958,27 +957,26 @@ pub const DKIMCli = struct {
         const key_id = args[0];
         const validation = try self.key_manager.validateKey(key_id);
 
-        var output = std.ArrayList(u8).init(self.allocator);
-        const writer = output.writer();
+        var output: std.ArrayList(u8) = .{};
 
-        try writer.print("Key Validation: {s}\n", .{key_id});
-        try writer.print("  Valid: {s}\n", .{if (validation.is_valid) "yes" else "no"});
+        try output.print(self.allocator, "Key Validation: {s}\n", .{key_id});
+        try output.print(self.allocator, "  Valid: {s}\n", .{if (validation.is_valid) "yes" else "no"});
 
         if (validation.days_until_expiry) |days| {
-            try writer.print("  Days until expiry: {d}\n", .{days});
+            try output.print(self.allocator, "  Days until expiry: {d}\n", .{days});
         }
 
         if (validation.issues.len > 0) {
-            try writer.print("  Issues:\n", .{});
+            try output.print(self.allocator, "  Issues:\n", .{});
             for (validation.issues) |issue| {
-                try writer.print("    - {s}\n", .{issue});
+                try output.print(self.allocator, "    - {s}\n", .{issue});
             }
         }
 
         return .{
             .success = validation.is_valid,
             .message = if (validation.is_valid) "Key is valid" else "Key has issues",
-            .data = try output.toOwnedSlice(),
+            .data = try output.toOwnedSlice(self.allocator),
         };
     }
 

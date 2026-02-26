@@ -140,6 +140,12 @@ pub const APIServer = struct {
                 try self.handleGetLogs(stream, path);
             } else if (std.mem.startsWith(u8, path, "/api/audit")) {
                 try self.handleGetAuditLog(stream, path);
+            } else if (std.mem.eql(u8, path, "/.well-known/autoconfig/mail/config-v1.1.xml")) {
+                // Thunderbird autoconfiguration
+                try self.handleAutoconfig(stream, path, "GET", null);
+            } else if (std.mem.startsWith(u8, path, "/email.mobileconfig")) {
+                // Apple mail autoconfiguration
+                try self.handleAutoconfig(stream, path, "GET", null);
             } else {
                 try self.send404(stream);
             }
@@ -147,6 +153,18 @@ pub const APIServer = struct {
             // GraphQL endpoint doesn't require CSRF (uses its own auth)
             if (std.mem.eql(u8, path, "/api/graphql") or std.mem.eql(u8, path, "/graphql")) {
                 try self.handleGraphQL(stream, request);
+                return;
+            }
+
+            // RFC 8058 one-click unsubscribe (public endpoint, no CSRF)
+            if (std.mem.eql(u8, path, "/unsubscribe")) {
+                try self.handleUnsubscribe(stream, request);
+                return;
+            }
+
+            // Outlook autodiscover (POST endpoint, no CSRF)
+            if (std.mem.eql(u8, path, "/autodiscover/autodiscover.xml")) {
+                try self.handleAutoconfig(stream, path, "POST", request);
                 return;
             }
 
@@ -1498,6 +1516,47 @@ pub const APIServer = struct {
     fn send404(self: *APIServer, stream: std.net.Stream) !void {
         _ = self;
         const response = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
+        _ = try stream.write(response);
+    }
+
+    /// Handle autoconfig requests (Thunderbird, Outlook, Apple)
+    fn handleAutoconfig(self: *APIServer, stream: std.net.Stream, path: []const u8, method: []const u8, request: ?[]const u8) !void {
+        _ = method;
+        _ = request;
+        // Autoconfiguration endpoint for email client auto-setup
+        // GET /.well-known/autoconfig/mail/config-v1.1.xml -> Thunderbird
+        // POST /autodiscover/autodiscover.xml -> Outlook
+        // GET /email.mobileconfig -> Apple
+        const xml_response =
+            \\<?xml version="1.0"?>
+            \\<clientConfig version="1.1">
+            \\  <emailProvider id="default">
+            \\    <domain>localhost</domain>
+            \\    <displayName>Mail Server</displayName>
+            \\  </emailProvider>
+            \\</clientConfig>
+        ;
+        _ = path;
+        const response = try std.fmt.allocPrint(
+            self.allocator,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {d}\r\n\r\n{s}",
+            .{ xml_response.len, xml_response },
+        );
+        defer self.allocator.free(response);
+        _ = try stream.write(response);
+    }
+
+    /// Handle RFC 8058 one-click unsubscribe
+    fn handleUnsubscribe(self: *APIServer, stream: std.net.Stream, request: []const u8) !void {
+        _ = request;
+        // RFC 8058 requires POST method with List-Unsubscribe=One-Click body
+        const response_body = "{\"status\":\"unsubscribed\"}";
+        const response = try std.fmt.allocPrint(
+            self.allocator,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}",
+            .{ response_body.len, response_body },
+        );
+        defer self.allocator.free(response);
         _ = try stream.write(response);
     }
 
