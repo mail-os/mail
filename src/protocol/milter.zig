@@ -1,5 +1,6 @@
 const std = @import("std");
 const time_compat = @import("../core/time_compat.zig");
+const socket = @import("../core/socket_compat.zig");
 
 /// Milter (Mail Filter) Protocol Implementation
 ///
@@ -602,7 +603,7 @@ pub const MilterClient = struct {
     owned_host: ?[]u8 = null,
     owned_name: []u8,
     /// Underlying network stream.
-    stream: ?std.net.Stream = null,
+    stream: ?socket.Connection = null,
     /// Negotiated capabilities.
     negotiated_actions: MilterActions = MilterActions.none,
     negotiated_protocol: MilterProtocol = MilterProtocol.all_callbacks,
@@ -695,9 +696,26 @@ pub const MilterClient = struct {
 
         if (port == 0) return error.MissingPort;
 
-        const addr = try std.net.Address.parseIp(host, port);
-        const stream = try std.net.tcpConnectToAddress(addr);
-        self.stream = stream;
+        const addr = try socket.Address.parseIp(host, port);
+        const posix = std.posix;
+        const family: c_uint = @intCast(addr.getPosixFamily());
+        const sock_type: c_uint = @intCast(@as(u32, posix.SOCK.STREAM | posix.SOCK.CLOEXEC));
+        const raw_fd = std.c.socket(family, sock_type, 0);
+        if (raw_fd < 0) return error.ConnectionRefused;
+        const fd: posix.socket_t = @intCast(raw_fd);
+        errdefer posix.close(fd);
+
+        if (addr.family == .ipv4) {
+            const sockaddr = addr.toSockaddrIn();
+            if (std.c.connect(fd, @ptrCast(&sockaddr), @sizeOf(@TypeOf(sockaddr))) < 0)
+                return error.ConnectionRefused;
+        } else {
+            const sockaddr = addr.toSockaddrIn6();
+            if (std.c.connect(fd, @ptrCast(&sockaddr), @sizeOf(@TypeOf(sockaddr))) < 0)
+                return error.ConnectionRefused;
+        }
+
+        self.stream = .{ .fd = fd };
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -706,9 +724,22 @@ pub const MilterClient = struct {
 
     /// Connect via Unix domain socket.
     fn connectUnix(self: *MilterClient, path: []const u8) !void {
-        const addr = try std.net.Address.initUnix(path);
-        const stream = try std.net.tcpConnectToAddress(addr);
-        self.stream = stream;
+        const posix = std.posix;
+        const sock_type: c_uint = @intCast(@as(u32, posix.SOCK.STREAM | posix.SOCK.CLOEXEC));
+        const raw_fd = std.c.socket(posix.AF.UNIX, sock_type, 0);
+        if (raw_fd < 0) return error.ConnectionRefused;
+        const fd: posix.socket_t = @intCast(raw_fd);
+        errdefer posix.close(fd);
+
+        var sockaddr: posix.sockaddr.un = .{ .family = posix.AF.UNIX, .path = undefined };
+        @memset(&sockaddr.path, 0);
+        if (path.len >= sockaddr.path.len) return error.NameTooLong;
+        @memcpy(sockaddr.path[0..path.len], path);
+
+        if (std.c.connect(fd, @ptrCast(&sockaddr), @sizeOf(@TypeOf(sockaddr))) < 0)
+            return error.ConnectionRefused;
+
+        self.stream = .{ .fd = fd };
 
         self.mutex.lock();
         defer self.mutex.unlock();

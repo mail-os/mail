@@ -531,7 +531,6 @@ pub const ARCValidator = struct {
                 error.InvalidASSeal,
                 => .permerror,
                 error.OutOfMemory => .temperror,
-                else => .temperror,
             };
         };
         defer chain.deinit();
@@ -977,7 +976,7 @@ pub const ARCSealer = struct {
     }
 
     /// Determine the appropriate cv= value for a new ARC set
-    fn determineChainValidation(self: *ARCSealer, instance: u32, chain_status: ARCChainValidation) ARCChainValidation {
+    pub fn determineChainValidation(self: *ARCSealer, instance: u32, chain_status: ARCChainValidation) ARCChainValidation {
         _ = self;
         if (instance == 1) {
             // First ARC set always has cv=none

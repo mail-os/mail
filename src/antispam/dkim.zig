@@ -603,8 +603,9 @@ pub const DKIMKeyManager = struct {
     fn generateKeyId(self: *DKIMKeyManager) ![]u8 {
         var buf: [16]u8 = undefined;
         std.c.arc4random_buf(&buf, buf.len);
+        const hex = std.fmt.bytesToHex(buf, .lower);
         return std.fmt.allocPrint(self.allocator, "dkim_{s}", .{
-            std.fmt.fmtSliceHexLower(&buf),
+            &hex,
         });
     }
 
@@ -623,16 +624,18 @@ pub const DKIMKeyManager = struct {
         var random_bytes: [64]u8 = undefined;
         std.c.arc4random_buf(&random_bytes, random_bytes.len);
 
+        const pub_hex = std.fmt.bytesToHex(random_bytes[0..32].*, .lower);
         const public_key = try std.fmt.allocPrint(self.allocator,
             "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA{s}",
-            .{std.fmt.fmtSliceHexLower(random_bytes[0..32])});
+            .{&pub_hex});
 
-        const key_size = algorithm.getKeySize();
+        _ = algorithm;
+        const full_hex = std.fmt.bytesToHex(random_bytes, .lower);
         const private_key = try std.fmt.allocPrint(self.allocator,
             \\-----BEGIN RSA PRIVATE KEY-----
             \\{s}
             \\-----END RSA PRIVATE KEY-----
-        , .{std.fmt.fmtSliceHexLower(random_bytes[0..@min(key_size / 8, 64)])});
+        , .{&full_hex});
 
         return .{
             .public_key = public_key,
