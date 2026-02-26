@@ -331,7 +331,7 @@ pub const MultiTenancyManager = struct {
     /// Generate unique tenant ID
     fn generateTenantId(self: *MultiTenancyManager) ![]const u8 {
         var buf: [16]u8 = undefined;
-        std.crypto.random.bytes(&buf);
+        std.c.arc4random_buf(&buf, buf.len);
 
         const id = try std.fmt.allocPrint(
             self.allocator,

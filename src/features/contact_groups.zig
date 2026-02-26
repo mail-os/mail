@@ -154,7 +154,7 @@ pub const ContactGroup = struct {
         }
 
         var rand_bytes: [4]u8 = undefined;
-        std.crypto.random.bytes(&rand_bytes);
+        std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
 
         const member = GroupMember{
             .id = try std.fmt.allocPrint(self.allocator, "mem_{x}", .{std.mem.readInt(u32, &rand_bytes, .big)}),
@@ -186,7 +186,7 @@ pub const ContactGroup = struct {
         }
 
         var rand_bytes: [4]u8 = undefined;
-        std.crypto.random.bytes(&rand_bytes);
+        std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
 
         const member = GroupMember{
             .id = try std.fmt.allocPrint(self.allocator, "mem_{x}", .{std.mem.readInt(u32, &rand_bytes, .big)}),
@@ -319,7 +319,7 @@ pub const ContactGroupManager = struct {
         }
 
         var rand_bytes: [8]u8 = undefined;
-        std.crypto.random.bytes(&rand_bytes);
+        std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
         const timestamp = std.time.timestamp();
 
         const id = try std.fmt.allocPrint(self.allocator, "grp_{x}_{x}", .{

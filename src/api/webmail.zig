@@ -1030,7 +1030,7 @@ pub const WebmailHandler = struct {
         // Fallback if storage not initialized
         const timestamp = std.time.timestamp();
         var rand_bytes: [8]u8 = undefined;
-        std.crypto.random.bytes(&rand_bytes);
+        std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
 
         var id_buf: [32]u8 = undefined;
         const id = std.fmt.bufPrint(&id_buf, "att_{x}_{x}", .{

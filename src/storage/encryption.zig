@@ -176,7 +176,7 @@ pub const EmailEncryption = struct {
     ) !EncryptedMessage {
         // Generate random nonce
         var nonce: [12]u8 = undefined;
-        crypto.random.bytes(&nonce);
+        std.c.arc4random_buf(&nonce, nonce.len);
 
         // Derive message-specific key from master key + message_id
         const message_key = try self.deriveMessageKey(message_id);
@@ -253,7 +253,7 @@ pub const EmailEncryption = struct {
     /// Generate random master key
     pub fn generateMasterKey() [32]u8 {
         var key: [32]u8 = undefined;
-        crypto.random.bytes(&key);
+        std.c.arc4random_buf(&key, key.len);
         return key;
     }
 
@@ -623,8 +623,8 @@ test "password-based key derivation" {
     // Generate random password and salt for testing instead of hardcoding
     var password_buf: [32]u8 = undefined;
     var salt_buf: [32]u8 = undefined;
-    std.crypto.random.bytes(&password_buf);
-    std.crypto.random.bytes(&salt_buf);
+    std.c.arc4random_buf(&password_buf, password_buf.len);
+    std.c.arc4random_buf(&salt_buf, salt_buf.len);
 
     const password = &password_buf;
     const salt = &salt_buf;

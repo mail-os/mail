@@ -254,7 +254,7 @@ pub const EmailScheduler = struct {
         }
 
         var rand_bytes: [8]u8 = undefined;
-        std.crypto.random.bytes(&rand_bytes);
+        std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
 
         const id = try std.fmt.allocPrint(self.allocator, "sched_{x}_{x}", .{
             @as(u64, @intCast(now)),

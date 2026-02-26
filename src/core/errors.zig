@@ -40,7 +40,7 @@ pub const SmtpError = error{
 };
 
 /// Combined error set for the entire SMTP server
-pub const ServerError = SmtpError || std.mem.Allocator.Error || std.fs.File.OpenError || std.fs.File.WriteError || std.posix.WriteError || std.posix.ReadError || error{
+pub const ServerError = SmtpError || std.mem.Allocator.Error || std.Io.File.OpenError || std.Io.File.WritePositionalError || error{
     EndOfStream,
     LineTooLong,
     OutOfMemory,

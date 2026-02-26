@@ -346,7 +346,7 @@ pub const CanSpamCompliance = struct {
         defer current_value.deinit();
 
         while (lines.next()) |line| {
-            const trimmed = std.mem.trimRight(u8, line, "\r");
+            const trimmed = std.mem.trimEnd(u8, line, "\r");
             if (trimmed.len == 0) continue;
 
             // Check if continuation line

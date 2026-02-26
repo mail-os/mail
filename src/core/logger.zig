@@ -39,21 +39,24 @@ pub const Logger = struct {
     allocator: std.mem.Allocator,
     min_level: LogLevel,
     use_colors: bool,
-    log_file: ?std.fs.File,
+    log_file: ?std.Io.File,
+    log_file_offset: u64,
     mutex: std.Thread.Mutex,
     format: LogFormat,
     service_name: []const u8,
     hostname: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, min_level: LogLevel, log_file_path: ?[]const u8) !Logger {
-        var log_file: ?std.fs.File = null;
+        const io = io_compat.getIo();
+        var log_file: ?std.Io.File = null;
+        var log_file_offset: u64 = 0;
 
         if (log_file_path) |path| {
-            log_file = try std.fs.cwd().createFile(path, .{
+            log_file = try std.Io.Dir.cwd().createFile(io, path, .{
                 .truncate = false,
-                .read = false,
             });
-            try log_file.?.seekFromEnd(0);
+            // Get file length so we can append
+            log_file_offset = log_file.?.length(io) catch 0;
         }
 
         // Get hostname
@@ -65,6 +68,7 @@ pub const Logger = struct {
             .min_level = min_level,
             .use_colors = true,
             .log_file = log_file,
+            .log_file_offset = log_file_offset,
             .mutex = std.Thread.Mutex{},
             .format = .text, // Default to text format
             .service_name = try allocator.dupe(u8, "smtp-server"),
@@ -81,7 +85,7 @@ pub const Logger = struct {
 
     pub fn deinit(self: *Logger) void {
         if (self.log_file) |file| {
-            file.close();
+            file.close(io_compat.getIo());
         }
         self.allocator.free(self.service_name);
         self.allocator.free(self.hostname);
@@ -118,14 +122,15 @@ pub const Logger = struct {
                 level.toColor(),
                 log_entry,
             }) catch return;
-            _ = std.posix.write(std.posix.STDERR_FILENO, colored) catch {};
+            _ = std.c.write(2, colored.ptr, colored.len);
         } else {
-            _ = std.posix.write(std.posix.STDERR_FILENO, log_entry) catch {};
+            _ = std.c.write(2, log_entry.ptr, log_entry.len);
         }
 
         // Write to file if configured
         if (self.log_file) |file| {
-            _ = file.write(log_entry) catch {};
+            file.writePositionalAll(io_compat.getIo(), log_entry, self.log_file_offset) catch {};
+            self.log_file_offset += log_entry.len;
         }
     }
 
@@ -306,14 +311,15 @@ pub const Logger = struct {
                 slog.level.toColor(),
                 log_entry,
             }) catch return;
-            _ = std.posix.write(std.posix.STDERR_FILENO, colored) catch {};
+            _ = std.c.write(2, colored.ptr, colored.len);
         } else {
-            _ = std.posix.write(std.posix.STDERR_FILENO, log_entry) catch {};
+            _ = std.c.write(2, log_entry.ptr, log_entry.len);
         }
 
         // Write to file
         if (self.log_file) |file| {
-            _ = file.write(log_entry) catch {};
+            file.writePositionalAll(io_compat.getIo(), log_entry, self.log_file_offset) catch {};
+            self.log_file_offset += log_entry.len;
         }
     }
 };

@@ -1,5 +1,6 @@
 const std = @import("std");
 const crypto = std.crypto;
+const io_compat = @import("../core/io_compat.zig");
 
 /// Password hashing using Argon2id (more secure than bcrypt, built into Zig std)
 pub const PasswordHasher = struct {
@@ -17,7 +18,7 @@ pub const PasswordHasher = struct {
     pub fn hashPassword(self: *PasswordHasher, password: []const u8) ![]u8 {
         // Generate random salt
         var salt: [salt_len]u8 = undefined;
-        crypto.random.bytes(&salt);
+        std.c.arc4random_buf(&salt, salt.len);
 
         // Hash the password with Argon2id
         var hash: [hash_len]u8 = undefined;
@@ -32,6 +33,7 @@ pub const PasswordHasher = struct {
                 .p = 4, // 4 parallelism
             },
             .argon2id,
+            io_compat.getIo(),
         );
 
         // Encode salt and hash as base64 (no padding - standard for Argon2)
@@ -121,6 +123,7 @@ pub const PasswordHasher = struct {
                 .p = p,
             },
             .argon2id,
+            io_compat.getIo(),
         );
 
         // Constant-time comparison

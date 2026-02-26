@@ -14,8 +14,8 @@ pub const TraceContext = struct {
         var span_id: [8]u8 = undefined;
 
         // Generate random trace and span IDs
-        std.crypto.random.bytes(&trace_id);
-        std.crypto.random.bytes(&span_id);
+        std.c.arc4random_buf(&trace_id, trace_id.len);
+        std.c.arc4random_buf(&span_id, span_id.len);
 
         return .{
             .trace_id = trace_id,
@@ -28,7 +28,7 @@ pub const TraceContext = struct {
 
     pub fn initWithParent(allocator: std.mem.Allocator, parent: *const TraceContext) !TraceContext {
         var span_id: [8]u8 = undefined;
-        std.crypto.random.bytes(&span_id);
+        std.c.arc4random_buf(&span_id, span_id.len);
 
         return .{
             .trace_id = parent.trace_id,

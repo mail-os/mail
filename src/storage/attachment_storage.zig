@@ -379,7 +379,7 @@ pub const AttachmentStorage = struct {
     fn generateId(self: *Self) ![]u8 {
         const timestamp = std.time.timestamp();
         var rand_bytes: [8]u8 = undefined;
-        crypto.random.bytes(&rand_bytes);
+        std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
 
         return std.fmt.allocPrint(self.allocator, "att_{x}_{x}", .{
             @as(u64, @intCast(timestamp)),

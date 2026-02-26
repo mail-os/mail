@@ -2,16 +2,17 @@ const std = @import("std");
 const builtin = @import("builtin");
 const time_compat = @import("../core/time_compat.zig");
 
-// Simple stdout wrapper that works across Zig versions
-// Implements the Writer interface for use with anytype writer arguments
+// Simple stdout wrapper using libc write
 const StdoutWriter = struct {
     const Self = @This();
 
-    pub const Error = std.posix.WriteError;
+    pub const Error = error{Unexpected};
     pub const Writer = std.io.GenericWriter(*Self, Error, write);
 
     pub fn write(_: *Self, bytes: []const u8) Error!usize {
-        return std.posix.write(std.posix.STDOUT_FILENO, bytes);
+        const result = std.c.write(1, bytes.ptr, bytes.len);
+        if (result < 0) return error.Unexpected;
+        return @intCast(result);
     }
 
     pub fn writeAll(self: *Self, data: []const u8) !void {

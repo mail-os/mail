@@ -748,7 +748,7 @@ test "WebSocket accept key generation" {
 
     // Generate random WebSocket key for testing
     var key_buf: [16]u8 = undefined;
-    std.crypto.random.bytes(&key_buf);
+    std.c.arc4random_buf(&key_buf, key_buf.len);
 
     const encoder = std.base64.standard.Encoder;
     var encoded_key: [encoder.calcSize(key_buf.len)]u8 = undefined;

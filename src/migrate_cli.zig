@@ -1,14 +1,15 @@
 const std = @import("std");
 const database = @import("storage/database.zig");
 const migrations = @import("storage/migrations.zig");
+const env = @import("core/env.zig");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     // Parse arguments
-    var arg_it = try std.process.argsWithAllocator(allocator);
+    var arg_it = try init.args.iterateAllocator(allocator);
     defer arg_it.deinit();
 
     // Skip program name
@@ -21,7 +22,7 @@ pub fn main() !void {
     };
 
     // Get database path
-    const db_path = std.posix.getenv("SMTP_DB_PATH") orelse "./smtp.db";
+    const db_path = env.get("SMTP_DB_PATH") orelse "./smtp.db";
 
     // Initialize database
     var db = try database.Database.init(allocator, db_path);

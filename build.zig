@@ -100,8 +100,30 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    // CLI tools temporarily disabled for 0.16-dev compatibility
-    // TODO: update argsAlloc/argsWithAllocator to new 0.16 API
+    // CLI tools
+    const cli_tools = [_]struct { name: []const u8, src: []const u8 }{
+        .{ .name = "benchmark", .src = "src/benchmark_cli.zig" },
+        .{ .name = "migrate-cli", .src = "src/migrate_cli.zig" },
+        .{ .name = "user-cli", .src = "src/user_cli.zig" },
+        .{ .name = "gdpr-cli", .src = "src/gdpr_cli.zig" },
+        .{ .name = "search-cli", .src = "src/search_cli.zig" },
+    };
+
+    for (cli_tools) |tool| {
+        const cli_module = b.createModule(.{
+            .root_source_file = b.path(tool.src),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        const cli_exe = b.addExecutable(.{
+            .name = tool.name,
+            .root_module = cli_module,
+        });
+
+        linkPlatformLibraries(cli_exe, target);
+        b.installArtifact(cli_exe);
+    }
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());

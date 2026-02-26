@@ -2,6 +2,8 @@ const std = @import("std");
 const args = @import("args.zig");
 const config_profiles = @import("config_profiles.zig");
 const toml = @import("toml.zig");
+const env = @import("env.zig");
+const io_compat = @import("io_compat.zig");
 
 pub const ValidationError = error{
     InvalidPort,
@@ -159,7 +161,7 @@ pub const Config = struct {
 
             // Check if TLS certificate file exists
             if (self.tls_cert_path) |cert_path| {
-                std.fs.cwd().access(cert_path, .{}) catch {
+                std.Io.Dir.cwd().access(io_compat.getIo(),cert_path, .{}) catch {
                     std.debug.print("Configuration Error: TLS certificate file not found: {s}\n", .{cert_path});
                     return ValidationError.TLSCertificateNotFound;
                 };
@@ -167,7 +169,7 @@ pub const Config = struct {
 
             // Check if TLS key file exists
             if (self.tls_key_path) |key_path| {
-                std.fs.cwd().access(key_path, .{}) catch {
+                std.Io.Dir.cwd().access(io_compat.getIo(),key_path, .{}) catch {
                     std.debug.print("Configuration Error: TLS key file not found: {s}\n", .{key_path});
                     return ValidationError.TLSKeyNotFound;
                 };
@@ -208,7 +210,7 @@ pub fn loadConfig(allocator: std.mem.Allocator, cli_args: args.Args) !Config {
     // Try to load from config file (CLI arg takes priority, then standard paths)
     if (cli_args.config_file) |config_path| {
         try applyConfigFile(allocator, &cfg, config_path);
-    } else if (std.posix.getenv("SMTP_CONFIG_FILE")) |config_path| {
+    } else if (env.get("SMTP_CONFIG_FILE")) |config_path| {
         try applyConfigFile(allocator, &cfg, config_path);
     } else {
         // Try standard config file locations
@@ -236,7 +238,7 @@ pub fn loadConfig(allocator: std.mem.Allocator, cli_args: args.Args) !Config {
 
 /// Determine which configuration profile to use
 fn determineProfile() config_profiles.Profile {
-    if (std.posix.getenv("SMTP_PROFILE")) |profile_str| {
+    if (env.get("SMTP_PROFILE")) |profile_str| {
         if (config_profiles.Profile.fromString(profile_str)) |profile| {
             return profile;
         }
@@ -285,129 +287,129 @@ fn loadDefaultsFromProfile(allocator: std.mem.Allocator, profile: config_profile
 
 fn applyEnvironmentVariables(allocator: std.mem.Allocator, cfg: *Config) !void {
     // SMTP_HOST
-    if (std.posix.getenv("SMTP_HOST")) |value| {
+    if (env.get("SMTP_HOST")) |value| {
         allocator.free(cfg.host);
         cfg.host = try allocator.dupe(u8, value);
     }
 
     // SMTP_PORT
-    if (std.posix.getenv("SMTP_PORT")) |value| {
+    if (env.get("SMTP_PORT")) |value| {
         cfg.port = std.fmt.parseInt(u16, value, 10) catch cfg.port;
     }
 
     // SMTP_HOSTNAME
-    if (std.posix.getenv("SMTP_HOSTNAME")) |value| {
+    if (env.get("SMTP_HOSTNAME")) |value| {
         allocator.free(cfg.hostname);
         cfg.hostname = try allocator.dupe(u8, value);
     }
 
     // SMTP_MAX_CONNECTIONS
-    if (std.posix.getenv("SMTP_MAX_CONNECTIONS")) |value| {
+    if (env.get("SMTP_MAX_CONNECTIONS")) |value| {
         cfg.max_connections = std.fmt.parseInt(usize, value, 10) catch cfg.max_connections;
     }
 
     // SMTP_MAX_MESSAGE_SIZE
-    if (std.posix.getenv("SMTP_MAX_MESSAGE_SIZE")) |value| {
+    if (env.get("SMTP_MAX_MESSAGE_SIZE")) |value| {
         cfg.max_message_size = std.fmt.parseInt(usize, value, 10) catch cfg.max_message_size;
     }
 
     // SMTP_MAX_RECIPIENTS
-    if (std.posix.getenv("SMTP_MAX_RECIPIENTS")) |value| {
+    if (env.get("SMTP_MAX_RECIPIENTS")) |value| {
         cfg.max_recipients = std.fmt.parseInt(usize, value, 10) catch cfg.max_recipients;
     }
 
     // SMTP_TIMEOUT_SECONDS (connection timeout)
-    if (std.posix.getenv("SMTP_TIMEOUT_SECONDS")) |value| {
+    if (env.get("SMTP_TIMEOUT_SECONDS")) |value| {
         cfg.timeout_seconds = std.fmt.parseInt(u32, value, 10) catch cfg.timeout_seconds;
     }
 
     // SMTP_DATA_TIMEOUT_SECONDS (DATA command timeout)
-    if (std.posix.getenv("SMTP_DATA_TIMEOUT_SECONDS")) |value| {
+    if (env.get("SMTP_DATA_TIMEOUT_SECONDS")) |value| {
         cfg.data_timeout_seconds = std.fmt.parseInt(u32, value, 10) catch cfg.data_timeout_seconds;
     }
 
     // SMTP_COMMAND_TIMEOUT_SECONDS (timeout between commands)
-    if (std.posix.getenv("SMTP_COMMAND_TIMEOUT_SECONDS")) |value| {
+    if (env.get("SMTP_COMMAND_TIMEOUT_SECONDS")) |value| {
         cfg.command_timeout_seconds = std.fmt.parseInt(u32, value, 10) catch cfg.command_timeout_seconds;
     }
 
     // SMTP_GREETING_TIMEOUT_SECONDS (timeout for initial greeting)
-    if (std.posix.getenv("SMTP_GREETING_TIMEOUT_SECONDS")) |value| {
+    if (env.get("SMTP_GREETING_TIMEOUT_SECONDS")) |value| {
         cfg.greeting_timeout_seconds = std.fmt.parseInt(u32, value, 10) catch cfg.greeting_timeout_seconds;
     }
 
     // SMTP_ENABLE_TLS
-    if (std.posix.getenv("SMTP_ENABLE_TLS")) |value| {
+    if (env.get("SMTP_ENABLE_TLS")) |value| {
         cfg.enable_tls = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
     }
 
     // SMTP_ENABLE_AUTH
-    if (std.posix.getenv("SMTP_ENABLE_AUTH")) |value| {
+    if (env.get("SMTP_ENABLE_AUTH")) |value| {
         cfg.enable_auth = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
     }
 
     // SMTP_ENABLE_DNSBL
-    if (std.posix.getenv("SMTP_ENABLE_DNSBL")) |value| {
+    if (env.get("SMTP_ENABLE_DNSBL")) |value| {
         cfg.enable_dnsbl = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
     }
 
     // SMTP_ENABLE_GREYLIST
-    if (std.posix.getenv("SMTP_ENABLE_GREYLIST")) |value| {
+    if (env.get("SMTP_ENABLE_GREYLIST")) |value| {
         cfg.enable_greylist = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
     }
 
     // SMTP_TLS_CERT
-    if (std.posix.getenv("SMTP_TLS_CERT")) |value| {
+    if (env.get("SMTP_TLS_CERT")) |value| {
         if (cfg.tls_cert_path) |old| allocator.free(old);
         cfg.tls_cert_path = try allocator.dupe(u8, value);
     }
 
     // SMTP_TLS_KEY
-    if (std.posix.getenv("SMTP_TLS_KEY")) |value| {
+    if (env.get("SMTP_TLS_KEY")) |value| {
         if (cfg.tls_key_path) |old| allocator.free(old);
         cfg.tls_key_path = try allocator.dupe(u8, value);
     }
 
     // SMTP_WEBHOOK_URL
-    if (std.posix.getenv("SMTP_WEBHOOK_URL")) |value| {
+    if (env.get("SMTP_WEBHOOK_URL")) |value| {
         if (cfg.webhook_url) |old| allocator.free(old);
         cfg.webhook_url = try allocator.dupe(u8, value);
         cfg.webhook_enabled = true;
     }
 
     // SMTP_WEBHOOK_ENABLED
-    if (std.posix.getenv("SMTP_WEBHOOK_ENABLED")) |value| {
+    if (env.get("SMTP_WEBHOOK_ENABLED")) |value| {
         cfg.webhook_enabled = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
     }
 
     // SMTP_RATE_LIMIT_PER_IP
-    if (std.posix.getenv("SMTP_RATE_LIMIT_PER_IP")) |value| {
+    if (env.get("SMTP_RATE_LIMIT_PER_IP")) |value| {
         cfg.rate_limit_per_ip = std.fmt.parseInt(u32, value, 10) catch cfg.rate_limit_per_ip;
     }
 
     // SMTP_RATE_LIMIT_PER_USER
-    if (std.posix.getenv("SMTP_RATE_LIMIT_PER_USER")) |value| {
+    if (env.get("SMTP_RATE_LIMIT_PER_USER")) |value| {
         cfg.rate_limit_per_user = std.fmt.parseInt(u32, value, 10) catch cfg.rate_limit_per_user;
     }
 
     // SMTP_RATE_LIMIT_CLEANUP_INTERVAL
-    if (std.posix.getenv("SMTP_RATE_LIMIT_CLEANUP_INTERVAL")) |value| {
+    if (env.get("SMTP_RATE_LIMIT_CLEANUP_INTERVAL")) |value| {
         cfg.rate_limit_cleanup_interval = std.fmt.parseInt(u64, value, 10) catch cfg.rate_limit_cleanup_interval;
     }
 
     // SMTP_ENABLE_TRACING
-    if (std.posix.getenv("SMTP_ENABLE_TRACING")) |value| {
+    if (env.get("SMTP_ENABLE_TRACING")) |value| {
         cfg.enable_tracing = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
     }
 
     // SMTP_TRACING_SERVICE_NAME
-    if (std.posix.getenv("SMTP_TRACING_SERVICE_NAME")) |value| {
+    if (env.get("SMTP_TRACING_SERVICE_NAME")) |value| {
         allocator.free(cfg.tracing_service_name);
         cfg.tracing_service_name = try allocator.dupe(u8, value);
     }
 
     // SMTP_ENABLE_JSON_LOGGING
-    if (std.posix.getenv("SMTP_ENABLE_JSON_LOGGING")) |value| {
+    if (env.get("SMTP_ENABLE_JSON_LOGGING")) |value| {
         cfg.enable_json_logging = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
     }
 }

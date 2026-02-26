@@ -9,9 +9,9 @@ const BenchmarkResult = benchmark.BenchmarkResult;
 const BenchmarkCategory = benchmark.BenchmarkCategory;
 const SMTPBenchmarks = benchmark.SMTPBenchmarks;
 
-// Simple output function that works across Zig versions
+// Simple output function using libc write
 fn writeOutput(data: []const u8) void {
-    _ = std.posix.write(std.posix.STDOUT_FILENO, data) catch {};
+    _ = std.c.write(1, data.ptr, data.len);
 }
 
 fn printLine(comptime fmt: []const u8, args: anytype) void {
@@ -20,14 +20,15 @@ fn printLine(comptime fmt: []const u8, args: anytype) void {
     writeOutput(slice);
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     // Get command line arguments
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const args = try init.args.toSlice(arena.allocator());
 
     // Parse arguments
     var output_json = false;

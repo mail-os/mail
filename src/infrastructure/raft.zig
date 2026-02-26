@@ -184,9 +184,7 @@ pub const RaftNode = struct {
 
         // Initialize random for election timeout
         var seed: u64 = undefined;
-        std.posix.getrandom(std.mem.asBytes(&seed)) catch {
-            seed = @intCast(time_compat.timestamp());
-        };
+        std.c.arc4random_buf(std.mem.asBytes(&seed), @sizeOf(u64));
         var prng = std.Random.DefaultPrng.init(seed);
 
         node.* = .{

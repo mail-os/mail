@@ -1,6 +1,7 @@
 const std = @import("std");
 const time_compat = @import("../core/time_compat.zig");
 const version_info = @import("../core/version.zig");
+const env = @import("../core/env.zig");
 
 /// Server statistics with thread-safe atomic counters
 pub const ServerStats = struct {
@@ -343,7 +344,7 @@ pub const HealthServer = struct {
 
         // Check database dependency (if DB_PATH is set, database is in use)
         const db_start = std.time.milliTimestamp();
-        if (std.posix.getenv("SMTP_DB_PATH")) |db_path| {
+        if (env.get("SMTP_DB_PATH")) |db_path| {
             // Try to access database file
             std.fs.cwd().access(db_path, .{}) catch |err| {
                 const err_msg = try std.fmt.allocPrint(self.allocator, "Database file not accessible: {}", .{err});
@@ -460,7 +461,7 @@ pub const HealthServer = struct {
         }
 
         // Check 2: Database accessible (if configured)
-        if (std.posix.getenv("SMTP_DB_PATH")) |db_path| {
+        if (env.get("SMTP_DB_PATH")) |db_path| {
             std.fs.cwd().access(db_path, .{}) catch {
                 ready = false;
             };
@@ -559,7 +560,7 @@ pub const HealthServer = struct {
         // (If we're responding, we're accepting)
 
         // Check 3: Database initialized (if using database)
-        if (std.posix.getenv("SMTP_DB_PATH")) |db_path| {
+        if (env.get("SMTP_DB_PATH")) |db_path| {
             std.fs.cwd().access(db_path, .{}) catch {
                 started = false;
             };

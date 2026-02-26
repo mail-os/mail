@@ -44,7 +44,7 @@ pub const CSRFManager = struct {
 
         // Generate random token
         var token_bytes: [TOKEN_LENGTH]u8 = undefined;
-        crypto.random.bytes(&token_bytes);
+        std.c.arc4random_buf(&token_bytes, token_bytes.len);
 
         // Encode as base64 for safe transmission
         const encoder = std.base64.url_safe_no_pad.Encoder;

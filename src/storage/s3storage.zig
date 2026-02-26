@@ -1,5 +1,6 @@
 const std = @import("std");
 const time_compat = @import("../core/time_compat.zig");
+const env = @import("../core/env.zig");
 
 /// S3-compatible object storage backend for email messages
 /// Provides scalable, durable email storage using S3 API
@@ -307,8 +308,8 @@ test "S3 key generation" {
     const testing = std.testing;
 
     // Use environment variables for credentials in tests
-    const access_key = std.posix.getenv("AWS_ACCESS_KEY_ID") orelse return error.SkipZigTest;
-    const secret_key = std.posix.getenv("AWS_SECRET_ACCESS_KEY") orelse return error.SkipZigTest;
+    const access_key = env.get("AWS_ACCESS_KEY_ID") orelse return error.SkipZigTest;
+    const secret_key = env.get("AWS_SECRET_ACCESS_KEY") orelse return error.SkipZigTest;
 
     const config = S3Config{
         .access_key = access_key,
@@ -333,8 +334,8 @@ test "S3 presigned URL generation" {
     const testing = std.testing;
 
     // Use environment variables for credentials in tests
-    const access_key = std.posix.getenv("AWS_ACCESS_KEY_ID") orelse return error.SkipZigTest;
-    const secret_key = std.posix.getenv("AWS_SECRET_ACCESS_KEY") orelse return error.SkipZigTest;
+    const access_key = env.get("AWS_ACCESS_KEY_ID") orelse return error.SkipZigTest;
+    const secret_key = env.get("AWS_SECRET_ACCESS_KEY") orelse return error.SkipZigTest;
 
     const config = S3Config{
         .access_key = access_key,
@@ -374,8 +375,8 @@ test "S3 multipart upload" {
     const testing = std.testing;
 
     // Use environment variables for credentials in tests
-    const access_key = std.posix.getenv("AWS_ACCESS_KEY_ID") orelse return error.SkipZigTest;
-    const secret_key = std.posix.getenv("AWS_SECRET_ACCESS_KEY") orelse return error.SkipZigTest;
+    const access_key = env.get("AWS_ACCESS_KEY_ID") orelse return error.SkipZigTest;
+    const secret_key = env.get("AWS_SECRET_ACCESS_KEY") orelse return error.SkipZigTest;
 
     const config = S3Config{
         .access_key = access_key,

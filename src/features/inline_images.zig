@@ -469,7 +469,7 @@ fn removeWhitespace(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
 /// Generate a Content-ID for a new inline image
 pub fn generateContentId(allocator: std.mem.Allocator, domain: []const u8) ![]u8 {
     var rand_bytes: [8]u8 = undefined;
-    std.crypto.random.bytes(&rand_bytes);
+    std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
 
     const timestamp = std.time.timestamp();
 

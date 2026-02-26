@@ -94,11 +94,11 @@ pub const Server = struct {
     address: Address,
 
     pub fn listen(address: Address, options: ListenOptions) !Server {
-        const fd = try posix.socket(
-            address.getPosixFamily(),
-            posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
-            0,
-        );
+        const family: c_uint = @intCast(address.getPosixFamily());
+        const sock_type: c_uint = @intCast(@as(u32, posix.SOCK.STREAM | posix.SOCK.CLOEXEC));
+        const raw_fd = std.c.socket(family, sock_type, 0);
+        if (raw_fd < 0) return error.Unexpected;
+        const fd: posix.socket_t = @intCast(raw_fd);
         errdefer posix.close(fd);
 
         if (options.reuse_address) {
@@ -108,12 +108,12 @@ pub const Server = struct {
 
         if (address.family == .ipv4) {
             const sockaddr = address.toSockaddrIn();
-            try posix.bind(fd, @ptrCast(&sockaddr), @sizeOf(@TypeOf(sockaddr)));
+            if (std.c.bind(fd, @ptrCast(&sockaddr), @sizeOf(@TypeOf(sockaddr))) < 0) return error.Unexpected;
         } else {
             const sockaddr = address.toSockaddrIn6();
-            try posix.bind(fd, @ptrCast(&sockaddr), @sizeOf(@TypeOf(sockaddr)));
+            if (std.c.bind(fd, @ptrCast(&sockaddr), @sizeOf(@TypeOf(sockaddr))) < 0) return error.Unexpected;
         }
-        try posix.listen(fd, options.kernel_backlog);
+        if (std.c.listen(fd, options.kernel_backlog) < 0) return error.Unexpected;
 
         return .{ .fd = fd, .address = address };
     }
@@ -174,7 +174,9 @@ pub const Connection = struct {
     }
 
     pub fn write(self: Connection, data: []const u8) !usize {
-        return posix.write(self.fd, data);
+        const result = std.c.write(self.fd, data.ptr, data.len);
+        if (result < 0) return error.Unexpected;
+        return @intCast(result);
     }
 
     pub fn close(self: Connection) void {

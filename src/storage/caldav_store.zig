@@ -732,7 +732,8 @@ pub const CalDavStore = struct {
 
     fn generateUid(self: *Self) ![]const u8 {
         const timestamp = std.time.timestamp();
-        const random = std.crypto.random.int(u64);
+        var random: u64 = undefined;
+        std.c.arc4random_buf(std.mem.asBytes(&random), @sizeOf(u64));
         return try std.fmt.allocPrint(self.allocator, "{x}-{x}@localhost", .{ timestamp, random });
     }
 

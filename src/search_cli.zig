@@ -4,14 +4,19 @@
 const std = @import("std");
 const search = @import("api/search.zig");
 const database = @import("storage/database.zig");
+const env = @import("core/env.zig");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const io_compat = @import("core/io_compat.zig");
+    io_compat.initIo(init.io);
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const args = try init.minimal.args.toSlice(arena.allocator());
 
     if (args.len < 2) {
         try printUsage();
@@ -21,9 +26,7 @@ pub fn main() !void {
     const command = args[1];
 
     // Get database path from environment or use default
-    const db_path = std.process.getEnvVarOwned(allocator, "SMTP_DB_PATH") catch
-        try allocator.dupe(u8, "smtp.db");
-    defer allocator.free(db_path);
+    const db_path = env.get("SMTP_DB_PATH") orelse "smtp.db";
 
     var db = try database.Database.init(allocator, db_path);
     defer db.deinit();
@@ -126,7 +129,7 @@ fn printUsage() !void {
 fn searchCommand(
     engine: *search.MessageSearch,
     allocator: std.mem.Allocator,
-    args: [][:0]u8,
+    args: []const [:0]const u8,
 ) !void {
     if (args.len < 3) {
         std.debug.print("Error: Missing search query\n", .{});
@@ -215,7 +218,7 @@ fn searchCommand(
 fn senderCommand(
     engine: *search.MessageSearch,
     allocator: std.mem.Allocator,
-    args: [][:0]u8,
+    args: []const [:0]const u8,
 ) !void {
     if (args.len < 3) {
         std.debug.print("Error: Missing sender\n", .{});
@@ -257,7 +260,7 @@ fn senderCommand(
 fn subjectCommand(
     engine: *search.MessageSearch,
     allocator: std.mem.Allocator,
-    args: [][:0]u8,
+    args: []const [:0]const u8,
 ) !void {
     if (args.len < 3) {
         std.debug.print("Error: Missing subject\n", .{});
@@ -298,7 +301,7 @@ fn subjectCommand(
 fn dateRangeCommand(
     engine: *search.MessageSearch,
     allocator: std.mem.Allocator,
-    args: [][:0]u8,
+    args: []const [:0]const u8,
 ) !void {
     if (args.len < 4) {
         std.debug.print("Error: Missing date range\n", .{});

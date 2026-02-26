@@ -1235,7 +1235,7 @@ pub const APIServer = struct {
         if (user_exists) {
             // Generate secure token
             var random_bytes: [32]u8 = undefined;
-            std.crypto.random.bytes(&random_bytes);
+            std.c.arc4random_buf(&random_bytes, random_bytes.len);
 
             var token: [64]u8 = undefined;
             _ = std.fmt.bufPrint(&token, "{s}", .{std.fmt.fmtSliceHexLower(&random_bytes)}) catch unreachable;

@@ -617,8 +617,8 @@ pub const TracerProvider = struct {
         span.* = try SpanData.init(self.allocator, name);
 
         // Generate IDs
-        std.crypto.random.bytes(&span.trace_id);
-        std.crypto.random.bytes(&span.span_id);
+        std.c.arc4random_buf(&span.trace_id, span.trace_id.len);
+        std.c.arc4random_buf(&span.span_id, span.span_id.len);
 
         // Check sampling
         if (!self.sampling_config.shouldSample(span.trace_id)) {
@@ -637,7 +637,7 @@ pub const TracerProvider = struct {
 
         // Inherit trace ID from parent
         span.trace_id = parent.trace_id;
-        std.crypto.random.bytes(&span.span_id);
+        std.c.arc4random_buf(&span.span_id, span.span_id.len);
         span.parent_span_id = parent.span_id;
 
         return span;

@@ -1,13 +1,18 @@
 const std = @import("std");
 const gdpr = @import("features/gdpr.zig");
+const env = @import("core/env.zig");
+const io_compat = @import("core/io_compat.zig");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    io_compat.initIo(init.io);
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const args = try init.minimal.args.toSlice(arena.allocator());
 
     if (args.len < 2) {
         try printUsage();
@@ -17,9 +22,7 @@ pub fn main() !void {
     const command = args[1];
 
     // Get database path from environment or use default
-    const db_path = std.process.getEnvVarOwned(allocator, "SMTP_DB_PATH") catch
-        try allocator.dupe(u8, "smtp.db");
-    defer allocator.free(db_path);
+    const db_path = env.get("SMTP_DB_PATH") orelse "smtp.db";
 
     var manager = try gdpr.GDPRManager.init(allocator, db_path);
     defer manager.deinit();
@@ -65,7 +68,7 @@ fn printUsage() !void {
     , .{});
 }
 
-fn exportCommand(manager: *gdpr.GDPRManager, allocator: std.mem.Allocator, args: [][:0]u8) !void {
+fn exportCommand(manager: *gdpr.GDPRManager, allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     if (args.len < 3) {
         std.debug.print("Error: Missing username\n", .{});
         std.debug.print("Usage: gdpr-cli export <username> [output_file]\n", .{});
@@ -96,12 +99,13 @@ fn exportCommand(manager: *gdpr.GDPRManager, allocator: std.mem.Allocator, args:
 
     // Write to file or stdout
     if (output_file) |path| {
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+        const io = io_compat.getIo();
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
 
         const json_str = try export_data.toJSONString(allocator);
         defer allocator.free(json_str);
-        try file.writeAll(json_str);
+        try file.writeStreamingAll(io, json_str);
 
         std.debug.print("\nData exported to: {s}\n", .{path});
     } else {
@@ -114,7 +118,7 @@ fn exportCommand(manager: *gdpr.GDPRManager, allocator: std.mem.Allocator, args:
     std.debug.print("This export contains all personal data as required by GDPR Article 15.\n", .{});
 }
 
-fn deleteCommand(manager: *gdpr.GDPRManager, allocator: std.mem.Allocator, args: [][:0]u8) !void {
+fn deleteCommand(manager: *gdpr.GDPRManager, allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     _ = allocator;
 
     if (args.len < 3) {
@@ -142,7 +146,7 @@ fn deleteCommand(manager: *gdpr.GDPRManager, allocator: std.mem.Allocator, args:
     std.debug.print("All personal data has been permanently removed as required by GDPR Article 17.\n", .{});
 }
 
-fn logCommand(manager: *gdpr.GDPRManager, allocator: std.mem.Allocator, args: [][:0]u8) !void {
+fn logCommand(manager: *gdpr.GDPRManager, allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     _ = allocator;
 
     if (args.len < 5) {

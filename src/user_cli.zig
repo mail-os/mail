@@ -2,21 +2,26 @@ const std = @import("std");
 const database = @import("storage/database.zig");
 const password_mod = @import("auth/password.zig");
 const auth = @import("auth/auth.zig");
+const env = @import("core/env.zig");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    const io_compat = @import("core/io_compat.zig");
+    io_compat.initIo(init.io);
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const args = try init.minimal.args.toSlice(arena.allocator());
 
     if (args.len < 2) {
         try printUsage();
         return;
     }
 
-    const db_path = std.posix.getenv("SMTP_DB_PATH") orelse "./smtp.db";
+    const db_path = env.get("SMTP_DB_PATH") orelse "./smtp.db";
 
     var db = try database.Database.init(allocator, db_path);
     defer db.deinit();

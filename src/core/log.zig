@@ -105,9 +105,10 @@ pub const Logger = struct {
     const Self = @This();
 
     config: Config,
-    file: ?std.fs.File = null,
+    file: ?std.Io.File = null,
     mutex: std.Thread.Mutex = .{},
     allocator: ?Allocator = null,
+    file_offset: u64 = 0,
 
     // Context fields for structured logging
     context: struct {
@@ -123,7 +124,12 @@ pub const Logger = struct {
 
         if (config.output == .file) {
             if (config.file_path) |path| {
-                logger.file = std.fs.cwd().createFile(path, .{ .truncate = false }) catch null;
+                const io = io_compat.getIo();
+                const f = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false }) catch null;
+                logger.file = f;
+                if (f) |file| {
+                    logger.file_offset = file.length(io) catch 0;
+                }
             }
         }
 
@@ -132,7 +138,7 @@ pub const Logger = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.file) |f| {
-            f.close();
+            f.close(io_compat.getIo());
         }
     }
 
@@ -429,19 +435,20 @@ pub const Logger = struct {
     fn writeOutput(self: *Self, data: []const u8) void {
         switch (self.config.output) {
             .stderr => {
-                std.io.getStdErr().writeAll(data) catch {};
+                _ = std.c.write(2, data.ptr, data.len);
             },
             .stdout => {
-                std.io.getStdOut().writeAll(data) catch {};
+                _ = std.c.write(1, data.ptr, data.len);
             },
             .file => {
                 if (self.file) |f| {
-                    f.writeAll(data) catch {};
+                    f.writePositionalAll(io_compat.getIo(), data, self.file_offset) catch {};
+                    self.file_offset += data.len;
                 }
             },
             .syslog => {
                 // Syslog implementation would go here
-                std.io.getStdErr().writeAll(data) catch {};
+                _ = std.c.write(2, data.ptr, data.len);
             },
             .null => {},
         }

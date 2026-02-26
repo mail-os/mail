@@ -72,7 +72,7 @@ pub const NonceManager = struct {
     /// Generate a new nonce
     pub fn generateNonce(self: *NonceManager) ![]const u8 {
         var random_bytes: [16]u8 = undefined;
-        std.crypto.random.bytes(&random_bytes);
+        std.c.arc4random_buf(&random_bytes, random_bytes.len);
 
         const now = getCurrentTimestamp();
 
@@ -203,7 +203,7 @@ pub const AuthBackend = struct {
         }
 
         // Extract base64 part
-        const encoded = std.mem.trimLeft(u8, auth_header[6..], " ");
+        const encoded = std.mem.trimStart(u8, auth_header[6..], " ");
 
         // Decode credentials
         const creds = try decodeBasicAuthCredentials(self.allocator, encoded);
@@ -777,7 +777,7 @@ pub const PasswordResetManager = struct {
 
         // Generate secure token
         var token_bytes: [32]u8 = undefined;
-        std.crypto.random.bytes(&token_bytes);
+        std.c.arc4random_buf(&token_bytes, token_bytes.len);
 
         // Hash token for storage
         var token_hash: [32]u8 = undefined;

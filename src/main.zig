@@ -3,6 +3,7 @@ const smtp = @import("core/smtp.zig");
 const config = @import("core/config.zig");
 const logger = @import("core/logger.zig");
 const args_parser = @import("core/args.zig");
+const env = @import("core/env.zig");
 const database = @import("storage/database.zig");
 const auth = @import("auth/auth.zig");
 const greylist_mod = @import("antispam/greylist.zig");
@@ -42,13 +43,16 @@ fn reloadHandler(sig: std.posix.SIG) callconv(.c) void {
     reload_requested.store(true, .release);
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
+    // Store global IO for compat with 0.16-dev APIs
+    const io_compat = @import("core/io_compat.zig");
+    io_compat.initIo(init.io);
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     // Parse command-line arguments
-    var cli_args = args_parser.parseArgs(allocator) catch |err| {
+    var cli_args = args_parser.parseArgs(allocator, init.minimal.args) catch |err| {
         if (err != error.UnknownArgument) {
             args_parser.printHelp();
         }
@@ -136,7 +140,7 @@ pub fn main() !void {
     var auth_ptr: ?*auth.AuthBackend = null;
 
     if (cfg.enable_auth) {
-        const db_path = std.posix.getenv("SMTP_DB_PATH") orelse "./smtp.db";
+        const db_path = env.get("SMTP_DB_PATH") orelse "./smtp.db";
         log.info("Initializing database at: {s}", .{db_path});
 
         db = try database.Database.init(allocator, db_path);
@@ -167,13 +171,13 @@ pub fn main() !void {
 
     // Initialize metrics collection
     var smtp_metrics: ?metrics_mod.SmtpMetrics = null;
-    const statsd_host = std.posix.getenv("STATSD_HOST");
+    const statsd_host = env.get("STATSD_HOST");
     const statsd_port: u16 = blk: {
-        const port_str = std.posix.getenv("STATSD_PORT") orelse "8125";
+        const port_str = env.get("STATSD_PORT") orelse "8125";
         break :blk std.fmt.parseInt(u16, port_str, 10) catch 8125;
     };
 
-    if (statsd_host != null or std.posix.getenv("SMTP_METRICS_ENABLED") != null) {
+    if (statsd_host != null or env.get("SMTP_METRICS_ENABLED") != null) {
         smtp_metrics = try metrics_mod.SmtpMetrics.init(allocator, statsd_host, statsd_port, "smtp");
         log.info("Metrics collection enabled (StatsD: {s}:{d})", .{ statsd_host orelse "local-only", statsd_port });
     }
@@ -181,14 +185,14 @@ pub fn main() !void {
 
     // Initialize alerting
     var alert_manager: ?alerting.AlertManager = null;
-    if (std.posix.getenv("SMTP_ALERTING_ENABLED") != null) {
+    if (env.get("SMTP_ALERTING_ENABLED") != null) {
         alert_manager = alerting.AlertManager.init(allocator);
 
         // Configure Slack if webhook URL is provided
-        if (std.posix.getenv("SLACK_WEBHOOK_URL")) |webhook_url| {
+        if (env.get("SLACK_WEBHOOK_URL")) |webhook_url| {
             try alert_manager.?.addSlackChannel(.{
                 .webhook_url = webhook_url,
-                .channel = std.posix.getenv("SLACK_CHANNEL"),
+                .channel = env.get("SLACK_CHANNEL"),
             });
             log.info("Slack alerting enabled", .{});
         }
@@ -206,19 +210,19 @@ pub fn main() !void {
 
     // Initialize secret manager
     var secret_manager: ?secrets.SecretManager = null;
-    const secret_backend_str = std.posix.getenv("SECRET_BACKEND") orelse "environment";
+    const secret_backend_str = env.get("SECRET_BACKEND") orelse "environment";
     if (!std.mem.eql(u8, secret_backend_str, "none")) {
         secret_manager = secrets.SecretManager.init(allocator, .environment);
 
         if (std.mem.eql(u8, secret_backend_str, "kubernetes")) {
             secret_manager.?.configureKubernetes(.{
-                .secrets_path = std.posix.getenv("K8S_SECRETS_PATH") orelse "/var/run/secrets",
+                .secrets_path = env.get("K8S_SECRETS_PATH") orelse "/var/run/secrets",
             });
         } else if (std.mem.eql(u8, secret_backend_str, "vault")) {
-            if (std.posix.getenv("VAULT_ADDR")) |vault_addr| {
+            if (env.get("VAULT_ADDR")) |vault_addr| {
                 try secret_manager.?.configureVault(.{
                     .address = vault_addr,
-                    .token = std.posix.getenv("VAULT_TOKEN"),
+                    .token = env.get("VAULT_TOKEN"),
                 });
             }
         }
@@ -229,15 +233,15 @@ pub fn main() !void {
 
     // Initialize cluster mode if enabled
     var cluster_manager: ?*cluster.ClusterManager = null;
-    const enable_cluster = std.posix.getenv("SMTP_CLUSTER_ENABLED") != null;
+    const enable_cluster = env.get("SMTP_CLUSTER_ENABLED") != null;
 
     if (enable_cluster) {
-        const node_id = std.posix.getenv("SMTP_NODE_ID") orelse "node-1";
+        const node_id = env.get("SMTP_NODE_ID") orelse "node-1";
         const cluster_port: u16 = blk: {
-            const port_str = std.posix.getenv("SMTP_CLUSTER_PORT") orelse "9000";
+            const port_str = env.get("SMTP_CLUSTER_PORT") orelse "9000";
             break :blk std.fmt.parseInt(u16, port_str, 10) catch 9000;
         };
-        const enable_raft = std.posix.getenv("SMTP_RAFT_DISABLED") == null;
+        const enable_raft = env.get("SMTP_RAFT_DISABLED") == null;
 
         const cluster_config = cluster.ClusterConfig{
             .node_id = node_id,
@@ -261,7 +265,7 @@ pub fn main() !void {
     // Initialize multi-tenancy if enabled
     // Note: MultiTenancyManager requires a TenantDB - disabled for now
     const tenant_manager: ?*multitenancy.MultiTenancyManager = null;
-    if (std.posix.getenv("SMTP_MULTITENANCY_ENABLED") != null) {
+    if (env.get("SMTP_MULTITENANCY_ENABLED") != null) {
         log.info("Multi-tenancy requested but not yet configured", .{});
     }
     // tenant_manager is used in logging below
@@ -273,9 +277,9 @@ pub fn main() !void {
     // Initialize IMAP server if auth is enabled
     var imap_server: ?imap.ImapServer = null;
     var imap_thread: ?std.Thread = null;
-    const enable_imap = std.posix.getenv("IMAP_ENABLED") != null or cfg.enable_auth;
+    const enable_imap = env.get("IMAP_ENABLED") != null or cfg.enable_auth;
     const imap_port: u16 = blk: {
-        const port_str = std.posix.getenv("IMAP_PORT") orelse "143";
+        const port_str = env.get("IMAP_PORT") orelse "143";
         break :blk std.fmt.parseInt(u16, port_str, 10) catch 143;
     };
 
@@ -299,13 +303,13 @@ pub fn main() !void {
     // Initialize CalDAV/CardDAV server if auth is enabled
     var caldav_server: ?caldav.CalDavServer = null;
     var caldav_thread: ?std.Thread = null;
-    const enable_caldav = std.posix.getenv("CALDAV_ENABLED") != null or cfg.enable_auth;
+    const enable_caldav = env.get("CALDAV_ENABLED") != null or cfg.enable_auth;
     const caldav_port: u16 = blk: {
-        const port_str = std.posix.getenv("CALDAV_PORT") orelse "80";
+        const port_str = env.get("CALDAV_PORT") orelse "80";
         break :blk std.fmt.parseInt(u16, port_str, 10) catch 80;
     };
     const caldav_ssl_port: u16 = blk: {
-        const port_str = std.posix.getenv("CALDAV_SSL_PORT") orelse "443";
+        const port_str = env.get("CALDAV_SSL_PORT") orelse "443";
         break :blk std.fmt.parseInt(u16, port_str, 10) catch 443;
     };
 

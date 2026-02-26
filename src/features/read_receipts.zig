@@ -188,7 +188,7 @@ pub const ReadReceiptManager = struct {
         recipient: []const u8,
     ) ![]const u8 {
         var rand_bytes: [8]u8 = undefined;
-        std.crypto.random.bytes(&rand_bytes);
+        std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
         const timestamp = std.time.timestamp();
 
         const id = try std.fmt.allocPrint(self.allocator, "rcpt_{x}_{x}", .{
@@ -225,7 +225,7 @@ pub const ReadReceiptManager = struct {
         recipient: []const u8,
     ) ![]const u8 {
         var rand_bytes: [8]u8 = undefined;
-        std.crypto.random.bytes(&rand_bytes);
+        std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
         const timestamp = std.time.timestamp();
 
         const id = try std.fmt.allocPrint(self.allocator, "in_rcpt_{x}_{x}", .{

@@ -602,7 +602,7 @@ pub const DKIMKeyManager = struct {
 
     fn generateKeyId(self: *DKIMKeyManager) ![]u8 {
         var buf: [16]u8 = undefined;
-        std.crypto.random.bytes(&buf);
+        std.c.arc4random_buf(&buf, buf.len);
         return std.fmt.allocPrint(self.allocator, "dkim_{s}", .{
             std.fmt.fmtSliceHexLower(&buf),
         });
@@ -621,7 +621,7 @@ pub const DKIMKeyManager = struct {
         // Generate cryptographic key material
         // In production, this would use actual RSA/Ed25519 key generation
         var random_bytes: [64]u8 = undefined;
-        std.crypto.random.bytes(&random_bytes);
+        std.c.arc4random_buf(&random_bytes, random_bytes.len);
 
         const public_key = try std.fmt.allocPrint(self.allocator,
             "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA{s}",

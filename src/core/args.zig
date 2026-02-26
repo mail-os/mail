@@ -22,12 +22,9 @@ pub const Args = struct {
     }
 };
 
-pub fn parseArgs(allocator: std.mem.Allocator) !Args {
+pub fn parseArgs(allocator: std.mem.Allocator, process_args: std.process.Args) !Args {
     var args = Args{};
-    var arg_it = std.process.args(allocator) catch |err| {
-        std.debug.print("Failed to get command-line arguments: {}\n", .{err});
-        return err;
-    };
+    var arg_it = try process_args.iterateAllocator(allocator);
     defer arg_it.deinit();
 
     // Skip program name

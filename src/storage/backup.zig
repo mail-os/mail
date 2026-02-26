@@ -395,7 +395,7 @@ pub const BackupManager = struct {
         // Would calculate SHA-256 of all files
         // For now, return placeholder
         var checksum: [32]u8 = undefined;
-        std.crypto.random.bytes(&checksum);
+        std.c.arc4random_buf(&checksum, checksum.len);
         return checksum;
     }
 
@@ -623,7 +623,7 @@ pub const BackupKeyManager = struct {
     /// Generate a new encryption key
     pub fn generateKey(self: *BackupKeyManager, key_id: []const u8) ![32]u8 {
         var key: [32]u8 = undefined;
-        std.crypto.random.bytes(&key);
+        std.c.arc4random_buf(&key, key.len);
 
         // Store key info (not the actual key)
         var key_hash: [32]u8 = undefined;

@@ -1,6 +1,7 @@
 const std = @import("std");
 const time_compat = @import("../core/time_compat.zig");
 const logger = @import("../core/logger.zig");
+const env = @import("../core/env.zig");
 
 // =============================================================================
 // Secret Management - Multi-Backend Secret Storage
@@ -145,7 +146,7 @@ const logger = @import("../core/logger.zig");
 // try secrets.configureVault(.{
 //     .address = "https://vault.example.com:8200",
 //     .role_id = "db-app-role",
-//     .secret_id = std.posix.getenv("VAULT_SECRET_ID"),
+//     .secret_id = env.get("VAULT_SECRET_ID"),
 //     .mount_path = "secret",
 // });
 // ```
@@ -490,7 +491,7 @@ pub const SecretManager = struct {
             };
         }
 
-        const value = std.posix.getenv(env_name) orelse return error.SecretNotFound;
+        const value = env.get(env_name) orelse return error.SecretNotFound;
         return try self.allocator.dupe(u8, value);
     }
 

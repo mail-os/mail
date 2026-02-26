@@ -1,5 +1,6 @@
 const std = @import("std");
 const time_compat = @import("time_compat.zig");
+const io_compat = @import("io_compat.zig");
 const socket = @import("socket_compat.zig");
 const config = @import("config.zig");
 const auth = @import("../auth/auth.zig");
@@ -956,21 +957,26 @@ pub const Session = struct {
         var cert_path_buf: [std.fs.max_path_bytes]u8 = undefined;
         var key_path_buf: [std.fs.max_path_bytes]u8 = undefined;
 
+        const io = io_compat.getIo();
         const abs_cert_path = if (std.fs.path.isAbsolute(cert_path))
             cert_path
-        else
-            std.fs.cwd().realpath(cert_path, &cert_path_buf) catch {
+        else blk: {
+            const len = std.Io.Dir.cwd().realPathFile(io, cert_path, &cert_path_buf) catch {
                 self.logger.err("Failed to resolve cert path: {s}", .{cert_path});
                 return error.InvalidCertificate;
             };
+            break :blk cert_path_buf[0..len];
+        };
 
         const abs_key_path = if (std.fs.path.isAbsolute(key_path))
             key_path
-        else
-            std.fs.cwd().realpath(key_path, &key_path_buf) catch {
+        else blk: {
+            const len = std.Io.Dir.cwd().realPathFile(io, key_path, &key_path_buf) catch {
                 self.logger.err("Failed to resolve key path: {s}", .{key_path});
                 return error.InvalidCertificate;
             };
+            break :blk key_path_buf[0..len];
+        };
 
         var cert_key = tls.config.CertKeyPair.fromFilePathAbsoluteSync(
             self.allocator,
@@ -1075,17 +1081,12 @@ pub const Session = struct {
     }
 
     fn saveMessage(self: *Session, data: []const u8) !void {
-        // Create a maildir-style directory structure
-        const cwd = std.fs.cwd();
+        const io = io_compat.getIo();
+        const cwd = std.Io.Dir.cwd();
 
         // Ensure mail directory exists
-        cwd.makeDir("mail") catch |err| {
-            if (err != error.PathAlreadyExists) return err;
-        };
-
-        cwd.makeDir("mail/new") catch |err| {
-            if (err != error.PathAlreadyExists) return err;
-        };
+        cwd.createDir(io, "mail", .default_dir) catch {};
+        cwd.createDir(io, "mail/new", .default_dir) catch {};
 
         // Generate unique filename based on timestamp
         const timestamp = time_compat.milliTimestamp();
@@ -1093,26 +1094,26 @@ pub const Session = struct {
         defer self.allocator.free(filename);
 
         // Write message to file
-        const file = try cwd.createFile(filename, .{});
-        defer file.close();
+        const file = try cwd.createFile(io, filename, .{});
+        defer file.close(io);
 
         var header_buf: [256]u8 = undefined;
 
         // Write headers
         const from_line = try std.fmt.bufPrint(&header_buf, "From: {s}\r\n", .{self.mail_from orelse "unknown"});
-        _ = try file.write(from_line);
+        try file.writeStreamingAll(io, from_line);
 
         for (self.rcpt_to.items) |rcpt| {
             const to_line = try std.fmt.bufPrint(&header_buf, "To: {s}\r\n", .{rcpt});
-            _ = try file.write(to_line);
+            try file.writeStreamingAll(io, to_line);
         }
 
         const date_line = try std.fmt.bufPrint(&header_buf, "Date: {d}\r\n", .{timestamp});
-        _ = try file.write(date_line);
-        _ = try file.write("\r\n");
+        try file.writeStreamingAll(io, date_line);
+        try file.writeStreamingAll(io, "\r\n");
 
         // Write message body
-        _ = try file.write(data);
+        try file.writeStreamingAll(io, data);
 
         self.logger.debug("Message saved to {s}", .{filename});
     }

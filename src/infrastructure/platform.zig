@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const env = @import("../core/env.zig");
 
 /// Platform abstraction layer for cross-platform support
 /// Provides unified interface for platform-specific operations
@@ -121,29 +122,29 @@ pub const Path = struct {
     pub fn homeDir(allocator: std.mem.Allocator) ![]const u8 {
         if (Platform.current() == .windows) {
             // Windows: USERPROFILE or HOMEDRIVE+HOMEPATH
-            return std.process.getEnvVarOwned(allocator, "USERPROFILE") catch {
-                const drive = try std.process.getEnvVarOwned(allocator, "HOMEDRIVE");
+            return env.getOwned(allocator, "USERPROFILE") catch {
+                const drive = try env.getOwned(allocator, "HOMEDRIVE");
                 defer allocator.free(drive);
-                const path = try std.process.getEnvVarOwned(allocator, "HOMEPATH");
+                const path = try env.getOwned(allocator, "HOMEPATH");
                 defer allocator.free(path);
                 return try std.fmt.allocPrint(allocator, "{s}{s}", .{ drive, path });
             };
         } else {
             // Unix: HOME
-            return std.process.getEnvVarOwned(allocator, "HOME");
+            return env.getOwned(allocator, "HOME");
         }
     }
 
     /// Get temp directory
     pub fn tempDir(allocator: std.mem.Allocator) ![]const u8 {
         if (Platform.current() == .windows) {
-            return std.process.getEnvVarOwned(allocator, "TEMP") catch {
-                return std.process.getEnvVarOwned(allocator, "TMP") catch {
+            return env.getOwned(allocator, "TEMP") catch {
+                return env.getOwned(allocator, "TMP") catch {
                     return allocator.dupe(u8, "C:\\Windows\\Temp");
                 };
             };
         } else {
-            return std.process.getEnvVarOwned(allocator, "TMPDIR") catch {
+            return env.getOwned(allocator, "TMPDIR") catch {
                 return allocator.dupe(u8, "/tmp");
             };
         }

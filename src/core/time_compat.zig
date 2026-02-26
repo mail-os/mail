@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("io_compat.zig");
 
 /// Get current Unix timestamp in seconds (Zig 0.16 compatible)
 pub fn timestamp() i64 {
@@ -20,16 +21,18 @@ pub fn nanoTimestamp() i128 {
 
 /// Read entire file content into memory (Zig 0.16 compatible)
 /// Replaces file.readToEndAlloc() which was removed
-pub fn readFileToEnd(allocator: std.mem.Allocator, file: std.fs.File, max_size: usize) ![]u8 {
-    const stat = try file.stat();
-    const size: usize = @intCast(@min(stat.size, max_size));
+pub fn readFileToEnd(allocator: std.mem.Allocator, file: std.Io.File, max_size: usize) ![]u8 {
+    const io = io_compat.getIo();
+    const file_len = file.length(io) catch 0;
+    const size: usize = @intCast(@min(file_len, max_size));
     if (size == 0) {
         // For files with unknown size (like /dev/stdin), read in chunks
         var list = std.ArrayListUnmanaged(u8){};
         errdefer list.deinit(allocator);
         var buf: [4096]u8 = undefined;
+        var iov = [_][]u8{buf[0..]};
         while (true) {
-            const n = try file.read(&buf);
+            const n = file.readStreaming(io, &iov) catch break;
             if (n == 0) break;
             try list.appendSlice(allocator, buf[0..n]);
             if (list.items.len >= max_size) break;
@@ -39,13 +42,7 @@ pub fn readFileToEnd(allocator: std.mem.Allocator, file: std.fs.File, max_size: 
     const data = try allocator.alloc(u8, size);
     errdefer allocator.free(data);
 
-    // Read all data using a loop
-    var total_read: usize = 0;
-    while (total_read < size) {
-        const n = try file.read(data[total_read..]);
-        if (n == 0) break;
-        total_read += n;
-    }
+    const total_read = try file.readPositionalAll(io, data, 0);
 
     if (total_read != size) {
         allocator.free(data);
@@ -58,7 +55,11 @@ pub fn readFileToEnd(allocator: std.mem.Allocator, file: std.fs.File, max_size: 
 pub fn sleep(nanoseconds: u64) void {
     const secs = nanoseconds / std.time.ns_per_s;
     const nsecs = nanoseconds % std.time.ns_per_s;
-    std.posix.nanosleep(secs, nsecs);
+    var ts = std.c.timespec{
+        .sec = @intCast(secs),
+        .nsec = @intCast(nsecs),
+    };
+    _ = std.c.nanosleep(&ts, &ts);
 }
 
 /// Sleep for the specified number of milliseconds

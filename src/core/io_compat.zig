@@ -1,6 +1,19 @@
 // Compatibility layer for Zig 0.16+ io changes
 const std = @import("std");
 
+// Global Io instance — set once from main(), used by compat wrappers.
+var global_io: std.Io = undefined;
+var io_initialized: bool = false;
+
+pub fn initIo(io: std.Io) void {
+    global_io = io;
+    io_initialized = true;
+}
+
+pub fn getIo() std.Io {
+    return global_io;
+}
+
 /// A simple fixed buffer stream that works like the old std.io.FixedBufferStream
 pub const FixedBufferStream = struct {
     buffer: []u8,

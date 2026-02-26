@@ -69,10 +69,12 @@ pub fn sendWebhook(allocator: std.mem.Allocator, cfg: WebhookConfig, payload: We
     };
 
     // Create socket
-    const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0) catch |err| {
-        log.err("Failed to create socket: {}", .{err});
+    const raw_fd = std.c.socket(@intCast(@as(u32, posix.AF.INET)), @intCast(@as(u32, posix.SOCK.STREAM)), 0);
+    if (raw_fd < 0) {
+        log.err("Failed to create socket", .{});
         return;
-    };
+    }
+    const fd: posix.socket_t = @intCast(raw_fd);
     defer posix.close(fd);
 
     // Connect
@@ -82,10 +84,10 @@ pub fn sendWebhook(allocator: std.mem.Allocator, cfg: WebhookConfig, payload: We
         .addr = std.mem.bytesToValue(u32, &ip),
     };
 
-    posix.connect(fd, @ptrCast(&sockaddr), @sizeOf(posix.sockaddr.in)) catch |err| {
-        log.err("Failed to connect to webhook: {s}:{d} - {}", .{ host_str, port, err });
+    if (std.c.connect(fd, @ptrCast(&sockaddr), @sizeOf(posix.sockaddr.in)) < 0) {
+        log.err("Failed to connect to webhook: {s}:{d}", .{ host_str, port });
         return;
-    };
+    }
 
     // Build HTTP request
     const request = try std.fmt.allocPrint(allocator, "POST {s} HTTP/1.1\r\n" ++
@@ -99,20 +101,21 @@ pub fn sendWebhook(allocator: std.mem.Allocator, cfg: WebhookConfig, payload: We
     defer allocator.free(request);
 
     // Send request
-    _ = posix.write(fd, request) catch |err| {
-        log.err("Failed to send webhook request: {}", .{err});
+    if (std.c.write(fd, request.ptr, request.len) < 0) {
+        log.err("Failed to send webhook request", .{});
         return;
-    };
+    }
 
     // Read response
     var response_buf: [1024]u8 = undefined;
-    const bytes_read = posix.read(fd, &response_buf) catch |err| {
-        log.warn("Failed to read webhook response: {}", .{err});
+    const bytes_read = std.c.read(fd, &response_buf, response_buf.len);
+    if (bytes_read < 0) {
+        log.warn("Failed to read webhook response", .{});
         return;
-    };
+    }
 
     if (bytes_read > 0) {
-        const response = response_buf[0..bytes_read];
+        const response = response_buf[0..@intCast(bytes_read)];
         if (std.mem.indexOf(u8, response, "HTTP/1") != null) {
             if (std.mem.indexOf(u8, response, " 2") != null) {
                 log.info("Webhook delivered successfully to {s}", .{url});

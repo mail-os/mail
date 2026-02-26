@@ -146,7 +146,7 @@ pub const MessageSubmissionAgent = struct {
     /// Generate Message-ID header
     fn generateMessageID(self: *Self) ![]const u8 {
         var random_bytes: [16]u8 = undefined;
-        std.crypto.random.bytes(&random_bytes);
+        std.c.arc4random_buf(&random_bytes, random_bytes.len);
 
         const timestamp = time_compat.timestamp();
 
@@ -199,7 +199,7 @@ pub const MessageSubmissionAgent = struct {
     /// Generate unique ID for Received header
     fn generateID(self: *Self) ![]const u8 {
         var random_bytes: [8]u8 = undefined;
-        std.crypto.random.bytes(&random_bytes);
+        std.c.arc4random_buf(&random_bytes, random_bytes.len);
 
         return try std.fmt.allocPrint(
             self.allocator,
@@ -270,7 +270,7 @@ pub const MessageSubmissionAgent = struct {
         var current_header: ?Header = null;
 
         while (lines.next()) |line| {
-            const trimmed = std.mem.trimRight(u8, line, "\r");
+            const trimmed = std.mem.trimEnd(u8, line, "\r");
 
             if (trimmed.len == 0) continue;
 

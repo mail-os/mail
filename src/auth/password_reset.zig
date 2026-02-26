@@ -79,7 +79,7 @@ pub const PasswordResetManager = struct {
         var random_bytes: [TOKEN_BYTES]u8 = undefined;
 
         // Use cryptographically secure random
-        std.crypto.random.bytes(&random_bytes);
+        std.c.arc4random_buf(&random_bytes, random_bytes.len);
 
         // Convert to hex string
         var hex_token: [TOKEN_BYTES * 2]u8 = undefined;

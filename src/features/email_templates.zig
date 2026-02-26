@@ -207,7 +207,7 @@ pub const TemplateManager = struct {
 
         // Generate ID
         var rand_bytes: [8]u8 = undefined;
-        std.crypto.random.bytes(&rand_bytes);
+        std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
         const timestamp = std.time.timestamp();
 
         const id = try std.fmt.allocPrint(self.allocator, "tmpl_{x}_{x}", .{

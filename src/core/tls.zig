@@ -1,5 +1,6 @@
 const std = @import("std");
 const time_compat = @import("time_compat.zig");
+const io_compat = @import("io_compat.zig");
 const net = std.Io.net;
 const logger = @import("logger.zig");
 const tls = @import("tls");
@@ -345,11 +346,12 @@ pub const TlsContext = struct {
         if (self.config.cert_path) |cert_path| {
             self.logger.info("Loading TLS certificate from: {s}", .{cert_path});
 
-            const cert_file = std.fs.cwd().openFile(cert_path, .{}) catch |err| {
+            const io = io_compat.getIo();
+            const cert_file = std.Io.Dir.cwd().openFile(io, cert_path, .{}) catch |err| {
                 self.logger.err("Failed to open certificate file: {s} - {}", .{ cert_path, err });
                 return error.CertificateLoadFailed;
             };
-            defer cert_file.close();
+            defer cert_file.close(io);
 
             const cert_data = try time_compat.readFileToEnd(self.allocator, cert_file, 1024 * 1024); // Max 1MB
             self.cert_data = cert_data;
@@ -360,11 +362,12 @@ pub const TlsContext = struct {
         if (self.config.key_path) |key_path| {
             self.logger.info("Loading TLS private key from: {s}", .{key_path});
 
-            const key_file = std.fs.cwd().openFile(key_path, .{}) catch |err| {
+            const io = io_compat.getIo();
+            const key_file = std.Io.Dir.cwd().openFile(io, key_path, .{}) catch |err| {
                 self.logger.err("Failed to open key file: {s} - {}", .{ key_path, err });
                 return error.KeyLoadFailed;
             };
-            defer key_file.close();
+            defer key_file.close(io);
 
             const key_data = try time_compat.readFileToEnd(self.allocator, key_file, 1024 * 1024); // Max 1MB
             self.key_data = key_data;
@@ -467,18 +470,24 @@ pub const TlsContext = struct {
         var cert_path_buf: [std.fs.max_path_bytes]u8 = undefined;
         var key_path_buf: [std.fs.max_path_bytes]u8 = undefined;
 
+        const io = io_compat.getIo();
         const abs_cert_path = if (std.fs.path.isAbsolute(cert_path))
             cert_path
-        else
-            try std.fs.cwd().realpath(cert_path, &cert_path_buf);
+        else blk: {
+            const len = try std.Io.Dir.cwd().realPathFile(io, cert_path, &cert_path_buf);
+            break :blk cert_path_buf[0..len];
+        };
 
         const abs_key_path = if (std.fs.path.isAbsolute(key_path))
             key_path
-        else
-            try std.fs.cwd().realpath(key_path, &key_path_buf);
+        else blk: {
+            const len = try std.Io.Dir.cwd().realPathFile(io, key_path, &key_path_buf);
+            break :blk key_path_buf[0..len];
+        };
 
-        const cert_key = tls.config.CertKeyPair.fromFilePathAbsoluteSync(
+        const cert_key = tls.config.CertKeyPair.fromFilePathAbsolute(
             self.allocator,
+            io,
             abs_cert_path,
             abs_key_path,
         ) catch |err| {
@@ -841,7 +850,7 @@ test "session cache" {
     defer cache.deinit();
 
     var nonce: [12]u8 = undefined;
-    std.crypto.random.bytes(&nonce);
+    std.c.arc4random_buf(&nonce, nonce.len);
 
     const ticket_data = "test-ticket-data";
     const ticket = SessionTicket{
@@ -1390,7 +1399,7 @@ pub const ServerHelloBuilder = struct {
 
         // Server random (32 bytes)
         var random: [32]u8 = undefined;
-        std.crypto.random.bytes(&random);
+        std.c.arc4random_buf(&random, random.len);
         try output.appendSlice(&random);
 
         // Session ID length and data
