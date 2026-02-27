@@ -74,6 +74,11 @@ pub fn fixedBufferStream(buffer: []u8) FixedBufferStream {
     return FixedBufferStream.init(buffer);
 }
 
+/// Fill buffer with cryptographically secure random bytes (cross-platform)
+pub fn randomBytes(buf: []u8) void {
+    global_io.random(buf);
+}
+
 /// Get current timestamp in nanoseconds (compatibility for std.time.nanoTimestamp)
 pub fn nanoTimestamp() i128 {
     return std.time.Instant.now().timestamp;

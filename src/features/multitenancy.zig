@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
@@ -331,7 +332,7 @@ pub const MultiTenancyManager = struct {
     /// Generate unique tenant ID
     fn generateTenantId(self: *MultiTenancyManager) ![]const u8 {
         var buf: [16]u8 = undefined;
-        std.c.arc4random_buf(&buf, buf.len);
+        io_compat.randomBytes(&buf);
 
         const id = try std.fmt.allocPrint(
             self.allocator,

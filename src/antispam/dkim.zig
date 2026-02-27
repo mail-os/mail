@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 
 /// DKIM validation result
 pub const DKIMResult = enum {
@@ -602,7 +603,7 @@ pub const DKIMKeyManager = struct {
 
     fn generateKeyId(self: *DKIMKeyManager) ![]u8 {
         var buf: [16]u8 = undefined;
-        std.c.arc4random_buf(&buf, buf.len);
+        io_compat.randomBytes(&buf);
         const hex = std.fmt.bytesToHex(buf, .lower);
         return std.fmt.allocPrint(self.allocator, "dkim_{s}", .{
             &hex,
@@ -622,7 +623,7 @@ pub const DKIMKeyManager = struct {
         // Generate cryptographic key material
         // In production, this would use actual RSA/Ed25519 key generation
         var random_bytes: [64]u8 = undefined;
-        std.c.arc4random_buf(&random_bytes, random_bytes.len);
+        io_compat.randomBytes(&random_bytes);
 
         const pub_hex = std.fmt.bytesToHex(random_bytes[0..32].*, .lower);
         const public_key = try std.fmt.allocPrint(self.allocator, "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA{s}", .{&pub_hex});

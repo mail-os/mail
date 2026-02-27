@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const path_sanitizer = @import("../core/path_sanitizer.zig");
@@ -396,7 +397,7 @@ pub const BackupManager = struct {
         // Would calculate SHA-256 of all files
         // For now, return placeholder
         var checksum: [32]u8 = undefined;
-        std.c.arc4random_buf(&checksum, checksum.len);
+        io_compat.randomBytes(&checksum);
         return checksum;
     }
 
@@ -624,7 +625,7 @@ pub const BackupKeyManager = struct {
     /// Generate a new encryption key
     pub fn generateKey(self: *BackupKeyManager, key_id: []const u8) ![32]u8 {
         var key: [32]u8 = undefined;
-        std.c.arc4random_buf(&key, key.len);
+        io_compat.randomBytes(&key);
 
         // Store key info (not the actual key)
         var key_hash: [32]u8 = undefined;

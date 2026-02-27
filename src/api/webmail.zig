@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 const version_info = @import("../core/version.zig");
 const attachment_storage = @import("../storage/attachment_storage.zig");
 const email_threads = @import("../features/email_threads.zig");
@@ -1028,7 +1029,7 @@ pub const WebmailHandler = struct {
         // Fallback if storage not initialized
         const timestamp = std.time.timestamp();
         var rand_bytes: [8]u8 = undefined;
-        std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
+        io_compat.randomBytes(&rand_bytes);
 
         var id_buf: [32]u8 = undefined;
         const id = std.fmt.bufPrint(&id_buf, "att_{x}_{x}", .{

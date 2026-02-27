@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const net = std.net;
@@ -749,7 +750,7 @@ test "WebSocket accept key generation" {
 
     // Generate random WebSocket key for testing
     var key_buf: [16]u8 = undefined;
-    std.c.arc4random_buf(&key_buf, key_buf.len);
+    io_compat.randomBytes(&key_buf);
 
     const encoder = std.base64.standard.Encoder;
     var encoded_key: [encoder.calcSize(key_buf.len)]u8 = undefined;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 
 // =============================================================================
 // Email Signature Management
@@ -177,7 +178,7 @@ pub const SignatureManager = struct {
 
         // Generate ID
         var rand_bytes: [8]u8 = undefined;
-        std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
+        io_compat.randomBytes(&rand_bytes);
         const timestamp = std.time.timestamp();
 
         const id = try std.fmt.allocPrint(self.allocator, "sig_{x}_{x}", .{

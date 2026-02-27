@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 
 // =============================================================================
 // Contact Groups / Distribution Lists
@@ -154,7 +155,7 @@ pub const ContactGroup = struct {
         }
 
         var rand_bytes: [4]u8 = undefined;
-        std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
+        io_compat.randomBytes(&rand_bytes);
 
         const member = GroupMember{
             .id = try std.fmt.allocPrint(self.allocator, "mem_{x}", .{std.mem.readInt(u32, &rand_bytes, .big)}),
@@ -186,7 +187,7 @@ pub const ContactGroup = struct {
         }
 
         var rand_bytes: [4]u8 = undefined;
-        std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
+        io_compat.randomBytes(&rand_bytes);
 
         const member = GroupMember{
             .id = try std.fmt.allocPrint(self.allocator, "mem_{x}", .{std.mem.readInt(u32, &rand_bytes, .big)}),
@@ -319,7 +320,7 @@ pub const ContactGroupManager = struct {
         }
 
         var rand_bytes: [8]u8 = undefined;
-        std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
+        io_compat.randomBytes(&rand_bytes);
         const timestamp = std.time.timestamp();
 
         const id = try std.fmt.allocPrint(self.allocator, "grp_{x}_{x}", .{

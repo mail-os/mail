@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 
 // =============================================================================
 // Read Receipts / Message Disposition Notifications (MDN)
@@ -188,7 +189,7 @@ pub const ReadReceiptManager = struct {
         recipient: []const u8,
     ) ![]const u8 {
         var rand_bytes: [8]u8 = undefined;
-        std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
+        io_compat.randomBytes(&rand_bytes);
         const timestamp = std.time.timestamp();
 
         const id = try std.fmt.allocPrint(self.allocator, "rcpt_{x}_{x}", .{
@@ -225,7 +226,7 @@ pub const ReadReceiptManager = struct {
         recipient: []const u8,
     ) ![]const u8 {
         var rand_bytes: [8]u8 = undefined;
-        std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
+        io_compat.randomBytes(&rand_bytes);
         const timestamp = std.time.timestamp();
 
         const id = try std.fmt.allocPrint(self.allocator, "in_rcpt_{x}_{x}", .{

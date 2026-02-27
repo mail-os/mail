@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
@@ -79,7 +80,7 @@ pub const PasswordResetManager = struct {
         var random_bytes: [TOKEN_BYTES]u8 = undefined;
 
         // Use cryptographically secure random
-        std.c.arc4random_buf(&random_bytes, random_bytes.len);
+        io_compat.randomBytes(&random_bytes);
 
         // Convert to hex string
         var hex_token: [TOKEN_BYTES * 2]u8 = undefined;

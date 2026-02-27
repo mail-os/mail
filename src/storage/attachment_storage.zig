@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 const mutex_compat = @import("../core/mutex_compat.zig");
 const fs = std.fs;
 const crypto = std.crypto;
@@ -380,7 +381,7 @@ pub const AttachmentStorage = struct {
     fn generateId(self: *Self) ![]u8 {
         const timestamp = std.time.timestamp();
         var rand_bytes: [8]u8 = undefined;
-        std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
+        io_compat.randomBytes(&rand_bytes);
 
         return std.fmt.allocPrint(self.allocator, "att_{x}_{x}", .{
             @as(u64, @intCast(timestamp)),

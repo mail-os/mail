@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 const mutex_compat = @import("../core/mutex_compat.zig");
 const tracing = @import("tracing.zig");
 const logger = @import("../core/logger.zig");
@@ -617,8 +618,8 @@ pub const TracerProvider = struct {
         span.* = try SpanData.init(self.allocator, name);
 
         // Generate IDs
-        std.c.arc4random_buf(&span.trace_id, span.trace_id.len);
-        std.c.arc4random_buf(&span.span_id, span.span_id.len);
+        io_compat.randomBytes(&span.trace_id);
+        io_compat.randomBytes(&span.span_id);
 
         // Check sampling
         if (!self.sampling_config.shouldSample(span.trace_id)) {
@@ -637,7 +638,7 @@ pub const TracerProvider = struct {
 
         // Inherit trace ID from parent
         span.trace_id = parent.trace_id;
-        std.c.arc4random_buf(&span.span_id, span.span_id.len);
+        io_compat.randomBytes(&span.span_id);
         span.parent_span_id = parent.span_id;
 
         return span;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 const posix = std.posix;
 const database = @import("../storage/database.zig");
 const password_mod = @import("password.zig");
@@ -74,7 +75,7 @@ pub const NonceManager = struct {
     /// Generate a new nonce
     pub fn generateNonce(self: *NonceManager) ![]const u8 {
         var random_bytes: [16]u8 = undefined;
-        std.c.arc4random_buf(&random_bytes, random_bytes.len);
+        io_compat.randomBytes(&random_bytes);
 
         const now = getCurrentTimestamp();
 
@@ -779,7 +780,7 @@ pub const PasswordResetManager = struct {
 
         // Generate secure token
         var token_bytes: [32]u8 = undefined;
-        std.c.arc4random_buf(&token_bytes, token_bytes.len);
+        io_compat.randomBytes(&token_bytes);
 
         // Hash token for storage
         var token_hash: [32]u8 = undefined;

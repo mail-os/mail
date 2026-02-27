@@ -18,7 +18,7 @@ pub const PasswordHasher = struct {
     pub fn hashPassword(self: *PasswordHasher, password: []const u8) ![]u8 {
         // Generate random salt
         var salt: [salt_len]u8 = undefined;
-        std.c.arc4random_buf(&salt, salt.len);
+        io_compat.randomBytes(&salt);
 
         // Hash the password with Argon2id
         var hash: [hash_len]u8 = undefined;

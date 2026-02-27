@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 const logger = @import("../core/logger.zig");
 
 /// OpenTelemetry trace context
@@ -14,8 +15,8 @@ pub const TraceContext = struct {
         var span_id: [8]u8 = undefined;
 
         // Generate random trace and span IDs
-        std.c.arc4random_buf(&trace_id, trace_id.len);
-        std.c.arc4random_buf(&span_id, span_id.len);
+        io_compat.randomBytes(&trace_id);
+        io_compat.randomBytes(&span_id);
 
         return .{
             .trace_id = trace_id,
@@ -28,7 +29,7 @@ pub const TraceContext = struct {
 
     pub fn initWithParent(allocator: std.mem.Allocator, parent: *const TraceContext) !TraceContext {
         var span_id: [8]u8 = undefined;
-        std.c.arc4random_buf(&span_id, span_id.len);
+        io_compat.randomBytes(&span_id);
 
         return .{
             .trace_id = parent.trace_id,

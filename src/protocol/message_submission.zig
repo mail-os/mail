@@ -2,6 +2,7 @@
 // Handles message submission from Mail User Agents (MUAs)
 
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 /// Message Submission Agent - RFC 6409 compliant
@@ -146,7 +147,7 @@ pub const MessageSubmissionAgent = struct {
     /// Generate Message-ID header
     fn generateMessageID(self: *Self) ![]const u8 {
         var random_bytes: [16]u8 = undefined;
-        std.c.arc4random_buf(&random_bytes, random_bytes.len);
+        io_compat.randomBytes(&random_bytes);
 
         const timestamp = time_compat.timestamp();
 
@@ -199,7 +200,7 @@ pub const MessageSubmissionAgent = struct {
     /// Generate unique ID for Received header
     fn generateID(self: *Self) ![]const u8 {
         var random_bytes: [8]u8 = undefined;
-        std.c.arc4random_buf(&random_bytes, random_bytes.len);
+        io_compat.randomBytes(&random_bytes);
 
         return try std.fmt.allocPrint(
             self.allocator,

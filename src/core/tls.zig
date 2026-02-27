@@ -853,7 +853,7 @@ test "session cache" {
     defer cache.deinit();
 
     var nonce: [12]u8 = undefined;
-    std.c.arc4random_buf(&nonce, nonce.len);
+    io_compat.randomBytes(&nonce);
 
     const ticket_data = "test-ticket-data";
     const ticket = SessionTicket{
@@ -1402,7 +1402,7 @@ pub const ServerHelloBuilder = struct {
 
         // Server random (32 bytes)
         var random: [32]u8 = undefined;
-        std.c.arc4random_buf(&random, random.len);
+        io_compat.randomBytes(&random);
         try output.appendSlice(&random);
 
         // Session ID length and data

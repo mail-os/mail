@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const crypto = std.crypto;
@@ -45,7 +46,7 @@ pub const CSRFManager = struct {
 
         // Generate random token
         var token_bytes: [TOKEN_LENGTH]u8 = undefined;
-        std.c.arc4random_buf(&token_bytes, token_bytes.len);
+        io_compat.randomBytes(&token_bytes);
 
         // Encode as base64 for safe transmission
         const encoder = std.base64.url_safe_no_pad.Encoder;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 // =============================================================================
@@ -469,7 +470,7 @@ fn removeWhitespace(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
 /// Generate a Content-ID for a new inline image
 pub fn generateContentId(allocator: std.mem.Allocator, domain: []const u8) ![]u8 {
     var rand_bytes: [8]u8 = undefined;
-    std.c.arc4random_buf(&rand_bytes, rand_bytes.len);
+    io_compat.randomBytes(&rand_bytes);
 
     const timestamp = std.time.timestamp();
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const logger = @import("../core/logger.zig");
@@ -185,7 +186,7 @@ pub const RaftNode = struct {
 
         // Initialize random for election timeout
         var seed: u64 = undefined;
-        std.c.arc4random_buf(std.mem.asBytes(&seed), @sizeOf(u64));
+        io_compat.randomBytes(std.mem.asBytes(&seed));
         var prng = std.Random.DefaultPrng.init(seed);
 
         node.* = .{

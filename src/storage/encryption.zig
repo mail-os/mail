@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const crypto = std.crypto;
@@ -177,7 +178,7 @@ pub const EmailEncryption = struct {
     ) !EncryptedMessage {
         // Generate random nonce
         var nonce: [12]u8 = undefined;
-        std.c.arc4random_buf(&nonce, nonce.len);
+        io_compat.randomBytes(&nonce);
 
         // Derive message-specific key from master key + message_id
         const message_key = try self.deriveMessageKey(message_id);
@@ -254,7 +255,7 @@ pub const EmailEncryption = struct {
     /// Generate random master key
     pub fn generateMasterKey() [32]u8 {
         var key: [32]u8 = undefined;
-        std.c.arc4random_buf(&key, key.len);
+        io_compat.randomBytes(&key);
         return key;
     }
 
@@ -624,8 +625,8 @@ test "password-based key derivation" {
     // Generate random password and salt for testing instead of hardcoding
     var password_buf: [32]u8 = undefined;
     var salt_buf: [32]u8 = undefined;
-    std.c.arc4random_buf(&password_buf, password_buf.len);
-    std.c.arc4random_buf(&salt_buf, salt_buf.len);
+    io_compat.randomBytes(&password_buf);
+    io_compat.randomBytes(&salt_buf);
 
     const password = &password_buf;
     const salt = &salt_buf;

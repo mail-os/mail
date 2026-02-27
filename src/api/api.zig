@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_compat = @import("../core/io_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const version_info = @import("../core/version.zig");
 const database = @import("../storage/database.zig");
@@ -1253,7 +1254,7 @@ pub const APIServer = struct {
         if (user_exists) {
             // Generate secure token
             var random_bytes: [32]u8 = undefined;
-            std.c.arc4random_buf(&random_bytes, random_bytes.len);
+            io_compat.randomBytes(&random_bytes);
 
             var token: [64]u8 = undefined;
             _ = std.fmt.bufPrint(&token, "{s}", .{std.fmt.fmtSliceHexLower(&random_bytes)}) catch unreachable;
