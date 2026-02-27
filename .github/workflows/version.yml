@@ -32,9 +32,9 @@ jobs:
         token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Setup Zig
-      uses: goto-bus-stop/setup-zig@v2
+      uses: mlugg/setup-zig@v2
       with:
-        version: master
+        version: 0.16.0-dev.2565+684032671
 
     - name: Configure Git
       run: |

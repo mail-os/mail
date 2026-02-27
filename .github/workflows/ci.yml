@@ -21,9 +21,9 @@ jobs:
         submodules: recursive
 
     - name: Setup Zig
-      uses: goto-bus-stop/setup-zig@v2
+      uses: mlugg/setup-zig@v2
       with:
-        version: master
+        version: 0.16.0-dev.2565+684032671
 
     - name: Install SQLite (Ubuntu)
       if: matrix.os == 'ubuntu-latest'
@@ -74,9 +74,9 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Setup Zig
-      uses: goto-bus-stop/setup-zig@v2
+      uses: mlugg/setup-zig@v2
       with:
-        version: master
+        version: 0.16.0-dev.2565+684032671
 
     - name: Check formatting
       run: zig fmt --check src/
@@ -95,9 +95,9 @@ jobs:
         submodules: recursive
 
     - name: Setup Zig
-      uses: goto-bus-stop/setup-zig@v2
+      uses: mlugg/setup-zig@v2
       with:
-        version: master
+        version: 0.16.0-dev.2565+684032671
 
     - name: Install dependencies
       run: |
@@ -146,9 +146,9 @@ jobs:
         submodules: recursive
 
     - name: Setup Zig
-      uses: goto-bus-stop/setup-zig@v2
+      uses: mlugg/setup-zig@v2
       with:
-        version: master
+        version: 0.16.0-dev.2565+684032671
 
     - name: Install dependencies
       run: |
