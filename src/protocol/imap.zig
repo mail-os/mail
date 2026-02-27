@@ -591,10 +591,21 @@ pub const ImapSession = struct {
         mailbox.unseen = 0;
 
         // Send mailbox info
-        try self.sendUntagged(try std.fmt.allocPrint(self.allocator, "{d} EXISTS", .{mailbox.exists}));
-        try self.sendUntagged(try std.fmt.allocPrint(self.allocator, "{d} RECENT", .{mailbox.recent}));
-        try self.sendUntagged(try std.fmt.allocPrint(self.allocator, "OK [UIDVALIDITY {d}]", .{mailbox.uidvalidity}));
-        try self.sendUntagged(try std.fmt.allocPrint(self.allocator, "OK [UIDNEXT {d}]", .{mailbox.uidnext}));
+        const exists_msg = try std.fmt.allocPrint(self.allocator, "{d} EXISTS", .{mailbox.exists});
+        defer self.allocator.free(exists_msg);
+        try self.sendUntagged(exists_msg);
+
+        const recent_msg = try std.fmt.allocPrint(self.allocator, "{d} RECENT", .{mailbox.recent});
+        defer self.allocator.free(recent_msg);
+        try self.sendUntagged(recent_msg);
+
+        const uidval_msg = try std.fmt.allocPrint(self.allocator, "OK [UIDVALIDITY {d}]", .{mailbox.uidvalidity});
+        defer self.allocator.free(uidval_msg);
+        try self.sendUntagged(uidval_msg);
+
+        const uidnext_msg = try std.fmt.allocPrint(self.allocator, "OK [UIDNEXT {d}]", .{mailbox.uidnext});
+        defer self.allocator.free(uidnext_msg);
+        try self.sendUntagged(uidnext_msg);
         try self.sendUntagged("FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)");
         try self.sendUntagged("OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)]");
 

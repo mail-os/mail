@@ -235,7 +235,7 @@ pub const CalDavSession = struct {
                 var content_length: usize = 0;
                 var h_lines = std.mem.splitSequence(u8, headers, "\r\n");
                 while (h_lines.next()) |hline| {
-                    if (std.ascii.startsWithIgnoreCase(hline, "content-length:")) {
+                    if (hline.len >= 15 and std.ascii.eqlIgnoreCase(hline[0..15], "content-length:")) {
                         const val = std.mem.trim(u8, hline[15..], &std.ascii.whitespace);
                         content_length = std.fmt.parseInt(usize, val, 10) catch 0;
                         break;
@@ -474,6 +474,7 @@ pub const CalDavSession = struct {
                     try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\n");
                     try appendPrint(&buf, self.allocator, "        <D:displayname>{s}</D:displayname>\n", .{cal.name});
                     try appendPrint(&buf, self.allocator, "        <CS:getctag xmlns:CS=\"http://calendarserver.org/ns/\">{s}</CS:getctag>\n", .{cal.ctag});
+                    try appendPrint(&buf, self.allocator, "        <D:sync-token>http://mail/sync/{d}</D:sync-token>\n", .{cal.sync_token});
                     try buf.appendSlice(self.allocator, "      </D:prop>\n");
                     try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
                     try buf.appendSlice(self.allocator, "    </D:propstat>\n");
@@ -537,6 +538,7 @@ pub const CalDavSession = struct {
                     try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>\n");
                     try appendPrint(&buf, self.allocator, "        <D:displayname>{s}</D:displayname>\n", .{ab.name});
                     try appendPrint(&buf, self.allocator, "        <CS:getctag xmlns:CS=\"http://calendarserver.org/ns/\">{s}</CS:getctag>\n", .{ab.ctag});
+                    try appendPrint(&buf, self.allocator, "        <D:sync-token>http://mail/sync/{d}</D:sync-token>\n", .{ab.sync_token});
                     try buf.appendSlice(self.allocator, "        <CARD:supported-address-data><CARD:address-data-type content-type=\"text/vcard\" version=\"3.0\"/></CARD:supported-address-data>\n");
                     try buf.appendSlice(self.allocator, "      </D:prop>\n");
                     try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
@@ -772,14 +774,12 @@ pub const CalDavSession = struct {
                     try self.sendError(404, "Not Found");
                     return;
                 };
-                const vcf_data = if (contact.vcf_data.len > 0)
-                    contact.vcf_data
-                else blk: {
-                    break :blk self.store.generateVcf(contact) catch {
-                        try self.sendError(500, "Internal Server Error");
-                        return;
-                    };
-                };
+                const generated_vcf: ?[]u8 = if (contact.vcf_data.len == 0) (self.store.generateVcf(contact) catch {
+                    try self.sendError(500, "Internal Server Error");
+                    return;
+                }) else null;
+                defer if (generated_vcf) |g| self.allocator.free(g);
+                const vcf_data: []const u8 = generated_vcf orelse contact.vcf_data;
                 try self.sendResourceResponse("text/vcard", contact.etag, vcf_data);
             },
             else => {
@@ -1094,6 +1094,11 @@ pub const CalDavSession = struct {
                 return;
             };
             const user_id = self.getUserId() catch 1;
+            // Check for duplicate
+            if (self.store.getCalendarByName(user_id, collection_name) != null) {
+                try self.sendError(405, "Calendar already exists");
+                return;
+            }
             _ = self.store.createCalendar(user_id, collection_name, null) catch {
                 try self.sendError(500, "Internal Server Error");
                 return;
@@ -1115,6 +1120,11 @@ pub const CalDavSession = struct {
                 return;
             };
             const user_id = self.getUserId() catch 1;
+            // Check for duplicate
+            if (self.store.getAddressBookByName(user_id, collection_name) != null) {
+                try self.sendError(405, "Address book already exists");
+                return;
+            }
             _ = self.store.createAddressBook(user_id, collection_name, null) catch {
                 try self.sendError(500, "Internal Server Error");
                 return;
@@ -1126,6 +1136,11 @@ pub const CalDavSession = struct {
                 return;
             };
             const user_id = self.getUserId() catch 1;
+            // Check for duplicate
+            if (self.store.getCalendarByName(user_id, collection_name) != null) {
+                try self.sendError(405, "Calendar already exists");
+                return;
+            }
             _ = self.store.createCalendar(user_id, collection_name, null) catch {
                 try self.sendError(500, "Internal Server Error");
                 return;
@@ -1161,11 +1176,51 @@ pub const CalDavSession = struct {
         }
     }
 
+    /// Parse iCalendar date from XML attribute value (YYYYMMDDTHHMMSSZ)
+    fn parseIcalDateFromXml(value: []const u8) ?i64 {
+        if (value.len < 8) return null;
+        var year = std.fmt.parseInt(i64, value[0..4], 10) catch return null;
+        var month = std.fmt.parseInt(i64, value[4..6], 10) catch return null;
+        const day = std.fmt.parseInt(i64, value[6..8], 10) catch return null;
+        // Compute days since epoch
+        if (month <= 2) {
+            year -= 1;
+            month += 12;
+        }
+        const days = 365 * year + @divFloor(year, 4) - @divFloor(year, 100) + @divFloor(year, 400) + @divFloor((153 * (month - 3) + 2), 5) + day - 1 - 719468;
+        if (value.len >= 15 and value[8] == 'T') {
+            const hour = std.fmt.parseInt(i64, value[9..11], 10) catch return null;
+            const minute = std.fmt.parseInt(i64, value[11..13], 10) catch return null;
+            const second = std.fmt.parseInt(i64, value[13..15], 10) catch return null;
+            return days * 86400 + hour * 3600 + minute * 60 + second;
+        }
+        return days * 86400;
+    }
+
     /// Handle calendar-query REPORT
     fn handleCalendarQuery(self: *CalDavSession, path: []const u8, request: []const u8) !void {
-        _ = request;
         const parsed = parsePath(path);
         const user_id = self.getUserId() catch 1;
+
+        // Parse time-range filter from request body
+        var time_range_start: ?i64 = null;
+        var time_range_end: ?i64 = null;
+        const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse request.len;
+        const body = if (body_start + 4 <= request.len) request[body_start + 4 ..] else "";
+        if (std.mem.indexOf(u8, body, "time-range")) |_| {
+            if (std.mem.indexOf(u8, body, "start=\"")) |s| {
+                const val_start = s + 7;
+                if (std.mem.indexOf(u8, body[val_start..], "\"")) |val_end| {
+                    time_range_start = parseIcalDateFromXml(body[val_start .. val_start + val_end]);
+                }
+            }
+            if (std.mem.indexOf(u8, body, "end=\"")) |s| {
+                const val_start = s + 5;
+                if (std.mem.indexOf(u8, body[val_start..], "\"")) |val_end| {
+                    time_range_end = parseIcalDateFromXml(body[val_start .. val_start + val_end]);
+                }
+            }
+        }
 
         var buf: std.ArrayList(u8) = .{};
         defer buf.deinit(self.allocator);
@@ -1181,6 +1236,14 @@ pub const CalDavSession = struct {
             if (std.mem.eql(u8, cal.name, collection_name)) {
                 const events = self.store.getCalendarEvents(cal.id) catch &[_]caldav_store.Event{};
                 for (events) |event| {
+                    // Apply time-range filter if present
+                    if (time_range_start) |start| {
+                        const event_end = event.dtend orelse event.dtstart;
+                        if (event_end < start) continue;
+                    }
+                    if (time_range_end) |end| {
+                        if (event.dtstart >= end) continue;
+                    }
                     try buf.appendSlice(self.allocator, "  <D:response>\n");
                     try appendPrint(&buf, self.allocator, "    <D:href>/calendars/{s}/{s}/{s}.ics</D:href>\n", .{ username, collection_name, event.uid });
                     try buf.appendSlice(self.allocator, "    <D:propstat>\n");
@@ -1286,10 +1349,9 @@ pub const CalDavSession = struct {
                     try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                     try buf.appendSlice(self.allocator, "      <D:prop>\n");
                     try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{contact.etag});
-                    const vcf = if (contact.vcf_data.len > 0)
-                        contact.vcf_data
-                    else
-                        self.store.generateVcf(contact) catch "";
+                    const gen_vcf: ?[]u8 = if (contact.vcf_data.len == 0) (self.store.generateVcf(contact) catch null) else null;
+                    defer if (gen_vcf) |g| self.allocator.free(g);
+                    const vcf: []const u8 = gen_vcf orelse contact.vcf_data;
                     if (vcf.len > 0) {
                         try buf.appendSlice(self.allocator, "        <CARD:address-data>");
                         try buf.appendSlice(self.allocator, vcf);
@@ -1340,10 +1402,9 @@ pub const CalDavSession = struct {
                                         try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                                         try buf.appendSlice(self.allocator, "      <D:prop>\n");
                                         try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{contact.etag});
-                                        const vcf = if (contact.vcf_data.len > 0)
-                                            contact.vcf_data
-                                        else
-                                            self.store.generateVcf(contact) catch "";
+                                        const gen_vcf: ?[]u8 = if (contact.vcf_data.len == 0) (self.store.generateVcf(contact) catch null) else null;
+                                        defer if (gen_vcf) |g| self.allocator.free(g);
+                                        const vcf: []const u8 = gen_vcf orelse contact.vcf_data;
                                         if (vcf.len > 0) {
                                             try buf.appendSlice(self.allocator, "        <CARD:address-data>");
                                             try buf.appendSlice(self.allocator, vcf);
@@ -1372,7 +1433,6 @@ pub const CalDavSession = struct {
     fn handleSyncCollection(self: *CalDavSession, path: []const u8, request: []const u8) !void {
         const parsed = parsePath(path);
         const user_id = self.getUserId() catch 1;
-        _ = user_id;
 
         // Parse sync-token from request body
         var sync_token: u64 = 0;
@@ -1398,7 +1458,7 @@ pub const CalDavSession = struct {
         var collection_id: u64 = 0;
         if (parsed.collection) |coll_name| {
             if (is_calendar) {
-                const calendars = self.store.getUserCalendars(1) catch &[_]caldav_store.Calendar{};
+                const calendars = self.store.getUserCalendars(user_id) catch &[_]caldav_store.Calendar{};
                 for (calendars) |cal| {
                     if (std.mem.eql(u8, cal.name, coll_name)) {
                         collection_id = cal.id;
@@ -1406,7 +1466,7 @@ pub const CalDavSession = struct {
                     }
                 }
             } else {
-                const addressbooks = self.store.getUserAddressBooks(1) catch &[_]caldav_store.AddressBook{};
+                const addressbooks = self.store.getUserAddressBooks(user_id) catch &[_]caldav_store.AddressBook{};
                 for (addressbooks) |ab| {
                     if (std.mem.eql(u8, ab.name, coll_name)) {
                         collection_id = ab.id;

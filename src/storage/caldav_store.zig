@@ -341,6 +341,16 @@ pub const CalDavStore = struct {
         return self.calendars.get(id);
     }
 
+    pub fn getCalendarByName(self: *Self, user_id: u64, name: []const u8) ?Calendar {
+        var iter = self.calendars.valueIterator();
+        while (iter.next()) |cal| {
+            if (cal.user_id == user_id and std.mem.eql(u8, cal.name, name)) {
+                return cal.*;
+            }
+        }
+        return null;
+    }
+
     pub fn getUserCalendars(self: *Self, user_id: u64) ![]Calendar {
         var result: std.ArrayList(Calendar) = .{};
         errdefer result.deinit(self.allocator);
@@ -1101,10 +1111,10 @@ pub const CalDavStore = struct {
 
     fn generateUid(self: *Self) ![]const u8 {
         const timestamp = currentTimestamp();
-        var random_bytes: [8]u8 = undefined;
-        std.crypto.random.bytes(&random_bytes);
-        const random = std.mem.readInt(u64, &random_bytes, .little);
-        return try std.fmt.allocPrint(self.allocator, "{x}-{x}@localhost", .{ timestamp, random });
+        // Use timestamp + counters as seed for unique UID generation
+        const counter = self.next_event_id +% self.next_contact_id;
+        const seed = @as(u64, @bitCast(timestamp)) *% 6364136223846793005 +% counter;
+        return try std.fmt.allocPrint(self.allocator, "{x}-{x}@localhost", .{ timestamp, seed });
     }
 
     fn getEventHref(self: *Self, calendar_id: u64, uid: []const u8) ![]const u8 {
@@ -1179,7 +1189,7 @@ pub const IcsParser = struct {
         return days * 86400;
     }
 
-    fn epochDays(year: i64, month: i64, day: i64) i64 {
+    pub fn epochDays(year: i64, month: i64, day: i64) i64 {
         // Compute days since Unix epoch (1970-01-01) using a standard algorithm
         var y = year;
         var m = month;
