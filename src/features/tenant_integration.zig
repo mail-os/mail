@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const Allocator = std.mem.Allocator;
 const multitenancy = @import("multitenancy.zig");
 const Tenant = multitenancy.Tenant;
@@ -209,7 +210,7 @@ pub const TenantResolver = struct {
     default_tenant_id: ?[]const u8 = null,
     /// Cache of domain -> tenant_id mappings
     domain_cache: std.StringHashMap([]const u8),
-    cache_mutex: std.Thread.Mutex = .{},
+    cache_mutex: mutex_compat.Mutex = .{},
     allocator: Allocator,
 
     pub const ResolutionStrategy = enum {
@@ -367,7 +368,7 @@ pub const TenantRateLimiter = struct {
     tenant_limits: std.StringHashMap(TenantRateState),
     /// Per-IP rate limit state (across tenants)
     ip_limits: std.StringHashMap(IpRateState),
-    mutex: std.Thread.Mutex = .{},
+    mutex: mutex_compat.Mutex = .{},
     allocator: Allocator,
 
     pub const TenantRateState = struct {

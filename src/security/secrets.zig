@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const logger = @import("../core/logger.zig");
 const env = @import("../core/env.zig");
@@ -186,7 +187,6 @@ const env = @import("../core/env.zig");
 /// const api_key = try secrets.getSecret("smtp/api-key");
 /// defer allocator.free(api_key);
 /// ```
-
 /// Secret backend types
 pub const SecretBackend = enum {
     environment, // Environment variables (default)
@@ -270,7 +270,7 @@ pub const SecretManager = struct {
     backend: SecretBackend,
     cache: std.StringHashMap(CachedSecret),
     cache_ttl_seconds: i64,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     // Backend-specific state
     vault_config: ?VaultConfig,

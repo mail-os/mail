@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 /// Circuit breaker states
@@ -41,7 +42,7 @@ pub const CircuitBreaker = struct {
     last_failure_time: i64,
     last_success_time: i64,
     last_state_change: i64,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8, config: CircuitConfig) !CircuitBreaker {
         return CircuitBreaker{
@@ -54,7 +55,7 @@ pub const CircuitBreaker = struct {
             .last_failure_time = 0,
             .last_success_time = 0,
             .last_state_change = time_compat.timestamp(),
-            .mutex = std.Thread.Mutex{},
+            .mutex = mutex_compat.Mutex{},
         };
     }
 
@@ -230,13 +231,13 @@ pub const CircuitStats = struct {
 pub const CircuitBreakerManager = struct {
     allocator: std.mem.Allocator,
     breakers: std.StringHashMap(*CircuitBreaker),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) CircuitBreakerManager {
         return .{
             .allocator = allocator,
             .breakers = std.StringHashMap(*CircuitBreaker).init(allocator),
-            .mutex = std.Thread.Mutex{},
+            .mutex = mutex_compat.Mutex{},
         };
     }
 

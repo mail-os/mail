@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const database = @import("database.zig");
 const filter = @import("../message/filter.zig");
@@ -9,7 +10,7 @@ const filter = @import("../message/filter.zig");
 pub const DatabaseStorage = struct {
     allocator: std.mem.Allocator,
     db: *database.Database,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, db: *database.Database) !DatabaseStorage {
         var storage = DatabaseStorage{

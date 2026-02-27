@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const tracing = @import("tracing.zig");
 const logger = @import("../core/logger.zig");
 
@@ -13,7 +14,6 @@ const logger = @import("../core/logger.zig");
 /// - Batch exporting with configurable intervals
 /// - Automatic retry with exponential backoff
 /// - Resource attribution
-
 /// Trace sampling configuration
 pub const SamplingConfig = struct {
     /// Sampling strategy
@@ -161,7 +161,7 @@ pub const BatchSpanExporter = struct {
     allocator: std.mem.Allocator,
     config: ExporterConfig,
     spans: std.ArrayList(SpanData),
-    mutex: std.Thread.Mutex = .{},
+    mutex: mutex_compat.Mutex = .{},
     last_export: i64 = 0,
     export_thread: ?std.Thread = null,
     should_stop: std.atomic.Value(bool),

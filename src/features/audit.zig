@@ -1,9 +1,9 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 /// Audit Trail System for tracking administrative actions
 /// Provides comprehensive logging of user CRUD, config changes, and security events
-
 /// Types of auditable actions
 pub const AuditAction = enum {
     // User management
@@ -155,7 +155,7 @@ pub const AuditTrail = struct {
     db: *anyopaque, // Database pointer (cast to actual type when using)
     enabled: bool,
     retention_days: u32,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     // Statistics
     entries_logged: u64,

@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 // =============================================================================
@@ -171,7 +172,7 @@ pub const MTASTSDnsRecord = struct {
 pub const MTASTSPolicyCache = struct {
     allocator: std.mem.Allocator,
     entries: std.StringHashMap(CacheEntry),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     max_entries: usize,
 
     const CacheEntry = struct {

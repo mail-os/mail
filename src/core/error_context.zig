@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("mutex_compat.zig");
 const time_compat = @import("time_compat.zig");
 
 /// Error context for debugging and recovery
@@ -157,14 +158,14 @@ pub const ErrorContextManager = struct {
     allocator: std.mem.Allocator,
     contexts: std.ArrayList(ErrorContext),
     max_contexts: usize,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, max_contexts: usize) ErrorContextManager {
         return .{
             .allocator = allocator,
             .contexts = std.ArrayList(ErrorContext).init(allocator),
             .max_contexts = max_contexts,
-            .mutex = std.Thread.Mutex{},
+            .mutex = mutex_compat.Mutex{},
         };
     }
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 
 /// SpamAssassin spam filtering integration
 /// Scans email messages for spam using SpamAssassin daemon (spamd)
@@ -9,7 +10,7 @@ pub const SpamAssassinScanner = struct {
     timeout_ms: u32,
     enabled: bool,
     stats: ScanStats,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16, timeout_ms: u32) !SpamAssassinScanner {
         return .{

@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const path_sanitizer = @import("../core/path_sanitizer.zig");
 
@@ -7,7 +8,7 @@ const path_sanitizer = @import("../core/path_sanitizer.zig");
 pub const MboxStorage = struct {
     allocator: std.mem.Allocator,
     mbox_path: []const u8,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     /// Initialize mbox storage with path validation
     /// If mbox_path is relative, it will be validated against the current working directory

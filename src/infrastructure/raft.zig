@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const logger = @import("../core/logger.zig");
 
@@ -169,7 +170,7 @@ pub const RaftNode = struct {
     random: std.Random,
 
     // Synchronization
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     // Callbacks
     apply_callback: ?ApplyCallback,

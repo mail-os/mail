@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const Allocator = std.mem.Allocator;
 const time_compat = @import("../core/time_compat.zig");
 
@@ -214,7 +215,7 @@ pub const Dependency = struct {
 pub const DependencyGraph = struct {
     allocator: Allocator,
     services: std.AutoHashMap(ServiceId, ServiceNode),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     // Statistics
     total_health_checks: u64,
@@ -526,7 +527,7 @@ pub const DegradationManager = struct {
     allocator: Allocator,
     graph: *DependencyGraph,
     disabled_features: std.StringHashMap(DisabledFeature),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub const DisabledFeature = struct {
         feature: []const u8,

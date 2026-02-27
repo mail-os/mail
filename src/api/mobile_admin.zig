@@ -279,7 +279,8 @@ pub const MobileAdminHandler = struct {
     }
 
     fn serveError(self: *MobileAdminHandler, status: u16, message: []const u8) ![]u8 {
-        return std.fmt.allocPrint(self.allocator,
+        return std.fmt.allocPrint(
+            self.allocator,
             "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\n\r\n{{\"error\": \"{s}\"}}",
             .{ status, message, message },
         );
@@ -301,7 +302,8 @@ pub const MobileAdminHandler = struct {
             \\  ]
             \\}
         ;
-        return std.fmt.allocPrint(self.allocator,
+        return std.fmt.allocPrint(
+            self.allocator,
             "HTTP/1.1 200 OK\r\nContent-Type: application/manifest+json\r\nContent-Length: {d}\r\n\r\n{s}",
             .{ manifest.len, manifest },
         );
@@ -314,7 +316,8 @@ pub const MobileAdminHandler = struct {
             \\self.addEventListener('install', e => e.waitUntil(caches.open(CACHE_NAME).then(c => c.addAll(urlsToCache))));
             \\self.addEventListener('fetch', e => e.respondWith(caches.match(e.request).then(r => r || fetch(e.request))));
         ;
-        return std.fmt.allocPrint(self.allocator,
+        return std.fmt.allocPrint(
+            self.allocator,
             "HTTP/1.1 200 OK\r\nContent-Type: application/javascript\r\nContent-Length: {d}\r\n\r\n{s}",
             .{ sw.len, sw },
         );
@@ -323,7 +326,8 @@ pub const MobileAdminHandler = struct {
     /// Serve the mobile admin PWA
     pub fn serveApp(self: *MobileAdminHandler) ![]u8 {
         const html = mobile_admin_html;
-        return std.fmt.allocPrint(self.allocator,
+        return std.fmt.allocPrint(
+            self.allocator,
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\n\r\n{s}",
             .{ html.len, html },
         );

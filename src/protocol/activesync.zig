@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const net = std.net;
 const Allocator = std.mem.Allocator;
 const auth = @import("../auth/auth.zig");
@@ -606,7 +607,7 @@ pub const ActiveSyncServer = struct {
     server: ?net.Server = null,
     running: std.atomic.Value(bool),
     sessions: std.ArrayList(*ActiveSyncSession),
-    sessions_mutex: std.Thread.Mutex,
+    sessions_mutex: mutex_compat.Mutex,
     auth_backend: *auth.AuthBackend,
 
     pub fn init(allocator: Allocator, config: ActiveSyncConfig, auth_backend: *auth.AuthBackend) ActiveSyncServer {
@@ -615,7 +616,7 @@ pub const ActiveSyncServer = struct {
             .config = config,
             .running = std.atomic.Value(bool).init(false),
             .sessions = std.ArrayList(*ActiveSyncSession){},
-            .sessions_mutex = std.Thread.Mutex{},
+            .sessions_mutex = mutex_compat.Mutex{},
             .auth_backend = auth_backend,
         };
     }

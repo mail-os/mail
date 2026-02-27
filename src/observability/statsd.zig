@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const posix = std.posix;
 
 /// StatsD client for metrics reporting
@@ -11,7 +12,7 @@ pub const StatsDClient = struct {
     prefix: ?[]const u8, // Optional metric prefix (e.g., "smtp.")
     socket_fd: ?posix.socket_t,
     enabled: bool,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(
         allocator: std.mem.Allocator,

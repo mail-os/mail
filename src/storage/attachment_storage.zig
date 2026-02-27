@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const fs = std.fs;
 const crypto = std.crypto;
 const posix = std.posix;
@@ -128,7 +129,7 @@ pub const AttachmentStorage = struct {
     /// Metadata index (id -> metadata)
     metadata_index: std.StringHashMap(AttachmentMetadata),
     /// Mutex for thread safety
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     /// Disk backend
     disk_backend: ?DiskBackend,
     /// Memory backend (for testing)

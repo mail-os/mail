@@ -77,7 +77,8 @@ pub const SwaggerHandler = struct {
     }
 
     fn serveError(self: *SwaggerHandler, status: u16, message: []const u8) ![]u8 {
-        return std.fmt.allocPrint(self.allocator,
+        return std.fmt.allocPrint(
+            self.allocator,
             "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\n\r\n{{\"error\": \"{s}\"}}",
             .{ status, message, message },
         );
@@ -86,7 +87,8 @@ pub const SwaggerHandler = struct {
     /// Serve the Swagger UI HTML page
     pub fn serveSwaggerUI(self: *SwaggerHandler) ![]u8 {
         const html = swagger_ui_html;
-        return std.fmt.allocPrint(self.allocator,
+        return std.fmt.allocPrint(
+            self.allocator,
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\n\r\n{s}",
             .{ html.len, html },
         );
@@ -95,7 +97,8 @@ pub const SwaggerHandler = struct {
     /// Serve the OpenAPI specification
     pub fn serveOpenApiSpec(self: *SwaggerHandler) ![]u8 {
         const spec = self.openapi_spec orelse default_openapi_spec;
-        return std.fmt.allocPrint(self.allocator,
+        return std.fmt.allocPrint(
+            self.allocator,
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {d}\r\n\r\n{s}",
             .{ spec.len, spec },
         );
@@ -104,7 +107,8 @@ pub const SwaggerHandler = struct {
     /// Serve OAuth2 redirect page for authentication flows
     fn serveOAuth2Redirect(self: *SwaggerHandler) ![]u8 {
         const html = oauth2_redirect_html;
-        return std.fmt.allocPrint(self.allocator,
+        return std.fmt.allocPrint(
+            self.allocator,
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\n\r\n{s}",
             .{ html.len, html },
         );

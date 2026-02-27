@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 
 /// ATRN extension (RFC 2645)
 /// Authenticated TURN - allows authenticated queue processing with role reversal
@@ -29,7 +30,7 @@ pub const ATRNHandler = struct {
     queue_dir: []const u8,
     authorized_domains: std.StringHashMap([]const u8), // domain -> authenticated_user
     require_auth: bool,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, queue_dir: []const u8, require_auth: bool) !ATRNHandler {
         return .{
@@ -218,7 +219,7 @@ pub const RoleReversalManager = struct {
     allocator: std.mem.Allocator,
     queue_dir: []const u8,
     in_reversal: bool,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, queue_dir: []const u8) !RoleReversalManager {
         return .{

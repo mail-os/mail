@@ -1065,26 +1065,21 @@ pub const ImapSession = struct {
             return std.fmt.allocPrint(self.allocator, "{s} OK NOOP completed\r\n", .{tag});
         } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "logout")) {
             self.state = .logout;
-            return std.fmt.allocPrint(self.allocator,
-                "* BYE IMAP4rev1 Server logging out\r\n{s} OK LOGOUT completed\r\n", .{tag});
+            return std.fmt.allocPrint(self.allocator, "* BYE IMAP4rev1 Server logging out\r\n{s} OK LOGOUT completed\r\n", .{tag});
         } else {
             return std.fmt.allocPrint(self.allocator, "{s} BAD Unknown command\r\n", .{tag});
         }
     }
 
     fn cmdCapability(self: *ImapSession, tag: []const u8) ![]u8 {
-        return std.fmt.allocPrint(self.allocator,
-            "* CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN AUTH=LOGIN IDLE NAMESPACE\r\n{s} OK CAPABILITY completed\r\n",
-            .{tag});
+        return std.fmt.allocPrint(self.allocator, "* CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN AUTH=LOGIN IDLE NAMESPACE\r\n{s} OK CAPABILITY completed\r\n", .{tag});
     }
 
     fn cmdLogin(self: *ImapSession, tag: []const u8, args: []const u8) ![]u8 {
         // Parse username and password from args
         var iter = std.mem.splitScalar(u8, args, ' ');
-        const username = iter.next() orelse return std.fmt.allocPrint(
-            self.allocator, "{s} BAD Missing username\r\n", .{tag});
-        const password = iter.next() orelse return std.fmt.allocPrint(
-            self.allocator, "{s} BAD Missing password\r\n", .{tag});
+        const username = iter.next() orelse return std.fmt.allocPrint(self.allocator, "{s} BAD Missing username\r\n", .{tag});
+        const password = iter.next() orelse return std.fmt.allocPrint(self.allocator, "{s} BAD Missing password\r\n", .{tag});
 
         // Remove quotes if present
         const clean_user = std.mem.trim(u8, username, "\"");
@@ -1147,9 +1142,7 @@ pub const ImapSession = struct {
         const mailbox_name = std.mem.trim(u8, iter.next() orelse "INBOX", "\"");
         const msg_count = self.mailbox.getMessageCount(mailbox_name);
 
-        return std.fmt.allocPrint(self.allocator,
-            "* STATUS \"{s}\" (MESSAGES {d} UNSEEN 0 UIDNEXT {d})\r\n{s} OK STATUS completed\r\n",
-            .{ mailbox_name, msg_count, msg_count + 1, tag });
+        return std.fmt.allocPrint(self.allocator, "* STATUS \"{s}\" (MESSAGES {d} UNSEEN 0 UIDNEXT {d})\r\n{s} OK STATUS completed\r\n", .{ mailbox_name, msg_count, msg_count + 1, tag });
     }
 
     fn cmdFetch(self: *ImapSession, tag: []const u8, args: []const u8) ![]u8 {
@@ -1163,9 +1156,7 @@ pub const ImapSession = struct {
         _ = seq_set;
 
         // Return simple fetch response
-        return std.fmt.allocPrint(self.allocator,
-            "* 1 FETCH (FLAGS (\\Seen) RFC822.SIZE 1024)\r\n{s} OK FETCH completed\r\n",
-            .{tag});
+        return std.fmt.allocPrint(self.allocator, "* 1 FETCH (FLAGS (\\Seen) RFC822.SIZE 1024)\r\n{s} OK FETCH completed\r\n", .{tag});
     }
 };
 
@@ -1240,8 +1231,7 @@ pub const Pop3Session = struct {
         if (self.state != .authorization) {
             return std.fmt.allocPrint(self.allocator, "-ERR Already authenticated\r\n", .{});
         }
-        const username = arg orelse return std.fmt.allocPrint(
-            self.allocator, "-ERR Missing username\r\n", .{});
+        const username = arg orelse return std.fmt.allocPrint(self.allocator, "-ERR Missing username\r\n", .{});
         self.pending_username = username;
         return std.fmt.allocPrint(self.allocator, "+OK User accepted\r\n", .{});
     }
@@ -1250,10 +1240,8 @@ pub const Pop3Session = struct {
         if (self.state != .authorization) {
             return std.fmt.allocPrint(self.allocator, "-ERR Already authenticated\r\n", .{});
         }
-        const password = arg orelse return std.fmt.allocPrint(
-            self.allocator, "-ERR Missing password\r\n", .{});
-        const username = self.pending_username orelse return std.fmt.allocPrint(
-            self.allocator, "-ERR Send USER first\r\n", .{});
+        const password = arg orelse return std.fmt.allocPrint(self.allocator, "-ERR Missing password\r\n", .{});
+        const username = self.pending_username orelse return std.fmt.allocPrint(self.allocator, "-ERR Send USER first\r\n", .{});
 
         if (self.auth_provider.authenticate(username, password)) {
             self.state = .transaction;
@@ -1306,15 +1294,12 @@ pub const Pop3Session = struct {
         if (self.state != .transaction) {
             return std.fmt.allocPrint(self.allocator, "-ERR Not authenticated\r\n", .{});
         }
-        const msg_num_str = arg orelse return std.fmt.allocPrint(
-            self.allocator, "-ERR Missing message number\r\n", .{});
+        const msg_num_str = arg orelse return std.fmt.allocPrint(self.allocator, "-ERR Missing message number\r\n", .{});
         const msg_num = std.fmt.parseInt(u64, msg_num_str, 10) catch
             return std.fmt.allocPrint(self.allocator, "-ERR Invalid message number\r\n", .{});
 
         if (self.mailbox.getMessage(msg_num)) |msg| {
-            return std.fmt.allocPrint(self.allocator,
-                "+OK {d} octets\r\nFrom: {s}\r\nTo: {s}\r\nSubject: {s}\r\n\r\n{s}\r\n.\r\n",
-                .{ msg.size, msg.from, msg.to, msg.subject, msg.body });
+            return std.fmt.allocPrint(self.allocator, "+OK {d} octets\r\nFrom: {s}\r\nTo: {s}\r\nSubject: {s}\r\n\r\n{s}\r\n.\r\n", .{ msg.size, msg.from, msg.to, msg.subject, msg.body });
         }
         return std.fmt.allocPrint(self.allocator, "-ERR No such message\r\n", .{});
     }
@@ -1323,8 +1308,7 @@ pub const Pop3Session = struct {
         if (self.state != .transaction) {
             return std.fmt.allocPrint(self.allocator, "-ERR Not authenticated\r\n", .{});
         }
-        const msg_num_str = arg orelse return std.fmt.allocPrint(
-            self.allocator, "-ERR Missing message number\r\n", .{});
+        const msg_num_str = arg orelse return std.fmt.allocPrint(self.allocator, "-ERR Missing message number\r\n", .{});
         const msg_num = std.fmt.parseInt(u64, msg_num_str, 10) catch
             return std.fmt.allocPrint(self.allocator, "-ERR Invalid message number\r\n", .{});
 

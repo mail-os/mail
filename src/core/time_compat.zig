@@ -3,19 +3,25 @@ const io_compat = @import("io_compat.zig");
 
 /// Get current Unix timestamp in seconds (Zig 0.16 compatible)
 pub fn timestamp() i64 {
-    const ts = std.posix.clock_gettime(.REALTIME) catch return 0;
+    var ts: std.c.timespec = undefined;
+    const rc = std.c.clock_gettime(.REALTIME, &ts);
+    if (rc != 0) return 0;
     return ts.sec;
 }
 
 /// Get current Unix timestamp in milliseconds
 pub fn milliTimestamp() i64 {
-    const ts = std.posix.clock_gettime(.REALTIME) catch return 0;
+    var ts: std.c.timespec = undefined;
+    const rc = std.c.clock_gettime(.REALTIME, &ts);
+    if (rc != 0) return 0;
     return ts.sec * 1000 + @divFloor(ts.nsec, std.time.ns_per_ms);
 }
 
 /// Get current Unix timestamp in nanoseconds
 pub fn nanoTimestamp() i128 {
-    const ts = std.posix.clock_gettime(.REALTIME) catch return 0;
+    var ts: std.c.timespec = undefined;
+    const rc = std.c.clock_gettime(.REALTIME, &ts);
+    if (rc != 0) return 0;
     return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
 }
 

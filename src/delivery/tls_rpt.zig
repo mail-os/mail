@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 /// TLS failure types per RFC 8460 Section 4.3
@@ -340,7 +341,7 @@ pub const AggregateStats = struct {
 /// and generates RFC 8460 compliant JSON reports.
 pub const TLSReportAggregator = struct {
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     domain_stats: std.StringHashMap(DomainMXStats),
     tracked_domains: std.StringHashMap(void),
     organization_name: []const u8,

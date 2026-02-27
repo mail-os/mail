@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 /// Auto-responder rule for vacation/out-of-office messages
@@ -147,7 +148,7 @@ pub const ResponseRecord = struct {
 pub const AutoResponderManager = struct {
     allocator: std.mem.Allocator,
     rules: std.ArrayList(*AutoResponderRule),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) AutoResponderManager {
         return .{

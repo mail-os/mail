@@ -33,8 +33,7 @@
     // internet connectivity.
     .dependencies = .{
         .tls = .{
-            // Local path to zig-tls with TLS 1.2 support for Apple Mail.app compatibility
-            .path = "../zig-tls",
+            .path = "deps/zig-tls",
         },
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{

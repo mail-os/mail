@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const version_info = @import("../core/version.zig");
 const raft = @import("raft.zig");
@@ -259,7 +260,7 @@ pub const ClusterManager = struct {
     config: ClusterConfig,
     local_node: *ClusterNode,
     nodes: std.StringHashMap(*ClusterNode),
-    nodes_mutex: std.Thread.Mutex,
+    nodes_mutex: mutex_compat.Mutex,
     state_store: *DistributedStateStore,
     heartbeat_thread: ?std.Thread = null,
     running: std.atomic.Value(bool),
@@ -297,7 +298,7 @@ pub const ClusterManager = struct {
             .config = config,
             .local_node = local_node,
             .nodes = std.StringHashMap(*ClusterNode).init(allocator),
-            .nodes_mutex = std.Thread.Mutex{},
+            .nodes_mutex = mutex_compat.Mutex{},
             .state_store = try DistributedStateStore.init(allocator),
             .running = std.atomic.Value(bool).init(false),
             .raft_node = null,
@@ -659,14 +660,14 @@ pub const ClusterStats = struct {
 pub const DistributedStateStore = struct {
     allocator: std.mem.Allocator,
     data: std.StringHashMap([]const u8),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) !*DistributedStateStore {
         const store = try allocator.create(DistributedStateStore);
         store.* = .{
             .allocator = allocator,
             .data = std.StringHashMap([]const u8).init(allocator),
-            .mutex = std.Thread.Mutex{},
+            .mutex = mutex_compat.Mutex{},
         };
         return store;
     }
@@ -740,13 +741,13 @@ pub const DistributedStateStore = struct {
 pub const ClusterRateLimiter = struct {
     local_counts: std.StringHashMap(u32),
     state_store: *DistributedStateStore,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(state_store: *DistributedStateStore, allocator: std.mem.Allocator) ClusterRateLimiter {
         return .{
             .local_counts = std.StringHashMap(u32).init(allocator),
             .state_store = state_store,
-            .mutex = std.Thread.Mutex{},
+            .mutex = mutex_compat.Mutex{},
         };
     }
 

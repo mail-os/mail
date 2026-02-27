@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 /// Sieve Email Filtering Language (RFC 5228)
@@ -56,8 +57,17 @@ pub const CommandType = enum {
 
     pub fn isAction(self: CommandType) bool {
         return switch (self) {
-            .keep, .fileinto, .redirect, .discard, .reject, .ereject,
-            .vacation, .notify, .setflag, .addflag, .removeflag,
+            .keep,
+            .fileinto,
+            .redirect,
+            .discard,
+            .reject,
+            .ereject,
+            .vacation,
+            .notify,
+            .setflag,
+            .addflag,
+            .removeflag,
             => true,
             else => false,
         };
@@ -1197,7 +1207,7 @@ fn extractAddress(value: []const u8) []const u8 {
 pub const SieveScriptManager = struct {
     allocator: std.mem.Allocator,
     scripts: std.StringHashMap(UserScripts),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub const UserScripts = struct {
         active_script: ?[]const u8,

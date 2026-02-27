@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 /// Mailing list management and message distribution
@@ -9,7 +10,7 @@ pub const MailingList = struct {
     description: []const u8,
     subscribers: std.StringHashMap(Subscriber),
     settings: ListSettings,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -234,7 +235,7 @@ pub const DistributionStatus = enum {
 pub const MailingListManager = struct {
     allocator: std.mem.Allocator,
     lists: std.StringHashMap(*MailingList),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) MailingListManager {
         return .{

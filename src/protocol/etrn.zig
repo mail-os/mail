@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 
 /// ETRN extension (RFC 1985)
 /// Extended Turn - allows remote sites to request queue processing
@@ -25,7 +26,7 @@ pub const ETRNHandler = struct {
     queue_dir: []const u8,
     allowed_domains: std.StringHashMap(void),
     max_queue_size: usize,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, queue_dir: []const u8, max_queue_size: usize) !ETRNHandler {
         return .{
@@ -249,7 +250,7 @@ pub const QueueProcessor = struct {
     allocator: std.mem.Allocator,
     queue_dir: []const u8,
     processing: bool,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, queue_dir: []const u8) !QueueProcessor {
         return .{

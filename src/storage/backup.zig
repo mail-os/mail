@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const path_sanitizer = @import("../core/path_sanitizer.zig");
 
@@ -18,7 +19,7 @@ pub const BackupManager = struct {
     source_path: []const u8,
     backup_path: []const u8,
     config: BackupConfig,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(
         allocator: std.mem.Allocator,

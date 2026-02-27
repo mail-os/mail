@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const crypto = std.crypto;
 
@@ -374,7 +375,7 @@ pub const EncryptedTimeSeriesStorage = struct {
     allocator: std.mem.Allocator,
     base_path: []const u8,
     encryption: *EmailEncryption,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(
         allocator: std.mem.Allocator,

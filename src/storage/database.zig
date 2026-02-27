@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const sqlite = @cImport({
     @cInclude("sqlite3.h");
@@ -162,7 +163,7 @@ pub const User = struct {
 pub const Database = struct {
     db: ?*sqlite.sqlite3,
     allocator: std.mem.Allocator,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, db_path: []const u8) !Database {
         var db: ?*sqlite.sqlite3 = null;
@@ -182,7 +183,7 @@ pub const Database = struct {
         var database = Database{
             .db = db,
             .allocator = allocator,
-            .mutex = std.Thread.Mutex{},
+            .mutex = mutex_compat.Mutex{},
         };
 
         // Enable WAL mode for better concurrent read performance

@@ -237,7 +237,7 @@ pub const CanSpamCompliance = struct {
 
         // Check for deceptive subject line indicators
         const deceptive_patterns = [_][]const u8{
-            "RE: ",  // False reply indicator
+            "RE: ", // False reply indicator
             "FWD: ", // False forward indicator
             "urgent",
             "URGENT",

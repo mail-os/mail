@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 /// Time-series filesystem storage for email messages
@@ -29,7 +30,7 @@ pub const TimeSeriesStorage = struct {
     allocator: std.mem.Allocator,
     base_path: []const u8,
     compress: bool, // Optional gzip compression
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, base_path: []const u8, compress: bool) !TimeSeriesStorage {
         // Create base directory if it doesn't exist

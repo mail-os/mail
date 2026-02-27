@@ -3,7 +3,6 @@ const std = @import("std");
 /// Central version management for the mail server
 /// This is the single source of truth for version information
 /// When bumping versions, update this file AND build.zig.zon
-
 /// Semantic version components
 pub const version_major: u32 = 0;
 pub const version_minor: u32 = 37;

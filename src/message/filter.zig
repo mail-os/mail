@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 
 // ============================================================================
 // Gmail-Style Email Categorization
@@ -36,26 +37,15 @@ pub const EmailCategory = enum {
 
 /// Default patterns for social network emails
 pub const SOCIAL_DOMAINS = [_][]const u8{
-    "facebookmail.com", "facebook.com", "fb.com",
-    "twitter.com",      "x.com",
-    "linkedin.com",     "linkedinmail.com",
-    "instagram.com",
-    "pinterest.com",
-    "snapchat.com",
-    "tiktok.com",
-    "reddit.com",       "redditmail.com",
-    "tumblr.com",
-    "whatsapp.com",
-    "telegram.org",
-    "discord.com",      "discordapp.com",
-    "slack.com",
-    "meetup.com",
-    "nextdoor.com",
-    "quora.com",
-    "medium.com",
-    "mastodon.social",
-    "threads.net",
-    "bluesky.social",
+    "facebookmail.com", "facebook.com",   "fb.com",
+    "twitter.com",      "x.com",          "linkedin.com",
+    "linkedinmail.com", "instagram.com",  "pinterest.com",
+    "snapchat.com",     "tiktok.com",     "reddit.com",
+    "redditmail.com",   "tumblr.com",     "whatsapp.com",
+    "telegram.org",     "discord.com",    "discordapp.com",
+    "slack.com",        "meetup.com",     "nextdoor.com",
+    "quora.com",        "medium.com",     "mastodon.social",
+    "threads.net",      "bluesky.social",
 };
 
 pub const SOCIAL_SUBSTRINGS = [_][]const u8{
@@ -66,62 +56,87 @@ pub const SOCIAL_SUBSTRINGS = [_][]const u8{
 
 /// Default patterns for forum/mailing list emails
 pub const FORUMS_DOMAINS = [_][]const u8{
-    "googlegroups.com", "groups.google.com",
-    "discourse.org",
-    "stackoverflow.com", "stackexchange.com",
-    "freelancer.com",
-    "upwork.com",
-    "mailman.org",
-    "listserv.net",
-    "yahoogroups.com",
-    "gnu.org",
-    "sourceforge.net",
+    "googlegroups.com",  "groups.google.com",
+    "discourse.org",     "stackoverflow.com",
+    "stackexchange.com", "freelancer.com",
+    "upwork.com",        "mailman.org",
+    "listserv.net",      "yahoogroups.com",
+    "gnu.org",           "sourceforge.net",
     "launchpad.net",
 };
 
 pub const FORUMS_SUBSTRINGS = [_][]const u8{
-    "-list@",    "-users@",    "-dev@", "-announce@",
-    "forum@",    "discuss@",   "community@",
-    "@lists.",   "@mailman.",  "@groups.",
+    "-list@",    "-users@",  "-dev@",      "-announce@",
+    "forum@",    "discuss@", "community@", "@lists.",
+    "@mailman.", "@groups.",
     "reply+", // GitHub discussion replies
 };
 
 /// Default patterns for update/transactional emails
 pub const UPDATES_DOMAINS = [_][]const u8{
-    "github.com",      "gitlab.com",       "bitbucket.org",
-    "stripe.com",      "paypal.com",       "square.com",     "venmo.com",
-    "ups.com",         "fedex.com",        "usps.com",       "dhl.com",
+    "github.com", "gitlab.com", "bitbucket.org",
+    "stripe.com", "paypal.com", "square.com",
+    "venmo.com",  "ups.com",    "fedex.com",
+    "usps.com",   "dhl.com",
     "amazonses.com", // Amazon SES transactional emails
-    "google.com",      "accounts.google.com",
-    "apple.com",       "id.apple.com",
-    "microsoft.com",   "live.com",       "outlook.com",
-    "dropbox.com",     "box.com",
-    "atlassian.com",   "jira.com",       "trello.com",
-    "notion.so",       "airtable.com",   "asana.com",
-    "vercel.com",      "netlify.com",    "heroku.com",
-    "cloudflare.com",  "digitalocean.com",
-    "twilio.com",      "sendgrid.com",
-    "intercom.io",     "zendesk.com",    "freshdesk.com",
-    "calendly.com",    "cal.com",
-    "zoom.us",         "zoom.com",
-    "doordash.com",    "ubereats.com",   "grubhub.com",
-    "airbnb.com",      "booking.com",    "expedia.com",
-    "uber.com",        "lyft.com",
-    "netflix.com",     "spotify.com",    "hulu.com",
+    "google.com",
+    "accounts.google.com",
+    "apple.com",
+    "id.apple.com",
+    "microsoft.com",
+    "live.com",
+    "outlook.com",
+    "dropbox.com",
+    "box.com",
+    "atlassian.com",
+    "jira.com",
+    "trello.com",
+    "notion.so",
+    "airtable.com",
+    "asana.com",
+    "vercel.com",
+    "netlify.com",
+    "heroku.com",
+    "cloudflare.com",
+    "digitalocean.com",
+    "twilio.com",
+    "sendgrid.com",
+    "intercom.io",
+    "zendesk.com",
+    "freshdesk.com",
+    "calendly.com",
+    "cal.com",
+    "zoom.us",
+    "zoom.com",
+    "doordash.com",
+    "ubereats.com",
+    "grubhub.com",
+    "airbnb.com",
+    "booking.com",
+    "expedia.com",
+    "uber.com",
+    "lyft.com",
+    "netflix.com",
+    "spotify.com",
+    "hulu.com",
 };
 
 pub const UPDATES_SUBSTRINGS = [_][]const u8{
-    "alert@",        "alerts@",
-    "notification@", "notifications@",
-    "noreply@",      "no-reply@",
-    "security@",     "support@",
-    "confirm@",      "confirmation@",
-    "receipt@",      "invoice@",  "billing@",
-    "shipping@",     "delivery@", "order@", "orders@",
-    "account@",      "password@",
-    "verify@",       "verification@",
+    "alert@",             "alerts@",
+    "notification@",      "notifications@",
+    "noreply@",           "no-reply@",
+    "security@",          "support@",
+    "confirm@",           "confirmation@",
+    "receipt@",           "invoice@",
+    "billing@",           "shipping@",
+    "delivery@",          "order@",
+    "orders@",            "account@",
+    "password@",          "verify@",
+    "verification@",
     // Amazon transactional prefixes
-    "auto-confirm@", "ship-notify@", "order-update@", "payments-messages@",
+         "auto-confirm@",
+    "ship-notify@",       "order-update@",
+    "payments-messages@",
     "return-", // return confirmations
 };
 
@@ -129,18 +144,13 @@ pub const UPDATES_SUBSTRINGS = [_][]const u8{
 pub const PROMOTIONS_DOMAINS = [_][]const u8{
     "mailchimp.com",       "mail.mailchimp.com",
     "sendgrid.net",        "sendgrid.com",
-    "constantcontact.com",
-    "mailerlite.com",
+    "constantcontact.com", "mailerlite.com",
     "hubspot.com",         "hubspotmail.com",
-    "klaviyo.com",
-    "convertkit.com",
-    "drip.com",
-    "getresponse.com",
-    "aweber.com",
-    "campaignmonitor.com",
+    "klaviyo.com",         "convertkit.com",
+    "drip.com",            "getresponse.com",
+    "aweber.com",          "campaignmonitor.com",
     "sendinblue.com",      "brevo.com",
-    "activecampaign.com",
-    "emarsys.net",
+    "activecampaign.com",  "emarsys.net",
     "salesforce.com",      "exacttarget.com",
     "amazonsellerservices.com", // Amazon promotional - generic amazon.com removed to avoid conflict with transactional
     "walmart.com",
@@ -161,15 +171,20 @@ pub const PROMOTIONS_DOMAINS = [_][]const u8{
 };
 
 pub const PROMOTIONS_SUBSTRINGS = [_][]const u8{
-    "promo@",      "promotions@",
-    "marketing@",  "newsletter@", "news@",
-    "deals@",      "offers@",     "sale@", "sales@",
-    "shop@",       "store@",
-    "rewards@",    "loyalty@",
+    "promo@",     "promotions@",
+    "marketing@", "newsletter@",
+    "news@",      "deals@",
+    "offers@",    "sale@",
+    "sales@",     "shop@",
+    "store@",     "rewards@",
+    "loyalty@",
     "unsubscribe", // common in promotional emails
-    "campaign",    "blast@",
+    "campaign",
+    "blast@",
     // Amazon promotional prefixes
-    "store-news@", "kindle-offers@", "vfe-campaign@",
+    "store-news@",
+    "kindle-offers@",
+    "vfe-campaign@",
 };
 
 /// Case-insensitive string contains check
@@ -490,7 +505,7 @@ pub const Message = struct {
 pub const FilterEngine = struct {
     allocator: std.mem.Allocator,
     rules: std.ArrayList(*FilterRule),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) FilterEngine {
         return .{

@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const os = std.os;
 const builtin = @import("builtin");
 const posix = std.posix;
@@ -714,7 +715,7 @@ pub const AsyncSmtpHandler = struct {
     ring: *IoUring,
     connections: std.AutoHashMap(u64, *AsyncConnection),
     next_id: u64,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, ring: *IoUring) AsyncSmtpHandler {
         return .{

@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 
 /// Memory pool for efficient allocation of fixed-size blocks
 /// Reduces allocator pressure and fragmentation
@@ -15,7 +16,7 @@ pub fn MemoryPool(comptime T: type) type {
         allocated_nodes: std.ArrayList(*Node),
         capacity: usize,
         available: usize,
-        mutex: std.Thread.Mutex,
+        mutex: mutex_compat.Mutex,
 
         pub fn init(allocator: std.mem.Allocator, initial_capacity: usize) !Self {
             var pool = Self{
@@ -203,7 +204,7 @@ pub const ArenaPool = struct {
     backing_allocator: std.mem.Allocator,
     arenas: std.ArrayList(*std.heap.ArenaAllocator),
     free_arenas: std.ArrayList(*std.heap.ArenaAllocator),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) ArenaPool {
         return .{

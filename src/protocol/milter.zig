@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const socket = @import("../core/socket_compat.zig");
 
@@ -614,7 +615,7 @@ pub const MilterClient = struct {
     /// Statistics.
     stats: MilterStats = .{},
     /// Mutex for stats.
-    mutex: std.Thread.Mutex = .{},
+    mutex: mutex_compat.Mutex = .{},
 
     /// Create a new MilterClient. The config strings are duplicated internally.
     pub fn init(allocator: std.mem.Allocator, config: MilterConfig) !MilterClient {
@@ -1439,7 +1440,7 @@ pub const MilterManager = struct {
     allocator: std.mem.Allocator,
     milters: std.ArrayList(ManagedMilter) = .{},
     stats: MilterManagerStats = .{},
-    mutex: std.Thread.Mutex = .{},
+    mutex: mutex_compat.Mutex = .{},
 
     pub const ManagedMilter = struct {
         config: MilterConfig,

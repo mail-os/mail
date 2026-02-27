@@ -32,10 +32,10 @@ pub const Config = struct {
     max_message_size: usize,
 
     // Timeout configuration with granularity
-    timeout_seconds: u32,           // General connection timeout
-    data_timeout_seconds: u32,      // Specific timeout for DATA command
-    command_timeout_seconds: u32,   // Timeout between commands
-    greeting_timeout_seconds: u32,  // Timeout for initial greeting
+    timeout_seconds: u32, // General connection timeout
+    data_timeout_seconds: u32, // Specific timeout for DATA command
+    command_timeout_seconds: u32, // Timeout between commands
+    greeting_timeout_seconds: u32, // Timeout for initial greeting
 
     rate_limit_per_ip: u32,
     rate_limit_per_user: u32,
@@ -115,7 +115,7 @@ pub const Config = struct {
         const min_message_size = 1024; // 1KB
         const max_message_size = 100 * 1024 * 1024; // 100MB
         if (self.max_message_size < min_message_size or self.max_message_size > max_message_size) {
-            std.debug.print("Configuration Error: max_message_size must be between {d} and {d}, got {d}\n", .{min_message_size, max_message_size, self.max_message_size});
+            std.debug.print("Configuration Error: max_message_size must be between {d} and {d}, got {d}\n", .{ min_message_size, max_message_size, self.max_message_size });
             return ValidationError.InvalidMaxMessageSize;
         }
 
@@ -130,22 +130,22 @@ pub const Config = struct {
         const max_timeout: u32 = 3600;
 
         if (self.timeout_seconds < min_timeout or self.timeout_seconds > max_timeout) {
-            std.debug.print("Configuration Error: timeout_seconds must be between {d} and {d}, got {d}\n", .{min_timeout, max_timeout, self.timeout_seconds});
+            std.debug.print("Configuration Error: timeout_seconds must be between {d} and {d}, got {d}\n", .{ min_timeout, max_timeout, self.timeout_seconds });
             return ValidationError.InvalidTimeout;
         }
 
         if (self.data_timeout_seconds < min_timeout or self.data_timeout_seconds > max_timeout) {
-            std.debug.print("Configuration Error: data_timeout_seconds must be between {d} and {d}, got {d}\n", .{min_timeout, max_timeout, self.data_timeout_seconds});
+            std.debug.print("Configuration Error: data_timeout_seconds must be between {d} and {d}, got {d}\n", .{ min_timeout, max_timeout, self.data_timeout_seconds });
             return ValidationError.InvalidTimeout;
         }
 
         if (self.command_timeout_seconds < min_timeout or self.command_timeout_seconds > max_timeout) {
-            std.debug.print("Configuration Error: command_timeout_seconds must be between {d} and {d}, got {d}\n", .{min_timeout, max_timeout, self.command_timeout_seconds});
+            std.debug.print("Configuration Error: command_timeout_seconds must be between {d} and {d}, got {d}\n", .{ min_timeout, max_timeout, self.command_timeout_seconds });
             return ValidationError.InvalidTimeout;
         }
 
         if (self.greeting_timeout_seconds < min_timeout or self.greeting_timeout_seconds > max_timeout) {
-            std.debug.print("Configuration Error: greeting_timeout_seconds must be between {d} and {d}, got {d}\n", .{min_timeout, max_timeout, self.greeting_timeout_seconds});
+            std.debug.print("Configuration Error: greeting_timeout_seconds must be between {d} and {d}, got {d}\n", .{ min_timeout, max_timeout, self.greeting_timeout_seconds });
             return ValidationError.InvalidTimeout;
         }
 
@@ -164,7 +164,7 @@ pub const Config = struct {
         const min_cleanup_interval: u64 = 60;
         const max_cleanup_interval: u64 = 86400;
         if (self.rate_limit_cleanup_interval < min_cleanup_interval or self.rate_limit_cleanup_interval > max_cleanup_interval) {
-            std.debug.print("Configuration Error: rate_limit_cleanup_interval must be between {d} and {d}, got {d}\n", .{min_cleanup_interval, max_cleanup_interval, self.rate_limit_cleanup_interval});
+            std.debug.print("Configuration Error: rate_limit_cleanup_interval must be between {d} and {d}, got {d}\n", .{ min_cleanup_interval, max_cleanup_interval, self.rate_limit_cleanup_interval });
             return ValidationError.InvalidRateLimit;
         }
 
@@ -181,7 +181,7 @@ pub const Config = struct {
 
             // Check if TLS certificate file exists
             if (self.tls_cert_path) |cert_path| {
-                std.Io.Dir.cwd().access(io_compat.getIo(),cert_path, .{}) catch {
+                std.Io.Dir.cwd().access(io_compat.getIo(), cert_path, .{}) catch {
                     std.debug.print("Configuration Error: TLS certificate file not found: {s}\n", .{cert_path});
                     return ValidationError.TLSCertificateNotFound;
                 };
@@ -189,7 +189,7 @@ pub const Config = struct {
 
             // Check if TLS key file exists
             if (self.tls_key_path) |key_path| {
-                std.Io.Dir.cwd().access(io_compat.getIo(),key_path, .{}) catch {
+                std.Io.Dir.cwd().access(io_compat.getIo(), key_path, .{}) catch {
                     std.debug.print("Configuration Error: TLS key file not found: {s}\n", .{key_path});
                     return ValidationError.TLSKeyNotFound;
                 };

@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const database = @import("../storage/database.zig");
 
@@ -7,7 +8,7 @@ const database = @import("../storage/database.zig");
 pub const QuotaManager = struct {
     allocator: std.mem.Allocator,
     db: *database.Database,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     // In-memory cache of quota info for performance
     quota_cache: std.StringHashMap(QuotaInfo),
     cache_ttl: i64, // Cache time-to-live in seconds

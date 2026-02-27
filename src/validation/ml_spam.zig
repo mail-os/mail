@@ -23,6 +23,7 @@
 //! ```
 
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const Allocator = std.mem.Allocator;
 
 // =============================================================================
@@ -103,11 +104,11 @@ pub const FeatureExtractor = struct {
 
         // Add common stop words
         const stop_list = [_][]const u8{
-            "the", "a",   "an",  "and", "or",  "but", "in",  "on",  "at",  "to",
-            "for", "of",  "is",  "it",  "be",  "as",  "was", "are", "been", "have",
-            "has", "had", "do",  "does", "did", "will", "would", "could", "should",
-            "may", "might", "must", "can", "this", "that", "these", "those", "i",
-            "you", "he",  "she", "we",  "they", "my",  "your", "his", "her", "our",
+            "the",   "a",    "an",   "and",  "or",   "but",   "in",    "on",    "at",     "to",
+            "for",   "of",   "is",   "it",   "be",   "as",    "was",   "are",   "been",   "have",
+            "has",   "had",  "do",   "does", "did",  "will",  "would", "could", "should", "may",
+            "might", "must", "can",  "this", "that", "these", "those", "i",     "you",    "he",
+            "she",   "we",   "they", "my",   "your", "his",   "her",   "our",
         };
 
         for (stop_list) |word| {
@@ -1478,14 +1479,14 @@ pub const TrainingJobManager = struct {
     allocator: Allocator,
     jobs: std.ArrayList(TrainingJob),
     next_job_id: u64,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: Allocator) TrainingJobManager {
         return .{
             .allocator = allocator,
             .jobs = std.ArrayList(TrainingJob).init(allocator),
             .next_job_id = 1,
-            .mutex = std.Thread.Mutex{},
+            .mutex = mutex_compat.Mutex{},
         };
     }
 

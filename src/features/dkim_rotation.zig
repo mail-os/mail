@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 pub const dkim = @import("../antispam/dkim.zig");
 
@@ -10,7 +11,7 @@ pub const DKIMRotationScheduler = struct {
     key_manager: *dkim.DKIMKeyManager,
     config: RotationConfig,
     rotation_state: std.StringHashMap(DomainRotationState),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     running: bool,
 
     pub const RotationConfig = struct {

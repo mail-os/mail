@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const statsd = @import("statsd.zig");
 
 /// Enhanced Application Metrics for SMTP Server
@@ -19,7 +20,6 @@ const statsd = @import("statsd.zig");
 /// metrics.recordSpamDetected(.spamassassin, 7.5);
 /// metrics.recordAuthAttempt(.plain, true);
 /// ```
-
 /// Spam detection engine types
 pub const SpamEngine = enum {
     spamassassin,
@@ -124,7 +124,7 @@ pub const SmtpMetrics = struct {
     allocator: std.mem.Allocator,
     client: ?*statsd.StatsDClient,
     enabled: bool,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     // In-memory counters for local aggregation
     counters: MetricCounters,
@@ -590,7 +590,7 @@ pub const DomainBounceTracker = struct {
 
     allocator: std.mem.Allocator,
     domains: std.StringHashMap(DomainStats),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
@@ -703,7 +703,7 @@ pub const QueueDepthHistogram = struct {
     sum: u64 = 0,
     min: ?usize = null,
     max: ?usize = null,
-    mutex: std.Thread.Mutex = .{},
+    mutex: mutex_compat.Mutex = .{},
 
     pub fn record(self: *Self, depth: usize) void {
         self.mutex.lock();
@@ -782,7 +782,7 @@ pub const MessageSizeDistribution = struct {
     total_messages: u64 = 0,
     min_size: ?usize = null,
     max_size: ?usize = null,
-    mutex: std.Thread.Mutex = .{},
+    mutex: mutex_compat.Mutex = .{},
 
     pub fn record(self: *Self, size: usize) void {
         self.mutex.lock();

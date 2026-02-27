@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 
 // Simplified database interface for audit trail
 // Production would import from storage/db.zig
@@ -77,7 +78,6 @@ const Database = struct {
 /// - Compliance reporting (SOC 2, HIPAA, GDPR)
 /// - Automatic log rotation and archival
 /// - Real-time audit event streaming
-
 /// Audit event types
 pub const AuditEventType = enum {
     // User Management
@@ -250,7 +250,7 @@ pub const AuditManager = struct {
     db: *Database,
     enable_hashing: bool,
     last_hash: ?[]const u8,
-    mutex: std.Thread.Mutex = .{},
+    mutex: mutex_compat.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator, db: *Database) AuditManager {
         return .{

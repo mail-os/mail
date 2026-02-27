@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const posix = std.posix;
 const time_compat = @import("../core/time_compat.zig");
 const socket = @import("../core/socket_compat.zig");
@@ -21,7 +22,6 @@ const tls = @import("tls");
 /// - SASL authentication
 /// - Mailbox subscriptions
 /// - Message status tracking
-
 /// IMAP server configuration
 pub const ImapConfig = struct {
     port: u16 = 143,
@@ -724,7 +724,7 @@ pub const ImapServer = struct {
     ssl_listener: ?socket.Server = null,
     sessions: std.ArrayList(*ImapSession),
     running: std.atomic.Value(bool),
-    mutex: std.Thread.Mutex = .{},
+    mutex: mutex_compat.Mutex = .{},
     auth_backend: *auth.AuthBackend,
     tls_context: ?*tls_mod.TlsContext = null,
     cert_key_pair: ?tls.config.CertKeyPair = null,
@@ -997,8 +997,10 @@ pub const ImapServer = struct {
 
             // Send close notify
             var close_buf: [64]u8 = undefined;
-            if (tls_conn.close(&close_buf)) |close_data| {
-                _ = connection.write(close_data) catch {};
+            if (tls_conn.close(&close_buf)) |maybe_close_data| {
+                if (maybe_close_data) |close_data| {
+                    _ = connection.write(close_data) catch {};
+                }
             } else |_| {}
         } else {
             // Plain text session (non-SSL)

@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const database = @import("../storage/database.zig");
 
@@ -8,7 +9,7 @@ const database = @import("../storage/database.zig");
 pub const Greylist = struct {
     allocator: std.mem.Allocator,
     entries: std.StringHashMap(GreylistEntry),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     db: ?*database.Database, // Optional database for persistence
 
     // Greylisting parameters

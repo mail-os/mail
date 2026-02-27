@@ -30,7 +30,9 @@ const Allocator = std.mem.Allocator;
 
 /// Get the current epoch timestamp in seconds (cross-platform).
 fn currentTimestamp() i64 {
-    const ts = std.posix.clock_gettime(.REALTIME) catch return 0;
+    var ts: std.c.timespec = undefined;
+    const rc = std.c.clock_gettime(.REALTIME, &ts);
+    if (rc != 0) return 0;
     return ts.sec;
 }
 

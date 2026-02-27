@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("mutex_compat.zig");
 const time_compat = @import("time_compat.zig");
 const io_compat = @import("io_compat.zig");
 
@@ -41,7 +42,7 @@ pub const Logger = struct {
     use_colors: bool,
     log_file: ?std.Io.File,
     log_file_offset: u64,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     format: LogFormat,
     service_name: []const u8,
     hostname: []const u8,
@@ -69,7 +70,7 @@ pub const Logger = struct {
             .use_colors = true,
             .log_file = log_file,
             .log_file_offset = log_file_offset,
-            .mutex = std.Thread.Mutex{},
+            .mutex = mutex_compat.Mutex{},
             .format = .text, // Default to text format
             .service_name = try allocator.dupe(u8, "smtp-server"),
             .hostname = try allocator.dupe(u8, hostname),

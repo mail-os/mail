@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("mutex_compat.zig");
 const time_compat = @import("time_compat.zig");
 const config = @import("config.zig");
 const args = @import("args.zig");
@@ -15,7 +16,7 @@ pub const HotReloadManager = struct {
     config_file_path: ?[]const u8,
     last_reload_time: i64,
     reload_count: u32,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     callbacks: std.ArrayList(ConfigChangeCallback),
 
     pub fn init(allocator: std.mem.Allocator, cfg: *config.Config, config_file_path: ?[]const u8) HotReloadManager {

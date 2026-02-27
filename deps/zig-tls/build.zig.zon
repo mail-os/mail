@@ -1,0 +1,12 @@
+.{
+    .name = .tls,
+    .version = "0.1.0",
+    .fingerprint = 0xacfd1db3b7b136c7,
+    .minimum_zig_version = "0.16.0-dev",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

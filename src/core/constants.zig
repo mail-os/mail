@@ -3,7 +3,6 @@ const std = @import("std");
 /// Global constants for SMTP server
 /// This module centralizes all magic numbers and buffer sizes used throughout the codebase
 /// to improve maintainability and consistency.
-
 /// Buffer sizes for I/O operations
 pub const BufferSizes = struct {
     /// Small buffer for short strings (e.g., status codes, short messages)

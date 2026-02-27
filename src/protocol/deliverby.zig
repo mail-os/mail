@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 /// DELIVERBY extension (RFC 2852)
@@ -273,7 +274,7 @@ pub const TimedMessage = struct {
 pub const TimedMessageQueue = struct {
     allocator: std.mem.Allocator,
     messages: std.ArrayList(TimedMessage),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) TimedMessageQueue {
         return .{

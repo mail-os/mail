@@ -5,7 +5,6 @@ const version_info = @import("../core/version.zig");
 /// Backup and Restore CLI Tool
 /// Provides comprehensive backup/restore functionality for the mail server
 /// Supports database, configuration, and maildir backups with verification
-
 pub const BackupError = error{
     BackupFailed,
     RestoreFailed,

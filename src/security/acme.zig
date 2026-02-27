@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 // =============================================================================
@@ -559,7 +560,7 @@ const ACMEAccount = struct {
 const NonceManager = struct {
     allocator: std.mem.Allocator,
     current_nonce: ?[]u8,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) NonceManager {
         return .{
@@ -629,7 +630,7 @@ pub const ACMEClient = struct {
     pending_challenges: std.StringHashMap(ACMEChallenge),
     active_orders: std.StringHashMap(ACMEOrder),
     stats: ACMEStats,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub const ACMEStats = struct {
         orders_created: u64 = 0,
@@ -1038,7 +1039,7 @@ pub const CertificateManager = struct {
     client: ACMEClient,
     certificates: std.StringHashMap(CertificateInfo),
     renewal_thread: ?CertRenewalThread,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, config: ACMEConfig) CertificateManager {
         return .{
@@ -1507,7 +1508,7 @@ const CSRBuilder = struct {
 pub const HTTP01Responder = struct {
     allocator: std.mem.Allocator,
     tokens: std.StringHashMap([]const u8),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) HTTP01Responder {
         return .{

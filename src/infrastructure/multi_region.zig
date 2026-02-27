@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 // =============================================================================
@@ -177,7 +178,7 @@ pub const MultiRegionManager = struct {
     replication_config: ReplicationConfig,
     event_queue: std.ArrayList(ReplicationEvent),
     next_event_id: u64,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     is_primary: bool,
 
     // Statistics
@@ -495,7 +496,7 @@ pub fn calculateDistance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) f64 {
 
     const a = @sin(dLat / 2) * @sin(dLat / 2) +
         @cos(lat1 * std.math.pi / 180.0) * @cos(lat2 * std.math.pi / 180.0) *
-        @sin(dLon / 2) * @sin(dLon / 2);
+            @sin(dLon / 2) * @sin(dLon / 2);
 
     const c = 2 * std.math.atan2(@sqrt(a), @sqrt(1 - a));
     return R * c;

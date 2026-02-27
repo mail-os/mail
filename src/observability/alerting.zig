@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const logger = @import("../core/logger.zig");
 const metrics = @import("metrics.zig");
@@ -228,7 +229,7 @@ pub const AlertManager = struct {
     rules: std.ArrayList(AlertRule),
     history: std.ArrayList(AlertHistoryEntry),
     max_history: usize,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     stats: AlertStats,
     enabled: bool,
 

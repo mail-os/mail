@@ -227,7 +227,8 @@ pub const ARCMessageSignature = struct {
         var buf: std.ArrayList(u8) = .{};
         errdefer buf.deinit(allocator);
 
-        try buf.print(allocator,
+        try buf.print(
+            allocator,
             "ARC-Message-Signature: i={d}; a={s}; c={s}; d={s}; s={s};\r\n" ++
                 "\th={s};\r\n" ++
                 "\tbh={s};\r\n",
@@ -336,7 +337,8 @@ pub const ARCSeal = struct {
         var buf: std.ArrayList(u8) = .{};
         errdefer buf.deinit(allocator);
 
-        try buf.print(allocator,
+        try buf.print(
+            allocator,
             "ARC-Seal: i={d}; a={s}; d={s}; s={s};\r\n" ++
                 "\tcv={s};",
             .{

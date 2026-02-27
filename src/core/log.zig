@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("mutex_compat.zig");
 const Allocator = std.mem.Allocator;
 const io_compat = @import("io_compat.zig");
 
@@ -106,7 +107,7 @@ pub const Logger = struct {
 
     config: Config,
     file: ?std.Io.File = null,
-    mutex: std.Thread.Mutex = .{},
+    mutex: mutex_compat.Mutex = .{},
     allocator: ?Allocator = null,
     file_offset: u64 = 0,
 
@@ -460,7 +461,7 @@ pub const Logger = struct {
 // =============================================================================
 
 var global_logger: ?Logger = null;
-var global_mutex: std.Thread.Mutex = .{};
+var global_mutex: mutex_compat.Mutex = .{};
 
 pub fn initGlobal(config: Config) void {
     global_mutex.lock();

@@ -9,7 +9,9 @@ const caldav_store = @import("../storage/caldav_store.zig");
 
 /// Get the current epoch timestamp in seconds.
 fn currentTimestamp() i64 {
-    const ts = std.posix.clock_gettime(.REALTIME) catch return 0;
+    var ts: std.c.timespec = undefined;
+    const rc = std.c.clock_gettime(.REALTIME, &ts);
+    if (rc != 0) return 0;
     return ts.sec;
 }
 
@@ -1827,8 +1829,10 @@ pub const CalDavServer = struct {
 
                 // Send close notify
                 var close_buf: [64]u8 = undefined;
-                if (tls_conn.close(&close_buf)) |close_data| {
-                    _ = connection.write(close_data) catch {};
+                if (tls_conn.close(&close_buf)) |maybe_close_data| {
+                    if (maybe_close_data) |close_data| {
+                        _ = connection.write(close_data) catch {};
+                    }
                 } else |_| {}
             }
             return;

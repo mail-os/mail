@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 
 /// PostgreSQL database backend for user management
 /// Alternative to SQLite for production deployments
@@ -215,7 +216,7 @@ pub const PostgresPool = struct {
     pool_size: usize,
     connections: std.ArrayList(*PostgresDatabase),
     available: std.ArrayList(*PostgresDatabase),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(
         allocator: std.mem.Allocator,

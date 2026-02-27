@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const constants = @import("../core/constants.zig");
 
 /// Thread-safe buffer pool for performance optimization
@@ -11,7 +12,7 @@ pub fn BufferPool(comptime buffer_size: usize) type {
         available_buffers: std.ArrayList([]u8),
         total_allocated: usize,
         max_pool_size: usize,
-        mutex: std.Thread.Mutex,
+        mutex: mutex_compat.Mutex,
         stats: Stats,
 
         pub const Stats = struct {

@@ -18,7 +18,6 @@ const platform = @import("platform.zig");
 /// - Abstract sockets (Linux) bypass filesystem
 /// - Automatic cleanup on close
 /// - Path length validation
-
 pub const UnixSocketError = error{
     NotSupportedOnThisPlatform,
     PathTooLong,

@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 pub const RateLimiter = struct {
@@ -9,7 +10,7 @@ pub const RateLimiter = struct {
     max_requests: u32,
     max_requests_per_user: u32,
     cleanup_interval_seconds: u64,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     cleanup_thread: ?std.Thread,
     should_stop: std.atomic.Value(bool),
     // Bucket-based tracking for O(1) cleanup
@@ -32,7 +33,7 @@ pub const RateLimiter = struct {
             .max_requests = max_requests,
             .max_requests_per_user = max_requests_per_user,
             .cleanup_interval_seconds = cleanup_interval_seconds,
-            .mutex = std.Thread.Mutex{},
+            .mutex = mutex_compat.Mutex{},
             .cleanup_thread = null,
             .should_stop = std.atomic.Value(bool).init(false),
             .time_buckets = std.AutoHashMap(i64, std.ArrayList([]const u8)).init(allocator),

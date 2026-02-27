@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const database = @import("../storage/database.zig");
 const attachment = @import("../message/attachment.zig");
 
@@ -9,7 +10,7 @@ pub const AttachmentLimitManager = struct {
     db: *database.Database,
     global_max_size: usize, // Global maximum attachment size
     global_max_total: usize, // Maximum total attachments size per message
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -150,7 +151,7 @@ pub const AttachmentLimitManager = struct {
     /// Get attachment count and total size for validation before processing
     pub fn getAttachmentStats(
         self: *AttachmentLimitManager,
-        mime_parts: []const anytype,
+        mime_parts: []const MimePart,
     ) AttachmentStats {
         _ = self;
 
@@ -197,6 +198,12 @@ pub const ValidationResult = struct {
 pub const AttachmentStats = struct {
     count: usize,
     total_size: usize,
+};
+
+/// Minimal MIME part representation for attachment stats
+pub const MimePart = struct {
+    headers: std.StringHashMap([]const u8),
+    body: []const u8,
 };
 
 /// Preset attachment limit configurations

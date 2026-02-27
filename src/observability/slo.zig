@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const Allocator = std.mem.Allocator;
 const time_compat = @import("../core/time_compat.zig");
 
@@ -90,7 +91,7 @@ pub const SliCollector = struct {
     memory_samples: std.ArrayList(f64),
     connection_samples: std.ArrayList(f64),
 
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     start_time: i64,
 
     const LATENCY_BUCKET_COUNT = 20;
@@ -310,7 +311,7 @@ pub const SloManager = struct {
     collector: *SliCollector,
     slos: std.ArrayList(Slo),
     evaluation_history: std.ArrayList(EvaluationRecord),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     // Alerting
     alert_callback: ?*const fn (SloAlert) void,
@@ -591,7 +592,7 @@ pub fn createDefaultSlos(manager: *SloManager) !void {
 pub const ErrorBudgetCalculator = struct {
     allocator: Allocator,
     budget_history: std.ArrayList(BudgetSnapshot),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     const BudgetSnapshot = struct {
         timestamp: i64,

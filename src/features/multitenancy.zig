@@ -1,10 +1,10 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 /// Multi-tenancy support for SMTP server
 /// Enables multiple isolated organizations to share the same infrastructure
 /// Each tenant has isolated data, quotas, and configuration
-
 /// Tenant information
 pub const Tenant = struct {
     id: []const u8,
@@ -161,7 +161,7 @@ pub const MultiTenancyManager = struct {
     allocator: std.mem.Allocator,
     db: *TenantDB,
     tenant_cache: std.StringHashMap(*Tenant),
-    cache_mutex: std.Thread.Mutex,
+    cache_mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, db: *TenantDB) !*MultiTenancyManager {
         const manager = try allocator.create(MultiTenancyManager);
@@ -169,7 +169,7 @@ pub const MultiTenancyManager = struct {
             .allocator = allocator,
             .db = db,
             .tenant_cache = std.StringHashMap(*Tenant).init(allocator),
-            .cache_mutex = std.Thread.Mutex{},
+            .cache_mutex = mutex_compat.Mutex{},
         };
         return manager;
     }
@@ -489,7 +489,7 @@ pub const TenantConnectionHandler = struct {
 pub const TenantRateLimiter = struct {
     allocator: std.mem.Allocator,
     tenant_buckets: std.StringHashMap(*TenantBucket),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     default_config: RateLimitConfig,
 
     pub const RateLimitConfig = struct {
@@ -529,7 +529,7 @@ pub const TenantRateLimiter = struct {
         return .{
             .allocator = allocator,
             .tenant_buckets = std.StringHashMap(*TenantBucket).init(allocator),
-            .mutex = std.Thread.Mutex{},
+            .mutex = mutex_compat.Mutex{},
             .default_config = .{},
         };
     }
@@ -754,14 +754,14 @@ pub const TenantConfig = struct {
 pub const TenantConfigManager = struct {
     allocator: std.mem.Allocator,
     configs: std.StringHashMap(TenantConfig),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     default_config: TenantConfig,
 
     pub fn init(allocator: std.mem.Allocator) TenantConfigManager {
         return .{
             .allocator = allocator,
             .configs = std.StringHashMap(TenantConfig).init(allocator),
-            .mutex = std.Thread.Mutex{},
+            .mutex = mutex_compat.Mutex{},
             .default_config = .{
                 .tenant_id = "default",
                 .smtp = .{},
@@ -992,13 +992,13 @@ pub const TenantUsageStats = struct {
 pub const TenantUsageManager = struct {
     allocator: std.mem.Allocator,
     stats: std.StringHashMap(*TenantUsageStats),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) TenantUsageManager {
         return .{
             .allocator = allocator,
             .stats = std.StringHashMap(*TenantUsageStats).init(allocator),
-            .mutex = std.Thread.Mutex{},
+            .mutex = mutex_compat.Mutex{},
         };
     }
 

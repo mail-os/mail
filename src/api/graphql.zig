@@ -5,7 +5,6 @@ const password_mod = @import("../auth/password.zig");
 
 /// GraphQL API for user management
 /// Supports queries and mutations for CRUD operations on users
-
 pub const GraphQLError = error{
     ParseError,
     ValidationError,
@@ -674,7 +673,7 @@ pub const GraphQLParser = struct {
             return false;
         }
 
-        if (std.mem.eql(u8, self.source[self.pos..self.pos + keyword.len], keyword)) {
+        if (std.mem.eql(u8, self.source[self.pos .. self.pos + keyword.len], keyword)) {
             // Make sure it's not part of a longer identifier
             if (self.pos + keyword.len < self.source.len) {
                 const next = self.source[self.pos + keyword.len];

@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("mutex_compat.zig");
 const time_compat = @import("time_compat.zig");
 const io_compat = @import("io_compat.zig");
 const net = std.Io.net;
@@ -181,7 +182,7 @@ pub const SessionCache = struct {
     allocator: std.mem.Allocator,
     sessions: std.StringHashMap(SessionTicket),
     max_sessions: usize,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, max_sessions: usize) SessionCache {
         return .{
@@ -565,8 +566,10 @@ pub fn upgradeToTls(
     log.info("Starting TLS handshake...", .{});
 
     // Load certificate and key
+    const io = io_compat.getIo();
     var auth = tls.config.CertKeyPair.fromFilePathAbsolute(
         allocator,
+        io,
         cert_path,
         key_path,
     ) catch |err| {

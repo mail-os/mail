@@ -5,7 +5,9 @@ const password_mod = @import("password.zig");
 
 /// Get current unix timestamp in seconds
 fn getCurrentTimestamp() i64 {
-    const ts = posix.clock_gettime(.REALTIME) catch return 0;
+    var ts: std.c.timespec = undefined;
+    const rc = std.c.clock_gettime(.REALTIME, &ts);
+    if (rc != 0) return 0;
     return ts.sec;
 }
 

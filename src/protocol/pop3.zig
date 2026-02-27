@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const auth = @import("../auth/auth.zig");
 const logger = @import("../core/logger.zig");
 
@@ -13,7 +14,6 @@ const logger = @import("../core/logger.zig");
 /// - SSL/TLS support (POP3S)
 /// - Message deletion
 /// - Multi-drop mailbox support
-
 /// POP3 server configuration
 pub const Pop3Config = struct {
     port: u16 = 110,
@@ -577,7 +577,7 @@ pub const Pop3Server = struct {
     listener: ?std.net.Server = null,
     sessions: std.ArrayList(*Pop3Session),
     running: std.atomic.Value(bool),
-    mutex: std.Thread.Mutex = .{},
+    mutex: mutex_compat.Mutex = .{},
     auth_backend: *auth.AuthBackend,
 
     pub fn init(allocator: std.mem.Allocator, config: Pop3Config, auth_backend: *auth.AuthBackend) Pop3Server {

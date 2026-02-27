@@ -625,9 +625,7 @@ pub const DKIMKeyManager = struct {
         std.c.arc4random_buf(&random_bytes, random_bytes.len);
 
         const pub_hex = std.fmt.bytesToHex(random_bytes[0..32].*, .lower);
-        const public_key = try std.fmt.allocPrint(self.allocator,
-            "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA{s}",
-            .{&pub_hex});
+        const public_key = try std.fmt.allocPrint(self.allocator, "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA{s}", .{&pub_hex});
 
         _ = algorithm;
         const full_hex = std.fmt.bytesToHex(random_bytes, .lower);
@@ -942,8 +940,7 @@ pub const DKIMCli = struct {
 
         return .{
             .success = true,
-            .message = try std.fmt.allocPrint(self.allocator,
-                "Rotation scheduled for key {s} in {d} days", .{ key_id, days }),
+            .message = try std.fmt.allocPrint(self.allocator, "Rotation scheduled for key {s} in {d} days", .{ key_id, days }),
             .data = null,
         };
     }

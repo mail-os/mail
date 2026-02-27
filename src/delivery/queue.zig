@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const database = @import("../storage/database.zig");
 
@@ -59,7 +60,7 @@ pub const QueuedMessage = struct {
 pub const MessageQueue = struct {
     allocator: std.mem.Allocator,
     messages: std.ArrayList(*QueuedMessage),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     next_id: u64,
     db: ?*database.Database, // Optional database for persistence
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 
 /// Connection pool for SMTP relay connections
 pub const ConnectionPool = struct {
@@ -8,7 +9,7 @@ pub const ConnectionPool = struct {
     max_connections: usize,
     idle_timeout_ms: u32,
     connections: std.ArrayList(PooledConnection),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     const PooledConnection = struct {
         stream: std.net.Stream,
@@ -177,7 +178,7 @@ pub fn ResourcePool(comptime T: type) type {
         create_fn: *const fn (std.mem.Allocator) anyerror!T,
         destroy_fn: *const fn (T) void,
         max_size: usize,
-        mutex: std.Thread.Mutex,
+        mutex: mutex_compat.Mutex,
 
         const Resource = struct {
             value: T,

@@ -622,8 +622,7 @@ pub const WebmailHandler = struct {
             };
             defer self.allocator.free(json);
 
-            return std.fmt.allocPrint(self.allocator,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{s}", .{json});
+            return std.fmt.allocPrint(self.allocator, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{s}", .{json});
         }
         return self.serveError(404, "Template not found");
     }
@@ -720,8 +719,7 @@ pub const WebmailHandler = struct {
             };
             defer self.allocator.free(json);
 
-            return std.fmt.allocPrint(self.allocator,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{s}", .{json});
+            return std.fmt.allocPrint(self.allocator, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{s}", .{json});
         }
         return self.serveError(404, "Signature not found");
     }
@@ -1125,7 +1123,8 @@ pub const WebmailHandler = struct {
             defer self.allocator.free(data);
 
             // Build response with actual content
-            const header = try std.fmt.allocPrint(self.allocator,
+            const header = try std.fmt.allocPrint(
+                self.allocator,
                 "HTTP/1.1 200 OK\r\n" ++
                     "Content-Type: {s}\r\n" ++
                     "Content-Disposition: attachment; filename=\"{s}\"\r\n" ++
@@ -1172,7 +1171,8 @@ pub const WebmailHandler = struct {
     }
 
     fn serveError(self: *WebmailHandler, status: u16, message: []const u8) ![]u8 {
-        return std.fmt.allocPrint(self.allocator,
+        return std.fmt.allocPrint(
+            self.allocator,
             "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\n\r\n{{\"error\": \"{s}\"}}",
             .{ status, message, message },
         );
@@ -1185,7 +1185,8 @@ pub const WebmailHandler = struct {
     /// Serve the main webmail page
     pub fn serveMainPage(self: *WebmailHandler) ![]u8 {
         const html = webmail_html;
-        return std.fmt.allocPrint(self.allocator,
+        return std.fmt.allocPrint(
+            self.allocator,
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\n\r\n{s}",
             .{ html.len, html },
         );

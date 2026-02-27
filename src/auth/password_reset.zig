@@ -1,10 +1,10 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 /// Secure Password Reset System
 /// Implements token-based password reset with expiration
 /// Follows OWASP guidelines for secure password reset
-
 /// Password reset token entry
 pub const ResetToken = struct {
     id: i64,
@@ -37,7 +37,7 @@ pub const PasswordResetManager = struct {
     db: *anyopaque, // Database pointer
     token_expiry_minutes: u32,
     max_attempts_per_hour: u32,
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     // Statistics
     tokens_generated: u64,

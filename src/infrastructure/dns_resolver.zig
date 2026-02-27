@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 /// DNS Resolver with validation for address family and result verification
@@ -263,7 +264,7 @@ pub const DNSResolver = struct {
 pub const DNSCache = struct {
     allocator: std.mem.Allocator,
     cache: std.StringHashMap(CacheEntry),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     default_ttl_seconds: u64,
 
     const CacheEntry = struct {

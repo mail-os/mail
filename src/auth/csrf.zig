@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const crypto = std.crypto;
 
@@ -6,7 +7,7 @@ const crypto = std.crypto;
 pub const CSRFManager = struct {
     allocator: std.mem.Allocator,
     tokens: std.StringHashMap(TokenData),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     token_lifetime_seconds: i64,
 
     const TokenData = struct {
@@ -21,7 +22,7 @@ pub const CSRFManager = struct {
         return .{
             .allocator = allocator,
             .tokens = std.StringHashMap(TokenData).init(allocator),
-            .mutex = std.Thread.Mutex{},
+            .mutex = mutex_compat.Mutex{},
             .token_lifetime_seconds = DEFAULT_LIFETIME,
         };
     }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("mutex_compat.zig");
 const logger = @import("logger.zig");
 
 /// Plugin System for SMTP Server Extensibility
@@ -12,7 +13,6 @@ const logger = @import("logger.zig");
 /// - Sandboxed plugin execution with resource limits
 /// - Plugin configuration and metadata
 /// - Hot-reload support for development
-
 /// Plugin metadata
 pub const PluginMetadata = struct {
     name: []const u8,
@@ -352,7 +352,7 @@ pub const PluginManager = struct {
     allocator: std.mem.Allocator,
     plugins: std.ArrayList(*Plugin),
     plugin_dir: []const u8,
-    mutex: std.Thread.Mutex = .{},
+    mutex: mutex_compat.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator, plugin_dir: []const u8) !PluginManager {
         return .{
@@ -1162,9 +1162,9 @@ pub const AttachmentScannerPluginTemplate = struct {
 
     /// Dangerous file extensions
     pub const dangerous_extensions = [_][]const u8{
-        ".exe", ".bat", ".cmd", ".com", ".scr",
-        ".pif", ".vbs", ".vbe", ".js",  ".jse",
-        ".ws",  ".wsf", ".msi", ".msp", ".msc",
+        ".exe", ".bat", ".cmd",  ".com",  ".scr",
+        ".pif", ".vbs", ".vbe",  ".js",   ".jse",
+        ".ws",  ".wsf", ".msi",  ".msp",  ".msc",
         ".ps1", ".ps2", ".psc1", ".psc2",
     };
 

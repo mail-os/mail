@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const net = std.net;
 const Allocator = std.mem.Allocator;
@@ -464,13 +465,13 @@ pub const WebSocketSession = struct {
 pub const NotificationManager = struct {
     allocator: Allocator,
     sessions: std.ArrayList(*WebSocketSession),
-    sessions_mutex: std.Thread.Mutex,
+    sessions_mutex: mutex_compat.Mutex,
 
     pub fn init(allocator: Allocator) NotificationManager {
         return NotificationManager{
             .allocator = allocator,
             .sessions = std.ArrayList(*WebSocketSession){},
-            .sessions_mutex = std.Thread.Mutex{},
+            .sessions_mutex = mutex_compat.Mutex{},
         };
     }
 
@@ -1065,9 +1066,7 @@ pub const EventStream = struct {
         }
 
         // Send replay complete message
-        const msg = try std.fmt.allocPrint(self.allocator,
-            "{{\"type\":\"replay_complete\",\"replayed\":{d},\"current_sequence\":{d}}}",
-            .{ replay_count, self.sequence_number });
+        const msg = try std.fmt.allocPrint(self.allocator, "{{\"type\":\"replay_complete\",\"replayed\":{d},\"current_sequence\":{d}}}", .{ replay_count, self.sequence_number });
         defer self.allocator.free(msg);
 
         try self.session.sendText(msg);
@@ -1079,7 +1078,7 @@ pub const DeliveryTracker = struct {
     allocator: Allocator,
     notification_manager: *NotificationManager,
     tracked_messages: std.StringHashMap(TrackedMessage),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
 
     const TrackedMessage = struct {
         message_id: []const u8,
@@ -1099,7 +1098,7 @@ pub const DeliveryTracker = struct {
             .allocator = allocator,
             .notification_manager = notification_manager,
             .tracked_messages = std.StringHashMap(TrackedMessage).init(allocator),
-            .mutex = std.Thread.Mutex{},
+            .mutex = mutex_compat.Mutex{},
         };
     }
 

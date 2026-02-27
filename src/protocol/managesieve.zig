@@ -1,4 +1,5 @@
 const std = @import("std");
+const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const socket = @import("../core/socket_compat.zig");
 
@@ -21,8 +22,19 @@ pub const ManageSieveConfig = struct {
 };
 
 pub const ManageSieveCommand = enum {
-    AUTHENTICATE, CAPABILITY, HAVESPACE, PUTSCRIPT, LISTSCRIPTS, SETACTIVE,
-    GETSCRIPT, DELETESCRIPT, RENAMESCRIPT, CHECKSCRIPT, NOOP, LOGOUT, STARTTLS,
+    AUTHENTICATE,
+    CAPABILITY,
+    HAVESPACE,
+    PUTSCRIPT,
+    LISTSCRIPTS,
+    SETACTIVE,
+    GETSCRIPT,
+    DELETESCRIPT,
+    RENAMESCRIPT,
+    CHECKSCRIPT,
+    NOOP,
+    LOGOUT,
+    STARTTLS,
 
     pub fn fromString(str: []const u8) ?ManageSieveCommand {
         if (str.len == 0 or str.len > 16) return null;
@@ -47,12 +59,19 @@ pub const ManageSieveCommand = enum {
 
     pub fn toString(self: ManageSieveCommand) []const u8 {
         return switch (self) {
-            .AUTHENTICATE => "AUTHENTICATE", .CAPABILITY => "CAPABILITY",
-            .HAVESPACE => "HAVESPACE", .PUTSCRIPT => "PUTSCRIPT",
-            .LISTSCRIPTS => "LISTSCRIPTS", .SETACTIVE => "SETACTIVE",
-            .GETSCRIPT => "GETSCRIPT", .DELETESCRIPT => "DELETESCRIPT",
-            .RENAMESCRIPT => "RENAMESCRIPT", .CHECKSCRIPT => "CHECKSCRIPT",
-            .NOOP => "NOOP", .LOGOUT => "LOGOUT", .STARTTLS => "STARTTLS",
+            .AUTHENTICATE => "AUTHENTICATE",
+            .CAPABILITY => "CAPABILITY",
+            .HAVESPACE => "HAVESPACE",
+            .PUTSCRIPT => "PUTSCRIPT",
+            .LISTSCRIPTS => "LISTSCRIPTS",
+            .SETACTIVE => "SETACTIVE",
+            .GETSCRIPT => "GETSCRIPT",
+            .DELETESCRIPT => "DELETESCRIPT",
+            .RENAMESCRIPT => "RENAMESCRIPT",
+            .CHECKSCRIPT => "CHECKSCRIPT",
+            .NOOP => "NOOP",
+            .LOGOUT => "LOGOUT",
+            .STARTTLS => "STARTTLS",
         };
     }
 };
@@ -60,17 +79,34 @@ pub const ManageSieveCommand = enum {
 pub const ManageSieveState = enum { connected, tls_negotiating, authenticated, closing };
 
 pub const ResponseCode = enum {
-    AUTH_TOO_WEAK, ENCRYPT_NEEDED, QUOTA, QUOTA_MAXSCRIPTS, QUOTA_MAXSIZE,
-    REFERRAL, SASL, TRANSITION_NEEDED, TRYLATER, ACTIVE, NONEXISTENT, ALREADYEXISTS, TAG,
+    AUTH_TOO_WEAK,
+    ENCRYPT_NEEDED,
+    QUOTA,
+    QUOTA_MAXSCRIPTS,
+    QUOTA_MAXSIZE,
+    REFERRAL,
+    SASL,
+    TRANSITION_NEEDED,
+    TRYLATER,
+    ACTIVE,
+    NONEXISTENT,
+    ALREADYEXISTS,
+    TAG,
 
     pub fn toString(self: ResponseCode) []const u8 {
         return switch (self) {
-            .AUTH_TOO_WEAK => "AUTH-TOO-WEAK", .ENCRYPT_NEEDED => "ENCRYPT-NEEDED",
-            .QUOTA => "QUOTA", .QUOTA_MAXSCRIPTS => "QUOTA/MAXSCRIPTS",
-            .QUOTA_MAXSIZE => "QUOTA/MAXSIZE", .REFERRAL => "REFERRAL",
-            .SASL => "SASL", .TRANSITION_NEEDED => "TRANSITION-NEEDED",
-            .TRYLATER => "TRYLATER", .ACTIVE => "ACTIVE",
-            .NONEXISTENT => "NONEXISTENT", .ALREADYEXISTS => "ALREADYEXISTS",
+            .AUTH_TOO_WEAK => "AUTH-TOO-WEAK",
+            .ENCRYPT_NEEDED => "ENCRYPT-NEEDED",
+            .QUOTA => "QUOTA",
+            .QUOTA_MAXSCRIPTS => "QUOTA/MAXSCRIPTS",
+            .QUOTA_MAXSIZE => "QUOTA/MAXSIZE",
+            .REFERRAL => "REFERRAL",
+            .SASL => "SASL",
+            .TRANSITION_NEEDED => "TRANSITION-NEEDED",
+            .TRYLATER => "TRYLATER",
+            .ACTIVE => "ACTIVE",
+            .NONEXISTENT => "NONEXISTENT",
+            .ALREADYEXISTS => "ALREADYEXISTS",
             .TAG => "TAG",
         };
     }
@@ -87,9 +123,13 @@ pub const ManageSieveCapability = struct {
 
     pub fn init(config: *const ManageSieveConfig) ManageSieveCapability {
         return .{
-            .implementation = config.implementation_name, .sasl_mechanisms = "PLAIN",
-            .sieve_extensions = config.sieve_extensions, .starttls = config.enable_tls,
-            .notify_methods = "mailto", .max_redirects = config.max_redirects, .version = "1.0",
+            .implementation = config.implementation_name,
+            .sasl_mechanisms = "PLAIN",
+            .sieve_extensions = config.sieve_extensions,
+            .starttls = config.enable_tls,
+            .notify_methods = "mailto",
+            .max_redirects = config.max_redirects,
+            .version = "1.0",
         };
     }
 
@@ -148,16 +188,26 @@ pub const SaslPlainCredentials = struct {
     }
 
     pub fn deinit(self: *SaslPlainCredentials, allocator: std.mem.Allocator) void {
-        if (self.passwd.len > 0) { const p: []u8 = @constCast(self.passwd); @memset(p, 0); allocator.free(p); }
+        if (self.passwd.len > 0) {
+            const p: []u8 = @constCast(self.passwd);
+            @memset(p, 0);
+            allocator.free(p);
+        }
         if (self.authcid.len > 0) allocator.free(self.authcid);
         if (self.authzid.len > 0) allocator.free(self.authzid);
     }
 };
 
 pub const ResponseFormatter = struct {
-    pub fn ok(a: std.mem.Allocator, code: ?ResponseCode, msg: ?[]const u8) ![]const u8 { return fmtResp(a, "OK", code, msg); }
-    pub fn no(a: std.mem.Allocator, code: ?ResponseCode, msg: ?[]const u8) ![]const u8 { return fmtResp(a, "NO", code, msg); }
-    pub fn bye(a: std.mem.Allocator, code: ?ResponseCode, msg: ?[]const u8) ![]const u8 { return fmtResp(a, "BYE", code, msg); }
+    pub fn ok(a: std.mem.Allocator, code: ?ResponseCode, msg: ?[]const u8) ![]const u8 {
+        return fmtResp(a, "OK", code, msg);
+    }
+    pub fn no(a: std.mem.Allocator, code: ?ResponseCode, msg: ?[]const u8) ![]const u8 {
+        return fmtResp(a, "NO", code, msg);
+    }
+    pub fn bye(a: std.mem.Allocator, code: ?ResponseCode, msg: ?[]const u8) ![]const u8 {
+        return fmtResp(a, "BYE", code, msg);
+    }
 
     fn fmtResp(a: std.mem.Allocator, tag: []const u8, code: ?ResponseCode, msg: ?[]const u8) ![]const u8 {
         var buf: std.ArrayList(u8) = .{};
@@ -180,7 +230,10 @@ pub const ResponseFormatter = struct {
         var buf: std.ArrayList(u8) = .{};
         defer buf.deinit(a);
         try buf.append(a, '"');
-        for (data) |c| { if (c == '\\' or c == '"') try buf.append(a, '\\'); try buf.append(a, c); }
+        for (data) |c| {
+            if (c == '\\' or c == '"') try buf.append(a, '\\');
+            try buf.append(a, c);
+        }
         try buf.append(a, '"');
         return try a.dupe(u8, buf.items);
     }
@@ -199,7 +252,10 @@ pub const LiteralParser = struct {
         if (i == ds) return null;
         const length = std.fmt.parseInt(usize, input[ds..i], 10) catch return null;
         var ns = false;
-        if (i < input.len and input[i] == '+') { ns = true; i += 1; }
+        if (i < input.len and input[i] == '+') {
+            ns = true;
+            i += 1;
+        }
         if (i >= input.len or input[i] != '}') return null;
         i += 1;
         if (i + 1 >= input.len or input[i] != '\r' or input[i + 1] != '\n') return null;
@@ -216,7 +272,10 @@ fn extractQuotedString(input: []const u8) ?QStr {
     const off = @intFromPtr(tr.ptr) - @intFromPtr(input.ptr);
     var i: usize = 1;
     while (i < tr.len) {
-        if (tr[i] == '\\' and i + 1 < tr.len) { i += 2; continue; }
+        if (tr[i] == '\\' and i + 1 < tr.len) {
+            i += 2;
+            continue;
+        }
         if (tr[i] == '"') return .{ .value = tr[1..i], .end = off + i + 1 };
         i += 1;
     }
@@ -234,7 +293,9 @@ fn validateSieveScript(script: []const u8) bool {
     return d == 0;
 }
 
-pub fn checkScriptSize(size: usize, max: usize) bool { return size <= max; }
+pub fn checkScriptSize(size: usize, max: usize) bool {
+    return size <= max;
+}
 
 pub const ManageSieveSession = struct {
     allocator: std.mem.Allocator,
@@ -248,9 +309,14 @@ pub const ManageSieveSession = struct {
 
     pub fn init(allocator: std.mem.Allocator, connection: socket.Connection, server: *ManageSieveServer) ManageSieveSession {
         return .{
-            .allocator = allocator, .stream = connection, .server = server,
-            .state = .connected, .username = null, .tls_active = false,
-            .scripts = std.StringHashMap(SieveScript).init(allocator), .active_script = null,
+            .allocator = allocator,
+            .stream = connection,
+            .server = server,
+            .state = .connected,
+            .username = null,
+            .tls_active = false,
+            .scripts = std.StringHashMap(SieveScript).init(allocator),
+            .active_script = null,
         };
     }
 
@@ -258,7 +324,10 @@ pub const ManageSieveSession = struct {
         if (self.username) |u| self.allocator.free(u);
         if (self.active_script) |a| self.allocator.free(a);
         var it = self.scripts.iterator();
-        while (it.next()) |e| { var s = e.value_ptr.*; s.deinit(self.allocator); }
+        while (it.next()) |e| {
+            var s = e.value_ptr.*;
+            s.deinit(self.allocator);
+        }
         self.scripts.deinit();
     }
 
@@ -270,19 +339,26 @@ pub const ManageSieveSession = struct {
     }
 
     fn sendOk(self: *ManageSieveSession, code: ?ResponseCode, msg: ?[]const u8) !void {
-        const r = try ResponseFormatter.ok(self.allocator, code, msg); defer self.allocator.free(r); try self.send(r);
+        const r = try ResponseFormatter.ok(self.allocator, code, msg);
+        defer self.allocator.free(r);
+        try self.send(r);
     }
     fn sendNo(self: *ManageSieveSession, code: ?ResponseCode, msg: ?[]const u8) !void {
-        const r = try ResponseFormatter.no(self.allocator, code, msg); defer self.allocator.free(r); try self.send(r);
+        const r = try ResponseFormatter.no(self.allocator, code, msg);
+        defer self.allocator.free(r);
+        try self.send(r);
     }
     fn sendBye(self: *ManageSieveSession, code: ?ResponseCode, msg: ?[]const u8) !void {
-        const r = try ResponseFormatter.bye(self.allocator, code, msg); defer self.allocator.free(r); try self.send(r);
+        const r = try ResponseFormatter.bye(self.allocator, code, msg);
+        defer self.allocator.free(r);
+        try self.send(r);
     }
 
     fn sendCapabilities(self: *ManageSieveSession) !void {
         var cap = ManageSieveCapability.init(&self.server.config);
         if (self.tls_active) cap.starttls = false;
-        const s = try cap.format(self.allocator); defer self.allocator.free(s);
+        const s = try cap.format(self.allocator);
+        defer self.allocator.free(s);
         try self.send(s);
         try self.sendOk(null, null);
     }
@@ -290,9 +366,13 @@ pub const ManageSieveSession = struct {
     pub fn handleConnection(self: *ManageSieveSession) !void {
         try self.sendCapabilities();
         var rbuf: [8192]u8 = undefined;
-        var lbuf = std.ArrayList(u8){}; defer lbuf.deinit(self.allocator);
+        var lbuf = std.ArrayList(u8){};
+        defer lbuf.deinit(self.allocator);
         while (self.state != .closing) {
-            const n = self.stream.read(&rbuf) catch |err| { std.log.err("ManageSieve read: {}", .{err}); break; };
+            const n = self.stream.read(&rbuf) catch |err| {
+                std.log.err("ManageSieve read: {}", .{err});
+                break;
+            };
             if (n == 0) break;
             try lbuf.appendSlice(self.allocator, rbuf[0..n]);
             while (self.state != .closing) {
@@ -302,7 +382,10 @@ pub const ManageSieveSession = struct {
                 const consumed = end + 2;
                 if (consumed < lbuf.items.len) std.mem.copyForwards(u8, lbuf.items[0..], lbuf.items[consumed..]);
                 lbuf.shrinkRetainingCapacity(lbuf.items.len - consumed);
-                if (!cont) { self.state = .closing; break; }
+                if (!cont) {
+                    self.state = .closing;
+                    break;
+                }
             }
         }
     }
@@ -315,16 +398,37 @@ pub const ManageSieveSession = struct {
         const rest = if (parts.next()) |f| blk: {
             break :blk t[@intFromPtr(f.ptr) - @intFromPtr(t.ptr) ..];
         } else "";
-        const cmd = ManageSieveCommand.fromString(cs) orelse { try self.sendNo(null, "Unknown command"); return true; };
+        const cmd = ManageSieveCommand.fromString(cs) orelse {
+            try self.sendNo(null, "Unknown command");
+            return true;
+        };
         switch (cmd) {
-            .CAPABILITY => { try self.sendCapabilities(); return true; },
-            .LOGOUT => { try self.handleLogout(); return false; },
-            .STARTTLS => { try self.handleStartTls(); return true; },
-            .AUTHENTICATE => { try self.handleAuthenticate(rest); return true; },
-            .NOOP => { try self.handleNoop(rest); return true; },
+            .CAPABILITY => {
+                try self.sendCapabilities();
+                return true;
+            },
+            .LOGOUT => {
+                try self.handleLogout();
+                return false;
+            },
+            .STARTTLS => {
+                try self.handleStartTls();
+                return true;
+            },
+            .AUTHENTICATE => {
+                try self.handleAuthenticate(rest);
+                return true;
+            },
+            .NOOP => {
+                try self.handleNoop(rest);
+                return true;
+            },
             else => {},
         }
-        if (self.state != .authenticated) { try self.sendNo(null, "Authenticate first"); return true; }
+        if (self.state != .authenticated) {
+            try self.sendNo(null, "Authenticate first");
+            return true;
+        }
         switch (cmd) {
             .HAVESPACE => try self.handleHaveSpace(rest),
             .PUTSCRIPT => try self.handlePutScript(rest),
@@ -340,26 +444,48 @@ pub const ManageSieveSession = struct {
     }
 
     fn handleAuthenticate(self: *ManageSieveSession, args: []const u8) !void {
-        if (self.state == .authenticated) { try self.sendNo(null, "Already authenticated"); return; }
-        const mech = extractQuotedString(args) orelse { try self.sendNo(null, "Missing authentication mechanism"); return; };
+        if (self.state == .authenticated) {
+            try self.sendNo(null, "Already authenticated");
+            return;
+        }
+        const mech = extractQuotedString(args) orelse {
+            try self.sendNo(null, "Missing authentication mechanism");
+            return;
+        };
         var mb: [16]u8 = undefined;
-        if (mech.value.len > 16) { try self.sendNo(.AUTH_TOO_WEAK, "Unsupported mechanism"); return; }
+        if (mech.value.len > 16) {
+            try self.sendNo(.AUTH_TOO_WEAK, "Unsupported mechanism");
+            return;
+        }
         const mu = mb[0..mech.value.len];
         _ = std.ascii.upperString(mu, mech.value);
-        if (!std.mem.eql(u8, mu, "PLAIN")) { try self.sendNo(.AUTH_TOO_WEAK, "Only PLAIN is supported"); return; }
+        if (!std.mem.eql(u8, mu, "PLAIN")) {
+            try self.sendNo(.AUTH_TOO_WEAK, "Only PLAIN is supported");
+            return;
+        }
         const rem = std.mem.trim(u8, args[mech.end..], " \t");
-        const cs = extractQuotedString(rem) orelse { try self.sendNo(null, "SASL PLAIN initial response required"); return; };
+        const cs = extractQuotedString(rem) orelse {
+            try self.sendNo(null, "SASL PLAIN initial response required");
+            return;
+        };
         var creds = (try SaslPlainCredentials.decode(self.allocator, cs.value)) orelse {
-            try self.sendNo(null, "Invalid SASL PLAIN credentials"); return;
+            try self.sendNo(null, "Invalid SASL PLAIN credentials");
+            return;
         };
         defer creds.deinit(self.allocator);
         const auth = self.server.auth_backend orelse {
-            try self.sendNo(.TRYLATER, "No auth backend configured"); return;
+            try self.sendNo(.TRYLATER, "No auth backend configured");
+            return;
         };
         const valid = auth.verifyCredentials(creds.authcid, creds.passwd) catch {
-            try self.sendNo(.TRYLATER, "Auth backend unavailable"); return;
+            try self.sendNo(.TRYLATER, "Auth backend unavailable");
+            return;
         };
-        if (!valid) { std.log.warn("ManageSieve auth failed: {s}", .{creds.authcid}); try self.sendNo(null, "Authentication failed"); return; }
+        if (!valid) {
+            std.log.warn("ManageSieve auth failed: {s}", .{creds.authcid});
+            try self.sendNo(null, "Authentication failed");
+            return;
+        }
         self.username = try self.allocator.dupe(u8, creds.authcid);
         self.state = .authenticated;
         std.log.info("ManageSieve authenticated: {s}", .{creds.authcid});
@@ -367,44 +493,88 @@ pub const ManageSieveSession = struct {
     }
 
     fn handleStartTls(self: *ManageSieveSession) !void {
-        if (self.tls_active) { try self.sendNo(null, "TLS already active"); return; }
-        if (!self.server.config.enable_tls) { try self.sendNo(null, "STARTTLS not available"); return; }
-        if (self.state == .authenticated) { try self.sendNo(null, "STARTTLS not allowed after auth"); return; }
+        if (self.tls_active) {
+            try self.sendNo(null, "TLS already active");
+            return;
+        }
+        if (!self.server.config.enable_tls) {
+            try self.sendNo(null, "STARTTLS not available");
+            return;
+        }
+        if (self.state == .authenticated) {
+            try self.sendNo(null, "STARTTLS not allowed after auth");
+            return;
+        }
         try self.sendOk(null, "Begin TLS negotiation now");
         self.tls_active = true;
         self.state = .connected; // client must re-authenticate
     }
 
     fn handleHaveSpace(self: *ManageSieveSession, args: []const u8) !void {
-        const nm = extractQuotedString(args) orelse { try self.sendNo(null, "Missing script name"); return; };
+        const nm = extractQuotedString(args) orelse {
+            try self.sendNo(null, "Missing script name");
+            return;
+        };
         const rem = std.mem.trim(u8, args[nm.end..], " \t");
-        const sz = std.fmt.parseInt(usize, rem, 10) catch { try self.sendNo(null, "Invalid size"); return; };
-        if (sz > self.server.config.max_script_size) { try self.sendNo(.QUOTA_MAXSIZE, "Script too large"); return; }
+        const sz = std.fmt.parseInt(usize, rem, 10) catch {
+            try self.sendNo(null, "Invalid size");
+            return;
+        };
+        if (sz > self.server.config.max_script_size) {
+            try self.sendNo(.QUOTA_MAXSIZE, "Script too large");
+            return;
+        }
         if (self.scripts.count() >= self.server.config.max_scripts_per_user and !self.scripts.contains(nm.value)) {
-            try self.sendNo(.QUOTA_MAXSCRIPTS, "Too many scripts"); return;
+            try self.sendNo(.QUOTA_MAXSCRIPTS, "Too many scripts");
+            return;
         }
         try self.sendOk(null, "Space available");
     }
 
     fn handlePutScript(self: *ManageSieveSession, args: []const u8) !void {
-        const nm = extractQuotedString(args) orelse { try self.sendNo(null, "Missing script name"); return; };
-        if (nm.value.len == 0) { try self.sendNo(null, "Script name must not be empty"); return; }
+        const nm = extractQuotedString(args) orelse {
+            try self.sendNo(null, "Missing script name");
+            return;
+        };
+        if (nm.value.len == 0) {
+            try self.sendNo(null, "Script name must not be empty");
+            return;
+        }
         const rem = std.mem.trim(u8, args[nm.end..], " \t");
         var content: []const u8 = undefined;
         if (LiteralParser.parse(rem)) |lit| {
-            if (lit.prefix_len + lit.length > rem.len) { try self.sendNo(null, "Incomplete literal"); return; }
+            if (lit.prefix_len + lit.length > rem.len) {
+                try self.sendNo(null, "Incomplete literal");
+                return;
+            }
             content = rem[lit.prefix_len .. lit.prefix_len + lit.length];
-        } else if (extractQuotedString(rem)) |qs| { content = qs.value; }
-        else { try self.sendNo(null, "Missing script content"); return; }
-        if (content.len > self.server.config.max_script_size) { try self.sendNo(.QUOTA_MAXSIZE, "Script too large"); return; }
-        if (!self.scripts.contains(nm.value) and self.scripts.count() >= self.server.config.max_scripts_per_user) {
-            try self.sendNo(.QUOTA_MAXSCRIPTS, "Too many scripts"); return;
+        } else if (extractQuotedString(rem)) |qs| {
+            content = qs.value;
+        } else {
+            try self.sendNo(null, "Missing script content");
+            return;
         }
-        if (!validateSieveScript(content)) { try self.sendNo(null, "Script validation failed"); return; }
+        if (content.len > self.server.config.max_script_size) {
+            try self.sendNo(.QUOTA_MAXSIZE, "Script too large");
+            return;
+        }
+        if (!self.scripts.contains(nm.value) and self.scripts.count() >= self.server.config.max_scripts_per_user) {
+            try self.sendNo(.QUOTA_MAXSCRIPTS, "Too many scripts");
+            return;
+        }
+        if (!validateSieveScript(content)) {
+            try self.sendNo(null, "Script validation failed");
+            return;
+        }
         const now = time_compat.timestamp();
-        const nc = try self.allocator.dupe(u8, nm.value); errdefer self.allocator.free(nc);
-        const cc = try self.allocator.dupe(u8, content); errdefer self.allocator.free(cc);
-        if (self.scripts.fetchRemove(nm.value)) |old| { var s = old.value; s.deinit(self.allocator); }
+        const nc = try self.allocator.dupe(u8, nm.value);
+        errdefer self.allocator.free(nc);
+        const cc = try self.allocator.dupe(u8, content);
+        errdefer self.allocator.free(cc);
+        if (self.scripts.fetchRemove(nm.value)) |old| {
+            var s = old.value;
+            s.deinit(self.allocator);
+        }
         try self.scripts.put(nc, .{ .name = nc, .content = cc, .active = false, .size = cc.len, .created_at = now, .modified_at = now });
         try self.sendOk(null, "Script stored");
     }
@@ -413,25 +583,42 @@ pub const ManageSieveSession = struct {
         var it = self.scripts.iterator();
         while (it.next()) |e| {
             const s = e.value_ptr.*;
-            const q = try ResponseFormatter.encodeQuoted(self.allocator, s.name); defer self.allocator.free(q);
+            const q = try ResponseFormatter.encodeQuoted(self.allocator, s.name);
+            defer self.allocator.free(q);
             if (s.active) {
-                const l = try std.fmt.allocPrint(self.allocator, "{s} ACTIVE\r\n", .{q}); defer self.allocator.free(l); try self.send(l);
+                const l = try std.fmt.allocPrint(self.allocator, "{s} ACTIVE\r\n", .{q});
+                defer self.allocator.free(l);
+                try self.send(l);
             } else {
-                const l = try std.fmt.allocPrint(self.allocator, "{s}\r\n", .{q}); defer self.allocator.free(l); try self.send(l);
+                const l = try std.fmt.allocPrint(self.allocator, "{s}\r\n", .{q});
+                defer self.allocator.free(l);
+                try self.send(l);
             }
         }
         try self.sendOk(null, null);
     }
 
     fn handleSetActive(self: *ManageSieveSession, args: []const u8) !void {
-        const nm = extractQuotedString(args) orelse { try self.sendNo(null, "Missing script name"); return; };
+        const nm = extractQuotedString(args) orelse {
+            try self.sendNo(null, "Missing script name");
+            return;
+        };
         if (nm.value.len == 0) {
-            var it = self.scripts.iterator(); while (it.next()) |e| e.value_ptr.*.active = false;
-            if (self.active_script) |a| { self.allocator.free(a); self.active_script = null; }
-            try self.sendOk(null, "All scripts deactivated"); return;
+            var it = self.scripts.iterator();
+            while (it.next()) |e| e.value_ptr.*.active = false;
+            if (self.active_script) |a| {
+                self.allocator.free(a);
+                self.active_script = null;
+            }
+            try self.sendOk(null, "All scripts deactivated");
+            return;
         }
-        if (!self.scripts.contains(nm.value)) { try self.sendNo(.NONEXISTENT, "Script does not exist"); return; }
-        var it = self.scripts.iterator(); while (it.next()) |e| e.value_ptr.*.active = false;
+        if (!self.scripts.contains(nm.value)) {
+            try self.sendNo(.NONEXISTENT, "Script does not exist");
+            return;
+        }
+        var it = self.scripts.iterator();
+        while (it.next()) |e| e.value_ptr.*.active = false;
         if (self.scripts.getPtr(nm.value)) |s| s.active = true;
         if (self.active_script) |a| self.allocator.free(a);
         self.active_script = try self.allocator.dupe(u8, nm.value);
@@ -439,33 +626,78 @@ pub const ManageSieveSession = struct {
     }
 
     fn handleGetScript(self: *ManageSieveSession, args: []const u8) !void {
-        const nm = extractQuotedString(args) orelse { try self.sendNo(null, "Missing script name"); return; };
-        const sc = self.scripts.get(nm.value) orelse { try self.sendNo(.NONEXISTENT, "No such script"); return; };
-        const lit = try ResponseFormatter.encodeLiteral(self.allocator, sc.content); defer self.allocator.free(lit);
-        try self.send(lit); try self.send("\r\n"); try self.sendOk(null, null);
+        const nm = extractQuotedString(args) orelse {
+            try self.sendNo(null, "Missing script name");
+            return;
+        };
+        const sc = self.scripts.get(nm.value) orelse {
+            try self.sendNo(.NONEXISTENT, "No such script");
+            return;
+        };
+        const lit = try ResponseFormatter.encodeLiteral(self.allocator, sc.content);
+        defer self.allocator.free(lit);
+        try self.send(lit);
+        try self.send("\r\n");
+        try self.sendOk(null, null);
     }
 
     fn handleDeleteScript(self: *ManageSieveSession, args: []const u8) !void {
-        const nm = extractQuotedString(args) orelse { try self.sendNo(null, "Missing script name"); return; };
-        const sc = self.scripts.get(nm.value) orelse { try self.sendNo(.NONEXISTENT, "No such script"); return; };
-        if (sc.active) { try self.sendNo(.ACTIVE, "Cannot delete active script"); return; }
-        if (self.scripts.fetchRemove(nm.value)) |old| { var s = old.value; s.deinit(self.allocator); }
+        const nm = extractQuotedString(args) orelse {
+            try self.sendNo(null, "Missing script name");
+            return;
+        };
+        const sc = self.scripts.get(nm.value) orelse {
+            try self.sendNo(.NONEXISTENT, "No such script");
+            return;
+        };
+        if (sc.active) {
+            try self.sendNo(.ACTIVE, "Cannot delete active script");
+            return;
+        }
+        if (self.scripts.fetchRemove(nm.value)) |old| {
+            var s = old.value;
+            s.deinit(self.allocator);
+        }
         try self.sendOk(null, "Script deleted");
     }
 
     fn handleRenameScript(self: *ManageSieveSession, args: []const u8) !void {
-        const on = extractQuotedString(args) orelse { try self.sendNo(null, "Missing old name"); return; };
+        const on = extractQuotedString(args) orelse {
+            try self.sendNo(null, "Missing old name");
+            return;
+        };
         const rem = std.mem.trim(u8, args[on.end..], " \t");
-        const nn = extractQuotedString(rem) orelse { try self.sendNo(null, "Missing new name"); return; };
-        if (nn.value.len == 0) { try self.sendNo(null, "New name must not be empty"); return; }
-        const old = self.scripts.get(on.value) orelse { try self.sendNo(.NONEXISTENT, "No such script"); return; };
-        if (self.scripts.contains(nn.value)) { try self.sendNo(.ALREADYEXISTS, "Name already in use"); return; }
-        const nk = try self.allocator.dupe(u8, nn.value); errdefer self.allocator.free(nk);
-        const cc = try self.allocator.dupe(u8, old.content); errdefer self.allocator.free(cc);
-        const wa = old.active; const cr = old.created_at;
-        if (self.scripts.fetchRemove(on.value)) |o| { var s = o.value; s.deinit(self.allocator); }
+        const nn = extractQuotedString(rem) orelse {
+            try self.sendNo(null, "Missing new name");
+            return;
+        };
+        if (nn.value.len == 0) {
+            try self.sendNo(null, "New name must not be empty");
+            return;
+        }
+        const old = self.scripts.get(on.value) orelse {
+            try self.sendNo(.NONEXISTENT, "No such script");
+            return;
+        };
+        if (self.scripts.contains(nn.value)) {
+            try self.sendNo(.ALREADYEXISTS, "Name already in use");
+            return;
+        }
+        const nk = try self.allocator.dupe(u8, nn.value);
+        errdefer self.allocator.free(nk);
+        const cc = try self.allocator.dupe(u8, old.content);
+        errdefer self.allocator.free(cc);
+        const wa = old.active;
+        const cr = old.created_at;
+        if (self.scripts.fetchRemove(on.value)) |o| {
+            var s = o.value;
+            s.deinit(self.allocator);
+        }
         try self.scripts.put(nk, .{ .name = nk, .content = cc, .active = wa, .size = cc.len, .created_at = cr, .modified_at = time_compat.timestamp() });
-        if (wa) { if (self.active_script) |a| self.allocator.free(a); self.active_script = try self.allocator.dupe(u8, nn.value); }
+        if (wa) {
+            if (self.active_script) |a| self.allocator.free(a);
+            self.active_script = try self.allocator.dupe(u8, nn.value);
+        }
         try self.sendOk(null, "Script renamed");
     }
 
@@ -473,11 +705,21 @@ pub const ManageSieveSession = struct {
         const tr = std.mem.trim(u8, args, " \t");
         var content: []const u8 = undefined;
         if (LiteralParser.parse(tr)) |lit| {
-            if (lit.prefix_len + lit.length > tr.len) { try self.sendNo(null, "Incomplete literal"); return; }
+            if (lit.prefix_len + lit.length > tr.len) {
+                try self.sendNo(null, "Incomplete literal");
+                return;
+            }
             content = tr[lit.prefix_len .. lit.prefix_len + lit.length];
-        } else if (extractQuotedString(tr)) |qs| { content = qs.value; }
-        else { try self.sendNo(null, "Missing script content"); return; }
-        if (!validateSieveScript(content)) { try self.sendNo(null, "Script validation failed"); return; }
+        } else if (extractQuotedString(tr)) |qs| {
+            content = qs.value;
+        } else {
+            try self.sendNo(null, "Missing script content");
+            return;
+        }
+        if (!validateSieveScript(content)) {
+            try self.sendNo(null, "Script validation failed");
+            return;
+        }
         try self.sendOk(null, "Script is valid");
     }
 
@@ -485,10 +727,13 @@ pub const ManageSieveSession = struct {
         const tr = std.mem.trim(u8, args, " \t");
         if (tr.len > 0) {
             if (extractQuotedString(tr)) |tag| {
-                var buf: std.ArrayList(u8) = .{}; defer buf.deinit(self.allocator);
+                var buf: std.ArrayList(u8) = .{};
+                defer buf.deinit(self.allocator);
                 try buf.print(self.allocator, "OK (TAG \"{s}\") \"NOOP completed\"\r\n", .{tag.value});
-                const r = try self.allocator.dupe(u8, buf.items); defer self.allocator.free(r);
-                try self.send(r); return;
+                const r = try self.allocator.dupe(u8, buf.items);
+                defer self.allocator.free(r);
+                try self.send(r);
+                return;
             }
         }
         try self.sendOk(null, "NOOP completed");
@@ -509,7 +754,7 @@ pub const ManageSieveServer = struct {
     config: ManageSieveConfig,
     listener: ?socket.Server,
     running: std.atomic.Value(bool),
-    mutex: std.Thread.Mutex,
+    mutex: mutex_compat.Mutex,
     active_sessions: usize,
     auth_backend: ?*AuthBackendInterface,
 
@@ -535,13 +780,19 @@ pub const ManageSieveServer = struct {
 
     pub fn init(allocator: std.mem.Allocator, config: ManageSieveConfig, auth_backend: ?*AuthBackendInterface) ManageSieveServer {
         return .{
-            .allocator = allocator, .config = config, .listener = null,
-            .running = std.atomic.Value(bool).init(false), .mutex = .{},
-            .active_sessions = 0, .auth_backend = auth_backend,
+            .allocator = allocator,
+            .config = config,
+            .listener = null,
+            .running = std.atomic.Value(bool).init(false),
+            .mutex = .{},
+            .active_sessions = 0,
+            .auth_backend = auth_backend,
         };
     }
 
-    pub fn deinit(self: *ManageSieveServer) void { self.stop(); }
+    pub fn deinit(self: *ManageSieveServer) void {
+        self.stop();
+    }
 
     pub fn start(self: *ManageSieveServer) !void {
         const addr = try socket.Address.parseIp("0.0.0.0", self.config.port);
@@ -558,7 +809,10 @@ pub const ManageSieveServer = struct {
             self.mutex.lock();
             if (self.active_sessions >= self.config.max_connections) {
                 self.mutex.unlock();
-                const b = ResponseFormatter.bye(self.allocator, .TRYLATER, "Too many connections") catch { conn.close(); continue; };
+                const b = ResponseFormatter.bye(self.allocator, .TRYLATER, "Too many connections") catch {
+                    conn.close();
+                    continue;
+                };
                 defer self.allocator.free(b);
                 _ = conn.write(b) catch {};
                 conn.close();
@@ -569,19 +823,30 @@ pub const ManageSieveServer = struct {
             self.handleConn(conn) catch |err| {
                 std.log.err("ManageSieve conn error: {}", .{err});
                 conn.close();
-                self.mutex.lock(); self.active_sessions -|= 1; self.mutex.unlock();
+                self.mutex.lock();
+                self.active_sessions -|= 1;
+                self.mutex.unlock();
             };
         }
     }
 
     pub fn stop(self: *ManageSieveServer) void {
         self.running.store(false, .monotonic);
-        if (self.listener) |*l| { l.close(); self.listener = null; }
+        if (self.listener) |*l| {
+            l.close();
+            self.listener = null;
+        }
     }
 
     fn handleConn(self: *ManageSieveServer, stream: socket.Connection) !void {
         var sess = ManageSieveSession.init(self.allocator, stream, self);
-        defer { sess.deinit(); stream.close(); self.mutex.lock(); self.active_sessions -|= 1; self.mutex.unlock(); }
+        defer {
+            sess.deinit();
+            stream.close();
+            self.mutex.lock();
+            self.active_sessions -|= 1;
+            self.mutex.unlock();
+        }
         sess.handleConnection() catch |err| {
             std.log.err("ManageSieve session: {}", .{err});
             sess.sendBye(.TRYLATER, "Internal error") catch {};
@@ -589,7 +854,9 @@ pub const ManageSieveServer = struct {
     }
 
     pub fn getActiveSessionCount(self: *ManageSieveServer) usize {
-        self.mutex.lock(); defer self.mutex.unlock(); return self.active_sessions;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.active_sessions;
     }
 };
 
@@ -638,50 +905,62 @@ test "command toString round-trips" {
 
 test "response formatting - OK" {
     const T = std.testing;
-    const r1 = try ResponseFormatter.ok(T.allocator, null, null); defer T.allocator.free(r1);
+    const r1 = try ResponseFormatter.ok(T.allocator, null, null);
+    defer T.allocator.free(r1);
     try T.expectEqualStrings("OK\r\n", r1);
-    const r2 = try ResponseFormatter.ok(T.allocator, null, "Done"); defer T.allocator.free(r2);
+    const r2 = try ResponseFormatter.ok(T.allocator, null, "Done");
+    defer T.allocator.free(r2);
     try T.expectEqualStrings("OK \"Done\"\r\n", r2);
-    const r3 = try ResponseFormatter.ok(T.allocator, .SASL, "Auth ok"); defer T.allocator.free(r3);
+    const r3 = try ResponseFormatter.ok(T.allocator, .SASL, "Auth ok");
+    defer T.allocator.free(r3);
     try T.expectEqualStrings("OK (SASL) \"Auth ok\"\r\n", r3);
 }
 
 test "response formatting - NO" {
     const T = std.testing;
-    const r1 = try ResponseFormatter.no(T.allocator, .QUOTA_MAXSIZE, "Too large"); defer T.allocator.free(r1);
+    const r1 = try ResponseFormatter.no(T.allocator, .QUOTA_MAXSIZE, "Too large");
+    defer T.allocator.free(r1);
     try T.expectEqualStrings("NO (QUOTA/MAXSIZE) \"Too large\"\r\n", r1);
-    const r2 = try ResponseFormatter.no(T.allocator, null, "Failed"); defer T.allocator.free(r2);
+    const r2 = try ResponseFormatter.no(T.allocator, null, "Failed");
+    defer T.allocator.free(r2);
     try T.expectEqualStrings("NO \"Failed\"\r\n", r2);
 }
 
 test "response formatting - BYE" {
     const T = std.testing;
-    const r1 = try ResponseFormatter.bye(T.allocator, .TRYLATER, "Shutting down"); defer T.allocator.free(r1);
+    const r1 = try ResponseFormatter.bye(T.allocator, .TRYLATER, "Shutting down");
+    defer T.allocator.free(r1);
     try T.expectEqualStrings("BYE (TRYLATER) \"Shutting down\"\r\n", r1);
-    const r2 = try ResponseFormatter.bye(T.allocator, null, null); defer T.allocator.free(r2);
+    const r2 = try ResponseFormatter.bye(T.allocator, null, null);
+    defer T.allocator.free(r2);
     try T.expectEqualStrings("BYE\r\n", r2);
 }
 
 test "response formatting - literal encoding" {
     const T = std.testing;
-    const e = try ResponseFormatter.encodeLiteral(T.allocator, "require \"fileinto\";"); defer T.allocator.free(e);
+    const e = try ResponseFormatter.encodeLiteral(T.allocator, "require \"fileinto\";");
+    defer T.allocator.free(e);
     try T.expectEqualStrings("{19+}\r\nrequire \"fileinto\";", e);
-    const e2 = try ResponseFormatter.encodeLiteral(T.allocator, ""); defer T.allocator.free(e2);
+    const e2 = try ResponseFormatter.encodeLiteral(T.allocator, "");
+    defer T.allocator.free(e2);
     try T.expectEqualStrings("{0+}\r\n", e2);
 }
 
 test "response formatting - quoted encoding" {
     const T = std.testing;
-    const e = try ResponseFormatter.encodeQuoted(T.allocator, "my-script"); defer T.allocator.free(e);
+    const e = try ResponseFormatter.encodeQuoted(T.allocator, "my-script");
+    defer T.allocator.free(e);
     try T.expectEqualStrings("\"my-script\"", e);
-    const e2 = try ResponseFormatter.encodeQuoted(T.allocator, "a\\b\"c"); defer T.allocator.free(e2);
+    const e2 = try ResponseFormatter.encodeQuoted(T.allocator, "a\\b\"c");
+    defer T.allocator.free(e2);
     try T.expectEqualStrings("\"a\\\\b\\\"c\"", e2);
 }
 
 test "response formatting - CRLF endings" {
     const T = std.testing;
     inline for (.{ ResponseFormatter.ok, ResponseFormatter.no, ResponseFormatter.bye }) |func| {
-        const r = try func(T.allocator, null, "x"); defer T.allocator.free(r);
+        const r = try func(T.allocator, null, "x");
+        defer T.allocator.free(r);
         try T.expect(std.mem.endsWith(u8, r, "\r\n"));
     }
 }
@@ -690,7 +969,8 @@ test "capability generation" {
     const T = std.testing;
     const cfg = ManageSieveConfig{ .implementation_name = "Test v1", .sieve_extensions = "fileinto", .enable_tls = true, .max_redirects = 3 };
     var cap = ManageSieveCapability.init(&cfg);
-    const o = try cap.format(T.allocator); defer T.allocator.free(o);
+    const o = try cap.format(T.allocator);
+    defer T.allocator.free(o);
     try T.expect(std.mem.indexOf(u8, o, "\"IMPLEMENTATION\" \"Test v1\"") != null);
     try T.expect(std.mem.indexOf(u8, o, "\"SASL\" \"PLAIN\"") != null);
     try T.expect(std.mem.indexOf(u8, o, "\"SIEVE\" \"fileinto\"") != null);
@@ -703,7 +983,8 @@ test "capability - TLS disabled hides STARTTLS" {
     const T = std.testing;
     const cfg = ManageSieveConfig{ .enable_tls = false };
     var cap = ManageSieveCapability.init(&cfg);
-    const o = try cap.format(T.allocator); defer T.allocator.free(o);
+    const o = try cap.format(T.allocator);
+    defer T.allocator.free(o);
     try T.expect(std.mem.indexOf(u8, o, "\"STARTTLS\"") == null);
 }
 
@@ -711,8 +992,10 @@ test "capability - deterministic output" {
     const T = std.testing;
     const cfg = ManageSieveConfig{};
     var cap = ManageSieveCapability.init(&cfg);
-    const a = try cap.format(T.allocator); defer T.allocator.free(a);
-    const b = try cap.format(T.allocator); defer T.allocator.free(b);
+    const a = try cap.format(T.allocator);
+    defer T.allocator.free(a);
+    const b = try cap.format(T.allocator);
+    defer T.allocator.free(b);
     try T.expectEqualStrings(a, b);
 }
 
@@ -778,7 +1061,8 @@ test "literal parsing - invalid inputs" {
 test "literal round-trip" {
     const T = std.testing;
     const orig = "require \"fileinto\";\nif true { keep; }";
-    const enc = try ResponseFormatter.encodeLiteral(T.allocator, orig); defer T.allocator.free(enc);
+    const enc = try ResponseFormatter.encodeLiteral(T.allocator, orig);
+    defer T.allocator.free(enc);
     const p = LiteralParser.parse(enc).?;
     try T.expectEqual(orig.len, p.length);
     try T.expectEqualStrings(orig, enc[p.prefix_len .. p.prefix_len + p.length]);
@@ -838,7 +1122,8 @@ test "config defaults" {
 
 test "SieveScript lifecycle" {
     const T = std.testing;
-    const nm = try T.allocator.dupe(u8, "test"); const ct = try T.allocator.dupe(u8, "keep;");
+    const nm = try T.allocator.dupe(u8, "test");
+    const ct = try T.allocator.dupe(u8, "keep;");
     var s = SieveScript{ .name = nm, .content = ct, .active = false, .size = ct.len, .created_at = 0, .modified_at = 0 };
     try T.expectEqualStrings("test", s.name);
     try T.expectEqual(@as(usize, 5), s.size);
