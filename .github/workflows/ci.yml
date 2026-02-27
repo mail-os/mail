@@ -102,7 +102,15 @@ jobs:
     - name: Install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y libsqlite3-dev kcov
+        sudo apt-get install -y libsqlite3-dev binutils-dev libdw-dev
+
+    - name: Install kcov from source
+      run: |
+        KCOV_VERSION=43
+        wget -q https://github.com/SimonKagstrom/kcov/releases/download/v${KCOV_VERSION}/kcov-amd64.tar.gz
+        tar xzf kcov-amd64.tar.gz
+        sudo cp usr/local/bin/kcov /usr/local/bin/
+        rm -rf usr kcov-amd64.tar.gz
 
     - name: Build with debug info
       run: zig build -Doptimize=Debug
