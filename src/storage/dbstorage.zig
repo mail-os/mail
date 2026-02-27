@@ -44,7 +44,9 @@ pub const DatabaseStorage = struct {
             \\    size INTEGER NOT NULL,
             \\    received_at INTEGER NOT NULL,
             \\    flags INTEGER DEFAULT 0,
-            \\    folder TEXT DEFAULT 'INBOX'
+            \\    folder TEXT DEFAULT 'INBOX',
+            \\    deleted_at INTEGER DEFAULT NULL,
+            \\    deleted_by TEXT DEFAULT NULL
             \\);
             \\
             \\CREATE INDEX IF NOT EXISTS idx_messages_email ON messages(email);
@@ -52,6 +54,7 @@ pub const DatabaseStorage = struct {
             \\CREATE INDEX IF NOT EXISTS idx_messages_received_at ON messages(received_at);
             \\CREATE INDEX IF NOT EXISTS idx_messages_folder ON messages(folder);
             \\CREATE INDEX IF NOT EXISTS idx_messages_flags ON messages(flags);
+            \\CREATE INDEX IF NOT EXISTS idx_messages_deleted_at ON messages(deleted_at);
             \\
             \\CREATE TABLE IF NOT EXISTS attachments (
             \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,6 +70,11 @@ pub const DatabaseStorage = struct {
         ;
 
         try self.db.exec(schema);
+
+        // Defensive migration: add soft-delete columns to existing databases
+        self.db.exec("ALTER TABLE messages ADD COLUMN deleted_at INTEGER DEFAULT NULL") catch {};
+        self.db.exec("ALTER TABLE messages ADD COLUMN deleted_by TEXT DEFAULT NULL") catch {};
+        self.db.exec("CREATE INDEX IF NOT EXISTS idx_messages_deleted_at ON messages(deleted_at)") catch {};
     }
 
     /// Store a message in the database
@@ -220,7 +228,7 @@ pub const DatabaseStorage = struct {
         return self.db.lastInsertRowId();
     }
 
-    /// Retrieve a message by ID
+    /// Retrieve a message by ID (excludes soft-deleted messages)
     pub fn retrieveMessage(
         self: *DatabaseStorage,
         email: []const u8,
@@ -232,7 +240,7 @@ pub const DatabaseStorage = struct {
         const query =
             \\SELECT id, sender, recipients, subject, body, headers, size, received_at, flags, folder
             \\FROM messages
-            \\WHERE email = ? AND message_id = ?
+            \\WHERE email = ? AND message_id = ? AND deleted_at IS NULL
         ;
 
         var stmt = try self.db.prepare(query);
@@ -267,7 +275,7 @@ pub const DatabaseStorage = struct {
         return null;
     }
 
-    /// List messages for an email address
+    /// List messages for an email address (excludes soft-deleted messages)
     pub fn listMessages(
         self: *DatabaseStorage,
         email: []const u8,
@@ -281,13 +289,13 @@ pub const DatabaseStorage = struct {
         const query = if (folder) |_|
             \\SELECT id, message_id, sender, recipients, subject, size, received_at, flags, folder
             \\FROM messages
-            \\WHERE email = ? AND folder = ?
+            \\WHERE email = ? AND folder = ? AND deleted_at IS NULL
             \\ORDER BY received_at DESC
             \\LIMIT ? OFFSET ?
         else
             \\SELECT id, message_id, sender, recipients, subject, size, received_at, flags, folder
             \\FROM messages
-            \\WHERE email = ?
+            \\WHERE email = ? AND deleted_at IS NULL
             \\ORDER BY received_at DESC
             \\LIMIT ? OFFSET ?
         ;
@@ -333,8 +341,43 @@ pub const DatabaseStorage = struct {
         return try messages.toOwnedSlice(self.allocator);
     }
 
-    /// Delete a message
+    /// Soft-delete a message (marks with deleted_at timestamp instead of removing)
     pub fn deleteMessage(
+        self: *DatabaseStorage,
+        email: []const u8,
+        message_id: []const u8,
+    ) !void {
+        return self.softDeleteMessage(email, message_id, "system");
+    }
+
+    /// Soft-delete a message with the identity of who deleted it
+    pub fn softDeleteMessage(
+        self: *DatabaseStorage,
+        email: []const u8,
+        message_id: []const u8,
+        deleted_by: []const u8,
+    ) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const query =
+            \\UPDATE messages SET deleted_at = ?, deleted_by = ?
+            \\WHERE email = ? AND message_id = ? AND deleted_at IS NULL
+        ;
+
+        var stmt = try self.db.prepare(query);
+        defer stmt.finalize();
+
+        try stmt.bind(1, time_compat.timestamp());
+        try stmt.bind(2, deleted_by);
+        try stmt.bind(3, email);
+        try stmt.bind(4, message_id);
+
+        _ = try stmt.step();
+    }
+
+    /// Permanently delete a message from the database (admin/GDPR purge only)
+    pub fn purgeMessage(
         self: *DatabaseStorage,
         email: []const u8,
         message_id: []const u8,
@@ -352,7 +395,89 @@ pub const DatabaseStorage = struct {
         try stmt.bind(1, email);
         try stmt.bind(2, message_id);
 
-        try stmt.step();
+        _ = try stmt.step();
+    }
+
+    /// Restore a soft-deleted message (undo soft-delete)
+    pub fn restoreMessage(
+        self: *DatabaseStorage,
+        email: []const u8,
+        message_id: []const u8,
+    ) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const query =
+            \\UPDATE messages SET deleted_at = NULL, deleted_by = NULL
+            \\WHERE email = ? AND message_id = ? AND deleted_at IS NOT NULL
+        ;
+
+        var stmt = try self.db.prepare(query);
+        defer stmt.finalize();
+
+        try stmt.bind(1, email);
+        try stmt.bind(2, message_id);
+
+        _ = try stmt.step();
+    }
+
+    /// List soft-deleted messages for admin UI
+    pub fn listDeletedMessages(
+        self: *DatabaseStorage,
+        email: []const u8,
+        limit: usize,
+        offset: usize,
+    ) ![]StoredMessage {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const query =
+            \\SELECT id, message_id, sender, recipients, subject, size, received_at, flags, folder, deleted_at, deleted_by
+            \\FROM messages
+            \\WHERE email = ? AND deleted_at IS NOT NULL
+            \\ORDER BY deleted_at DESC
+            \\LIMIT ? OFFSET ?
+        ;
+
+        var stmt = try self.db.prepare(query);
+        defer stmt.finalize();
+
+        try stmt.bind(1, email);
+        try stmt.bind(2, @as(i64, @intCast(limit)));
+        try stmt.bind(3, @as(i64, @intCast(offset)));
+
+        var messages = std.ArrayList(StoredMessage).init(self.allocator);
+
+        while (try stmt.step()) {
+            const message = StoredMessage{
+                .id = stmt.columnInt64(0),
+                .message_id = try self.allocator.dupe(u8, stmt.columnText(1)),
+                .email = try self.allocator.dupe(u8, email),
+                .sender = try self.allocator.dupe(u8, stmt.columnText(2)),
+                .recipients = try self.parseRecipients(stmt.columnText(3)),
+                .subject = blk: {
+                    const subj = stmt.columnText(4);
+                    if (subj.len == 0) break :blk null;
+                    break :blk try self.allocator.dupe(u8, subj);
+                },
+                .body = "",
+                .headers = "",
+                .size = @intCast(stmt.columnInt64(5)),
+                .received_at = stmt.columnInt64(6),
+                .flags = @intCast(stmt.columnInt64(7)),
+                .folder = try self.allocator.dupe(u8, stmt.columnText(8)),
+                .deleted_at = stmt.columnInt64Opt(9),
+                .deleted_by = blk: {
+                    const db = stmt.columnTextOpt(10);
+                    if (db) |d| break :blk try self.allocator.dupe(u8, d);
+                    break :blk null;
+                },
+            };
+
+            try messages.append(self.allocator, message);
+        }
+
+        return try messages.toOwnedSlice(self.allocator);
     }
 
     /// Move message to folder
@@ -403,7 +528,7 @@ pub const DatabaseStorage = struct {
         try stmt.step();
     }
 
-    /// Get message count for an email
+    /// Get message count for an email (excludes soft-deleted messages)
     pub fn getMessageCount(
         self: *DatabaseStorage,
         email: []const u8,
@@ -413,9 +538,9 @@ pub const DatabaseStorage = struct {
         defer self.mutex.unlock();
 
         const query = if (folder) |_|
-            \\SELECT COUNT(*) FROM messages WHERE email = ? AND folder = ?
+            \\SELECT COUNT(*) FROM messages WHERE email = ? AND folder = ? AND deleted_at IS NULL
         else
-            \\SELECT COUNT(*) FROM messages WHERE email = ?
+            \\SELECT COUNT(*) FROM messages WHERE email = ? AND deleted_at IS NULL
         ;
 
         var stmt = try self.db.prepare(query);
@@ -433,7 +558,7 @@ pub const DatabaseStorage = struct {
         return 0;
     }
 
-    /// Search messages
+    /// Search messages (excludes soft-deleted messages)
     pub fn searchMessages(
         self: *DatabaseStorage,
         email: []const u8,
@@ -446,7 +571,7 @@ pub const DatabaseStorage = struct {
         const query =
             \\SELECT id, message_id, sender, recipients, subject, size, received_at, flags, folder
             \\FROM messages
-            \\WHERE email = ? AND (subject LIKE ? OR body LIKE ? OR sender LIKE ?)
+            \\WHERE email = ? AND (subject LIKE ? OR body LIKE ? OR sender LIKE ?) AND deleted_at IS NULL
             \\ORDER BY received_at DESC
             \\LIMIT ?
         ;
@@ -518,6 +643,8 @@ pub const StoredMessage = struct {
     received_at: i64,
     flags: u32,
     folder: []const u8,
+    deleted_at: ?i64 = null,
+    deleted_by: ?[]const u8 = null,
 
     pub fn deinit(self: *StoredMessage, allocator: std.mem.Allocator) void {
         allocator.free(self.message_id);
@@ -533,6 +660,9 @@ pub const StoredMessage = struct {
         allocator.free(self.body);
         allocator.free(self.headers);
         allocator.free(self.folder);
+        if (self.deleted_by) |db| {
+            allocator.free(db);
+        }
     }
 };
 
@@ -659,7 +789,7 @@ test "list messages" {
     try testing.expectEqual(@as(usize, 2), messages.len);
 }
 
-test "delete message" {
+test "delete message (soft-delete)" {
     const testing = std.testing;
 
     var db = try database.Database.init(testing.allocator, ":memory:");
@@ -672,10 +802,78 @@ test "delete message" {
     const recipients = [_][]const u8{"recipient@example.com"};
     _ = try storage.storeMessage("user@example.com", "msg-delete", "sender@example.com", &recipients, "Delete Me", "", "Body");
 
+    // Soft-delete the message
     try storage.deleteMessage("user@example.com", "msg-delete");
 
+    // retrieveMessage should return null (filtered by deleted_at IS NULL)
     const message = try storage.retrieveMessage("user@example.com", "msg-delete");
     try testing.expect(message == null);
+
+    // Message should appear in deleted messages list
+    const deleted = try storage.listDeletedMessages("user@example.com", 10, 0);
+    defer {
+        for (deleted) |*msg| {
+            msg.deinit(testing.allocator);
+        }
+        testing.allocator.free(deleted);
+    }
+    try testing.expectEqual(@as(usize, 1), deleted.len);
+    try testing.expectEqualStrings("msg-delete", deleted[0].message_id);
+    try testing.expect(deleted[0].deleted_at != null);
+
+    // Message count should be 0 (soft-deleted messages excluded)
+    const count = try storage.getMessageCount("user@example.com", null);
+    try testing.expectEqual(@as(usize, 0), count);
+}
+
+test "restore soft-deleted message" {
+    const testing = std.testing;
+
+    var db = try database.Database.init(testing.allocator, ":memory:");
+    defer db.deinit();
+    try db.initSchema();
+
+    var storage = try DatabaseStorage.init(testing.allocator, &db);
+    defer storage.deinit();
+
+    const recipients = [_][]const u8{"recipient@example.com"};
+    _ = try storage.storeMessage("user@example.com", "msg-restore", "sender@example.com", &recipients, "Restore Me", "", "Body");
+
+    // Soft-delete then restore
+    try storage.deleteMessage("user@example.com", "msg-restore");
+    try storage.restoreMessage("user@example.com", "msg-restore");
+
+    // Message should be visible again
+    const message = try storage.retrieveMessage("user@example.com", "msg-restore");
+    try testing.expect(message != null);
+    if (message) |msg| {
+        var msg_copy = msg;
+        defer msg_copy.deinit(testing.allocator);
+        try testing.expectEqualStrings("Restore Me", msg.subject.?);
+    }
+}
+
+test "purge message (hard delete)" {
+    const testing = std.testing;
+
+    var db = try database.Database.init(testing.allocator, ":memory:");
+    defer db.deinit();
+    try db.initSchema();
+
+    var storage = try DatabaseStorage.init(testing.allocator, &db);
+    defer storage.deinit();
+
+    const recipients = [_][]const u8{"recipient@example.com"};
+    _ = try storage.storeMessage("user@example.com", "msg-purge", "sender@example.com", &recipients, "Purge Me", "", "Body");
+
+    // Soft-delete first, then purge
+    try storage.deleteMessage("user@example.com", "msg-purge");
+    try storage.purgeMessage("user@example.com", "msg-purge");
+
+    // Should not appear in deleted messages either
+    const deleted = try storage.listDeletedMessages("user@example.com", 10, 0);
+    defer testing.allocator.free(deleted);
+    try testing.expectEqual(@as(usize, 0), deleted.len);
 }
 
 test "message count" {

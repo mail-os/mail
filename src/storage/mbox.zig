@@ -126,7 +126,7 @@ pub const MboxStorage = struct {
         return messages.len;
     }
 
-    /// Delete a message by index (rewrites the entire file)
+    /// Soft-delete a message by index (moves to .deleted.mbox sidecar, rewrites main file)
     pub fn deleteMessage(self: *MboxStorage, index: usize) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -138,7 +138,10 @@ pub const MboxStorage = struct {
             return error.MessageNotFound;
         }
 
-        // Remove the message
+        // Append the deleted message to the sidecar file
+        try self.appendToDeletedSidecar(&messages[index]);
+
+        // Remove the message from main file
         var new_messages = std.ArrayList(MboxMessage).init(self.allocator);
         defer new_messages.deinit();
 
@@ -148,8 +151,70 @@ pub const MboxStorage = struct {
             }
         }
 
-        // Rewrite the file
+        // Rewrite the main file without the deleted message
         try self.rewriteMbox(new_messages.items);
+    }
+
+    /// Permanently delete a message by index (hard delete, no sidecar preservation)
+    pub fn purgeMessage(self: *MboxStorage, index: usize) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var messages = try self.readMessages();
+        defer self.freeMessages(messages);
+
+        if (index >= messages.len) {
+            return error.MessageNotFound;
+        }
+
+        // Remove the message without preserving to sidecar
+        var new_messages = std.ArrayList(MboxMessage).init(self.allocator);
+        defer new_messages.deinit();
+
+        for (messages, 0..) |msg, i| {
+            if (i != index) {
+                try new_messages.append(msg);
+            }
+        }
+
+        try self.rewriteMbox(new_messages.items);
+    }
+
+    /// Get the sidecar path for deleted messages (.deleted.mbox)
+    fn getDeletedSidecarPath(self: *MboxStorage) ![]const u8 {
+        return try std.fmt.allocPrint(self.allocator, "{s}.deleted.mbox", .{self.mbox_path});
+    }
+
+    /// Append a message to the .deleted.mbox sidecar file
+    fn appendToDeletedSidecar(self: *MboxStorage, msg: *const MboxMessage) !void {
+        const sidecar_path = try self.getDeletedSidecarPath();
+        defer self.allocator.free(sidecar_path);
+
+        const file = std.fs.cwd().openFile(sidecar_path, .{
+            .mode = .read_write,
+        }) catch blk: {
+            break :blk try std.fs.cwd().createFile(sidecar_path, .{
+                .read = true,
+            });
+        };
+        defer file.close();
+
+        try file.seekFromEnd(0);
+
+        const separator = try std.fmt.allocPrint(
+            self.allocator,
+            "From {s} {s}\n",
+            .{ msg.from, msg.date },
+        );
+        defer self.allocator.free(separator);
+
+        try file.writeAll(separator);
+        try file.writeAll(msg.content);
+
+        if (msg.content.len == 0 or msg.content[msg.content.len - 1] != '\n') {
+            try file.writeAll("\n");
+        }
+        try file.writeAll("\n");
     }
 
     fn parseMessages(self: *MboxStorage, content: []const u8) ![]MboxMessage {

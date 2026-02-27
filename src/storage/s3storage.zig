@@ -68,7 +68,7 @@ pub const S3Storage = struct {
         return try self.allocator.dupe(u8, "");
     }
 
-    /// Delete a message from S3
+    /// Soft-delete a message from S3 (moves to deleted/ prefix instead of removing)
     pub fn deleteMessage(
         self: *S3Storage,
         email: []const u8,
@@ -77,10 +77,45 @@ pub const S3Storage = struct {
         const key = try self.generateKey(email, message_id);
         defer self.allocator.free(key);
 
+        const deleted_key = try std.fmt.allocPrint(
+            self.allocator,
+            "deleted/{s}",
+            .{key},
+        );
+        defer self.allocator.free(deleted_key);
+
         // Would:
-        // 1. Create DeleteObject request
-        // 2. Sign request
-        // 3. Send HTTP DELETE to S3 endpoint
+        // 1. CopyObject from {key} to deleted/{key}
+        // 2. Sign CopyObject request with AWS Signature V4
+        // 3. Send HTTP PUT with x-amz-copy-source header
+        // 4. On success, DeleteObject the source key
+        // 5. The message is now preserved under deleted/ prefix
+
+        _ = deleted_key;
+    }
+
+    /// Permanently delete a message from S3 (actual S3 DELETE, admin/GDPR only)
+    pub fn purgeMessage(
+        self: *S3Storage,
+        email: []const u8,
+        message_id: []const u8,
+    ) !void {
+        const key = try self.generateKey(email, message_id);
+        defer self.allocator.free(key);
+
+        // Delete from both original and deleted/ locations
+        const deleted_key = try std.fmt.allocPrint(
+            self.allocator,
+            "deleted/{s}",
+            .{key},
+        );
+        defer self.allocator.free(deleted_key);
+
+        // Would:
+        // 1. Send HTTP DELETE for the original key (if still exists)
+        // 2. Send HTTP DELETE for the deleted/ key (if exists)
+
+        _ = deleted_key;
     }
 
     /// List messages for an email address

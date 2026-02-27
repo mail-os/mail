@@ -496,7 +496,15 @@ pub const GDPRManager = struct {
         };
     }
 
-    /// Delete all user data permanently (Article 17)
+    /// Delete all user data (Article 17) - soft-delete first, then purge for legal compliance
+    ///
+    /// GDPR erasure flow:
+    /// 1. Soft-delete all messages (SET deleted_at = NOW) for immediate visibility removal
+    /// 2. Permanently purge the soft-deleted messages (actual DELETE FROM) for legal compliance
+    /// 3. Delete the user record
+    ///
+    /// This ensures data is immediately invisible to the user, then fully removed.
+    /// For non-GDPR admin deletion, use soft-delete only (without purge).
     pub fn deleteUserData(self: *GDPRManager, username: []const u8) !void {
         // Start transaction for atomic deletion
         const begin_query = "BEGIN TRANSACTION";
@@ -509,17 +517,21 @@ pub const GDPRManager = struct {
             _ = sqlite.sqlite3_exec(self.db, "ROLLBACK", null, null, null);
         }
 
-        // Delete user's messages
-        const delete_messages = "DELETE FROM messages WHERE user = ?";
-        try self.executeDelete(delete_messages, username);
+        // Step 1: Soft-delete all messages (marks them with deleted_at timestamp)
+        const soft_delete_messages = "UPDATE messages SET deleted_at = strftime('%s','now'), deleted_by = 'gdpr-erasure' WHERE user = ? AND deleted_at IS NULL";
+        try self.executeStatement(soft_delete_messages, username);
+
+        // Step 2: Purge - permanently delete all messages (including previously soft-deleted ones)
+        const purge_messages = "DELETE FROM messages WHERE user = ?";
+        try self.executeStatement(purge_messages, username);
 
         // Delete user record
         const delete_user = "DELETE FROM users WHERE username = ?";
-        try self.executeDelete(delete_user, username);
+        try self.executeStatement(delete_user, username);
 
         // Delete activity log (optional - may keep for legal compliance)
         // const delete_activity = "DELETE FROM audit_log WHERE username = ?";
-        // try self.executeDelete(delete_activity, username);
+        // try self.executeStatement(delete_activity, username);
 
         // Commit transaction
         rc = sqlite.sqlite3_exec(self.db, "COMMIT", null, null, null);
@@ -527,11 +539,11 @@ pub const GDPRManager = struct {
             return GDPRError.DeletionFailed;
         }
 
-        // TODO: Delete physical message files from storage backend
-        // This would call storage backend's deleteUser() method
+        // TODO: Call storage backend's purgeMessage() for each message
+        // to remove physical files (S3 objects, mbox entries, etc.)
     }
 
-    fn executeDelete(self: *GDPRManager, query: [*:0]const u8, username: []const u8) !void {
+    fn executeStatement(self: *GDPRManager, query: [*:0]const u8, username: []const u8) !void {
         var stmt: ?*sqlite.sqlite3_stmt = null;
         const rc = sqlite.sqlite3_prepare_v2(self.db, query, -1, &stmt, null);
         if (rc != sqlite.SQLITE_OK) {

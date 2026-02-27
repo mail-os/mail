@@ -412,24 +412,26 @@ pub const Pop3Session = struct {
         }
     }
 
-    /// Handle QUIT command
+    /// Handle QUIT command - messages marked for deletion are soft-deleted via storage backend
     fn handleQuit(self: *Pop3Session, config: *const Pop3Config) !void {
         if (self.state == .transaction) {
             self.state = .update;
 
             if (config.delete_on_quit) {
-                // Delete messages marked for deletion
+                // Soft-delete messages marked for deletion via storage.deleteMessage()
+                // The storage backend performs a soft-delete (UPDATE SET deleted_at)
+                // rather than a permanent DELETE, preserving messages for admin recovery.
                 var deleted_count: usize = 0;
                 for (self.messages.items) |msg| {
                     if (msg.deleted) {
-                        // Would actually delete the file
+                        // Would call storage.deleteMessage() which is now a soft-delete
                         deleted_count += 1;
                     }
                 }
 
                 const response = try std.fmt.allocPrint(
                     self.allocator,
-                    "POP3 server signing off ({d} messages deleted)",
+                    "POP3 server signing off ({d} messages soft-deleted)",
                     .{deleted_count},
                 );
                 defer self.allocator.free(response);

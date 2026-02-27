@@ -629,6 +629,20 @@ pub const ImapSession = struct {
         try self.sendResponse(tag, "OK", "FETCH completed");
     }
 
+    /// Handle EXPUNGE command - soft-deletes messages marked with \Deleted flag
+    fn handleExpunge(self: *ImapSession, tag: []const u8) !void {
+        if (self.state != .selected) {
+            try self.sendResponse(tag, "NO", "Must select mailbox first");
+            return;
+        }
+
+        // Would iterate messages with \Deleted flag and call storage.deleteMessage()
+        // (which is now a soft-delete). For each expunged message, send untagged response:
+        // * <seq> EXPUNGE
+
+        try self.sendResponse(tag, "OK", "EXPUNGE completed (soft-delete)");
+    }
+
     /// Handle LOGOUT command
     fn handleLogout(self: *ImapSession, tag: []const u8) !void {
         try self.sendUntagged("BYE IMAP4rev1 Server logging out");
@@ -709,6 +723,7 @@ pub const ImapSession = struct {
                 const items = parts.next() orelse "FLAGS";
                 try self.handleFetch(tag, sequence_set, items);
             },
+            .expunge => try self.handleExpunge(tag),
             else => {
                 try self.sendResponse(tag, "NO", "Command not implemented");
             },

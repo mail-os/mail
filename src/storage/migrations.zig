@@ -365,6 +365,27 @@ pub const smtp_migrations = [_]Migration{
         \\DROP TABLE IF EXISTS message_queue;
         ,
     },
+    .{
+        .version = 4,
+        .name = "add_soft_delete_columns",
+        .up_sql =
+        \\ALTER TABLE messages ADD COLUMN deleted_at INTEGER DEFAULT NULL;
+        \\ALTER TABLE messages ADD COLUMN deleted_by TEXT DEFAULT NULL;
+        \\CREATE INDEX IF NOT EXISTS idx_messages_deleted_at ON messages(deleted_at);
+        ,
+        .down_sql =
+        \\DROP INDEX IF EXISTS idx_messages_deleted_at;
+        \\-- SQLite < 3.35 doesn't support DROP COLUMN; recreate table without soft-delete columns
+        \\CREATE TABLE messages_backup AS SELECT id, message_id, email, sender, recipients, subject, body, headers, size, received_at, flags, folder FROM messages;
+        \\DROP TABLE messages;
+        \\ALTER TABLE messages_backup RENAME TO messages;
+        \\CREATE INDEX IF NOT EXISTS idx_messages_email ON messages(email);
+        \\CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages(message_id);
+        \\CREATE INDEX IF NOT EXISTS idx_messages_received_at ON messages(received_at);
+        \\CREATE INDEX IF NOT EXISTS idx_messages_folder ON messages(folder);
+        \\CREATE INDEX IF NOT EXISTS idx_messages_flags ON messages(flags);
+        ,
+    },
 };
 
 test "migration manager basic operations" {
