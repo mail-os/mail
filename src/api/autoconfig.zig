@@ -60,6 +60,18 @@ pub const AutoconfigConfig = struct {
 
     /// Short display name (e.g., "Example")
     display_short_name: []const u8 = "Mail",
+
+    /// Whether CardDAV (contacts) is enabled in Apple mobileconfig
+    enable_carddav: bool = true,
+
+    /// Whether CalDAV (calendar) is enabled in Apple mobileconfig
+    enable_caldav_profile: bool = true,
+
+    /// CardDAV/CalDAV server hostname (defaults to main hostname)
+    caldav_hostname: ?[]const u8 = null,
+
+    /// CardDAV/CalDAV server port
+    caldav_port: u16 = 443,
 };
 
 /// HTTP response with status, content type, and body.
@@ -325,6 +337,20 @@ pub fn generateThunderbirdXML(
     try buf.appendSlice(allocator, "    </documentation>\n");
 
     try buf.appendSlice(allocator, "  </emailProvider>\n");
+
+    // CardDAV addressbook (Thunderbird supports this since v102+)
+    if (config.enable_carddav) {
+        const carddav_host = config.caldav_hostname orelse config.hostname;
+        try buf.appendSlice(allocator, "  <addressBook type=\"carddav\">\n");
+        try buf.print(allocator, "    <hostname>{s}</hostname>\n", .{carddav_host});
+        try buf.print(allocator, "    <port>{d}</port>\n", .{config.caldav_port});
+        try buf.appendSlice(allocator, "    <socketType>SSL</socketType>\n");
+        try buf.appendSlice(allocator, "    <authentication>password-cleartext</authentication>\n");
+        try buf.appendSlice(allocator, "    <username>%EMAILADDRESS%</username>\n");
+        try buf.print(allocator, "    <url>https://{s}:{d}/addressbooks/%EMAILADDRESS%/</url>\n", .{ carddav_host, config.caldav_port });
+        try buf.appendSlice(allocator, "  </addressBook>\n");
+    }
+
     try buf.appendSlice(allocator, "</clientConfig>\n");
 
     return buf.toOwnedSlice(allocator);
@@ -513,6 +539,75 @@ pub fn generateAppleMobileconfig(
     try buf.appendSlice(allocator, "      <false/>\n");
 
     try buf.appendSlice(allocator, "    </dict>\n");
+
+    // CardDAV (Contacts) payload
+    if (config.enable_carddav) {
+        const carddav_uuid = try generateDeterministicUUID(allocator, email, "carddav");
+        defer allocator.free(carddav_uuid);
+        const carddav_host = config.caldav_hostname orelse config.hostname;
+
+        try buf.appendSlice(allocator, "    <dict>\n");
+        try buf.appendSlice(allocator, "      <key>CardDAVAccountDescription</key>\n");
+        try buf.print(allocator, "      <string>{s} Contacts</string>\n", .{config.display_name});
+        try buf.appendSlice(allocator, "      <key>CardDAVHostName</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{carddav_host});
+        try buf.appendSlice(allocator, "      <key>CardDAVPort</key>\n");
+        try buf.print(allocator, "      <integer>{d}</integer>\n", .{config.caldav_port});
+        try buf.appendSlice(allocator, "      <key>CardDAVPrincipalURL</key>\n");
+        try buf.print(allocator, "      <string>/principals/{s}</string>\n", .{email});
+        try buf.appendSlice(allocator, "      <key>CardDAVUseSSL</key>\n");
+        try buf.appendSlice(allocator, "      <true/>\n");
+        try buf.appendSlice(allocator, "      <key>CardDAVUsername</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{email});
+        try buf.appendSlice(allocator, "      <key>PayloadDescription</key>\n");
+        try buf.print(allocator, "      <string>CardDAV contacts for {s}</string>\n", .{email_domain});
+        try buf.appendSlice(allocator, "      <key>PayloadDisplayName</key>\n");
+        try buf.print(allocator, "      <string>{s} Contacts</string>\n", .{config.display_name});
+        try buf.appendSlice(allocator, "      <key>PayloadIdentifier</key>\n");
+        try buf.print(allocator, "      <string>com.{s}.carddav.account</string>\n", .{email_domain});
+        try buf.appendSlice(allocator, "      <key>PayloadType</key>\n");
+        try buf.appendSlice(allocator, "      <string>com.apple.carddav.account</string>\n");
+        try buf.appendSlice(allocator, "      <key>PayloadUUID</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{carddav_uuid});
+        try buf.appendSlice(allocator, "      <key>PayloadVersion</key>\n");
+        try buf.appendSlice(allocator, "      <integer>1</integer>\n");
+        try buf.appendSlice(allocator, "    </dict>\n");
+    }
+
+    // CalDAV (Calendar) payload
+    if (config.enable_caldav_profile) {
+        const caldav_uuid = try generateDeterministicUUID(allocator, email, "caldav");
+        defer allocator.free(caldav_uuid);
+        const caldav_host = config.caldav_hostname orelse config.hostname;
+
+        try buf.appendSlice(allocator, "    <dict>\n");
+        try buf.appendSlice(allocator, "      <key>CalDAVAccountDescription</key>\n");
+        try buf.print(allocator, "      <string>{s} Calendar</string>\n", .{config.display_name});
+        try buf.appendSlice(allocator, "      <key>CalDAVHostName</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{caldav_host});
+        try buf.appendSlice(allocator, "      <key>CalDAVPort</key>\n");
+        try buf.print(allocator, "      <integer>{d}</integer>\n", .{config.caldav_port});
+        try buf.appendSlice(allocator, "      <key>CalDAVPrincipalURL</key>\n");
+        try buf.print(allocator, "      <string>/principals/{s}</string>\n", .{email});
+        try buf.appendSlice(allocator, "      <key>CalDAVUseSSL</key>\n");
+        try buf.appendSlice(allocator, "      <true/>\n");
+        try buf.appendSlice(allocator, "      <key>CalDAVUsername</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{email});
+        try buf.appendSlice(allocator, "      <key>PayloadDescription</key>\n");
+        try buf.print(allocator, "      <string>CalDAV calendar for {s}</string>\n", .{email_domain});
+        try buf.appendSlice(allocator, "      <key>PayloadDisplayName</key>\n");
+        try buf.print(allocator, "      <string>{s} Calendar</string>\n", .{config.display_name});
+        try buf.appendSlice(allocator, "      <key>PayloadIdentifier</key>\n");
+        try buf.print(allocator, "      <string>com.{s}.caldav.account</string>\n", .{email_domain});
+        try buf.appendSlice(allocator, "      <key>PayloadType</key>\n");
+        try buf.appendSlice(allocator, "      <string>com.apple.caldav.account</string>\n");
+        try buf.appendSlice(allocator, "      <key>PayloadUUID</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{caldav_uuid});
+        try buf.appendSlice(allocator, "      <key>PayloadVersion</key>\n");
+        try buf.appendSlice(allocator, "      <integer>1</integer>\n");
+        try buf.appendSlice(allocator, "    </dict>\n");
+    }
+
     try buf.appendSlice(allocator, "  </array>\n");
 
     // Profile-level metadata

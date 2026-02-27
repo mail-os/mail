@@ -161,6 +161,8 @@ pub fn build(b: *std.Build) void {
         "tests/autoconfig_test.zig",
         "tests/rfc5804_managesieve_test.zig",
         "tests/milter_test.zig",
+        "tests/rfc6352_carddav_test.zig",
+        "tests/imap_notes_test.zig",
     };
 
     for (test_files) |test_file| {

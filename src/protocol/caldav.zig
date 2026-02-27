@@ -5,6 +5,7 @@ const io_compat = @import("../core/io_compat.zig");
 const auth = @import("../auth/auth.zig");
 const logger = @import("../core/logger.zig");
 const tls = @import("tls");
+const caldav_store = @import("../storage/caldav_store.zig");
 
 /// CalDAV/CardDAV Server Implementation
 /// RFC 4791 (CalDAV) and RFC 6352 (CardDAV)
@@ -72,6 +73,110 @@ pub const HttpMethod = enum {
 };
 
 // ============================================================================
+// Path Parsing
+// ============================================================================
+
+/// Parsed components from a CalDAV/CardDAV URL path
+pub const ParsedPath = struct {
+    path_type: PathType,
+    user: ?[]const u8 = null,
+    collection: ?[]const u8 = null,
+    resource_uid: ?[]const u8 = null,
+
+    pub const PathType = enum {
+        root,
+        principals,
+        principal_user,
+        calendars_home,
+        calendar_collection,
+        calendar_resource,
+        addressbooks_home,
+        addressbook_collection,
+        addressbook_resource,
+        well_known_caldav,
+        well_known_carddav,
+        unknown,
+    };
+};
+
+/// Parse a CalDAV/CardDAV path into components.
+/// Paths follow patterns like:
+///   /principals/{user}
+///   /calendars/{user}/{calendar}/{uid}.ics
+///   /addressbooks/{user}/{addressbook}/{uid}.vcf
+pub fn parsePath(path: []const u8) ParsedPath {
+    // Handle well-known paths
+    if (std.mem.startsWith(u8, path, "/.well-known/caldav")) {
+        return .{ .path_type = .well_known_caldav };
+    }
+    if (std.mem.startsWith(u8, path, "/.well-known/carddav")) {
+        return .{ .path_type = .well_known_carddav };
+    }
+
+    // Trim trailing slash for uniform processing
+    const trimmed = if (path.len > 1 and path[path.len - 1] == '/') path[0 .. path.len - 1] else path;
+
+    // Split path segments
+    var segments: [8][]const u8 = undefined;
+    var seg_count: usize = 0;
+    var iter = std.mem.splitScalar(u8, trimmed, '/');
+    while (iter.next()) |seg| {
+        if (seg.len == 0) continue; // skip leading empty segment
+        if (seg_count < 8) {
+            segments[seg_count] = seg;
+            seg_count += 1;
+        }
+    }
+
+    if (seg_count == 0) return .{ .path_type = .root };
+
+    // /principals/...
+    if (std.mem.eql(u8, segments[0], "principals")) {
+        if (seg_count == 1) return .{ .path_type = .principals };
+        return .{ .path_type = .principal_user, .user = segments[1] };
+    }
+
+    // /calendars/...
+    if (std.mem.eql(u8, segments[0], "calendars")) {
+        if (seg_count == 1) return .{ .path_type = .calendars_home };
+        if (seg_count == 2) return .{ .path_type = .calendars_home, .user = segments[1] };
+        if (seg_count == 3) return .{ .path_type = .calendar_collection, .user = segments[1], .collection = segments[2] };
+        if (seg_count >= 4) {
+            // Extract UID from filename (remove .ics)
+            const filename = segments[3];
+            const uid = if (std.mem.endsWith(u8, filename, ".ics")) filename[0 .. filename.len - 4] else filename;
+            return .{ .path_type = .calendar_resource, .user = segments[1], .collection = segments[2], .resource_uid = uid };
+        }
+    }
+
+    // /addressbooks/...
+    if (std.mem.eql(u8, segments[0], "addressbooks")) {
+        if (seg_count == 1) return .{ .path_type = .addressbooks_home };
+        if (seg_count == 2) return .{ .path_type = .addressbooks_home, .user = segments[1] };
+        if (seg_count == 3) return .{ .path_type = .addressbook_collection, .user = segments[1], .collection = segments[2] };
+        if (seg_count >= 4) {
+            // Extract UID from filename (remove .vcf)
+            const filename = segments[3];
+            const uid = if (std.mem.endsWith(u8, filename, ".vcf")) filename[0 .. filename.len - 4] else filename;
+            return .{ .path_type = .addressbook_resource, .user = segments[1], .collection = segments[2], .resource_uid = uid };
+        }
+    }
+
+    return .{ .path_type = .unknown };
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+/// Append a formatted string to an ArrayList(u8)
+fn appendPrint(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+    const formatted = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(formatted);
+    try buf.appendSlice(formatted);
+}
+
+// ============================================================================
 // CalDAV/CardDAV Session
 // ============================================================================
 
@@ -81,12 +186,14 @@ pub const CalDavSession = struct {
     username: ?[]const u8 = null,
     authenticated: bool = false,
     auth_backend: *auth.AuthBackend,
+    store: *caldav_store.CalDavStore,
 
-    pub fn init(allocator: std.mem.Allocator, connection: socket.Connection, auth_backend: *auth.AuthBackend) CalDavSession {
+    pub fn init(allocator: std.mem.Allocator, connection: socket.Connection, auth_backend: *auth.AuthBackend, store: *caldav_store.CalDavStore) CalDavSession {
         return .{
             .allocator = allocator,
             .connection = connection,
             .auth_backend = auth_backend,
+            .store = store,
         };
     }
 
@@ -251,145 +358,319 @@ pub const CalDavSession = struct {
         config: *const CalDavConfig,
     ) !void {
         _ = config;
-        _ = request;
 
-        // Check if this is an addressbook (CardDAV) or calendar (CalDAV) request
-        const is_addressbook = std.mem.startsWith(u8, path, "/addressbooks");
-
-        // Build XML response
-        var response_body: [4096]u8 = undefined;
-        var fbs = io_compat.fixedBufferStream(&response_body);
-        const writer = fbs.writer();
-
-        if (is_addressbook) {
-            // CardDAV response for addressbooks
-            try writer.writeAll(
-                \\<?xml version="1.0" encoding="utf-8" ?>
-                \\<D:multistatus xmlns:D="DAV:" xmlns:CARD="urn:ietf:params:xml:ns:carddav">
-                \\  <D:response>
-                \\    <D:href>
-            );
-            try writer.writeAll(path);
-            try writer.writeAll(
-                \\</D:href>
-                \\    <D:propstat>
-                \\      <D:prop>
-                \\        <D:resourcetype>
-                \\          <D:collection/>
-                \\          <CARD:addressbook/>
-                \\        </D:resourcetype>
-                \\        <D:displayname>Contacts</D:displayname>
-                \\        <CARD:supported-address-data>
-                \\          <CARD:address-data-type content-type="text/vcard" version="3.0"/>
-                \\          <CARD:address-data-type content-type="text/vcard" version="4.0"/>
-                \\        </CARD:supported-address-data>
-                \\      </D:prop>
-                \\      <D:status>HTTP/1.1 200 OK</D:status>
-                \\    </D:propstat>
-                \\  </D:response>
-                \\</D:multistatus>
-            );
-        } else {
-            // CalDAV response for calendars
-            try writer.writeAll(
-                \\<?xml version="1.0" encoding="utf-8" ?>
-                \\<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
-                \\  <D:response>
-                \\    <D:href>
-            );
-            try writer.writeAll(path);
-            try writer.writeAll(
-                \\</D:href>
-                \\    <D:propstat>
-                \\      <D:prop>
-                \\        <D:resourcetype>
-                \\          <D:collection/>
-                \\          <C:calendar/>
-                \\        </D:resourcetype>
-                \\        <D:displayname>Calendar</D:displayname>
-                \\        <C:supported-calendar-component-set>
-                \\          <C:comp name="VEVENT"/>
-                \\          <C:comp name="VTODO"/>
-                \\        </C:supported-calendar-component-set>
-                \\      </D:prop>
-                \\      <D:status>HTTP/1.1 200 OK</D:status>
-                \\    </D:propstat>
-                \\  </D:response>
-                \\</D:multistatus>
-            );
+        // Parse Depth header (0 = resource only, 1 = resource + children)
+        var depth: u8 = 0;
+        var lines = std.mem.splitScalar(u8, request, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
+            if (trimmed.len == 0) break;
+            if (std.mem.startsWith(u8, trimmed, "Depth:")) {
+                const depth_val = std.mem.trim(u8, trimmed[6..], &std.ascii.whitespace);
+                if (std.mem.eql(u8, depth_val, "1")) depth = 1;
+                if (std.mem.eql(u8, depth_val, "infinity")) depth = 1;
+                break;
+            }
         }
 
-        const body_len = fbs.pos;
+        const parsed = parsePath(path);
+        const user_id: u64 = 1;
 
+        // Build XML response using dynamic buffer
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+
+        switch (parsed.path_type) {
+            .root, .well_known_caldav, .well_known_carddav => {
+                // Root PROPFIND - return principal URLs
+                try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+                try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
+                try buf.appendSlice("  <D:response>\n");
+                try buf.appendSlice("    <D:href>/</D:href>\n");
+                try buf.appendSlice("    <D:propstat>\n");
+                try buf.appendSlice("      <D:prop>\n");
+                try buf.appendSlice("        <D:resourcetype><D:collection/></D:resourcetype>\n");
+                const username = self.username orelse "user";
+                try appendPrint(&buf, self.allocator, "        <D:current-user-principal><D:href>/principals/{s}</D:href></D:current-user-principal>\n", .{username});
+                try buf.appendSlice("      </D:prop>\n");
+                try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                try buf.appendSlice("    </D:propstat>\n");
+                try buf.appendSlice("  </D:response>\n");
+                try buf.appendSlice("</D:multistatus>");
+            },
+            .principals, .principal_user => {
+                const username = parsed.user orelse (self.username orelse "user");
+                try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+                try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
+                try buf.appendSlice("  <D:response>\n");
+                try appendPrint(&buf, self.allocator, "    <D:href>/principals/{s}</D:href>\n", .{username});
+                try buf.appendSlice("    <D:propstat>\n");
+                try buf.appendSlice("      <D:prop>\n");
+                try buf.appendSlice("        <D:resourcetype><D:principal/></D:resourcetype>\n");
+                try appendPrint(&buf, self.allocator, "        <D:current-user-principal><D:href>/principals/{s}</D:href></D:current-user-principal>\n", .{username});
+                try appendPrint(&buf, self.allocator, "        <C:calendar-home-set><D:href>/calendars/{s}/</D:href></C:calendar-home-set>\n", .{username});
+                try appendPrint(&buf, self.allocator, "        <CARD:addressbook-home-set><D:href>/addressbooks/{s}/</D:href></CARD:addressbook-home-set>\n", .{username});
+                try buf.appendSlice("      </D:prop>\n");
+                try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                try buf.appendSlice("    </D:propstat>\n");
+                try buf.appendSlice("  </D:response>\n");
+                try buf.appendSlice("</D:multistatus>");
+            },
+            .calendars_home => {
+                try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+                try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n");
+                // List user's calendars
+                const calendars = self.store.getUserCalendars(user_id) catch &[_]caldav_store.Calendar{};
+                for (calendars) |cal| {
+                    try buf.appendSlice("  <D:response>\n");
+                    const username = parsed.user orelse "user";
+                    try appendPrint(&buf, self.allocator, "    <D:href>/calendars/{s}/{s}/</D:href>\n", .{ username, cal.name });
+                    try buf.appendSlice("    <D:propstat>\n");
+                    try buf.appendSlice("      <D:prop>\n");
+                    try buf.appendSlice("        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\n");
+                    try appendPrint(&buf, self.allocator, "        <D:displayname>{s}</D:displayname>\n", .{cal.name});
+                    try appendPrint(&buf, self.allocator, "        <CS:getctag xmlns:CS=\"http://calendarserver.org/ns/\">{s}</CS:getctag>\n", .{cal.ctag});
+                    try buf.appendSlice("      </D:prop>\n");
+                    try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                    try buf.appendSlice("    </D:propstat>\n");
+                    try buf.appendSlice("  </D:response>\n");
+                }
+                try buf.appendSlice("</D:multistatus>");
+            },
+            .calendar_collection => {
+                try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+                try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n");
+
+                const collection_name = parsed.collection orelse "default";
+                const username = parsed.user orelse "user";
+
+                // Collection itself
+                try buf.appendSlice("  <D:response>\n");
+                try appendPrint(&buf, self.allocator, "    <D:href>/calendars/{s}/{s}/</D:href>\n", .{ username, collection_name });
+                try buf.appendSlice("    <D:propstat>\n");
+                try buf.appendSlice("      <D:prop>\n");
+                try buf.appendSlice("        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\n");
+                try appendPrint(&buf, self.allocator, "        <D:displayname>{s}</D:displayname>\n", .{collection_name});
+                try buf.appendSlice("        <C:supported-calendar-component-set><C:comp name=\"VEVENT\"/><C:comp name=\"VTODO\"/></C:supported-calendar-component-set>\n");
+                try buf.appendSlice("      </D:prop>\n");
+                try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                try buf.appendSlice("    </D:propstat>\n");
+                try buf.appendSlice("  </D:response>\n");
+
+                // List events if Depth: 1
+                if (depth >= 1) {
+                    const calendars = self.store.getUserCalendars(user_id) catch &[_]caldav_store.Calendar{};
+                    for (calendars) |cal| {
+                        if (std.mem.eql(u8, cal.name, collection_name)) {
+                            const events = self.store.getCalendarEvents(cal.id) catch &[_]caldav_store.Event{};
+                            for (events) |event| {
+                                try buf.appendSlice("  <D:response>\n");
+                                try appendPrint(&buf, self.allocator, "    <D:href>/calendars/{s}/{s}/{s}.ics</D:href>\n", .{ username, collection_name, event.uid });
+                                try buf.appendSlice("    <D:propstat>\n");
+                                try buf.appendSlice("      <D:prop>\n");
+                                try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{event.etag});
+                                try buf.appendSlice("      </D:prop>\n");
+                                try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                                try buf.appendSlice("    </D:propstat>\n");
+                                try buf.appendSlice("  </D:response>\n");
+                            }
+                            break;
+                        }
+                    }
+                }
+                try buf.appendSlice("</D:multistatus>");
+            },
+            .addressbooks_home => {
+                try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+                try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
+                const addressbooks = self.store.getUserAddressBooks(user_id) catch &[_]caldav_store.AddressBook{};
+                for (addressbooks) |ab| {
+                    try buf.appendSlice("  <D:response>\n");
+                    const username = parsed.user orelse "user";
+                    try appendPrint(&buf, self.allocator, "    <D:href>/addressbooks/{s}/{s}/</D:href>\n", .{ username, ab.name });
+                    try buf.appendSlice("    <D:propstat>\n");
+                    try buf.appendSlice("      <D:prop>\n");
+                    try buf.appendSlice("        <D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>\n");
+                    try appendPrint(&buf, self.allocator, "        <D:displayname>{s}</D:displayname>\n", .{ab.name});
+                    try appendPrint(&buf, self.allocator, "        <CS:getctag xmlns:CS=\"http://calendarserver.org/ns/\">{s}</CS:getctag>\n", .{ab.ctag});
+                    try buf.appendSlice("        <CARD:supported-address-data><CARD:address-data-type content-type=\"text/vcard\" version=\"3.0\"/></CARD:supported-address-data>\n");
+                    try buf.appendSlice("      </D:prop>\n");
+                    try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                    try buf.appendSlice("    </D:propstat>\n");
+                    try buf.appendSlice("  </D:response>\n");
+                }
+                try buf.appendSlice("</D:multistatus>");
+            },
+            .addressbook_collection => {
+                try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+                try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
+
+                const collection_name = parsed.collection orelse "default";
+                const username = parsed.user orelse "user";
+
+                // Collection itself
+                try buf.appendSlice("  <D:response>\n");
+                try appendPrint(&buf, self.allocator, "    <D:href>/addressbooks/{s}/{s}/</D:href>\n", .{ username, collection_name });
+                try buf.appendSlice("    <D:propstat>\n");
+                try buf.appendSlice("      <D:prop>\n");
+                try buf.appendSlice("        <D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>\n");
+                try appendPrint(&buf, self.allocator, "        <D:displayname>{s}</D:displayname>\n", .{collection_name});
+                try buf.appendSlice("        <CARD:supported-address-data><CARD:address-data-type content-type=\"text/vcard\" version=\"3.0\"/></CARD:supported-address-data>\n");
+                try buf.appendSlice("      </D:prop>\n");
+                try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                try buf.appendSlice("    </D:propstat>\n");
+                try buf.appendSlice("  </D:response>\n");
+
+                // List contacts if Depth: 1
+                if (depth >= 1) {
+                    const addressbooks = self.store.getUserAddressBooks(user_id) catch &[_]caldav_store.AddressBook{};
+                    for (addressbooks) |ab| {
+                        if (std.mem.eql(u8, ab.name, collection_name)) {
+                            const contacts = self.store.getAddressBookContacts(ab.id) catch &[_]caldav_store.Contact{};
+                            for (contacts) |contact| {
+                                try buf.appendSlice("  <D:response>\n");
+                                try appendPrint(&buf, self.allocator, "    <D:href>/addressbooks/{s}/{s}/{s}.vcf</D:href>\n", .{ username, collection_name, contact.uid });
+                                try buf.appendSlice("    <D:propstat>\n");
+                                try buf.appendSlice("      <D:prop>\n");
+                                try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{contact.etag});
+                                try buf.appendSlice("      </D:prop>\n");
+                                try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                                try buf.appendSlice("    </D:propstat>\n");
+                                try buf.appendSlice("  </D:response>\n");
+                            }
+                            break;
+                        }
+                    }
+                }
+                try buf.appendSlice("</D:multistatus>");
+            },
+            else => {
+                // Fallback: generic PROPFIND response for the path
+                try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+                try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\">\n");
+                try buf.appendSlice("  <D:response>\n");
+                try buf.appendSlice("    <D:href>");
+                try buf.appendSlice(path);
+                try buf.appendSlice("</D:href>\n");
+                try buf.appendSlice("    <D:propstat>\n");
+                try buf.appendSlice("      <D:prop>\n");
+                try buf.appendSlice("        <D:resourcetype><D:collection/></D:resourcetype>\n");
+                try buf.appendSlice("      </D:prop>\n");
+                try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                try buf.appendSlice("    </D:propstat>\n");
+                try buf.appendSlice("  </D:response>\n");
+                try buf.appendSlice("</D:multistatus>");
+            },
+        }
+
+        const body = buf.items;
         var header_buf: [256]u8 = undefined;
         var header_fbs = io_compat.fixedBufferStream(&header_buf);
         const header_writer = header_fbs.writer();
         try header_writer.print(
             "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: {d}\r\n\r\n",
-            .{body_len},
+            .{body.len},
         );
 
         _ = try self.connection.write(header_fbs.getWritten());
-        _ = try self.connection.write(response_body[0..body_len]);
+        _ = try self.connection.write(body);
     }
 
     /// Handle GET request (retrieve calendar/contact resource)
     fn handleGet(self: *CalDavSession, path: []const u8, config: *const CalDavConfig) !void {
         _ = config;
+        const parsed = parsePath(path);
 
-        // Check if path is a calendar event or contact
-        if (std.mem.endsWith(u8, path, ".ics")) {
-            // Return iCalendar data
-            const ical_data =
-                \\BEGIN:VCALENDAR
-                \\VERSION:2.0
-                \\PRODID:-//SMTP Server//CalDAV Server//EN
-                \\BEGIN:VEVENT
-                \\UID:event-001@smtp-server
-                \\DTSTAMP:20250124T120000Z
-                \\DTSTART:20250124T140000Z
-                \\DTEND:20250124T150000Z
-                \\SUMMARY:Test Event
-                \\DESCRIPTION:This is a test calendar event
-                \\END:VEVENT
-                \\END:VCALENDAR
-            ;
-
-            var header_buf: [256]u8 = undefined;
-            var fbs = io_compat.fixedBufferStream(&header_buf);
-            const writer = fbs.writer();
-            try writer.print(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/calendar; charset=utf-8\r\nETag: \"event-001\"\r\nContent-Length: {d}\r\n\r\n",
-                .{ical_data.len},
-            );
-
-            _ = try self.connection.write(fbs.getWritten());
-            _ = try self.connection.write(ical_data);
-        } else if (std.mem.endsWith(u8, path, ".vcf")) {
-            // Return vCard data
-            const vcard_data =
-                \\BEGIN:VCARD
-                \\VERSION:3.0
-                \\FN:John Doe
-                \\N:Doe;John;;;
-                \\EMAIL;TYPE=INTERNET:john@example.com
-                \\TEL;TYPE=CELL:+1-555-1234
-                \\END:VCARD
-            ;
-
-            var header_buf: [256]u8 = undefined;
-            var fbs = io_compat.fixedBufferStream(&header_buf);
-            const writer = fbs.writer();
-            try writer.print(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/vcard; charset=utf-8\r\nETag: \"contact-001\"\r\nContent-Length: {d}\r\n\r\n",
-                .{vcard_data.len},
-            );
-
-            _ = try self.connection.write(fbs.getWritten());
-            _ = try self.connection.write(vcard_data);
-        } else {
-            try self.sendError(404, "Not Found");
+        switch (parsed.path_type) {
+            .calendar_resource => {
+                const uid = parsed.resource_uid orelse {
+                    try self.sendError(404, "Not Found");
+                    return;
+                };
+                const collection_name = parsed.collection orelse {
+                    try self.sendError(404, "Not Found");
+                    return;
+                };
+                // Look up calendar by name for the user (use user_id=1 as default)
+                const user_id: u64 = 1;
+                const calendars = self.store.getUserCalendars(user_id) catch {
+                    try self.sendError(500, "Internal Server Error");
+                    return;
+                };
+                var calendar_id: ?u64 = null;
+                for (calendars) |cal| {
+                    if (std.mem.eql(u8, cal.name, collection_name)) {
+                        calendar_id = cal.id;
+                        break;
+                    }
+                }
+                const cal_id = calendar_id orelse {
+                    try self.sendError(404, "Not Found");
+                    return;
+                };
+                const event = self.store.getEventByUid(cal_id, uid) orelse {
+                    try self.sendError(404, "Not Found");
+                    return;
+                };
+                const ics_data = if (event.ics_data.len > 0) event.ics_data else "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n";
+                try self.sendResourceResponse("text/calendar", event.etag, ics_data);
+            },
+            .addressbook_resource => {
+                const uid = parsed.resource_uid orelse {
+                    try self.sendError(404, "Not Found");
+                    return;
+                };
+                const collection_name = parsed.collection orelse {
+                    try self.sendError(404, "Not Found");
+                    return;
+                };
+                const user_id: u64 = 1;
+                const addressbooks = self.store.getUserAddressBooks(user_id) catch {
+                    try self.sendError(500, "Internal Server Error");
+                    return;
+                };
+                var ab_id: ?u64 = null;
+                for (addressbooks) |ab| {
+                    if (std.mem.eql(u8, ab.name, collection_name)) {
+                        ab_id = ab.id;
+                        break;
+                    }
+                }
+                const addressbook_id = ab_id orelse {
+                    try self.sendError(404, "Not Found");
+                    return;
+                };
+                const contact = self.store.getContactByUid(addressbook_id, uid) orelse {
+                    try self.sendError(404, "Not Found");
+                    return;
+                };
+                const vcf_data = if (contact.vcf_data.len > 0)
+                    contact.vcf_data
+                else blk: {
+                    break :blk self.store.generateVcf(contact) catch {
+                        try self.sendError(500, "Internal Server Error");
+                        return;
+                    };
+                };
+                try self.sendResourceResponse("text/vcard", contact.etag, vcf_data);
+            },
+            else => {
+                try self.sendError(404, "Not Found");
+            },
         }
+    }
+
+    /// Send a resource response with Content-Type, ETag, and body
+    fn sendResourceResponse(self: *CalDavSession, content_type: []const u8, etag: []const u8, body: []const u8) !void {
+        var header_buf: [512]u8 = undefined;
+        var fbs = io_compat.fixedBufferStream(&header_buf);
+        const writer = fbs.writer();
+        try writer.print(
+            "HTTP/1.1 200 OK\r\nContent-Type: {s}; charset=utf-8\r\nETag: {s}\r\nContent-Length: {d}\r\n\r\n",
+            .{ content_type, etag, body.len },
+        );
+        _ = try self.connection.write(fbs.getWritten());
+        _ = try self.connection.write(body);
     }
 
     /// Handle PUT request (create/update calendar/contact resource)
@@ -399,56 +680,332 @@ pub const CalDavSession = struct {
         request: []const u8,
         config: *const CalDavConfig,
     ) !void {
-        _ = path;
         _ = config;
+        const parsed = parsePath(path);
 
         // Extract body from request
         const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse {
             try self.sendError(400, "Bad Request");
             return;
         };
-
         const body = request[body_start + 4 ..];
 
-        // Validate iCalendar or vCard format
-        if (std.mem.indexOf(u8, body, "BEGIN:VCALENDAR") != null) {
-            // Parse and store calendar event
-            // TODO: Actual storage implementation
-            try self.sendSuccess(201, "Created");
-        } else if (std.mem.indexOf(u8, body, "BEGIN:VCARD") != null) {
-            // Parse and store contact
-            // TODO: Actual storage implementation
-            try self.sendSuccess(201, "Created");
-        } else {
-            try self.sendError(400, "Invalid format");
+        // Extract If-Match header for conflict detection
+        var if_match: ?[]const u8 = null;
+        var lines = std.mem.splitScalar(u8, request[0..body_start], '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
+            if (std.mem.startsWith(u8, trimmed, "If-Match:")) {
+                if_match = std.mem.trim(u8, trimmed[9..], &std.ascii.whitespace);
+                break;
+            }
+        }
+
+        switch (parsed.path_type) {
+            .calendar_resource => {
+                if (std.mem.indexOf(u8, body, "BEGIN:VCALENDAR") == null) {
+                    try self.sendError(400, "Invalid iCalendar format");
+                    return;
+                }
+                const uid = parsed.resource_uid orelse {
+                    try self.sendError(400, "Missing resource UID");
+                    return;
+                };
+                const collection_name = parsed.collection orelse {
+                    try self.sendError(400, "Missing calendar name");
+                    return;
+                };
+                const user_id: u64 = 1;
+
+                // Find or create calendar
+                var cal_id: u64 = undefined;
+                if (self.store.getAddressBookByName(user_id, collection_name)) |_| {
+                    // Wrong type - this is an addressbook path
+                    try self.sendError(400, "Path is not a calendar");
+                    return;
+                }
+                const calendars = self.store.getUserCalendars(user_id) catch {
+                    try self.sendError(500, "Internal Server Error");
+                    return;
+                };
+                var found = false;
+                for (calendars) |cal| {
+                    if (std.mem.eql(u8, cal.name, collection_name)) {
+                        cal_id = cal.id;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    cal_id = self.store.createCalendar(user_id, collection_name, null) catch {
+                        try self.sendError(500, "Internal Server Error");
+                        return;
+                    };
+                }
+
+                // Parse event summary from ICS
+                const parsed_event = caldav_store.IcsParser.parseEvent(body);
+                const summary = if (parsed_event) |e| (e.summary orelse "Untitled") else "Untitled";
+
+                // Check if this is an update
+                if (self.store.getEventIdByUid(cal_id, uid)) |event_id| {
+                    // Update existing: check ETag if If-Match provided
+                    if (if_match) |etag| {
+                        if (self.store.getEvent(event_id)) |existing| {
+                            if (!std.mem.eql(u8, existing.etag, etag)) {
+                                try self.sendError(412, "Precondition Failed");
+                                return;
+                            }
+                        }
+                    }
+                    self.store.updateEvent(event_id, .{ .summary = summary, .dtstart = std.time.timestamp(), .ics_data = body }) catch {
+                        try self.sendError(500, "Internal Server Error");
+                        return;
+                    };
+                    try self.sendSuccess(204, "No Content");
+                } else {
+                    // Create new
+                    _ = self.store.createEvent(cal_id, .{ .uid = uid, .summary = summary, .dtstart = std.time.timestamp(), .ics_data = body }) catch {
+                        try self.sendError(500, "Internal Server Error");
+                        return;
+                    };
+                    try self.sendSuccess(201, "Created");
+                }
+            },
+            .addressbook_resource => {
+                if (std.mem.indexOf(u8, body, "BEGIN:VCARD") == null) {
+                    try self.sendError(400, "Invalid vCard format");
+                    return;
+                }
+                const uid = parsed.resource_uid orelse {
+                    try self.sendError(400, "Missing resource UID");
+                    return;
+                };
+                const collection_name = parsed.collection orelse {
+                    try self.sendError(400, "Missing addressbook name");
+                    return;
+                };
+                const user_id: u64 = 1;
+
+                // Find or create addressbook
+                var ab_id: u64 = undefined;
+                const addressbooks = self.store.getUserAddressBooks(user_id) catch {
+                    try self.sendError(500, "Internal Server Error");
+                    return;
+                };
+                var found_ab = false;
+                for (addressbooks) |ab| {
+                    if (std.mem.eql(u8, ab.name, collection_name)) {
+                        ab_id = ab.id;
+                        found_ab = true;
+                        break;
+                    }
+                }
+                if (!found_ab) {
+                    ab_id = self.store.createAddressBook(user_id, collection_name, null) catch {
+                        try self.sendError(500, "Internal Server Error");
+                        return;
+                    };
+                }
+
+                // Parse contact from vCard
+                const parsed_contact = caldav_store.VcfParser.parseContact(body);
+                const full_name = if (parsed_contact) |c| (c.full_name orelse "Unknown") else "Unknown";
+
+                // Check if this is an update
+                if (self.store.getContactIdByUid(ab_id, uid)) |contact_id| {
+                    if (if_match) |etag| {
+                        if (self.store.getContact(contact_id)) |existing| {
+                            if (!std.mem.eql(u8, existing.etag, etag)) {
+                                try self.sendError(412, "Precondition Failed");
+                                return;
+                            }
+                        }
+                    }
+                    self.store.updateContact(contact_id, .{ .full_name = full_name, .vcf_data = body }) catch {
+                        try self.sendError(500, "Internal Server Error");
+                        return;
+                    };
+                    try self.sendSuccess(204, "No Content");
+                } else {
+                    _ = self.store.createContact(ab_id, .{ .uid = uid, .full_name = full_name, .vcf_data = body }) catch {
+                        try self.sendError(500, "Internal Server Error");
+                        return;
+                    };
+                    try self.sendSuccess(201, "Created");
+                }
+            },
+            else => {
+                try self.sendError(400, "Invalid PUT path");
+            },
         }
     }
 
     /// Handle DELETE request (delete calendar/contact resource)
     fn handleDelete(self: *CalDavSession, path: []const u8, config: *const CalDavConfig) !void {
-        _ = path;
         _ = config;
+        const parsed = parsePath(path);
 
-        // TODO: Actual deletion implementation
-        try self.sendSuccess(204, "No Content");
+        switch (parsed.path_type) {
+            .calendar_resource => {
+                const uid = parsed.resource_uid orelse {
+                    try self.sendError(404, "Not Found");
+                    return;
+                };
+                const collection_name = parsed.collection orelse {
+                    try self.sendError(404, "Not Found");
+                    return;
+                };
+                const user_id: u64 = 1;
+                const calendars = self.store.getUserCalendars(user_id) catch {
+                    try self.sendError(500, "Internal Server Error");
+                    return;
+                };
+                for (calendars) |cal| {
+                    if (std.mem.eql(u8, cal.name, collection_name)) {
+                        if (self.store.getEventIdByUid(cal.id, uid)) |event_id| {
+                            self.store.deleteEvent(event_id) catch {
+                                try self.sendError(500, "Internal Server Error");
+                                return;
+                            };
+                            try self.sendSuccess(204, "No Content");
+                            return;
+                        }
+                    }
+                }
+                try self.sendError(404, "Not Found");
+            },
+            .addressbook_resource => {
+                const uid = parsed.resource_uid orelse {
+                    try self.sendError(404, "Not Found");
+                    return;
+                };
+                const collection_name = parsed.collection orelse {
+                    try self.sendError(404, "Not Found");
+                    return;
+                };
+                const user_id: u64 = 1;
+                const addressbooks = self.store.getUserAddressBooks(user_id) catch {
+                    try self.sendError(500, "Internal Server Error");
+                    return;
+                };
+                for (addressbooks) |ab| {
+                    if (std.mem.eql(u8, ab.name, collection_name)) {
+                        if (self.store.getContactIdByUid(ab.id, uid)) |contact_id| {
+                            self.store.deleteContact(contact_id) catch {
+                                try self.sendError(500, "Internal Server Error");
+                                return;
+                            };
+                            try self.sendSuccess(204, "No Content");
+                            return;
+                        }
+                    }
+                }
+                try self.sendError(404, "Not Found");
+            },
+            .calendar_collection => {
+                // Delete entire calendar
+                const collection_name = parsed.collection orelse {
+                    try self.sendError(404, "Not Found");
+                    return;
+                };
+                const user_id: u64 = 1;
+                const calendars = self.store.getUserCalendars(user_id) catch {
+                    try self.sendError(500, "Internal Server Error");
+                    return;
+                };
+                for (calendars) |cal| {
+                    if (std.mem.eql(u8, cal.name, collection_name)) {
+                        self.store.deleteCalendar(cal.id) catch {
+                            try self.sendError(500, "Internal Server Error");
+                            return;
+                        };
+                        try self.sendSuccess(204, "No Content");
+                        return;
+                    }
+                }
+                try self.sendError(404, "Not Found");
+            },
+            .addressbook_collection => {
+                // Delete entire addressbook
+                const collection_name = parsed.collection orelse {
+                    try self.sendError(404, "Not Found");
+                    return;
+                };
+                const user_id: u64 = 1;
+                const addressbooks = self.store.getUserAddressBooks(user_id) catch {
+                    try self.sendError(500, "Internal Server Error");
+                    return;
+                };
+                for (addressbooks) |ab| {
+                    if (std.mem.eql(u8, ab.name, collection_name)) {
+                        self.store.deleteAddressBook(ab.id) catch {
+                            try self.sendError(500, "Internal Server Error");
+                            return;
+                        };
+                        try self.sendSuccess(204, "No Content");
+                        return;
+                    }
+                }
+                try self.sendError(404, "Not Found");
+            },
+            else => {
+                try self.sendError(404, "Not Found");
+            },
+        }
     }
 
     /// Handle MKCALENDAR request (create new calendar)
     fn handleMkcalendar(self: *CalDavSession, path: []const u8, config: *const CalDavConfig) !void {
-        _ = path;
         _ = config;
+        const parsed = parsePath(path);
 
-        // TODO: Create calendar collection
-        try self.sendSuccess(201, "Created");
+        if (parsed.path_type == .calendar_collection) {
+            const collection_name = parsed.collection orelse {
+                try self.sendError(400, "Missing calendar name");
+                return;
+            };
+            const user_id: u64 = 1;
+            _ = self.store.createCalendar(user_id, collection_name, null) catch {
+                try self.sendError(500, "Internal Server Error");
+                return;
+            };
+            try self.sendSuccess(201, "Created");
+        } else {
+            try self.sendError(400, "Invalid MKCALENDAR path");
+        }
     }
 
-    /// Handle MKCOL request (create collection)
+    /// Handle MKCOL request (create collection - typically addressbook)
     fn handleMkcol(self: *CalDavSession, path: []const u8, config: *const CalDavConfig) !void {
-        _ = path;
         _ = config;
+        const parsed = parsePath(path);
 
-        // TODO: Create addressbook collection
-        try self.sendSuccess(201, "Created");
+        if (parsed.path_type == .addressbook_collection) {
+            const collection_name = parsed.collection orelse {
+                try self.sendError(400, "Missing addressbook name");
+                return;
+            };
+            const user_id: u64 = 1;
+            _ = self.store.createAddressBook(user_id, collection_name, null) catch {
+                try self.sendError(500, "Internal Server Error");
+                return;
+            };
+            try self.sendSuccess(201, "Created");
+        } else if (parsed.path_type == .calendar_collection) {
+            const collection_name = parsed.collection orelse {
+                try self.sendError(400, "Missing calendar name");
+                return;
+            };
+            const user_id: u64 = 1;
+            _ = self.store.createCalendar(user_id, collection_name, null) catch {
+                try self.sendError(500, "Internal Server Error");
+                return;
+            };
+            try self.sendSuccess(201, "Created");
+        } else {
+            try self.sendError(400, "Invalid MKCOL path");
+        }
     }
 
     /// Handle REPORT request (calendar/contact queries)
@@ -458,93 +1015,322 @@ pub const CalDavSession = struct {
         request: []const u8,
         config: *const CalDavConfig,
     ) !void {
-        _ = path;
         _ = config;
 
         // Check report type
         if (std.mem.indexOf(u8, request, "calendar-query") != null) {
-            try self.handleCalendarQuery(request);
+            try self.handleCalendarQuery(path, request);
+        } else if (std.mem.indexOf(u8, request, "calendar-multiget") != null) {
+            try self.handleCalendarMultiget(path, request);
         } else if (std.mem.indexOf(u8, request, "addressbook-query") != null) {
-            try self.handleAddressbookQuery(request);
+            try self.handleAddressbookQuery(path, request);
+        } else if (std.mem.indexOf(u8, request, "addressbook-multiget") != null) {
+            try self.handleAddressbookMultiget(path, request);
+        } else if (std.mem.indexOf(u8, request, "sync-collection") != null) {
+            try self.handleSyncCollection(path, request);
         } else {
             try self.sendError(400, "Invalid report type");
         }
     }
 
     /// Handle calendar-query REPORT
-    fn handleCalendarQuery(self: *CalDavSession, request: []const u8) !void {
+    fn handleCalendarQuery(self: *CalDavSession, path: []const u8, request: []const u8) !void {
         _ = request;
+        const parsed = parsePath(path);
+        const user_id: u64 = 1;
 
-        // Build calendar query response
-        const response_body =
-            \\<?xml version="1.0" encoding="utf-8" ?>
-            \\<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
-            \\  <D:response>
-            \\    <D:href>/calendars/user/test/event-001.ics</D:href>
-            \\    <D:propstat>
-            \\      <D:prop>
-            \\        <D:getetag>"event-001"</D:getetag>
-            \\        <C:calendar-data>BEGIN:VCALENDAR
-            \\VERSION:2.0
-            \\BEGIN:VEVENT
-            \\UID:event-001
-            \\SUMMARY:Test Event
-            \\END:VEVENT
-            \\END:VCALENDAR</C:calendar-data>
-            \\      </D:prop>
-            \\      <D:status>HTTP/1.1 200 OK</D:status>
-            \\    </D:propstat>
-            \\  </D:response>
-            \\</D:multistatus>
-        ;
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
 
-        var header_buf: [256]u8 = undefined;
-        var fbs = io_compat.fixedBufferStream(&header_buf);
-        const writer = fbs.writer();
-        try writer.print(
-            "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: {d}\r\n\r\n",
-            .{response_body.len},
-        );
+        try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+        try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n");
 
-        _ = try self.connection.write(fbs.getWritten());
-        _ = try self.connection.write(response_body);
+        const collection_name = parsed.collection orelse "default";
+        const username = parsed.user orelse "user";
+
+        const calendars = self.store.getUserCalendars(user_id) catch &[_]caldav_store.Calendar{};
+        for (calendars) |cal| {
+            if (std.mem.eql(u8, cal.name, collection_name)) {
+                const events = self.store.getCalendarEvents(cal.id) catch &[_]caldav_store.Event{};
+                for (events) |event| {
+                    try buf.appendSlice("  <D:response>\n");
+                    try appendPrint(&buf, self.allocator, "    <D:href>/calendars/{s}/{s}/{s}.ics</D:href>\n", .{ username, collection_name, event.uid });
+                    try buf.appendSlice("    <D:propstat>\n");
+                    try buf.appendSlice("      <D:prop>\n");
+                    try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{event.etag});
+                    if (event.ics_data.len > 0) {
+                        try buf.appendSlice("        <C:calendar-data>");
+                        try buf.appendSlice(event.ics_data);
+                        try buf.appendSlice("</C:calendar-data>\n");
+                    }
+                    try buf.appendSlice("      </D:prop>\n");
+                    try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                    try buf.appendSlice("    </D:propstat>\n");
+                    try buf.appendSlice("  </D:response>\n");
+                }
+                break;
+            }
+        }
+        try buf.appendSlice("</D:multistatus>");
+        try self.sendMultistatusResponse(buf.items);
+    }
+
+    /// Handle calendar-multiget REPORT
+    fn handleCalendarMultiget(self: *CalDavSession, path: []const u8, request: []const u8) !void {
+        _ = path;
+        const user_id: u64 = 1;
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+
+        try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+        try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n");
+
+        // Parse <D:href> elements from request body
+        const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse request.len;
+        const body = if (body_start + 4 <= request.len) request[body_start + 4 ..] else "";
+
+        var search_pos: usize = 0;
+        while (std.mem.indexOf(u8, body[search_pos..], "<D:href>")) |href_start| {
+            const abs_start = search_pos + href_start + 8;
+            if (std.mem.indexOf(u8, body[abs_start..], "</D:href>")) |href_end| {
+                const href = body[abs_start .. abs_start + href_end];
+                const href_parsed = parsePath(href);
+                if (href_parsed.path_type == .calendar_resource) {
+                    if (href_parsed.resource_uid) |uid| {
+                        if (href_parsed.collection) |coll| {
+                            // Find calendar and event
+                            const calendars = self.store.getUserCalendars(user_id) catch &[_]caldav_store.Calendar{};
+                            for (calendars) |cal| {
+                                if (std.mem.eql(u8, cal.name, coll)) {
+                                    if (self.store.getEventByUid(cal.id, uid)) |event| {
+                                        try buf.appendSlice("  <D:response>\n");
+                                        try appendPrint(&buf, self.allocator, "    <D:href>{s}</D:href>\n", .{href});
+                                        try buf.appendSlice("    <D:propstat>\n");
+                                        try buf.appendSlice("      <D:prop>\n");
+                                        try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{event.etag});
+                                        if (event.ics_data.len > 0) {
+                                            try buf.appendSlice("        <C:calendar-data>");
+                                            try buf.appendSlice(event.ics_data);
+                                            try buf.appendSlice("</C:calendar-data>\n");
+                                        }
+                                        try buf.appendSlice("      </D:prop>\n");
+                                        try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                                        try buf.appendSlice("    </D:propstat>\n");
+                                        try buf.appendSlice("  </D:response>\n");
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                search_pos = abs_start + href_end + 9;
+            } else break;
+        }
+
+        try buf.appendSlice("</D:multistatus>");
+        try self.sendMultistatusResponse(buf.items);
     }
 
     /// Handle addressbook-query REPORT
-    fn handleAddressbookQuery(self: *CalDavSession, request: []const u8) !void {
+    fn handleAddressbookQuery(self: *CalDavSession, path: []const u8, request: []const u8) !void {
         _ = request;
+        const parsed = parsePath(path);
+        const user_id: u64 = 1;
 
-        // Build addressbook query response
-        const response_body =
-            \\<?xml version="1.0" encoding="utf-8" ?>
-            \\<D:multistatus xmlns:D="DAV:" xmlns:CARD="urn:ietf:params:xml:ns:carddav">
-            \\  <D:response>
-            \\    <D:href>/addressbooks/user/test/contact-001.vcf</D:href>
-            \\    <D:propstat>
-            \\      <D:prop>
-            \\        <D:getetag>"contact-001"</D:getetag>
-            \\        <CARD:address-data>BEGIN:VCARD
-            \\VERSION:3.0
-            \\FN:John Doe
-            \\EMAIL:john@example.com
-            \\END:VCARD</CARD:address-data>
-            \\      </D:prop>
-            \\      <D:status>HTTP/1.1 200 OK</D:status>
-            \\    </D:propstat>
-            \\  </D:response>
-            \\</D:multistatus>
-        ;
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
 
+        try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+        try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
+
+        const collection_name = parsed.collection orelse "default";
+        const username = parsed.user orelse "user";
+
+        const addressbooks = self.store.getUserAddressBooks(user_id) catch &[_]caldav_store.AddressBook{};
+        for (addressbooks) |ab| {
+            if (std.mem.eql(u8, ab.name, collection_name)) {
+                const contacts = self.store.getAddressBookContacts(ab.id) catch &[_]caldav_store.Contact{};
+                for (contacts) |contact| {
+                    try buf.appendSlice("  <D:response>\n");
+                    try appendPrint(&buf, self.allocator, "    <D:href>/addressbooks/{s}/{s}/{s}.vcf</D:href>\n", .{ username, collection_name, contact.uid });
+                    try buf.appendSlice("    <D:propstat>\n");
+                    try buf.appendSlice("      <D:prop>\n");
+                    try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{contact.etag});
+                    const vcf = if (contact.vcf_data.len > 0)
+                        contact.vcf_data
+                    else
+                        self.store.generateVcf(contact) catch "";
+                    if (vcf.len > 0) {
+                        try buf.appendSlice("        <CARD:address-data>");
+                        try buf.appendSlice(vcf);
+                        try buf.appendSlice("</CARD:address-data>\n");
+                    }
+                    try buf.appendSlice("      </D:prop>\n");
+                    try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                    try buf.appendSlice("    </D:propstat>\n");
+                    try buf.appendSlice("  </D:response>\n");
+                }
+                break;
+            }
+        }
+        try buf.appendSlice("</D:multistatus>");
+        try self.sendMultistatusResponse(buf.items);
+    }
+
+    /// Handle addressbook-multiget REPORT
+    fn handleAddressbookMultiget(self: *CalDavSession, path: []const u8, request: []const u8) !void {
+        _ = path;
+        const user_id: u64 = 1;
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+
+        try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+        try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
+
+        // Parse <D:href> elements from request body
+        const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse request.len;
+        const body = if (body_start + 4 <= request.len) request[body_start + 4 ..] else "";
+
+        var search_pos: usize = 0;
+        while (std.mem.indexOf(u8, body[search_pos..], "<D:href>")) |href_start| {
+            const abs_start = search_pos + href_start + 8;
+            if (std.mem.indexOf(u8, body[abs_start..], "</D:href>")) |href_end| {
+                const href = body[abs_start .. abs_start + href_end];
+                const href_parsed = parsePath(href);
+                if (href_parsed.path_type == .addressbook_resource) {
+                    if (href_parsed.resource_uid) |uid| {
+                        if (href_parsed.collection) |coll| {
+                            const addressbooks = self.store.getUserAddressBooks(user_id) catch &[_]caldav_store.AddressBook{};
+                            for (addressbooks) |ab| {
+                                if (std.mem.eql(u8, ab.name, coll)) {
+                                    if (self.store.getContactByUid(ab.id, uid)) |contact| {
+                                        try buf.appendSlice("  <D:response>\n");
+                                        try appendPrint(&buf, self.allocator, "    <D:href>{s}</D:href>\n", .{href});
+                                        try buf.appendSlice("    <D:propstat>\n");
+                                        try buf.appendSlice("      <D:prop>\n");
+                                        try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{contact.etag});
+                                        const vcf = if (contact.vcf_data.len > 0)
+                                            contact.vcf_data
+                                        else
+                                            self.store.generateVcf(contact) catch "";
+                                        if (vcf.len > 0) {
+                                            try buf.appendSlice("        <CARD:address-data>");
+                                            try buf.appendSlice(vcf);
+                                            try buf.appendSlice("</CARD:address-data>\n");
+                                        }
+                                        try buf.appendSlice("      </D:prop>\n");
+                                        try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                                        try buf.appendSlice("    </D:propstat>\n");
+                                        try buf.appendSlice("  </D:response>\n");
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                search_pos = abs_start + href_end + 9;
+            } else break;
+        }
+
+        try buf.appendSlice("</D:multistatus>");
+        try self.sendMultistatusResponse(buf.items);
+    }
+
+    /// Handle sync-collection REPORT (RFC 6578)
+    fn handleSyncCollection(self: *CalDavSession, path: []const u8, request: []const u8) !void {
+        const parsed = parsePath(path);
+        const user_id: u64 = 1;
+        _ = user_id;
+
+        // Parse sync-token from request body
+        var sync_token: u64 = 0;
+        const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse request.len;
+        const body = if (body_start + 4 <= request.len) request[body_start + 4 ..] else "";
+
+        if (std.mem.indexOf(u8, body, "<D:sync-token>")) |token_start| {
+            const abs_start = token_start + 14;
+            if (std.mem.indexOf(u8, body[abs_start..], "</D:sync-token>")) |token_end| {
+                const token_str = body[abs_start .. abs_start + token_end];
+                // Token format: "http://..." or just a number
+                if (std.mem.lastIndexOf(u8, token_str, "/")) |slash| {
+                    sync_token = std.fmt.parseInt(u64, token_str[slash + 1 ..], 10) catch 0;
+                } else {
+                    sync_token = std.fmt.parseInt(u64, token_str, 10) catch 0;
+                }
+            }
+        }
+
+        const is_calendar = parsed.path_type == .calendar_collection;
+
+        // Find collection ID
+        var collection_id: u64 = 0;
+        if (parsed.collection) |coll_name| {
+            if (is_calendar) {
+                const calendars = self.store.getUserCalendars(1) catch &[_]caldav_store.Calendar{};
+                for (calendars) |cal| {
+                    if (std.mem.eql(u8, cal.name, coll_name)) {
+                        collection_id = cal.id;
+                        break;
+                    }
+                }
+            } else {
+                const addressbooks = self.store.getUserAddressBooks(1) catch &[_]caldav_store.AddressBook{};
+                for (addressbooks) |ab| {
+                    if (std.mem.eql(u8, ab.name, coll_name)) {
+                        collection_id = ab.id;
+                        break;
+                    }
+                }
+            }
+        }
+
+        const report = self.store.getChangesSince(collection_id, sync_token, is_calendar) catch {
+            try self.sendError(500, "Internal Server Error");
+            return;
+        };
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        defer buf.deinit();
+
+        try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+        try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\">\n");
+
+        for (report.changes) |change| {
+            try buf.appendSlice("  <D:response>\n");
+            try appendPrint(&buf, self.allocator, "    <D:href>{s}</D:href>\n", .{change.href});
+            if (change.change_type == .deleted) {
+                try buf.appendSlice("    <D:status>HTTP/1.1 404 Not Found</D:status>\n");
+            } else {
+                try buf.appendSlice("    <D:propstat>\n");
+                try buf.appendSlice("      <D:prop>\n");
+                try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{change.etag});
+                try buf.appendSlice("      </D:prop>\n");
+                try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                try buf.appendSlice("    </D:propstat>\n");
+            }
+            try buf.appendSlice("  </D:response>\n");
+        }
+
+        try appendPrint(&buf, self.allocator, "  <D:sync-token>http://mail/sync/{d}</D:sync-token>\n", .{report.new_sync_token});
+        try buf.appendSlice("</D:multistatus>");
+        try self.sendMultistatusResponse(buf.items);
+    }
+
+    /// Send a 207 Multi-Status response with the given body
+    fn sendMultistatusResponse(self: *CalDavSession, body: []const u8) !void {
         var header_buf: [256]u8 = undefined;
         var fbs = io_compat.fixedBufferStream(&header_buf);
         const writer = fbs.writer();
         try writer.print(
             "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: {d}\r\n\r\n",
-            .{response_body.len},
+            .{body.len},
         );
-
         _ = try self.connection.write(fbs.getWritten());
-        _ = try self.connection.write(response_body);
+        _ = try self.connection.write(body);
     }
 
     /// Send authentication required response with Digest challenge
@@ -603,14 +1389,16 @@ pub const CalDavServer = struct {
     ssl_listener: ?socket.Server = null,
     running: std.atomic.Value(bool),
     auth_backend: *auth.AuthBackend,
+    store: *caldav_store.CalDavStore,
     cert_key_pair: ?tls.config.CertKeyPair = null,
 
-    pub fn init(allocator: std.mem.Allocator, config: CalDavConfig, auth_backend: *auth.AuthBackend) CalDavServer {
+    pub fn init(allocator: std.mem.Allocator, config: CalDavConfig, auth_backend: *auth.AuthBackend, store: *caldav_store.CalDavStore) CalDavServer {
         var server = CalDavServer{
             .allocator = allocator,
             .config = config,
             .running = std.atomic.Value(bool).init(false),
             .auth_backend = auth_backend,
+            .store = store,
         };
 
         // Load TLS certificate if configured
@@ -715,7 +1503,7 @@ pub const CalDavServer = struct {
 
     /// Handle client connection
     fn handleConnection(self: *CalDavServer, connection: socket.Connection, is_ssl: bool) !void {
-        var session = CalDavSession.init(self.allocator, connection, self.auth_backend);
+        var session = CalDavSession.init(self.allocator, connection, self.auth_backend, self.store);
         defer {
             session.deinit();
             connection.close();
@@ -818,7 +1606,7 @@ pub const CalDavServer = struct {
                     return;
                 };
 
-                var tls_session = TlsCalDavSession.init(self.allocator, connection, self.auth_backend, &tls_conn);
+                var tls_session = TlsCalDavSession.init(self.allocator, connection, self.auth_backend, self.store, &tls_conn);
                 defer tls_session.deinit();
 
                 // Handle first request if we have cleartext from initial decrypt
@@ -873,18 +1661,21 @@ const TlsCalDavSession = struct {
     username: ?[]const u8 = null,
     authenticated: bool = false,
     auth_backend: *auth.AuthBackend,
+    store: *caldav_store.CalDavStore,
     tls_conn: *tls.nonblock.Connection,
 
     pub fn init(
         allocator: std.mem.Allocator,
         connection: socket.Connection,
         auth_backend: *auth.AuthBackend,
+        store: *caldav_store.CalDavStore,
         tls_conn: *tls.nonblock.Connection,
     ) TlsCalDavSession {
         return .{
             .allocator = allocator,
             .connection = connection,
             .auth_backend = auth_backend,
+            .store = store,
             .tls_conn = tls_conn,
         };
     }

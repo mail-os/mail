@@ -9,6 +9,7 @@ const auth = @import("auth/auth.zig");
 const greylist_mod = @import("antispam/greylist.zig");
 const imap = @import("protocol/imap.zig");
 const caldav = @import("protocol/caldav.zig");
+const caldav_store_mod = @import("storage/caldav_store.zig");
 
 // Cluster and multi-tenancy support
 const cluster = @import("infrastructure/cluster.zig");
@@ -418,7 +419,8 @@ pub fn main(init: std.process.Init) !void {
     }
     defer if (imap_server) |*is| is.deinit();
 
-    // Initialize CalDAV/CardDAV server if auth is enabled
+    // Initialize CalDAV/CardDAV store and server if auth is enabled
+    var caldav_store_inst: ?caldav_store_mod.CalDavStore = null;
     var caldav_server: ?caldav.CalDavServer = null;
     var caldav_thread: ?std.Thread = null;
     const enable_caldav = env.get("CALDAV_ENABLED") != null or cfg.enable_auth;
@@ -432,6 +434,8 @@ pub fn main(init: std.process.Init) !void {
     };
 
     if (enable_caldav and auth_ptr != null) {
+        caldav_store_inst = try caldav_store_mod.CalDavStore.init(allocator, .{});
+
         const caldav_config = caldav.CalDavConfig{
             .port = caldav_port,
             .ssl_port = caldav_ssl_port,
@@ -440,13 +444,14 @@ pub fn main(init: std.process.Init) !void {
             .cert_path = cfg.tls_cert_path,
             .key_path = cfg.tls_key_path,
         };
-        caldav_server = caldav.CalDavServer.init(allocator, caldav_config, auth_ptr.?);
+        caldav_server = caldav.CalDavServer.init(allocator, caldav_config, auth_ptr.?, &caldav_store_inst.?);
         log.info("CalDAV/CardDAV server configured on port {d}", .{caldav_port});
         if (cfg.enable_tls and cfg.tls_cert_path != null) {
             log.info("CalDAV SSL server configured on port {d} (HTTPS)", .{caldav_ssl_port});
         }
     }
     defer if (caldav_server) |*cs| cs.deinit();
+    defer if (caldav_store_inst) |*s| s.deinit();
 
     // Start ManageSieve server in a separate thread
     if (managesieve_server) |*ms| {

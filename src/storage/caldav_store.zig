@@ -215,14 +215,14 @@ pub const CalDavStore = struct {
         return Self{
             .allocator = allocator,
             .config = config,
-            .calendars = std.AutoHashMap(u64, Calendar).init(allocator),
-            .events = std.AutoHashMap(u64, Event).init(allocator),
-            .addressbooks = std.AutoHashMap(u64, AddressBook).init(allocator),
-            .contacts = std.AutoHashMap(u64, Contact).init(allocator),
-            .emails = std.ArrayList(EmailAddress).init(allocator),
-            .phones = std.ArrayList(PhoneNumber).init(allocator),
-            .addresses = std.ArrayList(Address).init(allocator),
-            .sync_changes = std.ArrayList(SyncChange).init(allocator),
+            .calendars = .{},
+            .events = .{},
+            .addressbooks = .{},
+            .contacts = .{},
+            .emails = .{},
+            .phones = .{},
+            .addresses = .{},
+            .sync_changes = .{},
             .current_sync_token = 1,
             .next_calendar_id = 1,
             .next_event_id = 1,
@@ -232,14 +232,14 @@ pub const CalDavStore = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.calendars.deinit();
-        self.events.deinit();
-        self.addressbooks.deinit();
-        self.contacts.deinit();
-        self.emails.deinit();
-        self.phones.deinit();
-        self.addresses.deinit();
-        self.sync_changes.deinit();
+        self.calendars.deinit(self.allocator);
+        self.events.deinit(self.allocator);
+        self.addressbooks.deinit(self.allocator);
+        self.contacts.deinit(self.allocator);
+        self.emails.deinit(self.allocator);
+        self.phones.deinit(self.allocator);
+        self.addresses.deinit(self.allocator);
+        self.sync_changes.deinit(self.allocator);
     }
 
     // -------------------------------------------------------------------------
@@ -258,7 +258,7 @@ pub const CalDavStore = struct {
         const now = std.time.timestamp();
         const ctag = try self.generateCtag(id, now);
 
-        try self.calendars.put(id, .{
+        try self.calendars.put(self.allocator, id, .{
             .id = id,
             .user_id = user_id,
             .name = name,
@@ -279,28 +279,28 @@ pub const CalDavStore = struct {
     }
 
     pub fn getUserCalendars(self: *Self, user_id: u64) ![]Calendar {
-        var result = std.ArrayList(Calendar).init(self.allocator);
-        errdefer result.deinit();
+        var result: std.ArrayList(Calendar) = .{};
+        errdefer result.deinit(self.allocator);
 
         var iter = self.calendars.valueIterator();
         while (iter.next()) |cal| {
             if (cal.user_id == user_id) {
-                try result.append(cal.*);
+                try result.append(self.allocator, cal.*);
             }
         }
 
-        return result.toOwnedSlice();
+        return result.toOwnedSlice(self.allocator);
     }
 
     pub fn deleteCalendar(self: *Self, id: u64) !void {
         // Delete all events in this calendar first
-        var events_to_delete = std.ArrayList(u64).init(self.allocator);
-        defer events_to_delete.deinit();
+        var events_to_delete: std.ArrayList(u64) = .{};
+        defer events_to_delete.deinit(self.allocator);
 
         var iter = self.events.iterator();
         while (iter.next()) |entry| {
             if (entry.value_ptr.calendar_id == id) {
-                try events_to_delete.append(entry.key_ptr.*);
+                try events_to_delete.append(self.allocator, entry.key_ptr.*);
             }
         }
 
@@ -323,7 +323,7 @@ pub const CalDavStore = struct {
         const etag = try self.generateEtag(id, now);
         const uid = data.uid orelse try self.generateUid();
 
-        try self.events.put(id, .{
+        try self.events.put(self.allocator, id, .{
             .id = id,
             .calendar_id = calendar_id,
             .uid = uid,
@@ -380,17 +380,17 @@ pub const CalDavStore = struct {
     }
 
     pub fn getCalendarEvents(self: *Self, calendar_id: u64) ![]Event {
-        var result = std.ArrayList(Event).init(self.allocator);
-        errdefer result.deinit();
+        var result: std.ArrayList(Event) = .{};
+        errdefer result.deinit(self.allocator);
 
         var iter = self.events.valueIterator();
         while (iter.next()) |event| {
             if (event.calendar_id == calendar_id) {
-                try result.append(event.*);
+                try result.append(self.allocator, event.*);
             }
         }
 
-        return result.toOwnedSlice();
+        return result.toOwnedSlice(self.allocator);
     }
 
     pub fn updateEvent(self: *Self, id: u64, data: EventData) !void {
@@ -448,7 +448,7 @@ pub const CalDavStore = struct {
         const now = std.time.timestamp();
         const ctag = try self.generateCtag(id, now);
 
-        try self.addressbooks.put(id, .{
+        try self.addressbooks.put(self.allocator, id, .{
             .id = id,
             .user_id = user_id,
             .name = name,
@@ -466,18 +466,64 @@ pub const CalDavStore = struct {
         return self.addressbooks.get(id);
     }
 
+    pub fn getAddressBookByName(self: *Self, user_id: u64, name: []const u8) ?AddressBook {
+        var iter = self.addressbooks.valueIterator();
+        while (iter.next()) |ab| {
+            if (ab.user_id == user_id and std.mem.eql(u8, ab.name, name)) {
+                return ab.*;
+            }
+        }
+        return null;
+    }
+
     pub fn getUserAddressBooks(self: *Self, user_id: u64) ![]AddressBook {
-        var result = std.ArrayList(AddressBook).init(self.allocator);
-        errdefer result.deinit();
+        var result: std.ArrayList(AddressBook) = .{};
+        errdefer result.deinit(self.allocator);
 
         var iter = self.addressbooks.valueIterator();
         while (iter.next()) |ab| {
             if (ab.user_id == user_id) {
-                try result.append(ab.*);
+                try result.append(self.allocator, ab.*);
             }
         }
 
-        return result.toOwnedSlice();
+        return result.toOwnedSlice(self.allocator);
+    }
+
+    pub fn deleteAddressBook(self: *Self, id: u64) !void {
+        // Delete all contacts in this addressbook first
+        var contacts_to_delete: std.ArrayList(u64) = .{};
+        defer contacts_to_delete.deinit(self.allocator);
+
+        var iter = self.contacts.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.addressbook_id == id) {
+                try contacts_to_delete.append(self.allocator, entry.key_ptr.*);
+            }
+        }
+
+        for (contacts_to_delete.items) |contact_id| {
+            // Remove associated emails and phones
+            var i: usize = 0;
+            while (i < self.emails.items.len) {
+                if (self.emails.items[i].contact_id == contact_id) {
+                    _ = self.emails.orderedRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            i = 0;
+            while (i < self.phones.items.len) {
+                if (self.phones.items[i].contact_id == contact_id) {
+                    _ = self.phones.orderedRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            _ = self.contacts.remove(contact_id);
+        }
+
+        _ = self.addressbooks.remove(id);
     }
 
     // -------------------------------------------------------------------------
@@ -492,7 +538,7 @@ pub const CalDavStore = struct {
         const etag = try self.generateEtag(id, now);
         const uid = data.uid orelse try self.generateUid();
 
-        try self.contacts.put(id, .{
+        try self.contacts.put(self.allocator, id, .{
             .id = id,
             .addressbook_id = addressbook_id,
             .uid = uid,
@@ -513,7 +559,7 @@ pub const CalDavStore = struct {
 
         // Add emails
         for (data.emails) |email| {
-            try self.emails.append(.{
+            try self.emails.append(self.allocator, .{
                 .contact_id = id,
                 .email = email.email,
                 .email_type = email.email_type,
@@ -523,7 +569,7 @@ pub const CalDavStore = struct {
 
         // Add phones
         for (data.phones) |phone| {
-            try self.phones.append(.{
+            try self.phones.append(self.allocator, .{
                 .contact_id = id,
                 .number = phone.number,
                 .phone_type = phone.phone_type,
@@ -569,28 +615,144 @@ pub const CalDavStore = struct {
         return self.contacts.get(id);
     }
 
+    pub fn getContactByUid(self: *Self, addressbook_id: u64, uid: []const u8) ?Contact {
+        var iter = self.contacts.valueIterator();
+        while (iter.next()) |contact| {
+            if (contact.addressbook_id == addressbook_id and std.mem.eql(u8, contact.uid, uid)) {
+                return contact.*;
+            }
+        }
+        return null;
+    }
+
+    pub fn updateContact(self: *Self, id: u64, data: ContactData) !void {
+        if (self.contacts.getPtr(id)) |contact| {
+            const now = std.time.timestamp();
+            const etag = try self.generateEtag(id, now);
+
+            contact.full_name = data.full_name;
+            contact.given_name = data.given_name;
+            contact.family_name = data.family_name;
+            contact.nickname = data.nickname;
+            contact.organization = data.organization;
+            contact.title = data.title;
+            contact.birthday = data.birthday;
+            contact.note = data.note;
+            contact.photo_url = data.photo_url;
+            contact.modified_at = now;
+            contact.etag = etag;
+            if (data.vcf_data) |vcf| {
+                contact.vcf_data = vcf;
+            }
+
+            // Update emails: remove old, add new
+            var i: usize = 0;
+            while (i < self.emails.items.len) {
+                if (self.emails.items[i].contact_id == id) {
+                    _ = self.emails.orderedRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            for (data.emails) |email| {
+                try self.emails.append(self.allocator, .{
+                    .contact_id = id,
+                    .email = email.email,
+                    .email_type = email.email_type,
+                    .is_primary = email.is_primary,
+                });
+            }
+
+            // Update phones: remove old, add new
+            i = 0;
+            while (i < self.phones.items.len) {
+                if (self.phones.items[i].contact_id == id) {
+                    _ = self.phones.orderedRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            for (data.phones) |phone| {
+                try self.phones.append(self.allocator, .{
+                    .contact_id = id,
+                    .number = phone.number,
+                    .phone_type = phone.phone_type,
+                    .is_primary = phone.is_primary,
+                });
+            }
+
+            try self.recordChange(id, .contact, .modified, etag, try self.getContactHref(contact.addressbook_id, contact.uid));
+            try self.updateAddressBookCtag(contact.addressbook_id);
+        } else {
+            return error.ContactNotFound;
+        }
+    }
+
     pub fn getAddressBookContacts(self: *Self, addressbook_id: u64) ![]Contact {
-        var result = std.ArrayList(Contact).init(self.allocator);
-        errdefer result.deinit();
+        var result: std.ArrayList(Contact) = .{};
+        errdefer result.deinit(self.allocator);
 
         var iter = self.contacts.valueIterator();
         while (iter.next()) |contact| {
             if (contact.addressbook_id == addressbook_id) {
-                try result.append(contact.*);
+                try result.append(self.allocator, contact.*);
             }
         }
 
-        return result.toOwnedSlice();
+        return result.toOwnedSlice(self.allocator);
     }
 
     pub fn getContactEmails(self: *Self, contact_id: u64) []EmailAddress {
-        var result = std.ArrayList(EmailAddress).init(self.allocator);
+        var result: std.ArrayList(EmailAddress) = .{};
         for (self.emails.items) |email| {
             if (email.contact_id == contact_id) {
-                result.append(email) catch continue;
+                result.append(self.allocator, email) catch continue;
             }
         }
-        return result.toOwnedSlice() catch &.{};
+        return result.toOwnedSlice(self.allocator) catch &.{};
+    }
+
+    pub fn getContactPhones(self: *Self, contact_id: u64) []PhoneNumber {
+        var result: std.ArrayList(PhoneNumber) = .{};
+        for (self.phones.items) |phone| {
+            if (phone.contact_id == contact_id) {
+                result.append(self.allocator, phone) catch continue;
+            }
+        }
+        return result.toOwnedSlice(self.allocator) catch &.{};
+    }
+
+    /// Find a contact by ID across all addressbooks (used for DELETE/PUT by path)
+    pub fn findContactByUidGlobal(self: *Self, uid: []const u8) ?Contact {
+        var iter = self.contacts.valueIterator();
+        while (iter.next()) |contact| {
+            if (std.mem.eql(u8, contact.uid, uid)) {
+                return contact.*;
+            }
+        }
+        return null;
+    }
+
+    /// Find a contact's internal ID by UID within an addressbook
+    pub fn getContactIdByUid(self: *Self, addressbook_id: u64, uid: []const u8) ?u64 {
+        var iter = self.contacts.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.addressbook_id == addressbook_id and std.mem.eql(u8, entry.value_ptr.uid, uid)) {
+                return entry.key_ptr.*;
+            }
+        }
+        return null;
+    }
+
+    /// Find an event's internal ID by UID within a calendar
+    pub fn getEventIdByUid(self: *Self, calendar_id: u64, uid: []const u8) ?u64 {
+        var iter = self.events.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.calendar_id == calendar_id and std.mem.eql(u8, entry.value_ptr.uid, uid)) {
+                return entry.key_ptr.*;
+            }
+        }
+        return null;
     }
 
     pub fn deleteContact(self: *Self, id: u64) !void {
@@ -643,8 +805,8 @@ pub const CalDavStore = struct {
     }
 
     pub fn getChangesSince(self: *Self, collection_id: u64, since_token: u64, is_calendar: bool) !SyncReport {
-        var changes = std.ArrayList(SyncChange).init(self.allocator);
-        errdefer changes.deinit();
+        var changes: std.ArrayList(SyncChange) = .{};
+        errdefer changes.deinit(self.allocator);
 
         const expected_type: SyncChange.ResourceType = if (is_calendar) .event else .contact;
 
@@ -654,13 +816,13 @@ pub const CalDavStore = struct {
                 // In a real implementation, we'd check against the collection_id too
                 _ = collection_id;
                 if (self.getChangeToken(change) > since_token) {
-                    try changes.append(change);
+                    try changes.append(self.allocator, change);
                 }
             }
         }
 
         return SyncReport{
-            .changes = try changes.toOwnedSlice(),
+            .changes = try changes.toOwnedSlice(self.allocator),
             .new_sync_token = self.current_sync_token,
             .more_available = false,
         };
@@ -683,7 +845,7 @@ pub const CalDavStore = struct {
     ) !void {
         if (!self.config.enable_sync_tokens) return;
 
-        try self.sync_changes.append(.{
+        try self.sync_changes.append(self.allocator, .{
             .resource_id = resource_id,
             .resource_type = resource_type,
             .change_type = change_type,
@@ -716,6 +878,116 @@ pub const CalDavStore = struct {
             ab.modified_at = now;
             ab.sync_token = self.current_sync_token;
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // vCard Generation
+    // -------------------------------------------------------------------------
+
+    /// Generate a vCard 3.0 string from a Contact and its associated data
+    pub fn generateVcf(self: *Self, contact: Contact) ![]u8 {
+        // If the contact already has raw vcf_data, return it
+        if (contact.vcf_data.len > 0) {
+            return try self.allocator.dupe(u8, contact.vcf_data);
+        }
+
+        var buf: std.ArrayList(u8) = .{};
+        errdefer buf.deinit(self.allocator);
+
+        try buf.appendSlice(self.allocator, "BEGIN:VCARD\r\n");
+        try buf.appendSlice(self.allocator, "VERSION:3.0\r\n");
+
+        // FN (required)
+        try buf.appendSlice(self.allocator, "FN:");
+        try buf.appendSlice(self.allocator, contact.full_name);
+        try buf.appendSlice(self.allocator, "\r\n");
+
+        // N
+        {
+            try buf.appendSlice(self.allocator, "N:");
+            if (contact.family_name) |family| {
+                try buf.appendSlice(family);
+            }
+            try buf.appendSlice(self.allocator, ";");
+            if (contact.given_name) |given| {
+                try buf.appendSlice(given);
+            }
+            try buf.appendSlice(self.allocator, ";;;\r\n");
+        }
+
+        // NICKNAME
+        if (contact.nickname) |nickname| {
+            try buf.appendSlice(self.allocator, "NICKNAME:");
+            try buf.appendSlice(nickname);
+            try buf.appendSlice(self.allocator, "\r\n");
+        }
+
+        // ORG
+        if (contact.organization) |org| {
+            try buf.appendSlice(self.allocator, "ORG:");
+            try buf.appendSlice(org);
+            try buf.appendSlice(self.allocator, "\r\n");
+        }
+
+        // TITLE
+        if (contact.title) |t| {
+            try buf.appendSlice(self.allocator, "TITLE:");
+            try buf.appendSlice(t);
+            try buf.appendSlice(self.allocator, "\r\n");
+        }
+
+        // NOTE
+        if (contact.note) |n| {
+            try buf.appendSlice(self.allocator, "NOTE:");
+            try buf.appendSlice(n);
+            try buf.appendSlice(self.allocator, "\r\n");
+        }
+
+        // PHOTO
+        if (contact.photo_url) |photo| {
+            try buf.appendSlice(self.allocator, "PHOTO;VALUE=uri:");
+            try buf.appendSlice(photo);
+            try buf.appendSlice(self.allocator, "\r\n");
+        }
+
+        // Emails
+        const emails = self.getContactEmails(contact.id);
+        for (emails) |email| {
+            try buf.appendSlice(self.allocator, "EMAIL;TYPE=INTERNET");
+            switch (email.email_type) {
+                .home => try buf.appendSlice(self.allocator, ";TYPE=HOME"),
+                .work => try buf.appendSlice(self.allocator, ";TYPE=WORK"),
+                .other => {},
+            }
+            try buf.appendSlice(self.allocator, ":");
+            try buf.appendSlice(email.email);
+            try buf.appendSlice(self.allocator, "\r\n");
+        }
+
+        // Phones
+        const phones = self.getContactPhones(contact.id);
+        for (phones) |phone| {
+            try buf.appendSlice(self.allocator, "TEL");
+            switch (phone.phone_type) {
+                .home => try buf.appendSlice(self.allocator, ";TYPE=HOME"),
+                .work => try buf.appendSlice(self.allocator, ";TYPE=WORK"),
+                .mobile => try buf.appendSlice(self.allocator, ";TYPE=CELL"),
+                .fax => try buf.appendSlice(self.allocator, ";TYPE=FAX"),
+                .other => {},
+            }
+            try buf.appendSlice(self.allocator, ":");
+            try buf.appendSlice(phone.number);
+            try buf.appendSlice(self.allocator, "\r\n");
+        }
+
+        // UID
+        try buf.appendSlice(self.allocator, "UID:");
+        try buf.appendSlice(contact.uid);
+        try buf.appendSlice(self.allocator, "\r\n");
+
+        try buf.appendSlice(self.allocator, "END:VCARD\r\n");
+
+        return buf.toOwnedSlice();
     }
 
     // -------------------------------------------------------------------------

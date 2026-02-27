@@ -14,3 +14,6 @@ pub const list_unsubscribe = @import("features/list_unsubscribe.zig");
 pub const autoconfig = @import("api/autoconfig.zig");
 pub const managesieve = @import("protocol/managesieve.zig");
 pub const milter = @import("protocol/milter.zig");
+pub const caldav_store = @import("storage/caldav_store.zig");
+pub const caldav = @import("protocol/caldav.zig");
+pub const imap = @import("protocol/imap.zig");

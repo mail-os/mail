@@ -673,6 +673,108 @@ test "autoconfig edge case: generate config with all features disabled" {
     try testing.expect(std.mem.indexOf(u8, ol_xml, "<Type>SMTP</Type>") != null);
 }
 
+// =============================================================================
+// CardDAV + CalDAV Payload Tests
+// =============================================================================
+
+test "Apple mobileconfig includes CardDAV payload" {
+    const config = autoconfig.AutoconfigConfig{
+        .hostname = "mail.example.com",
+        .domain = "example.com",
+        .display_name = "Example Mail",
+        .enable_carddav = true,
+    };
+
+    const xml = try autoconfig.generateAppleMobileconfig(testing.allocator, config, "user@example.com");
+    defer testing.allocator.free(xml);
+
+    try testing.expect(std.mem.indexOf(u8, xml, "<string>com.apple.carddav.account</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, xml, "<key>CardDAVHostName</key>") != null);
+    try testing.expect(std.mem.indexOf(u8, xml, "<key>CardDAVPort</key>") != null);
+    try testing.expect(std.mem.indexOf(u8, xml, "<key>CardDAVPrincipalURL</key>") != null);
+    try testing.expect(std.mem.indexOf(u8, xml, "<key>CardDAVUseSSL</key>") != null);
+    try testing.expect(std.mem.indexOf(u8, xml, "<key>CardDAVUsername</key>") != null);
+    try testing.expect(std.mem.indexOf(u8, xml, "<string>Example Mail Contacts</string>") != null);
+}
+
+test "Apple mobileconfig includes CalDAV payload" {
+    const config = autoconfig.AutoconfigConfig{
+        .hostname = "mail.example.com",
+        .domain = "example.com",
+        .display_name = "Example Mail",
+        .enable_caldav_profile = true,
+    };
+
+    const xml = try autoconfig.generateAppleMobileconfig(testing.allocator, config, "user@example.com");
+    defer testing.allocator.free(xml);
+
+    try testing.expect(std.mem.indexOf(u8, xml, "<string>com.apple.caldav.account</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, xml, "<key>CalDAVHostName</key>") != null);
+    try testing.expect(std.mem.indexOf(u8, xml, "<key>CalDAVPort</key>") != null);
+    try testing.expect(std.mem.indexOf(u8, xml, "<key>CalDAVPrincipalURL</key>") != null);
+    try testing.expect(std.mem.indexOf(u8, xml, "<key>CalDAVUseSSL</key>") != null);
+    try testing.expect(std.mem.indexOf(u8, xml, "<key>CalDAVUsername</key>") != null);
+    try testing.expect(std.mem.indexOf(u8, xml, "<string>Example Mail Calendar</string>") != null);
+}
+
+test "Apple mobileconfig CardDAV uses correct hostname and port" {
+    const config = autoconfig.AutoconfigConfig{
+        .hostname = "mail.example.com",
+        .caldav_hostname = "dav.example.com",
+        .caldav_port = 8443,
+        .enable_carddav = true,
+        .enable_caldav_profile = true,
+    };
+
+    const xml = try autoconfig.generateAppleMobileconfig(testing.allocator, config, "user@example.com");
+    defer testing.allocator.free(xml);
+
+    // Should use custom caldav_hostname, not main hostname
+    try testing.expect(std.mem.indexOf(u8, xml, "<string>dav.example.com</string>") != null);
+    try testing.expect(std.mem.indexOf(u8, xml, "<integer>8443</integer>") != null);
+}
+
+test "Apple mobileconfig omits CardDAV when disabled" {
+    const config = autoconfig.AutoconfigConfig{
+        .hostname = "mail.example.com",
+        .enable_carddav = false,
+        .enable_caldav_profile = false,
+    };
+
+    const xml = try autoconfig.generateAppleMobileconfig(testing.allocator, config, "user@example.com");
+    defer testing.allocator.free(xml);
+
+    try testing.expect(std.mem.indexOf(u8, xml, "com.apple.carddav.account") == null);
+    try testing.expect(std.mem.indexOf(u8, xml, "com.apple.caldav.account") == null);
+}
+
+test "Thunderbird XML includes addressbook section when CardDAV enabled" {
+    const config = autoconfig.AutoconfigConfig{
+        .hostname = "mail.example.com",
+        .domain = "example.com",
+        .enable_carddav = true,
+    };
+
+    const xml = try autoconfig.generateThunderbirdXML(testing.allocator, config, "example.com");
+    defer testing.allocator.free(xml);
+
+    try testing.expect(std.mem.indexOf(u8, xml, "<addressBook type=\"carddav\">") != null);
+    try testing.expect(std.mem.indexOf(u8, xml, "<socketType>SSL</socketType>") != null);
+}
+
+test "Thunderbird XML omits addressbook when CardDAV disabled" {
+    const config = autoconfig.AutoconfigConfig{
+        .hostname = "mail.example.com",
+        .domain = "example.com",
+        .enable_carddav = false,
+    };
+
+    const xml = try autoconfig.generateThunderbirdXML(testing.allocator, config, "example.com");
+    defer testing.allocator.free(xml);
+
+    try testing.expect(std.mem.indexOf(u8, xml, "<addressBook") == null);
+}
+
 test "autoconfig edge case: routeRequest handles Apple mobileconfig paths" {
     var server = autoconfig.AutoconfigServer.init(testing.allocator, .{
         .hostname = "mail.example.com",

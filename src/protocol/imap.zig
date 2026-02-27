@@ -95,6 +95,7 @@ pub const FolderType = enum {
     forums,
     updates,
     promotions,
+    notes,
     regular,
 
     /// Get the SPECIAL-USE attributes for this folder type
@@ -113,6 +114,7 @@ pub const FolderType = enum {
             .forums => "\\HasNoChildren",
             .updates => "\\HasNoChildren",
             .promotions => "\\HasNoChildren",
+            .notes => "\\HasNoChildren",
             .regular => "\\HasNoChildren",
         };
     }
@@ -133,6 +135,7 @@ pub const FolderType = enum {
             .forums => "Forums",
             .updates => "Updates",
             .promotions => "Promotions",
+            .notes => "Notes",
             .regular => "",
         };
     }
@@ -157,6 +160,7 @@ pub const GmailFolders = [_]FolderType{
     .junk,
     .trash,
     .archive,
+    .notes,
     .social,
     .forums,
     .updates,
