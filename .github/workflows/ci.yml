@@ -106,7 +106,7 @@ jobs:
 
     - name: Install kcov from source
       run: |
-        KCOV_VERSION=43
+        KCOV_VERSION=42
         wget -q https://github.com/SimonKagstrom/kcov/releases/download/v${KCOV_VERSION}/kcov-amd64.tar.gz
         tar xzf kcov-amd64.tar.gz
         sudo cp usr/local/bin/kcov /usr/local/bin/
