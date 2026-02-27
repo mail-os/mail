@@ -171,6 +171,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path(test_file),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         });
         test_module.addImport("tls", tls_module);
 
