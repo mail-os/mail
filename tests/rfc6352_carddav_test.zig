@@ -14,7 +14,7 @@ const caldav = mail.caldav;
 
 test "addressbook: create and retrieve" {
     const allocator = testing.allocator;
-    var store = try caldav_store.CalDavStore.init(allocator, .{});
+    var store = try caldav_store.CalDavStore.init(allocator, .{ .enable_sync_tokens = false });
     defer store.deinit();
 
     const ab_id = try store.createAddressBook(1, "Personal", "My contacts");
@@ -28,7 +28,7 @@ test "addressbook: create and retrieve" {
 
 test "addressbook: getAddressBookByName" {
     const allocator = testing.allocator;
-    var store = try caldav_store.CalDavStore.init(allocator, .{});
+    var store = try caldav_store.CalDavStore.init(allocator, .{ .enable_sync_tokens = false });
     defer store.deinit();
 
     _ = try store.createAddressBook(1, "Work", null);
@@ -46,7 +46,7 @@ test "addressbook: getAddressBookByName" {
 
 test "addressbook: getUserAddressBooks" {
     const allocator = testing.allocator;
-    var store = try caldav_store.CalDavStore.init(allocator, .{});
+    var store = try caldav_store.CalDavStore.init(allocator, .{ .enable_sync_tokens = false });
     defer store.deinit();
 
     _ = try store.createAddressBook(1, "Personal", null);
@@ -54,19 +54,22 @@ test "addressbook: getUserAddressBooks" {
     _ = try store.createAddressBook(2, "Other User", null);
 
     const user1_abs = try store.getUserAddressBooks(1);
+    defer allocator.free(user1_abs);
     try testing.expectEqual(@as(usize, 2), user1_abs.len);
 
     const user2_abs = try store.getUserAddressBooks(2);
+    defer allocator.free(user2_abs);
     try testing.expectEqual(@as(usize, 1), user2_abs.len);
 }
 
 test "addressbook: deleteAddressBook removes contacts" {
     const allocator = testing.allocator;
-    var store = try caldav_store.CalDavStore.init(allocator, .{});
+    var store = try caldav_store.CalDavStore.init(allocator, .{ .enable_sync_tokens = false });
     defer store.deinit();
 
     const ab_id = try store.createAddressBook(1, "ToDelete", null);
     _ = try store.createContact(ab_id, .{
+        .uid = "jane-001",
         .full_name = "Jane Doe",
         .emails = &[_]caldav_store.CalDavStore.EmailData{
             .{ .email = "jane@example.com", .email_type = .work },
@@ -75,6 +78,7 @@ test "addressbook: deleteAddressBook removes contacts" {
 
     // Verify contact exists
     const contacts_before = try store.getAddressBookContacts(ab_id);
+    defer allocator.free(contacts_before);
     try testing.expectEqual(@as(usize, 1), contacts_before.len);
 
     // Delete addressbook
@@ -85,6 +89,7 @@ test "addressbook: deleteAddressBook removes contacts" {
 
     // Verify contacts removed
     const contacts_after = try store.getAddressBookContacts(ab_id);
+    defer allocator.free(contacts_after);
     try testing.expectEqual(@as(usize, 0), contacts_after.len);
 }
 
@@ -94,11 +99,12 @@ test "addressbook: deleteAddressBook removes contacts" {
 
 test "contact: create with full data" {
     const allocator = testing.allocator;
-    var store = try caldav_store.CalDavStore.init(allocator, .{});
+    var store = try caldav_store.CalDavStore.init(allocator, .{ .enable_sync_tokens = false });
     defer store.deinit();
 
     const ab_id = try store.createAddressBook(1, "Personal", null);
     const contact_id = try store.createContact(ab_id, .{
+        .uid = "john-001",
         .full_name = "John Doe",
         .given_name = "John",
         .family_name = "Doe",
@@ -127,7 +133,7 @@ test "contact: create with full data" {
 
 test "contact: getContactByUid" {
     const allocator = testing.allocator;
-    var store = try caldav_store.CalDavStore.init(allocator, .{});
+    var store = try caldav_store.CalDavStore.init(allocator, .{ .enable_sync_tokens = false });
     defer store.deinit();
 
     const ab_id = try store.createAddressBook(1, "Contacts", null);
@@ -146,11 +152,12 @@ test "contact: getContactByUid" {
 
 test "contact: updateContact" {
     const allocator = testing.allocator;
-    var store = try caldav_store.CalDavStore.init(allocator, .{});
+    var store = try caldav_store.CalDavStore.init(allocator, .{ .enable_sync_tokens = false });
     defer store.deinit();
 
     const ab_id = try store.createAddressBook(1, "Contacts", null);
     const contact_id = try store.createContact(ab_id, .{
+        .uid = "bob-001",
         .full_name = "Bob Original",
         .organization = "Old Corp",
     });
@@ -170,11 +177,12 @@ test "contact: updateContact" {
 
 test "contact: deleteContact removes emails and phones" {
     const allocator = testing.allocator;
-    var store = try caldav_store.CalDavStore.init(allocator, .{});
+    var store = try caldav_store.CalDavStore.init(allocator, .{ .enable_sync_tokens = false });
     defer store.deinit();
 
     const ab_id = try store.createAddressBook(1, "Contacts", null);
     const contact_id = try store.createContact(ab_id, .{
+        .uid = "del-001",
         .full_name = "To Delete",
         .emails = &[_]caldav_store.CalDavStore.EmailData{
             .{ .email = "del@example.com" },
@@ -194,7 +202,7 @@ test "contact: deleteContact removes emails and phones" {
 
 test "contact: getContactIdByUid" {
     const allocator = testing.allocator;
-    var store = try caldav_store.CalDavStore.init(allocator, .{});
+    var store = try caldav_store.CalDavStore.init(allocator, .{ .enable_sync_tokens = false });
     defer store.deinit();
 
     const ab_id = try store.createAddressBook(1, "Contacts", null);
@@ -217,11 +225,12 @@ test "contact: getContactIdByUid" {
 
 test "contact: etag is generated on create" {
     const allocator = testing.allocator;
-    var store = try caldav_store.CalDavStore.init(allocator, .{});
+    var store = try caldav_store.CalDavStore.init(allocator, .{ .enable_sync_tokens = false });
     defer store.deinit();
 
     const ab_id = try store.createAddressBook(1, "Contacts", null);
     const contact_id = try store.createContact(ab_id, .{
+        .uid = "etag-001",
         .full_name = "ETag Test",
     });
 
@@ -232,11 +241,12 @@ test "contact: etag is generated on create" {
 
 test "contact: etag changes on update" {
     const allocator = testing.allocator;
-    var store = try caldav_store.CalDavStore.init(allocator, .{});
+    var store = try caldav_store.CalDavStore.init(allocator, .{ .enable_sync_tokens = false });
     defer store.deinit();
 
     const ab_id = try store.createAddressBook(1, "Contacts", null);
     const contact_id = try store.createContact(ab_id, .{
+        .uid = "etag-002",
         .full_name = "ETag Change",
     });
 
@@ -257,13 +267,14 @@ test "contact: etag changes on update" {
 
 test "sync: changes recorded for contact operations" {
     const allocator = testing.allocator;
-    var store = try caldav_store.CalDavStore.init(allocator, .{});
+    var store = try caldav_store.CalDavStore.init(allocator, .{ .enable_sync_tokens = false });
     defer store.deinit();
 
     const ab_id = try store.createAddressBook(1, "Contacts", null);
     const initial_token = store.getSyncToken(ab_id, false);
 
     _ = try store.createContact(ab_id, .{
+        .uid = "sync-001",
         .full_name = "Sync Test",
     });
 
@@ -278,7 +289,7 @@ test "sync: changes recorded for contact operations" {
 
 test "vcf: generate minimal vCard (just FN)" {
     const allocator = testing.allocator;
-    var store = try caldav_store.CalDavStore.init(allocator, .{});
+    var store = try caldav_store.CalDavStore.init(allocator, .{ .enable_sync_tokens = false });
     defer store.deinit();
 
     const ab_id = try store.createAddressBook(1, "Test", null);
@@ -300,7 +311,7 @@ test "vcf: generate minimal vCard (just FN)" {
 
 test "vcf: generate full vCard with all fields" {
     const allocator = testing.allocator;
-    var store = try caldav_store.CalDavStore.init(allocator, .{});
+    var store = try caldav_store.CalDavStore.init(allocator, .{ .enable_sync_tokens = false });
     defer store.deinit();
 
     const ab_id = try store.createAddressBook(1, "Test", null);
@@ -343,12 +354,13 @@ test "vcf: generate full vCard with all fields" {
 
 test "vcf: contact with existing vcf_data returns it directly" {
     const allocator = testing.allocator;
-    var store = try caldav_store.CalDavStore.init(allocator, .{});
+    var store = try caldav_store.CalDavStore.init(allocator, .{ .enable_sync_tokens = false });
     defer store.deinit();
 
     const raw_vcf = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Raw Data\r\nEND:VCARD\r\n";
     const ab_id = try store.createAddressBook(1, "Test", null);
     const contact_id = try store.createContact(ab_id, .{
+        .uid = "raw-001",
         .full_name = "Raw Data",
         .vcf_data = raw_vcf,
     });
@@ -473,8 +485,11 @@ test "vcf parser: full vCard with all fields" {
     try testing.expectEqualStrings("Jane Smith", contact.?.full_name.?);
     try testing.expectEqualStrings("Smith", contact.?.family_name.?);
     try testing.expectEqualStrings("Jane", contact.?.given_name.?);
-    try testing.expectEqualStrings("jane@example.com", contact.?.email.?);
-    try testing.expectEqualStrings("+1-555-1234", contact.?.phone.?);
+    try testing.expectEqualStrings("jane@example.com", contact.?.email().?);
+    try testing.expectEqualStrings("+1-555-1234", contact.?.phone().?);
+    // Verify multi-value support
+    try testing.expectEqual(@as(usize, 1), contact.?.email_count);
+    try testing.expectEqual(@as(usize, 1), contact.?.phone_count);
     try testing.expectEqualStrings("Acme Corp", contact.?.organization.?);
     try testing.expectEqualStrings("contact-full-001", contact.?.uid.?);
 }

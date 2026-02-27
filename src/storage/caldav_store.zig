@@ -28,6 +28,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+/// Get the current epoch timestamp in seconds (cross-platform).
+fn currentTimestamp() i64 {
+    const ts = std.posix.clock_gettime(.REALTIME) catch return 0;
+    return ts.sec;
+}
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -166,8 +172,10 @@ pub const SyncToken = struct {
 
 pub const SyncChange = struct {
     resource_id: u64,
+    collection_id: u64,
     resource_type: ResourceType,
     change_type: ChangeType,
+    token: u64,
     etag: []const u8,
     href: []const u8,
     timestamp: i64,
@@ -201,6 +209,10 @@ pub const CalDavStore = struct {
     phones: std.ArrayList(PhoneNumber),
     addresses: std.ArrayList(Address),
 
+    // User registry (username -> user_id)
+    user_ids: std.ArrayList(UserEntry),
+    next_user_id: u64,
+
     // Sync history
     sync_changes: std.ArrayList(SyncChange),
     current_sync_token: u64,
@@ -211,17 +223,24 @@ pub const CalDavStore = struct {
     next_addressbook_id: u64,
     next_contact_id: u64,
 
+    pub const UserEntry = struct {
+        username: []const u8,
+        user_id: u64,
+    };
+
     pub fn init(allocator: Allocator, config: StoreConfig) !Self {
         return Self{
             .allocator = allocator,
             .config = config,
-            .calendars = .{},
-            .events = .{},
-            .addressbooks = .{},
-            .contacts = .{},
+            .calendars = std.AutoHashMap(u64, Calendar).init(allocator),
+            .events = std.AutoHashMap(u64, Event).init(allocator),
+            .addressbooks = std.AutoHashMap(u64, AddressBook).init(allocator),
+            .contacts = std.AutoHashMap(u64, Contact).init(allocator),
             .emails = .{},
             .phones = .{},
             .addresses = .{},
+            .user_ids = .{},
+            .next_user_id = 1,
             .sync_changes = .{},
             .current_sync_token = 1,
             .next_calendar_id = 1,
@@ -232,14 +251,58 @@ pub const CalDavStore = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        self.calendars.deinit(self.allocator);
-        self.events.deinit(self.allocator);
-        self.addressbooks.deinit(self.allocator);
-        self.contacts.deinit(self.allocator);
+        // Free dynamically allocated ctag/etag strings
+        var cal_iter = self.calendars.iterator();
+        while (cal_iter.next()) |entry| {
+            self.allocator.free(entry.value_ptr.ctag);
+        }
+        var event_iter = self.events.iterator();
+        while (event_iter.next()) |entry| {
+            self.allocator.free(entry.value_ptr.etag);
+        }
+        var ab_iter = self.addressbooks.iterator();
+        while (ab_iter.next()) |entry| {
+            self.allocator.free(entry.value_ptr.ctag);
+        }
+        var contact_iter = self.contacts.iterator();
+        while (contact_iter.next()) |entry| {
+            self.allocator.free(entry.value_ptr.etag);
+        }
+        // Free allocated href strings in sync changes
+        for (self.sync_changes.items) |change| {
+            self.allocator.free(change.href);
+        }
+        self.calendars.deinit();
+        self.events.deinit();
+        self.addressbooks.deinit();
+        self.contacts.deinit();
         self.emails.deinit(self.allocator);
         self.phones.deinit(self.allocator);
         self.addresses.deinit(self.allocator);
+        self.user_ids.deinit(self.allocator);
         self.sync_changes.deinit(self.allocator);
+    }
+
+    // -------------------------------------------------------------------------
+    // User Operations
+    // -------------------------------------------------------------------------
+
+    /// Get existing user_id for username, or create a new one.
+    pub fn getOrCreateUserId(self: *Self, username: []const u8) !u64 {
+        // Look up existing
+        for (self.user_ids.items) |entry| {
+            if (std.mem.eql(u8, entry.username, username)) {
+                return entry.user_id;
+            }
+        }
+        // Create new
+        const id = self.next_user_id;
+        self.next_user_id += 1;
+        try self.user_ids.append(self.allocator, .{
+            .username = username,
+            .user_id = id,
+        });
+        return id;
     }
 
     // -------------------------------------------------------------------------
@@ -255,10 +318,10 @@ pub const CalDavStore = struct {
         const id = self.next_calendar_id;
         self.next_calendar_id += 1;
 
-        const now = std.time.timestamp();
+        const now = currentTimestamp();
         const ctag = try self.generateCtag(id, now);
 
-        try self.calendars.put(self.allocator, id, .{
+        try self.calendars.put(id, .{
             .id = id,
             .user_id = user_id,
             .name = name,
@@ -305,9 +368,15 @@ pub const CalDavStore = struct {
         }
 
         for (events_to_delete.items) |event_id| {
+            if (self.events.getPtr(event_id)) |e| {
+                self.allocator.free(e.etag);
+            }
             _ = self.events.remove(event_id);
         }
 
+        if (self.calendars.getPtr(id)) |cal| {
+            self.allocator.free(cal.ctag);
+        }
         _ = self.calendars.remove(id);
     }
 
@@ -319,11 +388,11 @@ pub const CalDavStore = struct {
         const id = self.next_event_id;
         self.next_event_id += 1;
 
-        const now = std.time.timestamp();
+        const now = currentTimestamp();
         const etag = try self.generateEtag(id, now);
         const uid = data.uid orelse try self.generateUid();
 
-        try self.events.put(self.allocator, id, .{
+        try self.events.put(id, .{
             .id = id,
             .calendar_id = calendar_id,
             .uid = uid,
@@ -343,7 +412,9 @@ pub const CalDavStore = struct {
         });
 
         // Record sync change
-        try self.recordChange(id, .event, .created, etag, try self.getEventHref(calendar_id, uid));
+        if (self.config.enable_sync_tokens) {
+            try self.recordChange(calendar_id, id, .event, .created, etag, try self.getEventHref(calendar_id, uid));
+        }
 
         // Update calendar ctag
         try self.updateCalendarCtag(calendar_id);
@@ -395,8 +466,10 @@ pub const CalDavStore = struct {
 
     pub fn updateEvent(self: *Self, id: u64, data: EventData) !void {
         if (self.events.getPtr(id)) |event| {
-            const now = std.time.timestamp();
+            const now = currentTimestamp();
+            const old_etag = event.etag;
             const etag = try self.generateEtag(id, now);
+            self.allocator.free(old_etag);
 
             event.summary = data.summary;
             event.description = data.description;
@@ -412,7 +485,9 @@ pub const CalDavStore = struct {
                 event.ics_data = ics;
             }
 
-            try self.recordChange(id, .event, .modified, etag, try self.getEventHref(event.calendar_id, event.uid));
+            if (self.config.enable_sync_tokens) {
+                try self.recordChange(event.calendar_id, id, .event, .modified, etag, try self.getEventHref(event.calendar_id, event.uid));
+            }
             try self.updateCalendarCtag(event.calendar_id);
         } else {
             return error.EventNotFound;
@@ -422,12 +497,16 @@ pub const CalDavStore = struct {
     pub fn deleteEvent(self: *Self, id: u64) !void {
         if (self.events.get(id)) |event| {
             const etag = event.etag;
-            const href = try self.getEventHref(event.calendar_id, event.uid);
             const calendar_id = event.calendar_id;
 
-            _ = self.events.remove(id);
-
-            try self.recordChange(id, .event, .deleted, etag, href);
+            if (self.config.enable_sync_tokens) {
+                const href = try self.getEventHref(event.calendar_id, event.uid);
+                _ = self.events.remove(id);
+                try self.recordChange(calendar_id, id, .event, .deleted, etag, href);
+            } else {
+                _ = self.events.remove(id);
+                self.allocator.free(etag);
+            }
             try self.updateCalendarCtag(calendar_id);
         }
     }
@@ -445,10 +524,10 @@ pub const CalDavStore = struct {
         const id = self.next_addressbook_id;
         self.next_addressbook_id += 1;
 
-        const now = std.time.timestamp();
+        const now = currentTimestamp();
         const ctag = try self.generateCtag(id, now);
 
-        try self.addressbooks.put(self.allocator, id, .{
+        try self.addressbooks.put(id, .{
             .id = id,
             .user_id = user_id,
             .name = name,
@@ -503,6 +582,10 @@ pub const CalDavStore = struct {
         }
 
         for (contacts_to_delete.items) |contact_id| {
+            // Free allocated etag before removing
+            if (self.contacts.getPtr(contact_id)) |c| {
+                self.allocator.free(c.etag);
+            }
             // Remove associated emails and phones
             var i: usize = 0;
             while (i < self.emails.items.len) {
@@ -523,6 +606,10 @@ pub const CalDavStore = struct {
             _ = self.contacts.remove(contact_id);
         }
 
+        // Free allocated ctag before removing
+        if (self.addressbooks.getPtr(id)) |ab| {
+            self.allocator.free(ab.ctag);
+        }
         _ = self.addressbooks.remove(id);
     }
 
@@ -534,11 +621,11 @@ pub const CalDavStore = struct {
         const id = self.next_contact_id;
         self.next_contact_id += 1;
 
-        const now = std.time.timestamp();
+        const now = currentTimestamp();
         const etag = try self.generateEtag(id, now);
         const uid = data.uid orelse try self.generateUid();
 
-        try self.contacts.put(self.allocator, id, .{
+        try self.contacts.put(id, .{
             .id = id,
             .addressbook_id = addressbook_id,
             .uid = uid,
@@ -577,7 +664,9 @@ pub const CalDavStore = struct {
             });
         }
 
-        try self.recordChange(id, .contact, .created, etag, try self.getContactHref(addressbook_id, uid));
+        if (self.config.enable_sync_tokens) {
+            try self.recordChange(addressbook_id, id, .contact, .created, etag, try self.getContactHref(addressbook_id, uid));
+        }
         try self.updateAddressBookCtag(addressbook_id);
 
         return id;
@@ -627,8 +716,10 @@ pub const CalDavStore = struct {
 
     pub fn updateContact(self: *Self, id: u64, data: ContactData) !void {
         if (self.contacts.getPtr(id)) |contact| {
-            const now = std.time.timestamp();
+            const now = currentTimestamp();
+            const old_etag = contact.etag;
             const etag = try self.generateEtag(id, now);
+            self.allocator.free(old_etag);
 
             contact.full_name = data.full_name;
             contact.given_name = data.given_name;
@@ -681,7 +772,9 @@ pub const CalDavStore = struct {
                 });
             }
 
-            try self.recordChange(id, .contact, .modified, etag, try self.getContactHref(contact.addressbook_id, contact.uid));
+            if (self.config.enable_sync_tokens) {
+                try self.recordChange(contact.addressbook_id, id, .contact, .modified, etag, try self.getContactHref(contact.addressbook_id, contact.uid));
+            }
             try self.updateAddressBookCtag(contact.addressbook_id);
         } else {
             return error.ContactNotFound;
@@ -758,7 +851,6 @@ pub const CalDavStore = struct {
     pub fn deleteContact(self: *Self, id: u64) !void {
         if (self.contacts.get(id)) |contact| {
             const etag = contact.etag;
-            const href = try self.getContactHref(contact.addressbook_id, contact.uid);
             const addressbook_id = contact.addressbook_id;
 
             // Remove associated emails and phones
@@ -780,9 +872,14 @@ pub const CalDavStore = struct {
                 }
             }
 
-            _ = self.contacts.remove(id);
-
-            try self.recordChange(id, .contact, .deleted, etag, href);
+            if (self.config.enable_sync_tokens) {
+                const href = try self.getContactHref(contact.addressbook_id, contact.uid);
+                _ = self.contacts.remove(id);
+                try self.recordChange(addressbook_id, id, .contact, .deleted, etag, href);
+            } else {
+                _ = self.contacts.remove(id);
+                self.allocator.free(etag);
+            }
             try self.updateAddressBookCtag(addressbook_id);
         }
     }
@@ -811,13 +908,11 @@ pub const CalDavStore = struct {
         const expected_type: SyncChange.ResourceType = if (is_calendar) .event else .contact;
 
         for (self.sync_changes.items) |change| {
-            if (change.resource_type == expected_type) {
-                // Check if this change is after the token
-                // In a real implementation, we'd check against the collection_id too
-                _ = collection_id;
-                if (self.getChangeToken(change) > since_token) {
-                    try changes.append(self.allocator, change);
-                }
+            if (change.resource_type == expected_type and
+                change.collection_id == collection_id and
+                change.token > since_token)
+            {
+                try changes.append(self.allocator, change);
             }
         }
 
@@ -828,15 +923,9 @@ pub const CalDavStore = struct {
         };
     }
 
-    fn getChangeToken(self: *Self, change: SyncChange) u64 {
-        _ = self;
-        // In a real impl, each change would have a token
-        _ = change;
-        return 0;
-    }
-
     fn recordChange(
         self: *Self,
+        collection_id: u64,
         resource_id: u64,
         resource_type: SyncChange.ResourceType,
         change_type: SyncChange.ChangeType,
@@ -845,16 +934,18 @@ pub const CalDavStore = struct {
     ) !void {
         if (!self.config.enable_sync_tokens) return;
 
+        self.current_sync_token += 1;
+
         try self.sync_changes.append(self.allocator, .{
             .resource_id = resource_id,
+            .collection_id = collection_id,
             .resource_type = resource_type,
             .change_type = change_type,
+            .token = self.current_sync_token,
             .etag = etag,
             .href = href,
-            .timestamp = std.time.timestamp(),
+            .timestamp = currentTimestamp(),
         });
-
-        self.current_sync_token += 1;
 
         // Prune old history
         while (self.sync_changes.items.len > self.config.max_sync_history) {
@@ -864,8 +955,10 @@ pub const CalDavStore = struct {
 
     fn updateCalendarCtag(self: *Self, calendar_id: u64) !void {
         if (self.calendars.getPtr(calendar_id)) |cal| {
-            const now = std.time.timestamp();
+            const now = currentTimestamp();
+            const old_ctag = cal.ctag;
             cal.ctag = try self.generateCtag(calendar_id, now);
+            self.allocator.free(old_ctag);
             cal.modified_at = now;
             cal.sync_token = self.current_sync_token;
         }
@@ -873,8 +966,10 @@ pub const CalDavStore = struct {
 
     fn updateAddressBookCtag(self: *Self, addressbook_id: u64) !void {
         if (self.addressbooks.getPtr(addressbook_id)) |ab| {
-            const now = std.time.timestamp();
+            const now = currentTimestamp();
+            const old_ctag = ab.ctag;
             ab.ctag = try self.generateCtag(addressbook_id, now);
+            self.allocator.free(old_ctag);
             ab.modified_at = now;
             ab.sync_token = self.current_sync_token;
         }
@@ -906,11 +1001,11 @@ pub const CalDavStore = struct {
         {
             try buf.appendSlice(self.allocator, "N:");
             if (contact.family_name) |family| {
-                try buf.appendSlice(family);
+                try buf.appendSlice(self.allocator, family);
             }
             try buf.appendSlice(self.allocator, ";");
             if (contact.given_name) |given| {
-                try buf.appendSlice(given);
+                try buf.appendSlice(self.allocator, given);
             }
             try buf.appendSlice(self.allocator, ";;;\r\n");
         }
@@ -918,40 +1013,41 @@ pub const CalDavStore = struct {
         // NICKNAME
         if (contact.nickname) |nickname| {
             try buf.appendSlice(self.allocator, "NICKNAME:");
-            try buf.appendSlice(nickname);
+            try buf.appendSlice(self.allocator, nickname);
             try buf.appendSlice(self.allocator, "\r\n");
         }
 
         // ORG
         if (contact.organization) |org| {
             try buf.appendSlice(self.allocator, "ORG:");
-            try buf.appendSlice(org);
+            try buf.appendSlice(self.allocator, org);
             try buf.appendSlice(self.allocator, "\r\n");
         }
 
         // TITLE
         if (contact.title) |t| {
             try buf.appendSlice(self.allocator, "TITLE:");
-            try buf.appendSlice(t);
+            try buf.appendSlice(self.allocator, t);
             try buf.appendSlice(self.allocator, "\r\n");
         }
 
         // NOTE
         if (contact.note) |n| {
             try buf.appendSlice(self.allocator, "NOTE:");
-            try buf.appendSlice(n);
+            try buf.appendSlice(self.allocator, n);
             try buf.appendSlice(self.allocator, "\r\n");
         }
 
         // PHOTO
         if (contact.photo_url) |photo| {
             try buf.appendSlice(self.allocator, "PHOTO;VALUE=uri:");
-            try buf.appendSlice(photo);
+            try buf.appendSlice(self.allocator, photo);
             try buf.appendSlice(self.allocator, "\r\n");
         }
 
         // Emails
         const emails = self.getContactEmails(contact.id);
+        defer self.allocator.free(emails);
         for (emails) |email| {
             try buf.appendSlice(self.allocator, "EMAIL;TYPE=INTERNET");
             switch (email.email_type) {
@@ -960,12 +1056,13 @@ pub const CalDavStore = struct {
                 .other => {},
             }
             try buf.appendSlice(self.allocator, ":");
-            try buf.appendSlice(email.email);
+            try buf.appendSlice(self.allocator, email.email);
             try buf.appendSlice(self.allocator, "\r\n");
         }
 
         // Phones
         const phones = self.getContactPhones(contact.id);
+        defer self.allocator.free(phones);
         for (phones) |phone| {
             try buf.appendSlice(self.allocator, "TEL");
             switch (phone.phone_type) {
@@ -976,18 +1073,18 @@ pub const CalDavStore = struct {
                 .other => {},
             }
             try buf.appendSlice(self.allocator, ":");
-            try buf.appendSlice(phone.number);
+            try buf.appendSlice(self.allocator, phone.number);
             try buf.appendSlice(self.allocator, "\r\n");
         }
 
         // UID
         try buf.appendSlice(self.allocator, "UID:");
-        try buf.appendSlice(contact.uid);
+        try buf.appendSlice(self.allocator, contact.uid);
         try buf.appendSlice(self.allocator, "\r\n");
 
         try buf.appendSlice(self.allocator, "END:VCARD\r\n");
 
-        return buf.toOwnedSlice();
+        return buf.toOwnedSlice(self.allocator);
     }
 
     // -------------------------------------------------------------------------
@@ -1003,9 +1100,10 @@ pub const CalDavStore = struct {
     }
 
     fn generateUid(self: *Self) ![]const u8 {
-        const timestamp = std.time.timestamp();
-        var random: u64 = undefined;
-        std.c.arc4random_buf(std.mem.asBytes(&random), @sizeOf(u64));
+        const timestamp = currentTimestamp();
+        var random_bytes: [8]u8 = undefined;
+        std.crypto.random.bytes(&random_bytes);
+        const random = std.mem.readInt(u64, &random_bytes, .little);
         return try std.fmt.allocPrint(self.allocator, "{x}-{x}@localhost", .{ timestamp, random });
     }
 
@@ -1026,8 +1124,9 @@ pub const IcsParser = struct {
     pub fn parseEvent(ics_data: []const u8) ?ParsedEvent {
         var event = ParsedEvent{};
 
-        var lines = std.mem.splitSequence(u8, ics_data, "\r\n");
-        while (lines.next()) |line| {
+        var lines = std.mem.splitScalar(u8, ics_data, '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trimEnd(u8, raw_line, "\r");
             if (std.mem.startsWith(u8, line, "SUMMARY:")) {
                 event.summary = line[8..];
             } else if (std.mem.startsWith(u8, line, "DESCRIPTION:")) {
@@ -1052,15 +1151,46 @@ pub const IcsParser = struct {
     fn parseDtValue(line: []const u8) ?i64 {
         // Find the value after : or ;VALUE=DATE:
         if (std.mem.indexOf(u8, line, ":")) |idx| {
-            const value = line[idx + 1 ..];
-            // Parse YYYYMMDDTHHMMSS or YYYYMMDD
+            const value = std.mem.trimEnd(u8, line[idx + 1 ..], "\r");
             if (value.len >= 8) {
-                // Simplified parsing - just return current time
-                // Real implementation would parse the ISO date
-                return std.time.timestamp();
+                return parseIcalDate(value);
             }
         }
         return null;
+    }
+
+    /// Parse iCalendar date/time: YYYYMMDD or YYYYMMDDTHHMMSS[Z]
+    fn parseIcalDate(value: []const u8) ?i64 {
+        if (value.len < 8) return null;
+        const year = std.fmt.parseInt(i64, value[0..4], 10) catch return null;
+        const month = std.fmt.parseInt(i64, value[4..6], 10) catch return null;
+        const day = std.fmt.parseInt(i64, value[6..8], 10) catch return null;
+
+        // Days from epoch using a simplified calculation
+        // (accurate enough for calendar sync; not accounting for leap seconds)
+        const days = epochDays(year, month, day);
+
+        if (value.len >= 15 and value[8] == 'T') {
+            const hour = std.fmt.parseInt(i64, value[9..11], 10) catch return 0;
+            const minute = std.fmt.parseInt(i64, value[11..13], 10) catch return 0;
+            const second = std.fmt.parseInt(i64, value[13..15], 10) catch return 0;
+            return days * 86400 + hour * 3600 + minute * 60 + second;
+        }
+        return days * 86400;
+    }
+
+    fn epochDays(year: i64, month: i64, day: i64) i64 {
+        // Compute days since Unix epoch (1970-01-01) using a standard algorithm
+        var y = year;
+        var m = month;
+        if (m <= 2) {
+            y -= 1;
+            m += 12;
+        }
+        const era_days = 365 * y + @divFloor(y, 4) - @divFloor(y, 100) + @divFloor(y, 400);
+        const month_days = @divFloor((153 * (m - 3) + 2), 5) + day - 1;
+        // Epoch offset: days from year 0 to 1970-01-01 = 719468
+        return era_days + month_days - 719468;
     }
 
     pub const ParsedEvent = struct {
@@ -1079,26 +1209,37 @@ pub const IcsParser = struct {
 // =============================================================================
 
 pub const VcfParser = struct {
+    const MAX_MULTI_VALUES = 8;
+
     pub fn parseContact(vcf_data: []const u8) ?ParsedContact {
         var contact = ParsedContact{};
 
-        var lines = std.mem.splitSequence(u8, vcf_data, "\r\n");
-        while (lines.next()) |line| {
+        // Handle both \r\n (RFC standard) and \n (common in testing/unix)
+        var lines = std.mem.splitScalar(u8, vcf_data, '\n');
+        while (lines.next()) |raw_line| {
+            const line = std.mem.trimEnd(u8, raw_line, "\r");
             if (std.mem.startsWith(u8, line, "FN:")) {
                 contact.full_name = line[3..];
             } else if (std.mem.startsWith(u8, line, "N:")) {
-                // N:Last;First;Middle;Prefix;Suffix
                 const name_parts = line[2..];
                 var parts = std.mem.splitScalar(u8, name_parts, ';');
                 contact.family_name = parts.next();
                 contact.given_name = parts.next();
             } else if (std.mem.startsWith(u8, line, "EMAIL")) {
                 if (std.mem.indexOf(u8, line, ":")) |idx| {
-                    contact.email = line[idx + 1 ..];
+                    const value = line[idx + 1 ..];
+                    if (contact.email_count < MAX_MULTI_VALUES) {
+                        contact.emails[contact.email_count] = value;
+                        contact.email_count += 1;
+                    }
                 }
             } else if (std.mem.startsWith(u8, line, "TEL")) {
                 if (std.mem.indexOf(u8, line, ":")) |idx| {
-                    contact.phone = line[idx + 1 ..];
+                    const value = line[idx + 1 ..];
+                    if (contact.phone_count < MAX_MULTI_VALUES) {
+                        contact.phones[contact.phone_count] = value;
+                        contact.phone_count += 1;
+                    }
                 }
             } else if (std.mem.startsWith(u8, line, "ORG:")) {
                 contact.organization = line[4..];
@@ -1116,9 +1257,23 @@ pub const VcfParser = struct {
         full_name: ?[]const u8 = null,
         given_name: ?[]const u8 = null,
         family_name: ?[]const u8 = null,
-        email: ?[]const u8 = null,
-        phone: ?[]const u8 = null,
+        emails: [MAX_MULTI_VALUES][]const u8 = [_][]const u8{""} ** MAX_MULTI_VALUES,
+        email_count: usize = 0,
+        phones: [MAX_MULTI_VALUES][]const u8 = [_][]const u8{""} ** MAX_MULTI_VALUES,
+        phone_count: usize = 0,
         organization: ?[]const u8 = null,
+
+        /// Get first email (convenience, backward compat)
+        pub fn email(self: ParsedContact) ?[]const u8 {
+            if (self.email_count > 0) return self.emails[0];
+            return null;
+        }
+
+        /// Get first phone (convenience, backward compat)
+        pub fn phone(self: ParsedContact) ?[]const u8 {
+            if (self.phone_count > 0) return self.phones[0];
+            return null;
+        }
     };
 };
 
@@ -1153,7 +1308,7 @@ test "event operations" {
     // Create event
     const event_id = try store.createEvent(cal_id, .{
         .summary = "Test Meeting",
-        .dtstart = std.time.timestamp(),
+        .dtstart = currentTimestamp(),
     });
 
     try std.testing.expect(event_id > 0);

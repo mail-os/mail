@@ -7,6 +7,12 @@ const logger = @import("../core/logger.zig");
 const tls = @import("tls");
 const caldav_store = @import("../storage/caldav_store.zig");
 
+/// Get the current epoch timestamp in seconds.
+fn currentTimestamp() i64 {
+    const ts = std.posix.clock_gettime(.REALTIME) catch return 0;
+    return ts.sec;
+}
+
 /// CalDAV/CardDAV Server Implementation
 /// RFC 4791 (CalDAV) and RFC 6352 (CardDAV)
 ///
@@ -173,7 +179,7 @@ pub fn parsePath(path: []const u8) ParsedPath {
 fn appendPrint(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
     const formatted = try std.fmt.allocPrint(allocator, fmt, args);
     defer allocator.free(formatted);
-    try buf.appendSlice(formatted);
+    try buf.appendSlice(allocator, formatted);
 }
 
 // ============================================================================
@@ -205,14 +211,55 @@ pub const CalDavSession = struct {
 
     /// Handle incoming HTTP request
     pub fn handleRequest(self: *CalDavSession, config: *const CalDavConfig) !bool {
-        var buffer: [8192]u8 = undefined;
-        const bytes_read = self.connection.read(&buffer) catch return false;
+        // Initial read for headers (up to 64KB)
+        var header_buf: [65536]u8 = undefined;
+        const bytes_read = self.connection.read(&header_buf) catch return false;
 
         if (bytes_read == 0) {
             return false; // Connection closed
         }
 
-        const request = buffer[0..bytes_read];
+        // Check if we need to read more data based on Content-Length
+        var request_data: ?[]u8 = null;
+        defer if (request_data) |rd| self.allocator.free(rd);
+
+        const initial = header_buf[0..bytes_read];
+        const request = blk: {
+            // Find Content-Length header and end of headers
+            if (std.mem.indexOf(u8, initial, "\r\n\r\n")) |header_end| {
+                const headers = initial[0..header_end];
+                const body_start = header_end + 4;
+                const body_received = bytes_read - body_start;
+
+                // Parse Content-Length
+                var content_length: usize = 0;
+                var h_lines = std.mem.splitSequence(u8, headers, "\r\n");
+                while (h_lines.next()) |hline| {
+                    if (std.ascii.startsWithIgnoreCase(hline, "content-length:")) {
+                        const val = std.mem.trim(u8, hline[15..], &std.ascii.whitespace);
+                        content_length = std.fmt.parseInt(usize, val, 10) catch 0;
+                        break;
+                    }
+                }
+
+                if (content_length > 0 and content_length > body_received and content_length <= config.max_resource_size) {
+                    // Need to read more body data
+                    const total_size = body_start + content_length;
+                    var full_buf = try self.allocator.alloc(u8, total_size);
+                    @memcpy(full_buf[0..bytes_read], initial);
+
+                    var total_read = bytes_read;
+                    while (total_read < total_size) {
+                        const n = self.connection.read(full_buf[total_read..total_size]) catch break;
+                        if (n == 0) break;
+                        total_read += n;
+                    }
+                    request_data = full_buf;
+                    break :blk full_buf[0..total_read];
+                }
+            }
+            break :blk initial;
+        };
 
         // Parse HTTP request line
         var lines = std.mem.splitScalar(u8, request, '\n');
@@ -294,6 +341,12 @@ pub const CalDavSession = struct {
         return true;
     }
 
+    /// Resolve the user_id for the currently authenticated user.
+    fn getUserId(self: *CalDavSession) !u64 {
+        const username = self.username orelse return error.NotAuthenticated;
+        return self.store.getOrCreateUserId(username);
+    }
+
     /// Route request to appropriate handler
     fn routeRequest(
         self: *CalDavSession,
@@ -302,19 +355,10 @@ pub const CalDavSession = struct {
         request: []const u8,
         config: *const CalDavConfig,
     ) !void {
-        // Handle .well-known autodiscovery
-        if (std.mem.startsWith(u8, path, "/.well-known/caldav")) {
-            try self.sendWellKnownRedirect("/calendars/");
-            return;
-        }
-        if (std.mem.startsWith(u8, path, "/.well-known/carddav")) {
-            try self.sendWellKnownRedirect("/addressbooks/");
-            return;
-        }
-
         switch (method) {
             .options => try self.handleOptions(path),
             .propfind => try self.handlePropfind(path, request, config),
+            .proppatch => try self.handleProppatch(path, request, config),
             .get => try self.handleGet(path, config),
             .put => try self.handlePut(path, request, config),
             .delete => try self.handleDelete(path, config),
@@ -374,88 +418,88 @@ pub const CalDavSession = struct {
         }
 
         const parsed = parsePath(path);
-        const user_id: u64 = 1;
+        const user_id = self.getUserId() catch 1;
 
         // Build XML response using dynamic buffer
-        var buf = std.ArrayList(u8).init(self.allocator);
-        defer buf.deinit();
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(self.allocator);
 
         switch (parsed.path_type) {
             .root, .well_known_caldav, .well_known_carddav => {
                 // Root PROPFIND - return principal URLs
-                try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-                try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
-                try buf.appendSlice("  <D:response>\n");
-                try buf.appendSlice("    <D:href>/</D:href>\n");
-                try buf.appendSlice("    <D:propstat>\n");
-                try buf.appendSlice("      <D:prop>\n");
-                try buf.appendSlice("        <D:resourcetype><D:collection/></D:resourcetype>\n");
+                try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+                try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
+                try buf.appendSlice(self.allocator, "  <D:response>\n");
+                try buf.appendSlice(self.allocator, "    <D:href>/</D:href>\n");
+                try buf.appendSlice(self.allocator, "    <D:propstat>\n");
+                try buf.appendSlice(self.allocator, "      <D:prop>\n");
+                try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/></D:resourcetype>\n");
                 const username = self.username orelse "user";
                 try appendPrint(&buf, self.allocator, "        <D:current-user-principal><D:href>/principals/{s}</D:href></D:current-user-principal>\n", .{username});
-                try buf.appendSlice("      </D:prop>\n");
-                try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                try buf.appendSlice("    </D:propstat>\n");
-                try buf.appendSlice("  </D:response>\n");
-                try buf.appendSlice("</D:multistatus>");
+                try buf.appendSlice(self.allocator, "      </D:prop>\n");
+                try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                try buf.appendSlice(self.allocator, "    </D:propstat>\n");
+                try buf.appendSlice(self.allocator, "  </D:response>\n");
+                try buf.appendSlice(self.allocator, "</D:multistatus>");
             },
             .principals, .principal_user => {
                 const username = parsed.user orelse (self.username orelse "user");
-                try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-                try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
-                try buf.appendSlice("  <D:response>\n");
+                try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+                try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
+                try buf.appendSlice(self.allocator, "  <D:response>\n");
                 try appendPrint(&buf, self.allocator, "    <D:href>/principals/{s}</D:href>\n", .{username});
-                try buf.appendSlice("    <D:propstat>\n");
-                try buf.appendSlice("      <D:prop>\n");
-                try buf.appendSlice("        <D:resourcetype><D:principal/></D:resourcetype>\n");
+                try buf.appendSlice(self.allocator, "    <D:propstat>\n");
+                try buf.appendSlice(self.allocator, "      <D:prop>\n");
+                try buf.appendSlice(self.allocator, "        <D:resourcetype><D:principal/></D:resourcetype>\n");
                 try appendPrint(&buf, self.allocator, "        <D:current-user-principal><D:href>/principals/{s}</D:href></D:current-user-principal>\n", .{username});
                 try appendPrint(&buf, self.allocator, "        <C:calendar-home-set><D:href>/calendars/{s}/</D:href></C:calendar-home-set>\n", .{username});
                 try appendPrint(&buf, self.allocator, "        <CARD:addressbook-home-set><D:href>/addressbooks/{s}/</D:href></CARD:addressbook-home-set>\n", .{username});
-                try buf.appendSlice("      </D:prop>\n");
-                try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                try buf.appendSlice("    </D:propstat>\n");
-                try buf.appendSlice("  </D:response>\n");
-                try buf.appendSlice("</D:multistatus>");
+                try buf.appendSlice(self.allocator, "      </D:prop>\n");
+                try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                try buf.appendSlice(self.allocator, "    </D:propstat>\n");
+                try buf.appendSlice(self.allocator, "  </D:response>\n");
+                try buf.appendSlice(self.allocator, "</D:multistatus>");
             },
             .calendars_home => {
-                try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-                try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n");
+                try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+                try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n");
                 // List user's calendars
                 const calendars = self.store.getUserCalendars(user_id) catch &[_]caldav_store.Calendar{};
                 for (calendars) |cal| {
-                    try buf.appendSlice("  <D:response>\n");
+                    try buf.appendSlice(self.allocator, "  <D:response>\n");
                     const username = parsed.user orelse "user";
                     try appendPrint(&buf, self.allocator, "    <D:href>/calendars/{s}/{s}/</D:href>\n", .{ username, cal.name });
-                    try buf.appendSlice("    <D:propstat>\n");
-                    try buf.appendSlice("      <D:prop>\n");
-                    try buf.appendSlice("        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\n");
+                    try buf.appendSlice(self.allocator, "    <D:propstat>\n");
+                    try buf.appendSlice(self.allocator, "      <D:prop>\n");
+                    try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\n");
                     try appendPrint(&buf, self.allocator, "        <D:displayname>{s}</D:displayname>\n", .{cal.name});
                     try appendPrint(&buf, self.allocator, "        <CS:getctag xmlns:CS=\"http://calendarserver.org/ns/\">{s}</CS:getctag>\n", .{cal.ctag});
-                    try buf.appendSlice("      </D:prop>\n");
-                    try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                    try buf.appendSlice("    </D:propstat>\n");
-                    try buf.appendSlice("  </D:response>\n");
+                    try buf.appendSlice(self.allocator, "      </D:prop>\n");
+                    try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                    try buf.appendSlice(self.allocator, "    </D:propstat>\n");
+                    try buf.appendSlice(self.allocator, "  </D:response>\n");
                 }
-                try buf.appendSlice("</D:multistatus>");
+                try buf.appendSlice(self.allocator, "</D:multistatus>");
             },
             .calendar_collection => {
-                try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-                try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n");
+                try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+                try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n");
 
                 const collection_name = parsed.collection orelse "default";
                 const username = parsed.user orelse "user";
 
                 // Collection itself
-                try buf.appendSlice("  <D:response>\n");
+                try buf.appendSlice(self.allocator, "  <D:response>\n");
                 try appendPrint(&buf, self.allocator, "    <D:href>/calendars/{s}/{s}/</D:href>\n", .{ username, collection_name });
-                try buf.appendSlice("    <D:propstat>\n");
-                try buf.appendSlice("      <D:prop>\n");
-                try buf.appendSlice("        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\n");
+                try buf.appendSlice(self.allocator, "    <D:propstat>\n");
+                try buf.appendSlice(self.allocator, "      <D:prop>\n");
+                try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\n");
                 try appendPrint(&buf, self.allocator, "        <D:displayname>{s}</D:displayname>\n", .{collection_name});
-                try buf.appendSlice("        <C:supported-calendar-component-set><C:comp name=\"VEVENT\"/><C:comp name=\"VTODO\"/></C:supported-calendar-component-set>\n");
-                try buf.appendSlice("      </D:prop>\n");
-                try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                try buf.appendSlice("    </D:propstat>\n");
-                try buf.appendSlice("  </D:response>\n");
+                try buf.appendSlice(self.allocator, "        <C:supported-calendar-component-set><C:comp name=\"VEVENT\"/><C:comp name=\"VTODO\"/></C:supported-calendar-component-set>\n");
+                try buf.appendSlice(self.allocator, "      </D:prop>\n");
+                try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                try buf.appendSlice(self.allocator, "    </D:propstat>\n");
+                try buf.appendSlice(self.allocator, "  </D:response>\n");
 
                 // List events if Depth: 1
                 if (depth >= 1) {
@@ -464,62 +508,62 @@ pub const CalDavSession = struct {
                         if (std.mem.eql(u8, cal.name, collection_name)) {
                             const events = self.store.getCalendarEvents(cal.id) catch &[_]caldav_store.Event{};
                             for (events) |event| {
-                                try buf.appendSlice("  <D:response>\n");
+                                try buf.appendSlice(self.allocator, "  <D:response>\n");
                                 try appendPrint(&buf, self.allocator, "    <D:href>/calendars/{s}/{s}/{s}.ics</D:href>\n", .{ username, collection_name, event.uid });
-                                try buf.appendSlice("    <D:propstat>\n");
-                                try buf.appendSlice("      <D:prop>\n");
+                                try buf.appendSlice(self.allocator, "    <D:propstat>\n");
+                                try buf.appendSlice(self.allocator, "      <D:prop>\n");
                                 try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{event.etag});
-                                try buf.appendSlice("      </D:prop>\n");
-                                try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                                try buf.appendSlice("    </D:propstat>\n");
-                                try buf.appendSlice("  </D:response>\n");
+                                try buf.appendSlice(self.allocator, "      </D:prop>\n");
+                                try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                                try buf.appendSlice(self.allocator, "    </D:propstat>\n");
+                                try buf.appendSlice(self.allocator, "  </D:response>\n");
                             }
                             break;
                         }
                     }
                 }
-                try buf.appendSlice("</D:multistatus>");
+                try buf.appendSlice(self.allocator, "</D:multistatus>");
             },
             .addressbooks_home => {
-                try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-                try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
+                try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+                try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
                 const addressbooks = self.store.getUserAddressBooks(user_id) catch &[_]caldav_store.AddressBook{};
                 for (addressbooks) |ab| {
-                    try buf.appendSlice("  <D:response>\n");
+                    try buf.appendSlice(self.allocator, "  <D:response>\n");
                     const username = parsed.user orelse "user";
                     try appendPrint(&buf, self.allocator, "    <D:href>/addressbooks/{s}/{s}/</D:href>\n", .{ username, ab.name });
-                    try buf.appendSlice("    <D:propstat>\n");
-                    try buf.appendSlice("      <D:prop>\n");
-                    try buf.appendSlice("        <D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>\n");
+                    try buf.appendSlice(self.allocator, "    <D:propstat>\n");
+                    try buf.appendSlice(self.allocator, "      <D:prop>\n");
+                    try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>\n");
                     try appendPrint(&buf, self.allocator, "        <D:displayname>{s}</D:displayname>\n", .{ab.name});
                     try appendPrint(&buf, self.allocator, "        <CS:getctag xmlns:CS=\"http://calendarserver.org/ns/\">{s}</CS:getctag>\n", .{ab.ctag});
-                    try buf.appendSlice("        <CARD:supported-address-data><CARD:address-data-type content-type=\"text/vcard\" version=\"3.0\"/></CARD:supported-address-data>\n");
-                    try buf.appendSlice("      </D:prop>\n");
-                    try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                    try buf.appendSlice("    </D:propstat>\n");
-                    try buf.appendSlice("  </D:response>\n");
+                    try buf.appendSlice(self.allocator, "        <CARD:supported-address-data><CARD:address-data-type content-type=\"text/vcard\" version=\"3.0\"/></CARD:supported-address-data>\n");
+                    try buf.appendSlice(self.allocator, "      </D:prop>\n");
+                    try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                    try buf.appendSlice(self.allocator, "    </D:propstat>\n");
+                    try buf.appendSlice(self.allocator, "  </D:response>\n");
                 }
-                try buf.appendSlice("</D:multistatus>");
+                try buf.appendSlice(self.allocator, "</D:multistatus>");
             },
             .addressbook_collection => {
-                try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-                try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
+                try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+                try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
 
                 const collection_name = parsed.collection orelse "default";
                 const username = parsed.user orelse "user";
 
                 // Collection itself
-                try buf.appendSlice("  <D:response>\n");
+                try buf.appendSlice(self.allocator, "  <D:response>\n");
                 try appendPrint(&buf, self.allocator, "    <D:href>/addressbooks/{s}/{s}/</D:href>\n", .{ username, collection_name });
-                try buf.appendSlice("    <D:propstat>\n");
-                try buf.appendSlice("      <D:prop>\n");
-                try buf.appendSlice("        <D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>\n");
+                try buf.appendSlice(self.allocator, "    <D:propstat>\n");
+                try buf.appendSlice(self.allocator, "      <D:prop>\n");
+                try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>\n");
                 try appendPrint(&buf, self.allocator, "        <D:displayname>{s}</D:displayname>\n", .{collection_name});
-                try buf.appendSlice("        <CARD:supported-address-data><CARD:address-data-type content-type=\"text/vcard\" version=\"3.0\"/></CARD:supported-address-data>\n");
-                try buf.appendSlice("      </D:prop>\n");
-                try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                try buf.appendSlice("    </D:propstat>\n");
-                try buf.appendSlice("  </D:response>\n");
+                try buf.appendSlice(self.allocator, "        <CARD:supported-address-data><CARD:address-data-type content-type=\"text/vcard\" version=\"3.0\"/></CARD:supported-address-data>\n");
+                try buf.appendSlice(self.allocator, "      </D:prop>\n");
+                try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                try buf.appendSlice(self.allocator, "    </D:propstat>\n");
+                try buf.appendSlice(self.allocator, "  </D:response>\n");
 
                 // List contacts if Depth: 1
                 if (depth >= 1) {
@@ -528,38 +572,38 @@ pub const CalDavSession = struct {
                         if (std.mem.eql(u8, ab.name, collection_name)) {
                             const contacts = self.store.getAddressBookContacts(ab.id) catch &[_]caldav_store.Contact{};
                             for (contacts) |contact| {
-                                try buf.appendSlice("  <D:response>\n");
+                                try buf.appendSlice(self.allocator, "  <D:response>\n");
                                 try appendPrint(&buf, self.allocator, "    <D:href>/addressbooks/{s}/{s}/{s}.vcf</D:href>\n", .{ username, collection_name, contact.uid });
-                                try buf.appendSlice("    <D:propstat>\n");
-                                try buf.appendSlice("      <D:prop>\n");
+                                try buf.appendSlice(self.allocator, "    <D:propstat>\n");
+                                try buf.appendSlice(self.allocator, "      <D:prop>\n");
                                 try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{contact.etag});
-                                try buf.appendSlice("      </D:prop>\n");
-                                try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                                try buf.appendSlice("    </D:propstat>\n");
-                                try buf.appendSlice("  </D:response>\n");
+                                try buf.appendSlice(self.allocator, "      </D:prop>\n");
+                                try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                                try buf.appendSlice(self.allocator, "    </D:propstat>\n");
+                                try buf.appendSlice(self.allocator, "  </D:response>\n");
                             }
                             break;
                         }
                     }
                 }
-                try buf.appendSlice("</D:multistatus>");
+                try buf.appendSlice(self.allocator, "</D:multistatus>");
             },
             else => {
                 // Fallback: generic PROPFIND response for the path
-                try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-                try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\">\n");
-                try buf.appendSlice("  <D:response>\n");
-                try buf.appendSlice("    <D:href>");
-                try buf.appendSlice(path);
-                try buf.appendSlice("</D:href>\n");
-                try buf.appendSlice("    <D:propstat>\n");
-                try buf.appendSlice("      <D:prop>\n");
-                try buf.appendSlice("        <D:resourcetype><D:collection/></D:resourcetype>\n");
-                try buf.appendSlice("      </D:prop>\n");
-                try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                try buf.appendSlice("    </D:propstat>\n");
-                try buf.appendSlice("  </D:response>\n");
-                try buf.appendSlice("</D:multistatus>");
+                try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+                try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\">\n");
+                try buf.appendSlice(self.allocator, "  <D:response>\n");
+                try buf.appendSlice(self.allocator, "    <D:href>");
+                try buf.appendSlice(self.allocator, path);
+                try buf.appendSlice(self.allocator, "</D:href>\n");
+                try buf.appendSlice(self.allocator, "    <D:propstat>\n");
+                try buf.appendSlice(self.allocator, "      <D:prop>\n");
+                try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/></D:resourcetype>\n");
+                try buf.appendSlice(self.allocator, "      </D:prop>\n");
+                try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                try buf.appendSlice(self.allocator, "    </D:propstat>\n");
+                try buf.appendSlice(self.allocator, "  </D:response>\n");
+                try buf.appendSlice(self.allocator, "</D:multistatus>");
             },
         }
 
@@ -574,6 +618,90 @@ pub const CalDavSession = struct {
 
         _ = try self.connection.write(header_fbs.getWritten());
         _ = try self.connection.write(body);
+    }
+
+    /// Handle PROPPATCH request (modify properties on calendar/addressbook)
+    fn handleProppatch(
+        self: *CalDavSession,
+        path: []const u8,
+        request: []const u8,
+        config: *const CalDavConfig,
+    ) !void {
+        _ = config;
+        const parsed = parsePath(path);
+
+        // Extract body from request
+        var body: []const u8 = "";
+        if (std.mem.indexOf(u8, request, "\r\n\r\n")) |idx| {
+            body = request[idx + 4 ..];
+        }
+
+        // Parse displayname and calendar-color from the XML body
+        var new_name: ?[]const u8 = null;
+        var new_color: ?[]const u8 = null;
+
+        if (std.mem.indexOf(u8, body, "<D:displayname>")) |start| {
+            const val_start = start + 15;
+            if (std.mem.indexOf(u8, body[val_start..], "</D:displayname>")) |end| {
+                new_name = body[val_start .. val_start + end];
+            }
+        }
+        if (std.mem.indexOf(u8, body, "<A:calendar-color>")) |start| {
+            const val_start = start + 18;
+            if (std.mem.indexOf(u8, body[val_start..], "</A:calendar-color>")) |end| {
+                new_color = body[val_start .. val_start + end];
+            }
+        }
+
+        switch (parsed.path_type) {
+            .calendar_collection => {
+                if (parsed.collection) |col_name| {
+                    const user_id = self.getUserId() catch 1;
+                    if (self.store.getCalendarByName(user_id, col_name)) |cal| {
+                        if (self.store.calendars.getPtr(cal.id)) |cal_ptr| {
+                            if (new_name) |name| cal_ptr.name = name;
+                            if (new_color) |color| cal_ptr.color = color;
+                        }
+                        // Return 207 Multi-Status success
+                        const resp = "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\n\r\n" ++
+                            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" ++
+                            "<D:multistatus xmlns:D=\"DAV:\">\n" ++
+                            "  <D:response>\n" ++
+                            "    <D:propstat>\n" ++
+                            "      <D:status>HTTP/1.1 200 OK</D:status>\n" ++
+                            "    </D:propstat>\n" ++
+                            "  </D:response>\n" ++
+                            "</D:multistatus>\n";
+                        _ = try self.connection.write(resp);
+                        return;
+                    }
+                }
+                try self.sendError(404, "Not Found");
+            },
+            .addressbook_collection => {
+                if (parsed.collection) |col_name| {
+                    const user_id = self.getUserId() catch 1;
+                    if (self.store.getAddressBookByName(user_id, col_name)) |ab| {
+                        if (self.store.addressbooks.getPtr(ab.id)) |ab_ptr| {
+                            if (new_name) |name| ab_ptr.name = name;
+                        }
+                        const resp = "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\n\r\n" ++
+                            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" ++
+                            "<D:multistatus xmlns:D=\"DAV:\">\n" ++
+                            "  <D:response>\n" ++
+                            "    <D:propstat>\n" ++
+                            "      <D:status>HTTP/1.1 200 OK</D:status>\n" ++
+                            "    </D:propstat>\n" ++
+                            "  </D:response>\n" ++
+                            "</D:multistatus>\n";
+                        _ = try self.connection.write(resp);
+                        return;
+                    }
+                }
+                try self.sendError(404, "Not Found");
+            },
+            else => try self.sendError(501, "PROPPATCH not supported on this resource"),
+        }
     }
 
     /// Handle GET request (retrieve calendar/contact resource)
@@ -592,7 +720,7 @@ pub const CalDavSession = struct {
                     return;
                 };
                 // Look up calendar by name for the user (use user_id=1 as default)
-                const user_id: u64 = 1;
+                const user_id = self.getUserId() catch 1;
                 const calendars = self.store.getUserCalendars(user_id) catch {
                     try self.sendError(500, "Internal Server Error");
                     return;
@@ -624,7 +752,7 @@ pub const CalDavSession = struct {
                     try self.sendError(404, "Not Found");
                     return;
                 };
-                const user_id: u64 = 1;
+                const user_id = self.getUserId() catch 1;
                 const addressbooks = self.store.getUserAddressBooks(user_id) catch {
                     try self.sendError(500, "Internal Server Error");
                     return;
@@ -715,7 +843,7 @@ pub const CalDavSession = struct {
                     try self.sendError(400, "Missing calendar name");
                     return;
                 };
-                const user_id: u64 = 1;
+                const user_id = self.getUserId() catch 1;
 
                 // Find or create calendar
                 var cal_id: u64 = undefined;
@@ -758,14 +886,14 @@ pub const CalDavSession = struct {
                             }
                         }
                     }
-                    self.store.updateEvent(event_id, .{ .summary = summary, .dtstart = std.time.timestamp(), .ics_data = body }) catch {
+                    self.store.updateEvent(event_id, .{ .summary = summary, .dtstart = currentTimestamp(), .ics_data = body }) catch {
                         try self.sendError(500, "Internal Server Error");
                         return;
                     };
                     try self.sendSuccess(204, "No Content");
                 } else {
                     // Create new
-                    _ = self.store.createEvent(cal_id, .{ .uid = uid, .summary = summary, .dtstart = std.time.timestamp(), .ics_data = body }) catch {
+                    _ = self.store.createEvent(cal_id, .{ .uid = uid, .summary = summary, .dtstart = currentTimestamp(), .ics_data = body }) catch {
                         try self.sendError(500, "Internal Server Error");
                         return;
                     };
@@ -785,7 +913,7 @@ pub const CalDavSession = struct {
                     try self.sendError(400, "Missing addressbook name");
                     return;
                 };
-                const user_id: u64 = 1;
+                const user_id = self.getUserId() catch 1;
 
                 // Find or create addressbook
                 var ab_id: u64 = undefined;
@@ -856,7 +984,7 @@ pub const CalDavSession = struct {
                     try self.sendError(404, "Not Found");
                     return;
                 };
-                const user_id: u64 = 1;
+                const user_id = self.getUserId() catch 1;
                 const calendars = self.store.getUserCalendars(user_id) catch {
                     try self.sendError(500, "Internal Server Error");
                     return;
@@ -884,7 +1012,7 @@ pub const CalDavSession = struct {
                     try self.sendError(404, "Not Found");
                     return;
                 };
-                const user_id: u64 = 1;
+                const user_id = self.getUserId() catch 1;
                 const addressbooks = self.store.getUserAddressBooks(user_id) catch {
                     try self.sendError(500, "Internal Server Error");
                     return;
@@ -909,7 +1037,7 @@ pub const CalDavSession = struct {
                     try self.sendError(404, "Not Found");
                     return;
                 };
-                const user_id: u64 = 1;
+                const user_id = self.getUserId() catch 1;
                 const calendars = self.store.getUserCalendars(user_id) catch {
                     try self.sendError(500, "Internal Server Error");
                     return;
@@ -932,7 +1060,7 @@ pub const CalDavSession = struct {
                     try self.sendError(404, "Not Found");
                     return;
                 };
-                const user_id: u64 = 1;
+                const user_id = self.getUserId() catch 1;
                 const addressbooks = self.store.getUserAddressBooks(user_id) catch {
                     try self.sendError(500, "Internal Server Error");
                     return;
@@ -965,7 +1093,7 @@ pub const CalDavSession = struct {
                 try self.sendError(400, "Missing calendar name");
                 return;
             };
-            const user_id: u64 = 1;
+            const user_id = self.getUserId() catch 1;
             _ = self.store.createCalendar(user_id, collection_name, null) catch {
                 try self.sendError(500, "Internal Server Error");
                 return;
@@ -986,7 +1114,7 @@ pub const CalDavSession = struct {
                 try self.sendError(400, "Missing addressbook name");
                 return;
             };
-            const user_id: u64 = 1;
+            const user_id = self.getUserId() catch 1;
             _ = self.store.createAddressBook(user_id, collection_name, null) catch {
                 try self.sendError(500, "Internal Server Error");
                 return;
@@ -997,7 +1125,7 @@ pub const CalDavSession = struct {
                 try self.sendError(400, "Missing calendar name");
                 return;
             };
-            const user_id: u64 = 1;
+            const user_id = self.getUserId() catch 1;
             _ = self.store.createCalendar(user_id, collection_name, null) catch {
                 try self.sendError(500, "Internal Server Error");
                 return;
@@ -1037,13 +1165,13 @@ pub const CalDavSession = struct {
     fn handleCalendarQuery(self: *CalDavSession, path: []const u8, request: []const u8) !void {
         _ = request;
         const parsed = parsePath(path);
-        const user_id: u64 = 1;
+        const user_id = self.getUserId() catch 1;
 
-        var buf = std.ArrayList(u8).init(self.allocator);
-        defer buf.deinit();
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(self.allocator);
 
-        try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-        try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n");
+        try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+        try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n");
 
         const collection_name = parsed.collection orelse "default";
         const username = parsed.user orelse "user";
@@ -1053,38 +1181,38 @@ pub const CalDavSession = struct {
             if (std.mem.eql(u8, cal.name, collection_name)) {
                 const events = self.store.getCalendarEvents(cal.id) catch &[_]caldav_store.Event{};
                 for (events) |event| {
-                    try buf.appendSlice("  <D:response>\n");
+                    try buf.appendSlice(self.allocator, "  <D:response>\n");
                     try appendPrint(&buf, self.allocator, "    <D:href>/calendars/{s}/{s}/{s}.ics</D:href>\n", .{ username, collection_name, event.uid });
-                    try buf.appendSlice("    <D:propstat>\n");
-                    try buf.appendSlice("      <D:prop>\n");
+                    try buf.appendSlice(self.allocator, "    <D:propstat>\n");
+                    try buf.appendSlice(self.allocator, "      <D:prop>\n");
                     try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{event.etag});
                     if (event.ics_data.len > 0) {
-                        try buf.appendSlice("        <C:calendar-data>");
-                        try buf.appendSlice(event.ics_data);
-                        try buf.appendSlice("</C:calendar-data>\n");
+                        try buf.appendSlice(self.allocator, "        <C:calendar-data>");
+                        try buf.appendSlice(self.allocator, event.ics_data);
+                        try buf.appendSlice(self.allocator, "</C:calendar-data>\n");
                     }
-                    try buf.appendSlice("      </D:prop>\n");
-                    try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                    try buf.appendSlice("    </D:propstat>\n");
-                    try buf.appendSlice("  </D:response>\n");
+                    try buf.appendSlice(self.allocator, "      </D:prop>\n");
+                    try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                    try buf.appendSlice(self.allocator, "    </D:propstat>\n");
+                    try buf.appendSlice(self.allocator, "  </D:response>\n");
                 }
                 break;
             }
         }
-        try buf.appendSlice("</D:multistatus>");
+        try buf.appendSlice(self.allocator, "</D:multistatus>");
         try self.sendMultistatusResponse(buf.items);
     }
 
     /// Handle calendar-multiget REPORT
     fn handleCalendarMultiget(self: *CalDavSession, path: []const u8, request: []const u8) !void {
         _ = path;
-        const user_id: u64 = 1;
+        const user_id = self.getUserId() catch 1;
 
-        var buf = std.ArrayList(u8).init(self.allocator);
-        defer buf.deinit();
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(self.allocator);
 
-        try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-        try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n");
+        try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+        try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n");
 
         // Parse <D:href> elements from request body
         const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse request.len;
@@ -1104,20 +1232,20 @@ pub const CalDavSession = struct {
                             for (calendars) |cal| {
                                 if (std.mem.eql(u8, cal.name, coll)) {
                                     if (self.store.getEventByUid(cal.id, uid)) |event| {
-                                        try buf.appendSlice("  <D:response>\n");
+                                        try buf.appendSlice(self.allocator, "  <D:response>\n");
                                         try appendPrint(&buf, self.allocator, "    <D:href>{s}</D:href>\n", .{href});
-                                        try buf.appendSlice("    <D:propstat>\n");
-                                        try buf.appendSlice("      <D:prop>\n");
+                                        try buf.appendSlice(self.allocator, "    <D:propstat>\n");
+                                        try buf.appendSlice(self.allocator, "      <D:prop>\n");
                                         try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{event.etag});
                                         if (event.ics_data.len > 0) {
-                                            try buf.appendSlice("        <C:calendar-data>");
-                                            try buf.appendSlice(event.ics_data);
-                                            try buf.appendSlice("</C:calendar-data>\n");
+                                            try buf.appendSlice(self.allocator, "        <C:calendar-data>");
+                                            try buf.appendSlice(self.allocator, event.ics_data);
+                                            try buf.appendSlice(self.allocator, "</C:calendar-data>\n");
                                         }
-                                        try buf.appendSlice("      </D:prop>\n");
-                                        try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                                        try buf.appendSlice("    </D:propstat>\n");
-                                        try buf.appendSlice("  </D:response>\n");
+                                        try buf.appendSlice(self.allocator, "      </D:prop>\n");
+                                        try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                                        try buf.appendSlice(self.allocator, "    </D:propstat>\n");
+                                        try buf.appendSlice(self.allocator, "  </D:response>\n");
                                     }
                                     break;
                                 }
@@ -1129,7 +1257,7 @@ pub const CalDavSession = struct {
             } else break;
         }
 
-        try buf.appendSlice("</D:multistatus>");
+        try buf.appendSlice(self.allocator, "</D:multistatus>");
         try self.sendMultistatusResponse(buf.items);
     }
 
@@ -1137,13 +1265,13 @@ pub const CalDavSession = struct {
     fn handleAddressbookQuery(self: *CalDavSession, path: []const u8, request: []const u8) !void {
         _ = request;
         const parsed = parsePath(path);
-        const user_id: u64 = 1;
+        const user_id = self.getUserId() catch 1;
 
-        var buf = std.ArrayList(u8).init(self.allocator);
-        defer buf.deinit();
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(self.allocator);
 
-        try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-        try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
+        try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+        try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
 
         const collection_name = parsed.collection orelse "default";
         const username = parsed.user orelse "user";
@@ -1153,42 +1281,42 @@ pub const CalDavSession = struct {
             if (std.mem.eql(u8, ab.name, collection_name)) {
                 const contacts = self.store.getAddressBookContacts(ab.id) catch &[_]caldav_store.Contact{};
                 for (contacts) |contact| {
-                    try buf.appendSlice("  <D:response>\n");
+                    try buf.appendSlice(self.allocator, "  <D:response>\n");
                     try appendPrint(&buf, self.allocator, "    <D:href>/addressbooks/{s}/{s}/{s}.vcf</D:href>\n", .{ username, collection_name, contact.uid });
-                    try buf.appendSlice("    <D:propstat>\n");
-                    try buf.appendSlice("      <D:prop>\n");
+                    try buf.appendSlice(self.allocator, "    <D:propstat>\n");
+                    try buf.appendSlice(self.allocator, "      <D:prop>\n");
                     try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{contact.etag});
                     const vcf = if (contact.vcf_data.len > 0)
                         contact.vcf_data
                     else
                         self.store.generateVcf(contact) catch "";
                     if (vcf.len > 0) {
-                        try buf.appendSlice("        <CARD:address-data>");
-                        try buf.appendSlice(vcf);
-                        try buf.appendSlice("</CARD:address-data>\n");
+                        try buf.appendSlice(self.allocator, "        <CARD:address-data>");
+                        try buf.appendSlice(self.allocator, vcf);
+                        try buf.appendSlice(self.allocator, "</CARD:address-data>\n");
                     }
-                    try buf.appendSlice("      </D:prop>\n");
-                    try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                    try buf.appendSlice("    </D:propstat>\n");
-                    try buf.appendSlice("  </D:response>\n");
+                    try buf.appendSlice(self.allocator, "      </D:prop>\n");
+                    try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                    try buf.appendSlice(self.allocator, "    </D:propstat>\n");
+                    try buf.appendSlice(self.allocator, "  </D:response>\n");
                 }
                 break;
             }
         }
-        try buf.appendSlice("</D:multistatus>");
+        try buf.appendSlice(self.allocator, "</D:multistatus>");
         try self.sendMultistatusResponse(buf.items);
     }
 
     /// Handle addressbook-multiget REPORT
     fn handleAddressbookMultiget(self: *CalDavSession, path: []const u8, request: []const u8) !void {
         _ = path;
-        const user_id: u64 = 1;
+        const user_id = self.getUserId() catch 1;
 
-        var buf = std.ArrayList(u8).init(self.allocator);
-        defer buf.deinit();
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(self.allocator);
 
-        try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-        try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
+        try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+        try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
 
         // Parse <D:href> elements from request body
         const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse request.len;
@@ -1207,24 +1335,24 @@ pub const CalDavSession = struct {
                             for (addressbooks) |ab| {
                                 if (std.mem.eql(u8, ab.name, coll)) {
                                     if (self.store.getContactByUid(ab.id, uid)) |contact| {
-                                        try buf.appendSlice("  <D:response>\n");
+                                        try buf.appendSlice(self.allocator, "  <D:response>\n");
                                         try appendPrint(&buf, self.allocator, "    <D:href>{s}</D:href>\n", .{href});
-                                        try buf.appendSlice("    <D:propstat>\n");
-                                        try buf.appendSlice("      <D:prop>\n");
+                                        try buf.appendSlice(self.allocator, "    <D:propstat>\n");
+                                        try buf.appendSlice(self.allocator, "      <D:prop>\n");
                                         try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{contact.etag});
                                         const vcf = if (contact.vcf_data.len > 0)
                                             contact.vcf_data
                                         else
                                             self.store.generateVcf(contact) catch "";
                                         if (vcf.len > 0) {
-                                            try buf.appendSlice("        <CARD:address-data>");
-                                            try buf.appendSlice(vcf);
-                                            try buf.appendSlice("</CARD:address-data>\n");
+                                            try buf.appendSlice(self.allocator, "        <CARD:address-data>");
+                                            try buf.appendSlice(self.allocator, vcf);
+                                            try buf.appendSlice(self.allocator, "</CARD:address-data>\n");
                                         }
-                                        try buf.appendSlice("      </D:prop>\n");
-                                        try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                                        try buf.appendSlice("    </D:propstat>\n");
-                                        try buf.appendSlice("  </D:response>\n");
+                                        try buf.appendSlice(self.allocator, "      </D:prop>\n");
+                                        try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                                        try buf.appendSlice(self.allocator, "    </D:propstat>\n");
+                                        try buf.appendSlice(self.allocator, "  </D:response>\n");
                                     }
                                     break;
                                 }
@@ -1236,14 +1364,14 @@ pub const CalDavSession = struct {
             } else break;
         }
 
-        try buf.appendSlice("</D:multistatus>");
+        try buf.appendSlice(self.allocator, "</D:multistatus>");
         try self.sendMultistatusResponse(buf.items);
     }
 
     /// Handle sync-collection REPORT (RFC 6578)
     fn handleSyncCollection(self: *CalDavSession, path: []const u8, request: []const u8) !void {
         const parsed = parsePath(path);
-        const user_id: u64 = 1;
+        const user_id = self.getUserId() catch 1;
         _ = user_id;
 
         // Parse sync-token from request body
@@ -1293,30 +1421,30 @@ pub const CalDavSession = struct {
             return;
         };
 
-        var buf = std.ArrayList(u8).init(self.allocator);
-        defer buf.deinit();
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(self.allocator);
 
-        try buf.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-        try buf.appendSlice("<D:multistatus xmlns:D=\"DAV:\">\n");
+        try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
+        try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\">\n");
 
         for (report.changes) |change| {
-            try buf.appendSlice("  <D:response>\n");
+            try buf.appendSlice(self.allocator, "  <D:response>\n");
             try appendPrint(&buf, self.allocator, "    <D:href>{s}</D:href>\n", .{change.href});
             if (change.change_type == .deleted) {
-                try buf.appendSlice("    <D:status>HTTP/1.1 404 Not Found</D:status>\n");
+                try buf.appendSlice(self.allocator, "    <D:status>HTTP/1.1 404 Not Found</D:status>\n");
             } else {
-                try buf.appendSlice("    <D:propstat>\n");
-                try buf.appendSlice("      <D:prop>\n");
+                try buf.appendSlice(self.allocator, "    <D:propstat>\n");
+                try buf.appendSlice(self.allocator, "      <D:prop>\n");
                 try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{change.etag});
-                try buf.appendSlice("      </D:prop>\n");
-                try buf.appendSlice("      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                try buf.appendSlice("    </D:propstat>\n");
+                try buf.appendSlice(self.allocator, "      </D:prop>\n");
+                try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
+                try buf.appendSlice(self.allocator, "    </D:propstat>\n");
             }
-            try buf.appendSlice("  </D:response>\n");
+            try buf.appendSlice(self.allocator, "  </D:response>\n");
         }
 
         try appendPrint(&buf, self.allocator, "  <D:sync-token>http://mail/sync/{d}</D:sync-token>\n", .{report.new_sync_token});
-        try buf.appendSlice("</D:multistatus>");
+        try buf.appendSlice(self.allocator, "</D:multistatus>");
         try self.sendMultistatusResponse(buf.items);
     }
 
