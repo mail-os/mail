@@ -1878,10 +1878,8 @@ pub const CalDavServer = struct {
 
                 // Send close notify
                 var close_buf: [64]u8 = undefined;
-                if (tls_conn.close(&close_buf)) |maybe_close_data| {
-                    if (maybe_close_data) |close_data| {
-                        _ = connection.write(close_data) catch {};
-                    }
+                if (tls_conn.close(&close_buf)) |close_data| {
+                    _ = connection.write(close_data) catch {};
                 } else |_| {}
             }
             return;

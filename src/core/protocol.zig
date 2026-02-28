@@ -201,10 +201,8 @@ const ConnectionWrapper = struct {
     pub fn deinitTls(self: *ConnectionWrapper) void {
         if (self.tls_conn) |*conn| {
             var close_buf: [64]u8 = undefined;
-            if (conn.close(&close_buf)) |maybe_close_data| {
-                if (maybe_close_data) |close_data| {
-                    _ = self.tcp_conn.write(close_data) catch {};
-                }
+            if (conn.close(&close_buf)) |close_data| {
+                _ = self.tcp_conn.write(close_data) catch {};
             } else |_| {}
             self.tls_conn = null;
         }
@@ -1098,7 +1096,7 @@ pub const Session = struct {
         }
 
         // Get the cipher from completed handshake
-        const cipher = server_hs.cipher();
+        const cipher = server_hs.cipher() orelse return error.TlsHandshakeFailed;
 
         self.logger.info("TLS handshake successful", .{});
 
