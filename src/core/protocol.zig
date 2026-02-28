@@ -12,6 +12,28 @@ const tls_mod = @import("tls.zig");
 const chunking = @import("../protocol/chunking.zig");
 const tls = @import("tls");
 
+/// Sanitize a string for safe logging — strip control characters that could
+/// inject fake log entries (newlines, carriage returns, null bytes).
+fn sanitizeForLog(input: []const u8) [256]u8 {
+    var buf: [256]u8 = undefined;
+    const limit = @min(input.len, 255);
+    var i: usize = 0;
+    for (input[0..limit]) |c| {
+        if (c == '\n' or c == '\r' or c == 0) {
+            buf[i] = '?';
+        } else {
+            buf[i] = c;
+        }
+        i += 1;
+    }
+    buf[i] = 0; // null-terminate just for safety
+    return buf;
+}
+
+fn sanitizedSlice(buf: *const [256]u8, len: usize) []const u8 {
+    return buf[0..@min(len, 255)];
+}
+
 const SMTPCommand = enum {
     HELO,
     EHLO,
@@ -502,7 +524,8 @@ pub const Session = struct {
                 while (size_end < size_part.len and std.ascii.isDigit(size_part[size_end])) {
                     size_end += 1;
                 }
-                if (size_end > 0) {
+                // Cap at 15 digits to prevent overflow (max u64 is 20 digits)
+                if (size_end > 0 and size_end <= 15) {
                     declared_size = std.fmt.parseInt(usize, size_part[0..size_end], 10) catch null;
                 }
             }
@@ -519,7 +542,8 @@ pub const Session = struct {
                     while (size_end < size_part.len and std.ascii.isDigit(size_part[size_end])) {
                         size_end += 1;
                     }
-                    if (size_end > 0) {
+                    // Cap at 15 digits to prevent overflow
+                    if (size_end > 0 and size_end <= 15) {
                         declared_size = std.fmt.parseInt(usize, size_part[0..size_end], 10) catch null;
                     }
                 }
@@ -576,6 +600,18 @@ pub const Session = struct {
             return;
         }
 
+        // Prevent open relay: unauthenticated clients can only send to local domain
+        if (!self.authenticated) {
+            if (std.mem.indexOf(u8, addr, "@")) |at_pos| {
+                const recipient_domain = addr[at_pos + 1 ..];
+                if (!std.ascii.eqlIgnoreCase(recipient_domain, self.config.hostname)) {
+                    self.logger.logSecurityEvent(self.remote_addr, "Relay access denied for unauthenticated sender");
+                    try self.sendResponse(writer, 550, "5.7.1 Relay access denied", null);
+                    return;
+                }
+            }
+        }
+
         // Check greylisting if enabled
         if (self.greylist) |greylist| {
             const mail_from = self.mail_from orelse "";
@@ -586,7 +622,9 @@ pub const Session = struct {
             };
 
             if (!allowed) {
-                self.logger.info("Greylisting: Temporary reject for {s} -> {s} from {s}", .{ mail_from, addr, self.remote_addr });
+                const safe_from = sanitizeForLog(mail_from);
+                const safe_addr = sanitizeForLog(addr);
+                self.logger.info("Greylisting: Temporary reject for {s} -> {s} from {s}", .{ sanitizedSlice(&safe_from, mail_from.len), sanitizedSlice(&safe_addr, addr.len), self.remote_addr });
                 try self.sendResponse(writer, 451, "Greylisted - please try again later", null);
                 return;
             }
@@ -620,6 +658,8 @@ pub const Session = struct {
 
         var message_data = std.ArrayList(u8){};
         defer message_data.deinit(self.allocator);
+        // Pre-allocate to avoid repeated reallocations during message reception
+        message_data.ensureTotalCapacity(self.allocator, @min(65536, self.config.max_message_size)) catch {};
 
         var line_buffer: [4096]u8 = undefined;
         var line_pos: usize = 0;
@@ -662,16 +702,16 @@ pub const Session = struct {
                 else
                     trimmed;
 
+                // Enforce max message size before appending
+                if (message_data.items.len + data_line.len + 1 > self.config.max_message_size) {
+                    try self.sendResponse(writer, 552, "Message size exceeds maximum allowed", null);
+                    return;
+                }
+
                 try message_data.appendSlice(self.allocator, data_line);
                 try message_data.append(self.allocator, '\n');
 
                 prev_was_crlf = trimmed.len == 0;
-
-                // Enforce max message size
-                if (message_data.items.len > self.config.max_message_size) {
-                    try self.sendResponse(writer, 552, "Message size exceeds maximum allowed", null);
-                    return;
-                }
             } else {
                 line_pos += 1;
                 if (line_pos >= line_buffer.len) return error.LineTooLong;
@@ -681,8 +721,10 @@ pub const Session = struct {
         // Save the message (in a real implementation, you'd save to disk or database)
         try self.saveMessage(message_data.items);
 
+        const sender_str: []const u8 = self.mail_from orelse "unknown";
+        const safe_sender = sanitizeForLog(sender_str);
         self.logger.logMessageReceived(
-            self.mail_from orelse "unknown",
+            sanitizedSlice(&safe_sender, sender_str.len),
             self.rcpt_to.items.len,
             message_data.items.len,
         );
@@ -920,10 +962,12 @@ pub const Session = struct {
                     if (valid) {
                         self.authenticated = true;
                         self.state = .Authenticated;
-                        self.logger.info("User '{s}' authenticated successfully", .{credentials.username});
+                        const safe_user = sanitizeForLog(credentials.username);
+                        self.logger.info("User '{s}' authenticated successfully", .{sanitizedSlice(&safe_user, credentials.username.len)});
                         try self.sendResponse(writer, 235, "Authentication successful", null);
                     } else {
-                        self.logger.warn("Authentication failed for user '{s}'", .{credentials.username});
+                        const safe_user = sanitizeForLog(credentials.username);
+                        self.logger.warn("Authentication failed for user '{s}'", .{sanitizedSlice(&safe_user, credentials.username.len)});
                         try self.sendResponse(writer, 535, "Authentication failed", null);
                     }
                 } else {

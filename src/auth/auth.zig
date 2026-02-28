@@ -3,6 +3,8 @@ const io_compat = @import("../core/io_compat.zig");
 const posix = std.posix;
 const database = @import("../storage/database.zig");
 const password_mod = @import("password.zig");
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const mutex_compat = @import("../core/mutex_compat.zig");
 
 /// Get current unix timestamp in seconds
 fn getCurrentTimestamp() i64 {
@@ -19,6 +21,17 @@ fn bytesToHex(bytes: []const u8, out: []u8) void {
         out[i * 2] = hex_chars[b >> 4];
         out[i * 2 + 1] = hex_chars[b & 0x0f];
     }
+}
+
+/// Constant-time byte comparison to prevent timing attacks.
+/// Returns true if a and b are equal. Both slices must be the same length.
+pub fn constantTimeEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| {
+        diff |= x ^ y;
+    }
+    return diff == 0;
 }
 
 pub const Credentials = struct {
@@ -56,6 +69,9 @@ pub const NonceManager = struct {
     allocator: std.mem.Allocator,
     nonces: std.StringHashMap(i64), // nonce -> creation timestamp
     max_age_seconds: i64 = 300, // 5 minutes
+    generation_count: u32 = 0,
+    max_nonces: u32 = 4096, // Hard cap to prevent unbounded growth
+    mutex: mutex_compat.Mutex = .{}, // Thread safety for concurrent connections
 
     pub fn init(allocator: std.mem.Allocator) NonceManager {
         return .{
@@ -72,32 +88,42 @@ pub const NonceManager = struct {
         self.nonces.deinit();
     }
 
-    /// Generate a new nonce
+    /// Generate a new cryptographically random nonce (no predictable components)
     pub fn generateNonce(self: *NonceManager) ![]const u8 {
-        var random_bytes: [16]u8 = undefined;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var random_bytes: [32]u8 = undefined;
         io_compat.randomBytes(&random_bytes);
 
         const now = getCurrentTimestamp();
 
-        // Create nonce: hex(random) + ":" + timestamp
-        // 32 hex chars + 1 colon + up to 20 digits for timestamp
-        var hex_buf: [32]u8 = undefined;
+        // Nonce is purely random hex — no timestamp or other predictable data
+        var hex_buf: [64]u8 = undefined;
         bytesToHex(&random_bytes, &hex_buf);
 
-        var nonce_buf: [64]u8 = undefined;
-        const nonce_str = std.fmt.bufPrint(&nonce_buf, "{s}:{d}", .{
-            hex_buf[0..],
-            now,
-        }) catch return error.NonceGenerationFailed;
+        const nonce = try self.allocator.dupe(u8, &hex_buf);
 
-        const nonce = try self.allocator.dupe(u8, nonce_str);
+        // Deterministic cleanup every 64 generations (instead of random sampling)
+        self.generation_count +%= 1;
+        if (self.generation_count % 64 == 0 and self.nonces.count() > 0) {
+            self.cleanupLocked();
+        }
+
+        // Hard cap: if still over limit after cleanup, force another cleanup
+        if (self.nonces.count() >= self.max_nonces) {
+            self.cleanupLocked();
+        }
+
         try self.nonces.put(nonce, now);
-
         return nonce;
     }
 
     /// Validate a nonce (check it exists and hasn't expired)
     pub fn validateNonce(self: *NonceManager, nonce: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         const created = self.nonces.get(nonce) orelse return false;
         const now = getCurrentTimestamp();
         return (now - created) < self.max_age_seconds;
@@ -105,21 +131,31 @@ pub const NonceManager = struct {
 
     /// Remove a used nonce (for one-time use)
     pub fn invalidateNonce(self: *NonceManager, nonce: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (self.nonces.fetchRemove(nonce)) |entry| {
             self.allocator.free(entry.key);
         }
     }
 
-    /// Cleanup expired nonces
+    /// Cleanup expired nonces (public, acquires lock)
     pub fn cleanup(self: *NonceManager) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.cleanupLocked();
+    }
+
+    /// Cleanup expired nonces (internal, caller must hold lock)
+    fn cleanupLocked(self: *NonceManager) void {
         const now = getCurrentTimestamp();
-        var to_remove = std.ArrayList([]const u8).init(self.allocator);
-        defer to_remove.deinit();
+        var to_remove: std.ArrayList([]const u8) = .{};
+        defer to_remove.deinit(self.allocator);
 
         var iter = self.nonces.iterator();
         while (iter.next()) |entry| {
             if ((now - entry.value_ptr.*) >= self.max_age_seconds) {
-                to_remove.append(entry.key_ptr.*) catch continue;
+                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
 
@@ -226,7 +262,7 @@ pub const AuthBackend = struct {
     }
 
     /// Verify HTTP Digest Auth header and return username if valid
-    /// Format: "Digest username="...", realm="...", nonce="...", uri="...", response="...", ..."
+    /// Supports both SHA-256 (RFC 7616, preferred) and MD5 (RFC 2617, legacy fallback)
     pub fn verifyDigestAuth(self: *AuthBackend, auth_header: []const u8, method: []const u8, realm: []const u8) !?[]const u8 {
         const log = @import("../core/logger.zig");
 
@@ -240,11 +276,12 @@ pub const AuthBackend = struct {
         var params = try parseDigestAuthHeader(self.allocator, auth_header[7..]);
         defer params.deinit(self.allocator);
 
-        log.info("Digest auth: username={s}, realm={s}, uri={s}", .{ params.username, params.realm, params.uri });
+        // SECURITY: Only log username, never log hashes, nonces, or responses
+        log.info("Digest auth: attempt for user={s}", .{params.username});
 
-        // Verify realm matches
-        if (!std.mem.eql(u8, params.realm, realm)) {
-            log.warn("Digest auth: realm mismatch - got '{s}', expected '{s}'", .{ params.realm, realm });
+        // Verify realm matches (constant-time to avoid leaking realm info)
+        if (params.realm.len != realm.len or !constantTimeEql(params.realm, realm)) {
+            log.warn("Digest auth: realm mismatch", .{});
             return null;
         }
 
@@ -262,12 +299,10 @@ pub const AuthBackend = struct {
             break :blk params.username;
         };
 
-        log.info("Digest auth: normalized username={s}", .{normalized_username});
-
         // Get user from database
         var user = self.db.getUserByUsername(normalized_username) catch |err| {
             if (err == database.DatabaseError.NotFound) {
-                log.warn("Digest auth: user '{s}' not found in database", .{normalized_username});
+                log.warn("Digest auth: failed for user", .{});
                 return null;
             }
             return err;
@@ -275,34 +310,45 @@ pub const AuthBackend = struct {
         defer user.deinit(self.allocator);
 
         if (!user.enabled) {
-            log.warn("Digest auth: user '{s}' is disabled", .{normalized_username});
+            log.warn("Digest auth: user disabled", .{});
             return null;
         }
 
-        // Get the stored HA1 (MD5(username:realm:password)) for Digest auth
+        // Determine algorithm: prefer SHA-256, fall back to MD5
+        const use_sha256 = if (params.algorithm) |algo|
+            std.ascii.eqlIgnoreCase(algo, "SHA-256")
+        else
+            false;
+
+        // Get the stored HA1 for Digest auth
         const ha1 = user.digest_ha1 orelse {
-            // No HA1 stored, cannot verify Digest auth
-            log.warn("Digest auth: no HA1 stored for user '{s}'", .{normalized_username});
+            log.warn("Digest auth: no HA1 stored for user", .{});
             return null;
         };
 
-        log.info("Digest auth: found stored HA1={s}", .{ha1});
+        // Expected response length: 64 for SHA-256, 32 for MD5
+        const expected_len: usize = if (use_sha256) 64 else 32;
 
-        // Compute HA2 = MD5(method:uri)
+        // Compute HA2 = Hash(method:uri)
         var ha2_input_buf: [512]u8 = undefined;
         const ha2_input = std.fmt.bufPrint(&ha2_input_buf, "{s}:{s}", .{ method, params.uri }) catch return null;
 
-        var ha2_hash: [16]u8 = undefined;
-        std.crypto.hash.Md5.hash(ha2_input, &ha2_hash, .{});
-        var ha2_hex: [32]u8 = undefined;
-        bytesToHex(&ha2_hash, &ha2_hex);
+        var ha2_hex: [64]u8 = undefined;
+        if (use_sha256) {
+            var ha2_hash: [32]u8 = undefined;
+            Sha256.hash(ha2_input, &ha2_hash, .{});
+            bytesToHex(&ha2_hash, &ha2_hex);
+        } else {
+            var ha2_hash: [16]u8 = undefined;
+            std.crypto.hash.Md5.hash(ha2_input, &ha2_hash, .{});
+            bytesToHex(&ha2_hash, ha2_hex[0..32]);
+        }
 
         // Compute expected response based on qop
         var expected_response_buf: [1024]u8 = undefined;
         var expected_response: []const u8 = undefined;
 
         if (params.qop) |qop| {
-            // qop=auth: response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
             const nc = params.nc orelse return null;
             const cnonce = params.cnonce orelse return null;
 
@@ -312,42 +358,49 @@ pub const AuthBackend = struct {
                 nc,
                 cnonce,
                 qop,
-                ha2_hex[0..],
+                ha2_hex[0..expected_len],
             }) catch return null;
         } else {
-            // No qop: response = MD5(HA1:nonce:HA2)
             expected_response = std.fmt.bufPrint(&expected_response_buf, "{s}:{s}:{s}", .{
                 ha1,
                 params.nonce,
-                ha2_hex[0..],
+                ha2_hex[0..expected_len],
             }) catch return null;
         }
 
         // Hash the expected response string
-        var expected_hash: [16]u8 = undefined;
-        std.crypto.hash.Md5.hash(expected_response, &expected_hash, .{});
-        var expected_hex: [32]u8 = undefined;
-        bytesToHex(&expected_hash, &expected_hex);
+        var expected_hex: [64]u8 = undefined;
+        if (use_sha256) {
+            var expected_hash: [32]u8 = undefined;
+            Sha256.hash(expected_response, &expected_hash, .{});
+            bytesToHex(&expected_hash, &expected_hex);
+        } else {
+            var expected_hash: [16]u8 = undefined;
+            std.crypto.hash.Md5.hash(expected_response, &expected_hash, .{});
+            bytesToHex(&expected_hash, expected_hex[0..32]);
+        }
 
-        // Compare with client's response (case-insensitive for hex)
-        var client_response_lower: [32]u8 = undefined;
-        if (params.response.len != 32) {
-            log.warn("Digest auth: client response wrong length ({d} vs 32)", .{params.response.len});
+        // SECURITY: Zero the intermediate buffers containing hash material
+        @memset(&ha2_input_buf, 0);
+        @memset(&expected_response_buf, 0);
+
+        // Normalize client response to lowercase
+        var client_response_lower: [64]u8 = undefined;
+        if (params.response.len != expected_len) {
+            log.warn("Digest auth: response wrong length", .{});
             return null;
         }
         for (params.response, 0..) |c, i| {
             client_response_lower[i] = if (c >= 'A' and c <= 'F') c + 32 else c;
         }
 
-        log.info("Digest auth: expected={s}, client={s}", .{ expected_hex, client_response_lower });
-
-        if (!std.mem.eql(u8, &expected_hex, &client_response_lower)) {
-            // Response mismatch - authentication failed
-            log.warn("Digest auth: response mismatch!", .{});
+        // SECURITY: Constant-time comparison to prevent timing attacks
+        if (!constantTimeEql(expected_hex[0..expected_len], client_response_lower[0..expected_len])) {
+            log.warn("Digest auth: failed for user", .{});
             return null;
         }
 
-        log.info("Digest auth: SUCCESS for user {s}", .{normalized_username});
+        log.info("Digest auth: success", .{});
 
         // Mark nonce as used (prevents replay attacks)
         self.nonce_manager.invalidateNonce(params.nonce);
@@ -369,7 +422,11 @@ pub fn decodeBase64Auth(allocator: std.mem.Allocator, encoded: []const u8) !Cred
     const decoded_len = try decoder.calcSizeForSlice(encoded);
 
     const decoded = try allocator.alloc(u8, decoded_len);
-    defer allocator.free(decoded);
+    defer {
+        // SECURITY: Zero decoded credentials before freeing to prevent memory disclosure
+        @memset(decoded, 0);
+        allocator.free(decoded);
+    }
 
     try decoder.decode(decoded, encoded);
 
@@ -394,7 +451,11 @@ pub fn decodeBasicAuthCredentials(allocator: std.mem.Allocator, encoded: []const
     const decoded_len = try decoder.calcSizeForSlice(encoded);
 
     const decoded = try allocator.alloc(u8, decoded_len);
-    defer allocator.free(decoded);
+    defer {
+        // SECURITY: Zero decoded credentials before freeing to prevent memory disclosure
+        @memset(decoded, 0);
+        allocator.free(decoded);
+    }
 
     try decoder.decode(decoded, encoded);
 
@@ -450,6 +511,11 @@ pub fn parseDigestAuthHeader(allocator: std.mem.Allocator, header: []const u8) !
             pos += 1; // Skip opening quote
             const value_start = pos;
             while (pos < header.len and header[pos] != '"') {
+                // Handle escaped quotes (backslash-escaped)
+                if (header[pos] == '\\' and pos + 1 < header.len) {
+                    pos += 2; // Skip escaped character
+                    continue;
+                }
                 pos += 1;
             }
             value = header[value_start..pos];

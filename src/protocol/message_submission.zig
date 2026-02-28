@@ -38,6 +38,11 @@ pub const MessageSubmissionAgent = struct {
         self.allocator.free(self.hostname);
     }
 
+    // Maximum allowed values for message submission
+    const max_message_size: usize = 50 * 1024 * 1024; // 50 MB
+    const max_header_count: usize = 200;
+    const max_header_section_size: usize = 256 * 1024; // 256 KB
+
     /// Process a submitted message according to RFC 6409
     pub fn processSubmission(
         self: *Self,
@@ -45,10 +50,20 @@ pub const MessageSubmissionAgent = struct {
         auth_user: []const u8,
         client_ip: []const u8,
     ) ![]u8 {
+        // SECURITY: Reject oversized messages
+        if (message_data.len > max_message_size) {
+            return error.MessageTooLarge;
+        }
+
         // Parse message into headers and body
         const separator_pos = std.mem.indexOf(u8, message_data, "\r\n\r\n") orelse
             std.mem.indexOf(u8, message_data, "\n\n") orelse
             return error.InvalidMessageFormat;
+
+        // SECURITY: Reject oversized header sections
+        if (separator_pos > max_header_section_size) {
+            return error.HeaderSectionTooLarge;
+        }
 
         const headers_section = message_data[0..separator_pos];
         const body_section = if (separator_pos + 4 <= message_data.len)
@@ -67,6 +82,11 @@ pub const MessageSubmissionAgent = struct {
         }
 
         try self.parseHeaders(headers_section, &headers);
+
+        // SECURITY: Reject messages with too many headers
+        if (headers.items.len > max_header_count) {
+            return error.TooManyHeaders;
+        }
 
         // Apply RFC 6409 modifications
         try self.addRequiredHeaders(&headers, auth_user);
@@ -165,7 +185,8 @@ pub const MessageSubmissionAgent = struct {
     }
 
     /// Format Unix timestamp to RFC 5322 date
-    fn formatTimestamp(self: *Self, timestamp: i64) ![]const u8 {
+    pub fn formatTimestamp(self: *Self, timestamp: i64) ![]const u8 {
+        if (timestamp < 0) return error.InvalidTimestamp;
         const epoch_seconds = @as(u64, @intCast(timestamp));
 
         // Convert to broken-down time
@@ -176,18 +197,34 @@ pub const MessageSubmissionAgent = struct {
         const minutes = (seconds_today % 3600) / 60;
         const seconds = seconds_today % 60;
 
-        // Calculate year, month, day (simplified)
-        const year = 1970 + (days_since_epoch / 365);
-        const day_of_year = days_since_epoch % 365;
-        const month = (day_of_year / 30) + 1;
-        const day = (day_of_year % 30) + 1;
+        // Calculate year, month, day using proper calendar arithmetic
+        var remaining_days = days_since_epoch;
+        var year: u64 = 1970;
+        while (true) {
+            const days_in_year: u64 = if (isLeapYear(year)) 366 else 365;
+            if (remaining_days < days_in_year) break;
+            remaining_days -= days_in_year;
+            year += 1;
+        }
+
+        // Calculate month and day from day-of-year
+        const leap = isLeapYear(year);
+        const days_in_months = [_]u16{ 31, if (leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+        var month: u16 = 0;
+        var day_remaining = @as(u16, @intCast(remaining_days));
+        for (days_in_months) |dim| {
+            if (day_remaining < dim) break;
+            day_remaining -= dim;
+            month += 1;
+        }
+        const day = day_remaining + 1;
 
         const day_names = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
         const month_names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 
         const day_of_week = (days_since_epoch + 4) % 7; // Jan 1, 1970 was Thursday
         const day_name = day_names[day_of_week];
-        const month_name = month_names[@min(month - 1, 11)];
+        const month_name = month_names[month];
 
         // Format: Mon, 24 Oct 2025 10:00:00 +0000
         return try std.fmt.allocPrint(
@@ -195,6 +232,10 @@ pub const MessageSubmissionAgent = struct {
             "{s}, {d} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} +0000",
             .{ day_name, day, month_name, year, hours, minutes, seconds },
         );
+    }
+
+    pub fn isLeapYear(year: u64) bool {
+        return (year % 4 == 0) and ((year % 100 != 0) or (year % 400 == 0));
     }
 
     /// Generate unique ID for Received header
@@ -268,7 +309,11 @@ pub const MessageSubmissionAgent = struct {
 
     fn parseHeaders(self: *Self, headers_section: []const u8, headers: *std.ArrayList(Header)) !void {
         var lines = std.mem.split(u8, headers_section, "\n");
-        var current_header: ?Header = null;
+        var current_name: ?[]u8 = null;
+        // Use ArrayList to accumulate header value — avoids O(n²) from
+        // repeated allocPrint on continuation lines
+        var value_buf: std.ArrayList(u8) = .{};
+        defer value_buf.deinit(self.allocator);
 
         while (lines.next()) |line| {
             const trimmed = std.mem.trimEnd(u8, line, "\r");
@@ -277,44 +322,37 @@ pub const MessageSubmissionAgent = struct {
 
             // Check if continuation line (starts with whitespace)
             if (trimmed[0] == ' ' or trimmed[0] == '\t') {
-                if (current_header) |*header| {
-                    // Append to current header value
-                    const new_value = try std.fmt.allocPrint(
-                        self.allocator,
-                        "{s} {s}",
-                        .{ header.value, std.mem.trim(u8, trimmed, " \t") },
-                    );
-                    self.allocator.free(header.value);
-                    header.value = new_value;
+                if (current_name != null) {
+                    try value_buf.append(self.allocator, ' ');
+                    try value_buf.appendSlice(self.allocator, std.mem.trim(u8, trimmed, " \t"));
                 }
                 continue;
             }
 
             // Save previous header
-            if (current_header) |header| {
-                try headers.append(header);
+            if (current_name) |name| {
+                const value = try self.allocator.dupe(u8, value_buf.items);
+                try headers.append(.{ .name = name, .value = value });
+                current_name = null;
             }
 
             // Parse new header
             if (std.mem.indexOf(u8, trimmed, ":")) |colon_pos| {
-                const name = try self.allocator.dupe(u8, trimmed[0..colon_pos]);
+                current_name = try self.allocator.dupe(u8, trimmed[0..colon_pos]);
                 const value_start = colon_pos + 1;
                 const value_raw = if (value_start < trimmed.len)
                     trimmed[value_start..]
                 else
                     "";
-                const value = try self.allocator.dupe(u8, std.mem.trim(u8, value_raw, " \t"));
-
-                current_header = Header{
-                    .name = name,
-                    .value = value,
-                };
+                value_buf.clearRetainingCapacity();
+                try value_buf.appendSlice(self.allocator, std.mem.trim(u8, value_raw, " \t"));
             }
         }
 
         // Save last header
-        if (current_header) |header| {
-            try headers.append(header);
+        if (current_name) |name| {
+            const value = try self.allocator.dupe(u8, value_buf.items);
+            try headers.append(.{ .name = name, .value = value });
         }
     }
 

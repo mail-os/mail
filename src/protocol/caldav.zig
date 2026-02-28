@@ -113,6 +113,11 @@ pub const ParsedPath = struct {
 ///   /calendars/{user}/{calendar}/{uid}.ics
 ///   /addressbooks/{user}/{addressbook}/{uid}.vcf
 pub fn parsePath(path: []const u8) ParsedPath {
+    // SECURITY: Reject path traversal attempts
+    if (std.mem.indexOf(u8, path, "..") != null) {
+        return .{ .path_type = .unknown };
+    }
+
     // Handle well-known paths
     if (std.mem.startsWith(u8, path, "/.well-known/caldav")) {
         return .{ .path_type = .well_known_caldav };
@@ -184,6 +189,44 @@ fn appendPrint(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime f
     try buf.appendSlice(allocator, formatted);
 }
 
+/// XML-escape a string to prevent injection.
+/// Escapes &, <, >, ", and ' characters.
+fn xmlEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    // Quick check — if no special chars, return a copy
+    var needs_escape = false;
+    for (input) |c| {
+        if (c == '&' or c == '<' or c == '>' or c == '"' or c == '\'') {
+            needs_escape = true;
+            break;
+        }
+    }
+    if (!needs_escape) return try allocator.dupe(u8, input);
+
+    var result: std.ArrayList(u8) = .{};
+    errdefer result.deinit(allocator);
+
+    for (input) |c| {
+        switch (c) {
+            '&' => try result.appendSlice(allocator, "&amp;"),
+            '<' => try result.appendSlice(allocator, "&lt;"),
+            '>' => try result.appendSlice(allocator, "&gt;"),
+            '"' => try result.appendSlice(allocator, "&quot;"),
+            '\'' => try result.appendSlice(allocator, "&apos;"),
+            else => try result.append(allocator, c),
+        }
+    }
+    return try result.toOwnedSlice(allocator);
+}
+
+/// Append XML with escaped user data. fmt must have exactly one {s} placeholder.
+fn appendXmlEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime prefix: []const u8, value: []const u8, comptime suffix: []const u8) !void {
+    const escaped = try xmlEscape(allocator, value);
+    defer allocator.free(escaped);
+    try buf.appendSlice(allocator, prefix);
+    try buf.appendSlice(allocator, escaped);
+    try buf.appendSlice(allocator, suffix);
+}
+
 // ============================================================================
 // CalDAV/CardDAV Session
 // ============================================================================
@@ -244,7 +287,13 @@ pub const CalDavSession = struct {
                     }
                 }
 
-                if (content_length > 0 and content_length > body_received and content_length <= config.max_resource_size) {
+                // SECURITY: Reject requests with bodies exceeding max_resource_size
+                if (content_length > config.max_resource_size) {
+                    try self.sendError(413, "Request Entity Too Large");
+                    return true;
+                }
+
+                if (content_length > 0 and content_length > body_received) {
                     // Need to read more body data
                     const total_size = body_start + content_length;
                     var full_buf = try self.allocator.alloc(u8, total_size);
@@ -474,7 +523,7 @@ pub const CalDavSession = struct {
                     try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                     try buf.appendSlice(self.allocator, "      <D:prop>\n");
                     try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\n");
-                    try appendPrint(&buf, self.allocator, "        <D:displayname>{s}</D:displayname>\n", .{cal.name});
+                    try appendXmlEscaped(&buf, self.allocator, "        <D:displayname>", cal.name, "</D:displayname>\n");
                     try appendPrint(&buf, self.allocator, "        <CS:getctag xmlns:CS=\"http://calendarserver.org/ns/\">{s}</CS:getctag>\n", .{cal.ctag});
                     try appendPrint(&buf, self.allocator, "        <D:sync-token>http://mail/sync/{d}</D:sync-token>\n", .{cal.sync_token});
                     try buf.appendSlice(self.allocator, "      </D:prop>\n");
@@ -497,7 +546,7 @@ pub const CalDavSession = struct {
                 try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                 try buf.appendSlice(self.allocator, "      <D:prop>\n");
                 try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\n");
-                try appendPrint(&buf, self.allocator, "        <D:displayname>{s}</D:displayname>\n", .{collection_name});
+                try appendXmlEscaped(&buf, self.allocator, "        <D:displayname>", collection_name, "</D:displayname>\n");
                 try buf.appendSlice(self.allocator, "        <C:supported-calendar-component-set><C:comp name=\"VEVENT\"/><C:comp name=\"VTODO\"/></C:supported-calendar-component-set>\n");
                 try buf.appendSlice(self.allocator, "      </D:prop>\n");
                 try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
@@ -538,7 +587,7 @@ pub const CalDavSession = struct {
                     try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                     try buf.appendSlice(self.allocator, "      <D:prop>\n");
                     try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>\n");
-                    try appendPrint(&buf, self.allocator, "        <D:displayname>{s}</D:displayname>\n", .{ab.name});
+                    try appendXmlEscaped(&buf, self.allocator, "        <D:displayname>", ab.name, "</D:displayname>\n");
                     try appendPrint(&buf, self.allocator, "        <CS:getctag xmlns:CS=\"http://calendarserver.org/ns/\">{s}</CS:getctag>\n", .{ab.ctag});
                     try appendPrint(&buf, self.allocator, "        <D:sync-token>http://mail/sync/{d}</D:sync-token>\n", .{ab.sync_token});
                     try buf.appendSlice(self.allocator, "        <CARD:supported-address-data><CARD:address-data-type content-type=\"text/vcard\" version=\"3.0\"/></CARD:supported-address-data>\n");
@@ -562,7 +611,7 @@ pub const CalDavSession = struct {
                 try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                 try buf.appendSlice(self.allocator, "      <D:prop>\n");
                 try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>\n");
-                try appendPrint(&buf, self.allocator, "        <D:displayname>{s}</D:displayname>\n", .{collection_name});
+                try appendXmlEscaped(&buf, self.allocator, "        <D:displayname>", collection_name, "</D:displayname>\n");
                 try buf.appendSlice(self.allocator, "        <CARD:supported-address-data><CARD:address-data-type content-type=\"text/vcard\" version=\"3.0\"/></CARD:supported-address-data>\n");
                 try buf.appendSlice(self.allocator, "      </D:prop>\n");
                 try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
@@ -1541,7 +1590,7 @@ pub const CalDavSession = struct {
         const writer = fbs.writer();
         try writer.print(
             "HTTP/1.1 401 Unauthorized\r\n" ++
-                "WWW-Authenticate: Digest realm=\"CalDAV/CardDAV Server\", nonce=\"{s}\", qop=\"auth\", algorithm=MD5\r\n" ++
+                "WWW-Authenticate: Digest realm=\"CalDAV/CardDAV Server\", nonce=\"{s}\", qop=\"auth\", algorithm=SHA-256\r\n" ++
                 "WWW-Authenticate: Basic realm=\"CalDAV/CardDAV Server\"\r\n" ++
                 "Content-Length: 0\r\n\r\n",
             .{nonce},
@@ -1903,7 +1952,7 @@ const TlsCalDavSession = struct {
         const writer = fbs.writer();
         try writer.print(
             "HTTP/1.1 401 Unauthorized\r\n" ++
-                "WWW-Authenticate: Digest realm=\"CalDAV/CardDAV Server\", nonce=\"{s}\", qop=\"auth\", algorithm=MD5\r\n" ++
+                "WWW-Authenticate: Digest realm=\"CalDAV/CardDAV Server\", nonce=\"{s}\", qop=\"auth\", algorithm=SHA-256\r\n" ++
                 "WWW-Authenticate: Basic realm=\"CalDAV/CardDAV Server\"\r\n" ++
                 "Content-Length: 0\r\n\r\n",
             .{nonce},

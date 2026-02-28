@@ -297,7 +297,7 @@ pub fn generateThunderbirdXML(
         try buf.print(allocator, "      <hostname>{s}</hostname>\n", .{config.hostname});
         try buf.print(allocator, "      <port>{d}</port>\n", .{config.imaps_port});
         try buf.appendSlice(allocator, "      <socketType>SSL</socketType>\n");
-        try buf.appendSlice(allocator, "      <authentication>password-cleartext</authentication>\n");
+        try buf.appendSlice(allocator, "      <authentication>password-encrypted</authentication>\n");
         try buf.appendSlice(allocator, "      <username>%EMAILADDRESS%</username>\n");
         try buf.appendSlice(allocator, "    </incomingServer>\n");
 
@@ -306,7 +306,7 @@ pub fn generateThunderbirdXML(
         try buf.print(allocator, "      <hostname>{s}</hostname>\n", .{config.hostname});
         try buf.print(allocator, "      <port>{d}</port>\n", .{config.imap_port});
         try buf.appendSlice(allocator, "      <socketType>STARTTLS</socketType>\n");
-        try buf.appendSlice(allocator, "      <authentication>password-cleartext</authentication>\n");
+        try buf.appendSlice(allocator, "      <authentication>password-encrypted</authentication>\n");
         try buf.appendSlice(allocator, "      <username>%EMAILADDRESS%</username>\n");
         try buf.appendSlice(allocator, "    </incomingServer>\n");
     }
@@ -317,7 +317,7 @@ pub fn generateThunderbirdXML(
         try buf.print(allocator, "      <hostname>{s}</hostname>\n", .{config.hostname});
         try buf.print(allocator, "      <port>{d}</port>\n", .{config.pop3_port});
         try buf.appendSlice(allocator, "      <socketType>SSL</socketType>\n");
-        try buf.appendSlice(allocator, "      <authentication>password-cleartext</authentication>\n");
+        try buf.appendSlice(allocator, "      <authentication>password-encrypted</authentication>\n");
         try buf.appendSlice(allocator, "      <username>%EMAILADDRESS%</username>\n");
         try buf.appendSlice(allocator, "    </incomingServer>\n");
     }
@@ -327,7 +327,7 @@ pub fn generateThunderbirdXML(
     try buf.print(allocator, "      <hostname>{s}</hostname>\n", .{config.hostname});
     try buf.print(allocator, "      <port>{d}</port>\n", .{config.smtp_port});
     try buf.appendSlice(allocator, "      <socketType>STARTTLS</socketType>\n");
-    try buf.appendSlice(allocator, "      <authentication>password-cleartext</authentication>\n");
+    try buf.appendSlice(allocator, "      <authentication>password-encrypted</authentication>\n");
     try buf.appendSlice(allocator, "      <username>%EMAILADDRESS%</username>\n");
     try buf.appendSlice(allocator, "    </outgoingServer>\n");
 
@@ -959,7 +959,7 @@ test "Thunderbird XML generation - valid structure and ports" {
     try std.testing.expect(std.mem.indexOf(u8, xml, "<hostname>mail.example.com</hostname>") != null);
 
     // Verify authentication and username placeholder
-    try std.testing.expect(std.mem.indexOf(u8, xml, "<authentication>password-cleartext</authentication>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<authentication>password-encrypted</authentication>") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "<username>%EMAILADDRESS%</username>") != null);
 
     // POP3 should NOT be present when disabled

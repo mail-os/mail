@@ -187,7 +187,7 @@ pub const Greylist = struct {
                 // Delay has passed - allow and update
                 var updated_entry = entry;
                 updated_entry.allowed = true;
-                updated_entry.retry_count += 1;
+                updated_entry.retry_count +|= 1;
                 updated_entry.last_seen = now;
                 try self.updateEntry(key, updated_entry, now);
                 return true;
@@ -195,7 +195,7 @@ pub const Greylist = struct {
 
             // Still within initial delay - reject but update retry count
             var updated_entry = entry;
-            updated_entry.retry_count += 1;
+            updated_entry.retry_count +|= 1;
             updated_entry.last_seen = now;
             try self.updateEntry(key, updated_entry, now);
             return false;

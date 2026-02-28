@@ -301,15 +301,48 @@ pub const TenantsAPI = struct {
         _ = try stream.write(response);
     }
 
-    /// Send error response
+    /// Send error response (JSON-escapes the message to prevent injection)
     fn sendError(self: *TenantsAPI, stream: std.net.Stream, status: u16, message: []const u8) !void {
+        const escaped = try escapeJsonStr(self.allocator, message);
+        defer self.allocator.free(escaped);
+
         const json = try std.fmt.allocPrint(
             self.allocator,
             "{{\"error\":\"{s}\"}}",
-            .{message},
+            .{escaped},
         );
         defer self.allocator.free(json);
 
         try self.sendJSON(stream, status, json);
+    }
+
+    fn escapeJsonStr(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+        var needs_escape = false;
+        for (s) |c| {
+            if (c == '"' or c == '\\' or c < 0x20) { needs_escape = true; break; }
+        }
+        if (!needs_escape) return try allocator.dupe(u8, s);
+        var result: std.ArrayList(u8) = .{};
+        errdefer result.deinit(allocator);
+        for (s) |c| {
+            switch (c) {
+                '"' => try result.appendSlice(allocator, "\\\""),
+                '\\' => try result.appendSlice(allocator, "\\\\"),
+                '\n' => try result.appendSlice(allocator, "\\n"),
+                '\r' => try result.appendSlice(allocator, "\\r"),
+                '\t' => try result.appendSlice(allocator, "\\t"),
+                else => {
+                    if (c < 0x20) {
+                        const hex = "0123456789abcdef";
+                        try result.appendSlice(allocator, "\\u00");
+                        try result.append(allocator, hex[c >> 4]);
+                        try result.append(allocator, hex[c & 0x0f]);
+                    } else {
+                        try result.append(allocator, c);
+                    }
+                },
+            }
+        }
+        return try result.toOwnedSlice(allocator);
     }
 };

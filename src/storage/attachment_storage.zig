@@ -1,6 +1,7 @@
 const std = @import("std");
 const io_compat = @import("../core/io_compat.zig");
 const mutex_compat = @import("../core/mutex_compat.zig");
+const path_sanitizer = @import("../core/path_sanitizer.zig");
 const fs = std.fs;
 const crypto = std.crypto;
 const posix = std.posix;
@@ -202,8 +203,16 @@ pub const AttachmentStorage = struct {
             return StorageError.FileTooLarge;
         }
 
-        // Validate filename
+        // Validate and sanitize filename (prevents path traversal)
         if (filename.len == 0 or filename.len > 255) {
+            return StorageError.InvalidFilename;
+        }
+        // SECURITY: Reject filenames with path traversal or directory separators
+        if (std.mem.indexOf(u8, filename, "..") != null or
+            std.mem.indexOf(u8, filename, "/") != null or
+            std.mem.indexOf(u8, filename, "\\") != null or
+            std.mem.indexOf(u8, filename, "\x00") != null)
+        {
             return StorageError.InvalidFilename;
         }
 

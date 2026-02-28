@@ -163,6 +163,7 @@ pub fn build(b: *std.Build) void {
         "tests/milter_test.zig",
         "tests/rfc6352_carddav_test.zig",
         "tests/imap_notes_test.zig",
+        "tests/security_hardening_test.zig",
     };
 
     for (test_files) |test_file| {

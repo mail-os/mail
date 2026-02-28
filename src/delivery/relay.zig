@@ -2,13 +2,16 @@ const std = @import("std");
 const posix = std.posix;
 const time_compat = @import("../core/time_compat.zig");
 
-/// SMTP relay client for forwarding messages to other servers
+/// SMTP relay client for forwarding messages to other servers.
+/// Supports connection reuse — keeps the TCP connection open and uses RSET
+/// between messages to avoid per-message TCP handshake overhead.
 pub const SMTPRelay = struct {
     allocator: std.mem.Allocator,
     host: []const u8,
     port: u16,
     timeout_ms: u32,
     our_hostname: []const u8,
+    cached_fd: ?posix.socket_t = null,
 
     pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16, our_hostname: []const u8) !SMTPRelay {
         return .{
@@ -21,8 +24,82 @@ pub const SMTPRelay = struct {
     }
 
     pub fn deinit(self: *SMTPRelay) void {
+        self.closeConnection();
         self.allocator.free(self.host);
         self.allocator.free(self.our_hostname);
+    }
+
+    fn closeConnection(self: *SMTPRelay) void {
+        if (self.cached_fd) |fd| {
+            _ = fdWrite(fd, "QUIT\r\n") catch {};
+            posix.close(fd);
+            self.cached_fd = null;
+        }
+    }
+
+    /// Establish (or reuse) connection and perform EHLO handshake
+    fn ensureConnection(self: *SMTPRelay) !posix.socket_t {
+        // Try reusing cached connection with RSET
+        if (self.cached_fd) |fd| {
+            var buf: [1024]u8 = undefined;
+            _ = fdWrite(fd, "RSET\r\n") catch {
+                self.cached_fd = null;
+                posix.close(fd);
+                return self.newConnection();
+            };
+            const rset_resp = readResponse(fd, &buf) catch {
+                self.cached_fd = null;
+                posix.close(fd);
+                return self.newConnection();
+            };
+            if (std.mem.startsWith(u8, rset_resp, "250")) {
+                return fd;
+            }
+            // RSET failed — reconnect
+            posix.close(fd);
+            self.cached_fd = null;
+        }
+        return self.newConnection();
+    }
+
+    fn newConnection(self: *SMTPRelay) !posix.socket_t {
+        const ip = parseIpv4(self.host) orelse return error.InvalidAddress;
+
+        const raw_fd = std.c.socket(@intCast(@as(u32, posix.AF.INET)), @intCast(@as(u32, posix.SOCK.STREAM)), 0);
+        if (raw_fd < 0) return error.SocketCreateFailed;
+        const fd: posix.socket_t = @intCast(raw_fd);
+        errdefer posix.close(fd);
+
+        const sockaddr = posix.sockaddr.in{
+            .family = posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, self.port),
+            .addr = std.mem.bytesToValue(u32, &ip),
+        };
+
+        if (std.c.connect(fd, @ptrCast(&sockaddr), @sizeOf(posix.sockaddr.in)) < 0) {
+            return error.ConnectFailed;
+        }
+
+        var buf: [1024]u8 = undefined;
+
+        // Read greeting
+        const greeting = try readResponse(fd, &buf);
+        if (!std.mem.startsWith(u8, greeting, "220")) {
+            return error.InvalidGreeting;
+        }
+
+        // EHLO
+        const ehlo_cmd = try std.fmt.allocPrint(self.allocator, "EHLO {s}\r\n", .{self.our_hostname});
+        defer self.allocator.free(ehlo_cmd);
+        _ = try fdWrite(fd, ehlo_cmd);
+
+        const ehlo_response = try readResponse(fd, &buf);
+        if (!std.mem.startsWith(u8, ehlo_response, "250")) {
+            return error.EhloFailed;
+        }
+
+        self.cached_fd = fd;
+        return fd;
     }
 
     /// Send a message via SMTP relay
@@ -36,53 +113,21 @@ pub const SMTPRelay = struct {
         to: []const u8,
         data: []const u8,
     ) !void {
-        // === Outbound security checks (configured via environment) ===
-        // MTA-STS: Check if recipient domain enforces TLS via MTA-STS policy.
-        // If policy mode is "enforce", TLS is mandatory for this connection.
-        // DANE: Look up TLSA records for the destination MX. After TLS handshake,
-        // verify the server certificate matches the TLSA record.
-        // TLS-RPT: Record the outcome of TLS negotiation (success or failure type)
-        // for aggregate reporting per RFC 8460.
-
-        // Parse IP address
-        const ip = parseIpv4(self.host) orelse return error.InvalidAddress;
-
-        // Create socket
-        const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
-        defer posix.close(fd);
-
-        // Connect
-        const sockaddr = posix.sockaddr.in{
-            .family = posix.AF.INET,
-            .port = std.mem.nativeToBig(u16, self.port),
-            .addr = std.mem.bytesToValue(u32, &ip),
-        };
-        try posix.connect(fd, @ptrCast(&sockaddr), @sizeOf(posix.sockaddr.in));
+        const fd = try self.ensureConnection();
+        errdefer {
+            // On error, discard the connection
+            posix.close(fd);
+            self.cached_fd = null;
+        }
 
         var buf: [1024]u8 = undefined;
-
-        // Read greeting
-        const greeting = try self.readResponse(fd, &buf);
-        if (!std.mem.startsWith(u8, greeting, "220")) {
-            return error.InvalidGreeting;
-        }
-
-        // EHLO
-        const ehlo_cmd = try std.fmt.allocPrint(self.allocator, "EHLO {s}\r\n", .{self.our_hostname});
-        defer self.allocator.free(ehlo_cmd);
-        _ = try posix.write(fd, ehlo_cmd);
-
-        const ehlo_response = try self.readResponse(fd, &buf);
-        if (!std.mem.startsWith(u8, ehlo_response, "250")) {
-            return error.EhloFailed;
-        }
 
         // MAIL FROM
         const mail_cmd = try std.fmt.allocPrint(self.allocator, "MAIL FROM:<{s}>\r\n", .{from});
         defer self.allocator.free(mail_cmd);
-        _ = try posix.write(fd, mail_cmd);
+        _ = try fdWrite(fd, mail_cmd);
 
-        const mail_response = try self.readResponse(fd, &buf);
+        const mail_response = try readResponse(fd, &buf);
         if (!std.mem.startsWith(u8, mail_response, "250")) {
             return error.MailFromFailed;
         }
@@ -90,43 +135,30 @@ pub const SMTPRelay = struct {
         // RCPT TO
         const rcpt_cmd = try std.fmt.allocPrint(self.allocator, "RCPT TO:<{s}>\r\n", .{to});
         defer self.allocator.free(rcpt_cmd);
-        _ = try posix.write(fd, rcpt_cmd);
+        _ = try fdWrite(fd, rcpt_cmd);
 
-        const rcpt_response = try self.readResponse(fd, &buf);
+        const rcpt_response = try readResponse(fd, &buf);
         if (!std.mem.startsWith(u8, rcpt_response, "250")) {
             return error.RcptToFailed;
         }
 
         // DATA
-        _ = try posix.write(fd, "DATA\r\n");
-        const data_response = try self.readResponse(fd, &buf);
+        _ = try fdWrite(fd, "DATA\r\n");
+        const data_response = try readResponse(fd, &buf);
         if (!std.mem.startsWith(u8, data_response, "354")) {
             return error.DataFailed;
         }
 
         // Send message data
-        _ = try posix.write(fd, data);
+        _ = try fdWrite(fd, data);
         if (!std.mem.endsWith(u8, data, "\r\n.\r\n")) {
-            _ = try posix.write(fd, "\r\n.\r\n");
+            _ = try fdWrite(fd, "\r\n.\r\n");
         }
 
-        const send_response = try self.readResponse(fd, &buf);
+        const send_response = try readResponse(fd, &buf);
         if (!std.mem.startsWith(u8, send_response, "250")) {
             return error.MessageSendFailed;
         }
-
-        // QUIT
-        _ = try posix.write(fd, "QUIT\r\n");
-        _ = try self.readResponse(fd, &buf);
-    }
-
-    fn readResponse(self: *SMTPRelay, fd: posix.socket_t, buf: []u8) ![]const u8 {
-        _ = self;
-        const bytes_read = try posix.read(fd, buf);
-        if (bytes_read == 0) {
-            return error.ConnectionClosed;
-        }
-        return buf[0..bytes_read];
     }
 
     fn parseIpv4(s: []const u8) ?[4]u8 {
@@ -156,6 +188,25 @@ pub const SMTPRelay = struct {
         return result;
     }
 };
+
+// I/O helpers — posix.write/read were removed in Zig 0.16-dev
+fn fdWrite(fd: posix.socket_t, data: []const u8) !usize {
+    var written: usize = 0;
+    while (written < data.len) {
+        const rc = std.c.write(fd, data.ptr + written, data.len - written);
+        if (rc < 0) return error.WriteFailed;
+        if (rc == 0) return error.WriteFailed;
+        written += @intCast(rc);
+    }
+    return written;
+}
+
+fn readResponse(fd: posix.socket_t, buf: []u8) ![]const u8 {
+    const rc = std.c.read(fd, buf.ptr, buf.len);
+    if (rc < 0) return error.ReadFailed;
+    if (rc == 0) return error.ConnectionClosed;
+    return buf[0..@intCast(rc)];
+}
 
 /// Relay worker that processes queue messages
 pub const RelayWorker = struct {

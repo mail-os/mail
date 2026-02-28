@@ -139,7 +139,7 @@ pub const RateLimiter = struct {
                     try self.addToBucket(bucket_key, ip);
                 }
                 try self.ip_counters.put(ip, RateCounter{
-                    .count = counter.count + 1,
+                    .count = counter.count +| 1,
                     .window_start = counter.window_start,
                     .last_request = now,
                     .bucket_key = bucket_key,
@@ -208,7 +208,7 @@ pub const RateLimiter = struct {
                     try self.addToBucket(bucket_key, user);
                 }
                 try self.user_counters.put(user, RateCounter{
-                    .count = counter.count + 1,
+                    .count = counter.count +| 1,
                     .window_start = counter.window_start,
                     .last_request = now,
                     .bucket_key = bucket_key,
@@ -340,10 +340,18 @@ pub const RateLimiter = struct {
 };
 
 pub fn validateEmailAddress(email: []const u8) bool {
-    // Basic email validation
+    // RFC 5321 / RFC 5322 email validation
     if (email.len == 0 or email.len > 254) return false;
 
+    // SECURITY: Reject null bytes and control characters
+    for (email) |c| {
+        if (c < 32 or c == 127 or c == 0) return false;
+    }
+
     const at_pos = std.mem.indexOf(u8, email, "@") orelse return false;
+
+    // Reject multiple @ signs
+    if (std.mem.lastIndexOf(u8, email, "@") != at_pos) return false;
 
     if (at_pos == 0 or at_pos == email.len - 1) return false;
 
@@ -353,8 +361,31 @@ pub fn validateEmailAddress(email: []const u8) bool {
     if (local_part.len == 0 or local_part.len > 64) return false;
     if (domain_part.len == 0 or domain_part.len > 255) return false;
 
-    // Check for valid domain (must have at least one dot)
+    // Reject leading/trailing dots in local part
+    if (local_part[0] == '.' or local_part[local_part.len - 1] == '.') return false;
+
+    // Reject consecutive dots in local part
+    if (std.mem.indexOf(u8, local_part, "..") != null) return false;
+
+    // Domain validation
+    // Must have at least one dot
     if (std.mem.indexOf(u8, domain_part, ".") == null) return false;
+
+    // Reject leading/trailing dots and hyphens in domain
+    if (domain_part[0] == '.' or domain_part[domain_part.len - 1] == '.') return false;
+    if (domain_part[0] == '-' or domain_part[domain_part.len - 1] == '-') return false;
+
+    // Reject consecutive dots in domain
+    if (std.mem.indexOf(u8, domain_part, "..") != null) return false;
+
+    // Validate domain characters (letters, digits, hyphens, dots)
+    for (domain_part) |c| {
+        const valid = (c >= 'a' and c <= 'z') or
+            (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or
+            c == '.' or c == '-';
+        if (!valid) return false;
+    }
 
     return true;
 }

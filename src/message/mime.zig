@@ -149,13 +149,11 @@ pub const MultipartParser = struct {
     pub fn parse(self: *MultipartParser, body: []const u8, boundary: []const u8) ![]MimePart {
         // Validate MIME depth
         if (self.current_depth >= self.max_depth) {
-            std.log.err("MIME depth limit exceeded: {d} (max: {d})", .{ self.current_depth, self.max_depth });
             return error.MimeDepthExceeded;
         }
 
         // Validate boundary length per RFC 2046
         if (boundary.len > MAX_BOUNDARY_LENGTH) {
-            std.log.err("MIME boundary too long: {d} bytes (max: {d})", .{ boundary.len, MAX_BOUNDARY_LENGTH });
             return error.BoundaryTooLong;
         }
 
@@ -166,7 +164,6 @@ pub const MultipartParser = struct {
                 c == ',' or c == '-' or c == '.' or c == '/' or c == ':' or
                 c == '=' or c == '?';
             if (!is_valid) {
-                std.log.err("Invalid character in MIME boundary: 0x{x}", .{c});
                 return error.InvalidBoundary;
             }
         }
@@ -174,19 +171,21 @@ pub const MultipartParser = struct {
         self.current_depth += 1;
         defer self.current_depth -= 1;
 
-        var parts = std.ArrayList(MimePart).init(self.allocator);
+        var parts: std.ArrayList(MimePart) = .{};
         errdefer {
             for (parts.items) |*part| {
                 part.deinit();
             }
-            parts.deinit();
+            parts.deinit(self.allocator);
         }
 
-        // Boundary markers
-        var boundary_start = try std.fmt.allocPrint(self.allocator, "--{s}", .{boundary});
-        defer self.allocator.free(boundary_start);
-        var boundary_end = try std.fmt.allocPrint(self.allocator, "--{s}--", .{boundary});
-        defer self.allocator.free(boundary_end);
+        // Boundary start marker — stack buffer (RFC 2046: max 70 char boundary)
+        var start_buf: [74]u8 = undefined;
+        if (boundary.len > 70) return error.InvalidBoundary;
+        start_buf[0] = '-';
+        start_buf[1] = '-';
+        @memcpy(start_buf[2 .. 2 + boundary.len], boundary);
+        const boundary_start = start_buf[0 .. 2 + boundary.len];
 
         var pos: usize = 0;
         while (pos < body.len) {
@@ -227,12 +226,12 @@ pub const MultipartParser = struct {
                 }
             }
 
-            try parts.append(part);
+            try parts.append(self.allocator, part);
 
             pos += next_boundary;
         }
 
-        return try parts.toOwnedSlice();
+        return try parts.toOwnedSlice(self.allocator);
     }
 
     fn parsePart(self: *MultipartParser, data: []const u8) !MimePart {
@@ -247,8 +246,8 @@ pub const MultipartParser = struct {
         // Parse headers
         var lines = std.mem.splitSequence(u8, headers_data, "\r\n");
         var current_header: ?[]const u8 = null;
-        var current_value = std.ArrayList(u8).init(self.allocator);
-        defer current_value.deinit();
+        var current_value: std.ArrayList(u8) = .{};
+        defer current_value.deinit(self.allocator);
 
         while (lines.next()) |line| {
             if (line.len == 0) continue;
@@ -256,8 +255,8 @@ pub const MultipartParser = struct {
             // Check for continuation line
             if (line[0] == ' ' or line[0] == '\t') {
                 if (current_header != null) {
-                    try current_value.appendSlice(" ");
-                    try current_value.appendSlice(std.mem.trim(u8, line, " \t"));
+                    try current_value.appendSlice(self.allocator, " ");
+                    try current_value.appendSlice(self.allocator, std.mem.trim(u8, line, " \t"));
                 }
                 continue;
             }
@@ -275,7 +274,7 @@ pub const MultipartParser = struct {
                 const header_value = std.mem.trim(u8, line[colon_pos + 1 ..], " \t");
 
                 current_header = try self.allocator.dupe(u8, header_name);
-                try current_value.appendSlice(header_value);
+                try current_value.appendSlice(self.allocator, header_value);
             }
         }
 
@@ -302,7 +301,6 @@ pub const MultipartParser = struct {
 
     /// Free parsed parts
     pub fn freeParts(self: *MultipartParser, parts: []MimePart) void {
-        _ = self;
         for (parts) |*part| {
             part.deinit();
         }

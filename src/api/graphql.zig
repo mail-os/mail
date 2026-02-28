@@ -410,12 +410,27 @@ pub const GraphQLExecutor = struct {
     }
 
     fn formatError(self: *GraphQLExecutor, comptime fmt: []const u8, args: anytype) ![]u8 {
-        var result = std.ArrayList(u8).init(self.allocator);
-        const writer = result.writer();
-        try writer.writeAll("{\"errors\":[{\"message\":\"");
-        try writer.print(fmt, args);
-        try writer.writeAll("\"}]}");
-        return result.toOwnedSlice();
+        // First format the raw message, then JSON-escape it
+        var msg_buf: std.ArrayList(u8) = .{};
+        defer msg_buf.deinit(self.allocator);
+        try msg_buf.writer(self.allocator).print(fmt, args);
+
+        var result: std.ArrayList(u8) = .{};
+        errdefer result.deinit(self.allocator);
+        try result.appendSlice(self.allocator, "{\"errors\":[{\"message\":\"");
+        // Escape JSON special characters in the message
+        for (msg_buf.items) |c| {
+            switch (c) {
+                '"' => try result.appendSlice(self.allocator, "\\\""),
+                '\\' => try result.appendSlice(self.allocator, "\\\\"),
+                '\n' => try result.appendSlice(self.allocator, "\\n"),
+                '\r' => try result.appendSlice(self.allocator, "\\r"),
+                '\t' => try result.appendSlice(self.allocator, "\\t"),
+                else => try result.append(self.allocator, c),
+            }
+        }
+        try result.appendSlice(self.allocator, "\"}]}");
+        return try result.toOwnedSlice(self.allocator);
     }
 };
 

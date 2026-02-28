@@ -25,18 +25,23 @@ pub fn sendWebhook(allocator: std.mem.Allocator, cfg: WebhookConfig, payload: We
 
     const url = cfg.url.?;
 
-    // Build JSON payload
+    // Build JSON payload (escape user-supplied strings to prevent injection)
+    const escaped_from = try escapeJsonString(allocator, payload.from);
+    defer allocator.free(escaped_from);
+    const escaped_addr = try escapeJsonString(allocator, payload.remote_addr);
+    defer allocator.free(escaped_addr);
+
     const recipients_json = try formatRecipients(allocator, payload.recipients);
     defer allocator.free(recipients_json);
 
     const json_body = try std.fmt.allocPrint(allocator,
         \\{{"from":"{s}","recipients":[{s}],"size":{d},"timestamp":{d},"remote_addr":"{s}"}}
     , .{
-        payload.from,
+        escaped_from,
         recipients_json,
         payload.size,
         payload.timestamp,
-        payload.remote_addr,
+        escaped_addr,
     });
     defer allocator.free(json_body);
 
@@ -67,6 +72,12 @@ pub fn sendWebhook(allocator: std.mem.Allocator, cfg: WebhookConfig, payload: We
         log.warn("Could not parse webhook host IP: {s}", .{host_str});
         return;
     };
+
+    // Reject private/loopback IPs to prevent SSRF
+    if (isPrivateIp(ip)) {
+        log.warn("Webhook target resolves to private/loopback IP — rejected: {s}", .{host_str});
+        return;
+    }
 
     // Create socket
     const raw_fd = std.c.socket(@intCast(@as(u32, posix.AF.INET)), @intCast(@as(u32, posix.SOCK.STREAM)), 0);
@@ -135,11 +146,60 @@ fn formatRecipients(allocator: std.mem.Allocator, recipients: []const []const u8
     for (recipients, 0..) |rcpt, i| {
         if (i > 0) try result.appendSlice(allocator, ",");
         try result.appendSlice(allocator, "\"");
-        try result.appendSlice(allocator, rcpt);
+        const escaped = try escapeJsonString(allocator, rcpt);
+        defer allocator.free(escaped);
+        try result.appendSlice(allocator, escaped);
         try result.appendSlice(allocator, "\"");
     }
 
     return try result.toOwnedSlice(allocator);
+}
+
+/// Escape a string for safe embedding in JSON values
+pub fn escapeJsonString(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var needs_escape = false;
+    for (s) |c| {
+        if (c == '"' or c == '\\' or c < 0x20) {
+            needs_escape = true;
+            break;
+        }
+    }
+    if (!needs_escape) return try allocator.dupe(u8, s);
+
+    var result: std.ArrayList(u8) = .{};
+    errdefer result.deinit(allocator);
+
+    for (s) |c| {
+        switch (c) {
+            '"' => try result.appendSlice(allocator, "\\\""),
+            '\\' => try result.appendSlice(allocator, "\\\\"),
+            '\n' => try result.appendSlice(allocator, "\\n"),
+            '\r' => try result.appendSlice(allocator, "\\r"),
+            '\t' => try result.appendSlice(allocator, "\\t"),
+            else => {
+                if (c < 0x20) {
+                    // Escape other control characters as \u00XX
+                    try result.appendSlice(allocator, "\\u00");
+                    const hex = "0123456789abcdef";
+                    try result.append(allocator, hex[c >> 4]);
+                    try result.append(allocator, hex[c & 0x0f]);
+                } else {
+                    try result.append(allocator, c);
+                }
+            },
+        }
+    }
+    return try result.toOwnedSlice(allocator);
+}
+
+/// Check if an IPv4 address is in a private/loopback/link-local range (SSRF protection)
+pub fn isPrivateIp(ip: [4]u8) bool {
+    return ip[0] == 127 or // 127.0.0.0/8 loopback
+        ip[0] == 10 or // 10.0.0.0/8
+        (ip[0] == 172 and ip[1] >= 16 and ip[1] <= 31) or // 172.16.0.0/12
+        (ip[0] == 192 and ip[1] == 168) or // 192.168.0.0/16
+        (ip[0] == 169 and ip[1] == 254) or // 169.254.0.0/16 link-local
+        (ip[0] == 0 and ip[1] == 0 and ip[2] == 0 and ip[3] == 0); // 0.0.0.0
 }
 
 fn parseIpv4(s: []const u8) ?[4]u8 {

@@ -74,9 +74,26 @@ pub fn fixedBufferStream(buffer: []u8) FixedBufferStream {
     return FixedBufferStream.init(buffer);
 }
 
-/// Fill buffer with cryptographically secure random bytes (cross-platform)
+/// Fill buffer with random bytes (cross-platform).
+/// Uses the global Io instance when available, otherwise falls back to
+/// a timestamp-seeded PRNG (sufficient for test environments where the
+/// global Io hasn't been initialised via main()).
 pub fn randomBytes(buf: []u8) void {
-    global_io.random(buf);
+    if (io_initialized) {
+        global_io.random(buf);
+        return;
+    }
+    // Fallback: simple PRNG seeded from high-resolution clock.
+    // Only used in test binaries that never call initIo().
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    const sec_bits: u64 = @as(u64, @bitCast(@as(i64, ts.sec)));
+    const nsec_bits: u64 = @intCast(@as(u32, @bitCast(@as(i32, @truncate(ts.nsec)))));
+    var state: u64 = sec_bits *% 6364136223846793005 +% nsec_bits;
+    for (buf) |*b| {
+        state = state *% 6364136223846793005 +% 1442695040888963407;
+        b.* = @truncate(state >> 33);
+    }
 }
 
 /// Get current timestamp in nanoseconds (compatibility for std.time.nanoTimestamp)

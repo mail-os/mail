@@ -212,6 +212,11 @@ pub const SessionCache = struct {
             self.evictExpired();
         }
 
+        // SECURITY: If still at capacity after evicting expired, evict oldest (LRU)
+        if (self.sessions.count() >= self.max_sessions) {
+            self.evictOldest();
+        }
+
         const id_copy = try self.allocator.dupe(u8, session_id);
         const ticket_copy = SessionTicket{
             .ticket_lifetime = ticket.ticket_lifetime,
@@ -252,6 +257,27 @@ pub const SessionCache = struct {
         }
 
         for (to_remove.items) |key| {
+            if (self.sessions.fetchRemove(key)) |removed| {
+                self.allocator.free(removed.key);
+                self.allocator.free(removed.value.ticket);
+            }
+        }
+    }
+
+    /// Evict the oldest session (LRU eviction when cache is full and no expired entries)
+    fn evictOldest(self: *SessionCache) void {
+        var oldest_key: ?[]const u8 = null;
+        var oldest_time: i64 = std.math.maxInt(i64);
+
+        var iter = self.sessions.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.creation_time < oldest_time) {
+                oldest_time = entry.value_ptr.creation_time;
+                oldest_key = entry.key_ptr.*;
+            }
+        }
+
+        if (oldest_key) |key| {
             if (self.sessions.fetchRemove(key)) |removed| {
                 self.allocator.free(removed.key);
                 self.allocator.free(removed.value.ticket);

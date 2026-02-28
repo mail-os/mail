@@ -121,8 +121,9 @@ pub const DNSResolver = struct {
                     _ = self.stats.failures.fetchAdd(1, .release);
                     return err;
                 }
-                // Retry on failure
-                std.Thread.sleep(100 * std.time.ns_per_ms);
+                // Retry on failure — use C nanosleep (Zig 0.16-dev removed std.Thread.sleep)
+                const retry_ts = std.c.timespec{ .sec = 0, .nsec = 100_000_000 };
+                _ = std.c.nanosleep(&retry_ts, null);
                 continue;
             };
 
@@ -341,13 +342,13 @@ pub const DNSCache = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var to_remove = std.ArrayList([]const u8).init(self.allocator);
-        defer to_remove.deinit();
+        var to_remove: std.ArrayList([]const u8) = .{};
+        defer to_remove.deinit(self.allocator);
 
         var it = self.cache.iterator();
         while (it.next()) |entry| {
             if (entry.value_ptr.isExpired()) {
-                to_remove.append(entry.key_ptr.*) catch continue;
+                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
 
@@ -425,7 +426,8 @@ test "dns cache expiration" {
     try testing.expect(cache.get("localhost") != null);
 
     // Wait for expiration
-    std.Thread.sleep(1100 * std.time.ns_per_ms);
+    const wait_ts = std.c.timespec{ .sec = 1, .nsec = 100_000_000 };
+    _ = std.c.nanosleep(&wait_ts, null);
 
     // Should be expired
     try testing.expect(cache.get("localhost") == null);
