@@ -393,6 +393,13 @@ pub fn main(init: std.process.Init) !void {
     var server = try smtp.Server.init(allocator, cfg, &log, db_ptr, auth_ptr, greylist_ptr);
     defer server.deinit();
 
+    // Start SMTPS (port 465) if TLS is enabled
+    var smtps_thread: ?std.Thread = null;
+    const smtps_port: u16 = blk: {
+        const port_str = env.get("SMTPS_PORT") orelse "465";
+        break :blk std.fmt.parseInt(u16, port_str, 10) catch 465;
+    };
+
     // Initialize IMAP server if auth is enabled
     var imap_server: ?imap.ImapServer = null;
     var imap_thread: ?std.Thread = null;
@@ -483,6 +490,16 @@ pub fn main(init: std.process.Init) !void {
     log.info("  ARC: {}", .{arc_validator != null});
     log.info("  BIMI: {}", .{bimi_validator != null});
 
+    // Start SMTPS server (port 465, implicit TLS) in a separate thread
+    if (cfg.enable_tls and cfg.tls_cert_path != null) {
+        smtps_thread = try std.Thread.spawn(.{}, struct {
+            fn run(smtp_srv: *smtp.Server, port: u16, shutdown: *std.atomic.Value(bool)) void {
+                smtp_srv.startSmtps(port, shutdown);
+            }
+        }.run, .{ &server, smtps_port, &shutdown_requested });
+        log.info("SMTPS Server listening on 0.0.0.0:{d} (implicit TLS)", .{smtps_port});
+    }
+
     // Start IMAP server in a separate thread
     if (imap_server) |*is| {
         imap_thread = try std.Thread.spawn(.{}, struct {
@@ -535,6 +552,12 @@ pub fn main(init: std.process.Init) !void {
         }
         return err;
     };
+
+    // Stop SMTPS thread on shutdown (it checks shutdown_requested flag)
+    if (smtps_thread) |t| {
+        t.join();
+        log.info("SMTPS server stopped", .{});
+    }
 
     // Stop IMAP server on shutdown
     if (imap_server) |*is| {

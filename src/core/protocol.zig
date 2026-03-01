@@ -602,7 +602,15 @@ pub const Session = struct {
         if (!self.authenticated) {
             if (std.mem.indexOf(u8, addr, "@")) |at_pos| {
                 const recipient_domain = addr[at_pos + 1 ..];
-                if (!std.ascii.eqlIgnoreCase(recipient_domain, self.config.hostname)) {
+                // Check if recipient domain matches hostname or is the parent domain
+                // e.g. hostname "mail.stacksjs.com" should accept mail for "stacksjs.com"
+                const is_local = std.ascii.eqlIgnoreCase(recipient_domain, self.config.hostname) or blk: {
+                    if (std.mem.indexOf(u8, self.config.hostname, ".")) |dot_pos| {
+                        break :blk std.ascii.eqlIgnoreCase(recipient_domain, self.config.hostname[dot_pos + 1 ..]);
+                    }
+                    break :blk false;
+                };
+                if (!is_local) {
                     self.logger.logSecurityEvent(self.remote_addr, "Relay access denied for unauthenticated sender");
                     try self.sendResponse(writer, 550, "5.7.1 Relay access denied", null);
                     return;
@@ -610,8 +618,9 @@ pub const Session = struct {
             }
         }
 
-        // Check greylisting if enabled
-        if (self.greylist) |greylist| {
+        // Check greylisting if enabled (skip for authenticated users)
+        if (self.greylist != null and !self.authenticated) {
+            const greylist = self.greylist.?;
             const mail_from = self.mail_from orelse "";
             const allowed = greylist.checkTriplet(self.remote_addr, mail_from, addr) catch blk: {
                 // Error checking greylist - allow by default
@@ -1010,8 +1019,17 @@ pub const Session = struct {
 
         self.logger.info("STARTTLS command accepted - starting TLS handshake", .{});
 
-        // Perform TLS handshake using non-blocking API (uses global tls import)
+        try self.doTlsHandshake();
 
+        // Reset session state after TLS upgrade as per RFC
+        self.state = .Initial;
+        self.authenticated = false;
+
+        self.logger.info("TLS upgrade successful - connection now encrypted", .{});
+    }
+
+    /// Perform TLS handshake (shared by STARTTLS and SMTPS implicit TLS)
+    fn doTlsHandshake(self: *Session) !void {
         // Load certificate and key
         const cert_path = self.tls_context.?.config.cert_path orelse return error.TlsNotConfigured;
         const key_path = self.tls_context.?.config.key_path orelse return error.TlsNotConfigured;
@@ -1061,7 +1079,6 @@ pub const Session = struct {
         // Perform handshake loop
         var recv_pos: usize = 0;
         while (!server_hs.done()) {
-            // Read data from client
             const bytes_read = self.conn_wrapper.read(recv_buf[recv_pos..]) catch |err| {
                 self.logger.err("TLS handshake read error: {}", .{err});
                 return err;
@@ -1074,13 +1091,11 @@ pub const Session = struct {
 
             recv_pos += bytes_read;
 
-            // Process handshake
             const result = server_hs.run(recv_buf[0..recv_pos], &send_buf) catch |err| {
                 self.logger.err("TLS handshake error: {}", .{err});
                 return error.TlsHandshakeFailed;
             };
 
-            // Send response if any
             if (result.send.len > 0) {
                 _ = self.conn_wrapper.write(result.send) catch |err| {
                     self.logger.err("TLS handshake write error: {}", .{err});
@@ -1088,26 +1103,28 @@ pub const Session = struct {
                 };
             }
 
-            // Shift consumed data
             if (result.recv_pos > 0) {
                 std.mem.copyForwards(u8, &recv_buf, recv_buf[result.recv_pos..recv_pos]);
                 recv_pos -= result.recv_pos;
             }
         }
 
-        // Get the cipher from completed handshake
         const cipher = server_hs.cipher() orelse return error.TlsHandshakeFailed;
 
         self.logger.info("TLS handshake successful", .{});
-
-        // Upgrade connection with the cipher
         self.conn_wrapper.upgradeWithCipher(cipher);
+    }
 
-        // Reset session state after TLS upgrade as per RFC
-        self.state = .Initial;
-        self.authenticated = false;
-
-        self.logger.info("TLS upgrade successful - connection now encrypted", .{});
+    /// Perform implicit TLS handshake for SMTPS (port 465).
+    /// Called before sending the SMTP banner.
+    pub fn performImplicitTls(self: *Session) !void {
+        if (self.tls_context == null) {
+            self.logger.err("SMTPS: TLS not configured", .{});
+            return error.TlsNotConfigured;
+        }
+        self.logger.info("SMTPS: Starting implicit TLS handshake", .{});
+        try self.doTlsHandshake();
+        self.logger.info("SMTPS: TLS handshake completed", .{});
     }
 
     /// Sanitize a string by removing CR and LF characters to prevent header injection
@@ -1144,37 +1161,51 @@ pub const Session = struct {
         const io = io_compat.getIo();
         const cwd = std.Io.Dir.cwd();
 
-        // Ensure mail directory exists
-        cwd.createDir(io, "mail", .default_dir) catch {};
-        cwd.createDir(io, "mail/new", .default_dir) catch {};
-
         // Generate unique filename based on timestamp
         const timestamp = time_compat.milliTimestamp();
-        const filename = try std.fmt.allocPrint(self.allocator, "mail/new/{d}.eml", .{timestamp});
-        defer self.allocator.free(filename);
 
-        // Write message to file
-        const file = try cwd.createFile(io, filename, .{});
-        defer file.close(io);
-
-        var header_buf: [256]u8 = undefined;
-
-        // Write headers
-        const from_line = try std.fmt.bufPrint(&header_buf, "From: {s}\r\n", .{self.mail_from orelse "unknown"});
-        try file.writeStreamingAll(io, from_line);
-
+        // Deliver to each recipient's Maildir
         for (self.rcpt_to.items) |rcpt| {
+            // Extract username from recipient address (part before @)
+            const username = if (std.mem.indexOf(u8, rcpt, "@")) |at_pos|
+                rcpt[0..at_pos]
+            else
+                rcpt;
+
+            // Ensure per-user maildir exists: mail/{username}/new/
+            const user_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}", .{username});
+            defer self.allocator.free(user_dir);
+            cwd.createDir(io, "mail", .default_dir) catch {};
+            cwd.createDir(io, user_dir, .default_dir) catch {};
+
+            const new_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{username});
+            defer self.allocator.free(new_dir);
+            cwd.createDir(io, new_dir, .default_dir) catch {};
+
+            const filename = try std.fmt.allocPrint(self.allocator, "mail/{s}/new/{d}.eml", .{ username, timestamp });
+            defer self.allocator.free(filename);
+
+            // Write message to file
+            const file = try cwd.createFile(io, filename, .{});
+            defer file.close(io);
+
+            var header_buf: [256]u8 = undefined;
+
+            // Write headers
+            const from_line = try std.fmt.bufPrint(&header_buf, "From: {s}\r\n", .{self.mail_from orelse "unknown"});
+            try file.writeStreamingAll(io, from_line);
+
             const to_line = try std.fmt.bufPrint(&header_buf, "To: {s}\r\n", .{rcpt});
             try file.writeStreamingAll(io, to_line);
+
+            const date_line = try std.fmt.bufPrint(&header_buf, "Date: {d}\r\n", .{timestamp});
+            try file.writeStreamingAll(io, date_line);
+            try file.writeStreamingAll(io, "\r\n");
+
+            // Write message body
+            try file.writeStreamingAll(io, data);
+
+            self.logger.debug("Message saved to {s}", .{filename});
         }
-
-        const date_line = try std.fmt.bufPrint(&header_buf, "Date: {d}\r\n", .{timestamp});
-        try file.writeStreamingAll(io, date_line);
-        try file.writeStreamingAll(io, "\r\n");
-
-        // Write message body
-        try file.writeStreamingAll(io, data);
-
-        self.logger.debug("Message saved to {s}", .{filename});
     }
 };

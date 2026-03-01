@@ -195,6 +195,7 @@ pub const Server = struct {
         server: *Server,
         connection: socket.Connection,
         remote_addr: []const u8,
+        implicit_tls: bool = false,
     };
 
     fn handleConnection(ctx: ConnectionContext) void {
@@ -223,10 +224,68 @@ pub const Server = struct {
         };
         defer session.deinit();
 
+        // For SMTPS (port 465), perform TLS handshake before SMTP banner
+        if (ctx.implicit_tls) {
+            session.performImplicitTls() catch |err| {
+                ctx.server.logger.err("SMTPS TLS handshake failed from {s}: {}", .{ ctx.remote_addr, err });
+                return;
+            };
+        }
+
         session.handle() catch |err| {
             ctx.server.logger.err("Session error from {s}: {}", .{ ctx.remote_addr, err });
         };
 
         ctx.server.logger.logConnection(ctx.remote_addr, "disconnected");
+    }
+
+    /// Start SMTPS listener on port 465 (implicit TLS).
+    /// Runs in a separate thread alongside the main SMTP server.
+    pub fn startSmtps(self: *Server, smtps_port: u16, shutdown_flag: *std.atomic.Value(bool)) void {
+        const address = socket.Address.parseIp(self.config.host, smtps_port) catch |err| {
+            self.logger.err("SMTPS: Failed to parse address: {}", .{err});
+            return;
+        };
+
+        var smtps_listener = socket.Server.listen(address, .{
+            .reuse_address = true,
+        }) catch |err| {
+            self.logger.err("SMTPS: Failed to listen on port {d}: {}", .{ smtps_port, err });
+            return;
+        };
+
+        self.logger.info("SMTPS Server listening on {s}:{d} (implicit TLS)", .{ self.config.host, smtps_port });
+
+        while (!shutdown_flag.load(.acquire)) {
+            const connection = smtps_listener.accept() catch |err| {
+                if (err == error.OperationCancelled or err == error.WouldBlock) {
+                    time_compat.sleepMs(100);
+                    continue;
+                }
+                self.logger.err("SMTPS: Error accepting connection: {}", .{err});
+                continue;
+            };
+
+            _ = self.active_connections.fetchAdd(1, .monotonic);
+
+            self.logger.logConnection("client", "SMTPS connected");
+
+            const ctx = ConnectionContext{
+                .server = self,
+                .connection = connection,
+                .remote_addr = "client",
+                .implicit_tls = true,
+            };
+
+            const thread = std.Thread.spawn(.{}, handleConnection, .{ctx}) catch |err| {
+                self.logger.err("SMTPS: Failed to spawn handler: {}", .{err});
+                _ = self.active_connections.fetchSub(1, .monotonic);
+                connection.close();
+                continue;
+            };
+            thread.detach();
+        }
+
+        smtps_listener.close();
     }
 };

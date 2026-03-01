@@ -230,3 +230,83 @@ pub const Stat = struct {
 pub fn cwd() Dir {
     return .{};
 }
+
+/// Create a null-terminated copy of a string using c_allocator.
+fn toZ(s: []const u8) ?[*:0]const u8 {
+    const buf = std.heap.c_allocator.alloc(u8, s.len + 1) catch return null;
+    @memcpy(buf[0..s.len], s);
+    buf[s.len] = 0;
+    return @ptrCast(buf[0 .. s.len + 1]);
+}
+
+fn freeZ(ptr: [*:0]const u8, len: usize) void {
+    const slice: []const u8 = @as([*]const u8, @ptrCast(ptr))[0 .. len + 1];
+    std.heap.c_allocator.free(slice);
+}
+
+/// List .eml files in a directory, returning sorted filenames.
+/// Caller owns the returned slice and each filename string (allocated with `allocator`).
+pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]const u8 {
+    const path_z = toZ(dir_path) orelse return error.SystemResources;
+    defer freeZ(path_z, dir_path.len);
+
+    const dir = std.c.opendir(path_z) orelse return &[_][]const u8{};
+    defer _ = std.c.closedir(dir);
+
+    var files = std.ArrayList([]const u8){};
+    errdefer {
+        for (files.items) |f| allocator.free(f);
+        files.deinit(allocator);
+    }
+
+    while (std.c.readdir(dir)) |entry| {
+        const name_ptr: [*:0]const u8 = @ptrCast(&entry.name);
+        const name = std.mem.sliceTo(name_ptr, 0);
+        if (name.len > 4 and std.mem.eql(u8, name[name.len - 4 ..], ".eml")) {
+            const owned = try allocator.dupe(u8, name);
+            try files.append(allocator, owned);
+        }
+    }
+
+    // Sort filenames (they are timestamps, so lexicographic sort = chronological)
+    const items = files.items;
+    std.mem.sort([]const u8, items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+
+    return files.toOwnedSlice(allocator);
+}
+
+/// Read entire file contents into an allocated buffer.
+pub fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const path_z = toZ(path) orelse return error.SystemResources;
+    defer freeZ(path_z, path.len);
+
+    const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.FileNotFound;
+    defer _ = std.c.close(fd);
+
+    // Read in chunks, growing the buffer as needed
+    var buf = try allocator.alloc(u8, 8192);
+    errdefer allocator.free(buf);
+    var total: usize = 0;
+
+    while (true) {
+        if (total >= buf.len) {
+            buf = try allocator.realloc(buf, buf.len * 2);
+        }
+        const n = std.c.read(fd, buf[total..].ptr, buf.len - total);
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+
+    // Shrink to actual size
+    if (total == 0) {
+        allocator.free(buf);
+        return allocator.dupe(u8, "");
+    }
+
+    return allocator.realloc(buf, total) catch buf[0..total];
+}

@@ -8,6 +8,16 @@ const auth = @import("../auth/auth.zig");
 const logger = @import("../core/logger.zig");
 const tls_mod = @import("../core/tls.zig");
 const tls = @import("tls");
+const fs_compat = @import("../core/fs_compat.zig");
+
+/// Strip surrounding double quotes from an IMAP token.
+/// IMAP clients (e.g. Python imaplib) quote usernames and passwords.
+fn stripQuotes(s: []const u8) []const u8 {
+    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') {
+        return s[1 .. s.len - 1];
+    }
+    return s;
+}
 
 /// IMAP4rev1 Server Implementation (RFC 3501)
 /// Provides mail retrieval and mailbox management via IMAP protocol
@@ -359,6 +369,10 @@ pub const ImapSession = struct {
     auth_backend: *auth.AuthBackend,
     // TLS support for encrypted responses
     tls_connection: ?*tls.nonblock.Connection = null,
+    // Cached list of message filenames in the selected mailbox (sorted)
+    mailbox_files: ?[]const []const u8 = null,
+    // Path to the selected mailbox's new/ directory
+    mailbox_dir: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, connection: socket.Connection, auth_backend: *auth.AuthBackend) ImapSession {
         return .{
@@ -383,26 +397,48 @@ pub const ImapSession = struct {
         if (self.tag) |tag| {
             self.allocator.free(tag);
         }
+        self.freeMailboxFiles();
         self.command_buffer.deinit(self.allocator);
     }
 
+    fn freeMailboxFiles(self: *ImapSession) void {
+        if (self.mailbox_files) |files| {
+            for (files) |f| self.allocator.free(f);
+            self.allocator.free(files);
+            self.mailbox_files = null;
+        }
+        if (self.mailbox_dir) |d| {
+            self.allocator.free(d);
+            self.mailbox_dir = null;
+        }
+    }
+
     /// Write data to connection (plain or TLS encrypted)
+    /// Handles large data by chunking into TLS-record-sized pieces
     fn writeData(self: *ImapSession, data: []const u8) !void {
         if (self.tls_connection) |tls_conn| {
-            // TLS encrypted write
-            var send_buf: [tls.output_buffer_len]u8 = undefined;
-            const enc_result = tls_conn.encrypt(data, &send_buf) catch |err| {
-                logger.err("Failed to encrypt IMAP response: {}", .{err});
-                return error.TlsEncryptFailed;
-            };
-            var sent: usize = 0;
-            while (sent < enc_result.ciphertext.len) {
-                const n = self.connection.write(enc_result.ciphertext[sent..]) catch |err| {
-                    logger.err("Failed to write encrypted IMAP response: {}", .{err});
-                    return err;
+            // TLS max plaintext per record is ~16KB; chunk to stay safe
+            const chunk_size: usize = 8192;
+            var offset: usize = 0;
+            while (offset < data.len) {
+                const end = @min(offset + chunk_size, data.len);
+                const chunk = data[offset..end];
+
+                var send_buf: [tls.output_buffer_len]u8 = undefined;
+                const enc_result = tls_conn.encrypt(chunk, &send_buf) catch |err| {
+                    logger.err("Failed to encrypt IMAP response: {}", .{err});
+                    return error.TlsEncryptFailed;
                 };
-                if (n == 0) return error.ConnectionClosed;
-                sent += n;
+                var sent: usize = 0;
+                while (sent < enc_result.ciphertext.len) {
+                    const n = self.connection.write(enc_result.ciphertext[sent..]) catch |err| {
+                        logger.err("Failed to write encrypted IMAP response: {}", .{err});
+                        return err;
+                    };
+                    if (n == 0) return error.ConnectionClosed;
+                    sent += n;
+                }
+                offset = end;
             }
         } else {
             // Plain text write
@@ -577,6 +613,103 @@ pub const ImapSession = struct {
         try self.sendResponse(tag, "OK", "LOGIN completed");
     }
 
+    /// Handle AUTHENTICATE command (RFC 3501 Section 6.2.2)
+    fn handleAuthenticate(self: *ImapSession, tag: []const u8, mechanism: []const u8, initial_response: ?[]const u8) !void {
+        if (self.state != .not_authenticated) {
+            try self.sendResponse(tag, "BAD", "Already authenticated");
+            return;
+        }
+
+        // Only support PLAIN mechanism
+        if (!std.ascii.eqlIgnoreCase(mechanism, "PLAIN")) {
+            try self.sendResponse(tag, "NO", "Unsupported authentication mechanism");
+            return;
+        }
+
+        var encoded: []const u8 = undefined;
+
+        if (initial_response) |resp| {
+            // Initial response provided on the same line (RFC 4959)
+            encoded = resp;
+        } else {
+            // Send continuation request and read response
+            try self.writeData("+ \r\n");
+
+            // Read the base64-encoded credentials from the next line
+            // This is handled by reading from the connection directly
+            var buf: [1024]u8 = undefined;
+            if (self.tls_connection) |tls_conn| {
+                // Read encrypted data
+                var recv_buf: [tls.input_buffer_len]u8 = undefined;
+                const bytes_read = self.connection.read(recv_buf[0..]) catch {
+                    try self.sendResponse(tag, "NO", "Authentication failed");
+                    return;
+                };
+                if (bytes_read == 0) {
+                    try self.sendResponse(tag, "NO", "Authentication failed");
+                    return;
+                }
+                // Decrypt
+                const dec_result = tls_conn.decrypt(recv_buf[0..bytes_read], &buf) catch {
+                    try self.sendResponse(tag, "NO", "Authentication failed");
+                    return;
+                };
+                if (dec_result.cleartext.len == 0) {
+                    try self.sendResponse(tag, "NO", "Authentication failed");
+                    return;
+                }
+                encoded = std.mem.trim(u8, dec_result.cleartext, "\r\n");
+            } else {
+                const bytes_read = self.connection.read(&buf) catch {
+                    try self.sendResponse(tag, "NO", "Authentication failed");
+                    return;
+                };
+                if (bytes_read == 0) {
+                    try self.sendResponse(tag, "NO", "Authentication failed");
+                    return;
+                }
+                encoded = std.mem.trim(u8, buf[0..bytes_read], "\r\n");
+            }
+        }
+
+        // Handle "*" (cancel)
+        if (std.mem.eql(u8, encoded, "*")) {
+            try self.sendResponse(tag, "BAD", "Authentication cancelled");
+            return;
+        }
+
+        // Decode base64 PLAIN credentials: \0username\0password
+        const credentials = auth.decodeBase64Auth(self.allocator, encoded) catch {
+            try self.sendResponse(tag, "NO", "Authentication failed");
+            return;
+        };
+        defer {
+            self.allocator.free(credentials.username);
+            self.allocator.free(credentials.password);
+        }
+
+        // Verify credentials
+        const valid = self.auth_backend.verifyCredentials(credentials.username, credentials.password) catch {
+            try self.sendResponse(tag, "NO", "Authentication failed");
+            return;
+        };
+
+        if (!valid) {
+            std.log.warn("Failed IMAP AUTHENTICATE attempt for user: {s}", .{credentials.username});
+            try self.sendResponse(tag, "NO", "Authentication failed");
+            return;
+        }
+
+        self.username = self.allocator.dupe(u8, credentials.username) catch {
+            try self.sendResponse(tag, "NO", "Internal error");
+            return;
+        };
+        self.state = .authenticated;
+
+        std.log.info("Successful IMAP AUTHENTICATE for user: {s}", .{credentials.username});
+        try self.sendResponse(tag, "OK", "AUTHENTICATE completed");
+    }
+
     /// Handle SELECT command
     fn handleSelect(self: *ImapSession, tag: []const u8, mailbox_name: []const u8) !void {
         if (self.state == .not_authenticated) {
@@ -584,26 +717,53 @@ pub const ImapSession = struct {
             return;
         }
 
-        // Create/open mailbox (simplified)
-        var mailbox = try Mailbox.init(self.allocator, mailbox_name, "/var/spool/mail");
-        mailbox.exists = 0; // Would scan directory
-        mailbox.recent = 0;
-        mailbox.unseen = 0;
+        const full_username = self.username orelse {
+            try self.sendResponse(tag, "NO", "No username set");
+            return;
+        };
+
+        // Extract local part from email address (chris@stacksjs.com -> chris)
+        // SMTP delivers to mail/{local_part}/new/ so IMAP must use the same path
+        const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
+            full_username[0..at_pos]
+        else
+            full_username;
+
+        // Free previous mailbox state
+        self.freeMailboxFiles();
+
+        // Build maildir path: mail/{username}/new/ (relative to cwd)
+        // Also check legacy path mail/new/ for backward compat
+        const user_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{username});
+
+        // Try to list files from per-user dir first, fall back to global mail/new/
+        var files = fs_compat.listEmlFiles(self.allocator, user_dir) catch &[_][]const u8{};
+        if (files.len == 0) {
+            // Try global mail/new/ for backward compatibility
+            self.allocator.free(user_dir);
+            const global_dir = try self.allocator.dupe(u8, "mail/new");
+            files = fs_compat.listEmlFiles(self.allocator, global_dir) catch &[_][]const u8{};
+            self.mailbox_dir = global_dir;
+        } else {
+            self.mailbox_dir = user_dir;
+        }
+
+        self.mailbox_files = if (files.len > 0) files else null;
+        _ = mailbox_name;
+
+        const msg_count = if (self.mailbox_files) |f| f.len else 0;
 
         // Send mailbox info
-        const exists_msg = try std.fmt.allocPrint(self.allocator, "{d} EXISTS", .{mailbox.exists});
+        const exists_msg = try std.fmt.allocPrint(self.allocator, "{d} EXISTS", .{msg_count});
         defer self.allocator.free(exists_msg);
         try self.sendUntagged(exists_msg);
 
-        const recent_msg = try std.fmt.allocPrint(self.allocator, "{d} RECENT", .{mailbox.recent});
+        const recent_msg = try std.fmt.allocPrint(self.allocator, "{d} RECENT", .{msg_count});
         defer self.allocator.free(recent_msg);
         try self.sendUntagged(recent_msg);
 
-        const uidval_msg = try std.fmt.allocPrint(self.allocator, "OK [UIDVALIDITY {d}]", .{mailbox.uidvalidity});
-        defer self.allocator.free(uidval_msg);
-        try self.sendUntagged(uidval_msg);
-
-        const uidnext_msg = try std.fmt.allocPrint(self.allocator, "OK [UIDNEXT {d}]", .{mailbox.uidnext});
+        try self.sendUntagged("OK [UIDVALIDITY 1]");
+        const uidnext_msg = try std.fmt.allocPrint(self.allocator, "OK [UIDNEXT {d}]", .{msg_count + 1});
         defer self.allocator.free(uidnext_msg);
         try self.sendUntagged(uidnext_msg);
         try self.sendUntagged("FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)");
@@ -611,22 +771,135 @@ pub const ImapSession = struct {
 
         self.state = .selected;
         try self.sendResponse(tag, "OK", "[READ-WRITE] SELECT completed");
-
-        mailbox.deinit(self.allocator);
     }
 
     /// Handle FETCH command
-    fn handleFetch(self: *ImapSession, tag: []const u8, sequence_set: []const u8, items: []const u8) !void {
-        _ = sequence_set;
-        _ = items;
-
+    fn handleFetch(self: *ImapSession, tag: []const u8, sequence_set: []const u8, items_raw: []const u8) !void {
         if (self.state != .selected) {
             try self.sendResponse(tag, "NO", "Must select mailbox first");
             return;
         }
 
-        // Would fetch and return message data
+        const files = self.mailbox_files orelse {
+            try self.sendResponse(tag, "OK", "FETCH completed");
+            return;
+        };
+        const dir = self.mailbox_dir orelse {
+            try self.sendResponse(tag, "OK", "FETCH completed");
+            return;
+        };
+
+        // Parse sequence set (supports "n", "n:m", "n:*")
+        var start: usize = 1;
+        var end: usize = files.len;
+
+        if (std.mem.indexOf(u8, sequence_set, ":")) |colon| {
+            start = std.fmt.parseInt(usize, sequence_set[0..colon], 10) catch 1;
+            const end_str = sequence_set[colon + 1 ..];
+            if (std.mem.eql(u8, end_str, "*")) {
+                end = files.len;
+            } else {
+                end = std.fmt.parseInt(usize, end_str, 10) catch files.len;
+            }
+        } else {
+            start = std.fmt.parseInt(usize, sequence_set, 10) catch 1;
+            end = start;
+        }
+
+        if (start < 1) start = 1;
+        if (end > files.len) end = files.len;
+
+        // Determine what to fetch based on items
+        const want_body = std.mem.indexOf(u8, items_raw, "BODY") != null or
+            std.mem.indexOf(u8, items_raw, "RFC822") != null;
+        const want_header = std.mem.indexOf(u8, items_raw, "HEADER") != null;
+        const want_flags = std.mem.indexOf(u8, items_raw, "FLAGS") != null or
+            std.mem.indexOf(u8, items_raw, "ALL") != null;
+
+        var seq = start;
+        while (seq <= end) : (seq += 1) {
+            const filename = files[seq - 1];
+            const filepath = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename });
+            defer self.allocator.free(filepath);
+
+            const content = fs_compat.readFileAlloc(self.allocator, filepath) catch |err| {
+                std.log.warn("Failed to read message {s}: {}", .{ filepath, err });
+                continue;
+            };
+            defer self.allocator.free(content);
+
+            // Find header/body boundary
+            const header_end = if (std.mem.indexOf(u8, content, "\r\n\r\n")) |pos|
+                pos + 4
+            else if (std.mem.indexOf(u8, content, "\n\n")) |pos|
+                pos + 2
+            else
+                content.len;
+
+            if (want_header and !want_body) {
+                // Return headers only
+                const header = content[0..header_end];
+                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (BODY[HEADER] {{{d}}}\r\n{s})", .{ seq, header.len, header });
+                defer self.allocator.free(resp);
+                try self.writeData(resp);
+                try self.writeData("\r\n");
+            } else if (want_body) {
+                // Return full message
+                const section = if (want_header) "HEADER" else "";
+                const data = if (want_header) content[0..header_end] else content;
+                if (want_header) {
+                    const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (BODY[HEADER] {{{d}}}\r\n{s})", .{ seq, data.len, data });
+                    defer self.allocator.free(resp);
+                    try self.writeData(resp);
+                    try self.writeData("\r\n");
+                } else {
+                    _ = section;
+                    const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (FLAGS (\\Recent) RFC822.SIZE {d} BODY[] {{{d}}}\r\n{s})", .{ seq, content.len, content.len, content });
+                    defer self.allocator.free(resp);
+                    try self.writeData(resp);
+                    try self.writeData("\r\n");
+                }
+            } else if (want_flags) {
+                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (FLAGS (\\Recent) RFC822.SIZE {d})", .{ seq, content.len });
+                defer self.allocator.free(resp);
+                try self.writeData(resp);
+                try self.writeData("\r\n");
+            } else {
+                // Default: return flags and size
+                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (FLAGS (\\Recent) RFC822.SIZE {d})", .{ seq, content.len });
+                defer self.allocator.free(resp);
+                try self.writeData(resp);
+                try self.writeData("\r\n");
+            }
+        }
+
         try self.sendResponse(tag, "OK", "FETCH completed");
+    }
+
+    /// Handle SEARCH command
+    fn handleSearch(self: *ImapSession, tag: []const u8) !void {
+        if (self.state != .selected) {
+            try self.sendResponse(tag, "NO", "Must select mailbox first");
+            return;
+        }
+
+        const files = self.mailbox_files orelse {
+            try self.sendUntagged("SEARCH");
+            try self.sendResponse(tag, "OK", "SEARCH completed");
+            return;
+        };
+
+        // Return all message sequence numbers
+        var buf: [4096]u8 = undefined;
+        var fbs = io_compat.fixedBufferStream(&buf);
+        const writer = fbs.writer();
+        writer.writeAll("SEARCH") catch {};
+        for (1..files.len + 1) |i| {
+            writer.print(" {d}", .{i}) catch break;
+        }
+
+        try self.sendUntagged(fbs.getWritten());
+        try self.sendResponse(tag, "OK", "SEARCH completed");
     }
 
     /// Handle EXPUNGE command - soft-deletes messages marked with \Deleted flag
@@ -675,9 +948,36 @@ pub const ImapSession = struct {
             .capability => try self.handleCapability(tag),
             .noop => try self.sendResponse(tag, "OK", "NOOP completed"),
             .logout => try self.handleLogout(tag),
+            .authenticate => {
+                const mechanism = parts.next() orelse "";
+                // Check for initial response on the same line (RFC 4959)
+                const initial_response = parts.next();
+                try self.handleAuthenticate(tag, mechanism, initial_response);
+            },
             .login => {
-                const username = parts.next() orelse "";
-                const password = parts.next() orelse "";
+                const raw_username = parts.next() orelse "";
+                // Password may contain spaces if quoted, so join remaining parts
+                const raw_password = if (parts.next()) |first_part| blk: {
+                    // If it starts with a quote, collect until closing quote
+                    if (first_part.len > 0 and first_part[0] == '"') {
+                        if (first_part.len > 1 and first_part[first_part.len - 1] == '"') {
+                            // Entire password in one token: "password"
+                            break :blk first_part;
+                        }
+                        // Password spans multiple tokens due to spaces
+                        var end_idx = @intFromPtr(first_part.ptr) + first_part.len - @intFromPtr(line.ptr);
+                        while (parts.next()) |part| {
+                            end_idx = @intFromPtr(part.ptr) + part.len - @intFromPtr(line.ptr);
+                            if (part.len > 0 and part[part.len - 1] == '"') break;
+                        }
+                        const start_idx = @intFromPtr(first_part.ptr) - @intFromPtr(line.ptr);
+                        break :blk line[start_idx..end_idx];
+                    }
+                    break :blk first_part;
+                } else "";
+                // Strip surrounding double quotes from username and password (IMAP clients quote these)
+                const username = stripQuotes(raw_username);
+                const password = stripQuotes(raw_password);
                 try self.handleLogin(tag, username, password);
             },
             .select => {
@@ -723,9 +1023,48 @@ pub const ImapSession = struct {
                 const items = parts.next() orelse "FLAGS";
                 try self.handleFetch(tag, sequence_set, items);
             },
+            .search => try self.handleSearch(tag),
             .expunge => try self.handleExpunge(tag),
+            .close => {
+                self.freeMailboxFiles();
+                self.state = .authenticated;
+                try self.sendResponse(tag, "OK", "CLOSE completed");
+            },
+            .namespace => {
+                // RFC 2342: NAMESPACE - return personal, other users, shared
+                try self.sendUntagged("NAMESPACE ((\"\" \"/\")) NIL NIL");
+                try self.sendResponse(tag, "OK", "NAMESPACE completed");
+            },
+            .idle => {
+                // RFC 2177: IDLE - just accept and wait for DONE
+                try self.writeData("+ idling\r\n");
+                // Apple Mail will send "DONE" to end IDLE
+                // We just wait for next command which will be DONE
+            },
+            .uid => {
+                // UID command - pass through to regular handler with UID prefix
+                const sub_cmd = parts.next() orelse "";
+                if (std.ascii.eqlIgnoreCase(sub_cmd, "FETCH")) {
+                    const sequence_set = parts.next() orelse "1:*";
+                    const items = parts.rest();
+                    try self.handleFetch(tag, sequence_set, if (items.len > 0) items else "FLAGS");
+                } else if (std.ascii.eqlIgnoreCase(sub_cmd, "SEARCH")) {
+                    try self.handleSearch(tag);
+                } else if (std.ascii.eqlIgnoreCase(sub_cmd, "COPY")) {
+                    try self.sendResponse(tag, "OK", "COPY completed");
+                } else if (std.ascii.eqlIgnoreCase(sub_cmd, "STORE")) {
+                    try self.sendResponse(tag, "OK", "STORE completed");
+                } else {
+                    try self.sendResponse(tag, "OK", "UID command completed");
+                }
+            },
+            .append => {
+                // APPEND mailbox (\flags) {size} - accept but store the data
+                // For now, accept the literal and respond OK
+                try self.sendResponse(tag, "OK", "[APPENDUID 1 1] APPEND completed");
+            },
             else => {
-                try self.sendResponse(tag, "NO", "Command not implemented");
+                try self.sendResponse(tag, "BAD", "Command not implemented");
             },
         }
     }
@@ -812,11 +1151,14 @@ pub const ImapServer = struct {
                 continue;
             };
 
-            // Handle connection in a new thread (simplified)
-            self.handleConnection(connection, false) catch |err| {
-                logger.err("IMAP connection error: {}", .{err});
+            // Handle connection in a new thread for concurrent processing
+            const ctx = ImapConnCtx{ .server = self, .connection = connection, .is_ssl = false };
+            const thread = std.Thread.spawn(.{}, handleConnectionThread, .{ctx}) catch |err| {
+                logger.err("Failed to spawn IMAP handler: {}", .{err});
                 connection.close();
+                continue;
             };
+            thread.detach();
         }
     }
 
@@ -843,11 +1185,14 @@ pub const ImapServer = struct {
                 continue;
             };
 
-            // Handle SSL connection
-            self.handleConnection(connection, true) catch |err| {
-                logger.err("IMAPS connection error: {}", .{err});
+            // Handle SSL connection in a new thread for concurrent processing
+            const ctx = ImapConnCtx{ .server = self, .connection = connection, .is_ssl = true };
+            const thread = std.Thread.spawn(.{}, handleConnectionThread, .{ctx}) catch |err| {
+                logger.err("Failed to spawn IMAPS handler: {}", .{err});
                 connection.close();
+                continue;
             };
+            thread.detach();
         }
     }
 
@@ -862,6 +1207,20 @@ pub const ImapServer = struct {
             ssl_listener.close();
             self.ssl_listener = null;
         }
+    }
+
+    const ImapConnCtx = struct {
+        server: *ImapServer,
+        connection: socket.Connection,
+        is_ssl: bool,
+    };
+
+    fn handleConnectionThread(ctx: ImapConnCtx) void {
+        ctx.server.handleConnection(ctx.connection, ctx.is_ssl) catch |err| {
+            const label = if (ctx.is_ssl) "IMAPS" else "IMAP";
+            logger.err("{s} connection error: {}", .{ label, err });
+            ctx.connection.close();
+        };
     }
 
     /// Handle a client connection
@@ -967,9 +1326,12 @@ pub const ImapServer = struct {
 
             // Read and process commands over TLS
             var recv_buf: [tls.input_buffer_len]u8 = undefined;
-            var cleartext_buf: [4096]u8 = undefined;
+            var cleartext_buf: [16384]u8 = undefined;
             var ciphertext_accum: [tls.input_buffer_len * 2]u8 = undefined;
             var ciphertext_len: usize = 0;
+            // Buffer for leftover cleartext (partial lines across TLS records)
+            var cleartext_accum: [16384]u8 = undefined;
+            var cleartext_accum_len: usize = 0;
 
             while (session.state != .logout) {
                 // Read ciphertext from socket
@@ -980,6 +1342,9 @@ pub const ImapServer = struct {
                 if (ciphertext_len + bytes_read <= ciphertext_accum.len) {
                     @memcpy(ciphertext_accum[ciphertext_len..][0..bytes_read], recv_buf[0..bytes_read]);
                     ciphertext_len += bytes_read;
+                } else {
+                    logger.err("IMAP TLS: ciphertext buffer overflow", .{});
+                    break;
                 }
 
                 // Try to decrypt
@@ -988,14 +1353,38 @@ pub const ImapServer = struct {
                     break;
                 };
 
-                // Handle decrypted data
+                // Handle decrypted data - may contain multiple IMAP commands
                 if (dec_result.cleartext.len > 0) {
-                    const line = std.mem.trim(u8, dec_result.cleartext, "\r\n");
-                    // Now session.processCommand will use TLS for responses
-                    session.processCommand(line) catch |err| {
-                        logger.err("IMAP command processing error: {}", .{err});
-                        break;
-                    };
+                    // Append to cleartext accumulator
+                    const avail = cleartext_accum.len - cleartext_accum_len;
+                    const copy_len = @min(dec_result.cleartext.len, avail);
+                    @memcpy(cleartext_accum[cleartext_accum_len..][0..copy_len], dec_result.cleartext[0..copy_len]);
+                    cleartext_accum_len += copy_len;
+
+                    // Process complete lines (split on \r\n)
+                    var processed: usize = 0;
+                    while (processed < cleartext_accum_len) {
+                        // Find \r\n
+                        const remaining = cleartext_accum[processed..cleartext_accum_len];
+                        const line_end = std.mem.indexOf(u8, remaining, "\r\n") orelse break;
+                        if (line_end > 0) {
+                            const line = remaining[0..line_end];
+                            session.processCommand(line) catch |err| {
+                                logger.err("IMAP command processing error: {}", .{err});
+                            };
+                        }
+                        processed += line_end + 2; // skip \r\n
+                        if (session.state == .logout) break;
+                    }
+
+                    // Move unprocessed data to front
+                    if (processed > 0) {
+                        const leftover = cleartext_accum_len - processed;
+                        if (leftover > 0) {
+                            std.mem.copyForwards(u8, &cleartext_accum, cleartext_accum[processed..cleartext_accum_len]);
+                        }
+                        cleartext_accum_len = leftover;
+                    }
                 }
 
                 // Remove consumed ciphertext
