@@ -317,6 +317,9 @@ pub const ImapCommand = enum {
     copy,
     uid,
     idle,
+    namespace,
+    enable,
+    id,
 
     pub fn fromString(cmd: []const u8) ?ImapCommand {
         const upper = std.ascii.allocUpperString(std.heap.page_allocator, cmd) catch return null;
@@ -350,6 +353,9 @@ pub const ImapCommand = enum {
             .{ "COPY", .copy },
             .{ "UID", .uid },
             .{ "IDLE", .idle },
+            .{ "NAMESPACE", .namespace },
+            .{ "ENABLE", .enable },
+            .{ "ID", .id },
         });
 
         return commands.get(upper);
@@ -366,6 +372,7 @@ pub const ImapSession = struct {
     tag: ?[]const u8 = null,
     command_buffer: std.ArrayList(u8),
     idle_mode: bool = false,
+    idle_tag: ?[]const u8 = null,
     auth_backend: *auth.AuthBackend,
     // TLS support for encrypted responses
     tls_connection: ?*tls.nonblock.Connection = null,
@@ -397,6 +404,9 @@ pub const ImapSession = struct {
         if (self.tag) |tag| {
             self.allocator.free(tag);
         }
+        if (self.idle_tag) |idle_tag| {
+            self.allocator.free(idle_tag);
+        }
         self.freeMailboxFiles();
         self.command_buffer.deinit(self.allocator);
     }
@@ -416,6 +426,9 @@ pub const ImapSession = struct {
     /// Write data to connection (plain or TLS encrypted)
     /// Handles large data by chunking into TLS-record-sized pieces
     fn writeData(self: *ImapSession, data: []const u8) !void {
+        // Log response (truncated)
+        const log_len = @min(data.len, 200);
+        std.log.info("IMAP RSP ({d}b): {s}", .{ data.len, data[0..log_len] });
         if (self.tls_connection) |tls_conn| {
             // TLS max plaintext per record is ~16KB; chunk to stay safe
             const chunk_size: usize = 8192;
@@ -732,24 +745,29 @@ pub const ImapSession = struct {
         // Free previous mailbox state
         self.freeMailboxFiles();
 
-        // Build maildir path: mail/{username}/new/ (relative to cwd)
-        // Also check legacy path mail/new/ for backward compat
-        const user_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{username});
+        // Strip quotes from mailbox name (Apple Mail sends "INBOX" with quotes sometimes)
+        const mailbox = stripQuotes(mailbox_name);
 
-        // Try to list files from per-user dir first, fall back to global mail/new/
-        var files = fs_compat.listEmlFiles(self.allocator, user_dir) catch &[_][]const u8{};
-        if (files.len == 0) {
-            // Try global mail/new/ for backward compatibility
-            self.allocator.free(user_dir);
-            const global_dir = try self.allocator.dupe(u8, "mail/new");
-            files = fs_compat.listEmlFiles(self.allocator, global_dir) catch &[_][]const u8{};
-            self.mailbox_dir = global_dir;
-        } else {
-            self.mailbox_dir = user_dir;
+        // Only INBOX has real messages; other folders (Sent, Drafts, Trash, Starred) are empty
+        const is_inbox = std.ascii.eqlIgnoreCase(mailbox, "INBOX");
+
+        if (is_inbox) {
+            // Build maildir path: mail/{username}/new/ (relative to cwd)
+            const user_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{username});
+
+            // Try to list files from per-user dir first, fall back to global mail/new/
+            var files = fs_compat.listEmlFiles(self.allocator, user_dir) catch &[_][]const u8{};
+            if (files.len == 0) {
+                self.allocator.free(user_dir);
+                const global_dir = try self.allocator.dupe(u8, "mail/new");
+                files = fs_compat.listEmlFiles(self.allocator, global_dir) catch &[_][]const u8{};
+                self.mailbox_dir = global_dir;
+            } else {
+                self.mailbox_dir = user_dir;
+            }
+
+            self.mailbox_files = if (files.len > 0) files else null;
         }
-
-        self.mailbox_files = if (files.len > 0) files else null;
-        _ = mailbox_name;
 
         const msg_count = if (self.mailbox_files) |f| f.len else 0;
 
@@ -762,7 +780,7 @@ pub const ImapSession = struct {
         defer self.allocator.free(recent_msg);
         try self.sendUntagged(recent_msg);
 
-        try self.sendUntagged("OK [UIDVALIDITY 1]");
+        try self.sendUntagged("OK [UIDVALIDITY 1740700800]");
         const uidnext_msg = try std.fmt.allocPrint(self.allocator, "OK [UIDNEXT {d}]", .{msg_count + 1});
         defer self.allocator.free(uidnext_msg);
         try self.sendUntagged(uidnext_msg);
@@ -810,11 +828,17 @@ pub const ImapSession = struct {
         if (end > files.len) end = files.len;
 
         // Determine what to fetch based on items
-        const want_body = std.mem.indexOf(u8, items_raw, "BODY") != null or
-            std.mem.indexOf(u8, items_raw, "RFC822") != null;
-        const want_header = std.mem.indexOf(u8, items_raw, "HEADER") != null;
-        const want_flags = std.mem.indexOf(u8, items_raw, "FLAGS") != null or
-            std.mem.indexOf(u8, items_raw, "ALL") != null;
+        const want_internaldate = std.mem.indexOf(u8, items_raw, "INTERNALDATE") != null;
+        // BODY.PEEK[HEADER] or BODY[HEADER] - wants headers only
+        const want_header_only = std.mem.indexOf(u8, items_raw, "HEADER") != null;
+        // BODY.PEEK[] or BODY[] or BODY[TEXT] or RFC822 (not RFC822.SIZE) - wants full body
+        const want_full_body = (std.mem.indexOf(u8, items_raw, "BODY.PEEK[]") != null) or
+            (std.mem.indexOf(u8, items_raw, "BODY[]") != null) or
+            (std.mem.indexOf(u8, items_raw, "BODY[TEXT]") != null) or
+            (std.mem.indexOf(u8, items_raw, "RFC822") != null and
+            std.mem.indexOf(u8, items_raw, "RFC822.SIZE") == null and
+            std.mem.indexOf(u8, items_raw, "RFC822.HEADER") == null);
+        const want_bodystructure = std.mem.indexOf(u8, items_raw, "BODYSTRUCTURE") != null;
 
         var seq = start;
         while (seq <= end) : (seq += 1) {
@@ -836,37 +860,102 @@ pub const ImapSession = struct {
             else
                 content.len;
 
-            if (want_header and !want_body) {
-                // Return headers only
-                const header = content[0..header_end];
-                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (BODY[HEADER] {{{d}}}\r\n{s})", .{ seq, header.len, header });
+            const header = content[0..header_end];
+            const body = content[header_end..];
+
+            // Extract INTERNALDATE - try filename timestamp first, then Date header
+            var date_buf: [64]u8 = undefined;
+            var date_str: []const u8 = "01-Jan-2026 00:00:00 +0000";
+            // Try to parse epoch millis from filename (e.g., "1772259313773.eml")
+            const basename = if (std.mem.lastIndexOfScalar(u8, filename, '/')) |pos| filename[pos + 1 ..] else filename;
+            const name_no_ext = if (std.mem.endsWith(u8, basename, ".eml")) basename[0 .. basename.len - 4] else basename;
+            if (std.fmt.parseInt(i64, name_no_ext, 10)) |epoch_ms| {
+                date_str = formatImapDate(@divFloor(epoch_ms, 1000), &date_buf);
+            } else |_| {
+                // Try Date header
+                if (std.mem.indexOf(u8, header, "Date: ")) |date_pos| {
+                    const date_start = date_pos + 6;
+                    const date_line_end = std.mem.indexOfScalarPos(u8, header, date_start, '\r') orelse
+                        std.mem.indexOfScalarPos(u8, header, date_start, '\n') orelse header.len;
+                    const raw_date = header[date_start..date_line_end];
+                    // Try to parse RFC 2822 date and reformat
+                    date_str = parseAndFormatRfc2822Date(raw_date, &date_buf) orelse raw_date;
+                }
+            }
+
+            // Determine content type for BODYSTRUCTURE
+            var content_type: []const u8 = "text/plain";
+            var charset: []const u8 = "UTF-8";
+            if (std.mem.indexOf(u8, header, "Content-Type: ")) |ct_pos| {
+                const ct_start = ct_pos + 14;
+                const ct_end = std.mem.indexOfScalarPos(u8, header, ct_start, '\r') orelse
+                    std.mem.indexOfScalarPos(u8, header, ct_start, '\n') orelse header.len;
+                content_type = header[ct_start..ct_end];
+                if (std.mem.indexOf(u8, content_type, "charset=")) |cs_pos| {
+                    charset = std.mem.trim(u8, content_type[cs_pos + 8 ..], " \t\"");
+                    if (std.mem.indexOfScalar(u8, charset, ';')) |semi| {
+                        charset = charset[0..semi];
+                    }
+                }
+            }
+
+            // Determine if multipart
+            const is_multipart = std.mem.indexOf(u8, content_type, "multipart/") != null;
+            const is_html = std.mem.indexOf(u8, content_type, "text/html") != null;
+
+            // Build BODYSTRUCTURE string
+            var bs_buf: [512]u8 = undefined;
+            var bs_fbs = io_compat.fixedBufferStream(&bs_buf);
+            const bs_writer = bs_fbs.writer();
+            if (is_multipart) {
+                // Simplified multipart structure
+                bs_writer.print("((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"{s}\") NIL NIL \"7BIT\" {d} {d} NIL NIL NIL NIL)(\"TEXT\" \"HTML\" (\"CHARSET\" \"{s}\") NIL NIL \"7BIT\" {d} {d} NIL NIL NIL NIL) \"ALTERNATIVE\")", .{
+                    charset, body.len, body.len / 40 + 1, charset, body.len, body.len / 40 + 1,
+                }) catch {};
+            } else if (is_html) {
+                bs_writer.print("(\"TEXT\" \"HTML\" (\"CHARSET\" \"{s}\") NIL NIL \"7BIT\" {d} {d} NIL NIL NIL NIL)", .{
+                    charset, body.len, body.len / 40 + 1,
+                }) catch {};
+            } else {
+                bs_writer.print("(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"{s}\") NIL NIL \"7BIT\" {d} {d} NIL NIL NIL NIL)", .{
+                    charset, body.len, body.len / 40 + 1,
+                }) catch {};
+            }
+            const bodystructure = bs_fbs.getWritten();
+
+            // Build FETCH response
+            if (want_header_only and !want_full_body) {
+                // Header request (BODY.PEEK[HEADER]) - include all metadata + headers
+                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS (\\Seen) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} BODY[HEADER] {{{d}}}\r\n{s})", .{
+                    seq, seq, content.len, date_str,
+                    if (want_bodystructure) @as([]const u8, "") else "",
+                    header.len, header,
+                });
                 defer self.allocator.free(resp);
                 try self.writeData(resp);
                 try self.writeData("\r\n");
-            } else if (want_body) {
-                // Return full message
-                const section = if (want_header) "HEADER" else "";
-                const data = if (want_header) content[0..header_end] else content;
-                if (want_header) {
-                    const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (BODY[HEADER] {{{d}}}\r\n{s})", .{ seq, data.len, data });
-                    defer self.allocator.free(resp);
-                    try self.writeData(resp);
-                    try self.writeData("\r\n");
-                } else {
-                    _ = section;
-                    const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (FLAGS (\\Recent) RFC822.SIZE {d} BODY[] {{{d}}}\r\n{s})", .{ seq, content.len, content.len, content });
-                    defer self.allocator.free(resp);
-                    try self.writeData(resp);
-                    try self.writeData("\r\n");
-                }
-            } else if (want_flags) {
-                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (FLAGS (\\Recent) RFC822.SIZE {d})", .{ seq, content.len });
+            } else if (want_full_body) {
+                // Full body request (BODY.PEEK[] or BODY[])
+                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS (\\Seen) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} BODY[] {{{d}}}\r\n{s})", .{
+                    seq, seq, content.len, date_str,
+                    if (want_bodystructure)
+                        try std.fmt.allocPrint(self.allocator, " BODYSTRUCTURE {s}", .{bodystructure})
+                    else
+                        @as([]const u8, ""),
+                    content.len, content,
+                });
                 defer self.allocator.free(resp);
                 try self.writeData(resp);
                 try self.writeData("\r\n");
             } else {
-                // Default: return flags and size
-                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (FLAGS (\\Recent) RFC822.SIZE {d})", .{ seq, content.len });
+                // Metadata only (FLAGS, RFC822.SIZE, UID)
+                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS (\\Seen) RFC822.SIZE {d}{s})", .{
+                    seq, seq, content.len,
+                    if (want_internaldate)
+                        try std.fmt.allocPrint(self.allocator, " INTERNALDATE \"{s}\"", .{date_str})
+                    else
+                        @as([]const u8, ""),
+                });
                 defer self.allocator.free(resp);
                 try self.writeData(resp);
                 try self.writeData("\r\n");
@@ -925,6 +1014,25 @@ pub const ImapSession = struct {
 
     /// Process a single command
     pub fn processCommand(self: *ImapSession, line: []const u8) !void {
+        // Log every command for debugging
+        std.log.info("IMAP CMD: {s}", .{line});
+
+        // Handle DONE (ends IDLE mode) - DONE has no tag
+        if (self.idle_mode) {
+            const trimmed = std.mem.trim(u8, line, " \t\r\n");
+            if (std.ascii.eqlIgnoreCase(trimmed, "DONE")) {
+                self.idle_mode = false;
+                if (self.idle_tag) |saved_tag| {
+                    try self.sendResponse(saved_tag, "OK", "IDLE terminated");
+                    self.allocator.free(saved_tag);
+                    self.idle_tag = null;
+                } else {
+                    try self.sendResponse("*", "OK", "IDLE terminated");
+                }
+                return;
+            }
+        }
+
         // Parse command: TAG COMMAND [ARGS...]
         var parts = std.mem.splitScalar(u8, line, ' ');
 
@@ -1020,8 +1128,10 @@ pub const ImapSession = struct {
             },
             .fetch => {
                 const sequence_set = parts.next() orelse "1:*";
-                const items = parts.next() orelse "FLAGS";
-                try self.handleFetch(tag, sequence_set, items);
+                // Items may contain spaces (e.g. "(FLAGS UID BODY.PEEK[HEADER])"), get rest of line
+                const seq_end = @intFromPtr(sequence_set.ptr) + sequence_set.len - @intFromPtr(line.ptr);
+                const items = if (seq_end < line.len) std.mem.trim(u8, line[seq_end..], " \t") else "FLAGS";
+                try self.handleFetch(tag, sequence_set, if (items.len > 0) items else "FLAGS");
             },
             .search => try self.handleSearch(tag),
             .expunge => try self.handleExpunge(tag),
@@ -1036,17 +1146,23 @@ pub const ImapSession = struct {
                 try self.sendResponse(tag, "OK", "NAMESPACE completed");
             },
             .idle => {
-                // RFC 2177: IDLE - just accept and wait for DONE
+                // RFC 2177: IDLE - enter idle mode and wait for DONE
+                self.idle_mode = true;
+                // Save the tag so we can respond when DONE arrives
+                if (self.idle_tag) |old_tag| {
+                    self.allocator.free(old_tag);
+                }
+                self.idle_tag = self.allocator.dupe(u8, tag) catch null;
                 try self.writeData("+ idling\r\n");
-                // Apple Mail will send "DONE" to end IDLE
-                // We just wait for next command which will be DONE
             },
             .uid => {
                 // UID command - pass through to regular handler with UID prefix
                 const sub_cmd = parts.next() orelse "";
                 if (std.ascii.eqlIgnoreCase(sub_cmd, "FETCH")) {
                     const sequence_set = parts.next() orelse "1:*";
-                    const items = parts.rest();
+                    // Items may contain spaces (e.g. "(FLAGS UID BODY.PEEK[HEADER])"), get rest of line
+                    const seq_end = @intFromPtr(sequence_set.ptr) + sequence_set.len - @intFromPtr(line.ptr);
+                    const items = if (seq_end < line.len) std.mem.trim(u8, line[seq_end..], " \t") else "FLAGS";
                     try self.handleFetch(tag, sequence_set, if (items.len > 0) items else "FLAGS");
                 } else if (std.ascii.eqlIgnoreCase(sub_cmd, "SEARCH")) {
                     try self.handleSearch(tag);
@@ -1059,9 +1175,39 @@ pub const ImapSession = struct {
                 }
             },
             .append => {
-                // APPEND mailbox (\flags) {size} - accept but store the data
-                // For now, accept the literal and respond OK
+                // APPEND mailbox (\flags) {size} - accept the literal data
+                // Apple Mail uses APPEND to save sent messages to Sent folder
                 try self.sendResponse(tag, "OK", "[APPENDUID 1 1] APPEND completed");
+            },
+            .enable => {
+                // RFC 5161: ENABLE extension
+                try self.sendUntagged("ENABLED");
+                try self.sendResponse(tag, "OK", "ENABLE completed");
+            },
+            .id => {
+                // RFC 2971: ID extension
+                try self.sendUntagged("ID NIL");
+                try self.sendResponse(tag, "OK", "ID completed");
+            },
+            .create => {
+                // CREATE mailbox - pretend success for Apple Mail's Sent/Drafts/Trash
+                try self.sendResponse(tag, "OK", "CREATE completed");
+            },
+            .subscribe => {
+                try self.sendResponse(tag, "OK", "SUBSCRIBE completed");
+            },
+            .unsubscribe => {
+                try self.sendResponse(tag, "OK", "UNSUBSCRIBE completed");
+            },
+            .store => {
+                // STORE - set message flags (just acknowledge)
+                try self.sendResponse(tag, "OK", "STORE completed");
+            },
+            .copy => {
+                try self.sendResponse(tag, "OK", "COPY completed");
+            },
+            .check => {
+                try self.sendResponse(tag, "OK", "CHECK completed");
             },
             else => {
                 try self.sendResponse(tag, "BAD", "Command not implemented");
@@ -1422,6 +1568,78 @@ pub const ImapServer = struct {
         }
     }
 };
+
+/// Format epoch seconds as IMAP INTERNALDATE: "DD-Mon-YYYY HH:MM:SS +0000"
+fn formatImapDate(epoch_secs: i64, buf: *[64]u8) []const u8 {
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+    // Convert epoch seconds to date components
+    const SECS_PER_DAY: i64 = 86400;
+    var days = @divFloor(epoch_secs, SECS_PER_DAY);
+    var remaining_secs = @mod(epoch_secs, SECS_PER_DAY);
+    if (remaining_secs < 0) {
+        remaining_secs += SECS_PER_DAY;
+        days -= 1;
+    }
+
+    const hours: u32 = @intCast(@divFloor(remaining_secs, 3600));
+    const mins: u32 = @intCast(@divFloor(@mod(remaining_secs, 3600), 60));
+    const secs: u32 = @intCast(@mod(remaining_secs, 60));
+
+    // Days since Unix epoch (1 Jan 1970) to date
+    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
+    const z = days + 719468;
+    const era: i64 = @divFloor(if (z >= 0) z else z - 146096, 146097);
+    const doe: u32 = @intCast(z - era * 146097); // day of era [0, 146096]
+    const yoe: u32 = @intCast(@divFloor(doe - doe / 1460 + doe / 36524 - doe / 146096, 365));
+    const y: i64 = @as(i64, @intCast(yoe)) + era * 400;
+    const doy: u32 = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    const mp: u32 = (5 * doy + 2) / 153; // [0, 11]
+    const day: u32 = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    const month_idx: u32 = if (mp < 10) mp + 3 else mp - 9; // [1, 12]
+    const year: i64 = if (month_idx <= 2) y + 1 else y;
+
+    const mon = months[@as(usize, month_idx) - 1];
+    const len = (std.fmt.bufPrint(buf, "{d:0>2}-{s}-{d} {d:0>2}:{d:0>2}:{d:0>2} +0000", .{
+        day, mon, year, hours, mins, secs,
+    }) catch return "01-Jan-2026 00:00:00 +0000").len;
+    return buf[0..len];
+}
+
+/// Try to parse RFC 2822 date and reformat as IMAP INTERNALDATE
+/// Input: "Thu, 26 Feb 2026 05:39:21 +0000 (UTC)" or similar
+/// Output: "26-Feb-2026 05:39:21 +0000"
+fn parseAndFormatRfc2822Date(raw: []const u8, buf: *[64]u8) ?[]const u8 {
+    // Try to find day, month, year, time pattern
+    // Skip optional day-of-week prefix (e.g., "Thu, ")
+    var s = raw;
+    if (std.mem.indexOf(u8, s, ", ")) |comma_pos| {
+        s = s[comma_pos + 2 ..];
+    }
+    s = std.mem.trim(u8, s, " \t");
+
+    // Parse: DD Mon YYYY HH:MM:SS +ZZZZ
+    var parts_iter = std.mem.tokenizeAny(u8, s, " \t");
+    const day_s = parts_iter.next() orelse return null;
+    const mon_s = parts_iter.next() orelse return null;
+    const year_s = parts_iter.next() orelse return null;
+    const time_s = parts_iter.next() orelse return null;
+    const tz_s = parts_iter.next() orelse "+0000";
+
+    // Validate
+    const day = std.fmt.parseInt(u32, day_s, 10) catch return null;
+    _ = std.fmt.parseInt(i32, year_s, 10) catch return null;
+    if (time_s.len < 8) return null; // HH:MM:SS
+    if (mon_s.len < 3) return null;
+
+    // Use only first 5 chars of tz (skip trailing "(UTC)" etc)
+    const tz = if (tz_s.len >= 5) tz_s[0..5] else tz_s;
+
+    const len = (std.fmt.bufPrint(buf, "{d:0>2}-{s}-{s} {s} {s}", .{
+        day, mon_s[0..3], year_s, time_s, tz,
+    }) catch return null).len;
+    return buf[0..len];
+}
 
 // Tests
 test "IMAP command parsing" {

@@ -500,6 +500,21 @@ pub fn main(init: std.process.Init) !void {
         log.info("SMTPS Server listening on 0.0.0.0:{d} (implicit TLS)", .{smtps_port});
     }
 
+    // Start Submission server (port 587, STARTTLS) in a separate thread
+    var submission_thread: ?std.Thread = null;
+    const submission_port: u16 = blk: {
+        const port_str = env.get("SUBMISSION_PORT") orelse "587";
+        break :blk std.fmt.parseInt(u16, port_str, 10) catch 587;
+    };
+    if (cfg.enable_tls and cfg.tls_cert_path != null) {
+        submission_thread = try std.Thread.spawn(.{}, struct {
+            fn run(smtp_srv: *smtp.Server, port: u16, shutdown: *std.atomic.Value(bool)) void {
+                smtp_srv.startSubmission(port, shutdown);
+            }
+        }.run, .{ &server, submission_port, &shutdown_requested });
+        log.info("Submission Server listening on 0.0.0.0:{d} (STARTTLS)", .{submission_port});
+    }
+
     // Start IMAP server in a separate thread
     if (imap_server) |*is| {
         imap_thread = try std.Thread.spawn(.{}, struct {
@@ -557,6 +572,12 @@ pub fn main(init: std.process.Init) !void {
     if (smtps_thread) |t| {
         t.join();
         log.info("SMTPS server stopped", .{});
+    }
+
+    // Stop Submission thread on shutdown
+    if (submission_thread) |t| {
+        t.join();
+        log.info("Submission server stopped", .{});
     }
 
     // Stop IMAP server on shutdown

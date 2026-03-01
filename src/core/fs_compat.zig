@@ -47,10 +47,10 @@ pub const Dir = struct {
     /// Stat a file.
     pub fn statFile(self: Dir, sub_path: []const u8) StatError!Stat {
         _ = self;
-        const path_z = std.fmt.allocPrintZ(std.heap.c_allocator, "{s}", .{sub_path}) catch return error.SystemResources;
-        defer std.heap.c_allocator.free(path_z);
+        const path_z = toZ(sub_path) orelse return error.SystemResources;
+        defer freeZ(path_z, sub_path.len);
         var st: std.c.Stat = undefined;
-        const result = std.c.stat(path_z.ptr, &st);
+        const result = std.c.stat(path_z, &st);
         if (result != 0) return error.FileNotFound;
         return .{ .size = @intCast(st.size) };
     }

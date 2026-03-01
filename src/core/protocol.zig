@@ -494,8 +494,13 @@ pub const Session = struct {
             return;
         }
 
-        // Parse MAIL FROM:<address>
-        const from_start = std.mem.indexOf(u8, line, "FROM:") orelse {
+        // Parse MAIL FROM:<address> (case-insensitive for FROM:)
+        var upper_buf: [512]u8 = undefined;
+        const upper_len = @min(line.len, upper_buf.len);
+        for (line[0..upper_len], 0..) |c, i| {
+            upper_buf[i] = std.ascii.toUpper(c);
+        }
+        const from_start = std.mem.indexOf(u8, upper_buf[0..upper_len], "FROM:") orelse {
             try self.sendResponse(writer, 501, "Syntax: MAIL FROM:<address>", null);
             return;
         };
@@ -584,8 +589,13 @@ pub const Session = struct {
             return;
         }
 
-        // Parse RCPT TO:<address>
-        const to_start = std.mem.indexOf(u8, line, "TO:") orelse {
+        // Parse RCPT TO:<address> (case-insensitive for TO:)
+        var rcpt_upper_buf: [512]u8 = undefined;
+        const rcpt_upper_len = @min(line.len, rcpt_upper_buf.len);
+        for (line[0..rcpt_upper_len], 0..) |c, i| {
+            rcpt_upper_buf[i] = std.ascii.toUpper(c);
+        }
+        const to_start = std.mem.indexOf(u8, rcpt_upper_buf[0..rcpt_upper_len], "TO:") orelse {
             try self.sendResponse(writer, 501, "Syntax: RCPT TO:<address>", null);
             return;
         };

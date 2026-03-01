@@ -288,4 +288,55 @@ pub const Server = struct {
 
         smtps_listener.close();
     }
+
+    /// Start Submission listener on port 587 (STARTTLS).
+    /// Runs in a separate thread alongside the main SMTP server.
+    /// This is the standard port for mail clients to send outgoing mail.
+    pub fn startSubmission(self: *Server, submission_port: u16, shutdown_flag: *std.atomic.Value(bool)) void {
+        const address = socket.Address.parseIp(self.config.host, submission_port) catch |err| {
+            self.logger.err("Submission: Failed to parse address: {}", .{err});
+            return;
+        };
+
+        var submission_listener = socket.Server.listen(address, .{
+            .reuse_address = true,
+        }) catch |err| {
+            self.logger.err("Submission: Failed to listen on port {d}: {}", .{ submission_port, err });
+            return;
+        };
+
+        self.logger.info("Submission Server listening on {s}:{d} (STARTTLS)", .{ self.config.host, submission_port });
+
+        while (!shutdown_flag.load(.acquire)) {
+            const connection = submission_listener.accept() catch |err| {
+                if (err == error.OperationCancelled or err == error.WouldBlock) {
+                    time_compat.sleepMs(100);
+                    continue;
+                }
+                self.logger.err("Submission: Error accepting connection: {}", .{err});
+                continue;
+            };
+
+            _ = self.active_connections.fetchAdd(1, .monotonic);
+
+            self.logger.logConnection("client", "Submission connected");
+
+            const ctx = ConnectionContext{
+                .server = self,
+                .connection = connection,
+                .remote_addr = "client",
+                .implicit_tls = false, // STARTTLS, not implicit
+            };
+
+            const thread = std.Thread.spawn(.{}, handleConnection, .{ctx}) catch |err| {
+                self.logger.err("Submission: Failed to spawn handler: {}", .{err});
+                _ = self.active_connections.fetchSub(1, .monotonic);
+                connection.close();
+                continue;
+            };
+            thread.detach();
+        }
+
+        submission_listener.close();
+    }
 };
