@@ -33,3 +33,4 @@ config.local.zig
 test-emails/
 *.eml
 /pantry
+zig-pkg/
