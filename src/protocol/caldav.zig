@@ -1763,7 +1763,6 @@ pub const CalDavServer = struct {
 
             var tls_server = tls.nonblock.Server.init(.{
                 .auth = &self.cert_key_pair.?,
-                .now = .{ .nanoseconds = @intCast(time_compat.nanoTimestamp()) },
             });
 
             var recv_buf: [tls.input_buffer_len]u8 = undefined;

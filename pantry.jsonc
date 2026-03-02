@@ -4,7 +4,8 @@
   "description": "Modern SMTP/IMAP mail server written in Zig",
   "dependencies": {
     "ziglang.org": "0.16.0-dev",
-    "zig-bump": "~/Code/zig-bump"
+    "zig-bump": "~/Code/zig-bump",
+    "zig-tls": "zig-utils/zig-tls"
   },
   "repository": {
     "type": "git",

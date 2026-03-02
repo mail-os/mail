@@ -1610,7 +1610,6 @@ pub const ImapServer = struct {
             // Use nonblock TLS server handshake
             var tls_server = tls.nonblock.Server.init(.{
                 .auth = &self.cert_key_pair.?,
-                .now = .{ .nanoseconds = @intCast(time_compat.nanoTimestamp()) },
             });
 
             // Buffers for TLS handshake

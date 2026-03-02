@@ -356,7 +356,7 @@ fn linkSqlite3(exe: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) v
     if (is_cross_compiling) {
         // Cross-compilation: use bundled sqlite3 source
         exe.root_module.addCSourceFile(.{
-            .file = .{ .cwd_relative = "deps/sqlite3.c" },
+            .file = .{ .cwd_relative = "vendor/sqlite3.c" },
             .flags = &.{
                 "-DSQLITE_THREADSAFE=1",
                 "-DSQLITE_ENABLE_FTS5",
@@ -365,7 +365,7 @@ fn linkSqlite3(exe: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) v
                 "-DSQLITE_DQS=0",
             },
         });
-        exe.root_module.addIncludePath(.{ .cwd_relative = "deps" });
+        exe.root_module.addIncludePath(.{ .cwd_relative = "vendor" });
     } else {
         // Native build: use system sqlite3
         exe.root_module.linkSystemLibrary("sqlite3", .{});
@@ -385,7 +385,7 @@ fn linkPlatformLibraries(exe: *std.Build.Step.Compile, target: std.Build.Resolve
     if (is_cross_compiling) {
         // Add bundled sqlite3 source
         exe.root_module.addCSourceFile(.{
-            .file = .{ .cwd_relative = "deps/sqlite3.c" },
+            .file = .{ .cwd_relative = "vendor/sqlite3.c" },
             .flags = &.{
                 "-DSQLITE_THREADSAFE=1",
                 "-DSQLITE_ENABLE_FTS5",
@@ -394,7 +394,7 @@ fn linkPlatformLibraries(exe: *std.Build.Step.Compile, target: std.Build.Resolve
                 "-DSQLITE_DQS=0",
             },
         });
-        exe.root_module.addIncludePath(.{ .cwd_relative = "deps" });
+        exe.root_module.addIncludePath(.{ .cwd_relative = "vendor" });
     } else {
         // Native build: use system sqlite3
         switch (os_tag) {

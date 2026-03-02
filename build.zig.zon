@@ -33,7 +33,8 @@
     // internet connectivity.
     .dependencies = .{
         .tls = .{
-            .path = "deps/zig-tls",
+            .url = "https://github.com/zig-utils/zig-tls/archive/refs/heads/main.tar.gz",
+            .hash = "tls-0.1.0-MqkyGgaXBQBIE6lMw8rFtYmmECsuHELJkQDxDQ9UrgI6",
         },
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{

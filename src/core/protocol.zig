@@ -1188,7 +1188,7 @@ pub const Session = struct {
         defer cert_key.deinit(self.allocator);
 
         // Use non-blocking TLS handshake (matches proven IMAP pattern)
-        var server_hs = tls.nonblock.Server.init(.{ .auth = &cert_key, .now = .{ .nanoseconds = @intCast(time_compat.nanoTimestamp()) } });
+        var server_hs = tls.nonblock.Server.init(.{ .auth = &cert_key });
 
         // Buffers for TLS handshake
         var recv_buf: [tls.input_buffer_len]u8 = undefined;
