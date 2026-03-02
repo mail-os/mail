@@ -143,6 +143,7 @@ pub fn build(b: *std.Build) void {
         "src/security_test.zig",
         "src/errors_test.zig",
         "src/config_test.zig",
+        "src/fs_compat_test.zig",
     };
 
     // RFC compliance tests
@@ -164,6 +165,7 @@ pub fn build(b: *std.Build) void {
         "tests/rfc6352_carddav_test.zig",
         "tests/imap_notes_test.zig",
         "tests/security_hardening_test.zig",
+        "tests/imap_starttls_test.zig",
     };
 
     for (test_files) |test_file| {

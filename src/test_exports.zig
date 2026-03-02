@@ -24,3 +24,4 @@ pub const mime = @import("message/mime.zig");
 pub const message_submission = @import("protocol/message_submission.zig");
 pub const greylist = @import("antispam/greylist.zig");
 pub const io_compat = @import("core/io_compat.zig");
+pub const fs_compat = @import("core/fs_compat.zig");
