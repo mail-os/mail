@@ -260,6 +260,24 @@ fn parseFilenameTimestamp(filename: []const u8) i64 {
     return std.fmt.parseInt(i64, name_no_ext, 10) catch return 0;
 }
 
+/// Ensure a directory exists, creating it (and parent directories) if needed.
+pub fn ensureDir(path: []const u8) !void {
+    // Build path component by component, calling mkdir for each prefix
+    var path_buf: [4097]u8 = undefined;
+    var pos: usize = 0;
+    for (path, 0..) |c, i| {
+        if (pos >= path_buf.len - 1) break;
+        path_buf[pos] = c;
+        pos += 1;
+        if (c == '/' or i == path.len - 1) {
+            path_buf[pos] = 0;
+            const sentinel_ptr: [*:0]const u8 = @ptrCast(&path_buf);
+            _ = std.c.mkdir(sentinel_ptr, 0o755);
+            // Ignore errors - directory may already exist
+        }
+    }
+}
+
 /// List .eml files in a directory, returning filenames sorted by timestamp (oldest first).
 /// Files with epoch-millis filenames sort by their timestamp; non-timestamp files sort first (key=0)
 /// with alphabetical tiebreaker. This ensures new files always appear at the end, preserving
@@ -269,7 +287,7 @@ pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]con
     const path_z = toZ(dir_path) orelse return error.SystemResources;
     defer freeZ(path_z, dir_path.len);
 
-    const dir = std.c.opendir(path_z) orelse return &[_][]const u8{};
+    const dir = std.c.opendir(path_z) orelse return error.FileNotFound;
     defer _ = std.c.closedir(dir);
 
     var entries = std.ArrayList(EmlEntry){};
@@ -302,12 +320,14 @@ pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]con
     }.lessThan);
 
     // Extract just the filenames into the returned slice
-    var files = try allocator.alloc([]const u8, entries.items.len);
+    const files = try allocator.alloc([]const u8, entries.items.len);
     for (entries.items, 0..) |e, i| {
         files[i] = e.name;
     }
-    // Free only the ArrayList backing storage, not the name strings (now owned by files)
-    entries.items = &.{};
+
+    // Free the ArrayList's backing storage (the name strings are now owned by files).
+    // Do NOT set entries.items = &.{} before deinit — deinit uses items.ptr + capacity
+    // to compute the allocated slice, so changing items.ptr would cause a free of a bad pointer.
     entries.deinit(allocator);
 
     return files;

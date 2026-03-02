@@ -386,6 +386,8 @@ pub const ImapSession = struct {
     append_literal_size: usize = 0,
     append_literal_buf: ?[]u8 = null,
     append_literal_pos: usize = 0,
+    // STARTTLS upgrade requested (port 143 → TLS)
+    starttls_requested: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, connection: socket.Connection, auth_backend: *auth.AuthBackend) ImapSession {
         return .{
@@ -915,18 +917,52 @@ pub const ImapSession = struct {
         else
             try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ username, mailbox });
 
-        var files = fs_compat.listEmlFiles(self.allocator, user_dir) catch &[_][]const u8{};
+        // Ensure directory exists for standard mailboxes (Sent, Drafts, Trash, Junk, Archive)
+        if (!is_inbox) {
+            fs_compat.ensureDir(user_dir) catch {};
+        }
+
+        const files = fs_compat.listEmlFiles(self.allocator, user_dir) catch {
+            // Directory doesn't exist or can't be read — treat as empty
+            self.mailbox_dir = user_dir;
+            self.mailbox_files = null;
+            try self.sendUntagged("0 EXISTS");
+            try self.sendUntagged("0 RECENT");
+            try self.sendUntagged("OK [UIDVALIDITY 1772487000]");
+            try self.sendUntagged("OK [UIDNEXT 1]");
+            try self.sendUntagged("FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)");
+            try self.sendUntagged("OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)]");
+            self.state = .selected;
+            try self.sendResponse(tag, "OK", "[READ-WRITE] SELECT completed");
+            return;
+        };
         if (is_inbox and files.len == 0) {
             // Fall back to global mail/new/ for INBOX
             self.allocator.free(user_dir);
             const global_dir = try self.allocator.dupe(u8, "mail/new");
-            files = fs_compat.listEmlFiles(self.allocator, global_dir) catch &[_][]const u8{};
+            const inbox_files = fs_compat.listEmlFiles(self.allocator, global_dir) catch {
+                self.mailbox_dir = global_dir;
+                self.mailbox_files = null;
+                try self.sendUntagged("0 EXISTS");
+                try self.sendUntagged("0 RECENT");
+                try self.sendUntagged("OK [UIDVALIDITY 1772487000]");
+                try self.sendUntagged("OK [UIDNEXT 1]");
+                try self.sendUntagged("FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)");
+                try self.sendUntagged("OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)]");
+                self.state = .selected;
+                try self.sendResponse(tag, "OK", "[READ-WRITE] SELECT completed");
+                return;
+            };
             self.mailbox_dir = global_dir;
+            self.mailbox_files = if (inbox_files.len > 0) inbox_files else null;
         } else {
             self.mailbox_dir = user_dir;
+            self.mailbox_files = if (files.len > 0) files else null;
+            // Free the zero-length files slice if not stored
+            if (files.len == 0) {
+                self.allocator.free(files);
+            }
         }
-
-        self.mailbox_files = if (files.len > 0) files else null;
 
         const msg_count = if (self.mailbox_files) |f| f.len else 0;
 
@@ -1225,6 +1261,15 @@ pub const ImapSession = struct {
                 try self.sendResponse(tag, "OK", "NOOP completed");
             },
             .logout => try self.handleLogout(tag),
+            .starttls => {
+                // RFC 3501 Section 6.2.1 - STARTTLS
+                if (self.tls_connection != null) {
+                    try self.sendResponse(tag, "BAD", "TLS already active");
+                } else {
+                    try self.sendResponse(tag, "OK", "Begin TLS negotiation now");
+                    self.starttls_requested = true;
+                }
+            },
             .authenticate => {
                 const mechanism = parts.next() orelse "";
                 // Check for initial response on the same line (RFC 4959)
@@ -1824,7 +1869,7 @@ pub const ImapServer = struct {
             try session.sendGreeting();
 
             var buffer: [4096]u8 = undefined;
-            while (session.state != .logout) {
+            while (session.state != .logout and !session.starttls_requested) {
                 // During IDLE: set a short socket timeout so we can poll for new mail
                 if (session.idle_mode) {
                     const idle_tv: std.posix.timeval = .{ .sec = 5, .usec = 0 };
@@ -1867,6 +1912,187 @@ pub const ImapServer = struct {
                     logger.err("IMAP command processing error: {}", .{err});
                     break;
                 };
+            }
+
+            // STARTTLS upgrade: perform TLS handshake on the existing connection
+            if (session.starttls_requested and self.cert_key_pair != null) {
+                logger.info("Starting STARTTLS upgrade on port 143", .{});
+
+                var tls_server = tls.nonblock.Server.init(.{
+                    .auth = &self.cert_key_pair.?,
+                });
+
+                var recv_buf: [tls.input_buffer_len]u8 = undefined;
+                var send_buf: [tls.output_buffer_len]u8 = undefined;
+                var recv_len: usize = 0;
+
+                // Perform handshake loop
+                var handshake_ok = true;
+                while (!tls_server.done()) {
+                    const result = tls_server.run(recv_buf[0..recv_len], &send_buf) catch |err| {
+                        logger.err("STARTTLS handshake error: {}", .{err});
+                        handshake_ok = false;
+                        break;
+                    };
+
+                    if (result.recv_pos > 0) {
+                        const remaining = recv_len - result.recv_pos;
+                        if (remaining > 0) {
+                            std.mem.copyForwards(u8, &recv_buf, recv_buf[result.recv_pos..recv_len]);
+                        }
+                        recv_len = remaining;
+                    }
+
+                    if (result.send.len > 0) {
+                        var sent: usize = 0;
+                        while (sent < result.send.len) {
+                            const n = connection.write(result.send[sent..]) catch |err| {
+                                logger.err("STARTTLS handshake write error: {}", .{err});
+                                handshake_ok = false;
+                                break;
+                            };
+                            if (n == 0) {
+                                handshake_ok = false;
+                                break;
+                            }
+                            sent += n;
+                        }
+                        if (!handshake_ok) break;
+                    }
+
+                    if (!tls_server.done()) {
+                        const n = connection.read(recv_buf[recv_len..]) catch |err| {
+                            logger.err("STARTTLS handshake read error: {}", .{err});
+                            handshake_ok = false;
+                            break;
+                        };
+                        if (n == 0) {
+                            handshake_ok = false;
+                            break;
+                        }
+                        recv_len += n;
+                    }
+                }
+
+                if (handshake_ok) {
+                    if (tls_server.cipher()) |cipher| {
+                        logger.info("STARTTLS handshake completed successfully", .{});
+                        var starttls_tls_conn = tls.nonblock.Connection.init(cipher);
+                        session.setTlsConnection(&starttls_tls_conn);
+                        session.starttls_requested = false;
+
+                        // Enter TLS encrypted read loop (same as IMAPS)
+                        var tls_recv_buf: [tls.input_buffer_len]u8 = undefined;
+                        var cleartext_buf: [16384]u8 = undefined;
+                        var ciphertext_accum: [tls.input_buffer_len * 2]u8 = undefined;
+                        var ciphertext_len: usize = 0;
+                        var cleartext_accum: [16384]u8 = undefined;
+                        var cleartext_accum_len: usize = 0;
+
+                        while (session.state != .logout) {
+                            if (session.idle_mode) {
+                                const idle_tv: std.posix.timeval = .{ .sec = 5, .usec = 0 };
+                                std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&idle_tv)) catch {};
+                            }
+
+                            const bytes_read = connection.read(tls_recv_buf[0..]) catch |err| {
+                                if (session.idle_mode and (err == error.WouldBlock or err == error.ConnectionTimedOut)) {
+                                    if (session.state == .selected) {
+                                        _ = session.rescanMailbox() catch {};
+                                    }
+                                    continue;
+                                }
+                                break;
+                            };
+                            if (bytes_read == 0) break;
+
+                            if (!session.idle_mode) {
+                                const no_tv: std.posix.timeval = .{ .sec = 0, .usec = 0 };
+                                std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&no_tv)) catch {};
+                            }
+
+                            if (ciphertext_len + bytes_read <= ciphertext_accum.len) {
+                                @memcpy(ciphertext_accum[ciphertext_len..][0..bytes_read], tls_recv_buf[0..bytes_read]);
+                                ciphertext_len += bytes_read;
+                            } else {
+                                logger.err("IMAP STARTTLS: ciphertext buffer overflow", .{});
+                                break;
+                            }
+
+                            const dec_result = starttls_tls_conn.decrypt(ciphertext_accum[0..ciphertext_len], &cleartext_buf) catch |err| {
+                                logger.err("STARTTLS decrypt error: {}", .{err});
+                                break;
+                            };
+
+                            if (dec_result.cleartext.len > 0) {
+                                const avail = cleartext_accum.len - cleartext_accum_len;
+                                const copy_len = @min(dec_result.cleartext.len, avail);
+                                @memcpy(cleartext_accum[cleartext_accum_len..][0..copy_len], dec_result.cleartext[0..copy_len]);
+                                cleartext_accum_len += copy_len;
+
+                                var processed: usize = 0;
+                                while (processed < cleartext_accum_len) {
+                                    if (session.append_literal_buf) |buf| {
+                                        const needed = session.append_literal_size - session.append_literal_pos;
+                                        const available = cleartext_accum_len - processed;
+                                        const lit_len = @min(needed, available);
+                                        @memcpy(buf[session.append_literal_pos..][0..lit_len], cleartext_accum[processed..][0..lit_len]);
+                                        session.append_literal_pos += lit_len;
+                                        processed += lit_len;
+                                        if (session.append_literal_pos >= session.append_literal_size) {
+                                            session.finalizeAppend() catch |err| {
+                                                logger.err("IMAP APPEND finalize error: {}", .{err});
+                                            };
+                                            if (processed + 2 <= cleartext_accum_len and
+                                                cleartext_accum[processed] == '\r' and cleartext_accum[processed + 1] == '\n')
+                                            {
+                                                processed += 2;
+                                            }
+                                        }
+                                        continue;
+                                    }
+
+                                    const remaining = cleartext_accum[processed..cleartext_accum_len];
+                                    const line_end = std.mem.indexOf(u8, remaining, "\r\n") orelse break;
+                                    if (line_end > 0) {
+                                        const line = remaining[0..line_end];
+                                        session.processCommand(line) catch |err| {
+                                            logger.err("IMAP command processing error: {}", .{err});
+                                        };
+                                    }
+                                    processed += line_end + 2;
+                                    if (session.state == .logout) break;
+                                }
+
+                                if (processed > 0) {
+                                    const leftover = cleartext_accum_len - processed;
+                                    if (leftover > 0) {
+                                        std.mem.copyForwards(u8, &cleartext_accum, cleartext_accum[processed..cleartext_accum_len]);
+                                    }
+                                    cleartext_accum_len = leftover;
+                                }
+                            }
+
+                            if (dec_result.ciphertext_pos > 0) {
+                                const remaining = ciphertext_len - dec_result.ciphertext_pos;
+                                if (remaining > 0) {
+                                    std.mem.copyForwards(u8, &ciphertext_accum, ciphertext_accum[dec_result.ciphertext_pos..ciphertext_len]);
+                                }
+                                ciphertext_len = remaining;
+                            }
+
+                            if (dec_result.closed) break;
+                        }
+
+                        // Send close notify
+                        var close_buf: [64]u8 = undefined;
+                        if (starttls_tls_conn.close(&close_buf)) |close_data| {
+                            _ = connection.write(close_data) catch {};
+                        } else |_| {}
+                    } else {
+                        logger.err("STARTTLS: no cipher after handshake", .{});
+                    }
+                }
             }
         }
     }
