@@ -1642,8 +1642,9 @@ pub const CalDavServer = struct {
 
         // Load TLS certificate if configured
         if (config.enable_ssl and config.cert_path != null and config.key_path != null) {
-            server.cert_key_pair = tls.config.CertKeyPair.fromFilePathAbsoluteSync(
+            server.cert_key_pair = tls.config.CertKeyPair.fromFilePathAbsolute(
                 allocator,
+                io_compat.getIo(),
                 config.cert_path.?,
                 config.key_path.?,
             ) catch |err| {
@@ -1761,6 +1762,7 @@ pub const CalDavServer = struct {
 
             var tls_server = tls.nonblock.Server.init(.{
                 .auth = &self.cert_key_pair.?,
+                .now = std.Io.Timestamp.now(io_compat.getIo(), .real),
             });
 
             var recv_buf: [tls.input_buffer_len]u8 = undefined;

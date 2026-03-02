@@ -956,8 +956,8 @@ pub const ImapSession = struct {
             (std.mem.indexOf(u8, items_raw, "BODY[]") != null) or
             (std.mem.indexOf(u8, items_raw, "BODY[TEXT]") != null) or
             (std.mem.indexOf(u8, items_raw, "RFC822") != null and
-            std.mem.indexOf(u8, items_raw, "RFC822.SIZE") == null and
-            std.mem.indexOf(u8, items_raw, "RFC822.HEADER") == null);
+                std.mem.indexOf(u8, items_raw, "RFC822.SIZE") == null and
+                std.mem.indexOf(u8, items_raw, "RFC822.HEADER") == null);
         const want_bodystructure = std.mem.indexOf(u8, items_raw, "BODYSTRUCTURE") != null;
 
         var seq = start;
@@ -1047,9 +1047,8 @@ pub const ImapSession = struct {
             if (want_header_only and !want_full_body) {
                 // Header request (BODY.PEEK[HEADER]) - include all metadata + headers
                 const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS (\\Seen) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} BODY[HEADER] {{{d}}}\r\n{s})", .{
-                    seq, seq, content.len, date_str,
-                    if (want_bodystructure) @as([]const u8, "") else "",
-                    header.len, header,
+                    seq,                                                 seq,        content.len, date_str,
+                    if (want_bodystructure) @as([]const u8, "") else "", header.len, header,
                 });
                 defer self.allocator.free(resp);
                 try self.writeData(resp);
@@ -1057,12 +1056,13 @@ pub const ImapSession = struct {
             } else if (want_full_body) {
                 // Full body request (BODY.PEEK[] or BODY[])
                 const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS (\\Seen) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} BODY[] {{{d}}}\r\n{s})", .{
-                    seq, seq, content.len, date_str,
+                    seq,         seq, content.len, date_str,
                     if (want_bodystructure)
                         try std.fmt.allocPrint(self.allocator, " BODYSTRUCTURE {s}", .{bodystructure})
                     else
                         @as([]const u8, ""),
-                    content.len, content,
+                    content.len,
+                    content,
                 });
                 defer self.allocator.free(resp);
                 try self.writeData(resp);
@@ -1408,8 +1408,9 @@ pub const ImapServer = struct {
 
         // Load TLS certificate if configured
         if (config.enable_ssl and config.cert_path != null and config.key_path != null) {
-            server.cert_key_pair = tls.config.CertKeyPair.fromFilePathAbsoluteSync(
+            server.cert_key_pair = tls.config.CertKeyPair.fromFilePathAbsolute(
                 allocator,
+                io_compat.getIo(),
                 config.cert_path.?,
                 config.key_path.?,
             ) catch |err| {
@@ -1560,7 +1561,7 @@ pub const ImapServer = struct {
             // Use nonblock TLS server handshake
             var tls_server = tls.nonblock.Server.init(.{
                 .auth = &self.cert_key_pair.?,
-                // cipher_suites defaults to cipher_suites.all which includes TLS 1.2
+                .now = std.Io.Timestamp.now(io_compat.getIo(), .real),
             });
 
             // Buffers for TLS handshake

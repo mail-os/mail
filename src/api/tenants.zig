@@ -319,7 +319,10 @@ pub const TenantsAPI = struct {
     fn escapeJsonStr(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
         var needs_escape = false;
         for (s) |c| {
-            if (c == '"' or c == '\\' or c < 0x20) { needs_escape = true; break; }
+            if (c == '"' or c == '\\' or c < 0x20) {
+                needs_escape = true;
+                break;
+            }
         }
         if (!needs_escape) return try allocator.dupe(u8, s);
         var result: std.ArrayList(u8) = .{};

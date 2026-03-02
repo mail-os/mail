@@ -1176,8 +1176,9 @@ pub const Session = struct {
             break :blk key_path_buf[0..len];
         };
 
-        var cert_key = tls.config.CertKeyPair.fromFilePathAbsoluteSync(
+        var cert_key = tls.config.CertKeyPair.fromFilePathAbsolute(
             self.allocator,
+            io_compat.getIo(),
             abs_cert_path,
             abs_key_path,
         ) catch |err| {
@@ -1187,7 +1188,7 @@ pub const Session = struct {
         defer cert_key.deinit(self.allocator);
 
         // Use non-blocking TLS handshake (matches proven IMAP pattern)
-        var server_hs = tls.nonblock.Server.init(.{ .auth = &cert_key });
+        var server_hs = tls.nonblock.Server.init(.{ .auth = &cert_key, .now = std.Io.Timestamp.now(io_compat.getIo(), .real) });
 
         // Buffers for TLS handshake
         var recv_buf: [tls.input_buffer_len]u8 = undefined;

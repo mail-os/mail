@@ -7,7 +7,6 @@ const time_compat = @import("../core/time_compat.zig");
 /// AWS blocks outbound port 25 on EC2 instances, so we relay through
 /// SES using the AWS CLI (which uses the instance IAM role credentials).
 /// The instance role has ses:SendRawEmail permission.
-
 /// Deliver an email to a remote recipient via AWS SES.
 /// Base64-encodes the raw message, writes a JSON input file, and calls
 /// `aws ses send-raw-email --cli-input-json`.
@@ -84,9 +83,9 @@ pub fn deliverToRemote(
     // Spawn `aws ses send-raw-email --cli-input-json file:///tmp/ses-input-{ts}.json`
     var child = try std.process.spawn(io, .{
         .argv = &[_][]const u8{
-            "aws",               "ses",
-            "send-raw-email",    "--region",
-            "us-east-1",         "--cli-input-json",
+            "aws",            "ses",
+            "send-raw-email", "--region",
+            "us-east-1",      "--cli-input-json",
             file_arg,
         },
     });
