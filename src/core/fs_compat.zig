@@ -246,7 +246,24 @@ fn freeZ(ptr: [*:0]const u8, len: usize) void {
     std.heap.c_allocator.free(slice);
 }
 
-/// List .eml files in a directory, returning sorted filenames.
+/// Entry for sorting .eml files by timestamp then name.
+const EmlEntry = struct {
+    name: []const u8,
+    sort_key: i64, // epoch millis from filename, or 0 for non-timestamp names
+};
+
+/// Extract epoch millis from a filename like "1772486685658.eml" → 1772486685658.
+/// Returns 0 for filenames that aren't numeric timestamps (e.g. SES message IDs).
+fn parseFilenameTimestamp(filename: []const u8) i64 {
+    const basename = if (std.mem.lastIndexOfScalar(u8, filename, '/')) |pos| filename[pos + 1 ..] else filename;
+    const name_no_ext = if (std.mem.endsWith(u8, basename, ".eml")) basename[0 .. basename.len - 4] else basename;
+    return std.fmt.parseInt(i64, name_no_ext, 10) catch return 0;
+}
+
+/// List .eml files in a directory, returning filenames sorted by timestamp (oldest first).
+/// Files with epoch-millis filenames sort by their timestamp; non-timestamp files sort first (key=0)
+/// with alphabetical tiebreaker. This ensures new files always appear at the end, preserving
+/// IMAP UID stability (UIDs are 1-based indices into this sorted list).
 /// Caller owns the returned slice and each filename string (allocated with `allocator`).
 pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]const u8 {
     const path_z = toZ(dir_path) orelse return error.SystemResources;
@@ -255,10 +272,10 @@ pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]con
     const dir = std.c.opendir(path_z) orelse return &[_][]const u8{};
     defer _ = std.c.closedir(dir);
 
-    var files = std.ArrayList([]const u8){};
+    var entries = std.ArrayList(EmlEntry){};
     errdefer {
-        for (files.items) |f| allocator.free(f);
-        files.deinit(allocator);
+        for (entries.items) |e| allocator.free(e.name);
+        entries.deinit(allocator);
     }
 
     while (std.c.readdir(dir)) |entry| {
@@ -266,19 +283,34 @@ pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]con
         const name = std.mem.sliceTo(name_ptr, 0);
         if (name.len > 4 and std.mem.eql(u8, name[name.len - 4 ..], ".eml")) {
             const owned = try allocator.dupe(u8, name);
-            try files.append(allocator, owned);
+            try entries.append(allocator, .{
+                .name = owned,
+                .sort_key = parseFilenameTimestamp(name),
+            });
         }
     }
 
-    // Sort filenames (they are timestamps, so lexicographic sort = chronological)
-    const items = files.items;
-    std.mem.sort([]const u8, items, {}, struct {
-        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
+    // Sort by timestamp (oldest first), then by name as tiebreaker.
+    // Non-timestamp files (sort_key=0) sort before all timestamp files.
+    // This ensures new files (highest timestamp) always sort to the end,
+    // so existing IMAP UIDs (which are 1-based indices) remain stable.
+    std.mem.sort(EmlEntry, entries.items, {}, struct {
+        fn lessThan(_: void, a: EmlEntry, b: EmlEntry) bool {
+            if (a.sort_key != b.sort_key) return a.sort_key < b.sort_key;
+            return std.mem.order(u8, a.name, b.name) == .lt;
         }
     }.lessThan);
 
-    return files.toOwnedSlice(allocator);
+    // Extract just the filenames into the returned slice
+    var files = try allocator.alloc([]const u8, entries.items.len);
+    for (entries.items, 0..) |e, i| {
+        files[i] = e.name;
+    }
+    // Free only the ArrayList backing storage, not the name strings (now owned by files)
+    entries.items = &.{};
+    entries.deinit(allocator);
+
+    return files;
 }
 
 /// Read entire file contents into an allocated buffer.

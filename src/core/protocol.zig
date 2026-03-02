@@ -1188,7 +1188,7 @@ pub const Session = struct {
         defer cert_key.deinit(self.allocator);
 
         // Use non-blocking TLS handshake (matches proven IMAP pattern)
-        var server_hs = tls.nonblock.Server.init(.{ .auth = &cert_key, .now = std.Io.Timestamp.now(io_compat.getIo(), .real) });
+        var server_hs = tls.nonblock.Server.init(.{ .auth = &cert_key, .now = .{ .nanoseconds = @intCast(time_compat.nanoTimestamp()) } });
 
         // Buffers for TLS handshake
         var recv_buf: [tls.input_buffer_len]u8 = undefined;
@@ -1367,6 +1367,8 @@ pub const Session = struct {
                         continue;
                     },
                     .hostname = self.config.hostname,
+                    .delivery_method = self.config.delivery_method,
+                    .ses_region = self.config.ses_region,
                 };
                 const thread = std.Thread.spawn(.{}, outboundWorker, .{bg}) catch |err| {
                     self.logger.err("Failed to spawn outbound thread for {s}: {}", .{ rcpt, err });
@@ -1387,6 +1389,8 @@ pub const Session = struct {
         to: []u8,
         data: []u8,
         hostname: []const u8,
+        delivery_method: config.DeliveryMethod,
+        ses_region: []const u8,
     };
 
     fn outboundWorker(ctx: *OutboundContext) void {
@@ -1402,6 +1406,8 @@ pub const Session = struct {
             ctx.to,
             ctx.data,
             ctx.hostname,
+            ctx.delivery_method,
+            ctx.ses_region,
         ) catch |err| {
             std.log.err("Outbound delivery to {s} failed: {}", .{ ctx.to, err });
         };

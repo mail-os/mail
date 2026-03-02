@@ -131,7 +131,7 @@ pub const cert = struct {
 
     pub fn fromFilePathAbsolute(allocator: mem.Allocator, io: Io, path: []const u8) !Bundle {
         var bundle: Bundle = .{};
-        try bundle.addCertsFromFilePathAbsolute(allocator, io, Io.Clock.real.now(io), path);
+        try bundle.addCertsFromFilePathAbsolute(allocator, io, try Io.Clock.real.now(io), path);
         return bundle;
     }
 

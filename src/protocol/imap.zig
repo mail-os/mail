@@ -430,6 +430,45 @@ pub const ImapSession = struct {
         }
     }
 
+    /// Re-scan the current mailbox for new messages.
+    /// If the message count changed, sends untagged EXISTS/RECENT responses
+    /// so the client knows to fetch new messages. Returns true if new mail found.
+    fn rescanMailbox(self: *ImapSession) !bool {
+        const dir = self.mailbox_dir orelse return false;
+        const old_count: usize = if (self.mailbox_files) |f| f.len else 0;
+
+        // Re-read the maildir
+        const new_files = fs_compat.listEmlFiles(self.allocator, dir) catch return false;
+        const new_count = new_files.len;
+
+        if (new_count != old_count) {
+            // Free old file list (but keep mailbox_dir — it hasn't changed)
+            if (self.mailbox_files) |old_files| {
+                for (old_files) |f| self.allocator.free(f);
+                self.allocator.free(old_files);
+            }
+            self.mailbox_files = if (new_count > 0) new_files else null;
+
+            // Notify client of new message count
+            const exists_msg = try std.fmt.allocPrint(self.allocator, "{d} EXISTS", .{new_count});
+            defer self.allocator.free(exists_msg);
+            try self.sendUntagged(exists_msg);
+
+            const recent_count = if (new_count > old_count) new_count - old_count else 0;
+            const recent_msg = try std.fmt.allocPrint(self.allocator, "{d} RECENT", .{recent_count});
+            defer self.allocator.free(recent_msg);
+            try self.sendUntagged(recent_msg);
+
+            std.log.info("IMAP mailbox rescan: {d} -> {d} messages ({d} new)", .{ old_count, new_count, recent_count });
+            return true;
+        }
+
+        // No change — free the new list we just read
+        for (new_files) |f| self.allocator.free(f);
+        self.allocator.free(new_files);
+        return false;
+    }
+
     /// Clean up pending APPEND state
     fn cleanupAppend(self: *ImapSession) void {
         if (self.append_tag) |t| {
@@ -507,7 +546,7 @@ pub const ImapSession = struct {
         // Send OK with APPENDUID
         var resp_buf: [256]u8 = undefined;
         var fbs = io_compat.fixedBufferStream(&resp_buf);
-        fbs.writer().print("[APPENDUID 1740700800 {d}] APPEND completed", .{uid}) catch {
+        fbs.writer().print("[APPENDUID 1772487000 {d}] APPEND completed", .{uid}) catch {
             try self.sendResponse(tag, "OK", "APPEND completed");
             self.cleanupAppend();
             return;
@@ -699,7 +738,7 @@ pub const ImapSession = struct {
         }
         if (want_uidvalidity) {
             if (!first) try writer.writeAll(" ");
-            try writer.writeAll("UIDVALIDITY 1740700800");
+            try writer.writeAll("UIDVALIDITY 1772487000");
             first = false;
         }
         if (want_unseen) {
@@ -900,7 +939,7 @@ pub const ImapSession = struct {
         defer self.allocator.free(recent_msg);
         try self.sendUntagged(recent_msg);
 
-        try self.sendUntagged("OK [UIDVALIDITY 1740700800]");
+        try self.sendUntagged("OK [UIDVALIDITY 1772487000]");
         const uidnext_msg = try std.fmt.allocPrint(self.allocator, "OK [UIDNEXT {d}]", .{msg_count + 1});
         defer self.allocator.free(uidnext_msg);
         try self.sendUntagged(uidnext_msg);
@@ -1142,6 +1181,10 @@ pub const ImapSession = struct {
             const trimmed = std.mem.trim(u8, line, " \t\r\n");
             if (std.ascii.eqlIgnoreCase(trimmed, "DONE")) {
                 self.idle_mode = false;
+                // Rescan mailbox for new messages before ending IDLE
+                if (self.state == .selected) {
+                    _ = self.rescanMailbox() catch {};
+                }
                 if (self.idle_tag) |saved_tag| {
                     try self.sendResponse(saved_tag, "OK", "IDLE terminated");
                     self.allocator.free(saved_tag);
@@ -1174,7 +1217,13 @@ pub const ImapSession = struct {
         // Handle command
         switch (command) {
             .capability => try self.handleCapability(tag),
-            .noop => try self.sendResponse(tag, "OK", "NOOP completed"),
+            .noop => {
+                // RFC 3501: NOOP - check for new messages in selected mailbox
+                if (self.state == .selected) {
+                    _ = self.rescanMailbox() catch {};
+                }
+                try self.sendResponse(tag, "OK", "NOOP completed");
+            },
             .logout => try self.handleLogout(tag),
             .authenticate => {
                 const mechanism = parts.next() orelse "";
@@ -1332,7 +1381,7 @@ pub const ImapSession = struct {
                 }
 
                 // No literal found - just acknowledge
-                try self.sendResponse(tag, "OK", "[APPENDUID 1740700800 1] APPEND completed");
+                try self.sendResponse(tag, "OK", "[APPENDUID 1772487000 1] APPEND completed");
             },
             .enable => {
                 // RFC 5161: ENABLE extension
@@ -1561,7 +1610,7 @@ pub const ImapServer = struct {
             // Use nonblock TLS server handshake
             var tls_server = tls.nonblock.Server.init(.{
                 .auth = &self.cert_key_pair.?,
-                .now = std.Io.Timestamp.now(io_compat.getIo(), .real),
+                .now = .{ .nanoseconds = @intCast(time_compat.nanoTimestamp()) },
             });
 
             // Buffers for TLS handshake
@@ -1646,10 +1695,40 @@ pub const ImapServer = struct {
             var cleartext_accum: [16384]u8 = undefined;
             var cleartext_accum_len: usize = 0;
 
+            // Track IDLE polling state
+            var idle_poll_counter: u32 = 0;
+
             while (session.state != .logout) {
+                // During IDLE: set a short socket timeout so we can poll for new mail
+                if (session.idle_mode) {
+                    const idle_tv: std.posix.timeval = .{ .sec = 5, .usec = 0 };
+                    std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&idle_tv)) catch {};
+                }
+
                 // Read ciphertext from socket
-                const bytes_read = connection.read(recv_buf[0..]) catch break;
+                const bytes_read = connection.read(recv_buf[0..]) catch |err| {
+                    // During IDLE, timeout is expected — poll for new mail
+                    if (session.idle_mode and (err == error.WouldBlock or err == error.ConnectionTimedOut)) {
+                        idle_poll_counter += 1;
+                        // Check for new messages every poll cycle (~5 seconds)
+                        if (session.state == .selected) {
+                            _ = session.rescanMailbox() catch {};
+                        }
+                        continue;
+                    }
+                    break;
+                };
                 if (bytes_read == 0) break;
+
+                // If we got data during IDLE, restore normal timeout
+                if (session.idle_mode) {
+                    idle_poll_counter = 0;
+                }
+                // Restore normal (no timeout) when not in IDLE
+                if (!session.idle_mode) {
+                    const no_tv: std.posix.timeval = .{ .sec = 0, .usec = 0 };
+                    std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&no_tv)) catch {};
+                }
 
                 // Accumulate ciphertext
                 if (ciphertext_len + bytes_read <= ciphertext_accum.len) {
@@ -1747,8 +1826,28 @@ pub const ImapServer = struct {
 
             var buffer: [4096]u8 = undefined;
             while (session.state != .logout) {
-                const bytes_read = connection.read(&buffer) catch break;
+                // During IDLE: set a short socket timeout so we can poll for new mail
+                if (session.idle_mode) {
+                    const idle_tv: std.posix.timeval = .{ .sec = 5, .usec = 0 };
+                    std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&idle_tv)) catch {};
+                }
+
+                const bytes_read = connection.read(&buffer) catch |err| {
+                    if (session.idle_mode and (err == error.WouldBlock or err == error.ConnectionTimedOut)) {
+                        if (session.state == .selected) {
+                            _ = session.rescanMailbox() catch {};
+                        }
+                        continue;
+                    }
+                    break;
+                };
                 if (bytes_read == 0) break;
+
+                // Restore normal timeout when leaving IDLE
+                if (!session.idle_mode) {
+                    const no_tv: std.posix.timeval = .{ .sec = 0, .usec = 0 };
+                    std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&no_tv)) catch {};
+                }
 
                 // If collecting APPEND literal data, feed bytes to the buffer
                 if (session.append_literal_buf) |buf| {

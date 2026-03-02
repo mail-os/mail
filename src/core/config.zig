@@ -21,6 +21,11 @@ pub const ValidationError = error{
     InvalidHostnameFormat,
 };
 
+pub const DeliveryMethod = enum {
+    ses, // Relay through AWS SES (works when port 25 is blocked)
+    direct, // Direct MX delivery (requires outbound port 25)
+};
+
 pub const Config = struct {
     host: []const u8,
     port: u16,
@@ -67,6 +72,10 @@ pub const Config = struct {
     enable_managesieve: bool = false,
     managesieve_port: u16 = 4190,
     enable_milter: bool = false,
+
+    // Outbound delivery method: "ses" (AWS SES relay), "direct" (direct MX delivery)
+    delivery_method: DeliveryMethod = .ses,
+    ses_region: []const u8 = "us-east-1",
 
     pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
         allocator.free(self.tracing_service_name);
@@ -499,6 +508,20 @@ fn applyEnvironmentVariables(allocator: std.mem.Allocator, cfg: *Config) !void {
     }
     if (env.get("SMTP_ENABLE_MILTER")) |value| {
         cfg.enable_milter = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+
+    // SMTP_DELIVERY_METHOD (ses or direct)
+    if (env.get("SMTP_DELIVERY_METHOD")) |value| {
+        if (std.ascii.eqlIgnoreCase(value, "direct")) {
+            cfg.delivery_method = .direct;
+        } else {
+            cfg.delivery_method = .ses;
+        }
+    }
+
+    // SMTP_SES_REGION
+    if (env.get("SMTP_SES_REGION")) |value| {
+        cfg.ses_region = try allocator.dupe(u8, value);
     }
 }
 

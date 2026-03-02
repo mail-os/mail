@@ -5,6 +5,7 @@ const io_compat = @import("../core/io_compat.zig");
 const auth = @import("../auth/auth.zig");
 const logger = @import("../core/logger.zig");
 const tls = @import("tls");
+const time_compat = @import("../core/time_compat.zig");
 const caldav_store = @import("../storage/caldav_store.zig");
 
 /// Get the current epoch timestamp in seconds.
@@ -1762,7 +1763,7 @@ pub const CalDavServer = struct {
 
             var tls_server = tls.nonblock.Server.init(.{
                 .auth = &self.cert_key_pair.?,
-                .now = std.Io.Timestamp.now(io_compat.getIo(), .real),
+                .now = .{ .nanoseconds = @intCast(time_compat.nanoTimestamp()) },
             });
 
             var recv_buf: [tls.input_buffer_len]u8 = undefined;
