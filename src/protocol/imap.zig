@@ -380,6 +380,12 @@ pub const ImapSession = struct {
     mailbox_files: ?[]const []const u8 = null,
     // Path to the selected mailbox's new/ directory
     mailbox_dir: ?[]const u8 = null,
+    // Pending APPEND literal state
+    append_tag: ?[]u8 = null,
+    append_mailbox: ?[]u8 = null,
+    append_literal_size: usize = 0,
+    append_literal_buf: ?[]u8 = null,
+    append_literal_pos: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, connection: socket.Connection, auth_backend: *auth.AuthBackend) ImapSession {
         return .{
@@ -407,6 +413,7 @@ pub const ImapSession = struct {
         if (self.idle_tag) |idle_tag| {
             self.allocator.free(idle_tag);
         }
+        self.cleanupAppend();
         self.freeMailboxFiles();
         self.command_buffer.deinit(self.allocator);
     }
@@ -421,6 +428,117 @@ pub const ImapSession = struct {
             self.allocator.free(d);
             self.mailbox_dir = null;
         }
+    }
+
+    /// Clean up pending APPEND state
+    fn cleanupAppend(self: *ImapSession) void {
+        if (self.append_tag) |t| {
+            self.allocator.free(t);
+            self.append_tag = null;
+        }
+        if (self.append_mailbox) |m| {
+            self.allocator.free(m);
+            self.append_mailbox = null;
+        }
+        if (self.append_literal_buf) |b| {
+            self.allocator.free(b);
+            self.append_literal_buf = null;
+        }
+        self.append_literal_size = 0;
+        self.append_literal_pos = 0;
+    }
+
+    /// Finalize a pending APPEND: save message to Maildir and send OK response
+    pub fn finalizeAppend(self: *ImapSession) !void {
+        const tag = self.append_tag orelse return;
+        const mailbox = self.append_mailbox orelse return;
+        const data = self.append_literal_buf orelse return;
+        const size = self.append_literal_size;
+
+        const username = self.username orelse {
+            try self.sendResponse(tag, "NO", "Not authenticated");
+            self.cleanupAppend();
+            return;
+        };
+
+        // Extract local part from email address (chris@stacksjs.com -> chris)
+        const local_part = if (std.mem.indexOfScalar(u8, username, '@')) |at_pos|
+            username[0..at_pos]
+        else
+            username;
+
+        // Determine folder directory
+        const folder_dir = if (std.ascii.eqlIgnoreCase(mailbox, "INBOX"))
+            try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{local_part})
+        else
+            try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local_part, mailbox });
+        defer self.allocator.free(folder_dir);
+
+        // Create directory if it doesn't exist
+        fs_compat.cwd().makePath(folder_dir) catch {};
+
+        // Write message file with timestamp-based name
+        const timestamp = time_compat.milliTimestamp();
+        const filepath = try std.fmt.allocPrint(self.allocator, "{s}/{d}.eml", .{ folder_dir, timestamp });
+        defer self.allocator.free(filepath);
+
+        const file = fs_compat.cwd().createFile(filepath, .{}) catch {
+            try self.sendResponse(tag, "NO", "Failed to save message");
+            self.cleanupAppend();
+            return;
+        };
+        defer file.close();
+        file.writeAll(data[0..size]) catch {
+            try self.sendResponse(tag, "NO", "Failed to write message");
+            self.cleanupAppend();
+            return;
+        };
+
+        std.log.info("IMAP APPEND: Saved {d} bytes to {s}", .{ size, filepath });
+
+        // Count files to determine UID for response
+        const files = fs_compat.listEmlFiles(self.allocator, folder_dir) catch &[_][]const u8{};
+        const uid = files.len;
+        defer {
+            for (files) |f| self.allocator.free(f);
+            self.allocator.free(files);
+        }
+
+        // Send OK with APPENDUID
+        var resp_buf: [256]u8 = undefined;
+        var fbs = io_compat.fixedBufferStream(&resp_buf);
+        fbs.writer().print("[APPENDUID 1740700800 {d}] APPEND completed", .{uid}) catch {
+            try self.sendResponse(tag, "OK", "APPEND completed");
+            self.cleanupAppend();
+            return;
+        };
+        try self.sendResponse(tag, "OK", fbs.getWritten());
+        self.cleanupAppend();
+    }
+
+    /// Count messages in a mailbox folder
+    fn countMailboxMessages(self: *ImapSession, mailbox_name: []const u8) usize {
+        const username = self.username orelse return 0;
+        const local_part = if (std.mem.indexOfScalar(u8, username, '@')) |at_pos|
+            username[0..at_pos]
+        else
+            username;
+
+        const clean_name = stripQuotes(mailbox_name);
+        const dir_path = if (std.ascii.eqlIgnoreCase(clean_name, "INBOX"))
+            std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{local_part})
+        else
+            std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local_part, clean_name });
+
+        const path = dir_path catch return 0;
+        defer self.allocator.free(path);
+
+        const files = fs_compat.listEmlFiles(self.allocator, path) catch return 0;
+        defer {
+            for (files) |f| self.allocator.free(f);
+            self.allocator.free(files);
+        }
+        return files.len;
     }
 
     /// Write data to connection (plain or TLS encrypted)
@@ -562,9 +680,11 @@ pub const ImapSession = struct {
         const writer = fbs.writer();
         try writer.print("STATUS \"{s}\" (", .{mailbox_name});
 
+        const msg_count = self.countMailboxMessages(mailbox_name);
+
         var first = true;
         if (want_messages) {
-            try writer.writeAll("MESSAGES 0");
+            try writer.print("MESSAGES {d}", .{msg_count});
             first = false;
         }
         if (want_recent) {
@@ -574,17 +694,17 @@ pub const ImapSession = struct {
         }
         if (want_uidnext) {
             if (!first) try writer.writeAll(" ");
-            try writer.writeAll("UIDNEXT 1");
+            try writer.print("UIDNEXT {d}", .{msg_count + 1});
             first = false;
         }
         if (want_uidvalidity) {
             if (!first) try writer.writeAll(" ");
-            try writer.print("UIDVALIDITY {d}", .{@as(u32, @intCast(time_compat.timestamp()))});
+            try writer.writeAll("UIDVALIDITY 1740700800");
             first = false;
         }
         if (want_unseen) {
             if (!first) try writer.writeAll(" ");
-            try writer.writeAll("UNSEEN 0");
+            try writer.print("UNSEEN {d}", .{msg_count});
         }
         try writer.writeAll(")");
 
@@ -748,26 +868,26 @@ pub const ImapSession = struct {
         // Strip quotes from mailbox name (Apple Mail sends "INBOX" with quotes sometimes)
         const mailbox = stripQuotes(mailbox_name);
 
-        // Only INBOX has real messages; other folders (Sent, Drafts, Trash, Starred) are empty
         const is_inbox = std.ascii.eqlIgnoreCase(mailbox, "INBOX");
 
-        if (is_inbox) {
-            // Build maildir path: mail/{username}/new/ (relative to cwd)
-            const user_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{username});
+        // Build maildir path for any folder
+        const user_dir = if (is_inbox)
+            try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{username})
+        else
+            try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ username, mailbox });
 
-            // Try to list files from per-user dir first, fall back to global mail/new/
-            var files = fs_compat.listEmlFiles(self.allocator, user_dir) catch &[_][]const u8{};
-            if (files.len == 0) {
-                self.allocator.free(user_dir);
-                const global_dir = try self.allocator.dupe(u8, "mail/new");
-                files = fs_compat.listEmlFiles(self.allocator, global_dir) catch &[_][]const u8{};
-                self.mailbox_dir = global_dir;
-            } else {
-                self.mailbox_dir = user_dir;
-            }
-
-            self.mailbox_files = if (files.len > 0) files else null;
+        var files = fs_compat.listEmlFiles(self.allocator, user_dir) catch &[_][]const u8{};
+        if (is_inbox and files.len == 0) {
+            // Fall back to global mail/new/ for INBOX
+            self.allocator.free(user_dir);
+            const global_dir = try self.allocator.dupe(u8, "mail/new");
+            files = fs_compat.listEmlFiles(self.allocator, global_dir) catch &[_][]const u8{};
+            self.mailbox_dir = global_dir;
+        } else {
+            self.mailbox_dir = user_dir;
         }
+
+        self.mailbox_files = if (files.len > 0) files else null;
 
         const msg_count = if (self.mailbox_files) |f| f.len else 0;
 
@@ -1175,9 +1295,44 @@ pub const ImapSession = struct {
                 }
             },
             .append => {
-                // APPEND mailbox (\flags) {size} - accept the literal data
-                // Apple Mail uses APPEND to save sent messages to Sent folder
-                try self.sendResponse(tag, "OK", "[APPENDUID 1 1] APPEND completed");
+                // APPEND mailbox (\flags) {size} - read literal data and save to Maildir
+                // Parse rest of command line to find {N} literal size
+                const cmd_end = @intFromPtr(cmd_str.ptr) + cmd_str.len - @intFromPtr(line.ptr);
+                const rest = if (cmd_end < line.len) std.mem.trim(u8, line[cmd_end..], " \t") else "";
+
+                // Find {N} at end of line
+                if (std.mem.lastIndexOfScalar(u8, rest, '{')) |brace_start| {
+                    if (std.mem.lastIndexOfScalar(u8, rest, '}')) |brace_end| {
+                        if (brace_end > brace_start) {
+                            const size_str = rest[brace_start + 1 .. brace_end];
+                            const literal_size = std.fmt.parseInt(usize, size_str, 10) catch {
+                                try self.sendResponse(tag, "BAD", "Invalid literal size");
+                                return;
+                            };
+
+                            // Parse mailbox name (first arg after APPEND)
+                            const mailbox_raw = parts.next() orelse "INBOX";
+                            const mailbox = stripQuotes(mailbox_raw);
+
+                            // Set up pending append state
+                            self.cleanupAppend();
+                            self.append_tag = try self.allocator.dupe(u8, tag);
+                            self.append_mailbox = try self.allocator.dupe(u8, mailbox);
+                            self.append_literal_size = literal_size;
+                            self.append_literal_buf = try self.allocator.alloc(u8, literal_size);
+                            self.append_literal_pos = 0;
+
+                            // Send continuation response - client will send literal data
+                            try self.writeData("+ Ready for literal data\r\n");
+
+                            std.log.info("IMAP APPEND: Expecting {d} bytes for mailbox {s}", .{ literal_size, mailbox });
+                            return;
+                        }
+                    }
+                }
+
+                // No literal found - just acknowledge
+                try self.sendResponse(tag, "OK", "[APPENDUID 1740700800 1] APPEND completed");
             },
             .enable => {
                 // RFC 5161: ENABLE extension
@@ -1190,7 +1345,18 @@ pub const ImapSession = struct {
                 try self.sendResponse(tag, "OK", "ID completed");
             },
             .create => {
-                // CREATE mailbox - pretend success for Apple Mail's Sent/Drafts/Trash
+                // CREATE mailbox - create the Maildir folder
+                const create_name = stripQuotes(parts.next() orelse "");
+                if (create_name.len > 0) {
+                    if (self.username) |uname| {
+                        const local = if (std.mem.indexOfScalar(u8, uname, '@')) |at| uname[0..at] else uname;
+                        const dir = std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local, create_name }) catch null;
+                        if (dir) |d| {
+                            fs_compat.cwd().makePath(d) catch {};
+                            self.allocator.free(d);
+                        }
+                    }
+                }
                 try self.sendResponse(tag, "OK", "CREATE completed");
             },
             .subscribe => {
@@ -1507,10 +1673,34 @@ pub const ImapServer = struct {
                     @memcpy(cleartext_accum[cleartext_accum_len..][0..copy_len], dec_result.cleartext[0..copy_len]);
                     cleartext_accum_len += copy_len;
 
-                    // Process complete lines (split on \r\n)
+                    // Process data - command lines or APPEND literal data
                     var processed: usize = 0;
                     while (processed < cleartext_accum_len) {
-                        // Find \r\n
+                        // If collecting APPEND literal data, consume bytes directly
+                        if (session.append_literal_buf) |buf| {
+                            const needed = session.append_literal_size - session.append_literal_pos;
+                            const available = cleartext_accum_len - processed;
+                            const lit_len = @min(needed, available);
+                            @memcpy(buf[session.append_literal_pos..][0..lit_len], cleartext_accum[processed..][0..lit_len]);
+                            session.append_literal_pos += lit_len;
+                            processed += lit_len;
+
+                            if (session.append_literal_pos >= session.append_literal_size) {
+                                // Literal complete - save message and send OK
+                                session.finalizeAppend() catch |err| {
+                                    logger.err("IMAP APPEND finalize error: {}", .{err});
+                                };
+                                // Skip trailing \r\n after literal data
+                                if (processed + 2 <= cleartext_accum_len and
+                                    cleartext_accum[processed] == '\r' and cleartext_accum[processed + 1] == '\n')
+                                {
+                                    processed += 2;
+                                }
+                            }
+                            continue;
+                        }
+
+                        // Normal: find next \r\n delimited command line
                         const remaining = cleartext_accum[processed..cleartext_accum_len];
                         const line_end = std.mem.indexOf(u8, remaining, "\r\n") orelse break;
                         if (line_end > 0) {
@@ -1558,6 +1748,20 @@ pub const ImapServer = struct {
             while (session.state != .logout) {
                 const bytes_read = connection.read(&buffer) catch break;
                 if (bytes_read == 0) break;
+
+                // If collecting APPEND literal data, feed bytes to the buffer
+                if (session.append_literal_buf) |buf| {
+                    const needed = session.append_literal_size - session.append_literal_pos;
+                    const copy_len = @min(needed, bytes_read);
+                    @memcpy(buf[session.append_literal_pos..][0..copy_len], buffer[0..copy_len]);
+                    session.append_literal_pos += copy_len;
+                    if (session.append_literal_pos >= session.append_literal_size) {
+                        session.finalizeAppend() catch |err| {
+                            logger.err("IMAP APPEND finalize error: {}", .{err});
+                        };
+                    }
+                    continue;
+                }
 
                 const line = std.mem.trim(u8, buffer[0..bytes_read], "\r\n");
                 session.processCommand(line) catch |err| {

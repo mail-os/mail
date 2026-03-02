@@ -22,14 +22,14 @@ pub const Dir = struct {
     pub fn createFile(self: Dir, sub_path: []const u8, flags: CreateFlags) OpenError!File {
         _ = self;
         _ = flags;
-        const path_z = std.fmt.allocPrintZ(std.heap.c_allocator, "{s}", .{sub_path}) catch return error.SystemResources;
-        defer std.heap.c_allocator.free(path_z);
-        const fd = std.c.open(path_z.ptr, .{
+        const path_z = toZ(sub_path) orelse return error.SystemResources;
+        defer freeZ(path_z, sub_path.len);
+        const fd = std.c.open(path_z, .{
             .ACCMODE = .WRONLY,
             .CREAT = true,
             .TRUNC = true,
             .CLOEXEC = true,
-        }, 0o644);
+        }, @as(std.c.mode_t, 0o644));
         if (fd < 0) return error.FileNotFound;
         return .{ .handle = fd };
     }
@@ -89,14 +89,16 @@ pub const Dir = struct {
     pub fn makePath(self: Dir, sub_path: []const u8) MakePathError!void {
         _ = self;
         // Use mkdir for each component
-        var path_buf: [4096]u8 = undefined;
+        var path_buf: [4097]u8 = undefined;
         var pos: usize = 0;
         for (sub_path, 0..) |c, i| {
+            if (pos >= path_buf.len - 1) break;
             path_buf[pos] = c;
             pos += 1;
             if (c == '/' or i == sub_path.len - 1) {
                 path_buf[pos] = 0;
-                _ = std.c.mkdir(&path_buf, 0o755);
+                const sentinel_ptr: [*:0]const u8 = @ptrCast(&path_buf);
+                _ = std.c.mkdir(sentinel_ptr, 0o755);
                 // Ignore errors - directory may already exist
             }
         }

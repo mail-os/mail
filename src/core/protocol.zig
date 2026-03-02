@@ -11,6 +11,7 @@ const greylist_mod = @import("../antispam/greylist.zig");
 const tls_mod = @import("tls.zig");
 const chunking = @import("../protocol/chunking.zig");
 const tls = @import("tls");
+const outbound = @import("../delivery/outbound.zig");
 
 /// Sanitize a string for safe logging — strip control characters that could
 /// inject fake log entries (newlines, carriage returns, null bytes).
@@ -64,10 +65,10 @@ const ConnectionWrapper = struct {
     tls_conn: ?tls.nonblock.Connection,
     using_tls: bool,
     // Buffers for TLS encryption/decryption
-    ciphertext_accum: [tls.input_buffer_len * 2]u8,
+    ciphertext_accum: [tls.input_buffer_len * 4]u8,
     ciphertext_len: usize,
     // Buffer for decrypted cleartext that hasn't been consumed yet
-    cleartext_buf: [4096]u8,
+    cleartext_buf: [16384]u8,
     cleartext_start: usize,
     cleartext_end: usize,
 
@@ -116,7 +117,7 @@ const ConnectionWrapper = struct {
                 }
 
                 // Try to decrypt
-                var decrypt_buf: [4096]u8 = undefined;
+                var decrypt_buf: [16384]u8 = undefined;
                 const dec_result = tls_conn.decrypt(self.ciphertext_accum[0..self.ciphertext_len], &decrypt_buf) catch |err| {
                     logger.err("TLS decrypt error: {}", .{err});
                     return error.TlsDecryptFailed;
@@ -344,7 +345,9 @@ pub const Session = struct {
 
     pub fn handle(self: *Session) !void {
         // Send greeting
+        self.logger.info("SMTP: Sending 220 greeting (tls={s})", .{if (self.conn_wrapper.using_tls) "yes" else "no"});
         try self.sendResponse(null, 220, self.config.hostname, "ESMTP Service Ready");
+        self.logger.info("SMTP: Greeting sent, waiting for client command", .{});
 
         var line_buffer: [4096]u8 = undefined;
         var line_pos: usize = 0;
@@ -355,11 +358,15 @@ pub const Session = struct {
 
             // Read byte by byte until we hit \n
             const byte_read = self.conn_wrapper.read(line_buffer[line_pos .. line_pos + 1]) catch |err| {
+                self.logger.err("SMTP: Read error after {d} bytes: {}", .{ line_pos, err });
                 if (err == error.EndOfStream) break;
                 return err;
             };
 
-            if (byte_read == 0) break;
+            if (byte_read == 0) {
+                self.logger.info("SMTP: Client disconnected (0 bytes read, line_pos={d})", .{line_pos});
+                break;
+            }
 
             if (line_buffer[line_pos] == '\n') {
                 // Remove \r\n if present
@@ -374,6 +381,10 @@ pub const Session = struct {
                 self.updateActivity();
 
                 if (line.len == 0) continue;
+
+                // Log the command
+                const san = sanitizeForLog(line);
+                self.logger.info("SMTP CMD: {s}", .{sanitizedSlice(&san, line.len)});
 
                 const should_quit = try self.processCommand(null, line);
                 if (should_quit) break;
@@ -998,8 +1009,104 @@ pub const Session = struct {
                 try self.sendResponse(writer, 501, "AUTH PLAIN requires initial-response", null);
             }
         } else if (std.ascii.eqlIgnoreCase(mechanism, "LOGIN")) {
-            // LOGIN mechanism not yet implemented - would require multi-step interaction
-            try self.sendResponse(writer, 504, "AUTH LOGIN not yet implemented", null);
+            // AUTH LOGIN: multi-step challenge-response
+            // Step 1: Send "Username:" challenge (base64 encoded)
+            try self.sendResponse(writer, 334, "VXNlcm5hbWU6", null); // "Username:"
+
+            // Step 2: Read base64-encoded username
+            var username_line: [1024]u8 = undefined;
+            var username_pos: usize = 0;
+            while (true) {
+                const n = self.conn_wrapper.read(username_line[username_pos .. username_pos + 1]) catch {
+                    try self.sendResponse(writer, 535, "Authentication failed", null);
+                    return;
+                };
+                if (n == 0) {
+                    try self.sendResponse(writer, 535, "Authentication failed", null);
+                    return;
+                }
+                if (username_line[username_pos] == '\n') break;
+                username_pos += 1;
+                if (username_pos >= username_line.len - 1) break;
+            }
+            const username_b64 = std.mem.trim(u8, username_line[0..username_pos], " \t\r\n");
+
+            // Decode username from base64
+            var username_buf: [256]u8 = undefined;
+            const username_dec_len = std.base64.standard.Decoder.calcSizeForSlice(username_b64) catch {
+                try self.sendResponse(writer, 535, "Authentication failed", null);
+                return;
+            };
+            if (username_dec_len > username_buf.len) {
+                try self.sendResponse(writer, 535, "Authentication failed", null);
+                return;
+            }
+            std.base64.standard.Decoder.decode(username_buf[0..username_dec_len], username_b64) catch {
+                try self.sendResponse(writer, 535, "Authentication failed", null);
+                return;
+            };
+            const username = username_buf[0..username_dec_len];
+
+            // Step 3: Send "Password:" challenge (base64 encoded)
+            try self.sendResponse(writer, 334, "UGFzc3dvcmQ6", null); // "Password:"
+
+            // Step 4: Read base64-encoded password
+            var password_line: [1024]u8 = undefined;
+            var password_pos: usize = 0;
+            while (true) {
+                const n = self.conn_wrapper.read(password_line[password_pos .. password_pos + 1]) catch {
+                    try self.sendResponse(writer, 535, "Authentication failed", null);
+                    return;
+                };
+                if (n == 0) {
+                    try self.sendResponse(writer, 535, "Authentication failed", null);
+                    return;
+                }
+                if (password_line[password_pos] == '\n') break;
+                password_pos += 1;
+                if (password_pos >= password_line.len - 1) break;
+            }
+            const password_b64 = std.mem.trim(u8, password_line[0..password_pos], " \t\r\n");
+
+            // Decode password from base64
+            var password_buf: [256]u8 = undefined;
+            const password_dec_len = std.base64.standard.Decoder.calcSizeForSlice(password_b64) catch {
+                try self.sendResponse(writer, 535, "Authentication failed", null);
+                return;
+            };
+            if (password_dec_len > password_buf.len) {
+                try self.sendResponse(writer, 535, "Authentication failed", null);
+                return;
+            }
+            std.base64.standard.Decoder.decode(password_buf[0..password_dec_len], password_b64) catch {
+                try self.sendResponse(writer, 535, "Authentication failed", null);
+                return;
+            };
+            const password = password_buf[0..password_dec_len];
+
+            // Verify credentials
+            if (self.auth_backend) |backend| {
+                const valid = backend.verifyCredentials(username, password) catch {
+                    try self.sendResponse(writer, 454, "Temporary authentication failure", null);
+                    return;
+                };
+
+                if (valid) {
+                    self.authenticated = true;
+                    self.state = .Authenticated;
+                    const safe_user = sanitizeForLog(username);
+                    self.logger.info("User '{s}' authenticated via LOGIN", .{sanitizedSlice(&safe_user, username.len)});
+                    try self.sendResponse(writer, 235, "Authentication successful", null);
+                } else {
+                    const safe_user = sanitizeForLog(username);
+                    self.logger.warn("AUTH LOGIN failed for user '{s}'", .{sanitizedSlice(&safe_user, username.len)});
+                    try self.sendResponse(writer, 535, "Authentication failed", null);
+                }
+            } else {
+                self.authenticated = true;
+                self.state = .Authenticated;
+                try self.sendResponse(writer, 235, "Authentication successful", null);
+            }
         } else {
             try self.sendResponse(writer, 504, "Unrecognized authentication type", null);
         }
@@ -1079,43 +1186,58 @@ pub const Session = struct {
         };
         defer cert_key.deinit(self.allocator);
 
-        // Use non-blocking TLS handshake
+        // Use non-blocking TLS handshake (matches proven IMAP pattern)
         var server_hs = tls.nonblock.Server.init(.{ .auth = &cert_key });
 
         // Buffers for TLS handshake
-        var recv_buf: [tls.max_ciphertext_record_len]u8 = undefined;
-        var send_buf: [tls.max_ciphertext_record_len]u8 = undefined;
+        var recv_buf: [tls.input_buffer_len]u8 = undefined;
+        var send_buf: [tls.output_buffer_len]u8 = undefined;
+        var recv_len: usize = 0;
 
-        // Perform handshake loop
-        var recv_pos: usize = 0;
+        // Perform handshake loop: run first, then read if needed (IMAP pattern)
         while (!server_hs.done()) {
-            const bytes_read = self.conn_wrapper.read(recv_buf[recv_pos..]) catch |err| {
-                self.logger.err("TLS handshake read error: {}", .{err});
-                return err;
-            };
-
-            if (bytes_read == 0) {
-                self.logger.err("TLS handshake: connection closed", .{});
-                return error.ConnectionClosed;
-            }
-
-            recv_pos += bytes_read;
-
-            const result = server_hs.run(recv_buf[0..recv_pos], &send_buf) catch |err| {
+            // Run handshake step with whatever data we have
+            const result = server_hs.run(recv_buf[0..recv_len], &send_buf) catch |err| {
                 self.logger.err("TLS handshake error: {}", .{err});
                 return error.TlsHandshakeFailed;
             };
 
-            if (result.send.len > 0) {
-                _ = self.conn_wrapper.write(result.send) catch |err| {
-                    self.logger.err("TLS handshake write error: {}", .{err});
-                    return err;
-                };
+            // Consume processed bytes
+            if (result.recv_pos > 0) {
+                const remaining = recv_len - result.recv_pos;
+                if (remaining > 0) {
+                    std.mem.copyForwards(u8, &recv_buf, recv_buf[result.recv_pos..recv_len]);
+                }
+                recv_len = remaining;
             }
 
-            if (result.recv_pos > 0) {
-                std.mem.copyForwards(u8, &recv_buf, recv_buf[result.recv_pos..recv_pos]);
-                recv_pos -= result.recv_pos;
+            // Send data to client if any — use a write loop to ensure ALL bytes are sent
+            if (result.send.len > 0) {
+                var sent: usize = 0;
+                while (sent < result.send.len) {
+                    const n = self.connection.write(result.send[sent..]) catch |err| {
+                        self.logger.err("TLS handshake write error: {}", .{err});
+                        return error.TlsHandshakeFailed;
+                    };
+                    if (n == 0) {
+                        self.logger.err("TLS handshake: connection closed during write", .{});
+                        return error.TlsHandshakeFailed;
+                    }
+                    sent += n;
+                }
+            }
+
+            // Read more data from client if handshake not done
+            if (!server_hs.done()) {
+                const n = self.connection.read(recv_buf[recv_len..]) catch |err| {
+                    self.logger.err("TLS handshake read error: {}", .{err});
+                    return error.TlsHandshakeFailed;
+                };
+                if (n == 0) {
+                    self.logger.err("TLS handshake: connection closed during read", .{});
+                    return error.ConnectionClosed;
+                }
+                recv_len += n;
             }
         }
 
@@ -1123,6 +1245,14 @@ pub const Session = struct {
 
         self.logger.info("TLS handshake successful", .{});
         self.conn_wrapper.upgradeWithCipher(cipher);
+
+        // Seed any leftover bytes from the handshake into conn_wrapper's ciphertext buffer
+        if (recv_len > 0) {
+            if (recv_len <= self.conn_wrapper.ciphertext_accum.len) {
+                @memcpy(self.conn_wrapper.ciphertext_accum[0..recv_len], recv_buf[0..recv_len]);
+                self.conn_wrapper.ciphertext_len = recv_len;
+            }
+        }
     }
 
     /// Perform implicit TLS handshake for SMTPS (port 465).
@@ -1170,52 +1300,109 @@ pub const Session = struct {
     fn saveMessage(self: *Session, data: []const u8) !void {
         const io = io_compat.getIo();
         const cwd = std.Io.Dir.cwd();
-
-        // Generate unique filename based on timestamp
         const timestamp = time_compat.milliTimestamp();
+        const sender = self.mail_from orelse "unknown";
 
-        // Deliver to each recipient's Maildir
         for (self.rcpt_to.items) |rcpt| {
-            // Extract username from recipient address (part before @)
-            const username = if (std.mem.indexOf(u8, rcpt, "@")) |at_pos|
-                rcpt[0..at_pos]
-            else
-                rcpt;
+            // Determine if recipient is local or external
+            // Compare against hostname and its parent domain (mail.stacksjs.com -> stacksjs.com)
+            const is_local = if (std.mem.indexOf(u8, rcpt, "@")) |at_pos| blk: {
+                const rcpt_domain = rcpt[at_pos + 1 ..];
+                if (std.mem.eql(u8, rcpt_domain, self.config.hostname)) break :blk true;
+                // Also check parent domain: if hostname is "mail.X", accept "X" as local
+                if (std.mem.indexOf(u8, self.config.hostname, ".")) |dot_pos| {
+                    const parent_domain = self.config.hostname[dot_pos + 1 ..];
+                    if (std.mem.eql(u8, rcpt_domain, parent_domain)) break :blk true;
+                }
+                break :blk false;
+            } else true;
 
-            // Ensure per-user maildir exists: mail/{username}/new/
-            const user_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}", .{username});
-            defer self.allocator.free(user_dir);
-            cwd.createDir(io, "mail", .default_dir) catch {};
-            cwd.createDir(io, user_dir, .default_dir) catch {};
+            if (is_local) {
+                // Local delivery: save to Maildir
+                const username = if (std.mem.indexOf(u8, rcpt, "@")) |at_pos|
+                    rcpt[0..at_pos]
+                else
+                    rcpt;
 
-            const new_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{username});
-            defer self.allocator.free(new_dir);
-            cwd.createDir(io, new_dir, .default_dir) catch {};
+                const user_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}", .{username});
+                defer self.allocator.free(user_dir);
+                cwd.createDir(io, "mail", .default_dir) catch {};
+                cwd.createDir(io, user_dir, .default_dir) catch {};
 
-            const filename = try std.fmt.allocPrint(self.allocator, "mail/{s}/new/{d}.eml", .{ username, timestamp });
-            defer self.allocator.free(filename);
+                const new_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{username});
+                defer self.allocator.free(new_dir);
+                cwd.createDir(io, new_dir, .default_dir) catch {};
 
-            // Write message to file
-            const file = try cwd.createFile(io, filename, .{});
-            defer file.close(io);
+                const filename = try std.fmt.allocPrint(self.allocator, "mail/{s}/new/{d}.eml", .{ username, timestamp });
+                defer self.allocator.free(filename);
 
-            var header_buf: [256]u8 = undefined;
+                const file = try cwd.createFile(io, filename, .{});
+                defer file.close(io);
 
-            // Write headers
-            const from_line = try std.fmt.bufPrint(&header_buf, "From: {s}\r\n", .{self.mail_from orelse "unknown"});
-            try file.writeStreamingAll(io, from_line);
+                // Write the raw message data as-is (it already contains headers from the client)
+                try file.writeStreamingAll(io, data);
 
-            const to_line = try std.fmt.bufPrint(&header_buf, "To: {s}\r\n", .{rcpt});
-            try file.writeStreamingAll(io, to_line);
-
-            const date_line = try std.fmt.bufPrint(&header_buf, "Date: {d}\r\n", .{timestamp});
-            try file.writeStreamingAll(io, date_line);
-            try file.writeStreamingAll(io, "\r\n");
-
-            // Write message body
-            try file.writeStreamingAll(io, data);
-
-            self.logger.debug("Message saved to {s}", .{filename});
+                self.logger.debug("Message saved to {s}", .{filename});
+            } else {
+                // External delivery: relay via SES in a background thread
+                // so we don't block the SMTP session (Apple Mail times out otherwise)
+                self.logger.info("Queueing outbound delivery to: {s}", .{rcpt});
+                const bg = try self.allocator.create(OutboundContext);
+                bg.* = .{
+                    .allocator = self.allocator,
+                    .from = self.allocator.dupe(u8, sender) catch {
+                        self.allocator.destroy(bg);
+                        continue;
+                    },
+                    .to = self.allocator.dupe(u8, rcpt) catch {
+                        self.allocator.free(bg.from);
+                        self.allocator.destroy(bg);
+                        continue;
+                    },
+                    .data = self.allocator.dupe(u8, data) catch {
+                        self.allocator.free(bg.from);
+                        self.allocator.free(bg.to);
+                        self.allocator.destroy(bg);
+                        continue;
+                    },
+                    .hostname = self.config.hostname,
+                };
+                const thread = std.Thread.spawn(.{}, outboundWorker, .{bg}) catch |err| {
+                    self.logger.err("Failed to spawn outbound thread for {s}: {}", .{ rcpt, err });
+                    self.allocator.free(bg.data);
+                    self.allocator.free(bg.to);
+                    self.allocator.free(bg.from);
+                    self.allocator.destroy(bg);
+                    continue;
+                };
+                thread.detach();
+            }
         }
+    }
+
+    const OutboundContext = struct {
+        allocator: std.mem.Allocator,
+        from: []u8,
+        to: []u8,
+        data: []u8,
+        hostname: []const u8,
+    };
+
+    fn outboundWorker(ctx: *OutboundContext) void {
+        defer {
+            ctx.allocator.free(ctx.data);
+            ctx.allocator.free(ctx.to);
+            ctx.allocator.free(ctx.from);
+            ctx.allocator.destroy(ctx);
+        }
+        outbound.deliverToRemote(
+            ctx.allocator,
+            ctx.from,
+            ctx.to,
+            ctx.data,
+            ctx.hostname,
+        ) catch |err| {
+            std.log.err("Outbound delivery to {s} failed: {}", .{ ctx.to, err });
+        };
     }
 };
