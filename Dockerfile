@@ -4,10 +4,17 @@ FROM alpine:3.19 AS builder
 
 # Install build dependencies
 RUN apk add --no-cache \
-    zig \
     git \
     sqlite-dev \
-    musl-dev
+    musl-dev \
+    curl \
+    tar \
+    xz
+
+# Install Zig (not available in Alpine repos)
+ARG ZIG_VERSION=0.16.0-dev.2565+684032671
+RUN curl -fsSL "https://ziglang.org/builds/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" | tar -xJ -C /usr/local && \
+    ln -s /usr/local/zig-linux-x86_64-${ZIG_VERSION}/zig /usr/local/bin/zig
 
 # Set working directory
 WORKDIR /build
@@ -16,9 +23,6 @@ WORKDIR /build
 COPY . .
 
 # Build the application in release mode
-RUN zig build -Doptimize=ReleaseSafe
-
-# Build user CLI tool
 RUN zig build -Doptimize=ReleaseSafe
 
 # Stage 2: Create minimal runtime image
