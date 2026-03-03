@@ -13,8 +13,8 @@ RUN apk add --no-cache \
 
 # Install Zig (not available in Alpine repos)
 ARG ZIG_VERSION=0.16.0-dev.2565+684032671
-RUN curl -fsSL "https://ziglang.org/builds/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" | tar -xJ -C /usr/local && \
-    ln -s /usr/local/zig-linux-x86_64-${ZIG_VERSION}/zig /usr/local/bin/zig
+RUN curl -fsSL "https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C /usr/local && \
+    ln -s /usr/local/zig-x86_64-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
 
 # Set working directory
 WORKDIR /build
