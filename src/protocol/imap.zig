@@ -362,6 +362,77 @@ pub const ImapCommand = enum {
     }
 };
 
+/// Parse IMAP sequence sets like "1", "1:5", "1,3,5", "1:3,7", "*".
+/// Sequence numbers are 1-based. "*" maps to max_seq.
+const SequenceIterator = struct {
+    data: []const u8,
+    pos: usize = 0,
+    // Current range state
+    range_current: u32 = 0,
+    range_end: u32 = 0,
+    max_seq: u32,
+
+    pub fn init(seq_set: []const u8, file_count: usize) SequenceIterator {
+        return .{
+            .data = seq_set,
+            .max_seq = if (file_count > 0) @intCast(file_count) else 0,
+        };
+    }
+
+    pub fn next(self: *SequenceIterator) ?u32 {
+        // Continue yielding from current range
+        if (self.range_current <= self.range_end) {
+            const val = self.range_current;
+            self.range_current += 1;
+            return val;
+        }
+
+        // Parse next element from sequence set
+        if (self.pos >= self.data.len) return null;
+
+        // Skip comma separators
+        if (self.pos < self.data.len and self.data[self.pos] == ',') {
+            self.pos += 1;
+        }
+        if (self.pos >= self.data.len) return null;
+
+        // Parse first number (or *)
+        const start_num = self.parseNum() orelse return null;
+
+        // Check for range ':'
+        if (self.pos < self.data.len and self.data[self.pos] == ':') {
+            self.pos += 1;
+            const end_num = self.parseNum() orelse return null;
+            if (start_num <= end_num) {
+                self.range_current = start_num + 1;
+                self.range_end = end_num;
+            } else {
+                // Reverse range
+                self.range_current = end_num + 1;
+                self.range_end = start_num;
+                return end_num;
+            }
+            return start_num;
+        }
+
+        return start_num;
+    }
+
+    fn parseNum(self: *SequenceIterator) ?u32 {
+        if (self.pos >= self.data.len) return null;
+        if (self.data[self.pos] == '*') {
+            self.pos += 1;
+            return self.max_seq;
+        }
+        const start = self.pos;
+        while (self.pos < self.data.len and self.data[self.pos] >= '0' and self.data[self.pos] <= '9') {
+            self.pos += 1;
+        }
+        if (self.pos == start) return null;
+        return std.fmt.parseInt(u32, self.data[start..self.pos], 10) catch null;
+    }
+};
+
 /// IMAP session
 pub const ImapSession = struct {
     allocator: std.mem.Allocator,
@@ -388,6 +459,8 @@ pub const ImapSession = struct {
     append_literal_pos: usize = 0,
     // STARTTLS upgrade requested (port 143 → TLS)
     starttls_requested: bool = false,
+    // Track sequence numbers of messages marked \Deleted (for EXPUNGE)
+    deleted_seqs: std.ArrayList(u32) = std.ArrayList(u32){},
 
     pub fn init(allocator: std.mem.Allocator, connection: socket.Connection, auth_backend: *auth.AuthBackend) ImapSession {
         return .{
@@ -417,6 +490,7 @@ pub const ImapSession = struct {
         }
         self.cleanupAppend();
         self.freeMailboxFiles();
+        self.deleted_seqs.deinit(self.allocator);
         self.command_buffer.deinit(self.allocator);
     }
 
@@ -430,6 +504,7 @@ pub const ImapSession = struct {
             self.allocator.free(d);
             self.mailbox_dir = null;
         }
+        self.deleted_seqs.clearRetainingCapacity();
     }
 
     /// Re-scan the current mailbox for new messages.
@@ -1186,18 +1261,195 @@ pub const ImapSession = struct {
         try self.sendResponse(tag, "OK", "SEARCH completed");
     }
 
-    /// Handle EXPUNGE command - soft-deletes messages marked with \Deleted flag
+    /// Handle COPY command — copy messages to destination mailbox.
+    /// Implements RFC 3501 Section 6.4.7.
+    fn handleCopy(self: *ImapSession, tag: []const u8, sequence_set: []const u8, dest_mailbox: []const u8) !void {
+        if (self.state != .selected) {
+            try self.sendResponse(tag, "NO", "Must select mailbox first");
+            return;
+        }
+
+        const files = self.mailbox_files orelse {
+            try self.sendResponse(tag, "NO", "Mailbox is empty");
+            return;
+        };
+        const src_dir = self.mailbox_dir orelse {
+            try self.sendResponse(tag, "NO", "No mailbox selected");
+            return;
+        };
+        const full_username = self.username orelse {
+            try self.sendResponse(tag, "NO", "Not authenticated");
+            return;
+        };
+
+        const local_part = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
+            full_username[0..at_pos]
+        else
+            full_username;
+
+        const dest_name = stripQuotes(dest_mailbox);
+
+        // Build destination directory path
+        const dest_dir = if (std.ascii.eqlIgnoreCase(dest_name, "INBOX"))
+            try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{local_part})
+        else
+            try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local_part, dest_name });
+        defer self.allocator.free(dest_dir);
+
+        // Ensure destination directory exists
+        fs_compat.ensureDir(dest_dir) catch {};
+
+        // Parse sequence set and copy each message
+        var copied: u32 = 0;
+        var iter = SequenceIterator.init(sequence_set, files.len);
+        while (iter.next()) |seq| {
+            const idx = seq - 1; // sequence numbers are 1-based
+            if (idx >= files.len) continue;
+
+            const filename = files[idx];
+
+            // Build source path
+            const src_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ src_dir, filename });
+            defer self.allocator.free(src_path);
+
+            // Read source file
+            const content = fs_compat.readFileAlloc(self.allocator, src_path) catch continue;
+            defer self.allocator.free(content);
+
+            // Write to destination with a new timestamp filename
+            const timestamp = time_compat.milliTimestamp();
+            const dest_path = try std.fmt.allocPrint(self.allocator, "{s}/{d}.eml", .{ dest_dir, timestamp + copied });
+            defer self.allocator.free(dest_path);
+
+            const file = fs_compat.cwd().createFile(dest_path, .{}) catch continue;
+            defer file.close();
+            file.writeAll(content) catch continue;
+
+            copied += 1;
+        }
+
+        std.log.info("IMAP COPY: Copied {d} messages to {s}", .{ copied, dest_name });
+        try self.sendResponse(tag, "OK", "COPY completed");
+    }
+
+    /// Handle STORE command — set/add/remove message flags.
+    /// Implements RFC 3501 Section 6.4.6.
+    fn handleStore(self: *ImapSession, tag: []const u8, sequence_set: []const u8, flags_action: []const u8) !void {
+        if (self.state != .selected) {
+            try self.sendResponse(tag, "NO", "Must select mailbox first");
+            return;
+        }
+
+        const files = self.mailbox_files orelse {
+            try self.sendResponse(tag, "OK", "STORE completed");
+            return;
+        };
+
+        // Parse the flags action: +FLAGS, -FLAGS, FLAGS (with optional .SILENT)
+        const is_silent = std.ascii.indexOfIgnoreCase(flags_action, ".SILENT") != null;
+        const is_add = flags_action.len > 0 and flags_action[0] == '+';
+        const is_remove = flags_action.len > 0 and flags_action[0] == '-';
+        _ = is_remove;
+
+        // Check if \Deleted flag is being set
+        const has_deleted = std.ascii.indexOfIgnoreCase(flags_action, "\\Deleted") != null;
+
+        var iter = SequenceIterator.init(sequence_set, files.len);
+        while (iter.next()) |seq| {
+            if (seq < 1 or seq > files.len) continue;
+
+            if (has_deleted and is_add) {
+                // Track this message as deleted for EXPUNGE
+                // Avoid duplicates
+                var already = false;
+                for (self.deleted_seqs.items) |s| {
+                    if (s == seq) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (!already) {
+                    self.deleted_seqs.append(self.allocator, seq) catch {};
+                }
+            }
+
+            // Send untagged FETCH response with updated flags (unless .SILENT)
+            if (!is_silent) {
+                var resp_buf: [256]u8 = undefined;
+                var fbs = io_compat.fixedBufferStream(&resp_buf);
+                fbs.writer().print("{d} FETCH (FLAGS (\\Seen", .{seq}) catch continue;
+                if (has_deleted) {
+                    fbs.writer().writeAll(" \\Deleted") catch continue;
+                }
+                fbs.writer().writeAll("))") catch continue;
+                self.sendUntagged(fbs.getWritten()) catch continue;
+            }
+        }
+
+        try self.sendResponse(tag, "OK", "STORE completed");
+    }
+
+    /// Handle EXPUNGE command — remove messages marked with \Deleted flag.
+    /// Implements RFC 3501 Section 6.4.3.
     fn handleExpunge(self: *ImapSession, tag: []const u8) !void {
         if (self.state != .selected) {
             try self.sendResponse(tag, "NO", "Must select mailbox first");
             return;
         }
 
-        // Would iterate messages with \Deleted flag and call storage.deleteMessage()
-        // (which is now a soft-delete). For each expunged message, send untagged response:
-        // * <seq> EXPUNGE
+        const dir = self.mailbox_dir orelse {
+            try self.sendResponse(tag, "OK", "EXPUNGE completed");
+            return;
+        };
 
-        try self.sendResponse(tag, "OK", "EXPUNGE completed (soft-delete)");
+        const files = self.mailbox_files orelse {
+            try self.sendResponse(tag, "OK", "EXPUNGE completed");
+            return;
+        };
+
+        if (self.deleted_seqs.items.len == 0) {
+            try self.sendResponse(tag, "OK", "EXPUNGE completed");
+            return;
+        }
+
+        // Sort deleted sequence numbers in descending order so that
+        // removing from the end doesn't shift earlier indices
+        std.mem.sort(u32, self.deleted_seqs.items, {}, struct {
+            fn desc(_: void, a: u32, b: u32) bool {
+                return a > b;
+            }
+        }.desc);
+
+        var expunged: u32 = 0;
+        for (self.deleted_seqs.items) |seq| {
+            const idx = seq - 1;
+            if (idx >= files.len) continue;
+
+            const filename = files[idx];
+
+            // Build full path and delete the file
+            var path_buf: [4097]u8 = undefined;
+            const path_written = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, filename }) catch continue;
+            path_buf[path_written.len] = 0;
+            _ = std.c.unlink(@ptrCast(&path_buf));
+
+            // Send untagged EXPUNGE for this sequence number
+            var resp_buf: [32]u8 = undefined;
+            var fbs = io_compat.fixedBufferStream(&resp_buf);
+            fbs.writer().print("{d} EXPUNGE", .{seq}) catch continue;
+            self.sendUntagged(fbs.getWritten()) catch continue;
+
+            expunged += 1;
+            std.log.info("IMAP EXPUNGE: Deleted {s}/{s}", .{ dir, filename });
+        }
+
+        // Clear deleted flags
+        self.deleted_seqs.clearRetainingCapacity();
+
+        // Refresh mailbox file list after deletions
+        _ = self.rescanMailbox() catch {};
+
+        try self.sendResponse(tag, "OK", "EXPUNGE completed");
     }
 
     /// Handle LOGOUT command
@@ -1381,9 +1633,20 @@ pub const ImapSession = struct {
                 } else if (std.ascii.eqlIgnoreCase(sub_cmd, "SEARCH")) {
                     try self.handleSearch(tag);
                 } else if (std.ascii.eqlIgnoreCase(sub_cmd, "COPY")) {
-                    try self.sendResponse(tag, "OK", "COPY completed");
+                    // UID COPY <uid-set> <mailbox>
+                    // UIDs = sequence numbers in our implementation (1-based index into sorted files)
+                    const uid_set = parts.next() orelse "1:*";
+                    const dest = parts.next() orelse "INBOX";
+                    try self.handleCopy(tag, uid_set, dest);
                 } else if (std.ascii.eqlIgnoreCase(sub_cmd, "STORE")) {
-                    try self.sendResponse(tag, "OK", "STORE completed");
+                    // UID STORE <uid-set> <flags-action>
+                    const uid_set = parts.next() orelse "1:*";
+                    const uid_end = @intFromPtr(uid_set.ptr) + uid_set.len - @intFromPtr(line.ptr);
+                    const flags_action = if (uid_end < line.len) std.mem.trim(u8, line[uid_end..], " \t") else "";
+                    try self.handleStore(tag, uid_set, flags_action);
+                } else if (std.ascii.eqlIgnoreCase(sub_cmd, "EXPUNGE")) {
+                    // UID EXPUNGE (RFC 4315)
+                    try self.handleExpunge(tag);
                 } else {
                     try self.sendResponse(tag, "OK", "UID command completed");
                 }
@@ -1460,11 +1723,16 @@ pub const ImapSession = struct {
                 try self.sendResponse(tag, "OK", "UNSUBSCRIBE completed");
             },
             .store => {
-                // STORE - set message flags (just acknowledge)
-                try self.sendResponse(tag, "OK", "STORE completed");
+                const seq_set = parts.next() orelse "1:*";
+                // Flags action is rest of line after sequence set
+                const seq_end = @intFromPtr(seq_set.ptr) + seq_set.len - @intFromPtr(line.ptr);
+                const flags_action = if (seq_end < line.len) std.mem.trim(u8, line[seq_end..], " \t") else "";
+                try self.handleStore(tag, seq_set, flags_action);
             },
             .copy => {
-                try self.sendResponse(tag, "OK", "COPY completed");
+                const seq_set = parts.next() orelse "1:*";
+                const dest = parts.next() orelse "INBOX";
+                try self.handleCopy(tag, seq_set, dest);
             },
             .check => {
                 try self.sendResponse(tag, "OK", "CHECK completed");
