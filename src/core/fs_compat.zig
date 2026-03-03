@@ -256,7 +256,9 @@ const EmlEntry = struct {
 /// Returns 0 for filenames that aren't numeric timestamps (e.g. SES message IDs).
 fn parseFilenameTimestamp(filename: []const u8) i64 {
     const basename = if (std.mem.lastIndexOfScalar(u8, filename, '/')) |pos| filename[pos + 1 ..] else filename;
-    const name_no_ext = if (std.mem.endsWith(u8, basename, ".eml")) basename[0 .. basename.len - 4] else basename;
+    // Strip Maildir flag suffix (":2,XXX") first, then ".eml" extension
+    const no_flags = if (std.mem.indexOf(u8, basename, ":2,")) |pos| basename[0..pos] else basename;
+    const name_no_ext = if (std.mem.endsWith(u8, no_flags, ".eml")) no_flags[0 .. no_flags.len - 4] else no_flags;
     return std.fmt.parseInt(i64, name_no_ext, 10) catch return 0;
 }
 
@@ -299,7 +301,7 @@ pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]con
     while (std.c.readdir(dir)) |entry| {
         const name_ptr: [*:0]const u8 = @ptrCast(&entry.name);
         const name = std.mem.sliceTo(name_ptr, 0);
-        if (name.len > 4 and std.mem.eql(u8, name[name.len - 4 ..], ".eml")) {
+        if (name.len > 4 and (std.mem.endsWith(u8, name, ".eml") or std.mem.indexOf(u8, name, ".eml:") != null)) {
             const owned = try allocator.dupe(u8, name);
             try entries.append(allocator, .{
                 .name = owned,

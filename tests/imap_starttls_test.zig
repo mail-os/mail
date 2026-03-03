@@ -227,3 +227,143 @@ test "STARTTLS capability is listed" {
     const cap = imap.ImapCapability.starttls;
     try testing.expectEqualStrings("STARTTLS", cap.toString());
 }
+
+// =============================================================================
+// MaildirFlags — flag parsing, persistence, and COPY/MOVE flag preservation
+// =============================================================================
+
+test "MaildirFlags.fromFilename parses :2,S as Seen" {
+    const flags = imap.MaildirFlags.fromFilename("1772259313773.eml:2,S");
+    try testing.expect(flags.seen);
+    try testing.expect(!flags.answered);
+    try testing.expect(!flags.flagged);
+    try testing.expect(!flags.draft);
+    try testing.expect(!flags.deleted);
+}
+
+test "MaildirFlags.fromFilename parses multiple flags" {
+    const flags = imap.MaildirFlags.fromFilename("msg.eml:2,FRS");
+    try testing.expect(flags.seen);
+    try testing.expect(flags.answered); // R = Replied/Answered
+    try testing.expect(flags.flagged);
+    try testing.expect(!flags.draft);
+    try testing.expect(!flags.deleted);
+}
+
+test "MaildirFlags.fromFilename parses all flags" {
+    const flags = imap.MaildirFlags.fromFilename("msg.eml:2,DFRST");
+    try testing.expect(flags.draft);
+    try testing.expect(flags.flagged);
+    try testing.expect(flags.answered);
+    try testing.expect(flags.seen);
+    try testing.expect(flags.deleted);
+}
+
+test "MaildirFlags.fromFilename returns empty flags for no suffix" {
+    const flags = imap.MaildirFlags.fromFilename("1772259313773.eml");
+    try testing.expect(!flags.seen);
+    try testing.expect(!flags.answered);
+    try testing.expect(!flags.flagged);
+    try testing.expect(!flags.draft);
+    try testing.expect(!flags.deleted);
+}
+
+test "MaildirFlags.baseName strips flag suffix" {
+    try testing.expectEqualStrings("msg.eml", imap.MaildirFlags.baseName("msg.eml:2,S"));
+    try testing.expectEqualStrings("msg.eml", imap.MaildirFlags.baseName("msg.eml:2,DFRST"));
+    try testing.expectEqualStrings("msg.eml", imap.MaildirFlags.baseName("msg.eml"));
+}
+
+test "MaildirFlags.toSuffix generates correct Maildir suffix" {
+    var flags = imap.MaildirFlags{};
+    flags.seen = true;
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings(":2,S", flags.toSuffix(&buf));
+}
+
+test "MaildirFlags.toSuffix alphabetical order per Maildir spec" {
+    var flags = imap.MaildirFlags{
+        .draft = true,
+        .flagged = true,
+        .answered = true,
+        .seen = true,
+        .deleted = true,
+    };
+    var buf: [16]u8 = undefined;
+    // Maildir spec requires alphabetical order: D, F, R, S, T
+    try testing.expectEqualStrings(":2,DFRST", flags.toSuffix(&buf));
+}
+
+test "MaildirFlags round-trip: parse then regenerate preserves flags" {
+    // This is the exact scenario for COPY/MOVE: read flags from source filename,
+    // then generate a new filename with the same flags.
+    const source = "1772259313773.eml:2,S";
+    const flags = imap.MaildirFlags.fromFilename(source);
+    var suffix_buf: [16]u8 = undefined;
+    const suffix = flags.toSuffix(&suffix_buf);
+
+    // The new destination filename should have the same :2,S suffix
+    try testing.expectEqualStrings(":2,S", suffix);
+    try testing.expect(flags.seen);
+}
+
+test "MaildirFlags round-trip preserves multiple flags (archive read+flagged email)" {
+    const source = "msg.eml:2,FS";
+    const flags = imap.MaildirFlags.fromFilename(source);
+    var suffix_buf: [16]u8 = undefined;
+    const suffix = flags.toSuffix(&suffix_buf);
+
+    try testing.expectEqualStrings(":2,FS", suffix);
+    try testing.expect(flags.seen);
+    try testing.expect(flags.flagged);
+}
+
+test "MaildirFlags.toImapString formats correctly" {
+    var flags = imap.MaildirFlags{ .seen = true, .flagged = true };
+    var buf: [256]u8 = undefined;
+    const result = flags.toImapString(&buf);
+    try testing.expect(std.mem.indexOf(u8, result, "\\Seen") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\\Flagged") != null);
+}
+
+test "MaildirFlags.toImapString empty flags" {
+    var flags = imap.MaildirFlags{};
+    var buf: [256]u8 = undefined;
+    const result = flags.toImapString(&buf);
+    try testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "MaildirFlags.applyAction adds flags with +FLAGS" {
+    var flags = imap.MaildirFlags{ .seen = true };
+    flags.applyAction("+FLAGS (\\Flagged \\Answered)");
+    try testing.expect(flags.seen); // preserved
+    try testing.expect(flags.flagged); // added
+    try testing.expect(flags.answered); // added
+}
+
+test "MaildirFlags.applyAction removes flags with -FLAGS" {
+    var flags = imap.MaildirFlags{ .seen = true, .flagged = true };
+    flags.applyAction("-FLAGS (\\Seen)");
+    try testing.expect(!flags.seen); // removed
+    try testing.expect(flags.flagged); // preserved
+}
+
+test "MaildirFlags.applyAction replaces all flags with FLAGS" {
+    var flags = imap.MaildirFlags{ .seen = true, .flagged = true, .answered = true };
+    flags.applyAction("FLAGS (\\Deleted)");
+    try testing.expect(!flags.seen);
+    try testing.expect(!flags.flagged);
+    try testing.expect(!flags.answered);
+    try testing.expect(flags.deleted);
+}
+
+test "MOVE capability is advertised" {
+    const cap = imap.ImapCapability.move;
+    try testing.expectEqualStrings("MOVE", cap.toString());
+}
+
+test "fromString parses MOVE command" {
+    const cmd = imap.ImapCommand.fromString("MOVE");
+    try testing.expect(cmd != null);
+    try testing.expect(cmd.? == .move);
+}

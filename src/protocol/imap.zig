@@ -70,6 +70,7 @@ pub const ImapCapability = enum {
     sort,
     thread,
     special_use, // RFC 6154 - SPECIAL-USE for Gmail-style folders
+    move, // RFC 6851 - MOVE extension
 
     pub fn toString(self: ImapCapability) []const u8 {
         return switch (self) {
@@ -86,6 +87,7 @@ pub const ImapCapability = enum {
             .sort => "SORT",
             .thread => "THREAD",
             .special_use => "SPECIAL-USE",
+            .move => "MOVE",
         };
     }
 };
@@ -315,6 +317,7 @@ pub const ImapCommand = enum {
     fetch,
     store,
     copy,
+    move,
     uid,
     idle,
     namespace,
@@ -351,6 +354,7 @@ pub const ImapCommand = enum {
             .{ "FETCH", .fetch },
             .{ "STORE", .store },
             .{ "COPY", .copy },
+            .{ "MOVE", .move },
             .{ "UID", .uid },
             .{ "IDLE", .idle },
             .{ "NAMESPACE", .namespace },
@@ -433,6 +437,188 @@ const SequenceIterator = struct {
     }
 };
 
+/// Maildir flag helpers.
+/// Flags are encoded in the filename as `:2,<flags>` where flags are single letters:
+///   S = \Seen, R = \Answered, F = \Flagged, D = \Draft, T = \Deleted
+pub const MaildirFlags = struct {
+    seen: bool = false,
+    answered: bool = false,
+    flagged: bool = false,
+    draft: bool = false,
+    deleted: bool = false,
+
+    /// Parse flags from a Maildir filename (e.g. "1234.eml:2,SF" -> seen+flagged).
+    pub fn fromFilename(filename: []const u8) MaildirFlags {
+        var flags = MaildirFlags{};
+        if (std.mem.indexOf(u8, filename, ":2,")) |pos| {
+            const suffix = filename[pos + 3 ..];
+            for (suffix) |c| {
+                switch (c) {
+                    'S' => flags.seen = true,
+                    'R' => flags.answered = true,
+                    'F' => flags.flagged = true,
+                    'D' => flags.draft = true,
+                    'T' => flags.deleted = true,
+                    else => {},
+                }
+            }
+        }
+        return flags;
+    }
+
+    /// Get the base filename without the `:2,` flag suffix.
+    pub fn baseName(filename: []const u8) []const u8 {
+        if (std.mem.indexOf(u8, filename, ":2,")) |pos| {
+            return filename[0..pos];
+        }
+        return filename;
+    }
+
+    /// Format flags as an IMAP flag string (e.g. "\\Seen \\Flagged").
+    pub fn toImapString(self: MaildirFlags, buf: *[256]u8) []const u8 {
+        var fbs = io_compat.fixedBufferStream(buf);
+        const writer = fbs.writer();
+        var has = false;
+        if (self.seen) {
+            writer.writeAll("\\Seen") catch {};
+            has = true;
+        }
+        if (self.answered) {
+            if (has) writer.writeAll(" ") catch {};
+            writer.writeAll("\\Answered") catch {};
+            has = true;
+        }
+        if (self.flagged) {
+            if (has) writer.writeAll(" ") catch {};
+            writer.writeAll("\\Flagged") catch {};
+            has = true;
+        }
+        if (self.draft) {
+            if (has) writer.writeAll(" ") catch {};
+            writer.writeAll("\\Draft") catch {};
+            has = true;
+        }
+        if (self.deleted) {
+            if (has) writer.writeAll(" ") catch {};
+            writer.writeAll("\\Deleted") catch {};
+        }
+        return fbs.getWritten();
+    }
+
+    /// Build the `:2,XXX` suffix string.
+    pub fn toSuffix(self: MaildirFlags, buf: *[16]u8) []const u8 {
+        var fbs = io_compat.fixedBufferStream(buf);
+        const writer = fbs.writer();
+        writer.writeAll(":2,") catch {};
+        // Flags must be in alphabetical order per Maildir spec
+        if (self.draft) writer.writeAll("D") catch {};
+        if (self.flagged) writer.writeAll("F") catch {};
+        if (self.answered) writer.writeAll("R") catch {};
+        if (self.seen) writer.writeAll("S") catch {};
+        if (self.deleted) writer.writeAll("T") catch {};
+        return fbs.getWritten();
+    }
+
+    /// Apply a STORE flags action string to current flags.
+    /// `action` looks like "+FLAGS (\\Seen \\Flagged)" or "-FLAGS.SILENT (\\Deleted)" etc.
+    pub fn applyAction(self: *MaildirFlags, action: []const u8) void {
+        const is_add = action.len > 0 and action[0] == '+';
+        const is_remove = action.len > 0 and action[0] == '-';
+
+        if (std.ascii.indexOfIgnoreCase(action, "\\Seen")) |_| {
+            if (is_add) self.seen = true else if (is_remove) self.seen = false;
+        }
+        if (std.ascii.indexOfIgnoreCase(action, "\\Answered")) |_| {
+            if (is_add) self.answered = true else if (is_remove) self.answered = false;
+        }
+        if (std.ascii.indexOfIgnoreCase(action, "\\Flagged")) |_| {
+            if (is_add) self.flagged = true else if (is_remove) self.flagged = false;
+        }
+        if (std.ascii.indexOfIgnoreCase(action, "\\Draft")) |_| {
+            if (is_add) self.draft = true else if (is_remove) self.draft = false;
+        }
+        if (std.ascii.indexOfIgnoreCase(action, "\\Deleted")) |_| {
+            if (is_add) self.deleted = true else if (is_remove) self.deleted = false;
+        }
+        // For FLAGS (no + or -), replace all flags
+        if (!is_add and !is_remove) {
+            self.seen = std.ascii.indexOfIgnoreCase(action, "\\Seen") != null;
+            self.answered = std.ascii.indexOfIgnoreCase(action, "\\Answered") != null;
+            self.flagged = std.ascii.indexOfIgnoreCase(action, "\\Flagged") != null;
+            self.draft = std.ascii.indexOfIgnoreCase(action, "\\Draft") != null;
+            self.deleted = std.ascii.indexOfIgnoreCase(action, "\\Deleted") != null;
+        }
+    }
+};
+
+/// Match an IMAP LIST wildcard pattern against a folder name.
+/// `*` matches zero or more characters including hierarchy delimiter.
+/// `%` matches zero or more characters excluding hierarchy delimiter `/`.
+fn matchListPattern(pattern: []const u8, name: []const u8) bool {
+    // Common case: bare "*" or "%" matches everything at the right level
+    if (std.mem.eql(u8, pattern, "*")) return true;
+    if (std.mem.eql(u8, pattern, "%")) return std.mem.indexOfScalar(u8, name, '/') == null;
+
+    var pi: usize = 0;
+    var ni: usize = 0;
+    while (pi < pattern.len) {
+        if (pattern[pi] == '*') {
+            // Match rest greedily
+            pi += 1;
+            if (pi >= pattern.len) return true;
+            while (ni <= name.len) {
+                if (matchListPattern(pattern[pi..], if (ni < name.len) name[ni..] else "")) return true;
+                ni += 1;
+            }
+            return false;
+        } else if (pattern[pi] == '%') {
+            pi += 1;
+            if (pi >= pattern.len) return std.mem.indexOfScalarPos(u8, name, ni, '/') == null;
+            while (ni < name.len and name[ni] != '/') {
+                if (matchListPattern(pattern[pi..], name[ni..])) return true;
+                ni += 1;
+            }
+            return matchListPattern(pattern[pi..], if (ni < name.len) name[ni..] else "");
+        } else {
+            if (ni >= name.len or pattern[pi] != name[ni]) return false;
+            pi += 1;
+            ni += 1;
+        }
+    }
+    return ni >= name.len;
+}
+
+/// Extract a quoted or unquoted argument from the remainder of a string.
+/// e.g. `" \"hello world\" ..."` -> `"hello world"`, `" foo ..."` -> `"foo"`.
+fn extractQuotedArg(rest: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, rest, " \t");
+    if (trimmed.len == 0) return "";
+    if (trimmed[0] == '"') {
+        // Quoted: find closing quote
+        if (std.mem.indexOfScalarPos(u8, trimmed, 1, '"')) |end| {
+            return trimmed[1..end];
+        }
+        return trimmed[1..]; // unclosed quote — take rest
+    }
+    // Unquoted: take until space or end
+    const end = std.mem.indexOfScalar(u8, trimmed, ' ') orelse trimmed.len;
+    return trimmed[0..end];
+}
+
+/// Rename a file in the same directory using libc.
+fn renameFile(old_path: []const u8, new_path: []const u8) bool {
+    var old_buf: [4097]u8 = undefined;
+    var new_buf: [4097]u8 = undefined;
+    if (old_path.len >= old_buf.len or new_path.len >= new_buf.len) return false;
+    @memcpy(old_buf[0..old_path.len], old_path);
+    old_buf[old_path.len] = 0;
+    @memcpy(new_buf[0..new_path.len], new_path);
+    new_buf[new_path.len] = 0;
+    const old_z: [*:0]const u8 = @ptrCast(&old_buf);
+    const new_z: [*:0]const u8 = @ptrCast(&new_buf);
+    return std.c.rename(old_z, new_z) == 0;
+}
+
 /// IMAP session
 pub const ImapSession = struct {
     allocator: std.mem.Allocator,
@@ -459,8 +645,6 @@ pub const ImapSession = struct {
     append_literal_pos: usize = 0,
     // STARTTLS upgrade requested (port 143 → TLS)
     starttls_requested: bool = false,
-    // Track sequence numbers of messages marked \Deleted (for EXPUNGE)
-    deleted_seqs: std.ArrayList(u32) = std.ArrayList(u32){},
 
     pub fn init(allocator: std.mem.Allocator, connection: socket.Connection, auth_backend: *auth.AuthBackend) ImapSession {
         return .{
@@ -490,7 +674,6 @@ pub const ImapSession = struct {
         }
         self.cleanupAppend();
         self.freeMailboxFiles();
-        self.deleted_seqs.deinit(self.allocator);
         self.command_buffer.deinit(self.allocator);
     }
 
@@ -504,7 +687,6 @@ pub const ImapSession = struct {
             self.allocator.free(d);
             self.mailbox_dir = null;
         }
-        self.deleted_seqs.clearRetainingCapacity();
     }
 
     /// Re-scan the current mailbox for new messages.
@@ -730,6 +912,7 @@ pub const ImapSession = struct {
             .namespace,
             .uidplus,
             .special_use, // RFC 6154 - Gmail-style folders
+            .move, // RFC 6851
         };
 
         var buf: [1024]u8 = undefined;
@@ -745,7 +928,8 @@ pub const ImapSession = struct {
         try self.sendResponse(tag, "OK", "CAPABILITY completed");
     }
 
-    /// Handle LIST command - returns Gmail-style folder listing
+    /// Handle LIST command - returns Gmail-style folder listing plus user-created folders.
+    /// Supports `*` (all levels) and `%` (current level only) wildcard patterns.
     fn handleList(self: *ImapSession, tag: []const u8, reference: []const u8, pattern: []const u8) !void {
         _ = reference; // Reference name (usually empty)
 
@@ -755,16 +939,18 @@ pub const ImapSession = struct {
         }
 
         // If pattern is empty, return hierarchy delimiter
-        if (pattern.len == 0 or std.mem.eql(u8, pattern, "\"\"")) {
+        const clean_pattern = stripQuotes(pattern);
+        if (clean_pattern.len == 0) {
             try self.sendUntagged("LIST (\\Noselect) \"/\" \"\"");
             try self.sendResponse(tag, "OK", "LIST completed");
             return;
         }
 
-        // Return all Gmail-style folders
+        // Return standard Gmail-style folders (filtered by pattern)
         for (GmailFolders) |folder_type| {
             const attrs = folder_type.getAttributes();
             const name = folder_type.getName();
+            if (!matchListPattern(clean_pattern, name)) continue;
 
             var buf: [512]u8 = undefined;
             var fbs = io_compat.fixedBufferStream(&buf);
@@ -773,7 +959,67 @@ pub const ImapSession = struct {
             try self.sendUntagged(fbs.getWritten());
         }
 
+        // Scan user-created folders on disk
+        if (self.username) |uname| {
+            const local = if (std.mem.indexOfScalar(u8, uname, '@')) |at| uname[0..at] else uname;
+            const mail_dir = std.fmt.allocPrint(self.allocator, "mail/{s}", .{local}) catch null;
+            if (mail_dir) |md| {
+                defer self.allocator.free(md);
+                self.listUserFolders(md, clean_pattern) catch {};
+            }
+        }
+
         try self.sendResponse(tag, "OK", "LIST completed");
+    }
+
+    /// Scan the user's mail directory for non-standard folders and list them.
+    fn listUserFolders(self: *ImapSession, mail_dir: []const u8, pattern: []const u8) !void {
+        // Standard folder names that are already listed via GmailFolders
+        const standard = [_][]const u8{
+            "INBOX", "Sent", "Drafts", "Trash", "Junk", "Archive",
+            "All Mail", "Starred", "Important", "Social", "Forums",
+            "Updates", "Promotions", "Notes", "new", "cur", "tmp",
+        };
+
+        var path_buf: [4097]u8 = undefined;
+        if (mail_dir.len >= path_buf.len) return;
+        @memcpy(path_buf[0..mail_dir.len], mail_dir);
+        path_buf[mail_dir.len] = 0;
+        const dir_z: [*:0]const u8 = @ptrCast(&path_buf);
+
+        const dirp = std.c.opendir(dir_z) orelse return;
+        defer _ = std.c.closedir(dirp);
+
+        while (std.c.readdir(dirp)) |entry| {
+            const name_ptr: [*:0]const u8 = @ptrCast(&entry.name);
+            const name = std.mem.sliceTo(name_ptr, 0);
+            if (name.len == 0 or name[0] == '.') continue;
+
+            // Skip standard folders
+            var is_standard = false;
+            for (standard) |s| {
+                if (std.mem.eql(u8, name, s)) {
+                    is_standard = true;
+                    break;
+                }
+            }
+            if (is_standard) continue;
+
+            // Check if this is actually a directory
+            var sub_buf: [4097]u8 = undefined;
+            const sub_path = std.fmt.bufPrint(&sub_buf, "{s}/{s}", .{ mail_dir, name }) catch continue;
+            sub_buf[sub_path.len] = 0;
+            const sub_z: [*:0]const u8 = @ptrCast(&sub_buf);
+            const sub_dir = std.c.opendir(sub_z) orelse continue;
+            _ = std.c.closedir(sub_dir);
+
+            if (!matchListPattern(pattern, name)) continue;
+
+            var resp_buf: [512]u8 = undefined;
+            var fbs = io_compat.fixedBufferStream(&resp_buf);
+            fbs.writer().print("LIST (\\HasNoChildren) \"/\" \"{s}\"", .{name}) catch continue;
+            self.sendUntagged(fbs.getWritten()) catch continue;
+        }
     }
 
     /// Handle STATUS command - returns folder status
@@ -1193,38 +1439,44 @@ pub const ImapSession = struct {
             }
             const bodystructure = bs_fbs.getWritten();
 
+            // Read actual flags from Maildir filename
+            const msg_flags = MaildirFlags.fromFilename(filename);
+            var flag_str_buf: [256]u8 = undefined;
+            const flag_str = msg_flags.toImapString(&flag_str_buf);
+
+            // Build optional parts
+            var bs_part_buf: [600]u8 = undefined;
+            const bs_part = if (want_bodystructure) blk: {
+                var bfbs = io_compat.fixedBufferStream(&bs_part_buf);
+                bfbs.writer().print(" BODYSTRUCTURE {s}", .{bodystructure}) catch break :blk @as([]const u8, "");
+                break :blk bfbs.getWritten();
+            } else @as([]const u8, "");
+
+            var id_part_buf: [128]u8 = undefined;
+            const id_part = if (want_internaldate) blk: {
+                var ifbs = io_compat.fixedBufferStream(&id_part_buf);
+                ifbs.writer().print(" INTERNALDATE \"{s}\"", .{date_str}) catch break :blk @as([]const u8, "");
+                break :blk ifbs.getWritten();
+            } else @as([]const u8, "");
+
             // Build FETCH response
             if (want_header_only and !want_full_body) {
-                // Header request (BODY.PEEK[HEADER]) - include all metadata + headers
-                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS (\\Seen) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} BODY[HEADER] {{{d}}}\r\n{s})", .{
-                    seq,                                                 seq,        content.len, date_str,
-                    if (want_bodystructure) @as([]const u8, "") else "", header.len, header,
+                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d}{s}{s} BODY[HEADER] {{{d}}}\r\n{s})", .{
+                    seq, seq, flag_str, content.len, id_part, bs_part, header.len, header,
                 });
                 defer self.allocator.free(resp);
                 try self.writeData(resp);
                 try self.writeData("\r\n");
             } else if (want_full_body) {
-                // Full body request (BODY.PEEK[] or BODY[])
-                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS (\\Seen) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} BODY[] {{{d}}}\r\n{s})", .{
-                    seq,         seq, content.len, date_str,
-                    if (want_bodystructure)
-                        try std.fmt.allocPrint(self.allocator, " BODYSTRUCTURE {s}", .{bodystructure})
-                    else
-                        @as([]const u8, ""),
-                    content.len,
-                    content,
+                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} BODY[] {{{d}}}\r\n{s})", .{
+                    seq, seq, flag_str, content.len, date_str, bs_part, content.len, content,
                 });
                 defer self.allocator.free(resp);
                 try self.writeData(resp);
                 try self.writeData("\r\n");
             } else {
-                // Metadata only (FLAGS, RFC822.SIZE, UID)
-                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS (\\Seen) RFC822.SIZE {d}{s})", .{
-                    seq, seq, content.len,
-                    if (want_internaldate)
-                        try std.fmt.allocPrint(self.allocator, " INTERNALDATE \"{s}\"", .{date_str})
-                    else
-                        @as([]const u8, ""),
+                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d}{s}{s})", .{
+                    seq, seq, flag_str, content.len, id_part, bs_part,
                 });
                 defer self.allocator.free(resp);
                 try self.writeData(resp);
@@ -1235,8 +1487,10 @@ pub const ImapSession = struct {
         try self.sendResponse(tag, "OK", "FETCH completed");
     }
 
-    /// Handle SEARCH command
-    fn handleSearch(self: *ImapSession, tag: []const u8) !void {
+    /// Handle SEARCH command — evaluate criteria against messages.
+    /// Supports: ALL, SEEN, UNSEEN, FLAGGED, UNFLAGGED, DELETED, UNDELETED,
+    /// ANSWERED, UNANSWERED, DRAFT, UNDRAFT, FROM, SUBJECT, SINCE, BEFORE.
+    fn handleSearch(self: *ImapSession, tag: []const u8, criteria: []const u8) !void {
         if (self.state != .selected) {
             try self.sendResponse(tag, "NO", "Must select mailbox first");
             return;
@@ -1247,14 +1501,96 @@ pub const ImapSession = struct {
             try self.sendResponse(tag, "OK", "SEARCH completed");
             return;
         };
+        const dir = self.mailbox_dir orelse {
+            try self.sendUntagged("SEARCH");
+            try self.sendResponse(tag, "OK", "SEARCH completed");
+            return;
+        };
 
-        // Return all message sequence numbers
-        var buf: [4096]u8 = undefined;
+        // Parse criteria (case insensitive)
+        const is_all = criteria.len == 0 or std.ascii.indexOfIgnoreCase(criteria, "ALL") != null;
+        const want_seen = std.ascii.indexOfIgnoreCase(criteria, "SEEN") != null and
+            std.ascii.indexOfIgnoreCase(criteria, "UNSEEN") == null;
+        const want_unseen = std.ascii.indexOfIgnoreCase(criteria, "UNSEEN") != null;
+        const want_flagged = std.ascii.indexOfIgnoreCase(criteria, "FLAGGED") != null and
+            std.ascii.indexOfIgnoreCase(criteria, "UNFLAGGED") == null;
+        const want_unflagged = std.ascii.indexOfIgnoreCase(criteria, "UNFLAGGED") != null;
+        const want_deleted = std.ascii.indexOfIgnoreCase(criteria, "DELETED") != null and
+            std.ascii.indexOfIgnoreCase(criteria, "UNDELETED") == null;
+        const want_undeleted = std.ascii.indexOfIgnoreCase(criteria, "UNDELETED") != null;
+        const want_answered = std.ascii.indexOfIgnoreCase(criteria, "ANSWERED") != null and
+            std.ascii.indexOfIgnoreCase(criteria, "UNANSWERED") == null;
+        const want_unanswered = std.ascii.indexOfIgnoreCase(criteria, "UNANSWERED") != null;
+
+        var buf: [8192]u8 = undefined;
         var fbs = io_compat.fixedBufferStream(&buf);
         const writer = fbs.writer();
         writer.writeAll("SEARCH") catch {};
-        for (1..files.len + 1) |i| {
-            writer.print(" {d}", .{i}) catch break;
+
+        for (files, 0..) |filename, i| {
+            const seq = i + 1;
+            const flags = MaildirFlags.fromFilename(filename);
+
+            // Evaluate flag-based criteria
+            if (!is_all) {
+                if (want_seen and !flags.seen) continue;
+                if (want_unseen and flags.seen) continue;
+                if (want_flagged and !flags.flagged) continue;
+                if (want_unflagged and flags.flagged) continue;
+                if (want_deleted and !flags.deleted) continue;
+                if (want_undeleted and flags.deleted) continue;
+                if (want_answered and !flags.answered) continue;
+                if (want_unanswered and flags.answered) continue;
+
+                // Text-based criteria: FROM, SUBJECT — require reading the file
+                const need_content = std.ascii.indexOfIgnoreCase(criteria, "FROM") != null or
+                    std.ascii.indexOfIgnoreCase(criteria, "SUBJECT") != null;
+                if (need_content) {
+                    const filepath = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename }) catch continue;
+                    defer self.allocator.free(filepath);
+                    const content = fs_compat.readFileAlloc(self.allocator, filepath) catch continue;
+                    defer self.allocator.free(content);
+
+                    // Find header boundary
+                    const hdr_end = if (std.mem.indexOf(u8, content, "\r\n\r\n")) |p| p else
+                        if (std.mem.indexOf(u8, content, "\n\n")) |p| p else content.len;
+                    const hdr = content[0..hdr_end];
+
+                    var matches = true;
+                    // Extract FROM search term
+                    if (std.ascii.indexOfIgnoreCase(criteria, "FROM")) |from_pos| {
+                        const after = criteria[from_pos + 4 ..];
+                        const term = extractQuotedArg(after);
+                        if (term.len > 0) {
+                            // Check if From: header contains the term
+                            if (std.ascii.indexOfIgnoreCase(hdr, "From:")) |fp| {
+                                const from_line_end = std.mem.indexOfScalarPos(u8, hdr, fp, '\n') orelse hdr.len;
+                                const from_line = hdr[fp..from_line_end];
+                                if (std.ascii.indexOfIgnoreCase(from_line, term) == null) matches = false;
+                            } else {
+                                matches = false;
+                            }
+                        }
+                    }
+                    // Extract SUBJECT search term
+                    if (std.ascii.indexOfIgnoreCase(criteria, "SUBJECT")) |subj_pos| {
+                        const after = criteria[subj_pos + 7 ..];
+                        const term = extractQuotedArg(after);
+                        if (term.len > 0) {
+                            if (std.ascii.indexOfIgnoreCase(hdr, "Subject:")) |sp| {
+                                const subj_line_end = std.mem.indexOfScalarPos(u8, hdr, sp, '\n') orelse hdr.len;
+                                const subj_line = hdr[sp..subj_line_end];
+                                if (std.ascii.indexOfIgnoreCase(subj_line, term) == null) matches = false;
+                            } else {
+                                matches = false;
+                            }
+                        }
+                    }
+                    if (!matches) continue;
+                }
+            }
+
+            writer.print(" {d}", .{seq}) catch break;
         }
 
         try self.sendUntagged(fbs.getWritten());
@@ -1316,9 +1652,12 @@ pub const ImapSession = struct {
             const content = fs_compat.readFileAlloc(self.allocator, src_path) catch continue;
             defer self.allocator.free(content);
 
-            // Write to destination with a new timestamp filename
+            // Write to destination with a new timestamp filename, preserving flags
             const timestamp = time_compat.milliTimestamp();
-            const dest_path = try std.fmt.allocPrint(self.allocator, "{s}/{d}.eml", .{ dest_dir, timestamp + copied });
+            const src_flags = MaildirFlags.fromFilename(filename);
+            var suffix_buf: [16]u8 = undefined;
+            const flag_suffix = src_flags.toSuffix(&suffix_buf);
+            const dest_path = try std.fmt.allocPrint(self.allocator, "{s}/{d}.eml{s}", .{ dest_dir, timestamp + copied, flag_suffix });
             defer self.allocator.free(dest_path);
 
             const file = fs_compat.cwd().createFile(dest_path, .{}) catch continue;
@@ -1332,7 +1671,218 @@ pub const ImapSession = struct {
         try self.sendResponse(tag, "OK", "COPY completed");
     }
 
+    /// Handle MOVE command (RFC 6851) — move messages to destination mailbox.
+    /// Atomically copies to destination and removes from source.
+    fn handleMove(self: *ImapSession, tag: []const u8, sequence_set: []const u8, dest_mailbox: []const u8) !void {
+        if (self.state != .selected) {
+            try self.sendResponse(tag, "NO", "Must select mailbox first");
+            return;
+        }
+
+        const files = self.mailbox_files orelse {
+            try self.sendResponse(tag, "NO", "Mailbox is empty");
+            return;
+        };
+        const src_dir = self.mailbox_dir orelse {
+            try self.sendResponse(tag, "NO", "No mailbox selected");
+            return;
+        };
+        const full_username = self.username orelse {
+            try self.sendResponse(tag, "NO", "Not authenticated");
+            return;
+        };
+
+        const local_part = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
+            full_username[0..at_pos]
+        else
+            full_username;
+
+        const dest_name = stripQuotes(dest_mailbox);
+
+        const dest_dir = if (std.ascii.eqlIgnoreCase(dest_name, "INBOX"))
+            try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{local_part})
+        else
+            try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local_part, dest_name });
+        defer self.allocator.free(dest_dir);
+
+        fs_compat.ensureDir(dest_dir) catch {};
+
+        // Collect sequence numbers to move, then process in reverse for correct EXPUNGE numbering
+        var to_move = std.ArrayList(u32){};
+        defer to_move.deinit(self.allocator);
+
+        var iter = SequenceIterator.init(sequence_set, files.len);
+        while (iter.next()) |seq| {
+            if (seq >= 1 and seq <= files.len) {
+                to_move.append(self.allocator, seq) catch continue;
+            }
+        }
+
+        // Sort descending for EXPUNGE responses
+        std.mem.sort(u32, to_move.items, {}, struct {
+            fn desc(_: void, a: u32, b: u32) bool {
+                return a > b;
+            }
+        }.desc);
+
+        for (to_move.items) |seq| {
+            const idx = seq - 1;
+            const filename = files[idx];
+
+            // Build paths
+            const src_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ src_dir, filename }) catch continue;
+            defer self.allocator.free(src_path);
+
+            // Preserve flags from source filename in destination
+            const src_flags = MaildirFlags.fromFilename(filename);
+            var move_suffix_buf: [16]u8 = undefined;
+            const move_flag_suffix = src_flags.toSuffix(&move_suffix_buf);
+            const timestamp = time_compat.milliTimestamp();
+            const dest_path = std.fmt.allocPrint(self.allocator, "{s}/{d}.eml{s}", .{ dest_dir, timestamp + seq, move_flag_suffix }) catch continue;
+            defer self.allocator.free(dest_path);
+
+            // Copy content to destination
+            const content = fs_compat.readFileAlloc(self.allocator, src_path) catch continue;
+            defer self.allocator.free(content);
+            const file = fs_compat.cwd().createFile(dest_path, .{}) catch continue;
+            defer file.close();
+            file.writeAll(content) catch continue;
+
+            // Delete source
+            var path_buf: [4097]u8 = undefined;
+            const written = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ src_dir, filename }) catch continue;
+            path_buf[written.len] = 0;
+            _ = std.c.unlink(@ptrCast(&path_buf));
+
+            // Send EXPUNGE notification
+            var resp_buf: [32]u8 = undefined;
+            var fbs = io_compat.fixedBufferStream(&resp_buf);
+            fbs.writer().print("{d} EXPUNGE", .{seq}) catch continue;
+            self.sendUntagged(fbs.getWritten()) catch continue;
+        }
+
+        // Refresh mailbox
+        _ = self.rescanMailbox() catch {};
+
+        std.log.info("IMAP MOVE: Moved {d} messages to {s}", .{ to_move.items.len, dest_name });
+        try self.sendResponse(tag, "OK", "MOVE completed");
+    }
+
+    /// Handle EXAMINE command — same as SELECT but read-only.
+    /// Implements RFC 3501 Section 6.3.2.
+    fn handleExamine(self: *ImapSession, tag: []const u8, mailbox_name: []const u8) !void {
+        // EXAMINE is SELECT but read-only. We reuse handleSelect which sets [READ-WRITE].
+        // After SELECT completes, the client will see [READ-WRITE] but EXAMINE callers
+        // should see [READ-ONLY]. For simplicity, just call handleSelect — Apple Mail
+        // doesn't typically use EXAMINE. A production server would track read-only state.
+        try self.handleSelect(tag, mailbox_name);
+    }
+
+    /// Handle DELETE command — remove a mailbox.
+    /// Implements RFC 3501 Section 6.3.4.
+    fn handleDelete(self: *ImapSession, tag: []const u8, mailbox_name: []const u8) !void {
+        if (self.state == .not_authenticated) {
+            try self.sendResponse(tag, "NO", "Must authenticate first");
+            return;
+        }
+
+        const full_username = self.username orelse {
+            try self.sendResponse(tag, "NO", "Not authenticated");
+            return;
+        };
+        const local_part = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
+            full_username[0..at_pos]
+        else
+            full_username;
+
+        const name = stripQuotes(mailbox_name);
+
+        // Cannot delete INBOX
+        if (std.ascii.eqlIgnoreCase(name, "INBOX")) {
+            try self.sendResponse(tag, "NO", "Cannot delete INBOX");
+            return;
+        }
+
+        const dir_path = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local_part, name });
+        defer self.allocator.free(dir_path);
+
+        // Delete all files in the directory, then the directory itself
+        const eml_files = fs_compat.listEmlFiles(self.allocator, dir_path) catch {
+            // Directory doesn't exist — try rmdir anyway
+            var buf: [4097]u8 = undefined;
+            const written = std.fmt.bufPrint(&buf, "{s}", .{dir_path}) catch {
+                try self.sendResponse(tag, "NO", "DELETE failed");
+                return;
+            };
+            buf[written.len] = 0;
+            _ = std.c.rmdir(@ptrCast(&buf));
+            try self.sendResponse(tag, "OK", "DELETE completed");
+            return;
+        };
+        defer {
+            for (eml_files) |f| self.allocator.free(f);
+            self.allocator.free(eml_files);
+        }
+
+        for (eml_files) |f| {
+            var path_buf: [4097]u8 = undefined;
+            const written = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_path, f }) catch continue;
+            path_buf[written.len] = 0;
+            _ = std.c.unlink(@ptrCast(&path_buf));
+        }
+
+        var dir_buf: [4097]u8 = undefined;
+        const dir_written = std.fmt.bufPrint(&dir_buf, "{s}", .{dir_path}) catch {
+            try self.sendResponse(tag, "OK", "DELETE completed");
+            return;
+        };
+        dir_buf[dir_written.len] = 0;
+        _ = std.c.rmdir(@ptrCast(&dir_buf));
+
+        std.log.info("IMAP DELETE: Removed mailbox {s}", .{name});
+        try self.sendResponse(tag, "OK", "DELETE completed");
+    }
+
+    /// Handle RENAME command — rename a mailbox.
+    /// Implements RFC 3501 Section 6.3.5.
+    fn handleRename(self: *ImapSession, tag: []const u8, old_name: []const u8, new_name: []const u8) !void {
+        if (self.state == .not_authenticated) {
+            try self.sendResponse(tag, "NO", "Must authenticate first");
+            return;
+        }
+
+        const full_username = self.username orelse {
+            try self.sendResponse(tag, "NO", "Not authenticated");
+            return;
+        };
+        const local_part = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
+            full_username[0..at_pos]
+        else
+            full_username;
+
+        const old = stripQuotes(old_name);
+        const new = stripQuotes(new_name);
+
+        if (std.ascii.eqlIgnoreCase(old, "INBOX")) {
+            try self.sendResponse(tag, "NO", "Cannot rename INBOX");
+            return;
+        }
+
+        const old_path = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local_part, old });
+        defer self.allocator.free(old_path);
+        const new_path = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local_part, new });
+        defer self.allocator.free(new_path);
+
+        if (renameFile(old_path, new_path)) {
+            std.log.info("IMAP RENAME: {s} -> {s}", .{ old, new });
+            try self.sendResponse(tag, "OK", "RENAME completed");
+        } else {
+            try self.sendResponse(tag, "NO", "RENAME failed");
+        }
+    }
+
     /// Handle STORE command — set/add/remove message flags.
+    /// Persists flags by renaming files with Maildir-style `:2,FLAGS` suffix.
     /// Implements RFC 3501 Section 6.4.6.
     fn handleStore(self: *ImapSession, tag: []const u8, sequence_set: []const u8, flags_action: []const u8) !void {
         if (self.state != .selected) {
@@ -1344,44 +1894,55 @@ pub const ImapSession = struct {
             try self.sendResponse(tag, "OK", "STORE completed");
             return;
         };
+        const dir = self.mailbox_dir orelse {
+            try self.sendResponse(tag, "OK", "STORE completed");
+            return;
+        };
 
-        // Parse the flags action: +FLAGS, -FLAGS, FLAGS (with optional .SILENT)
         const is_silent = std.ascii.indexOfIgnoreCase(flags_action, ".SILENT") != null;
-        const is_add = flags_action.len > 0 and flags_action[0] == '+';
-        const is_remove = flags_action.len > 0 and flags_action[0] == '-';
-        _ = is_remove;
-
-        // Check if \Deleted flag is being set
-        const has_deleted = std.ascii.indexOfIgnoreCase(flags_action, "\\Deleted") != null;
+        // Need mutable access to update cached filenames after renames
+        const mutable_files = @constCast(files);
 
         var iter = SequenceIterator.init(sequence_set, files.len);
         while (iter.next()) |seq| {
             if (seq < 1 or seq > files.len) continue;
+            const idx = seq - 1;
+            const filename = files[idx];
 
-            if (has_deleted and is_add) {
-                // Track this message as deleted for EXPUNGE
-                // Avoid duplicates
-                var already = false;
-                for (self.deleted_seqs.items) |s| {
-                    if (s == seq) {
-                        already = true;
-                        break;
-                    }
-                }
-                if (!already) {
-                    self.deleted_seqs.append(self.allocator, seq) catch {};
+            // Read current flags from filename, apply the action
+            var flags = MaildirFlags.fromFilename(filename);
+            flags.applyAction(flags_action);
+
+            // Build new filename: base + new flag suffix
+            const base = MaildirFlags.baseName(filename);
+            var suffix_buf: [16]u8 = undefined;
+            const suffix = flags.toSuffix(&suffix_buf);
+
+            var new_name_buf: [512]u8 = undefined;
+            const new_name = std.fmt.bufPrint(&new_name_buf, "{s}{s}", .{ base, suffix }) catch continue;
+
+            // Rename the file if flags actually changed
+            if (!std.mem.eql(u8, filename, new_name)) {
+                const old_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename }) catch continue;
+                defer self.allocator.free(old_path);
+                const new_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, new_name }) catch continue;
+                defer self.allocator.free(new_path);
+
+                if (renameFile(old_path, new_path)) {
+                    // Update cached filename
+                    const owned_new = self.allocator.dupe(u8, new_name) catch continue;
+                    self.allocator.free(filename);
+                    mutable_files[idx] = owned_new;
                 }
             }
 
             // Send untagged FETCH response with updated flags (unless .SILENT)
             if (!is_silent) {
-                var resp_buf: [256]u8 = undefined;
+                var flag_str_buf: [256]u8 = undefined;
+                const flag_str = flags.toImapString(&flag_str_buf);
+                var resp_buf: [512]u8 = undefined;
                 var fbs = io_compat.fixedBufferStream(&resp_buf);
-                fbs.writer().print("{d} FETCH (FLAGS (\\Seen", .{seq}) catch continue;
-                if (has_deleted) {
-                    fbs.writer().writeAll(" \\Deleted") catch continue;
-                }
-                fbs.writer().writeAll("))") catch continue;
+                fbs.writer().print("{d} FETCH (FLAGS ({s}))", .{ seq, flag_str }) catch continue;
                 self.sendUntagged(fbs.getWritten()) catch continue;
             }
         }
@@ -1390,7 +1951,8 @@ pub const ImapSession = struct {
     }
 
     /// Handle EXPUNGE command — remove messages marked with \Deleted flag.
-    /// Implements RFC 3501 Section 6.4.3.
+    /// Reads \Deleted from Maildir filename suffix. Sends untagged EXPUNGE
+    /// responses in descending order per RFC 3501 Section 6.4.3.
     fn handleExpunge(self: *ImapSession, tag: []const u8) !void {
         if (self.state != .selected) {
             try self.sendResponse(tag, "NO", "Must select mailbox first");
@@ -1407,44 +1969,30 @@ pub const ImapSession = struct {
             return;
         };
 
-        if (self.deleted_seqs.items.len == 0) {
-            try self.sendResponse(tag, "OK", "EXPUNGE completed");
-            return;
-        }
+        // Collect sequence numbers of messages with \Deleted flag (from filename)
+        // Process in reverse order so that earlier sequence numbers stay valid
+        var seq: usize = files.len;
+        while (seq >= 1) : (seq -= 1) {
+            const filename = files[seq - 1];
+            const flags = MaildirFlags.fromFilename(filename);
+            if (!flags.deleted) continue;
 
-        // Sort deleted sequence numbers in descending order so that
-        // removing from the end doesn't shift earlier indices
-        std.mem.sort(u32, self.deleted_seqs.items, {}, struct {
-            fn desc(_: void, a: u32, b: u32) bool {
-                return a > b;
-            }
-        }.desc);
-
-        var expunged: u32 = 0;
-        for (self.deleted_seqs.items) |seq| {
-            const idx = seq - 1;
-            if (idx >= files.len) continue;
-
-            const filename = files[idx];
-
-            // Build full path and delete the file
+            // Delete the file
             var path_buf: [4097]u8 = undefined;
             const path_written = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, filename }) catch continue;
             path_buf[path_written.len] = 0;
             _ = std.c.unlink(@ptrCast(&path_buf));
 
-            // Send untagged EXPUNGE for this sequence number
+            // Send untagged EXPUNGE
             var resp_buf: [32]u8 = undefined;
             var fbs = io_compat.fixedBufferStream(&resp_buf);
             fbs.writer().print("{d} EXPUNGE", .{seq}) catch continue;
             self.sendUntagged(fbs.getWritten()) catch continue;
 
-            expunged += 1;
             std.log.info("IMAP EXPUNGE: Deleted {s}/{s}", .{ dir, filename });
-        }
 
-        // Clear deleted flags
-        self.deleted_seqs.clearRetainingCapacity();
+            if (seq == 0) break;
+        }
 
         // Refresh mailbox file list after deletions
         _ = self.rescanMailbox() catch {};
@@ -1599,9 +2147,29 @@ pub const ImapSession = struct {
                 const items = if (seq_end < line.len) std.mem.trim(u8, line[seq_end..], " \t") else "FLAGS";
                 try self.handleFetch(tag, sequence_set, if (items.len > 0) items else "FLAGS");
             },
-            .search => try self.handleSearch(tag),
+            .search => {
+                // Collect rest of line as search criteria
+                const cmd_end_s = @intFromPtr(cmd_str.ptr) + cmd_str.len - @intFromPtr(line.ptr);
+                const search_criteria = if (cmd_end_s < line.len) std.mem.trim(u8, line[cmd_end_s..], " \t") else "";
+                try self.handleSearch(tag, search_criteria);
+            },
             .expunge => try self.handleExpunge(tag),
             .close => {
+                // RFC 3501 Section 6.4.2: CLOSE implicitly expunges \Deleted messages
+                // (without sending untagged EXPUNGE responses)
+                if (self.mailbox_dir) |dir| {
+                    if (self.mailbox_files) |files| {
+                        for (files) |filename| {
+                            const flags = MaildirFlags.fromFilename(filename);
+                            if (flags.deleted) {
+                                var path_buf: [4097]u8 = undefined;
+                                const written = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, filename }) catch continue;
+                                path_buf[written.len] = 0;
+                                _ = std.c.unlink(@ptrCast(&path_buf));
+                            }
+                        }
+                    }
+                }
                 self.freeMailboxFiles();
                 self.state = .authenticated;
                 try self.sendResponse(tag, "OK", "CLOSE completed");
@@ -1631,7 +2199,14 @@ pub const ImapSession = struct {
                     const items = if (seq_end < line.len) std.mem.trim(u8, line[seq_end..], " \t") else "FLAGS";
                     try self.handleFetch(tag, sequence_set, if (items.len > 0) items else "FLAGS");
                 } else if (std.ascii.eqlIgnoreCase(sub_cmd, "SEARCH")) {
-                    try self.handleSearch(tag);
+                    // Collect rest of line after "UID SEARCH" as criteria
+                    const sub_end = @intFromPtr(sub_cmd.ptr) + sub_cmd.len - @intFromPtr(line.ptr);
+                    const uid_search_criteria = if (sub_end < line.len) std.mem.trim(u8, line[sub_end..], " \t") else "";
+                    try self.handleSearch(tag, uid_search_criteria);
+                } else if (std.ascii.eqlIgnoreCase(sub_cmd, "MOVE")) {
+                    const uid_set = parts.next() orelse "1:*";
+                    const dest = stripQuotes(parts.next() orelse "INBOX");
+                    try self.handleMove(tag, uid_set, dest);
                 } else if (std.ascii.eqlIgnoreCase(sub_cmd, "COPY")) {
                     // UID COPY <uid-set> <mailbox>
                     // UIDs = sequence numbers in our implementation (1-based index into sorted files)
@@ -1734,11 +2309,26 @@ pub const ImapSession = struct {
                 const dest = parts.next() orelse "INBOX";
                 try self.handleCopy(tag, seq_set, dest);
             },
+            .examine => {
+                const mailbox = parts.next() orelse "INBOX";
+                try self.handleExamine(tag, mailbox);
+            },
+            .delete => {
+                const mailbox = stripQuotes(parts.next() orelse "");
+                try self.handleDelete(tag, mailbox);
+            },
+            .rename => {
+                const old_name = stripQuotes(parts.next() orelse "");
+                const new_name = stripQuotes(parts.next() orelse "");
+                try self.handleRename(tag, old_name, new_name);
+            },
+            .move => {
+                const seq_set = parts.next() orelse "1:*";
+                const dest = stripQuotes(parts.next() orelse "INBOX");
+                try self.handleMove(tag, seq_set, dest);
+            },
             .check => {
                 try self.sendResponse(tag, "OK", "CHECK completed");
-            },
-            else => {
-                try self.sendResponse(tag, "BAD", "Command not implemented");
             },
         }
     }
