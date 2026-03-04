@@ -14,125 +14,60 @@ pub fn build(b: *std.Build) void {
     });
     const tls_module = tls.module("tls");
 
-    // Note: zig-bump dependency removed - version management steps disabled
-    // To re-enable, add bump dependency to build.zig.zon and uncomment below:
-    // const bump = b.dependency("bump", .{ .target = target, .optimize = optimize });
-    // const bump_exe = bump.artifact("bump");
-    // b.installArtifact(bump_exe);
+    // Add zig-cli dependency
+    const zig_cli_dep = b.dependency("zig_cli", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zig_cli_module = zig_cli_dep.module("zig-cli");
 
     if (build_all_targets) {
         // Build for all supported targets
         const targets = [_]std.Build.ResolvedTarget{
-            // Linux x86_64
-            b.resolveTargetQuery(.{
-                .cpu_arch = .x86_64,
-                .os_tag = .linux,
-                .abi = .gnu,
-            }),
-            // Linux ARM64
-            b.resolveTargetQuery(.{
-                .cpu_arch = .aarch64,
-                .os_tag = .linux,
-                .abi = .gnu,
-            }),
-            // macOS x86_64
-            b.resolveTargetQuery(.{
-                .cpu_arch = .x86_64,
-                .os_tag = .macos,
-            }),
-            // macOS ARM64 (Apple Silicon)
-            b.resolveTargetQuery(.{
-                .cpu_arch = .aarch64,
-                .os_tag = .macos,
-            }),
-            // Windows x86_64
-            b.resolveTargetQuery(.{
-                .cpu_arch = .x86_64,
-                .os_tag = .windows,
-                .abi = .gnu,
-            }),
-            // Windows ARM64
-            b.resolveTargetQuery(.{
-                .cpu_arch = .aarch64,
-                .os_tag = .windows,
-                .abi = .gnu,
-            }),
-            // FreeBSD x86_64
-            b.resolveTargetQuery(.{
-                .cpu_arch = .x86_64,
-                .os_tag = .freebsd,
-            }),
-            // FreeBSD ARM64
-            b.resolveTargetQuery(.{
-                .cpu_arch = .aarch64,
-                .os_tag = .freebsd,
-            }),
-            // OpenBSD x86_64
-            b.resolveTargetQuery(.{
-                .cpu_arch = .x86_64,
-                .os_tag = .openbsd,
-            }),
+            b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu }),
+            b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu }),
+            b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .macos }),
+            b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos }),
+            b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
+            b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .windows, .abi = .gnu }),
+            b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .freebsd }),
+            b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .freebsd }),
+            b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .openbsd }),
         };
 
         for (targets) |t| {
-            buildForTarget(b, t, optimize, tls_module);
+            buildForTarget(b, t, optimize, tls_module, zig_cli_module);
         }
     } else {
-        // Build for specified or native target
-        buildForTarget(b, target, optimize, tls_module);
+        buildForTarget(b, target, optimize, tls_module, zig_cli_module);
     }
 
-    // Create the root module for native target
-    const root_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+    // Single unified binary: mail
+    const mail_module = b.createModule(.{
+        .root_source_file = b.path("src/mail_cli.zig"),
         .target = target,
         .optimize = optimize,
     });
-    root_module.addImport("tls", tls_module);
+    mail_module.addImport("tls", tls_module);
+    mail_module.addImport("zig-cli", zig_cli_module);
 
-    const exe = b.addExecutable(.{
-        .name = "smtp-server",
-        .root_module = root_module,
+    const mail_exe = b.addExecutable(.{
+        .name = "mail",
+        .root_module = mail_module,
     });
 
-    // Platform-specific linking
-    linkPlatformLibraries(exe, target);
+    linkPlatformLibraries(mail_exe, target);
+    b.installArtifact(mail_exe);
 
-    b.installArtifact(exe);
-
-    // CLI tools
-    const cli_tools = [_]struct { name: []const u8, src: []const u8 }{
-        .{ .name = "benchmark", .src = "src/benchmark_cli.zig" },
-        .{ .name = "migrate-cli", .src = "src/migrate_cli.zig" },
-        .{ .name = "user-cli", .src = "src/user_cli.zig" },
-        .{ .name = "gdpr-cli", .src = "src/gdpr_cli.zig" },
-        .{ .name = "search-cli", .src = "src/search_cli.zig" },
-    };
-
-    for (cli_tools) |tool| {
-        const cli_module = b.createModule(.{
-            .root_source_file = b.path(tool.src),
-            .target = target,
-            .optimize = optimize,
-        });
-
-        const cli_exe = b.addExecutable(.{
-            .name = tool.name,
-            .root_module = cli_module,
-        });
-
-        linkPlatformLibraries(cli_exe, target);
-        b.installArtifact(cli_exe);
-    }
-
-    const run_cmd = b.addRunArtifact(exe);
+    // Run step: mail serve
+    const run_cmd = b.addRunArtifact(mail_exe);
     run_cmd.step.dependOn(b.getInstallStep());
 
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
 
-    const run_step = b.step("run", "Run the SMTP server");
+    const run_step = b.step("run", "Run the mail CLI");
     run_step.dependOn(&run_cmd.step);
 
     // Create test step
@@ -188,8 +123,7 @@ pub fn build(b: *std.Build) void {
     // RFC compliance tests
     const rfc_test_step = b.step("test-rfc", "Run RFC compliance tests");
 
-    // Single source module rooted in src/ so all relative imports resolve
-    const mail_module = b.createModule(.{
+    const mail_test_module = b.createModule(.{
         .root_source_file = b.path("src/test_exports.zig"),
         .target = target,
         .optimize = optimize,
@@ -202,7 +136,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
 
-        test_module.addImport("mail", mail_module);
+        test_module.addImport("mail", mail_test_module);
 
         const compliance_tests = b.addTest(.{
             .root_module = test_module,
@@ -250,62 +184,6 @@ pub fn build(b: *std.Build) void {
     if (build_all_targets) {
         cross_step.dependOn(b.getInstallStep());
     }
-
-    // Note: Version management steps disabled - bump dependency not available
-    // To re-enable, add bump dependency and call: addVersionManagementSteps(b, bump_exe);
-}
-
-/// Add version management build steps
-fn addVersionManagementSteps(b: *std.Build, bump_exe: *std.Build.Step.Compile) void {
-    // Install zig-bump step
-    const install_bump_step = b.step("install-bump", "Install zig-bump for version management");
-    install_bump_step.dependOn(&b.addInstallArtifact(bump_exe, .{}).step);
-
-    // Bump patch version
-    const bump_patch = b.addRunArtifact(bump_exe);
-    bump_patch.addArg("patch");
-    const bump_patch_step = b.step("bump-patch", "Bump patch version (0.0.1 -> 0.0.2)");
-    bump_patch_step.dependOn(install_bump_step);
-    bump_patch_step.dependOn(&bump_patch.step);
-
-    // Bump minor version
-    const bump_minor = b.addRunArtifact(bump_exe);
-    bump_minor.addArg("minor");
-    const bump_minor_step = b.step("bump-minor", "Bump minor version (0.0.1 -> 0.1.0)");
-    bump_minor_step.dependOn(install_bump_step);
-    bump_minor_step.dependOn(&bump_minor.step);
-
-    // Bump major version
-    const bump_major = b.addRunArtifact(bump_exe);
-    bump_major.addArg("major");
-    const bump_major_step = b.step("bump-major", "Bump major version (0.0.1 -> 1.0.0)");
-    bump_major_step.dependOn(install_bump_step);
-    bump_major_step.dependOn(&bump_major.step);
-
-    // Interactive bump
-    const bump_interactive = b.addRunArtifact(bump_exe);
-    const bump_interactive_step = b.step("bump", "Interactively select version to bump");
-    bump_interactive_step.dependOn(install_bump_step);
-    bump_interactive_step.dependOn(&bump_interactive.step);
-
-    // Dry-run versions (for testing)
-    const bump_patch_dry = b.addRunArtifact(bump_exe);
-    bump_patch_dry.addArgs(&[_][]const u8{ "patch", "--dry-run" });
-    const bump_patch_dry_step = b.step("bump-patch-dry", "Preview patch version bump");
-    bump_patch_dry_step.dependOn(install_bump_step);
-    bump_patch_dry_step.dependOn(&bump_patch_dry.step);
-
-    const bump_minor_dry = b.addRunArtifact(bump_exe);
-    bump_minor_dry.addArgs(&[_][]const u8{ "minor", "--dry-run" });
-    const bump_minor_dry_step = b.step("bump-minor-dry", "Preview minor version bump");
-    bump_minor_dry_step.dependOn(install_bump_step);
-    bump_minor_dry_step.dependOn(&bump_minor_dry.step);
-
-    const bump_major_dry = b.addRunArtifact(bump_exe);
-    bump_major_dry.addArgs(&[_][]const u8{ "major", "--dry-run" });
-    const bump_major_dry_step = b.step("bump-major-dry", "Preview major version bump");
-    bump_major_dry_step.dependOn(install_bump_step);
-    bump_major_dry_step.dependOn(&bump_major_dry.step);
 }
 
 /// Build executable for a specific target platform
@@ -314,6 +192,7 @@ fn buildForTarget(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     tls_module: *std.Build.Module,
+    zig_cli_module: *std.Build.Module,
 ) void {
     const target_query = target.query;
     const triple = b.fmt("{s}-{s}", .{
@@ -321,23 +200,21 @@ fn buildForTarget(
         @tagName(target_query.os_tag orelse .linux),
     });
 
-    // Create module for this target
     const root_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
+        .root_source_file = b.path("src/mail_cli.zig"),
         .target = target,
         .optimize = optimize,
     });
     root_module.addImport("tls", tls_module);
+    root_module.addImport("zig-cli", zig_cli_module);
 
     const exe = b.addExecutable(.{
-        .name = b.fmt("smtp-server-{s}", .{triple}),
+        .name = b.fmt("mail-{s}", .{triple}),
         .root_module = root_module,
     });
 
-    // Platform-specific linking
     linkPlatformLibraries(exe, target);
 
-    // Install to platform-specific directory
     const install = b.addInstallArtifact(exe, .{
         .dest_dir = .{
             .override = .{
@@ -348,44 +225,15 @@ fn buildForTarget(
     b.getInstallStep().dependOn(&install.step);
 }
 
-/// Link sqlite3 - uses bundled source for cross-compilation, system library for native
-fn linkSqlite3(exe: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) void {
-    const target_query = target.query;
-    const is_cross_compiling = target_query.os_tag != null or target_query.cpu_arch != null;
-
-    exe.root_module.link_libc = true;
-
-    if (is_cross_compiling) {
-        // Cross-compilation: use bundled sqlite3 source
-        exe.root_module.addCSourceFile(.{
-            .file = .{ .cwd_relative = "vendor/sqlite3.c" },
-            .flags = &.{
-                "-DSQLITE_THREADSAFE=1",
-                "-DSQLITE_ENABLE_FTS5",
-                "-DSQLITE_ENABLE_JSON1",
-                "-DSQLITE_ENABLE_RTREE",
-                "-DSQLITE_DQS=0",
-            },
-        });
-        exe.root_module.addIncludePath(.{ .cwd_relative = "vendor" });
-    } else {
-        // Native build: use system sqlite3
-        exe.root_module.linkSystemLibrary("sqlite3", .{});
-    }
-}
-
 /// Link platform-specific libraries
 fn linkPlatformLibraries(exe: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) void {
     const target_query = target.query;
     const os_tag = target_query.os_tag orelse .linux;
     const is_cross_compiling = target_query.os_tag != null or target_query.cpu_arch != null;
 
-    // Link libc on all platforms
     exe.root_module.link_libc = true;
 
-    // For cross-compilation, use bundled sqlite3 source
     if (is_cross_compiling) {
-        // Add bundled sqlite3 source
         exe.root_module.addCSourceFile(.{
             .file = .{ .cwd_relative = "vendor/sqlite3.c" },
             .flags = &.{
@@ -398,11 +246,7 @@ fn linkPlatformLibraries(exe: *std.Build.Step.Compile, target: std.Build.Resolve
         });
         exe.root_module.addIncludePath(.{ .cwd_relative = "vendor" });
     } else {
-        // Native build: use system sqlite3
         switch (os_tag) {
-            .linux, .freebsd, .openbsd, .macos => {
-                exe.root_module.linkSystemLibrary("sqlite3", .{});
-            },
             .windows => {
                 exe.root_module.linkSystemLibrary("sqlite3", .{});
                 exe.root_module.linkSystemLibrary("ws2_32", .{});

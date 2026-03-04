@@ -42,9 +42,8 @@ RUN addgroup -g 1000 smtp && \
 RUN mkdir -p /var/mail/queue /var/mail/storage /var/log/smtp /etc/smtp && \
     chown -R smtp:smtp /var/mail /var/log/smtp /etc/smtp
 
-# Copy binaries from builder
-COPY --from=builder /build/zig-out/bin/smtp-server /usr/local/bin/
-COPY --from=builder /build/zig-out/bin/user-cli /usr/local/bin/
+# Copy binary from builder
+COPY --from=builder /build/zig-out/bin/mail /usr/local/bin/
 
 # Copy TLS certificates directory (if needed)
 RUN mkdir -p /etc/smtp/tls
@@ -72,5 +71,5 @@ ENV SMTP_HOST=0.0.0.0 \
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD nc -z localhost ${SMTP_PORT} || exit 1
 
-# Run the SMTP server
-CMD ["/usr/local/bin/smtp-server"]
+# Run the mail server
+CMD ["/usr/local/bin/mail", "serve"]

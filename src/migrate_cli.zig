@@ -1,66 +1,8 @@
 const std = @import("std");
-const database = @import("storage/database.zig");
-const migrations = @import("storage/migrations.zig");
-const env = @import("core/env.zig");
+pub const database = @import("storage/database.zig");
+pub const migrations = @import("storage/migrations.zig");
 
-pub fn main(init: std.process.Init.Minimal) !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    // Parse arguments
-    var arg_it = try init.args.iterateAllocator(allocator);
-    defer arg_it.deinit();
-
-    // Skip program name
-    _ = arg_it.next();
-
-    // Get command
-    const command = arg_it.next() orelse {
-        printHelp();
-        return error.MissingCommand;
-    };
-
-    // Get database path
-    const db_path = env.get("SMTP_DB_PATH") orelse "./smtp.db";
-
-    // Initialize database
-    var db = try database.Database.init(allocator, db_path);
-    defer db.deinit();
-
-    // Initialize migration manager with SMTP migrations
-    var manager = migrations.MigrationManager.init(allocator, &db, &migrations.smtp_migrations);
-
-    // Execute command
-    if (std.mem.eql(u8, command, "up")) {
-        try manager.migrateUp();
-        std.debug.print("✓ Migrations applied successfully\n", .{});
-    } else if (std.mem.eql(u8, command, "down")) {
-        try manager.migrateDown();
-        std.debug.print("✓ Migration rolled back successfully\n", .{});
-    } else if (std.mem.eql(u8, command, "status")) {
-        try showStatus(&manager);
-    } else if (std.mem.eql(u8, command, "history")) {
-        try showHistory(&manager, allocator);
-    } else if (std.mem.eql(u8, command, "validate")) {
-        try manager.validate();
-        std.debug.print("✓ Migration order is valid\n", .{});
-    } else if (std.mem.eql(u8, command, "to")) {
-        const version_str = arg_it.next() orelse {
-            std.debug.print("Error: 'to' command requires a version number\n", .{});
-            return error.MissingVersion;
-        };
-        const version = try std.fmt.parseInt(u32, version_str, 10);
-        try manager.migrateTo(version);
-        std.debug.print("✓ Migrated to version {d}\n", .{version});
-    } else {
-        std.debug.print("Unknown command: {s}\n", .{command});
-        printHelp();
-        return error.UnknownCommand;
-    }
-}
-
-fn showStatus(manager: *migrations.MigrationManager) !void {
+pub fn showStatus(manager: *migrations.MigrationManager) !void {
     const current_version = try manager.getCurrentVersion();
     const total_migrations = migrations.smtp_migrations.len;
 
@@ -85,11 +27,11 @@ fn showStatus(manager: *migrations.MigrationManager) !void {
             }
         }
     } else {
-        std.debug.print("\n✓ Database is up to date\n", .{});
+        std.debug.print("\nDatabase is up to date\n", .{});
     }
 }
 
-fn showHistory(manager: *migrations.MigrationManager, allocator: std.mem.Allocator) !void {
+pub fn showHistory(manager: *migrations.MigrationManager, allocator: std.mem.Allocator) !void {
     try manager.initMigrationsTable();
 
     const records = try manager.getHistory(allocator);
@@ -116,7 +58,7 @@ fn showHistory(manager: *migrations.MigrationManager, allocator: std.mem.Allocat
     }
 }
 
-fn formatTimestamp(timestamp: i64) [19]u8 {
+pub fn formatTimestamp(timestamp: i64) [19]u8 {
     const epoch_seconds: u64 = @intCast(timestamp);
     const epoch_day = std.time.epoch.EpochDay{ .day = @intCast(epoch_seconds / 86400) };
     const year_day = epoch_day.calculateYearDay();
@@ -140,45 +82,4 @@ fn formatTimestamp(timestamp: i64) [19]u8 {
     };
 
     return buf;
-}
-
-fn printHelp() void {
-    const help_text =
-        \\Migration CLI - Database migration manager for SMTP server
-        \\
-        \\USAGE:
-        \\    migrate-cli <COMMAND> [OPTIONS]
-        \\
-        \\COMMANDS:
-        \\    up              Apply all pending migrations
-        \\    down            Rollback the last migration
-        \\    to <VERSION>    Migrate to a specific version (up or down)
-        \\    status          Show current migration status
-        \\    history         Show migration history
-        \\    validate        Validate migration order
-        \\
-        \\ENVIRONMENT:
-        \\    SMTP_DB_PATH    Path to database file (default: ./smtp.db)
-        \\
-        \\EXAMPLES:
-        \\    # Apply all pending migrations
-        \\    migrate-cli up
-        \\
-        \\    # Rollback last migration
-        \\    migrate-cli down
-        \\
-        \\    # Migrate to specific version
-        \\    migrate-cli to 2
-        \\
-        \\    # Show migration status
-        \\    migrate-cli status
-        \\
-        \\    # Show migration history
-        \\    migrate-cli history
-        \\
-        \\    # Validate migrations
-        \\    migrate-cli validate
-        \\
-    ;
-    std.debug.print("{s}\n", .{help_text});
 }

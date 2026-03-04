@@ -59,14 +59,12 @@ fn reloadHandler(sig: std.posix.SIG) callconv(.c) void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    // Store global IO for compat with 0.16-dev APIs
     const io_compat = @import("core/io_compat.zig");
     io_compat.initIo(init.io);
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Parse command-line arguments
     var cli_args = args_parser.parseArgs(allocator, init.minimal.args) catch |err| {
         if (err != error.UnknownArgument) {
             args_parser.printHelp();
@@ -75,18 +73,20 @@ pub fn main(init: std.process.Init) !void {
     };
     defer cli_args.deinit(allocator);
 
-    // Handle --help
     if (cli_args.help) {
         args_parser.printHelp();
         return;
     }
 
-    // Handle --version
     if (cli_args.version) {
         args_parser.printVersion();
         return;
     }
 
+    try run(allocator, cli_args);
+}
+
+pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     // Load configuration first (with CLI args and env vars)
     // Configuration validation is automatically performed during loading
     // Using var to allow hot reload to update configuration

@@ -5,14 +5,15 @@
   "dependencies": {
     "ziglang.org": "0.16.0-dev",
     "zig-bump": "~/Code/zig-bump",
-    "zig-tls": "zig-utils/zig-tls"
+    "zig-tls": "zig-utils/zig-tls",
+    "zig-cli": "stacksjs/zig-cli"
   },
   "repository": {
     "type": "git",
     "url": "https://github.com/mail-os/mail"
   },
   "build": {
-    "entry": "src/main.zig",
+    "entry": "src/mail_cli.zig",
     "output": "zig-out",
     "targets": [
       "x86_64-linux",
@@ -22,14 +23,22 @@
     ]
   },
   "scripts": {
-    // Build for native platform
+    // Build & Run
     "build": "zig build -Doptimize=ReleaseFast",
-
-    // Build for all platforms
+    "build:debug": "zig build",
     "build:all": "zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu && zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu && zig build -Doptimize=ReleaseFast -Dtarget=x86_64-macos && zig build -Doptimize=ReleaseFast -Dtarget=aarch64-macos",
+    "dev": "zig build run -- serve",
+    "cross": "zig build -Dall-targets=true -Doptimize=ReleaseFast",
 
     // Package all binaries into tarballs
-    "package:all": "mkdir -p dist && tar -czvf dist/smtp-server-x86_64-linux.tar.gz -C zig-out/bin/x86_64-linux smtp-server-x86_64-linux && tar -czvf dist/smtp-server-aarch64-linux.tar.gz -C zig-out/bin/aarch64-linux smtp-server-aarch64-linux && tar -czvf dist/smtp-server-x86_64-macos.tar.gz -C zig-out/bin/x86_64-macos smtp-server-x86_64-macos && tar -czvf dist/smtp-server-aarch64-macos.tar.gz -C zig-out/bin/aarch64-macos smtp-server-aarch64-macos",
+    "package:all": "mkdir -p dist && tar -czvf dist/mail-x86_64-linux.tar.gz -C zig-out/bin/x86_64-linux mail-x86_64-linux && tar -czvf dist/mail-aarch64-linux.tar.gz -C zig-out/bin/aarch64-linux mail-aarch64-linux && tar -czvf dist/mail-x86_64-macos.tar.gz -C zig-out/bin/x86_64-macos mail-x86_64-macos && tar -czvf dist/mail-aarch64-macos.tar.gz -C zig-out/bin/aarch64-macos mail-aarch64-macos",
+
+    // Testing
+    "test": "zig build test",
+
+    // Formatting
+    "fmt": "zig fmt src/",
+    "fmt:check": "zig fmt --check src/",
 
     // Version bumping with zig-bump
     "release": "bump patch --all",
@@ -37,10 +46,11 @@
     "release:minor": "bump minor --all",
     "release:major": "bump major --all",
 
-    // Test the mail server
-    "test": "zig build test",
+    // Docker
+    "docker:build": "docker build -t mail:latest .",
+    "docker:run": "docker run -p 2525:2525 -p 2465:2465 mail:latest",
 
-    // Run the mail server locally
-    "dev": "zig build run"
+    // Clean
+    "clean": "rm -rf zig-cache zig-out .zig-cache"
   }
 }
