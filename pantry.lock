@@ -1,6 +1,25 @@
 {
   "version": "1.0",
   "packages": {
-
+    "github:zig-utils/zig-bump@main": {
+      "name": "github:zig-utils/zig-bump",
+      "version": "main",
+      "resolved": "registry:github:zig-utils/zig-bump@main"
+    },
+    "github:zig-utils/zig-cli@main": {
+      "name": "github:zig-utils/zig-cli",
+      "version": "main",
+      "resolved": "registry:github:zig-utils/zig-cli@main"
+    },
+    "github:zig-utils/zig-tls@main": {
+      "name": "github:zig-utils/zig-tls",
+      "version": "main",
+      "resolved": "registry:github:zig-utils/zig-tls@main"
+    },
+    "ziglang.org@0.16.0-dev": {
+      "name": "ziglang.org",
+      "version": "0.16.0-dev",
+      "resolved": "registry:ziglang.org@0.16.0-dev"
+    }
   }
 }
