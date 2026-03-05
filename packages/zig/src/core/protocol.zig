@@ -1465,37 +1465,77 @@ pub const Session = struct {
 
             self.logger.info("Auto-forwarding from {s} to {s}", .{ username, forward_to });
 
-            const bg = self.allocator.create(OutboundContext) catch continue;
-            bg.* = .{
-                .allocator = self.allocator,
-                .from = self.allocator.dupe(u8, sender) catch {
-                    self.allocator.destroy(bg);
+            // Check if forward target is a local address
+            const is_local_forward = if (std.mem.indexOf(u8, forward_to, "@")) |at_pos| blk: {
+                const fwd_domain = forward_to[at_pos + 1 ..];
+                if (std.mem.eql(u8, fwd_domain, self.config.hostname)) break :blk true;
+                if (std.mem.indexOf(u8, self.config.hostname, ".")) |dot_pos| {
+                    const parent_domain = self.config.hostname[dot_pos + 1 ..];
+                    if (std.mem.eql(u8, fwd_domain, parent_domain)) break :blk true;
+                }
+                break :blk false;
+            } else true;
+
+            if (is_local_forward) {
+                // Local forward: save directly to recipient's mailbox
+                const fwd_username = if (std.mem.indexOf(u8, forward_to, "@")) |at_pos|
+                    forward_to[0..at_pos]
+                else
+                    forward_to;
+
+                const cwd = fs_compat.cwd();
+                const ts = time_compat.milliTimestamp();
+                const fwd_dir = std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{fwd_username}) catch continue;
+                defer self.allocator.free(fwd_dir);
+                cwd.makePath(fwd_dir) catch {};
+
+                const fwd_filename = std.fmt.allocPrint(self.allocator, "mail/{s}/new/{d}.eml", .{ fwd_username, ts }) catch continue;
+                defer self.allocator.free(fwd_filename);
+
+                const file = cwd.createFile(fwd_filename, .{}) catch |err| {
+                    self.logger.err("Failed to create forward file {s}: {}", .{ fwd_filename, err });
                     continue;
-                },
-                .to = self.allocator.dupe(u8, forward_to) catch {
-                    self.allocator.free(bg.from);
-                    self.allocator.destroy(bg);
+                };
+                defer file.close();
+                file.writeAll(data) catch |err| {
+                    self.logger.err("Failed to write forward data to {s}: {}", .{ fwd_filename, err });
                     continue;
-                },
-                .data = self.allocator.dupe(u8, data) catch {
-                    self.allocator.free(bg.from);
+                };
+                self.logger.info("Local forward from {s} to {s} saved to {s}", .{ username, fwd_username, fwd_filename });
+            } else {
+                // External forward: relay via SES
+                const bg = self.allocator.create(OutboundContext) catch continue;
+                bg.* = .{
+                    .allocator = self.allocator,
+                    .from = self.allocator.dupe(u8, sender) catch {
+                        self.allocator.destroy(bg);
+                        continue;
+                    },
+                    .to = self.allocator.dupe(u8, forward_to) catch {
+                        self.allocator.free(bg.from);
+                        self.allocator.destroy(bg);
+                        continue;
+                    },
+                    .data = self.allocator.dupe(u8, data) catch {
+                        self.allocator.free(bg.from);
+                        self.allocator.free(bg.to);
+                        self.allocator.destroy(bg);
+                        continue;
+                    },
+                    .hostname = self.config.hostname,
+                    .delivery_method = self.config.delivery_method,
+                    .ses_region = self.config.ses_region,
+                };
+                const thread = std.Thread.spawn(.{}, outboundWorker, .{bg}) catch |err| {
+                    self.logger.err("Failed to spawn forward thread to {s}: {}", .{ forward_to, err });
+                    self.allocator.free(bg.data);
                     self.allocator.free(bg.to);
+                    self.allocator.free(bg.from);
                     self.allocator.destroy(bg);
                     continue;
-                },
-                .hostname = self.config.hostname,
-                .delivery_method = self.config.delivery_method,
-                .ses_region = self.config.ses_region,
-            };
-            const thread = std.Thread.spawn(.{}, outboundWorker, .{bg}) catch |err| {
-                self.logger.err("Failed to spawn forward thread to {s}: {}", .{ forward_to, err });
-                self.allocator.free(bg.data);
-                self.allocator.free(bg.to);
-                self.allocator.free(bg.from);
-                self.allocator.destroy(bg);
-                continue;
-            };
-            thread.detach();
+                };
+                thread.detach();
+            }
         }
     }
 };

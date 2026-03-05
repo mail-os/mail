@@ -467,6 +467,15 @@ if [ -n "\$HOSTED_ZONE_ID" ] && [ -n "\$DOMAIN_NAME" ]; then
           \\"TTL\\": 300,
           \\"ResourceRecords\\": [{\\"Value\\": \\"\\\\\\\"v=DMARC1; p=quarantine; pct=100\\\\\\\"\\"  }]
         }
+      },
+      {
+        \\"Action\\": \\"UPSERT\\",
+        \\"ResourceRecordSet\\": {
+          \\"Name\\": \\"_atproto.\$BASE_DOMAIN\\",
+          \\"Type\\": \\"TXT\\",
+          \\"TTL\\": 300,
+          \\"ResourceRecords\\": [{\\"Value\\": \\"\\\\\\\"did=did:plc:ihvva6h2cjxbucgwspo7nubd\\\\\\\"\\"  }]
+        }
       }
     ]
   }" 2>/dev/null && echo "DNS records configured successfully" || echo "Warning: DNS record configuration failed (may need manual setup)"
