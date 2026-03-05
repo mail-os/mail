@@ -81,7 +81,7 @@ SMTP_DATA_TIMEOUT_SECONDS=600  # 10 minutes (default)
 SMTP_DATA_TIMEOUT_SECONDS=1200 # 20 minutes (for large messages)
 
 # Start server with custom DATA timeout
-SMTP_DATA_TIMEOUT_SECONDS=300 ./zig-out/bin/smtp-server
+SMTP_DATA_TIMEOUT_SECONDS=300 ./zig-out/bin/mail
 ```
 
 **Files Changed:**
@@ -345,7 +345,7 @@ for i in {1..1000}; do
 done
 
 # Monitor memory growth
-watch -n 1 'ps aux | grep smtp-server'
+watch -n 1 'ps aux | grep mail'
 ```
 
 2. **DATA Timeout:**
