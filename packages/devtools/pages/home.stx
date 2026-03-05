@@ -371,6 +371,122 @@
       font-weight: 700;
     }
 
+    /* Uptime chart */
+    .uptime-chart-card {
+      grid-column: 1 / -1;
+    }
+
+    .uptime-chart-header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      margin-bottom: 0.75rem;
+    }
+
+    .uptime-chart-header .card-label { margin-bottom: 0; }
+
+    .uptime-overall {
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .uptime-bar-row {
+      display: flex;
+      gap: 2px;
+      align-items: flex-end;
+      height: 34px;
+      margin-bottom: 0.375rem;
+    }
+
+    .uptime-bar {
+      flex: 1;
+      min-width: 0;
+      border-radius: 2px;
+      cursor: pointer;
+      position: relative;
+      transition: opacity 0.1s;
+    }
+
+    .uptime-bar:hover { opacity: 0.8; }
+
+    .uptime-bar-tooltip {
+      display: none;
+      position: absolute;
+      bottom: calc(100% + 6px);
+      left: 50%;
+      transform: translateX(-50%);
+      background: var(--surface-3);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.375rem 0.625rem;
+      font-size: 0.6875rem;
+      white-space: nowrap;
+      z-index: 20;
+      pointer-events: none;
+      color: var(--text);
+    }
+
+    .uptime-bar:hover .uptime-bar-tooltip { display: block; }
+
+    .uptime-labels {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.6875rem;
+      color: var(--text-muted);
+    }
+
+    .uptime-stats {
+      display: flex;
+      gap: 2rem;
+      margin-top: 0.75rem;
+      padding-top: 0.75rem;
+      border-top: 1px solid var(--border);
+    }
+
+    .uptime-stat {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .uptime-stat-value {
+      font-size: 1rem;
+      font-weight: 600;
+    }
+
+    .uptime-stat-label {
+      font-size: 0.6875rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .uptime-tabs {
+      display: flex;
+      gap: 0.25rem;
+      background: var(--surface-2);
+      border-radius: 8px;
+      padding: 0.1875rem;
+    }
+
+    .uptime-tab {
+      padding: 0.25rem 0.625rem;
+      border-radius: 6px;
+      font-size: 0.6875rem;
+      font-weight: 500;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: none;
+      background: none;
+      transition: all 0.15s ease;
+    }
+
+    .uptime-tab:hover { color: var(--text-dim); }
+    .uptime-tab.active {
+      background: var(--surface-3);
+      color: var(--text);
+    }
+
     /* Loading */
     .loading-overlay {
       position: fixed;
@@ -543,13 +659,49 @@
   </header>
 
   <main class="main">
-    <!-- Stats Cards -->
-    <div class="grid grid-4">
-      <div class="card">
-        <div class="card-label">Uptime</div>
-        <div class="card-value text-green" id="uptime">--</div>
-        <div class="card-sub" id="uptime-since"></div>
+    <!-- Uptime Chart -->
+    <div class="grid">
+      <div class="card uptime-chart-card">
+        <div class="uptime-chart-header">
+          <div>
+            <div class="card-label">Uptime</div>
+            <div style="font-size:0.8125rem;color:var(--text-dim);margin-top:0.25rem" id="uptime-summary">--</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:0.75rem">
+            <div class="uptime-tabs" id="uptime-tabs">
+              <button class="uptime-tab" data-days="7">7d</button>
+              <button class="uptime-tab" data-days="14">14d</button>
+              <button class="uptime-tab" data-days="30">30d</button>
+              <button class="uptime-tab" data-days="60">60d</button>
+              <button class="uptime-tab active" data-days="90">90d</button>
+            </div>
+            <div class="uptime-overall text-green" id="uptime-overall">--</div>
+          </div>
+        </div>
+        <div class="uptime-bar-row" id="uptime-bars"></div>
+        <div class="uptime-labels">
+          <span id="uptime-label-start">90 days ago</span>
+          <span>Today</span>
+        </div>
+        <div class="uptime-stats">
+          <div class="uptime-stat">
+            <span class="uptime-stat-value text-green" id="uptime-current">--</span>
+            <span class="uptime-stat-label">Current Uptime</span>
+          </div>
+          <div class="uptime-stat">
+            <span class="uptime-stat-value" id="uptime-since" style="color:var(--text)">--</span>
+            <span class="uptime-stat-label">Running Since</span>
+          </div>
+          <div class="uptime-stat">
+            <span class="uptime-stat-value" id="uptime-incidents" style="color:var(--text)">--</span>
+            <span class="uptime-stat-label">Incidents (90d)</span>
+          </div>
+        </div>
       </div>
+    </div>
+
+    <!-- Stats Cards -->
+    <div class="grid grid-4" style="margin-top:1rem">
       <div class="card">
         <div class="card-label">Users</div>
         <div class="card-value" id="user-count">--</div>
@@ -701,9 +853,10 @@
       $('server-status').className = 'status-pill ' + (online ? 'online' : 'offline')
       $('server-status').innerHTML = '<span class="dot"></span> ' + (online ? 'Online' : 'Offline')
 
+      // Uptime chart
+      renderUptimeChart(d)
+
       // Stats
-      $('uptime').textContent = d.uptime || '--'
-      $('uptime-since').textContent = d.uptimeSince ? 'since ' + d.uptimeSince : ''
       $('user-count').textContent = d.userCount ?? '--'
       $('user-list').textContent = d.users?.join(', ') || ''
       $('mailbox-count').textContent = d.mailboxCount ?? '--'
@@ -785,6 +938,115 @@
       $('db-size').textContent = d.dbSize || '--'
       $('db-detail').textContent = d.dbDetail || ''
     }
+
+    var _uptimeData = null
+    var _currentDays = 90
+
+    function renderUptimeChart(d) {
+      var chartData = d.uptimeChart || {}
+      _uptimeData = { chartData: chartData, uptime: d.uptime, uptimeSince: d.uptimeSince }
+
+      // Auto-select best timeframe based on data availability
+      var totalWithData = chartData.daysWithData || 0
+      if (totalWithData <= 2) {
+        _currentDays = 7
+      } else if (totalWithData <= 10) {
+        _currentDays = 14
+      } else if (totalWithData <= 21) {
+        _currentDays = 30
+      } else if (totalWithData <= 45) {
+        _currentDays = 60
+      } else {
+        _currentDays = 90
+      }
+
+      // Update active tab
+      updateActiveTab()
+      renderUptimeBars()
+    }
+
+    function updateActiveTab() {
+      var tabs = document.querySelectorAll('.uptime-tab')
+      for (var i = 0; i < tabs.length; i++) {
+        tabs[i].className = 'uptime-tab' + (parseInt(tabs[i].getAttribute('data-days')) === _currentDays ? ' active' : '')
+      }
+    }
+
+    function renderUptimeBars() {
+      if (!_uptimeData) return
+      var allDays = _uptimeData.chartData.days || {}
+      var chart = allDays[_currentDays] || []
+      var barsEl = $('uptime-bars')
+
+      var html = ''
+      var daysWithData = 0
+      var totalPct = 0
+      var incidents = 0
+
+      for (var i = 0; i < chart.length; i++) {
+        var day = chart[i]
+        var color, height, label
+
+        if (day.pct < 0) {
+          color = 'var(--surface-3)'
+          height = '4px'
+          label = day.date + ' \u2014 No data'
+        } else {
+          daysWithData++
+          totalPct += day.pct
+          if (day.pct >= 99.5) {
+            color = 'var(--green)'
+            height = '100%'
+            label = day.date + ' \u2014 ' + day.pct + '% uptime'
+          } else if (day.pct >= 95) {
+            color = 'var(--yellow)'
+            height = Math.max(40, day.pct) + '%'
+            label = day.date + ' \u2014 ' + day.pct + '% uptime'
+            incidents++
+          } else if (day.pct > 0) {
+            color = '#f97316'
+            height = Math.max(20, day.pct) + '%'
+            label = day.date + ' \u2014 ' + day.pct + '% uptime'
+            incidents++
+          } else {
+            color = 'var(--red)'
+            height = '8px'
+            label = day.date + ' \u2014 Down'
+            incidents++
+          }
+        }
+
+        html += '<div class="uptime-bar" style="height:' + height + ';background:' + color + '">'
+        html += '<div class="uptime-bar-tooltip">' + label + '</div>'
+        html += '</div>'
+      }
+
+      barsEl.innerHTML = html
+
+      var overall = daysWithData > 0 ? (totalPct / daysWithData).toFixed(2) : '--'
+      $('uptime-overall').textContent = overall + '%'
+      $('uptime-overall').className = 'uptime-overall ' + (overall >= 99.5 ? 'text-green' : overall >= 95 ? 'text-yellow' : 'text-red')
+
+      $('uptime-summary').textContent = daysWithData > 0
+        ? daysWithData + ' day' + (daysWithData !== 1 ? 's' : '') + ' monitored, ' + (daysWithData - incidents) + ' perfect'
+        : 'Collecting data...'
+
+      $('uptime-current').textContent = _uptimeData.uptime || '--'
+      $('uptime-since').textContent = _uptimeData.uptimeSince || '--'
+      $('uptime-incidents').textContent = incidents.toString()
+      $('uptime-incidents').style.color = incidents === 0 ? 'var(--green)' : 'var(--yellow)'
+
+      $('uptime-label-start').textContent = chart.length > 0 ? chart[0].date : _currentDays + ' days ago'
+    }
+
+    // Tab click handlers
+    document.addEventListener('click', function(e) {
+      if (e.target.classList.contains('uptime-tab')) {
+        _currentDays = parseInt(e.target.getAttribute('data-days'))
+        updateActiveTab()
+        renderUptimeBars()
+      }
+    })
 
     function showToast(message, type) {
       var existing = document.querySelector('.toast')

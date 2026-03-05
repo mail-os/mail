@@ -135,9 +135,28 @@ async function getServerStatus() {
     dnsLookup('A', DOMAIN),
     dnsLookup('TXT', BASE_DOMAIN).then(r => r.split('\n').find(l => l.includes('spf')) || ''),
     dnsLookup('TXT', `_dmarc.${BASE_DOMAIN}`),
-    dnsLookup('CNAME', `mail._domainkey.${BASE_DOMAIN}`).catch(() =>
-      dnsLookup('CNAME', `*._domainkey.${BASE_DOMAIN}`).catch(() => '')
-    ),
+    // Check DKIM: try common selectors, then SES-style token selectors
+    (async () => {
+      const selectors = ['mail', 'default', 'dkim', 'google', 'k1', 's1', 's2']
+      for (const sel of selectors) {
+        const r = await dnsLookup('CNAME', `${sel}._domainkey.${BASE_DOMAIN}`).catch(() => '')
+        if (r) return `Configured (${sel})`
+        const txt = await dnsLookup('TXT', `${sel}._domainkey.${BASE_DOMAIN}`).catch(() => '')
+        if (txt && txt.includes('p=')) return `Configured (${sel})`
+      }
+      // SES uses random token selectors - discover them via NXDOMAIN vs answer heuristic
+      // Query a few known SES tokens by checking for CNAME records pointing to *.dkim.amazonses.com
+      const probe = await shellRun(`dig +short CNAME '*.${BASE_DOMAIN}' @8.8.8.8; for token in $(dig +short NS _domainkey.${BASE_DOMAIN} @8.8.8.8 2>/dev/null); do echo $token; done; dig _domainkey.${BASE_DOMAIN} ANY +short @8.8.8.8 2>/dev/null`).catch(() => '')
+      if (probe.includes('amazonses')) return 'Verified (SES)'
+      // Direct approach: check if the domain has any _domainkey CNAME pointing to amazonses
+      // by testing the first SES-generated selector format
+      const sesCheck = await shellRun(`host -t CNAME $(host -t TXT _amazonses.${BASE_DOMAIN} 8.8.8.8 2>/dev/null | grep -oP '[a-z0-9]{32}' | head -1)._domainkey.${BASE_DOMAIN} 8.8.8.8 2>/dev/null`).catch(() => '')
+      if (sesCheck.includes('amazonses')) return 'Verified (SES)'
+      // Final: just check the _amazonses TXT verification record which confirms SES is configured
+      const amazonses = await dnsLookup('TXT', `_amazonses.${BASE_DOMAIN}`).catch(() => '')
+      if (amazonses) return 'Verified (SES)'
+      return ''
+    })(),
   ].map(p => p.catch(() => '')))
 
   const rdns = aRecord ? await dnsLookup('-x', aRecord).catch(() => '') : ''
@@ -231,7 +250,7 @@ async function getServerStatus() {
       rdns: rdns || '--',
       spf: spfRaw?.replace(/"/g, '') || '--',
       dmarc: dmarc?.replace(/"/g, '') || '--',
-      dkim: dkim ? 'Configured (SES)' : '--',
+      dkim: dkim || '--',
     },
     deliverability,
     dbSize,
@@ -267,6 +286,80 @@ async function createAccount(username: string, password: string): Promise<{ ok: 
 let cache: { data: any, time: number } | null = null
 const CACHE_TTL = 15000
 
+// Uptime history - stores checks as { ts: timestamp, up: boolean }
+interface UptimeEntry { ts: number; up: boolean }
+const UPTIME_STORE = process.env.UPTIME_STORE || './uptime.json'
+let uptimeHistory: UptimeEntry[] = []
+
+function loadUptimeHistory() {
+  try {
+    const raw = require('fs').readFileSync(UPTIME_STORE, 'utf8')
+    uptimeHistory = JSON.parse(raw)
+  } catch { uptimeHistory = [] }
+}
+
+function saveUptimeHistory() {
+  try {
+    require('fs').writeFileSync(UPTIME_STORE, JSON.stringify(uptimeHistory))
+  } catch {}
+}
+
+function recordUptime(up: boolean) {
+  const now = Date.now()
+  uptimeHistory.push({ ts: now, up })
+  // Keep 90 days of data (checking every 60s = ~130k entries max, but we compact per-day for the chart)
+  const cutoff = now - 90 * 86400000
+  uptimeHistory = uptimeHistory.filter(e => e.ts >= cutoff)
+  saveUptimeHistory()
+}
+
+function getUptimeChartData(): { days: Record<number, { date: string; pct: number; checks: number }[]>; daysWithData: number } {
+  const dayBuckets: Record<string, { up: number; total: number }> = {}
+
+  for (const entry of uptimeHistory) {
+    const d = new Date(entry.ts).toISOString().slice(0, 10)
+    if (!dayBuckets[d]) dayBuckets[d] = { up: 0, total: 0 }
+    dayBuckets[d].total++
+    if (entry.up) dayBuckets[d].up++
+  }
+
+  // Count how many days actually have data
+  const daysWithData = Object.keys(dayBuckets).length
+
+  // Generate data for each timeframe
+  const timeframes = [7, 14, 30, 60, 90]
+  const days: Record<number, { date: string; pct: number; checks: number }[]> = {}
+  const now = new Date()
+
+  for (const tf of timeframes) {
+    const result: { date: string; pct: number; checks: number }[] = []
+    for (let i = tf - 1; i >= 0; i--) {
+      const d = new Date(now.getTime() - i * 86400000).toISOString().slice(0, 10)
+      const day = dayBuckets[d]
+      if (day) {
+        result.push({ date: d, pct: Math.round((day.up / day.total) * 10000) / 100, checks: day.total })
+      } else {
+        result.push({ date: d, pct: -1, checks: 0 })
+      }
+    }
+    days[tf] = result
+  }
+
+  return { days, daysWithData }
+}
+
+loadUptimeHistory()
+
+// Record uptime every 60 seconds
+setInterval(async () => {
+  try {
+    const output = await ssmRun(['systemctl is-active mail 2>/dev/null || echo inactive'])
+    recordUptime(output.trim() === 'active')
+  } catch {
+    recordUptime(false)
+  }
+}, 60000)
+
 const tlsOptions = TLS_CERT && TLS_KEY ? {
   tls: {
     cert: Bun.file(TLS_CERT),
@@ -298,9 +391,12 @@ const server = serve({
 
         try {
           const data = await getServerStatus()
+          recordUptime(data.service === 'active')
+          ;(data as any).uptimeChart = getUptimeChartData()
           cache = { data, time: Date.now() }
           return Response.json(data)
         } catch (e: any) {
+          recordUptime(false)
           return Response.json({ error: e.message, service: 'unknown' }, { status: 500 })
         }
       },

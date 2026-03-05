@@ -1,6 +1,7 @@
 const std = @import("std");
 const time_compat = @import("time_compat.zig");
 const io_compat = @import("io_compat.zig");
+const fs_compat = @import("fs_compat.zig");
 const socket = @import("socket_compat.zig");
 const config = @import("config.zig");
 const auth = @import("../auth/auth.zig");
@@ -1344,6 +1345,11 @@ pub const Session = struct {
                 try file.writeStreamingAll(io, data);
 
                 self.logger.debug("Message saved to {s}", .{filename});
+
+                // Check for auto-forwarding rules
+                self.checkAndForward(username, sender, data) catch |err| {
+                    self.logger.err("Forward check failed for {s}: {}", .{ username, err });
+                };
             } else {
                 // External delivery: relay via SES in a background thread
                 // so we don't block the SMTP session (Apple Mail times out otherwise)
@@ -1411,5 +1417,68 @@ pub const Session = struct {
         ) catch |err| {
             std.log.err("Outbound delivery to {s} failed: {}", .{ ctx.to, err });
         };
+    }
+
+    /// Check forwards.json for auto-forwarding rules and relay if matched.
+    /// Format: {"hi": ["chris@stacksjs.com"], "info": ["a@x.com","b@x.com"]}
+    fn checkAndForward(self: *Session, username: []const u8, sender: []const u8, data: []const u8) !void {
+        const contents = fs_compat.readFileAlloc(self.allocator, "forwards.json") catch return;
+        defer self.allocator.free(contents);
+        if (contents.len == 0) return;
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, contents, .{}) catch return;
+        defer parsed.deinit();
+
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return,
+        };
+
+        const targets = obj.get(username) orelse return;
+        const arr = switch (targets) {
+            .array => |a| a,
+            else => return,
+        };
+
+        for (arr.items) |item| {
+            const forward_to = switch (item) {
+                .string => |s| s,
+                else => continue,
+            };
+
+            self.logger.info("Auto-forwarding from {s} to {s}", .{ username, forward_to });
+
+            const bg = self.allocator.create(OutboundContext) catch continue;
+            bg.* = .{
+                .allocator = self.allocator,
+                .from = self.allocator.dupe(u8, sender) catch {
+                    self.allocator.destroy(bg);
+                    continue;
+                },
+                .to = self.allocator.dupe(u8, forward_to) catch {
+                    self.allocator.free(bg.from);
+                    self.allocator.destroy(bg);
+                    continue;
+                },
+                .data = self.allocator.dupe(u8, data) catch {
+                    self.allocator.free(bg.from);
+                    self.allocator.free(bg.to);
+                    self.allocator.destroy(bg);
+                    continue;
+                },
+                .hostname = self.config.hostname,
+                .delivery_method = self.config.delivery_method,
+                .ses_region = self.config.ses_region,
+            };
+            const thread = std.Thread.spawn(.{}, outboundWorker, .{bg}) catch |err| {
+                self.logger.err("Failed to spawn forward thread to {s}: {}", .{ forward_to, err });
+                self.allocator.free(bg.data);
+                self.allocator.free(bg.to);
+                self.allocator.free(bg.from);
+                self.allocator.destroy(bg);
+                continue;
+            };
+            thread.detach();
+        }
     }
 };
