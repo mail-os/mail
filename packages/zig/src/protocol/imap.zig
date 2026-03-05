@@ -1532,6 +1532,19 @@ pub const ImapSession = struct {
         const want_body_text_only = (std.mem.indexOf(u8, items_raw, "BODY[TEXT]") != null) or
             (std.mem.indexOf(u8, items_raw, "BODY.PEEK[TEXT]") != null);
 
+        // Parse partial fetch <offset.count> if present
+        var partial_offset: ?usize = null;
+        var partial_count: ?usize = null;
+        if (std.mem.indexOf(u8, items_raw, "<")) |angle_start| {
+            if (std.mem.indexOfScalarPos(u8, items_raw, angle_start, '>')) |angle_end| {
+                const partial_spec = items_raw[angle_start + 1 .. angle_end];
+                if (std.mem.indexOf(u8, partial_spec, ".")) |dot| {
+                    partial_offset = std.fmt.parseInt(usize, partial_spec[0..dot], 10) catch null;
+                    partial_count = std.fmt.parseInt(usize, partial_spec[dot + 1 ..], 10) catch null;
+                }
+            }
+        }
+
         var seq = start;
         while (seq <= end) : (seq += 1) {
             const filename = files[seq - 1];
@@ -1653,8 +1666,23 @@ pub const ImapSession = struct {
                 try self.writeData("\r\n");
             } else if (want_body_text_only) {
                 // BODY[TEXT] or BODY.PEEK[TEXT] — return just the body (after headers)
-                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} BODY[TEXT] {{{d}}}\r\n{s})", .{
-                    seq, uid, flag_str, content.len, date_str, bs_part, body.len, body,
+                // Apply partial fetch <offset.count> if requested
+                const text_data = if (partial_offset) |off| blk: {
+                    if (off >= body.len) break :blk @as([]const u8, "");
+                    const remaining = body[off..];
+                    if (partial_count) |cnt| {
+                        break :blk remaining[0..@min(cnt, remaining.len)];
+                    }
+                    break :blk remaining;
+                } else body;
+                const section_tag = if (partial_offset) |off| blk: {
+                    break :blk std.fmt.allocPrint(self.allocator, "BODY[TEXT]<{d}>", .{off}) catch "BODY[TEXT]";
+                } else @as([]const u8, "BODY[TEXT]");
+                defer if (partial_offset != null) {
+                    if (!std.mem.eql(u8, section_tag, "BODY[TEXT]")) self.allocator.free(section_tag);
+                };
+                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} {s} {{{d}}}\r\n{s})", .{
+                    seq, uid, flag_str, content.len, date_str, bs_part, section_tag, text_data.len, text_data,
                 });
                 defer self.allocator.free(resp);
                 try self.writeData(resp);
@@ -1668,8 +1696,23 @@ pub const ImapSession = struct {
                 try self.writeData(resp);
                 try self.writeData("\r\n");
             } else if (want_full_body) {
-                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} BODY[] {{{d}}}\r\n{s})", .{
-                    seq, uid, flag_str, content.len, date_str, bs_part, content.len, content,
+                // Apply partial fetch <offset.count> if requested
+                const fetch_data = if (partial_offset) |off| blk: {
+                    if (off >= content.len) break :blk @as([]const u8, "");
+                    const remaining = content[off..];
+                    if (partial_count) |cnt| {
+                        break :blk remaining[0..@min(cnt, remaining.len)];
+                    }
+                    break :blk remaining;
+                } else content;
+                const body_tag = if (partial_offset) |off| blk: {
+                    break :blk std.fmt.allocPrint(self.allocator, "BODY[]<{d}>", .{off}) catch "BODY[]";
+                } else @as([]const u8, "BODY[]");
+                defer if (partial_offset != null) {
+                    if (!std.mem.eql(u8, body_tag, "BODY[]")) self.allocator.free(body_tag);
+                };
+                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} {s} {{{d}}}\r\n{s})", .{
+                    seq, uid, flag_str, content.len, date_str, bs_part, body_tag, fetch_data.len, fetch_data,
                 });
                 defer self.allocator.free(resp);
                 try self.writeData(resp);
