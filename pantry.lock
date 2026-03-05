@@ -1,25 +1,22 @@
 {
-  "version": "1.0",
+  "version": "1.0.0",
+  "lockfileVersion": 1,
+  "generatedAt": "1772682528",
   "packages": {
-    "github:zig-utils/zig-bump@main": {
-      "name": "github:zig-utils/zig-bump",
-      "version": "main",
-      "resolved": "registry:github:zig-utils/zig-bump@main"
+    "typescript@^5.9.3": {
+      "name": "typescript",
+      "version": "^5.9.3",
+      "source": "pkgx"
     },
-    "github:zig-utils/zig-cli@main": {
-      "name": "github:zig-utils/zig-cli",
-      "version": "main",
-      "resolved": "registry:github:zig-utils/zig-cli@main"
+    "npm:@types/bun@^1.3.0": {
+      "name": "npm:@types/bun",
+      "version": "^1.3.0",
+      "source": "pkgx"
     },
-    "github:zig-utils/zig-tls@main": {
-      "name": "github:zig-utils/zig-tls",
-      "version": "main",
-      "resolved": "registry:github:zig-utils/zig-tls@main"
-    },
-    "ziglang.org@0.16.0-dev": {
-      "name": "ziglang.org",
-      "version": "0.16.0-dev",
-      "resolved": "registry:ziglang.org@0.16.0-dev"
+    "ts-cloud@link:ts-cloud": {
+      "name": "ts-cloud",
+      "version": "link:ts-cloud",
+      "source": "pkgx"
     }
   }
 }

@@ -58,6 +58,13 @@
     "cloud:status": "cd packages/cloud && pantry run status",
     "cloud:diff": "cd packages/cloud && pantry run diff",
 
+    // Backup & Migration
+    "backup": "cd packages/zig && ./zig-out/bin/mail backup create",
+    "backup:list": "cd packages/zig && ./zig-out/bin/mail backup list",
+    "backup:restore": "cd packages/zig && ./zig-out/bin/mail backup restore",
+    "backup:status": "cd packages/zig && ./zig-out/bin/mail backup status",
+    "migrate:stack": "./scripts/migrate-stack.sh",
+
     // Clean
     "clean": "rm -rf zig-cache zig-out .zig-cache packages/zig/zig-cache packages/zig/zig-out packages/zig/.zig-cache"
   },

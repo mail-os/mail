@@ -228,6 +228,29 @@ mail benchmark run [--json]    # Run all benchmarks
 mail benchmark list            # List available benchmarks
 ```
 
+### `mail backup`
+
+Production backup and status commands via AWS SSM.
+
+```bash
+# Create a backup (stops service, archives data, uploads to S3, restarts)
+mail backup create [--instance-id <id>] [--env <environment>] [--bucket <name>]
+
+# Restore from a backup
+mail backup restore <backup-file> [--instance-id <id>] [--env <environment>] [--bucket <name>]
+
+# List available backups in S3
+mail backup list [--instance-id <id>] [--env <environment>] [--bucket <name>]
+
+# Show server status (service, disk, database, mailboxes, TLS, uptime)
+mail backup status [--instance-id <id>] [--env <environment>]
+```
+
+Options:
+- `--instance-id <id>` — EC2 instance ID (auto-detected from CloudFormation if omitted)
+- `--env <environment>` — Environment: `production`, `staging`, `dev` (default: `production`)
+- `--bucket <name>` — S3 bucket for backups (auto-detected from stack or by prefix search)
+
 ## Configuration
 
 Configuration uses TOML format. See `config.example.toml` for all options.

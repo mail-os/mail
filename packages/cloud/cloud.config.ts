@@ -72,7 +72,7 @@ const mailConfig = {
 const config: CloudConfig = {
   project: {
     name: 'Mail Server',
-    slug: 'smtp-server', // Keep existing slug to avoid breaking deployed CloudFormation stacks
+    slug: 'mail-server',
     region: process.env.AWS_REGION || 'us-east-1',
   },
 
@@ -287,6 +287,10 @@ echo "Building mail server..."
 cd ${cfg.paths.installDir}/packages/zig
 sudo -u mail-server zig build -Doptimize=ReleaseFast
 
+# Install binary (renamed to avoid conflict with mail/ directory)
+cp ${cfg.paths.installDir}/packages/zig/zig-out/bin/mail ${cfg.paths.installDir}/mail-server
+chmod +x ${cfg.paths.installDir}/mail-server
+
 # Create directories
 echo "Creating directories..."
 mkdir -p ${cfg.paths.dataDir}
@@ -294,9 +298,11 @@ mkdir -p ${cfg.paths.logDir}
 mkdir -p ${cfg.paths.mailDir}
 mkdir -p ${cfg.paths.configDir}
 mkdir -p ${cfg.paths.backupDir}
+mkdir -p ${cfg.paths.installDir}/mail  # mailbox directory (IMAP uses mail/{user} relative to CWD)
 chown -R mail-server:mail-server ${cfg.paths.dataDir}
 chown -R mail-server:mail-server ${cfg.paths.logDir}
 chown -R mail-server:mail-server ${cfg.paths.mailDir}
+chown -R mail-server:mail-server ${cfg.paths.installDir}/mail
 
 # Generate TLS certificates
 echo "Generating self-signed certificates..."
@@ -355,7 +361,7 @@ User=mail-server
 Group=mail-server
 WorkingDirectory=${cfg.paths.installDir}
 EnvironmentFile=${cfg.paths.configDir}/mail.env
-ExecStart=${cfg.paths.installDir}/packages/zig/zig-out/bin/mail serve
+ExecStart=${cfg.paths.installDir}/mail-server serve
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -367,16 +373,21 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=${cfg.paths.dataDir} ${cfg.paths.logDir} ${cfg.paths.mailDir}
+ReadWritePaths=${cfg.paths.dataDir} ${cfg.paths.logDir} ${cfg.paths.mailDir} ${cfg.paths.installDir}/mail
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
 
-# Configure fail2ban
-echo "Configuring fail2ban..."
+# Install and configure fail2ban
+echo "Installing fail2ban..."
+dnf install -y fail2ban || true
 systemctl enable fail2ban
 systemctl start fail2ban
+
+# Set up certbot auto-renewal with service restart
+echo "Configuring certbot renewal..."
+echo "0 3 * * * root certbot renew --quiet --deploy-hook \\"systemctl restart mail\\"" > /etc/cron.d/certbot-renewal
 
 # Enable and start mail server
 echo "Starting mail server..."

@@ -132,14 +132,14 @@ echo -e "${GREEN}║  Deployment Complete!                   ║${NC}"
 echo -e "${GREEN}╚════════════════════════════════════════╝${NC}"
 echo ""
 
-# Fetch and display outputs (stack names match existing CloudFormation stacks)
-STACK_NAME="smtp-server-$ENVIRONMENT"
+# Fetch and display outputs
+STACK_NAME="mail-server-$ENVIRONMENT"
 if [ "$ENVIRONMENT" = "dev" ]; then
-    STACK_NAME="SmtpServerDevStack"
+    STACK_NAME="MailServerDevStack"
 elif [ "$ENVIRONMENT" = "staging" ]; then
-    STACK_NAME="SmtpServerStagingStack"
+    STACK_NAME="MailServerStagingStack"
 else
-    STACK_NAME="SmtpServerProdStack"
+    STACK_NAME="MailServerProdStack"
 fi
 
 echo -e "${YELLOW}Stack Outputs:${NC}"
@@ -153,5 +153,5 @@ echo "3. Check service status: sudo systemctl status mail"
 echo "4. View logs: sudo journalctl -u mail -f"
 echo ""
 echo -e "${YELLOW}CloudWatch Logs:${NC}"
-echo "aws logs tail /aws/ec2/smtp-server-$ENVIRONMENT --follow"
+echo "aws logs tail /aws/ec2/mail-server-$ENVIRONMENT --follow"
 echo ""
