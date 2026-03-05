@@ -105,14 +105,14 @@ sudo firewall-cmd --reload
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/smtp-server.git
-cd smtp-server
+git clone https://github.com/yourusername/mail.git
+cd mail
 
 # Build for current platform
 zig build -Doptimize=ReleaseSafe
 
 # Verify build
-./zig-out/bin/smtp-server --version
+./zig-out/bin/mail --version
 ```
 
 ### Step 2: Create System User
@@ -191,7 +191,7 @@ sudo chmod 644 server.crt
 
 ```bash
 # Copy binary to system location
-sudo cp zig-out/bin/smtp-server /usr/local/bin/
+sudo cp zig-out/bin/mail /usr/local/bin/
 sudo cp zig-out/bin/user-cli /usr/local/bin/
 sudo cp zig-out/bin/gdpr-cli /usr/local/bin/
 
@@ -206,9 +206,9 @@ sudo -u smtp /usr/local/bin/user-cli add admin@example.com --admin --password "S
 
 ```bash
 # Create service file
-sudo tee /etc/systemd/system/smtp-server.service << 'EOF'
+sudo tee /etc/systemd/system/mail.service << 'EOF'
 [Unit]
-Description=SMTP Server
+Description=Mail Server
 After=network.target
 Wants=network-online.target
 
@@ -218,7 +218,7 @@ User=smtp
 Group=smtp
 WorkingDirectory=/var/lib/smtp
 EnvironmentFile=/etc/smtp/smtp.env
-ExecStart=/usr/local/bin/smtp-server
+ExecStart=/usr/local/bin/mail
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=65536
@@ -239,19 +239,19 @@ EOF
 
 # Enable and start service
 sudo systemctl daemon-reload
-sudo systemctl enable smtp-server
-sudo systemctl start smtp-server
-sudo systemctl status smtp-server
+sudo systemctl enable mail
+sudo systemctl start mail
+sudo systemctl status mail
 ```
 
 ### Step 7: Verify Deployment
 
 ```bash
 # Check service status
-sudo systemctl status smtp-server
+sudo systemctl status mail
 
 # View logs
-sudo journalctl -u smtp-server -f
+sudo journalctl -u mail -f
 
 # Test SMTP connection
 telnet localhost 25
@@ -308,7 +308,7 @@ RUN mkdir -p /var/lib/smtp/{data,logs,queue} && \
     chown -R smtp:smtp /var/lib/smtp
 
 # Copy binaries from builder
-COPY --from=builder /app/zig-out/bin/smtp-server /usr/local/bin/
+COPY --from=builder /app/zig-out/bin/mail /usr/local/bin/
 COPY --from=builder /app/zig-out/bin/user-cli /usr/local/bin/
 COPY --from=builder /app/zig-out/bin/gdpr-cli /usr/local/bin/
 
@@ -324,7 +324,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
 
 # Start server
-CMD ["/usr/local/bin/smtp-server"]
+CMD ["/usr/local/bin/mail"]
 ```
 
 ### Docker Compose
@@ -335,9 +335,9 @@ Create `docker-compose.yml`:
 version: '3.8'
 
 services:
-  smtp-server:
+  mail:
     build: .
-    container_name: smtp-server
+    container_name: mail
     restart: unless-stopped
     ports:
       - "25:25"
@@ -432,9 +432,9 @@ global:
   evaluation_interval: 15s
 
 scrape_configs:
-  - job_name: 'smtp-server'
+  - job_name: 'mail'
     static_configs:
-      - targets: ['smtp-server:9090']
+      - targets: ['mail:9090']
         labels:
           service: 'smtp'
 ```
@@ -446,13 +446,13 @@ scrape_configs:
 docker-compose up -d
 
 # View logs
-docker-compose logs -f smtp-server
+docker-compose logs -f mail
 
 # Initialize database
-docker exec smtp-server user-cli init
+docker exec mail user-cli init
 
 # Create admin user
-docker exec smtp-server user-cli add admin@example.com --admin --password "SecurePassword123!"
+docker exec mail user-cli add admin@example.com --admin --password "SecurePassword123!"
 
 # Check health
 curl http://localhost:8080/health
@@ -475,7 +475,7 @@ kind: Namespace
 metadata:
   name: smtp-system
   labels:
-    app.kubernetes.io/name: smtp-server
+    app.kubernetes.io/name: mail
 ```
 
 Create `k8s/configmap.yaml`:
@@ -554,10 +554,10 @@ Create `k8s/deployment.yaml`:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: smtp-server
+  name: mail
   namespace: smtp-system
   labels:
-    app: smtp-server
+    app: mail
 spec:
   replicas: 3
   strategy:
@@ -567,24 +567,24 @@ spec:
       maxUnavailable: 0
   selector:
     matchLabels:
-      app: smtp-server
+      app: mail
   template:
     metadata:
       labels:
-        app: smtp-server
+        app: mail
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
     spec:
-      serviceAccountName: smtp-server
+      serviceAccountName: mail
       securityContext:
         fsGroup: 1000
         runAsNonRoot: true
         runAsUser: 1000
       containers:
-      - name: smtp-server
-        image: your-registry/smtp-server:latest
+      - name: mail
+        image: your-registry/mail:latest
         imagePullPolicy: Always
         ports:
         - name: smtp
@@ -669,7 +669,7 @@ spec:
                 - key: app
                   operator: In
                   values:
-                  - smtp-server
+                  - mail
               topologyKey: kubernetes.io/hostname
 ```
 
@@ -681,14 +681,14 @@ Create `k8s/service.yaml`:
 apiVersion: v1
 kind: Service
 metadata:
-  name: smtp-server
+  name: mail
   namespace: smtp-system
   labels:
-    app: smtp-server
+    app: mail
 spec:
   type: LoadBalancer
   selector:
-    app: smtp-server
+    app: mail
   ports:
   - name: smtp
     port: 25
@@ -706,14 +706,14 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: smtp-server-internal
+  name: mail-internal
   namespace: smtp-system
   labels:
-    app: smtp-server
+    app: mail
 spec:
   type: ClusterIP
   selector:
-    app: smtp-server
+    app: mail
   ports:
   - name: http
     port: 8080
@@ -733,13 +733,13 @@ Create `k8s/rbac.yaml`:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: smtp-server
+  name: mail
   namespace: smtp-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: smtp-server-role
+  name: mail-role
   namespace: smtp-system
 rules:
 - apiGroups: [""]
@@ -749,15 +749,15 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: smtp-server-rolebinding
+  name: mail-rolebinding
   namespace: smtp-system
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: smtp-server-role
+  name: mail-role
 subjects:
 - kind: ServiceAccount
-  name: smtp-server
+  name: mail
   namespace: smtp-system
 ```
 
@@ -769,13 +769,13 @@ Create `k8s/hpa.yaml`:
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: smtp-server-hpa
+  name: mail-hpa
   namespace: smtp-system
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: smtp-server
+    name: mail
   minReplicas: 3
   maxReplicas: 10
   metrics:
@@ -831,19 +831,19 @@ kubectl apply -f k8s/service.yaml
 kubectl apply -f k8s/hpa.yaml
 
 # Wait for deployment
-kubectl rollout status deployment/smtp-server -n smtp-system
+kubectl rollout status deployment/mail -n smtp-system
 
 # Check pods
 kubectl get pods -n smtp-system
 
 # View logs
-kubectl logs -f -l app=smtp-server -n smtp-system
+kubectl logs -f -l app=mail -n smtp-system
 
 # Get service external IP
-kubectl get svc smtp-server -n smtp-system
+kubectl get svc mail -n smtp-system
 
 # Initialize database (run once)
-POD_NAME=$(kubectl get pods -n smtp-system -l app=smtp-server -o jsonpath='{.items[0].metadata.name}')
+POD_NAME=$(kubectl get pods -n smtp-system -l app=mail -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -n smtp-system $POD_NAME -- user-cli init
 
 # Create admin user
@@ -867,8 +867,8 @@ aws ec2 run-instances \
   --security-group-ids sg-xxxxxxxxx \
   --subnet-id subnet-xxxxxxxxx \
   --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":100,"VolumeType":"gp3","Iops":3000}}]' \
-  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=smtp-server}]' \
-  --iam-instance-profile Name=smtp-server-profile
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=mail}]' \
+  --iam-instance-profile Name=mail-profile
 ```
 
 **Step 2: Security Group Configuration**
@@ -876,24 +876,24 @@ aws ec2 run-instances \
 ```bash
 # Create security group
 aws ec2 create-security-group \
-  --group-name smtp-server-sg \
-  --description "SMTP Server Security Group"
+  --group-name mail-sg \
+  --description "Mail Server Security Group"
 
 # Add inbound rules
 aws ec2 authorize-security-group-ingress \
-  --group-name smtp-server-sg \
+  --group-name mail-sg \
   --protocol tcp --port 25 --cidr 0.0.0.0/0
 
 aws ec2 authorize-security-group-ingress \
-  --group-name smtp-server-sg \
+  --group-name mail-sg \
   --protocol tcp --port 587 --cidr 0.0.0.0/0
 
 aws ec2 authorize-security-group-ingress \
-  --group-name smtp-server-sg \
+  --group-name mail-sg \
   --protocol tcp --port 465 --cidr 0.0.0.0/0
 
 aws ec2 authorize-security-group-ingress \
-  --group-name smtp-server-sg \
+  --group-name mail-sg \
   --protocol tcp --port 22 --cidr your-ip/32
 ```
 
@@ -920,17 +920,17 @@ Create `ecs-task-definition.json`:
 
 ```json
 {
-  "family": "smtp-server",
+  "family": "mail",
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "2048",
   "memory": "4096",
   "executionRoleArn": "arn:aws:iam::ACCOUNT:role/ecsTaskExecutionRole",
-  "taskRoleArn": "arn:aws:iam::ACCOUNT:role/smtp-server-task-role",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT:role/mail-task-role",
   "containerDefinitions": [
     {
-      "name": "smtp-server",
-      "image": "ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/smtp-server:latest",
+      "name": "mail",
+      "image": "ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/mail:latest",
       "essential": true,
       "portMappings": [
         {"containerPort": 25, "protocol": "tcp"},
@@ -958,7 +958,7 @@ Create `ecs-task-definition.json`:
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
-          "awslogs-group": "/ecs/smtp-server",
+          "awslogs-group": "/ecs/mail",
           "awslogs-region": "us-east-1",
           "awslogs-stream-prefix": "smtp"
         }
@@ -993,26 +993,26 @@ aws ecs register-task-definition --cli-input-json file://ecs-task-definition.jso
 # Create service
 aws ecs create-service \
   --cluster smtp-cluster \
-  --service-name smtp-server \
-  --task-definition smtp-server:1 \
+  --service-name mail \
+  --task-definition mail:1 \
   --desired-count 3 \
   --launch-type FARGATE \
   --network-configuration "awsvpcConfiguration={subnets=[subnet-xxx,subnet-yyy],securityGroups=[sg-xxx],assignPublicIp=ENABLED}" \
-  --load-balancers "targetGroupArn=arn:aws:elasticloadbalancing:us-east-1:ACCOUNT:targetgroup/smtp/xxx,containerName=smtp-server,containerPort=587"
+  --load-balancers "targetGroupArn=arn:aws:elasticloadbalancing:us-east-1:ACCOUNT:targetgroup/smtp/xxx,containerName=mail,containerPort=587"
 ```
 
 ### GCP Compute Engine Deployment
 
 ```bash
 # Create instance
-gcloud compute instances create smtp-server \
+gcloud compute instances create mail \
   --machine-type=n2-standard-4 \
   --zone=us-central1-a \
   --image-family=ubuntu-2404-lts-amd64 \
   --image-project=ubuntu-os-cloud \
   --boot-disk-size=100GB \
   --boot-disk-type=pd-ssd \
-  --tags=smtp-server \
+  --tags=mail \
   --metadata=startup-script='#!/bin/bash
     apt-get update
     apt-get install -y sqlite3 libsqlite3-dev
@@ -1022,16 +1022,16 @@ gcloud compute instances create smtp-server \
 # Create firewall rules
 gcloud compute firewall-rules create allow-smtp \
   --allow tcp:25,tcp:587,tcp:465 \
-  --target-tags smtp-server \
+  --target-tags mail \
   --description "Allow SMTP traffic"
 
 # Reserve static IP
-gcloud compute addresses create smtp-server-ip --region us-central1
+gcloud compute addresses create mail-ip --region us-central1
 
 # Attach static IP
-gcloud compute instances add-access-config smtp-server \
+gcloud compute instances add-access-config mail \
   --zone us-central1-a \
-  --address $(gcloud compute addresses describe smtp-server-ip --region us-central1 --format="value(address)")
+  --address $(gcloud compute addresses describe mail-ip --region us-central1 --format="value(address)")
 ```
 
 ### Azure VM Deployment
@@ -1071,7 +1071,7 @@ az network nsg rule create \
 # Create VM
 az vm create \
   --resource-group smtp-rg \
-  --name smtp-server \
+  --name mail \
   --image Ubuntu2404 \
   --size Standard_D4s_v3 \
   --admin-username azureuser \
@@ -1292,7 +1292,7 @@ EOF
 # Set up automatic renewal
 sudo tee /etc/cron.daily/certbot-renew << 'EOF'
 #!/bin/bash
-certbot renew --quiet --post-hook "systemctl reload smtp-server"
+certbot renew --quiet --post-hook "systemctl reload mail"
 EOF
 sudo chmod +x /etc/cron.daily/certbot-renew
 ```
@@ -1459,12 +1459,12 @@ global:
     region: 'us-east-1'
 
 scrape_configs:
-  - job_name: 'smtp-server'
+  - job_name: 'mail'
     static_configs:
       - targets:
-        - 'smtp-server1:9090'
-        - 'smtp-server2:9090'
-        - 'smtp-server3:9090'
+        - 'mail1:9090'
+        - 'mail2:9090'
+        - 'mail3:9090'
     relabel_configs:
       - source_labels: [__address__]
         target_label: instance
@@ -1493,7 +1493,7 @@ groups:
     interval: 30s
     rules:
       - alert: SMTPServerDown
-        expr: up{job="smtp-server"} == 0
+        expr: up{job="mail"} == 0
         for: 1m
         labels:
           severity: critical
@@ -1520,7 +1520,7 @@ groups:
           description: "Queue has {{ $value }} messages pending"
 
       - alert: HighMemoryUsage
-        expr: process_resident_memory_bytes{job="smtp-server"} > 2e9
+        expr: process_resident_memory_bytes{job="mail"} > 2e9
         for: 5m
         labels:
           severity: warning
@@ -1529,7 +1529,7 @@ groups:
           description: "Memory usage is {{ $value | humanize }}B"
 
       - alert: HighCPUUsage
-        expr: rate(process_cpu_seconds_total{job="smtp-server"}[5m]) > 0.9
+        expr: rate(process_cpu_seconds_total{job="mail"}[5m]) > 0.9
         for: 5m
         labels:
           severity: warning
@@ -1586,7 +1586,7 @@ scrape_configs:
       - targets:
           - localhost
         labels:
-          job: smtp-server
+          job: mail
           __path__: /var/lib/smtp/logs/*.log
     pipeline_stages:
       - regex:
@@ -1698,7 +1698,7 @@ echo "Restoring from: $BACKUP_ARCHIVE"
 
 # Stop SMTP server
 echo "Stopping SMTP server..."
-systemctl stop smtp-server
+systemctl stop mail
 
 # Extract backup
 echo "Extracting backup..."
@@ -1738,7 +1738,7 @@ chmod 600 /etc/smtp/smtp.env
 
 # Start SMTP server
 echo "Starting SMTP server..."
-systemctl start smtp-server
+systemctl start mail
 
 # Cleanup
 rm -rf "$TEMP_DIR"
@@ -1805,12 +1805,12 @@ sudo fail2ban-client status smtp-auth
 
 ### AppArmor Profile
 
-Create `/etc/apparmor.d/usr.local.bin.smtp-server`:
+Create `/etc/apparmor.d/usr.local.bin.mail`:
 
 ```
 #include <tunables/global>
 
-/usr/local/bin/smtp-server {
+/usr/local/bin/mail {
   #include <abstractions/base>
   #include <abstractions/nameservice>
   #include <abstractions/ssl_certs>
@@ -1822,7 +1822,7 @@ Create `/etc/apparmor.d/usr.local.bin.smtp-server`:
   network inet stream,
   network inet6 stream,
 
-  /usr/local/bin/smtp-server mr,
+  /usr/local/bin/mail mr,
   /var/lib/smtp/** rw,
   /etc/smtp/** r,
   /tmp/** rw,
@@ -1835,15 +1835,15 @@ Create `/etc/apparmor.d/usr.local.bin.smtp-server`:
 Load profile:
 
 ```bash
-sudo apparmor_parser -r /etc/apparmor.d/usr.local.bin.smtp-server
+sudo apparmor_parser -r /etc/apparmor.d/usr.local.bin.mail
 ```
 
 ### SELinux Policy (RHEL/CentOS)
 
 ```bash
 # Create SELinux module
-cat > smtp-server.te << EOF
-module smtp-server 1.0;
+cat > mail.te << EOF
+module mail 1.0;
 
 require {
     type smtp_port_t;
@@ -1855,14 +1855,14 @@ allow smtp_server_t smtp_port_t:tcp_socket { bind listen };
 EOF
 
 # Compile and install
-checkmodule -M -m -o smtp-server.mod smtp-server.te
-semodule_package -o smtp-server.pp -m smtp-server.mod
-semodule -i smtp-server.pp
+checkmodule -M -m -o mail.mod mail.te
+semodule_package -o mail.pp -m mail.mod
+semodule -i mail.pp
 
 # Set file contexts
-semanage fcontext -a -t smtp_server_exec_t "/usr/local/bin/smtp-server"
+semanage fcontext -a -t smtp_server_exec_t "/usr/local/bin/mail"
 semanage fcontext -a -t smtp_server_var_lib_t "/var/lib/smtp(/.*)?"
-restorecon -Rv /usr/local/bin/smtp-server /var/lib/smtp
+restorecon -Rv /usr/local/bin/mail /var/lib/smtp
 ```
 
 ### System Hardening
@@ -2024,7 +2024,7 @@ After deployment, verify the following:
 
 ### Service Health
 
-- [ ] SMTP server is running: `systemctl status smtp-server`
+- [ ] SMTP server is running: `systemctl status mail`
 - [ ] Ports are listening: `ss -tlnp | grep -E '(25|587|465)'`
 - [ ] Health endpoint responds: `curl http://localhost:8080/health`
 - [ ] Metrics endpoint responds: `curl http://localhost:9090/metrics`
@@ -2084,7 +2084,7 @@ After deployment, verify the following:
 **Solution:**
 ```bash
 # Grant CAP_NET_BIND_SERVICE capability
-sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/smtp-server
+sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/mail
 
 # Or run as root (not recommended)
 # Or use systemd socket activation
@@ -2122,7 +2122,7 @@ lsof /var/lib/smtp/smtp.db
 **Solution:**
 ```bash
 # Check for memory leaks
-valgrind --leak-check=full /usr/local/bin/smtp-server
+valgrind --leak-check=full /usr/local/bin/mail
 
 # Reduce cache size
 CACHE_SIZE=536870912  # 512MB
@@ -2142,7 +2142,7 @@ ls -l /var/lib/smtp/queue/
 # (if queue management CLI is implemented)
 
 # Check logs
-journalctl -u smtp-server -n 100 | grep delivery
+journalctl -u mail -n 100 | grep delivery
 
 # Verify DNS records
 dig MX example.com

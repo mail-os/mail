@@ -296,13 +296,13 @@ Monitor these metrics during load testing:
 
 ```bash
 # CPU and memory usage
-top -p $(pgrep smtp-server)
+top -p $(pgrep mail)
 
 # Network connections
 watch -n 1 'ss -tan | grep :2525 | wc -l'
 
 # File descriptors
-watch -n 1 'ls -l /proc/$(pgrep smtp-server)/fd | wc -l'
+watch -n 1 'ls -l /proc/$(pgrep mail)/fd | wc -l'
 
 # Prometheus metrics
 curl http://localhost:8081/metrics
@@ -332,7 +332,7 @@ sqlite3 smtp.db "PRAGMA lock_status;"
 - "Connection refused" errors
 
 **Solutions**:
-1. Check server is running: `pgrep smtp-server`
+1. Check server is running: `pgrep mail`
 2. Verify port: `netstat -tulpn | grep 2525`
 3. Increase OS limits: `ulimit -n 65536`
 4. Check server logs for errors
@@ -415,7 +415,7 @@ jobs:
 
       - name: Start server
         run: |
-          ./zig-out/bin/smtp-server &
+          ./zig-out/bin/mail &
           sleep 5
 
       - name: Run load test
@@ -566,13 +566,13 @@ Ensure clean state:
 
 ```bash
 # Stop server
-pkill smtp-server
+pkill mail
 
 # Clean database
 rm -f smtp.db smtp.db-shm smtp.db-wal
 
 # Restart server
-./zig-out/bin/smtp-server &
+./zig-out/bin/mail &
 sleep 5
 
 # Run test

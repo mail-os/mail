@@ -1,4 +1,4 @@
-# SMTP Server Usage Examples
+# Mail Server Usage Examples
 
 ## Basic Usage
 
@@ -6,25 +6,25 @@
 
 ```bash
 # Start with defaults (port 2525, localhost)
-./zig-out/bin/smtp-server
+./zig-out/bin/mail
 
 # Start on a specific port
-./zig-out/bin/smtp-server --port 25
+./zig-out/bin/mail --port 25
 
 # Start with debug logging
-./zig-out/bin/smtp-server --log-level debug
+./zig-out/bin/mail --log-level debug
 
 # Start on all interfaces
-./zig-out/bin/smtp-server --host 0.0.0.0 --port 2525
+./zig-out/bin/mail --host 0.0.0.0 --port 2525
 
 # IPv6 localhost
-./zig-out/bin/smtp-server --host "::1" --port 2525
+./zig-out/bin/mail --host "::1" --port 2525
 
 # IPv6 all interfaces
-./zig-out/bin/smtp-server --host "::" --port 2525
+./zig-out/bin/mail --host "::" --port 2525
 
 # Dual-stack (IPv4 and IPv6)
-./zig-out/bin/smtp-server --host "::" --port 2525  # On most systems, this binds to both
+./zig-out/bin/mail --host "::" --port 2525  # On most systems, this binds to both
 ```
 
 ### Configuration via Environment Variables
@@ -47,14 +47,14 @@ export SMTP_ENABLE_TLS="true"
 export SMTP_ENABLE_AUTH="true"
 
 # Run the server
-./zig-out/bin/smtp-server
+./zig-out/bin/mail
 ```
 
 ### Command-Line Overrides
 
 ```bash
 # Override environment variables with CLI args
-SMTP_PORT=25 ./zig-out/bin/smtp-server --port 587 --log-level warn
+SMTP_PORT=25 ./zig-out/bin/mail --port 587 --log-level warn
 ```
 
 ## Testing with telnet
@@ -128,36 +128,36 @@ done
 
 ```bash
 # Option 1: Use sudo (not recommended for production)
-sudo ./zig-out/bin/smtp-server --port 25
+sudo ./zig-out/bin/mail --port 25
 
 # Option 2: Grant capability (Linux only)
-sudo setcap 'cap_net_bind_service=+ep' ./zig-out/bin/smtp-server
-./zig-out/bin/smtp-server --port 25
+sudo setcap 'cap_net_bind_service=+ep' ./zig-out/bin/mail
+./zig-out/bin/mail --port 25
 
 # Option 3: Use iptables to redirect (recommended)
 sudo iptables -t nat -A PREROUTING -p tcp --dport 25 -j REDIRECT --to-port 2525
-./zig-out/bin/smtp-server --port 2525
+./zig-out/bin/mail --port 2525
 ```
 
 ### Running as a systemd Service
 
-Create `/etc/systemd/system/smtp-server.service`:
+Create `/etc/systemd/system/mail.service`:
 
 ```ini
 [Unit]
-Description=SMTP Server
+Description=Mail Server
 After=network.target
 
 [Service]
 Type=simple
 User=smtp
 Group=smtp
-WorkingDirectory=/opt/smtp-server
+WorkingDirectory=/opt/mail
 Environment="SMTP_HOST=0.0.0.0"
 Environment="SMTP_PORT=2525"
 Environment="SMTP_HOSTNAME=mail.example.com"
 Environment="SMTP_MAX_CONNECTIONS=500"
-ExecStart=/opt/smtp-server/zig-out/bin/smtp-server --log-level info
+ExecStart=/opt/mail/zig-out/bin/mail --log-level info
 Restart=always
 RestartSec=5
 
@@ -166,7 +166,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/smtp-server/mail /opt/smtp-server/smtp-server.log
+ReadWritePaths=/opt/mail/mail /opt/mail/mail.log
 
 [Install]
 WantedBy=multi-user.target
@@ -175,14 +175,14 @@ WantedBy=multi-user.target
 Enable and start:
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable smtp-server
-sudo systemctl start smtp-server
-sudo systemctl status smtp-server
+sudo systemctl enable mail
+sudo systemctl start mail
+sudo systemctl status mail
 ```
 
 View logs:
 ```bash
-sudo journalctl -u smtp-server -f
+sudo journalctl -u mail -f
 ```
 
 ### Docker Deployment
@@ -209,29 +209,29 @@ RUN mkdir -p /app/mail/new
 EXPOSE 2525
 
 # Run server
-CMD ["./zig-out/bin/smtp-server", "--host", "0.0.0.0", "--port", "2525"]
+CMD ["./zig-out/bin/mail", "--host", "0.0.0.0", "--port", "2525"]
 ```
 
 Build and run:
 ```bash
 # Build Docker image
-docker build -t smtp-server .
+docker build -t mail .
 
 # Run container
 docker run -d \
-  --name smtp-server \
+  --name mail \
   -p 2525:2525 \
   -v $(pwd)/mail:/app/mail \
-  -v $(pwd)/smtp-server.log:/app/smtp-server.log \
+  -v $(pwd)/mail.log:/app/mail.log \
   -e SMTP_HOSTNAME=mail.example.com \
   -e SMTP_MAX_CONNECTIONS=200 \
-  smtp-server
+  mail
 
 # View logs
-docker logs -f smtp-server
+docker logs -f mail
 
 # Stop container
-docker stop smtp-server
+docker stop mail
 ```
 
 ### Docker Compose
@@ -242,13 +242,13 @@ Create `docker-compose.yml`:
 version: '3.8'
 
 services:
-  smtp-server:
+  mail:
     build: .
     ports:
       - "2525:2525"
     volumes:
       - ./mail:/app/mail
-      - ./smtp-server.log:/app/smtp-server.log
+      - ./mail.log:/app/mail.log
     environment:
       - SMTP_HOST=0.0.0.0
       - SMTP_PORT=2525
@@ -281,16 +281,16 @@ swaks --server localhost:2525 --quit-after BANNER
 
 ```bash
 # Real-time log viewing
-tail -f smtp-server.log
+tail -f mail.log
 
 # View colored logs
-tail -f smtp-server.log | grep --color=always -E 'ERROR|WARN|$'
+tail -f mail.log | grep --color=always -E 'ERROR|WARN|$'
 
 # Count errors
-grep ERROR smtp-server.log | wc -l
+grep ERROR mail.log | wc -l
 
 # View rate limit violations
-grep "Rate limit exceeded" smtp-server.log
+grep "Rate limit exceeded" mail.log
 ```
 
 ### Monitor Received Messages
@@ -362,7 +362,7 @@ stream {
 
 ```bash
 # Check if server is running
-ps aux | grep smtp-server
+ps aux | grep mail
 
 # Check if port is listening
 netstat -tuln | grep 2525
@@ -377,7 +377,7 @@ telnet localhost 2525
 
 ```bash
 # Check file permissions
-ls -l zig-out/bin/smtp-server
+ls -l zig-out/bin/mail
 
 # Check port permissions (ports < 1024 require root)
 # Use port 2525 or higher for non-root users
@@ -400,13 +400,13 @@ df -h .
 
 ```bash
 # Monitor memory
-watch -n 1 'ps aux | grep smtp-server | grep -v grep'
+watch -n 1 'ps aux | grep mail | grep -v grep'
 
 # Reduce max connections
-./zig-out/bin/smtp-server --max-connections 50
+./zig-out/bin/mail --max-connections 50
 
 # Check for memory leaks in logs
-grep "out of memory" smtp-server.log
+grep "out of memory" mail.log
 ```
 
 ## Performance Tuning
@@ -419,10 +419,10 @@ grep "out of memory" smtp-server.log
 *  hard  nofile  65536
 
 # Increase max connections
-./zig-out/bin/smtp-server --max-connections 1000
+./zig-out/bin/mail --max-connections 1000
 
 # Use faster log level
-./zig-out/bin/smtp-server --log-level warn
+./zig-out/bin/mail --log-level warn
 ```
 
 ### Load Testing
@@ -519,7 +519,7 @@ HTTPServer(('', 8080), WebhookHandler).serve_forever()
 
 # Start SMTP server with webhook
 export SMTP_WEBHOOK_URL="http://localhost:8080/webhook"
-./zig-out/bin/smtp-server
+./zig-out/bin/mail
 ```
 
 Webhook JSON payload format:

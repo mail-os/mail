@@ -1,11 +1,11 @@
-# SMTP Server Deployment Runbook
+# Mail Server Deployment Runbook
 
 **Version:** v0.28.0
 **Date:** 2025-10-24
 
 ## Overview
 
-This runbook provides step-by-step procedures for deploying, upgrading, and maintaining the SMTP server in production environments.
+This runbook provides step-by-step procedures for deploying, upgrading, and maintaining the Mail Server in production environments.
 
 ---
 
@@ -69,8 +69,8 @@ This runbook provides step-by-step procedures for deploying, upgrading, and main
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/smtp-server.git
-cd smtp-server
+git clone https://github.com/yourusername/mail.git
+cd mail
 
 # Checkout stable version
 git checkout v0.28.0
@@ -79,12 +79,12 @@ git checkout v0.28.0
 zig build -Doptimize=ReleaseSafe
 
 # Verify build
-./zig-out/bin/smtp-server --version
+./zig-out/bin/mail --version
 ```
 
 **Expected Output:**
 ```
-SMTP Server v0.28.0
+Mail Server v0.28.0
 Built with Zig 0.15.1
 ```
 
@@ -99,15 +99,15 @@ Built with Zig 0.15.1
 sudo useradd -r -s /bin/false smtp
 
 # Create directories
-sudo mkdir -p /opt/smtp-server
-sudo mkdir -p /var/lib/smtp-server
-sudo mkdir -p /var/log/smtp-server
-sudo mkdir -p /etc/smtp-server
+sudo mkdir -p /opt/mail
+sudo mkdir -p /var/lib/mail
+sudo mkdir -p /var/log/mail
+sudo mkdir -p /etc/mail
 
 # Set ownership
-sudo chown -R smtp:smtp /var/lib/smtp-server
-sudo chown -R smtp:smtp /var/log/smtp-server
-sudo chown -R smtp:smtp /etc/smtp-server
+sudo chown -R smtp:smtp /var/lib/mail
+sudo chown -R smtp:smtp /var/log/mail
+sudo chown -R smtp:smtp /etc/mail
 ```
 
 **Time:** 2 minutes
@@ -118,15 +118,15 @@ sudo chown -R smtp:smtp /etc/smtp-server
 
 ```bash
 # Copy binary
-sudo cp ./zig-out/bin/smtp-server /opt/smtp-server/
-sudo cp ./zig-out/bin/user-cli /opt/smtp-server/
+sudo cp ./zig-out/bin/mail /opt/mail/
+sudo cp ./zig-out/bin/user-cli /opt/mail/
 
 # Set permissions
-sudo chown root:smtp /opt/smtp-server/smtp-server
-sudo chmod 750 /opt/smtp-server/smtp-server
+sudo chown root:smtp /opt/mail/mail
+sudo chmod 750 /opt/mail/mail
 
 # Verify installation
-/opt/smtp-server/smtp-server --version
+/opt/mail/mail --version
 ```
 
 **Time:** 1 minute
@@ -137,8 +137,8 @@ sudo chmod 750 /opt/smtp-server/smtp-server
 
 ```bash
 # Create configuration file
-sudo tee /etc/smtp-server/config.env << 'EOF'
-# SMTP Server Configuration - Production
+sudo tee /etc/mail/config.env << 'EOF'
+# Mail Server Configuration - Production
 SMTP_PROFILE=production
 
 # Server Settings
@@ -159,7 +159,7 @@ SMTP_MAX_RECIPIENTS=100
 
 # Authentication
 SMTP_ENABLE_AUTH=true
-SMTP_DB_PATH=/var/lib/smtp-server/smtp.db
+SMTP_DB_PATH=/var/lib/mail/smtp.db
 
 # Security
 SMTP_ENABLE_TLS=false
@@ -187,8 +187,8 @@ SMTP_TRACING_SERVICE_NAME=smtp-prod-us-east-1
 EOF
 
 # Secure configuration file
-sudo chown root:smtp /etc/smtp-server/config.env
-sudo chmod 640 /etc/smtp-server/config.env
+sudo chown root:smtp /etc/mail/config.env
+sudo chmod 640 /etc/mail/config.env
 ```
 
 **Time:** 3 minutes
@@ -199,11 +199,11 @@ sudo chmod 640 /etc/smtp-server/config.env
 
 ```bash
 # Set database path
-export SMTP_DB_PATH=/var/lib/smtp-server/smtp.db
+export SMTP_DB_PATH=/var/lib/mail/smtp.db
 
 # Initialize database (migrations run automatically on first start)
 # Create initial admin user
-sudo -u smtp /opt/smtp-server/user-cli create \
+sudo -u smtp /opt/mail/user-cli create \
   admin@example.com \
   --password "$(openssl rand -base64 32)" \
   --email admin@example.com
@@ -225,19 +225,19 @@ admin@example.com|1
 
 ```bash
 # Create systemd service unit
-sudo tee /etc/systemd/system/smtp-server.service << 'EOF'
+sudo tee /etc/systemd/system/mail.service << 'EOF'
 [Unit]
-Description=SMTP Server
-Documentation=https://github.com/yourusername/smtp-server
+Description=Mail Server
+Documentation=https://github.com/yourusername/mail
 After=network.target
 
 [Service]
 Type=simple
 User=smtp
 Group=smtp
-WorkingDirectory=/opt/smtp-server
-EnvironmentFile=/etc/smtp-server/config.env
-ExecStart=/opt/smtp-server/smtp-server
+WorkingDirectory=/opt/mail
+EnvironmentFile=/etc/mail/config.env
+ExecStart=/opt/mail/mail
 Restart=always
 RestartSec=5
 
@@ -246,7 +246,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/smtp-server /var/log/smtp-server
+ReadWritePaths=/var/lib/mail /var/log/mail
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 # Resource limits
@@ -272,8 +272,8 @@ sudo systemctl daemon-reload
 sudo apt-get install -y nginx certbot python3-certbot-nginx
 
 # Create nginx configuration
-sudo tee /etc/nginx/sites-available/smtp-server << 'EOF'
-# SMTP Server - TLS Termination Proxy
+sudo tee /etc/nginx/sites-available/mail << 'EOF'
+# Mail Server - TLS Termination Proxy
 
 upstream smtp_backend {
     server localhost:2525 max_fails=3 fail_timeout=30s;
@@ -309,7 +309,7 @@ server {
 EOF
 
 # Enable site
-sudo ln -s /etc/nginx/sites-available/smtp-server /etc/nginx/sites-enabled/
+sudo ln -s /etc/nginx/sites-available/mail /etc/nginx/sites-enabled/mail
 
 # Test configuration
 sudo nginx -t
@@ -344,26 +344,26 @@ sudo systemctl start certbot.timer
 
 ```bash
 # Validate configuration
-sudo -u smtp SMTP_PROFILE=production /opt/smtp-server/smtp-server --validate-only
+sudo -u smtp SMTP_PROFILE=production /opt/mail/mail --validate-only
 
 # Start service
-sudo systemctl start smtp-server
+sudo systemctl start mail
 
 # Check status
-sudo systemctl status smtp-server
+sudo systemctl status mail
 
 # Enable auto-start on boot
-sudo systemctl enable smtp-server
+sudo systemctl enable mail
 
 # View logs
-sudo journalctl -u smtp-server -f
+sudo journalctl -u mail -f
 ```
 
 **Expected Log Output:**
 ```json
-{"timestamp":1698765432,"level":"INFO","service":"smtp-server","hostname":"prod-smtp-01","message":"=== SMTP Server Starting ==="}
-{"timestamp":1698765432,"level":"INFO","service":"smtp-server","hostname":"prod-smtp-01","message":"Configuration loaded and validated successfully:"}
-{"timestamp":1698765432,"level":"INFO","service":"smtp-server","hostname":"prod-smtp-01","message":"SMTP Server listening on 0.0.0.0:2525"}
+{"timestamp":1698765432,"level":"INFO","service":"mail","hostname":"prod-smtp-01","message":"=== Mail Server Starting ==="}
+{"timestamp":1698765432,"level":"INFO","service":"mail","hostname":"prod-smtp-01","message":"Configuration loaded and validated successfully:"}
+{"timestamp":1698765432,"level":"INFO","service":"mail","hostname":"prod-smtp-01","message":"Mail Server listening on 0.0.0.0:2525"}
 ```
 
 **Time:** 3 minutes
@@ -390,7 +390,7 @@ echo "Subject: Test Email
 This is a test message." | sendmail -f test@example.com recipient@example.com
 
 # Check logs for successful delivery
-sudo journalctl -u smtp-server | grep "Message received"
+sudo journalctl -u mail | grep "Message received"
 ```
 
 **Time:** 5 minutes
@@ -413,7 +413,7 @@ sudo journalctl -u smtp-server | grep "Message received"
 
 ```bash
 # Check current version
-/opt/smtp-server/smtp-server --version
+/opt/mail/mail --version
 
 # Check service health
 curl -s http://localhost:8081/health | jq .status
@@ -422,10 +422,10 @@ curl -s http://localhost:8081/health | jq .status
 curl -s http://localhost:8081/stats > /tmp/pre-upgrade-stats.json
 
 # Backup database
-sudo -u smtp sqlite3 /var/lib/smtp-server/smtp.db ".backup /var/lib/smtp-server/smtp-backup-$(date +%Y%m%d-%H%M%S).db"
+sudo -u smtp sqlite3 /var/lib/mail/smtp.db ".backup /var/lib/mail/smtp-backup-$(date +%Y%m%d-%H%M%S).db"
 
 # Verify backup
-sudo -u smtp sqlite3 /var/lib/smtp-server/smtp-backup-*.db "PRAGMA integrity_check;"
+sudo -u smtp sqlite3 /var/lib/mail/smtp-backup-*.db "PRAGMA integrity_check;"
 ```
 
 **Time:** 3 minutes
@@ -437,16 +437,16 @@ sudo -u smtp sqlite3 /var/lib/smtp-server/smtp-backup-*.db "PRAGMA integrity_che
 ```bash
 # Fetch new version
 cd /tmp
-git clone https://github.com/yourusername/smtp-server.git smtp-server-new
-cd smtp-server-new
+git clone https://github.com/yourusername/mail.git mail-new
+cd mail-new
 git checkout v0.29.0
 
 # Build
 zig build -Doptimize=ReleaseSafe
 
 # Verify build
-./zig-out/bin/smtp-server --version
-# Expected: SMTP Server v0.29.0
+./zig-out/bin/mail --version
+# Expected: Mail Server v0.29.0
 ```
 
 **Time:** 5 minutes
@@ -457,21 +457,21 @@ zig build -Doptimize=ReleaseSafe
 
 ```bash
 # Stop service
-sudo systemctl stop smtp-server
+sudo systemctl stop mail
 
 # Backup old binary
-sudo cp /opt/smtp-server/smtp-server /opt/smtp-server/smtp-server.v0.28.0
+sudo cp /opt/mail/mail /opt/mail/mail.v0.28.0
 
 # Install new binary
-sudo cp /tmp/smtp-server-new/zig-out/bin/smtp-server /opt/smtp-server/
-sudo chown root:smtp /opt/smtp-server/smtp-server
-sudo chmod 750 /opt/smtp-server/smtp-server
+sudo cp /tmp/mail-new/zig-out/bin/mail /opt/mail/
+sudo chown root:smtp /opt/mail/mail
+sudo chmod 750 /opt/mail/mail
 
 # Validate new version
-/opt/smtp-server/smtp-server --version
+/opt/mail/mail --version
 
 # Test configuration
-sudo -u smtp SMTP_PROFILE=production /opt/smtp-server/smtp-server --validate-only
+sudo -u smtp SMTP_PROFILE=production /opt/mail/mail --validate-only
 ```
 
 **Time:** 2 minutes
@@ -482,10 +482,10 @@ sudo -u smtp SMTP_PROFILE=production /opt/smtp-server/smtp-server --validate-onl
 
 ```bash
 # Start service
-sudo systemctl start smtp-server
+sudo systemctl start mail
 
 # Monitor startup
-sudo journalctl -u smtp-server -f -n 50
+sudo journalctl -u mail -f -n 50
 
 # Wait 30 seconds for warm-up
 sleep 30
@@ -517,10 +517,10 @@ echo "Subject: Post-Upgrade Test
 Upgrade to v0.29.0 successful" | sendmail test@example.com
 
 # Monitor for errors
-sudo journalctl -u smtp-server --since "5 minutes ago" | grep -i error
+sudo journalctl -u mail --since "5 minutes ago" | grep -i error
 
 # Check database migrations
-sudo -u smtp sqlite3 /var/lib/smtp-server/smtp.db "SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 5;"
+sudo -u smtp sqlite3 /var/lib/mail/smtp.db "SELECT version, name FROM schema_migrations ORDER BY version DESC LIMIT 5;"
 ```
 
 **Time:** 3 minutes
@@ -542,26 +542,26 @@ sudo -u smtp sqlite3 /var/lib/smtp-server/smtp.db "SELECT version, name FROM sch
 
 ```bash
 # Step 1: Stop current service
-sudo systemctl stop smtp-server
+sudo systemctl stop mail
 
 # Step 2: Restore old binary
-sudo cp /opt/smtp-server/smtp-server.v0.28.0 /opt/smtp-server/smtp-server
+sudo cp /opt/mail/mail.v0.28.0 /opt/mail/mail
 
 # Step 3: Rollback database (if migrations ran)
-sudo -u smtp cp /var/lib/smtp-server/smtp-backup-*.db /var/lib/smtp-server/smtp.db
+sudo -u smtp cp /var/lib/mail/smtp-backup-*.db /var/lib/mail/smtp.db
 
 # Step 4: Verify configuration
-sudo -u smtp /opt/smtp-server/smtp-server --validate-only
+sudo -u smtp /opt/mail/mail --validate-only
 
 # Step 5: Start service
-sudo systemctl start smtp-server
+sudo systemctl start mail
 
 # Step 6: Verify health
 curl -s http://localhost:8081/health | jq .status
 # Expected: "healthy"
 
 # Step 7: Monitor logs
-sudo journalctl -u smtp-server -f
+sudo journalctl -u mail -f
 ```
 
 **Rollback Time:** ~5 minutes
@@ -574,13 +574,13 @@ sudo journalctl -u smtp-server -f
 
 ```bash
 # Online backup (preferred)
-sudo -u smtp sqlite3 /var/lib/smtp-server/smtp.db ".backup /var/lib/smtp-server/smtp-backup-$(date +%Y%m%d).db"
+sudo -u smtp sqlite3 /var/lib/mail/smtp.db ".backup /var/lib/mail/smtp-backup-$(date +%Y%m%d).db"
 
 # Compress backup
-sudo gzip /var/lib/smtp-server/smtp-backup-*.db
+sudo gzip /var/lib/mail/smtp-backup-*.db
 
 # Copy to remote backup location
-scp /var/lib/smtp-server/smtp-backup-*.db.gz backup-server:/backups/smtp/
+scp /var/lib/mail/smtp-backup-*.db.gz backup-server:/backups/smtp/
 ```
 
 **Frequency:** Daily (automated via cron)
@@ -591,16 +591,16 @@ scp /var/lib/smtp-server/smtp-backup-*.db.gz backup-server:/backups/smtp/
 
 ```bash
 # Stop service
-sudo systemctl stop smtp-server
+sudo systemctl stop mail
 
 # Restore backup
-sudo -u smtp gunzip < /var/lib/smtp-server/smtp-backup-20251024.db.gz > /var/lib/smtp-server/smtp.db
+sudo -u smtp gunzip < /var/lib/mail/smtp-backup-20251024.db.gz > /var/lib/mail/smtp.db
 
 # Verify integrity
-sudo -u smtp sqlite3 /var/lib/smtp-server/smtp.db "PRAGMA integrity_check;"
+sudo -u smtp sqlite3 /var/lib/mail/smtp.db "PRAGMA integrity_check;"
 
 # Start service
-sudo systemctl start smtp-server
+sudo systemctl start mail
 ```
 
 ---
@@ -609,16 +609,16 @@ sudo systemctl start smtp-server
 
 ```bash
 # Vacuum database (monthly)
-sudo -u smtp sqlite3 /var/lib/smtp-server/smtp.db "VACUUM;"
+sudo -u smtp sqlite3 /var/lib/mail/smtp.db "VACUUM;"
 
 # Update statistics
-sudo -u smtp sqlite3 /var/lib/smtp-server/smtp.db "ANALYZE;"
+sudo -u smtp sqlite3 /var/lib/mail/smtp.db "ANALYZE;"
 
 # Check integrity
-sudo -u smtp sqlite3 /var/lib/smtp-server/smtp.db "PRAGMA integrity_check;"
+sudo -u smtp sqlite3 /var/lib/mail/smtp.db "PRAGMA integrity_check;"
 
 # Clean old queue entries
-sudo -u smtp sqlite3 /var/lib/smtp-server/smtp.db "DELETE FROM message_queue WHERE created_at < strftime('%s', 'now', '-30 days');"
+sudo -u smtp sqlite3 /var/lib/mail/smtp.db "DELETE FROM message_queue WHERE created_at < strftime('%s', 'now', '-30 days');"
 ```
 
 ---
@@ -662,19 +662,19 @@ echo "Certificate expires: $EXPIRY"
 
 ```bash
 #!/bin/bash
-# /opt/smtp-server/scripts/backup.sh
+# /opt/mail/scripts/backup.sh
 
-BACKUP_DIR="/var/backups/smtp-server"
+BACKUP_DIR="/var/backups/mail"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 RETENTION_DAYS=30
 
 mkdir -p $BACKUP_DIR
 
 # Backup database
-sudo -u smtp sqlite3 /var/lib/smtp-server/smtp.db ".backup $BACKUP_DIR/smtp-$TIMESTAMP.db"
+sudo -u smtp sqlite3 /var/lib/mail/smtp.db ".backup $BACKUP_DIR/smtp-$TIMESTAMP.db"
 
 # Backup configuration
-sudo cp /etc/smtp-server/config.env $BACKUP_DIR/config-$TIMESTAMP.env
+sudo cp /etc/mail/config.env $BACKUP_DIR/config-$TIMESTAMP.env
 
 # Compress
 gzip $BACKUP_DIR/smtp-$TIMESTAMP.db
@@ -692,7 +692,7 @@ gunzip -t $BACKUP_DIR/smtp-$TIMESTAMP.db.gz && echo "Backup successful"
 **Setup:**
 ```bash
 # Create cron job for daily backups at 2 AM
-echo "0 2 * * * /opt/smtp-server/scripts/backup.sh" | sudo crontab -
+echo "0 2 * * * /opt/mail/scripts/backup.sh" | sudo crontab -
 ```
 
 ---
@@ -704,13 +704,13 @@ echo "0 2 * * * /opt/smtp-server/scripts/backup.sh" | sudo crontab -
 ```yaml
 # /etc/prometheus/prometheus.yml
 scrape_configs:
-  - job_name: 'smtp-server'
+  - job_name: 'mail'
     scrape_interval: 15s
     static_configs:
       - targets: ['localhost:8081']
         labels:
           environment: 'production'
-          service: 'smtp-server'
+          service: 'mail'
 ```
 
 ### Grafana Dashboard
@@ -729,19 +729,19 @@ Import dashboard ID: (create custom dashboard with metrics from `/metrics`)
 ### Alerting Rules (Prometheus)
 
 ```yaml
-# /etc/prometheus/rules/smtp-server.yml
+# /etc/prometheus/rules/mail.yml
 groups:
   - name: smtp_server_alerts
     interval: 30s
     rules:
       - alert: SMTPServerDown
-        expr: up{job="smtp-server"} == 0
+        expr: up{job="mail"} == 0
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: "SMTP Server is down"
-          description: "SMTP server {{ $labels.instance }} has been down for more than 1 minute"
+          summary: "Mail Server is down"
+          description: "Mail Server {{ $labels.instance }} has been down for more than 1 minute"
 
       - alert: HighConnectionUsage
         expr: smtp_connections_active / smtp_max_connections > 0.8
@@ -750,7 +750,7 @@ groups:
           severity: warning
         annotations:
           summary: "High connection usage"
-          description: "SMTP server is using {{ $value }}% of max connections"
+          description: "Mail Server is using {{ $value }}% of max connections"
 
       - alert: HighRejectionRate
         expr: rate(smtp_messages_rejected_total[5m]) > 10
@@ -788,7 +788,7 @@ SMTP_BUFFER_POOL_SIZE=1000
 ### Kernel Tuning (Linux)
 
 ```bash
-# /etc/sysctl.d/99-smtp-server.conf
+# /etc/sysctl.d/99-mail.conf
 # Increase connection limits
 net.core.somaxconn=4096
 net.ipv4.tcp_max_syn_backlog=4096
@@ -798,7 +798,7 @@ net.ipv4.ip_local_port_range=10000 65535
 net.ipv4.tcp_fastopen=3
 
 # Apply settings
-sudo sysctl -p /etc/sysctl.d/99-smtp-server.conf
+sudo sysctl -p /etc/sysctl.d/99-mail.conf
 ```
 
 ---
@@ -820,10 +820,10 @@ sudo sysctl -p /etc/sysctl.d/99-smtp-server.conf
 **Issue: High Memory Usage**
 ```bash
 # Check memory usage
-ps aux | grep smtp-server
+ps aux | grep mail
 
 # Restart service if OOM risk
-sudo systemctl restart smtp-server
+sudo systemctl restart mail
 
 # Adjust configuration
 SMTP_MAX_CONNECTIONS=1000  # Reduce
@@ -833,10 +833,10 @@ SMTP_DATABASE_POOL_SIZE=10  # Reduce
 **Issue: Database Locked**
 ```bash
 # Check for long-running queries
-sudo -u smtp sqlite3 /var/lib/smtp-server/smtp.db "PRAGMA busy_timeout=10000;"
+sudo -u smtp sqlite3 /var/lib/mail/smtp.db "PRAGMA busy_timeout=10000;"
 
 # Restart service
-sudo systemctl restart smtp-server
+sudo systemctl restart mail
 ```
 
 **Issue: Queue Backup**

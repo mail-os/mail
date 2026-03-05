@@ -1,4 +1,4 @@
-# SMTP Server API Reference
+# Mail Server API Reference
 
 **Version:** v0.28.0
 **Date:** 2025-10-24
@@ -159,7 +159,7 @@ smtp_greylist_blocks_total 5
 **Prometheus Configuration:**
 ```yaml
 scrape_configs:
-  - job_name: 'smtp-server'
+  - job_name: 'mail'
     scrape_interval: 15s
     static_configs:
       - targets: ['localhost:8081']

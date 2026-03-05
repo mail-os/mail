@@ -1,4 +1,4 @@
-# SMTP Server Architecture
+# Mail Server Architecture
 
 Comprehensive architecture documentation for the production-grade SMTP server.
 
@@ -461,7 +461,7 @@ Client ──> STARTTLS ──> TLS 1.3 ──> Server
 │           Server (Linux)                │
 │                                         │
 │  ┌──────────────────────────────────┐  │
-│  │     SMTP Server (Port 25)        │  │
+│  │     Mail Server (Port 25)        │  │
 │  │     Submission (Port 587)        │  │
 │  └──────────────────────────────────┘  │
 │                 │                       │
@@ -527,7 +527,7 @@ Client ──> STARTTLS ──> TLS 1.3 ──> Server
 │  │              │               │                      │  │
 │  ▼              ▼               ▼                      │  │
 │  Pod-1         Pod-2          Pod-3                    │  │
-│  smtp-server   smtp-server    smtp-server              │  │
+│  mail   mail    mail              │  │
 │                                                         │  │
 │  ┌─────────────────────────────────────────────────┐   │  │
 │  │          PersistentVolumes                       │   │  │
@@ -673,13 +673,13 @@ Grafana Dashboards
 **Database Recovery:**
 ```bash
 # Stop server
-systemctl stop smtp-server
+systemctl stop mail
 
 # Restore from backup
 sqlite3 smtp.db < backup.sql
 
 # Start server
-systemctl start smtp-server
+systemctl start mail
 ```
 
 **Message Recovery:**
@@ -702,7 +702,7 @@ chmod -R 700 /var/mail/
 **Manual Failover:**
 ```bash
 # Promote replica to primary
-kubectl scale deployment smtp-server --replicas=5
+kubectl scale deployment mail --replicas=5
 
 # Update DNS for manual failover
 # Switch A record to backup IP

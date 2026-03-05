@@ -7,7 +7,7 @@ const std = @import("std");
 ///   zig build-lib examples/plugins/hello_world.zig -dynamic --name hello_world
 ///
 /// Load:
-///   ./smtp-server --plugin-dir ./zig-out/lib
+///   ./mail --plugin-dir ./zig-out/lib
 
 // Plugin state
 var allocator: std.mem.Allocator = undefined;

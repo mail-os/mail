@@ -1,5 +1,5 @@
 #!/bin/bash
-# Cross-platform build script for SMTP server
+# Cross-platform build script for mail server
 # Builds for all supported platforms and architectures
 
 set -e
@@ -62,12 +62,12 @@ build_target() {
         echo -e "${GREEN}✓ Built successfully: $target${NC}"
 
         # Copy to releases directory
-        local binary_name="smtp-server"
+        local binary_name="mail"
         if [[ "$os" == "windows" ]]; then
-            binary_name="smtp-server.exe"
+            binary_name="mail.exe"
         fi
 
-        local output_name="smtp-server-$target"
+        local output_name="mail-$target"
         if [[ "$os" == "windows" ]]; then
             output_name="$output_name.exe"
         fi
@@ -126,7 +126,7 @@ if [ "$SUCCESS" -gt 0 ]; then
     echo -e "${GREEN}Creating release archive...${NC}"
 
     VERSION=$(grep 'version' build.zig.zon | cut -d'"' -f2 || echo "latest")
-    ARCHIVE_NAME="smtp-server-$VERSION-all-platforms.tar.gz"
+    ARCHIVE_NAME="mail-$VERSION-all-platforms.tar.gz"
 
     tar -czf "$OUTPUT_DIR/$ARCHIVE_NAME" -C "$OUTPUT_DIR" \
         --exclude="*.tar.gz" \
@@ -137,7 +137,7 @@ if [ "$SUCCESS" -gt 0 ]; then
     # List all binaries
     echo ""
     echo -e "${GREEN}Built binaries:${NC}"
-    ls -lh "$OUTPUT_DIR" | grep smtp-server | grep -v sha256 | grep -v tar.gz
+    ls -lh "$OUTPUT_DIR" | grep mail | grep -v sha256 | grep -v tar.gz
 fi
 
 echo ""

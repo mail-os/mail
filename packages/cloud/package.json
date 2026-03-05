@@ -1,0 +1,50 @@
+{
+  "name": "mail-cloud",
+  "type": "module",
+  "version": "0.1.0",
+  "description": "AWS Infrastructure for Mail Server using ts-cloud",
+  "author": "Chris Breuer",
+  "license": "MIT",
+  "scripts": {
+    "build": "bun --bun build.ts",
+    "test": "bun test",
+    "cloud": "bun run ./node_modules/ts-cloud/bin/cli.ts",
+    "generate": "bun run ./node_modules/ts-cloud/bin/cli.ts generate",
+    "generate:dev": "bun run ./node_modules/ts-cloud/bin/cli.ts generate --env dev",
+    "generate:staging": "bun run ./node_modules/ts-cloud/bin/cli.ts generate --env staging",
+    "generate:prod": "bun run ./node_modules/ts-cloud/bin/cli.ts generate --env production",
+    "diff": "bun run ./node_modules/ts-cloud/bin/cli.ts diff",
+    "diff:dev": "bun run ./node_modules/ts-cloud/bin/cli.ts diff --env dev",
+    "diff:staging": "bun run ./node_modules/ts-cloud/bin/cli.ts diff --env staging",
+    "diff:prod": "bun run ./node_modules/ts-cloud/bin/cli.ts diff --env production",
+    "deploy": "bun run ./node_modules/ts-cloud/bin/cli.ts deploy",
+    "deploy:dev": "bun run ./node_modules/ts-cloud/bin/cli.ts deploy --env dev",
+    "deploy:staging": "bun run ./node_modules/ts-cloud/bin/cli.ts deploy --env staging",
+    "deploy:prod": "bun run ./node_modules/ts-cloud/bin/cli.ts deploy --env production",
+    "destroy": "bun run ./node_modules/ts-cloud/bin/cli.ts stack:delete smtp-server-production",
+    "destroy:dev": "bun run ./node_modules/ts-cloud/bin/cli.ts stack:delete smtp-server-dev",
+    "destroy:staging": "bun run ./node_modules/ts-cloud/bin/cli.ts stack:delete smtp-server-staging",
+    "destroy:prod": "bun run ./node_modules/ts-cloud/bin/cli.ts stack:delete smtp-server-production",
+    "status": "bun run ./node_modules/ts-cloud/bin/cli.ts deploy:status",
+    "status:dev": "bun run ./node_modules/ts-cloud/bin/cli.ts deploy:status --env dev",
+    "status:staging": "bun run ./node_modules/ts-cloud/bin/cli.ts deploy:status --env staging",
+    "status:prod": "bun run ./node_modules/ts-cloud/bin/cli.ts deploy:status --env production",
+    "stacks": "bun run ./node_modules/ts-cloud/bin/cli.ts stack:list",
+    "doctor": "bun run ./node_modules/ts-cloud/bin/cli.ts doctor",
+    "typecheck": "bun --bun tsc --noEmit"
+  },
+  "keywords": [
+    "ts-cloud",
+    "aws",
+    "mail-server",
+    "infrastructure",
+    "cloudformation"
+  ],
+  "dependencies": {
+    "ts-cloud": "link:ts-cloud"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.9.3"
+  }
+}

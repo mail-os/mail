@@ -360,14 +360,14 @@ sudo chmod +x /etc/letsencrypt/renewal-hooks/post/reload-nginx.sh
 
 ---
 
-## SMTP Server Configuration
+## Mail Server Configuration
 
 Configure the SMTP server to listen on a non-privileged port:
 
 ### Environment Variables
 
 ```bash
-# .env or /etc/smtp-server/config
+# .env or /etc/mail/config
 SMTP_HOST=127.0.0.1
 SMTP_PORT=2525
 SMTP_ENABLE_TLS=false   # Disable native TLS (proxy handles it)
@@ -377,18 +377,18 @@ SMTP_ENABLE_AUTH=true   # Keep authentication enabled
 ### systemd Service
 
 ```ini
-# /etc/systemd/system/smtp-server.service
+# /etc/systemd/system/mail.service
 [Unit]
-Description=SMTP Server (Behind TLS Proxy)
+Description=Mail Server (Behind TLS Proxy)
 After=network.target
 
 [Service]
 Type=simple
 User=smtp
 Group=smtp
-WorkingDirectory=/opt/smtp-server
-EnvironmentFile=/etc/smtp-server/config
-ExecStart=/opt/smtp-server/smtp-server
+WorkingDirectory=/opt/mail
+EnvironmentFile=/etc/mail/config
+ExecStart=/opt/mail/mail
 Restart=always
 RestartSec=5
 
@@ -397,7 +397,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/smtp-server
+ReadWritePaths=/var/lib/mail
 
 [Install]
 WantedBy=multi-user.target
@@ -407,23 +407,23 @@ WantedBy=multi-user.target
 
 ## Load Balancing Setup
 
-### Multiple SMTP Server Instances
+### Multiple Mail Server Instances
 
 Run multiple instances on different ports:
 
 **Instance 1:**
 ```bash
-SMTP_PORT=2525 ./smtp-server
+SMTP_PORT=2525 ./mail
 ```
 
 **Instance 2:**
 ```bash
-SMTP_PORT=2526 ./smtp-server
+SMTP_PORT=2526 ./mail
 ```
 
 **Instance 3:**
 ```bash
-SMTP_PORT=2527 ./smtp-server
+SMTP_PORT=2527 ./mail
 ```
 
 ### nginx Load Balancing
@@ -496,7 +496,7 @@ tail -f /var/log/haproxy.log
 **Symptom:** `connect() failed (111: Connection refused)`
 
 **Solution:**
-- Ensure SMTP server is running: `systemctl status smtp-server`
+- Ensure SMTP server is running: `systemctl status mail`
 - Check if listening on correct port: `netstat -tuln | grep 2525`
 - Verify firewall rules
 

@@ -400,12 +400,12 @@ jobs:
 set -e
 
 # Build fuzz targets
-zig build-exe $SRC/smtp-server/tests/fuzz_smtp_protocol.zig \
+zig build-exe $SRC/mail/tests/fuzz_smtp_protocol.zig \
   -fsanitize=fuzzer \
   -fsanitize=address \
   --name fuzz_smtp_protocol
 
-zig build-exe $SRC/smtp-server/tests/fuzz_mime_parser.zig \
+zig build-exe $SRC/mail/tests/fuzz_mime_parser.zig \
   -fsanitize=fuzzer \
   -fsanitize=address \
   --name fuzz_mime_parser

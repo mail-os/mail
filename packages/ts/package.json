@@ -1,0 +1,43 @@
+{
+  "name": "ts-mail",
+  "type": "module",
+  "version": "0.28.0",
+  "description": "A high-performance SMTP server powered by Zig",
+  "author": "Chris Breuer",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "bun": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./*": {
+      "bun": "./src/*",
+      "import": "./dist/*"
+    }
+  },
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "README.md",
+    "dist",
+    "src",
+    "bin"
+  ],
+  "scripts": {
+    "build": "bun build.ts",
+    "build:linux-x64": "bun build.ts --target x86_64-linux-gnu",
+    "build:linux-arm64": "bun build.ts --target aarch64-linux-gnu",
+    "build:all": "bun build.ts --all",
+    "prepublishOnly": "bun run build:all"
+  },
+  "keywords": [
+    "smtp",
+    "mail",
+    "email",
+    "server",
+    "zig",
+    "imap",
+    "pop3"
+  ]
+}

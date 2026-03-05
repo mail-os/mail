@@ -60,8 +60,8 @@ curl http://localhost:9090/metrics
 curl http://localhost:8080/stats | jq
 
 # System resources
-top -b -n 1 | grep smtp-server
-ps aux | grep smtp-server | awk '{print "CPU: "$3"% MEM: "$4"%"}'
+top -b -n 1 | grep mail
+ps aux | grep mail | awk '{print "CPU: "$3"% MEM: "$4"%"}'
 
 # Network connections
 ss -s
@@ -205,7 +205,7 @@ root hard nofile 65536
 
 ### Systemd Service Limits
 
-Create `/etc/systemd/system/smtp-server.service.d/limits.conf`:
+Create `/etc/systemd/system/mail.service.d/limits.conf`:
 
 ```ini
 [Service]
@@ -233,7 +233,7 @@ Apply:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl restart smtp-server
+sudo systemctl restart mail
 ```
 
 ### Huge Pages
@@ -780,13 +780,13 @@ Pin SMTP server to specific CPU cores:
 
 ```bash
 # Via systemd
-sudo systemctl edit smtp-server
+sudo systemctl edit mail
 # Add:
 [Service]
 CPUAffinity=0-7  # Use cores 0-7
 
 # Or via taskset
-sudo taskset -cp 0-7 $(pgrep smtp-server)
+sudo taskset -cp 0-7 $(pgrep mail)
 ```
 
 ### CPU Governor
@@ -813,30 +813,30 @@ For multi-socket systems:
 numactl --hardware
 
 # Run SMTP server on specific NUMA node
-numactl --cpunodebind=0 --membind=0 /usr/local/bin/smtp-server
+numactl --cpunodebind=0 --membind=0 /usr/local/bin/mail
 
 # Or via systemd
-sudo systemctl edit smtp-server
+sudo systemctl edit mail
 # Add:
 [Service]
 ExecStart=
-ExecStart=/usr/bin/numactl --cpunodebind=0 --membind=0 /usr/local/bin/smtp-server
+ExecStart=/usr/bin/numactl --cpunodebind=0 --membind=0 /usr/local/bin/mail
 ```
 
 ### Process Priority
 
 ```bash
 # Set nice value (lower = higher priority)
-sudo renice -n -10 -p $(pgrep smtp-server)
+sudo renice -n -10 -p $(pgrep mail)
 
 # Or via systemd
-sudo systemctl edit smtp-server
+sudo systemctl edit mail
 # Add:
 [Service]
 Nice=-10
 
 # Set I/O priority
-sudo ionice -c 1 -n 0 -p $(pgrep smtp-server)
+sudo ionice -c 1 -n 0 -p $(pgrep mail)
 
 # Or via systemd
 [Service]
@@ -1105,7 +1105,7 @@ Import or create dashboard with panels for:
 
 ```bash
 # Profile for 60 seconds
-sudo perf record -F 99 -p $(pgrep smtp-server) -g -- sleep 60
+sudo perf record -F 99 -p $(pgrep mail) -g -- sleep 60
 
 # Generate report
 sudo perf report
@@ -1120,7 +1120,7 @@ sudo perf script | ~/FlameGraph/stackcollapse-perf.pl | ~/FlameGraph/flamegraph.
 # Profile with callgrind
 valgrind --tool=callgrind \
   --callgrind-out-file=callgrind.out \
-  /usr/local/bin/smtp-server
+  /usr/local/bin/mail
 
 # Visualize with kcachegrind
 kcachegrind callgrind.out
@@ -1134,7 +1134,7 @@ kcachegrind callgrind.out
 # Profile memory usage
 valgrind --tool=massif \
   --massif-out-file=massif.out \
-  /usr/local/bin/smtp-server
+  /usr/local/bin/mail
 
 # Visualize
 ms_print massif.out
@@ -1144,10 +1144,10 @@ ms_print massif.out
 
 ```bash
 # Profile heap allocations
-heaptrack /usr/local/bin/smtp-server
+heaptrack /usr/local/bin/mail
 
 # Analyze
-heaptrack_gui heaptrack.smtp-server.*.gz
+heaptrack_gui heaptrack.mail.*.gz
 ```
 
 ### I/O Profiling
@@ -1168,7 +1168,7 @@ iostat -xz 5
 
 ```bash
 # Monitor I/O by process
-sudo iotop -o -p $(pgrep smtp-server)
+sudo iotop -o -p $(pgrep mail)
 ```
 
 **blktrace:**
@@ -1192,12 +1192,12 @@ Run built-in benchmark suite:
 zig build -Doptimize=ReleaseFast
 
 # Run benchmarks
-./zig-out/bin/smtp-server --benchmark
+./zig-out/bin/mail --benchmark
 
 # Specific benchmarks
-./zig-out/bin/smtp-server --benchmark=email_validation
-./zig-out/bin/smtp-server --benchmark=base64_encoding
-./zig-out/bin/smtp-server --benchmark=smtp_parsing
+./zig-out/bin/mail --benchmark=email_validation
+./zig-out/bin/mail --benchmark=base64_encoding
+./zig-out/bin/mail --benchmark=smtp_parsing
 ```
 
 ### Load Testing
@@ -1503,5 +1503,5 @@ print(f'Improvement: {improvement:.2f}%')
 - [API Documentation](./API.md) - Metrics API reference
 
 For performance-related questions:
-- GitHub Issues: https://github.com/yourusername/smtp-server/issues
+- GitHub Issues: https://github.com/yourusername/mail/issues
 - Discussion Forum: https://community.example.com/performance

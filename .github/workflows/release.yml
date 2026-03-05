@@ -42,15 +42,15 @@ jobs:
     - name: Package binary
       run: |
         mkdir -p release
-        # Find and copy the smtp-server binary (may be in target-specific dir)
-        find zig-out/bin -name 'smtp-server*' -type f -executable | head -1 | xargs -I {} cp {} release/smtp-server-${{ matrix.artifact }}
-        tar -czf smtp-server-${{ matrix.artifact }}.tar.gz -C release smtp-server-${{ matrix.artifact }}
+        # Find and copy the mail binary (may be in target-specific dir)
+        find zig-out/bin -name 'mail*' -type f -executable | head -1 | xargs -I {} cp {} release/mail-${{ matrix.artifact }}
+        tar -czf mail-${{ matrix.artifact }}.tar.gz -C release mail-${{ matrix.artifact }}
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: smtp-server-${{ matrix.target }}
-        path: smtp-server-${{ matrix.target }}.tar.gz
+        name: mail-${{ matrix.target }}
+        path: mail-${{ matrix.target }}.tar.gz
 
   docker:
     name: Build and Push Docker Image
@@ -80,8 +80,8 @@ jobs:
         context: .
         push: true
         tags: |
-          ${{ secrets.DOCKER_USERNAME }}/smtp-server:latest
-          ${{ secrets.DOCKER_USERNAME }}/smtp-server:${{ steps.version.outputs.VERSION }}
+          ${{ secrets.DOCKER_USERNAME }}/mail:latest
+          ${{ secrets.DOCKER_USERNAME }}/mail:${{ steps.version.outputs.VERSION }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
@@ -123,16 +123,16 @@ jobs:
       uses: softprops/action-gh-release@v1
       with:
         files: |
-          smtp-server-x86_64-linux/smtp-server-x86_64-linux.tar.gz
-          smtp-server-aarch64-linux/smtp-server-aarch64-linux.tar.gz
-          smtp-server-x86_64-macos/smtp-server-x86_64-macos.tar.gz
-          smtp-server-aarch64-macos/smtp-server-aarch64-macos.tar.gz
+          mail-x86_64-linux/mail-x86_64-linux.tar.gz
+          mail-aarch64-linux/mail-aarch64-linux.tar.gz
+          mail-x86_64-macos/mail-x86_64-macos.tar.gz
+          mail-aarch64-macos/mail-aarch64-macos.tar.gz
         body: |
           ${{ steps.changelog.outputs.RELEASE_NOTES }}
 
           ## Release Info
           - Version: ${{ steps.version.outputs.VERSION }}
-          - Docker Image: `${{ secrets.DOCKER_USERNAME }}/smtp-server:${{ steps.version.outputs.VERSION }}`
+          - Docker Image: `${{ secrets.DOCKER_USERNAME }}/mail:${{ steps.version.outputs.VERSION }}`
 
           ## Installation
 
@@ -140,7 +140,7 @@ jobs:
 
           ### Docker
           ```bash
-          docker pull ${{ secrets.DOCKER_USERNAME }}/smtp-server:${{ steps.version.outputs.VERSION }}
+          docker pull ${{ secrets.DOCKER_USERNAME }}/mail:${{ steps.version.outputs.VERSION }}
           ```
 
           🦎 This release was created using [zig-bump](https://github.com/stacksjs/zig-bump)

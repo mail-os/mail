@@ -81,7 +81,7 @@ Plugins can register for these hooks:
 
 ```zig
 const std = @import("std");
-const plugin = @import("smtp-server").plugin;
+const plugin = @import("mail").plugin;
 
 var allocator: std.mem.Allocator = undefined;
 var spam_threshold: f64 = 5.0;
@@ -551,7 +551,7 @@ test "spam detection" {
 
 ```bash
 # Load plugin in test mode
-./smtp-server --plugin-dir ./plugins --test-mode
+./mail --plugin-dir ./plugins --test-mode
 
 # Send test message
 echo "Test message" | nc localhost 2525
@@ -565,7 +565,7 @@ echo "Test message" | nc localhost 2525
 
 ```bash
 export SMTP_PLUGIN_DEBUG=1
-./smtp-server
+./mail
 ```
 
 ### Use GDB/LLDB
@@ -575,7 +575,7 @@ export SMTP_PLUGIN_DEBUG=1
 zig build-lib plugins/spam_filter.zig -dynamic -g
 
 # Debug with GDB
-gdb --args ./smtp-server --plugin-dir ./plugins
+gdb --args ./mail --plugin-dir ./plugins
 (gdb) break smtp_plugin_execute_hook
 (gdb) run
 ```
@@ -590,7 +590,7 @@ zig build-lib plugins/spam_filter.zig \
   -fsanitize=undefined
 
 # Run with leak detection
-ASAN_OPTIONS=detect_leaks=1 ./smtp-server
+ASAN_OPTIONS=detect_leaks=1 ./mail
 ```
 
 ---

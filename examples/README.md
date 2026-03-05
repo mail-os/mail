@@ -1,4 +1,4 @@
-# SMTP Server - Examples & Developer Tools
+# Mail Server - Examples & Developer Tools
 
 Welcome to the examples directory! This folder contains beautiful, production-ready web interfaces for developing, testing, and using your SMTP server.
 
@@ -204,7 +204,7 @@ Example plugin implementation:
 zig build-lib examples/plugins/hello_world.zig -dynamic --name hello_world
 
 # Load in server
-./smtp-server --plugin-dir ./zig-out/lib
+./mail --plugin-dir ./zig-out/lib
 ```
 
 ---
@@ -377,7 +377,7 @@ Found a bug or have a feature request?
 
 ## 📝 License
 
-Same as the main SMTP server project.
+Same as the main Mail Server project.
 
 ---
 

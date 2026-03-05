@@ -24,21 +24,21 @@
   },
   "scripts": {
     // Build & Run
-    "build": "zig build -Doptimize=ReleaseFast",
-    "build:debug": "zig build",
-    "build:all": "zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu && zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu && zig build -Doptimize=ReleaseFast -Dtarget=x86_64-macos && zig build -Doptimize=ReleaseFast -Dtarget=aarch64-macos",
-    "dev": "zig build run -- serve",
-    "cross": "zig build -Dall-targets=true -Doptimize=ReleaseFast",
+    "build": "cd packages/zig && zig build -Doptimize=ReleaseFast",
+    "build:debug": "cd packages/zig && zig build",
+    "build:all": "cd packages/zig && zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu && zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu && zig build -Doptimize=ReleaseFast -Dtarget=x86_64-macos && zig build -Doptimize=ReleaseFast -Dtarget=aarch64-macos",
+    "dev": "cd packages/zig && zig build run -- serve",
+    "cross": "cd packages/zig && zig build -Dall-targets=true -Doptimize=ReleaseFast",
 
     // Package all binaries into tarballs
-    "package:all": "mkdir -p dist && tar -czvf dist/mail-x86_64-linux.tar.gz -C zig-out/bin/x86_64-linux mail-x86_64-linux && tar -czvf dist/mail-aarch64-linux.tar.gz -C zig-out/bin/aarch64-linux mail-aarch64-linux && tar -czvf dist/mail-x86_64-macos.tar.gz -C zig-out/bin/x86_64-macos mail-x86_64-macos && tar -czvf dist/mail-aarch64-macos.tar.gz -C zig-out/bin/aarch64-macos mail-aarch64-macos",
+    "package:all": "mkdir -p dist && tar -czvf dist/mail-x86_64-linux.tar.gz -C packages/zig/zig-out/bin/x86_64-linux mail-x86_64-linux && tar -czvf dist/mail-aarch64-linux.tar.gz -C packages/zig/zig-out/bin/aarch64-linux mail-aarch64-linux && tar -czvf dist/mail-x86_64-macos.tar.gz -C packages/zig/zig-out/bin/x86_64-macos mail-x86_64-macos && tar -czvf dist/mail-aarch64-macos.tar.gz -C packages/zig/zig-out/bin/aarch64-macos mail-aarch64-macos",
 
     // Testing
-    "test": "zig build test",
+    "test": "cd packages/zig && zig build test",
 
     // Formatting
-    "fmt": "zig fmt src/",
-    "fmt:check": "zig fmt --check src/",
+    "fmt": "cd packages/zig && zig fmt src/",
+    "fmt:check": "cd packages/zig && zig fmt --check src/",
 
     // Version bumping with zig-bump
     "release": "bump patch --all",
@@ -50,7 +50,16 @@
     "docker:build": "docker build -t mail:latest .",
     "docker:run": "docker run -p 2525:2525 -p 2465:2465 mail:latest",
 
+    // Cloud / Deploy
+    "deploy": "cd packages/cloud && pantry run deploy",
+    "deploy:dev": "cd packages/cloud && pantry run deploy:dev",
+    "deploy:staging": "cd packages/cloud && pantry run deploy:staging",
+    "deploy:prod": "cd packages/cloud && pantry run deploy:prod",
+    "cloud:status": "cd packages/cloud && pantry run status",
+    "cloud:diff": "cd packages/cloud && pantry run diff",
+
     // Clean
-    "clean": "rm -rf zig-cache zig-out .zig-cache"
-  }
+    "clean": "rm -rf zig-cache zig-out .zig-cache packages/zig/zig-cache packages/zig/zig-out packages/zig/.zig-cache"
+  },
+  "workspaces": ["packages/*"]
 }

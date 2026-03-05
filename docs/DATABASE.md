@@ -205,17 +205,17 @@ pub const migrations = [_]Migration{
 sqlite3 smtp.db ".backup smtp_backup_$(date +%Y%m%d).db"
 
 # Or simple file copy (requires server stop)
-systemctl stop smtp-server
+systemctl stop mail
 cp smtp.db smtp_backup_$(date +%Y%m%d).db
-systemctl start smtp-server
+systemctl start mail
 ```
 
 ### Restore
 
 ```bash
-systemctl stop smtp-server
+systemctl stop mail
 cp smtp_backup_20231024.db smtp.db
-systemctl start smtp-server
+systemctl start mail
 ```
 
 ### Vacuum

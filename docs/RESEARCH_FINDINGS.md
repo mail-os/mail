@@ -977,7 +977,7 @@ others       → Queue 4
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: smtp-server
+  name: mail
 spec:
   replicas: 6
   strategy:
@@ -988,8 +988,8 @@ spec:
   template:
     spec:
       containers:
-      - name: smtp-server
-        image: smtp-server:v2.0.0
+      - name: mail
+        image: mail:v2.0.0
         readinessProbe:
           httpGet:
             path: /health
@@ -1021,8 +1021,8 @@ spec:
 
 **Architecture:**
 ```
-Production (Blue):     smtp-server:v1.0.0
-Staging (Green):       smtp-server:v2.0.0
+Production (Blue):     mail:v1.0.0
+Staging (Green):       mail:v2.0.0
 
 Step 1: Deploy v2.0.0 to Green environment
 Step 2: Test Green thoroughly
@@ -1037,54 +1037,54 @@ Step 5: Keep Blue running for instant rollback
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: smtp-server-blue
+  name: mail-blue
 spec:
   replicas: 3
   selector:
     matchLabels:
-      app: smtp-server
+      app: mail
       version: blue
   template:
     metadata:
       labels:
-        app: smtp-server
+        app: mail
         version: blue
     spec:
       containers:
-      - name: smtp-server
-        image: smtp-server:v1.0.0
+      - name: mail
+        image: mail:v1.0.0
 
 ---
 # Green deployment (new version)
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: smtp-server-green
+  name: mail-green
 spec:
   replicas: 3
   selector:
     matchLabels:
-      app: smtp-server
+      app: mail
       version: green
   template:
     metadata:
       labels:
-        app: smtp-server
+        app: mail
         version: green
     spec:
       containers:
-      - name: smtp-server
-        image: smtp-server:v2.0.0
+      - name: mail
+        image: mail:v2.0.0
 
 ---
 # Service that switches between blue and green
 apiVersion: v1
 kind: Service
 metadata:
-  name: smtp-server
+  name: mail
 spec:
   selector:
-    app: smtp-server
+    app: mail
     version: blue  # Change to "green" to switch
   ports:
   - port: 25
@@ -1130,10 +1130,10 @@ Phase 4:  100% traffic → Canary
 apiVersion: networking.istio.io/v1beta1
 kind: VirtualService
 metadata:
-  name: smtp-server
+  name: mail
 spec:
   hosts:
-  - smtp-server
+  - mail
   http:
   - match:
     - headers:
@@ -1141,15 +1141,15 @@ spec:
           exact: "true"
     route:
     - destination:
-        host: smtp-server
+        host: mail
         subset: canary
   - route:
     - destination:
-        host: smtp-server
+        host: mail
         subset: stable
       weight: 95
     - destination:
-        host: smtp-server
+        host: mail
         subset: canary
       weight: 5
 ```
@@ -1576,7 +1576,7 @@ Priority: LOW
 
 ### 7.2 Current Implementation Status
 
-**Our SMTP Server (v0.25.0) Already Has:**
+**Our Mail Server (v0.25.0) Already Has:**
 
 ✅ **Security (100% Complete)**
 - SPF validation (RFC 7208)

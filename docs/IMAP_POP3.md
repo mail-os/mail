@@ -5,7 +5,7 @@
 
 ## Overview
 
-The SMTP server now includes built-in IMAP4rev1 and POP3 support for complete mail retrieval functionality. Users can send mail via SMTP and retrieve it using either IMAP or POP3 clients.
+The Mail Server now includes built-in IMAP4rev1 and POP3 support for complete mail retrieval functionality. Users can send mail via SMTP and retrieve it using either IMAP or POP3 clients.
 
 ## Features
 
@@ -130,7 +130,7 @@ pop3_thread.join();
 telnet localhost 143
 
 # Server responds:
-* OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN] SMTP Server IMAP4rev1 ready
+* OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN] Mail Server IMAP4rev1 ready
 
 # Login
 A001 LOGIN username password

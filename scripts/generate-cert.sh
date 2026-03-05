@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Certificate Generation Script for SMTP Server TLS Testing
+# Certificate Generation Script for Mail Server TLS Testing
 # Generates self-signed certificates for development/testing only
 # DO NOT USE IN PRODUCTION - use proper CA-signed certificates
 
@@ -10,9 +10,9 @@ CERT_DIR="${CERT_DIR:-./certs}"
 CERT_FILE="${CERT_FILE:-$CERT_DIR/cert.pem}"
 KEY_FILE="${KEY_FILE:-$CERT_DIR/key.pem}"
 DAYS="${DAYS:-365}"
-SUBJECT="${SUBJECT:-/CN=localhost/O=SMTP Server/C=US}"
+SUBJECT="${SUBJECT:-/CN=localhost/O=Mail Server/C=US}"
 
-echo "=== SMTP Server Certificate Generator ==="
+echo "=== Mail Server Certificate Generator ==="
 echo ""
 echo "This script generates self-signed certificates for testing only."
 echo "DO NOT USE THESE CERTIFICATES IN PRODUCTION!"
@@ -57,16 +57,16 @@ echo "Certificate details:"
 openssl x509 -in "$CERT_FILE" -noout -text | grep -A2 "Subject:"
 openssl x509 -in "$CERT_FILE" -noout -text | grep -A1 "Validity"
 echo ""
-echo "To use these certificates with the SMTP server:"
+echo "To use these certificates with the mail server:"
 echo ""
 echo "  export SMTP_ENABLE_TLS=true"
 echo "  export SMTP_TLS_CERT=$CERT_FILE"
 echo "  export SMTP_TLS_KEY=$KEY_FILE"
-echo "  ./zig-out/bin/smtp-server"
+echo "  ./zig-out/bin/mail"
 echo ""
 echo "Or via command line:"
 echo ""
-echo "  ./zig-out/bin/smtp-server --enable-tls --tls-cert $CERT_FILE --tls-key $KEY_FILE"
+echo "  ./zig-out/bin/mail --enable-tls --tls-cert $CERT_FILE --tls-key $KEY_FILE"
 echo ""
 echo "Test with OpenSSL:"
 echo ""

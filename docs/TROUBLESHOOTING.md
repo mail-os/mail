@@ -29,21 +29,21 @@ Comprehensive troubleshooting guide for diagnosing and resolving common issues w
 
 ```bash
 # Systemd
-sudo systemctl status smtp-server
+sudo systemctl status mail
 
 # View recent logs
-sudo journalctl -u smtp-server -n 100 --no-pager
+sudo journalctl -u mail -n 100 --no-pager
 
 # Follow logs in real-time
-sudo journalctl -u smtp-server -f
+sudo journalctl -u mail -f
 
 # Docker
-docker ps | grep smtp-server
-docker logs smtp-server
+docker ps | grep mail
+docker logs mail
 
 # Kubernetes
 kubectl get pods -n smtp-system
-kubectl logs -l app=smtp-server -n smtp-system --tail=100
+kubectl logs -l app=mail -n smtp-system --tail=100
 ```
 
 ### 2. Verify Configuration
@@ -82,9 +82,9 @@ curl http://localhost:8080/health
 ### 4. Review Logs
 
 **Log Locations:**
-- Systemd: `journalctl -u smtp-server`
+- Systemd: `journalctl -u mail`
 - File: `/var/lib/smtp/logs/smtp.log`
-- Docker: `docker logs smtp-server`
+- Docker: `docker logs mail`
 - Kubernetes: `kubectl logs <pod-name> -n smtp-system`
 
 **Common Log Patterns:**
@@ -134,7 +134,7 @@ sudo systemctl disable postfix
 # Edit /etc/smtp/smtp.env
 SMTP_PORT=2525
 
-sudo systemctl restart smtp-server
+sudo systemctl restart mail
 ```
 
 ### Issue: Permission Denied on Port 25
@@ -153,10 +153,10 @@ Ports below 1024 require root privileges or special capabilities.
 **Option 1: Use systemd socket activation** (Recommended)
 ```bash
 # Create socket unit
-sudo tee /etc/systemd/system/smtp-server.socket << 'EOF'
+sudo tee /etc/systemd/system/mail.socket << 'EOF'
 [Unit]
-Description=SMTP Server Socket
-Before=smtp-server.service
+Description=Mail Server Socket
+Before=mail.service
 
 [Socket]
 ListenStream=25
@@ -169,17 +169,17 @@ WantedBy=sockets.target
 EOF
 
 # Update service to use socket
-sudo systemctl enable smtp-server.socket
-sudo systemctl start smtp-server.socket
+sudo systemctl enable mail.socket
+sudo systemctl start mail.socket
 ```
 
 **Option 2: Grant CAP_NET_BIND_SERVICE capability**
 ```bash
-sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/smtp-server
+sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/mail
 
 # Verify
-getcap /usr/local/bin/smtp-server
-# Expected: /usr/local/bin/smtp-server cap_net_bind_service=ep
+getcap /usr/local/bin/mail
+# Expected: /usr/local/bin/mail cap_net_bind_service=ep
 ```
 
 **Option 3: Use port forwarding**
@@ -208,7 +208,7 @@ sudo apt-get install -y libsqlite3-0 libssl3
 sudo dnf install -y sqlite-libs openssl-libs
 
 # Verify installation
-ldd /usr/local/bin/smtp-server
+ldd /usr/local/bin/mail
 ```
 
 ### Issue: Configuration File Not Found
@@ -230,7 +230,7 @@ sudo chown smtp:smtp /etc/smtp/smtp.env
 sudo chmod 600 /etc/smtp/smtp.env
 
 # Verify systemd EnvironmentFile path
-grep EnvironmentFile /etc/systemd/system/smtp-server.service
+grep EnvironmentFile /etc/systemd/system/mail.service
 ```
 
 ### Issue: Database Initialization Failed
@@ -268,7 +268,7 @@ ls -la /var/lib/smtp/smtp.db
 **Diagnosis:**
 ```bash
 # Check if service is running
-sudo systemctl status smtp-server
+sudo systemctl status mail
 
 # Check if port is listening
 sudo ss -tlnp | grep :25
@@ -281,7 +281,7 @@ sudo ufw status | grep 25
 **Solution:**
 ```bash
 # Start service if stopped
-sudo systemctl start smtp-server
+sudo systemctl start mail
 
 # Open firewall ports
 sudo ufw allow 25/tcp
@@ -329,7 +329,7 @@ MAX_CONNECTIONS=2000
 # Ensure inbound rules allow ports 25, 587, 465
 
 # Restart service
-sudo systemctl restart smtp-server
+sudo systemctl restart mail
 ```
 
 ### Issue: Too Many Connections
@@ -366,14 +366,14 @@ smtp hard nofile 65536
 EOF
 
 # Increase systemd service limits
-sudo mkdir -p /etc/systemd/system/smtp-server.service.d
-sudo tee /etc/systemd/system/smtp-server.service.d/limits.conf << 'EOF'
+sudo mkdir -p /etc/systemd/system/mail.service.d
+sudo tee /etc/systemd/system/mail.service.d/limits.conf << 'EOF'
 [Service]
 LimitNOFILE=65536
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl restart smtp-server
+sudo systemctl restart mail
 ```
 
 ### Issue: Connection Drops During Transfer
@@ -393,7 +393,7 @@ free -h
 df -h
 
 # Review logs for errors
-journalctl -u smtp-server | grep -i "timeout\|disconnect"
+journalctl -u mail | grep -i "timeout\|disconnect"
 ```
 
 **Solution:**
@@ -477,7 +477,7 @@ telnet localhost 587
 # Edit /etc/smtp/smtp.env
 SMTP_ENABLE_AUTH=true
 
-sudo systemctl restart smtp-server
+sudo systemctl restart mail
 
 # Verify AUTH is advertised
 echo "EHLO test.example.com" | nc localhost 587
@@ -531,7 +531,7 @@ Connection timeout during AUTH
 grep -E "time_cost|memory_cost|parallelism" src/auth.zig
 
 # Monitor authentication time
-journalctl -u smtp-server | grep "Authentication" | tail -20
+journalctl -u mail | grep "Authentication" | tail -20
 ```
 
 **Solution:**
@@ -654,7 +654,7 @@ RELAY_ALLOWED_DOMAINS=example.com,example.net
 # Or configure relay by IP
 RELAY_ALLOWED_IPS=10.0.0.0/8,192.168.0.0/16
 
-sudo systemctl restart smtp-server
+sudo systemctl restart mail
 ```
 
 ### Issue: Messages Delayed
@@ -685,7 +685,7 @@ GREYLIST_DELAY=60  # 1 minute instead of default 5
 sudo sqlite3 /var/lib/smtp/smtp.db \
   "INSERT INTO greylist_whitelist (ip) VALUES ('203.0.113.0/24');"
 
-sudo systemctl restart smtp-server
+sudo systemctl restart mail
 ```
 
 ---
@@ -796,7 +796,7 @@ sudo openssl req -x509 -newkey rsa:4096 -nodes \
 sudo chown smtp:smtp /etc/smtp/certs/server.{crt,key}
 sudo chmod 600 /etc/smtp/certs/server.key
 
-sudo systemctl restart smtp-server
+sudo systemctl restart mail
 ```
 
 ### Issue: Cipher Mismatch
@@ -845,14 +845,14 @@ ssl-default-bind-options no-sslv3 no-tlsv10 no-tlsv11
 **Diagnosis:**
 ```bash
 # Check CPU usage
-top -b -n 1 | grep smtp-server
-ps aux | grep smtp-server
+top -b -n 1 | grep mail
+ps aux | grep mail
 
 # Profile application
 # (if profiling is enabled in debug build)
 
 # Check for infinite loops in logs
-journalctl -u smtp-server | grep -i "loop\|hang"
+journalctl -u mail | grep -i "loop\|hang"
 
 # Check connection count
 sudo ss -tn | grep :25 | wc -l
@@ -874,11 +874,11 @@ RATE_LIMIT_PER_MINUTE=30
 WORKER_THREADS=8  # Match CPU core count
 
 # Use CPU affinity
-sudo systemctl edit smtp-server
+sudo systemctl edit mail
 # Add: CPUAffinity=0-7
 
 sudo systemctl daemon-reload
-sudo systemctl restart smtp-server
+sudo systemctl restart mail
 ```
 
 ### Issue: High Memory Usage
@@ -892,7 +892,7 @@ sudo systemctl restart smtp-server
 ```bash
 # Check memory usage
 free -h
-ps aux | grep smtp-server | awk '{print $6}'
+ps aux | grep mail | awk '{print $6}'
 
 # Check for memory leaks
 # Run with debug build and memory profiler
@@ -907,7 +907,7 @@ grep -E "BUFFER|CACHE" /etc/smtp/smtp.env
 **Solution:**
 ```bash
 # Set memory limits
-sudo systemctl edit smtp-server
+sudo systemctl edit mail
 # Add:
 # [Service]
 # MemoryMax=2G
@@ -921,7 +921,7 @@ SMTP_MAX_MESSAGE_SIZE=10485760  # 10MB
 
 # Enable aggressive memory reclaim
 # Restart service periodically (not ideal)
-sudo systemctl restart smtp-server
+sudo systemctl restart mail
 
 # Or implement memory pooling (code change required)
 ```
@@ -963,7 +963,7 @@ SPAM_CHECK_ENABLED=false
 VIRUS_SCAN_ENABLED=false
 
 # Increase I/O priority
-sudo systemctl edit smtp-server
+sudo systemctl edit mail
 # Add: IOSchedulingClass=realtime
 
 # Tune kernel I/O
@@ -1035,7 +1035,7 @@ sudo fsck /dev/sda1
 **Solution:**
 ```bash
 # Stop service
-sudo systemctl stop smtp-server
+sudo systemctl stop mail
 
 # Backup corrupted database
 sudo cp /var/lib/smtp/smtp.db /var/lib/smtp/smtp.db.corrupted
@@ -1051,7 +1051,7 @@ sudo chown smtp:smtp /var/lib/smtp/smtp.db
 # If recovery fails, restore from backup
 sudo cp /var/backups/smtp/latest/smtp.db /var/lib/smtp/smtp.db
 
-sudo systemctl start smtp-server
+sudo systemctl start mail
 ```
 
 ### Issue: Database Growing Too Large
@@ -1090,9 +1090,9 @@ WHERE received_at < datetime('now', '-90 days');
 EOF
 
 # Vacuum database
-sudo systemctl stop smtp-server
+sudo systemctl stop mail
 sudo -u smtp sqlite3 /var/lib/smtp/smtp.db "VACUUM;"
-sudo systemctl start smtp-server
+sudo systemctl start mail
 
 # Enable auto-vacuum
 sudo sqlite3 /var/lib/smtp/smtp.db "PRAGMA auto_vacuum = FULL;"
@@ -1102,7 +1102,7 @@ sudo sqlite3 /var/lib/smtp/smtp.db "PRAGMA auto_vacuum = FULL;"
 STORAGE_TYPE=timeseries
 STORAGE_PATH=/var/lib/smtp/archive
 
-sudo systemctl restart smtp-server
+sudo systemctl restart mail
 ```
 
 ### Issue: Foreign Key Constraint Failed
@@ -1177,7 +1177,7 @@ find /var/lib/smtp/data -type f -mtime +90 -delete
 sudo truncate -s 0 /var/lib/smtp/logs/smtp.log
 
 # Enable log rotation
-sudo tee /etc/logrotate.d/smtp-server << 'EOF'
+sudo tee /etc/logrotate.d/mail << 'EOF'
 /var/lib/smtp/logs/*.log {
     daily
     rotate 7
@@ -1186,7 +1186,7 @@ sudo tee /etc/logrotate.d/smtp-server << 'EOF'
     notifempty
     create 644 smtp smtp
     postrotate
-        systemctl reload smtp-server > /dev/null 2>&1 || true
+        systemctl reload mail > /dev/null 2>&1 || true
     endscript
 }
 EOF
@@ -1316,7 +1316,7 @@ QUEUE_WORKER_THREADS=4
 QUEUE_BATCH_SIZE=100
 
 # Restart service
-sudo systemctl restart smtp-server
+sudo systemctl restart mail
 
 # Manually trigger queue processing (if CLI available)
 # sudo -u smtp queue-cli process
@@ -1397,10 +1397,10 @@ journalctl -k | grep -i "oom"
 
 # Check memory usage
 free -h
-ps aux | grep smtp-server | awk '{print $6}'
+ps aux | grep mail | awk '{print $6}'
 
 # Check memory limits
-systemctl show smtp-server | grep Memory
+systemctl show mail | grep Memory
 ```
 
 **Solution:**
@@ -1408,7 +1408,7 @@ systemctl show smtp-server | grep Memory
 # Increase system memory (add RAM)
 
 # Set memory limits to prevent OOM
-sudo systemctl edit smtp-server
+sudo systemctl edit mail
 # Add:
 [Service]
 MemoryMax=4G
@@ -1441,14 +1441,14 @@ socket: Too many open files
 **Diagnosis:**
 ```bash
 # Check current file descriptor usage
-sudo ls -la /proc/$(pgrep smtp-server)/fd | wc -l
+sudo ls -la /proc/$(pgrep mail)/fd | wc -l
 
 # Check limits
 ulimit -n
 cat /proc/sys/fs/file-max
 
 # Check service limits
-systemctl show smtp-server | grep LimitNOFILE
+systemctl show mail | grep LimitNOFILE
 ```
 
 **Solution:**
@@ -1466,16 +1466,16 @@ smtp hard nofile 65536
 EOF
 
 # Increase systemd service limit
-sudo systemctl edit smtp-server
+sudo systemctl edit mail
 # Add:
 [Service]
 LimitNOFILE=65536
 
 sudo systemctl daemon-reload
-sudo systemctl restart smtp-server
+sudo systemctl restart mail
 
 # Verify
-sudo cat /proc/$(pgrep smtp-server)/limits | grep "open files"
+sudo cat /proc/$(pgrep mail)/limits | grep "open files"
 ```
 
 ### Issue: High Swap Usage
@@ -1544,7 +1544,7 @@ METRICS_PORT=9090
 # Open firewall (internal only)
 sudo ufw allow from 10.0.0.0/8 to any port 9090 proto tcp
 
-sudo systemctl restart smtp-server
+sudo systemctl restart mail
 
 # Verify
 curl http://localhost:9090/metrics | head -20
@@ -1563,16 +1563,16 @@ curl http://localhost:9090/metrics | head -20
 ls -lh /var/lib/smtp/logs/
 
 # Check logrotate configuration
-cat /etc/logrotate.d/smtp-server
+cat /etc/logrotate.d/mail
 
 # Test logrotate
-sudo logrotate -d /etc/logrotate.d/smtp-server
+sudo logrotate -d /etc/logrotate.d/mail
 ```
 
 **Solution:**
 ```bash
 # Create logrotate configuration
-sudo tee /etc/logrotate.d/smtp-server << 'EOF'
+sudo tee /etc/logrotate.d/mail << 'EOF'
 /var/lib/smtp/logs/*.log {
     daily
     rotate 14
@@ -1583,13 +1583,13 @@ sudo tee /etc/logrotate.d/smtp-server << 'EOF'
     create 644 smtp smtp
     sharedscripts
     postrotate
-        systemctl reload smtp-server > /dev/null 2>&1 || true
+        systemctl reload mail > /dev/null 2>&1 || true
     endscript
 }
 EOF
 
 # Test configuration
-sudo logrotate -f /etc/logrotate.d/smtp-server
+sudo logrotate -f /etc/logrotate.d/mail
 
 # Force rotation now
 sudo logrotate -f /etc/logrotate.conf
@@ -1614,7 +1614,7 @@ grep LOG /etc/smtp/smtp.env
 ls -la /var/lib/smtp/logs/smtp.log
 
 # Check systemd journal
-journalctl -u smtp-server --no-pager | head -50
+journalctl -u mail --no-pager | head -50
 ```
 
 **Solution:**
@@ -1633,7 +1633,7 @@ sudo touch /var/lib/smtp/logs/smtp.log
 sudo chown smtp:smtp /var/lib/smtp/logs/smtp.log
 sudo chmod 644 /var/lib/smtp/logs/smtp.log
 
-sudo systemctl restart smtp-server
+sudo systemctl restart mail
 
 # Check for log output
 tail -f /var/lib/smtp/logs/smtp.log
@@ -1654,25 +1654,25 @@ Container exits immediately
 **Diagnosis:**
 ```bash
 # Check container logs
-docker logs smtp-server
+docker logs mail
 
 # Check container status
-docker ps -a | grep smtp-server
+docker ps -a | grep mail
 
 # Inspect container
-docker inspect smtp-server
+docker inspect mail
 ```
 
 **Solution:**
 ```bash
 # Check Dockerfile syntax
-docker build -t smtp-server .
+docker build -t mail .
 
 # Check environment variables
-docker run --rm smtp-server env
+docker run --rm mail env
 
 # Run interactively for debugging
-docker run -it --entrypoint /bin/sh smtp-server
+docker run -it --entrypoint /bin/sh mail
 
 # Check volume mounts
 docker volume ls
@@ -1727,16 +1727,16 @@ Cannot write to /var/lib/smtp/data
 **Diagnosis:**
 ```bash
 # Check volume mount
-docker inspect smtp-server | grep Mounts -A 20
+docker inspect mail | grep Mounts -A 20
 
 # Check permissions inside container
-docker exec smtp-server ls -la /var/lib/smtp/
+docker exec mail ls -la /var/lib/smtp/
 ```
 
 **Solution:**
 ```bash
 # Fix ownership in volume
-docker exec smtp-server chown -R smtp:smtp /var/lib/smtp
+docker exec mail chown -R smtp:smtp /var/lib/smtp
 
 # Or specify user in docker-compose.yml
 user: "1000:1000"  # smtp UID:GID
@@ -1821,24 +1821,24 @@ kubectl get endpoints -n smtp-system
 
 # Check pod selector
 kubectl get pods -n smtp-system --show-labels
-kubectl describe svc smtp-server -n smtp-system | grep Selector
+kubectl describe svc mail -n smtp-system | grep Selector
 ```
 
 **Solution:**
 ```bash
 # For LoadBalancer type
 # Ensure cloud controller is installed
-kubectl get svc smtp-server -n smtp-system -w
+kubectl get svc mail -n smtp-system -w
 
 # For NodePort (alternative)
-kubectl patch svc smtp-server -n smtp-system -p '{"spec":{"type":"NodePort"}}'
+kubectl patch svc mail -n smtp-system -p '{"spec":{"type":"NodePort"}}'
 
 # For port-forward testing
-kubectl port-forward -n smtp-system svc/smtp-server 25:25
+kubectl port-forward -n smtp-system svc/mail 25:25
 
 # Check network policies
 kubectl get networkpolicy -n smtp-system
-kubectl describe networkpolicy smtp-server-network-policy -n smtp-system
+kubectl describe networkpolicy mail-network-policy -n smtp-system
 ```
 
 ### Issue: PersistentVolume Not Binding
@@ -1989,15 +1989,15 @@ getenforce
 sudo ausearch -m avc -ts recent | grep smtp
 
 # Check file contexts
-ls -Z /usr/local/bin/smtp-server
+ls -Z /usr/local/bin/mail
 ls -Z /var/lib/smtp/
 ```
 
 **Solution:**
 ```bash
 # Set correct contexts
-sudo semanage fcontext -a -t smtp_exec_t "/usr/local/bin/smtp-server"
-sudo restorecon -v /usr/local/bin/smtp-server
+sudo semanage fcontext -a -t smtp_exec_t "/usr/local/bin/mail"
+sudo restorecon -v /usr/local/bin/mail
 
 sudo semanage fcontext -a -t mail_spool_t "/var/lib/smtp(/.*)?"
 sudo restorecon -Rv /var/lib/smtp
@@ -2031,13 +2031,13 @@ wireshark smtp-capture.pcap
 
 ```bash
 # Trace system calls
-sudo strace -p $(pgrep smtp-server) -f -e trace=network,file
+sudo strace -p $(pgrep mail) -f -e trace=network,file
 
 # Trace only network calls
-sudo strace -p $(pgrep smtp-server) -f -e trace=network
+sudo strace -p $(pgrep mail) -f -e trace=network
 
 # Write to file
-sudo strace -p $(pgrep smtp-server) -f -o strace-output.txt
+sudo strace -p $(pgrep mail) -f -o strace-output.txt
 ```
 
 ### Core Dump Analysis
@@ -2049,7 +2049,7 @@ echo "kernel.core_pattern = /tmp/core-%e-%p-%t" | sudo tee -a /etc/sysctl.conf
 sudo sysctl -p
 
 # Analyze core dump (if Zig has debug symbols)
-# gdb /usr/local/bin/smtp-server /tmp/core-smtp-server-12345-1234567890
+# gdb /usr/local/bin/mail /tmp/core-mail-12345-1234567890
 ```
 
 ### Database Query Performance
@@ -2077,11 +2077,11 @@ valgrind --leak-check=full \
   --track-origins=yes \
   --verbose \
   --log-file=valgrind-out.txt \
-  /usr/local/bin/smtp-server
+  /usr/local/bin/mail
 
 # Or use heaptrack (Linux)
-heaptrack /usr/local/bin/smtp-server
-heaptrack_gui heaptrack.smtp-server.*.gz
+heaptrack /usr/local/bin/mail
+heaptrack_gui heaptrack.mail.*.gz
 ```
 
 ---
@@ -2100,10 +2100,10 @@ If you cannot resolve the issue using this guide:
    cat /etc/os-release >> smtp-diagnostics/system-info.txt
 
    # Service status
-   systemctl status smtp-server > smtp-diagnostics/service-status.txt
+   systemctl status mail > smtp-diagnostics/service-status.txt
 
    # Logs
-   journalctl -u smtp-server -n 1000 > smtp-diagnostics/logs.txt
+   journalctl -u mail -n 1000 > smtp-diagnostics/logs.txt
 
    # Configuration (redact passwords!)
    grep -v "PASSWORD\|KEY\|SECRET" /etc/smtp/smtp.env > smtp-diagnostics/config.txt
@@ -2120,7 +2120,7 @@ If you cannot resolve the issue using this guide:
    ```
 
 2. **Search existing issues:**
-   - Check GitHub issues: https://github.com/yourusername/smtp-server/issues
+   - Check GitHub issues: https://github.com/yourusername/mail/issues
    - Search documentation: docs/
 
 3. **Report the issue:**
@@ -2134,7 +2134,7 @@ If you cannot resolve the issue using this guide:
 
 4. **Community support:**
    - Join discussion forum/Discord/Slack
-   - Ask on Stack Overflow with tag `smtp-server`
+   - Ask on Stack Overflow with tag `mail`
 
 ---
 

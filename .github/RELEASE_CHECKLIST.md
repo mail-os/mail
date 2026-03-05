@@ -74,8 +74,8 @@ Choose one:
   - [ ] Version number correct
 - [ ] Test Docker image
   ```bash
-  docker pull <username>/smtp-server:<version>
-  docker run <username>/smtp-server:<version>
+  docker pull <username>/mail:<version>
+  docker run <username>/mail:<version>
   ```
 - [ ] Verify binaries work
   ```bash

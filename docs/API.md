@@ -1,4 +1,4 @@
-# SMTP Server API Documentation
+# Mail Server API Documentation
 
 Complete API reference for the SMTP server including REST API, CLI tools, and programmatic interfaces.
 
@@ -827,7 +827,7 @@ export SMTP_MAX_CONNECTIONS=200
 export SMTP_ENABLE_TLS=true
 export SMTP_TLS_CERT=/etc/smtp/cert.pem
 export SMTP_TLS_KEY=/etc/smtp/key.pem
-./smtp-server
+./mail
 ```
 
 ---

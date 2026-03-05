@@ -1,0 +1,99 @@
+version: '3.8'
+
+services:
+  mail:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mail
+    ports:
+      - "2525:2525"  # SMTP port
+      - "8025:8025"  # Health check / metrics port
+    volumes:
+      - smtp-mail:/var/mail
+      - smtp-logs:/var/log/smtp
+      - ./certs:/etc/smtp/tls:ro  # TLS certificates (optional)
+    environment:
+      - SMTP_HOST=0.0.0.0
+      - SMTP_PORT=2525
+      - SMTP_HOSTNAME=mail.example.com
+      - SMTP_MAX_CONNECTIONS=100
+      - SMTP_MAX_MESSAGE_SIZE=10485760
+      - SMTP_MAX_RECIPIENTS=100
+      - SMTP_ENABLE_TLS=false
+      - SMTP_ENABLE_AUTH=true
+      - SMTP_ENABLE_DNSBL=true
+      - SMTP_ENABLE_GREYLIST=true
+      - SMTP_DB_PATH=/var/mail/users.db
+    restart: unless-stopped
+    networks:
+      - smtp-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2525"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  # Health check / metrics server (optional separate service)
+  health-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smtp-health
+    ports:
+      - "9090:9090"  # Health check API
+    environment:
+      - HEALTH_PORT=9090
+    restart: unless-stopped
+    networks:
+      - smtp-network
+    depends_on:
+      - mail
+
+  # Prometheus for metrics collection (optional)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: smtp-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: unless-stopped
+    networks:
+      - smtp-network
+
+  # Grafana for visualization (optional)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: smtp-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    restart: unless-stopped
+    networks:
+      - smtp-network
+    depends_on:
+      - prometheus
+
+networks:
+  smtp-network:
+    driver: bridge
+
+volumes:
+  smtp-mail:
+    driver: local
+  smtp-logs:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local

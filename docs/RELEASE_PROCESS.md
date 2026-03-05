@@ -54,7 +54,7 @@ make release
 **What it looks like:**
 ```
 ╔═══════════════════════════════════════════════════════╗
-║         SMTP Server Release Manager                  ║
+║         Mail Server Release Manager                  ║
 ╚═══════════════════════════════════════════════════════╝
 
 [INFO] Current version: v0.0.0
@@ -248,8 +248,8 @@ This will:
 
 3. Test the Docker image:
    ```bash
-   docker pull <username>/smtp-server:X.Y.Z
-   docker run <username>/smtp-server:X.Y.Z
+   docker pull <username>/mail:X.Y.Z
+   docker run <username>/mail:X.Y.Z
    ```
 
 ## Advanced Options

@@ -114,23 +114,23 @@ Output binaries are placed in the `releases/` directory with checksums.
 **Service Management:**
 ```bash
 # Install as systemd service
-sudo systemctl enable smtp-server
-sudo systemctl start smtp-server
+sudo systemctl enable mail
+sudo systemctl start mail
 
 # View logs
-sudo journalctl -u smtp-server -f
+sudo journalctl -u mail -f
 ```
 
 **Configuration:**
 ```bash
 # Config location
-/etc/smtp-server/smtp.env
+/etc/mail/smtp.env
 
 # Data directory
-/var/lib/smtp-server/
+/var/lib/mail/
 
 # Logs
-/var/log/smtp-server/
+/var/log/mail/
 ```
 
 ### macOS
@@ -144,23 +144,23 @@ sudo journalctl -u smtp-server -f
 **Service Management:**
 ```bash
 # Install as launchd service
-sudo launchctl load /Library/LaunchDaemons/com.smtp-server.plist
-sudo launchctl start com.smtp-server
+sudo launchctl load /Library/LaunchDaemons/com.mail.plist
+sudo launchctl start com.mail
 
 # View logs
-tail -f /usr/local/var/log/smtp-server.log
+tail -f /usr/local/var/log/mail.log
 ```
 
 **Configuration:**
 ```bash
 # Config location
-/usr/local/etc/smtp-server/smtp.env
+/usr/local/etc/mail/smtp.env
 
 # Data directory
-/usr/local/var/lib/smtp-server/
+/usr/local/var/lib/mail/
 
 # Logs
-/usr/local/var/log/smtp-server/
+/usr/local/var/log/mail/
 ```
 
 ### Windows
@@ -175,23 +175,23 @@ tail -f /usr/local/var/log/smtp-server.log
 **Service Management:**
 ```powershell
 # Install as Windows Service
-sc create smtp-server binPath="C:\Program Files\smtp-server\smtp-server.exe" start=auto
-sc start smtp-server
+sc create mail binPath="C:\Program Files\mail\mail.exe" start=auto
+sc start mail
 
 # View logs
-Get-EventLog -LogName Application -Source smtp-server -Newest 50
+Get-EventLog -LogName Application -Source mail -Newest 50
 ```
 
 **Configuration:**
 ```powershell
 # Config location
-C:\ProgramData\smtp-server\smtp.env
+C:\ProgramData\mail\smtp.env
 
 # Data directory
-C:\ProgramData\smtp-server\data\
+C:\ProgramData\mail\data\
 
 # Logs
-C:\ProgramData\smtp-server\logs\
+C:\ProgramData\mail\logs\
 ```
 
 ### FreeBSD
@@ -206,22 +206,22 @@ C:\ProgramData\smtp-server\logs\
 ```bash
 # Install as rc.d service
 sudo sysrc smtp_server_enable="YES"
-sudo service smtp-server start
+sudo service mail start
 
 # View logs
-tail -f /var/log/smtp-server.log
+tail -f /var/log/mail.log
 ```
 
 **Configuration:**
 ```bash
 # Config location
-/usr/local/etc/smtp-server/smtp.env
+/usr/local/etc/mail/smtp.env
 
 # Data directory
-/var/db/smtp-server/
+/var/db/mail/
 
 # Logs
-/var/log/smtp-server/
+/var/log/mail/
 ```
 
 ### OpenBSD
@@ -239,19 +239,19 @@ sudo rcctl enable smtp_server
 sudo rcctl start smtp_server
 
 # View logs
-tail -f /var/log/smtp-server.log
+tail -f /var/log/mail.log
 ```
 
 **Configuration:**
 ```bash
 # Config location
-/etc/smtp-server/smtp.env
+/etc/mail/smtp.env
 
 # Data directory
-/var/smtp-server/
+/var/mail/
 
 # Logs
-/var/log/smtp-server/
+/var/log/mail/
 ```
 
 ## Platform Abstraction Layer
@@ -293,12 +293,12 @@ const temp = try platform.Path.tempDir(allocator);
 
 ```zig
 const service = platform.Service{
-    .name = "smtp-server",
+    .name = "mail",
     .description = "SMTP Mail Server",
 };
 
 // Install service (platform-specific)
-try service.install(allocator, "/usr/local/bin/smtp-server");
+try service.install(allocator, "/usr/local/bin/mail");
 
 // Start service
 try service.start(allocator);
@@ -320,7 +320,7 @@ try platform.Process.daemonize();
 const pid = platform.Process.getPid();
 
 // Write PID file
-try platform.Process.writePidFile(allocator, "/var/run/smtp-server.pid");
+try platform.Process.writePidFile(allocator, "/var/run/mail.pid");
 ```
 
 ### Signal Handling
@@ -378,7 +378,7 @@ const n = try stream.read(&buffer);
 
 ```zig
 // Linux-specific abstract namespace (no filesystem)
-const addr = unix_socket.UnixAddress.initAbstract("smtp-server");
+const addr = unix_socket.UnixAddress.initAbstract("mail");
 var listener = try unix_socket.UnixListener.init(allocator, addr);
 defer listener.deinit();
 ```
@@ -541,7 +541,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v3
         with:
-          name: smtp-server-${{ matrix.target }}
+          name: mail-${{ matrix.target }}
           path: zig-out/bin/
 ```
 
@@ -583,13 +583,13 @@ chmod 600 /tmp/smtp.sock
 
 ```powershell
 # Check Event Log
-Get-EventLog -LogName Application -Source smtp-server -Newest 10
+Get-EventLog -LogName Application -Source mail -Newest 10
 
 # Check service status
-sc query smtp-server
+sc query mail
 
 # Check file permissions
-icacls "C:\Program Files\smtp-server"
+icacls "C:\Program Files\mail"
 ```
 
 ### BSD Firewall Issues
@@ -614,7 +614,7 @@ On Linux with kernel 5.1+, io_uring provides significant performance improvement
 
 Enable with:
 ```bash
-SMTP_USE_IO_URING=true ./smtp-server
+SMTP_USE_IO_URING=true ./mail
 ```
 
 ### macOS (kqueue)

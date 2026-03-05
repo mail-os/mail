@@ -1,4 +1,4 @@
-# SMTP Server Security Guide
+# Mail Server Security Guide
 
 **Version:** v0.28.0
 **Last Updated:** 2025-10-24
@@ -131,7 +131,7 @@ export SMTP_TLS_CERT="/path/to/cert.pem"
 export SMTP_TLS_KEY="/path/to/key.pem"
 
 # Database (if not using default)
-export SMTP_DB_PATH="/var/lib/smtp-server/smtp.db"
+export SMTP_DB_PATH="/var/lib/mail/smtp.db"
 
 # Optional: JSON Logging
 export SMTP_ENABLE_JSON_LOGGING="true"
@@ -526,10 +526,10 @@ Memory usage > 80% → ALERT
 **Step 1: Detection**
 ```bash
 # Check logs for suspicious activity
-tail -f /var/log/smtp-server/security.log | grep -i "failed\|attack\|injection"
+tail -f /var/log/mail/security.log | grep -i "failed\|attack\|injection"
 
 # Monitor authentication failures
-grep "Failed.*login" /var/log/smtp-server/*.log | wc -l
+grep "Failed.*login" /var/log/mail/*.log | wc -l
 ```
 
 **Step 2: Containment**
@@ -541,16 +541,16 @@ iptables -A INPUT -s <MALICIOUS_IP> -j DROP
 # (Update database: enabled = false)
 
 # Restart server if needed
-systemctl restart smtp-server
+systemctl restart mail
 ```
 
 **Step 3: Investigation**
 ```bash
 # Collect evidence
-cp /var/log/smtp-server/security.log /incident/evidence/
+cp /var/log/mail/security.log /incident/evidence/
 
 # Check for unauthorized access
-grep "Successful.*login" /var/log/smtp-server/*.log
+grep "Successful.*login" /var/log/mail/*.log
 
 # Review file changes
 find /var/mail -type f -mtime -1 -ls

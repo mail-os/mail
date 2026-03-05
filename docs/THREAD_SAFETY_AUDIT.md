@@ -6,7 +6,7 @@
 
 ## Executive Summary
 
-This document provides a comprehensive thread safety audit of the SMTP server codebase. The server uses a multi-threaded architecture where each client connection is handled in a separate thread, requiring careful synchronization of shared resources.
+This document provides a comprehensive thread safety audit of the Mail Server codebase. The server uses a multi-threaded architecture where each client connection is handled in a separate thread, requiring careful synchronization of shared resources.
 
 ## Architecture Overview
 
@@ -392,7 +392,7 @@ wait
 zig build -Dthread-sanitizer=true
 
 # Run under Valgrind Helgrind
-valgrind --tool=helgrind ./zig-out/bin/smtp-server
+valgrind --tool=helgrind ./zig-out/bin/mail
 ```
 
 ---

@@ -48,7 +48,7 @@ greylist = false      # Greylisting for spam prevention
 
 [observability]
 tracing = false                    # OpenTelemetry tracing
-service_name = "smtp-server"       # Service name for traces
+service_name = "mail"              # Service name for traces
 json_logging = false               # JSON format for log output
 
 [dkim]

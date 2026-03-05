@@ -34,13 +34,13 @@ Set the `SMTP_PROFILE` environment variable to activate a profile:
 
 ```bash
 # Development mode
-SMTP_PROFILE=development ./smtp-server
+SMTP_PROFILE=development ./mail
 
 # Production mode
-SMTP_PROFILE=production ./smtp-server
+SMTP_PROFILE=production ./mail
 
 # Testing mode (used by test suite)
-SMTP_PROFILE=testing ./smtp-server
+SMTP_PROFILE=testing ./mail
 ```
 
 You can also use short aliases: `dev`, `test`, `stage`, `prod`
@@ -90,13 +90,13 @@ See `src/core/config_profiles.zig` for complete profile definitions.
 Validate your configuration without starting the server:
 
 ```bash
-./smtp-server --validate-only
+./mail --validate-only
 
 # With custom profile
-SMTP_PROFILE=production ./smtp-server --validate-only
+SMTP_PROFILE=production ./mail --validate-only
 
 # With environment overrides
-SMTP_PROFILE=production SMTP_MAX_CONNECTIONS=5000 ./smtp-server --validate-only
+SMTP_PROFILE=production SMTP_MAX_CONNECTIONS=5000 ./mail --validate-only
 ```
 
 This checks:
@@ -114,7 +114,7 @@ This checks:
 # Minimal configuration
 SMTP_HOST=0.0.0.0 \
 SMTP_PORT=2525 \
-./smtp-server
+./mail
 ```
 
 ### Production Setup
@@ -126,11 +126,11 @@ SMTP_PORT=2525 \
 SMTP_HOSTNAME=mail.example.com \
 SMTP_MAX_CONNECTIONS=500 \
 SMTP_ENABLE_AUTH=true \
-SMTP_DB_PATH=/var/lib/smtp-server/smtp.db \
+SMTP_DB_PATH=/var/lib/mail/smtp.db \
 SMTP_ENABLE_DNSBL=true \
 SMTP_ENABLE_GREYLIST=true \
 SMTP_WEBHOOK_URL=https://api.example.com/webhook \
-./smtp-server
+./mail
 ```
 
 ## Configuration Reference
@@ -363,11 +363,11 @@ SMTP_GREETING_TIMEOUT_SECONDS=10
 #### SMTP_TRACING_SERVICE_NAME
 - **Description:** Service name to identify this SMTP server in traces
 - **Type:** String
-- **Default:** `smtp-server`
+- **Default:** `mail`
 - **Purpose:** Helps identify this service in distributed tracing systems
 - **Examples:**
   ```bash
-  SMTP_TRACING_SERVICE_NAME=smtp-server         # Default
+  SMTP_TRACING_SERVICE_NAME=mail         # Default
   SMTP_TRACING_SERVICE_NAME=smtp-prod-us-west-1 # Production with region
   SMTP_TRACING_SERVICE_NAME=smtp-staging        # Staging environment
   ```
@@ -394,7 +394,7 @@ SMTP_GREETING_TIMEOUT_SECONDS=10
 - **Default:** `./smtp.db`
 - **Examples:**
   ```bash
-  SMTP_DB_PATH=/var/lib/smtp-server/smtp.db
+  SMTP_DB_PATH=/var/lib/mail/smtp.db
   SMTP_DB_PATH=/data/smtp/users.db
   ```
 
@@ -421,7 +421,7 @@ SMTP_GREETING_TIMEOUT_SECONDS=10
 - **Examples:**
   ```bash
   SMTP_TLS_CERT=/etc/ssl/certs/mail.example.com.crt
-  SMTP_TLS_CERT=/opt/smtp-server/certs/server.pem
+  SMTP_TLS_CERT=/opt/mail/certs/server.pem
   ```
 
 #### SMTP_TLS_KEY
@@ -432,7 +432,7 @@ SMTP_GREETING_TIMEOUT_SECONDS=10
 - **Examples:**
   ```bash
   SMTP_TLS_KEY=/etc/ssl/private/mail.example.com.key
-  SMTP_TLS_KEY=/opt/smtp-server/certs/server-key.pem
+  SMTP_TLS_KEY=/opt/mail/certs/server-key.pem
   ```
 
 ---
@@ -512,7 +512,7 @@ SMTP_GREETING_TIMEOUT_SECONDS=10
 
 ### systemd Service with Environment File
 
-**Create `/etc/smtp-server/config`:**
+**Create `/etc/mail/config`:**
 ```bash
 # Server
 SMTP_HOST=0.0.0.0
@@ -532,7 +532,7 @@ SMTP_MAX_RECIPIENTS=100
 
 # Authentication
 SMTP_ENABLE_AUTH=true
-SMTP_DB_PATH=/var/lib/smtp-server/smtp.db
+SMTP_DB_PATH=/var/lib/mail/smtp.db
 
 # Spam Prevention
 SMTP_ENABLE_DNSBL=true
@@ -548,19 +548,19 @@ SMTP_RATE_LIMIT_PER_USER=200
 SMTP_RATE_LIMIT_CLEANUP_INTERVAL=3600
 ```
 
-**Create `/etc/systemd/system/smtp-server.service`:**
+**Create `/etc/systemd/system/mail.service`:**
 ```ini
 [Unit]
-Description=SMTP Server
+Description=Mail Server
 After=network.target
 
 [Service]
 Type=simple
 User=smtp
 Group=smtp
-WorkingDirectory=/opt/smtp-server
-EnvironmentFile=/etc/smtp-server/config
-ExecStart=/opt/smtp-server/smtp-server
+WorkingDirectory=/opt/mail
+EnvironmentFile=/etc/mail/config
+ExecStart=/opt/mail/mail
 Restart=always
 RestartSec=5
 
@@ -569,7 +569,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/smtp-server
+ReadWritePaths=/var/lib/mail
 
 [Install]
 WantedBy=multi-user.target
@@ -603,7 +603,7 @@ SMTP_PORT=2525
 SMTP_HOSTNAME=mail-staging.example.com
 SMTP_MAX_CONNECTIONS=100
 SMTP_ENABLE_AUTH=true
-SMTP_DB_PATH=/var/lib/smtp-server/staging.db
+SMTP_DB_PATH=/var/lib/mail/staging.db
 SMTP_ENABLE_DNSBL=false
 SMTP_ENABLE_GREYLIST=false
 SMTP_WEBHOOK_URL=https://staging-api.example.com/webhook
@@ -618,7 +618,7 @@ SMTP_PORT=2525
 SMTP_HOSTNAME=mail.example.com
 SMTP_MAX_CONNECTIONS=1000
 SMTP_ENABLE_AUTH=true
-SMTP_DB_PATH=/var/lib/smtp-server/production.db
+SMTP_DB_PATH=/var/lib/mail/production.db
 SMTP_ENABLE_DNSBL=true
 SMTP_ENABLE_GREYLIST=true
 SMTP_WEBHOOK_URL=https://api.example.com/webhook
@@ -643,9 +643,9 @@ SMTP_GREETING_TIMEOUT_SECONDS=30
 version: '3.8'
 
 services:
-  smtp-server:
-    image: smtp-server:latest
-    container_name: smtp-server
+  mail:
+    image: mail:latest
+    container_name: mail
     restart: unless-stopped
     ports:
       - "2525:2525"
@@ -683,7 +683,7 @@ networks:
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: smtp-server-config
+  name: mail-config
   namespace: mail
 data:
   SMTP_HOST: "0.0.0.0"
@@ -707,7 +707,7 @@ data:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: smtp-server-secrets
+  name: mail-secrets
   namespace: mail
 type: Opaque
 stringData:
@@ -720,28 +720,28 @@ stringData:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: smtp-server
+  name: mail
   namespace: mail
 spec:
   replicas: 3
   selector:
     matchLabels:
-      app: smtp-server
+      app: mail
   template:
     metadata:
       labels:
-        app: smtp-server
+        app: mail
     spec:
       containers:
-      - name: smtp-server
-        image: smtp-server:latest
+      - name: mail
+        image: mail:latest
         ports:
         - containerPort: 2525
         envFrom:
         - configMapRef:
-            name: smtp-server-config
+            name: mail-config
         - secretRef:
-            name: smtp-server-secrets
+            name: mail-secrets
         volumeMounts:
         - name: data
           mountPath: /data
@@ -755,7 +755,7 @@ spec:
       volumes:
       - name: data
         persistentVolumeClaim:
-          claimName: smtp-server-data
+          claimName: mail-data
 ```
 
 ---
@@ -766,10 +766,10 @@ spec:
 
 ```bash
 # Print current configuration
-./smtp-server --help
+./mail --help
 
 # Test configuration
-SMTP_PORT=2525 ./smtp-server &
+SMTP_PORT=2525 ./mail &
 SERVER_PID=$!
 
 # Test connection
@@ -809,12 +809,12 @@ echo $SMTP_PORT
 
 2. Verify systemd service file:
    ```bash
-   sudo systemctl cat smtp-server.service
+   sudo systemctl cat mail.service
    ```
 
 3. Restart service:
    ```bash
-   sudo systemctl restart smtp-server
+   sudo systemctl restart mail
    ```
 
 ### Port Already in Use
@@ -829,7 +829,7 @@ echo $SMTP_PORT
 
 2. Use different port:
    ```bash
-   SMTP_PORT=2526 ./smtp-server
+   SMTP_PORT=2526 ./mail
    ```
 
 ### Permission Denied
@@ -841,7 +841,7 @@ echo $SMTP_PORT
 2. Run as root (not recommended)
 3. Use capabilities:
    ```bash
-   sudo setcap 'cap_net_bind_service=+ep' ./smtp-server
+   sudo setcap 'cap_net_bind_service=+ep' ./mail
    ```
 
 ---
@@ -917,7 +917,7 @@ SMTP_PROFILE=production \
 SMTP_MAX_CONNECTIONS=5000 \
 SMTP_WORKER_THREADS=16 \
 SMTP_LOG_LEVEL=debug \
-./smtp-server
+./mail
 ```
 
 **Common Environment Variables:**

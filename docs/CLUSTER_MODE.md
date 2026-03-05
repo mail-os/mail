@@ -116,7 +116,7 @@ export SMTP_CLUSTER_BIND_ADDRESS="0.0.0.0"
 export SMTP_CLUSTER_BIND_PORT=9000
 export SMTP_CLUSTER_PEERS="192.168.1.102:9000,192.168.1.103:9000"
 
-./zig-out/bin/smtp-server --port 2525
+./zig-out/bin/mail --port 2525
 ```
 
 #### Node 2 (192.168.1.102)
@@ -129,7 +129,7 @@ export SMTP_CLUSTER_BIND_ADDRESS="0.0.0.0"
 export SMTP_CLUSTER_BIND_PORT=9000
 export SMTP_CLUSTER_PEERS="192.168.1.101:9000,192.168.1.103:9000"
 
-./zig-out/bin/smtp-server --port 2525
+./zig-out/bin/mail --port 2525
 ```
 
 #### Node 3 (192.168.1.103)
@@ -142,7 +142,7 @@ export SMTP_CLUSTER_BIND_ADDRESS="0.0.0.0"
 export SMTP_CLUSTER_BIND_PORT=9000
 export SMTP_CLUSTER_PEERS="192.168.1.101:9000,192.168.1.102:9000"
 
-./zig-out/bin/smtp-server --port 2525
+./zig-out/bin/mail --port 2525
 ```
 
 ### Docker Compose
@@ -152,7 +152,7 @@ version: '3.8'
 
 services:
   smtp-node1:
-    image: smtp-server:latest
+    image: mail:latest
     environment:
       - SMTP_CLUSTER_ENABLED=true
       - SMTP_CLUSTER_NODE_ID=node1
@@ -166,7 +166,7 @@ services:
       - smtp-cluster
 
   smtp-node2:
-    image: smtp-server:latest
+    image: mail:latest
     environment:
       - SMTP_CLUSTER_ENABLED=true
       - SMTP_CLUSTER_NODE_ID=node2
@@ -180,7 +180,7 @@ services:
       - smtp-cluster
 
   smtp-node3:
-    image: smtp-server:latest
+    image: mail:latest
     environment:
       - SMTP_CLUSTER_ENABLED=true
       - SMTP_CLUSTER_NODE_ID=node3
@@ -210,15 +210,15 @@ spec:
   replicas: 3
   selector:
     matchLabels:
-      app: smtp-server
+      app: mail
   template:
     metadata:
       labels:
-        app: smtp-server
+        app: mail
     spec:
       containers:
-      - name: smtp-server
-        image: smtp-server:latest
+      - name: mail
+        image: mail:latest
         ports:
         - containerPort: 2525
           name: smtp
@@ -245,7 +245,7 @@ metadata:
 spec:
   clusterIP: None
   selector:
-    app: smtp-server
+    app: mail
   ports:
   - port: 9000
     name: cluster
@@ -257,7 +257,7 @@ metadata:
 spec:
   type: LoadBalancer
   selector:
-    app: smtp-server
+    app: mail
   ports:
   - port: 2525
     targetPort: 2525
@@ -512,7 +512,7 @@ smtp_cluster_state_replications_total 1523
 **Recovery**:
 ```bash
 # Restart failed node
-./zig-out/bin/smtp-server --port 2525
+./zig-out/bin/mail --port 2525
 
 # Node automatically rejoins cluster
 # Syncs state from leader

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Interactive release script for the SMTP server project
+# Interactive release script for the mail server project
 # This script provides a user-friendly interface for version bumping and releasing
 
 set -e
@@ -47,7 +47,7 @@ clear
 # Print header
 echo ""
 print_header "╔═══════════════════════════════════════════════════════╗"
-print_header "║         SMTP Server Release Manager                  ║"
+print_header "║         Mail Server Release Manager                  ║"
 print_header "╚═══════════════════════════════════════════════════════╝"
 echo ""
 
@@ -265,7 +265,7 @@ if [ $? -eq 0 ]; then
     echo -e "  ${BOLD}Next steps:${NC}"
     echo -e "    1. Monitor the release workflow on GitHub Actions"
     echo -e "    2. Check the release page: ${CYAN}https://github.com/<your-repo>/releases${NC}"
-    echo -e "    3. Verify Docker image: ${CYAN}docker pull <username>/smtp-server:$NEW_VERSION${NC}"
+    echo -e "    3. Verify Docker image: ${CYAN}docker pull <username>/mail:$NEW_VERSION${NC}"
     echo ""
     print_info "The release workflow will build binaries and create a GitHub release."
     echo ""
