@@ -66,7 +66,7 @@ pub const GeneratorConfig = struct {
     /// Output directory
     output_dir: []const u8 = "./sdk",
     /// Package name
-    package_name: []const u8 = "smtp-server-sdk",
+    package_name: []const u8 = "mail-sdk",
     /// Package version
     version: []const u8 = "0.28.0",
     /// Base URL for API

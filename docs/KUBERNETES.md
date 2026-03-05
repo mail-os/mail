@@ -25,21 +25,21 @@ Comprehensive guide for deploying the SMTP server on Kubernetes with resource li
 
 | Component | CPU Request | CPU Limit | Memory Request | Memory Limit |
 |-----------|------------|-----------|----------------|--------------|
-| SMTP Server | 100m | 500m | 128Mi | 512Mi |
+| Mail Server | 100m | 500m | 128Mi | 512Mi |
 | Database (SQLite) | 50m | 200m | 64Mi | 256Mi |
 
 ### Recommended (Production - Small)
 
 | Component | CPU Request | CPU Limit | Memory Request | Memory Limit |
 |-----------|------------|-----------|----------------|--------------|
-| SMTP Server | 500m | 2000m | 512Mi | 2Gi |
+| Mail Server | 500m | 2000m | 512Mi | 2Gi |
 | Database | 200m | 1000m | 256Mi | 1Gi |
 
 ### Recommended (Production - Large)
 
 | Component | CPU Request | CPU Limit | Memory Request | Memory Limit |
 |-----------|------------|-----------|----------------|--------------|
-| SMTP Server | 2000m | 4000m | 2Gi | 8Gi |
+| Mail Server | 2000m | 4000m | 2Gi | 8Gi |
 | Database | 1000m | 2000m | 1Gi | 4Gi |
 
 ### Resource Calculation Guidelines
@@ -63,35 +63,35 @@ Example: 1000 connections/sec, 10000 concurrent
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: smtp-server
+  name: mail
   namespace: mail
   labels:
-    app: smtp-server
+    app: mail
     tier: backend
 spec:
   replicas: 3
   selector:
     matchLabels:
-      app: smtp-server
+      app: mail
   template:
     metadata:
       labels:
-        app: smtp-server
+        app: mail
         tier: backend
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
         prometheus.io/path: "/metrics"
     spec:
-      serviceAccountName: smtp-server
+      serviceAccountName: mail
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
         fsGroup: 1000
       containers:
-      - name: smtp-server
-        image: smtp-server:latest
+      - name: mail
+        image: mail:latest
         imagePullPolicy: Always
         ports:
         - name: smtp
@@ -135,7 +135,7 @@ spec:
         - name: data
           mountPath: /data
         - name: config
-          mountPath: /etc/smtp-server
+          mountPath: /etc/mail
           readOnly: true
         - name: tls
           mountPath: /etc/tls
@@ -187,7 +187,7 @@ spec:
             podAffinityTerm:
               labelSelector:
                 matchLabels:
-                  app: smtp-server
+                  app: mail
               topologyKey: kubernetes.io/hostname
       topologySpreadConstraints:
       - maxSkew: 1
@@ -195,7 +195,7 @@ spec:
         whenUnsatisfiable: ScheduleAnyway
         labelSelector:
           matchLabels:
-            app: smtp-server
+            app: mail
 ```
 
 ### LimitRange for Namespace
@@ -278,7 +278,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app: smtp-server
+      app: mail
   policyTypes:
   - Ingress
   ingress:
@@ -304,7 +304,7 @@ spec:
   - from:
     - podSelector:
         matchLabels:
-          app: smtp-server
+          app: mail
     ports:
     - protocol: TCP
       port: 7946  # Cluster gossip
@@ -323,7 +323,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app: smtp-server
+      app: mail
   policyTypes:
   - Egress
   egress:
@@ -387,7 +387,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app: smtp-server
+      app: mail
   policyTypes:
   - Egress
   egress:
@@ -493,10 +493,10 @@ data:
 apiVersion: v1
 kind: Service
 metadata:
-  name: smtp-server
+  name: mail
   namespace: mail
   labels:
-    app: smtp-server
+    app: mail
 spec:
   type: ClusterIP
   ports:
@@ -517,7 +517,7 @@ spec:
     targetPort: 8080
     protocol: TCP
   selector:
-    app: smtp-server
+    app: mail
 ```
 
 ### LoadBalancer Service
@@ -526,7 +526,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: smtp-server-lb
+  name: mail-lb
   namespace: mail
   annotations:
     # AWS NLB
@@ -551,7 +551,7 @@ spec:
     targetPort: 5870
     protocol: TCP
   selector:
-    app: smtp-server
+    app: mail
 ```
 
 ---
@@ -564,13 +564,13 @@ spec:
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: smtp-server-hpa
+  name: mail-hpa
   namespace: mail
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: smtp-server
+    name: mail
   minReplicas: 3
   maxReplicas: 20
   metrics:
@@ -611,13 +611,13 @@ spec:
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: smtp-server-hpa-custom
+  name: mail-hpa-custom
   namespace: mail
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: smtp-server
+    name: mail
   minReplicas: 3
   maxReplicas: 20
   metrics:
@@ -645,25 +645,25 @@ spec:
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: smtp-server-pdb
+  name: mail-pdb
   namespace: mail
 spec:
   minAvailable: 2
   selector:
     matchLabels:
-      app: smtp-server
+      app: mail
 ---
 # Alternative: maxUnavailable
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
-  name: smtp-server-pdb-percent
+  name: mail-pdb-percent
   namespace: mail
 spec:
   maxUnavailable: 33%
   selector:
     matchLabels:
-      app: smtp-server
+      app: mail
 ```
 
 ---
@@ -727,14 +727,14 @@ startupProbe:
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: smtp-server
+  name: mail
   namespace: mail
   labels:
-    app: smtp-server
+    app: mail
 spec:
   selector:
     matchLabels:
-      app: smtp-server
+      app: mail
   endpoints:
   - port: http
     path: /metrics
@@ -751,14 +751,14 @@ spec:
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
-  name: smtp-server-alerts
+  name: mail-alerts
   namespace: mail
 spec:
   groups:
-  - name: smtp-server
+  - name: mail
     rules:
     - alert: SMTPServerDown
-      expr: up{job="smtp-server"} == 0
+      expr: up{job="mail"} == 0
       for: 5m
       labels:
         severity: critical
@@ -785,7 +785,7 @@ spec:
         description: "SMTP queue has {{ $value }} messages pending"
 
     - alert: SMTPHighMemory
-      expr: container_memory_usage_bytes{container="smtp-server"} / container_spec_memory_limit_bytes > 0.9
+      expr: container_memory_usage_bytes{container="mail"} / container_spec_memory_limit_bytes > 0.9
       for: 5m
       labels:
         severity: warning
@@ -831,14 +831,14 @@ metadata:
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: smtp-server
+  name: mail
   namespace: mail
 automountServiceAccountToken: false
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: smtp-server
+  name: mail
   namespace: mail
 rules:
 - apiGroups: [""]
@@ -852,15 +852,15 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: smtp-server
+  name: mail
   namespace: mail
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: smtp-server
+  name: mail
 subjects:
 - kind: ServiceAccount
-  name: smtp-server
+  name: mail
   namespace: mail
 ```
 
@@ -874,7 +874,7 @@ subjects:
 
 ```bash
 # Check pod status
-kubectl get pods -n mail -l app=smtp-server
+kubectl get pods -n mail -l app=mail
 
 # Check pod events
 kubectl describe pod -n mail <pod-name>
@@ -887,10 +887,10 @@ kubectl logs -n mail <pod-name> --previous
 
 ```bash
 # Test DNS resolution
-kubectl run -it --rm debug --image=busybox -n mail -- nslookup smtp-server
+kubectl run -it --rm debug --image=busybox -n mail -- nslookup mail
 
 # Test SMTP connectivity
-kubectl run -it --rm debug --image=busybox -n mail -- telnet smtp-server 2525
+kubectl run -it --rm debug --image=busybox -n mail -- telnet mail 2525
 
 # Check network policies
 kubectl get networkpolicies -n mail
@@ -917,7 +917,7 @@ kubectl describe limitrange -n mail
 kubectl get secret smtp-tls -n mail -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -dates
 
 # Verify TLS configuration
-openssl s_client -connect smtp-server.mail.svc:465 -servername mail.example.com
+openssl s_client -connect mail.mail.svc:465 -servername mail.example.com
 ```
 
 ### Debug Container
@@ -941,13 +941,13 @@ spec:
 kubectl exec -it smtp-debug -n mail -- bash
 
 # Test SMTP
-telnet smtp-server 2525
+telnet mail 2525
 
 # Test DNS
-dig smtp-server.mail.svc.cluster.local
+dig mail.mail.svc.cluster.local
 
 # Check network
-traceroute smtp-server
+traceroute mail
 ```
 
 ---
@@ -970,10 +970,10 @@ kubectl apply -f k8s/pdb.yaml
 
 # Verify deployment
 kubectl get all -n mail
-kubectl rollout status deployment/smtp-server -n mail
+kubectl rollout status deployment/mail -n mail
 
 # Check logs
-kubectl logs -f -l app=smtp-server -n mail
+kubectl logs -f -l app=mail -n mail
 ```
 
 ---

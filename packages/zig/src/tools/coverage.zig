@@ -547,7 +547,7 @@ pub const ReportGenerator = struct {
             \\<coverage line-rate="{d:.4}" branch-rate="{d:.4}" version="1.0">
         , .{ summary.lineCoveragePercent() / 100.0, summary.branchCoveragePercent() / 100.0 });
 
-        try writer.writeAll("<packages><package name=\"smtp-server\"><classes>");
+        try writer.writeAll("<packages><package name=\"mail\"><classes>");
 
         var iter = self.collector.files.iterator();
         while (iter.next()) |entry| {

@@ -25,7 +25,7 @@ export const PORTS = {
   pop3s: 995,
 } as const
 
-export interface SmtpServerConfig {
+export interface MailServerConfig {
   host?: string
   port?: number
   hostname?: string
@@ -151,9 +151,9 @@ export function buildForTarget(
 }
 
 /**
- * Convert a SmtpServerConfig to environment variables.
+ * Convert a MailServerConfig to environment variables.
  */
-export function configToEnv(config: SmtpServerConfig): Record<string, string> {
+export function configToEnv(config: MailServerConfig): Record<string, string> {
   const env: Record<string, string> = {}
 
   if (config.host) env.SMTP_HOST = config.host
