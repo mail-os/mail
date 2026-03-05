@@ -487,6 +487,241 @@
       color: var(--text);
     }
 
+    /* Email chart */
+    .email-chart-card { grid-column: 1 / -1; }
+
+    .chart-container {
+      position: relative;
+      height: 160px;
+      display: flex;
+      align-items: flex-end;
+      gap: 1px;
+      padding-top: 1.5rem;
+    }
+
+    .chart-col {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      position: relative;
+      cursor: pointer;
+    }
+
+    .chart-col:hover .chart-col-tooltip { display: block; }
+
+    .chart-bar-received {
+      background: var(--accent);
+      border-radius: 2px 2px 0 0;
+      min-height: 0;
+      transition: height 0.3s ease;
+    }
+
+    .chart-bar-sent {
+      background: var(--cyan);
+      border-radius: 0 0 2px 2px;
+      min-height: 0;
+      transition: height 0.3s ease;
+    }
+
+    .chart-col-tooltip {
+      display: none;
+      position: absolute;
+      bottom: calc(100% + 6px);
+      left: 50%;
+      transform: translateX(-50%);
+      background: var(--surface-3);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.375rem 0.625rem;
+      font-size: 0.6875rem;
+      white-space: nowrap;
+      z-index: 20;
+      pointer-events: none;
+      color: var(--text);
+    }
+
+    .chart-y-labels {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 100%;
+      pointer-events: none;
+    }
+
+    .chart-y-label {
+      position: absolute;
+      right: 0;
+      font-size: 0.625rem;
+      color: var(--text-muted);
+      transform: translateY(-50%);
+    }
+
+    .chart-y-line {
+      position: absolute;
+      left: 0;
+      right: 0;
+      border-top: 1px dashed rgba(42,50,72,0.5);
+    }
+
+    .chart-legend {
+      display: flex;
+      gap: 1.25rem;
+      margin-top: 0.625rem;
+      font-size: 0.75rem;
+      color: var(--text-dim);
+    }
+
+    .chart-legend-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 2px;
+      margin-right: 0.375rem;
+      vertical-align: middle;
+    }
+
+    /* Activity stats mini cards */
+    .activity-grid {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 1rem;
+    }
+
+    .mini-stat {
+      text-align: center;
+      padding: 1rem;
+    }
+
+    .mini-stat-value {
+      font-size: 1.75rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      line-height: 1.1;
+    }
+
+    .mini-stat-label {
+      font-size: 0.6875rem;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-top: 0.375rem;
+    }
+
+    @media (max-width: 1024px) {
+      .activity-grid { grid-template-columns: repeat(3, 1fr); }
+    }
+    @media (max-width: 640px) {
+      .activity-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    /* Logs */
+    .log-panel {
+      grid-column: 1 / -1;
+    }
+
+    .log-tabs {
+      display: flex;
+      gap: 0;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 0.75rem;
+    }
+
+    .log-tab {
+      padding: 0.5rem 1rem;
+      font-size: 0.75rem;
+      font-weight: 500;
+      color: var(--text-muted);
+      cursor: pointer;
+      border: none;
+      background: none;
+      border-bottom: 2px solid transparent;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: center;
+      gap: 0.375rem;
+    }
+
+    .log-tab:hover { color: var(--text-dim); }
+    .log-tab.active {
+      color: var(--text);
+      border-bottom-color: var(--accent);
+    }
+
+    .log-tab-count {
+      background: var(--surface-3);
+      color: var(--text-dim);
+      padding: 0.0625rem 0.375rem;
+      border-radius: 4px;
+      font-size: 0.625rem;
+      font-weight: 600;
+    }
+
+    .log-tab.active .log-tab-count {
+      background: var(--accent-glow);
+      color: var(--accent);
+    }
+
+    .log-entries {
+      max-height: 340px;
+      overflow-y: auto;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 0.75rem;
+      line-height: 1.7;
+    }
+
+    .log-entries::-webkit-scrollbar { width: 4px; }
+    .log-entries::-webkit-scrollbar-track { background: transparent; }
+    .log-entries::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 2px; }
+
+    .log-entry {
+      padding: 0.25rem 0;
+      border-bottom: 1px solid rgba(42,50,72,0.3);
+      display: flex;
+      gap: 0.75rem;
+      align-items: baseline;
+    }
+
+    .log-entry:last-child { border-bottom: none; }
+
+    .log-time {
+      color: var(--text-muted);
+      white-space: nowrap;
+      flex-shrink: 0;
+      min-width: 70px;
+    }
+
+    .log-level {
+      font-weight: 600;
+      text-transform: uppercase;
+      font-size: 0.625rem;
+      padding: 0.0625rem 0.375rem;
+      border-radius: 3px;
+      flex-shrink: 0;
+      min-width: 40px;
+      text-align: center;
+    }
+
+    .log-level-error { background: var(--red-dim); color: var(--red); }
+    .log-level-warn { background: var(--yellow-dim); color: var(--yellow); }
+    .log-level-info { background: var(--blue-dim); color: var(--blue); }
+
+    .log-msg {
+      color: var(--text-dim);
+      word-break: break-all;
+      min-width: 0;
+    }
+
+    .log-empty {
+      color: var(--text-muted);
+      text-align: center;
+      padding: 2rem;
+      font-family: inherit;
+      font-size: 0.8125rem;
+    }
+
     /* Loading */
     .loading-overlay {
       position: fixed;
@@ -700,8 +935,66 @@
       </div>
     </div>
 
+    <!-- Email Volume Chart -->
+    <div class="grid" style="margin-top:1rem">
+      <div class="card email-chart-card">
+        <div class="uptime-chart-header">
+          <div>
+            <div class="card-label">Email Volume</div>
+            <div style="font-size:0.8125rem;color:var(--text-dim);margin-top:0.25rem" id="email-chart-summary">--</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:0.75rem">
+            <div class="uptime-tabs" id="email-tabs">
+              <button class="uptime-tab" data-email-days="7">7d</button>
+              <button class="uptime-tab" data-email-days="14">14d</button>
+              <button class="uptime-tab active" data-email-days="30">30d</button>
+              <button class="uptime-tab" data-email-days="60">60d</button>
+              <button class="uptime-tab" data-email-days="90">90d</button>
+            </div>
+          </div>
+        </div>
+        <div style="position:relative">
+          <div class="chart-container" id="email-chart-bars"></div>
+        </div>
+        <div class="uptime-labels">
+          <span id="email-label-start">30 days ago</span>
+          <span>Today</span>
+        </div>
+        <div class="chart-legend">
+          <span><span class="chart-legend-dot" style="background:var(--accent)"></span>Received</span>
+          <span><span class="chart-legend-dot" style="background:var(--cyan)"></span>Sent</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Activity Stats -->
+    <div class="section-title">Activity</div>
+    <div class="activity-grid">
+      <div class="card mini-stat">
+        <div class="mini-stat-value text-green" id="stat-received">--</div>
+        <div class="mini-stat-label">Received</div>
+      </div>
+      <div class="card mini-stat">
+        <div class="mini-stat-value text-blue" id="stat-sent">--</div>
+        <div class="mini-stat-label">Sent</div>
+      </div>
+      <div class="card mini-stat">
+        <div class="mini-stat-value" style="color:var(--accent)" id="stat-connections">--</div>
+        <div class="mini-stat-label">SMTP Connections</div>
+      </div>
+      <div class="card mini-stat">
+        <div class="mini-stat-value" style="color:var(--cyan)" id="stat-imap">--</div>
+        <div class="mini-stat-label">IMAP Sessions</div>
+      </div>
+      <div class="card mini-stat">
+        <div class="mini-stat-value" id="stat-auth-fail">--</div>
+        <div class="mini-stat-label">Auth Failures</div>
+      </div>
+    </div>
+
     <!-- Stats Cards -->
-    <div class="grid grid-4" style="margin-top:1rem">
+    <div class="section-title">Overview</div>
+    <div class="grid grid-4">
       <div class="card">
         <div class="card-label">Users</div>
         <div class="card-value" id="user-count">--</div>
@@ -719,6 +1012,11 @@
           <div class="progress-fill" id="disk-bar" style="width:0%;background:var(--green)"></div>
         </div>
         <div class="card-sub" id="disk-detail"></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Storage per User</div>
+        <div class="card-value" style="color:var(--cyan)" id="db-size">--</div>
+        <div class="card-sub" id="db-detail"></div>
       </div>
     </div>
 
@@ -740,6 +1038,22 @@
           <button type="submit" class="btn btn-primary" id="create-account-btn">Create Account</button>
         </div>
       </form>
+    </div>
+
+    <!-- Logs -->
+    <div class="section-title">Logs</div>
+    <div class="grid">
+      <div class="card log-panel">
+        <div class="log-tabs">
+          <button class="log-tab active" data-log="errors">Errors <span class="log-tab-count" id="log-count-errors">0</span></button>
+          <button class="log-tab" data-log="auth">Auth Failures <span class="log-tab-count" id="log-count-auth">0</span></button>
+          <button class="log-tab" data-log="warnings">Warnings <span class="log-tab-count" id="log-count-warnings">0</span></button>
+          <button class="log-tab" data-log="smtp">SMTP Activity <span class="log-tab-count" id="log-count-smtp">0</span></button>
+        </div>
+        <div class="log-entries" id="log-entries">
+          <div class="log-empty">Loading...</div>
+        </div>
+      </div>
     </div>
 
     <!-- Services -->
@@ -800,7 +1114,7 @@
 
     <!-- Resources -->
     <div class="section-title">Resources</div>
-    <div class="grid grid-3">
+    <div class="grid grid-2">
       <div class="card">
         <div class="card-label">Memory</div>
         <div class="card-value text-blue" id="mem-usage">--</div>
@@ -816,11 +1130,6 @@
           <div class="progress-fill" id="cpu-bar" style="width:0%;background:var(--accent)"></div>
         </div>
         <div class="card-sub" id="cpu-detail"></div>
-      </div>
-      <div class="card">
-        <div class="card-label">Database</div>
-        <div class="card-value" style="color:var(--cyan)" id="db-size">--</div>
-        <div class="card-sub" id="db-detail"></div>
       </div>
     </div>
   </main>
@@ -937,6 +1246,21 @@
 
       $('db-size').textContent = d.dbSize || '--'
       $('db-detail').textContent = d.dbDetail || ''
+
+      // Email chart
+      renderEmailChart(d)
+
+      // Logs
+      renderLogs(d)
+
+      // Activity stats
+      $('stat-received').textContent = d.totalReceived ?? '--'
+      $('stat-sent').textContent = d.totalSent ?? '--'
+      $('stat-connections').textContent = d.smtpConnections ?? '--'
+      $('stat-imap').textContent = d.imapSessions ?? '--'
+      var af = d.authFails ?? 0
+      $('stat-auth-fail').textContent = af
+      $('stat-auth-fail').style.color = af > 10 ? 'var(--red)' : af > 0 ? 'var(--yellow)' : 'var(--green)'
     }
 
     var _uptimeData = null
@@ -1039,12 +1363,144 @@
       $('uptime-label-start').textContent = chart.length > 0 ? chart[0].date : _currentDays + ' days ago'
     }
 
+    // Email chart
+    var _emailChartData = []
+    var _emailDays = 30
+
+    function renderEmailChart(d) {
+      _emailChartData = d.emailChart || []
+      renderEmailBars()
+    }
+
+    function renderEmailBars() {
+      var chart = _emailChartData
+      var days = _emailDays
+      var slice = chart.slice(chart.length - days)
+      var barsEl = $('email-chart-bars')
+
+      // Find max for scaling
+      var maxVal = 0
+      var totalR = 0, totalS = 0
+      for (var i = 0; i < slice.length; i++) {
+        var total = slice[i].received + slice[i].sent
+        if (total > maxVal) maxVal = total
+        totalR += slice[i].received
+        totalS += slice[i].sent
+      }
+      if (maxVal === 0) maxVal = 1
+
+      var html = ''
+      for (var i = 0; i < slice.length; i++) {
+        var day = slice[i]
+        var rH = (day.received / maxVal) * 100
+        var sH = (day.sent / maxVal) * 100
+        var totalH = rH + sH
+        if (day.received + day.sent > 0 && totalH < 4) { rH = 4 }
+
+        html += '<div class="chart-col" style="height:100%">'
+        html += '<div class="chart-col-tooltip">' + day.date + '<br>Received: ' + day.received + ' &middot; Sent: ' + day.sent + '</div>'
+        if (day.received > 0 || day.sent > 0) {
+          html += '<div class="chart-bar-received" style="height:' + rH + '%"></div>'
+          html += '<div class="chart-bar-sent" style="height:' + sH + '%"></div>'
+        } else {
+          html += '<div style="height:2px;background:var(--surface-3);border-radius:1px;margin-top:auto"></div>'
+        }
+        html += '</div>'
+      }
+
+      barsEl.innerHTML = html
+
+      $('email-chart-summary').textContent = totalR + ' received, ' + totalS + ' sent in last ' + days + ' days'
+      $('email-label-start').textContent = slice.length > 0 ? slice[0].date : days + ' days ago'
+
+      // Update active tab
+      var tabs = document.querySelectorAll('[data-email-days]')
+      for (var i = 0; i < tabs.length; i++) {
+        tabs[i].className = 'uptime-tab' + (parseInt(tabs[i].getAttribute('data-email-days')) === _emailDays ? ' active' : '')
+      }
+    }
+
     // Tab click handlers
     document.addEventListener('click', function(e) {
-      if (e.target.classList.contains('uptime-tab')) {
-        _currentDays = parseInt(e.target.getAttribute('data-days'))
+      var target = e.target
+      if (!target.classList.contains('uptime-tab')) return
+      if (target.getAttribute('data-days')) {
+        _currentDays = parseInt(target.getAttribute('data-days'))
         updateActiveTab()
         renderUptimeBars()
+      } else if (target.getAttribute('data-email-days')) {
+        _emailDays = parseInt(target.getAttribute('data-email-days'))
+        renderEmailBars()
+      }
+    })
+
+    // Logs
+    var _logData = {}
+    var _activeLogTab = 'errors'
+
+    function renderLogs(d) {
+      _logData = {
+        errors: d.errors || [],
+        auth: d.authFailDetails || [],
+        warnings: d.warnings || [],
+        smtp: d.recentSmtp || [],
+      }
+
+      $('log-count-errors').textContent = _logData.errors.length
+      $('log-count-auth').textContent = _logData.auth.length
+      $('log-count-warnings').textContent = _logData.warnings.length
+      $('log-count-smtp').textContent = _logData.smtp.length
+
+      // Color the error count red if > 0
+      if (_logData.errors.length > 0) $('log-count-errors').style.cssText = 'background:var(--red-dim);color:var(--red)'
+      if (_logData.auth.length > 0) $('log-count-auth').style.cssText = 'background:var(--yellow-dim);color:var(--yellow)'
+
+      renderLogEntries()
+    }
+
+    function renderLogEntries() {
+      var entries = _logData[_activeLogTab] || []
+      var el = $('log-entries')
+
+      if (entries.length === 0) {
+        el.innerHTML = '<div class="log-empty">No ' + _activeLogTab + ' to show</div>'
+        return
+      }
+
+      // Show newest first
+      var sorted = entries.slice().reverse()
+      var html = ''
+      for (var i = 0; i < sorted.length; i++) {
+        var e = sorted[i]
+        var time = e.ts ? new Date(e.ts * 1000).toLocaleString() : '--'
+        var levelClass = e.level === 'ERROR' ? 'error' : e.level === 'WARN' ? 'warn' : 'info'
+        var msg = e.message
+          .replace(/&/g, '&amp;')
+          .replace(/</g, '&lt;')
+          .replace(/>/g, '&gt;')
+
+        html += '<div class="log-entry">'
+        html += '<span class="log-time">' + time + '</span>'
+        html += '<span class="log-level log-level-' + levelClass + '">' + e.level + '</span>'
+        html += '<span class="log-msg">' + msg + '</span>'
+        html += '</div>'
+      }
+
+      el.innerHTML = html
+    }
+
+    // Log tab click handler
+    document.addEventListener('click', function(e) {
+      if (e.target.closest && e.target.closest('.log-tab')) {
+        var tab = e.target.closest('.log-tab')
+        var key = tab.getAttribute('data-log')
+        if (!key) return
+        _activeLogTab = key
+        var tabs = document.querySelectorAll('.log-tab')
+        for (var i = 0; i < tabs.length; i++) {
+          tabs[i].className = 'log-tab' + (tabs[i].getAttribute('data-log') === key ? ' active' : '')
+        }
+        renderLogEntries()
       }
     })
 

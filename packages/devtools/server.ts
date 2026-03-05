@@ -116,6 +116,24 @@ async function getServerStatus() {
     'echo "===DB==="',
     'ls -lh /opt/mail/smtp.db 2>/dev/null | awk "{print \\\\$5}"',
     'sqlite3 /opt/mail/smtp.db "SELECT COUNT(*) FROM users;" 2>/dev/null',
+    'echo "===RECEIVED==="',
+    'find /opt/mail/mail -path "*/Sent" -prune -o -name "*.eml" -printf "%T@\\n" 2>/dev/null | sort -rn',
+    'echo "===SENT==="',
+    'find /opt/mail/mail -path "*/Sent/*.eml" -printf "%T@\\n" 2>/dev/null | sort -rn',
+    'echo "===AUTH_FAIL==="',
+    'grep -c "AUTH.*failed\\|AUTH LOGIN failed" /opt/mail/smtp-server.log 2>/dev/null || echo 0',
+    'echo "===CONNECTIONS==="',
+    'grep -c "Connection from client" /opt/mail/smtp-server.log 2>/dev/null || echo 0',
+    'echo "===IMAP_SESSIONS==="',
+    'grep -c "STARTTLS.*port 143\\|AUTHENTICATE completed" /opt/mail/smtp-server.log 2>/dev/null || echo 0',
+    'echo "===AUTH_FAIL_DETAIL==="',
+    'grep -i "AUTH.*failed\\|AUTH LOGIN failed" /opt/mail/smtp-server.log 2>/dev/null | tail -25',
+    'echo "===ERRORS==="',
+    'grep "\\\"level\\\":\\\"ERROR\\\"" /opt/mail/smtp-server.log 2>/dev/null | tail -25',
+    'echo "===WARNINGS==="',
+    'grep "\\\"level\\\":\\\"WARN\\\"" /opt/mail/smtp-server.log 2>/dev/null | grep -v "AUTH.*failed" | tail -15',
+    'echo "===RECENT_SMTP==="',
+    'grep -E "SMTP CMD|Connection from client|saved|deliver|forward" /opt/mail/smtp-server.log 2>/dev/null | tail -25',
   ])
 
   const sections: Record<string, string> = {}
@@ -221,6 +239,56 @@ async function getServerStatus() {
 
   const uptimeRaw = (sections.UPTIME || '').trim()
 
+  // Parse email timestamps into daily buckets
+  function bucketByDay(raw: string): Record<string, number> {
+    const buckets: Record<string, number> = {}
+    for (const line of raw.split('\n').filter(Boolean)) {
+      const ts = parseFloat(line)
+      if (isNaN(ts)) continue
+      const d = new Date(ts * 1000).toISOString().slice(0, 10)
+      buckets[d] = (buckets[d] || 0) + 1
+    }
+    return buckets
+  }
+
+  const receivedBuckets = bucketByDay(sections.RECEIVED || '')
+  const sentBuckets = bucketByDay(sections.SENT || '')
+
+  // Build daily series for last 90 days
+  const emailChart: { date: string; received: number; sent: number }[] = []
+  const today = new Date()
+  for (let i = 89; i >= 0; i--) {
+    const d = new Date(today.getTime() - i * 86400000).toISOString().slice(0, 10)
+    emailChart.push({
+      date: d,
+      received: receivedBuckets[d] || 0,
+      sent: sentBuckets[d] || 0,
+    })
+  }
+
+  const totalReceived = Object.values(receivedBuckets).reduce((a, b) => a + b, 0)
+  const totalSent = Object.values(sentBuckets).reduce((a, b) => a + b, 0)
+  const authFails = parseInt((sections.AUTH_FAIL || '0').trim()) || 0
+  const smtpConnections = parseInt((sections.CONNECTIONS || '0').trim()) || 0
+  const imapSessions = parseInt((sections.IMAP_SESSIONS || '0').trim()) || 0
+
+  // Parse structured JSON log lines into log entries
+  function parseLogLines(raw: string): { ts: number; level: string; message: string }[] {
+    return raw.split('\n').filter(Boolean).map(line => {
+      try {
+        const obj = JSON.parse(line)
+        return { ts: obj.timestamp || 0, level: obj.level || 'INFO', message: obj.message || '' }
+      } catch {
+        return { ts: 0, level: 'INFO', message: line }
+      }
+    }).filter(e => e.message)
+  }
+
+  const authFailDetails = parseLogLines(sections.AUTH_FAIL_DETAIL || '')
+  const errors = parseLogLines(sections.ERRORS || '')
+  const warnings = parseLogLines(sections.WARNINGS || '')
+  const recentSmtp = parseLogLines(sections.RECENT_SMTP || '')
+
   return {
     service: (sections.SERVICE || '').trim(),
     uptime: uptimeRaw.replace('up ', ''),
@@ -255,6 +323,16 @@ async function getServerStatus() {
     deliverability,
     dbSize,
     dbDetail: `${dbLines[1] || '?'} users`,
+    emailChart,
+    totalReceived,
+    totalSent,
+    authFails,
+    smtpConnections,
+    imapSessions,
+    authFailDetails,
+    errors,
+    warnings,
+    recentSmtp,
   }
 }
 
