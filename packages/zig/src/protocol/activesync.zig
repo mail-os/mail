@@ -650,7 +650,7 @@ pub const ActiveSyncServer = struct {
 
         while (self.running.load(.seq_cst)) {
             const connection = self.server.?.accept() catch |err| {
-                logger.err("ActiveSync accept error: {}", .{err});
+                logger.warn("ActiveSync accept error: {}", .{err});
                 continue;
             };
 

@@ -1218,11 +1218,11 @@ pub const Session = struct {
                 var sent: usize = 0;
                 while (sent < result.send.len) {
                     const n = self.connection.write(result.send[sent..]) catch |err| {
-                        self.logger.err("TLS handshake write error: {}", .{err});
+                        self.logger.debug("TLS handshake write error: {}", .{err});
                         return error.TlsHandshakeFailed;
                     };
                     if (n == 0) {
-                        self.logger.err("TLS handshake: connection closed during write", .{});
+                        self.logger.debug("TLS handshake: connection closed during write", .{});
                         return error.TlsHandshakeFailed;
                     }
                     sent += n;
@@ -1232,11 +1232,11 @@ pub const Session = struct {
             // Read more data from client if handshake not done
             if (!server_hs.done()) {
                 const n = self.connection.read(recv_buf[recv_len..]) catch |err| {
-                    self.logger.err("TLS handshake read error: {}", .{err});
+                    self.logger.debug("TLS handshake read error: {}", .{err});
                     return error.TlsHandshakeFailed;
                 };
                 if (n == 0) {
-                    self.logger.err("TLS handshake: connection closed during read", .{});
+                    self.logger.debug("TLS handshake: connection closed during read", .{});
                     return error.ConnectionClosed;
                 }
                 recv_len += n;

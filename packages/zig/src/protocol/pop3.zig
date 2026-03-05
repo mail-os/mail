@@ -614,7 +614,7 @@ pub const Pop3Server = struct {
 
         while (self.running.load(.monotonic)) {
             const connection = self.listener.?.accept() catch |err| {
-                logger.err("POP3 accept error: {}", .{err});
+                logger.warn("POP3 accept error: {}", .{err});
                 continue;
             };
 

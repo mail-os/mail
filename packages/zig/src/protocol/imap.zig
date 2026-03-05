@@ -2412,7 +2412,7 @@ pub const ImapServer = struct {
 
         while (self.running.load(.monotonic)) {
             const connection = self.listener.?.accept() catch |err| {
-                logger.err("IMAP accept error: {}", .{err});
+                logger.warn("IMAP accept error: {}", .{err});
                 continue;
             };
 
@@ -2446,7 +2446,7 @@ pub const ImapServer = struct {
         while (self.running.load(.monotonic)) {
             const connection = self.ssl_listener.?.accept() catch |err| {
                 if (!self.running.load(.monotonic)) break; // Server is stopping
-                logger.err("IMAPS accept error: {}", .{err});
+                logger.warn("IMAPS accept error: {}", .{err});
                 continue;
             };
 
@@ -2524,7 +2524,7 @@ pub const ImapServer = struct {
             while (!tls_server.done()) {
                 // Run handshake step
                 const result = tls_server.run(recv_buf[0..recv_len], &send_buf) catch |err| {
-                    logger.err("TLS handshake error: {}", .{err});
+                    logger.debug("TLS handshake error: {}", .{err});
                     return error.TlsHandshakeFailed;
                 };
 
@@ -2539,31 +2539,31 @@ pub const ImapServer = struct {
 
                 // Send data to client if any
                 if (result.send.len > 0) {
-                    logger.info("TLS handshake: preparing to send {d} bytes", .{result.send.len});
+                    logger.debug("TLS handshake: preparing to send {d} bytes", .{result.send.len});
                     var sent: usize = 0;
                     while (sent < result.send.len) {
                         const n = connection.write(result.send[sent..]) catch |err| {
-                            logger.err("TLS handshake write error: {}", .{err});
+                            logger.debug("TLS handshake write error: {}", .{err});
                             return error.TlsHandshakeFailed;
                         };
-                        logger.info("TLS handshake: wrote {d} bytes (total sent: {d}/{d})", .{ n, sent + n, result.send.len });
+                        logger.debug("TLS handshake: wrote {d} bytes (total sent: {d}/{d})", .{ n, sent + n, result.send.len });
                         if (n == 0) {
-                            logger.err("TLS handshake: connection closed during write", .{});
+                            logger.debug("TLS handshake: connection closed during write", .{});
                             return error.TlsHandshakeFailed;
                         }
                         sent += n;
                     }
-                    logger.info("TLS handshake: finished sending all {d} bytes", .{result.send.len});
+                    logger.debug("TLS handshake: finished sending all {d} bytes", .{result.send.len});
                 }
 
                 // Read more data from client if handshake not done
                 if (!tls_server.done()) {
                     const n = connection.read(recv_buf[recv_len..]) catch |err| {
-                        logger.err("TLS handshake read error: {}", .{err});
+                        logger.debug("TLS handshake read error: {}", .{err});
                         return error.TlsHandshakeFailed;
                     };
                     if (n == 0) {
-                        logger.err("TLS handshake: connection closed during read", .{});
+                        logger.debug("TLS handshake: connection closed during read", .{});
                         return error.TlsHandshakeFailed;
                     }
                     recv_len += n;
@@ -2788,7 +2788,7 @@ pub const ImapServer = struct {
                 var handshake_ok = true;
                 while (!tls_server.done()) {
                     const result = tls_server.run(recv_buf[0..recv_len], &send_buf) catch |err| {
-                        logger.err("STARTTLS handshake error: {}", .{err});
+                        logger.debug("STARTTLS handshake error: {}", .{err});
                         handshake_ok = false;
                         break;
                     };
@@ -2805,7 +2805,7 @@ pub const ImapServer = struct {
                         var sent: usize = 0;
                         while (sent < result.send.len) {
                             const n = connection.write(result.send[sent..]) catch |err| {
-                                logger.err("STARTTLS handshake write error: {}", .{err});
+                                logger.debug("STARTTLS handshake write error: {}", .{err});
                                 handshake_ok = false;
                                 break;
                             };
@@ -2820,7 +2820,7 @@ pub const ImapServer = struct {
 
                     if (!tls_server.done()) {
                         const n = connection.read(recv_buf[recv_len..]) catch |err| {
-                            logger.err("STARTTLS handshake read error: {}", .{err});
+                            logger.debug("STARTTLS handshake read error: {}", .{err});
                             handshake_ok = false;
                             break;
                         };

@@ -803,7 +803,7 @@ pub const ManageSieveServer = struct {
         while (self.running.load(.monotonic)) {
             const conn = self.listener.?.accept() catch |err| {
                 if (!self.running.load(.monotonic)) break;
-                std.log.err("ManageSieve accept: {}", .{err});
+                std.log.warn("ManageSieve accept: {}", .{err});
                 continue;
             };
             self.mutex.lock();

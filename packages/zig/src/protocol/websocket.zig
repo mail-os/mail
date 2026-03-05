@@ -582,7 +582,7 @@ pub const WebSocketServer = struct {
 
         while (self.running.load(.seq_cst)) {
             const connection = self.server.?.accept() catch |err| {
-                logger.err("WebSocket accept error: {}", .{err});
+                logger.warn("WebSocket accept error: {}", .{err});
                 continue;
             };
 
@@ -613,7 +613,7 @@ pub const WebSocketServer = struct {
 
         // Perform handshake
         session.handshake() catch |err| {
-            logger.err("WebSocket handshake error: {}", .{err});
+            logger.debug("WebSocket handshake error: {}", .{err});
             return;
         };
 

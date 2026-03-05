@@ -1686,7 +1686,7 @@ pub const CalDavServer = struct {
         while (self.running.load(.monotonic)) {
             const connection = self.listener.?.accept() catch |err| {
                 if (!self.running.load(.monotonic)) break;
-                logger.err("CalDAV accept error: {}", .{err});
+                logger.warn("CalDAV accept error: {}", .{err});
                 continue;
             };
 
@@ -1717,13 +1717,13 @@ pub const CalDavServer = struct {
         while (self.running.load(.monotonic)) {
             const connection = self.ssl_listener.?.accept() catch |err| {
                 if (!self.running.load(.monotonic)) break;
-                logger.err("CalDAV SSL accept error: {}", .{err});
+                logger.warn("CalDAV SSL accept error: {}", .{err});
                 continue;
             };
 
             // Handle SSL connection (defer in handleConnection closes the connection)
             self.handleConnection(connection, true) catch |err| {
-                logger.err("CalDAV SSL connection error: {}", .{err});
+                logger.debug("CalDAV SSL connection error: {}", .{err});
                 // Note: connection.close() is handled by defer in handleConnection
             };
         }
@@ -1773,17 +1773,17 @@ pub const CalDavServer = struct {
             while (!tls_server.done()) {
                 // Log raw data before processing (for debugging Mail.app issues)
                 if (first_read and recv_len > 0) {
-                    logger.info("CalDAV TLS: first {d} bytes received, record type: {d}", .{ recv_len, recv_buf[0] });
+                    logger.debug("CalDAV TLS: first {d} bytes received, record type: {d}", .{ recv_len, recv_buf[0] });
                     if (recv_len >= 5) {
-                        logger.info("CalDAV TLS: version=0x{x:0>2}{x:0>2}, length={d}", .{ recv_buf[1], recv_buf[2], @as(u16, recv_buf[3]) << 8 | recv_buf[4] });
+                        logger.debug("CalDAV TLS: version=0x{x:0>2}{x:0>2}, length={d}", .{ recv_buf[1], recv_buf[2], @as(u16, recv_buf[3]) << 8 | recv_buf[4] });
                     }
                     first_read = false;
                 }
 
                 const result = tls_server.run(recv_buf[0..recv_len], &send_buf) catch |err| {
-                    logger.err("CalDAV TLS handshake error: {} (recv_len={d})", .{ err, recv_len });
+                    logger.debug("CalDAV TLS handshake error: {} (recv_len={d})", .{ err, recv_len });
                     if (recv_len > 0) {
-                        logger.err("CalDAV TLS: first byte=0x{x:0>2}", .{recv_buf[0]});
+                        logger.debug("CalDAV TLS: first byte=0x{x:0>2}", .{recv_buf[0]});
                     }
                     return error.TlsHandshakeFailed;
                 };
@@ -1800,7 +1800,7 @@ pub const CalDavServer = struct {
                     var sent: usize = 0;
                     while (sent < result.send.len) {
                         const n = connection.write(result.send[sent..]) catch |err| {
-                            logger.err("CalDAV TLS handshake write error: {}", .{err});
+                            logger.debug("CalDAV TLS handshake write error: {}", .{err});
                             return error.TlsHandshakeFailed;
                         };
                         if (n == 0) return error.TlsHandshakeFailed;
@@ -1810,7 +1810,7 @@ pub const CalDavServer = struct {
 
                 if (!tls_server.done()) {
                     const n = connection.read(recv_buf[recv_len..]) catch |err| {
-                        logger.err("CalDAV TLS handshake read error: {}", .{err});
+                        logger.debug("CalDAV TLS handshake read error: {}", .{err});
                         return error.TlsHandshakeFailed;
                     };
                     if (n == 0) return error.TlsHandshakeFailed;

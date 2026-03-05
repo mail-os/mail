@@ -128,7 +128,7 @@ pub const Server = struct {
                     time_compat.sleepMs(100);
                     continue;
                 }
-                self.logger.err("Error accepting connection: {}", .{err});
+                self.logger.warn("Error accepting connection: {}", .{err});
                 continue;
             };
 
@@ -227,7 +227,7 @@ pub const Server = struct {
         // For SMTPS (port 465), perform TLS handshake before SMTP banner
         if (ctx.implicit_tls) {
             session.performImplicitTls() catch |err| {
-                ctx.server.logger.err("SMTPS TLS handshake failed from {s}: {}", .{ ctx.remote_addr, err });
+                ctx.server.logger.warn("SMTPS TLS handshake failed from {s}: {}", .{ ctx.remote_addr, err });
                 return;
             };
         }
@@ -262,7 +262,7 @@ pub const Server = struct {
                     time_compat.sleepMs(100);
                     continue;
                 }
-                self.logger.err("SMTPS: Error accepting connection: {}", .{err});
+                self.logger.warn("SMTPS: Error accepting connection: {}", .{err});
                 continue;
             };
 
@@ -313,7 +313,7 @@ pub const Server = struct {
                     time_compat.sleepMs(100);
                     continue;
                 }
-                self.logger.err("Submission: Error accepting connection: {}", .{err});
+                self.logger.warn("Submission: Error accepting connection: {}", .{err});
                 continue;
             };
 
