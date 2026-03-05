@@ -34,3 +34,4 @@ test-emails/
 *.eml
 /pantry
 zig-pkg/
+/packages/zig/pantry

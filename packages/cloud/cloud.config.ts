@@ -368,12 +368,15 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=mail
 
+# Allow binding to privileged ports (25, 80, 143, etc.)
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
 # Security hardening
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=${cfg.paths.dataDir} ${cfg.paths.logDir} ${cfg.paths.mailDir} ${cfg.paths.installDir}/mail
+ReadWritePaths=${cfg.paths.installDir}
 
 [Install]
 WantedBy=multi-user.target

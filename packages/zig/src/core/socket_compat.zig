@@ -104,14 +104,34 @@ pub const Server = struct {
         if (options.reuse_address) {
             const one: c_int = 1;
             try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
+            // Also set SO_REUSEPORT to allow binding even when port is in TIME_WAIT
+            posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&one)) catch {};
         }
 
         if (address.family == .ipv4) {
             const sockaddr = address.toSockaddrIn();
-            if (std.c.bind(fd, @ptrCast(&sockaddr), @sizeOf(@TypeOf(sockaddr))) < 0) return error.Unexpected;
+            if (std.c.bind(fd, @ptrCast(&sockaddr), @sizeOf(@TypeOf(sockaddr))) < 0) {
+                const e: posix.E = @enumFromInt(std.c._errno().*);
+                std.log.err("bind() failed on port {d}: errno={d}", .{ address.port, @intFromEnum(e) });
+                return switch (e) {
+                    .ADDRINUSE => error.AddressInUse,
+                    .ADDRNOTAVAIL => error.AddressNotAvailable,
+                    .ACCES => error.PermissionDenied,
+                    else => error.Unexpected,
+                };
+            }
         } else {
             const sockaddr = address.toSockaddrIn6();
-            if (std.c.bind(fd, @ptrCast(&sockaddr), @sizeOf(@TypeOf(sockaddr))) < 0) return error.Unexpected;
+            if (std.c.bind(fd, @ptrCast(&sockaddr), @sizeOf(@TypeOf(sockaddr))) < 0) {
+                const e: posix.E = @enumFromInt(std.c._errno().*);
+                std.log.err("bind() failed on port {d}: errno={d}", .{ address.port, @intFromEnum(e) });
+                return switch (e) {
+                    .ADDRINUSE => error.AddressInUse,
+                    .ADDRNOTAVAIL => error.AddressNotAvailable,
+                    .ACCES => error.PermissionDenied,
+                    else => error.Unexpected,
+                };
+            }
         }
         if (std.c.listen(fd, options.kernel_backlog) < 0) return error.Unexpected;
 
