@@ -428,11 +428,89 @@ function getUptimeChartData(): { days: Record<number, { date: string; pct: numbe
 
 loadUptimeHistory()
 
-// Record uptime every 60 seconds
+// Resource history - stores { ts, cpu, mem } snapshots
+interface ResourceEntry { ts: number; cpu: number; mem: number }
+const RESOURCE_STORE = process.env.RESOURCE_STORE || './resources.json'
+let resourceHistory: ResourceEntry[] = []
+
+function loadResourceHistory() {
+  try {
+    const raw = require('fs').readFileSync(RESOURCE_STORE, 'utf8')
+    resourceHistory = JSON.parse(raw)
+  } catch { resourceHistory = [] }
+}
+
+function saveResourceHistory() {
+  try {
+    require('fs').writeFileSync(RESOURCE_STORE, JSON.stringify(resourceHistory))
+  } catch {}
+}
+
+function recordResource(cpu: number, mem: number) {
+  const now = Date.now()
+  resourceHistory.push({ ts: now, cpu, mem })
+  // Keep 7 days at 60s intervals = ~10k entries
+  const cutoff = now - 7 * 86400000
+  resourceHistory = resourceHistory.filter(e => e.ts >= cutoff)
+  saveResourceHistory()
+}
+
+function getResourceChartData(): { labels: string[]; cpu: number[]; mem: number[] } {
+  // Downsample to ~288 points (every 5 minutes over 24h, or whatever we have)
+  const bucketSize = 5 * 60 * 1000 // 5 minutes
+  const buckets: Record<number, { cpuSum: number; memSum: number; count: number }> = {}
+
+  for (const e of resourceHistory) {
+    const key = Math.floor(e.ts / bucketSize) * bucketSize
+    if (!buckets[key]) buckets[key] = { cpuSum: 0, memSum: 0, count: 0 }
+    buckets[key].cpuSum += e.cpu
+    buckets[key].memSum += e.mem
+    buckets[key].count++
+  }
+
+  const keys = Object.keys(buckets).map(Number).sort()
+  const labels: string[] = []
+  const cpu: number[] = []
+  const mem: number[] = []
+
+  for (const k of keys) {
+    const b = buckets[k]
+    labels.push(new Date(k).toISOString())
+    cpu.push(Math.round(b.cpuSum / b.count))
+    mem.push(Math.round(b.memSum / b.count))
+  }
+
+  return { labels, cpu, mem }
+}
+
+loadResourceHistory()
+
+// Record uptime + resources every 60 seconds
 setInterval(async () => {
   try {
-    const output = await ssmRun(['systemctl is-active mail 2>/dev/null || echo inactive'])
-    recordUptime(output.trim() === 'active')
+    const output = await ssmRun([
+      'systemctl is-active mail 2>/dev/null || echo inactive',
+      'echo "---RESOURCES---"',
+      'top -bn1 | grep "Cpu(s)" | head -1',
+      'free -m | grep Mem',
+    ])
+    const lines = output.split('\n')
+    const statusLine = lines[0]?.trim()
+    recordUptime(statusLine === 'active')
+
+    // Parse CPU
+    const cpuLine = lines.find(l => l.includes('Cpu(s)') || l.includes('id'))
+    const cpuMatch = cpuLine?.match(/(\d+\.?\d*)\s*id/)
+    const cpuPct = cpuMatch ? Math.round(100 - parseFloat(cpuMatch[1])) : 0
+
+    // Parse MEM
+    const memLine = lines.find(l => l.includes('Mem'))
+    const memParts = memLine?.trim().split(/\s+/)
+    const memTotal = parseInt(memParts?.[1] || '1') || 1
+    const memUsed = parseInt(memParts?.[2] || '0') || 0
+    const memPct = Math.round((memUsed / memTotal) * 100)
+
+    recordResource(cpuPct, memPct)
   } catch {
     recordUptime(false)
   }
@@ -470,7 +548,9 @@ const server = serve({
         try {
           const data = await getServerStatus()
           recordUptime(data.service === 'active')
+          recordResource(data.cpuPercent ?? 0, data.memPercent ?? 0)
           ;(data as any).uptimeChart = getUptimeChartData()
+          ;(data as any).resourceChart = getResourceChartData()
           cache = { data, time: Date.now() }
           return Response.json(data)
         } catch (e: any) {

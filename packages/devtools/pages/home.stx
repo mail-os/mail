@@ -1116,20 +1116,34 @@
     <div class="section-title">Resources</div>
     <div class="grid grid-2">
       <div class="card">
-        <div class="card-label">Memory</div>
-        <div class="card-value text-blue" id="mem-usage">--</div>
-        <div class="progress-track">
+        <div style="display:flex;justify-content:space-between;align-items:baseline">
+          <div class="card-label">Memory</div>
+          <div style="display:flex;align-items:baseline;gap:0.5rem">
+            <span class="card-value text-blue" id="mem-usage" style="font-size:1.5rem">--</span>
+            <span class="card-sub" id="mem-detail" style="margin-top:0"></span>
+          </div>
+        </div>
+        <div class="progress-track" style="margin-top:0.5rem">
           <div class="progress-fill" id="mem-bar" style="width:0%;background:var(--blue)"></div>
         </div>
-        <div class="card-sub" id="mem-detail"></div>
+        <div style="position:relative;height:100px;margin-top:0.75rem">
+          <canvas id="mem-chart" style="width:100%;height:100%"></canvas>
+        </div>
       </div>
       <div class="card">
-        <div class="card-label">CPU</div>
-        <div class="card-value" id="cpu-usage" style="color:var(--accent)">--</div>
-        <div class="progress-track">
+        <div style="display:flex;justify-content:space-between;align-items:baseline">
+          <div class="card-label">CPU</div>
+          <div style="display:flex;align-items:baseline;gap:0.5rem">
+            <span class="card-value" id="cpu-usage" style="font-size:1.5rem;color:var(--accent)">--</span>
+            <span class="card-sub" id="cpu-detail" style="margin-top:0"></span>
+          </div>
+        </div>
+        <div class="progress-track" style="margin-top:0.5rem">
           <div class="progress-fill" id="cpu-bar" style="width:0%;background:var(--accent)"></div>
         </div>
-        <div class="card-sub" id="cpu-detail"></div>
+        <div style="position:relative;height:100px;margin-top:0.75rem">
+          <canvas id="cpu-chart" style="width:100%;height:100%"></canvas>
+        </div>
       </div>
     </div>
   </main>
@@ -1154,6 +1168,7 @@
     }
 
     function render(d) {
+      _lastData = d
       // Header
       $('header-domain').textContent = d.dns?.a ? d.tls?.domain || '--' : '--'
 
@@ -1243,6 +1258,12 @@
       $('cpu-usage').textContent = (d.cpuPercent ?? '--') + '%'
       $('cpu-bar').style.width = (d.cpuPercent || 0) + '%'
       $('cpu-detail').textContent = d.cpuDetail || ''
+
+      // Resource charts
+      if (d.resourceChart) {
+        drawAreaChart('mem-chart', d.resourceChart.mem, d.resourceChart.labels, '96,165,250', 100)
+        drawAreaChart('cpu-chart', d.resourceChart.cpu, d.resourceChart.labels, '129,140,248', 100)
+      }
 
       $('db-size').textContent = d.dbSize || '--'
       $('db-detail').textContent = d.dbDetail || ''
@@ -1433,6 +1454,119 @@
         renderEmailBars()
       }
     })
+
+    // Area chart drawing
+    function drawAreaChart(canvasId, data, labels, rgb, maxVal) {
+      var canvas = $(canvasId)
+      if (!canvas) return
+      var dpr = window.devicePixelRatio || 1
+      var rect = canvas.parentElement.getBoundingClientRect()
+      var w = rect.width
+      var h = rect.height
+      canvas.width = w * dpr
+      canvas.height = h * dpr
+      canvas.style.width = w + 'px'
+      canvas.style.height = h + 'px'
+
+      var ctx = canvas.getContext('2d')
+      ctx.scale(dpr, dpr)
+      ctx.clearRect(0, 0, w, h)
+
+      if (!data || data.length < 2) {
+        ctx.fillStyle = 'rgba(' + rgb + ',0.3)'
+        ctx.font = '11px -apple-system, system-ui, sans-serif'
+        ctx.textAlign = 'center'
+        ctx.fillText('Collecting data...', w / 2, h / 2)
+        return
+      }
+
+      var padTop = 4
+      var padBot = 14
+      var chartH = h - padTop - padBot
+      var stepX = w / (data.length - 1)
+
+      // Grid lines
+      ctx.strokeStyle = 'rgba(42,50,72,0.4)'
+      ctx.lineWidth = 0.5
+      for (var g = 0; g <= 4; g++) {
+        var gy = padTop + (chartH * g / 4)
+        ctx.beginPath()
+        ctx.moveTo(0, gy)
+        ctx.lineTo(w, gy)
+        ctx.stroke()
+      }
+
+      // Y-axis labels
+      ctx.fillStyle = 'rgba(74,87,120,0.8)'
+      ctx.font = '9px -apple-system, system-ui, sans-serif'
+      ctx.textAlign = 'right'
+      ctx.fillText(maxVal + '%', w - 2, padTop + 8)
+      ctx.fillText('0%', w - 2, h - padBot - 2)
+
+      // Area fill
+      ctx.beginPath()
+      ctx.moveTo(0, padTop + chartH - (data[0] / maxVal) * chartH)
+      for (var i = 1; i < data.length; i++) {
+        var x = i * stepX
+        var y = padTop + chartH - (data[i] / maxVal) * chartH
+        ctx.lineTo(x, y)
+      }
+      ctx.lineTo(w, padTop + chartH)
+      ctx.lineTo(0, padTop + chartH)
+      ctx.closePath()
+      var grad = ctx.createLinearGradient(0, padTop, 0, padTop + chartH)
+      grad.addColorStop(0, 'rgba(' + rgb + ',0.25)')
+      grad.addColorStop(1, 'rgba(' + rgb + ',0.02)')
+      ctx.fillStyle = grad
+      ctx.fill()
+
+      // Line
+      ctx.beginPath()
+      ctx.moveTo(0, padTop + chartH - (data[0] / maxVal) * chartH)
+      for (var i = 1; i < data.length; i++) {
+        var x = i * stepX
+        var y = padTop + chartH - (data[i] / maxVal) * chartH
+        ctx.lineTo(x, y)
+      }
+      ctx.strokeStyle = 'rgba(' + rgb + ',0.8)'
+      ctx.lineWidth = 1.5
+      ctx.stroke()
+
+      // Time labels
+      ctx.fillStyle = 'rgba(74,87,120,0.6)'
+      ctx.font = '9px -apple-system, system-ui, sans-serif'
+      ctx.textAlign = 'center'
+      if (labels.length >= 2) {
+        var first = new Date(labels[0])
+        var last = new Date(labels[labels.length - 1])
+        ctx.textAlign = 'left'
+        ctx.fillText(formatTimeLabel(first), 2, h - 2)
+        ctx.textAlign = 'right'
+        ctx.fillText(formatTimeLabel(last), w - 2, h - 2)
+        if (labels.length > 10) {
+          var mid = new Date(labels[Math.floor(labels.length / 2)])
+          ctx.textAlign = 'center'
+          ctx.fillText(formatTimeLabel(mid), w / 2, h - 2)
+        }
+      }
+    }
+
+    function formatTimeLabel(d) {
+      var now = new Date()
+      var diff = now.getTime() - d.getTime()
+      if (diff < 86400000) {
+        return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      }
+      return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    }
+
+    // Redraw charts on resize
+    var _resizeTimer
+    window.addEventListener('resize', function() {
+      clearTimeout(_resizeTimer)
+      _resizeTimer = setTimeout(function() { if (_lastData) render(_lastData) }, 200)
+    })
+    var _lastData = null
 
     // Logs
     var _logData = {}
