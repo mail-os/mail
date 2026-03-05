@@ -216,7 +216,7 @@ curl -X PUT https://mail.example.com:8443/calendars/user/work/event-001.ics \
   --data-binary @- <<'EOF'
 BEGIN:VCALENDAR
 VERSION:2.0
-PRODID:-//SMTP Server//CalDAV//EN
+PRODID:-//Mail Server//CalDAV//EN
 BEGIN:VEVENT
 UID:event-001@example.com
 DTSTAMP:20250124T120000Z

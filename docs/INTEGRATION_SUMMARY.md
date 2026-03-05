@@ -12,7 +12,7 @@ This document summarizes the integration of zig-bump into the SMTP server projec
 
 The bump tool is now built and installed automatically when you run `zig build`.
 
-**Location:** `/path/to/smtp-server/zig-out/bin/bump`
+**Location:** `/path/to/mail/zig-out/bin/bump`
 
 ### 2. GitHub Actions Workflows
 
@@ -283,7 +283,7 @@ zig build -Doptimize=ReleaseFast
 
 Then rebuild the SMTP server:
 ```bash
-cd /path/to/smtp-server
+cd /path/to/mail
 zig build
 ```
 

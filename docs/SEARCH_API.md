@@ -691,8 +691,8 @@ searchMessages('invoice', { email: 'user@example.com', limit: 50 })
 
 For issues, questions, or feature requests:
 
-- GitHub Issues: https://github.com/yourusername/smtp-server/issues
-- Documentation: https://github.com/yourusername/smtp-server/docs
+- GitHub Issues: https://github.com/yourusername/mail/issues
+- Documentation: https://github.com/yourusername/mail/docs
 - Email: support@example.com
 
 ---
