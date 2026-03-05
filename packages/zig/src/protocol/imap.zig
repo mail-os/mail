@@ -9,6 +9,7 @@ const logger = @import("../core/logger.zig");
 const tls_mod = @import("../core/tls.zig");
 const tls = @import("tls");
 const fs_compat = @import("../core/fs_compat.zig");
+const database = @import("../storage/database.zig");
 
 /// Strip surrounding double quotes from an IMAP token.
 /// IMAP clients (e.g. Python imaplib) quote usernames and passwords.
@@ -312,6 +313,7 @@ pub const ImapCommand = enum {
     // Selected
     check,
     close,
+    unselect,
     expunge,
     search,
     fetch,
@@ -349,6 +351,7 @@ pub const ImapCommand = enum {
             .{ "APPEND", .append },
             .{ "CHECK", .check },
             .{ "CLOSE", .close },
+            .{ "UNSELECT", .unselect },
             .{ "EXPUNGE", .expunge },
             .{ "SEARCH", .search },
             .{ "FETCH", .fetch },
@@ -630,13 +633,19 @@ pub const ImapSession = struct {
     command_buffer: std.ArrayList(u8),
     idle_mode: bool = false,
     idle_tag: ?[]const u8 = null,
+    mailbox_read_only: bool = false,
     auth_backend: *auth.AuthBackend,
+    db: ?*database.Database = null,
     // TLS support for encrypted responses
     tls_connection: ?*tls.nonblock.Connection = null,
     // Cached list of message filenames in the selected mailbox (sorted)
     mailbox_files: ?[]const []const u8 = null,
     // Path to the selected mailbox's new/ directory
     mailbox_dir: ?[]const u8 = null,
+    // UID persistence: parallel array of UIDs for mailbox_files (same indices)
+    mailbox_uids: ?[]i64 = null,
+    mailbox_uidvalidity: i64 = 0,
+    mailbox_name: ?[]const u8 = null,
     // Pending APPEND literal state
     append_tag: ?[]u8 = null,
     append_mailbox: ?[]u8 = null,
@@ -646,13 +655,14 @@ pub const ImapSession = struct {
     // STARTTLS upgrade requested (port 143 → TLS)
     starttls_requested: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, connection: socket.Connection, auth_backend: *auth.AuthBackend) ImapSession {
+    pub fn init(allocator: std.mem.Allocator, connection: socket.Connection, auth_backend: *auth.AuthBackend, db: ?*database.Database) ImapSession {
         return .{
             .allocator = allocator,
             .connection = connection,
             .state = .not_authenticated,
             .command_buffer = std.ArrayList(u8){},
             .auth_backend = auth_backend,
+            .db = db,
             .tls_connection = null,
         };
     }
@@ -674,6 +684,7 @@ pub const ImapSession = struct {
         }
         self.cleanupAppend();
         self.freeMailboxFiles();
+        if (self.mailbox_name) |n| self.allocator.free(n);
         self.command_buffer.deinit(self.allocator);
     }
 
@@ -686,6 +697,115 @@ pub const ImapSession = struct {
         if (self.mailbox_dir) |d| {
             self.allocator.free(d);
             self.mailbox_dir = null;
+        }
+        if (self.mailbox_uids) |uids| {
+            self.allocator.free(uids);
+            self.mailbox_uids = null;
+        }
+    }
+
+    /// Sync UIDs for the current mailbox_files using the database.
+    /// Assigns UIDs to new files and builds the mailbox_uids parallel array.
+    fn syncUids(self: *ImapSession) !void {
+        const db = self.db orelse return;
+        const files = self.mailbox_files orelse return;
+
+        const full_username = self.username orelse return;
+        const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
+            full_username[0..at_pos]
+        else
+            full_username;
+
+        const mailbox = self.mailbox_name orelse "INBOX";
+
+        // Ensure mailbox record exists
+        const mb_info = db.getOrCreateMailbox(username, mailbox) catch return;
+        self.mailbox_uidvalidity = mb_info.uidvalidity;
+
+        // Remove stale UIDs for files that no longer exist
+        db.removeStaleUids(username, mailbox, files) catch {};
+
+        // Build UID array
+        if (self.mailbox_uids) |old| self.allocator.free(old);
+        const uids = try self.allocator.alloc(i64, files.len);
+
+        for (files, 0..) |filename, i| {
+            // Try to get existing UID, or assign a new one
+            if (db.getUidForFile(username, mailbox, filename) catch null) |uid| {
+                uids[i] = uid;
+            } else {
+                uids[i] = db.assignUid(username, mailbox, filename) catch @as(i64, @intCast(i + 1));
+            }
+        }
+
+        self.mailbox_uids = uids;
+    }
+
+    /// Get the UID for a given sequence number (1-based).
+    fn getUidForSeq(self: *ImapSession, seq: usize) i64 {
+        if (self.mailbox_uids) |uids| {
+            if (seq >= 1 and seq <= uids.len) {
+                return uids[seq - 1];
+            }
+        }
+        return @intCast(seq);
+    }
+
+    /// Find sequence number (1-based) for a given UID. Returns null if not found.
+    fn getSeqForUid(self: *ImapSession, uid: i64) ?usize {
+        if (self.mailbox_uids) |uids| {
+            for (uids, 0..) |u, i| {
+                if (u == uid) return i + 1;
+            }
+            return null;
+        }
+        // Fallback: UID == sequence number
+        if (uid >= 1) return @intCast(uid);
+        return null;
+    }
+
+    /// Translate a UID set string (e.g. "5", "1:10", "3:*") to a sequence number set.
+    /// For UID ranges, finds matching sequence numbers and returns a "start:end" string.
+    fn uidSetToSeqSet(self: *ImapSession, uid_set: []const u8) ![]const u8 {
+        const files = self.mailbox_files orelse return uid_set;
+        const uids = self.mailbox_uids orelse return uid_set;
+
+        if (std.mem.indexOf(u8, uid_set, ":")) |colon| {
+            const start_str = uid_set[0..colon];
+            const end_str = uid_set[colon + 1 ..];
+
+            const start_uid = std.fmt.parseInt(i64, start_str, 10) catch 1;
+            const is_star = std.mem.eql(u8, end_str, "*");
+            const end_uid = if (is_star) std.math.maxInt(i64) else (std.fmt.parseInt(i64, end_str, 10) catch @as(i64, @intCast(files.len)));
+
+            // Find min and max sequence numbers that fall in this UID range
+            var min_seq: ?usize = null;
+            var max_seq: ?usize = null;
+            for (uids, 0..) |u, i| {
+                if (u >= start_uid and u <= end_uid) {
+                    const seq = i + 1;
+                    if (min_seq == null or seq < min_seq.?) min_seq = seq;
+                    if (max_seq == null or seq > max_seq.?) max_seq = seq;
+                }
+            }
+
+            if (min_seq) |mn| {
+                if (max_seq) |mx| {
+                    if (mn == mx) {
+                        return try std.fmt.allocPrint(self.allocator, "{d}", .{mn});
+                    }
+                    return try std.fmt.allocPrint(self.allocator, "{d}:{d}", .{ mn, mx });
+                }
+            }
+            // No matches — return "0:0" which won't match anything
+            return try self.allocator.dupe(u8, "0:0");
+        } else {
+            // Single UID
+            const target_uid = std.fmt.parseInt(i64, uid_set, 10) catch return uid_set;
+            if (self.getSeqForUid(target_uid)) |seq| {
+                return try std.fmt.allocPrint(self.allocator, "{d}", .{seq});
+            }
+            return try self.allocator.dupe(u8, "0");
         }
     }
 
@@ -707,6 +827,9 @@ pub const ImapSession = struct {
                 self.allocator.free(old_files);
             }
             self.mailbox_files = if (new_count > 0) new_files else null;
+
+            // Sync UIDs for new files
+            self.syncUids() catch {};
 
             // Notify client of new message count
             const exists_msg = try std.fmt.allocPrint(self.allocator, "{d} EXISTS", .{new_count});
@@ -877,7 +1000,7 @@ pub const ImapSession = struct {
 
     /// Send greeting
     pub fn sendGreeting(self: *ImapSession) !void {
-        const greeting = "* OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN] SMTP Server IMAP4rev1 ready\r\n";
+        const greeting = "* OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN AUTH=LOGIN IDLE NAMESPACE UIDPLUS SPECIAL-USE MOVE] Mail Server IMAP4rev1 ready\r\n";
         try self.writeData(greeting);
     }
 
@@ -1226,9 +1349,16 @@ pub const ImapSession = struct {
 
         // Free previous mailbox state
         self.freeMailboxFiles();
+        if (self.mailbox_name) |n| {
+            self.allocator.free(n);
+            self.mailbox_name = null;
+        }
 
         // Strip quotes from mailbox name (Apple Mail sends "INBOX" with quotes sometimes)
         const mailbox = stripQuotes(mailbox_name);
+
+        // Store mailbox name for UID persistence
+        self.mailbox_name = try self.allocator.dupe(u8, if (std.ascii.eqlIgnoreCase(mailbox, "INBOX")) "INBOX" else mailbox);
 
         const is_inbox = std.ascii.eqlIgnoreCase(mailbox, "INBOX");
 
@@ -1247,14 +1377,7 @@ pub const ImapSession = struct {
             // Directory doesn't exist or can't be read — treat as empty
             self.mailbox_dir = user_dir;
             self.mailbox_files = null;
-            try self.sendUntagged("0 EXISTS");
-            try self.sendUntagged("0 RECENT");
-            try self.sendUntagged("OK [UIDVALIDITY 1772487000]");
-            try self.sendUntagged("OK [UIDNEXT 1]");
-            try self.sendUntagged("FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)");
-            try self.sendUntagged("OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)]");
-            self.state = .selected;
-            try self.sendResponse(tag, "OK", "[READ-WRITE] SELECT completed");
+            try self.sendSelectResponse(tag, username, 0, 0);
             return;
         };
         if (is_inbox and files.len == 0) {
@@ -1264,14 +1387,7 @@ pub const ImapSession = struct {
             const inbox_files = fs_compat.listEmlFiles(self.allocator, global_dir) catch {
                 self.mailbox_dir = global_dir;
                 self.mailbox_files = null;
-                try self.sendUntagged("0 EXISTS");
-                try self.sendUntagged("0 RECENT");
-                try self.sendUntagged("OK [UIDVALIDITY 1772487000]");
-                try self.sendUntagged("OK [UIDNEXT 1]");
-                try self.sendUntagged("FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)");
-                try self.sendUntagged("OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)]");
-                self.state = .selected;
-                try self.sendResponse(tag, "OK", "[READ-WRITE] SELECT completed");
+                try self.sendSelectResponse(tag, username, 0, 0);
                 return;
             };
             self.mailbox_dir = global_dir;
@@ -1287,24 +1403,58 @@ pub const ImapSession = struct {
 
         const msg_count = if (self.mailbox_files) |f| f.len else 0;
 
-        // Send mailbox info
+        // Sync UIDs from database
+        self.syncUids() catch {};
+
+        // RECENT = messages without \Seen flag (new arrivals)
+        var recent_count: usize = 0;
+        if (self.mailbox_files) |mfiles| {
+            for (mfiles) |fname| {
+                const flags = MaildirFlags.fromFilename(fname);
+                if (!flags.seen) recent_count += 1;
+            }
+        }
+
+        try self.sendSelectResponse(tag, username, msg_count, recent_count);
+    }
+
+    /// Send the SELECT/EXAMINE response with proper UIDVALIDITY and UIDNEXT.
+    fn sendSelectResponse(self: *ImapSession, tag: []const u8, username: []const u8, msg_count: usize, recent_count: usize) !void {
         const exists_msg = try std.fmt.allocPrint(self.allocator, "{d} EXISTS", .{msg_count});
         defer self.allocator.free(exists_msg);
         try self.sendUntagged(exists_msg);
 
-        const recent_msg = try std.fmt.allocPrint(self.allocator, "{d} RECENT", .{msg_count});
+        const recent_msg = try std.fmt.allocPrint(self.allocator, "{d} RECENT", .{recent_count});
         defer self.allocator.free(recent_msg);
         try self.sendUntagged(recent_msg);
 
-        try self.sendUntagged("OK [UIDVALIDITY 1772487000]");
-        const uidnext_msg = try std.fmt.allocPrint(self.allocator, "OK [UIDNEXT {d}]", .{msg_count + 1});
+        // Get UIDVALIDITY and UIDNEXT from database
+        const mbox_name = self.mailbox_name orelse "INBOX";
+        var uidvalidity: i64 = 1;
+        var uidnext: i64 = @as(i64, @intCast(msg_count)) + 1;
+        if (self.db) |db| {
+            if (db.getOrCreateMailbox(username, mbox_name)) |info| {
+                uidvalidity = info.uidvalidity;
+                if (db.getUidNext(username, mbox_name)) |next| {
+                    uidnext = next;
+                } else |_| {}
+            } else |_| {}
+            self.mailbox_uidvalidity = uidvalidity;
+        }
+
+        const uidvalidity_msg = try std.fmt.allocPrint(self.allocator, "OK [UIDVALIDITY {d}]", .{uidvalidity});
+        defer self.allocator.free(uidvalidity_msg);
+        try self.sendUntagged(uidvalidity_msg);
+
+        const uidnext_msg = try std.fmt.allocPrint(self.allocator, "OK [UIDNEXT {d}]", .{uidnext});
         defer self.allocator.free(uidnext_msg);
         try self.sendUntagged(uidnext_msg);
+
         try self.sendUntagged("FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)");
         try self.sendUntagged("OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)]");
 
         self.state = .selected;
-        try self.sendResponse(tag, "OK", "[READ-WRITE] SELECT completed");
+        try self.sendResponse(tag, "OK", if (self.mailbox_read_only) "[READ-ONLY] EXAMINE completed" else "[READ-WRITE] SELECT completed");
     }
 
     /// Handle FETCH command
@@ -1368,19 +1518,24 @@ pub const ImapSession = struct {
             }
             break :blk false;
         };
-        // BODY.PEEK[] or BODY[] or BODY[TEXT] or BODY[n] or RFC822 (not RFC822.SIZE) - wants full body
+        // BODY.PEEK[] or BODY[] or BODY[TEXT] or BODY.PEEK[TEXT] or BODY[n] or RFC822 (not RFC822.SIZE) - wants full body
         const want_full_body = has_body_section or
             (std.mem.indexOf(u8, items_raw, "BODY.PEEK[]") != null) or
             (std.mem.indexOf(u8, items_raw, "BODY[]") != null) or
             (std.mem.indexOf(u8, items_raw, "BODY[TEXT]") != null) or
+            (std.mem.indexOf(u8, items_raw, "BODY.PEEK[TEXT]") != null) or
             (std.mem.indexOf(u8, items_raw, "RFC822") != null and
                 std.mem.indexOf(u8, items_raw, "RFC822.SIZE") == null and
                 std.mem.indexOf(u8, items_raw, "RFC822.HEADER") == null);
         const want_bodystructure = std.mem.indexOf(u8, items_raw, "BODYSTRUCTURE") != null;
+        // BODY[TEXT] or BODY.PEEK[TEXT] — return body only (after headers), not full message
+        const want_body_text_only = (std.mem.indexOf(u8, items_raw, "BODY[TEXT]") != null) or
+            (std.mem.indexOf(u8, items_raw, "BODY.PEEK[TEXT]") != null);
 
         var seq = start;
         while (seq <= end) : (seq += 1) {
             const filename = files[seq - 1];
+            const uid = self.getUidForSeq(seq);
             const filepath = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename });
             defer self.allocator.free(filepath);
 
@@ -1491,29 +1646,37 @@ pub const ImapSession = struct {
             // Build FETCH response
             if (want_header_only and !want_full_body) {
                 const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d}{s}{s} BODY[HEADER] {{{d}}}\r\n{s})", .{
-                    seq, seq, flag_str, content.len, id_part, bs_part, header.len, header,
+                    seq, uid, flag_str, content.len, id_part, bs_part, header.len, header,
+                });
+                defer self.allocator.free(resp);
+                try self.writeData(resp);
+                try self.writeData("\r\n");
+            } else if (want_body_text_only) {
+                // BODY[TEXT] or BODY.PEEK[TEXT] — return just the body (after headers)
+                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} BODY[TEXT] {{{d}}}\r\n{s})", .{
+                    seq, uid, flag_str, content.len, date_str, bs_part, body.len, body,
                 });
                 defer self.allocator.free(resp);
                 try self.writeData(resp);
                 try self.writeData("\r\n");
             } else if (want_full_body and has_body_section) {
-                // Numbered part or TEXT request — return just the body (after headers)
+                // Numbered MIME part request — return body text
                 const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} BODY[{s}] {{{d}}}\r\n{s})", .{
-                    seq, seq, flag_str, content.len, date_str, bs_part, body_section, body.len, body,
+                    seq, uid, flag_str, content.len, date_str, bs_part, body_section, body.len, body,
                 });
                 defer self.allocator.free(resp);
                 try self.writeData(resp);
                 try self.writeData("\r\n");
             } else if (want_full_body) {
                 const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} BODY[] {{{d}}}\r\n{s})", .{
-                    seq, seq, flag_str, content.len, date_str, bs_part, content.len, content,
+                    seq, uid, flag_str, content.len, date_str, bs_part, content.len, content,
                 });
                 defer self.allocator.free(resp);
                 try self.writeData(resp);
                 try self.writeData("\r\n");
             } else {
                 const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d}{s}{s})", .{
-                    seq, seq, flag_str, content.len, id_part, bs_part,
+                    seq, uid, flag_str, content.len, id_part, bs_part,
                 });
                 defer self.allocator.free(resp);
                 try self.writeData(resp);
@@ -1528,6 +1691,14 @@ pub const ImapSession = struct {
     /// Supports: ALL, SEEN, UNSEEN, FLAGGED, UNFLAGGED, DELETED, UNDELETED,
     /// ANSWERED, UNANSWERED, DRAFT, UNDRAFT, FROM, SUBJECT, SINCE, BEFORE.
     fn handleSearch(self: *ImapSession, tag: []const u8, criteria: []const u8) !void {
+        return self.handleSearchImpl(tag, criteria, false);
+    }
+
+    fn handleUidSearch(self: *ImapSession, tag: []const u8, criteria: []const u8) !void {
+        return self.handleSearchImpl(tag, criteria, true);
+    }
+
+    fn handleSearchImpl(self: *ImapSession, tag: []const u8, criteria: []const u8, is_uid: bool) !void {
         if (self.state != .selected) {
             try self.sendResponse(tag, "NO", "Must select mailbox first");
             return;
@@ -1627,7 +1798,8 @@ pub const ImapSession = struct {
                 }
             }
 
-            writer.print(" {d}", .{seq}) catch break;
+            const result_id: i64 = if (is_uid) self.getUidForSeq(seq) else @intCast(seq);
+            writer.print(" {d}", .{result_id}) catch break;
         }
 
         try self.sendUntagged(fbs.getWritten());
@@ -1808,10 +1980,7 @@ pub const ImapSession = struct {
     /// Handle EXAMINE command — same as SELECT but read-only.
     /// Implements RFC 3501 Section 6.3.2.
     fn handleExamine(self: *ImapSession, tag: []const u8, mailbox_name: []const u8) !void {
-        // EXAMINE is SELECT but read-only. We reuse handleSelect which sets [READ-WRITE].
-        // After SELECT completes, the client will see [READ-WRITE] but EXAMINE callers
-        // should see [READ-ONLY]. For simplicity, just call handleSelect — Apple Mail
-        // doesn't typically use EXAMINE. A production server would track read-only state.
+        self.mailbox_read_only = true;
         try self.handleSelect(tag, mailbox_name);
     }
 
@@ -2140,6 +2309,7 @@ pub const ImapSession = struct {
                 try self.handleLogin(tag, username, password);
             },
             .select => {
+                self.mailbox_read_only = false;
                 const mailbox = parts.next() orelse "INBOX";
                 try self.handleSelect(tag, mailbox);
             },
@@ -2227,35 +2397,41 @@ pub const ImapSession = struct {
                 try self.writeData("+ idling\r\n");
             },
             .uid => {
-                // UID command - pass through to regular handler with UID prefix
+                // UID command - translate UID sets to sequence numbers, then dispatch
                 const sub_cmd = parts.next() orelse "";
                 if (std.ascii.eqlIgnoreCase(sub_cmd, "FETCH")) {
-                    const sequence_set = parts.next() orelse "1:*";
+                    const uid_set_str = parts.next() orelse "1:*";
                     // Items may contain spaces (e.g. "(FLAGS UID BODY.PEEK[HEADER])"), get rest of line
-                    const seq_end = @intFromPtr(sequence_set.ptr) + sequence_set.len - @intFromPtr(line.ptr);
+                    const seq_end = @intFromPtr(uid_set_str.ptr) + uid_set_str.len - @intFromPtr(line.ptr);
                     const items = if (seq_end < line.len) std.mem.trim(u8, line[seq_end..], " \t") else "FLAGS";
-                    try self.handleFetch(tag, sequence_set, if (items.len > 0) items else "FLAGS");
+                    // Translate UID set to sequence set
+                    const seq_set = self.uidSetToSeqSet(uid_set_str) catch uid_set_str;
+                    defer if (seq_set.ptr != uid_set_str.ptr) self.allocator.free(seq_set);
+                    try self.handleFetch(tag, seq_set, if (items.len > 0) items else "FLAGS");
                 } else if (std.ascii.eqlIgnoreCase(sub_cmd, "SEARCH")) {
                     // Collect rest of line after "UID SEARCH" as criteria
                     const sub_end = @intFromPtr(sub_cmd.ptr) + sub_cmd.len - @intFromPtr(line.ptr);
                     const uid_search_criteria = if (sub_end < line.len) std.mem.trim(u8, line[sub_end..], " \t") else "";
-                    try self.handleSearch(tag, uid_search_criteria);
+                    try self.handleUidSearch(tag, uid_search_criteria);
                 } else if (std.ascii.eqlIgnoreCase(sub_cmd, "MOVE")) {
                     const uid_set = parts.next() orelse "1:*";
                     const dest = stripQuotes(parts.next() orelse "INBOX");
-                    try self.handleMove(tag, uid_set, dest);
+                    const seq_set = self.uidSetToSeqSet(uid_set) catch uid_set;
+                    defer if (seq_set.ptr != uid_set.ptr) self.allocator.free(seq_set);
+                    try self.handleMove(tag, seq_set, dest);
                 } else if (std.ascii.eqlIgnoreCase(sub_cmd, "COPY")) {
-                    // UID COPY <uid-set> <mailbox>
-                    // UIDs = sequence numbers in our implementation (1-based index into sorted files)
                     const uid_set = parts.next() orelse "1:*";
                     const dest = parts.next() orelse "INBOX";
-                    try self.handleCopy(tag, uid_set, dest);
+                    const seq_set = self.uidSetToSeqSet(uid_set) catch uid_set;
+                    defer if (seq_set.ptr != uid_set.ptr) self.allocator.free(seq_set);
+                    try self.handleCopy(tag, seq_set, dest);
                 } else if (std.ascii.eqlIgnoreCase(sub_cmd, "STORE")) {
-                    // UID STORE <uid-set> <flags-action>
                     const uid_set = parts.next() orelse "1:*";
                     const uid_end = @intFromPtr(uid_set.ptr) + uid_set.len - @intFromPtr(line.ptr);
                     const flags_action = if (uid_end < line.len) std.mem.trim(u8, line[uid_end..], " \t") else "";
-                    try self.handleStore(tag, uid_set, flags_action);
+                    const seq_set = self.uidSetToSeqSet(uid_set) catch uid_set;
+                    defer if (seq_set.ptr != uid_set.ptr) self.allocator.free(seq_set);
+                    try self.handleStore(tag, seq_set, flags_action);
                 } else if (std.ascii.eqlIgnoreCase(sub_cmd, "EXPUNGE")) {
                     // UID EXPUNGE (RFC 4315)
                     try self.handleExpunge(tag);
@@ -2364,6 +2540,13 @@ pub const ImapSession = struct {
                 const dest = stripQuotes(parts.next() orelse "INBOX");
                 try self.handleMove(tag, seq_set, dest);
             },
+            .unselect => {
+                // RFC 3691: UNSELECT - like CLOSE but without expunging
+                self.freeMailboxFiles();
+                self.state = .authenticated;
+                self.mailbox_read_only = false;
+                try self.sendResponse(tag, "OK", "UNSELECT completed");
+            },
             .check => {
                 try self.sendResponse(tag, "OK", "CHECK completed");
             },
@@ -2381,16 +2564,18 @@ pub const ImapServer = struct {
     running: std.atomic.Value(bool),
     mutex: mutex_compat.Mutex = .{},
     auth_backend: *auth.AuthBackend,
+    db: ?*database.Database = null,
     tls_context: ?*tls_mod.TlsContext = null,
     cert_key_pair: ?tls.config.CertKeyPair = null,
 
-    pub fn init(allocator: std.mem.Allocator, config: ImapConfig, auth_backend: *auth.AuthBackend) ImapServer {
+    pub fn init(allocator: std.mem.Allocator, config: ImapConfig, auth_backend: *auth.AuthBackend, db: ?*database.Database) ImapServer {
         var server = ImapServer{
             .allocator = allocator,
             .config = config,
             .sessions = std.ArrayList(*ImapSession){},
             .running = std.atomic.Value(bool).init(false),
             .auth_backend = auth_backend,
+            .db = db,
             .tls_context = null,
             .cert_key_pair = null,
         };
@@ -2528,7 +2713,7 @@ pub const ImapServer = struct {
     /// Handle a client connection
     fn handleConnection(self: *ImapServer, connection: socket.Connection, is_ssl: bool) !void {
         var session = try self.allocator.create(ImapSession);
-        session.* = ImapSession.init(self.allocator, connection, self.auth_backend);
+        session.* = ImapSession.init(self.allocator, connection, self.auth_backend, self.db);
         defer {
             session.deinit();
             self.allocator.destroy(session);
@@ -2640,7 +2825,7 @@ pub const ImapServer = struct {
             while (session.state != .logout) {
                 // During IDLE: set a short socket timeout so we can poll for new mail
                 if (session.idle_mode) {
-                    const idle_tv: std.posix.timeval = .{ .sec = 5, .usec = 0 };
+                    const idle_tv: std.posix.timeval = .{ .sec = 2, .usec = 0 };
                     std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&idle_tv)) catch {};
                 }
 
@@ -2767,7 +2952,7 @@ pub const ImapServer = struct {
             while (session.state != .logout and !session.starttls_requested) {
                 // During IDLE: set a short socket timeout so we can poll for new mail
                 if (session.idle_mode) {
-                    const idle_tv: std.posix.timeval = .{ .sec = 5, .usec = 0 };
+                    const idle_tv: std.posix.timeval = .{ .sec = 2, .usec = 0 };
                     std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&idle_tv)) catch {};
                 }
 
@@ -2886,7 +3071,7 @@ pub const ImapServer = struct {
 
                         while (session.state != .logout) {
                             if (session.idle_mode) {
-                                const idle_tv: std.posix.timeval = .{ .sec = 5, .usec = 0 };
+                                const idle_tv: std.posix.timeval = .{ .sec = 2, .usec = 0 };
                                 std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&idle_tv)) catch {};
                             }
 

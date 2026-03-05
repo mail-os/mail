@@ -418,7 +418,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
             .cert_path = cfg.tls_cert_path,
             .key_path = cfg.tls_key_path,
         };
-        imap_server = imap.ImapServer.init(allocator, imap_config, auth_ptr.?);
+        imap_server = imap.ImapServer.init(allocator, imap_config, auth_ptr.?, db_ptr);
         log.info("IMAP server configured on port {d}", .{imap_port});
         if (cfg.enable_tls and cfg.tls_cert_path != null) {
             log.info("IMAPS server configured on port 993 (SSL/TLS)", .{});

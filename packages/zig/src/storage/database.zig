@@ -250,6 +250,29 @@ pub const Database = struct {
 
         // Try to run migration, ignore errors if columns already exist
         self.exec(migration) catch {};
+
+        // IMAP UID persistence tables
+        try self.exec(
+            \\CREATE TABLE IF NOT EXISTS imap_mailboxes (
+            \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\    username TEXT NOT NULL,
+            \\    mailbox TEXT NOT NULL,
+            \\    uidvalidity INTEGER NOT NULL,
+            \\    uidnext INTEGER NOT NULL DEFAULT 1,
+            \\    UNIQUE(username, mailbox)
+            \\);
+            \\CREATE TABLE IF NOT EXISTS imap_uids (
+            \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\    username TEXT NOT NULL,
+            \\    mailbox TEXT NOT NULL,
+            \\    filename TEXT NOT NULL,
+            \\    uid INTEGER NOT NULL,
+            \\    UNIQUE(username, mailbox, filename),
+            \\    UNIQUE(username, mailbox, uid)
+            \\);
+            \\CREATE INDEX IF NOT EXISTS idx_imap_uids_lookup ON imap_uids(username, mailbox);
+            \\CREATE INDEX IF NOT EXISTS idx_imap_mailboxes_lookup ON imap_mailboxes(username, mailbox);
+        );
     }
 
     pub fn exec(self: *Database, sql: []const u8) !void {
@@ -1127,5 +1150,289 @@ pub const Database = struct {
 
         rc = sqlite.sqlite3_step(stmt);
         return rc == sqlite.SQLITE_ROW;
+    }
+
+    // ── IMAP UID persistence ──────────────────────────────────────────
+
+    /// Get or create a mailbox record, returning (uidvalidity, uidnext).
+    pub fn getOrCreateMailbox(self: *Database, username: []const u8, mailbox: []const u8) !struct { uidvalidity: i64, uidnext: i64 } {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Try to read existing
+        {
+            const sql = "SELECT uidvalidity, uidnext FROM imap_mailboxes WHERE username = ?1 AND mailbox = ?2";
+            const sql_z = try self.allocator.dupeZ(u8, sql);
+            defer self.allocator.free(sql_z);
+            var stmt: ?*sqlite.sqlite3_stmt = null;
+            var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
+            if (rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
+            defer _ = sqlite.sqlite3_finalize(stmt);
+
+            const u_z = try self.allocator.dupeZ(u8, username);
+            defer self.allocator.free(u_z);
+            const m_z = try self.allocator.dupeZ(u8, mailbox);
+            defer self.allocator.free(m_z);
+            _ = sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null);
+            _ = sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null);
+
+            rc = sqlite.sqlite3_step(stmt);
+            if (rc == sqlite.SQLITE_ROW) {
+                return .{
+                    .uidvalidity = sqlite.sqlite3_column_int64(stmt, 0),
+                    .uidnext = sqlite.sqlite3_column_int64(stmt, 1),
+                };
+            }
+        }
+
+        // Create new mailbox with uidvalidity = current timestamp
+        const uidvalidity = time_compat.timestamp();
+        {
+            const sql = "INSERT INTO imap_mailboxes (username, mailbox, uidvalidity, uidnext) VALUES (?1, ?2, ?3, 1)";
+            const sql_z = try self.allocator.dupeZ(u8, sql);
+            defer self.allocator.free(sql_z);
+            var stmt: ?*sqlite.sqlite3_stmt = null;
+            var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
+            if (rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
+            defer _ = sqlite.sqlite3_finalize(stmt);
+
+            const u_z = try self.allocator.dupeZ(u8, username);
+            defer self.allocator.free(u_z);
+            const m_z = try self.allocator.dupeZ(u8, mailbox);
+            defer self.allocator.free(m_z);
+            _ = sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null);
+            _ = sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null);
+            _ = sqlite.sqlite3_bind_int64(stmt, 3, uidvalidity);
+
+            rc = sqlite.sqlite3_step(stmt);
+            if (rc != sqlite.SQLITE_DONE) return DatabaseError.StepFailed;
+        }
+
+        return .{ .uidvalidity = uidvalidity, .uidnext = 1 };
+    }
+
+    /// Look up the UID for a given filename. Returns null if not assigned yet.
+    pub fn getUidForFile(self: *Database, username: []const u8, mailbox: []const u8, filename: []const u8) !?i64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const sql = "SELECT uid FROM imap_uids WHERE username = ?1 AND mailbox = ?2 AND filename = ?3";
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+        var stmt: ?*sqlite.sqlite3_stmt = null;
+        var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
+        if (rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
+        defer _ = sqlite.sqlite3_finalize(stmt);
+
+        const u_z = try self.allocator.dupeZ(u8, username);
+        defer self.allocator.free(u_z);
+        const m_z = try self.allocator.dupeZ(u8, mailbox);
+        defer self.allocator.free(m_z);
+        const f_z = try self.allocator.dupeZ(u8, filename);
+        defer self.allocator.free(f_z);
+        _ = sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null);
+        _ = sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null);
+        _ = sqlite.sqlite3_bind_text(stmt, 3, f_z.ptr, -1, null);
+
+        rc = sqlite.sqlite3_step(stmt);
+        if (rc == sqlite.SQLITE_ROW) {
+            return sqlite.sqlite3_column_int64(stmt, 0);
+        }
+        return null;
+    }
+
+    /// Assign a UID to a filename and bump uidnext. Returns the assigned UID.
+    pub fn assignUid(self: *Database, username: []const u8, mailbox: []const u8, filename: []const u8) !i64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Get current uidnext
+        var uidnext: i64 = 1;
+        {
+            const sql = "SELECT uidnext FROM imap_mailboxes WHERE username = ?1 AND mailbox = ?2";
+            const sql_z = try self.allocator.dupeZ(u8, sql);
+            defer self.allocator.free(sql_z);
+            var stmt: ?*sqlite.sqlite3_stmt = null;
+            var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
+            if (rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
+            defer _ = sqlite.sqlite3_finalize(stmt);
+
+            const u_z = try self.allocator.dupeZ(u8, username);
+            defer self.allocator.free(u_z);
+            const m_z = try self.allocator.dupeZ(u8, mailbox);
+            defer self.allocator.free(m_z);
+            _ = sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null);
+            _ = sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null);
+
+            rc = sqlite.sqlite3_step(stmt);
+            if (rc == sqlite.SQLITE_ROW) {
+                uidnext = sqlite.sqlite3_column_int64(stmt, 0);
+            }
+        }
+
+        const uid = uidnext;
+
+        // Insert the UID mapping
+        {
+            const sql = "INSERT OR IGNORE INTO imap_uids (username, mailbox, filename, uid) VALUES (?1, ?2, ?3, ?4)";
+            const sql_z = try self.allocator.dupeZ(u8, sql);
+            defer self.allocator.free(sql_z);
+            var stmt: ?*sqlite.sqlite3_stmt = null;
+            var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
+            if (rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
+            defer _ = sqlite.sqlite3_finalize(stmt);
+
+            const u_z = try self.allocator.dupeZ(u8, username);
+            defer self.allocator.free(u_z);
+            const m_z = try self.allocator.dupeZ(u8, mailbox);
+            defer self.allocator.free(m_z);
+            const f_z = try self.allocator.dupeZ(u8, filename);
+            defer self.allocator.free(f_z);
+            _ = sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null);
+            _ = sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null);
+            _ = sqlite.sqlite3_bind_text(stmt, 3, f_z.ptr, -1, null);
+            _ = sqlite.sqlite3_bind_int64(stmt, 4, uid);
+
+            rc = sqlite.sqlite3_step(stmt);
+            if (rc != sqlite.SQLITE_DONE) {
+                // UNIQUE constraint — might already be assigned, read existing
+                const get_sql = "SELECT uid FROM imap_uids WHERE username = ?1 AND mailbox = ?2 AND filename = ?3";
+                const get_z = try self.allocator.dupeZ(u8, get_sql);
+                defer self.allocator.free(get_z);
+                var get_stmt: ?*sqlite.sqlite3_stmt = null;
+                const get_rc = sqlite.sqlite3_prepare_v2(self.db, get_z.ptr, -1, &get_stmt, null);
+                if (get_rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
+                defer _ = sqlite.sqlite3_finalize(get_stmt);
+
+                const u2_z = try self.allocator.dupeZ(u8, username);
+                defer self.allocator.free(u2_z);
+                const m2_z = try self.allocator.dupeZ(u8, mailbox);
+                defer self.allocator.free(m2_z);
+                const f2_z = try self.allocator.dupeZ(u8, filename);
+                defer self.allocator.free(f2_z);
+                _ = sqlite.sqlite3_bind_text(get_stmt, 1, u2_z.ptr, -1, null);
+                _ = sqlite.sqlite3_bind_text(get_stmt, 2, m2_z.ptr, -1, null);
+                _ = sqlite.sqlite3_bind_text(get_stmt, 3, f2_z.ptr, -1, null);
+
+                const step_rc = sqlite.sqlite3_step(get_stmt);
+                if (step_rc == sqlite.SQLITE_ROW) {
+                    return sqlite.sqlite3_column_int64(get_stmt, 0);
+                }
+                return DatabaseError.StepFailed;
+            }
+        }
+
+        // Bump uidnext
+        {
+            const sql = "UPDATE imap_mailboxes SET uidnext = ?1 WHERE username = ?2 AND mailbox = ?3";
+            const sql_z = try self.allocator.dupeZ(u8, sql);
+            defer self.allocator.free(sql_z);
+            var stmt: ?*sqlite.sqlite3_stmt = null;
+            var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
+            if (rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
+            defer _ = sqlite.sqlite3_finalize(stmt);
+
+            const u_z = try self.allocator.dupeZ(u8, username);
+            defer self.allocator.free(u_z);
+            const m_z = try self.allocator.dupeZ(u8, mailbox);
+            defer self.allocator.free(m_z);
+            _ = sqlite.sqlite3_bind_int64(stmt, 1, uid + 1);
+            _ = sqlite.sqlite3_bind_text(stmt, 2, u_z.ptr, -1, null);
+            _ = sqlite.sqlite3_bind_text(stmt, 3, m_z.ptr, -1, null);
+
+            rc = sqlite.sqlite3_step(stmt);
+            if (rc != sqlite.SQLITE_DONE) return DatabaseError.StepFailed;
+        }
+
+        return uid;
+    }
+
+    /// Remove stale UID entries for files that no longer exist.
+    pub fn removeStaleUids(self: *Database, username: []const u8, mailbox: []const u8, current_files: []const []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Get all filenames from the DB for this mailbox
+        const sql = "SELECT id, filename FROM imap_uids WHERE username = ?1 AND mailbox = ?2";
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+        var stmt: ?*sqlite.sqlite3_stmt = null;
+        var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
+        if (rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
+        defer _ = sqlite.sqlite3_finalize(stmt);
+
+        const u_z = try self.allocator.dupeZ(u8, username);
+        defer self.allocator.free(u_z);
+        const m_z = try self.allocator.dupeZ(u8, mailbox);
+        defer self.allocator.free(m_z);
+        _ = sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null);
+        _ = sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null);
+
+        // Collect IDs to delete
+        var ids_to_delete = std.ArrayList(i64){};
+        defer ids_to_delete.deinit(self.allocator);
+
+        while (true) {
+            rc = sqlite.sqlite3_step(stmt);
+            if (rc == sqlite.SQLITE_ROW) {
+                const id = sqlite.sqlite3_column_int64(stmt, 0);
+                const db_filename_ptr = sqlite.sqlite3_column_text(stmt, 1);
+                if (db_filename_ptr) |ptr| {
+                    const len = sqlite.sqlite3_column_bytes(stmt, 1);
+                    const db_filename = ptr[0..@intCast(len)];
+                    // Check if this file still exists in the current file list
+                    var found = false;
+                    for (current_files) |f| {
+                        if (std.mem.eql(u8, f, db_filename)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        ids_to_delete.append(self.allocator, id) catch {};
+                    }
+                }
+            } else break;
+        }
+
+        // Delete stale entries
+        for (ids_to_delete.items) |id| {
+            const del_sql = "DELETE FROM imap_uids WHERE id = ?1";
+            const del_z = self.allocator.dupeZ(u8, del_sql) catch continue;
+            defer self.allocator.free(del_z);
+            var del_stmt: ?*sqlite.sqlite3_stmt = null;
+            const del_rc = sqlite.sqlite3_prepare_v2(self.db, del_z.ptr, -1, &del_stmt, null);
+            if (del_rc != sqlite.SQLITE_OK) continue;
+            defer _ = sqlite.sqlite3_finalize(del_stmt);
+            _ = sqlite.sqlite3_bind_int64(del_stmt, 1, id);
+            _ = sqlite.sqlite3_step(del_stmt);
+        }
+    }
+
+    /// Get the current uidnext for a mailbox.
+    pub fn getUidNext(self: *Database, username: []const u8, mailbox: []const u8) !i64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const sql = "SELECT uidnext FROM imap_mailboxes WHERE username = ?1 AND mailbox = ?2";
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+        var stmt: ?*sqlite.sqlite3_stmt = null;
+        var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
+        if (rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
+        defer _ = sqlite.sqlite3_finalize(stmt);
+
+        const u_z = try self.allocator.dupeZ(u8, username);
+        defer self.allocator.free(u_z);
+        const m_z = try self.allocator.dupeZ(u8, mailbox);
+        defer self.allocator.free(m_z);
+        _ = sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null);
+        _ = sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null);
+
+        rc = sqlite.sqlite3_step(stmt);
+        if (rc == sqlite.SQLITE_ROW) {
+            return sqlite.sqlite3_column_int64(stmt, 0);
+        }
+        return 1;
     }
 };
