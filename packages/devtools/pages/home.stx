@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mail Server Dashboard</title>
+
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --bg: #0a0c10;
+      --surface: #151921;
+      --surface-2: #1c2230;
+      --surface-3: #232a3a;
+      --border: #2a3248;
+      --border-hover: #3a4868;
+      --text: #e6eaf0;
+      --text-dim: #6b7a99;
+      --text-muted: #4a5778;
+      --accent: #818cf8;
+      --accent-dim: #6366f1;
+      --accent-glow: rgba(99,102,241,0.15);
+      --green: #34d399;
+      --green-dim: rgba(52,211,153,0.12);
+      --red: #f87171;
+      --red-dim: rgba(248,113,113,0.12);
+      --yellow: #fbbf24;
+      --yellow-dim: rgba(251,191,36,0.12);
+      --blue: #60a5fa;
+      --blue-dim: rgba(96,165,250,0.12);
+      --cyan: #22d3ee;
+      --cyan-dim: rgba(34,211,238,0.12);
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'SF Pro Text', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    /* Header */
+    .header {
+      background: linear-gradient(180deg, var(--surface) 0%, var(--bg) 100%);
+      border-bottom: 1px solid var(--border);
+      padding: 1.25rem 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 40;
+      backdrop-filter: blur(12px);
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .logo {
+      width: 32px;
+      height: 32px;
+      background: linear-gradient(135deg, var(--accent) 0%, #a78bfa 100%);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1rem;
+    }
+
+    .header-title {
+      font-size: 1.125rem;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+
+    .header-domain {
+      font-size: 0.8125rem;
+      color: var(--text-dim);
+      font-family: 'SF Mono', 'Fira Code', monospace;
+    }
+
+    .header-right {
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.375rem;
+      padding: 0.3rem 0.875rem;
+      border-radius: 999px;
+      font-size: 0.8125rem;
+      font-weight: 500;
+      border: 1px solid transparent;
+    }
+
+    .status-pill.online {
+      background: var(--green-dim);
+      color: var(--green);
+      border-color: rgba(52,211,153,0.2);
+    }
+
+    .status-pill.offline {
+      background: var(--red-dim);
+      color: var(--red);
+      border-color: rgba(248,113,113,0.2);
+    }
+
+    .status-pill .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .refresh-btn {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      padding: 0.375rem 0.875rem;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.8125rem;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: center;
+      gap: 0.375rem;
+    }
+
+    .refresh-btn:hover {
+      background: var(--surface-3);
+      color: var(--text);
+      border-color: var(--border-hover);
+    }
+
+    .refresh-btn svg {
+      width: 14px;
+      height: 14px;
+    }
+
+    /* Main */
+    .main {
+      max-width: 1360px;
+      margin: 0 auto;
+      padding: 1.5rem 2rem 3rem;
+    }
+
+    /* Grid */
+    .grid { display: grid; gap: 1rem; }
+    .grid-4 { grid-template-columns: repeat(4, 1fr); }
+    .grid-3 { grid-template-columns: repeat(3, 1fr); }
+    .grid-2 { grid-template-columns: repeat(2, 1fr); }
+
+    /* Cards */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 1.25rem 1.5rem;
+      transition: border-color 0.15s ease;
+    }
+
+    .card:hover {
+      border-color: var(--border-hover);
+    }
+
+    .card-label {
+      font-size: 0.75rem;
+      font-weight: 500;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 0.625rem;
+    }
+
+    .card-value {
+      font-size: 2.25rem;
+      font-weight: 700;
+      letter-spacing: -0.035em;
+      line-height: 1.1;
+    }
+
+    .card-sub {
+      font-size: 0.8125rem;
+      color: var(--text-dim);
+      margin-top: 0.375rem;
+    }
+
+    /* Section */
+    .section-title {
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin: 2.25rem 0 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .section-title::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+
+    /* Tables */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    th, td {
+      padding: 0.625rem 1rem;
+      text-align: left;
+      font-size: 0.8125rem;
+    }
+
+    th {
+      color: var(--text-muted);
+      font-weight: 500;
+      font-size: 0.6875rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      border-bottom: 1px solid var(--border);
+    }
+
+    td {
+      border-bottom: 1px solid rgba(42,50,72,0.5);
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    /* Badges */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 0.125rem 0.625rem;
+      border-radius: 6px;
+      font-size: 0.6875rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+    }
+
+    .badge-green { background: var(--green-dim); color: var(--green); }
+    .badge-red { background: var(--red-dim); color: var(--red); }
+    .badge-blue { background: var(--blue-dim); color: var(--blue); }
+    .badge-yellow { background: var(--yellow-dim); color: var(--yellow); }
+
+    /* Progress */
+    .progress-track {
+      height: 5px;
+      background: var(--surface-3);
+      border-radius: 3px;
+      overflow: hidden;
+      margin-top: 0.75rem;
+    }
+
+    .progress-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    /* Mono */
+    .mono {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 0.8125rem;
+    }
+
+    /* Colors */
+    .text-green { color: var(--green); }
+    .text-red { color: var(--red); }
+    .text-yellow { color: var(--yellow); }
+    .text-blue { color: var(--blue); }
+    .text-dim { color: var(--text-dim); }
+    .text-muted { color: var(--text-muted); }
+
+    /* DNS Grid */
+    .info-grid {
+      display: grid;
+      grid-template-columns: 72px 1fr;
+      gap: 0.375rem 0.75rem;
+      align-items: baseline;
+    }
+
+    .info-label {
+      font-size: 0.6875rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+    }
+
+    .info-value {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 0.75rem;
+      word-break: break-all;
+      color: var(--text-dim);
+    }
+
+    /* Check items */
+    .check-item {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.3rem 0;
+      font-size: 0.8125rem;
+    }
+
+    .check-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .check-dot.pass { background: var(--green); box-shadow: 0 0 6px var(--green-dim); }
+    .check-dot.fail { background: var(--red); box-shadow: 0 0 6px var(--red-dim); }
+    .check-dot.warn { background: var(--yellow); box-shadow: 0 0 6px var(--yellow-dim); }
+
+    /* Score ring */
+    .score-ring {
+      position: relative;
+      width: 64px;
+      height: 64px;
+      margin: 0.5rem auto 0.75rem;
+    }
+
+    .score-ring svg {
+      transform: rotate(-90deg);
+    }
+
+    .score-ring-bg {
+      fill: none;
+      stroke: var(--surface-3);
+      stroke-width: 4;
+    }
+
+    .score-ring-fill {
+      fill: none;
+      stroke-width: 4;
+      stroke-linecap: round;
+      transition: stroke-dasharray 0.6s ease;
+    }
+
+    .score-label {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.125rem;
+      font-weight: 700;
+    }
+
+    /* Loading */
+    .loading-overlay {
+      position: fixed;
+      inset: 0;
+      background: var(--bg);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 50;
+      gap: 1rem;
+    }
+
+    .loading-spinner {
+      width: 28px;
+      height: 28px;
+      border: 2.5px solid var(--surface-3);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+
+    .loading-text {
+      color: var(--text-dim);
+      font-size: 0.875rem;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Last updated */
+    .last-updated {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+
+    /* Forms */
+    .form-row {
+      display: flex;
+      gap: 0.625rem;
+      align-items: flex-end;
+    }
+
+    .form-group {
+      flex: 1;
+    }
+
+    .form-label {
+      display: block;
+      font-size: 0.6875rem;
+      font-weight: 500;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.375rem;
+    }
+
+    .form-input {
+      width: 100%;
+      padding: 0.5rem 0.75rem;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.8125rem;
+      font-family: inherit;
+      outline: none;
+      transition: border-color 0.15s ease;
+    }
+
+    .form-input:focus {
+      border-color: var(--accent);
+    }
+
+    .form-input::placeholder {
+      color: var(--text-muted);
+    }
+
+    .btn {
+      padding: 0.5rem 1rem;
+      border-radius: 8px;
+      font-size: 0.8125rem;
+      font-weight: 500;
+      cursor: pointer;
+      border: none;
+      transition: all 0.15s ease;
+      white-space: nowrap;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: white;
+    }
+
+    .btn-primary:hover {
+      background: var(--accent-dim);
+    }
+
+    .btn-primary:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .toast {
+      position: fixed;
+      bottom: 1.5rem;
+      right: 1.5rem;
+      padding: 0.75rem 1.25rem;
+      border-radius: 10px;
+      font-size: 0.8125rem;
+      font-weight: 500;
+      z-index: 100;
+      animation: slideUp 0.3s ease;
+      max-width: 400px;
+    }
+
+    .toast-success {
+      background: var(--green-dim);
+      color: var(--green);
+      border: 1px solid rgba(52,211,153,0.25);
+    }
+
+    .toast-error {
+      background: var(--red-dim);
+      color: var(--red);
+      border: 1px solid rgba(248,113,113,0.25);
+    }
+
+    @keyframes slideUp {
+      from { transform: translateY(1rem); opacity: 0; }
+      to { transform: translateY(0); opacity: 1; }
+    }
+
+    /* Responsive */
+    @media (max-width: 1024px) {
+      .grid-4 { grid-template-columns: repeat(2, 1fr); }
+      .grid-3 { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    @media (max-width: 640px) {
+      .grid-4, .grid-3, .grid-2 { grid-template-columns: 1fr; }
+      .main { padding: 1rem; }
+      .header { padding: 1rem; }
+    }
+  </style>
+</head>
+<body>
+  <div id="loading" class="loading-overlay">
+    <div class="loading-spinner"></div>
+    <div class="loading-text">Connecting to server...</div>
+  </div>
+
+  <header class="header">
+    <div class="header-left">
+      <div class="logo">&#9993;</div>
+      <div>
+        <div class="header-title">Mail Server Dashboard</div>
+        <div class="header-domain" id="header-domain">--</div>
+      </div>
+    </div>
+    <div class="header-right">
+      <span class="last-updated" id="last-updated"></span>
+      <span id="server-status" class="status-pill online">
+        <span class="dot"></span> Checking...
+      </span>
+      <button class="refresh-btn" onclick="loadData()">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 8a6 6 0 0 1 10.2-4.3M14 8a6 6 0 0 1-10.2 4.3"/><path d="M12.5 1v3.5H9M3.5 15v-3.5H7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Refresh
+      </button>
+    </div>
+  </header>
+
+  <main class="main">
+    <!-- Stats Cards -->
+    <div class="grid grid-4">
+      <div class="card">
+        <div class="card-label">Uptime</div>
+        <div class="card-value text-green" id="uptime">--</div>
+        <div class="card-sub" id="uptime-since"></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Users</div>
+        <div class="card-value" id="user-count">--</div>
+        <div class="card-sub" id="user-list"></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Mailboxes</div>
+        <div class="card-value" id="mailbox-count">--</div>
+        <div class="card-sub" id="email-count"></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Disk Usage</div>
+        <div class="card-value" id="disk-usage">--</div>
+        <div class="progress-track">
+          <div class="progress-fill" id="disk-bar" style="width:0%;background:var(--green)"></div>
+        </div>
+        <div class="card-sub" id="disk-detail"></div>
+      </div>
+    </div>
+
+    <!-- Management -->
+    <div class="section-title">Management</div>
+    <div class="card">
+      <div class="card-label">Create Account</div>
+      <div class="card-sub" style="margin-bottom:0.75rem">Creates user credentials and mailbox (INBOX, Sent, Drafts, Trash, Junk)</div>
+      <form id="create-account-form" onsubmit="return handleCreateAccount(event)">
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label">Username</label>
+            <input class="form-input" type="text" id="new-username" placeholder="e.g. john" required autocomplete="off">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Password</label>
+            <input class="form-input" type="password" id="new-password" placeholder="min 8 characters" required minlength="8">
+          </div>
+          <button type="submit" class="btn btn-primary" id="create-account-btn">Create Account</button>
+        </div>
+      </form>
+    </div>
+
+    <!-- Services -->
+    <div class="section-title">Services</div>
+    <div class="grid grid-2">
+      <div class="card">
+        <div class="card-label">Listening Ports</div>
+        <table>
+          <thead>
+            <tr><th>Service</th><th>Port</th><th>Status</th></tr>
+          </thead>
+          <tbody id="ports-table">
+            <tr><td colspan="3" class="text-muted">loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <div class="card-label">System Services</div>
+        <table>
+          <thead>
+            <tr><th>Service</th><th>Status</th></tr>
+          </thead>
+          <tbody id="services-table">
+            <tr><td colspan="2" class="text-muted">loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Security & DNS -->
+    <div class="section-title">Security &amp; Deliverability</div>
+    <div class="grid grid-3">
+      <div class="card">
+        <div class="card-label">TLS Certificate</div>
+        <div id="tls-info" style="margin-top:0.5rem">
+          <span class="text-muted">loading...</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-label">DNS Records</div>
+        <div id="dns-info" style="margin-top:0.5rem">
+          <span class="text-muted">loading...</span>
+        </div>
+      </div>
+      <div class="card" style="text-align:center;">
+        <div class="card-label" style="text-align:left;">Deliverability Score</div>
+        <div class="score-ring">
+          <svg width="64" height="64" viewBox="0 0 64 64">
+            <circle cx="32" cy="32" r="28" class="score-ring-bg"/>
+            <circle cx="32" cy="32" r="28" class="score-ring-fill" id="score-arc"
+              stroke="var(--green)" stroke-dasharray="0 176"/>
+          </svg>
+          <div class="score-label" id="score-label">--</div>
+        </div>
+        <div id="deliverability-info"></div>
+      </div>
+    </div>
+
+    <!-- Resources -->
+    <div class="section-title">Resources</div>
+    <div class="grid grid-3">
+      <div class="card">
+        <div class="card-label">Memory</div>
+        <div class="card-value text-blue" id="mem-usage">--</div>
+        <div class="progress-track">
+          <div class="progress-fill" id="mem-bar" style="width:0%;background:var(--blue)"></div>
+        </div>
+        <div class="card-sub" id="mem-detail"></div>
+      </div>
+      <div class="card">
+        <div class="card-label">CPU</div>
+        <div class="card-value" id="cpu-usage" style="color:var(--accent)">--</div>
+        <div class="progress-track">
+          <div class="progress-fill" id="cpu-bar" style="width:0%;background:var(--accent)"></div>
+        </div>
+        <div class="card-sub" id="cpu-detail"></div>
+      </div>
+      <div class="card">
+        <div class="card-label">Database</div>
+        <div class="card-value" style="color:var(--cyan)" id="db-size">--</div>
+        <div class="card-sub" id="db-detail"></div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    function $(id) { return document.getElementById(id) }
+
+    async function loadData() {
+      try {
+        const res = await fetch('/api/status')
+        const d = await res.json()
+        if (d.error) throw new Error(d.error)
+        render(d)
+        $('last-updated').textContent = 'Updated ' + new Date().toLocaleTimeString()
+      } catch (e) {
+        $('server-status').className = 'status-pill offline'
+        $('server-status').innerHTML = '<span class="dot"></span> Error'
+        console.error('Failed to load status:', e)
+      } finally {
+        $('loading').style.display = 'none'
+      }
+    }
+
+    function render(d) {
+      // Header
+      $('header-domain').textContent = d.dns?.a ? d.tls?.domain || '--' : '--'
+
+      // Status
+      const online = d.service === 'active'
+      $('server-status').className = 'status-pill ' + (online ? 'online' : 'offline')
+      $('server-status').innerHTML = '<span class="dot"></span> ' + (online ? 'Online' : 'Offline')
+
+      // Stats
+      $('uptime').textContent = d.uptime || '--'
+      $('uptime-since').textContent = d.uptimeSince ? 'since ' + d.uptimeSince : ''
+      $('user-count').textContent = d.userCount ?? '--'
+      $('user-list').textContent = d.users?.join(', ') || ''
+      $('mailbox-count').textContent = d.mailboxCount ?? '--'
+      $('email-count').textContent = d.emailCount ? d.emailCount + ' total emails' : ''
+
+      // Disk
+      const pct = parseInt(d.diskPercent) || 0
+      $('disk-usage').textContent = pct + '%'
+      $('disk-bar').style.width = pct + '%'
+      $('disk-bar').style.background = pct > 80 ? 'var(--red)' : pct > 60 ? 'var(--yellow)' : 'var(--green)'
+      $('disk-detail').textContent = d.diskDetail || ''
+
+      // Ports
+      if (d.ports?.length) {
+        $('ports-table').innerHTML = d.ports.map(p =>
+          '<tr><td>' + p.service + '</td><td class="mono">' + p.port + '</td><td><span class="badge badge-green">' + p.status + '</span></td></tr>'
+        ).join('')
+      }
+
+      // Services
+      if (d.services?.length) {
+        $('services-table').innerHTML = d.services.map(s =>
+          '<tr><td>' + s.name + '</td><td><span class="badge ' + (s.active ? 'badge-green' : 'badge-red') + '">' + (s.active ? 'active' : 'inactive') + '</span></td></tr>'
+        ).join('')
+      }
+
+      // TLS
+      if (d.tls) {
+        const color = d.tls.daysLeft > 30 ? 'text-green' : d.tls.daysLeft > 14 ? 'text-yellow' : 'text-red'
+        $('tls-info').innerHTML =
+          '<div class="check-item" style="margin-bottom:0.75rem"><span class="check-dot ' + (d.tls.valid ? 'pass' : 'fail') + '"></span><strong>' + (d.tls.valid ? 'Valid' : 'Invalid / Expired') + '</strong></div>' +
+          '<div class="info-grid">' +
+          '<span class="info-label">Domain</span><span class="info-value">' + (d.tls.domain || '--') + '</span>' +
+          '<span class="info-label">Expires</span><span class="info-value ' + color + '">' + (d.tls.expiry || '--') + ' (' + d.tls.daysLeft + 'd left)</span>' +
+          '<span class="info-label">Issuer</span><span class="info-value">' + (d.tls.issuer || '--') + '</span>' +
+          '</div>'
+      }
+
+      // DNS
+      if (d.dns) {
+        $('dns-info').innerHTML =
+          '<div class="info-grid">' +
+          '<span class="info-label">MX</span><span class="info-value">' + (d.dns.mx || '--') + '</span>' +
+          '<span class="info-label">A</span><span class="info-value">' + (d.dns.a || '--') + '</span>' +
+          '<span class="info-label">rDNS</span><span class="info-value">' + (d.dns.rdns || '--') + '</span>' +
+          '<span class="info-label">SPF</span><span class="info-value">' + (d.dns.spf || '--') + '</span>' +
+          '<span class="info-label">DMARC</span><span class="info-value">' + (d.dns.dmarc || '--') + '</span>' +
+          '<span class="info-label">DKIM</span><span class="info-value">' + (d.dns.dkim || '--') + '</span>' +
+          '</div>'
+      }
+
+      // Deliverability score
+      if (d.deliverability) {
+        const passed = d.deliverability.filter(c => c.pass).length
+        const total = d.deliverability.length
+        const pctScore = Math.round((passed / total) * 100)
+        const circumference = 2 * Math.PI * 28 // ~176
+        const filled = (pctScore / 100) * circumference
+
+        const arc = $('score-arc')
+        arc.setAttribute('stroke-dasharray', filled + ' ' + circumference)
+        arc.setAttribute('stroke', pctScore >= 80 ? 'var(--green)' : pctScore >= 50 ? 'var(--yellow)' : 'var(--red)')
+        $('score-label').textContent = passed + '/' + total
+
+        $('deliverability-info').innerHTML = d.deliverability.map(c =>
+          '<div class="check-item"><span class="check-dot ' + (c.pass ? 'pass' : c.warn ? 'warn' : 'fail') + '"></span>' + c.label + '</div>'
+        ).join('')
+      }
+
+      // Resources
+      $('mem-usage').textContent = (d.memPercent ?? '--') + '%'
+      $('mem-bar').style.width = (d.memPercent || 0) + '%'
+      $('mem-detail').textContent = d.memDetail || ''
+
+      $('cpu-usage').textContent = (d.cpuPercent ?? '--') + '%'
+      $('cpu-bar').style.width = (d.cpuPercent || 0) + '%'
+      $('cpu-detail').textContent = d.cpuDetail || ''
+
+      $('db-size').textContent = d.dbSize || '--'
+      $('db-detail').textContent = d.dbDetail || ''
+    }
+
+    function showToast(message, type) {
+      var existing = document.querySelector('.toast')
+      if (existing) existing.remove()
+      var el = document.createElement('div')
+      el.className = 'toast toast-' + type
+      el.textContent = message
+      document.body.appendChild(el)
+      setTimeout(function() { el.remove() }, 4000)
+    }
+
+    async function handleCreateAccount(e) {
+      e.preventDefault()
+      var btn = $('create-account-btn')
+      btn.disabled = true
+      btn.textContent = 'Creating...'
+      try {
+        var res = await fetch('/api/account', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: $('new-username').value.trim(),
+            password: $('new-password').value
+          })
+        })
+        var data = await res.json()
+        if (data.ok) {
+          showToast('Account "' + $('new-username').value.trim() + '" created with mailbox', 'success')
+          $('new-username').value = ''
+          $('new-password').value = ''
+          loadData()
+        } else {
+          showToast(data.error || 'Failed to create account', 'error')
+        }
+      } catch (err) {
+        showToast('Network error: ' + err.message, 'error')
+      } finally {
+        btn.disabled = false
+        btn.textContent = 'Create Account'
+      }
+      return false
+    }
+
+    loadData()
+    setInterval(loadData, 30000)
+  </script>
+</body>
+</html>

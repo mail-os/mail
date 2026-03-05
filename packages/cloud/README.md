@@ -152,7 +152,7 @@ ENVIRONMENT=dev
 # EC2 Configuration
 KEY_PAIR_NAME=mail
 
-# Optional: Domain Configuration
+# Domain Configuration (required for production email)
 DOMAIN_NAME=mail.example.com
 HOSTED_ZONE_ID=Z1234567890ABC
 ```
@@ -160,17 +160,19 @@ HOSTED_ZONE_ID=Z1234567890ABC
 ### 3. Deploy Development Environment
 
 ```bash
-bun run deploy:dev
+pantry run deploy:dev
 ```
 
 This will:
 1. Create VPC and networking
-2. Launch EC2 instance
-3. Configure security groups
-4. Create S3 bucket
-5. Set up Secrets Manager
-6. Install and configure Mail Server
-7. Start all services
+2. Launch EC2 instance with security groups
+3. Create S3 bucket for backups
+4. Install and build the mail server from source
+5. Obtain Let's Encrypt TLS certificate (if domain configured)
+6. Configure SES with DKIM signing
+7. Set up DNS records (MX, SPF, DMARC, A) in Route 53
+8. Configure fail2ban, certbot auto-renewal, and log rotation
+9. Start all services (SMTP, IMAP, CalDAV)
 
 **Deployment Time:** ~10-15 minutes
 

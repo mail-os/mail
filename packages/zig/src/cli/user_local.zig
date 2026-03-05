@@ -20,17 +20,29 @@ fn withDb(comptime action: fn (*cli.BaseCommand.ParseContext, *database.Database
 
 fn createAction(ctx: *cli.BaseCommand.ParseContext, _: *database.Database, auth_backend: *auth.AuthBackend) !void {
     const username = ctx.getArgument(0) orelse {
-        std.debug.print("Error: username is required\nUsage: mail user:local create <username> <password> <email>\n", .{});
+        std.debug.print("Error: username is required\nUsage: mail user:local create <username> [<password> [<email>]] [--password <pw>] [--email <email>]\n", .{});
         return;
     };
-    const password = ctx.getArgument(1) orelse {
-        std.debug.print("Error: password is required\nUsage: mail user:local create <username> <password> <email>\n", .{});
+
+    // Password: try --password option first, then positional arg
+    const password = ctx.getOption("password") orelse ctx.getArgument(1) orelse {
+        std.debug.print("Error: password is required\nUsage: mail user:local create <username> [<password> [<email>]] [--password <pw>] [--email <email>]\n", .{});
         return;
     };
-    const email_arg = ctx.getArgument(2) orelse {
-        std.debug.print("Error: email is required\nUsage: mail user:local create <username> <password> <email>\n", .{});
-        return;
+
+    // Email: try --email option, then positional arg, then derive from username
+    const email_arg = ctx.getOption("email") orelse ctx.getArgument(2) orelse blk: {
+        const domain = env.get("DOMAIN") orelse "localhost";
+        const buf = ctx.allocator.alloc(u8, username.len + 1 + domain.len) catch {
+            std.debug.print("Error: allocation failed\n", .{});
+            return;
+        };
+        @memcpy(buf[0..username.len], username);
+        buf[username.len] = '@';
+        @memcpy(buf[username.len + 1 ..], domain);
+        break :blk buf;
     };
+
     try user_cli.createUser(auth_backend, username, password, email_arg);
 }
 
@@ -97,8 +109,16 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     // create
     const create_cmd = try cli.BaseCommand.init(allocator, "create", "Create a new user locally");
     _ = try create_cmd.addArgument(cli.Argument.init("username", "Username", .string));
-    _ = try create_cmd.addArgument(cli.Argument.init("password", "Password", .string));
-    _ = try create_cmd.addArgument(cli.Argument.init("email", "Email address", .string));
+    _ = try create_cmd.addArgument(cli.Argument.init("password_pos", "Password (positional)", .string));
+    _ = try create_cmd.addArgument(cli.Argument.init("email_pos", "Email address (positional)", .string));
+    _ = try create_cmd.addOption(
+        cli.Option.init("password", "password", "Password for the new user", .string)
+            .withShort('p'),
+    );
+    _ = try create_cmd.addOption(
+        cli.Option.init("email", "email", "Email address (defaults to username@DOMAIN)", .string)
+            .withShort('e'),
+    );
     _ = create_cmd.setAction(withDb(createAction));
     _ = try cmd.addCommand(create_cmd);
 

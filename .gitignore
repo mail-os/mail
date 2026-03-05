@@ -35,3 +35,5 @@ test-emails/
 /pantry
 zig-pkg/
 /packages/zig/pantry
+/packages/devtools/.stx
+/packages/devtools/node_modules

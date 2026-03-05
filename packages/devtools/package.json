@@ -1,0 +1,10 @@
+{
+  "name": "mail-devtools",
+  "type": "module",
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "bun server.ts",
+    "start": "bun server.ts"
+  },
+  "dependencies": {}
+}

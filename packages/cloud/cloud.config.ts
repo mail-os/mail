@@ -34,6 +34,7 @@ const mailConfig = {
     https: 443,
     websocket: 8080,
     websocketSecure: 8443,
+    dashboard: 3456,
   },
 
   server: {
@@ -66,6 +67,8 @@ const mailConfig = {
     'openssl',
     'sqlite',
     'fail2ban',
+    'bind-utils',
+    'certbot',
   ],
 }
 
@@ -174,6 +177,8 @@ const config: CloudConfig = {
             // WebSocket
             { port: mailConfig.ports.websocket, protocol: 'tcp', cidr: '0.0.0.0/0', description: 'WebSocket' },
             { port: mailConfig.ports.websocketSecure, protocol: 'tcp', cidr: '0.0.0.0/0', description: 'WebSocket SSL' },
+            // Dashboard
+            { port: mailConfig.ports.dashboard, protocol: 'tcp', cidr: '0.0.0.0/0', description: 'Dashboard' },
           ],
           egress: [
             { port: 0, protocol: '-1', cidr: '0.0.0.0/0', description: 'Allow all outbound' },
@@ -194,6 +199,15 @@ const config: CloudConfig = {
       },
     },
 
+    email: {
+      domain: process.env.DOMAIN_NAME?.replace(/^[^.]*\./, '') || 'example.com',
+      hostedZoneId: process.env.HOSTED_ZONE_ID,
+      enableDkim: true,
+      dkimKeyLength: 'RSA_2048_BIT',
+      configurationSet: true,
+      dmarcReportingEmail: process.env.DMARC_EMAIL || `admin@${process.env.DOMAIN_NAME?.replace(/^[^.]*\./, '') || 'example.com'}`,
+    },
+
     dns: {
       domain: process.env.DOMAIN_NAME || 'mail.example.com',
       hostedZoneId: process.env.HOSTED_ZONE_ID,
@@ -201,6 +215,8 @@ const config: CloudConfig = {
         mx: {
           priority: 10,
         },
+        // SPF and DMARC TXT records are also created via the user data script
+        // since SPF needs the instance's public IP (not known at deploy time)
       },
     },
 
@@ -274,7 +290,7 @@ zig version
 
 # Create mail user
 echo "Creating mail-server user..."
-useradd -r -s /bin/bash -d ${cfg.paths.installDir} -m mail-server
+useradd -r -s /sbin/nologin -d ${cfg.paths.installDir} -M mail-server
 
 # Clone mail server repository
 echo "Cloning mail server repository..."
@@ -304,30 +320,182 @@ chown -R mail-server:mail-server ${cfg.paths.logDir}
 chown -R mail-server:mail-server ${cfg.paths.mailDir}
 chown -R mail-server:mail-server ${cfg.paths.installDir}/mail
 
-# Generate TLS certificates
-echo "Generating self-signed certificates..."
-openssl req -x509 -nodes -days 365 -newkey rsa:2048 \\
-  -keyout ${cfg.paths.configDir}/mail.key \\
-  -out ${cfg.paths.configDir}/mail.crt \\
-  -subj "/C=US/ST=State/L=City/O=Organization/CN=\${SMTP_HOSTNAME:-localhost}"
-chmod 600 ${cfg.paths.configDir}/mail.key
-chown mail-server:mail-server ${cfg.paths.configDir}/mail.*
+# Get instance metadata
+echo "Getting instance metadata..."
+TOKEN=\$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+PUBLIC_IP=\$(curl -s -H "X-aws-ec2-metadata-token: \$TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)
+REGION=\$(curl -s -H "X-aws-ec2-metadata-token: \$TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+DOMAIN_NAME=\${DOMAIN_NAME:-\$(aws ssm get-parameter --name "/mail-server/domain" --region \$REGION --query 'Parameter.Value' --output text 2>/dev/null || echo "")}
+HOSTED_ZONE_ID=\${HOSTED_ZONE_ID:-\$(aws ssm get-parameter --name "/mail-server/hosted-zone-id" --region \$REGION --query 'Parameter.Value' --output text 2>/dev/null || echo "")}
+MAIL_HOSTNAME=\${DOMAIN_NAME:-mail.example.com}
+
+echo "Public IP: \$PUBLIC_IP"
+echo "Domain: \$MAIL_HOSTNAME"
+echo "Hosted Zone: \$HOSTED_ZONE_ID"
+
+# Set up TLS certificates
+echo "Setting up TLS certificates..."
+if [ -n "\$DOMAIN_NAME" ] && [ "\$DOMAIN_NAME" != "mail.example.com" ]; then
+  # Use Let's Encrypt for real domains
+  echo "Requesting Let's Encrypt certificate for \$MAIL_HOSTNAME..."
+  certbot certonly --standalone --non-interactive --agree-tos \\
+    --email admin@\$(echo \$MAIL_HOSTNAME | sed 's/^[^.]*\\.//') \\
+    -d \$MAIL_HOSTNAME || {
+    echo "Let's Encrypt failed, falling back to self-signed certificate"
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \\
+      -keyout ${cfg.paths.configDir}/mail.key \\
+      -out ${cfg.paths.configDir}/mail.crt \\
+      -subj "/CN=\$MAIL_HOSTNAME"
+  }
+
+  if [ -d "/etc/letsencrypt/live/\$MAIL_HOSTNAME" ]; then
+    TLS_CERT="/etc/letsencrypt/live/\$MAIL_HOSTNAME/fullchain.pem"
+    TLS_KEY="/etc/letsencrypt/live/\$MAIL_HOSTNAME/privkey.pem"
+    # Make certs readable by mail-server user
+    chmod 755 /etc/letsencrypt/live/ /etc/letsencrypt/archive/
+    chmod 755 /etc/letsencrypt/archive/\$MAIL_HOSTNAME/
+    chgrp mail-server /etc/letsencrypt/archive/\$MAIL_HOSTNAME/privkey*.pem
+    chmod 640 /etc/letsencrypt/archive/\$MAIL_HOSTNAME/privkey*.pem
+  else
+    TLS_CERT="${cfg.paths.configDir}/mail.crt"
+    TLS_KEY="${cfg.paths.configDir}/mail.key"
+  fi
+else
+  # Self-signed for dev/testing
+  echo "Generating self-signed certificate..."
+  openssl req -x509 -nodes -days 365 -newkey rsa:2048 \\
+    -keyout ${cfg.paths.configDir}/mail.key \\
+    -out ${cfg.paths.configDir}/mail.crt \\
+    -subj "/CN=\$MAIL_HOSTNAME"
+  chmod 600 ${cfg.paths.configDir}/mail.key
+  chown mail-server:mail-server ${cfg.paths.configDir}/mail.*
+  TLS_CERT="${cfg.paths.configDir}/mail.crt"
+  TLS_KEY="${cfg.paths.configDir}/mail.key"
+fi
+
+# Set up SES for email delivery
+echo "Configuring SES..."
+DELIVERY_METHOD="direct"
+if [ -n "\$DOMAIN_NAME" ] && [ "\$DOMAIN_NAME" != "mail.example.com" ]; then
+  BASE_DOMAIN=\$(echo \$MAIL_HOSTNAME | sed 's/^[^.]*\\.//')
+
+  # Verify domain identity in SES
+  echo "Verifying domain \$BASE_DOMAIN in SES..."
+  aws ses verify-domain-identity --domain \$BASE_DOMAIN --region \$REGION 2>/dev/null || true
+
+  # Enable DKIM signing
+  echo "Enabling DKIM for \$BASE_DOMAIN..."
+  DKIM_TOKENS=\$(aws ses verify-domain-dkim --domain \$BASE_DOMAIN --region \$REGION --query 'DkimTokens' --output text 2>/dev/null || echo "")
+
+  if [ -n "\$HOSTED_ZONE_ID" ] && [ -n "\$DKIM_TOKENS" ]; then
+    # Add DKIM CNAME records to Route 53
+    echo "Adding DKIM records to Route 53..."
+    for DKIM_TOKEN in \$DKIM_TOKENS; do
+      aws route53 change-resource-record-sets --hosted-zone-id \$HOSTED_ZONE_ID --change-batch "{
+        \\"Changes\\": [{
+          \\"Action\\": \\"UPSERT\\",
+          \\"ResourceRecordSet\\": {
+            \\"Name\\": \\"\${DKIM_TOKEN}._domainkey.\${BASE_DOMAIN}\\",
+            \\"Type\\": \\"CNAME\\",
+            \\"TTL\\": 300,
+            \\"ResourceRecords\\": [{
+              \\"Value\\": \\"\${DKIM_TOKEN}.dkim.amazonses.com\\"
+            }]
+          }
+        }]
+      }" 2>/dev/null || true
+    done
+  fi
+
+  DELIVERY_METHOD="ses"
+fi
+
+# Set up DNS records (SPF, DMARC, MX, A, rDNS)
+if [ -n "\$HOSTED_ZONE_ID" ] && [ -n "\$DOMAIN_NAME" ]; then
+  BASE_DOMAIN=\$(echo \$MAIL_HOSTNAME | sed 's/^[^.]*\\.//')
+
+  echo "Configuring DNS records in Route 53..."
+
+  # Get existing TXT records for the base domain (to preserve them)
+  EXISTING_TXT=\$(aws route53 list-resource-record-sets --hosted-zone-id \$HOSTED_ZONE_ID \\
+    --query "ResourceRecordSets[?Name=='\${BASE_DOMAIN}.' && Type=='TXT'].ResourceRecords[].Value" \\
+    --output text 2>/dev/null | grep -v spf || echo "")
+
+  # Build TXT record values (SPF + any existing non-SPF records)
+  TXT_RECORDS="{\\"Value\\": \\"\\\\\\\"v=spf1 ip4:\$PUBLIC_IP include:amazonses.com ~all\\\\\\\"\\"}"
+  if [ -n "\$EXISTING_TXT" ]; then
+    for txt in \$EXISTING_TXT; do
+      TXT_RECORDS="\$TXT_RECORDS, {\\"Value\\": \\"\$txt\\"}"
+    done
+  fi
+
+  # Upsert all email DNS records
+  aws route53 change-resource-record-sets --hosted-zone-id \$HOSTED_ZONE_ID --change-batch "{
+    \\"Changes\\": [
+      {
+        \\"Action\\": \\"UPSERT\\",
+        \\"ResourceRecordSet\\": {
+          \\"Name\\": \\"\$MAIL_HOSTNAME\\",
+          \\"Type\\": \\"A\\",
+          \\"TTL\\": 300,
+          \\"ResourceRecords\\": [{\\"Value\\": \\"\$PUBLIC_IP\\"}]
+        }
+      },
+      {
+        \\"Action\\": \\"UPSERT\\",
+        \\"ResourceRecordSet\\": {
+          \\"Name\\": \\"\$BASE_DOMAIN\\",
+          \\"Type\\": \\"MX\\",
+          \\"TTL\\": 300,
+          \\"ResourceRecords\\": [{\\"Value\\": \\"10 \$MAIL_HOSTNAME\\"}]
+        }
+      },
+      {
+        \\"Action\\": \\"UPSERT\\",
+        \\"ResourceRecordSet\\": {
+          \\"Name\\": \\"\$BASE_DOMAIN\\",
+          \\"Type\\": \\"TXT\\",
+          \\"TTL\\": 300,
+          \\"ResourceRecords\\": [\$TXT_RECORDS]
+        }
+      },
+      {
+        \\"Action\\": \\"UPSERT\\",
+        \\"ResourceRecordSet\\": {
+          \\"Name\\": \\"_dmarc.\$BASE_DOMAIN\\",
+          \\"Type\\": \\"TXT\\",
+          \\"TTL\\": 300,
+          \\"ResourceRecords\\": [{\\"Value\\": \\"\\\\\\\"v=DMARC1; p=quarantine; pct=100\\\\\\\"\\"  }]
+        }
+      }
+    ]
+  }" 2>/dev/null && echo "DNS records configured successfully" || echo "Warning: DNS record configuration failed (may need manual setup)"
+
+  # Request reverse DNS (rDNS) via SES for the EIP
+  echo "Requesting reverse DNS for \$PUBLIC_IP -> \$MAIL_HOSTNAME..."
+  # Note: AWS requires a support case for rDNS on EC2. SES handles it for SES-sent mail.
+  # The user data script sets the SMTP_HOSTNAME which is used in EHLO/HELO
+fi
 
 # Create environment file
 echo "Creating environment configuration..."
-cat > ${cfg.paths.configDir}/mail.env << 'ENVEOF'
+cat > ${cfg.paths.configDir}/mail.env << ENVEOF
 # Mail Server Configuration
 SMTP_HOST=0.0.0.0
 SMTP_PORT=${cfg.server.port}
+SMTP_HOSTNAME=\$MAIL_HOSTNAME
 
 # TLS Configuration
 SMTP_ENABLE_TLS=true
-SMTP_TLS_CERT=${cfg.paths.configDir}/mail.crt
-SMTP_TLS_KEY=${cfg.paths.configDir}/mail.key
+SMTP_TLS_CERT=\$TLS_CERT
+SMTP_TLS_KEY=\$TLS_KEY
 
 # Authentication
 SMTP_ENABLE_AUTH=true
-SMTP_DB_PATH=${cfg.paths.dataDir}/mail.db
+SMTP_DB_PATH=${cfg.paths.installDir}/smtp.db
+
+# Delivery
+SMTP_DELIVERY_METHOD=\$DELIVERY_METHOD
 
 # Logging
 SMTP_ENABLE_JSON_LOGGING=true
@@ -382,9 +550,8 @@ ReadWritePaths=${cfg.paths.installDir}
 WantedBy=multi-user.target
 SVCEOF
 
-# Install and configure fail2ban
-echo "Installing fail2ban..."
-dnf install -y fail2ban || true
+# Configure fail2ban for mail server
+echo "Configuring fail2ban..."
 systemctl enable fail2ban
 systemctl start fail2ban
 
@@ -392,9 +559,34 @@ systemctl start fail2ban
 echo "Configuring certbot renewal..."
 echo "0 3 * * * root certbot renew --quiet --deploy-hook \\"systemctl restart mail\\"" > /etc/cron.d/certbot-renewal
 
+# Set up log rotation
+echo "Configuring log rotation..."
+cat > /etc/systemd/system/mail-logrotate.service << 'LOGEOF'
+[Unit]
+Description=Truncate mail server log
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c "tail -n 10000 ${cfg.paths.installDir}/smtp-server.log > ${cfg.paths.installDir}/smtp-server.log.tmp && mv ${cfg.paths.installDir}/smtp-server.log.tmp ${cfg.paths.installDir}/smtp-server.log"
+LOGEOF
+
+cat > /etc/systemd/system/mail-logrotate.timer << 'TIMEREOF'
+[Unit]
+Description=Weekly mail log rotation
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+TIMEREOF
+
+systemctl daemon-reload
+systemctl enable --now mail-logrotate.timer
+
 # Enable and start mail server
 echo "Starting mail server..."
-systemctl daemon-reload
 systemctl enable mail
 systemctl start mail
 

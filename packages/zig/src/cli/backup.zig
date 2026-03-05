@@ -167,7 +167,7 @@ fn printStdout(comptime fmt: []const u8, args: anytype) void {
 
 fn getBucketName(allocator: std.mem.Allocator, env: []const u8) ![]const u8 {
     // Get the S3 bucket from CloudFormation stack outputs
-    const stack_name = try std.fmt.allocPrint(allocator, "smtp-server-{s}", .{env});
+    const stack_name = try std.fmt.allocPrint(allocator, "mail-server-{s}", .{env});
     defer allocator.free(stack_name);
 
     const argv = &[_][]const u8{
@@ -199,7 +199,7 @@ fn getBucketName(allocator: std.mem.Allocator, env: []const u8) ![]const u8 {
 }
 
 fn findBucketByPrefix(allocator: std.mem.Allocator, env: []const u8) ![]const u8 {
-    const prefix = try std.fmt.allocPrint(allocator, "smtp-server-emails-{s}", .{env});
+    const prefix = try std.fmt.allocPrint(allocator, "mail-server-emails-{s}", .{env});
     defer allocator.free(prefix);
 
     const argv = &[_][]const u8{
