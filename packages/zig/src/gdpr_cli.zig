@@ -1,7 +1,7 @@
 const std = @import("std");
 pub const gdpr = @import("features/gdpr.zig");
 pub const env = @import("core/env.zig");
-const io_compat = @import("core/io_compat.zig");
+const fs_compat = @import("core/fs_compat.zig");
 
 pub fn exportCommand(manager: *gdpr.GDPRManager, allocator: std.mem.Allocator, username: []const u8, output_file: ?[]const u8) !void {
     std.debug.print("Exporting data for user: {s}\n", .{username});
@@ -25,13 +25,18 @@ pub fn exportCommand(manager: *gdpr.GDPRManager, allocator: std.mem.Allocator, u
 
     // Write to file or stdout
     if (output_file) |path| {
-        const io = io_compat.getIo();
-        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
-        defer file.close(io);
+        const file = fs_compat.cwd().createFile(path, .{}) catch |err| {
+            std.debug.print("Error: Failed to create file {s}: {}\n", .{ path, err });
+            return;
+        };
+        defer file.close();
 
         const json_str = try export_data.toJSONString(allocator);
         defer allocator.free(json_str);
-        try file.writeStreamingAll(io, json_str);
+        file.writeAll(json_str) catch |err| {
+            std.debug.print("Error: Failed to write to {s}: {}\n", .{ path, err });
+            return;
+        };
 
         std.debug.print("\nData exported to: {s}\n", .{path});
     } else {

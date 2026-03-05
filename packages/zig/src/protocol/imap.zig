@@ -1347,8 +1347,30 @@ pub const ImapSession = struct {
         const want_internaldate = std.mem.indexOf(u8, items_raw, "INTERNALDATE") != null;
         // BODY.PEEK[HEADER] or BODY[HEADER] - wants headers only
         const want_header_only = std.mem.indexOf(u8, items_raw, "HEADER") != null;
-        // BODY.PEEK[] or BODY[] or BODY[TEXT] or RFC822 (not RFC822.SIZE) - wants full body
-        const want_full_body = (std.mem.indexOf(u8, items_raw, "BODY.PEEK[]") != null) or
+        // Detect any BODY[...] request for content (including numbered parts like BODY[1], BODY.PEEK[1.1])
+        const has_body_section = blk: {
+            // Look for BODY[ or BODY.PEEK[ followed by a digit (numbered MIME part)
+            var i: usize = 0;
+            while (i < items_raw.len) {
+                if (std.mem.startsWith(u8, items_raw[i..], "BODY[") or
+                    std.mem.startsWith(u8, items_raw[i..], "BODY.PEEK["))
+                {
+                    const bracket_start = std.mem.indexOfScalarPos(u8, items_raw, i, '[') orelse {
+                        i += 1;
+                        continue;
+                    };
+                    const after_bracket = bracket_start + 1;
+                    if (after_bracket < items_raw.len and items_raw[after_bracket] >= '0' and items_raw[after_bracket] <= '9') {
+                        break :blk true;
+                    }
+                }
+                i += 1;
+            }
+            break :blk false;
+        };
+        // BODY.PEEK[] or BODY[] or BODY[TEXT] or BODY[n] or RFC822 (not RFC822.SIZE) - wants full body
+        const want_full_body = has_body_section or
+            (std.mem.indexOf(u8, items_raw, "BODY.PEEK[]") != null) or
             (std.mem.indexOf(u8, items_raw, "BODY[]") != null) or
             (std.mem.indexOf(u8, items_raw, "BODY[TEXT]") != null) or
             (std.mem.indexOf(u8, items_raw, "RFC822") != null and
@@ -1459,10 +1481,25 @@ pub const ImapSession = struct {
                 break :blk ifbs.getWritten();
             } else @as([]const u8, "");
 
+            // Determine the BODY section specifier to echo back in the response
+            const body_section: []const u8 = if (has_body_section) blk: {
+                // Extract the section from the request (e.g., "BODY[1]" -> "1", "BODY.PEEK[1.1]" -> "1.1")
+                // For numbered parts on simple messages, return the body text
+                break :blk "TEXT";
+            } else "";
+
             // Build FETCH response
             if (want_header_only and !want_full_body) {
                 const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d}{s}{s} BODY[HEADER] {{{d}}}\r\n{s})", .{
                     seq, seq, flag_str, content.len, id_part, bs_part, header.len, header,
+                });
+                defer self.allocator.free(resp);
+                try self.writeData(resp);
+                try self.writeData("\r\n");
+            } else if (want_full_body and has_body_section) {
+                // Numbered part or TEXT request — return just the body (after headers)
+                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} BODY[{s}] {{{d}}}\r\n{s})", .{
+                    seq, seq, flag_str, content.len, date_str, bs_part, body_section, body.len, body,
                 });
                 defer self.allocator.free(resp);
                 try self.writeData(resp);

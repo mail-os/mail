@@ -3,16 +3,34 @@ import { serve } from 'bun'
 const home = await Bun.file(new URL('./pages/home.stx', import.meta.url).pathname).text()
 
 const LOCAL = process.env.LOCAL === '1' || process.env.LOCAL === 'true'
-const INSTANCE_ID = process.env.INSTANCE_ID || 'i-0e365c6bd31da4678'
-const DOMAIN = process.env.DOMAIN || 'mail.stacksjs.com'
+const INSTANCE_ID = process.env.INSTANCE_ID || ''
+const DOMAIN = process.env.DOMAIN || 'localhost'
 const BASE_DOMAIN = DOMAIN.replace(/^[^.]*\./, '')
 const DASH_USER = process.env.DASH_USER || 'admin'
 const DASH_PASS = process.env.DASH_PASS || ''
 const TLS_CERT = process.env.TLS_CERT || ''
 const TLS_KEY = process.env.TLS_KEY || ''
 
+if (!LOCAL && !INSTANCE_ID) {
+  console.error('ERROR: INSTANCE_ID environment variable is required in remote mode')
+  process.exit(1)
+}
+
+if (!LOCAL && !DASH_PASS) {
+  console.error('ERROR: DASH_PASS environment variable is required in remote mode (set LOCAL=1 for dev)')
+  process.exit(1)
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  const encoder = new TextEncoder()
+  const bufA = encoder.encode(a)
+  const bufB = encoder.encode(b)
+  return crypto.subtle.timingSafeEqual(bufA, bufB)
+}
+
 function checkAuth(req: Request): Response | null {
-  if (!DASH_PASS) return null // no password set = no auth required (local dev)
+  if (!DASH_PASS) return null // no password set = no auth required (local dev only)
 
   const auth = req.headers.get('Authorization')
   if (!auth || !auth.startsWith('Basic ')) {
@@ -23,8 +41,16 @@ function checkAuth(req: Request): Response | null {
   }
 
   const decoded = atob(auth.slice(6))
-  const [user, pass] = decoded.split(':')
-  if (user !== DASH_USER || pass !== DASH_PASS) {
+  const colonIdx = decoded.indexOf(':')
+  if (colonIdx < 0) {
+    return new Response('Unauthorized', {
+      status: 401,
+      headers: { 'WWW-Authenticate': 'Basic realm="Mail Dashboard"' },
+    })
+  }
+  const user = decoded.slice(0, colonIdx)
+  const pass = decoded.slice(colonIdx + 1)
+  if (!timingSafeEqual(user, DASH_USER) || !timingSafeEqual(pass, DASH_PASS)) {
     return new Response('Unauthorized', {
       status: 401,
       headers: { 'WWW-Authenticate': 'Basic realm="Mail Dashboard"' },

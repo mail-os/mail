@@ -129,6 +129,8 @@ pub const Server = struct {
                     continue;
                 }
                 self.logger.warn("Error accepting connection: {}", .{err});
+                // Backoff on system errors to avoid CPU-burning tight loops
+                time_compat.sleepMs(500);
                 continue;
             };
 
@@ -177,9 +179,9 @@ pub const Server = struct {
 
         self.logger.info("Server shutting down gracefully...", .{});
 
-        // Wait for active connections to finish (with timeout)
+        // Wait for active connections to finish (60s timeout)
         var wait_count: u32 = 0;
-        while (self.active_connections.load(.monotonic) > 0 and wait_count < 100) : (wait_count += 1) {
+        while (self.active_connections.load(.monotonic) > 0 and wait_count < 600) : (wait_count += 1) {
             time_compat.sleepMs(100);
         }
 
@@ -263,6 +265,7 @@ pub const Server = struct {
                     continue;
                 }
                 self.logger.warn("SMTPS: Error accepting connection: {}", .{err});
+                time_compat.sleepMs(500);
                 continue;
             };
 
@@ -314,6 +317,7 @@ pub const Server = struct {
                     continue;
                 }
                 self.logger.warn("Submission: Error accepting connection: {}", .{err});
+                time_compat.sleepMs(500);
                 continue;
             };
 

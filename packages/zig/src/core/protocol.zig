@@ -239,6 +239,9 @@ pub const Session = struct {
     // BDAT/CHUNKING support
     bdat_session: ?chunking.BDATSession,
     chunking_handler: chunking.ChunkingHandler,
+    // Per-command rate limiting
+    command_count: u32,
+    command_window_start: i64,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -276,6 +279,8 @@ pub const Session = struct {
             .tls_writer_info = null,
             .bdat_session = null,
             .chunking_handler = chunking.ChunkingHandler.init(allocator, 10 * 1024 * 1024, cfg.max_message_size),
+            .command_count = 0,
+            .command_window_start = now,
         };
     }
 
@@ -399,6 +404,18 @@ pub const Session = struct {
     }
 
     fn processCommand(self: *Session, writer: anytype, line: []const u8) !bool {
+        // Per-connection command rate limiting (max 50 commands per 10 seconds)
+        const now = time_compat.timestamp();
+        if (now - self.command_window_start >= 10) {
+            self.command_count = 0;
+            self.command_window_start = now;
+        }
+        self.command_count += 1;
+        if (self.command_count > 50) {
+            try self.sendResponse(writer, 421, "Too many commands, slow down", null);
+            return true;
+        }
+
         const cmd = self.parseCommand(line);
 
         switch (cmd) {
@@ -1300,8 +1317,7 @@ pub const Session = struct {
     }
 
     fn saveMessage(self: *Session, data: []const u8) !void {
-        const io = io_compat.getIo();
-        const cwd = std.Io.Dir.cwd();
+        const cwd = fs_compat.cwd();
         const timestamp = time_compat.milliTimestamp();
         const sender = self.mail_from orelse "unknown";
 
@@ -1326,23 +1342,24 @@ pub const Session = struct {
                 else
                     rcpt;
 
-                const user_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}", .{username});
-                defer self.allocator.free(user_dir);
-                cwd.createDir(io, "mail", .default_dir) catch {};
-                cwd.createDir(io, user_dir, .default_dir) catch {};
-
                 const new_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{username});
                 defer self.allocator.free(new_dir);
-                cwd.createDir(io, new_dir, .default_dir) catch {};
+                cwd.makePath(new_dir) catch {};
 
                 const filename = try std.fmt.allocPrint(self.allocator, "mail/{s}/new/{d}.eml", .{ username, timestamp });
                 defer self.allocator.free(filename);
 
-                const file = try cwd.createFile(io, filename, .{});
-                defer file.close(io);
+                const file = cwd.createFile(filename, .{}) catch |err| {
+                    self.logger.err("Failed to create message file {s}: {}", .{ filename, err });
+                    continue;
+                };
+                defer file.close();
 
                 // Write the raw message data as-is (it already contains headers from the client)
-                try file.writeStreamingAll(io, data);
+                file.writeAll(data) catch |err| {
+                    self.logger.err("Failed to write message data to {s}: {}", .{ filename, err });
+                    continue;
+                };
 
                 self.logger.debug("Message saved to {s}", .{filename});
 

@@ -110,9 +110,13 @@ pub const NonceManager = struct {
             self.cleanupLocked();
         }
 
-        // Hard cap: if still over limit after cleanup, force another cleanup
+        // Hard cap: if still over limit after cleanup, reject to prevent memory exhaustion
         if (self.nonces.count() >= self.max_nonces) {
             self.cleanupLocked();
+            if (self.nonces.count() >= self.max_nonces) {
+                self.allocator.free(nonce);
+                return error.TooManyNonces;
+            }
         }
 
         try self.nonces.put(nonce, now);
