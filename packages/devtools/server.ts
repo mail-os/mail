@@ -456,11 +456,28 @@ function recordResource(cpu: number, mem: number) {
 }
 
 function getResourceChartData(): { labels: string[]; cpu: number[]; mem: number[] } {
-  // Downsample to ~288 points (every 5 minutes over 24h, or whatever we have)
-  const bucketSize = 5 * 60 * 1000 // 5 minutes
-  const buckets: Record<number, { cpuSum: number; memSum: number; count: number }> = {}
+  // Adaptive bucket size based on data span
+  const entries = resourceHistory
+  if (entries.length === 0) return { labels: [], cpu: [], mem: [] }
 
-  for (const e of resourceHistory) {
+  const span = entries[entries.length - 1].ts - entries[0].ts
+  // Under 1 hour: no bucketing (raw points)
+  // Under 6 hours: 1-minute buckets
+  // Under 24 hours: 2-minute buckets
+  // Over 24 hours: 5-minute buckets
+  const bucketSize = span < 3600000 ? 0 : span < 21600000 ? 60000 : span < 86400000 ? 120000 : 300000
+
+  if (bucketSize === 0) {
+    // Raw points
+    return {
+      labels: entries.map(e => new Date(e.ts).toISOString()),
+      cpu: entries.map(e => e.cpu),
+      mem: entries.map(e => e.mem),
+    }
+  }
+
+  const buckets: Record<number, { cpuSum: number; memSum: number; count: number }> = {}
+  for (const e of entries) {
     const key = Math.floor(e.ts / bucketSize) * bucketSize
     if (!buckets[key]) buckets[key] = { cpuSum: 0, memSum: 0, count: 0 }
     buckets[key].cpuSum += e.cpu
@@ -469,18 +486,11 @@ function getResourceChartData(): { labels: string[]; cpu: number[]; mem: number[
   }
 
   const keys = Object.keys(buckets).map(Number).sort()
-  const labels: string[] = []
-  const cpu: number[] = []
-  const mem: number[] = []
-
-  for (const k of keys) {
-    const b = buckets[k]
-    labels.push(new Date(k).toISOString())
-    cpu.push(Math.round(b.cpuSum / b.count))
-    mem.push(Math.round(b.memSum / b.count))
+  return {
+    labels: keys.map(k => new Date(k).toISOString()),
+    cpu: keys.map(k => Math.round(buckets[k].cpuSum / buckets[k].count)),
+    mem: keys.map(k => Math.round(buckets[k].memSum / buckets[k].count)),
   }
-
-  return { labels, cpu, mem }
 }
 
 loadResourceHistory()

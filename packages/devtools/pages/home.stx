@@ -1472,12 +1472,18 @@
       ctx.scale(dpr, dpr)
       ctx.clearRect(0, 0, w, h)
 
-      if (!data || data.length < 2) {
+      if (!data || data.length === 0) {
         ctx.fillStyle = 'rgba(' + rgb + ',0.3)'
         ctx.font = '11px -apple-system, system-ui, sans-serif'
         ctx.textAlign = 'center'
         ctx.fillText('Collecting data...', w / 2, h / 2)
         return
+      }
+
+      // If only 1 point, duplicate it so we can draw a flat line
+      if (data.length === 1) {
+        data = [data[0], data[0]]
+        labels = [labels[0], labels[0]]
       }
 
       var padTop = 4
