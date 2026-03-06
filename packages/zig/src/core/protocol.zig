@@ -102,6 +102,38 @@ const ConnectionWrapper = struct {
                     return to_copy;
                 }
 
+                // Try to decrypt pre-existing ciphertext first (e.g. leftover from STARTTLS handshake)
+                if (self.ciphertext_len > 0) {
+                    var decrypt_buf: [16384]u8 = undefined;
+                    const dec_result = tls_conn.decrypt(self.ciphertext_accum[0..self.ciphertext_len], &decrypt_buf) catch |err| {
+                        logger.err("TLS decrypt error (pre-existing): {}", .{err});
+                        return error.TlsDecryptFailed;
+                    };
+
+                    if (dec_result.ciphertext_pos > 0) {
+                        const remaining = self.ciphertext_len - dec_result.ciphertext_pos;
+                        if (remaining > 0) {
+                            std.mem.copyForwards(u8, &self.ciphertext_accum, self.ciphertext_accum[dec_result.ciphertext_pos..self.ciphertext_len]);
+                        }
+                        self.ciphertext_len = remaining;
+                    }
+
+                    if (dec_result.closed) return 0;
+
+                    if (dec_result.cleartext.len > 0) {
+                        const to_copy = @min(dec_result.cleartext.len, buffer.len);
+                        @memcpy(buffer[0..to_copy], dec_result.cleartext[0..to_copy]);
+                        if (dec_result.cleartext.len > to_copy) {
+                            const excess = dec_result.cleartext.len - to_copy;
+                            @memcpy(self.cleartext_buf[0..excess], dec_result.cleartext[to_copy..]);
+                            self.cleartext_start = 0;
+                            self.cleartext_end = excess;
+                        }
+                        return to_copy;
+                    }
+                    // Pre-existing data wasn't a complete TLS record, fall through to read more
+                }
+
                 // Need to read and decrypt more data
                 var recv_buf: [tls.input_buffer_len]u8 = undefined;
                 const bytes_read = self.tcp_conn.read(recv_buf[0..]) catch |err| {

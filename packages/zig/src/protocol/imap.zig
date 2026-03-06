@@ -388,10 +388,10 @@ const SequenceIterator = struct {
 
     pub fn next(self: *SequenceIterator) ?u32 {
         // Continue yielding from current range
-        if (self.range_current <= self.range_end) {
+        while (self.range_current <= self.range_end) {
             const val = self.range_current;
             self.range_current += 1;
-            return val;
+            if (val >= 1 and val <= self.max_seq) return val;
         }
 
         // Parse next element from sequence set
@@ -417,12 +417,15 @@ const SequenceIterator = struct {
                 // Reverse range
                 self.range_current = end_num + 1;
                 self.range_end = start_num;
-                return end_num;
+                if (end_num >= 1 and end_num <= self.max_seq) return end_num;
+                return self.next();
             }
-            return start_num;
+            if (start_num >= 1 and start_num <= self.max_seq) return start_num;
+            return self.next();
         }
 
-        return start_num;
+        if (start_num >= 1 and start_num <= self.max_seq) return start_num;
+        return self.next();
     }
 
     fn parseNum(self: *SequenceIterator) ?u32 {
@@ -1545,10 +1548,41 @@ pub const ImapSession = struct {
             }
         }
 
+        // Detect if we only need metadata (FLAGS, UID, RFC822.SIZE) — no file content read needed
+        const want_rfc822_size = std.mem.indexOf(u8, items_raw, "RFC822.SIZE") != null;
+        const metadata_only = !want_full_body and !want_header_only and !want_bodystructure and !want_body_text_only;
+
         var seq = start;
         while (seq <= end) : (seq += 1) {
             const filename = files[seq - 1];
             const uid = self.getUidForSeq(seq);
+
+            // For metadata-only requests (FLAGS, UID, RFC822.SIZE), skip reading file content
+            if (metadata_only) {
+                const msg_flags = MaildirFlags.fromFilename(filename);
+                var flag_str_buf: [256]u8 = undefined;
+                const flag_str = msg_flags.toImapString(&flag_str_buf);
+
+                if (want_rfc822_size) {
+                    const filepath = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename });
+                    defer self.allocator.free(filepath);
+                    const file_size = fs_compat.getFileSize(filepath) catch 0;
+                    const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d})", .{
+                        seq, uid, flag_str, file_size,
+                    });
+                    defer self.allocator.free(resp);
+                    try self.writeData(resp);
+                } else {
+                    const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}))", .{
+                        seq, uid, flag_str,
+                    });
+                    defer self.allocator.free(resp);
+                    try self.writeData(resp);
+                }
+                try self.writeData("\r\n");
+                continue;
+            }
+
             const filepath = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename });
             defer self.allocator.free(filepath);
 
@@ -1773,6 +1807,40 @@ pub const ImapSession = struct {
             std.ascii.indexOfIgnoreCase(criteria, "UNANSWERED") == null;
         const want_unanswered = std.ascii.indexOfIgnoreCase(criteria, "UNANSWERED") != null;
 
+        // Parse UID range criteria (e.g. "UID 4:*", "UID 1,3,5")
+        var uid_range_start: i64 = 0;
+        var uid_range_end: i64 = std.math.maxInt(i64);
+        var has_uid_range = false;
+        if (std.ascii.indexOfIgnoreCase(criteria, "UID")) |uid_pos| {
+            // Make sure this is the UID keyword, not part of another word
+            const after_uid = uid_pos + 3;
+            if (after_uid < criteria.len) {
+                const rest = std.mem.trim(u8, criteria[after_uid..], " \t");
+                if (rest.len > 0) {
+                    has_uid_range = true;
+                    if (std.mem.indexOf(u8, rest, ":")) |colon| {
+                        uid_range_start = std.fmt.parseInt(i64, rest[0..colon], 10) catch 1;
+                        const end_part = rest[colon + 1 ..];
+                        // End part might have trailing spaces or other criteria
+                        const end_token = if (std.mem.indexOfAny(u8, end_part, " \t")) |sp| end_part[0..sp] else end_part;
+                        if (std.mem.eql(u8, end_token, "*")) {
+                            uid_range_end = std.math.maxInt(i64);
+                        } else {
+                            uid_range_end = std.fmt.parseInt(i64, end_token, 10) catch std.math.maxInt(i64);
+                        }
+                    } else {
+                        // Single UID value
+                        const uid_token = if (std.mem.indexOfAny(u8, rest, " \t")) |sp| rest[0..sp] else rest;
+                        const single_uid = std.fmt.parseInt(i64, uid_token, 10) catch 0;
+                        if (single_uid > 0) {
+                            uid_range_start = single_uid;
+                            uid_range_end = single_uid;
+                        }
+                    }
+                }
+            }
+        }
+
         var buf: [8192]u8 = undefined;
         var fbs = io_compat.fixedBufferStream(&buf);
         const writer = fbs.writer();
@@ -1780,7 +1848,13 @@ pub const ImapSession = struct {
 
         for (files, 0..) |filename, i| {
             const seq = i + 1;
+            const uid = self.getUidForSeq(seq);
             const flags = MaildirFlags.fromFilename(filename);
+
+            // Filter by UID range if specified
+            if (has_uid_range) {
+                if (uid < uid_range_start or uid > uid_range_end) continue;
+            }
 
             // Evaluate flag-based criteria
             if (!is_all) {
@@ -1813,7 +1887,6 @@ pub const ImapSession = struct {
                         const after = criteria[from_pos + 4 ..];
                         const term = extractQuotedArg(after);
                         if (term.len > 0) {
-                            // Check if From: header contains the term
                             if (std.ascii.indexOfIgnoreCase(hdr, "From:")) |fp| {
                                 const from_line_end = std.mem.indexOfScalarPos(u8, hdr, fp, '\n') orelse hdr.len;
                                 const from_line = hdr[fp..from_line_end];
@@ -1841,7 +1914,7 @@ pub const ImapSession = struct {
                 }
             }
 
-            const result_id: i64 = if (is_uid) self.getUidForSeq(seq) else @intCast(seq);
+            const result_id: i64 = if (is_uid) uid else @intCast(seq);
             writer.print(" {d}", .{result_id}) catch break;
         }
 

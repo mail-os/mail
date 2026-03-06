@@ -336,6 +336,18 @@ pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]con
 }
 
 /// Read entire file contents into an allocated buffer.
+pub fn getFileSize(path: []const u8) !u64 {
+    const path_z = toZ(path) orelse return error.SystemResources;
+    defer freeZ(path_z, path.len);
+    const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.FileNotFound;
+    defer _ = std.c.close(fd);
+    // Seek to end to get file size
+    const size = std.c.lseek(fd, 0, std.c.SEEK.END);
+    if (size < 0) return error.SystemResources;
+    return @intCast(size);
+}
+
 pub fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const path_z = toZ(path) orelse return error.SystemResources;
     defer freeZ(path_z, path.len);
