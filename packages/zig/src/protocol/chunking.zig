@@ -248,17 +248,17 @@ test "chunk accumulation" {
     const testing = std.testing;
     var handler = ChunkingHandler.init(testing.allocator, 1024, 10 * 1024);
 
-    var chunks = std.ArrayList([]const u8).init(testing.allocator);
+    var chunks: std.ArrayList([]const u8) = .empty;
     defer {
         for (chunks.items) |chunk| {
             testing.allocator.free(chunk);
         }
-        chunks.deinit();
+        chunks.deinit(testing.allocator);
     }
 
-    try chunks.append(try testing.allocator.dupe(u8, "Part1 "));
-    try chunks.append(try testing.allocator.dupe(u8, "Part2 "));
-    try chunks.append(try testing.allocator.dupe(u8, "Part3"));
+    try chunks.append(testing.allocator, try testing.allocator.dupe(u8, "Part1 "));
+    try chunks.append(testing.allocator, try testing.allocator.dupe(u8, "Part2 "));
+    try chunks.append(testing.allocator, try testing.allocator.dupe(u8, "Part3"));
 
     const message = try handler.accumulateChunks(&chunks);
     defer testing.allocator.free(message);

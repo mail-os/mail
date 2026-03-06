@@ -79,6 +79,8 @@ pub fn build(b: *std.Build) void {
         "src/errors_test.zig",
         "src/config_test.zig",
         "src/fs_compat_test.zig",
+        "src/imap_test.zig",
+        "src/connection_wrapper_test.zig",
     };
 
     // RFC compliance tests
@@ -111,6 +113,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         test_module.addImport("tls", tls_module);
+        test_module.linkSystemLibrary("sqlite3", .{});
 
         const unit_tests = b.addTest(.{
             .root_module = test_module,

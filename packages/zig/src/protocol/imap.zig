@@ -371,7 +371,7 @@ pub const ImapCommand = enum {
 
 /// Parse IMAP sequence sets like "1", "1:5", "1,3,5", "1:3,7", "*".
 /// Sequence numbers are 1-based. "*" maps to max_seq.
-const SequenceIterator = struct {
+pub const SequenceIterator = struct {
     data: []const u8,
     pos: usize = 0,
     // Current range state

@@ -36,7 +36,7 @@ fn sanitizedSlice(buf: *const [256]u8, len: usize) []const u8 {
     return buf[0..@min(len, 255)];
 }
 
-const SMTPCommand = enum {
+pub const SMTPCommand = enum {
     HELO,
     EHLO,
     MAIL,
@@ -51,7 +51,7 @@ const SMTPCommand = enum {
     UNKNOWN,
 };
 
-const SessionState = enum {
+pub const SessionState = enum {
     Initial,
     Greeted,
     MailFrom,
@@ -61,7 +61,7 @@ const SessionState = enum {
 };
 
 /// Connection wrapper that abstracts TLS and plain TCP
-const ConnectionWrapper = struct {
+pub const ConnectionWrapper = struct {
     tcp_conn: socket.Connection,
     tls_conn: ?tls.nonblock.Connection,
     using_tls: bool,
@@ -473,7 +473,10 @@ pub const Session = struct {
 
     fn parseCommand(self: *Session, line: []const u8) SMTPCommand {
         _ = self;
+        return parseCommandStatic(line);
+    }
 
+    pub fn parseCommandStatic(line: []const u8) SMTPCommand {
         if (line.len < 4) return .UNKNOWN;
 
         const cmd_end = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
@@ -1319,7 +1322,7 @@ pub const Session = struct {
     }
 
     /// Sanitize a string by removing CR and LF characters to prevent header injection
-    fn sanitizeForHeader(input: []const u8, buf: []u8) []const u8 {
+    pub fn sanitizeForHeader(input: []const u8, buf: []u8) []const u8 {
         var write_pos: usize = 0;
         for (input) |c| {
             // Skip CR and LF characters

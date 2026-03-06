@@ -246,13 +246,13 @@ pub const SessionCache = struct {
 
     /// Remove expired sessions
     fn evictExpired(self: *SessionCache) void {
-        var to_remove = std.ArrayList([]const u8).init(self.allocator);
-        defer to_remove.deinit();
+        var to_remove: std.ArrayList([]const u8) = .empty;
+        defer to_remove.deinit(self.allocator);
 
         var iter = self.sessions.iterator();
         while (iter.next()) |entry| {
             if (entry.value_ptr.isExpired()) {
-                to_remove.append(entry.key_ptr.*) catch continue;
+                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
 
@@ -1356,7 +1356,7 @@ pub const ServerHelloBuilder = struct {
     version: TlsVersion,
     cipher_suite: CipherSuite,
     session_id: []const u8,
-    extensions: std.ArrayList(Extension),
+    extensions: std.ArrayList(Extension) = .empty,
 
     pub const Extension = struct {
         ext_type: ExtensionType,
@@ -1374,16 +1374,15 @@ pub const ServerHelloBuilder = struct {
             .version = version,
             .cipher_suite = cipher_suite,
             .session_id = session_id,
-            .extensions = std.ArrayList(Extension).init(allocator),
         };
     }
 
     pub fn deinit(self: *ServerHelloBuilder) void {
-        self.extensions.deinit();
+        self.extensions.deinit(self.allocator);
     }
 
     pub fn addExtension(self: *ServerHelloBuilder, ext_type: ExtensionType, data: []const u8) !void {
-        try self.extensions.append(.{
+        try self.extensions.append(self.allocator, .{
             .ext_type = ext_type,
             .data = data,
         });
@@ -1397,55 +1396,55 @@ pub const ServerHelloBuilder = struct {
     }
 
     pub fn addKeyShare(self: *ServerHelloBuilder, group: NamedGroup, key_exchange: []const u8) !void {
-        var data = std.ArrayList(u8).init(self.allocator);
-        defer data.deinit();
+        var data: std.ArrayList(u8) = .empty;
+        defer data.deinit(self.allocator);
 
         // Named group (2 bytes)
         var group_bytes: [2]u8 = undefined;
         std.mem.writeInt(u16, &group_bytes, @intFromEnum(group), .big);
-        try data.appendSlice(&group_bytes);
+        try data.appendSlice(self.allocator, &group_bytes);
 
         // Key exchange length (2 bytes)
         var len_bytes: [2]u8 = undefined;
         std.mem.writeInt(u16, &len_bytes, @intCast(key_exchange.len), .big);
-        try data.appendSlice(&len_bytes);
+        try data.appendSlice(self.allocator, &len_bytes);
 
         // Key exchange data
-        try data.appendSlice(key_exchange);
+        try data.appendSlice(self.allocator, key_exchange);
 
-        try self.addExtension(.key_share, try data.toOwnedSlice());
+        try self.addExtension(.key_share, try data.toOwnedSlice(self.allocator));
     }
 
     /// Build the ServerHello message
     pub fn build(self: *ServerHelloBuilder) ![]u8 {
-        var output = std.ArrayList(u8).init(self.allocator);
-        errdefer output.deinit();
+        var output: std.ArrayList(u8) = .empty;
+        errdefer output.deinit(self.allocator);
 
         // Legacy version (TLS 1.2 = 0x0303)
         var version_bytes: [2]u8 = undefined;
         std.mem.writeInt(u16, &version_bytes, 0x0303, .big);
-        try output.appendSlice(&version_bytes);
+        try output.appendSlice(self.allocator, &version_bytes);
 
         // Server random (32 bytes)
         var random: [32]u8 = undefined;
         io_compat.randomBytes(&random);
-        try output.appendSlice(&random);
+        try output.appendSlice(self.allocator, &random);
 
         // Session ID length and data
-        try output.append(@intCast(self.session_id.len));
-        try output.appendSlice(self.session_id);
+        try output.append(self.allocator, @intCast(self.session_id.len));
+        try output.appendSlice(self.allocator, self.session_id);
 
         // Cipher suite (2 bytes)
         var cipher_bytes: [2]u8 = undefined;
         std.mem.writeInt(u16, &cipher_bytes, @intFromEnum(self.cipher_suite), .big);
-        try output.appendSlice(&cipher_bytes);
+        try output.appendSlice(self.allocator, &cipher_bytes);
 
         // Compression method (0 = null)
-        try output.append(0);
+        try output.append(self.allocator, 0);
 
         // Extensions length (2 bytes) - placeholder
         const ext_len_pos = output.items.len;
-        try output.appendSlice(&[_]u8{ 0, 0 });
+        try output.appendSlice(self.allocator, &[_]u8{ 0, 0 });
 
         // Extensions
         const ext_start = output.items.len;
@@ -1453,22 +1452,22 @@ pub const ServerHelloBuilder = struct {
             // Extension type (2 bytes)
             var ext_type_bytes: [2]u8 = undefined;
             std.mem.writeInt(u16, &ext_type_bytes, @intFromEnum(ext.ext_type), .big);
-            try output.appendSlice(&ext_type_bytes);
+            try output.appendSlice(self.allocator, &ext_type_bytes);
 
             // Extension data length (2 bytes)
             var ext_len_bytes: [2]u8 = undefined;
             std.mem.writeInt(u16, &ext_len_bytes, @intCast(ext.data.len), .big);
-            try output.appendSlice(&ext_len_bytes);
+            try output.appendSlice(self.allocator, &ext_len_bytes);
 
             // Extension data
-            try output.appendSlice(ext.data);
+            try output.appendSlice(self.allocator, ext.data);
         }
 
         // Update extensions length
         const ext_len = output.items.len - ext_start;
         std.mem.writeInt(u16, output.items[ext_len_pos..][0..2], @intCast(ext_len), .big);
 
-        return output.toOwnedSlice();
+        return output.toOwnedSlice(self.allocator);
     }
 };
 
