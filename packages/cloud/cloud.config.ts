@@ -55,6 +55,10 @@ const mailConfig = {
     backupDir: '/var/lib/mail/backups',
   },
 
+  discord: {
+    webhookUrl: process.env.DISCORD_WEBHOOK_URL || 'https://discord.com/api/webhooks/1479364487294488596/4x1uwO_FvR-4PZ_bZ1ozkF3imltiNoZtEjM2CBFk30xXQkdF3pSJNsVYXtJ_kwEBQhqB',
+  },
+
   installUtils: [
     'git',
     'wget',
@@ -520,6 +524,9 @@ SMTP_MAX_MESSAGE_SIZE=${cfg.server.maxMessageSize}
 SMTP_MAX_RECIPIENTS=${cfg.server.maxRecipients}
 SMTP_RATE_LIMIT_PER_IP=${cfg.server.rateLimitPerIp}
 SMTP_RATE_LIMIT_PER_USER=${cfg.server.rateLimitPerUser}
+
+# Discord Health Monitoring
+DISCORD_WEBHOOK_URL=${cfg.discord?.webhookUrl || ''}
 ENVEOF
 
 chmod 600 ${cfg.paths.configDir}/mail.env

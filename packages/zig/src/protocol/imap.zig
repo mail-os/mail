@@ -773,6 +773,31 @@ pub const ImapSession = struct {
         const files = self.mailbox_files orelse return uid_set;
         const uids = self.mailbox_uids orelse return uid_set;
 
+        // Handle comma-separated UID sets (e.g., "83,85,88,90")
+        if (std.mem.indexOf(u8, uid_set, ",") != null) {
+            var result_buf: [1024]u8 = undefined;
+            var result_len: usize = 0;
+            var parts = std.mem.splitScalar(u8, uid_set, ',');
+            var first = true;
+            while (parts.next()) |part| {
+                const trimmed = std.mem.trim(u8, part, " ");
+                if (trimmed.len == 0) continue;
+                // Recursively convert each element (handles both single UIDs and ranges)
+                const converted = try self.uidSetToSeqSet(trimmed);
+                defer if (converted.ptr != trimmed.ptr) self.allocator.free(converted);
+                if (!first and result_len < result_buf.len) {
+                    result_buf[result_len] = ',';
+                    result_len += 1;
+                }
+                first = false;
+                if (result_len + converted.len <= result_buf.len) {
+                    @memcpy(result_buf[result_len..][0..converted.len], converted);
+                    result_len += converted.len;
+                }
+            }
+            return try self.allocator.dupe(u8, result_buf[0..result_len]);
+        }
+
         if (std.mem.indexOf(u8, uid_set, ":")) |colon| {
             const start_str = uid_set[0..colon];
             const end_str = uid_set[colon + 1 ..];
@@ -1496,6 +1521,14 @@ pub const ImapSession = struct {
         if (start < 1) start = 1;
         if (end > files.len) end = files.len;
 
+        // RFC 3501 Section 6.4.5: BODY[] (without .PEEK) implicitly sets \Seen flag
+        const is_peek = std.mem.indexOf(u8, items_raw, "BODY.PEEK") != null;
+        const has_body_fetch = std.mem.indexOf(u8, items_raw, "BODY[") != null or
+            (std.mem.indexOf(u8, items_raw, "RFC822") != null and
+            std.mem.indexOf(u8, items_raw, "RFC822.SIZE") == null and
+            std.mem.indexOf(u8, items_raw, "RFC822.HEADER") == null);
+        const should_set_seen = has_body_fetch and !is_peek and !self.mailbox_read_only;
+
         // Determine what to fetch based on items
         const want_internaldate = std.mem.indexOf(u8, items_raw, "INTERNALDATE") != null;
         // BODY.PEEK[HEADER] or BODY[HEADER] - wants headers only
@@ -1664,7 +1697,35 @@ pub const ImapSession = struct {
             const bodystructure = bs_fbs.getWritten();
 
             // Read actual flags from Maildir filename
-            const msg_flags = MaildirFlags.fromFilename(filename);
+            var msg_flags = MaildirFlags.fromFilename(filename);
+
+            // RFC 3501: BODY[] (non-PEEK) implicitly sets \Seen
+            if (should_set_seen and !msg_flags.seen) {
+                msg_flags.seen = true;
+                const base = MaildirFlags.baseName(filename);
+                var suffix_buf: [16]u8 = undefined;
+                const suffix = msg_flags.toSuffix(&suffix_buf);
+                var new_name_buf: [512]u8 = undefined;
+                const new_name = std.fmt.bufPrint(&new_name_buf, "{s}{s}", .{ base, suffix }) catch filename;
+                if (!std.mem.eql(u8, filename, new_name)) {
+                    const old_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename }) catch null;
+                    const new_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, new_name }) catch null;
+                    if (old_path != null and new_path != null) {
+                        if (renameFile(old_path.?, new_path.?)) {
+                            // Update cached filename
+                            const mutable_files = @constCast(files);
+                            const owned_new = self.allocator.dupe(u8, new_name) catch new_name;
+                            if (owned_new.ptr != new_name.ptr) {
+                                self.allocator.free(filename);
+                                mutable_files[seq - 1] = owned_new;
+                            }
+                        }
+                    }
+                    if (old_path) |p| self.allocator.free(p);
+                    if (new_path) |p| self.allocator.free(p);
+                }
+            }
+
             var flag_str_buf: [256]u8 = undefined;
             const flag_str = msg_flags.toImapString(&flag_str_buf);
 

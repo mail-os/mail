@@ -16,6 +16,7 @@ const cluster = @import("infrastructure/cluster.zig");
 const multitenancy = @import("features/multitenancy.zig");
 const metrics_mod = @import("observability/metrics.zig");
 const alerting = @import("observability/alerting.zig");
+const discord = @import("observability/discord.zig");
 const secrets = @import("security/secrets.zig");
 const hot_reload = @import("core/hot_reload.zig");
 
@@ -542,6 +543,26 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         }
     }
 
+    // Start Discord health monitor if webhook URL is configured
+    var discord_monitor: ?discord.DiscordHealthMonitor = null;
+    var discord_thread: ?std.Thread = null;
+    const discord_webhook_url = env.get("DISCORD_WEBHOOK_URL");
+    if (discord_webhook_url) |webhook_url| {
+        discord_monitor = discord.DiscordHealthMonitor.init(
+            allocator,
+            webhook_url,
+            &server.active_connections,
+            cfg.max_connections,
+            &shutdown_requested,
+        );
+        discord_thread = try std.Thread.spawn(.{}, struct {
+            fn run(monitor: *discord.DiscordHealthMonitor) void {
+                monitor.run();
+            }
+        }.run, .{&discord_monitor.?});
+        log.info("Discord health monitor enabled", .{});
+    }
+
     server.startWithReload(&shutdown_requested, &reload_requested, reloadConfigCallback) catch |err| {
         log.critical("Server error: {}", .{err});
         // Stop IMAP server on error
@@ -605,6 +626,12 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     }
     if (managesieve_thread) |t| {
         t.join();
+    }
+
+    // Stop Discord health monitor
+    if (discord_thread) |t| {
+        t.join();
+        log.info("Discord health monitor stopped", .{});
     }
 
     // Cleanup

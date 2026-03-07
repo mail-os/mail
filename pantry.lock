@@ -1,22 +1,71 @@
 {
   "version": "1.0.0",
   "lockfileVersion": 1,
-  "generatedAt": "1772682528",
+  "workspaces": {
+    "packages/devtools": {
+      "name": "mail-devtools",
+      "version": "0.1.0"
+    },
+    "packages/cloud": {
+      "name": "mail-cloud",
+      "version": "0.1.0",
+      "dependencies": {
+        "ts-cloud": "link:ts-cloud"
+      },
+      "devDependencies": {
+        "typescript": "^5.9.3",
+        "@types/bun": "^1.3.0"
+      }
+    },
+    "packages/ts": {
+      "name": "ts-mail",
+      "version": "0.28.0"
+    }
+  },
   "packages": {
+    "github:zig-utils/zig-bump@main": {
+      "name": "github:zig-utils/zig-bump",
+      "version": "main",
+      "source": "github"
+    },
     "typescript@^5.9.3": {
       "name": "typescript",
       "version": "^5.9.3",
-      "source": "pkgx"
+      "source": "npm",
+      "bin": {
+        "tsc": "./bin/tsc",
+        "tsserver": "./bin/tsserver"
+      }
     },
-    "npm:@types/bun@^1.3.0": {
-      "name": "npm:@types/bun",
-      "version": "^1.3.0",
-      "source": "pkgx"
+    "github:zig-utils/zig-cli@main": {
+      "name": "github:zig-utils/zig-cli",
+      "version": "main",
+      "source": "github"
+    },
+    "@types/bun@1.3.10": {
+      "name": "@types/bun",
+      "version": "1.3.10",
+      "source": "npm",
+      "resolved": "https://registry.npmjs.org/@types/bun/-/bun-1.3.10.tgz",
+      "integrity": "sha512-0+rlrUrOrTSskibryHbvQkDOWRJwJZqZlxrUs1u4oOoTln8+WIXBPmAuCF35SWB2z4Zl3E84Nl/D0P7803nigQ==",
+      "dependencies": {
+        "bun-types": "1.3.10"
+      }
+    },
+    "github:zig-utils/zig-tls@main": {
+      "name": "github:zig-utils/zig-tls",
+      "version": "main",
+      "source": "github"
+    },
+    "ziglang.org@0.16.0-dev": {
+      "name": "ziglang.org",
+      "version": "0.16.0-dev",
+      "source": "pantry"
     },
     "ts-cloud@link:ts-cloud": {
       "name": "ts-cloud",
       "version": "link:ts-cloud",
-      "source": "pkgx"
+      "source": "npm"
     }
   }
 }

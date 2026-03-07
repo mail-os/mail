@@ -699,11 +699,12 @@ pub const ResetRateLimiter = struct {
     pub fn recordAttempt(self: *ResetRateLimiter, identifier: []const u8) !void {
         const now = getCurrentTimestamp();
 
-        const result = try self.attempts.getOrPut(try self.allocator.dupe(u8, identifier));
+        const result = try self.attempts.getOrPut(identifier);
         if (result.found_existing) {
             result.value_ptr.count += 1;
             result.value_ptr.last_attempt = now;
         } else {
+            result.key_ptr.* = try self.allocator.dupe(u8, identifier);
             result.value_ptr.* = .{
                 .count = 1,
                 .first_attempt = now,

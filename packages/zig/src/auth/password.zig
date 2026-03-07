@@ -30,7 +30,7 @@ pub const PasswordHasher = struct {
             .{
                 .t = 3, // 3 iterations
                 .m = 65536, // 64 MB memory
-                .p = 4, // 4 parallelism
+                .p = 1, // single-threaded (avoids async I/O requirement)
             },
             .argon2id,
             io_compat.getIo(),
@@ -49,10 +49,10 @@ pub const PasswordHasher = struct {
         defer self.allocator.free(hash_b64);
         const hash_encoded = encoder.encode(hash_b64, &hash);
 
-        // Format: $argon2id$v=19$m=65536,t=3,p=4$<salt_b64>$<hash_b64>
+        // Format: $argon2id$v=19$m=65536,t=3,p=1$<salt_b64>$<hash_b64>
         const encoded = try std.fmt.allocPrint(
             self.allocator,
-            "$argon2id$v=19$m=65536,t=3,p=4${s}${s}",
+            "$argon2id$v=19$m=65536,t=3,p=1${s}${s}",
             .{ salt_encoded, hash_encoded },
         );
 
@@ -62,7 +62,7 @@ pub const PasswordHasher = struct {
     /// Verify a password against a hash
     pub fn verifyPassword(self: *PasswordHasher, password: []const u8, hash_str: []const u8) !bool {
         // Parse the hash string
-        // Format: $argon2id$v=19$m=65536,t=3,p=4$<salt_b64>$<hash_b64>
+        // Format: $argon2id$v=19$m=65536,t=3,p=1$<salt_b64>$<hash_b64>
         var parts = std.mem.splitSequence(u8, hash_str, "$");
 
         // Skip empty first part
@@ -77,11 +77,11 @@ pub const PasswordHasher = struct {
         // Skip version
         _ = parts.next();
 
-        // Parse parameters (m=65536,t=3,p=4)
+        // Parse parameters (m=65536,t=3,p=1)
         const params_str = parts.next() orelse return error.InvalidHashFormat;
         var m: u32 = 65536;
         var t: u32 = 3;
-        var p: u24 = 4;
+        var p: u24 = 1;
 
         var param_parts = std.mem.splitScalar(u8, params_str, ',');
         while (param_parts.next()) |param| {
