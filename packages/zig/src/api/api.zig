@@ -147,6 +147,12 @@ pub const APIServer = struct {
             } else if (std.mem.startsWith(u8, path, "/email.mobileconfig")) {
                 // Apple mail autoconfiguration
                 try self.handleAutoconfig(stream, path, "GET", null);
+            } else if (std.mem.startsWith(u8, path, "/.well-known/caldav")) {
+                // CalDAV discovery (RFC 6764) - Apple Calendar, etc.
+                try self.sendWellKnownRedirect(stream, "/calendars/");
+            } else if (std.mem.startsWith(u8, path, "/.well-known/carddav")) {
+                // CardDAV discovery (RFC 6764) - Apple Contacts, etc.
+                try self.sendWellKnownRedirect(stream, "/addressbooks/");
             } else {
                 try self.send404(stream);
             }
@@ -1517,6 +1523,17 @@ pub const APIServer = struct {
     fn send404(self: *APIServer, stream: std.net.Stream) !void {
         _ = self;
         const response = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
+        _ = try stream.write(response);
+    }
+
+    /// Send a 301 redirect for .well-known CalDAV/CardDAV discovery (RFC 6764)
+    fn sendWellKnownRedirect(self: *APIServer, stream: std.net.Stream, location: []const u8) !void {
+        const response = try std.fmt.allocPrint(
+            self.allocator,
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: {s}\r\nContent-Length: 0\r\n\r\n",
+            .{location},
+        );
+        defer self.allocator.free(response);
         _ = try stream.write(response);
     }
 

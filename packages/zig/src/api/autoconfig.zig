@@ -79,22 +79,33 @@ pub const HttpResponse = struct {
     status_code: u16,
     content_type: []const u8,
     body: []const u8,
+    location: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *HttpResponse) void {
         self.allocator.free(self.body);
+        if (self.location) |loc| self.allocator.free(loc);
     }
 
     /// Format the response as a raw HTTP response string.
     pub fn toHttp(self: *const HttpResponse, allocator: std.mem.Allocator) ![]u8 {
         const status_text = switch (self.status_code) {
             200 => "OK",
+            301 => "Moved Permanently",
             400 => "Bad Request",
             404 => "Not Found",
             405 => "Method Not Allowed",
             500 => "Internal Server Error",
             else => "Unknown",
         };
+
+        if (self.location) |loc| {
+            return try std.fmt.allocPrint(
+                allocator,
+                "HTTP/1.1 {d} {s}\r\nLocation: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                .{ self.status_code, status_text, loc },
+            );
+        }
 
         return try std.fmt.allocPrint(
             allocator,
@@ -237,6 +248,26 @@ pub const AutoconfigServer = struct {
                 const email = extractQueryParam(query, "email") orelse "";
                 return self.handleOutlookRequest(email, body);
             }
+        }
+
+        // CalDAV/CardDAV well-known discovery (RFC 6764) - any method
+        if (std.mem.startsWith(u8, path, "/.well-known/caldav")) {
+            return HttpResponse{
+                .status_code = 301,
+                .content_type = "text/plain",
+                .body = try self.allocator.dupe(u8, ""),
+                .location = try self.allocator.dupe(u8, "/calendars/"),
+                .allocator = self.allocator,
+            };
+        }
+        if (std.mem.startsWith(u8, path, "/.well-known/carddav")) {
+            return HttpResponse{
+                .status_code = 301,
+                .content_type = "text/plain",
+                .body = try self.allocator.dupe(u8, ""),
+                .location = try self.allocator.dupe(u8, "/addressbooks/"),
+                .allocator = self.allocator,
+            };
         }
 
         // Method not allowed for known paths
