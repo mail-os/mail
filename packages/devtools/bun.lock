@@ -5,7 +5,7 @@
     "": {
       "name": "mail-devtools",
       "dependencies": {
-        "bun-plugin-stx": "latest",
+        "bun-plugin-stx": "^0.2.6",
       },
     },
   },

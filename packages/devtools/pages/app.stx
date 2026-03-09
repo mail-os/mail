@@ -1,0 +1,1636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mail Dev</title>
+  <link id="favicon" rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%23007AFF'/><path d='M20 35l30 22 30-22M20 35v35h60V35' stroke='white' stroke-width='6' fill='none' stroke-linejoin='round'/></svg>">
+  <style>
+    /* ── Reset & Base ────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #F5F5F7;
+      --sidebar-bg: rgba(245, 245, 247, 0.8);
+      --list-bg: #FFFFFF;
+      --detail-bg: #FFFFFF;
+      --border: #E5E5EA;
+      --text: #1D1D1F;
+      --text-secondary: #86868B;
+      --text-tertiary: #AEAEB2;
+      --accent: #007AFF;
+      --accent-light: rgba(0, 122, 255, 0.1);
+      --red: #FF3B30;
+      --orange: #FF9500;
+      --green: #34C759;
+      --yellow: #FFCC00;
+      --selected: #007AFF;
+      --selected-bg: rgba(0, 122, 255, 0.12);
+      --hover-bg: rgba(0, 0, 0, 0.04);
+      --toolbar-bg: rgba(245, 245, 247, 0.72);
+      --shadow: 0 1px 3px rgba(0,0,0,0.08);
+      --radius: 10px;
+      --radius-sm: 6px;
+      --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", system-ui, sans-serif;
+      --mono: "SF Mono", SFMono-Regular, ui-monospace, Menlo, monospace;
+    }
+
+    html, body { height: 100%; overflow: hidden; }
+    body {
+      font-family: var(--font);
+      font-size: 13px;
+      color: var(--text);
+      background: var(--bg);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Layout ──────────────────────────────────────────────── */
+    .app {
+      display: flex;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Toolbar ─────────────────────────────────────────────── */
+    .toolbar {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 52px;
+      background: var(--toolbar-bg);
+      backdrop-filter: blur(20px) saturate(180%);
+      -webkit-backdrop-filter: blur(20px) saturate(180%);
+      border-bottom: 0.5px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 16px;
+      z-index: 100;
+      gap: 12px;
+    }
+
+    .toolbar-section {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .toolbar-spacer { flex: 1; }
+
+    .toolbar-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      border: none;
+      background: none;
+      color: var(--accent);
+      cursor: pointer;
+      border-radius: var(--radius-sm);
+      font-size: 16px;
+      transition: background 0.15s;
+    }
+    .toolbar-btn:hover { background: var(--hover-bg); }
+    .toolbar-btn:active { opacity: 0.7; }
+    .toolbar-btn.danger { color: var(--red); }
+    .toolbar-btn.active { background: var(--accent-light); }
+
+    .search-box {
+      display: flex;
+      align-items: center;
+      background: rgba(0,0,0,0.06);
+      border-radius: 8px;
+      padding: 0 10px;
+      height: 30px;
+      width: 260px;
+      transition: width 0.2s, background 0.15s;
+    }
+    .search-box:focus-within {
+      background: white;
+      box-shadow: 0 0 0 3px var(--accent-light);
+      width: 320px;
+    }
+    .search-box input {
+      border: none;
+      background: none;
+      outline: none;
+      font-size: 13px;
+      width: 100%;
+      font-family: var(--font);
+      color: var(--text);
+    }
+    .search-box input::placeholder { color: var(--text-tertiary); }
+    .search-icon { color: var(--text-tertiary); margin-right: 6px; font-size: 14px; }
+
+    .unread-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--accent);
+      color: white;
+      font-size: 11px;
+      font-weight: 600;
+      min-width: 20px;
+      height: 20px;
+      padding: 0 6px;
+      border-radius: 10px;
+    }
+
+    /* ── Sidebar ─────────────────────────────────────────────── */
+    .sidebar {
+      width: 220px;
+      min-width: 220px;
+      background: var(--sidebar-bg);
+      backdrop-filter: blur(20px);
+      border-right: 0.5px solid var(--border);
+      padding-top: 52px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .sidebar-section {
+      padding: 12px 12px 4px;
+    }
+
+    .sidebar-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text-tertiary);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      padding: 0 8px 6px;
+    }
+
+    .sidebar-item {
+      display: flex;
+      align-items: center;
+      padding: 6px 8px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      gap: 8px;
+      transition: background 0.1s;
+      font-size: 13px;
+      color: var(--text);
+    }
+    .sidebar-item:hover { background: var(--hover-bg); }
+    .sidebar-item.active {
+      background: var(--selected-bg);
+      color: var(--selected);
+      font-weight: 500;
+    }
+    .sidebar-item .icon { font-size: 16px; width: 20px; text-align: center; }
+    .sidebar-item .count {
+      margin-left: auto;
+      font-size: 12px;
+      color: var(--text-tertiary);
+      font-variant-numeric: tabular-nums;
+    }
+    .sidebar-item.active .count { color: var(--selected); }
+
+    .tag-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+
+    .sidebar-footer {
+      margin-top: auto;
+      padding: 12px;
+      border-top: 0.5px solid var(--border);
+    }
+
+    .sidebar-footer-btn {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      font-size: 12px;
+      color: var(--text-secondary);
+      border: none;
+      background: none;
+      width: 100%;
+      text-align: left;
+      font-family: var(--font);
+    }
+    .sidebar-footer-btn:hover { background: var(--hover-bg); color: var(--text); }
+
+    /* ── Message List ────────────────────────────────────────── */
+    .message-list {
+      width: 360px;
+      min-width: 300px;
+      border-right: 0.5px solid var(--border);
+      background: var(--list-bg);
+      padding-top: 52px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .list-header {
+      padding: 10px 16px;
+      border-bottom: 0.5px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+    .list-header h2 {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .list-count {
+      font-size: 12px;
+      color: var(--text-tertiary);
+    }
+
+    .list-scroll {
+      flex: 1;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+    }
+
+    .msg-item {
+      padding: 10px 16px;
+      border-bottom: 0.5px solid var(--border);
+      cursor: pointer;
+      transition: background 0.1s;
+      position: relative;
+    }
+    .msg-item:hover { background: var(--hover-bg); }
+    .msg-item.selected { background: var(--selected-bg); }
+    .msg-item.unread .msg-sender { font-weight: 600; }
+    .msg-item.unread::before {
+      content: '';
+      position: absolute;
+      left: 6px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+    }
+
+    .msg-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 2px;
+    }
+    .msg-sender {
+      font-size: 13px;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex: 1;
+    }
+    .msg-date {
+      font-size: 11px;
+      color: var(--text-tertiary);
+      flex-shrink: 0;
+      margin-left: 8px;
+    }
+    .msg-subject {
+      font-size: 13px;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      margin-bottom: 2px;
+    }
+    .msg-snippet {
+      font-size: 12px;
+      color: var(--text-secondary);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .msg-tags {
+      display: flex;
+      gap: 4px;
+      margin-top: 4px;
+    }
+    .msg-tag {
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 3px;
+      background: var(--accent-light);
+      color: var(--accent);
+      font-weight: 500;
+    }
+
+    .msg-star {
+      position: absolute;
+      right: 16px;
+      bottom: 10px;
+      font-size: 14px;
+      cursor: pointer;
+      color: var(--text-tertiary);
+      transition: color 0.15s;
+    }
+    .msg-star.starred { color: var(--yellow); }
+
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100%;
+      color: var(--text-tertiary);
+      gap: 8px;
+      padding: 40px;
+      text-align: center;
+    }
+    .empty-state .icon { font-size: 48px; opacity: 0.3; }
+    .empty-state p { font-size: 14px; }
+    .empty-state .hint { font-size: 12px; }
+
+    /* ── Message Detail ──────────────────────────────────────── */
+    .detail {
+      flex: 1;
+      background: var(--detail-bg);
+      padding-top: 52px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .detail-header {
+      padding: 16px 24px;
+      border-bottom: 0.5px solid var(--border);
+      flex-shrink: 0;
+    }
+    .detail-subject {
+      font-size: 20px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 12px;
+      line-height: 1.3;
+    }
+    .detail-meta {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+    }
+    .detail-avatar {
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: white;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 600;
+      font-size: 16px;
+      flex-shrink: 0;
+    }
+    .detail-from {
+      flex: 1;
+    }
+    .detail-from-name {
+      font-weight: 600;
+      font-size: 14px;
+      color: var(--text);
+    }
+    .detail-from-addr {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+    .detail-to {
+      font-size: 12px;
+      color: var(--text-secondary);
+      margin-top: 2px;
+    }
+    .detail-date {
+      font-size: 12px;
+      color: var(--text-tertiary);
+      white-space: nowrap;
+    }
+    .detail-tags {
+      display: flex;
+      gap: 4px;
+      margin-top: 8px;
+    }
+
+    /* ── Tabs ────────────────────────────────────────────────── */
+    .tabs {
+      display: flex;
+      border-bottom: 0.5px solid var(--border);
+      padding: 0 24px;
+      flex-shrink: 0;
+    }
+    .tab {
+      padding: 8px 16px;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: all 0.15s;
+      font-family: var(--font);
+      background: none;
+      border-top: none;
+      border-left: none;
+      border-right: none;
+    }
+    .tab:hover { color: var(--text); }
+    .tab.active {
+      color: var(--accent);
+      border-bottom-color: var(--accent);
+    }
+
+    .detail-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 0;
+    }
+
+    .detail-body iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+    }
+
+    .detail-body pre {
+      padding: 24px;
+      font-family: var(--mono);
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      line-height: 1.5;
+      color: var(--text);
+    }
+
+    .detail-body .text-content {
+      padding: 24px;
+      font-size: 14px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+    }
+
+    /* ── Check Results ───────────────────────────────────────── */
+    .check-results {
+      padding: 16px 24px;
+    }
+    .check-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 8px 0;
+      border-bottom: 0.5px solid var(--border);
+      font-size: 13px;
+    }
+    .check-item:last-child { border-bottom: none; }
+    .check-icon { font-size: 14px; flex-shrink: 0; margin-top: 1px; }
+    .check-icon.error { color: var(--red); }
+    .check-icon.warning { color: var(--orange); }
+    .check-icon.info { color: var(--accent); }
+    .check-icon.ok { color: var(--green); }
+    .check-client {
+      font-size: 11px;
+      color: var(--text-tertiary);
+      margin-top: 2px;
+    }
+
+    .spam-score {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 16px 24px;
+      border-bottom: 0.5px solid var(--border);
+    }
+    .spam-meter {
+      width: 120px;
+      height: 8px;
+      background: #E5E5EA;
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .spam-meter-fill {
+      height: 100%;
+      border-radius: 4px;
+      transition: width 0.3s;
+    }
+    .spam-verdict {
+      font-weight: 600;
+      font-size: 14px;
+    }
+    .spam-verdict.clean { color: var(--green); }
+    .spam-verdict.likely_spam { color: var(--orange); }
+    .spam-verdict.spam { color: var(--red); }
+
+    /* ── Modal ───────────────────────────────────────────────── */
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.4);
+      backdrop-filter: blur(4px);
+      z-index: 200;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.2s;
+    }
+    .modal-overlay.visible {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    .modal {
+      background: white;
+      border-radius: 14px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+      width: 520px;
+      max-height: 80vh;
+      overflow-y: auto;
+      transform: scale(0.95);
+      transition: transform 0.2s;
+    }
+    .modal-overlay.visible .modal { transform: scale(1); }
+    .modal-header {
+      padding: 16px 20px;
+      border-bottom: 0.5px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .modal-header h3 { font-size: 15px; font-weight: 600; }
+    .modal-close {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      border: none;
+      background: var(--hover-bg);
+      cursor: pointer;
+      font-size: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-secondary);
+    }
+    .modal-body { padding: 20px; }
+    .modal-footer {
+      padding: 12px 20px;
+      border-top: 0.5px solid var(--border);
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .btn {
+      padding: 6px 14px;
+      border-radius: var(--radius-sm);
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      border: 0.5px solid var(--border);
+      background: white;
+      color: var(--text);
+      font-family: var(--font);
+      transition: all 0.15s;
+    }
+    .btn:hover { background: var(--hover-bg); }
+    .btn.primary {
+      background: var(--accent);
+      color: white;
+      border-color: var(--accent);
+    }
+    .btn.primary:hover { background: #0066D6; }
+    .btn.danger {
+      background: var(--red);
+      color: white;
+      border-color: var(--red);
+    }
+
+    .form-group { margin-bottom: 12px; }
+    .form-group label {
+      display: block;
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      margin-bottom: 4px;
+    }
+    .form-group input, .form-group select {
+      width: 100%;
+      padding: 6px 10px;
+      border: 0.5px solid var(--border);
+      border-radius: var(--radius-sm);
+      font-size: 13px;
+      font-family: var(--font);
+      outline: none;
+    }
+    .form-group input:focus, .form-group select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-light);
+    }
+
+    /* ── Notification Toast ──────────────────────────────────── */
+    .toast-container {
+      position: fixed;
+      top: 60px;
+      right: 16px;
+      z-index: 300;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .toast {
+      background: rgba(30,30,30,0.95);
+      backdrop-filter: blur(20px);
+      color: white;
+      padding: 10px 16px;
+      border-radius: var(--radius);
+      font-size: 13px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+      transform: translateX(120%);
+      transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+      max-width: 360px;
+    }
+    .toast.show { transform: translateX(0); }
+    .toast-title { font-weight: 600; margin-bottom: 2px; }
+    .toast-body { color: rgba(255,255,255,0.7); font-size: 12px; }
+
+    /* ── Scrollbar ───────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.15); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(0,0,0,0.25); }
+
+    /* ── Loading ─────────────────────────────────────────────── */
+    .loading {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 16px 24px;
+      color: var(--text-secondary);
+      font-size: 13px;
+    }
+    .spinner {
+      width: 16px;
+      height: 16px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Settings Panel ──────────────────────────────────────── */
+    .settings-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .settings-card {
+      padding: 14px;
+      border: 0.5px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--bg);
+    }
+    .settings-card h4 {
+      font-size: 13px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }
+
+    .toggle {
+      position: relative;
+      width: 44px;
+      height: 24px;
+      background: #E5E5EA;
+      border-radius: 12px;
+      cursor: pointer;
+      transition: background 0.2s;
+      border: none;
+    }
+    .toggle.on { background: var(--green); }
+    .toggle::after {
+      content: '';
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 20px;
+      height: 20px;
+      background: white;
+      border-radius: 50%;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+      transition: transform 0.2s;
+    }
+    .toggle.on::after { transform: translateX(20px); }
+
+    .chaos-slider {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .chaos-slider label {
+      font-size: 12px;
+      color: var(--text-secondary);
+      width: 100px;
+    }
+    .chaos-slider input[type="range"] {
+      flex: 1;
+      accent-color: var(--accent);
+    }
+    .chaos-slider .value {
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      width: 35px;
+      text-align: right;
+    }
+
+    /* ── Responsive ──────────────────────────────────────────── */
+    @media (max-width: 900px) {
+      .sidebar { width: 60px; min-width: 60px; }
+      .sidebar-title, .sidebar-item span, .sidebar-item .count { display: none; }
+      .sidebar-item { justify-content: center; padding: 10px; }
+      .message-list { width: 280px; min-width: 200px; }
+    }
+  </style>
+</head>
+<body>
+  <!-- Toolbar -->
+  <div class="toolbar">
+    <div class="toolbar-section">
+      <button class="toolbar-btn" onclick="toggleSidebar()" title="Toggle Sidebar">☰</button>
+    </div>
+    <div class="toolbar-section">
+      <button class="toolbar-btn" onclick="deleteSelected()" title="Delete">🗑</button>
+      <button class="toolbar-btn" onclick="toggleRead()" title="Mark Read/Unread">✉</button>
+      <button class="toolbar-btn" onclick="toggleStar()" title="Star">⭐</button>
+    </div>
+    <div class="toolbar-spacer"></div>
+    <div class="search-box">
+      <span class="search-icon">🔍</span>
+      <input type="text" id="searchInput" placeholder="Search messages..." oninput="debounceSearch(this.value)">
+    </div>
+    <div class="toolbar-section">
+      <span class="unread-badge" id="unreadBadge" style="display:none">0</span>
+      <button class="toolbar-btn" onclick="markAllRead()" title="Mark All Read">📭</button>
+      <button class="toolbar-btn danger" onclick="deleteAll()" title="Delete All">🧹</button>
+      <button class="toolbar-btn" onclick="openSettings()" title="Settings">⚙</button>
+    </div>
+  </div>
+
+  <div class="app">
+    <!-- Sidebar -->
+    <div class="sidebar" id="sidebar">
+      <div class="sidebar-section">
+        <div class="sidebar-title">Mailboxes</div>
+        <div class="sidebar-item active" onclick="setFilter('all')" data-filter="all">
+          <span class="icon">📥</span>
+          <span>All Mail</span>
+          <span class="count" id="countAll">0</span>
+        </div>
+        <div class="sidebar-item" onclick="setFilter('unread')" data-filter="unread">
+          <span class="icon">🔵</span>
+          <span>Unread</span>
+          <span class="count" id="countUnread">0</span>
+        </div>
+        <div class="sidebar-item" onclick="setFilter('starred')" data-filter="starred">
+          <span class="icon">⭐</span>
+          <span>Starred</span>
+          <span class="count" id="countStarred">0</span>
+        </div>
+        <div class="sidebar-item" onclick="setFilter('attachments')" data-filter="attachments">
+          <span class="icon">📎</span>
+          <span>Attachments</span>
+        </div>
+      </div>
+      <div class="sidebar-section" id="tagsSection">
+        <div class="sidebar-title">Tags</div>
+        <!-- Tags inserted dynamically -->
+      </div>
+      <div class="sidebar-footer">
+        <button class="sidebar-footer-btn" onclick="openSettings()">⚙ Settings</button>
+        <button class="sidebar-footer-btn" onclick="openChaos()">🔥 Chaos</button>
+        <button class="sidebar-footer-btn" onclick="openWebhooks()">🔗 Webhooks</button>
+      </div>
+    </div>
+
+    <!-- Message List -->
+    <div class="message-list">
+      <div class="list-header">
+        <h2 id="listTitle">All Mail</h2>
+        <span class="list-count" id="listCount"></span>
+      </div>
+      <div class="list-scroll" id="messageList">
+        <div class="empty-state" id="emptyState">
+          <div class="icon">📬</div>
+          <p>No messages yet</p>
+          <p class="hint">Configure your app to send mail to<br><strong>localhost:1025</strong></p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Message Detail -->
+    <div class="detail" id="detailPanel">
+      <div class="empty-state" id="detailEmpty">
+        <div class="icon">📧</div>
+        <p>Select a message to read</p>
+      </div>
+      <div id="detailContent" style="display:none; flex-direction:column; flex:1; overflow:hidden;">
+        <div class="detail-header">
+          <div class="detail-subject" id="detailSubject"></div>
+          <div class="detail-meta">
+            <div class="detail-avatar" id="detailAvatar"></div>
+            <div class="detail-from">
+              <div class="detail-from-name" id="detailFromName"></div>
+              <div class="detail-from-addr" id="detailFromAddr"></div>
+              <div class="detail-to" id="detailTo"></div>
+            </div>
+            <div class="detail-date" id="detailDate"></div>
+          </div>
+          <div class="detail-tags" id="detailTags"></div>
+        </div>
+        <div class="tabs">
+          <button class="tab active" data-tab="html" onclick="setTab('html')">HTML</button>
+          <button class="tab" data-tab="text" onclick="setTab('text')">Text</button>
+          <button class="tab" data-tab="source" onclick="setTab('source')">Source</button>
+          <button class="tab" data-tab="html-check" onclick="setTab('html-check')">HTML Check</button>
+          <button class="tab" data-tab="links" onclick="setTab('links')">Links</button>
+          <button class="tab" data-tab="spam" onclick="setTab('spam')">Spam</button>
+          <button class="tab" data-tab="headers" onclick="setTab('headers')">Headers</button>
+        </div>
+        <div class="detail-body" id="detailBody"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Container -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <!-- Settings Modal -->
+  <div class="modal-overlay" id="settingsModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Settings</h3>
+        <button class="modal-close" onclick="closeModal('settingsModal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="settings-grid">
+          <div class="settings-card">
+            <h4>Server Info</h4>
+            <div style="font-size:12px; color:var(--text-secondary); line-height:1.8;">
+              <div>SMTP: <strong>localhost:<span id="infoSmtp">1025</span></strong></div>
+              <div>POP3: <strong>localhost:<span id="infoPop3">1110</span></strong></div>
+              <div>HTTP: <strong>localhost:<span id="infoHttp">8025</span></strong></div>
+              <div>API: <strong>/api/v1/*</strong></div>
+            </div>
+          </div>
+          <div class="settings-card">
+            <h4>Notifications</h4>
+            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;">
+              <span style="font-size:12px;">Browser Notifications</span>
+              <button class="toggle" id="notifToggle" onclick="toggleNotifications()"></button>
+            </div>
+            <div style="display:flex; align-items:center; justify-content:space-between;">
+              <span style="font-size:12px;">Sound</span>
+              <button class="toggle" id="soundToggle" onclick="toggleSound()"></button>
+            </div>
+          </div>
+          <div class="settings-card">
+            <h4>Relay (SMTP)</h4>
+            <div class="form-group">
+              <label>Relay Host</label>
+              <input type="text" id="relayHost" placeholder="smtp.example.com">
+            </div>
+            <div class="form-group">
+              <label>Relay Port</label>
+              <input type="number" id="relayPort" value="25">
+            </div>
+          </div>
+          <div class="settings-card">
+            <h4>Forward Rules</h4>
+            <div id="forwardRules" style="font-size:12px; color:var(--text-secondary);">No rules configured</div>
+            <button class="btn" style="margin-top:8px; font-size:11px;" onclick="addForwardRule()">+ Add Rule</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Chaos Modal -->
+  <div class="modal-overlay" id="chaosModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Chaos Engineering</h3>
+        <button class="modal-close" onclick="closeModal('chaosModal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size:13px; color:var(--text-secondary); margin-bottom:16px;">
+          Simulate SMTP failures to test your application's resilience.
+        </p>
+        <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;">
+          <span style="font-weight:600;">Enable Chaos Mode</span>
+          <button class="toggle" id="chaosToggle" onclick="toggleChaos()"></button>
+        </div>
+        <div class="chaos-slider">
+          <label>Reject %</label>
+          <input type="range" id="chaosReject" min="0" max="100" value="0" oninput="updateChaos()">
+          <span class="value" id="chaosRejectVal">0%</span>
+        </div>
+        <div class="chaos-slider">
+          <label>Slow Response %</label>
+          <input type="range" id="chaosSlow" min="0" max="100" value="0" oninput="updateChaos()">
+          <span class="value" id="chaosSlowVal">0%</span>
+        </div>
+        <div class="chaos-slider">
+          <label>Disconnect %</label>
+          <input type="range" id="chaosDisconnect" min="0" max="100" value="0" oninput="updateChaos()">
+          <span class="value" id="chaosDisconnectVal">0%</span>
+        </div>
+        <div class="form-group">
+          <label>Error Code</label>
+          <input type="number" id="chaosErrorCode" value="550" oninput="updateChaos()">
+        </div>
+        <div class="form-group">
+          <label>Error Message</label>
+          <input type="text" id="chaosErrorMsg" value="Mailbox unavailable (chaos mode)" oninput="updateChaos()">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closeModal('chaosModal')">Close</button>
+        <button class="btn primary" onclick="saveChaos()">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Webhooks Modal -->
+  <div class="modal-overlay" id="webhooksModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Webhooks</h3>
+        <button class="modal-close" onclick="closeModal('webhooksModal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size:13px; color:var(--text-secondary); margin-bottom:16px;">
+          Trigger external processes when messages are received.
+        </p>
+        <div id="webhooksList" style="margin-bottom:12px;"></div>
+        <div class="form-group">
+          <label>Webhook URL</label>
+          <input type="text" id="webhookUrl" placeholder="https://example.com/webhook">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closeModal('webhooksModal')">Close</button>
+        <button class="btn primary" onclick="addWebhook()">Add Webhook</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ── State ──────────────────────────────────────────────────
+    let messages = []
+    let selectedId = null
+    let currentFilter = 'all'
+    let searchQuery = ''
+    let currentTab = 'html'
+    let stats = { total: 0, unread: 0, starred: 0 }
+    let notificationsEnabled = false
+    let soundEnabled = false
+    let searchTimer = null
+    let tags = []
+
+    const API = '/api/v1'
+
+    // ── Init ───────────────────────────────────────────────────
+    async function init() {
+      await loadMessages()
+      await loadTags()
+      connectWebSocket()
+      requestNotificationPermission()
+      loadServerInfo()
+    }
+
+    // ── API Helpers ────────────────────────────────────────────
+    async function api(path, opts = {}) {
+      const res = await fetch(API + path, {
+        headers: { 'Content-Type': 'application/json' },
+        ...opts,
+        body: opts.body ? JSON.stringify(opts.body) : undefined,
+      })
+      return res.json()
+    }
+
+    // ── Messages ───────────────────────────────────────────────
+    async function loadMessages() {
+      const params = new URLSearchParams()
+      if (searchQuery) params.set('search', searchQuery)
+      if (currentFilter === 'unread') params.set('read', 'false')
+      if (currentFilter === 'starred') params.set('starred', 'true')
+      if (currentFilter.startsWith('tag:')) params.set('tag', currentFilter.slice(4))
+
+      const data = await api('/messages?' + params.toString())
+      messages = data.messages || []
+      stats = data.stats || stats
+      renderMessageList()
+      updateCounts()
+
+      if (selectedId && !messages.find(m => m.id === selectedId)) {
+        selectedId = null
+        showDetailEmpty()
+      }
+    }
+
+    function renderMessageList() {
+      const list = document.getElementById('messageList')
+      const empty = document.getElementById('emptyState')
+
+      if (messages.length === 0) {
+        list.innerHTML = ''
+        list.appendChild(empty)
+        empty.style.display = 'flex'
+        document.getElementById('listCount').textContent = ''
+        return
+      }
+
+      empty.style.display = 'none'
+      document.getElementById('listCount').textContent = `${messages.length} messages`
+
+      list.innerHTML = messages.map(m => {
+        const tags = JSON.parse(m.tags || '[]')
+        const date = formatDate(m.created_at)
+        const sender = m.from_name || m.from_addr || 'Unknown'
+        const isSelected = m.id === selectedId
+        const isUnread = !m.read
+
+        return `<div class="msg-item ${isSelected ? 'selected' : ''} ${isUnread ? 'unread' : ''}"
+                     onclick="selectMessage('${m.id}')"
+                     data-id="${m.id}">
+          <div class="msg-top">
+            <span class="msg-sender">${esc(sender)}</span>
+            <span class="msg-date">${date}</span>
+          </div>
+          <div class="msg-subject">${esc(m.subject)}</div>
+          <div class="msg-snippet">${esc(m.snippet || '')}</div>
+          ${tags.length ? `<div class="msg-tags">${tags.map(t => `<span class="msg-tag">${esc(t)}</span>`).join('')}</div>` : ''}
+          <span class="msg-star ${m.starred ? 'starred' : ''}" onclick="event.stopPropagation(); toggleStarMsg('${m.id}')">
+            ${m.starred ? '★' : '☆'}
+          </span>
+        </div>`
+      }).join('')
+    }
+
+    async function selectMessage(id) {
+      selectedId = id
+      renderMessageList()
+
+      // Mark as read
+      await api(`/messages/${id}`, { method: 'PUT', body: { read: 1 } })
+      const msg = messages.find(m => m.id === id)
+      if (msg) msg.read = 1
+      renderMessageList()
+
+      await showMessage(id)
+      updateCounts()
+    }
+
+    async function showMessage(id) {
+      const msg = await api(`/messages/${id}`)
+      if (!msg || msg.error) return
+
+      document.getElementById('detailEmpty').style.display = 'none'
+      const content = document.getElementById('detailContent')
+      content.style.display = 'flex'
+
+      document.getElementById('detailSubject').textContent = msg.subject
+      const initial = (msg.from_name || msg.from_addr || '?')[0].toUpperCase()
+      document.getElementById('detailAvatar').textContent = initial
+      document.getElementById('detailFromName').textContent = msg.from_name || msg.from_addr
+      document.getElementById('detailFromAddr').textContent = msg.from_name ? `<${msg.from_addr}>` : ''
+
+      const toAddrs = JSON.parse(msg.to_addrs || '[]')
+      document.getElementById('detailTo').textContent = `To: ${toAddrs.join(', ')}`
+      document.getElementById('detailDate').textContent = formatDateFull(msg.created_at)
+
+      const msgTags = JSON.parse(msg.tags || '[]')
+      document.getElementById('detailTags').innerHTML = msgTags.map(t =>
+        `<span class="msg-tag">${esc(t)}</span>`
+      ).join('')
+
+      setTab(currentTab)
+    }
+
+    function showDetailEmpty() {
+      document.getElementById('detailEmpty').style.display = 'flex'
+      document.getElementById('detailContent').style.display = 'none'
+    }
+
+    async function setTab(tab) {
+      currentTab = tab
+      document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab))
+      const body = document.getElementById('detailBody')
+
+      if (!selectedId) return
+
+      switch (tab) {
+        case 'html':
+          body.innerHTML = `<iframe src="${API}/messages/${selectedId}/html" sandbox="allow-same-origin" style="width:100%;height:100%;border:none;"></iframe>`
+          break
+        case 'text': {
+          const msg = await api(`/messages/${selectedId}`)
+          body.innerHTML = `<div class="text-content">${esc(msg.text_body || '(No text content)')}</div>`
+          break
+        }
+        case 'source': {
+          const res = await fetch(`${API}/messages/${selectedId}/source`)
+          const source = await res.text()
+          body.innerHTML = `<pre>${esc(source)}</pre>`
+          break
+        }
+        case 'html-check': {
+          body.innerHTML = '<div class="loading"><div class="spinner"></div>Checking HTML compatibility...</div>'
+          const issues = await api(`/messages/${selectedId}/html-check`)
+          body.innerHTML = '<div class="check-results">' + (Array.isArray(issues) ? issues : []).map(i => `
+            <div class="check-item">
+              <span class="check-icon ${i.severity}">${i.severity === 'error' ? '✕' : i.severity === 'warning' ? '⚠' : 'ℹ'}</span>
+              <div>
+                <div>${esc(i.message)}</div>
+                <div class="check-client">${esc(i.client)}</div>
+              </div>
+            </div>
+          `).join('') + '</div>'
+          break
+        }
+        case 'links': {
+          body.innerHTML = '<div class="loading"><div class="spinner"></div>Checking links...</div>'
+          const links = await api(`/messages/${selectedId}/link-check`)
+          if (!Array.isArray(links) || links.length === 0) {
+            body.innerHTML = '<div class="check-results"><div class="check-item"><span class="check-icon info">ℹ</span><div>No links found in this message</div></div></div>'
+          } else {
+            body.innerHTML = '<div class="check-results">' + links.map(l => `
+              <div class="check-item">
+                <span class="check-icon ${l.ok ? 'ok' : 'error'}">${l.ok ? '✓' : '✕'}</span>
+                <div>
+                  <div>${l.type === 'image' ? '🖼 ' : '🔗 '}<a href="${esc(l.url)}" target="_blank" style="color:var(--accent);text-decoration:none;">${esc(truncUrl(l.url))}</a></div>
+                  <div class="check-client">${l.ok ? `HTTP ${l.status}` : (l.error || `HTTP ${l.status}`)}</div>
+                </div>
+              </div>
+            `).join('') + '</div>'
+          }
+          break
+        }
+        case 'spam': {
+          body.innerHTML = '<div class="loading"><div class="spinner"></div>Analyzing spam score...</div>'
+          const result = await api(`/messages/${selectedId}/spam-check`)
+          const pct = Math.min(100, (result.score / result.maxScore) * 100)
+          const color = result.verdict === 'clean' ? 'var(--green)' : result.verdict === 'likely_spam' ? 'var(--orange)' : 'var(--red)'
+          body.innerHTML = `
+            <div class="spam-score">
+              <div class="spam-meter"><div class="spam-meter-fill" style="width:${pct}%;background:${color};"></div></div>
+              <span class="spam-verdict ${result.verdict}">${result.score} / ${result.maxScore}</span>
+              <span class="spam-verdict ${result.verdict}" style="text-transform:capitalize;">${result.verdict.replace('_', ' ')}</span>
+            </div>
+            <div class="check-results">${(result.rules || []).map(r => `
+              <div class="check-item">
+                <span class="check-icon ${r.score > 0 ? 'warning' : 'ok'}">${r.score > 0 ? '+' + r.score : r.score}</span>
+                <div>
+                  <div>${esc(r.description)}</div>
+                  <div class="check-client">${esc(r.name)}</div>
+                </div>
+              </div>
+            `).join('')}</div>`
+          break
+        }
+        case 'headers': {
+          const msg = await api(`/messages/${selectedId}`)
+          const headers = JSON.parse(msg.headers || '{}')
+          body.innerHTML = '<div class="check-results">' + Object.entries(headers).map(([k, v]) => `
+            <div class="check-item">
+              <div>
+                <div style="font-weight:600;font-size:12px;color:var(--text-secondary);">${esc(k)}</div>
+                <div style="font-size:12px;word-break:break-all;">${esc(String(v))}</div>
+              </div>
+            </div>
+          `).join('') + '</div>'
+          break
+        }
+      }
+    }
+
+    // ── Filters ────────────────────────────────────────────────
+    function setFilter(filter) {
+      currentFilter = filter
+      document.querySelectorAll('.sidebar-item').forEach(item => {
+        item.classList.toggle('active', item.dataset.filter === filter)
+      })
+
+      const titles = { all: 'All Mail', unread: 'Unread', starred: 'Starred', attachments: 'Attachments' }
+      document.getElementById('listTitle').textContent = filter.startsWith('tag:')
+        ? `Tag: ${filter.slice(4)}`
+        : titles[filter] || 'All Mail'
+
+      loadMessages()
+    }
+
+    // ── Tags ───────────────────────────────────────────────────
+    async function loadTags() {
+      tags = await api('/tags')
+      renderTags()
+    }
+
+    function renderTags() {
+      const section = document.getElementById('tagsSection')
+      const tagItems = (Array.isArray(tags) ? tags : []).map(t => `
+        <div class="sidebar-item" onclick="setFilter('tag:${esc(t.name)}')" data-filter="tag:${esc(t.name)}">
+          <span class="tag-dot" style="background:${esc(t.color)}"></span>
+          <span>${esc(t.name)}</span>
+        </div>
+      `).join('')
+      section.innerHTML = `<div class="sidebar-title">Tags</div>${tagItems}`
+    }
+
+    // ── Actions ────────────────────────────────────────────────
+    async function deleteSelected() {
+      if (!selectedId) return
+      await api(`/messages/${selectedId}`, { method: 'DELETE' })
+      selectedId = null
+      showDetailEmpty()
+      loadMessages()
+    }
+
+    async function toggleRead() {
+      if (!selectedId) return
+      const msg = messages.find(m => m.id === selectedId)
+      if (!msg) return
+      await api(`/messages/${selectedId}`, { method: 'PUT', body: { read: msg.read ? 0 : 1 } })
+      msg.read = msg.read ? 0 : 1
+      renderMessageList()
+      updateCounts()
+    }
+
+    async function toggleStar() {
+      if (!selectedId) return
+      const msg = messages.find(m => m.id === selectedId)
+      if (!msg) return
+      await api(`/messages/${selectedId}`, { method: 'PUT', body: { starred: msg.starred ? 0 : 1 } })
+      msg.starred = msg.starred ? 0 : 1
+      renderMessageList()
+    }
+
+    async function toggleStarMsg(id) {
+      const msg = messages.find(m => m.id === id)
+      if (!msg) return
+      await api(`/messages/${id}`, { method: 'PUT', body: { starred: msg.starred ? 0 : 1 } })
+      msg.starred = msg.starred ? 0 : 1
+      renderMessageList()
+    }
+
+    async function markAllRead() {
+      await api('/messages/read', { method: 'PUT' })
+      messages.forEach(m => m.read = 1)
+      renderMessageList()
+      updateCounts()
+    }
+
+    async function deleteAll() {
+      if (!confirm('Delete all messages?')) return
+      await api('/messages', { method: 'DELETE' })
+      messages = []
+      selectedId = null
+      showDetailEmpty()
+      renderMessageList()
+      updateCounts()
+    }
+
+    // ── Search ─────────────────────────────────────────────────
+    function debounceSearch(query) {
+      clearTimeout(searchTimer)
+      searchTimer = setTimeout(() => {
+        searchQuery = query
+        loadMessages()
+      }, 300)
+    }
+
+    // ── WebSocket ──────────────────────────────────────────────
+    function connectWebSocket() {
+      const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+      const ws = new WebSocket(`${protocol}//${location.host}/ws`)
+
+      ws.onmessage = (event) => {
+        const { event: evt, data } = JSON.parse(event.data)
+
+        if (evt === 'new-message') {
+          messages.unshift(data.message)
+          stats.total = data.total
+          stats.unread = data.unread
+          renderMessageList()
+          updateCounts()
+          showNotification(data.message)
+          showToast(data.message.from_name || data.message.from_addr, data.message.subject)
+        }
+
+        if (evt === 'message-updated' || evt === 'message-deleted' || evt === 'messages-cleared' || evt === 'all-read') {
+          loadMessages()
+        }
+      }
+
+      ws.onclose = () => setTimeout(connectWebSocket, 2000)
+      ws.onerror = () => ws.close()
+    }
+
+    // ── Notifications ──────────────────────────────────────────
+    function requestNotificationPermission() {
+      if ('Notification' in window && Notification.permission === 'granted') {
+        notificationsEnabled = true
+        document.getElementById('notifToggle')?.classList.add('on')
+      }
+    }
+
+    async function toggleNotifications() {
+      if (!('Notification' in window)) return
+      if (Notification.permission === 'granted') {
+        notificationsEnabled = !notificationsEnabled
+      } else {
+        const perm = await Notification.requestPermission()
+        notificationsEnabled = perm === 'granted'
+      }
+      document.getElementById('notifToggle').classList.toggle('on', notificationsEnabled)
+    }
+
+    function toggleSound() {
+      soundEnabled = !soundEnabled
+      document.getElementById('soundToggle').classList.toggle('on', soundEnabled)
+    }
+
+    function showNotification(msg) {
+      if (!notificationsEnabled) return
+      new Notification(msg.from_name || msg.from_addr || 'New Mail', {
+        body: msg.subject,
+        icon: 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" rx="22" fill="#007AFF"/><path d="M20 35l30 22 30-22M20 35v35h60V35" stroke="white" stroke-width="6" fill="none" stroke-linejoin="round"/></svg>'),
+      })
+    }
+
+    function showToast(title, body) {
+      const container = document.getElementById('toastContainer')
+      const toast = document.createElement('div')
+      toast.className = 'toast'
+      toast.innerHTML = `<div class="toast-title">${esc(title)}</div><div class="toast-body">${esc(body)}</div>`
+      container.appendChild(toast)
+      requestAnimationFrame(() => toast.classList.add('show'))
+      setTimeout(() => {
+        toast.classList.remove('show')
+        setTimeout(() => toast.remove(), 300)
+      }, 4000)
+    }
+
+    // ── Favicon Badge ──────────────────────────────────────────
+    function updateCounts() {
+      document.getElementById('countAll').textContent = stats.total
+      document.getElementById('countUnread').textContent = stats.unread
+      document.getElementById('countStarred').textContent = stats.starred
+
+      const badge = document.getElementById('unreadBadge')
+      if (stats.unread > 0) {
+        badge.style.display = 'inline-flex'
+        badge.textContent = stats.unread > 99 ? '99+' : stats.unread
+        updateFavicon(stats.unread)
+      } else {
+        badge.style.display = 'none'
+        updateFavicon(0)
+      }
+
+      document.title = stats.unread > 0 ? `(${stats.unread}) Mail Dev` : 'Mail Dev'
+    }
+
+    function updateFavicon(count) {
+      const canvas = document.createElement('canvas')
+      canvas.width = 64
+      canvas.height = 64
+      const ctx = canvas.getContext('2d')
+
+      // Draw mail icon
+      ctx.fillStyle = '#007AFF'
+      ctx.beginPath()
+      ctx.roundRect(0, 0, 64, 64, 14)
+      ctx.fill()
+
+      ctx.strokeStyle = 'white'
+      ctx.lineWidth = 4
+      ctx.lineJoin = 'round'
+      ctx.beginPath()
+      ctx.moveTo(13, 22)
+      ctx.lineTo(32, 36)
+      ctx.lineTo(51, 22)
+      ctx.stroke()
+      ctx.beginPath()
+      ctx.moveTo(13, 22)
+      ctx.lineTo(13, 45)
+      ctx.lineTo(51, 45)
+      ctx.lineTo(51, 22)
+      ctx.stroke()
+
+      // Draw badge
+      if (count > 0) {
+        const text = count > 99 ? '99+' : String(count)
+        ctx.fillStyle = '#FF3B30'
+        ctx.beginPath()
+        ctx.arc(52, 12, 14, 0, Math.PI * 2)
+        ctx.fill()
+        ctx.fillStyle = 'white'
+        ctx.font = 'bold 16px sans-serif'
+        ctx.textAlign = 'center'
+        ctx.textBaseline = 'middle'
+        ctx.fillText(text, 52, 13)
+      }
+
+      const link = document.getElementById('favicon')
+      link.href = canvas.toDataURL()
+    }
+
+    // ── Chaos ──────────────────────────────────────────────────
+    async function openChaos() {
+      const config = await api('/chaos')
+      document.getElementById('chaosToggle').classList.toggle('on', config.enabled)
+      document.getElementById('chaosReject').value = config.reject_chance
+      document.getElementById('chaosRejectVal').textContent = config.reject_chance + '%'
+      document.getElementById('chaosSlow').value = config.slow_chance
+      document.getElementById('chaosSlowVal').textContent = config.slow_chance + '%'
+      document.getElementById('chaosDisconnect').value = config.disconnect_chance
+      document.getElementById('chaosDisconnectVal').textContent = config.disconnect_chance + '%'
+      document.getElementById('chaosErrorCode').value = config.error_code
+      document.getElementById('chaosErrorMsg').value = config.error_message
+      openModal('chaosModal')
+    }
+
+    function toggleChaos() {
+      const toggle = document.getElementById('chaosToggle')
+      toggle.classList.toggle('on')
+    }
+
+    function updateChaos() {
+      document.getElementById('chaosRejectVal').textContent = document.getElementById('chaosReject').value + '%'
+      document.getElementById('chaosSlowVal').textContent = document.getElementById('chaosSlow').value + '%'
+      document.getElementById('chaosDisconnectVal').textContent = document.getElementById('chaosDisconnect').value + '%'
+    }
+
+    async function saveChaos() {
+      await api('/chaos', {
+        method: 'PUT',
+        body: {
+          enabled: document.getElementById('chaosToggle').classList.contains('on'),
+          reject_chance: parseInt(document.getElementById('chaosReject').value),
+          slow_chance: parseInt(document.getElementById('chaosSlow').value),
+          disconnect_chance: parseInt(document.getElementById('chaosDisconnect').value),
+          error_code: parseInt(document.getElementById('chaosErrorCode').value),
+          error_message: document.getElementById('chaosErrorMsg').value,
+        },
+      })
+      closeModal('chaosModal')
+      showToast('Chaos', 'Configuration saved')
+    }
+
+    // ── Webhooks ───────────────────────────────────────────────
+    async function openWebhooks() {
+      const webhooks = await api('/webhooks')
+      const list = document.getElementById('webhooksList')
+      if (Array.isArray(webhooks) && webhooks.length > 0) {
+        list.innerHTML = webhooks.map(w => `
+          <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:0.5px solid var(--border);font-size:12px;">
+            <span style="overflow:hidden;text-overflow:ellipsis;flex:1;">${esc(w.url)}</span>
+            <button class="btn" style="font-size:10px;padding:2px 8px;margin-left:8px;" onclick="deleteWebhook(${w.id})">✕</button>
+          </div>
+        `).join('')
+      } else {
+        list.innerHTML = '<div style="font-size:12px;color:var(--text-tertiary);padding:8px 0;">No webhooks configured</div>'
+      }
+      openModal('webhooksModal')
+    }
+
+    async function addWebhook() {
+      const url = document.getElementById('webhookUrl').value
+      if (!url) return
+      await api('/webhooks', { method: 'POST', body: { url } })
+      document.getElementById('webhookUrl').value = ''
+      openWebhooks()
+    }
+
+    async function deleteWebhook(id) {
+      await api(`/webhooks/${id}`, { method: 'DELETE' })
+      openWebhooks()
+    }
+
+    // ── Settings ───────────────────────────────────────────────
+    async function openSettings() {
+      openModal('settingsModal')
+    }
+
+    async function loadServerInfo() {
+      try {
+        const info = await api('/info')
+        document.getElementById('infoSmtp').textContent = info.smtp_port
+        document.getElementById('infoPop3').textContent = info.pop3_port
+        document.getElementById('infoHttp').textContent = info.http_port
+      } catch {}
+    }
+
+    // ── Modals ─────────────────────────────────────────────────
+    function openModal(id) {
+      document.getElementById(id).classList.add('visible')
+    }
+
+    function closeModal(id) {
+      document.getElementById(id).classList.remove('visible')
+    }
+
+    // Close modals on overlay click
+    document.querySelectorAll('.modal-overlay').forEach(overlay => {
+      overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) overlay.classList.remove('visible')
+      })
+    })
+
+    // Close modals on Escape key
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        document.querySelectorAll('.modal-overlay.visible').forEach(m => m.classList.remove('visible'))
+      }
+    })
+
+    // ── Sidebar Toggle ─────────────────────────────────────────
+    function toggleSidebar() {
+      const sidebar = document.getElementById('sidebar')
+      sidebar.style.display = sidebar.style.display === 'none' ? '' : 'none'
+    }
+
+    // ── Utilities ──────────────────────────────────────────────
+    function esc(str) {
+      if (!str) return ''
+      const div = document.createElement('div')
+      div.textContent = str
+      return div.innerHTML
+    }
+
+    function formatDate(iso) {
+      if (!iso) return ''
+      const d = new Date(iso + 'Z')
+      const now = new Date()
+      const diff = now.getTime() - d.getTime()
+
+      if (diff < 60000) return 'Just now'
+      if (diff < 3600000) return Math.floor(diff / 60000) + 'm'
+      if (diff < 86400000) return Math.floor(diff / 3600000) + 'h'
+      if (diff < 604800000) return d.toLocaleDateString(undefined, { weekday: 'short' })
+      return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+    }
+
+    function formatDateFull(iso) {
+      if (!iso) return ''
+      const d = new Date(iso + 'Z')
+      return d.toLocaleDateString(undefined, {
+        weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+      })
+    }
+
+    function truncUrl(url) {
+      return url.length > 60 ? url.slice(0, 57) + '...' : url
+    }
+
+    // ── Keyboard Shortcuts ─────────────────────────────────────
+    document.addEventListener('keydown', (e) => {
+      // Don't trigger if typing in input
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
+
+      if (e.key === '/') { e.preventDefault(); document.getElementById('searchInput').focus() }
+      if (e.key === 'j' || e.key === 'ArrowDown') selectNext()
+      if (e.key === 'k' || e.key === 'ArrowUp') selectPrev()
+      if (e.key === 'r') toggleRead()
+      if (e.key === 's') toggleStar()
+      if (e.key === 'Delete' || e.key === 'Backspace') deleteSelected()
+    })
+
+    function selectNext() {
+      const idx = messages.findIndex(m => m.id === selectedId)
+      if (idx < messages.length - 1) selectMessage(messages[idx + 1].id)
+    }
+
+    function selectPrev() {
+      const idx = messages.findIndex(m => m.id === selectedId)
+      if (idx > 0) selectMessage(messages[idx - 1].id)
+    }
+
+    // ── Forward Rules ──────────────────────────────────────────
+    async function addForwardRule() {
+      const forwardTo = prompt('Forward to email address:')
+      if (!forwardTo) return
+      await api('/forward-rules', { method: 'POST', body: { forward_to: forwardTo } })
+      showToast('Forward Rule', `Messages will be forwarded to ${forwardTo}`)
+    }
+
+    // ── Start ──────────────────────────────────────────────────
+    init()
+  </script>
+</body>
+</html>

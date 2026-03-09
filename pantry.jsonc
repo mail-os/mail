@@ -28,6 +28,8 @@
     "build:debug": "cd packages/zig && zig build",
     "build:all": "cd packages/zig && zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu && zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu && zig build -Doptimize=ReleaseFast -Dtarget=x86_64-macos && zig build -Doptimize=ReleaseFast -Dtarget=aarch64-macos",
     "dev": "cd packages/zig && zig build run -- serve",
+    "dev:mail": "cd packages/devtools && bun server.ts",
+    "dev:dashboard": "cd packages/devtools && DASHBOARD=1 bun server.ts",
     "cross": "cd packages/zig && zig build -Dall-targets=true -Doptimize=ReleaseFast",
 
     // Package all binaries into tarballs

@@ -3,8 +3,11 @@
   "type": "module",
   "version": "0.1.0",
   "scripts": {
-    "dev": "bun server.ts",
-    "start": "bun server.ts"
+    "dev": "bun --preload bun-plugin-stx/preload server.ts",
+    "start": "bun --preload bun-plugin-stx/preload server.ts",
+    "dashboard": "DASHBOARD=1 bun server.ts"
   },
-  "dependencies": {}
+  "dependencies": {
+    "bun-plugin-stx": "^0.2.6"
+  }
 }

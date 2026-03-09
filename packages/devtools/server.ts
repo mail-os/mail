@@ -1,629 +1,406 @@
 import { serve } from 'bun'
+import { MessageStore } from './src/store'
+import { createSmtpServer, type ChaosConfig, type ParsedEmail } from './src/smtp'
+import { createPop3Server } from './src/pop3'
+import { checkHtmlCompatibility, checkLinks, checkSpam, dispatchWebhook } from './src/utils'
 
-const home = await Bun.file(new URL('./pages/home.stx', import.meta.url).pathname).text()
+// Config
+const HTTP_PORT = parseInt(process.env.PORT || '8025')
+const SMTP_PORT = parseInt(process.env.SMTP_PORT || '1025')
+const POP3_PORT = parseInt(process.env.POP3_PORT || '1110')
+const DB_PATH = process.env.DB_PATH || './devmail.db'
+const RELAY_HOST = process.env.RELAY_HOST || ''
+const RELAY_PORT = parseInt(process.env.RELAY_PORT || '25')
+const AUTO_RELAY = process.env.AUTO_RELAY === '1'
+const QUIET = process.env.QUIET === '1'
 
-const LOCAL = process.env.LOCAL === '1' || process.env.LOCAL === 'true'
-const INSTANCE_ID = process.env.INSTANCE_ID || ''
-const DOMAIN = process.env.DOMAIN || 'localhost'
-const BASE_DOMAIN = DOMAIN.replace(/^[^.]*\./, '')
-const DASH_USER = process.env.DASH_USER || 'admin'
-const DASH_PASS = process.env.DASH_PASS || ''
-const TLS_CERT = process.env.TLS_CERT || ''
-const TLS_KEY = process.env.TLS_KEY || ''
+// Initialize store
+const store = new MessageStore(DB_PATH)
 
-if (!LOCAL && !INSTANCE_ID) {
-  console.error('ERROR: INSTANCE_ID environment variable is required in remote mode')
-  process.exit(1)
+// Chaos config (in-memory)
+let chaosConfig: ChaosConfig = {
+  enabled: false,
+  reject_chance: 0,
+  slow_chance: 0,
+  disconnect_chance: 0,
+  error_code: 550,
+  error_message: 'Mailbox unavailable (chaos mode)',
 }
 
-if (!LOCAL && !DASH_PASS) {
-  console.error('ERROR: DASH_PASS environment variable is required in remote mode (set LOCAL=1 for dev)')
-  process.exit(1)
+// WebSocket connections for live updates
+const wsClients = new Set<any>()
+
+function broadcast(event: string, data: any) {
+  const msg = JSON.stringify({ event, data })
+  for (const ws of wsClients) {
+    try { ws.send(msg) } catch { wsClients.delete(ws) }
+  }
 }
 
-function timingSafeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false
-  const encoder = new TextEncoder()
-  const bufA = encoder.encode(a)
-  const bufB = encoder.encode(b)
-  return crypto.subtle.timingSafeEqual(bufA, bufB)
-}
+// Auto-tag rules (simple pattern matching)
+function autoTag(msg: ParsedEmail): string[] {
+  const tags: string[] = []
+  const sub = msg.subject.toLowerCase()
 
-function checkAuth(req: Request): Response | null {
-  if (!DASH_PASS) return null // no password set = no auth required (local dev only)
+  if (sub.includes('newsletter') || msg.headers['list-unsubscribe']) tags.push('newsletter')
+  if (sub.includes('invoice') || sub.includes('receipt') || sub.includes('payment')) tags.push('transactional')
+  if (sub.includes('reset') || sub.includes('verify') || sub.includes('confirm')) tags.push('auth')
+  if (sub.includes('alert') || sub.includes('warning') || sub.includes('urgent')) tags.push('alert')
 
-  const auth = req.headers.get('Authorization')
-  if (!auth || !auth.startsWith('Basic ')) {
-    return new Response('Unauthorized', {
-      status: 401,
-      headers: { 'WWW-Authenticate': 'Basic realm="Mail Dashboard"' },
-    })
+  // Auto-create tags
+  for (const tag of tags) {
+    try { store.createTag(tag) } catch {}
   }
 
-  const decoded = atob(auth.slice(6))
-  const colonIdx = decoded.indexOf(':')
-  if (colonIdx < 0) {
-    return new Response('Unauthorized', {
-      status: 401,
-      headers: { 'WWW-Authenticate': 'Basic realm="Mail Dashboard"' },
-    })
-  }
-  const user = decoded.slice(0, colonIdx)
-  const pass = decoded.slice(colonIdx + 1)
-  if (!timingSafeEqual(user, DASH_USER) || !timingSafeEqual(pass, DASH_PASS)) {
-    return new Response('Unauthorized', {
-      status: 401,
-      headers: { 'WWW-Authenticate': 'Basic realm="Mail Dashboard"' },
-    })
-  }
-
-  return null
+  return tags
 }
 
-async function shellRun(command: string): Promise<string> {
-  const proc = Bun.spawn(['bash', '-c', command], { stdout: 'pipe', stderr: 'pipe' })
-  const result = await new Response(proc.stdout).text()
-  await proc.exited
-  return result
-}
+// Handle incoming SMTP message
+async function onMessage(msg: ParsedEmail) {
+  const tags = autoTag(msg)
 
-async function ssmRun(commands: string[]): Promise<string> {
-  if (LOCAL) {
-    return shellRun(commands.join('\n'))
-  }
-
-  const proc = Bun.spawn([
-    'aws', 'ssm', 'send-command',
-    '--instance-ids', INSTANCE_ID,
-    '--document-name', 'AWS-RunShellScript',
-    '--parameters', JSON.stringify({ commands }),
-    '--output', 'json',
-    '--query', 'Command.CommandId',
-  ], { stdout: 'pipe', stderr: 'pipe' })
-
-  const cmdId = (await new Response(proc.stdout).text()).trim().replace(/"/g, '')
-  await proc.exited
-
-  for (let i = 0; i < 20; i++) {
-    await Bun.sleep(1500)
-    const check = Bun.spawn([
-      'aws', 'ssm', 'get-command-invocation',
-      '--command-id', cmdId,
-      '--instance-id', INSTANCE_ID,
-      '--query', '[Status,StandardOutputContent]',
-      '--output', 'json',
-    ], { stdout: 'pipe', stderr: 'pipe' })
-
-    const raw = await new Response(check.stdout).text()
-    await check.exited
-
-    try {
-      const [status, output] = JSON.parse(raw)
-      if (status === 'Success') return output
-      if (status === 'Failed') return `ERROR: Command failed`
-    } catch {
-      continue
-    }
-  }
-  return 'ERROR: Timeout'
-}
-
-async function dnsLookup(type: string, name: string): Promise<string> {
-  const proc = Bun.spawn(['dig', '+short', type, name, '@8.8.8.8'], { stdout: 'pipe', stderr: 'pipe' })
-  const result = (await new Response(proc.stdout).text()).trim()
-  await proc.exited
-  return result
-}
-
-async function getServerStatus() {
-  const output = await ssmRun([
-    'echo "===SERVICE==="',
-    'systemctl is-active mail 2>/dev/null || echo inactive',
-    'echo "===UPTIME==="',
-    'uptime -p 2>/dev/null || uptime',
-    'echo "===UPTIME_SINCE==="',
-    'systemctl show mail --property=ActiveEnterTimestamp --value 2>/dev/null',
-    'echo "===USERS==="',
-    'sqlite3 /opt/mail/smtp.db "SELECT username FROM users;" 2>/dev/null',
-    'echo "===MAILBOXES==="',
-    'ls -d /opt/mail/mail/*/ 2>/dev/null | grep -v "\\\\.$" | while read d; do echo "$(basename $d):$(find "$d" -name "*.eml" 2>/dev/null | wc -l)"; done',
-    'echo "===DISK==="',
-    'df -h / --output=pcent,size,used,avail | tail -1',
-    'echo "===MEM==="',
-    'free -m | grep Mem',
-    'echo "===CPU==="',
-    'top -bn1 | grep "Cpu(s)" | head -1',
-    'echo "===PORTS==="',
-    'ss -tlnp | grep mail-server',
-    'echo "===SERVICES==="',
-    'for s in mail fail2ban certbot-renew.timer mail-logrotate.timer; do echo "$s:$(systemctl is-active $s 2>/dev/null || echo inactive)"; done',
-    'echo "===TLS==="',
-    'certbot certificates 2>/dev/null | grep -E "Domains:|Expiry" || echo "no certbot"',
-    'echo "===DB==="',
-    'ls -lh /opt/mail/smtp.db 2>/dev/null | awk "{print \\\\$5}"',
-    'sqlite3 /opt/mail/smtp.db "SELECT COUNT(*) FROM users;" 2>/dev/null',
-    'echo "===RECEIVED==="',
-    'find /opt/mail/mail -path "*/Sent" -prune -o -name "*.eml" -printf "%T@\\n" 2>/dev/null | sort -rn',
-    'echo "===SENT==="',
-    'find /opt/mail/mail -path "*/Sent/*.eml" -printf "%T@\\n" 2>/dev/null | sort -rn',
-    'echo "===AUTH_FAIL==="',
-    'grep -c "AUTH.*failed\\|AUTH LOGIN failed" /opt/mail/smtp-server.log 2>/dev/null || echo 0',
-    'echo "===CONNECTIONS==="',
-    'grep -c "Connection from client" /opt/mail/smtp-server.log 2>/dev/null || echo 0',
-    'echo "===IMAP_SESSIONS==="',
-    'grep -c "STARTTLS.*port 143\\|AUTHENTICATE completed" /opt/mail/smtp-server.log 2>/dev/null || echo 0',
-    'echo "===AUTH_FAIL_DETAIL==="',
-    'grep -i "AUTH.*failed\\|AUTH LOGIN failed" /opt/mail/smtp-server.log 2>/dev/null | tail -25',
-    'echo "===ERRORS==="',
-    'grep "\\\"level\\\":\\\"ERROR\\\"" /opt/mail/smtp-server.log 2>/dev/null | tail -25',
-    'echo "===WARNINGS==="',
-    'grep "\\\"level\\\":\\\"WARN\\\"" /opt/mail/smtp-server.log 2>/dev/null | grep -v "AUTH.*failed" | tail -15',
-    'echo "===RECENT_SMTP==="',
-    'grep -E "SMTP CMD|Connection from client|saved|deliver|forward" /opt/mail/smtp-server.log 2>/dev/null | tail -25',
-  ])
-
-  const sections: Record<string, string> = {}
-  let currentKey = ''
-  for (const line of output.split('\n')) {
-    const match = line.match(/^===(\w+)===$/)
-    if (match) {
-      currentKey = match[1]
-      sections[currentKey] = ''
-    } else if (currentKey) {
-      sections[currentKey] += (sections[currentKey] ? '\n' : '') + line
-    }
-  }
-
-  const [mx, aRecord, spfRaw, dmarc, dkim] = await Promise.all([
-    dnsLookup('MX', BASE_DOMAIN),
-    dnsLookup('A', DOMAIN),
-    dnsLookup('TXT', BASE_DOMAIN).then(r => r.split('\n').find(l => l.includes('spf')) || ''),
-    dnsLookup('TXT', `_dmarc.${BASE_DOMAIN}`),
-    // Check DKIM: try common selectors, then SES-style token selectors
-    (async () => {
-      const selectors = ['mail', 'default', 'dkim', 'google', 'k1', 's1', 's2']
-      for (const sel of selectors) {
-        const r = await dnsLookup('CNAME', `${sel}._domainkey.${BASE_DOMAIN}`).catch(() => '')
-        if (r) return `Configured (${sel})`
-        const txt = await dnsLookup('TXT', `${sel}._domainkey.${BASE_DOMAIN}`).catch(() => '')
-        if (txt && txt.includes('p=')) return `Configured (${sel})`
-      }
-      // SES uses random token selectors - discover them via NXDOMAIN vs answer heuristic
-      // Query a few known SES tokens by checking for CNAME records pointing to *.dkim.amazonses.com
-      const probe = await shellRun(`dig +short CNAME '*.${BASE_DOMAIN}' @8.8.8.8; for token in $(dig +short NS _domainkey.${BASE_DOMAIN} @8.8.8.8 2>/dev/null); do echo $token; done; dig _domainkey.${BASE_DOMAIN} ANY +short @8.8.8.8 2>/dev/null`).catch(() => '')
-      if (probe.includes('amazonses')) return 'Verified (SES)'
-      // Direct approach: check if the domain has any _domainkey CNAME pointing to amazonses
-      // by testing the first SES-generated selector format
-      const sesCheck = await shellRun(`host -t CNAME $(host -t TXT _amazonses.${BASE_DOMAIN} 8.8.8.8 2>/dev/null | grep -oP '[a-z0-9]{32}' | head -1)._domainkey.${BASE_DOMAIN} 8.8.8.8 2>/dev/null`).catch(() => '')
-      if (sesCheck.includes('amazonses')) return 'Verified (SES)'
-      // Final: just check the _amazonses TXT verification record which confirms SES is configured
-      const amazonses = await dnsLookup('TXT', `_amazonses.${BASE_DOMAIN}`).catch(() => '')
-      if (amazonses) return 'Verified (SES)'
-      return ''
-    })(),
-  ].map(p => p.catch(() => '')))
-
-  const rdns = aRecord ? await dnsLookup('-x', aRecord).catch(() => '') : ''
-
-  const users = (sections.USERS || '').split('\n').filter(Boolean)
-
-  const mailboxLines = (sections.MAILBOXES || '').split('\n').filter(Boolean)
-  let totalEmails = 0
-  mailboxLines.forEach(l => {
-    const count = parseInt(l.split(':')[1]) || 0
-    totalEmails += count
+  const stored = store.addMessage({
+    id: msg.id,
+    from_addr: msg.from_addr,
+    from_name: msg.from_name,
+    to_addrs: JSON.stringify(msg.to_addrs),
+    cc_addrs: JSON.stringify(msg.cc_addrs),
+    bcc_addrs: JSON.stringify(msg.bcc_addrs),
+    subject: msg.subject,
+    text_body: msg.text_body,
+    html_body: msg.html_body,
+    raw: msg.raw,
+    size: msg.size,
+    tags: JSON.stringify(tags),
+    attachments: JSON.stringify(msg.attachments.map(a => ({
+      name: a.name, type: a.type, size: a.size,
+    }))),
+    headers: JSON.stringify(msg.headers),
   })
 
-  const diskParts = (sections.DISK || '').trim().split(/\s+/)
-  const diskPercent = diskParts[0]?.replace('%', '') || '0'
-  const diskDetail = `${diskParts[2] || '?'} used / ${diskParts[1] || '?'} total (${diskParts[3] || '?'} free)`
-
-  const memParts = (sections.MEM || '').trim().split(/\s+/)
-  const memTotal = parseInt(memParts[1]) || 1
-  const memUsed = parseInt(memParts[2]) || 0
-  const memPercent = Math.round((memUsed / memTotal) * 100)
-
-  const cpuMatch = (sections.CPU || '').match(/(\d+\.?\d*)\s*id/)
-  const cpuIdle = parseFloat(cpuMatch?.[1] || '100')
-  const cpuPercent = Math.round(100 - cpuIdle)
-
-  const portMap: Record<number, string> = {
-    25: 'SMTP', 465: 'SMTPS', 587: 'Submission',
-    143: 'IMAP', 993: 'IMAPS',
-    80: 'CalDAV', 443: 'CalDAV SSL',
+  if (!QUIET) {
+    console.log(`[SMTP] ${msg.from_addr} → ${msg.to_addrs.join(', ')} | ${msg.subject}`)
   }
-  const ports = (sections.PORTS || '').split('\n').filter(Boolean).map(line => {
-    const portMatch = line.match(/:(\d+)\s/)
-    const port = parseInt(portMatch?.[1] || '0')
-    return { service: portMap[port] || `Port ${port}`, port, status: 'listening' }
-  }).sort((a, b) => a.port - b.port)
 
-  const services = (sections.SERVICES || '').split('\n').filter(Boolean).map(line => {
-    const [name, status] = line.split(':')
-    return { name: name?.replace('.timer', ''), active: status?.trim() === 'active' }
+  // Broadcast to WebSocket clients
+  const stats = store.getStats()
+  broadcast('new-message', {
+    message: stored,
+    unread: stats.unread,
+    total: stats.total,
   })
 
-  const tlsLines = (sections.TLS || '').split('\n').filter(Boolean)
-  const tlsDomain = tlsLines.find(l => l.includes('Domains:'))?.replace(/.*Domains:\s*/, '').trim()
-  const expiryLine = tlsLines.find(l => l.includes('Expiry'))
-  const expiryMatch = expiryLine?.match(/(\d{4}-\d{2}-\d{2})/)
-  const expiryDate = expiryMatch ? new Date(expiryMatch[1]) : null
-  const daysLeft = expiryDate ? Math.ceil((expiryDate.getTime() - Date.now()) / 86400000) : 0
-
-  const dbLines = (sections.DB || '').split('\n').filter(Boolean)
-  const dbSize = dbLines[0] || '--'
-
-  const deliverability = [
-    { label: 'MX Record', pass: !!mx, warn: false },
-    { label: 'A Record', pass: !!aRecord, warn: false },
-    { label: 'Reverse DNS', pass: !!rdns, warn: !rdns },
-    { label: 'SPF Record', pass: !!spfRaw, warn: false },
-    { label: 'DMARC Policy', pass: !!dmarc, warn: false },
-    { label: 'DKIM Signing', pass: !!dkim, warn: !dkim },
-    { label: 'TLS Certificate', pass: daysLeft > 14, warn: daysLeft > 0 && daysLeft <= 14 },
-  ]
-
-  const uptimeRaw = (sections.UPTIME || '').trim()
-
-  // Parse email timestamps into daily buckets
-  function bucketByDay(raw: string): Record<string, number> {
-    const buckets: Record<string, number> = {}
-    for (const line of raw.split('\n').filter(Boolean)) {
-      const ts = parseFloat(line)
-      if (isNaN(ts)) continue
-      const d = new Date(ts * 1000).toISOString().slice(0, 10)
-      buckets[d] = (buckets[d] || 0) + 1
-    }
-    return buckets
-  }
-
-  const receivedBuckets = bucketByDay(sections.RECEIVED || '')
-  const sentBuckets = bucketByDay(sections.SENT || '')
-
-  // Build daily series for last 90 days
-  const emailChart: { date: string; received: number; sent: number }[] = []
-  const today = new Date()
-  for (let i = 89; i >= 0; i--) {
-    const d = new Date(today.getTime() - i * 86400000).toISOString().slice(0, 10)
-    emailChart.push({
-      date: d,
-      received: receivedBuckets[d] || 0,
-      sent: sentBuckets[d] || 0,
-    })
-  }
-
-  const totalReceived = Object.values(receivedBuckets).reduce((a, b) => a + b, 0)
-  const totalSent = Object.values(sentBuckets).reduce((a, b) => a + b, 0)
-  const authFails = parseInt((sections.AUTH_FAIL || '0').trim()) || 0
-  const smtpConnections = parseInt((sections.CONNECTIONS || '0').trim()) || 0
-  const imapSessions = parseInt((sections.IMAP_SESSIONS || '0').trim()) || 0
-
-  // Parse structured JSON log lines into log entries
-  function parseLogLines(raw: string): { ts: number; level: string; message: string }[] {
-    return raw.split('\n').filter(Boolean).map(line => {
-      try {
-        const obj = JSON.parse(line)
-        return { ts: obj.timestamp || 0, level: obj.level || 'INFO', message: obj.message || '' }
-      } catch {
-        return { ts: 0, level: 'INFO', message: line }
-      }
-    }).filter(e => e.message)
-  }
-
-  const authFailDetails = parseLogLines(sections.AUTH_FAIL_DETAIL || '')
-  const errors = parseLogLines(sections.ERRORS || '')
-  const warnings = parseLogLines(sections.WARNINGS || '')
-  const recentSmtp = parseLogLines(sections.RECENT_SMTP || '')
-
-  return {
-    service: (sections.SERVICE || '').trim(),
-    uptime: uptimeRaw.replace('up ', ''),
-    uptimeSince: (sections.UPTIME_SINCE || '').trim(),
-    userCount: users.length,
-    users,
-    mailboxCount: mailboxLines.length,
-    emailCount: totalEmails,
-    diskPercent,
-    diskDetail,
-    memPercent,
-    memDetail: `${memUsed}MB / ${memTotal}MB`,
-    cpuPercent,
-    cpuDetail: `${cpuPercent}% utilized`,
-    ports,
-    services,
-    tls: {
-      valid: daysLeft > 0,
-      domain: tlsDomain || DOMAIN,
-      expiry: expiryMatch?.[1] || '--',
-      daysLeft,
-      issuer: "Let's Encrypt",
-    },
-    dns: {
-      mx: mx || '--',
-      a: aRecord || '--',
-      rdns: rdns || '--',
-      spf: spfRaw?.replace(/"/g, '') || '--',
-      dmarc: dmarc?.replace(/"/g, '') || '--',
-      dkim: dkim || '--',
-    },
-    deliverability,
-    dbSize,
-    dbDetail: `${dbLines[1] || '?'} users`,
-    emailChart,
-    totalReceived,
-    totalSent,
-    authFails,
-    smtpConnections,
-    imapSessions,
-    authFailDetails,
-    errors,
-    warnings,
-    recentSmtp,
-  }
-}
-
-async function createAccount(username: string, password: string): Promise<{ ok: boolean, error?: string }> {
-  if (!username || !password) return { ok: false, error: 'Username and password are required' }
-  if (!/^[a-zA-Z0-9._-]+$/.test(username)) return { ok: false, error: 'Invalid username (alphanumeric, dots, hyphens, underscores only)' }
-  if (password.length < 8) return { ok: false, error: 'Password must be at least 8 characters' }
-
-  // Create user in database
-  const email = `${username}@${BASE_DOMAIN}`
-  const escapedPass = password.replace(/'/g, "'\\''")
-  const userResult = await ssmRun([
-    `cd /opt/mail && ./mail-server user:local create ${username} '${escapedPass}' ${email} 2>&1 || echo "FAIL"`,
-  ])
-
-  if (userResult.includes('FAIL') || userResult.includes('error') || userResult.includes('Error')) {
-    return { ok: false, error: userResult.trim() || 'Failed to create user' }
-  }
-
-  // Create mailbox directories
-  await ssmRun([
-    `mkdir -p /opt/mail/mail/${username}/{INBOX,Sent,Drafts,Trash,Junk}/{cur,new,tmp}`,
-    `chown -R mail-server:mail-server /opt/mail/mail/${username}`,
-  ])
-
-  return { ok: true }
-}
-
-let cache: { data: any, time: number } | null = null
-const CACHE_TTL = 15000
-
-// Uptime history - stores checks as { ts: timestamp, up: boolean }
-interface UptimeEntry { ts: number; up: boolean }
-const UPTIME_STORE = process.env.UPTIME_STORE || './uptime.json'
-let uptimeHistory: UptimeEntry[] = []
-
-function loadUptimeHistory() {
-  try {
-    const raw = require('fs').readFileSync(UPTIME_STORE, 'utf8')
-    uptimeHistory = JSON.parse(raw)
-  } catch { uptimeHistory = [] }
-}
-
-function saveUptimeHistory() {
-  try {
-    require('fs').writeFileSync(UPTIME_STORE, JSON.stringify(uptimeHistory))
-  } catch {}
-}
-
-function recordUptime(up: boolean) {
-  const now = Date.now()
-  uptimeHistory.push({ ts: now, up })
-  // Keep 90 days of data (checking every 60s = ~130k entries max, but we compact per-day for the chart)
-  const cutoff = now - 90 * 86400000
-  uptimeHistory = uptimeHistory.filter(e => e.ts >= cutoff)
-  saveUptimeHistory()
-}
-
-function getUptimeChartData(): { days: Record<number, { date: string; pct: number; checks: number }[]>; daysWithData: number } {
-  const dayBuckets: Record<string, { up: number; total: number }> = {}
-
-  for (const entry of uptimeHistory) {
-    const d = new Date(entry.ts).toISOString().slice(0, 10)
-    if (!dayBuckets[d]) dayBuckets[d] = { up: 0, total: 0 }
-    dayBuckets[d].total++
-    if (entry.up) dayBuckets[d].up++
-  }
-
-  // Count how many days actually have data
-  const daysWithData = Object.keys(dayBuckets).length
-
-  // Generate data for each timeframe
-  const timeframes = [7, 14, 30, 60, 90]
-  const days: Record<number, { date: string; pct: number; checks: number }[]> = {}
-  const now = new Date()
-
-  for (const tf of timeframes) {
-    const result: { date: string; pct: number; checks: number }[] = []
-    for (let i = tf - 1; i >= 0; i--) {
-      const d = new Date(now.getTime() - i * 86400000).toISOString().slice(0, 10)
-      const day = dayBuckets[d]
-      if (day) {
-        result.push({ date: d, pct: Math.round((day.up / day.total) * 10000) / 100, checks: day.total })
-      } else {
-        result.push({ date: d, pct: -1, checks: 0 })
-      }
-    }
-    days[tf] = result
-  }
-
-  return { days, daysWithData }
-}
-
-loadUptimeHistory()
-
-// Resource history - stores { ts, cpu, mem } snapshots
-interface ResourceEntry { ts: number; cpu: number; mem: number }
-const RESOURCE_STORE = process.env.RESOURCE_STORE || './resources.json'
-let resourceHistory: ResourceEntry[] = []
-
-function loadResourceHistory() {
-  try {
-    const raw = require('fs').readFileSync(RESOURCE_STORE, 'utf8')
-    resourceHistory = JSON.parse(raw)
-  } catch { resourceHistory = [] }
-}
-
-function saveResourceHistory() {
-  try {
-    require('fs').writeFileSync(RESOURCE_STORE, JSON.stringify(resourceHistory))
-  } catch {}
-}
-
-function recordResource(cpu: number, mem: number) {
-  const now = Date.now()
-  resourceHistory.push({ ts: now, cpu, mem })
-  // Keep 7 days at 60s intervals = ~10k entries
-  const cutoff = now - 7 * 86400000
-  resourceHistory = resourceHistory.filter(e => e.ts >= cutoff)
-  saveResourceHistory()
-}
-
-function getResourceChartData(): { labels: string[]; cpu: number[]; mem: number[] } {
-  // Adaptive bucket size based on data span
-  const entries = resourceHistory
-  if (entries.length === 0) return { labels: [], cpu: [], mem: [] }
-
-  const span = entries[entries.length - 1].ts - entries[0].ts
-  // Under 1 hour: no bucketing (raw points)
-  // Under 6 hours: 1-minute buckets
-  // Under 24 hours: 2-minute buckets
-  // Over 24 hours: 5-minute buckets
-  const bucketSize = span < 3600000 ? 0 : span < 21600000 ? 60000 : span < 86400000 ? 120000 : 300000
-
-  if (bucketSize === 0) {
-    // Raw points
-    return {
-      labels: entries.map(e => new Date(e.ts).toISOString()),
-      cpu: entries.map(e => e.cpu),
-      mem: entries.map(e => e.mem),
+  // Dispatch webhooks
+  const webhooks = store.getWebhooks()
+  for (const wh of webhooks) {
+    if (wh.enabled) {
+      dispatchWebhook(wh.url, {
+        event: 'new-message',
+        message: {
+          id: stored.id,
+          from: msg.from_addr,
+          to: msg.to_addrs,
+          subject: msg.subject,
+          size: msg.size,
+          created_at: stored.created_at,
+        },
+      }).catch(() => {})
     }
   }
 
-  const buckets: Record<number, { cpuSum: number; memSum: number; count: number }> = {}
-  for (const e of entries) {
-    const key = Math.floor(e.ts / bucketSize) * bucketSize
-    if (!buckets[key]) buckets[key] = { cpuSum: 0, memSum: 0, count: 0 }
-    buckets[key].cpuSum += e.cpu
-    buckets[key].memSum += e.mem
-    buckets[key].count++
-  }
-
-  const keys = Object.keys(buckets).map(Number).sort()
-  return {
-    labels: keys.map(k => new Date(k).toISOString()),
-    cpu: keys.map(k => Math.round(buckets[k].cpuSum / buckets[k].count)),
-    mem: keys.map(k => Math.round(buckets[k].memSum / buckets[k].count)),
+  // Auto-forward
+  const rules = store.getForwardRules()
+  for (const rule of rules) {
+    if (!rule.enabled) continue
+    const matchFrom = !rule.match_from || msg.from_addr.includes(rule.match_from)
+    const matchTo = !rule.match_to || msg.to_addrs.some(a => a.includes(rule.match_to))
+    const matchSubject = !rule.match_subject || msg.subject.includes(rule.match_subject)
+    if (matchFrom && matchTo && matchSubject && RELAY_HOST) {
+      console.log(`[Forward] → ${rule.forward_to} via ${RELAY_HOST}:${RELAY_PORT}`)
+    }
   }
 }
 
-loadResourceHistory()
+// Start SMTP server
+const smtpServer = createSmtpServer({
+  port: SMTP_PORT,
+  onMessage,
+  getChaos: () => chaosConfig,
+})
 
-// Record uptime + resources every 60 seconds
-setInterval(async () => {
-  try {
-    const output = await ssmRun([
-      'systemctl is-active mail 2>/dev/null || echo inactive',
-      'echo "---RESOURCES---"',
-      'top -bn1 | grep "Cpu(s)" | head -1',
-      'free -m | grep Mem',
-    ])
-    const lines = output.split('\n')
-    const statusLine = lines[0]?.trim()
-    recordUptime(statusLine === 'active')
+// Start POP3 server
+const pop3Server = createPop3Server({
+  port: POP3_PORT,
+  store,
+})
 
-    // Parse CPU
-    const cpuLine = lines.find(l => l.includes('Cpu(s)') || l.includes('id'))
-    const cpuMatch = cpuLine?.match(/(\d+\.?\d*)\s*id/)
-    const cpuPct = cpuMatch ? Math.round(100 - parseFloat(cpuMatch[1])) : 0
+// Read the app UI template
+const appHtml = await Bun.file(new URL('./pages/app.stx', import.meta.url).pathname).text()
 
-    // Parse MEM
-    const memLine = lines.find(l => l.includes('Mem'))
-    const memParts = memLine?.trim().split(/\s+/)
-    const memTotal = parseInt(memParts?.[1] || '1') || 1
-    const memUsed = parseInt(memParts?.[2] || '0') || 0
-    const memPct = Math.round((memUsed / memTotal) * 100)
+// JSON helper
+function json(data: any, status = 200) {
+  return Response.json(data, { status })
+}
 
-    recordResource(cpuPct, memPct)
-  } catch {
-    recordUptime(false)
-  }
-}, 60000)
+// Parse URL params
+function getParams(url: URL): Record<string, string> {
+  const params: Record<string, string> = {}
+  url.searchParams.forEach((v, k) => params[k] = v)
+  return params
+}
 
-const tlsOptions = TLS_CERT && TLS_KEY ? {
-  tls: {
-    cert: Bun.file(TLS_CERT),
-    key: Bun.file(TLS_KEY),
-  },
-} : {}
+// Extract path segments: /api/v1/messages/:id → ['messages', id]
+function parsePath(pathname: string): string[] {
+  return pathname.replace('/api/v1/', '').split('/').filter(Boolean)
+}
 
+// HTTP Server
 const server = serve({
-  port: parseInt(process.env.PORT || '3456'),
-  ...tlsOptions,
+  port: HTTP_PORT,
+
+  websocket: {
+    open(ws) {
+      wsClients.add(ws)
+      const stats = store.getStats()
+      ws.send(JSON.stringify({ event: 'connected', data: stats }))
+    },
+    message() {},
+    close(ws) {
+      wsClients.delete(ws)
+    },
+  },
 
   routes: {
-    '/': {
-      GET(req) {
-        const denied = checkAuth(req)
-        if (denied) return denied
-        return new Response(home, { headers: { 'Content-Type': 'text/html' } })
-      },
-    },
+    '/': () => new Response(appHtml, { headers: { 'Content-Type': 'text/html; charset=utf-8' } }),
 
-    '/api/status': {
-      async GET(req) {
-        const denied = checkAuth(req)
-        if (denied) return denied
-
-        if (cache && Date.now() - cache.time < CACHE_TTL) {
-          return Response.json(cache.data)
-        }
-
-        try {
-          const data = await getServerStatus()
-          recordUptime(data.service === 'active')
-          recordResource(data.cpuPercent ?? 0, data.memPercent ?? 0)
-          ;(data as any).uptimeChart = getUptimeChartData()
-          ;(data as any).resourceChart = getResourceChartData()
-          cache = { data, time: Date.now() }
-          return Response.json(data)
-        } catch (e: any) {
-          recordUptime(false)
-          return Response.json({ error: e.message, service: 'unknown' }, { status: 500 })
-        }
-      },
-    },
-
-    '/api/account': {
-      async POST(req) {
-        const denied = checkAuth(req)
-        if (denied) return denied
-
-        try {
-          const body = await req.json() as { username?: string, password?: string }
-          const result = await createAccount(body.username || '', body.password || '')
-          cache = null
-          return Response.json(result, { status: result.ok ? 200 : 400 })
-        } catch (e: any) {
-          return Response.json({ ok: false, error: e.message }, { status: 500 })
-        }
-      },
+    '/ws': (req, server) => {
+      if (server.upgrade(req)) return undefined
+      return new Response('WebSocket upgrade failed', { status: 400 })
     },
   },
 
-  fetch(req) {
-    const denied = checkAuth(req)
-    if (denied) return denied
-    return new Response('Not Found', { status: 404 })
+  async fetch(req, server) {
+    const url = new URL(req.url)
+    const method = req.method
+
+    // WebSocket upgrade
+    if (url.pathname === '/ws') {
+      if (server.upgrade(req)) return undefined
+      return new Response('WebSocket upgrade failed', { status: 400 })
+    }
+
+    // Serve the app for non-API routes
+    if (!url.pathname.startsWith('/api/')) {
+      return new Response(appHtml, { headers: { 'Content-Type': 'text/html; charset=utf-8' } })
+    }
+
+    // CORS headers for API
+    const corsHeaders = {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+    }
+
+    if (method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: corsHeaders })
+    }
+
+    const path = parsePath(url.pathname)
+    const params = getParams(url)
+
+    try {
+      // ── Messages ──────────────────────────────────────────────
+      if (path[0] === 'messages') {
+        // GET /api/v1/messages
+        if (method === 'GET' && path.length === 1) {
+          const result = store.getMessages({
+            search: params.search,
+            tag: params.tag,
+            read: params.read !== undefined ? params.read === 'true' : undefined,
+            starred: params.starred !== undefined ? params.starred === 'true' : undefined,
+            limit: parseInt(params.limit || '50'),
+            offset: parseInt(params.offset || '0'),
+          })
+          return json({ ...result, stats: store.getStats() })
+        }
+
+        // DELETE /api/v1/messages (delete all)
+        if (method === 'DELETE' && path.length === 1) {
+          store.deleteAllMessages()
+          broadcast('messages-cleared', {})
+          return json({ ok: true })
+        }
+
+        // PUT /api/v1/messages/read (mark all read)
+        if (method === 'PUT' && path[1] === 'read') {
+          store.markAllRead()
+          broadcast('all-read', {})
+          return json({ ok: true })
+        }
+
+        // GET /api/v1/messages/:id
+        if (method === 'GET' && path.length === 2 && !['read'].includes(path[1])) {
+          const msg = store.getMessage(path[1])
+          if (!msg) return json({ error: 'Not found' }, 404)
+          return json(msg)
+        }
+
+        // GET /api/v1/messages/:id/html
+        if (method === 'GET' && path[2] === 'html') {
+          const msg = store.getMessage(path[1])
+          if (!msg) return json({ error: 'Not found' }, 404)
+          // Serve HTML in an iframe-safe way
+          const html = msg.html_body || `<pre style="font-family: monospace; white-space: pre-wrap;">${escapeHtml(msg.text_body)}</pre>`
+          return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', ...corsHeaders } })
+        }
+
+        // GET /api/v1/messages/:id/source
+        if (method === 'GET' && path[2] === 'source') {
+          const msg = store.getMessage(path[1])
+          if (!msg) return json({ error: 'Not found' }, 404)
+          return new Response(msg.raw, { headers: { 'Content-Type': 'text/plain; charset=utf-8', ...corsHeaders } })
+        }
+
+        // GET /api/v1/messages/:id/html-check
+        if (method === 'GET' && path[2] === 'html-check') {
+          const msg = store.getMessage(path[1])
+          if (!msg) return json({ error: 'Not found' }, 404)
+          return json(checkHtmlCompatibility(msg.html_body))
+        }
+
+        // GET /api/v1/messages/:id/link-check
+        if (method === 'GET' && path[2] === 'link-check') {
+          const msg = store.getMessage(path[1])
+          if (!msg) return json({ error: 'Not found' }, 404)
+          const results = await checkLinks(msg.html_body, msg.text_body)
+          return json(results)
+        }
+
+        // GET /api/v1/messages/:id/spam-check
+        if (method === 'GET' && path[2] === 'spam-check') {
+          const msg = store.getMessage(path[1])
+          if (!msg) return json({ error: 'Not found' }, 404)
+          const headers = JSON.parse(msg.headers || '{}')
+          return json(checkSpam(headers, msg.subject, msg.text_body, msg.html_body))
+        }
+
+        // POST /api/v1/messages/:id/relay
+        if (method === 'POST' && path[2] === 'relay') {
+          const msg = store.getMessage(path[1])
+          if (!msg) return json({ error: 'Not found' }, 404)
+          if (!RELAY_HOST) return json({ error: 'No relay host configured (set RELAY_HOST env)' }, 400)
+          return json({ ok: true, message: `Would relay to ${RELAY_HOST}:${RELAY_PORT}` })
+        }
+
+        // PUT /api/v1/messages/:id
+        if (method === 'PUT' && path.length === 2) {
+          const body = await req.json() as any
+          store.updateMessage(path[1], {
+            read: body.read,
+            starred: body.starred,
+            tags: body.tags ? JSON.stringify(body.tags) : undefined,
+          })
+          const msg = store.getMessage(path[1])
+          broadcast('message-updated', msg)
+          return json(msg)
+        }
+
+        // DELETE /api/v1/messages/:id
+        if (method === 'DELETE' && path.length === 2) {
+          store.deleteMessage(path[1])
+          broadcast('message-deleted', { id: path[1] })
+          return json({ ok: true })
+        }
+      }
+
+      // ── Tags ──────────────────────────────────────────────────
+      if (path[0] === 'tags') {
+        if (method === 'GET') return json(store.getTags())
+        if (method === 'POST') {
+          const body = await req.json() as any
+          const tag = store.createTag(body.name, body.color)
+          return json(tag)
+        }
+        if (method === 'DELETE' && path[1]) {
+          store.deleteTag(parseInt(path[1]))
+          return json({ ok: true })
+        }
+      }
+
+      // ── Webhooks ──────────────────────────────────────────────
+      if (path[0] === 'webhooks') {
+        if (method === 'GET') return json(store.getWebhooks())
+        if (method === 'POST') {
+          const body = await req.json() as any
+          const wh = store.addWebhook(body.url)
+          return json(wh)
+        }
+        if (method === 'DELETE' && path[1]) {
+          store.deleteWebhook(parseInt(path[1]))
+          return json({ ok: true })
+        }
+      }
+
+      // ── Forward Rules ─────────────────────────────────────────
+      if (path[0] === 'forward-rules') {
+        if (method === 'GET') return json(store.getForwardRules())
+        if (method === 'POST') {
+          const body = await req.json() as any
+          const rule = store.addForwardRule(body)
+          return json(rule)
+        }
+        if (method === 'DELETE' && path[1]) {
+          store.deleteForwardRule(parseInt(path[1]))
+          return json({ ok: true })
+        }
+      }
+
+      // ── Chaos Engineering ─────────────────────────────────────
+      if (path[0] === 'chaos') {
+        if (method === 'GET') return json(chaosConfig)
+        if (method === 'PUT') {
+          const body = await req.json() as any
+          chaosConfig = { ...chaosConfig, ...body }
+          return json(chaosConfig)
+        }
+      }
+
+      // ── Server Info ───────────────────────────────────────────
+      if (path[0] === 'info') {
+        return json({
+          version: '0.1.0',
+          smtp_port: SMTP_PORT,
+          pop3_port: POP3_PORT,
+          http_port: HTTP_PORT,
+          relay_host: RELAY_HOST || null,
+          auto_relay: AUTO_RELAY,
+          stats: store.getStats(),
+        })
+      }
+
+      return json({ error: 'Not found' }, 404)
+    } catch (err: any) {
+      return json({ error: err.message }, 500)
+    }
   },
 })
 
-const proto = TLS_CERT ? 'https' : 'http'
-console.log(`\n  Mail Server Dashboard`)
-console.log(`  ${proto}://localhost:${server.port}/`)
-console.log(`  Mode: ${LOCAL ? 'local' : 'remote (SSM)'}`)
-console.log(`  Auth: ${DASH_PASS ? 'enabled' : 'disabled (no DASH_PASS set)'}`)
-console.log(`  TLS:  ${TLS_CERT ? 'enabled' : 'disabled'}`)
-console.log(`  Domain: ${DOMAIN}\n`)
+function escapeHtml(str: string): string {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+// Startup banner
+console.log(`
+  ╔══════════════════════════════════════════════╗
+  ║            Mail Dev Server                   ║
+  ╠══════════════════════════════════════════════╣
+  ║  Web UI    http://localhost:${HTTP_PORT.toString().padEnd(5)}           ║
+  ║  SMTP      localhost:${SMTP_PORT.toString().padEnd(5)}                 ║
+  ║  POP3      localhost:${POP3_PORT.toString().padEnd(5)}                 ║
+  ╠══════════════════════════════════════════════╣
+  ║  API       http://localhost:${HTTP_PORT}/api/v1   ║
+  ║  WebSocket ws://localhost:${HTTP_PORT}/ws          ║
+  ╚══════════════════════════════════════════════╝
+
+  Configure your app to send mail to localhost:${SMTP_PORT}
+`)
