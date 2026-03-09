@@ -30,6 +30,11 @@ export function createPop3Server(opts: {
     return idx >= 0 && idx < msgs.length && session.deleted.has(msgs[idx].id)
   }
 
+  // RFC 1939: byte-stuff lines starting with '.' by prepending an extra '.'
+  function dotStuff(text: string): string {
+    return text.replace(/^\.(.)/gm, '..$1').replace(/^\.$/gm, '..')
+  }
+
   const server = Bun.listen({
     hostname,
     port,
@@ -117,7 +122,7 @@ export function createPop3Server(opts: {
           if (idx >= 0 && idx < msgs.length && !isDeleted(session, idx)) {
             const msg = msgs[idx]
             const raw = msg.raw || `From: ${msg.from_addr}\r\nTo: ${JSON.parse(msg.to_addrs).join(', ')}\r\nSubject: ${msg.subject}\r\n\r\n${msg.text_body || msg.html_body}`
-            socket.write(`+OK ${raw.length} octets\r\n${raw}\r\n.\r\n`)
+            socket.write(`+OK ${raw.length} octets\r\n${dotStuff(raw)}\r\n.\r\n`)
             store.updateMessage(msg.id, { read: 1 })
           } else {
             socket.write('-ERR No such message\r\n')
@@ -136,9 +141,9 @@ export function createPop3Server(opts: {
               const headers = raw.slice(0, headerEnd + sep.length)
               const lineSep = raw.includes('\r\n') ? '\r\n' : '\n'
               const body = raw.slice(headerEnd + sep.length).split(lineSep).slice(0, lines).join('\r\n')
-              socket.write(`+OK\r\n${headers}${body}\r\n.\r\n`)
+              socket.write(`+OK\r\n${dotStuff(headers + body)}\r\n.\r\n`)
             } else {
-              socket.write(`+OK\r\n${raw}\r\n.\r\n`)
+              socket.write(`+OK\r\n${dotStuff(raw)}\r\n.\r\n`)
             }
           } else {
             socket.write('-ERR No such message\r\n')
@@ -164,6 +169,7 @@ export function createPop3Server(opts: {
           }
           socket.write('+OK Bye\r\n')
           socket.end()
+          return // Stop processing further commands
         } else {
           socket.write('-ERR Unknown command\r\n')
         }

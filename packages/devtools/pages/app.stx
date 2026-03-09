@@ -1314,9 +1314,12 @@
     }
 
     // ── WebSocket ──────────────────────────────────────────────
+    let wsBackoff = 1000
     function connectWebSocket() {
       const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
       const ws = new WebSocket(`${protocol}//${location.host}/ws`)
+
+      ws.onopen = () => { wsBackoff = 1000 }
 
       ws.onmessage = (event) => {
         const { event: evt, data } = JSON.parse(event.data)
@@ -1336,7 +1339,10 @@
         }
       }
 
-      ws.onclose = () => setTimeout(connectWebSocket, 2000)
+      ws.onclose = () => {
+        setTimeout(connectWebSocket, wsBackoff)
+        wsBackoff = Math.min(wsBackoff * 2, 30000)
+      }
       ws.onerror = () => ws.close()
     }
 
@@ -1569,7 +1575,7 @@
       if (!str) return ''
       const div = document.createElement('div')
       div.textContent = str
-      return div.innerHTML
+      return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;')
     }
 
     function formatDate(iso) {

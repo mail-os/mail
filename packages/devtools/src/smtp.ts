@@ -82,7 +82,8 @@ export function createSmtpServer(opts: {
         const tryDeliverData = () => {
           // Handle both \r\n.\r\n and \n.\n line endings
           if (session.data.includes('\r\n.\r\n') || session.data.includes('\n.\n')) {
-            const raw = session.data.replace(/\r?\n\.\r?\n[\s\S]*$/, '')
+            // Strip terminator and dot-unstuff per RFC 5321 §4.5.2
+            const raw = session.data.replace(/\r?\n\.\r?\n[\s\S]*$/, '').replace(/^\.\./gm, '.')
 
             // Chaos: reject after DATA
             if (chaos.enabled && Math.random() * 100 < chaos.reject_chance) {
