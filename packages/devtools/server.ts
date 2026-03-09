@@ -139,7 +139,14 @@ const appHtml = await Bun.file(new URL('./pages/app.stx', import.meta.url).pathn
 
 // JSON helper
 function json(data: any, status = 200) {
-  return Response.json(data, { status })
+  return Response.json(data, {
+    status,
+    headers: {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+    },
+  })
 }
 
 // Parse URL params

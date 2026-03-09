@@ -8,14 +8,14 @@ interface HtmlIssue {
   line?: number
 }
 
-const CSS_ISSUES: { pattern: RegExp; clients: string[]; message: string; severity: 'error' | 'warning' }[] = [
+const CSS_ISSUES: { pattern: RegExp; clients: string[]; message: string; severity: 'error' | 'warning' | 'info' }[] = [
   { pattern: /display\s*:\s*flex/i, clients: ['Outlook 2007-2021', 'Gmail (non-Google)'], message: 'Flexbox not supported', severity: 'error' },
   { pattern: /display\s*:\s*grid/i, clients: ['Outlook 2007-2021', 'Gmail', 'Yahoo'], message: 'CSS Grid not supported', severity: 'error' },
   { pattern: /position\s*:\s*(?:fixed|sticky)/i, clients: ['Outlook', 'Gmail', 'Yahoo'], message: 'Fixed/sticky positioning not supported', severity: 'error' },
   { pattern: /background-image\s*:/i, clients: ['Outlook 2007-2021'], message: 'CSS background images not supported (use VML)', severity: 'warning' },
   { pattern: /border-radius/i, clients: ['Outlook 2007-2021'], message: 'Border-radius not supported', severity: 'warning' },
   { pattern: /box-shadow/i, clients: ['Outlook 2007-2021'], message: 'Box-shadow not supported', severity: 'warning' },
-  { pattern: /animation|@keyframes|transition/i, clients: ['Most email clients'], message: 'CSS animations/transitions have limited support', severity: 'info' as any },
+  { pattern: /animation|@keyframes|transition/i, clients: ['Most email clients'], message: 'CSS animations/transitions have limited support', severity: 'info' },
   { pattern: /@media/i, clients: ['Gmail (GANGA)', 'Outlook.com'], message: 'Media queries may be stripped', severity: 'warning' },
   { pattern: /margin\s*:\s*0?\s*auto/i, clients: ['Outlook 2007-2021'], message: 'margin: auto centering unreliable', severity: 'warning' },
   { pattern: /max-width/i, clients: ['Outlook 2007-2021'], message: 'max-width not supported (use width with conditional comments)', severity: 'warning' },
@@ -76,11 +76,14 @@ export function checkHtmlCompatibility(html: string): HtmlIssue[] {
     })
   }
 
-  if (/<img[^>]*(?!alt=)[^>]*>/i.test(html)) {
+  // Check for images without alt attributes
+  const imgTags = html.match(/<img[^>]*>/gi) || []
+  const imgsWithoutAlt = imgTags.filter(tag => !/\balt\s*=/i.test(tag))
+  if (imgsWithoutAlt.length > 0) {
     issues.push({
       severity: 'warning',
       client: 'Accessibility',
-      message: 'Some images missing alt attributes',
+      message: `${imgsWithoutAlt.length} image(s) missing alt attributes`,
     })
   }
 
@@ -109,7 +112,7 @@ interface LinkResult {
 }
 
 export async function checkLinks(html: string, text: string): Promise<LinkResult[]> {
-  const urls = new Set<{ url: string; type: 'link' | 'image' }>()
+  const urls = new Map<string, 'link' | 'image'>()
 
   // Extract from HTML
   const hrefRegex = /href="([^"]+)"/gi
@@ -119,26 +122,23 @@ export async function checkLinks(html: string, text: string): Promise<LinkResult
   while ((match = hrefRegex.exec(html)) !== null) {
     const url = match[1]
     if (url.startsWith('http://') || url.startsWith('https://')) {
-      urls.add({ url, type: 'link' })
+      urls.set(url, 'link')
     }
   }
   while ((match = srcRegex.exec(html)) !== null) {
     const url = match[1]
     if (url.startsWith('http://') || url.startsWith('https://')) {
-      urls.add({ url, type: 'image' })
+      urls.set(url, 'image')
     }
   }
 
   // Extract URLs from text body
   const urlRegex = /https?:\/\/[^\s<>"]+/g
   while ((match = urlRegex.exec(text)) !== null) {
-    urls.add({ url: match[0], type: 'link' })
+    if (!urls.has(match[0])) urls.set(match[0], 'link')
   }
 
-  // Deduplicate
-  const unique = Array.from(urls).filter((v, i, a) =>
-    a.findIndex(u => u.url === v.url) === i
-  )
+  const unique = Array.from(urls.entries()).map(([url, type]) => ({ url, type }))
 
   // Check each URL (with timeout)
   const results = await Promise.all(

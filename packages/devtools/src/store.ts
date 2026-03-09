@@ -213,10 +213,14 @@ export class MessageStore {
   }
 
   getStats() {
-    const total = (this.db.prepare('SELECT COUNT(*) as c FROM messages').get() as any).c
-    const unread = (this.db.prepare('SELECT COUNT(*) as c FROM messages WHERE read = 0').get() as any).c
-    const starred = (this.db.prepare('SELECT COUNT(*) as c FROM messages WHERE starred = 1').get() as any).c
-    return { total, unread, starred }
+    const row = this.db.prepare(`
+      SELECT
+        COUNT(*) as total,
+        COALESCE(SUM(CASE WHEN read = 0 THEN 1 ELSE 0 END), 0) as unread,
+        COALESCE(SUM(CASE WHEN starred = 1 THEN 1 ELSE 0 END), 0) as starred
+      FROM messages
+    `).get() as { total: number, unread: number, starred: number }
+    return row
   }
 
   // Tags

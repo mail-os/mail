@@ -70,14 +70,16 @@ export function createSmtpServer(opts: {
 
         const respond = (response: string) => {
           if (delay > 0) {
-            setTimeout(() => socket.write(response), delay)
+            setTimeout(() => {
+              try { socket.write(response) } catch {}
+            }, delay)
           } else {
             socket.write(response)
           }
         }
 
-        if (session.collecting) {
-          session.data += input
+        // Helper to process collected data and deliver message
+        const tryDeliverData = () => {
           // Handle both \r\n.\r\n and \n.\n line endings
           if (session.data.includes('\r\n.\r\n') || session.data.includes('\n.\n')) {
             const raw = session.data.replace(/\r?\n\.\r?\n[\s\S]*$/, '')
@@ -99,11 +101,18 @@ export function createSmtpServer(opts: {
             session.from = ''
             session.to = []
           }
+        }
+
+        if (session.collecting) {
+          session.data += input
+          tryDeliverData()
           return
         }
 
-        const lines = input.split(/\r?\n/).filter(Boolean)
-        for (const line of lines) {
+        const lines = input.split(/\r?\n/)
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i]
+          if (!line) continue // skip empty lines between commands
           const cmd = line.toUpperCase()
 
           if (cmd.startsWith('EHLO') || cmd.startsWith('HELO')) {
@@ -128,8 +137,29 @@ export function createSmtpServer(opts: {
             respond('250 2.1.5 Ok\r\n')
           } else if (cmd === 'DATA') {
             session.collecting = true
-            session.data = ''
+            // Capture everything after the DATA line from the raw input (preserving blank lines)
+            // Reconstruct the byte offset by joining the lines we've already processed
+            const processedLen = lines.slice(0, i + 1).join('\n').length
+            // Find the actual position in the original input accounting for \r\n vs \n
+            let pos = 0
+            let lineCount = 0
+            while (lineCount <= i && pos < input.length) {
+              const nextCr = input.indexOf('\r\n', pos)
+              const nextLf = input.indexOf('\n', pos)
+              if (nextCr >= 0 && nextCr <= nextLf) {
+                pos = nextCr + 2
+              } else if (nextLf >= 0) {
+                pos = nextLf + 1
+              } else {
+                pos = input.length
+                break
+              }
+              lineCount++
+            }
+            session.data = input.slice(pos)
             respond('354 End data with <CR><LF>.<CR><LF>\r\n')
+            tryDeliverData()
+            return // Stop processing - rest is data, not commands
           } else if (cmd === 'RSET') {
             session.from = ''
             session.to = []
@@ -139,6 +169,7 @@ export function createSmtpServer(opts: {
           } else if (cmd === 'QUIT') {
             respond('221 2.0.0 Bye\r\n')
             socket.end()
+            return
           } else if (cmd === 'NOOP') {
             respond('250 2.0.0 Ok\r\n')
           } else if (cmd === 'VRFY') {
@@ -281,14 +312,16 @@ function parseMimeParts(body: string, boundary: string): { headers: Record<strin
     const section = sections[i]
     if (section.startsWith('--')) break // closing boundary
 
-    const headerEnd = section.indexOf('\r\n\r\n')
+    // Handle both \r\n and \n line endings
+    const normalizedSection = section.replace(/\r\n/g, '\n')
+    const headerEnd = normalizedSection.indexOf('\n\n')
     if (headerEnd < 0) continue
 
-    const headerSection = section.slice(0, headerEnd).replace(/^\r\n/, '')
-    const bodyContent = section.slice(headerEnd + 4).replace(/\r\n$/, '')
+    const headerSection = normalizedSection.slice(0, headerEnd).replace(/^\n/, '')
+    const bodyContent = normalizedSection.slice(headerEnd + 2).replace(/\n$/, '')
 
     const headers: Record<string, string> = {}
-    const headerLines = headerSection.replace(/\r\n([ \t])/g, ' ').split('\r\n')
+    const headerLines = headerSection.replace(/\n([ \t])/g, ' ').split('\n')
     for (const line of headerLines) {
       const colonIdx = line.indexOf(':')
       if (colonIdx > 0) {

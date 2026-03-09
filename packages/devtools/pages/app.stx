@@ -1136,7 +1136,7 @@
 
       switch (tab) {
         case 'html':
-          body.innerHTML = `<iframe src="${API}/messages/${selectedId}/html" sandbox="allow-same-origin" style="width:100%;height:100%;border:none;"></iframe>`
+          body.innerHTML = `<iframe src="${API}/messages/${selectedId}/html" sandbox="" style="width:100%;height:100%;border:none;"></iframe>`
           break
         case 'text': {
           const msg = await api(`/messages/${selectedId}`)
