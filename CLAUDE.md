@@ -183,7 +183,7 @@ Test binaries link against `sqlite3` system library. The argon2 password tests u
 ## Frontend
 
 - Use **stx** for templating — never write vanilla JS (`var`, `document.*`, `window.*`) in stx templates
-- Use **crosswind** as the default CSS framework
+- Use **crosswind** as the default CSS framework which enables standard Tailwind-like utility classes
 - stx `<script>` tags should only contain stx-compatible code (signals, composables, directives)
 
 ## Dependencies
