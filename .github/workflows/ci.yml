@@ -23,7 +23,7 @@ jobs:
     - name: Setup Zig
       uses: mlugg/setup-zig@v2
       with:
-        version: 0.16.0-dev.2565+684032671
+        version: 0.16.0-dev.2962+08416b44f
 
     - name: Install SQLite (Ubuntu)
       if: matrix.os == 'ubuntu-latest'
@@ -76,7 +76,7 @@ jobs:
     - name: Setup Zig
       uses: mlugg/setup-zig@v2
       with:
-        version: 0.16.0-dev.2565+684032671
+        version: 0.16.0-dev.2962+08416b44f
 
     - name: Check formatting
       run: zig fmt --check src/
@@ -97,7 +97,7 @@ jobs:
     - name: Setup Zig
       uses: mlugg/setup-zig@v2
       with:
-        version: 0.16.0-dev.2565+684032671
+        version: 0.16.0-dev.2962+08416b44f
 
     - name: Install dependencies
       run: |
@@ -148,7 +148,7 @@ jobs:
     - name: Setup Zig
       uses: mlugg/setup-zig@v2
       with:
-        version: 0.16.0-dev.2565+684032671
+        version: 0.16.0-dev.2962+08416b44f
 
     - name: Install dependencies
       run: |
