@@ -37,3 +37,4 @@ zig-pkg/
 /packages/zig/pantry
 /packages/devtools/.stx
 /packages/devtools/node_modules
+pantry
