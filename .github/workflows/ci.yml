@@ -13,6 +13,9 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: packages/zig
 
     steps:
     - name: Checkout code
@@ -59,7 +62,7 @@ jobs:
     - name: Build Docker image
       uses: docker/build-push-action@v5
       with:
-        context: .
+        context: ./packages/zig
         push: false
         tags: mail:test
         cache-from: type=gha
@@ -68,6 +71,9 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/zig
 
     steps:
     - name: Checkout code
@@ -87,6 +93,9 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/zig
 
     steps:
     - name: Checkout code
@@ -100,11 +109,13 @@ jobs:
         version: 0.17.0-dev.56+a8226cd53
 
     - name: Install dependencies
+      working-directory: ${{ github.workspace }}
       run: |
         sudo apt-get update
         sudo apt-get install -y libsqlite3-dev binutils-dev libdw-dev
 
     - name: Install kcov from source
+      working-directory: ${{ github.workspace }}
       run: |
         KCOV_VERSION=42
         wget -q https://github.com/SimonKagstrom/kcov/releases/download/v${KCOV_VERSION}/kcov-amd64.tar.gz
@@ -130,7 +141,7 @@ jobs:
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v3
       with:
-        directory: ./coverage
+        directory: ./packages/zig/coverage
         fail_ci_if_error: false
         verbose: true
 
@@ -138,6 +149,9 @@ jobs:
     name: Performance Benchmarks
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    defaults:
+      run:
+        working-directory: packages/zig
 
     steps:
     - name: Checkout code
@@ -151,6 +165,7 @@ jobs:
         version: 0.17.0-dev.56+a8226cd53
 
     - name: Install dependencies
+      working-directory: ${{ github.workspace }}
       run: |
         sudo apt-get update
         sudo apt-get install -y libsqlite3-dev
@@ -170,4 +185,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: benchmark-results
-        path: benchmark-results.json
+        path: packages/zig/benchmark-results.json
