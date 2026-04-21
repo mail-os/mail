@@ -28,6 +28,9 @@ jobs:
       with:
         version: 0.17.0-dev.56+a8226cd53
 
+    - name: Setup Pantry
+      uses: home-lang/pantry/packages/action@main
+
     - name: Install SQLite (Ubuntu)
       if: matrix.os == 'ubuntu-latest'
       run: |
@@ -55,6 +58,9 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+
+    - name: Setup Pantry
+      uses: home-lang/pantry/packages/action@main
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
@@ -107,6 +113,9 @@ jobs:
       uses: mlugg/setup-zig@v2
       with:
         version: 0.17.0-dev.56+a8226cd53
+
+    - name: Setup Pantry
+      uses: home-lang/pantry/packages/action@main
 
     - name: Install dependencies
       working-directory: ${{ github.workspace }}
@@ -163,6 +172,9 @@ jobs:
       uses: mlugg/setup-zig@v2
       with:
         version: 0.17.0-dev.56+a8226cd53
+
+    - name: Setup Pantry
+      uses: home-lang/pantry/packages/action@main
 
     - name: Install dependencies
       working-directory: ${{ github.workspace }}

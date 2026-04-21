@@ -42,12 +42,11 @@ fn getInstanceId(ctx: *cli.BaseCommand.ParseContext, allocator: std.mem.Allocato
     }
 
     const detect_argv = &[_][]const u8{
-        "aws",          "ec2",
-        "describe-instances",
-        "--filters",    "Name=tag:Name,Values=*mail*",
-        "Name=instance-state-name,Values=running",
-        "--query",      "Reservations[0].Instances[0].InstanceId",
-        "--output",     "text",
+        "aws",                         "ec2",
+        "describe-instances",          "--filters",
+        "Name=tag:Name,Values=*mail*", "Name=instance-state-name,Values=running",
+        "--query",                     "Reservations[0].Instances[0].InstanceId",
+        "--output",                    "text",
     };
 
     const result = execCommand(allocator, detect_argv) catch {
@@ -74,14 +73,14 @@ fn getInstanceId(ctx: *cli.BaseCommand.ParseContext, allocator: std.mem.Allocato
 
 fn runRemoteCommandWithTimeout(allocator: std.mem.Allocator, instance_id: []const u8, remote_cmd: []const u8, max_attempts: u32) !ExecResult {
     const send_argv = &[_][]const u8{
-        "aws",             "ssm",
-        "send-command",
-        "--instance-ids",  instance_id,
-        "--document-name", "AWS-RunShellScript",
-        "--parameters",    remote_cmd,
-        "--timeout-seconds", "600",
-        "--query",         "Command.CommandId",
-        "--output",        "text",
+        "aws",                "ssm",
+        "send-command",       "--instance-ids",
+        instance_id,          "--document-name",
+        "AWS-RunShellScript", "--parameters",
+        remote_cmd,           "--timeout-seconds",
+        "600",                "--query",
+        "Command.CommandId",  "--output",
+        "text",
     };
 
     const send_result = try execCommand(allocator, send_argv);
@@ -102,11 +101,11 @@ fn runRemoteCommandWithTimeout(allocator: std.mem.Allocator, instance_id: []cons
         _ = std.c.nanosleep(&ts, null);
 
         const get_argv = &[_][]const u8{
-            "aws",            "ssm",
-            "get-command-invocation",
-            "--command-id",   command_id,
-            "--instance-id",  instance_id,
-            "--output",       "json",
+            "aws",                    "ssm",
+            "get-command-invocation", "--command-id",
+            command_id,               "--instance-id",
+            instance_id,              "--output",
+            "json",
         };
 
         const get_result = try execCommand(allocator, get_argv);
@@ -171,11 +170,11 @@ fn getBucketName(allocator: std.mem.Allocator, env: []const u8) ![]const u8 {
     defer allocator.free(stack_name);
 
     const argv = &[_][]const u8{
-        "aws",              "cloudformation",
-        "describe-stacks",
-        "--stack-name",     stack_name,
-        "--query",          "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue",
-        "--output",         "text",
+        "aws",                                                     "cloudformation",
+        "describe-stacks",                                         "--stack-name",
+        stack_name,                                                "--query",
+        "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue", "--output",
+        "text",
     };
 
     const result = execCommand(allocator, argv) catch {
@@ -203,9 +202,9 @@ fn findBucketByPrefix(allocator: std.mem.Allocator, env: []const u8) ![]const u8
     defer allocator.free(prefix);
 
     const argv = &[_][]const u8{
-        "aws", "s3api", "list-buckets",
-        "--query", try std.fmt.allocPrint(allocator, "Buckets[?starts_with(Name, '{s}')].Name | [0]", .{prefix}),
-        "--output", "text",
+        "aws",     "s3api",                                                                                       "list-buckets",
+        "--query", try std.fmt.allocPrint(allocator, "Buckets[?starts_with(Name, '{s}')].Name | [0]", .{prefix}), "--output",
+        "text",
     };
 
     const result = execCommand(allocator, argv) catch {
@@ -304,8 +303,8 @@ fn listAction(ctx: *cli.BaseCommand.ParseContext) !void {
     printStdout("Listing backups in s3://{s}/backups/...\n\n", .{bucket});
 
     const argv = &[_][]const u8{
-        "aws",     "s3",
-        "ls",      try std.fmt.allocPrint(allocator, "s3://{s}/backups/", .{bucket}),
+        "aws",              "s3",
+        "ls",               try std.fmt.allocPrint(allocator, "s3://{s}/backups/", .{bucket}),
         "--human-readable",
     };
 

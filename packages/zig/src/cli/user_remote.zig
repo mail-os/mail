@@ -37,12 +37,11 @@ fn getInstanceId(ctx: *cli.BaseCommand.ParseContext, allocator: std.mem.Allocato
     }
 
     const detect_argv = &[_][]const u8{
-        "aws",          "ec2",
-        "describe-instances",
-        "--filters",    "Name=tag:Name,Values=*mail*",
-        "Name=instance-state-name,Values=running",
-        "--query",      "Reservations[0].Instances[0].InstanceId",
-        "--output",     "text",
+        "aws",                         "ec2",
+        "describe-instances",          "--filters",
+        "Name=tag:Name,Values=*mail*", "Name=instance-state-name,Values=running",
+        "--query",                     "Reservations[0].Instances[0].InstanceId",
+        "--output",                    "text",
     };
 
     const result = execCommand(allocator, detect_argv) catch {
@@ -69,13 +68,13 @@ fn getInstanceId(ctx: *cli.BaseCommand.ParseContext, allocator: std.mem.Allocato
 
 fn runRemoteCommand(allocator: std.mem.Allocator, instance_id: []const u8, remote_cmd: []const u8) !ExecResult {
     const send_argv = &[_][]const u8{
-        "aws",             "ssm",
-        "send-command",
-        "--instance-ids",  instance_id,
-        "--document-name", "AWS-RunShellScript",
-        "--parameters",    remote_cmd,
-        "--query",         "Command.CommandId",
-        "--output",        "text",
+        "aws",                "ssm",
+        "send-command",       "--instance-ids",
+        instance_id,          "--document-name",
+        "AWS-RunShellScript", "--parameters",
+        remote_cmd,           "--query",
+        "Command.CommandId",  "--output",
+        "text",
     };
 
     const send_result = try execCommand(allocator, send_argv);
@@ -96,11 +95,11 @@ fn runRemoteCommand(allocator: std.mem.Allocator, instance_id: []const u8, remot
         _ = std.c.nanosleep(&ts, null);
 
         const get_argv = &[_][]const u8{
-            "aws",            "ssm",
-            "get-command-invocation",
-            "--command-id",   command_id,
-            "--instance-id",  instance_id,
-            "--output",       "json",
+            "aws",                    "ssm",
+            "get-command-invocation", "--command-id",
+            command_id,               "--instance-id",
+            instance_id,              "--output",
+            "json",
         };
 
         const get_result = try execCommand(allocator, get_argv);

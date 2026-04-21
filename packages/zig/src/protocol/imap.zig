@@ -1127,9 +1127,9 @@ pub const ImapSession = struct {
     fn listUserFolders(self: *ImapSession, mail_dir: []const u8, pattern: []const u8) !void {
         // Standard folder names that are already listed via GmailFolders
         const standard = [_][]const u8{
-            "INBOX", "Sent", "Drafts", "Trash", "Junk", "Archive",
-            "All Mail", "Starred", "Important", "Social", "Forums",
-            "Updates", "Promotions", "Notes", "new", "cur", "tmp",
+            "INBOX",      "Sent",    "Drafts",    "Trash",  "Junk",   "Archive",
+            "All Mail",   "Starred", "Important", "Social", "Forums", "Updates",
+            "Promotions", "Notes",   "new",       "cur",    "tmp",
         };
 
         var path_buf: [4097]u8 = undefined;
@@ -1525,8 +1525,8 @@ pub const ImapSession = struct {
         const is_peek = std.mem.indexOf(u8, items_raw, "BODY.PEEK") != null;
         const has_body_fetch = std.mem.indexOf(u8, items_raw, "BODY[") != null or
             (std.mem.indexOf(u8, items_raw, "RFC822") != null and
-            std.mem.indexOf(u8, items_raw, "RFC822.SIZE") == null and
-            std.mem.indexOf(u8, items_raw, "RFC822.HEADER") == null);
+                std.mem.indexOf(u8, items_raw, "RFC822.SIZE") == null and
+                std.mem.indexOf(u8, items_raw, "RFC822.HEADER") == null);
         const should_set_seen = has_body_fetch and !is_peek and !self.mailbox_read_only;
 
         // Determine what to fetch based on items
@@ -1938,8 +1938,7 @@ pub const ImapSession = struct {
                     defer self.allocator.free(content);
 
                     // Find header boundary
-                    const hdr_end = if (std.mem.indexOf(u8, content, "\r\n\r\n")) |p| p else
-                        if (std.mem.indexOf(u8, content, "\n\n")) |p| p else content.len;
+                    const hdr_end = if (std.mem.indexOf(u8, content, "\r\n\r\n")) |p| p else if (std.mem.indexOf(u8, content, "\n\n")) |p| p else content.len;
                     const hdr = content[0..hdr_end];
 
                     var matches = true;
