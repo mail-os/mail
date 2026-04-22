@@ -411,11 +411,11 @@ pub const GraphQLExecutor = struct {
 
     fn formatError(self: *GraphQLExecutor, comptime fmt: []const u8, args: anytype) ![]u8 {
         // First format the raw message, then JSON-escape it
-        var msg_buf: std.ArrayList(u8) = .{};
+        var msg_buf: std.ArrayList(u8) = .empty;
         defer msg_buf.deinit(self.allocator);
         try msg_buf.writer(self.allocator).print(fmt, args);
 
-        var result: std.ArrayList(u8) = .{};
+        var result: std.ArrayList(u8) = .empty;
         errdefer result.deinit(self.allocator);
         try result.appendSlice(self.allocator, "{\"errors\":[{\"message\":\"");
         // Escape JSON special characters in the message

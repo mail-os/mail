@@ -99,7 +99,7 @@ pub const Server = struct {
         const raw_fd = std.c.socket(family, sock_type, 0);
         if (raw_fd < 0) return error.Unexpected;
         const fd: posix.socket_t = @intCast(raw_fd);
-        errdefer posix.close(fd);
+        errdefer _ = std.c.close(fd);
 
         if (options.reuse_address) {
             const one: c_int = 1;
@@ -177,7 +177,7 @@ pub const Server = struct {
     }
 
     pub fn close(self: *Server) void {
-        posix.close(self.fd);
+        _ = std.c.close(self.fd);
     }
 };
 
@@ -200,6 +200,6 @@ pub const Connection = struct {
     }
 
     pub fn close(self: Connection) void {
-        posix.close(self.fd);
+        _ = std.c.close(self.fd);
     }
 };

@@ -294,7 +294,7 @@ pub const Session = struct {
             .config = cfg,
             .state = .Initial,
             .mail_from = null,
-            .rcpt_to = std.ArrayList([]u8){},
+            .rcpt_to = .empty,
             .authenticated = false,
             .client_hostname = null,
             .logger = log,
@@ -737,7 +737,7 @@ pub const Session = struct {
 
         try self.sendResponse(writer, 354, "Start mail input; end with <CRLF>.<CRLF>", null);
 
-        var message_data = std.ArrayList(u8){};
+        var message_data: std.ArrayList(u8) = .empty;
         defer message_data.deinit(self.allocator);
         // Pre-allocate to avoid repeated reallocations during message reception
         message_data.ensureTotalCapacity(self.allocator, @min(65536, self.config.max_message_size)) catch {};

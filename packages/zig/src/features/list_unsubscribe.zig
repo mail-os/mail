@@ -646,7 +646,7 @@ pub const OneClickHandler = struct {
     /// prevent unbounded memory growth.
     pub fn purgeExpiredEntries(self: *OneClickHandler, max_age_seconds: i64) usize {
         const now = time_compat.timestamp();
-        var to_remove: std.ArrayList([]const u8) = .{};
+        var to_remove: std.ArrayList([]const u8) = .empty;
         defer to_remove.deinit(self.allocator);
 
         var it = self.processed_tokens.iterator();
@@ -692,7 +692,7 @@ pub fn injectUnsubscribeHeaders(
     const boundary = std.mem.indexOf(u8, message, "\r\n\r\n");
     if (boundary) |pos| {
         // Insert new headers just before the blank line separating headers from body.
-        var result: std.ArrayList(u8) = .{};
+        var result: std.ArrayList(u8) = .empty;
         errdefer result.deinit(allocator);
 
         try result.appendSlice(allocator, message[0 .. pos + 2]); // Include the \r\n at end of last header

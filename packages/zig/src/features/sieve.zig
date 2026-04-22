@@ -302,7 +302,7 @@ pub const SieveParser = struct {
         self.errors.clearRetainingCapacity();
         self.requires.clearRetainingCapacity();
 
-        var commands: std.ArrayList(SieveCommand) = .{};
+        var commands: std.ArrayList(SieveCommand) = .empty;
         defer commands.deinit(self.allocator);
 
         while (self.pos < self.source.len) {
@@ -368,7 +368,7 @@ pub const SieveParser = struct {
 
     fn parseRequire(self: *SieveParser) !SieveCommand {
         self.skipWhitespaceAndComments();
-        var args: std.ArrayList([]const u8) = .{};
+        var args: std.ArrayList([]const u8) = .empty;
 
         if (self.pos < self.source.len and self.source[self.pos] == '[') {
             // String list
@@ -406,7 +406,7 @@ pub const SieveParser = struct {
         self.skipWhitespaceAndComments();
         const block = try self.parseBlock();
 
-        var elsif_branches: std.ArrayList(ElsifBranch) = .{};
+        var elsif_branches: std.ArrayList(ElsifBranch) = .empty;
         var else_block: []const SieveCommand = &.{};
 
         // Check for elsif/else
@@ -451,7 +451,7 @@ pub const SieveParser = struct {
         const folder = try self.parseString();
         try self.expectChar(';');
 
-        var args: std.ArrayList([]const u8) = .{};
+        var args: std.ArrayList([]const u8) = .empty;
         try args.append(self.allocator, folder);
 
         return SieveCommand{
@@ -465,7 +465,7 @@ pub const SieveParser = struct {
         const address = try self.parseString();
         try self.expectChar(';');
 
-        var args: std.ArrayList([]const u8) = .{};
+        var args: std.ArrayList([]const u8) = .empty;
         try args.append(self.allocator, address);
 
         return SieveCommand{
@@ -479,7 +479,7 @@ pub const SieveParser = struct {
         const reason = try self.parseString();
         try self.expectChar(';');
 
-        var args: std.ArrayList([]const u8) = .{};
+        var args: std.ArrayList([]const u8) = .empty;
         try args.append(self.allocator, reason);
 
         return SieveCommand{
@@ -684,7 +684,7 @@ pub const SieveParser = struct {
         self.skipWhitespaceAndComments();
         try self.expectChar('(');
 
-        var tests: std.ArrayList(SieveTest) = .{};
+        var tests: std.ArrayList(SieveTest) = .empty;
 
         while (self.pos < self.source.len and self.source[self.pos] != ')') {
             self.skipWhitespaceAndComments();
@@ -705,7 +705,7 @@ pub const SieveParser = struct {
         self.skipWhitespaceAndComments();
         try self.expectChar('{');
 
-        var commands: std.ArrayList(SieveCommand) = .{};
+        var commands: std.ArrayList(SieveCommand) = .empty;
 
         while (self.pos < self.source.len and self.source[self.pos] != '}') {
             self.skipWhitespaceAndComments();
@@ -735,7 +735,7 @@ pub const SieveParser = struct {
         if (self.pos >= self.source.len or self.source[self.pos] != '"') return error.ExpectedQuote;
         self.advance(); // skip opening quote
 
-        var result: std.ArrayList(u8) = .{};
+        var result: std.ArrayList(u8) = .empty;
 
         while (self.pos < self.source.len and self.source[self.pos] != '"') {
             if (self.source[self.pos] == '\\' and self.pos + 1 < self.source.len) {
@@ -763,7 +763,7 @@ pub const SieveParser = struct {
         self.skipWhitespaceAndComments();
         if (self.pos >= self.source.len) return error.UnexpectedEnd;
 
-        var list: std.ArrayList([]const u8) = .{};
+        var list: std.ArrayList([]const u8) = .empty;
 
         if (self.source[self.pos] == '[') {
             self.advance(); // skip [
@@ -946,7 +946,7 @@ pub const SieveEvaluator = struct {
 
     /// Evaluate a compiled Sieve script against a message
     pub fn evaluate(self: *SieveEvaluator, script: *const SieveScript, message: *const SieveMessage) ![]SieveAction {
-        var actions: std.ArrayList(SieveAction) = .{};
+        var actions: std.ArrayList(SieveAction) = .empty;
         var implicit_keep = true;
 
         for (script.commands) |cmd| {
@@ -1289,7 +1289,7 @@ pub const SieveScriptManager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var names: std.ArrayList([]const u8) = .{};
+        var names: std.ArrayList([]const u8) = .empty;
 
         if (self.scripts.getPtr(user)) |user_scripts| {
             var it = user_scripts.scripts.iterator();

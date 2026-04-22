@@ -704,7 +704,7 @@ pub const MilterClient = struct {
         const raw_fd = std.c.socket(family, sock_type, 0);
         if (raw_fd < 0) return error.ConnectionRefused;
         const fd: posix.socket_t = @intCast(raw_fd);
-        errdefer posix.close(fd);
+        errdefer _ = std.c.close(fd);
 
         if (addr.family == .ipv4) {
             const sockaddr = addr.toSockaddrIn();
@@ -730,7 +730,7 @@ pub const MilterClient = struct {
         const raw_fd = std.c.socket(posix.AF.UNIX, sock_type, 0);
         if (raw_fd < 0) return error.ConnectionRefused;
         const fd: posix.socket_t = @intCast(raw_fd);
-        errdefer posix.close(fd);
+        errdefer _ = std.c.close(fd);
 
         var sockaddr: posix.sockaddr.un = .{ .family = posix.AF.UNIX, .path = undefined };
         @memset(&sockaddr.path, 0);
@@ -875,7 +875,7 @@ pub const MilterClient = struct {
         sender: []const u8,
         esmtp_args: ?[]const []const u8,
     ) !MilterResponseData {
-        var payload: std.ArrayList(u8) = .{};
+        var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(self.allocator);
 
         // sender\0
@@ -904,7 +904,7 @@ pub const MilterClient = struct {
         recipient: []const u8,
         esmtp_args: ?[]const []const u8,
     ) !MilterResponseData {
-        var payload: std.ArrayList(u8) = .{};
+        var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(self.allocator);
 
         // recipient\0
@@ -979,7 +979,7 @@ pub const MilterClient = struct {
         try self.sendPacket(MilterPacket.commandOnly(.end_of_body));
 
         // Collect all responses until we get a final action.
-        var responses: std.ArrayList(MilterResponseData) = .{};
+        var responses: std.ArrayList(MilterResponseData) = .empty;
         errdefer {
             for (responses.items) |*r| r.deinit(self.allocator);
             responses.deinit(self.allocator);
@@ -1026,7 +1026,7 @@ pub const MilterClient = struct {
         cmd_code: MilterCommand,
         macros: []const [2][]const u8,
     ) !void {
-        var payload: std.ArrayList(u8) = .{};
+        var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(self.allocator);
 
         try payload.append(self.allocator, @intFromEnum(cmd_code));
@@ -1296,11 +1296,11 @@ pub const MilterDisposition = enum {
 
 /// Modifications requested by milters during the end-of-message phase.
 pub const MilterModifications = struct {
-    added_headers: std.ArrayList(HeaderPair) = .{},
-    changed_headers: std.ArrayList(HeaderChange) = .{},
-    deleted_headers: std.ArrayList(HeaderDelete) = .{},
-    added_recipients: std.ArrayList([]const u8) = .{},
-    deleted_recipients: std.ArrayList([]const u8) = .{},
+    added_headers: std.ArrayList(HeaderPair) = .empty,
+    changed_headers: std.ArrayList(HeaderChange) = .empty,
+    deleted_headers: std.ArrayList(HeaderDelete) = .empty,
+    added_recipients: std.ArrayList([]const u8) = .empty,
+    deleted_recipients: std.ArrayList([]const u8) = .empty,
     replacement_body: ?[]const u8 = null,
     quarantine_reason: ?[]const u8 = null,
     new_sender: ?[]const u8 = null,
@@ -1438,7 +1438,7 @@ pub const MilterModifications = struct {
 /// aggregated.
 pub const MilterManager = struct {
     allocator: std.mem.Allocator,
-    milters: std.ArrayList(ManagedMilter) = .{},
+    milters: std.ArrayList(ManagedMilter) = .empty,
     stats: MilterManagerStats = .{},
     mutex: mutex_compat.Mutex = .{},
 

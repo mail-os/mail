@@ -185,7 +185,7 @@ pub const Plugin = struct {
             .library_handle = null,
             .config = null,
             .error_message = null,
-            .enabled_hooks = std.ArrayList(PluginHookType){},
+            .enabled_hooks = .empty,
         };
     }
 
@@ -357,7 +357,7 @@ pub const PluginManager = struct {
     pub fn init(allocator: std.mem.Allocator, plugin_dir: []const u8) !PluginManager {
         return .{
             .allocator = allocator,
-            .plugins = std.ArrayList(*Plugin){},
+            .plugins = .empty,
             .plugin_dir = try allocator.dupe(u8, plugin_dir),
         };
     }
@@ -500,7 +500,7 @@ pub const PluginBuilder = struct {
         return .{
             .allocator = allocator,
             .metadata = try PluginMetadata.init(allocator, name, version),
-            .hooks = std.ArrayList(PluginHookType){},
+            .hooks = .empty,
         };
     }
 

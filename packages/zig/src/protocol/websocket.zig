@@ -169,7 +169,7 @@ pub const WebSocketSession = struct {
             .allocator = allocator,
             .stream = stream,
             .state = .connecting,
-            .subscriptions = std.ArrayList([]const u8){},
+            .subscriptions = .empty,
             .last_ping = time_compat.timestamp(),
             .config = config,
             .last_pong = time_compat.timestamp(),
@@ -374,7 +374,7 @@ pub const WebSocketSession = struct {
 
     /// Send a WebSocket frame
     pub fn sendFrame(self: *WebSocketSession, opcode: OpCode, payload: []const u8) !void {
-        var frame_header = std.ArrayList(u8){};
+        var frame_header: std.ArrayList(u8) = .empty;
         defer frame_header.deinit(self.allocator);
 
         // First byte: FIN + RSV + OpCode
@@ -409,7 +409,7 @@ pub const WebSocketSession = struct {
 
     /// Send JSON message
     pub fn sendJson(self: *WebSocketSession, data: anytype) !void {
-        var buffer = std.ArrayList(u8){};
+        var buffer: std.ArrayList(u8) = .empty;
         defer buffer.deinit(self.allocator);
 
         const writer = buffer.writer(self.allocator);
@@ -431,7 +431,7 @@ pub const WebSocketSession = struct {
 
     /// Send close frame
     pub fn sendClose(self: *WebSocketSession, code: u16, reason: []const u8) !void {
-        var close_payload = std.ArrayList(u8){};
+        var close_payload: std.ArrayList(u8) = .empty;
         defer close_payload.deinit(self.allocator);
 
         // Add close code (big-endian u16)
@@ -471,7 +471,7 @@ pub const NotificationManager = struct {
     pub fn init(allocator: Allocator) NotificationManager {
         return NotificationManager{
             .allocator = allocator,
-            .sessions = std.ArrayList(*WebSocketSession){},
+            .sessions = .empty,
             .sessions_mutex = mutex_compat.Mutex{},
         };
     }
@@ -511,7 +511,7 @@ pub const NotificationManager = struct {
 
         const event_type = @tagName(event);
 
-        var json_buffer = std.ArrayList(u8){};
+        var json_buffer: std.ArrayList(u8) = .empty;
         defer json_buffer.deinit(self.allocator);
 
         // Serialize event to JSON

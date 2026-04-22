@@ -292,7 +292,7 @@ pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]con
     const dir = std.c.opendir(path_z) orelse return error.FileNotFound;
     defer _ = std.c.closedir(dir);
 
-    var entries = std.ArrayList(EmlEntry){};
+    var entries: std.ArrayList(EmlEntry) = .empty;
     errdefer {
         for (entries.items) |e| allocator.free(e.name);
         entries.deinit(allocator);

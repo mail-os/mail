@@ -164,8 +164,7 @@ pub const RateLimiter = struct {
     fn addToBucket(self: *RateLimiter, bucket_key: i64, identifier: []const u8) !void {
         const bucket_result = try self.time_buckets.getOrPut(bucket_key);
         if (!bucket_result.found_existing) {
-            // In Zig 0.15, ArrayList is initialized with {} instead of init()
-            bucket_result.value_ptr.* = .{};
+            bucket_result.value_ptr.* = .empty;
         }
 
         // Only add if not already in bucket

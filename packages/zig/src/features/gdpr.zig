@@ -1,6 +1,6 @@
 const std = @import("std");
 const time_compat = @import("../core/time_compat.zig");
-const sqlite = @cImport(@cInclude("sqlite3.h"));
+const sqlite = @import("sqlite");
 
 /// GDPR Compliance Module
 /// Implements data protection and privacy requirements per GDPR (EU Regulation 2016/679)
@@ -203,7 +203,7 @@ pub const DataExport = struct {
 
     /// Export to JSON string (Zig 0.16 compatible)
     pub fn toJSONString(self: *const DataExport, allocator: std.mem.Allocator) ![]u8 {
-        var result = std.ArrayList(u8){};
+        var result: std.ArrayList(u8) = .empty;
         errdefer result.deinit(allocator);
 
         // Build JSON manually using appendSlice
@@ -358,7 +358,7 @@ pub const GDPRManager = struct {
     }
 
     fn getMessages(self: *GDPRManager, username: []const u8) ![]DataExport.Message {
-        var messages = std.ArrayList(DataExport.Message){};
+        var messages: std.ArrayList(DataExport.Message) = .empty;
         errdefer messages.deinit(self.allocator);
 
         const query = "SELECT message_id, from_addr, to_addrs, subject, date, size, folder, flags FROM messages WHERE user = ?";
@@ -388,7 +388,7 @@ pub const GDPRManager = struct {
 
             // Parse to addresses (comma-separated)
             const to_str = std.mem.span(to_text);
-            var to_list = std.ArrayList([]const u8){};
+            var to_list: std.ArrayList([]const u8) = .empty;
             var iter = std.mem.splitScalar(u8, to_str, ',');
             while (iter.next()) |to_addr| {
                 const trimmed = std.mem.trim(u8, to_addr, " ");
@@ -412,7 +412,7 @@ pub const GDPRManager = struct {
     }
 
     fn getActivity(self: *GDPRManager, username: []const u8) ![]DataExport.Activity {
-        var activity = std.ArrayList(DataExport.Activity){};
+        var activity: std.ArrayList(DataExport.Activity) = .empty;
         errdefer activity.deinit(self.allocator);
 
         const query = "SELECT timestamp, action, ip_address, user_agent, success FROM audit_log WHERE username = ? ORDER BY timestamp DESC LIMIT 1000";
@@ -468,7 +468,7 @@ pub const GDPRManager = struct {
             0;
 
         // Get folders
-        var folders = std.ArrayList([]const u8){};
+        var folders: std.ArrayList([]const u8) = .empty;
         const folder_query = "SELECT DISTINCT folder FROM messages WHERE user = ?";
 
         var stmt2: ?*sqlite.sqlite3_stmt = null;
@@ -485,7 +485,7 @@ pub const GDPRManager = struct {
         }
 
         // Storage locations (would be filled by storage backend)
-        var locations = std.ArrayList([]const u8){};
+        var locations: std.ArrayList([]const u8) = .empty;
         try locations.append(self.allocator, try self.allocator.dupe(u8, "/var/lib/mail/"));
 
         return DataExport.Metadata{
@@ -634,7 +634,7 @@ test "GDPR JSON export" {
         .allocator = testing.allocator,
     };
 
-    var buffer = std.ArrayList(u8){};
+    var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(testing.allocator);
 
     try export_data.toJSON(buffer.writer());

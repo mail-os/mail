@@ -171,7 +171,7 @@ pub const MultipartParser = struct {
         self.current_depth += 1;
         defer self.current_depth -= 1;
 
-        var parts: std.ArrayList(MimePart) = .{};
+        var parts: std.ArrayList(MimePart) = .empty;
         errdefer {
             for (parts.items) |*part| {
                 part.deinit();
@@ -246,7 +246,7 @@ pub const MultipartParser = struct {
         // Parse headers
         var lines = std.mem.splitSequence(u8, headers_data, "\r\n");
         var current_header: ?[]const u8 = null;
-        var current_value: std.ArrayList(u8) = .{};
+        var current_value: std.ArrayList(u8) = .empty;
         defer current_value.deinit(self.allocator);
 
         while (lines.next()) |line| {

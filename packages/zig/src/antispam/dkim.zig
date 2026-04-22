@@ -170,7 +170,7 @@ pub const DKIMValidator = struct {
         // Find DKIM-Signature header
         var lines = std.mem.splitSequence(u8, headers, "\r\n");
         var in_dkim_sig = false;
-        var sig_value: std.ArrayList(u8) = .{};
+        var sig_value: std.ArrayList(u8) = .empty;
         defer sig_value.deinit(self.allocator);
 
         while (lines.next()) |line| {
@@ -420,7 +420,7 @@ pub const DKIMKeyManager = struct {
     pub fn init(allocator: std.mem.Allocator, storage_path: ?[]const u8) !DKIMKeyManager {
         return .{
             .allocator = allocator,
-            .keys = .{},
+            .keys = .empty,
             .key_storage_path = if (storage_path) |p| try allocator.dupe(u8, p) else null,
         };
     }
@@ -489,7 +489,7 @@ pub const DKIMKeyManager = struct {
 
     /// Execute scheduled rotations
     pub fn executeScheduledRotations(self: *DKIMKeyManager) ![]const RotationResult {
-        var results: std.ArrayList(RotationResult) = .{};
+        var results: std.ArrayList(RotationResult) = .empty;
         const now = time_compat.timestamp();
 
         for (self.keys.items) |*key| {
@@ -540,7 +540,7 @@ pub const DKIMKeyManager = struct {
     /// List all keys for domain
     pub fn listKeys(self: *DKIMKeyManager, domain: ?[]const u8) []DKIMKeyPair {
         if (domain) |d| {
-            var filtered: std.ArrayList(DKIMKeyPair) = .{};
+            var filtered: std.ArrayList(DKIMKeyPair) = .empty;
             for (self.keys.items) |key| {
                 if (std.mem.eql(u8, key.domain, d)) {
                     filtered.append(self.allocator, key) catch continue;
@@ -556,7 +556,7 @@ pub const DKIMKeyManager = struct {
         for (self.keys.items) |*key| {
             if (std.mem.eql(u8, key.id, key_id)) {
                 const now = time_compat.timestamp();
-                var issues: std.ArrayList([]const u8) = .{};
+                var issues: std.ArrayList([]const u8) = .empty;
 
                 if (!key.is_active) {
                     try issues.append(self.allocator, "Key is inactive");
@@ -780,7 +780,7 @@ pub const DKIMCli = struct {
             };
         }
 
-        var output: std.ArrayList(u8) = .{};
+        var output: std.ArrayList(u8) = .empty;
 
         try output.print(self.allocator, "DKIM Keys:\n", .{});
         try output.print(self.allocator, "{s:<40} {s:<20} {s:<15} {s:<10} {s:<10}\n", .{
@@ -958,7 +958,7 @@ pub const DKIMCli = struct {
         const key_id = args[0];
         const validation = try self.key_manager.validateKey(key_id);
 
-        var output: std.ArrayList(u8) = .{};
+        var output: std.ArrayList(u8) = .empty;
 
         try output.print(self.allocator, "Key Validation: {s}\n", .{key_id});
         try output.print(self.allocator, "  Valid: {s}\n", .{if (validation.is_valid) "yes" else "no"});

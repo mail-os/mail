@@ -40,7 +40,7 @@ pub fn checkLinks(allocator: Allocator, html_content: []const u8) !LinkCheckResu
         .total_links = 0,
         .working_links = 0,
         .broken_links = 0,
-        .links = std.ArrayList(LinkStatus){},
+        .links = .empty,
     };
 
     // Extract all links from HTML
@@ -70,7 +70,7 @@ pub fn checkLinks(allocator: Allocator, html_content: []const u8) !LinkCheckResu
 }
 
 fn extractLinks(allocator: Allocator, html: []const u8) !std.ArrayList([]const u8) {
-    var links = std.ArrayList([]const u8){};
+    var links: std.ArrayList([]const u8) = .empty;
 
     // Simple link extraction (href="...")
     var i: usize = 0;
@@ -140,7 +140,7 @@ pub fn analyzeSpam(allocator: Allocator, email_content: []const u8, headers: []c
         .total_score = 0.0,
         .threshold = 5.0, // SpamAssassin default
         .is_spam = false,
-        .rules = std.ArrayList(SpamRule){},
+        .rules = .empty,
     };
 
     // Check various spam indicators
@@ -310,7 +310,7 @@ pub fn analyzeHeaders(allocator: Allocator, headers: []const u8) !HeaderAnalysis
         .has_dmarc = false,
         .sender_ip = null,
         .received_hops = 0,
-        .warnings = std.ArrayList([]const u8){},
+        .warnings = .empty,
     };
 
     // Check for authentication headers
@@ -419,7 +419,7 @@ test "spam word detection" {
         .total_score = 0.0,
         .threshold = 5.0,
         .is_spam = false,
-        .rules = std.ArrayList(SpamRule){},
+        .rules = .empty,
     };
     defer report.deinit(allocator);
 

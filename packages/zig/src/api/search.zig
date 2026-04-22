@@ -4,9 +4,7 @@
 const std = @import("std");
 const database = @import("../storage/database.zig");
 const logger = @import("../core/logger.zig");
-const sqlite = @cImport({
-    @cInclude("sqlite3.h");
-});
+const sqlite = @import("sqlite");
 
 /// Message search engine with FTS5 support
 pub const MessageSearch = struct {

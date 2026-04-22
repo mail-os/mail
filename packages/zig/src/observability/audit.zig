@@ -196,7 +196,7 @@ pub const AuditEvent = struct {
 
     /// Calculate cryptographic hash for tamper detection
     pub fn calculateHash(self: *const AuditEvent, allocator: std.mem.Allocator, previous_hash: ?[]const u8) ![]const u8 {
-        var buffer = std.ArrayList(u8){};
+        var buffer: std.ArrayList(u8) = .empty;
         defer buffer.deinit(allocator);
 
         const writer = buffer.writer(allocator);
@@ -356,10 +356,10 @@ pub const AuditManager = struct {
 
     /// Query audit events
     pub fn queryEvents(self: *AuditManager, query: AuditQuery) !std.ArrayList(AuditEvent) {
-        var events = std.ArrayList(AuditEvent){};
+        var events: std.ArrayList(AuditEvent) = .empty;
         errdefer events.deinit(self.allocator);
 
-        var sql = std.ArrayList(u8){};
+        var sql: std.ArrayList(u8) = .empty;
         defer sql.deinit(self.allocator);
 
         const writer = sql.writer(self.allocator);

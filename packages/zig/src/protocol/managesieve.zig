@@ -134,7 +134,7 @@ pub const ManageSieveCapability = struct {
     }
 
     pub fn format(self: *const ManageSieveCapability, allocator: std.mem.Allocator) ![]const u8 {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
         try buf.print(allocator, "\"IMPLEMENTATION\" \"{s}\"\r\n", .{self.implementation});
         try buf.print(allocator, "\"SASL\" \"{s}\"\r\n", .{self.sasl_mechanisms});
@@ -210,7 +210,7 @@ pub const ResponseFormatter = struct {
     }
 
     fn fmtResp(a: std.mem.Allocator, tag: []const u8, code: ?ResponseCode, msg: ?[]const u8) ![]const u8 {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(a);
         try buf.appendSlice(a, tag);
         if (code) |c| try buf.print(a, " ({s})", .{c.toString()});
@@ -220,14 +220,14 @@ pub const ResponseFormatter = struct {
     }
 
     pub fn encodeLiteral(a: std.mem.Allocator, data: []const u8) ![]const u8 {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(a);
         try buf.print(a, "{{{d}+}}\r\n{s}", .{ data.len, data });
         return try a.dupe(u8, buf.items);
     }
 
     pub fn encodeQuoted(a: std.mem.Allocator, data: []const u8) ![]const u8 {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(a);
         try buf.append(a, '"');
         for (data) |c| {
@@ -366,7 +366,7 @@ pub const ManageSieveSession = struct {
     pub fn handleConnection(self: *ManageSieveSession) !void {
         try self.sendCapabilities();
         var rbuf: [8192]u8 = undefined;
-        var lbuf = std.ArrayList(u8){};
+        var lbuf: std.ArrayList(u8) = .empty;
         defer lbuf.deinit(self.allocator);
         while (self.state != .closing) {
             const n = self.stream.read(&rbuf) catch |err| {
@@ -727,7 +727,7 @@ pub const ManageSieveSession = struct {
         const tr = std.mem.trim(u8, args, " \t");
         if (tr.len > 0) {
             if (extractQuotedString(tr)) |tag| {
-                var buf: std.ArrayList(u8) = .{};
+                var buf: std.ArrayList(u8) = .empty;
                 defer buf.deinit(self.allocator);
                 try buf.print(self.allocator, "OK (TAG \"{s}\") \"NOOP completed\"\r\n", .{tag.value});
                 const r = try self.allocator.dupe(u8, buf.items);

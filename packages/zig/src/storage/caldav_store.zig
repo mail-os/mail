@@ -238,12 +238,12 @@ pub const CalDavStore = struct {
             .events = std.AutoHashMap(u64, Event).init(allocator),
             .addressbooks = std.AutoHashMap(u64, AddressBook).init(allocator),
             .contacts = std.AutoHashMap(u64, Contact).init(allocator),
-            .emails = .{},
-            .phones = .{},
-            .addresses = .{},
-            .user_ids = .{},
+            .emails = .empty,
+            .phones = .empty,
+            .addresses = .empty,
+            .user_ids = .empty,
             .next_user_id = 1,
-            .sync_changes = .{},
+            .sync_changes = .empty,
             .current_sync_token = 1,
             .next_calendar_id = 1,
             .next_event_id = 1,
@@ -354,7 +354,7 @@ pub const CalDavStore = struct {
     }
 
     pub fn getUserCalendars(self: *Self, user_id: u64) ![]Calendar {
-        var result: std.ArrayList(Calendar) = .{};
+        var result: std.ArrayList(Calendar) = .empty;
         errdefer result.deinit(self.allocator);
 
         var iter = self.calendars.valueIterator();
@@ -369,7 +369,7 @@ pub const CalDavStore = struct {
 
     pub fn deleteCalendar(self: *Self, id: u64) !void {
         // Delete all events in this calendar first
-        var events_to_delete: std.ArrayList(u64) = .{};
+        var events_to_delete: std.ArrayList(u64) = .empty;
         defer events_to_delete.deinit(self.allocator);
 
         var iter = self.events.iterator();
@@ -463,7 +463,7 @@ pub const CalDavStore = struct {
     }
 
     pub fn getCalendarEvents(self: *Self, calendar_id: u64) ![]Event {
-        var result: std.ArrayList(Event) = .{};
+        var result: std.ArrayList(Event) = .empty;
         errdefer result.deinit(self.allocator);
 
         var iter = self.events.valueIterator();
@@ -568,7 +568,7 @@ pub const CalDavStore = struct {
     }
 
     pub fn getUserAddressBooks(self: *Self, user_id: u64) ![]AddressBook {
-        var result: std.ArrayList(AddressBook) = .{};
+        var result: std.ArrayList(AddressBook) = .empty;
         errdefer result.deinit(self.allocator);
 
         var iter = self.addressbooks.valueIterator();
@@ -583,7 +583,7 @@ pub const CalDavStore = struct {
 
     pub fn deleteAddressBook(self: *Self, id: u64) !void {
         // Delete all contacts in this addressbook first
-        var contacts_to_delete: std.ArrayList(u64) = .{};
+        var contacts_to_delete: std.ArrayList(u64) = .empty;
         defer contacts_to_delete.deinit(self.allocator);
 
         var iter = self.contacts.iterator();
@@ -794,7 +794,7 @@ pub const CalDavStore = struct {
     }
 
     pub fn getAddressBookContacts(self: *Self, addressbook_id: u64) ![]Contact {
-        var result: std.ArrayList(Contact) = .{};
+        var result: std.ArrayList(Contact) = .empty;
         errdefer result.deinit(self.allocator);
 
         var iter = self.contacts.valueIterator();
@@ -808,7 +808,7 @@ pub const CalDavStore = struct {
     }
 
     pub fn getContactEmails(self: *Self, contact_id: u64) []EmailAddress {
-        var result: std.ArrayList(EmailAddress) = .{};
+        var result: std.ArrayList(EmailAddress) = .empty;
         for (self.emails.items) |email| {
             if (email.contact_id == contact_id) {
                 result.append(self.allocator, email) catch continue;
@@ -818,7 +818,7 @@ pub const CalDavStore = struct {
     }
 
     pub fn getContactPhones(self: *Self, contact_id: u64) []PhoneNumber {
-        var result: std.ArrayList(PhoneNumber) = .{};
+        var result: std.ArrayList(PhoneNumber) = .empty;
         for (self.phones.items) |phone| {
             if (phone.contact_id == contact_id) {
                 result.append(self.allocator, phone) catch continue;
@@ -914,7 +914,7 @@ pub const CalDavStore = struct {
     }
 
     pub fn getChangesSince(self: *Self, collection_id: u64, since_token: u64, is_calendar: bool) !SyncReport {
-        var changes: std.ArrayList(SyncChange) = .{};
+        var changes: std.ArrayList(SyncChange) = .empty;
         errdefer changes.deinit(self.allocator);
 
         const expected_type: SyncChange.ResourceType = if (is_calendar) .event else .contact;
@@ -998,7 +998,7 @@ pub const CalDavStore = struct {
             return try self.allocator.dupe(u8, contact.vcf_data);
         }
 
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(self.allocator);
 
         try buf.appendSlice(self.allocator, "BEGIN:VCARD\r\n");

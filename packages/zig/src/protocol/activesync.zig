@@ -204,7 +204,7 @@ pub const ActiveSyncSession = struct {
         return ActiveSyncSession{
             .allocator = allocator,
             .stream = stream,
-            .request_buffer = std.ArrayList(u8){},
+            .request_buffer = .empty,
             .auth_backend = auth_backend,
         };
     }
@@ -615,7 +615,7 @@ pub const ActiveSyncServer = struct {
             .allocator = allocator,
             .config = config,
             .running = std.atomic.Value(bool).init(false),
-            .sessions = std.ArrayList(*ActiveSyncSession){},
+            .sessions = .empty,
             .sessions_mutex = mutex_compat.Mutex{},
             .auth_backend = auth_backend,
         };

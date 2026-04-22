@@ -312,7 +312,7 @@ pub const MessageSubmissionAgent = struct {
         var current_name: ?[]u8 = null;
         // Use ArrayList to accumulate header value — avoids O(n²) from
         // repeated allocPrint on continuation lines
-        var value_buf: std.ArrayList(u8) = .{};
+        var value_buf: std.ArrayList(u8) = .empty;
         defer value_buf.deinit(self.allocator);
 
         while (lines.next()) |line| {

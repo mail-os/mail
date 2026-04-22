@@ -77,7 +77,7 @@ fn deliverDirect(
     const raw_fd = std.c.socket(family, sock_type, 0);
     if (raw_fd < 0) return error.SocketCreateFailed;
     const sock: std.posix.socket_t = @intCast(raw_fd);
-    defer std.posix.close(sock);
+    defer _ = std.c.close(sock);
 
     // Set socket timeout (30 seconds)
     const tv: std.posix.timeval = .{ .sec = 30, .usec = 0 };

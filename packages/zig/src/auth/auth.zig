@@ -153,7 +153,7 @@ pub const NonceManager = struct {
     /// Cleanup expired nonces (internal, caller must hold lock)
     fn cleanupLocked(self: *NonceManager) void {
         const now = getCurrentTimestamp();
-        var to_remove: std.ArrayList([]const u8) = .{};
+        var to_remove: std.ArrayList([]const u8) = .empty;
         defer to_remove.deinit(self.allocator);
 
         var iter = self.nonces.iterator();

@@ -308,7 +308,7 @@ pub fn generateThunderbirdXML(
     config: AutoconfigConfig,
     domain: []const u8,
 ) ![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     // XML declaration and root element
@@ -402,7 +402,7 @@ pub fn generateOutlookXML(
     config: AutoconfigConfig,
     email: []const u8,
 ) ![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     // XML declaration and Autodiscover envelope
@@ -477,7 +477,7 @@ pub fn generateAppleMobileconfig(
     config: AutoconfigConfig,
     email: []const u8,
 ) ![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     // Extract username and domain from the email address
@@ -775,7 +775,7 @@ fn generateDeterministicUUID(allocator: std.mem.Allocator, seed: []const u8, sal
 /// Escape a string for use in XML content.
 /// Replaces &, <, >, ", and ' with their XML entity equivalents.
 pub fn xmlEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
     for (input) |c| {

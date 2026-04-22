@@ -133,7 +133,7 @@ pub const DKIMRotationScheduler = struct {
 
     /// Check all domains and rotate keys that are due
     pub fn checkAndRotate(self: *DKIMRotationScheduler) ![]RotationEvent {
-        var events: std.ArrayList(RotationEvent) = .{};
+        var events: std.ArrayList(RotationEvent) = .empty;
         const now = time_compat.timestamp();
 
         self.mutex.lock();
@@ -247,7 +247,7 @@ pub const DKIMRotationScheduler = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var domains: std.ArrayList([]const u8) = .{};
+        var domains: std.ArrayList([]const u8) = .empty;
         var it = self.rotation_state.iterator();
         while (it.next()) |entry| {
             try domains.append(self.allocator, entry.key_ptr.*);

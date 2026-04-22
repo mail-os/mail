@@ -384,9 +384,9 @@ pub const Process = struct {
         try std.posix.chdir("/");
 
         // Close file descriptors
-        std.posix.close(0);
-        std.posix.close(1);
-        std.posix.close(2);
+        _ = std.c.close(0);
+        _ = std.c.close(1);
+        _ = std.c.close(2);
     }
 
     /// Get process ID
@@ -423,7 +423,7 @@ pub const Network = struct {
             0,
         ) catch return false;
 
-        std.posix.close(socket_fd);
+        _ = std.c.close(socket_fd);
         return true;
     }
 

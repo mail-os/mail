@@ -34,7 +34,7 @@ pub fn main(init: std.process.Init) !void {
     _ = try root_cmd.addCommand(try backup_mod.setup(allocator));
 
     // Collect args (skip program name)
-    var args_list = std.ArrayList([]const u8){};
+    var args_list: std.ArrayList([]const u8) = .empty;
     defer args_list.deinit(allocator);
 
     var args_iter = std.process.Args.Iterator.init(init.minimal.args);

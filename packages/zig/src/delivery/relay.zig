@@ -32,7 +32,7 @@ pub const SMTPRelay = struct {
     fn closeConnection(self: *SMTPRelay) void {
         if (self.cached_fd) |fd| {
             _ = fdWrite(fd, "QUIT\r\n") catch {};
-            posix.close(fd);
+            _ = std.c.close(fd);
             self.cached_fd = null;
         }
     }
@@ -44,19 +44,19 @@ pub const SMTPRelay = struct {
             var buf: [1024]u8 = undefined;
             _ = fdWrite(fd, "RSET\r\n") catch {
                 self.cached_fd = null;
-                posix.close(fd);
+                _ = std.c.close(fd);
                 return self.newConnection();
             };
             const rset_resp = readResponse(fd, &buf) catch {
                 self.cached_fd = null;
-                posix.close(fd);
+                _ = std.c.close(fd);
                 return self.newConnection();
             };
             if (std.mem.startsWith(u8, rset_resp, "250")) {
                 return fd;
             }
             // RSET failed — reconnect
-            posix.close(fd);
+            _ = std.c.close(fd);
             self.cached_fd = null;
         }
         return self.newConnection();
@@ -68,7 +68,7 @@ pub const SMTPRelay = struct {
         const raw_fd = std.c.socket(@intCast(@as(u32, posix.AF.INET)), @intCast(@as(u32, posix.SOCK.STREAM)), 0);
         if (raw_fd < 0) return error.SocketCreateFailed;
         const fd: posix.socket_t = @intCast(raw_fd);
-        errdefer posix.close(fd);
+        errdefer _ = std.c.close(fd);
 
         const sockaddr = posix.sockaddr.in{
             .family = posix.AF.INET,
@@ -116,7 +116,7 @@ pub const SMTPRelay = struct {
         const fd = try self.ensureConnection();
         errdefer {
             // On error, discard the connection
-            posix.close(fd);
+            _ = std.c.close(fd);
             self.cached_fd = null;
         }
 

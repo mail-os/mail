@@ -64,7 +64,7 @@ pub const Pop3Session = struct {
             .allocator = allocator,
             .stream = stream,
             .state = .authorization,
-            .messages = std.ArrayList(Pop3Message){},
+            .messages = .empty,
             .auth_backend = auth_backend,
         };
     }
@@ -81,7 +81,7 @@ pub const Pop3Session = struct {
 
     /// Send +OK response
     pub fn sendOk(self: *Pop3Session, message: []const u8) !void {
-        var response = std.ArrayList(u8){};
+        var response: std.ArrayList(u8) = .empty;
         defer response.deinit(self.allocator);
 
         const writer = response.writer(self.allocator);
@@ -92,7 +92,7 @@ pub const Pop3Session = struct {
 
     /// Send -ERR response
     pub fn sendErr(self: *Pop3Session, message: []const u8) !void {
-        var response = std.ArrayList(u8){};
+        var response: std.ArrayList(u8) = .empty;
         defer response.deinit(self.allocator);
 
         const writer = response.writer(self.allocator);
@@ -586,7 +586,7 @@ pub const Pop3Server = struct {
         return .{
             .allocator = allocator,
             .config = config,
-            .sessions = std.ArrayList(*Pop3Session){},
+            .sessions = .empty,
             .running = std.atomic.Value(bool).init(false),
             .auth_backend = auth_backend,
         };

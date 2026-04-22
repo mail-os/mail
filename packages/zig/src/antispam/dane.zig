@@ -226,7 +226,7 @@ pub const TLSARecord = struct {
 
         // Remaining content is the certificate association data (hex encoded)
         // Collect all remaining parts (data may contain spaces)
-        var data_buf: std.ArrayList(u8) = .{};
+        var data_buf: std.ArrayList(u8) = .empty;
         defer data_buf.deinit(allocator);
 
         while (parts.next()) |part| {
@@ -467,7 +467,7 @@ pub const DANEPolicyCache = struct {
 
     /// Remove all expired entries from the cache.
     pub fn evictExpired(self: *DANEPolicyCache) void {
-        var to_remove: std.ArrayList([]const u8) = .{};
+        var to_remove: std.ArrayList([]const u8) = .empty;
         defer to_remove.deinit(self.allocator);
 
         var it = self.policies.iterator();

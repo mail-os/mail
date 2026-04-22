@@ -312,7 +312,7 @@ pub const BenchmarkSuite = struct {
     pub fn init(allocator: std.mem.Allocator, name: []const u8) BenchmarkSuite {
         return .{
             .allocator = allocator,
-            .results = std.ArrayList(BenchmarkResult){},
+            .results = .empty,
             .suite_name = name,
             .start_time = time_compat.timestamp(),
             .end_time = 0,
@@ -340,7 +340,7 @@ pub const BenchmarkSuite = struct {
         }
 
         // Build JSON using fmt.allocPrint
-        var json_parts = std.ArrayList(u8){};
+        var json_parts: std.ArrayList(u8) = .empty;
         defer json_parts.deinit(self.allocator);
 
         // Header

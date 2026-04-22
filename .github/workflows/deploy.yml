@@ -23,14 +23,6 @@ jobs:
       with:
         version: 0.17.0-dev.56+a8226cd53
 
-    - name: Setup Pantry
-      uses: home-lang/pantry/packages/action@main
-
-    - name: Install SQLite
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libsqlite3-dev
-
     - name: Build for Linux x86_64
       working-directory: packages/zig
       run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast

@@ -19,7 +19,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const zig_cli_module = zig_cli_dep.module("zig-cli");
+    const zig_cli_module = zig_cli_dep.module("zig_cli");
+
+    // Translate sqlite3.h into a Zig module (replaces @cImport in source files)
+    const sqlite_module = sqliteModule(b, target, optimize);
 
     if (build_all_targets) {
         // Build for all supported targets
@@ -50,6 +53,7 @@ pub fn build(b: *std.Build) void {
     });
     mail_module.addImport("tls", tls_module);
     mail_module.addImport("zig-cli", zig_cli_module);
+    mail_module.addImport("sqlite", sqlite_module);
 
     const mail_exe = b.addExecutable(.{
         .name = "mail",
@@ -113,6 +117,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         test_module.addImport("tls", tls_module);
+        test_module.addImport("sqlite", sqlite_module);
         test_module.linkSystemLibrary("sqlite3", .{});
 
         const unit_tests = b.addTest(.{
@@ -210,6 +215,7 @@ fn buildForTarget(
     });
     root_module.addImport("tls", tls_module);
     root_module.addImport("zig-cli", zig_cli_module);
+    root_module.addImport("sqlite", sqliteModule(b, target, optimize));
 
     const exe = b.addExecutable(.{
         .name = b.fmt("mail-{s}", .{triple}),
@@ -226,6 +232,21 @@ fn buildForTarget(
         },
     });
     b.getInstallStep().dependOn(&install.step);
+}
+
+/// Build a Zig module from the vendored sqlite3.h via translate-c.
+fn sqliteModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const translate = b.addTranslateC(.{
+        .root_source_file = b.path("vendor/sqlite3.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    return translate.createModule();
 }
 
 /// Link platform-specific libraries

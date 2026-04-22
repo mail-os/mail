@@ -1,9 +1,7 @@
 const std = @import("std");
 const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
-const sqlite = @cImport({
-    @cInclude("sqlite3.h");
-});
+const sqlite = @import("sqlite");
 
 pub const DatabaseError = error{
     OpenFailed,
@@ -1369,7 +1367,7 @@ pub const Database = struct {
         _ = sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null);
 
         // Collect IDs to delete
-        var ids_to_delete = std.ArrayList(i64){};
+        var ids_to_delete: std.ArrayList(i64) = .empty;
         defer ids_to_delete.deinit(self.allocator);
 
         while (true) {

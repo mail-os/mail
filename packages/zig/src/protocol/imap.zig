@@ -249,8 +249,8 @@ pub const Mailbox = struct {
             .path = try allocator.dupe(u8, path),
             .uidvalidity = @intCast(time_compat.timestamp()),
             .uidnext = 1,
-            .flags = std.ArrayList([]const u8){},
-            .permanent_flags = std.ArrayList([]const u8){},
+            .flags = .empty,
+            .permanent_flags = .empty,
         };
     }
 
@@ -663,7 +663,7 @@ pub const ImapSession = struct {
             .allocator = allocator,
             .connection = connection,
             .state = .not_authenticated,
-            .command_buffer = std.ArrayList(u8){},
+            .command_buffer = .empty,
             .auth_backend = auth_backend,
             .db = db,
             .tls_connection = null,
@@ -2093,7 +2093,7 @@ pub const ImapSession = struct {
         fs_compat.ensureDir(dest_dir) catch {};
 
         // Collect sequence numbers to move, then process in reverse for correct EXPUNGE numbering
-        var to_move = std.ArrayList(u32){};
+        var to_move: std.ArrayList(u32) = .empty;
         defer to_move.deinit(self.allocator);
 
         var iter = SequenceIterator.init(sequence_set, files.len);
@@ -2748,7 +2748,7 @@ pub const ImapServer = struct {
         var server = ImapServer{
             .allocator = allocator,
             .config = config,
-            .sessions = std.ArrayList(*ImapSession){},
+            .sessions = .empty,
             .running = std.atomic.Value(bool).init(false),
             .auth_backend = auth_backend,
             .db = db,

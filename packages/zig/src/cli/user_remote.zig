@@ -139,7 +139,7 @@ fn runRemoteCommand(allocator: std.mem.Allocator, instance_id: []const u8, remot
 }
 
 fn buildRemoteParams(allocator: std.mem.Allocator, args: []const []const u8) ![]const u8 {
-    var cmd_parts = std.ArrayList(u8){};
+    var cmd_parts: std.ArrayList(u8) = .empty;
     defer cmd_parts.deinit(allocator);
 
     try cmd_parts.appendSlice(allocator, "commands=[\"");

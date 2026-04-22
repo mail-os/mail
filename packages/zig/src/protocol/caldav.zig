@@ -203,7 +203,7 @@ fn xmlEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     }
     if (!needs_escape) return try allocator.dupe(u8, input);
 
-    var result: std.ArrayList(u8) = .{};
+    var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
 
     for (input) |c| {
@@ -473,7 +473,7 @@ pub const CalDavSession = struct {
         const user_id = self.getUserId() catch 1;
 
         // Build XML response using dynamic buffer
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
 
         switch (parsed.path_type) {
@@ -1274,7 +1274,7 @@ pub const CalDavSession = struct {
             }
         }
 
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
 
         try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
@@ -1323,7 +1323,7 @@ pub const CalDavSession = struct {
         _ = path;
         const user_id = self.getUserId() catch 1;
 
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
 
         try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
@@ -1382,7 +1382,7 @@ pub const CalDavSession = struct {
         const parsed = parsePath(path);
         const user_id = self.getUserId() catch 1;
 
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
 
         try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
@@ -1426,7 +1426,7 @@ pub const CalDavSession = struct {
         _ = path;
         const user_id = self.getUserId() catch 1;
 
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
 
         try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
@@ -1533,7 +1533,7 @@ pub const CalDavSession = struct {
             return;
         };
 
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
 
         try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");

@@ -126,7 +126,7 @@ pub const BDATSession = struct {
     pub fn init(allocator: std.mem.Allocator) BDATSession {
         return .{
             .allocator = allocator,
-            .chunks = .{},
+            .chunks = .empty,
             .total_size = 0,
             .completed = false,
         };

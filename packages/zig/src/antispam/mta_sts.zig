@@ -114,7 +114,7 @@ pub const MTASTSPolicy = struct {
     }
 
     pub fn format(self: *const MTASTSPolicy, allocator: std.mem.Allocator) ![]u8 {
-        var out: std.ArrayList(u8) = .{};
+        var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(allocator);
         try out.print(allocator, "version: {s}\nmode: {s}\n", .{ self.version, self.mode.toString() });
         for (self.mx_patterns.items) |p| try out.print(allocator, "mx: {s}\n", .{p});
@@ -303,7 +303,7 @@ pub const MTASTSPolicyCache = struct {
     }
 
     fn evictExpiredLocked(self: *MTASTSPolicyCache) !void {
-        var to_remove: std.ArrayList([]const u8) = .{};
+        var to_remove: std.ArrayList([]const u8) = .empty;
         defer to_remove.deinit(self.allocator);
         var it = self.entries.iterator();
         while (it.next()) |kv| {

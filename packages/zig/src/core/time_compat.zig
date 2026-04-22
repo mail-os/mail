@@ -33,7 +33,7 @@ pub fn readFileToEnd(allocator: std.mem.Allocator, file: std.Io.File, max_size: 
     const size: usize = @intCast(@min(file_len, max_size));
     if (size == 0) {
         // For files with unknown size (like /dev/stdin), read in chunks
-        var list = std.ArrayListUnmanaged(u8){};
+        var list: std.ArrayListUnmanaged(u8) = .empty;
         errdefer list.deinit(allocator);
         var buf: [4096]u8 = undefined;
         var iov = [_][]u8{buf[0..]};

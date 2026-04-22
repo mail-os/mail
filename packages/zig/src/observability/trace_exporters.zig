@@ -93,7 +93,7 @@ pub const SpanData = struct {
             .start_time_ns = @intCast(std.time.nanoTimestamp()),
             .end_time_ns = 0,
             .attributes = std.StringHashMap([]const u8).init(allocator),
-            .events = std.ArrayList(SpanEvent){},
+            .events = .empty,
         };
     }
 
@@ -171,7 +171,7 @@ pub const BatchSpanExporter = struct {
         return .{
             .allocator = allocator,
             .config = config,
-            .spans = std.ArrayList(SpanData){},
+            .spans = .empty,
             .should_stop = std.atomic.Value(bool).init(false),
         };
     }
@@ -263,7 +263,7 @@ pub const BatchSpanExporter = struct {
 
         // Create UDP socket
         const sock = try std.posix.socket(address.any.family, std.posix.SOCK.DGRAM, std.posix.IPPROTO.UDP);
-        defer std.posix.close(sock);
+        defer _ = std.c.close(sock);
 
         // Serialize spans to Jaeger Thrift format
         var buffer = std.ArrayList(u8).init(self.allocator);

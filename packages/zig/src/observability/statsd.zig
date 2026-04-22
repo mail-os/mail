@@ -37,7 +37,7 @@ pub const StatsDClient = struct {
             self.allocator.free(p);
         }
         if (self.socket_fd) |fd| {
-            posix.close(fd);
+            _ = std.c.close(fd);
         }
     }
 
@@ -180,7 +180,7 @@ pub const StatsDClient = struct {
             std.posix.SOCK.DGRAM,
             std.posix.IPPROTO.UDP,
         );
-        defer std.posix.close(sock);
+        defer _ = std.c.close(sock);
 
         _ = try std.posix.sendto(
             sock,
@@ -214,7 +214,7 @@ pub const StatsDClient = struct {
             std.posix.SOCK.DGRAM,
             std.posix.IPPROTO.UDP,
         );
-        defer std.posix.close(sock);
+        defer _ = std.c.close(sock);
 
         _ = try std.posix.sendto(
             sock,

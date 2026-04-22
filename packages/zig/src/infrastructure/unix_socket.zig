@@ -75,13 +75,13 @@ pub const UnixListener = struct {
             posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
             0,
         );
-        errdefer posix.close(sockfd);
+        errdefer _ = std.c.close(sockfd);
 
         // Remove existing socket file if it exists (non-abstract)
         if (!address.abstract) {
             std.fs.deleteFileAbsolute(address.path) catch |err| {
                 if (err != error.FileNotFound) {
-                    posix.close(sockfd);
+                    _ = std.c.close(sockfd);
                     return err;
                 }
             };
@@ -101,7 +101,7 @@ pub const UnixListener = struct {
     }
 
     pub fn deinit(self: *UnixListener) void {
-        posix.close(self.sockfd);
+        _ = std.c.close(self.sockfd);
 
         // Clean up socket file (non-abstract)
         if (!self.address.abstract) {
@@ -168,7 +168,7 @@ pub const UnixStream = struct {
             posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
             0,
         );
-        errdefer posix.close(sockfd);
+        errdefer _ = std.c.close(sockfd);
 
         // Connect
         try connectUnixSocket(sockfd, address);
@@ -180,7 +180,7 @@ pub const UnixStream = struct {
     }
 
     pub fn deinit(self: *UnixStream) void {
-        posix.close(self.sockfd);
+        _ = std.c.close(self.sockfd);
     }
 
     /// Read from socket
@@ -265,7 +265,7 @@ pub const UnixDatagram = struct {
             posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
             0,
         );
-        errdefer posix.close(sockfd);
+        errdefer _ = std.c.close(sockfd);
 
         // Bind if address provided
         if (address) |addr| {
@@ -273,7 +273,7 @@ pub const UnixDatagram = struct {
             if (!addr.abstract) {
                 std.fs.deleteFileAbsolute(addr.path) catch |err| {
                     if (err != error.FileNotFound) {
-                        posix.close(sockfd);
+                        _ = std.c.close(sockfd);
                         return err;
                     }
                 };
@@ -290,7 +290,7 @@ pub const UnixDatagram = struct {
     }
 
     pub fn deinit(self: *UnixDatagram) void {
-        posix.close(self.sockfd);
+        _ = std.c.close(self.sockfd);
 
         // Clean up socket file (non-abstract)
         if (self.address) |addr| {

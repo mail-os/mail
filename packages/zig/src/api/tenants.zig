@@ -325,7 +325,7 @@ pub const TenantsAPI = struct {
             }
         }
         if (!needs_escape) return try allocator.dupe(u8, s);
-        var result: std.ArrayList(u8) = .{};
+        var result: std.ArrayList(u8) = .empty;
         errdefer result.deinit(allocator);
         for (s) |c| {
             switch (c) {

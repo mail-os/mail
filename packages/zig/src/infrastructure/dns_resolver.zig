@@ -342,7 +342,7 @@ pub const DNSCache = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var to_remove: std.ArrayList([]const u8) = .{};
+        var to_remove: std.ArrayList([]const u8) = .empty;
         defer to_remove.deinit(self.allocator);
 
         var it = self.cache.iterator();

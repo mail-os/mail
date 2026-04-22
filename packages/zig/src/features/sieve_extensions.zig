@@ -237,7 +237,7 @@ pub const SieveExtensionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var list: std.ArrayList([]const u8) = .{};
+        var list: std.ArrayList([]const u8) = .empty;
         errdefer list.deinit(allocator);
 
         var it = self.extensions.iterator();
@@ -255,7 +255,7 @@ pub const SieveExtensionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var list: std.ArrayList([]const u8) = .{};
+        var list: std.ArrayList([]const u8) = .empty;
         errdefer list.deinit(allocator);
 
         var it = self.extensions.iterator();
@@ -281,13 +281,13 @@ pub const SieveExtensionRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var missing: std.ArrayList([]const u8) = .{};
+        var missing: std.ArrayList([]const u8) = .empty;
         errdefer missing.deinit(allocator);
 
-        var disabled: std.ArrayList([]const u8) = .{};
+        var disabled: std.ArrayList([]const u8) = .empty;
         errdefer disabled.deinit(allocator);
 
-        var dep_errors: std.ArrayList(ValidationResult.DependencyError) = .{};
+        var dep_errors: std.ArrayList(ValidationResult.DependencyError) = .empty;
         errdefer dep_errors.deinit(allocator);
 
         for (required) |cap| {

@@ -260,7 +260,7 @@ pub const Listener = struct {
             posix.SOCK.STREAM | posix.SOCK.NONBLOCK,
             posix.IPPROTO.TCP,
         );
-        errdefer posix.close(sock);
+        errdefer _ = std.c.close(sock);
 
         // Set socket options
         const one: u32 = 1;
@@ -275,7 +275,7 @@ pub const Listener = struct {
 
     pub fn close(self: *Self) void {
         if (self.socket) |sock| {
-            posix.close(sock);
+            _ = std.c.close(sock);
             self.socket = null;
         }
         self.running = false;

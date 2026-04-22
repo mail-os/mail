@@ -1195,7 +1195,7 @@ pub const CertificateManager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var entries: std.ArrayList(CertificateSummaryEntry) = .{};
+        var entries: std.ArrayList(CertificateSummaryEntry) = .empty;
         errdefer entries.deinit(self.allocator);
 
         var iter = self.certificates.iterator();

@@ -104,7 +104,7 @@ pub const TLSRPTRecord = struct {
     /// Expected format: "v=TLSRPTv1; rua=mailto:reports@example.com,https://..."
     pub fn parse(allocator: std.mem.Allocator, record_text: []const u8) !TLSRPTRecord {
         var version: ?[]const u8 = null;
-        var rua_list: std.ArrayList([]const u8) = .{};
+        var rua_list: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (rua_list.items) |uri| allocator.free(uri);
             rua_list.deinit(allocator);
@@ -484,7 +484,7 @@ pub const TLSReportAggregator = struct {
         const report_id = try std.fmt.allocPrint(self.allocator, "{d}-{s}", .{ now, domain_name });
         defer self.allocator.free(report_id);
 
-        var json: std.ArrayList(u8) = .{};
+        var json: std.ArrayList(u8) = .empty;
         defer json.deinit(self.allocator);
 
         try json.appendSlice(self.allocator, "{\n");
@@ -657,7 +657,7 @@ pub const TLSReportGenerator = struct {
     /// Generate a complete TLS-RPT JSON report from a TLSReport struct.
     /// The caller owns the returned memory.
     pub fn formatReport(self: *TLSReportGenerator, report: *const TLSReport) ![]const u8 {
-        var json: std.ArrayList(u8) = .{};
+        var json: std.ArrayList(u8) = .empty;
         defer json.deinit(self.allocator);
 
         try json.appendSlice(self.allocator, "{\n");
@@ -1137,7 +1137,7 @@ test "TLSReportGenerator formatReport multiple policies" {
 test "appendJsonEscaped handles special characters" {
     const testing = std.testing;
 
-    var buf: std.ArrayList(u8) = .{};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
 
     try appendJsonEscaped(&buf, testing.allocator, "hello \"world\"");

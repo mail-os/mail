@@ -86,7 +86,7 @@ pub fn sendWebhook(allocator: std.mem.Allocator, cfg: WebhookConfig, payload: We
         return;
     }
     const fd: posix.socket_t = @intCast(raw_fd);
-    defer posix.close(fd);
+    defer _ = std.c.close(fd);
 
     // Connect
     const sockaddr = posix.sockaddr.in{
@@ -140,7 +140,7 @@ pub fn sendWebhook(allocator: std.mem.Allocator, cfg: WebhookConfig, payload: We
 fn formatRecipients(allocator: std.mem.Allocator, recipients: []const []const u8) ![]u8 {
     if (recipients.len == 0) return try allocator.dupe(u8, "");
 
-    var result = std.ArrayList(u8){};
+    var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
 
     for (recipients, 0..) |rcpt, i| {
@@ -166,7 +166,7 @@ pub fn escapeJsonString(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     }
     if (!needs_escape) return try allocator.dupe(u8, s);
 
-    var result: std.ArrayList(u8) = .{};
+    var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
 
     for (s) |c| {

@@ -224,7 +224,7 @@ pub const ARCMessageSignature = struct {
 
     /// Format as a complete header line
     pub fn format(self: *const ARCMessageSignature, allocator: std.mem.Allocator) ![]u8 {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
 
         try buf.print(
@@ -334,7 +334,7 @@ pub const ARCSeal = struct {
 
     /// Format as a complete header line
     pub fn format(self: *const ARCSeal, allocator: std.mem.Allocator) ![]u8 {
-        var buf: std.ArrayList(u8) = .{};
+        var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(allocator);
 
         try buf.print(
@@ -581,19 +581,19 @@ pub const ARCValidator = struct {
         errdefer chain.deinit();
 
         // Collect individual ARC headers
-        var aars: std.ArrayList(ARCAuthenticationResults) = .{};
+        var aars: std.ArrayList(ARCAuthenticationResults) = .empty;
         defer {
             for (aars.items) |*aar| aar.deinit();
             aars.deinit(self.allocator);
         }
 
-        var amss: std.ArrayList(ARCMessageSignature) = .{};
+        var amss: std.ArrayList(ARCMessageSignature) = .empty;
         defer {
             for (amss.items) |*ams| ams.deinit();
             amss.deinit(self.allocator);
         }
 
-        var seals: std.ArrayList(ARCSeal) = .{};
+        var seals: std.ArrayList(ARCSeal) = .empty;
         defer {
             for (seals.items) |*seal| seal.deinit();
             seals.deinit(self.allocator);
@@ -602,7 +602,7 @@ pub const ARCValidator = struct {
         // Parse headers line by line, handling folded headers (continuation lines)
         var lines = std.mem.splitSequence(u8, headers, "\r\n");
         var current_header_name: ?[]const u8 = null;
-        var current_value: std.ArrayList(u8) = .{};
+        var current_value: std.ArrayList(u8) = .empty;
         defer current_value.deinit(self.allocator);
 
         while (lines.next()) |line| {
@@ -1011,7 +1011,7 @@ pub const ARCSealer = struct {
 
     /// Extract header names from the message for the h= tag.
     fn extractSignedHeaderNames(self: *ARCSealer, headers: []const u8) ![]u8 {
-        var names: std.ArrayList(u8) = .{};
+        var names: std.ArrayList(u8) = .empty;
         errdefer names.deinit(self.allocator);
 
         var seen = std.StringHashMap(void).init(self.allocator);
