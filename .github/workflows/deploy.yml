@@ -23,6 +23,9 @@ jobs:
       with:
         version: 0.17.0-dev.56+a8226cd53
 
+    - name: Setup Pantry
+      uses: home-lang/pantry/packages/action@main
+
     - name: Install SQLite
       run: |
         sudo apt-get update
