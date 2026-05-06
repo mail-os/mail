@@ -47,6 +47,10 @@ pub const Config = struct {
     rate_limit_cleanup_interval: u64,
     max_recipients: usize,
     hostname: []const u8,
+    /// Additional domains this server accepts mail for, beyond `hostname`
+    /// and its parent. Populated from TOML `server.hosted_domains` (comma-
+    /// separated string) or env `SMTP_HOSTED_DOMAINS`.
+    hosted_domains: []const []const u8 = &.{},
     webhook_url: ?[]const u8,
     webhook_enabled: bool,
     enable_dnsbl: bool,
@@ -86,6 +90,22 @@ pub const Config = struct {
         if (self.webhook_url) |url| allocator.free(url);
         if (self.acme_email) |email| allocator.free(email);
         if (self.list_unsubscribe_url) |url| allocator.free(url);
+        for (self.hosted_domains) |domain| allocator.free(domain);
+        if (self.hosted_domains.len > 0) allocator.free(self.hosted_domains);
+    }
+
+    /// Returns true if `domain` is one this server accepts mail for:
+    /// `hostname`, the parent of `hostname` (e.g. `mail.X` accepts `X`),
+    /// or any entry in `hosted_domains`. Match is case-insensitive.
+    pub fn isLocalDomain(self: Config, domain: []const u8) bool {
+        if (std.ascii.eqlIgnoreCase(domain, self.hostname)) return true;
+        if (std.mem.indexOfScalar(u8, self.hostname, '.')) |dot_pos| {
+            if (std.ascii.eqlIgnoreCase(domain, self.hostname[dot_pos + 1 ..])) return true;
+        }
+        for (self.hosted_domains) |hosted| {
+            if (std.ascii.eqlIgnoreCase(domain, hosted)) return true;
+        }
+        return false;
     }
 
     /// Validates the configuration and returns detailed error messages
@@ -265,6 +285,31 @@ pub fn loadConfig(allocator: std.mem.Allocator, cli_args: args.Args) !Config {
     return cfg;
 }
 
+/// Parse a comma-separated list of domain names into an owned slice of
+/// allocator-owned strings. Empty entries and surrounding whitespace are
+/// trimmed; an empty input yields a zero-length slice.
+fn parseDomainList(allocator: std.mem.Allocator, raw: []const u8) ![]const []const u8 {
+    var list = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (list.items) |item| allocator.free(item);
+        list.deinit(allocator);
+    }
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const dup = try allocator.dupe(u8, trimmed);
+        errdefer allocator.free(dup);
+        try list.append(allocator, dup);
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+fn freeDomainList(allocator: std.mem.Allocator, list: []const []const u8) void {
+    for (list) |entry| allocator.free(entry);
+    if (list.len > 0) allocator.free(list);
+}
+
 /// Determine which configuration profile to use
 fn determineProfile() config_profiles.Profile {
     if (env.get("SMTP_PROFILE")) |profile_str| {
@@ -304,6 +349,7 @@ fn loadDefaultsFromProfile(allocator: std.mem.Allocator, profile: config_profile
         .rate_limit_cleanup_interval = @as(u64, profile_config.rate_limit_window_seconds) * 60, // Convert to seconds
         .max_recipients = @intCast(profile_config.max_recipients),
         .hostname = try allocator.dupe(u8, "localhost"),
+        .hosted_domains = try allocator.alloc([]const u8, 0),
         .webhook_url = null,
         .webhook_enabled = false, // Only enable when URL is provided via env var
         .enable_dnsbl = false, // Not in profile config yet
@@ -346,6 +392,13 @@ fn applyEnvironmentVariables(allocator: std.mem.Allocator, cfg: *Config) !void {
     if (env.get("SMTP_HOSTNAME")) |value| {
         allocator.free(cfg.hostname);
         cfg.hostname = try allocator.dupe(u8, value);
+    }
+
+    // SMTP_HOSTED_DOMAINS — comma-separated list of additional hosted domains
+    if (env.get("SMTP_HOSTED_DOMAINS")) |value| {
+        const parsed = try parseDomainList(allocator, value);
+        freeDomainList(allocator, cfg.hosted_domains);
+        cfg.hosted_domains = parsed;
     }
 
     // SMTP_MAX_CONNECTIONS
@@ -568,6 +621,12 @@ fn applyConfigFile(allocator: std.mem.Allocator, cfg: *Config, path: []const u8)
         if (server.getString("hostname")) |value| {
             allocator.free(cfg.hostname);
             cfg.hostname = try allocator.dupe(u8, value);
+        }
+        // Comma-separated string until the TOML parser supports arrays.
+        if (server.getString("hosted_domains")) |value| {
+            const parsed = try parseDomainList(allocator, value);
+            freeDomainList(allocator, cfg.hosted_domains);
+            cfg.hosted_domains = parsed;
         }
         if (server.getInt("max_connections")) |value| {
             cfg.max_connections = @intCast(value);
