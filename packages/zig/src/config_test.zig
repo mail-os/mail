@@ -268,3 +268,73 @@ test "authentication configuration flags" {
 
     try testing.expectEqual(false, cfg_auth_off.enable_auth);
 }
+
+fn baseCfg(hostname: []const u8, hosted: []const []const u8) config.Config {
+    return .{
+        .host = "0.0.0.0",
+        .port = 2525,
+        .max_connections = 100,
+        .enable_tls = false,
+        .tls_cert_path = null,
+        .tls_key_path = null,
+        .enable_auth = true,
+        .max_message_size = 10 * 1024 * 1024,
+        .timeout_seconds = 300,
+        .data_timeout_seconds = 600,
+        .command_timeout_seconds = 300,
+        .greeting_timeout_seconds = 30,
+        .rate_limit_per_ip = 100,
+        .rate_limit_per_user = 200,
+        .rate_limit_cleanup_interval = 3600,
+        .max_recipients = 100,
+        .hostname = hostname,
+        .hosted_domains = hosted,
+        .webhook_url = null,
+        .webhook_enabled = false,
+        .enable_dnsbl = false,
+        .enable_greylist = false,
+        .enable_tracing = false,
+        .tracing_service_name = "mail",
+        .enable_json_logging = false,
+    };
+}
+
+test "isLocalDomain matches hostname exactly" {
+    const cfg = baseCfg("mail.stacksjs.com", &.{});
+    try testing.expect(cfg.isLocalDomain("mail.stacksjs.com"));
+}
+
+test "isLocalDomain matches parent of hostname" {
+    const cfg = baseCfg("mail.stacksjs.com", &.{});
+    try testing.expect(cfg.isLocalDomain("stacksjs.com"));
+}
+
+test "isLocalDomain matches an entry in hosted_domains" {
+    const extras = [_][]const u8{ "paweldregan.com", "example.org" };
+    const cfg = baseCfg("mail.stacksjs.com", &extras);
+    try testing.expect(cfg.isLocalDomain("paweldregan.com"));
+    try testing.expect(cfg.isLocalDomain("example.org"));
+}
+
+test "isLocalDomain is case-insensitive" {
+    const extras = [_][]const u8{"paweldregan.com"};
+    const cfg = baseCfg("mail.stacksjs.com", &extras);
+    try testing.expect(cfg.isLocalDomain("MAIL.Stacksjs.COM"));
+    try testing.expect(cfg.isLocalDomain("StacksJS.COM"));
+    try testing.expect(cfg.isLocalDomain("PaWeLdReGaN.com"));
+}
+
+test "isLocalDomain rejects unrelated domains" {
+    const extras = [_][]const u8{"paweldregan.com"};
+    const cfg = baseCfg("mail.stacksjs.com", &extras);
+    try testing.expect(!cfg.isLocalDomain("evil.example"));
+    try testing.expect(!cfg.isLocalDomain("notstacksjs.com"));
+    try testing.expect(!cfg.isLocalDomain(""));
+}
+
+test "isLocalDomain has no parent for single-label hostname" {
+    // "localhost" has no '.' so there's no parent to match
+    const cfg = baseCfg("localhost", &.{});
+    try testing.expect(cfg.isLocalDomain("localhost"));
+    try testing.expect(!cfg.isLocalDomain("host"));
+}

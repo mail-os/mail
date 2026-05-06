@@ -672,19 +672,12 @@ pub const Session = struct {
             return;
         }
 
-        // Prevent open relay: unauthenticated clients can only send to local domain
+        // Prevent open relay: unauthenticated clients can only send to a local domain
+        // (hostname, its parent, or any entry in config.hosted_domains).
         if (!self.authenticated) {
             if (std.mem.indexOf(u8, addr, "@")) |at_pos| {
                 const recipient_domain = addr[at_pos + 1 ..];
-                // Check if recipient domain matches hostname or is the parent domain
-                // e.g. hostname "mail.stacksjs.com" should accept mail for "stacksjs.com"
-                const is_local = std.ascii.eqlIgnoreCase(recipient_domain, self.config.hostname) or blk: {
-                    if (std.mem.indexOf(u8, self.config.hostname, ".")) |dot_pos| {
-                        break :blk std.ascii.eqlIgnoreCase(recipient_domain, self.config.hostname[dot_pos + 1 ..]);
-                    }
-                    break :blk false;
-                };
-                if (!is_local) {
+                if (!self.config.isLocalDomain(recipient_domain)) {
                     self.logger.logSecurityEvent(self.remote_addr, "Relay access denied for unauthenticated sender");
                     try self.sendResponse(writer, 550, "5.7.1 Relay access denied", null);
                     return;
@@ -1357,18 +1350,12 @@ pub const Session = struct {
         const sender = self.mail_from orelse "unknown";
 
         for (self.rcpt_to.items) |rcpt| {
-            // Determine if recipient is local or external
-            // Compare against hostname and its parent domain (mail.stacksjs.com -> stacksjs.com)
-            const is_local = if (std.mem.indexOf(u8, rcpt, "@")) |at_pos| blk: {
-                const rcpt_domain = rcpt[at_pos + 1 ..];
-                if (std.mem.eql(u8, rcpt_domain, self.config.hostname)) break :blk true;
-                // Also check parent domain: if hostname is "mail.X", accept "X" as local
-                if (std.mem.indexOf(u8, self.config.hostname, ".")) |dot_pos| {
-                    const parent_domain = self.config.hostname[dot_pos + 1 ..];
-                    if (std.mem.eql(u8, rcpt_domain, parent_domain)) break :blk true;
-                }
-                break :blk false;
-            } else true;
+            // Determine if recipient is local or external. A bare address with
+            // no '@' is treated as local (legacy local-user delivery).
+            const is_local = if (std.mem.indexOf(u8, rcpt, "@")) |at_pos|
+                self.config.isLocalDomain(rcpt[at_pos + 1 ..])
+            else
+                true;
 
             if (is_local) {
                 // Local delivery: save to Maildir
@@ -1500,16 +1487,11 @@ pub const Session = struct {
 
             self.logger.info("Auto-forwarding from {s} to {s}", .{ username, forward_to });
 
-            // Check if forward target is a local address
-            const is_local_forward = if (std.mem.indexOf(u8, forward_to, "@")) |at_pos| blk: {
-                const fwd_domain = forward_to[at_pos + 1 ..];
-                if (std.mem.eql(u8, fwd_domain, self.config.hostname)) break :blk true;
-                if (std.mem.indexOf(u8, self.config.hostname, ".")) |dot_pos| {
-                    const parent_domain = self.config.hostname[dot_pos + 1 ..];
-                    if (std.mem.eql(u8, fwd_domain, parent_domain)) break :blk true;
-                }
-                break :blk false;
-            } else true;
+            // Check if forward target is a local address.
+            const is_local_forward = if (std.mem.indexOf(u8, forward_to, "@")) |at_pos|
+                self.config.isLocalDomain(forward_to[at_pos + 1 ..])
+            else
+                true;
 
             if (is_local_forward) {
                 // Local forward: save directly to recipient's mailbox
