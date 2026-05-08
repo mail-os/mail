@@ -1,7 +1,7 @@
 {
   "name": "ts-mail",
   "type": "module",
-  "version": "0.28.0",
+  "version": "0.1.0",
   "description": "A high-performance SMTP server powered by Zig",
   "author": "Chris Breuer",
   "license": "MIT",

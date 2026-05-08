@@ -1,17 +1,14 @@
 # Changelog
 
-## [0.0.2] - 2025-12-27
+## [0.1.0] - 2026-05-08
 
 ### Features
 
-- feat: add all platform builds and pantry config
+- feat: publish the first Pantry-managed Linux mail binary release
 
 ### Chores
 
-- chore: add release script using zig-bump
-- chore: wip
-- chore: wip
-- chore: wip
+- chore: package the EC2 deploy binary as `mail-x86_64-linux.tar.gz`
 
 All notable changes to the SMTP Server project are documented in this file.
 
