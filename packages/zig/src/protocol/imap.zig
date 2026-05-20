@@ -611,6 +611,49 @@ fn extractQuotedArg(rest: []const u8) []const u8 {
     return trimmed[0..end];
 }
 
+const ParsedImapArg = struct {
+    value: []const u8,
+    rest: []const u8,
+};
+
+/// Parse one IMAP astring from a command remainder.
+/// Unlike whitespace splitting, this keeps quoted mailbox names like
+/// "All Mail" together and returns the remainder after the argument.
+fn parseImapArg(rest: []const u8) ?ParsedImapArg {
+    const trimmed = std.mem.trimStart(u8, rest, " \t");
+    if (trimmed.len == 0) return null;
+
+    if (trimmed[0] == '"') {
+        var i: usize = 1;
+        while (i < trimmed.len) : (i += 1) {
+            if (trimmed[i] == '"' and (i == 1 or trimmed[i - 1] != '\\')) {
+                return .{
+                    .value = trimmed[1..i],
+                    .rest = std.mem.trimStart(u8, trimmed[i + 1 ..], " \t"),
+                };
+            }
+        }
+
+        return .{ .value = trimmed[1..], .rest = "" };
+    }
+
+    if (trimmed.len >= "All Mail".len and std.ascii.eqlIgnoreCase(trimmed[0.."All Mail".len], "All Mail")) {
+        const arg_end = "All Mail".len;
+        if (trimmed.len == arg_end or trimmed[arg_end] == ' ' or trimmed[arg_end] == '\t') {
+            return .{
+                .value = trimmed[0..arg_end],
+                .rest = std.mem.trimStart(u8, trimmed[arg_end..], " \t"),
+            };
+        }
+    }
+
+    const end = std.mem.indexOfAny(u8, trimmed, " \t") orelse trimmed.len;
+    return .{
+        .value = trimmed[0..end],
+        .rest = std.mem.trimStart(u8, trimmed[end..], " \t"),
+    };
+}
+
 /// Rename a file in the same directory using libc.
 fn renameFile(old_path: []const u8, new_path: []const u8) bool {
     var old_buf: [4097]u8 = undefined;
@@ -967,27 +1010,136 @@ pub const ImapSession = struct {
 
     /// Count messages in a mailbox folder
     fn countMailboxMessages(self: *ImapSession, mailbox_name: []const u8) usize {
-        const username = self.username orelse return 0;
+        return self.countMailboxStats(mailbox_name).messages;
+    }
+
+    const MailboxStats = struct {
+        messages: usize = 0,
+        unseen: usize = 0,
+        recent: usize = 0,
+    };
+
+    fn countDirStats(self: *ImapSession, path: []const u8) MailboxStats {
+        const files = fs_compat.listEmlFiles(self.allocator, path) catch return .{};
+        defer {
+            for (files) |f| self.allocator.free(f);
+            self.allocator.free(files);
+        }
+
+        var stats = MailboxStats{ .messages = files.len };
+        for (files) |fname| {
+            const flags = MaildirFlags.fromFilename(fname);
+            if (!flags.seen) stats.unseen += 1;
+        }
+        return stats;
+    }
+
+    fn addDirStats(self: *ImapSession, stats: *MailboxStats, path: []const u8) void {
+        const next = self.countDirStats(path);
+        stats.messages += next.messages;
+        stats.unseen += next.unseen;
+        stats.recent += next.recent;
+    }
+
+    fn countMailboxStats(self: *ImapSession, mailbox_name: []const u8) MailboxStats {
+        const username = self.username orelse return .{};
         const local_part = if (std.mem.indexOfScalar(u8, username, '@')) |at_pos|
             username[0..at_pos]
         else
             username;
 
         const clean_name = stripQuotes(mailbox_name);
+
+        if (std.ascii.eqlIgnoreCase(clean_name, "All Mail") or std.ascii.eqlIgnoreCase(clean_name, "All")) {
+            return self.countAggregateMailboxStats(local_part, false);
+        }
+
+        if (std.ascii.eqlIgnoreCase(clean_name, "Starred")) {
+            return self.countFlaggedStats(local_part);
+        }
+
         const dir_path = if (std.ascii.eqlIgnoreCase(clean_name, "INBOX"))
             std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{local_part})
         else
             std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local_part, clean_name });
 
-        const path = dir_path catch return 0;
+        const path = dir_path catch return .{};
         defer self.allocator.free(path);
 
-        const files = fs_compat.listEmlFiles(self.allocator, path) catch return 0;
-        defer {
-            for (files) |f| self.allocator.free(f);
-            self.allocator.free(files);
+        return self.countDirStats(path);
+    }
+
+    fn shouldIncludeInAggregate(folder: []const u8, include_excluded: bool) bool {
+        if (folder.len == 0 or folder[0] == '.') return false;
+        if (std.mem.eql(u8, folder, "tmp") or std.mem.eql(u8, folder, "cur")) return false;
+        if (!include_excluded and (std.ascii.eqlIgnoreCase(folder, "Trash") or std.ascii.eqlIgnoreCase(folder, "Junk"))) return false;
+        return true;
+    }
+
+    fn countAggregateMailboxStats(self: *ImapSession, local_part: []const u8, include_excluded: bool) MailboxStats {
+        const root = std.fmt.allocPrint(self.allocator, "mail/{s}", .{local_part}) catch return .{};
+        defer self.allocator.free(root);
+
+        var stats = MailboxStats{};
+        const path_z = self.allocator.dupeZ(u8, root) catch return stats;
+        defer self.allocator.free(path_z);
+
+        const dir = std.c.opendir(path_z.ptr) orelse {
+            const inbox_path = std.fmt.allocPrint(self.allocator, "{s}/new", .{root}) catch return stats;
+            defer self.allocator.free(inbox_path);
+            self.addDirStats(&stats, inbox_path);
+            return stats;
+        };
+        defer _ = std.c.closedir(dir);
+
+        while (std.c.readdir(dir)) |entry| {
+            const name_ptr: [*:0]const u8 = @ptrCast(&entry.name);
+            const folder = std.mem.sliceTo(name_ptr, 0);
+            if (!shouldIncludeInAggregate(folder, include_excluded)) continue;
+
+            const path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ root, folder }) catch continue;
+            defer self.allocator.free(path);
+            self.addDirStats(&stats, path);
         }
-        return files.len;
+
+        return stats;
+    }
+
+    fn countFlaggedStats(self: *ImapSession, local_part: []const u8) MailboxStats {
+        var stats = MailboxStats{};
+        const root = std.fmt.allocPrint(self.allocator, "mail/{s}", .{local_part}) catch return stats;
+        defer self.allocator.free(root);
+
+        const path_z = self.allocator.dupeZ(u8, root) catch return stats;
+        defer self.allocator.free(path_z);
+
+        const dir = std.c.opendir(path_z.ptr) orelse return stats;
+        defer _ = std.c.closedir(dir);
+
+        while (std.c.readdir(dir)) |entry| {
+            const name_ptr: [*:0]const u8 = @ptrCast(&entry.name);
+            const folder = std.mem.sliceTo(name_ptr, 0);
+            if (!shouldIncludeInAggregate(folder, false)) continue;
+
+            const path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ root, folder }) catch continue;
+            defer self.allocator.free(path);
+
+            const files = fs_compat.listEmlFiles(self.allocator, path) catch continue;
+            defer {
+                for (files) |f| self.allocator.free(f);
+                self.allocator.free(files);
+            }
+
+            for (files) |fname| {
+                const flags = MaildirFlags.fromFilename(fname);
+                if (!flags.flagged) continue;
+
+                stats.messages += 1;
+                if (!flags.seen) stats.unseen += 1;
+            }
+        }
+
+        return stats;
     }
 
     /// Write data to connection (plain or TLS encrypted)
@@ -1191,23 +1343,24 @@ pub const ImapSession = struct {
         var buf: [1024]u8 = undefined;
         var fbs = io_compat.fixedBufferStream(&buf);
         const writer = fbs.writer();
-        try writer.print("STATUS \"{s}\" (", .{mailbox_name});
+        const clean_mailbox = stripQuotes(mailbox_name);
+        try writer.print("STATUS \"{s}\" (", .{clean_mailbox});
 
-        const msg_count = self.countMailboxMessages(mailbox_name);
+        const stats = self.countMailboxStats(clean_mailbox);
 
         var first = true;
         if (want_messages) {
-            try writer.print("MESSAGES {d}", .{msg_count});
+            try writer.print("MESSAGES {d}", .{stats.messages});
             first = false;
         }
         if (want_recent) {
             if (!first) try writer.writeAll(" ");
-            try writer.writeAll("RECENT 0");
+            try writer.print("RECENT {d}", .{stats.recent});
             first = false;
         }
         if (want_uidnext) {
             if (!first) try writer.writeAll(" ");
-            try writer.print("UIDNEXT {d}", .{msg_count + 1});
+            try writer.print("UIDNEXT {d}", .{stats.messages + 1});
             first = false;
         }
         if (want_uidvalidity) {
@@ -1217,7 +1370,7 @@ pub const ImapSession = struct {
         }
         if (want_unseen) {
             if (!first) try writer.writeAll(" ");
-            try writer.print("UNSEEN {d}", .{msg_count});
+            try writer.print("UNSEEN {d}", .{stats.unseen});
         }
         try writer.writeAll(")");
 
@@ -1455,6 +1608,22 @@ pub const ImapSession = struct {
         const recent_msg = try std.fmt.allocPrint(self.allocator, "{d} RECENT", .{recent_count});
         defer self.allocator.free(recent_msg);
         try self.sendUntagged(recent_msg);
+
+        var first_unseen: usize = 0;
+        if (self.mailbox_files) |mfiles| {
+            for (mfiles, 0..) |fname, i| {
+                const flags = MaildirFlags.fromFilename(fname);
+                if (!flags.seen) {
+                    first_unseen = i + 1;
+                    break;
+                }
+            }
+        }
+        if (first_unseen > 0) {
+            const unseen_msg = try std.fmt.allocPrint(self.allocator, "OK [UNSEEN {d}]", .{first_unseen});
+            defer self.allocator.free(unseen_msg);
+            try self.sendUntagged(unseen_msg);
+        }
 
         // Get UIDVALIDITY and UIDNEXT from database
         const mbox_name = self.mailbox_name orelse "INBOX";
@@ -2486,13 +2655,20 @@ pub const ImapSession = struct {
             },
             .select => {
                 self.mailbox_read_only = false;
-                const mailbox = parts.next() orelse "INBOX";
+                const cmd_end = @intFromPtr(cmd_str.ptr) + cmd_str.len - @intFromPtr(line.ptr);
+                const rest = if (cmd_end < line.len) line[cmd_end..] else "";
+                const mailbox = if (parseImapArg(rest)) |arg| arg.value else "INBOX";
                 try self.handleSelect(tag, mailbox);
             },
             .list, .xlist => {
-                // LIST/XLIST reference pattern
-                const reference = parts.next() orelse "";
-                const pattern = parts.next() orelse "*";
+                const cmd_end = @intFromPtr(cmd_str.ptr) + cmd_str.len - @intFromPtr(line.ptr);
+                const rest = if (cmd_end < line.len) line[cmd_end..] else "";
+                const reference_arg = parseImapArg(rest);
+                const reference = if (reference_arg) |arg| arg.value else "";
+                const pattern = if (reference_arg) |arg|
+                    if (parseImapArg(arg.rest)) |pattern_arg| pattern_arg.value else "*"
+                else
+                    "*";
                 if (command == .xlist) {
                     try self.handleXList(tag, reference, pattern);
                 } else {
@@ -2500,28 +2676,22 @@ pub const ImapSession = struct {
                 }
             },
             .lsub => {
-                // LSUB is same as LIST for subscribed folders (we treat all as subscribed)
-                const reference = parts.next() orelse "";
-                const pattern = parts.next() orelse "*";
+                const cmd_end = @intFromPtr(cmd_str.ptr) + cmd_str.len - @intFromPtr(line.ptr);
+                const rest = if (cmd_end < line.len) line[cmd_end..] else "";
+                const reference_arg = parseImapArg(rest);
+                const reference = if (reference_arg) |arg| arg.value else "";
+                const pattern = if (reference_arg) |arg|
+                    if (parseImapArg(arg.rest)) |pattern_arg| pattern_arg.value else "*"
+                else
+                    "*";
                 try self.handleList(tag, reference, pattern);
             },
             .status => {
-                // STATUS mailbox (items)
-                const mailbox_name = parts.next() orelse "INBOX";
-                // Get rest of line as status items
-                var status_items_buf: [256]u8 = undefined;
-                var status_len: usize = 0;
-                while (parts.next()) |part| {
-                    if (status_len > 0) {
-                        status_items_buf[status_len] = ' ';
-                        status_len += 1;
-                    }
-                    const copy_len = @min(part.len, status_items_buf.len - status_len);
-                    @memcpy(status_items_buf[status_len..][0..copy_len], part[0..copy_len]);
-                    status_len += copy_len;
-                }
-                const status_items = status_items_buf[0..status_len];
-                try self.handleStatus(tag, mailbox_name, status_items);
+                const cmd_end = @intFromPtr(cmd_str.ptr) + cmd_str.len - @intFromPtr(line.ptr);
+                const rest = if (cmd_end < line.len) line[cmd_end..] else "";
+                const mailbox_arg = parseImapArg(rest) orelse ParsedImapArg{ .value = "INBOX", .rest = "" };
+                const status_items = std.mem.trim(u8, mailbox_arg.rest, " \t");
+                try self.handleStatus(tag, mailbox_arg.value, status_items);
             },
             .fetch => {
                 const sequence_set = parts.next() orelse "1:*";
@@ -3436,6 +3606,36 @@ test "IMAP command parsing" {
 
     const unknown = ImapCommand.fromString("UNKNOWN");
     try testing.expect(unknown == null);
+}
+
+test "IMAP argument parsing preserves quoted mailbox names" {
+    const testing = std.testing;
+
+    const all_mail = parseImapArg(" \"All Mail\" (MESSAGES UIDNEXT UIDVALIDITY UNSEEN)").?;
+    try testing.expectEqualStrings("All Mail", all_mail.value);
+    try testing.expectEqualStrings("(MESSAGES UIDNEXT UIDVALIDITY UNSEEN)", all_mail.rest);
+
+    const loose_all_mail = parseImapArg(" All Mail (MESSAGES UIDNEXT UIDVALIDITY UNSEEN)").?;
+    try testing.expectEqualStrings("All Mail", loose_all_mail.value);
+    try testing.expectEqualStrings("(MESSAGES UIDNEXT UIDVALIDITY UNSEEN)", loose_all_mail.rest);
+
+    const list_reference = parseImapArg(" \"\" \"All Mail\"").?;
+    try testing.expectEqualStrings("", list_reference.value);
+    const list_pattern = parseImapArg(list_reference.rest).?;
+    try testing.expectEqualStrings("All Mail", list_pattern.value);
+    try testing.expectEqualStrings("", list_pattern.rest);
+
+    const inbox = parseImapArg(" INBOX").?;
+    try testing.expectEqualStrings("INBOX", inbox.value);
+    try testing.expectEqualStrings("", inbox.rest);
+}
+
+test "Maildir flags drive unseen counts" {
+    const testing = std.testing;
+
+    try testing.expect(MaildirFlags.fromFilename("1770000000000.eml").seen == false);
+    try testing.expect(MaildirFlags.fromFilename("1770000000001.eml:2,S").seen);
+    try testing.expect(MaildirFlags.fromFilename("1770000000002.eml:2,FS").flagged);
 }
 
 test "IMAP message flags" {
