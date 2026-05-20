@@ -798,12 +798,18 @@ pub const ManageSieveServer = struct {
         const addr = try socket.Address.parseIp("0.0.0.0", self.config.port);
         const listener = try socket.Server.listen(addr, .{ .reuse_address = true });
         self.listener = listener;
+        try self.listener.?.setNonBlocking(true);
         self.running.store(true, .monotonic);
         std.log.info("ManageSieve listening on port {d}", .{self.config.port});
         while (self.running.load(.monotonic)) {
             const conn = self.listener.?.accept() catch |err| {
                 if (!self.running.load(.monotonic)) break;
+                if (err == error.OperationCancelled or err == error.WouldBlock) {
+                    time_compat.sleepMs(100);
+                    continue;
+                }
                 std.log.warn("ManageSieve accept: {}", .{err});
+                time_compat.sleepMs(500);
                 continue;
             };
             self.mutex.lock();

@@ -557,6 +557,20 @@ pub const MaildirFlags = struct {
     }
 };
 
+const AggregateMailboxEntry = struct {
+    filename: []const u8,
+    dir: []const u8,
+    uid_key: []const u8,
+    sort_key: i64,
+};
+
+fn parseMessageSortKey(filename: []const u8) i64 {
+    const basename = if (std.mem.lastIndexOfScalar(u8, filename, '/')) |pos| filename[pos + 1 ..] else filename;
+    const no_flags = MaildirFlags.baseName(basename);
+    const name_no_ext = if (std.mem.endsWith(u8, no_flags, ".eml")) no_flags[0 .. no_flags.len - 4] else no_flags;
+    return std.fmt.parseInt(i64, name_no_ext, 10) catch return 0;
+}
+
 /// Match an IMAP LIST wildcard pattern against a folder name.
 /// `*` matches zero or more characters including hierarchy delimiter.
 /// `%` matches zero or more characters excluding hierarchy delimiter `/`.
@@ -686,12 +700,17 @@ pub const ImapSession = struct {
     tls_connection: ?*tls.nonblock.Connection = null,
     // Cached list of message filenames in the selected mailbox (sorted)
     mailbox_files: ?[]const []const u8 = null,
+    // Per-message source directories for virtual mailboxes such as All Mail.
+    mailbox_file_dirs: ?[]const []const u8 = null,
+    // Per-message UID keys for virtual mailboxes where filenames can collide across folders.
+    mailbox_uid_keys: ?[]const []const u8 = null,
     // Path to the selected mailbox's new/ directory
     mailbox_dir: ?[]const u8 = null,
     // UID persistence: parallel array of UIDs for mailbox_files (same indices)
     mailbox_uids: ?[]i64 = null,
     mailbox_uidvalidity: i64 = 0,
     mailbox_name: ?[]const u8 = null,
+    mailbox_is_virtual: bool = false,
     // Pending APPEND literal state
     append_tag: ?[]u8 = null,
     append_mailbox: ?[]u8 = null,
@@ -740,6 +759,16 @@ pub const ImapSession = struct {
             self.allocator.free(files);
             self.mailbox_files = null;
         }
+        if (self.mailbox_file_dirs) |dirs| {
+            for (dirs) |d| self.allocator.free(d);
+            self.allocator.free(dirs);
+            self.mailbox_file_dirs = null;
+        }
+        if (self.mailbox_uid_keys) |keys| {
+            for (keys) |k| self.allocator.free(k);
+            self.allocator.free(keys);
+            self.mailbox_uid_keys = null;
+        }
         if (self.mailbox_dir) |d| {
             self.allocator.free(d);
             self.mailbox_dir = null;
@@ -748,6 +777,133 @@ pub const ImapSession = struct {
             self.allocator.free(uids);
             self.mailbox_uids = null;
         }
+        self.mailbox_is_virtual = false;
+    }
+
+    fn selectedMessageDirForIndex(self: *ImapSession, idx: usize) ?[]const u8 {
+        if (self.mailbox_file_dirs) |dirs| {
+            if (idx < dirs.len) return dirs[idx];
+        }
+        return self.mailbox_dir;
+    }
+
+    fn allocSelectedMessagePath(self: *ImapSession, idx: usize, filename: []const u8) ![]u8 {
+        const dir = self.selectedMessageDirForIndex(idx) orelse return error.NoMailboxSelected;
+        return try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename });
+    }
+
+    fn freeSelectedMessageLists(self: *ImapSession) void {
+        if (self.mailbox_files) |files| {
+            for (files) |f| self.allocator.free(f);
+            self.allocator.free(files);
+            self.mailbox_files = null;
+        }
+        if (self.mailbox_file_dirs) |dirs| {
+            for (dirs) |d| self.allocator.free(d);
+            self.allocator.free(dirs);
+            self.mailbox_file_dirs = null;
+        }
+        if (self.mailbox_uid_keys) |keys| {
+            for (keys) |k| self.allocator.free(k);
+            self.allocator.free(keys);
+            self.mailbox_uid_keys = null;
+        }
+        if (self.mailbox_uids) |uids| {
+            self.allocator.free(uids);
+            self.mailbox_uids = null;
+        }
+    }
+
+    fn freeAggregateEntries(self: *ImapSession, entries: []AggregateMailboxEntry) void {
+        for (entries) |entry| {
+            self.allocator.free(entry.filename);
+            self.allocator.free(entry.dir);
+            self.allocator.free(entry.uid_key);
+        }
+    }
+
+    fn appendAggregateFolder(self: *ImapSession, entries: *std.ArrayList(AggregateMailboxEntry), dir_path: []const u8, folder_name: []const u8) !void {
+        const files = fs_compat.listEmlFiles(self.allocator, dir_path) catch return;
+        defer {
+            for (files) |f| self.allocator.free(f);
+            self.allocator.free(files);
+        }
+
+        for (files) |filename| {
+            const owned_filename = try self.allocator.dupe(u8, filename);
+            errdefer self.allocator.free(owned_filename);
+
+            const owned_dir = try self.allocator.dupe(u8, dir_path);
+            errdefer self.allocator.free(owned_dir);
+
+            const base = MaildirFlags.baseName(filename);
+            const uid_key = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ folder_name, base });
+            errdefer self.allocator.free(uid_key);
+
+            try entries.append(self.allocator, .{
+                .filename = owned_filename,
+                .dir = owned_dir,
+                .uid_key = uid_key,
+                .sort_key = parseMessageSortKey(filename),
+            });
+        }
+    }
+
+    fn loadAggregateMailboxFiles(self: *ImapSession, local_part: []const u8) !void {
+        var entries: std.ArrayList(AggregateMailboxEntry) = .empty;
+        defer entries.deinit(self.allocator);
+        errdefer self.freeAggregateEntries(entries.items);
+
+        const root = try std.fmt.allocPrint(self.allocator, "mail/{s}", .{local_part});
+        defer self.allocator.free(root);
+
+        const root_z = try self.allocator.dupeZ(u8, root);
+        defer self.allocator.free(root_z);
+
+        if (std.c.opendir(root_z.ptr)) |dir| {
+            defer _ = std.c.closedir(dir);
+
+            while (std.c.readdir(dir)) |entry| {
+                const name_ptr: [*:0]const u8 = @ptrCast(&entry.name);
+                const folder = std.mem.sliceTo(name_ptr, 0);
+                if (!shouldIncludeInAggregate(folder, false)) continue;
+
+                const folder_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ root, folder });
+                defer self.allocator.free(folder_path);
+
+                const display_folder = if (std.mem.eql(u8, folder, "new")) "INBOX" else folder;
+                try self.appendAggregateFolder(&entries, folder_path, display_folder);
+            }
+        } else {
+            try self.appendAggregateFolder(&entries, "mail/new", "INBOX");
+        }
+
+        std.mem.sort(AggregateMailboxEntry, entries.items, {}, struct {
+            fn lessThan(_: void, a: AggregateMailboxEntry, b: AggregateMailboxEntry) bool {
+                if (a.sort_key != b.sort_key) return a.sort_key < b.sort_key;
+                return std.mem.order(u8, a.uid_key, b.uid_key) == .lt;
+            }
+        }.lessThan);
+
+        if (entries.items.len == 0) return;
+
+        const files = try self.allocator.alloc([]const u8, entries.items.len);
+        errdefer self.allocator.free(files);
+        const dirs = try self.allocator.alloc([]const u8, entries.items.len);
+        errdefer self.allocator.free(dirs);
+        const uid_keys = try self.allocator.alloc([]const u8, entries.items.len);
+        errdefer self.allocator.free(uid_keys);
+
+        for (entries.items, 0..) |entry, i| {
+            files[i] = entry.filename;
+            dirs[i] = entry.dir;
+            uid_keys[i] = entry.uid_key;
+        }
+
+        self.mailbox_files = files;
+        self.mailbox_file_dirs = dirs;
+        self.mailbox_uid_keys = uid_keys;
+        entries.clearRetainingCapacity();
     }
 
     /// Sync UIDs for the current mailbox_files using the database.
@@ -755,6 +911,7 @@ pub const ImapSession = struct {
     fn syncUids(self: *ImapSession) !void {
         const db = self.db orelse return;
         const files = self.mailbox_files orelse return;
+        const uid_keys = self.mailbox_uid_keys orelse files;
 
         const full_username = self.username orelse return;
         const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
@@ -769,18 +926,19 @@ pub const ImapSession = struct {
         self.mailbox_uidvalidity = mb_info.uidvalidity;
 
         // Remove stale UIDs for files that no longer exist
-        db.removeStaleUids(username, mailbox, files) catch {};
+        db.removeStaleUids(username, mailbox, uid_keys) catch {};
 
         // Build UID array
         if (self.mailbox_uids) |old| self.allocator.free(old);
         const uids = try self.allocator.alloc(i64, files.len);
 
-        for (files, 0..) |filename, i| {
+        for (files, 0..) |_, i| {
+            const uid_key = if (i < uid_keys.len) uid_keys[i] else files[i];
             // Try to get existing UID, or assign a new one
-            if (db.getUidForFile(username, mailbox, filename) catch null) |uid| {
+            if (db.getUidForFile(username, mailbox, uid_key) catch null) |uid| {
                 uids[i] = uid;
             } else {
-                uids[i] = db.assignUid(username, mailbox, filename) catch @as(i64, @intCast(i + 1));
+                uids[i] = db.assignUid(username, mailbox, uid_key) catch @as(i64, @intCast(i + 1));
             }
         }
 
@@ -884,8 +1042,37 @@ pub const ImapSession = struct {
     /// If the message count changed, sends untagged EXISTS/RECENT responses
     /// so the client knows to fetch new messages. Returns true if new mail found.
     fn rescanMailbox(self: *ImapSession) !bool {
-        const dir = self.mailbox_dir orelse return false;
         const old_count: usize = if (self.mailbox_files) |f| f.len else 0;
+
+        if (self.mailbox_is_virtual) {
+            const full_username = self.username orelse return false;
+            const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
+                full_username[0..at_pos]
+            else
+                full_username;
+
+            self.freeSelectedMessageLists();
+            try self.loadAggregateMailboxFiles(username);
+            self.syncUids() catch {};
+
+            const new_count: usize = if (self.mailbox_files) |f| f.len else 0;
+            if (new_count != old_count) {
+                const exists_msg = try std.fmt.allocPrint(self.allocator, "{d} EXISTS", .{new_count});
+                defer self.allocator.free(exists_msg);
+                try self.sendUntagged(exists_msg);
+
+                const recent_count = if (new_count > old_count) new_count - old_count else 0;
+                const recent_msg = try std.fmt.allocPrint(self.allocator, "{d} RECENT", .{recent_count});
+                defer self.allocator.free(recent_msg);
+                try self.sendUntagged(recent_msg);
+
+                std.log.info("IMAP virtual mailbox rescan: {d} -> {d} messages ({d} new)", .{ old_count, new_count, recent_count });
+                return true;
+            }
+            return false;
+        }
+
+        const dir = self.mailbox_dir orelse return false;
 
         // Re-read the maildir
         const new_files = fs_compat.listEmlFiles(self.allocator, dir) catch return false;
@@ -1537,9 +1724,31 @@ pub const ImapSession = struct {
 
         // Strip quotes from mailbox name (Apple Mail sends "INBOX" with quotes sometimes)
         const mailbox = stripQuotes(mailbox_name);
+        const is_all_mail = std.ascii.eqlIgnoreCase(mailbox, "All Mail") or std.ascii.eqlIgnoreCase(mailbox, "All");
 
         // Store mailbox name for UID persistence
-        self.mailbox_name = try self.allocator.dupe(u8, if (std.ascii.eqlIgnoreCase(mailbox, "INBOX")) "INBOX" else mailbox);
+        const canonical_mailbox = if (is_all_mail) "All Mail" else if (std.ascii.eqlIgnoreCase(mailbox, "INBOX")) "INBOX" else mailbox;
+        self.mailbox_name = try self.allocator.dupe(u8, canonical_mailbox);
+
+        if (is_all_mail) {
+            self.mailbox_is_virtual = true;
+            self.mailbox_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}", .{username});
+            try self.loadAggregateMailboxFiles(username);
+
+            const msg_count = if (self.mailbox_files) |f| f.len else 0;
+            self.syncUids() catch {};
+
+            var recent_count: usize = 0;
+            if (self.mailbox_files) |mfiles| {
+                for (mfiles) |fname| {
+                    const flags = MaildirFlags.fromFilename(fname);
+                    if (!flags.seen) recent_count += 1;
+                }
+            }
+
+            try self.sendSelectResponse(tag, username, msg_count, recent_count);
+            return;
+        }
 
         const is_inbox = std.ascii.eqlIgnoreCase(mailbox, "INBOX");
 
@@ -1665,10 +1874,6 @@ pub const ImapSession = struct {
             try self.sendResponse(tag, "OK", "FETCH completed");
             return;
         };
-        const dir = self.mailbox_dir orelse {
-            try self.sendResponse(tag, "OK", "FETCH completed");
-            return;
-        };
 
         // Parse sequence set (supports "n", "n:m", "n:*")
         var start: usize = 1;
@@ -1766,7 +1971,7 @@ pub const ImapSession = struct {
                 const flag_str = msg_flags.toImapString(&flag_str_buf);
 
                 if (want_rfc822_size) {
-                    const filepath = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename });
+                    const filepath = self.allocSelectedMessagePath(seq - 1, filename) catch continue;
                     defer self.allocator.free(filepath);
                     const file_size = fs_compat.getFileSize(filepath) catch 0;
                     const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d})", .{
@@ -1785,7 +1990,7 @@ pub const ImapSession = struct {
                 continue;
             }
 
-            const filepath = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename });
+            const filepath = self.allocSelectedMessagePath(seq - 1, filename) catch continue;
             defer self.allocator.free(filepath);
 
             const content = fs_compat.readFileAlloc(self.allocator, filepath) catch |err| {
@@ -1810,7 +2015,8 @@ pub const ImapSession = struct {
             var date_str: []const u8 = "01-Jan-2026 00:00:00 +0000";
             // Try to parse epoch millis from filename (e.g., "1772259313773.eml")
             const basename = if (std.mem.lastIndexOfScalar(u8, filename, '/')) |pos| filename[pos + 1 ..] else filename;
-            const name_no_ext = if (std.mem.endsWith(u8, basename, ".eml")) basename[0 .. basename.len - 4] else basename;
+            const base_no_flags = MaildirFlags.baseName(basename);
+            const name_no_ext = if (std.mem.endsWith(u8, base_no_flags, ".eml")) base_no_flags[0 .. base_no_flags.len - 4] else base_no_flags;
             if (std.fmt.parseInt(i64, name_no_ext, 10)) |epoch_ms| {
                 date_str = formatImapDate(@divFloor(epoch_ms, 1000), &date_buf);
             } else |_| {
@@ -1877,8 +2083,9 @@ pub const ImapSession = struct {
                 var new_name_buf: [512]u8 = undefined;
                 const new_name = std.fmt.bufPrint(&new_name_buf, "{s}{s}", .{ base, suffix }) catch filename;
                 if (!std.mem.eql(u8, filename, new_name)) {
-                    const old_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename }) catch null;
-                    const new_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, new_name }) catch null;
+                    const dir = self.selectedMessageDirForIndex(seq - 1);
+                    const old_path = if (dir) |d| std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ d, filename }) catch null else null;
+                    const new_path = if (dir) |d| std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ d, new_name }) catch null else null;
                     if (old_path != null and new_path != null) {
                         if (renameFile(old_path.?, new_path.?)) {
                             // Update cached filename
@@ -2016,11 +2223,6 @@ pub const ImapSession = struct {
             try self.sendResponse(tag, "OK", "SEARCH completed");
             return;
         };
-        const dir = self.mailbox_dir orelse {
-            try self.sendUntagged("SEARCH");
-            try self.sendResponse(tag, "OK", "SEARCH completed");
-            return;
-        };
 
         // Parse criteria (case insensitive)
         const is_all = criteria.len == 0 or std.ascii.indexOfIgnoreCase(criteria, "ALL") != null;
@@ -2101,7 +2303,7 @@ pub const ImapSession = struct {
                 const need_content = std.ascii.indexOfIgnoreCase(criteria, "FROM") != null or
                     std.ascii.indexOfIgnoreCase(criteria, "SUBJECT") != null;
                 if (need_content) {
-                    const filepath = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename }) catch continue;
+                    const filepath = self.allocSelectedMessagePath(i, filename) catch continue;
                     defer self.allocator.free(filepath);
                     const content = fs_compat.readFileAlloc(self.allocator, filepath) catch continue;
                     defer self.allocator.free(content);
@@ -2163,10 +2365,6 @@ pub const ImapSession = struct {
             try self.sendResponse(tag, "NO", "Mailbox is empty");
             return;
         };
-        const src_dir = self.mailbox_dir orelse {
-            try self.sendResponse(tag, "NO", "No mailbox selected");
-            return;
-        };
         const full_username = self.username orelse {
             try self.sendResponse(tag, "NO", "Not authenticated");
             return;
@@ -2199,7 +2397,7 @@ pub const ImapSession = struct {
             const filename = files[idx];
 
             // Build source path
-            const src_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ src_dir, filename });
+            const src_path = self.allocSelectedMessagePath(idx, filename) catch continue;
             defer self.allocator.free(src_path);
 
             // Read source file
@@ -2235,10 +2433,6 @@ pub const ImapSession = struct {
 
         const files = self.mailbox_files orelse {
             try self.sendResponse(tag, "NO", "Mailbox is empty");
-            return;
-        };
-        const src_dir = self.mailbox_dir orelse {
-            try self.sendResponse(tag, "NO", "No mailbox selected");
             return;
         };
         const full_username = self.username orelse {
@@ -2284,7 +2478,7 @@ pub const ImapSession = struct {
             const filename = files[idx];
 
             // Build paths
-            const src_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ src_dir, filename }) catch continue;
+            const src_path = self.allocSelectedMessagePath(idx, filename) catch continue;
             defer self.allocator.free(src_path);
 
             // Preserve flags from source filename in destination
@@ -2303,10 +2497,9 @@ pub const ImapSession = struct {
             file.writeAll(content) catch continue;
 
             // Delete source
-            var path_buf: [4097]u8 = undefined;
-            const written = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ src_dir, filename }) catch continue;
-            path_buf[written.len] = 0;
-            _ = std.c.unlink(@ptrCast(&path_buf));
+            const src_path_z = self.allocator.dupeZ(u8, src_path) catch continue;
+            defer self.allocator.free(src_path_z);
+            _ = std.c.unlink(src_path_z.ptr);
 
             // Send EXPUNGE notification
             var resp_buf: [32]u8 = undefined;
@@ -2445,10 +2638,6 @@ pub const ImapSession = struct {
             try self.sendResponse(tag, "OK", "STORE completed");
             return;
         };
-        const dir = self.mailbox_dir orelse {
-            try self.sendResponse(tag, "OK", "STORE completed");
-            return;
-        };
 
         const is_silent = std.ascii.indexOfIgnoreCase(flags_action, ".SILENT") != null;
         // Need mutable access to update cached filenames after renames
@@ -2474,6 +2663,7 @@ pub const ImapSession = struct {
 
             // Rename the file if flags actually changed
             if (!std.mem.eql(u8, filename, new_name)) {
+                const dir = self.selectedMessageDirForIndex(idx) orelse continue;
                 const old_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename }) catch continue;
                 defer self.allocator.free(old_path);
                 const new_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, new_name }) catch continue;
@@ -2510,11 +2700,6 @@ pub const ImapSession = struct {
             return;
         }
 
-        const dir = self.mailbox_dir orelse {
-            try self.sendResponse(tag, "OK", "EXPUNGE completed");
-            return;
-        };
-
         const files = self.mailbox_files orelse {
             try self.sendResponse(tag, "OK", "EXPUNGE completed");
             return;
@@ -2529,10 +2714,11 @@ pub const ImapSession = struct {
             if (!flags.deleted) continue;
 
             // Delete the file
-            var path_buf: [4097]u8 = undefined;
-            const path_written = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, filename }) catch continue;
-            path_buf[path_written.len] = 0;
-            _ = std.c.unlink(@ptrCast(&path_buf));
+            const path = self.allocSelectedMessagePath(seq - 1, filename) catch continue;
+            defer self.allocator.free(path);
+            const path_z = self.allocator.dupeZ(u8, path) catch continue;
+            defer self.allocator.free(path_z);
+            _ = std.c.unlink(path_z.ptr);
 
             // Send untagged EXPUNGE
             var resp_buf: [32]u8 = undefined;
@@ -2540,7 +2726,7 @@ pub const ImapSession = struct {
             fbs.writer().print("{d} EXPUNGE", .{seq}) catch continue;
             self.sendUntagged(fbs.getWritten()) catch continue;
 
-            std.log.info("IMAP EXPUNGE: Deleted {s}/{s}", .{ dir, filename });
+            std.log.info("IMAP EXPUNGE: Deleted {s}", .{path});
 
             if (seq == 0) break;
         }
@@ -2710,16 +2896,15 @@ pub const ImapSession = struct {
             .close => {
                 // RFC 3501 Section 6.4.2: CLOSE implicitly expunges \Deleted messages
                 // (without sending untagged EXPUNGE responses)
-                if (self.mailbox_dir) |dir| {
-                    if (self.mailbox_files) |files| {
-                        for (files) |filename| {
-                            const flags = MaildirFlags.fromFilename(filename);
-                            if (flags.deleted) {
-                                var path_buf: [4097]u8 = undefined;
-                                const written = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, filename }) catch continue;
-                                path_buf[written.len] = 0;
-                                _ = std.c.unlink(@ptrCast(&path_buf));
-                            }
+                if (self.mailbox_files) |files| {
+                    for (files, 0..) |filename, i| {
+                        const flags = MaildirFlags.fromFilename(filename);
+                        if (flags.deleted) {
+                            const path = self.allocSelectedMessagePath(i, filename) catch continue;
+                            defer self.allocator.free(path);
+                            const path_z = self.allocator.dupeZ(u8, path) catch continue;
+                            defer self.allocator.free(path_z);
+                            _ = std.c.unlink(path_z.ptr);
                         }
                     }
                 }
@@ -2761,13 +2946,19 @@ pub const ImapSession = struct {
                     try self.handleUidSearch(tag, uid_search_criteria);
                 } else if (std.ascii.eqlIgnoreCase(sub_cmd, "MOVE")) {
                     const uid_set = parts.next() orelse "1:*";
-                    const dest = stripQuotes(parts.next() orelse "INBOX");
+                    const uid_end = @intFromPtr(uid_set.ptr) + uid_set.len - @intFromPtr(line.ptr);
+                    const rest = if (uid_end < line.len) line[uid_end..] else "";
+                    const dest_arg = parseImapArg(rest) orelse ParsedImapArg{ .value = "INBOX", .rest = "" };
+                    const dest = dest_arg.value;
                     const seq_set = self.uidSetToSeqSet(uid_set) catch uid_set;
                     defer if (seq_set.ptr != uid_set.ptr) self.allocator.free(seq_set);
                     try self.handleMove(tag, seq_set, dest);
                 } else if (std.ascii.eqlIgnoreCase(sub_cmd, "COPY")) {
                     const uid_set = parts.next() orelse "1:*";
-                    const dest = parts.next() orelse "INBOX";
+                    const uid_end = @intFromPtr(uid_set.ptr) + uid_set.len - @intFromPtr(line.ptr);
+                    const rest = if (uid_end < line.len) line[uid_end..] else "";
+                    const dest_arg = parseImapArg(rest) orelse ParsedImapArg{ .value = "INBOX", .rest = "" };
+                    const dest = dest_arg.value;
                     const seq_set = self.uidSetToSeqSet(uid_set) catch uid_set;
                     defer if (seq_set.ptr != uid_set.ptr) self.allocator.free(seq_set);
                     try self.handleCopy(tag, seq_set, dest);
@@ -2865,11 +3056,16 @@ pub const ImapSession = struct {
             },
             .copy => {
                 const seq_set = parts.next() orelse "1:*";
-                const dest = parts.next() orelse "INBOX";
+                const seq_end = @intFromPtr(seq_set.ptr) + seq_set.len - @intFromPtr(line.ptr);
+                const rest = if (seq_end < line.len) line[seq_end..] else "";
+                const dest_arg = parseImapArg(rest) orelse ParsedImapArg{ .value = "INBOX", .rest = "" };
+                const dest = dest_arg.value;
                 try self.handleCopy(tag, seq_set, dest);
             },
             .examine => {
-                const mailbox = parts.next() orelse "INBOX";
+                const cmd_end = @intFromPtr(cmd_str.ptr) + cmd_str.len - @intFromPtr(line.ptr);
+                const rest = if (cmd_end < line.len) line[cmd_end..] else "";
+                const mailbox = if (parseImapArg(rest)) |arg| arg.value else "INBOX";
                 try self.handleExamine(tag, mailbox);
             },
             .delete => {
@@ -2883,7 +3079,10 @@ pub const ImapSession = struct {
             },
             .move => {
                 const seq_set = parts.next() orelse "1:*";
-                const dest = stripQuotes(parts.next() orelse "INBOX");
+                const seq_end = @intFromPtr(seq_set.ptr) + seq_set.len - @intFromPtr(line.ptr);
+                const rest = if (seq_end < line.len) line[seq_end..] else "";
+                const dest_arg = parseImapArg(rest) orelse ParsedImapArg{ .value = "INBOX", .rest = "" };
+                const dest = dest_arg.value;
                 try self.handleMove(tag, seq_set, dest);
             },
             .unselect => {
@@ -2966,6 +3165,7 @@ pub const ImapServer = struct {
         self.listener = try socket.Server.listen(address, .{
             .reuse_address = true,
         });
+        try self.listener.?.setNonBlocking(true);
 
         self.running.store(true, .monotonic);
 
@@ -2980,7 +3180,13 @@ pub const ImapServer = struct {
 
         while (self.running.load(.monotonic)) {
             const connection = self.listener.?.accept() catch |err| {
+                if (!self.running.load(.monotonic)) break;
+                if (err == error.OperationCancelled or err == error.WouldBlock) {
+                    time_compat.sleepMs(100);
+                    continue;
+                }
                 logger.warn("IMAP accept error: {}", .{err});
+                time_compat.sleepMs(500);
                 continue;
             };
 
@@ -3008,13 +3214,22 @@ pub const ImapServer = struct {
             logger.err("Failed to start IMAPS listener: {}", .{err});
             return;
         };
+        self.ssl_listener.?.setNonBlocking(true) catch |err| {
+            logger.err("Failed to set IMAPS listener nonblocking: {}", .{err});
+            return;
+        };
 
         logger.info("IMAPS server listening on port {d} (SSL/TLS)", .{self.config.ssl_port});
 
         while (self.running.load(.monotonic)) {
             const connection = self.ssl_listener.?.accept() catch |err| {
                 if (!self.running.load(.monotonic)) break; // Server is stopping
+                if (err == error.OperationCancelled or err == error.WouldBlock) {
+                    time_compat.sleepMs(100);
+                    continue;
+                }
                 logger.warn("IMAPS accept error: {}", .{err});
+                time_compat.sleepMs(500);
                 continue;
             };
 
