@@ -105,6 +105,7 @@ pub const Server = struct {
         self.listener = try socket.Server.listen(address, .{
             .reuse_address = true,
         });
+        try self.listener.?.setNonBlocking(true);
 
         self.running = true;
 
@@ -255,6 +256,11 @@ pub const Server = struct {
             self.logger.err("SMTPS: Failed to listen on port {d}: {}", .{ smtps_port, err });
             return;
         };
+        smtps_listener.setNonBlocking(true) catch |err| {
+            self.logger.err("SMTPS: Failed to set nonblocking listener: {}", .{err});
+            smtps_listener.close();
+            return;
+        };
 
         self.logger.info("SMTPS Server listening on {s}:{d} (implicit TLS)", .{ self.config.host, smtps_port });
 
@@ -305,6 +311,11 @@ pub const Server = struct {
             .reuse_address = true,
         }) catch |err| {
             self.logger.err("Submission: Failed to listen on port {d}: {}", .{ submission_port, err });
+            return;
+        };
+        submission_listener.setNonBlocking(true) catch |err| {
+            self.logger.err("Submission: Failed to set nonblocking listener: {}", .{err});
+            submission_listener.close();
             return;
         };
 

@@ -41,8 +41,6 @@ pub fn build(b: *std.Build) void {
         for (targets) |t| {
             buildForTarget(b, t, optimize, tls_module, zig_cli_module);
         }
-    } else {
-        buildForTarget(b, target, optimize, tls_module, zig_cli_module);
     }
 
     // Single unified binary: mail

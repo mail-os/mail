@@ -154,9 +154,10 @@ pub const Server = struct {
         // Use raw syscall to avoid Zig 0.16 error type mismatch
         const rc = std.c.accept(self.fd, &client_addr, &addr_len);
         if (rc < 0) {
-            const err = std.posix.errno(rc);
+            const err: posix.E = @enumFromInt(std.c._errno().*);
             return switch (err) {
                 .AGAIN => error.WouldBlock,
+                .INTR => error.OperationCancelled,
                 .CONNABORTED => error.ConnectionAborted,
                 .MFILE => error.ProcessFdQuotaExceeded,
                 .NFILE => error.SystemFdQuotaExceeded,
@@ -174,6 +175,17 @@ pub const Server = struct {
         _ = posix.setsockopt(fd, posix.IPPROTO.TCP, TCP_NODELAY, std.mem.asBytes(&one)) catch {};
 
         return .{ .fd = fd };
+    }
+
+    pub fn setNonBlocking(self: *Server, enabled: bool) !void {
+        const flags = std.c.fcntl(self.fd, std.c.F.GETFL, @as(c_int, 0));
+        if (flags < 0) return error.Unexpected;
+        const nonblock_flag: c_int = @intCast(@as(u32, @bitCast(std.c.O{ .NONBLOCK = true })));
+        const new_flags = if (enabled)
+            flags | nonblock_flag
+        else
+            flags & ~nonblock_flag;
+        if (std.c.fcntl(self.fd, std.c.F.SETFL, new_flags) < 0) return error.Unexpected;
     }
 
     pub fn close(self: *Server) void {

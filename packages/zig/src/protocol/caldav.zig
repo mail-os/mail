@@ -1671,6 +1671,7 @@ pub const CalDavServer = struct {
         self.listener = try socket.Server.listen(address, .{
             .reuse_address = true,
         });
+        try self.listener.?.setNonBlocking(true);
 
         self.running.store(true, .monotonic);
 
@@ -1686,7 +1687,12 @@ pub const CalDavServer = struct {
         while (self.running.load(.monotonic)) {
             const connection = self.listener.?.accept() catch |err| {
                 if (!self.running.load(.monotonic)) break;
+                if (err == error.OperationCancelled or err == error.WouldBlock) {
+                    time_compat.sleepMs(100);
+                    continue;
+                }
                 logger.warn("CalDAV accept error: {}", .{err});
+                time_compat.sleepMs(500);
                 continue;
             };
 
@@ -1711,13 +1717,22 @@ pub const CalDavServer = struct {
             logger.err("Failed to start CalDAV SSL listener: {}", .{err});
             return;
         };
+        self.ssl_listener.?.setNonBlocking(true) catch |err| {
+            logger.err("Failed to set CalDAV SSL listener nonblocking: {}", .{err});
+            return;
+        };
 
         logger.info("CalDAV SSL server listening on port {d} (HTTPS)", .{self.config.ssl_port});
 
         while (self.running.load(.monotonic)) {
             const connection = self.ssl_listener.?.accept() catch |err| {
                 if (!self.running.load(.monotonic)) break;
+                if (err == error.OperationCancelled or err == error.WouldBlock) {
+                    time_compat.sleepMs(100);
+                    continue;
+                }
                 logger.warn("CalDAV SSL accept error: {}", .{err});
+                time_compat.sleepMs(500);
                 continue;
             };
 
