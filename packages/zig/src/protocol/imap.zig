@@ -906,6 +906,82 @@ pub const ImapSession = struct {
         entries.clearRetainingCapacity();
     }
 
+    /// Append every message file in a single maildir directory to `entries`,
+    /// recording its source directory so per-message paths resolve correctly.
+    /// uid_key is the full filename (matching the historical INBOX scheme) so
+    /// existing UID assignments are preserved.
+    fn appendInboxFolder(self: *ImapSession, entries: *std.ArrayList(AggregateMailboxEntry), dir_path: []const u8) !void {
+        const files = fs_compat.listEmlFiles(self.allocator, dir_path) catch return;
+        defer {
+            for (files) |f| self.allocator.free(f);
+            self.allocator.free(files);
+        }
+        for (files) |filename| {
+            const owned_filename = try self.allocator.dupe(u8, filename);
+            errdefer self.allocator.free(owned_filename);
+            const owned_dir = try self.allocator.dupe(u8, dir_path);
+            errdefer self.allocator.free(owned_dir);
+            const uid_key = try self.allocator.dupe(u8, filename);
+            errdefer self.allocator.free(uid_key);
+            try entries.append(self.allocator, .{
+                .filename = owned_filename,
+                .dir = owned_dir,
+                .uid_key = uid_key,
+                .sort_key = parseMessageSortKey(filename),
+            });
+        }
+    }
+
+    /// Load INBOX from both the maildir `new/` and `cur/` directories so that
+    /// messages are never lost if a client/migration moves them into `cur/`.
+    /// Populates mailbox_files + mailbox_file_dirs (per-message source dir) so
+    /// FETCH/STORE/COPY/MOVE resolve each message in the directory it lives in.
+    fn loadInboxFiles(self: *ImapSession, local_part: []const u8) !void {
+        var entries: std.ArrayList(AggregateMailboxEntry) = .empty;
+        defer entries.deinit(self.allocator);
+        errdefer self.freeAggregateEntries(entries.items);
+
+        const new_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{local_part});
+        defer self.allocator.free(new_dir);
+        const cur_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/cur", .{local_part});
+        defer self.allocator.free(cur_dir);
+
+        try self.appendInboxFolder(&entries, new_dir);
+        try self.appendInboxFolder(&entries, cur_dir);
+
+        // Fallback to the legacy global mail/new for INBOX if the user has none.
+        if (entries.items.len == 0) {
+            try self.appendInboxFolder(&entries, "mail/new");
+        }
+
+        std.mem.sort(AggregateMailboxEntry, entries.items, {}, struct {
+            fn lessThan(_: void, a: AggregateMailboxEntry, b: AggregateMailboxEntry) bool {
+                if (a.sort_key != b.sort_key) return a.sort_key < b.sort_key;
+                return std.mem.order(u8, a.filename, b.filename) == .lt;
+            }
+        }.lessThan);
+
+        if (entries.items.len == 0) return;
+
+        const files = try self.allocator.alloc([]const u8, entries.items.len);
+        errdefer self.allocator.free(files);
+        const dirs = try self.allocator.alloc([]const u8, entries.items.len);
+        errdefer self.allocator.free(dirs);
+        const uid_keys = try self.allocator.alloc([]const u8, entries.items.len);
+        errdefer self.allocator.free(uid_keys);
+
+        for (entries.items, 0..) |entry, i| {
+            files[i] = entry.filename;
+            dirs[i] = entry.dir;
+            uid_keys[i] = entry.uid_key;
+        }
+
+        self.mailbox_files = files;
+        self.mailbox_file_dirs = dirs;
+        self.mailbox_uid_keys = uid_keys;
+        entries.clearRetainingCapacity();
+    }
+
     /// Sync UIDs for the current mailbox_files using the database.
     /// Assigns UIDs to new files and builds the mailbox_uids parallel array.
     fn syncUids(self: *ImapSession) !void {
@@ -1070,6 +1146,34 @@ pub const ImapSession = struct {
                 return true;
             }
             return false;
+        }
+
+        // INBOX is backed by new/ + cur/ with per-message source dirs; reload it
+        // through the same loader SELECT used so the mapping stays consistent.
+        if (self.mailbox_name) |mname| {
+            if (std.ascii.eqlIgnoreCase(mname, "INBOX")) {
+                const full_username = self.username orelse return false;
+                const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
+                    full_username[0..at_pos]
+                else
+                    full_username;
+                self.freeSelectedMessageLists();
+                try self.loadInboxFiles(username);
+                self.syncUids() catch {};
+                const new_count: usize = if (self.mailbox_files) |f| f.len else 0;
+                if (new_count != old_count) {
+                    const exists_msg = try std.fmt.allocPrint(self.allocator, "{d} EXISTS", .{new_count});
+                    defer self.allocator.free(exists_msg);
+                    try self.sendUntagged(exists_msg);
+                    const recent_count = if (new_count > old_count) new_count - old_count else 0;
+                    const recent_msg = try std.fmt.allocPrint(self.allocator, "{d} RECENT", .{recent_count});
+                    defer self.allocator.free(recent_msg);
+                    try self.sendUntagged(recent_msg);
+                    std.log.info("IMAP INBOX rescan: {d} -> {d} messages ({d} new)", .{ old_count, new_count, recent_count });
+                    return true;
+                }
+                return false;
+            }
         }
 
         const dir = self.mailbox_dir orelse return false;
@@ -1260,12 +1364,19 @@ pub const ImapSession = struct {
             return self.countFlaggedStats(local_part);
         }
 
-        const dir_path = if (std.ascii.eqlIgnoreCase(clean_name, "INBOX"))
-            std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{local_part})
-        else
-            std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local_part, clean_name });
+        // INBOX spans both the maildir new/ and cur/ directories.
+        if (std.ascii.eqlIgnoreCase(clean_name, "INBOX")) {
+            var stats = MailboxStats{};
+            const new_path = std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{local_part}) catch return stats;
+            defer self.allocator.free(new_path);
+            const cur_path = std.fmt.allocPrint(self.allocator, "mail/{s}/cur", .{local_part}) catch return stats;
+            defer self.allocator.free(cur_path);
+            self.addDirStats(&stats, new_path);
+            self.addDirStats(&stats, cur_path);
+            return stats;
+        }
 
-        const path = dir_path catch return .{};
+        const path = std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local_part, clean_name }) catch return .{};
         defer self.allocator.free(path);
 
         return self.countDirStats(path);
@@ -1780,31 +1891,34 @@ pub const ImapSession = struct {
 
             const msg_count = if (self.mailbox_files) |f| f.len else 0;
             self.syncUids() catch {};
-
-            var recent_count: usize = 0;
-            if (self.mailbox_files) |mfiles| {
-                for (mfiles) |fname| {
-                    const flags = MaildirFlags.fromFilename(fname);
-                    if (!flags.seen) recent_count += 1;
-                }
-            }
-
-            try self.sendSelectResponse(tag, username, msg_count, recent_count);
+            // RECENT reported as 0 (see note in the INBOX branch below).
+            try self.sendSelectResponse(tag, username, msg_count, 0);
             return;
         }
 
         const is_inbox = std.ascii.eqlIgnoreCase(mailbox, "INBOX");
 
-        // Build maildir path for any folder
-        const user_dir = if (is_inbox)
-            try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{username})
-        else
-            try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ username, mailbox });
+        if (is_inbox) {
+            // INBOX aggregates the maildir new/ and cur/ directories so messages
+            // are not lost if they are ever moved into cur/. mailbox_dir points
+            // at new/ (where fresh mail is delivered) for rescan purposes.
+            self.mailbox_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{username});
+            try self.loadInboxFiles(username);
+            const msg_count = if (self.mailbox_files) |f| f.len else 0;
+            self.syncUids() catch {};
+            // RECENT is reported as 0: this server does not track the \Recent
+            // flag, and reporting the unseen count as RECENT made clients
+            // re-trigger "new mail" on every SELECT. Unread state is conveyed
+            // via UNSEEN and per-message \Seen flags instead.
+            try self.sendSelectResponse(tag, username, msg_count, 0);
+            return;
+        }
+
+        // Non-INBOX folders store messages directly in the folder directory.
+        const user_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ username, mailbox });
 
         // Ensure directory exists for standard mailboxes (Sent, Drafts, Trash, Junk, Archive)
-        if (!is_inbox) {
-            fs_compat.ensureDir(user_dir) catch {};
-        }
+        fs_compat.ensureDir(user_dir) catch {};
 
         const files = fs_compat.listEmlFiles(self.allocator, user_dir) catch {
             // Directory doesn't exist or can't be read — treat as empty
@@ -1813,42 +1927,15 @@ pub const ImapSession = struct {
             try self.sendSelectResponse(tag, username, 0, 0);
             return;
         };
-        if (is_inbox and files.len == 0) {
-            // Fall back to global mail/new/ for INBOX
-            self.allocator.free(user_dir);
-            const global_dir = try self.allocator.dupe(u8, "mail/new");
-            const inbox_files = fs_compat.listEmlFiles(self.allocator, global_dir) catch {
-                self.mailbox_dir = global_dir;
-                self.mailbox_files = null;
-                try self.sendSelectResponse(tag, username, 0, 0);
-                return;
-            };
-            self.mailbox_dir = global_dir;
-            self.mailbox_files = if (inbox_files.len > 0) inbox_files else null;
-        } else {
-            self.mailbox_dir = user_dir;
-            self.mailbox_files = if (files.len > 0) files else null;
-            // Free the zero-length files slice if not stored
-            if (files.len == 0) {
-                self.allocator.free(files);
-            }
+        self.mailbox_dir = user_dir;
+        self.mailbox_files = if (files.len > 0) files else null;
+        if (files.len == 0) {
+            self.allocator.free(files);
         }
 
         const msg_count = if (self.mailbox_files) |f| f.len else 0;
-
-        // Sync UIDs from database
         self.syncUids() catch {};
-
-        // RECENT = messages without \Seen flag (new arrivals)
-        var recent_count: usize = 0;
-        if (self.mailbox_files) |mfiles| {
-            for (mfiles) |fname| {
-                const flags = MaildirFlags.fromFilename(fname);
-                if (!flags.seen) recent_count += 1;
-            }
-        }
-
-        try self.sendSelectResponse(tag, username, msg_count, recent_count);
+        try self.sendSelectResponse(tag, username, msg_count, 0);
     }
 
     /// Send the SELECT/EXAMINE response with proper UIDVALIDITY and UIDNEXT.
