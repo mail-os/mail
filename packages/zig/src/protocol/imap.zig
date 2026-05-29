@@ -20,6 +20,23 @@ fn stripQuotes(s: []const u8) []const u8 {
     return s;
 }
 
+/// Reject mailbox names that could escape the user's maildir when interpolated
+/// into a filesystem path (path traversal / cross-user access). Mailbox paths
+/// are built as `mail/{local_part}/{name}`, so any '/', '\\', NUL, a leading
+/// '.', or a ".." segment is forbidden. The hierarchy separator advertised to
+/// clients is "/", but this server stores folders as flat single-level names,
+/// so a legitimate mailbox name never contains a path separator.
+fn isSafeMailboxName(raw: []const u8) bool {
+    const name = stripQuotes(raw);
+    if (name.len == 0 or name.len > 255) return false;
+    if (name[0] == '.') return false;
+    for (name) |c| {
+        if (c == '/' or c == '\\' or c == 0) return false;
+    }
+    if (std.mem.indexOf(u8, name, "..") != null) return false;
+    return true;
+}
+
 /// IMAP4rev1 Server Implementation (RFC 3501)
 /// Provides mail retrieval and mailbox management via IMAP protocol
 ///
@@ -1244,6 +1261,12 @@ pub const ImapSession = struct {
             return;
         };
 
+        if (!isSafeMailboxName(mailbox)) {
+            try self.sendResponse(tag, "NO", "Invalid mailbox name");
+            self.cleanupAppend();
+            return;
+        }
+
         // Extract local part from email address (chris@stacksjs.com -> chris)
         const local_part = if (std.mem.indexOfScalar(u8, username, '@')) |at_pos|
             username[0..at_pos]
@@ -1645,6 +1668,11 @@ pub const ImapSession = struct {
             return;
         }
 
+        if (!isSafeMailboxName(mailbox_name)) {
+            try self.sendResponse(tag, "NO", "Invalid mailbox name");
+            return;
+        }
+
         // Parse which status items are requested
         const want_messages = std.mem.indexOf(u8, status_items, "MESSAGES") != null;
         const want_recent = std.mem.indexOf(u8, status_items, "RECENT") != null;
@@ -1878,6 +1906,10 @@ pub const ImapSession = struct {
 
         // Strip quotes from mailbox name (Apple Mail sends "INBOX" with quotes sometimes)
         const mailbox = stripQuotes(mailbox_name);
+        if (!isSafeMailboxName(mailbox)) {
+            try self.sendResponse(tag, "NO", "Invalid mailbox name");
+            return;
+        }
         const is_all_mail = std.ascii.eqlIgnoreCase(mailbox, "All Mail") or std.ascii.eqlIgnoreCase(mailbox, "All");
 
         // Store mailbox name for UID persistence
@@ -2490,6 +2522,10 @@ pub const ImapSession = struct {
             try self.sendResponse(tag, "NO", "Must select mailbox first");
             return;
         }
+        if (!isSafeMailboxName(dest_mailbox)) {
+            try self.sendResponse(tag, "NO", "Invalid mailbox name");
+            return;
+        }
 
         const files = self.mailbox_files orelse {
             try self.sendResponse(tag, "NO", "Mailbox is empty");
@@ -2558,6 +2594,10 @@ pub const ImapSession = struct {
     fn handleMove(self: *ImapSession, tag: []const u8, sequence_set: []const u8, dest_mailbox: []const u8) !void {
         if (self.state != .selected) {
             try self.sendResponse(tag, "NO", "Must select mailbox first");
+            return;
+        }
+        if (!isSafeMailboxName(dest_mailbox)) {
+            try self.sendResponse(tag, "NO", "Invalid mailbox name");
             return;
         }
 
@@ -2659,6 +2699,10 @@ pub const ImapSession = struct {
             try self.sendResponse(tag, "NO", "Must authenticate first");
             return;
         }
+        if (!isSafeMailboxName(mailbox_name)) {
+            try self.sendResponse(tag, "NO", "Invalid mailbox name");
+            return;
+        }
 
         const full_username = self.username orelse {
             try self.sendResponse(tag, "NO", "Not authenticated");
@@ -2722,6 +2766,10 @@ pub const ImapSession = struct {
     fn handleRename(self: *ImapSession, tag: []const u8, old_name: []const u8, new_name: []const u8) !void {
         if (self.state == .not_authenticated) {
             try self.sendResponse(tag, "NO", "Must authenticate first");
+            return;
+        }
+        if (!isSafeMailboxName(old_name) or !isSafeMailboxName(new_name)) {
+            try self.sendResponse(tag, "NO", "Invalid mailbox name");
             return;
         }
 
@@ -3164,7 +3212,10 @@ pub const ImapSession = struct {
             .create => {
                 // CREATE mailbox - create the Maildir folder
                 const create_name = stripQuotes(parts.next() orelse "");
-                if (create_name.len > 0) {
+                if (!isSafeMailboxName(create_name)) {
+                    // Rejects empty names and any path-traversal attempt.
+                    try self.sendResponse(tag, "NO", "Invalid mailbox name");
+                } else {
                     if (self.username) |uname| {
                         const local = if (std.mem.indexOfScalar(u8, uname, '@')) |at| uname[0..at] else uname;
                         const dir = std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local, create_name }) catch null;
@@ -3173,8 +3224,8 @@ pub const ImapSession = struct {
                             self.allocator.free(d);
                         }
                     }
+                    try self.sendResponse(tag, "OK", "CREATE completed");
                 }
-                try self.sendResponse(tag, "OK", "CREATE completed");
             },
             .subscribe => {
                 try self.sendResponse(tag, "OK", "SUBSCRIBE completed");
