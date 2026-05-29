@@ -179,7 +179,12 @@ pub const DiscordHealthMonitor = struct {
     }
 
     fn checkTlsCertificate(self: *DiscordHealthMonitor, now: i64) void {
-        const cert_path = env.get("TLS_CERT_PATH") orelse
+        // SMTP_TLS_CERT is the variable the server actually loads its cert from;
+        // the other names are accepted as fallbacks. Without including
+        // SMTP_TLS_CERT this check returned early and never ran, so an expiring
+        // certificate was never alerted on.
+        const cert_path = env.get("SMTP_TLS_CERT") orelse
+            env.get("TLS_CERT_PATH") orelse
             env.get("SMTP_TLS_CERT_PATH") orelse return;
 
         // Check cert file modification time as a proxy for expiry.
