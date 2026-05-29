@@ -571,9 +571,32 @@ echo "Configuring fail2ban..."
 systemctl enable fail2ban
 systemctl start fail2ban
 
-# Set up certbot auto-renewal with service restart
+# Set up certbot auto-renewal with service restart.
+# The mail server binds port 80 (for ACME HTTP-01 / ActiveSync), so the
+# standalone authenticator cannot bind it during renewal. Stop mail in the
+# pre-hook to free port 80 and restart it in the post-hook. certbot only runs
+# these hooks when a certificate is actually due for renewal (~every 60 days),
+# so this does not cause daily downtime. Re-fix key perms via deploy-hook so the
+# mail-server user can read the freshly-rotated privkey.
 echo "Configuring certbot renewal..."
-echo "0 3 * * * root certbot renew --quiet --deploy-hook \\"systemctl restart mail\\"" > /etc/cron.d/certbot-renewal
+cat > /etc/cron.d/certbot-renewal << 'CRONEOF'
+SHELL=/bin/sh
+PATH=/usr/local/bin:/usr/bin:/bin
+0 3 * * * root certbot renew --quiet --pre-hook "systemctl stop mail" --post-hook "systemctl start mail" --deploy-hook "chmod 755 /etc/letsencrypt/live /etc/letsencrypt/archive && chgrp mail-server /etc/letsencrypt/archive/*/privkey*.pem 2>/dev/null && chmod 640 /etc/letsencrypt/archive/*/privkey*.pem 2>/dev/null" >> /var/log/certbot-renewal.log 2>&1
+CRONEOF
+chmod 644 /etc/cron.d/certbot-renewal
+
+# certbot's RPM ships a systemd timer that would also try the standalone
+# authenticator and fail on port 80 without our hooks. Disable it so only the
+# hook-aware cron job above runs.
+systemctl disable --now certbot-renew.timer 2>/dev/null || true
+
+# Ensure the cron daemon is installed and running (Amazon Linux 2023 does not
+# install cronie by default), otherwise the renewal job never fires.
+if ! systemctl is-enabled crond >/dev/null 2>&1; then
+  dnf install -y cronie || yum install -y cronie || true
+fi
+systemctl enable --now crond 2>/dev/null || true
 
 # Set up log rotation
 echo "Configuring log rotation..."
