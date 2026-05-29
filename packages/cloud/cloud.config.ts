@@ -484,6 +484,25 @@ if [ -n "\$HOSTED_ZONE_ID" ] && [ -n "\$DOMAIN_NAME" ]; then
     ]
   }" 2>/dev/null && echo "DNS records configured successfully" || echo "Warning: DNS record configuration failed (may need manual setup)"
 
+  # Autodiscovery SRV/TXT records (RFC 6764) so macOS "Internet Accounts" offers
+  # Calendar (CalDAV) and Contacts (CardDAV) when an account is added, plus
+  # IMAP/submission service discovery. CalDAV/CardDAV are served over TLS on 443.
+  cat > /tmp/autodiscover-dns.json <<DNSEOF
+{
+  "Comment": "Autodiscovery SRV/TXT for CalDAV/CardDAV/IMAP",
+  "Changes": [
+    {"Action":"UPSERT","ResourceRecordSet":{"Name":"_caldavs._tcp.\$BASE_DOMAIN","Type":"SRV","TTL":3600,"ResourceRecords":[{"Value":"0 1 443 \$MAIL_HOSTNAME."}]}},
+    {"Action":"UPSERT","ResourceRecordSet":{"Name":"_caldavs._tcp.\$BASE_DOMAIN","Type":"TXT","TTL":3600,"ResourceRecords":[{"Value":"\\"path=/.well-known/caldav\\""}]}},
+    {"Action":"UPSERT","ResourceRecordSet":{"Name":"_carddavs._tcp.\$BASE_DOMAIN","Type":"SRV","TTL":3600,"ResourceRecords":[{"Value":"0 1 443 \$MAIL_HOSTNAME."}]}},
+    {"Action":"UPSERT","ResourceRecordSet":{"Name":"_carddavs._tcp.\$BASE_DOMAIN","Type":"TXT","TTL":3600,"ResourceRecords":[{"Value":"\\"path=/.well-known/carddav\\""}]}},
+    {"Action":"UPSERT","ResourceRecordSet":{"Name":"_imaps._tcp.\$BASE_DOMAIN","Type":"SRV","TTL":3600,"ResourceRecords":[{"Value":"0 1 993 \$MAIL_HOSTNAME."}]}},
+    {"Action":"UPSERT","ResourceRecordSet":{"Name":"_submission._tcp.\$BASE_DOMAIN","Type":"SRV","TTL":3600,"ResourceRecords":[{"Value":"0 1 587 \$MAIL_HOSTNAME."}]}}
+  ]
+}
+DNSEOF
+  aws route53 change-resource-record-sets --hosted-zone-id \$HOSTED_ZONE_ID --change-batch file:///tmp/autodiscover-dns.json >/dev/null 2>&1 \\
+    && echo "Autodiscovery SRV/TXT records configured" || echo "Warning: autodiscovery DNS records failed"
+
   # Request reverse DNS (rDNS) via SES for the EIP
   echo "Requesting reverse DNS for \$PUBLIC_IP -> \$MAIL_HOSTNAME..."
   # Note: AWS requires a support case for rDNS on EC2. SES handles it for SES-sent mail.
@@ -570,6 +589,17 @@ SVCEOF
 echo "Configuring fail2ban..."
 systemctl enable fail2ban
 systemctl start fail2ban
+
+# Open all mail + DAV ports in the host firewall. The base AMI enables firewalld
+# with a restrictive default that omits 443; without 443 open, CalDAV/CardDAV is
+# unreachable and macOS will not offer Calendar/Contacts when adding the account.
+if systemctl is-active --quiet firewalld; then
+  echo "Opening mail ports in firewalld..."
+  for port in 25 80 110 143 443 465 587 993 995 ${cfg.ports.dashboard} ${cfg.ports.websocketSecure}; do
+    firewall-cmd --permanent --add-port=$port/tcp >/dev/null 2>&1 || true
+  done
+  firewall-cmd --reload >/dev/null 2>&1 || true
+fi
 
 # Set up certbot auto-renewal with service restart.
 # The mail server binds port 80 (for ACME HTTP-01 / ActiveSync), so the
