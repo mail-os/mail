@@ -9,6 +9,10 @@ const logger = @import("logger.zig");
 const security = @import("../auth/security.zig");
 const webhook = @import("../features/webhook.zig");
 const greylist_mod = @import("../antispam/greylist.zig");
+const spf_mod = @import("../antispam/spf.zig");
+const dkim_mod = @import("../antispam/dkim.zig");
+const dmarc_mod = @import("../antispam/dmarc.zig");
+const arc_mod = @import("../antispam/arc.zig");
 const tls_mod = @import("tls.zig");
 const chunking = @import("../protocol/chunking.zig");
 const tls = @import("tls");
@@ -60,6 +64,33 @@ fn sanitizeForLog(input: []const u8) [256]u8 {
 
 fn sanitizedSlice(buf: *const [256]u8, len: usize) []const u8 {
     return buf[0..@min(len, 255)];
+}
+
+/// Domain part of an address like `<user@example.com>` or `user@example.com`.
+fn domainOf(addr: []const u8) []const u8 {
+    const at = std.mem.lastIndexOfScalar(u8, addr, '@') orelse return "";
+    var d = addr[at + 1 ..];
+    while (d.len > 0 and (d[d.len - 1] == '>' or d[d.len - 1] == ' ' or d[d.len - 1] == '\t' or d[d.len - 1] == '\r')) {
+        d = d[0 .. d.len - 1];
+    }
+    return d;
+}
+
+/// Extract the domain from the first `From:` header line, if present.
+fn extractFromDomain(headers: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, headers, '\n');
+    while (it.next()) |line| {
+        if (line.len >= 5 and std.ascii.eqlIgnoreCase(line[0..5], "From:")) {
+            const at = std.mem.lastIndexOfScalar(u8, line, '@') orelse return null;
+            const d = line[at + 1 ..];
+            var end: usize = 0;
+            while (end < d.len and d[end] != '>' and d[end] != ' ' and d[end] != '\t' and d[end] != '\r' and d[end] != ';') {
+                end += 1;
+            }
+            return d[0..end];
+        }
+    }
+    return null;
 }
 
 pub const SMTPCommand = enum {
@@ -567,7 +598,9 @@ pub const Session = struct {
         _ = try self.conn_wrapper.write("250-SMTPUTF8\r\n");
         _ = try self.conn_wrapper.write("250-CHUNKING\r\n");
 
-        if (self.config.enable_auth) {
+        // Only advertise AUTH over an encrypted channel when TLS is required for
+        // auth, so credentials are never solicited in cleartext.
+        if (self.config.enable_auth and (self.conn_wrapper.using_tls or !self.config.require_tls_for_auth)) {
             _ = try self.conn_wrapper.write("250-AUTH PLAIN LOGIN\r\n");
         }
 
@@ -828,6 +861,18 @@ pub const Session = struct {
             }
         }
 
+        // === Inbound authentication: SPF/DKIM/DMARC/ARC ===
+        // Only for unauthenticated (inbound) mail — submission clients are
+        // already trusted via AUTH. Records an Authentication-Results header
+        // and is advisory unless SMTP_ANTISPAM_ENFORCE is set.
+        if (self.config.antispam_check and !self.authenticated) {
+            if (self.runInboundAntispam(&message_data)) {
+                try self.sendResponse(writer, 550, "5.7.1 Message rejected by mail authentication policy", null);
+                try self.handleRset(writer);
+                return;
+            }
+        }
+
         // Save the message (in a real implementation, you'd save to disk or database)
         try self.saveMessage(message_data.items);
 
@@ -884,6 +929,54 @@ pub const Session = struct {
 
         // Reset state for next message
         try self.handleRset(writer);
+    }
+
+    /// Run inbound SPF/DKIM/DMARC/ARC on a received message. Inserts an
+    /// Authentication-Results header into `message_data` and logs the verdicts.
+    /// Returns true only when the message should be rejected (enforce + DMARC
+    /// fail); otherwise checks are advisory and never block delivery.
+    fn runInboundAntispam(self: *Session, message_data: *std.ArrayList(u8)) bool {
+        const data = message_data.items;
+        const split = std.mem.indexOf(u8, data, "\n\n");
+        const headers = if (split) |i| data[0..i] else data;
+        const body = if (split) |i| (if (i + 2 <= data.len) data[i + 2 ..] else "") else "";
+
+        const mail_from = self.mail_from orelse "";
+        const helo = self.client_hostname orelse "";
+        const spf_domain = domainOf(mail_from);
+        const from_domain = extractFromDomain(headers) orelse spf_domain;
+
+        var spf_v = spf_mod.SPFValidator.init(self.allocator);
+        const spf_res = spf_v.validate(self.remote_addr, mail_from, helo) catch spf_mod.SPFResult.temperror;
+
+        var dkim_v = dkim_mod.DKIMValidator.init(self.allocator);
+        const dkim_res = dkim_v.validate(headers, body) catch dkim_mod.DKIMResult.temperror;
+
+        var arc_v = arc_mod.ARCValidator.init(self.allocator);
+        const arc_res = arc_v.validateChain(headers) catch arc_mod.ARCResult.temperror;
+
+        var dmarc_v = dmarc_mod.DMARCValidator.init(self.allocator);
+        const dmarc_res = dmarc_v.validate(from_domain, spf_res, spf_domain, dkim_res, from_domain) catch dmarc_mod.DMARCResult.temperror;
+
+        self.logger.info("inbound auth ip={s} mailfrom_domain={s} header_from={s}: spf={s} dkim={s} dmarc={s} arc={s}", .{ self.remote_addr, spf_domain, from_domain, spf_res.toString(), dkim_res.toString(), dmarc_res.toString(), arc_res.toString() });
+
+        var ar_buf: [600]u8 = undefined;
+        const ar = std.fmt.bufPrint(&ar_buf, "Authentication-Results: {s}; spf={s} smtp.mailfrom={s}; dkim={s}; dmarc={s} header.from={s}; arc={s}\n", .{ self.config.hostname, spf_res.toString(), spf_domain, dkim_res.toString(), dmarc_res.toString(), from_domain, arc_res.toString() }) catch return false;
+        // Prepend the header by rebuilding the buffer (only append/deinit, which
+        // are the unmanaged-ArrayList APIs used throughout this codebase).
+        var combined: std.ArrayList(u8) = .empty;
+        combined.appendSlice(self.allocator, ar) catch {
+            combined.deinit(self.allocator);
+            return false;
+        };
+        combined.appendSlice(self.allocator, message_data.items) catch {
+            combined.deinit(self.allocator);
+            return false;
+        };
+        message_data.deinit(self.allocator);
+        message_data.* = combined;
+
+        return self.config.antispam_enforce and dmarc_res == .fail;
     }
 
     fn handleBDAT(self: *Session, writer: anytype, line: []const u8) !void {
@@ -1031,6 +1124,13 @@ pub const Session = struct {
     fn handleAuth(self: *Session, writer: anytype, line: []const u8) !void {
         if (!self.config.enable_auth) {
             try self.sendResponse(writer, 502, "Command not implemented", null);
+            return;
+        }
+
+        // Refuse cleartext AUTH when TLS is required (RFC 3207): credentials
+        // must not be sent before STARTTLS / on a non-TLS connection.
+        if (self.config.require_tls_for_auth and !self.conn_wrapper.using_tls) {
+            try self.sendResponse(writer, 538, "Encryption required for requested authentication mechanism", null);
             return;
         }
 

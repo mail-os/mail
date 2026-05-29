@@ -73,6 +73,15 @@ pub const Config = struct {
     managesieve_port: u16 = 4190,
     enable_milter: bool = false,
 
+    // Require STARTTLS (or implicit TLS) before AUTH is offered/accepted.
+    // Default off to avoid locking out existing plaintext-auth clients.
+    require_tls_for_auth: bool = false,
+    // Run inbound SPF/DKIM/DMARC/ARC checks and record Authentication-Results.
+    antispam_check: bool = true,
+    // When true, reject inbound mail that fails policy (DMARC reject). When
+    // false (default), checks are advisory/log-only and never block mail.
+    antispam_enforce: bool = false,
+
     // Outbound delivery method: "ses" (AWS SES relay), "direct" (direct MX delivery)
     delivery_method: DeliveryMethod = .ses,
     ses_region: []const u8 = "us-east-1",
@@ -396,6 +405,21 @@ fn applyEnvironmentVariables(allocator: std.mem.Allocator, cfg: *Config) !void {
     // SMTP_ENABLE_DNSBL
     if (env.get("SMTP_ENABLE_DNSBL")) |value| {
         cfg.enable_dnsbl = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+
+    // SMTP_REQUIRE_TLS_FOR_AUTH
+    if (env.get("SMTP_REQUIRE_TLS_FOR_AUTH")) |value| {
+        cfg.require_tls_for_auth = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+
+    // SMTP_ANTISPAM_CHECK (default true)
+    if (env.get("SMTP_ANTISPAM_CHECK")) |value| {
+        cfg.antispam_check = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+
+    // SMTP_ANTISPAM_ENFORCE (default false = log-only)
+    if (env.get("SMTP_ANTISPAM_ENFORCE")) |value| {
+        cfg.antispam_enforce = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
     }
 
     // SMTP_ENABLE_GREYLIST
