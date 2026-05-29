@@ -1183,10 +1183,25 @@ pub const ImapSession = struct {
             self.allocator.free(files);
         }
 
+        // Use the mailbox's real UIDVALIDITY (matching SELECT/STATUS) so clients
+        // don't invalidate their UID cache for the folder after an append.
+        const append_canon = if (std.ascii.eqlIgnoreCase(mailbox, "All Mail") or std.ascii.eqlIgnoreCase(mailbox, "All"))
+            "All Mail"
+        else if (std.ascii.eqlIgnoreCase(mailbox, "INBOX"))
+            "INBOX"
+        else
+            mailbox;
+        var append_uidvalidity: i64 = 1;
+        if (self.db) |db| {
+            if (db.getOrCreateMailbox(local_part, append_canon)) |info| {
+                append_uidvalidity = info.uidvalidity;
+            } else |_| {}
+        }
+
         // Send OK with APPENDUID
         var resp_buf: [256]u8 = undefined;
         var fbs = io_compat.fixedBufferStream(&resp_buf);
-        fbs.writer().print("[APPENDUID 1772487000 {d}] APPEND completed", .{uid}) catch {
+        fbs.writer().print("[APPENDUID {d} {d}] APPEND completed", .{ append_uidvalidity, uid }) catch {
             try self.sendResponse(tag, "OK", "APPEND completed");
             self.cleanupAppend();
             return;
