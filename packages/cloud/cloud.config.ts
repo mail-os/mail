@@ -601,6 +601,47 @@ if systemctl is-active --quiet firewalld; then
   firewall-cmd --reload >/dev/null 2>&1 || true
 fi
 
+# Install the deploy swap helper used by .github/workflows/deploy.yml. It pulls
+# the new binary from S3, swaps it, runs an IMAPS smoke test and rolls back to
+# the previous binary automatically if the new one fails to serve.
+cat > /opt/mail/deploy-swap.sh <<'SWAPEOF'
+#!/bin/bash
+set -uo pipefail
+S3_BIN="s3://stacks-production-s3-email/deploy/mail-server"
+BIN="/opt/mail/mail-server"
+NEW="/opt/mail/mail-server-new"
+OLD="/opt/mail/mail-server-old"
+log() { echo "[deploy-swap] $*"; }
+smoke() {
+  systemctl is-active --quiet mail || return 1
+  printf '' | timeout 8 openssl s_client -connect localhost:993 -quiet 2>/dev/null | head -c 200 | grep -q "OK"
+}
+log "downloading new binary from S3"
+aws s3 cp "$S3_BIN" "$NEW" || { log "download failed"; exit 1; }
+chmod +x "$NEW"
+log "stopping mail and swapping binary"
+systemctl stop mail
+cp -f "$BIN" "$OLD" 2>/dev/null || true
+mv -f "$NEW" "$BIN"
+chown mail-server:mail-server "$BIN" 2>/dev/null || true
+systemctl start mail
+sleep 3
+if smoke; then
+  log "smoke test passed; deploy ok"
+  systemctl is-active mail
+  exit 0
+fi
+log "SMOKE TEST FAILED; rolling back to previous binary"
+systemctl stop mail
+mv -f "$OLD" "$BIN"
+chown mail-server:mail-server "$BIN" 2>/dev/null || true
+systemctl start mail
+sleep 3
+if smoke; then log "rollback restored service"; else log "rollback FAILED; service down"; fi
+exit 1
+SWAPEOF
+chmod +x /opt/mail/deploy-swap.sh
+
 # Set up certbot auto-renewal with service restart.
 # The mail server binds port 80 (for ACME HTTP-01 / ActiveSync), so the
 # standalone authenticator cannot bind it during renewal. Stop mail in the

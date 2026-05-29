@@ -45,7 +45,7 @@ jobs:
         COMMAND_ID=$(aws ssm send-command \
           --instance-ids ${{ secrets.INSTANCE_ID }} \
           --document-name AWS-RunShellScript \
-          --parameters '{"commands":["aws s3 cp s3://stacks-production-s3-email/deploy/mail-server /opt/mail/mail-server-new","chmod +x /opt/mail/mail-server-new","systemctl stop mail","mv /opt/mail/mail-server /opt/mail/mail-server-old","mv /opt/mail/mail-server-new /opt/mail/mail-server","systemctl start mail","sleep 2","systemctl is-active mail"]}' \
+          --parameters '{"commands":["bash /opt/mail/deploy-swap.sh"]}' \
           --output text --query 'Command.CommandId')
 
         echo "Command ID: $COMMAND_ID"
