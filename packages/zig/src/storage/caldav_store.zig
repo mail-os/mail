@@ -270,8 +270,9 @@ pub const CalDavStore = struct {
         while (contact_iter.next()) |entry| {
             self.allocator.free(entry.value_ptr.etag);
         }
-        // Free allocated href strings in sync changes
+        // Free allocated etag/href strings in sync changes (both owned by the store)
         for (self.sync_changes.items) |change| {
+            self.allocator.free(change.etag);
             self.allocator.free(change.href);
         }
         self.calendars.deinit();
@@ -510,6 +511,9 @@ pub const CalDavStore = struct {
         if (self.events.get(id)) |event| {
             const etag = event.etag;
             const calendar_id = event.calendar_id;
+            // The live etag is no longer owned by the map once we remove the
+            // event; recordChange dupes its own copy, so free it here in all paths.
+            defer self.allocator.free(etag);
 
             if (self.config.enable_sync_tokens) {
                 const href = try self.getEventHref(event.calendar_id, event.uid);
@@ -517,7 +521,6 @@ pub const CalDavStore = struct {
                 try self.recordChange(calendar_id, id, .event, .deleted, etag, href);
             } else {
                 _ = self.events.remove(id);
-                self.allocator.free(etag);
             }
             try self.updateCalendarCtag(calendar_id);
         }
@@ -864,6 +867,9 @@ pub const CalDavStore = struct {
         if (self.contacts.get(id)) |contact| {
             const etag = contact.etag;
             const addressbook_id = contact.addressbook_id;
+            // recordChange dupes its own etag copy; free the now-unowned live
+            // etag here in all paths.
+            defer self.allocator.free(etag);
 
             // Remove associated emails and phones
             var i: usize = 0;
@@ -890,7 +896,6 @@ pub const CalDavStore = struct {
                 try self.recordChange(addressbook_id, id, .contact, .deleted, etag, href);
             } else {
                 _ = self.contacts.remove(id);
-                self.allocator.free(etag);
             }
             try self.updateAddressBookCtag(addressbook_id);
         }
@@ -935,6 +940,11 @@ pub const CalDavStore = struct {
         };
     }
 
+    /// Record a sync change. The `href` slice is owned by the store after this
+    /// call (ownership transferred from the caller). The `etag` slice is NOT
+    /// taken over: it is duplicated here so the SyncChange owns an independent
+    /// copy and does not alias the live Event/Contact etag (which may be freed
+    /// by a later update/delete -> use-after-free).
     fn recordChange(
         self: *Self,
         collection_id: u64,
@@ -944,9 +954,20 @@ pub const CalDavStore = struct {
         etag: []const u8,
         href: []const u8,
     ) !void {
-        if (!self.config.enable_sync_tokens) return;
+        if (!self.config.enable_sync_tokens) {
+            // Caller transferred ownership of href; free it since we won't store it.
+            self.allocator.free(href);
+            return;
+        }
 
         self.current_sync_token += 1;
+
+        const owned_etag = self.allocator.dupe(u8, etag) catch |err| {
+            // On failure, free the caller-owned href to avoid a leak.
+            self.allocator.free(href);
+            return err;
+        };
+        errdefer self.allocator.free(owned_etag);
 
         try self.sync_changes.append(self.allocator, .{
             .resource_id = resource_id,
@@ -954,14 +975,17 @@ pub const CalDavStore = struct {
             .resource_type = resource_type,
             .change_type = change_type,
             .token = self.current_sync_token,
-            .etag = etag,
+            .etag = owned_etag,
             .href = href,
             .timestamp = currentTimestamp(),
         });
 
-        // Prune old history
+        // Prune old history, bounding retained changes. Free owned strings of
+        // any pruned entries to avoid leaks.
         while (self.sync_changes.items.len > self.config.max_sync_history) {
-            _ = self.sync_changes.orderedRemove(0);
+            const removed = self.sync_changes.orderedRemove(0);
+            self.allocator.free(removed.etag);
+            self.allocator.free(removed.href);
         }
     }
 

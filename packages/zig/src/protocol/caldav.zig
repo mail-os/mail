@@ -108,13 +108,94 @@ pub const ParsedPath = struct {
     };
 };
 
+/// Determine the total byte length of the first complete HTTP request in `buf`,
+/// honoring Content-Length. Returns null if the request is not yet complete
+/// (headers not fully received, or body shorter than Content-Length).
+fn httpRequestLength(buf: []const u8) ?usize {
+    const header_end = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return null;
+    const body_start = header_end + 4;
+    const headers = buf[0..header_end];
+
+    var content_length: usize = 0;
+    var h_lines = std.mem.splitSequence(u8, headers, "\r\n");
+    while (h_lines.next()) |hline| {
+        if (hline.len >= 15 and std.ascii.eqlIgnoreCase(hline[0..15], "content-length:")) {
+            const val = std.mem.trim(u8, hline[15..], &std.ascii.whitespace);
+            content_length = std.fmt.parseInt(usize, val, 10) catch 0;
+            break;
+        }
+    }
+
+    const total = body_start + content_length;
+    if (buf.len < total) return null;
+    return total;
+}
+
+/// Percent-decode `input` once into `out`, returning the decoded slice.
+/// Returns null if the input does not fit in `out`. Malformed escapes are
+/// passed through literally (the '%' is kept) so they cannot smuggle bytes.
+fn percentDecodeOnce(input: []const u8, out: []u8) ?[]const u8 {
+    var oi: usize = 0;
+    var i: usize = 0;
+    while (i < input.len) {
+        if (oi >= out.len) return null;
+        const c = input[i];
+        if (c == '%' and i + 2 < input.len) {
+            const byte = std.fmt.parseInt(u8, input[i + 1 .. i + 3], 16) catch {
+                // Malformed escape: keep '%' literally so no byte is smuggled.
+                out[oi] = c;
+                oi += 1;
+                i += 1;
+                continue;
+            };
+            out[oi] = byte;
+            oi += 1;
+            i += 3;
+        } else {
+            out[oi] = c;
+            oi += 1;
+            i += 1;
+        }
+    }
+    return out[0..oi];
+}
+
+/// Returns true if a percent-decoded path is unsafe (traversal, control chars,
+/// or path-escaping sequences).
+fn isUnsafeDecodedPath(decoded: []const u8) bool {
+    // Reject traversal in any form once decoded.
+    if (std.mem.indexOf(u8, decoded, "..") != null) return true;
+    // Reject backslashes (Windows-style separators / absolute-path bypass).
+    if (std.mem.indexOfScalar(u8, decoded, '\\') != null) return true;
+    // Reject control characters (including NUL and embedded CR/LF) which could
+    // smuggle separators or corrupt downstream handling.
+    for (decoded) |c| {
+        if (c < 0x20 or c == 0x7f) return true;
+    }
+    return false;
+}
+
 /// Parse a CalDAV/CardDAV path into components.
 /// Paths follow patterns like:
 ///   /principals/{user}
 ///   /calendars/{user}/{calendar}/{uid}.ics
 ///   /addressbooks/{user}/{addressbook}/{uid}.vcf
 pub fn parsePath(path: []const u8) ParsedPath {
-    // SECURITY: Reject path traversal attempts
+    // SECURITY: Reject path traversal attempts, including percent-encoded
+    // bypasses (e.g. "%2e%2e", "%2f"). Decode once into a stack buffer purely
+    // for validation; the returned slices still point into the original `path`.
+    var decode_buf: [2048]u8 = undefined;
+    if (percentDecodeOnce(path, &decode_buf)) |decoded| {
+        if (isUnsafeDecodedPath(decoded)) {
+            return .{ .path_type = .unknown };
+        }
+    } else {
+        // Path too long to decode/validate safely; reject.
+        return .{ .path_type = .unknown };
+    }
+
+    // Also reject traversal in the raw (still-encoded) form as a belt-and-braces
+    // check in case the decoded slices are used elsewhere.
     if (std.mem.indexOf(u8, path, "..") != null) {
         return .{ .path_type = .unknown };
     }
@@ -226,6 +307,60 @@ fn appendXmlEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, compt
     try buf.appendSlice(allocator, prefix);
     try buf.appendSlice(allocator, escaped);
     try buf.appendSlice(allocator, suffix);
+}
+
+/// Append a resource <D:href> element with every dynamic path component
+/// XML-escaped. Produces: "    <D:href>{base}{user}/{collection}/{uid}{ext}</D:href>\n"
+fn appendResourceHref(
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    comptime base: []const u8,
+    user: []const u8,
+    collection: []const u8,
+    uid: []const u8,
+    comptime ext: []const u8,
+) !void {
+    const user_esc = try xmlEscape(allocator, user);
+    defer allocator.free(user_esc);
+    const coll_esc = try xmlEscape(allocator, collection);
+    defer allocator.free(coll_esc);
+    const uid_esc = try xmlEscape(allocator, uid);
+    defer allocator.free(uid_esc);
+
+    try buf.appendSlice(allocator, "    <D:href>" ++ base);
+    try buf.appendSlice(allocator, user_esc);
+    try buf.appendSlice(allocator, "/");
+    try buf.appendSlice(allocator, coll_esc);
+    try buf.appendSlice(allocator, "/");
+    try buf.appendSlice(allocator, uid_esc);
+    try buf.appendSlice(allocator, ext ++ "</D:href>\n");
+}
+
+/// Append a plain <D:href> element with the href value XML-escaped.
+fn appendHrefEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, href: []const u8) !void {
+    try appendXmlEscaped(buf, allocator, "    <D:href>", href, "</D:href>\n");
+}
+
+/// Append a collection <D:href> element (trailing slash) with the user and
+/// collection components XML-escaped.
+/// Produces: "    <D:href>{base}{user}/{collection}/</D:href>\n"
+fn appendCollectionHref(
+    buf: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    comptime base: []const u8,
+    user: []const u8,
+    collection: []const u8,
+) !void {
+    const user_esc = try xmlEscape(allocator, user);
+    defer allocator.free(user_esc);
+    const coll_esc = try xmlEscape(allocator, collection);
+    defer allocator.free(coll_esc);
+
+    try buf.appendSlice(allocator, "    <D:href>" ++ base);
+    try buf.appendSlice(allocator, user_esc);
+    try buf.appendSlice(allocator, "/");
+    try buf.appendSlice(allocator, coll_esc);
+    try buf.appendSlice(allocator, "/</D:href>\n");
 }
 
 // ============================================================================
@@ -496,16 +631,18 @@ pub const CalDavSession = struct {
             },
             .principals, .principal_user => {
                 const username = parsed.user orelse (self.username orelse "user");
+                const username_esc = try xmlEscape(self.allocator, username);
+                defer self.allocator.free(username_esc);
                 try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
                 try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
                 try buf.appendSlice(self.allocator, "  <D:response>\n");
-                try appendPrint(&buf, self.allocator, "    <D:href>/principals/{s}</D:href>\n", .{username});
+                try appendPrint(&buf, self.allocator, "    <D:href>/principals/{s}</D:href>\n", .{username_esc});
                 try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                 try buf.appendSlice(self.allocator, "      <D:prop>\n");
                 try buf.appendSlice(self.allocator, "        <D:resourcetype><D:principal/></D:resourcetype>\n");
-                try appendPrint(&buf, self.allocator, "        <D:current-user-principal><D:href>/principals/{s}</D:href></D:current-user-principal>\n", .{username});
-                try appendPrint(&buf, self.allocator, "        <C:calendar-home-set><D:href>/calendars/{s}/</D:href></C:calendar-home-set>\n", .{username});
-                try appendPrint(&buf, self.allocator, "        <CARD:addressbook-home-set><D:href>/addressbooks/{s}/</D:href></CARD:addressbook-home-set>\n", .{username});
+                try appendPrint(&buf, self.allocator, "        <D:current-user-principal><D:href>/principals/{s}</D:href></D:current-user-principal>\n", .{username_esc});
+                try appendPrint(&buf, self.allocator, "        <C:calendar-home-set><D:href>/calendars/{s}/</D:href></C:calendar-home-set>\n", .{username_esc});
+                try appendPrint(&buf, self.allocator, "        <CARD:addressbook-home-set><D:href>/addressbooks/{s}/</D:href></CARD:addressbook-home-set>\n", .{username_esc});
                 try buf.appendSlice(self.allocator, "      </D:prop>\n");
                 try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
                 try buf.appendSlice(self.allocator, "    </D:propstat>\n");
@@ -520,7 +657,7 @@ pub const CalDavSession = struct {
                 for (calendars) |cal| {
                     try buf.appendSlice(self.allocator, "  <D:response>\n");
                     const username = parsed.user orelse "user";
-                    try appendPrint(&buf, self.allocator, "    <D:href>/calendars/{s}/{s}/</D:href>\n", .{ username, cal.name });
+                    try appendCollectionHref(&buf, self.allocator, "/calendars/", username, cal.name);
                     try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                     try buf.appendSlice(self.allocator, "      <D:prop>\n");
                     try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\n");
@@ -543,7 +680,7 @@ pub const CalDavSession = struct {
 
                 // Collection itself
                 try buf.appendSlice(self.allocator, "  <D:response>\n");
-                try appendPrint(&buf, self.allocator, "    <D:href>/calendars/{s}/{s}/</D:href>\n", .{ username, collection_name });
+                try appendCollectionHref(&buf, self.allocator, "/calendars/", username, collection_name);
                 try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                 try buf.appendSlice(self.allocator, "      <D:prop>\n");
                 try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\n");
@@ -562,10 +699,10 @@ pub const CalDavSession = struct {
                             const events = self.store.getCalendarEvents(cal.id) catch &[_]caldav_store.Event{};
                             for (events) |event| {
                                 try buf.appendSlice(self.allocator, "  <D:response>\n");
-                                try appendPrint(&buf, self.allocator, "    <D:href>/calendars/{s}/{s}/{s}.ics</D:href>\n", .{ username, collection_name, event.uid });
+                                try appendResourceHref(&buf, self.allocator, "/calendars/", username, collection_name, event.uid, ".ics");
                                 try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                                 try buf.appendSlice(self.allocator, "      <D:prop>\n");
-                                try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{event.etag});
+                                try appendXmlEscaped(&buf, self.allocator, "        <D:getetag>", event.etag, "</D:getetag>\n");
                                 try buf.appendSlice(self.allocator, "      </D:prop>\n");
                                 try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
                                 try buf.appendSlice(self.allocator, "    </D:propstat>\n");
@@ -584,7 +721,7 @@ pub const CalDavSession = struct {
                 for (addressbooks) |ab| {
                     try buf.appendSlice(self.allocator, "  <D:response>\n");
                     const username = parsed.user orelse "user";
-                    try appendPrint(&buf, self.allocator, "    <D:href>/addressbooks/{s}/{s}/</D:href>\n", .{ username, ab.name });
+                    try appendCollectionHref(&buf, self.allocator, "/addressbooks/", username, ab.name);
                     try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                     try buf.appendSlice(self.allocator, "      <D:prop>\n");
                     try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>\n");
@@ -608,7 +745,7 @@ pub const CalDavSession = struct {
 
                 // Collection itself
                 try buf.appendSlice(self.allocator, "  <D:response>\n");
-                try appendPrint(&buf, self.allocator, "    <D:href>/addressbooks/{s}/{s}/</D:href>\n", .{ username, collection_name });
+                try appendCollectionHref(&buf, self.allocator, "/addressbooks/", username, collection_name);
                 try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                 try buf.appendSlice(self.allocator, "      <D:prop>\n");
                 try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>\n");
@@ -627,10 +764,10 @@ pub const CalDavSession = struct {
                             const contacts = self.store.getAddressBookContacts(ab.id) catch &[_]caldav_store.Contact{};
                             for (contacts) |contact| {
                                 try buf.appendSlice(self.allocator, "  <D:response>\n");
-                                try appendPrint(&buf, self.allocator, "    <D:href>/addressbooks/{s}/{s}/{s}.vcf</D:href>\n", .{ username, collection_name, contact.uid });
+                                try appendResourceHref(&buf, self.allocator, "/addressbooks/", username, collection_name, contact.uid, ".vcf");
                                 try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                                 try buf.appendSlice(self.allocator, "      <D:prop>\n");
-                                try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{contact.etag});
+                                try appendXmlEscaped(&buf, self.allocator, "        <D:getetag>", contact.etag, "</D:getetag>\n");
                                 try buf.appendSlice(self.allocator, "      </D:prop>\n");
                                 try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
                                 try buf.appendSlice(self.allocator, "    </D:propstat>\n");
@@ -647,9 +784,7 @@ pub const CalDavSession = struct {
                 try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
                 try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\">\n");
                 try buf.appendSlice(self.allocator, "  <D:response>\n");
-                try buf.appendSlice(self.allocator, "    <D:href>");
-                try buf.appendSlice(self.allocator, path);
-                try buf.appendSlice(self.allocator, "</D:href>\n");
+                try appendHrefEscaped(&buf, self.allocator, path);
                 try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                 try buf.appendSlice(self.allocator, "      <D:prop>\n");
                 try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/></D:resourcetype>\n");
@@ -713,8 +848,15 @@ pub const CalDavSession = struct {
                     const user_id = self.getUserId() catch 1;
                     if (self.store.getCalendarByName(user_id, col_name)) |cal| {
                         if (self.store.calendars.getPtr(cal.id)) |cal_ptr| {
-                            if (new_name) |name| cal_ptr.name = name;
-                            if (new_color) |color| cal_ptr.color = color;
+                            // SECURITY/CORRECTNESS: new_name/new_color point into the
+                            // request buffer, which is freed after this request. Dupe
+                            // with the store allocator so the stored slices stay valid.
+                            if (new_name) |name| {
+                                cal_ptr.name = try self.store.allocator.dupe(u8, name);
+                            }
+                            if (new_color) |color| {
+                                cal_ptr.color = try self.store.allocator.dupe(u8, color);
+                            }
                         }
                         // Return 207 Multi-Status success
                         const resp = "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\n\r\n" ++
@@ -737,7 +879,12 @@ pub const CalDavSession = struct {
                     const user_id = self.getUserId() catch 1;
                     if (self.store.getAddressBookByName(user_id, col_name)) |ab| {
                         if (self.store.addressbooks.getPtr(ab.id)) |ab_ptr| {
-                            if (new_name) |name| ab_ptr.name = name;
+                            // SECURITY/CORRECTNESS: new_name points into the request
+                            // buffer (freed after this request). Dupe with the store
+                            // allocator so the stored slice stays valid.
+                            if (new_name) |name| {
+                                ab_ptr.name = try self.store.allocator.dupe(u8, name);
+                            }
                         }
                         const resp = "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\n\r\n" ++
                             "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" ++
@@ -1297,14 +1444,12 @@ pub const CalDavSession = struct {
                         if (event.dtstart >= end) continue;
                     }
                     try buf.appendSlice(self.allocator, "  <D:response>\n");
-                    try appendPrint(&buf, self.allocator, "    <D:href>/calendars/{s}/{s}/{s}.ics</D:href>\n", .{ username, collection_name, event.uid });
+                    try appendResourceHref(&buf, self.allocator, "/calendars/", username, collection_name, event.uid, ".ics");
                     try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                     try buf.appendSlice(self.allocator, "      <D:prop>\n");
-                    try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{event.etag});
+                    try appendXmlEscaped(&buf, self.allocator, "        <D:getetag>", event.etag, "</D:getetag>\n");
                     if (event.ics_data.len > 0) {
-                        try buf.appendSlice(self.allocator, "        <C:calendar-data>");
-                        try buf.appendSlice(self.allocator, event.ics_data);
-                        try buf.appendSlice(self.allocator, "</C:calendar-data>\n");
+                        try appendXmlEscaped(&buf, self.allocator, "        <C:calendar-data>", event.ics_data, "</C:calendar-data>\n");
                     }
                     try buf.appendSlice(self.allocator, "      </D:prop>\n");
                     try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
@@ -1348,14 +1493,12 @@ pub const CalDavSession = struct {
                                 if (std.mem.eql(u8, cal.name, coll)) {
                                     if (self.store.getEventByUid(cal.id, uid)) |event| {
                                         try buf.appendSlice(self.allocator, "  <D:response>\n");
-                                        try appendPrint(&buf, self.allocator, "    <D:href>{s}</D:href>\n", .{href});
+                                        try appendHrefEscaped(&buf, self.allocator, href);
                                         try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                                         try buf.appendSlice(self.allocator, "      <D:prop>\n");
-                                        try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{event.etag});
+                                        try appendXmlEscaped(&buf, self.allocator, "        <D:getetag>", event.etag, "</D:getetag>\n");
                                         if (event.ics_data.len > 0) {
-                                            try buf.appendSlice(self.allocator, "        <C:calendar-data>");
-                                            try buf.appendSlice(self.allocator, event.ics_data);
-                                            try buf.appendSlice(self.allocator, "</C:calendar-data>\n");
+                                            try appendXmlEscaped(&buf, self.allocator, "        <C:calendar-data>", event.ics_data, "</C:calendar-data>\n");
                                         }
                                         try buf.appendSlice(self.allocator, "      </D:prop>\n");
                                         try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
@@ -1397,17 +1540,15 @@ pub const CalDavSession = struct {
                 const contacts = self.store.getAddressBookContacts(ab.id) catch &[_]caldav_store.Contact{};
                 for (contacts) |contact| {
                     try buf.appendSlice(self.allocator, "  <D:response>\n");
-                    try appendPrint(&buf, self.allocator, "    <D:href>/addressbooks/{s}/{s}/{s}.vcf</D:href>\n", .{ username, collection_name, contact.uid });
+                    try appendResourceHref(&buf, self.allocator, "/addressbooks/", username, collection_name, contact.uid, ".vcf");
                     try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                     try buf.appendSlice(self.allocator, "      <D:prop>\n");
-                    try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{contact.etag});
+                    try appendXmlEscaped(&buf, self.allocator, "        <D:getetag>", contact.etag, "</D:getetag>\n");
                     const gen_vcf: ?[]u8 = if (contact.vcf_data.len == 0) (self.store.generateVcf(contact) catch null) else null;
                     defer if (gen_vcf) |g| self.allocator.free(g);
                     const vcf: []const u8 = gen_vcf orelse contact.vcf_data;
                     if (vcf.len > 0) {
-                        try buf.appendSlice(self.allocator, "        <CARD:address-data>");
-                        try buf.appendSlice(self.allocator, vcf);
-                        try buf.appendSlice(self.allocator, "</CARD:address-data>\n");
+                        try appendXmlEscaped(&buf, self.allocator, "        <CARD:address-data>", vcf, "</CARD:address-data>\n");
                     }
                     try buf.appendSlice(self.allocator, "      </D:prop>\n");
                     try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
@@ -1450,17 +1591,15 @@ pub const CalDavSession = struct {
                                 if (std.mem.eql(u8, ab.name, coll)) {
                                     if (self.store.getContactByUid(ab.id, uid)) |contact| {
                                         try buf.appendSlice(self.allocator, "  <D:response>\n");
-                                        try appendPrint(&buf, self.allocator, "    <D:href>{s}</D:href>\n", .{href});
+                                        try appendHrefEscaped(&buf, self.allocator, href);
                                         try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                                         try buf.appendSlice(self.allocator, "      <D:prop>\n");
-                                        try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{contact.etag});
+                                        try appendXmlEscaped(&buf, self.allocator, "        <D:getetag>", contact.etag, "</D:getetag>\n");
                                         const gen_vcf: ?[]u8 = if (contact.vcf_data.len == 0) (self.store.generateVcf(contact) catch null) else null;
                                         defer if (gen_vcf) |g| self.allocator.free(g);
                                         const vcf: []const u8 = gen_vcf orelse contact.vcf_data;
                                         if (vcf.len > 0) {
-                                            try buf.appendSlice(self.allocator, "        <CARD:address-data>");
-                                            try buf.appendSlice(self.allocator, vcf);
-                                            try buf.appendSlice(self.allocator, "</CARD:address-data>\n");
+                                            try appendXmlEscaped(&buf, self.allocator, "        <CARD:address-data>", vcf, "</CARD:address-data>\n");
                                         }
                                         try buf.appendSlice(self.allocator, "      </D:prop>\n");
                                         try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
@@ -1532,6 +1671,10 @@ pub const CalDavSession = struct {
             try self.sendError(500, "Internal Server Error");
             return;
         };
+        // getChangesSince allocates the changes slice with the store allocator; the
+        // SyncChange entries themselves alias store-owned strings, so only free the
+        // slice (not its elements).
+        defer self.store.allocator.free(report.changes);
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
@@ -1541,13 +1684,13 @@ pub const CalDavSession = struct {
 
         for (report.changes) |change| {
             try buf.appendSlice(self.allocator, "  <D:response>\n");
-            try appendPrint(&buf, self.allocator, "    <D:href>{s}</D:href>\n", .{change.href});
+            try appendHrefEscaped(&buf, self.allocator, change.href);
             if (change.change_type == .deleted) {
                 try buf.appendSlice(self.allocator, "    <D:status>HTTP/1.1 404 Not Found</D:status>\n");
             } else {
                 try buf.appendSlice(self.allocator, "    <D:propstat>\n");
                 try buf.appendSlice(self.allocator, "      <D:prop>\n");
-                try appendPrint(&buf, self.allocator, "        <D:getetag>{s}</D:getetag>\n", .{change.etag});
+                try appendXmlEscaped(&buf, self.allocator, "        <D:getetag>", change.etag, "</D:getetag>\n");
                 try buf.appendSlice(self.allocator, "      </D:prop>\n");
                 try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
                 try buf.appendSlice(self.allocator, "    </D:propstat>\n");
@@ -1839,58 +1982,73 @@ pub const CalDavServer = struct {
             // Handle TLS session - must be inside this block to access recv_buf/recv_len
             if (tls_cipher) |cipher| {
                 var tls_conn = tls.nonblock.Connection.init(cipher);
-                var cleartext_buf: [8192]u8 = undefined;
-                var ciphertext_accum: [tls.input_buffer_len * 2]u8 = undefined;
-                var ciphertext_len: usize = 0;
-
-                // First, check if there's leftover data from handshake
-                if (recv_len > 0) {
-                    @memcpy(ciphertext_accum[0..recv_len], recv_buf[0..recv_len]);
-                    ciphertext_len = recv_len;
-                }
-
-                // If no leftover data, read from socket
-                if (ciphertext_len == 0) {
-                    const bytes_read = connection.read(recv_buf[0..]) catch return;
-                    if (bytes_read == 0) return;
-                    @memcpy(ciphertext_accum[0..bytes_read], recv_buf[0..bytes_read]);
-                    ciphertext_len = bytes_read;
-                }
-
-                const dec_result = tls_conn.decrypt(ciphertext_accum[0..ciphertext_len], &cleartext_buf) catch |err| {
-                    logger.err("CalDAV TLS decrypt error: {}", .{err});
-                    return;
-                };
+                var cleartext_buf: [tls.input_buffer_len]u8 = undefined;
 
                 var tls_session = TlsCalDavSession.init(self.allocator, connection, self.auth_backend, self.store, &tls_conn);
                 defer tls_session.deinit();
 
-                // Handle first request if we have cleartext from initial decrypt
-                if (dec_result.cleartext.len > 0) {
-                    _ = tls_session.handleRequest(&self.config, dec_result.cleartext) catch {};
-                }
+                // Accumulate decrypted cleartext until a full HTTP request (headers
+                // + Content-Length body) has been received, then dispatch. This
+                // prevents truncating large PUTs (bug: previously capped at 8192).
+                var request_accum: std.ArrayList(u8) = .empty;
+                defer request_accum.deinit(self.allocator);
 
-                // Keep connection alive for multiple requests (needed for Digest auth)
-                var request_buf: [8192]u8 = undefined;
-                while (true) {
-                    // Read more encrypted data
-                    const bytes_read = connection.read(recv_buf[0..]) catch break;
-                    if (bytes_read == 0) break;
+                // `cipher_len` tracks ciphertext buffered at the front of recv_buf,
+                // including any partial TLS record left unconsumed by a previous
+                // decrypt. Seeded with leftover handshake bytes.
+                var cipher_len: usize = recv_len;
+                var closed = false;
 
-                    // Decrypt the data
-                    const dec = tls_conn.decrypt(recv_buf[0..bytes_read], &cleartext_buf) catch break;
-
-                    if (dec.cleartext.len > 0) {
-                        // Copy to request buffer
-                        const copy_len = @min(dec.cleartext.len, request_buf.len);
-                        @memcpy(request_buf[0..copy_len], dec.cleartext[0..copy_len]);
-
-                        // Handle the request
-                        _ = tls_session.handleRequest(&self.config, request_buf[0..copy_len]) catch {};
+                while (!closed) {
+                    // Always read more ciphertext from the socket, appending after
+                    // any carried-over partial record. A (blocking) read of 0 means
+                    // the peer closed -> stop. If the buffer is already full we skip
+                    // the read and decrypt what we have to make progress.
+                    if (cipher_len < recv_buf.len) {
+                        const bytes_read = connection.read(recv_buf[cipher_len..]) catch break;
+                        if (bytes_read == 0) break;
+                        cipher_len += bytes_read;
                     }
 
-                    // Check for connection close from client
-                    if (dec.closed) break;
+                    const dec = tls_conn.decrypt(recv_buf[0..cipher_len], &cleartext_buf) catch |err| {
+                        logger.err("CalDAV TLS decrypt error: {}", .{err});
+                        break;
+                    };
+                    if (dec.closed) closed = true;
+
+                    // Preserve any ciphertext not consumed (a partial record) by
+                    // shifting it to the front of recv_buf for the next read.
+                    const consumed = dec.ciphertext_pos;
+                    const leftover = cipher_len - consumed;
+                    if (leftover > 0 and consumed > 0) {
+                        std.mem.copyForwards(u8, recv_buf[0..leftover], recv_buf[consumed..cipher_len]);
+                    }
+                    cipher_len = leftover;
+
+                    // Guard against a stall: no ciphertext consumed and buffer full
+                    // means a single record is larger than our buffer -> give up.
+                    if (consumed == 0 and cipher_len >= recv_buf.len) break;
+
+                    if (dec.cleartext.len > 0) {
+                        // SECURITY: bound total buffered request size.
+                        if (request_accum.items.len + dec.cleartext.len > self.config.max_resource_size) {
+                            try tls_session.sendTls("HTTP/1.1 413 Request Entity Too Large\r\nContent-Length: 0\r\n\r\n");
+                            break;
+                        }
+                        try request_accum.appendSlice(self.allocator, dec.cleartext);
+                    }
+
+                    // Dispatch every complete request currently buffered (handles
+                    // pipelining), keeping any trailing partial request.
+                    while (httpRequestLength(request_accum.items)) |req_len| {
+                        _ = tls_session.handleRequest(&self.config, request_accum.items[0..req_len]) catch {};
+                        // Drop the consumed request, shifting any remainder down.
+                        const remaining = request_accum.items.len - req_len;
+                        if (remaining > 0) {
+                            std.mem.copyForwards(u8, request_accum.items[0..remaining], request_accum.items[req_len..]);
+                        }
+                        request_accum.shrinkRetainingCapacity(remaining);
+                    }
                 }
 
                 // Send close notify
@@ -2100,6 +2258,12 @@ const TlsCalDavSession = struct {
             var response_body_buf: [4096]u8 = undefined;
             var response_fbs = io_compat.fixedBufferStream(&response_body_buf);
             const response_writer = response_fbs.writer();
+
+            // TODO(security): `path` and `username` are written into the XML below
+            // unescaped. The non-TLS PROPFIND path (handlePropfind) XML-escapes all
+            // dynamic values; this TLS stub still uses a fixed-buffer writer. It
+            // should be migrated to the ArrayList + appendXmlEscaped helpers used
+            // elsewhere so `<` `>` `&` `"` `'` in the path/username are escaped.
 
             if (is_principals or is_root) {
                 // Principal discovery - return current-user-principal, calendar-home-set, addressbook-home-set
