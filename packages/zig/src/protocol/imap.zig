@@ -2720,13 +2720,18 @@ pub const ImapSession = struct {
                 }
             }
 
-            // Send untagged FETCH response with updated flags (unless .SILENT)
+            // Send untagged FETCH response with updated flags (unless .SILENT).
+            // Always include UID: a UID STORE (which Apple Mail uses to mark
+            // read/unread) requires the UID in the FETCH response so the client
+            // can correlate the flag change to its UID-keyed message and update
+            // its unread count. Without it the badge never reflects the change.
             if (!is_silent) {
                 var flag_str_buf: [256]u8 = undefined;
                 const flag_str = flags.toImapString(&flag_str_buf);
+                const uid = self.getUidForSeq(seq);
                 var resp_buf: [512]u8 = undefined;
                 var fbs = io_compat.fixedBufferStream(&resp_buf);
-                fbs.writer().print("{d} FETCH (FLAGS ({s}))", .{ seq, flag_str }) catch continue;
+                fbs.writer().print("{d} FETCH (UID {d} FLAGS ({s}))", .{ seq, uid, flag_str }) catch continue;
                 self.sendUntagged(fbs.getWritten()) catch continue;
             }
         }
