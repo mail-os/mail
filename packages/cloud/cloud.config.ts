@@ -614,7 +614,14 @@ OLD="/opt/mail/mail-server-old"
 log() { echo "[deploy-swap] $*"; }
 smoke() {
   systemctl is-active --quiet mail || return 1
-  printf '' | timeout 8 openssl s_client -connect localhost:993 -quiet 2>/dev/null | head -c 200 | grep -q "OK"
+  # Command substitution (not a bare pipe) so a SIGPIPE from head under
+  # pipefail cannot turn a healthy server into a false smoke failure.
+  local g
+  g="$(printf '' | timeout 8 openssl s_client -connect localhost:993 -quiet 2>/dev/null | head -c 200 || true)"
+  case "$g" in
+    *OK*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 log "downloading new binary from S3"
 aws s3 cp "$S3_BIN" "$NEW" || { log "download failed"; exit 1; }
