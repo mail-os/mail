@@ -1,5 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
+const time_compat = @import("../core/time_compat.zig");
 
 // =============================================================================
 // DNS query helpers (TXT / A / MX over UDP) - RFC 1035
@@ -32,7 +33,7 @@ const DNS_CLASS_IN: u16 = 1;
 /// Read the first nameserver from /etc/resolv.conf into `buf`.
 /// Returns the IPv4 string slice or null if none found.
 fn readSystemNameserver(buf: []u8) ?[]const u8 {
-    const fd = std.c.open("/etc/resolv.conf".ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    const fd = std.c.open("/etc/resolv.conf".ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;
     defer _ = std.c.close(fd);
 
@@ -48,11 +49,86 @@ fn readSystemNameserver(buf: []u8) ?[]const u8 {
         const rest = std.mem.trim(u8, trimmed["nameserver".len..], " \t\r");
         if (rest.len == 0 or rest.len > buf.len) continue;
         // Only accept IPv4 here (UDP socket below is AF.INET)
-        _ = std.net.Address.parseIp4(rest, 0) catch continue;
+        if (parseIp4(rest) == null) continue;
         @memcpy(buf[0..rest.len], rest);
         return buf[0..rest.len];
     }
     return null;
+}
+
+/// Parse a dotted-quad IPv4 string into a host-order u32 (null if malformed).
+fn parseIp4(s: []const u8) ?u32 {
+    var octets: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, s, '.');
+    var i: usize = 0;
+    while (it.next()) |part| {
+        if (i >= 4) return null;
+        octets[i] = std.fmt.parseInt(u8, part, 10) catch return null;
+        i += 1;
+    }
+    if (i != 4) return null;
+    return (@as(u32, octets[0]) << 24) | (@as(u32, octets[1]) << 16) | (@as(u32, octets[2]) << 8) | @as(u32, octets[3]);
+}
+
+/// Parse an IPv6 string (full form or one "::") into 16 bytes (null on error).
+fn parseIp6(s: []const u8) ?[16]u8 {
+    var out: [16]u8 = std.mem.zeroes([16]u8);
+    if (std.mem.indexOf(u8, s, "::")) |pos| {
+        var head: [8]u16 = undefined;
+        var hn: usize = 0;
+        var tail: [8]u16 = undefined;
+        var tn: usize = 0;
+        if (pos > 0) {
+            var it = std.mem.splitScalar(u8, s[0..pos], ':');
+            while (it.next()) |g| {
+                if (g.len == 0) continue;
+                if (hn >= 8) return null;
+                head[hn] = std.fmt.parseInt(u16, g, 16) catch return null;
+                hn += 1;
+            }
+        }
+        const tpart = s[pos + 2 ..];
+        if (tpart.len > 0) {
+            var it = std.mem.splitScalar(u8, tpart, ':');
+            while (it.next()) |g| {
+                if (g.len == 0) continue;
+                if (tn >= 8) return null;
+                tail[tn] = std.fmt.parseInt(u16, g, 16) catch return null;
+                tn += 1;
+            }
+        }
+        if (hn + tn > 8) return null;
+        var idx: usize = 0;
+        var k: usize = 0;
+        while (k < hn) : (k += 1) {
+            out[idx] = @intCast(head[k] >> 8);
+            out[idx + 1] = @intCast(head[k] & 0xff);
+            idx += 2;
+        }
+        idx = 16 - tn * 2;
+        k = 0;
+        while (k < tn) : (k += 1) {
+            out[idx] = @intCast(tail[k] >> 8);
+            out[idx + 1] = @intCast(tail[k] & 0xff);
+            idx += 2;
+        }
+    } else {
+        var groups: [8]u16 = undefined;
+        var n: usize = 0;
+        var it = std.mem.splitScalar(u8, s, ':');
+        while (it.next()) |g| {
+            if (n >= 8) return null;
+            groups[n] = std.fmt.parseInt(u16, g, 16) catch return null;
+            n += 1;
+        }
+        if (n != 8) return null;
+        var k: usize = 0;
+        while (k < 8) : (k += 1) {
+            out[k * 2] = @intCast(groups[k] >> 8);
+            out[k * 2 + 1] = @intCast(groups[k] & 0xff);
+        }
+    }
+    return out;
 }
 
 /// Encode a DNS QNAME (sequence of length-prefixed labels) into `out`.
@@ -114,7 +190,7 @@ fn skipName(msg: []const u8, start: usize) !usize {
 /// Send one UDP DNS query to `server` (IPv4 string) and read the reply into `recv`.
 /// Returns the number of bytes received.
 fn udpExchange(server: []const u8, query: []const u8, recv: []u8) DnsError!usize {
-    const addr = std.net.Address.parseIp4(server, 53) catch return error.DNSTemporaryFailure;
+    const server_ip = parseIp4(server) orelse return error.DNSTemporaryFailure;
 
     const family: c_uint = @intCast(@as(u32, posix.AF.INET));
     const sock_type: c_uint = @intCast(@as(u32, posix.SOCK.DGRAM));
@@ -128,7 +204,12 @@ fn udpExchange(server: []const u8, query: []const u8, recv: []u8) DnsError!usize
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
 
-    const sa = addr.in.sa;
+    // Build the destination sockaddr_in for <server>:53 (addr in network order).
+    const sa: posix.sockaddr.in = .{
+        .family = posix.AF.INET,
+        .port = std.mem.nativeToBig(u16, 53),
+        .addr = std.mem.nativeToBig(u32, server_ip),
+    };
     if (std.c.connect(fd, @ptrCast(&sa), @sizeOf(@TypeOf(sa))) < 0) {
         return error.DNSTemporaryFailure;
     }
@@ -153,7 +234,7 @@ fn dnsQuery(
     comptime handler: fn (Ctx, msg: []const u8, rdata: []const u8) anyerror!void,
 ) DnsError!void {
     var qbuf: [512]u8 = undefined;
-    const id: u16 = @truncate(@as(u64, @bitCast(std.time.microTimestamp())));
+    const id: u16 = @truncate(@as(u64, @bitCast(time_compat.milliTimestamp())));
     const qlen = buildQuery(id, name, qtype, &qbuf) catch return error.DNSFormatError;
 
     var recv: [4096]u8 = undefined;
@@ -514,7 +595,9 @@ pub const SPFValidator = struct {
         return .neutral;
     }
 
-    fn evaluateMechanism(self: *SPFValidator, mechanism: []const u8, ip_addr: []const u8, domain: []const u8, lookups: *u32) !SPFResult {
+    // Explicit error set (anyerror) breaks the inferred-error-set dependency
+    // loop between checkHost -> evaluateSPF -> evaluateMechanism -> checkHost.
+    fn evaluateMechanism(self: *SPFValidator, mechanism: []const u8, ip_addr: []const u8, domain: []const u8, lookups: *u32) anyerror!SPFResult {
         const trimmed = std.mem.trim(u8, mechanism, " \t");
         if (trimmed.len == 0) return .neutral;
 
@@ -640,14 +723,8 @@ pub const SPFValidator = struct {
             prefix_len = std.fmt.parseInt(u8, ip_spec[slash_pos + 1 ..], 10) catch return false;
         }
 
-        const addr = std.net.Address.parseIp6(ip_addr, 0) catch return false;
-        const net = std.net.Address.parseIp6(network, 0) catch return false;
-        if (addr.any.family != std.posix.AF.INET6 or net.any.family != std.posix.AF.INET6) {
-            return false;
-        }
-
-        const addr_bytes: [16]u8 = addr.in6.sa.addr;
-        const net_bytes: [16]u8 = net.in6.sa.addr;
+        const addr_bytes: [16]u8 = parseIp6(ip_addr) orelse return false;
+        const net_bytes: [16]u8 = parseIp6(network) orelse return false;
 
         var bits_left: u16 = prefix_len;
         var i: usize = 0;
@@ -682,19 +759,12 @@ pub const SPFValidator = struct {
     fn matchCIDR(self: *SPFValidator, ip_addr: []const u8, network: []const u8, prefix_len: u8) bool {
         _ = self;
 
-        // Parse IP addresses
-        const addr = std.net.Address.parseIp(ip_addr, 0) catch return false;
-        const net = std.net.Address.parseIp(network, 0) catch return false;
+        // Parse both addresses as IPv4 (host order).
+        const addr_bits = parseIp4(ip_addr) orelse return false;
+        const net_bits = parseIp4(network) orelse return false;
 
-        if (addr.any.family != std.posix.AF.INET or net.any.family != std.posix.AF.INET) {
-            return false;
-        }
-
-        const addr_bits = @as(u32, @bitCast(addr.in.sa.addr));
-        const net_bits = @as(u32, @bitCast(net.in.sa.addr));
-
-        // Create network mask
-        const mask: u32 = if (prefix_len == 0) 0 else ~@as(u32, 0) << @intCast(32 - prefix_len);
+        // Create network mask (guard prefix_len to avoid shift overflow).
+        const mask: u32 = if (prefix_len == 0) 0 else if (prefix_len >= 32) ~@as(u32, 0) else ~@as(u32, 0) << @intCast(32 - prefix_len);
 
         return (addr_bits & mask) == (net_bits & mask);
     }
