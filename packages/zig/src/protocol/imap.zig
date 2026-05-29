@@ -1531,9 +1531,37 @@ pub const ImapSession = struct {
         var fbs = io_compat.fixedBufferStream(&buf);
         const writer = fbs.writer();
         const clean_mailbox = stripQuotes(mailbox_name);
-        try writer.print("STATUS \"{s}\" (", .{clean_mailbox});
 
         const stats = self.countMailboxStats(clean_mailbox);
+
+        // Derive UIDVALIDITY/UIDNEXT from the database so STATUS matches what
+        // SELECT reports. If STATUS advertises different values than SELECT,
+        // clients such as Apple Mail treat the mailbox as invalidated on every
+        // poll, repeatedly discard their cache, and fail to show unread counts.
+        const canonical_mailbox = if (std.ascii.eqlIgnoreCase(clean_mailbox, "All Mail") or std.ascii.eqlIgnoreCase(clean_mailbox, "All"))
+            "All Mail"
+        else if (std.ascii.eqlIgnoreCase(clean_mailbox, "INBOX"))
+            "INBOX"
+        else
+            clean_mailbox;
+        var uidvalidity: i64 = 1;
+        var uidnext: i64 = @as(i64, @intCast(stats.messages)) + 1;
+        if (self.db) |db| {
+            if (self.username) |full_username| {
+                const local_part = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
+                    full_username[0..at_pos]
+                else
+                    full_username;
+                if (db.getOrCreateMailbox(local_part, canonical_mailbox)) |info| {
+                    uidvalidity = info.uidvalidity;
+                    if (db.getUidNext(local_part, canonical_mailbox)) |next| {
+                        uidnext = next;
+                    } else |_| {}
+                } else |_| {}
+            }
+        }
+
+        try writer.print("STATUS \"{s}\" (", .{clean_mailbox});
 
         var first = true;
         if (want_messages) {
@@ -1547,12 +1575,12 @@ pub const ImapSession = struct {
         }
         if (want_uidnext) {
             if (!first) try writer.writeAll(" ");
-            try writer.print("UIDNEXT {d}", .{stats.messages + 1});
+            try writer.print("UIDNEXT {d}", .{uidnext});
             first = false;
         }
         if (want_uidvalidity) {
             if (!first) try writer.writeAll(" ");
-            try writer.writeAll("UIDVALIDITY 1772487000");
+            try writer.print("UIDVALIDITY {d}", .{uidvalidity});
             first = false;
         }
         if (want_unseen) {
