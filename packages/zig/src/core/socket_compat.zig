@@ -174,7 +174,21 @@ pub const Server = struct {
         const TCP_NODELAY: u32 = 1;
         _ = posix.setsockopt(fd, posix.IPPROTO.TCP, TCP_NODELAY, std.mem.asBytes(&one)) catch {};
 
-        return .{ .fd = fd };
+        var conn = Connection{ .fd = fd };
+        // Record the peer IP as text (for SPF/DNSBL/logging). Best-effort and
+        // defensive: any unexpected family just leaves peer_ip_len = 0.
+        if (client_addr.family == posix.AF.INET) {
+            const sin: *align(1) const posix.sockaddr.in = @ptrCast(&client_addr);
+            const a: [4]u8 = @bitCast(sin.addr);
+            const s = std.fmt.bufPrint(&conn.peer_ip_buf, "{d}.{d}.{d}.{d}", .{ a[0], a[1], a[2], a[3] }) catch "";
+            conn.peer_ip_len = s.len;
+        } else if (client_addr.family == posix.AF.INET6) {
+            const sin6: *align(1) const posix.sockaddr.in6 = @ptrCast(&client_addr);
+            const g = sin6.addr;
+            const s = std.fmt.bufPrint(&conn.peer_ip_buf, "{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}:{x:0>2}{x:0>2}", .{ g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15] }) catch "";
+            conn.peer_ip_len = s.len;
+        }
+        return conn;
     }
 
     pub fn setNonBlocking(self: *Server, enabled: bool) !void {
@@ -200,6 +214,14 @@ pub const ListenOptions = struct {
 
 pub const Connection = struct {
     fd: posix.socket_t,
+    /// Peer IP address as text, filled by Server.accept. Empty if unknown.
+    peer_ip_buf: [46]u8 = undefined,
+    peer_ip_len: usize = 0,
+
+    /// The peer's IP address as text ("" if it could not be determined).
+    pub fn peerIp(self: *const Connection) []const u8 {
+        return self.peer_ip_buf[0..self.peer_ip_len];
+    }
 
     pub fn read(self: Connection, buf: []u8) !usize {
         return posix.read(self.fd, buf);

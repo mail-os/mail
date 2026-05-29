@@ -146,8 +146,11 @@ pub const Server = struct {
 
             _ = self.active_connections.fetchAdd(1, .monotonic);
 
-            // Get remote address for logging (simplified for socket_compat)
-            const addr_str = "client";
+            // Real peer IP (empty if unknown). Used for logging + DNSBL here
+            // while `connection` is still in scope; the session's remote_addr is
+            // re-derived from the thread's own connection copy in
+            // handleConnection to avoid a dangling slice across the spawn.
+            const addr_str = if (connection.peerIp().len > 0) connection.peerIp() else "client";
 
             self.logger.logConnection(addr_str, "connected");
 
@@ -166,7 +169,9 @@ pub const Server = struct {
             const ctx = ConnectionContext{
                 .server = self,
                 .connection = connection,
-                .remote_addr = addr_str,
+                // Static fallback; the real IP is read from ctx.connection
+                // (the thread's own copy) inside handleConnection.
+                .remote_addr = "client",
             };
 
             const thread = std.Thread.spawn(.{}, handleConnection, .{ctx}) catch |err| {
@@ -205,6 +210,10 @@ pub const Server = struct {
         defer ctx.connection.close();
         defer _ = ctx.server.active_connections.fetchSub(1, .monotonic);
 
+        // The peer IP lives in this thread's own copy of the connection, so a
+        // slice into it is valid for the whole session.
+        const remote_addr = if (ctx.connection.peerIp().len > 0) ctx.connection.peerIp() else ctx.remote_addr;
+
         // Get pointer to TLS context if it exists
         var tls_ctx_ptr: ?*tls_mod.TlsContext = null;
         if (ctx.server.tls_context) |*tls_ctx| {
@@ -216,13 +225,13 @@ pub const Server = struct {
             ctx.connection,
             ctx.server.config,
             ctx.server.logger,
-            ctx.remote_addr,
+            remote_addr,
             &ctx.server.rate_limiter,
             tls_ctx_ptr,
             ctx.server.auth_backend,
             ctx.server.greylist,
         ) catch |err| {
-            ctx.server.logger.err("Failed to initialize session from {s}: {}", .{ ctx.remote_addr, err });
+            ctx.server.logger.err("Failed to initialize session from {s}: {}", .{ remote_addr, err });
             return;
         };
         defer session.deinit();
@@ -230,16 +239,16 @@ pub const Server = struct {
         // For SMTPS (port 465), perform TLS handshake before SMTP banner
         if (ctx.implicit_tls) {
             session.performImplicitTls() catch |err| {
-                ctx.server.logger.warn("SMTPS TLS handshake failed from {s}: {}", .{ ctx.remote_addr, err });
+                ctx.server.logger.warn("SMTPS TLS handshake failed from {s}: {}", .{ remote_addr, err });
                 return;
             };
         }
 
         session.handle() catch |err| {
-            ctx.server.logger.err("Session error from {s}: {}", .{ ctx.remote_addr, err });
+            ctx.server.logger.err("Session error from {s}: {}", .{ remote_addr, err });
         };
 
-        ctx.server.logger.logConnection(ctx.remote_addr, "disconnected");
+        ctx.server.logger.logConnection(remote_addr, "disconnected");
     }
 
     /// Start SMTPS listener on port 465 (implicit TLS).
