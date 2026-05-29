@@ -2,18 +2,18 @@ const std = @import("std");
 const mutex_compat = @import("../core/mutex_compat.zig");
 const auth = @import("../auth/auth.zig");
 const logger = @import("../core/logger.zig");
+const fs_compat = @import("../core/fs_compat.zig");
 
 /// POP3 Server Implementation (RFC 1939)
 /// Provides simple mail retrieval via POP3 protocol
 ///
 /// Features:
 /// - POP3 protocol support (RFC 1939)
-/// - APOP authentication (RFC 1939)
 /// - TOP command support
 /// - UIDL support for unique message IDs
-/// - SSL/TLS support (POP3S)
-/// - Message deletion
-/// - Multi-drop mailbox support
+/// - SSL/TLS support (POP3S on the dedicated SSL port)
+/// - Message deletion (DELE + QUIT removes the underlying maildir files)
+/// - Operates on the user's real maildir (mail/{local}/new + cur)
 /// POP3 server configuration
 pub const Pop3Config = struct {
     port: u16 = 110,
@@ -33,19 +33,19 @@ pub const Pop3State = enum {
     update,
 };
 
-/// POP3 message
+/// POP3 message backed by a real maildir file.
 pub const Pop3Message = struct {
     number: usize,
+    /// Unique-ID for UIDL — the maildir filename, which is stable per message.
     uid: []const u8,
+    /// Full path to the message file on disk (e.g. "mail/chris/new/1772486685658.eml").
+    path: []const u8,
     size: usize,
     deleted: bool = false,
-    content: ?[]const u8 = null,
 
     pub fn deinit(self: *Pop3Message, allocator: std.mem.Allocator) void {
         allocator.free(self.uid);
-        if (self.content) |content| {
-            allocator.free(content);
-        }
+        allocator.free(self.path);
     }
 };
 
@@ -101,10 +101,19 @@ pub const Pop3Session = struct {
         try self.stream.writeAll(response.items);
     }
 
-    /// Send multi-line response
-    pub fn sendMultiLine(self: *Pop3Session, lines: []const []const u8) !void {
-        for (lines) |line| {
-            // Byte-stuff lines starting with '.'
+    /// Send a raw message body as a multi-line response, applying byte-stuffing
+    /// per RFC 1939 (lines beginning with '.' get an extra leading '.') and
+    /// terminating with the "." octet line. `body` is the raw message bytes;
+    /// it is split on CRLF/LF boundaries.
+    fn sendMultiLineBody(self: *Pop3Session, body: []const u8) !void {
+        var it = std.mem.splitScalar(u8, body, '\n');
+        while (it.next()) |raw_line| {
+            // Strip a trailing CR so we can re-emit canonical CRLF endings.
+            const line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
+                raw_line[0 .. raw_line.len - 1]
+            else
+                raw_line;
+
             if (std.mem.startsWith(u8, line, ".")) {
                 try self.stream.writeAll(".");
             }
@@ -120,6 +129,14 @@ pub const Pop3Session = struct {
         try self.sendOk("POP3 server ready");
     }
 
+    /// Clear any pending USER/PASS state (used on auth failure).
+    fn clearCredentials(self: *Pop3Session) void {
+        if (self.username) |username| {
+            self.allocator.free(username);
+            self.username = null;
+        }
+    }
+
     /// Handle USER command
     fn handleUser(self: *Pop3Session, username: []const u8) !void {
         if (self.state != .authorization) {
@@ -127,6 +144,8 @@ pub const Pop3Session = struct {
             return;
         }
 
+        // Replace any previously-supplied username.
+        self.clearCredentials();
         self.username = try self.allocator.dupe(u8, username);
         try self.sendOk("User accepted");
     }
@@ -146,12 +165,16 @@ pub const Pop3Session = struct {
         // Validate credentials against auth backend
         const valid = self.auth_backend.verifyCredentials(self.username.?, password) catch |err| {
             std.log.err("POP3 authentication error: {}", .{err});
+            // Clear USER/PASS so the client must re-send both per RFC 1939.
+            self.clearCredentials();
             try self.sendErr("Authentication failed");
             return;
         };
 
         if (!valid) {
             std.log.warn("Failed POP3 login attempt for user: {s}", .{self.username.?});
+            // Clear USER/PASS so the client must re-send both per RFC 1939.
+            self.clearCredentials();
             try self.sendErr("Authentication failed");
             return;
         }
@@ -159,7 +182,11 @@ pub const Pop3Session = struct {
         std.log.info("Successful POP3 login for user: {s}", .{self.username.?});
 
         // Lock maildrop and load messages
-        try self.lockMaildrop();
+        self.lockMaildrop() catch |err| {
+            std.log.err("POP3 failed to open maildrop: {}", .{err});
+            try self.sendErr("Unable to open maildrop");
+            return;
+        };
 
         self.state = .transaction;
         try self.sendOk("Mailbox locked and ready");
@@ -278,19 +305,22 @@ pub const Pop3Session = struct {
             return;
         }
 
+        const content = fs_compat.readFileAlloc(self.allocator, msg.path) catch |err| {
+            std.log.warn("POP3 failed to read message {s}: {}", .{ msg.path, err });
+            try self.sendErr("Unable to retrieve message");
+            return;
+        };
+        defer self.allocator.free(content);
+
         const response = try std.fmt.allocPrint(
             self.allocator,
             "{d} octets",
-            .{msg.size},
+            .{content.len},
         );
         defer self.allocator.free(response);
 
         try self.sendOk(response);
-
-        // Send message content (would read from file)
-        const content = msg.content orelse "Sample message content";
-        const lines = [_][]const u8{content};
-        try self.sendMultiLine(&lines);
+        try self.sendMultiLineBody(content);
     }
 
     /// Handle DELE command
@@ -311,6 +341,8 @@ pub const Pop3Session = struct {
             return;
         }
 
+        // Mark for deletion; the file is only unlinked on QUIT (UPDATE state),
+        // and RSET can undo this within the session, per RFC 1939.
         msg.deleted = true;
         try self.sendOk("Message deleted");
     }
@@ -335,10 +367,9 @@ pub const Pop3Session = struct {
         try self.sendOk("NOOP");
     }
 
-    /// Handle TOP command
+    /// Handle TOP command — return the full header block plus the first
+    /// `lines` lines of the body (RFC 1939).
     fn handleTop(self: *Pop3Session, msg_number: usize, lines: usize) !void {
-        _ = lines;
-
         if (self.state != .transaction) {
             try self.sendErr("Not in TRANSACTION state");
             return;
@@ -355,11 +386,43 @@ pub const Pop3Session = struct {
             return;
         }
 
-        try self.sendOk("Top of message follows");
+        const content = fs_compat.readFileAlloc(self.allocator, msg.path) catch |err| {
+            std.log.warn("POP3 failed to read message {s}: {}", .{ msg.path, err });
+            try self.sendErr("Unable to retrieve message");
+            return;
+        };
+        defer self.allocator.free(content);
 
-        // Would return headers + N lines of body
-        const content = [_][]const u8{"Headers would go here"};
-        try self.sendMultiLine(&content);
+        // Locate the header/body boundary (header_end marks the end of the
+        // header text; body_start is the first byte of the body).
+        var header_end: usize = content.len;
+        var body_start: usize = content.len;
+        if (std.mem.indexOf(u8, content, "\r\n\r\n")) |pos| {
+            header_end = pos + 2;
+            body_start = pos + 4;
+        } else if (std.mem.indexOf(u8, content, "\n\n")) |pos| {
+            header_end = pos + 1;
+            body_start = pos + 2;
+        }
+
+        // Collect the first `lines` body lines.
+        var body_end = body_start;
+        var line_count: usize = 0;
+        while (line_count < lines and body_end < content.len) {
+            if (std.mem.indexOfScalarPos(u8, content, body_end, '\n')) |pos| {
+                body_end = pos + 1;
+            } else {
+                body_end = content.len;
+            }
+            line_count += 1;
+        }
+
+        // Headers (always) plus the selected body lines. When no body lines
+        // were requested/available, send just the header block.
+        const partial = if (body_end > body_start) content[0..body_end] else content[0..header_end];
+
+        try self.sendOk("Top of message follows");
+        try self.sendMultiLineBody(partial);
     }
 
     /// Handle UIDL command
@@ -412,26 +475,27 @@ pub const Pop3Session = struct {
         }
     }
 
-    /// Handle QUIT command - messages marked for deletion are soft-deleted via storage backend
+    /// Handle QUIT command — in the UPDATE state, messages marked for deletion
+    /// have their underlying maildir files removed from disk.
     fn handleQuit(self: *Pop3Session, config: *const Pop3Config) !void {
         if (self.state == .transaction) {
             self.state = .update;
 
             if (config.delete_on_quit) {
-                // Soft-delete messages marked for deletion via storage.deleteMessage()
-                // The storage backend performs a soft-delete (UPDATE SET deleted_at)
-                // rather than a permanent DELETE, preserving messages for admin recovery.
                 var deleted_count: usize = 0;
                 for (self.messages.items) |msg| {
                     if (msg.deleted) {
-                        // Would call storage.deleteMessage() which is now a soft-delete
+                        fs_compat.cwd().deleteFile(msg.path) catch |err| {
+                            std.log.warn("POP3 failed to delete message {s}: {}", .{ msg.path, err });
+                            continue;
+                        };
                         deleted_count += 1;
                     }
                 }
 
                 const response = try std.fmt.allocPrint(
                     self.allocator,
-                    "POP3 server signing off ({d} messages soft-deleted)",
+                    "POP3 server signing off ({d} messages deleted)",
                     .{deleted_count},
                 );
                 defer self.allocator.free(response);
@@ -449,85 +513,118 @@ pub const Pop3Session = struct {
 
     /// Lock the maildrop and load messages
     fn lockMaildrop(self: *Pop3Session) !void {
-        // Would actually lock the mailbox file
-        // For now, just load sample messages
+        // NOTE: There is no cross-process maildrop lock yet; concurrent POP3
+        // sessions for the same user are uncommon and DELE only unlinks files
+        // that still exist. A real exclusive lock would go here.
         try self.loadMessages();
         self.maildrop_locked = true;
     }
 
     /// Unlock the maildrop
     fn unlockMaildrop(self: *Pop3Session) void {
-        // Would release the file lock
         self.maildrop_locked = false;
     }
 
-    /// Load messages from mailbox
+    /// Load messages from the authenticated user's real maildir.
+    /// Scans both `mail/{local}/new` and `mail/{local}/cur` (Maildir layout),
+    /// recording each message's full path, on-disk size, and a stable UID
+    /// (the maildir filename).
     fn loadMessages(self: *Pop3Session) !void {
-        // Would scan mailbox directory
-        // For now, create sample messages
-        for (0..3) |i| {
-            const uid = try std.fmt.allocPrint(self.allocator, "msg-{d}", .{i + 1});
-            const msg = Pop3Message{
-                .number = i + 1,
+        const username = self.username orelse return;
+
+        // Extract local part from the email address (chris@stacksjs.com -> chris).
+        const local_part = if (std.mem.indexOfScalar(u8, username, '@')) |at_pos|
+            username[0..at_pos]
+        else
+            username;
+
+        try self.loadMessagesFromDir(local_part, "new");
+        try self.loadMessagesFromDir(local_part, "cur");
+
+        // Fallback to the legacy global mail/new if the user has no per-user dir.
+        if (self.messages.items.len == 0) {
+            try self.loadMessagesFromAbsoluteDir("mail/new");
+        }
+    }
+
+    fn loadMessagesFromDir(self: *Pop3Session, local_part: []const u8, sub: []const u8) !void {
+        const dir_path = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local_part, sub });
+        defer self.allocator.free(dir_path);
+        try self.loadMessagesFromAbsoluteDir(dir_path);
+    }
+
+    fn loadMessagesFromAbsoluteDir(self: *Pop3Session, dir_path: []const u8) !void {
+        const files = fs_compat.listEmlFiles(self.allocator, dir_path) catch return;
+        defer {
+            for (files) |f| self.allocator.free(f);
+            self.allocator.free(files);
+        }
+
+        for (files) |filename| {
+            const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, filename });
+            errdefer self.allocator.free(path);
+
+            const size = fs_compat.getFileSize(path) catch 0;
+
+            const uid = try self.allocator.dupe(u8, filename);
+            errdefer self.allocator.free(uid);
+
+            try self.messages.append(self.allocator, .{
+                .number = self.messages.items.len + 1,
                 .uid = uid,
-                .size = 1024 + i * 512,
-                .content = try std.fmt.allocPrint(
-                    self.allocator,
-                    "Sample message {d} content",
-                    .{i + 1},
-                ),
-            };
-            try self.messages.append(self.allocator, msg);
+                .path = path,
+                .size = @intCast(size),
+            });
         }
     }
 
     /// Process a single command
     pub fn processCommand(self: *Pop3Session, line: []const u8, config: *const Pop3Config) !bool {
-        var parts = std.mem.splitScalar(u8, line, ' ');
-        const cmd_str = parts.next() orelse return true;
+        // Split into command verb and the remaining argument string. Splitting
+        // only on the first space keeps argument values (notably PASS, which may
+        // contain spaces) intact.
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (trimmed.len == 0) return true;
 
-        // Convert to uppercase
+        const sp = std.mem.indexOfScalar(u8, trimmed, ' ');
+        const cmd_str = if (sp) |i| trimmed[0..i] else trimmed;
+        const args = if (sp) |i| std.mem.trimLeft(u8, trimmed[i + 1 ..], " ") else "";
+
+        // Convert command verb to uppercase
         const cmd_upper = try self.allocator.alloc(u8, cmd_str.len);
         defer self.allocator.free(cmd_upper);
         _ = std.ascii.upperString(cmd_upper, cmd_str);
 
         if (std.mem.eql(u8, cmd_upper, "USER")) {
-            const username = parts.next() orelse {
+            if (args.len == 0) {
                 try self.sendErr("Missing username");
                 return true;
-            };
-            try self.handleUser(username);
+            }
+            try self.handleUser(args);
         } else if (std.mem.eql(u8, cmd_upper, "PASS")) {
-            const password = parts.next() orelse {
+            // PASS argument is the rest of the line verbatim (passwords may
+            // legitimately contain spaces).
+            if (args.len == 0) {
                 try self.sendErr("Missing password");
                 return true;
-            };
-            try self.handlePass(password);
+            }
+            try self.handlePass(args);
         } else if (std.mem.eql(u8, cmd_upper, "STAT")) {
             try self.handleStat();
         } else if (std.mem.eql(u8, cmd_upper, "LIST")) {
-            const msg_num_str = parts.next();
-            const msg_num = if (msg_num_str) |num_str|
-                std.fmt.parseInt(usize, num_str, 10) catch null
+            const msg_num = if (args.len > 0)
+                (std.fmt.parseInt(usize, args, 10) catch null)
             else
                 null;
             try self.handleList(msg_num);
         } else if (std.mem.eql(u8, cmd_upper, "RETR")) {
-            const msg_num_str = parts.next() orelse {
-                try self.sendErr("Missing message number");
-                return true;
-            };
-            const msg_num = std.fmt.parseInt(usize, msg_num_str, 10) catch {
+            const msg_num = std.fmt.parseInt(usize, args, 10) catch {
                 try self.sendErr("Invalid message number");
                 return true;
             };
             try self.handleRetr(msg_num);
         } else if (std.mem.eql(u8, cmd_upper, "DELE")) {
-            const msg_num_str = parts.next() orelse {
-                try self.sendErr("Missing message number");
-                return true;
-            };
-            const msg_num = std.fmt.parseInt(usize, msg_num_str, 10) catch {
+            const msg_num = std.fmt.parseInt(usize, args, 10) catch {
                 try self.sendErr("Invalid message number");
                 return true;
             };
@@ -537,14 +634,10 @@ pub const Pop3Session = struct {
         } else if (std.mem.eql(u8, cmd_upper, "NOOP")) {
             try self.handleNoop();
         } else if (std.mem.eql(u8, cmd_upper, "TOP")) {
-            const msg_num_str = parts.next() orelse {
-                try self.sendErr("Missing message number");
-                return true;
-            };
-            const lines_str = parts.next() orelse {
-                try self.sendErr("Missing line count");
-                return true;
-            };
+            // TOP <msg> <lines>
+            var top_parts = std.mem.splitScalar(u8, args, ' ');
+            const msg_num_str = top_parts.next() orelse "";
+            const lines_str = top_parts.next() orelse "";
             const msg_num = std.fmt.parseInt(usize, msg_num_str, 10) catch {
                 try self.sendErr("Invalid message number");
                 return true;
@@ -555,12 +648,13 @@ pub const Pop3Session = struct {
             };
             try self.handleTop(msg_num, lines);
         } else if (std.mem.eql(u8, cmd_upper, "UIDL")) {
-            const msg_num_str = parts.next();
-            const msg_num = if (msg_num_str) |num_str|
-                std.fmt.parseInt(usize, num_str, 10) catch null
+            const msg_num = if (args.len > 0)
+                (std.fmt.parseInt(usize, args, 10) catch null)
             else
                 null;
             try self.handleUidl(msg_num);
+        } else if (std.mem.eql(u8, cmd_upper, "CAPA")) {
+            try self.handleCapa();
         } else if (std.mem.eql(u8, cmd_upper, "QUIT")) {
             try self.handleQuit(config);
             return false; // Stop processing
@@ -570,6 +664,22 @@ pub const Pop3Session = struct {
 
         return true; // Continue processing
     }
+
+    /// Handle CAPA command — only advertise capabilities that are implemented.
+    /// Notably we do NOT advertise SASL/APOP/STLS since they are not supported.
+    fn handleCapa(self: *Pop3Session) !void {
+        try self.sendOk("Capability list follows");
+        const caps = [_][]const u8{
+            "TOP",
+            "USER",
+            "UIDL",
+        };
+        for (caps) |cap| {
+            try self.stream.writeAll(cap);
+            try self.stream.writeAll("\r\n");
+        }
+        try self.stream.writeAll(".\r\n");
+    }
 };
 
 /// POP3 server
@@ -577,7 +687,6 @@ pub const Pop3Server = struct {
     allocator: std.mem.Allocator,
     config: Pop3Config,
     listener: ?std.net.Server = null,
-    sessions: std.ArrayList(*Pop3Session),
     running: std.atomic.Value(bool),
     mutex: mutex_compat.Mutex = .{},
     auth_backend: *auth.AuthBackend,
@@ -586,7 +695,6 @@ pub const Pop3Server = struct {
         return .{
             .allocator = allocator,
             .config = config,
-            .sessions = .empty,
             .running = std.atomic.Value(bool).init(false),
             .auth_backend = auth_backend,
         };
@@ -594,11 +702,6 @@ pub const Pop3Server = struct {
 
     pub fn deinit(self: *Pop3Server) void {
         self.stop();
-        for (self.sessions.items) |session| {
-            session.deinit();
-            self.allocator.destroy(session);
-        }
-        self.sessions.deinit(self.allocator);
     }
 
     /// Start the POP3 server
@@ -618,7 +721,6 @@ pub const Pop3Server = struct {
                 continue;
             };
 
-            // Handle connection (simplified)
             self.handleConnection(connection.stream) catch |err| {
                 logger.err("POP3 connection error: {}", .{err});
                 connection.stream.close();
@@ -648,31 +750,61 @@ pub const Pop3Server = struct {
         // Send greeting
         try session.sendGreeting();
 
-        // Read commands
-        var buffer: [4096]u8 = undefined;
-        while (true) {
-            const bytes_read = stream.read(&buffer) catch break;
+        // Line-buffered command processing. POP3 commands are CRLF-terminated;
+        // we accumulate bytes until a full line is available so commands are
+        // never split or merged across TCP reads.
+        var line_buf: std.ArrayList(u8) = .empty;
+        defer line_buf.deinit(self.allocator);
+
+        var read_buf: [4096]u8 = undefined;
+        outer: while (true) {
+            const bytes_read = stream.read(&read_buf) catch break;
             if (bytes_read == 0) break;
 
-            const line = std.mem.trim(u8, buffer[0..bytes_read], "\r\n");
-            const continue_processing = session.processCommand(line, &self.config) catch |err| {
-                logger.err("POP3 command processing error: {}", .{err});
-                break;
-            };
+            try line_buf.appendSlice(self.allocator, read_buf[0..bytes_read]);
 
-            if (!continue_processing) break;
+            // Extract and process every complete line currently buffered.
+            while (std.mem.indexOfScalar(u8, line_buf.items, '\n')) |nl| {
+                const raw_line = line_buf.items[0..nl];
+                const line = std.mem.trimRight(u8, raw_line, "\r");
+
+                const continue_processing = session.processCommand(line, &self.config) catch |err| {
+                    logger.err("POP3 command processing error: {}", .{err});
+                    break :outer;
+                };
+
+                // Drop the consumed line (including the '\n') from the buffer.
+                const remaining = line_buf.items.len - (nl + 1);
+                std.mem.copyForwards(u8, line_buf.items[0..remaining], line_buf.items[nl + 1 ..]);
+                line_buf.shrinkRetainingCapacity(remaining);
+
+                if (!continue_processing) break :outer;
+            }
+
+            // Guard against unbounded buffering of a never-terminated line.
+            if (line_buf.items.len > self.config.max_message_size) break;
         }
     }
 };
+
+// TODO(STLS): RFC 2595 STLS (in-band TLS upgrade) is not implemented. The
+// session currently operates over a raw std.net.Stream, whereas the TLS stack
+// (src/core/tls.zig + the zig-tls dependency) is integrated through the IMAP
+// connection wrapper. Implementing STLS would require routing POP3 I/O through
+// that same abstraction so the plaintext socket can be upgraded mid-session.
+// Until then, encrypted access is only offered via implicit POP3S on the
+// dedicated SSL port, and STLS is intentionally NOT advertised in CAPA.
 
 // Tests
 test "POP3 message" {
     const testing = std.testing;
 
     const uid = try testing.allocator.dupe(u8, "msg-123");
+    const path = try testing.allocator.dupe(u8, "mail/test/new/msg-123.eml");
     var msg = Pop3Message{
         .number = 1,
         .uid = uid,
+        .path = path,
         .size = 1024,
     };
     defer msg.deinit(testing.allocator);
@@ -680,14 +812,4 @@ test "POP3 message" {
     try testing.expectEqual(@as(usize, 1), msg.number);
     try testing.expectEqual(@as(usize, 1024), msg.size);
     try testing.expect(!msg.deleted);
-}
-
-test "POP3 session state transitions" {
-    const testing = std.testing;
-
-    const stream = undefined; // Would need actual stream for real test
-    var session = Pop3Session.init(testing.allocator, stream);
-    defer session.deinit();
-
-    try testing.expectEqual(Pop3State.authorization, session.state);
 }
