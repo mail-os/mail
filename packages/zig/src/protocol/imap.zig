@@ -11,6 +11,11 @@ const tls = @import("tls");
 const fs_compat = @import("../core/fs_compat.zig");
 const database = @import("../storage/database.zig");
 
+/// Upper bound on an APPEND literal we are willing to buffer in memory, to
+/// prevent a client from exhausting server memory with a huge {N} literal.
+/// Matches the server's default max_message_size (50 MB).
+const max_append_literal_size: usize = 50 * 1024 * 1024;
+
 /// Strip surrounding double quotes from an IMAP token.
 /// IMAP clients (e.g. Python imaplib) quote usernames and passwords.
 fn stripQuotes(s: []const u8) []const u8 {
@@ -642,6 +647,27 @@ fn extractQuotedArg(rest: []const u8) []const u8 {
     return trimmed[0..end];
 }
 
+/// Case-insensitively check whether `criteria` contains `keyword` as a
+/// standalone token (delimited by start/end of string, whitespace, or
+/// parentheses) rather than as a substring of a larger word. Used by SEARCH so
+/// that e.g. a quoted search term cannot accidentally trigger a keyword match.
+fn hasCriteriaToken(criteria: []const u8, keyword: []const u8) bool {
+    if (keyword.len == 0) return false;
+    var search_from: usize = 0;
+    while (std.ascii.indexOfIgnoreCasePos(criteria, search_from, keyword)) |pos| {
+        const before_ok = pos == 0 or isCriteriaDelimiter(criteria[pos - 1]);
+        const after_idx = pos + keyword.len;
+        const after_ok = after_idx >= criteria.len or isCriteriaDelimiter(criteria[after_idx]);
+        if (before_ok and after_ok) return true;
+        search_from = pos + 1;
+    }
+    return false;
+}
+
+fn isCriteriaDelimiter(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '(' or c == ')';
+}
+
 const ParsedImapArg = struct {
     value: []const u8,
     rest: []const u8,
@@ -807,6 +833,30 @@ pub const ImapSession = struct {
     fn allocSelectedMessagePath(self: *ImapSession, idx: usize, filename: []const u8) ![]u8 {
         const dir = self.selectedMessageDirForIndex(idx) orelse return error.NoMailboxSelected;
         return try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename });
+    }
+
+    /// Build a collision-free Maildir-style destination path of the form
+    /// `{dir}/{timestamp}.{pid}.{counter}.eml{flag_suffix}`. COPY/MOVE used to
+    /// derive names purely from a millisecond timestamp, so two messages copied
+    /// within the same millisecond (or whose timestamps overlapped via the
+    /// `timestamp + n` offset) could produce the same filename and silently
+    /// truncate-overwrite each other (createFile opens with O_TRUNC). We probe
+    /// with access() and increment a counter until we find an unused name.
+    /// Caller owns the returned slice.
+    fn allocUniqueMaildirPath(self: *ImapSession, dir: []const u8, flag_suffix: []const u8) ![]u8 {
+        const ts = time_compat.milliTimestamp();
+        const pid: i64 = @intCast(std.posix.getpid());
+        var counter: u64 = 0;
+        while (true) : (counter += 1) {
+            const candidate = try std.fmt.allocPrint(self.allocator, "{s}/{d}.{d}.{d}.eml{s}", .{ dir, ts, pid, counter, flag_suffix });
+            // If the file does not already exist, this name is free to use.
+            fs_compat.cwd().access(candidate, .{}) catch {
+                return candidate;
+            };
+            // Name taken — discard and try the next counter value.
+            self.allocator.free(candidate);
+            if (counter == std.math.maxInt(u64)) return error.PathAlreadyExists;
+        }
     }
 
     fn freeSelectedMessageLists(self: *ImapSession) void {
@@ -1302,13 +1352,9 @@ pub const ImapSession = struct {
 
         std.log.info("IMAP APPEND: Saved {d} bytes to {s}", .{ size, filepath });
 
-        // Count files to determine UID for response
-        const files = fs_compat.listEmlFiles(self.allocator, folder_dir) catch &[_][]const u8{};
-        const uid = files.len;
-        defer {
-            for (files) |f| self.allocator.free(f);
-            self.allocator.free(files);
-        }
+        // The UID key for this message is its on-disk base filename (matching
+        // how syncUids/getUidForFile key the imap_uids table).
+        const uid_key = std.fs.path.basename(filepath);
 
         // Use the mailbox's real UIDVALIDITY (matching SELECT/STATUS) so clients
         // don't invalidate their UID cache for the folder after an append.
@@ -1318,22 +1364,34 @@ pub const ImapSession = struct {
             "INBOX"
         else
             mailbox;
-        var append_uidvalidity: i64 = 1;
+
+        // Assign a real UID via the database (matching SELECT/FETCH). Only
+        // report APPENDUID when we actually have an authoritative UID; never
+        // fabricate one from the file count.
+        var append_uidvalidity: i64 = 0;
+        var assigned_uid: ?i64 = null;
         if (self.db) |db| {
             if (db.getOrCreateMailbox(local_part, append_canon)) |info| {
                 append_uidvalidity = info.uidvalidity;
+                if (db.assignUid(local_part, append_canon, uid_key)) |new_uid| {
+                    assigned_uid = new_uid;
+                } else |_| {}
             } else |_| {}
         }
 
-        // Send OK with APPENDUID
-        var resp_buf: [256]u8 = undefined;
-        var fbs = io_compat.fixedBufferStream(&resp_buf);
-        fbs.writer().print("[APPENDUID {d} {d}] APPEND completed", .{ append_uidvalidity, uid }) catch {
+        // Send OK, including APPENDUID only when we have a real UID/UIDVALIDITY.
+        if (assigned_uid) |uid| {
+            var resp_buf: [256]u8 = undefined;
+            var fbs = io_compat.fixedBufferStream(&resp_buf);
+            fbs.writer().print("[APPENDUID {d} {d}] APPEND completed", .{ append_uidvalidity, uid }) catch {
+                try self.sendResponse(tag, "OK", "APPEND completed");
+                self.cleanupAppend();
+                return;
+            };
+            try self.sendResponse(tag, "OK", fbs.getWritten());
+        } else {
             try self.sendResponse(tag, "OK", "APPEND completed");
-            self.cleanupAppend();
-            return;
-        };
-        try self.sendResponse(tag, "OK", fbs.getWritten());
+        }
         self.cleanupAppend();
     }
 
@@ -2213,25 +2271,35 @@ pub const ImapSession = struct {
             const is_multipart = std.mem.indexOf(u8, content_type, "multipart/") != null;
             const is_html = std.mem.indexOf(u8, content_type, "text/html") != null;
 
-            // Build BODYSTRUCTURE string
-            var bs_buf: [512]u8 = undefined;
-            var bs_fbs = io_compat.fixedBufferStream(&bs_buf);
-            const bs_writer = bs_fbs.writer();
-            if (is_multipart) {
-                // Simplified multipart structure
-                bs_writer.print("((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"{s}\") NIL NIL \"7BIT\" {d} {d} NIL NIL NIL NIL)(\"TEXT\" \"HTML\" (\"CHARSET\" \"{s}\") NIL NIL \"7BIT\" {d} {d} NIL NIL NIL NIL) \"ALTERNATIVE\")", .{
-                    charset, body.len, body.len / 40 + 1, charset, body.len, body.len / 40 + 1,
-                }) catch {};
-            } else if (is_html) {
-                bs_writer.print("(\"TEXT\" \"HTML\" (\"CHARSET\" \"{s}\") NIL NIL \"7BIT\" {d} {d} NIL NIL NIL NIL)", .{
-                    charset, body.len, body.len / 40 + 1,
-                }) catch {};
-            } else {
-                bs_writer.print("(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"{s}\") NIL NIL \"7BIT\" {d} {d} NIL NIL NIL NIL)", .{
-                    charset, body.len, body.len / 40 + 1,
-                }) catch {};
-            }
-            const bodystructure = bs_fbs.getWritten();
+            // Sanitize the charset so it can be safely emitted inside an IMAP
+            // quoted-string. A charset is an atom-like token; if it contains
+            // characters that would need quoting/escaping (quotes, backslash,
+            // control chars, whitespace) we fall back to a safe default rather
+            // than risk producing a malformed BODYSTRUCTURE response.
+            const safe_charset = blk_cs: {
+                if (charset.len == 0 or charset.len > 64) break :blk_cs "UTF-8";
+                for (charset) |c| {
+                    if (c == '"' or c == '\\' or c <= ' ' or c == 0x7f) break :blk_cs "UTF-8";
+                }
+                break :blk_cs charset;
+            };
+
+            // Build BODYSTRUCTURE string into a heap buffer (no fixed-size
+            // truncation). The previous fixed 512-byte buffer with `catch {}`
+            // would silently drop the structure for large values.
+            const bodystructure = if (is_multipart)
+                std.fmt.allocPrint(self.allocator, "((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"{s}\") NIL NIL \"7BIT\" {d} {d} NIL NIL NIL NIL)(\"TEXT\" \"HTML\" (\"CHARSET\" \"{s}\") NIL NIL \"7BIT\" {d} {d} NIL NIL NIL NIL) \"ALTERNATIVE\")", .{
+                    safe_charset, body.len, body.len / 40 + 1, safe_charset, body.len, body.len / 40 + 1,
+                }) catch try self.allocator.dupe(u8, "")
+            else if (is_html)
+                std.fmt.allocPrint(self.allocator, "(\"TEXT\" \"HTML\" (\"CHARSET\" \"{s}\") NIL NIL \"7BIT\" {d} {d} NIL NIL NIL NIL)", .{
+                    safe_charset, body.len, body.len / 40 + 1,
+                }) catch try self.allocator.dupe(u8, "")
+            else
+                std.fmt.allocPrint(self.allocator, "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"{s}\") NIL NIL \"7BIT\" {d} {d} NIL NIL NIL NIL)", .{
+                    safe_charset, body.len, body.len / 40 + 1,
+                }) catch try self.allocator.dupe(u8, "");
+            defer self.allocator.free(bodystructure);
 
             // Read actual flags from Maildir filename
             var msg_flags = MaildirFlags.fromFilename(filename);
@@ -2267,13 +2335,13 @@ pub const ImapSession = struct {
             var flag_str_buf: [256]u8 = undefined;
             const flag_str = msg_flags.toImapString(&flag_str_buf);
 
-            // Build optional parts
-            var bs_part_buf: [600]u8 = undefined;
-            const bs_part = if (want_bodystructure) blk: {
-                var bfbs = io_compat.fixedBufferStream(&bs_part_buf);
-                bfbs.writer().print(" BODYSTRUCTURE {s}", .{bodystructure}) catch break :blk @as([]const u8, "");
-                break :blk bfbs.getWritten();
-            } else @as([]const u8, "");
+            // Build optional parts. Allocate dynamically so a long
+            // BODYSTRUCTURE is not truncated by a fixed-size buffer.
+            const bs_part = if (want_bodystructure)
+                std.fmt.allocPrint(self.allocator, " BODYSTRUCTURE {s}", .{bodystructure}) catch try self.allocator.dupe(u8, "")
+            else
+                try self.allocator.dupe(u8, "");
+            defer self.allocator.free(bs_part);
 
             var id_part_buf: [128]u8 = undefined;
             const id_part = if (want_internaldate) blk: {
@@ -2386,8 +2454,11 @@ pub const ImapSession = struct {
             return;
         };
 
-        // Parse criteria (case insensitive)
-        const is_all = criteria.len == 0 or std.ascii.indexOfIgnoreCase(criteria, "ALL") != null;
+        // Parse criteria (case insensitive). Match keywords as whitespace- or
+        // paren-delimited tokens, not bare substrings, so a FROM/SUBJECT term
+        // like "marshall" cannot be mistaken for the ALL key (which would
+        // otherwise match every message).
+        const is_all = criteria.len == 0 or hasCriteriaToken(criteria, "ALL");
         const want_seen = std.ascii.indexOfIgnoreCase(criteria, "SEEN") != null and
             std.ascii.indexOfIgnoreCase(criteria, "UNSEEN") == null;
         const want_unseen = std.ascii.indexOfIgnoreCase(criteria, "UNSEEN") != null;
@@ -2570,12 +2641,13 @@ pub const ImapSession = struct {
             const content = fs_compat.readFileAlloc(self.allocator, src_path) catch continue;
             defer self.allocator.free(content);
 
-            // Write to destination with a new timestamp filename, preserving flags
-            const timestamp = time_compat.milliTimestamp();
+            // Write to destination with a unique Maildir-style filename,
+            // preserving flags. allocUniqueMaildirPath probes for an unused
+            // name so a copy never truncate-overwrites an existing message.
             const src_flags = MaildirFlags.fromFilename(filename);
             var suffix_buf: [16]u8 = undefined;
             const flag_suffix = src_flags.toSuffix(&suffix_buf);
-            const dest_path = try std.fmt.allocPrint(self.allocator, "{s}/{d}.eml{s}", .{ dest_dir, timestamp + copied, flag_suffix });
+            const dest_path = self.allocUniqueMaildirPath(dest_dir, flag_suffix) catch continue;
             defer self.allocator.free(dest_path);
 
             const file = fs_compat.cwd().createFile(dest_path, .{}) catch continue;
@@ -2651,12 +2723,13 @@ pub const ImapSession = struct {
             const src_path = self.allocSelectedMessagePath(idx, filename) catch continue;
             defer self.allocator.free(src_path);
 
-            // Preserve flags from source filename in destination
+            // Preserve flags from source filename in destination. Use a
+            // collision-free Maildir-style name so a move never silently
+            // truncate-overwrites an existing destination message.
             const src_flags = MaildirFlags.fromFilename(filename);
             var move_suffix_buf: [16]u8 = undefined;
             const move_flag_suffix = src_flags.toSuffix(&move_suffix_buf);
-            const timestamp = time_compat.milliTimestamp();
-            const dest_path = std.fmt.allocPrint(self.allocator, "{s}/{d}.eml{s}", .{ dest_dir, timestamp + seq, move_flag_suffix }) catch continue;
+            const dest_path = self.allocUniqueMaildirPath(dest_dir, move_flag_suffix) catch continue;
             defer self.allocator.free(dest_path);
 
             // Copy content to destination
@@ -3161,6 +3234,14 @@ pub const ImapSession = struct {
             },
             .append => {
                 // APPEND mailbox (\flags) {size} - read literal data and save to Maildir
+                // RFC 3501: APPEND is only valid in the authenticated or
+                // selected state. Reject it otherwise so unauthenticated
+                // clients cannot trigger message storage / literal allocation.
+                if (self.state == .not_authenticated or self.username == null) {
+                    try self.sendResponse(tag, "NO", "Must authenticate first");
+                    return;
+                }
+
                 // Parse rest of command line to find {N} literal size
                 const cmd_end = @intFromPtr(cmd_str.ptr) + cmd_str.len - @intFromPtr(line.ptr);
                 const rest = if (cmd_end < line.len) std.mem.trim(u8, line[cmd_end..], " \t") else "";
@@ -3175,9 +3256,24 @@ pub const ImapSession = struct {
                                 return;
                             };
 
+                            // Reject oversized literals before allocating to
+                            // avoid a memory-exhaustion DoS (a client could
+                            // otherwise request an arbitrarily large buffer).
+                            if (literal_size > max_append_literal_size) {
+                                try self.sendResponse(tag, "NO", "[TOOBIG] Message too large");
+                                return;
+                            }
+
                             // Parse mailbox name (first arg after APPEND)
                             const mailbox_raw = parts.next() orelse "INBOX";
                             const mailbox = stripQuotes(mailbox_raw);
+
+                            // Reject invalid/unsafe mailbox names up front rather
+                            // than after buffering the whole literal.
+                            if (!isSafeMailboxName(mailbox)) {
+                                try self.sendResponse(tag, "NO", "[TRYCREATE] Invalid mailbox name");
+                                return;
+                            }
 
                             // Set up pending append state
                             self.cleanupAppend();
@@ -3196,8 +3292,10 @@ pub const ImapSession = struct {
                     }
                 }
 
-                // No literal found - just acknowledge
-                try self.sendResponse(tag, "OK", "[APPENDUID 1772487000 1] APPEND completed");
+                // No literal found - nothing was stored, so do not fabricate an
+                // APPENDUID (a hardcoded value would lie to the client and
+                // corrupt its UID cache). Acknowledge without UIDPLUS data.
+                try self.sendResponse(tag, "OK", "APPEND completed");
             },
             .enable => {
                 // RFC 5161: ENABLE extension
