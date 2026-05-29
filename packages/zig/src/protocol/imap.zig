@@ -11,6 +11,10 @@ const tls = @import("tls");
 const fs_compat = @import("../core/fs_compat.zig");
 const database = @import("../storage/database.zig");
 
+// std.posix.getpid is not available on this Zig version's std; libc is linked
+// (the binary links sqlite3 + libc), so declare the C symbol directly.
+extern "c" fn getpid() c_int;
+
 /// Upper bound on an APPEND literal we are willing to buffer in memory, to
 /// prevent a client from exhausting server memory with a huge {N} literal.
 /// Matches the server's default max_message_size (50 MB).
@@ -845,7 +849,7 @@ pub const ImapSession = struct {
     /// Caller owns the returned slice.
     fn allocUniqueMaildirPath(self: *ImapSession, dir: []const u8, flag_suffix: []const u8) ![]u8 {
         const ts = time_compat.milliTimestamp();
-        const pid: i64 = @intCast(std.posix.getpid());
+        const pid: i64 = @intCast(getpid());
         var counter: u64 = 0;
         while (true) : (counter += 1) {
             const candidate = try std.fmt.allocPrint(self.allocator, "{s}/{d}.{d}.{d}.eml{s}", .{ dir, ts, pid, counter, flag_suffix });
