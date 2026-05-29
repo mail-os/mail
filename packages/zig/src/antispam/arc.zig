@@ -387,7 +387,7 @@ pub const ARCChain = struct {
 
     pub fn init(allocator: std.mem.Allocator) ARCChain {
         return .{
-            .sets = .{},
+            .sets = .empty,
             .allocator = allocator,
         };
     }
