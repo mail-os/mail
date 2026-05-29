@@ -559,7 +559,7 @@ pub const ARCValidator = struct {
             return .fail;
         }
 
-        // Validate each individual set
+        // Validate each individual set (structural checks only)
         for (chain.sets.items) |*set| {
             const set_valid = self.validateSet(set, set.instance);
             if (!set_valid) {
@@ -567,10 +567,35 @@ pub const ARCValidator = struct {
             }
         }
 
-        // If we reach here, the chain structure is valid
-        // In a production system we would also verify cryptographic signatures
-        // using DNS-fetched public keys, similar to DKIM validation
-        return .pass;
+        // Cryptographic verification of the ARC chain.
+        //
+        // Per RFC 8617, for every ARC set we must verify:
+        //   1. The ARC-Message-Signature (AMS): canonicalized signed-header hash
+        //      + body hash compared against bh=, then the RSA/Ed25519 signature
+        //      (b=) checked against the public key published in DNS at
+        //      s=._domainkey.d=.
+        //   2. The ARC-Seal (AS): the RSA/Ed25519 signature over the chain's
+        //      ARC headers checked against the same DNS-published public key.
+        //
+        // Verifying these signatures requires fetching the signer's public key
+        // via a DNS TXT lookup and running an RSA/Ed25519 verifier. Neither
+        // primitive is available to this module: the repo's DKIM
+        // queryPublicKey() is a stub that returns null (no DNS TXT resolver
+        // exists), and the vendor RSA verifier in vendor/zig-tls is not exported
+        // through the `tls` module root that this package consumes. The message
+        // body is also not available here (validateChain only receives headers),
+        // so the AMS body hash cannot be recomputed either.
+        //
+        // Because we CANNOT cryptographically verify any AMS or ARC-Seal
+        // signature, returning .pass would let a forged-but-well-formed ARC
+        // chain be trusted. Per RFC 8617 §5.2 an unverifiable signature is a
+        // failure, so we fail closed here rather than trusting structure alone.
+        //
+        // TODO: once a DNS TXT resolver and an exported RSA/Ed25519 verifier are
+        // available (and validateChain is given the message body), replace this
+        // with: for each set verify bh=, then verify the AMS b= and the AS b=
+        // against the DNS public key; return .pass only when every set verifies.
+        return .fail;
     }
 
     /// Extract ARC sets from raw message headers.
@@ -804,7 +829,8 @@ pub const ARCValidator = struct {
 /// Check whether an algorithm string is a supported ARC/DKIM algorithm
 fn isSupportedAlgorithm(algorithm: []const u8) bool {
     if (std.mem.eql(u8, algorithm, "rsa-sha256")) return true;
-    if (std.mem.eql(u8, algorithm, "rsa-sha1")) return true;
+    // rsa-sha1 is intentionally NOT accepted: SHA-1 is cryptographically broken
+    // and RFC 8617 mandates rsa-sha256 (or ed25519-sha256) for ARC.
     if (std.mem.eql(u8, algorithm, "ed25519-sha256")) return true;
     return false;
 }
@@ -1712,8 +1738,12 @@ test "ARCValidator validate chain - valid single set" {
     var validator = ARCValidator.init(testing.allocator);
     defer validator.deinit();
 
+    // The chain is structurally valid, but the AMS/ARC-Seal signatures cannot be
+    // cryptographically verified (no DNS public-key fetch / RSA verifier is
+    // available to this module), so we must fail closed rather than trust
+    // forgeable structure. See validateChain for details.
     const result = try validator.validateChain(headers);
-    try testing.expectEqual(ARCResult.pass, result);
+    try testing.expectEqual(ARCResult.fail, result);
 }
 
 test "ARCValidator validateSet - valid first set" {
@@ -2051,8 +2081,9 @@ test "isSupportedAlgorithm" {
     const testing = std.testing;
 
     try testing.expect(isSupportedAlgorithm("rsa-sha256"));
-    try testing.expect(isSupportedAlgorithm("rsa-sha1"));
     try testing.expect(isSupportedAlgorithm("ed25519-sha256"));
+    // rsa-sha1 is rejected: SHA-1 is broken and not permitted by RFC 8617.
+    try testing.expect(!isSupportedAlgorithm("rsa-sha1"));
     try testing.expect(!isSupportedAlgorithm("unknown-algo"));
     try testing.expect(!isSupportedAlgorithm(""));
 }

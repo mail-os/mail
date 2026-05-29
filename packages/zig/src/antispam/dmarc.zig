@@ -166,20 +166,29 @@ pub const DMARCValidator = struct {
         dkim_result: dkim.DKIMResult,
         dkim_domain: []const u8,
     ) !DMARCResult {
-        // Query DMARC record for domain
-        const dmarc_record = self.queryDMARCRecord(from_domain) catch {
-            return .none;
+        // Query DMARC record for the From domain; if none, fall back to the
+        // organizational domain (RFC 7489 §6.6.3).
+        var maybe_record = self.queryDMARCRecord(from_domain) catch |err| switch (err) {
+            error.DNSTemporaryFailure => return .temperror,
+            else => return .none, // OutOfMemory and any other transient issue
         };
-        defer if (dmarc_record) |*record| {
+        if (maybe_record == null) {
+            const org = self.getOrganizationalDomain(from_domain);
+            if (!std.ascii.eqlIgnoreCase(org, from_domain)) {
+                maybe_record = self.queryDMARCRecord(org) catch null;
+            }
+        }
+
+        defer if (maybe_record) |*record| {
             var rec = record.*;
             rec.deinit();
         };
 
-        if (dmarc_record == null) {
+        if (maybe_record == null) {
             return .none;
         }
 
-        const record = dmarc_record.?;
+        const record = maybe_record.?;
 
         // Check identifier alignment
         const spf_aligned = self.checkAlignment(from_domain, spf_domain, record.spf_alignment);
@@ -193,22 +202,31 @@ pub const DMARCValidator = struct {
             return .pass;
         }
 
+        // NOTE: record.percentage (pct=) is parsed and available to the policy
+        // enforcement layer for sampling of the published policy; it does not
+        // change the pass/fail evaluation itself (RFC 7489 §6.6.4).
         return .fail;
     }
 
     fn queryDMARCRecord(self: *DMARCValidator, domain: []const u8) !?DMARCRecord {
-        // In production, query DNS TXT record at: _dmarc.domain
-        _ = self;
-        _ = domain;
+        // RFC 7489 §6.1: the DMARC record lives at `_dmarc.<domain>` as a TXT
+        // record beginning with "v=DMARC1".
+        const qname = try std.fmt.allocPrint(self.allocator, "_dmarc.{s}", .{domain});
+        defer self.allocator.free(qname);
 
-        // For now, return null (no record found)
-        // A real implementation would use DNS lookups
-        return null;
+        const txt = spf.dnsQueryTxt(self.allocator, qname, "v=DMARC1") catch |err| switch (err) {
+            error.DNSTimeout, error.DNSTemporaryFailure => return error.DNSTemporaryFailure,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return null,
+        };
+        if (txt == null) return null;
+        defer self.allocator.free(txt.?);
+
+        // Parse; a malformed record is treated as "no record" (none).
+        return DMARCRecord.parse(self.allocator, txt.?) catch null;
     }
 
     fn checkAlignment(self: *DMARCValidator, from_domain: []const u8, auth_domain: []const u8, mode: AlignmentMode) bool {
-        _ = self;
-
         switch (mode) {
             .strict => {
                 // Strict: domains must match exactly
@@ -265,7 +283,7 @@ pub const DMARCAggregateReport = struct {
             .email = try allocator.dupe(u8, email),
             .begin_timestamp = time_compat.timestamp(),
             .end_timestamp = time_compat.timestamp() + 86400,
-            .records = std.ArrayList(ReportRecord).init(allocator),
+            .records = .empty,
         };
     }
 
@@ -273,16 +291,15 @@ pub const DMARCAggregateReport = struct {
         self.allocator.free(self.report_id);
         self.allocator.free(self.org_name);
         self.allocator.free(self.email);
-        self.records.deinit();
+        self.records.deinit(self.allocator);
     }
 
     pub fn toXML(self: *DMARCAggregateReport) ![]const u8 {
-        var xml = std.ArrayList(u8).init(self.allocator);
-        defer xml.deinit();
+        var xml: std.ArrayList(u8) = .empty;
+        defer xml.deinit(self.allocator);
 
-        const writer = xml.writer();
-
-        try writer.print(
+        try xml.print(
+            self.allocator,
             \\<?xml version="1.0"?>
             \\<feedback>
             \\  <report_metadata>
@@ -304,7 +321,7 @@ pub const DMARCAggregateReport = struct {
             .{ self.org_name, self.email, self.report_id, self.begin_timestamp, self.end_timestamp },
         );
 
-        return try xml.toOwnedSlice();
+        return try xml.toOwnedSlice(self.allocator);
     }
 };
 

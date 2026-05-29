@@ -85,14 +85,20 @@ pub const DnsblChecker = struct {
         return result;
     }
 
-    /// Perform DNS lookup using getaddrinfo
-    /// Returns true if the query resolves (IP is blacklisted)
+    /// Perform DNS lookup using getaddrinfo.
+    /// Returns true only if the query resolves to an A record inside 127.0.0.0/8.
+    ///
+    /// Per the DNSBL convention (RFC 5782 §2.1), a "listed" answer is an A record
+    /// in 127.0.0.0/8 (the specific low octets encode the listing reason). Any
+    /// other resolution -- and in particular a wildcard/parking answer outside
+    /// 127/8 -- MUST NOT be treated as a hit, otherwise a DNSBL that returns a
+    /// catch-all address would cause every IP to be flagged as blacklisted.
     fn lookupDns(self: *DnsblChecker, hostname: []const u8) !bool {
         // Add null terminator for C string
         const hostname_z = try self.allocator.dupeZ(u8, hostname);
         defer self.allocator.free(hostname_z);
 
-        // Try to resolve the hostname
+        // Try to resolve the hostname (A records only)
         var result: ?*std.c.addrinfo = null;
         const hints = std.mem.zeroInit(std.c.addrinfo, .{
             .family = std.posix.AF.INET,
@@ -102,9 +108,23 @@ pub const DnsblChecker = struct {
         const rc = std.c.getaddrinfo(hostname_z.ptr, null, &hints, &result);
         defer if (result) |r| std.c.freeaddrinfo(r);
 
-        // If rc == 0, the hostname resolved (IP is blacklisted)
-        // If rc != 0, lookup failed (IP is not blacklisted)
-        return @intFromEnum(rc) == 0;
+        // rc != 0 means the name did not resolve (NXDOMAIN etc.) => not listed.
+        if (@intFromEnum(rc) != 0) return false;
+
+        // Walk the result list and look for an A record in 127.0.0.0/8.
+        var node = result;
+        while (node) |n| : (node = n.next) {
+            if (n.family != std.posix.AF.INET) continue;
+            const sa = n.addr orelse continue;
+            const sin: *const std.posix.sockaddr.in = @ptrCast(@alignCast(sa));
+            // sin.addr is the IPv4 address in network byte order; the first byte
+            // of its in-memory representation is the most-significant octet.
+            const first_octet = std.mem.toBytes(sin.addr)[0];
+            if (first_octet == 127) return true;
+        }
+
+        // Resolved, but no answer was in 127/8 => not a DNSBL listing.
+        return false;
     }
 };
 
