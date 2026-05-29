@@ -14,6 +14,32 @@ const chunking = @import("../protocol/chunking.zig");
 const tls = @import("tls");
 const outbound = @import("../delivery/outbound.zig");
 
+/// Maximum number of in-flight detached outbound/forward delivery worker
+/// threads across the whole process. Without a cap, a flood of recipients
+/// could spawn unbounded threads and exhaust resources.
+const max_outbound_workers: usize = 64;
+
+/// Current number of in-flight outbound/forward worker threads. Incremented
+/// before spawning a worker and decremented when the worker exits.
+var outbound_worker_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+
+/// Try to reserve a slot for a new outbound worker. Returns true if a slot was
+/// reserved (caller must ensure the worker decrements the counter on exit),
+/// false if the in-flight limit has been reached.
+fn tryReserveOutboundSlot() bool {
+    while (true) {
+        const cur = outbound_worker_count.load(.monotonic);
+        if (cur >= max_outbound_workers) return false;
+        if (outbound_worker_count.cmpxchgWeak(cur, cur + 1, .monotonic, .monotonic) == null) {
+            return true;
+        }
+    }
+}
+
+fn releaseOutboundSlot() void {
+    _ = outbound_worker_count.fetchSub(1, .monotonic);
+}
+
 /// Sanitize a string for safe logging — strip control characters that could
 /// inject fake log entries (newlines, carriage returns, null bytes).
 fn sanitizeForLog(input: []const u8) [256]u8 {
@@ -672,23 +698,26 @@ pub const Session = struct {
             return;
         }
 
-        // Prevent open relay: unauthenticated clients can only send to local domain
+        // Prevent open relay: unauthenticated clients can only send to local domain.
+        // A recipient with no '@' (or an empty domain) is NOT a local recipient and
+        // must be rejected — otherwise it would bypass the local-domain check.
         if (!self.authenticated) {
-            if (std.mem.indexOf(u8, addr, "@")) |at_pos| {
+            const is_local = if (std.mem.indexOf(u8, addr, "@")) |at_pos| blk: {
                 const recipient_domain = addr[at_pos + 1 ..];
+                if (recipient_domain.len == 0) break :blk false;
                 // Check if recipient domain matches hostname or is the parent domain
                 // e.g. hostname "mail.stacksjs.com" should accept mail for "stacksjs.com"
-                const is_local = std.ascii.eqlIgnoreCase(recipient_domain, self.config.hostname) or blk: {
-                    if (std.mem.indexOf(u8, self.config.hostname, ".")) |dot_pos| {
-                        break :blk std.ascii.eqlIgnoreCase(recipient_domain, self.config.hostname[dot_pos + 1 ..]);
-                    }
-                    break :blk false;
-                };
-                if (!is_local) {
-                    self.logger.logSecurityEvent(self.remote_addr, "Relay access denied for unauthenticated sender");
-                    try self.sendResponse(writer, 550, "5.7.1 Relay access denied", null);
-                    return;
+                if (std.ascii.eqlIgnoreCase(recipient_domain, self.config.hostname)) break :blk true;
+                if (std.mem.indexOf(u8, self.config.hostname, ".")) |dot_pos| {
+                    break :blk std.ascii.eqlIgnoreCase(recipient_domain, self.config.hostname[dot_pos + 1 ..]);
                 }
+                break :blk false;
+            } else false;
+
+            if (!is_local) {
+                self.logger.logSecurityEvent(self.remote_addr, "Relay access denied for unauthenticated sender");
+                try self.sendResponse(writer, 550, "5.7.1 Relay access denied", null);
+                return;
             }
         }
 
@@ -1404,24 +1433,36 @@ pub const Session = struct {
                 };
             } else {
                 // External delivery: relay via SES in a background thread
-                // so we don't block the SMTP session (Apple Mail times out otherwise)
+                // so we don't block the SMTP session (Apple Mail times out otherwise).
+                // Bound the number of in-flight worker threads to avoid resource
+                // exhaustion from a flood of recipients.
+                if (!tryReserveOutboundSlot()) {
+                    self.logger.warn("Outbound worker limit reached; dropping background delivery to {s}", .{rcpt});
+                    continue;
+                }
                 self.logger.info("Queueing outbound delivery to: {s}", .{rcpt});
-                const bg = try self.allocator.create(OutboundContext);
+                const bg = self.allocator.create(OutboundContext) catch {
+                    releaseOutboundSlot();
+                    continue;
+                };
                 bg.* = .{
                     .allocator = self.allocator,
                     .from = self.allocator.dupe(u8, sender) catch {
                         self.allocator.destroy(bg);
+                        releaseOutboundSlot();
                         continue;
                     },
                     .to = self.allocator.dupe(u8, rcpt) catch {
                         self.allocator.free(bg.from);
                         self.allocator.destroy(bg);
+                        releaseOutboundSlot();
                         continue;
                     },
                     .data = self.allocator.dupe(u8, data) catch {
                         self.allocator.free(bg.from);
                         self.allocator.free(bg.to);
                         self.allocator.destroy(bg);
+                        releaseOutboundSlot();
                         continue;
                     },
                     .hostname = self.config.hostname,
@@ -1434,6 +1475,7 @@ pub const Session = struct {
                     self.allocator.free(bg.to);
                     self.allocator.free(bg.from);
                     self.allocator.destroy(bg);
+                    releaseOutboundSlot();
                     continue;
                 };
                 thread.detach();
@@ -1457,6 +1499,8 @@ pub const Session = struct {
             ctx.allocator.free(ctx.to);
             ctx.allocator.free(ctx.from);
             ctx.allocator.destroy(ctx);
+            // Release the in-flight worker slot reserved before spawning.
+            releaseOutboundSlot();
         }
         outbound.deliverToRemote(
             ctx.allocator,
@@ -1538,23 +1582,34 @@ pub const Session = struct {
                 };
                 self.logger.info("Local forward from {s} to {s} saved to {s}", .{ username, fwd_username, fwd_filename });
             } else {
-                // External forward: relay via SES
-                const bg = self.allocator.create(OutboundContext) catch continue;
+                // External forward: relay via SES. Bound the number of in-flight
+                // worker threads to avoid resource exhaustion.
+                if (!tryReserveOutboundSlot()) {
+                    self.logger.warn("Outbound worker limit reached; dropping forward to {s}", .{forward_to});
+                    continue;
+                }
+                const bg = self.allocator.create(OutboundContext) catch {
+                    releaseOutboundSlot();
+                    continue;
+                };
                 bg.* = .{
                     .allocator = self.allocator,
                     .from = self.allocator.dupe(u8, sender) catch {
                         self.allocator.destroy(bg);
+                        releaseOutboundSlot();
                         continue;
                     },
                     .to = self.allocator.dupe(u8, forward_to) catch {
                         self.allocator.free(bg.from);
                         self.allocator.destroy(bg);
+                        releaseOutboundSlot();
                         continue;
                     },
                     .data = self.allocator.dupe(u8, data) catch {
                         self.allocator.free(bg.from);
                         self.allocator.free(bg.to);
                         self.allocator.destroy(bg);
+                        releaseOutboundSlot();
                         continue;
                     },
                     .hostname = self.config.hostname,
@@ -1567,6 +1622,7 @@ pub const Session = struct {
                     self.allocator.free(bg.to);
                     self.allocator.free(bg.from);
                     self.allocator.destroy(bg);
+                    releaseOutboundSlot();
                     continue;
                 };
                 thread.detach();

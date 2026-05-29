@@ -149,10 +149,21 @@ pub const SMTPRelay = struct {
             return error.DataFailed;
         }
 
-        // Send message data
-        _ = try fdWrite(fd, data);
-        if (!std.mem.endsWith(u8, data, "\r\n.\r\n")) {
-            _ = try fdWrite(fd, "\r\n.\r\n");
+        // Normalize line endings to CRLF and re-apply dot-stuffing (RFC 5321
+        // 4.5.2) before sending the body. Messages may have been reassembled
+        // internally with bare LF and without transparency, so sending them
+        // raw would allow SMTP smuggling.
+        const smtp_body = try normalizeForSmtp(self.allocator, data);
+        defer self.allocator.free(smtp_body);
+
+        // Send message data, terminated by <CRLF>.<CRLF>.
+        _ = try fdWrite(fd, smtp_body);
+        if (!std.mem.endsWith(u8, smtp_body, "\r\n.\r\n")) {
+            if (std.mem.endsWith(u8, smtp_body, "\r\n")) {
+                _ = try fdWrite(fd, ".\r\n");
+            } else {
+                _ = try fdWrite(fd, "\r\n.\r\n");
+            }
         }
 
         const send_response = try readResponse(fd, &buf);
@@ -188,6 +199,44 @@ pub const SMTPRelay = struct {
         return result;
     }
 };
+
+/// Normalize a message body for SMTP transmission: convert bare LF/CR line
+/// endings to CRLF and re-apply dot-stuffing (RFC 5321 section 4.5.2) by
+/// prepending '.' to any line that begins with '.'. The returned buffer is
+/// owned by the caller and must be freed with `allocator.free`.
+fn normalizeForSmtp(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    var at_line_start = true;
+    while (i < data.len) {
+        const c = data[i];
+        if (c == '\r') {
+            if (i + 1 < data.len and data[i + 1] == '\n') {
+                i += 1;
+            }
+            try out.appendSlice(allocator, "\r\n");
+            i += 1;
+            at_line_start = true;
+            continue;
+        }
+        if (c == '\n') {
+            try out.appendSlice(allocator, "\r\n");
+            i += 1;
+            at_line_start = true;
+            continue;
+        }
+        if (at_line_start and c == '.') {
+            try out.append(allocator, '.');
+        }
+        try out.append(allocator, c);
+        at_line_start = false;
+        i += 1;
+    }
+
+    return out.toOwnedSlice(allocator);
+}
 
 // I/O helpers — posix.write/read were removed in Zig 0.16-dev
 fn fdWrite(fd: posix.socket_t, data: []const u8) !usize {

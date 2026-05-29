@@ -3,6 +3,74 @@ const io_compat = @import("../core/io_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const config = @import("../core/config.zig");
 
+/// Reject email addresses that contain CR, LF, control characters, double
+/// quotes, or backslashes. These could be used for SMTP command injection
+/// (CRLF) or JSON injection (quotes/backslashes) when interpolated into
+/// downstream commands or JSON payloads.
+fn isSafeAddress(addr: []const u8) bool {
+    if (addr.len == 0) return false;
+    for (addr) |c| {
+        if (c < 0x20 or c == 0x7f) return false; // control chars (incl. CR/LF)
+        if (c == '"' or c == '\\') return false; // JSON / quoting hazards
+    }
+    return true;
+}
+
+/// Validate an MX hostname before using it in a shell command. Only allow
+/// characters valid in DNS hostnames ([A-Za-z0-9.-]) to prevent shell
+/// injection via the `dig` invocation.
+fn isSafeHostname(host: []const u8) bool {
+    if (host.len == 0 or host.len > 253) return false;
+    for (host) |c| {
+        const ok = (c >= 'A' and c <= 'Z') or
+            (c >= 'a' and c <= 'z') or
+            (c >= '0' and c <= '9') or
+            c == '.' or c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// Normalize a message body for SMTP transmission: convert bare LF/CR line
+/// endings to CRLF and re-apply dot-stuffing (RFC 5321 section 4.5.2) by
+/// prepending '.' to any line that begins with '.'. The returned buffer is
+/// owned by the caller and must be freed with `allocator.free`.
+fn normalizeForSmtp(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    var at_line_start = true;
+    while (i < data.len) {
+        const c = data[i];
+        if (c == '\r') {
+            // Treat CRLF or bare CR as a line terminator.
+            if (i + 1 < data.len and data[i + 1] == '\n') {
+                i += 1;
+            }
+            try out.appendSlice(allocator, "\r\n");
+            i += 1;
+            at_line_start = true;
+            continue;
+        }
+        if (c == '\n') {
+            try out.appendSlice(allocator, "\r\n");
+            i += 1;
+            at_line_start = true;
+            continue;
+        }
+        // Dot-stuffing: a line starting with '.' gets an extra leading '.'.
+        if (at_line_start and c == '.') {
+            try out.append(allocator, '.');
+        }
+        try out.append(allocator, c);
+        at_line_start = false;
+        i += 1;
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
 /// Outbound email delivery with configurable method.
 ///
 /// Supports two delivery methods:
@@ -19,6 +87,12 @@ pub fn deliverToRemote(
     delivery_method: config.DeliveryMethod,
     ses_region: []const u8,
 ) !void {
+    // Reject addresses containing CR/LF/control/quote chars before they are
+    // interpolated into SMTP commands or JSON payloads downstream.
+    if (!isSafeAddress(from) or !isSafeAddress(to)) {
+        std.log.err("Refusing delivery: unsafe characters in envelope address", .{});
+        return error.InvalidAddress;
+    }
     switch (delivery_method) {
         .direct => try deliverDirect(allocator, from, to, message_data, our_hostname),
         .ses => try deliverViaSes(allocator, from, to, message_data, ses_region),
@@ -40,6 +114,13 @@ fn deliverDirect(
     // Look up MX records using dig
     const mx_host = try lookupMx(allocator, domain);
     defer allocator.free(mx_host);
+
+    // The MX hostname is used inside a shell command (and getaddrinfo); reject
+    // anything outside the DNS hostname character set to prevent injection.
+    if (!isSafeHostname(mx_host)) {
+        std.log.err("Refusing delivery: unsafe MX hostname", .{});
+        return error.MxResolutionFailed;
+    }
 
     std.log.info("Direct delivery to {s} via MX: {s}", .{ to, mx_host });
 
@@ -160,11 +241,18 @@ fn deliverDirect(
         return error.SmtpDataFailed;
     }
 
-    // Send message content
-    try sendAll(sock, raw_message);
+    // Normalize line endings to CRLF and re-apply dot-stuffing before sending
+    // the body downstream. The body was reassembled internally with bare LF
+    // and without transparency, so sending it raw would enable SMTP smuggling.
+    const smtp_body = try normalizeForSmtp(allocator, raw_message);
+    defer allocator.free(smtp_body);
 
-    // Ensure message ends with \r\n.\r\n
-    if (!std.mem.endsWith(u8, raw_message, "\r\n")) {
+    // Send message content
+    try sendAll(sock, smtp_body);
+
+    // Ensure message ends with \r\n.\r\n (normalizeForSmtp guarantees CRLF
+    // line endings, so we only need to add the terminator when missing).
+    if (!std.mem.endsWith(u8, smtp_body, "\r\n")) {
         try sendAll(sock, "\r\n");
     }
     try sendAll(sock, ".\r\n");
@@ -230,6 +318,13 @@ fn readResponse(sock: std.posix.socket_t, buf: []u8) !usize {
 /// Look up MX records for a domain using the dig command.
 /// Returns the highest-priority MX hostname.
 fn lookupMx(allocator: std.mem.Allocator, domain: []const u8) ![]u8 {
+    // The domain is interpolated into a /bin/sh command, so it must only
+    // contain DNS hostname characters to prevent shell injection.
+    if (!isSafeHostname(domain)) {
+        std.log.err("Refusing MX lookup: unsafe domain", .{});
+        return error.MxResolutionFailed;
+    }
+
     const io = io_compat.getIo();
     const timestamp = time_compat.milliTimestamp();
 
@@ -336,7 +431,17 @@ fn deliverViaSes(
     defer allocator.free(b64_buf);
     const b64_data = encoder.Encoder.encode(b64_buf, raw_message);
 
-    // Build JSON input for AWS CLI
+    // Build JSON input for AWS CLI. `from`/`to` are interpolated into the JSON
+    // string, so they must not contain JSON-significant characters (quotes,
+    // backslashes) or control characters that could break out of the string
+    // and inject additional JSON fields. deliverToRemote already validates
+    // these, but we re-check here as defense-in-depth since this function
+    // builds untrusted-data JSON directly. b64_data is base64 and therefore
+    // safe by construction.
+    if (!isSafeAddress(from) or !isSafeAddress(to)) {
+        std.log.err("Refusing SES delivery: unsafe characters in envelope address", .{});
+        return error.InvalidAddress;
+    }
     const json_input = try std.fmt.allocPrint(
         allocator,
         "{{\"Source\":\"{s}\",\"Destinations\":[\"{s}\"],\"RawMessage\":{{\"Data\":\"{s}\"}}}}",

@@ -59,7 +59,7 @@ pub const QueuedMessage = struct {
 /// Message queue for outbound delivery with database persistence
 pub const MessageQueue = struct {
     allocator: std.mem.Allocator,
-    messages: std.ArrayList(*QueuedMessage),
+    messages: std.ArrayList(*QueuedMessage) = .empty,
     mutex: mutex_compat.Mutex,
     next_id: u64,
     db: ?*database.Database, // Optional database for persistence
@@ -67,7 +67,7 @@ pub const MessageQueue = struct {
     pub fn init(allocator: std.mem.Allocator) MessageQueue {
         return .{
             .allocator = allocator,
-            .messages = std.ArrayList(*QueuedMessage).init(allocator),
+            .messages = .empty,
             .mutex = .{},
             .next_id = 1,
             .db = null,
@@ -78,7 +78,7 @@ pub const MessageQueue = struct {
     pub fn initWithDB(allocator: std.mem.Allocator, db: *database.Database) !MessageQueue {
         var queue = MessageQueue{
             .allocator = allocator,
-            .messages = std.ArrayList(*QueuedMessage).init(allocator),
+            .messages = .empty,
             .mutex = .{},
             .next_id = 1,
             .db = db,
@@ -163,7 +163,7 @@ pub const MessageQueue = struct {
                         null,
                 };
 
-                try self.messages.append(msg);
+                try self.messages.append(self.allocator, msg);
 
                 // Track highest ID for next_id
                 if (std.fmt.parseInt(u64, id, 10)) |id_num| {
@@ -225,7 +225,7 @@ pub const MessageQueue = struct {
             msg.deinit(self.allocator);
             self.allocator.destroy(msg);
         }
-        self.messages.deinit();
+        self.messages.deinit(self.allocator);
     }
 
     /// Enqueue a new message for delivery
@@ -260,7 +260,7 @@ pub const MessageQueue = struct {
             .error_message = null,
         };
 
-        try self.messages.append(msg);
+        try self.messages.append(self.allocator, msg);
 
         // Persist to database
         try self.persistMessage(msg);
