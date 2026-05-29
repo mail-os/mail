@@ -11,9 +11,9 @@ pub const Dir = struct {
     pub fn openFile(self: Dir, sub_path: []const u8, flags: OpenFlags) OpenError!File {
         _ = self;
         _ = flags;
-        const path_z = std.fmt.allocPrintZ(std.heap.c_allocator, "{s}", .{sub_path}) catch return error.SystemResources;
-        defer std.heap.c_allocator.free(path_z);
-        const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        const path_z = toZ(sub_path) orelse return error.SystemResources;
+        defer freeZ(path_z, sub_path.len);
+        const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
         if (fd < 0) return error.FileNotFound;
         return .{ .handle = fd };
     }
@@ -38,9 +38,9 @@ pub const Dir = struct {
     pub fn access(self: Dir, sub_path: []const u8, flags: AccessFlags) AccessError!void {
         _ = self;
         _ = flags;
-        const path_z = std.fmt.allocPrintZ(std.heap.c_allocator, "{s}", .{sub_path}) catch return error.SystemResources;
-        defer std.heap.c_allocator.free(path_z);
-        const result = std.c.access(path_z.ptr, std.c.F.OK);
+        const path_z = toZ(sub_path) orelse return error.SystemResources;
+        defer freeZ(path_z, sub_path.len);
+        const result = std.c.access(path_z, std.c.F.OK);
         if (result != 0) return error.FileNotFound;
     }
 
@@ -58,19 +58,19 @@ pub const Dir = struct {
     /// Delete a file.
     pub fn deleteFile(self: Dir, sub_path: []const u8) DeleteError!void {
         _ = self;
-        const path_z = std.fmt.allocPrintZ(std.heap.c_allocator, "{s}", .{sub_path}) catch return error.SystemResources;
-        defer std.heap.c_allocator.free(path_z);
-        const result = std.c.unlink(path_z.ptr);
+        const path_z = toZ(sub_path) orelse return error.SystemResources;
+        defer freeZ(path_z, sub_path.len);
+        const result = std.c.unlink(path_z);
         if (result != 0) return error.FileNotFound;
     }
 
     /// Resolve real path.
     pub fn realpath(self: Dir, sub_path: []const u8, buf: []u8) RealPathError![]u8 {
         _ = self;
-        const path_z = std.fmt.allocPrintZ(std.heap.c_allocator, "{s}", .{sub_path}) catch return error.SystemResources;
-        defer std.heap.c_allocator.free(path_z);
+        const path_z = toZ(sub_path) orelse return error.SystemResources;
+        defer freeZ(path_z, sub_path.len);
         var result_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const result = std.c.realpath(path_z.ptr, &result_buf);
+        const result = std.c.realpath(path_z, &result_buf);
         if (result == null) return error.FileNotFound;
         const len = std.mem.indexOfScalar(u8, &result_buf, 0) orelse result_buf.len;
         if (len > buf.len) return error.NameTooLong;
@@ -108,11 +108,11 @@ pub const Dir = struct {
     pub fn deleteTree(self: Dir, sub_path: []const u8) DeleteError!void {
         _ = self;
         // Use system "rm -rf" via libc - simplified implementation
-        const path_z = std.fmt.allocPrintZ(std.heap.c_allocator, "{s}", .{sub_path}) catch return;
-        defer std.heap.c_allocator.free(path_z);
+        const path_z = toZ(sub_path) orelse return;
+        defer freeZ(path_z, sub_path.len);
         // Try rmdir first (for empty dirs), then unlink (for files)
-        _ = std.c.rmdir(path_z.ptr);
-        _ = std.c.unlink(path_z.ptr);
+        _ = std.c.rmdir(path_z);
+        _ = std.c.unlink(path_z);
     }
 
     /// Open a subdirectory.
@@ -120,10 +120,10 @@ pub const Dir = struct {
         _ = self;
         _ = flags;
         // Verify the path exists and is a directory
-        const path_z = std.fmt.allocPrintZ(std.heap.c_allocator, "{s}", .{sub_path}) catch return error.SystemResources;
-        defer std.heap.c_allocator.free(path_z);
+        const path_z = toZ(sub_path) orelse return error.SystemResources;
+        defer freeZ(path_z, sub_path.len);
         var st: std.c.Stat = undefined;
-        const result = std.c.stat(path_z.ptr, &st);
+        const result = std.c.stat(path_z, &st);
         if (result != 0) return error.FileNotFound;
         return .{};
     }
@@ -134,16 +134,16 @@ pub const Dir = struct {
         _ = dest_dir;
         _ = flags;
         // Read source, write dest
-        const src = std.fmt.allocPrintZ(std.heap.c_allocator, "{s}", .{src_path}) catch return error.SystemResources;
-        defer std.heap.c_allocator.free(src);
-        const dst = std.fmt.allocPrintZ(std.heap.c_allocator, "{s}", .{dest_path}) catch return error.SystemResources;
-        defer std.heap.c_allocator.free(dst);
+        const src = toZ(src_path) orelse return error.SystemResources;
+        defer freeZ(src, src_path.len);
+        const dst = toZ(dest_path) orelse return error.SystemResources;
+        defer freeZ(dst, dest_path.len);
 
-        const src_fd = std.c.open(src.ptr, .{ .ACCMODE = .RDONLY }, 0);
+        const src_fd = std.c.open(src, .{ .ACCMODE = .RDONLY }, 0);
         if (src_fd < 0) return error.FileNotFound;
         defer _ = std.c.close(src_fd);
 
-        const dst_fd = std.c.open(dst.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+        const dst_fd = std.c.open(dst, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
         if (dst_fd < 0) return error.FileNotFound;
         defer _ = std.c.close(dst_fd);
 
