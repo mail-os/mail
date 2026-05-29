@@ -40,7 +40,8 @@ pub const Dir = struct {
         _ = flags;
         const path_z = toZ(sub_path) orelse return error.SystemResources;
         defer freeZ(path_z, sub_path.len);
-        const result = std.c.access(path_z, std.c.F.OK);
+        // F_OK (existence check) is 0 in POSIX; std.c.F.OK is absent on this Zig.
+        const result = std.c.access(path_z, 0);
         if (result != 0) return error.FileNotFound;
     }
 
