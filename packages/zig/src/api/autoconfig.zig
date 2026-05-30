@@ -61,6 +61,11 @@ pub const AutoconfigConfig = struct {
     /// Short display name (e.g., "Example")
     display_short_name: []const u8 = "Mail",
 
+    /// Whether the IMAP/SMTP email (Mail + Notes) payload is included in the
+    /// Apple mobileconfig. Disable to emit a Calendar/Contacts-only profile that
+    /// will not collide with an email account the user already has configured.
+    enable_email: bool = true,
+
     /// Whether CardDAV (contacts) is enabled in Apple mobileconfig
     enable_carddav: bool = true,
 
@@ -506,70 +511,74 @@ pub fn generateAppleMobileconfig(
     try buf.appendSlice(allocator, "  <key>PayloadContent</key>\n");
     try buf.appendSlice(allocator, "  <array>\n");
 
-    // Email account payload
-    try buf.appendSlice(allocator, "    <dict>\n");
+    // Email account payload (IMAP/SMTP; also carries Apple Notes). Omitted when
+    // enable_email is false, yielding a Calendar/Contacts-only profile that does
+    // not collide with an email account the user already has configured.
+    if (config.enable_email) {
+        try buf.appendSlice(allocator, "    <dict>\n");
 
-    // Incoming mail server (IMAP)
-    try buf.appendSlice(allocator, "      <key>EmailAccountDescription</key>\n");
-    try buf.print(allocator, "      <string>{s}</string>\n", .{config.display_name});
-    try buf.appendSlice(allocator, "      <key>EmailAccountName</key>\n");
-    try buf.print(allocator, "      <string>{s}</string>\n", .{username});
-    try buf.appendSlice(allocator, "      <key>EmailAccountType</key>\n");
-    try buf.appendSlice(allocator, "      <string>EmailTypeIMAP</string>\n");
-    try buf.appendSlice(allocator, "      <key>EmailAddress</key>\n");
-    try buf.print(allocator, "      <string>{s}</string>\n", .{email});
+        // Incoming mail server (IMAP)
+        try buf.appendSlice(allocator, "      <key>EmailAccountDescription</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{config.display_name});
+        try buf.appendSlice(allocator, "      <key>EmailAccountName</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{username});
+        try buf.appendSlice(allocator, "      <key>EmailAccountType</key>\n");
+        try buf.appendSlice(allocator, "      <string>EmailTypeIMAP</string>\n");
+        try buf.appendSlice(allocator, "      <key>EmailAddress</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{email});
 
-    // Incoming server settings
-    try buf.appendSlice(allocator, "      <key>IncomingMailServerAuthentication</key>\n");
-    try buf.appendSlice(allocator, "      <string>EmailAuthPassword</string>\n");
-    try buf.appendSlice(allocator, "      <key>IncomingMailServerHostName</key>\n");
-    try buf.print(allocator, "      <string>{s}</string>\n", .{config.hostname});
-    try buf.appendSlice(allocator, "      <key>IncomingMailServerPortNumber</key>\n");
-    try buf.print(allocator, "      <integer>{d}</integer>\n", .{config.imaps_port});
-    try buf.appendSlice(allocator, "      <key>IncomingMailServerUseSSL</key>\n");
-    try buf.appendSlice(allocator, "      <true/>\n");
-    try buf.appendSlice(allocator, "      <key>IncomingMailServerUsername</key>\n");
-    try buf.print(allocator, "      <string>{s}</string>\n", .{email});
-    try buf.appendSlice(allocator, "      <key>IncomingPassword</key>\n");
-    try buf.appendSlice(allocator, "      <string></string>\n");
+        // Incoming server settings
+        try buf.appendSlice(allocator, "      <key>IncomingMailServerAuthentication</key>\n");
+        try buf.appendSlice(allocator, "      <string>EmailAuthPassword</string>\n");
+        try buf.appendSlice(allocator, "      <key>IncomingMailServerHostName</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{config.hostname});
+        try buf.appendSlice(allocator, "      <key>IncomingMailServerPortNumber</key>\n");
+        try buf.print(allocator, "      <integer>{d}</integer>\n", .{config.imaps_port});
+        try buf.appendSlice(allocator, "      <key>IncomingMailServerUseSSL</key>\n");
+        try buf.appendSlice(allocator, "      <true/>\n");
+        try buf.appendSlice(allocator, "      <key>IncomingMailServerUsername</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{email});
+        try buf.appendSlice(allocator, "      <key>IncomingPassword</key>\n");
+        try buf.appendSlice(allocator, "      <string></string>\n");
 
-    // Outgoing server settings
-    try buf.appendSlice(allocator, "      <key>OutgoingMailServerAuthentication</key>\n");
-    try buf.appendSlice(allocator, "      <string>EmailAuthPassword</string>\n");
-    try buf.appendSlice(allocator, "      <key>OutgoingMailServerHostName</key>\n");
-    try buf.print(allocator, "      <string>{s}</string>\n", .{config.hostname});
-    try buf.appendSlice(allocator, "      <key>OutgoingMailServerPortNumber</key>\n");
-    try buf.print(allocator, "      <integer>{d}</integer>\n", .{config.smtp_port});
-    try buf.appendSlice(allocator, "      <key>OutgoingMailServerUseSSL</key>\n");
-    try buf.appendSlice(allocator, "      <true/>\n");
-    try buf.appendSlice(allocator, "      <key>OutgoingMailServerUsername</key>\n");
-    try buf.print(allocator, "      <string>{s}</string>\n", .{email});
-    try buf.appendSlice(allocator, "      <key>OutgoingPassword</key>\n");
-    try buf.appendSlice(allocator, "      <string></string>\n");
-    try buf.appendSlice(allocator, "      <key>OutgoingPasswordSameAsIncomingPassword</key>\n");
-    try buf.appendSlice(allocator, "      <true/>\n");
+        // Outgoing server settings
+        try buf.appendSlice(allocator, "      <key>OutgoingMailServerAuthentication</key>\n");
+        try buf.appendSlice(allocator, "      <string>EmailAuthPassword</string>\n");
+        try buf.appendSlice(allocator, "      <key>OutgoingMailServerHostName</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{config.hostname});
+        try buf.appendSlice(allocator, "      <key>OutgoingMailServerPortNumber</key>\n");
+        try buf.print(allocator, "      <integer>{d}</integer>\n", .{config.smtp_port});
+        try buf.appendSlice(allocator, "      <key>OutgoingMailServerUseSSL</key>\n");
+        try buf.appendSlice(allocator, "      <true/>\n");
+        try buf.appendSlice(allocator, "      <key>OutgoingMailServerUsername</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{email});
+        try buf.appendSlice(allocator, "      <key>OutgoingPassword</key>\n");
+        try buf.appendSlice(allocator, "      <string></string>\n");
+        try buf.appendSlice(allocator, "      <key>OutgoingPasswordSameAsIncomingPassword</key>\n");
+        try buf.appendSlice(allocator, "      <true/>\n");
 
-    // Payload identification for the email account
-    try buf.appendSlice(allocator, "      <key>PayloadDescription</key>\n");
-    try buf.print(allocator, "      <string>Email account configuration for {s}</string>\n", .{email_domain});
-    try buf.appendSlice(allocator, "      <key>PayloadDisplayName</key>\n");
-    try buf.print(allocator, "      <string>{s} Email</string>\n", .{config.display_name});
-    try buf.appendSlice(allocator, "      <key>PayloadIdentifier</key>\n");
-    try buf.print(allocator, "      <string>com.{s}.email.account</string>\n", .{email_domain});
-    try buf.appendSlice(allocator, "      <key>PayloadType</key>\n");
-    try buf.appendSlice(allocator, "      <string>com.apple.mail.managed</string>\n");
-    try buf.appendSlice(allocator, "      <key>PayloadUUID</key>\n");
-    try buf.print(allocator, "      <string>{s}</string>\n", .{imap_uuid});
-    try buf.appendSlice(allocator, "      <key>PayloadVersion</key>\n");
-    try buf.appendSlice(allocator, "      <integer>1</integer>\n");
-    try buf.appendSlice(allocator, "      <key>PreventAppSheet</key>\n");
-    try buf.appendSlice(allocator, "      <false/>\n");
-    try buf.appendSlice(allocator, "      <key>PreventMove</key>\n");
-    try buf.appendSlice(allocator, "      <false/>\n");
-    try buf.appendSlice(allocator, "      <key>SMIMEEnabled</key>\n");
-    try buf.appendSlice(allocator, "      <false/>\n");
+        // Payload identification for the email account
+        try buf.appendSlice(allocator, "      <key>PayloadDescription</key>\n");
+        try buf.print(allocator, "      <string>Email account configuration for {s}</string>\n", .{email_domain});
+        try buf.appendSlice(allocator, "      <key>PayloadDisplayName</key>\n");
+        try buf.print(allocator, "      <string>{s} Email</string>\n", .{config.display_name});
+        try buf.appendSlice(allocator, "      <key>PayloadIdentifier</key>\n");
+        try buf.print(allocator, "      <string>com.{s}.email.account</string>\n", .{email_domain});
+        try buf.appendSlice(allocator, "      <key>PayloadType</key>\n");
+        try buf.appendSlice(allocator, "      <string>com.apple.mail.managed</string>\n");
+        try buf.appendSlice(allocator, "      <key>PayloadUUID</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{imap_uuid});
+        try buf.appendSlice(allocator, "      <key>PayloadVersion</key>\n");
+        try buf.appendSlice(allocator, "      <integer>1</integer>\n");
+        try buf.appendSlice(allocator, "      <key>PreventAppSheet</key>\n");
+        try buf.appendSlice(allocator, "      <false/>\n");
+        try buf.appendSlice(allocator, "      <key>PreventMove</key>\n");
+        try buf.appendSlice(allocator, "      <false/>\n");
+        try buf.appendSlice(allocator, "      <key>SMIMEEnabled</key>\n");
+        try buf.appendSlice(allocator, "      <false/>\n");
 
-    try buf.appendSlice(allocator, "    </dict>\n");
+        try buf.appendSlice(allocator, "    </dict>\n");
+    }
 
     // CardDAV (Contacts) payload
     if (config.enable_carddav) {

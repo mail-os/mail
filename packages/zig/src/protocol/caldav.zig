@@ -2198,6 +2198,12 @@ const TlsCalDavSession = struct {
             return;
         };
 
+        // `?services=dav` emits a Calendar/Contacts-only profile (no IMAP/SMTP
+        // email payload) so it cannot collide with an email account the user
+        // already has configured. Default includes everything.
+        const services = autoconfig.extractQueryParam(query, "services");
+        const dav_only = services != null and std.mem.eql(u8, services.?, "dav");
+
         const domain = autoconfig.extractDomainFromEmail(email) orelse "localhost";
         const ac = autoconfig.AutoconfigConfig{
             .hostname = config.public_hostname,
@@ -2205,6 +2211,7 @@ const TlsCalDavSession = struct {
             .imaps_port = config.imaps_port,
             .smtp_port = config.submission_port,
             .display_name = config.display_name,
+            .enable_email = !dav_only,
             .enable_carddav = config.enable_carddav,
             .enable_caldav_profile = config.enable_caldav,
             .caldav_hostname = config.public_hostname,
