@@ -1765,6 +1765,27 @@ pub const CalDavSession = struct {
 // CalDAV/CardDAV Server
 // ============================================================================
 
+// Process-wide cap on concurrent CalDAV/CardDAV connections so a burst (or a
+// client holding many keep-alive sockets) cannot spawn unbounded threads.
+var caldav_active_conns = std.atomic.Value(u32).init(0);
+const max_caldav_conns: u32 = 128;
+
+/// Per-connection thread context + entry point. Each accepted connection is
+/// handled on its own detached thread so one slow/keep-alive client can never
+/// block others (the old code handled connections serially in the accept loop).
+const CalDavConnContext = struct {
+    server: *CalDavServer,
+    connection: socket.Connection,
+    is_ssl: bool,
+};
+
+fn calDavConnectionThread(ctx: CalDavConnContext) void {
+    defer _ = caldav_active_conns.fetchSub(1, .monotonic);
+    ctx.server.handleConnection(ctx.connection, ctx.is_ssl) catch |err| {
+        logger.err("CalDAV connection error: {}", .{err});
+    };
+}
+
 pub const CalDavServer = struct {
     allocator: std.mem.Allocator,
     config: CalDavConfig,
@@ -1839,11 +1860,22 @@ pub const CalDavServer = struct {
                 continue;
             };
 
-            // Handle connection (defer in handleConnection closes the connection)
-            self.handleConnection(connection, false) catch |err| {
-                logger.err("CalDAV connection error: {}", .{err});
-                // Note: connection.close() is handled by defer in handleConnection
+            // Dispatch on a detached thread so connections are handled
+            // concurrently (defer in handleConnection closes the connection).
+            if (caldav_active_conns.fetchAdd(1, .monotonic) >= max_caldav_conns) {
+                _ = caldav_active_conns.fetchSub(1, .monotonic);
+                logger.warn("CalDAV: connection cap reached, rejecting", .{});
+                connection.close();
+                continue;
+            }
+            const ctx = CalDavConnContext{ .server = self, .connection = connection, .is_ssl = false };
+            const t = std.Thread.spawn(.{}, calDavConnectionThread, .{ctx}) catch |err| {
+                logger.err("CalDAV: failed to spawn handler: {}", .{err});
+                _ = caldav_active_conns.fetchSub(1, .monotonic);
+                connection.close();
+                continue;
             };
+            t.detach();
         }
     }
 
@@ -1879,11 +1911,21 @@ pub const CalDavServer = struct {
                 continue;
             };
 
-            // Handle SSL connection (defer in handleConnection closes the connection)
-            self.handleConnection(connection, true) catch |err| {
-                logger.debug("CalDAV SSL connection error: {}", .{err});
-                // Note: connection.close() is handled by defer in handleConnection
+            // Dispatch on a detached thread (defer in handleConnection closes it).
+            if (caldav_active_conns.fetchAdd(1, .monotonic) >= max_caldav_conns) {
+                _ = caldav_active_conns.fetchSub(1, .monotonic);
+                logger.warn("CalDAV SSL: connection cap reached, rejecting", .{});
+                connection.close();
+                continue;
+            }
+            const ctx = CalDavConnContext{ .server = self, .connection = connection, .is_ssl = true };
+            const t = std.Thread.spawn(.{}, calDavConnectionThread, .{ctx}) catch |err| {
+                logger.debug("CalDAV SSL: failed to spawn handler: {}", .{err});
+                _ = caldav_active_conns.fetchSub(1, .monotonic);
+                connection.close();
+                continue;
             };
+            t.detach();
         }
     }
 
@@ -1902,6 +1944,12 @@ pub const CalDavServer = struct {
 
     /// Handle client connection
     fn handleConnection(self: *CalDavServer, connection: socket.Connection, is_ssl: bool) !void {
+        // Bound how long a (TLS handshake or request) read can block, so an idle
+        // keep-alive or stuck client eventually releases this connection's thread
+        // instead of pinning it forever.
+        const rcv_tv: std.posix.timeval = .{ .sec = 120, .usec = 0 };
+        std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&rcv_tv)) catch {};
+
         var session = CalDavSession.init(self.allocator, connection, self.auth_backend, self.store);
         defer {
             session.deinit();
