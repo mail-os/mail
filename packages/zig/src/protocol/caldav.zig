@@ -7,6 +7,7 @@ const logger = @import("../core/logger.zig");
 const tls = @import("tls");
 const time_compat = @import("../core/time_compat.zig");
 const caldav_store = @import("../storage/caldav_store.zig");
+const autoconfig = @import("../api/autoconfig.zig");
 
 /// Get the current epoch timestamp in seconds.
 fn currentTimestamp() i64 {
@@ -39,6 +40,15 @@ pub const CalDavConfig = struct {
     // TLS configuration
     cert_path: ?[]const u8 = null,
     key_path: ?[]const u8 = null,
+    // Public-facing values used to build the downloadable Apple .mobileconfig
+    // profile (served unauthenticated over HTTPS at /email.mobileconfig). These
+    // let a single profile install configure Mail, Notes, Calendar and Contacts
+    // at once — Apple's Mail-account flow only ever offers Mail + Notes on its
+    // own, so this is the one-click path for the rest.
+    public_hostname: []const u8 = "localhost",
+    imaps_port: u16 = 993,
+    submission_port: u16 = 587,
+    display_name: []const u8 = "Mail",
 };
 
 // ============================================================================
@@ -2048,55 +2058,70 @@ pub const CalDavServer = struct {
                 var closed = false;
 
                 while (!closed) {
-                    // Always read more ciphertext from the socket, appending after
-                    // any carried-over partial record. A (blocking) read of 0 means
-                    // the peer closed -> stop. If the buffer is already full we skip
-                    // the read and decrypt what we have to make progress.
-                    if (cipher_len < recv_buf.len) {
-                        const bytes_read = connection.read(recv_buf[cipher_len..]) catch break;
-                        if (bytes_read == 0) break;
-                        cipher_len += bytes_read;
-                    }
-
-                    const dec = tls_conn.decrypt(recv_buf[0..cipher_len], &cleartext_buf) catch |err| {
-                        logger.err("CalDAV TLS decrypt error: {}", .{err});
-                        break;
-                    };
-                    if (dec.closed) closed = true;
-
-                    // Preserve any ciphertext not consumed (a partial record) by
-                    // shifting it to the front of recv_buf for the next read.
-                    const consumed = dec.ciphertext_pos;
-                    const leftover = cipher_len - consumed;
-                    if (leftover > 0 and consumed > 0) {
-                        std.mem.copyForwards(u8, recv_buf[0..leftover], recv_buf[consumed..cipher_len]);
-                    }
-                    cipher_len = leftover;
-
-                    // Guard against a stall: no ciphertext consumed and buffer full
-                    // means a single record is larger than our buffer -> give up.
-                    if (consumed == 0 and cipher_len >= recv_buf.len) break;
-
-                    if (dec.cleartext.len > 0) {
-                        // SECURITY: bound total buffered request size.
-                        if (request_accum.items.len + dec.cleartext.len > self.config.max_resource_size) {
-                            try tls_session.sendTls("HTTP/1.1 413 Request Entity Too Large\r\nContent-Length: 0\r\n\r\n");
+                    // Decrypt and dispatch whatever ciphertext is ALREADY buffered
+                    // before blocking on another read. The client's HTTP request
+                    // commonly arrives in the same TCP segment as its final TLS
+                    // handshake flight, so it is already sitting in recv_buf (seeded
+                    // into cipher_len as the handshake leftover). Reading first in
+                    // that case deadlocks: the client is waiting for our response and
+                    // will not send another byte. Whether the request piggybacks on
+                    // the handshake segment or arrives separately is timing-dependent,
+                    // which is why this manifested as an intermittent (~65%) hang.
+                    // (IMAP avoids this only because its server speaks first.)
+                    var made_progress = false;
+                    if (cipher_len > 0) {
+                        const dec = tls_conn.decrypt(recv_buf[0..cipher_len], &cleartext_buf) catch |err| {
+                            logger.err("CalDAV TLS decrypt error: {}", .{err});
                             break;
+                        };
+                        if (dec.closed) closed = true;
+
+                        // Preserve any ciphertext not consumed (a partial record) by
+                        // shifting it to the front of recv_buf for the next read.
+                        const consumed = dec.ciphertext_pos;
+                        const leftover = cipher_len - consumed;
+                        if (leftover > 0 and consumed > 0) {
+                            std.mem.copyForwards(u8, recv_buf[0..leftover], recv_buf[consumed..cipher_len]);
                         }
-                        try request_accum.appendSlice(self.allocator, dec.cleartext);
+                        cipher_len = leftover;
+                        if (consumed > 0) made_progress = true;
+
+                        if (dec.cleartext.len > 0) {
+                            made_progress = true;
+                            // SECURITY: bound total buffered request size.
+                            if (request_accum.items.len + dec.cleartext.len > self.config.max_resource_size) {
+                                try tls_session.sendTls("HTTP/1.1 413 Request Entity Too Large\r\nContent-Length: 0\r\n\r\n");
+                                break;
+                            }
+                            try request_accum.appendSlice(self.allocator, dec.cleartext);
+                        }
+
+                        // Dispatch every complete request currently buffered (handles
+                        // pipelining), keeping any trailing partial request.
+                        while (httpRequestLength(request_accum.items)) |req_len| {
+                            _ = tls_session.handleRequest(&self.config, request_accum.items[0..req_len]) catch {};
+                            // Drop the consumed request, shifting any remainder down.
+                            const remaining = request_accum.items.len - req_len;
+                            if (remaining > 0) {
+                                std.mem.copyForwards(u8, request_accum.items[0..remaining], request_accum.items[req_len..]);
+                            }
+                            request_accum.shrinkRetainingCapacity(remaining);
+                        }
                     }
 
-                    // Dispatch every complete request currently buffered (handles
-                    // pipelining), keeping any trailing partial request.
-                    while (httpRequestLength(request_accum.items)) |req_len| {
-                        _ = tls_session.handleRequest(&self.config, request_accum.items[0..req_len]) catch {};
-                        // Drop the consumed request, shifting any remainder down.
-                        const remaining = request_accum.items.len - req_len;
-                        if (remaining > 0) {
-                            std.mem.copyForwards(u8, request_accum.items[0..remaining], request_accum.items[req_len..]);
-                        }
-                        request_accum.shrinkRetainingCapacity(remaining);
-                    }
+                    if (closed) break;
+
+                    // Drain any further buffered records before blocking on a read.
+                    if (made_progress and cipher_len > 0) continue;
+
+                    // A single record larger than the whole buffer can never be
+                    // decrypted -> give up rather than spin.
+                    if (cipher_len >= recv_buf.len) break;
+
+                    // Block for more ciphertext from the client.
+                    const bytes_read = connection.read(recv_buf[cipher_len..]) catch break;
+                    if (bytes_read == 0) break;
+                    cipher_len += bytes_read;
                 }
 
                 // Send close notify
@@ -2159,6 +2184,51 @@ const TlsCalDavSession = struct {
         }
     }
 
+    /// Generate and send an Apple .mobileconfig profile for the email given in
+    /// the `?email=` query parameter. Bundles IMAP/SMTP (Mail + Notes), CalDAV
+    /// (Calendar) and CardDAV (Contacts) so one install configures everything.
+    fn serveMobileconfig(self: *TlsCalDavSession, config: *const CalDavConfig, path: []const u8) !void {
+        const query: ?[]const u8 = if (std.mem.indexOfScalar(u8, path, '?')) |q| path[q + 1 ..] else null;
+        const email = autoconfig.extractQueryParam(query, "email") orelse {
+            const msg = "Missing ?email=you@domain query parameter.\n";
+            var hdr: [128]u8 = undefined;
+            const resp = try std.fmt.bufPrint(&hdr, "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{msg.len});
+            try self.sendTls(resp);
+            try self.sendTls(msg);
+            return;
+        };
+
+        const domain = autoconfig.extractDomainFromEmail(email) orelse "localhost";
+        const ac = autoconfig.AutoconfigConfig{
+            .hostname = config.public_hostname,
+            .domain = domain,
+            .imaps_port = config.imaps_port,
+            .smtp_port = config.submission_port,
+            .display_name = config.display_name,
+            .enable_carddav = config.enable_carddav,
+            .enable_caldav_profile = config.enable_caldav,
+            .caldav_hostname = config.public_hostname,
+            .caldav_port = config.ssl_port,
+        };
+
+        const profile = try autoconfig.generateAppleMobileconfig(self.allocator, ac, email);
+        defer self.allocator.free(profile);
+
+        var hdr: [256]u8 = undefined;
+        const header = try std.fmt.bufPrint(
+            &hdr,
+            "HTTP/1.1 200 OK\r\n" ++
+                "Content-Type: application/x-apple-aspen-config; charset=utf-8\r\n" ++
+                "Content-Disposition: attachment; filename=\"mail.mobileconfig\"\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Cache-Control: no-cache, no-store\r\n" ++
+                "Connection: close\r\n\r\n",
+            .{profile.len},
+        );
+        try self.sendTls(header);
+        try self.sendTls(profile);
+    }
+
     /// Send authentication required response with Digest challenge over TLS
     fn sendTlsAuthRequired(self: *TlsCalDavSession) !void {
         const nonce = self.auth_backend.generateNonce() catch {
@@ -2182,8 +2252,6 @@ const TlsCalDavSession = struct {
     }
 
     pub fn handleRequest(self: *TlsCalDavSession, config: *const CalDavConfig, request: []const u8) !bool {
-        _ = config;
-
         // Debug: log incoming request
         logger.info("CalDAV TLS received request ({d} bytes)", .{request.len});
         if (request.len > 0 and request.len < 500) {
@@ -2220,6 +2288,18 @@ const TlsCalDavSession = struct {
                 return true;
             }
             // For PROPFIND, fall through to authentication and handle below
+        }
+
+        // Serve the downloadable Apple configuration profile (unauthenticated:
+        // it carries no secrets, only server names/ports, and the user must
+        // supply their password when installing). One install configures Mail,
+        // Notes, Calendar and Contacts together.
+        if (method == .get and std.mem.startsWith(u8, path, "/email.mobileconfig")) {
+            self.serveMobileconfig(config, path) catch |err| {
+                logger.err("CalDAV: mobileconfig generation failed: {}", .{err});
+                self.sendTls("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n") catch {};
+            };
+            return true;
         }
 
         // Check authentication (Digest or Basic Auth)

@@ -451,6 +451,10 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
             .max_connections = @intCast(cfg.max_connections),
             .cert_path = cfg.tls_cert_path,
             .key_path = cfg.tls_key_path,
+            .public_hostname = cfg.hostname,
+            .imaps_port = 993,
+            .submission_port = 587,
+            .display_name = cfg.hostname,
         };
         caldav_server = caldav.CalDavServer.init(allocator, caldav_config, auth_ptr.?, &caldav_store_inst.?);
         log.info("CalDAV/CardDAV server configured on port {d}", .{caldav_port});
