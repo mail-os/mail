@@ -172,19 +172,24 @@ pub const DKIMValidator = struct {
     }
 
     fn extractDKIMSignature(self: *DKIMValidator, headers: []const u8) ?[]const u8 {
-        // Find DKIM-Signature header
-        var lines = std.mem.splitSequence(u8, headers, "\r\n");
+        // Find the DKIM-Signature header, unfolding continuation lines. Split on
+        // '\n' and strip an optional trailing '\r' so this works whether the
+        // header block uses CRLF (wire) or LF (our in-memory normalized form);
+        // splitting on "\r\n" alone would grab the entire LF header block as one
+        // line and over-read the b= tag into following headers.
+        var lines = std.mem.splitScalar(u8, headers, '\n');
         var in_dkim_sig = false;
         var sig_value: std.ArrayList(u8) = .empty;
         defer sig_value.deinit(self.allocator);
 
-        while (lines.next()) |line| {
-            if (std.mem.startsWith(u8, line, "DKIM-Signature:")) {
+        while (lines.next()) |raw| {
+            const line = if (raw.len > 0 and raw[raw.len - 1] == '\r') raw[0 .. raw.len - 1] else raw;
+            if (std.ascii.startsWithIgnoreCase(line, "DKIM-Signature:")) {
                 in_dkim_sig = true;
-                const value = std.mem.trim(u8, line[15..], " \t");
+                const value = std.mem.trim(u8, line["DKIM-Signature:".len..], " \t");
                 sig_value.appendSlice(self.allocator, value) catch return null;
             } else if (in_dkim_sig) {
-                // Continuation line
+                // Folded continuation line (starts with WSP); anything else ends it.
                 if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) {
                     const value = std.mem.trim(u8, line, " \t");
                     sig_value.appendSlice(self.allocator, value) catch return null;
@@ -455,6 +460,31 @@ test "DKIM signature parsing" {
     try testing.expectEqualStrings("rsa-sha256", sig.algorithm);
     try testing.expectEqualStrings("example.com", sig.domain);
     try testing.expectEqualStrings("default", sig.selector);
+}
+
+test "extractDKIMSignature stops at next header on LF-delimited input" {
+    const testing = std.testing;
+    var validator = DKIMValidator.init(testing.allocator);
+
+    // LF-delimited (our in-memory form), DKIM-Signature first, b= the last tag
+    // with no trailing ';', followed by a Received header that contains ';'.
+    // The old "\r\n"-split code over-read b= into the Received header.
+    const headers =
+        "DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; s=sel; d=ex.com;\n" ++
+        "\th=from:to; bh=BODYHASH=; b=SIGPART1\n" ++
+        "\tSIGPART2\n" ++
+        "Received: from a by b; Sun, 31 May 2026 00:00:00 +0000\n" ++
+        "From: x@ex.com\n";
+
+    const extracted = validator.extractDKIMSignature(headers).?;
+    defer testing.allocator.free(extracted);
+
+    var sig = try DKIMSignature.parse(testing.allocator, extracted);
+    defer sig.deinit();
+    // b= must be exactly the (unfolded) signature, not bleeding into Received.
+    try testing.expectEqualStrings("SIGPART1SIGPART2", sig.signature);
+    try testing.expectEqualStrings("BODYHASH=", sig.body_hash);
+    try testing.expectEqualStrings("from:to", sig.headers);
 }
 
 test "DKIM validator neutral" {
