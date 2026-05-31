@@ -99,6 +99,7 @@ pub fn handleSoap(ctx: *Context, soap: []const u8) !Response {
     if (std.mem.eql(u8, op, "FindItem")) return emptyFindItem(ctx);
     if (std.mem.eql(u8, op, "GetUserConfiguration")) return userConfigurationFault(ctx);
     if (std.mem.eql(u8, op, "GetUserOofSettings")) return oofSettings(ctx);
+    if (std.mem.eql(u8, op, "Subscribe")) return subscribe(ctx);
 
     // Unknown/unimplemented: a soft success keeps setup probing rather than
     // erroring the account, while the request log tells us what to implement.
@@ -132,43 +133,68 @@ fn extractOperation(soap: []const u8) []const u8 {
 // Operations (Phase 1 best-effort; refined from captured requests)
 // ============================================================================
 
+const DistInfo = struct { tag: []const u8, name: []const u8 };
+
+/// Map an EWS distinguished folder id to its element type + display name.
+fn distFolderInfo(dist: []const u8) DistInfo {
+    if (std.mem.eql(u8, dist, "calendar")) return .{ .tag = "CalendarFolder", .name = "Calendar" };
+    if (std.mem.eql(u8, dist, "contacts")) return .{ .tag = "ContactsFolder", .name = "Contacts" };
+    if (std.mem.eql(u8, dist, "tasks")) return .{ .tag = "TasksFolder", .name = "Tasks" };
+    if (std.mem.eql(u8, dist, "inbox")) return .{ .tag = "Folder", .name = "Inbox" };
+    if (std.mem.eql(u8, dist, "drafts")) return .{ .tag = "Folder", .name = "Drafts" };
+    if (std.mem.eql(u8, dist, "sentitems")) return .{ .tag = "Folder", .name = "Sent Items" };
+    if (std.mem.eql(u8, dist, "deleteditems")) return .{ .tag = "Folder", .name = "Deleted Items" };
+    if (std.mem.eql(u8, dist, "junkemail")) return .{ .tag = "Folder", .name = "Junk Email" };
+    if (std.mem.eql(u8, dist, "outbox")) return .{ .tag = "Folder", .name = "Outbox" };
+    if (std.mem.eql(u8, dist, "notes")) return .{ .tag = "Folder", .name = "Notes" };
+    if (std.mem.eql(u8, dist, "journal")) return .{ .tag = "Folder", .name = "Journal" };
+    if (std.mem.eql(u8, dist, "msgfolderroot") or std.mem.eql(u8, dist, "root"))
+        return .{ .tag = "Folder", .name = "Top of Information Store" };
+    return .{ .tag = "Folder", .name = dist };
+}
+
+/// EWS requires EXACTLY one response message per requested folder, in order —
+/// a count mismatch makes macOS Mail assert and abort(). We echo one
+/// GetFolderResponseMessage for every (Distinguished)FolderId in the request,
+/// returning the requested id verbatim so later ops reference a stable id.
 fn getFolder(ctx: *Context, soap: []const u8) !Response {
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(ctx.allocator);
-    const w = ctx.allocator;
+    const a = ctx.allocator;
 
-    try buf.appendSlice(w, "<m:GetFolderResponse><m:ResponseMessages>");
-    // Respond for each distinguished folder the request references (plus root).
-    var matched = false;
-    if (std.mem.indexOf(u8, soap, "\"root\"") != null or std.mem.indexOf(u8, soap, "msgfolderroot") != null) {
-        try appendRootFolderMessage(&buf, w);
-        matched = true;
+    try buf.appendSlice(a, "<m:GetFolderResponse><m:ResponseMessages>");
+    var count: usize = 0;
+    var idx: usize = 0;
+    // Matches both `DistinguishedFolderId Id="..."` and `FolderId Id="..."`.
+    const needle = "FolderId Id=\"";
+    while (std.mem.indexOfPos(u8, soap, idx, needle)) |p| {
+        const vstart = p + needle.len;
+        const vend = std.mem.indexOfScalarPos(u8, soap, vstart, '"') orelse break;
+        const id = soap[vstart..vend];
+        const info = distFolderInfo(id);
+        try buf.print(a,
+            \\<m:GetFolderResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Folders><t:{s}><t:FolderId Id="{s}" ChangeKey="ck0"/><t:DisplayName>{s}</t:DisplayName><t:TotalCount>0</t:TotalCount><t:ChildFolderCount>0</t:ChildFolderCount><t:UnreadCount>0</t:UnreadCount></t:{s}></m:Folders></m:GetFolderResponseMessage>
+        , .{ info.tag, id, info.name, info.tag });
+        count += 1;
+        idx = vend + 1;
     }
-    for (FOLDERS) |f| {
-        if (std.mem.indexOf(u8, soap, f.dist) != null) {
-            try appendFolderMessage(&buf, w, f);
-            matched = true;
-        }
+    if (count == 0) {
+        try buf.appendSlice(a,
+            \\<m:GetFolderResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Folders><t:Folder><t:FolderId Id="msgfolderroot" ChangeKey="ck0"/><t:DisplayName>Top of Information Store</t:DisplayName></t:Folder></m:Folders></m:GetFolderResponseMessage>
+        );
     }
-    if (!matched) {
-        // Default: hand back the root.
-        try appendRootFolderMessage(&buf, w);
-    }
-    try buf.appendSlice(w, "</m:ResponseMessages></m:GetFolderResponse>");
-
+    try buf.appendSlice(a, "</m:ResponseMessages></m:GetFolderResponse>");
     return Response{ .body = try envelope(ctx.allocator, buf.items) };
 }
 
-fn appendRootFolderMessage(buf: *std.ArrayList(u8), a: std.mem.Allocator) !void {
-    try buf.print(a,
-        \\<m:GetFolderResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Folders><t:Folder><t:FolderId Id="{s}" ChangeKey="ck0"/><t:DisplayName>Top of Information Store</t:DisplayName><t:TotalCount>0</t:TotalCount><t:ChildFolderCount>{d}</t:ChildFolderCount></t:Folder></m:Folders></m:GetFolderResponseMessage>
-    , .{ ROOT_ID, FOLDERS.len });
-}
-
-fn appendFolderMessage(buf: *std.ArrayList(u8), a: std.mem.Allocator, f: FolderDef) !void {
-    try buf.appendSlice(a, "<m:GetFolderResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode><m:Folders>");
-    try appendFolder(buf, a, f);
-    try buf.appendSlice(a, "</m:Folders></m:GetFolderResponseMessage>");
+/// We don't offer streaming/push subscriptions. Return a proper error response
+/// (not an empty body) so the client stops hammering Subscribe and falls back
+/// to periodic sync.
+fn subscribe(ctx: *Context) !Response {
+    const inner =
+        \\<m:SubscribeResponse><m:ResponseMessages><m:SubscribeResponseMessage ResponseClass="Error"><m:MessageText>Subscriptions are not supported</m:MessageText><m:ResponseCode>ErrorInvalidServerVersion</m:ResponseCode><m:DescriptiveLinkKey>0</m:DescriptiveLinkKey></m:SubscribeResponseMessage></m:ResponseMessages></m:SubscribeResponse>
+    ;
+    return Response{ .body = try envelope(ctx.allocator, inner) };
 }
 
 fn appendFolder(buf: *std.ArrayList(u8), a: std.mem.Allocator, f: FolderDef) !void {
