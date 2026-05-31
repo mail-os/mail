@@ -55,6 +55,18 @@ pub const PublicKey = struct {
         return try fromBytes(parser.view(modulus), parser.view(pub_exp));
     }
 
+    /// Parse an RSA public key from a DER-encoded `SubjectPublicKeyInfo`
+    /// (X.509 / OpenSSL `-pubout` / DKIM `p=` format): unwrap the
+    /// AlgorithmIdentifier + BIT STRING and parse the inner PKCS#1 RSAPublicKey.
+    pub fn fromSpki(bytes: []const u8) (der.Parser.Error || FromBytesError)!PublicKey {
+        var parser = der.Parser{ .bytes = bytes };
+        _ = try parser.expectSequence(); // SubjectPublicKeyInfo
+        const algorithm = try parser.expectSequence(); // AlgorithmIdentifier
+        parser.seek(algorithm.slice.end);
+        const subject_public_key = try parser.expectBitstring();
+        return try fromDer(subject_public_key.bytes);
+    }
+
     /// Deprecated.
     ///
     /// Encrypt a short message using RSAES-PKCS1-v1_5.

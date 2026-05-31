@@ -224,13 +224,8 @@ pub const DKIMValidator = struct {
             return null;
         };
 
-        // DKIM publishes SPKI; unwrap to the inner PKCS#1 RSAPublicKey for
-        // zig-tls's PublicKey.fromDer. If unwrapping fails, assume raw PKCS#1.
-        if (spkiToPkcs1(der_bytes)) |pkcs1| {
-            const out = try self.allocator.dupe(u8, pkcs1);
-            self.allocator.free(der_bytes);
-            return out;
-        }
+        // DKIM publishes the key as SubjectPublicKeyInfo; PublicKey.fromSpki
+        // (in verifySignature) parses it directly.
         return der_bytes;
     }
 
@@ -293,8 +288,8 @@ pub const DKIMValidator = struct {
         defer self.allocator.free(sig_bytes);
         B64.Decoder.decode(sig_bytes, b_clean.items) catch return false;
 
-        // RSA-PKCS1-SHA256 verify via zig-tls.
-        const pub_key = tls.rsa.PublicKey.fromDer(public_key) catch return false;
+        // RSA-PKCS1-SHA256 verify via zig-tls (public_key is SPKI DER).
+        const pub_key = tls.rsa.PublicKey.fromSpki(public_key) catch return false;
         const Pkcs = tls.rsa.PKCS1v1_5(Sha256);
         const sig = Pkcs.Signature{ .bytes = sig_bytes };
         sig.verify(input.items, pub_key) catch return false;
@@ -395,46 +390,6 @@ fn canonBodySimple(allocator: std.mem.Allocator, body: []const u8, out: *std.Arr
     while (end >= 2 and tmp.items[end - 2] == '\r' and tmp.items[end - 1] == '\n') end -= 2;
     try out.appendSlice(allocator, tmp.items[0..end]);
     if (end > 0) try out.appendSlice(allocator, "\r\n");
-}
-
-/// Unwrap a SubjectPublicKeyInfo DER to its inner PKCS#1 RSAPublicKey (a slice
-/// into `spki`), or null if not a well-formed RSA SPKI.
-fn spkiToPkcs1(spki: []const u8) ?[]const u8 {
-    var p: usize = 0;
-    if (!derTag(spki, &p, 0x30)) return null; // outer SEQUENCE
-    _ = derLen(spki, &p) orelse return null;
-    if (!derTag(spki, &p, 0x30)) return null; // AlgorithmIdentifier SEQUENCE
-    const alg_len = derLen(spki, &p) orelse return null;
-    p += alg_len;
-    if (p >= spki.len or spki[p] != 0x03) return null; // BIT STRING
-    p += 1;
-    const bs_len = derLen(spki, &p) orelse return null;
-    if (bs_len < 1 or p >= spki.len or spki[p] != 0x00) return null; // unused-bits = 0
-    const start = p + 1;
-    const stop = p + bs_len;
-    if (stop > spki.len) return null;
-    return spki[start..stop];
-}
-
-fn derTag(b: []const u8, p: *usize, tag: u8) bool {
-    if (p.* >= b.len or b[p.*] != tag) return false;
-    p.* += 1;
-    return true;
-}
-fn derLen(b: []const u8, p: *usize) ?usize {
-    if (p.* >= b.len) return null;
-    const first = b[p.*];
-    p.* += 1;
-    if (first < 0x80) return first;
-    const n = first & 0x7f;
-    if (n == 0 or n > 4 or p.* + n > b.len) return null;
-    var len: usize = 0;
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        len = (len << 8) | b[p.*];
-        p.* += 1;
-    }
-    return len;
 }
 
 test "dkim tag + canon mode parsing" {
