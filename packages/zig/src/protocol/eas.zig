@@ -355,8 +355,9 @@ fn writeDavCollection(ctx: *Context, w: *wbxml.Writer, folder: FolderDef, req_ke
     const a = arena.allocator();
 
     const store_coll = resolveStoreCollection(ctx, folder.is_calendar) orelse {
-        // No backing calendar/addressbook exists yet — advance key, no items.
-        try w.elementInt(page, A.SyncKey, stored_key + 1);
+        // No backing calendar/addressbook yet — nothing to send. Echo the
+        // client's key (do NOT advance) so the next sync still matches.
+        try w.element(page, A.SyncKey, req_key);
         try w.element(page, A.Status, "1");
         try w.end();
         return;
@@ -364,117 +365,105 @@ fn writeDavCollection(ctx: *Context, w: *wbxml.Writer, folder: FolderDef, req_ke
 
     const since = getSyncToken(ctx, folder.id);
 
-    // First data sync (since == 0) — or the first sync after a server restart,
-    // where the in-memory change log is empty but data was loaded from SQLite —
-    // enumerates ALL current items as Adds instead of relying on the change log.
+    // Build the operations to send. `new_token` is the sync-token baseline to
+    // persist once we've sent them.
+    const Op = struct { kind: u8, rid: u64 };
+    var ops = std.ArrayList(Op).empty;
+    var new_token: i64 = since;
+
     if (since == 0) {
-        const first_key = stored_key + 1;
-        try w.elementInt(page, A.SyncKey, first_key);
-        try w.element(page, A.Status, "1");
-        const store_token = ctx.store.getSyncToken(store_coll, folder.is_calendar);
+        // First data sync (or the first after a restart, where the in-memory
+        // change log is empty but data was loaded from SQLite): enumerate ALL
+        // current items as Adds rather than relying on the change log.
+        new_token = @intCast(ctx.store.getSyncToken(store_coll, folder.is_calendar));
         if (folder.is_calendar) {
             const events = ctx.store.getCalendarEvents(store_coll) catch &[_]caldav_store.Event{};
             defer ctx.allocator.free(events);
-            if (events.len > 0) {
-                try w.startTag(page, A.Perform);
-                for (events) |ev| {
-                    const sid = std.fmt.allocPrint(a, "{d}", .{ev.id}) catch continue;
-                    try w.startTag(page, A.Add);
-                    try w.element(page, A.ServerEntryId, sid);
-                    try w.startTag(page, A.Data);
-                    writeEventAppData(a, w, ev) catch {};
-                    try w.end();
-                    try w.end();
-                }
-                try w.end();
-            }
+            for (events) |ev| ops.append(a, .{ .kind = A.Add, .rid = ev.id }) catch {};
         } else {
             const contacts = ctx.store.getAddressBookContacts(store_coll) catch &[_]caldav_store.Contact{};
             defer ctx.allocator.free(contacts);
-            if (contacts.len > 0) {
-                try w.startTag(page, A.Perform);
-                for (contacts) |ct| {
-                    const sid = std.fmt.allocPrint(a, "{d}", .{ct.id}) catch continue;
-                    try w.startTag(page, A.Add);
-                    try w.element(page, A.ServerEntryId, sid);
-                    try w.startTag(page, A.Data);
-                    writeContactAppData(a, w, ctx, ct) catch {};
-                    try w.end();
-                    try w.end();
-                }
-                try w.end();
+            for (contacts) |ct| ops.append(a, .{ .kind = A.Add, .rid = ct.id }) catch {};
+        }
+    } else {
+        // Incremental: collapse the change log (create+modify -> Add,
+        // *+delete -> Delete, create+delete -> skip).
+        const report = ctx.store.getChangesSince(store_coll, @intCast(since), folder.is_calendar) catch caldav_store.SyncReport{
+            .changes = &.{},
+            .new_sync_token = @intCast(since),
+            .more_available = false,
+        };
+        defer ctx.allocator.free(report.changes);
+        new_token = @intCast(report.new_sync_token);
+
+        const Agg = struct { has_create: bool, deleted: bool };
+        var byId = std.AutoHashMap(u64, Agg).init(a);
+        var order = std.ArrayList(u64).empty;
+        for (report.changes) |ch| {
+            const gop = byId.getOrPut(ch.resource_id) catch continue;
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{ .has_create = false, .deleted = false };
+                order.append(a, ch.resource_id) catch {};
+            }
+            switch (ch.change_type) {
+                .created => gop.value_ptr.has_create = true,
+                .deleted => gop.value_ptr.deleted = true,
+                .modified => {},
             }
         }
-        setSyncKey(ctx, folder.id, first_key, @intCast(store_token)) catch {};
-        try w.end(); // Folder
+        for (order.items) |rid| {
+            const agg = byId.get(rid).?;
+            if (agg.deleted and agg.has_create) continue; // client never saw it
+            const kind: u8 = if (agg.deleted) A.Remove else if (agg.has_create) A.Add else A.Modify;
+            ops.append(a, .{ .kind = kind, .rid = rid }) catch {};
+        }
+    }
+
+    // No changes: echo the client's key (don't signal a change). Still persist
+    // the advanced token so the next incremental sync has the right baseline.
+    if (ops.items.len == 0) {
+        if (new_token != since) setSyncKey(ctx, folder.id, stored_key, new_token) catch {};
+        try w.element(page, A.SyncKey, req_key);
+        try w.element(page, A.Status, "1");
+        try w.end();
         return;
     }
 
-    const report = ctx.store.getChangesSince(store_coll, @intCast(since), folder.is_calendar) catch caldav_store.SyncReport{
-        .changes = &.{},
-        .new_sync_token = @intCast(since),
-        .more_available = false,
-    };
-    defer ctx.allocator.free(report.changes);
-
-    // Dedup by resource id: collapse create+modify -> add, *+delete -> delete,
-    // create+delete -> nothing.
-    const Agg = struct { has_create: bool, deleted: bool };
-    var byId = std.AutoHashMap(u64, Agg).init(a);
-    var order = std.ArrayList(u64).empty;
-    for (report.changes) |ch| {
-        const gop = byId.getOrPut(ch.resource_id) catch continue;
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .{ .has_create = false, .deleted = false };
-            order.append(a, ch.resource_id) catch {};
-        }
-        switch (ch.change_type) {
-            .created => gop.value_ptr.has_create = true,
-            .deleted => gop.value_ptr.deleted = true,
-            .modified => {},
-        }
-    }
-
+    // Changes to send: advance the key and emit the commands.
     const next_key = stored_key + 1;
     try w.elementInt(page, A.SyncKey, next_key);
     try w.element(page, A.Status, "1");
-
-    if (order.items.len > 0) {
-        try w.startTag(page, A.Perform);
-        for (order.items) |rid| {
-            const agg = byId.get(rid).?;
-            const sid = std.fmt.allocPrint(a, "{d}", .{rid}) catch continue;
-            if (agg.deleted and !agg.has_create) {
-                try w.startTag(page, A.Remove);
-                try w.element(page, A.ServerEntryId, sid);
-                try w.end();
-            } else if (agg.deleted and agg.has_create) {
-                // Created and deleted within the window — client never saw it.
-            } else {
-                const kind = if (agg.has_create) A.Add else A.Modify;
-                if (folder.is_calendar) {
-                    const ev = ctx.store.getEvent(rid) orelse continue;
-                    try w.startTag(page, kind);
-                    try w.element(page, A.ServerEntryId, sid);
-                    try w.startTag(page, A.Data);
-                    writeEventAppData(a, w, ev) catch {};
-                    try w.end();
-                    try w.end();
-                } else {
-                    const c = ctx.store.getContact(rid) orelse continue;
-                    try w.startTag(page, kind);
-                    try w.element(page, A.ServerEntryId, sid);
-                    try w.startTag(page, A.Data);
-                    writeContactAppData(a, w, ctx, c) catch {};
-                    try w.end();
-                    try w.end();
-                }
-            }
+    try w.startTag(page, A.Perform);
+    for (ops.items) |op| {
+        const sid = std.fmt.allocPrint(a, "{d}", .{op.rid}) catch continue;
+        if (op.kind == A.Remove) {
+            try w.startTag(page, A.Remove);
+            try w.element(page, A.ServerEntryId, sid);
+            try w.end();
+            continue;
         }
-        try w.end(); // Perform
+        // Fetch the item before emitting so we can skip cleanly if it vanished.
+        if (folder.is_calendar) {
+            const ev = ctx.store.getEvent(op.rid) orelse continue;
+            try w.startTag(page, op.kind);
+            try w.element(page, A.ServerEntryId, sid);
+            try w.startTag(page, A.Data);
+            writeEventAppData(a, w, ev) catch {};
+            try w.end(); // Data
+            try w.end(); // Add/Change
+        } else {
+            const ct = ctx.store.getContact(op.rid) orelse continue;
+            try w.startTag(page, op.kind);
+            try w.element(page, A.ServerEntryId, sid);
+            try w.startTag(page, A.Data);
+            writeContactAppData(a, w, ctx, ct) catch {};
+            try w.end(); // Data
+            try w.end(); // Add/Change
+        }
     }
+    try w.end(); // Perform
 
-    setSyncKey(ctx, folder.id, next_key, @intCast(report.new_sync_token)) catch {};
+    setSyncKey(ctx, folder.id, next_key, new_token) catch {};
     try w.end(); // Folder
 }
 
