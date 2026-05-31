@@ -254,12 +254,30 @@ pub const DKIMValidator = struct {
         var input = std.ArrayList(u8).empty;
         defer input.deinit(self.allocator);
 
-        // Signed headers in h= order. A name may be missing (then skipped).
+        // Signed headers in h= order. RFC 6376 §5.4.2: when a name appears more
+        // than once in h=, instances are matched against the message from the
+        // bottom up, each consuming the next-lower unmatched header; an h= entry
+        // with no remaining match (over-signing / absent header) contributes
+        // nothing. Collect every header span once, then consume.
+        var hdrs = try collectHeaders(self.allocator, headers);
+        defer hdrs.deinit(self.allocator);
         var hit = std.mem.splitScalar(u8, signature.headers, ':');
         while (hit.next()) |name_raw| {
             const name = std.mem.trim(u8, name_raw, " \t\r\n");
             if (name.len == 0) continue;
-            const h = findHeader(headers, name) orelse continue;
+            // Pick the lowest unconsumed header with this name.
+            var idx: ?usize = null;
+            var k = hdrs.items.len;
+            while (k > 0) {
+                k -= 1;
+                if (!hdrs.items[k].consumed and std.ascii.eqlIgnoreCase(hdrs.items[k].name, name)) {
+                    idx = k;
+                    break;
+                }
+            }
+            const hi = idx orelse continue; // over-signed / absent → contribute nothing
+            hdrs.items[hi].consumed = true;
+            const h = hdrs.items[hi];
             if (relaxed) {
                 var lower_buf: [128]u8 = undefined;
                 const lname = if (name.len <= lower_buf.len) std.ascii.lowerString(lower_buf[0..name.len], name) else name;
@@ -354,6 +372,48 @@ fn findHeader(headers: []const u8, name: []const u8) ?RawHeader {
         i = nl + 1;
     }
     return null;
+}
+
+const HeaderSpan = struct { name: []const u8, full: []const u8, value: []const u8, consumed: bool };
+
+/// Split a header block into individual headers (folded continuation lines kept
+/// with their header). Works for CRLF or LF line endings. `name` is the field
+/// name (before the colon), `full` the whole header sans trailing CRLF, `value`
+/// the bytes after the colon. Caller deinits the returned list.
+fn collectHeaders(allocator: std.mem.Allocator, headers: []const u8) !std.ArrayList(HeaderSpan) {
+    var list: std.ArrayList(HeaderSpan) = .empty;
+    errdefer list.deinit(allocator);
+    var i: usize = 0;
+    while (i < headers.len) {
+        const ls = i;
+        // Extend across folded continuation lines (next line starts with WSP).
+        var j = ls;
+        var nl_final: usize = 0;
+        var have_nl = false;
+        while (true) {
+            const nl = std.mem.indexOfScalarPos(u8, headers, j, '\n') orelse break;
+            if (nl + 1 < headers.len and (headers[nl + 1] == ' ' or headers[nl + 1] == '\t')) {
+                j = nl + 1;
+                continue;
+            }
+            nl_final = nl;
+            have_nl = true;
+            break;
+        }
+        const line_end = if (have_nl) nl_final else headers.len;
+        const end = if (line_end > ls and headers[line_end - 1] == '\r') line_end - 1 else line_end;
+        const seg = headers[ls..end];
+        if (std.mem.indexOfScalar(u8, seg, ':')) |c| {
+            const name = seg[0..c];
+            // A real field name has no whitespace; skip stray/garbage lines.
+            if (name.len > 0 and std.mem.indexOfAny(u8, name, " \t") == null) {
+                try list.append(allocator, .{ .name = name, .full = seg, .value = seg[c + 1 ..], .consumed = false });
+            }
+        }
+        if (!have_nl) break;
+        i = nl_final + 1;
+    }
+    return list;
 }
 
 /// Copy of a raw DKIM-Signature header with the b= tag value emptied (keep
@@ -485,6 +545,45 @@ test "extractDKIMSignature stops at next header on LF-delimited input" {
     try testing.expectEqualStrings("SIGPART1SIGPART2", sig.signature);
     try testing.expectEqualStrings("BODYHASH=", sig.body_hash);
     try testing.expectEqualStrings("from:to", sig.headers);
+}
+
+test "collectHeaders: order, folds, bottom-up consumption" {
+    const testing = std.testing;
+    const headers =
+        "Received: a; by b\n" ++
+        "From: first@ex.com\n" ++
+        "Subject: hello\n" ++
+        "\tworld\n" ++ // folded into Subject
+        "From: second@ex.com\n";
+    var hdrs = try collectHeaders(testing.allocator, headers);
+    defer hdrs.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), hdrs.items.len);
+    try testing.expectEqualStrings("Subject: hello\n\tworld", hdrs.items[2].full);
+    try testing.expectEqualStrings(" hello\n\tworld", hdrs.items[2].value);
+
+    // RFC 6376 §5.4.2: first h=from consumes the LAST From (bottom-up).
+    var idx: ?usize = null;
+    var k = hdrs.items.len;
+    while (k > 0) {
+        k -= 1;
+        if (!hdrs.items[k].consumed and std.ascii.eqlIgnoreCase(hdrs.items[k].name, "from")) {
+            idx = k;
+            break;
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), idx.?);
+    hdrs.items[idx.?].consumed = true;
+    // A second h=from would then take the first From (index 1).
+    idx = null;
+    k = hdrs.items.len;
+    while (k > 0) {
+        k -= 1;
+        if (!hdrs.items[k].consumed and std.ascii.eqlIgnoreCase(hdrs.items[k].name, "from")) {
+            idx = k;
+            break;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), idx.?);
 }
 
 test "DKIM validator neutral" {
