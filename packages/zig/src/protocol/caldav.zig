@@ -488,6 +488,19 @@ pub const CalDavSession = struct {
             return true;
         }
 
+        // MTA-STS policy (RFC 8461), served at mta-sts.<domain>/.well-known/mta-sts.txt.
+        // Lets senders discover that this MX requires TLS. "testing" reports
+        // without enforcing (safe default); switch to "enforce" once confident.
+        if (method == .get and std.mem.startsWith(u8, path, "/.well-known/mta-sts.txt")) {
+            const policy = std.fmt.allocPrint(self.allocator, "version: STSv1\nmode: testing\nmx: {s}\nmax_age: 604800\n", .{config.public_hostname}) catch {
+                try self.sendError(500, "Internal Server Error");
+                return true;
+            };
+            defer self.allocator.free(policy);
+            try self.sendWeb(.{ .content_type = "text/plain; charset=utf-8", .body = policy });
+            return true;
+        }
+
         // --- Web services that work behind a TLS-terminating proxy (rpx) ---
         // These mirror the TLS server's 443 routes so the unified macOS Exchange
         // (EWS) account AND Calendar/Contacts autodiscovery work when the box's

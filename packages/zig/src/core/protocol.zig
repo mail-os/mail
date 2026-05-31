@@ -108,6 +108,34 @@ pub const SMTPCommand = enum {
     UNKNOWN,
 };
 
+/// Process-wide counter for synthesized Message-IDs.
+var msgid_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+/// If the message has no Message-ID header, prepend a synthesized one. The
+/// stored message uses LF line endings (the DATA loop strips CR), so the
+/// inserted header matches.
+fn ensureMessageId(allocator: std.mem.Allocator, message_data: *std.ArrayList(u8), hostname: []const u8) !void {
+    const items = message_data.items;
+    const hdr_end = std.mem.indexOf(u8, items, "\n\n") orelse
+        std.mem.indexOf(u8, items, "\r\n\r\n") orelse items.len;
+    if (headerPresent(items[0..hdr_end], "message-id")) return;
+    const seq = msgid_seq.fetchAdd(1, .monotonic);
+    const line = try std.fmt.allocPrint(allocator, "Message-ID: <{d}.{d}@{s}>\n", .{ time_compat.timestamp(), seq, hostname });
+    defer allocator.free(line);
+    try message_data.insertSlice(allocator, 0, line);
+}
+
+/// True if a header line `<name>:` (case-insensitive) exists in the block.
+fn headerPresent(headers: []const u8, name_lower: []const u8) bool {
+    var it = std.mem.splitScalar(u8, headers, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len > name_lower.len and line[name_lower.len] == ':' and
+            std.ascii.eqlIgnoreCase(line[0..name_lower.len], name_lower)) return true;
+    }
+    return false;
+}
+
 pub const SessionState = enum {
     Initial,
     Greeted,
@@ -859,6 +887,14 @@ pub const Session = struct {
                 line_pos += 1;
                 if (line_pos >= line_buffer.len) return error.LineTooLong;
             }
+        }
+
+        // Message-ID safety net: a submission without a Message-ID is rejected
+        // by Gmail and others ("missing a valid Message-ID header"). If an
+        // authenticated client omitted one, synthesize it before processing so
+        // the message is well-formed (and DKIM can cover it).
+        if (self.authenticated) {
+            ensureMessageId(self.allocator, &message_data, self.config.hostname) catch {};
         }
 
         // === Inbound authentication: SPF/DKIM/DMARC/ARC ===
