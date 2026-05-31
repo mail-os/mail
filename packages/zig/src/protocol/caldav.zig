@@ -9,6 +9,7 @@ const time_compat = @import("../core/time_compat.zig");
 const caldav_store = @import("../storage/caldav_store.zig");
 const autoconfig = @import("../api/autoconfig.zig");
 const eas = @import("eas.zig");
+const ews = @import("ews/ews.zig");
 
 /// Get the current epoch timestamp in seconds.
 fn currentTimestamp() i64 {
@@ -2318,6 +2319,54 @@ const TlsCalDavSession = struct {
         try self.sendTls(buf.items);
     }
 
+    /// Autodiscover v2 (JSON): tell macOS the EWS (or ActiveSync) endpoint URL.
+    /// Unauthenticated per the protocol.
+    fn serveAutodiscoverV2(self: *TlsCalDavSession, config: *const CalDavConfig, path: []const u8) !void {
+        const protocol = ews.autodiscover.protocolParam(path);
+        const url = try ews.autodiscover.urlForProtocol(self.allocator, config.public_hostname, protocol);
+        defer self.allocator.free(url);
+        const json = try ews.autodiscover.buildJson(self.allocator, protocol, url);
+        defer self.allocator.free(json);
+
+        var hdr: [256]u8 = undefined;
+        const header = try std.fmt.bufPrint(
+            &hdr,
+            "HTTP/1.1 200 OK\r\n" ++
+                "Content-Type: application/json; charset=utf-8\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Connection: keep-alive\r\n\r\n",
+            .{json.len},
+        );
+        try self.sendTls(header);
+        try self.sendTls(json);
+    }
+
+    /// Dispatch an EWS SOAP request to the EWS module and return its response.
+    fn serveEws(self: *TlsCalDavSession, config: *const CalDavConfig, request: []const u8) !void {
+        const body: []const u8 = if (std.mem.indexOf(u8, request, "\r\n\r\n")) |i| request[i + 4 ..] else "";
+
+        var ctx = ews.Context{
+            .allocator = self.allocator,
+            .username = self.username orelse "",
+            .hostname = config.public_hostname,
+        };
+
+        const resp = try ews.handleSoap(&ctx, body);
+        defer if (resp.body.len > 0) self.allocator.free(resp.body);
+
+        var hdr: [256]u8 = undefined;
+        const header = try std.fmt.bufPrint(
+            &hdr,
+            "HTTP/1.1 {d} OK\r\n" ++
+                "Content-Type: {s}\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Connection: keep-alive\r\n\r\n",
+            .{ resp.status, resp.content_type, resp.body.len },
+        );
+        try self.sendTls(header);
+        if (resp.body.len > 0) try self.sendTls(resp.body);
+    }
+
     /// Send authentication required response with Digest challenge over TLS
     fn sendTlsAuthRequired(self: *TlsCalDavSession) !void {
         const nonce = self.auth_backend.generateNonce() catch {
@@ -2386,6 +2435,16 @@ const TlsCalDavSession = struct {
         if (method == .get and std.mem.startsWith(u8, path, "/email.mobileconfig")) {
             self.serveMobileconfig(config, path) catch |err| {
                 logger.err("CalDAV: mobileconfig generation failed: {}", .{err});
+                self.sendTls("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n") catch {};
+            };
+            return true;
+        }
+
+        // Autodiscover v2 (JSON) — UNauthenticated GET that macOS uses to locate
+        // the EWS endpoint: /autodiscover/autodiscover.json/v1.0/{email}?Protocol=EWS
+        if (method == .get and std.mem.startsWith(u8, path, "/autodiscover/autodiscover.json")) {
+            self.serveAutodiscoverV2(config, path) catch |err| {
+                logger.err("Autodiscover v2 failed: {}", .{err});
                 self.sendTls("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n") catch {};
             };
             return true;
@@ -2484,6 +2543,18 @@ const TlsCalDavSession = struct {
         {
             self.serveAutodiscover(config) catch |err| {
                 logger.err("Autodiscover failed: {}", .{err});
+                self.sendTls("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n") catch {};
+            };
+            return true;
+        }
+
+        // Exchange Web Services (authenticated SOAP). macOS Mail/Calendar/
+        // Contacts talk EWS here.
+        if (method == .post and
+            (std.mem.startsWith(u8, path, "/EWS/") or std.mem.startsWith(u8, path, "/ews/")))
+        {
+            self.serveEws(config, request) catch |err| {
+                logger.err("EWS failed: {}", .{err});
                 self.sendTls("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n") catch {};
             };
             return true;
