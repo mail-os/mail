@@ -2176,13 +2176,23 @@ const TlsCalDavSession = struct {
     }
 
     fn sendTls(self: *TlsCalDavSession, data: []const u8) !void {
-        var send_buf: [tls.output_buffer_len]u8 = undefined;
-        const enc_result = try self.tls_conn.encrypt(data, &send_buf);
-        var sent: usize = 0;
-        while (sent < enc_result.ciphertext.len) {
-            const n = try self.connection.write(enc_result.ciphertext[sent..]);
-            if (n == 0) return error.ConnectionClosed;
-            sent += n;
+        // A single TLS record carries at most ~16 KiB of cleartext. Chunk larger
+        // payloads (e.g. an EWS mailbox listing) so each encrypt() call fits one
+        // record — encrypting the whole thing at once overflows the record and
+        // fails (previously surfaced as error.WriteFailed with a 0-byte body).
+        const max_chunk: usize = 15000;
+        var pos: usize = 0;
+        while (pos < data.len) {
+            const end = @min(pos + max_chunk, data.len);
+            var send_buf: [tls.output_buffer_len]u8 = undefined;
+            const enc_result = try self.tls_conn.encrypt(data[pos..end], &send_buf);
+            var sent: usize = 0;
+            while (sent < enc_result.ciphertext.len) {
+                const n = try self.connection.write(enc_result.ciphertext[sent..]);
+                if (n == 0) return error.ConnectionClosed;
+                sent += n;
+            }
+            pos = end;
         }
     }
 
