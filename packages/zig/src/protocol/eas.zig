@@ -363,7 +363,7 @@ fn writeDavCollection(ctx: *Context, w: *wbxml.Writer, folder: FolderDef, req_ke
     };
 
     const since = getSyncToken(ctx, folder.id);
-    var report = ctx.store.getChangesSince(store_coll, @intCast(since), folder.is_calendar) catch caldav_store.SyncReport{
+    const report = ctx.store.getChangesSince(store_coll, @intCast(since), folder.is_calendar) catch caldav_store.SyncReport{
         .changes = &.{},
         .new_sync_token = @intCast(since),
         .more_available = false,
@@ -493,7 +493,7 @@ fn estimatePending(ctx: *Context, collection_id: []const u8) i64 {
     }
     const store_coll = resolveStoreCollection(ctx, folder.is_calendar) orelse return 0;
     const since = getSyncToken(ctx, collection_id);
-    var report = ctx.store.getChangesSince(store_coll, @intCast(since), folder.is_calendar) catch return 0;
+    const report = ctx.store.getChangesSince(store_coll, @intCast(since), folder.is_calendar) catch return 0;
     defer ctx.allocator.free(report.changes);
     return @intCast(report.changes.len);
 }
@@ -774,7 +774,7 @@ fn headerValue(a: std.mem.Allocator, headers: []const u8, name: []const u8) ?[]c
     var collecting = false;
     var acc = std.ArrayList(u8).empty;
     while (lines.next()) |line_raw| {
-        const line = std.mem.trimRight(u8, line_raw, "\r");
+        const line = std.mem.trimEnd(u8, line_raw, "\r");
         if (collecting) {
             if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) {
                 acc.append(a, ' ') catch {};

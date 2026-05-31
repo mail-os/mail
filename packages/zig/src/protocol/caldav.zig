@@ -2266,7 +2266,7 @@ const TlsCalDavSession = struct {
             .device_id = device_id,
         };
 
-        var resp = try eas.dispatch(&ctx, cmd, body);
+        const resp = try eas.dispatch(&ctx, cmd, body);
         defer if (resp.body.len > 0) self.allocator.free(resp.body);
 
         var hdr: [256]u8 = undefined;
