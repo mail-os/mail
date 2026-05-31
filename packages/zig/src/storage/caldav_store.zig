@@ -316,6 +316,7 @@ pub const CalDavStore = struct {
         self.emails.deinit(self.allocator);
         self.phones.deinit(self.allocator);
         self.addresses.deinit(self.allocator);
+        for (self.user_ids.items) |entry| self.allocator.free(entry.username);
         self.user_ids.deinit(self.allocator);
         self.sync_changes.deinit(self.allocator);
     }
@@ -641,8 +642,13 @@ pub const CalDavStore = struct {
         // Create new
         const id = self.next_user_id;
         self.next_user_id += 1;
+        // Dupe the username: the caller's slice is the per-connection auth
+        // buffer, freed when that connection closes. Storing it directly left a
+        // dangling pointer, so the next connection's lookup never matched and
+        // every connection minted a fresh user_id — orphaning the previous
+        // connection's calendars/contacts (EWS/CalDAV read returned nothing).
         try self.user_ids.append(self.allocator, .{
-            .username = username,
+            .username = try self.allocator.dupe(u8, username),
             .user_id = id,
         });
         return id;
