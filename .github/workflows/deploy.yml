@@ -5,15 +5,14 @@ on:
     branches: [main]
     paths:
       - 'packages/zig/**'
-      - 'packages/devtools/**'
+  workflow_dispatch: {}
 
 permissions:
-  id-token: write   # required for AWS OIDC federation
   contents: read
 
 jobs:
   deploy:
-    name: Build & Deploy
+    name: Build & Deploy (Hetzner)
     runs-on: ubuntu-latest
 
     steps:
@@ -31,82 +30,39 @@ jobs:
       working-directory: packages/zig
       run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast
 
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        role-to-assume: arn:aws:iam::923076644019:role/github-actions-mail-deploy
-        aws-region: us-east-1
-
-    - name: Upload binary to S3
-      run: aws s3 cp packages/zig/zig-out/bin/mail s3://stacks-production-s3-email/deploy/mail-server
-
-    - name: Deploy to server
+    - name: Deploy to Hetzner
+      env:
+        SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+        HOST: ${{ secrets.HETZNER_HOST }}
       run: |
-        COMMAND_ID=$(aws ssm send-command \
-          --instance-ids ${{ secrets.INSTANCE_ID }} \
-          --document-name AWS-RunShellScript \
-          --parameters '{"commands":["bash /opt/mail/deploy-swap.sh"]}' \
-          --output text --query 'Command.CommandId')
+        set -euo pipefail
+        mkdir -p ~/.ssh
+        printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
-        echo "Command ID: $COMMAND_ID"
+        # ship the freshly built binary
+        scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
+          packages/zig/zig-out/bin/mail "root@$HOST:/tmp/mail-new"
 
-        for i in $(seq 1 20); do
-          sleep 5
-          STATUS=$(aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id ${{ secrets.INSTANCE_ID }} \
-            --query 'Status' --output text 2>/dev/null || echo "Pending")
-
-          echo "Attempt $i: $STATUS"
-
-          if [ "$STATUS" = "Success" ]; then
-            echo "Deployment successful!"
-            aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id ${{ secrets.INSTANCE_ID }} \
-              --query 'StandardOutputContent' --output text
-            exit 0
-          elif [ "$STATUS" = "Failed" ]; then
-            echo "Deployment failed!"
-            aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id ${{ secrets.INSTANCE_ID }} \
-              --query 'StandardErrorContent' --output text
-            exit 1
-          fi
-        done
-
-        echo "Deployment timed out"
-        exit 1
-
-    - name: Deploy dashboard
-      # The dashboard is optional and lives on a separate systemd unit; never let
-      # a dashboard problem fail (or roll back) a successful mail-server deploy.
-      continue-on-error: true
-      if: ${{ hashFiles('packages/devtools/server.ts') != '' }}
-      run: |
-        # Upload dashboard files to S3
-        aws s3 cp packages/devtools/server.ts s3://stacks-production-s3-email/deploy/dashboard/server.ts
-        aws s3 cp packages/devtools/pages/home.stx s3://stacks-production-s3-email/deploy/dashboard/pages/home.stx
-
-        COMMAND_ID=$(aws ssm send-command \
-          --instance-ids ${{ secrets.INSTANCE_ID }} \
-          --document-name AWS-RunShellScript \
-          --parameters '{"commands":["mkdir -p /opt/mail/dashboard/pages","aws s3 cp s3://stacks-production-s3-email/deploy/dashboard/server.ts /opt/mail/dashboard/server.ts","aws s3 cp s3://stacks-production-s3-email/deploy/dashboard/pages/home.stx /opt/mail/dashboard/pages/home.stx","systemctl restart mail-dashboard","sleep 2","systemctl is-active mail-dashboard"]}' \
-          --output text --query 'Command.CommandId')
-
-        for i in $(seq 1 10); do
+        # swap + restart with an ELF sanity check and rollback on failure
+        ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o StrictHostKeyChecking=accept-new "root@$HOST" '
+          set -e
+          test "$(head -c4 /tmp/mail-new | od -An -tx1 | tr -d " ")" = "7f454c46" || { echo "not an ELF binary"; exit 1; }
+          systemctl stop mail || true
+          cp -f /opt/mail/mail-server /opt/mail/mail-server.bak
+          mv /tmp/mail-new /opt/mail/mail-server
+          chmod +x /opt/mail/mail-server
+          chown mail-server:mail-server /opt/mail/mail-server
+          systemctl start mail
           sleep 3
-          STATUS=$(aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id ${{ secrets.INSTANCE_ID }} \
-            --query 'Status' --output text 2>/dev/null || echo "Pending")
-
-          if [ "$STATUS" = "Success" ]; then
-            echo "Dashboard deployed successfully!"
-            exit 0
-          elif [ "$STATUS" = "Failed" ]; then
-            echo "Dashboard deployment failed!"
+          active=$(systemctl is-active mail)
+          echo "mail service: $active"
+          if [ "$active" != "active" ]; then
+            echo "restart failed; rolling back"
+            cp -f /opt/mail/mail-server.bak /opt/mail/mail-server
+            systemctl restart mail
             exit 1
           fi
-        done
+        '
+        echo "Deployed to Hetzner ($HOST)."
