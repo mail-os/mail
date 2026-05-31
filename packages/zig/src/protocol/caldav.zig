@@ -2282,6 +2282,42 @@ const TlsCalDavSession = struct {
         if (resp.body.len > 0) try self.sendTls(resp.body);
     }
 
+    /// Respond to an Exchange autodiscover request with the EAS MobileSync
+    /// settings, pointing the client at /Microsoft-Server-ActiveSync. This is
+    /// what lets macOS/iOS "Add Exchange account" auto-configure (it queries
+    /// autodiscover.<domain>, which now CNAMEs to this host).
+    fn serveAutodiscover(self: *TlsCalDavSession, config: *const CalDavConfig) !void {
+        const user = self.username orelse "user";
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        try buf.print(self.allocator,
+            \\<?xml version="1.0" encoding="utf-8"?>
+            \\<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006">
+            \\  <Response xmlns="http://schemas.microsoft.com/exchange/autodiscover/mobilesync/responseschema/2006">
+            \\    <Culture>en:us</Culture>
+            \\    <User><DisplayName>{s}</DisplayName><EMailAddress>{s}</EMailAddress></User>
+            \\    <Action><Settings><Server>
+            \\      <Type>MobileSync</Type>
+            \\      <Url>https://{s}/Microsoft-Server-ActiveSync</Url>
+            \\      <Name>https://{s}/Microsoft-Server-ActiveSync</Name>
+            \\    </Server></Settings></Action>
+            \\  </Response>
+            \\</Autodiscover>
+        , .{ user, user, config.public_hostname, config.public_hostname });
+
+        var hdr: [256]u8 = undefined;
+        const header = try std.fmt.bufPrint(
+            &hdr,
+            "HTTP/1.1 200 OK\r\n" ++
+                "Content-Type: application/xml; charset=utf-8\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Connection: keep-alive\r\n\r\n",
+            .{buf.items.len},
+        );
+        try self.sendTls(header);
+        try self.sendTls(buf.items);
+    }
+
     /// Send authentication required response with Digest challenge over TLS
     fn sendTlsAuthRequired(self: *TlsCalDavSession) !void {
         const nonce = self.auth_backend.generateNonce() catch {
@@ -2435,6 +2471,19 @@ const TlsCalDavSession = struct {
         if (method == .post and std.mem.startsWith(u8, path, "/Microsoft-Server-ActiveSync")) {
             self.serveActiveSync(path, request) catch |err| {
                 logger.err("ActiveSync dispatch failed: {}", .{err});
+                self.sendTls("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n") catch {};
+            };
+            return true;
+        }
+
+        // Exchange autodiscover (authenticated). macOS/iOS "Add Exchange
+        // account" POSTs here to discover the ActiveSync URL. Match either
+        // capitalization.
+        if (method == .post and
+            (std.mem.startsWith(u8, path, "/autodiscover/") or std.mem.startsWith(u8, path, "/Autodiscover/")))
+        {
+            self.serveAutodiscover(config) catch |err| {
+                logger.err("Autodiscover failed: {}", .{err});
                 self.sendTls("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n") catch {};
             };
             return true;
