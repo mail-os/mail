@@ -11,6 +11,7 @@ const autoconfig = @import("../api/autoconfig.zig");
 const eas = @import("eas.zig");
 const ews = @import("ews/ews.zig");
 const core_config = @import("../core/config.zig");
+const database = @import("../storage/database.zig");
 
 /// Get the current epoch timestamp in seconds.
 fn currentTimestamp() i64 {
@@ -487,6 +488,30 @@ pub const CalDavSession = struct {
             return true;
         }
 
+        // --- Web services that work behind a TLS-terminating proxy (rpx) ---
+        // These mirror the TLS server's 443 routes so the unified macOS Exchange
+        // (EWS) account AND Calendar/Contacts autodiscovery work when the box's
+        // 443 is owned by a shared reverse proxy. Unauthenticated ones first.
+        if (method == .get and std.mem.startsWith(u8, path, "/email.mobileconfig")) {
+            const wr = webMobileconfig(self.allocator, config, path) catch {
+                try self.sendError(400, "Bad Request");
+                return true;
+            };
+            defer if (wr.body.len > 0) self.allocator.free(wr.body);
+            try self.sendWeb(wr);
+            return true;
+        }
+        if (method == .get and std.mem.startsWith(u8, path, "/autodiscover/autodiscover.json")) {
+            const wr = try webAutodiscoverV2(self.allocator, config, path);
+            defer if (wr.body.len > 0) self.allocator.free(wr.body);
+            try self.sendWeb(wr);
+            return true;
+        }
+        if (method == .options and std.mem.startsWith(u8, path, "/Microsoft-Server-ActiveSync")) {
+            try self.writeAllPlain(ACTIVESYNC_OPTIONS_RESPONSE);
+            return true;
+        }
+
         // Check authentication (Digest or Basic Auth)
         if (!self.authenticated) {
             var auth_header: ?[]const u8 = null;
@@ -536,6 +561,27 @@ pub const CalDavSession = struct {
                 try self.sendAuthRequired();
                 return true;
             }
+        }
+
+        // Authenticated web services (EWS / autodiscover / ActiveSync) behind
+        // the reverse proxy. macOS Mail/Calendar/Contacts talk EWS here.
+        if (method == .post and std.mem.startsWith(u8, path, "/Microsoft-Server-ActiveSync")) {
+            const wr = try webActiveSync(self.allocator, self.auth_backend.db, self.store, self.username, path, request);
+            defer if (wr.body.len > 0) self.allocator.free(wr.body);
+            try self.sendWeb(wr);
+            return true;
+        }
+        if (method == .post and (std.mem.startsWith(u8, path, "/autodiscover/") or std.mem.startsWith(u8, path, "/Autodiscover/"))) {
+            const wr = try webAutodiscover(self.allocator, config, self.username, request);
+            defer if (wr.body.len > 0) self.allocator.free(wr.body);
+            try self.sendWeb(wr);
+            return true;
+        }
+        if (method == .post and (std.mem.startsWith(u8, path, "/EWS/") or std.mem.startsWith(u8, path, "/ews/"))) {
+            const wr = try webEws(self.allocator, config, self.username, self.store, self.auth_backend.db, request);
+            defer if (wr.body.len > 0) self.allocator.free(wr.body);
+            try self.sendWeb(wr);
+            return true;
         }
 
         // Route request based on method and path
@@ -1775,7 +1821,141 @@ pub const CalDavSession = struct {
         try writer.print("HTTP/1.1 {d} {s}\r\nContent-Length: 0\r\n\r\n", .{ code, message });
         _ = try self.connection.write(fbs.getWritten());
     }
+
+    /// Write all bytes to the plain socket (connection.write may be partial).
+    fn writeAllPlain(self: *CalDavSession, data: []const u8) !void {
+        var off: usize = 0;
+        while (off < data.len) {
+            const n = try self.connection.write(data[off..]);
+            if (n == 0) return error.WriteFailed;
+            off += n;
+        }
+    }
+
+    /// Send a WebResponse (EWS/autodiscover/EAS/mobileconfig) over the plain
+    /// socket. Used when these services run behind a TLS-terminating reverse
+    /// proxy (rpx on the shared box) instead of the mail server's own 443.
+    fn sendWeb(self: *CalDavSession, wr: WebResponse) !void {
+        var hdr: [384]u8 = undefined;
+        const header = if (wr.disposition) |d|
+            try std.fmt.bufPrint(&hdr, "HTTP/1.1 {d} OK\r\nContent-Type: {s}\r\nContent-Disposition: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n", .{ wr.status, wr.content_type, d, wr.body.len })
+        else
+            try std.fmt.bufPrint(&hdr, "HTTP/1.1 {d} OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n", .{ wr.status, wr.content_type, wr.body.len });
+        try self.writeAllPlain(header);
+        if (wr.body.len > 0) try self.writeAllPlain(wr.body);
+    }
 };
+
+// ============================================================================
+// Transport-agnostic web handlers (EWS / autodiscover / EAS / mobileconfig).
+// These return a body owned by `allocator` so the SAME logic can be served
+// either by the mail server's own TLS server (443) OR over plain HTTP by the
+// CalDavSession behind a TLS-terminating reverse proxy (rpx on the shared box).
+// ============================================================================
+
+const WebResponse = struct {
+    status: u16 = 200,
+    content_type: []const u8 = "application/xml; charset=utf-8",
+    body: []const u8 = "",
+    disposition: ?[]const u8 = null,
+};
+
+/// The HTTP body (after the blank line) of a raw request.
+fn httpBody(request: []const u8) []const u8 {
+    return if (std.mem.indexOf(u8, request, "\r\n\r\n")) |i| request[i + 4 ..] else "";
+}
+
+/// EWS SOAP → response (body owned by allocator).
+fn webEws(allocator: std.mem.Allocator, config: *const CalDavConfig, username: ?[]const u8, store: *caldav_store.CalDavStore, db: *database.Database, request: []const u8) !WebResponse {
+    const user = username orelse "";
+    const local_part = if (std.mem.indexOfScalar(u8, user, '@')) |i| user[0..i] else user;
+    var ctx = ews.Context{
+        .allocator = allocator,
+        .username = user,
+        .local_part = local_part,
+        .hostname = config.public_hostname,
+        .db = db,
+        .store = store,
+        .delivery_method = config.delivery_method,
+        .ses_region = config.ses_region,
+    };
+    const resp = try ews.handleSoap(&ctx, httpBody(request));
+    return .{ .status = resp.status, .content_type = resp.content_type, .body = resp.body };
+}
+
+/// Exchange ActiveSync (WBXML) → response.
+fn webActiveSync(allocator: std.mem.Allocator, db: *database.Database, store: *caldav_store.CalDavStore, username: ?[]const u8, path: []const u8, request: []const u8) !WebResponse {
+    const query: ?[]const u8 = if (std.mem.indexOfScalar(u8, path, '?')) |q| path[q + 1 ..] else null;
+    const cmd = autoconfig.extractQueryParam(query, "Cmd") orelse "";
+    const device_id = autoconfig.extractQueryParam(query, "DeviceId") orelse "unknown";
+    const user = username orelse "";
+    const local_part = if (std.mem.indexOfScalar(u8, user, '@')) |i| user[0..i] else user;
+    var ctx = eas.Context{
+        .allocator = allocator,
+        .db = db,
+        .store = store,
+        .username = user,
+        .local_part = local_part,
+        .device_id = device_id,
+    };
+    const resp = try eas.dispatch(&ctx, cmd, httpBody(request));
+    return .{ .status = resp.status, .content_type = resp.content_type, .body = resp.body };
+}
+
+/// Autodiscover v1 XML (Outlook/EXCH for macOS, MobileSync for iOS).
+fn webAutodiscover(allocator: std.mem.Allocator, config: *const CalDavConfig, username: ?[]const u8, request: []const u8) !WebResponse {
+    const user = username orelse "user";
+    const wants_mobilesync = std.mem.indexOf(u8, httpBody(request), "mobilesync") != null;
+    const xml = if (wants_mobilesync)
+        try ews.autodiscover.buildMobileSyncXml(allocator, user, config.public_hostname)
+    else
+        try ews.autodiscover.buildOutlookExchXml(allocator, user, config.public_hostname);
+    return .{ .content_type = "application/xml; charset=utf-8", .body = xml };
+}
+
+/// Autodiscover v2 JSON (EWS endpoint URL).
+fn webAutodiscoverV2(allocator: std.mem.Allocator, config: *const CalDavConfig, path: []const u8) !WebResponse {
+    const protocol = ews.autodiscover.protocolParam(path);
+    const url = try ews.autodiscover.urlForProtocol(allocator, config.public_hostname, protocol);
+    defer allocator.free(url);
+    const json = try ews.autodiscover.buildJson(allocator, protocol, url);
+    return .{ .content_type = "application/json; charset=utf-8", .body = json };
+}
+
+/// Apple .mobileconfig profile (Mail+CalDAV+CardDAV, or ?services=eas/dav).
+fn webMobileconfig(allocator: std.mem.Allocator, config: *const CalDavConfig, path: []const u8) !WebResponse {
+    const query: ?[]const u8 = if (std.mem.indexOfScalar(u8, path, '?')) |q| path[q + 1 ..] else null;
+    const email = autoconfig.extractQueryParam(query, "email") orelse return error.MissingEmail;
+    const services = autoconfig.extractQueryParam(query, "services");
+    const dav_only = services != null and std.mem.eql(u8, services.?, "dav");
+    const eas_only = services != null and std.mem.eql(u8, services.?, "eas");
+    const domain = autoconfig.extractDomainFromEmail(email) orelse "localhost";
+    const ac = autoconfig.AutoconfigConfig{
+        .hostname = config.public_hostname,
+        .domain = domain,
+        .imaps_port = config.imaps_port,
+        .smtp_port = config.submission_port,
+        .display_name = config.display_name,
+        .enable_email = !dav_only and !eas_only,
+        .enable_carddav = config.enable_carddav and !eas_only,
+        .enable_caldav_profile = config.enable_caldav and !eas_only,
+        .enable_eas = eas_only,
+        .caldav_hostname = config.public_hostname,
+        .caldav_port = config.ssl_port,
+    };
+    const profile = try autoconfig.generateAppleMobileconfig(allocator, ac, email);
+    return .{ .content_type = "application/x-apple-aspen-config; charset=utf-8", .body = profile, .disposition = "attachment; filename=\"mail.mobileconfig\"" };
+}
+
+/// ActiveSync OPTIONS capability response (constant, unauthenticated).
+const ACTIVESYNC_OPTIONS_RESPONSE =
+    "HTTP/1.1 200 OK\r\n" ++
+    "MS-Server-ActiveSync: 14.1\r\n" ++
+    "MS-ASProtocolVersions: 2.5,12.0,12.1,14.0,14.1\r\n" ++
+    "MS-ASProtocolCommands: Sync,SendMail,SmartForward,SmartReply,GetAttachment,FolderSync,FolderCreate,FolderDelete,FolderUpdate,MoveItems,GetItemEstimate,MeetingResponse,Search,Settings,Ping,ItemOperations,Provision,ResolveRecipients,ValidateCert\r\n" ++
+    "Public: OPTIONS,POST\r\n" ++
+    "Allow: OPTIONS,POST\r\n" ++
+    "Content-Length: 0\r\n\r\n";
 
 // ============================================================================
 // CalDAV/CardDAV Server
