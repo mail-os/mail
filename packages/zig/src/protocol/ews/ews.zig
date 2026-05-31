@@ -340,7 +340,8 @@ fn appendItemMessage(buf: *std.ArrayList(u8), aa: std.mem.Allocator, ctx: *Conte
     const subject = xmlEscape(aa, headerValue(aa, headers, "subject") orelse "(no subject)");
     const from = parseEmail(headerValue(aa, headers, "from") orelse "");
     const to = parseEmail(headerValue(aa, headers, "to") orelse "");
-    const date = ewsDate(aa, found.epoch);
+    const date_epoch = parseRfc2822Date(headerValue(aa, headers, "date") orelse "");
+    const date = ewsDate(aa, if (date_epoch > 0) date_epoch else found.epoch);
     const a = ctx.allocator;
 
     // Element order follows the EWS Item/Message xs:sequence (macOS parses it
@@ -480,6 +481,50 @@ fn parseEmail(s: []const u8) Addr {
     }
     const t = std.mem.trim(u8, s, " \t");
     return .{ .name = t, .email = t };
+}
+
+fn monthFromName(s: []const u8) ?i64 {
+    const names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    for (names, 0..) |n, i| {
+        if (s.len >= 3 and std.ascii.eqlIgnoreCase(s[0..3], n)) return @intCast(i + 1);
+    }
+    return null;
+}
+
+/// Days since the unix epoch for a civil date (Howard Hinnant's algorithm).
+fn daysFromCivil(y0: i64, m: i64, d: i64) i64 {
+    const y = if (m <= 2) y0 - 1 else y0;
+    const era = @divFloor(if (y >= 0) y else y - 399, 400);
+    const yoe = y - era * 400;
+    const mp = if (m > 2) m - 3 else m + 9;
+    const doy = @divFloor(153 * mp + 2, 5) + d - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// Parse an RFC 2822 Date header ("Sat, 03 May 2026 15:55:14 +0000") to unix
+/// seconds. Returns 0 if it can't be parsed.
+fn parseRfc2822Date(s_in: []const u8) i64 {
+    var s = std.mem.trim(u8, s_in, " \t");
+    if (std.mem.indexOfScalar(u8, s, ',')) |c| s = std.mem.trim(u8, s[c + 1 ..], " \t");
+    var it = std.mem.tokenizeScalar(u8, s, ' ');
+    const day = std.fmt.parseInt(i64, it.next() orelse return 0, 10) catch return 0;
+    const month = monthFromName(it.next() orelse return 0) orelse return 0;
+    const year = std.fmt.parseInt(i64, it.next() orelse return 0, 10) catch return 0;
+    const time = it.next() orelse return 0;
+    var tp = std.mem.splitScalar(u8, time, ':');
+    const hh = std.fmt.parseInt(i64, tp.next() orelse "0", 10) catch 0;
+    const mm = std.fmt.parseInt(i64, tp.next() orelse "0", 10) catch 0;
+    const ss = std.fmt.parseInt(i64, tp.next() orelse "0", 10) catch 0;
+    var tz_off: i64 = 0;
+    if (it.next()) |tz| {
+        if (tz.len >= 5 and (tz[0] == '+' or tz[0] == '-')) {
+            const h = std.fmt.parseInt(i64, tz[1..3], 10) catch 0;
+            const m2 = std.fmt.parseInt(i64, tz[3..5], 10) catch 0;
+            tz_off = (h * 3600 + m2 * 60) * (if (tz[0] == '-') @as(i64, -1) else 1);
+        }
+    }
+    return daysFromCivil(year, month, day) * 86400 + hh * 3600 + mm * 60 + ss - tz_off;
 }
 
 /// EWS date: `YYYY-MM-DDTHH:MM:SSZ`.
