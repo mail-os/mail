@@ -442,7 +442,11 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     };
 
     if (enable_caldav and auth_ptr != null) {
-        caldav_store_inst = try caldav_store_mod.CalDavStore.init(allocator, .{});
+        // Persist CalDAV/CardDAV data to SQLite so calendars/contacts survive
+        // restarts (and so the ActiveSync server has real data to sync).
+        const caldav_db_path = env.get("CALDAV_DB_PATH") orelse "./caldav.db";
+        caldav_store_inst = try caldav_store_mod.CalDavStore.init(allocator, .{ .db_path = caldav_db_path });
+        log.info("CalDAV/CardDAV store persisting to: {s}", .{caldav_db_path});
 
         const caldav_config = caldav.CalDavConfig{
             .port = caldav_port,

@@ -28,6 +28,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const mutex_compat = @import("../core/mutex_compat.zig");
+const database = @import("database");
 
 /// Get the current epoch timestamp in seconds (cross-platform).
 fn currentTimestamp() i64 {
@@ -59,6 +60,12 @@ pub const StoreConfig = struct {
 
     /// Maximum contact size (bytes)
     max_contact_size: u32 = 512 * 1024, // 512KB
+
+    /// Optional SQLite file backing the store. When set, calendars/events/
+    /// address books/contacts are loaded on startup and written through on every
+    /// mutation, so data survives restarts. When null the store is purely
+    /// in-memory (unchanged legacy behavior).
+    db_path: ?[]const u8 = null,
 };
 
 // =============================================================================
@@ -211,6 +218,10 @@ pub const CalDavStore = struct {
     /// is no re-entrant deadlock.
     mutex: mutex_compat.Mutex = .{},
 
+    /// Optional SQLite persistence. Null = pure in-memory. All persistence
+    /// helpers no-op when this is null, so the legacy path is unchanged.
+    conn: ?database.Connection = null,
+
     // In-memory storage (would be SQLite in production)
     calendars: std.AutoHashMap(u64, Calendar),
     events: std.AutoHashMap(u64, Event),
@@ -240,7 +251,7 @@ pub const CalDavStore = struct {
     };
 
     pub fn init(allocator: Allocator, config: StoreConfig) !Self {
-        return Self{
+        var self = Self{
             .allocator = allocator,
             .config = config,
             .calendars = std.AutoHashMap(u64, Calendar).init(allocator),
@@ -259,9 +270,23 @@ pub const CalDavStore = struct {
             .next_addressbook_id = 1,
             .next_contact_id = 1,
         };
+
+        // Optional SQLite persistence: open the file, ensure schema, and hydrate
+        // the in-memory maps from disk. Failures degrade to in-memory rather than
+        // taking the whole server down.
+        if (config.db_path) |path| {
+            self.conn = database.Connection.open(allocator, path) catch null;
+            if (self.conn) |*conn| {
+                ensureSchema(conn) catch {};
+                self.loadFromDb() catch {};
+            }
+        }
+
+        return self;
     }
 
     pub fn deinit(self: *Self) void {
+        if (self.conn) |*conn| conn.close();
         // Free dynamically allocated ctag/etag strings
         var cal_iter = self.calendars.iterator();
         while (cal_iter.next()) |entry| {
@@ -293,6 +318,309 @@ pub const CalDavStore = struct {
         self.addresses.deinit(self.allocator);
         self.user_ids.deinit(self.allocator);
         self.sync_changes.deinit(self.allocator);
+    }
+
+    // -------------------------------------------------------------------------
+    // SQLite persistence (all helpers no-op when `conn` is null)
+    // -------------------------------------------------------------------------
+
+    fn ensureSchema(conn: *database.Connection) !void {
+        try conn.exec(
+            \\CREATE TABLE IF NOT EXISTS dav_calendars (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, description TEXT, color TEXT, timezone TEXT, created_at INTEGER, modified_at INTEGER, sync_token INTEGER, ctag TEXT);
+            \\CREATE TABLE IF NOT EXISTS dav_events (id INTEGER PRIMARY KEY, calendar_id INTEGER, uid TEXT, summary TEXT, description TEXT, location TEXT, dtstart INTEGER, dtend INTEGER, all_day INTEGER, rrule TEXT, organizer TEXT, status INTEGER, created_at INTEGER, modified_at INTEGER, etag TEXT, ics_data TEXT);
+            \\CREATE TABLE IF NOT EXISTS dav_addressbooks (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, description TEXT, created_at INTEGER, modified_at INTEGER, sync_token INTEGER, ctag TEXT);
+            \\CREATE TABLE IF NOT EXISTS dav_contacts (id INTEGER PRIMARY KEY, addressbook_id INTEGER, uid TEXT, full_name TEXT, given_name TEXT, family_name TEXT, nickname TEXT, organization TEXT, title TEXT, birthday INTEGER, note TEXT, photo_url TEXT, created_at INTEGER, modified_at INTEGER, etag TEXT, vcf_data TEXT);
+            \\CREATE TABLE IF NOT EXISTS dav_emails (contact_id INTEGER, email TEXT, email_type INTEGER, is_primary INTEGER);
+            \\CREATE TABLE IF NOT EXISTS dav_phones (contact_id INTEGER, number TEXT, phone_type INTEGER, is_primary INTEGER);
+            \\CREATE INDEX IF NOT EXISTS idx_dav_events_cal ON dav_events(calendar_id);
+            \\CREATE INDEX IF NOT EXISTS idx_dav_contacts_ab ON dav_contacts(addressbook_id);
+            \\CREATE INDEX IF NOT EXISTS idx_dav_emails_c ON dav_emails(contact_id);
+            \\CREATE INDEX IF NOT EXISTS idx_dav_phones_c ON dav_phones(contact_id);
+        );
+    }
+
+    fn bindOptText(stmt: *database.Statement, idx: c_int, v: ?[]const u8) !void {
+        if (v) |s| try stmt.bindText(idx, s) else try stmt.bindNull(idx);
+    }
+
+    fn bindOptInt(stmt: *database.Statement, idx: c_int, v: ?i64) !void {
+        if (v) |n| try stmt.bindInt(idx, n) else try stmt.bindNull(idx);
+    }
+
+    fn dupCol(self: *Self, stmt: *database.Statement, idx: c_int) []const u8 {
+        const s = stmt.columnText(idx) catch return "";
+        return self.allocator.dupe(u8, s) catch "";
+    }
+
+    fn dupColOpt(self: *Self, stmt: *database.Statement, idx: c_int) ?[]const u8 {
+        if (stmt.columnIsNull(idx)) return null;
+        return self.dupCol(stmt, idx);
+    }
+
+    fn dbExecId(self: *Self, comptime sql_fmt: []const u8, id: u64) void {
+        const conn = if (self.conn) |*c| c else return;
+        var buf: [160]u8 = undefined;
+        const sql = std.fmt.bufPrint(&buf, sql_fmt, .{id}) catch return;
+        conn.exec(sql) catch {};
+    }
+
+    fn persistCalendar(self: *Self, cal: Calendar) void {
+        const conn = if (self.conn) |*c| c else return;
+        var stmt = conn.prepare("INSERT OR REPLACE INTO dav_calendars (id,user_id,name,description,color,timezone,created_at,modified_at,sync_token,ctag) VALUES (?,?,?,?,?,?,?,?,?,?)") catch return;
+        defer stmt.finalize();
+        stmt.bindInt(1, @intCast(cal.id)) catch return;
+        stmt.bindInt(2, @intCast(cal.user_id)) catch return;
+        stmt.bindText(3, cal.name) catch return;
+        bindOptText(&stmt, 4, cal.description) catch return;
+        bindOptText(&stmt, 5, cal.color) catch return;
+        stmt.bindText(6, cal.timezone) catch return;
+        stmt.bindInt(7, cal.created_at) catch return;
+        stmt.bindInt(8, cal.modified_at) catch return;
+        stmt.bindInt(9, @intCast(cal.sync_token)) catch return;
+        stmt.bindText(10, cal.ctag) catch return;
+        _ = stmt.step() catch return;
+    }
+
+    fn persistEvent(self: *Self, ev: Event) void {
+        const conn = if (self.conn) |*c| c else return;
+        var stmt = conn.prepare("INSERT OR REPLACE INTO dav_events (id,calendar_id,uid,summary,description,location,dtstart,dtend,all_day,rrule,organizer,status,created_at,modified_at,etag,ics_data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)") catch return;
+        defer stmt.finalize();
+        stmt.bindInt(1, @intCast(ev.id)) catch return;
+        stmt.bindInt(2, @intCast(ev.calendar_id)) catch return;
+        stmt.bindText(3, ev.uid) catch return;
+        stmt.bindText(4, ev.summary) catch return;
+        bindOptText(&stmt, 5, ev.description) catch return;
+        bindOptText(&stmt, 6, ev.location) catch return;
+        stmt.bindInt(7, ev.dtstart) catch return;
+        bindOptInt(&stmt, 8, ev.dtend) catch return;
+        stmt.bindInt(9, if (ev.all_day) 1 else 0) catch return;
+        bindOptText(&stmt, 10, ev.rrule) catch return;
+        bindOptText(&stmt, 11, ev.organizer) catch return;
+        stmt.bindInt(12, @intFromEnum(ev.status)) catch return;
+        stmt.bindInt(13, ev.created_at) catch return;
+        stmt.bindInt(14, ev.modified_at) catch return;
+        stmt.bindText(15, ev.etag) catch return;
+        stmt.bindText(16, ev.ics_data) catch return;
+        _ = stmt.step() catch return;
+    }
+
+    fn persistAddressBook(self: *Self, ab: AddressBook) void {
+        const conn = if (self.conn) |*c| c else return;
+        var stmt = conn.prepare("INSERT OR REPLACE INTO dav_addressbooks (id,user_id,name,description,created_at,modified_at,sync_token,ctag) VALUES (?,?,?,?,?,?,?,?)") catch return;
+        defer stmt.finalize();
+        stmt.bindInt(1, @intCast(ab.id)) catch return;
+        stmt.bindInt(2, @intCast(ab.user_id)) catch return;
+        stmt.bindText(3, ab.name) catch return;
+        bindOptText(&stmt, 4, ab.description) catch return;
+        stmt.bindInt(5, ab.created_at) catch return;
+        stmt.bindInt(6, ab.modified_at) catch return;
+        stmt.bindInt(7, @intCast(ab.sync_token)) catch return;
+        stmt.bindText(8, ab.ctag) catch return;
+        _ = stmt.step() catch return;
+    }
+
+    fn persistContact(self: *Self, ct: Contact) void {
+        const conn = if (self.conn) |*c| c else return;
+        var stmt = conn.prepare("INSERT OR REPLACE INTO dav_contacts (id,addressbook_id,uid,full_name,given_name,family_name,nickname,organization,title,birthday,note,photo_url,created_at,modified_at,etag,vcf_data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)") catch return;
+        defer stmt.finalize();
+        stmt.bindInt(1, @intCast(ct.id)) catch return;
+        stmt.bindInt(2, @intCast(ct.addressbook_id)) catch return;
+        stmt.bindText(3, ct.uid) catch return;
+        stmt.bindText(4, ct.full_name) catch return;
+        bindOptText(&stmt, 5, ct.given_name) catch return;
+        bindOptText(&stmt, 6, ct.family_name) catch return;
+        bindOptText(&stmt, 7, ct.nickname) catch return;
+        bindOptText(&stmt, 8, ct.organization) catch return;
+        bindOptText(&stmt, 9, ct.title) catch return;
+        bindOptInt(&stmt, 10, ct.birthday) catch return;
+        bindOptText(&stmt, 11, ct.note) catch return;
+        bindOptText(&stmt, 12, ct.photo_url) catch return;
+        stmt.bindInt(13, ct.created_at) catch return;
+        stmt.bindInt(14, ct.modified_at) catch return;
+        stmt.bindText(15, ct.etag) catch return;
+        stmt.bindText(16, ct.vcf_data) catch return;
+        _ = stmt.step() catch return;
+        self.persistContactRelations(ct.id);
+    }
+
+    fn persistContactRelations(self: *Self, contact_id: u64) void {
+        const conn = if (self.conn) |*c| c else return;
+        self.dbExecId("DELETE FROM dav_emails WHERE contact_id = {d}", contact_id);
+        self.dbExecId("DELETE FROM dav_phones WHERE contact_id = {d}", contact_id);
+        for (self.emails.items) |e| {
+            if (e.contact_id != contact_id) continue;
+            var stmt = conn.prepare("INSERT INTO dav_emails (contact_id,email,email_type,is_primary) VALUES (?,?,?,?)") catch continue;
+            defer stmt.finalize();
+            stmt.bindInt(1, @intCast(contact_id)) catch continue;
+            stmt.bindText(2, e.email) catch continue;
+            stmt.bindInt(3, @intFromEnum(e.email_type)) catch continue;
+            stmt.bindInt(4, if (e.is_primary) 1 else 0) catch continue;
+            _ = stmt.step() catch continue;
+        }
+        for (self.phones.items) |p| {
+            if (p.contact_id != contact_id) continue;
+            var stmt = conn.prepare("INSERT INTO dav_phones (contact_id,number,phone_type,is_primary) VALUES (?,?,?,?)") catch continue;
+            defer stmt.finalize();
+            stmt.bindInt(1, @intCast(contact_id)) catch continue;
+            stmt.bindText(2, p.number) catch continue;
+            stmt.bindInt(3, @intFromEnum(p.phone_type)) catch continue;
+            stmt.bindInt(4, if (p.is_primary) 1 else 0) catch continue;
+            _ = stmt.step() catch continue;
+        }
+    }
+
+    fn bumpIds(self: *Self, id: u64, sync_token: u64, which: enum { calendar, event, addressbook, contact }) void {
+        switch (which) {
+            .calendar => if (id >= self.next_calendar_id) {
+                self.next_calendar_id = id + 1;
+            },
+            .event => if (id >= self.next_event_id) {
+                self.next_event_id = id + 1;
+            },
+            .addressbook => if (id >= self.next_addressbook_id) {
+                self.next_addressbook_id = id + 1;
+            },
+            .contact => if (id >= self.next_contact_id) {
+                self.next_contact_id = id + 1;
+            },
+        }
+        if (sync_token >= self.current_sync_token) self.current_sync_token = sync_token + 1;
+    }
+
+    /// Hydrate the in-memory maps from SQLite. Loaded strings are owned by
+    /// `self.allocator` (ctag/etag are freed by deinit; the rest persist for the
+    /// store's lifetime, matching the in-session ownership model).
+    fn loadFromDb(self: *Self) !void {
+        const conn = if (self.conn) |*c| c else return;
+
+        {
+            var stmt = try conn.prepare("SELECT id,user_id,name,description,color,timezone,created_at,modified_at,sync_token,ctag FROM dav_calendars");
+            defer stmt.finalize();
+            while (stmt.step() catch false) {
+                const id: u64 = @intCast(stmt.columnInt(0));
+                try self.calendars.put(id, .{
+                    .id = id,
+                    .user_id = @intCast(stmt.columnInt(1)),
+                    .name = self.dupCol(&stmt, 2),
+                    .description = self.dupColOpt(&stmt, 3),
+                    .color = self.dupColOpt(&stmt, 4),
+                    .timezone = self.dupCol(&stmt, 5),
+                    .created_at = stmt.columnInt(6),
+                    .modified_at = stmt.columnInt(7),
+                    .sync_token = @intCast(stmt.columnInt(8)),
+                    .ctag = self.dupCol(&stmt, 9),
+                });
+                self.bumpIds(id, @intCast(stmt.columnInt(8)), .calendar);
+            }
+        }
+        {
+            var stmt = try conn.prepare("SELECT id,calendar_id,uid,summary,description,location,dtstart,dtend,all_day,rrule,organizer,status,created_at,modified_at,etag,ics_data FROM dav_events");
+            defer stmt.finalize();
+            while (stmt.step() catch false) {
+                const id: u64 = @intCast(stmt.columnInt(0));
+                try self.events.put(id, .{
+                    .id = id,
+                    .calendar_id = @intCast(stmt.columnInt(1)),
+                    .uid = self.dupCol(&stmt, 2),
+                    .summary = self.dupCol(&stmt, 3),
+                    .description = self.dupColOpt(&stmt, 4),
+                    .location = self.dupColOpt(&stmt, 5),
+                    .dtstart = stmt.columnInt(6),
+                    .dtend = if (stmt.columnIsNull(7)) null else stmt.columnInt(7),
+                    .all_day = stmt.columnInt(8) != 0,
+                    .rrule = self.dupColOpt(&stmt, 9),
+                    .organizer = self.dupColOpt(&stmt, 10),
+                    .status = switch (stmt.columnInt(11)) {
+                        0 => .tentative,
+                        2 => .cancelled,
+                        else => .confirmed,
+                    },
+                    .created_at = stmt.columnInt(12),
+                    .modified_at = stmt.columnInt(13),
+                    .etag = self.dupCol(&stmt, 14),
+                    .ics_data = self.dupCol(&stmt, 15),
+                });
+                self.bumpIds(id, 0, .event);
+            }
+        }
+        {
+            var stmt = try conn.prepare("SELECT id,user_id,name,description,created_at,modified_at,sync_token,ctag FROM dav_addressbooks");
+            defer stmt.finalize();
+            while (stmt.step() catch false) {
+                const id: u64 = @intCast(stmt.columnInt(0));
+                try self.addressbooks.put(id, .{
+                    .id = id,
+                    .user_id = @intCast(stmt.columnInt(1)),
+                    .name = self.dupCol(&stmt, 2),
+                    .description = self.dupColOpt(&stmt, 3),
+                    .created_at = stmt.columnInt(4),
+                    .modified_at = stmt.columnInt(5),
+                    .sync_token = @intCast(stmt.columnInt(6)),
+                    .ctag = self.dupCol(&stmt, 7),
+                });
+                self.bumpIds(id, @intCast(stmt.columnInt(6)), .addressbook);
+            }
+        }
+        {
+            var stmt = try conn.prepare("SELECT id,addressbook_id,uid,full_name,given_name,family_name,nickname,organization,title,birthday,note,photo_url,created_at,modified_at,etag,vcf_data FROM dav_contacts");
+            defer stmt.finalize();
+            while (stmt.step() catch false) {
+                const id: u64 = @intCast(stmt.columnInt(0));
+                try self.contacts.put(id, .{
+                    .id = id,
+                    .addressbook_id = @intCast(stmt.columnInt(1)),
+                    .uid = self.dupCol(&stmt, 2),
+                    .full_name = self.dupCol(&stmt, 3),
+                    .given_name = self.dupColOpt(&stmt, 4),
+                    .family_name = self.dupColOpt(&stmt, 5),
+                    .nickname = self.dupColOpt(&stmt, 6),
+                    .organization = self.dupColOpt(&stmt, 7),
+                    .title = self.dupColOpt(&stmt, 8),
+                    .birthday = if (stmt.columnIsNull(9)) null else stmt.columnInt(9),
+                    .note = self.dupColOpt(&stmt, 10),
+                    .photo_url = self.dupColOpt(&stmt, 11),
+                    .created_at = stmt.columnInt(12),
+                    .modified_at = stmt.columnInt(13),
+                    .etag = self.dupCol(&stmt, 14),
+                    .vcf_data = self.dupCol(&stmt, 15),
+                });
+                self.bumpIds(id, 0, .contact);
+            }
+        }
+        {
+            var stmt = try conn.prepare("SELECT contact_id,email,email_type,is_primary FROM dav_emails");
+            defer stmt.finalize();
+            while (stmt.step() catch false) {
+                try self.emails.append(self.allocator, .{
+                    .contact_id = @intCast(stmt.columnInt(0)),
+                    .email = self.dupCol(&stmt, 1),
+                    .email_type = switch (stmt.columnInt(2)) {
+                        0 => .home,
+                        1 => .work,
+                        else => .other,
+                    },
+                    .is_primary = stmt.columnInt(3) != 0,
+                });
+            }
+        }
+        {
+            var stmt = try conn.prepare("SELECT contact_id,number,phone_type,is_primary FROM dav_phones");
+            defer stmt.finalize();
+            while (stmt.step() catch false) {
+                try self.phones.append(self.allocator, .{
+                    .contact_id = @intCast(stmt.columnInt(0)),
+                    .number = self.dupCol(&stmt, 1),
+                    .phone_type = switch (stmt.columnInt(2)) {
+                        0 => .home,
+                        1 => .work,
+                        2 => .mobile,
+                        3 => .fax,
+                        else => .other,
+                    },
+                    .is_primary = stmt.columnInt(3) != 0,
+                });
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -352,6 +680,7 @@ pub const CalDavStore = struct {
             .ctag = ctag,
         });
 
+        self.persistCalendar(self.calendars.get(id).?);
         return id;
     }
 
@@ -415,6 +744,8 @@ pub const CalDavStore = struct {
             self.allocator.free(cal.ctag);
         }
         _ = self.calendars.remove(id);
+        self.dbExecId("DELETE FROM dav_events WHERE calendar_id = {d}", id);
+        self.dbExecId("DELETE FROM dav_calendars WHERE id = {d}", id);
     }
 
     // -------------------------------------------------------------------------
@@ -458,6 +789,7 @@ pub const CalDavStore = struct {
 
         // Update calendar ctag
         try self.updateCalendarCtag(calendar_id);
+        self.persistEvent(self.events.get(id).?);
 
         return id;
     }
@@ -538,6 +870,7 @@ pub const CalDavStore = struct {
                 try self.recordChange(event.calendar_id, id, .event, .modified, etag, try self.getEventHref(event.calendar_id, event.uid));
             }
             try self.updateCalendarCtag(event.calendar_id);
+            self.persistEvent(event.*);
         } else {
             return error.EventNotFound;
         }
@@ -562,6 +895,7 @@ pub const CalDavStore = struct {
                 _ = self.events.remove(id);
             }
             try self.updateCalendarCtag(calendar_id);
+            self.dbExecId("DELETE FROM dav_events WHERE id = {d}", id);
         }
     }
 
@@ -595,6 +929,7 @@ pub const CalDavStore = struct {
             .ctag = ctag,
         });
 
+        self.persistAddressBook(self.addressbooks.get(id).?);
         return id;
     }
 
@@ -674,6 +1009,10 @@ pub const CalDavStore = struct {
             self.allocator.free(ab.ctag);
         }
         _ = self.addressbooks.remove(id);
+        self.dbExecId("DELETE FROM dav_emails WHERE contact_id IN (SELECT id FROM dav_contacts WHERE addressbook_id = {d})", id);
+        self.dbExecId("DELETE FROM dav_phones WHERE contact_id IN (SELECT id FROM dav_contacts WHERE addressbook_id = {d})", id);
+        self.dbExecId("DELETE FROM dav_contacts WHERE addressbook_id = {d}", id);
+        self.dbExecId("DELETE FROM dav_addressbooks WHERE id = {d}", id);
     }
 
     // -------------------------------------------------------------------------
@@ -734,6 +1073,7 @@ pub const CalDavStore = struct {
             try self.recordChange(addressbook_id, id, .contact, .created, etag, try self.getContactHref(addressbook_id, uid));
         }
         try self.updateAddressBookCtag(addressbook_id);
+        if (self.contacts.get(id)) |ct| self.persistContact(ct);
 
         return id;
     }
@@ -848,6 +1188,7 @@ pub const CalDavStore = struct {
                 try self.recordChange(contact.addressbook_id, id, .contact, .modified, etag, try self.getContactHref(contact.addressbook_id, contact.uid));
             }
             try self.updateAddressBookCtag(contact.addressbook_id);
+            self.persistContact(contact.*);
         } else {
             return error.ContactNotFound;
         }
@@ -967,6 +1308,9 @@ pub const CalDavStore = struct {
                 _ = self.contacts.remove(id);
             }
             try self.updateAddressBookCtag(addressbook_id);
+            self.dbExecId("DELETE FROM dav_contacts WHERE id = {d}", id);
+            self.dbExecId("DELETE FROM dav_emails WHERE contact_id = {d}", id);
+            self.dbExecId("DELETE FROM dav_phones WHERE contact_id = {d}", id);
         }
     }
 
@@ -1072,6 +1416,7 @@ pub const CalDavStore = struct {
             self.allocator.free(old_ctag);
             cal.modified_at = now;
             cal.sync_token = self.current_sync_token;
+            self.persistCalendar(cal.*);
         }
     }
 
@@ -1083,6 +1428,7 @@ pub const CalDavStore = struct {
             self.allocator.free(old_ctag);
             ab.modified_at = now;
             ab.sync_token = self.current_sync_token;
+            self.persistAddressBook(ab.*);
         }
     }
 

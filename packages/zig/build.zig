@@ -52,6 +52,7 @@ pub fn build(b: *std.Build) void {
     mail_module.addImport("tls", tls_module);
     mail_module.addImport("zig-cli", zig_cli_module);
     mail_module.addImport("sqlite", sqlite_module);
+    mail_module.addImport("database", databaseModule(b, target, optimize));
 
     const mail_exe = b.addExecutable(.{
         .name = "mail",
@@ -116,6 +117,7 @@ pub fn build(b: *std.Build) void {
         });
         test_module.addImport("tls", tls_module);
         test_module.addImport("sqlite", sqlite_module);
+        test_module.addImport("database", databaseModule(b, target, optimize));
         test_module.linkSystemLibrary("sqlite3", .{});
 
         const unit_tests = b.addTest(.{
@@ -134,6 +136,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    mail_test_module.addImport("tls", tls_module);
+    mail_test_module.addImport("sqlite", sqlite_module);
+    mail_test_module.addImport("database", databaseModule(b, target, optimize));
 
     for (rfc_compliance_tests) |test_file| {
         const test_module = b.createModule(.{
@@ -214,6 +219,7 @@ fn buildForTarget(
     root_module.addImport("tls", tls_module);
     root_module.addImport("zig-cli", zig_cli_module);
     root_module.addImport("sqlite", sqliteModule(b, target, optimize));
+    root_module.addImport("database", databaseModule(b, target, optimize));
 
     const exe = b.addExecutable(.{
         .name = b.fmt("mail-{s}", .{triple}),
@@ -245,6 +251,24 @@ fn sqliteModule(
         .link_libc = true,
     });
     return translate.createModule();
+}
+
+/// The vendored `database` SQLite wrapper (from ~/Code/Home/lang's database
+/// package). It provides a nicer Connection/Statement/Row API over SQLite; its
+/// `c` import is the translate-c sqlite module, and the actual sqlite3 symbols
+/// are resolved at the final exe link by `linkPlatformLibraries`.
+fn databaseModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const m = b.createModule(.{
+        .root_source_file = b.path("pantry/database/sqlite.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    m.addImport("c", sqliteModule(b, target, optimize));
+    return m;
 }
 
 /// Link platform-specific libraries

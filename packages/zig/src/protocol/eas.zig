@@ -363,6 +363,53 @@ fn writeDavCollection(ctx: *Context, w: *wbxml.Writer, folder: FolderDef, req_ke
     };
 
     const since = getSyncToken(ctx, folder.id);
+
+    // First data sync (since == 0) — or the first sync after a server restart,
+    // where the in-memory change log is empty but data was loaded from SQLite —
+    // enumerates ALL current items as Adds instead of relying on the change log.
+    if (since == 0) {
+        const first_key = stored_key + 1;
+        try w.elementInt(page, A.SyncKey, first_key);
+        try w.element(page, A.Status, "1");
+        const store_token = ctx.store.getSyncToken(store_coll, folder.is_calendar);
+        if (folder.is_calendar) {
+            const events = ctx.store.getCalendarEvents(store_coll) catch &[_]caldav_store.Event{};
+            defer ctx.allocator.free(events);
+            if (events.len > 0) {
+                try w.startTag(page, A.Perform);
+                for (events) |ev| {
+                    const sid = std.fmt.allocPrint(a, "{d}", .{ev.id}) catch continue;
+                    try w.startTag(page, A.Add);
+                    try w.element(page, A.ServerEntryId, sid);
+                    try w.startTag(page, A.Data);
+                    writeEventAppData(a, w, ev) catch {};
+                    try w.end();
+                    try w.end();
+                }
+                try w.end();
+            }
+        } else {
+            const contacts = ctx.store.getAddressBookContacts(store_coll) catch &[_]caldav_store.Contact{};
+            defer ctx.allocator.free(contacts);
+            if (contacts.len > 0) {
+                try w.startTag(page, A.Perform);
+                for (contacts) |ct| {
+                    const sid = std.fmt.allocPrint(a, "{d}", .{ct.id}) catch continue;
+                    try w.startTag(page, A.Add);
+                    try w.element(page, A.ServerEntryId, sid);
+                    try w.startTag(page, A.Data);
+                    writeContactAppData(a, w, ctx, ct) catch {};
+                    try w.end();
+                    try w.end();
+                }
+                try w.end();
+            }
+        }
+        setSyncKey(ctx, folder.id, first_key, @intCast(store_token)) catch {};
+        try w.end(); // Folder
+        return;
+    }
+
     const report = ctx.store.getChangesSince(store_coll, @intCast(since), folder.is_calendar) catch caldav_store.SyncReport{
         .changes = &.{},
         .new_sync_token = @intCast(since),
