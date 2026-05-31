@@ -274,51 +274,84 @@ fn extractScopedFolderId(soap: []const u8, scope: []const u8) ?[]const u8 {
     return soap[vstart..vend];
 }
 
-/// SyncFolderItems: on the first sync (no SyncState) return every message in the
-/// folder as an Add (IdOnly — macOS then GetItems them). Subsequent syncs (the
-/// client echoes our SyncState) return no changes.
+/// SyncFolderItems: return the folder's items as IdOnly Adds, WINDOWED to the
+/// client's MaxChangesReturned. macOS Mail rejects a response that returns more
+/// items than it asked for (and then never issues GetItem — so nothing appears);
+/// it pages by echoing our SyncState. We encode the offset as "off:N" and set
+/// IncludesLastItemInRange=false until the window reaches the end, so macOS keeps
+/// paging until it has the whole folder.
 fn syncFolderItems(ctx: *Context, soap: []const u8) !Response {
     const folder_id = extractScopedFolderId(soap, "SyncFolderId") orelse "inbox";
-    const has_state = std.mem.indexOf(u8, soap, "SyncState") != null;
+    const max_changes = blk: {
+        const v = elementText(soap, "MaxChangesReturned") orelse break :blk 512;
+        break :blk std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t\r\n"), 10) catch 512;
+    };
+    const offset = syncOffset(soap);
 
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(ctx.allocator);
     const a = ctx.allocator;
 
-    try buf.appendSlice(a,
-        \\<m:SyncFolderItemsResponse><m:ResponseMessages><m:SyncFolderItemsResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:SyncState>SS1</m:SyncState><m:IncludesLastItemInRange>true</m:IncludesLastItemInRange><m:Changes>
-    );
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
 
-    if (!has_state) {
-        if (folderById(folder_id)) |folder| {
-            var arena = std.heap.ArenaAllocator.init(a);
-            defer arena.deinit();
-            const aa = arena.allocator();
-            switch (folder.kind) {
-                .mail => if (folder.mailbox) |mailbox| {
-                    var items = std.ArrayList(MailItem).empty;
-                    collectMail(aa, ctx, mailbox, &items) catch {};
-                    for (items.items) |it| {
-                        const id = std.fmt.allocPrint(aa, "{s}:{s}", .{ folder_id, it.basename }) catch continue;
-                        try buf.print(a,
-                            \\<t:Create><t:Message><t:ItemId Id="{s}" ChangeKey="ck0"/></t:Message></t:Create>
-                        , .{id});
-                    }
-                },
-                .calendar => try appendCalendarSyncCreates(&buf, a, ctx),
-                .contacts => try appendContactSyncCreates(&buf, a, ctx),
-            }
+    // Collect all item ids for this folder, in a stable order.
+    var ids = std.ArrayList([]const u8).empty;
+    var item_tag: []const u8 = "Message";
+    if (folderById(folder_id)) |folder| {
+        switch (folder.kind) {
+            .mail => if (folder.mailbox) |mailbox| {
+                var items = std.ArrayList(MailItem).empty;
+                collectMail(aa, ctx, mailbox, &items) catch {};
+                for (items.items) |it| {
+                    const id = std.fmt.allocPrint(aa, "{s}:{s}", .{ folder_id, it.basename }) catch continue;
+                    ids.append(aa, id) catch {};
+                }
+            },
+            .calendar => {
+                item_tag = "CalendarItem";
+                collectCalendarIds(aa, ctx, &ids) catch {};
+            },
+            .contacts => {
+                item_tag = "Contact";
+                collectContactIds(aa, ctx, &ids) catch {};
+            },
         }
     }
 
+    const total = ids.items.len;
+    const start = @min(offset, total);
+    const end = @min(start + max_changes, total);
+    const includes_last = end >= total;
+
+    try buf.print(a,
+        \\<m:SyncFolderItemsResponse><m:ResponseMessages><m:SyncFolderItemsResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:SyncState>off:{d}</m:SyncState><m:IncludesLastItemInRange>{s}</m:IncludesLastItemInRange><m:Changes>
+    , .{ end, if (includes_last) "true" else "false" });
+
+    for (ids.items[start..end]) |id| {
+        try buf.print(a,
+            \\<t:Create><t:{s}><t:ItemId Id="{s}" ChangeKey="ck0"/></t:{s}></t:Create>
+        , .{ item_tag, id, item_tag });
+    }
+
     try buf.appendSlice(a, "</m:Changes></m:SyncFolderItemsResponseMessage></m:ResponseMessages></m:SyncFolderItemsResponse>");
+    logger.info("EWS SyncFolderItems: folder={s} total={d} window={d}..{d} last={any}", .{ folder_id, total, start, end, includes_last });
     return Response{ .body = try envelope(ctx.allocator, buf.items) };
 }
 
-/// Emit a `<t:Create><t:CalendarItem><t:ItemId/></t:CalendarItem></t:Create>`
-/// for every event across all of the user's calendars. The item id is
-/// `calendar:<event.id>` (a globally-unique store id GetItem can resolve).
-fn appendCalendarSyncCreates(buf: *std.ArrayList(u8), a: std.mem.Allocator, ctx: *Context) !void {
+/// Decode our offset-encoded SyncState ("off:N"); absent/empty/other → 0.
+fn syncOffset(soap: []const u8) usize {
+    const ss = elementText(soap, "SyncState") orelse return 0;
+    const p = std.mem.indexOf(u8, ss, "off:") orelse return 0;
+    var i = p + 4;
+    var n: usize = 0;
+    while (i < ss.len and ss[i] >= '0' and ss[i] <= '9') : (i += 1) n = n * 10 + (ss[i] - '0');
+    return n;
+}
+
+/// Append `calendar:<event-id>` for every event across the user's calendars.
+fn collectCalendarIds(aa: std.mem.Allocator, ctx: *Context, ids: *std.ArrayList([]const u8)) !void {
     const store = ctx.store orelse return;
     const uid = store.getOrCreateUserId(ctx.username) catch return;
     const cals = store.getUserCalendars(uid) catch return;
@@ -327,16 +360,14 @@ fn appendCalendarSyncCreates(buf: *std.ArrayList(u8), a: std.mem.Allocator, ctx:
         const events = store.getCalendarEvents(cal.id) catch continue;
         defer store.allocator.free(events);
         for (events) |ev| {
-            try buf.print(a,
-                \\<t:Create><t:CalendarItem><t:ItemId Id="calendar:{d}" ChangeKey="ck0"/></t:CalendarItem></t:Create>
-            , .{ev.id});
+            const id = std.fmt.allocPrint(aa, "calendar:{d}", .{ev.id}) catch continue;
+            ids.append(aa, id) catch {};
         }
     }
 }
 
-/// Emit a `<t:Create><t:Contact><t:ItemId/></t:Contact></t:Create>` for every
-/// contact across all of the user's address books. Id is `contacts:<contact.id>`.
-fn appendContactSyncCreates(buf: *std.ArrayList(u8), a: std.mem.Allocator, ctx: *Context) !void {
+/// Append `contacts:<contact-id>` for every contact across the user's books.
+fn collectContactIds(aa: std.mem.Allocator, ctx: *Context, ids: *std.ArrayList([]const u8)) !void {
     const store = ctx.store orelse return;
     const uid = store.getOrCreateUserId(ctx.username) catch return;
     const abs = store.getUserAddressBooks(uid) catch return;
@@ -345,9 +376,8 @@ fn appendContactSyncCreates(buf: *std.ArrayList(u8), a: std.mem.Allocator, ctx: 
         const contacts = store.getAddressBookContacts(ab.id) catch continue;
         defer store.allocator.free(contacts);
         for (contacts) |c| {
-            try buf.print(a,
-                \\<t:Create><t:Contact><t:ItemId Id="contacts:{d}" ChangeKey="ck0"/></t:Contact></t:Create>
-            , .{c.id});
+            const id = std.fmt.allocPrint(aa, "contacts:{d}", .{c.id}) catch continue;
+            ids.append(aa, id) catch {};
         }
     }
 }
