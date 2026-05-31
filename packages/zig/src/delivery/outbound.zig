@@ -2,6 +2,18 @@ const std = @import("std");
 const io_compat = @import("../core/io_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const config = @import("../core/config.zig");
+const dkim_sign = @import("../antispam/dkim_sign.zig");
+
+/// Process-wide outbound DKIM signer (set once at startup via configureDkim).
+/// When set, every message handed to deliverToRemote is RSA-SHA256 signed.
+var g_dkim: ?dkim_sign.Signer = null;
+
+/// Enable outbound DKIM signing. `domain`/`selector` must outlive the process
+/// (pass env-backed slices). `pem` is a PKCS#1 RSA private key; it is parsed and
+/// not retained. Returns an error if the key can't be parsed.
+pub fn configureDkim(domain: []const u8, selector: []const u8, pem: []const u8) !void {
+    g_dkim = try dkim_sign.Signer.initFromPem(domain, selector, pem);
+}
 
 /// Reject email addresses that contain CR, LF, control characters, double
 /// quotes, or backslashes. These could be used for SMTP command injection
@@ -93,9 +105,26 @@ pub fn deliverToRemote(
         std.log.err("Refusing delivery: unsafe characters in envelope address", .{});
         return error.InvalidAddress;
     }
+
+    // DKIM-sign if configured (best-effort: never block delivery on a sign error).
+    var signed: ?[]u8 = null;
+    defer if (signed) |s| allocator.free(s);
+    var msg = message_data;
+    if (g_dkim) |*signer| {
+        if (signer.buildHeader(allocator, message_data, time_compat.timestamp())) |hdr| {
+            defer allocator.free(hdr);
+            if (std.mem.concat(allocator, u8, &.{ hdr, message_data })) |combined| {
+                signed = combined;
+                msg = combined;
+            } else |_| {}
+        } else |err| {
+            std.log.warn("DKIM signing failed ({s}); sending unsigned", .{@errorName(err)});
+        }
+    }
+
     switch (delivery_method) {
-        .direct => try deliverDirect(allocator, from, to, message_data, our_hostname),
-        .ses => try deliverViaSes(allocator, from, to, message_data, ses_region),
+        .direct => try deliverDirect(allocator, from, to, msg, our_hostname),
+        .ses => try deliverViaSes(allocator, from, to, msg, ses_region),
     }
 }
 

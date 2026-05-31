@@ -22,6 +22,8 @@ const hot_reload = @import("core/hot_reload.zig");
 
 // New feature modules
 const dkim_rotation = @import("features/dkim_rotation.zig");
+const outbound = @import("delivery/outbound.zig");
+const fs_compat = @import("core/fs_compat.zig");
 const sieve = @import("features/sieve.zig");
 const dane = @import("antispam/dane.zig");
 const mta_sts = @import("antispam/mta_sts.zig");
@@ -300,6 +302,17 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     }
     defer if (rotation_scheduler) |*rs| rs.deinit();
     defer if (dkim_key_manager) |*km| km.deinit();
+
+    // Outbound DKIM signing (RFC 6376, rsa-sha256/relaxed). Enabled when a key
+    // is configured: DKIM_DOMAIN + DKIM_SELECTOR + DKIM_PRIVATE_KEY_PATH (PEM).
+    if (env.get("DKIM_DOMAIN")) |dd| if (env.get("DKIM_SELECTOR")) |ds| if (env.get("DKIM_PRIVATE_KEY_PATH")) |kp| {
+        if (fs_compat.readFileAlloc(allocator, kp)) |pem| {
+            defer allocator.free(pem);
+            if (outbound.configureDkim(dd, ds, pem)) {
+                log.info("Outbound DKIM signing enabled (d={s} s={s})", .{ dd, ds });
+            } else |err| log.err("DKIM key parse failed: {s}", .{@errorName(err)});
+        } else |err| log.err("DKIM key read failed ({s}): {s}", .{ kp, @errorName(err) });
+    };
 
     // Initialize Sieve filtering
     var sieve_manager: ?sieve.SieveScriptManager = null;
