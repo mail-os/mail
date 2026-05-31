@@ -434,10 +434,20 @@ fn appendItemMessage(buf: *std.ArrayList(u8), aa: std.mem.Allocator, ctx: *Conte
     const date = ewsDate(aa, if (date_epoch > 0) date_epoch else found.epoch);
     const a = ctx.allocator;
 
+    // MimeContent MUST be the FIRST element (EWS ItemType xs:sequence) and MUST
+    // be valid base64 of the full RFC822. macOS's MFEWSBodyFetchOperation
+    // requests it and base64-decodes it via -[NSData initWithBase64EncodedString:];
+    // if it's missing, macOS passes nil and Mail CRASHES (SIGABRT in
+    // +[MFEWSMessage dataFromMimeContent:]). Encoding the whole raw message also
+    // lets macOS render the real MIME (HTML parts, attachments) itself.
+    const mime_b64 = aa.alloc(u8, std.base64.standard.Encoder.calcSize(raw.len)) catch return error.NotFound;
+    _ = std.base64.standard.Encoder.encode(mime_b64, raw);
+
     // Element order follows the EWS Item/Message xs:sequence (macOS parses it
-    // strictly): ItemId, ItemClass, Subject, Body, DateTimeReceived, Size,
-    // DateTimeSent, then the Message-specific ToRecipients, From, IsRead.
+    // strictly): MimeContent, ItemId, ItemClass, Subject, Body, DateTimeReceived,
+    // Size, DateTimeSent, then the Message-specific ToRecipients, From, IsRead.
     try buf.appendSlice(a, "<m:GetItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode><m:Items><t:Message>");
+    try buf.print(a, "<t:MimeContent CharacterSet=\"UTF-8\">{s}</t:MimeContent>", .{mime_b64});
     try buf.print(a, "<t:ItemId Id=\"{s}\" ChangeKey=\"ck0\"/>", .{xmlEscape(aa, id)});
     try buf.appendSlice(a, "<t:ItemClass>IPM.Note</t:ItemClass>");
     try buf.print(a, "<t:Subject>{s}</t:Subject>", .{subject});
