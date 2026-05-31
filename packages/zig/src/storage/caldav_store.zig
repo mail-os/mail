@@ -28,7 +28,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const mutex_compat = @import("../core/mutex_compat.zig");
-const database = @import("database");
+const database = @import("db_sqlite.zig");
 
 /// Get the current epoch timestamp in seconds (cross-platform).
 fn currentTimestamp() i64 {
