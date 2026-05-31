@@ -8,6 +8,7 @@ const tls = @import("tls");
 const time_compat = @import("../core/time_compat.zig");
 const caldav_store = @import("../storage/caldav_store.zig");
 const autoconfig = @import("../api/autoconfig.zig");
+const eas = @import("eas.zig");
 
 /// Get the current epoch timestamp in seconds.
 fn currentTimestamp() i64 {
@@ -2200,9 +2201,13 @@ const TlsCalDavSession = struct {
 
         // `?services=dav` emits a Calendar/Contacts-only profile (no IMAP/SMTP
         // email payload) so it cannot collide with an email account the user
-        // already has configured. Default includes everything.
+        // already has configured. `?services=eas` emits a single unified
+        // Exchange ActiveSync account (Mail+Contacts+Calendars+Notes with
+        // toggles, like Google). Default includes the separate IMAP/CalDAV/
+        // CardDAV payloads.
         const services = autoconfig.extractQueryParam(query, "services");
         const dav_only = services != null and std.mem.eql(u8, services.?, "dav");
+        const eas_only = services != null and std.mem.eql(u8, services.?, "eas");
 
         const domain = autoconfig.extractDomainFromEmail(email) orelse "localhost";
         const ac = autoconfig.AutoconfigConfig{
@@ -2211,9 +2216,12 @@ const TlsCalDavSession = struct {
             .imaps_port = config.imaps_port,
             .smtp_port = config.submission_port,
             .display_name = config.display_name,
-            .enable_email = !dav_only,
-            .enable_carddav = config.enable_carddav,
-            .enable_caldav_profile = config.enable_caldav,
+            // EAS is a single account covering everything, so when requested it
+            // replaces the separate IMAP/CalDAV/CardDAV payloads to avoid dupes.
+            .enable_email = !dav_only and !eas_only,
+            .enable_carddav = config.enable_carddav and !eas_only,
+            .enable_caldav_profile = config.enable_caldav and !eas_only,
+            .enable_eas = eas_only,
             .caldav_hostname = config.public_hostname,
             .caldav_port = config.ssl_port,
         };
@@ -2234,6 +2242,44 @@ const TlsCalDavSession = struct {
         );
         try self.sendTls(header);
         try self.sendTls(profile);
+    }
+
+    /// Dispatch an Exchange ActiveSync command. The full HTTP request (headers
+    /// + WBXML body) is in `request`; the command and device id come from the
+    /// query string. The response is WBXML written back over TLS.
+    fn serveActiveSync(self: *TlsCalDavSession, path: []const u8, request: []const u8) !void {
+        const query: ?[]const u8 = if (std.mem.indexOfScalar(u8, path, '?')) |q| path[q + 1 ..] else null;
+        const cmd = autoconfig.extractQueryParam(query, "Cmd") orelse "";
+        const device_id = autoconfig.extractQueryParam(query, "DeviceId") orelse "unknown";
+
+        const body: []const u8 = if (std.mem.indexOf(u8, request, "\r\n\r\n")) |i| request[i + 4 ..] else "";
+
+        const user = self.username orelse "";
+        const local_part = if (std.mem.indexOfScalar(u8, user, '@')) |i| user[0..i] else user;
+
+        var ctx = eas.Context{
+            .allocator = self.allocator,
+            .db = self.auth_backend.db,
+            .store = self.store,
+            .username = user,
+            .local_part = local_part,
+            .device_id = device_id,
+        };
+
+        var resp = try eas.dispatch(&ctx, cmd, body);
+        defer if (resp.body.len > 0) self.allocator.free(resp.body);
+
+        var hdr: [256]u8 = undefined;
+        const header = try std.fmt.bufPrint(
+            &hdr,
+            "HTTP/1.1 {d} OK\r\n" ++
+                "Content-Type: {s}\r\n" ++
+                "Content-Length: {d}\r\n" ++
+                "Connection: keep-alive\r\n\r\n",
+            .{ resp.status, resp.content_type, resp.body.len },
+        );
+        try self.sendTls(header);
+        if (resp.body.len > 0) try self.sendTls(resp.body);
     }
 
     /// Send authentication required response with Digest challenge over TLS
@@ -2309,6 +2355,22 @@ const TlsCalDavSession = struct {
             return true;
         }
 
+        // Exchange ActiveSync capability discovery. iOS issues OPTIONS to the
+        // ActiveSync endpoint before setting up the account; answer it without
+        // requiring auth so the client learns the supported versions/commands.
+        if (method == .options and std.mem.startsWith(u8, path, "/Microsoft-Server-ActiveSync")) {
+            try self.sendTls(
+                "HTTP/1.1 200 OK\r\n" ++
+                    "MS-Server-ActiveSync: 14.1\r\n" ++
+                    "MS-ASProtocolVersions: 2.5,12.0,12.1,14.0,14.1\r\n" ++
+                    "MS-ASProtocolCommands: Sync,SendMail,SmartForward,SmartReply,GetAttachment,FolderSync,FolderCreate,FolderDelete,FolderUpdate,MoveItems,GetItemEstimate,MeetingResponse,Search,Settings,Ping,ItemOperations,Provision,ResolveRecipients,ValidateCert\r\n" ++
+                    "Public: OPTIONS,POST\r\n" ++
+                    "Allow: OPTIONS,POST\r\n" ++
+                    "Content-Length: 0\r\n\r\n",
+            );
+            return true;
+        }
+
         // Check authentication (Digest or Basic Auth)
         if (!self.authenticated) {
             var auth_header: ?[]const u8 = null;
@@ -2366,6 +2428,16 @@ const TlsCalDavSession = struct {
                 try self.sendTlsAuthRequired();
                 return true;
             }
+        }
+
+        // Exchange ActiveSync command dispatch (authenticated). All EAS commands
+        // are POSTed to this endpoint with the command in the `?Cmd=` query.
+        if (method == .post and std.mem.startsWith(u8, path, "/Microsoft-Server-ActiveSync")) {
+            self.serveActiveSync(path, request) catch |err| {
+                logger.err("ActiveSync dispatch failed: {}", .{err});
+                self.sendTls("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n") catch {};
+            };
+            return true;
         }
 
         // Handle OPTIONS for CalDAV capabilities

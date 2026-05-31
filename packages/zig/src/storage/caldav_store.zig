@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const mutex_compat = @import("../core/mutex_compat.zig");
 
 /// Get the current epoch timestamp in seconds (cross-platform).
 fn currentTimestamp() i64 {
@@ -202,6 +203,14 @@ pub const CalDavStore = struct {
     allocator: Allocator,
     config: StoreConfig,
 
+    /// Serialises all read/mutation access to the maps below. The store is
+    /// shared across CalDAV connection threads AND the ActiveSync handler (which
+    /// runs on the same TLS server's connection threads), so concurrent map
+    /// iteration/mutation would otherwise corrupt state. Locked only at public
+    /// leaf entry points — no public method calls another locked one, so there
+    /// is no re-entrant deadlock.
+    mutex: mutex_compat.Mutex = .{},
+
     // In-memory storage (would be SQLite in production)
     calendars: std.AutoHashMap(u64, Calendar),
     events: std.AutoHashMap(u64, Event),
@@ -292,6 +301,9 @@ pub const CalDavStore = struct {
 
     /// Get existing user_id for username, or create a new one.
     pub fn getOrCreateUserId(self: *Self, username: []const u8) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         // Look up existing
         for (self.user_ids.items) |entry| {
             if (std.mem.eql(u8, entry.username, username)) {
@@ -318,6 +330,9 @@ pub const CalDavStore = struct {
         name: []const u8,
         description: ?[]const u8,
     ) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         const id = self.next_calendar_id;
         self.next_calendar_id += 1;
 
@@ -341,6 +356,9 @@ pub const CalDavStore = struct {
     }
 
     pub fn getCalendar(self: *Self, id: u64) ?Calendar {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         return self.calendars.get(id);
     }
 
@@ -355,6 +373,9 @@ pub const CalDavStore = struct {
     }
 
     pub fn getUserCalendars(self: *Self, user_id: u64) ![]Calendar {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         var result: std.ArrayList(Calendar) = .empty;
         errdefer result.deinit(self.allocator);
 
@@ -369,6 +390,9 @@ pub const CalDavStore = struct {
     }
 
     pub fn deleteCalendar(self: *Self, id: u64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         // Delete all events in this calendar first
         var events_to_delete: std.ArrayList(u64) = .empty;
         defer events_to_delete.deinit(self.allocator);
@@ -398,6 +422,9 @@ pub const CalDavStore = struct {
     // -------------------------------------------------------------------------
 
     pub fn createEvent(self: *Self, calendar_id: u64, data: EventData) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         const id = self.next_event_id;
         self.next_event_id += 1;
 
@@ -450,6 +477,9 @@ pub const CalDavStore = struct {
     };
 
     pub fn getEvent(self: *Self, id: u64) ?Event {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         return self.events.get(id);
     }
 
@@ -464,6 +494,9 @@ pub const CalDavStore = struct {
     }
 
     pub fn getCalendarEvents(self: *Self, calendar_id: u64) ![]Event {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         var result: std.ArrayList(Event) = .empty;
         errdefer result.deinit(self.allocator);
 
@@ -478,6 +511,9 @@ pub const CalDavStore = struct {
     }
 
     pub fn updateEvent(self: *Self, id: u64, data: EventData) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (self.events.getPtr(id)) |event| {
             const now = currentTimestamp();
             const old_etag = event.etag;
@@ -508,6 +544,9 @@ pub const CalDavStore = struct {
     }
 
     pub fn deleteEvent(self: *Self, id: u64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (self.events.get(id)) |event| {
             const etag = event.etag;
             const calendar_id = event.calendar_id;
@@ -536,6 +575,9 @@ pub const CalDavStore = struct {
         name: []const u8,
         description: ?[]const u8,
     ) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         const id = self.next_addressbook_id;
         self.next_addressbook_id += 1;
 
@@ -571,6 +613,9 @@ pub const CalDavStore = struct {
     }
 
     pub fn getUserAddressBooks(self: *Self, user_id: u64) ![]AddressBook {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         var result: std.ArrayList(AddressBook) = .empty;
         errdefer result.deinit(self.allocator);
 
@@ -585,6 +630,9 @@ pub const CalDavStore = struct {
     }
 
     pub fn deleteAddressBook(self: *Self, id: u64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         // Delete all contacts in this addressbook first
         var contacts_to_delete: std.ArrayList(u64) = .empty;
         defer contacts_to_delete.deinit(self.allocator);
@@ -633,6 +681,9 @@ pub const CalDavStore = struct {
     // -------------------------------------------------------------------------
 
     pub fn createContact(self: *Self, addressbook_id: u64, data: ContactData) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         const id = self.next_contact_id;
         self.next_contact_id += 1;
 
@@ -716,6 +767,9 @@ pub const CalDavStore = struct {
     };
 
     pub fn getContact(self: *Self, id: u64) ?Contact {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         return self.contacts.get(id);
     }
 
@@ -730,6 +784,9 @@ pub const CalDavStore = struct {
     }
 
     pub fn updateContact(self: *Self, id: u64, data: ContactData) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (self.contacts.getPtr(id)) |contact| {
             const now = currentTimestamp();
             const old_etag = contact.etag;
@@ -797,6 +854,9 @@ pub const CalDavStore = struct {
     }
 
     pub fn getAddressBookContacts(self: *Self, addressbook_id: u64) ![]Contact {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         var result: std.ArrayList(Contact) = .empty;
         errdefer result.deinit(self.allocator);
 
@@ -811,6 +871,9 @@ pub const CalDavStore = struct {
     }
 
     pub fn getContactEmails(self: *Self, contact_id: u64) []EmailAddress {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         var result: std.ArrayList(EmailAddress) = .empty;
         for (self.emails.items) |email| {
             if (email.contact_id == contact_id) {
@@ -821,6 +884,9 @@ pub const CalDavStore = struct {
     }
 
     pub fn getContactPhones(self: *Self, contact_id: u64) []PhoneNumber {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         var result: std.ArrayList(PhoneNumber) = .empty;
         for (self.phones.items) |phone| {
             if (phone.contact_id == contact_id) {
@@ -864,6 +930,9 @@ pub const CalDavStore = struct {
     }
 
     pub fn deleteContact(self: *Self, id: u64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (self.contacts.get(id)) |contact| {
             const etag = contact.etag;
             const addressbook_id = contact.addressbook_id;
@@ -906,6 +975,9 @@ pub const CalDavStore = struct {
     // -------------------------------------------------------------------------
 
     pub fn getSyncToken(self: *Self, collection_id: u64, is_calendar: bool) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (is_calendar) {
             if (self.calendars.get(collection_id)) |cal| {
                 return cal.sync_token;
@@ -919,6 +991,9 @@ pub const CalDavStore = struct {
     }
 
     pub fn getChangesSince(self: *Self, collection_id: u64, since_token: u64, is_calendar: bool) !SyncReport {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         var changes: std.ArrayList(SyncChange) = .empty;
         errdefer changes.deinit(self.allocator);
 

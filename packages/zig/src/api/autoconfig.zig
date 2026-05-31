@@ -77,6 +77,14 @@ pub const AutoconfigConfig = struct {
 
     /// CardDAV/CalDAV server port
     caldav_port: u16 = 443,
+
+    /// Whether to emit a unified Exchange ActiveSync (`com.apple.eas.account`)
+    /// payload. This yields a single account carrying Mail, Contacts, Calendars
+    /// and Notes with per-service toggles — the Google-style experience — backed
+    /// by the server's ActiveSync endpoint (HTTPS on the main hostname). When
+    /// set, the caller should disable the separate IMAP/CalDAV/CardDAV payloads
+    /// so the two do not create duplicate accounts.
+    enable_eas: bool = false,
 };
 
 /// HTTP response with status, content type, and body.
@@ -510,6 +518,46 @@ pub fn generateAppleMobileconfig(
     // Profile metadata
     try buf.appendSlice(allocator, "  <key>PayloadContent</key>\n");
     try buf.appendSlice(allocator, "  <array>\n");
+
+    // Unified Exchange ActiveSync account (Mail + Contacts + Calendars + Notes
+    // under a single account with per-service toggles, like Google). Backed by
+    // the server's ActiveSync endpoint at /Microsoft-Server-ActiveSync over TLS.
+    // When enabled this replaces the separate IMAP/CalDAV/CardDAV payloads.
+    if (config.enable_eas) {
+        const eas_uuid = try generateDeterministicUUID(allocator, email, "eas");
+        defer allocator.free(eas_uuid);
+        const eas_host = config.caldav_hostname orelse config.hostname;
+
+        try buf.appendSlice(allocator, "    <dict>\n");
+        try buf.appendSlice(allocator, "      <key>PayloadDescription</key>\n");
+        try buf.print(allocator, "      <string>Exchange ActiveSync account for {s}</string>\n", .{email_domain});
+        try buf.appendSlice(allocator, "      <key>PayloadDisplayName</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{config.display_name});
+        try buf.appendSlice(allocator, "      <key>PayloadIdentifier</key>\n");
+        try buf.print(allocator, "      <string>com.{s}.eas.account</string>\n", .{email_domain});
+        try buf.appendSlice(allocator, "      <key>PayloadType</key>\n");
+        try buf.appendSlice(allocator, "      <string>com.apple.eas.account</string>\n");
+        try buf.appendSlice(allocator, "      <key>PayloadUUID</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{eas_uuid});
+        try buf.appendSlice(allocator, "      <key>PayloadVersion</key>\n");
+        try buf.appendSlice(allocator, "      <integer>1</integer>\n");
+
+        try buf.appendSlice(allocator, "      <key>EmailAddress</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{email});
+        try buf.appendSlice(allocator, "      <key>Host</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{eas_host});
+        try buf.appendSlice(allocator, "      <key>UserName</key>\n");
+        try buf.print(allocator, "      <string>{s}</string>\n", .{email});
+        try buf.appendSlice(allocator, "      <key>SSL</key>\n");
+        try buf.appendSlice(allocator, "      <true/>\n");
+        try buf.appendSlice(allocator, "      <key>PreventMove</key>\n");
+        try buf.appendSlice(allocator, "      <false/>\n");
+        try buf.appendSlice(allocator, "      <key>PreventAppSheet</key>\n");
+        try buf.appendSlice(allocator, "      <false/>\n");
+        try buf.appendSlice(allocator, "      <key>SMIMEEnabled</key>\n");
+        try buf.appendSlice(allocator, "      <false/>\n");
+        try buf.appendSlice(allocator, "    </dict>\n");
+    }
 
     // Email account payload (IMAP/SMTP; also carries Apple Notes). Omitted when
     // enable_email is false, yielding a Calendar/Contacts-only profile that does
