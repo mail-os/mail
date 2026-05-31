@@ -122,6 +122,7 @@ pub fn handleSoap(ctx: *Context, soap: []const u8) !Response {
     if (std.mem.eql(u8, op, "GetItem")) return getItem(ctx, soap);
     if (std.mem.eql(u8, op, "CreateItem")) return createItem(ctx, soap);
     if (std.mem.eql(u8, op, "SendItem")) return sendItem(ctx, soap);
+    if (std.mem.eql(u8, op, "DeleteItem")) return deleteItem(ctx, soap);
     if (std.mem.eql(u8, op, "FindFolder")) return findFolder(ctx, soap);
     if (std.mem.eql(u8, op, "FindItem")) return findItem(ctx, soap);
     if (std.mem.eql(u8, op, "GetUserConfiguration")) return userConfigurationFault(ctx);
@@ -1241,6 +1242,82 @@ fn createContactItem(ctx: *Context, soap: []const u8) !Response {
     const full_id = std.fmt.allocPrint(ctx.allocator, "contacts:{d}", .{c_id}) catch return createItemError(ctx);
     defer ctx.allocator.free(full_id);
     return createItemOk(ctx, "Contact", full_id);
+}
+
+/// Delete a Maildir message file (hard delete). Returns true on success.
+fn deleteMailFile(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, basename: []const u8) bool {
+    const dirs = mailboxDirs(a, ctx, mailbox) catch return false;
+    for (dirs) |dir| {
+        const files = fs_compat.listEmlFiles(a, dir) catch continue;
+        for (files) |fname| {
+            if (std.mem.eql(u8, maildirBaseName(fname), basename)) {
+                const path = std.fmt.allocPrint(a, "{s}/{s}", .{ dir, fname }) catch return false;
+                fs_compat.cwd().deleteFile(path) catch return false;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Resolve one DeleteItem ItemId to the right backing store and delete it.
+fn deleteOne(ctx: *Context, a: std.mem.Allocator, id: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, id, ':') orelse return false;
+    const folder = folderById(id[0..colon]) orelse return false;
+    const rest = id[colon + 1 ..];
+    switch (folder.kind) {
+        .calendar => {
+            const store = ctx.store orelse return false;
+            const ev_id = std.fmt.parseInt(u64, rest, 10) catch return false;
+            store.deleteEvent(ev_id) catch return false;
+            return true;
+        },
+        .contacts => {
+            const store = ctx.store orelse return false;
+            const c_id = std.fmt.parseInt(u64, rest, 10) catch return false;
+            store.deleteContact(c_id) catch return false;
+            return true;
+        },
+        .mail => {
+            const mailbox = folder.mailbox orelse return false;
+            return deleteMailFile(a, ctx, mailbox, rest);
+        },
+    }
+}
+
+/// DeleteItem: remove the referenced item(s) from their backing store
+/// (calendar event / contact / Maildir message). One ResponseMessage per id.
+fn deleteItem(ctx: *Context, soap: []const u8) !Response {
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const a = ctx.allocator;
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "<m:DeleteItemResponse><m:ResponseMessages>");
+
+    const needle = "ItemId Id=\"";
+    var i: usize = 0;
+    var n: usize = 0;
+    while (std.mem.indexOfPos(u8, soap, i, needle)) |p| {
+        const vs = p + needle.len;
+        const ve = std.mem.indexOfScalarPos(u8, soap, vs, '"') orelse break;
+        const id = soap[vs..ve];
+        i = ve + 1;
+        n += 1;
+        if (deleteOne(ctx, aa, id)) {
+            try buf.appendSlice(a, "<m:DeleteItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode></m:DeleteItemResponseMessage>");
+        } else {
+            try buf.appendSlice(a, "<m:DeleteItemResponseMessage ResponseClass=\"Error\"><m:MessageText>Item not found</m:MessageText><m:ResponseCode>ErrorItemNotFound</m:ResponseCode></m:DeleteItemResponseMessage>");
+        }
+    }
+    if (n == 0) {
+        try buf.appendSlice(a, "<m:DeleteItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode></m:DeleteItemResponseMessage>");
+    }
+    try buf.appendSlice(a, "</m:ResponseMessages></m:DeleteItemResponse>");
+    logger.info("EWS DeleteItem: items={d}", .{n});
+    return Response{ .body = try envelope(a, buf.items) };
 }
 
 /// SendItem: send previously-saved draft(s) referenced by ItemId. Reads each
