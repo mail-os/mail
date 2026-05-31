@@ -3,6 +3,27 @@ const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const sqlite = @import("sqlite");
 
+// SQLITE_TRANSIENT == (sqlite3_destructor_type)-1 — tells SQLite to make its own
+// copy of bound text/blob at bind time. We declare sqlite3_bind_text ourselves
+// with the destructor typed as an opaque ?*const anyopaque, because Zig 0.17
+// refuses to materialize the misaligned function-pointer sentinel that the
+// translate-c signature would require.
+const sqlite3_bind_text_raw: *const fn (
+    ?*sqlite.sqlite3_stmt,
+    c_int,
+    [*c]const u8,
+    c_int,
+    ?*const anyopaque,
+) callconv(.c) c_int = @extern(*const fn (
+    ?*sqlite.sqlite3_stmt,
+    c_int,
+    [*c]const u8,
+    c_int,
+    ?*const anyopaque,
+) callconv(.c) c_int, .{ .name = "sqlite3_bind_text" });
+
+const SQLITE_TRANSIENT_PTR: ?*const anyopaque = @ptrFromInt(std.math.maxInt(usize));
+
 pub const DatabaseError = error{
     OpenFailed,
     ExecFailed,
@@ -38,9 +59,10 @@ pub const Statement = struct {
             .comptime_float => sqlite.sqlite3_bind_double(self.stmt, @intCast(index), @floatCast(value)),
             .pointer => |ptr_info| blk: {
                 if (ptr_info.size == .slice and ptr_info.child == u8) {
-                    const text_z = try self.allocator.dupeZ(u8, value);
-                    defer self.allocator.free(text_z);
-                    break :blk sqlite.sqlite3_bind_text(self.stmt, @intCast(index), text_z.ptr, -1, null);
+                    // SQLITE_TRANSIENT: SQLite copies the bytes now, so the slice
+                    // need not outlive this call (and multiple text params can be
+                    // bound before step without clobbering each other).
+                    break :blk sqlite3_bind_text_raw(self.stmt, @intCast(index), value.ptr, @intCast(value.len), SQLITE_TRANSIENT_PTR);
                 }
                 @compileError("Unsupported pointer type for binding");
             },
