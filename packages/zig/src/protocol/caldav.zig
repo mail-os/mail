@@ -2283,28 +2283,21 @@ const TlsCalDavSession = struct {
         if (resp.body.len > 0) try self.sendTls(resp.body);
     }
 
-    /// Respond to an Exchange autodiscover request with the EAS MobileSync
-    /// settings, pointing the client at /Microsoft-Server-ActiveSync. This is
-    /// what lets macOS/iOS "Add Exchange account" auto-configure (it queries
-    /// autodiscover.<domain>, which now CNAMEs to this host).
-    fn serveAutodiscover(self: *TlsCalDavSession, config: *const CalDavConfig) !void {
+    /// Respond to an Autodiscover **v1 XML** request. macOS desktop Exchange
+    /// uses the Outlook (EXCH) schema and needs an EwsUrl; iOS uses the
+    /// MobileSync (ActiveSync) schema. We pick based on the AcceptableResponse
+    /// Schema the client advertises in its request body.
+    fn serveAutodiscover(self: *TlsCalDavSession, config: *const CalDavConfig, request: []const u8) !void {
         const user = self.username orelse "user";
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.allocator);
-        try buf.print(self.allocator,
-            \\<?xml version="1.0" encoding="utf-8"?>
-            \\<Autodiscover xmlns="http://schemas.microsoft.com/exchange/autodiscover/responseschema/2006">
-            \\  <Response xmlns="http://schemas.microsoft.com/exchange/autodiscover/mobilesync/responseschema/2006">
-            \\    <Culture>en:us</Culture>
-            \\    <User><DisplayName>{s}</DisplayName><EMailAddress>{s}</EMailAddress></User>
-            \\    <Action><Settings><Server>
-            \\      <Type>MobileSync</Type>
-            \\      <Url>https://{s}/Microsoft-Server-ActiveSync</Url>
-            \\      <Name>https://{s}/Microsoft-Server-ActiveSync</Name>
-            \\    </Server></Settings></Action>
-            \\  </Response>
-            \\</Autodiscover>
-        , .{ user, user, config.public_hostname, config.public_hostname });
+        const body: []const u8 = if (std.mem.indexOf(u8, request, "\r\n\r\n")) |i| request[i + 4 ..] else "";
+        const wants_mobilesync = std.mem.indexOf(u8, body, "mobilesync") != null;
+        logger.info("Autodiscover v1: schema={s} user={s}", .{ if (wants_mobilesync) "mobilesync" else "outlook/exch", user });
+
+        const xml = if (wants_mobilesync)
+            try ews.autodiscover.buildMobileSyncXml(self.allocator, user, config.public_hostname)
+        else
+            try ews.autodiscover.buildOutlookExchXml(self.allocator, user, config.public_hostname);
+        defer self.allocator.free(xml);
 
         var hdr: [256]u8 = undefined;
         const header = try std.fmt.bufPrint(
@@ -2313,10 +2306,10 @@ const TlsCalDavSession = struct {
                 "Content-Type: application/xml; charset=utf-8\r\n" ++
                 "Content-Length: {d}\r\n" ++
                 "Connection: keep-alive\r\n\r\n",
-            .{buf.items.len},
+            .{xml.len},
         );
         try self.sendTls(header);
-        try self.sendTls(buf.items);
+        try self.sendTls(xml);
     }
 
     /// Autodiscover v2 (JSON): tell macOS the EWS (or ActiveSync) endpoint URL.
@@ -2541,7 +2534,7 @@ const TlsCalDavSession = struct {
         if (method == .post and
             (std.mem.startsWith(u8, path, "/autodiscover/") or std.mem.startsWith(u8, path, "/Autodiscover/")))
         {
-            self.serveAutodiscover(config) catch |err| {
+            self.serveAutodiscover(config, request) catch |err| {
                 logger.err("Autodiscover failed: {}", .{err});
                 self.sendTls("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n") catch {};
             };
