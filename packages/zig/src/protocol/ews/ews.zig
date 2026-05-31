@@ -770,15 +770,22 @@ fn createItem(ctx: *Context, soap: []const u8) !Response {
     const do_send = !std.mem.eql(u8, disposition, "SaveOnly");
     const save_copy = !std.mem.eql(u8, disposition, "SendOnly");
 
-    const subject = try xmlUnescape(a, elementText(soap, "Subject") orelse "");
-    const body = try xmlUnescape(a, elementText(soap, "Body") orelse "");
-    const body_type = attrValue(soap, "BodyType") orelse "Text";
+    // Scope field extraction to the <t:Message> element. Without this, the
+    // prefix-stripping elementText("Body") would match the SOAP envelope's
+    // <soap:Body> (which appears first) and swallow the whole request as the
+    // message body. Subject/recipients are unique, but Message scoping is the
+    // robust fix for any field that collides with an envelope element name.
+    const scope = elementText(soap, "Message") orelse soap;
+
+    const subject = try xmlUnescape(a, elementText(scope, "Subject") orelse "");
+    const body = try xmlUnescape(a, elementText(scope, "Body") orelse "");
+    const body_type = attrValue(scope, "BodyType") orelse "Text";
     const is_html = std.ascii.eqlIgnoreCase(body_type, "HTML");
 
     var to_list = std.ArrayList([]const u8).empty;
     var cc_list = std.ArrayList([]const u8).empty;
-    if (elementText(soap, "ToRecipients")) |blk| try collectEmails(a, blk, &to_list);
-    if (elementText(soap, "CcRecipients")) |blk| try collectEmails(a, blk, &cc_list);
+    if (elementText(scope, "ToRecipients")) |blk| try collectEmails(a, blk, &to_list);
+    if (elementText(scope, "CcRecipients")) |blk| try collectEmails(a, blk, &cc_list);
 
     logger.info("EWS CreateItem: disp={s} subj_len={d} to={d} cc={d} bodytype={s}", .{
         disposition, subject.len, to_list.items.len, cc_list.items.len, body_type,
