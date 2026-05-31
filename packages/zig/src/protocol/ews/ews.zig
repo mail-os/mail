@@ -4,6 +4,9 @@ const logger = @import("../../core/logger.zig");
 // callback interface on Context instead of importing these directly.
 const database = @import("../../storage/database.zig");
 const fs_compat = @import("../../core/fs_compat.zig");
+const time_compat = @import("../../core/time_compat.zig");
+const outbound = @import("../../delivery/outbound.zig");
+const config = @import("../../core/config.zig");
 
 pub const autodiscover = @import("autodiscover.zig");
 
@@ -30,6 +33,10 @@ pub const Context = struct {
     hostname: []const u8,
     /// Database (IMAP UID mapping for stable item ids).
     db: *database.Database,
+    /// Outbound delivery method (SES on AWS, direct MX on Hetzner/self-host).
+    delivery_method: config.DeliveryMethod = .direct,
+    /// AWS SES region (only used when delivery_method == .ses).
+    ses_region: []const u8 = "us-east-1",
 };
 
 pub const Response = struct {
@@ -110,6 +117,8 @@ pub fn handleSoap(ctx: *Context, soap: []const u8) !Response {
     if (std.mem.eql(u8, op, "SyncFolderHierarchy")) return syncFolderHierarchy(ctx, soap);
     if (std.mem.eql(u8, op, "SyncFolderItems")) return syncFolderItems(ctx, soap);
     if (std.mem.eql(u8, op, "GetItem")) return getItem(ctx, soap);
+    if (std.mem.eql(u8, op, "CreateItem")) return createItem(ctx, soap);
+    if (std.mem.eql(u8, op, "SendItem")) return sendItem(ctx, soap);
     if (std.mem.eql(u8, op, "FindFolder")) return findFolder(ctx, soap);
     if (std.mem.eql(u8, op, "FindItem")) return emptyFindItem(ctx);
     if (std.mem.eql(u8, op, "GetUserConfiguration")) return userConfigurationFault(ctx);
@@ -557,6 +566,368 @@ fn xmlEscape(a: std.mem.Allocator, s: []const u8) []const u8 {
         }
     }
     return buf.items;
+}
+
+// ============================================================================
+// Sending — CreateItem / SendItem, wired to the server's outbound delivery.
+// macOS Mail composes via CreateItem (MessageDisposition="SendAndSaveCopy") for
+// a direct send, or SaveOnly (a draft) followed by SendItem referencing the
+// draft's ItemId. Both are handled here.
+// ============================================================================
+
+/// Monotonic counter to make saved-message filenames unique within a process.
+var send_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+/// Value of an XML attribute `name="..."` (first occurrence). Attribute names
+/// here are short constants, so we build the needle on the stack.
+fn attrValue(soap: []const u8, name: []const u8) ?[]const u8 {
+    var nbuf: [64]u8 = undefined;
+    if (name.len + 2 > nbuf.len) return null;
+    @memcpy(nbuf[0..name.len], name);
+    nbuf[name.len] = '=';
+    nbuf[name.len + 1] = '"';
+    const needle = nbuf[0 .. name.len + 2];
+    const p = std.mem.indexOf(u8, soap, needle) orelse return null;
+    const vstart = p + needle.len;
+    const vend = std.mem.indexOfScalarPos(u8, soap, vstart, '"') orelse return null;
+    return soap[vstart..vend];
+}
+
+/// Inner text of the first `<...:name ...>...</...:name>` element (namespace
+/// prefix and attributes ignored). Null if absent or self-closing.
+fn elementText(soap: []const u8, name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, soap, i, '<')) |lt| {
+        if (lt + 1 >= soap.len or soap[lt + 1] == '/' or soap[lt + 1] == '!' or soap[lt + 1] == '?') {
+            i = lt + 1;
+            continue;
+        }
+        var j = lt + 1;
+        while (j < soap.len and soap[j] != '>' and soap[j] != ' ' and soap[j] != '/' and
+            soap[j] != '\t' and soap[j] != '\r' and soap[j] != '\n') j += 1;
+        var tag = soap[lt + 1 .. j];
+        if (std.mem.indexOfScalar(u8, tag, ':')) |c| tag = tag[c + 1 ..];
+        if (std.mem.eql(u8, tag, name)) {
+            const gt = std.mem.indexOfScalarPos(u8, soap, j, '>') orelse return null;
+            if (gt > 0 and soap[gt - 1] == '/') return null; // self-closing
+            const content_start = gt + 1;
+            var k = content_start;
+            while (std.mem.indexOfPos(u8, soap, k, "</")) |close| {
+                var m = close + 2;
+                const cs = m;
+                while (m < soap.len and soap[m] != '>' and soap[m] != ' ') m += 1;
+                var ct = soap[cs..m];
+                if (std.mem.indexOfScalar(u8, ct, ':')) |c| ct = ct[c + 1 ..];
+                if (std.mem.eql(u8, ct, name)) return soap[content_start..close];
+                k = close + 2;
+            }
+            return null;
+        }
+        i = j;
+    }
+    return null;
+}
+
+/// Decode the XML entities EWS uses to escape Subject/Body text.
+fn xmlUnescape(a: std.mem.Allocator, s: []const u8) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(a);
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '&') {
+            if (std.mem.startsWith(u8, s[i..], "&amp;")) {
+                try buf.append(a, '&');
+                i += 5;
+                continue;
+            }
+            if (std.mem.startsWith(u8, s[i..], "&lt;")) {
+                try buf.append(a, '<');
+                i += 4;
+                continue;
+            }
+            if (std.mem.startsWith(u8, s[i..], "&gt;")) {
+                try buf.append(a, '>');
+                i += 4;
+                continue;
+            }
+            if (std.mem.startsWith(u8, s[i..], "&quot;")) {
+                try buf.append(a, '"');
+                i += 6;
+                continue;
+            }
+            if (std.mem.startsWith(u8, s[i..], "&apos;")) {
+                try buf.append(a, '\'');
+                i += 6;
+                continue;
+            }
+            if (std.mem.startsWith(u8, s[i..], "&#")) {
+                if (std.mem.indexOfScalarPos(u8, s, i, ';')) |semi| {
+                    const num = s[i + 2 .. semi];
+                    const cp: ?u21 = if (num.len > 1 and (num[0] == 'x' or num[0] == 'X'))
+                        (std.fmt.parseInt(u21, num[1..], 16) catch null)
+                    else
+                        (std.fmt.parseInt(u21, num, 10) catch null);
+                    if (cp) |code| {
+                        var utf8: [4]u8 = undefined;
+                        if (std.unicode.utf8Encode(code, &utf8)) |n| {
+                            try buf.appendSlice(a, utf8[0..n]);
+                            i = semi + 1;
+                            continue;
+                        } else |_| {}
+                    }
+                }
+            }
+        }
+        try buf.append(a, s[i]);
+        i += 1;
+    }
+    return buf.toOwnedSlice(a);
+}
+
+/// Collect the `<t:EmailAddress>` values inside a recipients block.
+fn collectEmails(a: std.mem.Allocator, block: []const u8, out: *std.ArrayList([]const u8)) !void {
+    const tag = "EmailAddress>";
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, block, i, tag)) |p| {
+        const vstart = p + tag.len;
+        const close = std.mem.indexOfScalarPos(u8, block, vstart, '<') orelse break;
+        const email = std.mem.trim(u8, block[vstart..close], " \t\r\n");
+        if (email.len > 0 and std.mem.indexOfScalar(u8, email, '@') != null) {
+            try out.append(a, email);
+        }
+        i = close + 1;
+    }
+}
+
+/// Collect addresses from a `To`/`Cc` header value (comma-separated, may carry
+/// display names).
+fn collectHeaderAddrs(a: std.mem.Allocator, headers: []const u8, name: []const u8, out: *std.ArrayList([]const u8)) !void {
+    const val = headerValue(a, headers, name) orelse return;
+    var it = std.mem.splitScalar(u8, val, ',');
+    while (it.next()) |part| {
+        const addr = parseEmail(std.mem.trim(u8, part, " \t"));
+        if (addr.email.len > 0 and std.mem.indexOfScalar(u8, addr.email, '@') != null) {
+            try out.append(a, addr.email);
+        }
+    }
+}
+
+/// Strip CR/LF from a header value so a crafted Subject/recipient can't inject
+/// additional headers.
+fn headerSafe(a: std.mem.Allocator, s: []const u8) []const u8 {
+    var buf = std.ArrayList(u8).empty;
+    for (s) |c| buf.append(a, if (c == '\r' or c == '\n') ' ' else c) catch {};
+    return buf.items;
+}
+
+/// RFC 2822 Date header, e.g. "Sat, 31 May 2026 15:55:14 +0000".
+fn rfc2822Date(a: std.mem.Allocator, epoch: i64) []const u8 {
+    const secs: u64 = if (epoch <= 0) 0 else @intCast(epoch);
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const ed = es.getEpochDay();
+    const yd = ed.calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    // Unix day 0 (1970-01-01) was a Thursday.
+    const wdays = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    const wd = wdays[@intCast(ed.day % 7)];
+    const mon = months[@intFromEnum(md.month) - 1];
+    return std.fmt.allocPrint(a, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} +0000", .{
+        wd,                      @as(u32, md.day_index) + 1, mon, yd.year,
+        ds.getHoursIntoDay(),    ds.getMinutesIntoHour(),    ds.getSecondsIntoMinute(),
+    }) catch "Thu, 01 Jan 1970 00:00:00 +0000";
+}
+
+/// Write `data` into mail/{user}/{mailbox}/{sub}/{filename} (Maildir).
+fn saveToMailbox(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, sub: []const u8, filename: []const u8, data: []const u8) !void {
+    const dir = try std.fmt.allocPrint(a, "mail/{s}/{s}/{s}", .{ ctx.local_part, mailbox, sub });
+    fs_compat.cwd().makePath(dir) catch {};
+    const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, filename });
+    const file = try fs_compat.cwd().createFile(path, .{});
+    defer file.close();
+    try file.writeAll(data);
+}
+
+/// Map an EWS distinguished folder id back to the Maildir mailbox name.
+fn ewsFolderToMailbox(folder: []const u8) []const u8 {
+    if (std.mem.eql(u8, folder, "inbox")) return "INBOX";
+    if (std.mem.eql(u8, folder, "drafts")) return "Drafts";
+    if (std.mem.eql(u8, folder, "sentitems")) return "Sent";
+    if (std.mem.eql(u8, folder, "deleteditems")) return "Trash";
+    return folder;
+}
+
+/// CreateItem: build an RFC822 message from the composed EWS Message, deliver it
+/// via the server's outbound path (SES on AWS, direct MX on Hetzner), and save a
+/// copy to Sent (or Drafts for MessageDisposition="SaveOnly").
+fn createItem(ctx: *Context, soap: []const u8) !Response {
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const disposition = attrValue(soap, "MessageDisposition") orelse "SendAndSaveCopy";
+    const do_send = !std.mem.eql(u8, disposition, "SaveOnly");
+    const save_copy = !std.mem.eql(u8, disposition, "SendOnly");
+
+    const subject = try xmlUnescape(a, elementText(soap, "Subject") orelse "");
+    const body = try xmlUnescape(a, elementText(soap, "Body") orelse "");
+    const body_type = attrValue(soap, "BodyType") orelse "Text";
+    const is_html = std.ascii.eqlIgnoreCase(body_type, "HTML");
+
+    var to_list = std.ArrayList([]const u8).empty;
+    var cc_list = std.ArrayList([]const u8).empty;
+    if (elementText(soap, "ToRecipients")) |blk| try collectEmails(a, blk, &to_list);
+    if (elementText(soap, "CcRecipients")) |blk| try collectEmails(a, blk, &cc_list);
+
+    logger.info("EWS CreateItem: disp={s} subj_len={d} to={d} cc={d} bodytype={s}", .{
+        disposition, subject.len, to_list.items.len, cc_list.items.len, body_type,
+    });
+
+    // Build the RFC822 message.
+    const epoch = time_compat.timestamp();
+    const nanos = time_compat.nanoTimestamp();
+    const seq = send_seq.fetchAdd(1, .monotonic);
+    const msgid = try std.fmt.allocPrint(a, "{d}.{d}.{d}@{s}", .{ epoch, nanos, seq, ctx.hostname });
+    const date_hdr = rfc2822Date(a, epoch);
+    const ctype: []const u8 = if (is_html) "text/html; charset=utf-8" else "text/plain; charset=utf-8";
+
+    var msg = std.ArrayList(u8).empty;
+    try msg.print(a, "From: {s}\r\n", .{ctx.username});
+    if (to_list.items.len > 0) {
+        try msg.appendSlice(a, "To: ");
+        for (to_list.items, 0..) |r, idx| {
+            if (idx > 0) try msg.appendSlice(a, ", ");
+            try msg.appendSlice(a, headerSafe(a, r));
+        }
+        try msg.appendSlice(a, "\r\n");
+    }
+    if (cc_list.items.len > 0) {
+        try msg.appendSlice(a, "Cc: ");
+        for (cc_list.items, 0..) |r, idx| {
+            if (idx > 0) try msg.appendSlice(a, ", ");
+            try msg.appendSlice(a, headerSafe(a, r));
+        }
+        try msg.appendSlice(a, "\r\n");
+    }
+    try msg.print(a, "Subject: {s}\r\n", .{headerSafe(a, subject)});
+    try msg.print(a, "Date: {s}\r\n", .{date_hdr});
+    try msg.print(a, "Message-ID: <{s}>\r\n", .{msgid});
+    try msg.appendSlice(a, "MIME-Version: 1.0\r\n");
+    try msg.print(a, "Content-Type: {s}\r\n", .{ctype});
+    try msg.appendSlice(a, "Content-Transfer-Encoding: 8bit\r\n\r\n");
+    try msg.appendSlice(a, body);
+    if (!std.mem.endsWith(u8, msg.items, "\n")) try msg.appendSlice(a, "\r\n");
+    const message_data = msg.items;
+
+    // Deliver to every recipient (To + Cc).
+    var delivered: usize = 0;
+    var failed: usize = 0;
+    if (do_send) {
+        var all = std.ArrayList([]const u8).empty;
+        try all.appendSlice(a, to_list.items);
+        try all.appendSlice(a, cc_list.items);
+        for (all.items) |rcpt| {
+            outbound.deliverToRemote(ctx.allocator, ctx.username, rcpt, message_data, ctx.hostname, ctx.delivery_method, ctx.ses_region) catch |err| {
+                logger.err("EWS CreateItem: delivery to {s} failed: {s}", .{ rcpt, @errorName(err) });
+                failed += 1;
+                continue;
+            };
+            delivered += 1;
+        }
+        logger.info("EWS CreateItem: delivered={d} failed={d}", .{ delivered, failed });
+    }
+
+    // Save a copy: Sent (read) for sends, Drafts (unread) for SaveOnly.
+    const target_mailbox: []const u8 = if (do_send) "Sent" else "Drafts";
+    const sub: []const u8 = if (do_send) "cur" else "new";
+    const suffix: []const u8 = if (do_send) ":2,S" else ":2,";
+    const filename = try std.fmt.allocPrint(a, "{d}.{d}{d}.{s}.eml{s}", .{ epoch, nanos, seq, ctx.hostname, suffix });
+    const item_folder: []const u8 = if (do_send) "sentitems" else "drafts";
+    if (save_copy) {
+        saveToMailbox(a, ctx, target_mailbox, sub, filename, message_data) catch |err| {
+            logger.err("EWS CreateItem: save to {s} failed: {s}", .{ target_mailbox, @errorName(err) });
+        };
+    }
+
+    const item_basename = maildirBaseName(filename);
+    var buf = std.ArrayList(u8).empty;
+    try buf.print(a,
+        \\<m:CreateItemResponse><m:ResponseMessages><m:CreateItemResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Items><t:Message><t:ItemId Id="{s}:{s}" ChangeKey="ck0"/></t:Message></m:Items></m:CreateItemResponseMessage></m:ResponseMessages></m:CreateItemResponse>
+    , .{ item_folder, item_basename });
+    return Response{ .body = try envelope(ctx.allocator, buf.items) };
+}
+
+/// SendItem: send previously-saved draft(s) referenced by ItemId. Reads each
+/// draft's RFC822 from its Maildir, extracts recipients from the headers,
+/// delivers, and (if SaveItemToFolder) copies it to Sent.
+fn sendItem(ctx: *Context, soap: []const u8) !Response {
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const save_copy = blk: {
+        const v = attrValue(soap, "SaveItemToFolder") orelse break :blk true;
+        break :blk std.mem.eql(u8, v, "true");
+    };
+
+    var ids = std.ArrayList([]const u8).empty;
+    {
+        const needle = "ItemId Id=\"";
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, soap, i, needle)) |p| {
+            const vs = p + needle.len;
+            const ve = std.mem.indexOfScalarPos(u8, soap, vs, '"') orelse break;
+            try ids.append(a, soap[vs..ve]);
+            i = ve + 1;
+        }
+    }
+    logger.info("EWS SendItem: items={d} save_copy={any}", .{ ids.items.len, save_copy });
+
+    var buf = std.ArrayList(u8).empty;
+    try buf.appendSlice(a, "<m:SendItemResponse><m:ResponseMessages>");
+    for (ids.items) |id| {
+        var ok = true;
+        const colon = std.mem.indexOfScalar(u8, id, ':');
+        if (colon) |cpos| {
+            const folder = id[0..cpos];
+            const basename = id[cpos + 1 ..];
+            const mailbox = ewsFolderToMailbox(folder);
+            if (readMailFile(a, ctx, mailbox, basename)) |found| {
+                const split = headerBodySplit(found.content);
+                const headers = found.content[0..split.header_end];
+                var rcpts = std.ArrayList([]const u8).empty;
+                try collectHeaderAddrs(a, headers, "To", &rcpts);
+                try collectHeaderAddrs(a, headers, "Cc", &rcpts);
+                for (rcpts.items) |rcpt| {
+                    outbound.deliverToRemote(ctx.allocator, ctx.username, rcpt, found.content, ctx.hostname, ctx.delivery_method, ctx.ses_region) catch |err| {
+                        logger.err("EWS SendItem: delivery to {s} failed: {s}", .{ rcpt, @errorName(err) });
+                        ok = false;
+                    };
+                }
+                if (save_copy) {
+                    const epoch = time_compat.timestamp();
+                    const seq = send_seq.fetchAdd(1, .monotonic);
+                    const fname = try std.fmt.allocPrint(a, "{d}.{d}.{s}.eml:2,S", .{ epoch, seq, ctx.hostname });
+                    saveToMailbox(a, ctx, "Sent", "cur", fname, found.content) catch {};
+                }
+            } else {
+                logger.err("EWS SendItem: item {s} not found", .{id});
+                ok = false;
+            }
+        } else ok = false;
+
+        if (ok) {
+            try buf.appendSlice(a, "<m:SendItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode></m:SendItemResponseMessage>");
+        } else {
+            try buf.appendSlice(a, "<m:SendItemResponseMessage ResponseClass=\"Error\"><m:MessageText>Item could not be sent</m:MessageText><m:ResponseCode>ErrorItemNotFound</m:ResponseCode></m:SendItemResponseMessage>");
+        }
+    }
+    if (ids.items.len == 0) {
+        try buf.appendSlice(a, "<m:SendItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode></m:SendItemResponseMessage>");
+    }
+    try buf.appendSlice(a, "</m:ResponseMessages></m:SendItemResponse>");
+    return Response{ .body = try envelope(ctx.allocator, buf.items) };
 }
 
 fn findFolder(ctx: *Context, soap: []const u8) !Response {

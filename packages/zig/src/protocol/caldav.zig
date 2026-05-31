@@ -10,6 +10,7 @@ const caldav_store = @import("../storage/caldav_store.zig");
 const autoconfig = @import("../api/autoconfig.zig");
 const eas = @import("eas.zig");
 const ews = @import("ews/ews.zig");
+const core_config = @import("../core/config.zig");
 
 /// Get the current epoch timestamp in seconds.
 fn currentTimestamp() i64 {
@@ -51,6 +52,9 @@ pub const CalDavConfig = struct {
     imaps_port: u16 = 993,
     submission_port: u16 = 587,
     display_name: []const u8 = "Mail",
+    // Outbound delivery (used by EWS CreateItem/SendItem to actually send mail).
+    delivery_method: core_config.DeliveryMethod = .direct,
+    ses_region: []const u8 = "us-east-1",
 };
 
 // ============================================================================
@@ -2357,6 +2361,8 @@ const TlsCalDavSession = struct {
             .local_part = local_part,
             .hostname = config.public_hostname,
             .db = self.auth_backend.db,
+            .delivery_method = config.delivery_method,
+            .ses_region = config.ses_region,
         };
 
         const resp = try ews.handleSoap(&ctx, body);
