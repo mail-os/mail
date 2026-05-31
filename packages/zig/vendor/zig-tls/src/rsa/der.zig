@@ -29,6 +29,7 @@ pub const Parser = struct {
         InvalidIntegerEncoding,
         Overflow,
         NonCanonical,
+        InvalidBitString,
     };
 
     pub fn expectBool(self: *Parser) Error!bool {
