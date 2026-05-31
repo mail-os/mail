@@ -1,5 +1,9 @@
 const std = @import("std");
 const logger = @import("../../core/logger.zig");
+// NOTE: for a future standalone `zig-ews`, reach the mailbox/store through a
+// callback interface on Context instead of importing these directly.
+const database = @import("../../storage/database.zig");
+const fs_compat = @import("../../core/fs_compat.zig");
 
 pub const autodiscover = @import("autodiscover.zig");
 
@@ -20,8 +24,12 @@ pub const Context = struct {
     allocator: std.mem.Allocator,
     /// Authenticated user (full email).
     username: []const u8,
+    /// Maildir directory name for the user (local part of the address).
+    local_part: []const u8,
     /// Public hostname (for self-referential URLs).
     hostname: []const u8,
+    /// Database (IMAP UID mapping for stable item ids).
+    db: *database.Database,
 };
 
 pub const Response = struct {
@@ -57,28 +65,34 @@ fn envelope(allocator: std.mem.Allocator, inner: []const u8) ![]u8 {
     });
 }
 
-/// The folders advertised to clients.
+/// The folders advertised to clients. The EWS folder id IS the distinguished
+/// name, so GetFolder / SyncFolderHierarchy / SyncFolderItems all agree on it.
 const FolderDef = struct {
-    /// EWS distinguished folder id (lowercase) used in GetFolder requests.
-    dist: []const u8,
-    /// Opaque-but-stable folder id we hand back.
+    /// EWS folder id = distinguished folder name (e.g. "inbox").
     id: []const u8,
     name: []const u8,
-    /// EWS element + class: .mail -> <t:Folder> IPF.Note, .calendar ->
-    /// <t:CalendarFolder> IPF.Appointment, .contacts -> <t:ContactsFolder>.
     kind: enum { mail, calendar, contacts },
+    /// Maildir mailbox backing this folder (null for calendar/contacts).
+    mailbox: ?[]const u8,
 };
 
 const FOLDERS = [_]FolderDef{
-    .{ .dist = "inbox", .id = "f-inbox", .name = "Inbox", .kind = .mail },
-    .{ .dist = "drafts", .id = "f-drafts", .name = "Drafts", .kind = .mail },
-    .{ .dist = "sentitems", .id = "f-sent", .name = "Sent Items", .kind = .mail },
-    .{ .dist = "deleteditems", .id = "f-trash", .name = "Deleted Items", .kind = .mail },
-    .{ .dist = "calendar", .id = "f-calendar", .name = "Calendar", .kind = .calendar },
-    .{ .dist = "contacts", .id = "f-contacts", .name = "Contacts", .kind = .contacts },
+    .{ .id = "inbox", .name = "Inbox", .kind = .mail, .mailbox = "INBOX" },
+    .{ .id = "drafts", .name = "Drafts", .kind = .mail, .mailbox = "Drafts" },
+    .{ .id = "sentitems", .name = "Sent Items", .kind = .mail, .mailbox = "Sent" },
+    .{ .id = "deleteditems", .name = "Deleted Items", .kind = .mail, .mailbox = "Trash" },
+    .{ .id = "calendar", .name = "Calendar", .kind = .calendar, .mailbox = null },
+    .{ .id = "contacts", .name = "Contacts", .kind = .contacts, .mailbox = null },
 };
 
-const ROOT_ID = "f-root";
+const ROOT_ID = "msgfolderroot";
+
+fn folderById(id: []const u8) ?FolderDef {
+    for (FOLDERS) |f| {
+        if (std.mem.eql(u8, f.id, id)) return f;
+    }
+    return null;
+}
 
 // ============================================================================
 // Dispatch
@@ -95,6 +109,7 @@ pub fn handleSoap(ctx: *Context, soap: []const u8) !Response {
     if (std.mem.eql(u8, op, "GetFolder")) return getFolder(ctx, soap);
     if (std.mem.eql(u8, op, "SyncFolderHierarchy")) return syncFolderHierarchy(ctx, soap);
     if (std.mem.eql(u8, op, "SyncFolderItems")) return syncFolderItems(ctx, soap);
+    if (std.mem.eql(u8, op, "GetItem")) return getItem(ctx, soap);
     if (std.mem.eql(u8, op, "FindFolder")) return findFolder(ctx, soap);
     if (std.mem.eql(u8, op, "FindItem")) return emptyFindItem(ctx);
     if (std.mem.eql(u8, op, "GetUserConfiguration")) return userConfigurationFault(ctx);
@@ -237,13 +252,266 @@ fn syncFolderHierarchy(ctx: *Context, soap: []const u8) !Response {
     return Response{ .body = try envelope(ctx.allocator, buf.items) };
 }
 
+/// Find the value of the FolderId inside a <SyncFolderId>/<ParentFolderId>.
+fn extractScopedFolderId(soap: []const u8, scope: []const u8) ?[]const u8 {
+    const p = std.mem.indexOf(u8, soap, scope) orelse return null;
+    const idp = std.mem.indexOfPos(u8, soap, p, "Id=\"") orelse return null;
+    const vstart = idp + 4;
+    const vend = std.mem.indexOfScalarPos(u8, soap, vstart, '"') orelse return null;
+    return soap[vstart..vend];
+}
+
+/// SyncFolderItems: on the first sync (no SyncState) return every message in the
+/// folder as an Add (IdOnly — macOS then GetItems them). Subsequent syncs (the
+/// client echoes our SyncState) return no changes.
 fn syncFolderItems(ctx: *Context, soap: []const u8) !Response {
-    _ = soap;
-    // No items yet — report an empty, completed range so the client moves on.
-    const inner =
-        \\<m:SyncFolderItemsResponse><m:ResponseMessages><m:SyncFolderItemsResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:SyncState>SYNCSTATE1</m:SyncState><m:IncludesLastItemInRange>true</m:IncludesLastItemInRange><m:Changes/></m:SyncFolderItemsResponseMessage></m:ResponseMessages></m:SyncFolderItemsResponse>
-    ;
-    return Response{ .body = try envelope(ctx.allocator, inner) };
+    const folder_id = extractScopedFolderId(soap, "SyncFolderId") orelse "inbox";
+    const has_state = std.mem.indexOf(u8, soap, "SyncState") != null;
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(ctx.allocator);
+    const a = ctx.allocator;
+
+    try buf.appendSlice(a,
+        \\<m:SyncFolderItemsResponse><m:ResponseMessages><m:SyncFolderItemsResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:SyncState>SS1</m:SyncState><m:IncludesLastItemInRange>true</m:IncludesLastItemInRange><m:Changes>
+    );
+
+    if (!has_state) {
+        if (folderById(folder_id)) |folder| {
+            if (folder.mailbox) |mailbox| {
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const aa = arena.allocator();
+                var items = std.ArrayList(MailItem).empty;
+                collectMail(aa, ctx, mailbox, &items) catch {};
+                for (items.items) |it| {
+                    const id = std.fmt.allocPrint(aa, "{s}:{s}", .{ folder_id, it.basename }) catch continue;
+                    try buf.print(a,
+                        \\<t:Create><t:Message><t:ItemId Id="{s}" ChangeKey="ck0"/></t:Message></t:Create>
+                    , .{id});
+                }
+            }
+        }
+    }
+
+    try buf.appendSlice(a, "</m:Changes></m:SyncFolderItemsResponseMessage></m:ResponseMessages></m:SyncFolderItemsResponse>");
+    return Response{ .body = try envelope(ctx.allocator, buf.items) };
+}
+
+/// GetItem: return the message content for each requested ItemId.
+fn getItem(ctx: *Context, soap: []const u8) !Response {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(ctx.allocator);
+    const a = ctx.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    try buf.appendSlice(a, "<m:GetItemResponse><m:ResponseMessages>");
+    var idx: usize = 0;
+    const needle = "ItemId Id=\"";
+    while (std.mem.indexOfPos(u8, soap, idx, needle)) |p| {
+        const vstart = p + needle.len;
+        const vend = std.mem.indexOfScalarPos(u8, soap, vstart, '"') orelse break;
+        const id = soap[vstart..vend];
+        appendItemMessage(&buf, aa, ctx, id) catch {
+            try buf.appendSlice(a, "<m:GetItemResponseMessage ResponseClass=\"Error\"><m:ResponseCode>ErrorItemNotFound</m:ResponseCode><m:Items/></m:GetItemResponseMessage>");
+        };
+        idx = vend + 1;
+    }
+    try buf.appendSlice(a, "</m:ResponseMessages></m:GetItemResponse>");
+    return Response{ .body = try envelope(ctx.allocator, buf.items) };
+}
+
+fn appendItemMessage(buf: *std.ArrayList(u8), aa: std.mem.Allocator, ctx: *Context, id: []const u8) !void {
+    const colon = std.mem.indexOfScalar(u8, id, ':') orelse return error.BadId;
+    const folder_id = id[0..colon];
+    const basename = id[colon + 1 ..];
+    const folder = folderById(folder_id) orelse return error.BadId;
+    const mailbox = folder.mailbox orelse return error.BadId;
+
+    const found = readMailFile(aa, ctx, mailbox, basename) orelse return error.NotFound;
+    const raw = found.content;
+    const split = headerBodySplit(raw);
+    const headers = raw[0..split.header_end];
+    const body_raw = raw[split.body_start..];
+    const body = if (body_raw.len > 64 * 1024) body_raw[0 .. 64 * 1024] else body_raw;
+
+    const subject = xmlEscape(aa, headerValue(aa, headers, "subject") orelse "(no subject)");
+    const from = parseEmail(headerValue(aa, headers, "from") orelse "");
+    const to = parseEmail(headerValue(aa, headers, "to") orelse "");
+    const date = ewsDate(aa, found.epoch);
+    const a = ctx.allocator;
+
+    // Element order follows the EWS Item/Message xs:sequence (macOS parses it
+    // strictly): ItemId, ItemClass, Subject, Body, DateTimeReceived, Size,
+    // DateTimeSent, then the Message-specific ToRecipients, From, IsRead.
+    try buf.appendSlice(a, "<m:GetItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode><m:Items><t:Message>");
+    try buf.print(a, "<t:ItemId Id=\"{s}\" ChangeKey=\"ck0\"/>", .{xmlEscape(aa, id)});
+    try buf.appendSlice(a, "<t:ItemClass>IPM.Note</t:ItemClass>");
+    try buf.print(a, "<t:Subject>{s}</t:Subject>", .{subject});
+    try buf.print(a, "<t:Body BodyType=\"Text\">{s}</t:Body>", .{xmlEscape(aa, body)});
+    try buf.print(a, "<t:DateTimeReceived>{s}</t:DateTimeReceived>", .{date});
+    try buf.print(a, "<t:Size>{d}</t:Size>", .{raw.len});
+    try buf.appendSlice(a, "<t:HasAttachments>false</t:HasAttachments>");
+    try buf.print(a, "<t:DateTimeSent>{s}</t:DateTimeSent>", .{date});
+    if (to.email.len > 0) {
+        try buf.print(a, "<t:ToRecipients><t:Mailbox><t:Name>{s}</t:Name><t:EmailAddress>{s}</t:EmailAddress></t:Mailbox></t:ToRecipients>", .{ xmlEscape(aa, to.name), xmlEscape(aa, to.email) });
+    }
+    try buf.print(a, "<t:From><t:Mailbox><t:Name>{s}</t:Name><t:EmailAddress>{s}</t:EmailAddress></t:Mailbox></t:From>", .{ xmlEscape(aa, from.name), xmlEscape(aa, from.email) });
+    try buf.print(a, "<t:IsRead>{s}</t:IsRead>", .{if (found.seen) "true" else "false"});
+    try buf.appendSlice(a, "</t:Message></m:Items></m:GetItemResponseMessage>");
+}
+
+// ---------------------------------------------------------------------------
+// Maildir access + helpers
+// ---------------------------------------------------------------------------
+
+const MailItem = struct {
+    basename: []const u8,
+    path: []const u8,
+    seen: bool,
+    epoch: i64,
+};
+
+const FoundMail = struct { content: []const u8, seen: bool, epoch: i64 };
+
+fn mailboxDirs(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8) ![2][]const u8 {
+    if (std.mem.eql(u8, mailbox, "INBOX")) {
+        return .{
+            try std.fmt.allocPrint(a, "mail/{s}/new", .{ctx.local_part}),
+            try std.fmt.allocPrint(a, "mail/{s}/cur", .{ctx.local_part}),
+        };
+    }
+    const base = try std.fmt.allocPrint(a, "mail/{s}/{s}", .{ ctx.local_part, mailbox });
+    return .{
+        try std.fmt.allocPrint(a, "{s}/new", .{base}),
+        try std.fmt.allocPrint(a, "{s}/cur", .{base}),
+    };
+}
+
+fn collectMail(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, out: *std.ArrayList(MailItem)) !void {
+    const dirs = try mailboxDirs(a, ctx, mailbox);
+    for (dirs) |dir| {
+        const files = fs_compat.listEmlFiles(a, dir) catch continue;
+        for (files) |fname| {
+            try out.append(a, .{
+                .basename = maildirBaseName(fname),
+                .path = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, fname }),
+                .seen = maildirSeen(fname),
+                .epoch = maildirEpoch(maildirBaseName(fname)),
+            });
+        }
+    }
+}
+
+fn readMailFile(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, basename: []const u8) ?FoundMail {
+    const dirs = mailboxDirs(a, ctx, mailbox) catch return null;
+    for (dirs) |dir| {
+        const files = fs_compat.listEmlFiles(a, dir) catch continue;
+        for (files) |fname| {
+            if (std.mem.eql(u8, maildirBaseName(fname), basename)) {
+                const path = std.fmt.allocPrint(a, "{s}/{s}", .{ dir, fname }) catch return null;
+                const content = fs_compat.readFileAlloc(a, path) catch return null;
+                return .{ .content = content, .seen = maildirSeen(fname), .epoch = maildirEpoch(basename) };
+            }
+        }
+    }
+    return null;
+}
+
+fn maildirBaseName(filename: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, filename, ":2,")) |i| return filename[0..i];
+    return filename;
+}
+fn maildirSeen(filename: []const u8) bool {
+    if (std.mem.indexOf(u8, filename, ":2,")) |i| return std.mem.indexOfScalar(u8, filename[i + 3 ..], 'S') != null;
+    return false;
+}
+fn maildirEpoch(base: []const u8) i64 {
+    var end: usize = 0;
+    while (end < base.len and base[end] >= '0' and base[end] <= '9') end += 1;
+    if (end == 0) return 0;
+    return std.fmt.parseInt(i64, base[0..end], 10) catch 0;
+}
+
+const Split = struct { header_end: usize, body_start: usize };
+fn headerBodySplit(raw: []const u8) Split {
+    if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |i| return .{ .header_end = i, .body_start = i + 4 };
+    if (std.mem.indexOf(u8, raw, "\n\n")) |i| return .{ .header_end = i, .body_start = i + 2 };
+    return .{ .header_end = raw.len, .body_start = raw.len };
+}
+
+fn headerValue(a: std.mem.Allocator, headers: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, headers, '\n');
+    var collecting = false;
+    var acc = std.ArrayList(u8).empty;
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trimEnd(u8, line_raw, "\r");
+        if (collecting) {
+            if (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) {
+                acc.append(a, ' ') catch {};
+                acc.appendSlice(a, std.mem.trim(u8, line, " \t")) catch {};
+                continue;
+            }
+            return acc.items;
+        }
+        if (line.len < name.len + 1) continue;
+        if (std.ascii.eqlIgnoreCase(line[0..name.len], name) and line[name.len] == ':') {
+            const val = std.mem.trim(u8, line[name.len + 1 ..], " \t");
+            acc.appendSlice(a, val) catch return val;
+            collecting = true;
+        }
+    }
+    if (collecting) return acc.items;
+    return null;
+}
+
+const Addr = struct { name: []const u8, email: []const u8 };
+/// Parse "Name <email@host>" or "email@host" into name + email.
+fn parseEmail(s: []const u8) Addr {
+    if (std.mem.indexOfScalar(u8, s, '<')) |lt| {
+        if (std.mem.indexOfScalarPos(u8, s, lt, '>')) |gt| {
+            const email = s[lt + 1 .. gt];
+            var name = std.mem.trim(u8, s[0..lt], " \t\"");
+            if (name.len == 0) name = email;
+            return .{ .name = name, .email = email };
+        }
+    }
+    const t = std.mem.trim(u8, s, " \t");
+    return .{ .name = t, .email = t };
+}
+
+/// EWS date: `YYYY-MM-DDTHH:MM:SSZ`.
+fn ewsDate(a: std.mem.Allocator, epoch: i64) []const u8 {
+    const secs: u64 = if (epoch <= 0) 0 else @intCast(epoch);
+    const es = std.time.epoch.EpochSeconds{ .secs = secs };
+    const yd = es.getEpochDay().calculateYearDay();
+    const md = yd.calculateMonthDay();
+    const ds = es.getDaySeconds();
+    return std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        yd.year, @intFromEnum(md.month), @as(u32, md.day_index) + 1,
+        ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+    }) catch "1970-01-01T00:00:00Z";
+}
+
+/// Escape text for XML and strip characters illegal in XML 1.0 (control chars),
+/// so raw MIME bodies can't corrupt the SOAP response (which macOS parses strictly).
+fn xmlEscape(a: std.mem.Allocator, s: []const u8) []const u8 {
+    var buf = std.ArrayList(u8).empty;
+    for (s) |c| {
+        switch (c) {
+            '&' => buf.appendSlice(a, "&amp;") catch {},
+            '<' => buf.appendSlice(a, "&lt;") catch {},
+            '>' => buf.appendSlice(a, "&gt;") catch {},
+            '"' => buf.appendSlice(a, "&quot;") catch {},
+            '\'' => buf.appendSlice(a, "&apos;") catch {},
+            '\t', '\n', '\r' => buf.append(a, c) catch {},
+            0...8, 11, 12, 14...31 => {}, // illegal in XML 1.0 — drop
+            else => buf.append(a, c) catch {},
+        }
+    }
+    return buf.items;
 }
 
 fn findFolder(ctx: *Context, soap: []const u8) !Response {

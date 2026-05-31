@@ -2338,10 +2338,15 @@ const TlsCalDavSession = struct {
     fn serveEws(self: *TlsCalDavSession, config: *const CalDavConfig, request: []const u8) !void {
         const body: []const u8 = if (std.mem.indexOf(u8, request, "\r\n\r\n")) |i| request[i + 4 ..] else "";
 
+        const user = self.username orelse "";
+        const local_part = if (std.mem.indexOfScalar(u8, user, '@')) |i| user[0..i] else user;
+
         var ctx = ews.Context{
             .allocator = self.allocator,
-            .username = self.username orelse "",
+            .username = user,
+            .local_part = local_part,
             .hostname = config.public_hostname,
+            .db = self.auth_backend.db,
         };
 
         const resp = try ews.handleSoap(&ctx, body);
