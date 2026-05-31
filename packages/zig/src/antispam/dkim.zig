@@ -1,5 +1,10 @@
 const std = @import("std");
 const io_compat = @import("../core/io_compat.zig");
+const tls = @import("tls");
+const spf = @import("spf.zig");
+const dkim_sign = @import("dkim_sign.zig");
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const B64 = std.base64.standard;
 
 /// DKIM validation result
 pub const DKIMResult = enum {
@@ -193,48 +198,253 @@ pub const DKIMValidator = struct {
         return sig_value.toOwnedSlice(self.allocator) catch return null;
     }
 
+    /// Look up `<selector>._domainkey.<domain>` TXT, parse `p=`, base64-decode,
+    /// and unwrap SPKI → PKCS#1 RSAPublicKey DER. Returns owned bytes, or null
+    /// (no key / revoked / malformed). Caller frees.
     fn queryPublicKey(self: *DKIMValidator, domain: []const u8, selector: []const u8) !?[]const u8 {
-        // In production, query DNS TXT record at: selector._domainkey.domain
-        // Format: "v=DKIM1; k=rsa; p=<base64-public-key>"
-        _ = self;
-        _ = domain;
-        _ = selector;
+        var name_buf: [320]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "{s}._domainkey.{s}", .{ selector, domain }) catch return null;
+        const txt = (spf.dnsQueryTxt(self.allocator, name, "") catch return error.TempError) orelse return null;
+        defer self.allocator.free(txt);
 
-        // For now, return null (no key found)
-        // A real implementation would use DNS lookups
-        return null;
+        const p_raw = dkimTag(txt, "p") orelse return null;
+        var p_clean = std.ArrayList(u8).empty;
+        defer p_clean.deinit(self.allocator);
+        for (p_raw) |c| {
+            if (c == ' ' or c == '\t' or c == '\r' or c == '\n') continue;
+            try p_clean.append(self.allocator, c);
+        }
+        if (p_clean.items.len == 0) return null; // empty p = revoked key
+
+        const dec_len = B64.Decoder.calcSizeForSlice(p_clean.items) catch return null;
+        const der_bytes = try self.allocator.alloc(u8, dec_len);
+        errdefer self.allocator.free(der_bytes);
+        B64.Decoder.decode(der_bytes, p_clean.items) catch {
+            self.allocator.free(der_bytes);
+            return null;
+        };
+
+        // DKIM publishes SPKI; unwrap to the inner PKCS#1 RSAPublicKey for
+        // zig-tls's PublicKey.fromDer. If unwrapping fails, assume raw PKCS#1.
+        if (spkiToPkcs1(der_bytes)) |pkcs1| {
+            const out = try self.allocator.dupe(u8, pkcs1);
+            self.allocator.free(der_bytes);
+            return out;
+        }
+        return der_bytes;
     }
 
     fn verifyBodyHash(self: *DKIMValidator, signature: *const DKIMSignature, body: []const u8) !bool {
-        _ = signature;
-        _ = body;
-        _ = self;
+        var cbody = std.ArrayList(u8).empty;
+        defer cbody.deinit(self.allocator);
+        if (bodyCanonRelaxed(signature.canonicalization))
+            try dkim_sign.canonBodyRelaxed(self.allocator, body, &cbody)
+        else
+            try canonBodySimple(self.allocator, body, &cbody);
 
-        // In production:
-        // 1. Canonicalize body according to c= tag
-        // 2. Compute hash (SHA256 for rsa-sha256)
-        // 3. Base64 encode
-        // 4. Compare with bh= tag
-
-        // For now, assume valid
-        return true;
+        var digest: [Sha256.digest_length]u8 = undefined;
+        Sha256.hash(cbody.items, &digest, .{});
+        var bh: [B64.Encoder.calcSize(Sha256.digest_length)]u8 = undefined;
+        _ = B64.Encoder.encode(&bh, &digest);
+        return std.mem.eql(u8, std.mem.trim(u8, signature.body_hash, " \t\r\n"), &bh);
     }
 
     fn verifySignature(self: *DKIMValidator, signature: *const DKIMSignature, headers: []const u8, public_key: []const u8) !bool {
-        _ = signature;
-        _ = headers;
-        _ = public_key;
-        _ = self;
+        const relaxed = headerCanonRelaxed(signature.canonicalization);
+        var input = std.ArrayList(u8).empty;
+        defer input.deinit(self.allocator);
 
-        // In production:
-        // 1. Extract signed headers (h= tag)
-        // 2. Canonicalize headers
-        // 3. Verify RSA signature with public key
+        // Signed headers in h= order. A name may be missing (then skipped).
+        var hit = std.mem.splitScalar(u8, signature.headers, ':');
+        while (hit.next()) |name_raw| {
+            const name = std.mem.trim(u8, name_raw, " \t\r\n");
+            if (name.len == 0) continue;
+            const h = findHeader(headers, name) orelse continue;
+            if (relaxed) {
+                var lower_buf: [128]u8 = undefined;
+                const lname = if (name.len <= lower_buf.len) std.ascii.lowerString(lower_buf[0..name.len], name) else name;
+                try dkim_sign.appendCanonHeader(self.allocator, &input, lname, h.value);
+            } else {
+                try input.appendSlice(self.allocator, h.full); // simple: verbatim
+            }
+            try input.appendSlice(self.allocator, "\r\n");
+        }
 
-        // For now, assume valid
+        // The DKIM-Signature header itself with the b= value emptied, NO CRLF.
+        const dk = findHeader(headers, "dkim-signature") orelse return false;
+        const stripped = try stripBTag(self.allocator, dk.full);
+        defer self.allocator.free(stripped);
+        if (relaxed) {
+            const colon = std.mem.indexOfScalar(u8, stripped, ':') orelse return false;
+            try dkim_sign.appendCanonHeader(self.allocator, &input, "dkim-signature", stripped[colon + 1 ..]);
+        } else {
+            try input.appendSlice(self.allocator, stripped);
+        }
+
+        // base64-decode b=
+        var b_clean = std.ArrayList(u8).empty;
+        defer b_clean.deinit(self.allocator);
+        for (signature.signature) |c| {
+            if (c == ' ' or c == '\t' or c == '\r' or c == '\n') continue;
+            try b_clean.append(self.allocator, c);
+        }
+        const sig_len = B64.Decoder.calcSizeForSlice(b_clean.items) catch return false;
+        const sig_bytes = try self.allocator.alloc(u8, sig_len);
+        defer self.allocator.free(sig_bytes);
+        B64.Decoder.decode(sig_bytes, b_clean.items) catch return false;
+
+        // RSA-PKCS1-SHA256 verify via zig-tls.
+        const pub_key = tls.rsa.PublicKey.fromDer(public_key) catch return false;
+        const Pkcs = tls.rsa.PKCS1v1_5(Sha256);
+        const sig = Pkcs.Signature{ .bytes = sig_bytes };
+        sig.verify(input.items, pub_key) catch return false;
         return true;
     }
 };
+
+// ---- DKIM verification helpers ----
+
+/// Value of a `key=value` tag in a DKIM TXT/Signature (`;`-separated). Trimmed.
+fn dkimTag(s: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, s, ';');
+    while (it.next()) |part| {
+        const p = std.mem.trim(u8, part, " \t\r\n");
+        if (p.len > key.len and std.mem.startsWith(u8, p, key) and p[key.len] == '=') {
+            return std.mem.trim(u8, p[key.len + 1 ..], " \t\r\n");
+        }
+    }
+    return null;
+}
+
+/// c= is `header/body`; default `simple/simple`.
+fn headerCanonRelaxed(c: []const u8) bool {
+    const slash = std.mem.indexOfScalar(u8, c, '/') orelse return std.mem.indexOf(u8, c, "relaxed") != null;
+    return std.mem.indexOf(u8, c[0..slash], "relaxed") != null;
+}
+fn bodyCanonRelaxed(c: []const u8) bool {
+    const slash = std.mem.indexOfScalar(u8, c, '/') orelse return false;
+    return std.mem.indexOf(u8, c[slash + 1 ..], "relaxed") != null;
+}
+
+const RawHeader = struct { full: []const u8, value: []const u8 };
+/// Find a header by case-insensitive name. Returns the full line(s) incl. folds
+/// (no trailing CRLF) and the value (after the colon).
+fn findHeader(headers: []const u8, name: []const u8) ?RawHeader {
+    var i: usize = 0;
+    while (i < headers.len) {
+        const ls = i;
+        if (ls + name.len + 1 <= headers.len and
+            std.ascii.eqlIgnoreCase(headers[ls .. ls + name.len], name) and
+            headers[ls + name.len] == ':')
+        {
+            var j = ls + name.len + 1;
+            while (true) {
+                const nl = std.mem.indexOfScalarPos(u8, headers, j, '\n') orelse {
+                    return .{ .full = headers[ls..], .value = headers[ls + name.len + 1 ..] };
+                };
+                if (nl + 1 < headers.len and (headers[nl + 1] == ' ' or headers[nl + 1] == '\t')) {
+                    j = nl + 1;
+                } else {
+                    const end = if (nl > ls and headers[nl - 1] == '\r') nl - 1 else nl;
+                    return .{ .full = headers[ls..end], .value = headers[ls + name.len + 1 .. end] };
+                }
+            }
+        }
+        const nl = std.mem.indexOfScalarPos(u8, headers, i, '\n') orelse return null;
+        i = nl + 1;
+    }
+    return null;
+}
+
+/// Copy of a raw DKIM-Signature header with the b= tag value emptied (keep
+/// `b=`), as required before verifying. Caller frees.
+fn stripBTag(allocator: std.mem.Allocator, hdr: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < hdr.len) {
+        if (hdr[i] == 'b' and (i == 0 or hdr[i - 1] == ';' or hdr[i - 1] == ' ' or hdr[i - 1] == '\t' or hdr[i - 1] == '\n' or hdr[i - 1] == '\r')) {
+            var k = i + 1;
+            while (k < hdr.len and (hdr[k] == ' ' or hdr[k] == '\t')) k += 1;
+            if (k < hdr.len and hdr[k] == '=') {
+                try out.appendSlice(allocator, hdr[i .. k + 1]); // "b="
+                var m = k + 1;
+                while (m < hdr.len and hdr[m] != ';') m += 1;
+                i = m;
+                continue;
+            }
+        }
+        try out.append(allocator, hdr[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Simple body canonicalization (RFC 6376 §3.4.3): content as-is, trailing empty
+/// lines removed, non-empty body ends with a single CRLF.
+fn canonBodySimple(allocator: std.mem.Allocator, body: []const u8, out: *std.ArrayList(u8)) !void {
+    var tmp = std.ArrayList(u8).empty;
+    defer tmp.deinit(allocator);
+    var it = std.mem.splitScalar(u8, body, '\n');
+    while (it.next()) |raw| {
+        const line = if (raw.len > 0 and raw[raw.len - 1] == '\r') raw[0 .. raw.len - 1] else raw;
+        try tmp.appendSlice(allocator, line);
+        try tmp.appendSlice(allocator, "\r\n");
+    }
+    var end = tmp.items.len;
+    while (end >= 2 and tmp.items[end - 2] == '\r' and tmp.items[end - 1] == '\n') end -= 2;
+    try out.appendSlice(allocator, tmp.items[0..end]);
+    if (end > 0) try out.appendSlice(allocator, "\r\n");
+}
+
+/// Unwrap a SubjectPublicKeyInfo DER to its inner PKCS#1 RSAPublicKey (a slice
+/// into `spki`), or null if not a well-formed RSA SPKI.
+fn spkiToPkcs1(spki: []const u8) ?[]const u8 {
+    var p: usize = 0;
+    if (!derTag(spki, &p, 0x30)) return null; // outer SEQUENCE
+    _ = derLen(spki, &p) orelse return null;
+    if (!derTag(spki, &p, 0x30)) return null; // AlgorithmIdentifier SEQUENCE
+    const alg_len = derLen(spki, &p) orelse return null;
+    p += alg_len;
+    if (p >= spki.len or spki[p] != 0x03) return null; // BIT STRING
+    p += 1;
+    const bs_len = derLen(spki, &p) orelse return null;
+    if (bs_len < 1 or p >= spki.len or spki[p] != 0x00) return null; // unused-bits = 0
+    const start = p + 1;
+    const stop = p + bs_len;
+    if (stop > spki.len) return null;
+    return spki[start..stop];
+}
+
+fn derTag(b: []const u8, p: *usize, tag: u8) bool {
+    if (p.* >= b.len or b[p.*] != tag) return false;
+    p.* += 1;
+    return true;
+}
+fn derLen(b: []const u8, p: *usize) ?usize {
+    if (p.* >= b.len) return null;
+    const first = b[p.*];
+    p.* += 1;
+    if (first < 0x80) return first;
+    const n = first & 0x7f;
+    if (n == 0 or n > 4 or p.* + n > b.len) return null;
+    var len: usize = 0;
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        len = (len << 8) | b[p.*];
+        p.* += 1;
+    }
+    return len;
+}
+
+test "dkim tag + canon mode parsing" {
+    try std.testing.expectEqualStrings("rsa", dkimTag("v=DKIM1; k=rsa; p=ABC", "k").?);
+    try std.testing.expectEqualStrings("ABC", dkimTag("v=DKIM1; k=rsa; p=ABC", "p").?);
+    try std.testing.expect(headerCanonRelaxed("relaxed/relaxed"));
+    try std.testing.expect(!headerCanonRelaxed("simple/simple"));
+    try std.testing.expect(bodyCanonRelaxed("relaxed/relaxed"));
+    try std.testing.expect(!bodyCanonRelaxed("relaxed/simple"));
+}
 
 /// DKIM signer for outgoing mail
 pub const DKIMSigner = struct {

@@ -126,7 +126,7 @@ fn findHeaderValue(header_block: []const u8, name: []const u8) ?[]const u8 {
 /// Append `name:value` with relaxed value canonicalization (no trailing CRLF).
 /// `name` is already lowercase. Relaxed: unfold + collapse WSP (incl CR/LF) to
 /// a single space, strip leading/trailing WSP, retain the colon.
-fn appendCanonHeader(allocator: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, raw_value: []const u8) !void {
+pub fn appendCanonHeader(allocator: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, raw_value: []const u8) !void {
     try out.appendSlice(allocator, name);
     try out.append(allocator, ':');
     var started = false; // have we emitted a non-WSP char yet
@@ -148,7 +148,7 @@ fn appendCanonHeader(allocator: std.mem.Allocator, out: *std.ArrayList(u8), name
 /// Relaxed body canonicalization (RFC 6376 §3.4.4): collapse WSP runs to one
 /// space, strip trailing WSP per line, remove trailing empty lines, terminate
 /// non-empty body with a single CRLF.
-fn canonBodyRelaxed(allocator: std.mem.Allocator, body: []const u8, out: *std.ArrayList(u8)) !void {
+pub fn canonBodyRelaxed(allocator: std.mem.Allocator, body: []const u8, out: *std.ArrayList(u8)) !void {
     var tmp = std.ArrayList(u8).empty;
     defer tmp.deinit(allocator);
     // process line by line (split on \n; strip a trailing \r)
