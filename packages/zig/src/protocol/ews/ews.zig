@@ -3,6 +3,7 @@ const logger = @import("../../core/logger.zig");
 // NOTE: for a future standalone `zig-ews`, reach the mailbox/store through a
 // callback interface on Context instead of importing these directly.
 const database = @import("../../storage/database.zig");
+const caldav_store = @import("../../storage/caldav_store.zig");
 const fs_compat = @import("../../core/fs_compat.zig");
 const time_compat = @import("../../core/time_compat.zig");
 const outbound = @import("../../delivery/outbound.zig");
@@ -33,6 +34,8 @@ pub const Context = struct {
     hostname: []const u8,
     /// Database (IMAP UID mapping for stable item ids).
     db: *database.Database,
+    /// CalDAV/CardDAV store backing the Calendar and Contacts folders.
+    store: ?*caldav_store.CalDavStore = null,
     /// Outbound delivery method (SES on AWS, direct MX on Hetzner/self-host).
     delivery_method: config.DeliveryMethod = .direct,
     /// AWS SES region (only used when delivery_method == .ses).
@@ -120,7 +123,7 @@ pub fn handleSoap(ctx: *Context, soap: []const u8) !Response {
     if (std.mem.eql(u8, op, "CreateItem")) return createItem(ctx, soap);
     if (std.mem.eql(u8, op, "SendItem")) return sendItem(ctx, soap);
     if (std.mem.eql(u8, op, "FindFolder")) return findFolder(ctx, soap);
-    if (std.mem.eql(u8, op, "FindItem")) return emptyFindItem(ctx);
+    if (std.mem.eql(u8, op, "FindItem")) return findItem(ctx, soap);
     if (std.mem.eql(u8, op, "GetUserConfiguration")) return userConfigurationFault(ctx);
     if (std.mem.eql(u8, op, "GetUserOofSettings")) return oofSettings(ctx);
     if (std.mem.eql(u8, op, "Subscribe")) return subscribe(ctx);
@@ -287,24 +290,65 @@ fn syncFolderItems(ctx: *Context, soap: []const u8) !Response {
 
     if (!has_state) {
         if (folderById(folder_id)) |folder| {
-            if (folder.mailbox) |mailbox| {
-                var arena = std.heap.ArenaAllocator.init(a);
-                defer arena.deinit();
-                const aa = arena.allocator();
-                var items = std.ArrayList(MailItem).empty;
-                collectMail(aa, ctx, mailbox, &items) catch {};
-                for (items.items) |it| {
-                    const id = std.fmt.allocPrint(aa, "{s}:{s}", .{ folder_id, it.basename }) catch continue;
-                    try buf.print(a,
-                        \\<t:Create><t:Message><t:ItemId Id="{s}" ChangeKey="ck0"/></t:Message></t:Create>
-                    , .{id});
-                }
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const aa = arena.allocator();
+            switch (folder.kind) {
+                .mail => if (folder.mailbox) |mailbox| {
+                    var items = std.ArrayList(MailItem).empty;
+                    collectMail(aa, ctx, mailbox, &items) catch {};
+                    for (items.items) |it| {
+                        const id = std.fmt.allocPrint(aa, "{s}:{s}", .{ folder_id, it.basename }) catch continue;
+                        try buf.print(a,
+                            \\<t:Create><t:Message><t:ItemId Id="{s}" ChangeKey="ck0"/></t:Message></t:Create>
+                        , .{id});
+                    }
+                },
+                .calendar => try appendCalendarSyncCreates(&buf, a, ctx),
+                .contacts => try appendContactSyncCreates(&buf, a, ctx),
             }
         }
     }
 
     try buf.appendSlice(a, "</m:Changes></m:SyncFolderItemsResponseMessage></m:ResponseMessages></m:SyncFolderItemsResponse>");
     return Response{ .body = try envelope(ctx.allocator, buf.items) };
+}
+
+/// Emit a `<t:Create><t:CalendarItem><t:ItemId/></t:CalendarItem></t:Create>`
+/// for every event across all of the user's calendars. The item id is
+/// `calendar:<event.id>` (a globally-unique store id GetItem can resolve).
+fn appendCalendarSyncCreates(buf: *std.ArrayList(u8), a: std.mem.Allocator, ctx: *Context) !void {
+    const store = ctx.store orelse return;
+    const uid = store.getOrCreateUserId(ctx.username) catch return;
+    const cals = store.getUserCalendars(uid) catch return;
+    defer store.allocator.free(cals);
+    for (cals) |cal| {
+        const events = store.getCalendarEvents(cal.id) catch continue;
+        defer store.allocator.free(events);
+        for (events) |ev| {
+            try buf.print(a,
+                \\<t:Create><t:CalendarItem><t:ItemId Id="calendar:{d}" ChangeKey="ck0"/></t:CalendarItem></t:Create>
+            , .{ev.id});
+        }
+    }
+}
+
+/// Emit a `<t:Create><t:Contact><t:ItemId/></t:Contact></t:Create>` for every
+/// contact across all of the user's address books. Id is `contacts:<contact.id>`.
+fn appendContactSyncCreates(buf: *std.ArrayList(u8), a: std.mem.Allocator, ctx: *Context) !void {
+    const store = ctx.store orelse return;
+    const uid = store.getOrCreateUserId(ctx.username) catch return;
+    const abs = store.getUserAddressBooks(uid) catch return;
+    defer store.allocator.free(abs);
+    for (abs) |ab| {
+        const contacts = store.getAddressBookContacts(ab.id) catch continue;
+        defer store.allocator.free(contacts);
+        for (contacts) |c| {
+            try buf.print(a,
+                \\<t:Create><t:Contact><t:ItemId Id="contacts:{d}" ChangeKey="ck0"/></t:Contact></t:Create>
+            , .{c.id});
+        }
+    }
 }
 
 /// GetItem: return the message content for each requested ItemId.
@@ -335,8 +379,14 @@ fn getItem(ctx: *Context, soap: []const u8) !Response {
 fn appendItemMessage(buf: *std.ArrayList(u8), aa: std.mem.Allocator, ctx: *Context, id: []const u8) !void {
     const colon = std.mem.indexOfScalar(u8, id, ':') orelse return error.BadId;
     const folder_id = id[0..colon];
-    const basename = id[colon + 1 ..];
+    const rest = id[colon + 1 ..];
     const folder = folderById(folder_id) orelse return error.BadId;
+    switch (folder.kind) {
+        .calendar => return appendCalendarItem(buf, aa, ctx, id, rest),
+        .contacts => return appendContactItem(buf, aa, ctx, id, rest),
+        .mail => {},
+    }
+    const basename = rest;
     const mailbox = folder.mailbox orelse return error.BadId;
 
     const found = readMailFile(aa, ctx, mailbox, basename) orelse return error.NotFound;
@@ -371,6 +421,129 @@ fn appendItemMessage(buf: *std.ArrayList(u8), aa: std.mem.Allocator, ctx: *Conte
     try buf.print(a, "<t:From><t:Mailbox><t:Name>{s}</t:Name><t:EmailAddress>{s}</t:EmailAddress></t:Mailbox></t:From>", .{ xmlEscape(aa, from.name), xmlEscape(aa, from.email) });
     try buf.print(a, "<t:IsRead>{s}</t:IsRead>", .{if (found.seen) "true" else "false"});
     try buf.appendSlice(a, "</t:Message></m:Items></m:GetItemResponseMessage>");
+}
+
+// ----------------------------------------------------------------------------
+// Calendar + Contacts item serialization (from the CalDAV/CardDAV store).
+// Element order follows the EWS CalendarItemType/ContactItemType xs:sequence —
+// all inherited ItemType elements first, then the type-specific ones. macOS
+// parses strictly, so order matters.
+// ----------------------------------------------------------------------------
+
+/// Write a complete `<t:CalendarItem>…</t:CalendarItem>` element.
+fn writeCalendarItemEl(buf: *std.ArrayList(u8), aa: std.mem.Allocator, a: std.mem.Allocator, full_id: []const u8, ev: caldav_store.Event) !void {
+    const start = ewsDate(aa, ev.dtstart);
+    const default_len: i64 = if (ev.all_day) 86400 else 3600;
+    const end = ewsDate(aa, ev.dtend orelse (ev.dtstart + default_len));
+
+    try buf.appendSlice(a, "<t:CalendarItem>");
+    try buf.print(a, "<t:ItemId Id=\"{s}\" ChangeKey=\"ck0\"/>", .{xmlEscape(aa, full_id)});
+    try buf.appendSlice(a, "<t:ItemClass>IPM.Appointment</t:ItemClass>");
+    try buf.print(a, "<t:Subject>{s}</t:Subject>", .{xmlEscape(aa, ev.summary)});
+    try buf.print(a, "<t:Body BodyType=\"Text\">{s}</t:Body>", .{xmlEscape(aa, ev.description orelse "")});
+    try buf.appendSlice(a, "<t:HasAttachments>false</t:HasAttachments>");
+    // CalendarItemType: UID, Start, End, IsAllDayEvent, LegacyFreeBusyStatus, Location, Organizer.
+    try buf.print(a, "<t:UID>{s}</t:UID>", .{xmlEscape(aa, ev.uid)});
+    try buf.print(a, "<t:Start>{s}</t:Start>", .{start});
+    try buf.print(a, "<t:End>{s}</t:End>", .{end});
+    try buf.print(a, "<t:IsAllDayEvent>{s}</t:IsAllDayEvent>", .{if (ev.all_day) "true" else "false"});
+    try buf.appendSlice(a, "<t:LegacyFreeBusyStatus>Busy</t:LegacyFreeBusyStatus>");
+    if (ev.location) |loc| if (loc.len > 0) try buf.print(a, "<t:Location>{s}</t:Location>", .{xmlEscape(aa, loc)});
+    if (ev.organizer) |org| {
+        var oaddr = parseEmail(org);
+        if (std.mem.startsWith(u8, oaddr.email, "mailto:")) oaddr.email = oaddr.email["mailto:".len..];
+        if (oaddr.email.len > 0)
+            try buf.print(a, "<t:Organizer><t:Mailbox><t:Name>{s}</t:Name><t:EmailAddress>{s}</t:EmailAddress></t:Mailbox></t:Organizer>", .{ xmlEscape(aa, oaddr.name), xmlEscape(aa, oaddr.email) });
+    }
+    try buf.appendSlice(a, "</t:CalendarItem>");
+}
+
+/// Write a complete `<t:Contact>…</t:Contact>` element.
+fn writeContactEl(buf: *std.ArrayList(u8), aa: std.mem.Allocator, a: std.mem.Allocator, full_id: []const u8, c: caldav_store.Contact, emails: []caldav_store.EmailAddress, phones: []caldav_store.PhoneNumber) !void {
+    try buf.appendSlice(a, "<t:Contact>");
+    try buf.print(a, "<t:ItemId Id=\"{s}\" ChangeKey=\"ck0\"/>", .{xmlEscape(aa, full_id)});
+    try buf.appendSlice(a, "<t:ItemClass>IPM.Contact</t:ItemClass>");
+    try buf.print(a, "<t:Subject>{s}</t:Subject>", .{xmlEscape(aa, c.full_name)});
+    try buf.appendSlice(a, "<t:HasAttachments>false</t:HasAttachments>");
+    // ContactItemType: FileAs, DisplayName, GivenName, Nickname, CompanyName,
+    // EmailAddresses, PhoneNumbers, JobTitle, Surname.
+    try buf.print(a, "<t:FileAs>{s}</t:FileAs>", .{xmlEscape(aa, c.full_name)});
+    try buf.print(a, "<t:DisplayName>{s}</t:DisplayName>", .{xmlEscape(aa, c.full_name)});
+    if (c.given_name) |gn| if (gn.len > 0) try buf.print(a, "<t:GivenName>{s}</t:GivenName>", .{xmlEscape(aa, gn)});
+    if (c.nickname) |nn| if (nn.len > 0) try buf.print(a, "<t:Nickname>{s}</t:Nickname>", .{xmlEscape(aa, nn)});
+    if (c.organization) |org| if (org.len > 0) try buf.print(a, "<t:CompanyName>{s}</t:CompanyName>", .{xmlEscape(aa, org)});
+    if (emails.len > 0) {
+        try buf.appendSlice(a, "<t:EmailAddresses>");
+        var n: usize = 0;
+        for (emails) |em| {
+            if (n >= 3 or em.email.len == 0) continue;
+            n += 1;
+            try buf.print(a, "<t:Entry Key=\"EmailAddress{d}\">{s}</t:Entry>", .{ n, xmlEscape(aa, em.email) });
+        }
+        try buf.appendSlice(a, "</t:EmailAddresses>");
+    }
+    if (phones.len > 0) {
+        try buf.appendSlice(a, "<t:PhoneNumbers>");
+        var home: u8 = 0;
+        var work: u8 = 0;
+        var mobile: u8 = 0;
+        var fax: u8 = 0;
+        var other: u8 = 0;
+        for (phones) |ph| {
+            if (ph.number.len == 0) continue;
+            const key: ?[]const u8 = switch (ph.phone_type) {
+                .home => kk: {
+                    home += 1;
+                    break :kk @as(?[]const u8, if (home == 1) "HomePhone" else if (home == 2) "HomePhone2" else null);
+                },
+                .work => kk: {
+                    work += 1;
+                    break :kk @as(?[]const u8, if (work == 1) "BusinessPhone" else if (work == 2) "BusinessPhone2" else null);
+                },
+                .mobile => kk: {
+                    mobile += 1;
+                    break :kk @as(?[]const u8, if (mobile == 1) "MobilePhone" else null);
+                },
+                .fax => kk: {
+                    fax += 1;
+                    break :kk @as(?[]const u8, if (fax == 1) "HomeFax" else if (fax == 2) "BusinessFax" else null);
+                },
+                .other => kk: {
+                    other += 1;
+                    break :kk @as(?[]const u8, if (other == 1) "OtherTelephone" else null);
+                },
+            };
+            if (key) |k| try buf.print(a, "<t:Entry Key=\"{s}\">{s}</t:Entry>", .{ k, xmlEscape(aa, ph.number) });
+        }
+        try buf.appendSlice(a, "</t:PhoneNumbers>");
+    }
+    if (c.title) |t| if (t.len > 0) try buf.print(a, "<t:JobTitle>{s}</t:JobTitle>", .{xmlEscape(aa, t)});
+    if (c.family_name) |fam| if (fam.len > 0) try buf.print(a, "<t:Surname>{s}</t:Surname>", .{xmlEscape(aa, fam)});
+    try buf.appendSlice(a, "</t:Contact>");
+}
+
+/// GetItem for `calendar:<event-id>`.
+fn appendCalendarItem(buf: *std.ArrayList(u8), aa: std.mem.Allocator, ctx: *Context, full_id: []const u8, rest: []const u8) !void {
+    const store = ctx.store orelse return error.NotFound;
+    const ev_id = std.fmt.parseInt(u64, rest, 10) catch return error.BadId;
+    const ev = store.getEvent(ev_id) orelse return error.NotFound;
+    const a = ctx.allocator;
+    try buf.appendSlice(a, "<m:GetItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode><m:Items>");
+    try writeCalendarItemEl(buf, aa, a, full_id, ev);
+    try buf.appendSlice(a, "</m:Items></m:GetItemResponseMessage>");
+}
+
+/// GetItem for `contacts:<contact-id>`.
+fn appendContactItem(buf: *std.ArrayList(u8), aa: std.mem.Allocator, ctx: *Context, full_id: []const u8, rest: []const u8) !void {
+    const store = ctx.store orelse return error.NotFound;
+    const c_id = std.fmt.parseInt(u64, rest, 10) catch return error.BadId;
+    const c = store.getContact(c_id) orelse return error.NotFound;
+    const a = ctx.allocator;
+    const emails = store.getContactEmails(c.id);
+    const phones = store.getContactPhones(c.id);
+    try buf.appendSlice(a, "<m:GetItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode><m:Items>");
+    try writeContactEl(buf, aa, a, full_id, c, emails, phones);
+    try buf.appendSlice(a, "</m:Items></m:GetItemResponseMessage>");
 }
 
 // ---------------------------------------------------------------------------
@@ -950,11 +1123,75 @@ fn findFolder(ctx: *Context, soap: []const u8) !Response {
     return Response{ .body = try envelope(ctx.allocator, buf.items) };
 }
 
-fn emptyFindItem(ctx: *Context) !Response {
-    const inner =
-        \\<m:FindItemResponse><m:ResponseMessages><m:FindItemResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:RootFolder TotalItemsInView="0" IncludesLastItemInRange="true"><t:Items/></m:RootFolder></m:FindItemResponseMessage></m:ResponseMessages></m:FindItemResponse>
-    ;
-    return Response{ .body = try envelope(ctx.allocator, inner) };
+/// FindItem: macOS Calendar/Contacts may enumerate via FindItem rather than
+/// SyncFolderItems+GetItem. Return the fully-serialized items for the
+/// calendar/contacts parent folder; mail folders stay empty (they use
+/// SyncFolderItems). The id scheme matches GetItem (calendar:<id>/contacts:<id>).
+fn findItem(ctx: *Context, soap: []const u8) !Response {
+    // First (Distinguished)FolderId inside ParentFolderIds.
+    const needle = "FolderId Id=\"";
+    const parent: []const u8 = if (std.mem.indexOf(u8, soap, needle)) |p| blk: {
+        const vs = p + needle.len;
+        const ve = std.mem.indexOfScalarPos(u8, soap, vs, '"') orelse break :blk "";
+        break :blk soap[vs..ve];
+    } else "";
+
+    const a = ctx.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var items = std.ArrayList(u8).empty; // serialized items, built on the arena
+    var count: usize = 0;
+
+    if (folderById(parent)) |folder| {
+        if (ctx.store) |store| switch (folder.kind) {
+            .calendar => {
+                const uid = store.getOrCreateUserId(ctx.username) catch 0;
+                if (uid != 0) {
+                    const cals = store.getUserCalendars(uid) catch &[_]caldav_store.Calendar{};
+                    defer store.allocator.free(cals);
+                    for (cals) |cal| {
+                        const evs = store.getCalendarEvents(cal.id) catch &[_]caldav_store.Event{};
+                        defer store.allocator.free(evs);
+                        for (evs) |ev| {
+                            const fid = std.fmt.allocPrint(aa, "calendar:{d}", .{ev.id}) catch continue;
+                            writeCalendarItemEl(&items, aa, aa, fid, ev) catch continue;
+                            count += 1;
+                        }
+                    }
+                }
+            },
+            .contacts => {
+                const uid = store.getOrCreateUserId(ctx.username) catch 0;
+                if (uid != 0) {
+                    const abs = store.getUserAddressBooks(uid) catch &[_]caldav_store.AddressBook{};
+                    defer store.allocator.free(abs);
+                    for (abs) |ab| {
+                        const cts = store.getAddressBookContacts(ab.id) catch &[_]caldav_store.Contact{};
+                        defer store.allocator.free(cts);
+                        for (cts) |c| {
+                            const fid = std.fmt.allocPrint(aa, "contacts:{d}", .{c.id}) catch continue;
+                            const emails = store.getContactEmails(c.id);
+                            const phones = store.getContactPhones(c.id);
+                            writeContactEl(&items, aa, aa, fid, c, emails, phones) catch continue;
+                            count += 1;
+                        }
+                    }
+                }
+            },
+            .mail => {},
+        };
+    }
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(a);
+    try buf.print(a,
+        \\<m:FindItemResponse><m:ResponseMessages><m:FindItemResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:RootFolder TotalItemsInView="{d}" IncludesLastItemInRange="true"><t:Items>
+    , .{count});
+    try buf.appendSlice(a, items.items);
+    try buf.appendSlice(a, "</t:Items></m:RootFolder></m:FindItemResponseMessage></m:ResponseMessages></m:FindItemResponse>");
+    return Response{ .body = try envelope(a, buf.items) };
 }
 
 fn oofSettings(ctx: *Context) !Response {

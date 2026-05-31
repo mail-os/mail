@@ -2361,6 +2361,7 @@ const TlsCalDavSession = struct {
             .local_part = local_part,
             .hostname = config.public_hostname,
             .db = self.auth_backend.db,
+            .store = self.store,
             .delivery_method = config.delivery_method,
             .ses_region = config.ses_region,
         };
