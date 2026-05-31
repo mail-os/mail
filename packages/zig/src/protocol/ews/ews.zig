@@ -935,6 +935,11 @@ fn ewsFolderToMailbox(folder: []const u8) []const u8 {
 /// via the server's outbound path (SES on AWS, direct MX on Hetzner), and save a
 /// copy to Sent (or Drafts for MessageDisposition="SaveOnly").
 fn createItem(ctx: *Context, soap: []const u8) !Response {
+    // Calendar/Contacts creates carry a <t:CalendarItem>/<t:Contact> instead of
+    // a <t:Message>; route those to the CalDAV/CardDAV store.
+    if (elementText(soap, "CalendarItem") != null) return createCalendarItem(ctx, soap);
+    if (elementText(soap, "Contact") != null) return createContactItem(ctx, soap);
+
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1036,6 +1041,206 @@ fn createItem(ctx: *Context, soap: []const u8) !Response {
         \\<m:CreateItemResponse><m:ResponseMessages><m:CreateItemResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Items><t:Message><t:ItemId Id="{s}:{s}" ChangeKey="ck0"/></t:Message></m:Items></m:CreateItemResponseMessage></m:ResponseMessages></m:CreateItemResponse>
     , .{ item_folder, item_basename });
     return Response{ .body = try envelope(ctx.allocator, buf.items) };
+}
+
+// ----------------------------------------------------------------------------
+// CreateItem for Calendar + Contacts (writes to the CalDAV/CardDAV store).
+// The store stores the passed string pointers directly (no dup), so every
+// dynamic string handed to createEvent/createContact is duped on the store's
+// long-lived allocator; folder-name literals are static and passed as-is.
+// ----------------------------------------------------------------------------
+
+/// Parse an EWS dateTime ("2026-06-01T15:00:00Z" or with ±HH:MM) to unix secs.
+fn parseEwsDate(s_in: []const u8) i64 {
+    const s = std.mem.trim(u8, s_in, " \t\r\n");
+    if (s.len < 19) return 0;
+    const year = std.fmt.parseInt(i64, s[0..4], 10) catch return 0;
+    const month = std.fmt.parseInt(i64, s[5..7], 10) catch return 0;
+    const day = std.fmt.parseInt(i64, s[8..10], 10) catch return 0;
+    const hh = std.fmt.parseInt(i64, s[11..13], 10) catch return 0;
+    const mm = std.fmt.parseInt(i64, s[14..16], 10) catch return 0;
+    const ss = std.fmt.parseInt(i64, s[17..19], 10) catch return 0;
+    var epoch = daysFromCivil(year, month, day) * 86400 + hh * 3600 + mm * 60 + ss;
+    if (s.len >= 25 and (s[19] == '+' or s[19] == '-')) {
+        const tz = s[19..];
+        const oh = std.fmt.parseInt(i64, tz[1..3], 10) catch 0;
+        const om = std.fmt.parseInt(i64, tz[4..6], 10) catch 0;
+        const off = oh * 3600 + om * 60;
+        epoch += if (tz[0] == '-') off else -off;
+    }
+    return epoch;
+}
+
+const Entry = struct { key: []const u8, value: []const u8 };
+
+/// Collect `<t:Entry Key="…">value</t:Entry>` pairs inside a dictionary block
+/// (EmailAddresses / PhoneNumbers).
+fn collectEntries(block: []const u8, out: *std.ArrayList(Entry), a: std.mem.Allocator) !void {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, block, i, '<')) |lt| {
+        if (lt + 1 >= block.len or block[lt + 1] == '/' or block[lt + 1] == '!' or block[lt + 1] == '?') {
+            i = lt + 1;
+            continue;
+        }
+        var j = lt + 1;
+        while (j < block.len and block[j] != '>' and block[j] != ' ' and block[j] != '/' and
+            block[j] != '\t' and block[j] != '\r' and block[j] != '\n') j += 1;
+        var tag = block[lt + 1 .. j];
+        if (std.mem.indexOfScalar(u8, tag, ':')) |c| tag = tag[c + 1 ..];
+        if (!std.mem.eql(u8, tag, "Entry")) {
+            i = j;
+            continue;
+        }
+        const gt = std.mem.indexOfScalarPos(u8, block, j, '>') orelse break;
+        const key = attrValue(block[lt .. gt + 1], "Key") orelse "";
+        if (gt > 0 and block[gt - 1] == '/') {
+            i = gt + 1;
+            continue;
+        }
+        const close = std.mem.indexOfPos(u8, block, gt + 1, "<") orelse break;
+        try out.append(a, .{ .key = key, .value = std.mem.trim(u8, block[gt + 1 .. close], " \t\r\n") });
+        i = close + 1;
+    }
+}
+
+fn phoneTypeFromKey(key: []const u8) caldav_store.PhoneNumber.PhoneType {
+    if (std.mem.indexOf(u8, key, "Mobile") != null or std.mem.indexOf(u8, key, "Cell") != null) return .mobile;
+    if (std.mem.indexOf(u8, key, "Business") != null or std.mem.indexOf(u8, key, "Work") != null) return .work;
+    if (std.mem.indexOf(u8, key, "Fax") != null) return .fax;
+    if (std.mem.indexOf(u8, key, "Home") != null) return .home;
+    return .other;
+}
+
+/// xmlUnescape an element's inner text onto `sa`, or null if empty/absent.
+fn dupOpt(sa: std.mem.Allocator, el: []const u8, name: []const u8) ?[]const u8 {
+    const v = elementText(el, name) orelse return null;
+    if (v.len == 0) return null;
+    const u = xmlUnescape(sa, v) catch return null;
+    return if (u.len == 0) null else u;
+}
+
+fn resolveCalendarId(ctx: *Context) ?u64 {
+    const store = ctx.store orelse return null;
+    const uid = store.getOrCreateUserId(ctx.username) catch return null;
+    const cals = store.getUserCalendars(uid) catch return null;
+    defer store.allocator.free(cals);
+    if (cals.len > 0) return cals[0].id;
+    return store.createCalendar(uid, "Calendar", null) catch null;
+}
+
+fn resolveAddressBookId(ctx: *Context) ?u64 {
+    const store = ctx.store orelse return null;
+    const uid = store.getOrCreateUserId(ctx.username) catch return null;
+    const abs = store.getUserAddressBooks(uid) catch return null;
+    defer store.allocator.free(abs);
+    if (abs.len > 0) return abs[0].id;
+    return store.createAddressBook(uid, "Contacts", null) catch null;
+}
+
+fn createItemError(ctx: *Context) !Response {
+    const inner =
+        \\<m:CreateItemResponse><m:ResponseMessages><m:CreateItemResponseMessage ResponseClass="Error"><m:MessageText>Could not create item</m:MessageText><m:ResponseCode>ErrorInternalServerError</m:ResponseCode></m:CreateItemResponseMessage></m:ResponseMessages></m:CreateItemResponse>
+    ;
+    return Response{ .body = try envelope(ctx.allocator, inner) };
+}
+
+fn createItemOk(ctx: *Context, item_tag: []const u8, full_id: []const u8) !Response {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(ctx.allocator);
+    const a = ctx.allocator;
+    try buf.print(a,
+        \\<m:CreateItemResponse><m:ResponseMessages><m:CreateItemResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Items><t:{s}><t:ItemId Id="{s}" ChangeKey="ck0"/></t:{s}></m:Items></m:CreateItemResponseMessage></m:ResponseMessages></m:CreateItemResponse>
+    , .{ item_tag, full_id, item_tag });
+    return Response{ .body = try envelope(a, buf.items) };
+}
+
+/// CreateItem carrying a <t:CalendarItem> → store.createEvent.
+fn createCalendarItem(ctx: *Context, soap: []const u8) !Response {
+    const store = ctx.store orelse return createItemError(ctx);
+    const el = elementText(soap, "CalendarItem") orelse return createItemError(ctx);
+    const sa = store.allocator;
+    const cal_id = resolveCalendarId(ctx) orelse return createItemError(ctx);
+
+    const subject = xmlUnescape(sa, elementText(el, "Subject") orelse "(no title)") catch return createItemError(ctx);
+    const body = xmlUnescape(sa, elementText(el, "Body") orelse "") catch "";
+    const location = xmlUnescape(sa, elementText(el, "Location") orelse "") catch "";
+    const start = parseEwsDate(elementText(el, "Start") orelse "");
+    const end_t = parseEwsDate(elementText(el, "End") orelse "");
+    const all_day = std.mem.eql(u8, elementText(el, "IsAllDayEvent") orelse "false", "true");
+    const uid = std.fmt.allocPrint(sa, "ews-{d}-{d}@{s}", .{ time_compat.timestamp(), send_seq.fetchAdd(1, .monotonic), ctx.hostname }) catch return createItemError(ctx);
+
+    const ev_id = store.createEvent(cal_id, .{
+        .uid = uid,
+        .summary = subject,
+        .description = if (body.len > 0) body else null,
+        .location = if (location.len > 0) location else null,
+        .dtstart = if (start > 0) start else time_compat.timestamp(),
+        .dtend = if (end_t > 0) end_t else null,
+        .all_day = all_day,
+    }) catch return createItemError(ctx);
+
+    logger.info("EWS CreateItem CalendarItem: id={d} cal={d} subj_len={d} start={d} end={d}", .{ ev_id, cal_id, subject.len, start, end_t });
+
+    const full_id = std.fmt.allocPrint(ctx.allocator, "calendar:{d}", .{ev_id}) catch return createItemError(ctx);
+    defer ctx.allocator.free(full_id);
+    return createItemOk(ctx, "CalendarItem", full_id);
+}
+
+/// CreateItem carrying a <t:Contact> → store.createContact (+ emails/phones).
+fn createContactItem(ctx: *Context, soap: []const u8) !Response {
+    const store = ctx.store orelse return createItemError(ctx);
+    const el = elementText(soap, "Contact") orelse return createItemError(ctx);
+    const sa = store.allocator;
+    const ab_id = resolveAddressBookId(ctx) orelse return createItemError(ctx);
+
+    // Request-scoped scratch for the entry lists; the strings themselves live on
+    // `sa` so they outlive this request inside the store.
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const display = elementText(el, "DisplayName") orelse elementText(el, "FileAs") orelse "Unnamed";
+    const full_name = xmlUnescape(sa, display) catch return createItemError(ctx);
+
+    var emails = std.ArrayList(caldav_store.CalDavStore.EmailData).empty;
+    var phones = std.ArrayList(caldav_store.CalDavStore.PhoneData).empty;
+    if (elementText(el, "EmailAddresses")) |eb| {
+        var entries = std.ArrayList(Entry).empty;
+        collectEntries(eb, &entries, aa) catch {};
+        for (entries.items) |en| {
+            if (en.value.len == 0) continue;
+            const dup = xmlUnescape(sa, en.value) catch continue;
+            emails.append(aa, .{ .email = dup, .email_type = .other, .is_primary = emails.items.len == 0 }) catch {};
+        }
+    }
+    if (elementText(el, "PhoneNumbers")) |pb| {
+        var entries = std.ArrayList(Entry).empty;
+        collectEntries(pb, &entries, aa) catch {};
+        for (entries.items) |en| {
+            if (en.value.len == 0) continue;
+            const dup = xmlUnescape(sa, en.value) catch continue;
+            phones.append(aa, .{ .number = dup, .phone_type = phoneTypeFromKey(en.key), .is_primary = phones.items.len == 0 }) catch {};
+        }
+    }
+
+    const uid = std.fmt.allocPrint(sa, "ews-{d}-{d}@{s}", .{ time_compat.timestamp(), send_seq.fetchAdd(1, .monotonic), ctx.hostname }) catch return createItemError(ctx);
+    const c_id = store.createContact(ab_id, .{
+        .uid = uid,
+        .full_name = full_name,
+        .given_name = dupOpt(sa, el, "GivenName"),
+        .family_name = dupOpt(sa, el, "Surname"),
+        .nickname = dupOpt(sa, el, "Nickname"),
+        .organization = dupOpt(sa, el, "CompanyName"),
+        .title = dupOpt(sa, el, "JobTitle"),
+        .emails = emails.items,
+        .phones = phones.items,
+    }) catch return createItemError(ctx);
+
+    logger.info("EWS CreateItem Contact: id={d} ab={d} name_len={d} emails={d} phones={d}", .{ c_id, ab_id, full_name.len, emails.items.len, phones.items.len });
+
+    const full_id = std.fmt.allocPrint(ctx.allocator, "contacts:{d}", .{c_id}) catch return createItemError(ctx);
+    defer ctx.allocator.free(full_id);
+    return createItemOk(ctx, "Contact", full_id);
 }
 
 /// SendItem: send previously-saved draft(s) referenced by ItemId. Reads each
