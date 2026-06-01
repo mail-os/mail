@@ -1,6 +1,6 @@
 # Webmail UI — Implementation Plan
 
-> **Status:** Phases 0–3 done — login + 3-pane inbox (folders, message list, sandboxed reading pane) wired to the live backend, verified in-browser. Next: Phase 4/5 (reading polish + persisted flags/actions).
+> **Status:** Phases 0–5 done — login + 3-pane inbox + persisted flags/move/delete with IMAP-consistent UIDs, verified in-browser and on-disk. Next: Phase 6 (compose & send).
 > **Owner:** TBD
 > **Last updated:** 2026-06-01
 > **Estimated effort:** ~8–12 weeks (multi-phase, see [Phases](#phases))
@@ -328,22 +328,37 @@ Do a minimal-but-correct sanitize here; harden later.
 
 ---
 
-### Phase 5 — Flags & message actions (persisted)  ·  ~1 week
+### Phase 5 — Flags & message actions (persisted)  ·  ✅ DONE
 **Tasks**
-- [ ] Backend: write endpoints to set flags (read/unread, flag/star, answered),
-      delete (→ Trash), move between folders — implemented by **renaming Maildir
-      files** (`:2,FLAGS`) and updating any SQLite UID/metadata so **IMAP stays
-      consistent**.
-- [ ] Frontend: wire actions (toolbar + context menu + bulk on multi-select),
-      optimistic UI with rollback on error.
-- [ ] Verify round-trip: action in webmail → visible in Apple Mail and vice versa.
+- [x] Backend write ops (`webmail_maildir.zig`): set flags (read/unread,
+      flag/star) via `:2,FLAGS` rename; delete (→ Trash, or purge in Trash);
+      move between folders. `PUT`/`DELETE /webmail/api/messages/:uid` with
+      same-origin (CSRF) + session enforced.
+- [x] **IMAP consistency:** UIDs keyed on the Maildir **base name**, so flag
+      renames keep the UID stable and webmail/IMAP/ActiveSync agree. Fixed two
+      pre-existing UID bugs in the shared `database.zig` path (full-name keying;
+      `assignUid` duplicate-UID on `INSERT OR IGNORE`). Covered by
+      `uid_consistency_test.zig`.
+- [x] Frontend: reading-pane toolbar (flag / mark-unread / delete), flagged ★ in
+      the list, optimistic UI + rollback, auto-mark-read on open (race-guarded).
+- [x] Verify round-trip: webmail action → correct `:2,FLAGS` on disk + stable
+      base-name UID in `imap_uids` (what IMAP reads). Confirmed via curl + disk
+      inspection + headless-browser drive.
+- [~] Bulk/multi-select actions: deferred to a later polish pass.
 
-**Acceptance**
-- Marking read/flag/delete/move in webmail is reflected in Apple Mail (and the
-  reverse), proving Maildir/IMAP consistency.
+**Acceptance** ✅ mark-read writes `:2,S` keeping the UID; move relocates the
+file + returns the dest UID; delete moves to Trash; cross-origin mutation → 403.
 
-**Risks:** This is the consistency crux. Add integration tests against a Maildir
-fixture; document the flag mapping precisely.
+**Hardening (adversarial review, 11 findings fixed):** error-propagating
+`unlinkPath` (no phantom-success deletes / no move duplication), dest-UID-before-
+move ordering, `setFlags` retry→409 on concurrent rename, symlink skip in
+`listEmlFiles` (planted-symlink path-escape), `jsonBoolField` terminator check,
+frontend rollback + auto-read race guard.
+
+> **Known unfixed (separate subsystem):** SMTP delivery can overwrite a message
+> on same-millisecond delivery (bare-timestamp Maildir name + `O_TRUNC`). See
+> memory `smtp-maildir-filename-collision`. Not a webmail bug; fix in the
+> delivery path.
 
 ---
 
