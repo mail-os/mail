@@ -35,6 +35,7 @@ const list_unsub = @import("features/list_unsubscribe.zig");
 const autoconfig_mod = @import("api/autoconfig.zig");
 const managesieve = @import("protocol/managesieve.zig");
 const milter = @import("protocol/milter.zig");
+const webmail_http = @import("api/webmail_http.zig");
 
 // Global shutdown flag
 var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -397,6 +398,24 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     }
     defer if (managesieve_server) |*ms| ms.deinit();
 
+    // Initialize Webmail HTTP server (browser client API). Requires auth+DB.
+    var webmail_server: ?webmail_http.WebmailHttpServer = null;
+    var webmail_thread: ?std.Thread = null;
+    if (cfg.enable_webmail) {
+        if (auth_ptr != null and db_ptr != null) {
+            const wm_config = webmail_http.WebmailHttpConfig{
+                .port = cfg.webmail_port,
+                .bind_host = "127.0.0.1",
+                .secure_cookies = cfg.webmail_secure_cookies,
+            };
+            webmail_server = webmail_http.WebmailHttpServer.init(allocator, wm_config, db_ptr.?, auth_ptr.?);
+            log.info("Webmail HTTP server configured on 127.0.0.1:{d}", .{cfg.webmail_port});
+        } else {
+            log.warn("Webmail enabled but auth/database are not — skipping webmail server", .{});
+        }
+    }
+    defer if (webmail_server) |*ws| ws.deinit();
+
     // Initialize Milter support
     _ = cfg.enable_milter; // Used by protocol.zig hooks
     if (cfg.enable_milter) {
@@ -505,11 +524,24 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         log.info("ManageSieve Server listening on 0.0.0.0:{d}", .{cfg.managesieve_port});
     }
 
+    // Start Webmail HTTP server in a separate thread
+    if (webmail_server) |*ws| {
+        webmail_thread = try std.Thread.spawn(.{}, struct {
+            fn run(wm_srv: *webmail_http.WebmailHttpServer) void {
+                wm_srv.start() catch |err| {
+                    std.log.err("Webmail HTTP server error: {}", .{err});
+                };
+            }
+        }.run, .{ws});
+        log.info("Webmail HTTP Server listening on 127.0.0.1:{d}", .{cfg.webmail_port});
+    }
+
     // Log startup summary
     log.info("Starting SMTP server...", .{});
     log.info("  IMAP enabled: {}", .{imap_server != null});
     log.info("  CalDAV enabled: {}", .{caldav_server != null});
     log.info("  ManageSieve enabled: {}", .{managesieve_server != null});
+    log.info("  Webmail HTTP enabled: {}", .{webmail_server != null});
     log.info("  Cluster mode: {}", .{enable_cluster});
     log.info("  Multi-tenancy: {}", .{tenant_manager != null});
     log.info("  Metrics: {}", .{smtp_metrics != null});
@@ -618,6 +650,13 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         if (managesieve_thread) |t| {
             t.join();
         }
+        // Stop Webmail HTTP server on error
+        if (webmail_server) |*ws| {
+            ws.stop();
+        }
+        if (webmail_thread) |t| {
+            t.join();
+        }
         return err;
     };
 
@@ -657,6 +696,15 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         log.info("ManageSieve server stopped", .{});
     }
     if (managesieve_thread) |t| {
+        t.join();
+    }
+
+    // Stop Webmail HTTP server on shutdown
+    if (webmail_server) |*ws| {
+        ws.stop();
+        log.info("Webmail HTTP server stopped", .{});
+    }
+    if (webmail_thread) |t| {
         t.join();
     }
 

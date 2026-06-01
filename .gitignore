@@ -29,6 +29,11 @@ Thumbs.db
 # Configuration overrides
 config.local.zig
 
+# Databases (runtime/test artifacts: smtp.db, caldav.db, devmail.db, …)
+*.db
+*.db-wal
+*.db-shm
+
 # Test data
 test-emails/
 *.eml

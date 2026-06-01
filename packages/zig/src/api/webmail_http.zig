@@ -1,0 +1,857 @@
+//! Webmail HTTP server.
+//!
+//! A small plain-HTTP/1.1 listener (thread-per-connection, mirroring the IMAP
+//! server's accept loop) that serves the webmail JSON API consumed by the stx
+//! frontend in packages/webmail. It is the only HTTP surface on the mail server.
+//!
+//! Routes (all JSON; see WEBMAIL.md "API Contract"):
+//!   POST /webmail/auth/login    {username,password} -> sets session cookie
+//!   POST /webmail/auth/logout   -> clears cookie
+//!   GET  /webmail/auth/me       -> {user}
+//!   GET  /webmail/api/folders   -> [{name,total,unread}]
+//!   GET  /webmail/api/messages?folder=&page=&per_page=  -> {items,total,page}
+//!   GET  /webmail/api/messages/:uid?folder=            -> {message}
+//!
+//! Auth: login verifies via AuthBackend (Argon2id) and mints a DB-backed
+//! session (webmail_session.zig). Subsequent requests carry an HttpOnly cookie.
+//! Mutating requests (currently just login/logout) are same-origin; CSRF
+//! enforcement for state-changing mailbox actions arrives with Phase 5.
+//!
+//! TLS: this listener is plain HTTP, intended to sit behind the existing TLS
+//! termination story (or localhost during dev). Production serving model is the
+//! Phase 9 decision in WEBMAIL.md.
+
+const std = @import("std");
+const socket = @import("../core/socket_compat.zig");
+const time_compat = @import("../core/time_compat.zig");
+const logger = @import("../core/logger.zig");
+const database = @import("../storage/database.zig");
+const auth_mod = @import("../auth/auth.zig");
+const session_mod = @import("webmail_session.zig");
+const maildir = @import("webmail_maildir.zig");
+const security = @import("../auth/security.zig");
+
+pub const WebmailHttpConfig = struct {
+    port: u16 = 8080,
+    bind_host: []const u8 = "127.0.0.1",
+    /// Add the Secure attribute to cookies (set false for local plain-HTTP dev).
+    secure_cookies: bool = true,
+    messages_per_page: usize = 50,
+    /// Max failed-or-not login attempts per IP within login_rate_window_seconds.
+    login_rate_max: u32 = 10,
+    login_rate_window_seconds: u64 = 300,
+};
+
+pub const WebmailHttpServer = struct {
+    allocator: std.mem.Allocator,
+    config: WebmailHttpConfig,
+    db: *database.Database,
+    auth: *auth_mod.AuthBackend,
+    sessions: session_mod.SessionManager,
+    /// Throttles login attempts per IP to blunt credential brute-forcing.
+    /// Its own internal mutex makes it safe to share across connection threads.
+    login_limiter: security.RateLimiter,
+    listener: ?socket.Server = null,
+    running: std.atomic.Value(bool),
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        config: WebmailHttpConfig,
+        db: *database.Database,
+        auth: *auth_mod.AuthBackend,
+    ) WebmailHttpServer {
+        var sessions = session_mod.SessionManager.init(allocator, db, auth);
+        sessions.secure_cookies = config.secure_cookies;
+        return .{
+            .allocator = allocator,
+            .config = config,
+            .db = db,
+            .auth = auth,
+            .sessions = sessions,
+            .login_limiter = security.RateLimiter.init(
+                allocator,
+                config.login_rate_window_seconds,
+                config.login_rate_max,
+                config.login_rate_max,
+                config.login_rate_window_seconds,
+            ),
+            .running = std.atomic.Value(bool).init(false),
+        };
+    }
+
+    pub fn deinit(self: *WebmailHttpServer) void {
+        self.stop();
+        self.login_limiter.deinit();
+    }
+
+    pub fn start(self: *WebmailHttpServer) !void {
+        const address = try socket.Address.parseIp(self.config.bind_host, self.config.port);
+        self.listener = try socket.Server.listen(address, .{ .reuse_address = true });
+        try self.listener.?.setNonBlocking(true);
+        self.running.store(true, .monotonic);
+
+        logger.info("Webmail HTTP server listening on {s}:{d}", .{ self.config.bind_host, self.config.port });
+
+        // Best-effort prune of expired sessions on startup.
+        self.sessions.sweep();
+
+        while (self.running.load(.monotonic)) {
+            const connection = self.listener.?.accept() catch |err| {
+                if (!self.running.load(.monotonic)) break;
+                if (err == error.OperationCancelled or err == error.WouldBlock) {
+                    time_compat.sleepMs(100);
+                    continue;
+                }
+                logger.warn("Webmail accept error: {}", .{err});
+                time_compat.sleepMs(500);
+                continue;
+            };
+
+            const ctx = ConnCtx{ .server = self, .connection = connection };
+            const thread = std.Thread.spawn(.{}, handleConnectionThread, .{ctx}) catch |err| {
+                logger.err("Failed to spawn webmail handler: {}", .{err});
+                connection.close();
+                continue;
+            };
+            thread.detach();
+        }
+    }
+
+    pub fn stop(self: *WebmailHttpServer) void {
+        self.running.store(false, .monotonic);
+        if (self.listener) |*listener| {
+            listener.close();
+            self.listener = null;
+        }
+    }
+};
+
+const ConnCtx = struct {
+    server: *WebmailHttpServer,
+    connection: socket.Connection,
+};
+
+fn handleConnectionThread(ctx: ConnCtx) void {
+    defer ctx.connection.close();
+    // Per-request arena: every allocation during this request (parsing, JSON,
+    // Maildir reads) lives here and is freed wholesale at the end.
+    var arena = std.heap.ArenaAllocator.init(ctx.server.allocator);
+    defer arena.deinit();
+    handleConnection(ctx.server, ctx.connection, arena.allocator()) catch |err| {
+        logger.warn("Webmail request error: {}", .{err});
+    };
+}
+
+// ── HTTP request parsing ─────────────────────────────────────────────────────
+
+const max_request_bytes = 1024 * 1024; // 1 MiB cap on a single request
+
+const Request = struct {
+    method: []const u8,
+    path: []const u8,
+    query: []const u8,
+    headers: []const u8, // raw header block (after request line, before body)
+    body: []const u8,
+
+    fn header(self: Request, name: []const u8) ?[]const u8 {
+        var line_start: usize = 0;
+        while (line_start < self.headers.len) {
+            const nl = std.mem.indexOfScalarPos(u8, self.headers, line_start, '\n') orelse self.headers.len;
+            const line = std.mem.trim(u8, self.headers[line_start..nl], "\r ");
+            if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+                const key = std.mem.trim(u8, line[0..colon], " \t");
+                if (std.ascii.eqlIgnoreCase(key, name)) {
+                    return std.mem.trim(u8, line[colon + 1 ..], " \t");
+                }
+            }
+            line_start = nl + 1;
+        }
+        return null;
+    }
+
+    fn queryParam(self: Request, allocator: std.mem.Allocator, name: []const u8) ?[]const u8 {
+        var it = std.mem.splitScalar(u8, self.query, '&');
+        while (it.next()) |pair| {
+            if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
+                if (std.mem.eql(u8, pair[0..eq], name)) {
+                    return urlDecode(allocator, pair[eq + 1 ..]) catch pair[eq + 1 ..];
+                }
+            } else if (std.mem.eql(u8, pair, name)) {
+                return "";
+            }
+        }
+        return null;
+    }
+};
+
+/// Read and parse a full HTTP request (request line + headers + body, honoring
+/// Content-Length). Returns null if the connection closed cleanly with no data.
+fn readRequest(conn: socket.Connection, allocator: std.mem.Allocator) !?Request {
+    var buf: std.ArrayList(u8) = .empty;
+    var chunk: [8192]u8 = undefined;
+
+    // Read until we have the full header block.
+    var header_len: usize = 0;
+    while (true) {
+        const n = conn.read(&chunk) catch |err| {
+            if (buf.items.len == 0) return null;
+            return err;
+        };
+        if (n == 0) {
+            if (buf.items.len == 0) return null;
+            break;
+        }
+        try buf.appendSlice(allocator, chunk[0..n]);
+        if (buf.items.len > max_request_bytes) return error.RequestTooLarge;
+        if (std.mem.indexOf(u8, buf.items, "\r\n\r\n")) |idx| {
+            header_len = idx + 4;
+            break;
+        }
+        // Guard against header-only floods.
+        if (buf.items.len > 64 * 1024) return error.HeadersTooLarge;
+    }
+    if (header_len == 0) {
+        // No header terminator seen; treat as malformed unless empty.
+        return error.MalformedRequest;
+    }
+
+    const head = buf.items[0..header_len];
+
+    // Request line.
+    const line_end = std.mem.indexOf(u8, head, "\r\n") orelse return error.MalformedRequest;
+    const request_line = head[0..line_end];
+    var parts = std.mem.splitScalar(u8, request_line, ' ');
+    const method = parts.next() orelse return error.MalformedRequest;
+    const target = parts.next() orelse return error.MalformedRequest;
+
+    // Split path?query.
+    var path = target;
+    var query: []const u8 = "";
+    if (std.mem.indexOfScalar(u8, target, '?')) |q| {
+        path = target[0..q];
+        query = target[q + 1 ..];
+    }
+
+    const headers_block = head[line_end + 2 .. header_len];
+
+    // Body, per Content-Length.
+    var body: []const u8 = "";
+    if (findContentLength(headers_block)) |clen| {
+        if (clen > max_request_bytes) return error.RequestTooLarge;
+        const have = buf.items.len - header_len;
+        while (buf.items.len - header_len < clen) {
+            const n = conn.read(&chunk) catch break;
+            if (n == 0) break;
+            try buf.appendSlice(allocator, chunk[0..n]);
+            if (buf.items.len > max_request_bytes) return error.RequestTooLarge;
+        }
+        _ = have;
+        const end = @min(header_len + clen, buf.items.len);
+        body = buf.items[header_len..end];
+    }
+
+    return Request{
+        .method = method,
+        .path = path,
+        .query = query,
+        .headers = headers_block,
+        .body = body,
+    };
+}
+
+fn findContentLength(headers_block: []const u8) ?usize {
+    var line_start: usize = 0;
+    while (line_start < headers_block.len) {
+        const nl = std.mem.indexOfScalarPos(u8, headers_block, line_start, '\n') orelse headers_block.len;
+        const line = std.mem.trim(u8, headers_block[line_start..nl], "\r ");
+        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
+            const key = std.mem.trim(u8, line[0..colon], " \t");
+            if (std.ascii.eqlIgnoreCase(key, "Content-Length")) {
+                const val = std.mem.trim(u8, line[colon + 1 ..], " \t");
+                return std.fmt.parseInt(usize, val, 10) catch null;
+            }
+        }
+        line_start = nl + 1;
+    }
+    return null;
+}
+
+// ── Routing ──────────────────────────────────────────────────────────────────
+
+fn handleConnection(server: *WebmailHttpServer, conn: socket.Connection, arena: std.mem.Allocator) !void {
+    const req = (try readRequest(conn, arena)) orelse return;
+
+    // CORS preflight (the dev proxy is same-origin, but be tolerant).
+    if (std.mem.eql(u8, req.method, "OPTIONS")) {
+        try sendStatus(conn, arena, 204, "No Content", null);
+        return;
+    }
+
+    const p = req.path;
+
+    if (std.mem.eql(u8, p, "/webmail/auth/login") and std.mem.eql(u8, req.method, "POST")) {
+        return handleLogin(server, conn, arena, req);
+    }
+    if (std.mem.eql(u8, p, "/webmail/auth/logout") and std.mem.eql(u8, req.method, "POST")) {
+        return handleLogout(server, conn, arena, req);
+    }
+    if (std.mem.eql(u8, p, "/webmail/auth/me") and std.mem.eql(u8, req.method, "GET")) {
+        return handleMe(server, conn, arena, req);
+    }
+    if (std.mem.eql(u8, p, "/webmail/api/folders") and std.mem.eql(u8, req.method, "GET")) {
+        return handleFolders(server, conn, arena, req);
+    }
+    if (std.mem.startsWith(u8, p, "/webmail/api/messages/") and std.mem.eql(u8, req.method, "GET")) {
+        return handleMessageDetail(server, conn, arena, req);
+    }
+    if (std.mem.eql(u8, p, "/webmail/api/messages") and std.mem.eql(u8, req.method, "GET")) {
+        return handleMessageList(server, conn, arena, req);
+    }
+
+    try sendError(conn, arena, 404, "not_found", "No such endpoint");
+}
+
+/// Resolve the authenticated session for a request, or send 401 and return null.
+fn requireSession(server: *WebmailHttpServer, conn: socket.Connection, arena: std.mem.Allocator, req: Request) !?session_mod.Session {
+    const cookie = req.header("Cookie") orelse {
+        try sendError(conn, arena, 401, "unauthorized", "No session");
+        return null;
+    };
+    const token = session_mod.parseSessionCookie(cookie) orelse {
+        try sendError(conn, arena, 401, "unauthorized", "No session cookie");
+        return null;
+    };
+    const sess = server.sessions.validate(token) catch {
+        try sendError(conn, arena, 401, "unauthorized", "Invalid or expired session");
+        return null;
+    };
+    return sess;
+}
+
+// ── Handlers ─────────────────────────────────────────────────────────────────
+
+fn handleLogin(server: *WebmailHttpServer, conn: socket.Connection, arena: std.mem.Allocator, req: Request) !void {
+    const ip = conn.peerIp();
+
+    // Throttle per IP BEFORE the expensive Argon2 verify, so a brute-forcer
+    // can't both burn CPU and sample credentials. checkAndIncrement returns
+    // false once the IP exceeds the window budget.
+    if (ip.len > 0) {
+        const allowed = server.login_limiter.checkAndIncrement(ip) catch true;
+        if (!allowed) {
+            logger.warn("Webmail login rate-limited for {s}", .{ip});
+            return sendError(conn, arena, 429, "rate_limited", "Too many login attempts; try again later");
+        }
+    }
+
+    const username = jsonStringField(req.body, "username") orelse {
+        return sendError(conn, arena, 400, "bad_request", "Missing username");
+    };
+    const password = jsonStringField(req.body, "password") orelse {
+        return sendError(conn, arena, 400, "bad_request", "Missing password");
+    };
+
+    const ua = req.header("User-Agent");
+
+    var sess = server.sessions.login(username, password, if (ip.len > 0) ip else null, ua) catch |err| {
+        if (err == session_mod.SessionError.InvalidCredentials) {
+            logger.warn("Webmail login failed for {s} from {s}", .{ username, ip });
+            return sendError(conn, arena, 401, "invalid_credentials", "Invalid username or password");
+        }
+        return sendError(conn, arena, 500, "server_error", "Login failed");
+    };
+    defer sess.deinit(server.allocator);
+
+    logger.info("Webmail login: {s} from {s}", .{ sess.username, ip });
+
+    const cookie = try server.sessions.buildSetCookie(sess.session_id);
+
+    var body: std.ArrayList(u8) = .empty;
+    const w = jw(&body, arena);
+    try w.writeAll("{\"user\":{\"username\":");
+    try writeJsonString(w, sess.username);
+    try w.writeAll(",\"email\":");
+    try writeJsonString(w, sess.email);
+    try w.writeAll("},\"csrf_token\":");
+    try writeJsonString(w, sess.csrf_secret);
+    try w.writeAll("}");
+
+    try sendJson(conn, arena, 200, body.items, cookie);
+}
+
+fn handleLogout(server: *WebmailHttpServer, conn: socket.Connection, arena: std.mem.Allocator, req: Request) !void {
+    // CSRF guard: logout is state-changing. SameSite=Lax allows top-level
+    // cross-origin POSTs, so reject when an Origin/Referer is present and does
+    // not match the Host. (Full per-action CSRF tokens land in Phase 5.)
+    if (!isSameOrigin(req)) {
+        return sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected");
+    }
+    if (req.header("Cookie")) |cookie| {
+        if (session_mod.parseSessionCookie(cookie)) |token| {
+            server.sessions.logout(token);
+        }
+    }
+    const clear = try server.sessions.buildClearCookie();
+    try sendJson(conn, arena, 200, "{\"ok\":true}", clear);
+}
+
+/// Same-origin check for state-changing requests. If neither Origin nor Referer
+/// is present (e.g. a non-browser client), allow. If present, the authority must
+/// match the Host header. Conservative: an Origin/Referer we can't parse fails.
+fn isSameOrigin(req: Request) bool {
+    const host = req.header("Host") orelse return true; // no Host to compare against
+    if (req.header("Origin")) |origin| {
+        return std.mem.eql(u8, authorityOf(origin), host);
+    }
+    if (req.header("Referer")) |referer| {
+        return std.mem.eql(u8, authorityOf(referer), host);
+    }
+    return true; // neither header present
+}
+
+/// Strip scheme and path from a URL, leaving host[:port]. "http://a:8/x" -> "a:8".
+fn authorityOf(url: []const u8) []const u8 {
+    var rest = url;
+    if (std.mem.indexOf(u8, rest, "://")) |i| rest = rest[i + 3 ..];
+    if (std.mem.indexOfScalar(u8, rest, '/')) |i| rest = rest[0..i];
+    return rest;
+}
+
+fn handleMe(server: *WebmailHttpServer, conn: socket.Connection, arena: std.mem.Allocator, req: Request) !void {
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+
+    var body: std.ArrayList(u8) = .empty;
+    const w = jw(&body, arena);
+    try w.writeAll("{\"user\":{\"username\":");
+    try writeJsonString(w, sess.username);
+    try w.writeAll(",\"email\":");
+    try writeJsonString(w, sess.email);
+    try w.writeAll("}}");
+    try sendJson(conn, arena, 200, body.items, null);
+}
+
+fn handleFolders(server: *WebmailHttpServer, conn: socket.Connection, arena: std.mem.Allocator, req: Request) !void {
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+
+    const folders = maildir.listFolders(arena, sess.username) catch {
+        return sendError(conn, arena, 500, "server_error", "Failed to read folders");
+    };
+
+    var body: std.ArrayList(u8) = .empty;
+    const w = jw(&body, arena);
+    try w.writeAll("[");
+    for (folders, 0..) |f, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.writeAll("{\"name\":");
+        try writeJsonString(w, f.name);
+        try w.print(",\"total\":{d},\"unread\":{d}}}", .{ f.total, f.unread });
+    }
+    try w.writeAll("]");
+    try sendJson(conn, arena, 200, body.items, null);
+}
+
+fn handleMessageList(server: *WebmailHttpServer, conn: socket.Connection, arena: std.mem.Allocator, req: Request) !void {
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+
+    const folder = req.queryParam(arena, "folder") orelse "INBOX";
+    const page = parseUintParam(req, arena, "page", 1);
+    const per_page = @min(parseUintParam(req, arena, "per_page", server.config.messages_per_page), 200);
+
+    const msgs = maildir.listMessages(arena, server.db, sess.username, folder, page, per_page) catch |err| {
+        if (err == maildir.MaildirError.InvalidFolderName) {
+            return sendError(conn, arena, 400, "bad_request", "Invalid folder");
+        }
+        return sendError(conn, arena, 500, "server_error", "Failed to read messages");
+    };
+
+    var body: std.ArrayList(u8) = .empty;
+    const w = jw(&body, arena);
+    try w.writeAll("{\"folder\":");
+    try writeJsonString(w, folder);
+    try w.print(",\"page\":{d},\"items\":[", .{page});
+    for (msgs, 0..) |m, i| {
+        if (i > 0) try w.writeAll(",");
+        try writeMessageSummary(w, m);
+    }
+    try w.writeAll("]}");
+    try sendJson(conn, arena, 200, body.items, null);
+}
+
+fn handleMessageDetail(server: *WebmailHttpServer, conn: socket.Connection, arena: std.mem.Allocator, req: Request) !void {
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+
+    const uid_str = req.path["/webmail/api/messages/".len..];
+    const uid = std.fmt.parseInt(i64, uid_str, 10) catch {
+        return sendError(conn, arena, 400, "bad_request", "Invalid message id");
+    };
+    const folder = req.queryParam(arena, "folder") orelse "INBOX";
+
+    const msg = maildir.getMessage(arena, server.db, sess.username, folder, uid) catch |err| {
+        if (err == maildir.MaildirError.MessageNotFound) {
+            return sendError(conn, arena, 404, "not_found", "Message not found");
+        }
+        if (err == maildir.MaildirError.InvalidFolderName) {
+            return sendError(conn, arena, 400, "bad_request", "Invalid folder");
+        }
+        return sendError(conn, arena, 500, "server_error", "Failed to read message");
+    };
+
+    var body: std.ArrayList(u8) = .empty;
+    const w = jw(&body, arena);
+    try writeMessageDetail(w, msg);
+    try sendJson(conn, arena, 200, body.items, null);
+}
+
+// ── JSON writers ─────────────────────────────────────────────────────────────
+
+/// Minimal writer over an unmanaged ArrayList(u8) + arena. The unmanaged
+/// ArrayList in this Zig has no `.writer()` that takes an allocator, so we wrap
+/// one. All the JSON emitters below take `anytype`, so this drops in cleanly.
+const JsonWriter = struct {
+    list: *std.ArrayList(u8),
+    arena: std.mem.Allocator,
+
+    pub fn writeAll(self: JsonWriter, bytes: []const u8) !void {
+        try self.list.appendSlice(self.arena, bytes);
+    }
+    pub fn writeByte(self: JsonWriter, b: u8) !void {
+        try self.list.append(self.arena, b);
+    }
+    pub fn print(self: JsonWriter, comptime fmt: []const u8, args: anytype) !void {
+        const s = try std.fmt.allocPrint(self.arena, fmt, args);
+        try self.list.appendSlice(self.arena, s);
+    }
+};
+
+fn jw(list: *std.ArrayList(u8), arena: std.mem.Allocator) JsonWriter {
+    return .{ .list = list, .arena = arena };
+}
+
+fn writeFlags(w: anytype, flags: maildir.Flags) !void {
+    try w.print(
+        "{{\"seen\":{},\"answered\":{},\"flagged\":{},\"draft\":{},\"deleted\":{}}}",
+        .{ flags.seen, flags.answered, flags.flagged, flags.draft, flags.deleted },
+    );
+}
+
+fn writeMessageSummary(w: anytype, m: maildir.MessageSummary) !void {
+    try w.print("{{\"uid\":{d},\"from\":", .{m.uid});
+    try writeJsonString(w, m.from);
+    try w.writeAll(",\"to\":");
+    try writeJsonString(w, m.to);
+    try w.writeAll(",\"subject\":");
+    try writeJsonString(w, m.subject);
+    try w.writeAll(",\"date\":");
+    try writeJsonString(w, m.date);
+    try w.writeAll(",\"snippet\":");
+    try writeJsonString(w, m.snippet);
+    try w.print(",\"has_attachments\":{},\"size\":{d},\"flags\":", .{ m.has_attachments, m.size });
+    try writeFlags(w, m.flags);
+    try w.writeAll("}");
+}
+
+fn writeMessageDetail(w: anytype, m: maildir.MessageDetail) !void {
+    try w.print("{{\"uid\":{d},\"from\":", .{m.uid});
+    try writeJsonString(w, m.from);
+    try w.writeAll(",\"to\":");
+    try writeJsonString(w, m.to);
+    try w.writeAll(",\"cc\":");
+    try writeJsonString(w, m.cc);
+    try w.writeAll(",\"subject\":");
+    try writeJsonString(w, m.subject);
+    try w.writeAll(",\"date\":");
+    try writeJsonString(w, m.date);
+    try w.writeAll(",\"message_id\":");
+    try writeJsonString(w, m.message_id);
+    try w.writeAll(",\"text\":");
+    try writeJsonString(w, m.text_body);
+    try w.writeAll(",\"html\":");
+    try writeJsonString(w, m.html_body);
+    try w.print(",\"size\":{d},\"attachments\":[", .{m.size});
+    for (m.attachments, 0..) |att, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.writeAll("{\"filename\":");
+        try writeJsonString(w, att.filename);
+        try w.writeAll(",\"content_type\":");
+        try writeJsonString(w, att.content_type);
+        try w.print(",\"size\":{d}}}", .{att.size});
+    }
+    try w.writeAll("],\"flags\":");
+    try writeFlags(w, m.flags);
+    try w.writeAll("}");
+}
+
+/// Write a JSON-escaped string (including surrounding quotes).
+fn writeJsonString(w: anytype, s: []const u8) !void {
+    // The output is declared charset=utf-8, so it must BE valid UTF-8. Email
+    // content (From/Subject/body) is attacker-controlled and may contain raw
+    // Latin-1 or otherwise-invalid bytes (e.g. from a charset we don't convert),
+    // which would make JSON.parse() throw on the frontend. We iterate by UTF-8
+    // sequence: pass valid sequences through verbatim, and replace any invalid
+    // byte with U+FFFD (the Unicode replacement character).
+    const replacement = "\u{FFFD}";
+    try w.writeByte('"');
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c < 0x80) {
+            switch (c) {
+                '"' => try w.writeAll("\\\""),
+                '\\' => try w.writeAll("\\\\"),
+                '\n' => try w.writeAll("\\n"),
+                '\r' => try w.writeAll("\\r"),
+                '\t' => try w.writeAll("\\t"),
+                0x08 => try w.writeAll("\\b"),
+                0x0C => try w.writeAll("\\f"),
+                else => {
+                    if (c < 0x20) {
+                        try w.print("\\u{x:0>4}", .{c});
+                    } else {
+                        try w.writeByte(c);
+                    }
+                },
+            }
+            i += 1;
+            continue;
+        }
+        // Multi-byte: validate the full sequence before emitting it.
+        const seq_len = std.unicode.utf8ByteSequenceLength(c) catch {
+            try w.writeAll(replacement);
+            i += 1;
+            continue;
+        };
+        if (i + seq_len > s.len or !std.unicode.utf8ValidateSlice(s[i .. i + seq_len])) {
+            try w.writeAll(replacement);
+            i += 1;
+            continue;
+        }
+        try w.writeAll(s[i .. i + seq_len]);
+        i += seq_len;
+    }
+    try w.writeByte('"');
+}
+
+// ── Response helpers ─────────────────────────────────────────────────────────
+
+fn sendJson(conn: socket.Connection, arena: std.mem.Allocator, status: u16, json_body: []const u8, set_cookie: ?[]const u8) !void {
+    var resp: std.ArrayList(u8) = .empty;
+    const w = jw(&resp, arena);
+    try w.print("HTTP/1.1 {d} {s}\r\n", .{ status, statusText(status) });
+    try w.writeAll("Content-Type: application/json; charset=utf-8\r\n");
+    try w.print("Content-Length: {d}\r\n", .{json_body.len});
+    try w.writeAll("Cache-Control: no-store\r\n");
+    try w.writeAll("X-Content-Type-Options: nosniff\r\n");
+    if (set_cookie) |c| {
+        try w.print("Set-Cookie: {s}\r\n", .{c});
+    }
+    try w.writeAll("Connection: close\r\n\r\n");
+    try w.writeAll(json_body);
+    try writeAll(conn, resp.items);
+}
+
+fn sendError(conn: socket.Connection, arena: std.mem.Allocator, status: u16, code: []const u8, message: []const u8) !void {
+    var body: std.ArrayList(u8) = .empty;
+    const w = jw(&body, arena);
+    try w.writeAll("{\"error\":");
+    try writeJsonString(w, code);
+    try w.writeAll(",\"message\":");
+    try writeJsonString(w, message);
+    try w.writeAll("}");
+    try sendJson(conn, arena, status, body.items, null);
+}
+
+fn sendStatus(conn: socket.Connection, arena: std.mem.Allocator, status: u16, text: []const u8, set_cookie: ?[]const u8) !void {
+    var resp: std.ArrayList(u8) = .empty;
+    const w = jw(&resp, arena);
+    try w.print("HTTP/1.1 {d} {s}\r\n", .{ status, text });
+    try w.writeAll("Content-Length: 0\r\n");
+    if (set_cookie) |c| try w.print("Set-Cookie: {s}\r\n", .{c});
+    try w.writeAll("Connection: close\r\n\r\n");
+    try writeAll(conn, resp.items);
+}
+
+fn writeAll(conn: socket.Connection, data: []const u8) !void {
+    var off: usize = 0;
+    while (off < data.len) {
+        const n = try conn.write(data[off..]);
+        if (n == 0) return error.ConnectionClosed;
+        off += n;
+    }
+}
+
+fn statusText(status: u16) []const u8 {
+    return switch (status) {
+        200 => "OK",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        else => "OK",
+    };
+}
+
+// ── Small parsing helpers ────────────────────────────────────────────────────
+
+fn parseUintParam(req: Request, arena: std.mem.Allocator, name: []const u8, default: usize) usize {
+    const v = req.queryParam(arena, name) orelse return default;
+    return std.fmt.parseInt(usize, v, 10) catch default;
+}
+
+/// Extract a top-level string field from a small JSON object. Deliberately
+/// minimal (no nesting, no escapes beyond \" and \\) — login bodies are tiny
+/// and trusted in shape. Returns null if absent.
+fn jsonStringField(body: []const u8, field: []const u8) ?[]const u8 {
+    // Find "field"
+    var needle_buf: [128]u8 = undefined;
+    if (field.len + 2 > needle_buf.len) return null;
+    needle_buf[0] = '"';
+    @memcpy(needle_buf[1 .. 1 + field.len], field);
+    needle_buf[1 + field.len] = '"';
+    const needle = needle_buf[0 .. field.len + 2];
+
+    const key_at = std.mem.indexOf(u8, body, needle) orelse return null;
+    var i = key_at + needle.len;
+    // Skip whitespace and ':'
+    while (i < body.len and (body[i] == ' ' or body[i] == '\t' or body[i] == ':' or body[i] == '\r' or body[i] == '\n')) : (i += 1) {}
+    if (i >= body.len or body[i] != '"') return null;
+    i += 1;
+    const start = i;
+    while (i < body.len) : (i += 1) {
+        if (body[i] == '\\') {
+            i += 1; // skip escaped char (best-effort; not unescaped here)
+            continue;
+        }
+        if (body[i] == '"') break;
+    }
+    // Reject unterminated strings: the loop only exits early on a closing quote;
+    // reaching the end (i >= body.len) means there was none — or a trailing
+    // backslash skipped past the end. Either way the input is malformed.
+    if (i >= body.len or body[i] != '"') return null;
+    return body[start..i];
+}
+
+/// URL-decode a query component (%XX and '+'). Arena-allocated.
+fn urlDecode(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c == '+') {
+            try out.append(allocator, ' ');
+        } else if (c == '%' and i + 2 < s.len) {
+            const hi = hexDigit(s[i + 1]);
+            const lo = hexDigit(s[i + 2]);
+            if (hi != null and lo != null) {
+                try out.append(allocator, hi.? * 16 + lo.?);
+                i += 2;
+            } else {
+                try out.append(allocator, c);
+            }
+        } else {
+            try out.append(allocator, c);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn hexDigit(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+test "jsonStringField extracts simple fields" {
+    const t = std.testing;
+    const body = "{\"username\": \"chris\", \"password\":\"secret\"}";
+    try t.expectEqualStrings("chris", jsonStringField(body, "username").?);
+    try t.expectEqualStrings("secret", jsonStringField(body, "password").?);
+    try t.expect(jsonStringField(body, "missing") == null);
+}
+
+test "jsonStringField rejects unterminated and trailing-backslash strings" {
+    const t = std.testing;
+    // Unterminated value must return null, not the rest of the buffer.
+    try t.expect(jsonStringField("{\"password\":\"unclosed", "password") == null);
+    // Trailing backslash that escapes past the end must not swallow the buffer.
+    try t.expect(jsonStringField("{\"password\":\"abc\\", "password") == null);
+    // Properly terminated still works.
+    try t.expectEqualStrings("ok", jsonStringField("{\"password\":\"ok\"}", "password").?);
+}
+
+test "writeJsonString keeps valid UTF-8 and replaces invalid bytes" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    // Valid UTF-8 (é = C3 A9) passes through verbatim.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        try writeJsonString(jw(&buf, arena.allocator()), "Caf\u{00E9}");
+        try t.expectEqualStrings("\"Caf\u{00E9}\"", buf.items);
+    }
+    // A lone 0xE9 (Latin-1 'é', invalid UTF-8) becomes U+FFFD, not a raw byte.
+    {
+        var buf: std.ArrayList(u8) = .empty;
+        try writeJsonString(jw(&buf, arena.allocator()), "Caf\xe9");
+        try t.expectEqualStrings("\"Caf\u{FFFD}\"", buf.items);
+        // And the result is itself valid UTF-8.
+        try t.expect(std.unicode.utf8ValidateSlice(buf.items));
+    }
+}
+
+test "isSameOrigin and authorityOf" {
+    const t = std.testing;
+    try t.expectEqualStrings("a:8", authorityOf("http://a:8/x"));
+    try t.expectEqualStrings("host", authorityOf("https://host"));
+    const ok = Request{ .method = "POST", .path = "/x", .query = "", .headers = "Host: h\r\nOrigin: http://h\r\n", .body = "" };
+    try t.expect(isSameOrigin(ok));
+    const bad = Request{ .method = "POST", .path = "/x", .query = "", .headers = "Host: h\r\nOrigin: http://evil\r\n", .body = "" };
+    try t.expect(!isSameOrigin(bad));
+    const none = Request{ .method = "POST", .path = "/x", .query = "", .headers = "Host: h\r\n", .body = "" };
+    try t.expect(isSameOrigin(none)); // no Origin/Referer -> allowed
+}
+
+test "writeJsonString escapes control chars and quotes" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    try writeJsonString(jw(&buf, arena.allocator()), "a\"b\\c\nd");
+    try t.expectEqualStrings("\"a\\\"b\\\\c\\nd\"", buf.items);
+}
+
+test "urlDecode handles percent and plus" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const d = try urlDecode(arena.allocator(), "All%20Mail+x");
+    try t.expectEqualStrings("All Mail x", d);
+}
+
+test "Request.header and queryParam" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const req = Request{
+        .method = "GET",
+        .path = "/webmail/api/messages",
+        .query = "folder=Sent&page=2",
+        .headers = "Host: x\r\nCookie: webmail_session=abc\r\n",
+        .body = "",
+    };
+    try t.expectEqualStrings("webmail_session=abc", req.header("Cookie").?);
+    try t.expectEqualStrings("Sent", req.queryParam(arena.allocator(), "folder").?);
+    try t.expectEqualStrings("2", req.queryParam(arena.allocator(), "page").?);
+    try t.expect(req.queryParam(arena.allocator(), "missing") == null);
+}

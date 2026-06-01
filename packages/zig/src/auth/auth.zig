@@ -203,20 +203,35 @@ pub const AuthBackend = struct {
         // Get user from database
         var user = self.db.getUserByUsername(normalized_username) catch |err| {
             if (err == database.DatabaseError.NotFound) {
-                // User not found - return false but don't leak this information
+                // User not found. Returning immediately here leaks the username's
+                // existence via timing (a real user runs a ~100-500ms Argon2
+                // verify; a missing one would return in microseconds). Burn an
+                // equivalent Argon2 KDF against the supplied password so both
+                // paths cost roughly the same, then report failure.
+                self.dummyVerify(password);
                 return false;
             }
             return err;
         };
         defer user.deinit(self.allocator);
 
-        // Check if user is enabled
+        // Check if user is enabled. Same timing concern as not-found: equalize
+        // the cost before returning so disabled accounts aren't distinguishable.
         if (!user.enabled) {
+            self.dummyVerify(password);
             return false;
         }
 
         // Verify password
         return try self.password_hasher.verifyPassword(password, user.password_hash);
+    }
+
+    /// Run a throwaway Argon2 KDF to match the timing of a real password verify.
+    /// Used on the user-not-found / disabled paths to prevent username
+    /// enumeration via response timing. The result is intentionally discarded.
+    fn dummyVerify(self: *AuthBackend, password: []const u8) void {
+        const h = self.password_hasher.hashPassword(password) catch return;
+        self.allocator.free(h);
     }
 
     pub fn createUser(self: *AuthBackend, username: []const u8, password: []const u8, email: []const u8) !i64 {

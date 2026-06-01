@@ -95,11 +95,26 @@ pub const Server = struct {
 
     pub fn listen(address: Address, options: ListenOptions) !Server {
         const family: c_uint = @intCast(address.getPosixFamily());
-        const sock_type: c_uint = @intCast(@as(u32, posix.SOCK.STREAM | posix.SOCK.CLOEXEC));
+        // SOCK_CLOEXEC in the socket() type argument is a Linux extension; macOS
+        // (and other BSDs) reject it with EINVAL, so set close-on-exec via fcntl
+        // after creation instead. On Linux both paths yield the same result.
+        const sock_type: c_uint = @intCast(@as(u32, posix.SOCK.STREAM));
         const raw_fd = std.c.socket(family, sock_type, 0);
         if (raw_fd < 0) return error.Unexpected;
         const fd: posix.socket_t = @intCast(raw_fd);
         errdefer _ = std.c.close(fd);
+
+        // Best-effort close-on-exec so child processes don't inherit the socket.
+        // Failures are non-fatal but worth a diagnostic — a leaked listen socket
+        // could otherwise be inherited by a spawned process.
+        const fd_flags = std.c.fcntl(fd, std.c.F.GETFD, @as(c_int, 0));
+        if (fd_flags >= 0) {
+            if (std.c.fcntl(fd, std.c.F.SETFD, fd_flags | std.c.FD_CLOEXEC) < 0) {
+                std.log.warn("Failed to set FD_CLOEXEC on listen socket (port {d}): errno={d}", .{ address.port, std.c._errno().* });
+            }
+        } else {
+            std.log.warn("Failed to read socket flags for FD_CLOEXEC (port {d}): errno={d}", .{ address.port, std.c._errno().* });
+        }
 
         if (options.reuse_address) {
             const one: c_int = 1;

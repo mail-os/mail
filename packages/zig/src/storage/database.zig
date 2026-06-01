@@ -180,6 +180,24 @@ pub const User = struct {
     }
 };
 
+/// A persisted webmail browser session (see webmail_sessions table).
+pub const WebmailSessionRow = struct {
+    session_id: []const u8,
+    username: []const u8,
+    email: []const u8,
+    csrf_secret: []const u8,
+    created_at: i64,
+    last_activity: i64,
+    expires_at: i64,
+
+    pub fn deinit(self: *WebmailSessionRow, allocator: std.mem.Allocator) void {
+        allocator.free(self.session_id);
+        allocator.free(self.username);
+        allocator.free(self.email);
+        allocator.free(self.csrf_secret);
+    }
+};
+
 pub const Database = struct {
     db: ?*sqlite.sqlite3,
     allocator: std.mem.Allocator,
@@ -271,6 +289,13 @@ pub const Database = struct {
         // Try to run migration, ignore errors if columns already exist
         self.exec(migration) catch {};
 
+        // Migration: digest_ha1 holds MD5(username:realm:password) for HTTP/SMTP
+        // Digest auth. getUserByUsername SELECTs it, so a fresh DB without this
+        // column makes every credential check fail with PrepareFailed. Run it as
+        // its own statement (sqlite3_exec stops at the first error, so it must
+        // not be bundled with the quota migration above).
+        self.exec("ALTER TABLE users ADD COLUMN digest_ha1 TEXT;") catch {};
+
         // IMAP UID persistence tables
         try self.exec(
             \\CREATE TABLE IF NOT EXISTS imap_mailboxes (
@@ -292,6 +317,26 @@ pub const Database = struct {
             \\);
             \\CREATE INDEX IF NOT EXISTS idx_imap_uids_lookup ON imap_uids(username, mailbox);
             \\CREATE INDEX IF NOT EXISTS idx_imap_mailboxes_lookup ON imap_mailboxes(username, mailbox);
+        );
+
+        // Webmail browser sessions (cookie-based). Distinct from SMTP/IMAP AUTH:
+        // a session_id is a random token stored as an HttpOnly cookie. Rows are
+        // pruned on expiry. See src/api/webmail_session.zig.
+        try self.exec(
+            \\CREATE TABLE IF NOT EXISTS webmail_sessions (
+            \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\    session_id TEXT UNIQUE NOT NULL,
+            \\    username TEXT NOT NULL,
+            \\    email TEXT NOT NULL,
+            \\    csrf_secret TEXT NOT NULL,
+            \\    created_at INTEGER NOT NULL,
+            \\    last_activity INTEGER NOT NULL,
+            \\    expires_at INTEGER NOT NULL,
+            \\    ip_address TEXT,
+            \\    user_agent TEXT
+            \\);
+            \\CREATE INDEX IF NOT EXISTS idx_webmail_sessions_sid ON webmail_sessions(session_id);
+            \\CREATE INDEX IF NOT EXISTS idx_webmail_sessions_expires ON webmail_sessions(expires_at);
         );
     }
 
@@ -496,6 +541,219 @@ pub const Database = struct {
         defer self.allocator.free(username_z);
 
         _ = sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null);
+
+        rc = sqlite.sqlite3_step(stmt);
+        if (rc != sqlite.SQLITE_DONE) {
+            return DatabaseError.StepFailed;
+        }
+    }
+
+    // ── Webmail browser sessions ────────────────────────────────────────────
+
+    /// Insert a new webmail session. Caller owns the input slices.
+    pub fn createWebmailSession(
+        self: *Database,
+        session_id: []const u8,
+        username: []const u8,
+        email: []const u8,
+        csrf_secret: []const u8,
+        expires_at: i64,
+        ip_address: ?[]const u8,
+        user_agent: ?[]const u8,
+    ) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const sql =
+            \\INSERT INTO webmail_sessions
+            \\    (session_id, username, email, csrf_secret, created_at, last_activity, expires_at, ip_address, user_agent)
+            \\VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8)
+        ;
+
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+
+        var stmt: ?*sqlite.sqlite3_stmt = null;
+        var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
+        if (rc != sqlite.SQLITE_OK) {
+            return DatabaseError.PrepareFailed;
+        }
+        defer _ = sqlite.sqlite3_finalize(stmt);
+
+        const session_z = try self.allocator.dupeZ(u8, session_id);
+        defer self.allocator.free(session_z);
+        const username_z = try self.allocator.dupeZ(u8, username);
+        defer self.allocator.free(username_z);
+        const email_z = try self.allocator.dupeZ(u8, email);
+        defer self.allocator.free(email_z);
+        const csrf_z = try self.allocator.dupeZ(u8, csrf_secret);
+        defer self.allocator.free(csrf_z);
+        const ip_z: ?[:0]u8 = if (ip_address) |v| try self.allocator.dupeZ(u8, v) else null;
+        defer if (ip_z) |v| self.allocator.free(v);
+        const ua_z: ?[:0]u8 = if (user_agent) |v| try self.allocator.dupeZ(u8, v) else null;
+        defer if (ua_z) |v| self.allocator.free(v);
+
+        const now = time_compat.timestamp();
+
+        _ = sqlite.sqlite3_bind_text(stmt, 1, session_z.ptr, -1, null);
+        _ = sqlite.sqlite3_bind_text(stmt, 2, username_z.ptr, -1, null);
+        _ = sqlite.sqlite3_bind_text(stmt, 3, email_z.ptr, -1, null);
+        _ = sqlite.sqlite3_bind_text(stmt, 4, csrf_z.ptr, -1, null);
+        _ = sqlite.sqlite3_bind_int64(stmt, 5, now);
+        _ = sqlite.sqlite3_bind_int64(stmt, 6, expires_at);
+        if (ip_z) |v| {
+            _ = sqlite.sqlite3_bind_text(stmt, 7, v.ptr, -1, null);
+        } else {
+            _ = sqlite.sqlite3_bind_null(stmt, 7);
+        }
+        if (ua_z) |v| {
+            _ = sqlite.sqlite3_bind_text(stmt, 8, v.ptr, -1, null);
+        } else {
+            _ = sqlite.sqlite3_bind_null(stmt, 8);
+        }
+
+        rc = sqlite.sqlite3_step(stmt);
+        if (rc != sqlite.SQLITE_DONE) {
+            if (rc == sqlite.SQLITE_CONSTRAINT) {
+                return DatabaseError.AlreadyExists;
+            }
+            return DatabaseError.StepFailed;
+        }
+    }
+
+    /// Look up a session by its token. Caller must call row.deinit(allocator).
+    /// Returns DatabaseError.NotFound if no such session.
+    pub fn getWebmailSession(self: *Database, session_id: []const u8) !WebmailSessionRow {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const sql =
+            \\SELECT session_id, username, email, csrf_secret, created_at, last_activity, expires_at
+            \\FROM webmail_sessions
+            \\WHERE session_id = ?1
+        ;
+
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+
+        var stmt: ?*sqlite.sqlite3_stmt = null;
+        var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
+        if (rc != sqlite.SQLITE_OK) {
+            return DatabaseError.PrepareFailed;
+        }
+        defer _ = sqlite.sqlite3_finalize(stmt);
+
+        const session_z = try self.allocator.dupeZ(u8, session_id);
+        defer self.allocator.free(session_z);
+
+        _ = sqlite.sqlite3_bind_text(stmt, 1, session_z.ptr, -1, null);
+
+        rc = sqlite.sqlite3_step(stmt);
+        if (rc != sqlite.SQLITE_ROW) {
+            return DatabaseError.NotFound;
+        }
+
+        const session_ptr = sqlite.sqlite3_column_text(stmt, 0);
+        const username_ptr = sqlite.sqlite3_column_text(stmt, 1);
+        const email_ptr = sqlite.sqlite3_column_text(stmt, 2);
+        const csrf_ptr = sqlite.sqlite3_column_text(stmt, 3);
+        const created_at = sqlite.sqlite3_column_int64(stmt, 4);
+        const last_activity = sqlite.sqlite3_column_int64(stmt, 5);
+        const expires_at = sqlite.sqlite3_column_int64(stmt, 6);
+
+        return WebmailSessionRow{
+            .session_id = try self.allocator.dupe(u8, std.mem.span(session_ptr)),
+            .username = try self.allocator.dupe(u8, std.mem.span(username_ptr)),
+            .email = try self.allocator.dupe(u8, std.mem.span(email_ptr)),
+            .csrf_secret = try self.allocator.dupe(u8, std.mem.span(csrf_ptr)),
+            .created_at = created_at,
+            .last_activity = last_activity,
+            .expires_at = expires_at,
+        };
+    }
+
+    /// Bump last_activity and push expiry forward (sliding idle window).
+    pub fn touchWebmailSession(self: *Database, session_id: []const u8, new_expires_at: i64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const sql =
+            \\UPDATE webmail_sessions
+            \\SET last_activity = ?1, expires_at = ?2
+            \\WHERE session_id = ?3
+        ;
+
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+
+        var stmt: ?*sqlite.sqlite3_stmt = null;
+        var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
+        if (rc != sqlite.SQLITE_OK) {
+            return DatabaseError.PrepareFailed;
+        }
+        defer _ = sqlite.sqlite3_finalize(stmt);
+
+        const session_z = try self.allocator.dupeZ(u8, session_id);
+        defer self.allocator.free(session_z);
+
+        const now = time_compat.timestamp();
+
+        _ = sqlite.sqlite3_bind_int64(stmt, 1, now);
+        _ = sqlite.sqlite3_bind_int64(stmt, 2, new_expires_at);
+        _ = sqlite.sqlite3_bind_text(stmt, 3, session_z.ptr, -1, null);
+
+        rc = sqlite.sqlite3_step(stmt);
+        if (rc != sqlite.SQLITE_DONE) {
+            return DatabaseError.StepFailed;
+        }
+    }
+
+    /// Delete a single session (logout).
+    pub fn deleteWebmailSession(self: *Database, session_id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const sql = "DELETE FROM webmail_sessions WHERE session_id = ?1";
+
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+
+        var stmt: ?*sqlite.sqlite3_stmt = null;
+        var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
+        if (rc != sqlite.SQLITE_OK) {
+            return DatabaseError.PrepareFailed;
+        }
+        defer _ = sqlite.sqlite3_finalize(stmt);
+
+        const session_z = try self.allocator.dupeZ(u8, session_id);
+        defer self.allocator.free(session_z);
+
+        _ = sqlite.sqlite3_bind_text(stmt, 1, session_z.ptr, -1, null);
+
+        rc = sqlite.sqlite3_step(stmt);
+        if (rc != sqlite.SQLITE_DONE) {
+            return DatabaseError.StepFailed;
+        }
+    }
+
+    /// Prune all sessions whose expiry is at or before `now`.
+    pub fn deleteExpiredWebmailSessions(self: *Database, now: i64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const sql = "DELETE FROM webmail_sessions WHERE expires_at <= ?1";
+
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+
+        var stmt: ?*sqlite.sqlite3_stmt = null;
+        var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
+        if (rc != sqlite.SQLITE_OK) {
+            return DatabaseError.PrepareFailed;
+        }
+        defer _ = sqlite.sqlite3_finalize(stmt);
+
+        _ = sqlite.sqlite3_bind_int64(stmt, 1, now);
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_DONE) {

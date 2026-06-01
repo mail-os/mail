@@ -83,6 +83,7 @@ pub fn build(b: *std.Build) void {
         "src/fs_compat_test.zig",
         "src/imap_test.zig",
         "src/connection_wrapper_test.zig",
+        "src/webmail_session_test.zig",
     };
 
     // RFC compliance tests

@@ -73,6 +73,13 @@ pub const Config = struct {
     managesieve_port: u16 = 4190,
     enable_milter: bool = false,
 
+    // Webmail HTTP API (browser client). Off by default; the listener is plain
+    // HTTP intended for localhost/dev or behind TLS termination. See WEBMAIL.md.
+    enable_webmail: bool = false,
+    webmail_port: u16 = 8080,
+    // Add Secure attribute to session cookies (disable for local plain-HTTP dev).
+    webmail_secure_cookies: bool = true,
+
     // Require STARTTLS (or implicit TLS) before AUTH is offered/accepted.
     // Default off to avoid locking out existing plaintext-auth clients.
     require_tls_for_auth: bool = false,
@@ -532,6 +539,17 @@ fn applyEnvironmentVariables(allocator: std.mem.Allocator, cfg: *Config) !void {
     }
     if (env.get("SMTP_ENABLE_MILTER")) |value| {
         cfg.enable_milter = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+
+    // Webmail HTTP API
+    if (env.get("SMTP_ENABLE_WEBMAIL")) |value| {
+        cfg.enable_webmail = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+    if (env.get("SMTP_WEBMAIL_PORT")) |value| {
+        cfg.webmail_port = std.fmt.parseInt(u16, value, 10) catch cfg.webmail_port;
+    }
+    if (env.get("SMTP_WEBMAIL_SECURE_COOKIES")) |value| {
+        cfg.webmail_secure_cookies = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
     }
 
     // SMTP_DELIVERY_METHOD (ses or direct)
