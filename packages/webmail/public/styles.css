@@ -230,6 +230,85 @@ body {
 .wm-action--danger { color: #c0392b; }
 .wm-action--danger:hover { background: #fdecea; }
 .wm-msg-flag { color: #e0a000; }
+.wm-read-toolbar { flex-wrap: wrap; }
+
+/* ── Compose button + composer modal ───────────────────────────────────── */
+.wm-compose-btn {
+  width: 100%;
+  margin-bottom: 14px;
+  padding: 9px;
+  background: var(--accent);
+  color: #fff;
+  border: 0;
+  border-radius: 10px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.wm-compose-btn:hover { filter: brightness(1.05); }
+
+.wm-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.wm-composer {
+  width: min(640px, 92vw);
+  max-height: 88vh;
+  background: var(--panel);
+  border-radius: 14px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.wm-composer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 700;
+}
+.wm-composer-close {
+  background: transparent; border: 0; font-size: 16px; color: var(--muted); cursor: pointer;
+}
+.wm-composer-fields { padding: 12px 18px 0; display: flex; flex-direction: column; gap: 8px; }
+.wm-composer-fields label {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 12px; font-weight: 600; color: var(--muted);
+}
+.wm-composer-fields input {
+  flex: 1; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; font-size: 14px;
+  color: var(--text);
+}
+.wm-composer-body {
+  margin: 12px 18px;
+  min-height: 220px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  font: inherit;
+  font-size: 14px;
+}
+.wm-composer-error {
+  margin: 0 18px; color: #c0392b; background: #fdecea; padding: 8px 10px; border-radius: 8px; font-size: 13px;
+}
+.wm-composer-foot {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 18px; border-top: 1px solid var(--border);
+}
+.wm-send-btn {
+  padding: 9px 22px; background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+  font-size: 14px; font-weight: 600; cursor: pointer;
+}
+.wm-send-btn:disabled { opacity: 0.6; cursor: default; }
+.wm-composer-status { font-size: 13px; color: var(--muted); }
 
 /* ── Responsive: collapse to one pane on mobile ────────────────────────── */
 @media (max-width: 860px) {

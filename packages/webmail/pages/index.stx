@@ -15,6 +15,7 @@
   <div class="wm" id="app">
     <aside class="wm-folders">
       <div class="wm-brand">📬 Webmail</div>
+      <button class="wm-compose-btn" id="composeBtn">✏️ Compose</button>
       <nav class="wm-folder-list" id="folderList"></nav>
       <div class="wm-user">
         <span class="wm-user-email" id="userEmail"></span>
@@ -35,6 +36,28 @@
       <div class="wm-read-empty wm-state" id="readEmpty">Select a message to read.</div>
       <article class="wm-read-body" id="readBody" style="display:none"></article>
     </section>
+  </div>
+
+  <!-- Composer modal -->
+  <div class="wm-modal" id="composeModal" style="display:none">
+    <div class="wm-composer">
+      <header class="wm-composer-head">
+        <span id="composerTitle">New message</span>
+        <button class="wm-composer-close" id="composerClose" title="Close">✕</button>
+      </header>
+      <div class="wm-composer-fields">
+        <label>To <input type="text" id="cTo" placeholder="recipient@example.com, …" /></label>
+        <label>Cc <input type="text" id="cCc" placeholder="optional" /></label>
+        <label>Bcc <input type="text" id="cBcc" placeholder="optional" /></label>
+        <label>Subject <input type="text" id="cSubject" /></label>
+      </div>
+      <textarea class="wm-composer-body" id="cBody" placeholder="Write your message…"></textarea>
+      <p class="wm-composer-error" id="composerError" style="display:none"></p>
+      <footer class="wm-composer-foot">
+        <button class="wm-send-btn" id="sendBtn">Send</button>
+        <span class="wm-composer-status" id="composerStatus"></span>
+      </footer>
+    </div>
   </div>
 
   <script>
@@ -219,6 +242,9 @@
 
       body.innerHTML = `
         <div class="wm-read-toolbar">
+          <button class="wm-action" data-act="reply" title="Reply">↩ Reply</button>
+          <button class="wm-action" data-act="replyall" title="Reply all">↩↩ Reply all</button>
+          <button class="wm-action" data-act="forward" title="Forward">↪ Forward</button>
           <button class="wm-action" data-act="flag" title="Flag">${flags.flagged ? '★ Flagged' : '☆ Flag'}</button>
           <button class="wm-action" data-act="unread" title="Mark unread">Mark unread</button>
           <button class="wm-action wm-action--danger" data-act="delete" title="Delete">🗑 Delete</button>
@@ -248,6 +274,9 @@
           if (act === 'flag') toggleFlag()
           else if (act === 'unread') markUnread()
           else if (act === 'delete') deleteCurrent()
+          else if (act === 'reply') openReply(m, false)
+          else if (act === 'replyall') openReply(m, true)
+          else if (act === 'forward') openForward(m)
         })
       })
     }
@@ -272,6 +301,137 @@
         })
       } catch (_e) { /* ignore */ }
       window.location.href = '/login'
+    })
+
+    // ── Composer ────────────────────────────────────────────────────────────
+    const composer = {
+      modal: document.getElementById('composeModal'),
+      title: document.getElementById('composerTitle'),
+      to: document.getElementById('cTo'),
+      cc: document.getElementById('cCc'),
+      bcc: document.getElementById('cBcc'),
+      subject: document.getElementById('cSubject'),
+      body: document.getElementById('cBody'),
+      error: document.getElementById('composerError'),
+      status: document.getElementById('composerStatus'),
+      sendBtn: document.getElementById('sendBtn'),
+      // Threading headers carried from the message being replied to.
+      inReplyTo: '',
+      references: '',
+    }
+
+    function openComposer(title) {
+      composer.title.textContent = title
+      composer.error.style.display = 'none'
+      composer.status.textContent = ''
+      composer.modal.style.display = 'flex'
+    }
+    function resetComposer() {
+      composer.to.value = ''; composer.cc.value = ''; composer.bcc.value = ''
+      composer.subject.value = ''; composer.body.value = ''
+      composer.inReplyTo = ''; composer.references = ''
+    }
+    function closeComposer() { composer.modal.style.display = 'none' }
+
+    // Pull a bare email address out of a "Name <addr>" header value.
+    function bareAddr(s) {
+      const m = /<([^>]+)>/.exec(s || '')
+      return (m ? m[1] : (s || '')).trim()
+    }
+    // Split a comma-separated recipient field into trimmed non-empty addresses.
+    function parseList(s) {
+      return (s || '').split(',').map(x => bareAddr(x)).filter(Boolean)
+    }
+
+    function quoteBody(m) {
+      const who = m.from || 'someone'
+      const when = m.date || ''
+      const text = (m.text && m.text.length) ? m.text : (m.html ? '[HTML message]' : '')
+      const quoted = text.split('\n').map(l => '> ' + l).join('\n')
+      return `\n\nOn ${when}, ${who} wrote:\n${quoted}\n`
+    }
+
+    function openReply(m, all) {
+      resetComposer()
+      composer.to.value = bareAddr(m.from)
+      if (all) {
+        // Reply-all: add original To/Cc minus ourselves.
+        const me = (state.user && state.user.email) || ''
+        const extra = [...parseList(m.to), ...parseList(m.cc)].filter(a => a !== me && a !== bareAddr(m.from))
+        if (extra.length) composer.cc.value = extra.join(', ')
+      }
+      const subj = m.subject || ''
+      composer.subject.value = /^re:/i.test(subj) ? subj : 'Re: ' + subj
+      composer.body.value = quoteBody(m)
+      // Threading: In-Reply-To = this message's Message-ID; References appends it.
+      composer.inReplyTo = m.message_id || ''
+      composer.references = m.message_id || ''
+      openComposer(all ? 'Reply all' : 'Reply')
+      composer.body.focus()
+      composer.body.setSelectionRange(0, 0)
+    }
+
+    function openForward(m) {
+      resetComposer()
+      const subj = m.subject || ''
+      composer.subject.value = /^fwd:/i.test(subj) ? subj : 'Fwd: ' + subj
+      const text = (m.text && m.text.length) ? m.text : (m.html ? '[HTML message]' : '')
+      composer.body.value = `\n\n---------- Forwarded message ----------\nFrom: ${m.from}\nDate: ${m.date}\nSubject: ${m.subject}\nTo: ${m.to}\n\n${text}\n`
+      openComposer('Forward')
+      composer.to.focus()
+    }
+
+    document.getElementById('composeBtn').addEventListener('click', () => {
+      resetComposer(); openComposer('New message'); composer.to.focus()
+    })
+    document.getElementById('composerClose').addEventListener('click', closeComposer)
+    composer.modal.addEventListener('click', (e) => { if (e.target === composer.modal) closeComposer() })
+
+    composer.sendBtn.addEventListener('click', async () => {
+      composer.error.style.display = 'none'
+      const to = parseList(composer.to.value)
+      const cc = parseList(composer.cc.value)
+      const bcc = parseList(composer.bcc.value)
+      if (to.length === 0 && cc.length === 0 && bcc.length === 0) {
+        composer.error.textContent = 'Add at least one recipient.'
+        composer.error.style.display = 'block'
+        return
+      }
+      composer.sendBtn.disabled = true
+      composer.status.textContent = 'Sending…'
+      try {
+        const res = await fetch('/webmail/api/compose', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json', 'Origin': window.location.origin },
+          body: JSON.stringify({
+            to, cc, bcc,
+            subject: composer.subject.value,
+            text: composer.body.value,
+            inReplyTo: composer.inReplyTo,
+            references: composer.references,
+          }),
+        })
+        if (res.ok) {
+          composer.status.textContent = 'Sent ✓'
+          setTimeout(() => { closeComposer(); if (state.folder === 'Sent') loadMessages(); loadFolders() }, 600)
+        } else if (res.status === 400) {
+          const j = await res.json().catch(() => ({}))
+          composer.error.textContent = j.message || 'Invalid message.'
+          composer.error.style.display = 'block'
+          composer.status.textContent = ''
+        } else {
+          composer.error.textContent = 'Send failed. Please try again.'
+          composer.error.style.display = 'block'
+          composer.status.textContent = ''
+        }
+      } catch (_e) {
+        composer.error.textContent = 'Could not reach the server.'
+        composer.error.style.display = 'block'
+        composer.status.textContent = ''
+      } finally {
+        composer.sendBtn.disabled = false
+      }
     })
 
     init()
