@@ -1,6 +1,6 @@
 # Webmail UI — Implementation Plan
 
-> **Status:** Phase 0 in progress — `packages/webmail` scaffolded & running
+> **Status:** Phases 0–2 done — frontend scaffold + backend HTTP API serving real mail (login, folders, messages) end-to-end. Next: Phase 3 (frontend app shell & auth UI).
 > **Owner:** TBD
 > **Last updated:** 2026-06-01
 > **Estimated effort:** ~8–12 weeks (multi-phase, see [Phases](#phases))
@@ -227,55 +227,55 @@ documented decision if it fights the toolchain.
 
 ---
 
-### Phase 1 — Backend: browser auth & sessions  ·  ~1 week
+### Phase 1 — Backend: browser auth & sessions  ·  ✅ DONE
 The webmail can't do anything per-user without authenticated browser sessions.
 
 **Tasks**
-- [ ] `sessions` table in SQLite (id, user_id, token hash, created/expires,
-      user-agent/ip, csrf secret). Migration + queries.
-- [ ] `webmail_session.zig`: create/validate/revoke sessions; secure,
-      `HttpOnly`, `SameSite=Lax/Strict`, `Secure` cookies.
-- [ ] `POST /webmail/auth/login` — verify credentials via existing
-      `auth.zig`/`password.zig` (Argon2id), issue session.
-- [ ] `POST /webmail/auth/logout` — revoke session.
-- [ ] `GET /webmail/auth/me` — current user info.
-- [ ] CSRF: issue token (reuse `csrf.zig`), require it on mutating requests.
-- [ ] Rate-limit login attempts (reuse existing rate-limit infra if present).
+- [x] `webmail_sessions` table in SQLite (session_id, username, email,
+      csrf_secret, created/last_activity/expires, ip, user-agent). Migration + CRUD.
+- [x] `webmail_session.zig`: create/validate/revoke sessions; `HttpOnly`,
+      `SameSite=Lax`, `Secure` cookies; sliding idle expiry; 256-bit tokens.
+- [x] `POST /webmail/auth/login` — verifies via `AuthBackend` (Argon2id), mints session.
+- [x] `POST /webmail/auth/logout` — revokes session (server-side + clears cookie).
+- [x] `GET /webmail/auth/me` — current user info.
+- [x] CSRF: per-session secret issued; same-origin check on logout. (Per-action
+      CSRF *token enforcement* on mailbox mutations deferred to Phase 5, when
+      those endpoints exist.)
+- [x] Rate-limit login per IP (429) via `auth/security.zig` RateLimiter.
+- [x] Login timing equalized (dummy Argon2 on unknown/disabled user) — no
+      username enumeration.
 
-**Acceptance**
-- `curl` login returns a session cookie; authenticated `/webmail/auth/me`
-  returns the user; logout invalidates it; bad password is rate-limited.
+**Acceptance** ✅ verified end-to-end with `curl`: login→cookie, `/auth/me`,
+logout invalidation, bad-password 401, rate-limit 429, cross-origin logout 403.
 
-**Risks:** Argon2id uses `p=1` in this project (test-runner constraint) — verify
-the login path works under the real server, not just tests.
+**Note:** Fixed a pre-existing bug — `users.digest_ha1` was SELECTed but never
+created, so every credential check failed on a fresh DB. Added the migration.
 
 ---
 
-### Phase 2 — Backend: HTTP wiring + real read path  ·  ~1.5–2 weeks
+### Phase 2 — Backend: HTTP wiring + real read path  ·  ✅ DONE
 Make the webmail API live and back it with **real mail** from Maildir + SQLite.
 
 **Tasks**
-- [ ] Wire an HTTP listener that routes `/webmail/*` to a webmail handler
-      (either revive `WebmailHandler.handleRequest` or fold into `api.zig`).
-      Decide whether webmail HTTP is always-on or config-gated.
-- [ ] **Folders:** enumerate real folders (Maildir layout + any SQLite metadata),
-      with real unread/total counts. Replace `getFolders` mock.
-- [ ] **Message list:** read messages from Maildir (`cur`/`new`), parse minimal
-      headers (From/To/Subject/Date/flags from `:2,FLAGS`), paginate, sort.
-      Replace `getMessages` mock. Map Maildir flags ↔ JSON (`seen`, `flagged`,
-      `answered`, `draft`, `deleted`).
-- [ ] **Message detail:** full headers, MIME parse → HTML part + text part +
-      attachment metadata. Reuse existing MIME parsing if present in the codebase.
-- [ ] **Attachment download:** stream a part by id with correct content-type.
-- [ ] Ensure **UID consistency** with the IMAP UID mapping (CLAUDE.md notes a
-      `uidSetToSeqSet()` and SQLite UID mappings — read state must agree).
+- [x] HTTP listener (`webmail_http.zig`) routing `/webmail/*`, config-gated via
+      `SMTP_ENABLE_WEBMAIL` (off by default). New module, not the old dead
+      `WebmailHandler`; thread-per-conn mirroring the IMAP accept loop.
+- [x] **Folders:** real folders + unread/total counts (`webmail_maildir.zig`).
+- [x] **Message list:** reads Maildir `new`/`cur`, parses From/To/Subject/Date,
+      flags from `:2,FLAGS`, paginated, newest-first; JSON flag mapping.
+- [x] **Message detail:** headers + MIME parse → text + html parts + attachment
+      metadata. Wrote a minimal MIME parser (multipart, base64/QP, RFC 2047).
+- [x] **UID consistency:** assigns UIDs via the shared `imap_uids` table in
+      oldest-first order (matching IMAP `syncUids`) — verified identical mapping.
+- [ ] **Attachment download:** metadata is returned; streaming the bytes by id
+      is deferred to Phase 4/6 (reading-pane work).
 
-**Acceptance**
-- Logged-in user sees their **real** Inbox list and can open a real message
-  (headers + body + attachment metadata) end-to-end via the API.
+**Acceptance** ✅ verified end-to-end: logged-in user sees their real INBOX
+(counts + list) and opens a real message (headers + text + html + attachment
+metadata) via the API; path-traversal folders rejected (400); missing UID 404.
 
-**Risks:** MIME edge cases (nested multipart, encodings, inline images). Lean on
-existing parser code; add fixtures from `tests/`.
+**Note:** Also fixed a pre-existing macOS/BSD socket bug (`SOCK_CLOEXEC` in the
+`socket()` type arg) that prevented the server binding anywhere but Linux.
 
 ---
 
