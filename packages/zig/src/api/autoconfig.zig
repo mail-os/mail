@@ -1199,6 +1199,56 @@ test "Apple mobileconfig generation" {
     try std.testing.expect(std.mem.indexOf(u8, xml, "<key>OutgoingPasswordSameAsIncomingPassword</key>") != null);
 }
 
+test "Apple mobileconfig - CalDAV/CardDAV advertise the public port, not the bind port" {
+    const allocator = std.testing.allocator;
+    // caldav_port is the PUBLIC-facing port (443). It must never be confused
+    // with an internal bind port like 8443 — clients can only reach 443, so an
+    // 8443 here makes Calendar/Contacts silently fail to connect.
+    const config = AutoconfigConfig{
+        .hostname = "mail.example.com",
+        .domain = "example.com",
+        .caldav_hostname = "mail.example.com",
+        .caldav_port = 443,
+        .enable_carddav = true,
+        .enable_caldav_profile = true,
+    };
+
+    const xml = try generateAppleMobileconfig(allocator, config, "user@example.com");
+    defer allocator.free(xml);
+
+    // Both DAV payloads must advertise 443...
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<key>CalDAVPort</key>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<key>CardDAVPort</key>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<integer>443</integer>") != null);
+    // ...and must NOT leak the internal bind port.
+    try std.testing.expect(std.mem.indexOf(u8, xml, "<integer>8443</integer>") == null);
+}
+
+test "Apple mobileconfig - dav-only profile omits the email payload (no account collision)" {
+    const allocator = std.testing.allocator;
+    // services=dav path: a user who already has Mail configured installs only
+    // Calendar+Contacts. The IMAP email payload MUST be absent, or the atomic
+    // profile install fails with "This account already exists".
+    const config = AutoconfigConfig{
+        .hostname = "mail.example.com",
+        .domain = "example.com",
+        .caldav_port = 443,
+        .enable_email = false,
+        .enable_carddav = true,
+        .enable_caldav_profile = true,
+    };
+
+    const xml = try generateAppleMobileconfig(allocator, config, "user@example.com");
+    defer allocator.free(xml);
+
+    // No mail account payload at all.
+    try std.testing.expect(std.mem.indexOf(u8, xml, "com.apple.mail.managed") == null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "EmailTypeIMAP") == null);
+    // But Calendar + Contacts are present.
+    try std.testing.expect(std.mem.indexOf(u8, xml, "com.apple.caldav.account") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "com.apple.carddav.account") != null);
+}
+
 test "Apple mobileconfig - deterministic UUIDs" {
     const allocator = std.testing.allocator;
     const config = AutoconfigConfig{

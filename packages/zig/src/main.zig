@@ -453,6 +453,14 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         const port_str = env.get("CALDAV_SSL_PORT") orelse "443";
         break :blk std.fmt.parseInt(u16, port_str, 10) catch 443;
     };
+    // Publicly reachable HTTPS port advertised in the Apple .mobileconfig for
+    // CalDAV/CardDAV. Defaults to 443 (the standard HTTPS port clients try),
+    // independent of the internal bind port above — set CALDAV_PUBLIC_SSL_PORT
+    // only if DAV is reachable on a non-standard public port.
+    const caldav_public_ssl_port: u16 = blk: {
+        const port_str = env.get("CALDAV_PUBLIC_SSL_PORT") orelse "443";
+        break :blk std.fmt.parseInt(u16, port_str, 10) catch 443;
+    };
 
     if (enable_caldav and auth_ptr != null) {
         // Persist CalDAV/CardDAV data to SQLite so calendars/contacts survive
@@ -471,6 +479,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
             .public_hostname = cfg.hostname,
             .imaps_port = 993,
             .submission_port = 587,
+            .public_dav_port = caldav_public_ssl_port,
             .display_name = cfg.hostname,
             .delivery_method = cfg.delivery_method,
             .ses_region = cfg.ses_region,

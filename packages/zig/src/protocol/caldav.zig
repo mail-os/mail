@@ -52,6 +52,12 @@ pub const CalDavConfig = struct {
     public_hostname: []const u8 = "localhost",
     imaps_port: u16 = 993,
     submission_port: u16 = 587,
+    // Publicly reachable HTTPS port for CalDAV/CardDAV, as advertised in the
+    // Apple .mobileconfig. This is intentionally separate from `ssl_port` (the
+    // internal bind port): the server may bind 8443 behind a 443 firewall
+    // forward / proxy, but the profile MUST advertise the port clients can
+    // actually reach (443), or Calendar/Contacts silently fail to connect.
+    public_dav_port: u16 = 443,
     display_name: []const u8 = "Mail",
     // Outbound delivery (used by EWS CreateItem/SendItem to actually send mail).
     delivery_method: core_config.DeliveryMethod = .direct,
@@ -1954,7 +1960,7 @@ fn webMobileconfig(allocator: std.mem.Allocator, config: *const CalDavConfig, pa
         .enable_caldav_profile = config.enable_caldav and !eas_only,
         .enable_eas = eas_only,
         .caldav_hostname = config.public_hostname,
-        .caldav_port = config.ssl_port,
+        .caldav_port = config.public_dav_port,
     };
     const profile = try autoconfig.generateAppleMobileconfig(allocator, ac, email);
     return .{ .content_type = "application/x-apple-aspen-config; charset=utf-8", .body = profile, .disposition = "attachment; filename=\"mail.mobileconfig\"" };
@@ -2431,7 +2437,7 @@ const TlsCalDavSession = struct {
             .enable_caldav_profile = config.enable_caldav and !eas_only,
             .enable_eas = eas_only,
             .caldav_hostname = config.public_hostname,
-            .caldav_port = config.ssl_port,
+            .caldav_port = config.public_dav_port,
         };
 
         const profile = try autoconfig.generateAppleMobileconfig(self.allocator, ac, email);
