@@ -38,7 +38,7 @@
   </div>
 
   <script>
-    const state = { user: null, folder: 'INBOX', messages: [], selectedUid: null }
+    const state = { user: null, folder: 'INBOX', messages: [], selectedUid: null, suppressAutoRead: new Set() }
 
     // HTML-escape untrusted text before inserting via innerHTML.
     function esc(s) {
@@ -107,7 +107,7 @@
             <span class="wm-msg-from">${esc(m.from)}</span>
             <span class="wm-msg-date">${shortDate(m.date)}</span>
           </div>
-          <div class="wm-msg-subject">${esc(m.subject || '(no subject)')}</div>
+          <div class="wm-msg-subject">${m.flags && m.flags.flagged ? '<span class="wm-msg-flag" title="Flagged">★</span> ' : ''}${esc(m.subject || '(no subject)')}</div>
           <div class="wm-msg-snippet">${esc(m.snippet)}</div>
           ${m.has_attachments ? '<span class="wm-msg-attach" title="Has attachments">📎</span>' : ''}
         </div>`).join('')
@@ -120,6 +120,7 @@
       if (name === state.folder) return
       state.folder = name
       state.selectedUid = null
+      state.suppressAutoRead.clear() // UIDs are per-folder; don't carry across
       document.getElementById('listTitle').textContent = name
       document.getElementById('app').classList.remove('wm--reading')
       showReadEmpty()
@@ -141,14 +142,87 @@
       if (!res.ok) { body.innerHTML = '<div class="wm-state">Failed to load message.</div>'; return }
       const m = await res.json()
       renderMessage(m)
+
+      // Auto mark-read on open (only if currently unread). Skipped if the user
+      // just manually marked this message unread — otherwise re-opening would
+      // immediately re-mark it read and the two PUTs would race.
+      const item = state.messages.find(x => x.uid === uid)
+      if (item && item.flags && !item.flags.seen && !state.suppressAutoRead.has(uid)) {
+        item.flags.seen = true
+        renderList()
+        const ok = await mutateFlags(uid, item.flags)
+        if (ok) { await loadFolders() } else { item.flags.seen = false; renderList() }
+      }
+    }
+
+    // Mutating request helper: PUT flags/move. Same-origin header satisfies the
+    // backend CSRF guard. Returns the parsed JSON or null on failure.
+    async function mutateFlags(uid, flags) {
+      try {
+        const res = await api('/webmail/api/messages/' + uid + '?folder=' + encodeURIComponent(state.folder), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', 'Origin': window.location.origin },
+          body: JSON.stringify({ flags }),
+        })
+        return res.ok ? await res.json() : null
+      } catch (_e) { return null }
+    }
+
+    function currentMessage() {
+      return state.messages.find(x => x.uid === state.selectedUid)
+    }
+
+    async function toggleFlag() {
+      const m = currentMessage()
+      if (!m) return
+      m.flags.flagged = !m.flags.flagged
+      renderList(); renderMessage(m)
+      const ok = await mutateFlags(m.uid, m.flags)
+      if (!ok) { m.flags.flagged = !m.flags.flagged; renderList(); renderMessage(m) } // rollback
+    }
+
+    async function markUnread() {
+      const m = currentMessage()
+      if (!m) return
+      m.flags.seen = false
+      // Remember so a subsequent open() doesn't auto-re-mark-read and race us.
+      state.suppressAutoRead.add(m.uid)
+      renderList(); renderMessage(m)
+      const ok = await mutateFlags(m.uid, m.flags)
+      if (ok) { await loadFolders() } else { m.flags.seen = true; renderList(); renderMessage(m) }
+    }
+
+    async function deleteCurrent() {
+      const m = currentMessage()
+      if (!m) return
+      const uid = m.uid
+      // Optimistic: drop from list + close reader.
+      state.messages = state.messages.filter(x => x.uid !== uid)
+      state.selectedUid = null
+      document.getElementById('app').classList.remove('wm--reading')
+      showReadEmpty(); renderList()
+      try {
+        await api('/webmail/api/messages/' + uid + '?folder=' + encodeURIComponent(state.folder), {
+          method: 'DELETE',
+          headers: { 'Origin': window.location.origin },
+        })
+      } catch (_e) { /* best-effort; refresh will reconcile */ }
+      await loadFolders()
+      await loadMessages()
     }
 
     function renderMessage(m) {
       const body = document.getElementById('readBody')
       const attachments = (m.attachments || []).map(a =>
         `<span class="wm-attach-chip">📎 ${esc(a.filename)}</span>`).join('')
+      const flags = m.flags || {}
 
       body.innerHTML = `
+        <div class="wm-read-toolbar">
+          <button class="wm-action" data-act="flag" title="Flag">${flags.flagged ? '★ Flagged' : '☆ Flag'}</button>
+          <button class="wm-action" data-act="unread" title="Mark unread">Mark unread</button>
+          <button class="wm-action wm-action--danger" data-act="delete" title="Delete">🗑 Delete</button>
+        </div>
         <h2 class="wm-read-subject">${esc(m.subject || '(no subject)')}</h2>
         <div class="wm-read-meta">
           <div><span class="wm-read-label">From</span> ${esc(m.from)}</div>
@@ -168,6 +242,14 @@
         const frame = body.querySelector('.wm-read-html')
         frame.srcdoc = m.html
       }
+      body.querySelectorAll('.wm-action').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const act = btn.getAttribute('data-act')
+          if (act === 'flag') toggleFlag()
+          else if (act === 'unread') markUnread()
+          else if (act === 'delete') deleteCurrent()
+        })
+      })
     }
 
     function showReadEmpty() {

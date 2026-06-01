@@ -35,6 +35,19 @@ pub const DatabaseError = error{
     AlreadyExists,
 };
 
+/// Strip the Maildir `:2,FLAGS` suffix, returning the stable message identity.
+///
+/// The imap_uids table keys UIDs on this base name, NOT the full filename:
+/// flag changes (mark read, flag, etc.) rename the file by changing the suffix,
+/// so keying on the full name would churn the UID on every flag change (and made
+/// IMAP, ActiveSync, and webmail disagree, since they touched the same table
+/// with different key conventions). Keying on the base name makes the UID stable
+/// across flag mutations and consistent across all protocols.
+pub fn maildirBaseName(filename: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, filename, ":2,")) |pos| return filename[0..pos];
+    return filename;
+}
+
 pub const Statement = struct {
     stmt: *sqlite.sqlite3_stmt,
     allocator: std.mem.Allocator,
@@ -1494,6 +1507,9 @@ pub const Database = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        // Key on the flag-suffix-stripped base name (see maildirBaseName).
+        const base = maildirBaseName(filename);
+
         const sql = "SELECT uid FROM imap_uids WHERE username = ?1 AND mailbox = ?2 AND filename = ?3";
         const sql_z = try self.allocator.dupeZ(u8, sql);
         defer self.allocator.free(sql_z);
@@ -1506,7 +1522,7 @@ pub const Database = struct {
         defer self.allocator.free(u_z);
         const m_z = try self.allocator.dupeZ(u8, mailbox);
         defer self.allocator.free(m_z);
-        const f_z = try self.allocator.dupeZ(u8, filename);
+        const f_z = try self.allocator.dupeZ(u8, base);
         defer self.allocator.free(f_z);
         _ = sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null);
         _ = sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null);
@@ -1523,6 +1539,9 @@ pub const Database = struct {
     pub fn assignUid(self: *Database, username: []const u8, mailbox: []const u8, filename: []const u8) !i64 {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        // Key on the flag-suffix-stripped base name (see maildirBaseName).
+        const base = maildirBaseName(filename);
 
         // Get current uidnext
         var uidnext: i64 = 1;
@@ -1564,7 +1583,7 @@ pub const Database = struct {
             defer self.allocator.free(u_z);
             const m_z = try self.allocator.dupeZ(u8, mailbox);
             defer self.allocator.free(m_z);
-            const f_z = try self.allocator.dupeZ(u8, filename);
+            const f_z = try self.allocator.dupeZ(u8, base);
             defer self.allocator.free(f_z);
             _ = sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null);
             _ = sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null);
@@ -1572,8 +1591,15 @@ pub const Database = struct {
             _ = sqlite.sqlite3_bind_int64(stmt, 4, uid);
 
             rc = sqlite.sqlite3_step(stmt);
-            if (rc != sqlite.SQLITE_DONE) {
-                // UNIQUE constraint — might already be assigned, read existing
+            if (rc != sqlite.SQLITE_DONE) return DatabaseError.StepFailed;
+
+            // INSERT OR IGNORE returns SQLITE_DONE even when the UNIQUE(base
+            // filename) constraint suppressed the insert (the row already has a
+            // UID). Detect that via sqlite3_changes == 0 and return the EXISTING
+            // UID without consuming a new one — otherwise re-assigning an
+            // already-known message (e.g. after a flag change) would mint a new
+            // UID and churn uidnext, breaking UID stability.
+            if (sqlite.sqlite3_changes(self.db) == 0) {
                 const get_sql = "SELECT uid FROM imap_uids WHERE username = ?1 AND mailbox = ?2 AND filename = ?3";
                 const get_z = try self.allocator.dupeZ(u8, get_sql);
                 defer self.allocator.free(get_z);
@@ -1586,7 +1612,7 @@ pub const Database = struct {
                 defer self.allocator.free(u2_z);
                 const m2_z = try self.allocator.dupeZ(u8, mailbox);
                 defer self.allocator.free(m2_z);
-                const f2_z = try self.allocator.dupeZ(u8, filename);
+                const f2_z = try self.allocator.dupeZ(u8, base);
                 defer self.allocator.free(f2_z);
                 _ = sqlite.sqlite3_bind_text(get_stmt, 1, u2_z.ptr, -1, null);
                 _ = sqlite.sqlite3_bind_text(get_stmt, 2, m2_z.ptr, -1, null);
@@ -1658,10 +1684,12 @@ pub const Database = struct {
                 if (db_filename_ptr) |ptr| {
                     const len = sqlite.sqlite3_column_bytes(stmt, 1);
                     const db_filename = ptr[0..@intCast(len)];
-                    // Check if this file still exists in the current file list
+                    // Rows are keyed on the base name; current_files are full
+                    // Maildir names, so compare on base name (a flag rename must
+                    // not look like the message disappeared).
                     var found = false;
                     for (current_files) |f| {
-                        if (std.mem.eql(u8, f, db_filename)) {
+                        if (std.mem.eql(u8, maildirBaseName(f), db_filename)) {
                             found = true;
                             break;
                         }

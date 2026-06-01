@@ -11,9 +11,10 @@
 //! where {user} is the local part of the address (no domain).
 //!
 //! Flags come from the Maildir `:2,FLAGS` filename suffix (see imap.MaildirFlags).
-//! UIDs are resolved via db.getUidForFile / db.assignUid keyed on the full
-//! filename — identical to what `ImapSession.syncUids` does — so a message has
-//! the same UID in webmail as over IMAP.
+//! UIDs are resolved via db.getUidForFile / db.assignUid, which key on the
+//! Maildir BASE name (suffix stripped, see database.maildirBaseName) — identical
+//! to what IMAP's syncUids resolves to — so a message keeps the same UID across
+//! flag changes and is identified the same way in webmail and over IMAP.
 //!
 //! Allocation model: callers pass an allocator that is expected to be an arena
 //! (the HTTP layer uses a per-request arena). Nothing here frees individually;
@@ -29,6 +30,8 @@ const imap = @import("../protocol/imap.zig");
 pub const MaildirError = error{
     InvalidFolderName,
     MessageNotFound,
+    WriteFailed,
+    Conflict,
 };
 
 /// The set of folders webmail exposes. Order is the display order.
@@ -297,6 +300,206 @@ pub fn getMessage(
         };
     }
     return MaildirError.MessageNotFound;
+}
+
+// ── Write operations (flags / move / delete) ─────────────────────────────────
+//
+// These persist by renaming/moving Maildir files exactly as the IMAP server
+// does (imap.zig handleStore/handleMove/handleExpunge), so a change made in
+// webmail is seen identically over IMAP and vice versa. UIDs are keyed on the
+// Maildir base name (database.maildirBaseName), so a flag rename keeps the same
+// UID — no imap_uids update is needed for flag changes.
+
+/// Locate the FileRef for a UID within a folder. Returns null if not found.
+/// Caller must have called preassignUids first (so UIDs are assigned).
+fn findByUid(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, uid: i64) !?FileRef {
+    const refs = try collectFiles(allocator, user, folder);
+    preassignUids(db, user, folder, refs);
+    for (refs, 0..) |r, idx| {
+        if (uidFor(db, user, folder, r.name, @intCast(idx + 1)) == uid) return r;
+    }
+    return null;
+}
+
+/// POSIX rename via libc (mirrors imap.zig renameFile). Returns true on success.
+fn renamePath(old_path: []const u8, new_path: []const u8) bool {
+    var ob: [4097]u8 = undefined;
+    var nb: [4097]u8 = undefined;
+    if (old_path.len >= ob.len or new_path.len >= nb.len) return false;
+    @memcpy(ob[0..old_path.len], old_path);
+    ob[old_path.len] = 0;
+    @memcpy(nb[0..new_path.len], new_path);
+    nb[new_path.len] = 0;
+    return std.c.rename(@ptrCast(&ob), @ptrCast(&nb)) == 0;
+}
+
+/// Unlink a path, propagating failure. Callers must NOT ignore the error: a
+/// silently-ignored unlink leaves a deleted/moved message on disk while the
+/// caller reports success (data-consistency bug).
+fn unlinkPath(allocator: std.mem.Allocator, path: []const u8) !void {
+    const z = try allocator.dupeZ(u8, path);
+    defer allocator.free(z);
+    if (std.c.unlink(z.ptr) != 0) return MaildirError.WriteFailed;
+}
+
+/// A Maildir entry name must be a single path component. Reject anything with a
+/// separator or parent ref so a planted/crafted filename can't make rename or
+/// unlink escape the mailbox directory (defense-in-depth alongside the symlink
+/// skip in fs_compat.listEmlFiles).
+fn isSafeName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, name, '/') != null) return false;
+    if (std.mem.indexOf(u8, name, "..") != null) return false;
+    if (name[0] == '.') return false;
+    return true;
+}
+
+/// Build the `:2,FLAGS` Maildir suffix from a Flags value (alphabetical order,
+/// matching imap.MaildirFlags.toSuffix: D,F,R,S,T).
+fn suffixFor(flags: Flags, buf: []u8) []const u8 {
+    var n: usize = 0;
+    const prefix = ":2,";
+    @memcpy(buf[0..prefix.len], prefix);
+    n = prefix.len;
+    if (flags.draft) {
+        buf[n] = 'D';
+        n += 1;
+    }
+    if (flags.flagged) {
+        buf[n] = 'F';
+        n += 1;
+    }
+    if (flags.answered) {
+        buf[n] = 'R';
+        n += 1;
+    }
+    if (flags.seen) {
+        buf[n] = 'S';
+        n += 1;
+    }
+    if (flags.deleted) {
+        buf[n] = 'T';
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// Set the flags on a message (by UID) by renaming its Maildir file's suffix.
+/// The base name (and thus the UID) is unchanged. Returns the resulting Flags.
+pub fn setFlags(
+    allocator: std.mem.Allocator,
+    db: *database.Database,
+    user: []const u8,
+    folder: []const u8,
+    uid: i64,
+    flags: Flags,
+) !Flags {
+    if (!isValidFolderName(folder)) return MaildirError.InvalidFolderName;
+    _ = db.getOrCreateMailbox(user, folder) catch {};
+
+    // Retry once: a concurrent rename (IMAP STORE, or another webmail request)
+    // between resolving the file and renaming it would otherwise fail as a
+    // generic write error and silently drop the flag change. Re-resolve the
+    // current on-disk name and try again before reporting a conflict.
+    var attempt: u8 = 0;
+    while (attempt < 2) : (attempt += 1) {
+        const ref = (try findByUid(allocator, db, user, folder, uid)) orelse return MaildirError.MessageNotFound;
+        if (!isSafeName(ref.name)) return MaildirError.WriteFailed;
+
+        const base = imap.MaildirFlags.baseName(ref.name);
+        var suffix_buf: [16]u8 = undefined;
+        const suffix = suffixFor(flags, &suffix_buf);
+        const new_name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ base, suffix });
+
+        if (std.mem.eql(u8, ref.name, new_name)) return flags; // already in the desired state
+
+        const old_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ref.dir, ref.name });
+        const new_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ref.dir, new_name });
+        if (renamePath(old_path, new_path)) return flags;
+        // Rename failed — the file may have been renamed out from under us. Loop
+        // to re-resolve; if it fails again, report a conflict.
+    }
+    return MaildirError.Conflict;
+}
+
+/// Move a message (by UID) to another folder. The file is physically moved and
+/// a UID is assigned in the destination mailbox; the source UID becomes stale on
+/// the next sync. Returns the new UID in the destination folder.
+pub fn moveMessage(
+    allocator: std.mem.Allocator,
+    db: *database.Database,
+    user: []const u8,
+    src_folder: []const u8,
+    uid: i64,
+    dst_folder: []const u8,
+) !i64 {
+    if (!isValidFolderName(src_folder) or !isValidFolderName(dst_folder)) return MaildirError.InvalidFolderName;
+    if (std.mem.eql(u8, src_folder, dst_folder)) return uid;
+    _ = db.getOrCreateMailbox(user, src_folder) catch {};
+    _ = db.getOrCreateMailbox(user, dst_folder) catch {};
+
+    const ref = (try findByUid(allocator, db, user, src_folder, uid)) orelse return MaildirError.MessageNotFound;
+    if (!isSafeName(ref.name)) return MaildirError.WriteFailed;
+
+    // Destination dir: INBOX lives in new/, other folders in the folder dir.
+    const dst_dir = if (std.ascii.eqlIgnoreCase(dst_folder, "INBOX"))
+        try std.fmt.allocPrint(allocator, "mail/{s}/new", .{user})
+    else
+        try std.fmt.allocPrint(allocator, "mail/{s}/{s}", .{ user, dst_folder });
+    fs_compat.ensureDir(dst_dir) catch {};
+
+    const old_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ref.dir, ref.name });
+    const new_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dst_dir, ref.name });
+
+    // Assign the destination UID FIRST. UID keying is on the base name, so this
+    // is correct regardless of the physical move; doing it before the move means
+    // a UID failure aborts cleanly without leaving an orphaned file, and the
+    // returned UID is always the real destination UID (never a stale source one).
+    const dst_uid = try db.assignUid(user, dst_folder, ref.name);
+
+    // Prefer an atomic rename; fall back to copy+unlink across filesystems.
+    if (!renamePath(old_path, new_path)) {
+        const content = fs_compat.readFileAlloc(allocator, old_path) catch return MaildirError.WriteFailed;
+        const f = fs_compat.cwd().createFile(new_path, .{}) catch return MaildirError.WriteFailed;
+        f.writeAll(content) catch {
+            f.close();
+            unlinkPath(allocator, new_path) catch {}; // don't leave a partial copy
+            return MaildirError.WriteFailed;
+        };
+        f.close();
+        // If the source unlink fails, the message would exist in BOTH folders.
+        // Roll back the destination copy and fail rather than duplicate.
+        unlinkPath(allocator, old_path) catch {
+            unlinkPath(allocator, new_path) catch {};
+            return MaildirError.WriteFailed;
+        };
+    }
+
+    return dst_uid;
+}
+
+/// Delete a message (by UID): move it to Trash, or permanently unlink if it is
+/// already in Trash. Returns true on success.
+pub fn deleteMessage(
+    allocator: std.mem.Allocator,
+    db: *database.Database,
+    user: []const u8,
+    folder: []const u8,
+    uid: i64,
+) !void {
+    if (!isValidFolderName(folder)) return MaildirError.InvalidFolderName;
+
+    if (std.ascii.eqlIgnoreCase(folder, "Trash")) {
+        // Permanent delete from Trash.
+        _ = db.getOrCreateMailbox(user, folder) catch {};
+        const ref = (try findByUid(allocator, db, user, folder, uid)) orelse return MaildirError.MessageNotFound;
+        if (!isSafeName(ref.name)) return MaildirError.WriteFailed;
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ref.dir, ref.name });
+        try unlinkPath(allocator, path); // propagate failure — don't report a phantom success
+        return;
+    }
+
+    _ = try moveMessage(allocator, db, user, folder, uid, "Trash");
 }
 
 // ── Minimal RFC 5322 / MIME parsing ──────────────────────────────────────────

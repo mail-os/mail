@@ -6,6 +6,21 @@
 /// link libc for sqlite3).
 const std = @import("std");
 
+// readlink, declared directly (CLAUDE.md convention). Used to detect symlinks
+// when listing Maildir files so later rename/unlink on those names can't follow
+// a planted symlink out of the dir. We use readlink rather than lstat because
+// std.c.Stat's fields aren't portable across our cross-compile targets (the
+// Linux minimal libc Stat lacks `.mode`); readlink has a stable signature
+// everywhere and needs no struct.
+extern "c" fn readlink(path: [*:0]const u8, buf: [*]u8, bufsiz: usize) isize;
+
+/// True if `path` is a symlink. readlink succeeds (>= 0) only on symlinks; on a
+/// regular file it fails with EINVAL, so a negative return means "not a symlink".
+fn isSymlink(path: [*:0]const u8) bool {
+    var dummy: [1]u8 = undefined;
+    return readlink(path, &dummy, dummy.len) >= 0;
+}
+
 pub const Dir = struct {
     /// Open a file relative to cwd.
     pub fn openFile(self: Dir, sub_path: []const u8, flags: OpenFlags) OpenError!File {
@@ -299,10 +314,15 @@ pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]con
         entries.deinit(allocator);
     }
 
+    var path_buf: [4097]u8 = undefined;
     while (std.c.readdir(dir)) |entry| {
         const name_ptr: [*:0]const u8 = @ptrCast(&entry.name);
         const name = std.mem.sliceTo(name_ptr, 0);
         if (name.len > 4 and (std.mem.endsWith(u8, name, ".eml") or std.mem.indexOf(u8, name, ".eml:") != null)) {
+            // Skip symlinks: these names are later fed to rename/unlink, and a
+            // symlink could redirect those operations outside the mailbox.
+            const full = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ dir_path, name }) catch continue;
+            if (isSymlink(full)) continue;
             const owned = try allocator.dupe(u8, name);
             try entries.append(allocator, .{
                 .name = owned,

@@ -215,6 +215,22 @@ body {
 
 .wm-state { padding: 32px 16px; color: var(--muted); text-align: center; }
 
+/* ── Reading-pane toolbar + flag indicator ─────────────────────────────── */
+.wm-read-toolbar { display: flex; gap: 8px; margin-bottom: 16px; }
+.wm-action {
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+.wm-action:hover { background: var(--bg); }
+.wm-action--danger { color: #c0392b; }
+.wm-action--danger:hover { background: #fdecea; }
+.wm-msg-flag { color: #e0a000; }
+
 /* ── Responsive: collapse to one pane on mobile ────────────────────────── */
 @media (max-width: 860px) {
   .wm { grid-template-columns: 1fr; }

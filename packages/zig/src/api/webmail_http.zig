@@ -304,11 +304,26 @@ fn handleConnection(server: *WebmailHttpServer, conn: socket.Connection, arena: 
     if (std.mem.startsWith(u8, p, "/webmail/api/messages/") and std.mem.eql(u8, req.method, "GET")) {
         return handleMessageDetail(server, conn, arena, req);
     }
+    if (std.mem.startsWith(u8, p, "/webmail/api/messages/") and std.mem.eql(u8, req.method, "PUT")) {
+        return handleMessageUpdate(server, conn, arena, req);
+    }
+    if (std.mem.startsWith(u8, p, "/webmail/api/messages/") and std.mem.eql(u8, req.method, "DELETE")) {
+        return handleMessageDelete(server, conn, arena, req);
+    }
     if (std.mem.eql(u8, p, "/webmail/api/messages") and std.mem.eql(u8, req.method, "GET")) {
         return handleMessageList(server, conn, arena, req);
     }
 
     try sendError(conn, arena, 404, "not_found", "No such endpoint");
+}
+
+/// Parse the :uid from a /webmail/api/messages/:uid path (ignores any query,
+/// already stripped). Returns null on malformed input.
+fn uidFromPath(path: []const u8) ?i64 {
+    const prefix = "/webmail/api/messages/";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    const rest = path[prefix.len..];
+    return std.fmt.parseInt(i64, rest, 10) catch null;
 }
 
 /// Resolve the authenticated session for a request, or send 401 and return null.
@@ -506,6 +521,76 @@ fn handleMessageDetail(server: *WebmailHttpServer, conn: socket.Connection, aren
     try sendJson(conn, arena, 200, body.items, null);
 }
 
+/// PUT /webmail/api/messages/:uid  { flags?: {...}, folder?: "dest" }
+/// Sets flags (rename suffix) and/or moves the message to another folder.
+fn handleMessageUpdate(server: *WebmailHttpServer, conn: socket.Connection, arena: std.mem.Allocator, req: Request) !void {
+    // State-changing: require same-origin (CSRF guard) and a session.
+    if (!isSameOrigin(req)) return sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+
+    const uid = uidFromPath(req.path) orelse return sendError(conn, arena, 400, "bad_request", "Invalid message id");
+    const folder = req.queryParam(arena, "folder") orelse "INBOX";
+
+    var current_uid = uid;
+    var current_folder = folder;
+
+    // Move first if a destination folder is given, so a subsequent flag change
+    // applies to the message in its new home.
+    if (jsonStringField(req.body, "folder")) |dest| {
+        const new_uid = maildir.moveMessage(arena, server.db, sess.username, folder, uid, dest) catch |err| {
+            return mapMaildirError(conn, arena, err);
+        };
+        current_uid = new_uid;
+        current_folder = dest;
+    }
+
+    // Apply flags if present.
+    if (std.mem.indexOf(u8, req.body, "\"flags\"") != null) {
+        const flags = maildir.Flags{
+            .seen = jsonBoolField(req.body, "seen") orelse false,
+            .answered = jsonBoolField(req.body, "answered") orelse false,
+            .flagged = jsonBoolField(req.body, "flagged") orelse false,
+            .draft = jsonBoolField(req.body, "draft") orelse false,
+            .deleted = jsonBoolField(req.body, "deleted") orelse false,
+        };
+        _ = maildir.setFlags(arena, server.db, sess.username, current_folder, current_uid, flags) catch |err| {
+            return mapMaildirError(conn, arena, err);
+        };
+    }
+
+    var rb: std.ArrayList(u8) = .empty;
+    const w = jw(&rb, arena);
+    try w.print("{{\"ok\":true,\"uid\":{d},\"folder\":", .{current_uid});
+    try writeJsonString(w, current_folder);
+    try w.writeAll("}");
+    try sendJson(conn, arena, 200, rb.items, null);
+}
+
+/// DELETE /webmail/api/messages/:uid?folder=  → move to Trash (or purge in Trash)
+fn handleMessageDelete(server: *WebmailHttpServer, conn: socket.Connection, arena: std.mem.Allocator, req: Request) !void {
+    if (!isSameOrigin(req)) return sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+
+    const uid = uidFromPath(req.path) orelse return sendError(conn, arena, 400, "bad_request", "Invalid message id");
+    const folder = req.queryParam(arena, "folder") orelse "INBOX";
+
+    maildir.deleteMessage(arena, server.db, sess.username, folder, uid) catch |err| {
+        return mapMaildirError(conn, arena, err);
+    };
+    try sendJson(conn, arena, 200, "{\"ok\":true}", null);
+}
+
+fn mapMaildirError(conn: socket.Connection, arena: std.mem.Allocator, err: anyerror) !void {
+    return switch (err) {
+        maildir.MaildirError.MessageNotFound => sendError(conn, arena, 404, "not_found", "Message not found"),
+        maildir.MaildirError.InvalidFolderName => sendError(conn, arena, 400, "bad_request", "Invalid folder"),
+        maildir.MaildirError.Conflict => sendError(conn, arena, 409, "conflict", "Message changed concurrently; retry"),
+        else => sendError(conn, arena, 500, "server_error", "Operation failed"),
+    };
+}
+
 // ── JSON writers ─────────────────────────────────────────────────────────────
 
 /// Minimal writer over an unmanaged ArrayList(u8) + arena. The unmanaged
@@ -691,6 +776,7 @@ fn statusText(status: u16) []const u8 {
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
+        409 => "Conflict",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         else => "OK",
@@ -737,6 +823,35 @@ fn jsonStringField(body: []const u8, field: []const u8) ?[]const u8 {
     return body[start..i];
 }
 
+/// Extract a top-level boolean field (`"name": true/false`) from a small JSON
+/// object. Returns null if absent. Minimal — matches jsonStringField's scope.
+fn jsonBoolField(body: []const u8, field: []const u8) ?bool {
+    var needle_buf: [128]u8 = undefined;
+    if (field.len + 2 > needle_buf.len) return null;
+    needle_buf[0] = '"';
+    @memcpy(needle_buf[1 .. 1 + field.len], field);
+    needle_buf[1 + field.len] = '"';
+    const needle = needle_buf[0 .. field.len + 2];
+
+    const key_at = std.mem.indexOf(u8, body, needle) orelse return null;
+    var i = key_at + needle.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == '\t' or body[i] == ':' or body[i] == '\r' or body[i] == '\n')) : (i += 1) {}
+    const rest = body[i..];
+    // Require a JSON terminator after the literal so "trueX"/"falsey" are rejected.
+    if (jsonLiteralAt(rest, "true")) return true;
+    if (jsonLiteralAt(rest, "false")) return false;
+    return null;
+}
+
+/// True if `s` begins with `lit` followed by a JSON value terminator (so we
+/// match the literal `true`, not the prefix of `trueX`).
+fn jsonLiteralAt(s: []const u8, lit: []const u8) bool {
+    if (!std.mem.startsWith(u8, s, lit)) return false;
+    if (s.len == lit.len) return true;
+    const c = s[lit.len];
+    return c == ',' or c == '}' or c == ']' or c == ' ' or c == '\t' or c == '\r' or c == '\n';
+}
+
 /// URL-decode a query component (%XX and '+'). Arena-allocated.
 fn urlDecode(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -778,6 +893,31 @@ test "jsonStringField extracts simple fields" {
     try t.expectEqualStrings("chris", jsonStringField(body, "username").?);
     try t.expectEqualStrings("secret", jsonStringField(body, "password").?);
     try t.expect(jsonStringField(body, "missing") == null);
+}
+
+test "jsonBoolField parses booleans" {
+    const t = std.testing;
+    const body = "{\"flags\":{\"seen\":true,\"flagged\":false}}";
+    try t.expectEqual(@as(?bool, true), jsonBoolField(body, "seen"));
+    try t.expectEqual(@as(?bool, false), jsonBoolField(body, "flagged"));
+    try t.expectEqual(@as(?bool, null), jsonBoolField(body, "draft"));
+}
+
+test "jsonBoolField rejects non-terminated literals" {
+    const t = std.testing;
+    // "trueX"/"falsey" must NOT be accepted as true/false.
+    try t.expectEqual(@as(?bool, null), jsonBoolField("{\"seen\":trueX}", "seen"));
+    try t.expectEqual(@as(?bool, null), jsonBoolField("{\"seen\":falsey}", "seen"));
+    // Proper terminators are accepted.
+    try t.expectEqual(@as(?bool, true), jsonBoolField("{\"seen\":true}", "seen"));
+    try t.expectEqual(@as(?bool, true), jsonBoolField("{\"seen\":true,\"x\":1}", "seen"));
+}
+
+test "uidFromPath parses the uid" {
+    const t = std.testing;
+    try t.expectEqual(@as(?i64, 42), uidFromPath("/webmail/api/messages/42"));
+    try t.expectEqual(@as(?i64, null), uidFromPath("/webmail/api/messages/abc"));
+    try t.expectEqual(@as(?i64, null), uidFromPath("/other"));
 }
 
 test "jsonStringField rejects unterminated and trailing-backslash strings" {
