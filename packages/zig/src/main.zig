@@ -407,6 +407,11 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
                 .port = cfg.webmail_port,
                 .bind_host = "127.0.0.1",
                 .secure_cookies = cfg.webmail_secure_cookies,
+                // Outbound send settings: mirror the server's so webmail mail is
+                // delivered + DKIM-signed identically to SMTP submission.
+                .hostname = cfg.hostname,
+                .delivery_method = cfg.delivery_method,
+                .ses_region = cfg.ses_region,
             };
             webmail_server = webmail_http.WebmailHttpServer.init(allocator, wm_config, db_ptr.?, auth_ptr.?);
             log.info("Webmail HTTP server configured on 127.0.0.1:{d}", .{cfg.webmail_port});

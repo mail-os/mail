@@ -112,7 +112,11 @@ fn findHeaderValue(header_block: []const u8, name: []const u8) ?[]const u8 {
                 if (nl + 1 < header_block.len and (header_block[nl + 1] == ' ' or header_block[nl + 1] == '\t')) {
                     j = nl + 1; // folded; continue
                 } else {
-                    return header_block[vstart..nl]; // value up to (not incl) the newline
+                    // Value up to (not incl) the line's CRLF. Exclude the trailing
+                    // '\r' too, so the returned value is the header value proper.
+                    var vend = nl;
+                    if (vend > vstart and header_block[vend - 1] == '\r') vend -= 1;
+                    return header_block[vstart..vend];
                 }
             }
         }

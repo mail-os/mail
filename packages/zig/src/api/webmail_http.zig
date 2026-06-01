@@ -30,6 +30,8 @@ const auth_mod = @import("../auth/auth.zig");
 const session_mod = @import("webmail_session.zig");
 const maildir = @import("webmail_maildir.zig");
 const security = @import("../auth/security.zig");
+const core_config = @import("../core/config.zig");
+const compose = @import("webmail_compose.zig");
 
 pub const WebmailHttpConfig = struct {
     port: u16 = 8080,
@@ -40,6 +42,11 @@ pub const WebmailHttpConfig = struct {
     /// Max failed-or-not login attempts per IP within login_rate_window_seconds.
     login_rate_max: u32 = 10,
     login_rate_window_seconds: u64 = 300,
+    /// Outbound send settings — must mirror the server's so webmail mail is
+    /// delivered + DKIM-signed identically to SMTP submission.
+    hostname: []const u8 = "localhost",
+    delivery_method: core_config.DeliveryMethod = .ses,
+    ses_region: []const u8 = "us-east-1",
 };
 
 pub const WebmailHttpServer = struct {
@@ -298,6 +305,9 @@ fn handleConnection(server: *WebmailHttpServer, conn: socket.Connection, arena: 
     if (std.mem.eql(u8, p, "/webmail/auth/me") and std.mem.eql(u8, req.method, "GET")) {
         return handleMe(server, conn, arena, req);
     }
+    if (std.mem.eql(u8, p, "/webmail/api/compose") and std.mem.eql(u8, req.method, "POST")) {
+        return handleCompose(server, conn, arena, req);
+    }
     if (std.mem.eql(u8, p, "/webmail/api/folders") and std.mem.eql(u8, req.method, "GET")) {
         return handleFolders(server, conn, arena, req);
     }
@@ -443,6 +453,57 @@ fn handleMe(server: *WebmailHttpServer, conn: socket.Connection, arena: std.mem.
     try w.writeAll(",\"email\":");
     try writeJsonString(w, sess.email);
     try w.writeAll("}}");
+    try sendJson(conn, arena, 200, body.items, null);
+}
+
+/// POST /webmail/api/compose
+/// { to:[...], cc:[...], bcc:[...], subject, text, html, inReplyTo?, references? }
+/// Sends through the shared delivery path (DKIM-signed) and saves to Sent.
+/// The From address is always the session user — never client-supplied.
+fn handleCompose(server: *WebmailHttpServer, conn: socket.Connection, arena: std.mem.Allocator, req: Request) !void {
+    if (!isSameOrigin(req)) return sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+
+    const to = try jsonStringArray(arena, req.body, "to");
+    const cc = try jsonStringArray(arena, req.body, "cc");
+    const bcc = try jsonStringArray(arena, req.body, "bcc");
+    if (to.len == 0 and cc.len == 0 and bcc.len == 0) {
+        return sendError(conn, arena, 400, "bad_request", "At least one recipient is required");
+    }
+
+    const msg = compose.Message{
+        .from = sess.email,
+        .to = to,
+        .cc = cc,
+        .bcc = bcc,
+        // Free-text fields are JSON-unescaped (the browser sends \n etc.).
+        .subject = (try jsonStringFieldAlloc(arena, req.body, "subject")) orelse "",
+        .text_body = (try jsonStringFieldAlloc(arena, req.body, "text")) orelse "",
+        .html_body = (try jsonStringFieldAlloc(arena, req.body, "html")) orelse "",
+        .in_reply_to = jsonStringField(req.body, "inReplyTo") orelse "",
+        .references = jsonStringField(req.body, "references") orelse "",
+    };
+
+    const cfg = compose.SendConfig{
+        .hostname = server.config.hostname,
+        .delivery_method = server.config.delivery_method,
+        .ses_region = server.config.ses_region,
+        .sender_user = session_mod.normalizeUsername(sess.email),
+    };
+
+    const result = compose.send(arena, msg, cfg) catch |err| {
+        if (err == compose.ComposeError.InvalidAddress) return sendError(conn, arena, 400, "bad_request", "Invalid recipient address");
+        if (err == compose.ComposeError.InvalidHeader) return sendError(conn, arena, 400, "bad_request", "Invalid header content");
+        if (err == compose.ComposeError.NoRecipients) return sendError(conn, arena, 400, "bad_request", "No recipients");
+        return sendError(conn, arena, 500, "server_error", "Send failed");
+    };
+
+    var body: std.ArrayList(u8) = .empty;
+    const w = jw(&body, arena);
+    try w.writeAll("{\"ok\":true,\"message_id\":");
+    try writeJsonString(w, result.message_id);
+    try w.print(",\"delivered\":{d}}}", .{result.delivered});
     try sendJson(conn, arena, 200, body.items, null);
 }
 
@@ -823,6 +884,98 @@ fn jsonStringField(body: []const u8, field: []const u8) ?[]const u8 {
     return body[start..i];
 }
 
+/// Like jsonStringField but returns a JSON-UNESCAPED, arena-allocated copy
+/// (resolves \n \t \r \" \\ \/ \b \f \uXXXX). Use for free-text fields (subject,
+/// body) where the browser's JSON.stringify emits escapes that must be decoded
+/// before the value goes into a mail header/body. Returns null if absent.
+fn jsonStringFieldAlloc(arena: std.mem.Allocator, body: []const u8, field: []const u8) !?[]const u8 {
+    const raw = jsonStringField(body, field) orelse return null;
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        const c = raw[i];
+        if (c != '\\') {
+            try out.append(arena, c);
+            continue;
+        }
+        i += 1;
+        if (i >= raw.len) break;
+        switch (raw[i]) {
+            'n' => try out.append(arena, '\n'),
+            't' => try out.append(arena, '\t'),
+            'r' => try out.append(arena, '\r'),
+            'b' => try out.append(arena, 0x08),
+            'f' => try out.append(arena, 0x0C),
+            '"' => try out.append(arena, '"'),
+            '\\' => try out.append(arena, '\\'),
+            '/' => try out.append(arena, '/'),
+            'u' => {
+                // \uXXXX -> UTF-8. Best-effort; on malformed input emit U+FFFD.
+                if (i + 4 < raw.len) {
+                    const hex = raw[i + 1 .. i + 5];
+                    const cp = std.fmt.parseInt(u21, hex, 16) catch {
+                        try out.appendSlice(arena, "\u{FFFD}");
+                        i += 4;
+                        continue;
+                    };
+                    var buf: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(cp, &buf) catch {
+                        try out.appendSlice(arena, "\u{FFFD}");
+                        i += 4;
+                        continue;
+                    };
+                    try out.appendSlice(arena, buf[0..n]);
+                    i += 4;
+                } else {
+                    try out.appendSlice(arena, "\u{FFFD}");
+                }
+            },
+            else => |x| try out.append(arena, x), // unknown escape: keep the char
+        }
+    }
+    return try out.toOwnedSlice(arena);
+}
+
+/// Extract a top-level string ARRAY field (`"name": ["a","b"]`) from a small
+/// JSON object. Returns an arena-allocated slice of the string elements (empty
+/// if the field is absent or `[]`). Minimal parser matching jsonStringField's
+/// scope: handles quoted strings with backslash escapes skipped (not unescaped).
+fn jsonStringArray(arena: std.mem.Allocator, body: []const u8, field: []const u8) ![]const []const u8 {
+    var needle_buf: [128]u8 = undefined;
+    if (field.len + 2 > needle_buf.len) return &.{};
+    needle_buf[0] = '"';
+    @memcpy(needle_buf[1 .. 1 + field.len], field);
+    needle_buf[1 + field.len] = '"';
+    const needle = needle_buf[0 .. field.len + 2];
+
+    const key_at = std.mem.indexOf(u8, body, needle) orelse return &.{};
+    var i = key_at + needle.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == '\t' or body[i] == ':' or body[i] == '\r' or body[i] == '\n')) : (i += 1) {}
+    if (i >= body.len or body[i] != '[') return &.{};
+    i += 1;
+
+    var out: std.ArrayList([]const u8) = .empty;
+    while (i < body.len) {
+        // skip whitespace and commas
+        while (i < body.len and (body[i] == ' ' or body[i] == '\t' or body[i] == ',' or body[i] == '\r' or body[i] == '\n')) : (i += 1) {}
+        if (i >= body.len or body[i] == ']') break;
+        if (body[i] != '"') break; // malformed element
+        i += 1;
+        const start = i;
+        while (i < body.len) : (i += 1) {
+            if (body[i] == '\\') {
+                i += 1;
+                continue;
+            }
+            if (body[i] == '"') break;
+        }
+        if (i >= body.len) break; // unterminated
+        try out.append(arena, body[start..i]);
+        i += 1; // past closing quote
+    }
+    return out.toOwnedSlice(arena);
+}
+
 /// Extract a top-level boolean field (`"name": true/false`) from a small JSON
 /// object. Returns null if absent. Minimal — matches jsonStringField's scope.
 fn jsonBoolField(body: []const u8, field: []const u8) ?bool {
@@ -893,6 +1046,35 @@ test "jsonStringField extracts simple fields" {
     try t.expectEqualStrings("chris", jsonStringField(body, "username").?);
     try t.expectEqualStrings("secret", jsonStringField(body, "password").?);
     try t.expect(jsonStringField(body, "missing") == null);
+}
+
+test "jsonStringFieldAlloc unescapes JSON escapes" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = "{\"text\":\"Line A\\nLine B\\tTabbed \\\"q\\\" end\"}";
+    const v = (try jsonStringFieldAlloc(a, body, "text")).?;
+    try t.expectEqualStrings("Line A\nLine B\tTabbed \"q\" end", v);
+    // unicode escape
+    const u = (try jsonStringFieldAlloc(a, "{\"text\":\"Caf\\u00e9\"}", "text")).?;
+    try t.expectEqualStrings("Caf\u{00E9}", u);
+}
+
+test "jsonStringArray parses recipient lists" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = "{\"to\":[\"a@x.com\", \"b@y.com\"],\"cc\":[],\"subject\":\"hi\"}";
+    const to = try jsonStringArray(a, body, "to");
+    try t.expectEqual(@as(usize, 2), to.len);
+    try t.expectEqualStrings("a@x.com", to[0]);
+    try t.expectEqualStrings("b@y.com", to[1]);
+    const cc = try jsonStringArray(a, body, "cc");
+    try t.expectEqual(@as(usize, 0), cc.len);
+    const missing = try jsonStringArray(a, body, "bcc");
+    try t.expectEqual(@as(usize, 0), missing.len);
 }
 
 test "jsonBoolField parses booleans" {
