@@ -1,0 +1,5 @@
+# The `serve` command (from bun-plugin-stx) handles .stx files directly.
+# Do NOT preload the plugin here — its preload entry crashes under Bun 1.3
+# (build.config.root undefined). The serve bin sets up the loader itself.
+[install]
+linker = "hoisted"

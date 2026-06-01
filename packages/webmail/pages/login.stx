@@ -1,0 +1,19 @@
+<script>
+const meta = { title: 'Sign in — Webmail', description: 'Sign in to webmail' }
+</script>
+
+@extends('layouts/auth.stx')
+
+@section('content')
+  <div class="login">
+    <h1>Sign in</h1>
+    <p style="color:#6e6e73;margin-top:-8px">
+      Wiring lands in WEBMAIL.md Phase 1 (sessions) + Phase 3 (this form).
+    </p>
+    <label>Email</label>
+    <input type="email" placeholder="you@mail.stacksjs.com" autocomplete="username" />
+    <label>Password</label>
+    <input type="password" placeholder="••••••••" autocomplete="current-password" />
+    <button type="button">Sign in</button>
+  </div>
+@endsection

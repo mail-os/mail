@@ -1,0 +1,23 @@
+<script>
+const meta = { title: 'Webmail', description: 'Webmail client for the mail server' }
+</script>
+
+@extends('layouts/app.stx')
+
+@section('content')
+  @include('PhaseNotice')
+
+  <div class="placeholder">
+    <h1>📬 Webmail — Phase 0 scaffold</h1>
+    <p>
+      This is the stx frontend skeleton. The real inbox lands in
+      <code>WEBMAIL.md</code> Phase 3+ once the Zig backend serves real mail.
+    </p>
+    <p>
+      The API client (<code>functions/useApi.ts</code>) proxies
+      <code>/webmail/*</code> to the Zig server. Until Phase 2 wires that up,
+      those calls return a labelled 502.
+    </p>
+    <p><a href="/login">→ Login page</a></p>
+  </div>
+@endsection

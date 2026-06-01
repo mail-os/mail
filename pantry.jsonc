@@ -30,6 +30,8 @@
     "dev": "cd packages/zig && zig build run -- serve",
     "dev:mail": "cd packages/devtools && bun server.ts",
     "dev:dashboard": "cd packages/devtools && DASHBOARD=1 bun server.ts",
+    "dev:webmail": "cd packages/webmail && bun run dev",
+    "build:webmail": "cd packages/webmail && bun run build",
     "cross": "cd packages/zig && zig build -Dall-targets=true -Doptimize=ReleaseFast",
 
     // Package all binaries into tarballs

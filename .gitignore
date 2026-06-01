@@ -37,4 +37,6 @@ zig-pkg/
 /packages/zig/pantry
 /packages/devtools/.stx
 /packages/devtools/node_modules
+/packages/webmail/.stx
+/packages/webmail/node_modules
 pantry

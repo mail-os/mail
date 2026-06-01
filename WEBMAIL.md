@@ -1,8 +1,8 @@
 # Webmail UI — Implementation Plan
 
-> **Status:** Planning / not started
+> **Status:** Phase 0 in progress — `packages/webmail` scaffolded & running
 > **Owner:** TBD
-> **Last updated:** 2026-05-29
+> **Last updated:** 2026-06-01
 > **Estimated effort:** ~8–12 weeks (multi-phase, see [Phases](#phases))
 
 This document is the single source of truth for building a browser-based webmail
@@ -194,20 +194,33 @@ don't churn.
 **Tasks**
 - [ ] Resolve [Open Questions](#open-questions-decisions): prod serving model,
       crosswind setup approach, session storage location.
-- [ ] Scaffold `packages/webmail` (Bun + `bun-plugin-stx`, `bunfig.toml` with
-      `linker = "hoisted"` per CLAUDE.md if `better-dx` is present).
+- [x] Scaffold `packages/webmail` (Bun + `bun-plugin-stx`, `bunfig.toml` with
+      `linker = "hoisted"`). stx layout: `pages/`, `layouts/`, `partials/`,
+      `functions/`, `public/` + `stx.config.ts`.
+- [x] Stand up a **dev server with a proxy** to the Zig HTTP API (`server.ts`
+      uses `bun-plugin-stx/serve` + its `onRequest` hook to proxy `/webmail/*`;
+      unreachable backend returns a labelled 502). Verified: pages, login, static
+      asset, and proxy all respond.
+- [x] Decide the **JSON API contract** shape — drafted in [API Contract](#api-contract-draft);
+      typed client stub at `functions/useApi.ts`.
+- [x] CI: lint clean with **pickier** (`bunx --bun pickier .`).
 - [ ] Install + wire **crosswind**; produce a one-screen "design system" page
       (colors, type scale, spacing, buttons, inputs) so the look is decided early.
-- [ ] Stand up a **dev server with a proxy** to the Zig HTTP API (so the SPA can
-      fetch `/webmail/*` during development).
-- [ ] Add `dev:webmail` / `build:webmail` scripts to `pantry.jsonc`.
-- [ ] Decide the **JSON API contract** shape (see [API Contract](#api-contract-draft))
-      and write it down as the interface both sides build against.
-- [ ] CI: lint with **pickier** (`bunx --bun pickier .`), typecheck.
+      *(Currently placeholder CSS in `public/styles.css` — see note below.)*
+- [x] Add `dev:webmail` / `build:webmail` scripts to `pantry.jsonc`.
 
 **Acceptance**
-- `pantry run dev:webmail` serves a styled placeholder page that successfully
-  proxies a request to the Zig server (even if it 404s on a stub endpoint).
+- ✅ `cd packages/webmail && bun run dev` serves the placeholder pages and proxies
+  `/webmail/*` to the Zig server (labelled 502 until Phase 2 — expected).
+
+**Notes / deviations from plan**
+- The `bun-plugin-stx/preload` entry **crashes** under Bun 1.3
+  (`build.config.root` undefined), so we do **not** preload it. Dev uses the
+  plugin's programmatic `serve()` instead (`bun server.ts`). `bun run pages` runs
+  the bundled `serve` bin as a fallback.
+- stx uses **Blade-style** layout composition (`@extends` / `@section('content')`
+  / `@yield('content')`, `@include('Partial')`), **not** `<slot />`. Pages set a
+  `meta` object in `<script>` for title/description.
 
 **Risks:** crosswind integration is unproven here — timebox it; fall back to a
 documented decision if it fights the toolchain.

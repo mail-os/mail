@@ -1,0 +1,15 @@
+{
+  "name": "mail-webmail",
+  "type": "module",
+  "version": "0.0.1",
+  "description": "Browser webmail client for the mail server (stx frontend)",
+  "scripts": {
+    "dev": "bun server.ts",
+    "start": "bun server.ts",
+    "pages": "bun serve pages/",
+    "build": "bun build.ts"
+  },
+  "dependencies": {
+    "bun-plugin-stx": "^0.2.6"
+  }
+}
