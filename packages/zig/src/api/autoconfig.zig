@@ -85,6 +85,15 @@ pub const AutoconfigConfig = struct {
     /// set, the caller should disable the separate IMAP/CalDAV/CardDAV payloads
     /// so the two do not create duplicate accounts.
     enable_eas: bool = false,
+
+    /// Optional per-download nonce folded into every payload UUID and appended
+    /// to every PayloadIdentifier so each generated profile is unique. Apple
+    /// rejects a profile install with "This account already exists" when a
+    /// prior (partial) setup left the old *stable* identifier registered — even
+    /// after the account is removed from the UI. A fresh nonce per download
+    /// sidesteps that dead-end. Empty (the default) preserves the deterministic,
+    /// stable-identifier behavior used by tests and by callers that want it.
+    profile_nonce: []const u8 = "",
 };
 
 /// HTTP response with status, content type, and body.
@@ -497,17 +506,28 @@ pub fn generateAppleMobileconfig(
     const username = extractLocalPart(email) orelse email;
     const email_domain = extractDomainFromEmail(email) orelse config.domain;
 
-    // Generate deterministic UUIDs from the email and domain.
-    // These are not cryptographically random but are stable for the same input,
-    // which helps clients recognize previously installed profiles.
-    const profile_uuid = try generateDeterministicUUID(allocator, config.domain, "profile");
+    // Generate payload UUIDs from the email and domain, folding in the optional
+    // per-download nonce. With an empty nonce these are stable (so a reinstall
+    // updates the same profile); with a nonce each download is unique (so a
+    // reinstall after a partial setup cannot collide — see `profile_nonce`).
+    const nonce = config.profile_nonce;
+    const profile_uuid = try uuidFor(allocator, config.domain, "profile", nonce);
     defer allocator.free(profile_uuid);
 
-    const imap_uuid = try generateDeterministicUUID(allocator, email, "imap");
+    const imap_uuid = try uuidFor(allocator, email, "imap", nonce);
     defer allocator.free(imap_uuid);
 
-    const smtp_uuid = try generateDeterministicUUID(allocator, email, "smtp");
+    const smtp_uuid = try uuidFor(allocator, email, "smtp", nonce);
     defer allocator.free(smtp_uuid);
+
+    // Suffix appended to every PayloadIdentifier so identifiers are unique per
+    // download too (the UUID alone is not what Apple's dedup keys on). Empty
+    // when no nonce is set, leaving identifiers unchanged.
+    const id_suffix = if (nonce.len > 0)
+        try std.fmt.allocPrint(allocator, ".{s}", .{nonce})
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(id_suffix);
 
     // Plist XML header
     try buf.appendSlice(allocator, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -524,7 +544,7 @@ pub fn generateAppleMobileconfig(
     // the server's ActiveSync endpoint at /Microsoft-Server-ActiveSync over TLS.
     // When enabled this replaces the separate IMAP/CalDAV/CardDAV payloads.
     if (config.enable_eas) {
-        const eas_uuid = try generateDeterministicUUID(allocator, email, "eas");
+        const eas_uuid = try uuidFor(allocator, email, "eas", nonce);
         defer allocator.free(eas_uuid);
         const eas_host = config.caldav_hostname orelse config.hostname;
 
@@ -534,7 +554,7 @@ pub fn generateAppleMobileconfig(
         try buf.appendSlice(allocator, "      <key>PayloadDisplayName</key>\n");
         try buf.print(allocator, "      <string>{s}</string>\n", .{config.display_name});
         try buf.appendSlice(allocator, "      <key>PayloadIdentifier</key>\n");
-        try buf.print(allocator, "      <string>com.{s}.eas.account</string>\n", .{email_domain});
+        try buf.print(allocator, "      <string>com.{s}.eas.account{s}</string>\n", .{ email_domain, id_suffix });
         try buf.appendSlice(allocator, "      <key>PayloadType</key>\n");
         try buf.appendSlice(allocator, "      <string>com.apple.eas.account</string>\n");
         try buf.appendSlice(allocator, "      <key>PayloadUUID</key>\n");
@@ -611,7 +631,7 @@ pub fn generateAppleMobileconfig(
         try buf.appendSlice(allocator, "      <key>PayloadDisplayName</key>\n");
         try buf.print(allocator, "      <string>{s} Email</string>\n", .{config.display_name});
         try buf.appendSlice(allocator, "      <key>PayloadIdentifier</key>\n");
-        try buf.print(allocator, "      <string>com.{s}.email.account</string>\n", .{email_domain});
+        try buf.print(allocator, "      <string>com.{s}.email.account{s}</string>\n", .{ email_domain, id_suffix });
         try buf.appendSlice(allocator, "      <key>PayloadType</key>\n");
         try buf.appendSlice(allocator, "      <string>com.apple.mail.managed</string>\n");
         try buf.appendSlice(allocator, "      <key>PayloadUUID</key>\n");
@@ -630,7 +650,7 @@ pub fn generateAppleMobileconfig(
 
     // CardDAV (Contacts) payload
     if (config.enable_carddav) {
-        const carddav_uuid = try generateDeterministicUUID(allocator, email, "carddav");
+        const carddav_uuid = try uuidFor(allocator, email, "carddav", nonce);
         defer allocator.free(carddav_uuid);
         const carddav_host = config.caldav_hostname orelse config.hostname;
 
@@ -652,7 +672,7 @@ pub fn generateAppleMobileconfig(
         try buf.appendSlice(allocator, "      <key>PayloadDisplayName</key>\n");
         try buf.print(allocator, "      <string>{s} Contacts</string>\n", .{config.display_name});
         try buf.appendSlice(allocator, "      <key>PayloadIdentifier</key>\n");
-        try buf.print(allocator, "      <string>com.{s}.carddav.account</string>\n", .{email_domain});
+        try buf.print(allocator, "      <string>com.{s}.carddav.account{s}</string>\n", .{ email_domain, id_suffix });
         try buf.appendSlice(allocator, "      <key>PayloadType</key>\n");
         try buf.appendSlice(allocator, "      <string>com.apple.carddav.account</string>\n");
         try buf.appendSlice(allocator, "      <key>PayloadUUID</key>\n");
@@ -664,7 +684,7 @@ pub fn generateAppleMobileconfig(
 
     // CalDAV (Calendar) payload
     if (config.enable_caldav_profile) {
-        const caldav_uuid = try generateDeterministicUUID(allocator, email, "caldav");
+        const caldav_uuid = try uuidFor(allocator, email, "caldav", nonce);
         defer allocator.free(caldav_uuid);
         const caldav_host = config.caldav_hostname orelse config.hostname;
 
@@ -686,7 +706,7 @@ pub fn generateAppleMobileconfig(
         try buf.appendSlice(allocator, "      <key>PayloadDisplayName</key>\n");
         try buf.print(allocator, "      <string>{s} Calendar</string>\n", .{config.display_name});
         try buf.appendSlice(allocator, "      <key>PayloadIdentifier</key>\n");
-        try buf.print(allocator, "      <string>com.{s}.caldav.account</string>\n", .{email_domain});
+        try buf.print(allocator, "      <string>com.{s}.caldav.account{s}</string>\n", .{ email_domain, id_suffix });
         try buf.appendSlice(allocator, "      <key>PayloadType</key>\n");
         try buf.appendSlice(allocator, "      <string>com.apple.caldav.account</string>\n");
         try buf.appendSlice(allocator, "      <key>PayloadUUID</key>\n");
@@ -704,7 +724,7 @@ pub fn generateAppleMobileconfig(
     try buf.appendSlice(allocator, "  <key>PayloadDisplayName</key>\n");
     try buf.print(allocator, "  <string>{s} Mail</string>\n", .{config.display_name});
     try buf.appendSlice(allocator, "  <key>PayloadIdentifier</key>\n");
-    try buf.print(allocator, "  <string>com.{s}.email.profile</string>\n", .{email_domain});
+    try buf.print(allocator, "  <string>com.{s}.email.profile{s}</string>\n", .{ email_domain, id_suffix });
     try buf.appendSlice(allocator, "  <key>PayloadOrganization</key>\n");
     try buf.print(allocator, "  <string>{s}</string>\n", .{config.display_name});
     try buf.appendSlice(allocator, "  <key>PayloadRemovalDisallowed</key>\n");
@@ -802,6 +822,17 @@ pub fn extractEmailFromAutodiscover(body: []const u8) ?[]const u8 {
 /// input strings via FNV-1a hashing. It produces a string in the standard
 /// UUID format (8-4-4-4-12 hex digits) for compatibility with Apple's
 /// mobileconfig format, which requires PayloadUUID fields.
+/// Generate a payload UUID for `seed`/`salt`, optionally made unique by folding
+/// in a per-download `nonce`. An empty nonce yields the stable, deterministic
+/// UUID (identical to `generateDeterministicUUID(seed, salt)`); a non-empty
+/// nonce mixes it into the salt so each download is distinct.
+fn uuidFor(allocator: std.mem.Allocator, seed: []const u8, salt: []const u8, nonce: []const u8) ![]u8 {
+    if (nonce.len == 0) return generateDeterministicUUID(allocator, seed, salt);
+    const combined = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ salt, nonce });
+    defer allocator.free(combined);
+    return generateDeterministicUUID(allocator, seed, combined);
+}
+
 fn generateDeterministicUUID(allocator: std.mem.Allocator, seed: []const u8, salt: []const u8) ![]u8 {
     // FNV-1a hash of concatenated seed and salt
     var hash: u128 = 14695981039346656037;
@@ -1247,6 +1278,43 @@ test "Apple mobileconfig - dav-only profile omits the email payload (no account 
     // But Calendar + Contacts are present.
     try std.testing.expect(std.mem.indexOf(u8, xml, "com.apple.caldav.account") != null);
     try std.testing.expect(std.mem.indexOf(u8, xml, "com.apple.carddav.account") != null);
+}
+
+test "Apple mobileconfig - profile_nonce makes each download unique (no reinstall collision)" {
+    const allocator = std.testing.allocator;
+    const base = AutoconfigConfig{
+        .hostname = "mail.example.com",
+        .domain = "example.com",
+        .caldav_port = 443,
+        .enable_email = false,
+        .enable_carddav = true,
+        .enable_caldav_profile = true,
+    };
+
+    // Two downloads with different nonces must differ entirely (UUIDs AND
+    // identifiers), so a reinstall after a partial setup cannot collide.
+    var a = base;
+    a.profile_nonce = "aaaa1111";
+    var b = base;
+    b.profile_nonce = "bbbb2222";
+
+    const xml_a = try generateAppleMobileconfig(allocator, a, "user@example.com");
+    defer allocator.free(xml_a);
+    const xml_b = try generateAppleMobileconfig(allocator, b, "user@example.com");
+    defer allocator.free(xml_b);
+
+    try std.testing.expect(!std.mem.eql(u8, xml_a, xml_b));
+    // The nonce must reach the identifiers (that is what Apple dedups on).
+    try std.testing.expect(std.mem.indexOf(u8, xml_a, "com.example.com.caldav.account.aaaa1111") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml_b, "com.example.com.caldav.account.bbbb2222") != null);
+
+    // Empty nonce (the default) stays stable and free of any trailing suffix.
+    const xml_stable1 = try generateAppleMobileconfig(allocator, base, "user@example.com");
+    defer allocator.free(xml_stable1);
+    const xml_stable2 = try generateAppleMobileconfig(allocator, base, "user@example.com");
+    defer allocator.free(xml_stable2);
+    try std.testing.expectEqualStrings(xml_stable1, xml_stable2);
+    try std.testing.expect(std.mem.indexOf(u8, xml_stable1, "com.example.com.caldav.account<") != null);
 }
 
 test "Apple mobileconfig - deterministic UUIDs" {

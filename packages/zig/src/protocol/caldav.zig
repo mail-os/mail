@@ -1941,6 +1941,21 @@ fn webAutodiscoverV2(allocator: std.mem.Allocator, config: *const CalDavConfig, 
     return .{ .content_type = "application/json; charset=utf-8", .body = json };
 }
 
+// Monotonic sequence so two profile downloads in the same nanosecond still get
+// distinct nonces.
+var mobileconfig_nonce_seq = std.atomic.Value(u64).init(0);
+
+/// Build a per-download nonce (hex of the current time + a sequence counter)
+/// into `buf` and return the slice. Folded into the .mobileconfig payload
+/// UUIDs/identifiers so each download is unique and reinstalls never hit
+/// Apple's "This account already exists" dead-end. Alphanumeric/hex only, so it
+/// is safe inside reverse-DNS PayloadIdentifiers.
+fn nextProfileNonce(buf: []u8) []const u8 {
+    const seq = mobileconfig_nonce_seq.fetchAdd(1, .monotonic);
+    const ts: u64 = @bitCast(@as(i64, @truncate(time_compat.nanoTimestamp())));
+    return std.fmt.bufPrint(buf, "{x}{x}", .{ ts, seq }) catch "0";
+}
+
 /// Apple .mobileconfig profile (Mail+CalDAV+CardDAV, or ?services=eas/dav).
 fn webMobileconfig(allocator: std.mem.Allocator, config: *const CalDavConfig, path: []const u8) !WebResponse {
     const query: ?[]const u8 = if (std.mem.indexOfScalar(u8, path, '?')) |q| path[q + 1 ..] else null;
@@ -1949,6 +1964,7 @@ fn webMobileconfig(allocator: std.mem.Allocator, config: *const CalDavConfig, pa
     const dav_only = services != null and std.mem.eql(u8, services.?, "dav");
     const eas_only = services != null and std.mem.eql(u8, services.?, "eas");
     const domain = autoconfig.extractDomainFromEmail(email) orelse "localhost";
+    var nonce_buf: [40]u8 = undefined;
     const ac = autoconfig.AutoconfigConfig{
         .hostname = config.public_hostname,
         .domain = domain,
@@ -1961,6 +1977,7 @@ fn webMobileconfig(allocator: std.mem.Allocator, config: *const CalDavConfig, pa
         .enable_eas = eas_only,
         .caldav_hostname = config.public_hostname,
         .caldav_port = config.public_dav_port,
+        .profile_nonce = nextProfileNonce(&nonce_buf),
     };
     const profile = try autoconfig.generateAppleMobileconfig(allocator, ac, email);
     return .{ .content_type = "application/x-apple-aspen-config; charset=utf-8", .body = profile, .disposition = "attachment; filename=\"mail.mobileconfig\"" };
@@ -2424,6 +2441,7 @@ const TlsCalDavSession = struct {
         const eas_only = services != null and std.mem.eql(u8, services.?, "eas");
 
         const domain = autoconfig.extractDomainFromEmail(email) orelse "localhost";
+        var nonce_buf: [40]u8 = undefined;
         const ac = autoconfig.AutoconfigConfig{
             .hostname = config.public_hostname,
             .domain = domain,
@@ -2438,6 +2456,7 @@ const TlsCalDavSession = struct {
             .enable_eas = eas_only,
             .caldav_hostname = config.public_hostname,
             .caldav_port = config.public_dav_port,
+            .profile_nonce = nextProfileNonce(&nonce_buf),
         };
 
         const profile = try autoconfig.generateAppleMobileconfig(self.allocator, ac, email);
