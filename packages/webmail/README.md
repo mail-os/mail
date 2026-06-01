@@ -12,14 +12,22 @@ framework is **not** involved.
 
 ```text
 pages/        file-based routes (index.stx -> /, login.stx -> /login)
-layouts/      shared page shells
-components/   auto-imported components (AppShell, ...)
-functions/    composables / API client (useApi.ts)
 public/       static assets (styles.css)
 stx.config.ts stx configuration
 server.ts     dev server + /webmail/* proxy to the Zig API
 build.ts      prod build (Phase 9 — not implemented yet)
 ```
+
+### Why standalone pages (no layouts/components)
+
+Each page is a **full standalone HTML document** with a self-contained
+`<script>` that does explicit DOM rendering — the same approach as the proven
+`packages/devtools/pages/app.stx`. We deliberately do **not** use stx
+`@extends` layouts or Alpine-style reactive directives (`x-data`/`@click`/
+`x-model`) here: under a layout, stx strips those directives from the DOM
+without attaching the reactive runtime, so they silently don't work. Vanilla
+`addEventListener` + `innerHTML` is reliable across the stx SPA router. See the
+inline comments and the project memory note `stx-client-side-gotchas`.
 
 ## Develop
 
@@ -29,11 +37,13 @@ bun run dev            # http://localhost:5173
 ```
 
 `server.ts` proxies `/webmail/api/*` and `/webmail/auth/*` to `API_TARGET`
-(default `http://127.0.0.1:8080`). The Zig HTTP listener doesn't exist yet
-(WEBMAIL.md Phase 2), so those calls return a labelled `502` until it's wired up
-— that's expected at this stage.
+(default `http://127.0.0.1:8080`; the Zig server runs webmail on `:8099` when
+`SMTP_ENABLE_WEBMAIL=true`, so use `API_TARGET=http://127.0.0.1:8099`). If the
+backend is down, proxied calls return a labelled `502`.
 
 ## Status
 
-**Phase 0** (scaffold) per WEBMAIL.md. crosswind, real auth, the 3-pane inbox,
-and the production build are deliberately stubbed and called out inline.
+**Phase 3 done** (WEBMAIL.md): login + 3-pane inbox (folders, message list,
+reading pane with sandboxed HTML), wired to the live Zig backend and verified
+end-to-end in a browser. Next: flags/actions (Phase 5), compose (Phase 6),
+crosswind, and the production build (Phase 9).

@@ -1,23 +1,198 @@
-<script>
-const meta = { title: 'Webmail', description: 'Webmail client for the mail server' }
-</script>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Webmail</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!--
+    Standalone page (no @extends): explicit DOM rendering via <script>, matching
+    the proven packages/devtools/pages/app.stx approach. All data comes from the
+    Zig backend's JSON API at /webmail/*.
+  -->
+  <div class="wm" id="app">
+    <aside class="wm-folders">
+      <div class="wm-brand">📬 Webmail</div>
+      <nav class="wm-folder-list" id="folderList"></nav>
+      <div class="wm-user">
+        <span class="wm-user-email" id="userEmail"></span>
+        <button class="wm-logout" id="logoutBtn">Sign out</button>
+      </div>
+    </aside>
 
-@extends('layouts/app.stx')
+    <section class="wm-list">
+      <header class="wm-list-head">
+        <span class="wm-list-title" id="listTitle">INBOX</span>
+        <button class="wm-refresh" id="refreshBtn" title="Refresh">⟳</button>
+      </header>
+      <div class="wm-list-body" id="messageList"></div>
+    </section>
 
-@section('content')
-  @include('PhaseNotice')
-
-  <div class="placeholder">
-    <h1>📬 Webmail — Phase 0 scaffold</h1>
-    <p>
-      This is the stx frontend skeleton. The real inbox lands in
-      <code>WEBMAIL.md</code> Phase 3+ once the Zig backend serves real mail.
-    </p>
-    <p>
-      The API client (<code>functions/useApi.ts</code>) proxies
-      <code>/webmail/*</code> to the Zig server. Until Phase 2 wires that up,
-      those calls return a labelled 502.
-    </p>
-    <p><a href="/login">→ Login page</a></p>
+    <section class="wm-read" id="readPane">
+      <button class="wm-back" id="backBtn">← Back</button>
+      <div class="wm-read-empty wm-state" id="readEmpty">Select a message to read.</div>
+      <article class="wm-read-body" id="readBody" style="display:none"></article>
+    </section>
   </div>
-@endsection
+
+  <script>
+    const state = { user: null, folder: 'INBOX', messages: [], selectedUid: null }
+
+    // HTML-escape untrusted text before inserting via innerHTML.
+    function esc(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
+    }
+
+    function shortDate(d) {
+      if (!d) return ''
+      const t = Date.parse(d)
+      if (isNaN(t)) return esc(d)
+      const dt = new Date(t), now = new Date()
+      return dt.toDateString() === now.toDateString()
+        ? dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        : dt.toLocaleDateString([], { month: 'short', day: 'numeric' })
+    }
+
+    async function api(path, opts) {
+      const res = await fetch(path, { credentials: 'same-origin', ...(opts || {}) })
+      if (res.status === 401) { window.location.href = '/login'; throw new Error('unauthorized') }
+      return res
+    }
+
+    async function init() {
+      try {
+        const me = await api('/webmail/auth/me')
+        if (me.ok) { state.user = (await me.json()).user; document.getElementById('userEmail').textContent = state.user.email }
+        await loadFolders()
+        await loadMessages()
+      } catch (_e) { /* 401 already redirected */ }
+    }
+
+    async function loadFolders() {
+      const res = await api('/webmail/api/folders')
+      if (!res.ok) return
+      const folders = await res.json()
+      document.getElementById('folderList').innerHTML = folders.map(f => `
+        <a class="wm-folder ${f.name === state.folder ? 'wm-folder--active' : ''}" data-folder="${esc(f.name)}">
+          <span class="wm-folder-name">${esc(f.name)}</span>
+          ${f.unread > 0 ? `<span class="wm-folder-count">${f.unread}</span>` : ''}
+        </a>`).join('')
+      document.querySelectorAll('.wm-folder').forEach(el => {
+        el.addEventListener('click', () => selectFolder(el.getAttribute('data-folder')))
+      })
+    }
+
+    async function loadMessages() {
+      const list = document.getElementById('messageList')
+      list.innerHTML = '<div class="wm-state">Loading…</div>'
+      const res = await api('/webmail/api/messages?folder=' + encodeURIComponent(state.folder))
+      if (!res.ok) { list.innerHTML = '<div class="wm-state">Failed to load.</div>'; return }
+      state.messages = (await res.json()).items || []
+      renderList()
+    }
+
+    function renderList() {
+      const list = document.getElementById('messageList')
+      if (state.messages.length === 0) {
+        list.innerHTML = '<div class="wm-state">No messages in this folder.</div>'
+        return
+      }
+      list.innerHTML = state.messages.map(m => `
+        <div class="wm-msg ${m.uid === state.selectedUid ? 'wm-msg--active' : ''} ${m.flags && m.flags.seen ? '' : 'wm-msg--unread'}" data-uid="${m.uid}">
+          <div class="wm-msg-row">
+            <span class="wm-msg-from">${esc(m.from)}</span>
+            <span class="wm-msg-date">${shortDate(m.date)}</span>
+          </div>
+          <div class="wm-msg-subject">${esc(m.subject || '(no subject)')}</div>
+          <div class="wm-msg-snippet">${esc(m.snippet)}</div>
+          ${m.has_attachments ? '<span class="wm-msg-attach" title="Has attachments">📎</span>' : ''}
+        </div>`).join('')
+      list.querySelectorAll('.wm-msg').forEach(el => {
+        el.addEventListener('click', () => openMessage(parseInt(el.getAttribute('data-uid'), 10)))
+      })
+    }
+
+    async function selectFolder(name) {
+      if (name === state.folder) return
+      state.folder = name
+      state.selectedUid = null
+      document.getElementById('listTitle').textContent = name
+      document.getElementById('app').classList.remove('wm--reading')
+      showReadEmpty()
+      await loadFolders()
+      await loadMessages()
+    }
+
+    async function openMessage(uid) {
+      state.selectedUid = uid
+      renderList()
+      document.getElementById('app').classList.add('wm--reading')
+      const empty = document.getElementById('readEmpty')
+      const body = document.getElementById('readBody')
+      empty.style.display = 'none'
+      body.style.display = 'block'
+      body.innerHTML = '<div class="wm-state">Loading message…</div>'
+
+      const res = await api('/webmail/api/messages/' + uid + '?folder=' + encodeURIComponent(state.folder))
+      if (!res.ok) { body.innerHTML = '<div class="wm-state">Failed to load message.</div>'; return }
+      const m = await res.json()
+      renderMessage(m)
+    }
+
+    function renderMessage(m) {
+      const body = document.getElementById('readBody')
+      const attachments = (m.attachments || []).map(a =>
+        `<span class="wm-attach-chip">📎 ${esc(a.filename)}</span>`).join('')
+
+      body.innerHTML = `
+        <h2 class="wm-read-subject">${esc(m.subject || '(no subject)')}</h2>
+        <div class="wm-read-meta">
+          <div><span class="wm-read-label">From</span> ${esc(m.from)}</div>
+          <div><span class="wm-read-label">To</span> ${esc(m.to)}</div>
+          ${m.cc ? `<div><span class="wm-read-label">Cc</span> ${esc(m.cc)}</div>` : ''}
+          <div><span class="wm-read-label">Date</span> ${esc(m.date)}</div>
+        </div>
+        ${attachments ? `<div class="wm-read-attach">${attachments}</div>` : ''}
+        ${m.html
+          ? '<iframe class="wm-read-html" sandbox="" referrerpolicy="no-referrer"></iframe>'
+          : `<pre class="wm-read-text">${esc(m.text)}</pre>`}
+      `
+      // Inject HTML email into a sandboxed iframe via srcdoc. The empty sandbox
+      // blocks scripts, forms, popups and same-origin access, so attacker
+      // markup can't run or read the session cookie.
+      if (m.html) {
+        const frame = body.querySelector('.wm-read-html')
+        frame.srcdoc = m.html
+      }
+    }
+
+    function showReadEmpty() {
+      document.getElementById('readEmpty').style.display = 'block'
+      document.getElementById('readBody').style.display = 'none'
+    }
+
+    document.getElementById('refreshBtn').addEventListener('click', loadMessages)
+    document.getElementById('backBtn').addEventListener('click', () => {
+      state.selectedUid = null
+      document.getElementById('app').classList.remove('wm--reading')
+      showReadEmpty()
+      renderList()
+    })
+    document.getElementById('logoutBtn').addEventListener('click', async () => {
+      try {
+        await fetch('/webmail/auth/logout', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Origin': window.location.origin },
+        })
+      } catch (_e) { /* ignore */ }
+      window.location.href = '/login'
+    })
+
+    init()
+  </script>
+</body>
+</html>

@@ -1,19 +1,77 @@
-<script>
-const meta = { title: 'Sign in — Webmail', description: 'Sign in to webmail' }
-</script>
-
-@extends('layouts/auth.stx')
-
-@section('content')
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sign in — Webmail</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <!--
+    Standalone page (no @extends): stx strips reactive directives like x-data /
+    @click under a layout, so we use a self-contained <script> with explicit DOM
+    handlers — the same approach as the proven packages/devtools/pages/app.stx.
+  -->
   <div class="login">
     <h1>Sign in</h1>
-    <p style="color:#6e6e73;margin-top:-8px">
-      Wiring lands in WEBMAIL.md Phase 1 (sessions) + Phase 3 (this form).
-    </p>
-    <label>Email</label>
-    <input type="email" placeholder="you@mail.stacksjs.com" autocomplete="username" />
-    <label>Password</label>
-    <input type="password" placeholder="••••••••" autocomplete="current-password" />
-    <button type="button">Sign in</button>
+    <p class="login-sub">Webmail for the mail server</p>
+
+    <form id="loginForm">
+      <!-- type="text", not "email": the backend accepts both a bare username
+           ("alice") and a full address ("alice@domain"), so HTML5 email
+           validation must not block a username-only login. -->
+      <label for="email">Email or username</label>
+      <input id="email" type="text" autocomplete="username" placeholder="you@mail.stacksjs.com" />
+
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" placeholder="••••••••" />
+
+      <p class="login-error" id="loginError" style="display:none"></p>
+
+      <button type="submit" id="loginBtn">Sign in</button>
+    </form>
   </div>
-@endsection
+
+  <script>
+    // Event delegation on document: survives the stx SPA router swapping the
+    // page DOM (a listener bound directly to the form element is lost when the
+    // router re-renders <main>, so we listen at the document level instead).
+    function showError(msg) {
+      const errEl = document.getElementById('loginError')
+      if (!errEl) return
+      errEl.textContent = msg
+      errEl.style.display = msg ? 'block' : 'none'
+    }
+
+    document.addEventListener('submit', async (e) => {
+      if (!e.target || e.target.id !== 'loginForm') return
+      e.preventDefault()
+      showError('')
+      const btn = document.getElementById('loginBtn')
+      const username = document.getElementById('email').value.trim()
+      const password = document.getElementById('password').value
+      if (!username || !password) { showError('Enter your email and password.'); return }
+
+      btn.disabled = true
+      btn.textContent = 'Signing in…'
+      try {
+        const res = await fetch('/webmail/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ username, password }),
+        })
+        if (res.ok) { window.location.href = '/'; return }
+        if (res.status === 429) showError('Too many attempts. Please wait a minute and try again.')
+        else if (res.status === 401) showError('Invalid email or password.')
+        else showError('Sign in failed. Please try again.')
+      } catch (_e) {
+        showError('Could not reach the server.')
+      } finally {
+        btn.disabled = false
+        btn.textContent = 'Sign in'
+      }
+    })
+  </script>
+</body>
+</html>

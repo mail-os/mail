@@ -1,6 +1,6 @@
 # Webmail UI — Implementation Plan
 
-> **Status:** Phases 0–2 done — frontend scaffold + backend HTTP API serving real mail (login, folders, messages) end-to-end. Next: Phase 3 (frontend app shell & auth UI).
+> **Status:** Phases 0–3 done — login + 3-pane inbox (folders, message list, sandboxed reading pane) wired to the live backend, verified in-browser. Next: Phase 4/5 (reading polish + persisted flags/actions).
 > **Owner:** TBD
 > **Last updated:** 2026-06-01
 > **Estimated effort:** ~8–12 weeks (multi-phase, see [Phases](#phases))
@@ -279,20 +279,33 @@ metadata) via the API; path-traversal folders rejected (400); missing UID 404.
 
 ---
 
-### Phase 3 — Frontend: app shell & auth UI  ·  ~1 week
+### Phase 3 — Frontend: app shell & auth UI  ·  ✅ DONE
 **Tasks**
-- [ ] App shell with the 3-pane layout (folder sidebar │ list │ reading pane),
-      responsive collapse for mobile.
-- [ ] Client-side routing (folder / message / compose views).
-- [ ] Login + logout pages wired to Phase 1 endpoints; session-expiry handling
-      (redirect to login on 401).
-- [ ] Typed API client (extend `packages/ts` or a local `src/api/`) used by all
-      views; central CSRF token handling.
-- [ ] Loading / empty / error states as reusable components.
+- [x] App shell with the 3-pane layout (folder sidebar │ list │ reading pane),
+      responsive collapse for mobile (single-pane on ≤860px).
+- [x] Login + logout pages wired to Phase 1 endpoints; session-expiry handling
+      (any 401 → redirect to /login).
+- [x] Loading / empty / error states.
+- [~] Client-side routing — kept simple: `/login` + `/` full pages; in-app view
+      switching (list ↔ reading) is state-driven. Compose view is Phase 6.
+- [~] API access — inline `fetch` per the standalone-page approach (the Phase 0
+      `useApi.ts` stub was removed; see "Notes" below).
 
-**Acceptance**
-- Log in through the UI, land on an (empty-state) inbox shell, refresh keeps the
-  session, logout returns to login.
+**Acceptance** ✅ verified in headless Chrome end-to-end: log in via the form →
+land on inbox → folders + message list render from the API → open a message
+(headers + sandboxed HTML iframe / plain-text) → sign out returns to /login.
+Bonus already done (overlaps Phase 4): real folder tree with unread counts,
+paginated-ready list, sandboxed HTML rendering.
+
+**Notes / deviations (see memory `stx-client-side-gotchas`):**
+- Pages are **standalone HTML + vanilla `<script>`** (the `devtools/app.stx`
+  approach), **not** stx `@extends` layouts or Alpine directives — those get
+  stripped under a layout without their reactive runtime. The Phase 0
+  `layouts/`, `partials/`, `functions/useApi.ts` scaffold was removed as dead.
+- Login field is `type="text"` (backend accepts bare username or full address;
+  `type="email"` silently blocked username-only login via HTML5 validation).
+- HTML email renders in an empty-`sandbox` iframe via `srcdoc` (no scripts, no
+  same-origin) — the Phase 8 XSS-isolation approach, brought forward.
 
 ---
 
