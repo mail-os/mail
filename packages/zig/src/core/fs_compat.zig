@@ -49,6 +49,29 @@ pub const Dir = struct {
         return .{ .handle = fd };
     }
 
+    /// Create a file but fail with error.PathAlreadyExists if it already exists
+    /// (O_EXCL). Lets callers avoid silently truncating an existing message when
+    /// two writers pick the same Maildir filename.
+    pub fn createFileExclusive(self: Dir, sub_path: []const u8) ExclCreateError!File {
+        _ = self;
+        const path_z = toZ(sub_path) orelse return error.SystemResources;
+        defer freeZ(path_z, sub_path.len);
+        const fd = std.c.open(path_z, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .EXCL = true,
+            .CLOEXEC = true,
+        }, @as(std.c.mode_t, 0o644));
+        if (fd < 0) {
+            const e: std.c.E = @enumFromInt(std.c._errno().*);
+            if (e == .EXIST) return error.PathAlreadyExists;
+            return error.SystemResources;
+        }
+        return .{ .handle = fd };
+    }
+
+    pub const ExclCreateError = error{ PathAlreadyExists, SystemResources };
+
     /// Check access to a path.
     pub fn access(self: Dir, sub_path: []const u8, flags: AccessFlags) AccessError!void {
         _ = self;

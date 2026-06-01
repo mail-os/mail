@@ -413,8 +413,17 @@
           }),
         })
         if (res.ok) {
-          composer.status.textContent = 'Sent ✓'
-          setTimeout(() => { closeComposer(); if (state.folder === 'Sent') loadMessages(); loadFolders() }, 600)
+          const j = await res.json().catch(() => ({}))
+          if (j.ok === false && j.failed && j.failed.length) {
+            // Partial failure: some recipients didn't get it. Keep the composer
+            // open and tell the user exactly who failed.
+            composer.error.textContent = 'Could not deliver to: ' + j.failed.join(', ')
+            composer.error.style.display = 'block'
+            composer.status.textContent = ''
+          } else {
+            composer.status.textContent = 'Sent ✓'
+            setTimeout(() => { closeComposer(); if (state.folder === 'Sent') loadMessages(); loadFolders() }, 600)
+          }
         } else if (res.status === 400) {
           const j = await res.json().catch(() => ({}))
           composer.error.textContent = j.message || 'Invalid message.'

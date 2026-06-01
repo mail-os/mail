@@ -501,9 +501,18 @@ fn handleCompose(server: *WebmailHttpServer, conn: socket.Connection, arena: std
 
     var body: std.ArrayList(u8) = .empty;
     const w = jw(&body, arena);
-    try w.writeAll("{\"ok\":true,\"message_id\":");
+    // ok=true only if every recipient was delivered; otherwise report which failed.
+    const all_ok = result.failed.len == 0;
+    try w.print("{{\"ok\":{},\"message_id\":", .{all_ok});
     try writeJsonString(w, result.message_id);
-    try w.print(",\"delivered\":{d}}}", .{result.delivered});
+    try w.print(",\"delivered\":{d},\"failed\":[", .{result.delivered});
+    for (result.failed, 0..) |f, i| {
+        if (i > 0) try w.writeAll(",");
+        try writeJsonString(w, f);
+    }
+    try w.writeAll("]}");
+    // 207-ish semantics over 200: still 200 so the client parses the body, which
+    // carries ok=false + the failed list when delivery was partial.
     try sendJson(conn, arena, 200, body.items, null);
 }
 

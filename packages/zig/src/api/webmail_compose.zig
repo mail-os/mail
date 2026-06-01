@@ -74,7 +74,8 @@ pub const SendConfig = struct {
 
 pub const SendResult = struct {
     message_id: []const u8,
-    delivered: usize, // recipients we attempted delivery for
+    delivered: usize, // recipients delivery SUCCEEDED for
+    failed: []const []const u8, // recipients delivery failed for (arena-allocated)
 };
 
 /// A header VALUE must not contain CR/LF (header injection) and stays short
@@ -90,12 +91,30 @@ fn isSafeHeaderValue(v: []const u8) bool {
 fn isSafeAddress(a: []const u8) bool {
     if (a.len == 0 or a.len > 320) return false;
     for (a) |c| {
-        if (c == '\r' or c == '\n' or c == 0 or c == '"' or c == '<' or c == '>') return false;
+        // Reject header-injection chars, and '/' '\' (which would let a crafted
+        // local-part escape the mail/{user}/ path on local delivery) plus '..'.
+        // The '\' set also matches outbound.zig's validator so a webmail-accepted
+        // address never fails the outbound backstop.
+        if (c == '\r' or c == '\n' or c == 0 or c == '"' or c == '<' or c == '>' or c == '/' or c == '\\') return false;
     }
-    // Must look like an address (one @, non-empty local/domain).
+    if (std.mem.indexOf(u8, a, "..") != null) return false;
+    // Must look like an address (one @, non-empty local/domain, no leading dot).
     const at = std.mem.indexOfScalar(u8, a, '@') orelse return false;
     if (at == 0 or at == a.len - 1) return false;
+    if (a[0] == '.') return false;
     if (std.mem.indexOfScalarPos(u8, a, at + 1, '@') != null) return false;
+    return true;
+}
+
+/// A Maildir user (local-part) must be a single safe path component — defense in
+/// depth for the mail/{user}/... path even though isSafeAddress already guards.
+fn isSafeLocalPart(user: []const u8) bool {
+    if (user.len == 0 or user.len > 256) return false;
+    if (user[0] == '.') return false;
+    for (user) |c| {
+        if (c == '/' or c == '\\' or c == 0) return false;
+    }
+    if (std.mem.indexOf(u8, user, "..") != null) return false;
     return true;
 }
 
@@ -144,6 +163,48 @@ fn joinAddrs(allocator: std.mem.Allocator, addrs: []const []const u8) ![]const u
     return out.toOwnedSlice(allocator);
 }
 
+/// Generate a unique, unpredictable MIME boundary that does NOT occur anywhere
+/// in `parts` (so a crafted body/attachment can't inject a spurious delimiter).
+/// Uses crypto random; retries with fresh randomness on the rare collision.
+fn uniqueBoundary(allocator: std.mem.Allocator, parts: []const []const u8) ![]const u8 {
+    var attempt: u8 = 0;
+    while (attempt < 8) : (attempt += 1) {
+        var rnd: [18]u8 = undefined;
+        io_random(&rnd);
+        var hex: [36]u8 = undefined;
+        const hexchars = "0123456789abcdef";
+        for (rnd, 0..) |b, i| {
+            hex[i * 2] = hexchars[b >> 4];
+            hex[i * 2 + 1] = hexchars[b & 0x0f];
+        }
+        const boundary = try std.fmt.allocPrint(allocator, "=_wm_{s}", .{hex});
+        var collides = false;
+        for (parts) |p| {
+            if (std.mem.indexOf(u8, p, boundary) != null) {
+                collides = true;
+                break;
+            }
+        }
+        if (!collides) return boundary;
+    }
+    return ComposeError.BuildFailed;
+}
+
+/// Fill `buf` with cryptographically secure random bytes via the project's
+/// io_compat helper (CSPRNG when initialized).
+fn io_random(buf: []u8) void {
+    @import("../core/io_compat.zig").randomBytes(buf);
+}
+
+/// Choose a Content-Transfer-Encoding: 8bit raises interop issues with strict
+/// relays for non-ASCII, so use base64 when the body has any byte >= 0x80.
+fn needsBase64(body: []const u8) bool {
+    for (body) |c| {
+        if (c >= 0x80) return true;
+    }
+    return false;
+}
+
 /// Base64-encode `data` wrapped at 76 columns (RFC 2045).
 fn base64Wrapped(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     const enc = std.base64.standard.Encoder;
@@ -163,10 +224,13 @@ fn base64Wrapped(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
 /// Build the full RFC 5322 message bytes (CRLF line endings). Arena-allocated.
 /// `msgid` is the already-formed Message-ID (with angle brackets).
 pub fn buildMime(allocator: std.mem.Allocator, msg: Message, ts: i64, msgid: []const u8) ![]const u8 {
-    // Validate everything that lands in a header.
+    // Validate everything that lands in a header OR a delivery path. Bcc is
+    // validated too (it never reaches a header but is used for delivery), so a
+    // bad Bcc fails loudly instead of being silently dropped.
     if (!isSafeAddress(msg.from)) return ComposeError.InvalidAddress;
     for (msg.to) |a| if (!isSafeAddress(a)) return ComposeError.InvalidAddress;
     for (msg.cc) |a| if (!isSafeAddress(a)) return ComposeError.InvalidAddress;
+    for (msg.bcc) |a| if (!isSafeAddress(a)) return ComposeError.InvalidAddress;
     if (!isSafeHeaderValue(msg.subject)) return ComposeError.InvalidHeader;
     if (!isSafeHeaderValue(msg.in_reply_to)) return ComposeError.InvalidHeader;
     if (!isSafeHeaderValue(msg.references)) return ComposeError.InvalidHeader;
@@ -189,17 +253,22 @@ pub fn buildMime(allocator: std.mem.Allocator, msg: Message, ts: i64, msgid: []c
     const has_html = msg.html_body.len > 0;
 
     if (!has_attachments and !has_html) {
-        // Simple text/plain.
+        // Simple text/plain. base64 for non-ASCII to avoid 8bit interop issues.
         try w.writeAll("Content-Type: text/plain; charset=utf-8\r\n");
-        try w.writeAll("Content-Transfer-Encoding: 8bit\r\n\r\n");
-        try writeBodyCrlf(allocator, &out, msg.text_body);
+        if (needsBase64(msg.text_body)) {
+            try w.writeAll("Content-Transfer-Encoding: base64\r\n\r\n");
+            try w.writeAll(try base64Wrapped(allocator, msg.text_body));
+        } else {
+            try w.writeAll("Content-Transfer-Encoding: 8bit\r\n\r\n");
+            try writeBodyCrlf(allocator, &out, msg.text_body);
+        }
         return out.toOwnedSlice(allocator);
     }
 
-    // Multipart. Outer is mixed if there are attachments, else alternative.
-    // Layout: multipart/mixed [ multipart/alternative [text, html] | text, attachments... ]
-    const boundary = try std.fmt.allocPrint(allocator, "=_wm_{d}_{s}", .{ ts, "b0" });
-    const alt_boundary = try std.fmt.allocPrint(allocator, "=_wm_{d}_{s}", .{ ts, "a0" });
+    // Multipart. Boundaries are crypto-random and verified absent from the body
+    // and attachments so content can't inject a spurious delimiter.
+    const boundary = try uniqueBoundary(allocator, &.{ msg.text_body, msg.html_body });
+    const alt_boundary = try uniqueBoundary(allocator, &.{ msg.text_body, msg.html_body, boundary });
 
     if (has_attachments) {
         try w.print("Content-Type: multipart/mixed; boundary=\"{s}\"\r\n\r\n", .{boundary});
@@ -227,6 +296,20 @@ pub fn buildMime(allocator: std.mem.Allocator, msg: Message, ts: i64, msgid: []c
     return out.toOwnedSlice(allocator);
 }
 
+/// Emit a `text/<sub>` body with the right transfer encoding (base64 for
+/// non-ASCII, else 8bit). Does not write part boundaries — caller frames it.
+fn writeTextBody(allocator: std.mem.Allocator, out: *std.ArrayList(u8), sub: []const u8, body: []const u8) !void {
+    const w = writerFor(out, allocator);
+    try w.print("Content-Type: text/{s}; charset=utf-8\r\n", .{sub});
+    if (needsBase64(body)) {
+        try w.writeAll("Content-Transfer-Encoding: base64\r\n\r\n");
+        try w.writeAll(try base64Wrapped(allocator, body));
+    } else {
+        try w.writeAll("Content-Transfer-Encoding: 8bit\r\n\r\n");
+        try writeBodyCrlf(allocator, out, body);
+    }
+}
+
 /// Write a body "part" — either a nested multipart/alternative (when html is
 /// present) or a single text/plain part — for use inside multipart/mixed.
 fn writeBodyPart(allocator: std.mem.Allocator, out: *std.ArrayList(u8), msg: Message, alt_boundary: []const u8) !void {
@@ -235,23 +318,17 @@ fn writeBodyPart(allocator: std.mem.Allocator, out: *std.ArrayList(u8), msg: Mes
         try w.print("Content-Type: multipart/alternative; boundary=\"{s}\"\r\n\r\n", .{alt_boundary});
         try writeAltParts(allocator, out, msg, alt_boundary);
     } else {
-        try w.writeAll("Content-Type: text/plain; charset=utf-8\r\n");
-        try w.writeAll("Content-Transfer-Encoding: 8bit\r\n\r\n");
-        try writeBodyCrlf(allocator, out, msg.text_body);
+        try writeTextBody(allocator, out, "plain", msg.text_body);
     }
 }
 
 fn writeAltParts(allocator: std.mem.Allocator, out: *std.ArrayList(u8), msg: Message, alt_boundary: []const u8) !void {
     const w = writerFor(out, allocator);
     try w.print("--{s}\r\n", .{alt_boundary});
-    try w.writeAll("Content-Type: text/plain; charset=utf-8\r\n");
-    try w.writeAll("Content-Transfer-Encoding: 8bit\r\n\r\n");
-    try writeBodyCrlf(allocator, out, msg.text_body);
+    try writeTextBody(allocator, out, "plain", msg.text_body);
     try w.writeAll("\r\n");
     try w.print("--{s}\r\n", .{alt_boundary});
-    try w.writeAll("Content-Type: text/html; charset=utf-8\r\n");
-    try w.writeAll("Content-Transfer-Encoding: 8bit\r\n\r\n");
-    try writeBodyCrlf(allocator, out, msg.html_body);
+    try writeTextBody(allocator, out, "html", msg.html_body);
     try w.writeAll("\r\n");
     try w.print("--{s}--\r\n", .{alt_boundary});
 }
@@ -277,6 +354,11 @@ fn writeBodyCrlf(allocator: std.mem.Allocator, out: *std.ArrayList(u8), body: []
     }
 }
 
+/// Local iff the recipient domain is our hostname or its parent domain. This is
+/// an EXACT mirror of the SMTP delivery path (core/protocol.zig saveMessage:
+/// "mail.stacksjs.com" accepts "stacksjs.com" as local). It must stay identical
+/// so webmail and SMTP route the same recipient the same way — do not "fix" the
+/// parent-domain acceptance without changing the SMTP path too.
 fn isLocalDomain(domain: []const u8, hostname: []const u8) bool {
     if (std.mem.eql(u8, domain, hostname)) return true;
     if (std.mem.indexOfScalar(u8, hostname, '.')) |dot| {
@@ -286,32 +368,43 @@ fn isLocalDomain(domain: []const u8, hostname: []const u8) bool {
 }
 
 /// Deliver `raw` to one recipient: local -> Maildir INBOX, remote -> outbound.
-fn deliverOne(allocator: std.mem.Allocator, cfg: SendConfig, from: []const u8, rcpt: []const u8, raw: []const u8) void {
+/// Returns an error on failure so the caller can report it to the user (no more
+/// silent best-effort losses).
+fn deliverOne(allocator: std.mem.Allocator, cfg: SendConfig, from: []const u8, rcpt: []const u8, raw: []const u8) !void {
+    if (!isSafeAddress(rcpt)) return ComposeError.InvalidAddress;
     const at = std.mem.indexOfScalar(u8, rcpt, '@');
     const domain = if (at) |p| rcpt[p + 1 ..] else "";
     if (at != null and isLocalDomain(domain, cfg.hostname)) {
         const user = rcpt[0..at.?];
-        writeMaildir(allocator, user, "new", raw) catch |err| {
-            std.log.err("webmail local delivery to {s} failed: {}", .{ rcpt, err });
-        };
+        if (!isSafeLocalPart(user)) return ComposeError.InvalidAddress;
+        try writeMaildir(allocator, user, "new", raw);
     } else {
-        outbound.deliverToRemote(allocator, from, rcpt, raw, cfg.hostname, cfg.delivery_method, cfg.ses_region) catch |err| {
-            std.log.err("webmail outbound delivery to {s} failed: {}", .{ rcpt, err });
-        };
+        try outbound.deliverToRemote(allocator, from, rcpt, raw, cfg.hostname, cfg.delivery_method, cfg.ses_region);
     }
 }
 
-/// Write a message into mail/{user}/{subdir}/{ts}.eml. subdir is "new" (INBOX
-/// delivery) or "Sent". Uses a unique-ish name to avoid same-ms collisions.
+/// Write a message into mail/{user}/{subdir}/{name}. subdir is "new" (INBOX
+/// delivery) or "Sent". Uses O_EXCL + retry so two writers picking the same
+/// name never silently overwrite each other. `user` MUST already be validated
+/// by isSafeLocalPart (callers do this).
 fn writeMaildir(allocator: std.mem.Allocator, user: []const u8, subdir: []const u8, raw: []const u8) !void {
+    if (!isSafeLocalPart(user)) return ComposeError.InvalidAddress;
     const dir = try std.fmt.allocPrint(allocator, "mail/{s}/{s}", .{ user, subdir });
     fs_compat.ensureDir(dir) catch {};
-    // Unique name: ms timestamp + a process-monotonic counter to dodge collisions.
-    const seq = nameSeq.fetchAdd(1, .monotonic);
-    const path = try std.fmt.allocPrint(allocator, "{s}/{d}.{d}.eml", .{ dir, time_compat.milliTimestamp(), seq });
-    const f = try fs_compat.cwd().createFile(path, .{});
-    defer f.close();
-    try f.writeAll(raw);
+    var attempt: u8 = 0;
+    while (attempt < 16) : (attempt += 1) {
+        const seq = nameSeq.fetchAdd(1, .monotonic);
+        // Name carries ms time + a process counter + attempt for uniqueness.
+        const path = try std.fmt.allocPrint(allocator, "{s}/{d}.{d}p{d}.eml", .{ dir, time_compat.milliTimestamp(), seq, attempt });
+        const f = fs_compat.cwd().createFileExclusive(path) catch |err| {
+            if (err == error.PathAlreadyExists) continue; // collision; pick a new name
+            return err;
+        };
+        defer f.close();
+        try f.writeAll(raw);
+        return;
+    }
+    return ComposeError.BuildFailed;
 }
 
 var nameSeq = std.atomic.Value(u64).init(0);
@@ -328,32 +421,33 @@ pub fn send(allocator: std.mem.Allocator, msg: Message, cfg: SendConfig) !SendRe
 
     // Deliver to every recipient (To + Cc + Bcc). Bcc recipients receive the
     // message but are not in the headers (buildMime never emits a Bcc header).
-    var count: usize = 0;
-    for (msg.to) |r| {
-        deliverOne(allocator, cfg, msg.from, r, raw);
-        count += 1;
-    }
-    for (msg.cc) |r| {
-        deliverOne(allocator, cfg, msg.from, r, raw);
-        count += 1;
-    }
-    for (msg.bcc) |r| {
-        if (!isSafeAddress(r)) continue;
-        deliverOne(allocator, cfg, msg.from, r, raw);
-        count += 1;
+    // Track real successes + failures so the caller can tell the user the truth.
+    var delivered: usize = 0;
+    var failed: std.ArrayList([]const u8) = .empty;
+    const all_groups = [_][]const []const u8{ msg.to, msg.cc, msg.bcc };
+    for (all_groups) |group| {
+        for (group) |r| {
+            if (deliverOne(allocator, cfg, msg.from, r, raw)) {
+                delivered += 1;
+            } else |err| {
+                std.log.err("webmail delivery to {s} failed: {}", .{ r, err });
+                try failed.append(allocator, r);
+            }
+        }
     }
 
-    // Save a copy to the sender's Sent folder (best-effort).
+    // Save a copy to the sender's Sent folder (best-effort; doesn't affect the
+    // delivered count, but a failure is logged).
     writeMaildir(allocator, cfg.sender_user, "Sent", raw) catch |err| {
         std.log.warn("webmail: failed to save to Sent: {}", .{err});
     };
 
-    return .{ .message_id = msgid, .delivered = count };
+    return .{ .message_id = msgid, .delivered = delivered, .failed = try failed.toOwnedSlice(allocator) };
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 
-test "isSafeAddress rejects injection and malformed" {
+test "isSafeAddress rejects injection, path traversal, and malformed" {
     const t = std.testing;
     try t.expect(isSafeAddress("alice@example.com"));
     try t.expect(!isSafeAddress("a@b\r\nBcc: evil@x.com"));
@@ -361,6 +455,47 @@ test "isSafeAddress rejects injection and malformed" {
     try t.expect(!isSafeAddress("two@@x.com"));
     try t.expect(!isSafeAddress("@x.com"));
     try t.expect(!isSafeAddress("a@"));
+    // Path-traversal / separator chars must be rejected (local-delivery safety).
+    try t.expect(!isSafeAddress("../../etc@mail.test"));
+    try t.expect(!isSafeAddress("a/b@mail.test"));
+    try t.expect(!isSafeAddress("a\\b@mail.test"));
+    try t.expect(!isSafeAddress(".hidden@mail.test"));
+}
+
+test "isSafeLocalPart guards the maildir path component" {
+    const t = std.testing;
+    try t.expect(isSafeLocalPart("alice"));
+    try t.expect(!isSafeLocalPart("../../etc"));
+    try t.expect(!isSafeLocalPart("a/b"));
+    try t.expect(!isSafeLocalPart(".hidden"));
+    try t.expect(!isSafeLocalPart(""));
+}
+
+test "buildMime validates bcc and uses base64 for non-ASCII" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Bad bcc -> hard error (no silent skip).
+    const bad = Message{ .from = "a@b.test", .to = &.{"c@d.test"}, .bcc = &.{"x@y\r\nevil"}, .text_body = "x" };
+    try t.expectError(ComposeError.InvalidAddress, buildMime(a, bad, 1, "<m@b.test>"));
+    // Non-ASCII body -> base64 CTE, not 8bit.
+    const utf8 = Message{ .from = "a@b.test", .to = &.{"c@d.test"}, .text_body = "Caf\u{00E9}" };
+    const raw = try buildMime(a, utf8, 1, "<m@b.test>");
+    try t.expect(std.mem.indexOf(u8, raw, "Content-Transfer-Encoding: base64") != null);
+    try t.expect(std.mem.indexOf(u8, raw, "Content-Transfer-Encoding: 8bit") == null);
+}
+
+test "uniqueBoundary avoids a boundary present in the body" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const b = try uniqueBoundary(a, &.{"some body text"});
+    try t.expect(std.mem.startsWith(u8, b, "=_wm_"));
+    // Build a body that literally contains the boundary; the next call must differ.
+    const b2 = try uniqueBoundary(a, &.{ b, b });
+    try t.expect(!std.mem.eql(u8, b, b2));
 }
 
 test "formatDate produces RFC5322 shape" {
