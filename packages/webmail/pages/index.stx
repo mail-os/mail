@@ -12,7 +12,7 @@
     the proven packages/devtools/pages/app.stx approach. All data comes from the
     Zig backend's JSON API at /webmail/*.
   -->
-  <div class="wm" id="app">
+  <div class="wm" id="app" style="display:none">
     <aside class="wm-folders">
       <div class="wm-brand">📬 Webmail</div>
       <button class="wm-compose-btn" id="composeBtn">✏️ Compose</button>
@@ -87,12 +87,25 @@
     }
 
     async function init() {
+      // Gate on a confirmed session BEFORE showing the app. Anything other than
+      // a 200 from /auth/me — not-authenticated (401), backend down (502), or a
+      // network error — sends the user to the login page rather than stranding
+      // them on a broken inbox shell. The shell starts hidden (display:none) so
+      // it never flashes for an unauthenticated visitor.
+      let me
       try {
-        const me = await api('/webmail/auth/me')
-        if (me.ok) { state.user = (await me.json()).user; document.getElementById('userEmail').textContent = state.user.email }
-        await loadFolders()
-        await loadMessages()
-      } catch (_e) { /* 401 already redirected */ }
+        me = await fetch('/webmail/auth/me', { credentials: 'same-origin' })
+      } catch (_e) {
+        window.location.href = '/login'
+        return
+      }
+      if (!me.ok) { window.location.href = '/login'; return }
+
+      state.user = (await me.json()).user
+      document.getElementById('userEmail').textContent = state.user.email
+      document.getElementById('app').style.display = '' // authenticated — reveal
+      await loadFolders()
+      await loadMessages()
     }
 
     async function loadFolders() {
