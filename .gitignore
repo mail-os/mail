@@ -44,4 +44,6 @@ zig-pkg/
 /packages/devtools/node_modules
 /packages/webmail/.stx
 /packages/webmail/node_modules
+/packages/webmail/dist
+/packages/zig/src/api/webmail_dist
 pantry

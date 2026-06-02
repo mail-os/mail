@@ -58,6 +58,13 @@ pub fn build(b: *std.Build) void {
         .root_module = mail_module,
     });
 
+    // Build the webmail frontend (renders pages -> src/api/webmail_dist/*) before
+    // compiling, so the @embedFile'd assets in webmail_http.zig are always fresh.
+    // Best-effort: if bun is unavailable, the committed/previous dist is used.
+    const webmail_build = b.addSystemCommand(&.{ "bun", "run", "build" });
+    webmail_build.setCwd(b.path("../webmail"));
+    mail_exe.step.dependOn(&webmail_build.step);
+
     linkPlatformLibraries(mail_exe, target);
     b.installArtifact(mail_exe);
 

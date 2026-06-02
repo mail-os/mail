@@ -248,6 +248,17 @@ pub const Connection = struct {
         return @intCast(result);
     }
 
+    /// Force this connection into blocking mode. A connection accepted from a
+    /// non-blocking listener can inherit O_NONBLOCK on some platforms, which
+    /// makes a straightforward read() return WouldBlock; callers that want to
+    /// block (e.g. a TLS handshake loop) call this once after accept.
+    pub fn setBlocking(self: Connection) void {
+        const flags = std.c.fcntl(self.fd, std.c.F.GETFL, @as(c_int, 0));
+        if (flags < 0) return;
+        const nonblock_flag: c_int = @intCast(@as(u32, @bitCast(std.c.O{ .NONBLOCK = true })));
+        _ = std.c.fcntl(self.fd, std.c.F.SETFL, flags & ~nonblock_flag);
+    }
+
     pub fn close(self: Connection) void {
         _ = std.c.close(self.fd);
     }

@@ -1,6 +1,6 @@
 # Webmail UI — Implementation Plan
 
-> **Status:** Phases 0–6 done — full read + write client: login, 3-pane inbox, persisted flags/move/delete, and compose/reply/forward sending through the shared DKIM-signed delivery path. Verified in-browser, on-disk, and adversarially reviewed. Next: Phase 7 (search & organization polish) or Phase 9 (production serving).
+> **Status:** Phases 0–6 done + Phase 9 built & locally verified over HTTPS — full read+write client (login, 3-pane inbox, flags/move/delete, compose/reply/forward) now ships as a single binary that serves the embedded SPA over its own TLS. Prod deploy to mail.stacksjs.com is the one remaining explicit step (runbook in Phase 9). Next: trigger the deploy, or Phase 7 (search/polish).
 > **Owner:** TBD
 > **Last updated:** 2026-06-01
 > **Estimated effort:** ~8–12 weeks (multi-phase, see [Phases](#phases))
@@ -434,27 +434,50 @@ send test against an external mailbox before launch.
 
 ---
 
-### Phase 9 — Production serving & deployment  ·  ~3–5 days
-Resolve the deferred "how is it served" decision and ship it.
+### Phase 9 — Production serving & deployment  ·  🟡 BUILT & LOCALLY VERIFIED (prod deploy deferred)
+Decision: **Option A — embed the built SPA in the Zig binary**, with the webmail
+server terminating **TLS directly** (like IMAPS/CalDAV). Single binary, no extra
+moving parts. Verified locally over HTTPS; the live prod deploy is a separate,
+explicit step (see runbook below).
 
-**Options to choose from (decide in Phase 0 or here):**
-- **A. Embed built assets in the Zig binary** (`@embedFile` the built SPA) →
-  single binary, simplest deploy, matches `serveMainPage` precedent.
-- **B. Serve static assets from disk** next to the binary (`/opt/mail/webmail/`).
-- **C. Bun sidecar** serving the SPA, reverse-proxied to the Zig API.
+**Serving model — done**
+- [x] `packages/webmail/build.ts` renders the two standalone pages + CSS to
+      `packages/zig/src/api/webmail_dist/` (gitignored). `zig build` runs it
+      automatically (build.zig system step), so embedded assets are always fresh.
+- [x] `webmail_http.zig` `@embedFile`s `index.html`/`login.html`/`styles.css` and
+      serves `GET /`, `/login`, `/styles.css` (with `nosniff`/`DENY`/cache
+      headers). Pages call `/webmail/*` same-origin — no proxy in prod.
+- [x] Direct TLS (`webmail_tls.zig`): nonblock handshake + record I/O via a
+      `Stream` abstraction (plain or TLS), mirroring caldav.zig. Reuses the
+      Let's Encrypt `CertKeyPair` loader. Config: `enable_tls` +
+      `tls_cert_path`/`tls_key_path`; wired in main.zig (binds `0.0.0.0` and sets
+      `Secure` cookies only when TLS is on).
+- [x] Verified locally end-to-end over HTTPS (self-signed): login → inbox (6
+      folders) → all served from the single binary on `:8443`.
 
-**Tasks**
-- [ ] Implement the chosen serving model + production build pipeline.
-- [ ] TLS already exists (Let's Encrypt at `mail.stacksjs.com`) — choose the
-      webmail hostname/path (e.g. `https://mail.stacksjs.com/` or a subdomain).
-- [ ] Deploy via the existing **AWS SSM** flow (cross-compile `x86_64-linux`,
-      S3 upload, SSM swap, restart) per CLAUDE.md.
-- [ ] Observability: add webmail health/metrics to the Discord monitor + metrics.
-- [ ] Runbook: how to deploy/rollback the webmail.
+**Fix found during this phase:** an accepted connection inherited the listener's
+non-blocking mode on this platform, so the TLS handshake read hit `WouldBlock`
+and failed. Added `socket.Connection.setBlocking()`, called after accept. (Would
+have broken the prod deploy — caught locally.)
 
-**Acceptance**
-- Webmail reachable over HTTPS in production against a real mailbox, deployed via
-  the documented SSM pipeline.
+**Deferred to the explicit prod-deploy step (runbook):**
+- [ ] Open the webmail port (default **8443**) in the EC2 security group
+      (`packages/cloud/cloud.config.ts`).
+- [ ] Set env on the box (`/etc/mail/mail.env`): `SMTP_ENABLE_WEBMAIL=true`,
+      `SMTP_WEBMAIL_PORT=8443` (TLS reuses the existing `SMTP_ENABLE_TLS=true` +
+      `SMTP_TLS_CERT`/`SMTP_TLS_KEY` Let's Encrypt paths).
+- [ ] Deploy via SSM (CLAUDE.md flow): `cd packages/zig && zig build
+      -Doptimize=ReleaseFast -Dtarget=x86_64-linux` (auto-builds the frontend +
+      embeds it) → `aws s3 cp zig-out/bin/mail s3://…/deploy/mail-server-new` →
+      SSM swap binary + `systemctl restart mail`.
+- [ ] Smoke test: `curl https://mail.stacksjs.com:8443/login` → 200; log in with
+      a real mailbox.
+- [ ] (Optional) Decide final URL: `:8443` vs. moving CalDAV off 443 to free it,
+      vs. a `webmail.` subdomain. Add webmail health to the Discord monitor.
+
+**Acceptance (local):** ✅ webmail fully served from the single binary over HTTPS,
+login→inbox verified in a headless browser. **Prod acceptance** remains the
+deferred deploy above.
 
 ---
 

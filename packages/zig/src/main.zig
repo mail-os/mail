@@ -403,18 +403,26 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     var webmail_thread: ?std.Thread = null;
     if (cfg.enable_webmail) {
         if (auth_ptr != null and db_ptr != null) {
+            // When TLS is enabled, the webmail server terminates HTTPS itself
+            // (like IMAPS/CalDAV) and must bind a public interface; otherwise it
+            // stays plain HTTP on localhost (dev / behind a proxy).
+            const wm_tls = cfg.enable_tls and cfg.tls_cert_path != null and cfg.tls_key_path != null;
             const wm_config = webmail_http.WebmailHttpConfig{
                 .port = cfg.webmail_port,
-                .bind_host = "127.0.0.1",
-                .secure_cookies = cfg.webmail_secure_cookies,
+                .bind_host = if (wm_tls) "0.0.0.0" else "127.0.0.1",
+                // Cookies are Secure only over HTTPS; respect the explicit override too.
+                .secure_cookies = cfg.webmail_secure_cookies and wm_tls,
                 // Outbound send settings: mirror the server's so webmail mail is
                 // delivered + DKIM-signed identically to SMTP submission.
                 .hostname = cfg.hostname,
                 .delivery_method = cfg.delivery_method,
                 .ses_region = cfg.ses_region,
+                .enable_tls = wm_tls,
+                .tls_cert_path = cfg.tls_cert_path,
+                .tls_key_path = cfg.tls_key_path,
             };
             webmail_server = webmail_http.WebmailHttpServer.init(allocator, wm_config, db_ptr.?, auth_ptr.?);
-            log.info("Webmail HTTP server configured on 127.0.0.1:{d}", .{cfg.webmail_port});
+            log.info("Webmail HTTP server configured on {s}:{d} (TLS={})", .{ wm_config.bind_host, cfg.webmail_port, wm_tls });
         } else {
             log.warn("Webmail enabled but auth/database are not — skipping webmail server", .{});
         }
