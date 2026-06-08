@@ -10,14 +10,23 @@ permissions:
 
 jobs:
   build:
-    name: Build Release Binaries
-    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.artifact }}
+    # All targets cross-compile from ONE cheap Linux box: build.zig vendors sqlite3.c
+    # and only links libc when cross-compiling (no system/framework deps), so zig
+    # produces every platform's binary without macOS/ARM runners.
+    runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-linux-gnu
+          - target: x86_64-linux-gnu
             artifact: x86_64-linux
+          - target: aarch64-linux-gnu
+            artifact: aarch64-linux
+          - target: x86_64-macos
+            artifact: x86_64-macos
+          - target: aarch64-macos
+            artifact: aarch64-macos
 
     steps:
     - name: Checkout code
@@ -38,7 +47,10 @@ jobs:
     - name: Package binary
       run: |
         mkdir -p release
-        find packages/zig/zig-out/bin -name 'mail*' -type f -executable | head -1 | xargs -I {} cp {} release/mail-${{ matrix.artifact }}
+        # Single -Dtarget build installs the exe as zig-out/bin/mail (or mail-*).
+        bin=$(find packages/zig/zig-out/bin -type f -name 'mail*' ! -name '*.tar.gz' | head -1)
+        test -n "$bin" || { echo "no mail binary produced for ${{ matrix.target }}"; exit 1; }
+        cp "$bin" "release/mail-${{ matrix.artifact }}"
         tar -czf mail-${{ matrix.artifact }}.tar.gz -C release mail-${{ matrix.artifact }}
 
     - name: Upload artifacts
