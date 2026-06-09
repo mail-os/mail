@@ -9,25 +9,9 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build ${{ matrix.artifact }}
-    # All targets cross-compile from ONE cheap Linux box: build.zig vendors sqlite3.c
-    # and only links libc when cross-compiling (no system/framework deps), so zig
-    # produces every platform's binary without macOS/ARM runners.
+  release:
+    name: Build & Release (all platforms)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-linux-gnu
-            artifact: x86_64-linux
-          - target: aarch64-linux-gnu
-            artifact: aarch64-linux
-          - target: x86_64-macos
-            artifact: x86_64-macos
-          - target: aarch64-macos
-            artifact: aarch64-macos
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -39,54 +23,33 @@ jobs:
       with:
         version: 0.17.0-dev.56+a8226cd53
 
-    - name: Build release binary
+    - name: Cross-compile every platform
+      # build.zig vendors sqlite3.c + links only libc when cross-compiling, so one
+      # Linux box produces linux & macOS (x86_64 + arm64) binaries into
+      # packages/zig/zig-out/cross/<triple>/ — no macOS/ARM runners needed.
       run: |
         cd packages/zig
-        zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+        zig build -Dall-targets -Doptimize=ReleaseFast
 
-    - name: Package binary
-      run: |
-        mkdir -p release
-        # Single -Dtarget build installs the exe as zig-out/bin/mail (or mail-*).
-        bin=$(find packages/zig/zig-out/bin -type f -name 'mail*' ! -name '*.tar.gz' | head -1)
-        test -n "$bin" || { echo "no mail binary produced for ${{ matrix.target }}"; exit 1; }
-        cp "$bin" "release/mail-${{ matrix.artifact }}"
-        tar -czf mail-${{ matrix.artifact }}.tar.gz -C release mail-${{ matrix.artifact }}
-
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: mail-${{ matrix.artifact }}
-        path: mail-${{ matrix.artifact }}.tar.gz
-
-  release:
-    name: Create GitHub Release
-    runs-on: ubuntu-latest
-    needs: build
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Download all artifacts
-      uses: actions/download-artifact@v4
-
-    - name: Create release with Pantry
+    - name: Release via Pantry action
+      # The Pantry action auto-discovers packages/zig/zig-out/cross/<triple>/,
+      # packages each platform, extracts the changelog, and creates the GitHub
+      # release — the whole release flow lives in the action.
       uses: home-lang/pantry/packages/action@main
       with:
         install: 'false'
         release: 'true'
-        release-files: |
-          mail-*/mail-*.tar.gz
+        release-files: 'auto'
         release-tag: ${{ github.ref_name }}
         release-token: ${{ secrets.GITHUB_TOKEN }}
         release-changelog: .github/release-notes.md
         release-notes: |
-          ## Release Info
-          - Version: ${{ github.ref_name }}
+          ## mail ${{ github.ref_name }}
 
-          ## Installation
+          Prebuilt binaries for linux & macOS (x86_64 + arm64) are attached below.
 
-          Download the appropriate binary for your platform from the assets below.
+          Install via pantry:
 
-          This release was created using the Pantry GitHub Action.
+          ```sh
+          pantry install github.com/mail-os/mail
+          ```

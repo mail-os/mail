@@ -233,10 +233,12 @@ fn buildForTarget(
 
     linkPlatformLibraries(exe, target);
 
+    // Output under zig-out/cross/<triple>/ so the Pantry GitHub Action auto-discovers
+    // and packages each platform for the release (it scans zig-out/cross/<target>/).
     const install = b.addInstallArtifact(exe, .{
         .dest_dir = .{
             .override = .{
-                .custom = b.fmt("bin/{s}", .{triple}),
+                .custom = b.fmt("cross/{s}", .{triple}),
             },
         },
     });
