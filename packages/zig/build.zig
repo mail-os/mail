@@ -26,16 +26,13 @@ pub fn build(b: *std.Build) void {
 
     if (build_all_targets) {
         // Build for all supported targets
+        // The released/supported platforms. (windows/*bsd were dropped — they don't
+        // cross-compile cleanly and aren't published.)
         const targets = [_]std.Build.ResolvedTarget{
             b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu }),
             b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu }),
             b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .macos }),
             b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos }),
-            b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
-            b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .windows, .abi = .gnu }),
-            b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .freebsd }),
-            b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .freebsd }),
-            b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .openbsd }),
         };
 
         for (targets) |t| {

@@ -18,10 +18,21 @@ jobs:
       with:
         submodules: recursive
 
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@v2
+
     - name: Setup Zig
       uses: mlugg/setup-zig@v2
       with:
         version: 0.17.0-dev.56+a8226cd53
+
+    - name: Build webmail frontend
+      # The zig binaries @embedFile packages/zig/src/api/webmail_dist/* (generated,
+      # not committed), so render it before compiling or every target fails FileNotFound.
+      run: |
+        cd packages/webmail
+        bun install
+        bun run build
 
     - name: Cross-compile every platform
       # build.zig vendors sqlite3.c + links only libc when cross-compiling, so one
