@@ -7,6 +7,7 @@ const env = @import("core/env.zig");
 const database = @import("storage/database.zig");
 const auth = @import("auth/auth.zig");
 const greylist_mod = @import("antispam/greylist.zig");
+const delivery_retry = @import("delivery/retry.zig");
 const imap = @import("protocol/imap.zig");
 const caldav = @import("protocol/caldav.zig");
 const caldav_store_mod = @import("storage/caldav_store.zig");
@@ -175,6 +176,15 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     }
 
     defer if (db) |*d| d.deinit();
+
+    // Start the outbound retry + DSN pipeline (persistent queue in the main
+    // DB; failed first attempts get exponential-backoff retries, and a
+    // permanent failure delivers a bounce to the local sender).
+    if (db_ptr) |dptr| {
+        delivery_retry.start(allocator, dptr, cfg.hostname, cfg.delivery_method, cfg.ses_region) catch |err| {
+            log.warn("Outbound retry pipeline failed to start: {} (failed deliveries will be dropped)", .{err});
+        };
+    }
 
     // Initialize greylisting if enabled
     var greylist: ?greylist_mod.Greylist = null;

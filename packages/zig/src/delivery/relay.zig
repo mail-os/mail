@@ -294,7 +294,7 @@ pub const RelayWorker = struct {
                     );
                     defer self.allocator.free(err_msg);
 
-                    try self.queue.markForRetry(msg.id, err_msg);
+                    _ = try self.queue.markForRetry(msg.id, err_msg);
                     std.log.err("Failed to relay message {s}: {any}", .{ msg.id, err });
                     continue;
                 };

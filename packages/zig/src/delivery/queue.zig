@@ -331,8 +331,17 @@ pub const MessageQueue = struct {
         self.removeAt(i);
     }
 
+    /// What markForRetry decided for a failed delivery.
+    pub const RetryDisposition = enum {
+        /// Another attempt is scheduled (exponential backoff).
+        scheduled,
+        /// Max attempts exhausted: the message was recorded as failed and
+        /// removed from the active queue. Callers should emit a DSN.
+        permanent,
+    };
+
     /// Mark message as failed for retry
-    pub fn markForRetry(self: *MessageQueue, id: []const u8, error_msg: []const u8) !void {
+    pub fn markForRetry(self: *MessageQueue, id: []const u8, error_msg: []const u8) !RetryDisposition {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -355,6 +364,7 @@ pub const MessageQueue = struct {
 
             // Remove from active queue
             self.removeAt(i);
+            return .permanent;
         } else {
             // Schedule retry with exponential backoff
             const backoff_seconds: i64 = @as(i64, @intCast(std.math.pow(u32, 2, msg.attempts))) * 60; // 2^n minutes
@@ -366,6 +376,7 @@ pub const MessageQueue = struct {
 
             // Persist retry state
             try self.persistMessage(msg);
+            return .scheduled;
         }
     }
 
@@ -455,7 +466,7 @@ test "message queue retry logic" {
     const id = try queue.enqueue("sender@example.com", "recipient@example.com", "Test message");
 
     _ = queue.getNextPending().?;
-    try queue.markForRetry(id, "Connection failed");
+    try std.testing.expectEqual(MessageQueue.RetryDisposition.scheduled, try queue.markForRetry(id, "Connection failed"));
 
     const stats = queue.getStats();
     try testing.expectEqual(@as(usize, 1), stats.retry);

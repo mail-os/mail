@@ -17,6 +17,8 @@ const tls_mod = @import("tls.zig");
 const chunking = @import("../protocol/chunking.zig");
 const tls = @import("tls");
 const outbound = @import("../delivery/outbound.zig");
+const retry = @import("../delivery/retry.zig");
+const aliases = @import("../delivery/aliases.zig");
 const typesense = @import("../search/typesense.zig");
 
 /// Maximum number of in-flight detached outbound/forward delivery worker
@@ -1034,13 +1036,20 @@ pub const Session = struct {
         const spf_res = spf_v.validate(self.remote_addr, mail_from, helo) catch spf_mod.SPFResult.temperror;
 
         var dkim_v = dkim_mod.DKIMValidator.init(self.allocator);
-        const dkim_res = dkim_v.validate(headers, body) catch dkim_mod.DKIMResult.temperror;
+        const dkim_check = dkim_v.validateWithDomain(headers, body) catch
+            dkim_mod.DKIMValidator.DKIMCheck{ .result = .temperror, .domain = null };
+        const dkim_res = dkim_check.result;
+        defer if (dkim_check.domain) |d| self.allocator.free(d);
 
         var arc_v = arc_mod.ARCValidator.init(self.allocator);
         const arc_res = arc_v.validateChain(headers) catch arc_mod.ARCResult.temperror;
 
+        // DMARC's DKIM alignment must compare the header-From domain against
+        // the signature's REAL d= domain (RFC 7489 §3.1.1) — previously the
+        // From domain was passed for both sides, making alignment vacuous.
+        const dkim_domain = dkim_check.domain orelse from_domain;
         var dmarc_v = dmarc_mod.DMARCValidator.init(self.allocator);
-        const dmarc_res = dmarc_v.validate(from_domain, spf_res, spf_domain, dkim_res, from_domain) catch dmarc_mod.DMARCResult.temperror;
+        const dmarc_res = dmarc_v.validate(from_domain, spf_res, spf_domain, dkim_res, dkim_domain) catch dmarc_mod.DMARCResult.temperror;
 
         self.logger.info("inbound auth ip={s} mailfrom_domain={s} header_from={s}: spf={s} dkim={s} dmarc={s} arc={s}", .{ self.remote_addr, spf_domain, from_domain, spf_res.toString(), dkim_res.toString(), dmarc_res.toString(), arc_res.toString() });
 
@@ -1555,11 +1564,14 @@ pub const Session = struct {
             } else true;
 
             if (is_local) {
-                // Local delivery: save to Maildir
-                const username = if (std.mem.indexOf(u8, rcpt, "@")) |at_pos|
+                // Local delivery: save to Maildir. Role mailboxes
+                // (postmaster@, abuse@, tlsrpt@, ...) resolve through the
+                // aliases file to a real user.
+                const raw_local = if (std.mem.indexOf(u8, rcpt, "@")) |at_pos|
                     rcpt[0..at_pos]
                 else
                     rcpt;
+                const username = aliases.resolve(raw_local);
 
                 const new_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{username});
                 defer self.allocator.free(new_dir);
@@ -1672,7 +1684,10 @@ pub const Session = struct {
             ctx.delivery_method,
             ctx.ses_region,
         ) catch |err| {
-            std.log.err("Outbound delivery to {s} failed: {}", .{ ctx.to, err });
+            std.log.err("Outbound delivery to {s} failed: {} — queueing for retry", .{ ctx.to, err });
+            // Persistent retry with backoff; a permanent failure there
+            // generates a DSN back to the (local) sender.
+            retry.enqueueFailure(ctx.from, ctx.to, ctx.data);
         };
     }
 
