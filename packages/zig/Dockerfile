@@ -9,25 +9,17 @@ RUN apk add --no-cache \
     musl-dev \
     curl \
     tar \
-    xz \
-    unzip \
-    libgcc \
-    libstdc++
+    xz
 
 # Install Zig (not available in Alpine repos). ziglang.org prunes old dev
 # builds, so fall back to a community mirror when the primary 404s.
+# No bun needed: the webmail package lives outside this build context, so
+# zig build skips the frontend step and uses the committed dist.
 ARG ZIG_VERSION=0.17.0-dev.56+a8226cd53
 RUN (curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" || \
      curl -fsSL -o /tmp/zig.tar.xz "https://zigmirror.hryx.net/zig/zig-x86_64-linux-${ZIG_VERSION}.tar.xz") && \
     tar -xJf /tmp/zig.tar.xz -C /usr/local && rm /tmp/zig.tar.xz && \
     ln -s /usr/local/zig-x86_64-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
-
-# Install Bun (zig build runs `bun build.ts` for the webmail bundle)
-RUN curl -fsSL -o /tmp/bun.zip "https://github.com/oven-sh/bun/releases/latest/download/bun-linux-x64-musl.zip" && \
-    unzip -q /tmp/bun.zip -d /tmp && \
-    mv /tmp/bun-linux-x64-musl/bun /usr/local/bin/bun && \
-    chmod +x /usr/local/bin/bun && \
-    rm -rf /tmp/bun.zip /tmp/bun-linux-x64-musl
 
 # Set working directory
 WORKDIR /build

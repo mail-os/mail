@@ -57,10 +57,23 @@ pub fn build(b: *std.Build) void {
 
     // Build the webmail frontend (renders pages -> src/api/webmail_dist/*) before
     // compiling, so the @embedFile'd assets in webmail_http.zig are always fresh.
-    // Best-effort: if bun is unavailable, the committed/previous dist is used.
-    const webmail_build = b.addSystemCommand(&.{ "bun", "run", "build" });
-    webmail_build.setCwd(b.path("../webmail"));
-    mail_exe.step.dependOn(&webmail_build.step);
+    // Best-effort, for real this time: when bun or the webmail package is
+    // unavailable (Docker builds only ship packages/zig; library consumers
+    // may not have bun), the committed dist is used instead of failing the
+    // whole build on an unspawnable command.
+    const have_bun = blk: {
+        _ = b.findProgram(&.{"bun"}, &.{}) catch break :blk false;
+        break :blk true;
+    };
+    const have_webmail_pkg = blk: {
+        std.Io.Dir.accessAbsolute(b.graph.io, b.pathFromRoot("../webmail"), .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (have_bun and have_webmail_pkg) {
+        const webmail_build = b.addSystemCommand(&.{ "bun", "run", "build" });
+        webmail_build.setCwd(b.path("../webmail"));
+        mail_exe.step.dependOn(&webmail_build.step);
+    }
 
     linkPlatformLibraries(mail_exe, target);
     b.installArtifact(mail_exe);
