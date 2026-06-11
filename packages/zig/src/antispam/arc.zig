@@ -569,33 +569,25 @@ pub const ARCValidator = struct {
 
         // Cryptographic verification of the ARC chain.
         //
-        // Per RFC 8617, for every ARC set we must verify:
-        //   1. The ARC-Message-Signature (AMS): canonicalized signed-header hash
-        //      + body hash compared against bh=, then the RSA/Ed25519 signature
-        //      (b=) checked against the public key published in DNS at
-        //      s=._domainkey.d=.
-        //   2. The ARC-Seal (AS): the RSA/Ed25519 signature over the chain's
-        //      ARC headers checked against the same DNS-published public key.
+        // Per RFC 8617, for every ARC set we must verify the ARC-Message-
+        // Signature (body hash + signature against the DNS-published key) and
+        // the ARC-Seal. This module only performs the structural checks above;
+        // the AMS body hash cannot even be recomputed here because validateChain
+        // receives headers only.
         //
-        // Verifying these signatures requires fetching the signer's public key
-        // via a DNS TXT lookup and running an RSA/Ed25519 verifier. Neither
-        // primitive is available to this module: the repo's DKIM
-        // queryPublicKey() is a stub that returns null (no DNS TXT resolver
-        // exists), and the vendor RSA verifier in vendor/zig-tls is not exported
-        // through the `tls` module root that this package consumes. The message
-        // body is also not available here (validateChain only receives headers),
-        // so the AMS body hash cannot be recomputed either.
+        // Verdict for "structurally valid but not cryptographically verified":
+        //   - NOT .pass — that would trust a forged-but-well-formed chain.
+        //   - NOT .fail — nothing downstream gates on ARC (the result feeds the
+        //     log line and Authentication-Results header), and reporting
+        //     arc=fail for every mailing-list/forwarded message claims a
+        //     verification outcome that never happened.
+        //   - .none: no verified chain. Honest, and safe for any consumer that
+        //     might later use ARC to override DMARC (none never overrides).
         //
-        // Because we CANNOT cryptographically verify any AMS or ARC-Seal
-        // signature, returning .pass would let a forged-but-well-formed ARC
-        // chain be trusted. Per RFC 8617 §5.2 an unverifiable signature is a
-        // failure, so we fail closed here rather than trusting structure alone.
-        //
-        // TODO: once a DNS TXT resolver and an exported RSA/Ed25519 verifier are
-        // available (and validateChain is given the message body), replace this
-        // with: for each set verify bh=, then verify the AMS b= and the AS b=
-        // against the DNS public key; return .pass only when every set verifies.
-        return .fail;
+        // TODO: real verification can now be built — DKIM's queryPublicKey()
+        // resolves keys via spf.dnsQueryTxt, and its RSA verifier could be
+        // shared. validateChain would also need the message body for bh=.
+        return .none;
     }
 
     /// Extract ARC sets from raw message headers.

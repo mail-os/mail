@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const time_compat = @import("../core/time_compat.zig");
+const dns_cache = @import("dns_cache.zig");
 
 // =============================================================================
 // DNS query helpers (TXT / A / MX over UDP) - RFC 1035
@@ -292,7 +293,36 @@ fn pickNameserver(buf: []u8) []const u8 {
 
 /// Query a TXT record. Returns the first concatenated TXT string that starts
 /// with `prefix` (use "" to accept the first TXT). Caller owns the result.
+/// Answers are served from the process-wide TTL cache when possible — this
+/// single choke point covers SPF records, DKIM public keys, and DMARC
+/// policies (dkim.zig and dmarc.zig both resolve through here).
 pub fn dnsQueryTxt(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    prefix: []const u8,
+) DnsError!?[]const u8 {
+    var key_buf: [512]u8 = undefined;
+    const cache_key: ?[]const u8 = std.fmt.bufPrint(&key_buf, "txt:{s}:{s}", .{ name, prefix }) catch null;
+
+    if (cache_key) |key| {
+        switch (dns_cache.get(allocator, key)) {
+            .hit => |v| return v,
+            .negative => return null,
+            .miss => {},
+        }
+    }
+
+    const result = dnsQueryTxtUncached(allocator, name, prefix) catch |err| {
+        // Don't cache transient failures — retry on the next message.
+        return err;
+    };
+    if (cache_key) |key| {
+        dns_cache.put(key, result, if (result != null) dns_cache.positive_ttl else dns_cache.negative_ttl);
+    }
+    return result;
+}
+
+fn dnsQueryTxtUncached(
     allocator: std.mem.Allocator,
     name: []const u8,
     prefix: []const u8,
@@ -390,6 +420,57 @@ fn readNameInto(msg: []const u8, start: usize, out: []u8) !usize {
         }
     }
     return out_pos;
+}
+
+pub const MxHost = struct {
+    preference: u16,
+    host: []const u8,
+};
+
+/// Query MX records, returning exchange hosts sorted by preference (best
+/// first). Caller owns the slice and each host string. An empty slice means
+/// the domain has no MX records (implicit-MX rules apply, RFC 5321 §5.1).
+pub fn dnsQueryMxRecords(allocator: std.mem.Allocator, name: []const u8) DnsError![]MxHost {
+    const Collector = struct {
+        list: *std.ArrayList(MxHost),
+        allocator: std.mem.Allocator,
+
+        fn onRr(self: *@This(), msg: []const u8, rdata: []const u8) anyerror!void {
+            // MX RDATA: 2-byte preference + exchange name (may be compressed).
+            if (rdata.len < 3) return;
+            const pref = std.mem.readInt(u16, rdata[0..2], .big);
+            const rdata_off = @intFromPtr(rdata.ptr) - @intFromPtr(msg.ptr);
+            var namebuf: [256]u8 = undefined;
+            const nlen = readNameInto(msg, rdata_off + 2, &namebuf) catch return;
+            if (nlen == 0) return;
+            const host = try self.allocator.dupe(u8, namebuf[0..nlen]);
+            errdefer self.allocator.free(host);
+            try self.list.append(self.allocator, .{ .preference = pref, .host = host });
+        }
+    };
+
+    var ns_buf: [64]u8 = undefined;
+    const ns = pickNameserver(&ns_buf);
+
+    var list: std.ArrayList(MxHost) = .empty;
+    errdefer {
+        for (list.items) |h| allocator.free(h.host);
+        list.deinit(allocator);
+    }
+
+    var collector = Collector{ .list = &list, .allocator = allocator };
+    dnsQuery(name, DNS_TYPE_MX, ns, *Collector, &collector, Collector.onRr) catch |err| switch (err) {
+        error.DNSNameError, error.DNSNoAnswer => {},
+        else => return err,
+    };
+
+    std.mem.sort(MxHost, list.items, {}, struct {
+        fn lessThan(_: void, a: MxHost, b: MxHost) bool {
+            return a.preference < b.preference;
+        }
+    }.lessThan);
+
+    return list.toOwnedSlice(allocator) catch return error.DNSTemporaryFailure;
 }
 
 /// Query MX records and resolve each exchange host's A records, appending the

@@ -1,4 +1,5 @@
 const std = @import("std");
+const dns_cache = @import("dns_cache.zig");
 
 /// DNSBL checker for spam prevention
 pub const DnsblChecker = struct {
@@ -75,12 +76,31 @@ pub const DnsblChecker = struct {
         );
         defer self.allocator.free(query);
 
+        // Serve repeat lookups for the same IP from the process-wide cache —
+        // a reconnecting sender otherwise costs one blocking getaddrinfo per
+        // blacklist per connection.
+        var key_buf: [320]u8 = undefined;
+        const cache_key: ?[]const u8 = std.fmt.bufPrint(&key_buf, "dnsbl:{s}", .{query}) catch null;
+        if (cache_key) |key| {
+            switch (dns_cache.get(self.allocator, key)) {
+                .hit => |v| {
+                    defer self.allocator.free(v);
+                    return v.len == 1 and v[0] == '1';
+                },
+                .negative, .miss => {},
+            }
+        }
+
         // Try to resolve the DNS query
         // If it resolves (returns any A record), the IP is blacklisted
         const result = self.lookupDns(query) catch {
             // DNS lookup failed - treat as not blacklisted
             return false;
         };
+
+        if (cache_key) |key| {
+            dns_cache.put(key, if (result) "1" else "0", if (result) dns_cache.positive_ttl else dns_cache.negative_ttl);
+        }
 
         return result;
     }
