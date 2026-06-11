@@ -18,6 +18,9 @@ pub const CSRFManager = struct {
 
     const TOKEN_LENGTH = 32;
     const DEFAULT_LIFETIME = 3600; // 1 hour
+    // Hard cap on outstanding tokens so the map can't grow without bound
+    // under flood load (each entry is ~60 bytes of key + TokenData).
+    const MAX_TOKENS = 50_000;
 
     pub fn init(allocator: std.mem.Allocator) CSRFManager {
         return .{
@@ -57,14 +60,19 @@ pub const CSRFManager = struct {
         const now = time_compat.timestamp();
         const expires_at = now + self.token_lifetime_seconds;
 
+        // Bound the map: at the cap, sweep expired tokens; if everything is
+        // still live (flood), evict an arbitrary batch — bounded memory wins
+        // over honoring every outstanding form token under attack load.
+        if (self.tokens.count() >= MAX_TOKENS) {
+            self.removeExpiredLocked();
+            if (self.tokens.count() >= MAX_TOKENS) self.evictBatchLocked(MAX_TOKENS / 10);
+        }
+
         // Store token with expiration
         try self.tokens.put(try self.allocator.dupe(u8, encoded), .{
             .expires_at = expires_at,
             .used = false,
         });
-
-        // Cleanup expired tokens (limit to avoid long pauses)
-        try self.cleanupExpiredTokensLocked(100);
 
         return token;
     }
@@ -125,24 +133,43 @@ pub const CSRFManager = struct {
     }
 
     /// Cleanup expired tokens (call with mutex held)
-    fn cleanupExpiredTokensLocked(self: *CSRFManager, max_items: usize) !void {
+    /// Remove all expired tokens. (The old variant removed every token —
+    /// expired or not — once its removal budget was reached, and freed each
+    /// key before calling remove() with it.)
+    fn removeExpiredLocked(self: *CSRFManager) void {
         const now = time_compat.timestamp();
-        var count: usize = 0;
+
+        var to_remove: std.ArrayList([]const u8) = .empty;
+        defer to_remove.deinit(self.allocator);
 
         var it = self.tokens.iterator();
-        var to_remove = std.ArrayList([]const u8).init(self.allocator);
-        defer to_remove.deinit();
-
         while (it.next()) |entry| {
-            if (entry.value_ptr.expires_at < now or count >= max_items) {
-                try to_remove.append(entry.key_ptr.*);
-                count += 1;
+            if (entry.value_ptr.expires_at < now) {
+                to_remove.append(self.allocator, entry.key_ptr.*) catch break;
             }
         }
 
         for (to_remove.items) |key| {
-            self.allocator.free(key);
             _ = self.tokens.remove(key);
+            self.allocator.free(key);
+        }
+    }
+
+    /// Evict up to `n` arbitrary tokens (used only when the cap is hit while
+    /// every entry is still live).
+    fn evictBatchLocked(self: *CSRFManager, n: usize) void {
+        var to_remove: std.ArrayList([]const u8) = .empty;
+        defer to_remove.deinit(self.allocator);
+
+        var it = self.tokens.iterator();
+        while (it.next()) |entry| {
+            if (to_remove.items.len >= n) break;
+            to_remove.append(self.allocator, entry.key_ptr.*) catch break;
+        }
+
+        for (to_remove.items) |key| {
+            _ = self.tokens.remove(key);
+            self.allocator.free(key);
         }
     }
 

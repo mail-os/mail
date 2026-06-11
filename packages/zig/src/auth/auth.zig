@@ -176,6 +176,81 @@ pub const AuthBackend = struct {
     password_hasher: password_mod.PasswordHasher,
     allocator: std.mem.Allocator,
     nonce_manager: NonceManager,
+    verify_cache: VerifyCache,
+
+    /// Cache of recent successful password verifications. Mail clients
+    /// reconnect constantly (IMAP polling, IDLE drops, per-message SMTP
+    /// submission), and every login costs a full 64MB Argon2id KDF
+    /// (hundreds of ms). A cache entry is SHA-256(process salt, username,
+    /// password, stored hash): binding the STORED hash means a password
+    /// change or reset invalidates the entry implicitly, and the
+    /// per-process random salt keeps entries useless outside this process.
+    /// Only successes are cached; failures always pay full KDF cost.
+    const VerifyCache = struct {
+        const ttl_seconds: i64 = 600;
+        const max_entries = 1024;
+
+        map: std.AutoHashMap([32]u8, i64),
+        salt: [32]u8,
+        mutex: mutex_compat.Mutex = .{},
+
+        fn init(allocator: std.mem.Allocator) VerifyCache {
+            var salt: [32]u8 = undefined;
+            io_compat.randomBytes(&salt);
+            return .{
+                .map = std.AutoHashMap([32]u8, i64).init(allocator),
+                .salt = salt,
+            };
+        }
+
+        fn deinit(self: *VerifyCache) void {
+            self.map.deinit();
+        }
+
+        fn key(self: *VerifyCache, username: []const u8, pass: []const u8, stored_hash: []const u8) [32]u8 {
+            var h = Sha256.init(.{});
+            h.update(&self.salt);
+            h.update(username);
+            h.update(&[_]u8{0});
+            h.update(pass);
+            h.update(&[_]u8{0});
+            h.update(stored_hash);
+            var out: [32]u8 = undefined;
+            h.final(&out);
+            return out;
+        }
+
+        fn check(self: *VerifyCache, k: [32]u8) bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (self.map.get(k)) |expires| {
+                if (getCurrentTimestamp() < expires) return true;
+                _ = self.map.remove(k);
+            }
+            return false;
+        }
+
+        fn insert(self: *VerifyCache, k: [32]u8) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const now = getCurrentTimestamp();
+            if (self.map.count() >= max_entries) {
+                // Evict expired entries; if everything is still live, drop
+                // the whole cache — wrong logins then just pay the KDF again.
+                var expired: std.ArrayList([32]u8) = .empty;
+                defer expired.deinit(self.map.allocator);
+                var it = self.map.iterator();
+                while (it.next()) |entry| {
+                    if (now >= entry.value_ptr.*) {
+                        expired.append(self.map.allocator, entry.key_ptr.*) catch break;
+                    }
+                }
+                for (expired.items) |ek| _ = self.map.remove(ek);
+                if (self.map.count() >= max_entries) self.map.clearRetainingCapacity();
+            }
+            self.map.put(k, now + ttl_seconds) catch {};
+        }
+    };
 
     pub fn init(allocator: std.mem.Allocator, db: *database.Database) AuthBackend {
         return .{
@@ -183,11 +258,13 @@ pub const AuthBackend = struct {
             .password_hasher = password_mod.PasswordHasher.init(allocator),
             .allocator = allocator,
             .nonce_manager = NonceManager.init(allocator),
+            .verify_cache = VerifyCache.init(allocator),
         };
     }
 
     pub fn deinit(self: *AuthBackend) void {
         self.nonce_manager.deinit();
+        self.verify_cache.deinit();
     }
 
     pub fn verifyCredentials(self: *AuthBackend, username: []const u8, password: []const u8) !bool {
@@ -222,8 +299,17 @@ pub const AuthBackend = struct {
             return false;
         }
 
+        // Serve repeat logins from the verification cache (skips the
+        // ~100-500ms Argon2 KDF for reconnecting clients). The user row was
+        // still fetched above, so disabled accounts never hit this path, and
+        // the key binds user.password_hash so a changed password misses.
+        const cache_key = self.verify_cache.key(normalized_username, password, user.password_hash);
+        if (self.verify_cache.check(cache_key)) return true;
+
         // Verify password
-        return try self.password_hasher.verifyPassword(password, user.password_hash);
+        const ok = try self.password_hasher.verifyPassword(password, user.password_hash);
+        if (ok) self.verify_cache.insert(cache_key);
+        return ok;
     }
 
     /// Run a throwaway Argon2 KDF to match the timing of a real password verify.
@@ -883,6 +969,11 @@ pub const PasswordResetManager = struct {
             .ip_address = if (ip_address) |ip| try self.allocator.dupe(u8, ip) else null,
         };
 
+        // Opportunistic sweep: nothing calls cleanupExpiredTokens
+        // periodically, so expired/used tokens would otherwise accumulate
+        // until process restart.
+        if (self.tokens.count() >= 1024) _ = self.cleanupExpiredTokens();
+
         // Store token (keyed by hash)
         var hash_hex: [64]u8 = undefined;
         bytesToHex(&token_hash, &hash_hex);
@@ -1081,12 +1172,12 @@ pub const PasswordResetManager = struct {
         var removed: usize = 0;
 
         var iter = self.tokens.iterator();
-        var to_remove = std.ArrayList([]const u8).init(self.allocator);
-        defer to_remove.deinit();
+        var to_remove: std.ArrayList([]const u8) = .empty;
+        defer to_remove.deinit(self.allocator);
 
         while (iter.next()) |entry| {
             if (entry.value_ptr.isExpired(now) or entry.value_ptr.used) {
-                to_remove.append(entry.key_ptr.*) catch continue;
+                to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
 

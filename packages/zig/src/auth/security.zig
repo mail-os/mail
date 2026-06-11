@@ -13,16 +13,20 @@ pub const RateLimiter = struct {
     mutex: mutex_compat.Mutex,
     cleanup_thread: ?std.Thread,
     should_stop: std.atomic.Value(bool),
-    // Bucket-based tracking for O(1) cleanup
-    time_buckets: std.AutoHashMap(i64, std.ArrayList([]const u8)),
-    bucket_size_seconds: u64,
+    // Opportunistic-sweep counter: every N operations, expired counters are
+    // removed inline. (The old "time bucket" cleanup machinery stored
+    // borrowed identifier slices that could alias freed session buffers and
+    // was never wired up; counters grew until restart.)
+    ops_since_sweep: u32,
 
     const RateCounter = struct {
         count: u32,
         window_start: i64,
         last_request: i64,
-        bucket_key: i64, // Which time bucket this entry belongs to
     };
+
+    /// Run an inline sweep after this many checkAndIncrement* calls.
+    const sweep_every_ops: u32 = 4096;
 
     pub fn init(allocator: std.mem.Allocator, window_seconds: u64, max_requests: u32, max_requests_per_user: u32, cleanup_interval_seconds: u64) RateLimiter {
         return RateLimiter{
@@ -36,14 +40,8 @@ pub const RateLimiter = struct {
             .mutex = mutex_compat.Mutex{},
             .cleanup_thread = null,
             .should_stop = std.atomic.Value(bool).init(false),
-            .time_buckets = std.AutoHashMap(i64, std.ArrayList([]const u8)).init(allocator),
-            .bucket_size_seconds = window_seconds * 2, // Buckets are 2x window size
+            .ops_since_sweep = 0,
         };
-    }
-
-    /// Calculate which time bucket a timestamp belongs to
-    fn getBucketKey(self: *RateLimiter, timestamp: i64) i64 {
-        return @divFloor(timestamp, @as(i64, @intCast(self.bucket_size_seconds)));
     }
 
     /// Start automatic cleanup in background thread
@@ -74,7 +72,7 @@ pub const RateLimiter = struct {
             var remaining = cleanup_interval_ns;
             while (remaining > 0 and !self.should_stop.load(.monotonic)) {
                 const sleep_time = @min(remaining, 10 * std.time.ns_per_s);
-                std.time.sleep(sleep_time);
+                time_compat.sleep(sleep_time);
                 remaining -= sleep_time;
             }
 
@@ -101,13 +99,6 @@ pub const RateLimiter = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.user_counters.deinit();
-
-        // Clean up time buckets
-        var bucket_it = self.time_buckets.iterator();
-        while (bucket_it.next()) |entry| {
-            entry.value_ptr.deinit(self.allocator);
-        }
-        self.time_buckets.deinit();
     }
 
     pub fn checkAndIncrement(self: *RateLimiter, ip: []const u8) !bool {
@@ -115,66 +106,41 @@ pub const RateLimiter = struct {
         defer self.mutex.unlock();
 
         const now = time_compat.timestamp();
-        const bucket_key = self.getBucketKey(now);
+        self.maybeSweepLocked(now);
 
         if (self.ip_counters.get(ip)) |counter| {
             const elapsed = now - counter.window_start;
 
             if (elapsed >= self.window_seconds) {
-                // Reset window - update bucket tracking
-                try self.addToBucket(bucket_key, ip);
+                // Reset window
                 try self.ip_counters.put(ip, RateCounter{
                     .count = 1,
                     .window_start = now,
                     .last_request = now,
-                    .bucket_key = bucket_key,
                 });
                 return true;
             } else if (counter.count >= self.max_requests) {
                 // Rate limit exceeded
                 return false;
             } else {
-                // Increment counter - update bucket if changed
-                if (counter.bucket_key != bucket_key) {
-                    try self.addToBucket(bucket_key, ip);
-                }
+                // Increment counter
                 try self.ip_counters.put(ip, RateCounter{
                     .count = counter.count +| 1,
                     .window_start = counter.window_start,
                     .last_request = now,
-                    .bucket_key = bucket_key,
                 });
                 return true;
             }
         } else {
-            // New IP - add to bucket
+            // New IP
             const ip_copy = try self.allocator.dupe(u8, ip);
-            try self.addToBucket(bucket_key, ip_copy);
             try self.ip_counters.put(ip_copy, RateCounter{
                 .count = 1,
                 .window_start = now,
                 .last_request = now,
-                .bucket_key = bucket_key,
             });
             return true;
         }
-    }
-
-    /// Add an IP/user to a time bucket for efficient cleanup
-    fn addToBucket(self: *RateLimiter, bucket_key: i64, identifier: []const u8) !void {
-        const bucket_result = try self.time_buckets.getOrPut(bucket_key);
-        if (!bucket_result.found_existing) {
-            bucket_result.value_ptr.* = .empty;
-        }
-
-        // Only add if not already in bucket
-        for (bucket_result.value_ptr.items) |item| {
-            if (std.mem.eql(u8, item, identifier)) {
-                return;
-            }
-        }
-
-        try bucket_result.value_ptr.append(self.allocator, identifier);
     }
 
     /// Check and increment rate limit for authenticated user
@@ -183,19 +149,17 @@ pub const RateLimiter = struct {
         defer self.mutex.unlock();
 
         const now = time_compat.timestamp();
-        const bucket_key = self.getBucketKey(now);
+        self.maybeSweepLocked(now);
 
         if (self.user_counters.get(user)) |counter| {
             const elapsed = now - counter.window_start;
 
             if (elapsed >= self.window_seconds) {
                 // Reset window
-                try self.addToBucket(bucket_key, user);
                 try self.user_counters.put(user, RateCounter{
                     .count = 1,
                     .window_start = now,
                     .last_request = now,
-                    .bucket_key = bucket_key,
                 });
                 return true;
             } else if (counter.count >= self.max_requests_per_user) {
@@ -203,28 +167,65 @@ pub const RateLimiter = struct {
                 return false;
             } else {
                 // Increment counter
-                if (counter.bucket_key != bucket_key) {
-                    try self.addToBucket(bucket_key, user);
-                }
                 try self.user_counters.put(user, RateCounter{
                     .count = counter.count +| 1,
                     .window_start = counter.window_start,
                     .last_request = now,
-                    .bucket_key = bucket_key,
                 });
                 return true;
             }
         } else {
             // New user
             const user_copy = try self.allocator.dupe(u8, user);
-            try self.addToBucket(bucket_key, user_copy);
             try self.user_counters.put(user_copy, RateCounter{
                 .count = 1,
                 .window_start = now,
                 .last_request = now,
-                .bucket_key = bucket_key,
             });
             return true;
+        }
+    }
+
+    /// Inline sweep every `sweep_every_ops` operations so stale counters
+    /// (one per unique client IP / user, forever) can't grow unboundedly
+    /// even when no background cleanup thread is running. Caller holds the
+    /// mutex.
+    fn maybeSweepLocked(self: *RateLimiter, now: i64) void {
+        self.ops_since_sweep +%= 1;
+        if (self.ops_since_sweep < sweep_every_ops) return;
+        self.ops_since_sweep = 0;
+        self.sweepLocked(now);
+    }
+
+    fn sweepLocked(self: *RateLimiter, now: i64) void {
+        const cutoff = now - @as(i64, @intCast(self.window_seconds * 2));
+
+        var stale: std.ArrayList([]const u8) = .empty;
+        defer stale.deinit(self.allocator);
+
+        var ip_it = self.ip_counters.iterator();
+        while (ip_it.next()) |entry| {
+            if (entry.value_ptr.last_request < cutoff) {
+                stale.append(self.allocator, entry.key_ptr.*) catch break;
+            }
+        }
+        for (stale.items) |key| {
+            if (self.ip_counters.fetchRemove(key)) |removed| {
+                self.allocator.free(removed.key);
+            }
+        }
+        stale.clearRetainingCapacity();
+
+        var user_it = self.user_counters.iterator();
+        while (user_it.next()) |entry| {
+            if (entry.value_ptr.last_request < cutoff) {
+                stale.append(self.allocator, entry.key_ptr.*) catch break;
+            }
+        }
+        for (stale.items) |key| {
+            if (self.user_counters.fetchRemove(key)) |removed| {
+                self.allocator.free(removed.key);
+            }
         }
     }
 
@@ -276,41 +277,7 @@ pub const RateLimiter = struct {
     pub fn cleanup(self: *RateLimiter) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-
-        const now = time_compat.timestamp();
-
-        // Calculate cutoff bucket - anything before this should be removed
-        const cutoff_time = now - @as(i64, @intCast(self.window_seconds * 2));
-        const cutoff_bucket = self.getBucketKey(cutoff_time);
-
-        var buckets_to_remove = std.ArrayList(i64).init(self.allocator);
-        defer buckets_to_remove.deinit();
-
-        // Identify old buckets for removal
-        var bucket_it = self.time_buckets.iterator();
-        while (bucket_it.next()) |entry| {
-            if (entry.key_ptr.* < cutoff_bucket) {
-                buckets_to_remove.append(entry.key_ptr.*) catch continue;
-            }
-        }
-
-        // Remove old entries from old buckets
-        for (buckets_to_remove.items) |bucket_key| {
-            if (self.time_buckets.fetchRemove(bucket_key)) |removed_bucket| {
-                // Remove all IPs/users in this bucket from counters
-                for (removed_bucket.value.items) |identifier| {
-                    // Check if it's still in IP counters
-                    if (self.ip_counters.fetchRemove(identifier)) |removed_ip| {
-                        self.allocator.free(removed_ip.key);
-                    }
-                    // Check if it's still in user counters
-                    if (self.user_counters.fetchRemove(identifier)) |removed_user| {
-                        self.allocator.free(removed_user.key);
-                    }
-                }
-                removed_bucket.value.deinit(self.allocator);
-            }
-        }
+        self.sweepLocked(time_compat.timestamp());
     }
 
     pub fn getStats(self: *RateLimiter) struct { tracked_ips: usize, tracked_users: usize, total_requests: u64, total_user_requests: u64 } {
