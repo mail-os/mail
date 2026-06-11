@@ -1583,11 +1583,39 @@ pub const CalDavStore = struct {
 // ICS Parser (iCalendar)
 // =============================================================================
 
+/// Unfold RFC 5545 / RFC 6350 logical lines into `buf` (a continuation line
+/// begins with a space or tab and appends to the previous line, sans the
+/// leading WSP). Returns the unfolded slice, or the original `src` when it
+/// doesn't fit (callers then parse line-by-line; only folded properties
+/// degrade). CR is stripped from each physical line.
+fn unfoldLines(src: []const u8, buf: []u8) []const u8 {
+    var ulen: usize = 0;
+    var raw = std.mem.splitScalar(u8, src, '\n');
+    var first = true;
+    while (raw.next()) |rl| {
+        const l = std.mem.trimEnd(u8, rl, "\r");
+        const cont = !first and l.len > 0 and (l[0] == ' ' or l[0] == '\t');
+        const piece = if (cont) l[1..] else l;
+        const need = piece.len + @as(usize, if (cont or first) 0 else 1);
+        if (ulen + need > buf.len) return src;
+        if (!cont and !first) {
+            buf[ulen] = '\n';
+            ulen += 1;
+        }
+        @memcpy(buf[ulen..][0..piece.len], piece);
+        ulen += piece.len;
+        first = false;
+    }
+    return buf[0..ulen];
+}
+
 pub const IcsParser = struct {
     pub fn parseEvent(ics_data: []const u8) ?ParsedEvent {
         var event = ParsedEvent{};
 
-        var lines = std.mem.splitScalar(u8, ics_data, '\n');
+        var unfold_buf: [64 * 1024]u8 = undefined;
+        const unfolded = unfoldLines(ics_data, &unfold_buf);
+        var lines = std.mem.splitScalar(u8, unfolded, '\n');
         while (lines.next()) |raw_line| {
             const line = std.mem.trimEnd(u8, raw_line, "\r");
             if (std.mem.startsWith(u8, line, "SUMMARY:")) {
@@ -1681,42 +1709,113 @@ pub const VcfParser = struct {
     pub fn parseContact(vcf_data: []const u8) ?ParsedContact {
         var contact = ParsedContact{};
 
-        // Handle both \r\n (RFC standard) and \n (common in testing/unix)
-        var lines = std.mem.splitScalar(u8, vcf_data, '\n');
-        while (lines.next()) |raw_line| {
-            const line = std.mem.trimEnd(u8, raw_line, "\r");
-            if (std.mem.startsWith(u8, line, "FN:")) {
-                contact.full_name = line[3..];
-            } else if (std.mem.startsWith(u8, line, "N:")) {
-                const name_parts = line[2..];
-                var parts = std.mem.splitScalar(u8, name_parts, ';');
+        // Handle \r\n / \n and RFC 6350 line folding (continuation lines begin
+        // with a space/tab and append to the previous logical line).
+        var unfold_buf: [64 * 1024]u8 = undefined;
+        const unfolded = unfoldLines(vcf_data, &unfold_buf);
+
+        var lines = std.mem.splitScalar(u8, unfolded, '\n');
+        while (lines.next()) |raw_logical| {
+            // Trim a trailing CR (kept by the oversized-vCard fallback path).
+            const line = std.mem.trimEnd(u8, raw_logical, "\r");
+            // Split a content line into its property part (NAME;params) and
+            // value (everything after the first unquoted colon).
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const prop = line[0..colon];
+            const value = line[colon + 1 ..];
+            // Property name is up to the first ';' (params follow).
+            const semi = std.mem.indexOfScalar(u8, prop, ';');
+            const name = if (semi) |s| prop[0..s] else prop;
+            const params = if (semi) |s| prop[s + 1 ..] else "";
+
+            if (std.ascii.eqlIgnoreCase(name, "FN")) {
+                contact.full_name = value;
+            } else if (std.ascii.eqlIgnoreCase(name, "N")) {
+                var parts = std.mem.splitScalar(u8, value, ';');
                 contact.family_name = parts.next();
                 contact.given_name = parts.next();
-            } else if (std.mem.startsWith(u8, line, "EMAIL")) {
-                if (std.mem.indexOf(u8, line, ":")) |idx| {
-                    const value = line[idx + 1 ..];
-                    if (contact.email_count < MAX_MULTI_VALUES) {
-                        contact.emails[contact.email_count] = value;
-                        contact.email_count += 1;
-                    }
+            } else if (std.ascii.eqlIgnoreCase(name, "EMAIL")) {
+                if (contact.email_count < MAX_MULTI_VALUES) {
+                    contact.emails[contact.email_count] = value;
+                    contact.email_types[contact.email_count] = emailTypeFromParams(params);
+                    contact.email_pref[contact.email_count] = paramHasPref(params);
+                    contact.email_count += 1;
                 }
-            } else if (std.mem.startsWith(u8, line, "TEL")) {
-                if (std.mem.indexOf(u8, line, ":")) |idx| {
-                    const value = line[idx + 1 ..];
-                    if (contact.phone_count < MAX_MULTI_VALUES) {
-                        contact.phones[contact.phone_count] = value;
-                        contact.phone_count += 1;
-                    }
+            } else if (std.ascii.eqlIgnoreCase(name, "TEL")) {
+                if (contact.phone_count < MAX_MULTI_VALUES) {
+                    contact.phones[contact.phone_count] = value;
+                    contact.phone_types[contact.phone_count] = phoneTypeFromParams(params);
+                    contact.phone_pref[contact.phone_count] = paramHasPref(params);
+                    contact.phone_count += 1;
                 }
-            } else if (std.mem.startsWith(u8, line, "ORG:")) {
-                contact.organization = line[4..];
-            } else if (std.mem.startsWith(u8, line, "UID:")) {
-                contact.uid = line[4..];
+            } else if (std.ascii.eqlIgnoreCase(name, "ORG")) {
+                // ORG is structured (Company;Department;...); take the company.
+                contact.organization = if (std.mem.indexOfScalar(u8, value, ';')) |s| value[0..s] else value;
+            } else if (std.ascii.eqlIgnoreCase(name, "TITLE")) {
+                contact.title = value;
+            } else if (std.ascii.eqlIgnoreCase(name, "NICKNAME")) {
+                contact.nickname = value;
+            } else if (std.ascii.eqlIgnoreCase(name, "UID")) {
+                contact.uid = value;
             }
         }
 
-        if (contact.full_name == null) return null;
+        if (contact.full_name == null) {
+            // Fall back to the structured name when FN is absent.
+            if (contact.given_name) |g| contact.full_name = g else return null;
+        }
         return contact;
+    }
+
+    /// True if the parameter list marks this value preferred (TYPE=pref or
+    /// PREF=1 / a bare PREF). RFC 6350 (PREF=1..100) and vCard 3.0 (TYPE=pref).
+    fn paramHasPref(params: []const u8) bool {
+        var it = std.mem.splitScalar(u8, params, ';');
+        while (it.next()) |p| {
+            if (std.ascii.eqlIgnoreCase(p, "PREF")) return true;
+            if (std.ascii.startsWithIgnoreCase(p, "PREF=")) return true;
+            // TYPE=pref (possibly comma-joined with other types)
+            if (std.ascii.startsWithIgnoreCase(p, "TYPE=")) {
+                if (paramTokenContains(p[5..], "pref")) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Case-insensitive membership of `needle` in a comma/semicolon TYPE list,
+    /// tolerating quotes: TYPE="WORK,VOICE" or TYPE=work;TYPE=voice.
+    fn paramTokenContains(list: []const u8, needle: []const u8) bool {
+        const trimmed = std.mem.trim(u8, list, "\"");
+        var it = std.mem.splitAny(u8, trimmed, ",");
+        while (it.next()) |tok| {
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, tok, " \""), needle)) return true;
+        }
+        return false;
+    }
+
+    fn emailTypeFromParams(params: []const u8) EmailAddress.EmailType {
+        var it = std.mem.splitScalar(u8, params, ';');
+        while (it.next()) |p| {
+            if (!std.ascii.startsWithIgnoreCase(p, "TYPE=")) continue;
+            const v = p[5..];
+            if (paramTokenContains(v, "work")) return .work;
+            if (paramTokenContains(v, "home")) return .home;
+        }
+        return .other;
+    }
+
+    fn phoneTypeFromParams(params: []const u8) PhoneNumber.PhoneType {
+        var it = std.mem.splitScalar(u8, params, ';');
+        while (it.next()) |p| {
+            if (!std.ascii.startsWithIgnoreCase(p, "TYPE=")) continue;
+            const v = p[5..];
+            // Mobile aliases: cell (3.0), CELL/text, "cell"
+            if (paramTokenContains(v, "cell") or paramTokenContains(v, "mobile")) return .mobile;
+            if (paramTokenContains(v, "fax")) return .fax;
+            if (paramTokenContains(v, "work")) return .work;
+            if (paramTokenContains(v, "home")) return .home;
+        }
+        return .other;
     }
 
     pub const ParsedContact = struct {
@@ -1724,9 +1823,15 @@ pub const VcfParser = struct {
         full_name: ?[]const u8 = null,
         given_name: ?[]const u8 = null,
         family_name: ?[]const u8 = null,
+        nickname: ?[]const u8 = null,
+        title: ?[]const u8 = null,
         emails: [MAX_MULTI_VALUES][]const u8 = [_][]const u8{""} ** MAX_MULTI_VALUES,
+        email_types: [MAX_MULTI_VALUES]EmailAddress.EmailType = [_]EmailAddress.EmailType{.other} ** MAX_MULTI_VALUES,
+        email_pref: [MAX_MULTI_VALUES]bool = [_]bool{false} ** MAX_MULTI_VALUES,
         email_count: usize = 0,
         phones: [MAX_MULTI_VALUES][]const u8 = [_][]const u8{""} ** MAX_MULTI_VALUES,
+        phone_types: [MAX_MULTI_VALUES]PhoneNumber.PhoneType = [_]PhoneNumber.PhoneType{.other} ** MAX_MULTI_VALUES,
+        phone_pref: [MAX_MULTI_VALUES]bool = [_]bool{false} ** MAX_MULTI_VALUES,
         phone_count: usize = 0,
         organization: ?[]const u8 = null,
 
@@ -1829,6 +1934,20 @@ test "ics parsing" {
     try std.testing.expectEqualStrings("Team Meeting", event.?.summary.?);
 }
 
+test "ics parsing: folded DESCRIPTION, all-day, real times" {
+    const ics =
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n" ++
+        "UID:e1\r\n" ++
+        "SUMMARY:Offsite\r\n" ++
+        "DESCRIPTION:Long agenda that spans\r\n  multiple physical lines\r\n" ++
+        "DTSTART;VALUE=DATE:20260615\r\n" ++
+        "END:VEVENT\r\nEND:VCALENDAR\r\n";
+    const e = IcsParser.parseEvent(ics).?;
+    try std.testing.expectEqualStrings("Long agenda that spans multiple physical lines", e.description.?);
+    try std.testing.expect(e.all_day);
+    try std.testing.expect(e.dtstart != null); // 2026-06-15 parsed, not "now"
+}
+
 test "vcf parsing" {
     const vcf =
         \\BEGIN:VCARD
@@ -1845,4 +1964,38 @@ test "vcf parsing" {
     const contact = VcfParser.parseContact(vcf);
     try std.testing.expect(contact != null);
     try std.testing.expectEqualStrings("Jane Smith", contact.?.full_name.?);
+}
+
+test "vcf parsing: typed emails/phones, pref, folding, structured ORG" {
+    const vcf =
+        "BEGIN:VCARD\r\n" ++
+        "VERSION:3.0\r\n" ++
+        "FN:Grace Hopper\r\n" ++
+        "N:Hopper;Grace;;;\r\n" ++
+        "ORG:US Navy;Research\r\n" ++
+        "TITLE:Rear Admiral\r\n" ++
+        "NICKNAME:Amazing Grace\r\n" ++
+        "EMAIL;TYPE=WORK,PREF:grace@navy.mil\r\n" ++
+        "EMAIL;TYPE=home:grace@\r\n example.com\r\n" ++ // folded continuation
+        "TEL;TYPE=CELL:+15551112222\r\n" ++
+        "TEL;TYPE=work,voice:+15553334444\r\n" ++
+        "TEL;TYPE=fax:+15555556666\r\n" ++
+        "UID:grace-1\r\n" ++
+        "END:VCARD\r\n";
+
+    const c = VcfParser.parseContact(vcf).?;
+    try std.testing.expectEqualStrings("Grace Hopper", c.full_name.?);
+    try std.testing.expectEqualStrings("Grace", c.given_name.?);
+    try std.testing.expectEqualStrings("US Navy", c.organization.?); // company only
+    try std.testing.expectEqualStrings("Rear Admiral", c.title.?);
+    try std.testing.expectEqualStrings("Amazing Grace", c.nickname.?);
+
+    try std.testing.expectEqual(@as(usize, 2), c.email_count);
+    try std.testing.expectEqual(PhoneNumber.PhoneType.mobile, c.phone_types[0]);
+    try std.testing.expectEqual(PhoneNumber.PhoneType.work, c.phone_types[1]);
+    try std.testing.expectEqual(PhoneNumber.PhoneType.fax, c.phone_types[2]);
+    try std.testing.expectEqual(EmailAddress.EmailType.work, c.email_types[0]);
+    try std.testing.expectEqual(EmailAddress.EmailType.home, c.email_types[1]);
+    try std.testing.expect(c.email_pref[0]); // TYPE=...,PREF
+    try std.testing.expectEqualStrings("grace@example.com", c.emails[1]); // unfolded
 }

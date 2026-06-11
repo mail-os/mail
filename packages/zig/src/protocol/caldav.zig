@@ -1255,11 +1255,30 @@ pub const CalDavSession = struct {
                 var emails: []const Store.EmailData = &.{};
                 var phones: []const Store.PhoneData = &.{};
                 if (parsed_contact) |c| {
+                    // Carry the parsed TYPE (work/home/mobile/...) and PREF
+                    // through; if no entry is flagged PREF, the first is primary.
                     const ne = @min(c.email_count, email_buf.len);
-                    for (0..ne) |i| email_buf[i] = .{ .email = c.emails[i], .is_primary = i == 0 };
+                    var any_email_pref = false;
+                    for (0..ne) |i| {
+                        if (c.email_pref[i]) any_email_pref = true;
+                    }
+                    for (0..ne) |i| email_buf[i] = .{
+                        .email = c.emails[i],
+                        .email_type = c.email_types[i],
+                        .is_primary = if (any_email_pref) c.email_pref[i] else i == 0,
+                    };
                     emails = email_buf[0..ne];
+
                     const np = @min(c.phone_count, phone_buf.len);
-                    for (0..np) |i| phone_buf[i] = .{ .number = c.phones[i], .is_primary = i == 0 };
+                    var any_phone_pref = false;
+                    for (0..np) |i| {
+                        if (c.phone_pref[i]) any_phone_pref = true;
+                    }
+                    for (0..np) |i| phone_buf[i] = .{
+                        .number = c.phones[i],
+                        .phone_type = c.phone_types[i],
+                        .is_primary = if (any_phone_pref) c.phone_pref[i] else i == 0,
+                    };
                     phones = phone_buf[0..np];
                 }
                 const contact_data = Store.ContactData{
@@ -1267,7 +1286,9 @@ pub const CalDavSession = struct {
                     .full_name = full_name,
                     .given_name = if (parsed_contact) |c| c.given_name else null,
                     .family_name = if (parsed_contact) |c| c.family_name else null,
+                    .nickname = if (parsed_contact) |c| c.nickname else null,
                     .organization = if (parsed_contact) |c| c.organization else null,
+                    .title = if (parsed_contact) |c| c.title else null,
                     .vcf_data = body,
                     .emails = emails,
                     .phones = phones,
