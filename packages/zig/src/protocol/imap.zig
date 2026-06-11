@@ -2678,6 +2678,26 @@ pub const ImapSession = struct {
         mailbox: ?[]const u8,
     };
 
+    /// Index-time mailbox name for the message at `idx` in the selected
+    /// listing. For regular mailboxes that's the selected name; for
+    /// virtual/aggregate mailboxes the per-message uid_key carries the real
+    /// folder as a "{folder}/{base}" prefix (with new/ already mapped to
+    /// INBOX by the loader).
+    fn sourceMailboxForIndex(self: *ImapSession, idx: usize) []const u8 {
+        if (self.mailbox_is_virtual) {
+            if (self.mailbox_uid_keys) |keys| {
+                if (idx < keys.len) {
+                    if (std.mem.indexOfScalar(u8, keys[idx], '/')) |slash| {
+                        return keys[idx][0..slash];
+                    }
+                }
+            }
+            return "INBOX";
+        }
+        const name = self.mailbox_name orelse return "INBOX";
+        return if (std.ascii.eqlIgnoreCase(name, "INBOX")) "INBOX" else name;
+    }
+
     /// Identity for search-index operations: the local-part username and
     /// the selected mailbox (null for virtual/aggregate mailboxes, which
     /// span folders and therefore search the whole account).
@@ -3011,6 +3031,15 @@ pub const ImapSession = struct {
             defer file.close();
             file.writeAll(content) catch continue;
 
+            // Keep the search index in sync with the new copy
+            typesense.indexMessageAsync(
+                self.allocator,
+                local_part,
+                if (std.ascii.eqlIgnoreCase(dest_name, "INBOX")) "INBOX" else dest_name,
+                std.fs.path.basename(dest_path),
+                content,
+            );
+
             copied += 1;
         }
 
@@ -3100,6 +3129,16 @@ pub const ImapSession = struct {
             const src_path_z = self.allocator.dupeZ(u8, src_path) catch continue;
             defer self.allocator.free(src_path_z);
             _ = std.c.unlink(src_path_z.ptr);
+
+            // Search index: add the destination copy, drop the source doc
+            typesense.indexMessageAsync(
+                self.allocator,
+                local_part,
+                if (std.ascii.eqlIgnoreCase(dest_name, "INBOX")) "INBOX" else dest_name,
+                std.fs.path.basename(dest_path),
+                content,
+            );
+            typesense.deleteMessage(self.allocator, local_part, self.sourceMailboxForIndex(idx), filename);
 
             // Send EXPUNGE notification
             var resp_buf: [32]u8 = undefined;
@@ -3335,7 +3374,7 @@ pub const ImapSession = struct {
 
             // Drop from the search index (best-effort)
             if (self.searchIdentity()) |ident| {
-                typesense.deleteMessage(self.allocator, ident.username, ident.mailbox orelse "INBOX", filename);
+                typesense.deleteMessage(self.allocator, ident.username, self.sourceMailboxForIndex(seq - 1), filename);
             }
 
             // Send untagged EXPUNGE

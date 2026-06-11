@@ -295,6 +295,88 @@ pub fn searchFilenames(
     return out.toOwnedSlice(allocator);
 }
 
+/// A full search hit (for the webmail/REST surface). All slices are owned
+/// by the caller's allocator.
+pub const MessageHit = struct {
+    mailbox: []u8,
+    filename: []u8,
+    subject: []u8,
+    sender: []u8,
+    recipients: []u8,
+    date: i64,
+
+    pub fn deinit(self: *MessageHit, allocator: std.mem.Allocator) void {
+        allocator.free(self.mailbox);
+        allocator.free(self.filename);
+        allocator.free(self.subject);
+        allocator.free(self.sender);
+        allocator.free(self.recipients);
+    }
+};
+
+/// Search across all message fields, returning rich hits for UI surfaces.
+/// Caller frees each hit (deinit) and the slice.
+pub fn searchDocs(
+    allocator: std.mem.Allocator,
+    username: []const u8,
+    mailbox: ?[]const u8,
+    query: []const u8,
+) ![]MessageHit {
+    const engine = loadEngine() orelse return error.Disabled;
+
+    var filter: std.ArrayList(u8) = .empty;
+    defer filter.deinit(allocator);
+    try filter.appendSlice(allocator, "username:=`");
+    try filter.appendSlice(allocator, username);
+    try filter.appendSlice(allocator, "`");
+    if (mailbox) |mb| {
+        try filter.appendSlice(allocator, " && mailbox:=`");
+        try filter.appendSlice(allocator, mb);
+        try filter.appendSlice(allocator, "`");
+    }
+
+    var result = try engine.search(allocator, collection, .{
+        .query = query,
+        .query_by = "subject,sender,recipients,body",
+        .filter_by = filter.items,
+        .per_page = 50,
+    });
+    defer result.deinit();
+
+    var out: std.ArrayList(MessageHit) = .empty;
+    errdefer {
+        for (out.items) |*h| h.deinit(allocator);
+        out.deinit(allocator);
+    }
+
+    var it = result.hits();
+    while (it.next()) |doc| {
+        const fname = se.SearchResponse.docString(doc, "filename");
+        if (fname.len == 0) continue;
+
+        var hit = MessageHit{
+            .mailbox = try allocator.dupe(u8, se.SearchResponse.docString(doc, "mailbox")),
+            .filename = undefined,
+            .subject = undefined,
+            .sender = undefined,
+            .recipients = undefined,
+            .date = std.fmt.parseInt(i64, se.SearchResponse.docString(doc, "date"), 10) catch 0,
+        };
+        errdefer allocator.free(hit.mailbox);
+        hit.filename = try allocator.dupe(u8, fname);
+        errdefer allocator.free(hit.filename);
+        hit.subject = try allocator.dupe(u8, se.SearchResponse.docString(doc, "subject"));
+        errdefer allocator.free(hit.subject);
+        hit.sender = try allocator.dupe(u8, se.SearchResponse.docString(doc, "sender"));
+        errdefer allocator.free(hit.sender);
+        hit.recipients = try allocator.dupe(u8, se.SearchResponse.docString(doc, "recipients"));
+
+        try out.append(allocator, hit);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
 // =============================================================================
 // Small helpers
 // =============================================================================

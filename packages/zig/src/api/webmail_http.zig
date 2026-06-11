@@ -33,6 +33,7 @@ const security = @import("../auth/security.zig");
 const core_config = @import("../core/config.zig");
 const compose = @import("webmail_compose.zig");
 const webmail_tls = @import("webmail_tls.zig");
+const typesense = @import("../search/typesense.zig");
 const io_compat = @import("../core/io_compat.zig");
 const tls = @import("tls");
 
@@ -382,6 +383,9 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.eql(u8, p, "/webmail/api/messages") and std.mem.eql(u8, req.method, "GET")) {
         return handleMessageList(server, conn, arena, req);
     }
+    if (std.mem.eql(u8, p, "/webmail/api/search") and std.mem.eql(u8, req.method, "GET")) {
+        return handleSearch(server, conn, arena, req);
+    }
 
     // ── SPA static assets (embedded) ─────────────────────────────────────────
     // The pages call /webmail/* on the same origin (no proxy in prod). The page
@@ -656,6 +660,49 @@ fn handleMessageList(server: *WebmailHttpServer, conn: *webmail_tls.Stream, aren
     for (msgs, 0..) |m, i| {
         if (i > 0) try w.writeAll(",");
         try writeMessageSummary(w, m);
+    }
+    try w.writeAll("]}");
+    try sendJson(conn, arena, 200, body.items, null);
+}
+
+/// GET /webmail/api/search?q=...[&folder=...] — full-text search over the
+/// session user's mail via the Typesense index. Hits are joined back to
+/// IMAP UIDs so the frontend can open them with the existing message API.
+fn handleSearch(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+
+    const q = req.queryParam(arena, "q") orelse "";
+    if (q.len == 0) return sendError(conn, arena, 400, "bad_request", "Missing query parameter 'q'");
+    if (!typesense.enabled()) return sendError(conn, arena, 503, "unavailable", "Search engine not configured");
+
+    const folder = req.queryParam(arena, "folder");
+
+    const hits = typesense.searchDocs(arena, sess.username, folder, q) catch {
+        return sendError(conn, arena, 502, "search_failed", "Search engine error");
+    };
+
+    var body: std.ArrayList(u8) = .empty;
+    const w = jw(&body, arena);
+    try w.writeAll("{\"query\":");
+    try writeJsonString(w, q);
+    try w.writeAll(",\"items\":[");
+    var written: usize = 0;
+    for (hits) |hit| {
+        // Join back to the message's IMAP UID; a hit whose file vanished
+        // since indexing is dropped (the nightly reindex prunes the doc).
+        const uid = (server.db.getUidForFile(sess.username, hit.mailbox, hit.filename) catch null) orelse continue;
+        if (written > 0) try w.writeAll(",");
+        written += 1;
+        try w.print("{{\"uid\":{d},\"folder\":", .{uid});
+        try writeJsonString(w, hit.mailbox);
+        try w.writeAll(",\"subject\":");
+        try writeJsonString(w, hit.subject);
+        try w.writeAll(",\"from\":");
+        try writeJsonString(w, hit.sender);
+        try w.writeAll(",\"to\":");
+        try writeJsonString(w, hit.recipients);
+        try w.print(",\"date\":{d}}}", .{hit.date});
     }
     try w.writeAll("]}");
     try sendJson(conn, arena, 200, body.items, null);
