@@ -515,11 +515,10 @@ test "writer emits switch page and tags once" {
     // SWITCH_PAGE 0x00, page 7, FolderSync|0x40, Status|0x40, STR_I '1' 0x00,
     // END (status), END (foldersync)
     const expected = [_]u8{
-        SWITCH_PAGE, 0x07,
-        FolderHierarchy.FolderSync | HAS_CONTENT,
-        FolderHierarchy.Status | HAS_CONTENT,
-        STR_I, '1', 0x00,
-        END,
+        SWITCH_PAGE,                              0x07,
+        FolderHierarchy.FolderSync | HAS_CONTENT, FolderHierarchy.Status | HAS_CONTENT,
+        STR_I,                                    '1',
+        0x00,                                     END,
         END,
     };
     try std.testing.expectEqualSlices(u8, &expected, w.buf.items);

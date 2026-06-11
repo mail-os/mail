@@ -26,6 +26,9 @@ jobs:
       with:
         version: 0.17.0-dev.56+a8226cd53
 
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@v2
+
     - name: Build for Linux x86_64
       working-directory: packages/zig
       run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast

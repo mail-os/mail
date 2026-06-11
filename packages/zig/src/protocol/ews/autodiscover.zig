@@ -9,13 +9,12 @@ const std = @import("std");
 ///
 /// This module is intentionally dependency-free (only std) so it can move into
 /// a standalone `zig-ews` package unchanged.
-
 /// Extract the `Protocol` query parameter from a request path/query.
 pub fn protocolParam(path: []const u8) []const u8 {
     const q = std.mem.indexOfScalar(u8, path, '?') orelse return "EWS";
     var it = std.mem.splitScalar(u8, path[q + 1 ..], '&');
     while (it.next()) |pair| {
-        if (std.mem.startsWith(u8, pair, "Protocol=")) return pair["Protocol=".len ..];
+        if (std.mem.startsWith(u8, pair, "Protocol=")) return pair["Protocol=".len..];
     }
     return "EWS";
 }

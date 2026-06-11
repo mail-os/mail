@@ -20,7 +20,6 @@ const time_compat = @import("../core/time_compat.zig");
 /// NOTE: the CalDAV store is in-memory and non-persistent (see caldav_store.zig);
 /// calendar/contacts items exist only for the current server uptime. That is a
 /// storage-layer limitation shared with CalDAV, independent of this protocol code.
-
 const CONTENT_TYPE = "application/vnd.ms-sync.wbxml";
 
 /// Maximum email items emitted in a single Sync response.

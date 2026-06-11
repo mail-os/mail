@@ -28,6 +28,9 @@ jobs:
       with:
         version: 0.17.0-dev.56+a8226cd53
 
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@v2
+
     - name: Setup Pantry
       uses: home-lang/pantry/packages/action@main
 
@@ -90,6 +93,9 @@ jobs:
       with:
         version: 0.17.0-dev.56+a8226cd53
 
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@v2
+
     - name: Check formatting
       run: zig fmt --check src/
 
@@ -113,6 +119,9 @@ jobs:
       uses: mlugg/setup-zig@v2
       with:
         version: 0.17.0-dev.56+a8226cd53
+
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@v2
 
     - name: Setup Pantry
       uses: home-lang/pantry/packages/action@main
@@ -172,6 +181,9 @@ jobs:
       uses: mlugg/setup-zig@v2
       with:
         version: 0.17.0-dev.56+a8226cd53
+
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@v2
 
     - name: Setup Pantry
       uses: home-lang/pantry/packages/action@main
