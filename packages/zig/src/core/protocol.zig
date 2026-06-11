@@ -157,6 +157,12 @@ pub const ConnectionWrapper = struct {
     cleartext_buf: [16384]u8,
     cleartext_start: usize,
     cleartext_end: usize,
+    // Read-ahead buffer for line-oriented parsing (one syscall per chunk
+    // instead of one per byte). Raw read() bypasses this; before a TLS
+    // upgrade any unconsumed bytes must be drained via drainBuffered().
+    read_buf: [4096]u8,
+    read_buf_start: usize,
+    read_buf_end: usize,
 
     pub fn init(tcp_conn: socket.Connection) ConnectionWrapper {
         return .{
@@ -168,10 +174,52 @@ pub const ConnectionWrapper = struct {
             .cleartext_buf = undefined,
             .cleartext_start = 0,
             .cleartext_end = 0,
+            .read_buf = undefined,
+            .read_buf_start = 0,
+            .read_buf_end = 0,
         };
     }
 
+    /// Buffered read: serves from the read-ahead buffer, refilling it with
+    /// one large read() when empty.
+    pub fn readBuffered(self: *ConnectionWrapper, buffer: []u8) !usize {
+        if (self.read_buf_start == self.read_buf_end) {
+            const n = try self.rawRead(self.read_buf[0..]);
+            if (n == 0) return 0;
+            self.read_buf_start = 0;
+            self.read_buf_end = n;
+        }
+        const available = self.read_buf_end - self.read_buf_start;
+        const to_copy = @min(available, buffer.len);
+        @memcpy(buffer[0..to_copy], self.read_buf[self.read_buf_start..][0..to_copy]);
+        self.read_buf_start += to_copy;
+        return to_copy;
+    }
+
+    /// Hand back any read-ahead bytes without touching the socket. Called
+    /// before a TLS upgrade so pipelined handshake bytes aren't lost.
+    pub fn drainBuffered(self: *ConnectionWrapper, buffer: []u8) usize {
+        const available = self.read_buf_end - self.read_buf_start;
+        const to_copy = @min(available, buffer.len);
+        @memcpy(buffer[0..to_copy], self.read_buf[self.read_buf_start..][0..to_copy]);
+        self.read_buf_start += to_copy;
+        if (self.read_buf_start == self.read_buf_end) {
+            self.read_buf_start = 0;
+            self.read_buf_end = 0;
+        }
+        return to_copy;
+    }
+
     pub fn read(self: *ConnectionWrapper, buffer: []u8) !usize {
+        // Serve read-ahead bytes first so raw and buffered reads never
+        // observe the stream out of order.
+        if (self.read_buf_end > self.read_buf_start) {
+            return self.drainBuffered(buffer);
+        }
+        return self.rawRead(buffer);
+    }
+
+    fn rawRead(self: *ConnectionWrapper, buffer: []u8) !usize {
         if (self.using_tls) {
             if (self.tls_conn) |*tls_conn| {
                 // First, return any buffered cleartext
@@ -268,7 +316,7 @@ pub const ConnectionWrapper = struct {
                 }
 
                 // No cleartext yet, try again (TLS record not complete)
-                return self.read(buffer);
+                return self.rawRead(buffer);
             }
             return error.TlsNotActive;
         }
@@ -479,8 +527,8 @@ pub const Session = struct {
             // Check for timeout before each read
             try self.checkTimeout();
 
-            // Read byte by byte until we hit \n
-            const byte_read = self.conn_wrapper.read(line_buffer[line_pos .. line_pos + 1]) catch |err| {
+            // Read until we hit \n (buffered: bulk syscalls, per-byte consume)
+            const byte_read = self.conn_wrapper.readBuffered(line_buffer[line_pos .. line_pos + 1]) catch |err| {
                 self.logger.err("SMTP: Read error after {d} bytes: {}", .{ line_pos, err });
                 if (err == error.EndOfStream) break;
                 return err;
@@ -786,9 +834,9 @@ pub const Session = struct {
         if (self.greylist != null and !self.authenticated) {
             const greylist = self.greylist.?;
             const mail_from = self.mail_from orelse "";
-            const allowed = greylist.checkTriplet(self.remote_addr, mail_from, addr) catch blk: {
-                // Error checking greylist - allow by default
-                self.logger.warn("Greylist check error for {s}", .{self.remote_addr});
+            const allowed = greylist.checkTriplet(self.remote_addr, mail_from, addr) catch |err| blk: {
+                // Error checking greylist - allow by default (fail open)
+                self.logger.warn("Greylist check error for {s}: {} - allowing", .{ self.remote_addr, err });
                 break :blk true;
             };
 
@@ -848,8 +896,7 @@ pub const Session = struct {
                 try self.sendResponse(writer, 451, "DATA timeout - message transfer took too long", null);
                 return error.DataTimeout;
             }
-            // Read byte by byte
-            const byte_read = try self.conn_wrapper.read(line_buffer[line_pos .. line_pos + 1]);
+            const byte_read = try self.conn_wrapper.readBuffered(line_buffer[line_pos .. line_pos + 1]);
             if (byte_read == 0) break;
 
             if (line_buffer[line_pos] == '\n') {
@@ -1235,7 +1282,7 @@ pub const Session = struct {
             var username_line: [1024]u8 = undefined;
             var username_pos: usize = 0;
             while (true) {
-                const n = self.conn_wrapper.read(username_line[username_pos .. username_pos + 1]) catch {
+                const n = self.conn_wrapper.readBuffered(username_line[username_pos .. username_pos + 1]) catch {
                     try self.sendResponse(writer, 535, "Authentication failed", null);
                     return;
                 };
@@ -1272,7 +1319,7 @@ pub const Session = struct {
             var password_line: [1024]u8 = undefined;
             var password_pos: usize = 0;
             while (true) {
-                const n = self.conn_wrapper.read(password_line[password_pos .. password_pos + 1]) catch {
+                const n = self.conn_wrapper.readBuffered(password_line[password_pos .. password_pos + 1]) catch {
                     try self.sendResponse(writer, 535, "Authentication failed", null);
                     return;
                 };
@@ -1365,53 +1412,24 @@ pub const Session = struct {
 
     /// Perform TLS handshake (shared by STARTTLS and SMTPS implicit TLS)
     fn doTlsHandshake(self: *Session) !void {
-        // Load certificate and key
-        const cert_path = self.tls_context.?.config.cert_path orelse return error.TlsNotConfigured;
-        const key_path = self.tls_context.?.config.key_path orelse return error.TlsNotConfigured;
-
-        // Convert to absolute paths
-        var cert_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        var key_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-
-        const io = io_compat.getIo();
-        const abs_cert_path = if (std.fs.path.isAbsolute(cert_path))
-            cert_path
-        else blk: {
-            const len = std.Io.Dir.cwd().realPathFile(io, cert_path, &cert_path_buf) catch {
-                self.logger.err("Failed to resolve cert path: {s}", .{cert_path});
-                return error.InvalidCertificate;
-            };
-            break :blk cert_path_buf[0..len];
-        };
-
-        const abs_key_path = if (std.fs.path.isAbsolute(key_path))
-            key_path
-        else blk: {
-            const len = std.Io.Dir.cwd().realPathFile(io, key_path, &key_path_buf) catch {
-                self.logger.err("Failed to resolve key path: {s}", .{key_path});
-                return error.InvalidCertificate;
-            };
-            break :blk key_path_buf[0..len];
-        };
-
-        var cert_key = tls.config.CertKeyPair.fromFilePathAbsolute(
-            self.allocator,
-            io_compat.getIo(),
-            abs_cert_path,
-            abs_key_path,
-        ) catch |err| {
-            self.logger.err("Failed to load certificate/key: {}", .{err});
-            return error.InvalidCertificate;
-        };
-        defer cert_key.deinit(self.allocator);
+        // Reuse the CertKeyPair the TlsContext parsed at startup instead of
+        // re-reading cert/key files from disk on every handshake.
+        const ctx = self.tls_context.?;
+        if (ctx.cert_key_pair == null) {
+            self.logger.err("TLS certificate not loaded in context", .{});
+            return error.TlsNotConfigured;
+        }
+        const cert_key = &ctx.cert_key_pair.?;
 
         // Use non-blocking TLS handshake (matches proven IMAP pattern)
-        var server_hs = tls.nonblock.Server.init(.{ .auth = &cert_key });
+        var server_hs = tls.nonblock.Server.init(.{ .auth = cert_key });
 
         // Buffers for TLS handshake
         var recv_buf: [tls.input_buffer_len]u8 = undefined;
         var send_buf: [tls.output_buffer_len]u8 = undefined;
-        var recv_len: usize = 0;
+        // Seed with any read-ahead bytes (a pipelining client may have sent
+        // its ClientHello right behind the STARTTLS command).
+        var recv_len: usize = self.conn_wrapper.drainBuffered(recv_buf[0..]);
 
         // Perform handshake loop: run first, then read if needed (IMAP pattern)
         while (!server_hs.done()) {
