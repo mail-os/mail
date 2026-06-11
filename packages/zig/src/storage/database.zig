@@ -24,6 +24,12 @@ const sqlite3_bind_text_raw: *const fn (
 
 const SQLITE_TRANSIENT_PTR: ?*const anyopaque = @ptrFromInt(std.math.maxInt(usize));
 
+/// Surface sqlite3_bind_* failures instead of silently continuing to step()
+/// with unbound/partially-bound parameters.
+fn checkBind(rc: c_int) DatabaseError!void {
+    if (rc != sqlite.SQLITE_OK) return DatabaseError.BindFailed;
+}
+
 pub const DatabaseError = error{
     OpenFailed,
     ExecFailed,
@@ -267,6 +273,22 @@ pub const Database = struct {
         // Set a reasonable busy timeout (5 seconds)
         const timeout_pragma = "PRAGMA busy_timeout=5000;";
         try self.exec(timeout_pragma);
+
+        // Enforce the FOREIGN KEY constraints declared in the schema
+        // (SQLite ignores them unless this pragma is on, per connection)
+        const fk_pragma = "PRAGMA foreign_keys=ON;";
+        try self.exec(fk_pragma);
+    }
+
+    /// exec without taking the mutex — for use inside methods that already
+    /// hold it (e.g. to wrap multiple statements in one transaction).
+    fn execLocked(self: *Database, sql: [:0]const u8) !void {
+        var errmsg: [*c]u8 = null;
+        const rc = sqlite.sqlite3_exec(self.db, sql.ptr, null, null, @ptrCast(&errmsg));
+        if (rc != sqlite.SQLITE_OK) {
+            if (errmsg) |msg| sqlite.sqlite3_free(msg);
+            return DatabaseError.ExecFailed;
+        }
     }
 
     fn initSchema(self: *Database) !void {
@@ -423,11 +445,11 @@ pub const Database = struct {
 
         const now = time_compat.timestamp();
 
-        _ = sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null);
-        _ = sqlite.sqlite3_bind_text(stmt, 2, password_z.ptr, -1, null);
-        _ = sqlite.sqlite3_bind_text(stmt, 3, email_z.ptr, -1, null);
-        _ = sqlite.sqlite3_bind_int64(stmt, 4, now);
-        _ = sqlite.sqlite3_bind_int64(stmt, 5, now);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null));
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 2, password_z.ptr, -1, null));
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 3, email_z.ptr, -1, null));
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 4, now));
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 5, now));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_DONE) {
@@ -463,7 +485,7 @@ pub const Database = struct {
         const username_z = try self.allocator.dupeZ(u8, username);
         defer self.allocator.free(username_z);
 
-        _ = sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_ROW) {
@@ -524,9 +546,9 @@ pub const Database = struct {
 
         const now = time_compat.timestamp();
 
-        _ = sqlite.sqlite3_bind_text(stmt, 1, password_z.ptr, -1, null);
-        _ = sqlite.sqlite3_bind_int64(stmt, 2, now);
-        _ = sqlite.sqlite3_bind_text(stmt, 3, username_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 1, password_z.ptr, -1, null));
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 2, now));
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 3, username_z.ptr, -1, null));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_DONE) {
@@ -553,7 +575,7 @@ pub const Database = struct {
         const username_z = try self.allocator.dupeZ(u8, username);
         defer self.allocator.free(username_z);
 
-        _ = sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_DONE) {
@@ -608,21 +630,21 @@ pub const Database = struct {
 
         const now = time_compat.timestamp();
 
-        _ = sqlite.sqlite3_bind_text(stmt, 1, session_z.ptr, -1, null);
-        _ = sqlite.sqlite3_bind_text(stmt, 2, username_z.ptr, -1, null);
-        _ = sqlite.sqlite3_bind_text(stmt, 3, email_z.ptr, -1, null);
-        _ = sqlite.sqlite3_bind_text(stmt, 4, csrf_z.ptr, -1, null);
-        _ = sqlite.sqlite3_bind_int64(stmt, 5, now);
-        _ = sqlite.sqlite3_bind_int64(stmt, 6, expires_at);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 1, session_z.ptr, -1, null));
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 2, username_z.ptr, -1, null));
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 3, email_z.ptr, -1, null));
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 4, csrf_z.ptr, -1, null));
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 5, now));
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 6, expires_at));
         if (ip_z) |v| {
-            _ = sqlite.sqlite3_bind_text(stmt, 7, v.ptr, -1, null);
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 7, v.ptr, -1, null));
         } else {
-            _ = sqlite.sqlite3_bind_null(stmt, 7);
+            try checkBind(sqlite.sqlite3_bind_null(stmt, 7));
         }
         if (ua_z) |v| {
-            _ = sqlite.sqlite3_bind_text(stmt, 8, v.ptr, -1, null);
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 8, v.ptr, -1, null));
         } else {
-            _ = sqlite.sqlite3_bind_null(stmt, 8);
+            try checkBind(sqlite.sqlite3_bind_null(stmt, 8));
         }
 
         rc = sqlite.sqlite3_step(stmt);
@@ -659,7 +681,7 @@ pub const Database = struct {
         const session_z = try self.allocator.dupeZ(u8, session_id);
         defer self.allocator.free(session_z);
 
-        _ = sqlite.sqlite3_bind_text(stmt, 1, session_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 1, session_z.ptr, -1, null));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_ROW) {
@@ -711,9 +733,9 @@ pub const Database = struct {
 
         const now = time_compat.timestamp();
 
-        _ = sqlite.sqlite3_bind_int64(stmt, 1, now);
-        _ = sqlite.sqlite3_bind_int64(stmt, 2, new_expires_at);
-        _ = sqlite.sqlite3_bind_text(stmt, 3, session_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 1, now));
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 2, new_expires_at));
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 3, session_z.ptr, -1, null));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_DONE) {
@@ -741,7 +763,7 @@ pub const Database = struct {
         const session_z = try self.allocator.dupeZ(u8, session_id);
         defer self.allocator.free(session_z);
 
-        _ = sqlite.sqlite3_bind_text(stmt, 1, session_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 1, session_z.ptr, -1, null));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_DONE) {
@@ -766,7 +788,7 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        _ = sqlite.sqlite3_bind_int64(stmt, 1, now);
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 1, now));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_DONE) {
@@ -799,9 +821,9 @@ pub const Database = struct {
 
         const now = time_compat.timestamp();
 
-        _ = sqlite.sqlite3_bind_int(stmt, 1, if (enabled) 1 else 0);
-        _ = sqlite.sqlite3_bind_int64(stmt, 2, now);
-        _ = sqlite.sqlite3_bind_text(stmt, 3, username_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_int(stmt, 1, if (enabled) 1 else 0));
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 2, now));
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 3, username_z.ptr, -1, null));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_DONE) {
@@ -895,9 +917,9 @@ pub const Database = struct {
 
         const now = time_compat.timestamp();
 
-        _ = sqlite.sqlite3_bind_text(stmt, 1, email_z.ptr, -1, null);
-        _ = sqlite.sqlite3_bind_int64(stmt, 2, now);
-        _ = sqlite.sqlite3_bind_text(stmt, 3, username_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 1, email_z.ptr, -1, null));
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 2, now));
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 3, username_z.ptr, -1, null));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_DONE) {
@@ -975,51 +997,51 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        _ = sqlite.sqlite3_bind_int64(stmt, 1, timestamp);
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 1, timestamp));
 
         const action_z = try self.allocator.dupeZ(u8, action);
         defer self.allocator.free(action_z);
-        _ = sqlite.sqlite3_bind_text(stmt, 2, action_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 2, action_z.ptr, -1, null));
 
         const actor_z = try self.allocator.dupeZ(u8, actor);
         defer self.allocator.free(actor_z);
-        _ = sqlite.sqlite3_bind_text(stmt, 3, actor_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 3, actor_z.ptr, -1, null));
 
         if (target) |t| {
             const target_z = try self.allocator.dupeZ(u8, t);
             defer self.allocator.free(target_z);
-            _ = sqlite.sqlite3_bind_text(stmt, 4, target_z.ptr, -1, null);
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 4, target_z.ptr, -1, null));
         } else {
-            _ = sqlite.sqlite3_bind_null(stmt, 4);
+            try checkBind(sqlite.sqlite3_bind_null(stmt, 4));
         }
 
         if (target_type) |tt| {
             const tt_z = try self.allocator.dupeZ(u8, tt);
             defer self.allocator.free(tt_z);
-            _ = sqlite.sqlite3_bind_text(stmt, 5, tt_z.ptr, -1, null);
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 5, tt_z.ptr, -1, null));
         } else {
-            _ = sqlite.sqlite3_bind_null(stmt, 5);
+            try checkBind(sqlite.sqlite3_bind_null(stmt, 5));
         }
 
         if (ip_address) |ip| {
             const ip_z = try self.allocator.dupeZ(u8, ip);
             defer self.allocator.free(ip_z);
-            _ = sqlite.sqlite3_bind_text(stmt, 6, ip_z.ptr, -1, null);
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 6, ip_z.ptr, -1, null));
         } else {
-            _ = sqlite.sqlite3_bind_null(stmt, 6);
+            try checkBind(sqlite.sqlite3_bind_null(stmt, 6));
         }
 
         if (details) |d| {
             const details_z = try self.allocator.dupeZ(u8, d);
             defer self.allocator.free(details_z);
-            _ = sqlite.sqlite3_bind_text(stmt, 7, details_z.ptr, -1, null);
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 7, details_z.ptr, -1, null));
         } else {
-            _ = sqlite.sqlite3_bind_null(stmt, 7);
+            try checkBind(sqlite.sqlite3_bind_null(stmt, 7));
         }
 
         const severity_z = try self.allocator.dupeZ(u8, severity);
         defer self.allocator.free(severity_z);
-        _ = sqlite.sqlite3_bind_text(stmt, 8, severity_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 8, severity_z.ptr, -1, null));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_DONE) {
@@ -1074,8 +1096,8 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        _ = sqlite.sqlite3_bind_int64(stmt, 1, @intCast(limit));
-        _ = sqlite.sqlite3_bind_int64(stmt, 2, @intCast(offset));
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 1, @intCast(limit)));
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 2, @intCast(offset)));
 
         var entries = std.ArrayList(AuditLogEntry).init(self.allocator);
         errdefer {
@@ -1160,7 +1182,7 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        _ = sqlite.sqlite3_bind_int64(stmt, 1, before_timestamp);
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 1, before_timestamp));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_DONE) {
@@ -1256,21 +1278,21 @@ pub const Database = struct {
 
         const username_z = try self.allocator.dupeZ(u8, username);
         defer self.allocator.free(username_z);
-        _ = sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null));
 
         const hash_z = try self.allocator.dupeZ(u8, token_hash);
         defer self.allocator.free(hash_z);
-        _ = sqlite.sqlite3_bind_text(stmt, 2, hash_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 2, hash_z.ptr, -1, null));
 
-        _ = sqlite.sqlite3_bind_int64(stmt, 3, created_at);
-        _ = sqlite.sqlite3_bind_int64(stmt, 4, expires_at);
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 3, created_at));
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 4, expires_at));
 
         if (ip_address) |ip| {
             const ip_z = try self.allocator.dupeZ(u8, ip);
             defer self.allocator.free(ip_z);
-            _ = sqlite.sqlite3_bind_text(stmt, 5, ip_z.ptr, -1, null);
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 5, ip_z.ptr, -1, null));
         } else {
-            _ = sqlite.sqlite3_bind_null(stmt, 5);
+            try checkBind(sqlite.sqlite3_bind_null(stmt, 5));
         }
 
         rc = sqlite.sqlite3_step(stmt);
@@ -1304,7 +1326,7 @@ pub const Database = struct {
 
         const hash_z = try self.allocator.dupeZ(u8, token_hash);
         defer self.allocator.free(hash_z);
-        _ = sqlite.sqlite3_bind_text(stmt, 1, hash_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 1, hash_z.ptr, -1, null));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_ROW) {
@@ -1351,11 +1373,11 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        _ = sqlite.sqlite3_bind_int64(stmt, 1, now);
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 1, now));
 
         const hash_z = try self.allocator.dupeZ(u8, token_hash);
         defer self.allocator.free(hash_z);
-        _ = sqlite.sqlite3_bind_text(stmt, 2, hash_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 2, hash_z.ptr, -1, null));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_DONE) {
@@ -1382,7 +1404,7 @@ pub const Database = struct {
 
         const username_z = try self.allocator.dupeZ(u8, username);
         defer self.allocator.free(username_z);
-        _ = sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_DONE) {
@@ -1408,7 +1430,7 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        _ = sqlite.sqlite3_bind_int64(stmt, 1, now);
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 1, now));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_DONE) {
@@ -1437,7 +1459,7 @@ pub const Database = struct {
 
         const username_z = try self.allocator.dupeZ(u8, username);
         defer self.allocator.free(username_z);
-        _ = sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null));
 
         rc = sqlite.sqlite3_step(stmt);
         return rc == sqlite.SQLITE_ROW;
@@ -1464,8 +1486,8 @@ pub const Database = struct {
             defer self.allocator.free(u_z);
             const m_z = try self.allocator.dupeZ(u8, mailbox);
             defer self.allocator.free(m_z);
-            _ = sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null);
-            _ = sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null);
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null));
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null));
 
             rc = sqlite.sqlite3_step(stmt);
             if (rc == sqlite.SQLITE_ROW) {
@@ -1491,9 +1513,9 @@ pub const Database = struct {
             defer self.allocator.free(u_z);
             const m_z = try self.allocator.dupeZ(u8, mailbox);
             defer self.allocator.free(m_z);
-            _ = sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null);
-            _ = sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null);
-            _ = sqlite.sqlite3_bind_int64(stmt, 3, uidvalidity);
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null));
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null));
+            try checkBind(sqlite.sqlite3_bind_int64(stmt, 3, uidvalidity));
 
             rc = sqlite.sqlite3_step(stmt);
             if (rc != sqlite.SQLITE_DONE) return DatabaseError.StepFailed;
@@ -1524,9 +1546,9 @@ pub const Database = struct {
         defer self.allocator.free(m_z);
         const f_z = try self.allocator.dupeZ(u8, base);
         defer self.allocator.free(f_z);
-        _ = sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null);
-        _ = sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null);
-        _ = sqlite.sqlite3_bind_text(stmt, 3, f_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null));
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null));
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 3, f_z.ptr, -1, null));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc == sqlite.SQLITE_ROW) {
@@ -1535,11 +1557,124 @@ pub const Database = struct {
         return null;
     }
 
+    /// Bulk getUidForFile/assignUid for an entire mailbox: one lock, one
+    /// transaction, two prepared statements reused across all keys (instead
+    /// of a prepare + autocommit round-trip per message). Returns one UID per
+    /// key, in input order. Caller owns the returned slice.
+    pub fn syncMailboxUids(
+        self: *Database,
+        allocator: std.mem.Allocator,
+        username: []const u8,
+        mailbox: []const u8,
+        uid_keys: []const []const u8,
+    ) ![]i64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const uids = try allocator.alloc(i64, uid_keys.len);
+        errdefer allocator.free(uids);
+
+        try self.execLocked("BEGIN IMMEDIATE");
+        errdefer self.execLocked("ROLLBACK") catch {};
+
+        // Current uidnext for the mailbox
+        var uidnext: i64 = 1;
+        {
+            const sql: [:0]const u8 = "SELECT uidnext FROM imap_mailboxes WHERE username = ?1 AND mailbox = ?2";
+            var stmt: ?*sqlite.sqlite3_stmt = null;
+            if (sqlite.sqlite3_prepare_v2(self.db, sql.ptr, -1, &stmt, null) != sqlite.SQLITE_OK)
+                return DatabaseError.PrepareFailed;
+            defer _ = sqlite.sqlite3_finalize(stmt);
+            try checkBind(sqlite3_bind_text_raw(stmt, 1, username.ptr, @intCast(username.len), SQLITE_TRANSIENT_PTR));
+            try checkBind(sqlite3_bind_text_raw(stmt, 2, mailbox.ptr, @intCast(mailbox.len), SQLITE_TRANSIENT_PTR));
+            if (sqlite.sqlite3_step(stmt) == sqlite.SQLITE_ROW) {
+                uidnext = sqlite.sqlite3_column_int64(stmt, 0);
+            }
+        }
+        const start_uidnext = uidnext;
+
+        const sel_sql: [:0]const u8 = "SELECT uid FROM imap_uids WHERE username = ?1 AND mailbox = ?2 AND filename = ?3";
+        var sel_stmt: ?*sqlite.sqlite3_stmt = null;
+        if (sqlite.sqlite3_prepare_v2(self.db, sel_sql.ptr, -1, &sel_stmt, null) != sqlite.SQLITE_OK)
+            return DatabaseError.PrepareFailed;
+        defer _ = sqlite.sqlite3_finalize(sel_stmt);
+
+        const ins_sql: [:0]const u8 = "INSERT OR IGNORE INTO imap_uids (username, mailbox, filename, uid) VALUES (?1, ?2, ?3, ?4)";
+        var ins_stmt: ?*sqlite.sqlite3_stmt = null;
+        if (sqlite.sqlite3_prepare_v2(self.db, ins_sql.ptr, -1, &ins_stmt, null) != sqlite.SQLITE_OK)
+            return DatabaseError.PrepareFailed;
+        defer _ = sqlite.sqlite3_finalize(ins_stmt);
+
+        for (uid_keys, 0..) |key, i| {
+            const base = maildirBaseName(key);
+
+            _ = sqlite.sqlite3_reset(sel_stmt);
+            try checkBind(sqlite3_bind_text_raw(sel_stmt, 1, username.ptr, @intCast(username.len), SQLITE_TRANSIENT_PTR));
+            try checkBind(sqlite3_bind_text_raw(sel_stmt, 2, mailbox.ptr, @intCast(mailbox.len), SQLITE_TRANSIENT_PTR));
+            try checkBind(sqlite3_bind_text_raw(sel_stmt, 3, base.ptr, @intCast(base.len), SQLITE_TRANSIENT_PTR));
+            if (sqlite.sqlite3_step(sel_stmt) == sqlite.SQLITE_ROW) {
+                uids[i] = sqlite.sqlite3_column_int64(sel_stmt, 0);
+                continue;
+            }
+
+            _ = sqlite.sqlite3_reset(ins_stmt);
+            try checkBind(sqlite3_bind_text_raw(ins_stmt, 1, username.ptr, @intCast(username.len), SQLITE_TRANSIENT_PTR));
+            try checkBind(sqlite3_bind_text_raw(ins_stmt, 2, mailbox.ptr, @intCast(mailbox.len), SQLITE_TRANSIENT_PTR));
+            try checkBind(sqlite3_bind_text_raw(ins_stmt, 3, base.ptr, @intCast(base.len), SQLITE_TRANSIENT_PTR));
+            try checkBind(sqlite.sqlite3_bind_int64(ins_stmt, 4, uidnext));
+            if (sqlite.sqlite3_step(ins_stmt) != sqlite.SQLITE_DONE) return DatabaseError.StepFailed;
+
+            if (sqlite.sqlite3_changes(self.db) > 0) {
+                uids[i] = uidnext;
+                uidnext += 1;
+            } else {
+                // UNIQUE suppressed the insert (duplicate base name within
+                // this batch) — fetch the UID that row already has.
+                _ = sqlite.sqlite3_reset(sel_stmt);
+                try checkBind(sqlite3_bind_text_raw(sel_stmt, 1, username.ptr, @intCast(username.len), SQLITE_TRANSIENT_PTR));
+                try checkBind(sqlite3_bind_text_raw(sel_stmt, 2, mailbox.ptr, @intCast(mailbox.len), SQLITE_TRANSIENT_PTR));
+                try checkBind(sqlite3_bind_text_raw(sel_stmt, 3, base.ptr, @intCast(base.len), SQLITE_TRANSIENT_PTR));
+                if (sqlite.sqlite3_step(sel_stmt) == sqlite.SQLITE_ROW) {
+                    uids[i] = sqlite.sqlite3_column_int64(sel_stmt, 0);
+                } else {
+                    return DatabaseError.StepFailed;
+                }
+            }
+        }
+
+        // Persist uidnext once for the whole batch
+        if (uidnext != start_uidnext) {
+            const upd_sql: [:0]const u8 = "UPDATE imap_mailboxes SET uidnext = ?1 WHERE username = ?2 AND mailbox = ?3";
+            var upd_stmt: ?*sqlite.sqlite3_stmt = null;
+            if (sqlite.sqlite3_prepare_v2(self.db, upd_sql.ptr, -1, &upd_stmt, null) != sqlite.SQLITE_OK)
+                return DatabaseError.PrepareFailed;
+            defer _ = sqlite.sqlite3_finalize(upd_stmt);
+            try checkBind(sqlite.sqlite3_bind_int64(upd_stmt, 1, uidnext));
+            try checkBind(sqlite3_bind_text_raw(upd_stmt, 2, username.ptr, @intCast(username.len), SQLITE_TRANSIENT_PTR));
+            try checkBind(sqlite3_bind_text_raw(upd_stmt, 3, mailbox.ptr, @intCast(mailbox.len), SQLITE_TRANSIENT_PTR));
+            if (sqlite.sqlite3_step(upd_stmt) != sqlite.SQLITE_DONE) return DatabaseError.StepFailed;
+        }
+
+        try self.execLocked("COMMIT");
+        return uids;
+    }
+
     /// Assign a UID to a filename and bump uidnext. Returns the assigned UID.
     pub fn assignUid(self: *Database, username: []const u8, mailbox: []const u8, filename: []const u8) !i64 {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        // One transaction for SELECT-uidnext + INSERT + UPDATE-uidnext: a
+        // single WAL commit instead of three, and the read-modify-write of
+        // uidnext can't be torn by a crash between statements.
+        try self.execLocked("BEGIN IMMEDIATE");
+        errdefer self.execLocked("ROLLBACK") catch {};
+        const uid = try self.assignUidInTxn(username, mailbox, filename);
+        try self.execLocked("COMMIT");
+        return uid;
+    }
+
+    fn assignUidInTxn(self: *Database, username: []const u8, mailbox: []const u8, filename: []const u8) !i64 {
         // Key on the flag-suffix-stripped base name (see maildirBaseName).
         const base = maildirBaseName(filename);
 
@@ -1558,8 +1693,8 @@ pub const Database = struct {
             defer self.allocator.free(u_z);
             const m_z = try self.allocator.dupeZ(u8, mailbox);
             defer self.allocator.free(m_z);
-            _ = sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null);
-            _ = sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null);
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null));
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null));
 
             rc = sqlite.sqlite3_step(stmt);
             if (rc == sqlite.SQLITE_ROW) {
@@ -1585,10 +1720,10 @@ pub const Database = struct {
             defer self.allocator.free(m_z);
             const f_z = try self.allocator.dupeZ(u8, base);
             defer self.allocator.free(f_z);
-            _ = sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null);
-            _ = sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null);
-            _ = sqlite.sqlite3_bind_text(stmt, 3, f_z.ptr, -1, null);
-            _ = sqlite.sqlite3_bind_int64(stmt, 4, uid);
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null));
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null));
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 3, f_z.ptr, -1, null));
+            try checkBind(sqlite.sqlite3_bind_int64(stmt, 4, uid));
 
             rc = sqlite.sqlite3_step(stmt);
             if (rc != sqlite.SQLITE_DONE) return DatabaseError.StepFailed;
@@ -1614,9 +1749,9 @@ pub const Database = struct {
                 defer self.allocator.free(m2_z);
                 const f2_z = try self.allocator.dupeZ(u8, base);
                 defer self.allocator.free(f2_z);
-                _ = sqlite.sqlite3_bind_text(get_stmt, 1, u2_z.ptr, -1, null);
-                _ = sqlite.sqlite3_bind_text(get_stmt, 2, m2_z.ptr, -1, null);
-                _ = sqlite.sqlite3_bind_text(get_stmt, 3, f2_z.ptr, -1, null);
+                try checkBind(sqlite.sqlite3_bind_text(get_stmt, 1, u2_z.ptr, -1, null));
+                try checkBind(sqlite.sqlite3_bind_text(get_stmt, 2, m2_z.ptr, -1, null));
+                try checkBind(sqlite.sqlite3_bind_text(get_stmt, 3, f2_z.ptr, -1, null));
 
                 const step_rc = sqlite.sqlite3_step(get_stmt);
                 if (step_rc == sqlite.SQLITE_ROW) {
@@ -1640,9 +1775,9 @@ pub const Database = struct {
             defer self.allocator.free(u_z);
             const m_z = try self.allocator.dupeZ(u8, mailbox);
             defer self.allocator.free(m_z);
-            _ = sqlite.sqlite3_bind_int64(stmt, 1, uid + 1);
-            _ = sqlite.sqlite3_bind_text(stmt, 2, u_z.ptr, -1, null);
-            _ = sqlite.sqlite3_bind_text(stmt, 3, m_z.ptr, -1, null);
+            try checkBind(sqlite.sqlite3_bind_int64(stmt, 1, uid + 1));
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 2, u_z.ptr, -1, null));
+            try checkBind(sqlite.sqlite3_bind_text(stmt, 3, m_z.ptr, -1, null));
 
             rc = sqlite.sqlite3_step(stmt);
             if (rc != sqlite.SQLITE_DONE) return DatabaseError.StepFailed;
@@ -1669,8 +1804,16 @@ pub const Database = struct {
         defer self.allocator.free(u_z);
         const m_z = try self.allocator.dupeZ(u8, mailbox);
         defer self.allocator.free(m_z);
-        _ = sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null);
-        _ = sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null));
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null));
+
+        // Hash set of current base names so the existence check is O(1)
+        // per row instead of a scan over all current files.
+        var current_set = std.StringHashMap(void).init(self.allocator);
+        defer current_set.deinit();
+        for (current_files) |f| {
+            try current_set.put(maildirBaseName(f), {});
+        }
 
         // Collect IDs to delete
         var ids_to_delete: std.ArrayList(i64) = .empty;
@@ -1687,32 +1830,33 @@ pub const Database = struct {
                     // Rows are keyed on the base name; current_files are full
                     // Maildir names, so compare on base name (a flag rename must
                     // not look like the message disappeared).
-                    var found = false;
-                    for (current_files) |f| {
-                        if (std.mem.eql(u8, maildirBaseName(f), db_filename)) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) {
-                        ids_to_delete.append(self.allocator, id) catch {};
+                    if (!current_set.contains(db_filename)) {
+                        try ids_to_delete.append(self.allocator, id);
                     }
                 }
             } else break;
         }
 
-        // Delete stale entries
+        if (ids_to_delete.items.len == 0) return;
+
+        // Delete stale entries: one prepared statement, one transaction
+        // (instead of a prepare + autocommit fsync per row).
+        try self.execLocked("BEGIN IMMEDIATE");
+        errdefer self.execLocked("ROLLBACK") catch {};
+
+        const del_sql: [:0]const u8 = "DELETE FROM imap_uids WHERE id = ?1";
+        var del_stmt: ?*sqlite.sqlite3_stmt = null;
+        const del_rc = sqlite.sqlite3_prepare_v2(self.db, del_sql.ptr, -1, &del_stmt, null);
+        if (del_rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
+        defer _ = sqlite.sqlite3_finalize(del_stmt);
+
         for (ids_to_delete.items) |id| {
-            const del_sql = "DELETE FROM imap_uids WHERE id = ?1";
-            const del_z = self.allocator.dupeZ(u8, del_sql) catch continue;
-            defer self.allocator.free(del_z);
-            var del_stmt: ?*sqlite.sqlite3_stmt = null;
-            const del_rc = sqlite.sqlite3_prepare_v2(self.db, del_z.ptr, -1, &del_stmt, null);
-            if (del_rc != sqlite.SQLITE_OK) continue;
-            defer _ = sqlite.sqlite3_finalize(del_stmt);
-            _ = sqlite.sqlite3_bind_int64(del_stmt, 1, id);
+            _ = sqlite.sqlite3_reset(del_stmt);
+            try checkBind(sqlite.sqlite3_bind_int64(del_stmt, 1, id));
             _ = sqlite.sqlite3_step(del_stmt);
         }
+
+        try self.execLocked("COMMIT");
     }
 
     /// Get the current uidnext for a mailbox.
@@ -1732,8 +1876,8 @@ pub const Database = struct {
         defer self.allocator.free(u_z);
         const m_z = try self.allocator.dupeZ(u8, mailbox);
         defer self.allocator.free(m_z);
-        _ = sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null);
-        _ = sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null));
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc == sqlite.SQLITE_ROW) {
