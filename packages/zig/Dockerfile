@@ -10,7 +10,9 @@ RUN apk add --no-cache \
     curl \
     tar \
     xz \
-    unzip
+    unzip \
+    libgcc \
+    libstdc++
 
 # Install Zig (not available in Alpine repos). ziglang.org prunes old dev
 # builds, so fall back to a community mirror when the primary 404s.
