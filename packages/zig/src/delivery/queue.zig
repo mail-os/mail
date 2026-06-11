@@ -60,6 +60,10 @@ pub const QueuedMessage = struct {
 pub const MessageQueue = struct {
     allocator: std.mem.Allocator,
     messages: std.ArrayList(*QueuedMessage) = .empty,
+    // id -> index into `messages`, so markDelivered/markForRetry are O(1)
+    // instead of a scan over the whole queue per delivered message. Keys
+    // alias msg.id and entries are removed before the message is freed.
+    index: std.StringHashMapUnmanaged(usize) = .empty,
     mutex: mutex_compat.Mutex,
     next_id: u64,
     db: ?*database.Database, // Optional database for persistence
@@ -164,6 +168,7 @@ pub const MessageQueue = struct {
                 };
 
                 try self.messages.append(self.allocator, msg);
+                try self.index.put(self.allocator, msg.id, self.messages.items.len - 1);
 
                 // Track highest ID for next_id
                 if (std.fmt.parseInt(u64, id, 10)) |id_num| {
@@ -226,6 +231,7 @@ pub const MessageQueue = struct {
             self.allocator.destroy(msg);
         }
         self.messages.deinit(self.allocator);
+        self.index.deinit(self.allocator);
     }
 
     /// Enqueue a new message for delivery
@@ -261,11 +267,26 @@ pub const MessageQueue = struct {
         };
 
         try self.messages.append(self.allocator, msg);
+        try self.index.put(self.allocator, msg.id, self.messages.items.len - 1);
 
         // Persist to database
         try self.persistMessage(msg);
 
         return id;
+    }
+
+    /// Remove `messages.items[i]`, keeping the id index consistent with the
+    /// swapRemove (the last element moves into slot i). Frees the message.
+    fn removeAt(self: *MessageQueue, i: usize) void {
+        const msg = self.messages.items[i];
+        _ = self.index.remove(msg.id);
+        _ = self.messages.swapRemove(i);
+        if (i < self.messages.items.len) {
+            // The previously-last message now lives at index i.
+            self.index.put(self.allocator, self.messages.items[i].id, i) catch {};
+        }
+        msg.deinit(self.allocator);
+        self.allocator.destroy(msg);
     }
 
     /// Get next message ready for delivery
@@ -298,23 +319,16 @@ pub const MessageQueue = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        for (self.messages.items, 0..) |msg, i| {
-            if (std.mem.eql(u8, msg.id, id)) {
-                msg.status = .delivered;
-                msg.updated_at = time_compat.timestamp();
+        const i = self.index.get(id) orelse return error.MessageNotFound;
+        const msg = self.messages.items[i];
+        msg.status = .delivered;
+        msg.updated_at = time_compat.timestamp();
 
-                // Delete from database
-                try self.deleteFromDB(id);
+        // Delete from database
+        try self.deleteFromDB(id);
 
-                // Remove from queue after successful delivery
-                _ = self.messages.swapRemove(i);
-                msg.deinit(self.allocator);
-                self.allocator.destroy(msg);
-                return;
-            }
-        }
-
-        return error.MessageNotFound;
+        // Remove from queue after successful delivery
+        self.removeAt(i);
     }
 
     /// Mark message as failed for retry
@@ -322,45 +336,37 @@ pub const MessageQueue = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        for (self.messages.items, 0..) |msg, i| {
-            if (std.mem.eql(u8, msg.id, id)) {
-                const now = time_compat.timestamp();
+        const i = self.index.get(id) orelse return error.MessageNotFound;
+        const msg = self.messages.items[i];
+        const now = time_compat.timestamp();
 
-                if (msg.attempts >= msg.max_attempts) {
-                    // Permanent failure
-                    msg.status = .failed;
-                    msg.updated_at = now;
-                    if (msg.error_message) |old| self.allocator.free(old);
-                    msg.error_message = try self.allocator.dupe(u8, error_msg);
+        if (msg.attempts >= msg.max_attempts) {
+            // Permanent failure
+            msg.status = .failed;
+            msg.updated_at = now;
+            if (msg.error_message) |old| self.allocator.free(old);
+            msg.error_message = try self.allocator.dupe(u8, error_msg);
 
-                    // Persist failed status to database for audit trail
-                    try self.persistMessage(msg);
+            // Persist failed status to database for audit trail
+            try self.persistMessage(msg);
 
-                    // Delete from active queue
-                    try self.deleteFromDB(id);
+            // Delete from active queue
+            try self.deleteFromDB(id);
 
-                    // Remove from active queue
-                    _ = self.messages.swapRemove(i);
-                    msg.deinit(self.allocator);
-                    self.allocator.destroy(msg);
-                } else {
-                    // Schedule retry with exponential backoff
-                    const backoff_seconds: i64 = @as(i64, @intCast(std.math.pow(u32, 2, msg.attempts))) * 60; // 2^n minutes
-                    msg.status = .retry;
-                    msg.next_retry = now + backoff_seconds;
-                    msg.updated_at = now;
-                    if (msg.error_message) |old| self.allocator.free(old);
-                    msg.error_message = try self.allocator.dupe(u8, error_msg);
+            // Remove from active queue
+            self.removeAt(i);
+        } else {
+            // Schedule retry with exponential backoff
+            const backoff_seconds: i64 = @as(i64, @intCast(std.math.pow(u32, 2, msg.attempts))) * 60; // 2^n minutes
+            msg.status = .retry;
+            msg.next_retry = now + backoff_seconds;
+            msg.updated_at = now;
+            if (msg.error_message) |old| self.allocator.free(old);
+            msg.error_message = try self.allocator.dupe(u8, error_msg);
 
-                    // Persist retry state
-                    try self.persistMessage(msg);
-                }
-
-                return;
-            }
+            // Persist retry state
+            try self.persistMessage(msg);
         }
-
-        return error.MessageNotFound;
     }
 
     /// Get queue statistics

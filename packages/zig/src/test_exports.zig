@@ -25,3 +25,6 @@ pub const message_submission = @import("protocol/message_submission.zig");
 pub const greylist = @import("antispam/greylist.zig");
 pub const io_compat = @import("core/io_compat.zig");
 pub const fs_compat = @import("core/fs_compat.zig");
+pub const bounce = @import("delivery/bounce.zig");
+pub const queue = @import("delivery/queue.zig");
+pub const dns_cache = @import("antispam/dns_cache.zig");

@@ -3,6 +3,8 @@ const io_compat = @import("../core/io_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const config = @import("../core/config.zig");
 const dkim_sign = @import("../antispam/dkim_sign.zig");
+const spf = @import("../antispam/spf.zig");
+const dns_cache = @import("../antispam/dns_cache.zig");
 
 /// Process-wide outbound DKIM signer (set once at startup via configureDkim).
 /// When set, every message handed to deliverToRemote is RSA-SHA256 signed.
@@ -344,93 +346,45 @@ fn readResponse(sock: std.posix.socket_t, buf: []u8) !usize {
     return total;
 }
 
-/// Look up MX records for a domain using the dig command.
-/// Returns the highest-priority MX hostname.
+/// Look up MX records for a domain using the built-in DNS resolver (in-process
+/// UDP query with a 5s timeout — replaces shelling out to `dig` via a temp
+/// file, which blocked a delivery worker on process spawn + disk I/O per
+/// message). Returns the best-preference MX hostname, or the domain itself
+/// when no MX exists (implicit MX, RFC 5321 §5.1). Results are cached.
 fn lookupMx(allocator: std.mem.Allocator, domain: []const u8) ![]u8 {
-    // The domain is interpolated into a /bin/sh command, so it must only
-    // contain DNS hostname characters to prevent shell injection.
+    // Sanity-check that the value looks like a hostname before resolving it.
     if (!isSafeHostname(domain)) {
         std.log.err("Refusing MX lookup: unsafe domain", .{});
         return error.MxResolutionFailed;
     }
 
-    const io = io_compat.getIo();
-    const timestamp = time_compat.milliTimestamp();
+    var key_buf: [320]u8 = undefined;
+    const cache_key: ?[]const u8 = std.fmt.bufPrint(&key_buf, "mx:{s}", .{domain}) catch null;
+    if (cache_key) |key| {
+        switch (dns_cache.get(allocator, key)) {
+            .hit => |v| return v,
+            .negative => return try allocator.dupe(u8, domain),
+            .miss => {},
+        }
+    }
 
-    // Write dig output to a temp file since we can't capture stdout directly
-    const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/mx-lookup-{d}.txt", .{timestamp});
-    defer allocator.free(tmp_path);
-
-    const shell_cmd = try std.fmt.allocPrint(allocator, "dig +short MX {s} > {s} 2>/dev/null", .{ domain, tmp_path });
-    defer allocator.free(shell_cmd);
-
-    const shell_cmd_z = try allocator.dupeZ(u8, shell_cmd);
-    defer allocator.free(shell_cmd_z);
-
-    // Use /bin/sh -c to run the command with shell redirection
-    var child = std.process.spawn(io, .{
-        .argv = &[_][]const u8{ "/bin/sh", "-c", shell_cmd },
-    }) catch {
+    const records = spf.dnsQueryMxRecords(allocator, domain) catch {
+        // Transient DNS failure: fall back to the implicit MX (the domain),
+        // matching the old dig-based behavior. Not cached.
         return try allocator.dupe(u8, domain);
     };
-
-    _ = child.wait(io) catch {};
-
-    // Read the temp file
-    const tmp_path_z = try allocator.dupeZ(u8, tmp_path);
-    defer allocator.free(tmp_path_z);
-
-    const fd = std.c.open(tmp_path_z.ptr, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
     defer {
-        _ = std.c.unlink(tmp_path_z.ptr);
-    }
-    if (fd < 0) return try allocator.dupe(u8, domain);
-    defer _ = std.c.close(fd);
-
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout_len: usize = 0;
-    while (stdout_len < stdout_buf.len) {
-        const n = std.c.read(fd, stdout_buf[stdout_len..].ptr, stdout_buf.len - stdout_len);
-        if (n <= 0) break;
-        stdout_len += @intCast(n);
+        for (records) |r| allocator.free(r.host);
+        allocator.free(records);
     }
 
-    if (stdout_len == 0) {
+    if (records.len == 0) {
+        if (cache_key) |key| dns_cache.put(key, null, dns_cache.negative_ttl);
         return try allocator.dupe(u8, domain);
     }
 
-    // Parse MX output: "priority hostname\n" — pick lowest priority (highest preference)
-    // Example: "10 alt1.aspmx.l.google.com.\n20 alt2.aspmx.l.google.com.\n"
-    const output = stdout_buf[0..stdout_len];
-    var best_priority: u32 = std.math.maxInt(u32);
-    var best_host: ?[]const u8 = null;
-
-    var line_iter = std.mem.splitScalar(u8, output, '\n');
-    while (line_iter.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r\n");
-        if (trimmed.len == 0) continue;
-
-        // Parse "priority hostname"
-        const space_pos = std.mem.indexOfScalar(u8, trimmed, ' ') orelse continue;
-        const priority = std.fmt.parseInt(u32, trimmed[0..space_pos], 10) catch continue;
-        var hostname = std.mem.trim(u8, trimmed[space_pos + 1 ..], " \t");
-
-        // Remove trailing dot from DNS name
-        if (hostname.len > 0 and hostname[hostname.len - 1] == '.') {
-            hostname = hostname[0 .. hostname.len - 1];
-        }
-
-        if (hostname.len > 0 and priority < best_priority) {
-            best_priority = priority;
-            best_host = hostname;
-        }
-    }
-
-    if (best_host) |host| {
-        return try allocator.dupe(u8, host);
-    }
-
-    return try allocator.dupe(u8, domain);
+    if (cache_key) |key| dns_cache.put(key, records[0].host, dns_cache.positive_ttl);
+    return try allocator.dupe(u8, records[0].host);
 }
 
 /// Deliver an email via AWS SES.
