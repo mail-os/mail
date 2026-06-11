@@ -324,6 +324,28 @@ pub fn ensureDir(path: []const u8) !void {
 /// with alphabetical tiebreaker. This ensures new files always appear at the end, preserving
 /// IMAP UID stability (UIDs are 1-based indices into this sorted list).
 /// Caller owns the returned slice and each filename string (allocated with `allocator`).
+/// Count `.eml` entries in a directory without allocating or sorting.
+/// Cheap change-detection probe for IDLE polling: if the count is unchanged
+/// since the last poll, the full listEmlFiles + UID sync can be skipped.
+/// Returns 0 if the directory can't be opened.
+pub fn countEmlFiles(dir_path: []const u8) usize {
+    const path_z = toZ(dir_path) orelse return 0;
+    defer freeZ(path_z, dir_path.len);
+
+    const dir = std.c.opendir(path_z) orelse return 0;
+    defer _ = std.c.closedir(dir);
+
+    var count: usize = 0;
+    while (std.c.readdir(dir)) |entry| {
+        const name_ptr: [*:0]const u8 = @ptrCast(&entry.name);
+        const name = std.mem.sliceTo(name_ptr, 0);
+        if (name.len > 4 and (std.mem.endsWith(u8, name, ".eml") or std.mem.indexOf(u8, name, ".eml:") != null)) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
 pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]const u8 {
     const path_z = toZ(dir_path) orelse return error.SystemResources;
     defer freeZ(path_z, dir_path.len);

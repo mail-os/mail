@@ -755,6 +755,11 @@ pub const ImapSession = struct {
     mailbox_dir: ?[]const u8 = null,
     // UID persistence: parallel array of UIDs for mailbox_files (same indices)
     mailbox_uids: ?[]i64 = null,
+    // Reverse index UID -> sequence number, rebuilt with mailbox_uids, so
+    // UID FETCH/STORE on large mailboxes is O(1) per UID instead of O(n).
+    uid_seq_map: std.AutoHashMapUnmanaged(i64, usize) = .empty,
+    // Cheap IDLE-poll signature: maildir entry count at the last poll.
+    idle_scan_count: ?usize = null,
     mailbox_uidvalidity: i64 = 0,
     mailbox_name: ?[]const u8 = null,
     mailbox_is_virtual: bool = false,
@@ -796,6 +801,7 @@ pub const ImapSession = struct {
         }
         self.cleanupAppend();
         self.freeMailboxFiles();
+        self.uid_seq_map.deinit(self.allocator);
         if (self.mailbox_name) |n| self.allocator.free(n);
         self.command_buffer.deinit(self.allocator);
     }
@@ -824,6 +830,7 @@ pub const ImapSession = struct {
             self.allocator.free(uids);
             self.mailbox_uids = null;
         }
+        self.uid_seq_map.clearRetainingCapacity();
         self.mailbox_is_virtual = false;
     }
 
@@ -883,6 +890,7 @@ pub const ImapSession = struct {
             self.allocator.free(uids);
             self.mailbox_uids = null;
         }
+        self.uid_seq_map.clearRetainingCapacity();
     }
 
     fn freeAggregateEntries(self: *ImapSession, entries: []AggregateMailboxEntry) void {
@@ -1075,21 +1083,39 @@ pub const ImapSession = struct {
         // Remove stale UIDs for files that no longer exist
         db.removeStaleUids(username, mailbox, uid_keys) catch {};
 
-        // Build UID array
+        // Build UID array in one bulk DB call: a single transaction with
+        // reused prepared statements instead of 1-2 round-trips per message.
         if (self.mailbox_uids) |old| self.allocator.free(old);
-        const uids = try self.allocator.alloc(i64, files.len);
+        self.mailbox_uids = null;
 
-        for (files, 0..) |_, i| {
-            const uid_key = if (i < uid_keys.len) uid_keys[i] else files[i];
-            // Try to get existing UID, or assign a new one
-            if (db.getUidForFile(username, mailbox, uid_key) catch null) |uid| {
-                uids[i] = uid;
-            } else {
-                uids[i] = db.assignUid(username, mailbox, uid_key) catch @as(i64, @intCast(i + 1));
-            }
-        }
+        const keys = try self.allocator.alloc([]const u8, files.len);
+        defer self.allocator.free(keys);
+        for (files, 0..) |f, i| keys[i] = if (i < uid_keys.len) uid_keys[i] else f;
+
+        const uids = db.syncMailboxUids(self.allocator, username, mailbox, keys) catch blk: {
+            // Fallback: UID == sequence number (matches the old per-file
+            // fallback when assignment failed)
+            const fallback = try self.allocator.alloc(i64, files.len);
+            for (fallback, 0..) |*u, i| u.* = @intCast(i + 1);
+            break :blk fallback;
+        };
 
         self.mailbox_uids = uids;
+        self.rebuildUidSeqMap() catch {};
+    }
+
+    /// Rebuild the UID -> sequence number reverse index after mailbox_uids
+    /// changes. On duplicate UIDs the FIRST occurrence wins (matching the
+    /// old linear-scan semantics).
+    fn rebuildUidSeqMap(self: *ImapSession) !void {
+        self.uid_seq_map.clearRetainingCapacity();
+        if (self.mailbox_uids) |uids| {
+            try self.uid_seq_map.ensureTotalCapacity(self.allocator, @intCast(uids.len));
+            for (uids, 0..) |u, i| {
+                const gop = self.uid_seq_map.getOrPutAssumeCapacity(u);
+                if (!gop.found_existing) gop.value_ptr.* = i + 1;
+            }
+        }
     }
 
     /// Get the UID for a given sequence number (1-based).
@@ -1104,11 +1130,8 @@ pub const ImapSession = struct {
 
     /// Find sequence number (1-based) for a given UID. Returns null if not found.
     fn getSeqForUid(self: *ImapSession, uid: i64) ?usize {
-        if (self.mailbox_uids) |uids| {
-            for (uids, 0..) |u, i| {
-                if (u == uid) return i + 1;
-            }
-            return null;
+        if (self.mailbox_uids != null) {
+            return self.uid_seq_map.get(uid);
         }
         // Fallback: UID == sequence number
         if (uid >= 1) return @intCast(uid);
@@ -1121,10 +1144,12 @@ pub const ImapSession = struct {
         const files = self.mailbox_files orelse return uid_set;
         const uids = self.mailbox_uids orelse return uid_set;
 
-        // Handle comma-separated UID sets (e.g., "83,85,88,90")
+        // Handle comma-separated UID sets (e.g., "83,85,88,90"). Grows
+        // dynamically — a fixed buffer here used to silently drop elements
+        // of large UID sets once it filled up.
         if (std.mem.indexOf(u8, uid_set, ",") != null) {
-            var result_buf: [1024]u8 = undefined;
-            var result_len: usize = 0;
+            var result: std.ArrayList(u8) = .empty;
+            defer result.deinit(self.allocator);
             var parts = std.mem.splitScalar(u8, uid_set, ',');
             var first = true;
             while (parts.next()) |part| {
@@ -1133,17 +1158,11 @@ pub const ImapSession = struct {
                 // Recursively convert each element (handles both single UIDs and ranges)
                 const converted = try self.uidSetToSeqSet(trimmed);
                 defer if (converted.ptr != trimmed.ptr) self.allocator.free(converted);
-                if (!first and result_len < result_buf.len) {
-                    result_buf[result_len] = ',';
-                    result_len += 1;
-                }
+                if (!first) try result.append(self.allocator, ',');
                 first = false;
-                if (result_len + converted.len <= result_buf.len) {
-                    @memcpy(result_buf[result_len..][0..converted.len], converted);
-                    result_len += converted.len;
-                }
+                try result.appendSlice(self.allocator, converted);
             }
-            return try self.allocator.dupe(u8, result_buf[0..result_len]);
+            return try self.allocator.dupe(u8, result.items);
         }
 
         if (std.mem.indexOf(u8, uid_set, ":")) |colon| {
@@ -1183,6 +1202,70 @@ pub const ImapSession = struct {
             }
             return try self.allocator.dupe(u8, "0");
         }
+    }
+
+    /// Count maildir entries across the same directories the mailbox loader
+    /// scans, without allocating, sorting, or touching the database.
+    fn currentMailboxEntryCount(self: *ImapSession) usize {
+        if (self.mailbox_is_virtual) {
+            const full_username = self.username orelse return 0;
+            const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
+                full_username[0..at_pos]
+            else
+                full_username;
+
+            var root_buf: [512]u8 = undefined;
+            const root = std.fmt.bufPrintZ(&root_buf, "mail/{s}", .{username}) catch return 0;
+
+            var total: usize = 0;
+            if (std.c.opendir(root.ptr)) |dir| {
+                defer _ = std.c.closedir(dir);
+                var folder_buf: [1024]u8 = undefined;
+                while (std.c.readdir(dir)) |entry| {
+                    const name_ptr: [*:0]const u8 = @ptrCast(&entry.name);
+                    const folder = std.mem.sliceTo(name_ptr, 0);
+                    if (!shouldIncludeInAggregate(folder, false)) continue;
+                    const folder_path = std.fmt.bufPrint(&folder_buf, "{s}/{s}", .{ root, folder }) catch continue;
+                    total += fs_compat.countEmlFiles(folder_path);
+                }
+            } else {
+                total = fs_compat.countEmlFiles("mail/new");
+            }
+            return total;
+        }
+
+        if (self.mailbox_name) |mname| {
+            if (std.ascii.eqlIgnoreCase(mname, "INBOX")) {
+                const full_username = self.username orelse return 0;
+                const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
+                    full_username[0..at_pos]
+                else
+                    full_username;
+                var new_buf: [512]u8 = undefined;
+                var cur_buf: [512]u8 = undefined;
+                const new_dir = std.fmt.bufPrint(&new_buf, "mail/{s}/new", .{username}) catch return 0;
+                const cur_dir = std.fmt.bufPrint(&cur_buf, "mail/{s}/cur", .{username}) catch return 0;
+                const total = fs_compat.countEmlFiles(new_dir) + fs_compat.countEmlFiles(cur_dir);
+                if (total == 0) return fs_compat.countEmlFiles("mail/new");
+                return total;
+            }
+        }
+
+        const dir = self.mailbox_dir orelse return 0;
+        return fs_compat.countEmlFiles(dir);
+    }
+
+    /// Cheap IDLE poll: run the full rescan (directory listing + sort + UID
+    /// sync) only when the maildir entry count actually changed. The full
+    /// rescan also only reports on count changes, so this is equivalent —
+    /// minus the per-poll allocations and database traffic.
+    fn idlePollRescan(self: *ImapSession) void {
+        const count = self.currentMailboxEntryCount();
+        if (self.idle_scan_count) |last| {
+            if (count == last) return;
+        }
+        self.idle_scan_count = count;
+        _ = self.rescanMailbox() catch {};
     }
 
     /// Re-scan the current mailbox for new messages.
@@ -3685,7 +3768,7 @@ pub const ImapServer = struct {
                         idle_poll_counter += 1;
                         // Check for new messages every poll cycle (~5 seconds)
                         if (session.state == .selected) {
-                            _ = session.rescanMailbox() catch {};
+                            session.idlePollRescan();
                         }
                         continue;
                     }
@@ -3808,7 +3891,7 @@ pub const ImapServer = struct {
                 const bytes_read = connection.read(&buffer) catch |err| {
                     if (session.idle_mode and (err == error.WouldBlock or err == error.ConnectionTimedOut)) {
                         if (session.state == .selected) {
-                            _ = session.rescanMailbox() catch {};
+                            session.idlePollRescan();
                         }
                         continue;
                     }
@@ -3927,7 +4010,7 @@ pub const ImapServer = struct {
                             const bytes_read = connection.read(tls_recv_buf[0..]) catch |err| {
                                 if (session.idle_mode and (err == error.WouldBlock or err == error.ConnectionTimedOut)) {
                                     if (session.state == .selected) {
-                                        _ = session.rescanMailbox() catch {};
+                                        session.idlePollRescan();
                                     }
                                     continue;
                                 }
