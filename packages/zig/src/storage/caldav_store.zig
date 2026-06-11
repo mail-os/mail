@@ -1598,6 +1598,9 @@ pub const IcsParser = struct {
                 event.location = line[9..];
             } else if (std.mem.startsWith(u8, line, "DTSTART")) {
                 event.dtstart = parseDtValue(line);
+                // A date-only DTSTART (VALUE=DATE / 8-digit value) is an
+                // all-day event.
+                if (std.mem.indexOf(u8, line, "VALUE=DATE") != null) event.all_day = true;
             } else if (std.mem.startsWith(u8, line, "DTEND")) {
                 event.dtend = parseDtValue(line);
             } else if (std.mem.startsWith(u8, line, "UID:")) {
@@ -1663,6 +1666,7 @@ pub const IcsParser = struct {
         location: ?[]const u8 = null,
         dtstart: ?i64 = null,
         dtend: ?i64 = null,
+        all_day: bool = false,
         rrule: ?[]const u8 = null,
     };
 };

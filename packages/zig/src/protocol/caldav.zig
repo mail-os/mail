@@ -1151,9 +1151,25 @@ pub const CalDavSession = struct {
                     };
                 }
 
-                // Parse event summary from ICS
+                // Parse the full event from the ICS so the structured fields
+                // (start/end/location/description/recurrence) are stored —
+                // EAS/EWS/webmail read these, not the raw ICS. Previously only
+                // the summary was kept and dtstart was stamped with the current
+                // time, so every event showed up as "now" with no end/location.
                 const parsed_event = caldav_store.IcsParser.parseEvent(body);
                 const summary = if (parsed_event) |e| (e.summary orelse "Untitled") else "Untitled";
+                const event_data = caldav_store.CalDavStore.EventData{
+                    .uid = uid,
+                    .summary = summary,
+                    .description = if (parsed_event) |e| e.description else null,
+                    .location = if (parsed_event) |e| e.location else null,
+                    // Fall back to "now" only if the ICS truly lacks DTSTART.
+                    .dtstart = if (parsed_event) |e| (e.dtstart orelse currentTimestamp()) else currentTimestamp(),
+                    .dtend = if (parsed_event) |e| e.dtend else null,
+                    .all_day = if (parsed_event) |e| e.all_day else false,
+                    .rrule = if (parsed_event) |e| e.rrule else null,
+                    .ics_data = body,
+                };
 
                 // Check if this is an update
                 if (self.store.getEventIdByUid(cal_id, uid)) |event_id| {
@@ -1166,14 +1182,14 @@ pub const CalDavSession = struct {
                             }
                         }
                     }
-                    self.store.updateEvent(event_id, .{ .summary = summary, .dtstart = currentTimestamp(), .ics_data = body }) catch {
+                    self.store.updateEvent(event_id, event_data) catch {
                         try self.sendError(500, "Internal Server Error");
                         return;
                     };
                     try self.sendSuccess(204, "No Content");
                 } else {
                     // Create new
-                    _ = self.store.createEvent(cal_id, .{ .uid = uid, .summary = summary, .dtstart = currentTimestamp(), .ics_data = body }) catch {
+                    _ = self.store.createEvent(cal_id, event_data) catch {
                         try self.sendError(500, "Internal Server Error");
                         return;
                     };
@@ -1216,9 +1232,39 @@ pub const CalDavSession = struct {
                     };
                 }
 
-                // Parse contact from vCard
+                // Parse the full vCard so name parts, emails, and phones are
+                // stored (EAS/EWS/webmail read these structured fields).
+                // Previously only full_name was kept, so contacts synced with
+                // no email or phone numbers.
                 const parsed_contact = caldav_store.VcfParser.parseContact(body);
                 const full_name = if (parsed_contact) |c| (c.full_name orelse "Unknown") else "Unknown";
+
+                // Build email/phone arrays from the parsed vCard. The vCard
+                // parser doesn't track per-entry type, so first entry is
+                // marked primary and the rest default to .other.
+                const Store = caldav_store.CalDavStore;
+                var email_buf: [8]Store.EmailData = undefined;
+                var phone_buf: [8]Store.PhoneData = undefined;
+                var emails: []const Store.EmailData = &.{};
+                var phones: []const Store.PhoneData = &.{};
+                if (parsed_contact) |c| {
+                    const ne = @min(c.email_count, email_buf.len);
+                    for (0..ne) |i| email_buf[i] = .{ .email = c.emails[i], .is_primary = i == 0 };
+                    emails = email_buf[0..ne];
+                    const np = @min(c.phone_count, phone_buf.len);
+                    for (0..np) |i| phone_buf[i] = .{ .number = c.phones[i], .is_primary = i == 0 };
+                    phones = phone_buf[0..np];
+                }
+                const contact_data = Store.ContactData{
+                    .uid = uid,
+                    .full_name = full_name,
+                    .given_name = if (parsed_contact) |c| c.given_name else null,
+                    .family_name = if (parsed_contact) |c| c.family_name else null,
+                    .organization = if (parsed_contact) |c| c.organization else null,
+                    .vcf_data = body,
+                    .emails = emails,
+                    .phones = phones,
+                };
 
                 // Check if this is an update
                 if (self.store.getContactIdByUid(ab_id, uid)) |contact_id| {
@@ -1230,13 +1276,13 @@ pub const CalDavSession = struct {
                             }
                         }
                     }
-                    self.store.updateContact(contact_id, .{ .full_name = full_name, .vcf_data = body }) catch {
+                    self.store.updateContact(contact_id, contact_data) catch {
                         try self.sendError(500, "Internal Server Error");
                         return;
                     };
                     try self.sendSuccess(204, "No Content");
                 } else {
-                    _ = self.store.createContact(ab_id, .{ .uid = uid, .full_name = full_name, .vcf_data = body }) catch {
+                    _ = self.store.createContact(ab_id, contact_data) catch {
                         try self.sendError(500, "Internal Server Error");
                         return;
                     };
