@@ -177,8 +177,8 @@ pub const SmtpMetrics = struct {
             c.increment("messages.received") catch {};
             c.counter("bytes.received", @intCast(size_bytes), null) catch {};
             // Per-domain metric
-            const metric_name = std.fmt.allocPrint(self.allocator, "messages.received.{s}", .{domain}) catch return;
-            defer self.allocator.free(metric_name);
+            var metric_name_buf: [128]u8 = undefined;
+            const metric_name = std.fmt.bufPrint(&metric_name_buf, "messages.received.{s}", .{domain}) catch return;
             c.increment(metric_name) catch {};
         }
     }
@@ -214,8 +214,8 @@ pub const SmtpMetrics = struct {
 
         if (self.client) |c| {
             c.increment("messages.bounced") catch {};
-            const bounce_metric = std.fmt.allocPrint(self.allocator, "bounces.{s}", .{bounce_type.toString()}) catch return;
-            defer self.allocator.free(bounce_metric);
+            var bounce_metric_buf: [128]u8 = undefined;
+            const bounce_metric = std.fmt.bufPrint(&bounce_metric_buf, "bounces.{s}", .{bounce_type.toString()}) catch return;
             c.increment(bounce_metric) catch {};
             _ = domain;
         }
@@ -246,8 +246,8 @@ pub const SmtpMetrics = struct {
 
         if (self.client) |c| {
             c.increment("spam.detected") catch {};
-            const engine_metric = std.fmt.allocPrint(self.allocator, "spam.detected.{s}", .{engine.toString()}) catch return;
-            defer self.allocator.free(engine_metric);
+            var engine_metric_buf: [128]u8 = undefined;
+            const engine_metric = std.fmt.bufPrint(&engine_metric_buf, "spam.detected.{s}", .{engine.toString()}) catch return;
             c.increment(engine_metric) catch {};
             c.histogram("spam.score", @intFromFloat(score * 100), null) catch {};
         }
@@ -301,12 +301,12 @@ pub const SmtpMetrics = struct {
             } else {
                 c.increment("auth.failure") catch {};
             }
-            const mech_metric = std.fmt.allocPrint(
-                self.allocator,
+            var mech_metric_buf: [128]u8 = undefined;
+            const mech_metric = std.fmt.bufPrint(
+                &mech_metric_buf,
                 "auth.{s}.{s}",
                 .{ mechanism.toString(), if (success) "success" else "failure" },
             ) catch return;
-            defer self.allocator.free(mech_metric);
             c.increment(mech_metric) catch {};
         }
     }
@@ -320,8 +320,8 @@ pub const SmtpMetrics = struct {
 
         if (self.client) |c| {
             c.increment("ratelimit.hit") catch {};
-            const metric = std.fmt.allocPrint(self.allocator, "ratelimit.{s}", .{limit_type}) catch return;
-            defer self.allocator.free(metric);
+            var metric_buf: [128]u8 = undefined;
+            const metric = std.fmt.bufPrint(&metric_buf, "ratelimit.{s}", .{limit_type}) catch return;
             c.increment(metric) catch {};
         }
     }
@@ -342,8 +342,8 @@ pub const SmtpMetrics = struct {
         if (self.client) |c| {
             c.increment("connections.total") catch {};
             c.gauge("connections.active", @intCast(self.gauges.connections_active)) catch {};
-            const type_metric = std.fmt.allocPrint(self.allocator, "connections.{s}", .{conn_type.toString()}) catch return;
-            defer self.allocator.free(type_metric);
+            var type_metric_buf: [128]u8 = undefined;
+            const type_metric = std.fmt.bufPrint(&type_metric_buf, "connections.{s}", .{conn_type.toString()}) catch return;
             c.increment(type_metric) catch {};
             if (tls_enabled) {
                 c.increment("connections.tls") catch {};
@@ -378,8 +378,8 @@ pub const SmtpMetrics = struct {
 
         if (self.client) |c| {
             c.gauge("queue.size", @intCast(size)) catch {};
-            const metric = std.fmt.allocPrint(self.allocator, "queue.{s}.size", .{queue_name}) catch return;
-            defer self.allocator.free(metric);
+            var metric_buf: [128]u8 = undefined;
+            const metric = std.fmt.bufPrint(&metric_buf, "queue.{s}.size", .{queue_name}) catch return;
             c.gauge(metric, @intCast(size)) catch {};
         }
     }
@@ -448,8 +448,8 @@ pub const SmtpMetrics = struct {
 
         if (self.client) |c| {
             c.increment("spf.checked") catch {};
-            const metric = std.fmt.allocPrint(self.allocator, "spf.{s}", .{result}) catch return;
-            defer self.allocator.free(metric);
+            var metric_buf: [128]u8 = undefined;
+            const metric = std.fmt.bufPrint(&metric_buf, "spf.{s}", .{result}) catch return;
             c.increment(metric) catch {};
         }
     }

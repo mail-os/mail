@@ -223,12 +223,16 @@ pub const DiscordHealthMonitor = struct {
     }
 
     fn checkDiskSpace(self: *DiscordHealthMonitor, now: i64) void {
+        // Monitor the filesystem holding the mail spool (DISK_MONITOR_PATH),
+        // not unconditionally "/" — a full /var doesn't show up on a separate
+        // root partition and vice versa.
+        const monitor_path: []const u8 = if (std.c.getenv("DISK_MONITOR_PATH")) |p| std.mem.sliceTo(p, 0) else "/";
         const result = runCommand(self.allocator, &.{
-            "df", "--output=pcent", "/",
+            "df", "--output=pcent", monitor_path,
         }) catch {
             // macOS doesn't support --output, try alternate
             const mac_result = runCommand(self.allocator, &.{
-                "df", "-h", "/",
+                "df", "-h", monitor_path,
             }) catch return;
             defer self.allocator.free(mac_result);
             // Parse macOS df output: "Capacity" column
@@ -446,28 +450,62 @@ pub const DiscordHealthMonitor = struct {
         return buf.toOwnedSlice(self.allocator);
     }
 
+    /// Detached webhook post: a slow or hung Discord endpoint must not
+    /// stall the health-check loop (system() previously blocked it for the
+    /// whole request, freezing all checks).
+    const PostJob = struct {
+        allocator: std.mem.Allocator,
+        cmd: [:0]u8,
+        tmp_path: [:0]u8,
+
+        fn run(job: *PostJob) void {
+            _ = system(job.cmd.ptr);
+            _ = unlink(job.tmp_path.ptr);
+            job.allocator.free(job.cmd);
+            job.allocator.free(job.tmp_path);
+            const allocator = job.allocator;
+            allocator.destroy(job);
+        }
+    };
+
+    /// Sequence for unique temp-file names (concurrent posts previously
+    /// overwrote one fixed path mid-send).
+    var post_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
     fn postWebhook(self: *DiscordHealthMonitor, json: []const u8) !void {
-        // Write JSON to a temp file to avoid shell escaping issues
-        const tmp_path: [*:0]const u8 = "/tmp/.mail_discord_payload.json";
-        const fp = std.c.fopen(tmp_path, "w") orelse {
+        // Write JSON to a per-post temp file to avoid shell escaping issues
+        const seq = post_seq.fetchAdd(1, .monotonic);
+        const tmp_path_s = try std.fmt.allocPrint(self.allocator, "/tmp/.mail_discord_{d}.json", .{seq});
+        defer self.allocator.free(tmp_path_s);
+        const tmp_path = try self.allocator.dupeZ(u8, tmp_path_s);
+        errdefer self.allocator.free(tmp_path);
+
+        const fp = std.c.fopen(tmp_path.ptr, "w") orelse {
             logger.err("Failed to create temp file for Discord webhook", .{});
             return error.TempFileCreationFailed;
         };
         _ = std.c.fwrite(json.ptr, 1, json.len, fp);
         _ = std.c.fclose(fp);
 
-        // Use curl via system() - handles HTTPS natively
-        var cmd_buf: [2048:0]u8 = undefined;
-        const cmd = std.fmt.bufPrint(&cmd_buf, "curl -s -o /dev/null -X POST -H 'Content-Type: application/json' -d @/tmp/.mail_discord_payload.json '{s}' 2>/dev/null", .{self.webhook_url}) catch {
-            logger.err("Discord webhook URL too long", .{});
+        // curl handles HTTPS natively; -m bounds a hung endpoint.
+        const cmd_s = try std.fmt.allocPrint(self.allocator, "curl -s -m 10 -o /dev/null -X POST -H 'Content-Type: application/json' -d @{s} '{s}' 2>/dev/null", .{ tmp_path_s, self.webhook_url });
+        defer self.allocator.free(cmd_s);
+        const cmd = try self.allocator.dupeZ(u8, cmd_s);
+        errdefer self.allocator.free(cmd);
+
+        const job = try self.allocator.create(PostJob);
+        job.* = .{ .allocator = self.allocator, .cmd = cmd, .tmp_path = tmp_path };
+
+        const thread = std.Thread.spawn(.{}, PostJob.run, .{job}) catch {
+            // Couldn't spawn — post synchronously rather than dropping the alert.
+            self.allocator.destroy(job);
+            _ = system(cmd.ptr);
+            _ = unlink(tmp_path.ptr);
+            self.allocator.free(cmd);
+            self.allocator.free(tmp_path);
             return;
         };
-        cmd_buf[cmd.len] = 0;
-
-        _ = system(&cmd_buf);
-
-        // Cleanup
-        _ = unlink(tmp_path);
+        thread.detach();
     }
 
     // =========================================================================
