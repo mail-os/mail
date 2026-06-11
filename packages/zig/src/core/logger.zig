@@ -95,13 +95,11 @@ pub const Logger = struct {
     pub fn log(self: *Logger, level: LogLevel, comptime fmt: []const u8, args: anytype) void {
         if (@intFromEnum(level) < @intFromEnum(self.min_level)) return;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         const timestamp = time_compat.timestamp();
         var buf: [8192]u8 = undefined;
 
-        // Format the message
+        // Format the message (outside the mutex so concurrent threads only
+        // serialize on the actual write, not on formatting)
         const message = std.fmt.bufPrint(&buf, fmt, args) catch |format_err| {
             std.debug.print("Logger formatting error: {}\n", .{format_err});
             return;
@@ -117,16 +115,20 @@ pub const Logger = struct {
             .json => self.formatJSON(&log_buf, timestamp, level, message, null) catch return,
         };
 
-        // Write to stderr with colors (text mode only)
-        if (self.use_colors and self.format == .text) {
-            const colored = std.fmt.bufPrint(&buf, "{s}{s}\x1b[0m", .{
+        // Colorized stderr variant (text mode only); `buf` is free to reuse
+        // since `message` was already copied into `log_buf`.
+        const stderr_entry = if (self.use_colors and self.format == .text)
+            std.fmt.bufPrint(&buf, "{s}{s}\x1b[0m", .{
                 level.toColor(),
                 log_entry,
-            }) catch return;
-            _ = std.c.write(2, colored.ptr, colored.len);
-        } else {
-            _ = std.c.write(2, log_entry.ptr, log_entry.len);
-        }
+            }) catch return
+        else
+            log_entry;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        _ = std.c.write(2, stderr_entry.ptr, stderr_entry.len);
 
         // Write to file if configured
         if (self.log_file) |file| {
@@ -278,9 +280,6 @@ pub const Logger = struct {
     pub fn logStructured(self: *Logger, slog: *StructuredLog) void {
         if (@intFromEnum(slog.level) < @intFromEnum(self.min_level)) return;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
         const timestamp = time_compat.timestamp();
         var log_buf: [8192]u8 = undefined;
 
@@ -305,17 +304,20 @@ pub const Logger = struct {
             },
         };
 
-        // Write to stderr
-        if (self.use_colors and self.format == .text) {
-            var buf: [8192]u8 = undefined;
-            const colored = std.fmt.bufPrint(&buf, "{s}{s}\x1b[0m", .{
+        // Colorized stderr variant (text mode only)
+        var color_buf: [8192]u8 = undefined;
+        const stderr_entry = if (self.use_colors and self.format == .text)
+            std.fmt.bufPrint(&color_buf, "{s}{s}\x1b[0m", .{
                 slog.level.toColor(),
                 log_entry,
-            }) catch return;
-            _ = std.c.write(2, colored.ptr, colored.len);
-        } else {
-            _ = std.c.write(2, log_entry.ptr, log_entry.len);
-        }
+            }) catch return
+        else
+            log_entry;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        _ = std.c.write(2, stderr_entry.ptr, stderr_entry.len);
 
         // Write to file
         if (self.log_file) |file| {
