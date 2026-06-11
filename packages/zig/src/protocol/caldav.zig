@@ -2084,7 +2084,7 @@ pub const CalDavServer = struct {
             const connection = self.listener.?.accept() catch |err| {
                 if (!self.running.load(.monotonic)) break;
                 if (err == error.OperationCancelled or err == error.WouldBlock) {
-                    time_compat.sleepMs(100);
+                    self.listener.?.waitReadable(1000);
                     continue;
                 }
                 logger.warn("CalDAV accept error: {}", .{err});
@@ -2135,7 +2135,7 @@ pub const CalDavServer = struct {
             const connection = self.ssl_listener.?.accept() catch |err| {
                 if (!self.running.load(.monotonic)) break;
                 if (err == error.OperationCancelled or err == error.WouldBlock) {
-                    time_compat.sleepMs(100);
+                    self.ssl_listener.?.waitReadable(1000);
                     continue;
                 }
                 logger.warn("CalDAV SSL accept error: {}", .{err});
@@ -2357,8 +2357,13 @@ pub const CalDavServer = struct {
 
         // Handle plain text session (non-SSL)
         if (!is_ssl) {
-            // Plain text session
-            _ = session.handleRequest(&self.config) catch {};
+            // Serve requests until the client closes or errors (HTTP
+            // keep-alive). This path sits behind the rpx gateway, which
+            // reuses upstream connections — handling a single request per
+            // TCP connection forced a reconnect for every proxied request
+            // while the TLS path above already looped. The socket RCVTIMEO
+            // set at the top bounds idle keep-alive connections.
+            while (session.handleRequest(&self.config) catch false) {}
         }
     }
 };

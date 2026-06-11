@@ -3553,7 +3553,7 @@ pub const ImapServer = struct {
             const connection = self.listener.?.accept() catch |err| {
                 if (!self.running.load(.monotonic)) break;
                 if (err == error.OperationCancelled or err == error.WouldBlock) {
-                    time_compat.sleepMs(100);
+                    self.listener.?.waitReadable(1000);
                     continue;
                 }
                 logger.warn("IMAP accept error: {}", .{err});
@@ -3596,7 +3596,7 @@ pub const ImapServer = struct {
             const connection = self.ssl_listener.?.accept() catch |err| {
                 if (!self.running.load(.monotonic)) break; // Server is stopping
                 if (err == error.OperationCancelled or err == error.WouldBlock) {
-                    time_compat.sleepMs(100);
+                    self.ssl_listener.?.waitReadable(1000);
                     continue;
                 }
                 logger.warn("IMAPS accept error: {}", .{err});

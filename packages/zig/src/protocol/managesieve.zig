@@ -805,7 +805,7 @@ pub const ManageSieveServer = struct {
             const conn = self.listener.?.accept() catch |err| {
                 if (!self.running.load(.monotonic)) break;
                 if (err == error.OperationCancelled or err == error.WouldBlock) {
-                    time_compat.sleepMs(100);
+                    self.listener.?.waitReadable(1000);
                     continue;
                 }
                 std.log.warn("ManageSieve accept: {}", .{err});

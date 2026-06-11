@@ -126,7 +126,7 @@ pub const Server = struct {
             // Accept with timeout to allow checking shutdown flag
             const connection = self.listener.?.accept() catch |err| {
                 if (err == error.OperationCancelled or err == error.WouldBlock) {
-                    time_compat.sleepMs(100);
+                    self.listener.?.waitReadable(1000);
                     continue;
                 }
                 self.logger.warn("Error accepting connection: {}", .{err});
@@ -210,6 +210,15 @@ pub const Server = struct {
         defer ctx.connection.close();
         defer _ = ctx.server.active_connections.fetchSub(1, .monotonic);
 
+        // Socket-level read/write timeout (RFC 5321 §4.5.3.2 recommends a
+        // 5-minute server timeout). Without it a silent client blocks this
+        // thread in read() forever — the session's idle check only runs
+        // between reads, so it never fired for a fully silent peer.
+        const timeout_secs: i64 = @intCast(@max(ctx.server.config.timeout_seconds, 1));
+        const tv: std.posix.timeval = .{ .sec = @intCast(timeout_secs), .usec = 0 };
+        std.posix.setsockopt(ctx.connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+        std.posix.setsockopt(ctx.connection.fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
+
         // The peer IP lives in this thread's own copy of the connection, so a
         // slice into it is valid for the whole session.
         const remote_addr = if (ctx.connection.peerIp().len > 0) ctx.connection.peerIp() else ctx.remote_addr;
@@ -276,7 +285,7 @@ pub const Server = struct {
         while (!shutdown_flag.load(.acquire)) {
             const connection = smtps_listener.accept() catch |err| {
                 if (err == error.OperationCancelled or err == error.WouldBlock) {
-                    time_compat.sleepMs(100);
+                    smtps_listener.waitReadable(1000);
                     continue;
                 }
                 self.logger.warn("SMTPS: Error accepting connection: {}", .{err});
@@ -333,7 +342,7 @@ pub const Server = struct {
         while (!shutdown_flag.load(.acquire)) {
             const connection = submission_listener.accept() catch |err| {
                 if (err == error.OperationCancelled or err == error.WouldBlock) {
-                    time_compat.sleepMs(100);
+                    submission_listener.waitReadable(1000);
                     continue;
                 }
                 self.logger.warn("Submission: Error accepting connection: {}", .{err});

@@ -1,6 +1,7 @@
 // Socket compatibility layer for Zig 0.16
 // Provides synchronous socket operations using posix APIs
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 
 pub const AddressFamily = enum { ipv4, ipv6 };
@@ -189,6 +190,31 @@ pub const Server = struct {
         const TCP_NODELAY: u32 = 1;
         _ = posix.setsockopt(fd, posix.IPPROTO.TCP, TCP_NODELAY, std.mem.asBytes(&one)) catch {};
 
+        // Enable TCP keepalive so dead peers (crashed clients, NAT drops)
+        // release their connection slot instead of holding it forever.
+        // Keepalive never drops an idle-but-alive client, so this is safe
+        // even for protocols with long mandated idle windows (IMAP).
+        _ = posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.KEEPALIVE, std.mem.asBytes(&one)) catch {};
+        switch (builtin.os.tag) {
+            .linux => {
+                const idle: c_int = 300; // probe after 5 min idle
+                const intvl: c_int = 60; // then every 60s
+                const cnt: c_int = 4; // give up after 4 failed probes
+                const TCP_KEEPIDLE: u32 = 4;
+                const TCP_KEEPINTVL: u32 = 5;
+                const TCP_KEEPCNT: u32 = 6;
+                _ = posix.setsockopt(fd, posix.IPPROTO.TCP, TCP_KEEPIDLE, std.mem.asBytes(&idle)) catch {};
+                _ = posix.setsockopt(fd, posix.IPPROTO.TCP, TCP_KEEPINTVL, std.mem.asBytes(&intvl)) catch {};
+                _ = posix.setsockopt(fd, posix.IPPROTO.TCP, TCP_KEEPCNT, std.mem.asBytes(&cnt)) catch {};
+            },
+            .macos => {
+                const idle: c_int = 300;
+                const TCP_KEEPALIVE: u32 = 0x10; // idle time before probes
+                _ = posix.setsockopt(fd, posix.IPPROTO.TCP, TCP_KEEPALIVE, std.mem.asBytes(&idle)) catch {};
+            },
+            else => {},
+        }
+
         var conn = Connection{ .fd = fd };
         // Record the peer IP as text (for SPF/DNSBL/logging). Best-effort and
         // defensive: any unexpected family just leaves peer_ip_len = 0.
@@ -204,6 +230,15 @@ pub const Server = struct {
             conn.peer_ip_len = s.len;
         }
         return conn;
+    }
+
+    /// Block until the listener has a pending connection or `timeout_ms`
+    /// elapses. Lets accept loops park in poll() instead of sleeping a fixed
+    /// 100ms between accept attempts (which both wasted wakeups and added up
+    /// to 100ms latency to every new connection).
+    pub fn waitReadable(self: *Server, timeout_ms: i32) void {
+        var fds = [1]std.c.pollfd{.{ .fd = self.fd, .events = std.c.POLL.IN, .revents = 0 }};
+        _ = std.c.poll(&fds, 1, timeout_ms);
     }
 
     pub fn setNonBlocking(self: *Server, enabled: bool) !void {
