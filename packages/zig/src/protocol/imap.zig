@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const mutex_compat = @import("../core/mutex_compat.zig");
 const posix = std.posix;
 const time_compat = @import("../core/time_compat.zig");
@@ -10,6 +11,7 @@ const tls_mod = @import("../core/tls.zig");
 const tls = @import("tls");
 const fs_compat = @import("../core/fs_compat.zig");
 const database = @import("../storage/database.zig");
+const typesense = @import("../search/typesense.zig");
 
 // std.posix.getpid is not available on this Zig version's std; libc is linked
 // (the binary links sqlite3 + libc), so declare the C symbol directly.
@@ -760,6 +762,10 @@ pub const ImapSession = struct {
     uid_seq_map: std.AutoHashMapUnmanaged(i64, usize) = .empty,
     // Cheap IDLE-poll signature: maildir entry count at the last poll.
     idle_scan_count: ?usize = null,
+    // inotify fd watching the selected mailbox's dirs during IDLE (Linux).
+    // null = not set up yet, -1 = unavailable (non-Linux or setup failed,
+    // fall back to timed polling).
+    idle_watch_fd: ?i32 = null,
     mailbox_uidvalidity: i64 = 0,
     mailbox_name: ?[]const u8 = null,
     mailbox_is_virtual: bool = false,
@@ -800,6 +806,7 @@ pub const ImapSession = struct {
             self.allocator.free(idle_tag);
         }
         self.cleanupAppend();
+        self.closeIdleWatch();
         self.freeMailboxFiles();
         self.uid_seq_map.deinit(self.allocator);
         if (self.mailbox_name) |n| self.allocator.free(n);
@@ -1255,6 +1262,142 @@ pub const ImapSession = struct {
         return fs_compat.countEmlFiles(dir);
     }
 
+    /// Set up inotify watches over the selected mailbox's directories so
+    /// IDLE pushes EXISTS the moment a message file lands instead of
+    /// polling. Linux only; returns null on any failure (callers fall back
+    /// to the count-gated timed poll).
+    fn setupIdleWatch(self: *ImapSession) ?i32 {
+        if (builtin.os.tag != .linux) return null;
+        const linux = std.os.linux;
+
+        const init_res = linux.inotify_init1(linux.IN.CLOEXEC | linux.IN.NONBLOCK);
+        if (@as(isize, @bitCast(init_res)) < 0) return null;
+        const fd: i32 = @intCast(init_res);
+
+        var watched: usize = 0;
+
+        if (self.mailbox_is_virtual) {
+            // Watch the user's root (folder add/remove) and every folder.
+            const full_username = self.username orelse {
+                _ = std.c.close(fd);
+                return null;
+            };
+            const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
+                full_username[0..at_pos]
+            else
+                full_username;
+
+            var root_buf: [512]u8 = undefined;
+            const root = std.fmt.bufPrintZ(&root_buf, "mail/{s}", .{username}) catch {
+                _ = std.c.close(fd);
+                return null;
+            };
+            if (addIdleWatchDir(fd, root)) watched += 1;
+
+            if (std.c.opendir(root.ptr)) |dir| {
+                defer _ = std.c.closedir(dir);
+                var folder_buf: [1024]u8 = undefined;
+                while (std.c.readdir(dir)) |entry| {
+                    const name_ptr: [*:0]const u8 = @ptrCast(&entry.name);
+                    const folder = std.mem.sliceTo(name_ptr, 0);
+                    if (!shouldIncludeInAggregate(folder, false)) continue;
+                    const folder_path = std.fmt.bufPrintZ(&folder_buf, "{s}/{s}", .{ root, folder }) catch continue;
+                    if (addIdleWatchDir(fd, folder_path)) watched += 1;
+                }
+            }
+        } else if (self.mailbox_name != null and std.ascii.eqlIgnoreCase(self.mailbox_name.?, "INBOX")) {
+            const full_username = self.username orelse {
+                _ = std.c.close(fd);
+                return null;
+            };
+            const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
+                full_username[0..at_pos]
+            else
+                full_username;
+            var new_buf: [512]u8 = undefined;
+            var cur_buf: [512]u8 = undefined;
+            if (std.fmt.bufPrintZ(&new_buf, "mail/{s}/new", .{username})) |p| {
+                if (addIdleWatchDir(fd, p)) watched += 1;
+            } else |_| {}
+            if (std.fmt.bufPrintZ(&cur_buf, "mail/{s}/cur", .{username})) |p| {
+                if (addIdleWatchDir(fd, p)) watched += 1;
+            } else |_| {}
+        } else if (self.mailbox_dir) |dir| {
+            var dir_buf: [1024]u8 = undefined;
+            if (std.fmt.bufPrintZ(&dir_buf, "{s}", .{dir})) |p| {
+                if (addIdleWatchDir(fd, p)) watched += 1;
+            } else |_| {}
+        }
+
+        if (watched == 0) {
+            _ = std.c.close(fd);
+            return null;
+        }
+        return fd;
+    }
+
+    fn addIdleWatchDir(fd: i32, path: [:0]const u8) bool {
+        if (builtin.os.tag != .linux) return false;
+        const linux = std.os.linux;
+        const mask = linux.IN.CREATE | linux.IN.MOVED_TO | linux.IN.MOVED_FROM | linux.IN.DELETE;
+        const res = linux.inotify_add_watch(fd, path.ptr, mask);
+        return @as(isize, @bitCast(res)) >= 0;
+    }
+
+    /// Drain pending inotify events (we only care THAT something changed).
+    fn drainIdleWatch(fd: i32) void {
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = std.c.read(fd, &buf, buf.len);
+            if (n <= 0) break;
+        }
+    }
+
+    fn closeIdleWatch(self: *ImapSession) void {
+        if (self.idle_watch_fd) |fd| {
+            if (fd >= 0) _ = std.c.close(fd);
+            self.idle_watch_fd = null;
+        }
+    }
+
+    /// Block until the IDLE connection has socket data or the mailbox
+    /// changed. Returns true when the caller should proceed to read() from
+    /// the socket, false when it should re-loop (a mailbox event or
+    /// safety-net timeout was handled here).
+    ///
+    /// Push mode (Linux, inotify available): poll() on socket + watch fd —
+    /// new mail is announced the moment the file lands, with a 60s
+    /// safety-net rescan. Fallback mode: 2s socket RCVTIMEO; the read's
+    /// WouldBlock drives the count-gated poll (pre-inotify behavior).
+    fn idleWaitReadable(self: *ImapSession, sock_fd: std.posix.socket_t) bool {
+        if (self.idle_watch_fd == null) {
+            self.idle_watch_fd = self.setupIdleWatch() orelse -1;
+        }
+        const wfd = self.idle_watch_fd.?;
+
+        if (wfd < 0) {
+            const idle_tv: std.posix.timeval = .{ .sec = 2, .usec = 0 };
+            std.posix.setsockopt(sock_fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&idle_tv)) catch {};
+            return true;
+        }
+
+        var fds = [2]std.c.pollfd{
+            .{ .fd = sock_fd, .events = std.c.POLL.IN, .revents = 0 },
+            .{ .fd = wfd, .events = std.c.POLL.IN, .revents = 0 },
+        };
+        const n = std.c.poll(&fds, 2, 60_000);
+        if (n <= 0) {
+            // Timeout/EINTR: safety-net rescan in case an event was missed
+            if (self.state == .selected) self.idlePollRescan();
+            return false;
+        }
+        if (fds[1].revents != 0) {
+            drainIdleWatch(wfd);
+            if (self.state == .selected) self.idlePollRescan();
+        }
+        return fds[0].revents != 0;
+    }
+
     /// Cheap IDLE poll: run the full rescan (directory listing + sort + UID
     /// sync) only when the maildir entry count actually changed. The full
     /// rescan also only reports on count changes, so this is equivalent —
@@ -1442,6 +1585,15 @@ pub const ImapSession = struct {
         // The UID key for this message is its on-disk base filename (matching
         // how syncUids/getUidForFile key the imap_uids table).
         const uid_key = std.fs.path.basename(filepath);
+
+        // Index for full-text search (best-effort, detached thread)
+        typesense.indexMessageAsync(
+            self.allocator,
+            local_part,
+            if (std.ascii.eqlIgnoreCase(mailbox, "INBOX")) "INBOX" else mailbox,
+            uid_key,
+            data[0..size],
+        );
 
         // Use the mailbox's real UIDVALIDITY (matching SELECT/STATUS) so clients
         // don't invalidate their UID cache for the folder after an append.
@@ -2521,6 +2673,106 @@ pub const ImapSession = struct {
     /// Handle SEARCH command — evaluate criteria against messages.
     /// Supports: ALL, SEEN, UNSEEN, FLAGGED, UNFLAGGED, DELETED, UNDELETED,
     /// ANSWERED, UNANSWERED, DRAFT, UNDRAFT, FROM, SUBJECT, SINCE, BEFORE.
+    const SearchIdentity = struct {
+        username: []const u8,
+        mailbox: ?[]const u8,
+    };
+
+    /// Identity for search-index operations: the local-part username and
+    /// the selected mailbox (null for virtual/aggregate mailboxes, which
+    /// span folders and therefore search the whole account).
+    fn searchIdentity(self: *ImapSession) ?SearchIdentity {
+        const full_username = self.username orelse return null;
+        const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
+            full_username[0..at_pos]
+        else
+            full_username;
+        if (self.mailbox_is_virtual) return .{ .username = username, .mailbox = null };
+        return .{ .username = username, .mailbox = self.mailbox_name orelse "INBOX" };
+    }
+
+    /// Find `keyword` as a standalone criteria token and return the index
+    /// just past it (where its argument starts), or null.
+    fn findCriteriaToken(criteria: []const u8, keyword: []const u8) ?usize {
+        var search_from: usize = 0;
+        while (std.ascii.indexOfIgnoreCasePos(criteria, search_from, keyword)) |pos| {
+            const before_ok = pos == 0 or isCriteriaDelimiter(criteria[pos - 1]);
+            const after_idx = pos + keyword.len;
+            const after_ok = after_idx >= criteria.len or isCriteriaDelimiter(criteria[after_idx]);
+            if (before_ok and after_ok) return after_idx;
+            search_from = pos + 1;
+        }
+        return null;
+    }
+
+    /// Run the text criteria (FROM/TO/SUBJECT/BODY/TEXT) against the
+    /// Typesense index, intersecting per-criterion result sets (IMAP
+    /// criteria are ANDed). Returns null when no text criterion is present;
+    /// errors bubble up so the caller can fall back to the file scan.
+    /// Keys are owned base filenames (free each + deinit).
+    fn typesenseSearchMatches(self: *ImapSession, criteria: []const u8) !?std.StringHashMap(void) {
+        const ident = self.searchIdentity() orelse return null;
+
+        const Criterion = struct { keyword: []const u8, query_by: []const u8 };
+        const criterion_table = [_]Criterion{
+            .{ .keyword = "FROM", .query_by = "sender" },
+            .{ .keyword = "SUBJECT", .query_by = "subject" },
+            .{ .keyword = "TO", .query_by = "recipients" },
+            .{ .keyword = "BODY", .query_by = "body" },
+            .{ .keyword = "TEXT", .query_by = "subject,sender,recipients,body" },
+        };
+
+        var result: ?std.StringHashMap(void) = null;
+        errdefer if (result) |*m| freeMatchSet(self.allocator, m);
+
+        for (criterion_table) |c| {
+            const arg_start = findCriteriaToken(criteria, c.keyword) orelse continue;
+            const term = extractQuotedArg(criteria[arg_start..]);
+            if (term.len == 0) continue;
+
+            const names = try typesense.searchFilenames(self.allocator, ident.username, ident.mailbox, term, c.query_by);
+            defer {
+                for (names) |n| self.allocator.free(n);
+                self.allocator.free(names);
+            }
+
+            if (result == null) {
+                var m = std.StringHashMap(void).init(self.allocator);
+                errdefer freeMatchSet(self.allocator, &m);
+                for (names) |n| {
+                    if (m.contains(n)) continue;
+                    const key = try self.allocator.dupe(u8, n);
+                    errdefer self.allocator.free(key);
+                    try m.put(key, {});
+                }
+                result = m;
+            } else {
+                // Intersect: drop existing keys absent from this criterion's hits
+                var keep = std.StringHashMap(void).init(self.allocator);
+                defer keep.deinit();
+                for (names) |n| try keep.put(n, {});
+
+                var stale: std.ArrayList([]const u8) = .empty;
+                defer stale.deinit(self.allocator);
+                var it = result.?.keyIterator();
+                while (it.next()) |k| {
+                    if (!keep.contains(k.*)) try stale.append(self.allocator, k.*);
+                }
+                for (stale.items) |k| {
+                    if (result.?.fetchRemove(k)) |removed| self.allocator.free(removed.key);
+                }
+            }
+        }
+
+        return result;
+    }
+
+    fn freeMatchSet(allocator: std.mem.Allocator, m: *std.StringHashMap(void)) void {
+        var it = m.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        m.deinit();
+    }
+
     fn handleSearch(self: *ImapSession, tag: []const u8, criteria: []const u8) !void {
         return self.handleSearchImpl(tag, criteria, false);
     }
@@ -2593,6 +2845,16 @@ pub const ImapSession = struct {
             }
         }
 
+        // Resolve text criteria (FROM/TO/SUBJECT/BODY/TEXT) through the
+        // Typesense index when available: one indexed query instead of
+        // reading every message file. On error (engine down, not indexed)
+        // fall back to the per-file scan below.
+        var ts_matches: ?std.StringHashMap(void) = null;
+        defer if (ts_matches) |*m| freeMatchSet(self.allocator, m);
+        if (!is_all and typesense.enabled()) {
+            ts_matches = self.typesenseSearchMatches(criteria) catch null;
+        }
+
         var buf: [8192]u8 = undefined;
         var fbs = io_compat.fixedBufferStream(&buf);
         const writer = fbs.writer();
@@ -2619,9 +2881,17 @@ pub const ImapSession = struct {
                 if (want_answered and !flags.answered) continue;
                 if (want_unanswered and flags.answered) continue;
 
-                // Text-based criteria: FROM, SUBJECT — require reading the file
-                const need_content = std.ascii.indexOfIgnoreCase(criteria, "FROM") != null or
-                    std.ascii.indexOfIgnoreCase(criteria, "SUBJECT") != null;
+                // Text-based criteria, indexed path: membership in the
+                // Typesense result set (keyed by maildir base name).
+                if (ts_matches) |*m| {
+                    if (!m.contains(MaildirFlags.baseName(filename))) continue;
+                }
+
+                // Text-based criteria, fallback path: FROM, SUBJECT —
+                // require reading the file
+                const need_content = ts_matches == null and
+                    (std.ascii.indexOfIgnoreCase(criteria, "FROM") != null or
+                        std.ascii.indexOfIgnoreCase(criteria, "SUBJECT") != null);
                 if (need_content) {
                     const filepath = self.allocSelectedMessagePath(i, filename) catch continue;
                     defer self.allocator.free(filepath);
@@ -3063,6 +3333,11 @@ pub const ImapSession = struct {
             defer self.allocator.free(path_z);
             _ = std.c.unlink(path_z.ptr);
 
+            // Drop from the search index (best-effort)
+            if (self.searchIdentity()) |ident| {
+                typesense.deleteMessage(self.allocator, ident.username, ident.mailbox orelse "INBOX", filename);
+            }
+
             // Send untagged EXPUNGE
             var resp_buf: [32]u8 = undefined;
             var fbs = io_compat.fixedBufferStream(&resp_buf);
@@ -3097,6 +3372,7 @@ pub const ImapSession = struct {
             const trimmed = std.mem.trim(u8, line, " \t\r\n");
             if (std.ascii.eqlIgnoreCase(trimmed, "DONE")) {
                 self.idle_mode = false;
+                self.closeIdleWatch();
                 // Rescan mailbox for new messages before ending IDLE
                 if (self.state == .selected) {
                     _ = self.rescanMailbox() catch {};
@@ -3757,8 +4033,7 @@ pub const ImapServer = struct {
             while (session.state != .logout) {
                 // During IDLE: set a short socket timeout so we can poll for new mail
                 if (session.idle_mode) {
-                    const idle_tv: std.posix.timeval = .{ .sec = 2, .usec = 0 };
-                    std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&idle_tv)) catch {};
+                    if (!session.idleWaitReadable(connection.fd)) continue;
                 }
 
                 // Read ciphertext from socket
@@ -3884,8 +4159,7 @@ pub const ImapServer = struct {
             while (session.state != .logout and !session.starttls_requested) {
                 // During IDLE: set a short socket timeout so we can poll for new mail
                 if (session.idle_mode) {
-                    const idle_tv: std.posix.timeval = .{ .sec = 2, .usec = 0 };
-                    std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&idle_tv)) catch {};
+                    if (!session.idleWaitReadable(connection.fd)) continue;
                 }
 
                 const bytes_read = connection.read(&buffer) catch |err| {
@@ -4003,8 +4277,7 @@ pub const ImapServer = struct {
 
                         while (session.state != .logout) {
                             if (session.idle_mode) {
-                                const idle_tv: std.posix.timeval = .{ .sec = 2, .usec = 0 };
-                                std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&idle_tv)) catch {};
+                                if (!session.idleWaitReadable(connection.fd)) continue;
                             }
 
                             const bytes_read = connection.read(tls_recv_buf[0..]) catch |err| {
