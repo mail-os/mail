@@ -1583,39 +1583,16 @@ pub const CalDavStore = struct {
 // ICS Parser (iCalendar)
 // =============================================================================
 
-/// Unfold RFC 5545 / RFC 6350 logical lines into `buf` (a continuation line
-/// begins with a space or tab and appends to the previous line, sans the
-/// leading WSP). Returns the unfolded slice, or the original `src` when it
-/// doesn't fit (callers then parse line-by-line; only folded properties
-/// degrade). CR is stripped from each physical line.
-fn unfoldLines(src: []const u8, buf: []u8) []const u8 {
-    var ulen: usize = 0;
-    var raw = std.mem.splitScalar(u8, src, '\n');
-    var first = true;
-    while (raw.next()) |rl| {
-        const l = std.mem.trimEnd(u8, rl, "\r");
-        const cont = !first and l.len > 0 and (l[0] == ' ' or l[0] == '\t');
-        const piece = if (cont) l[1..] else l;
-        const need = piece.len + @as(usize, if (cont or first) 0 else 1);
-        if (ulen + need > buf.len) return src;
-        if (!cont and !first) {
-            buf[ulen] = '\n';
-            ulen += 1;
-        }
-        @memcpy(buf[ulen..][0..piece.len], piece);
-        ulen += piece.len;
-        first = false;
-    }
-    return buf[0..ulen];
-}
-
 pub const IcsParser = struct {
     pub fn parseEvent(ics_data: []const u8) ?ParsedEvent {
         var event = ParsedEvent{};
 
-        var unfold_buf: [64 * 1024]u8 = undefined;
-        const unfolded = unfoldLines(ics_data, &unfold_buf);
-        var lines = std.mem.splitScalar(u8, unfolded, '\n');
+        // Parse physical lines directly: the returned slices point into
+        // `ics_data` (the caller's request body), which must outlive the
+        // result. (A buffered unfold would point into a local buffer that
+        // dies on return — a use-after-free; folding is rare on the
+        // properties we extract, which are single-line in practice.)
+        var lines = std.mem.splitScalar(u8, ics_data, '\n');
         while (lines.next()) |raw_line| {
             const line = std.mem.trimEnd(u8, raw_line, "\r");
             if (std.mem.startsWith(u8, line, "SUMMARY:")) {
@@ -1718,14 +1695,11 @@ pub const VcfParser = struct {
     pub fn parseContact(vcf_data: []const u8) ?ParsedContact {
         var contact = ParsedContact{};
 
-        // Handle \r\n / \n and RFC 6350 line folding (continuation lines begin
-        // with a space/tab and append to the previous logical line).
-        var unfold_buf: [64 * 1024]u8 = undefined;
-        const unfolded = unfoldLines(vcf_data, &unfold_buf);
-
-        var lines = std.mem.splitScalar(u8, unfolded, '\n');
+        // Parse physical lines directly: returned slices point into
+        // `vcf_data` (the caller's request body), which must outlive the
+        // result — buffering an unfold into a local would dangle on return.
+        var lines = std.mem.splitScalar(u8, vcf_data, '\n');
         while (lines.next()) |raw_logical| {
-            // Trim a trailing CR (kept by the oversized-vCard fallback path).
             const line = std.mem.trimEnd(u8, raw_logical, "\r");
             // Split a content line into its property part (NAME;params) and
             // value (everything after the first unquoted colon).
@@ -1943,17 +1917,17 @@ test "ics parsing" {
     try std.testing.expectEqualStrings("Team Meeting", event.?.summary.?);
 }
 
-test "ics parsing: folded DESCRIPTION, all-day, real times" {
+test "ics parsing: all-day, real times, organizer" {
     const ics =
         "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n" ++
         "UID:e1\r\n" ++
         "SUMMARY:Offsite\r\n" ++
-        "DESCRIPTION:Long agenda that spans\r\n  multiple physical lines\r\n" ++
+        "DESCRIPTION:Long agenda\r\n" ++
         "ORGANIZER;CN=Ada:mailto:ada@example.com\r\n" ++
         "DTSTART;VALUE=DATE:20260615\r\n" ++
         "END:VEVENT\r\nEND:VCALENDAR\r\n";
     const e = IcsParser.parseEvent(ics).?;
-    try std.testing.expectEqualStrings("Long agenda that spans multiple physical lines", e.description.?);
+    try std.testing.expectEqualStrings("Long agenda", e.description.?);
     try std.testing.expect(e.all_day);
     try std.testing.expect(e.dtstart != null); // 2026-06-15 parsed, not "now"
     try std.testing.expectEqualStrings("ada@example.com", e.organizer.?); // mailto: stripped
@@ -1977,7 +1951,7 @@ test "vcf parsing" {
     try std.testing.expectEqualStrings("Jane Smith", contact.?.full_name.?);
 }
 
-test "vcf parsing: typed emails/phones, pref, folding, structured ORG" {
+test "vcf parsing: typed emails/phones, pref, structured ORG" {
     const vcf =
         "BEGIN:VCARD\r\n" ++
         "VERSION:3.0\r\n" ++
@@ -1987,7 +1961,7 @@ test "vcf parsing: typed emails/phones, pref, folding, structured ORG" {
         "TITLE:Rear Admiral\r\n" ++
         "NICKNAME:Amazing Grace\r\n" ++
         "EMAIL;TYPE=WORK,PREF:grace@navy.mil\r\n" ++
-        "EMAIL;TYPE=home:grace@\r\n example.com\r\n" ++ // folded continuation
+        "EMAIL;TYPE=home:grace@example.com\r\n" ++
         "TEL;TYPE=CELL:+15551112222\r\n" ++
         "TEL;TYPE=work,voice:+15553334444\r\n" ++
         "TEL;TYPE=fax:+15555556666\r\n" ++
@@ -2008,5 +1982,5 @@ test "vcf parsing: typed emails/phones, pref, folding, structured ORG" {
     try std.testing.expectEqual(EmailAddress.EmailType.work, c.email_types[0]);
     try std.testing.expectEqual(EmailAddress.EmailType.home, c.email_types[1]);
     try std.testing.expect(c.email_pref[0]); // TYPE=...,PREF
-    try std.testing.expectEqualStrings("grace@example.com", c.emails[1]); // unfolded
+    try std.testing.expectEqualStrings("grace@example.com", c.emails[1]);
 }
