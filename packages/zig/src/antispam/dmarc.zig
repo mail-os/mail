@@ -158,6 +158,15 @@ pub const DMARCValidator = struct {
     }
 
     /// Validate DMARC policy
+    pub const DMARCEval = struct {
+        result: DMARCResult,
+        /// The domain owner's published policy (p=). Enforcement should only
+        /// reject when this is .reject (or .quarantine) — a domain publishing
+        /// p=none is explicitly asking receivers NOT to act on its behalf, so
+        /// rejecting its mail on a fail would be a false positive.
+        policy: DMARCPolicy = .none,
+    };
+
     pub fn validate(
         self: *DMARCValidator,
         from_domain: []const u8,
@@ -166,16 +175,31 @@ pub const DMARCValidator = struct {
         dkim_result: dkim.DKIMResult,
         dkim_domain: []const u8,
     ) !DMARCResult {
+        const eval = try self.validateWithPolicy(from_domain, spf_result, spf_domain, dkim_result, dkim_domain);
+        return eval.result;
+    }
+
+    /// validate() plus the published policy, for policy-aware enforcement.
+    pub fn validateWithPolicy(
+        self: *DMARCValidator,
+        from_domain: []const u8,
+        spf_result: spf.SPFResult,
+        spf_domain: []const u8,
+        dkim_result: dkim.DKIMResult,
+        dkim_domain: []const u8,
+    ) !DMARCEval {
         // Query DMARC record for the From domain; if none, fall back to the
         // organizational domain (RFC 7489 §6.6.3).
         var maybe_record = self.queryDMARCRecord(from_domain) catch |err| switch (err) {
-            error.DNSTemporaryFailure => return .temperror,
-            else => return .none, // OutOfMemory and any other transient issue
+            error.DNSTemporaryFailure => return .{ .result = .temperror },
+            else => return .{ .result = .none }, // OutOfMemory and any other transient issue
         };
+        var used_org_policy = false;
         if (maybe_record == null) {
             const org = self.getOrganizationalDomain(from_domain);
             if (!std.ascii.eqlIgnoreCase(org, from_domain)) {
                 maybe_record = self.queryDMARCRecord(org) catch null;
+                used_org_policy = true;
             }
         }
 
@@ -185,10 +209,16 @@ pub const DMARCValidator = struct {
         };
 
         if (maybe_record == null) {
-            return .none;
+            return .{ .result = .none };
         }
 
         const record = maybe_record.?;
+        // For a subdomain falling back to the org record, sp= (if set)
+        // governs (RFC 7489 §6.3).
+        const policy = if (used_org_policy and record.subdomain_policy != .none)
+            record.subdomain_policy
+        else
+            record.policy;
 
         // Check identifier alignment
         const spf_aligned = self.checkAlignment(from_domain, spf_domain, record.spf_alignment);
@@ -199,13 +229,13 @@ pub const DMARCValidator = struct {
         const dkim_pass = dkim_result == .pass and dkim_aligned;
 
         if (spf_pass or dkim_pass) {
-            return .pass;
+            return .{ .result = .pass, .policy = policy };
         }
 
         // NOTE: record.percentage (pct=) is parsed and available to the policy
         // enforcement layer for sampling of the published policy; it does not
         // change the pass/fail evaluation itself (RFC 7489 §6.6.4).
-        return .fail;
+        return .{ .result = .fail, .policy = policy };
     }
 
     fn queryDMARCRecord(self: *DMARCValidator, domain: []const u8) !?DMARCRecord {

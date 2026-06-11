@@ -1049,7 +1049,9 @@ pub const Session = struct {
         // From domain was passed for both sides, making alignment vacuous.
         const dkim_domain = dkim_check.domain orelse from_domain;
         var dmarc_v = dmarc_mod.DMARCValidator.init(self.allocator);
-        const dmarc_res = dmarc_v.validate(from_domain, spf_res, spf_domain, dkim_res, dkim_domain) catch dmarc_mod.DMARCResult.temperror;
+        const dmarc_eval = dmarc_v.validateWithPolicy(from_domain, spf_res, spf_domain, dkim_res, dkim_domain) catch
+            dmarc_mod.DMARCValidator.DMARCEval{ .result = .temperror };
+        const dmarc_res = dmarc_eval.result;
 
         self.logger.info("inbound auth ip={s} mailfrom_domain={s} header_from={s}: spf={s} dkim={s} dmarc={s} arc={s}", .{ self.remote_addr, spf_domain, from_domain, spf_res.toString(), dkim_res.toString(), dmarc_res.toString(), arc_res.toString() });
 
@@ -1069,7 +1071,14 @@ pub const Session = struct {
         message_data.deinit(self.allocator);
         message_data.* = combined;
 
-        return self.config.antispam_enforce and dmarc_res == .fail;
+        // Reject only when enforcement is on, DMARC failed, AND the sender's
+        // OWN published policy is p=reject. A domain publishing p=none (or
+        // p=quarantine) is not asking us to reject on its behalf, so honoring
+        // that avoids bouncing legitimate mail (e.g. forwarded messages whose
+        // SPF/DKIM broke in transit). Quarantine-worthy mail is still
+        // delivered with the Authentication-Results header for downstream
+        // filtering.
+        return self.config.antispam_enforce and dmarc_res == .fail and dmarc_eval.policy == .reject;
     }
 
     fn handleBDAT(self: *Session, writer: anytype, line: []const u8) !void {
@@ -1270,7 +1279,9 @@ pub const Session = struct {
                         try self.sendResponse(writer, 235, "Authentication successful", null);
                     } else {
                         const safe_user = sanitizeForLog(credentials.username);
-                        self.logger.warn("Authentication failed for user '{s}'", .{sanitizedSlice(&safe_user, credentials.username.len)});
+                        // Include the client IP so fail2ban can ban brute-force
+                        // sources (its failregex matches "from <HOST>").
+                        self.logger.warn("Authentication failed for user '{s}' from {s}", .{ sanitizedSlice(&safe_user, credentials.username.len), self.remote_addr });
                         try self.sendResponse(writer, 535, "Authentication failed", null);
                     }
                 } else {
