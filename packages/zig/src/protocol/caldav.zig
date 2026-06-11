@@ -1175,6 +1175,7 @@ pub const CalDavSession = struct {
                     .dtend = if (parsed_event) |e| e.dtend else null,
                     .all_day = if (parsed_event) |e| e.all_day else false,
                     .rrule = if (parsed_event) |e| e.rrule else null,
+                    .organizer = if (parsed_event) |e| e.organizer else null,
                     .ics_data = body,
                 };
 

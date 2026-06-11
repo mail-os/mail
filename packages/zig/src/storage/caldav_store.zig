@@ -1635,6 +1635,14 @@ pub const IcsParser = struct {
                 event.uid = line[4..];
             } else if (std.mem.startsWith(u8, line, "RRULE:")) {
                 event.rrule = line[6..];
+            } else if (std.mem.startsWith(u8, line, "ORGANIZER")) {
+                // ORGANIZER[;CN=Name]:mailto:addr — keep the address, drop the
+                // "mailto:" scheme.
+                if (std.mem.indexOfScalar(u8, line, ':')) |idx| {
+                    var v = line[idx + 1 ..];
+                    if (std.ascii.startsWithIgnoreCase(v, "mailto:")) v = v[7..];
+                    event.organizer = v;
+                }
             }
         }
 
@@ -1696,6 +1704,7 @@ pub const IcsParser = struct {
         dtend: ?i64 = null,
         all_day: bool = false,
         rrule: ?[]const u8 = null,
+        organizer: ?[]const u8 = null,
     };
 };
 
@@ -1940,12 +1949,14 @@ test "ics parsing: folded DESCRIPTION, all-day, real times" {
         "UID:e1\r\n" ++
         "SUMMARY:Offsite\r\n" ++
         "DESCRIPTION:Long agenda that spans\r\n  multiple physical lines\r\n" ++
+        "ORGANIZER;CN=Ada:mailto:ada@example.com\r\n" ++
         "DTSTART;VALUE=DATE:20260615\r\n" ++
         "END:VEVENT\r\nEND:VCALENDAR\r\n";
     const e = IcsParser.parseEvent(ics).?;
     try std.testing.expectEqualStrings("Long agenda that spans multiple physical lines", e.description.?);
     try std.testing.expect(e.all_day);
     try std.testing.expect(e.dtstart != null); // 2026-06-15 parsed, not "now"
+    try std.testing.expectEqualStrings("ada@example.com", e.organizer.?); // mailto: stripped
 }
 
 test "vcf parsing" {
