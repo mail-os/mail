@@ -59,6 +59,13 @@ pub const CalDavConfig = struct {
     // actually reach (443), or Calendar/Contacts silently fail to connect.
     public_dav_port: u16 = 443,
     display_name: []const u8 = "Mail",
+    // MTA-STS policy mode served at /.well-known/mta-sts.txt (RFC 8461).
+    // "enforce" makes sending MTAs refuse delivery if STARTTLS to our MX
+    // can't be negotiated with a valid cert; "testing" reports failures
+    // without blocking. Set via MTA_STS_MODE in main.zig. (The policy `id`
+    // lives in the `_mta-sts` DNS TXT record, not this file — bump it there
+    // when changing the mode so senders refetch.)
+    mta_sts_mode: []const u8 = "enforce",
     // Outbound delivery (used by EWS CreateItem/SendItem to actually send mail).
     delivery_method: core_config.DeliveryMethod = .direct,
     ses_region: []const u8 = "us-east-1",
@@ -498,7 +505,7 @@ pub const CalDavSession = struct {
         // Lets senders discover that this MX requires TLS. "testing" reports
         // without enforcing (safe default); switch to "enforce" once confident.
         if (method == .get and std.mem.startsWith(u8, path, "/.well-known/mta-sts.txt")) {
-            const policy = std.fmt.allocPrint(self.allocator, "version: STSv1\nmode: testing\nmx: {s}\nmax_age: 604800\n", .{config.public_hostname}) catch {
+            const policy = std.fmt.allocPrint(self.allocator, "version: STSv1\nmode: {s}\nmx: {s}\nmax_age: 604800\n", .{ config.mta_sts_mode, config.public_hostname }) catch {
                 try self.sendError(500, "Internal Server Error");
                 return true;
             };

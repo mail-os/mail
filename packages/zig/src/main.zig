@@ -523,6 +523,8 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
             .submission_port = 587,
             .public_dav_port = caldav_public_ssl_port,
             .display_name = cfg.hostname,
+            // MTA-STS policy mode (default enforce); override with MTA_STS_MODE=testing.
+            .mta_sts_mode = env.get("MTA_STS_MODE") orelse "enforce",
             .delivery_method = cfg.delivery_method,
             .ses_region = cfg.ses_region,
         };
