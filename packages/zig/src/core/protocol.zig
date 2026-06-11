@@ -17,6 +17,7 @@ const tls_mod = @import("tls.zig");
 const chunking = @import("../protocol/chunking.zig");
 const tls = @import("tls");
 const outbound = @import("../delivery/outbound.zig");
+const typesense = @import("../search/typesense.zig");
 
 /// Maximum number of in-flight detached outbound/forward delivery worker
 /// threads across the whole process. Without a cap, a flood of recipients
@@ -1580,6 +1581,12 @@ pub const Session = struct {
                 };
 
                 self.logger.debug("Message saved to {s}", .{filename});
+
+                // Index for full-text search (best-effort, detached thread)
+                var base_buf: [64]u8 = undefined;
+                if (std.fmt.bufPrint(&base_buf, "{d}.eml", .{timestamp})) |base| {
+                    typesense.indexMessageAsync(self.allocator, username, "INBOX", base, data);
+                } else |_| {}
 
                 // Check for auto-forwarding rules
                 self.checkAndForward(username, sender, data) catch |err| {

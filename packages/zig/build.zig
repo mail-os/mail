@@ -21,6 +21,13 @@ pub fn build(b: *std.Build) void {
     });
     const zig_cli_module = zig_cli_dep.module("zig_cli");
 
+    // Add zig-search-engine dependency (Typesense-backed full-text search)
+    const search_engine_dep = b.dependency("search_engine", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const search_engine_module = search_engine_dep.module("search-engine");
+
     // Translate sqlite3.h into a Zig module (replaces @cImport in source files)
     const sqlite_module = sqliteModule(b, target, optimize);
 
@@ -36,7 +43,7 @@ pub fn build(b: *std.Build) void {
         };
 
         for (targets) |t| {
-            buildForTarget(b, t, optimize, tls_module, zig_cli_module);
+            buildForTarget(b, t, optimize, tls_module, zig_cli_module, search_engine_module);
         }
     }
 
@@ -47,6 +54,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     mail_module.addImport("tls", tls_module);
+    mail_module.addImport("search-engine", search_engine_module);
     mail_module.addImport("zig-cli", zig_cli_module);
     mail_module.addImport("sqlite", sqlite_module);
 
@@ -135,6 +143,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         test_module.addImport("tls", tls_module);
+        test_module.addImport("search-engine", search_engine_module);
         test_module.addImport("sqlite", sqlite_module);
         test_module.linkSystemLibrary("sqlite3", .{});
 
@@ -155,6 +164,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     mail_test_module.addImport("tls", tls_module);
+    mail_test_module.addImport("search-engine", search_engine_module);
     mail_test_module.addImport("sqlite", sqlite_module);
 
     for (rfc_compliance_tests) |test_file| {
@@ -221,6 +231,7 @@ fn buildForTarget(
     optimize: std.builtin.OptimizeMode,
     tls_module: *std.Build.Module,
     zig_cli_module: *std.Build.Module,
+    search_engine_module: *std.Build.Module,
 ) void {
     const target_query = target.query;
     const triple = b.fmt("{s}-{s}", .{
@@ -234,6 +245,7 @@ fn buildForTarget(
         .optimize = optimize,
     });
     root_module.addImport("tls", tls_module);
+    root_module.addImport("search-engine", search_engine_module);
     root_module.addImport("zig-cli", zig_cli_module);
     root_module.addImport("sqlite", sqliteModule(b, target, optimize));
 

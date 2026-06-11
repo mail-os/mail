@@ -1,6 +1,8 @@
 const std = @import("std");
 const cli = @import("zig-cli");
 const search_cli = @import("../search_cli.zig");
+const typesense = @import("../search/typesense.zig");
+const fs_compat = @import("../core/fs_compat.zig");
 
 fn withSearchEngine(comptime action: fn (*cli.BaseCommand.ParseContext, *search_cli.search.MessageSearch) anyerror!void) cli.BaseCommand.CommandAction {
     return struct {
@@ -93,6 +95,82 @@ fn rebuildIndexAction(_: *cli.BaseCommand.ParseContext, engine: *search_cli.sear
     try search_cli.rebuildIndexCommand(engine);
 }
 
+/// Backfill the Typesense index from the Maildir tree: every message in
+/// mail/{user}/{folder} is parsed and upserted. new/ and cur/ map to
+/// INBOX, matching how the server names mailboxes at index time.
+fn typesenseReindexAction(ctx: *cli.BaseCommand.ParseContext) anyerror!void {
+    const allocator = ctx.allocator;
+
+    if (!typesense.enabled()) {
+        std.debug.print("Error: TYPESENSE_API_KEY is not set (TYPESENSE_HOST/TYPESENSE_PORT optional)\n", .{});
+        return;
+    }
+
+    const root = ctx.getOption("root") orelse "mail";
+    var indexed: usize = 0;
+    var failed: usize = 0;
+
+    const root_z = try allocator.dupeZ(u8, root);
+    defer allocator.free(root_z);
+    const root_dir = std.c.opendir(root_z.ptr) orelse {
+        std.debug.print("Error: cannot open maildir root {s}\n", .{root});
+        return;
+    };
+    defer _ = std.c.closedir(root_dir);
+
+    while (std.c.readdir(root_dir)) |user_entry| {
+        const user_ptr: [*:0]const u8 = @ptrCast(&user_entry.name);
+        const user = std.mem.sliceTo(user_ptr, 0);
+        if (user.len == 0 or user[0] == '.') continue;
+
+        const user_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, user });
+        defer allocator.free(user_path);
+        const user_path_z = try allocator.dupeZ(u8, user_path);
+        defer allocator.free(user_path_z);
+
+        const user_dir = std.c.opendir(user_path_z.ptr) orelse continue;
+        defer _ = std.c.closedir(user_dir);
+
+        while (std.c.readdir(user_dir)) |folder_entry| {
+            const folder_ptr: [*:0]const u8 = @ptrCast(&folder_entry.name);
+            const folder = std.mem.sliceTo(folder_ptr, 0);
+            if (folder.len == 0 or folder[0] == '.' or std.mem.eql(u8, folder, "tmp")) continue;
+
+            const mailbox = if (std.mem.eql(u8, folder, "new") or std.mem.eql(u8, folder, "cur"))
+                "INBOX"
+            else
+                folder;
+
+            const folder_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ user_path, folder });
+            defer allocator.free(folder_path);
+
+            const files = fs_compat.listEmlFiles(allocator, folder_path) catch continue;
+            defer {
+                for (files) |f| allocator.free(f);
+                allocator.free(files);
+            }
+
+            for (files) |filename| {
+                const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ folder_path, filename });
+                defer allocator.free(full_path);
+                const content = fs_compat.readFileAlloc(allocator, full_path) catch {
+                    failed += 1;
+                    continue;
+                };
+                defer allocator.free(content);
+
+                typesense.indexRawMessage(allocator, user, mailbox, filename, content) catch {
+                    failed += 1;
+                    continue;
+                };
+                indexed += 1;
+            }
+        }
+    }
+
+    std.debug.print("Typesense reindex complete: {d} indexed, {d} failed\n", .{ indexed, failed });
+}
+
 fn addSearchOptions(cmd: *cli.BaseCommand) !void {
     _ = try cmd.addOption(cli.Option.init("email", "email", "Filter by email address", .string));
     _ = try cmd.addOption(cli.Option.init("folder", "folder", "Filter by folder", .string));
@@ -143,6 +221,12 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     const rebuild_cmd = try cli.BaseCommand.init(allocator, "rebuild-index", "Rebuild the FTS5 search index");
     _ = rebuild_cmd.setAction(withSearchEngine(rebuildIndexAction));
     _ = try cmd.addCommand(rebuild_cmd);
+
+    // search reindex — backfill the Typesense index from the Maildir
+    const reindex_cmd = try cli.BaseCommand.init(allocator, "reindex", "Backfill the Typesense index from the Maildir");
+    _ = try reindex_cmd.addOption(cli.Option.init("root", "root", "Maildir root (default: mail)", .string));
+    _ = reindex_cmd.setAction(typesenseReindexAction);
+    _ = try cmd.addCommand(reindex_cmd);
 
     return cmd;
 }

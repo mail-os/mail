@@ -35,6 +35,9 @@
         .tls = .{
             .path = "vendor/zig-tls",
         },
+        .search_engine = .{
+            .path = "vendor/zig-search-engine",
+        },
         .zig_cli = .{
             .url = "https://github.com/zig-utils/zig-cli/archive/50eebc9a12826d8028e9b8cb1523a69ffd959848.tar.gz",
             .hash = "zig_cli-0.1.1-18T51N3rAwBWhiQBbZE2zVbdrjB6pY-a94aoqG8ap6AM",

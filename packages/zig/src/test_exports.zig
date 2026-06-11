@@ -30,3 +30,4 @@ pub const queue = @import("delivery/queue.zig");
 pub const dns_cache = @import("antispam/dns_cache.zig");
 pub const autoresponder = @import("features/autoresponder.zig");
 pub const csrf = @import("auth/csrf.zig");
+pub const typesense = @import("search/typesense.zig");
