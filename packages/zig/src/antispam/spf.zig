@@ -71,8 +71,27 @@ fn parseIp4(s: []const u8) ?u32 {
     return (@as(u32, octets[0]) << 24) | (@as(u32, octets[1]) << 16) | (@as(u32, octets[2]) << 8) | @as(u32, octets[3]);
 }
 
-/// Parse an IPv6 string (full form or one "::") into 16 bytes (null on error).
-fn parseIp6(s: []const u8) ?[16]u8 {
+/// Parse an IPv6 string (full form, one "::", or a trailing embedded IPv4
+/// like ::ffff:1.2.3.4) into 16 bytes (null on error). Pub so DNSBL can
+/// reuse it for nibble-format queries.
+pub fn parseIp6(s: []const u8) ?[16]u8 {
+    // Embedded IPv4 tail: rewrite "...:a.b.c.d" into two 16-bit hex groups
+    // so the group parser below handles everything uniformly.
+    if (std.mem.indexOfScalar(u8, s, '.') != null) {
+        const last_colon = std.mem.lastIndexOfScalar(u8, s, ':') orelse return null;
+        const v4 = parseIp4(s[last_colon + 1 ..]) orelse return null;
+        var buf: [64]u8 = undefined;
+        const rewritten = std.fmt.bufPrint(&buf, "{s}{x}:{x}", .{
+            s[0 .. last_colon + 1],
+            v4 >> 16,
+            v4 & 0xffff,
+        }) catch return null;
+        return parseIp6Groups(rewritten);
+    }
+    return parseIp6Groups(s);
+}
+
+fn parseIp6Groups(s: []const u8) ?[16]u8 {
     var out: [16]u8 = std.mem.zeroes([16]u8);
     if (std.mem.indexOf(u8, s, "::")) |pos| {
         var head: [8]u16 = undefined;

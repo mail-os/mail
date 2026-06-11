@@ -1,4 +1,6 @@
 const std = @import("std");
+extern "c" fn system(command: [*:0]const u8) c_int;
+extern "c" fn unlink(path: [*:0]const u8) c_int;
 const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const logger = @import("../core/logger.zig");
@@ -539,32 +541,92 @@ pub const SecretManager = struct {
         return value;
     }
 
-    fn fetchFromAws(self: *SecretManager, name: []const u8) ![]u8 {
-        const config = self.aws_config orelse return error.BackendNotConfigured;
-        _ = config;
-        _ = name;
-
-        // In a full implementation, this would:
-        // 1. Sign request with AWS SigV4
-        // 2. Call secretsmanager:GetSecretValue
-        // 3. Parse JSON response
-        // 4. Return SecretString or decode SecretBinary
-
-        return error.NotImplemented;
+    /// True when `name` only contains characters safe to interpolate into a
+    /// shell command (secret ids: alnum plus / _ . : - @).
+    fn isSafeSecretName(name: []const u8) bool {
+        if (name.len == 0 or name.len > 512) return false;
+        for (name) |c| {
+            const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+                (c >= '0' and c <= '9') or c == '/' or c == '_' or c == '.' or
+                c == ':' or c == '-' or c == '@';
+            if (!ok) return false;
+        }
+        return true;
     }
 
+    /// Run a command and capture its stdout via a temp file (the same
+    /// pattern deliverViaSes and the Discord monitor use — this codebase
+    /// has no native HTTPS client; cloud APIs go through their CLIs).
+    fn runCliCapture(self: *SecretManager, cmd: []const u8) ![]u8 {
+        const ts = time_compat.milliTimestamp();
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "/tmp/.mail_secret_{d}", .{ts});
+        defer self.allocator.free(tmp_path);
+
+        const full_cmd = try std.fmt.allocPrintSentinel(self.allocator, "{s} > {s} 2>/dev/null", .{ cmd, tmp_path }, 0);
+        defer self.allocator.free(full_cmd);
+
+        const tmp_path_z = try self.allocator.dupeZ(u8, tmp_path);
+        defer self.allocator.free(tmp_path_z);
+        defer _ = unlink(tmp_path_z.ptr);
+
+        const ret = system(full_cmd.ptr);
+        if (ret != 0) return error.SecretNotFound;
+
+        const fp = std.c.fopen(tmp_path_z.ptr, "r") orelse return error.SecretNotFound;
+        defer _ = std.c.fclose(fp);
+
+        var buf: [64 * 1024]u8 = undefined;
+        const n = std.c.fread(&buf, 1, buf.len, fp);
+        if (n == 0) return error.SecretNotFound;
+
+        // Trim the trailing newline the CLIs append
+        var out = buf[0..n];
+        while (out.len > 0 and (out[out.len - 1] == '\n' or out[out.len - 1] == '\r')) {
+            out = out[0 .. out.len - 1];
+        }
+        if (out.len == 0) return error.SecretNotFound;
+        return try self.allocator.dupe(u8, out);
+    }
+
+    /// AWS Secrets Manager via the aws CLI (same access path the SES
+    /// delivery backend uses). Requires the instance role / configured
+    /// credentials the CLI normally picks up.
+    fn fetchFromAws(self: *SecretManager, name: []const u8) ![]u8 {
+        const config = self.aws_config orelse return error.BackendNotConfigured;
+        if (!isSafeSecretName(name)) return error.SecretNotFound;
+        if (!isSafeSecretName(config.region)) return error.BackendNotConfigured;
+
+        const cmd = try std.fmt.allocPrint(
+            self.allocator,
+            "aws secretsmanager get-secret-value --region {s} --secret-id '{s}' --query SecretString --output text",
+            .{ config.region, name },
+        );
+        defer self.allocator.free(cmd);
+
+        return self.runCliCapture(cmd);
+    }
+
+    /// Azure Key Vault via the az CLI (managed identity or `az login`
+    /// credentials).
     fn fetchFromAzure(self: *SecretManager, name: []const u8) ![]u8 {
         const config = self.azure_config orelse return error.BackendNotConfigured;
-        _ = config;
-        _ = name;
+        if (!isSafeSecretName(name)) return error.SecretNotFound;
 
-        // In a full implementation, this would:
-        // 1. Get access token (managed identity or service principal)
-        // 2. Call GET {vault_url}/secrets/{name}?api-version=7.4
-        // 3. Parse JSON response
-        // 4. Return the value
+        // vault_url is "https://<name>.vault.azure.net"; az wants the vault
+        // name. Extract the first label of the host.
+        const host_start = if (std.mem.indexOf(u8, config.vault_url, "://")) |p| p + 3 else 0;
+        const host = config.vault_url[host_start..];
+        const vault_name = host[0 .. std.mem.indexOfScalar(u8, host, '.') orelse host.len];
+        if (!isSafeSecretName(vault_name)) return error.BackendNotConfigured;
 
-        return error.NotImplemented;
+        const cmd = try std.fmt.allocPrint(
+            self.allocator,
+            "az keyvault secret show --vault-name '{s}' --name '{s}' --query value --output tsv",
+            .{ vault_name, name },
+        );
+        defer self.allocator.free(cmd);
+
+        return self.runCliCapture(cmd);
     }
 
     fn fetchFromFile(self: *SecretManager, name: []const u8) ![]u8 {

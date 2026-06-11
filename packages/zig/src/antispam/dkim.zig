@@ -129,6 +129,36 @@ pub const DKIMValidator = struct {
     }
 
     /// Validate DKIM signature in email headers
+    pub const DKIMCheck = struct {
+        result: DKIMResult,
+        /// The signature's d= domain (caller-owned, null when no signature
+        /// was present/parseable).
+        domain: ?[]u8,
+    };
+
+    /// validate() plus the signature's d= domain. DMARC alignment needs the
+    /// REAL signing domain — passing the header-From domain instead silently
+    /// turns the DKIM alignment check into a tautology.
+    pub fn validateWithDomain(self: *DKIMValidator, headers: []const u8, body: []const u8) !DKIMCheck {
+        const sig_header = self.extractDKIMSignature(headers) orelse {
+            return .{ .result = .neutral, .domain = null };
+        };
+
+        var signature = DKIMSignature.parse(self.allocator, sig_header) catch {
+            return .{ .result = .permerror, .domain = null };
+        };
+        defer signature.deinit();
+
+        const domain_copy: ?[]u8 = if (signature.domain.len > 0)
+            self.allocator.dupe(u8, signature.domain) catch null
+        else
+            null;
+        errdefer if (domain_copy) |d| self.allocator.free(d);
+
+        const result = try self.validate(headers, body);
+        return .{ .result = result, .domain = domain_copy };
+    }
+
     pub fn validate(self: *DKIMValidator, headers: []const u8, body: []const u8) !DKIMResult {
         // Extract DKIM-Signature header
         const sig_header = self.extractDKIMSignature(headers) orelse {

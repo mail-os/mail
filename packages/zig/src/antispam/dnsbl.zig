@@ -1,5 +1,6 @@
 const std = @import("std");
 const dns_cache = @import("dns_cache.zig");
+const spf = @import("spf.zig");
 
 /// DNSBL checker for spam prevention
 pub const DnsblChecker = struct {
@@ -24,17 +25,65 @@ pub const DnsblChecker = struct {
     /// Check if an IP address is listed in any DNSBL
     /// Returns true if the IP is blacklisted
     pub fn isBlacklisted(self: *DnsblChecker, ip_addr: []const u8) !bool {
-        // Parse IP address into octets
-        const octets = parseIpv4(ip_addr) orelse return false;
+        // IPv4: reversed-octet queries
+        if (parseIpv4(ip_addr)) |octets| {
+            for (self.blacklists) |blacklist| {
+                if (try self.checkBlacklist(octets, blacklist)) {
+                    return true;
+                }
+            }
+            return false;
+        }
 
-        // Check each blacklist
-        for (self.blacklists) |blacklist| {
-            if (try self.checkBlacklist(octets, blacklist)) {
-                return true;
+        // IPv6: nibble-reversed queries (RFC 5782 §2.4)
+        if (spf.parseIp6(ip_addr)) |bytes| {
+            for (self.blacklists) |blacklist| {
+                if (try self.checkBlacklist6(bytes, blacklist)) {
+                    return true;
+                }
             }
         }
 
         return false;
+    }
+
+    /// Check a single blacklist for an IPv6 address: each of the 32 nibbles
+    /// reversed and dot-separated, e.g. 2001:db8::1 ->
+    /// 1.0.0.0....8.b.d.0.1.0.0.2.<blacklist>
+    fn checkBlacklist6(self: *DnsblChecker, bytes: [16]u8, blacklist: []const u8) !bool {
+        var query: std.ArrayList(u8) = .empty;
+        defer query.deinit(self.allocator);
+
+        const hex = "0123456789abcdef";
+        var i: usize = 16;
+        while (i > 0) {
+            i -= 1;
+            try query.append(self.allocator, hex[bytes[i] & 0x0f]);
+            try query.append(self.allocator, '.');
+            try query.append(self.allocator, hex[bytes[i] >> 4]);
+            try query.append(self.allocator, '.');
+        }
+        try query.appendSlice(self.allocator, blacklist);
+
+        var key_buf: [384]u8 = undefined;
+        const cache_key: ?[]const u8 = std.fmt.bufPrint(&key_buf, "dnsbl:{s}", .{query.items}) catch null;
+        if (cache_key) |key| {
+            switch (dns_cache.get(self.allocator, key)) {
+                .hit => |v| {
+                    defer self.allocator.free(v);
+                    return v.len == 1 and v[0] == '1';
+                },
+                .negative, .miss => {},
+            }
+        }
+
+        const result = self.lookupDns(query.items) catch return false;
+
+        if (cache_key) |key| {
+            dns_cache.put(key, if (result) "1" else "0", if (result) dns_cache.positive_ttl else dns_cache.negative_ttl);
+        }
+
+        return result;
     }
 
     fn parseIpv4(ip: []const u8) ?[4]u8 {
