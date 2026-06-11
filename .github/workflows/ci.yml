@@ -65,6 +65,16 @@ jobs:
     - name: Setup Pantry
       uses: home-lang/pantry/packages/action@main
 
+    - name: Setup Bun
+      uses: oven-sh/setup-bun@v2
+
+    # The Docker context is packages/zig only and webmail_dist is gitignored,
+    # so render the webmail bundle on the runner first; the image build then
+    # embeds the pre-rendered dist (no bun inside the image).
+    - name: Build webmail bundle
+      working-directory: packages/webmail
+      run: bun run build
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 

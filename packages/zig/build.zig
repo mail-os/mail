@@ -58,9 +58,10 @@ pub fn build(b: *std.Build) void {
     // Build the webmail frontend (renders pages -> src/api/webmail_dist/*) before
     // compiling, so the @embedFile'd assets in webmail_http.zig are always fresh.
     // Best-effort, for real this time: when bun or the webmail package is
-    // unavailable (Docker builds only ship packages/zig; library consumers
-    // may not have bun), the committed dist is used instead of failing the
-    // whole build on an unspawnable command.
+    // unavailable (the Docker context only ships packages/zig), skip the step
+    // and embed an existing pre-rendered webmail_dist instead of failing the
+    // whole build on an unspawnable command. webmail_dist is gitignored, so
+    // whoever invokes such a build must pre-render it (the Docker CI job does).
     const have_bun = blk: {
         _ = b.findProgram(&.{"bun"}, &.{}) catch break :blk false;
         break :blk true;
