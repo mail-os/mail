@@ -28,7 +28,7 @@ pub const Dir = struct {
         _ = flags;
         const path_z = toZ(sub_path) orelse return error.SystemResources;
         defer freeZ(path_z, sub_path.len);
-        const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
         if (fd < 0) return error.FileNotFound;
         return .{ .handle = fd };
     }

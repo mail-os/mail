@@ -129,10 +129,20 @@ pub const WebmailHttpServer = struct {
 
         logger.info("Webmail HTTP server listening on {s}:{d}", .{ self.config.bind_host, self.config.port });
 
-        // Best-effort prune of expired sessions on startup.
+        // Best-effort prune of expired sessions on startup, then
+        // periodically from the accept loop (expired rows otherwise
+        // accumulated in the DB until the next restart).
         self.sessions.sweep();
+        var last_sweep = time_compat.timestamp();
+        const sweep_interval_seconds: i64 = 600;
 
         while (self.running.load(.monotonic)) {
+            const now = time_compat.timestamp();
+            if (now - last_sweep >= sweep_interval_seconds) {
+                last_sweep = now;
+                self.sessions.sweep();
+            }
+
             const connection = self.listener.?.accept() catch |err| {
                 if (!self.running.load(.monotonic)) break;
                 if (err == error.OperationCancelled or err == error.WouldBlock) {

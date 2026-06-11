@@ -26,6 +26,36 @@ pub const Pop3Config = struct {
     delete_on_quit: bool = true, // Delete messages marked for deletion
 };
 
+/// In-process registry of locked maildrops (RFC 1939 §3: the maildrop must
+/// be held exclusively from PASS to QUIT). The maildir is only served by
+/// this one process, so an in-process set is sufficient. Usernames are
+/// copied into the set with the libc allocator and freed on release.
+var maildrop_locks_mutex: mutex_compat.Mutex = .{};
+var maildrop_locks: ?std.StringHashMap(void) = null;
+
+fn acquireMaildropLock(username: []const u8) bool {
+    maildrop_locks_mutex.lock();
+    defer maildrop_locks_mutex.unlock();
+    if (maildrop_locks == null) maildrop_locks = std.StringHashMap(void).init(std.heap.c_allocator);
+    var locks = &maildrop_locks.?;
+    if (locks.contains(username)) return false;
+    const key = std.heap.c_allocator.dupe(u8, username) catch return false;
+    locks.put(key, {}) catch {
+        std.heap.c_allocator.free(key);
+        return false;
+    };
+    return true;
+}
+
+fn releaseMaildropLock(username: []const u8) void {
+    maildrop_locks_mutex.lock();
+    defer maildrop_locks_mutex.unlock();
+    if (maildrop_locks == null) return;
+    if (maildrop_locks.?.fetchRemove(username)) |removed| {
+        std.heap.c_allocator.free(removed.key);
+    }
+}
+
 /// POP3 connection state
 pub const Pop3State = enum {
     authorization,
@@ -70,6 +100,10 @@ pub const Pop3Session = struct {
     }
 
     pub fn deinit(self: *Pop3Session) void {
+        // Release the maildrop lock even when the session dies without a
+        // clean QUIT (dropped connection) — a leaked lock would block the
+        // user's POP3 access until restart.
+        self.unlockMaildrop();
         if (self.username) |username| {
             self.allocator.free(username);
         }
@@ -183,6 +217,12 @@ pub const Pop3Session = struct {
 
         // Lock maildrop and load messages
         self.lockMaildrop() catch |err| {
+            if (err == error.MaildropLocked) {
+                // RFC 1939 §3: the maildrop must be locked by exactly one
+                // session; tell the second client it's busy.
+                try self.sendErr("[IN-USE] maildrop already locked by another session");
+                return;
+            }
             std.log.err("POP3 failed to open maildrop: {}", .{err});
             try self.sendErr("Unable to open maildrop");
             return;
@@ -511,17 +551,22 @@ pub const Pop3Session = struct {
         }
     }
 
-    /// Lock the maildrop and load messages
+    /// Lock the maildrop and load messages. Fails with error.MaildropLocked
+    /// if another session holds the lock — without it, two concurrent
+    /// sessions for the same user could RETR/DELE files the other already
+    /// unlinked at QUIT.
     fn lockMaildrop(self: *Pop3Session) !void {
-        // NOTE: There is no cross-process maildrop lock yet; concurrent POP3
-        // sessions for the same user are uncommon and DELE only unlinks files
-        // that still exist. A real exclusive lock would go here.
+        const username = self.username orelse return error.NotAuthenticated;
+        if (!acquireMaildropLock(username)) return error.MaildropLocked;
+        errdefer releaseMaildropLock(username);
         try self.loadMessages();
         self.maildrop_locked = true;
     }
 
     /// Unlock the maildrop
     fn unlockMaildrop(self: *Pop3Session) void {
+        if (!self.maildrop_locked) return;
+        if (self.username) |username| releaseMaildropLock(username);
         self.maildrop_locked = false;
     }
 

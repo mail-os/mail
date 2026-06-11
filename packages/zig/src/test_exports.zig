@@ -28,3 +28,5 @@ pub const fs_compat = @import("core/fs_compat.zig");
 pub const bounce = @import("delivery/bounce.zig");
 pub const queue = @import("delivery/queue.zig");
 pub const dns_cache = @import("antispam/dns_cache.zig");
+pub const autoresponder = @import("features/autoresponder.zig");
+pub const csrf = @import("auth/csrf.zig");

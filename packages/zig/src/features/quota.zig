@@ -2,6 +2,7 @@ const std = @import("std");
 const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const database = @import("../storage/database.zig");
+const fs_compat = @import("../core/fs_compat.zig");
 
 /// User quota management
 /// Tracks storage usage and enforces limits per user
@@ -44,12 +45,12 @@ pub const QuotaManager = struct {
             \\UPDATE users SET quota_limit = ?1 WHERE email = ?2
         ;
 
-        var stmt = try self.db.db.?.prepare(query);
-        defer stmt.deinit();
+        var stmt = try self.db.prepare(query);
+        defer stmt.finalize();
 
-        try stmt.bind(0, limit_bytes);
-        try stmt.bind(1, email);
-        try stmt.exec();
+        try stmt.bind(1, limit_bytes);
+        try stmt.bind(2, email);
+        _ = try stmt.step();
 
         // Invalidate cache
         if (self.quota_cache.get(email)) |_| {
@@ -78,10 +79,10 @@ pub const QuotaManager = struct {
             \\SELECT quota_limit, quota_used FROM users WHERE email = ?1
         ;
 
-        var stmt = try self.db.db.?.prepare(query);
-        defer stmt.deinit();
+        var stmt = try self.db.prepare(query);
+        defer stmt.finalize();
 
-        try stmt.bind(0, email);
+        try stmt.bind(1, email);
 
         if (try stmt.step()) {
             const quota_limit = stmt.columnInt64(0);
@@ -124,12 +125,12 @@ pub const QuotaManager = struct {
             \\UPDATE users SET quota_used = quota_used + ?1 WHERE email = ?2
         ;
 
-        var stmt = try self.db.db.?.prepare(query);
-        defer stmt.deinit();
+        var stmt = try self.db.prepare(query);
+        defer stmt.finalize();
 
-        try stmt.bind(0, @as(i64, @intCast(bytes)));
-        try stmt.bind(1, email);
-        try stmt.exec();
+        try stmt.bind(1, @as(i64, @intCast(bytes)));
+        try stmt.bind(2, email);
+        _ = try stmt.step();
 
         // Invalidate cache
         if (self.quota_cache.get(email)) |_| {
@@ -149,12 +150,12 @@ pub const QuotaManager = struct {
             \\UPDATE users SET quota_used = MAX(0, quota_used - ?1) WHERE email = ?2
         ;
 
-        var stmt = try self.db.db.?.prepare(query);
-        defer stmt.deinit();
+        var stmt = try self.db.prepare(query);
+        defer stmt.finalize();
 
-        try stmt.bind(0, @as(i64, @intCast(bytes)));
-        try stmt.bind(1, email);
-        try stmt.exec();
+        try stmt.bind(1, @as(i64, @intCast(bytes)));
+        try stmt.bind(2, email);
+        _ = try stmt.step();
 
         // Invalidate cache
         if (self.quota_cache.get(email)) |_| {
@@ -165,31 +166,49 @@ pub const QuotaManager = struct {
         }
     }
 
-    /// Recalculate quota usage by scanning storage
+    /// Recalculate quota usage by scanning storage. Sums the on-disk size
+    /// of every message in the user's maildir (new/ + cur/) and resyncs the
+    /// stored counter — the recovery path for when transactional
+    /// addUsage/removeUsage tracking drifts (manual deletions, crashes).
+    /// The old implementation was a stub that reset quota_used to 0.
     pub fn recalculateQuota(self: *QuotaManager, email: []const u8, maildir_path: []const u8) !usize {
-        _ = self;
-        _ = maildir_path;
+        var total_bytes: usize = 0;
+        const subdirs = [_][]const u8{ "new", "cur" };
+        for (subdirs) |sub| {
+            const dir_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ maildir_path, sub });
+            defer self.allocator.free(dir_path);
 
-        // This would scan the user's maildir and calculate total size
-        // For now, return 0 as a placeholder
-        // Real implementation would:
-        // 1. Open maildir directory
-        // 2. Iterate through all message files
-        // 3. Sum up file sizes
-        // 4. Update database
+            const files = fs_compat.listEmlFiles(self.allocator, dir_path) catch continue;
+            defer {
+                for (files) |f| self.allocator.free(f);
+                self.allocator.free(files);
+            }
 
-        const total_bytes: usize = 0;
+            for (files) |f| {
+                const full_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, f });
+                defer self.allocator.free(full_path);
+                total_bytes += fs_compat.getFileSize(full_path) catch 0;
+            }
+        }
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
         const update_query =
             \\UPDATE users SET quota_used = ?1 WHERE email = ?2
         ;
 
-        var stmt = try self.db.db.?.prepare(update_query);
-        defer stmt.deinit();
+        var stmt = try self.db.prepare(update_query);
+        defer stmt.finalize();
 
-        try stmt.bind(0, @as(i64, @intCast(total_bytes)));
-        try stmt.bind(1, email);
-        try stmt.exec();
+        try stmt.bind(1, @as(i64, @intCast(total_bytes)));
+        try stmt.bind(2, email);
+        _ = try stmt.step();
+
+        // Invalidate the cached entry so the next read sees the fresh value
+        if (self.quota_cache.fetchRemove(email)) |removed| {
+            self.allocator.free(removed.key);
+        }
 
         return total_bytes;
     }
@@ -224,8 +243,8 @@ pub const QuotaManager = struct {
             \\WHERE quota_limit > 0 AND quota_used > quota_limit
         ;
 
-        var stmt = try self.db.db.?.prepare(query);
-        defer stmt.deinit();
+        var stmt = try self.db.prepare(query);
+        defer stmt.finalize();
 
         var users = std.ArrayList([]const u8).init(self.allocator);
         errdefer {

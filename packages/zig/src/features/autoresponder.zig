@@ -79,54 +79,85 @@ pub const AutoResponderRule = struct {
 
         // Check response limit
         if (self.response_limit) |limit| {
-            const gop = try self.sent_responses.getOrPut(try self.allocator.dupe(u8, from_email));
-            if (!gop.found_existing) {
-                gop.value_ptr.* = ResponseRecord{
-                    .count = 0,
-                    .last_sent = 0,
-                };
-            }
-
-            if (gop.value_ptr.count >= limit) {
-                return false;
+            if (self.sent_responses.get(from_email)) |rec| {
+                if (rec.count >= limit) return false;
             }
         }
 
         return true;
     }
 
+    /// Sender records older than this are pruned — a vacation reply per
+    /// sender per week matches common MTA behavior, and without expiry the
+    /// map grew one entry per unique sender for the rule's lifetime.
+    const response_record_ttl_seconds: i64 = 7 * 24 * 3600;
+    const max_tracked_senders = 10_000;
+
     /// Record that a response was sent
     pub fn recordResponse(self: *AutoResponderRule, from_email: []const u8) !void {
-        const gop = try self.sent_responses.getOrPut(try self.allocator.dupe(u8, from_email));
-        if (!gop.found_existing) {
-            gop.value_ptr.* = ResponseRecord{
-                .count = 0,
-                .last_sent = 0,
-            };
+        const now = time_compat.timestamp();
+
+        if (self.sent_responses.count() >= max_tracked_senders) {
+            self.pruneExpired(now);
         }
 
-        gop.value_ptr.count += 1;
-        gop.value_ptr.last_sent = time_compat.timestamp();
+        if (self.sent_responses.getPtr(from_email)) |rec| {
+            rec.count += 1;
+            rec.last_sent = now;
+            return;
+        }
+
+        // (The old getOrPut(dupe(...)) leaked one key copy per repeat sender.)
+        const key = try self.allocator.dupe(u8, from_email);
+        errdefer self.allocator.free(key);
+        try self.sent_responses.put(key, ResponseRecord{
+            .count = 1,
+            .last_sent = now,
+        });
+    }
+
+    /// Drop sender records whose last response is older than the TTL.
+    fn pruneExpired(self: *AutoResponderRule, now: i64) void {
+        var stale: std.ArrayList([]const u8) = .empty;
+        defer stale.deinit(self.allocator);
+
+        var it = self.sent_responses.iterator();
+        while (it.next()) |entry| {
+            if (now - entry.value_ptr.last_sent > response_record_ttl_seconds) {
+                stale.append(self.allocator, entry.key_ptr.*) catch break;
+            }
+        }
+        for (stale.items) |key| {
+            if (self.sent_responses.fetchRemove(key)) |removed| {
+                self.allocator.free(removed.key);
+            }
+        }
     }
 
     /// Generate auto-response message
     pub fn generateResponse(self: *AutoResponderRule, from_email: []const u8) ![]const u8 {
-        var response = std.ArrayList(u8).init(self.allocator);
-        defer response.deinit();
+        var response: std.ArrayList(u8) = .empty;
+        defer response.deinit(self.allocator);
 
         // Email headers
-        try std.fmt.format(response.writer(), "From: {s}\r\n", .{self.email});
-        try std.fmt.format(response.writer(), "To: {s}\r\n", .{from_email});
-        try std.fmt.format(response.writer(), "Subject: {s}\r\n", .{self.subject});
-        try response.appendSlice("Auto-Submitted: auto-replied\r\n"); // RFC 3834
-        try response.appendSlice("Precedence: bulk\r\n");
-        try response.appendSlice("Content-Type: text/plain; charset=UTF-8\r\n");
-        try response.appendSlice("\r\n");
+        try self.appendf(&response, "From: {s}\r\n", .{self.email});
+        try self.appendf(&response, "To: {s}\r\n", .{from_email});
+        try self.appendf(&response, "Subject: {s}\r\n", .{self.subject});
+        try response.appendSlice(self.allocator, "Auto-Submitted: auto-replied\r\n"); // RFC 3834
+        try response.appendSlice(self.allocator, "Precedence: bulk\r\n");
+        try response.appendSlice(self.allocator, "Content-Type: text/plain; charset=UTF-8\r\n");
+        try response.appendSlice(self.allocator, "\r\n");
 
         // Message body
-        try response.appendSlice(self.message);
+        try response.appendSlice(self.allocator, self.message);
 
-        return try response.toOwnedSlice();
+        return try response.toOwnedSlice(self.allocator);
+    }
+
+    fn appendf(self: *AutoResponderRule, list: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {
+        const s = try std.fmt.allocPrint(self.allocator, fmt, args);
+        defer self.allocator.free(s);
+        try list.appendSlice(self.allocator, s);
     }
 
     /// Reset response counters (useful for testing or manual reset)
@@ -153,7 +184,7 @@ pub const AutoResponderManager = struct {
     pub fn init(allocator: std.mem.Allocator) AutoResponderManager {
         return .{
             .allocator = allocator,
-            .rules = std.ArrayList(*AutoResponderRule).init(allocator),
+            .rules = .empty,
             .mutex = .{},
         };
     }
@@ -166,7 +197,7 @@ pub const AutoResponderManager = struct {
             rule.deinit();
             self.allocator.destroy(rule);
         }
-        self.rules.deinit();
+        self.rules.deinit(self.allocator);
     }
 
     /// Add an auto-responder rule
@@ -174,7 +205,7 @@ pub const AutoResponderManager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        try self.rules.append(rule);
+        try self.rules.append(self.allocator, rule);
     }
 
     /// Remove an auto-responder rule by email
@@ -222,8 +253,6 @@ pub const AutoResponderManager = struct {
 
     /// Check if sender should be skipped (to prevent auto-response loops)
     fn shouldSkipSender(self: *AutoResponderManager, email: []const u8) bool {
-        _ = self;
-
         // Skip common automated senders
         const skip_patterns = [_][]const u8{
             "noreply@",
