@@ -6,8 +6,7 @@
 //! const smtp = @import("root.zig");
 //!
 //! // Access modules
-//! var logger = smtp.log.Logger.init(.{});
-//! const map = try smtp.presized_maps.MapFactory.createHeaderMap(allocator);
+//! var logger = try smtp.logger.Logger.init(allocator, .info, null);
 //! ```
 
 const std = @import("std");
@@ -25,23 +24,11 @@ pub const config_profiles = @import("core/config_profiles.zig");
 /// Command-line argument parsing
 pub const args = @import("core/args.zig");
 
-/// Centralized structured logging (replaces std.debug.print)
-pub const log = @import("core/log.zig");
-
-/// Existing logger for compatibility
+/// Structured logging (text/JSON, global instance)
 pub const logger = @import("core/logger.zig");
 
 /// Error handling utilities with categories and metrics
 pub const error_handler = @import("core/error_handler.zig");
-
-/// Memory management (RAII patterns, pools, arenas)
-pub const memory = @import("core/memory.zig");
-
-/// Pre-sized hash maps for headers, recipients, sessions
-pub const presized_maps = @import("core/presized_maps.zig");
-
-/// Zero-copy optimizations for hot paths
-pub const zero_copy = @import("core/zero_copy.zig");
 
 /// Buffer and protocol constants
 pub const constants = @import("core/constants.zig");
@@ -179,8 +166,6 @@ pub const multi_region = @import("infrastructure/multi_region.zig");
 /// Service dependency graph
 pub const dependency_graph = @import("infrastructure/dependency_graph.zig");
 
-/// io_uring integration (Linux)
-pub const io_uring = @import("infrastructure/io_uring.zig");
 
 /// Vectored I/O
 pub const vectored_io = @import("infrastructure/vectored_io.zig");
@@ -285,58 +270,9 @@ pub const SmtpError = error{
 // Convenience Functions
 // =============================================================================
 
-/// Initialize the logging system with default configuration
-pub fn initLogging(level: log.Level) void {
-    log.initGlobal(.{
-        .level = level,
-        .format = .text,
-        .colors = true,
-    });
-}
-
-/// Initialize logging for production (JSON format)
-pub fn initProductionLogging() void {
-    log.initGlobal(.{
-        .level = .info,
-        .format = .json,
-        .colors = false,
-        .timestamps = true,
-    });
-}
-
-/// Create a scoped logger for a component
-pub fn scopedLog(comptime component: []const u8) type {
-    return log.scoped(component);
-}
-
-/// Create a pre-sized header map
-pub fn createHeaderMap(allocator: Allocator) !presized_maps.HeaderMap {
-    return presized_maps.HeaderMap.init(allocator);
-}
-
-/// Create a pre-sized recipient set
-pub fn createRecipientSet(allocator: Allocator) !presized_maps.RecipientSet {
-    return presized_maps.RecipientSet.init(allocator);
-}
-
-/// Create a scoped allocator (arena)
-pub fn createScopedAllocator(backing: Allocator) memory.ScopedAllocator {
-    return memory.ScopedAllocator.init(backing);
-}
-
 /// Create an error handler
 pub fn createErrorHandler(allocator: Allocator) !error_handler.ErrorHandler {
     return error_handler.ErrorHandler.init(allocator, .{});
-}
-
-/// Parse a buffer without allocation using zero-copy
-pub fn parseSmtpCommand(input: []const u8) zero_copy.Parser.SmtpCommand {
-    return zero_copy.Parser.parseSmtpCommand(input);
-}
-
-/// Parse email address without allocation
-pub fn parseEmailAddress(input: []const u8) zero_copy.Parser.EmailAddress {
-    return zero_copy.Parser.parseEmailAddress(input);
 }
 
 // =============================================================================
