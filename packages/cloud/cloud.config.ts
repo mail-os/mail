@@ -337,6 +337,18 @@ echo "Public IP: \$PUBLIC_IP"
 echo "Domain: \$MAIL_HOSTNAME"
 echo "Hosted Zone: \$HOSTED_ZONE_ID"
 
+# Resolve our own mail hostname over loopback. Co-located services (the mail
+# server's own webmail/health checks, and any app sharing the box that wants to
+# submit mail) otherwise have to reach \$MAIL_HOSTNAME via the public IP — which
+# fails on providers that don't hairpin NAT a host back to itself. Clients must
+# connect by NAME, not 127.0.0.1, for TLS to verify (the cert CN is
+# \$MAIL_HOSTNAME), so this entry makes the name resolve locally while keeping
+# the certificate valid. Idempotent.
+if ! grep -qE "^127\\.0\\.0\\.1[[:space:]]+\$MAIL_HOSTNAME(\$|[[:space:]])" /etc/hosts; then
+  echo "127.0.0.1 \$MAIL_HOSTNAME" >> /etc/hosts
+  echo "Added loopback /etc/hosts entry for \$MAIL_HOSTNAME"
+fi
+
 # Set up TLS certificates
 echo "Setting up TLS certificates..."
 if [ -n "\$DOMAIN_NAME" ] && [ "\$DOMAIN_NAME" != "mail.example.com" ]; then
