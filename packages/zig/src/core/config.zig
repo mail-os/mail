@@ -47,6 +47,10 @@ pub const Config = struct {
     rate_limit_cleanup_interval: u64,
     max_recipients: usize,
     hostname: []const u8,
+    /// Comma-separated list of additional domains this server delivers locally,
+    /// beyond `hostname` and its parent domain. Lets one mail server host
+    /// mailboxes for multiple domains (e.g. "example.org, another.com").
+    extra_local_domains: ?[]const u8 = null,
     webhook_url: ?[]const u8,
     webhook_enabled: bool,
     enable_dnsbl: bool,
@@ -93,10 +97,30 @@ pub const Config = struct {
     delivery_method: DeliveryMethod = .ses,
     ses_region: []const u8 = "us-east-1",
 
+    /// Whether `domain` is delivered locally by this server. True for the
+    /// configured hostname, its parent domain (mail.X -> X), and any entry in
+    /// `extra_local_domains`. Case-insensitive.
+    pub fn isLocalDomain(self: Config, domain: []const u8) bool {
+        if (domain.len == 0) return false;
+        if (std.ascii.eqlIgnoreCase(domain, self.hostname)) return true;
+        if (std.mem.indexOf(u8, self.hostname, ".")) |dot_pos| {
+            if (std.ascii.eqlIgnoreCase(domain, self.hostname[dot_pos + 1 ..])) return true;
+        }
+        if (self.extra_local_domains) |list| {
+            var it = std.mem.splitScalar(u8, list, ',');
+            while (it.next()) |raw| {
+                const d = std.mem.trim(u8, raw, " \t");
+                if (d.len > 0 and std.ascii.eqlIgnoreCase(domain, d)) return true;
+            }
+        }
+        return false;
+    }
+
     pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
         allocator.free(self.tracing_service_name);
         allocator.free(self.host);
         allocator.free(self.hostname);
+        if (self.extra_local_domains) |v| allocator.free(v);
         if (self.tls_cert_path) |path| allocator.free(path);
         if (self.tls_key_path) |path| allocator.free(path);
         if (self.webhook_url) |url| allocator.free(url);
@@ -364,6 +388,12 @@ fn applyEnvironmentVariables(allocator: std.mem.Allocator, cfg: *Config) !void {
         cfg.hostname = try allocator.dupe(u8, value);
     }
 
+    // SMTP_LOCAL_DOMAINS — comma-separated additional local-delivery domains
+    if (env.get("SMTP_LOCAL_DOMAINS")) |value| {
+        if (cfg.extra_local_domains) |old| allocator.free(old);
+        cfg.extra_local_domains = try allocator.dupe(u8, value);
+    }
+
     // SMTP_MAX_CONNECTIONS
     if (env.get("SMTP_MAX_CONNECTIONS")) |value| {
         cfg.max_connections = std.fmt.parseInt(usize, value, 10) catch cfg.max_connections;
@@ -610,6 +640,10 @@ fn applyConfigFile(allocator: std.mem.Allocator, cfg: *Config, path: []const u8)
         if (server.getString("hostname")) |value| {
             allocator.free(cfg.hostname);
             cfg.hostname = try allocator.dupe(u8, value);
+        }
+        if (server.getString("local_domains")) |value| {
+            if (cfg.extra_local_domains) |old| allocator.free(old);
+            cfg.extra_local_domains = try allocator.dupe(u8, value);
         }
         if (server.getInt("max_connections")) |value| {
             cfg.max_connections = @intCast(value);
