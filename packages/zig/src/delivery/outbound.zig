@@ -6,15 +6,43 @@ const dkim_sign = @import("../antispam/dkim_sign.zig");
 const spf = @import("../antispam/spf.zig");
 const dns_cache = @import("../antispam/dns_cache.zig");
 
-/// Process-wide outbound DKIM signer (set once at startup via configureDkim).
-/// When set, every message handed to deliverToRemote is RSA-SHA256 signed.
-var g_dkim: ?dkim_sign.Signer = null;
+/// Process-wide outbound DKIM signers, selected per-message by the envelope
+/// sender's domain so each hosted domain signs with its own key (for DMARC
+/// alignment). Built once at startup (before delivery workers spawn) via
+/// configureDkim; read-only afterward, so no locking is needed. The first
+/// registered signer is the primary fallback for domains without their own key
+/// (preserving the legacy single-domain behaviour).
+const max_dkim_signers = 32;
+var g_dkim_signers: [max_dkim_signers]dkim_sign.Signer = undefined;
+var g_dkim_count: usize = 0;
 
-/// Enable outbound DKIM signing. `domain`/`selector` must outlive the process
-/// (pass env-backed slices). `pem` is a PKCS#1 RSA private key; it is parsed and
-/// not retained. Returns an error if the key can't be parsed.
+/// Register an outbound DKIM signer for `domain`. `domain`/`selector` must
+/// outlive the process (pass env-backed slices). `pem` is a PKCS#1 RSA private
+/// key; it is parsed and not retained. A duplicate domain or a full table is
+/// silently ignored. Returns an error only if the key can't be parsed.
 pub fn configureDkim(domain: []const u8, selector: []const u8, pem: []const u8) !void {
-    g_dkim = try dkim_sign.Signer.initFromPem(domain, selector, pem);
+    if (g_dkim_count >= max_dkim_signers) return;
+    if (dkimSignerFor(domain) != null) return;
+    g_dkim_signers[g_dkim_count] = try dkim_sign.Signer.initFromPem(domain, selector, pem);
+    g_dkim_count += 1;
+}
+
+/// Find the signer registered for `domain` (case-insensitive), if any.
+fn dkimSignerFor(domain: []const u8) ?*dkim_sign.Signer {
+    var i: usize = 0;
+    while (i < g_dkim_count) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(g_dkim_signers[i].domain, domain)) return &g_dkim_signers[i];
+    }
+    return null;
+}
+
+/// Pick the DKIM signer for an envelope sender: the domain's own signer if it
+/// has one, else the primary (first-registered) signer, else none.
+fn selectDkimSigner(from: []const u8) ?*dkim_sign.Signer {
+    const from_domain: []const u8 = if (std.mem.indexOfScalar(u8, from, '@')) |at| from[at + 1 ..] else "";
+    if (dkimSignerFor(from_domain)) |s| return s;
+    if (g_dkim_count > 0) return &g_dkim_signers[0];
+    return null;
 }
 
 /// Reject email addresses that contain CR, LF, control characters, double
@@ -108,11 +136,12 @@ pub fn deliverToRemote(
         return error.InvalidAddress;
     }
 
-    // DKIM-sign if configured (best-effort: never block delivery on a sign error).
+    // DKIM-sign with the sender domain's key if configured (best-effort: never
+    // block delivery on a sign error).
     var signed: ?[]u8 = null;
     defer if (signed) |s| allocator.free(s);
     var msg = message_data;
-    if (g_dkim) |*signer| {
+    if (selectDkimSigner(from)) |signer| {
         if (signer.buildHeader(allocator, message_data, time_compat.timestamp())) |hdr| {
             defer allocator.free(hdr);
             if (std.mem.concat(allocator, u8, &.{ hdr, message_data })) |combined| {

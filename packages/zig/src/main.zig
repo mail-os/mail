@@ -325,6 +325,30 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         } else |err| log.err("DKIM key read failed ({s}): {s}", .{ kp, @errorName(err) });
     };
 
+    // Additional per-domain DKIM keys for other hosted domains, so each signs
+    // with its own d= for DMARC alignment. DKIM_EXTRA_KEYS is a comma-separated
+    // list of "domain:selector:/path/to/key.pem" entries (PEM PKCS#1). The env
+    // value lives for the process, so its sub-slices can back the signers.
+    if (env.get("DKIM_EXTRA_KEYS")) |spec| {
+        var it = std.mem.splitScalar(u8, spec, ',');
+        while (it.next()) |entry_raw| {
+            const entry = std.mem.trim(u8, entry_raw, " \t");
+            if (entry.len == 0) continue;
+            const c1 = std.mem.indexOfScalar(u8, entry, ':') orelse continue;
+            const rest = entry[c1 + 1 ..];
+            const c2 = std.mem.indexOfScalar(u8, rest, ':') orelse continue;
+            const dd = entry[0..c1];
+            const ds = rest[0..c2];
+            const kp = rest[c2 + 1 ..];
+            if (fs_compat.readFileAlloc(allocator, kp)) |pem| {
+                defer allocator.free(pem);
+                if (outbound.configureDkim(dd, ds, pem)) {
+                    log.info("Outbound DKIM signing enabled (d={s} s={s})", .{ dd, ds });
+                } else |err| log.err("DKIM extra key parse failed (d={s}): {s}", .{ dd, @errorName(err) });
+            } else |err| log.err("DKIM extra key read failed ({s}): {s}", .{ kp, @errorName(err) });
+        }
+    }
+
     // Initialize Sieve filtering
     var sieve_manager: ?sieve.SieveScriptManager = null;
     if (cfg.enable_sieve) {
