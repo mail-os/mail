@@ -267,11 +267,29 @@ pub const AuthBackend = struct {
         self.verify_cache.deinit();
     }
 
+    /// Resolve a login or recipient address to the canonical mailbox key (the
+    /// `username` a maildir is stored under). A full address that is itself a
+    /// registered username (a per-domain isolated mailbox, e.g.
+    /// `info@example.com`) resolves to itself, so `info@a.com` and `info@b.com`
+    /// are distinct accounts. Otherwise it falls back to the local-part, which
+    /// keeps the legacy single-namespace behaviour and lets a user log in with
+    /// either `chris` or `chris@any-hosted-domain`. Caller owns the result.
+    pub fn canonicalUsername(self: *AuthBackend, address: []const u8, allocator: std.mem.Allocator) ![]const u8 {
+        if (std.mem.indexOf(u8, address, "@")) |at_pos| {
+            if (self.db.userExists(address) catch false)
+                return allocator.dupe(u8, address);
+            return allocator.dupe(u8, address[0..at_pos]);
+        }
+        return allocator.dupe(u8, address);
+    }
+
     pub fn verifyCredentials(self: *AuthBackend, username: []const u8, password: []const u8) !bool {
-        // Normalize username - if it's an email address (contains @), extract the local part
-        // This allows users to login with either "chris" or "chris@11ly.org"
+        // Normalize username to the canonical mailbox key — a registered full
+        // address (per-domain isolated mailbox) authenticates as itself; any
+        // other "user@domain" falls back to the local-part. See canonicalUsername.
         const normalized_username = blk: {
             if (std.mem.indexOf(u8, username, "@")) |at_pos| {
+                if (self.db.userExists(username) catch false) break :blk username;
                 break :blk username[0..at_pos];
             }
             break :blk username;

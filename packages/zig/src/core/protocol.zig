@@ -1562,14 +1562,25 @@ pub const Session = struct {
                 true;
 
             if (is_local) {
-                // Local delivery: save to Maildir. Role mailboxes
-                // (postmaster@, abuse@, tlsrpt@, ...) resolve through the
-                // aliases file to a real user.
+                // Local delivery: save to Maildir.
+                //
+                // Per-domain isolated mailbox: if the full recipient address is
+                // itself a registered user (e.g. info@a.com), deliver to
+                // mail/{full-address}/ so info@a.com and info@b.com stay distinct
+                // — matching the canonical maildir key IMAP authenticates against.
+                //
+                // Otherwise fall back to the local-part resolved through the
+                // aliases file (postmaster@, abuse@, tlsrpt@, ... → a real user),
+                // the legacy single-namespace path.
                 const raw_local = if (std.mem.indexOf(u8, rcpt, "@")) |at_pos|
                     rcpt[0..at_pos]
                 else
                     rcpt;
-                const username = aliases.resolve(raw_local);
+                const is_isolated = if (self.auth_backend) |ab|
+                    (ab.db.userExists(rcpt) catch false)
+                else
+                    false;
+                const username = if (is_isolated) rcpt else aliases.resolve(raw_local);
 
                 const new_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{username});
                 defer self.allocator.free(new_dir);

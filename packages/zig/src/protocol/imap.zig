@@ -1076,10 +1076,7 @@ pub const ImapSession = struct {
         const uid_keys = self.mailbox_uid_keys orelse files;
 
         const full_username = self.username orelse return;
-        const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
-            full_username[0..at_pos]
-        else
-            full_username;
+        const username = full_username;
 
         const mailbox = self.mailbox_name orelse "INBOX";
 
@@ -1216,10 +1213,7 @@ pub const ImapSession = struct {
     fn currentMailboxEntryCount(self: *ImapSession) usize {
         if (self.mailbox_is_virtual) {
             const full_username = self.username orelse return 0;
-            const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
-                full_username[0..at_pos]
-            else
-                full_username;
+            const username = full_username;
 
             var root_buf: [512]u8 = undefined;
             const root = std.fmt.bufPrintZ(&root_buf, "mail/{s}", .{username}) catch return 0;
@@ -1244,10 +1238,7 @@ pub const ImapSession = struct {
         if (self.mailbox_name) |mname| {
             if (std.ascii.eqlIgnoreCase(mname, "INBOX")) {
                 const full_username = self.username orelse return 0;
-                const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
-                    full_username[0..at_pos]
-                else
-                    full_username;
+                const username = full_username;
                 var new_buf: [512]u8 = undefined;
                 var cur_buf: [512]u8 = undefined;
                 const new_dir = std.fmt.bufPrint(&new_buf, "mail/{s}/new", .{username}) catch return 0;
@@ -1282,10 +1273,7 @@ pub const ImapSession = struct {
                 _ = std.c.close(fd);
                 return null;
             };
-            const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
-                full_username[0..at_pos]
-            else
-                full_username;
+            const username = full_username;
 
             var root_buf: [512]u8 = undefined;
             const root = std.fmt.bufPrintZ(&root_buf, "mail/{s}", .{username}) catch {
@@ -1310,10 +1298,7 @@ pub const ImapSession = struct {
                 _ = std.c.close(fd);
                 return null;
             };
-            const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
-                full_username[0..at_pos]
-            else
-                full_username;
+            const username = full_username;
             var new_buf: [512]u8 = undefined;
             var cur_buf: [512]u8 = undefined;
             if (std.fmt.bufPrintZ(&new_buf, "mail/{s}/new", .{username})) |p| {
@@ -1419,10 +1404,7 @@ pub const ImapSession = struct {
 
         if (self.mailbox_is_virtual) {
             const full_username = self.username orelse return false;
-            const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
-                full_username[0..at_pos]
-            else
-                full_username;
+            const username = full_username;
 
             self.freeSelectedMessageLists();
             try self.loadAggregateMailboxFiles(username);
@@ -1450,10 +1432,7 @@ pub const ImapSession = struct {
         if (self.mailbox_name) |mname| {
             if (std.ascii.eqlIgnoreCase(mname, "INBOX")) {
                 const full_username = self.username orelse return false;
-                const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
-                    full_username[0..at_pos]
-                else
-                    full_username;
+                const username = full_username;
                 self.freeSelectedMessageLists();
                 try self.loadInboxFiles(username);
                 self.syncUids() catch {};
@@ -1548,10 +1527,7 @@ pub const ImapSession = struct {
         }
 
         // Extract local part from email address (chris@stacksjs.com -> chris)
-        const local_part = if (std.mem.indexOfScalar(u8, username, '@')) |at_pos|
-            username[0..at_pos]
-        else
-            username;
+        const local_part = username;
 
         // Determine folder directory
         const folder_dir = if (std.ascii.eqlIgnoreCase(mailbox, "INBOX"))
@@ -1669,10 +1645,7 @@ pub const ImapSession = struct {
 
     fn countMailboxStats(self: *ImapSession, mailbox_name: []const u8) MailboxStats {
         const username = self.username orelse return .{};
-        const local_part = if (std.mem.indexOfScalar(u8, username, '@')) |at_pos|
-            username[0..at_pos]
-        else
-            username;
+        const local_part = username;
 
         const clean_name = stripQuotes(mailbox_name);
 
@@ -1897,7 +1870,7 @@ pub const ImapSession = struct {
 
         // Scan user-created folders on disk
         if (self.username) |uname| {
-            const local = if (std.mem.indexOfScalar(u8, uname, '@')) |at| uname[0..at] else uname;
+            const local = uname;
             const mail_dir = std.fmt.allocPrint(self.allocator, "mail/{s}", .{local}) catch null;
             if (mail_dir) |md| {
                 defer self.allocator.free(md);
@@ -1999,10 +1972,7 @@ pub const ImapSession = struct {
         var uidnext: i64 = @as(i64, @intCast(stats.messages)) + 1;
         if (self.db) |db| {
             if (self.username) |full_username| {
-                const local_part = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
-                    full_username[0..at_pos]
-                else
-                    full_username;
+                const local_part = full_username;
                 if (db.getOrCreateMailbox(local_part, canonical_mailbox)) |info| {
                     uidvalidity = info.uidvalidity;
                     if (db.getUidNext(local_part, canonical_mailbox)) |next| {
@@ -2071,8 +2041,10 @@ pub const ImapSession = struct {
             return;
         }
 
-        // Store username
-        self.username = try self.allocator.dupe(u8, username);
+        // Store the canonical mailbox key (a registered full address stays a
+        // full address — a per-domain isolated mailbox; otherwise the local-part,
+        // keeping legacy single-namespace behaviour). The maildir is keyed by this.
+        self.username = try self.auth_backend.canonicalUsername(username, self.allocator);
         self.state = .authenticated;
 
         std.log.info("Successful IMAP login for user: {s}", .{username});
@@ -2166,7 +2138,7 @@ pub const ImapSession = struct {
             return;
         }
 
-        self.username = self.allocator.dupe(u8, credentials.username) catch {
+        self.username = self.auth_backend.canonicalUsername(credentials.username, self.allocator) catch {
             try self.sendResponse(tag, "NO", "Internal error");
             return;
         };
@@ -2190,10 +2162,7 @@ pub const ImapSession = struct {
 
         // Extract local part from email address (chris@stacksjs.com -> chris)
         // SMTP delivers to mail/{local_part}/new/ so IMAP must use the same path
-        const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
-            full_username[0..at_pos]
-        else
-            full_username;
+        const username = full_username;
 
         // Free previous mailbox state
         self.freeMailboxFiles();
@@ -2704,10 +2673,7 @@ pub const ImapSession = struct {
     /// span folders and therefore search the whole account).
     fn searchIdentity(self: *ImapSession) ?SearchIdentity {
         const full_username = self.username orelse return null;
-        const username = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
-            full_username[0..at_pos]
-        else
-            full_username;
+        const username = full_username;
         if (self.mailbox_is_virtual) return .{ .username = username, .mailbox = null };
         return .{ .username = username, .mailbox = self.mailbox_name orelse "INBOX" };
     }
@@ -2985,10 +2951,7 @@ pub const ImapSession = struct {
             return;
         };
 
-        const local_part = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
-            full_username[0..at_pos]
-        else
-            full_username;
+        const local_part = full_username;
 
         const dest_name = stripQuotes(dest_mailbox);
 
@@ -3069,10 +3032,7 @@ pub const ImapSession = struct {
             return;
         };
 
-        const local_part = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
-            full_username[0..at_pos]
-        else
-            full_username;
+        const local_part = full_username;
 
         const dest_name = stripQuotes(dest_mailbox);
 
@@ -3178,10 +3138,7 @@ pub const ImapSession = struct {
             try self.sendResponse(tag, "NO", "Not authenticated");
             return;
         };
-        const local_part = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
-            full_username[0..at_pos]
-        else
-            full_username;
+        const local_part = full_username;
 
         const name = stripQuotes(mailbox_name);
 
@@ -3247,10 +3204,7 @@ pub const ImapSession = struct {
             try self.sendResponse(tag, "NO", "Not authenticated");
             return;
         };
-        const local_part = if (std.mem.indexOfScalar(u8, full_username, '@')) |at_pos|
-            full_username[0..at_pos]
-        else
-            full_username;
+        const local_part = full_username;
 
         const old = stripQuotes(old_name);
         const new = stripQuotes(new_name);
@@ -3718,7 +3672,7 @@ pub const ImapSession = struct {
                     try self.sendResponse(tag, "NO", "Invalid mailbox name");
                 } else {
                     if (self.username) |uname| {
-                        const local = if (std.mem.indexOfScalar(u8, uname, '@')) |at| uname[0..at] else uname;
+                        const local = uname;
                         const dir = std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local, create_name }) catch null;
                         if (dir) |d| {
                             fs_compat.cwd().makePath(d) catch {};
