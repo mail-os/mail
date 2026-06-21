@@ -508,6 +508,72 @@ SMTP_GREETING_TIMEOUT_SECONDS=10
 
 ---
 
+### Multi-Domain Hosting
+
+One mail server instance can host mailboxes for several unrelated domains, each
+fully isolated. See **[MULTI_DOMAIN_HOSTING.md](MULTI_DOMAIN_HOSTING.md)** for the
+complete guide.
+
+#### SMTP_LOCAL_DOMAINS
+- **Description:** Additional domains the server accepts and delivers **locally**
+  (instead of relaying outbound). The server's own hostname/parent domain is
+  always local; list every *other* hosted domain here.
+- **Type:** String (comma-separated)
+- **Default:** *(empty)*
+- **Examples:**
+  ```bash
+  SMTP_LOCAL_DOMAINS=example.com
+  SMTP_LOCAL_DOMAINS=example.com,another-domain.org
+  ```
+
+**Isolated mailboxes:** a user whose `username` is a **full email address** (e.g.
+`info@example.com`) gets its own maildir keyed by the full address
+(`mail/info@example.com/`), so `info@example.com` and `info@other.com` are
+distinct accounts. A user whose `username` is a bare local-part (e.g. `chris`)
+keeps the legacy shared-namespace behaviour (`mail/chris/`, reachable as
+`chris@any-hosted-domain`). The choice is per-user, made at account creation.
+
+---
+
+### Outbound DKIM Signing
+
+Outbound mail is RSA-SHA256 (relaxed/relaxed) DKIM-signed. With multiple hosted
+domains, each signs with its **own** key so the `d=` aligns with the `From:`
+domain and DMARC passes on DKIM (not only SPF).
+
+#### DKIM_DOMAIN / DKIM_SELECTOR / DKIM_PRIVATE_KEY_PATH
+- **Description:** The **primary** DKIM signer. Also the fallback signer for any
+  sender domain that has no dedicated key.
+- **Type:** String / String / Path (PEM, PKCS#1 or PKCS#8 RSA private key)
+- **Publish:** the public key at `<selector>._domainkey.<domain>` TXT as
+  `v=DKIM1; k=rsa; p=<base64 SPKI>`.
+- **Examples:**
+  ```bash
+  DKIM_DOMAIN=example.com
+  DKIM_SELECTOR=mail
+  DKIM_PRIVATE_KEY_PATH=/opt/mail/dkim/mail.private
+  ```
+
+#### DKIM_EXTRA_KEYS
+- **Description:** Additional per-domain DKIM signers for other hosted domains.
+  Each registers a signer selected at send time by the envelope sender's domain.
+- **Type:** String — comma-separated `domain:selector:/path/to/key.pem` entries
+- **Default:** *(empty)*
+- **Examples:**
+  ```bash
+  DKIM_EXTRA_KEYS=example.com:mail:/opt/mail/dkim/example.private
+  DKIM_EXTRA_KEYS=a.com:mail:/opt/mail/dkim/a.private,b.com:s1:/opt/mail/dkim/b.private
+  ```
+
+**Generate a domain key + DNS record:**
+```bash
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /opt/mail/dkim/example.private
+# TXT value for  mail._domainkey.example.com :
+echo "v=DKIM1; k=rsa; p=$(openssl rsa -in /opt/mail/dkim/example.private -pubout -outform DER 2>/dev/null | base64 -w0)"
+```
+
+---
+
 ## Configuration Files
 
 ### systemd Service with Environment File
