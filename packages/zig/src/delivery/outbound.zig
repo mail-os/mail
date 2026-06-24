@@ -5,6 +5,70 @@ const config = @import("../core/config.zig");
 const dkim_sign = @import("../antispam/dkim_sign.zig");
 const spf = @import("../antispam/spf.zig");
 const dns_cache = @import("../antispam/dns_cache.zig");
+const socket_compat = @import("../core/socket_compat.zig");
+const smtp_tls = @import("smtp_tls.zig");
+
+/// SMTP I/O transport: either a plain socket fd or a STARTTLS-upgraded stream.
+/// Lets the linear SMTP conversation run unchanged over both.
+const Transport = union(enum) {
+    plain: std.posix.socket_t,
+    tls: *smtp_tls.Stream,
+
+    fn writeAll(self: Transport, data: []const u8) !void {
+        switch (self) {
+            .plain => |fd| try sendAll(fd, data),
+            .tls => |s| try s.writeAll(data),
+        }
+    }
+
+    fn readChunk(self: Transport, buf: []u8) !usize {
+        switch (self) {
+            .plain => |fd| {
+                const n = std.c.read(fd, buf.ptr, buf.len);
+                if (n <= 0) return error.SocketReadFailed;
+                return @intCast(n);
+            },
+            .tls => |s| {
+                const n = try s.read(buf);
+                if (n == 0) return error.SocketReadFailed;
+                return n;
+            },
+        }
+    }
+};
+
+/// Read a complete (possibly multi-line) SMTP reply over a Transport. The final
+/// line is "code<space>…"; continuation lines are "code-…".
+fn readReply(t: Transport, buf: []u8) !usize {
+    var total: usize = 0;
+    while (total < buf.len) {
+        total += try t.readChunk(buf[total..]);
+        if (total >= 5 and buf[total - 1] == '\n' and buf[total - 2] == '\r') {
+            var last_line_start: usize = 0;
+            if (total > 2) {
+                var j: usize = total - 3;
+                while (j > 0) : (j -= 1) {
+                    if (buf[j] == '\n') {
+                        last_line_start = j + 1;
+                        break;
+                    }
+                }
+            }
+            if (last_line_start + 3 < total and buf[last_line_start + 3] == ' ') return total;
+        }
+    }
+    return total;
+}
+
+/// Case-insensitive substring search (for spotting "STARTTLS" in an EHLO reply).
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
 
 /// Process-wide outbound DKIM signers, selected per-message by the envelope
 /// sender's domain so each hosted domain signs with its own key (for DMARC
@@ -171,12 +235,12 @@ fn deliverDirect(
     const at_pos = std.mem.indexOf(u8, to, "@") orelse return error.InvalidRecipient;
     const domain = to[at_pos + 1 ..];
 
-    // Look up MX records using dig
+    // Look up MX records
     const mx_host = try lookupMx(allocator, domain);
     defer allocator.free(mx_host);
 
-    // The MX hostname is used inside a shell command (and getaddrinfo); reject
-    // anything outside the DNS hostname character set to prevent injection.
+    // The MX hostname is used inside getaddrinfo / SNI; reject anything outside
+    // the DNS hostname character set to prevent injection.
     if (!isSafeHostname(mx_host)) {
         std.log.err("Refusing delivery: unsafe MX hostname", .{});
         return error.MxResolutionFailed;
@@ -194,7 +258,34 @@ fn deliverDirect(
         raw_message = owned_message.?;
     }
 
-    // Connect to MX server on port 25
+    // Prefer STARTTLS. Receivers (notably Gmail) penalize cleartext SMTP, so we
+    // upgrade the connection whenever the MX advertises STARTTLS. If the TLS
+    // handshake itself fails after we've committed to STARTTLS, the connection
+    // can't be reused for cleartext — reconnect once and deliver unencrypted
+    // rather than drop the message (opportunistic-TLS semantics).
+    deliverOnce(allocator, from, to, raw_message, our_hostname, mx_host, true) catch |err| {
+        if (err == error.TlsHandshakeFallback) {
+            std.log.warn("STARTTLS to {s} failed; retrying delivery in cleartext", .{mx_host});
+            return deliverOnce(allocator, from, to, raw_message, our_hostname, mx_host, false);
+        }
+        return err;
+    };
+}
+
+/// One delivery attempt to `mx_host` on port 25. When `attempt_tls` is set and
+/// the server advertises STARTTLS, the connection is upgraded before MAIL FROM.
+/// Returns error.TlsHandshakeFallback when STARTTLS was negotiated (server said
+/// 220) but the TLS handshake failed, so the caller can retry in cleartext on a
+/// fresh connection.
+fn deliverOnce(
+    allocator: std.mem.Allocator,
+    from: []const u8,
+    to: []const u8,
+    raw_message: []const u8,
+    our_hostname: []const u8,
+    mx_host: []const u8,
+    attempt_tls: bool,
+) !void {
     const mx_host_z = try allocator.dupeZ(u8, mx_host);
     defer allocator.free(mx_host_z);
 
@@ -232,73 +323,73 @@ fn deliverDirect(
 
     // SMTP conversation
     var recv_buf: [4096]u8 = undefined;
+    var transport: Transport = .{ .plain = sock };
+    var tls_stream: smtp_tls.Stream = undefined;
+    var used_tls = false;
 
     // Read greeting (220)
-    const greeting_len = readResponse(sock, &recv_buf) catch {
-        return error.SmtpGreetingFailed;
-    };
+    const greeting_len = readReply(transport, &recv_buf) catch return error.SmtpGreetingFailed;
     if (greeting_len < 3 or !std.mem.startsWith(u8, recv_buf[0..greeting_len], "220")) {
         std.log.err("MX server {s} greeting not 220: {s}", .{ mx_host, recv_buf[0..@min(greeting_len, 100)] });
         return error.SmtpGreetingFailed;
     }
 
-    // Send EHLO
-    const ehlo_cmd = try std.fmt.allocPrint(allocator, "EHLO {s}\r\n", .{our_hostname});
-    defer allocator.free(ehlo_cmd);
-    try sendAll(sock, ehlo_cmd);
+    // EHLO (cleartext) — note whether STARTTLS is on offer.
+    const ehlo_len = try ehlo(allocator, transport, our_hostname, &recv_buf);
+    const starttls_offered = containsIgnoreCase(recv_buf[0..ehlo_len], "STARTTLS");
 
-    const ehlo_len = readResponse(sock, &recv_buf) catch {
-        return error.SmtpEhloFailed;
-    };
-    if (ehlo_len < 3 or !std.mem.startsWith(u8, recv_buf[0..ehlo_len], "250")) {
-        // Try HELO fallback
-        const helo_cmd = try std.fmt.allocPrint(allocator, "HELO {s}\r\n", .{our_hostname});
-        defer allocator.free(helo_cmd);
-        try sendAll(sock, helo_cmd);
-
-        const helo_len = readResponse(sock, &recv_buf) catch {
-            return error.SmtpHeloFailed;
-        };
-        if (helo_len < 3 or !std.mem.startsWith(u8, recv_buf[0..helo_len], "250")) {
-            return error.SmtpHeloFailed;
+    // STARTTLS upgrade (RFC 3207).
+    if (attempt_tls and starttls_offered) {
+        try transport.writeAll("STARTTLS\r\n");
+        const st_len = readReply(transport, &recv_buf) catch return error.SmtpStartTlsFailed;
+        if (st_len >= 3 and std.mem.startsWith(u8, recv_buf[0..st_len], "220")) {
+            tls_stream = smtp_tls.clientHandshake(socket_compat.Connection{ .fd = sock }, mx_host) catch {
+                // We already sent STARTTLS; this socket can't fall back to
+                // cleartext. Ask the caller to reconnect plaintext.
+                return error.TlsHandshakeFallback;
+            };
+            transport = .{ .tls = &tls_stream };
+            used_tls = true;
+            // Re-EHLO over the encrypted channel (the prior EHLO is discarded).
+            _ = try ehlo(allocator, transport, our_hostname, &recv_buf);
+        } else {
+            std.log.warn("STARTTLS refused by {s} after advertising it: {s}", .{ mx_host, recv_buf[0..@min(st_len, 100)] });
+            // Continue cleartext on the same connection.
         }
     }
 
     // MAIL FROM
-    const mail_cmd = try std.fmt.allocPrint(allocator, "MAIL FROM:<{s}>\r\n", .{from});
-    defer allocator.free(mail_cmd);
-    try sendAll(sock, mail_cmd);
-
-    const mail_len = readResponse(sock, &recv_buf) catch {
-        return error.SmtpMailFromFailed;
-    };
-    if (mail_len < 3 or !std.mem.startsWith(u8, recv_buf[0..mail_len], "250")) {
-        std.log.err("MAIL FROM rejected by {s}: {s}", .{ mx_host, recv_buf[0..@min(mail_len, 100)] });
-        return error.SmtpMailFromFailed;
+    {
+        const cmd = try std.fmt.allocPrint(allocator, "MAIL FROM:<{s}>\r\n", .{from});
+        defer allocator.free(cmd);
+        try transport.writeAll(cmd);
+        const n = readReply(transport, &recv_buf) catch return error.SmtpMailFromFailed;
+        if (n < 3 or !std.mem.startsWith(u8, recv_buf[0..n], "250")) {
+            std.log.err("MAIL FROM rejected by {s}: {s}", .{ mx_host, recv_buf[0..@min(n, 100)] });
+            return error.SmtpMailFromFailed;
+        }
     }
 
     // RCPT TO
-    const rcpt_cmd = try std.fmt.allocPrint(allocator, "RCPT TO:<{s}>\r\n", .{to});
-    defer allocator.free(rcpt_cmd);
-    try sendAll(sock, rcpt_cmd);
-
-    const rcpt_len = readResponse(sock, &recv_buf) catch {
-        return error.SmtpRcptToFailed;
-    };
-    if (rcpt_len < 3 or !std.mem.startsWith(u8, recv_buf[0..rcpt_len], "250")) {
-        std.log.err("RCPT TO rejected by {s}: {s}", .{ mx_host, recv_buf[0..@min(rcpt_len, 100)] });
-        return error.SmtpRcptToFailed;
+    {
+        const cmd = try std.fmt.allocPrint(allocator, "RCPT TO:<{s}>\r\n", .{to});
+        defer allocator.free(cmd);
+        try transport.writeAll(cmd);
+        const n = readReply(transport, &recv_buf) catch return error.SmtpRcptToFailed;
+        if (n < 3 or !std.mem.startsWith(u8, recv_buf[0..n], "250")) {
+            std.log.err("RCPT TO rejected by {s}: {s}", .{ mx_host, recv_buf[0..@min(n, 100)] });
+            return error.SmtpRcptToFailed;
+        }
     }
 
     // DATA
-    try sendAll(sock, "DATA\r\n");
-
-    const data_len = readResponse(sock, &recv_buf) catch {
-        return error.SmtpDataFailed;
-    };
-    if (data_len < 3 or !std.mem.startsWith(u8, recv_buf[0..data_len], "354")) {
-        std.log.err("DATA rejected by {s}: {s}", .{ mx_host, recv_buf[0..@min(data_len, 100)] });
-        return error.SmtpDataFailed;
+    try transport.writeAll("DATA\r\n");
+    {
+        const n = readReply(transport, &recv_buf) catch return error.SmtpDataFailed;
+        if (n < 3 or !std.mem.startsWith(u8, recv_buf[0..n], "354")) {
+            std.log.err("DATA rejected by {s}: {s}", .{ mx_host, recv_buf[0..@min(n, 100)] });
+            return error.SmtpDataFailed;
+        }
     }
 
     // Normalize line endings to CRLF and re-apply dot-stuffing before sending
@@ -307,28 +398,47 @@ fn deliverDirect(
     const smtp_body = try normalizeForSmtp(allocator, raw_message);
     defer allocator.free(smtp_body);
 
-    // Send message content
-    try sendAll(sock, smtp_body);
+    try transport.writeAll(smtp_body);
 
     // Ensure message ends with \r\n.\r\n (normalizeForSmtp guarantees CRLF
     // line endings, so we only need to add the terminator when missing).
     if (!std.mem.endsWith(u8, smtp_body, "\r\n")) {
-        try sendAll(sock, "\r\n");
+        try transport.writeAll("\r\n");
     }
-    try sendAll(sock, ".\r\n");
+    try transport.writeAll(".\r\n");
 
-    const result_len = readResponse(sock, &recv_buf) catch {
-        return error.SmtpDataFailed;
-    };
-    if (result_len < 3 or !std.mem.startsWith(u8, recv_buf[0..result_len], "250")) {
-        std.log.err("Message rejected by {s}: {s}", .{ mx_host, recv_buf[0..@min(result_len, 100)] });
-        return error.SmtpDeliveryRejected;
+    {
+        const n = readReply(transport, &recv_buf) catch return error.SmtpDataFailed;
+        if (n < 3 or !std.mem.startsWith(u8, recv_buf[0..n], "250")) {
+            std.log.err("Message rejected by {s}: {s}", .{ mx_host, recv_buf[0..@min(n, 100)] });
+            return error.SmtpDeliveryRejected;
+        }
     }
 
     // QUIT (best effort, socket closed by defer)
-    _ = sendAll(sock, "QUIT\r\n") catch {};
+    transport.writeAll("QUIT\r\n") catch {};
 
-    std.log.info("Email delivered to {s} via direct SMTP to {s}", .{ to, mx_host });
+    std.log.info("Email delivered to {s} via direct SMTP to {s} ({s})", .{
+        to, mx_host, if (used_tls) "STARTTLS" else "cleartext",
+    });
+}
+
+/// Send EHLO (with a HELO fallback) and require a 250. Returns the byte length
+/// of the reply left in `recv_buf` so the caller can scan it for capabilities.
+fn ehlo(allocator: std.mem.Allocator, transport: Transport, our_hostname: []const u8, recv_buf: []u8) !usize {
+    const ehlo_cmd = try std.fmt.allocPrint(allocator, "EHLO {s}\r\n", .{our_hostname});
+    defer allocator.free(ehlo_cmd);
+    try transport.writeAll(ehlo_cmd);
+    const ehlo_len = readReply(transport, recv_buf) catch return error.SmtpEhloFailed;
+    if (ehlo_len >= 3 and std.mem.startsWith(u8, recv_buf[0..ehlo_len], "250")) return ehlo_len;
+
+    // HELO fallback for non-ESMTP servers.
+    const helo_cmd = try std.fmt.allocPrint(allocator, "HELO {s}\r\n", .{our_hostname});
+    defer allocator.free(helo_cmd);
+    try transport.writeAll(helo_cmd);
+    const helo_len = readReply(transport, recv_buf) catch return error.SmtpHeloFailed;
+    if (helo_len < 3 or !std.mem.startsWith(u8, recv_buf[0..helo_len], "250")) return error.SmtpHeloFailed;
+    return helo_len;
 }
 
 /// Send all bytes over a socket.
@@ -339,40 +449,6 @@ fn sendAll(sock: std.posix.socket_t, data: []const u8) !void {
         if (n <= 0) return error.SocketWriteFailed;
         sent += @intCast(n);
     }
-}
-
-/// Read a complete SMTP response (handles multi-line responses).
-/// Multi-line responses use "code-text\r\n" for continuation and "code text\r\n" for the final line.
-fn readResponse(sock: std.posix.socket_t, buf: []u8) !usize {
-    var total: usize = 0;
-    while (total < buf.len) {
-        const n = std.c.read(sock, buf[total..].ptr, buf.len - total);
-        if (n <= 0) {
-            if (total > 0) return total;
-            return error.SocketReadFailed;
-        }
-        total += @intCast(n);
-
-        // Check if we have a complete final line ending with \r\n
-        if (total >= 5 and buf[total - 1] == '\n' and buf[total - 2] == '\r') {
-            // Find the start of the last line
-            var last_line_start: usize = 0;
-            if (total > 2) {
-                var j: usize = total - 3;
-                while (j > 0) : (j -= 1) {
-                    if (buf[j] == '\n') {
-                        last_line_start = j + 1;
-                        break;
-                    }
-                }
-            }
-            // Final line has "code space" (not "code dash")
-            if (last_line_start + 3 < total and buf[last_line_start + 3] == ' ') {
-                return total;
-            }
-        }
-    }
-    return total;
 }
 
 /// Look up MX records for a domain using the built-in DNS resolver (in-process
