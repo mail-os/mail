@@ -556,9 +556,19 @@ pub const Session = struct {
 
                 if (line.len == 0) continue;
 
-                // Log the command
-                const san = sanitizeForLog(line);
-                self.logger.info("SMTP CMD: {s}", .{sanitizedSlice(&san, line.len)});
+                // Log the command. On AUTH, redact the credential payload: the
+                // AUTH PLAIN/LOGIN initial-response is base64 that decodes to
+                // the account username+password, so it must never hit the logs.
+                if (line.len >= 4 and std.ascii.eqlIgnoreCase(line[0..4], "AUTH")) {
+                    const search_start = @min(line.len, 5);
+                    const mech_end = std.mem.indexOfScalarPos(u8, line, search_start, ' ') orelse line.len;
+                    const shown = line[0..mech_end];
+                    const san = sanitizeForLog(shown);
+                    self.logger.info("SMTP CMD: {s} <redacted>", .{sanitizedSlice(&san, shown.len)});
+                } else {
+                    const san = sanitizeForLog(line);
+                    self.logger.info("SMTP CMD: {s}", .{sanitizedSlice(&san, line.len)});
+                }
 
                 const should_quit = try self.processCommand(null, line);
                 if (should_quit) break;
