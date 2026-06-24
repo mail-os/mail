@@ -1315,11 +1315,11 @@ pub const Session = struct {
                         try self.sendResponse(writer, 535, "Authentication failed", null);
                     }
                 } else {
-                    // No auth backend configured - fall back to accepting all (development mode)
-                    self.logger.warn("No auth backend configured - accepting all credentials", .{});
-                    self.authenticated = true;
-                    self.state = .Authenticated;
-                    try self.sendResponse(writer, 235, "Authentication successful", null);
+                    // No auth backend configured: fail closed. Granting auth here
+                    // would turn the server into an authenticated open relay if it
+                    // were ever started without a backend.
+                    self.logger.warn("AUTH attempted but no auth backend is configured; rejecting", .{});
+                    try self.sendResponse(writer, 454, "Temporary authentication failure", null);
                 }
             } else {
                 try self.sendResponse(writer, 501, "AUTH PLAIN requires initial-response", null);
@@ -1419,9 +1419,9 @@ pub const Session = struct {
                     try self.sendResponse(writer, 535, "Authentication failed", null);
                 }
             } else {
-                self.authenticated = true;
-                self.state = .Authenticated;
-                try self.sendResponse(writer, 235, "Authentication successful", null);
+                // No auth backend configured: fail closed (see AUTH PLAIN above).
+                self.logger.warn("AUTH LOGIN attempted but no auth backend is configured; rejecting", .{});
+                try self.sendResponse(writer, 454, "Temporary authentication failure", null);
             }
         } else {
             try self.sendResponse(writer, 504, "Unrecognized authentication type", null);
