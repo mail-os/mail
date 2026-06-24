@@ -117,15 +117,32 @@ var msgid_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 /// If the message has no Message-ID header, prepend a synthesized one. The
 /// stored message uses LF line endings (the DATA loop strips CR), so the
 /// inserted header matches.
-fn ensureMessageId(allocator: std.mem.Allocator, message_data: *std.ArrayList(u8), hostname: []const u8) !void {
+fn ensureSubmissionHeaders(allocator: std.mem.Allocator, message_data: *std.ArrayList(u8), hostname: []const u8) !void {
     const items = message_data.items;
     const hdr_end = std.mem.indexOf(u8, items, "\n\n") orelse
         std.mem.indexOf(u8, items, "\r\n\r\n") orelse items.len;
-    if (headerPresent(items[0..hdr_end], "message-id")) return;
-    const seq = msgid_seq.fetchAdd(1, .monotonic);
-    const line = try std.fmt.allocPrint(allocator, "Message-ID: <{d}.{d}@{s}>\n", .{ time_compat.timestamp(), seq, hostname });
-    defer allocator.free(line);
-    try message_data.insertSlice(allocator, 0, line);
+    const headers = items[0..hdr_end];
+    // Capture presence up front; each insert is at offset 0 (prepend), which
+    // doesn't remove existing headers, so these flags stay valid.
+    const has_message_id = headerPresent(headers, "message-id");
+    const has_date = headerPresent(headers, "date");
+
+    if (!has_message_id) {
+        const seq = msgid_seq.fetchAdd(1, .monotonic);
+        const line = try std.fmt.allocPrint(allocator, "Message-ID: <{d}.{d}@{s}>\n", .{ time_compat.timestamp(), seq, hostname });
+        defer allocator.free(line);
+        try message_data.insertSlice(allocator, 0, line);
+    }
+
+    // A missing Date is penalized/rejected by Gmail just like a missing
+    // Message-ID. Synthesize one (RFC 5322, UTC) before DKIM so it's covered.
+    if (!has_date) {
+        const date_val = try time_compat.formatRfc5322Date(allocator, time_compat.timestamp());
+        defer allocator.free(date_val);
+        const line = try std.fmt.allocPrint(allocator, "Date: {s}\n", .{date_val});
+        defer allocator.free(line);
+        try message_data.insertSlice(allocator, 0, line);
+    }
 }
 
 /// True if a header line `<name>:` (case-insensitive) exists in the block.
@@ -942,12 +959,12 @@ pub const Session = struct {
             }
         }
 
-        // Message-ID safety net: a submission without a Message-ID is rejected
-        // by Gmail and others ("missing a valid Message-ID header"). If an
-        // authenticated client omitted one, synthesize it before processing so
-        // the message is well-formed (and DKIM can cover it).
+        // Header safety net: a submission without a Message-ID or Date is
+        // rejected/penalized by Gmail and others. If an authenticated client
+        // omitted either, synthesize it before processing so the message is
+        // well-formed (and DKIM can cover it).
         if (self.authenticated) {
-            ensureMessageId(self.allocator, &message_data, self.config.hostname) catch {};
+            ensureSubmissionHeaders(self.allocator, &message_data, self.config.hostname) catch {};
         }
 
         // === Inbound authentication: SPF/DKIM/DMARC/ARC ===
