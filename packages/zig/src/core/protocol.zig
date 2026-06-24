@@ -126,10 +126,15 @@ fn ensureSubmissionHeaders(allocator: std.mem.Allocator, message_data: *std.Arra
     // doesn't remove existing headers, so these flags stay valid.
     const has_message_id = headerPresent(headers, "message-id");
     const has_date = headerPresent(headers, "date");
+    // The Message-ID domain should match the From domain — using the server
+    // hostname instead is a spam signal (Gmail spam-files on the mismatch).
+    // Dupe it: a subsequent insert may reallocate message_data, dangling `headers`.
+    const from_dom: ?[]u8 = if (fromHeaderDomain(headers)) |fd| try allocator.dupe(u8, fd) else null;
+    defer if (from_dom) |d| allocator.free(d);
 
     if (!has_message_id) {
         const seq = msgid_seq.fetchAdd(1, .monotonic);
-        const line = try std.fmt.allocPrint(allocator, "Message-ID: <{d}.{d}@{s}>\n", .{ time_compat.timestamp(), seq, hostname });
+        const line = try std.fmt.allocPrint(allocator, "Message-ID: <{d}.{d}@{s}>\n", .{ time_compat.timestamp(), seq, from_dom orelse hostname });
         defer allocator.free(line);
         try message_data.insertSlice(allocator, 0, line);
     }
@@ -143,6 +148,35 @@ fn ensureSubmissionHeaders(allocator: std.mem.Allocator, message_data: *std.Arra
         defer allocator.free(line);
         try message_data.insertSlice(allocator, 0, line);
     }
+}
+
+/// Extract the domain from the From header's address: `X <a@b.com>` -> `b.com`,
+/// `a@b.com` -> `b.com`. Returns null when there's no From header or address.
+fn fromHeaderDomain(headers: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, headers, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len > 5 and std.ascii.eqlIgnoreCase(line[0..5], "from:")) {
+            const at = std.mem.lastIndexOfScalar(u8, line, '@') orelse return null;
+            var end = at + 1;
+            while (end < line.len) : (end += 1) {
+                switch (line[end]) {
+                    '>', ' ', '\t', ',', ';', ')', '"' => break,
+                    else => {},
+                }
+            }
+            const dom = line[at + 1 .. end];
+            return if (dom.len > 0) dom else null;
+        }
+    }
+    return null;
+}
+
+test "fromHeaderDomain extracts the From domain" {
+    try std.testing.expectEqualStrings("b.com", fromHeaderDomain("From: Joe <a@b.com>\r\nTo: x@y\r\n").?);
+    try std.testing.expectEqualStrings("b.com", fromHeaderDomain("Subject: hi\nFrom: a@b.com\n").?);
+    try std.testing.expectEqualStrings("sexual-harassment-at-reveal.com", fromHeaderDomain("From: Reveal <info@sexual-harassment-at-reveal.com>\n").?);
+    try std.testing.expect(fromHeaderDomain("To: a@b.com\r\n") == null);
 }
 
 /// True if a header line `<name>:` (case-insensitive) exists in the block.
