@@ -33,7 +33,7 @@ pub const BounceGenerator = struct {
         original_message: ?[]const u8,
     ) ![]const u8 {
         const timestamp = time_compat.timestamp();
-        const date_str = try formatDate(self.allocator, timestamp);
+        const date_str = try time_compat.formatRfc5322Date(self.allocator, timestamp);
         defer self.allocator.free(date_str);
 
         // Unique per-message boundary: a fixed boundary corrupts the MIME
@@ -99,44 +99,6 @@ pub const BounceGenerator = struct {
     }
 };
 
-/// RFC 5322 date in UTC, e.g. "Mon, 01 Jun 2026 10:00:00 +0000".
-/// (Previously returned a hardcoded date, stamping every bounce
-/// "Mon, 1 Jan 2024".)
-fn formatDate(allocator: std.mem.Allocator, ts: i64) ![]const u8 {
-    const days = [_][]const u8{ "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
-    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-    const es: u64 = @intCast(@max(ts, 0));
-    const secs_of_day: u64 = es % 86400;
-    const day_num: u64 = es / 86400; // days since 1970-01-01 (Thursday)
-    const hour = secs_of_day / 3600;
-    const minute = (secs_of_day % 3600) / 60;
-    const second = secs_of_day % 60;
-    const dow = (day_num + 4) % 7; // 1970-01-01 was Thursday(4)
-
-    // Civil-from-days (Howard Hinnant's algorithm).
-    var z: i64 = @intCast(day_num);
-    z += 719468;
-    const era: i64 = @divFloor(if (z >= 0) z else z - 146096, 146097);
-    const doe: u64 = @intCast(z - era * 146097);
-    const yoe: u64 = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    const y: i64 = @as(i64, @intCast(yoe)) + era * 400;
-    const doy: u64 = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    const mp: u64 = (5 * doy + 2) / 153;
-    const d: u64 = doy - (153 * mp + 2) / 5 + 1;
-    const m: u64 = if (mp < 10) mp + 3 else mp - 9;
-    const year: i64 = if (m <= 2) y + 1 else y;
-
-    return std.fmt.allocPrint(allocator, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} +0000", .{
-        days[@intCast(dow)],
-        d,
-        months[m - 1],
-        year,
-        hour,
-        minute,
-        second,
-    });
-}
-
 /// Bounce reasons
 pub const BounceReason = enum {
     user_unknown,
@@ -199,10 +161,10 @@ test "bounce reasons" {
     try testing.expectEqualStrings("5.1.1", BounceReason.user_unknown.statusCode());
 }
 
-test "formatDate produces a real RFC 5322 date" {
+test "bounce date uses shared RFC 5322 formatter" {
     const testing = std.testing;
     // 2026-06-10 12:34:56 UTC
-    const date = try formatDate(testing.allocator, 1781094896);
+    const date = try time_compat.formatRfc5322Date(testing.allocator, 1781094896);
     defer testing.allocator.free(date);
     try testing.expectEqualStrings("Wed, 10 Jun 2026 12:34:56 +0000", date);
 }
