@@ -1016,8 +1016,9 @@ pub const Session = struct {
 
         try self.sendResponse(writer, 250, "OK: Message accepted for delivery", null);
 
-        // Reset state for next message
-        try self.handleRset(writer);
+        // Reset envelope/state for the next message — without a reply (the 250
+        // above is the only response to this transaction).
+        self.resetTransactionState();
     }
 
     /// Run inbound SPF/DKIM/DMARC/ARC on a received message. Inserts an
@@ -1190,8 +1191,9 @@ pub const Session = struct {
                 s.deinit();
                 self.bdat_session = null;
 
-                // Reset state for next message
-                try self.handleRset(writer);
+                // Reset envelope/state for the next message — without a reply
+                // (the 250 above is the only response to this transaction).
+                self.resetTransactionState();
             }
         } else {
             // More chunks expected
@@ -1199,7 +1201,12 @@ pub const Session = struct {
         }
     }
 
-    fn handleRset(self: *Session, writer: anytype) !void {
+    /// Clear the current mail transaction (envelope + any BDAT session) and
+    /// return to the post-greeting state, WITHOUT emitting an SMTP reply. RSET
+    /// adds its own 250; the post-DATA/post-BDAT cleanup must NOT send a reply
+    /// (a second 250 there desyncs strict clients — they read it as the answer
+    /// to their next command, e.g. QUIT).
+    fn resetTransactionState(self: *Session) void {
         if (self.mail_from) |mf| {
             self.allocator.free(mf);
             self.mail_from = null;
@@ -1222,7 +1229,10 @@ pub const Session = struct {
         } else {
             self.state = .Greeted;
         }
+    }
 
+    fn handleRset(self: *Session, writer: anytype) !void {
+        self.resetTransactionState();
         try self.sendResponse(writer, 250, "OK", null);
     }
 
