@@ -200,15 +200,27 @@ pub fn deliverToRemote(
         return error.InvalidAddress;
     }
 
+    // Ensure a From:/To: header block exists BEFORE signing. DMARC requires the
+    // From header to be covered by the DKIM signature; if we synthesized it
+    // afterwards (as deliverDirect/deliverViaSes used to), the From line would
+    // be unsigned and DKIM/DMARC alignment would fail at the receiver.
+    var with_headers: ?[]u8 = null;
+    defer if (with_headers) |m| allocator.free(m);
+    var base = message_data;
+    if (!hasHeader(message_data, "From:")) {
+        with_headers = try std.fmt.allocPrint(allocator, "From: {s}\r\nTo: {s}\r\n{s}", .{ from, to, message_data });
+        base = with_headers.?;
+    }
+
     // DKIM-sign with the sender domain's key if configured (best-effort: never
     // block delivery on a sign error).
     var signed: ?[]u8 = null;
     defer if (signed) |s| allocator.free(s);
-    var msg = message_data;
+    var msg = base;
     if (selectDkimSigner(from)) |signer| {
-        if (signer.buildHeader(allocator, message_data, time_compat.timestamp())) |hdr| {
+        if (signer.buildHeader(allocator, base, time_compat.timestamp())) |hdr| {
             defer allocator.free(hdr);
-            if (std.mem.concat(allocator, u8, &.{ hdr, message_data })) |combined| {
+            if (std.mem.concat(allocator, u8, &.{ hdr, base })) |combined| {
                 signed = combined;
                 msg = combined;
             } else |_| {}
