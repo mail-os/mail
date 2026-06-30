@@ -111,6 +111,7 @@ pub fn build(b: *std.Build) void {
         "src/connection_wrapper_test.zig",
         "src/webmail_session_test.zig",
         "src/uid_consistency_test.zig",
+        "src/antispam/spam_filter.zig",
     };
 
     // RFC compliance tests
