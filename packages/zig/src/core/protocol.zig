@@ -13,6 +13,8 @@ const spf_mod = @import("../antispam/spf.zig");
 const dkim_mod = @import("../antispam/dkim.zig");
 const dmarc_mod = @import("../antispam/dmarc.zig");
 const arc_mod = @import("../antispam/arc.zig");
+const dnsbl_mod = @import("../antispam/dnsbl.zig");
+const spam_filter = @import("../antispam/spam_filter.zig");
 const tls_mod = @import("tls.zig");
 const chunking = @import("../protocol/chunking.zig");
 const tls = @import("tls");
@@ -94,6 +96,80 @@ fn extractFromDomain(headers: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+fn mapSpf(r: spf_mod.SPFResult) spam_filter.Verdict {
+    return switch (r) {
+        .none => .none,
+        .neutral => .neutral,
+        .pass => .pass,
+        .fail => .fail,
+        .softfail => .softfail,
+        .temperror => .temperror,
+        .permerror => .permerror,
+    };
+}
+
+fn mapDkim(r: dkim_mod.DKIMResult) spam_filter.Verdict {
+    return switch (r) {
+        .pass => .pass,
+        .fail => .fail,
+        .neutral => .neutral,
+        .temperror => .temperror,
+        .permerror => .permerror,
+    };
+}
+
+fn mapDmarc(r: dmarc_mod.DMARCResult) spam_filter.Verdict {
+    return switch (r) {
+        .pass => .pass,
+        .fail => .fail,
+        .none => .none,
+        .temperror => .temperror,
+        .permerror => .permerror,
+    };
+}
+
+/// A HELO/EHLO argument that is empty, has no dot, is a bracketed IP literal, or
+/// is a bare dotted IP is not a real FQDN — a common signature of spam bots.
+fn heloNotFqdn(helo: []const u8) bool {
+    if (helo.len == 0) return true;
+    if (std.mem.indexOfScalar(u8, helo, '[') != null) return true; // [1.2.3.4]
+    if (std.mem.indexOfScalar(u8, helo, '.') == null) return true; // single label
+    for (helo) |c| {
+        if (!std.ascii.isDigit(c) and c != '.') return false;
+    }
+    return true; // digits and dots only -> a bare IPv4, not a hostname
+}
+
+/// Best-effort reverse-DNS check: does the connecting IP have a PTR record?
+/// Fails OPEN (returns true) on any resolver error so a transient DNS hiccup
+/// never penalizes legitimate mail. The IP string is turned into a sockaddr via
+/// getaddrinfo(AI_NUMERICHOST) (no DNS), then getnameinfo does the reverse
+/// lookup; with no NI flags it echoes the numeric address when no PTR exists,
+/// which we detect explicitly. (std.net was removed in this Zig, so we go
+/// straight to libc — mirroring antispam/dnsbl.zig.)
+fn hasReverseDns(allocator: std.mem.Allocator, ip: []const u8) bool {
+    const ip_z = allocator.dupeZ(u8, ip) catch return true;
+    defer allocator.free(ip_z);
+
+    var res: ?*std.c.addrinfo = null;
+    const hints = std.mem.zeroInit(std.c.addrinfo, .{
+        .flags = std.c.AI{ .NUMERICHOST = true },
+        .family = std.posix.AF.UNSPEC,
+        .socktype = std.posix.SOCK.STREAM,
+    });
+    const rc1 = std.c.getaddrinfo(ip_z.ptr, null, &hints, &res);
+    defer if (res) |r| std.c.freeaddrinfo(r);
+    if (@intFromEnum(rc1) != 0) return true; // unparseable -> don't penalize
+    const node = res orelse return true;
+    const sa = node.addr orelse return true;
+
+    var host_buf: [256]u8 = undefined;
+    const rc2 = std.c.getnameinfo(sa, node.addrlen, &host_buf, @intCast(host_buf.len), null, 0, .{});
+    if (@intFromEnum(rc2) != 0) return true; // lookup error -> don't penalize
+    const host = std.mem.sliceTo(&host_buf, 0);
+    return !std.mem.eql(u8, host, ip); // numeric echo means no PTR
 }
 
 pub const SMTPCommand = enum {
@@ -461,6 +537,10 @@ pub const Session = struct {
     // Per-command rate limiting
     command_count: u32,
     command_window_start: i64,
+    // Memoized DNSBL verdict for this connection's remote IP (null = not yet
+    // checked). Avoids re-querying blocklists for the early RCPT reject and the
+    // later DATA-time spam score within the same session.
+    dnsbl_hits_cache: ?u8 = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -906,6 +986,18 @@ pub const Session = struct {
             }
         }
 
+        // Hard-reject IPs on a DNS blocklist before accepting the body (saves
+        // bandwidth on botnet floods). Opt-in via SMTP_DNSBL_REJECT; otherwise a
+        // listing only contributes to the post-DATA spam score. The verdict is
+        // memoized so the later score reuses it. Skipped for authenticated users.
+        if (self.config.enable_dnsbl and self.config.dnsbl_reject and !self.authenticated) {
+            if (self.dnsblHits() > 0) {
+                self.logger.logSecurityEvent(self.remote_addr, "Rejected: IP listed on DNS blocklist");
+                try self.sendResponse(writer, 554, "5.7.1 Rejected: your IP is listed on a DNS blocklist", null);
+                return;
+            }
+        }
+
         try self.rcpt_to.append(self.allocator, try self.allocator.dupe(u8, addr));
 
         self.state = .RcptTo;
@@ -1005,16 +1097,37 @@ pub const Session = struct {
         // Only for unauthenticated (inbound) mail — submission clients are
         // already trusted via AUTH. Records an Authentication-Results header
         // and is advisory unless SMTP_ANTISPAM_ENFORCE is set.
+        var to_junk = false;
         if (self.config.antispam_check and !self.authenticated) {
-            if (self.runInboundAntispam(&message_data)) {
+            const auth_res = self.runInboundAntispam(&message_data);
+            if (auth_res.reject_policy) {
                 try self.sendResponse(writer, 550, "5.7.1 Message rejected by mail authentication policy", null);
                 try self.handleRset(writer);
                 return;
             }
+
+            // === Content-based spam scoring ===
+            // Combines the auth verdicts above with DNSBL/reverse-DNS/HELO and
+            // message heuristics. High scores are rejected outright; medium
+            // scores are filed into the Junk mailbox; the rest reach the inbox.
+            if (self.config.spam_filter_enabled) {
+                const report = self.scoreSpam(&message_data, auth_res);
+                switch (report.disposition) {
+                    .reject => {
+                        self.logger.info("Spam rejected from {s} (score {d:.1})", .{ self.remote_addr, report.score });
+                        try self.sendResponse(writer, 550, "5.7.1 Message rejected as spam", null);
+                        try self.handleRset(writer);
+                        return;
+                    },
+                    .junk => to_junk = true,
+                    .accept => {},
+                }
+            }
         }
 
-        // Save the message (in a real implementation, you'd save to disk or database)
-        try self.saveMessage(message_data.items);
+        // Save the message. Spam that scored into the Junk band is delivered to
+        // the recipient's Junk mailbox instead of the inbox.
+        try self.saveMessage(message_data.items, to_junk);
 
         const sender_str: []const u8 = self.mail_from orelse "unknown";
         const safe_sender = sanitizeForLog(sender_str);
@@ -1072,11 +1185,23 @@ pub const Session = struct {
         self.resetTransactionState();
     }
 
+    /// Authentication verdicts for an inbound message, plus whether the
+    /// sender's own DMARC policy asks us to reject it.
+    const InboundAuth = struct {
+        spf: spf_mod.SPFResult = .none,
+        dkim: dkim_mod.DKIMResult = .neutral,
+        dmarc: dmarc_mod.DMARCResult = .none,
+        /// True only when enforcement is on AND DMARC failed AND the From
+        /// domain publishes p=reject.
+        reject_policy: bool = false,
+    };
+
     /// Run inbound SPF/DKIM/DMARC/ARC on a received message. Inserts an
-    /// Authentication-Results header into `message_data` and logs the verdicts.
-    /// Returns true only when the message should be rejected (enforce + DMARC
-    /// fail); otherwise checks are advisory and never block delivery.
-    fn runInboundAntispam(self: *Session, message_data: *std.ArrayList(u8)) bool {
+    /// Authentication-Results header into `message_data`, logs the verdicts, and
+    /// returns them so the spam scorer can reuse them without re-validating.
+    /// `reject_policy` is set only when the message should be rejected on the
+    /// sender's behalf (enforce + DMARC fail + p=reject).
+    fn runInboundAntispam(self: *Session, message_data: *std.ArrayList(u8)) InboundAuth {
         const data = message_data.items;
         const split = std.mem.indexOf(u8, data, "\n\n");
         const headers = if (split) |i| data[0..i] else data;
@@ -1110,22 +1235,6 @@ pub const Session = struct {
 
         self.logger.info("inbound auth ip={s} mailfrom_domain={s} header_from={s}: spf={s} dkim={s} dmarc={s} arc={s}", .{ self.remote_addr, spf_domain, from_domain, spf_res.toString(), dkim_res.toString(), dmarc_res.toString(), arc_res.toString() });
 
-        var ar_buf: [600]u8 = undefined;
-        const ar = std.fmt.bufPrint(&ar_buf, "Authentication-Results: {s}; spf={s} smtp.mailfrom={s}; dkim={s}; dmarc={s} header.from={s}; arc={s}\n", .{ self.config.hostname, spf_res.toString(), spf_domain, dkim_res.toString(), dmarc_res.toString(), from_domain, arc_res.toString() }) catch return false;
-        // Prepend the header by rebuilding the buffer (only append/deinit, which
-        // are the unmanaged-ArrayList APIs used throughout this codebase).
-        var combined: std.ArrayList(u8) = .empty;
-        combined.appendSlice(self.allocator, ar) catch {
-            combined.deinit(self.allocator);
-            return false;
-        };
-        combined.appendSlice(self.allocator, message_data.items) catch {
-            combined.deinit(self.allocator);
-            return false;
-        };
-        message_data.deinit(self.allocator);
-        message_data.* = combined;
-
         // Reject only when enforcement is on, DMARC failed, AND the sender's
         // OWN published policy is p=reject. A domain publishing p=none (or
         // p=quarantine) is not asking us to reject on its behalf, so honoring
@@ -1133,7 +1242,114 @@ pub const Session = struct {
         // SPF/DKIM broke in transit). Quarantine-worthy mail is still
         // delivered with the Authentication-Results header for downstream
         // filtering.
-        return self.config.antispam_enforce and dmarc_res == .fail and dmarc_eval.policy == .reject;
+        const result = InboundAuth{
+            .spf = spf_res,
+            .dkim = dkim_res,
+            .dmarc = dmarc_res,
+            .reject_policy = self.config.antispam_enforce and dmarc_res == .fail and dmarc_eval.policy == .reject,
+        };
+
+        var ar_buf: [600]u8 = undefined;
+        const ar = std.fmt.bufPrint(&ar_buf, "Authentication-Results: {s}; spf={s} smtp.mailfrom={s}; dkim={s}; dmarc={s} header.from={s}; arc={s}\n", .{ self.config.hostname, spf_res.toString(), spf_domain, dkim_res.toString(), dmarc_res.toString(), from_domain, arc_res.toString() }) catch return result;
+        // Prepend the header by rebuilding the buffer (only append/deinit, which
+        // are the unmanaged-ArrayList APIs used throughout this codebase).
+        var combined: std.ArrayList(u8) = .empty;
+        combined.appendSlice(self.allocator, ar) catch {
+            combined.deinit(self.allocator);
+            return result;
+        };
+        combined.appendSlice(self.allocator, message_data.items) catch {
+            combined.deinit(self.allocator);
+            return result;
+        };
+        message_data.deinit(self.allocator);
+        message_data.* = combined;
+
+        return result;
+    }
+
+    /// Look up the connecting IP against DNS blocklists once per session and
+    /// memoize the count. Fails open (returns 0) on any resolver error.
+    fn dnsblHits(self: *Session) u8 {
+        if (self.dnsbl_hits_cache) |c| return c;
+        var checker = dnsbl_mod.DnsblChecker.init(self.allocator, null);
+        const listed = checker.isBlacklisted(self.remote_addr) catch false;
+        const hits: u8 = if (listed) 1 else 0;
+        self.dnsbl_hits_cache = hits;
+        return hits;
+    }
+
+    /// Score an inbound message for spam, reusing the SPF/DKIM/DMARC verdicts
+    /// already computed by runInboundAntispam. Gathers connection-reputation
+    /// signals (DNSBL, reverse DNS, HELO), prepends X-Spam-* headers, logs the
+    /// verdict, and returns the report (disposition: accept / junk / reject).
+    fn scoreSpam(self: *Session, message_data: *std.ArrayList(u8), auth_res: InboundAuth) spam_filter.Report {
+        var signals = spam_filter.Signals{
+            .spf = mapSpf(auth_res.spf),
+            .dkim = mapDkim(auth_res.dkim),
+            .dmarc = mapDmarc(auth_res.dmarc),
+        };
+        if (self.config.enable_dnsbl) {
+            signals.dnsbl_hits = self.dnsblHits();
+        }
+        signals.no_ptr = !hasReverseDns(self.allocator, self.remote_addr);
+
+        const helo = self.client_hostname orelse "";
+        signals.helo_forges_us = helo.len > 0 and std.ascii.eqlIgnoreCase(helo, self.config.hostname);
+        if (!signals.helo_forges_us) signals.helo_not_fqdn = heloNotFqdn(helo);
+
+        // Header/body boundary: CRLF (BDAT/CHUNKING preserves raw \r\n\r\n) or
+        // bare LF (the DATA path normalizes line endings to \n).
+        const data = message_data.items;
+        var headers: []const u8 = data;
+        var body: []const u8 = "";
+        if (std.mem.indexOf(u8, data, "\r\n\r\n")) |i| {
+            headers = data[0..i];
+            body = data[i + 4 ..];
+        } else if (std.mem.indexOf(u8, data, "\n\n")) |i| {
+            headers = data[0..i];
+            body = if (i + 2 <= data.len) data[i + 2 ..] else "";
+        }
+
+        const report = spam_filter.evaluate(signals, headers, body, .{
+            .junk = self.config.spam_junk_threshold,
+            .reject = self.config.spam_reject_threshold,
+        });
+
+        self.logger.info("spam score ip={s} score={d:.1} disposition={s} tests=[{s}]", .{
+            self.remote_addr,
+            report.score,
+            @tagName(report.disposition),
+            report.tests(),
+        });
+
+        // Prepend X-Spam-* headers so clients and downstream filters can act on
+        // the verdict (and so we can debug placement). Best-effort: on OOM we
+        // simply skip the headers and keep the original message.
+        var hdr_buf: [768]u8 = undefined;
+        const flag = if (report.disposition == .accept) "NO" else "YES";
+        const spam_headers = std.fmt.bufPrint(&hdr_buf, "X-Spam-Flag: {s}\nX-Spam-Score: {d:.1}\nX-Spam-Status: {s}, score={d:.1} required={d:.1} tests={s}\n", .{
+            flag,
+            report.score,
+            flag,
+            report.score,
+            self.config.spam_junk_threshold,
+            report.tests(),
+        }) catch return report;
+
+        var combined: std.ArrayList(u8) = .empty;
+        combined.appendSlice(self.allocator, spam_headers) catch {
+            combined.deinit(self.allocator);
+            return report;
+        };
+        combined.appendSlice(self.allocator, message_data.items) catch {
+            combined.deinit(self.allocator);
+            return report;
+        };
+        message_data.deinit(self.allocator);
+        message_data.* = combined;
+
+        return report;
     }
 
     fn handleBDAT(self: *Session, writer: anytype, line: []const u8) !void {
@@ -1198,8 +1414,45 @@ pub const Session = struct {
                 };
                 defer self.allocator.free(message);
 
-                // Save the message
-                self.saveMessage(message) catch |err| {
+                // Run the same inbound auth + spam pipeline as the DATA path so
+                // CHUNKING can't be used to bypass spam filtering. Work on a
+                // mutable copy because the scorer prepends headers.
+                var msg_buf: std.ArrayList(u8) = .empty;
+                defer msg_buf.deinit(self.allocator);
+                var to_junk = false;
+                const have_copy = blk: {
+                    msg_buf.appendSlice(self.allocator, message) catch break :blk false;
+                    break :blk true;
+                };
+                if (have_copy and self.config.antispam_check and !self.authenticated) {
+                    const auth_res = self.runInboundAntispam(&msg_buf);
+                    if (auth_res.reject_policy) {
+                        try self.sendResponse(writer, 550, "5.7.1 Message rejected by mail authentication policy", null);
+                        var s = session.*;
+                        s.deinit();
+                        self.bdat_session = null;
+                        return;
+                    }
+                    if (self.config.spam_filter_enabled) {
+                        const report = self.scoreSpam(&msg_buf, auth_res);
+                        switch (report.disposition) {
+                            .reject => {
+                                self.logger.info("Spam rejected from {s} (score {d:.1})", .{ self.remote_addr, report.score });
+                                try self.sendResponse(writer, 550, "5.7.1 Message rejected as spam", null);
+                                var s = session.*;
+                                s.deinit();
+                                self.bdat_session = null;
+                                return;
+                            },
+                            .junk => to_junk = true,
+                            .accept => {},
+                        }
+                    }
+                }
+
+                // Save the message (the scored copy when available, else raw).
+                const to_save = if (have_copy) msg_buf.items else message;
+                self.saveMessage(to_save, to_junk) catch |err| {
                     try self.sendResponse(writer, 554, "Transaction failed", null);
                     self.logger.err("Failed to save message: {}", .{err});
                     var s = session.*;
@@ -1619,10 +1872,13 @@ pub const Session = struct {
         _ = writer;
     }
 
-    fn saveMessage(self: *Session, data: []const u8) !void {
+    fn saveMessage(self: *Session, data: []const u8, to_junk: bool) !void {
         const cwd = fs_compat.cwd();
         const timestamp = time_compat.milliTimestamp();
         const sender = self.mail_from orelse "unknown";
+        // Spam goes into the recipient's Junk mailbox (a flat Maildir subfolder,
+        // mail/<user>/<Junk>/), everything else into the inbox (mail/<user>/new).
+        const sub = if (to_junk) self.config.junkFolder() else "new";
 
         for (self.rcpt_to.items) |rcpt| {
             // Determine if recipient is local or external
@@ -1653,11 +1909,11 @@ pub const Session = struct {
                     false;
                 const username = if (is_isolated) rcpt else aliases.resolve(raw_local);
 
-                const new_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{username});
+                const new_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ username, sub });
                 defer self.allocator.free(new_dir);
                 cwd.makePath(new_dir) catch {};
 
-                const filename = try std.fmt.allocPrint(self.allocator, "mail/{s}/new/{d}.eml", .{ username, timestamp });
+                const filename = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}/{d}.eml", .{ username, sub, timestamp });
                 defer self.allocator.free(filename);
 
                 const file = cwd.createFile(filename, .{}) catch |err| {
@@ -1673,6 +1929,10 @@ pub const Session = struct {
                 };
 
                 self.logger.debug("Message saved to {s}", .{filename});
+
+                // Spam is not indexed for inbox search and is never auto-forwarded
+                // (forwarding spam would just relay it to the user's other address).
+                if (to_junk) continue;
 
                 // Index for full-text search (best-effort, detached thread)
                 var base_buf: [64]u8 = undefined;
