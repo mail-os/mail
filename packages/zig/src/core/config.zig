@@ -93,6 +93,23 @@ pub const Config = struct {
     // false (default), checks are advisory/log-only and never block mail.
     antispam_enforce: bool = false,
 
+    // Content-based spam scoring. Combines SPF/DKIM/DMARC verdicts, DNSBL
+    // listings, reverse-DNS/HELO sanity and message heuristics into a score.
+    // Mail at/above `spam_junk_threshold` is filed into the Junk mailbox; mail
+    // at/above `spam_reject_threshold` is rejected at SMTP time. Only applied to
+    // unauthenticated inbound mail (our own authenticated users are never
+    // scored). Adds X-Spam-Score / X-Spam-Status / X-Spam-Flag headers.
+    spam_filter_enabled: bool = true,
+    spam_junk_threshold: f32 = 5.0,
+    spam_reject_threshold: f32 = 12.0,
+    // Mailbox subfolder spam is delivered into (Maildir: mail/<user>/<folder>/).
+    // null means the built-in default "Junk" (see junkFolder()).
+    spam_junk_folder: ?[]const u8 = null,
+    // Hard-reject (5xx) inbound mail from IPs on a DNS blocklist instead of just
+    // scoring it toward Junk. Requires enable_dnsbl. Off by default because a
+    // single rare false positive would bounce legitimate mail.
+    dnsbl_reject: bool = false,
+
     // Outbound delivery method: "ses" (AWS SES relay), "direct" (direct MX delivery)
     delivery_method: DeliveryMethod = .ses,
     ses_region: []const u8 = "us-east-1",
@@ -116,6 +133,11 @@ pub const Config = struct {
         return false;
     }
 
+    /// Maildir subfolder that spam is delivered into. Defaults to "Junk".
+    pub fn junkFolder(self: Config) []const u8 {
+        return self.spam_junk_folder orelse "Junk";
+    }
+
     pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
         allocator.free(self.tracing_service_name);
         allocator.free(self.host);
@@ -126,6 +148,7 @@ pub const Config = struct {
         if (self.webhook_url) |url| allocator.free(url);
         if (self.acme_email) |email| allocator.free(email);
         if (self.list_unsubscribe_url) |url| allocator.free(url);
+        if (self.spam_junk_folder) |v| allocator.free(v);
     }
 
     /// Validates the configuration and returns detailed error messages
@@ -346,7 +369,7 @@ fn loadDefaultsFromProfile(allocator: std.mem.Allocator, profile: config_profile
         .hostname = try allocator.dupe(u8, "localhost"),
         .webhook_url = null,
         .webhook_enabled = false, // Only enable when URL is provided via env var
-        .enable_dnsbl = false, // Not in profile config yet
+        .enable_dnsbl = true, // DNSBL feeds the spam score (safe: errors fail open)
         .enable_greylist = profile_config.enable_greylist,
         .enable_tracing = profile_config.enable_tracing,
         .tracing_service_name = try allocator.dupe(u8, "mail"),
@@ -462,6 +485,34 @@ fn applyEnvironmentVariables(allocator: std.mem.Allocator, cfg: *Config) !void {
     // SMTP_ENABLE_GREYLIST
     if (env.get("SMTP_ENABLE_GREYLIST")) |value| {
         cfg.enable_greylist = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+
+    // SMTP_SPAM_FILTER (default true) — content-based spam scoring + Junk foldering
+    if (env.get("SMTP_SPAM_FILTER")) |value| {
+        cfg.spam_filter_enabled = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+
+    // SMTP_SPAM_JUNK_SCORE — score at/above which mail is filed into Junk
+    if (env.get("SMTP_SPAM_JUNK_SCORE")) |value| {
+        cfg.spam_junk_threshold = std.fmt.parseFloat(f32, value) catch cfg.spam_junk_threshold;
+    }
+
+    // SMTP_SPAM_REJECT_SCORE — score at/above which mail is rejected at SMTP time
+    if (env.get("SMTP_SPAM_REJECT_SCORE")) |value| {
+        cfg.spam_reject_threshold = std.fmt.parseFloat(f32, value) catch cfg.spam_reject_threshold;
+    }
+
+    // SMTP_JUNK_FOLDER — Maildir subfolder spam is delivered into
+    if (env.get("SMTP_JUNK_FOLDER")) |value| {
+        if (value.len > 0) {
+            if (cfg.spam_junk_folder) |old| allocator.free(old);
+            cfg.spam_junk_folder = try allocator.dupe(u8, value);
+        }
+    }
+
+    // SMTP_DNSBL_REJECT (default false) — hard-reject DNSBL-listed IPs at RCPT
+    if (env.get("SMTP_DNSBL_REJECT")) |value| {
+        cfg.dnsbl_reject = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
     }
 
     // SMTP_TLS_CERT
@@ -725,6 +776,24 @@ fn applyConfigFile(allocator: std.mem.Allocator, cfg: *Config, path: []const u8)
         }
         if (antispam.getBool("greylist")) |value| {
             cfg.enable_greylist = value;
+        }
+        if (antispam.getBool("spam_filter")) |value| {
+            cfg.spam_filter_enabled = value;
+        }
+        if (antispam.getBool("dnsbl_reject")) |value| {
+            cfg.dnsbl_reject = value;
+        }
+        if (antispam.getInt("junk_score")) |value| {
+            cfg.spam_junk_threshold = @floatFromInt(value);
+        }
+        if (antispam.getInt("reject_score")) |value| {
+            cfg.spam_reject_threshold = @floatFromInt(value);
+        }
+        if (antispam.getString("junk_folder")) |value| {
+            if (value.len > 0) {
+                if (cfg.spam_junk_folder) |old| allocator.free(old);
+                cfg.spam_junk_folder = try allocator.dupe(u8, value);
+            }
         }
     }
 
