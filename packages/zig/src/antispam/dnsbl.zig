@@ -188,11 +188,18 @@ pub const DnsblChecker = struct {
             const sin: *const std.posix.sockaddr.in = @ptrCast(@alignCast(sa));
             // sin.addr is the IPv4 address in network byte order; the first byte
             // of its in-memory representation is the most-significant octet.
-            const first_octet = std.mem.toBytes(sin.addr)[0];
-            if (first_octet == 127) return true;
+            const octets = std.mem.toBytes(sin.addr);
+            if (octets[0] != 127) continue;
+            // 127.255.255.0/24 is reserved by Spamhaus (and others) for ERROR
+            // responses, NOT listings — e.g. 127.255.255.254 (query volume
+            // exceeded) / .253 (public-resolver block) / .252 (typo) / .255
+            // (banned). Treating those as a listing would flag EVERY sender the
+            // moment the resolver gets rate-limited, so they must be ignored.
+            if (octets[1] == 255 and octets[2] == 255) continue;
+            return true;
         }
 
-        // Resolved, but no answer was in 127/8 => not a DNSBL listing.
+        // Resolved, but no answer was a real listing => not blacklisted.
         return false;
     }
 };
