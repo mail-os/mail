@@ -439,21 +439,64 @@ SMTP_GREETING_TIMEOUT_SECONDS=10
 
 ### Spam Prevention
 
-#### SMTP_ENABLE_DNSBL
-- **Description:** Enable DNSBL/RBL spam checking
+#### SMTP_SPAM_FILTER
+- **Description:** Content-based spam scoring for unauthenticated inbound mail.
+  Combines the SPF/DKIM/DMARC verdicts with DNSBL listings, reverse-DNS (PTR)
+  and HELO sanity, and message heuristics (missing/forged headers, shouty or
+  obfuscated subjects, spam phrases, link farms, hidden HTML text, dangerous
+  attachments) into a single score. Authenticated submissions are never scored.
 - **Type:** Boolean
-- **Default:** `false` (performance impact)
-- **Purpose:** Block known spam sources
+- **Default:** `true`
+- **Disposition:**
+  - score `>= SMTP_SPAM_JUNK_SCORE` → delivered to the recipient's **Junk** mailbox
+  - score `>= SMTP_SPAM_REJECT_SCORE` → rejected at SMTP time (`550`)
+  - otherwise → delivered to the inbox
+- **Headers added:** `X-Spam-Flag`, `X-Spam-Score`, `X-Spam-Status` (lists the
+  rules that fired, e.g. `DNSBL_LISTED,SPF_FAIL,NO_PTR`).
+
+#### SMTP_SPAM_JUNK_SCORE / SMTP_SPAM_REJECT_SCORE
+- **Description:** Score thresholds for the Junk and reject bands.
+- **Type:** Float
+- **Defaults:** `5` (junk), `12` (reject)
+- **Tuning:** Lower the junk score to be more aggressive; raise the reject score
+  if you are worried about bouncing misconfigured-but-legitimate senders. A
+  single DNSBL listing scores ~6 (→ Junk, not rejected, on its own).
+
+#### SMTP_JUNK_FOLDER
+- **Description:** Maildir subfolder spam is delivered into (`mail/<user>/<folder>/`).
+- **Type:** String
+- **Default:** `Junk`
+
+#### SMTP_ENABLE_DNSBL
+- **Description:** Enable DNSBL/RBL checking of the connecting IP. When enabled,
+  a listing contributes to the spam score (see `SMTP_SPAM_FILTER`); it only
+  hard-rejects when `SMTP_DNSBL_REJECT=true`.
+- **Type:** Boolean
+- **Default:** `true`
 - **Examples:**
   ```bash
-  SMTP_ENABLE_DNSBL=true   # Enable spam checking
-  SMTP_ENABLE_DNSBL=false  # Disable (faster)
+  SMTP_ENABLE_DNSBL=true   # Check IPs against blocklists (feeds the spam score)
+  SMTP_ENABLE_DNSBL=false  # Disable (slightly faster, weaker filtering)
   ```
 
 **DNSBL Lists Used:**
 - zen.spamhaus.org
 - bl.spamcop.net
+- b.barracudacentral.org
 - dnsbl.sorbs.net
+
+> Spamhaus error/blocked-resolver answers (`127.255.255.0/24`) are ignored, so a
+> rate-limited resolver never falsely flags every sender.
+
+#### SMTP_DNSBL_REJECT
+- **Description:** Hard-reject (`554`) connections from DNSBL-listed IPs at RCPT
+  time, before the message body is sent (saves bandwidth on botnet floods),
+  instead of only scoring the message toward Junk. Requires `SMTP_ENABLE_DNSBL`.
+- **Type:** Boolean
+- **Default:** `false`
+- **Note:** Off by default because a single rare false positive would bounce
+  legitimate mail. Scoring (the default) sends such mail to Junk, which is
+  recoverable.
 
 #### SMTP_ENABLE_GREYLIST
 - **Description:** Enable greylisting for spam prevention
