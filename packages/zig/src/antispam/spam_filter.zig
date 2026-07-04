@@ -111,6 +111,48 @@ const dangerous_exts = [_][]const u8{
     ".js\"",  ".jar\"", ".cpl\"", ".lnk\"", ".iso\"", ".hta\"",
 };
 
+/// Unsolicited SEO / web-design outreach — by volume the dominant spam class
+/// hitting a published contact address. These are solicitation-specific
+/// bigrams (deliberately NOT bare "web"/"seo") so a passing mention in real
+/// mail doesn't score; a genuine pitch stacks several. Individually low-weight
+/// and capped, like `spam_phrases`.
+const seo_phrases = [_][]const u8{
+    "search engine optimization", "seo service",      "seo services",     "seo package",
+    "seo expert",                 "seo company",       "seo agency",       "1st page of google",
+    "first page of google",       "top of google",     "page of google",   "google ranking",
+    "search ranking",             "increase your ranking", "improve your ranking", "rank higher",
+    "higher ranking",             "website traffic",   "organic traffic",  "increase traffic",
+    "website design",             "web design service", "website development", "web development",
+    "web developer",              "website redesign",  "redesign of your", "redesign your website",
+    "revamp your website",        "existing website",  "build your website", "backlink",
+    "link building",              "guest post",        "domain authority", "digital marketing",
+    "lead generation",            "mobile app development", "se0",
+};
+
+/// Contact-harvesting closers: an unsolicited pitch angling to move the
+/// conversation to phone/WhatsApp or asking for a "cost/price list". Strong,
+/// low-false-positive marker of cold outreach.
+const harvest_phrases = [_][]const u8{
+    "whatsapp",          "your mobile number", "share your contact", "share your number",
+    "send me your number", "send your contact", "your contact number", "cost list",
+    "price list",        "your whatsapp",
+};
+
+/// Free / consumer mail providers. A cold B2B SEO pitch almost always ships
+/// from one of these; only ever used as a MULTIPLIER on solicitation content,
+/// never on its own (plenty of real people mail from gmail).
+const free_providers = [_][]const u8{
+    "gmail.com", "googlemail.com", "hotmail.com", "outlook.com", "live.com",
+    "yahoo.com", "ymail.com",      "aol.com",     "msn.com",     "gmx.com",
+};
+
+/// Consumer brands commonly spoofed in the From display-name (phishing).
+/// Kept to distinctive, low-substring-collision names on purpose.
+const spoofed_brands = [_][]const u8{
+    "netflix", "paypal", "amazon", "microsoft", "coinbase",
+    "binance", "fedex",  "norton", "mcafee",    "docusign",
+};
+
 /// Score a message. `headers` is the header block (LF-separated lines, no
 /// trailing body), `body` is everything after the header/body boundary.
 pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresholds: Thresholds) Report {
@@ -194,6 +236,43 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
             score += 1.0;
             tl.add("SUBJ_OBFUSCATED");
         }
+        // Fabricated reply/forward prefix: cold outreach fakes a threaded
+        // subject ("Re: Hi,", "Rw: …", "Fwd: …") to look like an ongoing
+        // conversation, but a genuine reply always carries In-Reply-To /
+        // References. (Base64-encoded subjects are skipped — not worth
+        // decoding here; the plain-prefixed fakes are the common case.)
+        const st = std.mem.trim(u8, s, " \t");
+        if ((startsWithCI(st, "re:") or startsWithCI(st, "rw:") or
+            startsWithCI(st, "fwd:") or startsWithCI(st, "fw:")) and
+            !headerPresent(headers, "In-Reply-To") and
+            !headerPresent(headers, "References"))
+        {
+            score += 3.0;
+            tl.add("FAKE_REPLY");
+        }
+    }
+
+    // Brand spoofing in the From display-name (phishing): the visible name
+    // claims a consumer brand the sending domain has nothing to do with
+    // (e.g. `"Netflix.com" <l1xwv4u9@aqg.io>`). Independent of DMARC — the
+    // display name is never authenticated even when the domain's DMARC passes.
+    if (headerValue(headers, "From")) |from_hdr| {
+        const disp_end = std.mem.indexOfScalar(u8, from_hdr, '<') orelse from_hdr.len;
+        const display = from_hdr[0..disp_end];
+        const from_dom = headerDomain(headers, "From");
+        for (spoofed_brands) |brand| {
+            if (std.ascii.indexOfIgnoreCase(display, brand) != null) {
+                const dom_has_brand = if (from_dom) |fd|
+                    std.ascii.indexOfIgnoreCase(fd, brand) != null
+                else
+                    false;
+                if (!dom_has_brand) {
+                    score += 4.0;
+                    tl.add("BRAND_SPOOF");
+                }
+                break;
+            }
+        }
     }
 
     // From / Reply-To domain mismatch (only when DMARC didn't already pass).
@@ -221,6 +300,52 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
     if (phrase_hits > 0) {
         score += @min(phrase_hits, 3.0);
         tl.add("SPAM_PHRASES");
+    }
+
+    // Unsolicited SEO / web-design solicitation (subject + start of body).
+    var seo_hits: f32 = 0;
+    for (seo_phrases) |phrase| {
+        const in_subject = if (subject) |s| std.ascii.indexOfIgnoreCase(s, phrase) != null else false;
+        if (in_subject or std.ascii.indexOfIgnoreCase(scan_body, phrase) != null) {
+            seo_hits += 1.2;
+        }
+    }
+    if (seo_hits > 0) {
+        // Capped so a legitimate inquiry that happens to use a couple of these
+        // bigrams (a real risk on a web-dev company's inbox) stays under the
+        // Junk line; only a dense pitch (4+ distinct terms) reaches it alone.
+        score += @min(seo_hits, 5.2);
+        tl.add("SEO_SOLICITATION");
+    }
+
+    // Contact-harvesting closer (WhatsApp / "cost list" / "your mobile number").
+    // Near-unambiguous cold-outreach marker — legitimate correspondence rarely
+    // asks an unknown recipient for their WhatsApp or a "cost list".
+    var harvest_hit = false;
+    for (harvest_phrases) |phrase| {
+        if (std.ascii.indexOfIgnoreCase(scan_body, phrase) != null) {
+            harvest_hit = true;
+            break;
+        }
+    }
+    if (harvest_hit) {
+        score += 3.0;
+        tl.add("CONTACT_HARVEST");
+    }
+
+    // A free / consumer-provider sender attached to ANY solicitation content is
+    // the textbook cold-outreach shape. A multiplier only — never scored on its
+    // own, so a normal person mailing from gmail is unaffected.
+    if (seo_hits > 0 or harvest_hit) {
+        if (headerDomain(headers, "From")) |fd| {
+            for (free_providers) |fp| {
+                if (std.ascii.eqlIgnoreCase(fd, fp)) {
+                    score += 2.0;
+                    tl.add("FREEMAIL_OUTREACH");
+                    break;
+                }
+            }
+        }
     }
 
     // Link farm: a wall of URLs is a strong bulk-mail signal.
@@ -341,6 +466,11 @@ fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool
     return false;
 }
 
+fn startsWithCI(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    return std.ascii.eqlIgnoreCase(haystack[0..needle.len], needle);
+}
+
 // =========================== tests ===========================
 
 test "clean authenticated-looking mail scores zero and is accepted" {
@@ -411,4 +541,71 @@ test "headerDomain extracts From domain" {
     const headers = "From: Bob <bob@Example.COM>\n";
     const d = headerDomain(headers, "From").?;
     try std.testing.expectEqualStrings("Example.COM", d);
+}
+
+test "unsolicited SEO pitch from a free provider lands in Junk" {
+    const headers =
+        "From: Rekha <seo.services@outlook.com>\n" ++
+        "Subject: Website Fix\n" ++
+        "Date: Mon, 29 Jun 2026 10:00:00 +0000\n" ++
+        "Message-ID: <1@outlook.com>";
+    const body = "Hello, I am a Web Developer offering website design and website development, " ++
+        "including a complete redesign of your existing website. Please share your mobile number.";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "SEO_SOLICITATION") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "FREEMAIL_OUTREACH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "CONTACT_HARVEST") != null);
+    try std.testing.expectEqual(Disposition.junk, r.disposition);
+}
+
+test "fabricated reply prefix without thread headers is flagged" {
+    const headers =
+        "From: Lucy <lucy@lexxdigital.com>\n" ++
+        "Subject: Re: Hi,\n" ++
+        "Date: Mon, 29 Jun 2026 10:00:00 +0000\n" ++
+        "Message-ID: <1@lexxdigital.com>";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass }, headers, "hi\n", .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "FAKE_REPLY") != null);
+}
+
+test "genuine reply with In-Reply-To is not a fake reply" {
+    const headers =
+        "From: Bob <bob@example.com>\n" ++
+        "Subject: Re: project update\n" ++
+        "In-Reply-To: <prev@example.com>\n" ++
+        "Date: Mon, 29 Jun 2026 10:00:00 +0000\n" ++
+        "Message-ID: <2@example.com>";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, "thanks!\n", .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "FAKE_REPLY") == null);
+}
+
+test "brand name in display with unrelated domain is brand spoofing" {
+    const headers =
+        "From: \"Netflix.com\" <l1xwv4u9@aqg.io>\n" ++
+        "Subject: Membership will be canceled\n" ++
+        "Date: Mon, 29 Jun 2026 10:00:00 +0000\n" ++
+        "Message-ID: <1@aqg.io>";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass }, headers, "update your payment\n", .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_SPOOF") != null);
+}
+
+test "legit brand mail from its own domain is not brand spoofing" {
+    const headers =
+        "From: Netflix <info@mailer.netflix.com>\n" ++
+        "Subject: New shows this week\n" ++
+        "Date: Mon, 29 Jun 2026 10:00:00 +0000\n" ++
+        "Message-ID: <1@netflix.com>";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, "watch now\n", .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_SPOOF") == null);
+}
+
+test "a single website mention from gmail does not junk legit mail" {
+    const headers =
+        "From: Jamie <jamie@gmail.com>\n" ++
+        "Subject: question about your site\n" ++
+        "Date: Mon, 29 Jun 2026 10:00:00 +0000\n" ++
+        "Message-ID: <9@gmail.com>";
+    const body = "Hi, I noticed a broken link on your existing website's contact page. Thought you'd want to know.";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expectEqual(Disposition.accept, r.disposition);
 }
