@@ -1182,7 +1182,10 @@ pub const Session = struct {
             const auth_res = self.runInboundAntispam(&message_data);
             if (auth_res.reject_policy) {
                 try self.sendResponse(writer, 550, "5.7.1 Message rejected by mail authentication policy", null);
-                try self.handleRset(writer);
+                // Reset WITHOUT a response — handleRset() answers the RSET
+                // command with 250, and an unsolicited 250 here desyncs the
+                // client's response stream by one (QUIT reads 250, 221 queues).
+                self.resetTransactionState();
                 return;
             }
 
@@ -1196,7 +1199,7 @@ pub const Session = struct {
                     .reject => {
                         self.logger.info("Spam rejected from {s} (score {d:.1})", .{ self.remote_addr, report.score });
                         try self.sendResponse(writer, 550, "5.7.1 Message rejected as spam", null);
-                        try self.handleRset(writer);
+                        self.resetTransactionState(); // no response — see above
                         return;
                     },
                     .junk => to_junk = true,
@@ -1513,9 +1516,9 @@ pub const Session = struct {
                     const auth_res = self.runInboundAntispam(&msg_buf);
                     if (auth_res.reject_policy) {
                         try self.sendResponse(writer, 550, "5.7.1 Message rejected by mail authentication policy", null);
-                        var s = session.*;
-                        s.deinit();
-                        self.bdat_session = null;
+                        // Full transaction reset (frees the BDAT session and
+                        // the envelope) so a follow-up MAIL starts clean.
+                        self.resetTransactionState();
                         return;
                     }
                     if (self.config.spam_filter_enabled) {
@@ -1524,9 +1527,7 @@ pub const Session = struct {
                             .reject => {
                                 self.logger.info("Spam rejected from {s} (score {d:.1})", .{ self.remote_addr, report.score });
                                 try self.sendResponse(writer, 550, "5.7.1 Message rejected as spam", null);
-                                var s = session.*;
-                                s.deinit();
-                                self.bdat_session = null;
+                                self.resetTransactionState();
                                 return;
                             },
                             .junk => to_junk = true,
