@@ -6,6 +6,11 @@ const database = @import("../storage/database.zig");
 /// Greylisting implementation for spam prevention with database persistence
 /// Temporarily rejects mail from unknown sender/recipient/IP triplets
 /// Legitimate mail servers will retry, spam bots typically won't
+///
+/// Triplets are keyed on the sender's subnet (/24 for IPv4, /64 for IPv6),
+/// not the exact IP: large providers (Gmail, Outlook) retry from a rotating
+/// pool of hosts, and exact-IP keying makes every retry look like a new
+/// triplet so the initial delay never elapses and the mail never delivers.
 pub const Greylist = struct {
     allocator: std.mem.Allocator,
     entries: std.StringHashMap(GreylistEntry),
@@ -150,6 +155,31 @@ pub const Greylist = struct {
         self.entries.deinit();
     }
 
+    /// Reduce an IP to the prefix used for triplet keying: the first three
+    /// octets for IPv4 (/24) or the first four groups for IPv6 (/64). Falls
+    /// back to the full string for anything it can't parse, which only makes
+    /// greylisting stricter, never more permissive.
+    fn subnetPrefix(ip_addr: []const u8) []const u8 {
+        if (std.mem.indexOfScalar(u8, ip_addr, ':') == null) {
+            // IPv4: keep everything before the last dot
+            if (std.mem.lastIndexOfScalar(u8, ip_addr, '.')) |last_dot| {
+                return ip_addr[0..last_dot];
+            }
+            return ip_addr;
+        }
+        // IPv6: keep the first four colon-separated groups. Abbreviated
+        // addresses ("::") may yield fewer groups; use the full string then.
+        var colons: usize = 0;
+        for (ip_addr, 0..) |c, i| {
+            if (c == ':') {
+                if (i > 0 and ip_addr[i - 1] == ':') return ip_addr; // "::" abbreviation
+                colons += 1;
+                if (colons == 4) return ip_addr[0..i];
+            }
+        }
+        return ip_addr;
+    }
+
     /// Check if a mail triplet (IP, sender, recipient) should be allowed
     /// Returns true if allowed, false if should be temporarily rejected
     pub fn checkTriplet(
@@ -162,7 +192,7 @@ pub const Greylist = struct {
         const key = try std.fmt.allocPrint(
             self.allocator,
             "{s}|{s}|{s}",
-            .{ ip_addr, mail_from, rcpt_to },
+            .{ subnetPrefix(ip_addr), mail_from, rcpt_to },
         );
         defer self.allocator.free(key);
 
@@ -214,6 +244,45 @@ pub const Greylist = struct {
             try self.persistEntry(key, new_entry);
 
             return false;
+        }
+    }
+
+    /// Immediately whitelist a triplet, bypassing the initial delay. Used for
+    /// senders whose connecting IP passed SPF: the IP is a sanctioned MTA for
+    /// the sender domain, so the retry test proves nothing and only delays
+    /// (or, with rotating provider IPs, permanently blocks) legitimate mail.
+    pub fn markAllowed(
+        self: *Greylist,
+        ip_addr: []const u8,
+        mail_from: []const u8,
+        rcpt_to: []const u8,
+    ) !void {
+        const key = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}|{s}|{s}",
+            .{ subnetPrefix(ip_addr), mail_from, rcpt_to },
+        );
+        defer self.allocator.free(key);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const now = time_compat.timestamp();
+
+        if (self.entries.getPtr(key)) |entry| {
+            entry.allowed = true;
+            entry.last_seen = now;
+            try self.persistEntry(key, entry.*);
+        } else {
+            const stored_key = try self.allocator.dupe(u8, key);
+            const new_entry = GreylistEntry{
+                .first_seen = now,
+                .last_seen = now,
+                .allowed = true,
+                .retry_count = 1,
+            };
+            try self.entries.put(stored_key, new_entry);
+            try self.persistEntry(key, new_entry);
         }
     }
 
@@ -316,4 +385,48 @@ test "greylisting basic flow" {
 
     // Simulate time passage (we can't actually wait, so this tests the logic)
     // In production, the server would retry after the delay
+}
+
+test "greylisting keys by subnet so provider retries from sibling IPs share a triplet" {
+    const testing = std.testing;
+    var greylist = Greylist.init(testing.allocator);
+    defer greylist.deinit();
+    greylist.initial_delay = 0; // pass immediately on the second attempt
+
+    // First attempt from one Gmail farm host
+    const first = try greylist.checkTriplet("209.85.160.46", "sender@gmail.com", "info@example.com");
+    try testing.expect(!first);
+
+    // Retry from a sibling host in the same /24 must match the same triplet
+    const retry = try greylist.checkTriplet("209.85.160.99", "sender@gmail.com", "info@example.com");
+    try testing.expect(retry);
+
+    // A different /24 is still a new triplet
+    const other = try greylist.checkTriplet("209.85.161.46", "sender@gmail.com", "info@example.com");
+    try testing.expect(!other);
+}
+
+test "markAllowed bypasses the initial delay" {
+    const testing = std.testing;
+    var greylist = Greylist.init(testing.allocator);
+    defer greylist.deinit();
+
+    // Rejected on first contact
+    const first = try greylist.checkTriplet("209.85.160.46", "sender@gmail.com", "info@example.com");
+    try testing.expect(!first);
+
+    // SPF pass -> whitelist immediately; a retry from another IP in the
+    // subnet is allowed with no delay
+    try greylist.markAllowed("209.85.160.46", "sender@gmail.com", "info@example.com");
+    const retry = try greylist.checkTriplet("209.85.160.12", "sender@gmail.com", "info@example.com");
+    try testing.expect(retry);
+}
+
+test "subnetPrefix handles ipv4 and ipv6" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("209.85.160", Greylist.subnetPrefix("209.85.160.46"));
+    try testing.expectEqualStrings("2001:db8:1:2", Greylist.subnetPrefix("2001:db8:1:2:3:4:5:6"));
+    // Abbreviated IPv6 and non-IP strings fall back to the full string
+    try testing.expectEqualStrings("2001:db8::1", Greylist.subnetPrefix("2001:db8::1"));
+    try testing.expectEqualStrings("localhost", Greylist.subnetPrefix("localhost"));
 }

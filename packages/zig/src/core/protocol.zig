@@ -541,6 +541,10 @@ pub const Session = struct {
     // checked). Avoids re-querying blocklists for the early RCPT reject and the
     // later DATA-time spam score within the same session.
     dnsbl_hits_cache: ?u8 = null,
+    // Memoized "SPF pass for the current MAIL FROM" verdict (null = not yet
+    // checked), used for the RCPT-time greylist bypass. Reset whenever the
+    // transaction (and thus MAIL FROM) changes.
+    spf_greylist_pass: ?bool = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -914,6 +918,7 @@ pub const Session = struct {
             self.allocator.free(old);
         }
         self.mail_from = try self.allocator.dupe(u8, addr);
+        self.spf_greylist_pass = null; // new sender, new SPF verdict
 
         self.state = .MailFrom;
         try self.sendResponse(writer, 250, "OK", null);
@@ -971,11 +976,24 @@ pub const Session = struct {
         if (self.greylist != null and !self.authenticated) {
             const greylist = self.greylist.?;
             const mail_from = self.mail_from orelse "";
-            const allowed = greylist.checkTriplet(self.remote_addr, mail_from, addr) catch |err| blk: {
+            var allowed = greylist.checkTriplet(self.remote_addr, mail_from, addr) catch |err| blk: {
                 // Error checking greylist - allow by default (fail open)
                 self.logger.warn("Greylist check error for {s}: {} - allowing", .{ self.remote_addr, err });
                 break :blk true;
             };
+
+            // SPF-authorized senders bypass the retry test: a pass proves the
+            // connecting IP is a sanctioned MTA for the sender domain, and
+            // providers like Gmail retry from a different pool IP each time,
+            // so the delay would otherwise never elapse for them.
+            if (!allowed and self.spfPassesForCurrentSender()) {
+                greylist.markAllowed(self.remote_addr, mail_from, addr) catch |err| {
+                    self.logger.warn("Greylist markAllowed error for {s}: {}", .{ self.remote_addr, err });
+                };
+                const safe_from = sanitizeForLog(mail_from);
+                self.logger.info("Greylisting: SPF pass bypass for {s} from {s}", .{ sanitizedSlice(&safe_from, mail_from.len), self.remote_addr });
+                allowed = true;
+            }
 
             if (!allowed) {
                 const safe_from = sanitizeForLog(mail_from);
@@ -1002,6 +1020,20 @@ pub const Session = struct {
 
         self.state = .RcptTo;
         try self.sendResponse(writer, 250, "OK", null);
+    }
+
+    /// Whether the connecting IP passes SPF for the current MAIL FROM (HELO
+    /// identity as RFC 7208 fallback for empty MAIL FROM). Memoized for the
+    /// transaction so multi-recipient messages cost one DNS evaluation.
+    fn spfPassesForCurrentSender(self: *Session) bool {
+        if (self.spf_greylist_pass) |cached| return cached;
+        const mail_from = self.mail_from orelse "";
+        const helo = self.client_hostname orelse "";
+        var spf_v = spf_mod.SPFValidator.init(self.allocator);
+        const res = spf_v.validate(self.remote_addr, mail_from, helo) catch spf_mod.SPFResult.temperror;
+        const pass = res == .pass;
+        self.spf_greylist_pass = pass;
+        return pass;
     }
 
     fn handleData(self: *Session, writer: anytype) !void {
@@ -1520,6 +1552,8 @@ pub const Session = struct {
             self.allocator.free(rcpt);
         }
         self.rcpt_to.clearRetainingCapacity();
+
+        self.spf_greylist_pass = null;
 
         // Reset BDAT session if active
         if (self.bdat_session) |*session| {
