@@ -180,7 +180,7 @@ fn buildQuery(id: u16, name: []const u8, qtype: u16, out: []u8) !usize {
     std.mem.writeInt(u16, out[4..6], 1, .big); // QDCOUNT
     std.mem.writeInt(u16, out[6..8], 0, .big); // ANCOUNT
     std.mem.writeInt(u16, out[8..10], 0, .big); // NSCOUNT
-    std.mem.writeInt(u16, out[10..12], 0, .big); // ARCOUNT
+    std.mem.writeInt(u16, out[10..12], 1, .big); // ARCOUNT (EDNS0 OPT below)
 
     var pos: usize = 12;
     pos += try encodeQName(name, out[pos..]);
@@ -188,6 +188,18 @@ fn buildQuery(id: u16, name: []const u8, qtype: u16, out: []u8) !usize {
     std.mem.writeInt(u16, out[pos..][0..2], qtype, .big);
     std.mem.writeInt(u16, out[pos + 2 ..][0..2], DNS_CLASS_IN, .big);
     pos += 4;
+
+    // EDNS0 OPT pseudo-RR (RFC 6891). Without it responses are capped at 512
+    // bytes and resolvers TRUNCATE large answers — e.g. outlook.com's DKIM key
+    // (CNAME chain + 2048-bit TXT) or fat SPF record sets — which then looked
+    // like a missing record (dkim=permerror). Advertise our 4096-byte buffer.
+    if (pos + 11 > out.len) return error.DNSFormatError;
+    out[pos] = 0; // root name
+    std.mem.writeInt(u16, out[pos + 1 ..][0..2], 41, .big); // TYPE = OPT
+    std.mem.writeInt(u16, out[pos + 3 ..][0..2], 4096, .big); // CLASS = UDP payload size
+    std.mem.writeInt(u32, out[pos + 5 ..][0..4], 0, .big); // TTL = extended RCODE/flags
+    std.mem.writeInt(u16, out[pos + 9 ..][0..2], 0, .big); // RDLENGTH
+    pos += 11;
     return pos;
 }
 
@@ -272,6 +284,10 @@ fn dnsQuery(
         3 => return error.DNSNameError, // NXDOMAIN
         else => return error.DNSFormatError,
     }
+    // Truncated (TC): the answer didn't fit even with EDNS0. Treat as a
+    // transient failure rather than parsing a partial answer set — a missing
+    // TXT here would otherwise read as "no such record" (permerror for DKIM).
+    if ((flags & 0x0200) != 0) return error.DNSTemporaryFailure;
 
     const qdcount = std.mem.readInt(u16, msg[4..6], .big);
     const ancount = std.mem.readInt(u16, msg[6..8], .big);

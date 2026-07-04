@@ -191,9 +191,19 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     var greylist_ptr: ?*greylist_mod.Greylist = null;
 
     if (cfg.enable_greylist) {
-        greylist = greylist_mod.Greylist.init(allocator);
+        // Persist triplets in the main DB when available — a memory-only
+        // greylist forgets everything on restart, so every deploy made every
+        // active sender re-serve the full initial delay.
+        greylist = if (db_ptr) |dptr|
+            greylist_mod.Greylist.initWithDB(allocator, dptr) catch |err| blk: {
+                log.warn("Greylist DB persistence unavailable ({}); falling back to in-memory", .{err});
+                break :blk greylist_mod.Greylist.init(allocator);
+            }
+        else
+            greylist_mod.Greylist.init(allocator);
         greylist_ptr = &greylist.?;
-        log.info("Greylisting enabled (5 min delay, 4 hour retry window)", .{});
+        const mode: []const u8 = if (db_ptr != null) ", persistent" else ", in-memory";
+        log.info("Greylisting enabled (5 min delay, 4 hour retry window{s})", .{mode});
     }
 
     defer if (greylist) |*g| g.deinit();

@@ -90,14 +90,14 @@ const TestList = struct {
 /// robust signals (DNSBL, SPF/DKIM/DMARC, rDNS, header sanity) carry the
 /// decision. Matched case-insensitively against subject + start of body.
 const spam_phrases = [_][]const u8{
-    "viagra",          "cialis",            "sildenafil",        "pharmacy",
-    "online casino",   "casino",            "forex",             "bitcoin",
-    "crypto investment", "you have won",     "you've won",        "congratulations you",
-    "claim your prize", "lottery",          "unclaimed funds",   "inheritance",
-    "wire transfer",   "western union",     "hot singles",       "weight loss",
-    "work from home",  "make money fast",   "earn extra cash",   "million dollars",
-    "risk free",       "100% free",         "act now",           "limited time offer",
-    "this is not spam", "cheap meds",        "loan approved",     "refinance",
+    "viagra",            "cialis",          "sildenafil",      "pharmacy",
+    "online casino",     "casino",          "forex",           "bitcoin",
+    "crypto investment", "you have won",    "you've won",      "congratulations you",
+    "claim your prize",  "lottery",         "unclaimed funds", "inheritance",
+    "wire transfer",     "western union",   "hot singles",     "weight loss",
+    "work from home",    "make money fast", "earn extra cash", "million dollars",
+    "risk free",         "100% free",       "act now",         "limited time offer",
+    "this is not spam",  "cheap meds",      "loan approved",   "refinance",
 };
 
 /// URL shorteners frequently used to hide payload links.
@@ -117,25 +117,46 @@ const dangerous_exts = [_][]const u8{
 /// mail doesn't score; a genuine pitch stacks several. Individually low-weight
 /// and capped, like `spam_phrases`.
 const seo_phrases = [_][]const u8{
-    "search engine optimization", "seo service",      "seo services",     "seo package",
-    "seo expert",                 "seo company",       "seo agency",       "1st page of google",
-    "first page of google",       "top of google",     "page of google",   "google ranking",
-    "search ranking",             "increase your ranking", "improve your ranking", "rank higher",
-    "higher ranking",             "website traffic",   "organic traffic",  "increase traffic",
-    "website design",             "web design service", "website development", "web development",
-    "web developer",              "website redesign",  "redesign of your", "redesign your website",
-    "revamp your website",        "existing website",  "build your website", "backlink",
-    "link building",              "guest post",        "domain authority", "digital marketing",
-    "lead generation",            "mobile app development", "se0",
+    "search engine optimization", "seo service",             "seo services",         "seo package",
+    "seo expert",                 "seo company",             "seo agency",           "1st page of google",
+    "first page of google",       "top of google",           "page of google",       "google ranking",
+    "search ranking",             "increase your ranking",   "improve your ranking", "rank higher",
+    "higher ranking",             "website traffic",         "organic traffic",      "increase traffic",
+    "website design",             "web design service",      "website development",  "web development",
+    "web developer",              "website redesign",        "redesign of your",     "redesign your website",
+    "revamp your website",        "existing website",        "build your website",   "backlink",
+    "link building",              "guest post",              "domain authority",     "digital marketing",
+    "lead generation",            "se0",
+    // App-development pitches, the sibling of the SEO pitch ("interested in
+    // building a mobile app?"). Same bigram discipline: no bare "app".
+                        "mobile app",           "app development",
+    "app developer",              "application development", "build an app",         "building an app",
+    "develop an app",             "ios and android",         "android and ios",      "app idea",
+};
+
+/// Cold-outreach scaffolding: the opener/closer boilerplate every unsolicited
+/// pitch is built from, independent of what is being sold. Each phrase is weak
+/// alone (a real correspondent can say "are you interested") so the weight is
+/// low and capped — but a pitch stacks four or more, and combined with
+/// FREEMAIL_OUTREACH and a solicitation topic it clears the Junk line.
+const outreach_phrases = [_][]const u8{
+    "just checking",       "are you interested",   "i can send you",                "estimated cost",
+    "share the details",   "business development", "looking forward to your reply", "get back to me",
+    "quick call",          "schedule a call",      "free consultation",             "no obligation",
+    "our services",        "we provide",           "we offer",                      "we specialize",
+    "our company",         "dear sir",             "dear madam",                    "greetings of the day",
+    "dedicated developer", "hire a developer",     "our portfolio",                 "our team of",
+    "years of experience", "cost-effective",       "affordable price",              "best price",
+    "special offer",       "reach out to me",
 };
 
 /// Contact-harvesting closers: an unsolicited pitch angling to move the
 /// conversation to phone/WhatsApp or asking for a "cost/price list". Strong,
 /// low-false-positive marker of cold outreach.
 const harvest_phrases = [_][]const u8{
-    "whatsapp",          "your mobile number", "share your contact", "share your number",
-    "send me your number", "send your contact", "your contact number", "cost list",
-    "price list",        "your whatsapp",
+    "whatsapp",            "your mobile number", "share your contact",  "share your number",
+    "send me your number", "send your contact",  "your contact number", "cost list",
+    "price list",          "your whatsapp",
 };
 
 /// Free / consumer mail providers. A cold B2B SEO pitch almost always ships
@@ -152,6 +173,233 @@ const spoofed_brands = [_][]const u8{
     "netflix", "paypal", "amazon", "microsoft", "coinbase",
     "binance", "fedex",  "norton", "mcafee",    "docusign",
 };
+
+fn hexVal(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+/// Decode quoted-printable into `out`. `=XX` becomes the byte, `=\n`/`=\r\n`
+/// soft line breaks vanish (rejoining phrases QP split across lines), and
+/// anything unrecognized passes through verbatim — so non-QP text is
+/// unchanged and it is safe to run unconditionally on the scan window.
+fn decodeQuotedPrintable(in: []const u8, out: []u8) []const u8 {
+    var i: usize = 0;
+    var o: usize = 0;
+    while (i < in.len and o < out.len) {
+        const c = in[i];
+        if (c == '=' and i + 1 < in.len) {
+            if (in[i + 1] == '\n') {
+                i += 2;
+                continue;
+            }
+            if (in[i + 1] == '\r' and i + 2 < in.len and in[i + 2] == '\n') {
+                i += 3;
+                continue;
+            }
+            if (i + 2 < in.len) {
+                if (hexVal(in[i + 1])) |hi| {
+                    if (hexVal(in[i + 2])) |lo| {
+                        out[o] = (hi << 4) | lo;
+                        o += 1;
+                        i += 3;
+                        continue;
+                    }
+                }
+            }
+        }
+        out[o] = c;
+        o += 1;
+        i += 1;
+    }
+    return out[0..o];
+}
+
+/// Replace a leading HTML entity with its character. Returns null when `s`
+/// doesn't start with a known entity.
+fn matchEntity(s: []const u8) ?struct { ch: u8, len: usize } {
+    const table = [_]struct { name: []const u8, ch: u8 }{
+        .{ .name = "&nbsp;", .ch = ' ' },
+        .{ .name = "&amp;", .ch = '&' },
+        .{ .name = "&lt;", .ch = '<' },
+        .{ .name = "&gt;", .ch = '>' },
+        .{ .name = "&quot;", .ch = '"' },
+        .{ .name = "&#39;", .ch = '\'' },
+    };
+    for (table) |e| {
+        if (std.ascii.startsWithIgnoreCase(s, e.name)) return .{ .ch = e.ch, .len = e.name.len };
+    }
+    return null;
+}
+
+/// Reduce HTML to the text a mail client would render: drop <style>/<script>
+/// blocks wholesale, drop tags, decode common entities, and collapse
+/// whitespace runs to single spaces. Phrase matching runs on this, so markup
+/// (or an entity like "mobile&nbsp;app") can't break up a phrase. Plain text
+/// passes through with only whitespace collapsed.
+fn stripHtmlText(in: []const u8, out: []u8) []const u8 {
+    var i: usize = 0;
+    var o: usize = 0;
+    var pending_space = false;
+    while (i < in.len and o < out.len) {
+        var c = in[i];
+        if (c == '<') {
+            if (std.ascii.startsWithIgnoreCase(in[i..], "<style")) {
+                if (std.ascii.indexOfIgnoreCase(in[i..], "</style")) |rel| {
+                    const close = i + rel;
+                    i = if (std.mem.indexOfScalarPos(u8, in, close, '>')) |gt| gt + 1 else in.len;
+                } else i = in.len;
+            } else if (std.ascii.startsWithIgnoreCase(in[i..], "<script")) {
+                if (std.ascii.indexOfIgnoreCase(in[i..], "</script")) |rel| {
+                    const close = i + rel;
+                    i = if (std.mem.indexOfScalarPos(u8, in, close, '>')) |gt| gt + 1 else in.len;
+                } else i = in.len;
+            } else {
+                i = if (std.mem.indexOfScalarPos(u8, in, i, '>')) |gt| gt + 1 else in.len;
+            }
+            pending_space = true;
+            continue;
+        }
+        if (c == '&') {
+            if (matchEntity(in[i..])) |e| {
+                c = e.ch;
+                i += e.len;
+            } else {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            pending_space = true;
+            continue;
+        }
+        if (pending_space) {
+            out[o] = ' ';
+            o += 1;
+            pending_space = false;
+            if (o >= out.len) break;
+        }
+        out[o] = c;
+        o += 1;
+    }
+    return out[0..o];
+}
+
+/// Find a `Content-Transfer-Encoding: base64` MIME part inside the scan
+/// window and decode its payload (bounded by `out`). Wrapping the pitch in a
+/// base64 text/html part is the oldest filter-evasion trick there is; without
+/// this the phrase scan only ever sees boundary noise.
+fn decodeBase64Part(window: []const u8, out: []u8) []const u8 {
+    const marker = "content-transfer-encoding:";
+    var search: usize = 0;
+    while (search < window.len) {
+        const rel = std.ascii.indexOfIgnoreCase(window[search..], marker) orelse return out[0..0];
+        const vstart = search + rel + marker.len;
+        const line_end = std.mem.indexOfScalarPos(u8, window, vstart, '\n') orelse window.len;
+        if (std.ascii.indexOfIgnoreCase(window[vstart..line_end], "base64") == null) {
+            search = line_end;
+            continue;
+        }
+        // Skip the remaining part headers up to the blank line.
+        var bp = line_end;
+        while (bp < window.len) {
+            const le = std.mem.indexOfScalarPos(u8, window, bp + 1, '\n') orelse window.len;
+            const line = std.mem.trim(u8, window[bp + 1 .. le], " \t\r");
+            bp = le;
+            if (line.len == 0) break;
+        }
+        // Collect base64 payload lines until a boundary ("--...") or garbage.
+        var collected: [8192]u8 = undefined;
+        var n: usize = 0;
+        var p = bp;
+        collect: while (p < window.len and n < collected.len) {
+            const le = std.mem.indexOfScalarPos(u8, window, p + 1, '\n') orelse window.len;
+            const line = std.mem.trim(u8, window[p + 1 .. le], " \t\r");
+            p = le;
+            if (line.len == 0) continue;
+            if (std.mem.startsWith(u8, line, "--")) break;
+            for (line) |ch| {
+                const ok = std.ascii.isAlphanumeric(ch) or ch == '+' or ch == '/' or ch == '=';
+                if (!ok) break :collect;
+                if (n >= collected.len) break :collect;
+                collected[n] = ch;
+                n += 1;
+            }
+        }
+        n -= n % 4; // drop a trailing partial quantum (window cut mid-line)
+        if (n == 0) return out[0..0];
+        const dec_len = std.base64.standard.Decoder.calcSizeForSlice(collected[0..n]) catch return out[0..0];
+        if (dec_len > out.len) return out[0..0];
+        std.base64.standard.Decoder.decode(out[0..dec_len], collected[0..n]) catch return out[0..0];
+        return out[0..dec_len];
+    }
+    return out[0..0];
+}
+
+/// Decode RFC 2047 encoded-words ("=?utf-8?B?...?=" / "=?utf-8?Q?...?=") so
+/// subject heuristics see the text the recipient sees. Spam leans on encoded
+/// subjects precisely because naive filters skip them. Plain subjects are
+/// returned as-is.
+fn decodeEncodedWords(s: []const u8, out: []u8) []const u8 {
+    if (std.mem.indexOf(u8, s, "=?") == null) return s;
+    var i: usize = 0;
+    var o: usize = 0;
+    while (i < s.len and o < out.len) {
+        if (s[i] == '=' and i + 1 < s.len and s[i + 1] == '?') decoded: {
+            const q1 = std.mem.indexOfScalarPos(u8, s, i + 2, '?') orelse break :decoded;
+            if (q1 + 2 >= s.len or s[q1 + 2] != '?') break :decoded;
+            const enc = s[q1 + 1];
+            const dend = std.mem.indexOfPos(u8, s, q1 + 3, "?=") orelse break :decoded;
+            const data = s[q1 + 3 .. dend];
+            if (enc == 'B' or enc == 'b') {
+                const dec_len = std.base64.standard.Decoder.calcSizeForSlice(data) catch break :decoded;
+                if (o + dec_len > out.len) break :decoded;
+                std.base64.standard.Decoder.decode(out[o .. o + dec_len], data) catch break :decoded;
+                o += dec_len;
+            } else if (enc == 'Q' or enc == 'q') {
+                var j: usize = 0;
+                while (j < data.len and o < out.len) {
+                    if (data[j] == '_') {
+                        out[o] = ' ';
+                        o += 1;
+                        j += 1;
+                    } else if (data[j] == '=' and j + 2 < data.len) {
+                        const hi = hexVal(data[j + 1]) orelse {
+                            out[o] = data[j];
+                            o += 1;
+                            j += 1;
+                            continue;
+                        };
+                        const lo = hexVal(data[j + 2]) orelse {
+                            out[o] = data[j];
+                            o += 1;
+                            j += 1;
+                            continue;
+                        };
+                        out[o] = (hi << 4) | lo;
+                        o += 1;
+                        j += 3;
+                    } else {
+                        out[o] = data[j];
+                        o += 1;
+                        j += 1;
+                    }
+                }
+            } else break :decoded;
+            i = dend + 2;
+            continue;
+        }
+        out[o] = s[i];
+        o += 1;
+        i += 1;
+    }
+    return out[0..o];
+}
 
 /// Score a message. `headers` is the header block (LF-separated lines, no
 /// trailing body), `body` is everything after the header/body boundary.
@@ -213,7 +461,11 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
     }
 
     // === 3. Message structure ===
-    const subject = headerValue(headers, "Subject");
+    // Subject heuristics run on the RFC 2047-decoded form — encoded-word
+    // subjects otherwise sail past every subject rule.
+    var subj_buf: [256]u8 = undefined;
+    const subject_raw = headerValue(headers, "Subject");
+    const subject: ?[]const u8 = if (subject_raw) |s| decodeEncodedWords(s, &subj_buf) else null;
     if (subject == null or std.mem.trim(u8, subject.?, " \t").len == 0) {
         score += 0.8;
         tl.add("NO_SUBJECT");
@@ -236,11 +488,17 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
             score += 1.0;
             tl.add("SUBJ_OBFUSCATED");
         }
+        // Repeated exclamation marks ("Building a new app !!"). Real subjects
+        // use at most one.
+        if (std.mem.indexOf(u8, s, "!!") != null) {
+            score += 0.8;
+            tl.add("SUBJ_EXCLAIM");
+        }
         // Fabricated reply/forward prefix: cold outreach fakes a threaded
         // subject ("Re: Hi,", "Rw: …", "Fwd: …") to look like an ongoing
         // conversation, but a genuine reply always carries In-Reply-To /
-        // References. (Base64-encoded subjects are skipped — not worth
-        // decoding here; the plain-prefixed fakes are the common case.)
+        // References. (Encoded-word subjects are decoded above, so encoded
+        // fakes are caught too.)
         const st = std.mem.trim(u8, s, " \t");
         if ((startsWithCI(st, "re:") or startsWithCI(st, "rw:") or
             startsWithCI(st, "fwd:") or startsWithCI(st, "fw:")) and
@@ -249,6 +507,14 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
         {
             score += 3.0;
             tl.add("FAKE_REPLY");
+        }
+    }
+
+    // Bulk-blast addressing: the recipient list was hidden.
+    if (headerValue(headers, "To")) |to_v| {
+        if (std.ascii.indexOfIgnoreCase(to_v, "undisclosed") != null) {
+            score += 1.5;
+            tl.add("UNDISCLOSED_RCPTS");
         }
     }
 
@@ -290,25 +556,48 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
     // Phrase + structural body heuristics (scan subject + start of body).
     const scan_body = body[0..@min(body.len, 8192)];
 
+    // Phrase scans run on a NORMALIZED view of the body, not the raw bytes:
+    // quoted-printable is decoded (soft breaks rejoin split phrases), HTML
+    // markup/entities are stripped, whitespace is collapsed, and a
+    // base64-encoded MIME part is decoded and appended. Raw-byte scans stay
+    // raw where the markup itself is the signal (URLs, hidden-text CSS,
+    // attachment filenames).
+    var qp_buf: [8192]u8 = undefined;
+    var text_buf: [8192]u8 = undefined;
+    var b64_buf: [6144]u8 = undefined;
+    var b64_text_buf: [6144]u8 = undefined;
+    const scan_qp = decodeQuotedPrintable(scan_body, &qp_buf);
+    const scan_text = stripHtmlText(scan_qp, &text_buf);
+    const b64_part = decodeBase64Part(scan_body, &b64_buf);
+    const b64_text = if (b64_part.len > 0) stripHtmlText(b64_part, &b64_text_buf) else b64_part;
+
+    const Scan = struct {
+        subject: ?[]const u8,
+        text: []const u8,
+        b64: []const u8,
+        fn hit(self: @This(), phrase: []const u8) bool {
+            if (self.subject) |s| {
+                if (std.ascii.indexOfIgnoreCase(s, phrase) != null) return true;
+            }
+            if (std.ascii.indexOfIgnoreCase(self.text, phrase) != null) return true;
+            return self.b64.len > 0 and std.ascii.indexOfIgnoreCase(self.b64, phrase) != null;
+        }
+    };
+    const scan = Scan{ .subject = subject, .text = scan_text, .b64 = b64_text };
+
     var phrase_hits: f32 = 0;
     for (spam_phrases) |phrase| {
-        const in_subject = if (subject) |s| std.ascii.indexOfIgnoreCase(s, phrase) != null else false;
-        if (in_subject or std.ascii.indexOfIgnoreCase(scan_body, phrase) != null) {
-            phrase_hits += 0.6;
-        }
+        if (scan.hit(phrase)) phrase_hits += 0.6;
     }
     if (phrase_hits > 0) {
         score += @min(phrase_hits, 3.0);
         tl.add("SPAM_PHRASES");
     }
 
-    // Unsolicited SEO / web-design solicitation (subject + start of body).
+    // Unsolicited SEO / web-design / app-development solicitation.
     var seo_hits: f32 = 0;
     for (seo_phrases) |phrase| {
-        const in_subject = if (subject) |s| std.ascii.indexOfIgnoreCase(s, phrase) != null else false;
-        if (in_subject or std.ascii.indexOfIgnoreCase(scan_body, phrase) != null) {
-            seo_hits += 1.2;
-        }
+        if (scan.hit(phrase)) seo_hits += 1.2;
     }
     if (seo_hits > 0) {
         // Capped so a legitimate inquiry that happens to use a couple of these
@@ -318,12 +607,24 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
         tl.add("SEO_SOLICITATION");
     }
 
+    // Cold-outreach scaffolding ("just checking", "i can send you",
+    // "estimated cost", role signatures, …). Individually meaningless, so the
+    // per-phrase weight is low and the total capped — but a pitch stacks them.
+    var outreach_count: usize = 0;
+    for (outreach_phrases) |phrase| {
+        if (scan.hit(phrase)) outreach_count += 1;
+    }
+    if (outreach_count > 0) {
+        score += @min(@as(f32, @floatFromInt(outreach_count)) * 0.8, 4.0);
+        tl.add("OUTREACH_PITCH");
+    }
+
     // Contact-harvesting closer (WhatsApp / "cost list" / "your mobile number").
     // Near-unambiguous cold-outreach marker — legitimate correspondence rarely
     // asks an unknown recipient for their WhatsApp or a "cost list".
     var harvest_hit = false;
     for (harvest_phrases) |phrase| {
-        if (std.ascii.indexOfIgnoreCase(scan_body, phrase) != null) {
+        if (scan.hit(phrase)) {
             harvest_hit = true;
             break;
         }
@@ -335,8 +636,10 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
 
     // A free / consumer-provider sender attached to ANY solicitation content is
     // the textbook cold-outreach shape. A multiplier only — never scored on its
-    // own, so a normal person mailing from gmail is unaffected.
-    if (seo_hits > 0 or harvest_hit) {
+    // own, so a normal person mailing from gmail is unaffected. Outreach
+    // scaffolding alone needs 2+ distinct phrases before it counts as
+    // solicitation content here.
+    if (seo_hits > 0 or harvest_hit or outreach_count >= 2) {
         if (headerDomain(headers, "From")) |fd| {
             for (free_providers) |fp| {
                 if (std.ascii.eqlIgnoreCase(fd, fp)) {
@@ -348,22 +651,25 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
         }
     }
 
-    // Link farm: a wall of URLs is a strong bulk-mail signal.
-    const url_count = countOccurrences(scan_body, "http://") + countOccurrences(scan_body, "https://");
+    // Link farm: a wall of URLs is a strong bulk-mail signal. Scanned on the
+    // QP-decoded view so a soft line break can't split "https://" or a
+    // shortener host.
+    const url_count = countOccurrences(scan_qp, "http://") + countOccurrences(scan_qp, "https://");
     if (url_count >= 20) {
         score += 1.5;
         tl.add("MANY_URLS");
     }
     for (url_shorteners) |sh| {
-        if (std.ascii.indexOfIgnoreCase(scan_body, sh) != null) {
+        if (std.ascii.indexOfIgnoreCase(scan_qp, sh) != null) {
             score += 1.0;
             tl.add("URL_SHORTENER");
             break;
         }
     }
 
-    // Hidden HTML text (common in image-spam / cloaking).
-    if (containsAnyIgnoreCase(scan_body, &.{ "display:none", "visibility:hidden", "font-size:0", "font-size: 0px" })) {
+    // Hidden HTML text (common in image-spam / cloaking). QP-decoded view:
+    // markup must be intact (not tag-stripped) but soft breaks unsplit.
+    if (containsAnyIgnoreCase(scan_qp, &.{ "display:none", "visibility:hidden", "font-size:0", "font-size: 0px" })) {
         score += 1.5;
         tl.add("HTML_HIDDEN_TEXT");
     }
@@ -597,6 +903,107 @@ test "legit brand mail from its own domain is not brand spoofing" {
         "Message-ID: <1@netflix.com>";
     const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, "watch now\n", .{});
     try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_SPOOF") == null);
+}
+
+test "real-world app-dev cold outreach (QP, outlook freemail) lands in Junk" {
+    // Reconstruction of a live miss: scored 1.5 (HTML_HIDDEN_TEXT only)
+    // before the outreach/app-dev rules and QP decoding existed.
+    const headers =
+        "From: Ekta Pandey <ektapandey856@outlook.com>\n" ++
+        "To: <info@example.com>\n" ++
+        "Subject: Building a new app !!\n" ++
+        "Date: Sat, 4 Jul 2026 05:11:19 +0000\n" ++
+        "Message-ID: <CH2PR04MB7112@outlook.com>";
+    const body =
+        "Content-Type: text/plain; charset=\"Windows-1252\"\r\n" ++
+        "Content-Transfer-Encoding: quoted-printable\r\n" ++
+        "\r\n" ++
+        "Hello,\r\n" ++
+        "Just checking =97 are you interested in building a mobile app?\r\n" ++
+        "If yes, I can send you:\r\n" ++
+        "  *   Estimated cost\r\n" ++
+        "  *   Timeline\r\n" ++
+        "  *   Feature suggestions\r\n" ++
+        "Let me know, and I=92ll share the details.\r\n" ++
+        "Regards,\r\n" ++
+        "Business Development Manager\r\n" ++
+        "\r\n" ++
+        "<style type=3D\"text/css\" style=3D\"display:none;\"> P {margin-top:0;} </style>\r\n";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "OUTREACH_PITCH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "SEO_SOLICITATION") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "FREEMAIL_OUTREACH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "SUBJ_EXCLAIM") != null);
+    try std.testing.expectEqual(Disposition.junk, r.disposition);
+}
+
+test "QP soft line break cannot split a phrase" {
+    const headers = "From: x@gmail.com\nTo: a@b\nSubject: hi\nDate: d\nMessage-ID: <1@g>";
+    const body = "we do mobile app devel=\r\nopment and website des=\nign for you";
+    const r = evaluate(.{ .spf = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "SEO_SOLICITATION") != null);
+}
+
+test "base64-encoded MIME part cannot hide the pitch" {
+    // "Are you interested in seo services? I can send you our price list on whatsapp"
+    const b64 = "QXJlIHlvdSBpbnRlcmVzdGVkIGluIHNlbyBzZXJ2aWNlcz8gSSBjYW4gc2VuZCB5b3Ugb3VyIHByaWNlIGxpc3Qgb24gd2hhdHNhcHA=";
+    const headers = "From: x@gmail.com\nTo: a@b\nSubject: hello\nDate: d\nMessage-ID: <1@g>";
+    const body =
+        "--boundary42\r\n" ++
+        "Content-Type: text/html; charset=utf-8\r\n" ++
+        "Content-Transfer-Encoding: base64\r\n" ++
+        "\r\n" ++
+        b64 ++ "\r\n" ++
+        "--boundary42--\r\n";
+    const r = evaluate(.{ .spf = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "SEO_SOLICITATION") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "CONTACT_HARVEST") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "OUTREACH_PITCH") != null);
+}
+
+test "encoded-word subject is decoded before subject heuristics" {
+    // =?UTF-8?B?...?= of "WIN A FREE IPHONE RIGHT NOW!!"
+    const headers =
+        "From: x@promo.example\nTo: a@b\n" ++
+        "Subject: =?UTF-8?B?V0lOIEEgRlJFRSBJUEhPTkUgUklHSFQgTk9XISE=?=\n" ++
+        "Date: d\nMessage-ID: <1@p>";
+    const r = evaluate(.{ .spf = .pass }, headers, "", .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "SUBJ_ALL_CAPS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "SUBJ_EXCLAIM") != null);
+}
+
+test "html entities cannot split a phrase" {
+    const headers = "From: x@gmail.com\nTo: a@b\nSubject: hi\nDate: d\nMessage-ID: <1@g>";
+    const body = "<div>we offer mobile&nbsp;app development at an affordable&nbsp;price</div>";
+    const r = evaluate(.{ .spf = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "SEO_SOLICITATION") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "OUTREACH_PITCH") != null);
+}
+
+test "undisclosed recipients is flagged" {
+    const headers = "From: x@y.example\nTo: undisclosed-recipients:;\nSubject: hi\nDate: d\nMessage-ID: <1@y>";
+    const r = evaluate(.{ .spf = .pass }, headers, "hello\n", .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "UNDISCLOSED_RCPTS") != null);
+}
+
+test "friendly mail using one outreach phrase is not junked" {
+    const headers =
+        "From: Sam <sam@gmail.com>\nTo: info@example.com\n" ++
+        "Subject: coffee next week?\nDate: d\nMessage-ID: <7@g>";
+    const body = "Hey! We met at the conference last month — are you interested in grabbing coffee next week?";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expectEqual(Disposition.accept, r.disposition);
+}
+
+test "personal testimony from a free provider is not junked" {
+    const headers =
+        "From: A Witness <witness2024@gmail.com>\nTo: info@example.com\n" ++
+        "Subject: my experience\nDate: d\nMessage-ID: <8@g>";
+    const body = "Hi, I found your site. I worked there in 2024 and experienced " ++
+        "similar treatment. I can share more details if that helps — let me know how.";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expectEqual(Disposition.accept, r.disposition);
+    try std.testing.expectEqual(@as(f32, 0), r.score);
 }
 
 test "a single website mention from gmail does not junk legit mail" {
