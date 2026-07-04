@@ -2060,23 +2060,36 @@ pub const Session = struct {
 
             self.logger.info("Auto-forwarding from {s} to {s}", .{ username, forward_to });
 
-            // Check if forward target is a local address
-            const is_local_forward = if (std.mem.indexOf(u8, forward_to, "@")) |at_pos| blk: {
-                const fwd_domain = forward_to[at_pos + 1 ..];
-                if (std.mem.eql(u8, fwd_domain, self.config.hostname)) break :blk true;
-                if (std.mem.indexOf(u8, self.config.hostname, ".")) |dot_pos| {
-                    const parent_domain = self.config.hostname[dot_pos + 1 ..];
-                    if (std.mem.eql(u8, fwd_domain, parent_domain)) break :blk true;
-                }
-                break :blk false;
-            } else true;
+            // Is the forward target a local address? Use the same
+            // isLocalDomain() test as inbound delivery — not just a
+            // hostname/parent comparison — so a forward to any configured
+            // local domain (SMTP_LOCAL_DOMAINS), including a second tenant on
+            // this same box (e.g. no-reply@verygoodadblock.org ->
+            // chris@verygoodadblock.org), is delivered straight to the local
+            // Maildir instead of being relayed back out over SMTP.
+            const is_local_forward = if (std.mem.indexOf(u8, forward_to, "@")) |at_pos|
+                self.config.isLocalDomain(forward_to[at_pos + 1 ..])
+            else
+                true;
 
             if (is_local_forward) {
-                // Local forward: save directly to recipient's mailbox
-                const fwd_username = if (std.mem.indexOf(u8, forward_to, "@")) |at_pos|
-                    forward_to[0..at_pos]
+                // Local forward: save directly to recipient's mailbox.
+                // Mirror inbound delivery's isolation rule so the copy lands
+                // in the right Maildir: if the full target address is itself a
+                // registered user (per-domain isolated mailbox, e.g.
+                // chris@verygoodadblock.org) key off the full address;
+                // otherwise resolve the local-part through the aliases file
+                // (role mailboxes like postmaster@, abuse@).
+                const fwd_is_isolated = if (self.auth_backend) |ab|
+                    (ab.db.userExists(forward_to) catch false)
                 else
-                    forward_to;
+                    false;
+                const fwd_username = if (fwd_is_isolated)
+                    forward_to
+                else if (std.mem.indexOf(u8, forward_to, "@")) |at_pos|
+                    aliases.resolve(forward_to[0..at_pos])
+                else
+                    aliases.resolve(forward_to);
 
                 const cwd = fs_compat.cwd();
                 const ts = time_compat.milliTimestamp();
