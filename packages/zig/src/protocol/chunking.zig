@@ -59,6 +59,28 @@ pub const ChunkingHandler = struct {
         };
     }
 
+    /// Read and discard the payload of a BDAT command that is being rejected.
+    /// RFC 3030: BDAT payloads are sent immediately after the command without
+    /// waiting for a response, so the server must consume the announced octet
+    /// count even when failing the command — otherwise the payload bytes are
+    /// parsed as SMTP commands and the session desynchronizes. The drain is
+    /// capped at max_message_size; an announcement beyond that is hostile and
+    /// the connection will be dropped anyway.
+    pub fn drainBDAT(self: *ChunkingHandler, command: []const u8, stream: anytype) void {
+        var parts = std.mem.splitScalar(u8, command, ' ');
+        _ = parts.next(); // Skip "BDAT"
+        const size_str = std.mem.trim(u8, parts.next() orelse return, " \t\r\n");
+        const chunk_size = std.fmt.parseInt(usize, size_str, 10) catch return;
+
+        var remaining = @min(chunk_size, self.max_message_size);
+        var buf: [4096]u8 = undefined;
+        while (remaining > 0) {
+            const n = stream.read(buf[0..@min(buf.len, remaining)]) catch return;
+            if (n == 0) return;
+            remaining -= n;
+        }
+    }
+
     /// Accumulate message chunks
     pub fn accumulateChunks(self: *ChunkingHandler, chunks: *std.ArrayList([]const u8)) ![]const u8 {
         // Calculate total size
@@ -179,6 +201,56 @@ pub const BDATSession = struct {
         self.completed = false;
     }
 };
+
+const MockStream = struct {
+    data: []const u8,
+    pos: usize = 0,
+    pub fn read(self: *MockStream, out: []u8) !usize {
+        const n = @min(out.len, self.data.len - self.pos);
+        @memcpy(out[0..n], self.data[self.pos .. self.pos + n]);
+        self.pos += n;
+        return n;
+    }
+};
+
+test "drainBDAT consumes exactly the announced payload" {
+    const testing = std.testing;
+    var handler = ChunkingHandler.init(testing.allocator, 1024, 10 * 1024);
+
+    // 10 payload bytes pipelined behind the rejected BDAT, then the next command
+    var stream = MockStream{ .data = "0123456789QUIT\r\n" };
+    handler.drainBDAT("BDAT 10 LAST", &stream);
+    try testing.expectEqual(@as(usize, 10), stream.pos);
+
+    // The next read must yield the next command, not payload bytes
+    var buf: [16]u8 = undefined;
+    const n = try stream.read(&buf);
+    try testing.expectEqualStrings("QUIT\r\n", buf[0..n]);
+}
+
+test "drainBDAT tolerates malformed commands and short streams" {
+    const testing = std.testing;
+    var handler = ChunkingHandler.init(testing.allocator, 1024, 10 * 1024);
+
+    // No size / garbage size: nothing to drain, no crash
+    var s1 = MockStream{ .data = "abc" };
+    handler.drainBDAT("BDAT", &s1);
+    try testing.expectEqual(@as(usize, 0), s1.pos);
+    var s2 = MockStream{ .data = "abc" };
+    handler.drainBDAT("BDAT xyz LAST", &s2);
+    try testing.expectEqual(@as(usize, 0), s2.pos);
+
+    // Announced size larger than what arrives: stop at EOF
+    var s3 = MockStream{ .data = "abc" };
+    handler.drainBDAT("BDAT 100", &s3);
+    try testing.expectEqual(@as(usize, 3), s3.pos);
+
+    // Hostile announcement is capped at max_message_size
+    var s4 = MockStream{ .data = "x" ** 32 };
+    var small = ChunkingHandler.init(testing.allocator, 16, 16);
+    small.drainBDAT("BDAT 999999999", &s4);
+    try testing.expectEqual(@as(usize, 16), s4.pos);
+}
 
 test "BDAT command parsing" {
     const testing = std.testing;

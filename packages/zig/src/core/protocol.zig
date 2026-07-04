@@ -190,14 +190,32 @@ pub const SMTPCommand = enum {
 /// Process-wide counter for synthesized Message-IDs.
 var msgid_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
+const HeaderBodySplit = struct { headers: []const u8, body: []const u8 };
+
+/// Split a message at the first blank line. Messages reach us with either
+/// line-ending convention — BDAT/CHUNKING preserves raw \r\n while the DATA
+/// loop normalizes to \n — so both must be handled; whichever blank line
+/// occurs first is the boundary. A message with no blank line is all headers.
+fn splitHeadersBody(data: []const u8) HeaderBodySplit {
+    const crlf = std.mem.indexOf(u8, data, "\r\n\r\n");
+    const lf = std.mem.indexOf(u8, data, "\n\n");
+    if (crlf) |c| {
+        if (lf == null or c < lf.?) {
+            return .{ .headers = data[0..c], .body = data[c + 4 ..] };
+        }
+    }
+    if (lf) |l| {
+        return .{ .headers = data[0..l], .body = data[l + 2 ..] };
+    }
+    return .{ .headers = data, .body = "" };
+}
+
 /// If the message has no Message-ID header, prepend a synthesized one. The
 /// stored message uses LF line endings (the DATA loop strips CR), so the
 /// inserted header matches.
 fn ensureSubmissionHeaders(allocator: std.mem.Allocator, message_data: *std.ArrayList(u8), hostname: []const u8) !void {
     const items = message_data.items;
-    const hdr_end = std.mem.indexOf(u8, items, "\n\n") orelse
-        std.mem.indexOf(u8, items, "\r\n\r\n") orelse items.len;
-    const headers = items[0..hdr_end];
+    const headers = splitHeadersBody(items).headers;
     // Capture presence up front; each insert is at offset 0 (prepend), which
     // doesn't remove existing headers, so these flags stay valid.
     const has_message_id = headerPresent(headers, "message-id");
@@ -246,6 +264,36 @@ fn fromHeaderDomain(headers: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+test "splitHeadersBody handles CRLF, LF, mixed and headers-only messages" {
+    const t = std.testing;
+
+    // CRLF (BDAT/CHUNKING wire form) — this is what Gmail delivers; splitting
+    // only on \n\n used to leave body empty and fail every DKIM body hash.
+    const crlf = splitHeadersBody("From: a@b.com\r\nSubject: hi\r\n\r\nbody line\r\n");
+    try t.expectEqualStrings("From: a@b.com\r\nSubject: hi", crlf.headers);
+    try t.expectEqualStrings("body line\r\n", crlf.body);
+
+    // LF (DATA path normalized form)
+    const lf = splitHeadersBody("From: a@b.com\nSubject: hi\n\nbody line\n");
+    try t.expectEqualStrings("From: a@b.com\nSubject: hi", lf.headers);
+    try t.expectEqualStrings("body line\n", lf.body);
+
+    // Mixed: LF blank line before a CRLF blank line — first boundary wins
+    const mixed = splitHeadersBody("X-Added: 1\nFrom: a@b.com\n\nbody\r\n\r\nmore");
+    try t.expectEqualStrings("X-Added: 1\nFrom: a@b.com", mixed.headers);
+    try t.expectEqualStrings("body\r\n\r\nmore", mixed.body);
+
+    // No blank line at all: everything is headers
+    const hdr_only = splitHeadersBody("From: a@b.com\r\nSubject: hi\r\n");
+    try t.expectEqualStrings("From: a@b.com\r\nSubject: hi\r\n", hdr_only.headers);
+    try t.expectEqualStrings("", hdr_only.body);
+
+    // Blank line at the very end (empty body)
+    const empty_body = splitHeadersBody("From: a@b.com\r\n\r\n");
+    try t.expectEqualStrings("From: a@b.com", empty_body.headers);
+    try t.expectEqualStrings("", empty_body.body);
 }
 
 test "fromHeaderDomain extracts the From domain" {
@@ -1234,10 +1282,9 @@ pub const Session = struct {
     /// `reject_policy` is set only when the message should be rejected on the
     /// sender's behalf (enforce + DMARC fail + p=reject).
     fn runInboundAntispam(self: *Session, message_data: *std.ArrayList(u8)) InboundAuth {
-        const data = message_data.items;
-        const split = std.mem.indexOf(u8, data, "\n\n");
-        const headers = if (split) |i| data[0..i] else data;
-        const body = if (split) |i| (if (i + 2 <= data.len) data[i + 2 ..] else "") else "";
+        const split = splitHeadersBody(message_data.items);
+        const headers = split.headers;
+        const body = split.body;
 
         const mail_from = self.mail_from orelse "";
         const helo = self.client_hostname orelse "";
@@ -1330,18 +1377,9 @@ pub const Session = struct {
         signals.helo_forges_us = helo.len > 0 and std.ascii.eqlIgnoreCase(helo, self.config.hostname);
         if (!signals.helo_forges_us) signals.helo_not_fqdn = heloNotFqdn(helo);
 
-        // Header/body boundary: CRLF (BDAT/CHUNKING preserves raw \r\n\r\n) or
-        // bare LF (the DATA path normalizes line endings to \n).
-        const data = message_data.items;
-        var headers: []const u8 = data;
-        var body: []const u8 = "";
-        if (std.mem.indexOf(u8, data, "\r\n\r\n")) |i| {
-            headers = data[0..i];
-            body = data[i + 4 ..];
-        } else if (std.mem.indexOf(u8, data, "\n\n")) |i| {
-            headers = data[0..i];
-            body = if (i + 2 <= data.len) data[i + 2 ..] else "";
-        }
+        const split = splitHeadersBody(message_data.items);
+        const headers = split.headers;
+        const body = split.body;
 
         const report = spam_filter.evaluate(signals, headers, body, .{
             .junk = self.config.spam_junk_threshold,
@@ -1385,7 +1423,13 @@ pub const Session = struct {
     }
 
     fn handleBDAT(self: *Session, writer: anytype, line: []const u8) !void {
+        // Any rejection of a BDAT command must still consume the announced
+        // payload (see drainBDAT): the client pipelines the chunk bytes right
+        // behind the command, and without the drain they would be parsed as
+        // SMTP commands. This is exactly what a greylist 451 at RCPT followed
+        // by Gmail's pipelined BDAT used to do to the session.
         if (self.state != .RcptTo and self.state != .Data) {
+            self.chunking_handler.drainBDAT(line, &self.conn_wrapper);
             try self.sendResponse(writer, 503, "Bad sequence of commands", null);
             return;
         }
@@ -1398,18 +1442,27 @@ pub const Session = struct {
 
         // Check rate limit before accepting chunk
         const allowed = self.rate_limiter.checkAndIncrement(self.remote_addr) catch {
+            self.chunking_handler.drainBDAT(line, &self.conn_wrapper);
             try self.sendResponse(writer, 451, "Internal error checking rate limit", null);
             return;
         };
 
         if (!allowed) {
             self.logger.logSecurityEvent(self.remote_addr, "Rate limit exceeded");
+            self.chunking_handler.drainBDAT(line, &self.conn_wrapper);
             try self.sendResponse(writer, 450, "Rate limit exceeded, try again later", null);
             return;
         }
 
         // Process BDAT command
         const result = self.chunking_handler.handleBDAT(line, &self.conn_wrapper) catch |err| {
+            // ChunkTooLarge fails before any payload byte is read — drain so
+            // the oversized chunk doesn't get parsed as commands. Other errors
+            // are parse failures (size unknown, nothing to drain) or read
+            // failures (connection already broken).
+            if (err == error.ChunkTooLarge) {
+                self.chunking_handler.drainBDAT(line, &self.conn_wrapper);
+            }
             try self.sendResponse(writer, 500, "BDAT command failed", null);
             self.logger.err("BDAT error: {}", .{err});
             if (self.bdat_session) |*session| {
