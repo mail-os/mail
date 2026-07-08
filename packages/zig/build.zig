@@ -112,6 +112,7 @@ pub fn build(b: *std.Build) void {
         "src/webmail_session_test.zig",
         "src/uid_consistency_test.zig",
         "src/antispam/spam_filter.zig",
+        "src/dkim_verify_test.zig",
     };
 
     // RFC compliance tests

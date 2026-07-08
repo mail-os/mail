@@ -140,65 +140,90 @@ pub const DKIMValidator = struct {
     /// REAL signing domain — passing the header-From domain instead silently
     /// turns the DKIM alignment check into a tautology.
     pub fn validateWithDomain(self: *DKIMValidator, headers: []const u8, body: []const u8) !DKIMCheck {
-        const sig_header = self.extractDKIMSignature(headers) orelse {
-            return .{ .result = .neutral, .domain = null };
-        };
-
-        var signature = DKIMSignature.parse(self.allocator, sig_header) catch {
-            return .{ .result = .permerror, .domain = null };
-        };
-        defer signature.deinit();
-
-        const domain_copy: ?[]u8 = if (signature.domain.len > 0)
-            self.allocator.dupe(u8, signature.domain) catch null
-        else
-            null;
-        errdefer if (domain_copy) |d| self.allocator.free(d);
-
-        const result = try self.validate(headers, body);
-        return .{ .result = result, .domain = domain_copy };
+        return self.validateInternal(headers, body, true);
     }
 
     pub fn validate(self: *DKIMValidator, headers: []const u8, body: []const u8) !DKIMResult {
-        // Extract DKIM-Signature header
-        const sig_header = self.extractDKIMSignature(headers) orelse {
-            return .neutral;
-        };
+        const check = try self.validateInternal(headers, body, false);
+        if (check.domain) |d| self.allocator.free(d);
+        return check.result;
+    }
 
-        // Parse signature
-        var signature = DKIMSignature.parse(self.allocator, sig_header) catch {
-            return .permerror;
-        };
-        defer signature.deinit();
+    /// Verify every DKIM-Signature on the message and return the aggregate
+    /// result. RFC 6376 §6.1: a message with multiple signatures verifies if
+    /// ANY one verifies — large senders (Stripe, Amazon SES relays, Google)
+    /// routinely attach two, and it is normal for one to fail while the other
+    /// passes. Returns `.pass` as soon as a signature verifies, reporting that
+    /// signature's d= domain (needed for DMARC alignment); otherwise it returns
+    /// the strongest failure seen (fail > permerror > temperror > neutral).
+    ///
+    /// The message reaches us with CR stripped (LF line endings — see the DATA
+    /// loop), but DKIM is defined over the on-the-wire CRLF form and *simple*
+    /// body canonicalization is byte-exact. We reconstruct the CRLF form before
+    /// hashing so simple-canon signatures (e.g. Stripe's `c=relaxed/simple`)
+    /// verify instead of always failing the body hash.
+    fn validateInternal(self: *DKIMValidator, headers: []const u8, body: []const u8, want_domain: bool) !DKIMCheck {
+        const cr_headers = try crlfNormalize(self.allocator, headers);
+        defer self.allocator.free(cr_headers);
+        const cr_body = try crlfNormalize(self.allocator, body);
+        defer self.allocator.free(cr_body);
 
-        // Verify version
-        if (!std.mem.eql(u8, signature.version, "1")) {
-            return .permerror;
+        var spans = try collectHeaders(self.allocator, cr_headers);
+        defer spans.deinit(self.allocator);
+
+        var best: DKIMResult = .neutral;
+        var first_domain: ?[]const u8 = null;
+
+        for (spans.items) |span| {
+            if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, span.name, " \t"), "DKIM-Signature")) continue;
+
+            var signature = DKIMSignature.parse(self.allocator, span.value) catch {
+                best = strongerResult(best, .permerror);
+                continue;
+            };
+            defer signature.deinit();
+
+            if (first_domain == null and signature.domain.len > 0) first_domain = signature.domain;
+
+            if (!std.mem.eql(u8, signature.version, "1")) {
+                best = strongerResult(best, .permerror);
+                continue;
+            }
+
+            const public_key = self.queryPublicKey(signature.domain, signature.selector) catch {
+                best = strongerResult(best, .temperror);
+                continue;
+            };
+            defer if (public_key) |key| self.allocator.free(key);
+            if (public_key == null) {
+                best = strongerResult(best, .permerror);
+                continue;
+            }
+
+            const body_ok = self.verifyBodyHash(&signature, cr_body) catch false;
+            if (!body_ok) {
+                best = strongerResult(best, .fail);
+                continue;
+            }
+            const sig_ok = self.verifySignature(&signature, cr_headers, span.full, public_key.?) catch false;
+            if (!sig_ok) {
+                best = strongerResult(best, .fail);
+                continue;
+            }
+
+            // A signature verified — this is a pass.
+            const dom: ?[]u8 = if (want_domain and signature.domain.len > 0)
+                self.allocator.dupe(u8, signature.domain) catch null
+            else
+                null;
+            return .{ .result = .pass, .domain = dom };
         }
 
-        // Query DNS for public key
-        const public_key = self.queryPublicKey(signature.domain, signature.selector) catch {
-            return .temperror;
-        };
-        defer if (public_key) |key| self.allocator.free(key);
-
-        if (public_key == null) {
-            return .permerror;
-        }
-
-        // Verify body hash
-        const body_hash_valid = try self.verifyBodyHash(&signature, body);
-        if (!body_hash_valid) {
-            return .fail;
-        }
-
-        // Verify signature
-        const sig_valid = try self.verifySignature(&signature, headers, public_key.?);
-        if (!sig_valid) {
-            return .fail;
-        }
-
-        return .pass;
+        const dom: ?[]u8 = if (want_domain) blk: {
+            const d = first_domain orelse break :blk null;
+            break :blk self.allocator.dupe(u8, d) catch null;
+        } else null;
+        return .{ .result = best, .domain = dom };
     }
 
     fn extractDKIMSignature(self: *DKIMValidator, headers: []const u8) ?[]const u8 {
@@ -279,7 +304,7 @@ pub const DKIMValidator = struct {
         return std.mem.eql(u8, std.mem.trim(u8, signature.body_hash, " \t\r\n"), &bh);
     }
 
-    fn verifySignature(self: *DKIMValidator, signature: *const DKIMSignature, headers: []const u8, public_key: []const u8) !bool {
+    fn verifySignature(self: *DKIMValidator, signature: *const DKIMSignature, headers: []const u8, dkim_sig_full: []const u8, public_key: []const u8) !bool {
         const relaxed = headerCanonRelaxed(signature.canonicalization);
         var input = std.ArrayList(u8).empty;
         defer input.deinit(self.allocator);
@@ -319,8 +344,9 @@ pub const DKIMValidator = struct {
         }
 
         // The DKIM-Signature header itself with the b= value emptied, NO CRLF.
-        const dk = findHeader(headers, "dkim-signature") orelse return false;
-        const stripped = try stripBTag(self.allocator, dk.full);
+        // Use the *specific* signature header being verified (a message may
+        // carry several DKIM-Signature headers), not merely the first one.
+        const stripped = try stripBTag(self.allocator, dkim_sig_full);
         defer self.allocator.free(stripped);
         if (relaxed) {
             const colon = std.mem.indexOfScalar(u8, stripped, ':') orelse return false;
@@ -362,6 +388,37 @@ fn dkimTag(s: []const u8, key: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// Rank of a non-pass result for aggregating across multiple signatures; a
+/// definite `fail` outranks the softer error states so the reported verdict is
+/// the most informative one seen.
+fn resultRank(r: DKIMResult) u8 {
+    return switch (r) {
+        .neutral => 0,
+        .temperror => 1,
+        .permerror => 2,
+        .fail => 3,
+        .pass => 4,
+    };
+}
+fn strongerResult(a: DKIMResult, b: DKIMResult) DKIMResult {
+    return if (resultRank(b) > resultRank(a)) b else a;
+}
+
+/// Reconstruct on-the-wire CRLF line endings from our LF-normalized in-memory
+/// form: drop any stray CR, then insert CR before every LF. DKIM signs the
+/// CRLF form, and *simple* canonicalization is byte-exact, so this is required
+/// for simple-canon signatures to verify. Idempotent on already-CRLF input.
+fn crlfNormalize(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (s) |c| {
+        if (c == '\r') continue;
+        if (c == '\n') try out.append(allocator, '\r');
+        try out.append(allocator, c);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// c= is `header/body`; default `simple/simple`.
@@ -1450,4 +1507,46 @@ test "DKIM CLI help command" {
     var cli = DKIMCli.init(std.testing.allocator, &manager);
     const result = try cli.execute(.help, &[_][]const u8{});
     try std.testing.expect(result.success);
+}
+
+test "crlfNormalize reconstructs wire CRLF from LF, idempotent, drops stray CR" {
+    const a = std.testing.allocator;
+    const lf = try crlfNormalize(a, "a\nb\n\nc\n");
+    defer a.free(lf);
+    try std.testing.expectEqualStrings("a\r\nb\r\n\r\nc\r\n", lf);
+    const already = try crlfNormalize(a, "a\r\nb\r\n");
+    defer a.free(already);
+    try std.testing.expectEqualStrings("a\r\nb\r\n", already);
+}
+
+test "strongerResult keeps the most informative verdict across signatures" {
+    try std.testing.expectEqual(DKIMResult.fail, strongerResult(.temperror, .fail));
+    try std.testing.expectEqual(DKIMResult.fail, strongerResult(.fail, .permerror));
+    try std.testing.expectEqual(DKIMResult.permerror, strongerResult(.neutral, .permerror));
+    try std.testing.expectEqual(DKIMResult.temperror, strongerResult(.temperror, .neutral));
+}
+
+test "simple body canon and crlfNormalize agree on wire vs CR-stripped bodies" {
+    // A body that arrived on the wire as CRLF but was normalized to LF (CR
+    // stripped by the DATA loop) must canonicalize to the wire form so the
+    // body hash matches. Both the reconstruction path (crlfNormalize) and the
+    // canonicalizer itself must land on the same bytes ending in a single CRLF.
+    const a = std.testing.allocator;
+    const wire = "Line one\r\nLine two\r\n\r\n\r\n"; // trailing empty lines
+    const stripped = "Line one\nLine two\n\n\n"; // same content, CR removed
+    const want = "Line one\r\nLine two\r\n";
+
+    var canon_wire = std.ArrayList(u8).empty;
+    defer canon_wire.deinit(a);
+    try canonBodySimple(a, wire, &canon_wire);
+    try std.testing.expectEqualStrings(want, canon_wire.items);
+
+    const rebuilt = try crlfNormalize(a, stripped);
+    defer a.free(rebuilt);
+    try std.testing.expectEqualStrings(wire, rebuilt);
+
+    var canon_stripped = std.ArrayList(u8).empty;
+    defer canon_stripped.deinit(a);
+    try canonBodySimple(a, stripped, &canon_stripped);
+    try std.testing.expectEqualStrings(want, canon_stripped.items);
 }
