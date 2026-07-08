@@ -107,9 +107,35 @@ const url_shorteners = [_][]const u8{
 
 /// Attachment name suffixes that are almost always malicious in email.
 const dangerous_exts = [_][]const u8{
-    ".exe\"", ".scr\"", ".pif\"", ".bat\"", ".cmd\"", ".com\"", ".vbs\"",
-    ".js\"",  ".jar\"", ".cpl\"", ".lnk\"", ".iso\"", ".hta\"",
+    ".exe", ".scr", ".pif", ".bat", ".cmd", ".com", ".vbs",
+    ".js",  ".jar", ".cpl", ".lnk", ".iso", ".hta",
 };
+
+/// True if a MIME `name=` / `filename=` parameter declares a file whose
+/// extension is in `dangerous_exts`. Only the parameter *value* is examined,
+/// so link URLs in the body (e.g. `href="https://example.com"`) cannot
+/// false-match a bare extension like ".com". Matching `name=` also covers
+/// `filename=` since that string ends in `name=`.
+fn hasDangerousAttachment(scan: []const u8) bool {
+    var pos: usize = 0;
+    while (std.ascii.indexOfIgnoreCasePos(scan, pos, "name=")) |at| {
+        var v = at + "name=".len;
+        pos = v; // advance past this match for the next iteration
+        if (v < scan.len and (scan[v] == '"' or scan[v] == '\'')) v += 1;
+        var end = v;
+        while (end < scan.len) : (end += 1) {
+            const c = scan[end];
+            if (c == '"' or c == '\'' or c == ';' or c == '\r' or c == '\n' or c == ' ') break;
+        }
+        const value = scan[v..end];
+        for (dangerous_exts) |ext| {
+            if (value.len >= ext.len and
+                std.ascii.eqlIgnoreCase(value[value.len - ext.len ..], ext))
+                return true;
+        }
+    }
+    return false;
+}
 
 /// Unsolicited SEO / web-design outreach — by volume the dominant spam class
 /// hitting a published contact address. These are solicitation-specific
@@ -423,7 +449,14 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
         },
         else => {},
     }
-    if (signals.dkim == .fail) {
+    // A failing DKIM signature is only a spam signal when DMARC did not
+    // otherwise pass. Large senders (Stripe, Google, SES relays) attach
+    // multiple DKIM signatures; it is normal for one (e.g. an ESP's) to fail
+    // verification while the aligned signature passes and yields dmarc=pass.
+    // Scoring DKIM_FAIL on a dmarc=pass message double-counts against fully
+    // authenticated, legitimate mail — the exact false positive that folds
+    // Stripe/Google/Hetzner notifications into Junk.
+    if (signals.dkim == .fail and signals.dmarc != .pass) {
         score += 2.5;
         tl.add("DKIM_FAIL");
     }
@@ -674,14 +707,14 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
         tl.add("HTML_HIDDEN_TEXT");
     }
 
-    // Dangerous executable attachment.
+    // Dangerous executable attachment. Inspect only declared MIME filenames
+    // (`name=` / `filename=` parameters), never the raw body: a body-wide
+    // substring scan matches ordinary links such as href="https://hetzner.com"
+    // against ".com", which false-flagged nearly every HTML newsletter.
     const scan_attach = body[0..@min(body.len, 65536)];
-    for (dangerous_exts) |ext| {
-        if (std.ascii.indexOfIgnoreCase(scan_attach, ext) != null) {
-            score += 2.5;
-            tl.add("DANGEROUS_ATTACHMENT");
-            break;
-        }
+    if (hasDangerousAttachment(scan_attach)) {
+        score += 2.5;
+        tl.add("DANGEROUS_ATTACHMENT");
     }
 
     var report = Report{ .score = score };
@@ -835,6 +868,32 @@ test "dangerous attachment flagged" {
     const body = "Content-Disposition: attachment; filename=\"invoice.exe\"\n";
     const r = evaluate(.{ .spf = .pass }, headers, body, .{});
     try std.testing.expect(std.mem.indexOf(u8, r.tests(), "DANGEROUS_ATTACHMENT") != null);
+}
+
+test "bare-domain link is not a dangerous attachment" {
+    const headers = "From: Hetzner <support-cloud@hetzner.com>\nSubject: Invoice\nDate: d\nMessage-ID: <1@hetzner.com>";
+    // A newsletter that links to the sender's homepage — the old body-wide
+    // scan matched ".com\"" here and false-flagged DANGEROUS_ATTACHMENT.
+    const body = "<html><body><a href=\"https://www.hetzner.com\">Home</a> " ++
+        "and <a href='https://cloud.hetzner.com/'>Console</a></body></html>";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "DANGEROUS_ATTACHMENT") == null);
+}
+
+test "dkim fail is not scored when dmarc passes" {
+    const headers = "From: Stripe <notifications@stripe.com>\nSubject: Receipt\nDate: d\nMessage-ID: <1@stripe.com>";
+    // Real Stripe/SES shape: spf=pass, one DKIM signature fails to verify, but
+    // the aligned signature yields dmarc=pass. Must not accrue DKIM_FAIL.
+    const r = evaluate(.{ .spf = .pass, .dkim = .fail, .dmarc = .pass }, headers, "hi\n", .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "DKIM_FAIL") == null);
+    try std.testing.expect(r.score < 5.0);
+    try std.testing.expectEqual(Disposition.accept, r.disposition);
+}
+
+test "dkim fail still scores when dmarc does not pass" {
+    const headers = "From: x@y.example\nSubject: hi\nDate: d\nMessage-ID: <1@y>";
+    const r = evaluate(.{ .spf = .neutral, .dkim = .fail, .dmarc = .none }, headers, "hi\n", .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "DKIM_FAIL") != null);
 }
 
 test "headerValue is case-insensitive and trims" {
