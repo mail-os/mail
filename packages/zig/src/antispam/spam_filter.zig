@@ -700,11 +700,26 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
         }
     }
 
-    // Hidden HTML text (common in image-spam / cloaking). QP-decoded view:
-    // markup must be intact (not tag-stripped) but soft breaks unsplit.
-    if (containsAnyIgnoreCase(scan_qp, &.{ "display:none", "visibility:hidden", "font-size:0", "font-size: 0px" })) {
-        score += 1.5;
-        tl.add("HTML_HIDDEN_TEXT");
+    // Hidden HTML text is a cloaking / image-spam signal, but a *single* hidden
+    // declaration is ubiquitous in legitimate mail — the inbox-preview
+    // "preheader" span, Outlook's `display:none` margin resets, and responsive
+    // show/hide blocks. Two guards keep it from nickel-and-diming real
+    // newsletters (Stripe, SingleStore, …) into Junk: DMARC-authenticated mail
+    // is exempt (an accountable sender), and unauthenticated mail must hide in
+    // bulk (cloaking stacks many declarations; a lone preheader does not).
+    // QP-decoded view: markup intact (not tag-stripped) but soft breaks unsplit.
+    if (signals.dmarc != .pass) {
+        const hidden_markers = [_][]const u8{
+            "display:none",       "display: none",
+            "visibility:hidden",  "visibility: hidden",
+            "font-size:0",        "font-size: 0",
+        };
+        var hidden_hits: usize = 0;
+        for (hidden_markers) |m| hidden_hits += countOccurrencesIgnoreCase(scan_qp, m);
+        if (hidden_hits >= 2) {
+            score += 1.5;
+            tl.add("HTML_HIDDEN_TEXT");
+        }
     }
 
     // Dangerous executable attachment. Inspect only declared MIME filenames
@@ -792,6 +807,17 @@ fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     var count: usize = 0;
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, haystack, i, needle)) |pos| {
+        count += 1;
+        i = pos + needle.len;
+    }
+    return count;
+}
+
+fn countOccurrencesIgnoreCase(haystack: []const u8, needle: []const u8) usize {
+    if (needle.len == 0) return 0;
+    var count: usize = 0;
+    var i: usize = 0;
+    while (std.ascii.indexOfIgnoreCasePos(haystack, i, needle)) |pos| {
         count += 1;
         i = pos + needle.len;
     }
@@ -894,6 +920,30 @@ test "dkim fail still scores when dmarc does not pass" {
     const headers = "From: x@y.example\nSubject: hi\nDate: d\nMessage-ID: <1@y>";
     const r = evaluate(.{ .spf = .neutral, .dkim = .fail, .dmarc = .none }, headers, "hi\n", .{});
     try std.testing.expect(std.mem.indexOf(u8, r.tests(), "DKIM_FAIL") != null);
+}
+
+test "authenticated newsletter with a preheader is not flagged as hidden text" {
+    const headers =
+        "From: Stripe <notifications@stripe.com>\n" ++
+        "Subject: Your receipt\n" ++
+        "Date: Mon, 29 Jun 2026 10:00:00 +0000\n" ++
+        "Message-ID: <1@stripe.com>";
+    // A single inbox-preview preheader span — the ubiquitous legitimate case.
+    const body = "<html><body><span style=\"display:none\">Receipt preview text</span>" ++
+        "<p>Thanks for your payment.</p></body></html>";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "HTML_HIDDEN_TEXT") == null);
+    try std.testing.expectEqual(Disposition.accept, r.disposition);
+}
+
+test "bulk hidden text on unauthenticated mail is still flagged" {
+    const headers =
+        "From: x@spammy.example\nSubject: hi\nDate: d\nMessage-ID: <1@y>";
+    // Keyword-stuffing / cloaking stacks many hidden declarations.
+    const body = "<div style=\"display:none\">a</div><div style=\"display: none\">b</div>" ++
+        "<span style=\"visibility:hidden\">c</span><i style=\"font-size:0\">d</i>";
+    const r = evaluate(.{ .spf = .neutral, .dkim = .none, .dmarc = .none }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "HTML_HIDDEN_TEXT") != null);
 }
 
 test "headerValue is case-insensitive and trims" {
