@@ -172,7 +172,11 @@ pub const DKIMValidator = struct {
         defer spans.deinit(self.allocator);
 
         var best: DKIMResult = .neutral;
-        var first_domain: ?[]const u8 = null;
+        // Owned copy of the first signing domain seen — signature.domain is
+        // freed when each iteration's `signature.deinit()` runs, so we cannot
+        // hold a borrowed slice across the loop.
+        var first_domain: ?[]u8 = null;
+        defer if (first_domain) |d| self.allocator.free(d);
 
         for (spans.items) |span| {
             if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, span.name, " \t"), "DKIM-Signature")) continue;
@@ -183,7 +187,8 @@ pub const DKIMValidator = struct {
             };
             defer signature.deinit();
 
-            if (first_domain == null and signature.domain.len > 0) first_domain = signature.domain;
+            if (first_domain == null and want_domain and signature.domain.len > 0)
+                first_domain = self.allocator.dupe(u8, signature.domain) catch null;
 
             if (!std.mem.eql(u8, signature.version, "1")) {
                 best = strongerResult(best, .permerror);
