@@ -24,8 +24,10 @@ const typesense = @import("../search/typesense.zig");
 
 const State = struct {
     allocator: std.mem.Allocator,
+    db: *database.Database,
     queue: queue_mod.MessageQueue,
     hostname: []const u8,
+    extra_local_domains: ?[]const u8,
     delivery_method: config.DeliveryMethod,
     ses_region: []const u8,
     running: std.atomic.Value(bool),
@@ -41,6 +43,7 @@ pub fn start(
     allocator: std.mem.Allocator,
     db: *database.Database,
     hostname: []const u8,
+    extra_local_domains: ?[]const u8,
     delivery_method: config.DeliveryMethod,
     ses_region: []const u8,
 ) !void {
@@ -49,15 +52,24 @@ pub fn start(
     const s = try allocator.create(State);
     errdefer allocator.destroy(s);
 
+    const hostname_copy = try allocator.dupe(u8, hostname);
+    errdefer allocator.free(hostname_copy);
+    const domains_copy = if (extra_local_domains) |domains| try allocator.dupe(u8, domains) else null;
+    errdefer if (domains_copy) |domains| allocator.free(domains);
+    const region_copy = try allocator.dupe(u8, ses_region);
+    errdefer allocator.free(region_copy);
+
     s.* = .{
         .allocator = allocator,
+        .db = db,
         .queue = try queue_mod.MessageQueue.initWithDB(allocator, db),
-        .hostname = try allocator.dupe(u8, hostname),
+        .hostname = hostname_copy,
+        .extra_local_domains = domains_copy,
         .delivery_method = delivery_method,
-        .ses_region = try allocator.dupe(u8, ses_region),
+        .ses_region = region_copy,
         .running = std.atomic.Value(bool).init(true),
     };
-    state = s;
+    errdefer s.queue.deinit();
 
     const pending = s.queue.getStats();
     if (pending.total > 0) {
@@ -65,6 +77,7 @@ pub fn start(
     }
 
     const thread = try std.Thread.spawn(.{}, workerLoop, .{s});
+    state = s;
     thread.detach();
 }
 
@@ -140,22 +153,31 @@ fn workerLoop(s: *State) void {
 
 /// Deliver an RFC 3464 bounce into the original (local) sender's maildir.
 /// `from_addr` is the failed message's envelope sender.
+fn isLocalBounceDomain(hostname: []const u8, extra_local_domains: ?[]const u8, sender_domain: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(sender_domain, hostname)) return true;
+    if (std.mem.indexOfScalar(u8, hostname, '.')) |dot| {
+        if (std.ascii.eqlIgnoreCase(sender_domain, hostname[dot + 1 ..])) return true;
+    }
+    if (extra_local_domains) |domains| {
+        var it = std.mem.splitScalar(u8, domains, ',');
+        while (it.next()) |raw| {
+            const domain = std.mem.trim(u8, raw, " \t");
+            if (std.ascii.eqlIgnoreCase(sender_domain, domain)) return true;
+        }
+    }
+    return false;
+}
+
 fn deliverBounceLocally(s: *State, from_addr: []const u8, failed_to: []const u8, error_message: []const u8, original: []const u8) void {
     // Only local senders get a DSN (no backscatter).
     const at_pos = std.mem.indexOfScalar(u8, from_addr, '@') orelse return;
     const sender_domain = from_addr[at_pos + 1 ..];
-    const local = blk: {
-        if (std.mem.eql(u8, sender_domain, s.hostname)) break :blk true;
-        if (std.mem.indexOfScalar(u8, s.hostname, '.')) |dot| {
-            if (std.mem.eql(u8, sender_domain, s.hostname[dot + 1 ..])) break :blk true;
-        }
-        break :blk false;
-    };
-    if (!local) {
+    if (!isLocalBounceDomain(s.hostname, s.extra_local_domains, sender_domain)) {
         std.log.info("not bouncing to external sender {s} (backscatter guard)", .{from_addr});
         return;
     }
     const local_part = from_addr[0..at_pos];
+    const mailbox = if (s.db.userExists(from_addr) catch false) from_addr else local_part;
 
     var gen = bounce_mod.BounceGenerator.init(s.allocator, s.hostname) catch return;
     defer gen.deinit();
@@ -163,26 +185,31 @@ fn deliverBounceLocally(s: *State, from_addr: []const u8, failed_to: []const u8,
     defer s.allocator.free(dsn);
 
     const ts = time_compat.milliTimestamp();
-    const dir = std.fmt.allocPrint(s.allocator, "mail/{s}/new", .{local_part}) catch return;
+    const nonce = std.crypto.random.int(u64);
+    const dir = std.fmt.allocPrint(s.allocator, "mail/{s}/new", .{mailbox}) catch return;
     defer s.allocator.free(dir);
     fs_compat.cwd().makePath(dir) catch {};
 
-    const path = std.fmt.allocPrint(s.allocator, "{s}/{d}.eml", .{ dir, ts }) catch return;
+    const path = std.fmt.allocPrint(s.allocator, "{s}/{d}.{d}.eml", .{ dir, ts, nonce }) catch return;
     defer s.allocator.free(path);
 
-    const file = fs_compat.cwd().createFile(path, .{}) catch |err| {
+    const file = fs_compat.cwd().createFile(path, .{ .exclusive = true }) catch |err| {
         std.log.err("failed to write DSN for {s}: {}", .{ from_addr, err });
         return;
     };
-    defer file.close();
-    file.writeAll(dsn) catch return;
+    file.writeAll(dsn) catch {
+        file.close();
+        fs_compat.cwd().deleteFile(path) catch {};
+        return;
+    };
+    file.close();
 
     std.log.info("DSN delivered to {s} for failed delivery to {s}", .{ from_addr, failed_to });
 
     // Index the DSN for search like any other delivery
     var base_buf: [64]u8 = undefined;
-    if (std.fmt.bufPrint(&base_buf, "{d}.eml", .{ts})) |base| {
-        typesense.indexMessageAsync(s.allocator, local_part, "INBOX", base, dsn);
+    if (std.fmt.bufPrint(&base_buf, "{d}.{d}.eml", .{ ts, nonce })) |base| {
+        typesense.indexMessageAsync(s.allocator, mailbox, "INBOX", base, dsn);
     } else |_| {}
 }
 
@@ -191,4 +218,10 @@ test "retry module compiles" {
     // and network, covered by e2e verification.
     _ = enqueueFailure;
     _ = start;
+}
+
+test "bounce domains include configured local domains" {
+    try std.testing.expect(isLocalBounceDomain("mail.example.com", null, "example.com"));
+    try std.testing.expect(isLocalBounceDomain("mail.example.com", "other.test, tenant.test", "TENANT.TEST"));
+    try std.testing.expect(!isLocalBounceDomain("mail.example.com", "other.test", "external.test"));
 }

@@ -181,7 +181,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     // DB; failed first attempts get exponential-backoff retries, and a
     // permanent failure delivers a bounce to the local sender).
     if (db_ptr) |dptr| {
-        delivery_retry.start(allocator, dptr, cfg.hostname, cfg.delivery_method, cfg.ses_region) catch |err| {
+        delivery_retry.start(allocator, dptr, cfg.hostname, cfg.extra_local_domains, cfg.delivery_method, cfg.ses_region) catch |err| {
             log.warn("Outbound retry pipeline failed to start: {} (failed deliveries will be dropped)", .{err});
         };
     }
