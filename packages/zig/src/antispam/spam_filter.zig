@@ -108,8 +108,26 @@ const url_shorteners = [_][]const u8{
 /// Attachment name suffixes that are almost always malicious in email.
 const dangerous_exts = [_][]const u8{
     ".exe", ".scr", ".pif", ".bat", ".cmd", ".com", ".vbs",
-    ".js",  ".jar", ".cpl", ".lnk", ".iso", ".hta",
+    ".js",  ".jar", ".cpl", ".lnk", ".iso", ".hta", ".msi",
+    ".reg", ".ps1", ".wsf", ".chm", ".img",
 };
+
+fn hasDangerousSuffix(value: []const u8) bool {
+    for (dangerous_exts) |ext| {
+        if (value.len >= ext.len and
+            std.ascii.eqlIgnoreCase(value[value.len - ext.len ..], ext)) return true;
+
+        // RFC 2231 filenames commonly percent-encode the dot, e.g.
+        // filename*=UTF-8''invoice%2Eexe.
+        if (value.len >= ext.len + 2 and value[value.len - ext.len - 2] == '%') {
+            const hi = hexVal(value[value.len - ext.len - 1]) orelse continue;
+            const lo = hexVal(value[value.len - ext.len]) orelse continue;
+            if ((hi << 4) | lo == '.' and
+                std.ascii.eqlIgnoreCase(value[value.len - ext.len + 1 ..], ext[1..])) return true;
+        }
+    }
+    return false;
+}
 
 /// True if a MIME `name=` / `filename=` parameter declares a file whose
 /// extension is in `dangerous_exts`. Only the parameter *value* is examined,
@@ -117,21 +135,19 @@ const dangerous_exts = [_][]const u8{
 /// false-match a bare extension like ".com". Matching `name=` also covers
 /// `filename=` since that string ends in `name=`.
 fn hasDangerousAttachment(scan: []const u8) bool {
-    var pos: usize = 0;
-    while (std.ascii.indexOfIgnoreCasePos(scan, pos, "name=")) |at| {
-        var v = at + "name=".len;
-        pos = v; // advance past this match for the next iteration
-        if (v < scan.len and (scan[v] == '"' or scan[v] == '\'')) v += 1;
-        var end = v;
-        while (end < scan.len) : (end += 1) {
-            const c = scan[end];
-            if (c == '"' or c == '\'' or c == ';' or c == '\r' or c == '\n' or c == ' ') break;
-        }
-        const value = scan[v..end];
-        for (dangerous_exts) |ext| {
-            if (value.len >= ext.len and
-                std.ascii.eqlIgnoreCase(value[value.len - ext.len ..], ext))
-                return true;
+    const markers = [_][]const u8{ "name=", "name*=" };
+    for (markers) |marker| {
+        var pos: usize = 0;
+        while (std.ascii.indexOfIgnoreCasePos(scan, pos, marker)) |at| {
+            var v = at + marker.len;
+            pos = v;
+            if (v < scan.len and (scan[v] == '"' or scan[v] == '\'')) v += 1;
+            var end = v;
+            while (end < scan.len) : (end += 1) {
+                const c = scan[end];
+                if (c == '"' or c == ';' or c == '\r' or c == '\n' or c == ' ') break;
+            }
+            if (hasDangerousSuffix(scan[v..end])) return true;
         }
     }
     return false;
@@ -143,21 +159,24 @@ fn hasDangerousAttachment(scan: []const u8) bool {
 /// mail doesn't score; a genuine pitch stacks several. Individually low-weight
 /// and capped, like `spam_phrases`.
 const seo_phrases = [_][]const u8{
-    "search engine optimization", "seo service",             "seo services",         "seo package",
-    "seo expert",                 "seo company",             "seo agency",           "1st page of google",
-    "first page of google",       "top of google",           "page of google",       "google ranking",
-    "search ranking",             "increase your ranking",   "improve your ranking", "rank higher",
-    "higher ranking",             "website traffic",         "organic traffic",      "increase traffic",
-    "website design",             "web design service",      "website development",  "web development",
-    "web developer",              "website redesign",        "redesign of your",     "redesign your website",
-    "revamp your website",        "existing website",        "build your website",   "backlink",
-    "link building",              "guest post",              "domain authority",     "digital marketing",
-    "lead generation",            "se0",
+    "search engine optimization",  "seo service",            "seo services",                 "seo package",
+    "seo expert",                  "seo company",            "seo agency",                   "1st page of google",
+    "first page of google",        "top of google",          "page of google",               "google ranking",
+    "search ranking",              "increase your ranking",  "improve your ranking",         "rank higher",
+    "higher ranking",              "website traffic",        "organic traffic",              "increase traffic",
+    "website visibility",          "visibility on google",   "optimized for search engines", "improving rankings",
+    "website ranking",             "errors at your website", "website errors",               "fix errors",
+    "screenshots of these errors", "website design",         "web design service",           "website development",
+    "web development",             "web developer",          "website redesign",             "redesign of your",
+    "redesign your website",       "revamp your website",    "existing website",             "build your website",
+    "backlink",                    "link building",          "guest post",                   "domain authority",
+    "digital marketing",           "lead generation",        "se0",
     // App-development pitches, the sibling of the SEO pitch ("interested in
     // building a mobile app?"). Same bigram discipline: no bare "app".
-                        "mobile app",           "app development",
-    "app developer",              "application development", "build an app",         "building an app",
-    "develop an app",             "ios and android",         "android and ios",      "app idea",
+                             "mobile app",
+    "app development",             "app developer",          "application development",      "build an app",
+    "building an app",             "develop an app",         "ios and android",              "android and ios",
+    "app idea",
 };
 
 /// Cold-outreach scaffolding: the opener/closer boilerplate every unsolicited
@@ -198,6 +217,27 @@ const free_providers = [_][]const u8{
 const spoofed_brands = [_][]const u8{
     "netflix", "paypal", "amazon", "microsoft", "coinbase",
     "binance", "fedex",  "norton", "mcafee",    "docusign",
+};
+
+/// Parcel-fee phishing impersonates a carrier while sending from an unrelated,
+/// but often perfectly SPF/DKIM/DMARC-authenticated, compromised domain.  It is
+/// important that these are conjunctions: ordinary shipment notices mention a
+/// carrier, and ordinary invoices mention payment, but the scam stacks several
+/// urgent fee/payment prompts while claiming a carrier identity.
+const carriers = [_]struct { brand: []const u8, domain: []const u8 }{
+    .{ .brand = "dhl", .domain = "dhl.com" },
+    .{ .brand = "fedex", .domain = "fedex.com" },
+    .{ .brand = "ups", .domain = "ups.com" },
+    .{ .brand = "usps", .domain = "usps.com" },
+};
+const parcel_phrases = [_][]const u8{
+    "shipment held", "shipment release", "customs documentation",
+    "customs fee",   "final delivery",   "local facility",
+};
+const payment_phrases = [_][]const u8{
+    "fee required",         "fee must be paid", "amount due",
+    "awaiting payment",     "make payment",     "payment information",
+    "complete the process", "release fee",
 };
 
 fn hexVal(c: u8) ?u8 {
@@ -255,6 +295,9 @@ fn matchEntity(s: []const u8) ?struct { ch: u8, len: usize } {
         .{ .name = "&gt;", .ch = '>' },
         .{ .name = "&quot;", .ch = '"' },
         .{ .name = "&#39;", .ch = '\'' },
+        .{ .name = "&#32;", .ch = ' ' },
+        .{ .name = "&#x20;", .ch = ' ' },
+        .{ .name = "&#X20;", .ch = ' ' },
     };
     for (table) |e| {
         if (std.ascii.startsWithIgnoreCase(s, e.name)) return .{ .ch = e.ch, .len = e.name.len };
@@ -273,6 +316,18 @@ fn stripHtmlText(in: []const u8, out: []u8) []const u8 {
     var pending_space = false;
     while (i < in.len and o < out.len) {
         var c = in[i];
+        // Zero-width Unicode characters and their common HTML encodings are
+        // invisible in clients but otherwise split phrases such as "pay​ment".
+        const zero_width = [_][]const u8{ "\xE2\x80\x8B", "\xE2\x80\x8C", "\xE2\x80\x8D", "&#8203;", "&#x200b;", "&#x200B;" };
+        var skipped_zero_width = false;
+        for (zero_width) |zw| {
+            if (std.mem.startsWith(u8, in[i..], zw)) {
+                i += zw.len;
+                skipped_zero_width = true;
+                break;
+            }
+        }
+        if (skipped_zero_width) continue;
         if (c == '<') {
             if (std.ascii.startsWithIgnoreCase(in[i..], "<style")) {
                 if (std.ascii.indexOfIgnoreCase(in[i..], "</style")) |rel| {
@@ -320,15 +375,16 @@ fn stripHtmlText(in: []const u8, out: []u8) []const u8 {
 /// window and decode its payload (bounded by `out`). Wrapping the pitch in a
 /// base64 text/html part is the oldest filter-evasion trick there is; without
 /// this the phrase scan only ever sees boundary noise.
-fn decodeBase64Part(window: []const u8, out: []u8) []const u8 {
+fn decodeBase64Parts(window: []const u8, out: []u8) []const u8 {
     const marker = "content-transfer-encoding:";
     var search: usize = 0;
+    var out_len: usize = 0;
     while (search < window.len) {
-        const rel = std.ascii.indexOfIgnoreCase(window[search..], marker) orelse return out[0..0];
+        const rel = std.ascii.indexOfIgnoreCase(window[search..], marker) orelse break;
         const vstart = search + rel + marker.len;
         const line_end = std.mem.indexOfScalarPos(u8, window, vstart, '\n') orelse window.len;
         if (std.ascii.indexOfIgnoreCase(window[vstart..line_end], "base64") == null) {
-            search = line_end;
+            search = @min(line_end + 1, window.len);
             continue;
         }
         // Skip the remaining part headers up to the blank line.
@@ -357,14 +413,19 @@ fn decodeBase64Part(window: []const u8, out: []u8) []const u8 {
                 n += 1;
             }
         }
+        search = @min(p + 1, window.len);
         n -= n % 4; // drop a trailing partial quantum (window cut mid-line)
-        if (n == 0) return out[0..0];
-        const dec_len = std.base64.standard.Decoder.calcSizeForSlice(collected[0..n]) catch return out[0..0];
-        if (dec_len > out.len) return out[0..0];
-        std.base64.standard.Decoder.decode(out[0..dec_len], collected[0..n]) catch return out[0..0];
-        return out[0..dec_len];
+        if (n == 0) continue;
+        const dec_len = std.base64.standard.Decoder.calcSizeForSlice(collected[0..n]) catch continue;
+        if (dec_len > out.len - out_len) break;
+        std.base64.standard.Decoder.decode(out[out_len .. out_len + dec_len], collected[0..n]) catch continue;
+        out_len += dec_len;
+        if (out_len < out.len) {
+            out[out_len] = '\n';
+            out_len += 1;
+        }
     }
-    return out[0..0];
+    return out[0..out_len];
 }
 
 /// Decode RFC 2047 encoded-words ("=?utf-8?B?...?=" / "=?utf-8?Q?...?=") so
@@ -496,9 +557,15 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
     // === 3. Message structure ===
     // Subject heuristics run on the RFC 2047-decoded form — encoded-word
     // subjects otherwise sail past every subject rule.
-    var subj_buf: [256]u8 = undefined;
-    const subject_raw = headerValue(headers, "Subject");
+    var subj_raw_buf: [1024]u8 = undefined;
+    var subj_buf: [1024]u8 = undefined;
+    const subject_raw = headerValueUnfolded(headers, "Subject", &subj_raw_buf);
     const subject: ?[]const u8 = if (subject_raw) |s| decodeEncodedWords(s, &subj_buf) else null;
+    var from_raw_buf: [1024]u8 = undefined;
+    var from_decoded_buf: [1024]u8 = undefined;
+    const from_raw = headerValueUnfolded(headers, "From", &from_raw_buf);
+    const from_decoded: ?[]const u8 = if (from_raw) |s| decodeEncodedWords(s, &from_decoded_buf) else null;
+    const from_domain = if (from_raw) |s| domainOfHeaderValue(s) else null;
     if (subject == null or std.mem.trim(u8, subject.?, " \t").len == 0) {
         score += 0.8;
         tl.add("NO_SUBJECT");
@@ -555,14 +622,13 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
     // claims a consumer brand the sending domain has nothing to do with
     // (e.g. `"Netflix.com" <l1xwv4u9@aqg.io>`). Independent of DMARC — the
     // display name is never authenticated even when the domain's DMARC passes.
-    if (headerValue(headers, "From")) |from_hdr| {
+    if (from_decoded) |from_hdr| {
         const disp_end = std.mem.indexOfScalar(u8, from_hdr, '<') orelse from_hdr.len;
         const display = from_hdr[0..disp_end];
-        const from_dom = headerDomain(headers, "From");
         for (spoofed_brands) |brand| {
             if (std.ascii.indexOfIgnoreCase(display, brand) != null) {
-                const dom_has_brand = if (from_dom) |fd|
-                    std.ascii.indexOfIgnoreCase(fd, brand) != null
+                const dom_has_brand = if (from_domain) |fd|
+                    domainHasLabel(fd, brand)
                 else
                     false;
                 if (!dom_has_brand) {
@@ -576,10 +642,11 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
 
     // From / Reply-To domain mismatch (only when DMARC didn't already pass).
     if (signals.dmarc != .pass) {
-        const from_dom = headerDomain(headers, "From");
-        const reply_dom = headerDomain(headers, "Reply-To");
-        if (from_dom != null and reply_dom != null and
-            !std.ascii.eqlIgnoreCase(from_dom.?, reply_dom.?))
+        var reply_raw_buf: [1024]u8 = undefined;
+        const reply_raw = headerValueUnfolded(headers, "Reply-To", &reply_raw_buf);
+        const reply_domain = if (reply_raw) |s| domainOfHeaderValue(s) else null;
+        if (from_domain != null and reply_domain != null and
+            !std.ascii.eqlIgnoreCase(from_domain.?, reply_domain.?))
         {
             score += 0.7;
             tl.add("REPLYTO_MISMATCH");
@@ -587,7 +654,9 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
     }
 
     // Phrase + structural body heuristics (scan subject + start of body).
-    const scan_body = body[0..@min(body.len, 8192)];
+    // A larger bounded window prevents trivial padding (large comments/style
+    // blocks before the pitch) from pushing content beyond the old 8 KiB scan.
+    const scan_body = body[0..@min(body.len, 16384)];
 
     // Phrase scans run on a NORMALIZED view of the body, not the raw bytes:
     // quoted-printable is decoded (soft breaks rejoin split phrases), HTML
@@ -595,13 +664,13 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
     // base64-encoded MIME part is decoded and appended. Raw-byte scans stay
     // raw where the markup itself is the signal (URLs, hidden-text CSS,
     // attachment filenames).
-    var qp_buf: [8192]u8 = undefined;
-    var text_buf: [8192]u8 = undefined;
-    var b64_buf: [6144]u8 = undefined;
-    var b64_text_buf: [6144]u8 = undefined;
+    var qp_buf: [16384]u8 = undefined;
+    var text_buf: [16384]u8 = undefined;
+    var b64_buf: [12288]u8 = undefined;
+    var b64_text_buf: [12288]u8 = undefined;
     const scan_qp = decodeQuotedPrintable(scan_body, &qp_buf);
     const scan_text = stripHtmlText(scan_qp, &text_buf);
-    const b64_part = decodeBase64Part(scan_body, &b64_buf);
+    const b64_part = decodeBase64Parts(scan_body, &b64_buf);
     const b64_text = if (b64_part.len > 0) stripHtmlText(b64_part, &b64_text_buf) else b64_part;
 
     const Scan = struct {
@@ -617,6 +686,37 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
         }
     };
     const scan = Scan{ .subject = subject, .text = scan_text, .b64 = b64_text };
+
+    // Authenticated-domain parcel phishing. DMARC proves only that the sender
+    // controls (or compromised) its own domain; it does not make a claim to be
+    // DHL/FedEx/UPS/USPS legitimate. Require a carrier/domain mismatch plus a
+    // parcel phrase and at least two payment prompts to keep real tracking and
+    // invoice messages out of Junk.
+    var claimed_carrier: ?@TypeOf(carriers[0]) = null;
+    for (carriers) |carrier| {
+        if (scanHitWord(scan, carrier.brand)) {
+            claimed_carrier = carrier;
+            break;
+        }
+    }
+    var parcel_hits: usize = 0;
+    for (parcel_phrases) |phrase| {
+        if (scan.hit(phrase)) parcel_hits += 1;
+    }
+    var payment_hits: usize = 0;
+    for (payment_phrases) |phrase| {
+        if (scan.hit(phrase)) payment_hits += 1;
+    }
+    if (claimed_carrier) |carrier| {
+        const from_matches = if (from_domain) |fd|
+            domainIsOrSubdomain(fd, carrier.domain)
+        else
+            false;
+        if (!from_matches and parcel_hits > 0 and payment_hits >= 2) {
+            score += 6.0;
+            tl.add("CARRIER_PAYMENT_PHISH");
+        }
+    }
 
     var phrase_hits: f32 = 0;
     for (spam_phrases) |phrase| {
@@ -673,7 +773,7 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
     // scaffolding alone needs 2+ distinct phrases before it counts as
     // solicitation content here.
     if (seo_hits > 0 or harvest_hit or outreach_count >= 2) {
-        if (headerDomain(headers, "From")) |fd| {
+        if (from_domain) |fd| {
             for (free_providers) |fp| {
                 if (std.ascii.eqlIgnoreCase(fd, fp)) {
                     score += 2.0;
@@ -687,7 +787,10 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
     // Link farm: a wall of URLs is a strong bulk-mail signal. Scanned on the
     // QP-decoded view so a soft line break can't split "https://" or a
     // shortener host.
-    const url_count = countOccurrences(scan_qp, "http://") + countOccurrences(scan_qp, "https://");
+    const url_count = countOccurrencesIgnoreCase(scan_qp, "http://") +
+        countOccurrencesIgnoreCase(scan_qp, "https://") +
+        countOccurrencesIgnoreCase(b64_part, "http://") +
+        countOccurrencesIgnoreCase(b64_part, "https://");
     if (url_count >= 20) {
         score += 1.5;
         tl.add("MANY_URLS");
@@ -710,9 +813,9 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
     // QP-decoded view: markup intact (not tag-stripped) but soft breaks unsplit.
     if (signals.dmarc != .pass) {
         const hidden_markers = [_][]const u8{
-            "display:none",       "display: none",
-            "visibility:hidden",  "visibility: hidden",
-            "font-size:0",        "font-size: 0",
+            "display:none",      "display: none",
+            "visibility:hidden", "visibility: hidden",
+            "font-size:0",       "font-size: 0",
         };
         var hidden_hits: usize = 0;
         for (hidden_markers) |m| hidden_hits += countOccurrencesIgnoreCase(scan_qp, m);
@@ -760,6 +863,40 @@ pub fn headerValue(headers: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Return a header value with RFC 5322 continuation lines unfolded into a
+/// caller-owned buffer. This closes a common evasion where a spam phrase is
+/// split immediately after `Subject:` onto a whitespace-prefixed line.
+fn headerValueUnfolded(headers: []const u8, name: []const u8, out: []u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, headers, '\n');
+    var found = false;
+    var len: usize = 0;
+    while (it.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        if (!found) {
+            if (line.len < name.len + 1 or
+                !std.ascii.eqlIgnoreCase(line[0..name.len], name) or
+                line[name.len] != ':') continue;
+            const value = std.mem.trim(u8, line[name.len + 1 ..], " \t");
+            const n = @min(value.len, out.len);
+            @memcpy(out[0..n], value[0..n]);
+            len = n;
+            found = true;
+            continue;
+        }
+        if (line.len == 0 or (line[0] != ' ' and line[0] != '\t')) break;
+        const continuation = std.mem.trim(u8, line, " \t");
+        if (continuation.len == 0 or len >= out.len) continue;
+        if (len > 0) {
+            out[len] = ' ';
+            len += 1;
+        }
+        const n = @min(continuation.len, out.len - len);
+        @memcpy(out[len .. len + n], continuation[0..n]);
+        len += n;
+    }
+    return if (found) out[0..len] else null;
+}
+
 pub fn headerPresent(headers: []const u8, name: []const u8) bool {
     return headerValue(headers, name) != null;
 }
@@ -767,6 +904,10 @@ pub fn headerPresent(headers: []const u8, name: []const u8) bool {
 /// Domain portion of an address-bearing header (e.g. From, Reply-To).
 fn headerDomain(headers: []const u8, name: []const u8) ?[]const u8 {
     const v = headerValue(headers, name) orelse return null;
+    return domainOfHeaderValue(v);
+}
+
+fn domainOfHeaderValue(v: []const u8) ?[]const u8 {
     const at = std.mem.lastIndexOfScalar(u8, v, '@') orelse return null;
     var d = v[at + 1 ..];
     var end: usize = 0;
@@ -777,6 +918,48 @@ fn headerDomain(headers: []const u8, name: []const u8) ?[]const u8 {
     }
     d = d[0..end];
     return if (d.len == 0) null else d;
+}
+
+fn domainIsOrSubdomain(domain: []const u8, expected: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(domain, expected)) return true;
+    return domain.len > expected.len and
+        domain[domain.len - expected.len - 1] == '.' and
+        std.ascii.eqlIgnoreCase(domain[domain.len - expected.len ..], expected);
+}
+
+/// Match a complete DNS label, not an arbitrary substring. Without label
+/// boundaries a sender like `paypal-security.example` could evade display-name
+/// spoof detection merely by putting the impersonated brand in its domain.
+fn domainHasLabel(domain: []const u8, label: []const u8) bool {
+    var it = std.mem.splitScalar(u8, domain, '.');
+    while (it.next()) |part| {
+        if (std.ascii.eqlIgnoreCase(part, label)) return true;
+    }
+    return false;
+}
+
+fn isWordByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+fn containsWordIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    var pos: usize = 0;
+    while (std.ascii.indexOfIgnoreCasePos(haystack, pos, needle)) |at| {
+        const before_ok = at == 0 or !isWordByte(haystack[at - 1]);
+        const end = at + needle.len;
+        const after_ok = end == haystack.len or !isWordByte(haystack[end]);
+        if (before_ok and after_ok) return true;
+        pos = at + 1;
+    }
+    return false;
+}
+
+fn scanHitWord(scan: anytype, word: []const u8) bool {
+    if (scan.subject) |s| {
+        if (containsWordIgnoreCase(s, word)) return true;
+    }
+    return containsWordIgnoreCase(scan.text, word) or
+        (scan.b64.len > 0 and containsWordIgnoreCase(scan.b64, word));
 }
 
 fn isMostlyUppercase(s: []const u8) bool {
@@ -896,6 +1079,13 @@ test "dangerous attachment flagged" {
     try std.testing.expect(std.mem.indexOf(u8, r.tests(), "DANGEROUS_ATTACHMENT") != null);
 }
 
+test "RFC 2231 encoded dangerous attachment is flagged" {
+    const headers = "From: x@y.example\nSubject: invoice\nDate: d\nMessage-ID: <1@y>";
+    const body = "Content-Disposition: attachment; filename*=UTF-8''invoice%2Eps1\n";
+    const r = evaluate(.{ .spf = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "DANGEROUS_ATTACHMENT") != null);
+}
+
 test "bare-domain link is not a dangerous attachment" {
     const headers = "From: Hetzner <support-cloud@hetzner.com>\nSubject: Invoice\nDate: d\nMessage-ID: <1@hetzner.com>";
     // A newsletter that links to the sender's homepage — the old body-wide
@@ -973,6 +1163,42 @@ test "unsolicited SEO pitch from a free provider lands in Junk" {
     try std.testing.expectEqual(Disposition.junk, r.disposition);
 }
 
+test "real-world organic traffic follow-up lands in Junk" {
+    const headers =
+        "From: Ronit Roy <ronitroy17906@outlook.com>\n" ++
+        "To: info@example.com\n" ++
+        "Subject: Gentle Reminder.....\n" ++
+        "Date: Mon, 6 Jul 2026 11:17:07 +0000\n" ++
+        "Message-ID: <1@outlook.com>";
+    const body =
+        "Hi, Hope you're doing well. I wanted to follow up and see if you're interested in " ++
+        "improving your website's visibility on Google. I can share details along with pricing. " ++
+        "Many great websites struggle because they aren't properly optimized for search engines. " ++
+        "We fix that - improving rankings, visibility, and conversions through data-driven SEO " ++
+        "strategies. Would you like to explore how we can optimize your site? I can send our " ++
+        "proposal and pricing.";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "SEO_SOLICITATION") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "FREEMAIL_OUTREACH") != null);
+    try std.testing.expectEqual(Disposition.junk, r.disposition);
+}
+
+test "real-world website ranking error pitch lands in Junk" {
+    const headers =
+        "From: Jessica <jessica@seopackagesprice.com>\n" ++
+        "To: info@example.com\n" ++
+        "Subject: Increase Web Reach\n" ++
+        "Date: Mon, 6 Jul 2026 14:23:36 +0530\n" ++
+        "Message-ID: <1@seopackagesprice.com>";
+    const body =
+        "Hi info@example.com, Greetings, I noticed some errors at your website ranking. " ++
+        "I can help to fix errors for better Google ranking. " ++
+        "May I send you screenshots of these errors? Sincerely, Jessica";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "SEO_SOLICITATION") != null);
+    try std.testing.expectEqual(Disposition.junk, r.disposition);
+}
+
 test "fabricated reply prefix without thread headers is flagged" {
     const headers =
         "From: Lucy <lucy@lexxdigital.com>\n" ++
@@ -1004,6 +1230,23 @@ test "brand name in display with unrelated domain is brand spoofing" {
     try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_SPOOF") != null);
 }
 
+test "brand in lookalike sender domain does not bypass spoof detection" {
+    const headers =
+        "From: PayPal <billing@paypal-security.example>\n" ++
+        "Subject: Account notice\nDate: d\nMessage-ID: <1@paypal-security.example>";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, "review account", .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_SPOOF") != null);
+}
+
+test "encoded brand in folded From header is still detected" {
+    const headers =
+        "From: =?UTF-8?B?UGF5UGFs?=\n" ++
+        " <billing@unrelated.example>\n" ++
+        "Subject: Account notice\nDate: d\nMessage-ID: <1@unrelated.example>";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, "review account", .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_SPOOF") != null);
+}
+
 test "legit brand mail from its own domain is not brand spoofing" {
     const headers =
         "From: Netflix <info@mailer.netflix.com>\n" ++
@@ -1012,6 +1255,83 @@ test "legit brand mail from its own domain is not brand spoofing" {
         "Message-ID: <1@netflix.com>";
     const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, "watch now\n", .{});
     try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_SPOOF") == null);
+}
+
+test "authenticated parcel payment phishing lands in Junk" {
+    const headers =
+        "From: Customs Department <random@blueoceancorp.com.vn>\n" ++
+        "To: victim@example.com\n" ++
+        "Subject: Shipment held - fee required\n" ++
+        "Date: Thu, 9 Jul 2026 12:38:39 +0700\n" ++
+        "Message-ID: <1@blueoceancorp.com.vn>";
+    const body =
+        "DHL Express Shipment Release Information. We received the customs documentation. " ++
+        "A fee must be paid before final delivery. Total amount due $3.35. " ++
+        "Status: Awaiting payment at the local facility. Make payment to complete the process.";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "CARRIER_PAYMENT_PHISH") != null);
+    try std.testing.expectEqual(Disposition.junk, r.disposition);
+}
+
+test "legitimate carrier tracking notice is not parcel payment phishing" {
+    const headers =
+        "From: Shop <shipping@trusted-shop.example>\n" ++
+        "To: customer@example.com\n" ++
+        "Subject: Your order shipped\nDate: d\nMessage-ID: <1@trusted-shop.example>";
+    const body = "DHL has your parcel. Track the shipment for the expected final delivery date.";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "CARRIER_PAYMENT_PHISH") == null);
+    try std.testing.expectEqual(Disposition.accept, r.disposition);
+}
+
+test "legitimate carrier payment mail from carrier domain is not impersonation" {
+    const headers =
+        "From: DHL <billing@dhl.com>\nTo: customer@example.com\n" ++
+        "Subject: Customs fee required\nDate: d\nMessage-ID: <1@dhl.com>";
+    const body = "DHL shipment release: customs fee required, amount due, make payment.";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "CARRIER_PAYMENT_PHISH") == null);
+    try std.testing.expectEqual(Disposition.accept, r.disposition);
+}
+
+test "UPS is matched as a word and not inside groups" {
+    const headers =
+        "From: Community <hello@community.example>\nTo: a@b\n" ++
+        "Subject: Local groups\nDate: d\nMessage-ID: <1@community.example>";
+    const body = "Our community groups discussed shipment release and amount due, then make payment.";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "CARRIER_PAYMENT_PHISH") == null);
+}
+
+test "folded subject is unfolded before scoring" {
+    const headers =
+        "From: x@promo.example\nTo: a@b\n" ++
+        "Subject: Shipment held -\n\tfee required\n" ++
+        "Date: d\nMessage-ID: <1@promo.example>";
+    const body = "DHL shipment release, amount due, awaiting payment at the local facility.";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "CARRIER_PAYMENT_PHISH") != null);
+}
+
+test "content padded beyond eight KiB is still scanned" {
+    const headers =
+        "From: x@promo.example\nTo: a@b\nSubject: hello\nDate: d\nMessage-ID: <1@promo.example>";
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(std.testing.allocator);
+    try body.appendNTimes(std.testing.allocator, 'x', 9000);
+    try body.appendSlice(std.testing.allocator, " DHL shipment release fee required amount due awaiting payment");
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body.items, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "CARRIER_PAYMENT_PHISH") != null);
+}
+
+test "uppercase URL schemes count toward link farm" {
+    const headers = "From: x@y.example\nSubject: links\nDate: d\nMessage-ID: <1@y>";
+    const body = "HTTPS://a.test HTTPS://b.test HTTPS://c.test HTTPS://d.test HTTPS://e.test " ++
+        "HTTPS://f.test HTTPS://g.test HTTPS://h.test HTTPS://i.test HTTPS://j.test " ++
+        "HTTPS://k.test HTTPS://l.test HTTPS://m.test HTTPS://n.test HTTPS://o.test " ++
+        "HTTPS://p.test HTTPS://q.test HTTPS://r.test HTTPS://s.test HTTPS://t.test";
+    const r = evaluate(.{ .spf = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "MANY_URLS") != null);
 }
 
 test "real-world app-dev cold outreach (QP, outlook freemail) lands in Junk" {
@@ -1070,6 +1390,27 @@ test "base64-encoded MIME part cannot hide the pitch" {
     try std.testing.expect(std.mem.indexOf(u8, r.tests(), "OUTREACH_PITCH") != null);
 }
 
+test "a benign first base64 part cannot hide spam in a later part" {
+    const headers = "From: x@gmail.com\nTo: a@b\nSubject: hello\nDate: d\nMessage-ID: <1@g>";
+    const body =
+        "--b\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\n" ++
+        "SGVsbG8sIHRoaXMgaXMgYSBub3JtYWwgYWx0ZXJuYXRpdmUu\r\n" ++
+        "--b\r\nContent-Type: text/html\r\nContent-Transfer-Encoding: base64\r\n\r\n" ++
+        "c2VvIHNlcnZpY2VzIG1vYmlsZSBhcHAgZGV2ZWxvcG1lbnQgcHJpY2UgbGlzdCB3aGF0c2FwcA==\r\n--b--\r\n";
+    const r = evaluate(.{ .spf = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "SEO_SOLICITATION") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "CONTACT_HARVEST") != null);
+}
+
+test "URLs in a base64 MIME part count toward link farm" {
+    const headers = "From: x@y.example\nSubject: links\nDate: d\nMessage-ID: <1@y>";
+    const body =
+        "--b\r\nContent-Type: text/html\r\nContent-Transfer-Encoding: base64\r\n\r\n" ++
+        "aHR0cHM6Ly9hLnRlc3QgaHR0cHM6Ly9iLnRlc3QgaHR0cHM6Ly9jLnRlc3QgaHR0cHM6Ly9kLnRlc3QgaHR0cHM6Ly9lLnRlc3QgaHR0cHM6Ly9mLnRlc3QgaHR0cHM6Ly9nLnRlc3QgaHR0cHM6Ly9oLnRlc3QgaHR0cHM6Ly9pLnRlc3QgaHR0cHM6Ly9qLnRlc3QgaHR0cHM6Ly9rLnRlc3QgaHR0cHM6Ly9sLnRlc3QgaHR0cHM6Ly9tLnRlc3QgaHR0cHM6Ly9uLnRlc3QgaHR0cHM6Ly9vLnRlc3QgaHR0cHM6Ly9wLnRlc3QgaHR0cHM6Ly9xLnRlc3QgaHR0cHM6Ly9yLnRlc3QgaHR0cHM6Ly9zLnRlc3QgaHR0cHM6Ly90LnRlc3Q=\r\n--b--\r\n";
+    const r = evaluate(.{ .spf = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "MANY_URLS") != null);
+}
+
 test "encoded-word subject is decoded before subject heuristics" {
     // =?UTF-8?B?...?= of "WIN A FREE IPHONE RIGHT NOW!!"
     const headers =
@@ -1087,6 +1428,30 @@ test "html entities cannot split a phrase" {
     const r = evaluate(.{ .spf = .pass }, headers, body, .{});
     try std.testing.expect(std.mem.indexOf(u8, r.tests(), "SEO_SOLICITATION") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.tests(), "OUTREACH_PITCH") != null);
+}
+
+test "numeric HTML entities cannot split a phrase" {
+    const headers = "From: x@gmail.com\nTo: a@b\nSubject: hi\nDate: d\nMessage-ID: <1@g>";
+    const body = "we offer mobile&#32;app development and seo&#x20;services";
+    const r = evaluate(.{ .spf = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "SEO_SOLICITATION") != null);
+}
+
+test "zero-width Unicode cannot split a phrase" {
+    const headers = "From: x@gmail.com\nTo: a@b\nSubject: hi\nDate: d\nMessage-ID: <1@g>";
+    const body = "we offer mobile\xE2\x80\x8B app development and seo ser&#8203;vices";
+    const r = evaluate(.{ .spf = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "SEO_SOLICITATION") != null);
+}
+
+test "long subject is not truncated at 512 bytes" {
+    var headers: std.ArrayList(u8) = .empty;
+    defer headers.deinit(std.testing.allocator);
+    try headers.appendSlice(std.testing.allocator, "From: x@y.example\nSubject: ");
+    try headers.appendNTimes(std.testing.allocator, 'x', 600);
+    try headers.appendSlice(std.testing.allocator, " viagra\nDate: d\nMessage-ID: <1@y>");
+    const r = evaluate(.{ .spf = .pass }, headers.items, "", .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "SPAM_PHRASES") != null);
 }
 
 test "undisclosed recipients is flagged" {
