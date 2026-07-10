@@ -32,6 +32,16 @@ const max_outbound_workers: usize = 64;
 /// before spawning a worker and decremented when the worker exits.
 var outbound_worker_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
+/// Monotonic suffix for Maildir names. Millisecond timestamps alone collide
+/// under concurrent delivery and `createFile` would truncate the first message.
+var maildir_sequence: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+fn maildirBasename(buf: []u8) ![]const u8 {
+    const ts = time_compat.milliTimestamp();
+    const seq = maildir_sequence.fetchAdd(1, .monotonic);
+    return std.fmt.bufPrint(buf, "{d}.{d}.eml", .{ ts, seq });
+}
+
 /// Try to reserve a slot for a new outbound worker. Returns true if a slot was
 /// reserved (caller must ensure the worker decrements the counter on exit),
 /// false if the in-flight limit has been reached.
@@ -47,6 +57,10 @@ fn tryReserveOutboundSlot() bool {
 
 fn releaseOutboundSlot() void {
     _ = outbound_worker_count.fetchSub(1, .monotonic);
+}
+
+fn shouldRunInboundPipeline(authenticated: bool, antispam_check: bool, spam_filter_enabled: bool) bool {
+    return !authenticated and (antispam_check or spam_filter_enabled);
 }
 
 /// Sanitize a string for safe logging — strip control characters that could
@@ -186,6 +200,22 @@ pub const SMTPCommand = enum {
     STARTTLS,
     UNKNOWN,
 };
+
+test "spam filtering runs independently of authentication checks" {
+    try std.testing.expect(shouldRunInboundPipeline(false, false, true));
+    try std.testing.expect(shouldRunInboundPipeline(false, true, false));
+    try std.testing.expect(!shouldRunInboundPipeline(false, false, false));
+    try std.testing.expect(!shouldRunInboundPipeline(true, true, true));
+}
+
+test "maildir basenames are unique within one millisecond" {
+    var a_buf: [64]u8 = undefined;
+    var b_buf: [64]u8 = undefined;
+    const a = try maildirBasename(&a_buf);
+    const b = try maildirBasename(&b_buf);
+    try std.testing.expect(!std.mem.eql(u8, a, b));
+    try std.testing.expect(std.mem.endsWith(u8, a, ".eml"));
+}
 
 /// Process-wide counter for synthesized Message-IDs.
 var msgid_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
@@ -1178,9 +1208,12 @@ pub const Session = struct {
         // already trusted via AUTH. Records an Authentication-Results header
         // and is advisory unless SMTP_ANTISPAM_ENFORCE is set.
         var to_junk = false;
-        if (self.config.antispam_check and !self.authenticated) {
-            const auth_res = self.runInboundAntispam(&message_data);
-            if (auth_res.reject_policy) {
+        if (shouldRunInboundPipeline(self.authenticated, self.config.antispam_check, self.config.spam_filter_enabled)) {
+            const auth_res: InboundAuth = if (self.config.antispam_check)
+                self.runInboundAntispam(&message_data)
+            else
+                .{};
+            if (self.config.antispam_check and auth_res.reject_policy) {
                 try self.sendResponse(writer, 550, "5.7.1 Message rejected by mail authentication policy", null);
                 // Reset WITHOUT a response — handleRset() answers the RSET
                 // command with 250, and an unsolicited 250 here desyncs the
@@ -1512,9 +1545,16 @@ pub const Session = struct {
                     msg_buf.appendSlice(self.allocator, message) catch break :blk false;
                     break :blk true;
                 };
-                if (have_copy and self.config.antispam_check and !self.authenticated) {
-                    const auth_res = self.runInboundAntispam(&msg_buf);
-                    if (auth_res.reject_policy) {
+                if (have_copy and shouldRunInboundPipeline(
+                    self.authenticated,
+                    self.config.antispam_check,
+                    self.config.spam_filter_enabled,
+                )) {
+                    const auth_res: InboundAuth = if (self.config.antispam_check)
+                        self.runInboundAntispam(&msg_buf)
+                    else
+                        .{};
+                    if (self.config.antispam_check and auth_res.reject_policy) {
                         try self.sendResponse(writer, 550, "5.7.1 Message rejected by mail authentication policy", null);
                         // Full transaction reset (frees the BDAT session and
                         // the envelope) so a follow-up MAIL starts clean.
@@ -1962,7 +2002,6 @@ pub const Session = struct {
 
     fn saveMessage(self: *Session, data: []const u8, to_junk: bool) !void {
         const cwd = fs_compat.cwd();
-        const timestamp = time_compat.milliTimestamp();
         const sender = self.mail_from orelse "unknown";
         // Spam goes into the recipient's Junk mailbox (a flat Maildir subfolder,
         // mail/<user>/<Junk>/), everything else into the inbox (mail/<user>/new).
@@ -1999,22 +2038,29 @@ pub const Session = struct {
 
                 const new_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ username, sub });
                 defer self.allocator.free(new_dir);
-                cwd.makePath(new_dir) catch {};
+                cwd.makePath(new_dir) catch |err| {
+                    self.logger.err("Failed to create mailbox directory {s}: {}", .{ new_dir, err });
+                    return error.MaildirCreateFailed;
+                };
 
-                const filename = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}/{d}.eml", .{ username, sub, timestamp });
+                var base_buf: [64]u8 = undefined;
+                const basename = try maildirBasename(&base_buf);
+                const filename = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}/{s}", .{ username, sub, basename });
                 defer self.allocator.free(filename);
 
-                const file = cwd.createFile(filename, .{}) catch |err| {
+                const file = cwd.createFile(filename, .{ .exclusive = true }) catch |err| {
                     self.logger.err("Failed to create message file {s}: {}", .{ filename, err });
-                    continue;
+                    return error.MaildirCreateFailed;
                 };
-                defer file.close();
 
                 // Write the raw message data as-is (it already contains headers from the client)
                 file.writeAll(data) catch |err| {
+                    file.close();
+                    cwd.deleteFile(filename) catch {};
                     self.logger.err("Failed to write message data to {s}: {}", .{ filename, err });
-                    continue;
+                    return error.MaildirWriteFailed;
                 };
+                file.close();
 
                 self.logger.debug("Message saved to {s}", .{filename});
 
@@ -2023,10 +2069,7 @@ pub const Session = struct {
                 if (to_junk) continue;
 
                 // Index for full-text search (best-effort, detached thread)
-                var base_buf: [64]u8 = undefined;
-                if (std.fmt.bufPrint(&base_buf, "{d}.eml", .{timestamp})) |base| {
-                    typesense.indexMessageAsync(self.allocator, username, "INBOX", base, data);
-                } else |_| {}
+                typesense.indexMessageAsync(self.allocator, username, "INBOX", basename, data);
 
                 // Check for auto-forwarding rules
                 self.checkAndForward(username, sender, data) catch |err| {
@@ -2038,12 +2081,14 @@ pub const Session = struct {
                 // Bound the number of in-flight worker threads to avoid resource
                 // exhaustion from a flood of recipients.
                 if (!tryReserveOutboundSlot()) {
-                    self.logger.warn("Outbound worker limit reached; dropping background delivery to {s}", .{rcpt});
+                    self.logger.warn("Outbound worker limit reached; queueing delivery to {s}", .{rcpt});
+                    retry.enqueueFailure(sender, rcpt, data);
                     continue;
                 }
                 self.logger.info("Queueing outbound delivery to: {s}", .{rcpt});
                 const bg = self.allocator.create(OutboundContext) catch {
                     releaseOutboundSlot();
+                    retry.enqueueFailure(sender, rcpt, data);
                     continue;
                 };
                 bg.* = .{
@@ -2051,12 +2096,14 @@ pub const Session = struct {
                     .from = self.allocator.dupe(u8, sender) catch {
                         self.allocator.destroy(bg);
                         releaseOutboundSlot();
+                        retry.enqueueFailure(sender, rcpt, data);
                         continue;
                     },
                     .to = self.allocator.dupe(u8, rcpt) catch {
                         self.allocator.free(bg.from);
                         self.allocator.destroy(bg);
                         releaseOutboundSlot();
+                        retry.enqueueFailure(sender, rcpt, data);
                         continue;
                     },
                     .data = self.allocator.dupe(u8, data) catch {
@@ -2064,6 +2111,7 @@ pub const Session = struct {
                         self.allocator.free(bg.to);
                         self.allocator.destroy(bg);
                         releaseOutboundSlot();
+                        retry.enqueueFailure(sender, rcpt, data);
                         continue;
                     },
                     .hostname = self.config.hostname,
@@ -2077,6 +2125,7 @@ pub const Session = struct {
                     self.allocator.free(bg.from);
                     self.allocator.destroy(bg);
                     releaseOutboundSlot();
+                    retry.enqueueFailure(sender, rcpt, data);
                     continue;
                 };
                 thread.detach();
@@ -2180,33 +2229,38 @@ pub const Session = struct {
                     aliases.resolve(forward_to);
 
                 const cwd = fs_compat.cwd();
-                const ts = time_compat.milliTimestamp();
-                const fwd_dir = std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{fwd_username}) catch continue;
+                const fwd_dir = std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{fwd_username}) catch return error.OutOfMemory;
                 defer self.allocator.free(fwd_dir);
-                cwd.makePath(fwd_dir) catch {};
+                cwd.makePath(fwd_dir) catch return error.ForwardDirectoryFailed;
 
-                const fwd_filename = std.fmt.allocPrint(self.allocator, "mail/{s}/new/{d}.eml", .{ fwd_username, ts }) catch continue;
+                var fwd_base_buf: [64]u8 = undefined;
+                const fwd_basename = maildirBasename(&fwd_base_buf) catch return error.ForwardNameFailed;
+                const fwd_filename = std.fmt.allocPrint(self.allocator, "mail/{s}/new/{s}", .{ fwd_username, fwd_basename }) catch return error.OutOfMemory;
                 defer self.allocator.free(fwd_filename);
 
-                const file = cwd.createFile(fwd_filename, .{}) catch |err| {
+                const file = cwd.createFile(fwd_filename, .{ .exclusive = true }) catch |err| {
                     self.logger.err("Failed to create forward file {s}: {}", .{ fwd_filename, err });
-                    continue;
+                    return error.ForwardCreateFailed;
                 };
-                defer file.close();
                 file.writeAll(data) catch |err| {
+                    file.close();
+                    cwd.deleteFile(fwd_filename) catch {};
                     self.logger.err("Failed to write forward data to {s}: {}", .{ fwd_filename, err });
-                    continue;
+                    return error.ForwardWriteFailed;
                 };
+                file.close();
                 self.logger.info("Local forward from {s} to {s} saved to {s}", .{ username, fwd_username, fwd_filename });
             } else {
                 // External forward: relay via SES. Bound the number of in-flight
                 // worker threads to avoid resource exhaustion.
                 if (!tryReserveOutboundSlot()) {
-                    self.logger.warn("Outbound worker limit reached; dropping forward to {s}", .{forward_to});
+                    self.logger.warn("Outbound worker limit reached; queueing forward to {s}", .{forward_to});
+                    retry.enqueueFailure(sender, forward_to, data);
                     continue;
                 }
                 const bg = self.allocator.create(OutboundContext) catch {
                     releaseOutboundSlot();
+                    retry.enqueueFailure(sender, forward_to, data);
                     continue;
                 };
                 bg.* = .{
@@ -2214,12 +2268,14 @@ pub const Session = struct {
                     .from = self.allocator.dupe(u8, sender) catch {
                         self.allocator.destroy(bg);
                         releaseOutboundSlot();
+                        retry.enqueueFailure(sender, forward_to, data);
                         continue;
                     },
                     .to = self.allocator.dupe(u8, forward_to) catch {
                         self.allocator.free(bg.from);
                         self.allocator.destroy(bg);
                         releaseOutboundSlot();
+                        retry.enqueueFailure(sender, forward_to, data);
                         continue;
                     },
                     .data = self.allocator.dupe(u8, data) catch {
@@ -2227,6 +2283,7 @@ pub const Session = struct {
                         self.allocator.free(bg.to);
                         self.allocator.destroy(bg);
                         releaseOutboundSlot();
+                        retry.enqueueFailure(sender, forward_to, data);
                         continue;
                     },
                     .hostname = self.config.hostname,
@@ -2240,6 +2297,7 @@ pub const Session = struct {
                     self.allocator.free(bg.from);
                     self.allocator.destroy(bg);
                     releaseOutboundSlot();
+                    retry.enqueueFailure(sender, forward_to, data);
                     continue;
                 };
                 thread.detach();
