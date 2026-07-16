@@ -15,6 +15,7 @@
 const std = @import("std");
 const time_compat = @import("../core/time_compat.zig");
 const fs_compat = @import("../core/fs_compat.zig");
+const io_compat = @import("../core/io_compat.zig");
 const config = @import("../core/config.zig");
 const database = @import("../storage/database.zig");
 const queue_mod = @import("queue.zig");
@@ -185,7 +186,9 @@ fn deliverBounceLocally(s: *State, from_addr: []const u8, failed_to: []const u8,
     defer s.allocator.free(dsn);
 
     const ts = time_compat.milliTimestamp();
-    const nonce = std.crypto.random.int(u64);
+    var nonce_bytes: [8]u8 = undefined;
+    io_compat.randomBytes(&nonce_bytes);
+    const nonce = std.mem.readInt(u64, &nonce_bytes, .little);
     const dir = std.fmt.allocPrint(s.allocator, "mail/{s}/new", .{mailbox}) catch return;
     defer s.allocator.free(dir);
     fs_compat.cwd().makePath(dir) catch {};
@@ -193,7 +196,7 @@ fn deliverBounceLocally(s: *State, from_addr: []const u8, failed_to: []const u8,
     const path = std.fmt.allocPrint(s.allocator, "{s}/{d}.{d}.eml", .{ dir, ts, nonce }) catch return;
     defer s.allocator.free(path);
 
-    const file = fs_compat.cwd().createFile(path, .{ .exclusive = true }) catch |err| {
+    const file = fs_compat.cwd().createFileExclusive(path) catch |err| {
         std.log.err("failed to write DSN for {s}: {}", .{ from_addr, err });
         return;
     };

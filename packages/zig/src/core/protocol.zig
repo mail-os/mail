@@ -2048,7 +2048,7 @@ pub const Session = struct {
                 const filename = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}/{s}", .{ username, sub, basename });
                 defer self.allocator.free(filename);
 
-                const file = cwd.createFile(filename, .{ .exclusive = true }) catch |err| {
+                const file = cwd.createFileExclusive(filename) catch |err| {
                     self.logger.err("Failed to create message file {s}: {}", .{ filename, err });
                     return error.MaildirCreateFailed;
                 };
@@ -2238,7 +2238,7 @@ pub const Session = struct {
                 const fwd_filename = std.fmt.allocPrint(self.allocator, "mail/{s}/new/{s}", .{ fwd_username, fwd_basename }) catch return error.OutOfMemory;
                 defer self.allocator.free(fwd_filename);
 
-                const file = cwd.createFile(fwd_filename, .{ .exclusive = true }) catch |err| {
+                const file = cwd.createFileExclusive(fwd_filename) catch |err| {
                     self.logger.err("Failed to create forward file {s}: {}", .{ fwd_filename, err });
                     return error.ForwardCreateFailed;
                 };
