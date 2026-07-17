@@ -1,5 +1,20 @@
 # Release Notes
 
+## v0.1.3
+
+### Fixes
+
+- fix(cli): probe systemctl by invoking it during `mail upgrade` — `command -v` is a shell builtin and cannot be exec'd directly, so upgrades always reported "systemctl not available" and skipped the service restart
+- ci(version): run bump from packages/zig where build.zig.zon lives, fixing the manual Version Management workflow
+
+Prebuilt binaries for linux & macOS (x86_64 + arm64) are attached below.
+
+Install via pantry:
+
+```sh
+pantry install github.com/mail-os/mail
+```
+
 ## v0.1.2
 
 ### Highlights
