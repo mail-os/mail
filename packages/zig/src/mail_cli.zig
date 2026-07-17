@@ -11,6 +11,7 @@ const gdpr_mod = @import("cli/gdpr.zig");
 const search_mod = @import("cli/search.zig");
 const benchmark_mod = @import("cli/benchmark.zig");
 const backup_mod = @import("cli/backup.zig");
+const upgrade_mod = @import("cli/upgrade.zig");
 
 pub fn main(init: std.process.Init) !void {
     io_compat.initIo(init.io);
@@ -32,6 +33,7 @@ pub fn main(init: std.process.Init) !void {
     _ = try root_cmd.addCommand(try search_mod.setup(allocator));
     _ = try root_cmd.addCommand(try benchmark_mod.setup(allocator));
     _ = try root_cmd.addCommand(try backup_mod.setup(allocator));
+    _ = try root_cmd.addCommand(try upgrade_mod.setup(allocator));
 
     // Collect args (skip program name)
     var args_list: std.ArrayList([]const u8) = .empty;
