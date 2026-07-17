@@ -592,6 +592,46 @@ const AggregateMailboxEntry = struct {
     sort_key: i64,
 };
 
+const AppendArgs = struct {
+    mailbox: []const u8,
+    flags: ?[]const u8,
+};
+
+/// Parse the APPEND arguments that precede the `{N}` literal:
+/// `mailbox [(\Flag ...)] ["date-time"]`. The mailbox may be quoted
+/// (e.g. `"All Mail"`); the flag list and the obsolete date-time are
+/// optional per RFC 3501 Section 6.3.11. The date-time is accepted and
+/// ignored — filenames carry their own arrival timestamp.
+fn parseAppendArgs(args_raw: []const u8) AppendArgs {
+    const args = std.mem.trim(u8, args_raw, " \t");
+    var result = AppendArgs{ .mailbox = "INBOX", .flags = null };
+    if (args.len == 0) return result;
+
+    var cursor: usize = 0;
+    if (args[0] == '"') {
+        if (std.mem.indexOfScalarPos(u8, args, 1, '"')) |q| {
+            result.mailbox = args[1..q];
+            cursor = q + 1;
+        } else {
+            // Unterminated quote — take the rest as the mailbox name.
+            result.mailbox = args[1..];
+            return result;
+        }
+    } else {
+        const sp = std.mem.indexOfScalar(u8, args, ' ') orelse args.len;
+        result.mailbox = args[0..sp];
+        cursor = sp;
+    }
+
+    const tail = std.mem.trim(u8, args[cursor..], " \t");
+    if (tail.len > 0 and tail[0] == '(') {
+        if (std.mem.indexOfScalar(u8, tail, ')')) |cp| {
+            result.flags = tail[1..cp];
+        }
+    }
+    return result;
+}
+
 fn parseMessageSortKey(filename: []const u8) i64 {
     const basename = if (std.mem.lastIndexOfScalar(u8, filename, '/')) |pos| filename[pos + 1 ..] else filename;
     const no_flags = MaildirFlags.baseName(basename);
@@ -772,6 +812,7 @@ pub const ImapSession = struct {
     // Pending APPEND literal state
     append_tag: ?[]u8 = null,
     append_mailbox: ?[]u8 = null,
+    append_flags: ?[]u8 = null,
     append_literal_size: usize = 0,
     append_literal_buf: ?[]u8 = null,
     append_literal_pos: usize = 0,
@@ -1499,6 +1540,10 @@ pub const ImapSession = struct {
             self.allocator.free(m);
             self.append_mailbox = null;
         }
+        if (self.append_flags) |f| {
+            self.allocator.free(f);
+            self.append_flags = null;
+        }
         if (self.append_literal_buf) |b| {
             self.allocator.free(b);
             self.append_literal_buf = null;
@@ -1539,9 +1584,35 @@ pub const ImapSession = struct {
         // Create directory if it doesn't exist
         fs_compat.cwd().makePath(folder_dir) catch {};
 
-        // Write message file with timestamp-based name
+        // Write message file with timestamp-based name, honoring the flags
+        // from the APPEND command (e.g. APPEND "Sent" (\Seen) {...}). Without
+        // this, sent/draft copies saved by clients land on disk flagless and
+        // surface as "unread" in folder counts (STATUS UNSEEN, webmail, and
+        // client badges such as Apple Mail's).
+        var msg_flags = MaildirFlags{};
+        if (self.append_flags) |fs| {
+            // No +/- prefix: applyAction treats the list as the full flag set.
+            msg_flags.applyAction(fs);
+        } else if (std.ascii.eqlIgnoreCase(mailbox, "Sent") or std.ascii.eqlIgnoreCase(mailbox, "Drafts")) {
+            // Clients that omit the flag list for Sent/Drafts still expect
+            // those copies to be read — they are the user's own messages.
+            msg_flags.seen = true;
+        }
         const timestamp = time_compat.milliTimestamp();
-        const filepath = try std.fmt.allocPrint(self.allocator, "{s}/{d}.eml", .{ folder_dir, timestamp });
+        var name_buf: [640]u8 = undefined;
+        const file_name = if (msg_flags.seen or msg_flags.answered or msg_flags.flagged or msg_flags.draft or msg_flags.deleted) blk: {
+            var suffix_buf: [16]u8 = undefined;
+            break :blk std.fmt.bufPrint(&name_buf, "{d}.eml{s}", .{ timestamp, msg_flags.toSuffix(&suffix_buf) }) catch {
+                try self.sendResponse(tag, "NO", "Failed to save message");
+                self.cleanupAppend();
+                return;
+            };
+        } else std.fmt.bufPrint(&name_buf, "{d}.eml", .{timestamp}) catch {
+            try self.sendResponse(tag, "NO", "Failed to save message");
+            self.cleanupAppend();
+            return;
+        };
+        const filepath = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ folder_dir, file_name });
         defer self.allocator.free(filepath);
 
         const file = fs_compat.cwd().createFile(filepath, .{}) catch {
@@ -3621,9 +3692,13 @@ pub const ImapSession = struct {
                                 return;
                             }
 
-                            // Parse mailbox name (first arg after APPEND)
-                            const mailbox_raw = parts.next() orelse "INBOX";
-                            const mailbox = stripQuotes(mailbox_raw);
+                            // Parse mailbox name plus the optional flag list
+                            // and date-time preceding the {N} literal, e.g.
+                            //   APPEND "Sent" (\Seen) "14-Jul-2026 09:58:00 +0000" {1234}
+                            // Parsing from `rest` (not the space-split `parts`)
+                            // keeps quoted names with spaces ("All Mail") intact.
+                            const parsed = parseAppendArgs(rest[0..brace_start]);
+                            const mailbox = parsed.mailbox;
 
                             // Reject invalid/unsafe mailbox names up front rather
                             // than after buffering the whole literal.
@@ -3636,6 +3711,9 @@ pub const ImapSession = struct {
                             self.cleanupAppend();
                             self.append_tag = try self.allocator.dupe(u8, tag);
                             self.append_mailbox = try self.allocator.dupe(u8, mailbox);
+                            if (parsed.flags) |fs| {
+                                self.append_flags = try self.allocator.dupe(u8, fs);
+                            }
                             self.append_literal_size = literal_size;
                             self.append_literal_buf = try self.allocator.alloc(u8, literal_size);
                             self.append_literal_pos = 0;
@@ -4489,6 +4567,43 @@ test "Maildir flags drive unseen counts" {
     try testing.expect(MaildirFlags.fromFilename("1770000000000.eml").seen == false);
     try testing.expect(MaildirFlags.fromFilename("1770000000001.eml:2,S").seen);
     try testing.expect(MaildirFlags.fromFilename("1770000000002.eml:2,FS").flagged);
+}
+
+test "parseAppendArgs parses mailbox, flags and date-time" {
+    const testing = std.testing;
+
+    const bare = parseAppendArgs("INBOX");
+    try testing.expectEqualStrings("INBOX", bare.mailbox);
+    try testing.expect(bare.flags == null);
+
+    const quoted = parseAppendArgs("\"All Mail\" (\\Seen)");
+    try testing.expectEqualStrings("All Mail", quoted.mailbox);
+    try testing.expectEqualStrings("\\Seen", quoted.flags.?);
+
+    const with_date = parseAppendArgs("\"Sent\" (\\Seen \\Draft) \"14-Jul-2026 09:58:00 +0000\"");
+    try testing.expectEqualStrings("Sent", with_date.mailbox);
+    try testing.expectEqualStrings("\\Seen \\Draft", with_date.flags.?);
+
+    const empty_flags = parseAppendArgs("Drafts ()");
+    try testing.expectEqualStrings("Drafts", empty_flags.mailbox);
+    try testing.expectEqualStrings("", empty_flags.flags.?);
+
+    const date_only = parseAppendArgs("INBOX \"14-Jul-2026 09:58:00 +0000\"");
+    try testing.expectEqualStrings("INBOX", date_only.mailbox);
+    try testing.expect(date_only.flags == null);
+}
+
+test "APPEND flag list maps to Maildir flags" {
+    const testing = std.testing;
+
+    var flags = MaildirFlags{};
+    flags.applyAction("\\Seen \\Draft");
+    try testing.expect(flags.seen);
+    try testing.expect(flags.draft);
+    try testing.expect(!flags.flagged);
+
+    var suffix_buf: [16]u8 = undefined;
+    try testing.expectEqualStrings(":2,DS", flags.toSuffix(&suffix_buf));
 }
 
 test "IMAP message flags" {
