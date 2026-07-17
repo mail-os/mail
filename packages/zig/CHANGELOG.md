@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.3] - 2026-08-02
+
+- fix(cli): probe systemctl by invoking it during upgrade restart
+- ci(version): run bump from packages/zig where build.zig.zon lives
+
 ## [0.1.2] - 2026-08-02
 
 - ci: pin zig 0.16.0 across workflows and add release notes
