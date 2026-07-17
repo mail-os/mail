@@ -55,13 +55,15 @@ jobs:
     - name: Bump version (dry-run)
       if: ${{ inputs.dry_run }}
       run: |
-        cd $GITHUB_WORKSPACE
+        # bump reads build.zig.zon from its CWD — it lives in packages/zig,
+        # not the repo root.
+        cd $GITHUB_WORKSPACE/packages/zig
         bump ${{ inputs.release_type }} --dry-run
 
     - name: Bump version and push
       if: ${{ !inputs.dry_run }}
       run: |
-        cd $GITHUB_WORKSPACE
+        cd $GITHUB_WORKSPACE/packages/zig
         bump ${{ inputs.release_type }} --all
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
