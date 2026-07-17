@@ -350,19 +350,11 @@ fn upgradeAction(ctx: *cli.BaseCommand.ParseContext) !void {
 }
 
 fn restartService(allocator: std.mem.Allocator, service: []const u8) void {
-    var which_result = execCommand(allocator, &[_][]const u8{ "command", "-v", "systemctl" }) catch {
-        std.debug.print("systemctl not available; restart the service manually.\n", .{});
-        return;
-    };
-    const have_systemctl = which_result.success;
-    freeExec(allocator, &which_result);
-    if (!have_systemctl) {
-        std.debug.print("systemctl not available; restart the service manually.\n", .{});
-        return;
-    }
-
+    // Probe systemctl by invoking it directly: `command -v` is a shell
+    // builtin and cannot be exec'd without a shell. A spawn failure here
+    // means systemctl is absent (e.g. macOS or a minimal container).
     var active_result = execCommand(allocator, &[_][]const u8{ "systemctl", "is-active", "--quiet", service }) catch {
-        std.debug.print("Service {s} is not active; nothing to restart.\n", .{service});
+        std.debug.print("systemctl not available; restart the service manually.\n", .{});
         return;
     };
     const is_active = active_result.success;
