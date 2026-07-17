@@ -2081,7 +2081,9 @@ pub const ImapSession = struct {
         }
         try writer.writeAll(")");
 
-        try self.sendUntagged(fbs.getWritten());
+        const response = fbs.getWritten();
+        std.log.info("IMAP STATUS for {s}: {s}", .{ clean_mailbox, response });
+        try self.sendUntagged(response);
         try self.sendResponse(tag, "OK", "STATUS completed");
     }
 
