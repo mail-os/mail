@@ -9,6 +9,39 @@ set -euo pipefail
 MAIL_DIR="${MAIL_DIR:-/opt/mail}"
 BACKUP_DIR="${BACKUP_DIR:-/opt/mail/backups}"
 RETAIN_DAYS="${RETAIN_DAYS:-7}"
+SWAP_GB="${SWAP_GB:-2}"
+
+echo "== memory safety =="
+# The production box is shared with Bun applications. Give short deployment
+# spikes somewhere safe to go instead of letting the global OOM killer choose
+# the mail daemon. This is idempotent and intentionally low-swappiness.
+if [ "$SWAP_GB" -gt 0 ] && ! swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; then
+  if [ ! -f /swapfile ]; then
+    fallocate -l "${SWAP_GB}G" /swapfile || dd if=/dev/zero of=/swapfile bs=1M count="$((SWAP_GB * 1024))" status=none
+    chmod 600 /swapfile
+    mkswap /swapfile >/dev/null
+  fi
+  swapon /swapfile
+fi
+if [ "$SWAP_GB" -gt 0 ]; then
+  grep -qE '^/swapfile\s' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  echo 'vm.swappiness=10' > /etc/sysctl.d/99-mail-swap.conf
+  sysctl -w vm.swappiness=10 >/dev/null
+fi
+
+# Protect the small, stable mail process when unrelated co-tenants consume the
+# host. MemoryLow reserves reclaim protection; OOMScoreAdjust makes mail a last
+# resort without making it unkillable if it is ever genuinely at fault.
+mkdir -p /etc/systemd/system/mail.service.d
+cat > /etc/systemd/system/mail.service.d/resources.conf <<'UNIT'
+[Service]
+MemoryAccounting=true
+MemoryLow=128M
+OOMScoreAdjust=-750
+Restart=always
+RestartSec=3
+UNIT
+systemctl daemon-reload
 
 echo "== fail2ban =="
 if ! command -v fail2ban-server >/dev/null 2>&1; then
