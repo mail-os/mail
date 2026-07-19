@@ -69,3 +69,23 @@ jobs:
           fi
         '
         echo "Deployed to Hetzner ($HOST)."
+
+    - name: Verify public mail protocols
+      env:
+        HOST: ${{ secrets.HETZNER_HOST }}
+      run: |
+        set -euo pipefail
+        # Run from the GitHub runner, outside Hetzner. A local listener check
+        # cannot detect a cloud firewall that dropped the mail ports.
+        for port in 25 143 465 587 993; do
+          timeout 10 bash -c "exec 3<>/dev/tcp/$HOST/$port"
+          echo "public tcp/$port reachable"
+        done
+        # Prove the implicit-TLS endpoints complete a real handshake and serve
+        # the certificate for mail.stacksjs.com, not merely accept a socket.
+        timeout 15 openssl s_client -connect "$HOST:993" -servername mail.stacksjs.com </dev/null 2>/dev/null \
+          | openssl x509 -noout -checkend 86400 -subject \
+          | grep -F 'CN = mail.stacksjs.com'
+        timeout 15 openssl s_client -connect "$HOST:465" -servername mail.stacksjs.com </dev/null 2>/dev/null \
+          | openssl x509 -noout -checkend 86400 -subject \
+          | grep -F 'CN = mail.stacksjs.com'

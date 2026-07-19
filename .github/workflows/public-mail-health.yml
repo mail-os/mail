@@ -1,0 +1,29 @@
+name: Public Mail Health
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  public-mail-health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Verify public TCP and TLS
+        env:
+          HOST: ${{ secrets.HETZNER_HOST }}
+        run: |
+          set -euo pipefail
+          for port in 25 143 465 587 993; do
+            timeout 10 bash -c "exec 3<>/dev/tcp/$HOST/$port"
+            echo "public tcp/$port reachable"
+          done
+          for port in 465 993; do
+            timeout 15 openssl s_client -connect "$HOST:$port" -servername mail.stacksjs.com </dev/null 2>/dev/null \
+              | openssl x509 -noout -checkend 86400 -subject \
+              | grep -F 'CN = mail.stacksjs.com'
+          done
