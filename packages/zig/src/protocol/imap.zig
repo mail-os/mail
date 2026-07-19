@@ -641,6 +641,16 @@ fn parseMessageSortKey(filename: []const u8) i64 {
     return std.fmt.parseInt(i64, numeric_prefix, 10) catch return 0;
 }
 
+fn isLegacySyntheticMailbox(name: []const u8) bool {
+    const legacy = [_][]const u8{
+        "All", "All Mail", "Starred", "Important", "Social", "Forums", "Updates", "Promotions",
+    };
+    for (legacy) |candidate| {
+        if (std.ascii.eqlIgnoreCase(name, candidate)) return true;
+    }
+    return false;
+}
+
 /// Match an IMAP LIST wildcard pattern against a folder name.
 /// `*` matches zero or more characters including hierarchy delimiter.
 /// `%` matches zero or more characters excluding hierarchy delimiter `/`.
@@ -2028,6 +2038,11 @@ pub const ImapSession = struct {
         const writer = fbs.writer();
         const clean_mailbox = stripQuotes(mailbox_name);
 
+        if (isLegacySyntheticMailbox(clean_mailbox)) {
+            try self.sendResponse(tag, "NO", "[NONEXISTENT] Mailbox does not exist");
+            return;
+        }
+
         const stats = self.countMailboxStats(clean_mailbox);
 
         // Derive UIDVALIDITY/UIDNEXT from the database so STATUS matches what
@@ -2249,6 +2264,10 @@ pub const ImapSession = struct {
         const mailbox = stripQuotes(mailbox_name);
         if (!isSafeMailboxName(mailbox)) {
             try self.sendResponse(tag, "NO", "Invalid mailbox name");
+            return;
+        }
+        if (isLegacySyntheticMailbox(mailbox)) {
+            try self.sendResponse(tag, "NO", "[NONEXISTENT] Mailbox does not exist");
             return;
         }
         const is_all_mail = std.ascii.eqlIgnoreCase(mailbox, "All Mail") or std.ascii.eqlIgnoreCase(mailbox, "All");
@@ -4579,6 +4598,15 @@ test "Maildir delivery counter does not break chronological ordering" {
     try testing.expectEqual(@as(i64, 1_784_428_368_187), parseMessageSortKey("1784428368187.9.eml:2,S"));
     try testing.expectEqual(@as(i64, 1_784_440_561_138), parseMessageSortKey("mail/chris/new/1784440561138.0.eml"));
     try testing.expectEqual(@as(i64, 0), parseMessageSortKey("legacy-random-name.eml:2,S"));
+}
+
+test "legacy synthetic Gmail mailboxes are retired" {
+    const testing = std.testing;
+
+    try testing.expect(isLegacySyntheticMailbox("All Mail"));
+    try testing.expect(isLegacySyntheticMailbox("promotions"));
+    try testing.expect(!isLegacySyntheticMailbox("INBOX"));
+    try testing.expect(!isLegacySyntheticMailbox("Notes"));
 }
 
 test "parseAppendArgs parses mailbox, flags and date-time" {
