@@ -74,6 +74,8 @@ pub const ImapConfig = struct {
     // TLS configuration
     cert_path: ?[]const u8 = null,
     key_path: ?[]const u8 = null,
+    /// Advertise the optional Gmail-style aggregate/category mailboxes.
+    enable_gmail_labels: bool = true,
 };
 
 /// IMAP connection state
@@ -148,7 +150,10 @@ pub const FolderType = enum {
             .trash => "\\HasNoChildren \\Trash",
             .junk => "\\HasNoChildren \\Junk",
             .archive => "\\HasNoChildren \\Archive",
-            .all_mail => "\\HasNoChildren \\All",
+            // Keep All Mail visible without claiming Gmail's canonical `\\All`
+            // semantics. Apple Mail otherwise moves the Inbox unread badge to
+            // this aggregate view even though the message is still in INBOX.
+            .all_mail => "\\HasNoChildren",
             .starred => "\\HasNoChildren \\Flagged",
             .important => "\\HasNoChildren \\Important",
             .social => "\\HasNoChildren",
@@ -190,17 +195,22 @@ pub const FolderType = enum {
     }
 };
 
-/// Real standard mailboxes in the order they should be listed. Do not
-/// advertise synthetic Gmail labels: Apple Mail treats `\All` as the canonical
-/// copy and INBOX as a label, which moves unread badges away from INBOX and
-/// makes every refresh scan duplicate views of the same messages.
+/// Standard and optional Gmail-style mailboxes in display order.
 pub const GmailFolders = [_]FolderType{
     .inbox,
+    .starred,
+    .important,
     .sent,
     .drafts,
+    .all_mail,
     .junk,
     .trash,
     .archive,
+    .notes,
+    .social,
+    .forums,
+    .updates,
+    .promotions,
 };
 
 /// IMAP message flags
@@ -821,6 +831,7 @@ pub const ImapSession = struct {
     mailbox_uidvalidity: i64 = 0,
     mailbox_name: ?[]const u8 = null,
     mailbox_is_virtual: bool = false,
+    gmail_labels_enabled: bool = true,
     // Pending APPEND literal state
     append_tag: ?[]u8 = null,
     append_mailbox: ?[]u8 = null,
@@ -831,7 +842,7 @@ pub const ImapSession = struct {
     // STARTTLS upgrade requested (port 143 → TLS)
     starttls_requested: bool = false,
 
-    pub fn init(allocator: std.mem.Allocator, connection: socket.Connection, auth_backend: *auth.AuthBackend, db: ?*database.Database) ImapSession {
+    pub fn init(allocator: std.mem.Allocator, connection: socket.Connection, auth_backend: *auth.AuthBackend, db: ?*database.Database, gmail_labels_enabled: bool) ImapSession {
         return .{
             .allocator = allocator,
             .connection = connection,
@@ -839,6 +850,7 @@ pub const ImapSession = struct {
             .command_buffer = .empty,
             .auth_backend = auth_backend,
             .db = db,
+            .gmail_labels_enabled = gmail_labels_enabled,
             .tls_connection = null,
         };
     }
@@ -1940,6 +1952,11 @@ pub const ImapSession = struct {
 
         // Return standard Gmail-style folders (filtered by pattern)
         for (GmailFolders) |folder_type| {
+            if (!self.gmail_labels_enabled and folder_type.isVirtual()) continue;
+            if (!self.gmail_labels_enabled and switch (folder_type) {
+                .important, .social, .forums, .updates, .promotions => true,
+                else => false,
+            }) continue;
             const attrs = folder_type.getAttributes();
             const name = folder_type.getName();
             if (!matchListPattern(clean_pattern, name)) continue;
@@ -1968,8 +1985,9 @@ pub const ImapSession = struct {
     fn listUserFolders(self: *ImapSession, mail_dir: []const u8, pattern: []const u8) !void {
         // Standard folder names that are already listed via GmailFolders
         const standard = [_][]const u8{
-            "INBOX", "Sent", "Drafts", "Trash", "Junk", "Archive",
-            "new",   "cur",  "tmp",
+            "INBOX",      "Sent",    "Drafts",    "Trash",  "Junk",   "Archive",
+            "All Mail",   "Starred", "Important", "Social", "Forums", "Updates",
+            "Promotions", "Notes",   "new",       "cur",    "tmp",
         };
 
         var path_buf: [4097]u8 = undefined;
@@ -2038,7 +2056,7 @@ pub const ImapSession = struct {
         const writer = fbs.writer();
         const clean_mailbox = stripQuotes(mailbox_name);
 
-        if (isLegacySyntheticMailbox(clean_mailbox)) {
+        if (!self.gmail_labels_enabled and isLegacySyntheticMailbox(clean_mailbox)) {
             try self.sendResponse(tag, "NO", "[NONEXISTENT] Mailbox does not exist");
             return;
         }
@@ -2266,7 +2284,7 @@ pub const ImapSession = struct {
             try self.sendResponse(tag, "NO", "Invalid mailbox name");
             return;
         }
-        if (isLegacySyntheticMailbox(mailbox)) {
+        if (!self.gmail_labels_enabled and isLegacySyntheticMailbox(mailbox)) {
             try self.sendResponse(tag, "NO", "[NONEXISTENT] Mailbox does not exist");
             return;
         }
@@ -4015,7 +4033,7 @@ pub const ImapServer = struct {
     /// Handle a client connection
     fn handleConnection(self: *ImapServer, connection: socket.Connection, is_ssl: bool) !void {
         var session = try self.allocator.create(ImapSession);
-        session.* = ImapSession.init(self.allocator, connection, self.auth_backend, self.db);
+        session.* = ImapSession.init(self.allocator, connection, self.auth_backend, self.db, self.config.enable_gmail_labels);
         defer {
             session.deinit();
             self.allocator.destroy(session);
@@ -4600,13 +4618,15 @@ test "Maildir delivery counter does not break chronological ordering" {
     try testing.expectEqual(@as(i64, 0), parseMessageSortKey("legacy-random-name.eml:2,S"));
 }
 
-test "legacy synthetic Gmail mailboxes are retired" {
+test "Gmail-style mailboxes are configurable and All Mail is not canonical" {
     const testing = std.testing;
 
+    try testing.expect((ImapConfig{}).enable_gmail_labels);
     try testing.expect(isLegacySyntheticMailbox("All Mail"));
     try testing.expect(isLegacySyntheticMailbox("promotions"));
     try testing.expect(!isLegacySyntheticMailbox("INBOX"));
     try testing.expect(!isLegacySyntheticMailbox("Notes"));
+    try testing.expect(std.mem.indexOf(u8, FolderType.all_mail.getAttributes(), "\\All") == null);
 }
 
 test "parseAppendArgs parses mailbox, flags and date-time" {

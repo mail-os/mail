@@ -507,6 +507,10 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
             .max_connections = @intCast(cfg.max_connections),
             .cert_path = cfg.tls_cert_path,
             .key_path = cfg.tls_key_path,
+            .enable_gmail_labels = if (env.get("IMAP_GMAIL_LABELS_ENABLED")) |value|
+                std.ascii.eqlIgnoreCase(value, "true") or std.mem.eql(u8, value, "1")
+            else
+                true,
         };
         imap_server = imap.ImapServer.init(allocator, imap_config, auth_ptr.?, db_ptr);
         log.info("IMAP server configured on port {d}", .{imap_port});
