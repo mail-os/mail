@@ -190,22 +190,17 @@ pub const FolderType = enum {
     }
 };
 
-/// Gmail-style folders in the order they should be listed
+/// Real standard mailboxes in the order they should be listed. Do not
+/// advertise synthetic Gmail labels: Apple Mail treats `\All` as the canonical
+/// copy and INBOX as a label, which moves unread badges away from INBOX and
+/// makes every refresh scan duplicate views of the same messages.
 pub const GmailFolders = [_]FolderType{
     .inbox,
-    .starred,
-    .important,
     .sent,
     .drafts,
-    .all_mail,
     .junk,
     .trash,
     .archive,
-    .notes,
-    .social,
-    .forums,
-    .updates,
-    .promotions,
 };
 
 /// IMAP message flags
@@ -636,7 +631,14 @@ fn parseMessageSortKey(filename: []const u8) i64 {
     const basename = if (std.mem.lastIndexOfScalar(u8, filename, '/')) |pos| filename[pos + 1 ..] else filename;
     const no_flags = MaildirFlags.baseName(basename);
     const name_no_ext = if (std.mem.endsWith(u8, no_flags, ".eml")) no_flags[0 .. no_flags.len - 4] else no_flags;
-    return std.fmt.parseInt(i64, name_no_ext, 10) catch return 0;
+    // Current Maildir names are `<millis>.<counter>.eml`. Parsing the whole
+    // stem fails on the counter separator and returns 0, which sorts each new
+    // delivery into the legacy-name block near the start of the mailbox. That
+    // shifts every following IMAP sequence number without an EXPUNGE and makes
+    // clients re-scan their complete cache. Sort on the numeric timestamp
+    // prefix so newly delivered messages are always appended at the end.
+    const numeric_prefix = if (std.mem.indexOfScalar(u8, name_no_ext, '.')) |dot| name_no_ext[0..dot] else name_no_ext;
+    return std.fmt.parseInt(i64, numeric_prefix, 10) catch return 0;
 }
 
 /// Match an IMAP LIST wildcard pattern against a folder name.
@@ -1956,9 +1958,8 @@ pub const ImapSession = struct {
     fn listUserFolders(self: *ImapSession, mail_dir: []const u8, pattern: []const u8) !void {
         // Standard folder names that are already listed via GmailFolders
         const standard = [_][]const u8{
-            "INBOX",      "Sent",    "Drafts",    "Trash",  "Junk",   "Archive",
-            "All Mail",   "Starred", "Important", "Social", "Forums", "Updates",
-            "Promotions", "Notes",   "new",       "cur",    "tmp",
+            "INBOX", "Sent", "Drafts", "Trash", "Junk", "Archive",
+            "new",   "cur",  "tmp",
         };
 
         var path_buf: [4097]u8 = undefined;
@@ -4569,6 +4570,15 @@ test "Maildir flags drive unseen counts" {
     try testing.expect(MaildirFlags.fromFilename("1770000000000.eml").seen == false);
     try testing.expect(MaildirFlags.fromFilename("1770000000001.eml:2,S").seen);
     try testing.expect(MaildirFlags.fromFilename("1770000000002.eml:2,FS").flagged);
+}
+
+test "Maildir delivery counter does not break chronological ordering" {
+    const testing = std.testing;
+
+    try testing.expectEqual(@as(i64, 1_784_428_368_187), parseMessageSortKey("1784428368187.9.eml"));
+    try testing.expectEqual(@as(i64, 1_784_428_368_187), parseMessageSortKey("1784428368187.9.eml:2,S"));
+    try testing.expectEqual(@as(i64, 1_784_440_561_138), parseMessageSortKey("mail/chris/new/1784440561138.0.eml"));
+    try testing.expectEqual(@as(i64, 0), parseMessageSortKey("legacy-random-name.eml:2,S"));
 }
 
 test "parseAppendArgs parses mailbox, flags and date-time" {
