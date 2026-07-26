@@ -233,8 +233,9 @@ pub fn plan(
 fn maildirExists(allocator: std.mem.Allocator, mail_root: []const u8, address: []const u8) bool {
     const path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ mail_root, address }) catch return false;
     defer allocator.free(path);
-    var dir = fs_compat.cwd().openDir(path, .{}) catch return false;
-    dir.close();
+    // `access` rather than `openDir`: fs_compat's Dir has no close(), so an
+    // opened handle would leak a file descriptor per mailbox.
+    fs_compat.cwd().access(path, .{}) catch return false;
     return true;
 }
 
@@ -343,32 +344,40 @@ fn applyForwards(
     defer parsed.deinit();
     if (parsed.value != .object) return;
 
-    var out = std.json.ObjectMap.init(allocator);
-    defer out.deinit();
+    // Every rewritten key and destination is a fresh allocation with exactly
+    // one lifetime: until the file has been rendered. An arena frees the lot in
+    // one call — an ObjectMap's deinit releases its own storage but not the
+    // keys it was given, so tracking them individually is just a way to leak
+    // one of them.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+
+    var out: std.json.ObjectMap = .empty;
 
     var it = parsed.value.object.iterator();
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         const new_key = if (addressInDomain(key, old_domain))
-            try rewriteAddress(allocator, key, new_domain)
+            try rewriteAddress(scratch, key, new_domain)
         else
-            try allocator.dupe(u8, key);
+            key;
 
         const value = entry.value_ptr.*;
         if (value == .array) {
             for (value.array.items) |*dest| {
                 if (dest.* != .string) continue;
                 if (!addressInDomain(dest.string, old_domain)) continue;
-                dest.* = .{ .string = try rewriteAddress(allocator, dest.string, new_domain) };
+                dest.* = .{ .string = try rewriteAddress(scratch, dest.string, new_domain) };
             }
         }
-        try out.put(new_key, value);
+        try out.put(scratch, new_key, value);
     }
 
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.migrating", .{path});
     defer allocator.free(tmp_path);
 
-    const rendered = try std.json.stringifyAlloc(
+    const rendered = try std.json.Stringify.valueAlloc(
         allocator,
         std.json.Value{ .object = out },
         .{ .whitespace = .indent_2 },
@@ -452,12 +461,12 @@ pub fn listDomains(allocator: std.mem.Allocator, db: *database.Database) ![]Doma
         allocator.free(users);
     }
 
-    var counts = std.StringArrayHashMap(u32).init(allocator);
-    defer counts.deinit();
+    var counts: std.StringArrayHashMapUnmanaged(u32) = .empty;
+    defer counts.deinit(allocator);
 
     for (users) |u| {
         const domain = domainOf(u.username) orelse "(no domain)";
-        const gop = try counts.getOrPut(domain);
+        const gop = try counts.getOrPut(allocator, domain);
         if (!gop.found_existing) {
             gop.key_ptr.* = try allocator.dupe(u8, domain);
             gop.value_ptr.* = 0;

@@ -867,12 +867,12 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        var users = std.ArrayList(User).init(self.allocator);
+        var users: std.ArrayList(User) = .empty;
         errdefer {
             for (users.items) |*user| {
                 user.deinit(self.allocator);
             }
-            users.deinit();
+            users.deinit(self.allocator);
         }
 
         while (true) {
@@ -890,7 +890,7 @@ pub const Database = struct {
             const created_at = sqlite.sqlite3_column_int64(stmt, 5);
             const updated_at = sqlite.sqlite3_column_int64(stmt, 6);
 
-            try users.append(User{
+            try users.append(self.allocator, User{
                 .id = id,
                 .username = try self.allocator.dupe(u8, std.mem.span(username_ptr)),
                 .password_hash = try self.allocator.dupe(u8, std.mem.span(password_ptr)),
@@ -901,7 +901,7 @@ pub const Database = struct {
             });
         }
 
-        return users.toOwnedSlice();
+        return users.toOwnedSlice(self.allocator);
     }
 
     /// Update user email
