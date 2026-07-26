@@ -7,6 +7,7 @@ const serve = @import("cli/serve.zig");
 const user_remote = @import("cli/user_remote.zig");
 const user_local = @import("cli/user_local.zig");
 const migrate_mod = @import("cli/migrate.zig");
+const domain_mod = @import("cli/domain.zig");
 const gdpr_mod = @import("cli/gdpr.zig");
 const search_mod = @import("cli/search.zig");
 const benchmark_mod = @import("cli/benchmark.zig");
@@ -29,6 +30,7 @@ pub fn main(init: std.process.Init) !void {
     _ = try root_cmd.addCommand(try user_remote.setup(allocator));
     _ = try root_cmd.addCommand(try user_local.setup(allocator));
     _ = try root_cmd.addCommand(try migrate_mod.setup(allocator));
+    _ = try root_cmd.addCommand(try domain_mod.setup(allocator));
     _ = try root_cmd.addCommand(try gdpr_mod.setup(allocator));
     _ = try root_cmd.addCommand(try search_mod.setup(allocator));
     _ = try root_cmd.addCommand(try benchmark_mod.setup(allocator));

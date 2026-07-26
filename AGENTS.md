@@ -171,6 +171,52 @@ Test binaries link against `sqlite3` system library. The argon2 password tests u
 - **Check service**: `systemctl status mail` (on server via SSM)
 - **View IMAP logs**: `journalctl -u mail | grep IMAP`
 - **Backup**: `mail-server backup create` → S3 bucket `stacks-production-s3-backups`
+- **List domains**: `mail-server domain list`
+- **Rename a domain**: `mail-server domain migrate <old> <new>` (see below)
+
+## Domain Migration
+
+A project renames itself and its mail domain has to follow. Doing that by hand
+means editing five things that must agree, and the mailbox goes dark if any one
+is missed:
+
+1. `users` — `username` and `email` are both the full address, both UNIQUE
+2. `imap_mailboxes` / `imap_uids` — keyed by `username`; losing these makes
+   every client re-download the mailbox and lose read/flag state
+3. `webmail_sessions` — carry a baked-in identity
+4. Maildirs at `/opt/mail/mail/<address>`
+5. `/opt/mail/forwards.json` — keys and destinations
+
+`domain migrate` does all five in one pass. It prints a plan and changes
+nothing unless `--yes` is given:
+
+```bash
+mail-server domain list                                   # what is in use
+mail-server domain migrate ghostanalytics.org analyticshq.org
+mail-server domain migrate ghostanalytics.org analyticshq.org --yes
+```
+
+It refuses up front when a target address is already taken — `username` and
+`email` are UNIQUE, so the UPDATE would abort partway and strand the domain
+across two names. Merge or delete the conflicting mailbox first.
+
+The database moves in one transaction; maildir renames follow. A maildir that
+fails to rename is reported by name, because the alternative (rolling back with
+directories already moved) is worse.
+
+**Not automated**, and printed as a reminder at the end of every run:
+
+- add the new domain to `SMTP_LOCAL_DOMAINS` in `/etc/mail/mail.env`, and keep
+  the old one until mail has drained
+- generate a DKIM key for the new domain and publish its TXT record — mail from
+  a domain with no key arrives unsigned and gets filtered
+- MX, SPF and DMARC for the new domain
+
+Paths come from `MAIL_ROOT`, `MAIL_FORWARDS_PATH` and `MAIL_DKIM_DIR`, all
+relative to the working directory by default (`/opt/mail` in production).
+
+Source: `src/domain_migrate.zig` (planning), `src/cli/domain.zig` (CLI),
+`Database.renameDomain` (the SQL, in one transaction).
 
 ---
 

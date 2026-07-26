@@ -217,6 +217,21 @@ pub const WebmailSessionRow = struct {
     }
 };
 
+/// LIKE pattern matching any address in `domain`: `%@<domain>` with SQLite's
+/// wildcards escaped, so a domain containing `_` (a legal DNS character) does
+/// not match a single arbitrary character.
+fn domainLikePattern(allocator: std.mem.Allocator, domain: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.appendSlice(allocator, "%@");
+    for (domain) |c| {
+        if (c == '%' or c == '_' or c == '\\') try out.append(allocator, '\\');
+        try out.append(allocator, c);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 pub const Database = struct {
     db: ?*sqlite.sqlite3,
     allocator: std.mem.Allocator,
@@ -1463,6 +1478,114 @@ pub const Database = struct {
 
         rc = sqlite.sqlite3_step(stmt);
         return rc == sqlite.SQLITE_ROW;
+    }
+
+    // ── Domain migration ──────────────────────────────────────────────
+
+    /// Number of rows in `table` whose `username` sits in `domain`.
+    ///
+    /// Matching is done in SQL with a suffix LIKE so a large `imap_uids` is not
+    /// pulled into memory just to be counted. `@` and the dot are literals
+    /// here, not wildcards, so `a@bXorg` cannot match `b.org`; SQLite's LIKE
+    /// only treats `%` and `_` specially, and the `_` in `b_org` is why the
+    /// ESCAPE clause is needed.
+    pub fn countUsernamesInDomain(self: *Database, table: []const u8, domain: []const u8) !u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // `table` is never user input — callers pass a literal — but build the
+        // statement from a fixed set anyway rather than interpolating freely.
+        const sql_text = if (std.mem.eql(u8, table, "users"))
+            "SELECT COUNT(*) FROM users WHERE username LIKE ?1 ESCAPE '\\'"
+        else if (std.mem.eql(u8, table, "webmail_sessions"))
+            "SELECT COUNT(*) FROM webmail_sessions WHERE username LIKE ?1 ESCAPE '\\'"
+        else if (std.mem.eql(u8, table, "imap_mailboxes"))
+            "SELECT COUNT(*) FROM imap_mailboxes WHERE username LIKE ?1 ESCAPE '\\'"
+        else if (std.mem.eql(u8, table, "imap_uids"))
+            "SELECT COUNT(*) FROM imap_uids WHERE username LIKE ?1 ESCAPE '\\'"
+        else
+            return DatabaseError.PrepareFailed;
+
+        const sql_z = try self.allocator.dupeZ(u8, sql_text);
+        defer self.allocator.free(sql_z);
+
+        var stmt: ?*sqlite.sqlite3_stmt = null;
+        if (sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null) != sqlite.SQLITE_OK)
+            return DatabaseError.PrepareFailed;
+        defer _ = sqlite.sqlite3_finalize(stmt);
+
+        const pattern = try domainLikePattern(self.allocator, domain);
+        defer self.allocator.free(pattern);
+        try checkBind(sqlite3_bind_text_raw(stmt, 1, pattern.ptr, @intCast(pattern.len), SQLITE_TRANSIENT_PTR));
+
+        if (sqlite.sqlite3_step(stmt) != sqlite.SQLITE_ROW) return 0;
+        return @intCast(sqlite.sqlite3_column_int64(stmt, 0));
+    }
+
+    /// Repoints every mailbox on `old_domain` at `new_domain`, in one
+    /// transaction.
+    ///
+    /// `users`, `imap_mailboxes` and `imap_uids` all key on the full address,
+    /// so they move together or not at all — a partial rename loses IMAP UIDs
+    /// and makes every client re-sync from scratch. `webmail_sessions` rows are
+    /// deleted rather than rewritten: a session carries a baked-in identity and
+    /// re-login costs the user nothing.
+    ///
+    /// Callers should check for target-address collisions first (see
+    /// `domain_migrate.plan`); UNIQUE(username) and UNIQUE(email) would
+    /// otherwise abort the transaction mid-way.
+    pub fn renameDomain(self: *Database, old_domain: []const u8, new_domain: []const u8) !u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const pattern = try domainLikePattern(self.allocator, old_domain);
+        defer self.allocator.free(pattern);
+
+        const suffix = try std.fmt.allocPrint(self.allocator, "@{s}", .{new_domain});
+        defer self.allocator.free(suffix);
+
+        const old_len: i64 = @intCast(old_domain.len + 1); // include the '@'
+
+        try self.execLocked("BEGIN IMMEDIATE");
+        errdefer self.execLocked("ROLLBACK") catch {};
+
+        // `substr(x, 1, length(x) - <old_len>) || <suffix>` rebuilds the address
+        // from its local part, so a local part containing '@' survives intact.
+        const statements = [_][:0]const u8{
+            "UPDATE users SET username = substr(username, 1, length(username) - ?3) || ?2, updated_at = strftime('%s','now') WHERE username LIKE ?1 ESCAPE '\\'",
+            "UPDATE users SET email = substr(email, 1, length(email) - ?3) || ?2 WHERE email LIKE ?1 ESCAPE '\\'",
+            "UPDATE imap_mailboxes SET username = substr(username, 1, length(username) - ?3) || ?2 WHERE username LIKE ?1 ESCAPE '\\'",
+            "UPDATE imap_uids SET username = substr(username, 1, length(username) - ?3) || ?2 WHERE username LIKE ?1 ESCAPE '\\'",
+        };
+
+        var moved: u32 = 0;
+        for (statements, 0..) |sql, i| {
+            var stmt: ?*sqlite.sqlite3_stmt = null;
+            if (sqlite.sqlite3_prepare_v2(self.db, sql.ptr, -1, &stmt, null) != sqlite.SQLITE_OK)
+                return DatabaseError.PrepareFailed;
+            defer _ = sqlite.sqlite3_finalize(stmt);
+
+            try checkBind(sqlite3_bind_text_raw(stmt, 1, pattern.ptr, @intCast(pattern.len), SQLITE_TRANSIENT_PTR));
+            try checkBind(sqlite3_bind_text_raw(stmt, 2, suffix.ptr, @intCast(suffix.len), SQLITE_TRANSIENT_PTR));
+            try checkBind(sqlite.sqlite3_bind_int64(stmt, 3, old_len));
+
+            if (sqlite.sqlite3_step(stmt) != sqlite.SQLITE_DONE) return DatabaseError.StepFailed;
+            // The first statement is the authoritative mailbox count.
+            if (i == 0) moved = @intCast(sqlite.sqlite3_changes(self.db));
+        }
+
+        {
+            const sql: [:0]const u8 = "DELETE FROM webmail_sessions WHERE username LIKE ?1 ESCAPE '\\'";
+            var stmt: ?*sqlite.sqlite3_stmt = null;
+            if (sqlite.sqlite3_prepare_v2(self.db, sql.ptr, -1, &stmt, null) != sqlite.SQLITE_OK)
+                return DatabaseError.PrepareFailed;
+            defer _ = sqlite.sqlite3_finalize(stmt);
+            try checkBind(sqlite3_bind_text_raw(stmt, 1, pattern.ptr, @intCast(pattern.len), SQLITE_TRANSIENT_PTR));
+            if (sqlite.sqlite3_step(stmt) != sqlite.SQLITE_DONE) return DatabaseError.StepFailed;
+        }
+
+        try self.execLocked("COMMIT");
+        return moved;
     }
 
     // ── IMAP UID persistence ──────────────────────────────────────────
