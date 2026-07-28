@@ -54,14 +54,10 @@ fn migrateAction(ctx: *cli.BaseCommand.ParseContext) !void {
 
     var plan = dm.plan(allocator, &db, old_domain, new_domain, options) catch |err| {
         switch (err) {
-            dm.Error.InvalidDomain =>
-                std.debug.print("Error: '{s}' or '{s}' is not a valid domain.\n", .{ old_domain, new_domain }),
-            dm.Error.SameDomain =>
-                std.debug.print("Error: source and target are the same domain.\n", .{}),
-            dm.Error.NoMailboxes =>
-                std.debug.print("No mailboxes on '{s}'. Nothing to migrate.\nRun `mail domain list` to see which domains are in use.\n", .{old_domain}),
-            dm.Error.TargetAddressExists =>
-                std.debug.print("Error: a mailbox already exists on '{s}' with the same local part.\nMerge or delete it first — usernames and emails are unique.\n", .{new_domain}),
+            dm.Error.InvalidDomain => std.debug.print("Error: '{s}' or '{s}' is not a valid domain.\n", .{ old_domain, new_domain }),
+            dm.Error.SameDomain => std.debug.print("Error: source and target are the same domain.\n", .{}),
+            dm.Error.NoMailboxes => std.debug.print("No mailboxes on '{s}'. Nothing to migrate.\nRun `mail domain list` to see which domains are in use.\n", .{old_domain}),
+            dm.Error.TargetAddressExists => std.debug.print("Error: a mailbox already exists on '{s}' with the same local part.\nMerge or delete it first. Usernames and emails are unique.\n", .{new_domain}),
             else => std.debug.print("Error: {}\n", .{err}),
         }
         return;
