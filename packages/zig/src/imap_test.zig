@@ -275,6 +275,18 @@ test "ImapCommand - fromString basic commands" {
     try testing.expectEqual(imap.ImapCommand.namespace, imap.ImapCommand.fromString("NAMESPACE").?);
 }
 
+test "decodeAuthenticationField decodes AUTH LOGIN values" {
+    var output: [64]u8 = undefined;
+    const username = try imap.ImapSession.decodeAuthenticationField("Y2hyaXM=", &output);
+    try testing.expectEqualStrings("chris", username);
+}
+
+test "decodeAuthenticationField rejects malformed and oversized values" {
+    var output: [4]u8 = undefined;
+    try testing.expectError(error.InvalidCharacter, imap.ImapSession.decodeAuthenticationField("!!!!", &output));
+    try testing.expectError(error.AuthenticationFieldTooLong, imap.ImapSession.decodeAuthenticationField("Y2hyaXM=", &output));
+}
+
 test "ImapCommand - fromString unknown returns null" {
     try testing.expect(imap.ImapCommand.fromString("UNKNOWN") == null);
     try testing.expect(imap.ImapCommand.fromString("NOTACOMMAND") == null);

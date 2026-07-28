@@ -1846,9 +1846,10 @@ pub const ImapSession = struct {
     /// Write data to connection (plain or TLS encrypted)
     /// Handles large data by chunking into TLS-record-sized pieces
     fn writeData(self: *ImapSession, data: []const u8) !void {
-        // Log response (truncated)
-        const log_len = @min(data.len, 200);
-        std.log.info("IMAP RSP ({d}b): {s}", .{ data.len, data[0..log_len] });
+        // Never copy response bodies into the journal. FETCH responses can
+        // contain private message content and high-volume synchronization
+        // traffic should not consume production CPU and disk at info level.
+        std.log.debug("IMAP response: {d} bytes", .{data.len});
         if (self.tls_connection) |tls_conn| {
             // TLS max plaintext per record is ~16KB; chunk to stay safe
             const chunk_size: usize = 8192;
@@ -1877,6 +1878,52 @@ pub const ImapSession = struct {
             // Plain text write
             _ = try self.connection.write(data);
         }
+    }
+
+    fn readAuthenticationLine(self: *ImapSession, buf: *[1024]u8) ![]const u8 {
+        if (self.tls_connection) |tls_conn| {
+            var ciphertext: [tls.input_buffer_len * 2]u8 = undefined;
+            var ciphertext_len: usize = 0;
+            var cleartext_len: usize = 0;
+
+            while (cleartext_len < buf.len) {
+                if (ciphertext_len == ciphertext.len) return error.AuthenticationFieldTooLong;
+                const bytes_read = try self.connection.read(ciphertext[ciphertext_len..]);
+                if (bytes_read == 0) return error.ConnectionClosed;
+                ciphertext_len += bytes_read;
+
+                const dec_result = try tls_conn.decrypt(ciphertext[0..ciphertext_len], buf[cleartext_len..]);
+                cleartext_len += dec_result.cleartext.len;
+                if (dec_result.ciphertext_pos > 0) {
+                    const remaining = ciphertext_len - dec_result.ciphertext_pos;
+                    if (remaining > 0)
+                        std.mem.copyForwards(u8, &ciphertext, ciphertext[dec_result.ciphertext_pos..ciphertext_len]);
+                    ciphertext_len = remaining;
+                }
+
+                if (std.mem.indexOfScalar(u8, buf[0..cleartext_len], '\n')) |line_end|
+                    return std.mem.trim(u8, buf[0..line_end], "\r");
+                if (dec_result.closed) return error.ConnectionClosed;
+            }
+            return error.AuthenticationFieldTooLong;
+        }
+
+        var used: usize = 0;
+        while (used < buf.len) {
+            const bytes_read = try self.connection.read(buf[used..]);
+            if (bytes_read == 0) return error.ConnectionClosed;
+            used += bytes_read;
+            if (std.mem.indexOfScalar(u8, buf[0..used], '\n')) |line_end|
+                return std.mem.trim(u8, buf[0..line_end], "\r");
+        }
+        return error.AuthenticationFieldTooLong;
+    }
+
+    pub fn decodeAuthenticationField(encoded: []const u8, output: []u8) ![]const u8 {
+        const decoded_len = try std.base64.standard.Decoder.calcSizeForSlice(encoded);
+        if (decoded_len > output.len) return error.AuthenticationFieldTooLong;
+        try std.base64.standard.Decoder.decode(output[0..decoded_len], encoded);
+        return output[0..decoded_len];
     }
 
     /// Send greeting
@@ -2165,9 +2212,66 @@ pub const ImapSession = struct {
             return;
         }
 
-        // Only support PLAIN mechanism
-        if (!std.ascii.eqlIgnoreCase(mechanism, "PLAIN")) {
+        if (!std.ascii.eqlIgnoreCase(mechanism, "PLAIN") and !std.ascii.eqlIgnoreCase(mechanism, "LOGIN")) {
             try self.sendResponse(tag, "NO", "Unsupported authentication mechanism");
+            return;
+        }
+
+        if (std.ascii.eqlIgnoreCase(mechanism, "LOGIN")) {
+            var username_line_buf: [1024]u8 = undefined;
+            const encoded_username = if (initial_response) |resp| resp else blk: {
+                try self.writeData("+ VXNlcm5hbWU6\r\n");
+                break :blk self.readAuthenticationLine(&username_line_buf) catch {
+                    try self.sendResponse(tag, "NO", "Authentication failed");
+                    return;
+                };
+            };
+            if (std.mem.eql(u8, encoded_username, "*")) {
+                try self.sendResponse(tag, "BAD", "Authentication cancelled");
+                return;
+            }
+
+            var username_buf: [512]u8 = undefined;
+            const username = decodeAuthenticationField(encoded_username, &username_buf) catch {
+                try self.sendResponse(tag, "NO", "Authentication failed");
+                return;
+            };
+
+            try self.writeData("+ UGFzc3dvcmQ6\r\n");
+            var password_line_buf: [1024]u8 = undefined;
+            const encoded_password = self.readAuthenticationLine(&password_line_buf) catch {
+                try self.sendResponse(tag, "NO", "Authentication failed");
+                return;
+            };
+            if (std.mem.eql(u8, encoded_password, "*")) {
+                try self.sendResponse(tag, "BAD", "Authentication cancelled");
+                return;
+            }
+
+            var password_buf: [512]u8 = undefined;
+            const password = decodeAuthenticationField(encoded_password, &password_buf) catch {
+                try self.sendResponse(tag, "NO", "Authentication failed");
+                return;
+            };
+            defer @memset(password_buf[0..password.len], 0);
+
+            const valid = self.auth_backend.verifyCredentials(username, password) catch {
+                try self.sendResponse(tag, "NO", "Authentication failed");
+                return;
+            };
+            if (!valid) {
+                std.log.warn("Failed IMAP AUTH LOGIN from {s}", .{self.connection.peerIp()});
+                try self.sendResponse(tag, "NO", "Authentication failed");
+                return;
+            }
+
+            self.username = self.auth_backend.canonicalUsername(username, self.allocator) catch {
+                try self.sendResponse(tag, "NO", "Internal error");
+                return;
+            };
+            self.state = .authenticated;
+            std.log.info("Successful IMAP AUTH LOGIN", .{});
+            try self.sendResponse(tag, "OK", "AUTHENTICATE completed");
             return;
         }
 
@@ -2177,44 +2281,13 @@ pub const ImapSession = struct {
             // Initial response provided on the same line (RFC 4959)
             encoded = resp;
         } else {
-            // Send continuation request and read response
             try self.writeData("+ \r\n");
 
-            // Read the base64-encoded credentials from the next line
-            // This is handled by reading from the connection directly
             var buf: [1024]u8 = undefined;
-            if (self.tls_connection) |tls_conn| {
-                // Read encrypted data
-                var recv_buf: [tls.input_buffer_len]u8 = undefined;
-                const bytes_read = self.connection.read(recv_buf[0..]) catch {
-                    try self.sendResponse(tag, "NO", "Authentication failed");
-                    return;
-                };
-                if (bytes_read == 0) {
-                    try self.sendResponse(tag, "NO", "Authentication failed");
-                    return;
-                }
-                // Decrypt
-                const dec_result = tls_conn.decrypt(recv_buf[0..bytes_read], &buf) catch {
-                    try self.sendResponse(tag, "NO", "Authentication failed");
-                    return;
-                };
-                if (dec_result.cleartext.len == 0) {
-                    try self.sendResponse(tag, "NO", "Authentication failed");
-                    return;
-                }
-                encoded = std.mem.trim(u8, dec_result.cleartext, "\r\n");
-            } else {
-                const bytes_read = self.connection.read(&buf) catch {
-                    try self.sendResponse(tag, "NO", "Authentication failed");
-                    return;
-                };
-                if (bytes_read == 0) {
-                    try self.sendResponse(tag, "NO", "Authentication failed");
-                    return;
-                }
-                encoded = std.mem.trim(u8, buf[0..bytes_read], "\r\n");
-            }
+            encoded = self.readAuthenticationLine(&buf) catch {
+                try self.sendResponse(tag, "NO", "Authentication failed");
+                return;
+            };
         }
 
         // Handle "*" (cancel)
@@ -2230,6 +2303,7 @@ pub const ImapSession = struct {
         };
         defer {
             self.allocator.free(credentials.username);
+            @memset(@constCast(credentials.password), 0);
             self.allocator.free(credentials.password);
         }
 
@@ -3469,9 +3543,6 @@ pub const ImapSession = struct {
 
     /// Process a single command
     pub fn processCommand(self: *ImapSession, line: []const u8) !void {
-        // Log every command for debugging
-        std.log.info("IMAP CMD: {s}", .{line});
-
         // Handle DONE (ends IDLE mode) - DONE has no tag
         if (self.idle_mode) {
             const trimmed = std.mem.trim(u8, line, " \t\r\n");
@@ -3510,6 +3581,11 @@ pub const ImapSession = struct {
             try self.sendResponse(tag, "BAD", "Unknown command");
             return;
         };
+
+        // Log only the command verb, never arguments. LOGIN and AUTHENTICATE
+        // arguments can contain clear or base64-encoded credentials; SEARCH
+        // and other commands can contain private message data.
+        std.log.debug("IMAP command: {s}", .{cmd_str});
 
         // Handle command
         switch (command) {
