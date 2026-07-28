@@ -119,15 +119,17 @@ paths: {
 - CloudWatch Agent log paths
 - Environment file paths
 
-### 6. Software Configuration (`config.zigVersion`, `config.gitRepository`)
+### 6. Software Configuration (`config.zigVersion`, `config.zigSha256`, `config.gitRepository`)
 
 ```typescript
-zigVersion: '0.15.1',
+zigVersion: '0.17.0-dev.1471+ff10b90bc',
+zigSha256: '60d83e4295b7057a382ec8dbc416b0dc59918818c0b5010b0491cec65ccd994f',
 gitRepository: 'https://github.com/yourusername/mail.git',
 ```
 
 **Used in stack:**
 - Zig compiler installation version
+- Zig compiler archive integrity verification
 - Mail Server repository cloning
 
 ### 7. User Data Configuration (`config.userData`)
@@ -419,7 +421,8 @@ All previously hardcoded values have been migrated:
 
 | Old (Hardcoded) | New (From Config) |
 |----------------|------------------|
-| `'0.15.1'` | `config.zigVersion` |
+| `'0.17.0-dev.1471+ff10b90bc'` | `config.zigVersion` |
+| Zig archive checksum | `config.zigSha256` |
 | `'10.0.0.0/16'` | `config.vpcCidr` |
 | `22, 25, 465, 587...` | `config.ports.*` |
 | `'/opt/mail'` | `config.paths.installDir` |
@@ -460,7 +463,8 @@ export const config: SmtpServerConfig = {
     },
   },
   vpcCidr: '172.16.0.0/16',
-  zigVersion: '0.15.1',
+  zigVersion: '0.17.0-dev.1471+ff10b90bc',
+  zigSha256: '60d83e4295b7057a382ec8dbc416b0dc59918818c0b5010b0491cec65ccd994f',
   gitRepository: 'https://github.com/mycompany/mail.git',
   smtpServer: {
     port: 25,

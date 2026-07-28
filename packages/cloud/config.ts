@@ -56,6 +56,9 @@ export interface MailServerConfig {
   /** Zig compiler version to install */
   zigVersion: string
 
+  /** SHA-256 checksum for the Zig compiler archive */
+  zigSha256: string
+
   /** Git repository URL for SMTP server code */
   gitRepository: string
 
@@ -211,7 +214,8 @@ export const config: MailServerConfig = {
   // SMTP Server Settings
   // ============================================================================
 
-  zigVersion: '0.16.0-dev',
+  zigVersion: '0.17.0-dev.1471+ff10b90bc',
+  zigSha256: '60d83e4295b7057a382ec8dbc416b0dc59918818c0b5010b0491cec65ccd994f',
   gitRepository: 'https://github.com/stacksjs/mail.git',
 
   smtpServer: {

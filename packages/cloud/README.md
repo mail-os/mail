@@ -191,7 +191,8 @@ Edit `infra/config.ts` to customize:
 ```typescript
 export const config: SmtpServerConfig = {
   // Change Zig version
-  zigVersion: '0.15.1',
+  zigVersion: '0.17.0-dev.1471+ff10b90bc',
+  zigSha256: '60d83e4295b7057a382ec8dbc416b0dc59918818c0b5010b0491cec65ccd994f',
 
   // Update your repository
   gitRepository: 'https://github.com/stacksjs/mail.git',

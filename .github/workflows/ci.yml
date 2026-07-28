@@ -26,7 +26,7 @@ jobs:
     - name: Setup Zig
       uses: mlugg/setup-zig@v2
       with:
-        version: 0.16.0
+        version: 0.17.0-dev.1471+ff10b90bc
 
     - name: Setup Bun
       uses: oven-sh/setup-bun@v2
@@ -101,7 +101,7 @@ jobs:
     - name: Setup Zig
       uses: mlugg/setup-zig@v2
       with:
-        version: 0.16.0
+        version: 0.17.0-dev.1471+ff10b90bc
 
     - name: Setup Bun
       uses: oven-sh/setup-bun@v2
@@ -128,7 +128,7 @@ jobs:
     - name: Setup Zig
       uses: mlugg/setup-zig@v2
       with:
-        version: 0.16.0
+        version: 0.17.0-dev.1471+ff10b90bc
 
     - name: Setup Bun
       uses: oven-sh/setup-bun@v2
@@ -190,7 +190,7 @@ jobs:
     - name: Setup Zig
       uses: mlugg/setup-zig@v2
       with:
-        version: 0.16.0
+        version: 0.17.0-dev.1471+ff10b90bc
 
     - name: Setup Bun
       uses: oven-sh/setup-bun@v2

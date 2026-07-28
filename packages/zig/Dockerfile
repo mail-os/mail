@@ -11,11 +11,13 @@ RUN apk add --no-cache \
     tar \
     xz
 
-# Install the same stable Zig release used by local builds and CI.
+# Install the same Zig 0.17 development snapshot used by local builds and CI.
 # No bun needed: the webmail package lives outside this build context, so
 # zig build skips the frontend step and uses the committed dist.
-ARG ZIG_VERSION=0.16.0
-RUN curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" && \
+ARG ZIG_VERSION=0.17.0-dev.1471+ff10b90bc
+ARG ZIG_SHA256=60d83e4295b7057a382ec8dbc416b0dc59918818c0b5010b0491cec65ccd994f
+RUN curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" && \
+    echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c - && \
     tar -xJf /tmp/zig.tar.xz -C /usr/local && rm /tmp/zig.tar.xz && \
     ln -s /usr/local/zig-x86_64-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
 

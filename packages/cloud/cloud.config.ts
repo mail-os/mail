@@ -18,7 +18,8 @@ import type { CloudConfig } from 'ts-cloud'
 
 // Mail server specific configuration (not part of CloudConfig, used for user data script)
 const mailConfig = {
-  zigVersion: '0.16.0-dev',
+  zigVersion: '0.17.0-dev.1471+ff10b90bc',
+  zigSha256: '60d83e4295b7057a382ec8dbc416b0dc59918818c0b5010b0491cec65ccd994f',
   gitRepository: 'https://github.com/stacksjs/mail.git',
 
   ports: {
@@ -285,10 +286,12 @@ dnf install -y \\
 # Install Zig
 echo "Installing Zig..."
 ZIG_VERSION="${cfg.zigVersion}"
+ZIG_SHA256="${cfg.zigSha256}"
 cd /tmp
-wget https://ziglang.org/download/\${ZIG_VERSION}/zig-linux-x86_64-\${ZIG_VERSION}.tar.xz
-tar -xf zig-linux-x86_64-\${ZIG_VERSION}.tar.xz
-mv zig-linux-x86_64-\${ZIG_VERSION} /usr/local/zig
+wget https://ziglang.org/builds/zig-x86_64-linux-\${ZIG_VERSION}.tar.xz
+echo "\${ZIG_SHA256}  zig-x86_64-linux-\${ZIG_VERSION}.tar.xz" | sha256sum -c -
+tar -xf zig-x86_64-linux-\${ZIG_VERSION}.tar.xz
+mv zig-x86_64-linux-\${ZIG_VERSION} /usr/local/zig
 ln -sf /usr/local/zig/zig /usr/local/bin/zig
 zig version
 
