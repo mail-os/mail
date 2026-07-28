@@ -2189,8 +2189,7 @@ pub const ImapSession = struct {
         };
 
         if (!valid) {
-            // Include the client IP for fail2ban (failregex matches "from <HOST>").
-            std.log.warn("Failed IMAP login attempt for user: {s} from {s}", .{ username, self.connection.peerIp() });
+            std.log.warn("Failed IMAP authentication from {s}", .{self.connection.peerIp()});
             try self.sendResponse(tag, "NO", "LOGIN failed");
             return;
         }
@@ -2260,7 +2259,7 @@ pub const ImapSession = struct {
                 return;
             };
             if (!valid) {
-                std.log.warn("Failed IMAP AUTH LOGIN from {s}", .{self.connection.peerIp()});
+                std.log.warn("Failed IMAP authentication from {s}", .{self.connection.peerIp()});
                 try self.sendResponse(tag, "NO", "Authentication failed");
                 return;
             }
@@ -2314,7 +2313,7 @@ pub const ImapSession = struct {
         };
 
         if (!valid) {
-            std.log.warn("Failed IMAP AUTHENTICATE attempt for user: {s}", .{credentials.username});
+            std.log.warn("Failed IMAP authentication from {s}", .{self.connection.peerIp()});
             try self.sendResponse(tag, "NO", "Authentication failed");
             return;
         }

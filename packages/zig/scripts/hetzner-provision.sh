@@ -48,8 +48,15 @@ if ! command -v fail2ban-server >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq && apt-get install -y -qq fail2ban >/dev/null
 fi
-# sshd jail (the main brute-force vector). A mail-auth jail can be added once
-# the server's failed-AUTH log line format is finalized.
+# sshd and mail authentication jails. The mail daemon emits one stable,
+# credential-free failure line for every supported SMTP and IMAP mechanism.
+cat > /etc/fail2ban/filter.d/mail-auth.conf <<'FILTER'
+[Definition]
+failregex = ^.*Failed (?:IMAP|SMTP) authentication from <HOST>.*$
+ignoreregex =
+journalmatch = _SYSTEMD_UNIT=mail.service
+FILTER
+
 cat > /etc/fail2ban/jail.local <<'JAIL'
 [DEFAULT]
 bantime  = 1h
@@ -59,6 +66,12 @@ backend  = systemd
 
 [sshd]
 enabled = true
+
+[mail-auth]
+enabled = true
+filter = mail-auth
+port = smtp,submission,submissions,imap,imaps
+maxretry = 5
 JAIL
 systemctl enable --now fail2ban >/dev/null 2>&1 || true
 systemctl restart fail2ban || true

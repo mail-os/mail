@@ -1723,10 +1723,7 @@ pub const Session = struct {
                         self.logger.info("User '{s}' authenticated successfully", .{sanitizedSlice(&safe_user, credentials.username.len)});
                         try self.sendResponse(writer, 235, "Authentication successful", null);
                     } else {
-                        const safe_user = sanitizeForLog(credentials.username);
-                        // Include the client IP so fail2ban can ban brute-force
-                        // sources (its failregex matches "from <HOST>").
-                        self.logger.warn("Authentication failed for user '{s}' from {s}", .{ sanitizedSlice(&safe_user, credentials.username.len), self.remote_addr });
+                        self.logger.warn("Failed SMTP authentication from {s}", .{self.remote_addr});
                         try self.sendResponse(writer, 535, "Authentication failed", null);
                     }
                 } else {
@@ -1829,8 +1826,7 @@ pub const Session = struct {
                     self.logger.info("User '{s}' authenticated via LOGIN", .{sanitizedSlice(&safe_user, username.len)});
                     try self.sendResponse(writer, 235, "Authentication successful", null);
                 } else {
-                    const safe_user = sanitizeForLog(username);
-                    self.logger.warn("AUTH LOGIN failed for user '{s}'", .{sanitizedSlice(&safe_user, username.len)});
+                    self.logger.warn("Failed SMTP authentication from {s}", .{self.remote_addr});
                     try self.sendResponse(writer, 535, "Authentication failed", null);
                 }
             } else {
