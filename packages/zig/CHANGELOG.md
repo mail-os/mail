@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.6] - 2026-08-13
+
+- chore(build): pin latest Zig 0.17 dev
+- feat(build): support Zig 0.17 dev
+
 ## [0.1.5] - 2026-08-13
 
 - fix(docker): build with supported Zig release
