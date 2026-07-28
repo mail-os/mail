@@ -534,6 +534,45 @@ pub const Database = struct {
         };
     }
 
+    /// Resolve a bare mailbox local-part to a single full-address username.
+    ///
+    /// This supports clients configured before per-domain mailbox isolation,
+    /// while refusing ambiguous aliases such as `info` when both
+    /// `info@example.com` and `info@example.net` exist. Caller owns the result.
+    pub fn uniqueUsernameForLocalPart(self: *Database, local_part: []const u8, allocator: std.mem.Allocator) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const sql =
+            \\SELECT username
+            \\FROM users
+            \\WHERE instr(username, '@') > 1
+            \\  AND substr(username, 1, instr(username, '@') - 1) = ?1
+            \\LIMIT 2
+        ;
+        const sql_z = try self.allocator.dupeZ(u8, sql);
+        defer self.allocator.free(sql_z);
+
+        var stmt: ?*sqlite.sqlite3_stmt = null;
+        if (sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null) != sqlite.SQLITE_OK)
+            return DatabaseError.PrepareFailed;
+        defer _ = sqlite.sqlite3_finalize(stmt);
+
+        try checkBind(sqlite3_bind_text_raw(stmt, 1, local_part.ptr, @intCast(local_part.len), SQLITE_TRANSIENT_PTR));
+
+        if (sqlite.sqlite3_step(stmt) != sqlite.SQLITE_ROW) return null;
+        const first_ptr = sqlite.sqlite3_column_text(stmt, 0) orelse return DatabaseError.ColumnFailed;
+        const first_len = sqlite.sqlite3_column_bytes(stmt, 0);
+        const first = try allocator.dupe(u8, first_ptr[0..@intCast(first_len)]);
+        errdefer allocator.free(first);
+
+        if (sqlite.sqlite3_step(stmt) == sqlite.SQLITE_ROW) {
+            allocator.free(first);
+            return null;
+        }
+        return first;
+    }
+
     pub fn updateUserPassword(self: *Database, username: []const u8, new_password_hash: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();

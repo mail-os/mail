@@ -49,6 +49,55 @@ test "AuthBackend verifyCredentials success" {
     try testing.expect(valid);
 }
 
+test "AuthBackend resolves a unique local-part login to its full mailbox" {
+    const allocator = testing.allocator;
+
+    var db = try database.Database.init(allocator, ":memory:");
+    defer db.deinit();
+
+    var backend = auth.AuthBackend.init(allocator, &db);
+    defer backend.deinit();
+
+    _ = try backend.createUser("chris@stacksjs.com", "password123", "chris@stacksjs.com");
+
+    try testing.expect(try backend.verifyCredentials("chris", "password123"));
+    const canonical = try backend.canonicalUsername("chris", allocator);
+    defer allocator.free(canonical);
+    try testing.expectEqualStrings("chris@stacksjs.com", canonical);
+}
+
+test "AuthBackend refuses an ambiguous local-part login" {
+    const allocator = testing.allocator;
+
+    var db = try database.Database.init(allocator, ":memory:");
+    defer db.deinit();
+
+    var backend = auth.AuthBackend.init(allocator, &db);
+    defer backend.deinit();
+
+    _ = try backend.createUser("info@example.com", "first-password", "info@example.com");
+    _ = try backend.createUser("info@example.net", "second-password", "info@example.net");
+
+    try testing.expect(!try backend.verifyCredentials("info", "first-password"));
+    try testing.expect(!try backend.verifyCredentials("info", "second-password"));
+}
+
+test "AuthBackend exact bare username wins over a full-address alias" {
+    const allocator = testing.allocator;
+
+    var db = try database.Database.init(allocator, ":memory:");
+    defer db.deinit();
+
+    var backend = auth.AuthBackend.init(allocator, &db);
+    defer backend.deinit();
+
+    _ = try backend.createUser("chris", "bare-password", "legacy@example.com");
+    _ = try backend.createUser("chris@stacksjs.com", "address-password", "chris@stacksjs.com");
+
+    try testing.expect(try backend.verifyCredentials("chris", "bare-password"));
+    try testing.expect(!try backend.verifyCredentials("chris", "address-password"));
+}
+
 test "AuthBackend verifyCredentials wrong password" {
     const allocator = testing.allocator;
 
