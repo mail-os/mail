@@ -10,6 +10,7 @@ MAIL_DIR="${MAIL_DIR:-/opt/mail}"
 BACKUP_DIR="${BACKUP_DIR:-/opt/mail/backups}"
 RETAIN_DAYS="${RETAIN_DAYS:-7}"
 SWAP_GB="${SWAP_GB:-2}"
+FAIL2BAN_IGNORE_IPS="${FAIL2BAN_IGNORE_IPS:-127.0.0.1/8 ::1}"
 
 echo "== memory safety =="
 # The production box is shared with Bun applications. Give short deployment
@@ -57,12 +58,13 @@ ignoreregex =
 journalmatch = _SYSTEMD_UNIT=mail.service
 FILTER
 
-cat > /etc/fail2ban/jail.local <<'JAIL'
+cat > /etc/fail2ban/jail.local <<JAIL
 [DEFAULT]
 bantime  = 1h
 findtime = 10m
 maxretry = 5
 backend  = systemd
+ignoreip = $FAIL2BAN_IGNORE_IPS
 
 [sshd]
 enabled = true
