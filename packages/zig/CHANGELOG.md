@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.4] - 2026-08-13
+
+- fix(release): make patch releases runnable with Bun
+- fix(auth): qualify bare logins with primary domain
+- fix(imap): implement secure AUTH LOGIN
+- fix(auth): resolve unique mailbox local parts
+- fix(build): target Zig 0.16.0 and make the tree compile against it
+- feat(cli): add domain list and domain migrate
+- ci: monitor public mail reachability
+- fix(ops): protect mail from host memory pressure
+- fix(imap): make Gmail labels configurable
+- fix(imap): retire synthetic Gmail mailboxes
+- fix(imap): stabilize Apple Mail synchronization
+- docs: add v0.1.3 section to release notes
+
 ## [0.1.3] - 2026-08-02
 
 - fix(cli): probe systemctl by invoking it during upgrade restart
