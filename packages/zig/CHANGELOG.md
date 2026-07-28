@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.5] - 2026-08-13
+
+- fix(docker): build with supported Zig release
+- fix(cli): accept mailbox passwords from stdin
+- fix(ops): support trusted mail client addresses
+- fix(security): ban repeated mail authentication failures
+- style(cli): format domain migration errors
+
 ## [0.1.4] - 2026-08-13
 
 - fix(release): make patch releases runnable with Bun
