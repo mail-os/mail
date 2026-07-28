@@ -592,8 +592,8 @@ test "Database long strings" {
     defer db.deinit();
 
     // Create long strings
-    const long_username = "a" ** 255;
-    const long_email = ("b" ** 240) ++ "@example.com";
+    const long_username = @as([255]u8, @splat('a'));
+    const long_email = @as([240]u8, @splat('b')) ++ "@example.com";
 
     _ = try db.createUser(long_username, "hash", long_email);
 

@@ -241,7 +241,7 @@ pub const Database = struct {
         var db: ?*sqlite.sqlite3 = null;
 
         // Add null terminator for C string
-        const path_z = try allocator.dupeZ(u8, db_path);
+        const path_z = try allocator.dupeSentinel(u8, db_path, 0);
         defer allocator.free(path_z);
 
         const rc = sqlite.sqlite3_open(path_z.ptr, &db);
@@ -394,7 +394,7 @@ pub const Database = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var errmsg: [*c]u8 = null;
@@ -412,7 +412,7 @@ pub const Database = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -441,7 +441,7 @@ pub const Database = struct {
             \\VALUES (?1, ?2, ?3, ?4, ?5)
         ;
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -451,11 +451,11 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        const username_z = try self.allocator.dupeZ(u8, username);
+        const username_z = try self.allocator.dupeSentinel(u8, username, 0);
         defer self.allocator.free(username_z);
-        const password_z = try self.allocator.dupeZ(u8, password_hash);
+        const password_z = try self.allocator.dupeSentinel(u8, password_hash, 0);
         defer self.allocator.free(password_z);
-        const email_z = try self.allocator.dupeZ(u8, email);
+        const email_z = try self.allocator.dupeSentinel(u8, email, 0);
         defer self.allocator.free(email_z);
 
         const now = time_compat.timestamp();
@@ -487,7 +487,7 @@ pub const Database = struct {
             \\WHERE username = ?1
         ;
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -497,7 +497,7 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        const username_z = try self.allocator.dupeZ(u8, username);
+        const username_z = try self.allocator.dupeSentinel(u8, username, 0);
         defer self.allocator.free(username_z);
 
         try checkBind(sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null));
@@ -550,7 +550,7 @@ pub const Database = struct {
             \\  AND substr(username, 1, instr(username, '@') - 1) = ?1
             \\LIMIT 2
         ;
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -583,7 +583,7 @@ pub const Database = struct {
             \\WHERE username = ?3
         ;
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -593,9 +593,9 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        const password_z = try self.allocator.dupeZ(u8, new_password_hash);
+        const password_z = try self.allocator.dupeSentinel(u8, new_password_hash, 0);
         defer self.allocator.free(password_z);
-        const username_z = try self.allocator.dupeZ(u8, username);
+        const username_z = try self.allocator.dupeSentinel(u8, username, 0);
         defer self.allocator.free(username_z);
 
         const now = time_compat.timestamp();
@@ -616,7 +616,7 @@ pub const Database = struct {
 
         const sql = "DELETE FROM users WHERE username = ?1";
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -626,7 +626,7 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        const username_z = try self.allocator.dupeZ(u8, username);
+        const username_z = try self.allocator.dupeSentinel(u8, username, 0);
         defer self.allocator.free(username_z);
 
         try checkBind(sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null));
@@ -659,7 +659,7 @@ pub const Database = struct {
             \\VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8)
         ;
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -669,17 +669,17 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        const session_z = try self.allocator.dupeZ(u8, session_id);
+        const session_z = try self.allocator.dupeSentinel(u8, session_id, 0);
         defer self.allocator.free(session_z);
-        const username_z = try self.allocator.dupeZ(u8, username);
+        const username_z = try self.allocator.dupeSentinel(u8, username, 0);
         defer self.allocator.free(username_z);
-        const email_z = try self.allocator.dupeZ(u8, email);
+        const email_z = try self.allocator.dupeSentinel(u8, email, 0);
         defer self.allocator.free(email_z);
-        const csrf_z = try self.allocator.dupeZ(u8, csrf_secret);
+        const csrf_z = try self.allocator.dupeSentinel(u8, csrf_secret, 0);
         defer self.allocator.free(csrf_z);
-        const ip_z: ?[:0]u8 = if (ip_address) |v| try self.allocator.dupeZ(u8, v) else null;
+        const ip_z: ?[:0]u8 = if (ip_address) |v| try self.allocator.dupeSentinel(u8, v, 0) else null;
         defer if (ip_z) |v| self.allocator.free(v);
-        const ua_z: ?[:0]u8 = if (user_agent) |v| try self.allocator.dupeZ(u8, v) else null;
+        const ua_z: ?[:0]u8 = if (user_agent) |v| try self.allocator.dupeSentinel(u8, v, 0) else null;
         defer if (ua_z) |v| self.allocator.free(v);
 
         const now = time_compat.timestamp();
@@ -722,7 +722,7 @@ pub const Database = struct {
             \\WHERE session_id = ?1
         ;
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -732,7 +732,7 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        const session_z = try self.allocator.dupeZ(u8, session_id);
+        const session_z = try self.allocator.dupeSentinel(u8, session_id, 0);
         defer self.allocator.free(session_z);
 
         try checkBind(sqlite.sqlite3_bind_text(stmt, 1, session_z.ptr, -1, null));
@@ -772,7 +772,7 @@ pub const Database = struct {
             \\WHERE session_id = ?3
         ;
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -782,7 +782,7 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        const session_z = try self.allocator.dupeZ(u8, session_id);
+        const session_z = try self.allocator.dupeSentinel(u8, session_id, 0);
         defer self.allocator.free(session_z);
 
         const now = time_compat.timestamp();
@@ -804,7 +804,7 @@ pub const Database = struct {
 
         const sql = "DELETE FROM webmail_sessions WHERE session_id = ?1";
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -814,7 +814,7 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        const session_z = try self.allocator.dupeZ(u8, session_id);
+        const session_z = try self.allocator.dupeSentinel(u8, session_id, 0);
         defer self.allocator.free(session_z);
 
         try checkBind(sqlite.sqlite3_bind_text(stmt, 1, session_z.ptr, -1, null));
@@ -832,7 +832,7 @@ pub const Database = struct {
 
         const sql = "DELETE FROM webmail_sessions WHERE expires_at <= ?1";
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -860,7 +860,7 @@ pub const Database = struct {
             \\WHERE username = ?3
         ;
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -870,7 +870,7 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        const username_z = try self.allocator.dupeZ(u8, username);
+        const username_z = try self.allocator.dupeSentinel(u8, username, 0);
         defer self.allocator.free(username_z);
 
         const now = time_compat.timestamp();
@@ -896,7 +896,7 @@ pub const Database = struct {
             \\ORDER BY username ASC
         ;
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -954,7 +954,7 @@ pub const Database = struct {
             \\WHERE username = ?3
         ;
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -964,9 +964,9 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        const email_z = try self.allocator.dupeZ(u8, new_email);
+        const email_z = try self.allocator.dupeSentinel(u8, new_email, 0);
         defer self.allocator.free(email_z);
-        const username_z = try self.allocator.dupeZ(u8, username);
+        const username_z = try self.allocator.dupeSentinel(u8, username, 0);
         defer self.allocator.free(username_z);
 
         const now = time_compat.timestamp();
@@ -1008,7 +1008,7 @@ pub const Database = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var errmsg: [*c]u8 = null;
@@ -1041,7 +1041,7 @@ pub const Database = struct {
             \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         ;
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -1053,16 +1053,16 @@ pub const Database = struct {
 
         try checkBind(sqlite.sqlite3_bind_int64(stmt, 1, timestamp));
 
-        const action_z = try self.allocator.dupeZ(u8, action);
+        const action_z = try self.allocator.dupeSentinel(u8, action, 0);
         defer self.allocator.free(action_z);
         try checkBind(sqlite.sqlite3_bind_text(stmt, 2, action_z.ptr, -1, null));
 
-        const actor_z = try self.allocator.dupeZ(u8, actor);
+        const actor_z = try self.allocator.dupeSentinel(u8, actor, 0);
         defer self.allocator.free(actor_z);
         try checkBind(sqlite.sqlite3_bind_text(stmt, 3, actor_z.ptr, -1, null));
 
         if (target) |t| {
-            const target_z = try self.allocator.dupeZ(u8, t);
+            const target_z = try self.allocator.dupeSentinel(u8, t, 0);
             defer self.allocator.free(target_z);
             try checkBind(sqlite.sqlite3_bind_text(stmt, 4, target_z.ptr, -1, null));
         } else {
@@ -1070,7 +1070,7 @@ pub const Database = struct {
         }
 
         if (target_type) |tt| {
-            const tt_z = try self.allocator.dupeZ(u8, tt);
+            const tt_z = try self.allocator.dupeSentinel(u8, tt, 0);
             defer self.allocator.free(tt_z);
             try checkBind(sqlite.sqlite3_bind_text(stmt, 5, tt_z.ptr, -1, null));
         } else {
@@ -1078,7 +1078,7 @@ pub const Database = struct {
         }
 
         if (ip_address) |ip| {
-            const ip_z = try self.allocator.dupeZ(u8, ip);
+            const ip_z = try self.allocator.dupeSentinel(u8, ip, 0);
             defer self.allocator.free(ip_z);
             try checkBind(sqlite.sqlite3_bind_text(stmt, 6, ip_z.ptr, -1, null));
         } else {
@@ -1086,14 +1086,14 @@ pub const Database = struct {
         }
 
         if (details) |d| {
-            const details_z = try self.allocator.dupeZ(u8, d);
+            const details_z = try self.allocator.dupeSentinel(u8, d, 0);
             defer self.allocator.free(details_z);
             try checkBind(sqlite.sqlite3_bind_text(stmt, 7, details_z.ptr, -1, null));
         } else {
             try checkBind(sqlite.sqlite3_bind_null(stmt, 7));
         }
 
-        const severity_z = try self.allocator.dupeZ(u8, severity);
+        const severity_z = try self.allocator.dupeSentinel(u8, severity, 0);
         defer self.allocator.free(severity_z);
         try checkBind(sqlite.sqlite3_bind_text(stmt, 8, severity_z.ptr, -1, null));
 
@@ -1140,7 +1140,7 @@ pub const Database = struct {
             \\LIMIT ?1 OFFSET ?2
         ;
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -1201,7 +1201,7 @@ pub const Database = struct {
 
         const sql = "SELECT COUNT(*) FROM audit_log";
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -1226,7 +1226,7 @@ pub const Database = struct {
 
         const sql = "DELETE FROM audit_log WHERE timestamp < ?1";
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -1272,7 +1272,7 @@ pub const Database = struct {
             \\CREATE INDEX IF NOT EXISTS idx_reset_expires ON password_reset_tokens(expires_at);
         ;
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var err_msg: [*c]u8 = null;
@@ -1320,7 +1320,7 @@ pub const Database = struct {
             \\VALUES (?1, ?2, ?3, ?4, ?5)
         ;
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -1330,11 +1330,11 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        const username_z = try self.allocator.dupeZ(u8, username);
+        const username_z = try self.allocator.dupeSentinel(u8, username, 0);
         defer self.allocator.free(username_z);
         try checkBind(sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null));
 
-        const hash_z = try self.allocator.dupeZ(u8, token_hash);
+        const hash_z = try self.allocator.dupeSentinel(u8, token_hash, 0);
         defer self.allocator.free(hash_z);
         try checkBind(sqlite.sqlite3_bind_text(stmt, 2, hash_z.ptr, -1, null));
 
@@ -1342,7 +1342,7 @@ pub const Database = struct {
         try checkBind(sqlite.sqlite3_bind_int64(stmt, 4, expires_at));
 
         if (ip_address) |ip| {
-            const ip_z = try self.allocator.dupeZ(u8, ip);
+            const ip_z = try self.allocator.dupeSentinel(u8, ip, 0);
             defer self.allocator.free(ip_z);
             try checkBind(sqlite.sqlite3_bind_text(stmt, 5, ip_z.ptr, -1, null));
         } else {
@@ -1368,7 +1368,7 @@ pub const Database = struct {
             \\WHERE token_hash = ?1
         ;
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -1378,7 +1378,7 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        const hash_z = try self.allocator.dupeZ(u8, token_hash);
+        const hash_z = try self.allocator.dupeSentinel(u8, token_hash, 0);
         defer self.allocator.free(hash_z);
         try checkBind(sqlite.sqlite3_bind_text(stmt, 1, hash_z.ptr, -1, null));
 
@@ -1417,7 +1417,7 @@ pub const Database = struct {
         const now = time_compat.timestamp();
         const sql = "UPDATE password_reset_tokens SET used = 1, used_at = ?1 WHERE token_hash = ?2";
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -1429,7 +1429,7 @@ pub const Database = struct {
 
         try checkBind(sqlite.sqlite3_bind_int64(stmt, 1, now));
 
-        const hash_z = try self.allocator.dupeZ(u8, token_hash);
+        const hash_z = try self.allocator.dupeSentinel(u8, token_hash, 0);
         defer self.allocator.free(hash_z);
         try checkBind(sqlite.sqlite3_bind_text(stmt, 2, hash_z.ptr, -1, null));
 
@@ -1446,7 +1446,7 @@ pub const Database = struct {
 
         const sql = "UPDATE password_reset_tokens SET used = 1 WHERE username = ?1 AND used = 0";
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -1456,7 +1456,7 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        const username_z = try self.allocator.dupeZ(u8, username);
+        const username_z = try self.allocator.dupeSentinel(u8, username, 0);
         defer self.allocator.free(username_z);
         try checkBind(sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null));
 
@@ -1474,7 +1474,7 @@ pub const Database = struct {
         const now = time_compat.timestamp();
         const sql = "DELETE FROM password_reset_tokens WHERE expires_at < ?1 OR used = 1";
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -1501,7 +1501,7 @@ pub const Database = struct {
 
         const sql = "SELECT 1 FROM users WHERE username = ?1";
 
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -1511,7 +1511,7 @@ pub const Database = struct {
         }
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        const username_z = try self.allocator.dupeZ(u8, username);
+        const username_z = try self.allocator.dupeSentinel(u8, username, 0);
         defer self.allocator.free(username_z);
         try checkBind(sqlite.sqlite3_bind_text(stmt, 1, username_z.ptr, -1, null));
 
@@ -1545,7 +1545,7 @@ pub const Database = struct {
         else
             return DatabaseError.PrepareFailed;
 
-        const sql_z = try self.allocator.dupeZ(u8, sql_text);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql_text, 0);
         defer self.allocator.free(sql_z);
 
         var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -1637,16 +1637,16 @@ pub const Database = struct {
         // Try to read existing
         {
             const sql = "SELECT uidvalidity, uidnext FROM imap_mailboxes WHERE username = ?1 AND mailbox = ?2";
-            const sql_z = try self.allocator.dupeZ(u8, sql);
+            const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
             defer self.allocator.free(sql_z);
             var stmt: ?*sqlite.sqlite3_stmt = null;
             var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
             if (rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
             defer _ = sqlite.sqlite3_finalize(stmt);
 
-            const u_z = try self.allocator.dupeZ(u8, username);
+            const u_z = try self.allocator.dupeSentinel(u8, username, 0);
             defer self.allocator.free(u_z);
-            const m_z = try self.allocator.dupeZ(u8, mailbox);
+            const m_z = try self.allocator.dupeSentinel(u8, mailbox, 0);
             defer self.allocator.free(m_z);
             try checkBind(sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null));
             try checkBind(sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null));
@@ -1664,16 +1664,16 @@ pub const Database = struct {
         const uidvalidity = time_compat.timestamp();
         {
             const sql = "INSERT INTO imap_mailboxes (username, mailbox, uidvalidity, uidnext) VALUES (?1, ?2, ?3, 1)";
-            const sql_z = try self.allocator.dupeZ(u8, sql);
+            const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
             defer self.allocator.free(sql_z);
             var stmt: ?*sqlite.sqlite3_stmt = null;
             var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
             if (rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
             defer _ = sqlite.sqlite3_finalize(stmt);
 
-            const u_z = try self.allocator.dupeZ(u8, username);
+            const u_z = try self.allocator.dupeSentinel(u8, username, 0);
             defer self.allocator.free(u_z);
-            const m_z = try self.allocator.dupeZ(u8, mailbox);
+            const m_z = try self.allocator.dupeSentinel(u8, mailbox, 0);
             defer self.allocator.free(m_z);
             try checkBind(sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null));
             try checkBind(sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null));
@@ -1695,18 +1695,18 @@ pub const Database = struct {
         const base = maildirBaseName(filename);
 
         const sql = "SELECT uid FROM imap_uids WHERE username = ?1 AND mailbox = ?2 AND filename = ?3";
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
         var stmt: ?*sqlite.sqlite3_stmt = null;
         var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
         if (rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        const u_z = try self.allocator.dupeZ(u8, username);
+        const u_z = try self.allocator.dupeSentinel(u8, username, 0);
         defer self.allocator.free(u_z);
-        const m_z = try self.allocator.dupeZ(u8, mailbox);
+        const m_z = try self.allocator.dupeSentinel(u8, mailbox, 0);
         defer self.allocator.free(m_z);
-        const f_z = try self.allocator.dupeZ(u8, base);
+        const f_z = try self.allocator.dupeSentinel(u8, base, 0);
         defer self.allocator.free(f_z);
         try checkBind(sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null));
         try checkBind(sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null));
@@ -1844,16 +1844,16 @@ pub const Database = struct {
         var uidnext: i64 = 1;
         {
             const sql = "SELECT uidnext FROM imap_mailboxes WHERE username = ?1 AND mailbox = ?2";
-            const sql_z = try self.allocator.dupeZ(u8, sql);
+            const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
             defer self.allocator.free(sql_z);
             var stmt: ?*sqlite.sqlite3_stmt = null;
             var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
             if (rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
             defer _ = sqlite.sqlite3_finalize(stmt);
 
-            const u_z = try self.allocator.dupeZ(u8, username);
+            const u_z = try self.allocator.dupeSentinel(u8, username, 0);
             defer self.allocator.free(u_z);
-            const m_z = try self.allocator.dupeZ(u8, mailbox);
+            const m_z = try self.allocator.dupeSentinel(u8, mailbox, 0);
             defer self.allocator.free(m_z);
             try checkBind(sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null));
             try checkBind(sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null));
@@ -1869,18 +1869,18 @@ pub const Database = struct {
         // Insert the UID mapping
         {
             const sql = "INSERT OR IGNORE INTO imap_uids (username, mailbox, filename, uid) VALUES (?1, ?2, ?3, ?4)";
-            const sql_z = try self.allocator.dupeZ(u8, sql);
+            const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
             defer self.allocator.free(sql_z);
             var stmt: ?*sqlite.sqlite3_stmt = null;
             var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
             if (rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
             defer _ = sqlite.sqlite3_finalize(stmt);
 
-            const u_z = try self.allocator.dupeZ(u8, username);
+            const u_z = try self.allocator.dupeSentinel(u8, username, 0);
             defer self.allocator.free(u_z);
-            const m_z = try self.allocator.dupeZ(u8, mailbox);
+            const m_z = try self.allocator.dupeSentinel(u8, mailbox, 0);
             defer self.allocator.free(m_z);
-            const f_z = try self.allocator.dupeZ(u8, base);
+            const f_z = try self.allocator.dupeSentinel(u8, base, 0);
             defer self.allocator.free(f_z);
             try checkBind(sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null));
             try checkBind(sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null));
@@ -1898,18 +1898,18 @@ pub const Database = struct {
             // UID and churn uidnext, breaking UID stability.
             if (sqlite.sqlite3_changes(self.db) == 0) {
                 const get_sql = "SELECT uid FROM imap_uids WHERE username = ?1 AND mailbox = ?2 AND filename = ?3";
-                const get_z = try self.allocator.dupeZ(u8, get_sql);
+                const get_z = try self.allocator.dupeSentinel(u8, get_sql, 0);
                 defer self.allocator.free(get_z);
                 var get_stmt: ?*sqlite.sqlite3_stmt = null;
                 const get_rc = sqlite.sqlite3_prepare_v2(self.db, get_z.ptr, -1, &get_stmt, null);
                 if (get_rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
                 defer _ = sqlite.sqlite3_finalize(get_stmt);
 
-                const u2_z = try self.allocator.dupeZ(u8, username);
+                const u2_z = try self.allocator.dupeSentinel(u8, username, 0);
                 defer self.allocator.free(u2_z);
-                const m2_z = try self.allocator.dupeZ(u8, mailbox);
+                const m2_z = try self.allocator.dupeSentinel(u8, mailbox, 0);
                 defer self.allocator.free(m2_z);
-                const f2_z = try self.allocator.dupeZ(u8, base);
+                const f2_z = try self.allocator.dupeSentinel(u8, base, 0);
                 defer self.allocator.free(f2_z);
                 try checkBind(sqlite.sqlite3_bind_text(get_stmt, 1, u2_z.ptr, -1, null));
                 try checkBind(sqlite.sqlite3_bind_text(get_stmt, 2, m2_z.ptr, -1, null));
@@ -1926,16 +1926,16 @@ pub const Database = struct {
         // Bump uidnext
         {
             const sql = "UPDATE imap_mailboxes SET uidnext = ?1 WHERE username = ?2 AND mailbox = ?3";
-            const sql_z = try self.allocator.dupeZ(u8, sql);
+            const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
             defer self.allocator.free(sql_z);
             var stmt: ?*sqlite.sqlite3_stmt = null;
             var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
             if (rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
             defer _ = sqlite.sqlite3_finalize(stmt);
 
-            const u_z = try self.allocator.dupeZ(u8, username);
+            const u_z = try self.allocator.dupeSentinel(u8, username, 0);
             defer self.allocator.free(u_z);
-            const m_z = try self.allocator.dupeZ(u8, mailbox);
+            const m_z = try self.allocator.dupeSentinel(u8, mailbox, 0);
             defer self.allocator.free(m_z);
             try checkBind(sqlite.sqlite3_bind_int64(stmt, 1, uid + 1));
             try checkBind(sqlite.sqlite3_bind_text(stmt, 2, u_z.ptr, -1, null));
@@ -1955,16 +1955,16 @@ pub const Database = struct {
 
         // Get all filenames from the DB for this mailbox
         const sql = "SELECT id, filename FROM imap_uids WHERE username = ?1 AND mailbox = ?2";
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
         var stmt: ?*sqlite.sqlite3_stmt = null;
         var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
         if (rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        const u_z = try self.allocator.dupeZ(u8, username);
+        const u_z = try self.allocator.dupeSentinel(u8, username, 0);
         defer self.allocator.free(u_z);
-        const m_z = try self.allocator.dupeZ(u8, mailbox);
+        const m_z = try self.allocator.dupeSentinel(u8, mailbox, 0);
         defer self.allocator.free(m_z);
         try checkBind(sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null));
         try checkBind(sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null));
@@ -2027,16 +2027,16 @@ pub const Database = struct {
         defer self.mutex.unlock();
 
         const sql = "SELECT uidnext FROM imap_mailboxes WHERE username = ?1 AND mailbox = ?2";
-        const sql_z = try self.allocator.dupeZ(u8, sql);
+        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
         var stmt: ?*sqlite.sqlite3_stmt = null;
         var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
         if (rc != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
         defer _ = sqlite.sqlite3_finalize(stmt);
 
-        const u_z = try self.allocator.dupeZ(u8, username);
+        const u_z = try self.allocator.dupeSentinel(u8, username, 0);
         defer self.allocator.free(u_z);
-        const m_z = try self.allocator.dupeZ(u8, mailbox);
+        const m_z = try self.allocator.dupeSentinel(u8, mailbox, 0);
         defer self.allocator.free(m_z);
         try checkBind(sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null));
         try checkBind(sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null));

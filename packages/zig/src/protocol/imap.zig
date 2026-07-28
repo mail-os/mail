@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const ascii_compat = @import("ascii-compat");
 const mutex_compat = @import("../core/mutex_compat.zig");
 const posix = std.posix;
 const time_compat = @import("../core/time_compat.zig");
@@ -564,28 +565,28 @@ pub const MaildirFlags = struct {
         const is_add = action.len > 0 and action[0] == '+';
         const is_remove = action.len > 0 and action[0] == '-';
 
-        if (std.ascii.indexOfIgnoreCase(action, "\\Seen")) |_| {
+        if (ascii_compat.indexOfIgnoreCase(action, "\\Seen")) |_| {
             if (is_add) self.seen = true else if (is_remove) self.seen = false;
         }
-        if (std.ascii.indexOfIgnoreCase(action, "\\Answered")) |_| {
+        if (ascii_compat.indexOfIgnoreCase(action, "\\Answered")) |_| {
             if (is_add) self.answered = true else if (is_remove) self.answered = false;
         }
-        if (std.ascii.indexOfIgnoreCase(action, "\\Flagged")) |_| {
+        if (ascii_compat.indexOfIgnoreCase(action, "\\Flagged")) |_| {
             if (is_add) self.flagged = true else if (is_remove) self.flagged = false;
         }
-        if (std.ascii.indexOfIgnoreCase(action, "\\Draft")) |_| {
+        if (ascii_compat.indexOfIgnoreCase(action, "\\Draft")) |_| {
             if (is_add) self.draft = true else if (is_remove) self.draft = false;
         }
-        if (std.ascii.indexOfIgnoreCase(action, "\\Deleted")) |_| {
+        if (ascii_compat.indexOfIgnoreCase(action, "\\Deleted")) |_| {
             if (is_add) self.deleted = true else if (is_remove) self.deleted = false;
         }
         // For FLAGS (no + or -), replace all flags
         if (!is_add and !is_remove) {
-            self.seen = std.ascii.indexOfIgnoreCase(action, "\\Seen") != null;
-            self.answered = std.ascii.indexOfIgnoreCase(action, "\\Answered") != null;
-            self.flagged = std.ascii.indexOfIgnoreCase(action, "\\Flagged") != null;
-            self.draft = std.ascii.indexOfIgnoreCase(action, "\\Draft") != null;
-            self.deleted = std.ascii.indexOfIgnoreCase(action, "\\Deleted") != null;
+            self.seen = ascii_compat.indexOfIgnoreCase(action, "\\Seen") != null;
+            self.answered = ascii_compat.indexOfIgnoreCase(action, "\\Answered") != null;
+            self.flagged = ascii_compat.indexOfIgnoreCase(action, "\\Flagged") != null;
+            self.draft = ascii_compat.indexOfIgnoreCase(action, "\\Draft") != null;
+            self.deleted = ascii_compat.indexOfIgnoreCase(action, "\\Deleted") != null;
         }
     }
 };
@@ -722,7 +723,7 @@ fn extractQuotedArg(rest: []const u8) []const u8 {
 fn hasCriteriaToken(criteria: []const u8, keyword: []const u8) bool {
     if (keyword.len == 0) return false;
     var search_from: usize = 0;
-    while (std.ascii.indexOfIgnoreCasePos(criteria, search_from, keyword)) |pos| {
+    while (ascii_compat.indexOfIgnoreCasePos(criteria, search_from, keyword)) |pos| {
         const before_ok = pos == 0 or isCriteriaDelimiter(criteria[pos - 1]);
         const after_idx = pos + keyword.len;
         const after_ok = after_idx >= criteria.len or isCriteriaDelimiter(criteria[after_idx]);
@@ -1008,7 +1009,7 @@ pub const ImapSession = struct {
         const root = try std.fmt.allocPrint(self.allocator, "mail/{s}", .{local_part});
         defer self.allocator.free(root);
 
-        const root_z = try self.allocator.dupeZ(u8, root);
+        const root_z = try self.allocator.dupeSentinel(u8, root, 0);
         defer self.allocator.free(root_z);
 
         if (std.c.opendir(root_z.ptr)) |dir| {
@@ -1281,7 +1282,7 @@ pub const ImapSession = struct {
             const username = full_username;
 
             var root_buf: [512]u8 = undefined;
-            const root = std.fmt.bufPrintZ(&root_buf, "mail/{s}", .{username}) catch return 0;
+            const root = std.fmt.bufPrintSentinel(&root_buf, "mail/{s}", .{username}, 0) catch return 0;
 
             var total: usize = 0;
             if (std.c.opendir(root.ptr)) |dir| {
@@ -1341,7 +1342,7 @@ pub const ImapSession = struct {
             const username = full_username;
 
             var root_buf: [512]u8 = undefined;
-            const root = std.fmt.bufPrintZ(&root_buf, "mail/{s}", .{username}) catch {
+            const root = std.fmt.bufPrintSentinel(&root_buf, "mail/{s}", .{username}, 0) catch {
                 _ = std.c.close(fd);
                 return null;
             };
@@ -1354,7 +1355,7 @@ pub const ImapSession = struct {
                     const name_ptr: [*:0]const u8 = @ptrCast(&entry.name);
                     const folder = std.mem.sliceTo(name_ptr, 0);
                     if (!shouldIncludeInAggregate(folder, false)) continue;
-                    const folder_path = std.fmt.bufPrintZ(&folder_buf, "{s}/{s}", .{ root, folder }) catch continue;
+                    const folder_path = std.fmt.bufPrintSentinel(&folder_buf, "{s}/{s}", .{ root, folder }, 0) catch continue;
                     if (addIdleWatchDir(fd, folder_path)) watched += 1;
                 }
             }
@@ -1366,15 +1367,15 @@ pub const ImapSession = struct {
             const username = full_username;
             var new_buf: [512]u8 = undefined;
             var cur_buf: [512]u8 = undefined;
-            if (std.fmt.bufPrintZ(&new_buf, "mail/{s}/new", .{username})) |p| {
+            if (std.fmt.bufPrintSentinel(&new_buf, "mail/{s}/new", .{username}, 0)) |p| {
                 if (addIdleWatchDir(fd, p)) watched += 1;
             } else |_| {}
-            if (std.fmt.bufPrintZ(&cur_buf, "mail/{s}/cur", .{username})) |p| {
+            if (std.fmt.bufPrintSentinel(&cur_buf, "mail/{s}/cur", .{username}, 0)) |p| {
                 if (addIdleWatchDir(fd, p)) watched += 1;
             } else |_| {}
         } else if (self.mailbox_dir) |dir| {
             var dir_buf: [1024]u8 = undefined;
-            if (std.fmt.bufPrintZ(&dir_buf, "{s}", .{dir})) |p| {
+            if (std.fmt.bufPrintSentinel(&dir_buf, "{s}", .{dir}, 0)) |p| {
                 if (addIdleWatchDir(fd, p)) watched += 1;
             } else |_| {}
         }
@@ -1782,7 +1783,7 @@ pub const ImapSession = struct {
         defer self.allocator.free(root);
 
         var stats = MailboxStats{};
-        const path_z = self.allocator.dupeZ(u8, root) catch return stats;
+        const path_z = self.allocator.dupeSentinel(u8, root, 0) catch return stats;
         defer self.allocator.free(path_z);
 
         const dir = std.c.opendir(path_z.ptr) orelse {
@@ -1811,7 +1812,7 @@ pub const ImapSession = struct {
         const root = std.fmt.allocPrint(self.allocator, "mail/{s}", .{local_part}) catch return stats;
         defer self.allocator.free(root);
 
-        const path_z = self.allocator.dupeZ(u8, root) catch return stats;
+        const path_z = self.allocator.dupeSentinel(u8, root, 0) catch return stats;
         defer self.allocator.free(path_z);
 
         const dir = std.c.opendir(path_z.ptr) orelse return stats;
@@ -2866,7 +2867,7 @@ pub const ImapSession = struct {
     /// just past it (where its argument starts), or null.
     fn findCriteriaToken(criteria: []const u8, keyword: []const u8) ?usize {
         var search_from: usize = 0;
-        while (std.ascii.indexOfIgnoreCasePos(criteria, search_from, keyword)) |pos| {
+        while (ascii_compat.indexOfIgnoreCasePos(criteria, search_from, keyword)) |pos| {
             const before_ok = pos == 0 or isCriteriaDelimiter(criteria[pos - 1]);
             const after_idx = pos + keyword.len;
             const after_ok = after_idx >= criteria.len or isCriteriaDelimiter(criteria[after_idx]);
@@ -2969,24 +2970,24 @@ pub const ImapSession = struct {
         // like "marshall" cannot be mistaken for the ALL key (which would
         // otherwise match every message).
         const is_all = criteria.len == 0 or hasCriteriaToken(criteria, "ALL");
-        const want_seen = std.ascii.indexOfIgnoreCase(criteria, "SEEN") != null and
-            std.ascii.indexOfIgnoreCase(criteria, "UNSEEN") == null;
-        const want_unseen = std.ascii.indexOfIgnoreCase(criteria, "UNSEEN") != null;
-        const want_flagged = std.ascii.indexOfIgnoreCase(criteria, "FLAGGED") != null and
-            std.ascii.indexOfIgnoreCase(criteria, "UNFLAGGED") == null;
-        const want_unflagged = std.ascii.indexOfIgnoreCase(criteria, "UNFLAGGED") != null;
-        const want_deleted = std.ascii.indexOfIgnoreCase(criteria, "DELETED") != null and
-            std.ascii.indexOfIgnoreCase(criteria, "UNDELETED") == null;
-        const want_undeleted = std.ascii.indexOfIgnoreCase(criteria, "UNDELETED") != null;
-        const want_answered = std.ascii.indexOfIgnoreCase(criteria, "ANSWERED") != null and
-            std.ascii.indexOfIgnoreCase(criteria, "UNANSWERED") == null;
-        const want_unanswered = std.ascii.indexOfIgnoreCase(criteria, "UNANSWERED") != null;
+        const want_seen = ascii_compat.indexOfIgnoreCase(criteria, "SEEN") != null and
+            ascii_compat.indexOfIgnoreCase(criteria, "UNSEEN") == null;
+        const want_unseen = ascii_compat.indexOfIgnoreCase(criteria, "UNSEEN") != null;
+        const want_flagged = ascii_compat.indexOfIgnoreCase(criteria, "FLAGGED") != null and
+            ascii_compat.indexOfIgnoreCase(criteria, "UNFLAGGED") == null;
+        const want_unflagged = ascii_compat.indexOfIgnoreCase(criteria, "UNFLAGGED") != null;
+        const want_deleted = ascii_compat.indexOfIgnoreCase(criteria, "DELETED") != null and
+            ascii_compat.indexOfIgnoreCase(criteria, "UNDELETED") == null;
+        const want_undeleted = ascii_compat.indexOfIgnoreCase(criteria, "UNDELETED") != null;
+        const want_answered = ascii_compat.indexOfIgnoreCase(criteria, "ANSWERED") != null and
+            ascii_compat.indexOfIgnoreCase(criteria, "UNANSWERED") == null;
+        const want_unanswered = ascii_compat.indexOfIgnoreCase(criteria, "UNANSWERED") != null;
 
         // Parse UID range criteria (e.g. "UID 4:*", "UID 1,3,5")
         var uid_range_start: i64 = 0;
         var uid_range_end: i64 = std.math.maxInt(i64);
         var has_uid_range = false;
-        if (std.ascii.indexOfIgnoreCase(criteria, "UID")) |uid_pos| {
+        if (ascii_compat.indexOfIgnoreCase(criteria, "UID")) |uid_pos| {
             // Make sure this is the UID keyword, not part of another word
             const after_uid = uid_pos + 3;
             if (after_uid < criteria.len) {
@@ -3061,8 +3062,8 @@ pub const ImapSession = struct {
                 // Text-based criteria, fallback path: FROM, SUBJECT —
                 // require reading the file
                 const need_content = ts_matches == null and
-                    (std.ascii.indexOfIgnoreCase(criteria, "FROM") != null or
-                        std.ascii.indexOfIgnoreCase(criteria, "SUBJECT") != null);
+                    (ascii_compat.indexOfIgnoreCase(criteria, "FROM") != null or
+                        ascii_compat.indexOfIgnoreCase(criteria, "SUBJECT") != null);
                 if (need_content) {
                     const filepath = self.allocSelectedMessagePath(i, filename) catch continue;
                     defer self.allocator.free(filepath);
@@ -3075,28 +3076,28 @@ pub const ImapSession = struct {
 
                     var matches = true;
                     // Extract FROM search term
-                    if (std.ascii.indexOfIgnoreCase(criteria, "FROM")) |from_pos| {
+                    if (ascii_compat.indexOfIgnoreCase(criteria, "FROM")) |from_pos| {
                         const after = criteria[from_pos + 4 ..];
                         const term = extractQuotedArg(after);
                         if (term.len > 0) {
-                            if (std.ascii.indexOfIgnoreCase(hdr, "From:")) |fp| {
+                            if (ascii_compat.indexOfIgnoreCase(hdr, "From:")) |fp| {
                                 const from_line_end = std.mem.indexOfScalarPos(u8, hdr, fp, '\n') orelse hdr.len;
                                 const from_line = hdr[fp..from_line_end];
-                                if (std.ascii.indexOfIgnoreCase(from_line, term) == null) matches = false;
+                                if (ascii_compat.indexOfIgnoreCase(from_line, term) == null) matches = false;
                             } else {
                                 matches = false;
                             }
                         }
                     }
                     // Extract SUBJECT search term
-                    if (std.ascii.indexOfIgnoreCase(criteria, "SUBJECT")) |subj_pos| {
+                    if (ascii_compat.indexOfIgnoreCase(criteria, "SUBJECT")) |subj_pos| {
                         const after = criteria[subj_pos + 7 ..];
                         const term = extractQuotedArg(after);
                         if (term.len > 0) {
-                            if (std.ascii.indexOfIgnoreCase(hdr, "Subject:")) |sp| {
+                            if (ascii_compat.indexOfIgnoreCase(hdr, "Subject:")) |sp| {
                                 const subj_line_end = std.mem.indexOfScalarPos(u8, hdr, sp, '\n') orelse hdr.len;
                                 const subj_line = hdr[sp..subj_line_end];
-                                if (std.ascii.indexOfIgnoreCase(subj_line, term) == null) matches = false;
+                                if (ascii_compat.indexOfIgnoreCase(subj_line, term) == null) matches = false;
                             } else {
                                 matches = false;
                             }
@@ -3271,7 +3272,7 @@ pub const ImapSession = struct {
             file.writeAll(content) catch continue;
 
             // Delete source
-            const src_path_z = self.allocator.dupeZ(u8, src_path) catch continue;
+            const src_path_z = self.allocator.dupeSentinel(u8, src_path, 0) catch continue;
             defer self.allocator.free(src_path_z);
             _ = std.c.unlink(src_path_z.ptr);
 
@@ -3425,7 +3426,7 @@ pub const ImapSession = struct {
             return;
         };
 
-        const is_silent = std.ascii.indexOfIgnoreCase(flags_action, ".SILENT") != null;
+        const is_silent = ascii_compat.indexOfIgnoreCase(flags_action, ".SILENT") != null;
         // Need mutable access to update cached filenames after renames
         const mutable_files = @constCast(files);
 
@@ -3507,7 +3508,7 @@ pub const ImapSession = struct {
             // Delete the file
             const path = self.allocSelectedMessagePath(seq - 1, filename) catch continue;
             defer self.allocator.free(path);
-            const path_z = self.allocator.dupeZ(u8, path) catch continue;
+            const path_z = self.allocator.dupeSentinel(u8, path, 0) catch continue;
             defer self.allocator.free(path_z);
             _ = std.c.unlink(path_z.ptr);
 
@@ -3701,7 +3702,7 @@ pub const ImapSession = struct {
                         if (flags.deleted) {
                             const path = self.allocSelectedMessagePath(i, filename) catch continue;
                             defer self.allocator.free(path);
-                            const path_z = self.allocator.dupeZ(u8, path) catch continue;
+                            const path_z = self.allocator.dupeSentinel(u8, path, 0) catch continue;
                             defer self.allocator.free(path_z);
                             _ = std.c.unlink(path_z.ptr);
                         }

@@ -63,7 +63,7 @@ pub const Dir = struct {
             .CLOEXEC = true,
         }, @as(std.c.mode_t, 0o644));
         if (fd < 0) {
-            const e: std.c.E = @enumFromInt(std.c._errno().*);
+            const e: std.c.E = @fromBackingInt(@intCast(std.c._errno().*));
             if (e == .EXIST) return error.PathAlreadyExists;
             return error.SystemResources;
         }
@@ -366,7 +366,7 @@ pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]con
         if (name.len > 4 and (std.mem.endsWith(u8, name, ".eml") or std.mem.indexOf(u8, name, ".eml:") != null)) {
             // Skip symlinks: these names are later fed to rename/unlink, and a
             // symlink could redirect those operations outside the mailbox.
-            const full = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ dir_path, name }) catch continue;
+            const full = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ dir_path, name }, 0) catch continue;
             if (isSymlink(full)) continue;
             const owned = try allocator.dupe(u8, name);
             try entries.append(allocator, .{

@@ -23,6 +23,7 @@
 //! correctness-sensitive module.
 
 const std = @import("std");
+const ascii_compat = @import("ascii-compat");
 const fs_compat = @import("../core/fs_compat.zig");
 const database = @import("../storage/database.zig");
 const imap = @import("../protocol/imap.zig");
@@ -337,7 +338,7 @@ fn renamePath(old_path: []const u8, new_path: []const u8) bool {
 /// silently-ignored unlink leaves a deleted/moved message on disk while the
 /// caller reports success (data-consistency bug).
 fn unlinkPath(allocator: std.mem.Allocator, path: []const u8) !void {
-    const z = try allocator.dupeZ(u8, path);
+    const z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(z);
     if (std.c.unlink(z.ptr) != 0) return MaildirError.WriteFailed;
 }
@@ -606,13 +607,13 @@ fn extractBestBody(allocator: std.mem.Allocator, raw: []const u8) !BodyParts {
 
     const ctype = try getHeader(allocator, header_block, "Content-Type");
 
-    if (std.ascii.indexOfIgnoreCase(ctype, "multipart/") != null) {
+    if (ascii_compat.indexOfIgnoreCase(ctype, "multipart/") != null) {
         return parseMultipart(allocator, ctype, body, 0);
     }
 
     const cte = try getHeader(allocator, header_block, "Content-Transfer-Encoding");
     const decoded = decodeBody(allocator, body, cte) catch body;
-    if (std.ascii.indexOfIgnoreCase(ctype, "text/html") != null) {
+    if (ascii_compat.indexOfIgnoreCase(ctype, "text/html") != null) {
         return BodyParts{ .html = decoded, .text = "" };
     }
     return BodyParts{ .text = decoded, .html = "" };
@@ -650,8 +651,8 @@ fn parseMultipart(allocator: std.mem.Allocator, ctype: []const u8, body: []const
         const pcd = try getHeader(allocator, part_headers, "Content-Disposition");
 
         // Attachment if disposition says so or there's a filename.
-        if (std.ascii.indexOfIgnoreCase(pcd, "attachment") != null or
-            std.ascii.indexOfIgnoreCase(pcd, "filename") != null)
+        if (ascii_compat.indexOfIgnoreCase(pcd, "attachment") != null or
+            ascii_compat.indexOfIgnoreCase(pcd, "filename") != null)
         {
             result.has_attachments = true;
             try attachments.append(allocator, .{
@@ -662,11 +663,11 @@ fn parseMultipart(allocator: std.mem.Allocator, ctype: []const u8, body: []const
             continue;
         }
 
-        if (std.ascii.indexOfIgnoreCase(pct, "text/html") != null and result.html.len == 0) {
+        if (ascii_compat.indexOfIgnoreCase(pct, "text/html") != null and result.html.len == 0) {
             result.html = decodeBody(allocator, part_body, pcte) catch part_body;
-        } else if (std.ascii.indexOfIgnoreCase(pct, "text/plain") != null and result.text.len == 0) {
+        } else if (ascii_compat.indexOfIgnoreCase(pct, "text/plain") != null and result.text.len == 0) {
             result.text = decodeBody(allocator, part_body, pcte) catch part_body;
-        } else if (std.ascii.indexOfIgnoreCase(pct, "multipart/") != null) {
+        } else if (ascii_compat.indexOfIgnoreCase(pct, "multipart/") != null) {
             // Nested multipart (e.g. multipart/alternative inside multipart/mixed).
             const nested = parseMultipart(allocator, pct, part_body, depth + 1) catch BodyParts{};
             if (result.text.len == 0) result.text = nested.text;
@@ -685,7 +686,7 @@ fn parseMultipart(allocator: std.mem.Allocator, ctype: []const u8, body: []const
 const max_boundary_len = 70;
 
 fn extractBoundary(ctype: []const u8) ?[]const u8 {
-    const idx = std.ascii.indexOfIgnoreCase(ctype, "boundary=") orelse return null;
+    const idx = ascii_compat.indexOfIgnoreCase(ctype, "boundary=") orelse return null;
     var v = ctype[idx + "boundary=".len ..];
     if (v.len > 0 and v[0] == '"') {
         v = v[1..];
@@ -706,7 +707,7 @@ fn extractBoundary(ctype: []const u8) ?[]const u8 {
 /// Extract a parameter value like filename="x" from a header value.
 fn extractParam(allocator: std.mem.Allocator, header_val: []const u8, param: []const u8) ![]const u8 {
     const needle = try std.fmt.allocPrint(allocator, "{s}=", .{param});
-    const idx = std.ascii.indexOfIgnoreCase(header_val, needle) orelse return "";
+    const idx = ascii_compat.indexOfIgnoreCase(header_val, needle) orelse return "";
     var v = header_val[idx + needle.len ..];
     if (v.len > 0 and v[0] == '"') {
         v = v[1..];
@@ -720,10 +721,10 @@ fn extractParam(allocator: std.mem.Allocator, header_val: []const u8, param: []c
 
 /// Decode a body per Content-Transfer-Encoding. Falls back to the raw bytes.
 fn decodeBody(allocator: std.mem.Allocator, body: []const u8, cte: []const u8) ![]const u8 {
-    if (std.ascii.indexOfIgnoreCase(cte, "base64") != null) {
+    if (ascii_compat.indexOfIgnoreCase(cte, "base64") != null) {
         return decodeBase64(allocator, body) catch body;
     }
-    if (std.ascii.indexOfIgnoreCase(cte, "quoted-printable") != null) {
+    if (ascii_compat.indexOfIgnoreCase(cte, "quoted-printable") != null) {
         return decodeQuotedPrintable(allocator, body) catch body;
     }
     return body;
@@ -974,7 +975,7 @@ test "extractBoundary rejects oversized and unterminated boundaries" {
     // Unterminated quoted boundary -> rejected (would otherwise become a huge delimiter).
     try t.expect(extractBoundary("multipart/mixed; boundary=\"aaaaaaaaaa") == null);
     // Over 70 chars -> rejected.
-    const long = "multipart/mixed; boundary=" ++ ("a" ** 80);
+    const long = "multipart/mixed; boundary=" ++ @as([80]u8, @splat('a'));
     try t.expect(extractBoundary(long) == null);
     // Missing boundary -> null.
     try t.expect(extractBoundary("multipart/mixed") == null);

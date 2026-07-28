@@ -144,7 +144,7 @@ pub const DiscordHealthMonitor = struct {
         const db_path = env.get("SMTP_DB_PATH") orelse return;
         // Check file accessibility via libc access()
         const db_accessible = blk: {
-            const z = std.heap.c_allocator.dupeZ(u8, db_path) catch break :blk false;
+            const z = std.heap.c_allocator.dupeSentinel(u8, db_path, 0) catch break :blk false;
             defer std.heap.c_allocator.free(z);
             break :blk (access(z.ptr, 0) == 0); // F_OK = 0
         };
@@ -477,7 +477,7 @@ pub const DiscordHealthMonitor = struct {
         const seq = post_seq.fetchAdd(1, .monotonic);
         const tmp_path_s = try std.fmt.allocPrint(self.allocator, "/tmp/.mail_discord_{d}.json", .{seq});
         defer self.allocator.free(tmp_path_s);
-        const tmp_path = try self.allocator.dupeZ(u8, tmp_path_s);
+        const tmp_path = try self.allocator.dupeSentinel(u8, tmp_path_s, 0);
         errdefer self.allocator.free(tmp_path);
 
         const fp = std.c.fopen(tmp_path.ptr, "w") orelse {
@@ -490,7 +490,7 @@ pub const DiscordHealthMonitor = struct {
         // curl handles HTTPS natively; -m bounds a hung endpoint.
         const cmd_s = try std.fmt.allocPrint(self.allocator, "curl -s -m 10 -o /dev/null -X POST -H 'Content-Type: application/json' -d @{s} '{s}' 2>/dev/null", .{ tmp_path_s, self.webhook_url });
         defer self.allocator.free(cmd_s);
-        const cmd = try self.allocator.dupeZ(u8, cmd_s);
+        const cmd = try self.allocator.dupeSentinel(u8, cmd_s, 0);
         errdefer self.allocator.free(cmd);
 
         const job = try self.allocator.create(PostJob);

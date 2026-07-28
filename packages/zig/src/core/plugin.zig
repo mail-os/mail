@@ -760,7 +760,7 @@ pub const HotReloadManager = struct {
         _ = self;
         const file = std.fs.cwd().openFile(path, .{}) catch |err| {
             if (err == error.FileNotFound) return error.FileNotFound;
-            return [_]u8{0} ** 32;
+            return @splat(0);
         };
         defer file.close();
 

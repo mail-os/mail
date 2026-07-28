@@ -164,7 +164,7 @@ pub const DnsblChecker = struct {
     /// catch-all address would cause every IP to be flagged as blacklisted.
     fn lookupDns(self: *DnsblChecker, hostname: []const u8) !bool {
         // Add null terminator for C string
-        const hostname_z = try self.allocator.dupeZ(u8, hostname);
+        const hostname_z = try self.allocator.dupeSentinel(u8, hostname, 0);
         defer self.allocator.free(hostname_z);
 
         // Try to resolve the hostname (A records only)
@@ -178,7 +178,7 @@ pub const DnsblChecker = struct {
         defer if (result) |r| std.c.freeaddrinfo(r);
 
         // rc != 0 means the name did not resolve (NXDOMAIN etc.) => not listed.
-        if (@intFromEnum(rc) != 0) return false;
+        if (@backingInt(rc) != 0) return false;
 
         // Walk the result list and look for an A record in 127.0.0.0/8.
         var node = result;

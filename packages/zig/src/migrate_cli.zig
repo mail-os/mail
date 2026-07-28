@@ -49,7 +49,7 @@ pub fn showHistory(manager: *migrations.MigrationManager, allocator: std.mem.All
 
     std.debug.print("\n=== Migration History ===\n", .{});
     std.debug.print("{s:<10} {s:<30} {s}\n", .{ "Version", "Name", "Applied At" });
-    std.debug.print("{s}\n", .{"-" ** 70});
+    std.debug.print("{s}\n", .{@as([70]u8, @splat('-'))});
 
     for (records) |record| {
         const timestamp = @as(i64, @intCast(record.applied_at));

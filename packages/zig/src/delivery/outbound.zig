@@ -298,7 +298,7 @@ fn deliverOnce(
     mx_host: []const u8,
     attempt_tls: bool,
 ) !void {
-    const mx_host_z = try allocator.dupeZ(u8, mx_host);
+    const mx_host_z = try allocator.dupeSentinel(u8, mx_host, 0);
     defer allocator.free(mx_host_z);
 
     // Resolve hostname to IP using getaddrinfo
@@ -309,7 +309,7 @@ fn deliverOnce(
 
     var result: ?*std.c.addrinfo = null;
     const gai_ret = std.c.getaddrinfo(mx_host_z.ptr, "25", &hints, &result);
-    if (@intFromEnum(gai_ret) != 0 or result == null) {
+    if (@backingInt(gai_ret) != 0 or result == null) {
         std.log.err("Failed to resolve MX host {s}", .{mx_host});
         return error.MxResolutionFailed;
     }
@@ -554,7 +554,7 @@ fn deliverViaSes(
     const tmp_path_z = try std.fmt.allocPrint(allocator, "/tmp/ses-input-{d}.json", .{timestamp});
     defer allocator.free(tmp_path_z);
 
-    const path_z = try allocator.dupeZ(u8, tmp_path_z);
+    const path_z = try allocator.dupeSentinel(u8, tmp_path_z, 0);
     defer allocator.free(path_z);
 
     const fd = std.c.open(path_z.ptr, .{

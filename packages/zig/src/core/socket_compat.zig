@@ -127,8 +127,8 @@ pub const Server = struct {
         if (address.family == .ipv4) {
             const sockaddr = address.toSockaddrIn();
             if (std.c.bind(fd, @ptrCast(&sockaddr), @sizeOf(@TypeOf(sockaddr))) < 0) {
-                const e: posix.E = @enumFromInt(std.c._errno().*);
-                std.log.err("bind() failed on port {d}: errno={d}", .{ address.port, @intFromEnum(e) });
+                const e: posix.E = @fromBackingInt(@intCast(std.c._errno().*));
+                std.log.err("bind() failed on port {d}: errno={d}", .{ address.port, @backingInt(e) });
                 return switch (e) {
                     .ADDRINUSE => error.AddressInUse,
                     .ADDRNOTAVAIL => error.AddressNotAvailable,
@@ -139,8 +139,8 @@ pub const Server = struct {
         } else {
             const sockaddr = address.toSockaddrIn6();
             if (std.c.bind(fd, @ptrCast(&sockaddr), @sizeOf(@TypeOf(sockaddr))) < 0) {
-                const e: posix.E = @enumFromInt(std.c._errno().*);
-                std.log.err("bind() failed on port {d}: errno={d}", .{ address.port, @intFromEnum(e) });
+                const e: posix.E = @fromBackingInt(@intCast(std.c._errno().*));
+                std.log.err("bind() failed on port {d}: errno={d}", .{ address.port, @backingInt(e) });
                 return switch (e) {
                     .ADDRINUSE => error.AddressInUse,
                     .ADDRNOTAVAIL => error.AddressNotAvailable,
@@ -170,7 +170,7 @@ pub const Server = struct {
         // Use raw syscall to avoid Zig 0.16 error type mismatch
         const rc = std.c.accept(self.fd, &client_addr, &addr_len);
         if (rc < 0) {
-            const err: posix.E = @enumFromInt(std.c._errno().*);
+            const err: posix.E = @fromBackingInt(@intCast(std.c._errno().*));
             return switch (err) {
                 .AGAIN => error.WouldBlock,
                 .INTR => error.OperationCancelled,

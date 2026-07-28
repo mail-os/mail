@@ -695,10 +695,11 @@ pub const ImapCommands = struct {
         const cmd_str = iter.next() orelse return null;
         const args = iter.rest();
 
-        const cmd = std.meta.stringToEnum(Command, std.ascii.lowerString(
-            &[_]u8{0} ** 20,
-            cmd_str,
-        )[0..cmd_str.len]) orelse return null;
+        var lowercase_buf: [20]u8 = undefined;
+        const cmd = std.meta.stringToEnum(
+            Command,
+            std.ascii.lowerString(&lowercase_buf, cmd_str)[0..cmd_str.len],
+        ) orelse return null;
 
         return .{ .tag = tag, .cmd = cmd, .args = args };
     }
@@ -732,7 +733,7 @@ pub const Pop3Commands = struct {
         const arg = iter.next();
 
         const cmd = std.meta.stringToEnum(Command, std.ascii.lowerString(
-            &[_]u8{0} ** 10,
+            &@as([10]u8, @splat(0)),
             cmd_str,
         )[0..cmd_str.len]) orelse return null;
 
@@ -1046,24 +1047,25 @@ pub const ImapSession = struct {
     }
 
     pub fn handleCommand(self: *ImapSession, tag: []const u8, cmd: []const u8, args: []const u8) ![]u8 {
-        const cmd_lower = std.ascii.lowerString(&[_]u8{0} ** 20, cmd);
-        const cmd_name = cmd_lower[0..@min(cmd.len, 20)];
+        var cmd_buf: [20]u8 = undefined;
+        const cmd_len = @min(cmd.len, cmd_buf.len);
+        const cmd_name = std.ascii.lowerString(cmd_buf[0..cmd_len], cmd[0..cmd_len]);
 
-        if (std.mem.eql(u8, cmd_name[0..cmd.len], "capability")) {
+        if (std.mem.eql(u8, cmd_name, "capability")) {
             return self.cmdCapability(tag);
-        } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "login")) {
+        } else if (std.mem.eql(u8, cmd_name, "login")) {
             return self.cmdLogin(tag, args);
-        } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "select")) {
+        } else if (std.mem.eql(u8, cmd_name, "select")) {
             return self.cmdSelect(tag, args);
-        } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "list")) {
+        } else if (std.mem.eql(u8, cmd_name, "list")) {
             return self.cmdList(tag, args);
-        } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "status")) {
+        } else if (std.mem.eql(u8, cmd_name, "status")) {
             return self.cmdStatus(tag, args);
-        } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "fetch")) {
+        } else if (std.mem.eql(u8, cmd_name, "fetch")) {
             return self.cmdFetch(tag, args);
-        } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "noop")) {
+        } else if (std.mem.eql(u8, cmd_name, "noop")) {
             return std.fmt.allocPrint(self.allocator, "{s} OK NOOP completed\r\n", .{tag});
-        } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "logout")) {
+        } else if (std.mem.eql(u8, cmd_name, "logout")) {
             self.state = .logout;
             return std.fmt.allocPrint(self.allocator, "* BYE IMAP4rev1 Server logging out\r\n{s} OK LOGOUT completed\r\n", .{tag});
         } else {
@@ -1197,30 +1199,31 @@ pub const Pop3Session = struct {
     }
 
     pub fn handleCommand(self: *Pop3Session, cmd: []const u8, arg: ?[]const u8) ![]u8 {
-        const cmd_upper = std.ascii.upperString(&[_]u8{0} ** 10, cmd);
-        const cmd_name = cmd_upper[0..@min(cmd.len, 10)];
+        var cmd_buf: [10]u8 = undefined;
+        const cmd_len = @min(cmd.len, cmd_buf.len);
+        const cmd_name = std.ascii.upperString(cmd_buf[0..cmd_len], cmd[0..cmd_len]);
 
-        if (std.mem.eql(u8, cmd_name[0..cmd.len], "USER")) {
+        if (std.mem.eql(u8, cmd_name, "USER")) {
             return self.cmdUser(arg);
-        } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "PASS")) {
+        } else if (std.mem.eql(u8, cmd_name, "PASS")) {
             return self.cmdPass(arg);
-        } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "STAT")) {
+        } else if (std.mem.eql(u8, cmd_name, "STAT")) {
             return self.cmdStat();
-        } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "LIST")) {
+        } else if (std.mem.eql(u8, cmd_name, "LIST")) {
             return self.cmdList(arg);
-        } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "RETR")) {
+        } else if (std.mem.eql(u8, cmd_name, "RETR")) {
             return self.cmdRetr(arg);
-        } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "DELE")) {
+        } else if (std.mem.eql(u8, cmd_name, "DELE")) {
             return self.cmdDele(arg);
-        } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "NOOP")) {
+        } else if (std.mem.eql(u8, cmd_name, "NOOP")) {
             return std.fmt.allocPrint(self.allocator, "+OK\r\n", .{});
-        } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "RSET")) {
+        } else if (std.mem.eql(u8, cmd_name, "RSET")) {
             return self.cmdRset();
-        } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "QUIT")) {
+        } else if (std.mem.eql(u8, cmd_name, "QUIT")) {
             return self.cmdQuit();
-        } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "CAPA")) {
+        } else if (std.mem.eql(u8, cmd_name, "CAPA")) {
             return self.cmdCapa();
-        } else if (std.mem.eql(u8, cmd_name[0..cmd.len], "UIDL")) {
+        } else if (std.mem.eql(u8, cmd_name, "UIDL")) {
             return self.cmdUidl(arg);
         } else {
             return std.fmt.allocPrint(self.allocator, "-ERR Unknown command\r\n", .{});

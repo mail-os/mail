@@ -287,11 +287,11 @@ test "email address length limits" {
     const testing = std.testing;
 
     // Create a local part that's 65 characters (too long)
-    const long_local = "a" ** 65 ++ "@example.com";
+    const long_local = @as([65]u8, @splat('a')) ++ "@example.com";
     try testing.expectError(error.LocalPartTooLong, EmailValidator.validate(long_local));
 
     // Create a domain that's 256 characters (too long)
-    const long_domain = "user@" ++ ("a" ** 250) ++ ".com";
+    const long_domain = "user@" ++ @as([250]u8, @splat('a')) ++ ".com";
     try testing.expectError(error.DomainTooLong, EmailValidator.validate(long_domain));
 }
 

@@ -363,7 +363,7 @@ test "reject boundary longer than 70 characters" {
     var parser = MultipartParser.init(testing.allocator);
 
     // Create a boundary that's 71 characters (too long)
-    const long_boundary = "a" ** 71;
+    const long_boundary = @as([71]u8, @splat('a'));
     const message = "--" ++ long_boundary ++ "\r\ntest\r\n--" ++ long_boundary ++ "--";
 
     const result = parser.parse(message, long_boundary);

@@ -294,7 +294,7 @@ test "streaming parser message too large" {
     var parser = try StreamingParser.init(testing.allocator, 1024, 100); // Max 100 bytes
     defer parser.deinit();
 
-    const large_chunk = "x" ** 200; // 200 bytes
+    const large_chunk = @as([200]u8, @splat('x')); // 200 bytes
     const result = parser.processChunk(large_chunk);
 
     try testing.expectError(StreamingParser.ParseError.MessageTooLarge, result);

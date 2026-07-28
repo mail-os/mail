@@ -389,7 +389,7 @@ test "AuthBackend long password" {
     var backend = auth.AuthBackend.init(allocator, &db);
 
     // Create user with very long password
-    const long_password = "a" ** 1000;
+    const long_password = @as([1000]u8, @splat('a'));
     _ = try backend.createUser("testuser", long_password, "test@example.com");
 
     // Verify long password works

@@ -164,7 +164,7 @@ fn heloNotFqdn(helo: []const u8) bool {
 /// which we detect explicitly. (std.net was removed in this Zig, so we go
 /// straight to libc — mirroring antispam/dnsbl.zig.)
 fn hasReverseDns(allocator: std.mem.Allocator, ip: []const u8) bool {
-    const ip_z = allocator.dupeZ(u8, ip) catch return true;
+    const ip_z = allocator.dupeSentinel(u8, ip, 0) catch return true;
     defer allocator.free(ip_z);
 
     var res: ?*std.c.addrinfo = null;
@@ -175,13 +175,13 @@ fn hasReverseDns(allocator: std.mem.Allocator, ip: []const u8) bool {
     });
     const rc1 = std.c.getaddrinfo(ip_z.ptr, null, &hints, &res);
     defer if (res) |r| std.c.freeaddrinfo(r);
-    if (@intFromEnum(rc1) != 0) return true; // unparseable -> don't penalize
+    if (@backingInt(rc1) != 0) return true; // unparseable -> don't penalize
     const node = res orelse return true;
     const sa = node.addr orelse return true;
 
     var host_buf: [256]u8 = undefined;
     const rc2 = std.c.getnameinfo(sa, node.addrlen, &host_buf, @intCast(host_buf.len), null, 0, .{});
-    if (@intFromEnum(rc2) != 0) return true; // lookup error -> don't penalize
+    if (@backingInt(rc2) != 0) return true; // lookup error -> don't penalize
     const host = std.mem.sliceTo(&host_buf, 0);
     return !std.mem.eql(u8, host, ip); // numeric echo means no PTR
 }
@@ -679,7 +679,7 @@ pub const Session = struct {
         self.conn_wrapper.deinitTls();
         // Clean up TLS reader/writer - use stored alignment
         if (self.tls_reader_info) |info| {
-            const log2_align: std.mem.Alignment = @enumFromInt(std.math.log2(info.alignment));
+            const log2_align: std.mem.Alignment = @fromBackingInt(@intCast(std.math.log2(info.alignment)));
             const ptr_bytes: [*]u8 = @ptrCast(info.ptr);
             switch (info.alignment) {
                 1 => self.allocator.rawFree(ptr_bytes[0..info.size], log2_align, @returnAddress()),
@@ -691,7 +691,7 @@ pub const Session = struct {
             }
         }
         if (self.tls_writer_info) |info| {
-            const log2_align: std.mem.Alignment = @enumFromInt(std.math.log2(info.alignment));
+            const log2_align: std.mem.Alignment = @fromBackingInt(@intCast(std.math.log2(info.alignment)));
             const ptr_bytes: [*]u8 = @ptrCast(info.ptr);
             switch (info.alignment) {
                 1 => self.allocator.rawFree(ptr_bytes[0..info.size], log2_align, @returnAddress()),

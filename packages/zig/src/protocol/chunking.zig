@@ -246,7 +246,7 @@ test "drainBDAT tolerates malformed commands and short streams" {
     try testing.expectEqual(@as(usize, 3), s3.pos);
 
     // Hostile announcement is capped at max_message_size
-    var s4 = MockStream{ .data = "x" ** 32 };
+    var s4 = MockStream{ .data = @as([32]u8, @splat('x')) };
     var small = ChunkingHandler.init(testing.allocator, 16, 16);
     small.drainBDAT("BDAT 999999999", &s4);
     try testing.expectEqual(@as(usize, 16), s4.pos);

@@ -460,7 +460,9 @@ pub const SMTPBenchmarks = struct {
     /// Benchmark large base64 decoding
     pub fn benchmarkLargeBase64Decode(self: *SMTPBenchmarks) !void {
         // Simulated 1KB base64 data
-        const test_data = "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo=" ** 10;
+        const unit = "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo=";
+        const test_data = unit ++ unit ++ unit ++ unit ++ unit ++
+            unit ++ unit ++ unit ++ unit ++ unit;
         const decoder = std.base64.standard.Decoder;
         const decoded_len = try decoder.calcSizeForSlice(test_data);
         const decoded = try self.allocator.alloc(u8, decoded_len);

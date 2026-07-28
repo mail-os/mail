@@ -60,7 +60,7 @@ pub fn CBC(comptime BlockCipher: anytype) type {
                 @memcpy(dst[i..][0..block_length], &cv);
             }
             // Last block
-            var in = [_]u8{0} ** block_length;
+            var in: [block_length]u8 = @splat(0);
             const padding_length: u8 = @intCast(padded_length - src.len - 1);
             @memset(&in, padding_length);
             @memcpy(in[0 .. src.len - i], src[i..]);
@@ -117,12 +117,12 @@ test "CBC mode" {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     inline for (0..src_.len) |len| {
         const src = src_[0..len];
-        var dst = [_]u8{0} ** M.paddedLength(src.len);
+        var dst: [M.paddedLength(src.len)]u8 = @splat(0);
 
         z.encrypt(&dst, src, iv);
         h.update(&dst);
 
-        var decrypted = [_]u8{0} ** dst.len;
+        var decrypted: [dst.len]u8 = @splat(0);
         try z.decrypt(&decrypted, &dst, iv);
 
         const padding = decrypted[decrypted.len - 1] + 1;
@@ -134,7 +134,7 @@ test "CBC mode" {
     // Test encryption and decryption with the same buffer
     h = std.crypto.hash.sha2.Sha256.init(.{});
     inline for (0..src_.len) |len| {
-        var buf = [_]u8{0} ** M.paddedLength(len);
+        var buf: [M.paddedLength(len)]u8 = @splat(0);
         @memcpy(buf[0..len], src_[0..len]);
         z.encrypt(&buf, buf[0..len], iv);
         h.update(&buf);

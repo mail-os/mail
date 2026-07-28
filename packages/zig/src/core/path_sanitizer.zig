@@ -275,7 +275,7 @@ test "sanitizeFilename - limits length" {
     const allocator = testing.allocator;
 
     // Create a filename longer than 255 chars
-    const long_name = "a" ** 300;
+    const long_name = @as([300]u8, @splat('a'));
     const sanitized = try PathSanitizer.sanitizeFilename(allocator, long_name);
     defer allocator.free(sanitized);
 

@@ -3,6 +3,7 @@
 // https://www.ftc.gov/business-guidance/resources/can-spam-act-compliance-guide-business
 
 const std = @import("std");
+const ascii_compat = @import("ascii-compat");
 const time_compat = @import("../core/time_compat.zig");
 
 /// CAN-SPAM compliance checker and enforcer
@@ -247,7 +248,7 @@ pub const CanSpamCompliance = struct {
         };
 
         for (deceptive_patterns) |pattern| {
-            if (std.ascii.indexOfIgnoreCase(subject, pattern)) |_| {
+            if (ascii_compat.indexOfIgnoreCase(subject, pattern)) |_| {
                 // Potentially deceptive - log warning
                 // In production, this might be configurable
                 break;

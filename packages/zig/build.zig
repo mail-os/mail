@@ -30,6 +30,9 @@ pub fn build(b: *std.Build) void {
 
     // Translate sqlite3.h into a Zig module (replaces @cImport in source files)
     const sqlite_module = sqliteModule(b, target, optimize);
+    const ascii_compat_module = b.createModule(.{
+        .root_source_file = b.path("src/core/ascii_compat.zig"),
+    });
 
     if (build_all_targets) {
         // Build for all supported targets
@@ -43,7 +46,7 @@ pub fn build(b: *std.Build) void {
         };
 
         for (targets) |t| {
-            buildForTarget(b, t, optimize, tls_module, zig_cli_module, search_engine_module);
+            buildForTarget(b, t, optimize, tls_module, zig_cli_module, search_engine_module, ascii_compat_module);
         }
     }
 
@@ -57,6 +60,7 @@ pub fn build(b: *std.Build) void {
     mail_module.addImport("search-engine", search_engine_module);
     mail_module.addImport("zig-cli", zig_cli_module);
     mail_module.addImport("sqlite", sqlite_module);
+    mail_module.addImport("ascii-compat", ascii_compat_module);
 
     const mail_exe = b.addExecutable(.{
         .name = "mail",
@@ -71,11 +75,10 @@ pub fn build(b: *std.Build) void {
     // whole build on an unspawnable command. webmail_dist is gitignored, so
     // whoever invokes such a build must pre-render it (the Docker CI job does).
     const have_bun = blk: {
-        _ = b.findProgram(&.{"bun"}, &.{}) catch break :blk false;
-        break :blk true;
+        break :blk b.findProgram(.{ .names = &.{"bun"} }) != null;
     };
     const have_webmail_pkg = blk: {
-        std.Io.Dir.accessAbsolute(b.graph.io, b.pathFromRoot("../webmail"), .{}) catch break :blk false;
+        b.root.access(b.graph.io, "../webmail", .{}) catch break :blk false;
         break :blk true;
     };
     if (have_bun and have_webmail_pkg) {
@@ -90,10 +93,7 @@ pub fn build(b: *std.Build) void {
     // Run step: mail serve
     const run_cmd = b.addRunArtifact(mail_exe);
     run_cmd.step.dependOn(b.getInstallStep());
-
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run the mail CLI");
     run_step.dependOn(&run_cmd.step);
@@ -148,6 +148,7 @@ pub fn build(b: *std.Build) void {
         test_module.addImport("tls", tls_module);
         test_module.addImport("search-engine", search_engine_module);
         test_module.addImport("sqlite", sqlite_module);
+        test_module.addImport("ascii-compat", ascii_compat_module);
         test_module.linkSystemLibrary("sqlite3", .{});
 
         const unit_tests = b.addTest(.{
@@ -169,6 +170,7 @@ pub fn build(b: *std.Build) void {
     mail_test_module.addImport("tls", tls_module);
     mail_test_module.addImport("search-engine", search_engine_module);
     mail_test_module.addImport("sqlite", sqlite_module);
+    mail_test_module.addImport("ascii-compat", ascii_compat_module);
 
     for (rfc_compliance_tests) |test_file| {
         const test_module = b.createModule(.{
@@ -235,6 +237,7 @@ fn buildForTarget(
     tls_module: *std.Build.Module,
     zig_cli_module: *std.Build.Module,
     search_engine_module: *std.Build.Module,
+    ascii_compat_module: *std.Build.Module,
 ) void {
     const target_query = target.query;
     const triple = b.fmt("{s}-{s}", .{
@@ -251,6 +254,7 @@ fn buildForTarget(
     root_module.addImport("search-engine", search_engine_module);
     root_module.addImport("zig-cli", zig_cli_module);
     root_module.addImport("sqlite", sqliteModule(b, target, optimize));
+    root_module.addImport("ascii-compat", ascii_compat_module);
 
     const exe = b.addExecutable(.{
         .name = b.fmt("mail-{s}", .{triple}),

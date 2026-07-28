@@ -244,7 +244,7 @@ pub const BackupManager = struct {
             defer self.allocator.free(backup_dir);
 
             const metadata = self.loadMetadata(backup_dir) catch continue;
-            const checksum = self.loadChecksum(backup_dir) catch [_]u8{0} ** 32;
+            const checksum = self.loadChecksum(backup_dir) catch @as([32]u8, @splat(0));
 
             const info = BackupInfo{
                 .name = try self.allocator.dupe(u8, entry.name),

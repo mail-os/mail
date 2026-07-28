@@ -697,7 +697,7 @@ pub const QueueDepthHistogram = struct {
     const Self = @This();
 
     // Bucket boundaries: 0, 10, 50, 100, 500, 1000, 5000, 10000, 50000, inf
-    buckets: [10]u64 = [_]u64{0} ** 10,
+    buckets: [10]u64 = @splat(0),
     bucket_boundaries: [9]usize = .{ 10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000 },
     samples: u64 = 0,
     sum: u64 = 0,
@@ -763,7 +763,7 @@ pub const QueueDepthHistogram = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        self.buckets = [_]u64{0} ** 10;
+        self.buckets = @splat(0);
         self.samples = 0;
         self.sum = 0;
         self.min = null;
@@ -777,7 +777,7 @@ pub const MessageSizeDistribution = struct {
 
     // Size buckets: 0-1KB, 1-10KB, 10-100KB, 100KB-1MB, 1-10MB, 10-50MB, 50MB+
     bucket_boundaries: [6]usize = .{ 1024, 10240, 102400, 1048576, 10485760, 52428800 },
-    buckets: [7]u64 = [_]u64{0} ** 7,
+    buckets: [7]u64 = @splat(0),
     total_bytes: u64 = 0,
     total_messages: u64 = 0,
     min_size: ?usize = null,
@@ -844,7 +844,7 @@ pub const MessageSizeDistribution = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        self.buckets = [_]u64{0} ** 7;
+        self.buckets = @splat(0);
         self.total_bytes = 0;
         self.total_messages = 0;
         self.min_size = null;
@@ -960,15 +960,15 @@ pub const MetricHistograms = struct {
 
     pub fn init() MetricHistograms {
         return .{
-            .delivery_times = [_]u64{0} ** 100,
+            .delivery_times = @splat(0),
             .delivery_count = 0,
-            .scan_times = [_]u64{0} ** 100,
+            .scan_times = @splat(0),
             .scan_count = 0,
-            .connection_durations = [_]u64{0} ** 100,
+            .connection_durations = @splat(0),
             .connection_count = 0,
-            .queue_times = [_]u64{0} ** 100,
+            .queue_times = @splat(0),
             .queue_count = 0,
-            .spam_scores = [_]f64{0} ** 100,
+            .spam_scores = @splat(0),
             .spam_score_count = 0,
         };
     }

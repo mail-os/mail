@@ -22,6 +22,7 @@
 //! only calls this for unauthenticated inbound mail.
 
 const std = @import("std");
+const ascii_compat = @import("ascii-compat");
 
 /// Generic authentication verdict. Map the protocol-specific SPF/DKIM/DMARC
 /// result enums onto this before calling `evaluate`.
@@ -138,7 +139,7 @@ fn hasDangerousAttachment(scan: []const u8) bool {
     const markers = [_][]const u8{ "name=", "name*=" };
     for (markers) |marker| {
         var pos: usize = 0;
-        while (std.ascii.indexOfIgnoreCasePos(scan, pos, marker)) |at| {
+        while (ascii_compat.indexOfIgnoreCasePos(scan, pos, marker)) |at| {
             var v = at + marker.len;
             pos = v;
             if (v < scan.len and (scan[v] == '"' or scan[v] == '\'')) v += 1;
@@ -330,12 +331,12 @@ fn stripHtmlText(in: []const u8, out: []u8) []const u8 {
         if (skipped_zero_width) continue;
         if (c == '<') {
             if (std.ascii.startsWithIgnoreCase(in[i..], "<style")) {
-                if (std.ascii.indexOfIgnoreCase(in[i..], "</style")) |rel| {
+                if (ascii_compat.indexOfIgnoreCase(in[i..], "</style")) |rel| {
                     const close = i + rel;
                     i = if (std.mem.indexOfScalarPos(u8, in, close, '>')) |gt| gt + 1 else in.len;
                 } else i = in.len;
             } else if (std.ascii.startsWithIgnoreCase(in[i..], "<script")) {
-                if (std.ascii.indexOfIgnoreCase(in[i..], "</script")) |rel| {
+                if (ascii_compat.indexOfIgnoreCase(in[i..], "</script")) |rel| {
                     const close = i + rel;
                     i = if (std.mem.indexOfScalarPos(u8, in, close, '>')) |gt| gt + 1 else in.len;
                 } else i = in.len;
@@ -380,10 +381,10 @@ fn decodeBase64Parts(window: []const u8, out: []u8) []const u8 {
     var search: usize = 0;
     var out_len: usize = 0;
     while (search < window.len) {
-        const rel = std.ascii.indexOfIgnoreCase(window[search..], marker) orelse break;
+        const rel = ascii_compat.indexOfIgnoreCase(window[search..], marker) orelse break;
         const vstart = search + rel + marker.len;
         const line_end = std.mem.indexOfScalarPos(u8, window, vstart, '\n') orelse window.len;
-        if (std.ascii.indexOfIgnoreCase(window[vstart..line_end], "base64") == null) {
+        if (ascii_compat.indexOfIgnoreCase(window[vstart..line_end], "base64") == null) {
             search = @min(line_end + 1, window.len);
             continue;
         }
@@ -612,7 +613,7 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
 
     // Bulk-blast addressing: the recipient list was hidden.
     if (headerValue(headers, "To")) |to_v| {
-        if (std.ascii.indexOfIgnoreCase(to_v, "undisclosed") != null) {
+        if (ascii_compat.indexOfIgnoreCase(to_v, "undisclosed") != null) {
             score += 1.5;
             tl.add("UNDISCLOSED_RCPTS");
         }
@@ -626,7 +627,7 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
         const disp_end = std.mem.indexOfScalar(u8, from_hdr, '<') orelse from_hdr.len;
         const display = from_hdr[0..disp_end];
         for (spoofed_brands) |brand| {
-            if (std.ascii.indexOfIgnoreCase(display, brand) != null) {
+            if (ascii_compat.indexOfIgnoreCase(display, brand) != null) {
                 const dom_has_brand = if (from_domain) |fd|
                     domainHasLabel(fd, brand)
                 else
@@ -679,10 +680,10 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
         b64: []const u8,
         fn hit(self: @This(), phrase: []const u8) bool {
             if (self.subject) |s| {
-                if (std.ascii.indexOfIgnoreCase(s, phrase) != null) return true;
+                if (ascii_compat.indexOfIgnoreCase(s, phrase) != null) return true;
             }
-            if (std.ascii.indexOfIgnoreCase(self.text, phrase) != null) return true;
-            return self.b64.len > 0 and std.ascii.indexOfIgnoreCase(self.b64, phrase) != null;
+            if (ascii_compat.indexOfIgnoreCase(self.text, phrase) != null) return true;
+            return self.b64.len > 0 and ascii_compat.indexOfIgnoreCase(self.b64, phrase) != null;
         }
     };
     const scan = Scan{ .subject = subject, .text = scan_text, .b64 = b64_text };
@@ -796,7 +797,7 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
         tl.add("MANY_URLS");
     }
     for (url_shorteners) |sh| {
-        if (std.ascii.indexOfIgnoreCase(scan_qp, sh) != null) {
+        if (ascii_compat.indexOfIgnoreCase(scan_qp, sh) != null) {
             score += 1.0;
             tl.add("URL_SHORTENER");
             break;
@@ -944,7 +945,7 @@ fn isWordByte(c: u8) bool {
 
 fn containsWordIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     var pos: usize = 0;
-    while (std.ascii.indexOfIgnoreCasePos(haystack, pos, needle)) |at| {
+    while (ascii_compat.indexOfIgnoreCasePos(haystack, pos, needle)) |at| {
         const before_ok = at == 0 or !isWordByte(haystack[at - 1]);
         const end = at + needle.len;
         const after_ok = end == haystack.len or !isWordByte(haystack[end]);
@@ -1000,7 +1001,7 @@ fn countOccurrencesIgnoreCase(haystack: []const u8, needle: []const u8) usize {
     if (needle.len == 0) return 0;
     var count: usize = 0;
     var i: usize = 0;
-    while (std.ascii.indexOfIgnoreCasePos(haystack, i, needle)) |pos| {
+    while (ascii_compat.indexOfIgnoreCasePos(haystack, i, needle)) |pos| {
         count += 1;
         i = pos + needle.len;
     }
@@ -1009,7 +1010,7 @@ fn countOccurrencesIgnoreCase(haystack: []const u8, needle: []const u8) usize {
 
 fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
     for (needles) |n| {
-        if (std.ascii.indexOfIgnoreCase(haystack, n) != null) return true;
+        if (ascii_compat.indexOfIgnoreCase(haystack, n) != null) return true;
     }
     return false;
 }

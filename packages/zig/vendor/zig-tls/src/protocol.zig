@@ -91,7 +91,7 @@ pub const Extension = enum(u16) {
 };
 
 pub fn alertFromError(err: anyerror) [2]u8 {
-    return [2]u8{ @intFromEnum(Alert.Level.fatal), @intFromEnum(Alert.fromError(err)) };
+    return [2]u8{ @backingInt(Alert.Level.fatal), @backingInt(Alert.fromError(err)) };
 }
 
 pub const Alert = enum(u8) {
@@ -228,16 +228,16 @@ pub const Alert = enum(u8) {
     }
 
     pub fn parse(buf: [2]u8) Alert {
-        const level: Alert.Level = @enumFromInt(buf[0]);
-        const alert: Alert = @enumFromInt(buf[1]);
+        const level: Alert.Level = @fromBackingInt(@intCast(buf[0]));
+        const alert: Alert = @fromBackingInt(@intCast(buf[1]));
         _ = level;
         return alert;
     }
 
     pub fn closeNotify() [2]u8 {
         return [2]u8{
-            @intFromEnum(Alert.Level.warning),
-            @intFromEnum(Alert.close_notify),
+            @backingInt(Alert.Level.warning),
+            @backingInt(Alert.close_notify),
         };
     }
 };

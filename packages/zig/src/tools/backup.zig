@@ -864,7 +864,7 @@ fn runList(allocator: std.mem.Allocator, args: []const []const u8) !u8 {
 
     std.debug.print("Available backups in {s}:\n\n", .{backup_dir});
     std.debug.print("{s:<40} {s:<20}\n", .{ "Name", "Path" });
-    std.debug.print("{s}\n", .{"-" ** 60});
+    std.debug.print("{s}\n", .{@as([60]u8, @splat('-'))});
 
     for (backups) |backup| {
         std.debug.print("{s:<40} {s:<20}\n", .{ backup.name, backup.path });

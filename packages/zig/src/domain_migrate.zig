@@ -250,9 +250,9 @@ fn dkimKeyExists(allocator: std.mem.Allocator, dkim_dir: []const u8, domain: []c
 /// does — `std.fs`'s rename signature has moved between the Zig versions this
 /// project has had to build under.
 fn renamePath(allocator: std.mem.Allocator, from: []const u8, to: []const u8) bool {
-    const from_z = allocator.dupeZ(u8, from) catch return false;
+    const from_z = allocator.dupeSentinel(u8, from, 0) catch return false;
     defer allocator.free(from_z);
-    const to_z = allocator.dupeZ(u8, to) catch return false;
+    const to_z = allocator.dupeSentinel(u8, to, 0) catch return false;
     defer allocator.free(to_z);
     return std.c.rename(from_z.ptr, to_z.ptr) == 0;
 }

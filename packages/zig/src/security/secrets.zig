@@ -565,7 +565,7 @@ pub const SecretManager = struct {
         const full_cmd = try std.fmt.allocPrintSentinel(self.allocator, "{s} > {s} 2>/dev/null", .{ cmd, tmp_path }, 0);
         defer self.allocator.free(full_cmd);
 
-        const tmp_path_z = try self.allocator.dupeZ(u8, tmp_path);
+        const tmp_path_z = try self.allocator.dupeSentinel(u8, tmp_path, 0);
         defer self.allocator.free(tmp_path_z);
         defer _ = unlink(tmp_path_z.ptr);
 
@@ -993,7 +993,7 @@ pub const AwsSigV4Signer = struct {
 
         return try std.fmt.allocPrint(self.allocator, "{d:0>4}{d:0>2}{d:0>2}", .{
             year_and_day.year,
-            @intFromEnum(month_day.month),
+            @backingInt(month_day.month),
             month_day.day_index + 1,
         });
     }
@@ -1013,7 +1013,7 @@ pub const AwsSigV4Signer = struct {
 
         return try std.fmt.allocPrint(self.allocator, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
             year_and_day.year,
-            @intFromEnum(month_day.month),
+            @backingInt(month_day.month),
             month_day.day_index + 1,
             hours,
             minutes,

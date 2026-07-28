@@ -1172,7 +1172,7 @@ pub const DKIMCli = struct {
         try output.print(self.allocator, "{s:<40} {s:<20} {s:<15} {s:<10} {s:<10}\n", .{
             "ID", "Domain", "Selector", "Algorithm", "Status",
         });
-        try output.print(self.allocator, "{s}\n", .{"-" ** 95});
+        try output.print(self.allocator, "{s}\n", .{@as([95]u8, @splat('-'))});
 
         for (keys) |key| {
             const status = if (key.is_active) "active" else "inactive";

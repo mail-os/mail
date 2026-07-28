@@ -19,8 +19,8 @@ pub const Record = struct {
 
     pub fn init(buffer: []const u8) Record {
         return .{
-            .content_type = @enumFromInt(buffer[0]),
-            .protocol_version = @enumFromInt(mem.readInt(u16, buffer[1..3], .big)),
+            .content_type = @fromBackingInt(@intCast(buffer[0])),
+            .protocol_version = @fromBackingInt(@intCast(mem.readInt(u16, buffer[1..3], .big))),
             .buffer = buffer,
             .header = buffer[0..header_len],
             .payload = buffer[header_len..],
@@ -55,8 +55,8 @@ pub const Record = struct {
 
     pub fn decoder(rdr: *Io.Reader) !Decoder {
         const rec = try Record.read(rdr);
-        if (@intFromEnum(rec.protocol_version) != 0x0300 and
-            @intFromEnum(rec.protocol_version) != 0x0301 and
+        if (@backingInt(rec.protocol_version) != 0x0300 and
+            @backingInt(rec.protocol_version) != 0x0301 and
             rec.protocol_version != .tls_1_2)
             return error.TlsBadVersion;
         return .{
@@ -110,8 +110,8 @@ pub const Decoder = struct {
             },
             .@"enum" => |info| {
                 const int = try d.decode(info.tag_type);
-                if (info.is_exhaustive) @compileError("exhaustive enum cannot be used");
-                return @as(T, @enumFromInt(int));
+                if (info.mode == .exhaustive) @compileError("exhaustive enum cannot be used");
+                return @as(T, @fromBackingInt(@intCast(int)));
             },
             else => @compileError("unsupported type: " ++ @typeName(T)),
         }
@@ -276,7 +276,7 @@ pub const Writer = struct {
     }
 
     pub fn enumValue(w: *Writer, value: anytype) !void {
-        const i = @intFromEnum(value);
+        const i = @backingInt(value);
         try w.int(@TypeOf(i), i);
     }
 
@@ -449,14 +449,14 @@ fn int3(int: u24) [3]u8 {
 }
 
 pub fn header(content_type: proto.ContentType, payload_len: usize) [header_len]u8 {
-    return [1]u8{@intFromEnum(content_type)} ++
-        int2(@intFromEnum(proto.Version.tls_1_2)) ++
+    return [1]u8{@backingInt(content_type)} ++
+        int2(@backingInt(proto.Version.tls_1_2)) ++
         int2(@intCast(payload_len));
 }
 
 pub fn handshakeHeader(handshake_type: proto.Handshake, payload_len: usize) [4]u8 {
     var ret: [4]u8 = undefined;
-    ret[0] = @intFromEnum(handshake_type);
+    ret[0] = @backingInt(handshake_type);
     std.mem.writeInt(u24, ret[1..4], @intCast(payload_len), .big);
     return ret;
 }

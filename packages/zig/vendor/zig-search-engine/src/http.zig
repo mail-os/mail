@@ -6,6 +6,20 @@
 const std = @import("std");
 const types = @import("types.zig");
 
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > haystack.len) return null;
+
+    const first = std.ascii.toLower(needle[0]);
+    const last_start = haystack.len - needle.len;
+    var index: usize = 0;
+    while (index <= last_start) : (index += 1) {
+        if (std.ascii.toLower(haystack[index]) != first) continue;
+        if (std.ascii.eqlIgnoreCase(haystack[index .. index + needle.len], needle)) return index;
+    }
+    return null;
+}
+
 pub const Response = struct {
     status: u16,
     body: []u8,
@@ -26,7 +40,7 @@ pub const Header = struct {
 
 fn tcpConnect(host: [:0]const u8, port: u16, timeout_seconds: u32) types.Error!std.posix.socket_t {
     var port_buf: [8]u8 = undefined;
-    const port_z = std.fmt.bufPrintZ(&port_buf, "{d}", .{port}) catch return error.ConnectFailed;
+    const port_z = std.fmt.bufPrintSentinel(&port_buf, "{d}", .{port}, 0) catch return error.ConnectFailed;
 
     const hints = std.mem.zeroInit(std.c.addrinfo, .{
         .family = std.posix.AF.INET,
@@ -34,7 +48,7 @@ fn tcpConnect(host: [:0]const u8, port: u16, timeout_seconds: u32) types.Error!s
     });
     var result: ?*std.c.addrinfo = null;
     const gai = std.c.getaddrinfo(host.ptr, port_z.ptr, &hints, &result);
-    if (@intFromEnum(gai) != 0 or result == null) return error.ConnectFailed;
+    if (@backingInt(gai) != 0 or result == null) return error.ConnectFailed;
     defer std.c.freeaddrinfo(result.?);
 
     const family: c_uint = @intCast(std.posix.AF.INET);
@@ -110,7 +124,7 @@ pub fn request(
 
     var dechunked: std.ArrayList(u8) = .empty;
     defer dechunked.deinit(allocator);
-    if (std.ascii.indexOfIgnoreCase(data[0..hdr_end], "transfer-encoding: chunked") != null) {
+    if (indexOfIgnoreCase(data[0..hdr_end], "transfer-encoding: chunked") != null) {
         var pos: usize = 0;
         while (pos < resp_body.len) {
             const line_end = std.mem.indexOfPos(u8, resp_body, pos, "\r\n") orelse break;

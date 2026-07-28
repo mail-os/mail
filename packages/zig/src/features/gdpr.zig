@@ -277,7 +277,7 @@ pub const GDPRManager = struct {
     pub fn init(allocator: std.mem.Allocator, db_path: []const u8) !GDPRManager {
         // sqlite3_open requires a NUL-terminated path; a Zig slice's .ptr
         // isn't guaranteed to be one.
-        const path_z = try allocator.dupeZ(u8, db_path);
+        const path_z = try allocator.dupeSentinel(u8, db_path, 0);
         defer allocator.free(path_z);
 
         var db: ?*sqlite.sqlite3 = null;
@@ -385,7 +385,7 @@ pub const GDPRManager = struct {
 
         const root = try std.fmt.allocPrint(self.allocator, "mail/{s}", .{username});
         defer self.allocator.free(root);
-        const root_z = try self.allocator.dupeZ(u8, root);
+        const root_z = try self.allocator.dupeSentinel(u8, root, 0);
         defer self.allocator.free(root_z);
 
         const dir = std.c.opendir(root_z.ptr) orelse return try messages.toOwnedSlice(self.allocator);

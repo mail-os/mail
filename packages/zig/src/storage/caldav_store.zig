@@ -397,7 +397,7 @@ pub const CalDavStore = struct {
         stmt.bindInt(9, if (ev.all_day) 1 else 0) catch return;
         bindOptText(&stmt, 10, ev.rrule) catch return;
         bindOptText(&stmt, 11, ev.organizer) catch return;
-        stmt.bindInt(12, @intFromEnum(ev.status)) catch return;
+        stmt.bindInt(12, @backingInt(ev.status)) catch return;
         stmt.bindInt(13, ev.created_at) catch return;
         stmt.bindInt(14, ev.modified_at) catch return;
         stmt.bindText(15, ev.etag) catch return;
@@ -454,7 +454,7 @@ pub const CalDavStore = struct {
             defer stmt.finalize();
             stmt.bindInt(1, @intCast(contact_id)) catch continue;
             stmt.bindText(2, e.email) catch continue;
-            stmt.bindInt(3, @intFromEnum(e.email_type)) catch continue;
+            stmt.bindInt(3, @backingInt(e.email_type)) catch continue;
             stmt.bindInt(4, if (e.is_primary) 1 else 0) catch continue;
             _ = stmt.step() catch continue;
         }
@@ -464,7 +464,7 @@ pub const CalDavStore = struct {
             defer stmt.finalize();
             stmt.bindInt(1, @intCast(contact_id)) catch continue;
             stmt.bindText(2, p.number) catch continue;
-            stmt.bindInt(3, @intFromEnum(p.phone_type)) catch continue;
+            stmt.bindInt(3, @backingInt(p.phone_type)) catch continue;
             stmt.bindInt(4, if (p.is_primary) 1 else 0) catch continue;
             _ = stmt.step() catch continue;
         }
@@ -1808,13 +1808,13 @@ pub const VcfParser = struct {
         family_name: ?[]const u8 = null,
         nickname: ?[]const u8 = null,
         title: ?[]const u8 = null,
-        emails: [MAX_MULTI_VALUES][]const u8 = [_][]const u8{""} ** MAX_MULTI_VALUES,
-        email_types: [MAX_MULTI_VALUES]EmailAddress.EmailType = [_]EmailAddress.EmailType{.other} ** MAX_MULTI_VALUES,
-        email_pref: [MAX_MULTI_VALUES]bool = [_]bool{false} ** MAX_MULTI_VALUES,
+        emails: [MAX_MULTI_VALUES][]const u8 = @splat(""),
+        email_types: [MAX_MULTI_VALUES]EmailAddress.EmailType = @splat(.other),
+        email_pref: [MAX_MULTI_VALUES]bool = @splat(false),
         email_count: usize = 0,
-        phones: [MAX_MULTI_VALUES][]const u8 = [_][]const u8{""} ** MAX_MULTI_VALUES,
-        phone_types: [MAX_MULTI_VALUES]PhoneNumber.PhoneType = [_]PhoneNumber.PhoneType{.other} ** MAX_MULTI_VALUES,
-        phone_pref: [MAX_MULTI_VALUES]bool = [_]bool{false} ** MAX_MULTI_VALUES,
+        phones: [MAX_MULTI_VALUES][]const u8 = @splat(""),
+        phone_types: [MAX_MULTI_VALUES]PhoneNumber.PhoneType = @splat(.other),
+        phone_pref: [MAX_MULTI_VALUES]bool = @splat(false),
         phone_count: usize = 0,
         organization: ?[]const u8 = null,
 

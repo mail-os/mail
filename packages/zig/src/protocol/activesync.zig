@@ -735,7 +735,7 @@ test "Protocol version parsing" {
 test "Folder types" {
     const testing = std.testing;
 
-    try testing.expectEqual(@as(u8, 2), @intFromEnum(FolderType.default_inbox));
-    try testing.expectEqual(@as(u8, 8), @intFromEnum(FolderType.default_calendar));
-    try testing.expectEqual(@as(u8, 9), @intFromEnum(FolderType.default_contacts));
+    try testing.expectEqual(@as(u8, 2), @backingInt(FolderType.default_inbox));
+    try testing.expectEqual(@as(u8, 8), @backingInt(FolderType.default_calendar));
+    try testing.expectEqual(@as(u8, 9), @backingInt(FolderType.default_contacts));
 }

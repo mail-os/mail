@@ -110,7 +110,7 @@ fn typesenseReindexAction(ctx: *cli.BaseCommand.ParseContext) anyerror!void {
     var indexed: usize = 0;
     var failed: usize = 0;
 
-    const root_z = try allocator.dupeZ(u8, root);
+    const root_z = try allocator.dupeSentinel(u8, root, 0);
     defer allocator.free(root_z);
     const root_dir = std.c.opendir(root_z.ptr) orelse {
         std.debug.print("Error: cannot open maildir root {s}\n", .{root});
@@ -125,7 +125,7 @@ fn typesenseReindexAction(ctx: *cli.BaseCommand.ParseContext) anyerror!void {
 
         const user_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, user });
         defer allocator.free(user_path);
-        const user_path_z = try allocator.dupeZ(u8, user_path);
+        const user_path_z = try allocator.dupeSentinel(u8, user_path, 0);
         defer allocator.free(user_path_z);
 
         const user_dir = std.c.opendir(user_path_z.ptr) orelse continue;
