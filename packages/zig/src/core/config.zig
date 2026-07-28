@@ -51,6 +51,9 @@ pub const Config = struct {
     /// beyond `hostname` and its parent domain. Lets one mail server host
     /// mailboxes for multiple domains (e.g. "example.org, another.com").
     extra_local_domains: ?[]const u8 = null,
+    /// Domain appended to legacy bare usernames during authentication.
+    /// Defaults to the parent of `hostname` (mail.example.com -> example.com).
+    auth_default_domain: ?[]const u8 = null,
     webhook_url: ?[]const u8,
     webhook_enabled: bool,
     enable_dnsbl: bool,
@@ -143,6 +146,7 @@ pub const Config = struct {
         allocator.free(self.host);
         allocator.free(self.hostname);
         if (self.extra_local_domains) |v| allocator.free(v);
+        if (self.auth_default_domain) |v| allocator.free(v);
         if (self.tls_cert_path) |path| allocator.free(path);
         if (self.tls_key_path) |path| allocator.free(path);
         if (self.webhook_url) |url| allocator.free(url);
@@ -415,6 +419,12 @@ fn applyEnvironmentVariables(allocator: std.mem.Allocator, cfg: *Config) !void {
     if (env.get("SMTP_LOCAL_DOMAINS")) |value| {
         if (cfg.extra_local_domains) |old| allocator.free(old);
         cfg.extra_local_domains = try allocator.dupe(u8, value);
+    }
+
+    // SMTP_AUTH_DEFAULT_DOMAIN - qualifies legacy bare mailbox usernames
+    if (env.get("SMTP_AUTH_DEFAULT_DOMAIN")) |value| {
+        if (cfg.auth_default_domain) |old| allocator.free(old);
+        cfg.auth_default_domain = try allocator.dupe(u8, value);
     }
 
     // SMTP_MAX_CONNECTIONS
@@ -695,6 +705,10 @@ fn applyConfigFile(allocator: std.mem.Allocator, cfg: *Config, path: []const u8)
         if (server.getString("local_domains")) |value| {
             if (cfg.extra_local_domains) |old| allocator.free(old);
             cfg.extra_local_domains = try allocator.dupe(u8, value);
+        }
+        if (server.getString("auth_default_domain")) |value| {
+            if (cfg.auth_default_domain) |old| allocator.free(old);
+            cfg.auth_default_domain = try allocator.dupe(u8, value);
         }
         if (server.getInt("max_connections")) |value| {
             cfg.max_connections = @intCast(value);

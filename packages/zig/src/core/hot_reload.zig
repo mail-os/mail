@@ -88,13 +88,9 @@ pub const HotReloadManager = struct {
         const old_config = self.current_config.*;
         self.current_config.* = new_config;
 
-        // Clean up old config strings
-        self.allocator.free(old_config.host);
-        self.allocator.free(old_config.hostname);
-        self.allocator.free(old_config.tracing_service_name);
-        if (old_config.tls_cert_path) |p| self.allocator.free(p);
-        if (old_config.tls_key_path) |p| self.allocator.free(p);
-        if (old_config.webhook_url) |u| self.allocator.free(u);
+        // Release every owned string from the replaced configuration. Keeping
+        // a second partial cleanup list here leaked newly added optional fields.
+        old_config.deinit(self.allocator);
 
         // Update reload statistics
         self.last_reload_time = time_compat.timestamp();

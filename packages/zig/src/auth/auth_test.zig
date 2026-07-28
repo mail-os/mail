@@ -82,6 +82,26 @@ test "AuthBackend refuses an ambiguous local-part login" {
     try testing.expect(!try backend.verifyCredentials("info", "second-password"));
 }
 
+test "AuthBackend default domain resolves an otherwise ambiguous local-part" {
+    const allocator = testing.allocator;
+
+    var db = try database.Database.init(allocator, ":memory:");
+    defer db.deinit();
+
+    var backend = auth.AuthBackend.init(allocator, &db);
+    defer backend.deinit();
+    try backend.setDefaultDomain("example.com");
+
+    _ = try backend.createUser("chris@example.com", "primary-password", "chris@example.com");
+    _ = try backend.createUser("chris@example.net", "secondary-password", "chris@example.net");
+
+    try testing.expect(try backend.verifyCredentials("chris", "primary-password"));
+    try testing.expect(!try backend.verifyCredentials("chris", "secondary-password"));
+    const canonical = try backend.canonicalUsername("chris", allocator);
+    defer allocator.free(canonical);
+    try testing.expectEqualStrings("chris@example.com", canonical);
+}
+
 test "AuthBackend exact bare username wins over a full-address alias" {
     const allocator = testing.allocator;
 

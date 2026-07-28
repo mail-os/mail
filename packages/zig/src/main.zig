@@ -168,6 +168,14 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
 
         db_ptr = &db.?;
         auth_backend = auth.AuthBackend.init(allocator, db_ptr.?);
+        const auth_default_domain = cfg.auth_default_domain orelse if (std.mem.indexOfScalar(u8, cfg.hostname, '.')) |dot|
+            cfg.hostname[dot + 1 ..]
+        else
+            null;
+        if (auth_default_domain) |domain| {
+            try auth_backend.?.setDefaultDomain(domain);
+            log.info("Bare mailbox logins use the configured default domain", .{});
+        }
         auth_ptr = &auth_backend.?;
 
         log.info("Database-backed authentication enabled", .{});

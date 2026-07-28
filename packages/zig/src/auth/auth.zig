@@ -177,6 +177,7 @@ pub const AuthBackend = struct {
     allocator: std.mem.Allocator,
     nonce_manager: NonceManager,
     verify_cache: VerifyCache,
+    default_domain: ?[]u8 = null,
 
     /// Cache of recent successful password verifications. Mail clients
     /// reconnect constantly (IMAP polling, IDLE drops, per-message SMTP
@@ -265,6 +266,13 @@ pub const AuthBackend = struct {
     pub fn deinit(self: *AuthBackend) void {
         self.nonce_manager.deinit();
         self.verify_cache.deinit();
+        if (self.default_domain) |domain| self.allocator.free(domain);
+    }
+
+    pub fn setDefaultDomain(self: *AuthBackend, domain: []const u8) !void {
+        const next = try self.allocator.dupe(u8, domain);
+        if (self.default_domain) |current| self.allocator.free(current);
+        self.default_domain = next;
     }
 
     /// Resolve a login or recipient address to the canonical mailbox key.
@@ -275,8 +283,14 @@ pub const AuthBackend = struct {
     pub fn canonicalUsername(self: *AuthBackend, address: []const u8, allocator: std.mem.Allocator) ![]const u8 {
         if (self.db.userExists(address) catch false)
             return allocator.dupe(u8, address);
-        if (std.mem.indexOfScalar(u8, address, '@') == null)
+        if (std.mem.indexOfScalar(u8, address, '@') == null) {
+            if (self.default_domain) |domain| {
+                const qualified = try std.fmt.allocPrint(allocator, "{s}@{s}", .{ address, domain });
+                if (self.db.userExists(qualified) catch false) return qualified;
+                allocator.free(qualified);
+            }
             return (try self.db.uniqueUsernameForLocalPart(address, allocator)) orelse allocator.dupe(u8, address);
+        }
         return allocator.dupe(u8, address);
     }
 
