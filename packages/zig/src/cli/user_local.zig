@@ -93,13 +93,39 @@ fn verifyAction(ctx: *cli.BaseCommand.ParseContext, _: *database.Database, auth_
 
 fn changePasswordAction(ctx: *cli.BaseCommand.ParseContext, _: *database.Database, auth_backend: *auth.AuthBackend) !void {
     const username = ctx.getArgument(0) orelse {
-        std.debug.print("Error: username is required\nUsage: mail user:local change-password <username> <password>\n", .{});
+        std.debug.print("Error: username is required\nUsage: mail user:local change-password <username> [<password> | --password-stdin]\n", .{});
         return;
     };
-    const password = ctx.getArgument(1) orelse {
-        std.debug.print("Error: password is required\nUsage: mail user:local change-password <username> <password>\n", .{});
+
+    var stdin_password: ?[]u8 = null;
+    defer if (stdin_password) |password| {
+        @memset(password, 0);
+        ctx.allocator.free(password);
+    };
+    const password = if (ctx.hasOption("password-stdin")) blk: {
+        var input_list: std.ArrayList(u8) = .empty;
+        errdefer input_list.deinit(ctx.allocator);
+        var read_buf: [512]u8 = undefined;
+        while (input_list.items.len < 4096) {
+            const remaining = 4096 - input_list.items.len;
+            const count = try std.posix.read(std.posix.STDIN_FILENO, read_buf[0..@min(remaining, read_buf.len)]);
+            if (count == 0) break;
+            try input_list.appendSlice(ctx.allocator, read_buf[0..count]);
+        }
+        const input = try input_list.toOwnedSlice(ctx.allocator);
+        stdin_password = input;
+        var end = input.len;
+        while (end > 0 and (input[end - 1] == '\r' or input[end - 1] == '\n')) end -= 1;
+        if (end == 0) {
+            std.debug.print("Error: password read from stdin is empty\n", .{});
+            return;
+        }
+        break :blk input[0..end];
+    } else ctx.getArgument(1) orelse {
+        std.debug.print("Error: password is required\nUsage: mail user:local change-password <username> [<password> | --password-stdin]\n", .{});
         return;
     };
+
     try user_cli.changePassword(auth_backend, username, password);
 }
 
@@ -156,7 +182,10 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     // change-password
     const change_pw_cmd = try cli.BaseCommand.init(allocator, "change-password", "Change user password");
     _ = try change_pw_cmd.addArgument(cli.Argument.init("username", "Username", .string));
-    _ = try change_pw_cmd.addArgument(cli.Argument.init("password", "New password", .string));
+    _ = try change_pw_cmd.addArgument(cli.Argument.init("password", "New password", .string).withRequired(false));
+    _ = try change_pw_cmd.addOption(
+        cli.Option.init("password-stdin", "password-stdin", "Read the new password from standard input", .bool),
+    );
     _ = change_pw_cmd.setAction(withDb(changePasswordAction));
     _ = try cmd.addCommand(change_pw_cmd);
 
