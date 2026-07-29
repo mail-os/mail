@@ -35,8 +35,8 @@
         .tls = .{
             // Keep TLS sourced from the canonical zig-utils/zig-tls repository
             // instead of carrying a divergent snapshot under vendor/.
-            .url = "git+https://github.com/zig-utils/zig-tls.git#42f4ea2398868c6a1d45b99a2b1a518e13fb10f2",
-            .hash = "zig_tls-0.1.1-CwcE5Jb4JwAOOgutzm4ZFMftuFwc3Bjdfc6ceyQRSXuq",
+            .url = "git+https://github.com/zig-utils/zig-tls.git#7701c14c89ca22dbc19577b2c53acc00ec0e1a6d",
+            .hash = "zig_tls-0.1.1-CwcE5Jb4JwApYgi6y6WoRhwGAinXCwixFaVD1YSLCJxJ",
         },
         .search_engine = .{
             .path = "vendor/zig-search-engine",
