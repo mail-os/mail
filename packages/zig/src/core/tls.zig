@@ -1026,7 +1026,7 @@ pub const CipherNegotiator = struct {
             // Server preference: iterate server's list first
             for (self.server_config.cipher_suites) |server_suite| {
                 for (client_suites) |client_suite| {
-                    if (@intFromEnum(server_suite) == client_suite) {
+                    if (@backingInt(server_suite) == client_suite) {
                         return server_suite;
                     }
                 }
@@ -1035,7 +1035,7 @@ pub const CipherNegotiator = struct {
             // Client preference: iterate client's list first
             for (client_suites) |client_suite| {
                 for (self.server_config.cipher_suites) |server_suite| {
-                    if (@intFromEnum(server_suite) == client_suite) {
+                    if (@backingInt(server_suite) == client_suite) {
                         return server_suite;
                     }
                 }
@@ -1051,7 +1051,7 @@ pub const CipherNegotiator = struct {
     ) ?NamedGroup {
         for (self.server_config.named_groups) |server_group| {
             for (client_groups) |client_group| {
-                if (@intFromEnum(server_group) == client_group) {
+                if (@backingInt(server_group) == client_group) {
                     return server_group;
                 }
             }
@@ -1072,7 +1072,7 @@ pub const CipherNegotiator = struct {
             }
 
             for (client_schemes) |client_scheme| {
-                if (@intFromEnum(server_scheme) == client_scheme) {
+                if (@backingInt(server_scheme) == client_scheme) {
                     return server_scheme;
                 }
             }
@@ -1294,7 +1294,7 @@ pub const ServerHelloBuilder = struct {
 
         // Named group (2 bytes)
         var group_bytes: [2]u8 = undefined;
-        std.mem.writeInt(u16, &group_bytes, @intFromEnum(group), .big);
+        std.mem.writeInt(u16, &group_bytes, @backingInt(group), .big);
         try data.appendSlice(self.allocator, &group_bytes);
 
         // Key exchange length (2 bytes)
@@ -1329,7 +1329,7 @@ pub const ServerHelloBuilder = struct {
 
         // Cipher suite (2 bytes)
         var cipher_bytes: [2]u8 = undefined;
-        std.mem.writeInt(u16, &cipher_bytes, @intFromEnum(self.cipher_suite), .big);
+        std.mem.writeInt(u16, &cipher_bytes, @backingInt(self.cipher_suite), .big);
         try output.appendSlice(self.allocator, &cipher_bytes);
 
         // Compression method (0 = null)
@@ -1344,7 +1344,7 @@ pub const ServerHelloBuilder = struct {
         for (self.extensions.items) |ext| {
             // Extension type (2 bytes)
             var ext_type_bytes: [2]u8 = undefined;
-            std.mem.writeInt(u16, &ext_type_bytes, @intFromEnum(ext.ext_type), .big);
+            std.mem.writeInt(u16, &ext_type_bytes, @backingInt(ext.ext_type), .big);
             try output.appendSlice(self.allocator, &ext_type_bytes);
 
             // Extension data length (2 bytes)
@@ -1452,8 +1452,8 @@ pub const TlsAlert = struct {
         return .{
             21, // Alert content type
             0x03, 0x03, // Version (TLS 1.2 for compatibility)
-            0x00,                     0x02, // Length
-            @intFromEnum(self.level), @intFromEnum(self.description),
+            0x00,                    0x02, // Length
+            @backingInt(self.level), @backingInt(self.description),
         };
     }
 
@@ -1706,9 +1706,9 @@ test "cipher negotiation server preference" {
 
     // Client offers TLS 1.2 ciphers first, then TLS 1.3
     const client_suites = [_]u16{
-        @intFromEnum(CipherSuite.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256),
-        @intFromEnum(CipherSuite.TLS_AES_128_GCM_SHA256),
-        @intFromEnum(CipherSuite.TLS_AES_256_GCM_SHA384),
+        @backingInt(CipherSuite.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256),
+        @backingInt(CipherSuite.TLS_AES_128_GCM_SHA256),
+        @backingInt(CipherSuite.TLS_AES_256_GCM_SHA384),
     };
 
     // Server prefers TLS_AES_256_GCM_SHA384 (first in server list)
@@ -1744,8 +1744,8 @@ test "named group negotiation" {
     var negotiator = CipherNegotiator.init(testing.allocator, .{});
 
     const client_groups = [_]u16{
-        @intFromEnum(NamedGroup.secp256r1),
-        @intFromEnum(NamedGroup.x25519),
+        @backingInt(NamedGroup.secp256r1),
+        @backingInt(NamedGroup.x25519),
     };
 
     // Server prefers x25519
@@ -1761,17 +1761,17 @@ test "full negotiation" {
 
     const client_hello = ClientHelloParams{
         .cipher_suites = &[_]u16{
-            @intFromEnum(CipherSuite.TLS_AES_128_GCM_SHA256),
-            @intFromEnum(CipherSuite.TLS_AES_256_GCM_SHA384),
+            @backingInt(CipherSuite.TLS_AES_128_GCM_SHA256),
+            @backingInt(CipherSuite.TLS_AES_256_GCM_SHA384),
         },
         .supported_versions = &[_]u16{ 0x0304, 0x0303 },
         .named_groups = &[_]u16{
-            @intFromEnum(NamedGroup.x25519),
-            @intFromEnum(NamedGroup.secp256r1),
+            @backingInt(NamedGroup.x25519),
+            @backingInt(NamedGroup.secp256r1),
         },
         .signature_algorithms = &[_]u16{
-            @intFromEnum(SignatureScheme.ecdsa_secp256r1_sha256),
-            @intFromEnum(SignatureScheme.rsa_pss_rsae_sha256),
+            @backingInt(SignatureScheme.ecdsa_secp256r1_sha256),
+            @backingInt(SignatureScheme.rsa_pss_rsae_sha256),
         },
         .server_name = "mail.example.com",
     };

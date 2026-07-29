@@ -309,7 +309,7 @@ fn deliverOnce(
 
     var result: ?*std.c.addrinfo = null;
     const gai_ret = std.c.getaddrinfo(mx_host_z.ptr, "25", &hints, &result);
-    if (@intFromEnum(gai_ret) != 0 or result == null) {
+    if (@backingInt(gai_ret) != 0 or result == null) {
         std.log.err("Failed to resolve MX host {s}", .{mx_host});
         return error.MxResolutionFailed;
     }

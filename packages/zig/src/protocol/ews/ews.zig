@@ -757,7 +757,7 @@ fn ewsDate(a: std.mem.Allocator, epoch: i64) []const u8 {
     const md = yd.calculateMonthDay();
     const ds = es.getDaySeconds();
     return std.fmt.allocPrint(a, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
-        yd.year,              @intFromEnum(md.month),  @as(u32, md.day_index) + 1,
+        yd.year,              @backingInt(md.month),   @as(u32, md.day_index) + 1,
         ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
     }) catch "1970-01-01T00:00:00Z";
 }
@@ -945,7 +945,7 @@ fn rfc2822Date(a: std.mem.Allocator, epoch: i64) []const u8 {
     const wdays = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
     const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
     const wd = wdays[@intCast(ed.day % 7)];
-    const mon = months[@intFromEnum(md.month) - 1];
+    const mon = months[@backingInt(md.month) - 1];
     return std.fmt.allocPrint(a, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} +0000", .{
         wd,                   @as(u32, md.day_index) + 1, mon,                       yd.year,
         ds.getHoursIntoDay(), ds.getMinutesIntoHour(),    ds.getSecondsIntoMinute(),

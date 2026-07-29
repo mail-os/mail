@@ -98,7 +98,7 @@ pub const Connection = struct {
             switch (content_type) {
                 .application_data => {},
                 .handshake => {
-                    const handshake_type: proto.Handshake = @enumFromInt(cleartext[0]);
+                    const handshake_type: proto.Handshake = @fromBackingInt(@intCast(cleartext[0]));
                     switch (handshake_type) {
                         .new_session_ticket => {
                             if (c.session_resumption) |r| {
@@ -111,7 +111,7 @@ pub const Connection = struct {
                             // rfc: Upon receiving a KeyUpdate, the receiver MUST
                             // update its receiving keys.
                             try c.cipher.keyUpdateDecrypt();
-                            const key: proto.KeyUpdateRequest = @enumFromInt(cleartext[4]);
+                            const key: proto.KeyUpdateRequest = @fromBackingInt(@intCast(cleartext[4]));
                             switch (key) {
                                 .update_requested => {
                                     @atomicStore(bool, &c.key_update_requested, true, .monotonic);

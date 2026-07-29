@@ -74,9 +74,11 @@ pub fn build(b: *std.Build) void {
     // and embed an existing pre-rendered webmail_dist instead of failing the
     // whole build on an unspawnable command. webmail_dist is gitignored, so
     // whoever invokes such a build must pre-render it (the Docker CI job does).
-    const have_bun = (b.findProgram(&.{"bun"}, &.{}) catch null) != null;
+    const have_bun = blk: {
+        break :blk b.findProgram(.{ .names = &.{"bun"} }) != null;
+    };
     const have_webmail_pkg = blk: {
-        std.Io.Dir.cwd().access(b.graph.io, "../webmail", .{}) catch break :blk false;
+        b.root.access(b.graph.io, "../webmail", .{}) catch break :blk false;
         break :blk true;
     };
     if (have_bun and have_webmail_pkg) {
@@ -91,7 +93,7 @@ pub fn build(b: *std.Build) void {
     // Run step: mail serve
     const run_cmd = b.addRunArtifact(mail_exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run the mail CLI");
     run_step.dependOn(&run_cmd.step);

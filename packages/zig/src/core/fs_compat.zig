@@ -63,7 +63,7 @@ pub const Dir = struct {
             .CLOEXEC = true,
         }, @as(std.c.mode_t, 0o644));
         if (fd < 0) {
-            const e: std.c.E = @enumFromInt(std.c._errno().*);
+            const e: std.c.E = @fromBackingInt(@intCast(std.c._errno().*));
             if (e == .EXIST) return error.PathAlreadyExists;
             return error.SystemResources;
         }

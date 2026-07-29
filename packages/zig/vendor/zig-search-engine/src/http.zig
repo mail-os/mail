@@ -48,7 +48,7 @@ fn tcpConnect(host: [:0]const u8, port: u16, timeout_seconds: u32) types.Error!s
     });
     var result: ?*std.c.addrinfo = null;
     const gai = std.c.getaddrinfo(host.ptr, port_z.ptr, &hints, &result);
-    if (@intFromEnum(gai) != 0 or result == null) return error.ConnectFailed;
+    if (@backingInt(gai) != 0 or result == null) return error.ConnectFailed;
     defer std.c.freeaddrinfo(result.?);
 
     const family: c_uint = @intCast(std.posix.AF.INET);

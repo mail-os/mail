@@ -350,7 +350,7 @@ pub const MultiRegionManager = struct {
             // Serialize event
             try batch.writer().print("{d}:{d}:{s}\n", .{
                 event.id,
-                @intFromEnum(event.event_type),
+                @backingInt(event.event_type),
                 event.payload,
             });
         }

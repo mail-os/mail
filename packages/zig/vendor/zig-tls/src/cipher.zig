@@ -497,7 +497,7 @@ fn Aead13Type(comptime AeadType: type, comptime Hash: type) type {
             if (&cleartext[0] != &buf[record.header_len]) {
                 @memcpy(buf[record.header_len..][0..cleartext.len], cleartext);
             }
-            buf[record.header_len + cleartext.len] = @intFromEnum(content_type);
+            buf[record.header_len + cleartext.len] = @backingInt(content_type);
             const ciphertext = buf[record.header_len..][0 .. cleartext.len + 1];
             const auth_tag = buf[record.header_len + ciphertext.len ..][0..auth_tag_len];
 
@@ -541,7 +541,7 @@ fn Aead13Type(comptime AeadType: type, comptime Hash: type) type {
             while (buf[content_type_idx] == 0 and content_type_idx > 0) : (content_type_idx -= 1) {}
 
             const cleartext = buf[0..content_type_idx];
-            const content_type: proto.ContentType = @enumFromInt(buf[content_type_idx]);
+            const content_type: proto.ContentType = @fromBackingInt(@intCast(buf[content_type_idx]));
             self.decrypt_seq +%= 1;
             return .{ content_type, cleartext };
         }
