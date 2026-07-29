@@ -22,6 +22,7 @@ const outbound = @import("../delivery/outbound.zig");
 const retry = @import("../delivery/retry.zig");
 const aliases = @import("../delivery/aliases.zig");
 const typesense = @import("../search/typesense.zig");
+const sieve = @import("../features/sieve.zig");
 
 /// Maximum number of in-flight detached outbound/forward delivery worker
 /// threads across the whole process. Without a cap, a flood of recipients
@@ -2164,9 +2165,131 @@ pub const Session = struct {
         };
     }
 
-    /// Check forwards.json for auto-forwarding rules and relay if matched.
-    /// Format: {"hi": ["chris@stacksjs.com"], "info": ["a@x.com","b@x.com"]}
+    fn forwardMessage(self: *Session, username: []const u8, sender: []const u8, data: []const u8, forward_to: []const u8) !void {
+        self.logger.info("Auto-forwarding from {s} to {s}", .{ username, forward_to });
+
+        const is_local_forward = if (std.mem.indexOf(u8, forward_to, "@")) |at_pos|
+            self.config.isLocalDomain(forward_to[at_pos + 1 ..])
+        else
+            true;
+
+        if (is_local_forward) {
+            const fwd_is_isolated = if (self.auth_backend) |ab|
+                (ab.db.userExists(forward_to) catch false)
+            else
+                false;
+            const fwd_username = if (fwd_is_isolated)
+                forward_to
+            else if (std.mem.indexOf(u8, forward_to, "@")) |at_pos|
+                aliases.resolve(forward_to[0..at_pos])
+            else
+                aliases.resolve(forward_to);
+
+            const cwd = fs_compat.cwd();
+            const fwd_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{fwd_username});
+            defer self.allocator.free(fwd_dir);
+            cwd.makePath(fwd_dir) catch return error.ForwardDirectoryFailed;
+
+            var fwd_base_buf: [64]u8 = undefined;
+            const fwd_basename = maildirBasename(&fwd_base_buf) catch return error.ForwardNameFailed;
+            const fwd_filename = try std.fmt.allocPrint(self.allocator, "mail/{s}/new/{s}", .{ fwd_username, fwd_basename });
+            defer self.allocator.free(fwd_filename);
+
+            const file = cwd.createFileExclusive(fwd_filename) catch |err| {
+                self.logger.err("Failed to create forward file {s}: {}", .{ fwd_filename, err });
+                return error.ForwardCreateFailed;
+            };
+            file.writeAll(data) catch |err| {
+                file.close();
+                cwd.deleteFile(fwd_filename) catch {};
+                self.logger.err("Failed to write forward data to {s}: {}", .{ fwd_filename, err });
+                return error.ForwardWriteFailed;
+            };
+            file.close();
+            self.logger.info("Local forward from {s} to {s} saved to {s}", .{ username, fwd_username, fwd_filename });
+            return;
+        }
+
+        if (!tryReserveOutboundSlot()) {
+            self.logger.warn("Outbound worker limit reached; queueing forward to {s}", .{forward_to});
+            retry.enqueueFailure(sender, forward_to, data);
+            return;
+        }
+        const bg = self.allocator.create(OutboundContext) catch {
+            releaseOutboundSlot();
+            retry.enqueueFailure(sender, forward_to, data);
+            return;
+        };
+        bg.* = .{
+            .allocator = self.allocator,
+            .from = self.allocator.dupe(u8, sender) catch {
+                self.allocator.destroy(bg);
+                releaseOutboundSlot();
+                retry.enqueueFailure(sender, forward_to, data);
+                return;
+            },
+            .to = self.allocator.dupe(u8, forward_to) catch {
+                self.allocator.free(bg.from);
+                self.allocator.destroy(bg);
+                releaseOutboundSlot();
+                retry.enqueueFailure(sender, forward_to, data);
+                return;
+            },
+            .data = self.allocator.dupe(u8, data) catch {
+                self.allocator.free(bg.from);
+                self.allocator.free(bg.to);
+                self.allocator.destroy(bg);
+                releaseOutboundSlot();
+                retry.enqueueFailure(sender, forward_to, data);
+                return;
+            },
+            .hostname = self.config.hostname,
+            .delivery_method = self.config.delivery_method,
+            .ses_region = self.config.ses_region,
+        };
+        const thread = std.Thread.spawn(.{}, outboundWorker, .{bg}) catch |err| {
+            self.logger.err("Failed to spawn forward thread to {s}: {}", .{ forward_to, err });
+            self.allocator.free(bg.data);
+            self.allocator.free(bg.to);
+            self.allocator.free(bg.from);
+            self.allocator.destroy(bg);
+            releaseOutboundSlot();
+            retry.enqueueFailure(sender, forward_to, data);
+            return;
+        };
+        thread.detach();
+    }
+
+    /// Evaluate the standard RFC 5228 forwarding script. `forwards.json`
+    /// remains a compatibility fallback for installations not yet migrated.
     fn checkAndForward(self: *Session, username: []const u8, sender: []const u8, data: []const u8) !void {
+        if (fs_compat.readFileAlloc(self.allocator, "forwards.sieve")) |source| {
+            defer self.allocator.free(source);
+            var parser = sieve.SieveParser.init(self.allocator);
+            defer parser.deinit();
+            var script = parser.parse(source) catch |err| {
+                self.logger.err("Invalid forwards.sieve: {}", .{err});
+                return error.InvalidForwardScript;
+            };
+            defer script.deinit();
+            if (!script.is_valid) return error.InvalidForwardScript;
+
+            var message = sieve.SieveMessage.init(self.allocator);
+            defer message.deinit();
+            message.envelope_from = sender;
+            message.envelope_to = username;
+
+            var evaluator = sieve.SieveEvaluator.init(self.allocator);
+            const actions = try evaluator.evaluate(&script, &message);
+            defer self.allocator.free(actions);
+            for (actions) |action| {
+                if (action.action_type == .redirect) {
+                    if (action.argument) |target| try self.forwardMessage(username, sender, data, target);
+                }
+            }
+            return;
+        } else |_| {}
+
         const contents = fs_compat.readFileAlloc(self.allocator, "forwards.json") catch return;
         defer self.allocator.free(contents);
         if (contents.len == 0) return;

@@ -11,6 +11,8 @@ BACKUP_DIR="${BACKUP_DIR:-/opt/mail/backups}"
 RETAIN_DAYS="${RETAIN_DAYS:-7}"
 SWAP_GB="${SWAP_GB:-2}"
 FAIL2BAN_IGNORE_IPS="${FAIL2BAN_IGNORE_IPS:-127.0.0.1/8 ::1}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 echo "== memory safety =="
 # The production box is shared with Bun applications. Give short deployment
@@ -79,26 +81,25 @@ systemctl enable --now fail2ban >/dev/null 2>&1 || true
 systemctl restart fail2ban || true
 echo "fail2ban: $(systemctl is-active fail2ban)"
 
+echo "== encrypted storage =="
+if ! command -v cryptsetup >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq && apt-get install -y -qq cryptsetup >/dev/null
+fi
+chmod +x "${REPO_ROOT}/scripts/setup-encrypted-storage.sh"
+MAIL_ROOT="${MAIL_DIR}" "${REPO_ROOT}/scripts/setup-encrypted-storage.sh"
+
 echo "== backups =="
 mkdir -p "$BACKUP_DIR"
-cat > "$MAIL_DIR/backup.sh" <<BK
-#!/usr/bin/env bash
-set -euo pipefail
-TS=\$(date +%Y%m%d-%H%M%S)
-OUT="$BACKUP_DIR/mail-backup-\$TS.tgz"
-# mailboxes + databases + DKIM key + config (exclude the backups dir itself)
-tar czf "\$OUT" \\
-  -C "$MAIL_DIR" mail smtp.db caldav.db dkim 2>/dev/null || true
-[ -f /etc/mail/mail.env ] && tar rf "\${OUT%.tgz}.env.tar" -C /etc/mail mail.env 2>/dev/null || true
-# prune old backups
-find "$BACKUP_DIR" -name 'mail-backup-*.tgz' -mtime +$RETAIN_DAYS -delete 2>/dev/null || true
-echo "backup written: \$OUT (\$(du -h "\$OUT" 2>/dev/null | cut -f1))"
-BK
-chmod +x "$MAIL_DIR/backup.sh"
+install -m 0755 "${REPO_ROOT}/scripts/mail-backup.sh" "$MAIL_DIR/backup.sh"
+install -m 0755 "${REPO_ROOT}/scripts/mail-forward-compile" /usr/local/sbin/mail-forward-compile
+install -m 0755 "${REPO_ROOT}/scripts/maildir-migrate.sh" /usr/local/sbin/maildir-migrate
 
 cat > /etc/systemd/system/mail-backup.service <<'U'
 [Unit]
 Description=Mail server backup
+Requires=mail-storage.service
+After=mail-storage.service
 [Service]
 Type=oneshot
 ExecStart=/opt/mail/backup.sh

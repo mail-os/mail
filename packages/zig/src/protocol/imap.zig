@@ -17,6 +17,8 @@ const typesense = @import("../search/typesense.zig");
 // std.posix.getpid is not available on this Zig version's std; libc is linked
 // (the binary links sqlite3 + libc), so declare the C symbol directly.
 extern "c" fn getpid() c_int;
+extern "c" fn readlink(path: [*:0]const u8, buf: [*]u8, bufsiz: usize) isize;
+extern "c" fn symlink(target: [*:0]const u8, linkpath: [*:0]const u8) c_int;
 
 /// Upper bound on an APPEND literal we are willing to buffer in memory, to
 /// prevent a client from exhausting server memory with a huge {N} literal.
@@ -792,6 +794,29 @@ fn renameFile(old_path: []const u8, new_path: []const u8) bool {
     const old_z: [*:0]const u8 = @ptrCast(&old_buf);
     const new_z: [*:0]const u8 = @ptrCast(&new_buf);
     return std.c.rename(old_z, new_z) == 0;
+}
+
+fn pathIsSymlink(path: []const u8) bool {
+    var path_buf: [4097]u8 = undefined;
+    var target_buf: [1]u8 = undefined;
+    if (path.len >= path_buf.len) return false;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+    return readlink(path_z, &target_buf, target_buf.len) >= 0;
+}
+
+fn createRelativeSymlink(target: []const u8, path: []const u8) bool {
+    var target_buf: [4097]u8 = undefined;
+    var path_buf: [4097]u8 = undefined;
+    if (target.len >= target_buf.len or path.len >= path_buf.len) return false;
+    @memcpy(target_buf[0..target.len], target);
+    target_buf[target.len] = 0;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const target_z: [*:0]const u8 = @ptrCast(&target_buf);
+    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+    return symlink(target_z, path_z) == 0;
 }
 
 /// IMAP session
@@ -3361,6 +3386,51 @@ pub const ImapSession = struct {
             _ = std.c.unlink(@ptrCast(&path_buf));
         }
 
+        if (pathIsSymlink(dir_path)) {
+            var visible_buf: [4097]u8 = undefined;
+            const visible = std.fmt.bufPrint(&visible_buf, "{s}", .{dir_path}) catch {
+                try self.sendResponse(tag, "NO", "DELETE failed");
+                return;
+            };
+            visible_buf[visible.len] = 0;
+            _ = std.c.unlink(@ptrCast(&visible_buf));
+
+            const canonical = try std.fmt.allocPrint(self.allocator, "mail/{s}/.{s}", .{ local_part, name });
+            defer self.allocator.free(canonical);
+            for ([_][]const u8{ "tmp", "new", "cur" }) |component| {
+                const child = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ canonical, component });
+                defer self.allocator.free(child);
+                const child_files = fs_compat.listEmlFiles(self.allocator, child) catch &.{};
+                defer {
+                    for (child_files) |file_name| self.allocator.free(file_name);
+                    if (child_files.len > 0) self.allocator.free(child_files);
+                }
+                for (child_files) |file_name| {
+                    var child_file_buf: [4097]u8 = undefined;
+                    const child_file = std.fmt.bufPrint(&child_file_buf, "{s}/{s}", .{ child, file_name }) catch continue;
+                    child_file_buf[child_file.len] = 0;
+                    _ = std.c.unlink(@ptrCast(&child_file_buf));
+                }
+                var child_buf: [4097]u8 = undefined;
+                const child_path = std.fmt.bufPrint(&child_buf, "{s}", .{child}) catch continue;
+                child_buf[child_path.len] = 0;
+                _ = std.c.rmdir(@ptrCast(&child_buf));
+            }
+            var canonical_buf: [4097]u8 = undefined;
+            const canonical_path = std.fmt.bufPrint(&canonical_buf, "{s}", .{canonical}) catch {
+                try self.sendResponse(tag, "NO", "DELETE failed");
+                return;
+            };
+            canonical_buf[canonical_path.len] = 0;
+            if (std.c.rmdir(@ptrCast(&canonical_buf)) != 0) {
+                try self.sendResponse(tag, "NO", "DELETE failed");
+                return;
+            }
+            std.log.info("IMAP DELETE: Removed Maildir++ mailbox {s}", .{name});
+            try self.sendResponse(tag, "OK", "DELETE completed");
+            return;
+        }
+
         var dir_buf: [4097]u8 = undefined;
         const dir_written = std.fmt.bufPrint(&dir_buf, "{s}", .{dir_path}) catch {
             try self.sendResponse(tag, "OK", "DELETE completed");
@@ -3403,6 +3473,39 @@ pub const ImapSession = struct {
         defer self.allocator.free(old_path);
         const new_path = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local_part, new });
         defer self.allocator.free(new_path);
+
+        if (pathIsSymlink(old_path)) {
+            const old_canonical = try std.fmt.allocPrint(self.allocator, "mail/{s}/.{s}", .{ local_part, old });
+            defer self.allocator.free(old_canonical);
+            const new_canonical = try std.fmt.allocPrint(self.allocator, "mail/{s}/.{s}", .{ local_part, new });
+            defer self.allocator.free(new_canonical);
+            const new_target = try std.fmt.allocPrint(self.allocator, ".{s}/cur", .{new});
+            defer self.allocator.free(new_target);
+            const old_target = try std.fmt.allocPrint(self.allocator, ".{s}/cur", .{old});
+            defer self.allocator.free(old_target);
+
+            if (!renameFile(old_canonical, new_canonical)) {
+                try self.sendResponse(tag, "NO", "RENAME failed");
+                return;
+            }
+            var old_buf: [4097]u8 = undefined;
+            const old_visible = std.fmt.bufPrint(&old_buf, "{s}", .{old_path}) catch {
+                _ = renameFile(new_canonical, old_canonical);
+                try self.sendResponse(tag, "NO", "RENAME failed");
+                return;
+            };
+            old_buf[old_visible.len] = 0;
+            _ = std.c.unlink(@ptrCast(&old_buf));
+            if (!createRelativeSymlink(new_target, new_path)) {
+                _ = renameFile(new_canonical, old_canonical);
+                _ = createRelativeSymlink(old_target, old_path);
+                try self.sendResponse(tag, "NO", "RENAME failed");
+                return;
+            }
+            std.log.info("IMAP RENAME: {s} -> {s}", .{ old, new });
+            try self.sendResponse(tag, "OK", "RENAME completed");
+            return;
+        }
 
         if (renameFile(old_path, new_path)) {
             std.log.info("IMAP RENAME: {s} -> {s}", .{ old, new });
@@ -3859,21 +3962,42 @@ pub const ImapSession = struct {
                 try self.sendResponse(tag, "OK", "ID completed");
             },
             .create => {
-                // CREATE mailbox - create the Maildir folder
+                // CREATE mailbox in canonical Maildir++ form. The visible
+                // folder symlink preserves compatibility with older server
+                // paths while external Maildir tools use .Folder/{tmp,new,cur}.
                 const create_name = stripQuotes(parts.next() orelse "");
                 if (!isSafeMailboxName(create_name)) {
                     // Rejects empty names and any path-traversal attempt.
                     try self.sendResponse(tag, "NO", "Invalid mailbox name");
                 } else {
+                    var created = false;
                     if (self.username) |uname| {
                         const local = uname;
-                        const dir = std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local, create_name }) catch null;
-                        if (dir) |d| {
-                            fs_compat.cwd().makePath(d) catch {};
-                            self.allocator.free(d);
+                        const visible = std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local, create_name }) catch null;
+                        const canonical = std.fmt.allocPrint(self.allocator, "mail/{s}/.{s}", .{ local, create_name }) catch null;
+                        const target = std.fmt.allocPrint(self.allocator, ".{s}/cur", .{create_name}) catch null;
+                        if (visible != null and canonical != null and target != null) {
+                            const tmp = std.fmt.allocPrint(self.allocator, "{s}/tmp", .{canonical.?}) catch null;
+                            const new = std.fmt.allocPrint(self.allocator, "{s}/new", .{canonical.?}) catch null;
+                            const cur = std.fmt.allocPrint(self.allocator, "{s}/cur", .{canonical.?}) catch null;
+                            if (tmp != null and new != null and cur != null) {
+                                fs_compat.cwd().makePath(tmp.?) catch {};
+                                fs_compat.cwd().makePath(new.?) catch {};
+                                fs_compat.cwd().makePath(cur.?) catch {};
+                                created = createRelativeSymlink(target.?, visible.?);
+                            }
+                            if (tmp) |value| self.allocator.free(value);
+                            if (new) |value| self.allocator.free(value);
+                            if (cur) |value| self.allocator.free(value);
                         }
+                        if (visible) |value| self.allocator.free(value);
+                        if (canonical) |value| self.allocator.free(value);
+                        if (target) |value| self.allocator.free(value);
                     }
-                    try self.sendResponse(tag, "OK", "CREATE completed");
+                    if (created)
+                        try self.sendResponse(tag, "OK", "CREATE completed")
+                    else
+                        try self.sendResponse(tag, "NO", "Mailbox already exists or could not be created");
                 }
             },
             .subscribe => {
