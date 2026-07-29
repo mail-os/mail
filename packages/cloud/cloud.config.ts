@@ -70,6 +70,7 @@ const mailConfig = {
     'python3',
     'python3-pip',
     'openssl',
+    'cryptsetup',
     'sqlite',
     'fail2ban',
     'bind-utils',
@@ -326,6 +327,14 @@ chown -R mail-server:mail-server ${cfg.paths.dataDir}
 chown -R mail-server:mail-server ${cfg.paths.logDir}
 chown -R mail-server:mail-server ${cfg.paths.mailDir}
 chown -R mail-server:mail-server ${cfg.paths.installDir}/mail
+
+# Encrypt every persistent mail path by default. The LUKS2 volume key is
+# machine-bound in systemd's encrypted credential store and is never exposed
+# to the mail-server service as a persistent plaintext file.
+chmod +x ${cfg.paths.installDir}/scripts/setup-encrypted-storage.sh
+MAIL_ROOT=${cfg.paths.installDir} \
+  MAIL_ENCRYPTED_IMAGE_SIZE="\${MAIL_ENCRYPTED_IMAGE_SIZE:-4G}" \
+  ${cfg.paths.installDir}/scripts/setup-encrypted-storage.sh
 
 # Get instance metadata
 echo "Getting instance metadata..."
