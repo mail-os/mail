@@ -397,7 +397,7 @@ pub const CalDavStore = struct {
         stmt.bindInt(9, if (ev.all_day) 1 else 0) catch return;
         bindOptText(&stmt, 10, ev.rrule) catch return;
         bindOptText(&stmt, 11, ev.organizer) catch return;
-        stmt.bindInt(12, @backingInt(ev.status)) catch return;
+        stmt.bindInt(12, @intFromEnum(ev.status)) catch return;
         stmt.bindInt(13, ev.created_at) catch return;
         stmt.bindInt(14, ev.modified_at) catch return;
         stmt.bindText(15, ev.etag) catch return;
@@ -454,7 +454,7 @@ pub const CalDavStore = struct {
             defer stmt.finalize();
             stmt.bindInt(1, @intCast(contact_id)) catch continue;
             stmt.bindText(2, e.email) catch continue;
-            stmt.bindInt(3, @backingInt(e.email_type)) catch continue;
+            stmt.bindInt(3, @intFromEnum(e.email_type)) catch continue;
             stmt.bindInt(4, if (e.is_primary) 1 else 0) catch continue;
             _ = stmt.step() catch continue;
         }
@@ -464,7 +464,7 @@ pub const CalDavStore = struct {
             defer stmt.finalize();
             stmt.bindInt(1, @intCast(contact_id)) catch continue;
             stmt.bindText(2, p.number) catch continue;
-            stmt.bindInt(3, @backingInt(p.phone_type)) catch continue;
+            stmt.bindInt(3, @intFromEnum(p.phone_type)) catch continue;
             stmt.bindInt(4, if (p.is_primary) 1 else 0) catch continue;
             _ = stmt.step() catch continue;
         }

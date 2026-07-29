@@ -178,7 +178,7 @@ pub const DnsblChecker = struct {
         defer if (result) |r| std.c.freeaddrinfo(r);
 
         // rc != 0 means the name did not resolve (NXDOMAIN etc.) => not listed.
-        if (@backingInt(rc) != 0) return false;
+        if (@intFromEnum(rc) != 0) return false;
 
         // Walk the result list and look for an A record in 127.0.0.0/8.
         var node = result;

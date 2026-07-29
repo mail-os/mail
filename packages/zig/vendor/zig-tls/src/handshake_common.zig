@@ -326,7 +326,7 @@ pub const CertificateParser = struct {
     pub_key_buf: [1038]u8 = undefined,
     pub_key: []const u8 = undefined,
 
-    signature_scheme: proto.SignatureScheme = @fromBackingInt(@intCast(0)),
+    signature_scheme: proto.SignatureScheme = @enumFromInt(0),
     signature_buf: [1024]u8 = undefined,
     signature: []const u8 = undefined,
 

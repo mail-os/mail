@@ -144,7 +144,7 @@ pub const ClusterNetwork = struct {
         try std.json.stringify(message, .{}, body.writer());
 
         // Write message type (1 byte)
-        const type_byte = [1]u8{@backingInt(msg_type)};
+        const type_byte = [1]u8{@intFromEnum(msg_type)};
         _ = try stream.write(&type_byte);
 
         // Write message length (4 bytes, big-endian)

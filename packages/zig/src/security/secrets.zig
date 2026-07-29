@@ -993,7 +993,7 @@ pub const AwsSigV4Signer = struct {
 
         return try std.fmt.allocPrint(self.allocator, "{d:0>4}{d:0>2}{d:0>2}", .{
             year_and_day.year,
-            @backingInt(month_day.month),
+            @intFromEnum(month_day.month),
             month_day.day_index + 1,
         });
     }
@@ -1013,7 +1013,7 @@ pub const AwsSigV4Signer = struct {
 
         return try std.fmt.allocPrint(self.allocator, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}Z", .{
             year_and_day.year,
-            @backingInt(month_day.month),
+            @intFromEnum(month_day.month),
             month_day.day_index + 1,
             hours,
             minutes,

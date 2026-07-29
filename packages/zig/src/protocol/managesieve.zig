@@ -904,7 +904,7 @@ test "command parsing - unknown returns null" {
 
 test "command toString round-trips" {
     inline for (@typeInfo(ManageSieveCommand).@"enum".field_values) |value| {
-        const c: ManageSieveCommand = @fromBackingInt(@intCast(value));
+        const c: ManageSieveCommand = @enumFromInt(value);
         try std.testing.expectEqual(c, ManageSieveCommand.fromString(c.toString()).?);
     }
 }

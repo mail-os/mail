@@ -293,7 +293,7 @@ pub const ErrorHandler = struct {
         }
 
         // Check severity
-        if (@backingInt(ctx.severity) < @backingInt(self.config.min_log_severity)) return;
+        if (@intFromEnum(ctx.severity) < @intFromEnum(self.config.min_log_severity)) return;
 
         // Log the error
         if (self.config.log_all_errors) {
@@ -494,8 +494,8 @@ pub const ErrorMetrics = struct {
 
     pub fn record(self: *Self, ctx: ErrorContext) void {
         _ = self.total_errors.fetchAdd(1, .monotonic);
-        _ = self.errors_by_category[@backingInt(ctx.category)].fetchAdd(1, .monotonic);
-        _ = self.errors_by_severity[@backingInt(ctx.severity)].fetchAdd(1, .monotonic);
+        _ = self.errors_by_category[@intFromEnum(ctx.category)].fetchAdd(1, .monotonic);
+        _ = self.errors_by_severity[@intFromEnum(ctx.severity)].fetchAdd(1, .monotonic);
         self.last_error_time.store(ctx.timestamp, .monotonic);
 
         if (ctx.is_retryable) {
@@ -508,11 +508,11 @@ pub const ErrorMetrics = struct {
     }
 
     pub fn getErrorsByCategory(self: *const Self, category: ErrorCategory) u64 {
-        return self.errors_by_category[@backingInt(category)].load(.monotonic);
+        return self.errors_by_category[@intFromEnum(category)].load(.monotonic);
     }
 
     pub fn getErrorsBySeverity(self: *const Self, severity: ErrorSeverity) u64 {
-        return self.errors_by_severity[@backingInt(severity)].load(.monotonic);
+        return self.errors_by_severity[@intFromEnum(severity)].load(.monotonic);
     }
 
     pub fn getCriticalErrors(self: *const Self) u64 {

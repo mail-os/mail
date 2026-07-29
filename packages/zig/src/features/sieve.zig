@@ -280,8 +280,8 @@ pub const SieveParser = struct {
             .pos = 0,
             .line = 1,
             .column = 1,
-            .errors = .{},
-            .requires = .{},
+            .errors = .empty,
+            .requires = .empty,
         };
     }
 

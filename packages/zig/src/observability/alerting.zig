@@ -502,7 +502,7 @@ pub const AlertManager = struct {
         };
 
         // Check severity threshold
-        return @backingInt(alert.severity) >= @backingInt(min_severity);
+        return @intFromEnum(alert.severity) >= @intFromEnum(min_severity);
     }
 
     fn sendToChannel(self: *AlertManager, channel: AlertChannel, alert: Alert) !void {
@@ -702,8 +702,8 @@ test "add slack channel" {
 test "severity comparison" {
     const testing = std.testing;
 
-    try testing.expect(@backingInt(Severity.critical) > @backingInt(Severity.warning));
-    try testing.expect(@backingInt(Severity.warning) > @backingInt(Severity.info));
+    try testing.expect(@intFromEnum(Severity.critical) > @intFromEnum(Severity.warning));
+    try testing.expect(@intFromEnum(Severity.warning) > @intFromEnum(Severity.info));
 }
 
 test "default rules creation" {

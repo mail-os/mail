@@ -93,7 +93,7 @@ pub const Logger = struct {
     }
 
     pub fn log(self: *Logger, level: LogLevel, comptime fmt: []const u8, args: anytype) void {
-        if (@backingInt(level) < @backingInt(self.min_level)) return;
+        if (@intFromEnum(level) < @intFromEnum(self.min_level)) return;
 
         const timestamp = time_compat.timestamp();
         var buf: [8192]u8 = undefined;
@@ -278,7 +278,7 @@ pub const Logger = struct {
     };
 
     pub fn logStructured(self: *Logger, slog: *StructuredLog) void {
-        if (@backingInt(slog.level) < @backingInt(self.min_level)) return;
+        if (@intFromEnum(slog.level) < @intFromEnum(self.min_level)) return;
 
         const timestamp = time_compat.timestamp();
         var log_buf: [8192]u8 = undefined;

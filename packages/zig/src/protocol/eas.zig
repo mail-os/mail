@@ -856,7 +856,7 @@ fn civilFromEpoch(epoch: i64) Civil {
     const ds = es.getDaySeconds();
     return .{
         .year = year_day.year,
-        .month = @backingInt(month_day.month),
+        .month = @intFromEnum(month_day.month),
         .day = @as(u8, month_day.day_index) + 1,
         .hour = ds.getHoursIntoDay(),
         .minute = ds.getMinutesIntoHour(),

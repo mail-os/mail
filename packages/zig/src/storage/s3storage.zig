@@ -148,7 +148,7 @@ pub const S3Storage = struct {
         return try std.fmt.allocPrint(
             self.allocator,
             "{s}/{d}/{d:0>2}/{s}.eml",
-            .{ email, year_and_day.year, @backingInt(month_day.month), message_id },
+            .{ email, year_and_day.year, @intFromEnum(month_day.month), message_id },
         );
     }
 

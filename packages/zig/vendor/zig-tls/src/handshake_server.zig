@@ -74,9 +74,9 @@ pub const Handshake = struct {
     client_random: [32]u8 = undefined,
     legacy_session_id_buf: [32]u8 = undefined,
     legacy_session_id: []u8 = &.{},
-    cipher_suite: CipherSuite = @fromBackingInt(@intCast(0)),
-    signature_scheme: proto.SignatureScheme = @fromBackingInt(@intCast(0)),
-    named_group: proto.NamedGroup = @fromBackingInt(@intCast(0)),
+    cipher_suite: CipherSuite = @enumFromInt(0),
+    signature_scheme: proto.SignatureScheme = @enumFromInt(0),
+    named_group: proto.NamedGroup = @enumFromInt(0),
     client_pub_key_buf: [max_pub_key_len]u8 = undefined,
     client_pub_key: []u8 = &.{},
     server_pub_key_buf: [max_pub_key_len]u8 = undefined,
@@ -169,7 +169,7 @@ pub const Handshake = struct {
         var w: record.Writer = .initFromIo(h.output);
 
         // Debug: log the selected named_group (use info level to show in production)
-        log.info("TLS 1.2 serverFlightTls12: named_group={x}, cipher_suite={x}", .{ @backingInt(h.named_group), @backingInt(h.cipher_suite) });
+        log.info("TLS 1.2 serverFlightTls12: named_group={x}, cipher_suite={x}", .{ @intFromEnum(h.named_group), @intFromEnum(h.cipher_suite) });
 
         // Generate server's DH public key
         log.info("TLS 1.2: generating DH public key", .{});
@@ -278,7 +278,7 @@ pub const Handshake = struct {
         _ = try hw.skip(4);
 
         // ECParameters - named_curve type + curve ID
-        try hw.int(u8, @backingInt(proto.Curve.named_curve));
+        try hw.int(u8, @intFromEnum(proto.Curve.named_curve));
         try hw.enumValue(h.named_group);
 
         // ECPoint - public key
@@ -299,7 +299,7 @@ pub const Handshake = struct {
 
         // Sign the data using the appropriate signing method based on key type
         const signature_scheme = auth.key.signature_scheme;
-        log.info("TLS 1.2 ServerKeyExchange: signature_scheme={x}, ecdsa_key_pair_present={}", .{ @backingInt(signature_scheme), auth.ecdsa_key_pair != null });
+        log.info("TLS 1.2 ServerKeyExchange: signature_scheme={x}, ecdsa_key_pair_present={}", .{ @intFromEnum(signature_scheme), auth.ecdsa_key_pair != null });
         try hw.enumValue(signature_scheme);
 
         const signature = switch (signature_scheme) {
@@ -354,9 +354,9 @@ pub const Handshake = struct {
                 log.err("TLS 1.2 clientFlight2Tls12: Record.decoder failed: {}", .{err});
                 return err;
             };
-            log.info("TLS 1.2 clientFlight2Tls12: got record, content_type={x}", .{@backingInt(d.content_type)});
+            log.info("TLS 1.2 clientFlight2Tls12: got record, content_type={x}", .{@intFromEnum(d.content_type)});
             d.expectContentType(.handshake) catch |err| {
-                log.err("TLS 1.2 clientFlight2Tls12: expected handshake but got content_type={x}, payload_len={d}", .{ @backingInt(d.content_type), d.payload.len });
+                log.err("TLS 1.2 clientFlight2Tls12: expected handshake but got content_type={x}, payload_len={d}", .{ @intFromEnum(d.content_type), d.payload.len });
                 if (d.content_type == .alert and d.payload.len >= 2) {
                     log.err("TLS 1.2 clientFlight2Tls12: client sent alert: level={d}, desc={d}", .{ d.payload[0], d.payload[1] });
                 }
@@ -365,7 +365,7 @@ pub const Handshake = struct {
             h.transcript.update(d.payload);
 
             const handshake_type = try d.decode(proto.Handshake);
-            log.info("TLS 1.2 clientFlight2Tls12: handshake_type={x} (decimal={d}), expected client_key_exchange={x}", .{ @backingInt(handshake_type), @backingInt(handshake_type), @backingInt(proto.Handshake.client_key_exchange) });
+            log.info("TLS 1.2 clientFlight2Tls12: handshake_type={x} (decimal={d}), expected client_key_exchange={x}", .{ @intFromEnum(handshake_type), @intFromEnum(handshake_type), @intFromEnum(proto.Handshake.client_key_exchange) });
             if (handshake_type != .client_key_exchange) {
                 log.err("TLS 1.2 clientFlight2Tls12: handshake type mismatch! got={s}, expected=client_key_exchange", .{@tagName(handshake_type)});
                 return error.TlsUnexpectedMessage;
@@ -390,7 +390,7 @@ pub const Handshake = struct {
 
         // Generate pre-master secret and derive keys
         if (h.cipher_suite.keyExchange() == .ecdhe) {
-            log.info("TLS 1.2 clientFlight2Tls12: generating shared key, named_group={x}", .{@backingInt(h.named_group)});
+            log.info("TLS 1.2 clientFlight2Tls12: generating shared key, named_group={x}", .{@intFromEnum(h.named_group)});
             const pre_master_secret = try h.dh_kp.sharedKey(h.named_group, h.client_pub_key);
             log.info("TLS 1.2 clientFlight2Tls12: got pre_master_secret, len={d}", .{pre_master_secret.len});
             h.transcript.masterSecret(&h.master_secret, pre_master_secret, h.client_random, h.server_random);
@@ -407,7 +407,7 @@ pub const Handshake = struct {
         log.info("TLS 1.2 clientFlight2Tls12: reading ChangeCipherSpec", .{});
         {
             var d = try Record.decoder(h.input);
-            log.info("TLS 1.2 clientFlight2Tls12: got record, content_type={x}", .{@backingInt(d.content_type)});
+            log.info("TLS 1.2 clientFlight2Tls12: got record, content_type={x}", .{@intFromEnum(d.content_type)});
             try d.expectContentType(.change_cipher_spec);
             log.info("TLS 1.2 clientFlight2Tls12: ChangeCipherSpec payload_len={d}, payload[0]={d}", .{ d.payload.len, if (d.payload.len > 0) d.payload[0] else 255 });
             if (d.payload.len != 1 or d.payload[0] != 1) return error.TlsUnexpectedMessage;
@@ -420,17 +420,17 @@ pub const Handshake = struct {
         log.info("TLS 1.2 clientFlight2Tls12: reading encrypted Finished", .{});
         {
             const rec = try Record.read(h.input);
-            log.info("TLS 1.2 clientFlight2Tls12: got record, content_type={x}", .{@backingInt(rec.content_type)});
+            log.info("TLS 1.2 clientFlight2Tls12: got record, content_type={x}", .{@intFromEnum(rec.content_type)});
             // TLS 1.2 encrypted Finished uses handshake (0x16) content type, NOT application_data
             if (rec.content_type != .handshake) {
-                log.err("TLS 1.2 clientFlight2Tls12: expected handshake, got {x}", .{@backingInt(rec.content_type)});
+                log.err("TLS 1.2 clientFlight2Tls12: expected handshake, got {x}", .{@intFromEnum(rec.content_type)});
                 return error.TlsUnexpectedMessage;
             }
 
             var cleartext_buf: [128]u8 = undefined;
             // For TLS 1.2, decrypt returns the record's content_type (which is handshake)
             const content_type, const cleartext = try h.cipher.decrypt(&cleartext_buf, rec);
-            log.info("TLS 1.2 clientFlight2Tls12: decrypted, content_type={x}, cleartext_len={d}", .{ @backingInt(content_type), cleartext.len });
+            log.info("TLS 1.2 clientFlight2Tls12: decrypted, content_type={x}, cleartext_len={d}", .{ @intFromEnum(content_type), cleartext.len });
             if (content_type != .handshake) return error.TlsUnexpectedMessage;
 
             // Parse Finished message
@@ -707,8 +707,8 @@ pub const Handshake = struct {
         }
         // Track cipher suite candidates for both TLS versions separately
         // This is needed because we don't know which TLS version will be used yet
-        var tls13_cipher: CipherSuite = @fromBackingInt(@intCast(0));
-        var tls12_cipher: CipherSuite = @fromBackingInt(@intCast(0));
+        var tls13_cipher: CipherSuite = @enumFromInt(0);
+        var tls12_cipher: CipherSuite = @enumFromInt(0);
         { // cipher suites
             const end_idx = try d.decode(u16) + d.idx;
 
@@ -717,21 +717,21 @@ pub const Handshake = struct {
                 if (cipher_suites.includes(supported_cipher_suites, cipher_suite)) {
                     // Track TLS 1.3 and TLS 1.2 ciphers separately
                     if (cipher_suites.includes(cipher_suites.tls13, cipher_suite)) {
-                        if (@backingInt(tls13_cipher) == 0) {
+                        if (@intFromEnum(tls13_cipher) == 0) {
                             tls13_cipher = cipher_suite;
                         }
                     } else if (cipher_suites.includes(cipher_suites.tls12, cipher_suite)) {
-                        if (@backingInt(tls12_cipher) == 0) {
+                        if (@intFromEnum(tls12_cipher) == 0) {
                             tls12_cipher = cipher_suite;
                         }
                     }
                 }
             }
             // Must have at least one supported cipher
-            if (@backingInt(tls13_cipher) == 0 and @backingInt(tls12_cipher) == 0)
+            if (@intFromEnum(tls13_cipher) == 0 and @intFromEnum(tls12_cipher) == 0)
                 return error.TlsNoSupportedCiphers;
         }
-        log.info("readClientHello: tls13_cipher={x}, tls12_cipher={x}", .{ @backingInt(tls13_cipher), @backingInt(tls12_cipher) });
+        log.info("readClientHello: tls13_cipher={x}, tls12_cipher={x}", .{ @intFromEnum(tls13_cipher), @intFromEnum(tls12_cipher) });
         try d.skip(2); // compression methods
 
         var key_share_received = false;
@@ -762,7 +762,7 @@ pub const Handshake = struct {
                     const end_idx = try d.decode(u16) + d.idx;
                     while (d.idx < end_idx) {
                         const named_group = try d.decode(proto.NamedGroup);
-                        switch (@backingInt(named_group)) {
+                        switch (@intFromEnum(named_group)) {
                             0x0001...0x0016,
                             0x001a...0x001c,
                             0xff01...0xff02,
@@ -778,14 +778,14 @@ pub const Handshake = struct {
                             }
                         }
                     }
-                    if (@backingInt(h.named_group) == 0)
+                    if (@intFromEnum(h.named_group) == 0)
                         return error.TlsIllegalParameter;
                 },
                 .supported_groups => {
                     const end_idx = try d.decode(u16) + d.idx;
                     while (d.idx < end_idx) {
                         const named_group = try d.decode(proto.NamedGroup);
-                        switch (@backingInt(named_group)) {
+                        switch (@intFromEnum(named_group)) {
                             // Deprecated/insecure curves - skip silently for TLS 1.2 compatibility
                             // Some clients (including Apple SecureTransport) may include these
                             0x0001...0x0016,
@@ -803,7 +803,7 @@ pub const Handshake = struct {
                     }
                 },
                 .signature_algorithms => {
-                    if (@backingInt(h.signature_scheme) == 0) {
+                    if (@intFromEnum(h.signature_scheme) == 0) {
                         try d.skip(extension_len);
                     } else {
                         var found = false;
@@ -825,12 +825,12 @@ pub const Handshake = struct {
 
         // Determine TLS version based on client capabilities
         log.info("readClientHello: tls_1_3_supported={}, key_share_received={}, supported_groups_len={}", .{ tls_1_3_supported, key_share_received, supported_groups_len });
-        if (tls_1_3_supported and key_share_received and @backingInt(tls13_cipher) != 0) {
+        if (tls_1_3_supported and key_share_received and @intFromEnum(tls13_cipher) != 0) {
             // TLS 1.3 handshake - requires TLS 1.3 cipher
             h.tls_version = .tls_1_3;
             h.cipher_suite = tls13_cipher;
-            if (@backingInt(h.named_group) == 0) return error.TlsIllegalParameter;
-        } else if (@backingInt(tls12_cipher) != 0) {
+            if (@intFromEnum(h.named_group) == 0) return error.TlsIllegalParameter;
+        } else if (@intFromEnum(tls12_cipher) != 0) {
             // TLS 1.2 handshake - need to select named group from supported_groups
             h.tls_version = .tls_1_2;
             h.cipher_suite = tls12_cipher;
@@ -855,16 +855,16 @@ pub const Handshake = struct {
                             break;
                         }
                     }
-                    if (@backingInt(h.named_group) != 0) break;
+                    if (@intFromEnum(h.named_group) != 0) break;
                 }
-                if (@backingInt(h.named_group) == 0) return error.TlsIllegalParameter;
+                if (@intFromEnum(h.named_group) == 0) return error.TlsIllegalParameter;
             }
-            log.info("TLS 1.2 readClientHello: selected named_group={x}", .{@backingInt(h.named_group)});
+            log.info("TLS 1.2 readClientHello: selected named_group={x}", .{@intFromEnum(h.named_group)});
         } else {
             // No compatible cipher suite found
             return error.TlsNoSupportedCiphers;
         }
-        log.info("readClientHello complete: tls_version={}, cipher_suite={x}, named_group={x}", .{ h.tls_version, @backingInt(h.cipher_suite), @backingInt(h.named_group) });
+        log.info("readClientHello complete: tls_version={}, cipher_suite={x}, named_group={x}", .{ h.tls_version, @intFromEnum(h.cipher_suite), @intFromEnum(h.named_group) });
     }
 };
 
@@ -945,7 +945,7 @@ pub const NonBlock = struct {
         client_flight_2,
 
         fn next(self: *State) void {
-            self.* = @fromBackingInt(@intCast(@backingInt(self.*) + 1));
+            self.* = @enumFromInt(@intFromEnum(self.*) + 1);
         }
     };
 

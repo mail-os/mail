@@ -500,7 +500,7 @@ pub const EncryptedTimeSeriesStorage = struct {
 
         return Date{
             .year = @intCast(year_and_day.year),
-            .month = @backingInt(month_day.month),
+            .month = @intFromEnum(month_day.month),
             .day = month_day.day_index + 1,
         };
     }

@@ -378,7 +378,7 @@ pub const WebSocketSession = struct {
         defer frame_header.deinit(self.allocator);
 
         // First byte: FIN + RSV + OpCode
-        const byte1: u8 = 0x80 | @backingInt(opcode); // FIN=1, RSV=0, OpCode
+        const byte1: u8 = 0x80 | @intFromEnum(opcode); // FIN=1, RSV=0, OpCode
         try frame_header.append(self.allocator, byte1);
 
         // Second byte: MASK + Payload length
@@ -768,11 +768,11 @@ test "WebSocket accept key generation" {
 test "OpCode enum values" {
     const testing = std.testing;
 
-    try testing.expectEqual(@as(u8, 0x1), @backingInt(OpCode.text));
-    try testing.expectEqual(@as(u8, 0x2), @backingInt(OpCode.binary));
-    try testing.expectEqual(@as(u8, 0x8), @backingInt(OpCode.close));
-    try testing.expectEqual(@as(u8, 0x9), @backingInt(OpCode.ping));
-    try testing.expectEqual(@as(u8, 0xA), @backingInt(OpCode.pong));
+    try testing.expectEqual(@as(u8, 0x1), @intFromEnum(OpCode.text));
+    try testing.expectEqual(@as(u8, 0x2), @intFromEnum(OpCode.binary));
+    try testing.expectEqual(@as(u8, 0x8), @intFromEnum(OpCode.close));
+    try testing.expectEqual(@as(u8, 0x9), @intFromEnum(OpCode.ping));
+    try testing.expectEqual(@as(u8, 0xA), @intFromEnum(OpCode.pong));
 }
 
 test "Notification manager" {

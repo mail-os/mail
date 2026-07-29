@@ -263,9 +263,9 @@ pub const TLSARecord = struct {
     /// Format the TLSA record as a DNS presentation string.
     pub fn format(self: *const TLSARecord, allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "{d} {d} {d} {s}", .{
-            @backingInt(self.usage),
-            @backingInt(self.selector),
-            @backingInt(self.matching_type),
+            @intFromEnum(self.usage),
+            @intFromEnum(self.selector),
+            @intFromEnum(self.matching_type),
             self.certificate_data,
         });
     }
@@ -1512,7 +1512,7 @@ test "All TLSA usage values are covered" {
         const parsed = TLSAUsage.fromInt(val);
         try testing.expect(parsed != null);
         try testing.expectEqual(exp, parsed.?);
-        try testing.expectEqual(val, @backingInt(parsed.?));
+        try testing.expectEqual(val, @intFromEnum(parsed.?));
     }
 }
 

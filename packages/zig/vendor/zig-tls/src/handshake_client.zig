@@ -77,11 +77,11 @@ pub const Options = struct {
     session_resumption: ?*SessionResumption = null,
 
     pub const Diagnostic = struct {
-        tls_version: proto.Version = @fromBackingInt(@intCast(0)),
-        cipher_suite_tag: CipherSuite = @fromBackingInt(@intCast(0)),
-        named_group: proto.NamedGroup = @fromBackingInt(@intCast(0)),
-        signature_scheme: proto.SignatureScheme = @fromBackingInt(@intCast(0)),
-        client_signature_scheme: proto.SignatureScheme = @fromBackingInt(@intCast(0)),
+        tls_version: proto.Version = @enumFromInt(0),
+        cipher_suite_tag: CipherSuite = @enumFromInt(0),
+        named_group: proto.NamedGroup = @enumFromInt(0),
+        signature_scheme: proto.SignatureScheme = @enumFromInt(0),
+        client_signature_scheme: proto.SignatureScheme = @enumFromInt(0),
         is_session_resumption: bool = false,
         max_server_record_len: usize = 0,
         max_server_cleartext_len: usize = 0,
@@ -109,7 +109,7 @@ pub const Options = struct {
 
             pub fn init(payload: []const u8, secret: []const u8) !Ticket {
                 var d = record.Decoder.init(.handshake, payload);
-                const handshake_type: proto.Handshake = @fromBackingInt(@intCast(try d.decode(u8)));
+                const handshake_type: proto.Handshake = @enumFromInt(try d.decode(u8));
                 if (handshake_type != proto.Handshake.new_session_ticket) return error.InvalidType;
                 const length = try d.decode(u24);
                 if (d.rest().len != length) return error.InvalidLength;
@@ -219,7 +219,7 @@ pub const Handshake = struct {
     key_material: [48 * 4]u8 = undefined, // for sha256 32 * 4 is filled, for sha384 48 * 4
 
     transcript: Transcript = .{},
-    cipher_suite: CipherSuite = @fromBackingInt(@intCast(0)),
+    cipher_suite: CipherSuite = @enumFromInt(0),
     named_group: ?proto.NamedGroup = null,
     dh_kp: DhKeyPair = undefined,
     rsa_secret: RsaSecret = undefined,
@@ -728,8 +728,8 @@ pub const Handshake = struct {
             var w = Io.Writer.fixed(&buffer);
             try w.writeAll(&h.client_random);
             try w.writeAll(&h.server_random);
-            try w.writeByte(@backingInt(proto.Curve.named_curve));
-            try w.writeInt(u16, @backingInt(h.named_group.?), .big);
+            try w.writeByte(@intFromEnum(proto.Curve.named_curve));
+            try w.writeInt(u16, @intFromEnum(h.named_group.?), .big);
             try w.writeByte(@intCast(h.server_pub_key.len));
             try w.writeAll(h.server_pub_key);
             break :brk w.buffered();
@@ -890,7 +890,7 @@ pub const Handshake = struct {
         if (opt.diagnostic) |d| {
             d.tls_version = h.tls_version;
             d.cipher_suite_tag = h.cipher_suite;
-            d.named_group = h.named_group orelse @as(proto.NamedGroup, @fromBackingInt(@intCast(0x0000)));
+            d.named_group = h.named_group orelse @as(proto.NamedGroup, @enumFromInt(0x0000));
             d.signature_scheme = h.cert.signature_scheme;
             d.is_session_resumption = is_session_resumption;
             d.max_server_record_len = h.max_server_record_len;
@@ -1203,7 +1203,7 @@ pub const NonBlock = struct {
         server_flight_2,
 
         fn next(self: *State) void {
-            self.* = @fromBackingInt(@intCast(@backingInt(self.*) + 1));
+            self.* = @enumFromInt(@intFromEnum(self.*) + 1);
         }
     };
 
