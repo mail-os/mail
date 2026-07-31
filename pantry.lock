@@ -2,6 +2,9 @@
   "version": "1.0.0",
   "lockfileVersion": 2,
   "workspaces": {
+    "": {
+      "name": "mail-workspace"
+    },
     "packages/cloud": {
       "name": "mail-cloud",
       "version": "0.1.0",
@@ -95,9 +98,9 @@
       "version": "main",
       "source": "github"
     },
-    "ziglang.org@0.16.0": {
+    "ziglang.org@0.17.0-dev.1509_bb296ab9b": {
       "name": "ziglang.org",
-      "version": "0.16.0",
+      "version": "0.17.0-dev.1509_bb296ab9b",
       "source": "pantry"
     }
   }
