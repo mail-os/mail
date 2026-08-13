@@ -11,13 +11,17 @@ case "$RELEASE_TYPE" in
 esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ZIG="$REPO_ROOT/pantry/ziglang.org/v0.16.0/bin/zig"
+ZIG="${ZIG:-$REPO_ROOT/pantry/ziglang.org/v0/bin/zig}"
 BUMP_ROOT="$REPO_ROOT/pantry/zig-bump"
 BUMP="$BUMP_ROOT/zig-out/bin/bump"
 
 if [[ ! -x "$ZIG" ]]; then
-  echo "missing pinned Zig compiler: $ZIG" >&2
-  exit 1
+  if command -v zig >/dev/null 2>&1; then
+    ZIG="$(command -v zig)"
+  else
+    echo "missing Zig compiler: $ZIG" >&2
+    exit 1
+  fi
 fi
 
 if [[ ! -x "$BUMP" ]]; then
