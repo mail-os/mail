@@ -24,7 +24,7 @@ jobs:
         submodules: recursive
 
     - name: Setup project dependencies with Pantry
-      uses: home-lang/pantry/packages/action@v0.11.24
+      uses: home-lang/pantry/packages/action@v0.11.25
 
     - name: Build
       run: zig build -Doptimize=ReleaseSafe
@@ -45,7 +45,7 @@ jobs:
       uses: actions/checkout@v6
 
     - name: Setup project dependencies with Pantry
-      uses: home-lang/pantry/packages/action@v0.11.24
+      uses: home-lang/pantry/packages/action@v0.11.25
 
     # The Docker context is packages/zig only and webmail_dist is gitignored,
     # so render the webmail bundle on the runner first; the image build then
@@ -78,7 +78,7 @@ jobs:
       uses: actions/checkout@v6
 
     - name: Setup project dependencies with Pantry
-      uses: home-lang/pantry/packages/action@v0.11.24
+      uses: home-lang/pantry/packages/action@v0.11.25
 
     - name: Check formatting
       run: zig fmt --check src/
@@ -100,7 +100,7 @@ jobs:
         submodules: recursive
 
     - name: Setup project dependencies with Pantry
-      uses: home-lang/pantry/packages/action@v0.11.24
+      uses: home-lang/pantry/packages/action@v0.11.25
 
     - name: Install coverage dependencies
       working-directory: ${{ github.workspace }}
@@ -154,7 +154,7 @@ jobs:
         submodules: recursive
 
     - name: Setup project dependencies with Pantry
-      uses: home-lang/pantry/packages/action@v0.11.24
+      uses: home-lang/pantry/packages/action@v0.11.25
 
     - name: Build release
       run: zig build -Doptimize=ReleaseFast

@@ -19,7 +19,7 @@ jobs:
         submodules: recursive
 
     - name: Setup project dependencies with Pantry
-      uses: home-lang/pantry/packages/action@v0.11.24
+      uses: home-lang/pantry/packages/action@v0.11.25
 
     - name: Build webmail frontend
       # The zig binaries @embedFile packages/zig/src/api/webmail_dist/* (generated,
@@ -41,7 +41,7 @@ jobs:
       # The Pantry action auto-discovers packages/zig/zig-out/cross/<triple>/,
       # packages each platform, extracts the changelog, and creates the GitHub
       # release — the whole release flow lives in the action.
-      uses: home-lang/pantry/packages/action@v0.11.24
+      uses: home-lang/pantry/packages/action@v0.11.25
       with:
         install: 'false'
         release: 'true'

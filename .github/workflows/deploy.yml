@@ -22,7 +22,7 @@ jobs:
         submodules: recursive
 
     - name: Setup project dependencies with Pantry
-      uses: home-lang/pantry/packages/action@v0.11.24
+      uses: home-lang/pantry/packages/action@v0.11.25
 
     - name: Build for Linux x86_64
       working-directory: packages/zig
