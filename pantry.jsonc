@@ -3,7 +3,9 @@
   "version": "0.0.1",
   "description": "Modern SMTP/IMAP mail server written in Zig",
   "dependencies": {
-    "ziglang.org": "^0.17.0-dev",
+    "ziglang.org": "0.17.0-dev.1509_bb296ab9b",
+    "bun.sh": "^1.3.0",
+    "sqlite.org": "^3.47.2",
     "zig-bump": "github:zig-utils/zig-bump",
     "zig-tls": "github:zig-utils/zig-tls",
     "zig-search-engine": "github:zig-utils/zig-search-engine",

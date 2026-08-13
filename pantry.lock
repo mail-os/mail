@@ -61,6 +61,16 @@
         "stx-serve": "./dist/serve.js"
       }
     },
+    "bun.sh@1.3.14": {
+      "name": "bun.sh",
+      "version": "1.3.14",
+      "source": "pantry"
+    },
+    "sqlite.org@3.53.4": {
+      "name": "sqlite.org",
+      "version": "3.53.4",
+      "source": "pantry"
+    },
     "ts-cloud@link:ts-cloud": {
       "name": "ts-cloud",
       "version": "link:ts-cloud",
