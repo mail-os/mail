@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.10] - 2026-08-29
+
+- chore(deps): update TLS cross-target support
+- fix(build): resolve TLS per release target
+
 ## [0.1.9] - 2026-08-29
 
 - fix(tls): support pinned Zig optimize modes
