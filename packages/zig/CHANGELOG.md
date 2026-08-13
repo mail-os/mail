@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.9] - 2026-08-29
+
+- fix(tls): support pinned Zig optimize modes
+
 ## [0.1.8] - 2026-08-29
 
 - fix(ci): provision dependencies with Pantry
