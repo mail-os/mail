@@ -83,9 +83,9 @@ jobs:
         done
         # Prove the implicit-TLS endpoints complete a real handshake and serve
         # the certificate for mail.stacksjs.com, not merely accept a socket.
-        timeout 15 openssl s_client -connect "$HOST:993" -servername mail.stacksjs.com </dev/null 2>/dev/null \
-          | openssl x509 -noout -checkend 86400 -subject \
-          | grep -F 'CN = mail.stacksjs.com'
-        timeout 15 openssl s_client -connect "$HOST:465" -servername mail.stacksjs.com </dev/null 2>/dev/null \
-          | openssl x509 -noout -checkend 86400 -subject \
-          | grep -F 'CN = mail.stacksjs.com'
+        timeout 15 openssl s_client -connect "$HOST:993" -servername mail.stacksjs.com \
+          -verify_hostname mail.stacksjs.com -verify_return_error </dev/null 2>/dev/null \
+          | openssl x509 -noout -checkend 86400
+        timeout 15 openssl s_client -connect "$HOST:465" -servername mail.stacksjs.com \
+          -verify_hostname mail.stacksjs.com -verify_return_error </dev/null 2>/dev/null \
+          | openssl x509 -noout -checkend 86400
