@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.1.7] - 2026-08-29
+
+- fix(release): use active Zig toolchain
+- fix: take the zig-tls P-256 field-gate fix, restoring TLS
+- chore: take zig-tls 8aba73d (P-256 DER length fix)
+- fix: take the zig-tls certificate-buffer fix, and build on 0.17-dev
+- chore(tls): pin complete Zig 0.17 compatibility fix
+- fix(zig): use canonical TLS on latest Zig 0.17-dev
+- Revert "fix(zig): restore pinned Zig 0.16 build compatibility"
+- ci(zig): track latest Zig 0.17-dev toolchain
+- feat(mail): adopt Sieve forwarding and Maildir++ layout
+- feat(storage): harden encrypted mail data and recovery
+- fix(zig): restore pinned Zig 0.16 build compatibility
+
 ## [0.1.6] - 2026-08-13
 
 - chore(build): pin latest Zig 0.17 dev
