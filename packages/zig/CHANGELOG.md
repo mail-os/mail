@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.1.11] - 2026-08-29
+
+- ci: use Pantry v0.11.25
+
 ## [0.1.10] - 2026-08-29
 
 - chore(deps): update TLS cross-target support
