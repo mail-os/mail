@@ -61,6 +61,7 @@ pub fn build(b: *std.Build) void {
     mail_module.addImport("zig-cli", zig_cli_module);
     mail_module.addImport("sqlite", sqlite_module);
     mail_module.addImport("ascii-compat", ascii_compat_module);
+    linkVendoredSqlite(mail_module);
 
     const mail_exe = b.addExecutable(.{
         .name = "mail",
@@ -149,7 +150,7 @@ pub fn build(b: *std.Build) void {
         test_module.addImport("search-engine", search_engine_module);
         test_module.addImport("sqlite", sqlite_module);
         test_module.addImport("ascii-compat", ascii_compat_module);
-        test_module.linkSystemLibrary("sqlite3", .{});
+        linkVendoredSqlite(test_module);
 
         const unit_tests = b.addTest(.{
             .root_module = test_module,
@@ -255,6 +256,7 @@ fn buildForTarget(
     root_module.addImport("zig-cli", zig_cli_module);
     root_module.addImport("sqlite", sqliteModule(b, target, optimize));
     root_module.addImport("ascii-compat", ascii_compat_module);
+    linkVendoredSqlite(root_module);
 
     const exe = b.addExecutable(.{
         .name = b.fmt("mail-{s}", .{triple}),
@@ -294,32 +296,28 @@ fn sqliteModule(
 fn linkPlatformLibraries(exe: *std.Build.Step.Compile, target: std.Build.ResolvedTarget) void {
     const target_query = target.query;
     const os_tag = target_query.os_tag orelse .linux;
-    const is_cross_compiling = target_query.os_tag != null or target_query.cpu_arch != null;
-
     exe.root_module.link_libc = true;
 
-    if (is_cross_compiling) {
-        exe.root_module.addCSourceFile(.{
-            .file = .{ .cwd_relative = "vendor/sqlite3.c" },
-            .flags = &.{
-                "-DSQLITE_THREADSAFE=1",
-                "-DSQLITE_ENABLE_FTS5",
-                "-DSQLITE_ENABLE_JSON1",
-                "-DSQLITE_ENABLE_RTREE",
-                "-DSQLITE_DQS=0",
-            },
-        });
-        exe.root_module.addIncludePath(.{ .cwd_relative = "vendor" });
-    } else {
-        switch (os_tag) {
-            .windows => {
-                exe.root_module.linkSystemLibrary("sqlite3", .{});
-                exe.root_module.linkSystemLibrary("ws2_32", .{});
-                exe.root_module.linkSystemLibrary("advapi32", .{});
-            },
-            else => {
-                exe.root_module.linkSystemLibrary("sqlite3", .{});
-            },
-        }
+    if (os_tag == .windows) {
+        exe.root_module.linkSystemLibrary("ws2_32", .{});
+        exe.root_module.linkSystemLibrary("advapi32", .{});
     }
+}
+
+/// Compile the pinned SQLite amalgamation for every target. This makes native
+/// and cross builds identical and removes an otherwise hidden system-package
+/// dependency from developer machines and CI runners.
+fn linkVendoredSqlite(module: *std.Build.Module) void {
+    module.link_libc = true;
+    module.addCSourceFile(.{
+        .file = .{ .cwd_relative = "vendor/sqlite3.c" },
+        .flags = &.{
+            "-DSQLITE_THREADSAFE=1",
+            "-DSQLITE_ENABLE_FTS5",
+            "-DSQLITE_ENABLE_JSON1",
+            "-DSQLITE_ENABLE_RTREE",
+            "-DSQLITE_DQS=0",
+        },
+    });
+    module.addIncludePath(.{ .cwd_relative = "vendor" });
 }
