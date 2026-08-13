@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.8] - 2026-08-29
+
+- fix(ci): provision dependencies with Pantry
+- chore(deps): pin complete Pantry toolchain
+- build(sqlite): use vendored amalgamation everywhere
+- fix(tls): handle nonblocking decrypt alerts safely
+- fix(deploy): validate certificate hostnames
+- fix(ci): remove redundant Pantry setup
+
 ## [0.1.7] - 2026-08-29
 
 - fix(release): use active Zig toolchain
