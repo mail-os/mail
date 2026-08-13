@@ -46,7 +46,7 @@ pub fn build(b: *std.Build) void {
         };
 
         for (targets) |t| {
-            buildForTarget(b, t, optimize, tls_module, zig_cli_module, search_engine_module, ascii_compat_module);
+            buildForTarget(b, t, optimize, zig_cli_module, search_engine_module, ascii_compat_module);
         }
     }
 
@@ -235,7 +235,6 @@ fn buildForTarget(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    tls_module: *std.Build.Module,
     zig_cli_module: *std.Build.Module,
     search_engine_module: *std.Build.Module,
     ascii_compat_module: *std.Build.Module,
@@ -246,12 +245,20 @@ fn buildForTarget(
         @tagName(target_query.os_tag orelse .linux),
     });
 
+    // zig-tls selects architecture- and OS-specific assembly from its target
+    // dependency option. Reusing the host dependency module here links x86
+    // assembly into ARM artifacts (and Linux assembly into macOS artifacts).
+    const target_tls = b.dependency("tls", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/mail_cli.zig"),
         .target = target,
         .optimize = optimize,
     });
-    root_module.addImport("tls", tls_module);
+    root_module.addImport("tls", target_tls.module("tls"));
     root_module.addImport("search-engine", search_engine_module);
     root_module.addImport("zig-cli", zig_cli_module);
     root_module.addImport("sqlite", sqliteModule(b, target, optimize));
