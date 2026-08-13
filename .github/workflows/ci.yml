@@ -23,23 +23,8 @@ jobs:
       with:
         submodules: recursive
 
-    - name: Setup Zig
-      uses: mlugg/setup-zig@v2
-      with:
-        version: 0.17.0-dev.1476+91a29d707
-
-    - name: Setup Bun
-      uses: oven-sh/setup-bun@v2
-
-    - name: Install SQLite (Ubuntu)
-      if: matrix.os == 'ubuntu-latest'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libsqlite3-dev
-
-    - name: Install SQLite (macOS)
-      if: matrix.os == 'macos-latest'
-      run: brew install sqlite
+    - name: Setup project dependencies with Pantry
+      uses: home-lang/pantry/packages/action@v0.11.24
 
     - name: Build
       run: zig build -Doptimize=ReleaseSafe
@@ -59,8 +44,8 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v6
 
-    - name: Setup Bun
-      uses: oven-sh/setup-bun@v2
+    - name: Setup project dependencies with Pantry
+      uses: home-lang/pantry/packages/action@v0.11.24
 
     # The Docker context is packages/zig only and webmail_dist is gitignored,
     # so render the webmail bundle on the runner first; the image build then
@@ -92,13 +77,8 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v6
 
-    - name: Setup Zig
-      uses: mlugg/setup-zig@v2
-      with:
-        version: 0.17.0-dev.1476+91a29d707
-
-    - name: Setup Bun
-      uses: oven-sh/setup-bun@v2
+    - name: Setup project dependencies with Pantry
+      uses: home-lang/pantry/packages/action@v0.11.24
 
     - name: Check formatting
       run: zig fmt --check src/
@@ -119,19 +99,14 @@ jobs:
       with:
         submodules: recursive
 
-    - name: Setup Zig
-      uses: mlugg/setup-zig@v2
-      with:
-        version: 0.17.0-dev.1476+91a29d707
+    - name: Setup project dependencies with Pantry
+      uses: home-lang/pantry/packages/action@v0.11.24
 
-    - name: Setup Bun
-      uses: oven-sh/setup-bun@v2
-
-    - name: Install dependencies
+    - name: Install coverage dependencies
       working-directory: ${{ github.workspace }}
       run: |
         sudo apt-get update
-        sudo apt-get install -y libsqlite3-dev binutils-dev libdw-dev
+        sudo apt-get install -y binutils-dev libdw-dev
 
     - name: Install kcov from source
       working-directory: ${{ github.workspace }}
@@ -178,19 +153,8 @@ jobs:
       with:
         submodules: recursive
 
-    - name: Setup Zig
-      uses: mlugg/setup-zig@v2
-      with:
-        version: 0.17.0-dev.1476+91a29d707
-
-    - name: Setup Bun
-      uses: oven-sh/setup-bun@v2
-
-    - name: Install dependencies
-      working-directory: ${{ github.workspace }}
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libsqlite3-dev
+    - name: Setup project dependencies with Pantry
+      uses: home-lang/pantry/packages/action@v0.11.24
 
     - name: Build release
       run: zig build -Doptimize=ReleaseFast

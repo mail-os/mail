@@ -31,10 +31,8 @@ jobs:
         fetch-depth: 0
         token: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Setup Zig
-      uses: mlugg/setup-zig@v2
-      with:
-        version: 0.17.0-dev.1476+91a29d707
+    - name: Setup project dependencies with Pantry
+      uses: home-lang/pantry/packages/action@v0.11.24
 
     - name: Configure Git
       run: |
