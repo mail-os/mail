@@ -21,6 +21,8 @@ jobs:
 
     - name: Setup project dependencies with Pantry
       uses: pantry-pm/pantry/packages/action@v0.11.27
+      with:
+        install: 'false'
 
     # One hoisted install at the root covers every workspace: webmail's build
     # plugin and the dtsx generator that packages/ts runs from prepublishOnly.
