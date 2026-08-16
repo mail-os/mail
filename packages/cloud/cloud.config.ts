@@ -57,7 +57,7 @@ const mailConfig = {
   },
 
   discord: {
-    webhookUrl: process.env.DISCORD_WEBHOOK_URL || 'https://discord.com/api/webhooks/1479364487294488596/4x1uwO_FvR-4PZ_bZ1ozkF3imltiNoZtEjM2CBFk30xXQkdF3pSJNsVYXtJ_kwEBQhqB',
+    webhookUrl: process.env.DISCORD_WEBHOOK_URL || '',
   },
 
   installUtils: [
@@ -76,6 +76,35 @@ const mailConfig = {
     'bind-utils',
     'certbot',
   ],
+}
+
+const deploymentEnvironment = process.env.CLOUD_ENV === 'dev' || process.env.CLOUD_ENV === 'staging'
+  ? process.env.CLOUD_ENV
+  : 'production'
+const deploymentProfile = {
+  dev: { instanceType: 't3.small', volumeSize: 30, monitoring: false, backups: false, logRetention: 7 },
+  staging: { instanceType: 't3.medium', volumeSize: 50, monitoring: true, backups: true, logRetention: 14 },
+  production: { instanceType: 't3.large', volumeSize: 100, monitoring: true, backups: true, logRetention: 30 },
+}[deploymentEnvironment]
+const mailSecurityGroups = {
+  smtp: {
+    ingress: [
+      { port: mailConfig.ports.ssh, protocol: 'tcp', cidr: '0.0.0.0/0' },
+      { port: mailConfig.ports.smtp, protocol: 'tcp', cidr: '0.0.0.0/0' },
+      { port: mailConfig.ports.smtps, protocol: 'tcp', cidr: '0.0.0.0/0' },
+      { port: mailConfig.ports.submission, protocol: 'tcp', cidr: '0.0.0.0/0' },
+      { port: mailConfig.ports.imap, protocol: 'tcp', cidr: '0.0.0.0/0' },
+      { port: mailConfig.ports.imaps, protocol: 'tcp', cidr: '0.0.0.0/0' },
+      { port: mailConfig.ports.pop3, protocol: 'tcp', cidr: '0.0.0.0/0' },
+      { port: mailConfig.ports.pop3s, protocol: 'tcp', cidr: '0.0.0.0/0' },
+      { port: mailConfig.ports.http, protocol: 'tcp', cidr: '0.0.0.0/0' },
+      { port: mailConfig.ports.https, protocol: 'tcp', cidr: '0.0.0.0/0' },
+      { port: mailConfig.ports.websocket, protocol: 'tcp', cidr: '0.0.0.0/0' },
+      { port: mailConfig.ports.websocketSecure, protocol: 'tcp', cidr: '0.0.0.0/0' },
+      { port: mailConfig.ports.dashboard, protocol: 'tcp', cidr: '0.0.0.0/0' },
+    ],
+    egress: [{ port: 0, protocol: '-1', cidr: '0.0.0.0/0' }],
+  },
 }
 
 const config: CloudConfig = {
@@ -130,79 +159,30 @@ const config: CloudConfig = {
         website: false,
         encryption: true,
         versioning: true,
-        lifecycle: {
-          transitionToIA: 30,
-          transitionToGlacier: 90,
-        },
+        lifecycleRules: [{
+          id: 'archive-email',
+          enabled: true,
+          transitions: [
+            { days: 30, storageClass: 'STANDARD_IA' },
+            { days: 90, storageClass: 'GLACIER' },
+          ],
+        }],
       },
     },
 
     compute: {
       mode: 'server',
-
       server: {
-        dev: {
-          instanceType: 't3.small',
-          volumeSize: 30,
-          monitoring: false,
-          backups: false,
-        },
-        staging: {
-          instanceType: 't3.medium',
-          volumeSize: 50,
-          monitoring: true,
-          backups: true,
-        },
-        production: {
-          instanceType: 't3.large',
-          volumeSize: 100,
-          monitoring: true,
-          backups: true,
-        },
+        instanceType: deploymentProfile.instanceType,
+        userData: generateUserDataScript(mailConfig),
       },
-
-      securityGroups: {
-        smtp: {
-          description: 'Security group for mail server',
-          ingress: [
-            // SSH access (configure sshAllowedCidrs per environment)
-            { port: mailConfig.ports.ssh, protocol: 'tcp', cidr: '0.0.0.0/0', description: 'SSH' },
-            // SMTP ports
-            { port: mailConfig.ports.smtp, protocol: 'tcp', cidr: '0.0.0.0/0', description: 'SMTP' },
-            { port: mailConfig.ports.smtps, protocol: 'tcp', cidr: '0.0.0.0/0', description: 'SMTPS (implicit TLS)' },
-            { port: mailConfig.ports.submission, protocol: 'tcp', cidr: '0.0.0.0/0', description: 'SMTP Submission (STARTTLS)' },
-            // IMAP ports
-            { port: mailConfig.ports.imap, protocol: 'tcp', cidr: '0.0.0.0/0', description: 'IMAP' },
-            { port: mailConfig.ports.imaps, protocol: 'tcp', cidr: '0.0.0.0/0', description: 'IMAPS' },
-            // POP3 ports
-            { port: mailConfig.ports.pop3, protocol: 'tcp', cidr: '0.0.0.0/0', description: 'POP3' },
-            { port: mailConfig.ports.pop3s, protocol: 'tcp', cidr: '0.0.0.0/0', description: 'POP3S' },
-            // HTTP/HTTPS for ActiveSync, CalDAV, API
-            { port: mailConfig.ports.http, protocol: 'tcp', cidr: '0.0.0.0/0', description: 'HTTP' },
-            { port: mailConfig.ports.https, protocol: 'tcp', cidr: '0.0.0.0/0', description: 'HTTPS' },
-            // WebSocket
-            { port: mailConfig.ports.websocket, protocol: 'tcp', cidr: '0.0.0.0/0', description: 'WebSocket' },
-            { port: mailConfig.ports.websocketSecure, protocol: 'tcp', cidr: '0.0.0.0/0', description: 'WebSocket SSL' },
-            // Dashboard
-            { port: mailConfig.ports.dashboard, protocol: 'tcp', cidr: '0.0.0.0/0', description: 'Dashboard' },
-          ],
-          egress: [
-            { port: 0, protocol: '-1', cidr: '0.0.0.0/0', description: 'Allow all outbound' },
-          ],
-        },
+      disk: {
+        size: deploymentProfile.volumeSize,
+        encrypted: true,
       },
+      monitoring: deploymentProfile.monitoring,
+      backups: { enabled: deploymentProfile.backups },
 
-      userData: generateUserDataScript(mailConfig),
-    },
-
-    secrets: {
-      credentials: {
-        description: 'Mail server database credentials and secrets',
-        generatePassword: {
-          length: 32,
-          excludePunctuation: true,
-        },
-      },
     },
 
     email: {
@@ -217,27 +197,17 @@ const config: CloudConfig = {
     dns: {
       domain: process.env.DOMAIN_NAME || 'mail.example.com',
       hostedZoneId: process.env.HOSTED_ZONE_ID,
-      records: {
-        mx: {
-          priority: 10,
-        },
-        // SPF and DMARC TXT records are also created via the user data script
-        // since SPF needs the instance's public IP (not known at deploy time)
-      },
     },
 
     security: {
       kms: true,
-      imdsv2: true,
-      ebsEncryption: true,
+      securityGroups: mailSecurityGroups,
     },
 
     monitoring: {
       dashboards: true,
-      logRetention: {
-        dev: 7,
-        staging: 14,
-        production: 30,
+      logs: {
+        retention: deploymentProfile.logRetention,
       },
       alarms: [
         {
