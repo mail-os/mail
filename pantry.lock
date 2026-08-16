@@ -3,63 +3,71 @@
   "lockfileVersion": 2,
   "workspaces": {
     "": {
-      "name": "mail-workspace"
+      "name": "mail-workspace",
+      "devDependencies": {
+        "better-dx": "^0.2.23"
+      }
     },
     "packages/cloud": {
       "name": "mail-cloud",
-      "version": "0.1.0",
+      "version": "0.3.0",
       "dependencies": {
-        "ts-cloud": "link:ts-cloud"
+        "@stacksjs/ts-cloud": "^0.8.1"
       },
       "devDependencies": {
-        "@types/bun": "^1.3.0",
-        "typescript": "^5.9.3"
+        "better-dx": "^0.2.23"
       }
     },
     "packages/devtools": {
       "name": "mail-devtools",
-      "version": "0.1.0",
+      "version": "0.3.0",
       "dependencies": {
         "bun-plugin-stx": "^0.2.6"
       }
     },
     "packages/ts": {
-      "name": "ts-mail",
-      "version": "0.1.0"
+      "name": "@stacksjs/mail",
+      "version": "0.3.0",
+      "devDependencies": {
+        "@stacksjs/dtsx": "^0.11.5"
+      }
     },
     "packages/webmail": {
       "name": "mail-webmail",
-      "version": "0.0.1",
+      "version": "0.3.0",
       "dependencies": {
         "bun-plugin-stx": "^0.2.6"
       }
     }
   },
   "packages": {
-    "@types/bun@1.3.14": {
-      "name": "@types/bun",
-      "version": "1.3.14",
+    "@stacksjs/dtsx@0.11.5": {
+      "name": "@stacksjs/dtsx",
+      "version": "0.11.5",
       "source": "npm",
-      "resolved": "https://registry.npmjs.org/@types/bun/-/bun-1.3.14.tgz",
-      "integrity": "sha512-h1hFqFVcvAvD9j9K7ZW7vd82aSA+rTdznZa+5bwvCwqSB1jmmfLcbIWhOLx1/+boy/xmjgCs/OMUL8hRJSmnPw==",
-      "dependencies": {
-        "bun-types": "1.3.14"
-      }
+      "resolved": "https://registry.npmjs.org/@stacksjs/dtsx/-/dtsx-0.11.5.tgz",
+      "integrity": "sha512-BW8+/zkpK7uA6vMnKUMs2uvHJeiau/HTz8bDJb5ecdAltdn6w0hb+U6lCwdc3zypp1Q1m/10Cay9rrMn/D4e1A=="
+    },
+    "@stacksjs/ts-cloud@0.8.3": {
+      "name": "@stacksjs/ts-cloud",
+      "version": "0.8.3",
+      "source": "npm",
+      "resolved": "https://registry.npmjs.org/@stacksjs/ts-cloud/-/ts-cloud-0.8.3.tgz",
+      "integrity": "sha512-8R3534Ov6CUxJbSAZ377ThwUhdjZdhGqF8lZI5Za0v19JQOL9qlv0N8Qk+FyajqebP2xtGOqgbvbCEpZy1XE1g=="
+    },
+    "better-dx@0.2.23": {
+      "name": "better-dx",
+      "version": "0.2.23",
+      "source": "npm",
+      "resolved": "https://registry.npmjs.org/better-dx/-/better-dx-0.2.23.tgz",
+      "integrity": "sha512-MMxi0sR7WIhxWWgd4B0djoPg9rRR3f66qfLeeinbjknmLK0VmOkF4WFFNnAyQug9pvxrGpFL9i9YFMrDwP+h5Q=="
     },
     "bun-plugin-stx@0.2.99": {
       "name": "bun-plugin-stx",
       "version": "0.2.99",
       "source": "npm",
       "resolved": "https://registry.npmjs.org/bun-plugin-stx/-/bun-plugin-stx-0.2.99.tgz",
-      "integrity": "sha512-aMbMujmUqabHjA/NFJMJrKP2EieK4Dkr8dtLSDiinTjdIBnsLNCuy8yBWHPF/x6bD4tnvctF5FORlyOBoIXX8Q==",
-      "dependencies": {
-        "@stacksjs/stx": "^0.2.72",
-        "stx-router": "^0.2.72"
-      },
-      "bin": {
-        "serve": "./dist/serve.js",
-        "stx-serve": "./dist/serve.js"
-      }
+      "integrity": "sha512-aMbMujmUqabHjA/NFJMJrKP2EieK4Dkr8dtLSDiinTjdIBnsLNCuy8yBWHPF/x6bD4tnvctF5FORlyOBoIXX8Q=="
     },
     "bun.sh@1.3.14": {
       "name": "bun.sh",
@@ -70,28 +78,6 @@
       "name": "sqlite.org",
       "version": "3.53.4",
       "source": "pantry"
-    },
-    "ts-cloud@link:ts-cloud": {
-      "name": "ts-cloud",
-      "version": "link:ts-cloud",
-      "source": "npm",
-      "resolved": "https://registry.npmjs.org/ts-cloud/-/ts-cloud-link:ts-cloud.tgz"
-    },
-    "typescript@5.9.3": {
-      "name": "typescript",
-      "version": "5.9.3",
-      "source": "npm",
-      "resolved": "https://registry.npmjs.org/typescript/-/typescript-5.9.3.tgz",
-      "integrity": "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==",
-      "bin": {
-        "tsc": "./bin/tsc",
-        "tsserver": "./bin/tsserver"
-      }
-    },
-    "zig-bump@main": {
-      "name": "zig-bump",
-      "version": "main",
-      "source": "github"
     },
     "zig-cli@main": {
       "name": "zig-cli",
