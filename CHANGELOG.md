@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.2.2...v0.3.0)
+
+## 🐛 Bug Fixes
+
+- **release**: avoid duplicate workspace install ([8f75267](https://github.com/mail-os/mail/commit/8f75267)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.0 ([a47d010](https://github.com/mail-os/mail/commit/a47d010)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.2.1...v0.2.2)
 
 ## 🐛 Bug Fixes
