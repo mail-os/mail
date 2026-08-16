@@ -1,5 +1,28 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.2.0...v0.2.1)
+
+## 🐛 Bug Fixes
+
+- **ts-mail**: publish compiled runtime entrypoints ([47e332c](https://github.com/mail-os/mail/commit/47e332c)) _(by Chris <chris@stacksjs.com>)_
+- **devtools**: remove invalid build entrypoints ([3ded1ae](https://github.com/mail-os/mail/commit/3ded1ae)) _(by Chris <chris@stacksjs.com>)_
+- **cloud**: validate deploy configuration ([a8c6e2b](https://github.com/mail-os/mail/commit/a8c6e2b)) _(by Chris <chris@stacksjs.com>)_
+
+## 💚 Continuous Integration
+
+- **release**: fail fast when NPM_TOKEN is missing ([289868f](https://github.com/mail-os/mail/commit/289868f)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.2.1 ([10c854c](https://github.com/mail-os/mail/commit/10c854c)) _(by Chris <chris@stacksjs.com>)_
+- **lint**: clean documentation whitespace ([da209ae](https://github.com/mail-os/mail/commit/da209ae)) _(by Chris <chris@stacksjs.com>)_
+- **deps**: update owned development toolchain ([c31b6c1](https://github.com/mail-os/mail/commit/c31b6c1)) _(by Chris <chris@stacksjs.com>)_
+- **release**: drive releases with bumpx and logsmith ([2de6bb3](https://github.com/mail-os/mail/commit/2de6bb3)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 ## [0.1.0] - 2026-05-08
 
 ### Features
