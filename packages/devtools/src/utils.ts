@@ -287,6 +287,7 @@ export async function dispatchWebhook(url: string, payload: any): Promise<boolea
 
 // Message relay
 export async function relayMessage(raw: string, smtpHost: string, smtpPort: number): Promise<{ ok: boolean; error?: string }> {
+  void raw
   try {
     const socket = await Bun.connect({
       hostname: smtpHost,

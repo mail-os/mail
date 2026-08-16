@@ -122,20 +122,20 @@ async function onMessage(msg: ParsedEmail) {
 }
 
 // Start SMTP server
-const smtpServer = createSmtpServer({
+createSmtpServer({
   port: SMTP_PORT,
   onMessage,
   getChaos: () => chaosConfig,
 })
 
 // Start POP3 server
-const pop3Server = createPop3Server({
+createPop3Server({
   port: POP3_PORT,
   store,
 })
 
 // Read the app UI template
-const appHtml = await Bun.file(new URL('./pages/app.stx', import.meta.url).pathname).text()
+const appHtml = Bun.file(new URL('./pages/app.stx', import.meta.url).pathname)
 
 // JSON helper
 function json(data: any, status = 200) {

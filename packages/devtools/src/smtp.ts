@@ -140,7 +140,6 @@ export function createSmtpServer(opts: {
             session.collecting = true
             // Capture everything after the DATA line from the raw input (preserving blank lines)
             // Reconstruct the byte offset by joining the lines we've already processed
-            const processedLen = lines.slice(0, i + 1).join('\n').length
             // Find the actual position in the original input accounting for \r\n vs \n
             let pos = 0
             let lineCount = 0
@@ -360,6 +359,7 @@ function decodeBody(body: string, encoding?: string): string {
 function decodeHeader(value: string): string {
   // Decode RFC 2047 encoded words: =?charset?encoding?text?=
   return value.replace(/=\?([^?]+)\?([BbQq])\?([^?]*)\?=/g, (_, charset, encoding, text) => {
+    void charset
     if (encoding.toUpperCase() === 'B') {
       try { return Buffer.from(text, 'base64').toString('utf-8') } catch { return text }
     }

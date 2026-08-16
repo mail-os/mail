@@ -32,12 +32,20 @@ const copies: Array<[string, string]> = [
   [join(root, 'public/styles.css'), join(dist, 'styles.css')],
 ]
 
-await mkdir(dist, { recursive: true })
-for (const [src, out] of copies) {
-  const body = await readFile(src, 'utf8')
-  await writeFile(out, body)
+async function buildWebmail() {
+  await mkdir(dist, { recursive: true })
+  for (const [src, out] of copies) {
+    const body = await readFile(src, 'utf8')
+    await writeFile(out, body)
+    // eslint-disable-next-line no-console
+    console.log(`built ${out}  (${body.length} bytes)`)
+  }
   // eslint-disable-next-line no-console
-  console.log(`built ${out}  (${body.length} bytes)`)
+  console.log('webmail build complete → dist/')
 }
-// eslint-disable-next-line no-console
-console.log('webmail build complete → dist/')
+
+buildWebmail().catch((error) => {
+  // eslint-disable-next-line no-console
+  console.error(error)
+  process.exitCode = 1
+})
