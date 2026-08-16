@@ -1,9 +1,9 @@
 import { existsSync, mkdirSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { execSync } from 'node:child_process'
 
-// The Zig project root is two levels up from packages/ts-mail/
-const zigProjectRoot = resolve(import.meta.dir, '..', '..')
+// packages/ts and packages/zig are sibling packages in the mail workspace.
+const zigProjectRoot = resolve(import.meta.dir, '..', 'zig')
 const binDir = join(import.meta.dir, 'bin')
 
 interface BuildOptions {

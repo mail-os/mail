@@ -59,3 +59,11 @@ jobs:
           ```sh
           pantry install github.com/mail-os/mail
           ```
+
+    - name: Publish the typed management client
+      env:
+        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      run: |
+        npm config set //registry.npmjs.org/:_authToken "$NODE_AUTH_TOKEN"
+        cd packages/ts
+        npm publish --access public

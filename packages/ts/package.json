@@ -2,9 +2,14 @@
   "name": "ts-mail",
   "type": "module",
   "version": "0.1.0",
-  "description": "A high-performance SMTP server powered by Zig",
+  "description": "Typed runtime and management client for the mail server",
   "author": "Chris Breuer",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mail-os/mail.git",
+    "directory": "packages/ts"
+  },
   "exports": {
     ".": {
       "bun": "./src/index.ts",
@@ -25,11 +30,15 @@
     "bin"
   ],
   "scripts": {
-    "build": "bun build.ts",
+    "build": "bun run build:sdk && bun build.ts",
+    "build:sdk": "bun build src/index.ts --outdir dist --target bun && bun x @stacksjs/dtsx generate --root src --entrypoints index.ts --outdir dist --exclude '**/*.test.ts' --validate",
     "build:linux-x64": "bun build.ts --target x86_64-linux-gnu",
     "build:linux-arm64": "bun build.ts --target aarch64-linux-gnu",
     "build:all": "bun build.ts --all",
-    "prepublishOnly": "bun run build:all"
+    "prepublishOnly": "bun run build:sdk && bun run build:all"
+  },
+  "devDependencies": {
+    "@stacksjs/dtsx": "^0.11.5"
   },
   "keywords": [
     "smtp",

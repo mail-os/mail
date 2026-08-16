@@ -1,11 +1,11 @@
 import { existsSync } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { execSync } from 'node:child_process'
 
 /**
- * Root of the Zig mail project (two levels up from packages/ts-mail/src/)
+ * Root of the sibling Zig mail package.
  */
-export const ZIG_PROJECT_ROOT = resolve(dirname(import.meta.dir), '..', '..')
+export const ZIG_PROJECT_ROOT = resolve(import.meta.dir, '..', '..', 'zig')
 
 /**
  * Directory containing pre-built binaries within this package
@@ -176,4 +176,188 @@ export function configToEnv(config: MailServerConfig): Record<string, string> {
   if (config.profile) env.SMTP_PROFILE = config.profile
 
   return env
+}
+
+export interface MailAdminClientOptions {
+  baseUrl: string
+  username?: string
+  password?: string
+  token?: string
+  fetch?: typeof fetch
+}
+
+export interface MailboxUser {
+  id?: number | string
+  username: string
+  email: string
+  quota_mb?: number
+  used_mb?: number
+  enabled?: boolean
+  created_at?: string
+  last_login?: string
+}
+
+export interface CreateMailboxInput {
+  username: string
+  email: string
+  password: string
+  quota_mb?: number
+}
+
+export interface MailServerStats {
+  messages_received?: number
+  messages_sent?: number
+  messages_queued?: number
+  connections_active?: number
+  [key: string]: unknown
+}
+
+export interface MailServerHealth {
+  status: 'healthy' | 'degraded' | 'unhealthy'
+  version?: string
+  uptime?: number
+  components?: Record<string, { status: string, message?: string }>
+}
+
+export class MailAdminError extends Error {
+  constructor(public status: number, message: string, public body?: unknown) {
+    super(message)
+    this.name = 'MailAdminError'
+  }
+}
+
+export class MailAdminClient {
+  private baseUrl: string
+  private username?: string
+  private password?: string
+  private token?: string
+  private requestFetch: typeof fetch
+  private csrfToken?: string
+
+  constructor(options: MailAdminClientOptions) {
+    this.baseUrl = options.baseUrl.replace(/\/+$/, '')
+    this.username = options.username
+    this.password = options.password
+    this.token = options.token
+    this.requestFetch = options.fetch ?? fetch
+  }
+
+  private headers(mutating = false): Headers {
+    const headers = new Headers({ Accept: 'application/json' })
+    if (this.token) headers.set('Authorization', `Bearer ${this.token}`)
+    else if (this.username && this.password) headers.set('Authorization', `Basic ${btoa(`${this.username}:${this.password}`)}`)
+    if (mutating) headers.set('Content-Type', 'application/json')
+    if (mutating && this.csrfToken) headers.set('X-CSRF-Token', this.csrfToken)
+    return headers
+  }
+
+  private async csrf(): Promise<string> {
+    if (this.csrfToken) return this.csrfToken
+    const response = await this.requestFetch(`${this.baseUrl}/api/csrf-token`, { headers: this.headers() })
+    const body = await this.readBody(response)
+    if (!response.ok) throw new MailAdminError(response.status, 'Unable to acquire mail admin CSRF token', body)
+    const record = body as Record<string, unknown>
+    const token = String(record.csrf_token ?? record.token ?? '')
+    if (!token) throw new MailAdminError(response.status, 'Mail admin returned an empty CSRF token', body)
+    this.csrfToken = token
+    return token
+  }
+
+  private async readBody(response: Response): Promise<unknown> {
+    const text = await response.text()
+    if (!text) return null
+    try { return JSON.parse(text) }
+    catch { return text }
+  }
+
+  private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
+    const method = String(init.method ?? 'GET').toUpperCase()
+    const mutating = !['GET', 'HEAD'].includes(method)
+    if (mutating) await this.csrf()
+    const response = await this.requestFetch(`${this.baseUrl}${path}`, {
+      ...init,
+      headers: this.headers(mutating),
+    })
+    const body = await this.readBody(response)
+    if (!response.ok) {
+      const message = typeof body === 'object' && body !== null && 'message' in body
+        ? String((body as Record<string, unknown>).message)
+        : `Mail admin request failed with HTTP ${response.status}`
+      throw new MailAdminError(response.status, message, body)
+    }
+    return body as T
+  }
+
+  async listMailboxes(options: { offset?: number, limit?: number } = {}): Promise<{ users: MailboxUser[], total: number }> {
+    const query = new URLSearchParams()
+    if (options.offset !== undefined) query.set('offset', String(options.offset))
+    if (options.limit !== undefined) query.set('limit', String(options.limit))
+    const result = await this.request<{ users: MailboxUser[], total?: number, count?: number }>(`/api/users${query.size ? `?${query}` : ''}`)
+    return { users: result.users, total: result.total ?? result.count ?? result.users.length }
+  }
+
+  async getMailbox(username: string): Promise<MailboxUser> {
+    return this.request(`/api/users/${encodeURIComponent(username)}`)
+  }
+
+  async createMailbox(input: CreateMailboxInput): Promise<MailboxUser> {
+    return this.request('/api/users', { method: 'POST', body: JSON.stringify(input) })
+  }
+
+  async updateMailbox(username: string, patch: Partial<Omit<CreateMailboxInput, 'username'>> & { enabled?: boolean }): Promise<MailboxUser> {
+    return this.request(`/api/users/${encodeURIComponent(username)}`, { method: 'PUT', body: JSON.stringify(patch) })
+  }
+
+  async deleteMailbox(username: string): Promise<{ success: boolean, message?: string }> {
+    return this.request(`/api/users/${encodeURIComponent(username)}`, { method: 'DELETE' })
+  }
+
+  async ensureMailbox(input: CreateMailboxInput): Promise<{ mailbox: MailboxUser, created: boolean }> {
+    try {
+      return { mailbox: await this.getMailbox(input.username), created: false }
+    }
+    catch (error) {
+      if (!(error instanceof MailAdminError) || error.status !== 404) throw error
+      return { mailbox: await this.createMailbox(input), created: true }
+    }
+  }
+
+  async stats(): Promise<MailServerStats> {
+    return this.request('/api/stats')
+  }
+
+  async health(): Promise<MailServerHealth> {
+    return this.request('/health')
+  }
+
+  async queue(options: { offset?: number, limit?: number, status?: string } = {}): Promise<unknown> {
+    const query = new URLSearchParams(Object.entries(options).filter(([, value]) => value !== undefined).map(([key, value]) => [key, String(value)]))
+    return this.request(`/api/queue${query.size ? `?${query}` : ''}`)
+  }
+
+  async getConfig(): Promise<Record<string, unknown>> {
+    const result = await this.request<Record<string, unknown>>('/api/config')
+    return typeof result.config === 'object' && result.config !== null
+      ? result.config as Record<string, unknown>
+      : result
+  }
+
+  async updateConfig(patch: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.request('/api/config', { method: 'PUT', body: JSON.stringify(patch) })
+  }
+
+  async ensureDomain(domain: string): Promise<{ domain: string, configured: boolean }> {
+    const normalized = domain.trim().toLowerCase()
+    if (!/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(normalized))
+      throw new TypeError(`Invalid mail domain: ${domain}`)
+    const config = await this.getConfig()
+    const current = Array.isArray(config.extra_local_domains) ? config.extra_local_domains.map(String) : []
+    if (current.includes(normalized)) return { domain: normalized, configured: false }
+    await this.updateConfig({ extra_local_domains: [...current, normalized] })
+    return { domain: normalized, configured: true }
+  }
+}
+
+export function createMailAdminClient(options: MailAdminClientOptions): MailAdminClient {
+  return new MailAdminClient(options)
 }
