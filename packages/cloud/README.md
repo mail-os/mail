@@ -98,7 +98,7 @@ This ts-cloud application deploys a complete Mail Server infrastructure on AWS, 
    ```bash
    # Option 1: AWS CLI
    aws configure
-   
+
    # Option 2: Environment variables
    export AWS_ACCESS_KEY_ID=your-key
    export AWS_SECRET_ACCESS_KEY=your-secret

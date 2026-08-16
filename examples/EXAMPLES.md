@@ -415,8 +415,8 @@ grep "out of memory" mail.log
 
 ```bash
 # Increase system limits (add to /etc/security/limits.conf)
-*  soft  nofile  65536
-*  hard  nofile  65536
+* soft  nofile  65536
+* hard  nofile  65536
 
 # Increase max connections
 ./zig-out/bin/mail --max-connections 1000

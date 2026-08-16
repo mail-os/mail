@@ -141,4 +141,3 @@
 - perf(smtp): buffered socket reads + reuse startup-parsed TLS cert
 
 All notable changes to this project will be documented in this file.
-

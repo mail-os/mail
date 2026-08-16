@@ -258,8 +258,8 @@ ulimit -n
 ulimit -n 65536
 
 # Permanent increase (add to /etc/security/limits.conf)
-*  soft  nofile  65536
-*  hard  nofile  65536
+* soft  nofile  65536
+* hard  nofile  65536
 
 # Kernel tuning (/etc/sysctl.conf)
 net.core.somaxconn = 65536

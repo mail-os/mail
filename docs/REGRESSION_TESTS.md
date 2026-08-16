@@ -95,16 +95,16 @@ test "path traversal prevention" {
 ```zig
 test "constant time password comparison" {
     const hash = try auth.hashPassword("secret123");
-    
+
     // Both should take approximately the same time
     const start1 = std.time.nanoTimestamp();
     _ = auth.constantTimeCompare(hash, "wrong");
     const end1 = std.time.nanoTimestamp();
-    
+
     const start2 = std.time.nanoTimestamp();
     _ = auth.constantTimeCompare(hash, "secret123");
     const end2 = std.time.nanoTimestamp();
-    
+
     // Allow 20% variance for timing noise
     const time1 = end1 - start1;
     const time2 = end2 - start2;
