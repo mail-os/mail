@@ -26,7 +26,7 @@ pantry run release:patch   # or release:minor, release:major
 4. bumpx commits the lot, tags it `vX.Y.Z`, and pushes both.
 5. The tag push starts `.github/workflows/release.yml`, which cross-compiles
    every target, attaches the binaries to a GitHub release whose body logsmith
-   regenerates for that tag range, and publishes `ts-mail` to npm.
+   regenerates for that tag range, and publishes `@stacksjs/mail` to npm.
 
 The version bump is therefore repo-wide: one tag, one version, every package.
 

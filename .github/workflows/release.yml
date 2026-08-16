@@ -78,7 +78,7 @@ jobs:
         # v0.2.0 burned 20 minutes of cross-compiling before dying here with
         # ENEEDAUTH. Check the secret first so the failure names its own cause.
         if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-          echo "::error::NPM_TOKEN is not set — the GitHub release was published, but ts-mail was not."
+          echo "::error::NPM_TOKEN is not set: the GitHub release was published, but @stacksjs/mail was not."
           exit 1
         fi
         npm config set //registry.npmjs.org/:_authToken "$NODE_AUTH_TOKEN"

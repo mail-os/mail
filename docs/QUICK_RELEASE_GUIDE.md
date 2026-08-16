@@ -48,5 +48,5 @@ that before it happens.
 ## After the tag lands
 
 Watch the **Release** workflow. It cross-compiles linux and macOS (x86_64 +
-arm64), attaches the binaries to a GitHub release, and publishes `ts-mail` to
+arm64), attaches the binaries to a GitHub release, and publishes `@stacksjs/mail` to
 npm.
