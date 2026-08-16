@@ -331,15 +331,29 @@ QUIT
 ## Development
 
 ```bash
+# Install the dev tooling (bumpx, logsmith, pickier, gitlint via better-dx)
+bun install
+
 # Format code
 pantry run fmt
 
+# Lint the non-Zig sources
+pantry run lint
+
 # Cross-compile for all platforms
 pantry run cross
-
-# Release
-pantry run release:patch   # or release:minor, release:major
 ```
+
+### Releasing
+
+```bash
+pantry run release:patch   # or release:minor, release:major
+pantry run release:dry     # preview, writes nothing
+```
+
+One command bumps every manifest in the workspace, regenerates `CHANGELOG.md`
+from the conventional commits, tags, and pushes — the tag is what builds and
+publishes the release. See [docs/QUICK_RELEASE_GUIDE.md](docs/QUICK_RELEASE_GUIDE.md).
 
 ## Contributing
 

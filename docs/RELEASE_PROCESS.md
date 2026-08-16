@@ -1,456 +1,119 @@
 # Release Process
 
-This document describes how to create releases for the SMTP server using zig-bump.
+Releases are cut with [bumpx](https://github.com/stacksjs/bumpx) and
+[logsmith](https://github.com/stacksjs/logsmith), both of which arrive with the
+`better-dx` dev dependency — there is nothing else to install.
 
-## Overview
-
-The release process is automated using [zig-bump](https://github.com/stacksjs/zig-bump), a fast version bumping tool for Zig projects. When you bump the version, zig-bump will:
-
-1. Update the version in `build.zig.zon`
-2. Create a git commit
-3. Create a git tag (e.g., `v0.1.0`)
-4. Push the changes and tag to GitHub
-5. Trigger the release workflow automatically
-
-The GitHub Actions release workflow will then:
-- Build binaries for all supported platforms
-- Build and push Docker images
-- Create a GitHub release with all artifacts
-
-## Prerequisites
-
-1. Install zig-bump:
-   ```bash
-   make install
-   ```
-
-2. Ensure you have commit access to the repository
-3. Ensure you're on the `main` branch and it's up to date:
-   ```bash
-   git checkout main
-   git pull origin main
-   ```
-
-## Quick Start
-
-### Using Interactive Script (Easiest!) 🎯
-
-The interactive release script provides a guided experience:
+## The one-liner
 
 ```bash
-./scripts/release.sh
-# or
-make release
+pantry run release:patch   # or release:minor, release:major
 ```
 
-**Features:**
-- 🎨 Beautiful colored interface
-- ✅ Pre-release checklist (CHANGELOG, tests)
-- 📊 Visual version preview
-- 🔍 Dry-run option
-- ✋ Confirmation before release
-- 🎯 Clear next steps after release
+`bun run release:patch` does the same thing; `pantry run` just forwards to it.
 
-**What it looks like:**
-```
-╔═══════════════════════════════════════════════════════╗
-║         Mail Server Release Manager                  ║
-╚═══════════════════════════════════════════════════════╝
+## What that actually does
 
-[INFO] Current version: v0.0.0
+1. **`scripts/release.ts`** refuses to continue unless the tree is releasable:
+   on `main`, no uncommitted tracked files, `main` matching `origin/main`, and —
+   the one bumpx cannot check for itself — every versioned manifest sitting on
+   the same version.
+2. **bumpx** rewrites the version in each of them:
+   - `package.json` (root) and each `packages/*/package.json`
+   - `packages/zig/build.zig.zon`
+3. **logsmith** (invoked by bumpx) regenerates `CHANGELOG.md` from the
+   conventional commits since the last tag and prepends the new section.
+4. bumpx commits the lot, tags it `vX.Y.Z`, and pushes both.
+5. The tag push starts `.github/workflows/release.yml`, which cross-compiles
+   every target, attaches the binaries to a GitHub release whose body logsmith
+   regenerates for that tag range, and publishes `ts-mail` to npm.
 
-Pre-Release Checklist
+The version bump is therefore repo-wide: one tag, one version, every package.
 
-▶ Have you updated CHANGELOG.md? [y/N]
-▶ Have all tests passed? [y/N]
+### Why the manifest list is explicit
 
-╔═══════════════════════════════════════════════════════╗
-║         Select Version to Bump                       ║
-╚═══════════════════════════════════════════════════════╝
+`scripts/release.ts` passes bumpx `--no-recursive --files <list>` rather than
+letting it discover manifests. Recursive discovery walks the tree for anything
+named `package.json` or `build.zig.zon`, and bumpx's `.gitignore` matching only
+handles top-level patterns — so it also finds the vendored Zig dependencies
+under `packages/zig/vendor/`, `packages/zig/zig-pkg/` and `packages/zig/pantry/`
+and rewrites *their* versions too.
 
-  1) Patch  v0.0.0 → v0.0.1
-     └─ Bug fixes, security patches, minor updates
+`pantry.jsonc` is not in the list. Its version is package metadata that has
+never tracked releases, and bumpx cannot rewrite it anyway: its JSONC comment
+stripper mangles the `https://` in `repository.url` and the parse fails, so the
+file is skipped without a word.
 
-  2) Minor  v0.0.0 → v0.1.0
-     └─ New features, backwards compatible changes
+### Why the manifests must stay in lockstep
 
-  3) Major  v0.0.0 → v1.0.0
-     └─ Breaking changes, major refactors
+bumpx only rewrites a manifest whose current version matches the version it is
+bumping *from*. A manifest that has drifted is skipped **silently** and ships
+stale. `bun test scripts` asserts they all match, and CI runs it on every PR, so
+drift fails a pull request rather than a release.
 
-  4) Dry Run - Preview changes without applying
-
-  0) Cancel
-
-Enter selection [1-4, 0 to cancel]:
-```
-
-### Using Zig Build (Recommended for automation)
-
-The native Zig way - no external tools needed:
+## Preview before you push
 
 ```bash
-# Patch release (0.0.1 -> 0.0.2) - Bug fixes
-zig build bump-patch
-
-# Minor release (0.0.1 -> 0.1.0) - New features
-zig build bump-minor
-
-# Major release (0.0.1 -> 1.0.0) - Breaking changes
-zig build bump-major
-
-# Interactive mode (choose version type)
-zig build bump
-
-# Dry-run (preview without applying)
-zig build bump-patch-dry
-zig build bump-minor-dry
-zig build bump-major-dry
+pantry run release:dry     # preflight + a bumpx dry run
+pantry run changelog       # print the changelog logsmith would generate
 ```
 
-### Using Make (Alternative)
+Neither writes anything or touches git.
 
-For those who prefer Makefile shortcuts:
+## Releasing from GitHub Actions
+
+The **Version Management** workflow (`.github/workflows/version.yml`) is the
+same flow, run manually from the Actions tab: pick `patch`/`minor`/`major`, tick
+*Dry run* to preview. It calls the same `scripts/release.ts`, and pushes the tag
+as `github-actions[bot]`.
+
+## Commit messages matter
+
+logsmith builds both `CHANGELOG.md` and the GitHub release body from
+conventional commits, so a malformed subject line just disappears from the
+release. The `commit-msg` git hook runs `gitlint` to catch that locally; run
+`bun install` once to install the hook.
+
+| prefix | lands in | bump it deserves |
+| --- | --- | --- |
+| `fix:` | Bug Fixes | patch |
+| `feat:` | Features | minor |
+| `feat!:` / `BREAKING CHANGE:` | Breaking Changes | major |
+| `chore:`, `ci:`, `docs:` | grouped, low prominence | patch |
+
+## Manual changelog regeneration
 
 ```bash
-# Patch release (0.0.1 -> 0.0.2)
-make release-patch
-
-# Minor release (0.0.1 -> 0.1.0)
-make release-minor
-
-# Major release (0.0.1 -> 1.0.0)
-make release-major
-
-# Interactive mode (choose version type)
-make bump-interactive
+pantry run changelog:generate   # rewrites CHANGELOG.md in place
 ```
 
-### Using the Script Directly (Alternative)
-
-```bash
-# Bump patch version
-./scripts/bump-version.sh patch
-
-# Bump minor version
-./scripts/bump-version.sh minor
-
-# Bump major version
-./scripts/bump-version.sh major
-
-# Interactive mode
-./scripts/bump-version.sh
-```
-
-### Using zig-bump Binary Directly (Low-level)
-
-If you want full control:
-
-```bash
-# The bump binary is built automatically with zig build
-./zig-out/bin/bump patch
-./zig-out/bin/bump minor
-./zig-out/bin/bump major
-
-# Interactive mode
-./zig-out/bin/bump
-```
-
-## Release Types
-
-Following [Semantic Versioning](https://semver.org/):
-
-- **Patch** (x.y.Z): Bug fixes, minor changes
-- **Minor** (x.Y.0): New features, backwards compatible
-- **Major** (X.0.0): Breaking changes
-
-## Detailed Process
-
-### 1. Prepare the Release
-
-Before bumping the version:
-
-1. Ensure all changes are committed:
-   ```bash
-   git status
-   ```
-
-2. Update the CHANGELOG.md (recommended):
-   ```bash
-   vim CHANGELOG.md
-   ```
-
-   Add a new section for the version:
-   ```markdown
-   ## [0.1.0] - 2025-10-24
-
-   ### Added
-   - Feature X
-   - Feature Y
-
-   ### Fixed
-   - Bug A
-   - Bug B
-
-   ### Changed
-   - Updated dependency Z
-   ```
-
-3. Commit the changelog:
-   ```bash
-   git add CHANGELOG.md
-   git commit -m "docs: update changelog for v0.1.0"
-   git push
-   ```
-
-### 2. Bump the Version
-
-Using native Zig build (recommended):
-
-```bash
-zig build bump-patch  # or bump-minor, bump-major
-```
-
-Or using Make:
-
-```bash
-make release-patch  # or release-minor, release-major
-```
-
-Or using the script:
-
-```bash
-./scripts/bump-version.sh patch
-```
-
-This will:
-- Update `build.zig.zon`
-- Create a commit with message: `chore: release vX.Y.Z`
-- Create an annotated git tag: `vX.Y.Z`
-- Push the commit and tag to GitHub
-
-### 3. Monitor the Release
-
-1. Go to the [Actions tab](../../actions) on GitHub
-2. Watch the "Release" workflow
-3. The workflow will:
-   - Build binaries for Linux (x86_64)
-   - Build binaries for macOS (x86_64, ARM64)
-   - Build and push Docker images
-   - Create a GitHub release
-
-### 4. Verify the Release
-
-1. Check the [Releases page](../../releases)
-2. Verify the release includes:
-   - Release notes (from CHANGELOG.md or auto-generated)
-   - Binary artifacts for all platforms
-   - Docker image tag in the description
-
-3. Test the Docker image:
-   ```bash
-   docker pull <username>/mail:X.Y.Z
-   docker run <username>/mail:X.Y.Z
-   ```
-
-## Advanced Options
-
-### Dry Run
-
-Preview what would happen without making changes:
-
-```bash
-~/Code/zig-bump/zig-out/bin/bump patch --dry-run
-```
-
-### Skip Push
-
-Bump and commit locally without pushing:
-
-```bash
-~/Code/zig-bump/zig-out/bin/bump patch --no-push
-```
-
-### Custom Tag Name
-
-Use a custom tag name:
-
-```bash
-~/Code/zig-bump/zig-out/bin/bump patch --tag-name "release-0.1.0"
-```
-
-### Skip Git Operations
-
-Just update the version file:
-
-```bash
-~/Code/zig-bump/zig-out/bin/bump patch --no-commit
-```
-
-## Manual Release (GitHub Actions)
-
-You can also trigger a release manually from GitHub:
-
-1. Go to [Actions](../../actions)
-2. Select "Version Management" workflow
-3. Click "Run workflow"
-4. Choose the release type (patch/minor/major)
-5. Optionally enable dry-run mode
-6. Click "Run workflow"
-
-## Rollback
-
-If you need to rollback a release:
-
-1. Delete the tag locally and remotely:
-   ```bash
-   git tag -d vX.Y.Z
-   git push origin :refs/tags/vX.Y.Z
-   ```
-
-2. Delete the GitHub release (if created)
-
-3. Revert the version commit:
-   ```bash
-   git revert HEAD
-   git push
-   ```
+logsmith prepends new sections under the existing `# Changelog` heading, so the
+hand-written history further down the file is preserved.
 
 ## Troubleshooting
 
-### Issue: "zig-bump not found"
+**"Manifest versions are out of sync"** — the preflight lists exactly which file
+drifted and what it expected. Set it by hand to the root `package.json` version,
+commit, and re-run.
 
-Run:
-```bash
-make install
-```
+**"Releases must run from main" / "Tracked files must be clean"** — the preflight
+is doing its job. A tag is not a local mistake; it ships binaries.
 
-### Issue: "Permission denied"
+**"Git working tree is not clean"** from bumpx — same cause, raised by bumpx's
+own check after the preflight passed (something changed in between).
 
-Make the script executable:
-```bash
-chmod +x scripts/bump-version.sh
-```
+**The release notes look generic** — the Pantry action is configured with
+`release-changelog: auto`, so it regenerates the notes with logsmith over
+previous-tag → this-tag. Empty notes mean no conventional commits landed in that
+range.
 
-### Issue: "Not in a git repository"
-
-Ensure you're in the project root directory.
-
-### Issue: "Uncommitted changes"
-
-Commit or stash your changes before bumping:
-```bash
-git stash
-make release-patch
-git stash pop
-```
-
-### Issue: "Failed to push"
-
-Ensure you have push permissions and are authenticated:
-```bash
-git config --list | grep remote.origin.url
-```
-
-## CI/CD Integration
-
-The release process integrates with two workflows:
-
-1. **version.yml**: Manual version bumping via GitHub Actions
-2. **release.yml**: Automatically triggered on version tags
-
-### Workflow Trigger Chain
-
-```
-make release-patch
-  ↓
-zig-bump updates version
-  ↓
-git commit + tag + push
-  ↓
-GitHub detects tag push (v*)
-  ↓
-release.yml workflow starts
-  ↓
-Build → Docker → GitHub Release
-```
-
-## Best Practices
-
-1. **Always update CHANGELOG.md** before releasing
-2. **Use semantic versioning** consistently
-3. **Test thoroughly** before releasing
-4. **Use patch releases** for bug fixes
-5. **Use minor releases** for new features
-6. **Use major releases** for breaking changes
-7. **Tag releases** with descriptive messages
-8. **Document** breaking changes clearly
-
-## Examples
-
-### Example 1: Bug Fix Release
-
-```bash
-# Fix bugs
-git add .
-git commit -m "fix: resolve connection timeout issue"
-
-# Update changelog
-vim CHANGELOG.md
-git add CHANGELOG.md
-git commit -m "docs: update changelog for v0.0.2"
-
-# Release (choose one)
-zig build bump-patch    # Recommended
-make release-patch      # Alternative
-```
-
-### Example 2: Feature Release
-
-```bash
-# Implement feature
-git add .
-git commit -m "feat: add DKIM signature support"
-
-# Update changelog
-vim CHANGELOG.md
-git add CHANGELOG.md
-git commit -m "docs: update changelog for v0.1.0"
-
-# Release (choose one)
-zig build bump-minor    # Recommended
-make release-minor      # Alternative
-```
-
-### Example 3: Breaking Change Release
-
-```bash
-# Implement breaking changes
-git add .
-git commit -m "feat!: redesign configuration format"
-
-# Update changelog and migration guide
-vim CHANGELOG.md
-vim docs/MIGRATION.md
-git add CHANGELOG.md docs/MIGRATION.md
-git commit -m "docs: update changelog and migration guide for v1.0.0"
-
-# Release (choose one)
-zig build bump-major    # Recommended
-make release-major      # Alternative
-```
+**A release tag exists but no release appeared** — check the Release workflow
+run. The cross-compile step is the long pole; the Pantry action only creates the
+release after every required target has been built.
 
 ## Resources
 
-- [zig-bump Documentation](https://github.com/stacksjs/zig-bump)
+- [bumpx](https://github.com/stacksjs/bumpx)
+- [logsmith](https://github.com/stacksjs/logsmith)
 - [Semantic Versioning](https://semver.org/)
-- [Keep a Changelog](https://keepachangelog.com/)
-- [GitHub Actions Documentation](https://docs.github.com/en/actions)
-
-## Support
-
-If you encounter issues with the release process:
-
-1. Check this documentation
-2. Review the GitHub Actions logs
-3. Open an issue on the repository
-4. Contact the maintainers
+- [Conventional Commits](https://www.conventionalcommits.org/)

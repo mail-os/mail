@@ -32,37 +32,26 @@ jobs:
         token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Setup project dependencies with Pantry
-      uses: home-lang/pantry/packages/action@v0.11.25
+      uses: pantry-pm/pantry/packages/action@v0.11.27
+
+    - name: Install dependencies
+      run: bun install --frozen-lockfile
 
     - name: Configure Git
       run: |
         git config user.name "github-actions[bot]"
         git config user.email "github-actions[bot]@users.noreply.github.com"
 
-    - name: Build zig-bump
-      run: |
-        cd ../
-        if [ ! -d "zig-bump" ]; then
-          git clone https://github.com/stacksjs/zig-bump.git
-        fi
-        cd zig-bump
-        zig build -Doptimize=ReleaseFast
-        sudo cp zig-out/bin/bump /usr/local/bin/
-        cd ../mail
-
     - name: Bump version (dry-run)
       if: ${{ inputs.dry_run }}
-      run: |
-        # bump reads build.zig.zon from its CWD — it lives in packages/zig,
-        # not the repo root.
-        cd $GITHUB_WORKSPACE/packages/zig
-        bump ${{ inputs.release_type }} --dry-run
+      run: bun scripts/release.ts ${{ inputs.release_type }} --dry-run
 
+    # Same entry point as `pantry run release:<level>` locally: preflight, then
+    # bumpx over the explicit manifest list, logsmith for the changelog, commit,
+    # tag, push. The tag push is what starts release.yml.
     - name: Bump version and push
       if: ${{ !inputs.dry_run }}
-      run: |
-        cd $GITHUB_WORKSPACE/packages/zig
-        bump ${{ inputs.release_type }} --all
+      run: bun scripts/release.ts ${{ inputs.release_type }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

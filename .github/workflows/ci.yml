@@ -24,7 +24,7 @@ jobs:
         submodules: recursive
 
     - name: Setup project dependencies with Pantry
-      uses: home-lang/pantry/packages/action@v0.11.25
+      uses: pantry-pm/pantry/packages/action@v0.11.27
 
     - name: Build
       run: zig build -Doptimize=ReleaseSafe
@@ -45,7 +45,10 @@ jobs:
       uses: actions/checkout@v6
 
     - name: Setup project dependencies with Pantry
-      uses: home-lang/pantry/packages/action@v0.11.25
+      uses: pantry-pm/pantry/packages/action@v0.11.27
+
+    - name: Install workspace dependencies
+      run: bun install --frozen-lockfile
 
     # The Docker context is packages/zig only and webmail_dist is gitignored,
     # so render the webmail bundle on the runner first; the image build then
@@ -78,10 +81,21 @@ jobs:
       uses: actions/checkout@v6
 
     - name: Setup project dependencies with Pantry
-      uses: home-lang/pantry/packages/action@v0.11.25
+      uses: pantry-pm/pantry/packages/action@v0.11.27
 
     - name: Check formatting
       run: zig fmt --check src/
+
+    - name: Install workspace dependencies
+      working-directory: ${{ github.workspace }}
+      run: bun install --frozen-lockfile
+
+    # Guards the release flow: the preflight suite asserts every manifest bumpx
+    # rewrites is still on the same version, so drift fails a PR instead of
+    # silently shipping a stale package at release time.
+    - name: Test release scripts
+      working-directory: ${{ github.workspace }}
+      run: bun test scripts
 
     - name: Static analysis (future)
       run: echo "Static analysis placeholder"
@@ -100,7 +114,7 @@ jobs:
         submodules: recursive
 
     - name: Setup project dependencies with Pantry
-      uses: home-lang/pantry/packages/action@v0.11.25
+      uses: pantry-pm/pantry/packages/action@v0.11.27
 
     - name: Install coverage dependencies
       working-directory: ${{ github.workspace }}
@@ -154,7 +168,7 @@ jobs:
         submodules: recursive
 
     - name: Setup project dependencies with Pantry
-      uses: home-lang/pantry/packages/action@v0.11.25
+      uses: pantry-pm/pantry/packages/action@v0.11.27
 
     - name: Build release
       run: zig build -Doptimize=ReleaseFast

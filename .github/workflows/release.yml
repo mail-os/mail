@@ -14,19 +14,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: recursive
+        fetch-depth: 0
 
     - name: Setup project dependencies with Pantry
-      uses: home-lang/pantry/packages/action@v0.11.25
+      uses: pantry-pm/pantry/packages/action@v0.11.27
+
+    # One hoisted install at the root covers every workspace: webmail's build
+    # plugin and the dtsx generator that packages/ts runs from prepublishOnly.
+    - name: Install workspace dependencies
+      run: bun install --frozen-lockfile
 
     - name: Build webmail frontend
       # The zig binaries @embedFile packages/zig/src/api/webmail_dist/* (generated,
       # not committed), so render it before compiling or every target fails FileNotFound.
       run: |
         cd packages/webmail
-        bun install
         bun run build
 
     - name: Cross-compile every platform
@@ -41,14 +46,19 @@ jobs:
       # The Pantry action auto-discovers packages/zig/zig-out/cross/<triple>/,
       # packages each platform, extracts the changelog, and creates the GitHub
       # release — the whole release flow lives in the action.
-      uses: home-lang/pantry/packages/action@v0.11.25
+      uses: pantry-pm/pantry/packages/action@v0.11.27
       with:
         install: 'false'
         release: 'true'
         release-files: 'auto'
         release-tag: ${{ github.ref_name }}
         release-token: ${{ secrets.GITHUB_TOKEN }}
-        release-changelog: .github/release-notes.md
+        # "auto" runs logsmith over previous-tag → this-tag rather than trying to
+        # find this tag's heading inside CHANGELOG.md. The changelog logsmith
+        # writes during the version bump has no per-version heading to extract,
+        # so section extraction would come up empty and silently fall through to
+        # the generic notes below.
+        release-changelog: auto
         release-notes: |
           ## mail ${{ github.ref_name }}
 

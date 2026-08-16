@@ -1,0 +1,6 @@
+[install]
+# better-dx ships the shared dev tooling (bumpx, logsmith, pickier, gitlint,
+# bun-git-hooks, buddy-bot) as its own dependencies, and their CLIs have to
+# resolve from the workspace root — hoisted linking is what puts them in
+# node_modules/.bin instead of behind per-package isolated trees.
+linker = "hoisted"

@@ -1,4 +1,4 @@
-import type { CloudConfig } from 'ts-cloud'
+import type { CloudConfig } from '@stacksjs/ts-cloud'
 
 /**
  * Mail Server Infrastructure Configuration

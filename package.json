@@ -1,11 +1,52 @@
 {
   "name": "mail-workspace",
+  "type": "module",
+  "version": "0.2.0",
   "private": true,
+  "description": "Modern SMTP/IMAP mail server written in Zig",
+  "author": "Chris Breuer <chris@stacksjs.com>",
+  "license": "MIT",
+  "homepage": "https://github.com/mail-os/mail#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mail-os/mail.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mail-os/mail/issues"
+  },
+  "keywords": [
+    "smtp",
+    "imap",
+    "pop3",
+    "mail",
+    "zig"
+  ],
   "scripts": {
-    "release": "bun scripts/release-version.ts patch",
-    "release:patch": "bun scripts/release-version.ts patch",
-    "release:minor": "bun scripts/release-version.ts minor",
-    "release:major": "bun scripts/release-version.ts major",
-    "release:test": "bun test scripts/release-version.test.ts"
+    "prepare": "bunx --bun bun-git-hooks",
+    "build": "cd packages/zig && zig build -Doptimize=ReleaseFast",
+    "test": "cd packages/zig && zig build test",
+    "test:scripts": "bun test scripts",
+    "fmt": "cd packages/zig && zig fmt src/",
+    "fmt:check": "cd packages/zig && zig fmt --check src/",
+    "lint": "bunx --bun pickier .",
+    "lint:fix": "bunx --bun pickier . --fix",
+    "format": "bunx --bun pickier . --format",
+    "format:fix": "bunx --bun pickier . --format --write",
+    "changelog": "bunx --bun @stacksjs/logsmith --verbose",
+    "changelog:generate": "bunx --bun @stacksjs/logsmith --output CHANGELOG.md",
+    "release": "bun scripts/release.ts prompt",
+    "release:patch": "bun scripts/release.ts patch",
+    "release:minor": "bun scripts/release.ts minor",
+    "release:major": "bun scripts/release.ts major",
+    "release:dry": "bun scripts/release.ts patch --dry-run"
+  },
+  "devDependencies": {
+    "better-dx": "^0.2.22"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "git-hooks": {
+    "commit-msg": "bunx --bun @stacksjs/gitlint --edit .git/COMMIT_EDITMSG"
   }
 }

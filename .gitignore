@@ -47,3 +47,8 @@ zig-pkg/
 /packages/webmail/dist
 /packages/zig/src/api/webmail_dist
 pantry
+
+# Bun / workspace tooling
+node_modules/
+packages/ts/dist/
+packages/ts/bin/
