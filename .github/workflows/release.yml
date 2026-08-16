@@ -20,12 +20,10 @@ jobs:
         fetch-depth: 0
 
     - name: Setup project dependencies with Pantry
-      uses: pantry-pm/pantry/packages/action@v0.11.27
-      with:
-        install: 'false'
+      uses: pantry-pm/pantry/packages/action@v0.11.28
 
-    # One hoisted install at the root covers every workspace: webmail's build
-    # plugin and the dtsx generator that packages/ts runs from prepublishOnly.
+    # Pantry provides the pinned native toolchain. The hoisted Bun install
+    # provides each workspace's JavaScript dependencies and release builders.
     - name: Install workspace dependencies
       run: bun install --frozen-lockfile
 
@@ -48,7 +46,7 @@ jobs:
       # The Pantry action auto-discovers packages/zig/zig-out/cross/<triple>/,
       # packages each platform, extracts the changelog, and creates the GitHub
       # release — the whole release flow lives in the action.
-      uses: pantry-pm/pantry/packages/action@v0.11.27
+      uses: pantry-pm/pantry/packages/action@v0.11.28
       with:
         install: 'false'
         release: 'true'

@@ -32,7 +32,7 @@ jobs:
         token: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Setup project dependencies with Pantry
-      uses: pantry-pm/pantry/packages/action@v0.11.27
+      uses: pantry-pm/pantry/packages/action@v0.11.28
 
     - name: Install dependencies
       run: bun install --frozen-lockfile
