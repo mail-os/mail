@@ -1,7 +1,7 @@
 {
   "name": "mail-workspace",
   "type": "module",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": true,
   "description": "Modern SMTP/IMAP mail server written in Zig",
   "author": "Chris Breuer <chris@stacksjs.com>",

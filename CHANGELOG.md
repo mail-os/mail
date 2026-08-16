@@ -1,5 +1,20 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.0...v0.3.1)
+
+## 🐛 Bug Fixes
+
+- **release**: install native toolchain with Pantry ([cb2ddd7](https://github.com/mail-os/mail/commit/cb2ddd7)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.1 ([69a463c](https://github.com/mail-os/mail/commit/69a463c)) _(by Chris <chris@stacksjs.com>)_
+- **deps**: refresh Pantry lockfile ([17be589](https://github.com/mail-os/mail/commit/17be589)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.2.2...v0.3.0)
 
 ## 🐛 Bug Fixes
