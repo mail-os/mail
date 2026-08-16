@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.2.1...v0.2.2)
+
+## 🐛 Bug Fixes
+
+- **release**: publish mail client from owned scope ([b38f881](https://github.com/mail-os/mail/commit/b38f881)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.2.2 ([ae2ee5e](https://github.com/mail-os/mail/commit/ae2ee5e)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.2.0...v0.2.1)
 
 ## 🐛 Bug Fixes

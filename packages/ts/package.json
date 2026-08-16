@@ -1,7 +1,7 @@
 {
   "name": "@stacksjs/mail",
   "type": "module",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Typed runtime and management client for the mail server",
   "author": "Chris Breuer",
   "license": "MIT",
