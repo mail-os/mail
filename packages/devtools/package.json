@@ -1,7 +1,7 @@
 {
   "name": "mail-devtools",
   "type": "module",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "scripts": {
     "dev": "bun --preload bun-plugin-stx/preload server.ts",
     "start": "bun --preload bun-plugin-stx/preload server.ts",

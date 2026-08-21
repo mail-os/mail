@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.1...v0.3.2)
+
+## ✨ Features
+
+- **trap**: a catch-all mode, so the mail catcher catches mail ([594a694](https://github.com/mail-os/mail/commit/594a694)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.2 ([8a72b37](https://github.com/mail-os/mail/commit/8a72b37)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.0...v0.3.1)
 
 ## 🐛 Bug Fixes
