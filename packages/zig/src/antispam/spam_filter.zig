@@ -213,11 +213,91 @@ const free_providers = [_][]const u8{
     "yahoo.com", "ymail.com",      "aol.com",     "msn.com",     "gmx.com",
 };
 
-/// Consumer brands commonly spoofed in the From display-name (phishing).
-/// Kept to distinctive, low-substring-collision names on purpose.
-const spoofed_brands = [_][]const u8{
-    "netflix", "paypal", "amazon", "microsoft", "coinbase",
-    "binance", "fedex",  "norton", "mcafee",    "docusign",
+/// A brand that phishing impersonates, plus every domain that legitimately
+/// speaks for it. `check_links` marks tokens distinctive enough to be searched
+/// for as a *substring* of a link hostname (see `hasBrandLinkMismatch`);
+/// short or compound-prone names ("apple" in `pineapple.com`, "ups" in
+/// `groups.google.com`, "amazon" in `amazonia.example`) stay out of that scan
+/// and are only ever word-matched.
+const Brand = struct {
+    name: []const u8,
+    domains: []const []const u8,
+    check_links: bool = true,
+};
+
+/// Brands commonly impersonated in the From display-name or Subject. Consumer
+/// services, plus the registrar / hosting / DNS brands that "your domain has
+/// expired" phishing wears — those lures address the one recipient class that
+/// definitely owns a domain, so they are over-represented on a technical inbox.
+const impersonated_brands = [_]Brand{
+    .{ .name = "netflix", .domains = &.{"netflix.com"} },
+    .{ .name = "paypal", .domains = &.{"paypal.com"} },
+    .{ .name = "amazon", .domains = &.{ "amazon.com", "amazonses.com", "amazonaws.com" }, .check_links = false },
+    .{ .name = "apple", .domains = &.{ "apple.com", "icloud.com" }, .check_links = false },
+    .{ .name = "microsoft", .domains = &.{ "microsoft.com", "microsoftonline.com", "office.com" } },
+    .{ .name = "coinbase", .domains = &.{"coinbase.com"} },
+    .{ .name = "binance", .domains = &.{"binance.com"} },
+    .{ .name = "metamask", .domains = &.{"metamask.io"} },
+    .{ .name = "fedex", .domains = &.{"fedex.com"} },
+    .{ .name = "norton", .domains = &.{"norton.com"} },
+    .{ .name = "mcafee", .domains = &.{"mcafee.com"} },
+    .{ .name = "docusign", .domains = &.{ "docusign.com", "docusign.net" } },
+    .{ .name = "dropbox", .domains = &.{"dropbox.com"} },
+    .{ .name = "wetransfer", .domains = &.{"wetransfer.com"} },
+    .{ .name = "linkedin", .domains = &.{ "linkedin.com", "licdn.com" } },
+    .{ .name = "instagram", .domains = &.{"instagram.com"} },
+    .{ .name = "quickbooks", .domains = &.{ "quickbooks.com", "intuit.com" } },
+    // Registrars / hosts / DNS — the "domain expired" lure family.
+    .{ .name = "porkbun", .domains = &.{"porkbun.com"} },
+    .{ .name = "namecheap", .domains = &.{"namecheap.com"} },
+    .{ .name = "godaddy", .domains = &.{"godaddy.com"} },
+    .{ .name = "cloudflare", .domains = &.{ "cloudflare.com", "notify.cloudflare.com" } },
+    .{ .name = "hostgator", .domains = &.{"hostgator.com"} },
+    .{ .name = "bluehost", .domains = &.{"bluehost.com"} },
+    .{ .name = "dynadot", .domains = &.{"dynadot.com"} },
+    .{ .name = "gandi", .domains = &.{ "gandi.net", "gandi.link" }, .check_links = false },
+    .{ .name = "squarespace", .domains = &.{"squarespace.com"} },
+};
+
+/// Expiry / suspension lures: the message claims something the recipient owns
+/// is about to stop working. Half of the `EXPIRY_BRAND_PHISH` conjunction.
+const expiry_phrases = [_][]const u8{
+    "has expired",        "have expired",          "is expiring",
+    "will expire",        "expires on",            "expired on",
+    "expiration date",    "expiry date",           "about to expire",
+    "has been suspended", "will be suspended",     "will be deactivated",
+    "will be terminated", "will be deleted",       "has been locked",
+    "no longer active",   "scheduled for removal",
+};
+
+/// The other half: the "fix it now" call to action every expiry lure carries.
+const restore_cta_phrases = [_][]const u8{
+    "renew",               "reactivate",           "restore your",
+    "back online",         "update your billing",  "update your payment",
+    "verify your account", "confirm your account", "avoid suspension",
+    "avoid interruption",  "avoid deactivation",   "reclaim",
+};
+
+/// A From display-name is an identity, not a claim. Real senders put their
+/// name or brand there and the alarm in the Subject; phishing puts the alarm
+/// in the display-name itself ("Your domain has expired" <info@unrelated.cz>)
+/// because that is the line every mail client renders largest.
+const display_lure_phrases = [_][]const u8{
+    "expired",        "expiring",         "suspended",      "suspension",
+    "deactivated",    "action required",  "payment failed", "payment declined",
+    "security alert", "unusual activity", "account locked", "final notice",
+    "past due",       "overdue",          "verify your",    "confirm your",
+};
+
+/// Reserved / non-routable TLDs (RFC 2606, RFC 6762, RFC 8375). Mail arriving
+/// from the internet can never legitimately carry a From address in one of
+/// these — the domain is unresolvable outside a private network, so the
+/// address is unreplyable by construction. `.example` is deliberately absent:
+/// it is the documentation TLD used by this project's own test fixtures.
+const bogus_tlds = [_][]const u8{
+    ".local",     ".localdomain", ".localhost", ".lan",  ".home",
+    ".home.arpa", ".internal",    ".intranet",  ".corp", ".private",
+    ".invalid",   ".test",
 };
 
 /// Parcel-fee phishing impersonates a carrier while sending from an unrelated,
@@ -623,21 +703,39 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
     // claims a consumer brand the sending domain has nothing to do with
     // (e.g. `"Netflix.com" <l1xwv4u9@aqg.io>`). Independent of DMARC — the
     // display name is never authenticated even when the domain's DMARC passes.
-    if (from_decoded) |from_hdr| {
+    const display_name: ?[]const u8 = if (from_decoded) |from_hdr| blk: {
         const disp_end = std.mem.indexOfScalar(u8, from_hdr, '<') orelse from_hdr.len;
-        const display = from_hdr[0..disp_end];
-        for (spoofed_brands) |brand| {
-            if (ascii_compat.indexOfIgnoreCase(display, brand) != null) {
-                const dom_has_brand = if (from_domain) |fd|
-                    domainHasLabel(fd, brand)
-                else
-                    false;
-                if (!dom_has_brand) {
-                    score += 4.0;
-                    tl.add("BRAND_SPOOF");
-                }
-                break;
+        break :blk std.mem.trim(u8, from_hdr[0..disp_end], " \t\"'");
+    } else null;
+    if (display_name) |display| {
+        for (impersonated_brands) |brand| {
+            // Word-matched: a substring test flags "Pineapple Farms" as Apple.
+            if (!containsWordIgnoreCase(display, brand.name)) continue;
+            const dom_is_brand = if (from_domain) |fd|
+                domainMatchesAny(fd, brand.domains)
+            else
+                false;
+            if (!dom_is_brand) {
+                score += 4.0;
+                tl.add("BRAND_SPOOF");
             }
+            break;
+        }
+        // The display-name is a warning rather than an identity.
+        if (containsAnyIgnoreCase(display, &display_lure_phrases)) {
+            score += 3.0;
+            tl.add("DISPLAY_NAME_LURE");
+        }
+    }
+
+    // A From address in a reserved / non-routable TLD cannot have come from a
+    // real correspondent: the domain does not exist outside somebody's LAN, so
+    // the address can never be replied to. Bulk senders hit this when they
+    // blast straight out of a misconfigured appliance.
+    if (from_domain) |fd| {
+        if (isBogusTld(fd)) {
+            score += 4.0;
+            tl.add("SENDER_BOGUS_TLD");
         }
     }
 
@@ -716,6 +814,68 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
         if (!from_matches and parcel_hits > 0 and payment_hits >= 2) {
             score += 6.0;
             tl.add("CARRIER_PAYMENT_PHISH");
+        }
+    }
+
+    // Brand impersonation, second angle: the payload link. Scanned on views
+    // that still carry markup (`scan_qp`, and the raw base64-decoded part) —
+    // `scan_text` has had its tags, and therefore its hrefs, stripped.
+    if (hasBrandLinkMismatch(scan_qp) or
+        (b64_part.len > 0 and hasBrandLinkMismatch(b64_part)))
+    {
+        score += 5.0;
+        tl.add("BRAND_LINK_MISMATCH");
+    }
+
+    // "Your domain has expired — renew now": an expiry/suspension lure wearing
+    // a brand the sender demonstrably is not. All three legs are required, and
+    // the brand claim must sit in the Subject or the From display-name (an
+    // identity position) rather than anywhere in the body — otherwise a
+    // newsletter that merely discusses Cloudflare and mentions a renewal would
+    // score. A real registrar's own renewal notice is exempt because it sends
+    // from the brand's domain.
+    var claimed_brand: ?Brand = null;
+    for (impersonated_brands) |b| {
+        const in_subject = if (subject) |s| containsWordIgnoreCase(s, b.name) else false;
+        const in_display = if (display_name) |d| containsWordIgnoreCase(d, b.name) else false;
+        if (in_subject or in_display) {
+            claimed_brand = b;
+            break;
+        }
+    }
+    if (claimed_brand) |b| {
+        const from_is_brand = if (from_domain) |fd| domainMatchesAny(fd, b.domains) else false;
+        if (!from_is_brand) {
+            // The Subject wears the brand as a sender identity ("MetaMask:
+            // Action Required", or a bare "Porkbun") while the address behind
+            // it belongs to somebody else. Distinct from a passing mention:
+            // "Re: your Apple Developer agreement" is a human talking *about*
+            // a brand and never matches, because the brand must lead the
+            // subject and be followed by a separator or nothing at all.
+            if (subject) |s| {
+                if (subjectClaimsBrand(s, b.name)) {
+                    score += 4.0;
+                    tl.add("BRAND_SUBJECT_SPOOF");
+                }
+            }
+            var expiry_hit = false;
+            for (expiry_phrases) |p| {
+                if (scan.hit(p)) {
+                    expiry_hit = true;
+                    break;
+                }
+            }
+            var cta_hit = false;
+            for (restore_cta_phrases) |p| {
+                if (scan.hit(p)) {
+                    cta_hit = true;
+                    break;
+                }
+            }
+            if (expiry_hit and cta_hit) {
+                score += 6.0;
+                tl.add("EXPIRY_BRAND_PHISH");
+            }
         }
     }
 
@@ -928,15 +1088,77 @@ fn domainIsOrSubdomain(domain: []const u8, expected: []const u8) bool {
         std.ascii.eqlIgnoreCase(domain[domain.len - expected.len ..], expected);
 }
 
-/// Match a complete DNS label, not an arbitrary substring. Without label
-/// boundaries a sender like `paypal-security.example` could evade display-name
-/// spoof detection merely by putting the impersonated brand in its domain.
-fn domainHasLabel(domain: []const u8, label: []const u8) bool {
-    var it = std.mem.splitScalar(u8, domain, '.');
-    while (it.next()) |part| {
-        if (std.ascii.eqlIgnoreCase(part, label)) return true;
+/// True when `domain` is one of `list`, or a subdomain of one of them.
+fn domainMatchesAny(domain: []const u8, list: []const []const u8) bool {
+    for (list) |d| {
+        if (domainIsOrSubdomain(domain, d)) return true;
     }
     return false;
+}
+
+fn isBogusTld(domain: []const u8) bool {
+    for (bogus_tlds) |tld| {
+        if (domain.len > tld.len and
+            std.ascii.eqlIgnoreCase(domain[domain.len - tld.len ..], tld)) return true;
+    }
+    return false;
+}
+
+/// Extract the host of the http(s) URL whose `://` sits at `at`, or null when
+/// the scheme is not http/https. Userinfo and port are stripped.
+fn urlHostAt(text: []const u8, at: usize) ?[]const u8 {
+    const https = at >= 5 and std.ascii.eqlIgnoreCase(text[at - 5 .. at], "https");
+    const http = at >= 4 and std.ascii.eqlIgnoreCase(text[at - 4 .. at], "http");
+    if (!https and !http) return null;
+    var end = at + 3;
+    while (end < text.len) : (end += 1) {
+        switch (text[end]) {
+            '/', '?', '#', '"', '\'', '<', '>', ' ', '\t', '\r', '\n', ')', ',', ';' => break,
+            else => {},
+        }
+    }
+    var host = text[at + 3 .. end];
+    if (std.mem.lastIndexOfScalar(u8, host, '@')) |a| host = host[a + 1 ..];
+    if (std.mem.indexOfScalar(u8, host, ':')) |c| host = host[0..c];
+    return if (host.len == 0) null else host;
+}
+
+/// A link whose *hostname* embeds a brand token while its registrable domain
+/// belongs to somebody else — `https://sslporkbunvalid.ros-ohrana.ru/` on a
+/// message wearing Porkbun's logo. This is the single most reliable phishing
+/// tell available without a URL reputation feed, and it is orthogonal to
+/// authentication: the sending domain can be perfectly SPF/DKIM/DMARC-aligned
+/// (it usually is, being compromised) and the payload link still gives it away.
+/// Only the host is inspected, never the path, so `twitter.com/Porkbun` and
+/// other legitimate profile links do not match.
+fn hasBrandLinkMismatch(text: []const u8) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, text, i, "://")) |at| {
+        i = at + 3;
+        const host = urlHostAt(text, at) orelse continue;
+        for (impersonated_brands) |b| {
+            if (!b.check_links) continue;
+            if (ascii_compat.indexOfIgnoreCase(host, b.name) == null) continue;
+            if (!domainMatchesAny(host, b.domains)) return true;
+        }
+    }
+    return false;
+}
+
+/// True when `subject` presents `brand` as the sender's identity: the brand is
+/// the entire subject, or leads it and is followed by a separator. A brand
+/// appearing anywhere else in the subject is ordinary correspondence about
+/// that brand and deliberately does not match.
+fn subjectClaimsBrand(subject: []const u8, brand: []const u8) bool {
+    const s = std.mem.trim(u8, subject, " \t");
+    if (s.len < brand.len) return false;
+    if (!std.ascii.eqlIgnoreCase(s[0..brand.len], brand)) return false;
+    const rest = std.mem.trimStart(u8, s[brand.len..], " \t");
+    if (rest.len == 0) return true;
+    return switch (rest[0]) {
+        ':', '-', '|', '\xE2' => true, // ':' '-' '|' and the UTF-8 lead byte of an em/en dash
+        else => false,
+    };
 }
 
 fn isWordByte(c: u8) bool {
@@ -1490,4 +1712,144 @@ test "a single website mention from gmail does not junk legit mail" {
     const body = "Hi, I noticed a broken link on your existing website's contact page. Thought you'd want to know.";
     const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
     try std.testing.expectEqual(Disposition.accept, r.disposition);
+}
+
+test "authenticated registrar-expiry phishing is rejected" {
+    // Real message (2026-08-19): a compromised but fully SPF/DKIM/DMARC-passing
+    // domain wearing Porkbun's identity. Every legacy rule scored it 0.0.
+    const headers =
+        "From: Your domain has expired <info@bebarefoot.cz>\n" ++
+        "To: hi@stacksjs.com\n" ++
+        "Subject: Porkbun\n" ++
+        "Date: Wed, 19 Aug 2026 14:48:01 +0000\n" ++
+        "Message-ID: <0@bebarefoot.cz>";
+    const body =
+        "<p><strong>Your domain has expired</strong></p>" ++
+        "<p>The following Porkbun Domain expired on 22.08.2026:<br>" ++
+        "Domain Name: stacksjs.com<br>Expiration Date: 22.08.2026<br>" ++
+        "To get your domain back online, please visit the " ++
+        "<a href=\"https://porkbun.com/panel\">Domains panel</a> of your Porkbun site.</p>" ++
+        "<p><a href=\"https://sslporkbunvalid.ros-ohrana.ru/\">RENEW DOMAIN</a></p>";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "DISPLAY_NAME_LURE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_LINK_MISMATCH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_SUBJECT_SPOOF") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "EXPIRY_BRAND_PHISH") != null);
+    try std.testing.expectEqual(Disposition.reject, r.disposition);
+}
+
+test "a registrar's own expiry notice is not phishing" {
+    const headers =
+        "From: Porkbun Support <support@porkbun.com>\n" ++
+        "Subject: Porkbun: your domain expires soon\n" ++
+        "Date: Wed, 19 Aug 2026 14:48:01 +0000\n" ++
+        "Message-ID: <1@porkbun.com>";
+    const body =
+        "<p>Your domain expires on 22.08.2026. " ++
+        "<a href=\"https://porkbun.com/renew\">Renew</a> to keep it online.</p>";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expectEqual(Disposition.accept, r.disposition);
+    try std.testing.expectEqual(@as(f32, 0), r.score);
+}
+
+test "brand in a link path is not a link mismatch" {
+    // Legitimate social links ("twitter.com/Porkbun") must not fire the rule —
+    // only the hostname is inspected.
+    const headers =
+        "From: Newsletter <news@example.com>\n" ++
+        "Subject: Weekly roundup\nDate: d\nMessage-ID: <2@example.com>";
+    const body = "<a href=\"https://twitter.com/Porkbun\">us</a> " ++
+        "<a href=\"https://www.facebook.com/PorkbunLLC/\">fb</a>";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_LINK_MISMATCH") == null);
+}
+
+test "brand subdomain of its own domain is not a link mismatch" {
+    const headers =
+        "From: Cloudflare <noreply@notify.cloudflare.com>\n" ++
+        "Subject: [Action required] Verify your email address\nDate: d\nMessage-ID: <3@cloudflare.com>";
+    const body = "<a href=\"https://dash.cloudflare.com/verify\">Verify</a>";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expectEqual(Disposition.accept, r.disposition);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_LINK_MISMATCH") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_SPOOF") == null);
+}
+
+test "a brand substring inside an unrelated host is not scanned" {
+    // "apple" and "amazon" are excluded from the hostname substring scan
+    // precisely so `pineapple.example` and `amazonia.example` stay clean.
+    const headers =
+        "From: Grocer <hi@example.com>\n" ++
+        "Subject: Fruit delivery\nDate: d\nMessage-ID: <4@example.com>";
+    const body = "<a href=\"https://pineapple-farms.example/order\">order</a>";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_LINK_MISMATCH") == null);
+}
+
+test "brand leading the subject with a separator is an identity claim" {
+    const headers =
+        "From: \"SUPPORT\" <u9qun8zq@uep.io>\n" ++
+        "Subject: MetaMask: Action Required\nDate: d\nMessage-ID: <5@uep.io>";
+    const r = evaluate(.{ .spf = .none, .dkim = .none, .dmarc = .none }, headers, "confirm your email\n", .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_SUBJECT_SPOOF") != null);
+}
+
+test "brand mentioned mid-subject is ordinary correspondence" {
+    const headers =
+        "From: Sam <sam@example.com>\n" ++
+        "Subject: Re: your Apple Developer agreement\nDate: d\nMessage-ID: <6@example.com>\n" ++
+        "In-Reply-To: <prev@example.com>";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, "signed it, thanks\n", .{});
+    try std.testing.expectEqual(Disposition.accept, r.disposition);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_SUBJECT_SPOOF") == null);
+}
+
+test "display name carrying the alarm instead of an identity is flagged" {
+    const headers =
+        "From: \"Payment Failed\" <billing@unrelated.example>\n" ++
+        "Subject: Notice\nDate: d\nMessage-ID: <7@unrelated.example>";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, "see attached\n", .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "DISPLAY_NAME_LURE") != null);
+}
+
+test "an ordinary display name is not a lure" {
+    const headers =
+        "From: Turo Support <support@turo.com>\n" ++
+        "Subject: Your support call\nDate: d\nMessage-ID: <8@turo.com>\n" ++
+        "In-Reply-To: <prev@turo.com>";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, "thanks for calling\n", .{});
+    try std.testing.expectEqual(@as(f32, 0), r.score);
+}
+
+test "sender in a reserved TLD is flagged" {
+    const headers =
+        "From: Your domain has expired <contact@dcitsaqgvi.local>\n" ++
+        "Subject: Notice\nDate: d\nMessage-ID: <9@dcitsaqgvi.local>";
+    const r = evaluate(.{ .spf = .temperror, .dkim = .neutral, .dmarc = .temperror }, headers, "hello\n", .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "SENDER_BOGUS_TLD") != null);
+}
+
+test "a real TLD is not a reserved TLD" {
+    const headers =
+        "From: Alice <alice@localhost-services.com>\n" ++
+        "Subject: Hi\nDate: d\nMessage-ID: <10@localhost-services.com>";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, "hello\n", .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "SENDER_BOGUS_TLD") == null);
+}
+
+test "base64 body cannot hide a brand link mismatch" {
+    const headers =
+        "From: Your domain has expired <info@compromised.example>\n" ++
+        "Subject: Namecheap\nDate: d\nMessage-ID: <11@compromised.example>\n" ++
+        "Content-Type: multipart/alternative; boundary=\"b\"";
+    const body =
+        "--b\n" ++
+        "Content-Type: text/html; charset=\"utf-8\"\n" ++
+        "Content-Transfer-Encoding: base64\n" ++
+        "\n" ++
+        // "<a href=\"https://namecheap-renew.attacker.example/\">renew</a>"
+        "PGEgaHJlZj0iaHR0cHM6Ly9uYW1lY2hlYXAtcmVuZXcuYXR0YWNrZXIuZXhhbXBsZS8iPnJlbmV3PC9hPg==\n" ++
+        "--b--\n";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_LINK_MISMATCH") != null);
 }
