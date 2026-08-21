@@ -12,7 +12,17 @@
 set -euo pipefail
 
 TARGET="${1:?usage: deploy-native.sh root@HOST}"
-ZIG_VER="${ZIG_VERSION:-0.16.0}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The toolchain is pinned in pantry.jsonc; pantry spells the build metadata
+# separator as `_`, ziglang.org as `+`. Read the pin rather than hardcoding it
+# so the host never builds with a toolchain the repo has moved off.
+ZIG_VER="${ZIG_VERSION:-$(sed -n 's/.*"ziglang.org"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO_ROOT/pantry.jsonc" | head -1 | tr '_' '+')}"
+: "${ZIG_VER:?could not read the ziglang.org pin from pantry.jsonc}"
+# Tagged releases live under /download/<ver>/, nightlies under /builds/.
+case "$ZIG_VER" in
+  *-dev*) ZIG_URL="https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VER}.tar.xz" ;;
+  *)      ZIG_URL="https://ziglang.org/download/${ZIG_VER}/zig-x86_64-linux-${ZIG_VER}.tar.xz" ;;
+esac
 REMOTE_DIR=/root/mailbuild
 
 echo "==> shipping source to $TARGET:$REMOTE_DIR"
@@ -23,13 +33,17 @@ tar czf - --exclude='.zig-cache' --exclude='zig-out' --exclude='*.log' \
 echo "==> building on host (zig $ZIG_VER, native linux)"
 ssh "$TARGET" "bash -s" <<REMOTE
 set -euo pipefail
-cd $REMOTE_DIR
-if [ ! -x zigdist/zig ]; then
-  curl -fsSL "https://ziglang.org/download/${ZIG_VER}/zig-x86_64-linux-${ZIG_VER}.tar.xz" -o zig.tar.xz
-  rm -rf zigdist && mkdir zigdist && tar xJf zig.tar.xz -C zigdist --strip-components=1
+# Keyed by version and kept OUTSIDE \$REMOTE_DIR (which is wiped every deploy),
+# so the toolchain survives across deploys but a pin bump still refetches.
+ZIGDIST=/root/zigdist-${ZIG_VER}
+if [ ! -x "\$ZIGDIST/zig" ]; then
+  curl -fsSL "${ZIG_URL}" -o /root/zig.tar.xz
+  rm -rf "\$ZIGDIST" && mkdir -p "\$ZIGDIST"
+  tar xJf /root/zig.tar.xz -C "\$ZIGDIST" --strip-components=1
+  rm -f /root/zig.tar.xz
 fi
-cd packages/zig
-../../zigdist/zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
+cd $REMOTE_DIR/packages/zig
+"\$ZIGDIST/zig" build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
 test -x zig-out/bin/mail
 REMOTE
 
