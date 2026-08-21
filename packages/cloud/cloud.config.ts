@@ -183,15 +183,15 @@ const config: CloudConfig = {
       monitoring: deploymentProfile.monitoring,
       backups: { enabled: deploymentProfile.backups },
 
-      // Auto-updates are not configured here on purpose. Scheduling a tool's
-      // self-update is ts-cloud's job, not this file's — once the dependency
-      // carries `compute.appUpdates` (on ts-cloud main, unreleased at time of
-      // writing), this becomes:
-      //
-      //   appUpdates: [{ service: 'mail', binary: `${mailConfig.paths.installDir}/mail-server` }],
-      //
-      // and ts-cloud renders the service, timer and pause switch. Until then a
-      // running host gets the same units from `mail upgrade --install-timer`.
+      // Keep the instance on the latest release without anyone SSHing in.
+      // ts-cloud renders the systemd service, timer and pause switch from these
+      // two facts — no unit text belongs in this file. `mail upgrade` supplies
+      // the safety: it no-ops when already current, refuses to downgrade, and
+      // rolls back a binary that will not start, so the daily check only ever
+      // restarts the service when there is genuinely something new.
+      appUpdates: [
+        { service: 'mail', binary: `${mailConfig.paths.installDir}/mail-server` },
+      ],
     },
 
     email: {
