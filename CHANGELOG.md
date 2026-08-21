@@ -1,5 +1,28 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.4...v0.3.5)
+
+## ✨ Features
+
+- **upgrade**: verify the download against the release manifest ([ca5eb70](https://github.com/mail-os/mail/commit/ca5eb70)) _(by Chris <chris@stacksjs.com>)_
+- **cloud**: declare the mail binary as a self-updating tool ([1be05aa](https://github.com/mail-os/mail/commit/1be05aa)) _(by Chris <chris@stacksjs.com>)_
+
+## 🐛 Bug Fixes
+
+- **cloud**: stop a stray config.ts shadowing cloud.config.ts ([1c8541e](https://github.com/mail-os/mail/commit/1c8541e)) _(by Chris <chris@stacksjs.com>)_
+
+## ♻️ Code Refactoring
+
+- **cloud**: stop hand-writing the auto-update timer ([1f4518b](https://github.com/mail-os/mail/commit/1f4518b)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.5 ([a8f5695](https://github.com/mail-os/mail/commit/a8f5695)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.3...v0.3.4)
 
 ## ✨ Features
