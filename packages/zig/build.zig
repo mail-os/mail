@@ -141,6 +141,7 @@ pub fn build(b: *std.Build) void {
         "src/dkim_verify_test.zig",
         "src/domain_migrate_test.zig",
         "src/core/version.zig",
+        "src/upgrade_test.zig",
     };
 
     // RFC compliance tests
@@ -177,6 +178,9 @@ pub fn build(b: *std.Build) void {
         test_module.addImport("sqlite", sqlite_module);
         test_module.addImport("ascii-compat", ascii_compat_module);
         test_module.addImport("build-options", build_options_module);
+        // upgrade_test roots at src/ and reaches cli/upgrade.zig, which builds
+        // its command surface with zig-cli.
+        test_module.addImport("zig-cli", zig_cli_module);
         linkVendoredSqlite(test_module);
 
         const unit_tests = b.addTest(.{

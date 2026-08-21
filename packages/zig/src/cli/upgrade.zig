@@ -127,6 +127,70 @@ pub fn findAsset(allocator: std.mem.Allocator, release: *const Release) !?Asset 
     return null;
 }
 
+/// One entry of `release-manifest.json`, published alongside the binaries.
+pub const ManifestAsset = struct {
+    name: []const u8,
+    size: u64 = 0,
+    sha256: []const u8 = "",
+};
+
+/// The release manifest: what the build actually produced, and its digests.
+pub const ReleaseManifest = struct {
+    tag: []const u8 = "",
+    commit: []const u8 = "",
+    assets: []ManifestAsset = &[_]ManifestAsset{},
+};
+
+pub const MANIFEST_ASSET = "release-manifest.json";
+
+/// Digest the manifest claims for `asset_name`, or null when the manifest does
+/// not mention it (an older release, or a partially uploaded one).
+pub fn expectedSha256(manifest: *const ReleaseManifest, asset_name: []const u8) ?[]const u8 {
+    for (manifest.assets) |a| {
+        if (std.mem.eql(u8, a.name, asset_name)) {
+            return if (a.sha256.len == 64) a.sha256 else null;
+        }
+    }
+    return null;
+}
+
+pub fn parseManifest(allocator: std.mem.Allocator, json_body: []const u8) !std.json.Parsed(ReleaseManifest) {
+    return std.json.parseFromSlice(ReleaseManifest, allocator, json_body, .{
+        .ignore_unknown_fields = true,
+    });
+}
+
+/// Locate the manifest asset within a release.
+fn findManifestAsset(release: *const Release) ?Asset {
+    for (release.assets) |a| {
+        if (std.mem.eql(u8, a.name, MANIFEST_ASSET)) return a;
+    }
+    return null;
+}
+
+/// Lowercase hex SHA-256 of `bytes`. Split out from `sha256OfFile` so the
+/// digest and its encoding can be checked against published test vectors — an
+/// encoding bug here would silently compare two strings that never match, and
+/// the symptom would be "upgrades stopped working" long after the change.
+pub fn sha256Hex(bytes: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    var hex: [64]u8 = undefined;
+    const alphabet = "0123456789abcdef";
+    for (digest, 0..) |b, i| {
+        hex[i * 2] = alphabet[b >> 4];
+        hex[i * 2 + 1] = alphabet[b & 0x0f];
+    }
+    return hex;
+}
+
+/// Lowercase hex SHA-256 of a file's contents.
+fn sha256OfFile(allocator: std.mem.Allocator, path: []const u8) ![64]u8 {
+    const bytes = try fs_compat.readFileAlloc(allocator, path);
+    defer allocator.free(bytes);
+    return sha256Hex(bytes);
+}
+
 /// Parse the GitHub releases API response into Release records. The caller
 /// owns the returned Parsed result and must call .deinit() on it.
 pub fn parseReleases(allocator: std.mem.Allocator, json_body: []const u8) !std.json.Parsed([]Release) {
@@ -321,6 +385,49 @@ fn upgradeAction(ctx: *cli.BaseCommand.ParseContext) !void {
     if (!dl_result.success) {
         std.debug.print("Download failed: {s}\n", .{dl_result.stderr});
         return error.DownloadFailed;
+    }
+
+    // Verify the download against the digest the release itself published.
+    // A version string is a claim, not proof: today's incident had a binary
+    // self-reporting the right version that was not the released artifact at
+    // all. Checking the digest is what makes "running v0.3.4" mean the bytes
+    // this project built, rather than something of the same name.
+    if (findManifestAsset(release)) |manifest_asset| {
+        const manifest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ tmp_dir, MANIFEST_ASSET });
+        defer allocator.free(manifest_path);
+        var mdl = try execCommand(allocator, &[_][]const u8{
+            "curl", "-fSL", "--retry", "3", "-o", manifest_path, manifest_asset.browser_download_url,
+        });
+        defer freeExec(allocator, &mdl);
+        if (!mdl.success) {
+            std.debug.print("Could not fetch {s}; refusing to install an unverified binary.\n", .{MANIFEST_ASSET});
+            return error.ManifestUnavailable;
+        }
+        const body = try fs_compat.readFileAlloc(allocator, manifest_path);
+        defer allocator.free(body);
+        const parsed = parseManifest(allocator, body) catch {
+            std.debug.print("Could not parse {s}; refusing to install an unverified binary.\n", .{MANIFEST_ASSET});
+            return error.ManifestUnreadable;
+        };
+        defer parsed.deinit();
+
+        if (expectedSha256(&parsed.value, asset.name)) |want| {
+            const got = try sha256OfFile(allocator, zip_path);
+            if (!std.mem.eql(u8, want, &got)) {
+                std.debug.print(
+                    "Checksum mismatch for {s}:\n  expected {s}\n  got      {s}\nRefusing to install.\n",
+                    .{ asset.name, want, got },
+                );
+                return error.ChecksumMismatch;
+            }
+            std.debug.print("Verified {s} against the release manifest.\n", .{asset.name});
+        } else {
+            // Fail open only here: the manifest exists but predates this asset.
+            std.debug.print("No digest for {s} in {s}; installing unverified.\n", .{ asset.name, MANIFEST_ASSET });
+        }
+    } else {
+        // Releases published before the manifest existed still need to install.
+        std.debug.print("Release {s} publishes no {s}; installing unverified.\n", .{ release.tag_name, MANIFEST_ASSET });
     }
 
     const extract_dir = try std.fmt.allocPrint(allocator, "{s}/x", .{tmp_dir});
@@ -673,4 +780,86 @@ fn runSystemctl(allocator: std.mem.Allocator, argv: []const []const u8) bool {
     var result = execCommand(allocator, argv) catch return false;
     defer freeExec(allocator, &result);
     return result.success;
+}
+
+test "expectedSha256 finds the digest for an asset" {
+    const testing = std.testing;
+    const body =
+        \\{"schemaVersion":1,"repository":"mail-os/mail","tag":"v0.3.4",
+        \\ "commit":"abc","generatedAt":"2026-08-21T22:25:56.543Z",
+        \\ "assets":[
+        \\  {"name":"mail-aarch64-linux.zip","size":1,"sha256":"e842d619d938a76468434efc1038def6024dbea61a6a66f6795349e90a91dbb1"},
+        \\  {"name":"mail-x86_64-linux.zip","size":2,"sha256":"9a463bf1ede070de062948f04e4d48a71cc897e0181871bb77187ffc551eddc9"}]}
+    ;
+    const parsed = try parseManifest(testing.allocator, body);
+    defer parsed.deinit();
+
+    try testing.expectEqualStrings(
+        "9a463bf1ede070de062948f04e4d48a71cc897e0181871bb77187ffc551eddc9",
+        expectedSha256(&parsed.value, "mail-x86_64-linux.zip").?,
+    );
+    try testing.expectEqualStrings("v0.3.4", parsed.value.tag);
+}
+
+test "expectedSha256 is null for an asset the manifest omits" {
+    const testing = std.testing;
+    const body =
+        \\{"tag":"v0.3.4","assets":[{"name":"other.zip","size":1,"sha256":"9a463bf1ede070de062948f04e4d48a71cc897e0181871bb77187ffc551eddc9"}]}
+    ;
+    const parsed = try parseManifest(testing.allocator, body);
+    defer parsed.deinit();
+    try testing.expect(expectedSha256(&parsed.value, "mail-x86_64-linux.zip") == null);
+}
+
+test "a truncated digest is not accepted as a digest" {
+    // A malformed entry must read as "no digest published", never as a value to
+    // compare against — a short string would otherwise fail every comparison
+    // and make upgrades impossible, or worse be treated as a match elsewhere.
+    const testing = std.testing;
+    const body =
+        \\{"tag":"v0.3.4","assets":[{"name":"a.zip","size":1,"sha256":"9a463bf1"}]}
+    ;
+    const parsed = try parseManifest(testing.allocator, body);
+    defer parsed.deinit();
+    try testing.expect(expectedSha256(&parsed.value, "a.zip") == null);
+}
+
+test "manifest parsing ignores fields it does not model" {
+    const testing = std.testing;
+    const body =
+        \\{"schemaVersion":1,"repository":"mail-os/mail","tag":"v1.2.3","commit":"c",
+        \\ "generatedAt":"2026-01-01T00:00:00.000Z","extraFutureField":{"nested":true},
+        \\ "assets":[{"name":"a.zip","size":1,"sha256":"0000000000000000000000000000000000000000000000000000000000000000","unknown":1}]}
+    ;
+    const parsed = try parseManifest(testing.allocator, body);
+    defer parsed.deinit();
+    try testing.expectEqualStrings("v1.2.3", parsed.value.tag);
+    try testing.expectEqual(@as(usize, 1), parsed.value.assets.len);
+}
+
+test "sha256Hex matches the published FIPS-180-4 vectors" {
+    const testing = std.testing;
+    try testing.expectEqualStrings(
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        &sha256Hex(""),
+    );
+    try testing.expectEqualStrings(
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        &sha256Hex("abc"),
+    );
+}
+
+test "a tampered payload does not match the digest the manifest publishes" {
+    const testing = std.testing;
+    const body =
+        \\{"tag":"v0.3.4","assets":[{"name":"a.zip","size":3,
+        \\ "sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"}]}
+    ;
+    const parsed = try parseManifest(testing.allocator, body);
+    defer parsed.deinit();
+    const want = expectedSha256(&parsed.value, "a.zip").?;
+
+    try testing.expect(std.mem.eql(u8, want, &sha256Hex("abc")));
+    // One appended byte — the shape of a truncated or padded download.
+    try testing.expect(!std.mem.eql(u8, want, &sha256Hex("abcX")));
 }
