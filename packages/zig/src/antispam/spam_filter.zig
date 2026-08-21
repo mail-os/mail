@@ -509,6 +509,33 @@ fn decodeBase64Parts(window: []const u8, out: []u8) []const u8 {
     return out[0..out_len];
 }
 
+/// Decode a body that is base64 in its entirety — a single-part message whose
+/// *message-level* `Content-Transfer-Encoding` is base64. `decodeBase64Parts`
+/// only recognises a part header found inside the body, so without this a
+/// sender skips MIME altogether and every body heuristic goes blind: the scan
+/// window holds nothing but an unbroken run of base64.
+fn decodeBase64Blob(window: []const u8, out: []u8) []const u8 {
+    var collected: [12288]u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, window, '\n');
+    outer: while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        for (line) |ch| {
+            const ok = std.ascii.isAlphanumeric(ch) or ch == '+' or ch == '/' or ch == '=';
+            if (!ok or n >= collected.len) break :outer;
+            collected[n] = ch;
+            n += 1;
+        }
+    }
+    n -= n % 4; // drop a trailing partial quantum (window cut mid-line)
+    if (n == 0) return out[0..0];
+    const dec_len = std.base64.standard.Decoder.calcSizeForSlice(collected[0..n]) catch return out[0..0];
+    if (dec_len > out.len) return out[0..0];
+    std.base64.standard.Decoder.decode(out[0..dec_len], collected[0..n]) catch return out[0..0];
+    return out[0..dec_len];
+}
+
 /// Decode RFC 2047 encoded-words ("=?utf-8?B?...?=" / "=?utf-8?Q?...?=") so
 /// subject heuristics see the text the recipient sees. Spam leans on encoded
 /// subjects precisely because naive filters skip them. Plain subjects are
@@ -769,7 +796,16 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
     var b64_text_buf: [12288]u8 = undefined;
     const scan_qp = decodeQuotedPrintable(scan_body, &qp_buf);
     const scan_text = stripHtmlText(scan_qp, &text_buf);
-    const b64_part = decodeBase64Parts(scan_body, &b64_buf);
+    // A single-part base64 body is decoded whole; anything else is searched for
+    // base64 MIME parts. The blob decoder yields nothing on a multipart body
+    // (it stops at the first `-` of the boundary), so falling through covers a
+    // message that declares base64 at the top level and then nests parts.
+    const cte_base64 = if (headerValue(headers, "Content-Transfer-Encoding")) |cte|
+        ascii_compat.indexOfIgnoreCase(cte, "base64") != null
+    else
+        false;
+    var b64_part: []const u8 = if (cte_base64) decodeBase64Blob(scan_body, &b64_buf) else &.{};
+    if (b64_part.len == 0) b64_part = decodeBase64Parts(scan_body, &b64_buf);
     const b64_text = if (b64_part.len > 0) stripHtmlText(b64_part, &b64_text_buf) else b64_part;
 
     const Scan = struct {
@@ -1852,4 +1888,25 @@ test "base64 body cannot hide a brand link mismatch" {
         "--b--\n";
     const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
     try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_LINK_MISMATCH") != null);
+}
+
+test "a single-part base64 body is decoded" {
+    // No MIME parts at all: the message-level Content-Transfer-Encoding is
+    // base64, so the whole body is one opaque run. Skipping MIME is the
+    // cheapest way to blind a body scanner.
+    const headers =
+        "From: Your domain has expired <info@compromised.example>\n" ++
+        "Subject: Porkbun\n" ++
+        "Date: d\nMessage-ID: <12@compromised.example>\n" ++
+        "MIME-Version: 1.0\n" ++
+        "Content-Type: text/html; charset=\"utf-8\"\n" ++
+        "Content-Transfer-Encoding: base64";
+    // "<p>Your domain has expired. <a href=\"https://porkbun-renew.evil.example/\">Renew</a></p>"
+    const body =
+        "PHA+WW91ciBkb21haW4gaGFzIGV4cGlyZWQuIDxhIGhyZWY9Imh0dHBzOi8vcG9ya2J1bi1yZW5l\n" ++
+        "dy5ldmlsLmV4YW1wbGUvIj5SZW5ldzwvYT48L3A+\n";
+    const r = evaluate(.{ .spf = .pass, .dkim = .pass, .dmarc = .pass }, headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "BRAND_LINK_MISMATCH") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.tests(), "EXPIRY_BRAND_PHISH") != null);
+    try std.testing.expectEqual(Disposition.reject, r.disposition);
 }
