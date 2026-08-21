@@ -33,6 +33,9 @@ fn currentTimestamp() i64 {
 pub const CalDavConfig = struct {
     port: u16 = 8008,
     ssl_port: u16 = 8443,
+    /// Interface to bind. See {@link ImapConfig.bind_host} for why the default
+    /// is every interface and when to narrow it.
+    bind_host: []const u8 = "0.0.0.0",
     enable_ssl: bool = true,
     max_connections: usize = 100,
     connection_timeout_seconds: u64 = 300,
@@ -2138,7 +2141,7 @@ pub const CalDavServer = struct {
 
     /// Start the CalDAV/CardDAV server
     pub fn start(self: *CalDavServer) !void {
-        const address = try socket.Address.parseIp("0.0.0.0", self.config.port);
+        const address = try socket.Address.parseIp(self.config.bind_host, self.config.port);
         self.listener = try socket.Server.listen(address, .{
             .reuse_address = true,
         });
@@ -2188,7 +2191,7 @@ pub const CalDavServer = struct {
 
     /// Start the SSL listener (runs in separate thread)
     fn startSslListener(self: *CalDavServer) void {
-        const ssl_address = socket.Address.parseIp("0.0.0.0", self.config.ssl_port) catch |err| {
+        const ssl_address = socket.Address.parseIp(self.config.bind_host, self.config.ssl_port) catch |err| {
             logger.err("Failed to parse CalDAV SSL address: {}", .{err});
             return;
         };

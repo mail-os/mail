@@ -47,6 +47,30 @@ var reload_requested = std.atomic.Value(bool).init(false);
 // Global reload manager pointer for callback
 var global_reload_manager: ?*hot_reload.HotReloadManager = null;
 
+/// Read an environment variable as an on/off flag, or `null` when it is unset.
+///
+/// `null` is the point of it. A caller can then say "unset means default to X"
+/// without conflating that with an explicit `false` — which is the bug this
+/// replaced: `env.get("IMAP_ENABLED") != null` treated *every* value as yes, so
+/// `IMAP_ENABLED=0` switched IMAP on and there was no way to switch it off.
+///
+/// `0`, `false`, `no` and `off` are false; anything else present is true, so a
+/// variable set to a version string or a path still reads as "on" the way the
+/// old check did.
+fn envFlag(name: [*:0]const u8) ?bool {
+    const value = env.get(name) orelse return null;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+
+    if (trimmed.len == 0) return null;
+
+    if (std.mem.eql(u8, trimmed, "0") or
+        std.ascii.eqlIgnoreCase(trimmed, "false") or
+        std.ascii.eqlIgnoreCase(trimmed, "no") or
+        std.ascii.eqlIgnoreCase(trimmed, "off")) return false;
+
+    return true;
+}
+
 fn reloadConfigCallback() void {
     if (global_reload_manager) |manager| {
         _ = manager.checkAndReload(&reload_requested);
@@ -159,7 +183,17 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     var db_ptr: ?*database.Database = null;
     var auth_ptr: ?*auth.AuthBackend = null;
 
-    if (cfg.enable_auth) {
+    // The database and auth backend exist whenever *anything* needs them, and
+    // the webmail client does: it reads mailboxes through the database and
+    // authenticates sessions through the backend. Gating them on `enable_auth`
+    // alone meant a server with webmail on and SMTP AUTH off logged
+    // "Webmail enabled but auth/database are not — skipping webmail server"
+    // and then served no webmail at all, having reported itself started.
+    //
+    // That combination is not exotic. It is exactly a development mail catcher:
+    // no SMTP AUTH, because there are no accounts to authenticate, and a
+    // webmail UI, because reading the caught mail is the entire point.
+    if (cfg.enable_auth or cfg.enable_webmail) {
         const db_path = env.get("SMTP_DB_PATH") orelse "./smtp.db";
         log.info("Initializing database at: {s}", .{db_path});
 
@@ -177,6 +211,28 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
             log.info("Bare mailbox logins use the configured default domain", .{});
         }
         auth_ptr = &auth_backend.?;
+
+        // A trap needs one account, or its webmail has a login page and nothing
+        // that gets past it — which is a catcher that catches mail nobody can
+        // read. Created once, only when absent, and only in catch_all mode:
+        // this must never invent an account on a real server.
+        //
+        // The password is fixed and printed rather than generated. A trap is
+        // loopback-only by construction (see Config.validate), so the secret
+        // protects nothing, and a generated one would have to be fished out of
+        // a log every time the container restarted.
+        if (cfg.catch_all) {
+            const exists = auth_ptr.?.db.userExists(cfg.catch_all_mailbox) catch false;
+            if (!exists) {
+                const email = std.fmt.allocPrint(allocator, "{s}@{s}", .{ cfg.catch_all_mailbox, cfg.hostname }) catch null;
+                defer if (email) |e| allocator.free(e);
+                if (auth_ptr.?.createUser(cfg.catch_all_mailbox, "dev", email orelse cfg.catch_all_mailbox)) |_| {
+                    log.info("Trap mailbox created: sign in to webmail as '{s}' with the password 'dev'", .{cfg.catch_all_mailbox});
+                } else |err| {
+                    log.err("Could not create the trap mailbox '{s}': {s}", .{ cfg.catch_all_mailbox, @errorName(err) });
+                }
+            }
+        }
 
         log.info("Database-backed authentication enabled", .{});
     } else {
@@ -501,7 +557,14 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     // Initialize IMAP server if auth is enabled
     var imap_server: ?imap.ImapServer = null;
     var imap_thread: ?std.Thread = null;
-    const enable_imap = env.get("IMAP_ENABLED") != null or cfg.enable_auth;
+    // `IMAP_ENABLED=0` used to *enable* IMAP: the test was `!= null`, so any
+    // value at all — including the one somebody sets to turn it off — read as
+    // yes. It is parsed as a boolean now, and defaults to whether this server
+    // has SMTP AUTH, which is the closest thing to "this server has accounts".
+    //
+    // Deliberately not `or cfg.enable_webmail`: a catcher that starts a database
+    // so its UI can read mail must not thereby publish an IMAP server.
+    const enable_imap = envFlag("IMAP_ENABLED") orelse cfg.enable_auth;
     const imap_port: u16 = blk: {
         const port_str = env.get("IMAP_PORT") orelse "143";
         break :blk std.fmt.parseInt(u16, port_str, 10) catch 143;
@@ -511,6 +574,11 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         const imap_config = imap.ImapConfig{
             .port = imap_port,
             .ssl_port = 993,
+            // The interface SMTP was told to use. A server told to bind
+            // 127.0.0.1 meant it, and an IMAP listener that ignored that and
+            // took 0.0.0.0 published mailboxes to the local network from a
+            // process the operator had confined to loopback.
+            .bind_host = cfg.host,
             .enable_ssl = cfg.enable_tls,
             .max_connections = @intCast(cfg.max_connections),
             .cert_path = cfg.tls_cert_path,
@@ -532,7 +600,8 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     var caldav_store_inst: ?caldav_store_mod.CalDavStore = null;
     var caldav_server: ?caldav.CalDavServer = null;
     var caldav_thread: ?std.Thread = null;
-    const enable_caldav = env.get("CALDAV_ENABLED") != null or cfg.enable_auth;
+    // Same defect, same fix. See `enable_imap` above.
+    const enable_caldav = envFlag("CALDAV_ENABLED") orelse cfg.enable_auth;
     const caldav_port: u16 = blk: {
         const port_str = env.get("CALDAV_PORT") orelse "80";
         break :blk std.fmt.parseInt(u16, port_str, 10) catch 80;
@@ -560,6 +629,9 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         const caldav_config = caldav.CalDavConfig{
             .port = caldav_port,
             .ssl_port = caldav_ssl_port,
+            // Same reason as IMAP above: honour the interface the server was
+            // told to bind rather than publishing calendars on every one.
+            .bind_host = cfg.host,
             .enable_ssl = cfg.enable_tls,
             .max_connections = @intCast(cfg.max_connections),
             .cert_path = cfg.tls_cert_path,

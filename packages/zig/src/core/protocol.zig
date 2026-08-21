@@ -2031,7 +2031,13 @@ pub const Session = struct {
                     (ab.db.userExists(rcpt) catch false)
                 else
                     false;
-                const username = if (is_isolated) rcpt else aliases.resolve(raw_local);
+                // A trap files everything into one mailbox, whoever it was
+                // addressed to. That is what makes it readable: a developer
+                // wants the list of what the application just sent, not a
+                // mailbox per fixture address. See `Config.catch_all_mailbox`.
+                const username = if (self.config.catch_all)
+                    self.config.catch_all_mailbox
+                else if (is_isolated) rcpt else aliases.resolve(raw_local);
 
                 const new_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ username, sub });
                 defer self.allocator.free(new_dir);

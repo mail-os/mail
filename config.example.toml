@@ -16,6 +16,16 @@ hostname = "mail.example.com"
 # host mailboxes for multiple domains. Also via SMTP_LOCAL_DOMAINS env.
 # local_domains = "example.org, another.com"
 
+# Trap mode, for local development: accept mail for EVERY domain, deliver none
+# of it onward, and file all of it into one mailbox you can read in webmail.
+# This is what replaces mailpit/Mailhog - same binary, same parser, same UI as
+# production, minus the delivery.
+#
+# The server refuses to start with this on unless `host` is a loopback address:
+# a machine that accepts mail for every domain and stores it must not be
+# reachable from anywhere but itself. Also via SMTP_CATCH_ALL=1.
+# catch_all = false
+
 # Connection limits
 max_connections = 1000
 max_message_size = 26214400  # 25MB

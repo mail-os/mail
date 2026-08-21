@@ -68,6 +68,11 @@ fn isSafeMailboxName(raw: []const u8) bool {
 pub const ImapConfig = struct {
     port: u16 = 143,
     ssl_port: u16 = 993,
+    /// Interface to bind. Defaults to every interface, which is what a mail
+    /// server wants — a client connects from another machine by definition.
+    /// A server confined to one host (a development catcher, a box behind a
+    /// proxy that terminates TLS) passes its own bind address here instead.
+    bind_host: []const u8 = "0.0.0.0",
     enable_ssl: bool = true,
     max_connections: usize = 100,
     connection_timeout_seconds: u64 = 300,
@@ -4120,7 +4125,7 @@ pub const ImapServer = struct {
 
     /// Start the IMAP server (plain text on port 143)
     pub fn start(self: *ImapServer) !void {
-        const address = try socket.Address.parseIp("0.0.0.0", self.config.port);
+        const address = try socket.Address.parseIp(self.config.bind_host, self.config.port);
         self.listener = try socket.Server.listen(address, .{
             .reuse_address = true,
         });
@@ -4162,7 +4167,7 @@ pub const ImapServer = struct {
 
     /// Start the IMAPS listener on port 993 (runs in separate thread)
     fn startImapsListener(self: *ImapServer) void {
-        const ssl_address = socket.Address.parseIp("0.0.0.0", self.config.ssl_port) catch |err| {
+        const ssl_address = socket.Address.parseIp(self.config.bind_host, self.config.ssl_port) catch |err| {
             logger.err("Failed to parse IMAPS address: {}", .{err});
             return;
         };

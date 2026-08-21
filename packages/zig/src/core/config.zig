@@ -19,6 +19,7 @@ pub const ValidationError = error{
     TLSCertificateNotFound,
     TLSKeyNotFound,
     InvalidHostnameFormat,
+    CatchAllNotLoopback,
 };
 
 pub const DeliveryMethod = enum {
@@ -51,6 +52,29 @@ pub const Config = struct {
     /// beyond `hostname` and its parent domain. Lets one mail server host
     /// mailboxes for multiple domains (e.g. "example.org, another.com").
     extra_local_domains: ?[]const u8 = null,
+    /// Trap mode: treat EVERY domain as local, so nothing is ever relayed and
+    /// every message is delivered into a mailbox here.
+    ///
+    /// This is what a development mail catcher is. An application under test
+    /// sends to whatever addresses its fixtures contain, and a server that
+    /// answered "550 relay access denied" to all of them would be a trap that
+    /// catches nothing — which is exactly what happens without this, because
+    /// unauthenticated mail to a non-local domain is (correctly) refused.
+    ///
+    /// **Never enable this on a server reachable from the internet.** A machine
+    /// that accepts mail for every domain and delivers it locally is an open
+    /// relay's more embarrassing cousin: it does not forward the spam, it files
+    /// it. `serve` refuses to start in this mode unless the listener is bound to
+    /// a loopback address.
+    catch_all: bool = false,
+    /// The single mailbox a trap files everything into. See `catch_all`.
+    ///
+    /// One inbox, deliberately, and it is what makes a trap readable. Delivering
+    /// by recipient would scatter a test run across a mailbox per address —
+    /// and worse, collapse `someone@a.test` and `someone@b.test` into one
+    /// anyway, because a recipient with no account is filed under its local
+    /// part. A developer wants the list of what the app just sent, in one place.
+    catch_all_mailbox: []const u8 = "dev",
     /// Domain appended to legacy bare usernames during authentication.
     /// Defaults to the parent of `hostname` (mail.example.com -> example.com).
     auth_default_domain: ?[]const u8 = null,
@@ -122,6 +146,11 @@ pub const Config = struct {
     /// `extra_local_domains`. Case-insensitive.
     pub fn isLocalDomain(self: Config, domain: []const u8) bool {
         if (domain.len == 0) return false;
+        // Trap mode: everything is local, so the RCPT gate accepts every
+        // recipient and delivery files every message into a mailbox rather than
+        // queueing it for the outside world. One flag, checked in the one
+        // function both of those decisions already go through.
+        if (self.catch_all) return true;
         if (std.ascii.eqlIgnoreCase(domain, self.hostname)) return true;
         if (std.mem.indexOf(u8, self.hostname, ".")) |dot_pos| {
             if (std.ascii.eqlIgnoreCase(domain, self.hostname[dot_pos + 1 ..])) return true;
@@ -134,6 +163,17 @@ pub const Config = struct {
             }
         }
         return false;
+    }
+
+    /// Whether a bind address reaches only this machine.
+    ///
+    /// `localhost` is included because that is what people type, and it cannot
+    /// resolve anywhere else in any configuration worth supporting.
+    fn isLoopbackHost(host: []const u8) bool {
+        return std.mem.eql(u8, host, "127.0.0.1") or
+            std.mem.eql(u8, host, "::1") or
+            std.ascii.eqlIgnoreCase(host, "localhost") or
+            std.mem.startsWith(u8, host, "127.");
     }
 
     /// Maildir subfolder that spam is delivered into. Defaults to "Junk".
@@ -171,6 +211,20 @@ pub const Config = struct {
         if (self.hostname.len == 0) {
             std.debug.print("Configuration Error: Hostname cannot be empty\n", .{});
             return ValidationError.InvalidHostname;
+        }
+
+        // A trap must never be reachable from anywhere but the machine running
+        // it. `catch_all` accepts mail for every domain and files it locally, so
+        // one bound to a public interface is a server that will happily receive
+        // and store the internet's mail for anybody's domain. Refused at start
+        // rather than logged: this is a mistake nobody notices from the outside.
+        if (self.catch_all and !isLoopbackHost(self.host)) {
+            std.debug.print(
+                "Configuration Error: catch_all is on but the server binds {s}. " ++
+                    "A catch-all accepts mail for every domain and must stay on 127.0.0.1 or ::1.\n",
+                .{self.host},
+            );
+            return ValidationError.CatchAllNotLoopback;
         }
 
         // Basic hostname format validation (no spaces, basic characters)
@@ -473,6 +527,9 @@ fn applyEnvironmentVariables(allocator: std.mem.Allocator, cfg: *Config) !void {
     }
 
     // SMTP_ENABLE_DNSBL
+    if (env.get("SMTP_CATCH_ALL")) |value| {
+        cfg.catch_all = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
     if (env.get("SMTP_ENABLE_DNSBL")) |value| {
         cfg.enable_dnsbl = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
     }
@@ -705,6 +762,9 @@ fn applyConfigFile(allocator: std.mem.Allocator, cfg: *Config, path: []const u8)
         if (server.getString("local_domains")) |value| {
             if (cfg.extra_local_domains) |old| allocator.free(old);
             cfg.extra_local_domains = try allocator.dupe(u8, value);
+        }
+        if (server.getBool("catch_all")) |value| {
+            cfg.catch_all = value;
         }
         if (server.getString("auth_default_domain")) |value| {
             if (cfg.auth_default_domain) |old| allocator.free(old);
