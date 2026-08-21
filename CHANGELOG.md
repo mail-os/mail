@@ -1,5 +1,20 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.3...v0.3.4)
+
+## ✨ Features
+
+- **upgrade**: make hosts keep themselves current ([f4ea081](https://github.com/mail-os/mail/commit/f4ea081)) _(by Chris <chris@stacksjs.com>)_
+- **cli**: report the version the build actually came from ([84464d1](https://github.com/mail-os/mail/commit/84464d1)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.4 ([f5ffde5](https://github.com/mail-os/mail/commit/f5ffde5)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.2...v0.3.3)
 
 ## ✨ Features
