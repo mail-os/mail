@@ -183,6 +183,15 @@ const config: CloudConfig = {
       monitoring: deploymentProfile.monitoring,
       backups: { enabled: deploymentProfile.backups },
 
+      // Auto-updates are not configured here on purpose. Scheduling a tool's
+      // self-update is ts-cloud's job, not this file's — once the dependency
+      // carries `compute.appUpdates` (on ts-cloud main, unreleased at time of
+      // writing), this becomes:
+      //
+      //   appUpdates: [{ service: 'mail', binary: `${mailConfig.paths.installDir}/mail-server` }],
+      //
+      // and ts-cloud renders the service, timer and pause switch. Until then a
+      // running host gets the same units from `mail upgrade --install-timer`.
     },
 
     email: {
@@ -700,27 +709,6 @@ systemctl enable --now mail-logrotate.timer
 echo "Starting mail server..."
 systemctl enable mail
 systemctl start mail
-
-# Keep the instance current on its own. The units are rendered by the binary
-# itself (\`mail upgrade --install-timer\`) rather than written out here, so an
-# already-running host and a freshly provisioned one get exactly the same
-# timer — there is no second copy of the unit text to drift.
-#
-# The daily run is a no-op unless a newer release exists, so the mail service is
-# only ever restarted when there is genuinely something to install; a new binary
-# that fails to start is rolled back to the previous one automatically. Pause it
-# with MAIL_UPGRADE_ENABLED=false in ${cfg.paths.configDir}/upgrade.env.
-echo "Enabling automatic updates..."
-cat > ${cfg.paths.configDir}/upgrade.env << 'UPGENVEOF'
-# Set to false to pause automatic updates without disabling the timer.
-MAIL_UPGRADE_ENABLED=true
-# Extra flags appended to the upgrade run (e.g. --repo owner/name).
-MAIL_UPGRADE_ARGS=
-UPGENVEOF
-chmod 644 ${cfg.paths.configDir}/upgrade.env
-${cfg.paths.installDir}/mail-server upgrade --install-timer \\
-  --path ${cfg.paths.installDir}/mail-server --service mail || \\
-  echo "WARNING: could not enable the auto-upgrade timer"
 
 # Wait for service to start
 sleep 5
