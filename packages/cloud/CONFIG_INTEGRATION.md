@@ -350,7 +350,7 @@ security: {
 ### Example 5: Use a Configuration Preset
 
 ```typescript
-import { config, presets } from '../config';
+import { config, presets } from '../presets';
 
 // Override with cost-optimized preset
 const envConfig = {

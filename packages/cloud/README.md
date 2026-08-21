@@ -270,7 +270,7 @@ All settings are defined in `config.ts`:
 Use pre-configured presets for common scenarios:
 
 ```typescript
-import { presets } from './config';
+import { presets } from './presets';
 
 // Cost-optimized (smaller instances)
 const devConfig = { ...getEnvironmentConfig('dev'), ...presets.costOptimized.dev };

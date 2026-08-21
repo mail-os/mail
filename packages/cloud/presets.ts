@@ -1,8 +1,11 @@
 /**
- * Centralized Configuration for SMTP Server Infrastructure
+ * Environment profiles and presets for the mail server's AWS infrastructure.
  *
- * Pure TypeScript configuration without CDK dependencies.
- * Used by cloud.config.ts for ts-cloud deployments.
+ * Deliberately NOT named `config.ts`: bunfig's discovery treats a bare
+ * `config.ts` as the package's configuration file and loads it in preference
+ * to `cloud.config.ts`. Because this file exports a `config` of an unrelated
+ * shape, that made `cloud generate` silently emit an empty template for the
+ * default project instead of the mail server's — with no error anywhere.
  */
 
 export type Environment = 'dev' | 'staging' | 'production'
