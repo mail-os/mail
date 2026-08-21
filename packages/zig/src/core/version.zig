@@ -1,18 +1,27 @@
 const std = @import("std");
+const build_options = @import("build-options");
 
-/// Central version management for the mail server
-/// This is the single source of truth for version information
-/// When bumping versions, update this file AND build.zig.zon
-/// Semantic version components
-pub const version_major: u32 = 0;
-pub const version_minor: u32 = 37;
-pub const version_patch: u32 = 0;
+/// Central version management for the mail server.
+///
+/// The version is NOT written here: it is threaded in from `build.zig.zon` via
+/// the `build-options` module, so there is exactly one place a release number
+/// lives and a binary can never misreport which release produced it. (This
+/// file previously hardcoded its own copy and had drifted to "0.37.0" against
+/// a real version of 0.3.x — the drift `mail upgrade` now depends on not
+/// happening, since it compares the compiled-in version against the release
+/// tag to decide whether an unattended update has anything to do.)
+/// Full version string, e.g. "0.3.3".
+pub const version: []const u8 = build_options.version;
 
-/// Full version string (matches build.zig.zon)
-pub const version = "0.37.0";
+/// Version with 'v' prefix for display.
+pub const version_display = "v" ++ version;
 
-/// Version with 'v' prefix for display
-pub const version_display = "v0.37.0";
+/// Semantic version components, parsed from `version` at comptime.
+const parsed_self = parseVersion(version) orelse
+    @compileError("build.zig.zon .version is not a parsable semver: " ++ version);
+pub const version_major: u32 = parsed_self.major;
+pub const version_minor: u32 = parsed_self.minor;
+pub const version_patch: u32 = parsed_self.patch;
 
 /// Application name
 pub const app_name = "SMTP Server";
@@ -87,6 +96,21 @@ pub fn compareVersions(a: []const u8, b: []const u8) ?VersionComparison {
     if (ver_a.patch > ver_b.patch) return .greater_than;
 
     return .equal;
+}
+
+/// True when two version spellings name the same release, tolerating the
+/// leading "v" of a git tag ("0.3.3" == "v0.3.3"). Compared as strings rather
+/// than parsed components so a prerelease ("v0.4.0-canary.1") is distinct from
+/// its stable counterpart — `mail upgrade` uses this to decide whether an
+/// unattended run can skip the download *and the service restart*.
+pub fn isSameRelease(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, stripTagPrefix(a), stripTagPrefix(b));
+}
+
+fn stripTagPrefix(s: []const u8) []const u8 {
+    const t = std.mem.trim(u8, s, " \t\r\n");
+    if (t.len > 0 and (t[0] == 'v' or t[0] == 'V')) return t[1..];
+    return t;
 }
 
 /// Check if a version is compatible (same major, >= minor.patch)
@@ -194,8 +218,39 @@ test "isCompatible" {
     try std.testing.expect(!isCompatible("0.28.0", "1.0.0"));
 }
 
-test "meetsMinimum" {
-    try std.testing.expect(meetsMinimum("0.1.0"));
-    try std.testing.expect(meetsMinimum("0.28.0"));
-    try std.testing.expect(!meetsMinimum("1.0.0"));
+test "meetsMinimum compares against the compiled-in version" {
+    // Phrased relative to `version` rather than a literal: the build's version
+    // comes from build.zig.zon and changes with every release.
+    try std.testing.expect(meetsMinimum("0.0.0"));
+    try std.testing.expect(meetsMinimum(version));
+    try std.testing.expect(!meetsMinimum("999.0.0"));
+}
+
+test "the compiled-in version is the one build.zig.zon declares" {
+    try std.testing.expect(parseVersion(version) != null);
+    try std.testing.expectEqual(version_major, parseVersion(version).?.major);
+    try std.testing.expectEqual(version_minor, parseVersion(version).?.minor);
+    try std.testing.expectEqual(version_patch, parseVersion(version).?.patch);
+    try std.testing.expectEqualStrings("v" ++ version, version_display);
+}
+
+test "isSameRelease tolerates the tag prefix but not a prerelease" {
+    try std.testing.expect(isSameRelease("0.3.3", "v0.3.3"));
+    try std.testing.expect(isSameRelease("v0.3.3", "0.3.3"));
+    try std.testing.expect(!isSameRelease("0.3.3", "v0.3.4"));
+    try std.testing.expect(!isSameRelease("0.3.3", "v0.3.3-canary.1"));
+}
+
+test "compareVersions tolerates a tag prefix on either side" {
+    // The upgrade command's downgrade guard compares the compiled-in version
+    // (bare) against a GitHub tag ("v0.3.2"), so the prefix must not matter.
+    try std.testing.expectEqual(VersionComparison.greater_than, compareVersions("0.3.3", "v0.3.2").?);
+    try std.testing.expectEqual(VersionComparison.less_than, compareVersions("0.3.3", "v0.4.0").?);
+    try std.testing.expectEqual(VersionComparison.equal, compareVersions("0.3.3", "v0.3.3").?);
+}
+
+test "a prerelease tag does not compare as a plain version" {
+    // parseVersion cannot read "0.4.0-canary.1", so the guard sees null and
+    // falls through rather than mistaking a canary for a downgrade.
+    try std.testing.expect(compareVersions("0.3.3", "v0.4.0-canary.1") == null);
 }

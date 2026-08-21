@@ -13,6 +13,8 @@ const search_mod = @import("cli/search.zig");
 const benchmark_mod = @import("cli/benchmark.zig");
 const backup_mod = @import("cli/backup.zig");
 const upgrade_mod = @import("cli/upgrade.zig");
+const version_mod = @import("cli/version.zig");
+const version = @import("core/version.zig");
 
 pub fn main(init: std.process.Init) !void {
     io_compat.initIo(init.io);
@@ -36,6 +38,7 @@ pub fn main(init: std.process.Init) !void {
     _ = try root_cmd.addCommand(try benchmark_mod.setup(allocator));
     _ = try root_cmd.addCommand(try backup_mod.setup(allocator));
     _ = try root_cmd.addCommand(try upgrade_mod.setup(allocator));
+    _ = try root_cmd.addCommand(try version_mod.setup(allocator));
 
     // Collect args (skip program name)
     var args_list: std.ArrayList([]const u8) = .empty;
@@ -50,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
     // Show help if no args provided
     if (args_list.items.len == 0) {
         var help = cli.Help.init(allocator);
-        try help.generate(root_cmd, "mail", "0.0.2");
+        try help.generate(root_cmd, "mail", version.version);
         return;
     }
 

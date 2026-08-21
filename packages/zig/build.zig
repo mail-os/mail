@@ -1,8 +1,32 @@
 const std = @import("std");
 
+/// The release version, read straight from build.zig.zon so there is exactly
+/// one place it lives. `scripts/release.ts` already bumps the .zon; deriving
+/// the compiled-in version from it means `mail version` can never drift from
+/// the tag that produced the binary — which is what `mail upgrade` compares
+/// against to decide whether an unattended update is needed at all.
+///
+/// Scraped from the source text rather than `@import`ed: a .zon import must
+/// model *every* field, which would couple this file to the dependency list
+/// and break the build each time a dependency is added.
+const release_version = blk: {
+    const src = @embedFile("build.zig.zon");
+    const at = std.mem.indexOf(u8, src, ".version") orelse
+        @compileError("build.zig.zon has no .version field");
+    const open = std.mem.indexOfScalarPos(u8, src, at, '"') orelse
+        @compileError("build.zig.zon .version is not a string");
+    const close = std.mem.indexOfScalarPos(u8, src, open + 1, '"') orelse
+        @compileError("build.zig.zon .version string is unterminated");
+    break :blk src[open + 1 .. close];
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const version_options = b.addOptions();
+    version_options.addOption([]const u8, "version", release_version);
+    const build_options_module = version_options.createModule();
 
     // Cross-compilation options
     const build_all_targets = b.option(bool, "all-targets", "Build for all supported platforms") orelse false;
@@ -46,7 +70,7 @@ pub fn build(b: *std.Build) void {
         };
 
         for (targets) |t| {
-            buildForTarget(b, t, optimize, zig_cli_module, search_engine_module, ascii_compat_module);
+            buildForTarget(b, t, optimize, zig_cli_module, search_engine_module, ascii_compat_module, build_options_module);
         }
     }
 
@@ -61,6 +85,7 @@ pub fn build(b: *std.Build) void {
     mail_module.addImport("zig-cli", zig_cli_module);
     mail_module.addImport("sqlite", sqlite_module);
     mail_module.addImport("ascii-compat", ascii_compat_module);
+    mail_module.addImport("build-options", build_options_module);
     linkVendoredSqlite(mail_module);
 
     const mail_exe = b.addExecutable(.{
@@ -115,6 +140,7 @@ pub fn build(b: *std.Build) void {
         "src/antispam/spam_filter.zig",
         "src/dkim_verify_test.zig",
         "src/domain_migrate_test.zig",
+        "src/core/version.zig",
     };
 
     // RFC compliance tests
@@ -150,6 +176,7 @@ pub fn build(b: *std.Build) void {
         test_module.addImport("search-engine", search_engine_module);
         test_module.addImport("sqlite", sqlite_module);
         test_module.addImport("ascii-compat", ascii_compat_module);
+        test_module.addImport("build-options", build_options_module);
         linkVendoredSqlite(test_module);
 
         const unit_tests = b.addTest(.{
@@ -172,6 +199,7 @@ pub fn build(b: *std.Build) void {
     mail_test_module.addImport("search-engine", search_engine_module);
     mail_test_module.addImport("sqlite", sqlite_module);
     mail_test_module.addImport("ascii-compat", ascii_compat_module);
+    mail_test_module.addImport("build-options", build_options_module);
 
     for (rfc_compliance_tests) |test_file| {
         const test_module = b.createModule(.{
@@ -238,6 +266,7 @@ fn buildForTarget(
     zig_cli_module: *std.Build.Module,
     search_engine_module: *std.Build.Module,
     ascii_compat_module: *std.Build.Module,
+    build_options_module: *std.Build.Module,
 ) void {
     const target_query = target.query;
     const triple = b.fmt("{s}-{s}", .{
@@ -263,6 +292,7 @@ fn buildForTarget(
     root_module.addImport("zig-cli", zig_cli_module);
     root_module.addImport("sqlite", sqliteModule(b, target, optimize));
     root_module.addImport("ascii-compat", ascii_compat_module);
+    root_module.addImport("build-options", build_options_module);
     linkVendoredSqlite(root_module);
 
     const exe = b.addExecutable(.{
