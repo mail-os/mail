@@ -1,7 +1,7 @@
 {
   "name": "mail-webmail",
   "type": "module",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Browser webmail client for the mail server (stx frontend)",
   "scripts": {
     "dev": "bun server.ts",

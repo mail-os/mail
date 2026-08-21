@@ -1,5 +1,24 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.2...v0.3.3)
+
+## ✨ Features
+
+- **antispam**: catch brand-impersonation phishing ([f96fb52](https://github.com/mail-os/mail/commit/f96fb52)) _(by Chris <chris@stacksjs.com>)_
+
+## 🐛 Bug Fixes
+
+- **deploy**: build with the pinned toolchain ([96df47b](https://github.com/mail-os/mail/commit/96df47b)) _(by Chris <chris@stacksjs.com>)_
+- **antispam**: decode a single-part base64 body ([65115e7](https://github.com/mail-os/mail/commit/65115e7)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.3 ([a895bbe](https://github.com/mail-os/mail/commit/a895bbe)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.1...v0.3.2)
 
 ## ✨ Features
