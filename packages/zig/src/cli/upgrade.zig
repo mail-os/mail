@@ -16,6 +16,8 @@ const std = @import("std");
 const cli = @import("zig-cli");
 const io_compat = @import("../core/io_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
+const fs_compat = @import("../core/fs_compat.zig");
+const ver = @import("../core/version.zig");
 const builtin = @import("builtin");
 
 const DEFAULT_REPO = "mail-os/mail";
@@ -161,6 +163,15 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try cmd.addOption(
         cli.Option.init("check", "check", "Only report what would be installed", .bool),
     );
+    _ = try cmd.addOption(
+        cli.Option.init("force", "force", "Reinstall even when the resolved release is already installed", .bool),
+    );
+    _ = try cmd.addOption(
+        cli.Option.init("install-timer", "install-timer", "Install a systemd timer that runs this command daily", .bool),
+    );
+    _ = try cmd.addOption(
+        cli.Option.init("uninstall-timer", "uninstall-timer", "Remove the systemd auto-upgrade timer", .bool),
+    );
 
     _ = cmd.setAction(upgradeAction);
     return cmd;
@@ -174,6 +185,19 @@ fn upgradeAction(ctx: *cli.BaseCommand.ParseContext) !void {
     const canary = ctx.hasOption("canary");
     const check_only = ctx.hasOption("check");
     const no_restart = ctx.hasOption("no-restart");
+    const force = ctx.hasOption("force");
+
+    // Managing the timer is a separate job from running an upgrade: it wires
+    // this same command into systemd so a host keeps itself current without
+    // anyone SSHing in. Handled before any network call.
+    if (ctx.hasOption("uninstall-timer")) return uninstallTimer(allocator);
+    if (ctx.hasOption("install-timer")) {
+        const target_path = ctx.getOption("path") orelse detectInstallPath() orelse {
+            std.debug.print("Could not locate the installed binary. Pass --path explicitly.\n", .{});
+            return error.MissingInstallPath;
+        };
+        return installTimer(allocator, target_path, service, canary);
+    }
 
     // Resolve an explicit --version to the canonical tag spelling.
     var wanted_tag: ?[]const u8 = null;
@@ -229,9 +253,38 @@ fn upgradeAction(ctx: *cli.BaseCommand.ParseContext) !void {
     };
 
     std.debug.print("Resolved {s} ({s}) -> {s}\n", .{ release.tag_name, channel, asset.name });
+
+    // Already on this release: do nothing. This is what makes the command safe
+    // to run unattended on a timer — without it every tick would re-download
+    // the same binary and, far worse, restart a live mail server for nothing.
+    // --force still allows a deliberate reinstall over a corrupt binary.
+    const already_current = ver.isSameRelease(ver.version, release.tag_name);
+    if (already_current and !force) {
+        std.debug.print("Already running {s}; nothing to do.\n", .{ver.version_display});
+        return;
+    }
+    // Never move backwards on an unattended run. A yanked release, or a
+    // releases list that briefly omits the newest tag, would otherwise have the
+    // timer quietly downgrade a live server. A deliberate rollback is still
+    // available via --version (or --force).
+    if (wanted_tag == null and !force and
+        ver.compareVersions(ver.version, release.tag_name) == .greater_than)
+    {
+        std.debug.print(
+            "Resolved {s} is older than the installed {s}; refusing to downgrade (use --version {s} to force one).\n",
+            .{ release.tag_name, ver.version_display, release.tag_name },
+        );
+        return;
+    }
+
     if (check_only) {
         std.debug.print("{s}\n", .{asset.browser_download_url});
         return;
+    }
+    if (already_current) {
+        std.debug.print("Reinstalling {s} (--force).\n", .{ver.version_display});
+    } else {
+        std.debug.print("Upgrading {s} -> {s}\n", .{ ver.version_display, release.tag_name });
     }
 
     // ------------------------------------------------------------------
@@ -323,6 +376,17 @@ fn upgradeAction(ctx: *cli.BaseCommand.ParseContext) !void {
     var chmod2_result = try execCommand(allocator, &[_][]const u8{ "chmod", "755", staged_path });
     defer freeExec(allocator, &chmod2_result);
 
+    // Run the staged binary before it becomes the installed one. A download
+    // that is truncated, built for the wrong libc, or simply not executable
+    // fails here — while the working binary is still in place — instead of
+    // taking the service down on restart.
+    if (!verifyBinary(allocator, staged_path)) {
+        std.debug.print("Staged binary at {s} does not run; keeping the current install.\n", .{staged_path});
+        var rm_staged = execCommand(allocator, &[_][]const u8{ "rm", "-f", staged_path }) catch null;
+        if (rm_staged) |*r| freeExec(allocator, r);
+        return error.StagedBinaryUnusable;
+    }
+
     var mv_result = try execCommand(allocator, &[_][]const u8{ "mv", "-f", staged_path, target });
     defer freeExec(allocator, &mv_result);
     if (!mv_result.success) {
@@ -346,27 +410,46 @@ fn upgradeAction(ctx: *cli.BaseCommand.ParseContext) !void {
         std.debug.print("Skipping service restart (--no-restart).\n", .{});
         return;
     }
-    restartService(allocator, service);
+    if (!restartService(allocator, service) and had_existing) {
+        std.debug.print("Rolling back to the previous binary.\n", .{});
+        var restore = execCommand(allocator, &[_][]const u8{ "cp", "-p", backup_path, target }) catch null;
+        if (restore) |*r| freeExec(allocator, r);
+        _ = restartService(allocator, service);
+        return error.UpgradeRolledBack;
+    }
 }
 
-fn restartService(allocator: std.mem.Allocator, service: []const u8) void {
+/// Run `<path> version --short` to prove the binary is executable on this host.
+/// Any spawn failure or non-zero exit means "do not install this".
+fn verifyBinary(allocator: std.mem.Allocator, path: []const u8) bool {
+    var result = execCommand(allocator, &[_][]const u8{ path, "version", "--short" }) catch return false;
+    defer freeExec(allocator, &result);
+    if (!result.success) return false;
+    // A release old enough to predate `mail version` still exits non-zero
+    // above, so reaching here means the new binary answered.
+    return ver.parseVersion(std.mem.trim(u8, result.stdout, " \t\r\n")) != null;
+}
+
+/// Returns true when the service is running afterwards (or when there is no
+/// service to manage). False means the caller should roll back.
+fn restartService(allocator: std.mem.Allocator, service: []const u8) bool {
     // Probe systemctl by invoking it directly: `command -v` is a shell
     // builtin and cannot be exec'd without a shell. A spawn failure here
     // means systemctl is absent (e.g. macOS or a minimal container).
     var active_result = execCommand(allocator, &[_][]const u8{ "systemctl", "is-active", "--quiet", service }) catch {
         std.debug.print("systemctl not available; restart the service manually.\n", .{});
-        return;
+        return true;
     };
     const is_active = active_result.success;
     freeExec(allocator, &active_result);
     if (!is_active) {
         std.debug.print("Service {s} is not active; nothing to restart.\n", .{service});
-        return;
+        return true;
     }
 
     var restart_result = execCommand(allocator, &[_][]const u8{ "systemctl", "restart", service }) catch {
         std.debug.print("Failed to restart {s}; please restart it manually.\n", .{service});
-        return;
+        return false;
     };
     const ok = restart_result.success;
     const stderr_dupe = allocator.dupe(u8, restart_result.stderr) catch "";
@@ -374,9 +457,25 @@ fn restartService(allocator: std.mem.Allocator, service: []const u8) void {
     defer if (stderr_dupe.len > 0) allocator.free(stderr_dupe);
     if (!ok) {
         std.debug.print("Failed to restart {s}: {s}\n", .{ service, stderr_dupe });
-        return;
+        return false;
+    }
+
+    // `systemctl restart` returns as soon as the unit is started, not once it
+    // has survived startup. A binary that dies immediately (bad config, missing
+    // symbol) leaves the unit in auto-restart or failed a moment later, so give
+    // it a beat and re-check before declaring the upgrade good.
+    time_compat.sleep(3 * std.time.ns_per_s);
+    var recheck = execCommand(allocator, &[_][]const u8{ "systemctl", "is-active", "--quiet", service }) catch {
+        return false;
+    };
+    const still_up = recheck.success;
+    freeExec(allocator, &recheck);
+    if (!still_up) {
+        std.debug.print("Service {s} did not stay up after restart.\n", .{service});
+        return false;
     }
     std.debug.print("Service {s} restarted.\n", .{service});
+    return true;
 }
 
 /// Default install locations, first existing one wins. MAIL_SERVER_PATH
@@ -482,4 +581,96 @@ test "findAsset matches the platform asset" {
     const wanted = (try assetNameForPlatform(testing.allocator)).?;
     defer testing.allocator.free(wanted);
     try testing.expectEqualStrings(wanted, found.name);
+}
+
+// ============================================================================
+// Unattended operation: the systemd timer
+// ============================================================================
+
+const TIMER_UNIT = "/etc/systemd/system/mail-upgrade.timer";
+const SERVICE_UNIT = "/etc/systemd/system/mail-upgrade.service";
+const UPGRADE_ENV = "/etc/mail/upgrade.env";
+
+/// Render `mail-upgrade.{service,timer}` and enable them, so the host checks
+/// for a new release once a day and installs it on its own.
+///
+/// The daily run is a no-op unless a *new* release exists (see the
+/// already-current check in `upgradeAction`), so a live mail server is only
+/// ever restarted when there is genuinely something new — and if the new
+/// binary fails to come up, `upgradeAction` restores the backup itself.
+fn installTimer(allocator: std.mem.Allocator, target: []const u8, service: []const u8, canary: bool) !void {
+    const channel_args: []const u8 = if (canary) " --canary" else "";
+
+    const service_unit = try std.fmt.allocPrint(allocator,
+        \\[Unit]
+        \\Description=Check for and install mail server updates
+        \\Documentation=https://github.com/{s}
+        \\After=network-online.target
+        \\Wants=network-online.target
+        \\
+        \\[Service]
+        \\Type=oneshot
+        \\# Set MAIL_UPGRADE_ENABLED=false here to pause auto-updates without
+        \\# disabling the timer (survives a reinstall of these units).
+        \\EnvironmentFile=-{s}
+        \\ExecStart=/bin/sh -c 'if [ "${{MAIL_UPGRADE_ENABLED:-true}}" != "true" ]; then echo "auto-upgrade disabled via {s}"; exit 0; fi; exec {s} upgrade --path {s} --service {s}{s} $MAIL_UPGRADE_ARGS'
+        \\
+    , .{ DEFAULT_REPO, UPGRADE_ENV, UPGRADE_ENV, target, target, service, channel_args });
+    defer allocator.free(service_unit);
+
+    const timer_unit =
+        \\[Unit]
+        \\Description=Daily mail server update check
+        \\
+        \\[Timer]
+        \\OnCalendar=daily
+        \\# Spread the GitHub API call across the day so a fleet of hosts does
+        \\# not stampede the releases endpoint at midnight, and Persistent so a
+        \\# host that was off still checks once it comes back.
+        \\RandomizedDelaySec=4h
+        \\Persistent=true
+        \\
+        \\[Install]
+        \\WantedBy=timers.target
+        \\
+    ;
+
+    try writeFile(SERVICE_UNIT, service_unit);
+    try writeFile(TIMER_UNIT, timer_unit);
+    std.debug.print("Wrote {s} and {s}\n", .{ SERVICE_UNIT, TIMER_UNIT });
+
+    if (!runSystemctl(allocator, &[_][]const u8{ "systemctl", "daemon-reload" })) {
+        std.debug.print("systemctl unavailable; units written but not enabled.\n", .{});
+        return;
+    }
+    if (!runSystemctl(allocator, &[_][]const u8{ "systemctl", "enable", "--now", "mail-upgrade.timer" })) {
+        std.debug.print("Failed to enable mail-upgrade.timer.\n", .{});
+        return error.TimerEnableFailed;
+    }
+    std.debug.print("Auto-upgrade enabled ({s} channel, daily). Pause it with MAIL_UPGRADE_ENABLED=false in {s}.\n", .{
+        if (canary) "canary" else "stable",
+        UPGRADE_ENV,
+    });
+}
+
+fn uninstallTimer(allocator: std.mem.Allocator) !void {
+    _ = runSystemctl(allocator, &[_][]const u8{ "systemctl", "disable", "--now", "mail-upgrade.timer" });
+    fs_compat.cwd().deleteFile(TIMER_UNIT) catch {};
+    fs_compat.cwd().deleteFile(SERVICE_UNIT) catch {};
+    _ = runSystemctl(allocator, &[_][]const u8{ "systemctl", "daemon-reload" });
+    std.debug.print("Auto-upgrade timer removed.\n", .{});
+}
+
+fn writeFile(path: []const u8, contents: []const u8) !void {
+    const file = try fs_compat.cwd().createFile(path, .{});
+    defer file.close();
+    try file.writeAll(contents);
+}
+
+/// Run a systemctl argv, reporting only whether it succeeded. A spawn failure
+/// (no systemd on this host) is a false, not an error.
+fn runSystemctl(allocator: std.mem.Allocator, argv: []const []const u8) bool {
+    var result = execCommand(allocator, argv) catch return false;
+    defer freeExec(allocator, &result);
+    return result.success;
 }
