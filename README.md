@@ -74,7 +74,7 @@ This is a monorepo managed by [pantry](https://github.com/stacksjs/pantry):
 │   │       ├── infrastructure/ # Cluster mode
 │   │       ├── api/          # REST API, webmail, swagger
 │   │       └── tools/        # SDK generator, migrations
-│   ├── ts/                   # TypeScript SDK
+│   ├── ts/                   # TypeScript SDK + MIME parser
 │   └── cloud/                # AWS deployment (ts-cloud)
 ├── docs/                     # Documentation
 ├── examples/                 # Usage examples

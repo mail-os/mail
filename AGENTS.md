@@ -25,7 +25,7 @@ mail/
 │   │   └── pantry/                   # Zig dependencies (zig-tls, zig-cli)
 │   ├── cloud/        # AWS infrastructure (ts-cloud / CloudFormation)
 │   │   └── cloud.config.ts           # EC2, SES, Route53, IAM config
-│   └── ts/           # TypeScript SDK (ts-mail)
+│   └── ts/           # TypeScript SDK (ts-mail) + MIME parser (src/mime, docs/MIME_PARSER.md)
 ├── pantry.jsonc       # Monorepo config (workspaces, scripts)
 └── docs/              # Architecture, security, protocol docs
 ```
