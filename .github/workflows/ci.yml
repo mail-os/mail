@@ -35,6 +35,29 @@ jobs:
     - name: Check formatting
       run: zig fmt --check src/
 
+  sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v6
+
+    - name: Setup project dependencies with Pantry
+      uses: pantry-pm/pantry/packages/action@v0.11.28
+
+    - name: Install workspace dependencies
+      run: bun install --frozen-lockfile
+
+    # Covers the MIME parser: its own behaviour suite plus the parity suites that
+    # compare it against postal-mime on well formed, malformed and mutated messages.
+    - name: Run SDK tests
+      working-directory: packages/ts
+      run: bun test
+
+    - name: Lint
+      run: bunx --bun pickier packages/ts
+
   build-docker:
     name: Build Docker Image
     runs-on: ubuntu-latest
