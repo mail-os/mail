@@ -7,6 +7,9 @@ on:
 
 permissions:
   contents: write
+  # npm mints the publish credential from this token, so the job needs it even
+  # though nothing in the workflow reads it directly.
+  id-token: write
 
 jobs:
   release:
@@ -71,16 +74,19 @@ jobs:
           ```
 
     - name: Publish the typed management client
-      env:
-        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      run: |
-        set -euo pipefail
-        # v0.2.0 burned 20 minutes of cross-compiling before dying here with
-        # ENEEDAUTH. Check the secret first so the failure names its own cause.
-        if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-          echo "::error::NPM_TOKEN is not set: the GitHub release was published, but @stacksjs/mail was not."
-          exit 1
-        fi
-        npm config set //registry.npmjs.org/:_authToken "$NODE_AUTH_TOKEN"
-        cd packages/ts
-        npm publish --access public
+      # Trusted publishing (OIDC), which is how every other @stacksjs package
+      # ships. A personal token published 0.3.5 and then stopped working: npm
+      # answers an unauthorized publish with `E404 ... PUT /@stacksjs%2fmail`,
+      # masking auth as "not found", so v0.3.7 cross-compiled for 21 minutes
+      # twice before dying on an error that never named its own cause. The
+      # credential now comes from the job's OIDC identity: nothing to expire,
+      # no secret to keep in sync, and no token to leak.
+      #
+      # NPM_TOKEN is deliberately NOT passed. pantry prefers the OIDC identity
+      # when id-token is available, and leaving the token out means a stale one
+      # can never quietly take the failing path again.
+      #
+      # The npm-side trusted publisher names THIS workflow's filename, so
+      # renaming this file breaks publishing until npm is updated to match.
+      working-directory: packages/ts
+      run: pantry publish --npm --access public
