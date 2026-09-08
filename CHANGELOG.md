@@ -1,5 +1,37 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.5...v0.3.6)
+
+## ✨ Features
+
+- **mime**: parse RFC 5322 messages in the TypeScript SDK ([a492ec4](https://github.com/mail-os/mail/commit/a492ec4)) _(by Chris <chris@stacksjs.com>)_
+
+## 🐛 Bug Fixes
+
+- **ts**: emit declarations for both build entry points ([ddcd71f](https://github.com/mail-os/mail/commit/ddcd71f)) _(by Chris <chris@stacksjs.com>)_
+
+## 📝 Documentation
+
+- **mime**: document the parser, its API and its benchmarks ([4274e37](https://github.com/mail-os/mail/commit/4274e37)) _(by Chris <chris@stacksjs.com>)_
+
+## ✅ Tests
+
+- **mime**: benchmark the parser against postal-mime ([8a6efb9](https://github.com/mail-os/mail/commit/8a6efb9)) _(by Chris <chris@stacksjs.com>)_
+- **mime**: pin behaviour and parity with postal-mime ([832d623](https://github.com/mail-os/mail/commit/832d623)) _(by Chris <chris@stacksjs.com>)_
+
+## 💚 Continuous Integration
+
+- run the TypeScript SDK tests ([5aa1fec](https://github.com/mail-os/mail/commit/5aa1fec)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.6 ([60284d6](https://github.com/mail-os/mail/commit/60284d6)) _(by Chris <chris@stacksjs.com>)_
+- **ts**: build and export the MIME parser ([f820956](https://github.com/mail-os/mail/commit/f820956)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.4...v0.3.5)
 
 ## ✨ Features
