@@ -1,5 +1,20 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.6...v0.3.7)
+
+## 🐛 Bug Fixes
+
+- **ts**: one generator run, and a dtsx binary that matches the pin ([3cb9aff](https://github.com/mail-os/mail/commit/3cb9aff)) _(by Chris <chris@stacksjs.com>)_
+- **deps**: repin zig to a dev build pantry actually mirrors ([e3438fb](https://github.com/mail-os/mail/commit/e3438fb)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.7 ([b45c3f1](https://github.com/mail-os/mail/commit/b45c3f1)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.5...v0.3.6)
 
 ## ✨ Features
