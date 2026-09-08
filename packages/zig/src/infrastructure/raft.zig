@@ -194,7 +194,7 @@ pub const RaftNode = struct {
             .config = config,
             .current_term = 0,
             .voted_for = null,
-            .log = .{ .items = &.{}, .capacity = 0 },
+            .log = .empty,
             .commit_index = 0,
             .last_applied = 0,
             .state = std.atomic.Value(RaftState).init(.follower),
@@ -641,7 +641,7 @@ pub const RaftNode = struct {
             0;
 
         // Collect entries to send
-        var entries_to_send: std.ArrayList(LogEntry) = .{ .items = &.{}, .capacity = 0 };
+        var entries_to_send: std.ArrayList(LogEntry) = .empty;
         defer entries_to_send.deinit(self.allocator);
 
         var i = peer.next_index;

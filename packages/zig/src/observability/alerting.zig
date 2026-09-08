@@ -242,9 +242,9 @@ pub const AlertManager = struct {
     pub fn init(allocator: std.mem.Allocator) AlertManager {
         return .{
             .allocator = allocator,
-            .channels = .{ .items = &.{}, .capacity = 0 },
-            .rules = .{ .items = &.{}, .capacity = 0 },
-            .history = .{ .items = &.{}, .capacity = 0 },
+            .channels = .empty,
+            .rules = .empty,
+            .history = .empty,
             .max_history = 1000,
             .mutex = .{},
             .stats = AlertStats{},
@@ -613,7 +613,7 @@ pub const AlertStats = struct {
 
 /// Create default alert rules for SMTP monitoring
 pub fn createDefaultRules(allocator: std.mem.Allocator) !std.ArrayList(AlertRule) {
-    var rules: std.ArrayList(AlertRule) = .{ .items = &.{}, .capacity = 0 };
+    var rules: std.ArrayList(AlertRule) = .empty;
 
     // High bounce rate
     try rules.append(allocator, .{

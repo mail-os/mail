@@ -27,7 +27,7 @@ pub const HotReloadManager = struct {
             .last_reload_time = time_compat.timestamp(),
             .reload_count = 0,
             .mutex = .{},
-            .callbacks = .{ .items = &.{}, .capacity = 0 },
+            .callbacks = .empty,
         };
     }
 
