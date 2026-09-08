@@ -80,6 +80,31 @@ jobs:
       working-directory: packages/webmail
       run: bun run build
 
+    # The image installs Zig itself, and its build context is packages/zig only,
+    # so the Dockerfile cannot read pantry.jsonc and carries its own copy of the
+    # pin. That copy went stale unnoticed — every other job moved to
+    # 0.17.0-dev.2033 while the image kept asking ziglang.org for a build it had
+    # already garbage-collected, and the only symptom was a 404 deep in a log.
+    # Compare them here so a repin that misses the Dockerfile fails on the
+    # mismatch rather than on whatever breaks weeks later.
+    - name: Check the Dockerfile's Zig pin matches pantry.jsonc
+      run: |
+        set -euo pipefail
+        pinned=$(grep -oE '"ziglang\.org"[[:space:]]*:[[:space:]]*"[^"]+"' pantry.jsonc \
+          | head -1 | sed -E 's/.*:[[:space:]]*"([^"]+)"/\1/')
+        dockerfile=$(grep -oE '^ARG ZIG_VERSION=.*' packages/zig/Dockerfile \
+          | head -1 | cut -d= -f2-)
+        if [ -z "$pinned" ] || [ -z "$dockerfile" ]; then
+          echo "::error::could not read the Zig pin (pantry.jsonc='$pinned', Dockerfile='$dockerfile')"
+          exit 1
+        fi
+        if [ "$pinned" != "$dockerfile" ]; then
+          echo "::error::Zig pin drift: pantry.jsonc says '$pinned', packages/zig/Dockerfile says '$dockerfile'."
+          echo "::error::Update ARG ZIG_VERSION and ARG ZIG_SHA256 in packages/zig/Dockerfile to match."
+          exit 1
+        fi
+        echo "Zig pin matches on both sides: $pinned"
+
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 

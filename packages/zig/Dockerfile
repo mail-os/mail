@@ -14,12 +14,24 @@ RUN apk add --no-cache \
 # Install the same Zig 0.17 development snapshot used by local builds and CI.
 # No bun needed: the webmail package lives outside this build context, so
 # zig build skips the frontend step and uses the committed dist.
-ARG ZIG_VERSION=0.17.0-dev.1471+ff10b90bc
-ARG ZIG_SHA256=60d83e4295b7057a382ec8dbc416b0dc59918818c0b5010b0491cec65ccd994f
-RUN curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" && \
-    echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c - && \
-    tar -xJf /tmp/zig.tar.xz -C /usr/local && rm /tmp/zig.tar.xz && \
-    ln -s /usr/local/zig-x86_64-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
+#
+# Fetched from Pantry's mirror rather than ziglang.org/builds, which garbage
+# collects master dev builds: a pin there stops existing after a few weeks and
+# every image build 404s on it. Nothing in this Dockerfile runs before the
+# toolchain installs, so that failure is total. Pantry mirrors dev builds and
+# keeps them, and ships a statically linked zig, so it runs on musl unchanged.
+#
+# ZIG_VERSION must stay identical to the ziglang.org pin in the repo's
+# pantry.jsonc — the Docker context is packages/zig only, so this file cannot
+# read it and CI asserts the two match instead. ZIG_SHA256 is the sha256 of the
+# mirror's tarball and changes with it.
+ARG ZIG_VERSION=0.17.0-dev.2033_af24fd11a
+ARG ZIG_SHA256=434a18cb106f4e1c94d6c174488cd9766f7af84db9b1b3a1866b98822bcfefac
+RUN curl -fsSL -o /tmp/zig.tar.gz "https://registry.pantry.dev/binaries/ziglang.org/${ZIG_VERSION}/linux-x86-64/ziglang.org-${ZIG_VERSION}.tar.gz" && \
+    echo "${ZIG_SHA256}  /tmp/zig.tar.gz" | sha256sum -c - && \
+    mkdir -p /usr/local/zig && \
+    tar -xzf /tmp/zig.tar.gz -C /usr/local/zig && rm /tmp/zig.tar.gz && \
+    ln -s /usr/local/zig/bin/zig /usr/local/bin/zig
 
 # Set working directory
 WORKDIR /build
