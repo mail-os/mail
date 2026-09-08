@@ -1,5 +1,24 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.7...v0.3.8)
+
+## 🐛 Bug Fixes
+
+- **ci**: publish the SDK through OIDC ([b2153df](https://github.com/mail-os/mail/commit/b2153df)) _(by Chris <chris@stacksjs.com>)_
+- **docker**: install Zig from the mirror that keeps dev builds ([33eb792](https://github.com/mail-os/mail/commit/33eb792)) _(by Chris <chris@stacksjs.com>)_
+
+## ✅ Tests
+
+- **mime**: commit the corpus fixtures the ignore rule was swallowing ([bfa8389](https://github.com/mail-os/mail/commit/bfa8389)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.8 ([48b98a9](https://github.com/mail-os/mail/commit/48b98a9)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.6...v0.3.7)
 
 ## 🐛 Bug Fixes
