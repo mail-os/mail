@@ -37,6 +37,11 @@ config.local.zig
 # Test data
 test-emails/
 *.eml
+# ...but not the MIME corpus. These five are postal-mime's own test fixtures,
+# byte-identical and MIT-0, and the parity tests and benchmarks read them at
+# module load — without them CI dies with an ENOENT that names a path rather
+# than the rule that hid it.
+!packages/ts/test/mime/fixtures/*.eml
 /pantry
 zig-pkg/
 /packages/zig/pantry

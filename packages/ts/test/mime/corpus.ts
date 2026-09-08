@@ -23,6 +23,32 @@ const FIXTURE_DIR = join(import.meta.dir, 'fixtures')
 // a MIME torture test.
 const FIXTURES = ['arf.eml', 'bounce.eml', 'calendar-event.eml', 'mimetorture.eml', 'mixed.eml']
 
+/**
+ * Read one fixture, naming the likely cause when it is not there.
+ *
+ * These are read at module load, so a missing file throws before any test
+ * registers and Bun reports it as "Unhandled error between tests" with a bare
+ * ENOENT path. That is how a `*.eml` ignore rule kept the whole corpus out of
+ * git while every local run stayed green: CI failed on a filename, not on the
+ * reason the file was absent.
+ */
+function readFixture(fixture: string): string {
+  try {
+    return readFileSync(join(FIXTURE_DIR, fixture), 'latin1')
+  }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT')
+      throw error
+    throw new Error(
+      `MIME corpus fixture missing: ${fixture}\n`
+      + `  expected at: ${join(FIXTURE_DIR, fixture)}\n`
+      + `These are postal-mime's MIT-0 fixtures and are committed to this repo. If the file is\n`
+      + `present on disk but absent from a clean checkout, check that .gitignore's \`*.eml\` rule\n`
+      + `is still negated for this directory.`,
+    )
+  }
+}
+
 function crlf(lines: string[]): string {
   return `${lines.join('\r\n')}\r\n`
 }
@@ -400,7 +426,7 @@ function buildMessages(): Message[] {
     messages.push({
       name: `real/${fixture.replace(/\.eml$/, '')}`,
       group: 'real',
-      raw: readFileSync(join(FIXTURE_DIR, fixture), 'latin1'),
+      raw: readFixture(fixture),
     })
   }
 
