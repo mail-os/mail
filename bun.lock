@@ -10,7 +10,7 @@
     },
     "packages/cloud": {
       "name": "mail-cloud",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "dependencies": {
         "@stacksjs/ts-cloud": "^0.11.0",
       },
@@ -20,22 +20,22 @@
     },
     "packages/devtools": {
       "name": "mail-devtools",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "dependencies": {
         "bun-plugin-stx": "^0.2.6",
       },
     },
     "packages/ts": {
       "name": "@stacksjs/mail",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "devDependencies": {
-        "@stacksjs/dtsx": "^0.11.10",
+        "@stacksjs/dtsx": "^0.11.11",
         "postal-mime": "^3.0.0",
       },
     },
     "packages/webmail": {
       "name": "mail-webmail",
-      "version": "0.3.5",
+      "version": "0.3.6",
       "dependencies": {
         "bun-plugin-stx": "^0.2.6",
       },
@@ -60,7 +60,7 @@
 
     "@stacksjs/desktop": ["@stacksjs/desktop@0.2.184", "", { "dependencies": { "craft-native": ">=0.0.55" } }, "sha512-2t9Bjr8xrM18WJdYJMG0Uir9oBFbLN7pSE+UG+Fv28yiDFpWDAgoePyPTSS+EoNGnpiyxkz1aDp7PmsQP3NTIg=="],
 
-    "@stacksjs/dtsx": ["@stacksjs/dtsx@0.11.10", "", { "dependencies": { "@stacksjs/clapp": "^0.2.0" }, "bin": { "dtsx": "./dist/bin/cli.js" } }, "sha512-NOSSGv7mdxzmijmKHxTZDmgZp7vCYrRKWpDwNqwTc97MTv5csjo3uukf7A/c+s7pSzJd+HxqsTCZ7IznjfEtmw=="],
+    "@stacksjs/dtsx": ["@stacksjs/dtsx@0.11.11", "", { "dependencies": { "@stacksjs/clapp": "^0.2.16" }, "bin": { "dtsx": "./dist/bin/cli.js" } }, "sha512-rxDpQxElpeGYxgwChAwHsTVmXoV4JuokqT2DuQPBLsgls8RyDvRBTWpnJseQhrxySv6BignXVrWl2UC8h+OWuA=="],
 
     "@stacksjs/gitlint": ["@stacksjs/gitlint@0.1.7", "", { "bin": { "gitlint": "./dist/bin/cli.js" } }, "sha512-7d43l2r5gSLXK8YKflvkwZvN/huoJqbUSmDN+OY3CGHjb4ItimV6GJ/8JyFJwGI7tDEc5VgNGL0JYyIbk2IQ6g=="],
 
@@ -231,6 +231,8 @@
     "undici-types": ["undici-types@8.3.0", "", {}, "sha512-j375ScV60dom+YkPFIfTLcOiPxkN/buHz5GobjLhixFuANaNs3C9l4GmrWqejgXWJ7BbJcFYpTEUkS1Ge8bpZQ=="],
 
     "@stacksjs/bunpress/@stacksjs/ts-cloud": ["@stacksjs/ts-cloud@0.7.127", "", { "dependencies": { "@stacksjs/ts-xml": "^0.1.0", "@ts-cloud/aws-types": "0.7.127", "@ts-cloud/core": "0.7.127" }, "bin": { "cloud": "./dist/bin/cli.js" } }, "sha512-X00KwO2olaEp2AFGXIXLbjeEc8CNVCX15sIi8mT/m87fhagB5BEpydP/9v60sC8Nm2YJW82nT8eQm682HR22Vw=="],
+
+    "@stacksjs/dtsx/@stacksjs/clapp": ["@stacksjs/clapp@0.2.16", "", {}, "sha512-g/5HUXGxD9QffyPKGdywZODte0DJYwzNhSmrPime1z7TLxWPodJ9IYfIwr2G6Wco+fAQISgaVQUtVf0pUNGV0w=="],
 
     "bun-plugin-dtsx/@stacksjs/dtsx": ["@stacksjs/dtsx@0.11.5", "", { "dependencies": { "@stacksjs/clapp": "^0.2.0" }, "bin": { "dtsx": "./dist/bin/cli.js" } }, "sha512-BW8+/zkpK7uA6vMnKUMs2uvHJeiau/HTz8bDJb5ecdAltdn6w0hb+U6lCwdc3zypp1Q1m/10Cay9rrMn/D4e1A=="],
 

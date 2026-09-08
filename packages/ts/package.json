@@ -35,7 +35,7 @@
   ],
   "scripts": {
     "build": "bun run build:sdk && bun build.ts",
-    "build:sdk": "bun build src/index.ts src/mime/index.ts --outdir dist --target bun --splitting && bun x @stacksjs/dtsx generate --root src --entrypoints index.ts --outdir dist --exclude '**/*.test.ts' --validate && bun x @stacksjs/dtsx generate --root src --entrypoints mime/index.ts --outdir dist --exclude '**/*.test.ts' --validate",
+    "build:sdk": "bun build src/index.ts src/mime/index.ts --outdir dist --target bun --splitting && dtsx generate --root src --entrypoints index.ts,mime/index.ts --outdir dist --exclude '**/*.test.ts' --validate",
     "build:linux-x64": "bun build.ts --target x86_64-linux-gnu",
     "build:linux-arm64": "bun build.ts --target aarch64-linux-gnu",
     "build:all": "bun build.ts --all",
@@ -44,7 +44,7 @@
     "bench:mime": "bun run bench/mime.bench.ts"
   },
   "devDependencies": {
-    "@stacksjs/dtsx": "^0.11.10",
+    "@stacksjs/dtsx": "^0.11.11",
     "postal-mime": "^3.0.0"
   },
   "keywords": [
