@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.8...v0.3.9)
+
+## 🐛 Bug Fixes
+
+- **smtp**: take the null sender, refuse recipients with no mailbox ([c663ee7](https://github.com/mail-os/mail/commit/c663ee7)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.9 ([c3f4792](https://github.com/mail-os/mail/commit/c3f4792)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.7...v0.3.8)
 
 ## 🐛 Bug Fixes
