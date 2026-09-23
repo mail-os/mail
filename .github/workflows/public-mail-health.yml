@@ -23,7 +23,10 @@ jobs:
             echo "public tcp/$port reachable"
           done
           for port in 465 993; do
-            timeout 15 openssl s_client -connect "$HOST:$port" -servername mail.stacksjs.com </dev/null 2>/dev/null \
-              | openssl x509 -noout -checkend 86400 -subject \
-              | grep -F 'CN = mail.stacksjs.com'
+            # The certificate covers every hosted mail domain, so its subject CN
+            # is whichever name sorts first. Verify the hostname against the
+            # names the certificate is actually valid for, as deploy.yml does.
+            timeout 15 openssl s_client -connect "$HOST:$port" -servername mail.stacksjs.com \
+              -verify_hostname mail.stacksjs.com -verify_return_error </dev/null 2>/dev/null \
+              | openssl x509 -noout -checkend 86400
           done
