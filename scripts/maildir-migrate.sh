@@ -38,10 +38,14 @@ inspect_mailbox() {
   local mailbox="$1"
   local entry name canonical target
 
+  # The server runs as the mailbox's owner, not root. Directories created here
+  # used to stay root-owned, which left the server unable to list cur/ (so a
+  # message there never appeared in INBOX) or to deliver into a missing new/.
+  # Own them like the mailbox, and repair any an earlier run left as root.
   for required in tmp new cur; do
-    [[ -d "${mailbox}/${required}" ]] || {
-      [[ "${COMMAND}" == "migrate" ]] && install -d -m 0700 "${mailbox}/${required}"
-    }
+    [[ "${COMMAND}" == "migrate" ]] || continue
+    [[ -d "${mailbox}/${required}" ]] || install -d -m 0700 "${mailbox}/${required}"
+    chown --reference="${mailbox}" "${mailbox}/${required}"
   done
 
   while IFS= read -r -d '' entry; do
