@@ -96,6 +96,36 @@ fn domainOf(addr: []const u8) []const u8 {
     return d;
 }
 
+/// Whether the text after `MAIL FROM:` is the null reverse-path `<>`,
+/// optionally followed by ESMTP parameters (`<> SIZE=1234`).
+fn isNullReversePath(addr_part: []const u8) bool {
+    const trimmed = std.mem.trimStart(u8, addr_part, " \t");
+    return std.mem.startsWith(u8, trimmed, "<>");
+}
+
+/// Whether a recipient on a local domain reaches a mailbox. This is the
+/// resolution `saveMessage` performs, asked before the message is accepted:
+///
+///   - the full address is a user (a per-domain mailbox, `hi@example.com`),
+///   - the local part is `postmaster`, which RFC 5321 4.5.1 requires every
+///     domain to accept,
+///   - the local part is an alias (`abuse`, `tlsrpt`, ... in the aliases file),
+///   - or the local part is itself a user (the legacy single-namespace path).
+///
+/// Anything else used to be accepted and written to a maildir no account can
+/// open. `users` is anything with `userExists(name) !bool`; a lookup error
+/// counts as known, so a database fault never turns into a hard bounce.
+fn localRecipientKnown(users: anytype, rcpt: []const u8, resolveAlias: *const fn ([]const u8) []const u8) bool {
+    if (users.userExists(rcpt) catch return true) return true;
+
+    const local = if (std.mem.indexOfScalar(u8, rcpt, '@')) |at| rcpt[0..at] else rcpt;
+    if (local.len == 0) return false;
+    if (std.ascii.eqlIgnoreCase(local, "postmaster")) return true;
+    if (!std.mem.eql(u8, resolveAlias(local), local)) return true;
+
+    return users.userExists(local) catch true;
+}
+
 /// Extract the domain from the first `From:` header line, if present.
 fn extractFromDomain(headers: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, headers, '\n');
@@ -207,6 +237,57 @@ test "spam filtering runs independently of authentication checks" {
     try std.testing.expect(shouldRunInboundPipeline(false, true, false));
     try std.testing.expect(!shouldRunInboundPipeline(false, false, false));
     try std.testing.expect(!shouldRunInboundPipeline(true, true, true));
+}
+
+test "null reverse-path is recognised, a missing address is not" {
+    try std.testing.expect(isNullReversePath("<>"));
+    try std.testing.expect(isNullReversePath(" <>"));
+    try std.testing.expect(isNullReversePath("<> SIZE=1024"));
+    try std.testing.expect(!isNullReversePath(""));
+    try std.testing.expect(!isNullReversePath("   "));
+    try std.testing.expect(!isNullReversePath("<a@b.c>"));
+}
+
+const FakeUsers = struct {
+    names: []const []const u8,
+    fail: bool = false,
+
+    pub fn userExists(self: FakeUsers, name: []const u8) !bool {
+        if (self.fail) return error.LookupFailed;
+        for (self.names) |n| if (std.mem.eql(u8, n, name)) return true;
+        return false;
+    }
+};
+
+fn fakeAliases(local: []const u8) []const u8 {
+    if (std.mem.eql(u8, local, "abuse") or std.mem.eql(u8, local, "tlsrpt")) return "chris";
+    return local;
+}
+
+test "local recipients resolve the way delivery resolves them" {
+    const users = FakeUsers{ .names = &.{ "hi@chrisbreuer.me", "hi" } };
+
+    // A per-domain mailbox.
+    try std.testing.expect(localRecipientKnown(users, "hi@chrisbreuer.me", fakeAliases));
+    // The legacy namespace: the local part alone is a user.
+    try std.testing.expect(localRecipientKnown(users, "hi@wildloop.org", fakeAliases));
+    // Role addresses: aliased, even though the alias target has no user row.
+    try std.testing.expect(localRecipientKnown(users, "tlsrpt@stacksjs.com", fakeAliases));
+    try std.testing.expect(localRecipientKnown(users, "abuse@wildloop.org", fakeAliases));
+    // postmaster is always accepted (RFC 5321 4.5.1), in any case.
+    try std.testing.expect(localRecipientKnown(users, "postmaster@chrisbreuer.me", fakeAliases));
+    try std.testing.expect(localRecipientKnown(users, "PostMaster@chrisbreuer.me", fakeAliases));
+
+    // No mailbox, no alias: refused.
+    try std.testing.expect(!localRecipientKnown(users, "nobody-here@chrisbreuer.me", fakeAliases));
+    try std.testing.expect(!localRecipientKnown(users, "@chrisbreuer.me", fakeAliases));
+    // Lookups are exact; the caller retries lowercase.
+    try std.testing.expect(!localRecipientKnown(users, "Hi@ChrisBreuer.me", fakeAliases));
+}
+
+test "a failed user lookup never becomes a bounce" {
+    const broken = FakeUsers{ .names = &.{}, .fail = true };
+    try std.testing.expect(localRecipientKnown(broken, "anyone@chrisbreuer.me", fakeAliases));
 }
 
 test "maildir basenames are unique within one millisecond" {
@@ -979,7 +1060,13 @@ pub const Session = struct {
             }
         }
 
-        if (addr.len == 0) {
+        // `MAIL FROM:<>` is the null reverse-path (RFC 5321 4.5.5): bounces,
+        // delivery reports and auto-replies are sent from it, and a server has
+        // to take it or those notices never arrive. Only a missing address is
+        // a syntax error. An empty sender is safe downstream: the relay check
+        // still confines unauthenticated mail to local domains, and the DSN
+        // path bounces only to an address with a local domain, never to <>.
+        if (addr.len == 0 and !isNullReversePath(addr_part)) {
             try self.sendResponse(writer, 501, "Invalid sender address", null);
             return;
         }
@@ -1028,26 +1115,54 @@ pub const Session = struct {
         };
 
         const addr_part = line[to_start + 3 ..];
-        const addr = std.mem.trim(u8, addr_part, " \t<>");
+        var addr = std.mem.trim(u8, addr_part, " \t<>");
 
         if (addr.len == 0) {
             try self.sendResponse(writer, 501, "Invalid recipient address", null);
             return;
         }
 
-        // Prevent open relay: unauthenticated clients can only send to local domain.
-        // A recipient with no '@' (or an empty domain) is NOT a local recipient and
-        // must be rejected — otherwise it would bypass the local-domain check.
-        if (!self.authenticated) {
-            const is_local = if (std.mem.indexOf(u8, addr, "@")) |at_pos|
-                self.config.isLocalDomain(addr[at_pos + 1 ..])
-            else
-                false;
+        // A recipient with no '@' (or an empty domain) is NOT a local recipient.
+        const is_local = if (std.mem.indexOf(u8, addr, "@")) |at_pos|
+            self.config.isLocalDomain(addr[at_pos + 1 ..])
+        else
+            false;
 
-            if (!is_local) {
-                self.logger.logSecurityEvent(self.remote_addr, "Relay access denied for unauthenticated sender");
-                try self.sendResponse(writer, 550, "5.7.1 Relay access denied", null);
-                return;
+        // Prevent open relay: unauthenticated clients can only send to local domain.
+        // The no-'@' case above must be rejected here — otherwise it would bypass
+        // the local-domain check.
+        if (!self.authenticated and !is_local) {
+            self.logger.logSecurityEvent(self.remote_addr, "Relay access denied for unauthenticated sender");
+            try self.sendResponse(writer, 550, "5.7.1 Relay access denied", null);
+            return;
+        }
+
+        // Refuse a local recipient that has no mailbox, now rather than after
+        // the body: accepting it wrote the message into a maildir nobody can
+        // open, and the sender never learned. Ahead of greylisting, so a
+        // mistyped address fails at once instead of after the retry delay.
+        // A trap (`catch_all`) takes every address, and without a user
+        // database there is nothing to check against.
+        var lower_buf: [320]u8 = undefined;
+        if (is_local and !self.config.catch_all) {
+            if (self.auth_backend) |ab| {
+                if (!localRecipientKnown(ab.db, addr, aliases.resolve)) {
+                    // Mailboxes are stored lowercase, but senders do not always
+                    // write addresses that way. Deliver `Hi@Example.com` to
+                    // `hi@example.com` rather than refusing it.
+                    const lower: ?[]const u8 = if (addr.len <= lower_buf.len)
+                        std.ascii.lowerString(&lower_buf, addr)
+                    else
+                        null;
+                    if (lower != null and !std.mem.eql(u8, lower.?, addr) and localRecipientKnown(ab.db, lower.?, aliases.resolve)) {
+                        addr = lower.?;
+                    } else {
+                        const safe_addr = sanitizeForLog(addr);
+                        self.logger.info("Rejected unknown recipient {s} from {s}", .{ sanitizedSlice(&safe_addr, addr.len), self.remote_addr });
+                        try self.sendResponse(writer, 550, "5.1.1 Recipient address rejected: user unknown", null);
+                        return;
+                    }
+                }
             }
         }
 
