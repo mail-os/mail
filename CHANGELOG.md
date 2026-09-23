@@ -1,5 +1,21 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.9...v0.3.10)
+
+## 🐛 Bug Fixes
+
+- **ci**: check the mail certificate's hostnames, not its subject CN ([ed1ab40](https://github.com/mail-os/mail/commit/ed1ab40)) _(by Chris <chris@stacksjs.com>)_
+- **scripts**: give migrated mailboxes' tmp/new/cur to their owner ([e80d353](https://github.com/mail-os/mail/commit/e80d353)) _(by Chris <chris@stacksjs.com>)_
+- **imap**: report stored flags; answer FETCH and STATUS as asked ([aa05495](https://github.com/mail-os/mail/commit/aa05495)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.10 ([164542c](https://github.com/mail-os/mail/commit/164542c)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.8...v0.3.9)
 
 ## 🐛 Bug Fixes
