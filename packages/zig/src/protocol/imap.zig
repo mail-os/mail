@@ -801,6 +801,207 @@ fn renameFile(old_path: []const u8, new_path: []const u8) bool {
     return std.c.rename(old_z, new_z) == 0;
 }
 
+/// Finds the name a message's file has on disk now.
+///
+/// A session caches the filenames it listed at SELECT, but a message's flags
+/// live in its name (`base.eml` -> `base.eml:2,S`), so another connection
+/// marking it read renames the file out from under the cache. Apple Mail keeps
+/// several connections open, which makes that the ordinary case, not a race.
+/// The base name is the message's identity, so a stale name is looked up by
+/// its base. Each directory is listed at most once per command, however many
+/// cached names in it turn out to be stale.
+const MaildirNameResolver = struct {
+    allocator: std.mem.Allocator,
+    /// "{dir}/{base}" -> current filename. Both owned.
+    names: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Directories already listed into `names`. Owned.
+    listed: std.ArrayList([]const u8) = .empty,
+
+    fn init(allocator: std.mem.Allocator) MaildirNameResolver {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *MaildirNameResolver) void {
+        var it = self.names.iterator();
+        while (it.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            self.allocator.free(e.value_ptr.*);
+        }
+        self.names.deinit(self.allocator);
+        for (self.listed.items) |d| self.allocator.free(d);
+        self.listed.deinit(self.allocator);
+    }
+
+    /// The current name of the message cached as `cached` in `dir`: `cached`
+    /// itself while that file exists, otherwise the file with the same base
+    /// name, or null when there is none (expunged by another connection). The
+    /// returned slice is borrowed from `cached` or from the resolver.
+    fn resolve(self: *MaildirNameResolver, dir: []const u8, cached: []const u8) !?[]const u8 {
+        var path_buf: [4097]u8 = undefined;
+        const cached_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, cached }) catch return cached;
+        if (fs_compat.cwd().access(cached_path, .{})) |_| {
+            return cached;
+        } else |_| {}
+
+        try self.listDir(dir);
+        const key = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, MaildirFlags.baseName(cached) }) catch return null;
+        return self.names.get(key);
+    }
+
+    fn listDir(self: *MaildirNameResolver, dir: []const u8) !void {
+        for (self.listed.items) |d| {
+            if (std.mem.eql(u8, d, dir)) return;
+        }
+        try self.listed.append(self.allocator, try self.allocator.dupe(u8, dir));
+
+        const files = fs_compat.listEmlFiles(self.allocator, dir) catch return;
+        defer self.allocator.free(files);
+        for (files) |name| {
+            const key = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, MaildirFlags.baseName(name) }) catch {
+                self.allocator.free(name);
+                continue;
+            };
+            const gop = self.names.getOrPut(self.allocator, key) catch {
+                self.allocator.free(key);
+                self.allocator.free(name);
+                continue;
+            };
+            if (gop.found_existing) {
+                // Two files with one base name should not exist; keep the first.
+                self.allocator.free(key);
+                self.allocator.free(name);
+            } else {
+                gop.value_ptr.* = name;
+            }
+        }
+    }
+};
+
+/// Offset just past the blank line that ends a message's header block.
+///
+/// The first blank line wins, whichever line ending it uses. Searching for
+/// "\r\n\r\n" first and falling back to "\n\n" would end a bare-LF header at
+/// a CRLF blank line further down in the body. With no blank line at all the
+/// whole message is header.
+fn headerEnd(content: []const u8) usize {
+    if (std.mem.startsWith(u8, content, "\r\n")) return 2;
+    if (std.mem.startsWith(u8, content, "\n")) return 1;
+    var pos: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, content, pos, '\n')) |nl| {
+        const next = nl + 1;
+        if (next < content.len and content[next] == '\n') return next + 1;
+        if (next + 1 < content.len and content[next] == '\r' and content[next + 1] == '\n') return next + 2;
+        pos = next;
+    }
+    return content.len;
+}
+
+/// A header section requested by FETCH: `BODY[HEADER]`,
+/// `BODY[HEADER.FIELDS (...)]`, `BODY[HEADER.FIELDS.NOT (...)]` (each also as
+/// `BODY.PEEK[...]`), or `RFC822.HEADER`.
+const HeaderSection = struct {
+    const Kind = enum { all, fields, fields_not };
+
+    kind: Kind,
+    /// The section text between the brackets, echoed back verbatim in the
+    /// response item name (RFC 3501 7.4.2). Empty for RFC822.HEADER.
+    spec: []const u8,
+    /// The field names inside the parentheses, space separated.
+    fields: []const u8 = "",
+    rfc822: bool = false,
+};
+
+fn parseHeaderSection(items: []const u8) ?HeaderSection {
+    var search_from: usize = 0;
+    while (ascii_compat.indexOfIgnoreCasePos(items, search_from, "BODY")) |at| {
+        search_from = at + 4;
+        var open = at + 4;
+        if (open + 5 <= items.len and std.ascii.eqlIgnoreCase(items[open .. open + 5], ".PEEK")) open += 5;
+        if (open >= items.len or items[open] != '[') continue;
+        const close = std.mem.indexOfScalarPos(u8, items, open, ']') orelse return null;
+        const spec = items[open + 1 .. close];
+        if (!(spec.len >= 6 and std.ascii.eqlIgnoreCase(spec[0..6], "HEADER"))) continue;
+
+        const rest = spec[6..];
+        const kind: HeaderSection.Kind = if (rest.len == 0)
+            .all
+        else if (rest.len >= 11 and std.ascii.eqlIgnoreCase(rest[0..11], ".FIELDS.NOT"))
+            .fields_not
+        else if (rest.len >= 7 and std.ascii.eqlIgnoreCase(rest[0..7], ".FIELDS"))
+            .fields
+        else
+            continue;
+
+        var fields: []const u8 = "";
+        if (kind != .all) {
+            const lp = std.mem.indexOfScalar(u8, spec, '(') orelse return null;
+            const rp = std.mem.indexOfScalarPos(u8, spec, lp, ')') orelse return null;
+            fields = spec[lp + 1 .. rp];
+        }
+        return .{ .kind = kind, .spec = spec, .fields = fields };
+    }
+    if (ascii_compat.indexOfIgnoreCase(items, "RFC822.HEADER") != null) {
+        return .{ .kind = .all, .spec = "", .rfc822 = true };
+    }
+    return null;
+}
+
+/// The header fields of `header` whose names are (`keep_listed`) or are not
+/// (`!keep_listed`) in the space-separated `fields`, in their original order
+/// with continuation lines kept, followed by the blank line that ends a header
+/// block (RFC 3501 6.4.5). Caller owns the returned slice.
+fn filterHeaderFields(allocator: std.mem.Allocator, header: []const u8, fields: []const u8, keep_listed: bool) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var pos: usize = 0;
+    while (pos < header.len) {
+        var end = lineEndAfter(header, pos);
+        const first_line = header[pos..end];
+        if (std.mem.trim(u8, first_line, "\r\n").len == 0) break;
+        // Folded continuation lines start with a space or tab.
+        while (end < header.len and (header[end] == ' ' or header[end] == '\t')) end = lineEndAfter(header, end);
+
+        const colon = std.mem.indexOfScalar(u8, first_line, ':');
+        const name = if (colon) |c| std.mem.trim(u8, first_line[0..c], " \t") else "";
+        if (name.len > 0 and headerFieldListed(fields, name) == keep_listed) {
+            const field = header[pos..end];
+            try out.appendSlice(allocator, field);
+            if (!std.mem.endsWith(u8, field, "\n")) try out.appendSlice(allocator, "\r\n");
+        }
+        pos = end;
+    }
+    try out.appendSlice(allocator, "\r\n");
+    return out.toOwnedSlice(allocator);
+}
+
+fn lineEndAfter(buf: []const u8, start: usize) usize {
+    return if (std.mem.indexOfScalarPos(u8, buf, start, '\n')) |nl| nl + 1 else buf.len;
+}
+
+fn headerFieldListed(fields: []const u8, name: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, fields, " \t\"");
+    while (it.next()) |f| {
+        if (std.ascii.eqlIgnoreCase(f, name)) return true;
+    }
+    return false;
+}
+
+/// The section of a numbered body part request (`BODY[1]`, `BODY.PEEK[1.2]`),
+/// echoed back in the response item name.
+fn numberedPartSpec(items: []const u8) ?[]const u8 {
+    var search_from: usize = 0;
+    while (ascii_compat.indexOfIgnoreCasePos(items, search_from, "BODY")) |at| {
+        search_from = at + 4;
+        var open = at + 4;
+        if (open + 5 <= items.len and std.ascii.eqlIgnoreCase(items[open .. open + 5], ".PEEK")) open += 5;
+        if (open + 1 >= items.len or items[open] != '[' or !std.ascii.isDigit(items[open + 1])) continue;
+        const close = std.mem.indexOfScalarPos(u8, items, open, ']') orelse return null;
+        return items[open + 1 .. close];
+    }
+    return null;
+}
+
 fn pathIsSymlink(path: []const u8) bool {
     var path_buf: [4097]u8 = undefined;
     var target_buf: [1]u8 = undefined;
@@ -947,6 +1148,52 @@ pub const ImapSession = struct {
     fn allocSelectedMessagePath(self: *ImapSession, idx: usize, filename: []const u8) ![]u8 {
         const dir = self.selectedMessageDirForIndex(idx) orelse return error.NoMailboxSelected;
         return try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename });
+    }
+
+    /// The filename message `idx` has on disk now, adopted into the cached
+    /// listing, or null when its file is gone. See `MaildirNameResolver`.
+    fn adoptCurrentName(self: *ImapSession, resolver: *MaildirNameResolver, idx: usize) ?[]const u8 {
+        const files = self.mailbox_files orelse return null;
+        if (idx >= files.len) return null;
+        const cached = files[idx];
+        const dir = self.selectedMessageDirForIndex(idx) orelse return null;
+        // A failed lookup keeps the cached name: the next file operation then
+        // fails on it and reports that, rather than dropping the message here.
+        const current = (resolver.resolve(dir, cached) catch return cached) orelse return null;
+        if (current.ptr == cached.ptr) return cached;
+
+        const owned = self.allocator.dupe(u8, current) catch return cached;
+        self.allocator.free(cached);
+        @constCast(files)[idx] = owned;
+        return owned;
+    }
+
+    /// Give message `idx`, currently named `filename`, exactly `flags` by
+    /// renaming its file. True when the file on disk now carries them.
+    fn writeMessageFlags(self: *ImapSession, idx: usize, filename: []const u8, flags: MaildirFlags) bool {
+        const base = MaildirFlags.baseName(filename);
+        var suffix_buf: [16]u8 = undefined;
+        const suffix = flags.toSuffix(&suffix_buf);
+        var new_name_buf: [512]u8 = undefined;
+        const new_name = std.fmt.bufPrint(&new_name_buf, "{s}{s}", .{ base, suffix }) catch return false;
+        if (std.mem.eql(u8, filename, new_name)) return true;
+
+        const dir = self.selectedMessageDirForIndex(idx) orelse return false;
+        const old_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename }) catch return false;
+        defer self.allocator.free(old_path);
+        const new_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, new_name }) catch return false;
+        defer self.allocator.free(new_path);
+        if (!renameFile(old_path, new_path)) return false;
+
+        // The rename happened; keep the cache in step with it. If the copy
+        // fails the cached name is stale, which the next command resolves.
+        const files = self.mailbox_files orelse return true;
+        if (idx < files.len and files[idx].ptr == filename.ptr) {
+            const owned = self.allocator.dupe(u8, new_name) catch return true;
+            self.allocator.free(files[idx]);
+            @constCast(files)[idx] = owned;
+        }
+        return true;
     }
 
     /// Build a collision-free Maildir-style destination path of the form
@@ -1202,6 +1449,62 @@ pub const ImapSession = struct {
 
         self.mailbox_uids = uids;
         self.rebuildUidSeqMap() catch {};
+    }
+
+    /// Give every message in `mailbox` its UID without selecting it, listing
+    /// the mailbox exactly as SELECT would so both assign the same UIDs. The
+    /// selected mailbox's listing is set aside for the duration and restored.
+    fn assignUidsForStatus(self: *ImapSession, db: *database.Database, username: []const u8, mailbox: []const u8) void {
+        // The selected mailbox was synced when it was selected.
+        if (self.state == .selected) {
+            if (self.mailbox_name) |selected| {
+                if (std.mem.eql(u8, selected, mailbox)) return;
+            }
+        }
+
+        const saved_files = self.mailbox_files;
+        const saved_dirs = self.mailbox_file_dirs;
+        const saved_keys = self.mailbox_uid_keys;
+        self.mailbox_files = null;
+        self.mailbox_file_dirs = null;
+        self.mailbox_uid_keys = null;
+        defer {
+            if (self.mailbox_files) |files| {
+                for (files) |f| self.allocator.free(f);
+                self.allocator.free(files);
+            }
+            if (self.mailbox_file_dirs) |dirs| {
+                for (dirs) |d| self.allocator.free(d);
+                self.allocator.free(dirs);
+            }
+            if (self.mailbox_uid_keys) |keys| {
+                for (keys) |k| self.allocator.free(k);
+                self.allocator.free(keys);
+            }
+            self.mailbox_files = saved_files;
+            self.mailbox_file_dirs = saved_dirs;
+            self.mailbox_uid_keys = saved_keys;
+        }
+
+        if (std.mem.eql(u8, mailbox, "All Mail")) {
+            self.loadAggregateMailboxFiles(username) catch return;
+        } else if (std.mem.eql(u8, mailbox, "INBOX")) {
+            self.loadInboxFiles(username) catch return;
+        } else {
+            const dir = std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ username, mailbox }) catch return;
+            defer self.allocator.free(dir);
+            const files = fs_compat.listEmlFiles(self.allocator, dir) catch return;
+            if (files.len == 0) {
+                self.allocator.free(files);
+                return;
+            }
+            self.mailbox_files = files;
+        }
+
+        const files = self.mailbox_files orelse return;
+        const keys = self.mailbox_uid_keys orelse files;
+        const uids = db.syncMailboxUids(self.allocator, username, mailbox, keys) catch return;
+        self.allocator.free(uids);
     }
 
     /// Rebuild the UID -> sequence number reverse index after mailbox_uids
@@ -2158,6 +2461,12 @@ pub const ImapSession = struct {
                 const local_part = full_username;
                 if (db.getOrCreateMailbox(local_part, canonical_mailbox)) |info| {
                     uidvalidity = info.uidvalidity;
+                    // UIDNEXT has to exceed every UID in the mailbox, including
+                    // the ones its messages have not been given yet. Those were
+                    // assigned only on SELECT, so a mailbox never selected
+                    // reported e.g. MESSAGES 12 UIDNEXT 1, and then UIDNEXT 13
+                    // once it had been.
+                    if (want_uidnext) self.assignUidsForStatus(db, local_part, canonical_mailbox);
                     if (db.getUidNext(local_part, canonical_mailbox)) |next| {
                         uidnext = next;
                     } else |_| {}
@@ -2519,26 +2828,6 @@ pub const ImapSession = struct {
             return;
         };
 
-        // Parse sequence set (supports "n", "n:m", "n:*")
-        var start: usize = 1;
-        var end: usize = files.len;
-
-        if (std.mem.indexOf(u8, sequence_set, ":")) |colon| {
-            start = std.fmt.parseInt(usize, sequence_set[0..colon], 10) catch 1;
-            const end_str = sequence_set[colon + 1 ..];
-            if (std.mem.eql(u8, end_str, "*")) {
-                end = files.len;
-            } else {
-                end = std.fmt.parseInt(usize, end_str, 10) catch files.len;
-            }
-        } else {
-            start = std.fmt.parseInt(usize, sequence_set, 10) catch 1;
-            end = start;
-        }
-
-        if (start < 1) start = 1;
-        if (end > files.len) end = files.len;
-
         // RFC 3501 Section 6.4.5: BODY[] (without .PEEK) implicitly sets \Seen flag
         const is_peek = std.mem.indexOf(u8, items_raw, "BODY.PEEK") != null;
         const has_body_fetch = std.mem.indexOf(u8, items_raw, "BODY[") != null or
@@ -2549,8 +2838,9 @@ pub const ImapSession = struct {
 
         // Determine what to fetch based on items
         const want_internaldate = std.mem.indexOf(u8, items_raw, "INTERNALDATE") != null;
-        // BODY.PEEK[HEADER] or BODY[HEADER] - wants headers only
-        const want_header_only = std.mem.indexOf(u8, items_raw, "HEADER") != null;
+        // BODY[HEADER], BODY[HEADER.FIELDS (...)], BODY[HEADER.FIELDS.NOT (...)]
+        // (or their .PEEK forms), or RFC822.HEADER.
+        const header_section = parseHeaderSection(items_raw);
         // Detect any BODY[...] request for content (including numbered parts like BODY[1], BODY.PEEK[1.1])
         const has_body_section = blk: {
             // Look for BODY[ or BODY.PEEK[ followed by a digit (numbered MIME part)
@@ -2599,13 +2889,23 @@ pub const ImapSession = struct {
             }
         }
 
-        // Detect if we only need metadata (FLAGS, UID, RFC822.SIZE) — no file content read needed
+        // Detect if we only need metadata (FLAGS, UID, RFC822.SIZE) — no file content read needed.
+        // INTERNALDATE can come from the Date header, so it takes the full path.
         const want_rfc822_size = std.mem.indexOf(u8, items_raw, "RFC822.SIZE") != null;
-        const metadata_only = !want_full_body and !want_header_only and !want_bodystructure and !want_body_text_only;
+        const metadata_only = !want_full_body and header_section == null and !want_bodystructure and
+            !want_body_text_only and !want_internaldate;
 
-        var seq = start;
-        while (seq <= end) : (seq += 1) {
-            const filename = files[seq - 1];
+        var resolver = MaildirNameResolver.init(self.allocator);
+        defer resolver.deinit();
+
+        // The whole set: "1,3,5", "2:4,7", "*". Only "n" and "n:m" used to be
+        // understood here, so a UID FETCH of a list answered with message 1.
+        var iter = SequenceIterator.init(sequence_set, files.len);
+        while (iter.next()) |seq_u32| {
+            const seq: usize = seq_u32;
+            // Flags are part of the name; another connection may have changed
+            // them since this session listed the mailbox.
+            const filename = self.adoptCurrentName(&resolver, seq - 1) orelse continue;
             const uid = self.getUidForSeq(seq);
 
             // For metadata-only requests (FLAGS, UID, RFC822.SIZE), skip reading file content
@@ -2644,12 +2944,7 @@ pub const ImapSession = struct {
             defer self.allocator.free(content);
 
             // Find header/body boundary
-            const header_end = if (std.mem.indexOf(u8, content, "\r\n\r\n")) |pos|
-                pos + 4
-            else if (std.mem.indexOf(u8, content, "\n\n")) |pos|
-                pos + 2
-            else
-                content.len;
+            const header_end = headerEnd(content);
 
             const header = content[0..header_end];
             const body = content[header_end..];
@@ -2728,32 +3023,12 @@ pub const ImapSession = struct {
             // Read actual flags from Maildir filename
             var msg_flags = MaildirFlags.fromFilename(filename);
 
-            // RFC 3501: BODY[] (non-PEEK) implicitly sets \Seen
+            // RFC 3501: BODY[] (non-PEEK) implicitly sets \Seen. Report it only
+            // once it is on disk.
             if (should_set_seen and !msg_flags.seen) {
-                msg_flags.seen = true;
-                const base = MaildirFlags.baseName(filename);
-                var suffix_buf: [16]u8 = undefined;
-                const suffix = msg_flags.toSuffix(&suffix_buf);
-                var new_name_buf: [512]u8 = undefined;
-                const new_name = std.fmt.bufPrint(&new_name_buf, "{s}{s}", .{ base, suffix }) catch filename;
-                if (!std.mem.eql(u8, filename, new_name)) {
-                    const dir = self.selectedMessageDirForIndex(seq - 1);
-                    const old_path = if (dir) |d| std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ d, filename }) catch null else null;
-                    const new_path = if (dir) |d| std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ d, new_name }) catch null else null;
-                    if (old_path != null and new_path != null) {
-                        if (renameFile(old_path.?, new_path.?)) {
-                            // Update cached filename
-                            const mutable_files = @constCast(files);
-                            const owned_new = self.allocator.dupe(u8, new_name) catch new_name;
-                            if (owned_new.ptr != new_name.ptr) {
-                                self.allocator.free(filename);
-                                mutable_files[seq - 1] = owned_new;
-                            }
-                        }
-                    }
-                    if (old_path) |p| self.allocator.free(p);
-                    if (new_path) |p| self.allocator.free(p);
-                }
+                var seen_flags = msg_flags;
+                seen_flags.seen = true;
+                if (self.writeMessageFlags(seq - 1, filename, seen_flags)) msg_flags = seen_flags;
             }
 
             var flag_str_buf: [256]u8 = undefined;
@@ -2774,82 +3049,70 @@ pub const ImapSession = struct {
                 break :blk ifbs.getWritten();
             } else @as([]const u8, "");
 
-            // Determine the BODY section specifier to echo back in the response
-            const body_section: []const u8 = if (has_body_section) blk: {
-                // Extract the section from the request (e.g., "BODY[1]" -> "1", "BODY.PEEK[1.1]" -> "1.1")
-                // For numbered parts on simple messages, return the body text
-                break :blk "TEXT";
-            } else "";
+            // One response carrying every requested item. The branches this
+            // replaced each emitted a fixed subset: a header section together
+            // with a body section lost the header, and a header section was
+            // always labelled BODY[HEADER] whatever was asked for.
+            var resp: std.ArrayList(u8) = .empty;
+            defer resp.deinit(self.allocator);
+            try resp.print(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d}{s}{s}", .{
+                seq, uid, flag_str, content.len, id_part, bs_part,
+            });
 
-            // Build FETCH response
-            if (want_header_only and !want_full_body) {
-                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d}{s}{s} BODY[HEADER] {{{d}}}\r\n{s})", .{
-                    seq, uid, flag_str, content.len, id_part, bs_part, header.len, header,
-                });
-                defer self.allocator.free(resp);
-                try self.writeData(resp);
-                try self.writeData("\r\n");
-            } else if (want_body_text_only) {
-                // BODY[TEXT] or BODY.PEEK[TEXT] — return just the body (after headers)
-                // Apply partial fetch <offset.count> if requested
+            if (header_section) |hs| {
+                const filtered: ?[]u8 = switch (hs.kind) {
+                    .all => null,
+                    .fields => try filterHeaderFields(self.allocator, header, hs.fields, true),
+                    .fields_not => try filterHeaderFields(self.allocator, header, hs.fields, false),
+                };
+                defer if (filtered) |f| self.allocator.free(f);
+                const data = filtered orelse header;
+                // RFC 3501 7.4.2: the section is echoed as requested, so the
+                // client can match the data to the item it asked for.
+                if (hs.rfc822) {
+                    try resp.print(self.allocator, " RFC822.HEADER {{{d}}}\r\n", .{data.len});
+                } else {
+                    try resp.print(self.allocator, " BODY[{s}] {{{d}}}\r\n", .{ hs.spec, data.len });
+                }
+                try resp.appendSlice(self.allocator, data);
+            }
+
+            if (want_body_text_only) {
+                // BODY[TEXT] or BODY.PEEK[TEXT] — just the body (after headers),
+                // with a partial <offset.count> applied if requested.
                 const text_data = if (partial_offset) |off| blk: {
                     if (off >= body.len) break :blk @as([]const u8, "");
                     const remaining = body[off..];
-                    if (partial_count) |cnt| {
-                        break :blk remaining[0..@min(cnt, remaining.len)];
-                    }
+                    if (partial_count) |cnt| break :blk remaining[0..@min(cnt, remaining.len)];
                     break :blk remaining;
                 } else body;
-                const section_tag = if (partial_offset) |off| blk: {
-                    break :blk std.fmt.allocPrint(self.allocator, "BODY[TEXT]<{d}>", .{off}) catch "BODY[TEXT]";
-                } else @as([]const u8, "BODY[TEXT]");
-                defer if (partial_offset != null) {
-                    if (!std.mem.eql(u8, section_tag, "BODY[TEXT]")) self.allocator.free(section_tag);
-                };
-                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} {s} {{{d}}}\r\n{s})", .{
-                    seq, uid, flag_str, content.len, date_str, bs_part, section_tag, text_data.len, text_data,
-                });
-                defer self.allocator.free(resp);
-                try self.writeData(resp);
-                try self.writeData("\r\n");
-            } else if (want_full_body and has_body_section) {
-                // Numbered MIME part request — return body text
-                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} BODY[{s}] {{{d}}}\r\n{s})", .{
-                    seq, uid, flag_str, content.len, date_str, bs_part, body_section, body.len, body,
-                });
-                defer self.allocator.free(resp);
-                try self.writeData(resp);
-                try self.writeData("\r\n");
+                if (partial_offset) |off| {
+                    try resp.print(self.allocator, " BODY[TEXT]<{d}> {{{d}}}\r\n", .{ off, text_data.len });
+                } else {
+                    try resp.print(self.allocator, " BODY[TEXT] {{{d}}}\r\n", .{text_data.len});
+                }
+                try resp.appendSlice(self.allocator, text_data);
+            } else if (has_body_section) {
+                // Numbered MIME part: the body text, under the part it was asked for.
+                try resp.print(self.allocator, " BODY[{s}] {{{d}}}\r\n", .{ numberedPartSpec(items_raw) orelse "1", body.len });
+                try resp.appendSlice(self.allocator, body);
             } else if (want_full_body) {
-                // Apply partial fetch <offset.count> if requested
                 const fetch_data = if (partial_offset) |off| blk: {
                     if (off >= content.len) break :blk @as([]const u8, "");
                     const remaining = content[off..];
-                    if (partial_count) |cnt| {
-                        break :blk remaining[0..@min(cnt, remaining.len)];
-                    }
+                    if (partial_count) |cnt| break :blk remaining[0..@min(cnt, remaining.len)];
                     break :blk remaining;
                 } else content;
-                const body_tag = if (partial_offset) |off| blk: {
-                    break :blk std.fmt.allocPrint(self.allocator, "BODY[]<{d}>", .{off}) catch "BODY[]";
-                } else @as([]const u8, "BODY[]");
-                defer if (partial_offset != null) {
-                    if (!std.mem.eql(u8, body_tag, "BODY[]")) self.allocator.free(body_tag);
-                };
-                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d} INTERNALDATE \"{s}\"{s} {s} {{{d}}}\r\n{s})", .{
-                    seq, uid, flag_str, content.len, date_str, bs_part, body_tag, fetch_data.len, fetch_data,
-                });
-                defer self.allocator.free(resp);
-                try self.writeData(resp);
-                try self.writeData("\r\n");
-            } else {
-                const resp = try std.fmt.allocPrint(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d}{s}{s})", .{
-                    seq, uid, flag_str, content.len, id_part, bs_part,
-                });
-                defer self.allocator.free(resp);
-                try self.writeData(resp);
-                try self.writeData("\r\n");
+                if (partial_offset) |off| {
+                    try resp.print(self.allocator, " BODY[]<{d}> {{{d}}}\r\n", .{ off, fetch_data.len });
+                } else {
+                    try resp.print(self.allocator, " BODY[] {{{d}}}\r\n", .{fetch_data.len});
+                }
+                try resp.appendSlice(self.allocator, fetch_data);
             }
+
+            try resp.appendSlice(self.allocator, ")\r\n");
+            try self.writeData(resp.items);
         }
 
         try self.sendResponse(tag, "OK", "FETCH completed");
@@ -3523,6 +3786,13 @@ pub const ImapSession = struct {
     /// Handle STORE command — set/add/remove message flags.
     /// Persists flags by renaming files with Maildir-style `:2,FLAGS` suffix.
     /// Implements RFC 3501 Section 6.4.6.
+    ///
+    /// Only flags that reached the disk are reported. A message whose file
+    /// could not be renamed gets an untagged FETCH with the flags it still
+    /// has — even under .SILENT, since the client now holds the wrong ones —
+    /// and the command ends NO. Reporting the requested flags regardless used
+    /// to leave a client showing a message as read that the server still
+    /// counted as unread.
     fn handleStore(self: *ImapSession, tag: []const u8, sequence_set: []const u8, flags_action: []const u8) !void {
         if (self.state != .selected) {
             try self.sendResponse(tag, "NO", "Must select mailbox first");
@@ -3535,60 +3805,47 @@ pub const ImapSession = struct {
         };
 
         const is_silent = ascii_compat.indexOfIgnoreCase(flags_action, ".SILENT") != null;
-        // Need mutable access to update cached filenames after renames
-        const mutable_files = @constCast(files);
+        var resolver = MaildirNameResolver.init(self.allocator);
+        defer resolver.deinit();
+        var failed = false;
 
         var iter = SequenceIterator.init(sequence_set, files.len);
         while (iter.next()) |seq| {
             if (seq < 1 or seq > files.len) continue;
             const idx = seq - 1;
-            const filename = files[idx];
 
-            // Read current flags from filename, apply the action
-            var flags = MaildirFlags.fromFilename(filename);
+            // Start from the flags on disk, not the ones cached at SELECT:
+            // another connection may have changed them since.
+            const filename = self.adoptCurrentName(&resolver, idx) orelse {
+                failed = true; // expunged by another connection
+                continue;
+            };
+            const before = MaildirFlags.fromFilename(filename);
+            var flags = before;
             flags.applyAction(flags_action);
 
-            // Build new filename: base + new flag suffix
-            const base = MaildirFlags.baseName(filename);
-            var suffix_buf: [16]u8 = undefined;
-            const suffix = flags.toSuffix(&suffix_buf);
+            const stored = self.writeMessageFlags(idx, filename, flags);
+            if (!stored) failed = true;
+            if (is_silent and stored) continue;
 
-            var new_name_buf: [512]u8 = undefined;
-            const new_name = std.fmt.bufPrint(&new_name_buf, "{s}{s}", .{ base, suffix }) catch continue;
-
-            // Rename the file if flags actually changed
-            if (!std.mem.eql(u8, filename, new_name)) {
-                const dir = self.selectedMessageDirForIndex(idx) orelse continue;
-                const old_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, filename }) catch continue;
-                defer self.allocator.free(old_path);
-                const new_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, new_name }) catch continue;
-                defer self.allocator.free(new_path);
-
-                if (renameFile(old_path, new_path)) {
-                    // Update cached filename
-                    const owned_new = self.allocator.dupe(u8, new_name) catch continue;
-                    self.allocator.free(filename);
-                    mutable_files[idx] = owned_new;
-                }
-            }
-
-            // Send untagged FETCH response with updated flags (unless .SILENT).
             // Always include UID: a UID STORE (which Apple Mail uses to mark
             // read/unread) requires the UID in the FETCH response so the client
             // can correlate the flag change to its UID-keyed message and update
             // its unread count. Without it the badge never reflects the change.
-            if (!is_silent) {
-                var flag_str_buf: [256]u8 = undefined;
-                const flag_str = flags.toImapString(&flag_str_buf);
-                const uid = self.getUidForSeq(seq);
-                var resp_buf: [512]u8 = undefined;
-                var fbs = io_compat.fixedBufferStream(&resp_buf);
-                fbs.writer().print("{d} FETCH (UID {d} FLAGS ({s}))", .{ seq, uid, flag_str }) catch continue;
-                self.sendUntagged(fbs.getWritten()) catch continue;
-            }
+            var flag_str_buf: [256]u8 = undefined;
+            const flag_str = (if (stored) flags else before).toImapString(&flag_str_buf);
+            const uid = self.getUidForSeq(seq);
+            var resp_buf: [512]u8 = undefined;
+            var fbs = io_compat.fixedBufferStream(&resp_buf);
+            fbs.writer().print("{d} FETCH (UID {d} FLAGS ({s}))", .{ seq, uid, flag_str }) catch continue;
+            self.sendUntagged(fbs.getWritten()) catch continue;
         }
 
-        try self.sendResponse(tag, "OK", "STORE completed");
+        if (failed) {
+            try self.sendResponse(tag, "NO", "STORE failed for some messages; their current flags were sent");
+        } else {
+            try self.sendResponse(tag, "OK", "STORE completed");
+        }
     }
 
     /// Handle EXPUNGE command — remove messages marked with \Deleted flag.
@@ -4894,4 +5151,304 @@ test "IMAP mailbox" {
 
     try testing.expect(std.mem.eql(u8, mailbox.name, "INBOX"));
     try testing.expectEqual(@as(usize, 0), mailbox.exists);
+}
+
+test "the header ends at the first blank line, whichever line ending it uses" {
+    try std.testing.expectEqual(@as(usize, 14), headerEnd("Subject: a\r\n\r\nbody"));
+    try std.testing.expectEqual(@as(usize, 12), headerEnd("Subject: a\n\nbody"));
+    // A bare-LF header must not run on to a CRLF blank line inside the body.
+    try std.testing.expectEqual(@as(usize, 12), headerEnd("Subject: a\n\nline\r\n\r\nmore"));
+    try std.testing.expectEqual(@as(usize, 2), headerEnd("\r\nbody only"));
+    try std.testing.expectEqual(@as(usize, 10), headerEnd("Subject: a"));
+}
+
+test "header sections are parsed as requested" {
+    const fields = parseHeaderSection("(UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])").?;
+    try std.testing.expectEqual(HeaderSection.Kind.fields, fields.kind);
+    try std.testing.expectEqualStrings("HEADER.FIELDS (SUBJECT FROM DATE)", fields.spec);
+    try std.testing.expectEqualStrings("SUBJECT FROM DATE", fields.fields);
+
+    const not = parseHeaderSection("BODY[HEADER.FIELDS.NOT (Received)]").?;
+    try std.testing.expectEqual(HeaderSection.Kind.fields_not, not.kind);
+    try std.testing.expectEqualStrings("Received", not.fields);
+
+    const all = parseHeaderSection("body.peek[header]").?;
+    try std.testing.expectEqual(HeaderSection.Kind.all, all.kind);
+    try std.testing.expectEqualStrings("header", all.spec);
+
+    try std.testing.expect(parseHeaderSection("RFC822.HEADER").?.rfc822);
+    try std.testing.expect(parseHeaderSection("(FLAGS BODY.PEEK[TEXT])") == null);
+    try std.testing.expect(parseHeaderSection("BODY[1]") == null);
+    try std.testing.expect(parseHeaderSection("RFC822.SIZE") == null);
+}
+
+test "header fields are filtered with their continuation lines, in order" {
+    const header = "Received: from a\r\n\tby b\r\nSubject: long\r\n subject\r\nFrom: x@y\r\nTo: z@y\r\n\r\n";
+    const kept = try filterHeaderFields(std.testing.allocator, header, "from SUBJECT", true);
+    defer std.testing.allocator.free(kept);
+    try std.testing.expectEqualStrings("Subject: long\r\n subject\r\nFrom: x@y\r\n\r\n", kept);
+
+    const dropped = try filterHeaderFields(std.testing.allocator, header, "Received", false);
+    defer std.testing.allocator.free(dropped);
+    try std.testing.expectEqualStrings("Subject: long\r\n subject\r\nFrom: x@y\r\nTo: z@y\r\n\r\n", dropped);
+
+    // Nothing matched is still a header block: just the blank line.
+    const none = try filterHeaderFields(std.testing.allocator, header, "Cc", true);
+    defer std.testing.allocator.free(none);
+    try std.testing.expectEqualStrings("\r\n", none);
+}
+
+test "numbered body parts are echoed as requested" {
+    try std.testing.expectEqualStrings("1.2", numberedPartSpec("(BODY.PEEK[1.2])").?);
+    try std.testing.expectEqualStrings("1", numberedPartSpec("BODY[1]").?);
+    try std.testing.expect(numberedPartSpec("BODY[TEXT]") == null);
+}
+
+/// A real ImapSession on one end of a socketpair, in a scratch directory with
+/// its own SQLite database and maildir. The server resolves `mail/...`
+/// against the working directory, so the harness moves into the scratch
+/// directory for its lifetime.
+const ImapTestHarness = struct {
+    allocator: std.mem.Allocator,
+    root: []u8,
+    prev_cwd: [4096]u8 = undefined,
+    prev_cwd_len: usize = 0,
+    db: database.Database,
+    auth_backend: auth.AuthBackend,
+    peer: c_int,
+    session: ImapSession,
+
+    const user = "hi@test.local";
+
+    fn create(allocator: std.mem.Allocator) !*ImapTestHarness {
+        const h = try allocator.create(ImapTestHarness);
+        errdefer allocator.destroy(h);
+        h.allocator = allocator;
+
+        var rnd: [8]u8 = undefined;
+        io_compat.randomBytes(&rnd);
+        h.root = try std.fmt.allocPrint(allocator, "/tmp/mail-imap-test-{x}", .{std.mem.readInt(u64, &rnd, .little)});
+        try fs_compat.cwd().makePath(h.root);
+
+        const cwd_ptr = std.c.getcwd(&h.prev_cwd, h.prev_cwd.len) orelse return error.GetCwdFailed;
+        h.prev_cwd_len = std.mem.len(@as([*:0]u8, @ptrCast(cwd_ptr)));
+        const root_z = try allocator.dupeSentinel(u8, h.root, 0);
+        defer allocator.free(root_z);
+        if (std.c.chdir(root_z.ptr) != 0) return error.ChdirFailed;
+
+        try fs_compat.cwd().makePath("mail/" ++ user ++ "/new");
+        h.db = try database.Database.init(allocator, "smtp.db");
+        h.auth_backend = auth.AuthBackend.init(allocator, &h.db);
+
+        var fds: [2]c_int = undefined;
+        if (std.c.socketpair(std.posix.AF.UNIX, @intCast(@as(u32, std.posix.SOCK.STREAM)), 0, &fds) != 0) return error.SocketPairFailed;
+        const flags = std.c.fcntl(fds[1], std.c.F.GETFL, @as(c_int, 0));
+        const nonblock: c_int = @intCast(@as(u32, @bitCast(std.c.O{ .NONBLOCK = true })));
+        _ = std.c.fcntl(fds[1], std.c.F.SETFL, flags | nonblock);
+        h.peer = fds[1];
+
+        h.session = ImapSession.init(allocator, .{ .fd = fds[0] }, &h.auth_backend, &h.db, true);
+        h.session.username = try allocator.dupe(u8, user);
+        h.session.state = .authenticated;
+        return h;
+    }
+
+    fn destroy(h: *ImapTestHarness) void {
+        const allocator = h.allocator;
+        _ = std.c.close(h.session.connection.fd);
+        h.session.deinit();
+        _ = std.c.close(h.peer);
+        h.auth_backend.deinit();
+        h.db.deinit();
+        h.prev_cwd[h.prev_cwd_len] = 0;
+        _ = std.c.chdir(@ptrCast(&h.prev_cwd));
+        fs_compat.cwd().deleteTree(h.root) catch {};
+        allocator.free(h.root);
+        allocator.destroy(h);
+    }
+
+    fn writeFile(h: *ImapTestHarness, rel: []const u8, content: []const u8) !void {
+        _ = h;
+        const f = try fs_compat.cwd().createFile(rel, .{});
+        defer f.close();
+        try f.writeAll(content);
+    }
+
+    fn exists(h: *ImapTestHarness, rel: []const u8) bool {
+        _ = h;
+        fs_compat.cwd().access(rel, .{}) catch return false;
+        return true;
+    }
+
+    /// Run one command line and return everything the server wrote for it.
+    fn run(h: *ImapTestHarness, line: []const u8) ![]u8 {
+        try h.session.processCommand(line);
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(h.allocator);
+        var buf: [16384]u8 = undefined;
+        while (true) {
+            const n = std.c.read(h.peer, &buf, buf.len);
+            if (n <= 0) break;
+            try out.appendSlice(h.allocator, buf[0..@intCast(n)]);
+        }
+        return out.toOwnedSlice(h.allocator);
+    }
+
+    fn expectContains(haystack: []const u8, needle: []const u8) !void {
+        if (std.mem.indexOf(u8, haystack, needle) == null) {
+            std.debug.print("expected to find {s}\n--- in ---\n{s}\n", .{ needle, haystack });
+            return error.TestExpectedSubstring;
+        }
+    }
+};
+
+const test_message = "Received: from mx.example\r\nSubject: Hello there\r\nFrom: Sender <s@example.org>\r\nTo: hi@test.local\r\nDate: Wed, 16 Sep 2026 08:16:30 -0700\r\n\r\nBody line\r\n";
+
+test "STORE applies the flags on disk when another connection renamed the file" {
+    const h = try ImapTestHarness.create(std.testing.allocator);
+    defer h.destroy();
+    try h.writeFile("mail/" ++ ImapTestHarness.user ++ "/new/1789571792269.1.eml", test_message);
+
+    std.testing.allocator.free(try h.run("a SELECT INBOX"));
+
+    // Another connection marks it read: the file this session listed is gone.
+    try std.testing.expect(renameFile(
+        "mail/" ++ ImapTestHarness.user ++ "/new/1789571792269.1.eml",
+        "mail/" ++ ImapTestHarness.user ++ "/new/1789571792269.1.eml:2,S",
+    ));
+
+    // Marking it unread from here has to act on the renamed file. It used to
+    // compute from the stale name (already unread), rename nothing, and still
+    // answer FLAGS () with OK while the disk kept \Seen.
+    const resp = try h.run("b UID STORE 1 -FLAGS (\\Seen)");
+    defer std.testing.allocator.free(resp);
+    try ImapTestHarness.expectContains(resp, "* 1 FETCH (UID 1 FLAGS ())");
+    try ImapTestHarness.expectContains(resp, "b OK");
+    // Clearing the last flag leaves an empty flag list in the name.
+    try std.testing.expect(h.exists("mail/" ++ ImapTestHarness.user ++ "/new/1789571792269.1.eml:2,"));
+    try std.testing.expect(!h.exists("mail/" ++ ImapTestHarness.user ++ "/new/1789571792269.1.eml:2,S"));
+}
+
+test "STORE reports the flags a message still has when saving fails" {
+    // Root ignores directory permissions, so the rename cannot be made to fail.
+    if (std.c.geteuid() == 0) return error.SkipZigTest;
+
+    const h = try ImapTestHarness.create(std.testing.allocator);
+    defer h.destroy();
+    try h.writeFile("mail/" ++ ImapTestHarness.user ++ "/new/1000.eml", test_message);
+    std.testing.allocator.free(try h.run("a SELECT INBOX"));
+
+    const new_dir = "mail/" ++ ImapTestHarness.user ++ "/new";
+    try std.testing.expect(std.c.chmod(new_dir, 0o555) == 0);
+    defer _ = std.c.chmod(new_dir, 0o755);
+
+    const resp = try h.run("b STORE 1 +FLAGS.SILENT (\\Seen)");
+    defer std.testing.allocator.free(resp);
+    // Even under .SILENT: the client must learn the flag did not stick.
+    try ImapTestHarness.expectContains(resp, "* 1 FETCH (UID 1 FLAGS ())");
+    try ImapTestHarness.expectContains(resp, "b NO");
+}
+
+test "FETCH answers every message in a sequence list, with its current flags" {
+    const h = try ImapTestHarness.create(std.testing.allocator);
+    defer h.destroy();
+    try h.writeFile("mail/" ++ ImapTestHarness.user ++ "/new/1000.eml", test_message);
+    try h.writeFile("mail/" ++ ImapTestHarness.user ++ "/new/2000.eml", test_message);
+    try h.writeFile("mail/" ++ ImapTestHarness.user ++ "/new/3000.eml", test_message);
+    std.testing.allocator.free(try h.run("a SELECT INBOX"));
+
+    try std.testing.expect(renameFile(
+        "mail/" ++ ImapTestHarness.user ++ "/new/3000.eml",
+        "mail/" ++ ImapTestHarness.user ++ "/new/3000.eml:2,S",
+    ));
+
+    const resp = try h.run("b FETCH 1,3 (FLAGS)");
+    defer std.testing.allocator.free(resp);
+    try ImapTestHarness.expectContains(resp, "* 1 FETCH (UID 1 FLAGS ())");
+    try ImapTestHarness.expectContains(resp, "* 3 FETCH (UID 3 FLAGS (\\Seen))");
+    try std.testing.expect(std.mem.indexOf(u8, resp, "* 2 FETCH") == null);
+}
+
+test "FETCH echoes the header section it was asked for and returns only those fields" {
+    const h = try ImapTestHarness.create(std.testing.allocator);
+    defer h.destroy();
+    try h.writeFile("mail/" ++ ImapTestHarness.user ++ "/new/1000.eml", test_message);
+    std.testing.allocator.free(try h.run("a SELECT INBOX"));
+
+    const fields = try h.run("b FETCH 1 (BODY.PEEK[HEADER.FIELDS (SUBJECT FROM)])");
+    defer std.testing.allocator.free(fields);
+    const want = "Subject: Hello there\r\nFrom: Sender <s@example.org>\r\n\r\n";
+    var expect_buf: [128]u8 = undefined;
+    const item = try std.fmt.bufPrint(&expect_buf, "BODY[HEADER.FIELDS (SUBJECT FROM)] {{{d}}}\r\n", .{want.len});
+    try ImapTestHarness.expectContains(fields, item);
+    try ImapTestHarness.expectContains(fields, want ++ ")");
+    try std.testing.expect(std.mem.indexOf(u8, fields, "Received:") == null);
+
+    const not = try h.run("c FETCH 1 (BODY.PEEK[HEADER.FIELDS.NOT (RECEIVED TO DATE)])");
+    defer std.testing.allocator.free(not);
+    try ImapTestHarness.expectContains(not, "BODY[HEADER.FIELDS.NOT (RECEIVED TO DATE)] {");
+    try std.testing.expect(std.mem.indexOf(u8, not, "Received:") == null);
+    try ImapTestHarness.expectContains(not, "Subject: Hello there");
+
+    // A header section and a body section in one FETCH: both come back.
+    const both = try h.run("d FETCH 1 (BODY.PEEK[HEADER.FIELDS (SUBJECT)] BODY.PEEK[TEXT])");
+    defer std.testing.allocator.free(both);
+    try ImapTestHarness.expectContains(both, "BODY[HEADER.FIELDS (SUBJECT)] {");
+    try ImapTestHarness.expectContains(both, "BODY[TEXT] {11}\r\nBody line\r\n)");
+
+    // PEEK leaves the message unread.
+    try std.testing.expect(h.exists("mail/" ++ ImapTestHarness.user ++ "/new/1000.eml"));
+}
+
+test "FETCH returns INTERNALDATE whenever it is requested" {
+    const h = try ImapTestHarness.create(std.testing.allocator);
+    defer h.destroy();
+    try h.writeFile("mail/" ++ ImapTestHarness.user ++ "/new/1789571792269.1.eml", test_message);
+    std.testing.allocator.free(try h.run("a SELECT INBOX"));
+
+    const resp = try h.run("b FETCH 1:* (UID FLAGS RFC822.SIZE INTERNALDATE)");
+    defer std.testing.allocator.free(resp);
+    // No timestamp-only filename here, so the date comes from the Date header.
+    try ImapTestHarness.expectContains(resp, "INTERNALDATE \"16-Sep-2026 08:16:30 -0700\"");
+    try ImapTestHarness.expectContains(resp, "RFC822.SIZE");
+}
+
+test "STATUS UIDNEXT exceeds every UID before the mailbox is ever selected" {
+    const h = try ImapTestHarness.create(std.testing.allocator);
+    defer h.destroy();
+    try h.writeFile("mail/" ++ ImapTestHarness.user ++ "/new/1000.eml", test_message);
+    try h.writeFile("mail/" ++ ImapTestHarness.user ++ "/new/2000.eml", test_message);
+    try h.writeFile("mail/" ++ ImapTestHarness.user ++ "/new/3000.eml", test_message);
+
+    const inbox = try h.run("a STATUS INBOX (MESSAGES UIDNEXT)");
+    defer std.testing.allocator.free(inbox);
+    try ImapTestHarness.expectContains(inbox, "MESSAGES 3 UIDNEXT 4");
+
+    const all_mail = try h.run("b STATUS \"All Mail\" (MESSAGES UIDNEXT)");
+    defer std.testing.allocator.free(all_mail);
+    try ImapTestHarness.expectContains(all_mail, "MESSAGES 3 UIDNEXT 4");
+
+    // SELECT agrees with what STATUS promised.
+    const select = try h.run("c SELECT \"All Mail\"");
+    defer std.testing.allocator.free(select);
+    try ImapTestHarness.expectContains(select, "[UIDNEXT 4]");
+}
+
+test "the name resolver follows a renamed message by its base name" {
+    const allocator = std.testing.allocator;
+    const dir = "/tmp/mail-resolver-test";
+    fs_compat.cwd().deleteTree(dir) catch {};
+    try fs_compat.cwd().makePath(dir);
+    defer fs_compat.cwd().deleteTree(dir) catch {};
+    for ([_][]const u8{ dir ++ "/100.eml:2,S", dir ++ "/200.eml" }) |p| {
+        const f = try fs_compat.cwd().createFile(p, .{});
+        f.close();
+    }
+
+    var resolver = MaildirNameResolver.init(allocator);
+    defer resolver.deinit();
+    try std.testing.expectEqualStrings("100.eml:2,S", (try resolver.resolve(dir, "100.eml")).?);
+    const same = "200.eml";
+    try std.testing.expectEqual(@as([*]const u8, same.ptr), (try resolver.resolve(dir, same)).?.ptr);
+    try std.testing.expect((try resolver.resolve(dir, "300.eml:2,S")) == null);
 }
