@@ -356,6 +356,63 @@ fn ensureSubmissionHeaders(allocator: std.mem.Allocator, message_data: *std.Arra
     }
 }
 
+/// The RFC 3848 keyword for the Received header's `with` clause: ESMTP, plus
+/// S when the session ran over TLS and A when the client authenticated.
+fn receivedProtocol(over_tls: bool, authenticated: bool) []const u8 {
+    if (over_tls and authenticated) return "ESMTPSA";
+    if (over_tls) return "ESMTPS";
+    if (authenticated) return "ESMTPA";
+    return "ESMTP";
+}
+
+/// Append a client-supplied token (a HELO name, an address) to a header,
+/// keeping only visible ASCII. The HELO is whatever the client typed: a CR or
+/// LF in it would start a header of the client's choosing.
+fn appendTraceToken(allocator: std.mem.Allocator, out: *std.ArrayList(u8), token: []const u8, fallback: []const u8) !void {
+    const start = out.items.len;
+    for (token[0..@min(token.len, 255)]) |c| {
+        if (c > 0x20 and c < 0x7f and c != '(' and c != ')' and c != ';') try out.append(allocator, c);
+    }
+    if (out.items.len == start) try out.appendSlice(allocator, fallback);
+}
+
+/// The trace header RFC 5321 §4.4 requires of every server that accepts a
+/// message: "from" the client's HELO and address, "by" this host, "with" the
+/// protocol, and when. Without it, mail this server relays reaches the next
+/// hop with no record of where it entered the system, which receivers such as
+/// Gmail weigh against it. `for` names the recipient only when there is one,
+/// so a message to several never lists the others.
+fn formatReceivedHeader(
+    allocator: std.mem.Allocator,
+    helo: []const u8,
+    remote_addr: []const u8,
+    our_hostname: []const u8,
+    over_tls: bool,
+    authenticated: bool,
+    single_recipient: ?[]const u8,
+    date: []const u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "Received: from ");
+    try appendTraceToken(allocator, &out, helo, "unknown");
+    try out.appendSlice(allocator, " ([");
+    try appendTraceToken(allocator, &out, remote_addr, "unknown");
+    try out.appendSlice(allocator, "])\n\tby ");
+    try appendTraceToken(allocator, &out, our_hostname, "localhost");
+    try out.appendSlice(allocator, " with ");
+    try out.appendSlice(allocator, receivedProtocol(over_tls, authenticated));
+    if (single_recipient) |rcpt| {
+        try out.appendSlice(allocator, "\n\tfor <");
+        try appendTraceToken(allocator, &out, rcpt, "unknown");
+        try out.append(allocator, '>');
+    }
+    try out.appendSlice(allocator, ";\n\t");
+    try out.appendSlice(allocator, date);
+    try out.append(allocator, '\n');
+    return out.toOwnedSlice(allocator);
+}
+
 /// Extract the domain from the From header's address: `X <a@b.com>` -> `b.com`,
 /// `a@b.com` -> `b.com`. Returns null when there's no From header or address.
 fn fromHeaderDomain(headers: []const u8) ?[]const u8 {
@@ -1230,6 +1287,35 @@ pub const Session = struct {
         return pass;
     }
 
+    /// Headers every accepted message gets before anything else reads it,
+    /// whichever command (DATA or BDAT) carried it.
+    ///
+    /// A submission without a Message-ID or Date is rejected or penalized by
+    /// Gmail and others, so an authenticated client that omitted either gets
+    /// one, before DKIM signing so the signature covers it. Then the Received
+    /// trace header, on top. Best-effort: a message is never refused over its
+    /// trace header.
+    fn stampAcceptedMessage(self: *Session, message: *std.ArrayList(u8)) void {
+        if (self.authenticated) {
+            ensureSubmissionHeaders(self.allocator, message, self.config.hostname) catch {};
+        }
+        const date = time_compat.formatRfc5322Date(self.allocator, time_compat.timestamp()) catch return;
+        defer self.allocator.free(date);
+        const single = if (self.rcpt_to.items.len == 1) self.rcpt_to.items[0] else null;
+        const received = formatReceivedHeader(
+            self.allocator,
+            self.client_hostname orelse "",
+            self.remote_addr,
+            self.config.hostname,
+            self.conn_wrapper.using_tls,
+            self.authenticated,
+            single,
+            date,
+        ) catch return;
+        defer self.allocator.free(received);
+        message.insertSlice(self.allocator, 0, received) catch {};
+    }
+
     fn handleData(self: *Session, writer: anytype) !void {
         if (self.state != .RcptTo) {
             try self.sendResponse(writer, 503, "Bad sequence of commands", null);
@@ -1311,13 +1397,7 @@ pub const Session = struct {
             }
         }
 
-        // Header safety net: a submission without a Message-ID or Date is
-        // rejected/penalized by Gmail and others. If an authenticated client
-        // omitted either, synthesize it before processing so the message is
-        // well-formed (and DKIM can cover it).
-        if (self.authenticated) {
-            ensureSubmissionHeaders(self.allocator, &message_data, self.config.hostname) catch {};
-        }
+        self.stampAcceptedMessage(&message_data);
 
         // === Inbound authentication: SPF/DKIM/DMARC/ARC ===
         // Only for unauthenticated (inbound) mail — submission clients are
@@ -1661,6 +1741,9 @@ pub const Session = struct {
                     msg_buf.appendSlice(self.allocator, message) catch break :blk false;
                     break :blk true;
                 };
+                // The same trace and submission headers as the DATA path: a
+                // client that submits with CHUNKING used to skip both.
+                if (have_copy) self.stampAcceptedMessage(&msg_buf);
                 if (have_copy and shouldRunInboundPipeline(
                     self.authenticated,
                     self.config.antispam_check,
@@ -2545,3 +2628,35 @@ pub const Session = struct {
         }
     }
 };
+
+test "Received header: from, by, with and for, per RFC 5321 4.4" {
+    const a = std.testing.allocator;
+    const hdr = try formatReceivedHeader(a, "mail.stacksjs.com", "178.105.248.188", "mail.stacksjs.com", true, true, "chris@example.com", "Tue, 29 Sep 2026 16:39:46 +0000");
+    defer a.free(hdr);
+    try std.testing.expectEqualStrings(
+        "Received: from mail.stacksjs.com ([178.105.248.188])\n\tby mail.stacksjs.com with ESMTPSA\n\tfor <chris@example.com>;\n\tTue, 29 Sep 2026 16:39:46 +0000\n",
+        hdr,
+    );
+}
+
+test "Received header: protocol keyword follows TLS and auth (RFC 3848)" {
+    try std.testing.expectEqualStrings("ESMTP", receivedProtocol(false, false));
+    try std.testing.expectEqualStrings("ESMTPS", receivedProtocol(true, false));
+    try std.testing.expectEqualStrings("ESMTPA", receivedProtocol(false, true));
+    try std.testing.expectEqualStrings("ESMTPSA", receivedProtocol(true, true));
+}
+
+test "Received header: a HELO cannot inject a header, and several recipients stay private" {
+    const a = std.testing.allocator;
+    const hdr = try formatReceivedHeader(a, "evil\r\nBcc: victim@example.com", "10.0.0.1", "mx.local", false, false, null, "Tue, 29 Sep 2026 16:39:46 +0000");
+    defer a.free(hdr);
+    // One header: the only line breaks are the header's own folds.
+    try std.testing.expect(std.mem.indexOf(u8, hdr, "\nBcc:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, hdr, "\r") == null);
+    try std.testing.expect(std.mem.indexOf(u8, hdr, "for <") == null);
+    try std.testing.expect(std.mem.startsWith(u8, hdr, "Received: from evilBcc:victim@example.com ([10.0.0.1])"));
+
+    const blank = try formatReceivedHeader(a, "", "", "mx.local", false, false, null, "d");
+    defer a.free(blank);
+    try std.testing.expect(std.mem.startsWith(u8, blank, "Received: from unknown ([unknown])"));
+}
