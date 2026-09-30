@@ -231,6 +231,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tests/e2e_test.zig"),
         .target = target,
         .optimize = optimize,
+        // It reads MAIL_E2E_SMTP with libc's getenv. macOS links libc
+        // implicitly, so this compiled there and failed only on Linux CI.
+        .link_libc = true,
     });
     const e2e_tests = b.addTest(.{
         .root_module = e2e_module,
