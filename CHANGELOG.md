@@ -1,5 +1,30 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.10...v0.3.11)
+
+## 🐛 Bug Fixes
+
+- **build**: link libc for the e2e tests on Linux ([e7b5f4d](https://github.com/mail-os/mail/commit/e7b5f4d)) _(by Chris <chris@stacksjs.com>)_
+- **antispam**: DANE, MTA-STS and TLS-RPT did not compile ([328dea2](https://github.com/mail-os/mail/commit/328dea2)) _(by Chris <chris@stacksjs.com>)_
+- **smtp**: make accepted connections blocking on every platform ([d7fbcdb](https://github.com/mail-os/mail/commit/d7fbcdb)) _(by Chris <chris@stacksjs.com>)_
+- **smtp**: answer VRFY with 252 and HELP with 214 ([42c9371](https://github.com/mail-os/mail/commit/42c9371)) _(by Chris <chris@stacksjs.com>)_
+- **smtp**: accept long DATA lines; answer oversize mail, don't drop it ([d9bec96](https://github.com/mail-os/mail/commit/d9bec96)) _(by Chris <chris@stacksjs.com>)_
+- **auth**: name the account on every failed login ([01c102d](https://github.com/mail-os/mail/commit/01c102d)) _(by Chris <chrisbreuer93@gmail.com>)_
+- **smtp**: stamp every accepted message with a Received header ([37570ed](https://github.com/mail-os/mail/commit/37570ed)) _(by Chris <chris@stacksjs.com>)_
+
+## ✅ Tests
+
+- run the RFC, fuzz and e2e suites, and keep CI running them ([396200b](https://github.com/mail-os/mail/commit/396200b)) _(by Chris <chris@stacksjs.com>)_
+- fix ARC and BDAT unit tests that had never compiled ([7b9bc04](https://github.com/mail-os/mail/commit/7b9bc04)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.11 ([bc47fa2](https://github.com/mail-os/mail/commit/bc47fa2)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.9...v0.3.10)
 
 ## 🐛 Bug Fixes
