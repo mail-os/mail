@@ -342,7 +342,7 @@ pub const DANEPolicy = struct {
     pub fn init(allocator: std.mem.Allocator, domain: []const u8, cache_ttl: u32) !DANEPolicy {
         return .{
             .domain = try allocator.dupe(u8, domain),
-            .records = .{},
+            .records = .empty,
             .last_checked = time_compat.timestamp(),
             .cache_ttl = cache_ttl,
             .allocator = allocator,

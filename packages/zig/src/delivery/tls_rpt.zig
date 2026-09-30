@@ -406,7 +406,7 @@ pub const TLSReportAggregator = struct {
             result.value_ptr.* = .{
                 .successful_sessions = 0,
                 .failed_sessions = 0,
-                .failures = .{},
+                .failures = .empty,
             };
         } else {
             key.free(self.allocator);
@@ -438,7 +438,7 @@ pub const TLSReportAggregator = struct {
             result.value_ptr.* = .{
                 .successful_sessions = 0,
                 .failed_sessions = 0,
-                .failures = .{},
+                .failures = .empty,
             };
         } else {
             key.free(self.allocator);

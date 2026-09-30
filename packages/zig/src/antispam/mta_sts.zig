@@ -79,7 +79,7 @@ pub const MTASTSPolicy = struct {
         return .{
             .version = "",
             .mode = .none,
-            .mx_patterns = .{},
+            .mx_patterns = .empty,
             .max_age = 0,
             .policy_id = "",
             .fetched_at = 0,
