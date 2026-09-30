@@ -229,6 +229,8 @@ pub const SMTPCommand = enum {
     QUIT,
     AUTH,
     STARTTLS,
+    VRFY,
+    HELP,
     UNKNOWN,
 };
 
@@ -1291,6 +1293,12 @@ pub const Session = struct {
             },
             .AUTH => try self.handleAuth(writer, line),
             .STARTTLS => try self.handleStartTls(writer),
+            // RFC 5321 4.5.1 lists VRFY among the commands every server
+            // implements; 252 is the answer that confirms nothing about which
+            // addresses exist (3.5.3), so it cannot be used to harvest them.
+            .VRFY => try self.sendResponse(writer, 252, "2.5.0 Cannot VRFY user, but will accept message and attempt delivery", null),
+            // EHLO advertises HELP, so answer it.
+            .HELP => try self.sendResponse(writer, 214, "2.0.0 See RFC 5321", null),
             .UNKNOWN => try self.sendResponse(writer, 500, "Syntax error, command unrecognized", null),
         }
 
@@ -1319,6 +1327,8 @@ pub const Session = struct {
         if (std.ascii.eqlIgnoreCase(cmd_str, "QUIT")) return .QUIT;
         if (std.ascii.eqlIgnoreCase(cmd_str, "AUTH")) return .AUTH;
         if (std.ascii.eqlIgnoreCase(cmd_str, "STARTTLS")) return .STARTTLS;
+        if (std.ascii.eqlIgnoreCase(cmd_str, "VRFY")) return .VRFY;
+        if (std.ascii.eqlIgnoreCase(cmd_str, "HELP")) return .HELP;
 
         return .UNKNOWN;
     }
