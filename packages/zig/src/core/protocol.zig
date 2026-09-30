@@ -483,6 +483,291 @@ fn headerPresent(headers: []const u8, name_lower: []const u8) bool {
     return false;
 }
 
+/// Incremental decoder for the DATA content stream (RFC 5321 §4.5.2).
+///
+/// Fed whatever the socket delivered, in chunks of any size, it undoes dot
+/// stuffing, normalizes line endings to LF (the form the rest of the pipeline
+/// and the maildir store use) and stops exactly after the end-of-data line,
+/// so bytes a PIPELINING client sent behind the "." stay unread for the
+/// command loop.
+///
+/// There is no line length limit. RFC 5321 §4.5.3.1.6 caps what a sender may
+/// emit at 1000 octets, but real mail (HTML newsletters, unwrapped base64)
+/// exceeds it, and refusing it helps nobody: the only bound that matters is
+/// the message size, which is enforced here. A message over that size is not
+/// an error mid-stream either: the decoder keeps consuming (and discarding) to
+/// the end-of-data line, so the session can answer 552 to the transaction and
+/// carry on with the next command instead of being dropped.
+///
+/// End of data is recognized only as <CRLF>.<CRLF>. A "." line delimited by a
+/// bare LF on either side is content. Accepting "<LF>.<LF>" as well is what
+/// made SMTP smuggling work (CVE-2023-51764/51765/51766): another server
+/// passes such a sequence through as data, and a receiver that ends the
+/// message there reads the rest as a second, forged transaction. Bare LF is
+/// still accepted as a line ending for content, as before.
+pub const DataDecoder = struct {
+    max_size: usize,
+    state: State = .line_start,
+    /// Whether the line now being decoded began right after a CRLF. The
+    /// DATA command itself is the first such line break.
+    line_after_crlf: bool = true,
+    /// Set once the end-of-data line has been consumed.
+    done: bool = false,
+    /// Set once the decoded message would exceed `max_size`. From then on
+    /// the output is freed and further content is discarded.
+    too_large: bool = false,
+
+    const State = enum {
+        /// Nothing of the current line seen yet.
+        line_start,
+        /// The line so far is ".".
+        dot,
+        /// The line so far is ".\r".
+        dot_cr,
+        /// Inside a line.
+        body,
+        /// Inside a line whose last byte was a CR, held back until we know
+        /// whether an LF follows it.
+        body_cr,
+    };
+
+    pub fn init(max_size: usize) DataDecoder {
+        return .{ .max_size = max_size };
+    }
+
+    /// Decode `data` into `out`. Returns how many bytes of `data` belong to
+    /// the message; it is less than `data.len` only when the end-of-data
+    /// line ends inside `data`, and the rest belongs to the next command.
+    pub fn feed(self: *DataDecoder, allocator: std.mem.Allocator, out: *std.ArrayList(u8), data: []const u8) !usize {
+        var i: usize = 0;
+        while (i < data.len and !self.done) {
+            switch (self.state) {
+                .line_start => {
+                    if (data[i] == '.') {
+                        self.state = .dot;
+                        i += 1;
+                    } else {
+                        self.state = .body;
+                    }
+                },
+                .dot => switch (data[i]) {
+                    '\r' => {
+                        self.state = .dot_cr;
+                        i += 1;
+                    },
+                    '\n' => {
+                        // "." ended by a bare LF: content, never the terminator.
+                        try self.emit(allocator, out, ".\n");
+                        self.line_after_crlf = false;
+                        self.state = .line_start;
+                        i += 1;
+                    },
+                    // A leading dot with more on the line is stuffing: drop it.
+                    else => self.state = .body,
+                },
+                .dot_cr => {
+                    if (data[i] == '\n') {
+                        i += 1;
+                        if (self.line_after_crlf) {
+                            self.done = true;
+                        } else {
+                            // "<LF>.<CRLF>": the smuggling shape, kept as content.
+                            try self.emit(allocator, out, ".\n");
+                            self.line_after_crlf = true;
+                            self.state = .line_start;
+                        }
+                    } else {
+                        // ".\r" followed by more: the dot was stuffing, the CR is content.
+                        try self.emit(allocator, out, "\r");
+                        self.state = .body;
+                    }
+                },
+                .body => {
+                    const rest = data[i..];
+                    if (std.mem.indexOfScalar(u8, rest, '\n')) |nl| {
+                        const crlf = nl > 0 and rest[nl - 1] == '\r';
+                        try self.emit(allocator, out, rest[0..if (crlf) nl - 1 else nl]);
+                        try self.emit(allocator, out, "\n");
+                        self.line_after_crlf = crlf;
+                        self.state = .line_start;
+                        i += nl + 1;
+                    } else if (rest[rest.len - 1] == '\r') {
+                        try self.emit(allocator, out, rest[0 .. rest.len - 1]);
+                        self.state = .body_cr;
+                        i = data.len;
+                    } else {
+                        try self.emit(allocator, out, rest);
+                        i = data.len;
+                    }
+                },
+                .body_cr => {
+                    if (data[i] == '\n') {
+                        try self.emit(allocator, out, "\n");
+                        self.line_after_crlf = true;
+                        self.state = .line_start;
+                        i += 1;
+                    } else {
+                        try self.emit(allocator, out, "\r");
+                        self.state = .body;
+                    }
+                },
+            }
+        }
+        return i;
+    }
+
+    fn emit(self: *DataDecoder, allocator: std.mem.Allocator, out: *std.ArrayList(u8), bytes: []const u8) !void {
+        if (self.too_large or bytes.len == 0) return;
+        if (out.items.len + bytes.len > self.max_size) {
+            self.too_large = true;
+            out.clearAndFree(allocator);
+            return;
+        }
+        try out.appendSlice(allocator, bytes);
+    }
+};
+
+/// `s` repeated `n` times, at compile time (test fixtures).
+fn repeatStr(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    comptime {
+        @setEvalBranchQuota(1_000_000);
+        var out: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+        const final = out;
+        return &final;
+    }
+}
+
+/// Feed `input` to a fresh decoder in pieces of `piece` bytes, the way a
+/// socket might deliver it. Returns the decoded message and how many input
+/// bytes the decoder claimed.
+fn decodeInPieces(allocator: std.mem.Allocator, input: []const u8, piece: usize, max_size: usize) !struct { out: std.ArrayList(u8), consumed: usize, decoder: DataDecoder } {
+    var decoder = DataDecoder.init(max_size);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var pos: usize = 0;
+    while (pos < input.len and !decoder.done) {
+        const end = @min(input.len, pos + piece);
+        pos += try decoder.feed(allocator, &out, input[pos..end]);
+    }
+    return .{ .out = out, .consumed = pos, .decoder = decoder };
+}
+
+test "DATA: a 10,000-character line is accepted whole" {
+    const a = std.testing.allocator;
+    const long = comptime repeatStr("x", 10_000);
+    const input = "Subject: long\r\n\r\n" ++ long ++ "\r\nend\r\n.\r\n";
+    for ([_]usize{ 1, 7, 4096, input.len }) |piece| {
+        var r = try decodeInPieces(a, input, piece, 1 << 20);
+        defer r.out.deinit(a);
+        try std.testing.expect(r.decoder.done);
+        try std.testing.expect(!r.decoder.too_large);
+        try std.testing.expectEqual(input.len, r.consumed);
+        try std.testing.expectEqualStrings("Subject: long\n\n" ++ long ++ "\nend\n", r.out.items);
+    }
+}
+
+test "DATA: lines at and around the old 4096-byte buffer boundary" {
+    const a = std.testing.allocator;
+    inline for (.{ 4094, 4095, 4096, 4097, 8192 }) |n| {
+        const line = comptime repeatStr("y", n);
+        const input = line ++ "\r\n" ++ line ++ "\r\n.\r\n";
+        // Pieces the size of the connection's read-ahead buffer put the CRLF
+        // exactly on, before and after a chunk boundary.
+        for ([_]usize{ 4096, 4095, 4097 }) |piece| {
+            var r = try decodeInPieces(a, input, piece, 1 << 20);
+            defer r.out.deinit(a);
+            try std.testing.expect(r.decoder.done);
+            try std.testing.expectEqualStrings(line ++ "\n" ++ line ++ "\n", r.out.items);
+        }
+    }
+}
+
+test "DATA: dot-stuffing is undone even when the dots straddle chunks" {
+    const a = std.testing.allocator;
+    const input = "..leading dot\r\n...two\r\n..\r\n.x\r\n.\r\n";
+    for (1..input.len + 1) |piece| {
+        var r = try decodeInPieces(a, input, piece, 1 << 20);
+        defer r.out.deinit(a);
+        try std.testing.expect(r.decoder.done);
+        try std.testing.expectEqualStrings(".leading dot\n..two\n.\nx\n", r.out.items);
+    }
+}
+
+test "DATA: end of data is found whatever read boundary splits <CRLF>.<CRLF>" {
+    const a = std.testing.allocator;
+    const input = "a\r\nb\r\n.\r\nQUIT\r\n";
+    const message_len = input.len - "QUIT\r\n".len;
+    for (1..input.len + 1) |piece| {
+        var r = try decodeInPieces(a, input, piece, 1 << 20);
+        defer r.out.deinit(a);
+        try std.testing.expect(r.decoder.done);
+        // The pipelined command behind the terminator is left unread.
+        try std.testing.expectEqual(message_len, r.consumed);
+        try std.testing.expectEqualStrings("a\nb\n", r.out.items);
+    }
+    // Every split point of the terminator itself, fed as two reads.
+    for (1.."\r\n.\r\n".len) |cut| {
+        var d = DataDecoder.init(1 << 20);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        const whole = "body\r\n.\r\n";
+        const split = "body".len + cut;
+        _ = try d.feed(a, &out, whole[0..split]);
+        try std.testing.expect(!d.done);
+        _ = try d.feed(a, &out, whole[split..]);
+        try std.testing.expect(d.done);
+        try std.testing.expectEqualStrings("body\n", out.items);
+    }
+}
+
+test "DATA: an empty message and a CR that is not part of a line ending" {
+    const a = std.testing.allocator;
+    var empty = try decodeInPieces(a, ".\r\n", 1, 1 << 20);
+    defer empty.out.deinit(a);
+    try std.testing.expect(empty.decoder.done);
+    try std.testing.expectEqualStrings("", empty.out.items);
+
+    var cr = try decodeInPieces(a, "a\rb\r\r\n.\r\n", 1, 1 << 20);
+    defer cr.out.deinit(a);
+    try std.testing.expectEqualStrings("a\rb\r\n", cr.out.items);
+}
+
+test "DATA: a dot line delimited by a bare LF does not end the message (SMTP smuggling)" {
+    const a = std.testing.allocator;
+    const smuggled = "legit\r\n\n.\nMAIL FROM:<x@y>\r\n\n.\r\nstill body\r\n.\r\n";
+    for ([_]usize{ 1, smuggled.len }) |piece| {
+        var r = try decodeInPieces(a, smuggled, piece, 1 << 20);
+        defer r.out.deinit(a);
+        try std.testing.expect(r.decoder.done);
+        try std.testing.expectEqual(smuggled.len, r.consumed);
+        try std.testing.expectEqualStrings("legit\n\n.\nMAIL FROM:<x@y>\n\n.\nstill body\n", r.out.items);
+    }
+    // Bare LF line endings in content are still accepted.
+    var lf = try decodeInPieces(a, "one\ntwo\r\n.\r\n", 3, 1 << 20);
+    defer lf.out.deinit(a);
+    try std.testing.expectEqualStrings("one\ntwo\n", lf.out.items);
+}
+
+test "DATA: an oversize message is drained to its end, not cut off" {
+    const a = std.testing.allocator;
+    const input = comptime repeatStr(repeatStr("z", 3000) ++ "\r\n", 4) ++ ".\r\nRSET\r\n";
+    var r = try decodeInPieces(a, input, 512, 5000);
+    defer r.out.deinit(a);
+    try std.testing.expect(r.decoder.done);
+    try std.testing.expect(r.decoder.too_large);
+    try std.testing.expectEqual(input.len - "RSET\r\n".len, r.consumed);
+    try std.testing.expectEqual(@as(usize, 0), r.out.items.len);
+
+    // Exactly at the limit is fine; one byte over is not.
+    var at = try decodeInPieces(a, "abcd\r\n.\r\n", 4, 5);
+    defer at.out.deinit(a);
+    try std.testing.expect(!at.decoder.too_large);
+    var over = try decodeInPieces(a, "abcde\r\n.\r\n", 4, 5);
+    defer over.out.deinit(a);
+    try std.testing.expect(over.decoder.too_large);
+}
+
 pub const SessionState = enum {
     Initial,
     Greeted,
@@ -541,6 +826,24 @@ pub const ConnectionWrapper = struct {
         @memcpy(buffer[0..to_copy], self.read_buf[self.read_buf_start..][0..to_copy]);
         self.read_buf_start += to_copy;
         return to_copy;
+    }
+
+    /// The unconsumed read-ahead bytes, refilled with one read() when there
+    /// are none. An empty slice means the peer closed the connection. Nothing
+    /// is consumed: the caller says how much it used with consumeBuffered(),
+    /// and whatever it leaves stays buffered for the next reader.
+    pub fn fillBuffered(self: *ConnectionWrapper) ![]const u8 {
+        if (self.read_buf_start == self.read_buf_end) {
+            const n = try self.rawRead(self.read_buf[0..]);
+            self.read_buf_start = 0;
+            self.read_buf_end = n;
+        }
+        return self.read_buf[self.read_buf_start..self.read_buf_end];
+    }
+
+    pub fn consumeBuffered(self: *ConnectionWrapper, n: usize) void {
+        std.debug.assert(n <= self.read_buf_end - self.read_buf_start);
+        self.read_buf_start += n;
     }
 
     /// Hand back any read-ahead bytes without touching the socket. Called
@@ -798,7 +1101,10 @@ pub const Session = struct {
             .tls_reader_info = null,
             .tls_writer_info = null,
             .bdat_session = null,
-            .chunking_handler = chunking.ChunkingHandler.init(allocator, 10 * 1024 * 1024, cfg.max_message_size),
+            // A chunk can be as large as the message it carries: Gmail sends a
+            // whole message as one BDAT LAST, so a lower per-chunk cap refused
+            // messages that the advertised SIZE allowed.
+            .chunking_handler = chunking.ChunkingHandler.init(allocator, cfg.max_message_size, cfg.max_message_size),
             .command_count = 0,
             .command_window_start = now,
         };
@@ -875,61 +1181,83 @@ pub const Session = struct {
         try self.sendResponse(null, 220, self.config.hostname, "ESMTP Service Ready");
         self.logger.info("SMTP: Greeting sent, waiting for client command", .{});
 
+        // RFC 5321 §4.5.3.1.4 allows 512 octets per command line; this is
+        // generous on purpose. A longer line is answered and skipped, not
+        // treated as a reason to drop the connection.
         var line_buffer: [4096]u8 = undefined;
         var line_pos: usize = 0;
+        var overlong = false;
 
         while (true) {
             // Check for timeout before each read
             try self.checkTimeout();
 
-            // Read until we hit \n (buffered: bulk syscalls, per-byte consume)
-            const byte_read = self.conn_wrapper.readBuffered(line_buffer[line_pos .. line_pos + 1]) catch |err| {
+            const chunk = self.conn_wrapper.fillBuffered() catch |err| {
                 self.logger.err("SMTP: Read error after {d} bytes: {}", .{ line_pos, err });
                 if (err == error.EndOfStream) break;
                 return err;
             };
 
-            if (byte_read == 0) {
+            if (chunk.len == 0) {
                 self.logger.info("SMTP: Client disconnected (0 bytes read, line_pos={d})", .{line_pos});
                 break;
             }
 
-            if (line_buffer[line_pos] == '\n') {
-                // Remove \r\n if present
-                const line = if (line_pos > 0 and line_buffer[line_pos - 1] == '\r')
-                    line_buffer[0 .. line_pos - 1]
-                else
-                    line_buffer[0..line_pos];
-
-                line_pos = 0;
-
-                // Update activity timestamp
-                self.updateActivity();
-
-                if (line.len == 0) continue;
-
-                // Log the command. On AUTH, redact the credential payload: the
-                // AUTH PLAIN/LOGIN initial-response is base64 that decodes to
-                // the account username+password, so it must never hit the logs.
-                if (line.len >= 4 and std.ascii.eqlIgnoreCase(line[0..4], "AUTH")) {
-                    const search_start = @min(line.len, 5);
-                    const mech_end = std.mem.indexOfScalarPos(u8, line, search_start, ' ') orelse line.len;
-                    const shown = line[0..mech_end];
-                    const san = sanitizeForLog(shown);
-                    self.logger.info("SMTP CMD: {s} <redacted>", .{sanitizedSlice(&san, shown.len)});
+            // Take only up to the end of this line: whatever follows it is
+            // the next pipelined command, or TLS handshake bytes after
+            // STARTTLS, or a BDAT payload, and stays buffered for its reader.
+            const newline = std.mem.indexOfScalar(u8, chunk, '\n');
+            const take = newline orelse chunk.len;
+            if (!overlong) {
+                if (line_pos + take > line_buffer.len) {
+                    overlong = true;
                 } else {
-                    const san = sanitizeForLog(line);
-                    self.logger.info("SMTP CMD: {s}", .{sanitizedSlice(&san, line.len)});
-                }
-
-                const should_quit = try self.processCommand(null, line);
-                if (should_quit) break;
-            } else {
-                line_pos += 1;
-                if (line_pos >= line_buffer.len) {
-                    return error.LineTooLong;
+                    @memcpy(line_buffer[line_pos..][0..take], chunk[0..take]);
+                    line_pos += take;
                 }
             }
+            if (newline == null) {
+                self.conn_wrapper.consumeBuffered(take);
+                continue;
+            }
+            self.conn_wrapper.consumeBuffered(take + 1);
+
+            // Remove \r\n if present
+            const line = if (line_pos > 0 and line_buffer[line_pos - 1] == '\r')
+                line_buffer[0 .. line_pos - 1]
+            else
+                line_buffer[0..line_pos];
+
+            line_pos = 0;
+
+            // Update activity timestamp
+            self.updateActivity();
+
+            if (overlong) {
+                overlong = false;
+                self.logger.warn("SMTP: command line over {d} bytes from {s}, rejected", .{ line_buffer.len, self.remote_addr });
+                try self.sendResponse(null, 500, "5.5.2 Line too long", null);
+                continue;
+            }
+
+            if (line.len == 0) continue;
+
+            // Log the command. On AUTH, redact the credential payload: the
+            // AUTH PLAIN/LOGIN initial-response is base64 that decodes to
+            // the account username+password, so it must never hit the logs.
+            if (line.len >= 4 and std.ascii.eqlIgnoreCase(line[0..4], "AUTH")) {
+                const search_start = @min(line.len, 5);
+                const mech_end = std.mem.indexOfScalarPos(u8, line, search_start, ' ') orelse line.len;
+                const shown = line[0..mech_end];
+                const san = sanitizeForLog(shown);
+                self.logger.info("SMTP CMD: {s} <redacted>", .{sanitizedSlice(&san, shown.len)});
+            } else {
+                const san = sanitizeForLog(line);
+                self.logger.info("SMTP CMD: {s}", .{sanitizedSlice(&san, line.len)});
+            }
+
+            const should_quit = try self.processCommand(null, line);
+            if (should_quit) break;
         }
     }
 
@@ -1341,60 +1669,39 @@ pub const Session = struct {
         // Pre-allocate to avoid repeated reallocations during message reception
         message_data.ensureTotalCapacity(self.allocator, @min(65536, self.config.max_message_size)) catch {};
 
-        var line_buffer: [4096]u8 = undefined;
-        var line_pos: usize = 0;
-        var prev_was_crlf = false;
-
         // Start DATA timeout timer
         const data_start_time = time_compat.milliTimestamp();
         const data_timeout_ms = @as(i64, self.config.data_timeout_seconds) * 1000;
 
-        while (true) {
+        // Whole read-ahead chunks go through the decoder, which copies runs
+        // of line content in bulk; no per-byte reads and no line length limit.
+        var decoder = DataDecoder.init(self.config.max_message_size);
+        while (!decoder.done) {
             // Check if DATA timeout has been exceeded
             const elapsed_ms = time_compat.milliTimestamp() - data_start_time;
             if (elapsed_ms > data_timeout_ms) {
                 self.logger.warn("DATA timeout exceeded for {s} after {d}ms", .{ self.remote_addr, elapsed_ms });
-                try self.sendResponse(writer, 451, "DATA timeout - message transfer took too long", null);
+                try self.sendResponse(writer, 451, "4.4.2 DATA timeout - message transfer took too long", null);
                 return error.DataTimeout;
             }
-            const byte_read = try self.conn_wrapper.readBuffered(line_buffer[line_pos .. line_pos + 1]);
-            if (byte_read == 0) break;
-
-            if (line_buffer[line_pos] == '\n') {
-                const line = if (line_pos > 0 and line_buffer[line_pos - 1] == '\r')
-                    line_buffer[0 .. line_pos - 1]
-                else
-                    line_buffer[0..line_pos];
-
-                line_pos = 0;
-                const trimmed = line;
-
-                // Check for end of data (single dot on a line by itself)
-                if (trimmed.len == 1 and trimmed[0] == '.') {
-                    // End of message data
-                    break;
-                }
-
-                // Handle transparency (remove leading dot if line starts with ..)
-                const data_line = if (trimmed.len > 1 and trimmed[0] == '.' and trimmed[1] == '.')
-                    trimmed[1..]
-                else
-                    trimmed;
-
-                // Enforce max message size before appending
-                if (message_data.items.len + data_line.len + 1 > self.config.max_message_size) {
-                    try self.sendResponse(writer, 552, "Message size exceeds maximum allowed", null);
-                    return;
-                }
-
-                try message_data.appendSlice(self.allocator, data_line);
-                try message_data.append(self.allocator, '\n');
-
-                prev_was_crlf = trimmed.len == 0;
-            } else {
-                line_pos += 1;
-                if (line_pos >= line_buffer.len) return error.LineTooLong;
+            const chunk = try self.conn_wrapper.fillBuffered();
+            if (chunk.len == 0) {
+                // The client went away before <CRLF>.<CRLF>. What arrived is
+                // a truncated message, and it was never accepted: drop it.
+                self.logger.warn("SMTP: connection from {s} closed during DATA after {d} bytes; message discarded", .{ self.remote_addr, message_data.items.len });
+                return;
             }
+            const used = try decoder.feed(self.allocator, &message_data, chunk);
+            self.conn_wrapper.consumeBuffered(used);
+        }
+
+        if (decoder.too_large) {
+            self.logger.warn("SMTP: message from {s} over the {d}-byte limit, rejected", .{ self.remote_addr, self.config.max_message_size });
+            try self.sendResponse(writer, 552, "5.3.4 Message size exceeds fixed maximum message size", null);
+            // The transaction is over; the session is not. No reply beyond
+            // the 552 (see resetTransactionState).
+            self.resetTransactionState();
+            return;
         }
 
         self.stampAcceptedMessage(&message_data);
@@ -1692,28 +1999,38 @@ pub const Session = struct {
             // the oversized chunk doesn't get parsed as commands. Other errors
             // are parse failures (size unknown, nothing to drain) or read
             // failures (connection already broken).
+            //
+            // Either way the transaction is over. Resetting it (rather than
+            // only dropping the chunks received so far) matters: the client
+            // has usually pipelined more BDATs, and with the state left at
+            // .Data they would start a fresh message and deliver its tail
+            // as if it were the whole thing. Reset, they get 503 and drain.
+            self.logger.err("BDAT error: {}", .{err});
             if (err == error.ChunkTooLarge) {
                 self.chunking_handler.drainBDAT(line, &self.conn_wrapper);
+                try self.sendResponse(writer, 552, "5.3.4 Message size exceeds fixed maximum message size", null);
+            } else {
+                try self.sendResponse(writer, 500, "BDAT command failed", null);
             }
-            try self.sendResponse(writer, 500, "BDAT command failed", null);
-            self.logger.err("BDAT error: {}", .{err});
-            if (self.bdat_session) |*session| {
-                var s = session.*;
-                s.deinit();
-                self.bdat_session = null;
-            }
+            self.resetTransactionState();
             return;
         };
 
-        // Add chunk to session
+        // Add chunk to session, enforcing the message size across chunks:
+        // each chunk is bounded on its own, their sum was not.
         if (self.bdat_session) |*session| {
-            session.addChunk(result.chunk_data, result.is_last) catch |err| {
-                try self.sendResponse(writer, 552, "Message size exceeds maximum allowed", null);
-                self.logger.err("BDAT session error: {}", .{err});
-                var s = session.*;
-                s.deinit();
-                self.bdat_session = null;
+            if (session.total_size + result.chunk_data.len > self.config.max_message_size) {
                 self.chunking_handler.freeChunk(result.chunk_data);
+                self.logger.warn("SMTP: BDAT message from {s} over the {d}-byte limit, rejected", .{ self.remote_addr, self.config.max_message_size });
+                try self.sendResponse(writer, 552, "5.3.4 Message size exceeds fixed maximum message size", null);
+                self.resetTransactionState();
+                return;
+            }
+            session.addChunk(result.chunk_data, result.is_last) catch |err| {
+                self.chunking_handler.freeChunk(result.chunk_data);
+                self.logger.err("BDAT session error: {}", .{err});
+                try self.sendResponse(writer, 554, "5.3.0 Transaction failed", null);
+                self.resetTransactionState();
                 return;
             };
         }
@@ -2661,4 +2978,253 @@ test "Received header: a HELO cannot inject a header, and several recipients sta
     const blank = try formatReceivedHeader(a, "", "", "mx.local", false, false, null, "d");
     defer a.free(blank);
     try std.testing.expect(std.mem.startsWith(u8, blank, "Received: from unknown ([unknown])"));
+}
+
+/// A real SMTP Session on one end of a socketpair, in a scratch directory (the
+/// session resolves `mail/...` against the working directory). The client
+/// script is written up front, then the session runs until QUIT or EOF, so the
+/// tests see the exact bytes a client would, split wherever the kernel splits
+/// them.
+const SmtpTestHarness = struct {
+    allocator: std.mem.Allocator,
+    root: []u8,
+    prev_cwd: [4096]u8 = undefined,
+    prev_cwd_len: usize = 0,
+    log: logger.Logger,
+    rate_limiter: security.RateLimiter,
+    peer: c_int,
+    session: Session,
+
+    const domain = "test.local";
+    const user = "uplink";
+
+    fn create(allocator: std.mem.Allocator, max_message_size: usize) !*SmtpTestHarness {
+        const h = try allocator.create(SmtpTestHarness);
+        errdefer allocator.destroy(h);
+        h.allocator = allocator;
+
+        var rnd: [8]u8 = undefined;
+        io_compat.randomBytes(&rnd);
+        h.root = try std.fmt.allocPrint(allocator, "/tmp/mail-smtp-test-{x}", .{std.mem.readInt(u64, &rnd, .little)});
+        try fs_compat.cwd().makePath(h.root);
+        const cwd_ptr = std.c.getcwd(&h.prev_cwd, h.prev_cwd.len) orelse return error.GetCwdFailed;
+        h.prev_cwd_len = std.mem.len(@as([*:0]u8, @ptrCast(cwd_ptr)));
+        const root_z = try allocator.dupeSentinel(u8, h.root, 0);
+        defer allocator.free(root_z);
+        if (std.c.chdir(root_z.ptr) != 0) return error.ChdirFailed;
+
+        h.log = try logger.Logger.init(allocator, .critical, null);
+        h.rate_limiter = security.RateLimiter.init(allocator, 60, 1000, 1000, 3600);
+
+        var fds: [2]c_int = undefined;
+        if (std.c.socketpair(std.posix.AF.UNIX, @intCast(@as(u32, std.posix.SOCK.STREAM)), 0, &fds) != 0) return error.SocketPairFailed;
+        // Room for a whole client script in flight: it is written before the
+        // session starts reading.
+        const bufsize: c_int = 1 << 20;
+        _ = std.c.setsockopt(fds[1], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&bufsize), @sizeOf(c_int));
+        _ = std.c.setsockopt(fds[0], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&bufsize), @sizeOf(c_int));
+        h.peer = fds[1];
+
+        const cfg = config.Config{
+            .host = "127.0.0.1",
+            .port = 25,
+            .max_connections = 10,
+            .enable_tls = false,
+            .tls_cert_path = null,
+            .tls_key_path = null,
+            .enable_auth = false,
+            .max_message_size = max_message_size,
+            .timeout_seconds = 60,
+            .data_timeout_seconds = 60,
+            .command_timeout_seconds = 60,
+            .greeting_timeout_seconds = 60,
+            .rate_limit_per_ip = 1000,
+            .rate_limit_per_user = 1000,
+            .rate_limit_cleanup_interval = 3600,
+            .max_recipients = 10,
+            .hostname = "mail." ++ domain,
+            .webhook_url = null,
+            .webhook_enabled = false,
+            .enable_dnsbl = false,
+            .enable_greylist = false,
+            .enable_tracing = false,
+            .tracing_service_name = "test",
+            .enable_json_logging = false,
+            // No DNS from a unit test.
+            .antispam_check = false,
+            .spam_filter_enabled = false,
+        };
+        h.session = try Session.init(allocator, .{ .fd = fds[0] }, cfg, &h.log, "127.0.0.1", &h.rate_limiter, null, null, null);
+        return h;
+    }
+
+    fn destroy(h: *SmtpTestHarness) void {
+        const allocator = h.allocator;
+        _ = std.c.close(h.session.connection.fd);
+        h.session.deinit();
+        _ = std.c.close(h.peer);
+        h.rate_limiter.deinit();
+        h.log.deinit();
+        h.prev_cwd[h.prev_cwd_len] = 0;
+        _ = std.c.chdir(@ptrCast(&h.prev_cwd));
+        fs_compat.cwd().deleteTree(h.root) catch {};
+        allocator.free(h.root);
+        allocator.destroy(h);
+    }
+
+    /// Send `script` as the client (then half-close), run the session to
+    /// completion, and return everything the server said.
+    fn converse(h: *SmtpTestHarness, script: []const u8) ![]u8 {
+        var off: usize = 0;
+        while (off < script.len) {
+            const n = std.c.write(h.peer, script[off..].ptr, script.len - off);
+            if (n <= 0) return error.WriteFailed;
+            off += @intCast(n);
+        }
+        _ = std.c.shutdown(h.peer, std.c.SHUT.WR);
+
+        try h.session.handle();
+
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(h.allocator);
+        const flags = std.c.fcntl(h.peer, std.c.F.GETFL, @as(c_int, 0));
+        const nonblock: c_int = @intCast(@as(u32, @bitCast(std.c.O{ .NONBLOCK = true })));
+        _ = std.c.fcntl(h.peer, std.c.F.SETFL, flags | nonblock);
+        var buf: [16384]u8 = undefined;
+        while (true) {
+            const n = std.c.read(h.peer, &buf, buf.len);
+            if (n <= 0) break;
+            try out.appendSlice(h.allocator, buf[0..@intCast(n)]);
+        }
+        return out.toOwnedSlice(h.allocator);
+    }
+
+    /// The messages delivered to the test mailbox, oldest first.
+    fn delivered(h: *SmtpTestHarness) ![][]u8 {
+        const dir = "mail/" ++ user ++ "/new";
+        const names = fs_compat.listEmlFiles(h.allocator, dir) catch |err| switch (err) {
+            error.FileNotFound => return h.allocator.alloc([]u8, 0),
+            else => return err,
+        };
+        defer {
+            for (names) |n| h.allocator.free(n);
+            h.allocator.free(names);
+        }
+        const out = try h.allocator.alloc([]u8, names.len);
+        for (names, 0..) |name, i| {
+            const path = try std.fmt.allocPrint(h.allocator, "{s}/{s}", .{ dir, name });
+            defer h.allocator.free(path);
+            out[i] = try fs_compat.readFileAlloc(h.allocator, path);
+        }
+        return out;
+    }
+
+    fn freeDelivered(h: *SmtpTestHarness, messages: [][]u8) void {
+        for (messages) |m| h.allocator.free(m);
+        h.allocator.free(messages);
+    }
+
+    /// The reply codes, in order, one per reply (multi-line replies count once).
+    fn replyCodes(replies: []const u8, buf: []u16) []u16 {
+        var n: usize = 0;
+        var it = std.mem.splitSequence(u8, replies, "\r\n");
+        while (it.next()) |line| {
+            if (line.len < 4 or line[3] != ' ') continue;
+            buf[n] = std.fmt.parseInt(u16, line[0..3], 10) catch continue;
+            n += 1;
+        }
+        return buf[0..n];
+    }
+
+    const envelope = "EHLO client.example\r\nMAIL FROM:<sender@example.org>\r\nRCPT TO:<" ++ user ++ "@" ++ domain ++ ">\r\nDATA\r\n";
+};
+
+test "SMTP session: a message with a 10,000-character line is delivered intact" {
+    const a = std.testing.allocator;
+    const h = try SmtpTestHarness.create(a, 1 << 20);
+    defer h.destroy();
+
+    const long = comptime repeatStr("L", 10_000);
+    const replies = try h.converse(SmtpTestHarness.envelope ++
+        "Subject: long line\r\n\r\n" ++ long ++ "\r\n..stuffed\r\n.\r\nQUIT\r\n");
+    defer a.free(replies);
+
+    var codes_buf: [16]u16 = undefined;
+    try std.testing.expectEqualSlices(u16, &.{ 220, 250, 250, 250, 354, 250, 221 }, SmtpTestHarness.replyCodes(replies, &codes_buf));
+
+    const messages = try h.delivered();
+    defer h.freeDelivered(messages);
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expect(std.mem.endsWith(u8, messages[0], "Subject: long line\n\n" ++ long ++ "\n.stuffed\n"));
+}
+
+test "SMTP session: an oversize message gets 552 and the session carries on" {
+    const a = std.testing.allocator;
+    const h = try SmtpTestHarness.create(a, 4096);
+    defer h.destroy();
+
+    const big = comptime repeatStr(repeatStr("B", 1000) ++ "\r\n", 12);
+    // The oversize body, then a second, small transaction on the same
+    // connection, pipelined straight behind the first "." as a client would.
+    const replies = try h.converse(SmtpTestHarness.envelope ++ big ++ ".\r\n" ++
+        "MAIL FROM:<sender@example.org>\r\nRCPT TO:<" ++ SmtpTestHarness.user ++ "@" ++ SmtpTestHarness.domain ++ ">\r\nDATA\r\n" ++
+        "Subject: small\r\n\r\nfits\r\n.\r\nQUIT\r\n");
+    defer a.free(replies);
+
+    var codes_buf: [16]u16 = undefined;
+    try std.testing.expectEqualSlices(u16, &.{ 220, 250, 250, 250, 354, 552, 250, 250, 354, 250, 221 }, SmtpTestHarness.replyCodes(replies, &codes_buf));
+    try std.testing.expect(std.mem.indexOf(u8, replies, "552 5.3.4 ") != null);
+
+    const messages = try h.delivered();
+    defer h.freeDelivered(messages);
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expect(std.mem.endsWith(u8, messages[0], "Subject: small\n\nfits\n"));
+}
+
+test "SMTP session: an overlong command line is refused, not a dropped connection" {
+    const a = std.testing.allocator;
+    const h = try SmtpTestHarness.create(a, 1 << 20);
+    defer h.destroy();
+
+    const replies = try h.converse("EHLO client.example\r\nNOOP " ++ comptime repeatStr("n", 9000) ++ "\r\nNOOP\r\nQUIT\r\n");
+    defer a.free(replies);
+
+    var codes_buf: [16]u16 = undefined;
+    try std.testing.expectEqualSlices(u16, &.{ 220, 250, 500, 250, 221 }, SmtpTestHarness.replyCodes(replies, &codes_buf));
+    try std.testing.expect(std.mem.indexOf(u8, replies, "500 5.5.2 Line too long") != null);
+}
+
+test "SMTP session: a connection lost inside DATA delivers nothing" {
+    const a = std.testing.allocator;
+    const h = try SmtpTestHarness.create(a, 1 << 20);
+    defer h.destroy();
+
+    // No terminating "." before the client goes away.
+    const replies = try h.converse(SmtpTestHarness.envelope ++ "Subject: cut off\r\n\r\npartial\r\n");
+    defer a.free(replies);
+
+    const messages = try h.delivered();
+    defer h.freeDelivered(messages);
+    try std.testing.expectEqual(@as(usize, 0), messages.len);
+}
+
+test "SMTP session: BDAT chunks over the message size are refused and the transaction reset" {
+    const a = std.testing.allocator;
+    const h = try SmtpTestHarness.create(a, 4096);
+    defer h.destroy();
+
+    const chunk = comptime repeatStr("C", 3000);
+    // Two chunks that fit one at a time but not together, then the pipelined
+    // LAST chunk, which must not become a message of its own.
+    const replies = try h.converse("EHLO client.example\r\nMAIL FROM:<sender@example.org>\r\nRCPT TO:<" ++
+        SmtpTestHarness.user ++ "@" ++ SmtpTestHarness.domain ++ ">\r\n" ++
+        "BDAT 3000\r\n" ++ chunk ++ "BDAT 3000\r\n" ++ chunk ++ "BDAT 5 LAST\r\ntail\n" ++ "NOOP\r\nQUIT\r\n");
+    defer a.free(replies);
+
+    var codes_buf: [16]u16 = undefined;
+    try std.testing.expectEqualSlices(u16, &.{ 220, 250, 250, 250, 250, 552, 503, 250, 221 }, SmtpTestHarness.replyCodes(replies, &codes_buf));
+
+    const messages = try h.delivered();
+    defer h.freeDelivered(messages);
+    try std.testing.expectEqual(@as(usize, 0), messages.len);
 }
