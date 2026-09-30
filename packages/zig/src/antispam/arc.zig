@@ -1730,12 +1730,12 @@ test "ARCValidator validate chain - valid single set" {
     var validator = ARCValidator.init(testing.allocator);
     defer validator.deinit();
 
-    // The chain is structurally valid, but the AMS/ARC-Seal signatures cannot be
-    // cryptographically verified (no DNS public-key fetch / RSA verifier is
-    // available to this module), so we must fail closed rather than trust
-    // forgeable structure. See validateChain for details.
+    // The chain is structurally valid, but the AMS/ARC-Seal signatures are
+    // not cryptographically verified here, so the verdict is .none: neither a
+    // pass that would trust forgeable structure nor a fail that claims a
+    // verification that never happened. See validateChain for details.
     const result = try validator.validateChain(headers);
-    try testing.expectEqual(ARCResult.fail, result);
+    try testing.expectEqual(ARCResult.none, result);
 }
 
 test "ARCValidator validateSet - valid first set" {
@@ -1825,7 +1825,9 @@ test "ARCValidator validateChainOrder - valid" {
     defer validator.deinit();
 
     var chain = ARCChain.init(testing.allocator);
-    defer chain.deinit();
+    // The sets below borrow string literals, so free only the list:
+    // chain.deinit() would free each literal as if it were owned.
+    defer chain.sets.deinit(testing.allocator);
 
     try chain.addSet(.{
         .instance = 1,
@@ -1851,7 +1853,9 @@ test "ARCValidator validateChainOrder - invalid gap" {
     defer validator.deinit();
 
     var chain = ARCChain.init(testing.allocator);
-    defer chain.deinit();
+    // The sets below borrow string literals, so free only the list:
+    // chain.deinit() would free each literal as if it were owned.
+    defer chain.sets.deinit(testing.allocator);
 
     try chain.addSet(.{
         .instance = 1,
@@ -2084,7 +2088,9 @@ test "ARCChain latestChainValidation" {
     const testing = std.testing;
 
     var chain = ARCChain.init(testing.allocator);
-    defer chain.deinit();
+    // The sets below borrow string literals, so free only the list:
+    // chain.deinit() would free each literal as if it were owned.
+    defer chain.sets.deinit(testing.allocator);
 
     // Empty chain
     try testing.expectEqual(ARCChainValidation.none, chain.latestChainValidation());
