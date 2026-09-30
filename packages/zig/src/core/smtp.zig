@@ -210,6 +210,13 @@ pub const Server = struct {
         defer ctx.connection.close();
         defer _ = ctx.server.active_connections.fetchSub(1, .monotonic);
 
+        // The listener is non-blocking, and on macOS and the BSDs an accepted
+        // socket inherits O_NONBLOCK. The session's reads assume blocking
+        // I/O, so there a client slower than the server's next read() got
+        // error.WouldBlock and a dropped connection. Linux does not inherit
+        // the flag; this makes every platform behave the same.
+        ctx.connection.setBlocking();
+
         // Socket-level read/write timeout (RFC 5321 §4.5.3.2 recommends a
         // 5-minute server timeout). Without it a silent client blocks this
         // thread in read() forever — the session's idle check only runs
