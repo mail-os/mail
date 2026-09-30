@@ -1922,7 +1922,8 @@ pub const Session = struct {
                         self.logger.info("User '{s}' authenticated successfully", .{sanitizedSlice(&safe_user, credentials.username.len)});
                         try self.sendResponse(writer, 235, "Authentication successful", null);
                     } else {
-                        self.logger.warn("Failed SMTP authentication from {s}", .{self.remote_addr});
+                        const safe_user = sanitizeForLog(credentials.username);
+                        self.logger.warn("Failed SMTP authentication for {s} from {s}", .{ sanitizedSlice(&safe_user, credentials.username.len), self.remote_addr });
                         try self.sendResponse(writer, 535, "Authentication failed", null);
                     }
                 } else {
@@ -2025,7 +2026,8 @@ pub const Session = struct {
                     self.logger.info("User '{s}' authenticated via LOGIN", .{sanitizedSlice(&safe_user, username.len)});
                     try self.sendResponse(writer, 235, "Authentication successful", null);
                 } else {
-                    self.logger.warn("Failed SMTP authentication from {s}", .{self.remote_addr});
+                    const safe_user = sanitizeForLog(username);
+                    self.logger.warn("Failed SMTP authentication for {s} from {s}", .{ sanitizedSlice(&safe_user, username.len), self.remote_addr });
                     try self.sendResponse(writer, 535, "Authentication failed", null);
                 }
             } else {

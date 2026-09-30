@@ -141,6 +141,7 @@ pub fn build(b: *std.Build) void {
         "src/dkim_verify_test.zig",
         "src/domain_migrate_test.zig",
         "src/core/version.zig",
+        "src/core/log_safe.zig",
         "src/upgrade_test.zig",
     };
 

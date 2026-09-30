@@ -8,6 +8,7 @@ const socket = @import("../core/socket_compat.zig");
 const io_compat = @import("../core/io_compat.zig");
 const auth = @import("../auth/auth.zig");
 const logger = @import("../core/logger.zig");
+const log_safe = @import("../core/log_safe.zig");
 const tls_mod = @import("../core/tls.zig");
 const tls = @import("tls");
 const fs_compat = @import("../core/fs_compat.zig");
@@ -2528,8 +2529,9 @@ pub const ImapSession = struct {
             return;
         };
 
+        var name_buf: log_safe.Buffer = undefined;
         if (!valid) {
-            std.log.warn("Failed IMAP authentication from {s}", .{self.connection.peerIp()});
+            std.log.warn("Failed IMAP authentication for {s} from {s}", .{ log_safe.account(&name_buf, username), self.connection.peerIp() });
             try self.sendResponse(tag, "NO", "LOGIN failed");
             return;
         }
@@ -2540,7 +2542,7 @@ pub const ImapSession = struct {
         self.username = try self.auth_backend.canonicalUsername(username, self.allocator);
         self.state = .authenticated;
 
-        std.log.info("Successful IMAP login for user: {s}", .{username});
+        std.log.info("Successful IMAP login for user: {s}", .{log_safe.account(&name_buf, username)});
         try self.sendResponse(tag, "OK", "LOGIN completed");
     }
 
@@ -2598,8 +2600,9 @@ pub const ImapSession = struct {
                 try self.sendResponse(tag, "NO", "Authentication failed");
                 return;
             };
+            var name_buf: log_safe.Buffer = undefined;
             if (!valid) {
-                std.log.warn("Failed IMAP authentication from {s}", .{self.connection.peerIp()});
+                std.log.warn("Failed IMAP authentication for {s} from {s}", .{ log_safe.account(&name_buf, username), self.connection.peerIp() });
                 try self.sendResponse(tag, "NO", "Authentication failed");
                 return;
             }
@@ -2609,7 +2612,7 @@ pub const ImapSession = struct {
                 return;
             };
             self.state = .authenticated;
-            std.log.info("Successful IMAP AUTH LOGIN", .{});
+            std.log.info("Successful IMAP AUTH LOGIN for user: {s}", .{log_safe.account(&name_buf, username)});
             try self.sendResponse(tag, "OK", "AUTHENTICATE completed");
             return;
         }
@@ -2652,8 +2655,9 @@ pub const ImapSession = struct {
             return;
         };
 
+        var name_buf: log_safe.Buffer = undefined;
         if (!valid) {
-            std.log.warn("Failed IMAP authentication from {s}", .{self.connection.peerIp()});
+            std.log.warn("Failed IMAP authentication for {s} from {s}", .{ log_safe.account(&name_buf, credentials.username), self.connection.peerIp() });
             try self.sendResponse(tag, "NO", "Authentication failed");
             return;
         }
@@ -2664,7 +2668,7 @@ pub const ImapSession = struct {
         };
         self.state = .authenticated;
 
-        std.log.info("Successful IMAP AUTHENTICATE for user: {s}", .{credentials.username});
+        std.log.info("Successful IMAP AUTHENTICATE for user: {s}", .{log_safe.account(&name_buf, credentials.username)});
         try self.sendResponse(tag, "OK", "AUTHENTICATE completed");
     }
 

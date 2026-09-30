@@ -2,6 +2,7 @@ const std = @import("std");
 const mutex_compat = @import("../core/mutex_compat.zig");
 const auth = @import("../auth/auth.zig");
 const logger = @import("../core/logger.zig");
+const log_safe = @import("../core/log_safe.zig");
 const fs_compat = @import("../core/fs_compat.zig");
 
 /// POP3 Server Implementation (RFC 1939)
@@ -206,7 +207,8 @@ pub const Pop3Session = struct {
         };
 
         if (!valid) {
-            std.log.warn("Failed POP3 login attempt for user: {s}", .{self.username.?});
+            var name_buf: log_safe.Buffer = undefined;
+            std.log.warn("Failed POP3 login attempt for user: {s}", .{log_safe.account(&name_buf, self.username.?)});
             // Clear USER/PASS so the client must re-send both per RFC 1939.
             self.clearCredentials();
             try self.sendErr("Authentication failed");
