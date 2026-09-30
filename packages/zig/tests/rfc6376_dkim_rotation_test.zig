@@ -386,9 +386,9 @@ test "DKIM rotation edge case: rotation event log with many entries via checkAnd
 
     // Register many domains
     const domains = [_][]const u8{
-        "domain1.com", "domain2.com", "domain3.com",
-        "domain4.com", "domain5.com", "domain6.com",
-        "domain7.com", "domain8.com", "domain9.com",
+        "domain1.com",  "domain2.com", "domain3.com",
+        "domain4.com",  "domain5.com", "domain6.com",
+        "domain7.com",  "domain8.com", "domain9.com",
         "domain10.com",
     };
     for (domains) |d| {

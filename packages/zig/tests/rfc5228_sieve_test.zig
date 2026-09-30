@@ -890,7 +890,7 @@ test "Edge case: string with escaped backslash" {
 
 test "Edge case: very long string (10KB+)" {
     // Build a long redirect address string
-    var long_str: std.ArrayList(u8) = .{};
+    var long_str: std.ArrayList(u8) = .empty;
     defer long_str.deinit(testing.allocator);
 
     try long_str.appendSlice(testing.allocator, "redirect \"");
@@ -978,7 +978,7 @@ test "Edge case: UTF-8 in redirect argument" {
 
 test "Edge case: deeply nested if blocks (10 levels)" {
     // Construct: if true { if true { if true { ... keep; } } }
-    var source: std.ArrayList(u8) = .{};
+    var source: std.ArrayList(u8) = .empty;
     defer source.deinit(testing.allocator);
 
     const depth: usize = 10;

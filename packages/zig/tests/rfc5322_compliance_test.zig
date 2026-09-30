@@ -3,6 +3,7 @@
 // https://datatracker.ietf.org/doc/html/rfc5322
 
 const std = @import("std");
+const repeat = @import("test_util.zig").repeat;
 const testing = std.testing;
 
 // Import email parsing module (adjust path as needed)
@@ -246,7 +247,7 @@ test "RFC 5322 Section 3.6.4: Identification fields (Message-ID)" {
     try testing.expect(msg_id_line != null);
 
     // Should contain angle brackets
-    const after_msg_id = msg_with_id[msg_id_line.? ..];
+    const after_msg_id = msg_with_id[msg_id_line.?..];
     try testing.expect(std.mem.indexOf(u8, after_msg_id, "<") != null);
     try testing.expect(std.mem.indexOf(u8, after_msg_id, ">") != null);
 }
@@ -451,7 +452,7 @@ test "RFC 5322: Maximum line length (998 characters)" {
     try testing.expect(short_line.len < 998);
 
     // Lines longer than 998 should be folded
-    const very_long_line = "Subject: " ++ "A" ** 1000;
+    const very_long_line = "Subject: " ++ repeat("A", 1000);
     try testing.expect(very_long_line.len > 998);
     // In practice, this should be folded into multiple lines
 }

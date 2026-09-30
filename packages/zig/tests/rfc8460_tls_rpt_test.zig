@@ -4,6 +4,7 @@
 // https://datatracker.ietf.org/doc/html/rfc8460
 
 const std = @import("std");
+const repeat = @import("test_util.zig").repeat;
 const testing = std.testing;
 const tls_rpt = @import("mail").tls_rpt;
 
@@ -420,7 +421,7 @@ test "RFC 8460 edge case: report with very long organization name" {
     defer agg.deinit();
 
     // Set a very long organization name (1000 characters)
-    const long_name = "A" ** 1000;
+    const long_name = repeat("A", 1000);
     agg.setOrganizationName(long_name);
 
     try agg.recordSuccess("example.com", "mx.example.com");

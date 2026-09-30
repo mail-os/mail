@@ -32,6 +32,33 @@ jobs:
     - name: Run tests
       run: zig build test
 
+    # tests/ sat at the repo root after packages/zig was split out, where
+    # build.zig could not reach it, so these suites went unrun (and rotted)
+    # for months. Running them here keeps that from happening again.
+    - name: Run RFC compliance tests
+      run: zig build test-rfc
+
+    - name: Run fuzz tests
+      run: zig build test-fuzz
+
+    # The real binary over TCP. Trap mode (SMTP_CATCH_ALL) files every
+    # recipient into one mailbox, so the tests need no user database; auth is
+    # on so AUTH gets a real 535 rather than 502. Without MAIL_E2E_SMTP the
+    # suite skips, so a server that fails to start fails the step instead.
+    - name: Run end-to-end tests against a live server
+      run: |
+        set -euo pipefail
+        dir=$(mktemp -d)
+        (cd "$dir" && env SMTP_HOSTNAME=mail.example.com SMTP_CATCH_ALL=true \
+          SMTP_ANTISPAM_CHECK=false SMTP_SPAM_FILTER=false \
+          IMAP_ENABLED=false CALDAV_ENABLED=false SUBMISSION_PORT=25870 \
+          SMTP_DB_PATH="$dir/smtp.db" \
+          "$GITHUB_WORKSPACE/packages/zig/zig-out/bin/mail" serve \
+            --host 127.0.0.1 --port 25825 --disable-tls --enable-auth \
+            > "$dir/server.log" 2>&1 &)
+        for _ in $(seq 1 50); do nc -z 127.0.0.1 25825 && break; sleep 0.2; done
+        MAIL_E2E_SMTP=127.0.0.1:25825 zig build test-e2e --summary all || { cat "$dir/server.log"; exit 1; }
+
     - name: Check formatting
       run: zig fmt --check src/
 

@@ -2,12 +2,15 @@
 // Tests for compliance with RFC 5321 - Simple Mail Transfer Protocol
 // https://datatracker.ietf.org/doc/html/rfc5321
 //
-// Uses an in-process SMTP responder over a socketpair so no external
-// server is required.
+// Each test talks to the server's own SMTP session (mail.smtp.Session) over a
+// socketpair, in a scratch directory it can deliver into. This suite used to
+// run against a stand-in responder written inside this file, which meant it
+// tested that responder and not the server.
 
 const std = @import("std");
 const testing = std.testing;
 const posix = std.posix;
+const mail_pkg = @import("mail");
 
 // Wrappers for raw I/O — posix.write/read were removed in Zig 0.16-dev
 fn fdWrite(fd: posix.socket_t, data: []const u8) !usize {
@@ -36,11 +39,11 @@ const SmtpTestClient = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        posix.close(self.fd);
+        _ = std.c.close(self.fd);
     }
 
     pub fn readResponse(self: *Self) ![]u8 {
-        var buffer: std.ArrayList(u8) = .{};
+        var buffer: std.ArrayList(u8) = .empty;
         errdefer buffer.deinit(self.allocator);
 
         var read_buffer: [4096]u8 = undefined;
@@ -70,8 +73,10 @@ const SmtpTestClient = struct {
         return last_line.len >= 4 and last_line[3] == ' ';
     }
 
+    /// Send one command line, CRLF appended when missing.
     pub fn sendCommand(self: *Self, command: []const u8) !void {
-        _ = fdWrite(self.fd, command) catch return error.WriteFailed;
+        var off: usize = 0;
+        while (off < command.len) off += fdWrite(self.fd, command[off..]) catch return error.WriteFailed;
         if (!std.mem.endsWith(u8, command, "\r\n")) {
             _ = fdWrite(self.fd, "\r\n") catch return error.WriteFailed;
         }
@@ -91,148 +96,114 @@ const SmtpTestClient = struct {
 };
 
 // ============================================================================
-// RFC 5321-compliant SMTP responder that runs in a thread
+// The server under test: a real mail.smtp.Session on a thread
 // ============================================================================
-const SmtpResponder = struct {
-    fd: posix.socket_t,
-
-    const SmtpState = enum { initial, greeted, mail_from, rcpt_to, data };
+const Server = struct {
+    /// example.com is local to this hostname (its parent domain), so the
+    /// tests' recipients are accepted rather than refused as relaying.
+    const hostname = "mail.example.com";
 
     fn run(fd: posix.socket_t) void {
-        var state: SmtpState = .initial;
+        defer _ = std.c.close(fd);
+        const allocator = std.heap.c_allocator;
+        var log = mail_pkg.logger.Logger.init(allocator, .critical, null) catch return;
+        defer log.deinit();
+        var rate_limiter = mail_pkg.security.RateLimiter.init(allocator, 60, 1000, 1000, 3600);
+        defer rate_limiter.deinit();
 
-        // Send greeting (RFC 5321 Section 3.1)
-        _ = fdWrite(fd, "220 test.local ESMTP RFC5321 Compliance Server\r\n") catch return;
-
-        var buf: [8192]u8 = undefined;
-        while (true) {
-            const n = fdRead(fd, &buf) catch return;
-            if (n == 0) return; // Connection closed
-
-            // Handle possibly multiple lines in one read
-            var remaining = buf[0..n];
-            while (remaining.len > 0) {
-                const line_end = std.mem.indexOf(u8, remaining, "\r\n") orelse
-                    std.mem.indexOf(u8, remaining, "\n") orelse {
-                    // Partial line — in DATA mode, handle it
-                    if (state == .data) {
-                        if (std.mem.startsWith(u8, remaining, ".")) {
-                            _ = fdWrite(fd, "250 2.0.0 Message accepted\r\n") catch return;
-                            state = .greeted;
-                        }
-                    }
-                    break;
-                };
-
-                const sep_len: usize = if (line_end < remaining.len - 1 and remaining[line_end] == '\r') 2 else 1;
-                const line = remaining[0..line_end];
-                remaining = if (line_end + sep_len < remaining.len) remaining[line_end + sep_len ..] else &[_]u8{};
-
-                if (state == .data) {
-                    // In DATA mode, look for terminating "."
-                    if (std.mem.eql(u8, line, ".")) {
-                        _ = fdWrite(fd, "250 2.0.0 Message accepted\r\n") catch return;
-                        state = .greeted;
-                    }
-                    continue;
-                }
-
-                // Parse command (case-insensitive)
-                const upper = upperFirst4(line);
-
-                if (std.mem.startsWith(u8, &upper, "EHLO") or std.mem.startsWith(u8, &upper, "ehlo")) {
-                    handleEhlo(fd, line);
-                    state = .greeted;
-                } else if (strEqlIgnoreCase4(upper, "HELO")) {
-                    _ = fdWrite(fd, "250 test.local\r\n") catch return;
-                    state = .greeted;
-                } else if (strEqlIgnoreCase4(upper, "MAIL")) {
-                    if (state == .initial) {
-                        _ = fdWrite(fd, "503 5.5.1 Bad sequence of commands\r\n") catch return;
-                    } else {
-                        _ = fdWrite(fd, "250 2.1.0 OK\r\n") catch return;
-                        state = .mail_from;
-                    }
-                } else if (strEqlIgnoreCase4(upper, "RCPT")) {
-                    if (state != .mail_from and state != .rcpt_to) {
-                        _ = fdWrite(fd, "503 5.5.1 Bad sequence of commands\r\n") catch return;
-                    } else {
-                        _ = fdWrite(fd, "250 2.1.5 OK\r\n") catch return;
-                        state = .rcpt_to;
-                    }
-                } else if (strEqlIgnoreCase4(upper, "DATA")) {
-                    if (state != .rcpt_to) {
-                        _ = fdWrite(fd, "503 5.5.1 Bad sequence of commands\r\n") catch return;
-                    } else {
-                        _ = fdWrite(fd, "354 End data with <CR><LF>.<CR><LF>\r\n") catch return;
-                        state = .data;
-                    }
-                } else if (strEqlIgnoreCase4(upper, "RSET")) {
-                    _ = fdWrite(fd, "250 2.0.0 OK\r\n") catch return;
-                    if (state != .initial) state = .greeted;
-                } else if (strEqlIgnoreCase4(upper, "NOOP")) {
-                    _ = fdWrite(fd, "250 2.0.0 OK\r\n") catch return;
-                } else if (strEqlIgnoreCase4(upper, "VRFY")) {
-                    _ = fdWrite(fd, "252 2.5.0 Cannot VRFY user, but will accept message\r\n") catch return;
-                } else if (strEqlIgnoreCase4(upper, "QUIT")) {
-                    _ = fdWrite(fd, "221 2.0.0 Bye\r\n") catch return;
-                    posix.close(fd);
-                    return;
-                } else {
-                    _ = fdWrite(fd, "500 5.5.2 Unrecognized command\r\n") catch return;
-                }
-            }
-        }
-    }
-
-    fn handleEhlo(fd: posix.socket_t, line: []const u8) void {
-        _ = line;
-        _ = fdWrite(fd, "250-test.local\r\n" ++
-            "250-SIZE 10485760\r\n" ++
-            "250-PIPELINING\r\n" ++
-            "250-8BITMIME\r\n" ++
-            "250 SMTPUTF8\r\n") catch return;
-    }
-
-    fn upperFirst4(line: []const u8) [4]u8 {
-        var result: [4]u8 = .{ 0, 0, 0, 0 };
-        for (0..@min(4, line.len)) |i| {
-            result[i] = std.ascii.toUpper(line[i]);
-        }
-        return result;
-    }
-
-    fn strEqlIgnoreCase4(a: [4]u8, comptime b: *const [4]u8) bool {
-        inline for (0..4) |i| {
-            if (a[i] != b[i]) return false;
-        }
-        return true;
+        const cfg = mail_pkg.config.Config{
+            .host = "127.0.0.1",
+            .port = 25,
+            .max_connections = 10,
+            .enable_tls = false,
+            .tls_cert_path = null,
+            .tls_key_path = null,
+            .enable_auth = false,
+            .max_message_size = 10 * 1024 * 1024,
+            .timeout_seconds = 60,
+            .data_timeout_seconds = 60,
+            .command_timeout_seconds = 60,
+            .greeting_timeout_seconds = 60,
+            .rate_limit_per_ip = 1000,
+            .rate_limit_per_user = 1000,
+            .rate_limit_cleanup_interval = 3600,
+            .max_recipients = 100,
+            .hostname = hostname,
+            .webhook_url = null,
+            .webhook_enabled = false,
+            .enable_dnsbl = false,
+            .enable_greylist = false,
+            .enable_tracing = false,
+            .tracing_service_name = "test",
+            .enable_json_logging = false,
+            // No DNS lookups from a test.
+            .antispam_check = false,
+            .spam_filter_enabled = false,
+        };
+        var session = mail_pkg.smtp.Session.init(allocator, .{ .fd = fd }, cfg, &log, "127.0.0.1", &rate_limiter, null, null, null) catch return;
+        defer session.deinit();
+        session.handle() catch {};
     }
 };
 
 // ============================================================================
-// Helper: create a connected socketpair with responder thread
+// Helper: a client connected to a server thread, in a scratch directory
 // ============================================================================
 const TestPair = struct {
     client: SmtpTestClient,
     thread: std.Thread,
+    root: [64]u8 = undefined,
+    root_len: usize = 0,
+    prev_cwd: [4096]u8 = undefined,
 
     fn create(allocator: std.mem.Allocator) !TestPair {
+        var pair: TestPair = undefined;
+
+        // The session delivers into mail/<user>/new relative to the working
+        // directory, so give it one of its own.
+        var rnd: [8]u8 = undefined;
+        mail_pkg.io_compat.randomBytes(&rnd);
+        const root = try std.fmt.bufPrintSentinel(&pair.root, "/tmp/mail-rfc5321-{x}", .{std.mem.readInt(u64, &rnd, .little)}, 0);
+        pair.root_len = root.len;
+        try mail_pkg.fs_compat.cwd().makePath(root);
+        _ = std.c.getcwd(&pair.prev_cwd, pair.prev_cwd.len) orelse return error.GetCwdFailed;
+        if (std.c.chdir(root.ptr) != 0) return error.ChdirFailed;
+
         var fds: [2]posix.socket_t = undefined;
         const rc = std.c.socketpair(posix.AF.UNIX, @intCast(@as(u32, posix.SOCK.STREAM)), 0, &fds);
         if (rc != 0) return error.SocketPairFailed;
 
-        const thread = try std.Thread.spawn(.{}, SmtpResponder.run, .{fds[1]});
-
-        return TestPair{
-            .client = SmtpTestClient.initFromFd(allocator, fds[0]),
-            .thread = thread,
-        };
+        pair.thread = try std.Thread.spawn(.{}, Server.run, .{fds[1]});
+        pair.client = SmtpTestClient.initFromFd(allocator, fds[0]);
+        return pair;
     }
 
     fn deinit(self: *TestPair) void {
         self.client.deinit();
         self.thread.join();
+        _ = std.c.chdir(@ptrCast(&self.prev_cwd));
+        mail_pkg.fs_compat.cwd().deleteTree(self.root[0..self.root_len]) catch {};
+    }
+
+    /// The messages delivered to `user`'s inbox. Caller frees each and the slice.
+    fn delivered(self: *TestPair, allocator: std.mem.Allocator, comptime user: []const u8) ![][]u8 {
+        _ = self;
+        const dir = "mail/" ++ user ++ "/new";
+        const names = mail_pkg.fs_compat.listEmlFiles(allocator, dir) catch |err| switch (err) {
+            error.FileNotFound => return allocator.alloc([]u8, 0),
+            else => return err,
+        };
+        defer {
+            for (names) |n| allocator.free(n);
+            allocator.free(names);
+        }
+        const out = try allocator.alloc([]u8, names.len);
+        for (names, 0..) |name, i| {
+            const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, name });
+            defer allocator.free(path);
+            out[i] = try mail_pkg.fs_compat.readFileAlloc(allocator, path);
+        }
+        return out;
     }
 };
 
@@ -541,8 +512,34 @@ test "RFC 5321 Section 4.5.3.1.10: QUIT closes connection gracefully" {
 
 // RFC 5321 Section 4.5.4 - Trace Information
 test "RFC 5321 Section 4.5.4: Server adds Received header" {
-    // Trace headers are added during message delivery.
-    // This is verified by the message_submission module tests.
+    var pair = try TestPair.create(testing.allocator);
+    defer pair.deinit();
+
+    const greeting = try pair.client.readResponse();
+    defer testing.allocator.free(greeting);
+    inline for (.{
+        .{ "EHLO client.example.org", "250" },
+        .{ "MAIL FROM:<sender@example.org>", "250" },
+        .{ "RCPT TO:<recipient@example.com>", "250" },
+        .{ "DATA", "354" },
+        .{ "Subject: trace\r\n\r\nBody\r\n.", "250" },
+    }) |step| {
+        const resp = try pair.client.sendAndRead(step[0]);
+        defer testing.allocator.free(resp);
+        try SmtpTestClient.expectCode(resp, step[1]);
+    }
+    const quit = try pair.client.sendAndRead("QUIT");
+    testing.allocator.free(quit);
+
+    const messages = try pair.delivered(testing.allocator, "recipient");
+    defer {
+        for (messages) |m| testing.allocator.free(m);
+        testing.allocator.free(messages);
+    }
+    try testing.expectEqual(@as(usize, 1), messages.len);
+    // A Received line on top naming the client (from) and this server (by).
+    try testing.expect(std.mem.startsWith(u8, messages[0], "Received: from client.example.org"));
+    try testing.expect(std.mem.indexOf(u8, messages[0], "by " ++ Server.hostname) != null);
 }
 
 // RFC 5321 Section 6.1 - Reliability

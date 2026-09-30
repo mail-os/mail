@@ -4,6 +4,7 @@
 // https://datatracker.ietf.org/doc/html/rfc8555
 
 const std = @import("std");
+const repeat = @import("test_util.zig").repeat;
 const testing = std.testing;
 const acme = @import("mail").acme;
 
@@ -477,7 +478,7 @@ test "ACME edge case: certificate request for empty domain name" {
 
 test "ACME edge case: config validate rejects domain with invalid length (>253 chars)" {
     // RFC 1035 limits domain names to 253 characters.
-    const long_domain = "a" ** 254;
+    const long_domain = repeat("a", 254);
     const config = acme.ACMEConfig{
         .email = "admin@example.com",
         .domains = &.{long_domain},
@@ -486,7 +487,7 @@ test "ACME edge case: config validate rejects domain with invalid length (>253 c
 }
 
 test "ACME edge case: config validate accepts domain at exactly 253 chars" {
-    const max_domain = "a" ** 253;
+    const max_domain = repeat("a", 253);
     const config = acme.ACMEConfig{
         .email = "admin@example.com",
         .domains = &.{max_domain},
@@ -581,7 +582,7 @@ test "ACME edge case: request certificates for multiple distinct domains" {
 
 test "ACME edge case: CSR generation with very long domain name via requestCertificate" {
     // Use a domain that is long but within the 253-char limit
-    const long_domain = "a" ** 200 ++ ".example.com";
+    const long_domain = repeat("a", 200) ++ ".example.com";
 
     var client = acme.ACMEClient.init(testing.allocator, .{});
     defer client.deinit();

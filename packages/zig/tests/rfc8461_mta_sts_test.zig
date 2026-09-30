@@ -4,6 +4,7 @@
 // https://datatracker.ietf.org/doc/html/rfc8461
 
 const std = @import("std");
+const repeat = @import("test_util.zig").repeat;
 const testing = std.testing;
 const mta_sts = @import("mail").mta_sts;
 
@@ -798,7 +799,7 @@ test "RFC 8461 edge case: matchesMxPattern hostname equals wildcard suffix" {
 }
 
 test "RFC 8461 edge case: matchesMxPattern with very long hostname" {
-    const long_label = "a" ** 63;
+    const long_label = repeat("a", 63);
     const hostname = long_label ++ ".example.com";
     try testing.expect(mta_sts.matchesMxPattern(hostname, "*.example.com"));
 }

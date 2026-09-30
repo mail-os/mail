@@ -3,6 +3,7 @@
 // https://datatracker.ietf.org/doc/html/rfc5804
 
 const std = @import("std");
+const repeat = @import("test_util.zig").repeat;
 const testing = std.testing;
 const managesieve = @import("mail").managesieve;
 
@@ -47,9 +48,9 @@ test "RFC 5804: ManageSieveCommand fromString rejects overly long input" {
 
 test "RFC 5804: ManageSieveCommand toString round-trips" {
     const commands = [_]managesieve.ManageSieveCommand{
-        .AUTHENTICATE, .CAPABILITY, .HAVESPACE, .PUTSCRIPT,
-        .LISTSCRIPTS,  .SETACTIVE,  .GETSCRIPT, .DELETESCRIPT,
-        .RENAMESCRIPT,  .CHECKSCRIPT, .NOOP,     .LOGOUT,
+        .AUTHENTICATE, .CAPABILITY,  .HAVESPACE, .PUTSCRIPT,
+        .LISTSCRIPTS,  .SETACTIVE,   .GETSCRIPT, .DELETESCRIPT,
+        .RENAMESCRIPT, .CHECKSCRIPT, .NOOP,      .LOGOUT,
         .STARTTLS,
     };
 
@@ -449,7 +450,7 @@ test "RFC 5804 edge: empty script body via literal {0+}" {
 // 4. PUTSCRIPT with very long script name (>256 chars)
 test "RFC 5804 edge: very long script name quoted string encoding" {
     // Create a script name longer than 256 characters
-    const long_name = "a" ** 300;
+    const long_name = repeat("a", 300);
     const encoded = try managesieve.ResponseFormatter.encodeQuoted(testing.allocator, long_name);
     defer testing.allocator.free(encoded);
 
@@ -645,8 +646,8 @@ test "RFC 5804 edge: already authenticated response" {
 // ResponseCode: verify all codes format correctly in NO responses
 test "RFC 5804 edge: all ResponseCode values in NO responses" {
     const codes = [_]managesieve.ResponseCode{
-        .AUTH_TOO_WEAK, .ENCRYPT_NEEDED, .QUOTA, .QUOTA_MAXSCRIPTS,
-        .QUOTA_MAXSIZE, .REFERRAL,       .SASL,  .TRANSITION_NEEDED,
+        .AUTH_TOO_WEAK, .ENCRYPT_NEEDED, .QUOTA,       .QUOTA_MAXSCRIPTS,
+        .QUOTA_MAXSIZE, .REFERRAL,       .SASL,        .TRANSITION_NEEDED,
         .TRYLATER,      .ACTIVE,         .NONEXISTENT, .ALREADYEXISTS,
         .TAG,
     };

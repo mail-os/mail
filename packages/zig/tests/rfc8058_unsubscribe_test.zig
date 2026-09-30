@@ -3,6 +3,7 @@
 // https://datatracker.ietf.org/doc/html/rfc8058
 
 const std = @import("std");
+const repeat = @import("test_util.zig").repeat;
 const testing = std.testing;
 const list_unsub = @import("mail").list_unsubscribe;
 
@@ -359,7 +360,7 @@ test "RFC 8058 edge case: generate headers with very long list ID" {
     const header = list_unsub.ListUnsubscribeHeader.init(config);
 
     // Create a long list ID (200 chars)
-    const long_list_id = "a]" ** 100;
+    const long_list_id = repeat("a]", 100);
 
     const pair = try header.generateHeaders(
         testing.allocator,

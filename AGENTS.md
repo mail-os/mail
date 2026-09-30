@@ -184,8 +184,18 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 ## Testing
 
 ```bash
-cd packages/zig && zig build test
+cd packages/zig
+zig build test        # unit tests, beside the code in src/
+zig build test-rfc    # packages/zig/tests/: RFC compliance suites
+zig build test-fuzz   # randomized tests of the DATA decoder and SMTP session
+MAIL_E2E_SMTP=127.0.0.1:25825 zig build test-e2e   # against a running `mail serve`; skipped when unset
 ```
+
+CI runs all four (see `.github/workflows/ci.yml` for how it starts the e2e
+server). A few files in `packages/zig/tests/` (security_test, integration_test,
+error_path_test, chaos_test, load_test, coverage, webmail_mobile_admin_test,
+fuzz_mime_parser, fuzz_smtp_protocol) are in no build step and do not compile;
+they import `../src/...` paths from before the monorepo split.
 
 Tests are split across multiple binaries (main, auth, imap, protocol, config, connection_wrapper, etc.). The logging tests produce stderr output which Zig's test runner reports as warnings — this is expected behavior, not a failure.
 

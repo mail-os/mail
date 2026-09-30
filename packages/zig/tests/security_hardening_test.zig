@@ -6,9 +6,9 @@
 // email validation, autoconfig security, and more.
 
 const std = @import("std");
+const repeat = @import("test_util.zig").repeat;
 const testing = std.testing;
 const mail = @import("mail");
-
 
 // ============================================================================
 // Webhook JSON Escaping Tests (Task #18)
@@ -332,7 +332,7 @@ test "MIME: parser rejects boundary over 70 chars" {
     const allocator = testing.allocator;
     var parser = mail.mime.MultipartParser.init(allocator);
 
-    const long_boundary = "a" ** 71;
+    const long_boundary = repeat("a", 71);
     const body = "--" ++ long_boundary ++ "\r\nContent-Type: text/plain\r\n\r\nHello\r\n--" ++ long_boundary ++ "--\r\n";
     const result = parser.parse(body, long_boundary);
     try testing.expectError(error.BoundaryTooLong, result);
@@ -342,7 +342,7 @@ test "MIME: parser accepts boundary at exactly 70 chars" {
     const allocator = testing.allocator;
     var parser = mail.mime.MultipartParser.init(allocator);
 
-    const boundary_70 = "a" ** 70;
+    const boundary_70 = repeat("a", 70);
     const body = "--" ++ boundary_70 ++ "\r\nContent-Type: text/plain\r\n\r\nHello\r\n--" ++ boundary_70 ++ "--\r\n";
     const parts = try parser.parse(body, boundary_70);
     defer {

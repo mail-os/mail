@@ -1,60 +1,96 @@
 const std = @import("std");
-const net = std.net;
 const testing = std.testing;
+const repeat = @import("test_util.zig").repeat;
 
-/// End-to-end tests for SMTP server
-/// Tests complete workflows from client connection to message delivery
-///
-/// Test scenarios:
-/// - Full message delivery workflow
-/// - Authentication flows
-/// - TLS/STARTTLS handshake
-/// - Multiple concurrent clients
-/// - Error recovery scenarios
-/// - Performance under load
-/// - Real-world email scenarios
-
-const TestConfig = struct {
-    host: []const u8 = "127.0.0.1",
-    port: u16 = 2525,
-    timeout_ms: u32 = 5000,
-    tls_port: u16 = 2526,
-};
+// End-to-end tests for the SMTP server: a real `mail serve` process, spoken
+// to over TCP.
+//
+// They need a running server and are skipped without one. Point them at it
+// with MAIL_E2E_SMTP=<ipv4>:<port>; CI starts one in trap mode (every
+// recipient accepted and filed into one mailbox) and runs `zig build
+// test-e2e` against it. Once MAIL_E2E_SMTP is set, a server that cannot be
+// reached is a failure, not a skip.
 
 const SmtpClient = struct {
-    stream: net.Stream,
+    fd: c_int,
     allocator: std.mem.Allocator,
-    config: TestConfig,
 
-    pub fn init(allocator: std.mem.Allocator, config: TestConfig) !SmtpClient {
-        const address = try net.Address.parseIp(config.host, config.port);
-        const stream = try net.tcpConnectToAddress(address);
+    /// Connect to the server named by MAIL_E2E_SMTP, or skip the test.
+    pub fn connect(allocator: std.mem.Allocator) !SmtpClient {
+        const target_z = std.c.getenv("MAIL_E2E_SMTP") orelse return error.SkipZigTest;
+        const target = std.mem.sliceTo(target_z, 0);
+        const colon = std.mem.lastIndexOfScalar(u8, target, ':') orelse return error.InvalidE2ETarget;
+        const port = try std.fmt.parseInt(u16, target[colon + 1 ..], 10);
 
-        return SmtpClient{
-            .stream = stream,
-            .allocator = allocator,
-            .config = config,
-        };
+        var ip: [4]u8 = undefined;
+        var parts = std.mem.splitScalar(u8, target[0..colon], '.');
+        for (&ip) |*octet| octet.* = try std.fmt.parseInt(u8, parts.next() orelse return error.InvalidE2ETarget, 10);
+
+        const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+        if (fd < 0) return error.SocketFailed;
+        errdefer _ = std.c.close(fd);
+
+        var addr = std.mem.zeroes(std.c.sockaddr.in);
+        addr.family = std.c.AF.INET;
+        addr.port = std.mem.nativeToBig(u16, port);
+        addr.addr = @bitCast(ip);
+        if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) != 0) return error.ConnectionRefused;
+
+        return .{ .fd = fd, .allocator = allocator };
     }
 
     pub fn deinit(self: *SmtpClient) void {
-        self.stream.close();
+        _ = std.c.close(self.fd);
     }
 
+    /// Read one complete reply, multi-line replies included.
     pub fn readResponse(self: *SmtpClient) ![]u8 {
-        var buffer = std.ArrayList(u8).init(self.allocator);
-        errdefer buffer.deinit();
+        return self.readReplies(1);
+    }
+
+    /// Read `count` complete replies (e.g. the answers to pipelined commands).
+    pub fn readReplies(self: *SmtpClient, count: usize) ![]u8 {
+        var buffer: std.ArrayList(u8) = .empty;
+        errdefer buffer.deinit(self.allocator);
 
         var read_buffer: [4096]u8 = undefined;
-        const n = try self.stream.read(&read_buffer);
-        try buffer.appendSlice(read_buffer[0..n]);
-
-        return buffer.toOwnedSlice();
+        while (completeReplies(buffer.items) < count) {
+            const n = std.c.read(self.fd, &read_buffer, read_buffer.len);
+            if (n <= 0) return error.ConnectionClosed;
+            try buffer.appendSlice(self.allocator, read_buffer[0..@intCast(n)]);
+        }
+        return buffer.toOwnedSlice(self.allocator);
     }
 
+    /// Replies are complete at each CRLF-terminated "NNN " line.
+    fn completeReplies(data: []const u8) usize {
+        var n: usize = 0;
+        var it = std.mem.splitSequence(u8, data, "\r\n");
+        while (it.next()) |line| {
+            if (it.index == null) break; // unterminated tail
+            if (line.len >= 4 and line[3] == ' ') n += 1;
+        }
+        return n;
+    }
+
+    /// Send a command, or a message body. SMTP lines end in CRLF, so a bare
+    /// LF (the multiline string literals below have those) is sent as CRLF,
+    /// as any real client would.
     pub fn sendCommand(self: *SmtpClient, command: []const u8) !void {
-        try self.stream.writeAll(command);
-        try self.stream.writeAll("\r\n");
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.allocator);
+        for (command, 0..) |c, i| {
+            if (c == '\n' and (i == 0 or command[i - 1] != '\r')) try out.append(self.allocator, '\r');
+            try out.append(self.allocator, c);
+        }
+        if (!std.mem.endsWith(u8, out.items, "\r\n")) try out.appendSlice(self.allocator, "\r\n");
+
+        var off: usize = 0;
+        while (off < out.items.len) {
+            const n = std.c.write(self.fd, out.items[off..].ptr, out.items.len - off);
+            if (n <= 0) return error.WriteFailed;
+            off += @intCast(n);
+        }
     }
 
     pub fn sendCommandAndRead(self: *SmtpClient, command: []const u8) ![]u8 {
@@ -62,7 +98,7 @@ const SmtpClient = struct {
         return self.readResponse();
     }
 
-    pub fn expectCode(self: *SmtpClient, response: []const u8, expected_code: []const u8) !void {
+    pub fn expectCode(_: *SmtpClient, response: []const u8, expected_code: []const u8) !void {
         if (!std.mem.startsWith(u8, response, expected_code)) {
             std.debug.print("Expected code {s}, got: {s}\n", .{ expected_code, response });
             return error.UnexpectedResponseCode;
@@ -70,37 +106,8 @@ const SmtpClient = struct {
     }
 };
 
-// Helper to wait for server to be ready
-fn waitForServer(allocator: std.mem.Allocator, config: TestConfig) !void {
-    var attempts: u32 = 0;
-    const max_attempts = 10;
-
-    while (attempts < max_attempts) : (attempts += 1) {
-        const address = net.Address.parseIp(config.host, config.port) catch {
-            std.time.sleep(100 * std.time.ns_per_ms);
-            continue;
-        };
-
-        const stream = net.tcpConnectToAddress(address) catch {
-            std.time.sleep(100 * std.time.ns_per_ms);
-            continue;
-        };
-        stream.close();
-        return; // Server is ready
-    }
-
-    return error.ServerNotReady;
-}
-
 test "E2E: Basic SMTP conversation" {
-    const config = TestConfig{};
-
-    // Note: This test requires the SMTP server to be running
-    // Skip if server is not available
-    var client = SmtpClient.init(testing.allocator, config) catch |err| {
-        if (err == error.ConnectionRefused) return error.SkipZigTest;
-        return err;
-    };
+    var client = try SmtpClient.connect(testing.allocator);
     defer client.deinit();
 
     // Read greeting
@@ -120,12 +127,7 @@ test "E2E: Basic SMTP conversation" {
 }
 
 test "E2E: Send simple email without authentication" {
-    const config = TestConfig{};
-
-    var client = SmtpClient.init(testing.allocator, config) catch |err| {
-        if (err == error.ConnectionRefused) return error.SkipZigTest;
-        return err;
-    };
+    var client = try SmtpClient.connect(testing.allocator);
     defer client.deinit();
 
     // Greeting
@@ -173,12 +175,7 @@ test "E2E: Send simple email without authentication" {
 }
 
 test "E2E: Send email with authentication" {
-    const config = TestConfig{};
-
-    var client = SmtpClient.init(testing.allocator, config) catch |err| {
-        if (err == error.ConnectionRefused) return error.SkipZigTest;
-        return err;
-    };
+    var client = try SmtpClient.connect(testing.allocator);
     defer client.deinit();
 
     // Greeting
@@ -205,12 +202,7 @@ test "E2E: Send email with authentication" {
 }
 
 test "E2E: PIPELINING support" {
-    const config = TestConfig{};
-
-    var client = SmtpClient.init(testing.allocator, config) catch |err| {
-        if (err == error.ConnectionRefused) return error.SkipZigTest;
-        return err;
-    };
+    var client = try SmtpClient.connect(testing.allocator);
     defer client.deinit();
 
     // Greeting
@@ -231,8 +223,8 @@ test "E2E: PIPELINING support" {
     try client.sendCommand("RCPT TO:<recipient@example.com>");
     try client.sendCommand("DATA");
 
-    // Read all responses
-    const responses = try client.readResponse();
+    // Read all three responses
+    const responses = try client.readReplies(3);
     defer testing.allocator.free(responses);
 
     // Should contain multiple 250 responses and one 354
@@ -259,12 +251,7 @@ test "E2E: PIPELINING support" {
 }
 
 test "E2E: SIZE extension" {
-    const config = TestConfig{};
-
-    var client = SmtpClient.init(testing.allocator, config) catch |err| {
-        if (err == error.ConnectionRefused) return error.SkipZigTest;
-        return err;
-    };
+    var client = try SmtpClient.connect(testing.allocator);
     defer client.deinit();
 
     // Greeting
@@ -302,12 +289,7 @@ test "E2E: SIZE extension" {
 }
 
 test "E2E: Error handling - invalid commands" {
-    const config = TestConfig{};
-
-    var client = SmtpClient.init(testing.allocator, config) catch |err| {
-        if (err == error.ConnectionRefused) return error.SkipZigTest;
-        return err;
-    };
+    var client = try SmtpClient.connect(testing.allocator);
     defer client.deinit();
 
     // Greeting
@@ -332,12 +314,7 @@ test "E2E: Error handling - invalid commands" {
 }
 
 test "E2E: Multiple recipients" {
-    const config = TestConfig{};
-
-    var client = SmtpClient.init(testing.allocator, config) catch |err| {
-        if (err == error.ConnectionRefused) return error.SkipZigTest;
-        return err;
-    };
+    var client = try SmtpClient.connect(testing.allocator);
     defer client.deinit();
 
     // Greeting
@@ -393,12 +370,7 @@ test "E2E: Multiple recipients" {
 }
 
 test "E2E: RSET command" {
-    const config = TestConfig{};
-
-    var client = SmtpClient.init(testing.allocator, config) catch |err| {
-        if (err == error.ConnectionRefused) return error.SkipZigTest;
-        return err;
-    };
+    var client = try SmtpClient.connect(testing.allocator);
     defer client.deinit();
 
     // Greeting
@@ -441,12 +413,7 @@ test "E2E: RSET command" {
 }
 
 test "E2E: VRFY command" {
-    const config = TestConfig{};
-
-    var client = SmtpClient.init(testing.allocator, config) catch |err| {
-        if (err == error.ConnectionRefused) return error.SkipZigTest;
-        return err;
-    };
+    var client = try SmtpClient.connect(testing.allocator);
     defer client.deinit();
 
     // Greeting
@@ -477,12 +444,7 @@ test "E2E: VRFY command" {
 }
 
 test "E2E: NOOP command" {
-    const config = TestConfig{};
-
-    var client = SmtpClient.init(testing.allocator, config) catch |err| {
-        if (err == error.ConnectionRefused) return error.SkipZigTest;
-        return err;
-    };
+    var client = try SmtpClient.connect(testing.allocator);
     defer client.deinit();
 
     // Greeting
@@ -507,12 +469,7 @@ test "E2E: NOOP command" {
 }
 
 test "E2E: Case insensitivity of commands" {
-    const config = TestConfig{};
-
-    var client = SmtpClient.init(testing.allocator, config) catch |err| {
-        if (err == error.ConnectionRefused) return error.SkipZigTest;
-        return err;
-    };
+    var client = try SmtpClient.connect(testing.allocator);
     defer client.deinit();
 
     // Greeting
@@ -544,4 +501,29 @@ test "E2E: Case insensitivity of commands" {
     const quit = try client.sendCommandAndRead("quit");
     defer testing.allocator.free(quit);
     try client.expectCode(quit, "221");
+}
+
+test "E2E: a line far longer than 4096 bytes is accepted, and the session stays usable" {
+    var client = try SmtpClient.connect(testing.allocator);
+    defer client.deinit();
+
+    const greeting = try client.readResponse();
+    defer testing.allocator.free(greeting);
+    try client.expectCode(greeting, "220");
+
+    inline for (.{
+        .{ "EHLO test.example.com", "250" },
+        .{ "MAIL FROM:<sender@example.com>", "250" },
+        .{ "RCPT TO:<recipient@example.com>", "250" },
+        .{ "DATA", "354" },
+        // One 20,000-character line: the server used to drop the connection
+        // at 4096.
+        .{ "Subject: long line\r\n\r\n" ++ repeat("x", 20_000) ++ "\r\n.", "250" },
+        .{ "NOOP", "250" },
+        .{ "QUIT", "221" },
+    }) |step| {
+        const reply = try client.sendCommandAndRead(step[0]);
+        defer testing.allocator.free(reply);
+        try client.expectCode(reply, step[1]);
+    }
 }

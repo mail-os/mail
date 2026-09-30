@@ -494,7 +494,7 @@ test "vcf parser: full vCard with all fields" {
     try testing.expectEqualStrings("contact-full-001", contact.?.uid.?);
 }
 
-test "vcf parser: returns null without FN" {
+test "vcf parser: without FN, falls back to the given name from N" {
     const vcf =
         \\BEGIN:VCARD
         \\VERSION:3.0
@@ -503,7 +503,20 @@ test "vcf parser: returns null without FN" {
     ;
 
     const contact = caldav_store.VcfParser.parseContact(vcf);
-    try testing.expect(contact == null);
+    try testing.expect(contact != null);
+    try testing.expectEqualStrings("John", contact.?.full_name.?);
+    try testing.expectEqualStrings("Smith", contact.?.family_name.?);
+}
+
+test "vcf parser: returns null with neither FN nor N" {
+    const vcf =
+        \\BEGIN:VCARD
+        \\VERSION:3.0
+        \\EMAIL:john@example.com
+        \\END:VCARD
+    ;
+
+    try testing.expect(caldav_store.VcfParser.parseContact(vcf) == null);
 }
 
 // =============================================================================

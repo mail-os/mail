@@ -11,21 +11,21 @@ const milter = @import("mail").milter;
 // =============================================================================
 
 test "Milter: command byte values match SMFIC constants" {
-    try testing.expectEqual(@as(u8, 'A'), @intFromEnum(milter.MilterCommand.abort));
-    try testing.expectEqual(@as(u8, 'B'), @intFromEnum(milter.MilterCommand.body));
-    try testing.expectEqual(@as(u8, 'C'), @intFromEnum(milter.MilterCommand.connect));
-    try testing.expectEqual(@as(u8, 'D'), @intFromEnum(milter.MilterCommand.macro));
-    try testing.expectEqual(@as(u8, 'E'), @intFromEnum(milter.MilterCommand.end_of_body));
-    try testing.expectEqual(@as(u8, 'H'), @intFromEnum(milter.MilterCommand.helo));
-    try testing.expectEqual(@as(u8, 'L'), @intFromEnum(milter.MilterCommand.header));
-    try testing.expectEqual(@as(u8, 'N'), @intFromEnum(milter.MilterCommand.end_of_headers));
-    try testing.expectEqual(@as(u8, 'M'), @intFromEnum(milter.MilterCommand.mail_from));
-    try testing.expectEqual(@as(u8, 'O'), @intFromEnum(milter.MilterCommand.option_negotiation));
-    try testing.expectEqual(@as(u8, 'Q'), @intFromEnum(milter.MilterCommand.quit));
-    try testing.expectEqual(@as(u8, 'R'), @intFromEnum(milter.MilterCommand.rcpt_to));
-    try testing.expectEqual(@as(u8, 'T'), @intFromEnum(milter.MilterCommand.data));
-    try testing.expectEqual(@as(u8, 'K'), @intFromEnum(milter.MilterCommand.quit_new_connection));
-    try testing.expectEqual(@as(u8, 'U'), @intFromEnum(milter.MilterCommand.unknown));
+    try testing.expectEqual(@as(u8, 'A'), @backingInt(milter.MilterCommand.abort));
+    try testing.expectEqual(@as(u8, 'B'), @backingInt(milter.MilterCommand.body));
+    try testing.expectEqual(@as(u8, 'C'), @backingInt(milter.MilterCommand.connect));
+    try testing.expectEqual(@as(u8, 'D'), @backingInt(milter.MilterCommand.macro));
+    try testing.expectEqual(@as(u8, 'E'), @backingInt(milter.MilterCommand.end_of_body));
+    try testing.expectEqual(@as(u8, 'H'), @backingInt(milter.MilterCommand.helo));
+    try testing.expectEqual(@as(u8, 'L'), @backingInt(milter.MilterCommand.header));
+    try testing.expectEqual(@as(u8, 'N'), @backingInt(milter.MilterCommand.end_of_headers));
+    try testing.expectEqual(@as(u8, 'M'), @backingInt(milter.MilterCommand.mail_from));
+    try testing.expectEqual(@as(u8, 'O'), @backingInt(milter.MilterCommand.option_negotiation));
+    try testing.expectEqual(@as(u8, 'Q'), @backingInt(milter.MilterCommand.quit));
+    try testing.expectEqual(@as(u8, 'R'), @backingInt(milter.MilterCommand.rcpt_to));
+    try testing.expectEqual(@as(u8, 'T'), @backingInt(milter.MilterCommand.data));
+    try testing.expectEqual(@as(u8, 'K'), @backingInt(milter.MilterCommand.quit_new_connection));
+    try testing.expectEqual(@as(u8, 'U'), @backingInt(milter.MilterCommand.unknown));
 }
 
 test "Milter: MilterCommand fromByte valid bytes" {
@@ -66,24 +66,24 @@ test "Milter: MilterCommand toString returns SMFIC names" {
 // =============================================================================
 
 test "Milter: response byte values match SMFIR constants" {
-    try testing.expectEqual(@as(u8, '+'), @intFromEnum(milter.MilterResponse.add_recipient));
-    try testing.expectEqual(@as(u8, '-'), @intFromEnum(milter.MilterResponse.delete_recipient));
-    try testing.expectEqual(@as(u8, 'a'), @intFromEnum(milter.MilterResponse.accept));
-    try testing.expectEqual(@as(u8, 'b'), @intFromEnum(milter.MilterResponse.replace_body));
-    try testing.expectEqual(@as(u8, 'c'), @intFromEnum(milter.MilterResponse.@"continue"));
-    try testing.expectEqual(@as(u8, 'd'), @intFromEnum(milter.MilterResponse.discard));
-    try testing.expectEqual(@as(u8, 'h'), @intFromEnum(milter.MilterResponse.add_header));
-    try testing.expectEqual(@as(u8, 'i'), @intFromEnum(milter.MilterResponse.insert_header));
-    try testing.expectEqual(@as(u8, 'm'), @intFromEnum(milter.MilterResponse.change_header));
-    try testing.expectEqual(@as(u8, 'p'), @intFromEnum(milter.MilterResponse.progress));
-    try testing.expectEqual(@as(u8, 'q'), @intFromEnum(milter.MilterResponse.quarantine));
-    try testing.expectEqual(@as(u8, 'r'), @intFromEnum(milter.MilterResponse.reject));
-    try testing.expectEqual(@as(u8, 't'), @intFromEnum(milter.MilterResponse.temp_fail));
-    try testing.expectEqual(@as(u8, 'y'), @intFromEnum(milter.MilterResponse.reply_code));
-    try testing.expectEqual(@as(u8, 's'), @intFromEnum(milter.MilterResponse.skip));
-    try testing.expectEqual(@as(u8, 'e'), @intFromEnum(milter.MilterResponse.change_from));
-    try testing.expectEqual(@as(u8, '2'), @intFromEnum(milter.MilterResponse.add_recipient_par));
-    try testing.expectEqual(@as(u8, 'O'), @intFromEnum(milter.MilterResponse.option_negotiation));
+    try testing.expectEqual(@as(u8, '+'), @backingInt(milter.MilterResponse.add_recipient));
+    try testing.expectEqual(@as(u8, '-'), @backingInt(milter.MilterResponse.delete_recipient));
+    try testing.expectEqual(@as(u8, 'a'), @backingInt(milter.MilterResponse.accept));
+    try testing.expectEqual(@as(u8, 'b'), @backingInt(milter.MilterResponse.replace_body));
+    try testing.expectEqual(@as(u8, 'c'), @backingInt(milter.MilterResponse.@"continue"));
+    try testing.expectEqual(@as(u8, 'd'), @backingInt(milter.MilterResponse.discard));
+    try testing.expectEqual(@as(u8, 'h'), @backingInt(milter.MilterResponse.add_header));
+    try testing.expectEqual(@as(u8, 'i'), @backingInt(milter.MilterResponse.insert_header));
+    try testing.expectEqual(@as(u8, 'm'), @backingInt(milter.MilterResponse.change_header));
+    try testing.expectEqual(@as(u8, 'p'), @backingInt(milter.MilterResponse.progress));
+    try testing.expectEqual(@as(u8, 'q'), @backingInt(milter.MilterResponse.quarantine));
+    try testing.expectEqual(@as(u8, 'r'), @backingInt(milter.MilterResponse.reject));
+    try testing.expectEqual(@as(u8, 't'), @backingInt(milter.MilterResponse.temp_fail));
+    try testing.expectEqual(@as(u8, 'y'), @backingInt(milter.MilterResponse.reply_code));
+    try testing.expectEqual(@as(u8, 's'), @backingInt(milter.MilterResponse.skip));
+    try testing.expectEqual(@as(u8, 'e'), @backingInt(milter.MilterResponse.change_from));
+    try testing.expectEqual(@as(u8, '2'), @backingInt(milter.MilterResponse.add_recipient_par));
+    try testing.expectEqual(@as(u8, 'O'), @backingInt(milter.MilterResponse.option_negotiation));
 }
 
 test "Milter: MilterResponse fromByte valid bytes" {
@@ -287,7 +287,7 @@ test "Milter: packet encoding command-only" {
 test "Milter: packet encoding with data" {
     const data = "test body content";
     const pkt = milter.MilterPacket{
-        .command = @intFromEnum(milter.MilterCommand.body),
+        .command = @backingInt(milter.MilterCommand.body),
         .data = data,
     };
 
@@ -304,7 +304,7 @@ test "Milter: packet encoding with data" {
 
 test "Milter: packet encoding fails with buffer too small" {
     const pkt = milter.MilterPacket{
-        .command = @intFromEnum(milter.MilterCommand.body),
+        .command = @backingInt(milter.MilterCommand.body),
         .data = "some data",
     };
 
@@ -388,7 +388,7 @@ test "Milter: packet decoding oversized packet" {
 
 test "Milter: packet encode-decode round-trip" {
     const original = milter.MilterPacket{
-        .command = @intFromEnum(milter.MilterCommand.helo),
+        .command = @backingInt(milter.MilterCommand.helo),
         .data = "mail.example.com",
     };
 
@@ -405,10 +405,10 @@ test "Milter: packet encode-decode round-trip" {
 // =============================================================================
 
 test "Milter: MilterFamily byte values" {
-    try testing.expectEqual(@as(u8, 'U'), @intFromEnum(milter.MilterFamily.unknown));
-    try testing.expectEqual(@as(u8, 'L'), @intFromEnum(milter.MilterFamily.unix));
-    try testing.expectEqual(@as(u8, '4'), @intFromEnum(milter.MilterFamily.inet));
-    try testing.expectEqual(@as(u8, '6'), @intFromEnum(milter.MilterFamily.inet6));
+    try testing.expectEqual(@as(u8, 'U'), @backingInt(milter.MilterFamily.unknown));
+    try testing.expectEqual(@as(u8, 'L'), @backingInt(milter.MilterFamily.unix));
+    try testing.expectEqual(@as(u8, '4'), @backingInt(milter.MilterFamily.inet));
+    try testing.expectEqual(@as(u8, '6'), @backingInt(milter.MilterFamily.inet6));
 }
 
 test "Milter: MilterFamily fromByte" {
@@ -537,8 +537,7 @@ test "Milter edge: packet decode with oversized length returns PacketTooLarge" {
 // 3. Invalid command byte (not matching any MilterCommand)
 test "Milter edge: fromByte returns null for every non-command byte" {
     // Test a range of bytes that are NOT valid milter commands
-    const invalid_bytes = [_]u8{ 0, 1, 'a', 'b', 'c', 'd', 'e', 'f', 'g',
-        'X', 'Y', 'Z', '0', '1', '2', '3', 0x80, 0xFE, 0xFF };
+    const invalid_bytes = [_]u8{ 0, 1, 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'X', 'Y', 'Z', '0', '1', '2', '3', 0x80, 0xFE, 0xFF };
     for (invalid_bytes) |b| {
         // Only check bytes that are genuinely not commands
         if (milter.MilterCommand.fromByte(b) == null) {
@@ -558,16 +557,16 @@ test "Milter edge: fromByte returns null for every non-command byte" {
 test "Milter edge: response packet construction for all response types" {
     // Verify that each MilterResponse can be encoded as a packet command byte
     const responses = [_]milter.MilterResponse{
-        .add_recipient, .delete_recipient, .accept,       .replace_body,
-        .@"continue",   .discard,          .add_header,   .insert_header,
-        .change_header, .progress,         .quarantine,    .reject,
-        .temp_fail,     .reply_code,       .skip,          .change_from,
+        .add_recipient,     .delete_recipient,   .accept,     .replace_body,
+        .@"continue",       .discard,            .add_header, .insert_header,
+        .change_header,     .progress,           .quarantine, .reject,
+        .temp_fail,         .reply_code,         .skip,       .change_from,
         .add_recipient_par, .option_negotiation,
     };
 
     for (responses) |resp| {
         const pkt = milter.MilterPacket{
-            .command = @intFromEnum(resp),
+            .command = @backingInt(resp),
             .data = &[_]u8{},
         };
 
@@ -576,7 +575,7 @@ test "Milter edge: response packet construction for all response types" {
 
         // Decode round-trip
         const decoded = try milter.MilterPacket.decode(encoded);
-        try testing.expectEqual(@intFromEnum(resp), decoded.packet.command);
+        try testing.expectEqual(@backingInt(resp), decoded.packet.command);
 
         // Verify the byte can be converted back to response
         const recovered = milter.MilterResponse.fromByte(decoded.packet.command);
@@ -593,7 +592,7 @@ test "Milter edge: macro payload with empty macro values" {
     var offset: usize = 0;
 
     // Command code for connect
-    payload_buf[offset] = @intFromEnum(milter.MilterCommand.connect);
+    payload_buf[offset] = @backingInt(milter.MilterCommand.connect);
     offset += 1;
 
     // Macro name "j" + NUL
@@ -607,7 +606,7 @@ test "Milter edge: macro payload with empty macro values" {
     offset += 1;
 
     const pkt = milter.MilterPacket{
-        .command = @intFromEnum(milter.MilterCommand.macro),
+        .command = @backingInt(milter.MilterCommand.macro),
         .data = payload_buf[0..offset],
     };
 
@@ -616,11 +615,11 @@ test "Milter edge: macro payload with empty macro values" {
     const encoded = try pkt.encode(&buf);
     const decoded = try milter.MilterPacket.decode(encoded);
 
-    try testing.expectEqual(@intFromEnum(milter.MilterCommand.macro), decoded.packet.command);
+    try testing.expectEqual(@backingInt(milter.MilterCommand.macro), decoded.packet.command);
     // Data should contain cmd byte + "j\0\0"
     try testing.expectEqual(@as(usize, 4), decoded.packet.data.len);
     // The first byte is the command code
-    try testing.expectEqual(@intFromEnum(milter.MilterCommand.connect), decoded.packet.data[0]);
+    try testing.expectEqual(@backingInt(milter.MilterCommand.connect), decoded.packet.data[0]);
 }
 
 // 6. Header modification with empty header name
@@ -628,7 +627,7 @@ test "Milter edge: header packet with empty header name" {
     // Header payload: name\0 value\0, where name is empty
     const data = "\x00some-value\x00";
     const pkt = milter.MilterPacket{
-        .command = @intFromEnum(milter.MilterCommand.header),
+        .command = @backingInt(milter.MilterCommand.header),
         .data = data,
     };
 
@@ -636,7 +635,7 @@ test "Milter edge: header packet with empty header name" {
     const encoded = try pkt.encode(&buf);
     const decoded = try milter.MilterPacket.decode(encoded);
 
-    try testing.expectEqual(@intFromEnum(milter.MilterCommand.header), decoded.packet.command);
+    try testing.expectEqual(@backingInt(milter.MilterCommand.header), decoded.packet.command);
     // The first byte is NUL (empty name)
     try testing.expectEqual(@as(u8, 0), decoded.packet.data[0]);
 }
@@ -646,7 +645,7 @@ test "Milter edge: header packet with empty header value" {
     // Header payload: name\0 value\0, where value is empty
     const data = "Subject\x00\x00";
     const pkt = milter.MilterPacket{
-        .command = @intFromEnum(milter.MilterCommand.header),
+        .command = @backingInt(milter.MilterCommand.header),
         .data = data,
     };
 
@@ -654,14 +653,14 @@ test "Milter edge: header packet with empty header value" {
     const encoded = try pkt.encode(&buf);
     const decoded = try milter.MilterPacket.decode(encoded);
 
-    try testing.expectEqual(@intFromEnum(milter.MilterCommand.header), decoded.packet.command);
+    try testing.expectEqual(@backingInt(milter.MilterCommand.header), decoded.packet.command);
     try testing.expectEqualStrings("Subject\x00\x00", decoded.packet.data);
 }
 
 // 8. Body replacement with empty body
 test "Milter edge: body packet with empty body" {
     const pkt = milter.MilterPacket{
-        .command = @intFromEnum(milter.MilterCommand.body),
+        .command = @backingInt(milter.MilterCommand.body),
         .data = "",
     };
 
@@ -671,7 +670,7 @@ test "Milter edge: body packet with empty body" {
     const encoded = try pkt.encode(&buf);
     const decoded = try milter.MilterPacket.decode(encoded);
 
-    try testing.expectEqual(@intFromEnum(milter.MilterCommand.body), decoded.packet.command);
+    try testing.expectEqual(@backingInt(milter.MilterCommand.body), decoded.packet.command);
     try testing.expectEqual(@as(usize, 0), decoded.packet.data.len);
 }
 
@@ -682,7 +681,7 @@ test "Milter edge: multiple RCPT TO payloads encode distinct recipients" {
         "alice@example.com",
         "bob@example.com",
         "charlie@example.com",
-        "",  // edge case: empty recipient
+        "", // edge case: empty recipient
     };
 
     for (recipients) |rcpt| {
@@ -693,7 +692,7 @@ test "Milter edge: multiple RCPT TO payloads encode distinct recipients" {
         alloc_buf[rcpt.len] = 0;
 
         const pkt = milter.MilterPacket{
-            .command = @intFromEnum(milter.MilterCommand.rcpt_to),
+            .command = @backingInt(milter.MilterCommand.rcpt_to),
             .data = alloc_buf,
         };
 
@@ -701,7 +700,7 @@ test "Milter edge: multiple RCPT TO payloads encode distinct recipients" {
         defer testing.allocator.free(encoded);
 
         const decoded = try milter.MilterPacket.decode(encoded);
-        try testing.expectEqual(@intFromEnum(milter.MilterCommand.rcpt_to), decoded.packet.command);
+        try testing.expectEqual(@backingInt(milter.MilterCommand.rcpt_to), decoded.packet.command);
         try testing.expectEqual(rcpt.len + 1, decoded.packet.data.len);
         // The data should end with NUL
         try testing.expectEqual(@as(u8, 0), decoded.packet.data[decoded.packet.data.len - 1]);
@@ -725,7 +724,7 @@ test "Milter edge: connect payload with IPv4 address" {
     offset += hostname.len;
     buf[offset] = 0;
     offset += 1;
-    buf[offset] = @intFromEnum(family);
+    buf[offset] = @backingInt(family);
     offset += 1;
     std.mem.writeInt(u16, buf[offset..][0..2], port, .big);
     offset += 2;
@@ -734,7 +733,7 @@ test "Milter edge: connect payload with IPv4 address" {
     buf[offset] = 0;
 
     const pkt = milter.MilterPacket{
-        .command = @intFromEnum(milter.MilterCommand.connect),
+        .command = @backingInt(milter.MilterCommand.connect),
         .data = buf,
     };
 
@@ -742,9 +741,9 @@ test "Milter edge: connect payload with IPv4 address" {
     defer testing.allocator.free(encoded);
 
     const decoded = try milter.MilterPacket.decode(encoded);
-    try testing.expectEqual(@intFromEnum(milter.MilterCommand.connect), decoded.packet.command);
+    try testing.expectEqual(@backingInt(milter.MilterCommand.connect), decoded.packet.command);
     // Verify family byte is at the right position
-    try testing.expectEqual(@intFromEnum(milter.MilterFamily.inet), decoded.packet.data[hostname.len + 1]);
+    try testing.expectEqual(@backingInt(milter.MilterFamily.inet), decoded.packet.data[hostname.len + 1]);
 }
 
 test "Milter edge: connect payload with IPv6 address" {
@@ -762,7 +761,7 @@ test "Milter edge: connect payload with IPv6 address" {
     offset += hostname.len;
     buf[offset] = 0;
     offset += 1;
-    buf[offset] = @intFromEnum(family);
+    buf[offset] = @backingInt(family);
     offset += 1;
     std.mem.writeInt(u16, buf[offset..][0..2], port, .big);
     offset += 2;
@@ -771,7 +770,7 @@ test "Milter edge: connect payload with IPv6 address" {
     buf[offset] = 0;
 
     const pkt = milter.MilterPacket{
-        .command = @intFromEnum(milter.MilterCommand.connect),
+        .command = @backingInt(milter.MilterCommand.connect),
         .data = buf,
     };
 
@@ -779,8 +778,8 @@ test "Milter edge: connect payload with IPv6 address" {
     defer testing.allocator.free(encoded);
 
     const decoded = try milter.MilterPacket.decode(encoded);
-    try testing.expectEqual(@intFromEnum(milter.MilterCommand.connect), decoded.packet.command);
-    try testing.expectEqual(@intFromEnum(milter.MilterFamily.inet6), decoded.packet.data[hostname.len + 1]);
+    try testing.expectEqual(@backingInt(milter.MilterCommand.connect), decoded.packet.command);
+    try testing.expectEqual(@backingInt(milter.MilterFamily.inet6), decoded.packet.data[hostname.len + 1]);
 
     // Verify port bytes
     const port_bytes = decoded.packet.data[hostname.len + 2 ..][0..2];
@@ -797,7 +796,7 @@ test "Milter edge: negotiation payload encodes version correctly" {
     std.mem.writeInt(u32, payload[8..12], milter.MilterProtocol.all_callbacks.toNetworkU32(), .big);
 
     const pkt = milter.MilterPacket{
-        .command = @intFromEnum(milter.MilterCommand.option_negotiation),
+        .command = @backingInt(milter.MilterCommand.option_negotiation),
         .data = &payload,
     };
 
@@ -805,7 +804,7 @@ test "Milter edge: negotiation payload encodes version correctly" {
     const encoded = try pkt.encode(&buf);
     const decoded = try milter.MilterPacket.decode(encoded);
 
-    try testing.expectEqual(@intFromEnum(milter.MilterCommand.option_negotiation), decoded.packet.command);
+    try testing.expectEqual(@backingInt(milter.MilterCommand.option_negotiation), decoded.packet.command);
     try testing.expectEqual(@as(usize, 12), decoded.packet.data.len);
 
     // Parse the version from the decoded data
@@ -820,7 +819,7 @@ test "Milter edge: negotiation payload with version 6 and all actions" {
     std.mem.writeInt(u32, payload[8..12], milter.MilterProtocol.minimal.toNetworkU32(), .big);
 
     const pkt = milter.MilterPacket{
-        .command = @intFromEnum(milter.MilterCommand.option_negotiation),
+        .command = @backingInt(milter.MilterCommand.option_negotiation),
         .data = &payload,
     };
 
@@ -1052,7 +1051,7 @@ test "Milter edge: packet with large data encodes correctly" {
     @memset(data, 'X');
 
     const pkt = milter.MilterPacket{
-        .command = @intFromEnum(milter.MilterCommand.body),
+        .command = @backingInt(milter.MilterCommand.body),
         .data = data,
     };
 
@@ -1062,7 +1061,7 @@ test "Milter edge: packet with large data encodes correctly" {
     defer testing.allocator.free(encoded);
 
     const decoded = try milter.MilterPacket.decode(encoded);
-    try testing.expectEqual(@intFromEnum(milter.MilterCommand.body), decoded.packet.command);
+    try testing.expectEqual(@backingInt(milter.MilterCommand.body), decoded.packet.command);
     try testing.expectEqual(data_size, decoded.packet.data.len);
     // Verify all bytes are 'X'
     for (decoded.packet.data) |b| {

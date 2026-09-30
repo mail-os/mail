@@ -3,6 +3,7 @@
 // https://datatracker.ietf.org/doc/html/rfc8617
 
 const std = @import("std");
+const repeat = @import("test_util.zig").repeat;
 const testing = std.testing;
 const arc = @import("mail").arc;
 
@@ -767,7 +768,7 @@ test "RFC 8617 Edge Case: Very long header value exceeding RFC 5322 line limit" 
     // RFC 5322 limits lines to 998 characters. ARC headers with very long
     // signatures may be folded. This test ensures parsing handles a single
     // very long value without crashing.
-    const long_sig = "A" ** 1200;
+    const long_sig = repeat("A", 1200);
     const header = try std.fmt.allocPrint(
         testing.allocator,
         "i=1; a=rsa-sha256; d=example.com; s=sel; h=from; bh=bh==; b={s}",
@@ -859,7 +860,7 @@ test "RFC 8617 Edge Case: ARC-Seal with unsupported algorithm fails validateSet"
 
 test "RFC 8617 Edge Case: Validator with more than 50 ARC sets returns permerror" {
     // Build raw headers with 51 ARC sets to exceed the RFC 8617 limit.
-    var headers_buf: std.ArrayList(u8) = .{};
+    var headers_buf: std.ArrayList(u8) = .empty;
     defer headers_buf.deinit(testing.allocator);
 
     var i: u32 = 1;

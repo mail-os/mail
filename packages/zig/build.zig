@@ -205,12 +205,14 @@ pub fn build(b: *std.Build) void {
     mail_test_module.addImport("sqlite", sqlite_module);
     mail_test_module.addImport("ascii-compat", ascii_compat_module);
     mail_test_module.addImport("build-options", build_options_module);
+    linkVendoredSqlite(mail_test_module);
 
     for (rfc_compliance_tests) |test_file| {
         const test_module = b.createModule(.{
             .root_source_file = b.path(test_file),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
         });
 
         test_module.addImport("mail", mail_test_module);
@@ -234,6 +236,9 @@ pub fn build(b: *std.Build) void {
         .root_module = e2e_module,
     });
     const run_e2e_tests = b.addRunArtifact(e2e_tests);
+    // They talk to whatever server MAIL_E2E_SMTP names, which the build
+    // cache cannot see: never serve a cached result.
+    run_e2e_tests.has_side_effects = true;
     e2e_step.dependOn(&run_e2e_tests.step);
 
     // Fuzzing tests
@@ -242,7 +247,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tests/fuzz_test.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    fuzz_module.addImport("mail", mail_test_module);
     const fuzz_tests = b.addTest(.{
         .root_module = fuzz_module,
     });

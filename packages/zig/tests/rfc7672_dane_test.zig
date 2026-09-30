@@ -4,6 +4,7 @@
 // https://datatracker.ietf.org/doc/html/rfc6698
 
 const std = @import("std");
+const repeat = @import("test_util.zig").repeat;
 const testing = std.testing;
 const dane = @import("mail").dane;
 
@@ -423,7 +424,7 @@ test "RFC 7672 edge case: TLSA record with all-zero SHA-256 data" {
 }
 
 test "RFC 7672 edge case: TLSA record with all-zero SHA-512 data" {
-    const all_zeros = "0" ** 128;
+    const all_zeros = repeat("0", 128);
     var record = try dane.TLSARecord.parse(testing.allocator, "3 1 2 " ++ all_zeros);
     defer record.deinit();
 
@@ -432,7 +433,7 @@ test "RFC 7672 edge case: TLSA record with all-zero SHA-512 data" {
 }
 
 test "RFC 7672 edge case: TLSA record with all-ff data" {
-    const all_ff = "f" ** 64;
+    const all_ff = repeat("f", 64);
     var record = try dane.TLSARecord.parse(testing.allocator, "3 0 1 " ++ all_ff);
     defer record.deinit();
 
@@ -565,7 +566,7 @@ test "RFC 7672 edge case: matching type 0 (exact) accepts any length data" {
 
 test "RFC 7672 edge case: matching type 0 (exact) accepts long data" {
     // Exact match with large data representing a full certificate
-    const long_hex = "ab" ** 256;
+    const long_hex = repeat("ab", 256);
     var record = try dane.TLSARecord.parse(testing.allocator, "3 0 0 " ++ long_hex);
     defer record.deinit();
     try testing.expectEqual(dane.TLSAMatchingType.EXACT, record.matching_type);
@@ -606,7 +607,7 @@ test "RFC 7672 edge case: SHA-256 with 1 byte (2 hex chars) rejected" {
 // ============================================================================
 
 test "RFC 7672 edge case: SHA-512 with 63 bytes (126 hex chars) rejected" {
-    const short_hex = "ab" ** 63;
+    const short_hex = repeat("ab", 63);
     try testing.expectEqual(@as(usize, 126), short_hex.len);
     try testing.expectError(
         error.InvalidTLSARecord,
@@ -615,7 +616,7 @@ test "RFC 7672 edge case: SHA-512 with 63 bytes (126 hex chars) rejected" {
 }
 
 test "RFC 7672 edge case: SHA-512 with 65 bytes (130 hex chars) rejected" {
-    const long_hex = "ab" ** 65;
+    const long_hex = repeat("ab", 65);
     try testing.expectEqual(@as(usize, 130), long_hex.len);
     try testing.expectError(
         error.InvalidTLSARecord,
@@ -663,7 +664,7 @@ test "RFC 7672 edge case: DNS name for domain with trailing dot" {
 
 test "RFC 7672 edge case: DNS name for very long domain" {
     // Build a domain name near the 255-character DNS limit
-    const long_label = "a" ** 63;
+    const long_label = repeat("a", 63);
     const long_domain = long_label ++ "." ++ long_label ++ "." ++ long_label ++ ".example.com";
     const dns_name = try dane.TLSARecord.dnsName(testing.allocator, long_domain, 25);
     defer testing.allocator.free(dns_name);
