@@ -35,3 +35,4 @@ pub const typesense = @import("search/typesense.zig");
 pub const smtp = @import("core/protocol.zig");
 pub const config = @import("core/config.zig");
 pub const logger = @import("core/logger.zig");
+pub const database = @import("storage/database.zig");

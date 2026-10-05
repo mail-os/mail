@@ -540,31 +540,42 @@ pub const AuthBackend = struct {
     }
 };
 
-/// Decode SASL PLAIN base64 authentication (SMTP/IMAP/POP3)
-/// Format: base64(\0username\0password)
+/// Decode a SASL PLAIN response (RFC 4616) for SMTP, IMAP and POP3:
+/// base64 of `authzid NUL authcid NUL passwd`.
+///
+/// The authorization identity (authzid) is usually empty. When a client does
+/// send one it must name the account that is logging in: nobody may act as
+/// another user, so any other authzid is refused with AuthzidNotPermitted.
+/// The returned username is the authentication identity (authcid).
 pub fn decodeBase64Auth(allocator: std.mem.Allocator, encoded: []const u8) !Credentials {
-    // Decode base64 authentication string
     const decoder = std.base64.standard.Decoder;
-    const decoded_len = try decoder.calcSizeForSlice(encoded);
+    const trimmed = std.mem.trim(u8, encoded, " \t\r\n");
+    const decoded_len = try decoder.calcSizeForSlice(trimmed);
 
     const decoded = try allocator.alloc(u8, decoded_len);
     defer {
         // SECURITY: Zero decoded credentials before freeing to prevent memory disclosure
-        @memset(decoded, 0);
+        std.crypto.secureZero(u8, decoded);
         allocator.free(decoded);
     }
 
-    try decoder.decode(decoded, encoded);
+    try decoder.decode(decoded, trimmed);
 
-    // Parse credentials in format: \0username\0password
-    var parts = std.mem.splitSequence(u8, decoded, "\x00");
-    _ = parts.next(); // Skip first empty part
+    // Exactly three fields: two NULs, and none in the password.
+    const first_nul = std.mem.indexOfScalar(u8, decoded, 0) orelse return error.InvalidAuthFormat;
+    const authzid = decoded[0..first_nul];
+    const rest = decoded[first_nul + 1 ..];
+    const second_nul = std.mem.indexOfScalar(u8, rest, 0) orelse return error.InvalidAuthFormat;
+    const authcid = rest[0..second_nul];
+    const password = rest[second_nul + 1 ..];
+    if (std.mem.indexOfScalar(u8, password, 0) != null) return error.InvalidAuthFormat;
+    if (authcid.len == 0) return error.InvalidAuthFormat;
+    if (authzid.len != 0 and !std.ascii.eqlIgnoreCase(authzid, authcid)) return error.AuthzidNotPermitted;
 
-    const username = parts.next() orelse return error.InvalidAuthFormat;
-    const password = parts.next() orelse return error.InvalidAuthFormat;
-
+    const username = try allocator.dupe(u8, authcid);
+    errdefer allocator.free(username);
     return Credentials{
-        .username = try allocator.dupe(u8, username),
+        .username = username,
         .password = try allocator.dupe(u8, password),
     };
 }

@@ -86,6 +86,23 @@ fn sanitizedSlice(buf: *const [256]u8, len: usize) []const u8 {
     return buf[0..@min(len, 255)];
 }
 
+/// The base64 of a SASL response, with "=" (RFC 4954 §4: a response of
+/// zero length) mapped to the empty string.
+pub fn saslPayload(response: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, response, " \t\r\n");
+    return if (std.mem.eql(u8, trimmed, "=")) "" else trimmed;
+}
+
+/// Decode one base64 SASL field (an AUTH LOGIN username or password) into
+/// `buf`. Null when it is not base64 or does not fit.
+pub fn decodeSaslField(buf: []u8, b64: []const u8) ?[]const u8 {
+    const decoder = std.base64.standard.Decoder;
+    const len = decoder.calcSizeForSlice(b64) catch return null;
+    if (len > buf.len) return null;
+    decoder.decode(buf[0..len], b64) catch return null;
+    return buf[0..len];
+}
+
 /// Domain part of an address like `<user@example.com>` or `user@example.com`.
 fn domainOf(addr: []const u8) []const u8 {
     const at = std.mem.lastIndexOfScalar(u8, addr, '@') orelse return "";
@@ -2212,8 +2229,9 @@ pub const Session = struct {
             return;
         }
 
-        // Parse AUTH mechanism
-        var it = std.mem.splitScalar(u8, line, ' ');
+        // Parse AUTH mechanism. Tokenized, so a stray trailing space is not
+        // taken for an (empty) initial response.
+        var it = std.mem.tokenizeAny(u8, line, " \t");
         _ = it.next(); // Skip AUTH
 
         const mechanism = it.next() orelse {
@@ -2221,149 +2239,147 @@ pub const Session = struct {
             return;
         };
 
+        // RFC 4954 §4: the response may ride on the AUTH line (the
+        // "initial-response"), or, when it does not, the server sends an
+        // empty 334 challenge and the client answers on the next line. A
+        // lone "=" is an initial response of zero length.
         if (std.ascii.eqlIgnoreCase(mechanism, "PLAIN")) {
-            // Get the initial response (base64 encoded credentials)
-            const initial_response = it.next();
+            var response_buf: [auth_response_max]u8 = undefined;
+            defer std.crypto.secureZero(u8, &response_buf);
 
-            if (initial_response) |encoded| {
-                // Decode and verify credentials
-                if (self.auth_backend) |backend| {
-                    const credentials = auth.decodeBase64Auth(self.allocator, encoded) catch {
-                        try self.sendResponse(writer, 535, "Authentication failed", null);
-                        return;
-                    };
-                    defer {
-                        self.allocator.free(credentials.username);
-                        self.allocator.free(credentials.password);
-                    }
+            const encoded = if (it.next()) |initial| initial else blk: {
+                try self.sendResponse(writer, 334, "", null);
+                break :blk (try self.awaitAuthResponse(writer, &response_buf)) orelse return;
+            };
 
-                    const valid = backend.verifyCredentials(credentials.username, credentials.password) catch {
-                        try self.sendResponse(writer, 454, "Temporary authentication failure", null);
-                        return;
-                    };
-
-                    if (valid) {
-                        self.authenticated = true;
-                        self.state = .Authenticated;
-                        const safe_user = sanitizeForLog(credentials.username);
-                        self.logger.info("User '{s}' authenticated successfully", .{sanitizedSlice(&safe_user, credentials.username.len)});
-                        try self.sendResponse(writer, 235, "Authentication successful", null);
-                    } else {
-                        const safe_user = sanitizeForLog(credentials.username);
-                        self.logger.warn("Failed SMTP authentication for {s} from {s}", .{ sanitizedSlice(&safe_user, credentials.username.len), self.remote_addr });
-                        try self.sendResponse(writer, 535, "Authentication failed", null);
-                    }
-                } else {
-                    // No auth backend configured: fail closed. Granting auth here
-                    // would turn the server into an authenticated open relay if it
-                    // were ever started without a backend.
-                    self.logger.warn("AUTH attempted but no auth backend is configured; rejecting", .{});
-                    try self.sendResponse(writer, 454, "Temporary authentication failure", null);
+            const credentials = auth.decodeBase64Auth(self.allocator, saslPayload(encoded)) catch |err| {
+                switch (err) {
+                    error.InvalidAuthFormat, error.AuthzidNotPermitted => try self.sendResponse(writer, 535, "Authentication failed", null),
+                    error.OutOfMemory => try self.sendResponse(writer, 454, "Temporary authentication failure", null),
+                    // Not base64 at all (RFC 4954 §4).
+                    else => try self.sendResponse(writer, 501, "Invalid base64 in authentication response", null),
                 }
-            } else {
-                try self.sendResponse(writer, 501, "AUTH PLAIN requires initial-response", null);
+                return;
+            };
+            defer {
+                self.allocator.free(credentials.username);
+                std.crypto.secureZero(u8, @constCast(credentials.password));
+                self.allocator.free(credentials.password);
             }
+
+            try self.completeAuth(writer, "PLAIN", credentials.username, credentials.password);
         } else if (std.ascii.eqlIgnoreCase(mechanism, "LOGIN")) {
-            // AUTH LOGIN: multi-step challenge-response
-            // Step 1: Send "Username:" challenge (base64 encoded)
-            try self.sendResponse(writer, 334, "VXNlcm5hbWU6", null); // "Username:"
+            // AUTH LOGIN: the username, then the password, each answering a
+            // 334 challenge. The username may instead come as the initial
+            // response ("AUTH LOGIN <b64 username>"), which skips the first
+            // challenge.
+            var user_line: [auth_response_max]u8 = undefined;
+            const username_b64 = if (it.next()) |initial| initial else blk: {
+                try self.sendResponse(writer, 334, "VXNlcm5hbWU6", null); // "Username:"
+                break :blk (try self.awaitAuthResponse(writer, &user_line)) orelse return;
+            };
 
-            // Step 2: Read base64-encoded username
-            var username_line: [1024]u8 = undefined;
-            var username_pos: usize = 0;
-            while (true) {
-                const n = self.conn_wrapper.readBuffered(username_line[username_pos .. username_pos + 1]) catch {
-                    try self.sendResponse(writer, 535, "Authentication failed", null);
-                    return;
-                };
-                if (n == 0) {
-                    try self.sendResponse(writer, 535, "Authentication failed", null);
-                    return;
-                }
-                if (username_line[username_pos] == '\n') break;
-                username_pos += 1;
-                if (username_pos >= username_line.len - 1) break;
-            }
-            const username_b64 = std.mem.trim(u8, username_line[0..username_pos], " \t\r\n");
-
-            // Decode username from base64
             var username_buf: [256]u8 = undefined;
-            const username_dec_len = std.base64.standard.Decoder.calcSizeForSlice(username_b64) catch {
-                try self.sendResponse(writer, 535, "Authentication failed", null);
+            const username = decodeSaslField(&username_buf, saslPayload(username_b64)) orelse {
+                try self.sendResponse(writer, 501, "Invalid base64 in authentication response", null);
                 return;
             };
-            if (username_dec_len > username_buf.len) {
-                try self.sendResponse(writer, 535, "Authentication failed", null);
-                return;
-            }
-            std.base64.standard.Decoder.decode(username_buf[0..username_dec_len], username_b64) catch {
-                try self.sendResponse(writer, 535, "Authentication failed", null);
-                return;
-            };
-            const username = username_buf[0..username_dec_len];
 
-            // Step 3: Send "Password:" challenge (base64 encoded)
             try self.sendResponse(writer, 334, "UGFzc3dvcmQ6", null); // "Password:"
 
-            // Step 4: Read base64-encoded password
-            var password_line: [1024]u8 = undefined;
-            var password_pos: usize = 0;
-            while (true) {
-                const n = self.conn_wrapper.readBuffered(password_line[password_pos .. password_pos + 1]) catch {
-                    try self.sendResponse(writer, 535, "Authentication failed", null);
-                    return;
-                };
-                if (n == 0) {
-                    try self.sendResponse(writer, 535, "Authentication failed", null);
-                    return;
-                }
-                if (password_line[password_pos] == '\n') break;
-                password_pos += 1;
-                if (password_pos >= password_line.len - 1) break;
-            }
-            const password_b64 = std.mem.trim(u8, password_line[0..password_pos], " \t\r\n");
+            var password_line: [auth_response_max]u8 = undefined;
+            defer std.crypto.secureZero(u8, &password_line);
+            const password_b64 = (try self.awaitAuthResponse(writer, &password_line)) orelse return;
 
-            // Decode password from base64
             var password_buf: [256]u8 = undefined;
-            const password_dec_len = std.base64.standard.Decoder.calcSizeForSlice(password_b64) catch {
-                try self.sendResponse(writer, 535, "Authentication failed", null);
+            defer std.crypto.secureZero(u8, &password_buf);
+            const password = decodeSaslField(&password_buf, saslPayload(password_b64)) orelse {
+                try self.sendResponse(writer, 501, "Invalid base64 in authentication response", null);
                 return;
             };
-            if (password_dec_len > password_buf.len) {
-                try self.sendResponse(writer, 535, "Authentication failed", null);
-                return;
-            }
-            std.base64.standard.Decoder.decode(password_buf[0..password_dec_len], password_b64) catch {
-                try self.sendResponse(writer, 535, "Authentication failed", null);
-                return;
-            };
-            const password = password_buf[0..password_dec_len];
 
-            // Verify credentials
-            if (self.auth_backend) |backend| {
-                const valid = backend.verifyCredentials(username, password) catch {
-                    try self.sendResponse(writer, 454, "Temporary authentication failure", null);
-                    return;
-                };
-
-                if (valid) {
-                    self.authenticated = true;
-                    self.state = .Authenticated;
-                    const safe_user = sanitizeForLog(username);
-                    self.logger.info("User '{s}' authenticated via LOGIN", .{sanitizedSlice(&safe_user, username.len)});
-                    try self.sendResponse(writer, 235, "Authentication successful", null);
-                } else {
-                    const safe_user = sanitizeForLog(username);
-                    self.logger.warn("Failed SMTP authentication for {s} from {s}", .{ sanitizedSlice(&safe_user, username.len), self.remote_addr });
-                    try self.sendResponse(writer, 535, "Authentication failed", null);
-                }
-            } else {
-                // No auth backend configured: fail closed (see AUTH PLAIN above).
-                self.logger.warn("AUTH LOGIN attempted but no auth backend is configured; rejecting", .{});
-                try self.sendResponse(writer, 454, "Temporary authentication failure", null);
-            }
+            try self.completeAuth(writer, "LOGIN", username, password);
         } else {
             try self.sendResponse(writer, 504, "Unrecognized authentication type", null);
+        }
+    }
+
+    /// Longest SASL response line accepted from a client. A PLAIN response
+    /// for a 255-byte username and password is under 700 base64 characters.
+    const auth_response_max = 2048;
+
+    /// How a client answered a 334 challenge.
+    const AuthResponse = union(enum) {
+        /// The response, CRLF removed.
+        line: []const u8,
+        /// "*": the client abandoned the exchange (RFC 4954 §4).
+        cancelled,
+        /// Longer than `auth_response_max`; the rest of it was discarded.
+        too_long,
+        /// The connection closed or failed mid-exchange.
+        closed,
+    };
+
+    /// Read one response line to a 334 challenge into `buf`. It comes off
+    /// the same read-ahead buffer the command loop reads from, so a client
+    /// that sent its response early loses nothing.
+    fn readAuthResponse(self: *Session, buf: []u8) AuthResponse {
+        var len: usize = 0;
+        var overflow = false;
+        while (true) {
+            var byte: [1]u8 = undefined;
+            const n = self.conn_wrapper.readBuffered(&byte) catch return .closed;
+            if (n == 0) return .closed;
+            if (byte[0] == '\n') break;
+            if (len < buf.len) {
+                buf[len] = byte[0];
+                len += 1;
+            } else overflow = true;
+        }
+        self.updateActivity();
+        if (overflow) return .too_long;
+
+        const line = std.mem.trim(u8, buf[0..len], " \t\r");
+        if (std.mem.eql(u8, line, "*")) return .cancelled;
+        return .{ .line = line };
+    }
+
+    /// Await the client's answer to a 334 challenge, replying for it when
+    /// there is none to act on. Null means the exchange is over.
+    fn awaitAuthResponse(self: *Session, writer: anytype, buf: []u8) !?[]const u8 {
+        switch (self.readAuthResponse(buf)) {
+            .line => |line| return line,
+            .cancelled => try self.sendResponse(writer, 501, "Authentication cancelled", null),
+            .too_long => try self.sendResponse(writer, 500, "Authentication response too long", null),
+            .closed => {},
+        }
+        return null;
+    }
+
+    /// Verify a username and password from any mechanism and answer the
+    /// client. Fails closed when no auth backend is configured: granting
+    /// auth there would make the server an authenticated open relay.
+    fn completeAuth(self: *Session, writer: anytype, mechanism: []const u8, username: []const u8, password: []const u8) !void {
+        const backend = self.auth_backend orelse {
+            self.logger.warn("AUTH {s} attempted but no auth backend is configured; rejecting", .{mechanism});
+            try self.sendResponse(writer, 454, "Temporary authentication failure", null);
+            return;
+        };
+
+        const valid = backend.verifyCredentials(username, password) catch {
+            try self.sendResponse(writer, 454, "Temporary authentication failure", null);
+            return;
+        };
+
+        const safe_user = sanitizeForLog(username);
+        if (valid) {
+            self.authenticated = true;
+            self.state = .Authenticated;
+            self.logger.info("User '{s}' authenticated via {s}", .{ sanitizedSlice(&safe_user, username.len), mechanism });
+            try self.sendResponse(writer, 235, "Authentication successful", null);
+        } else {
+            self.logger.warn("Failed SMTP authentication for {s} from {s}", .{ sanitizedSlice(&safe_user, username.len), self.remote_addr });
+            try self.sendResponse(writer, 535, "Authentication failed", null);
         }
     }
 
