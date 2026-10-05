@@ -89,63 +89,92 @@ This project uses Zig 0.16.0-dev which has breaking changes from 0.15:
 
 ## Production Server
 
-- **Instance**: `i-0e365c6bd31da4678` (EC2, Amazon Linux 2023, us-east-1)
-- **Domain**: `mail.stacksjs.com`
-- **Binary**: `/opt/mail/mail-server` (renamed from `mail` to avoid conflict with `mail/` mailbox dir)
-- **Mailboxes**: `/opt/mail/mail/{username}/new/` (Maildir format)
-- **Database**: `/opt/mail/smtp.db` (SQLite)
+Reached over SSH. There is no SSM agent on this host, and no AWS instance behind
+it — an earlier version of this file described an EC2 box in us-east-1 deployed
+via `aws ssm send-command`, which no longer exists.
+
+- **Host**: `178.105.248.188` — Hetzner, Ubuntu 24.04 LTS, x86_64
+- **Hostname**: reports as `statushq-production-app`; the box is shared, so do
+  not assume a unit belongs to mail just because it is running here
+- **Domain**: `mail.stacksjs.com` (A record points at the IP above)
+- **Access**: `ssh -i ~/.ssh/id_ed25519 root@178.105.248.188`
+- **Binary**: `/opt/mail/mail-server`
+- **Service**: `mail.service` — "Mail Server (Zig)", systemd, runs as the
+  `mail-server` user with `CAP_NET_BIND_SERVICE`
 - **Config**: `/etc/mail/mail.env`
+- **Delivery**: `SMTP_DELIVERY_METHOD=direct` — this host sends its own mail. It
+  is not relaying through SES.
 - **TLS**: Let's Encrypt at `/etc/letsencrypt/live/mail.stacksjs.com/`
-- **Service**: `mail.service` (systemd, runs as `mail-server` user with `CAP_NET_BIND_SERVICE`)
-- **Delivery**: Amazon SES (`SMTP_DELIVERY_METHOD=ses`)
-- **Ports**: 25 (SMTP), 465 (SMTPS), 587 (Submission), 143 (IMAP), 993 (IMAPS)
+- **Ports**: 25 (SMTP), 465 (SMTPS), 587 (Submission), 143 (IMAP), 993 (IMAPS).
+  ufw allows all five from anywhere, plus 22/80/443.
 
-## Deployment via AWS SSM
+### State lives under /var/lib, not /opt
 
-Deploy new builds without SSH. The server has SSM agent running and an IAM role with SSM permissions.
+Everything in `/opt/mail` that holds data is a symlink into
+`/var/lib/mail-storage/data/`. Follow the link before reasoning about a path,
+and back up the real file rather than the symlink:
+
+| via /opt/mail | real path |
+|---|---|
+| `smtp.db` | `/var/lib/mail-storage/data/smtp.db` |
+| `mail/{username}/` | `/var/lib/mail-storage/data/mail/{username}/` |
+| `dkim/` | `/var/lib/mail-storage/data/dkim/` |
+| `forwards.json` | `/var/lib/mail-storage/data/forwards.json` |
+| `backups/` | `/var/lib/mail-storage/data/backups/` |
+
+Maildirs are named after the account's `username` column, which is **not always
+the email address** — 12 of the current accounts are stored bare (`cloud`,
+`zoltan`, `noreply`) and the rest use the full address. A bare-username account
+will not authenticate with its email address.
+
+`mail.log` sits beside them and is not rotated; it was 345MB as of 2026-10-05,
+so `tail -c` a slice rather than reading it whole.
+
+## Deployment over SSH
+
+Cross-compile locally, ship the binary, restart the unit. Keep the old binary —
+the convention on the box is `mail-server.bak-<epoch>`, and there are a dozen of
+them from previous rollbacks.
 
 ```bash
-# 1. Cross-compile for Linux
+# 1. Build for the server
 cd packages/zig
-zig build -Dtarget=x86_64-linux
+zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux
 
-# 2. Upload binary to S3
-aws s3 cp zig-out/bin/mail s3://stacks-production-s3-email/deploy/mail-server-new
+# 2. Ship it beside the running one
+scp -i ~/.ssh/id_ed25519 zig-out/bin/mail root@178.105.248.188:/tmp/mail-server-new
 
-# 3. Deploy via SSM (stop service, swap binary, restart)
-aws ssm send-command \
-  --instance-ids i-0e365c6bd31da4678 \
-  --document-name "AWS-RunShellScript" \
-  --parameters 'commands=[
-    "aws s3 cp s3://stacks-production-s3-email/deploy/mail-server-new /tmp/mail-server-new",
-    "chmod +x /tmp/mail-server-new",
-    "systemctl stop mail",
-    "cp /opt/mail/mail-server /opt/mail/mail-server.bak",
-    "mv /tmp/mail-server-new /opt/mail/mail-server",
-    "chown mail-server:mail-server /opt/mail/mail-server",
-    "systemctl start mail",
-    "sleep 2",
-    "systemctl is-active mail"
-  ]'
+# 3. Swap and restart
+ssh -i ~/.ssh/id_ed25519 root@178.105.248.188 '
+  cp /opt/mail/mail-server /opt/mail/mail-server.bak-$(date +%s)
+  install -o mail-server -g mail-server -m 755 /tmp/mail-server-new /opt/mail/mail-server
+  systemctl restart mail.service
+  systemctl is-active mail.service
+'
 
-# 4. Check result
-aws ssm get-command-invocation \
-  --command-id <COMMAND_ID> \
-  --instance-id i-0e365c6bd31da4678
+# 4. Confirm it came back on all five ports
+ssh -i ~/.ssh/id_ed25519 root@178.105.248.188 \
+  "ss -ltn | grep -cE ':(25|143|465|587|993)\\b'"   # expect 5
 
-# View logs
-aws ssm send-command \
-  --instance-ids i-0e365c6bd31da4678 \
-  --document-name "AWS-RunShellScript" \
-  --parameters 'commands=["journalctl -u mail --no-pager -n 100"]'
+# Logs
+ssh -i ~/.ssh/id_ed25519 root@178.105.248.188 \
+  "journalctl -u mail.service --no-pager -n 100"
 ```
 
-The old host key may need updating after instance rebuilds:
-```bash
-ssh-keygen -R mail.stacksjs.com
-```
+No `setcap` step. The binary carries no file capabilities (`getcap` on it is
+empty) — port 25 works because the unit declares
+`AmbientCapabilities=CAP_NET_BIND_SERVICE`, which systemd grants at launch. Keep
+the `install` ownership as `mail-server:mail-server 755`, matching what is there.
+
+If the host key changes after a rebuild: `ssh-keygen -R mail.stacksjs.com`
 
 ## Cloud Infrastructure (packages/cloud)
+
+> This describes `packages/cloud/cloud.config.ts` as written, not what is
+> serving mail today. Production currently runs on the Hetzner host above,
+> with `SMTP_DELIVERY_METHOD=direct` and DNS at Porkbun — no EC2, no SES
+> relay, no Route 53. Treat this section as the AWS path the repo still
+> supports, and verify against the live box before acting on it.
 
 Defined in `cloud.config.ts` using ts-cloud (CloudFormation wrapper):
 
