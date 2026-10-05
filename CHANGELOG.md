@@ -1,5 +1,23 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.11...v0.3.12)
+
+## 🐛 Bug Fixes
+
+- **smtp**: accept AUTH PLAIN without an initial response ([a5e584e](https://github.com/mail-os/mail/commit/a5e584e)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## ✅ Tests
+
+- **e2e**: log in for real with AUTH PLAIN and LOGIN ([ef32f02](https://github.com/mail-os/mail/commit/ef32f02)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## 🔧 Chores
+
+- release v0.3.12 ([0f30a33](https://github.com/mail-os/mail/commit/0f30a33)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## Contributors
+
+- _Chris <chrisbreuer93@gmail.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.10...v0.3.11)
 
 ## 🐛 Bug Fixes
