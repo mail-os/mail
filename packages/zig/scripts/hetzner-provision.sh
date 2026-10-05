@@ -56,10 +56,12 @@ fi
 # "for <account>"), as JSON for SMTP and as a plain line for IMAP. The account is
 # whatever the client sent, spaces and quotes included, so the address is only
 # trusted at the very end of the line: a name like `x from 9.9.9.9` must not get
-# 9.9.9.9 banned.
+# 9.9.9.9 banned. The same jail bans a client the server refuses to relay for
+# while it is unauthenticated, which logs the peer address before any client text.
 cat > /etc/fail2ban/filter.d/mail-auth.conf <<'FILTER'
 [Definition]
 failregex = ^.*(?:Failed (?:SMTP|IMAP) authentication(?: for .+)?|Authentication failed for user .+|Failed IMAP login attempt for user: .+) from <HOST>(?:"\})?$
+            "message":"Security event from <HOST>: Relay access denied
 ignoreregex =
 journalmatch = _SYSTEMD_UNIT=mail.service
 FILTER
