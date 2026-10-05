@@ -191,6 +191,10 @@ zig build test-fuzz   # randomized tests of the DATA decoder and SMTP session
 MAIL_E2E_SMTP=127.0.0.1:25825 zig build test-e2e   # against a running `mail serve`; skipped when unset
 ```
 
+The e2e AUTH tests that log in for real also need `MAIL_E2E_USER` and
+`MAIL_E2E_PASSWORD`, an account in that server's database (CI creates a
+throwaway one with `mail user:local create`); without them they skip.
+
 CI runs all four (see `.github/workflows/ci.yml` for how it starts the e2e
 server). A few files in `packages/zig/tests/` (security_test, integration_test,
 error_path_test, chaos_test, load_test, coverage, webmail_mobile_admin_test,

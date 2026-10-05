@@ -201,6 +201,112 @@ test "E2E: Send email with authentication" {
     try client.expectCode(quit, "221");
 }
 
+/// The account CI creates in the server's throwaway database, named by
+/// MAIL_E2E_USER and MAIL_E2E_PASSWORD. Tests that need a real login skip
+/// without it.
+fn e2eAccount() !struct { user: []const u8, password: []const u8 } {
+    const user = std.c.getenv("MAIL_E2E_USER") orelse return error.SkipZigTest;
+    const password = std.c.getenv("MAIL_E2E_PASSWORD") orelse return error.SkipZigTest;
+    return .{ .user = std.mem.sliceTo(user, 0), .password = std.mem.sliceTo(password, 0) };
+}
+
+fn base64Alloc(raw: []const u8) ![]u8 {
+    const enc = std.base64.standard.Encoder;
+    const out = try testing.allocator.alloc(u8, enc.calcSize(raw.len));
+    _ = enc.encode(out, raw);
+    return out;
+}
+
+/// Greet and EHLO, ready for AUTH.
+fn connectGreeted() !SmtpClient {
+    var client = try SmtpClient.connect(testing.allocator);
+    errdefer client.deinit();
+    const greeting = try client.readResponse();
+    defer testing.allocator.free(greeting);
+    try client.expectCode(greeting, "220");
+    const ehlo = try client.sendCommandAndRead("EHLO test.example.com");
+    defer testing.allocator.free(ehlo);
+    try client.expectCode(ehlo, "250");
+    try testing.expect(std.mem.indexOf(u8, ehlo, "AUTH PLAIN LOGIN") != null);
+    return client;
+}
+
+fn plainResponse(user: []const u8, password: []const u8) ![]u8 {
+    const raw = try std.fmt.allocPrint(testing.allocator, "\x00{s}\x00{s}", .{ user, password });
+    defer testing.allocator.free(raw);
+    return base64Alloc(raw);
+}
+
+test "E2E: AUTH PLAIN with an initial response logs in" {
+    const account = try e2eAccount();
+    var client = try connectGreeted();
+    defer client.deinit();
+
+    const b64 = try plainResponse(account.user, account.password);
+    defer testing.allocator.free(b64);
+    const cmd = try std.fmt.allocPrint(testing.allocator, "AUTH PLAIN {s}", .{b64});
+    defer testing.allocator.free(cmd);
+    const auth = try client.sendCommandAndRead(cmd);
+    defer testing.allocator.free(auth);
+    try client.expectCode(auth, "235");
+}
+
+// What curl and many client libraries send: bare "AUTH PLAIN", then the
+// credentials after the server's empty 334 challenge.
+test "E2E: AUTH PLAIN without an initial response logs in after a 334" {
+    const account = try e2eAccount();
+    var client = try connectGreeted();
+    defer client.deinit();
+
+    const challenge = try client.sendCommandAndRead("AUTH PLAIN");
+    defer testing.allocator.free(challenge);
+    try client.expectCode(challenge, "334");
+
+    const b64 = try plainResponse(account.user, account.password);
+    defer testing.allocator.free(b64);
+    const auth = try client.sendCommandAndRead(b64);
+    defer testing.allocator.free(auth);
+    try client.expectCode(auth, "235");
+}
+
+test "E2E: AUTH LOGIN logs in" {
+    const account = try e2eAccount();
+    var client = try connectGreeted();
+    defer client.deinit();
+
+    const user_challenge = try client.sendCommandAndRead("AUTH LOGIN");
+    defer testing.allocator.free(user_challenge);
+    try client.expectCode(user_challenge, "334");
+
+    const user_b64 = try base64Alloc(account.user);
+    defer testing.allocator.free(user_b64);
+    const pass_challenge = try client.sendCommandAndRead(user_b64);
+    defer testing.allocator.free(pass_challenge);
+    try client.expectCode(pass_challenge, "334");
+
+    const pass_b64 = try base64Alloc(account.password);
+    defer testing.allocator.free(pass_b64);
+    const auth = try client.sendCommandAndRead(pass_b64);
+    defer testing.allocator.free(auth);
+    try client.expectCode(auth, "235");
+}
+
+test "E2E: AUTH PLAIN with a wrong password is refused after a 334" {
+    const account = try e2eAccount();
+    var client = try connectGreeted();
+    defer client.deinit();
+
+    const challenge = try client.sendCommandAndRead("AUTH PLAIN");
+    defer testing.allocator.free(challenge);
+    try client.expectCode(challenge, "334");
+
+    const b64 = try plainResponse(account.user, "not-the-password");
+    defer testing.allocator.free(b64);
+    const auth = try client.sendCommandAndRead(b64);
+    defer testing.allocator.free(auth);
+    try client.expectCode(auth, "535");
+}
+
 test "E2E: PIPELINING support" {
     var client = try SmtpClient.connect(testing.allocator);
     defer client.deinit();

@@ -43,12 +43,19 @@ jobs:
 
     # The real binary over TCP. Trap mode (SMTP_CATCH_ALL) files every
     # recipient into one mailbox, so the tests need no user database; auth is
-    # on so AUTH gets a real 535 rather than 502. Without MAIL_E2E_SMTP the
-    # suite skips, so a server that fails to start fails the step instead.
+    # on so AUTH gets a real 535 rather than 502. One throwaway account in the
+    # throwaway database lets the AUTH tests log in for real (235), in every
+    # form clients use. Without MAIL_E2E_SMTP the suite skips, so a server
+    # that fails to start fails the step instead.
     - name: Run end-to-end tests against a live server
       run: |
         set -euo pipefail
         dir=$(mktemp -d)
+        export MAIL_E2E_USER=e2e@example.com
+        MAIL_E2E_PASSWORD=$(openssl rand -hex 16)
+        export MAIL_E2E_PASSWORD
+        (cd "$dir" && SMTP_DB_PATH="$dir/smtp.db" "$GITHUB_WORKSPACE/packages/zig/zig-out/bin/mail" \
+          user:local create "$MAIL_E2E_USER" "$MAIL_E2E_PASSWORD" "$MAIL_E2E_USER" > /dev/null)
         (cd "$dir" && env SMTP_HOSTNAME=mail.example.com SMTP_CATCH_ALL=true \
           SMTP_ANTISPAM_CHECK=false SMTP_SPAM_FILTER=false \
           IMAP_ENABLED=false CALDAV_ENABLED=false SUBMISSION_PORT=25870 \
