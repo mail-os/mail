@@ -51,11 +51,15 @@ if ! command -v fail2ban-server >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq && apt-get install -y -qq fail2ban >/dev/null
 fi
-# sshd and mail authentication jails. The mail daemon emits one stable,
-# credential-free failure line for every supported SMTP and IMAP mechanism.
+# sshd and mail authentication jails. A failed SMTP or IMAP login logs
+# "Failed <proto> authentication for <account> from <ip>" (older builds left out
+# "for <account>"), as JSON for SMTP and as a plain line for IMAP. The account is
+# whatever the client sent, spaces and quotes included, so the address is only
+# trusted at the very end of the line: a name like `x from 9.9.9.9` must not get
+# 9.9.9.9 banned.
 cat > /etc/fail2ban/filter.d/mail-auth.conf <<'FILTER'
 [Definition]
-failregex = ^.*Failed (?:IMAP|SMTP) authentication from <HOST>.*$
+failregex = ^.*(?:Failed (?:SMTP|IMAP) authentication(?: for .+)?|Authentication failed for user .+|Failed IMAP login attempt for user: .+) from <HOST>(?:"\})?$
 ignoreregex =
 journalmatch = _SYSTEMD_UNIT=mail.service
 FILTER
