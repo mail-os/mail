@@ -1,18 +1,28 @@
 # Webmail UI — Implementation Plan
 
-> **Status:** Phases 0–6 done + Phase 9 built & locally verified over HTTPS — full read+write client (login, 3-pane inbox, flags/move/delete, compose/reply/forward) now ships as a single binary that serves the embedded SPA over its own TLS. Prod deploy to mail.stacksjs.com is the one remaining explicit step (runbook in Phase 9). Next: trigger the deploy, or Phase 7 (search/polish).
+> **Status:** Phases 1, 2, 3, 5 and 6 are ✅ DONE and Phase 9 is 🟡 built and
+> locally verified over HTTPS — the read+write client (login, 3-pane inbox,
+> flags/move/delete, compose/reply/forward) ships as a single binary serving the
+> embedded SPA over its own TLS. Prod deploy to mail.stacksjs.com is the one
+> remaining explicit step (runbook in Phase 9). Phases 0, 4, 7, 8 and 10 carry no
+> completion marker — Phase 4's reading UI is covered by the shipped 3-pane
+> client, so its marker lags the code. Next: trigger the deploy, or Phase 7
+> (search/polish).
 > **Owner:** TBD
-> **Last updated:** 2026-06-01
+> **Last updated:** 2026-10-05
 > **Estimated effort:** ~8–12 weeks (multi-phase, see [Phases](#phases))
 
 This document is the single source of truth for building a browser-based webmail
-client for this mail server. It captures (1) the **real current state** of the
-codebase, (2) the **target architecture**, and (3) a **phased plan** broken into
-shippable increments.
+client for this mail server. It captures (1) the **state the plan started from**,
+(2) the **target architecture**, and (3) a **phased plan** broken into shippable
+increments.
 
-Read [Current State](#current-state) first — it corrects the common assumption
-that "there is no UI yet." There is a lot of *scaffolding and design work*, but
-**none of it is live and none of it serves real mail.**
+[Current State](#current-state) is an inventory taken on 2026-05-29, before the
+backend was wired up — read it as history, not as a description of the code
+today. At that point there was scaffolding and design work but no HTTP listener
+and no real mail. The per-phase markers under [Phases](#phases) are the current
+record: the client serves real mail over its own TLS, and what remains is
+deploying it to production.
 
 ---
 
@@ -43,11 +53,25 @@ IMAP/SMTP.
       delivery queue / SES path.
 - [ ] Works on desktop + responsive on mobile.
 
+> These are the v1 roll-up, deliberately still unticked. The phases that cover
+> them are marked done, but nothing has been verified end-to-end against a
+> deployed instance — tick these off the deploy, not off the phase markers.
+
 ---
 
 ## Current State
 
-> Evidence-based inventory as of 2026-05-29. Legend:
+> ⚠️ **Historical snapshot — 2026-05-29, superseded.** This records the state
+> before Phases 1–3, 5, 6 and 9 landed. It is kept for the design rationale it
+> explains, not as a description of the code today.
+>
+> Known superseded: `webmail.zig` is no longer "never imported anywhere"
+> (`main.zig` imports `api/webmail_http.zig` and starts it when `enable_webmail`
+> or `enable_auth` is set), and "no HTTP/HTTPS port is opened at all" no longer
+> holds. Still accurate: `crosswind` is not installed —
+> `packages/webmail/package.json` carries only `bun-plugin-stx`.
+>
+> Legend:
 > **🟢 Live** = wired in and working · **🟡 Code-complete but dead** = compiles
 > but never invoked · **🔵 Mock** = returns fake/in-memory data · **⚪ Mockup** =
 > static design reference · **🔴 Missing** = does not exist.
@@ -579,3 +603,5 @@ deferred deploy above.
 
 ## Changelog
 - 2026-05-29 — Initial plan + current-state inventory.
+- 2026-10-05 — Reconciled the status header with the per-phase markers; flagged
+  the Current State inventory as a superseded 2026-05-29 snapshot.
