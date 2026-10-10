@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.17...v0.3.18)
+
+## 🐛 Bug Fixes
+
+- **webmail**: fingerprint stylesheet assets on deployment ([1579d57](https://github.com/mail-os/mail/commit/1579d57)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.18 ([66e844a](https://github.com/mail-os/mail/commit/66e844a)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.16...v0.3.17)
 
 ## 🐛 Bug Fixes

@@ -1,7 +1,7 @@
 {
   "name": "mail-cloud",
   "type": "module",
-  "version": "0.3.17",
+  "version": "0.3.18",
   "description": "AWS Infrastructure for Mail Server using ts-cloud",
   "author": "Chris Breuer",
   "license": "MIT",
