@@ -177,7 +177,7 @@ jobs:
     # silently shipping a stale package at release time.
     - name: Test release scripts
       working-directory: ${{ github.workspace }}
-      run: bun test scripts
+      run: bun test scripts packages/webmail
 
     - name: Static analysis (future)
       run: echo "Static analysis placeholder"

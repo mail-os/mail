@@ -68,7 +68,7 @@ pub const SessionManager = struct {
 
     /// Verify credentials and create a new session. On success returns a
     /// Session the caller owns (call deinit). The username is normalized the
-    /// same way AuthBackend does (email local part) so the session and Maildir
+    /// same way AuthBackend does (canonical mailbox key) so the session and Maildir
     /// lookups agree.
     pub fn login(
         self: *SessionManager,
@@ -80,9 +80,10 @@ pub const SessionManager = struct {
         const ok = try self.auth.verifyCredentials(username, password);
         if (!ok) return SessionError.InvalidCredentials;
 
-        // Normalize to the local part so the rest of webmail (Maildir paths,
-        // mailbox tables) uses the same key IMAP does.
-        const local = normalizeUsername(username);
+        // Use the same canonical key as IMAP and SMTP. Domains distinguish
+        // hosted accounts and must never be discarded from a session identity.
+        const local = try self.auth.canonicalUsername(username, self.allocator);
+        defer self.allocator.free(local);
 
         // Resolve the canonical email from the user record; fall back to the
         // raw username if the lookup fails for any reason.
@@ -183,12 +184,6 @@ pub const SessionManager = struct {
     }
 };
 
-/// Extract the local part of an email-style username (`chris@x.org` -> `chris`).
-pub fn normalizeUsername(username: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, username, '@')) |at| return username[0..at];
-    return username;
-}
-
 /// Parse the session token from a Cookie header value, or null if absent.
 /// Handles multiple cookies: "a=1; webmail_session=abc; b=2".
 pub fn parseSessionCookie(cookie_header: []const u8) ?[]const u8 {
@@ -228,10 +223,27 @@ test "parseSessionCookie finds the session among others" {
     try t.expect(parseSessionCookie("") == null);
 }
 
-test "normalizeUsername strips domain" {
+test "sessions preserve canonical full-address identities across hosted domains" {
     const t = std.testing;
-    try t.expectEqualStrings("chris", normalizeUsername("chris@11ly.org"));
-    try t.expectEqualStrings("chris", normalizeUsername("chris"));
+    var db = try database.Database.init(t.allocator, ":memory:");
+    defer db.deinit();
+    var auth = auth_mod.AuthBackend.init(t.allocator, &db);
+    defer auth.deinit();
+    _ = try auth.createUser("pawel@hq.training", "temporary-password", "pawel@hq.training");
+    _ = try auth.createUser("pawel@other.example", "other-password", "pawel@other.example");
+    var manager = SessionManager.init(t.allocator, &db, &auth);
+    var session = try manager.login("pawel@hq.training", "temporary-password", null, null);
+    defer session.deinit(t.allocator);
+    try t.expectEqualStrings("pawel@hq.training", session.username);
+    try t.expectEqualStrings("pawel@hq.training", session.email);
+    try t.expectError(SessionError.InvalidCredentials, manager.login("pawel@other.example", "temporary-password", null, null));
+    try t.expectError(SessionError.InvalidCredentials, manager.login("pawel", "temporary-password", null, null));
+    try auth.changePassword(session.username, "replacement-password");
+    try db.deleteUserWebmailSessions(session.username);
+    try t.expectError(SessionError.SessionNotFound, manager.validate(session.session_id));
+    try t.expect(!try auth.verifyCredentials("pawel@hq.training", "temporary-password"));
+    try t.expect(try auth.verifyCredentials("pawel@hq.training", "replacement-password"));
+    try t.expect(try auth.verifyCredentials("pawel@other.example", "other-password"));
 }
 
 test "generateToken produces hex of expected length" {

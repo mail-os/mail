@@ -110,6 +110,8 @@ pub const Config = struct {
     webmail_port: u16 = 8080,
     // Add Secure attribute to session cookies (disable for local plain-HTTP dev).
     webmail_secure_cookies: bool = true,
+    /// Disable the dedicated HTTPS listener when a trusted local TLS gateway fronts it.
+    webmail_tls: bool = true,
 
     // Require STARTTLS (or implicit TLS) before AUTH is offered/accepted.
     // Default off to avoid locking out existing plaintext-auth clients.
@@ -695,6 +697,9 @@ fn applyEnvironmentVariables(allocator: std.mem.Allocator, cfg: *Config) !void {
     }
     if (env.get("SMTP_WEBMAIL_PORT")) |value| {
         cfg.webmail_port = std.fmt.parseInt(u16, value, 10) catch cfg.webmail_port;
+    }
+    if (env.get("SMTP_WEBMAIL_TLS")) |value| {
+        cfg.webmail_tls = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
     }
     if (env.get("SMTP_WEBMAIL_SECURE_COOKIES")) |value| {
         cfg.webmail_secure_cookies = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");

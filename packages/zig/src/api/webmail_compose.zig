@@ -19,6 +19,8 @@ const fs_compat = @import("../core/fs_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const outbound = @import("../delivery/outbound.zig");
 const core_config = @import("../core/config.zig");
+const auth_mod = @import("../auth/auth.zig");
+const aliases = @import("../delivery/aliases.zig");
 
 pub const ComposeError = error{
     NoRecipients,
@@ -68,7 +70,9 @@ pub const SendConfig = struct {
     hostname: []const u8,
     delivery_method: core_config.DeliveryMethod,
     ses_region: []const u8,
-    /// Local part of the sender (used for the Sent folder path).
+    mail_config: ?*const core_config.Config = null,
+    auth: ?*auth_mod.AuthBackend = null,
+    /// Canonical mailbox key of the sender (used for the Sent folder path).
     sender_user: []const u8,
 };
 
@@ -374,9 +378,18 @@ fn deliverOne(allocator: std.mem.Allocator, cfg: SendConfig, from: []const u8, r
     if (!isSafeAddress(rcpt)) return ComposeError.InvalidAddress;
     const at = std.mem.indexOfScalar(u8, rcpt, '@');
     const domain = if (at) |p| rcpt[p + 1 ..] else "";
-    if (at != null and isLocalDomain(domain, cfg.hostname)) {
-        const user = rcpt[0..at.?];
+    const is_local = if (cfg.mail_config) |config| config.isLocalDomain(domain) else isLocalDomain(domain, cfg.hostname);
+    if (at != null and is_local) {
+        const user = if (cfg.mail_config != null and cfg.mail_config.?.catch_all)
+            cfg.mail_config.?.catch_all_mailbox
+        else if (cfg.auth != null and (cfg.auth.?.db.userExists(rcpt) catch false))
+            rcpt
+        else
+            aliases.resolve(rcpt[0..at.?]);
         if (!isSafeLocalPart(user)) return ComposeError.InvalidAddress;
+        if (cfg.auth) |auth| {
+            if (!(try auth.db.userExists(user))) return ComposeError.InvalidAddress;
+        }
         try writeMaildir(allocator, user, "new", raw);
     } else {
         try outbound.deliverToRemote(allocator, from, rcpt, raw, cfg.hostname, cfg.delivery_method, cfg.ses_region);

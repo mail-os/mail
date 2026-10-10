@@ -5,6 +5,10 @@ on:
     branches: [main]
     paths:
       - 'packages/zig/**'
+      - 'packages/webmail/**'
+      - 'packages/cloud/webmail.gateway.json'
+      - 'scripts/deploy*.sh'
+      - 'bun.lock'
   workflow_dispatch: {}
 
 permissions:
@@ -23,6 +27,12 @@ jobs:
 
     - name: Setup project dependencies with Pantry
       uses: pantry-pm/pantry/packages/action@v0.11.28
+
+    - name: Install frontend dependencies
+      run: bun install --frozen-lockfile
+
+    - name: Compile STX webmail
+      run: cd packages/webmail && bun run build
 
     - name: Build for Linux x86_64
       working-directory: packages/zig
@@ -64,6 +74,10 @@ jobs:
           fi
         '
         echo "Deployed to Hetzner ($HOST)."
+        export GIT_SSH_COMMAND="ssh -i ~/.ssh/deploy_key -o BatchMode=yes"
+        # The deployment script uses ssh/scp, which respect this per-host identity.
+        printf 'Host %s\n  IdentityFile ~/.ssh/deploy_key\n  BatchMode yes\n' "$HOST" > ~/.ssh/config
+        scripts/deploy-webmail.sh "root@$HOST"
 
     - name: Verify public mail protocols
       env:

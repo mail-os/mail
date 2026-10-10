@@ -25,6 +25,9 @@ case "$ZIG_VER" in
 esac
 REMOTE_DIR=/root/mailbuild
 
+echo "==> compiling STX webmail assets"
+(cd "$REPO_ROOT/packages/webmail" && bun run build)
+
 echo "==> shipping source to $TARGET:$REMOTE_DIR"
 ssh "$TARGET" "rm -rf $REMOTE_DIR && mkdir -p $REMOTE_DIR"
 tar czf - --exclude='.zig-cache' --exclude='zig-out' --exclude='*.log' \
@@ -52,13 +55,16 @@ ssh "$TARGET" "bash -s" <<REMOTE
 set -euo pipefail
 BK=/opt/mail/mail-server.bak-\$(date +%s)
 cp -a /opt/mail/mail-server "\$BK"
+systemctl stop mail.service
 install -o mail-server -g mail-server -m 755 $REMOTE_DIR/packages/zig/zig-out/bin/mail /opt/mail/mail-server
-systemctl restart mail.service
+systemctl start mail.service
 sleep 5
-if [ "\$(systemctl is-active mail.service)" != "active" ]; then
+if ! systemctl is-active --quiet mail.service; then
   echo "service failed — rolling back"; cp -a "\$BK" /opt/mail/mail-server
   systemctl restart mail.service; exit 1
 fi
 echo "deployed; service active; backup at \$BK"
 REMOTE
 echo "==> done"
+
+"$REPO_ROOT/scripts/deploy-webmail.sh" "$TARGET"

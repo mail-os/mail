@@ -1,462 +1,240 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Webmail</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mail</title>
+  <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <!--
-    Standalone page (no @extends): explicit DOM rendering via <script>, matching
-    the proven packages/devtools/pages/app.stx approach. All data comes from the
-    Zig backend's JSON API at /webmail/*.
-  -->
-  <div class="wm" id="app" style="display:none">
-    <aside class="wm-folders">
-      <div class="wm-brand">📬 Webmail</div>
-      <button class="wm-compose-btn" id="composeBtn">✏️ Compose</button>
-      <nav class="wm-folder-list" id="folderList"></nav>
-      <div class="wm-user">
-        <span class="wm-user-email" id="userEmail"></span>
-        <button class="wm-logout" id="logoutBtn">Sign out</button>
-      </div>
-    </aside>
-
-    <section class="wm-list">
-      <header class="wm-list-head">
-        <span class="wm-list-title" id="listTitle">INBOX</span>
-        <button class="wm-refresh" id="refreshBtn" title="Refresh">⟳</button>
-      </header>
-      <div class="wm-list-body" id="messageList"></div>
-    </section>
-
-    <section class="wm-read" id="readPane">
-      <button class="wm-back" id="backBtn">← Back</button>
-      <div class="wm-read-empty wm-state" id="readEmpty">Select a message to read.</div>
-      <article class="wm-read-body" id="readBody" style="display:none"></article>
-    </section>
-  </div>
-
-  <!-- Composer modal -->
-  <div class="wm-modal" id="composeModal" style="display:none">
-    <div class="wm-composer">
-      <header class="wm-composer-head">
-        <span id="composerTitle">New message</span>
-        <button class="wm-composer-close" id="composerClose" title="Close">✕</button>
-      </header>
-      <div class="wm-composer-fields">
-        <label>To <input type="text" id="cTo" placeholder="recipient@example.com, …" /></label>
-        <label>Cc <input type="text" id="cCc" placeholder="optional" /></label>
-        <label>Bcc <input type="text" id="cBcc" placeholder="optional" /></label>
-        <label>Subject <input type="text" id="cSubject" /></label>
-      </div>
-      <textarea class="wm-composer-body" id="cBody" placeholder="Write your message…"></textarea>
-      <p class="wm-composer-error" id="composerError" style="display:none"></p>
-      <footer class="wm-composer-foot">
-        <button class="wm-send-btn" id="sendBtn">Send</button>
-        <span class="wm-composer-status" id="composerStatus"></span>
-      </footer>
+<script client>
+const user = state(null)
+const folders = state([])
+const folder = state('INBOX')
+const messages = state([])
+const selected = state(null)
+const loading = state(false)
+const reading = state(false)
+const error = state('')
+const notice = state('')
+const query = state('')
+const page = state(1)
+const total = state(0)
+const visible = derived(() => messages().filter(m => [m.from, m.subject, m.snippet].join(' ').toLowerCase().includes(query().toLowerCase())))
+const composing = state(false)
+const title = state('New message')
+const to = state('')
+const cc = state('')
+const bcc = state('')
+const subject = state('')
+const body = state('')
+const inReplyTo = state('')
+const references = state('')
+const sending = state(false)
+const composeError = state('')
+const settings = state(false)
+const currentPassword = state('')
+const newPassword = state('')
+const confirmPassword = state('')
+const passwordError = state('')
+const saving = state(false)
+let listRequest = 0
+let messageRequest = 0
+async function api(path, options = {}) {
+  const response = await fetch(path, { credentials: 'same-origin', ...options })
+  if (response.status === 401) { navigate('/login', { reload: true }); throw new Error('Please sign in again.') }
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({}))
+    throw new Error(result.message || 'The request failed. Please try again.')
+  }
+  return response.json()
+}
+function messagePath(uid) { return '/webmail/api/messages/' + uid + '?folder=' + encodeURIComponent(folder()) }
+async function loadFolders() { folders.set(await api('/webmail/api/folders')) }
+async function loadMessages() {
+  const request = ++listRequest
+  const activeFolder = folder()
+  loading.set(true); error.set('')
+  try {
+    const result = await api('/webmail/api/messages?folder=' + encodeURIComponent(activeFolder) + '&page=' + page() + '&per_page=50')
+    if (request !== listRequest) return
+    messages.set(result.items || []); total.set(result.total || 0)
+  }
+  catch (cause) { if (request === listRequest) error.set(cause.message) }
+  finally { if (request === listRequest) loading.set(false) }
+}
+async function refresh() {
+  await loadMessages()
+  try { await loadFolders() } catch (cause) { error.set(cause.message) }
+}
+async function selectFolder(name) {
+  folder.set(name); page.set(1); query.set(''); selected.set(null); reading.set(false); ++messageRequest
+  await refresh()
+}
+async function turnPage(delta) { page.update(value => value + delta); selected.set(null); ++messageRequest; await loadMessages() }
+async function openMessage(uid) {
+  const request = ++messageRequest
+  const path = messagePath(uid)
+  reading.set(true); selected.set(null); error.set('')
+  try {
+    const message = await api(path)
+    if (request !== messageRequest) return
+    selected.set(message)
+    if (!message.flags?.seen) {
+      await api(path, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ flags: { ...message.flags, seen: true } }) })
+      if (request === messageRequest) selected.set({ ...message, flags: { ...message.flags, seen: true } })
+      await refresh()
+    }
+  }
+  catch (cause) { if (request === messageRequest) error.set(cause.message) }
+}
+async function setFlag(name, value) {
+  const message = selected()
+  if (!message) return
+  try {
+    const flags = { ...message.flags, [name]: value }
+    await api(messagePath(message.uid), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ flags }) })
+    selected.set({ ...message, flags }); await refresh()
+  }
+  catch (cause) { error.set(cause.message) }
+}
+async function deleteMessage() {
+  const message = selected()
+  if (!message) return
+  try {
+    await api(messagePath(message.uid), { method: 'DELETE' })
+    selected.set(null); reading.set(false); await refresh()
+  }
+  catch (cause) { error.set(cause.message) }
+}
+function bareAddress(value) { const match = /<([^>]+)>/.exec(value || ''); return (match ? match[1] : value || '').trim() }
+function addresses(value) { return value.split(',').map(bareAddress).filter(Boolean) }
+function compose(mode = 'new') {
+  const message = selected()
+  to.set(''); cc.set(''); bcc.set(''); subject.set(''); body.set(''); inReplyTo.set(''); references.set(''); composeError.set('')
+  title.set(mode === 'new' ? 'New message' : mode === 'forward' ? 'Forward' : mode === 'all' ? 'Reply all' : 'Reply')
+  if (message && mode !== 'new') {
+    const text = message.text || '[HTML message]'
+    subject.set((mode === 'forward' ? 'Fwd: ' : /^re:/i.test(message.subject || '') ? '' : 'Re: ') + (message.subject || ''))
+    if (mode === 'forward') body.set('\n\n---------- Forwarded message ----------\nFrom: ' + message.from + '\nDate: ' + message.date + '\nSubject: ' + message.subject + '\n\n' + text)
+    else {
+      to.set(bareAddress(message.from))
+      if (mode === 'all') cc.set([...new Set([...addresses(message.to || ''), ...addresses(message.cc || '')])].filter(a => a.toLowerCase() !== user().email.toLowerCase() && a !== bareAddress(message.from)).join(', '))
+      body.set('\n\nOn ' + message.date + ', ' + message.from + ' wrote:\n' + text.split('\n').map(line => '> ' + line).join('\n'))
+      inReplyTo.set(message.message_id || ''); references.set(message.message_id || '')
+    }
+  }
+  composing.set(true)
+}
+async function send() {
+  if (sending()) return
+  composeError.set('')
+  if (!addresses(to()).length && !addresses(cc()).length && !addresses(bcc()).length) { composeError.set('Add at least one recipient.'); return }
+  sending.set(true)
+  try {
+    const result = await api('/webmail/api/compose', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ to: addresses(to()), cc: addresses(cc()), bcc: addresses(bcc()), subject: subject(), text: body(), inReplyTo: inReplyTo(), references: references() }) })
+    if (result.ok === false) { composeError.set('Could not deliver to: ' + (result.failed || []).join(', ')); return }
+    composing.set(false); notice.set('Message sent.'); await refresh()
+  }
+  catch (cause) { composeError.set(cause.message) }
+  finally { sending.set(false) }
+}
+async function signOut() {
+  try { await api('/webmail/auth/logout', { method: 'POST' }); navigate('/login', { reload: true }) }
+  catch (cause) { error.set(cause.message) }
+}
+async function changePassword() {
+  if (saving()) return
+  passwordError.set('')
+  if (newPassword() !== confirmPassword()) { passwordError.set('The new passwords do not match.'); return }
+  if (newPassword().length < 12) { passwordError.set('Use at least 12 characters.'); return }
+  saving.set(true)
+  try {
+    await api('/webmail/auth/password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ currentPassword: currentPassword(), newPassword: newPassword() }) })
+    currentPassword.set(''); newPassword.set(''); confirmPassword.set(''); navigate('/login', { reload: true })
+  }
+  catch (cause) { passwordError.set(cause.message) }
+  finally { saving.set(false) }
+}
+function shortDate(value) { const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString([], { month: 'short', day: 'numeric' }) }
+function safeHtml(html) { return '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src data:; style-src \'unsafe-inline\'">' + html }
+onMount(async () => {
+  try { const result = await api('/webmail/auth/me'); user.set(result.user); await refresh() }
+  catch (cause) { error.set(cause.message) }
+})
+</script>
+<p :if="!user" class="wm-state" role="status" :text="error || 'Opening your inbox…'"></p>
+<div :if="user" class="wm" :class="{ 'wm--reading': reading }">
+  <aside class="wm-folders">
+    <div class="text-indigo-600 wm-brand">Mail</div>
+    <button class="wm-compose-btn" @click="compose()">Compose</button>
+    <nav class="wm-folder-list" aria-label="Mail folders">
+      <button :for="item in folders" class="wm-folder" :class="{ 'wm-folder--active': item.name === folder }" @click="selectFolder(item.name)">
+        <span :text="item.name"></span><span :if="item.unread > 0" class="wm-folder-count" :text="item.unread"></span>
+      </button>
+    </nav>
+    <div class="wm-user">
+      <span class="wm-user-email" :text="user?.email"></span>
+      <button class="mb-2 wm-logout" @click="settings.set(true)">Change password</button>
+      <button class="wm-logout" @click="signOut()">Sign out</button>
     </div>
-  </div>
-
-  <script>
-    const state = { user: null, folder: 'INBOX', messages: [], selectedUid: null, suppressAutoRead: new Set() }
-
-    // HTML-escape untrusted text before inserting via innerHTML.
-    function esc(s) {
-      return String(s == null ? '' : s)
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;').replace(/'/g, '&#39;')
-    }
-
-    function shortDate(d) {
-      if (!d) return ''
-      const t = Date.parse(d)
-      if (isNaN(t)) return esc(d)
-      const dt = new Date(t), now = new Date()
-      return dt.toDateString() === now.toDateString()
-        ? dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        : dt.toLocaleDateString([], { month: 'short', day: 'numeric' })
-    }
-
-    async function api(path, opts) {
-      const res = await fetch(path, { credentials: 'same-origin', ...(opts || {}) })
-      if (res.status === 401) { window.location.href = '/login'; throw new Error('unauthorized') }
-      return res
-    }
-
-    async function init() {
-      // Gate on a confirmed session BEFORE showing the app. Anything other than
-      // a 200 from /auth/me — not-authenticated (401), backend down (502), or a
-      // network error — sends the user to the login page rather than stranding
-      // them on a broken inbox shell. The shell starts hidden (display:none) so
-      // it never flashes for an unauthenticated visitor.
-      let me
-      try {
-        me = await fetch('/webmail/auth/me', { credentials: 'same-origin' })
-      } catch (_e) {
-        window.location.href = '/login'
-        return
-      }
-      if (!me.ok) { window.location.href = '/login'; return }
-
-      state.user = (await me.json()).user
-      document.getElementById('userEmail').textContent = state.user.email
-      document.getElementById('app').style.display = '' // authenticated — reveal
-      await loadFolders()
-      await loadMessages()
-    }
-
-    async function loadFolders() {
-      const res = await api('/webmail/api/folders')
-      if (!res.ok) return
-      const folders = await res.json()
-      document.getElementById('folderList').innerHTML = folders.map(f => `
-        <a class="wm-folder ${f.name === state.folder ? 'wm-folder--active' : ''}" data-folder="${esc(f.name)}">
-          <span class="wm-folder-name">${esc(f.name)}</span>
-          ${f.unread > 0 ? `<span class="wm-folder-count">${f.unread}</span>` : ''}
-        </a>`).join('')
-      document.querySelectorAll('.wm-folder').forEach(el => {
-        el.addEventListener('click', () => selectFolder(el.getAttribute('data-folder')))
-      })
-    }
-
-    async function loadMessages() {
-      const list = document.getElementById('messageList')
-      list.innerHTML = '<div class="wm-state">Loading…</div>'
-      const res = await api('/webmail/api/messages?folder=' + encodeURIComponent(state.folder))
-      if (!res.ok) { list.innerHTML = '<div class="wm-state">Failed to load.</div>'; return }
-      state.messages = (await res.json()).items || []
-      renderList()
-    }
-
-    function renderList() {
-      const list = document.getElementById('messageList')
-      if (state.messages.length === 0) {
-        list.innerHTML = '<div class="wm-state">No messages in this folder.</div>'
-        return
-      }
-      list.innerHTML = state.messages.map(m => `
-        <div class="wm-msg ${m.uid === state.selectedUid ? 'wm-msg--active' : ''} ${m.flags && m.flags.seen ? '' : 'wm-msg--unread'}" data-uid="${m.uid}">
-          <div class="wm-msg-row">
-            <span class="wm-msg-from">${esc(m.from)}</span>
-            <span class="wm-msg-date">${shortDate(m.date)}</span>
-          </div>
-          <div class="wm-msg-subject">${m.flags && m.flags.flagged ? '<span class="wm-msg-flag" title="Flagged">★</span> ' : ''}${esc(m.subject || '(no subject)')}</div>
-          <div class="wm-msg-snippet">${esc(m.snippet)}</div>
-          ${m.has_attachments ? '<span class="wm-msg-attach" title="Has attachments">📎</span>' : ''}
-        </div>`).join('')
-      list.querySelectorAll('.wm-msg').forEach(el => {
-        el.addEventListener('click', () => openMessage(parseInt(el.getAttribute('data-uid'), 10)))
-      })
-    }
-
-    async function selectFolder(name) {
-      if (name === state.folder) return
-      state.folder = name
-      state.selectedUid = null
-      state.suppressAutoRead.clear() // UIDs are per-folder; don't carry across
-      document.getElementById('listTitle').textContent = name
-      document.getElementById('app').classList.remove('wm--reading')
-      showReadEmpty()
-      await loadFolders()
-      await loadMessages()
-    }
-
-    async function openMessage(uid) {
-      state.selectedUid = uid
-      renderList()
-      document.getElementById('app').classList.add('wm--reading')
-      const empty = document.getElementById('readEmpty')
-      const body = document.getElementById('readBody')
-      empty.style.display = 'none'
-      body.style.display = 'block'
-      body.innerHTML = '<div class="wm-state">Loading message…</div>'
-
-      const res = await api('/webmail/api/messages/' + uid + '?folder=' + encodeURIComponent(state.folder))
-      if (!res.ok) { body.innerHTML = '<div class="wm-state">Failed to load message.</div>'; return }
-      const m = await res.json()
-      renderMessage(m)
-
-      // Auto mark-read on open (only if currently unread). Skipped if the user
-      // just manually marked this message unread — otherwise re-opening would
-      // immediately re-mark it read and the two PUTs would race.
-      const item = state.messages.find(x => x.uid === uid)
-      if (item && item.flags && !item.flags.seen && !state.suppressAutoRead.has(uid)) {
-        item.flags.seen = true
-        renderList()
-        const ok = await mutateFlags(uid, item.flags)
-        if (ok) { await loadFolders() } else { item.flags.seen = false; renderList() }
-      }
-    }
-
-    // Mutating request helper: PUT flags/move. Same-origin header satisfies the
-    // backend CSRF guard. Returns the parsed JSON or null on failure.
-    async function mutateFlags(uid, flags) {
-      try {
-        const res = await api('/webmail/api/messages/' + uid + '?folder=' + encodeURIComponent(state.folder), {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json', 'Origin': window.location.origin },
-          body: JSON.stringify({ flags }),
-        })
-        return res.ok ? await res.json() : null
-      } catch (_e) { return null }
-    }
-
-    function currentMessage() {
-      return state.messages.find(x => x.uid === state.selectedUid)
-    }
-
-    async function toggleFlag() {
-      const m = currentMessage()
-      if (!m) return
-      m.flags.flagged = !m.flags.flagged
-      renderList(); renderMessage(m)
-      const ok = await mutateFlags(m.uid, m.flags)
-      if (!ok) { m.flags.flagged = !m.flags.flagged; renderList(); renderMessage(m) } // rollback
-    }
-
-    async function markUnread() {
-      const m = currentMessage()
-      if (!m) return
-      m.flags.seen = false
-      // Remember so a subsequent open() doesn't auto-re-mark-read and race us.
-      state.suppressAutoRead.add(m.uid)
-      renderList(); renderMessage(m)
-      const ok = await mutateFlags(m.uid, m.flags)
-      if (ok) { await loadFolders() } else { m.flags.seen = true; renderList(); renderMessage(m) }
-    }
-
-    async function deleteCurrent() {
-      const m = currentMessage()
-      if (!m) return
-      const uid = m.uid
-      // Optimistic: drop from list + close reader.
-      state.messages = state.messages.filter(x => x.uid !== uid)
-      state.selectedUid = null
-      document.getElementById('app').classList.remove('wm--reading')
-      showReadEmpty(); renderList()
-      try {
-        await api('/webmail/api/messages/' + uid + '?folder=' + encodeURIComponent(state.folder), {
-          method: 'DELETE',
-          headers: { 'Origin': window.location.origin },
-        })
-      } catch (_e) { /* best-effort; refresh will reconcile */ }
-      await loadFolders()
-      await loadMessages()
-    }
-
-    function renderMessage(m) {
-      const body = document.getElementById('readBody')
-      const attachments = (m.attachments || []).map(a =>
-        `<span class="wm-attach-chip">📎 ${esc(a.filename)}</span>`).join('')
-      const flags = m.flags || {}
-
-      body.innerHTML = `
-        <div class="wm-read-toolbar">
-          <button class="wm-action" data-act="reply" title="Reply">↩ Reply</button>
-          <button class="wm-action" data-act="replyall" title="Reply all">↩↩ Reply all</button>
-          <button class="wm-action" data-act="forward" title="Forward">↪ Forward</button>
-          <button class="wm-action" data-act="flag" title="Flag">${flags.flagged ? '★ Flagged' : '☆ Flag'}</button>
-          <button class="wm-action" data-act="unread" title="Mark unread">Mark unread</button>
-          <button class="wm-action wm-action--danger" data-act="delete" title="Delete">🗑 Delete</button>
-        </div>
-        <h2 class="wm-read-subject">${esc(m.subject || '(no subject)')}</h2>
-        <div class="wm-read-meta">
-          <div><span class="wm-read-label">From</span> ${esc(m.from)}</div>
-          <div><span class="wm-read-label">To</span> ${esc(m.to)}</div>
-          ${m.cc ? `<div><span class="wm-read-label">Cc</span> ${esc(m.cc)}</div>` : ''}
-          <div><span class="wm-read-label">Date</span> ${esc(m.date)}</div>
-        </div>
-        ${attachments ? `<div class="wm-read-attach">${attachments}</div>` : ''}
-        ${m.html
-          ? '<iframe class="wm-read-html" sandbox="" referrerpolicy="no-referrer"></iframe>'
-          : `<pre class="wm-read-text">${esc(m.text)}</pre>`}
-      `
-      // Inject HTML email into a sandboxed iframe via srcdoc. The empty sandbox
-      // blocks scripts, forms, popups and same-origin access, so attacker
-      // markup can't run or read the session cookie.
-      if (m.html) {
-        const frame = body.querySelector('.wm-read-html')
-        frame.srcdoc = m.html
-      }
-      body.querySelectorAll('.wm-action').forEach(btn => {
-        btn.addEventListener('click', () => {
-          const act = btn.getAttribute('data-act')
-          if (act === 'flag') toggleFlag()
-          else if (act === 'unread') markUnread()
-          else if (act === 'delete') deleteCurrent()
-          else if (act === 'reply') openReply(m, false)
-          else if (act === 'replyall') openReply(m, true)
-          else if (act === 'forward') openForward(m)
-        })
-      })
-    }
-
-    function showReadEmpty() {
-      document.getElementById('readEmpty').style.display = 'block'
-      document.getElementById('readBody').style.display = 'none'
-    }
-
-    document.getElementById('refreshBtn').addEventListener('click', loadMessages)
-    document.getElementById('backBtn').addEventListener('click', () => {
-      state.selectedUid = null
-      document.getElementById('app').classList.remove('wm--reading')
-      showReadEmpty()
-      renderList()
-    })
-    document.getElementById('logoutBtn').addEventListener('click', async () => {
-      try {
-        await fetch('/webmail/auth/logout', {
-          method: 'POST', credentials: 'same-origin',
-          headers: { 'Origin': window.location.origin },
-        })
-      } catch (_e) { /* ignore */ }
-      window.location.href = '/login'
-    })
-
-    // ── Composer ────────────────────────────────────────────────────────────
-    const composer = {
-      modal: document.getElementById('composeModal'),
-      title: document.getElementById('composerTitle'),
-      to: document.getElementById('cTo'),
-      cc: document.getElementById('cCc'),
-      bcc: document.getElementById('cBcc'),
-      subject: document.getElementById('cSubject'),
-      body: document.getElementById('cBody'),
-      error: document.getElementById('composerError'),
-      status: document.getElementById('composerStatus'),
-      sendBtn: document.getElementById('sendBtn'),
-      // Threading headers carried from the message being replied to.
-      inReplyTo: '',
-      references: '',
-    }
-
-    function openComposer(title) {
-      composer.title.textContent = title
-      composer.error.style.display = 'none'
-      composer.status.textContent = ''
-      composer.modal.style.display = 'flex'
-    }
-    function resetComposer() {
-      composer.to.value = ''; composer.cc.value = ''; composer.bcc.value = ''
-      composer.subject.value = ''; composer.body.value = ''
-      composer.inReplyTo = ''; composer.references = ''
-    }
-    function closeComposer() { composer.modal.style.display = 'none' }
-
-    // Pull a bare email address out of a "Name <addr>" header value.
-    function bareAddr(s) {
-      const m = /<([^>]+)>/.exec(s || '')
-      return (m ? m[1] : (s || '')).trim()
-    }
-    // Split a comma-separated recipient field into trimmed non-empty addresses.
-    function parseList(s) {
-      return (s || '').split(',').map(x => bareAddr(x)).filter(Boolean)
-    }
-
-    function quoteBody(m) {
-      const who = m.from || 'someone'
-      const when = m.date || ''
-      const text = (m.text && m.text.length) ? m.text : (m.html ? '[HTML message]' : '')
-      const quoted = text.split('\n').map(l => '> ' + l).join('\n')
-      return `\n\nOn ${when}, ${who} wrote:\n${quoted}\n`
-    }
-
-    function openReply(m, all) {
-      resetComposer()
-      composer.to.value = bareAddr(m.from)
-      if (all) {
-        // Reply-all: add original To/Cc minus ourselves.
-        const me = (state.user && state.user.email) || ''
-        const extra = [...parseList(m.to), ...parseList(m.cc)].filter(a => a !== me && a !== bareAddr(m.from))
-        if (extra.length) composer.cc.value = extra.join(', ')
-      }
-      const subj = m.subject || ''
-      composer.subject.value = /^re:/i.test(subj) ? subj : 'Re: ' + subj
-      composer.body.value = quoteBody(m)
-      // Threading: In-Reply-To = this message's Message-ID; References appends it.
-      composer.inReplyTo = m.message_id || ''
-      composer.references = m.message_id || ''
-      openComposer(all ? 'Reply all' : 'Reply')
-      composer.body.focus()
-      composer.body.setSelectionRange(0, 0)
-    }
-
-    function openForward(m) {
-      resetComposer()
-      const subj = m.subject || ''
-      composer.subject.value = /^fwd:/i.test(subj) ? subj : 'Fwd: ' + subj
-      const text = (m.text && m.text.length) ? m.text : (m.html ? '[HTML message]' : '')
-      composer.body.value = `\n\n---------- Forwarded message ----------\nFrom: ${m.from}\nDate: ${m.date}\nSubject: ${m.subject}\nTo: ${m.to}\n\n${text}\n`
-      openComposer('Forward')
-      composer.to.focus()
-    }
-
-    document.getElementById('composeBtn').addEventListener('click', () => {
-      resetComposer(); openComposer('New message'); composer.to.focus()
-    })
-    document.getElementById('composerClose').addEventListener('click', closeComposer)
-    composer.modal.addEventListener('click', (e) => { if (e.target === composer.modal) closeComposer() })
-
-    composer.sendBtn.addEventListener('click', async () => {
-      composer.error.style.display = 'none'
-      const to = parseList(composer.to.value)
-      const cc = parseList(composer.cc.value)
-      const bcc = parseList(composer.bcc.value)
-      if (to.length === 0 && cc.length === 0 && bcc.length === 0) {
-        composer.error.textContent = 'Add at least one recipient.'
-        composer.error.style.display = 'block'
-        return
-      }
-      composer.sendBtn.disabled = true
-      composer.status.textContent = 'Sending…'
-      try {
-        const res = await fetch('/webmail/api/compose', {
-          method: 'POST',
-          credentials: 'same-origin',
-          headers: { 'Content-Type': 'application/json', 'Origin': window.location.origin },
-          body: JSON.stringify({
-            to, cc, bcc,
-            subject: composer.subject.value,
-            text: composer.body.value,
-            inReplyTo: composer.inReplyTo,
-            references: composer.references,
-          }),
-        })
-        if (res.ok) {
-          const j = await res.json().catch(() => ({}))
-          if (j.ok === false && j.failed && j.failed.length) {
-            // Partial failure: some recipients didn't get it. Keep the composer
-            // open and tell the user exactly who failed.
-            composer.error.textContent = 'Could not deliver to: ' + j.failed.join(', ')
-            composer.error.style.display = 'block'
-            composer.status.textContent = ''
-          } else {
-            composer.status.textContent = 'Sent ✓'
-            setTimeout(() => { closeComposer(); if (state.folder === 'Sent') loadMessages(); loadFolders() }, 600)
-          }
-        } else if (res.status === 400) {
-          const j = await res.json().catch(() => ({}))
-          composer.error.textContent = j.message || 'Invalid message.'
-          composer.error.style.display = 'block'
-          composer.status.textContent = ''
-        } else {
-          composer.error.textContent = 'Send failed. Please try again.'
-          composer.error.style.display = 'block'
-          composer.status.textContent = ''
-        }
-      } catch (_e) {
-        composer.error.textContent = 'Could not reach the server.'
-        composer.error.style.display = 'block'
-        composer.status.textContent = ''
-      } finally {
-        composer.sendBtn.disabled = false
-      }
-    })
-
-    init()
-  </script>
+  </aside>
+  <section class="wm-list" aria-label="Messages">
+    <header class="wm-list-head"><span class="wm-list-title" :text="folder"></span><button class="wm-refresh" @click="refresh()" :disabled="loading" aria-label="Refresh messages">Refresh</button></header>
+    <input class="wm-search" type="search" x-model="query" placeholder="Search this page" aria-label="Search messages">
+    <p :if="error" class="login-error" role="alert" :text="error"></p>
+    <p :if="notice" class="px-4 text-indigo-600" role="status" :text="notice"></p>
+    <div class="wm-list-body" :aria-busy="loading">
+      <p :if="loading" class="wm-state">Loading messages…</p>
+      <p :if="!loading && visible.length === 0" class="wm-state">No messages in this folder.</p>
+      <button :for="message in visible" class="wm-msg" :class="{ 'wm-msg--active': message.uid === selected?.uid, 'wm-msg--unread': !message.flags?.seen }" @click="openMessage(message.uid)">
+        <span class="wm-msg-row"><span class="wm-msg-from" :text="message.from"></span><span class="wm-msg-date" :text="shortDate(message.date)"></span></span>
+        <span class="wm-msg-subject" :text="(message.flags?.flagged ? '★ ' : '') + (message.subject || '(no subject)')"></span>
+        <span class="wm-msg-snippet" :text="message.snippet"></span>
+      </button>
+    </div>
+    <footer class="flex items-center justify-between p-3 border-gray-200 border-t">
+      <button @click="turnPage(-1)" :disabled="page <= 1 || loading">Previous</button>
+      <span :text="'Page ' + page + ' · ' + total + ' messages'"></span>
+      <button @click="turnPage(1)" :disabled="page * 50 >= total || loading">Next</button>
+    </footer>
+  </section>
+  <section class="wm-read" aria-label="Message reader">
+    <button class="wm-back" @click="reading.set(false)">Back to messages</button>
+    <p :if="!selected" class="wm-state">Select a message to read.</p>
+    <article :if="selected" class="wm-read-body">
+      <div class="wm-read-toolbar">
+        <button class="wm-action" @click="compose('reply')">Reply</button><button class="wm-action" @click="compose('all')">Reply all</button><button class="wm-action" @click="compose('forward')">Forward</button>
+        <button class="wm-action" @click="setFlag('flagged', !selected.flags?.flagged)" :text="selected.flags?.flagged ? 'Unflag' : 'Flag'"></button>
+        <button class="wm-action" @click="setFlag('seen', false)">Mark unread</button><button class="wm-action wm-action--danger" @click="deleteMessage()" :text="folder === 'Trash' ? 'Delete permanently' : 'Move to Trash'"></button>
+      </div>
+      <h2 class="wm-read-subject" :text="selected.subject || '(no subject)'"></h2>
+      <div class="wm-read-meta"><div><span class="wm-read-label">From</span><span :text="selected.from"></span></div><div><span class="wm-read-label">To</span><span :text="selected.to"></span></div><div :if="selected.cc"><span class="wm-read-label">Cc</span><span :text="selected.cc"></span></div><div><span class="wm-read-label">Date</span><span :text="selected.date"></span></div></div>
+      <div class="wm-read-attach"><span :for="attachment in (selected.attachments || [])" class="wm-attach-chip" :text="attachment.filename"></span></div>
+      <iframe :if="selected.html" class="wm-read-html" sandbox="" referrerpolicy="no-referrer" title="Email content" :srcdoc="safeHtml(selected.html)"></iframe>
+      <pre :if="!selected.html" class="wm-read-text" :text="selected.text"></pre>
+    </article>
+  </section>
+</div>
+<div :if="composing" class="wm-modal" role="dialog" aria-modal="true" aria-label="Compose message">
+  <form class="wm-composer" @submit.prevent="send()">
+    <header class="wm-composer-head"><span :text="title"></span><button type="button" class="wm-composer-close" @click="composing.set(false)" :disabled="sending" aria-label="Close composer">Close</button></header>
+    <div class="wm-composer-fields"><label>To<input type="text" x-model="to" placeholder="recipient@example.com"></label><label>Cc<input type="text" x-model="cc"></label><label>Bcc<input type="text" x-model="bcc"></label><label>Subject<input type="text" x-model="subject"></label></div>
+    <textarea class="wm-composer-body" x-model="body" aria-label="Message body" placeholder="Write your message…"></textarea>
+    <p :if="composeError" class="wm-composer-error" role="alert" :text="composeError"></p>
+    <footer class="wm-composer-foot"><button class="wm-send-btn" type="submit" :disabled="sending" :text="sending ? 'Sending…' : 'Send'"></button></footer>
+  </form>
+</div>
+<div :if="settings" class="wm-modal" role="dialog" aria-modal="true" aria-label="Change password">
+  <form class="login" @submit.prevent="changePassword()">
+    <h1>Change password</h1><p class="login-sub">This updates your webmail, IMAP and SMTP password. You’ll sign in again afterward.</p>
+    <label for="currentPassword">Current password</label><input id="currentPassword" type="password" x-model="currentPassword" autocomplete="current-password" required>
+    <label for="newPassword">New password</label><input id="newPassword" type="password" x-model="newPassword" autocomplete="new-password" minlength="12" required>
+    <label for="confirmPassword">Confirm password</label><input id="confirmPassword" type="password" x-model="confirmPassword" autocomplete="new-password" minlength="12" required>
+    <p :if="passwordError" class="login-error" role="alert" :text="passwordError"></p>
+    <button type="submit" :disabled="saving" :text="saving ? 'Saving…' : 'Save password'"></button><button type="button" @click="settings.set(false)" :disabled="saving">Cancel</button>
+  </form>
+</div>
+<noscript>JavaScript is required to use webmail.</noscript>
 </body>
 </html>

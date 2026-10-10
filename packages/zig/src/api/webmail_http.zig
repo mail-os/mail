@@ -56,6 +56,7 @@ pub const WebmailHttpConfig = struct {
     /// Outbound send settings — must mirror the server's so webmail mail is
     /// delivered + DKIM-signed identically to SMTP submission.
     hostname: []const u8 = "localhost",
+    mail_config: ?*const core_config.Config = null,
     delivery_method: core_config.DeliveryMethod = .ses,
     ses_region: []const u8 = "us-east-1",
     /// TLS: when enabled the server terminates HTTPS itself (like IMAPS/CalDAV),
@@ -362,6 +363,9 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.eql(u8, p, "/webmail/auth/logout") and std.mem.eql(u8, req.method, "POST")) {
         return handleLogout(server, conn, arena, req);
     }
+    if (std.mem.eql(u8, p, "/webmail/auth/password") and std.mem.eql(u8, req.method, "POST")) {
+        return handlePasswordChange(server, conn, arena, req);
+    }
     if (std.mem.eql(u8, p, "/webmail/auth/me") and std.mem.eql(u8, req.method, "GET")) {
         return handleMe(server, conn, arena, req);
     }
@@ -469,10 +473,10 @@ fn handleLogin(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std
         }
     }
 
-    const username = jsonStringField(req.body, "username") orelse {
+    const username = (try jsonStringFieldAlloc(arena, req.body, "username")) orelse {
         return sendError(conn, arena, 400, "bad_request", "Missing username");
     };
-    const password = jsonStringField(req.body, "password") orelse {
+    const password = (try jsonStringFieldAlloc(arena, req.body, "password")) orelse {
         return sendError(conn, arena, 400, "bad_request", "Missing password");
     };
 
@@ -542,6 +546,23 @@ fn authorityOf(url: []const u8) []const u8 {
     return rest;
 }
 
+/// Change the shared IMAP/SMTP/webmail password, then revoke browser sessions.
+fn handlePasswordChange(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
+    if (!isSameOrigin(req)) return sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const current = (try jsonStringFieldAlloc(arena, req.body, "currentPassword")) orelse return sendError(conn, arena, 400, "bad_request", "Missing current password");
+    const next = (try jsonStringFieldAlloc(arena, req.body, "newPassword")) orelse return sendError(conn, arena, 400, "bad_request", "Missing new password");
+    if (next.len < 12 or next.len > 1024) return sendError(conn, arena, 400, "bad_request", "Use a password between 12 and 1024 characters");
+    const key = try std.fmt.allocPrint(arena, "password:{s}", .{sess.username});
+    if (!try server.login_limiter.checkAndIncrementUser(key)) return sendError(conn, arena, 429, "rate_limited", "Too many attempts. Please wait five minutes");
+    if (!try server.auth.verifyCredentials(sess.username, current)) return sendError(conn, arena, 400, "invalid_credentials", "Current password is incorrect");
+    try server.auth.changePassword(sess.username, next);
+    try server.db.deleteUserWebmailSessions(sess.username);
+    const clear = try server.sessions.buildClearCookie();
+    try sendJson(conn, arena, 200, "{\"ok\":true}", clear);
+}
+
 fn handleMe(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
     var sess = (try requireSession(server, conn, arena, req)) orelse return;
     defer sess.deinit(server.allocator);
@@ -589,7 +610,9 @@ fn handleCompose(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: s
         .hostname = server.config.hostname,
         .delivery_method = server.config.delivery_method,
         .ses_region = server.config.ses_region,
-        .sender_user = session_mod.normalizeUsername(sess.email),
+        .sender_user = sess.username,
+        .mail_config = server.config.mail_config,
+        .auth = server.auth,
     };
 
     const result = compose.send(arena, msg, cfg) catch |err| {
@@ -652,11 +675,20 @@ fn handleMessageList(server: *WebmailHttpServer, conn: *webmail_tls.Stream, aren
         return sendError(conn, arena, 500, "server_error", "Failed to read messages");
     };
 
+    const folders = try maildir.listFolders(arena, sess.username);
+    var total: usize = 0;
+    for (folders) |item| {
+        if (std.mem.eql(u8, item.name, folder)) {
+            total = item.total;
+            break;
+        }
+    }
+
     var body: std.ArrayList(u8) = .empty;
     const w = jw(&body, arena);
     try w.writeAll("{\"folder\":");
     try writeJsonString(w, folder);
-    try w.print(",\"page\":{d},\"items\":[", .{page});
+    try w.print(",\"page\":{d},\"total\":{d},\"items\":[", .{ page, total });
     for (msgs, 0..) |m, i| {
         if (i > 0) try w.writeAll(",");
         try writeMessageSummary(w, m);

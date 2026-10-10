@@ -514,15 +514,16 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
             // When TLS is enabled, the webmail server terminates HTTPS itself
             // (like IMAPS/CalDAV) and must bind a public interface; otherwise it
             // stays plain HTTP on localhost (dev / behind a proxy).
-            const wm_tls = cfg.enable_tls and cfg.tls_cert_path != null and cfg.tls_key_path != null;
+            const wm_tls = cfg.webmail_tls and cfg.enable_tls and cfg.tls_cert_path != null and cfg.tls_key_path != null;
             const wm_config = webmail_http.WebmailHttpConfig{
                 .port = cfg.webmail_port,
                 .bind_host = if (wm_tls) "0.0.0.0" else "127.0.0.1",
                 // Cookies are Secure only over HTTPS; respect the explicit override too.
-                .secure_cookies = cfg.webmail_secure_cookies and wm_tls,
+                .secure_cookies = cfg.webmail_secure_cookies,
                 // Outbound send settings: mirror the server's so webmail mail is
                 // delivered + DKIM-signed identically to SMTP submission.
                 .hostname = cfg.hostname,
+                .mail_config = &cfg,
                 .delivery_method = cfg.delivery_method,
                 .ses_region = cfg.ses_region,
                 .enable_tls = wm_tls,

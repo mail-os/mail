@@ -1,0 +1,10 @@
+{
+  "slug": "mail",
+  "proxies": [{ "to": "mail.stacksjs.com", "from": "localhost:8099", "id": "mail.stacksjs.com" }],
+  "https": true,
+  "hostsManagement": false,
+  "cleanup": { "hosts": false, "certs": false },
+  "productionCerts": { "certsDir": "/etc/rpx/certs", "certsDirServerNames": ["mail.stacksjs.com"] },
+  "onDemandTls": { "enabled": true, "allowedSuffixes": ["mail.stacksjs.com"], "email": "chris@stacksjs.com", "certsDir": "/etc/rpx/certs", "staging": false },
+  "acmeChallengeWebroot": "/var/www/acme-challenge"
+}

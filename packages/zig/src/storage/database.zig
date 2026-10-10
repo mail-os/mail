@@ -826,6 +826,18 @@ pub const Database = struct {
     }
 
     /// Prune all sessions whose expiry is at or before `now`.
+    /// Revoke every browser session after a mailbox password change.
+    pub fn deleteUserWebmailSessions(self: *Database, username: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var raw: ?*sqlite.sqlite3_stmt = null;
+        if (sqlite.sqlite3_prepare_v2(self.db, "DELETE FROM webmail_sessions WHERE username = ?1", -1, &raw, null) != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
+        const stmt = Statement{ .stmt = raw.?, .allocator = self.allocator };
+        defer stmt.finalize();
+        try stmt.bind(1, username);
+        _ = try stmt.step();
+    }
+
     pub fn deleteExpiredWebmailSessions(self: *Database, now: i64) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
