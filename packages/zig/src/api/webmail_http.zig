@@ -220,6 +220,8 @@ const Request = struct {
     query: []const u8,
     headers: []const u8, // raw header block (after request line, before body)
     body: []const u8,
+    /// Only a plaintext listener bound to loopback may trust gateway headers.
+    trust_forwarded_headers: bool = false,
 
     fn header(self: Request, name: []const u8) ?[]const u8 {
         var line_start: usize = 0;
@@ -347,7 +349,11 @@ fn findContentLength(headers_block: []const u8) ?usize {
 // ── Routing ──────────────────────────────────────────────────────────────────
 
 fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator) !void {
-    const req = (try readRequest(conn, arena)) orelse return;
+    var req = (try readRequest(conn, arena)) orelse return;
+    const loopback_bind = std.mem.eql(u8, server.config.bind_host, "127.0.0.1") or std.mem.eql(u8, server.config.bind_host, "::1");
+    const peer = conn.peerIp();
+    const loopback_peer = std.mem.eql(u8, peer, "127.0.0.1") or std.mem.eql(u8, peer, "::1");
+    req.trust_forwarded_headers = !server.config.enable_tls and loopback_bind and loopback_peer;
 
     // CORS preflight (the dev proxy is same-origin, but be tolerant).
     if (std.mem.eql(u8, req.method, "OPTIONS")) {
@@ -460,7 +466,7 @@ fn requireSession(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 fn handleLogin(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
-    const ip = conn.peerIp();
+    const ip = if (req.trust_forwarded_headers) req.header("X-Real-IP") orelse conn.peerIp() else conn.peerIp();
 
     // Throttle per IP BEFORE the expensive Argon2 verify, so a brute-forcer
     // can't both burn CPU and sample credentials. checkAndIncrement returns
@@ -528,7 +534,9 @@ fn handleLogout(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: st
 /// is present (e.g. a non-browser client), allow. If present, the authority must
 /// match the Host header. Conservative: an Origin/Referer we can't parse fails.
 fn isSameOrigin(req: Request) bool {
-    const host = req.header("Host") orelse return true; // no Host to compare against
+    // A gateway rewrites Host to its upstream. Compare the original authority
+    // only when the listener and connection are both trusted loopback peers.
+    const host = (if (req.trust_forwarded_headers) req.header("X-Forwarded-Host") orelse req.header("Host") else req.header("Host")) orelse return false;
     if (req.header("Origin")) |origin| {
         return std.mem.eql(u8, authorityOf(origin), host);
     }
@@ -1322,6 +1330,16 @@ test "isSameOrigin and authorityOf" {
     try t.expect(!isSameOrigin(bad));
     const none = Request{ .method = "POST", .path = "/x", .query = "", .headers = "Host: h\r\n", .body = "" };
     try t.expect(isSameOrigin(none)); // no Origin/Referer -> allowed
+}
+
+test "CSRF uses gateway authority only on trusted loopback requests" {
+    const t = std.testing;
+    var req = Request{ .method = "POST", .path = "/webmail/api/compose", .query = "", .headers = "Host: localhost:8099\r\nX-Forwarded-Host: mail.stacksjs.com\r\nOrigin: https://mail.stacksjs.com\r\n", .body = "" };
+    try t.expect(!isSameOrigin(req));
+    req.trust_forwarded_headers = true;
+    try t.expect(isSameOrigin(req));
+    req.headers = "Host: localhost:8099\r\nX-Forwarded-Host: mail.stacksjs.com\r\nOrigin: https://example.invalid\r\n";
+    try t.expect(!isSameOrigin(req));
 }
 
 test "writeJsonString escapes control chars and quotes" {
