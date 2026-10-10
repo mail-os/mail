@@ -52,5 +52,9 @@ UNIT
 systemctl daemon-reload
 systemctl enable --now rpx-cert-renew-mail.timer
 systemctl start rpx-cert-renew-mail.service
-curl --fail --silent --retry 10 --retry-connrefused --retry-delay 3 https://mail.stacksjs.com/login >/dev/null
+hosts=$(python3 -c 'import json; print("\n".join(json.load(open("/etc/rpx/sites.d/mail.json"))["productionCerts"]["certsDirServerNames"]))')
+test -n "$hosts"
+while IFS= read -r host; do
+  curl --fail --silent --retry 10 --retry-connrefused --retry-delay 3 "https://$host/login" >/dev/null
+done <<< "$hosts"
 REMOTE

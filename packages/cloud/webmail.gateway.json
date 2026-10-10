@@ -1,10 +1,13 @@
 {
   "slug": "mail",
-  "proxies": [{ "to": "mail.stacksjs.com", "from": "localhost:8099", "id": "mail.stacksjs.com" }],
+  "proxies": [
+    { "to": "mail.stacksjs.com", "from": "localhost:8099", "id": "mail.stacksjs.com" },
+    { "to": "mail.hq.training", "from": "localhost:8099", "id": "mail.hq.training" }
+  ],
   "https": true,
   "hostsManagement": false,
   "cleanup": { "hosts": false, "certs": false },
-  "productionCerts": { "certsDir": "/etc/rpx/certs", "certsDirServerNames": ["mail.stacksjs.com"] },
-  "onDemandTls": { "enabled": true, "allowedSuffixes": ["mail.stacksjs.com"], "email": "chris@stacksjs.com", "certsDir": "/etc/rpx/certs", "staging": false },
+  "productionCerts": { "certsDir": "/etc/rpx/certs", "certsDirServerNames": ["mail.stacksjs.com", "mail.hq.training"] },
+  "onDemandTls": { "enabled": true, "allowedSuffixes": ["mail.stacksjs.com", "mail.hq.training"], "email": "chris@stacksjs.com", "certsDir": "/etc/rpx/certs", "staging": false },
   "acmeChallengeWebroot": "/var/www/acme-challenge"
 }
