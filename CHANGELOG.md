@@ -1,5 +1,24 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.12...v0.3.13)
+
+## ✨ Features
+
+- **webmail**: deploy compiled STX client with canonical mail accounts ([99acea8](https://github.com/mail-os/mail/commit/99acea8)) _(by Chris <chris@stacksjs.com>)_
+
+## 🐛 Bug Fixes
+
+- **ops**: ban unauthenticated relay attempts in the mail-auth jail ([7424c82](https://github.com/mail-os/mail/commit/7424c82)) _(by Chris <chrisbreuer93@gmail.com>)_
+- **ops**: ban failed logins again now that they name the account ([e7ef2cf](https://github.com/mail-os/mail/commit/e7ef2cf)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## 🔧 Chores
+
+- release v0.3.13 ([1f67dc7](https://github.com/mail-os/mail/commit/1f67dc7)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.11...v0.3.12)
 
 ## 🐛 Bug Fixes
