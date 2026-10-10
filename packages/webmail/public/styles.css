@@ -305,10 +305,19 @@ body {
 
 /* ── Responsive: collapse to one pane on mobile ────────────────────────── */
 @media (max-width: 860px) {
-  .wm { grid-template-columns: 1fr; }
-  .wm-folders { display: none; }      /* simple v1: hide folder rail on mobile */
-  .wm-list { display: flex; }
+  .wm { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); }
+  .wm-folders { display: grid; grid-template-columns: 1fr auto; padding: 12px; gap: 8px; border-bottom: 1px solid var(--border); }
+  .wm-brand { padding: 8px; }
+  .wm-compose-btn { margin: 0; }
+  .wm-folder-list { grid-column: 1 / -1; flex-direction: row; overflow-x: auto; }
+  .wm-folder { white-space: nowrap; }
+  .wm-user { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; margin: 0; padding-top: 8px; }
+  .wm-user-email { flex: 1; min-width: 0; padding: 0; }
+  .wm-logout { width: auto; white-space: nowrap; }
+  .wm-list { display: flex; min-height: 0; }
   .wm-read { display: none; }
+  .wm--reading { grid-template-rows: 1fr; }
+  .wm--reading .wm-folders { display: none; }
   .wm--reading .wm-list { display: none; }
   .wm--reading .wm-read { display: flex; }
   .wm--reading .wm-back { display: block; margin: 12px 0 0 16px; background: transparent; border: 0; color: var(--accent); font-size: 14px; cursor: pointer; }

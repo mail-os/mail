@@ -13,6 +13,7 @@ fn withDb(comptime action: fn (*cli.BaseCommand.ParseContext, *database.Database
             var db = try database.Database.init(allocator, db_path);
             defer db.deinit();
             var auth_backend = auth.AuthBackend.init(allocator, &db);
+            defer auth_backend.deinit();
             try action(ctx, &db, &auth_backend);
         }
     }.wrapper;

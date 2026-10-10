@@ -30,7 +30,7 @@ echo "==> compiling STX webmail assets"
 
 echo "==> shipping source to $TARGET:$REMOTE_DIR"
 ssh "$TARGET" "rm -rf $REMOTE_DIR && mkdir -p $REMOTE_DIR"
-tar czf - --exclude='.zig-cache' --exclude='zig-out' --exclude='*.log' \
+tar --no-xattrs -czf - --exclude='.zig-cache' --exclude='zig-out' --exclude='*.log' \
   packages/zig pantry.jsonc pantry.lock | ssh "$TARGET" "tar xzf - -C $REMOTE_DIR"
 
 echo "==> building on host (zig $ZIG_VER, native linux)"
