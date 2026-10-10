@@ -29,7 +29,9 @@ echo "==> compiling STX webmail assets"
 (cd "$REPO_ROOT/packages/webmail" && bun run build)
 
 echo "==> shipping source to $TARGET:$REMOTE_DIR"
-ssh "$TARGET" "rm -rf $REMOTE_DIR && mkdir -p $REMOTE_DIR"
+# Retain the compiler cache outside the source snapshot so repeated releases
+# do not rebuild the unchanged SQLite and TLS dependencies.
+ssh "$TARGET" "if [ -d $REMOTE_DIR/packages/zig/.zig-cache ] && [ ! -d /root/mail-build-cache ]; then mv $REMOTE_DIR/packages/zig/.zig-cache /root/mail-build-cache; fi; rm -rf $REMOTE_DIR && mkdir -p $REMOTE_DIR"
 tar --no-xattrs -czf - --exclude='.zig-cache' --exclude='zig-out' --exclude='*.log' \
   packages/zig pantry.jsonc pantry.lock | ssh "$TARGET" "tar xzf - -C $REMOTE_DIR"
 
@@ -46,7 +48,7 @@ if [ ! -x "\$ZIGDIST/zig" ]; then
   rm -f /root/zig.tar.xz
 fi
 cd $REMOTE_DIR/packages/zig
-"\$ZIGDIST/zig" build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
+"\$ZIGDIST/zig" build --cache-dir /root/mail-build-cache -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
 test -x zig-out/bin/mail
 REMOTE
 

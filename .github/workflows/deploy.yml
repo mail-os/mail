@@ -8,6 +8,7 @@ on:
       - 'packages/webmail/**'
       - 'packages/cloud/webmail.gateway.json'
       - 'scripts/deploy*.sh'
+      - 'scripts/renew-webmail-cert.sh'
       - 'bun.lock'
   workflow_dispatch: {}
 

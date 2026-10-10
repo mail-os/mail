@@ -30,7 +30,9 @@ The latter installs the source-controlled rpx fragment
 `packages/cloud/webmail.gateway.json`, enables webmail on loopback port 8099,
 keeps secure cookies, restarts mail and the existing shared rpx gateway, and
 checks HTTPS at `<https://mail.stacksjs.com/login>`. SMTP/IMAP keep their own TLS.
-The gateway provisions and renews a trusted certificate for the UI hostname.
+A tlsx HTTP-01 provisioning service obtains the certificate before the HTTPS
+check; its daily systemd timer renews it before expiry. The source script lives
+at `scripts/renew-webmail-cert.sh`.
 GitHub's deployment workflow also builds STX and applies this configuration.
 
 `bun run build` compiles into `packages/zig/src/api/webmail_dist` (generated and
