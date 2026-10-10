@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.19...v0.3.20)
+
+## ✨ Features
+
+- **webmail**: add drafts and attachments with native cloud deployment ([853ee48](https://github.com/mail-os/mail/commit/853ee48)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.20 ([af70eba](https://github.com/mail-os/mail/commit/af70eba)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.18...v0.3.19)
 
 ## ✨ Features

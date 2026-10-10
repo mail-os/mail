@@ -1,7 +1,7 @@
 {
   "name": "mail-cloud",
   "type": "module",
-  "version": "0.3.19",
+  "version": "0.3.20",
   "description": "Cloud integration for the mail server using ts-cloud",
   "author": "Chris Breuer",
   "license": "MIT",
