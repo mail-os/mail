@@ -141,6 +141,18 @@ pub const SessionManager = struct {
             return SessionError.SessionExpired;
         }
 
+        // Administrative deletion or disablement also ends browser access.
+        var user = self.db.getUserByUsername(row.username) catch |err| {
+            if (err != database.DatabaseError.NotFound) return err;
+            self.logout(session_id);
+            return SessionError.SessionNotFound;
+        };
+        defer user.deinit(self.allocator);
+        if (!user.enabled) {
+            self.logout(session_id);
+            return SessionError.SessionNotFound;
+        }
+
         // Sliding expiry: push the window forward. Best-effort.
         self.db.touchWebmailSession(session_id, now + self.idle_ttl_seconds) catch {};
 
@@ -258,4 +270,24 @@ test "generateToken produces hex of expected length" {
     for (tok) |c| {
         try t.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
     }
+}
+
+test "sessions are revoked when an account is disabled or deleted" {
+    const t = std.testing;
+    var db = try database.Database.init(t.allocator, ":memory:");
+    defer db.deinit();
+    var auth = auth_mod.AuthBackend.init(t.allocator, &db);
+    defer auth.deinit();
+    _ = try auth.createUser("lifecycle@example.com", "test-password", "lifecycle@example.com");
+    var manager = SessionManager.init(t.allocator, &db, &auth);
+    var disabled = try manager.login("lifecycle@example.com", "test-password", null, null);
+    defer disabled.deinit(t.allocator);
+    try db.setUserEnabled(disabled.username, false);
+    try t.expectError(SessionError.SessionNotFound, manager.validate(disabled.session_id));
+    try db.setUserEnabled(disabled.username, true);
+    try t.expectError(SessionError.SessionNotFound, manager.validate(disabled.session_id));
+    var deleted = try manager.login("lifecycle@example.com", "test-password", null, null);
+    defer deleted.deinit(t.allocator);
+    try db.deleteUser(deleted.username);
+    try t.expectError(SessionError.SessionNotFound, manager.validate(deleted.session_id));
 }
