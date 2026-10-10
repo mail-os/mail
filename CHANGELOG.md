@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.14...v0.3.15)
+
+## 🐛 Bug Fixes
+
+- **deploy**: provision and renew webmail TLS before HTTPS checks ([34bfd34](https://github.com/mail-os/mail/commit/34bfd34)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.15 ([7d84f93](https://github.com/mail-os/mail/commit/7d84f93)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.13...v0.3.14)
 
 ## 🐛 Bug Fixes
