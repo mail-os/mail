@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.20...v0.3.21)
+
+## 🐛 Bug Fixes
+
+- **webmail**: reject sessions for disabled or deleted accounts ([9e2ca22](https://github.com/mail-os/mail/commit/9e2ca22)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.21 ([7b7238b](https://github.com/mail-os/mail/commit/7b7238b)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.19...v0.3.20)
 
 ## ✨ Features
