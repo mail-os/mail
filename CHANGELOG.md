@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.18...v0.3.19)
+
+## ✨ Features
+
+- **webmail**: serve mail.hq.training with managed TLS ([72cf00e](https://github.com/mail-os/mail/commit/72cf00e)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.19 ([6fd9699](https://github.com/mail-os/mail/commit/6fd9699)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.17...v0.3.18)
 
 ## 🐛 Bug Fixes
