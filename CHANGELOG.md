@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.16...v0.3.17)
+
+## 🐛 Bug Fixes
+
+- **webmail**: validate CSRF against trusted gateway authority ([90383ab](https://github.com/mail-os/mail/commit/90383ab)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.17 ([35ea143](https://github.com/mail-os/mail/commit/35ea143)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.15...v0.3.16)
 
 ## 🐛 Bug Fixes
