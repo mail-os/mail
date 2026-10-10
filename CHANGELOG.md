@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.13...v0.3.14)
+
+## 🐛 Bug Fixes
+
+- **webmail**: keep mailbox controls accessible on mobile ([61941b0](https://github.com/mail-os/mail/commit/61941b0)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.14 ([9ed45b2](https://github.com/mail-os/mail/commit/9ed45b2)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.12...v0.3.13)
 
 ## ✨ Features
