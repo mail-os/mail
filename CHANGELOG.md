@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.15...v0.3.16)
+
+## 🐛 Bug Fixes
+
+- **deploy**: wait for gateway restart before verifying HTTPS ([8c18f6b](https://github.com/mail-os/mail/commit/8c18f6b)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.16 ([a93ba21](https://github.com/mail-os/mail/commit/a93ba21)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.14...v0.3.15)
 
 ## 🐛 Bug Fixes
