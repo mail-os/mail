@@ -52,5 +52,5 @@ UNIT
 systemctl daemon-reload
 systemctl enable --now rpx-cert-renew-mail.timer
 systemctl start rpx-cert-renew-mail.service
-curl --fail --silent --retry 5 --retry-delay 3 https://mail.stacksjs.com/login >/dev/null
+curl --fail --silent --retry 10 --retry-connrefused --retry-delay 3 https://mail.stacksjs.com/login >/dev/null
 REMOTE
