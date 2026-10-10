@@ -1,6 +1,19 @@
 import { renderTemplate } from '@stacksjs/stx'
 import { expect, test } from 'bun:test'
 import { join } from 'node:path'
+import { buildWebmail, stylesheetUrl } from './build'
+
+test('deployments fingerprint styles so existing browsers fetch updated controls', async () => {
+  const first = new TextEncoder().encode('.wm-folders { display: none; }')
+  const second = new TextEncoder().encode('.wm-folders { display: grid; }')
+  expect(stylesheetUrl(first)).toBe(stylesheetUrl(first))
+  expect(stylesheetUrl(first)).not.toBe(stylesheetUrl(second))
+  await buildWebmail()
+  for (const page of ['index', 'login']) {
+    const html = await Bun.file(join(import.meta.dir, `../zig/src/api/webmail_dist/${page}.html`)).text()
+    expect(html).toMatch(/href="\/styles\.css\?v=[0-9a-f]{16}"/)
+  }
+})
 
 for (const page of ['login', 'index']) {
   test(`${page} compiles with STX bindings and a self-contained runtime`, async () => {
