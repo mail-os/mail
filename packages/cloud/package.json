@@ -2,7 +2,7 @@
   "name": "mail-cloud",
   "type": "module",
   "version": "0.3.19",
-  "description": "AWS Infrastructure for Mail Server using ts-cloud",
+  "description": "Cloud integration for the mail server using ts-cloud",
   "author": "Chris Breuer",
   "license": "MIT",
   "scripts": {
@@ -41,7 +41,7 @@
     "cloudformation"
   ],
   "dependencies": {
-    "@stacksjs/ts-cloud": "^0.11.0"
+    "@stacksjs/ts-cloud": "0.16.50"
   },
   "devDependencies": {
     "better-dx": "^0.2.23"

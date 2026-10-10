@@ -6,9 +6,10 @@ on:
     paths:
       - 'packages/zig/**'
       - 'packages/webmail/**'
-      - 'packages/cloud/webmail.gateway.json'
+      - 'packages/cloud/webmail.config.ts'
+      - 'packages/cloud/package.json'
       - 'scripts/deploy*.sh'
-      - 'scripts/renew-webmail-cert.sh'
+      - 'scripts/deploy-webmail.ts'
       - 'bun.lock'
   workflow_dispatch: {}
 
@@ -82,7 +83,7 @@ jobs:
         export GIT_SSH_COMMAND="ssh -i ~/.ssh/deploy_key -o BatchMode=yes"
         # The deployment script uses ssh/scp, which respect this per-host identity.
         printf 'Host %s\n  IdentityFile ~/.ssh/deploy_key\n  BatchMode yes\n' "$HOST" > ~/.ssh/config
-        scripts/deploy-webmail.sh "root@$HOST"
+        bun scripts/deploy-webmail.ts "root@$HOST"
 
     - name: Verify public mail protocols
       env:

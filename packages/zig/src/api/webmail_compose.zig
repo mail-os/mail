@@ -64,6 +64,8 @@ pub const Message = struct {
     in_reply_to: []const u8 = "", // Message-ID being replied to (optional)
     references: []const u8 = "", // References header value (optional)
     attachments: []const Attachment = &.{},
+    /// Only drafts and the sender's private Sent copy retain Bcc headers.
+    include_bcc: bool = false,
 };
 
 pub const SendConfig = struct {
@@ -80,6 +82,7 @@ pub const SendResult = struct {
     message_id: []const u8,
     delivered: usize, // recipients delivery SUCCEEDED for
     failed: []const []const u8, // recipients delivery failed for (arena-allocated)
+    sent_saved: bool,
 };
 
 /// A header VALUE must not contain CR/LF (header injection) and stays short
@@ -99,7 +102,7 @@ fn isSafeAddress(a: []const u8) bool {
         // local-part escape the mail/{user}/ path on local delivery) plus '..'.
         // The '\' set also matches outbound.zig's validator so a webmail-accepted
         // address never fails the outbound backstop.
-        if (c == '\r' or c == '\n' or c == 0 or c == '"' or c == '<' or c == '>' or c == '/' or c == '\\') return false;
+        if (c <= 0x20 or c == 0x7f or c == ',' or c == ';' or c == ':' or c == '"' or c == '<' or c == '>' or c == '/' or c == '\\') return false;
     }
     if (std.mem.indexOf(u8, a, "..") != null) return false;
     // Must look like an address (one @, non-empty local/domain, no leading dot).
@@ -246,7 +249,26 @@ pub fn buildMime(allocator: std.mem.Allocator, msg: Message, ts: i64, msgid: []c
     try w.print("From: {s}\r\n", .{msg.from});
     if (msg.to.len > 0) try w.print("To: {s}\r\n", .{try joinAddrs(allocator, msg.to)});
     if (msg.cc.len > 0) try w.print("Cc: {s}\r\n", .{try joinAddrs(allocator, msg.cc)});
-    try w.print("Subject: {s}\r\n", .{msg.subject});
+    if (msg.include_bcc and msg.bcc.len > 0) try w.print("Bcc: {s}\r\n", .{try joinAddrs(allocator, msg.bcc)});
+    if (needsBase64(msg.subject)) {
+        // RFC 2047 limits each encoded-word to 75 bytes. Fold between words,
+        // taking care not to split a UTF-8 code point between independently
+        // encoded chunks.
+        try w.writeAll("Subject: ");
+        const enc = std.base64.standard.Encoder;
+        var offset: usize = 0;
+        while (offset < msg.subject.len) {
+            var end = @min(offset + 42, msg.subject.len);
+            while (end < msg.subject.len and (msg.subject[end] & 0xc0) == 0x80) end -= 1;
+            const chunk = msg.subject[offset..end];
+            const encoded = try allocator.alloc(u8, enc.calcSize(chunk.len));
+            _ = enc.encode(encoded, chunk);
+            if (offset > 0) try w.writeAll("\r\n ");
+            try w.print("=?UTF-8?B?{s}?=", .{encoded});
+            offset = end;
+        }
+        try w.writeAll("\r\n");
+    } else try w.print("Subject: {s}\r\n", .{msg.subject});
     try w.print("Date: {s}\r\n", .{date});
     try w.print("Message-ID: {s}\r\n", .{msgid});
     if (msg.in_reply_to.len > 0) try w.print("In-Reply-To: {s}\r\n", .{msg.in_reply_to});
@@ -286,7 +308,13 @@ pub fn buildMime(allocator: std.mem.Allocator, msg: Message, ts: i64, msgid: []c
             try w.print("--{s}\r\n", .{boundary});
             try w.print("Content-Type: {s}\r\n", .{att.content_type});
             try w.writeAll("Content-Transfer-Encoding: base64\r\n");
-            try w.print("Content-Disposition: attachment; filename=\"{s}\"\r\n\r\n", .{att.filename});
+            // Quote/backslash in a filename must not terminate its parameter.
+            try w.writeAll("Content-Disposition: attachment; filename=\"");
+            for (att.filename) |c| {
+                if (c == '"' or c == '\\') try w.writeAll("\\");
+                try out.append(allocator, c);
+            }
+            try w.writeAll("\"\r\n\r\n");
             try w.writeAll(try base64Wrapped(allocator, att.data));
             try w.writeAll("\r\n");
         }
@@ -431,19 +459,27 @@ pub fn send(allocator: std.mem.Allocator, msg: Message, cfg: SendConfig) !SendRe
     const msgid = try std.fmt.allocPrint(allocator, "<{d}.{d}@{s}>", .{ ts, seq, cfg.hostname });
 
     const raw = try buildMime(allocator, msg, ts, msgid);
+    var private_msg = msg;
+    private_msg.include_bcc = true;
+    const sent_raw = try buildMime(allocator, private_msg, ts, msgid);
 
     // Deliver to every recipient (To + Cc + Bcc). Bcc recipients receive the
     // message but are not in the headers (buildMime never emits a Bcc header).
     // Track real successes + failures so the caller can tell the user the truth.
     var delivered: usize = 0;
     var failed: std.ArrayList([]const u8) = .empty;
+    var attempted: std.StringHashMap(void) = .init(allocator);
+    defer attempted.deinit();
     const all_groups = [_][]const []const u8{ msg.to, msg.cc, msg.bcc };
     for (all_groups) |group| {
         for (group) |r| {
+            const key = try std.ascii.allocLowerString(allocator, r);
+            const entry = try attempted.getOrPut(key);
+            if (entry.found_existing) continue;
             if (deliverOne(allocator, cfg, msg.from, r, raw)) {
                 delivered += 1;
             } else |err| {
-                std.log.err("webmail delivery to {s} failed: {}", .{ r, err });
+                std.log.warn("webmail delivery to {s} failed: {}", .{ r, err });
                 try failed.append(allocator, r);
             }
         }
@@ -451,11 +487,14 @@ pub fn send(allocator: std.mem.Allocator, msg: Message, cfg: SendConfig) !SendRe
 
     // Save a copy to the sender's Sent folder (best-effort; doesn't affect the
     // delivered count, but a failure is logged).
-    writeMaildir(allocator, cfg.sender_user, "Sent", raw) catch |err| {
-        std.log.warn("webmail: failed to save to Sent: {}", .{err});
-    };
+    var sent_saved = false;
+    if (delivered > 0) {
+        if (writeMaildir(allocator, cfg.sender_user, "Sent", sent_raw)) {
+            sent_saved = true;
+        } else |err| std.log.warn("webmail: failed to save to Sent: {}", .{err});
+    }
 
-    return .{ .message_id = msgid, .delivered = delivered, .failed = try failed.toOwnedSlice(allocator) };
+    return .{ .message_id = msgid, .delivered = delivered, .failed = try failed.toOwnedSlice(allocator), .sent_saved = sent_saved };
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -572,4 +611,36 @@ test "buildMime multipart with html and attachment" {
     try t.expect(std.mem.indexOf(u8, raw, "Content-Disposition: attachment; filename=\"x.txt\"") != null);
     // "ATTACH" base64 = "QVRUQUNI"
     try t.expect(std.mem.indexOf(u8, raw, "QVRUQUNI") != null);
+}
+
+test "compose deduplicates envelope recipients and reports partial delivery" {
+    const t = std.testing;
+    const db_mod = @import("../storage/database.zig");
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var db = try db_mod.Database.init(t.allocator, ":memory:");
+    defer db.deinit();
+    var auth = auth_mod.AuthBackend.init(t.allocator, &db);
+    defer auth.deinit();
+    const user = try std.fmt.allocPrint(a, "webmail-unit-{d}@unit.test", .{time_compat.milliTimestamp()});
+    _ = try auth.createUser(user, "test-only-password", user);
+    const root = try std.fmt.allocPrint(a, "mail/{s}", .{user});
+    defer fs_compat.cwd().deleteTree(root) catch {};
+    const msg = Message{ .from = user, .to = &.{ user, "missing@unit.test" }, .cc = &.{user}, .bcc = &.{user}, .text_body = "test" };
+    const result = try send(a, msg, .{ .hostname = "mail.unit.test", .delivery_method = .direct, .ses_region = "", .sender_user = user, .auth = &auth });
+    try t.expectEqual(@as(usize, 1), result.delivered);
+    try t.expectEqual(@as(usize, 1), result.failed.len);
+    try t.expectEqualStrings("missing@unit.test", result.failed[0]);
+    try t.expect(result.sent_saved);
+    const inbox = try std.fmt.allocPrint(a, "{s}/new", .{root});
+    const sent = try std.fmt.allocPrint(a, "{s}/Sent", .{root});
+    try t.expectEqual(@as(usize, 1), fs_compat.countEmlFiles(inbox));
+    try t.expectEqual(@as(usize, 1), fs_compat.countEmlFiles(sent));
+    const files = try fs_compat.listEmlFiles(a, inbox);
+    const received = try fs_compat.readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/{s}", .{ inbox, files[0] }));
+    try t.expect(std.mem.indexOf(u8, received, "\r\nBcc:") == null);
+    const sent_files = try fs_compat.listEmlFiles(a, sent);
+    const private_copy = try fs_compat.readFileAlloc(a, try std.fmt.allocPrint(a, "{s}/{s}", .{ sent, sent_files[0] }));
+    try t.expect(std.mem.indexOf(u8, private_copy, "\r\nBcc:") != null);
 }

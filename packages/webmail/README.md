@@ -7,10 +7,20 @@ server deploys its UI, without a separate frontend service.
 
 Users sign in with the same canonical mailbox username and password as IMAP and
 SMTP. Sessions use secure HttpOnly cookies. The UI supports folders, paginated
-message lists, searching the current page, reading sandboxed HTML, reply/reply
-all/forward, compose, flags, mark unread, moving to Trash, sign-out and changing
+message lists, searching the complete folder (including decoded plain-text
+bodies), reading sandboxed HTML, Reply-To-aware reply/reply all/forward, compose,
+flags, mark unread, folder moves and restoration, sign-out and changing
 the shared mail password. Password changes require the current password and
-revoke every webmail session for that mailbox.
+revoke every webmail session for that mailbox, including administrative resets.
+
+Compositions survive closing the composer. Save and reopen server-side drafts
+(including Bcc and attachments); successful sends move the old draft to Trash.
+Upload up to 20 attachments totaling 512 KiB and download received attachments
+through authenticated routes. Remote email images remain blocked, and a
+plain-text view is available. Native dialogs provide keyboard focus handling;
+discard and permanent deletion require confirmation. The inbox refreshes every
+30 seconds while visible. Partial delivery retains only failed recipients for
+retry, deduplicates recipients, and reports Sent-copy failures.
 
 ## Development
 
@@ -24,18 +34,20 @@ the production STX build and proxies `/webmail/*` to `API_TARGET` (default
 
 Run `scripts/deploy-native.sh root@HOST` from the workspace. It compiles STX
 before shipping the source, builds the pinned Zig release on Linux, backs up
-and swaps the executable, and runs `scripts/deploy-webmail.sh`.
+and swaps the executable, and runs `scripts/deploy-webmail.ts`.
 
-The latter installs the source-controlled rpx fragment
-`packages/cloud/webmail.gateway.json`, enables webmail on loopback port 8099,
-keeps secure cookies, restarts mail and the existing shared rpx gateway, and
-checks HTTPS at `<https://mail.stacksjs.com/login>` and
-`<https://mail.hq.training/login>`. Both addresses serve the same mailboxes and
-accept the same mail credentials. SMTP/IMAP keep their own TLS.
-A tlsx HTTP-01 provisioning service obtains each configured certificate before the HTTPS
-check; its daily systemd timer renews it before expiry. The source script lives
-at `scripts/renew-webmail-cert.sh`.
-GitHub's deployment workflow also builds STX and applies this configuration.
+The TypeScript entry calls `deployMailWebmail` from `@stacksjs/ts-cloud/mail`.
+`packages/cloud/webmail.config.ts` declares the primary hostname, aliases and
+listener port. ts-cloud owns the rpx fragment, secure loopback listener settings,
+certificate issuance, renewal timer and HTTPS readiness checks. SMTP/IMAP retain
+their own TLS. The repo contains no certificate or gateway deployment scripts.
+
+Defaults here serve `<https://mail.stacksjs.com/login>` and
+`<https://mail.hq.training/login>`. Override `WEBMAIL_DOMAIN`, `WEBMAIL_ALIASES`,
+`WEBMAIL_PORT`, `WEBMAIL_ACME_EMAIL`, `MAIL_SERVER_ENV_FILE` and
+`MAIL_SERVICE_UNIT`, or edit the typed cloud settings. Both hosts share the same
+mail credentials and mailbox storage. GitHub's deployment also compiles STX and
+calls this ts-cloud integration after deploying the mail executable.
 
 `bun run build` compiles into `packages/zig/src/api/webmail_dist` (generated and
 ignored). `bun test packages/webmail` checks compilation and source conventions.

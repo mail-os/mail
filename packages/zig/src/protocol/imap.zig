@@ -646,7 +646,7 @@ fn parseAppendArgs(args_raw: []const u8) AppendArgs {
     return result;
 }
 
-fn parseMessageSortKey(filename: []const u8) i64 {
+pub fn parseMessageSortKey(filename: []const u8) i64 {
     const basename = if (std.mem.lastIndexOfScalar(u8, filename, '/')) |pos| filename[pos + 1 ..] else filename;
     const no_flags = MaildirFlags.baseName(basename);
     const name_no_ext = if (std.mem.endsWith(u8, no_flags, ".eml")) no_flags[0 .. no_flags.len - 4] else no_flags;
@@ -1304,8 +1304,6 @@ pub const ImapSession = struct {
                 const display_folder = if (std.mem.eql(u8, folder, "new")) "INBOX" else folder;
                 try self.appendAggregateFolder(&entries, folder_path, display_folder);
             }
-        } else {
-            try self.appendAggregateFolder(&entries, "mail/new", "INBOX");
         }
 
         std.mem.sort(AggregateMailboxEntry, entries.items, {}, struct {
@@ -1378,11 +1376,6 @@ pub const ImapSession = struct {
 
         try self.appendInboxFolder(&entries, new_dir);
         try self.appendInboxFolder(&entries, cur_dir);
-
-        // Fallback to the legacy global mail/new for INBOX if the user has none.
-        if (entries.items.len == 0) {
-            try self.appendInboxFolder(&entries, "mail/new");
-        }
 
         std.mem.sort(AggregateMailboxEntry, entries.items, {}, struct {
             fn lessThan(_: void, a: AggregateMailboxEntry, b: AggregateMailboxEntry) bool {
@@ -1629,8 +1622,6 @@ pub const ImapSession = struct {
                     const folder_path = std.fmt.bufPrint(&folder_buf, "{s}/{s}", .{ root, folder }) catch continue;
                     total += fs_compat.countEmlFiles(folder_path);
                 }
-            } else {
-                total = fs_compat.countEmlFiles("mail/new");
             }
             return total;
         }
@@ -1644,7 +1635,6 @@ pub const ImapSession = struct {
                 const new_dir = std.fmt.bufPrint(&new_buf, "mail/{s}/new", .{username}) catch return 0;
                 const cur_dir = std.fmt.bufPrint(&cur_buf, "mail/{s}/cur", .{username}) catch return 0;
                 const total = fs_compat.countEmlFiles(new_dir) + fs_compat.countEmlFiles(cur_dir);
-                if (total == 0) return fs_compat.countEmlFiles("mail/new");
                 return total;
             }
         }

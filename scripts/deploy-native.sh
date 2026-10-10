@@ -69,4 +69,4 @@ echo "deployed; service active; backup at \$BK"
 REMOTE
 echo "==> done"
 
-"$REPO_ROOT/scripts/deploy-webmail.sh" "$TARGET"
+bun "$REPO_ROOT/scripts/deploy-webmail.ts" "$TARGET"

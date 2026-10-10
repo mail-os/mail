@@ -378,6 +378,12 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.eql(u8, p, "/webmail/api/compose") and std.mem.eql(u8, req.method, "POST")) {
         return handleCompose(server, conn, arena, req);
     }
+    if (std.mem.eql(u8, p, "/webmail/api/drafts") and std.mem.eql(u8, req.method, "POST")) {
+        return handleDraftSave(server, conn, arena, req);
+    }
+    if (std.mem.eql(u8, p, "/webmail/api/attachment") and std.mem.eql(u8, req.method, "GET")) {
+        return handleAttachment(server, conn, arena, req);
+    }
     if (std.mem.eql(u8, p, "/webmail/api/folders") and std.mem.eql(u8, req.method, "GET")) {
         return handleFolders(server, conn, arena, req);
     }
@@ -466,6 +472,7 @@ fn requireSession(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
 fn handleLogin(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
+    if (!isSameOrigin(req)) return sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected");
     const ip = if (req.trust_forwarded_headers) req.header("X-Real-IP") orelse conn.peerIp() else conn.peerIp();
 
     // Throttle per IP BEFORE the expensive Argon2 verify, so a brute-forcer
@@ -566,7 +573,8 @@ fn handlePasswordChange(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a
     if (!try server.login_limiter.checkAndIncrementUser(key)) return sendError(conn, arena, 429, "rate_limited", "Too many attempts. Please wait five minutes");
     if (!try server.auth.verifyCredentials(sess.username, current)) return sendError(conn, arena, 400, "invalid_credentials", "Current password is incorrect");
     try server.auth.changePassword(sess.username, next);
-    try server.db.deleteUserWebmailSessions(sess.username);
+    const ip = if (req.trust_forwarded_headers) req.header("X-Real-IP") orelse conn.peerIp() else conn.peerIp();
+    logger.info("Webmail password changed for {s} from {s}", .{ sess.username, ip });
     const clear = try server.sessions.buildClearCookie();
     try sendJson(conn, arena, 200, "{\"ok\":true}", clear);
 }
@@ -585,6 +593,86 @@ fn handleMe(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.me
     try sendJson(conn, arena, 200, body.items, null);
 }
 
+const ComposePayload = struct {
+    to: []const []const u8 = &.{},
+    cc: []const []const u8 = &.{},
+    bcc: []const []const u8 = &.{},
+    subject: []const u8 = "",
+    text: []const u8 = "",
+    html: []const u8 = "",
+    inReplyTo: []const u8 = "",
+    references: []const u8 = "",
+    draftUid: ?i64 = null,
+    attachments: []const struct {
+        filename: []const u8,
+        contentType: []const u8 = "application/octet-stream",
+        data: []const u8,
+    } = &.{},
+};
+
+fn payloadMessage(arena: std.mem.Allocator, payload: ComposePayload, from: []const u8) !compose.Message {
+    if (payload.attachments.len > 20) return error.TooManyAttachments;
+    var attachments: std.ArrayList(compose.Attachment) = .empty;
+    var total: usize = 0;
+    for (payload.attachments) |att| {
+        if (att.filename.len == 0 or att.filename.len > 255) return error.InvalidAttachmentName;
+        const size = try std.base64.standard.Decoder.calcSizeForSlice(att.data);
+        total += size;
+        if (total > 512 * 1024) return error.AttachmentTooLarge;
+        const bytes = try arena.alloc(u8, size);
+        try std.base64.standard.Decoder.decode(bytes, att.data);
+        try attachments.append(arena, .{ .filename = att.filename, .content_type = att.contentType, .data = bytes });
+    }
+    return .{
+        .from = from,
+        .to = payload.to,
+        .cc = payload.cc,
+        .bcc = payload.bcc,
+        .subject = payload.subject,
+        .text_body = payload.text,
+        .html_body = payload.html,
+        .in_reply_to = payload.inReplyTo,
+        .references = payload.references,
+        .attachments = try attachments.toOwnedSlice(arena),
+    };
+}
+
+fn handleDraftSave(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
+    if (!isSameOrigin(req)) return sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const parsed = std.json.parseFromSlice(ComposePayload, arena, req.body, .{ .ignore_unknown_fields = true }) catch return sendError(conn, arena, 400, "bad_request", "Invalid draft JSON");
+    defer parsed.deinit();
+    var msg = payloadMessage(arena, parsed.value, sess.email) catch return sendError(conn, arena, 400, "bad_request", "Invalid attachments (maximum 512 KiB total)");
+    msg.include_bcc = true;
+    const id = try std.fmt.allocPrint(arena, "<draft.{d}@{s}>", .{ time_compat.milliTimestamp(), server.config.hostname });
+    const raw = compose.buildMime(arena, msg, time_compat.timestamp(), id) catch return sendError(conn, arena, 400, "bad_request", "Invalid draft recipient or header");
+    const uid = maildir.saveDraft(arena, server.db, sess.username, raw, parsed.value.draftUid) catch |err| return mapMaildirError(conn, arena, err);
+    const response = try std.fmt.allocPrint(arena, "{{\"ok\":true,\"uid\":{d}}}", .{uid});
+    return sendJson(conn, arena, 200, response, null);
+}
+
+fn attachmentDisposition(arena: std.mem.Allocator, filename: []const u8) ![]const u8 {
+    var encoded: std.ArrayList(u8) = .empty;
+    const hex = "0123456789ABCDEF";
+    for (filename) |c| try encoded.appendSlice(arena, &.{ '%', hex[c >> 4], hex[c & 15] });
+    return std.fmt.allocPrint(arena, "attachment; filename=\"download\"; filename*=UTF-8''{s}", .{encoded.items});
+}
+
+fn handleAttachment(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const folder = req.queryParam(arena, "folder") orelse "INBOX";
+    const uid = std.fmt.parseInt(i64, req.queryParam(arena, "uid") orelse "", 10) catch return sendError(conn, arena, 400, "bad_request", "Invalid message UID");
+    const index = std.fmt.parseInt(usize, req.queryParam(arena, "index") orelse "", 10) catch return sendError(conn, arena, 400, "bad_request", "Invalid attachment index");
+    const message = maildir.getMessage(arena, server.db, sess.username, folder, uid) catch |err| return mapMaildirError(conn, arena, err);
+    if (index >= message.attachments.len) return sendError(conn, arena, 404, "not_found", "No such attachment");
+    const att = message.attachments[index];
+    const header = try std.fmt.allocPrint(arena, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: {s}\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: sandbox\r\nConnection: close\r\n\r\n", .{ try attachmentDisposition(arena, att.filename), att.data.len });
+    try writeAll(conn, header);
+    try writeAll(conn, att.data);
+}
+
 /// POST /webmail/api/compose
 /// { to:[...], cc:[...], bcc:[...], subject, text, html, inReplyTo?, references? }
 /// Sends through the shared delivery path (DKIM-signed) and saves to Sent.
@@ -594,25 +682,10 @@ fn handleCompose(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: s
     var sess = (try requireSession(server, conn, arena, req)) orelse return;
     defer sess.deinit(server.allocator);
 
-    const to = try jsonStringArray(arena, req.body, "to");
-    const cc = try jsonStringArray(arena, req.body, "cc");
-    const bcc = try jsonStringArray(arena, req.body, "bcc");
-    if (to.len == 0 and cc.len == 0 and bcc.len == 0) {
-        return sendError(conn, arena, 400, "bad_request", "At least one recipient is required");
-    }
-
-    const msg = compose.Message{
-        .from = sess.email,
-        .to = to,
-        .cc = cc,
-        .bcc = bcc,
-        // Free-text fields are JSON-unescaped (the browser sends \n etc.).
-        .subject = (try jsonStringFieldAlloc(arena, req.body, "subject")) orelse "",
-        .text_body = (try jsonStringFieldAlloc(arena, req.body, "text")) orelse "",
-        .html_body = (try jsonStringFieldAlloc(arena, req.body, "html")) orelse "",
-        .in_reply_to = jsonStringField(req.body, "inReplyTo") orelse "",
-        .references = jsonStringField(req.body, "references") orelse "",
-    };
+    const parsed = std.json.parseFromSlice(ComposePayload, arena, req.body, .{ .ignore_unknown_fields = true }) catch return sendError(conn, arena, 400, "bad_request", "Invalid compose JSON");
+    defer parsed.deinit();
+    const msg = payloadMessage(arena, parsed.value, sess.email) catch return sendError(conn, arena, 400, "bad_request", "Invalid attachments (maximum 512 KiB total)");
+    if (msg.to.len + msg.cc.len + msg.bcc.len > 100) return sendError(conn, arena, 400, "bad_request", "Use at most 100 recipients");
 
     const cfg = compose.SendConfig{
         .hostname = server.config.hostname,
@@ -636,7 +709,7 @@ fn handleCompose(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: s
     const all_ok = result.failed.len == 0;
     try w.print("{{\"ok\":{},\"message_id\":", .{all_ok});
     try writeJsonString(w, result.message_id);
-    try w.print(",\"delivered\":{d},\"failed\":[", .{result.delivered});
+    try w.print(",\"delivered\":{d},\"sent_saved\":{},\"failed\":[", .{ result.delivered, result.sent_saved });
     for (result.failed, 0..) |f, i| {
         if (i > 0) try w.writeAll(",");
         try writeJsonString(w, f);
@@ -673,24 +746,16 @@ fn handleMessageList(server: *WebmailHttpServer, conn: *webmail_tls.Stream, aren
     defer sess.deinit(server.allocator);
 
     const folder = req.queryParam(arena, "folder") orelse "INBOX";
-    const page = parseUintParam(req, arena, "page", 1);
-    const per_page = @min(parseUintParam(req, arena, "per_page", server.config.messages_per_page), 200);
-
-    const msgs = maildir.listMessages(arena, server.db, sess.username, folder, page, per_page) catch |err| {
-        if (err == maildir.MaildirError.InvalidFolderName) {
-            return sendError(conn, arena, 400, "bad_request", "Invalid folder");
-        }
+    const page = @max(parseUintParam(req, arena, "page", 1), 1);
+    const per_page = @max(@min(parseUintParam(req, arena, "per_page", server.config.messages_per_page), 200), 1);
+    const query = req.queryParam(arena, "q") orelse "";
+    if (query.len > 256) return sendError(conn, arena, 400, "bad_request", "Search is too long");
+    const result = maildir.listMessagePage(arena, server.db, sess.username, folder, page, per_page, query) catch |err| {
+        if (err == maildir.MaildirError.InvalidFolderName) return sendError(conn, arena, 400, "bad_request", "Invalid folder");
         return sendError(conn, arena, 500, "server_error", "Failed to read messages");
     };
-
-    const folders = try maildir.listFolders(arena, sess.username);
-    var total: usize = 0;
-    for (folders) |item| {
-        if (std.mem.eql(u8, item.name, folder)) {
-            total = item.total;
-            break;
-        }
-    }
+    const msgs = result.items;
+    const total = result.total;
 
     var body: std.ArrayList(u8) = .empty;
     const w = jw(&body, arena);
@@ -899,6 +964,14 @@ fn writeMessageDetail(w: anytype, m: maildir.MessageDetail) !void {
     try writeJsonString(w, m.to);
     try w.writeAll(",\"cc\":");
     try writeJsonString(w, m.cc);
+    try w.writeAll(",\"bcc\":");
+    try writeJsonString(w, m.bcc);
+    try w.writeAll(",\"reply_to\":");
+    try writeJsonString(w, m.reply_to);
+    try w.writeAll(",\"in_reply_to\":");
+    try writeJsonString(w, m.in_reply_to);
+    try w.writeAll(",\"references\":");
+    try writeJsonString(w, m.references);
     try w.writeAll(",\"subject\":");
     try writeJsonString(w, m.subject);
     try w.writeAll(",\"date\":");
@@ -1374,4 +1447,28 @@ test "Request.header and queryParam" {
     try t.expectEqualStrings("Sent", req.queryParam(arena.allocator(), "folder").?);
     try t.expectEqualStrings("2", req.queryParam(arena.allocator(), "page").?);
     try t.expect(req.queryParam(arena.allocator(), "missing") == null);
+}
+
+test "compose JSON is typed and attachment fields cannot shadow the message" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parsed = try std.json.parseFromSlice(ComposePayload, a, "{\"subject\":\"real subject\",\"text\":\"Line 1\\nCafé\",\"attachments\":[{\"filename\":\"subject\",\"data\":\"AAEC/w==\"}]}", .{});
+    defer parsed.deinit();
+    const msg = try payloadMessage(a, parsed.value, "user@example.com");
+    try t.expectEqualStrings("real subject", msg.subject);
+    try t.expectEqualStrings("Line 1\nCafé", msg.text_body);
+    try t.expectEqualSlices(u8, &.{ 0, 1, 2, 255 }, msg.attachments[0].data);
+    try t.expectError(error.InvalidCharacter, payloadMessage(a, .{ .attachments = &.{.{ .filename = "a", .data = "!!!!" }} }, "user@example.com"));
+}
+
+test "attachment download headers percent-encode untrusted filenames" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const header = try attachmentDisposition(arena.allocator(), "café\"\r\n.txt");
+    try t.expect(std.mem.indexOf(u8, header, "\r") == null);
+    try t.expect(std.mem.indexOf(u8, header, "\n") == null);
+    try t.expect(std.mem.indexOf(u8, header, "%C3%A9%22%0D%0A") != null);
 }

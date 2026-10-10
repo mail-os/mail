@@ -1848,6 +1848,32 @@ pub const Database = struct {
         return uid;
     }
 
+    /// A move into a mailbox is a new arrival even if this physical filename
+    /// was there earlier. Never resurrect its historical UID after EXPUNGE.
+    pub fn assignFreshUid(self: *Database, username: []const u8, mailbox: []const u8, filename: []const u8) !i64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.execLocked("BEGIN IMMEDIATE");
+        errdefer self.execLocked("ROLLBACK") catch {};
+        const sql: [:0]const u8 = "DELETE FROM imap_uids WHERE username = ?1 AND mailbox = ?2 AND filename = ?3";
+        var stmt: ?*sqlite.sqlite3_stmt = null;
+        if (sqlite.sqlite3_prepare_v2(self.db, sql.ptr, -1, &stmt, null) != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
+        defer _ = sqlite.sqlite3_finalize(stmt);
+        const user_z = try self.allocator.dupeSentinel(u8, username, 0);
+        defer self.allocator.free(user_z);
+        const mailbox_z = try self.allocator.dupeSentinel(u8, mailbox, 0);
+        defer self.allocator.free(mailbox_z);
+        const name_z = try self.allocator.dupeSentinel(u8, maildirBaseName(filename), 0);
+        defer self.allocator.free(name_z);
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 1, user_z.ptr, -1, null));
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 2, mailbox_z.ptr, -1, null));
+        try checkBind(sqlite.sqlite3_bind_text(stmt, 3, name_z.ptr, -1, null));
+        if (sqlite.sqlite3_step(stmt) != sqlite.SQLITE_DONE) return DatabaseError.StepFailed;
+        const uid = try self.assignUidInTxn(username, mailbox, filename);
+        try self.execLocked("COMMIT");
+        return uid;
+    }
+
     fn assignUidInTxn(self: *Database, username: []const u8, mailbox: []const u8, filename: []const u8) !i64 {
         // Key on the flag-suffix-stripped base name (see maildirBaseName).
         const base = maildirBaseName(filename);

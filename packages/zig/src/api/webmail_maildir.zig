@@ -27,6 +27,7 @@ const ascii_compat = @import("ascii-compat");
 const fs_compat = @import("../core/fs_compat.zig");
 const database = @import("../storage/database.zig");
 const imap = @import("../protocol/imap.zig");
+const time_compat = @import("../core/time_compat.zig");
 
 pub const MaildirError = error{
     InvalidFolderName,
@@ -79,6 +80,10 @@ pub const MessageDetail = struct {
     from: []const u8,
     to: []const u8,
     cc: []const u8,
+    bcc: []const u8,
+    reply_to: []const u8,
+    in_reply_to: []const u8,
+    references: []const u8,
     subject: []const u8,
     date: []const u8,
     message_id: []const u8,
@@ -96,6 +101,7 @@ pub const AttachmentInfo = struct {
     filename: []const u8,
     content_type: []const u8,
     size: usize,
+    data: []const u8 = "",
 };
 
 /// Validate a folder name against path traversal and separators. We only allow
@@ -136,21 +142,32 @@ const FileRef = struct {
 /// Collect the message files for a folder, in stable IMAP order. The returned
 /// slices are arena-allocated.
 fn collectFiles(allocator: std.mem.Allocator, user: []const u8, folder: []const u8) ![]FileRef {
+    return collectFilesAtRoot(allocator, "mail", user, folder);
+}
+
+fn collectFilesAtRoot(allocator: std.mem.Allocator, root: []const u8, user: []const u8, folder: []const u8) ![]FileRef {
     var refs: std.ArrayList(FileRef) = .empty;
 
     if (std.ascii.eqlIgnoreCase(folder, "INBOX")) {
-        const new_dir = try std.fmt.allocPrint(allocator, "mail/{s}/new", .{user});
-        const cur_dir = try std.fmt.allocPrint(allocator, "mail/{s}/cur", .{user});
+        const new_dir = try std.fmt.allocPrint(allocator, "{s}/{s}/new", .{ root, user });
+        const cur_dir = try std.fmt.allocPrint(allocator, "{s}/{s}/cur", .{ root, user });
         try appendDir(allocator, &refs, new_dir);
         try appendDir(allocator, &refs, cur_dir);
-        if (refs.items.len == 0) {
-            try appendDir(allocator, &refs, "mail/new");
-        }
     } else {
-        const dir = try std.fmt.allocPrint(allocator, "mail/{s}/{s}", .{ user, folder });
+        const dir = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ root, user, folder });
         try appendDir(allocator, &refs, dir);
     }
 
+    // Merge new/ and cur/ in the same oldest-first order IMAP uses before
+    // assigning UIDs. Concatenating directory lists changes identity/order.
+    std.mem.sort(FileRef, refs.items, {}, struct {
+        fn lessThan(_: void, left: FileRef, right: FileRef) bool {
+            const a = imap.parseMessageSortKey(left.name);
+            const b = imap.parseMessageSortKey(right.name);
+            if (a != b) return a < b;
+            return std.mem.order(u8, left.name, right.name) == .lt;
+        }
+    }.lessThan);
     return refs.toOwnedSlice(allocator);
 }
 
@@ -211,52 +228,68 @@ pub fn listMessages(
     page: usize,
     per_page: usize,
 ) ![]MessageSummary {
+    return (try listMessagePage(allocator, db, user, folder, page, per_page, "")).items;
+}
+
+pub const MessagePage = struct { items: []MessageSummary, total: usize };
+
+/// Search the complete folder before pagination. Per-file scratch arenas keep
+/// scanning large mailboxes from retaining every decoded body in memory.
+pub fn listMessagePage(
+    allocator: std.mem.Allocator,
+    db: *database.Database,
+    user: []const u8,
+    folder: []const u8,
+    page: usize,
+    per_page: usize,
+    query: []const u8,
+) !MessagePage {
     if (!isValidFolderName(folder)) return MaildirError.InvalidFolderName;
-
-    // Ensure the mailbox record exists so UIDVALIDITY is stable.
-    _ = db.getOrCreateMailbox(user, folder) catch {};
-
+    _ = try db.getOrCreateMailbox(user, folder);
     const refs = try collectFiles(allocator, user, folder);
-
-    // Assign UIDs oldest-first (IMAP order) before the reverse display walk.
     preassignUids(db, user, folder, refs);
-
-    // Newest first for display. refs is oldest-first; iterate in reverse.
-    const total = refs.len;
-    const start = (page -| 1) * per_page;
-    if (start >= total) return &[_]MessageSummary{};
-    const remaining = total - start;
-    const count = @min(per_page, remaining);
-
-    var out = try allocator.alloc(MessageSummary, count);
-    var written: usize = 0;
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        // Reverse index into refs (newest first).
-        const idx = total - 1 - (start + i);
-        const r = refs[idx];
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ r.dir, r.name });
-        const raw = fs_compat.readFileAlloc(allocator, path) catch continue;
-
-        const headers = parseHeaders(allocator, raw) catch HeaderSet{};
-        const body = extractBestBody(allocator, raw) catch BodyParts{};
-        const uid = uidFor(db, user, folder, r.name, @intCast(idx + 1));
-
-        out[written] = .{
-            .uid = uid,
-            .from = headers.from,
-            .to = headers.to,
-            .subject = headers.subject,
-            .date = headers.date,
-            .snippet = makeSnippet(allocator, body.text) catch "",
+    const start = std.math.mul(usize, page -| 1, per_page) catch std.math.maxInt(usize);
+    var out: std.ArrayList(MessageSummary) = .empty;
+    var total: usize = 0;
+    var remaining = refs.len;
+    while (remaining > 0) {
+        remaining -= 1;
+        const r = refs[remaining];
+        if (query.len == 0 and (total < start or out.items.len >= per_page)) {
+            total += 1;
+            continue;
+        }
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ r.dir, r.name });
+        const raw = fs_compat.readFileAlloc(a, path) catch continue;
+        const headers = parseHeaders(a, raw) catch HeaderSet{};
+        const body = extractBestBody(a, raw) catch BodyParts{};
+        if (query.len > 0 and !matchesQuery(headers, body, query)) continue;
+        const position = total;
+        total += 1;
+        if (position < start or out.items.len >= per_page) continue;
+        try out.append(allocator, .{
+            .uid = uidFor(db, user, folder, r.name, @intCast(remaining + 1)),
+            .from = try allocator.dupe(u8, headers.from),
+            .to = try allocator.dupe(u8, headers.to),
+            .subject = try allocator.dupe(u8, headers.subject),
+            .date = try allocator.dupe(u8, headers.date),
+            .snippet = try makeSnippet(allocator, body.text),
             .flags = flagsFrom(r.name),
             .has_attachments = body.has_attachments,
             .size = raw.len,
-        };
-        written += 1;
+        });
     }
+    return .{ .items = try out.toOwnedSlice(allocator), .total = total };
+}
 
-    return out[0..written];
+fn matchesQuery(headers: HeaderSet, body: BodyParts, query: []const u8) bool {
+    for ([_][]const u8{ headers.from, headers.to, headers.cc, headers.subject, body.text }) |value| {
+        if (ascii_compat.indexOfIgnoreCase(value, query) != null) return true;
+    }
+    return false;
 }
 
 /// Load one message's full detail by UID.
@@ -290,6 +323,10 @@ pub fn getMessage(
             .from = headers.from,
             .to = headers.to,
             .cc = headers.cc,
+            .bcc = headers.bcc,
+            .reply_to = headers.reply_to,
+            .in_reply_to = headers.in_reply_to,
+            .references = headers.references,
             .subject = headers.subject,
             .date = headers.date,
             .message_id = headers.message_id,
@@ -456,7 +493,9 @@ pub fn moveMessage(
     // is correct regardless of the physical move; doing it before the move means
     // a UID failure aborts cleanly without leaving an orphaned file, and the
     // returned UID is always the real destination UID (never a stale source one).
-    const dst_uid = try db.assignUid(user, dst_folder, ref.name);
+    // A destination that already contains this name must not be overwritten.
+    if (fs_compat.cwd().access(new_path, .{})) return MaildirError.Conflict else |_| {}
+    const dst_uid = try db.assignFreshUid(user, dst_folder, ref.name);
 
     // Prefer an atomic rename; fall back to copy+unlink across filesystems.
     if (!renamePath(old_path, new_path)) {
@@ -477,6 +516,34 @@ pub fn moveMessage(
     }
 
     return dst_uid;
+}
+
+var draft_sequence = std.atomic.Value(u64).init(0);
+
+/// Replace a draft atomically while preserving its UID. A temporary filename
+/// is invisible to Maildir readers until the complete message is ready.
+pub fn saveDraft(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, raw: []const u8, existing: ?i64) !i64 {
+    _ = try db.getOrCreateMailbox(user, "Drafts");
+    const dir = try std.fmt.allocPrint(allocator, "mail/{s}/Drafts", .{user});
+    try fs_compat.ensureDir(dir);
+    const seq = draft_sequence.fetchAdd(1, .monotonic);
+    const now = time_compat.milliTimestamp();
+    const name = if (existing) |uid| blk: {
+        const ref = (try findByUid(allocator, db, user, "Drafts", uid)) orelse return MaildirError.MessageNotFound;
+        break :blk ref.name;
+    } else try std.fmt.allocPrint(allocator, "{d}.{d}.eml:2,DS", .{ now, seq });
+    const temporary = try std.fmt.allocPrint(allocator, "{s}/.draft-{d}.{d}.tmp", .{ dir, now, seq });
+    const destination = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, name });
+    const uid = try db.assignUid(user, "Drafts", name);
+    const file = try fs_compat.cwd().createFileExclusive(temporary);
+    defer unlinkPath(allocator, temporary) catch {};
+    file.writeAll(raw) catch |err| {
+        file.close();
+        return err;
+    };
+    file.close();
+    if (!renamePath(temporary, destination)) return MaildirError.WriteFailed;
+    return uid;
 }
 
 /// Delete a message (by UID): move it to Trash, or permanently unlink if it is
@@ -513,6 +580,10 @@ const HeaderSet = struct {
     from: []const u8 = "",
     to: []const u8 = "",
     cc: []const u8 = "",
+    bcc: []const u8 = "",
+    reply_to: []const u8 = "",
+    in_reply_to: []const u8 = "",
+    references: []const u8 = "",
     subject: []const u8 = "",
     date: []const u8 = "",
     message_id: []const u8 = "",
@@ -589,6 +660,10 @@ fn parseHeaders(allocator: std.mem.Allocator, raw: []const u8) !HeaderSet {
         .from = try getHeader(allocator, block, "From"),
         .to = try getHeader(allocator, block, "To"),
         .cc = try getHeader(allocator, block, "Cc"),
+        .bcc = try getHeader(allocator, block, "Bcc"),
+        .reply_to = try getHeader(allocator, block, "Reply-To"),
+        .in_reply_to = try getHeader(allocator, block, "In-Reply-To"),
+        .references = try getHeader(allocator, block, "References"),
         .subject = try getHeader(allocator, block, "Subject"),
         .date = try getHeader(allocator, block, "Date"),
         .message_id = try getHeader(allocator, block, "Message-ID"),
@@ -655,10 +730,12 @@ fn parseMultipart(allocator: std.mem.Allocator, ctype: []const u8, body: []const
             ascii_compat.indexOfIgnoreCase(pcd, "filename") != null)
         {
             result.has_attachments = true;
+            const decoded = try decodeBody(allocator, part_body, pcte);
             try attachments.append(allocator, .{
                 .filename = extractParam(allocator, pcd, "filename") catch "attachment",
                 .content_type = if (pct.len > 0) pct else "application/octet-stream",
-                .size = part_body.len,
+                .size = decoded.len,
+                .data = decoded,
             });
             continue;
         }
@@ -673,6 +750,7 @@ fn parseMultipart(allocator: std.mem.Allocator, ctype: []const u8, body: []const
             if (result.text.len == 0) result.text = nested.text;
             if (result.html.len == 0) result.html = nested.html;
             if (nested.has_attachments) result.has_attachments = true;
+            try attachments.appendSlice(allocator, nested.attachments);
         }
     }
 
@@ -710,9 +788,14 @@ fn extractParam(allocator: std.mem.Allocator, header_val: []const u8, param: []c
     const idx = ascii_compat.indexOfIgnoreCase(header_val, needle) orelse return "";
     var v = header_val[idx + needle.len ..];
     if (v.len > 0 and v[0] == '"') {
-        v = v[1..];
-        if (std.mem.indexOfScalar(u8, v, '"')) |end| return v[0..end];
-        return v;
+        var decoded: std.ArrayList(u8) = .empty;
+        var i: usize = 1;
+        while (i < v.len) : (i += 1) {
+            if (v[i] == '"') break;
+            if (v[i] == '\\' and i + 1 < v.len) i += 1;
+            try decoded.append(allocator, v[i]);
+        }
+        return decoded.toOwnedSlice(allocator);
     }
     var end: usize = 0;
     while (end < v.len and v[end] != ';' and v[end] != ' ' and v[end] != '\r' and v[end] != '\n') : (end += 1) {}
@@ -819,6 +902,11 @@ fn decodeMimeWords(allocator: std.mem.Allocator, value: []const u8) ![]const u8 
             };
             try out.appendSlice(allocator, decoded);
             i = end + 2;
+            // RFC 2047: whitespace between adjacent encoded-words is folding,
+            // not part of the decoded header value.
+            var next = i;
+            while (next < value.len and std.ascii.isWhitespace(value[next])) next += 1;
+            if (std.mem.startsWith(u8, value[next..], "=?")) i = next;
         } else {
             try out.append(allocator, value[i]);
             i += 1;
@@ -997,4 +1085,113 @@ test "parseMultipart bounds recursion on deeply nested input" {
     // Must not crash/hang; returns some BodyParts.
     const b = try extractBestBody(a, buf.items);
     _ = b;
+}
+
+test "empty users stay isolated and new-cur merge follows IMAP ordering" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.fmt.allocPrint(a, "/tmp/mail-webmail-isolation-{d}", .{time_compat.milliTimestamp()});
+    defer fs_compat.cwd().deleteTree(root) catch {};
+    const shared = try std.fmt.allocPrint(a, "{s}/new", .{root});
+    const new_dir = try std.fmt.allocPrint(a, "{s}/alice/new", .{root});
+    const cur_dir = try std.fmt.allocPrint(a, "{s}/alice/cur", .{root});
+    for ([_][]const u8{ shared, new_dir, cur_dir }) |dir| try fs_compat.ensureDir(dir);
+    const paths = [_][]const u8{
+        try std.fmt.allocPrint(a, "{s}/100.0.eml", .{shared}),
+        try std.fmt.allocPrint(a, "{s}/200.0.eml", .{new_dir}),
+        try std.fmt.allocPrint(a, "{s}/100.0.eml:2,S", .{cur_dir}),
+        try std.fmt.allocPrint(a, "{s}/300.0.eml:2,S", .{cur_dir}),
+    };
+    for (paths) |path| {
+        const file = try fs_compat.cwd().createFile(path, .{});
+        file.close();
+    }
+    const empty = try collectFilesAtRoot(a, root, "bob", "INBOX");
+    try t.expectEqual(@as(usize, 0), empty.len);
+    const alice = try collectFilesAtRoot(a, root, "alice", "INBOX");
+    try t.expectEqual(@as(usize, 3), alice.len);
+    try t.expectEqualStrings("100.0.eml:2,S", alice[0].name);
+    try t.expectEqualStrings("200.0.eml", alice[1].name);
+    try t.expectEqualStrings("300.0.eml:2,S", alice[2].name);
+}
+
+test "nested attachments decode exact bytes and quoted filenames" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const raw = "Content-Type: multipart/mixed; boundary=outer\r\n\r\n" ++
+        "--outer\r\nContent-Type: multipart/mixed; boundary=inner\r\n\r\n" ++
+        "--inner\r\nContent-Type: application/octet-stream\r\n" ++
+        "Content-Disposition: attachment; filename=\"a\\\"b.txt\"\r\n" ++
+        "Content-Transfer-Encoding: base64\r\n\r\nAAEC/w==\r\n--inner--\r\n--outer--\r\n";
+    const body = try extractBestBody(arena.allocator(), raw);
+    try t.expectEqual(@as(usize, 1), body.attachments.len);
+    try t.expectEqualStrings("a\"b.txt", body.attachments[0].filename);
+    try t.expectEqual(@as(usize, 4), body.attachments[0].size);
+    try t.expectEqualSlices(u8, &.{ 0, 1, 2, 255 }, body.attachments[0].data);
+}
+
+test "search includes complete decoded text and reply headers survive parsing" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = "From: sender@example.com\r\nReply-To: replies@example.com\r\nReferences: <earlier@example.com>\r\nBcc: private@example.com\r\n\r\nBody";
+    const headers = try parseHeaders(a, raw);
+    try t.expectEqualStrings("replies@example.com", headers.reply_to);
+    try t.expectEqualStrings("<earlier@example.com>", headers.references);
+    try t.expectEqualStrings("private@example.com", headers.bcc);
+    const prefix = try a.alloc(u8, 300);
+    @memset(prefix, 'a');
+    const text = try std.fmt.allocPrint(a, "{s} UNIQUE-TAIL", .{prefix});
+    try t.expect(matchesQuery(headers, .{ .text = text }, "unique-tail"));
+    try t.expect(!matchesQuery(headers, .{ .text = text }, "absent"));
+}
+
+test "first draft initializes UIDNEXT and replacement preserves identity" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var db = try database.Database.init(t.allocator, ":memory:");
+    defer db.deinit();
+    const user = try std.fmt.allocPrint(a, "webmail-drafts-{d}", .{time_compat.milliTimestamp()});
+    const root = try std.fmt.allocPrint(a, "mail/{s}", .{user});
+    defer fs_compat.cwd().deleteTree(root) catch {};
+    const first = try saveDraft(a, &db, user, "Subject: first\r\n\r\nOld body", null);
+    const same = try saveDraft(a, &db, user, "Subject: first\r\n\r\nNew body", first);
+    try t.expectEqual(first, same);
+    const second = try saveDraft(a, &db, user, "Subject: second\r\n\r\nSecond body", null);
+    try t.expect(second > first);
+    const messages = try listMessages(a, &db, user, "Drafts", 1, 50);
+    try t.expectEqual(@as(usize, 2), messages.len);
+    const detail = try getMessage(a, &db, user, "Drafts", first);
+    try t.expectEqualStrings("New body", detail.text_body);
+}
+
+test "adjacent MIME encoded words unfold without inserting body spaces" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const decoded = try decodeMimeWords(arena.allocator(), "=?UTF-8?B?Y2Fm?= =?UTF-8?B?w6k=?= ordinary text");
+    try std.testing.expectEqualStrings("café ordinary text", decoded);
+}
+
+test "moving a message back into a folder never resurrects its old UID" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var db = try database.Database.init(t.allocator, ":memory:");
+    defer db.deinit();
+    const user = try std.fmt.allocPrint(a, "webmail-moves-{d}", .{time_compat.milliTimestamp()});
+    const root = try std.fmt.allocPrint(a, "mail/{s}", .{user});
+    defer fs_compat.cwd().deleteTree(root) catch {};
+    const original = try saveDraft(a, &db, user, "Subject: move\r\n\r\nBody", null);
+    const archived = try moveMessage(a, &db, user, "Drafts", original, "Archive");
+    const restored = try moveMessage(a, &db, user, "Archive", archived, "Drafts");
+    try t.expect(restored > original);
+    try t.expectError(MaildirError.MessageNotFound, getMessage(a, &db, user, "Drafts", original));
+    try t.expectEqualStrings("Body", (try getMessage(a, &db, user, "Drafts", restored)).text_body);
 }

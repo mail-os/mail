@@ -238,8 +238,12 @@ test "sessions preserve canonical full-address identities across hosted domains"
     try t.expectEqualStrings("pawel@hq.training", session.email);
     try t.expectError(SessionError.InvalidCredentials, manager.login("pawel@other.example", "temporary-password", null, null));
     try t.expectError(SessionError.InvalidCredentials, manager.login("pawel", "temporary-password", null, null));
+    var other = try manager.login("pawel@other.example", "other-password", null, null);
+    defer other.deinit(t.allocator);
     try auth.changePassword(session.username, "replacement-password");
-    try db.deleteUserWebmailSessions(session.username);
+    var unaffected = try manager.validate(other.session_id);
+    defer unaffected.deinit(t.allocator);
+    try t.expectEqualStrings("pawel@other.example", unaffected.username);
     try t.expectError(SessionError.SessionNotFound, manager.validate(session.session_id));
     try t.expect(!try auth.verifyCredentials("pawel@hq.training", "temporary-password"));
     try t.expect(try auth.verifyCredentials("pawel@hq.training", "replacement-password"));

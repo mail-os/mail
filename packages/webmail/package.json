@@ -10,8 +10,8 @@
     "build": "bun build.ts"
   },
   "dependencies": {
-    "@stacksjs/stx": "0.2.422",
+    "@stacksjs/stx": "0.2.427",
     "@stacksjs/ts-css": "0.3.8",
-    "bun-plugin-stx": "0.2.422"
+    "bun-plugin-stx": "0.2.427"
   }
 }

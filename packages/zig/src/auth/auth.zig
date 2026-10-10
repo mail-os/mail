@@ -357,6 +357,9 @@ pub const AuthBackend = struct {
 
         // Update in database
         try self.db.updateUserPassword(username, password_hash);
+        // Administrative resets and webmail changes have the same session
+        // boundary: an old authenticated browser must sign in again.
+        try self.db.deleteUserWebmailSessions(username);
     }
 
     /// Verify HTTP Basic Auth header and return username if valid
