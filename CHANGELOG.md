@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.21...v0.3.22)
+
+## ✨ Features
+
+- **webmail**: add durable drafts, mailbox tools and undoable send ([bc6e2df](https://github.com/mail-os/mail/commit/bc6e2df)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.22 ([527b8d4](https://github.com/mail-os/mail/commit/527b8d4)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## Contributors
+
+- _Chris <chrisbreuer93@gmail.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.20...v0.3.21)
 
 ## 🐛 Bug Fixes
