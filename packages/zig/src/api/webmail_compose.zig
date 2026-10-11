@@ -66,6 +66,9 @@ pub const Message = struct {
     attachments: []const Attachment = &.{},
     /// Only drafts and the sender's private Sent copy retain Bcc headers.
     include_bcc: bool = false,
+    /// Mark a message the server wrote itself (RFC 3834), so vacation
+    /// responders and auto-forwarders do not answer it.
+    auto_submitted: bool = false,
 };
 
 pub const SendConfig = struct {
@@ -273,6 +276,7 @@ pub fn buildMime(allocator: std.mem.Allocator, msg: Message, ts: i64, msgid: []c
     try w.print("Message-ID: {s}\r\n", .{msgid});
     if (msg.in_reply_to.len > 0) try w.print("In-Reply-To: {s}\r\n", .{msg.in_reply_to});
     if (msg.references.len > 0) try w.print("References: {s}\r\n", .{msg.references});
+    if (msg.auto_submitted) try w.writeAll("Auto-Submitted: auto-generated\r\n");
     try w.writeAll("MIME-Version: 1.0\r\n");
 
     const has_attachments = msg.attachments.len > 0;
@@ -499,6 +503,18 @@ pub fn send(allocator: std.mem.Allocator, msg: Message, cfg: SendConfig) !SendRe
     }
 
     return .{ .message_id = msgid, .delivered = delivered, .failed = try failed.toOwnedSlice(allocator), .sent_saved = sent_saved };
+}
+
+/// Deliver a message the server writes on its own behalf (password reset
+/// links and account notices): the same local-or-remote path and DKIM signing
+/// as a composed message, with no Sent copy, because no mailbox sent it.
+pub fn deliverSystem(allocator: std.mem.Allocator, msg: Message, cfg: SendConfig) !void {
+    if (msg.to.len == 0) return ComposeError.NoRecipients;
+    const ts = time_compat.timestamp();
+    const seq = nameSeq.fetchAdd(1, .monotonic);
+    const msgid = try std.fmt.allocPrint(allocator, "<{d}.{d}@{s}>", .{ ts, seq, cfg.hostname });
+    const raw = try buildMime(allocator, msg, ts, msgid);
+    for (msg.to) |recipient| try deliverOne(allocator, cfg, msg.from, recipient, raw);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="referrer" content="no-referrer">
+  <title>Reset password — Mail</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<script client>
+import { newPasswordProblem, resetErrorMessage, tokenFromHash } from '../functions/recovery'
+// request: ask for a link · sent: asked · checking: reading a link
+// reset: choose a password · invalid: dead link · done: password changed
+const mode = state('request')
+const address = state('')
+const account = state('')
+const token = state('')
+const password = state('')
+const confirmation = state('')
+const busy = state(false)
+const error = state('')
+
+async function post(path, payload) {
+  const response = await fetch(path, {
+    method: 'POST', credentials: 'same-origin', cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+  const result = await response.json().catch(() => ({}))
+  return { ok: response.ok, status: response.status, result }
+}
+
+async function requestLink() {
+  if (busy()) return
+  error.set('')
+  if (!address().trim()) { error.set('Enter your mailbox address.'); return }
+  busy.set(true)
+  try {
+    const { ok, status } = await post('/webmail/auth/forgot', { address: address().trim() })
+    if (ok) { mode.set('sent'); return }
+    error.set(status === 429 ? 'Too many requests. Please wait a few minutes.' : status === 400 ? 'Enter your mailbox address.' : 'Something went wrong. Please try again.')
+  }
+  catch { error.set('Could not reach the server. Please try again.') }
+  finally { busy.set(false) }
+}
+
+async function checkLink() {
+  const found = tokenFromHash(useRoute().hash)
+  if (!found) return
+  token.set(found)
+  mode.set('checking')
+  try {
+    const { ok, status, result } = await post('/webmail/auth/reset/verify', { token: found })
+    if (ok) { account.set(result.account || ''); mode.set('reset'); return }
+    error.set(resetErrorMessage(status))
+    mode.set('invalid')
+  }
+  catch { error.set('Could not reach the server. Reload this page to try again.'); mode.set('invalid') }
+}
+
+async function choosePassword() {
+  if (busy()) return
+  error.set('')
+  const problem = newPasswordProblem(password(), confirmation())
+  if (problem) { error.set(problem); return }
+  busy.set(true)
+  try {
+    const { ok, status, result } = await post('/webmail/auth/reset', { token: token(), password: password() })
+    if (ok) { password.set(''); confirmation.set(''); account.set(result.account || account()); mode.set('done'); return }
+    error.set(resetErrorMessage(status, result.message || 'The password could not be changed. Please try again.'))
+    if (status === 400 && result.code === 'invalid_token') mode.set('invalid')
+  }
+  catch { error.set('Could not reach the server. Please try again.') }
+  finally { busy.set(false) }
+}
+
+function startOver() { error.set(''); token.set(''); mode.set('request') }
+
+onMount(checkLink)
+</script>
+<main class="login">
+  <div class="mb-4 font-semibold text-indigo-600 text-sm tracking-wide">MAIL</div>
+
+  <section :if="mode === 'request'">
+    <h1>Forgot your password?</h1>
+    <p class="login-sub">Enter your mailbox address. If it has a recovery address, we will email a reset link there.</p>
+    <form @submit.prevent="requestLink()">
+      <label for="address">Mailbox address</label>
+      <input id="address" type="text" x-model.trim="address" autocomplete="username" placeholder="you@example.com" required autofocus>
+      <p :if="error" :text="error" class="login-error" role="alert"></p>
+      <button type="submit" :disabled="busy" :text="busy ? 'Sending…' : 'Email me a reset link'"></button>
+    </form>
+  </section>
+
+  <section :if="mode === 'sent'">
+    <h1>Check your recovery inbox</h1>
+    <p class="login-sub" role="status">If <strong :text="address"></strong> has a recovery address, a reset link is on its way there. It works once and expires in 30 minutes.</p>
+    <p class="login-sub">Nothing after a few minutes? Check spam, or ask your mail administrator: the mailbox may have no recovery address.</p>
+  </section>
+
+  <section :if="mode === 'checking'">
+    <h1>Reset your password</h1>
+    <p class="login-sub" role="status">Checking your reset link…</p>
+  </section>
+
+  <section :if="mode === 'reset'">
+    <h1>Choose a new password</h1>
+    <p class="login-sub">For <strong :text="account"></strong>. It replaces the password in webmail and in your mail apps, and signs out every session.</p>
+    <form @submit.prevent="choosePassword()">
+      <input type="text" :value="account" autocomplete="username" hidden readonly>
+      <label for="newPassword">New password</label>
+      <input id="newPassword" type="password" x-model="password" autocomplete="new-password" minlength="12" required autofocus>
+      <label for="confirmPassword">Confirm password</label>
+      <input id="confirmPassword" type="password" x-model="confirmation" autocomplete="new-password" minlength="12" required>
+      <p :if="error" :text="error" class="login-error" role="alert"></p>
+      <button type="submit" :disabled="busy" :text="busy ? 'Saving…' : 'Set new password'"></button>
+    </form>
+  </section>
+
+  <section :if="mode === 'invalid'">
+    <h1>This link cannot be used</h1>
+    <p :text="error" class="login-error" role="alert"></p>
+    <button type="button" @click="startOver()">Ask for a new link</button>
+  </section>
+
+  <section :if="mode === 'done'">
+    <h1>Password changed</h1>
+    <p class="login-sub" role="status">Sign in to <strong :text="account"></strong> with your new password, and update it in your mail apps.</p>
+    <a class="login-link" href="/login">Sign in</a>
+  </section>
+
+  <p :if="mode !== 'done'" class="login-sub"><a class="login-link" href="/login">Back to sign in</a></p>
+  <noscript>JavaScript is required to reset your password.</noscript>
+</main>
+</body>
+</html>

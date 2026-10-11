@@ -352,6 +352,37 @@ pub const Database = struct {
         // not be bundled with the quota migration above).
         self.exec("ALTER TABLE users ADD COLUMN digest_ha1 TEXT;") catch {};
 
+        // Migration: a mailbox's recovery address, where a password reset link
+        // is sent. `recovery_source` records who set it ('operator' for the CLI
+        // and deploy provisioning, 'user' for the mailbox owner in webmail), so
+        // provisioning can leave an owner's own choice alone. One statement
+        // each: sqlite3_exec stops at the first error, and an existing column
+        // is that error.
+        self.exec("ALTER TABLE users ADD COLUMN recovery_email TEXT;") catch {};
+        self.exec("ALTER TABLE users ADD COLUMN recovery_source TEXT;") catch {};
+        self.exec("ALTER TABLE users ADD COLUMN recovery_updated_at INTEGER;") catch {};
+
+        // Single-use password reset tokens (see src/api/webmail_recovery.zig).
+        // Only the SHA-256 of a token is stored. Rows outlive their use for an
+        // hour so the per-mailbox send limit can count them.
+        //
+        // No foreign key to users(username), deliberately: a username is
+        // rewritten by `domain migrate` and by deploy-time username migrations,
+        // and a referencing row would make that UPDATE fail. deleteUser and
+        // renameDomain remove a mailbox's tokens explicitly instead.
+        try self.exec(
+            \\CREATE TABLE IF NOT EXISTS mailbox_reset_tokens (
+            \\    token_hash TEXT PRIMARY KEY,
+            \\    username TEXT NOT NULL,
+            \\    recovery_email TEXT NOT NULL,
+            \\    created_at INTEGER NOT NULL,
+            \\    expires_at INTEGER NOT NULL,
+            \\    used_at INTEGER,
+            \\    ip_address TEXT
+            \\);
+            \\CREATE INDEX IF NOT EXISTS idx_mailbox_reset_tokens_user ON mailbox_reset_tokens(username, created_at);
+        );
+
         // IMAP UID persistence tables
         try self.exec(
             \\CREATE TABLE IF NOT EXISTS imap_mailboxes (
@@ -621,6 +652,7 @@ pub const Database = struct {
         defer self.mutex.unlock();
 
         try self.deleteUserSessionsLocked(username);
+        try self.deleteUserResetTokensLocked(username);
 
         const sql = "DELETE FROM users WHERE username = ?1";
 
@@ -839,6 +871,23 @@ pub const Database = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.deleteUserSessionsLocked(username);
+    }
+
+    /// Void every password reset link for a mailbox. Called when its password
+    /// or recovery address changes, so an older link cannot outlive either.
+    pub fn deleteUserResetTokens(self: *Database, username: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.deleteUserResetTokensLocked(username);
+    }
+
+    fn deleteUserResetTokensLocked(self: *Database, username: []const u8) !void {
+        var raw: ?*sqlite.sqlite3_stmt = null;
+        if (sqlite.sqlite3_prepare_v2(self.db, "DELETE FROM mailbox_reset_tokens WHERE username = ?1", -1, &raw, null) != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
+        const stmt = Statement{ .stmt = raw.?, .allocator = self.allocator };
+        defer stmt.finalize();
+        try stmt.bind(1, username);
+        _ = try stmt.step();
     }
 
     fn deleteUserSessionsLocked(self: *Database, username: []const u8) !void {
@@ -1639,8 +1688,12 @@ pub const Database = struct {
             if (i == 0) moved = @intCast(sqlite.sqlite3_changes(self.db));
         }
 
-        {
-            const sql: [:0]const u8 = "DELETE FROM webmail_sessions WHERE username LIKE ?1 ESCAPE '\\'";
+        // Sessions and reset links carry the old address, so they are voided
+        // rather than rewritten. Both are cheap to obtain again.
+        for ([_][:0]const u8{
+            "DELETE FROM webmail_sessions WHERE username LIKE ?1 ESCAPE '\\'",
+            "DELETE FROM mailbox_reset_tokens WHERE username LIKE ?1 ESCAPE '\\'",
+        }) |sql| {
             var stmt: ?*sqlite.sqlite3_stmt = null;
             if (sqlite.sqlite3_prepare_v2(self.db, sql.ptr, -1, &stmt, null) != sqlite.SQLITE_OK)
                 return DatabaseError.PrepareFailed;

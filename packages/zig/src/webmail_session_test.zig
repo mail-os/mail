@@ -14,4 +14,5 @@ test {
     std.testing.refAllDecls(@import("api/webmail_threads.zig"));
     std.testing.refAllDecls(@import("api/webmail_service.zig"));
     std.testing.refAllDecls(@import("api/webmail_service_test.zig"));
+    std.testing.refAllDecls(@import("api/webmail_recovery.zig"));
 }

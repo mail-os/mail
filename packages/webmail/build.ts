@@ -13,7 +13,7 @@ export async function buildWebmail(): Promise<void> {
   const dist = join(root, '../zig/src/api/webmail_dist')
   const styles = await readFile(join(root, 'public/styles.css'))
   await mkdir(dist, { recursive: true })
-  for (const page of ['index', 'login']) {
+  for (const page of ['index', 'login', 'recover']) {
     const html = await renderTemplate(join(root, `pages/${page}.stx`), { injectCSS: true })
     if (!html.includes('data-stx') || html.includes('<script client>'))
       throw new Error(`STX did not compile ${page}`)

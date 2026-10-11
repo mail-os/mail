@@ -360,6 +360,8 @@ pub const AuthBackend = struct {
         // Administrative resets and webmail changes have the same session
         // boundary: an old authenticated browser must sign in again.
         try self.db.deleteUserWebmailSessions(username);
+        // A reset link requested before this change must not undo it.
+        try self.db.deleteUserResetTokens(username);
     }
 
     /// Verify HTTP Basic Auth header and return username if valid

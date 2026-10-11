@@ -4,6 +4,7 @@ const user_cli = @import("../user_cli.zig");
 const database = @import("../storage/database.zig");
 const auth = @import("../auth/auth.zig");
 const env = @import("../core/env.zig");
+const recovery = @import("../api/webmail_recovery.zig");
 
 fn withDb(comptime action: fn (*cli.BaseCommand.ParseContext, *database.Database, *auth.AuthBackend) anyerror!void) cli.BaseCommand.CommandAction {
     return struct {
@@ -130,6 +131,29 @@ fn changePasswordAction(ctx: *cli.BaseCommand.ParseContext, _: *database.Databas
     try user_cli.changePassword(auth_backend, username, password);
 }
 
+fn recoveryAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Database, _: *auth.AuthBackend) !void {
+    const usage = "Usage: mail user:local recovery <username> [<address>] [--policy initial|managed] [--clear]\n";
+    const username = ctx.getArgument(0) orelse {
+        std.debug.print("Error: username is required\n{s}", .{usage});
+        return error.MissingArgument;
+    };
+    const address = ctx.getArgument(1);
+    if (ctx.hasOption("clear")) {
+        if (address != null) {
+            std.debug.print("Error: give an address or --clear, not both\n{s}", .{usage});
+            return error.InvalidArgument;
+        }
+        return user_cli.recoveryCommand(db, ctx.allocator, username, .clear);
+    }
+    const wanted = address orelse return user_cli.recoveryCommand(db, ctx.allocator, username, .show);
+    const policy_name = ctx.getOption("policy") orelse "managed";
+    const policy = recovery.Policy.parse(policy_name) orelse {
+        std.debug.print("Error: --policy must be 'initial' or 'managed'\n{s}", .{usage});
+        return error.InvalidArgument;
+    };
+    return user_cli.recoveryCommand(db, ctx.allocator, username, .{ .apply = .{ .address = wanted, .policy = policy } });
+}
+
 pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     const cmd = try cli.BaseCommand.init(allocator, "user:local", "Local user management (direct DB access)");
 
@@ -189,6 +213,19 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     );
     _ = change_pw_cmd.setAction(withDb(changePasswordAction));
     _ = try cmd.addCommand(change_pw_cmd);
+
+    // recovery
+    const recovery_cmd = try cli.BaseCommand.init(allocator, "recovery", "Show, set or clear a mailbox's password recovery address");
+    _ = try recovery_cmd.addArgument(cli.Argument.init("username", "Mailbox (full address)", .string));
+    _ = try recovery_cmd.addArgument(cli.Argument.init("address", "Recovery address to set (omit to show the current one)", .string).withRequired(false));
+    _ = try recovery_cmd.addOption(
+        cli.Option.init("policy", "policy", "managed (default): always set it; initial: keep an address the mailbox owner set in webmail", .string),
+    );
+    _ = try recovery_cmd.addOption(
+        cli.Option.init("clear", "clear", "Remove the recovery address", .bool),
+    );
+    _ = recovery_cmd.setAction(withDb(recoveryAction));
+    _ = try cmd.addCommand(recovery_cmd);
 
     return cmd;
 }
