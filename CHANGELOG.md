@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.24...v0.3.25)
+
+## 🐛 Bug Fixes
+
+- **webmail**: track forwarded attachments during loading and retry ([78d044d](https://github.com/mail-os/mail/commit/78d044d)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## 🔧 Chores
+
+- release v0.3.25 ([7cce538](https://github.com/mail-os/mail/commit/7cce538)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## Contributors
+
+- _Chris <chrisbreuer93@gmail.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.23...v0.3.24)
 
 ## 🐛 Bug Fixes
