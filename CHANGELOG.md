@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.23...v0.3.24)
+
+## 🐛 Bug Fixes
+
+- **webmail**: frame MIME attachments and clear sent draft readers ([3d14d8c](https://github.com/mail-os/mail/commit/3d14d8c)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## 🔧 Chores
+
+- release v0.3.24 ([d13c30c](https://github.com/mail-os/mail/commit/d13c30c)) _(by Chris <chrisbreuer93@gmail.com>)_
+
+## Contributors
+
+- _Chris <chrisbreuer93@gmail.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.22...v0.3.23)
 
 ## ✅ Tests
