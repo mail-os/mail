@@ -302,6 +302,10 @@ pub fn buildMime(allocator: std.mem.Allocator, msg: Message, ts: i64, msgid: []c
         // First part: the body (alternative if html present, else plain).
         try w.print("--{s}\r\n", .{boundary});
         try writeBodyPart(allocator, &out, msg, alt_boundary);
+        // RFC 2046 delimiters begin on a new line, including when a plain
+        // text body has no trailing newline. Otherwise a standards parser
+        // treats the attachment headers and data as part of the text body.
+        try w.writeAll("\r\n");
         // Attachment parts.
         for (msg.attachments) |att| {
             if (!isSafeHeaderValue(att.filename) or !isSafeHeaderValue(att.content_type)) return ComposeError.InvalidHeader;
@@ -548,6 +552,37 @@ test "uniqueBoundary avoids a boundary present in the body" {
     // Build a body that literally contains the boundary; the next call must differ.
     const b2 = try uniqueBoundary(a, &.{ b, b });
     try t.expect(!std.mem.eql(u8, b, b2));
+}
+
+test "multipart attachment delimiters start on complete MIME lines" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "No trailing newline", "First line\nLast line", "Caf\u{00E9}" }) |text| {
+        const raw = try buildMime(a, .{
+            .from = "sender@unit.test",
+            .to = &.{"recipient@unit.test"},
+            .text_body = text,
+            .attachments = &.{.{ .filename = "fixture.bin", .content_type = "application/octet-stream", .data = &.{ 0, 1, 255 } }},
+        }, 1, "<mime@unit.test>");
+        const marker = "boundary=\"";
+        const start = std.mem.indexOf(u8, raw, marker).? + marker.len;
+        const end = start + std.mem.indexOfScalar(u8, raw[start..], '"').?;
+        const delimiter = try std.fmt.allocPrint(a, "--{s}", .{raw[start..end]});
+        var offset: usize = 0;
+        var count: usize = 0;
+        while (std.mem.indexOfPos(u8, raw, offset, delimiter)) |position| {
+            try t.expect(position >= 2);
+            try t.expectEqualStrings("\r\n", raw[position - 2 .. position]);
+            const suffix = raw[position + delimiter.len ..][0..2];
+            try t.expect(std.mem.eql(u8, suffix, "\r\n") or std.mem.eql(u8, suffix, "--"));
+            offset = position + delimiter.len;
+            count += 1;
+        }
+        try t.expectEqual(@as(usize, 3), count);
+        try t.expect(std.mem.indexOf(u8, raw, "Content-Disposition: attachment; filename=\"fixture.bin\"") != null);
+    }
 }
 
 test "formatDate produces RFC5322 shape" {

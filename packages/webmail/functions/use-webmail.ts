@@ -396,6 +396,10 @@ export function useWebmail(ports: WebmailPorts) {
     try { await api('/webmail/api/preferences', { method: 'PUT', body: JSON.stringify({ undoSendSeconds: sendDelay() }) }) }
     catch (cause) { composeError.set(errorMessage(cause)) }
   }
+  function closeQueuedDraft(payload: ComposePayload): void {
+    const message = selected()
+    if (message?.folder === 'Drafts' && message.uid === payload.draftUid) closeReader()
+  }
   async function send(): Promise<void> {
     if (sending() || sendUncertain() || attachmentEditor.attachmentPending()) return
     composeError.set('')
@@ -419,6 +423,7 @@ export function useWebmail(ports: WebmailPorts) {
         catch { sendUncertain.set(true); throw new Error('Could not confirm the send. Check its status before editing or retrying.') }
       }
       pendingSend.set(queued)
+      closeQueuedDraft(payload)
       clockOffset = queued.serverTime - Date.now() / 1000
       now.set(Date.now() / 1000 + clockOffset)
       notice.set(queued.state === 'pending' && queued.dueAt > queued.serverTime ? `Message queued. Undo Send is available for ${queued.dueAt - queued.serverTime} seconds.` : 'Message queued for delivery.')
@@ -447,6 +452,7 @@ export function useWebmail(ports: WebmailPorts) {
         item = await api<OutboxItem>('/webmail/api/compose', { method: 'POST', body: JSON.stringify(payload) })
       }
       pendingSend.set(item)
+      closeQueuedDraft(payload)
       resetComposition()
       notice.set('Send status confirmed. Check Outbox for its delivery result.')
       await refreshOutbox()
