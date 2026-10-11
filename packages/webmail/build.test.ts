@@ -9,13 +9,13 @@ test('deployments fingerprint styles so existing browsers fetch updated controls
   expect(stylesheetUrl(first)).toBe(stylesheetUrl(first))
   expect(stylesheetUrl(first)).not.toBe(stylesheetUrl(second))
   await buildWebmail()
-  for (const page of ['index', 'login']) {
+  for (const page of ['index', 'login', 'recover']) {
     const html = await Bun.file(join(import.meta.dir, `../zig/src/api/webmail_dist/${page}.html`)).text()
     expect(html).toMatch(/href="\/styles\.css\?v=[0-9a-f]{16}"/)
   }
 })
 
-for (const page of ['login', 'index']) {
+for (const page of ['login', 'index', 'recover']) {
   test(`${page} compiles with STX bindings and a self-contained runtime`, async () => {
     const path = join(import.meta.dir, `pages/${page}.stx`)
     const source = await Bun.file(path).text()
@@ -31,6 +31,14 @@ for (const page of ['login', 'index']) {
     if (page === 'index') {
       expect(html).toContain('sandbox=""')
       expect(html).toContain('/webmail/auth/password')
+      expect(html).toContain('/webmail/auth/recovery')
+    }
+    if (page === 'login')
+      expect(html).toContain('href="/forgot"')
+    if (page === 'recover') {
+      expect(html).toContain('/webmail/auth/forgot')
+      expect(html).toContain('/webmail/auth/reset/verify')
+      expect(html).toContain('/webmail/auth/reset')
     }
   })
 }

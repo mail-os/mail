@@ -42,6 +42,7 @@ async function signIn() {
     <p :if="error" :text="error" class="login-error" role="alert"></p>
     <button type="submit" :disabled="busy" :text="busy ? 'Signing in…' : 'Sign in'"></button>
   </form>
+  <p class="login-forgot"><a class="login-link" href="/forgot">Forgot password?</a></p>
   <noscript>JavaScript is required to use webmail.</noscript>
 </main>
 </body>

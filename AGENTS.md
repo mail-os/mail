@@ -208,6 +208,7 @@ Test binaries link against `sqlite3` system library. The argon2 password tests u
 ## Common Tasks
 
 - **Add a user**: `mail-server user add <email> <password>` (on server)
+- **Recovery address** (where "Forgot password?" sends the reset link): `mail-server user:local recovery <mailbox> [<address>] [--policy initial|managed] [--clear]`; see WEBMAIL.md "Password recovery"
 - **Check service**: `systemctl status mail` (on server via SSM)
 - **View IMAP logs**: `journalctl -u mail | grep IMAP`
 - **Backup**: `mail-server backup create` → S3 bucket `stacks-production-s3-backups`

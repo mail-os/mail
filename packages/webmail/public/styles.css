@@ -56,6 +56,12 @@ body {
   cursor: pointer;
 }
 .login button:disabled { opacity: 0.6; cursor: default; }
+.login-link { color: var(--accent); font-weight: 600; text-decoration: none; }
+.login-link:hover, .login-link:focus-visible { text-decoration: underline; }
+.login-forgot { margin: 14px 0 0; text-align: center; font-size: 13px; }
+.login .login-secondary { background: transparent; color: var(--accent); border: 1px solid var(--border); margin-top: 10px; }
+.login-recovery { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--border); }
+.login-recovery h2 { margin: 0 0 4px; font-size: 16px; }
 .login-error {
   margin: 12px 0 0;
   color: #c0392b;

@@ -5,6 +5,7 @@ import { dateBoundary, folderName, fullDate, messageKey, rangeSelection, readabl
 import { useAttachments } from './use-attachments'
 import { useDraftAutosave } from './use-draft-autosave'
 import { useRecipientEditor } from './use-recipient-editor'
+import { useRecoverySettings } from './use-recovery-settings'
 
 interface Ref<T> { current: T | null }
 export interface WebmailPorts {
@@ -110,6 +111,7 @@ export function useWebmail(ports: WebmailPorts) {
   }
   const api = createMailApi(() => user()?.username, onAuthError)
   const recipientEditor = useRecipientEditor(value => api<Contact[]>(`/webmail/api/contacts?q=${encodeURIComponent(value)}`))
+  const recoverySettings = useRecoverySettings(api, () => user()?.username || '')
   const attachmentEditor = useAttachments(() => user()?.username, limits, cause => { if (cause instanceof MailApiError && cause.status === 401) onAuthError(cause) }, id => api(`/webmail/api/uploads/${id}`, { method: 'DELETE' }))
   const hasComposition = derived(() => Boolean(subject() || body() || draftHtml() || attachmentEditor.attachments().length || recipientEditor.toRecipients().length || recipientEditor.ccRecipients().length || recipientEditor.bccRecipients().length || recipientEditor.toInput() || recipientEditor.ccInput() || recipientEditor.bccInput()))
   function content() {
@@ -547,7 +549,7 @@ export function useWebmail(ports: WebmailPorts) {
     try { if (hasComposition()) await draft.flushAll(); await api('/webmail/auth/logout', { method: 'POST', body: '{}' }); resetComposition(); ports.navigate('/login', { reload: true }) }
     catch (cause) { error.set(errorMessage(cause)) }
   }
-  function showSettings(): void { settings.set(true); passwordError.set(''); ports.nextTick(() => { if (!ports.password.current?.open) ports.password.current?.showModal() }) }
+  function showSettings(): void { settings.set(true); passwordError.set(''); void recoverySettings.loadRecovery(); ports.nextTick(() => { if (!ports.password.current?.open) ports.password.current?.showModal() }) }
   async function changePassword(): Promise<void> {
     if (savingPassword()) return
     passwordError.set('')
@@ -604,7 +606,7 @@ export function useWebmail(ports: WebmailPorts) {
   }
   function preventUnload(event: BeforeUnloadEvent): void { if (hasUnsavedChanges()) { event.preventDefault(); event.returnValue = '' } }
   function destroy(): void { destroyed = true; ++listRequest; ++messageRequest; recipientEditor.destroy(); attachmentEditor.destroy(); draft.destroy(); selectionEffect() }
-  return { user, folders, folder, messages, threads, expandedThreads, selected, loading, reading, readingLoading, mutating, error, notice, query, activeQuery, searchAll, filterSender, filterAfter, filterBefore, filterUnread, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, checked, checkedKeys, selectedCount, allChecked, someChecked, undoAction, undoRemaining, pendingSend, sendRemaining, outbox, outboxCount, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...recipientEditor, ...attachmentEditor, refresh, loadMessages, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread, toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openMessage, closeReader, bulkAction, selectedAction, undoLastAction, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments, saveSendPreference, send, confirmPendingSend, showOutbox, refreshOutbox, cancelSend, retryOutbox, signOut, showSettings, changePassword, showConfirmation, confirmAction, saveDraftCopy: draft.saveCopy, mount, resume, tick, preventUnload, destroy, messageKey, folderName, shortDate, fullDate, readableBytes, safeHtml, attachmentPath }
+  return { user, folders, folder, messages, threads, expandedThreads, selected, loading, reading, readingLoading, mutating, error, notice, query, activeQuery, searchAll, filterSender, filterAfter, filterBefore, filterUnread, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, checked, checkedKeys, selectedCount, allChecked, someChecked, undoAction, undoRemaining, pendingSend, sendRemaining, outbox, outboxCount, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...recipientEditor, ...attachmentEditor, ...recoverySettings, refresh, loadMessages, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread, toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openMessage, closeReader, bulkAction, selectedAction, undoLastAction, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments, saveSendPreference, send, confirmPendingSend, showOutbox, refreshOutbox, cancelSend, retryOutbox, signOut, showSettings, changePassword, showConfirmation, confirmAction, saveDraftCopy: draft.saveCopy, mount, resume, tick, preventUnload, destroy, messageKey, folderName, shortDate, fullDate, readableBytes, safeHtml, attachmentPath }
 }
 
 function errorMessage(cause: unknown): string { return cause instanceof Error ? cause.message : 'Something went wrong. Please try again.' }

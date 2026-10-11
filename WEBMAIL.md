@@ -30,6 +30,46 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   Outbox records delivery results. A partial retry contains only failed recipients.
   Interrupted dispatch is marked Unknown and requires review before a manual retry.
 
+## Password recovery
+
+Each mailbox may have one recovery address outside itself. "Forgot password?"
+on the sign-in page (`/forgot`) asks for the mailbox address and always answers
+the same way, whether or not the mailbox exists or has a recovery address. When
+it does, the server mails a reset link to the recovery address, from
+`no-reply@<mailbox domain>` through the normal delivery path, so the message is
+DKIM-signed with that domain's key. The link (`/reset#token=...`) works once,
+expires after 30 minutes, and carries its token in the fragment so it never
+reaches a server or gateway log. Setting the new password signs out every
+session and tells the recovery address that the password was reset.
+
+Limits: at most 3 links per mailbox per hour and one per minute (counted in the
+database, so a restart does not reset them), plus a per-IP limit on requests and
+on token attempts. A link is voided by a newer one, by any password change and
+by any change of the recovery address. Only a token's SHA-256 is stored
+(`mailbox_reset_tokens`).
+
+Links point at `mail.<mailbox domain>` or the server hostname when the request
+came in on one of those names, and at `SMTP_HOSTNAME` otherwise. The request's
+Host header alone is never trusted, because a link built from it would carry the
+token to whichever server the requester named.
+
+Signed-in users see and change their recovery address under Account; saving
+asks for the mailbox password again, and the previous address is notified.
+Operators and deploy provisioning use the CLI:
+
+```bash
+mail user:local recovery pawel@example.com                               # show
+mail user:local recovery pawel@example.com pawel@elsewhere.example       # set (policy managed)
+mail user:local recovery pawel@example.com pawel@elsewhere.example --policy initial
+mail user:local recovery pawel@example.com --clear
+```
+
+`users.recovery_source` records who set the address: `operator` (CLI) or
+`user` (webmail). `--policy initial` sets it unless the owner has set or cleared
+their own; `--policy managed` always sets it. The command prints one
+`Recovery: updated|unchanged|kept|cleared` line and exits non-zero for an
+unknown mailbox or an unusable address.
+
 ## Configuration
 
 Declare `infrastructure.compute.managedServices.mail.webmail` in a ts-cloud
@@ -80,6 +120,14 @@ revokes existing webmail sessions.
   `delaySeconds` controls the hold. Replaying the same ID cannot dispatch twice.
   `GET /webmail/api/outbox` exposes results; `DELETE /webmail/api/outbox/:id`
   cancels a pending send. A reviewed Unknown record may be resolved explicitly.
+- `POST /webmail/auth/forgot` `{address}` always returns `{ok:true}` (429 when
+  the IP is over its limit). `POST /webmail/auth/reset/verify` `{token}` returns
+  `{account}` without spending the token; `POST /webmail/auth/reset`
+  `{token,password}` spends it and sets the password. A dead token is 400
+  `invalid_token`. These three need no session but must be same-origin.
+- `GET /webmail/auth/recovery` returns `{recovery, setBy}`;
+  `PUT /webmail/auth/recovery` `{currentPassword, recovery}` changes it, and an
+  empty `recovery` removes it.
 - Existing immediate-compose and message endpoints remain compatible with the
   native SDK and older clients. New clients use the durable draft and queue APIs.
 
