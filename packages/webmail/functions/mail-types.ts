@@ -37,7 +37,7 @@ export interface ComposeAttachment extends Partial<Upload> {
   contentType: string
   size: number
   progress: number
-  status: 'uploading' | 'ready' | 'failed'
+  status: 'uploading' | 'loading' | 'ready' | 'failed'
   error?: string
 }
 export interface ComposePayload {

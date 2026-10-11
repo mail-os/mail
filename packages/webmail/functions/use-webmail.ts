@@ -118,6 +118,7 @@ export function useWebmail(ports: WebmailPorts) {
   const draft = useDraftAutosave({ snapshot: content, hasContent: hasComposition, active: () => composing() && !sending(), blocked: () => attachmentEditor.attachmentPending() || authExpired(), save: payload => api<DraftAck>('/webmail/api/drafts', { method: 'POST', body: JSON.stringify(payload) }) })
   const hasUnsavedChanges = derived(() => draft.dirty() || attachmentEditor.attachmentPending())
   const saveStatus = derived(() => {
+    if (attachmentEditor.attachments().some(item => item.status === 'loading')) return 'Loading forwarded attachments…'
     if (attachmentEditor.attachmentUploading()) return 'Uploading attachments…'
     if (attachmentEditor.attachmentPending()) return 'An attachment needs attention.'
     if (draft.status() === 'saved') return 'Saved to Drafts'
@@ -326,13 +327,14 @@ export function useWebmail(ports: WebmailPorts) {
   }
   async function importAttachments(message: MessageDetail): Promise<void> {
     try {
-      for (let index = 0; index < message.attachments.length; index++) {
-        const item = message.attachments[index]
-        if (item.size > limits().maxFileBytes || attachmentEditor.attachmentBytes() + item.size > limits().maxTotalBytes) throw new Error('This message has an attachment above your current limit. Forward the text or download the attachment separately.')
-        const response = await fetch(attachmentPath(index, message), { credentials: 'same-origin', cache: 'no-store' })
-        if (!response.ok) throw new Error('Could not load an attachment from this message.')
-        await attachmentEditor.addFiles([new File([await response.arrayBuffer()], item.filename, { type: item.content_type })])
-      }
+      await attachmentEditor.addRemoteFiles(message.attachments.map((item, index) => ({
+        filename: item.filename, contentType: item.content_type, size: item.size,
+        read: async (signal: AbortSignal) => {
+          const response = await fetch(attachmentPath(index, message), { credentials: 'same-origin', cache: 'no-store', signal })
+          if (!response.ok) throw new Error('Could not load an attachment from this message. Retry it or remove it to send without it.')
+          return new File([await response.arrayBuffer()], item.filename, { type: item.content_type })
+        },
+      })))
     }
     catch (cause) { composeError.set(errorMessage(cause)) }
   }
