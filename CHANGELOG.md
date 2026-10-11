@@ -1,5 +1,19 @@
 # Changelog
 
+[Compare changes](https://github.com/mail-os/mail/compare/v0.3.25...v0.3.26)
+
+## ✨ Features
+
+- mailbox recovery addresses and password reset by email ([bb763e5](https://github.com/mail-os/mail/commit/bb763e5)) _(by Chris <chris@stacksjs.com>)_
+
+## 🔧 Chores
+
+- release v0.3.26 ([685ac06](https://github.com/mail-os/mail/commit/685ac06)) _(by Chris <chris@stacksjs.com>)_
+
+## Contributors
+
+- _Chris <chris@stacksjs.com>_
+
 [Compare changes](https://github.com/mail-os/mail/compare/v0.3.24...v0.3.25)
 
 ## 🐛 Bug Fixes
