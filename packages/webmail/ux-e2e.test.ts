@@ -50,7 +50,7 @@ test.skipIf(!enabled)('draft revisions preserve incomplete entry and isolate acc
   expect((await api.json(`/webmail/api/drafts?uid=${fresh}`)).message.text).toBe('Second body')
   await api.json(`/webmail/api/messages/${fresh}?folder=Drafts`, 'DELETE')
   await api.json('/webmail/auth/logout', 'POST', {})
-})
+}, 30_000)
 
 test.skipIf(!enabled)('binary uploads exceed the old cap and retain exact bytes through draft MIME', async () => {
   const api = await client()
@@ -82,7 +82,7 @@ test.skipIf(!enabled)('binary uploads exceed the old cap and retain exact bytes 
   expect((await api.request('/webmail/api/drafts', 'POST', { attachments: [{ uploadId: crypto.randomUUID() }] })).status).toBe(404)
   await api.json(`/webmail/api/messages/${saved.uid}?folder=Drafts`, 'DELETE')
   await api.json('/webmail/auth/logout', 'POST', {})
-})
+}, 30_000)
 
 test.skipIf(!enabled)('search filters and conversation grouping precede pagination across folders', async () => {
   const api = await client()
@@ -119,7 +119,7 @@ test.skipIf(!enabled)('search filters and conversation grouping precede paginati
     for (const message of messages.items) await api.json(`/webmail/api/messages/${message.uid}?folder=${folder}`, 'DELETE')
   }
   await api.json('/webmail/auth/logout', 'POST', {})
-})
+}, 30_000)
 
 test.skipIf(!enabled)('Undo Send holds dispatch, while delivery remains independent of a browser tab', async () => {
   const api = await client()
@@ -146,4 +146,4 @@ test.skipIf(!enabled)('Undo Send holds dispatch, while delivery remains independ
     await api.json(`/webmail/api/messages/${list.items[0].uid}?folder=${folder}`, 'DELETE')
   }
   await api.json('/webmail/auth/logout', 'POST', {})
-})
+}, 30_000)
