@@ -54,6 +54,7 @@ zig-pkg/
 pantry
 
 # Bun / workspace tooling
+/.stx/
 node_modules/
 packages/ts/dist/
 packages/ts/bin/

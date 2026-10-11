@@ -164,6 +164,12 @@ pub const Statement = struct {
         }
     }
 
+    pub fn bindBlob(self: Statement, index: usize, bytes: []const u8) !void {
+        // SQLITE_TRANSIENT asks SQLite to own a copy after this call returns.
+        const bind_blob: *const fn (?*sqlite.sqlite3_stmt, c_int, ?*const anyopaque, c_int, ?*const anyopaque) callconv(.c) c_int = @extern(*const fn (?*sqlite.sqlite3_stmt, c_int, ?*const anyopaque, c_int, ?*const anyopaque) callconv(.c) c_int, .{ .name = "sqlite3_bind_blob" });
+        try checkBind(bind_blob(self.stmt, @intCast(index), bytes.ptr, @intCast(bytes.len), SQLITE_TRANSIENT_PTR));
+    }
+
     /// Bind optional value - NULL if none
     pub fn bindOpt(self: Statement, index: usize, value: anytype) !void {
         const T = @TypeOf(value);
@@ -614,6 +620,8 @@ pub const Database = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        try self.deleteUserSessionsLocked(username);
+
         const sql = "DELETE FROM users WHERE username = ?1";
 
         const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
@@ -830,6 +838,10 @@ pub const Database = struct {
     pub fn deleteUserWebmailSessions(self: *Database, username: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        return self.deleteUserSessionsLocked(username);
+    }
+
+    fn deleteUserSessionsLocked(self: *Database, username: []const u8) !void {
         var raw: ?*sqlite.sqlite3_stmt = null;
         if (sqlite.sqlite3_prepare_v2(self.db, "DELETE FROM webmail_sessions WHERE username = ?1", -1, &raw, null) != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
         const stmt = Statement{ .stmt = raw.?, .allocator = self.allocator };
@@ -865,6 +877,8 @@ pub const Database = struct {
     pub fn setUserEnabled(self: *Database, username: []const u8, enabled: bool) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        if (!enabled) try self.deleteUserSessionsLocked(username);
 
         const sql =
             \\UPDATE users
@@ -1877,6 +1891,25 @@ pub const Database = struct {
     fn assignUidInTxn(self: *Database, username: []const u8, mailbox: []const u8, filename: []const u8) !i64 {
         // Key on the flag-suffix-stripped base name (see maildirBaseName).
         const base = maildirBaseName(filename);
+
+        // UID allocation owns its parent invariant. Callers must not be able to
+        // mint UID 1 repeatedly merely because a folder has not been selected
+        // over IMAP yet. Existing mappings also bound UIDNEXT from below.
+        {
+            const sql: [:0]const u8 =
+                \\INSERT INTO imap_mailboxes(username,mailbox,uidvalidity,uidnext)
+                \\VALUES(?1,?2,?3,(SELECT COALESCE(MAX(uid),0)+1 FROM imap_uids WHERE username=?1 AND mailbox=?2))
+                \\ON CONFLICT(username,mailbox) DO UPDATE SET uidnext=MAX(imap_mailboxes.uidnext,excluded.uidnext)
+            ;
+            var raw: ?*sqlite.sqlite3_stmt = null;
+            if (sqlite.sqlite3_prepare_v2(self.db, sql.ptr, -1, &raw, null) != sqlite.SQLITE_OK) return DatabaseError.PrepareFailed;
+            const statement = Statement{ .stmt = raw.?, .allocator = self.allocator };
+            defer statement.finalize();
+            try statement.bind(1, username);
+            try statement.bind(2, mailbox);
+            try statement.bind(3, time_compat.timestamp());
+            _ = try statement.step();
+        }
 
         // Get current uidnext
         var uidnext: i64 = 1;

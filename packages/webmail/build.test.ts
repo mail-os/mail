@@ -19,7 +19,9 @@ for (const page of ['login', 'index']) {
   test(`${page} compiles with STX bindings and a self-contained runtime`, async () => {
     const path = join(import.meta.dir, `pages/${page}.stx`)
     const source = await Bun.file(path).text()
-    expect(source).not.toMatch(/\b(?:document|window)\./)
+    const clientScript = source.match(/<script client>([\s\S]*?)<\/script>/)?.[1]
+    expect(clientScript).toBeDefined()
+    expect(clientScript).not.toMatch(/\b(?:document|window)\./)
     const html = await renderTemplate(path, { injectCSS: true })
     expect(html).toContain('data-stx')
     expect(html).toContain('data-stx-runtime')

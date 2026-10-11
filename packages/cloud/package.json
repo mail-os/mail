@@ -41,7 +41,7 @@
     "cloudformation"
   ],
   "dependencies": {
-    "@stacksjs/ts-cloud": "0.16.50"
+    "@stacksjs/ts-cloud": "0.16.51"
   },
   "devDependencies": {
     "better-dx": "^0.2.23"

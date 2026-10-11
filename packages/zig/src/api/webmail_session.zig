@@ -283,11 +283,11 @@ test "sessions are revoked when an account is disabled or deleted" {
     var disabled = try manager.login("lifecycle@example.com", "test-password", null, null);
     defer disabled.deinit(t.allocator);
     try db.setUserEnabled(disabled.username, false);
-    try t.expectError(SessionError.SessionNotFound, manager.validate(disabled.session_id));
     try db.setUserEnabled(disabled.username, true);
     try t.expectError(SessionError.SessionNotFound, manager.validate(disabled.session_id));
     var deleted = try manager.login("lifecycle@example.com", "test-password", null, null);
     defer deleted.deinit(t.allocator);
     try db.deleteUser(deleted.username);
+    _ = try auth.createUser("lifecycle@example.com", "new-password", "lifecycle@example.com");
     try t.expectError(SessionError.SessionNotFound, manager.validate(deleted.session_id));
 }

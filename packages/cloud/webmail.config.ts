@@ -15,6 +15,12 @@ export default {
             port: Number(process.env.WEBMAIL_PORT || 8099),
             domain: process.env.WEBMAIL_DOMAIN || process.env.DOMAIN_NAME || 'mail.stacksjs.com',
             aliases: (process.env.WEBMAIL_ALIASES ?? 'mail.hq.training').split(',').map(value => value.trim()).filter(Boolean),
+            attachments: {
+              maxFileBytes: Number(process.env.WEBMAIL_ATTACHMENT_MAX_FILE || 20 * 1024 * 1024),
+              maxTotalBytes: Number(process.env.WEBMAIL_ATTACHMENT_MAX_TOTAL || 20 * 1024 * 1024),
+              maxCount: Number(process.env.WEBMAIL_ATTACHMENT_MAX_COUNT ?? 20),
+            },
+            undoSendSeconds: Number(process.env.WEBMAIL_UNDO_SEND_SECONDS ?? 10),
           },
         },
       },

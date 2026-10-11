@@ -8,431 +8,161 @@
 </head>
 <body>
 <script client>
-const user = state(null)
-const folders = state([])
-const folder = state('INBOX')
-const messages = state([])
-const selected = state(null)
-const loading = state(false)
-const reading = state(false)
-const readingLoading = state(false)
-const mutating = state(false)
-const error = state('')
-const notice = state('')
-const query = state('')
-const activeQuery = state('')
-const page = state(1)
-const total = state(0)
-const moveTo = state('Archive')
-const showHtml = state(true)
-const composing = state(false)
-const title = state('New message')
-const to = state('')
-const cc = state('')
-const bcc = state('')
-const subject = state('')
-const body = state('')
-const draftHtml = state('')
-const draftInitialText = state('')
-const inReplyTo = state('')
-const references = state('')
-const attachments = state([])
-const draftUid = state(null)
-const replyContext = state(null)
-const hasComposition = derived(() => !!(to() || cc() || bcc() || subject() || body() || draftHtml() || attachments().length))
-const sending = state(false)
-const savingDraft = state(false)
-const attaching = state(false)
-const composeError = state('')
-const settings = state(false)
-const currentPassword = state('')
-const newPassword = state('')
-const confirmPassword = state('')
-const passwordError = state('')
-const saving = state(false)
-const confirmation = state('')
-const confirming = state(false)
-const composerDialog = useRef('composerDialog')
-const passwordDialog = useRef('passwordDialog')
-const confirmDialog = useRef('confirmDialog')
-const fileInput = useRef('fileInput')
-let listRequest = 0
-let messageRequest = 0
-async function api(path, options = {}) {
-  const response = await fetch(path, { credentials: 'same-origin', ...options })
-  if (response.status === 401) { navigate('/login', { reload: true }); throw new Error('Please sign in again.') }
-  if (!response.ok) {
-    const result = await response.json().catch(() => ({}))
-    throw new Error(result.message || 'The request failed. Please try again.')
-  }
-  return response.json()
-}
-function messagePath(uid, name = folder()) { return '/webmail/api/messages/' + uid + '?folder=' + encodeURIComponent(name) }
-function attachmentPath(index, uid = selected()?.uid, name = folder()) { return '/webmail/api/attachment?uid=' + uid + '&folder=' + encodeURIComponent(name) + '&index=' + index }
-async function loadFolders() { folders.set(await api('/webmail/api/folders')) }
-async function loadMessages(quiet = false) {
-  const request = ++listRequest
-  const activeFolder = folder()
-  if (!quiet) { loading.set(true); messages.set([]) }
-  error.set('')
-  try {
-    const result = await api('/webmail/api/messages?folder=' + encodeURIComponent(activeFolder) + '&page=' + page() + '&per_page=50&q=' + encodeURIComponent(activeQuery()))
-    if (request !== listRequest) return
-    const last = Math.max(1, Math.ceil(result.total / 50))
-    if (page() > last) { page.set(last); await loadMessages(quiet); return }
-    messages.set(result.items || []); total.set(result.total || 0)
-    const current = selected()
-    const summary = (result.items || []).find(item => item.uid === current?.uid)
-    if (summary && folder() === activeFolder) selected.set({ ...current, flags: summary.flags })
-  }
-  catch (cause) { if (request === listRequest) error.set(cause.message) }
-  finally { if (request === listRequest) loading.set(false) }
-}
-async function refresh(quiet = false) {
-  await loadMessages(quiet)
-  try { await loadFolders() } catch (cause) { error.set(cause.message) }
-}
-function closeReader() { selected.set(null); reading.set(false); readingLoading.set(false); ++messageRequest }
-async function selectFolder(name) {
-  if (mutating()) return
-  folder.set(name); page.set(1); query.set(''); activeQuery.set(''); notice.set(''); closeReader()
-  await refresh()
-}
-async function search() { page.set(1); activeQuery.set(query().trim()); closeReader(); await loadMessages() }
-async function clearSearch() { query.set(''); activeQuery.set(''); page.set(1); await loadMessages() }
-async function turnPage(delta) { if (loading() || mutating()) return; page.update(value => Math.max(1, value + delta)); closeReader(); await loadMessages() }
-async function openMessage(uid) {
-  if (mutating()) return
-  const request = ++messageRequest
-  const name = folder()
-  const path = messagePath(uid, name)
-  reading.set(true); readingLoading.set(true); selected.set(null); showHtml.set(true); error.set('')
-  try {
-    const message = await api(path)
-    if (request !== messageRequest) return
-    selected.set(message)
-    if (!message.flags?.seen) {
-      await api(path, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ flags: { ...message.flags, seen: true } }) })
-      if (request === messageRequest) selected.set({ ...message, flags: { ...message.flags, seen: true } })
-      await refresh(true)
-    }
-  }
-  catch (cause) { if (request === messageRequest) error.set(cause.message) }
-  finally { if (request === messageRequest) readingLoading.set(false) }
-}
-async function setFlag(name, value) {
-  const message = selected()
-  if (!message || mutating()) return
-  const activeFolder = folder()
-  const request = messageRequest
-  mutating.set(true); error.set('')
-  try {
-    const flags = { ...message.flags, [name]: value }
-    await api(messagePath(message.uid, activeFolder), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ flags }) })
-    if (request === messageRequest) selected.set({ ...message, flags })
-    await refresh(true)
-  }
-  catch (cause) { error.set(cause.message) }
-  finally { mutating.set(false) }
-}
-async function moveMessage(destination) {
-  const message = selected()
-  if (!message || mutating() || !destination || destination === folder()) return
-  mutating.set(true); error.set('')
-  try {
-    await api(messagePath(message.uid), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ folder: destination }) })
-    closeReader(); notice.set('Message moved to ' + destination + '.'); await refresh()
-  }
-  catch (cause) { error.set(cause.message) }
-  finally { mutating.set(false) }
-}
-function askConfirmation(action) { confirmation.set(action); void nextTick(() => confirmDialog.current?.showModal()) }
-async function deleteMessage(confirmed = false) {
-  const message = selected()
-  if (!message || mutating()) return
-  if (folder() === 'Trash' && !confirmed) { askConfirmation('delete'); return }
-  mutating.set(true); error.set('')
-  try {
-    await api(messagePath(message.uid), { method: 'DELETE' })
-    closeReader(); notice.set(folder() === 'Trash' ? 'Message deleted.' : 'Message moved to Trash.'); await refresh()
-  }
-  catch (cause) { error.set(cause.message) }
-  finally { mutating.set(false) }
-}
-function addresses(value) {
-  // Split only outside a quoted display name or <address>; commas in a name
-  // are not recipient separators. Bare addresses and semicolon lists work too.
-  const parts = []; let part = ''; let quoted = false; let angle = 0; let escaped = false
-  for (const char of value || '') {
-    if (escaped) { part += char; escaped = false; continue }
-    if (char === '\\' && quoted) { part += char; escaped = true; continue }
-    if (char === '"') quoted = !quoted
-    if (!quoted && char === '<') angle++
-    if (!quoted && char === '>') angle = Math.max(0, angle - 1)
-    if (!quoted && !angle && (char === ',' || char === ';')) { parts.push(part); part = '' }
-    else part += char
-  }
-  parts.push(part)
-  const parsed = parts.map(value => { const match = /<([^>]+)>/.exec(value); return (match ? match[1] : value).trim() }).filter(Boolean)
-  return [...new Map(parsed.map(address => [address.toLowerCase(), address])).values()]
-}
-function validRecipients() {
-  const values = [...addresses(to()), ...addresses(cc()), ...addresses(bcc())]
-  const invalid = values.find(address => !/^[^\s<>"/\\,;:@]+@[^\s<>"/\\,;:@]+$/.test(address) || address.startsWith('.') || address.includes('..'))
-  if (invalid) { composeError.set('Check this email address: ' + invalid); return false }
-  if (values.length > 100) { composeError.set('Use at most 100 recipients.'); return false }
-  return true
-}
-function resetComposition() {
-  to.set(''); cc.set(''); bcc.set(''); subject.set(''); body.set(''); draftHtml.set(''); draftInitialText.set(''); inReplyTo.set(''); references.set(''); attachments.set([]); draftUid.set(null); replyContext.set(null); composeError.set(''); title.set('New message')
-}
-function showComposer() { composing.set(true); void nextTick(() => composerDialog.current?.showModal()) }
-function closeComposer() { if (!sending() && !savingDraft() && !attaching()) composing.set(false) }
-function compose(mode = 'new') {
-  if (hasComposition()) { showComposer(); if (mode !== 'new') composeError.set('Save or discard your current composition before starting another.'); return }
-  resetComposition()
-  const message = selected()
-  title.set(mode === 'new' ? 'New message' : mode === 'forward' ? 'Forward' : mode === 'all' ? 'Reply all' : 'Reply')
-  if (message && mode !== 'new') {
-    const text = message.text || '[HTML message]'
-    subject.set((mode === 'forward' ? /^fwd:/i.test(message.subject || '') ? '' : 'Fwd: ' : /^re:/i.test(message.subject || '') ? '' : 'Re: ') + (message.subject || ''))
-    if (mode === 'forward') body.set('\n\n---------- Forwarded message ----------\nFrom: ' + message.from + '\nDate: ' + message.date + '\nSubject: ' + message.subject + '\n\n' + text)
-    else {
-      const mine = user().email.toLowerCase()
-      const targets = folder() === 'Sent' ? addresses(message.to) : addresses(message.reply_to || message.from)
-      to.set(targets.join(', '))
-      if (mode === 'all') {
-        const exclude = new Set([mine, ...targets.map(address => address.toLowerCase())])
-        cc.set(addresses((message.to || '') + ', ' + (message.cc || '')).filter(address => !exclude.has(address.toLowerCase())).join(', '))
-      }
-      body.set('\n\nOn ' + message.date + ', ' + message.from + ' wrote:\n' + text.split('\n').map(line => '> ' + line).join('\n'))
-      inReplyTo.set(message.message_id || '')
-      references.set(((message.references || '') + ' ' + (message.message_id || '')).trim())
-      replyContext.set({ uid: message.uid, folder: folder() })
-    }
-  }
-  showComposer()
-}
-function encodeBytes(bytes) {
-  let binary = ''
-  for (let offset = 0; offset < bytes.length; offset += 8192) binary += String.fromCharCode(...bytes.subarray(offset, offset + 8192))
-  return btoa(binary)
-}
-async function attachFiles() {
-  const files = [...(fileInput.current?.files || [])]
-  if (attaching() || sending() || savingDraft()) return
-  attaching.set(true); composeError.set('')
-  try {
-    const additions = []
-    if (files.length + attachments().length > 20 || files.reduce((sum, file) => sum + file.size, 0) + attachments().reduce((sum, file) => sum + file.size, 0) > 512 * 1024) throw new Error('Use at most 20 attachments, totaling 512 KiB or less.')
-    for (const file of files) additions.push({ filename: file.name, contentType: file.type || 'application/octet-stream', size: file.size, data: encodeBytes(new Uint8Array(await file.arrayBuffer())) })
-    attachments.update(items => [...items, ...additions])
-  }
-  catch (cause) { composeError.set(cause.message) }
-  finally { attaching.set(false); if (fileInput.current) fileInput.current.value = '' }
-}
-function removeAttachment(index) { attachments.update(items => items.filter((file, position) => position !== index)) }
-function compositionPayload() { return { to: addresses(to()), cc: addresses(cc()), bcc: addresses(bcc()), subject: subject(), text: body(), html: body() === draftInitialText() ? draftHtml() : '', inReplyTo: inReplyTo(), references: references(), attachments: attachments(), draftUid: draftUid() } }
-async function editDraft() {
-  const message = selected()
-  if (!message || mutating() || hasComposition()) { if (hasComposition()) { showComposer(); composeError.set('Save or discard your current composition first.'); } return }
-  mutating.set(true); error.set('')
-  try {
-    const files = []
-    if ((message.attachments || []).reduce((sum, item) => sum + item.size, 0) > 512 * 1024) throw new Error('This draft exceeds the 512 KiB attachment limit.')
-    for (const [index, file] of (message.attachments || []).entries()) {
-      const response = await fetch(attachmentPath(index), { credentials: 'same-origin' })
-      if (!response.ok) throw new Error('Could not load the draft attachment.')
-      files.push({ ...file, contentType: file.content_type, data: encodeBytes(new Uint8Array(await response.arrayBuffer())) })
-    }
-    resetComposition(); title.set('Edit draft'); draftUid.set(message.uid); to.set(message.to || ''); cc.set(message.cc || ''); bcc.set(message.bcc || ''); subject.set(message.subject || ''); body.set(message.text || ''); draftInitialText.set(message.text || ''); draftHtml.set(message.html || ''); inReplyTo.set(message.in_reply_to || ''); references.set(message.references || ''); attachments.set(files); showComposer()
-  }
-  catch (cause) { error.set(cause.message) }
-  finally { mutating.set(false) }
-}
-function serializedComposition() {
-  const payload = JSON.stringify(compositionPayload())
-  if (new TextEncoder().encode(payload).length > 950000) throw new Error('This message is too large. Reduce the body or attachments.')
-  return payload
-}
-async function saveDraft() {
-  if (sending() || savingDraft() || attaching() || !validRecipients()) return
-  if (!hasComposition()) { composeError.set('Write something before saving a draft.'); return }
-  savingDraft.set(true); composeError.set('')
-  try {
-    await api('/webmail/api/drafts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: serializedComposition() })
-    composing.set(false); resetComposition(); if (folder() === 'Drafts') closeReader(); notice.set('Draft saved. Open it from Drafts to continue.'); await refresh(true)
-  }
-  catch (cause) { composeError.set(cause.message) }
-  finally { savingDraft.set(false) }
-}
-async function send() {
-  if (sending() || savingDraft() || attaching() || !validRecipients()) return
-  composeError.set('')
-  if (!addresses(to()).length && !addresses(cc()).length && !addresses(bcc()).length) { composeError.set('Add at least one recipient.'); return }
-  if (new TextEncoder().encode(body()).length > 256 * 1024) { composeError.set('Keep the message body under 256 KiB.'); return }
-  sending.set(true)
-  try {
-    const result = await api('/webmail/api/compose', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: serializedComposition() })
-    if (result.delivered > 0 && replyContext()) {
-      const context = replyContext()
-      try { const original = await api(messagePath(context.uid, context.folder)); await api(messagePath(context.uid, context.folder), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ flags: { ...original.flags, answered: true } }) }) }
-      catch { notice.set('Message sent; the original could not be marked answered.') }
-      replyContext.set(null)
-    }
-    if (result.ok === false) {
-      const failed = new Set((result.failed || []).map(address => address.toLowerCase()))
-      to.set(addresses(to()).filter(address => failed.has(address.toLowerCase())).join(', ')); cc.set(addresses(cc()).filter(address => failed.has(address.toLowerCase())).join(', ')); bcc.set(addresses(bcc()).filter(address => failed.has(address.toLowerCase())).join(', '))
-      composeError.set((result.delivered ? 'Sent to ' + result.delivered + ' recipient(s). ' : '') + 'Delivery failed to: ' + (result.failed || []).join(', ') + '. Only failed recipients remain for retry.' + (result.delivered > 0 && result.sent_saved === false ? ' The Sent copy could not be saved.' : ''))
-      if (draftUid()) {
-        try { await api('/webmail/api/drafts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: serializedComposition() }) }
-        catch { composeError.update(value => value + ' The saved draft could not be updated; save this composition before leaving.') }
-      }
-      await refresh(true); return
-    }
-    const originalDraft = draftUid()
-    composing.set(false); resetComposition(); notice.set(result.sent_saved === false ? 'Message sent, but the Sent copy could not be saved.' : 'Message sent.')
-    if (originalDraft) {
-      try { await api(messagePath(originalDraft, 'Drafts'), { method: 'DELETE' }); if (folder() === 'Drafts') closeReader() }
-      catch { notice.set('Message sent. Its draft remains in Drafts; do not resend it.') }
-    }
-    await refresh(true)
-  }
-  catch (cause) { composeError.set(cause.message + ' If sending was interrupted, check Sent before retrying.') }
-  finally { sending.set(false) }
-}
-async function signOut(confirmed = false) {
-  if (hasComposition() && !confirmed) { askConfirmation('signout'); return }
-  try { await api('/webmail/auth/logout', { method: 'POST' }); resetComposition(); navigate('/login', { reload: true }) }
-  catch (cause) { error.set(cause.message) }
-}
-function showSettings() { passwordError.set(''); settings.set(true); void nextTick(() => passwordDialog.current?.showModal()) }
-function closeSettings() { if (!saving()) { settings.set(false); currentPassword.set(''); newPassword.set(''); confirmPassword.set(''); passwordError.set('') } }
-async function confirmAction() {
-  if (confirming()) return
-  confirming.set(true)
-  try {
-    if (confirmation() === 'delete') await deleteMessage(true)
-    if (confirmation() === 'signout') await signOut(true)
-    if (confirmation() === 'discard') {
-      if (draftUid()) await api(messagePath(draftUid(), 'Drafts'), { method: 'DELETE' })
-      composing.set(false); resetComposition(); await refresh(true)
-    }
-    confirmation.set('')
-  }
-  catch (cause) { composeError.set(cause.message); error.set(cause.message); confirmation.set('') }
-  finally { confirming.set(false) }
-}
-async function changePassword() {
-  if (saving()) return
-  passwordError.set('')
-  if (newPassword() !== confirmPassword()) { passwordError.set('The new passwords do not match.'); return }
-  if (newPassword().length < 12) { passwordError.set('Use at least 12 characters.'); return }
-  saving.set(true)
-  try {
-    await api('/webmail/auth/password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ currentPassword: currentPassword(), newPassword: newPassword() }) })
-    currentPassword.set(''); newPassword.set(''); confirmPassword.set(''); navigate('/login', { reload: true })
-  }
-  catch (cause) { passwordError.set(cause.message) }
-  finally { saving.set(false) }
-}
-function shortDate(value) { const date = new Date(value); return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString([], { month: 'short', day: 'numeric' }) }
-function readableBytes(value) { return value < 1024 ? value + ' B' : (value / 1024).toFixed(1) + ' KiB' }
-function safeHtml(html) { return '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; img-src data:; style-src \'unsafe-inline\'">' + html }
-useInterval(() => { if (user() && !loading() && !mutating() && !composing() && !settings() && !confirmation()) void refresh(true) }, 30000, { whileVisible: true })
-useEventListener('beforeunload', event => { if (hasComposition()) { event.preventDefault(); event.returnValue = '' } })
-onMount(async () => {
-  try { const result = await api('/webmail/auth/me'); user.set(result.user); await refresh() }
-  catch (cause) { error.set(cause.message) }
+import { useWebmail } from '../functions/use-webmail'
+const ready = state(false)
+const mail = useWebmail({
+  composer: useRef('composerDialog'), password: useRef('passwordDialog'),
+  confirmation: useRef('confirmDialog'), fileInput: useRef('fileInput'),
+  selectAll: useRef('selectAll'), navigate, nextTick,
 })
+const {
+  user, folders, folder, messages, threads, expandedThreads, selected, loading, reading, readingLoading,
+  mutating, error, notice, query, searchAll, filterSender, filterAfter, filterBefore, filterUnread,
+  filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal,
+  moveTo, showHtml, checkedKeys, selectedCount, allChecked, someChecked, undoAction, undoRemaining,
+  pendingSend, sendRemaining, outbox, outboxCount, outboxView, cancelling, authExpired, currentFolderName, now,
+  composing, title, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, saveStatus,
+  savingDraft, draftError, draftConflict, sendDelay, sendDelayOptions, settings, currentPassword, newPassword,
+  confirmPassword, passwordError, savingPassword, confirmation, confirming, limits,
+  toRecipients, ccRecipients, bccRecipients, toInput, ccInput, bccInput, recipientFocus, suggestions,
+  suggestionIndex, recipientSearching, recipientErrors, lookup, chooseContact, removeRecipient,
+  editRecipient, recipientKeydown, recipientBlur, attachments, dragging, attachmentBytes,
+  attachmentRemaining, attachmentPending, attachmentUploading, removeAttachment, retryAttachment,
+  refresh, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread,
+  toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openMessage, closeReader, bulkAction, selectedAction,
+  undoLastAction, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments,
+  saveSendPreference, send, confirmPendingSend, showOutbox, cancelSend, retryOutbox, signOut, showSettings, changePassword,
+  showConfirmation, confirmAction, saveDraftCopy, resume, tick, preventUnload,
+  messageKey, folderName, shortDate, fullDate, readableBytes, safeHtml, attachmentPath,
+} = mail
+async function boot() { ready.set(false); await mail.mount(); ready.set(true) }
+useInterval(() => tick(), 1000, { whileVisible: true })
+useEventListener('beforeunload', preventUnload)
+useEventListener('online', resume)
+useEventListener('focus', resume)
+onMount(boot)
+onUnmounted(() => mail.destroy())
 </script>
-<p :if="!user" class="wm-state" role="status" :text="error || 'Opening your inbox…'"></p>
-<div :if="user" class="wm" :class="{ 'wm--reading': reading }">
+<main :if="!ready || !user" class="wm-boot"><p role="status" :text="error || 'Opening your inbox…'"></p><button :if="error" @click="boot()">Retry connection</button></main>
+<div :if="ready && user" class="wm" :class="{ 'wm--reading': reading }">
   <aside class="wm-folders">
-    <div class="text-indigo-600 wm-brand">Mail</div>
-    <button class="wm-compose-btn" @click="compose()" :text="hasComposition ? 'Resume composition' : 'Compose'"></button>
+    <div class="wm-brand font-semibold text-indigo-600">Mail</div>
+    <button class="wm-compose-btn" @click="compose()" :disabled="sending || sendUncertain" :text="hasComposition ? 'Resume draft' : 'Compose'"></button>
     <nav class="wm-folder-list" aria-label="Mail folders">
-      <button :for="item in folders" class="wm-folder" :class="{ 'wm-folder--active': item.name === folder }" @click="selectFolder(item.name)" :disabled="mutating" :aria-current="item.name === folder ? 'page' : null">
-        <span :text="item.name"></span><span :if="item.unread > 0" class="wm-folder-count" :text="item.unread"></span>
+      <button :for="item in folders" class="wm-folder" :class="{ 'wm-folder--active': !outboxView && item.name === folder }" @click="selectFolder(item.name)" :disabled="mutating" :aria-current="!outboxView && item.name === folder ? 'page' : null">
+        <span :text="folderName(item.name)"></span><span :if="(item.name === 'Drafts' ? item.total : item.unread) > 0" class="wm-folder-count" :text="item.name === 'Drafts' ? item.total : item.unread"></span>
       </button>
+      <button class="wm-folder" :class="{ 'wm-folder--active': !outboxView && folder === '*' }" @click="selectFolder('*')" :disabled="mutating">All mail</button>
+      <button class="wm-folder" :class="{ 'wm-folder--active': outboxView }" @click="showOutbox()"><span>Outbox</span><span :if="outboxCount > 0" class="wm-folder-count" :text="outboxCount"></span></button>
     </nav>
-    <div class="wm-user">
-      <span class="wm-user-email" :text="user?.email"></span>
-      <button class="mb-2 wm-logout" @click="showSettings()">Change password</button>
-      <button class="wm-logout" @click="signOut()">Sign out</button>
-    </div>
+    <div class="wm-user"><span class="wm-user-email" :text="user?.email"></span><button class="wm-logout" @click="showSettings()">Change password</button><button class="wm-logout" @click="signOut()" :disabled="sending || savingDraft">Sign out</button></div>
   </aside>
-  <section class="wm-list" aria-label="Messages">
-    <header class="wm-list-head"><span class="wm-list-title" :text="folder"></span><button class="wm-refresh" @click="refresh()" :disabled="loading" aria-label="Refresh messages">Refresh</button></header>
-    <form class="flex gap-2 items-center p-3" role="search" @submit.prevent="search()">
-      <input class="wm-search" type="search" x-model="query" maxlength="256" placeholder="Search this folder" aria-label="Search messages">
-      <button class="wm-action" type="submit" :disabled="loading">Search</button><button :if="activeQuery" class="wm-action" type="button" @click="clearSearch()">Clear</button>
-    </form>
-    <p :if="error" class="login-error" role="alert" :text="error"></p>
-    <p :if="notice" class="px-4 text-indigo-600" role="status" :text="notice"></p>
-    <div class="wm-list-body" :aria-busy="loading">
-      <p :if="loading" class="wm-state">Loading messages…</p>
-      <p :if="!loading && messages.length === 0" class="wm-state" :text="activeQuery ? 'No messages match your search.' : 'No messages in this folder.'"></p>
-      <button :for="message in messages" class="wm-msg" :class="{ 'wm-msg--active': message.uid === selected?.uid, 'wm-msg--unread': !message.flags?.seen }" @click="openMessage(message.uid)" :disabled="mutating">
-        <span class="wm-msg-row"><span class="wm-msg-from" :text="message.from"></span><span class="wm-msg-date" :text="shortDate(message.date)"></span></span>
-        <span class="wm-msg-subject" :text="(message.flags?.flagged ? '★ ' : '') + (message.has_attachments ? '📎 ' : '') + (message.flags?.answered ? '↩ ' : '') + (message.subject || '(no subject)')"></span>
-        <span class="wm-msg-snippet" :text="message.snippet"></span>
-      </button>
+  <section class="wm-workspace">
+    <div :if="authExpired" class="wm-session" role="alert">Your session expired. <a href="/login" target="_blank" rel="noopener">Sign in again</a>, then return here to save your changes.</div>
+    <div :if="notice" class="wm-notice" role="status"><span :text="notice"></span><button :if="undoAction && undoRemaining > 0" class="wm-action" @click="undoLastAction()" :disabled="mutating" aria-label="Undo last action">Undo <span aria-hidden="true" :text="'(' + undoRemaining + 's)' "></span></button><button :if="pendingSend?.state === 'pending' && sendRemaining > 0" class="wm-action" @click="cancelSend()" :disabled="cancelling" aria-label="Undo send">Undo Send <span aria-hidden="true" :text="'(' + sendRemaining + 's)' "></span></button></div>
+    <div class="wm-columns">
+    <section :if="!outboxView" class="wm-list" aria-label="Messages">
+      <header class="wm-list-head"><h1 class="wm-list-title" :text="currentFolderName"></h1><button class="wm-refresh" @click="refresh()" :disabled="loading" aria-label="Refresh messages">Refresh</button></header>
+      <form class="wm-search-form" role="search" @submit.prevent="search()">
+        <div class="wm-search-row"><input type="search" class="wm-search" x-model="query" maxlength="256" :placeholder="searchAll ? 'Search all folders' : 'Search this folder'" aria-label="Search messages"><button class="wm-action" type="submit" :disabled="loading">Search</button><button class="wm-action" type="button" @click="filtersOpen.set(!filtersOpen())" :aria-expanded="filtersOpen" aria-controls="mailFilters">Filters</button></div>
+        <div :if="filtersOpen" id="mailFilters" class="wm-filter-panel">
+          <label>Sender<input type="text" x-model="filterSender" maxlength="256" placeholder="Name or email" aria-label="Filter by sender"></label>
+          <div class="wm-filter-dates"><label>After<input type="date" x-model="filterAfter" aria-label="After date"></label><label>Before<input type="date" x-model="filterBefore" aria-label="Before date"></label></div>
+          <div class="wm-filter-checks"><label><input type="checkbox" x-model="filterUnread">Unread</label><label><input type="checkbox" x-model="filterFlagged">Flagged</label><label><input type="checkbox" x-model="filterAttachments">Has attachments</label><label><input type="checkbox" x-model="searchAll">All folders</label></div>
+          <button class="wm-action" type="submit" :disabled="loading">Apply filters</button>
+        </div>
+        <button :if="filterActive" class="wm-clear-search" type="button" @click="clearSearch()">Clear search and filters</button>
+      </form>
+      <div class="wm-list-options"><label :if="folder !== 'Drafts'"><input type="checkbox" x-model="conversations" @change="changeConversationView()">Conversations</label><span :text="matchingTotal + (matchingTotal === 1 ? ' message' : ' messages')"></span></div>
+      <div class="wm-selection-bar"><label class="wm-select-all"><input ref="selectAll" type="checkbox" :checked="allChecked" :aria-checked="someChecked ? 'mixed' : allChecked ? 'true' : 'false'" @change="toggleAll()" :disabled="loading || mutating" aria-label="Select messages on this page"><span :text="selectedCount ? selectedCount + ' selected' : 'Select messages'"></span></label><button :if="selectedCount > 0" class="wm-clear-search" @click="clearSelection()">Clear</button></div>
+      <div :if="selectedCount > 0" class="wm-bulk-toolbar" aria-label="Selected message actions">
+        <button class="wm-action" @click="bulkAction('move', 'Archive')" :disabled="mutating">Archive</button><button class="wm-action" @click="bulkAction('move')" :disabled="mutating">Move</button><select x-model="moveTo" :disabled="mutating" aria-label="Bulk move destination"><option :for="item in folders" :value="item.name" :text="folderName(item.name)"></option></select>
+        <button class="wm-action" @click="bulkAction('read')" :disabled="mutating">Mark read</button><button class="wm-action" @click="bulkAction('unread')" :disabled="mutating">Mark unread</button><button class="wm-action" @click="bulkAction('flag')" :disabled="mutating">Flag</button>
+        <button class="wm-action wm-action--danger" @click="bulkAction(folder() === 'Trash' ? 'purge' : 'trash')" :disabled="mutating" :text="folder === 'Trash' ? 'Delete permanently' : 'Trash'"></button>
+      </div>
+      <p :if="error" class="login-error" role="alert" :text="error"></p>
+      <div class="wm-list-body" :aria-busy="loading">
+        <p :if="loading" class="wm-state" role="status">Loading messages…</p>
+        <p :if="!loading && total === 0" class="wm-state" role="status" :text="filterActive ? 'No messages match your search.' : 'No messages in this folder.'"></p>
+        <div :for="thread in threads" class="wm-thread">
+          <div class="wm-message-row" :class="{ 'wm-message-row--unread': thread.unread > 0 }">
+            <input class="wm-message-check" type="checkbox" :checked="threadChecked(thread)" :aria-checked="threadPartial(thread) ? 'mixed' : threadChecked(thread) ? 'true' : 'false'" @click.stop.prevent="toggleThreadSelection(thread, $event)" :disabled="mutating" :aria-label="'Select conversation: ' + (thread.latest.subject || '(no subject)')">
+            <button class="wm-msg" @click="thread.count > 1 ? toggleThread(thread.id) : openMessage(thread.latest)" :aria-expanded="thread.count > 1 ? expandedThreads.includes(thread.id) : null" :disabled="mutating">
+              <span class="wm-msg-row"><span class="wm-msg-from" :text="thread.latest.from"></span><span class="wm-msg-date" :title="fullDate(thread.latest.date)" :text="shortDate(thread.latest.date)"></span></span>
+              <span class="wm-msg-subject"><span :text="(thread.latest.flags?.flagged ? '★ ' : '') + (thread.latest.has_attachments ? '📎 ' : '') + (thread.latest.subject || '(no subject)')"></span><span :if="thread.count > 1" class="wm-thread-count" :text="thread.count"></span></span>
+              <span class="wm-msg-snippet" :text="thread.latest.snippet"></span>
+            </button>
+          </div>
+          <div :if="thread.count > 1 && expandedThreads.includes(thread.id)" class="wm-thread-members">
+            <div :for="message in thread.members" class="wm-message-row" :class="{ 'wm-message-row--active': selected && messageKey(message) === messageKey(selected), 'wm-message-row--unread': !message.flags.seen }">
+              <input class="wm-message-check" type="checkbox" :checked="checkedKeys.includes(messageKey(message))" @click.stop.prevent="toggleSelection(message, $event)" :disabled="mutating" :aria-label="'Select message: ' + (message.subject || '(no subject)')">
+              <button class="wm-msg" @click="openMessage(message)" :disabled="mutating"><span class="wm-msg-row"><span class="wm-msg-from" :text="message.from"></span><span class="wm-msg-date" :text="shortDate(message.date)"></span></span><span class="wm-msg-subject" :text="message.subject || '(no subject)'"></span><span :if="searchAll" class="wm-folder-badge" :text="folderName(message.folder)"></span><span class="wm-msg-snippet" :text="message.snippet"></span></button>
+            </div>
+          </div>
+        </div>
+        <div :for="message in messages" class="wm-message-row" :class="{ 'wm-message-row--active': selected && messageKey(message) === messageKey(selected), 'wm-message-row--unread': !message.flags.seen }">
+          <input class="wm-message-check" type="checkbox" :checked="checkedKeys.includes(messageKey(message))" @click.stop.prevent="toggleSelection(message, $event)" :disabled="mutating" :aria-label="'Select message: ' + (message.subject || '(no subject)')">
+          <button class="wm-msg" @click="openMessage(message)" :disabled="mutating"><span class="wm-msg-row"><span class="wm-msg-from" :text="message.from"></span><span class="wm-msg-date" :title="fullDate(message.date)" :text="shortDate(message.date)"></span></span><span class="wm-msg-subject" :text="(message.flags.flagged ? '★ ' : '') + (message.has_attachments ? '📎 ' : '') + (message.flags.answered ? '↩ ' : '') + (message.subject || '(no subject)')"></span><span :if="searchAll" class="wm-folder-badge" :text="folderName(message.folder)"></span><span class="wm-msg-snippet" :text="message.snippet"></span></button>
+        </div>
+      </div>
+      <footer class="wm-pagination"><button @click="turnPage(-1)" :disabled="page <= 1 || loading || mutating">Previous</button><span :text="'Page ' + page + ' of ' + Math.max(1, Math.ceil(total / 50))"></span><button @click="turnPage(1)" :disabled="page * 50 >= total || loading || mutating">Next</button></footer>
+    </section>
+    <section :if="!outboxView" class="wm-read" aria-label="Message reader">
+      <button class="wm-back" @click="reading.set(false)" :disabled="mutating">Back to messages</button>
+      <p :if="!selected" class="wm-state" role="status" :text="readingLoading ? 'Opening message…' : 'Select a message to read.'"></p>
+      <article :if="selected" class="wm-read-body">
+        <div class="wm-read-toolbar" :aria-busy="mutating">
+          <button :if="selected?.folder === 'Drafts'" class="wm-action" @click="editDraft()" :disabled="mutating">Edit draft</button>
+          <button :if="selected?.folder !== 'Drafts'" class="wm-action" @click="compose('reply')" :disabled="mutating">Reply</button><button :if="selected?.folder !== 'Drafts'" class="wm-action" @click="compose('all')" :disabled="mutating">Reply all</button><button :if="selected?.folder !== 'Drafts'" class="wm-action" @click="compose('forward')" :disabled="mutating">Forward</button>
+          <button class="wm-action" @click="selectedAction(selected?.flags?.flagged ? 'unflag' : 'flag')" :disabled="mutating" :text="selected?.flags?.flagged ? 'Unflag' : 'Flag'"></button><button class="wm-action" @click="selectedAction('unread')" :disabled="mutating">Mark unread</button><button class="wm-action" @click="selectedAction('move')" :disabled="mutating">Move</button><select x-model="moveTo" :disabled="mutating" aria-label="Move destination"><option :for="item in folders" :value="item.name" :text="folderName(item.name)"></option></select><button class="wm-action wm-action--danger" @click="selectedAction(selected?.folder === 'Trash' ? 'purge' : 'trash')" :disabled="mutating" :text="selected?.folder === 'Trash' ? 'Delete permanently' : 'Trash'"></button>
+        </div>
+        <span class="wm-folder-badge" :text="folderName(selected?.folder || '')"></span><h2 class="wm-read-subject" :text="selected?.subject || '(no subject)'"></h2>
+        <div class="wm-read-meta"><div><span class="wm-read-label">From</span><span :text="selected?.from"></span></div><div><span class="wm-read-label">To</span><span :text="selected?.to"></span></div><div :if="selected?.cc"><span class="wm-read-label">Cc</span><span :text="selected?.cc"></span></div><div :if="selected?.bcc"><span class="wm-read-label">Bcc</span><span :text="selected?.bcc"></span></div><div :if="selected?.reply_to"><span class="wm-read-label">Reply to</span><span :text="selected?.reply_to"></span></div><div><span class="wm-read-label">Date</span><span :text="fullDate(selected?.date || '')"></span></div></div>
+        <div class="wm-read-attach"><a :for="(attachment, index) in (selected?.attachments || [])" class="wm-attach-chip" :href="attachmentPath(index)" :download="attachment.filename" :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></a></div>
+        <div :if="selected?.html" class="wm-format-control"><button class="wm-action" @click="showHtml.set(!showHtml())" :text="showHtml ? 'Show plain text' : 'Show formatted email'"></button><span>Remote images are blocked.</span></div>
+        <iframe :if="selected?.html && showHtml" class="wm-read-html" sandbox="" referrerpolicy="no-referrer" title="Email content" :srcdoc="safeHtml(selected?.html || '')"></iframe><pre :if="!selected?.html || !showHtml" class="wm-read-text" :text="selected?.text || 'No plain-text version is available.'"></pre>
+      </article>
+    </section>
+    <section :if="outboxView" class="wm-outbox" aria-label="Outbox"><header class="wm-list-head"><h1>Outbox</h1><p>Messages wait here during the Undo Send window.</p></header><p :if="error" role="alert" class="login-error" :text="error"></p><p :if="outbox.length === 0" class="wm-state">No queued messages.</p>
+      <article :for="item in outbox" class="wm-outbox-item"><div><h2 :text="item.message.subject || '(no subject)'"></h2><p :text="item.message.to.join(', ')"></p><span class="wm-outbox-status" :text="item.state === 'pending' ? 'Waiting to send' : item.state === 'sending' ? 'Sending…' : item.state === 'sent' ? 'Delivered' : item.state === 'cancelled' ? 'Cancelled' : item.state === 'partial' ? 'Partially delivered' : item.state === 'sent_unfiled' ? 'Delivered; Sent copy unavailable' : item.state === 'unknown' ? 'Check Sent before retrying' : 'Delivery failed'"></span><p :if="item.error" :text="item.error"></p><p :if="item.result?.failed?.length" :text="'Unsent recipients: ' + item.result.failed.join(', ')"></p></div><button :if="item.state === 'pending' && item.dueAt > now" class="wm-action" @click="cancelSend(item.id)" :disabled="cancelling">Undo Send</button><button :if="['failed', 'partial', 'cancelled', 'unknown'].includes(item.state)" class="wm-action" @click="retryOutbox(item.id)">Review and retry</button><button :if="item.state === 'unknown' || item.state === 'sent_unfiled'" class="wm-action" @click="selectFolder('Sent')">Check Sent</button></article>
+    </section>
     </div>
-    <footer class="flex items-center justify-between p-3 border-gray-200 border-t">
-      <button @click="turnPage(-1)" :disabled="page <= 1 || loading || mutating">Previous</button>
-      <span :text="'Page ' + page + ' of ' + Math.max(1, Math.ceil(total / 50)) + ' · ' + total + (activeQuery ? ' matches' : ' messages')"></span>
-      <button @click="turnPage(1)" :disabled="page * 50 >= total || loading || mutating">Next</button>
-    </footer>
-  </section>
-  <section class="wm-read" aria-label="Message reader">
-    <button class="wm-back" @click="reading.set(false)" :disabled="mutating">Back to messages</button>
-    <p :if="error" class="login-error" role="alert" :text="error"></p>
-    <p :if="!selected" class="wm-state" role="status" :text="readingLoading ? 'Opening message…' : 'Select a message to read.'"></p>
-    <article :if="selected" class="wm-read-body">
-      <div class="wm-read-toolbar" :aria-busy="mutating">
-        <button :if="folder === 'Drafts'" class="wm-action" @click="editDraft()" :disabled="mutating">Edit draft</button>
-        <button :if="folder !== 'Drafts'" class="wm-action" @click="compose('reply')" :disabled="mutating">Reply</button><button :if="folder !== 'Drafts'" class="wm-action" @click="compose('all')" :disabled="mutating">Reply all</button><button :if="folder !== 'Drafts'" class="wm-action" @click="compose('forward')" :disabled="mutating">Forward</button>
-        <button class="wm-action" @click="setFlag('flagged', !selected?.flags?.flagged)" :disabled="mutating" :text="selected?.flags?.flagged ? 'Unflag' : 'Flag'"></button>
-        <button class="wm-action" @click="setFlag('seen', false)" :disabled="mutating">Mark unread</button><button class="wm-action wm-action--danger" @click="deleteMessage()" :disabled="mutating" :text="folder === 'Trash' ? 'Delete permanently' : 'Move to Trash'"></button>
-      </div>
-      <div class="flex flex-wrap gap-2 items-center mb-4">
-        <label for="moveDestination">Move to</label><select id="moveDestination" class="wm-action" x-model="moveTo" :disabled="mutating"><option :for="item in folders" :value="item.name" :text="item.name"></option></select><button class="wm-action" @click="moveMessage(moveTo())" :disabled="mutating || moveTo === folder">Move</button>
-      </div>
-      <h2 class="wm-read-subject" :text="selected?.subject || '(no subject)'"></h2>
-      <div class="wm-read-meta"><div><span class="wm-read-label">From</span><span :text="selected?.from"></span></div><div><span class="wm-read-label">To</span><span :text="selected?.to"></span></div><div :if="selected?.cc"><span class="wm-read-label">Cc</span><span :text="selected?.cc"></span></div><div :if="selected?.bcc"><span class="wm-read-label">Bcc</span><span :text="selected?.bcc"></span></div><div :if="selected?.reply_to"><span class="wm-read-label">Reply to</span><span :text="selected?.reply_to"></span></div><div><span class="wm-read-label">Date</span><span :text="selected?.date"></span></div></div>
-      <div class="wm-read-attach"><a :for="(attachment, index) in (selected?.attachments || [])" class="wm-attach-chip" :href="attachmentPath(index)" :download="attachment.filename" :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></a></div>
-      <div :if="selected?.html" class="flex gap-2 items-center"><button class="wm-action" @click="showHtml.set(!showHtml())" :text="showHtml ? 'Show plain text' : 'Show formatted email'"></button><span class="text-gray-500 text-xs">Remote images are blocked.</span></div>
-      <iframe :if="selected?.html && showHtml" class="wm-read-html" sandbox="" referrerpolicy="no-referrer" title="Email content" :srcdoc="safeHtml(selected?.html)"></iframe>
-      <pre :if="!selected?.html || !showHtml" class="wm-read-text" :text="selected?.text || 'No plain-text version is available.'"></pre>
-    </article>
   </section>
 </div>
 <dialog :if="composing" ref="composerDialog" class="wm-modal" aria-label="Compose message" @cancel.prevent="closeComposer()">
   <form class="wm-composer" @submit.prevent="send()">
-    <header class="wm-composer-head"><span :text="title"></span><button type="button" class="wm-composer-close" @click="closeComposer()" :disabled="sending || savingDraft || attaching" aria-label="Close composer">Close</button></header>
-    <div class="wm-composer-fields"><label for="composeTo">To</label><input id="composeTo" type="text" x-model="to" :disabled="sending || savingDraft || attaching" placeholder="recipient@example.com" autocomplete="off" autofocus><label for="composeCc">Cc</label><input id="composeCc" type="text" x-model="cc" :disabled="sending || savingDraft || attaching" autocomplete="off"><label for="composeBcc">Bcc</label><input id="composeBcc" type="text" x-model="bcc" :disabled="sending || savingDraft || attaching" autocomplete="off"><label for="composeSubject">Subject</label><input id="composeSubject" type="text" x-model="subject" :disabled="sending || savingDraft || attaching" maxlength="500"></div>
-    <p :if="draftHtml" class="px-4 text-gray-500 text-xs">Formatted content is preserved unless you edit the body. Body edits send a plain-text version.</p>
-    <textarea class="wm-composer-body" x-model="body" :disabled="sending || savingDraft || attaching" aria-label="Message body" placeholder="Write your message…"></textarea>
-    <div class="px-4"><label class="wm-action">Add attachments<input ref="fileInput" class="wm-file-input" type="file" multiple aria-label="Add attachments" @change="attachFiles()" :disabled="sending || savingDraft || attaching"></label><span class="wm-composer-status">Up to 512 KiB total</span></div>
-    <ul :if="attachments.length" class="wm-compose-attachments"><li :for="(attachment, index) in attachments"><span :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></span><button type="button" @click="removeAttachment(index)" :disabled="sending || savingDraft || attaching" :aria-label="'Remove ' + attachment.filename">Remove</button></li></ul>
-    <p :if="composeError" class="wm-composer-error" role="alert" :text="composeError"></p>
-    <footer class="wm-composer-foot"><button class="wm-send-btn" type="submit" :disabled="sending || savingDraft || attaching" :text="sending ? 'Sending…' : 'Send'"></button><button class="wm-action" type="button" @click="saveDraft()" :disabled="sending || savingDraft || attaching" :text="savingDraft ? 'Saving…' : 'Save draft'"></button><button class="wm-action" type="button" @click="askConfirmation('discard')" :disabled="sending || savingDraft || attaching">Discard</button></footer>
+    <header class="wm-composer-head"><span :text="title"></span><button type="button" class="wm-composer-close" @click="closeComposer()" :disabled="sending || savingDraft" aria-label="Close composer">Close</button></header>
+    <div class="wm-composer-fields">
+      <div class="wm-recipient-field"><label for="recipient-to">To</label><div class="wm-recipient-box" :class="{ 'wm-recipient-box--invalid': toRecipients.some(item => !item.valid) }">
+        <div :for="(item, index) in toRecipients" class="wm-recipient-chip" :class="{ 'wm-recipient-chip--invalid': !item.valid }"><button type="button" @click="editRecipient('to', index)" :disabled="sending || sendUncertain" :title="item.address" :text="item.name || item.address || item.raw"></button><button type="button" @click="removeRecipient('to', index)" :disabled="sending || sendUncertain" :aria-label="'Remove recipient ' + item.address">×</button></div>
+        <input id="recipient-to" autofocus type="text" x-model="toInput" @input="lookup('to')" @focus="lookup('to')" @keydown="recipientKeydown($event, 'to')" @blur="recipientBlur($event, 'to')" :disabled="sending || sendUncertain" autocomplete="off" role="combobox" aria-autocomplete="list" :aria-expanded="recipientFocus === 'to' && suggestions.length > 0" aria-controls="contacts-to" :aria-activedescendant="recipientFocus === 'to' && suggestionIndex >= 0 ? 'contact-to-' + suggestionIndex : null" placeholder="Add a recipient" aria-label="To" :aria-invalid="toRecipients.some(item => !item.valid)">
+        <div :if="recipientFocus === 'to' && suggestions.length > 0" id="contacts-to" class="wm-recipient-suggestions" role="listbox" aria-label="Recent contacts"><button :for="(contact, index) in suggestions" :id="'contact-to-' + index" type="button" role="option" :aria-selected="suggestionIndex === index" data-recipient-suggestion @mousedown.prevent="void 0" @click="chooseContact('to', contact)"><span :text="contact.name || contact.address"></span><small :text="contact.address"></small></button></div>
+      </div></div>
+      <div :if="showCc" class="wm-recipient-field"><label for="recipient-cc">Cc</label><div class="wm-recipient-box" :class="{ 'wm-recipient-box--invalid': ccRecipients.some(item => !item.valid) }">
+        <div :for="(item, index) in ccRecipients" class="wm-recipient-chip" :class="{ 'wm-recipient-chip--invalid': !item.valid }"><button type="button" @click="editRecipient('cc', index)" :disabled="sending || sendUncertain" :title="item.address" :text="item.name || item.address || item.raw"></button><button type="button" @click="removeRecipient('cc', index)" :disabled="sending || sendUncertain" :aria-label="'Remove recipient ' + item.address">×</button></div>
+        <input id="recipient-cc" type="text" x-model="ccInput" @input="lookup('cc')" @focus="lookup('cc')" @keydown="recipientKeydown($event, 'cc')" @blur="recipientBlur($event, 'cc')" :disabled="sending || sendUncertain" autocomplete="off" role="combobox" aria-autocomplete="list" :aria-expanded="recipientFocus === 'cc' && suggestions.length > 0" aria-controls="contacts-cc" :aria-activedescendant="recipientFocus === 'cc' && suggestionIndex >= 0 ? 'contact-cc-' + suggestionIndex : null" placeholder="Add a recipient" aria-label="Cc" :aria-invalid="ccRecipients.some(item => !item.valid)">
+        <div :if="recipientFocus === 'cc' && suggestions.length > 0" id="contacts-cc" class="wm-recipient-suggestions" role="listbox" aria-label="Recent contacts"><button :for="(contact, index) in suggestions" :id="'contact-cc-' + index" type="button" role="option" :aria-selected="suggestionIndex === index" data-recipient-suggestion @mousedown.prevent="void 0" @click="chooseContact('cc', contact)"><span :text="contact.name || contact.address"></span><small :text="contact.address"></small></button></div>
+      </div></div>
+      <div :if="showBcc" class="wm-recipient-field"><label for="recipient-bcc">Bcc</label><div class="wm-recipient-box" :class="{ 'wm-recipient-box--invalid': bccRecipients.some(item => !item.valid) }">
+        <div :for="(item, index) in bccRecipients" class="wm-recipient-chip" :class="{ 'wm-recipient-chip--invalid': !item.valid }"><button type="button" @click="editRecipient('bcc', index)" :disabled="sending || sendUncertain" :title="item.address" :text="item.name || item.address || item.raw"></button><button type="button" @click="removeRecipient('bcc', index)" :disabled="sending || sendUncertain" :aria-label="'Remove recipient ' + item.address">×</button></div>
+        <input id="recipient-bcc" type="text" x-model="bccInput" @input="lookup('bcc')" @focus="lookup('bcc')" @keydown="recipientKeydown($event, 'bcc')" @blur="recipientBlur($event, 'bcc')" :disabled="sending || sendUncertain" autocomplete="off" role="combobox" aria-autocomplete="list" :aria-expanded="recipientFocus === 'bcc' && suggestions.length > 0" aria-controls="contacts-bcc" :aria-activedescendant="recipientFocus === 'bcc' && suggestionIndex >= 0 ? 'contact-bcc-' + suggestionIndex : null" placeholder="Add a recipient" aria-label="Bcc" :aria-invalid="bccRecipients.some(item => !item.valid)">
+        <div :if="recipientFocus === 'bcc' && suggestions.length > 0" id="contacts-bcc" class="wm-recipient-suggestions" role="listbox" aria-label="Recent contacts"><button :for="(contact, index) in suggestions" :id="'contact-bcc-' + index" type="button" role="option" :aria-selected="suggestionIndex === index" data-recipient-suggestion @mousedown.prevent="void 0" @click="chooseContact('bcc', contact)"><span :text="contact.name || contact.address"></span><small :text="contact.address"></small></button></div>
+      </div></div>
+      <div class="wm-cc-controls"><button type="button" class="wm-clear-search" @click="showCc.set(!showCc())" :disabled="ccRecipients.length > 0 || !!ccInput" :text="showCc ? 'Hide Cc' : 'Add Cc'"></button><button type="button" class="wm-clear-search" @click="showBcc.set(!showBcc())" :disabled="bccRecipients.length > 0 || !!bccInput" :text="showBcc ? 'Hide Bcc' : 'Add Bcc'"></button><span :if="recipientSearching" aria-hidden="true">Looking for contacts…</span></div>
+      <p :if="recipientErrors.length > 0" class="wm-composer-error" role="alert" :text="'Check recipient addresses: ' + recipientErrors.join(', ')"></p>
+      <label for="composeSubject">Subject</label><input id="composeSubject" type="text" x-model="subject" :disabled="sending || sendUncertain" maxlength="500">
+    </div>
+    <textarea class="wm-composer-body" x-model="body" :disabled="sending || sendUncertain" aria-label="Message body" placeholder="Write your message…"></textarea>
+    <div class="wm-dropzone" :class="{ 'wm-dropzone--active': dragging }" @dragover.prevent="dragging.set(true)" @dragleave="dragging.set(false)" @drop.prevent="dropAttachments($event)">
+      <label class="wm-action">Add attachments<input ref="fileInput" class="wm-file-input" type="file" multiple aria-label="Add attachments" @change="attachFiles()" :disabled="sending || attachmentUploading || limits.maxCount === 0"></label><span>or drop files here</span><small :text="readableBytes(attachmentBytes()) + ' used · ' + readableBytes(attachmentRemaining()) + ' remaining'"></small>
+    </div>
+    <ul :if="attachments.length" class="wm-compose-attachments"><li :for="attachment in attachments"><div><span :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></span><progress :if="attachment.status === 'uploading'" max="100" :value="attachment.progress" :aria-label="'Uploading ' + attachment.filename"></progress><small :if="attachment.status === 'uploading'" aria-hidden="true" :text="attachment.progress === 100 ? 'Processing…' : attachment.progress + '%' "></small><p :if="attachment.error" class="wm-composer-error" :text="attachment.error"></p></div><button :if="attachment.status === 'failed'" type="button" class="wm-action" @click="retryAttachment(attachment.key)" :disabled="sending || sendUncertain">Retry upload</button><button type="button" class="wm-action" @click="removeAttachment(attachment.key)" :disabled="sending || sendUncertain" :aria-label="'Remove attachment ' + attachment.filename">Remove</button></li></ul>
+    <p :if="composeError || draftError" class="wm-composer-error" role="alert" :text="composeError || draftError"></p><div :if="sendUncertain" class="wm-draft-conflict"><button type="button" class="wm-action" @click="confirmPendingSend()" :disabled="sending">Confirm send status</button></div><div :if="draftConflict" class="wm-draft-conflict"><button type="button" class="wm-action" @click="saveDraftCopy()">Save a copy</button><button type="button" class="wm-action" @click="showConfirmation('reload-draft')">Reload saved draft</button></div>
+    <div class="wm-draft-status" role="status" aria-live="polite" aria-atomic="true" :text="saveStatus"></div>
+    <footer class="wm-composer-foot"><button class="wm-send-btn" type="submit" :disabled="sending || sendUncertain || savingDraft || attachmentPending || draftConflict || authExpired" :text="sending ? 'Queuing…' : 'Send'"></button><button class="wm-action" type="button" @click="saveDraft()" :disabled="sending || savingDraft || attachmentPending" :text="savingDraft ? 'Saving…' : 'Save draft'"></button><button class="wm-action" type="button" @click="showConfirmation('discard')" :disabled="sending || savingDraft">Discard</button><label class="wm-send-delay">Undo Send<select x-model.number="sendDelay" @change="saveSendPreference()" :disabled="sending || sendUncertain"><option :for="value in sendDelayOptions" :value="value" :text="value === 0 ? 'Off' : value + ' seconds'"></option></select></label></footer>
   </form>
 </dialog>
-<dialog :if="settings" ref="passwordDialog" class="wm-modal" aria-label="Change password" @cancel.prevent="closeSettings()">
-  <form class="login" @submit.prevent="changePassword()">
-    <h1>Change password</h1><p class="login-sub">This updates your webmail, IMAP and SMTP password. You’ll sign in again afterward.</p>
-    <label for="currentPassword">Current password</label><input id="currentPassword" type="password" x-model="currentPassword" autocomplete="current-password" required autofocus>
-    <label for="newPassword">New password</label><input id="newPassword" type="password" x-model="newPassword" autocomplete="new-password" minlength="12" required>
-    <label for="confirmPassword">Confirm password</label><input id="confirmPassword" type="password" x-model="confirmPassword" autocomplete="new-password" minlength="12" required>
-    <p :if="passwordError" class="login-error" role="alert" :text="passwordError"></p>
-    <button type="submit" :disabled="saving" :text="saving ? 'Saving…' : 'Save password'"></button><button type="button" @click="closeSettings()" :disabled="saving">Cancel</button>
-  </form>
-</dialog>
-<dialog :if="confirmation" ref="confirmDialog" class="wm-modal" aria-label="Confirm action" @cancel.prevent="confirmation.set('')">
-  <div class="login"><h1 :text="confirmation === 'delete' ? 'Delete permanently?' : confirmation === 'signout' ? 'Sign out with an unsaved composition?' : 'Discard this composition?'"></h1><p class="login-sub" :text="confirmation === 'delete' ? 'This message cannot be recovered after deletion.' : confirmation === 'signout' ? 'Save your draft first if you want to keep it.' : 'A saved draft will move to Trash. Unsaved changes will be discarded.'"></p><button @click="confirmation.set('')" :disabled="confirming" autofocus>Keep working</button><button @click="confirmAction()" :disabled="confirming" :text="confirming ? 'Working…' : confirmation === 'delete' ? 'Delete permanently' : confirmation === 'signout' ? 'Sign out' : 'Discard'"></button></div>
-</dialog>
-<noscript>JavaScript is required to use webmail.</noscript>
+<dialog :if="settings" ref="passwordDialog" class="wm-modal wm-password-dialog" aria-label="Change password" @cancel.prevent="settings.set(false)"><form class="login" @submit.prevent="changePassword()"><h1>Change password</h1><p class="login-sub">Updates your webmail, SMTP and IMAP credentials.</p><label for="currentPassword">Current password</label><input id="currentPassword" type="password" x-model="currentPassword" autocomplete="current-password" required autofocus><label for="newPassword">New password</label><input id="newPassword" type="password" x-model="newPassword" autocomplete="new-password" minlength="12" required><label for="confirmPassword">Confirm password</label><input id="confirmPassword" type="password" x-model="confirmPassword" autocomplete="new-password" minlength="12" required><p :if="passwordError" role="alert" class="login-error" :text="passwordError"></p><button type="submit" :disabled="savingPassword" :text="savingPassword ? 'Saving…' : 'Change password'"></button><button type="button" @click="settings.set(false)" :disabled="savingPassword">Cancel</button></form></dialog>
+<dialog :if="confirmation" ref="confirmDialog" class="wm-modal wm-confirm-dialog" aria-label="Confirm action" @cancel.prevent="confirmation.set('')"><div class="login"><h1 :text="confirmation === 'purge' ? 'Delete permanently?' : confirmation === 'reload-draft' ? 'Reload saved draft?' : confirmation === 'retry-unknown' ? 'Review an interrupted delivery?' : 'Discard this draft?'"></h1><p class="login-sub" :text="confirmation === 'purge' ? 'These messages cannot be recovered after deletion.' : confirmation === 'reload-draft' ? 'Your local changes will be replaced with the latest saved version. Save a copy to keep both.' : confirmation === 'retry-unknown' ? 'This message may already have arrived. Check Sent and the delivery result before retrying. A retry could send a duplicate.' : 'Your saved draft will move to Trash. Unsaved changes will be discarded.'"></p><button @click="confirmation.set('')" :disabled="confirming" autofocus>Keep working</button><button @click="confirmAction()" :disabled="confirming" :text="confirming ? 'Working…' : confirmation === 'purge' ? 'Delete permanently' : confirmation === 'reload-draft' ? 'Reload saved version' : confirmation === 'retry-unknown' ? 'I checked Sent; review the message' : 'Discard draft'"></button></div></dialog>
 </body>
 </html>

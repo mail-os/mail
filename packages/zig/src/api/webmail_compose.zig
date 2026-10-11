@@ -95,7 +95,7 @@ fn isSafeHeaderValue(v: []const u8) bool {
     return true;
 }
 
-fn isSafeAddress(a: []const u8) bool {
+pub fn isSafeAddress(a: []const u8) bool {
     if (a.len == 0 or a.len > 320) return false;
     for (a) |c| {
         // Reject header-injection chars, and '/' '\' (which would let a crafted

@@ -10,4 +10,8 @@ test {
     std.testing.refAllDecls(@import("api/webmail_maildir.zig"));
     std.testing.refAllDecls(@import("api/webmail_http.zig"));
     std.testing.refAllDecls(@import("api/webmail_compose.zig"));
+    std.testing.refAllDecls(@import("api/webmail_store.zig"));
+    std.testing.refAllDecls(@import("api/webmail_threads.zig"));
+    std.testing.refAllDecls(@import("api/webmail_service.zig"));
+    std.testing.refAllDecls(@import("api/webmail_service_test.zig"));
 }

@@ -112,6 +112,10 @@ pub const Config = struct {
     webmail_secure_cookies: bool = true,
     /// Disable the dedicated HTTPS listener when a trusted local TLS gateway fronts it.
     webmail_tls: bool = true,
+    webmail_attachment_max_file: usize = 20 * 1024 * 1024,
+    webmail_attachment_max_total: usize = 20 * 1024 * 1024,
+    webmail_attachment_max_count: usize = 20,
+    webmail_undo_send_seconds: u32 = 10,
 
     // Require STARTTLS (or implicit TLS) before AUTH is offered/accepted.
     // Default off to avoid locking out existing plaintext-auth clients.
@@ -704,6 +708,10 @@ fn applyEnvironmentVariables(allocator: std.mem.Allocator, cfg: *Config) !void {
     if (env.get("SMTP_WEBMAIL_SECURE_COOKIES")) |value| {
         cfg.webmail_secure_cookies = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
     }
+    if (env.get("SMTP_WEBMAIL_ATTACHMENT_MAX_FILE")) |value| cfg.webmail_attachment_max_file = std.fmt.parseInt(usize, value, 10) catch cfg.webmail_attachment_max_file;
+    if (env.get("SMTP_WEBMAIL_ATTACHMENT_MAX_TOTAL")) |value| cfg.webmail_attachment_max_total = std.fmt.parseInt(usize, value, 10) catch cfg.webmail_attachment_max_total;
+    if (env.get("SMTP_WEBMAIL_ATTACHMENT_MAX_COUNT")) |value| cfg.webmail_attachment_max_count = std.fmt.parseInt(usize, value, 10) catch cfg.webmail_attachment_max_count;
+    if (env.get("SMTP_WEBMAIL_UNDO_SEND_SECONDS")) |value| cfg.webmail_undo_send_seconds = std.fmt.parseInt(u32, value, 10) catch cfg.webmail_undo_send_seconds;
 
     // SMTP_DELIVERY_METHOD (ses or direct)
     if (env.get("SMTP_DELIVERY_METHOD")) |value| {

@@ -72,6 +72,12 @@ pub const MessageSummary = struct {
     flags: Flags,
     has_attachments: bool,
     size: u64,
+    folder: []const u8 = "INBOX",
+    message_id: []const u8 = "",
+    in_reply_to: []const u8 = "",
+    references: []const u8 = "",
+    timestamp: i64 = 0,
+    matches_filters: bool = true,
 };
 
 /// A fully parsed message for the reading pane.
@@ -265,7 +271,7 @@ pub fn listMessagePage(
         const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ r.dir, r.name });
         const raw = fs_compat.readFileAlloc(a, path) catch continue;
         const headers = parseHeaders(a, raw) catch HeaderSet{};
-        const body = extractBestBody(a, raw) catch BodyParts{};
+        const body = extractBody(a, raw, false) catch BodyParts{};
         if (query.len > 0 and !matchesQuery(headers, body, query)) continue;
         const position = total;
         total += 1;
@@ -280,6 +286,11 @@ pub fn listMessagePage(
             .flags = flagsFrom(r.name),
             .has_attachments = body.has_attachments,
             .size = raw.len,
+            .folder = try allocator.dupe(u8, folder),
+            .message_id = try allocator.dupe(u8, headers.message_id),
+            .in_reply_to = try allocator.dupe(u8, headers.in_reply_to),
+            .references = try allocator.dupe(u8, headers.references),
+            .timestamp = messageTimestamp(headers.date, r.name),
         });
     }
     return .{ .items = try out.toOwnedSlice(allocator), .total = total };
@@ -290,6 +301,159 @@ fn matchesQuery(headers: HeaderSet, body: BodyParts, query: []const u8) bool {
         if (ascii_compat.indexOfIgnoreCase(value, query) != null) return true;
     }
     return false;
+}
+
+pub const QueryOptions = struct {
+    folder: []const u8 = "INBOX",
+    query: []const u8 = "",
+    sender: []const u8 = "",
+    after: ?i64 = null,
+    before: ?i64 = null,
+    unread: bool = false,
+    flagged: bool = false,
+    attachments: bool = false,
+    include_context: bool = false,
+};
+
+/// Includes custom folders already known to IMAP. All results stay within the
+/// canonical full-address account; no global Maildir fallback is permitted.
+pub fn folderNames(allocator: std.mem.Allocator, db: *database.Database, user: []const u8) ![]const []const u8 {
+    var names: std.ArrayList([]const u8) = .empty;
+    try names.appendSlice(allocator, &standard_folders);
+    const s = try db.prepare("SELECT mailbox FROM imap_mailboxes WHERE username=?1 ORDER BY mailbox");
+    defer s.finalize();
+    try s.bind(1, user);
+    while (try s.step()) {
+        const name = s.columnText(0);
+        if (!isValidFolderName(name)) continue;
+        var exists = false;
+        for (names.items) |known| if (std.ascii.eqlIgnoreCase(known, name)) {
+            exists = true;
+            break;
+        };
+        if (!exists) try names.append(allocator, try allocator.dupe(u8, name));
+    }
+    return names.toOwnedSlice(allocator);
+}
+
+/// Scan once, filter before pagination, and avoid decoding binary attachments
+/// for search and list previews. Threading consumes these same header records.
+pub fn queryMessages(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, options: QueryOptions) ![]MessageSummary {
+    const names = if (std.mem.eql(u8, options.folder, "*")) try folderNames(allocator, db, user) else blk: {
+        if (!isValidFolderName(options.folder)) return MaildirError.InvalidFolderName;
+        const one = try allocator.alloc([]const u8, 1);
+        one[0] = options.folder;
+        break :blk one;
+    };
+    var rows: std.ArrayList(MessageSummary) = .empty;
+    for (names) |folder| {
+        _ = try db.getOrCreateMailbox(user, folder);
+        const refs = try collectFiles(allocator, user, folder);
+        preassignUids(db, user, folder, refs);
+        for (refs, 0..) |ref, index| {
+            const flags = flagsFrom(ref.name);
+            const flags_match = !(options.unread and flags.seen) and !(options.flagged and !flags.flagged);
+            if (!flags_match and !options.include_context) continue;
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ ref.dir, ref.name });
+            const raw = fs_compat.readFileAlloc(a, path) catch continue;
+            const headers = parseHeaders(a, raw) catch HeaderSet{};
+            const stamp = messageTimestamp(headers.date, ref.name);
+            const body = extractBody(a, raw, false) catch BodyParts{};
+            const matches = flags_match and
+                (options.sender.len == 0 or ascii_compat.indexOfIgnoreCase(headers.from, options.sender) != null) and
+                (options.after == null or stamp >= options.after.?) and
+                (options.before == null or stamp <= options.before.?) and
+                (!options.attachments or body.has_attachments) and
+                (options.query.len == 0 or matchesQuery(headers, body, options.query));
+            if (!matches and !options.include_context) continue;
+            try rows.append(allocator, .{
+                .uid = uidFor(db, user, folder, ref.name, @intCast(index + 1)),
+                .folder = try allocator.dupe(u8, folder),
+                .from = try allocator.dupe(u8, headers.from),
+                .to = try allocator.dupe(u8, headers.to),
+                .subject = try allocator.dupe(u8, headers.subject),
+                .date = try allocator.dupe(u8, headers.date),
+                .message_id = try allocator.dupe(u8, headers.message_id),
+                .in_reply_to = try allocator.dupe(u8, headers.in_reply_to),
+                .references = try allocator.dupe(u8, headers.references),
+                .timestamp = stamp,
+                .snippet = try makeSnippet(allocator, body.text),
+                .flags = flags,
+                .has_attachments = body.has_attachments,
+                .size = raw.len,
+                .matches_filters = matches,
+            });
+        }
+    }
+    std.mem.sort(MessageSummary, rows.items, {}, struct {
+        fn lessThan(_: void, left: MessageSummary, right: MessageSummary) bool {
+            if (left.timestamp != right.timestamp) return left.timestamp > right.timestamp;
+            const order = std.mem.order(u8, left.folder, right.folder);
+            if (order != .eq) return order == .lt;
+            return left.uid > right.uid;
+        }
+    }.lessThan);
+    return rows.toOwnedSlice(allocator);
+}
+
+pub fn rawMessage(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, uid: i64) ![]const u8 {
+    if (!isValidFolderName(folder)) return MaildirError.InvalidFolderName;
+    const ref = (try findByUid(allocator, db, user, folder, uid)) orelse return MaildirError.MessageNotFound;
+    return fs_compat.readFileAlloc(allocator, try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ref.dir, ref.name }));
+}
+
+/// RFC 5322 numeric-offset dates, with arrival-time fallback for malformed or
+/// obsolete dates. Filters and ordering use the same timestamp.
+pub fn messageTimestamp(date: []const u8, filename: []const u8) i64 {
+    if (parseDate(date)) |stamp| return stamp;
+    const arrival = imap.parseMessageSortKey(filename);
+    return if (arrival > 10_000_000_000) @divTrunc(arrival, 1000) else arrival;
+}
+
+fn parseDate(date: []const u8) ?i64 {
+    var words: [10][]const u8 = undefined;
+    var count: usize = 0;
+    var it = std.mem.tokenizeAny(u8, date, " ,:\t\r\n");
+    while (it.next()) |word| {
+        if (count == words.len) break;
+        words[count] = word;
+        count += 1;
+    }
+    if (count < 7) return null;
+    const start: usize = if (std.ascii.isDigit(words[0][0])) 0 else 1;
+    if (count < start + 7) return null;
+    const day = std.fmt.parseInt(i64, words[start], 10) catch return null;
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    var month: i64 = 0;
+    for (months, 0..) |name, index| if (std.ascii.eqlIgnoreCase(name, words[start + 1])) {
+        month = @intCast(index + 1);
+        break;
+    };
+    var year = std.fmt.parseInt(i64, words[start + 2], 10) catch return null;
+    if (year < 100) year += if (year < 50) @as(i64, 2000) else @as(i64, 1900);
+    const hour = std.fmt.parseInt(i64, words[start + 3], 10) catch return null;
+    const minute = std.fmt.parseInt(i64, words[start + 4], 10) catch return null;
+    const second = std.fmt.parseInt(i64, words[start + 5], 10) catch return null;
+    if (month < 1 or year < 1601 or year > 9999 or day < 1 or hour < 0 or hour > 23 or minute < 0 or minute > 59 or second < 0 or second > 60) return null;
+    const month_days = [_]i64{ 31, if (@mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0)) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (day > month_days[@intCast(month - 1)]) return null;
+    const zone = words[start + 6];
+    var offset: i64 = 0;
+    if (zone.len == 5 and (zone[0] == '+' or zone[0] == '-')) {
+        const zh = std.fmt.parseInt(i64, zone[1..3], 10) catch return null;
+        const zm = std.fmt.parseInt(i64, zone[3..5], 10) catch return null;
+        if (zh > 23 or zm > 59) return null;
+        offset = (zh * 60 + zm) * 60 * (if (zone[0] == '-') @as(i64, -1) else @as(i64, 1));
+    } else if (!std.ascii.eqlIgnoreCase(zone, "GMT") and !std.ascii.eqlIgnoreCase(zone, "UT") and !std.ascii.eqlIgnoreCase(zone, "Z")) return null;
+    year -= if (month <= 2) @as(i64, 1) else @as(i64, 0);
+    const era = @divFloor(year, 400);
+    const yoe = year - era * 400;
+    const m = month + (if (month > 2) @as(i64, -3) else @as(i64, 9));
+    const days = era * 146097 + yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + @divFloor(153 * m + 2, 5) + day - 1 - 719468;
+    return days * 86400 + hour * 3600 + minute * 60 + second - offset;
 }
 
 /// Load one message's full detail by UID.
@@ -676,6 +840,10 @@ fn parseHeaders(allocator: std.mem.Allocator, raw: []const u8) !HeaderSet {
 ///   - simple multipart/* (splits on boundary, picks text + html parts)
 /// Quoted-printable and base64 transfer encodings are decoded for text parts.
 fn extractBestBody(allocator: std.mem.Allocator, raw: []const u8) !BodyParts {
+    return extractBody(allocator, raw, true);
+}
+
+fn extractBody(allocator: std.mem.Allocator, raw: []const u8, attachment_data: bool) !BodyParts {
     const he = headerEnd(raw);
     const header_block = raw[0..he];
     const body = if (he < raw.len) raw[he..] else "";
@@ -683,7 +851,7 @@ fn extractBestBody(allocator: std.mem.Allocator, raw: []const u8) !BodyParts {
     const ctype = try getHeader(allocator, header_block, "Content-Type");
 
     if (ascii_compat.indexOfIgnoreCase(ctype, "multipart/") != null) {
-        return parseMultipart(allocator, ctype, body, 0);
+        return parseMultipartMode(allocator, ctype, body, 0, attachment_data);
     }
 
     const cte = try getHeader(allocator, header_block, "Content-Transfer-Encoding");
@@ -700,6 +868,10 @@ fn extractBestBody(allocator: std.mem.Allocator, raw: []const u8) !BodyParts {
 const max_multipart_depth = 10;
 
 fn parseMultipart(allocator: std.mem.Allocator, ctype: []const u8, body: []const u8, depth: u32) !BodyParts {
+    return parseMultipartMode(allocator, ctype, body, depth, true);
+}
+
+fn parseMultipartMode(allocator: std.mem.Allocator, ctype: []const u8, body: []const u8, depth: u32, attachment_data: bool) !BodyParts {
     // Bound recursion: beyond the cap, treat the remainder as opaque text.
     if (depth >= max_multipart_depth) return BodyParts{ .text = body };
 
@@ -730,6 +902,7 @@ fn parseMultipart(allocator: std.mem.Allocator, ctype: []const u8, body: []const
             ascii_compat.indexOfIgnoreCase(pcd, "filename") != null)
         {
             result.has_attachments = true;
+            if (!attachment_data) continue;
             const decoded = try decodeBody(allocator, part_body, pcte);
             try attachments.append(allocator, .{
                 .filename = extractParam(allocator, pcd, "filename") catch "attachment",
@@ -746,7 +919,7 @@ fn parseMultipart(allocator: std.mem.Allocator, ctype: []const u8, body: []const
             result.text = decodeBody(allocator, part_body, pcte) catch part_body;
         } else if (ascii_compat.indexOfIgnoreCase(pct, "multipart/") != null) {
             // Nested multipart (e.g. multipart/alternative inside multipart/mixed).
-            const nested = parseMultipart(allocator, pct, part_body, depth + 1) catch BodyParts{};
+            const nested = parseMultipartMode(allocator, pct, part_body, depth + 1, attachment_data) catch BodyParts{};
             if (result.text.len == 0) result.text = nested.text;
             if (result.html.len == 0) result.html = nested.html;
             if (nested.has_attachments) result.has_attachments = true;

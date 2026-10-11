@@ -1,20 +1,108 @@
-# Webmail UI — Implementation Plan
+# Native webmail
 
-> **Status:** Phases 0–6 done + Phase 9 built & locally verified over HTTPS — full read+write client (login, 3-pane inbox, flags/move/delete, compose/reply/forward) now ships as a single binary that serves the embedded SPA over its own TLS. Prod deploy to mail.stacksjs.com is the one remaining explicit step (runbook in Phase 9). Next: trigger the deploy, or Phase 7 (search/polish).
-> **Owner:** TBD
-> **Last updated:** 2026-06-01
-> **Estimated effort:** ~8–12 weeks (multi-phase, see [Phases](#phases))
+The mail executable embeds an STX client and serves the same account and Maildir
+used by SMTP and IMAP. Users sign in with their full mailbox address and mail
+password. Deployments expose HTTPS through ts-cloud's native rpx integration;
+webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud.
 
-This document is the single source of truth for building a browser-based webmail
-client for this mail server. It captures (1) the **real current state** of the
-codebase, (2) the **target architecture**, and (3) a **phased plan** broken into
-shippable increments.
+## Mailbox experience
 
-Read [Current State](#current-state) first — it corrects the common assumption
-that "there is no UI yet." There is a lot of *scaffolding and design work*, but
-**none of it is live and none of it serves real mail.**
+- Drafts autosave while the composer remains open. Server acknowledgements drive
+  Saving/Saved status; saved recipients, unfinished input, names and attachment
+  references survive refresh. Conditional revisions prevent a stale browser tab
+  from overwriting another edit. A conflict offers Save a copy or Reload.
+- Message selection supports individual rows, Shift ranges and the current page.
+  Bulk archive, move, read/unread, flag and Trash return per-message results.
+  Recoverable actions offer Undo for 30 seconds, with fresh UIDs on restored moves.
+  Permanent deletion requires explicit confirmation and has no Undo.
+- To/Cc/Bcc use recipient chips, keyboard contact selection and inline validation.
+  Suggestions combine the account's CardDAV contacts with recent correspondents.
+  Cc/Bcc remain collapsed until requested or restored from an existing draft.
+- Search supports all folders, sender, dates, unread, flagged and attachments.
+  Filtering and conversation grouping precede pagination. Conversations use
+  Message-ID/In-Reply-To/References; unrelated messages with the same subject stay
+  separate. Expanded members retain their own folder, UID and actions.
+- Attachments upload as binary data with progress, retry, removal and drag/drop.
+  Account-scoped staging IDs survive draft recovery and make upload retries
+  idempotent. Downloaded attachments retain their original bytes.
+- Undo Send holds the message on the server for a configurable interval. It works
+  even if the browser closes; cancellation is available before dispatch starts.
+  Outbox records delivery results. A partial retry contains only failed recipients.
+  Interrupted dispatch is marked Unknown and requires review before a manual retry.
 
----
+## Configuration
+
+Declare `infrastructure.compute.managedServices.mail.webmail` in a ts-cloud
+`CloudConfig`. The mail repository's `packages/cloud/webmail.config.ts` is a
+consumer; it contains no separate certificate or deployment implementation.
+
+```ts
+webmail: {
+  port: 8099,
+  domain: 'mail.example.com',
+  aliases: ['mail.other-example.com'],
+  attachments: {
+    maxFileBytes: 20 * 1024 * 1024,
+    maxTotalBytes: 20 * 1024 * 1024,
+    maxCount: 20,
+  },
+  undoSendSeconds: 10,
+}
+```
+
+The executable reads `SMTP_WEBMAIL_ATTACHMENT_MAX_FILE`,
+`SMTP_WEBMAIL_ATTACHMENT_MAX_TOTAL`, `SMTP_WEBMAIL_ATTACHMENT_MAX_COUNT` and
+`SMTP_WEBMAIL_UNDO_SEND_SECONDS`. Byte limits accept 0–100 MiB, count 0–100 and
+send delay 0–30 seconds. Effective attachment limits also respect mailbox limits
+and the MIME expansion budget under `SMTP_MAX_MESSAGE_SIZE`; the UI displays the
+actual effective limit. A user may choose a 0–30 second send delay in the composer.
+
+## API contracts
+
+All mutations require a session and same-origin request. Clients include
+`X-Webmail-Account` with the URL-encoded full account address; attachment links
+include the equivalent `account` query parameter. A changed account returns 409
+before a request may affect another mailbox. Disabling or deleting an account
+revokes existing webmail sessions.
+
+- `GET /webmail/api/config` returns effective limits and preferences.
+- `POST /webmail/api/drafts` accepts `draftId`, `draftRevision`, `saveToken` and
+  composition fields, including recipient labels, unfinished inputs and staged
+  attachment IDs. Repeating the identical save token returns its acknowledgement;
+  a stale revision returns 409. `GET /webmail/api/drafts/:id` restores metadata.
+- `POST /webmail/api/uploads?filename=...&contentType=...&uploadId=...` stages
+  raw bytes. Repeating an ID and identical content succeeds; different content
+  conflicts. `DELETE /webmail/api/uploads/:id` removes an unused owned upload.
+- `POST /webmail/api/bulk` validates up to 100 folder/UID references before
+  mutation and returns individual results plus an optional Undo receipt.
+  `POST /webmail/api/undo/:id` restores an unchanged receipt once, idempotently.
+- `POST /webmail/api/compose` with a stable `sendId` queues a validated message;
+  `delaySeconds` controls the hold. Replaying the same ID cannot dispatch twice.
+  `GET /webmail/api/outbox` exposes results; `DELETE /webmail/api/outbox/:id`
+  cancels a pending send. A reviewed Unknown record may be resolved explicitly.
+- Existing immediate-compose and message endpoints remain compatible with the
+  native SDK and older clients. New clients use the durable draft and queue APIs.
+
+## Validation and release
+
+Run `bun test`, the strict TypeScript check for webmail composables, Pickier, and
+`zig build test` with the repository's pinned Zig toolchain. `bun run build` in
+`packages/webmail` compiles the embedded STX pages; the Zig build also does this.
+Live API suites in `packages/webmail/{e2e,ux-e2e}.test.ts` run with
+`MAIL_WEBMAIL_E2E_URL`, `MAIL_WEBMAIL_E2E_USER` and `MAIL_WEBMAIL_E2E_PASSWORD`.
+Use a disposable owned mailbox: these tests send messages and exercise deletion.
+Browser acceptance covers draft recovery, recipient validation, bulk Undo,
+conversation expansion, filtered search, large attachment byte integrity and
+Undo Send, including a mobile viewport.
+
+Commit source fixes, push main, run `bun run release:patch`, then pull and consume
+published dependencies. Deploy the released executable through the native
+workflow and verify the live HTTPS UI with real mailbox credentials.
+
+## Historical design notes
+
+The following original phased plan records early implementation decisions. The
+current behavior and contracts above supersede its status and remaining-work notes.
 
 ## Goals
 

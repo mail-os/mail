@@ -149,6 +149,8 @@ pub const EmailAddress = struct {
     pub const EmailType = enum { home, work, other };
 };
 
+pub const ContactSuggestion = struct { name: []const u8, address: []const u8 };
+
 pub const PhoneNumber = struct {
     contact_id: u64,
     number: []const u8,
@@ -1217,6 +1219,56 @@ pub const CalDavStore = struct {
         return result.toOwnedSlice(self.allocator);
     }
 
+    /// Deep-copy a bounded snapshot while holding the store lock. A concurrent
+    /// CardDAV edit must not invalidate webmail's contact names or addresses.
+    pub fn suggestContacts(self: *Self, allocator: Allocator, username: []const u8, query: []const u8, requested_limit: usize) ![]ContactSuggestion {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const ascii = @import("ascii-compat");
+        const limit = @min(requested_limit, 100);
+        var user_id: ?u64 = null;
+        for (self.user_ids.items) |entry| if (std.mem.eql(u8, entry.username, username)) {
+            user_id = entry.user_id;
+            break;
+        };
+        if (user_id == null or limit == 0) return &.{};
+        var result: std.ArrayList(ContactSuggestion) = .empty;
+        defer result.deinit(allocator);
+        for (self.emails.items) |email| {
+            const contact = self.contacts.get(email.contact_id) orelse continue;
+            const book = self.addressbooks.get(contact.addressbook_id) orelse continue;
+            if (book.user_id != user_id.?) continue;
+            if (query.len > 0 and ascii.indexOfIgnoreCase(email.email, query) == null and ascii.indexOfIgnoreCase(contact.full_name, query) == null) continue;
+            var duplicate = false;
+            for (result.items) |known| if (std.ascii.eqlIgnoreCase(known.address, email.email)) {
+                duplicate = true;
+                break;
+            };
+            if (duplicate) continue;
+            var position: usize = 0;
+            while (position < result.items.len and std.ascii.orderIgnoreCase(result.items[position].address, email.email) == .lt) position += 1;
+            if (position >= limit) continue;
+            try result.insert(allocator, position, .{ .name = contact.full_name, .address = email.email });
+            if (result.items.len > limit) result.items.len = limit;
+        }
+        const output = try allocator.alloc(ContactSuggestion, result.items.len);
+        var completed: usize = 0;
+        errdefer {
+            for (output[0..completed]) |item| {
+                allocator.free(item.name);
+                allocator.free(item.address);
+            }
+            allocator.free(output);
+        }
+        for (result.items, 0..) |item, index| {
+            const name = try allocator.dupe(u8, item.name);
+            errdefer allocator.free(name);
+            output[index] = .{ .name = name, .address = try allocator.dupe(u8, item.address) };
+            completed += 1;
+        }
+        return output;
+    }
+
     pub fn getContactEmails(self: *Self, contact_id: u64) []EmailAddress {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1895,6 +1947,31 @@ test "contact operations" {
     const contact = store.getContact(contact_id);
     try std.testing.expect(contact != null);
     try std.testing.expectEqualStrings("John Doe", contact.?.full_name);
+}
+
+test "contact suggestions isolate full-address owners and remain valid after deletion" {
+    const allocator = std.testing.allocator;
+    var store = try CalDavStore.init(allocator, .{});
+    defer store.deinit();
+    const one = try store.getOrCreateUserId("person@one.test");
+    const two = try store.getOrCreateUserId("person@two.test");
+    const book_one = try store.createAddressBook(one, "Personal", null);
+    const book_two = try store.createAddressBook(two, "Personal", null);
+    const contact = try store.createContact(book_one, .{ .full_name = "Jane Doe", .emails = &.{.{ .email = "jane@one.test" }} });
+    _ = try store.createContact(book_two, .{ .full_name = "Jane Other", .emails = &.{.{ .email = "jane@two.test" }} });
+    const result = try store.suggestContacts(allocator, "person@one.test", "JANE", 10);
+    defer {
+        for (result) |item| {
+            allocator.free(item.name);
+            allocator.free(item.address);
+        }
+        allocator.free(result);
+    }
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    try std.testing.expectEqualStrings("jane@one.test", result[0].address);
+    try store.deleteContact(contact);
+    try std.testing.expectEqualStrings("Jane Doe", result[0].name);
+    try std.testing.expectEqual(@as(usize, 0), (try store.suggestContacts(allocator, "person", "Jane", 10)).len);
 }
 
 test "ics parsing" {

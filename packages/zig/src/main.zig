@@ -520,6 +520,10 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
                 .bind_host = if (wm_tls) "0.0.0.0" else "127.0.0.1",
                 // Cookies are Secure only over HTTPS; respect the explicit override too.
                 .secure_cookies = cfg.webmail_secure_cookies,
+                .max_attachment_file_bytes = cfg.webmail_attachment_max_file,
+                .max_attachment_total_bytes = cfg.webmail_attachment_max_total,
+                .max_attachment_count = cfg.webmail_attachment_max_count,
+                .undo_send_seconds = cfg.webmail_undo_send_seconds,
                 // Outbound send settings: mirror the server's so webmail mail is
                 // delivered + DKIM-signed identically to SMTP submission.
                 .hostname = cfg.hostname,
@@ -530,7 +534,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
                 .tls_cert_path = cfg.tls_cert_path,
                 .tls_key_path = cfg.tls_key_path,
             };
-            webmail_server = webmail_http.WebmailHttpServer.init(allocator, wm_config, db_ptr.?, auth_ptr.?);
+            webmail_server = try webmail_http.WebmailHttpServer.init(allocator, wm_config, db_ptr.?, auth_ptr.?);
             log.info("Webmail HTTP server configured on {s}:{d} (TLS={})", .{ wm_config.bind_host, cfg.webmail_port, wm_tls });
         } else {
             log.warn("Webmail enabled but auth/database are not — skipping webmail server", .{});
@@ -648,6 +652,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
             .ses_region = cfg.ses_region,
         };
         caldav_server = caldav.CalDavServer.init(allocator, caldav_config, auth_ptr.?, &caldav_store_inst.?);
+        if (webmail_server) |*ws| ws.contacts = &caldav_store_inst.?;
         log.info("CalDAV/CardDAV server configured on port {d}", .{caldav_port});
         if (cfg.enable_tls and cfg.tls_cert_path != null) {
             log.info("CalDAV SSL server configured on port {d} (HTTPS)", .{caldav_ssl_port});
