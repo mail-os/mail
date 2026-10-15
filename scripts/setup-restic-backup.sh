@@ -48,7 +48,8 @@ IOSchedulingClass=best-effort
 IOSchedulingPriority=7
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/mail-storage /opt/mail
+# Backups serialize with other host writers through /run/lock/host-backup.lock.
+ReadWritePaths=/var/lib/mail-storage /opt/mail /run/lock
 UNIT
 
 cat > /etc/systemd/system/mail-restic-backup.timer <<'UNIT'
