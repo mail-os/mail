@@ -236,7 +236,7 @@ pub const DiscordHealthMonitor = struct {
             }) catch return;
             defer self.allocator.free(mac_result);
             // Parse macOS df output: "Capacity" column
-            self.parseMacDfAndAlert(mac_result, now);
+            self.parseMacDfAndAlert(mac_result, monitor_path, now);
             return;
         };
         defer self.allocator.free(result);
@@ -247,11 +247,11 @@ pub const DiscordHealthMonitor = struct {
         if (lines.next()) |pct_line| {
             const trimmed = std.mem.trim(u8, pct_line, " %\n\r\t");
             const pct = std.fmt.parseFloat(f64, trimmed) catch return;
-            self.alertOnDiskUsage(pct, now);
+            self.alertOnDiskUsage(pct, monitor_path, now);
         }
     }
 
-    fn parseMacDfAndAlert(self: *DiscordHealthMonitor, output: []const u8, now: i64) void {
+    fn parseMacDfAndAlert(self: *DiscordHealthMonitor, output: []const u8, monitor_path: []const u8, now: i64) void {
         // macOS df -h output has "Capacity" as second-to-last column
         var lines = std.mem.splitScalar(u8, output, '\n');
         _ = lines.next(); // skip header
@@ -264,7 +264,7 @@ pub const DiscordHealthMonitor = struct {
                     const pct_str = field[0 .. field.len - 1];
                     const pct = std.fmt.parseFloat(f64, pct_str) catch continue;
                     if (pct > 10.0) { // Sanity check - skip tiny numbers like iuse%
-                        self.alertOnDiskUsage(pct, now);
+                        self.alertOnDiskUsage(pct, monitor_path, now);
                         return;
                     }
                 }
@@ -272,7 +272,7 @@ pub const DiscordHealthMonitor = struct {
         }
     }
 
-    fn alertOnDiskUsage(self: *DiscordHealthMonitor, pct: f64, now: i64) void {
+    fn alertOnDiskUsage(self: *DiscordHealthMonitor, pct: f64, monitor_path: []const u8, now: i64) void {
         if (pct >= self.disk_critical_pct and now - self.last_disk_alert > self.alert_cooldown_seconds) {
             self.last_disk_alert = now;
             self.sendEmbed(.{
@@ -281,6 +281,8 @@ pub const DiscordHealthMonitor = struct {
                 .color = Color.red,
                 .fields = &[_]Field{
                     .{ .name = "Usage", .value_fmt = .{ .pct = pct }, .inline_field = true },
+                    .{ .name = "Monitored Path", .value_str = monitor_path, .inline_field = true },
+                    .{ .name = "Host", .value_str = self.hostname, .inline_field = true },
                 },
             });
         } else if (pct >= self.disk_warn_pct and now - self.last_disk_alert > 3600) { // Hourly warning
@@ -291,6 +293,8 @@ pub const DiscordHealthMonitor = struct {
                 .color = Color.orange,
                 .fields = &[_]Field{
                     .{ .name = "Usage", .value_fmt = .{ .pct = pct }, .inline_field = true },
+                    .{ .name = "Monitored Path", .value_str = monitor_path, .inline_field = true },
+                    .{ .name = "Host", .value_str = self.hostname, .inline_field = true },
                 },
             });
         }

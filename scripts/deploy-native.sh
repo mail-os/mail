@@ -33,7 +33,8 @@ echo "==> shipping source to $TARGET:$REMOTE_DIR"
 # do not rebuild the unchanged SQLite and TLS dependencies.
 ssh "$TARGET" "if [ -d $REMOTE_DIR/packages/zig/.zig-cache ] && [ ! -d /root/mail-build-cache ]; then mv $REMOTE_DIR/packages/zig/.zig-cache /root/mail-build-cache; fi; rm -rf $REMOTE_DIR && mkdir -p $REMOTE_DIR"
 tar --no-xattrs -czf - --exclude='.zig-cache' --exclude='zig-out' --exclude='*.log' \
-  packages/zig pantry.jsonc pantry.lock | ssh "$TARGET" "tar xzf - -C $REMOTE_DIR"
+  packages/zig pantry.jsonc pantry.lock scripts/cleanup-clamav-downloads.sh \
+  scripts/setup-clamav-cleanup.sh | ssh "$TARGET" "tar xzf - -C $REMOTE_DIR"
 
 echo "==> building on host (zig $ZIG_VER, native linux)"
 ssh "$TARGET" "bash -s" <<REMOTE
@@ -69,4 +70,5 @@ echo "deployed; service active; backup at \$BK"
 REMOTE
 echo "==> done"
 
+ssh "$TARGET" "bash $REMOTE_DIR/scripts/setup-clamav-cleanup.sh"
 bun "$REPO_ROOT/scripts/deploy-webmail.ts" "$TARGET"
