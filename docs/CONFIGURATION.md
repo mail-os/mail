@@ -1039,8 +1039,10 @@ SMTP_LOG_LEVEL=debug \
 | `SMTP_MAX_CONNECTIONS` | `max_connections` | `1000`, `2000` |
 | `SMTP_LOG_LEVEL` | `log_level` | `debug`, `info`, `warn`, `error` |
 | `SMTP_DB_PATH` | Database file path | `/var/lib/smtp/smtp.db` |
-| `SMTP_ENABLE_TLS` | `require_tls` | `true`, `false` |
-| `SMTP_ENABLE_AUTH` | `require_auth` | `true`, `false` |
+| `SMTP_ENABLE_TLS` | Enable STARTTLS support | `true`, `false` |
+| `SMTP_REQUIRE_TLS` | Require encryption before AUTH and MAIL | `true`, `false` |
+| `SMTP_REQUIRE_TLS_FOR_AUTH` | Require encryption before AUTH | `true`, `false` |
+| `SMTP_ENABLE_AUTH` | Enable authentication | `true`, `false` |
 | `SMTP_WORKER_THREADS` | `worker_threads` | `4`, `8`, `16` |
 | `SMTP_MAX_MESSAGE_SIZE` | `max_message_size` | `10485760` (10MB) |
 | `SMTP_ENABLE_GREYLIST` | `enable_greylist` | `true`, `false` |
@@ -1104,3 +1106,16 @@ SMTP_MAX_MESSAGE_SIZE=5242880  # 5MB limit
 
 **Last Updated:** 2025-10-24
 **Version:** v0.28.0
+
+
+Production and staging profiles require TLS before authentication and message
+submission. `SMTP_ENABLE_TLS` enables STARTTLS support; `SMTP_REQUIRE_TLS`
+enforces encryption. Set `SMTP_REQUIRE_TLS=false` explicitly for an MX listener
+that must receive opportunistic plaintext mail, while keeping
+`SMTP_REQUIRE_TLS_FOR_AUTH=true` to protect credentials. Submission listeners
+on ports 465 and 587 always require authentication.
+
+SMTP authentication attempts have a shared per-IP budget of ten attempts per
+five minutes, charged before password hashing. Successful authentication releases
+its attempt. Message quotas are charged once per DATA or BDAT transaction and
+include the authenticated account, across connections.
