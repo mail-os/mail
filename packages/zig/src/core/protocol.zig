@@ -2,6 +2,7 @@ const std = @import("std");
 const time_compat = @import("time_compat.zig");
 const io_compat = @import("io_compat.zig");
 const fs_compat = @import("fs_compat.zig");
+const durable_maildir = @import("durable_maildir.zig");
 const socket = @import("socket_compat.zig");
 const config = @import("config.zig");
 const auth = @import("../auth/auth.zig");
@@ -1863,7 +1864,12 @@ pub const Session = struct {
 
         // Save the message. Spam that scored into the Junk band is delivered to
         // the recipient's Junk mailbox instead of the inbox.
-        try self.saveMessage(message_data.items, to_junk);
+        self.saveMessage(message_data.items, to_junk) catch |err| {
+            self.logger.err("Failed to save message: {}", .{err});
+            try self.sendResponse(writer, 451, "4.3.0 Temporary storage failure; please retry", null);
+            self.resetTransactionState();
+            return;
+        };
 
         const sender_str: []const u8 = self.mail_from orelse "unknown";
         const safe_sender = sanitizeForLog(sender_str);
@@ -2720,19 +2726,10 @@ pub const Session = struct {
                 const filename = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}/{s}", .{ username, sub, basename });
                 defer self.allocator.free(filename);
 
-                const file = cwd.createFileExclusive(filename) catch |err| {
-                    self.logger.err("Failed to create message file {s}: {}", .{ filename, err });
-                    return error.MaildirCreateFailed;
+                durable_maildir.write(self.allocator, filename, data) catch |err| {
+                    self.logger.err("Failed to save message: {}", .{err});
+                    return err;
                 };
-
-                // Write the raw message data as-is (it already contains headers from the client)
-                file.writeAll(data) catch |err| {
-                    file.close();
-                    cwd.deleteFile(filename) catch {};
-                    self.logger.err("Failed to write message data to {s}: {}", .{ filename, err });
-                    return error.MaildirWriteFailed;
-                };
-                file.close();
 
                 self.logger.debug("Message saved to {s}", .{filename});
 
@@ -2872,17 +2869,10 @@ pub const Session = struct {
             const fwd_filename = try std.fmt.allocPrint(self.allocator, "mail/{s}/new/{s}", .{ fwd_username, fwd_basename });
             defer self.allocator.free(fwd_filename);
 
-            const file = cwd.createFileExclusive(fwd_filename) catch |err| {
-                self.logger.err("Failed to create forward file {s}: {}", .{ fwd_filename, err });
-                return error.ForwardCreateFailed;
+            durable_maildir.write(self.allocator, fwd_filename, data) catch |err| {
+                self.logger.err("Failed to save message: {}", .{err});
+                return err;
             };
-            file.writeAll(data) catch |err| {
-                file.close();
-                cwd.deleteFile(fwd_filename) catch {};
-                self.logger.err("Failed to write forward data to {s}: {}", .{ fwd_filename, err });
-                return error.ForwardWriteFailed;
-            };
-            file.close();
             self.logger.info("Local forward from {s} to {s} saved to {s}", .{ username, fwd_username, fwd_filename });
             return;
         }
@@ -3036,17 +3026,10 @@ pub const Session = struct {
                 const fwd_filename = std.fmt.allocPrint(self.allocator, "mail/{s}/new/{s}", .{ fwd_username, fwd_basename }) catch return error.OutOfMemory;
                 defer self.allocator.free(fwd_filename);
 
-                const file = cwd.createFileExclusive(fwd_filename) catch |err| {
-                    self.logger.err("Failed to create forward file {s}: {}", .{ fwd_filename, err });
-                    return error.ForwardCreateFailed;
+                durable_maildir.write(self.allocator, fwd_filename, data) catch |err| {
+                    self.logger.err("Failed to save message: {}", .{err});
+                    return err;
                 };
-                file.writeAll(data) catch |err| {
-                    file.close();
-                    cwd.deleteFile(fwd_filename) catch {};
-                    self.logger.err("Failed to write forward data to {s}: {}", .{ fwd_filename, err });
-                    return error.ForwardWriteFailed;
-                };
-                file.close();
                 self.logger.info("Local forward from {s} to {s} saved to {s}", .{ username, fwd_username, fwd_filename });
             } else {
                 // External forward: relay via SES. Bound the number of in-flight

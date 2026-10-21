@@ -158,16 +158,10 @@ pub const Server = struct {
 
             self.logger.logConnection(addr_str, "connected");
 
-            // Check DNSBL if enabled
-            if (self.dnsbl_checker) |*checker| {
-                const is_blacklisted = checker.isBlacklisted(addr_str) catch false;
-                if (is_blacklisted) {
-                    self.logger.warn("Connection from {s} rejected - IP blacklisted in DNSBL", .{addr_str});
-                    _ = self.active_connections.fetchSub(1, .monotonic);
-                    connection.close();
-                    continue;
-                }
-            }
+            // DNSBL is evaluated by the session: normally it contributes to
+            // spam scoring; SMTP_DNSBL_REJECT explicitly opts into a rejection
+            // at RCPT with an SMTP status. A pre-greeting disconnect ignores
+            // that policy and blocks legitimate shared senders such as SES.
 
             // Handle connection in a new thread for concurrent processing
             const ctx = ConnectionContext{

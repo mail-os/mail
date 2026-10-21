@@ -5,7 +5,7 @@
 # from a Mac links host (Darwin) libc symbols into the binary. Building ON the
 # linux box avoids that entirely. The `-Dtarget=x86_64-linux-gnu` flag is still
 # passed so the build uses the *vendored* sqlite3.c (no system libsqlite3-dev
-# needed) — on a linux host that's a same-OS "cross" and links cleanly.
+# needed) - on a linux host that's a same-OS "cross" and links cleanly.
 #
 # Usage:  scripts/deploy-native.sh root@HOST
 # Safe:   backs up the current binary and auto-rolls-back if the service fails.
@@ -28,13 +28,16 @@ REMOTE_DIR=/root/mailbuild
 echo "==> compiling STX webmail assets"
 (cd "$REPO_ROOT/packages/webmail" && bun run build)
 
+cd "$REPO_ROOT"
+
 echo "==> shipping source to $TARGET:$REMOTE_DIR"
 # Retain the compiler cache outside the source snapshot so repeated releases
 # do not rebuild the unchanged SQLite and TLS dependencies.
 ssh "$TARGET" "if [ -d $REMOTE_DIR/packages/zig/.zig-cache ] && [ ! -d /root/mail-build-cache ]; then mv $REMOTE_DIR/packages/zig/.zig-cache /root/mail-build-cache; fi; rm -rf $REMOTE_DIR && mkdir -p $REMOTE_DIR"
 tar --no-xattrs -czf - --exclude='.zig-cache' --exclude='zig-out' --exclude='*.log' \
   packages/zig pantry.jsonc pantry.lock scripts/cleanup-clamav-downloads.sh \
-  scripts/setup-clamav-cleanup.sh | ssh "$TARGET" "tar xzf - -C $REMOTE_DIR"
+  scripts/setup-clamav-cleanup.sh scripts/mail-health.py scripts/mail-health-watch.py \
+  scripts/setup-mail-health.sh scripts/test-mail-tls.py | ssh "$TARGET" "tar xzf - -C $REMOTE_DIR"
 
 echo "==> building on host (zig $ZIG_VER, native linux)"
 ssh "$TARGET" "bash -s" <<REMOTE
@@ -51,24 +54,43 @@ fi
 cd $REMOTE_DIR/packages/zig
 "\$ZIGDIST/zig" build --cache-dir /root/mail-build-cache -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
 test -x zig-out/bin/mail
+CC="\$ZIGDIST/zig cc" python3 $REMOTE_DIR/scripts/test-mail-tls.py zig-out/bin/mail
 REMOTE
 
 echo "==> hot-swapping /opt/mail/mail-server (with backup + auto-rollback)"
 ssh "$TARGET" "bash -s" <<REMOTE
 set -euo pipefail
 BK=/opt/mail/mail-server.bak-\$(date +%s)
+exec 9>/run/mail-health-check.lock
+flock 9
 cp -a /opt/mail/mail-server "\$BK"
+rollback() {
+  code=\$?
+  trap - EXIT
+  if [ "\$code" != 0 ]; then
+    restore=\$(mktemp /opt/mail/.mail-rollback.XXXXXX)
+    cp -a "\$BK" "\$restore"
+    mv -f "\$restore" /opt/mail/mail-server
+    systemctl restart mail
+  fi
+  exit "\$code"
+}
+trap rollback EXIT
 systemctl stop mail.service
 install -o mail-server -g mail-server -m 755 $REMOTE_DIR/packages/zig/zig-out/bin/mail /opt/mail/mail-server
 systemctl start mail.service
 sleep 5
-if ! systemctl is-active --quiet mail.service; then
-  echo "service failed — rolling back"; cp -a "\$BK" /opt/mail/mail-server
-  systemctl restart mail.service; exit 1
+if ! systemctl is-active --quiet mail.service || ! python3 $REMOTE_DIR/scripts/mail-health.py --host mail.stacksjs.com --connect-host 127.0.0.1; then
+  echo "service failed - rolling back"
+  exit 1
 fi
+trap - EXIT
 echo "deployed; service active; backup at \$BK"
 REMOTE
 echo "==> done"
 
 ssh "$TARGET" "bash $REMOTE_DIR/scripts/setup-clamav-cleanup.sh"
 bun "$REPO_ROOT/scripts/deploy-webmail.ts" "$TARGET"
+
+ssh "$TARGET" "sh $REMOTE_DIR/scripts/setup-mail-health.sh $REMOTE_DIR/scripts/mail-health.py && systemctl start mail-health.service"
+python3 "$REPO_ROOT/scripts/mail-health.py" --connect-host "${TARGET#*@}"

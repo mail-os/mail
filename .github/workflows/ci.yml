@@ -66,6 +66,11 @@ jobs:
         for _ in $(seq 1 50); do nc -z 127.0.0.1 25825 && break; sleep 0.2; done
         MAIL_E2E_SMTP=127.0.0.1:25825 zig build test-e2e --summary all || { cat "$dir/server.log"; exit 1; }
 
+    - name: Verify encrypted SMTP receipt, padding and DNSBL policy
+      run: |
+        python3 ../../scripts/test-mail-health-watch.py
+        python3 ../../scripts/test-mail-tls.py zig-out/bin/mail
+
     - name: Check formatting
       run: zig fmt --check src/
 
@@ -164,6 +169,9 @@ jobs:
 
     - name: Setup project dependencies with Pantry
       uses: pantry-pm/pantry/packages/action@v0.11.28
+
+    - name: Test incident state and alert retry behavior
+      run: python3 ../../scripts/test-mail-health-watch.py
 
     - name: Check formatting
       run: zig fmt --check src/
