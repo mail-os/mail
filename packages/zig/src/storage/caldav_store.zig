@@ -289,7 +289,7 @@ pub const CalDavStore = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.conn) |*conn| conn.close();
-        // Free dynamically allocated ctag/etag strings
+        // Free owned collection tags, record tags and record UIDs.
         var cal_iter = self.calendars.iterator();
         while (cal_iter.next()) |entry| {
             self.allocator.free(entry.value_ptr.ctag);
@@ -297,6 +297,7 @@ pub const CalDavStore = struct {
         var event_iter = self.events.iterator();
         while (event_iter.next()) |entry| {
             self.allocator.free(entry.value_ptr.etag);
+            self.allocator.free(entry.value_ptr.uid);
         }
         var ab_iter = self.addressbooks.iterator();
         while (ab_iter.next()) |entry| {
@@ -305,6 +306,7 @@ pub const CalDavStore = struct {
         var contact_iter = self.contacts.iterator();
         while (contact_iter.next()) |entry| {
             self.allocator.free(entry.value_ptr.etag);
+            self.allocator.free(entry.value_ptr.uid);
         }
         // Free allocated etag/href strings in sync changes (both owned by the store)
         for (self.sync_changes.items) |change| {
@@ -491,7 +493,7 @@ pub const CalDavStore = struct {
     }
 
     /// Hydrate the in-memory maps from SQLite. Loaded strings are owned by
-    /// `self.allocator` (ctag/etag are freed by deinit; the rest persist for the
+    /// `self.allocator` (ctag/etag/UID are freed by deinit; the rest persist for the
     /// store's lifetime, matching the in-session ownership model).
     fn loadFromDb(self: *Self) !void {
         const conn = if (self.conn) |*c| c else return;
@@ -744,6 +746,7 @@ pub const CalDavStore = struct {
         for (events_to_delete.items) |event_id| {
             if (self.events.getPtr(event_id)) |e| {
                 self.allocator.free(e.etag);
+                self.allocator.free(e.uid);
             }
             _ = self.events.remove(event_id);
         }
@@ -768,8 +771,12 @@ pub const CalDavStore = struct {
         self.next_event_id += 1;
 
         const now = currentTimestamp();
+        var inserted = false;
         const etag = try self.generateEtag(id, now);
-        const uid = data.uid orelse try self.generateUid();
+        errdefer if (!inserted) self.allocator.free(etag);
+        // UID slices belong to the stored record, including caller-supplied IDs.
+        const uid = if (data.uid) |value| try self.allocator.dupe(u8, value) else try self.generateUid();
+        errdefer if (!inserted) self.allocator.free(uid);
 
         try self.events.put(id, .{
             .id = id,
@@ -790,6 +797,7 @@ pub const CalDavStore = struct {
             .ics_data = data.ics_data orelse "",
         });
 
+        inserted = true;
         // Record sync change
         if (self.config.enable_sync_tokens) {
             try self.recordChange(calendar_id, id, .event, .created, etag, try self.getEventHref(calendar_id, uid));
@@ -891,17 +899,11 @@ pub const CalDavStore = struct {
         if (self.events.get(id)) |event| {
             const etag = event.etag;
             const calendar_id = event.calendar_id;
-            // The live etag is no longer owned by the map once we remove the
-            // event; recordChange dupes its own copy, so free it here in all paths.
+            const href = if (self.config.enable_sync_tokens) try self.getEventHref(calendar_id, event.uid) else null;
+            _ = self.events.remove(id);
             defer self.allocator.free(etag);
-
-            if (self.config.enable_sync_tokens) {
-                const href = try self.getEventHref(event.calendar_id, event.uid);
-                _ = self.events.remove(id);
-                try self.recordChange(calendar_id, id, .event, .deleted, etag, href);
-            } else {
-                _ = self.events.remove(id);
-            }
+            defer self.allocator.free(event.uid);
+            if (href) |value| try self.recordChange(calendar_id, id, .event, .deleted, etag, value);
             try self.updateCalendarCtag(calendar_id);
             self.dbExecId("DELETE FROM dav_events WHERE id = {d}", id);
         }
@@ -991,6 +993,7 @@ pub const CalDavStore = struct {
             // Free allocated etag before removing
             if (self.contacts.getPtr(contact_id)) |c| {
                 self.allocator.free(c.etag);
+                self.allocator.free(c.uid);
             }
             // Remove associated emails and phones
             var i: usize = 0;
@@ -1035,8 +1038,12 @@ pub const CalDavStore = struct {
         self.next_contact_id += 1;
 
         const now = currentTimestamp();
+        var inserted = false;
         const etag = try self.generateEtag(id, now);
-        const uid = data.uid orelse try self.generateUid();
+        errdefer if (!inserted) self.allocator.free(etag);
+        // UID slices belong to the stored record, including caller-supplied IDs.
+        const uid = if (data.uid) |value| try self.allocator.dupe(u8, value) else try self.generateUid();
+        errdefer if (!inserted) self.allocator.free(uid);
 
         try self.contacts.put(id, .{
             .id = id,
@@ -1057,6 +1064,7 @@ pub const CalDavStore = struct {
             .vcf_data = data.vcf_data orelse "",
         });
 
+        inserted = true;
         // Add emails
         for (data.emails) |email| {
             try self.emails.append(self.allocator, .{
@@ -1335,10 +1343,7 @@ pub const CalDavStore = struct {
         if (self.contacts.get(id)) |contact| {
             const etag = contact.etag;
             const addressbook_id = contact.addressbook_id;
-            // recordChange dupes its own etag copy; free the now-unowned live
-            // etag here in all paths.
-            defer self.allocator.free(etag);
-
+            const href = if (self.config.enable_sync_tokens) try self.getContactHref(addressbook_id, contact.uid) else null;
             // Remove associated emails and phones
             var i: usize = 0;
             while (i < self.emails.items.len) {
@@ -1358,13 +1363,10 @@ pub const CalDavStore = struct {
                 }
             }
 
-            if (self.config.enable_sync_tokens) {
-                const href = try self.getContactHref(contact.addressbook_id, contact.uid);
-                _ = self.contacts.remove(id);
-                try self.recordChange(addressbook_id, id, .contact, .deleted, etag, href);
-            } else {
-                _ = self.contacts.remove(id);
-            }
+            _ = self.contacts.remove(id);
+            defer self.allocator.free(etag);
+            defer self.allocator.free(contact.uid);
+            if (href) |value| try self.recordChange(addressbook_id, id, .contact, .deleted, etag, value);
             try self.updateAddressBookCtag(addressbook_id);
             self.dbExecId("DELETE FROM dav_contacts WHERE id = {d}", id);
             self.dbExecId("DELETE FROM dav_emails WHERE contact_id = {d}", id);
@@ -1439,11 +1441,8 @@ pub const CalDavStore = struct {
 
         self.current_sync_token += 1;
 
-        const owned_etag = self.allocator.dupe(u8, etag) catch |err| {
-            // On failure, free the caller-owned href to avoid a leak.
-            self.allocator.free(href);
-            return err;
-        };
+        errdefer self.allocator.free(href);
+        const owned_etag = try self.allocator.dupe(u8, etag);
         errdefer self.allocator.free(owned_etag);
 
         try self.sync_changes.append(self.allocator, .{
@@ -2060,4 +2059,48 @@ test "vcf parsing: typed emails/phones, pref, structured ORG" {
     try std.testing.expectEqual(EmailAddress.EmailType.home, c.email_types[1]);
     try std.testing.expect(c.email_pref[0]); // TYPE=...,PREF
     try std.testing.expectEqualStrings("grace@example.com", c.emails[1]);
+}
+
+test "DAV record UID ownership survives caller mutation and collection deletion" {
+    const a = std.testing.allocator;
+    var store = try CalDavStore.init(a, .{});
+    defer store.deinit();
+    const calendar = try store.createCalendar(1, "Calendar", null);
+    const book = try store.createAddressBook(1, "Contacts", null);
+    var event_uid = "event-uid".*;
+    var contact_uid = "contact-uid".*;
+    const event = try store.createEvent(calendar, .{ .uid = &event_uid, .summary = "Meeting", .dtstart = 1 });
+    const contact = try store.createContact(book, .{ .uid = &contact_uid, .full_name = "Contact" });
+    @memset(&event_uid, 'x');
+    @memset(&contact_uid, 'x');
+    try std.testing.expectEqualStrings("event-uid", store.getEvent(event).?.uid);
+    try std.testing.expectEqualStrings("contact-uid", store.getContact(contact).?.uid);
+    try store.deleteEvent(event);
+    try store.deleteContact(contact);
+    _ = try store.createEvent(calendar, .{ .summary = "Generated UID", .dtstart = 1 });
+    _ = try store.createContact(book, .{ .full_name = "Generated UID" });
+    try store.deleteCalendar(calendar);
+    try store.deleteAddressBook(book);
+    try std.testing.expectEqual(@as(u32, 0), store.events.count());
+    try std.testing.expectEqual(@as(u32, 0), store.contacts.count());
+}
+
+test "DAV allocation failure before deletion retains valid record ownership" {
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{});
+    var store = try CalDavStore.init(failing.allocator(), .{});
+    defer store.deinit();
+    const calendar = try store.createCalendar(1, "Calendar", null);
+    const book = try store.createAddressBook(1, "Contacts", null);
+    const event = try store.createEvent(calendar, .{ .summary = "Meeting", .dtstart = 1 });
+    const contact = try store.createContact(book, .{ .full_name = "Contact" });
+    const event_etag = try a.dupe(u8, store.getEvent(event).?.etag);
+    defer a.free(event_etag);
+    const contact_etag = try a.dupe(u8, store.getContact(contact).?.etag);
+    defer a.free(contact_etag);
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, store.deleteEvent(event));
+    try std.testing.expectError(error.OutOfMemory, store.deleteContact(contact));
+    try std.testing.expectEqualStrings(event_etag, store.getEvent(event).?.etag);
+    try std.testing.expectEqualStrings(contact_etag, store.getContact(contact).?.etag);
 }
