@@ -115,7 +115,7 @@ int getaddrinfo(const char *name, const char *service, const struct addrinfo *hi
             ctx = ssl.create_default_context(cafile=cert)
             ctx.minimum_version = ctx.maximum_version = ssl.TLSVersion.TLSv1_3
             for _ in range(512):
-                with smtplib.SMTP('localhost', port, timeout=10) as smtp:
+                with smtplib.SMTP('localhost', port, local_hostname='mail-health.stacksjs.com', timeout=10) as smtp:
                     smtp.ehlo()
                     smtp.starttls(context=ctx)
                     smtp.ehlo()
@@ -124,7 +124,7 @@ int getaddrinfo(const char *name, const char *service, const struct addrinfo *hi
                 ctx = ssl.create_default_context(cafile=cert)
                 ctx.minimum_version = ctx.maximum_version = version
                 marker = f'mail-tls-receipt-{version.name}'
-                with smtplib.SMTP('localhost', port, timeout=10) as smtp:
+                with smtplib.SMTP('localhost', port, local_hostname='mail-health.stacksjs.com', timeout=10) as smtp:
                     smtp.ehlo()
                     smtp.starttls(context=ctx)
                     smtp.ehlo()
@@ -142,7 +142,7 @@ int getaddrinfo(const char *name, const char *service, const struct addrinfo *hi
             rejected = root / 'reject-policy'
             rejected.mkdir()
             with server(binary, rejected, cert, key, reject=True, preload=preload) as port:
-                with smtplib.SMTP('localhost', port, timeout=10) as smtp:
+                with smtplib.SMTP('localhost', port, local_hostname='mail-health.stacksjs.com', timeout=10) as smtp:
                     smtp.ehlo()
                     smtp.mail('sender@example.test')
                     code, _ = smtp.rcpt('recipient@example.test')
@@ -152,7 +152,7 @@ int getaddrinfo(const char *name, const char *service, const struct addrinfo *hi
             failed = root / 'storage-failure'
             failed.mkdir()
             with server(binary, failed, cert, key, preload=preload, fail_sync=True) as port:
-                with smtplib.SMTP('localhost', port, timeout=10) as smtp:
+                with smtplib.SMTP('localhost', port, local_hostname='mail-health.stacksjs.com', timeout=10) as smtp:
                     smtp.ehlo()
                     smtp.starttls(context=ssl.create_default_context(cafile=cert))
                     smtp.ehlo()
