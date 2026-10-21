@@ -3,6 +3,7 @@ const io_compat = @import("../core/io_compat.zig");
 const posix = std.posix;
 const database = @import("../storage/database.zig");
 const password_mod = @import("password.zig");
+const security = @import("security.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const mutex_compat = @import("../core/mutex_compat.zig");
 
@@ -177,6 +178,7 @@ pub const AuthBackend = struct {
     allocator: std.mem.Allocator,
     nonce_manager: NonceManager,
     verify_cache: VerifyCache,
+    login_limiter: security.RateLimiter,
     default_domain: ?[]u8 = null,
 
     /// Cache of recent successful password verifications. Mail clients
@@ -260,12 +262,14 @@ pub const AuthBackend = struct {
             .allocator = allocator,
             .nonce_manager = NonceManager.init(allocator),
             .verify_cache = VerifyCache.init(allocator),
+            .login_limiter = security.RateLimiter.init(allocator, 300, 10, 10, 300),
         };
     }
 
     pub fn deinit(self: *AuthBackend) void {
         self.nonce_manager.deinit();
         self.verify_cache.deinit();
+        self.login_limiter.deinit();
         if (self.default_domain) |domain| self.allocator.free(domain);
     }
 
@@ -292,6 +296,33 @@ pub const AuthBackend = struct {
             return (try self.db.uniqueUsernameForLocalPart(address, allocator)) orelse allocator.dupe(u8, address);
         }
         return allocator.dupe(u8, address);
+    }
+
+    /// Network adapters share this budget across protocols and connections.
+    /// Reserve before any lookup or password hashing, including unknown users.
+    fn reserveLogin(self: *AuthBackend, peer: []const u8) !security.RateLimiter.AuthAttempt {
+        return (try self.login_limiter.beginAuthAttempt(peer)) orelse error.AuthenticationRateLimited;
+    }
+
+    pub fn verifyCredentialsForPeer(self: *AuthBackend, peer: []const u8, username: []const u8, password: []const u8) !bool {
+        const attempt = try self.reserveLogin(peer);
+        const valid = try self.verifyCredentials(username, password);
+        if (valid) self.login_limiter.finishAuthSuccess(peer, attempt);
+        return valid;
+    }
+
+    pub fn verifyBasicAuthForPeer(self: *AuthBackend, peer: []const u8, header: []const u8) !?[]const u8 {
+        const attempt = try self.reserveLogin(peer);
+        const username = try self.verifyBasicAuth(header);
+        if (username != null) self.login_limiter.finishAuthSuccess(peer, attempt);
+        return username;
+    }
+
+    pub fn verifyDigestAuthForPeer(self: *AuthBackend, peer: []const u8, header: []const u8, method: []const u8, realm: []const u8) !?[]const u8 {
+        const attempt = try self.reserveLogin(peer);
+        const username = try self.verifyDigestAuth(header, method, realm);
+        if (username != null) self.login_limiter.finishAuthSuccess(peer, attempt);
+        return username;
     }
 
     pub fn verifyCredentials(self: *AuthBackend, username: []const u8, password: []const u8) !bool {
@@ -1397,4 +1428,30 @@ test "reset token validation" {
     // Used token
     token.used = true;
     try std.testing.expect(!token.isValid(1500));
+}
+
+test "security: password Basic and Digest authentication share one peer budget" {
+    const a = std.testing.allocator;
+    var db = try database.Database.init(a, ":memory:");
+    defer db.deinit();
+    var backend = AuthBackend.init(a, &db);
+    defer backend.deinit();
+    backend.login_limiter.max_auth_attempts = 2;
+    try std.testing.expect((try backend.verifyBasicAuthForPeer("192.0.2.1", "invalid")) == null);
+    try std.testing.expect((try backend.verifyDigestAuthForPeer("192.0.2.1", "invalid", "GET", "test")) == null);
+    try std.testing.expectError(error.AuthenticationRateLimited, backend.verifyCredentialsForPeer("192.0.2.1", "unknown", "wrong"));
+    try std.testing.expect((try backend.verifyBasicAuthForPeer("192.0.2.2", "invalid")) == null);
+}
+
+test "security: authentication budget allocation failures fail closed" {
+    const a = std.testing.allocator;
+    var db = try database.Database.init(a, ":memory:");
+    defer db.deinit();
+    var backend = AuthBackend.init(a, &db);
+    defer backend.deinit();
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    backend.login_limiter.deinit();
+    backend.login_limiter = security.RateLimiter.init(failing.allocator(), 300, 10, 10, 300);
+    try std.testing.expectError(error.OutOfMemory, backend.verifyCredentialsForPeer("192.0.2.1", "unknown", "wrong"));
+    try std.testing.expectEqual(@as(u32, 0), backend.login_limiter.auth_counters.count());
 }

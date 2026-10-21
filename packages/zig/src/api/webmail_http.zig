@@ -65,7 +65,7 @@ pub const WebmailHttpConfig = struct {
     /// Add the Secure attribute to cookies (set false for local plain-HTTP dev).
     secure_cookies: bool = true,
     messages_per_page: usize = 50,
-    /// Max failed-or-not login attempts per IP within login_rate_window_seconds.
+    /// Max failed or pending logins per IP within login_rate_window_seconds.
     login_rate_max: u32 = 10,
     login_rate_window_seconds: u64 = 300,
     /// Outbound send settings — must mirror the server's so webmail mail is
@@ -93,7 +93,7 @@ pub const WebmailHttpServer = struct {
     service: service_mod.Service,
     contacts: ?*caldav_store.CalDavStore = null,
     sessions: session_mod.SessionManager,
-    /// Throttles login attempts per IP to blunt credential brute-forcing.
+    /// Webmail-specific login and authenticated account-change budgets.
     /// Its own internal mutex makes it safe to share across connection threads.
     login_limiter: security.RateLimiter,
     /// Throttles the unauthenticated password reset endpoints per IP: asking
@@ -142,6 +142,8 @@ pub const WebmailHttpServer = struct {
             .reset_limiter = security.RateLimiter.init(allocator, 15 * 60, 10, 30, 15 * 60),
             .running = std.atomic.Value(bool).init(false),
         };
+        server.login_limiter.max_auth_attempts = config.login_rate_max;
+        server.login_limiter.auth_window_seconds = @intCast(@min(config.login_rate_window_seconds, std.math.maxInt(i64)));
         if (config.enable_tls and config.tls_cert_path != null and config.tls_key_path != null) {
             server.cert_key_pair = tls.config.CertKeyPair.fromFilePathAbsolute(
                 allocator,
@@ -615,17 +617,6 @@ fn handleLogin(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std
     if (!isSameOrigin(req)) return sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected");
     const ip = if (req.trust_forwarded_headers) req.header("X-Real-IP") orelse conn.peerIp() else conn.peerIp();
 
-    // Throttle per IP BEFORE the expensive Argon2 verify, so a brute-forcer
-    // can't both burn CPU and sample credentials. checkAndIncrement returns
-    // false once the IP exceeds the window budget.
-    if (ip.len > 0) {
-        const allowed = server.login_limiter.checkAndIncrement(ip) catch true;
-        if (!allowed) {
-            logger.warn("Webmail login rate-limited for {s}", .{ip});
-            return sendError(conn, arena, 429, "rate_limited", "Too many login attempts; try again later");
-        }
-    }
-
     const username = (try jsonStringFieldAlloc(arena, req.body, "username")) orelse {
         return sendError(conn, arena, 400, "bad_request", "Missing username");
     };
@@ -633,9 +624,15 @@ fn handleLogin(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std
         return sendError(conn, arena, 400, "bad_request", "Missing password");
     };
 
+    // Retain the configured webmail cap as well as the shared backend cap.
+    // Both reserve before verification and refund a successful login.
+    const attempt = (server.login_limiter.beginAuthAttempt(ip) catch null) orelse
+        return sendError(conn, arena, 429, "rate_limited", "Too many login attempts; try again later");
     const ua = req.header("User-Agent");
 
     var sess = server.sessions.login(username, password, if (ip.len > 0) ip else null, ua) catch |err| {
+        if (err == error.AuthenticationRateLimited)
+            return sendError(conn, arena, 429, "rate_limited", "Too many login attempts; try again later");
         if (err == session_mod.SessionError.InvalidCredentials) {
             logger.warn("Webmail login failed for {s} from {s}", .{ username, ip });
             return sendError(conn, arena, 401, "invalid_credentials", "Invalid username or password");
@@ -643,10 +640,12 @@ fn handleLogin(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std
         return sendError(conn, arena, 500, "server_error", "Login failed");
     };
     defer sess.deinit(server.allocator);
+    server.login_limiter.finishAuthSuccess(ip, attempt);
 
     logger.info("Webmail login: {s} from {s}", .{ sess.username, ip });
 
     const cookie = try server.sessions.buildSetCookie(sess.session_id);
+    defer server.allocator.free(cookie);
 
     var body: std.ArrayList(u8) = .empty;
     const w = jw(&body, arena);
@@ -2112,4 +2111,48 @@ test "attachment download headers percent-encode untrusted filenames" {
     try t.expect(std.mem.indexOf(u8, header, "\r") == null);
     try t.expect(std.mem.indexOf(u8, header, "\n") == null);
     try t.expect(std.mem.indexOf(u8, header, "%C3%A9%22%0D%0A") != null);
+}
+
+test "security: HTTP logins refund successes and retain configured failure limits" {
+    const a = std.testing.allocator;
+    var db = try database.Database.init(a, ":memory:");
+    defer db.deinit();
+    var backend = auth_mod.AuthBackend.init(a, &db);
+    defer backend.deinit();
+    var hash: [32]u8 = undefined;
+    try std.crypto.pwhash.argon2.kdf(a, &hash, "test-password", "0123456789abcdef", .{ .m = 8, .t = 1, .p = 1 }, .argon2id, io_compat.getIo());
+    var encoded: [43]u8 = undefined;
+    const stored = try std.fmt.allocPrint(a, "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg${s}", .{std.base64.standard_no_pad.Encoder.encode(&encoded, &hash)});
+    defer a.free(stored);
+    _ = try db.createUser("user@test.local", stored, "user@test.local");
+    var server = try WebmailHttpServer.init(a, .{ .login_rate_max = 2 }, &db, &backend);
+    defer server.deinit();
+    var fds: [2]c_int = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, @intCast(@as(u32, std.posix.SOCK.STREAM)), 0, &fds) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    var connection = socket.Connection{ .fd = fds[0] };
+    const peer = "192.0.2.1";
+    @memcpy(connection.peer_ip_buf[0..peer.len], peer);
+    connection.peer_ip_len = peer.len;
+    var stream = webmail_tls.Stream.plain(connection);
+    for (0..15) |index| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        try handleLogin(&server, &stream, arena.allocator(), .{
+            .method = "POST",
+            .path = "/webmail/auth/login",
+            .query = "",
+            .headers = "Host: test.local\r\nOrigin: http://test.local\r\n",
+            .body = if (index == 12 or index == 13)
+                "{\"username\":\"user@test.local\",\"password\":\"wrong-password\"}"
+            else
+                "{\"username\":\"user@test.local\",\"password\":\"test-password\"}",
+        });
+        var reply: [8192]u8 = undefined;
+        const n = std.c.read(fds[1], &reply, reply.len);
+        try std.testing.expect(n > 0);
+        const expected = if (index < 12) "HTTP/1.1 200" else if (index < 14) "HTTP/1.1 401" else "HTTP/1.1 429";
+        try std.testing.expect(std.mem.startsWith(u8, reply[0..@intCast(n)], expected));
+    }
 }

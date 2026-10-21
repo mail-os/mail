@@ -77,7 +77,7 @@ pub const SessionManager = struct {
         ip_address: ?[]const u8,
         user_agent: ?[]const u8,
     ) !Session {
-        const ok = try self.auth.verifyCredentials(username, password);
+        const ok = try self.auth.verifyCredentialsForPeer(ip_address orelse "", username, password);
         if (!ok) return SessionError.InvalidCredentials;
 
         // Use the same canonical key as IMAP and SMTP. Domains distinguish

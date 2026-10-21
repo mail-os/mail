@@ -477,7 +477,7 @@ pub const ManageSieveSession = struct {
             try self.sendNo(.TRYLATER, "No auth backend configured");
             return;
         };
-        const valid = auth.verifyCredentials(creds.authcid, creds.passwd) catch {
+        const valid = auth.verifyCredentialsForPeer(self.stream.peerIp(), creds.authcid, creds.passwd) catch {
             try self.sendNo(.TRYLATER, "Auth backend unavailable");
             return;
         };
@@ -761,7 +761,14 @@ pub const ManageSieveServer = struct {
     pub const AuthBackendInterface = struct {
         ptr: *anyopaque,
         verifyFn: *const fn (ptr: *anyopaque, username: []const u8, password: []const u8) VerifyError!bool,
+        verifyPeerFn: ?*const fn (ptr: *anyopaque, peer: []const u8, username: []const u8, password: []const u8) VerifyError!bool = null,
         pub const VerifyError = error{ DatabaseError, PasswordHashError, OutOfMemory, Unexpected };
+
+        pub fn verifyCredentialsForPeer(self: *AuthBackendInterface, peer: []const u8, u: []const u8, p: []const u8) VerifyError!bool {
+            if (self.verifyPeerFn) |verify| return verify(self.ptr, peer, u, p);
+            // Custom authentication providers retain responsibility for their policy.
+            return self.verifyCredentials(u, p);
+        }
 
         pub fn verifyCredentials(self: *AuthBackendInterface, u: []const u8, p: []const u8) VerifyError!bool {
             return self.verifyFn(self.ptr, u, p);
@@ -769,12 +776,18 @@ pub const ManageSieveServer = struct {
         pub fn from(backend: anytype) AuthBackendInterface {
             const Ptr = @TypeOf(backend);
             const gen = struct {
+                fn verifyPeer(ptr: *anyopaque, peer: []const u8, user: []const u8, pass: []const u8) VerifyError!bool {
+                    const s: Ptr = @ptrCast(@alignCast(ptr));
+                    if (@hasDecl(@typeInfo(Ptr).pointer.child, "verifyCredentialsForPeer"))
+                        return s.verifyCredentialsForPeer(peer, user, pass) catch return VerifyError.Unexpected;
+                    return verify(ptr, user, pass);
+                }
                 fn verify(ptr: *anyopaque, user: []const u8, pass: []const u8) VerifyError!bool {
                     const s: Ptr = @ptrCast(@alignCast(ptr));
                     return s.verifyCredentials(user, pass) catch return VerifyError.Unexpected;
                 }
             };
-            return .{ .ptr = @ptrCast(backend), .verifyFn = &gen.verify };
+            return .{ .ptr = @ptrCast(backend), .verifyFn = &gen.verify, .verifyPeerFn = &gen.verifyPeer };
         }
     };
 
@@ -1134,4 +1147,18 @@ test "SieveScript lifecycle" {
     try T.expectEqualStrings("test", s.name);
     try T.expectEqual(@as(usize, 5), s.size);
     s.deinit(T.allocator);
+}
+
+test "security: native ManageSieve adapters retain the shared login budget" {
+    const a = std.testing.allocator;
+    const database = @import("../storage/database.zig");
+    const native_auth = @import("../auth/auth.zig");
+    var db = try database.Database.init(a, ":memory:");
+    defer db.deinit();
+    var backend = native_auth.AuthBackend.init(a, &db);
+    defer backend.deinit();
+    backend.login_limiter.max_auth_attempts = 1;
+    _ = try backend.verifyBasicAuthForPeer("192.0.2.1", "invalid");
+    var adapter = ManageSieveServer.AuthBackendInterface.from(&backend);
+    try std.testing.expectError(ManageSieveServer.AuthBackendInterface.VerifyError.Unexpected, adapter.verifyCredentialsForPeer("192.0.2.1", "unknown", "wrong"));
 }

@@ -563,7 +563,8 @@ pub const CalDavSession = struct {
             var validated_username: ?[]const u8 = null;
 
             if (std.mem.startsWith(u8, auth_header.?, "Digest ")) {
-                validated_username = self.auth_backend.verifyDigestAuth(
+                validated_username = self.auth_backend.verifyDigestAuthForPeer(
+                    self.connection.peerIp(),
                     auth_header.?,
                     method_str,
                     "CalDAV/CardDAV Server",
@@ -575,7 +576,7 @@ pub const CalDavSession = struct {
 
             // Fall back to Basic auth if Digest didn't work
             if (validated_username == null and std.mem.startsWith(u8, auth_header.?, "Basic ")) {
-                validated_username = self.auth_backend.verifyBasicAuth(auth_header.?) catch |err| blk: {
+                validated_username = self.auth_backend.verifyBasicAuthForPeer(self.connection.peerIp(), auth_header.?) catch |err| blk: {
                     logger.err("CalDAV Basic authentication error: {}", .{err});
                     break :blk null;
                 };
@@ -2801,14 +2802,13 @@ const TlsCalDavSession = struct {
                 return true;
             }
 
-            logger.info("CalDAV: Got Authorization header: {s}", .{auth_header.?[0..@min(auth_header.?.len, 100)]});
-
             // Try Digest auth first, then fall back to Basic
             var validated_username: ?[]const u8 = null;
 
             if (std.mem.startsWith(u8, auth_header.?, "Digest ")) {
                 logger.info("CalDAV: Attempting Digest auth", .{});
-                validated_username = self.auth_backend.verifyDigestAuth(
+                validated_username = self.auth_backend.verifyDigestAuthForPeer(
+                    self.connection.peerIp(),
                     auth_header.?,
                     method_str,
                     "CalDAV/CardDAV Server",
@@ -2824,7 +2824,7 @@ const TlsCalDavSession = struct {
             // Fall back to Basic auth if Digest didn't work
             if (validated_username == null and std.mem.startsWith(u8, auth_header.?, "Basic ")) {
                 logger.info("CalDAV: Attempting Basic auth", .{});
-                validated_username = self.auth_backend.verifyBasicAuth(auth_header.?) catch |err| blk: {
+                validated_username = self.auth_backend.verifyBasicAuthForPeer(self.connection.peerIp(), auth_header.?) catch |err| blk: {
                     logger.err("CalDAV TLS Basic authentication error: {}", .{err});
                     break :blk null;
                 };

@@ -1115,7 +1115,8 @@ that must receive opportunistic plaintext mail, while keeping
 `SMTP_REQUIRE_TLS_FOR_AUTH=true` to protect credentials. Submission listeners
 on ports 465 and 587 always require authentication.
 
-SMTP authentication attempts have a shared per-IP budget of ten attempts per
-five minutes, charged before password hashing. Successful authentication releases
-its attempt. Message quotas are charged once per DATA or BDAT transaction and
+SMTP, IMAP, CalDAV/CardDAV and webmail authentication share a per-IP budget of
+ten attempts per five minutes, charged before password hashing. The native
+ManageSieve authentication adapter uses the same budget when configured.
+Successful authentication releases its attempt. Message quotas are charged once per DATA or BDAT transaction and
 include the authenticated account, across connections.

@@ -2513,8 +2513,11 @@ pub const ImapSession = struct {
         }
 
         // Validate credentials against auth backend
-        const valid = self.auth_backend.verifyCredentials(username, password) catch |err| {
-            std.log.err("Authentication error: {}", .{err});
+        const valid = self.auth_backend.verifyCredentialsForPeer(self.connection.peerIp(), username, password) catch |err| {
+            if (err == error.AuthenticationRateLimited)
+                std.log.warn("IMAP authentication rate-limited for {s}", .{self.connection.peerIp()})
+            else
+                std.log.err("Authentication error: {}", .{err});
             try self.sendResponse(tag, "NO", "LOGIN failed");
             return;
         };
@@ -2586,7 +2589,7 @@ pub const ImapSession = struct {
             };
             defer @memset(password_buf[0..password.len], 0);
 
-            const valid = self.auth_backend.verifyCredentials(username, password) catch {
+            const valid = self.auth_backend.verifyCredentialsForPeer(self.connection.peerIp(), username, password) catch {
                 try self.sendResponse(tag, "NO", "Authentication failed");
                 return;
             };
@@ -2640,7 +2643,7 @@ pub const ImapSession = struct {
         }
 
         // Verify credentials
-        const valid = self.auth_backend.verifyCredentials(credentials.username, credentials.password) catch {
+        const valid = self.auth_backend.verifyCredentialsForPeer(self.connection.peerIp(), credentials.username, credentials.password) catch {
             try self.sendResponse(tag, "NO", "Authentication failed");
             return;
         };
@@ -5445,4 +5448,47 @@ test "the name resolver follows a renamed message by its base name" {
     const same = "200.eml";
     try std.testing.expectEqual(@as([*]const u8, same.ptr), (try resolver.resolve(dir, same)).?.ptr);
     try std.testing.expect((try resolver.resolve(dir, "300.eml:2,S")) == null);
+}
+
+test "security: IMAP logins retain failed attempts across connections" {
+    const a = std.testing.allocator;
+    const h = try ImapTestHarness.create(a);
+    defer h.destroy();
+    a.free(h.session.username.?);
+    h.session.username = null;
+    h.session.state = .not_authenticated;
+    // A small KDF cost keeps this protocol regression quick; production's
+    // PasswordHasher.hashPassword still uses its normal 64 MB configuration.
+    var hash: [32]u8 = undefined;
+    try std.crypto.pwhash.argon2.kdf(a, &hash, "test-password", "0123456789abcdef", .{ .m = 8, .t = 1, .p = 1 }, .argon2id, io_compat.getIo());
+    var encoded: [43]u8 = undefined;
+    const hash_b64 = std.base64.standard_no_pad.Encoder.encode(&encoded, &hash);
+    const stored = try std.fmt.allocPrint(a, "$argon2id$v=19$m=8,t=1,p=1$MDEyMzQ1Njc4OWFiY2RlZg${s}", .{hash_b64});
+    defer a.free(stored);
+    _ = try h.db.createUser(ImapTestHarness.user, stored, ImapTestHarness.user);
+    for (0..10) |_| {
+        const reply = try h.run("a LOGIN hi@test.local wrong-password");
+        defer a.free(reply);
+        try ImapTestHarness.expectContains(reply, "a NO");
+    }
+    // A new session shares the backend and budget, rather than resetting it.
+    const connection = h.session.connection;
+    h.session.deinit();
+    h.session = ImapSession.init(a, connection, &h.auth_backend, &h.db, true);
+    const denied = try h.run("b LOGIN hi@test.local test-password");
+    defer a.free(denied);
+    try ImapTestHarness.expectContains(denied, "b NO");
+    try std.testing.expect(h.session.state == .not_authenticated);
+    // Successful protocol reconnects on a different peer release reservations.
+    for (0..20) |_| {
+        var next_connection = h.session.connection;
+        const peer = "192.0.2.5";
+        @memcpy(next_connection.peer_ip_buf[0..peer.len], peer);
+        next_connection.peer_ip_len = peer.len;
+        h.session.deinit();
+        h.session = ImapSession.init(a, next_connection, &h.auth_backend, &h.db, true);
+        const success = try h.run("c LOGIN hi@test.local test-password");
+        defer a.free(success);
+        try ImapTestHarness.expectContains(success, "c OK LOGIN completed");
+    }
 }

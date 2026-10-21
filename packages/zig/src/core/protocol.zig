@@ -2468,17 +2468,17 @@ pub const Session = struct {
     /// client. Fails closed when no auth backend is configured: granting
     /// auth there would make the server an authenticated open relay.
     fn completeAuth(self: *Session, writer: anytype, mechanism: []const u8, username: []const u8, password: []const u8) !void {
-        if (!(self.rate_limiter.beginAuthAttempt(self.remote_addr) catch false)) {
+        const attempt = (self.rate_limiter.beginAuthAttempt(self.remote_addr) catch null) orelse {
             try self.sendResponse(writer, 454, "Too many authentication attempts, try again later", null);
             return;
-        }
+        };
         const backend = self.auth_backend orelse {
             self.logger.warn("AUTH {s} attempted but no auth backend is configured; rejecting", .{mechanism});
             try self.sendResponse(writer, 454, "Temporary authentication failure", null);
             return;
         };
 
-        const valid = backend.verifyCredentials(username, password) catch {
+        const valid = backend.verifyCredentialsForPeer(self.remote_addr, username, password) catch {
             try self.sendResponse(writer, 454, "Temporary authentication failure", null);
             return;
         };
@@ -2492,7 +2492,7 @@ pub const Session = struct {
             };
             if (self.authenticated_username) |old| self.allocator.free(old);
             self.authenticated_username = identity;
-            self.rate_limiter.finishAuthSuccess(self.remote_addr);
+            self.rate_limiter.finishAuthSuccess(self.remote_addr, attempt);
             self.authenticated = true;
             self.state = .Authenticated;
             self.logger.info("User '{s}' authenticated via {s}", .{ sanitizedSlice(&safe_user, username.len), mechanism });

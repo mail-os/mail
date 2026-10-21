@@ -108,31 +108,38 @@ pub const RateLimiter = struct {
         self.auth_counters.deinit();
     }
 
+    pub const AuthAttempt = struct { window_start: i64 };
+
     /// Reserve before hashing so concurrent connections share the same budget.
     /// Successful attempts release only their own reservation, preserving failures.
-    pub fn beginAuthAttempt(self: *RateLimiter, ip: []const u8) !bool {
+    pub fn beginAuthAttempt(self: *RateLimiter, ip: []const u8) !?AuthAttempt {
         self.mutex.lock();
         defer self.mutex.unlock();
         const now = time_compat.timestamp();
         self.maybeSweepLocked(now);
+        if (self.max_auth_attempts == 0) return null;
+        var window_start = now;
         if (self.auth_counters.getPtr(ip)) |counter| {
             if (now - counter.window_start >= self.auth_window_seconds)
                 counter.* = .{ .count = 0, .window_start = now, .last_request = now };
-            if (counter.count >= self.max_auth_attempts) return false;
+            if (counter.count >= self.max_auth_attempts) return null;
             counter.count += 1;
             counter.last_request = now;
+            window_start = counter.window_start;
         } else {
             const key = try self.allocator.dupe(u8, ip);
             errdefer self.allocator.free(key);
             try self.auth_counters.put(key, .{ .count = 1, .window_start = now, .last_request = now });
         }
-        return true;
+        return .{ .window_start = window_start };
     }
 
-    pub fn finishAuthSuccess(self: *RateLimiter, ip: []const u8) void {
+    pub fn finishAuthSuccess(self: *RateLimiter, ip: []const u8, attempt: AuthAttempt) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        if (self.auth_counters.getPtr(ip)) |counter| counter.count -|= 1;
+        if (self.auth_counters.getPtr(ip)) |counter| {
+            if (counter.window_start == attempt.window_start) counter.count -|= 1;
+        }
     }
 
     pub fn checkAndIncrement(self: *RateLimiter, ip: []const u8) !bool {
@@ -433,11 +440,26 @@ test "security: failed login budget is shared independently of message quotas" {
     var limiter = RateLimiter.init(std.testing.allocator, 3600, 1000, 1000, 3600);
     defer limiter.deinit();
     limiter.max_auth_attempts = 2;
-    try std.testing.expect(try limiter.beginAuthAttempt("1.2.3.4"));
-    limiter.finishAuthSuccess("1.2.3.4");
-    try std.testing.expect(try limiter.beginAuthAttempt("1.2.3.4"));
-    try std.testing.expect(try limiter.beginAuthAttempt("1.2.3.4"));
-    try std.testing.expect(!try limiter.beginAuthAttempt("1.2.3.4"));
+    const first = (try limiter.beginAuthAttempt("1.2.3.4")).?;
+    limiter.finishAuthSuccess("1.2.3.4", first);
+    try std.testing.expect((try limiter.beginAuthAttempt("1.2.3.4")) != null);
+    try std.testing.expect((try limiter.beginAuthAttempt("1.2.3.4")) != null);
+    try std.testing.expect((try limiter.beginAuthAttempt("1.2.3.4")) == null);
     try std.testing.expect(try limiter.checkAndIncrement("1.2.3.4"));
-    try std.testing.expect(try limiter.beginAuthAttempt("4.3.2.1"));
+    try std.testing.expect((try limiter.beginAuthAttempt("4.3.2.1")) != null);
+}
+
+test "security: a late authentication success cannot refund a new window" {
+    var limiter = RateLimiter.init(std.testing.allocator, 300, 10, 10, 300);
+    defer limiter.deinit();
+    const old = (try limiter.beginAuthAttempt("192.0.2.1")).?;
+    const counter = limiter.auth_counters.getPtr("192.0.2.1").?;
+    // Simulate the window rolling over while the first KDF is still running.
+    counter.window_start = old.window_start + 1;
+    counter.count = 0;
+    const current = (try limiter.beginAuthAttempt("192.0.2.1")).?;
+    limiter.finishAuthSuccess("192.0.2.1", old);
+    try std.testing.expectEqual(@as(u32, 1), counter.count);
+    limiter.finishAuthSuccess("192.0.2.1", current);
+    try std.testing.expectEqual(@as(u32, 0), counter.count);
 }
