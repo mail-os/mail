@@ -56,3 +56,27 @@ test "public health fails closed for stale, missing and degraded monitoring" {
         try std.testing.expect(!isHealthy(allocator, raw));
     }
 }
+
+/// A read-only monitoring credential, deliberately independent of mailbox logins.
+pub fn authorized(provided: ?[]const u8) bool {
+    const file = fs.cwd().openFile("/var/lib/mail-health/public/read-token", .{}) catch return false;
+    defer file.close();
+    var token: [65]u8 = undefined;
+    const size = file.readAll(&token) catch return false;
+    if (size != 64) return false;
+    return tokensEqual(token[0..64], provided);
+}
+
+fn tokensEqual(expected: []const u8, provided: ?[]const u8) bool {
+    const value = provided orelse return false;
+    if (expected.len != 64 or value.len != 64) return false;
+    return std.crypto.timing_safe.eql([64]u8, expected[0..64].*, value[0..64].*);
+}
+
+test "monitoring token is exact and fails closed" {
+    const token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    try std.testing.expect(tokensEqual(token, token));
+    for ([_]?[]const u8{ null, "", token ++ "x", "1123456789abcdef1123456789abcdef1123456789abcdef1123456789abcdef" }) |value| {
+        try std.testing.expect(!tokensEqual(token, value));
+    }
+}

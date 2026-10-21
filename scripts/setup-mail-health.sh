@@ -10,6 +10,13 @@ install -d -m 0750 -o root -g mail-server /var/lib/mail-health /var/lib/mail-hea
 install -d -m 0700 /var/lib/mail-health/private
 # Future atomic snapshots inherit the public directory's mail-server group.
 chmod g+s /var/lib/mail-health/public
+# Never rotate on deployment: only the daemon and root can read this credential.
+if [ ! -s /var/lib/mail-health/public/read-token ]; then
+  umask 077
+  python3 -c 'import secrets; print(secrets.token_hex(32), end="")' > /var/lib/mail-health/public/read-token
+fi
+chown root:mail-server /var/lib/mail-health/public/read-token
+chmod 0640 /var/lib/mail-health/public/read-token
 cat > /usr/local/sbin/mail-protocol-health-check <<'CHECK'
 #!/bin/sh
 set -eu

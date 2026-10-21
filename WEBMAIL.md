@@ -776,3 +776,19 @@ the configured score-only policy. TLS padding is decoded according to
 [RFC 8446 section 5.2](https://www.rfc-editor.org/rfc/rfc8446#section-5.2).
 DNSBL rejection is now an explicit opt-in SMTP reply at RCPT. A TLS handshake or
 an open port alone is insufficient evidence that a server can receive mail.
+
+### Read-only service monitoring
+
+`GET /health/report` exposes the sanitized service-health envelope to monitoring
+systems. Send `oh-dear-health-check-secret` with the 64-character credential in
+`/var/lib/mail-health/public/read-token`. The installer generates it once and
+preserves it across deploys, readable only by root and the mail daemon group.
+An absent or incorrect credential returns 401. This credential grants no mailbox
+access. Responses disable caching and return 503 for unavailable, stale or
+unhealthy monitoring evidence. The public `/healthz` remains a summary only.
+
+StatusHQ can poll this endpoint as a health monitor. Configure a 180-second
+maximum report age and require the complete expected check inventory. Route
+incidents and recoveries through an independent alert channel as well as any
+email notifications. Public health, certificate and TCP monitors should run
+outside the mail host to detect host, routing and listener outages independently.
