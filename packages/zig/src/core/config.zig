@@ -120,6 +120,7 @@ pub const Config = struct {
     // Require STARTTLS (or implicit TLS) before AUTH is offered/accepted.
     // Default off to avoid locking out existing plaintext-auth clients.
     require_tls_for_auth: bool = false,
+    require_tls: bool = false,
     // Run inbound SPF/DKIM/DMARC/ARC checks and record Authentication-Results.
     antispam_check: bool = true,
     // When true, reject inbound mail that fails policy (DMARC reject). When
@@ -418,6 +419,8 @@ fn loadDefaultsFromProfile(allocator: std.mem.Allocator, profile: config_profile
         .port = profile_config.smtp_port,
         .max_connections = @intCast(profile_config.max_connections),
         .enable_tls = profile_config.require_tls,
+        .require_tls = profile_config.require_tls,
+        .require_tls_for_auth = profile_config.require_tls,
         .tls_cert_path = null,
         .tls_key_path = null,
         .enable_auth = profile_config.require_auth,
@@ -538,6 +541,10 @@ fn applyEnvironmentVariables(allocator: std.mem.Allocator, cfg: *Config) !void {
     }
     if (env.get("SMTP_ENABLE_DNSBL")) |value| {
         cfg.enable_dnsbl = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
+    }
+
+    if (env.get("SMTP_REQUIRE_TLS")) |value| {
+        cfg.require_tls = std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
     }
 
     // SMTP_REQUIRE_TLS_FOR_AUTH
@@ -995,4 +1002,11 @@ fn applyConfigFile(allocator: std.mem.Allocator, cfg: *Config, path: []const u8)
             cfg.enable_milter = value;
         }
     }
+}
+
+test "security: production profile requires encryption for authentication and mail" {
+    const cfg = try loadDefaultsFromProfile(std.testing.allocator, .production);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(cfg.require_tls);
+    try std.testing.expect(cfg.require_tls_for_auth);
 }

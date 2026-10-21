@@ -6,6 +6,9 @@ pub const RateLimiter = struct {
     allocator: std.mem.Allocator,
     ip_counters: std.StringHashMap(RateCounter),
     user_counters: std.StringHashMap(RateCounter),
+    auth_counters: std.StringHashMap(RateCounter),
+    max_auth_attempts: u32 = 10,
+    auth_window_seconds: i64 = 300,
     window_seconds: u64,
     max_requests: u32,
     max_requests_per_user: u32,
@@ -33,6 +36,7 @@ pub const RateLimiter = struct {
             .allocator = allocator,
             .ip_counters = std.StringHashMap(RateCounter).init(allocator),
             .user_counters = std.StringHashMap(RateCounter).init(allocator),
+            .auth_counters = std.StringHashMap(RateCounter).init(allocator),
             .window_seconds = window_seconds,
             .max_requests = max_requests,
             .max_requests_per_user = max_requests_per_user,
@@ -99,6 +103,36 @@ pub const RateLimiter = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.user_counters.deinit();
+        var auth_it = self.auth_counters.keyIterator();
+        while (auth_it.next()) |key| self.allocator.free(key.*);
+        self.auth_counters.deinit();
+    }
+
+    /// Reserve before hashing so concurrent connections share the same budget.
+    /// Successful attempts release only their own reservation, preserving failures.
+    pub fn beginAuthAttempt(self: *RateLimiter, ip: []const u8) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const now = time_compat.timestamp();
+        self.maybeSweepLocked(now);
+        if (self.auth_counters.getPtr(ip)) |counter| {
+            if (now - counter.window_start >= self.auth_window_seconds)
+                counter.* = .{ .count = 0, .window_start = now, .last_request = now };
+            if (counter.count >= self.max_auth_attempts) return false;
+            counter.count += 1;
+            counter.last_request = now;
+        } else {
+            const key = try self.allocator.dupe(u8, ip);
+            errdefer self.allocator.free(key);
+            try self.auth_counters.put(key, .{ .count = 1, .window_start = now, .last_request = now });
+        }
+        return true;
+    }
+
+    pub fn finishAuthSuccess(self: *RateLimiter, ip: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.auth_counters.getPtr(ip)) |counter| counter.count -|= 1;
     }
 
     pub fn checkAndIncrement(self: *RateLimiter, ip: []const u8) !bool {
@@ -134,6 +168,7 @@ pub const RateLimiter = struct {
         } else {
             // New IP
             const ip_copy = try self.allocator.dupe(u8, ip);
+            errdefer self.allocator.free(ip_copy);
             try self.ip_counters.put(ip_copy, RateCounter{
                 .count = 1,
                 .window_start = now,
@@ -177,6 +212,7 @@ pub const RateLimiter = struct {
         } else {
             // New user
             const user_copy = try self.allocator.dupe(u8, user);
+            errdefer self.allocator.free(user_copy);
             try self.user_counters.put(user_copy, RateCounter{
                 .count = 1,
                 .window_start = now,
@@ -226,6 +262,15 @@ pub const RateLimiter = struct {
             if (self.user_counters.fetchRemove(key)) |removed| {
                 self.allocator.free(removed.key);
             }
+        }
+        stale.clearRetainingCapacity();
+        var auth_it = self.auth_counters.iterator();
+        while (auth_it.next()) |entry| {
+            if (entry.value_ptr.last_request < now - self.auth_window_seconds * 2)
+                stale.append(self.allocator, entry.key_ptr.*) catch break;
+        }
+        for (stale.items) |key| {
+            if (self.auth_counters.fetchRemove(key)) |removed| self.allocator.free(removed.key);
         }
     }
 
@@ -382,4 +427,17 @@ pub fn isValidHostname(hostname: []const u8) bool {
     }
 
     return true;
+}
+
+test "security: failed login budget is shared independently of message quotas" {
+    var limiter = RateLimiter.init(std.testing.allocator, 3600, 1000, 1000, 3600);
+    defer limiter.deinit();
+    limiter.max_auth_attempts = 2;
+    try std.testing.expect(try limiter.beginAuthAttempt("1.2.3.4"));
+    limiter.finishAuthSuccess("1.2.3.4");
+    try std.testing.expect(try limiter.beginAuthAttempt("1.2.3.4"));
+    try std.testing.expect(try limiter.beginAuthAttempt("1.2.3.4"));
+    try std.testing.expect(!try limiter.beginAuthAttempt("1.2.3.4"));
+    try std.testing.expect(try limiter.checkAndIncrement("1.2.3.4"));
+    try std.testing.expect(try limiter.beginAuthAttempt("4.3.2.1"));
 }

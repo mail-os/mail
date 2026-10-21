@@ -127,9 +127,12 @@ pub fn build(b: *std.Build) void {
     // Create test step
     const test_step = b.step("test", "Run unit tests");
 
+    const test_filter = b.option([]const u8, "test-filter", "Run tests matching this substring");
+
     // Add tests for each module
     const test_files = [_][]const u8{
         "src/security_test.zig",
+        "src/security_regression_test.zig",
         "src/errors_test.zig",
         "src/config_test.zig",
         "src/fs_compat_test.zig",
@@ -187,6 +190,7 @@ pub fn build(b: *std.Build) void {
 
         const unit_tests = b.addTest(.{
             .root_module = test_module,
+            .filters = if (test_filter) |filter| &.{filter} else if (std.mem.eql(u8, test_file, "src/security_regression_test.zig")) &.{"security:"} else &.{},
         });
 
         const run_unit_tests = b.addRunArtifact(unit_tests);

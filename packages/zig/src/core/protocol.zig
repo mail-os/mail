@@ -21,6 +21,8 @@ const tls = @import("tls");
 const outbound = @import("../delivery/outbound.zig");
 const retry = @import("../delivery/retry.zig");
 const aliases = @import("../delivery/aliases.zig");
+const maildir_path = @import("maildir_path.zig");
+const submission_headers = @import("../message/submission.zig");
 const typesense = @import("../search/typesense.zig");
 const sieve = @import("../features/sieve.zig");
 
@@ -132,13 +134,13 @@ fn isNullReversePath(addr_part: []const u8) bool {
 /// Anything else used to be accepted and written to a maildir no account can
 /// open. `users` is anything with `userExists(name) !bool`; a lookup error
 /// counts as known, so a database fault never turns into a hard bounce.
-fn localRecipientKnown(users: anytype, rcpt: []const u8, resolveAlias: *const fn ([]const u8) []const u8) bool {
+fn localRecipientKnown(users: anytype, rcpt: []const u8, hasAlias: *const fn ([]const u8) bool) bool {
     if (users.userExists(rcpt) catch return true) return true;
 
     const local = if (std.mem.indexOfScalar(u8, rcpt, '@')) |at| rcpt[0..at] else rcpt;
     if (local.len == 0) return false;
     if (std.ascii.eqlIgnoreCase(local, "postmaster")) return true;
-    if (!std.mem.eql(u8, resolveAlias(local), local)) return true;
+    if (hasAlias(local)) return true;
 
     return users.userExists(local) catch true;
 }
@@ -278,9 +280,8 @@ const FakeUsers = struct {
     }
 };
 
-fn fakeAliases(local: []const u8) []const u8 {
-    if (std.mem.eql(u8, local, "abuse") or std.mem.eql(u8, local, "tlsrpt")) return "chris";
-    return local;
+fn fakeAliases(local: []const u8) bool {
+    return std.mem.eql(u8, local, "abuse") or std.mem.eql(u8, local, "tlsrpt");
 }
 
 test "local recipients resolve the way delivery resolves them" {
@@ -1055,6 +1056,9 @@ pub const Session = struct {
     mail_from: ?[]u8,
     rcpt_to: std.ArrayList([]u8),
     authenticated: bool,
+    authenticated_username: ?[]const u8 = null,
+    submission: bool = false,
+    message_quota_charged: bool = false,
     client_hostname: ?[]u8,
     logger: *logger.Logger,
     remote_addr: []const u8,
@@ -1130,6 +1134,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session) void {
+        if (self.authenticated_username) |identity| self.allocator.free(identity);
         if (self.mail_from) |mf| {
             self.allocator.free(mf);
         }
@@ -1357,12 +1362,10 @@ pub const Session = struct {
         }
 
         const hostname = std.mem.trim(u8, line[5..], " \t");
-        if (self.client_hostname) |old| {
-            self.allocator.free(old);
-        }
-        self.client_hostname = try self.allocator.dupe(u8, hostname);
-
-        self.state = .Greeted;
+        const owned_hostname = try self.allocator.dupe(u8, hostname);
+        if (self.client_hostname) |old| self.allocator.free(old);
+        self.client_hostname = owned_hostname;
+        self.resetTransactionState();
         try self.sendResponse(writer, 250, self.config.hostname, null);
     }
 
@@ -1373,12 +1376,10 @@ pub const Session = struct {
         }
 
         const hostname = std.mem.trim(u8, line[5..], " \t");
-        if (self.client_hostname) |old| {
-            self.allocator.free(old);
-        }
-        self.client_hostname = try self.allocator.dupe(u8, hostname);
-
-        self.state = .Greeted;
+        const owned_hostname = try self.allocator.dupe(u8, hostname);
+        if (self.client_hostname) |old| self.allocator.free(old);
+        self.client_hostname = owned_hostname;
+        self.resetTransactionState();
 
         // Send EHLO response with extensions
         var ehlo_buf: [256]u8 = undefined;
@@ -1396,7 +1397,7 @@ pub const Session = struct {
 
         // Only advertise AUTH over an encrypted channel when TLS is required for
         // auth, so credentials are never solicited in cleartext.
-        if (self.config.enable_auth and (self.conn_wrapper.using_tls or !self.config.require_tls_for_auth)) {
+        if (self.config.enable_auth and (self.conn_wrapper.using_tls or !(self.config.require_tls_for_auth or self.config.require_tls))) {
             _ = try self.conn_wrapper.write("250-AUTH PLAIN LOGIN\r\n");
         }
 
@@ -1407,9 +1408,47 @@ pub const Session = struct {
         _ = try self.conn_wrapper.write("250 HELP\r\n");
     }
 
+    fn maySendAs(self: *Session, address: []const u8) !bool {
+        const identity = self.authenticated_username orelse return false;
+        if (std.ascii.eqlIgnoreCase(identity, address)) return true;
+        const backend = self.auth_backend orelse return false;
+        var user = backend.db.getUserByUsername(identity) catch return false;
+        defer user.deinit(backend.db.allocator);
+        if (std.ascii.eqlIgnoreCase(user.email, address)) return true;
+        // An exact isolated account owns its address even when a legacy
+        // account happens to share its local part.
+        if (try backend.db.userExists(address)) return false;
+        // Legacy accounts use a bare username across the hosted domains.
+        if (std.mem.indexOfScalar(u8, identity, '@') == null) {
+            if (std.mem.indexOfScalar(u8, address, '@')) |at| {
+                return self.config.isLocalDomain(address[at + 1 ..]) and std.ascii.eqlIgnoreCase(identity, address[0..at]);
+            }
+        }
+        return false;
+    }
+
+    fn chargeMessageQuota(self: *Session) !bool {
+        if (self.message_quota_charged) return true;
+        if (!try self.rate_limiter.checkAndIncrement(self.remote_addr)) return false;
+        if (self.authenticated_username) |identity| {
+            if (!try self.rate_limiter.checkAndIncrementUser(identity)) return false;
+        }
+        self.message_quota_charged = true;
+        return true;
+    }
+
     fn handleMail(self: *Session, writer: anytype, line: []const u8) !void {
         if (self.state != .Greeted and self.state != .Authenticated) {
             try self.sendResponse(writer, 503, "Bad sequence of commands", null);
+            return;
+        }
+
+        if (self.config.require_tls and !self.conn_wrapper.using_tls) {
+            try self.sendResponse(writer, 530, "Must issue STARTTLS first", null);
+            return;
+        }
+        if (self.submission and self.config.enable_auth and !self.authenticated) {
+            try self.sendResponse(writer, 530, "Authentication required", null);
             return;
         }
 
@@ -1483,6 +1522,16 @@ pub const Session = struct {
             return;
         }
 
+        if (addr.len > 0) maildir_path.validate(addr) catch {
+            try self.sendResponse(writer, 501, "Invalid sender address", null);
+            return;
+        };
+
+        if (self.authenticated and addr.len > 0 and !try self.maySendAs(addr)) {
+            try self.sendResponse(writer, 553, "5.7.1 Sender address is not authorized for this account", null);
+            return;
+        }
+
         // Validate declared size against max message size
         if (declared_size) |size| {
             if (size > self.config.max_message_size) {
@@ -1534,6 +1583,11 @@ pub const Session = struct {
             return;
         }
 
+        maildir_path.validate(addr) catch {
+            try self.sendResponse(writer, 501, "Invalid recipient address", null);
+            return;
+        };
+
         // A recipient with no '@' (or an empty domain) is NOT a local recipient.
         const is_local = if (std.mem.indexOf(u8, addr, "@")) |at_pos|
             self.config.isLocalDomain(addr[at_pos + 1 ..])
@@ -1558,7 +1612,7 @@ pub const Session = struct {
         var lower_buf: [320]u8 = undefined;
         if (is_local and !self.config.catch_all) {
             if (self.auth_backend) |ab| {
-                if (!localRecipientKnown(ab.db, addr, aliases.resolve)) {
+                if (!localRecipientKnown(ab.db, addr, aliases.hasAlias)) {
                     // Mailboxes are stored lowercase, but senders do not always
                     // write addresses that way. Deliver `Hi@Example.com` to
                     // `hi@example.com` rather than refusing it.
@@ -1566,7 +1620,7 @@ pub const Session = struct {
                         std.ascii.lowerString(&lower_buf, addr)
                     else
                         null;
-                    if (lower != null and !std.mem.eql(u8, lower.?, addr) and localRecipientKnown(ab.db, lower.?, aliases.resolve)) {
+                    if (lower != null and !std.mem.eql(u8, lower.?, addr) and localRecipientKnown(ab.db, lower.?, aliases.hasAlias)) {
                         addr = lower.?;
                     } else {
                         const safe_addr = sanitizeForLog(addr);
@@ -1642,6 +1696,37 @@ pub const Session = struct {
         return pass;
     }
 
+    /// Bind an authenticated submission to an author owned by that account.
+    fn authorizeSubmission(self: *Session, message: *std.ArrayList(u8)) !bool {
+        if (!self.authenticated) return true;
+        if (try submission_headers.author(self.allocator, message.items)) |address| {
+            defer self.allocator.free(address);
+            return self.maySendAs(address);
+        }
+        // Supply the missing required author from an identity already authorized
+        // for this account. Never infer it from an untrusted message header.
+        var sender = self.mail_from orelse "";
+        var owned_sender: ?[]u8 = null;
+        defer if (owned_sender) |value| self.allocator.free(value);
+        if (sender.len == 0) {
+            const identity = self.authenticated_username orelse return false;
+            if (std.mem.indexOfScalar(u8, identity, '@') != null) {
+                sender = identity;
+            } else {
+                const backend = self.auth_backend orelse return false;
+                var user = backend.db.getUserByUsername(identity) catch return false;
+                defer user.deinit(backend.db.allocator);
+                owned_sender = try self.allocator.dupe(u8, user.email);
+                sender = owned_sender.?;
+            }
+        }
+        if (!submission_headers.validMailbox(sender) or !try self.maySendAs(sender)) return false;
+        const header = try std.fmt.allocPrint(self.allocator, "From: <{s}>\n", .{sender});
+        defer self.allocator.free(header);
+        try message.insertSlice(self.allocator, 0, header);
+        return true;
+    }
+
     /// Headers every accepted message gets before anything else reads it,
     /// whichever command (DATA or BDAT) carried it.
     ///
@@ -1678,7 +1763,7 @@ pub const Session = struct {
         }
 
         // Check rate limit before accepting message
-        const allowed = self.rate_limiter.checkAndIncrement(self.remote_addr) catch {
+        const allowed = self.chargeMessageQuota() catch {
             try self.sendResponse(writer, 451, "Internal error checking rate limit", null);
             return;
         };
@@ -1731,6 +1816,11 @@ pub const Session = struct {
             return;
         }
 
+        if (!(self.authorizeSubmission(&message_data) catch false)) {
+            try self.sendResponse(writer, 550, "5.7.1 Message author is not authorized for this account", null);
+            self.resetTransactionState();
+            return;
+        }
         self.stampAcceptedMessage(&message_data);
 
         // === Inbound authentication: SPF/DKIM/DMARC/ARC ===
@@ -2007,7 +2097,7 @@ pub const Session = struct {
         }
 
         // Check rate limit before accepting chunk
-        const allowed = self.rate_limiter.checkAndIncrement(self.remote_addr) catch {
+        const allowed = self.chargeMessageQuota() catch {
             self.chunking_handler.drainBDAT(line, &self.conn_wrapper);
             try self.sendResponse(writer, 451, "Internal error checking rate limit", null);
             return;
@@ -2087,7 +2177,17 @@ pub const Session = struct {
                 };
                 // The same trace and submission headers as the DATA path: a
                 // client that submits with CHUNKING used to skip both.
-                if (have_copy) self.stampAcceptedMessage(&msg_buf);
+                if (!have_copy) {
+                    try self.sendResponse(writer, 451, "Temporary message processing failure", null);
+                    self.resetTransactionState();
+                    return;
+                }
+                if (!(self.authorizeSubmission(&msg_buf) catch false)) {
+                    try self.sendResponse(writer, 550, "5.7.1 Message author is not authorized for this account", null);
+                    self.resetTransactionState();
+                    return;
+                }
+                self.stampAcceptedMessage(&msg_buf);
                 if (have_copy and shouldRunInboundPipeline(
                     self.authenticated,
                     self.config.antispam_check,
@@ -2191,6 +2291,7 @@ pub const Session = struct {
         self.rcpt_to.clearRetainingCapacity();
 
         self.spf_greylist_pass = null;
+        self.message_quota_charged = false;
 
         // Reset BDAT session if active
         if (self.bdat_session) |*session| {
@@ -2199,11 +2300,7 @@ pub const Session = struct {
             self.bdat_session = null;
         }
 
-        if (self.state == .Authenticated) {
-            self.state = .Authenticated;
-        } else {
-            self.state = .Greeted;
-        }
+        self.state = if (self.authenticated) .Authenticated else .Greeted;
     }
 
     fn handleRset(self: *Session, writer: anytype) !void {
@@ -2219,13 +2316,18 @@ pub const Session = struct {
 
         // Refuse cleartext AUTH when TLS is required (RFC 3207): credentials
         // must not be sent before STARTTLS / on a non-TLS connection.
-        if (self.config.require_tls_for_auth and !self.conn_wrapper.using_tls) {
+        if ((self.config.require_tls_for_auth or self.config.require_tls) and !self.conn_wrapper.using_tls) {
             try self.sendResponse(writer, 538, "Encryption required for requested authentication mechanism", null);
             return;
         }
 
         if (self.authenticated) {
             try self.sendResponse(writer, 503, "Already authenticated", null);
+            return;
+        }
+
+        if (self.state == .MailFrom or self.state == .RcptTo or self.state == .Data) {
+            try self.sendResponse(writer, 503, "AUTH is not permitted during a mail transaction", null);
             return;
         }
 
@@ -2360,6 +2462,10 @@ pub const Session = struct {
     /// client. Fails closed when no auth backend is configured: granting
     /// auth there would make the server an authenticated open relay.
     fn completeAuth(self: *Session, writer: anytype, mechanism: []const u8, username: []const u8, password: []const u8) !void {
+        if (!(self.rate_limiter.beginAuthAttempt(self.remote_addr) catch false)) {
+            try self.sendResponse(writer, 454, "Too many authentication attempts, try again later", null);
+            return;
+        }
         const backend = self.auth_backend orelse {
             self.logger.warn("AUTH {s} attempted but no auth backend is configured; rejecting", .{mechanism});
             try self.sendResponse(writer, 454, "Temporary authentication failure", null);
@@ -2373,6 +2479,14 @@ pub const Session = struct {
 
         const safe_user = sanitizeForLog(username);
         if (valid) {
+            const identity = try backend.canonicalUsername(username, self.allocator);
+            maildir_path.validate(identity) catch |err| {
+                self.allocator.free(identity);
+                return err;
+            };
+            if (self.authenticated_username) |old| self.allocator.free(old);
+            self.authenticated_username = identity;
+            self.rate_limiter.finishAuthSuccess(self.remote_addr);
             self.authenticated = true;
             self.state = .Authenticated;
             self.logger.info("User '{s}' authenticated via {s}", .{ sanitizedSlice(&safe_user, username.len), mechanism });
@@ -2407,13 +2521,22 @@ pub const Session = struct {
 
         self.logger.info("STARTTLS command accepted - starting TLS handshake", .{});
 
+        self.resetForTls();
         try self.doTlsHandshake();
 
-        // Reset session state after TLS upgrade as per RFC
-        self.state = .Initial;
-        self.authenticated = false;
-
         self.logger.info("TLS upgrade successful - connection now encrypted", .{});
+    }
+
+    fn resetForTls(self: *Session) void {
+        self.resetTransactionState();
+        self.authenticated = false;
+        if (self.authenticated_username) |identity| self.allocator.free(identity);
+        self.authenticated_username = null;
+        if (self.client_hostname) |hostname| self.allocator.free(hostname);
+        self.client_hostname = null;
+        self.conn_wrapper.read_buf_start = 0;
+        self.conn_wrapper.read_buf_end = 0;
+        self.state = .Initial;
     }
 
     /// Perform TLS handshake (shared by STARTTLS and SMTPS implicit TLS)
@@ -2579,8 +2702,11 @@ pub const Session = struct {
                 // wants the list of what the application just sent, not a
                 // mailbox per fixture address. See `Config.catch_all_mailbox`.
                 const username = if (self.config.catch_all)
-                    self.config.catch_all_mailbox
-                else if (is_isolated) rcpt else aliases.resolve(raw_local);
+                    try self.allocator.dupe(u8, self.config.catch_all_mailbox)
+                else if (is_isolated) try self.allocator.dupe(u8, rcpt) else try aliases.resolve(self.allocator, raw_local);
+                defer self.allocator.free(username);
+                try maildir_path.validate(username);
+                try maildir_path.validate(sub);
 
                 const new_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ username, sub });
                 defer self.allocator.free(new_dir);
@@ -2728,11 +2854,13 @@ pub const Session = struct {
             else
                 false;
             const fwd_username = if (fwd_is_isolated)
-                forward_to
+                try self.allocator.dupe(u8, forward_to)
             else if (std.mem.indexOf(u8, forward_to, "@")) |at_pos|
-                aliases.resolve(forward_to[0..at_pos])
+                try aliases.resolve(self.allocator, forward_to[0..at_pos])
             else
-                aliases.resolve(forward_to);
+                try aliases.resolve(self.allocator, forward_to);
+            defer self.allocator.free(fwd_username);
+            try maildir_path.validate(fwd_username);
 
             const cwd = fs_compat.cwd();
             const fwd_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{fwd_username});
@@ -2890,11 +3018,13 @@ pub const Session = struct {
                 else
                     false;
                 const fwd_username = if (fwd_is_isolated)
-                    forward_to
+                    try self.allocator.dupe(u8, forward_to)
                 else if (std.mem.indexOf(u8, forward_to, "@")) |at_pos|
-                    aliases.resolve(forward_to[0..at_pos])
+                    try aliases.resolve(self.allocator, forward_to[0..at_pos])
                 else
-                    aliases.resolve(forward_to);
+                    try aliases.resolve(self.allocator, forward_to);
+                defer self.allocator.free(fwd_username);
+                try maildir_path.validate(fwd_username);
 
                 const cwd = fs_compat.cwd();
                 const fwd_dir = std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{fwd_username}) catch return error.OutOfMemory;
@@ -3253,4 +3383,132 @@ test "SMTP session: BDAT chunks over the message size are refused and the transa
     const messages = try h.delivered();
     defer h.freeDelivered(messages);
     try std.testing.expectEqual(@as(usize, 0), messages.len);
+}
+
+test "security: Maildir writes reject traversal from recipients and forwards" {
+    const a = std.testing.allocator;
+    const h = try SmtpTestHarness.create(a, 4096);
+    defer h.destroy();
+    h.session.mail_from = try a.dupe(u8, "sender@example.com");
+    try h.session.rcpt_to.append(a, try a.dupe(u8, "../escape@test.local"));
+    try std.testing.expectError(error.InvalidMailboxPath, h.session.saveMessage("subject: test\n\nbody", false));
+    try std.testing.expectError(error.InvalidMailboxPath, h.session.forwardMessage("uplink", "sender@example.com", "body", "../escape@test.local"));
+}
+
+test "security: STARTTLS clears the plaintext envelope identity and buffered commands" {
+    const a = std.testing.allocator;
+    const h = try SmtpTestHarness.create(a, 4096);
+    defer h.destroy();
+    h.session.mail_from = try a.dupe(u8, "sender@example.com");
+    try h.session.rcpt_to.append(a, try a.dupe(u8, "uplink@test.local"));
+    h.session.authenticated = true;
+    h.session.authenticated_username = try a.dupe(u8, "uplink@test.local");
+    h.session.client_hostname = try a.dupe(u8, "plaintext.example");
+    h.session.bdat_session = chunking.BDATSession.init(a);
+    h.session.conn_wrapper.read_buf_end = 10;
+    h.session.resetForTls();
+    try std.testing.expect(h.session.mail_from == null);
+    try std.testing.expectEqual(@as(usize, 0), h.session.rcpt_to.items.len);
+    try std.testing.expect(h.session.bdat_session == null);
+    try std.testing.expect(h.session.authenticated_username == null);
+    try std.testing.expect(!h.session.authenticated);
+    try std.testing.expect(h.session.client_hostname == null);
+    try std.testing.expectEqual(@as(usize, 0), h.session.conn_wrapper.read_buf_end);
+    try std.testing.expectEqual(SessionState.Initial, h.session.state);
+}
+
+test "security: TLS policy suppresses plaintext AUTH and MAIL" {
+    const a = std.testing.allocator;
+    const h = try SmtpTestHarness.create(a, 4096);
+    defer h.destroy();
+    h.session.config.enable_auth = true;
+    h.session.config.require_tls = true;
+    const replies = try h.converse("EHLO test\r\nAUTH PLAIN AHVzZXIAcGFzcw==\r\nMAIL FROM:<a@test.local>\r\nQUIT\r\n");
+    defer a.free(replies);
+    try std.testing.expect(std.mem.indexOf(u8, replies, "250-AUTH") == null);
+    try std.testing.expect(std.mem.indexOf(u8, replies, "538 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, replies, "530 ") != null);
+}
+
+test "security: SMTP login attempts share a budget across connections" {
+    const a = std.testing.allocator;
+    var limiter = security.RateLimiter.init(a, 3600, 1000, 1000, 3600);
+    defer limiter.deinit();
+    limiter.max_auth_attempts = 1;
+    for (0..2) |i| {
+        const h = try SmtpTestHarness.create(a, 4096);
+        defer h.destroy();
+        h.session.config.enable_auth = true;
+        h.session.rate_limiter = &limiter;
+        const replies = try h.converse("EHLO test\r\nAUTH PLAIN AHVzZXIAcGFzcw==\r\nQUIT\r\n");
+        defer a.free(replies);
+        try std.testing.expectEqual(i == 1, std.mem.indexOf(u8, replies, "Too many authentication attempts") != null);
+    }
+}
+
+test "security: sender authorization and per-account quotas survive transactions" {
+    const a = std.testing.allocator;
+    const h = try SmtpTestHarness.create(a, 4096);
+    defer h.destroy();
+    h.session.authenticated = true;
+    h.session.authenticated_username = try a.dupe(u8, "uplink@test.local");
+    try std.testing.expect(try h.session.maySendAs("uplink@test.local"));
+    try std.testing.expect(!try h.session.maySendAs("other@test.local"));
+    h.rate_limiter.max_requests_per_user = 1;
+    try std.testing.expect(try h.session.chargeMessageQuota());
+    try std.testing.expect(try h.session.chargeMessageQuota()); // another BDAT chunk
+    h.session.resetTransactionState();
+    try std.testing.expectEqual(SessionState.Authenticated, h.session.state);
+    try std.testing.expect(!try h.session.chargeMessageQuota());
+}
+
+test "security: DATA and BDAT authorize the message author before delivery" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "DATA\r\nFrom: victim@test.local\r\n\r\nbody\r\n.\r\n", "BDAT 33 LAST\r\nFrom: victim@test.local\r\n\r\nbody\r\n" }) |body| {
+        const h = try SmtpTestHarness.create(a, 4096);
+        defer h.destroy();
+        h.session.authenticated = true;
+        h.session.authenticated_username = try a.dupe(u8, "attacker@test.local");
+        const script = try std.fmt.allocPrint(a, "EHLO test\r\nMAIL FROM:<attacker@test.local>\r\nRCPT TO:<uplink@test.local>\r\n{s}QUIT\r\n", .{body});
+        defer a.free(script);
+        const replies = try h.converse(script);
+        defer a.free(replies);
+        try std.testing.expect(std.mem.indexOf(u8, replies, "550 5.7.1 Message author") != null);
+    }
+}
+
+test "security: greetings reset unfinished transactions" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "HELO test\r\nQUIT\r\n", "EHLO test\r\nQUIT\r\n" }) |greeting| {
+        const h = try SmtpTestHarness.create(a, 4096);
+        defer h.destroy();
+        h.session.mail_from = try a.dupe(u8, "sender@test.local");
+        try h.session.rcpt_to.append(a, try a.dupe(u8, "uplink@test.local"));
+        h.session.bdat_session = chunking.BDATSession.init(a);
+        h.session.message_quota_charged = true;
+        const replies = try h.converse(greeting);
+        defer a.free(replies);
+        try std.testing.expect(h.session.mail_from == null);
+        try std.testing.expectEqual(@as(usize, 0), h.session.rcpt_to.items.len);
+        try std.testing.expect(h.session.bdat_session == null);
+        try std.testing.expect(!h.session.message_quota_charged);
+    }
+}
+
+test "security: legacy sender names cannot claim an isolated mailbox" {
+    const a = std.testing.allocator;
+    const h = try SmtpTestHarness.create(a, 4096);
+    defer h.destroy();
+    const database = @import("../storage/database.zig");
+    var db = try database.Database.init(a, ":memory:");
+    defer db.deinit();
+    _ = try db.createUser("info", "unused", "info@test.local");
+    _ = try db.createUser("info@tenant.local", "unused", "info@tenant.local");
+    var backend = auth.AuthBackend.init(a, &db);
+    defer backend.deinit();
+    h.session.auth_backend = &backend;
+    h.session.config.extra_local_domains = "test.local,tenant.local";
+    h.session.authenticated_username = try a.dupe(u8, "info");
+    try std.testing.expect(try h.session.maySendAs("info@test.local"));
+    try std.testing.expect(!try h.session.maySendAs("info@tenant.local"));
 }

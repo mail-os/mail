@@ -25,6 +25,15 @@ pub const Server = struct {
     dnsbl_checker: ?dnsbl.DnsblChecker,
     greylist: ?*greylist_mod.Greylist,
 
+    fn tryReserveConnection(self: *Server) bool {
+        while (true) {
+            const current = self.active_connections.load(.monotonic);
+            if (current >= self.config.max_connections) return false;
+            if (self.active_connections.cmpxchgWeak(current, current + 1, .monotonic, .monotonic) == null)
+                return true;
+        }
+    }
+
     pub fn init(
         allocator: std.mem.Allocator,
         cfg: config.Config,
@@ -135,16 +144,11 @@ pub const Server = struct {
                 continue;
             };
 
-            // Check connection limits
-            const current_connections = self.active_connections.load(.monotonic);
-            if (current_connections >= self.config.max_connections) {
-                self.logger.warn("Max connections ({d}) reached, rejecting new connection", .{self.config.max_connections});
+            if (!self.tryReserveConnection()) {
                 _ = connection.write("421 Too many connections, try again later\r\n") catch {};
                 connection.close();
                 continue;
             }
-
-            _ = self.active_connections.fetchAdd(1, .monotonic);
 
             // Real peer IP (empty if unknown). Used for logging + DNSBL here
             // while `connection` is still in scope; the session's remote_addr is
@@ -204,6 +208,7 @@ pub const Server = struct {
         connection: socket.Connection,
         remote_addr: []const u8,
         implicit_tls: bool = false,
+        submission: bool = false,
     };
 
     fn handleConnection(ctx: ConnectionContext) void {
@@ -251,6 +256,7 @@ pub const Server = struct {
             return;
         };
         defer session.deinit();
+        session.submission = ctx.submission;
 
         // For SMTPS (port 465), perform TLS handshake before SMTP banner
         if (ctx.implicit_tls) {
@@ -300,7 +306,11 @@ pub const Server = struct {
                 continue;
             };
 
-            _ = self.active_connections.fetchAdd(1, .monotonic);
+            if (!self.tryReserveConnection()) {
+                // SMTPS has not completed TLS, so close without plaintext SMTP.
+                connection.close();
+                continue;
+            }
 
             self.logger.logConnection("client", "SMTPS connected");
 
@@ -309,6 +319,7 @@ pub const Server = struct {
                 .connection = connection,
                 .remote_addr = "client",
                 .implicit_tls = true,
+                .submission = true,
             };
 
             const thread = std.Thread.spawn(.{}, handleConnection, .{ctx}) catch |err| {
@@ -357,7 +368,11 @@ pub const Server = struct {
                 continue;
             };
 
-            _ = self.active_connections.fetchAdd(1, .monotonic);
+            if (!self.tryReserveConnection()) {
+                _ = connection.write("421 Too many connections, try again later\r\n") catch {};
+                connection.close();
+                continue;
+            }
 
             self.logger.logConnection("client", "Submission connected");
 
@@ -366,6 +381,7 @@ pub const Server = struct {
                 .connection = connection,
                 .remote_addr = "client",
                 .implicit_tls = false, // STARTTLS, not implicit
+                .submission = true,
             };
 
             const thread = std.Thread.spawn(.{}, handleConnection, .{ctx}) catch |err| {
@@ -380,3 +396,13 @@ pub const Server = struct {
         submission_listener.close();
     }
 };
+
+test "security: every SMTP listener shares an atomic connection budget" {
+    var server: Server = undefined;
+    server.active_connections = std.atomic.Value(u32).init(0);
+    server.config.max_connections = 1;
+    try std.testing.expect(server.tryReserveConnection());
+    try std.testing.expect(!server.tryReserveConnection());
+    _ = server.active_connections.fetchSub(1, .monotonic);
+    try std.testing.expect(server.tryReserveConnection());
+}

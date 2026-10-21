@@ -12,6 +12,7 @@
 //! mail submitted by our own authenticated users, and never bouncing to
 //! external addresses rules out backscatter.
 
+const maildir_path = @import("../core/maildir_path.zig");
 const std = @import("std");
 const time_compat = @import("../core/time_compat.zig");
 const fs_compat = @import("../core/fs_compat.zig");
@@ -90,11 +91,11 @@ pub fn enqueueFailure(from: []const u8, to: []const u8, data: []const u8) void {
         std.log.err("delivery retry queue not running; dropping failed delivery to {s}", .{to});
         return;
     };
-    const id = s.queue.enqueue(from, to, data) catch |err| {
+    _ = s.queue.enqueue(from, to, data) catch |err| {
         std.log.err("failed to enqueue retry for {s}: {}", .{ to, err });
         return;
     };
-    std.log.info("delivery to {s} queued for retry (id {s})", .{ to, id });
+    std.log.info("delivery to {s} queued for retry", .{to});
 }
 
 /// Bytes of the original message quoted in a DSN.
@@ -178,7 +179,10 @@ fn deliverBounceLocally(s: *State, from_addr: []const u8, failed_to: []const u8,
         return;
     }
     const local_part = from_addr[0..at_pos];
+    maildir_path.validate(from_addr) catch return;
     const mailbox = if (s.db.userExists(from_addr) catch false) from_addr else local_part;
+
+    maildir_path.validate(mailbox) catch return;
 
     var gen = bounce_mod.BounceGenerator.init(s.allocator, s.hostname) catch return;
     defer gen.deinit();
@@ -227,4 +231,36 @@ test "bounce domains include configured local domains" {
     try std.testing.expect(isLocalBounceDomain("mail.example.com", null, "example.com"));
     try std.testing.expect(isLocalBounceDomain("mail.example.com", "other.test, tenant.test", "TENANT.TEST"));
     try std.testing.expect(!isLocalBounceDomain("mail.example.com", "other.test", "external.test"));
+}
+
+test "security: a bounce sender cannot escape the Maildir root" {
+    const a = std.testing.allocator;
+    var rnd: [8]u8 = undefined;
+    io_compat.randomBytes(&rnd);
+    const root = try std.fmt.allocPrint(a, "/tmp/mail-bounce-test-{x}", .{std.mem.readInt(u64, &rnd, .little)});
+    defer a.free(root);
+    try fs_compat.cwd().makePath(root);
+    defer fs_compat.cwd().deleteTree(root) catch {};
+    var prev: [4096]u8 = undefined;
+    _ = std.c.getcwd(&prev, prev.len) orelse return error.GetCwdFailed;
+    const root_z = try a.dupeSentinel(u8, root, 0);
+    defer a.free(root_z);
+    if (std.c.chdir(root_z.ptr) != 0) return error.ChdirFailed;
+    defer _ = std.c.chdir(@ptrCast(&prev));
+    var db = try database.Database.init(a, ":memory:");
+    defer db.deinit();
+    var s = State{
+        .allocator = a,
+        .db = &db,
+        .queue = queue_mod.MessageQueue.init(a),
+        .hostname = "test.local",
+        .extra_local_domains = null,
+        .delivery_method = .ses,
+        .ses_region = "us-east-1",
+        .running = std.atomic.Value(bool).init(false),
+    };
+    defer s.queue.deinit();
+    // Any vulnerable write stays inside this owned scratch directory.
+    deliverBounceLocally(&s, "../escape@test.local", "recipient@external.test", "permanent failure", "Subject: test\n\nbody");
+    try std.testing.expectError(error.FileNotFound, fs_compat.cwd().access("escape", .{}));
 }

@@ -417,11 +417,12 @@ fn deliverOne(allocator: std.mem.Allocator, cfg: SendConfig, from: []const u8, r
     const is_local = if (cfg.mail_config) |config| config.isLocalDomain(domain) else isLocalDomain(domain, cfg.hostname);
     if (at != null and is_local) {
         const user = if (cfg.mail_config != null and cfg.mail_config.?.catch_all)
-            cfg.mail_config.?.catch_all_mailbox
+            try allocator.dupe(u8, cfg.mail_config.?.catch_all_mailbox)
         else if (cfg.auth != null and (cfg.auth.?.db.userExists(rcpt) catch false))
-            rcpt
+            try allocator.dupe(u8, rcpt)
         else
-            aliases.resolve(rcpt[0..at.?]);
+            try aliases.resolve(allocator, rcpt[0..at.?]);
+        defer allocator.free(user);
         if (!isSafeLocalPart(user)) return ComposeError.InvalidAddress;
         if (cfg.auth) |auth| {
             if (!(try auth.db.userExists(user))) return ComposeError.InvalidAddress;

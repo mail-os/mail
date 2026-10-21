@@ -88,6 +88,7 @@ pub const MessageQueue = struct {
             .db = db,
         };
 
+        errdefer queue.deinit();
         // Initialize database schema
         try queue.initSchema();
 
@@ -150,24 +151,33 @@ pub const MessageQueue = struct {
                 const status_str = stmt.columnText(4);
                 const error_msg_text = stmt.columnText(10);
 
+                const owned_id = try self.allocator.dupe(u8, id);
+                errdefer self.allocator.free(owned_id);
+                const owned_from = try self.allocator.dupe(u8, from_addr);
+                errdefer self.allocator.free(owned_from);
+                const owned_to = try self.allocator.dupe(u8, to_addr);
+                errdefer self.allocator.free(owned_to);
+                const owned_data = try self.allocator.dupe(u8, message_data);
+                errdefer self.allocator.free(owned_data);
+                const owned_error = if (error_msg_text.len > 0) try self.allocator.dupe(u8, error_msg_text) else null;
+                errdefer if (owned_error) |value| self.allocator.free(value);
+                const status = try MessageStatus.fromString(status_str);
                 msg.* = .{
-                    .id = try self.allocator.dupe(u8, id),
-                    .from = try self.allocator.dupe(u8, from_addr),
-                    .to = try self.allocator.dupe(u8, to_addr),
-                    .data = try self.allocator.dupe(u8, message_data),
-                    .status = try MessageStatus.fromString(status_str),
+                    .id = owned_id,
+                    .from = owned_from,
+                    .to = owned_to,
+                    .data = owned_data,
+                    .status = if (status == .processing) .pending else status,
                     .attempts = @intCast(stmt.columnInt64(5)),
                     .max_attempts = @intCast(stmt.columnInt64(6)),
                     .next_retry = stmt.columnInt64(7),
                     .created_at = stmt.columnInt64(8),
                     .updated_at = stmt.columnInt64(9),
-                    .error_message = if (error_msg_text.len > 0)
-                        try self.allocator.dupe(u8, error_msg_text)
-                    else
-                        null,
+                    .error_message = owned_error,
                 };
 
                 try self.messages.append(self.allocator, msg);
+                errdefer _ = self.messages.pop();
                 try self.index.put(self.allocator, msg.id, self.messages.items.len - 1);
 
                 // Track highest ID for next_id
@@ -246,17 +256,25 @@ pub const MessageQueue = struct {
 
         const id = try std.fmt.allocPrint(self.allocator, "{d}", .{self.next_id});
         self.next_id += 1;
+        errdefer self.allocator.free(id);
 
         const msg = try self.allocator.create(QueuedMessage);
         errdefer self.allocator.destroy(msg);
 
         const now = time_compat.timestamp();
 
+        const owned_from = try self.allocator.dupe(u8, from);
+        errdefer self.allocator.free(owned_from);
+        const owned_to = try self.allocator.dupe(u8, to);
+        errdefer self.allocator.free(owned_to);
+        const owned_data = try self.allocator.dupe(u8, data);
+        errdefer self.allocator.free(owned_data);
+
         msg.* = .{
             .id = id,
-            .from = try self.allocator.dupe(u8, from),
-            .to = try self.allocator.dupe(u8, to),
-            .data = try self.allocator.dupe(u8, data),
+            .from = owned_from,
+            .to = owned_to,
+            .data = owned_data,
             .status = .pending,
             .attempts = 0,
             .max_attempts = 5,
@@ -267,7 +285,9 @@ pub const MessageQueue = struct {
         };
 
         try self.messages.append(self.allocator, msg);
+        errdefer _ = self.messages.pop();
         try self.index.put(self.allocator, msg.id, self.messages.items.len - 1);
+        errdefer _ = self.index.remove(msg.id);
 
         // Persist to database
         try self.persistMessage(msg);
@@ -349,33 +369,34 @@ pub const MessageQueue = struct {
         const msg = self.messages.items[i];
         const now = time_compat.timestamp();
 
-        if (msg.attempts >= msg.max_attempts) {
-            // Permanent failure
-            msg.status = .failed;
+        // A failed allocation or disk update must release the worker's claim.
+        // Keep the prior owned error string, but make this message retryable.
+        errdefer {
+            msg.status = .retry;
+            msg.next_retry = now + 60;
             msg.updated_at = now;
-            if (msg.error_message) |old| self.allocator.free(old);
-            msg.error_message = try self.allocator.dupe(u8, error_msg);
+        }
 
-            // Persist failed status to database for audit trail
-            try self.persistMessage(msg);
+        const next_error = try self.allocator.dupe(u8, error_msg);
+        errdefer self.allocator.free(next_error);
+        var updated = msg.*;
+        updated.error_message = next_error;
+        updated.updated_at = now;
 
-            // Delete from active queue
+        if (msg.attempts >= msg.max_attempts) {
+            updated.status = .failed;
+            try self.persistMessage(&updated);
             try self.deleteFromDB(id);
-
-            // Remove from active queue
             self.removeAt(i);
+            self.allocator.free(next_error);
             return .permanent;
         } else {
-            // Schedule retry with exponential backoff
-            const backoff_seconds: i64 = @as(i64, @intCast(std.math.pow(u32, 2, msg.attempts))) * 60; // 2^n minutes
-            msg.status = .retry;
-            msg.next_retry = now + backoff_seconds;
-            msg.updated_at = now;
+            const backoff_seconds: i64 = @as(i64, @intCast(std.math.pow(u32, 2, msg.attempts))) * 60;
+            updated.status = .retry;
+            updated.next_retry = now + backoff_seconds;
+            try self.persistMessage(&updated);
             if (msg.error_message) |old| self.allocator.free(old);
-            msg.error_message = try self.allocator.dupe(u8, error_msg);
-
-            // Persist retry state
-            try self.persistMessage(msg);
+            msg.* = updated;
             return .scheduled;
         }
     }
@@ -470,4 +491,81 @@ test "message queue retry logic" {
 
     const stats = queue.getStats();
     try testing.expectEqual(@as(usize, 1), stats.retry);
+}
+
+fn allocationFailureEnqueue(a: std.mem.Allocator) !void {
+    var queue = MessageQueue.init(a);
+    defer queue.deinit();
+    _ = try queue.enqueue("from@example.com", "to@example.com", "body");
+}
+
+test "security: enqueue handles every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFailureEnqueue, .{});
+}
+
+test "security: retry retains the previous error after allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var queue = MessageQueue.init(failing.allocator());
+    defer queue.deinit();
+    const id = try queue.enqueue("from@example.com", "to@example.com", "body");
+    _ = try queue.markForRetry(id, "old error");
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, queue.markForRetry(id, "new error"));
+    try std.testing.expectEqualStrings("old error", queue.messages.items[0].error_message.?);
+}
+
+test "security: failed queue persistence leaves no linked message" {
+    var db = try database.Database.init(std.testing.allocator, ":memory:");
+    defer db.deinit();
+    var queue = try MessageQueue.initWithDB(std.testing.allocator, &db);
+    defer queue.deinit();
+    try db.exec("DROP TABLE message_queue");
+    if (queue.enqueue("from@example.com", "to@example.com", "body")) |_| return error.ExpectedPersistenceFailure else |_| {}
+    try std.testing.expectEqual(@as(usize, 0), queue.messages.items.len);
+    try std.testing.expectEqual(@as(u32, 0), queue.index.count());
+}
+
+test "security: retry persistence failure releases the worker claim" {
+    var db = try database.Database.init(std.testing.allocator, ":memory:");
+    defer db.deinit();
+    var queue = try MessageQueue.initWithDB(std.testing.allocator, &db);
+    defer queue.deinit();
+    const id = try queue.enqueue("from@example.com", "to@example.com", "body");
+    _ = queue.getNextPending();
+    try db.exec("DROP TABLE message_queue");
+    if (queue.markForRetry(id, "temporary failure")) |_| return error.ExpectedPersistenceFailure else |_| {}
+    try std.testing.expectEqual(MessageStatus.retry, queue.messages.items[0].status);
+}
+
+test "security: restart recovers persisted worker claims" {
+    const a = std.testing.allocator;
+    var db = try database.Database.init(a, ":memory:");
+    defer db.deinit();
+    {
+        var queue = try MessageQueue.initWithDB(a, &db);
+        defer queue.deinit();
+        _ = try queue.enqueue("from@example.com", "to@example.com", "body");
+        try db.exec("UPDATE message_queue SET status = 'processing'");
+    }
+    var restored = try MessageQueue.initWithDB(a, &db);
+    defer restored.deinit();
+    try std.testing.expect(restored.getNextPending() != null);
+}
+
+fn allocationFailureLoad(a: std.mem.Allocator, db: *database.Database) !void {
+    var queue = try MessageQueue.initWithDB(a, db);
+    defer queue.deinit();
+}
+
+test "security: queue reload releases every partial allocation" {
+    const a = std.testing.allocator;
+    var db = try database.Database.init(a, ":memory:");
+    defer db.deinit();
+    {
+        var queue = try MessageQueue.initWithDB(a, &db);
+        defer queue.deinit();
+        _ = try queue.enqueue("from@example.com", "to@example.com", "body");
+        _ = try queue.enqueue("from@example.com", "to@example.com", "another");
+    }
+    try std.testing.checkAllAllocationFailures(a, allocationFailureLoad, .{&db});
 }

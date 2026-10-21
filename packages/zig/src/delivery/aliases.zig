@@ -83,20 +83,12 @@ fn loadLocked() void {
     }
 }
 
-/// Resolve a local part through the aliases file. Returns the final
-/// delivery target (the input itself when unaliased). The returned slice
-/// is valid until the next reload — callers must use or copy it promptly
-/// (delivery does so within the same request).
-pub fn resolve(local_part: []const u8) []const u8 {
-    mutex.lock();
-    defer mutex.unlock();
-
+fn resolveLocked(local_part: []const u8) []const u8 {
     const now = time_compat.timestamp();
     if (map == null or now - last_load >= reload_interval_seconds) {
         last_load = now;
         loadLocked();
     }
-
     var current = local_part;
     var hops: usize = 0;
     while (hops < max_hops) : (hops += 1) {
@@ -106,8 +98,23 @@ pub fn resolve(local_part: []const u8) []const u8 {
     return current;
 }
 
+/// Caller owns the result. Copy while the reload mutex still protects it.
+pub fn resolve(allocator: std.mem.Allocator, local_part: []const u8) ![]u8 {
+    mutex.lock();
+    defer mutex.unlock();
+    return allocator.dupe(u8, resolveLocked(local_part));
+}
+
+pub fn hasAlias(local_part: []const u8) bool {
+    mutex.lock();
+    defer mutex.unlock();
+    return !std.mem.eql(u8, resolveLocked(local_part), local_part);
+}
+
 test "alias file parsing and chains" {
     const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
 
     // Build a temp aliases file and point resolution at it.
     const path = "/tmp/pantry-mail-aliases-test";
@@ -144,13 +151,29 @@ test "alias file parsing and chains" {
     last_load = time_compat.timestamp() + 1000; // suppress reload during asserts
     mutex.unlock();
 
-    try testing.expectEqualStrings("chris", resolve("postmaster"));
-    try testing.expectEqualStrings("chris", resolve("abuse")); // chain: abuse -> postmaster -> chris
-    try testing.expectEqualStrings("chris", resolve("tlsrpt"));
-    try testing.expectEqualStrings("nobody-aliased", resolve("nobody-aliased"));
+    try testing.expectEqualStrings("chris", (try resolve(arena.allocator(), "postmaster")));
+    try testing.expectEqualStrings("chris", (try resolve(arena.allocator(), "abuse"))); // chain: abuse -> postmaster -> chris
+    try testing.expectEqualStrings("chris", (try resolve(arena.allocator(), "tlsrpt")));
+    try testing.expectEqualStrings("nobody-aliased", (try resolve(arena.allocator(), "nobody-aliased")));
 
     mutex.lock();
     clearLocked();
     last_load = 0;
     mutex.unlock();
+}
+
+test "security: resolved aliases remain owned across reload" {
+    mutex.lock();
+    clearLocked();
+    map = std.StringHashMap([]const u8).init(gpa);
+    try map.?.put(try gpa.dupe(u8, "role"), try gpa.dupe(u8, "mailbox"));
+    last_load = time_compat.timestamp() + 1000;
+    mutex.unlock();
+    const result = try resolve(std.testing.allocator, "role");
+    defer std.testing.allocator.free(result);
+    mutex.lock();
+    clearLocked();
+    last_load = 0;
+    mutex.unlock();
+    try std.testing.expectEqualStrings("mailbox", result);
 }
