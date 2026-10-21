@@ -13,10 +13,12 @@ export async function buildWebmail(): Promise<void> {
   const dist = join(root, '../zig/src/api/webmail_dist')
   const styles = await readFile(join(root, 'public/styles.css'))
   await mkdir(dist, { recursive: true })
-  for (const page of ['index', 'login', 'recover']) {
+  for (const page of ['index', 'login', 'recover', 'status']) {
     const html = await renderTemplate(join(root, `pages/${page}.stx`), { injectCSS: true })
     if (!html.includes('data-stx') || html.includes('<script client>'))
       throw new Error(`STX did not compile ${page}`)
+    if (html.includes('__stxModules[') && !/<script\b[^>]*data-stx-modules/.test(html))
+      throw new Error(`STX did not bundle the client module registry for ${page}`)
     await writeFile(join(dist, `${page}.html`), html.replace('href="/styles.css"', `href="${stylesheetUrl(styles)}"`))
   }
   await writeFile(join(dist, 'styles.css'), styles)

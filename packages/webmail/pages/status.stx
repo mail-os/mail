@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mail health</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<script client>
+import { useServiceHealth } from '../functions/use-service-health'
+const { snapshot, status, label, checkedAt, busy, error, refresh, tick } = useServiceHealth()
+onMount(refresh)
+useInterval(refresh, 30000, { whileVisible: true })
+useInterval(tick, 1000, { whileVisible: true })
+</script>
+<main class="health-page">
+  <nav class="health-nav" aria-label="Mail navigation"><a href="/">Mail</a><a href="/login">Account sign in</a></nav>
+  <header class="health-header"><div><p class="health-eyebrow">Service health</p><h1>Mail delivery</h1><p>Live protocol checks and recent incidents.</p></div><button class="wm-action" @click="refresh()" :disabled="busy" :text="busy ? 'Checking…' : 'Refresh'"></button></header>
+  <section class="health-summary" :class="{ 'health-summary--ok': status === 'healthy', 'health-summary--warn': status !== 'healthy' }" aria-live="polite"><h2 :text="label"></h2><p :text="'Last checked: ' + checkedAt"></p><p :if="status === 'unknown'">A missing or outdated report cannot confirm that mail is working.</p><p :if="error" :text="error" role="alert"></p><p :if="status === 'degraded'">Some mail may be delayed. Administrators can review the failing checks below.</p></section>
+  <section :if="snapshot?.available" class="health-card"><h2>Current checks</h2><p>Tests run every minute. Delivery error counts cover the last five minutes. Passing checks confirm the tested paths; they do not prove that a particular email has arrived.</p><div class="health-check" :for="check in (snapshot?.report?.checks || [])"><span :text="check.name"></span><span class="health-result" :class="{ 'health-result--bad': !check.ok || status === 'unknown' }" :text="status === 'unknown' ? 'Outdated' : check.ok ? 'Passing' : 'Needs attention'"></span><small :if="check.count > 0" :text="check.count + ' errors in 5 minutes'"></small><small :if="check.pending > 0" :text="check.pending + ' alerts awaiting delivery'"></small></div></section>
+  <section :if="snapshot?.available" class="health-card"><h2>Incident history</h2><p :if="!(snapshot?.report?.events?.length)">No incidents recorded since monitoring started.</p><article :for="event in (snapshot?.report?.events || [])" class="health-event"><time :text="new Date(event.at * 1000).toLocaleString()"></time><p :text="event.summary"></p></article></section>
+  <p class="health-footnote">Health data contains no message contents or mailbox addresses. Administrator alerts use a separate transport from mail.</p>
+</main>
+</body>
+</html>

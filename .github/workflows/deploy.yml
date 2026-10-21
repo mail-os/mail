@@ -10,6 +10,10 @@ on:
       - 'packages/cloud/package.json'
       - 'scripts/deploy*.sh'
       - 'scripts/deploy-webmail.ts'
+      - 'scripts/mail-health.py'
+      - 'scripts/test-mail-tls.py'
+      - 'scripts/setup-mail-health.sh'
+      - 'scripts/mail-health-watch.py'
       - 'bun.lock'
   workflow_dispatch: {}
 
@@ -18,7 +22,7 @@ permissions:
 
 concurrency:
   group: mail-production
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   deploy:
@@ -44,27 +48,50 @@ jobs:
       working-directory: packages/zig
       run: zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast
 
+    - name: Test the candidate before production activation
+      run: python3 scripts/test-mail-tls.py packages/zig/zig-out/bin/mail
+
     - name: Deploy to Hetzner
       env:
         SSH_KEY: ${{ secrets.HETZNER_SSH_KEY }}
+        KNOWN_HOSTS: ${{ secrets.HETZNER_KNOWN_HOSTS }}
         HOST: ${{ secrets.HETZNER_HOST }}
       run: |
         set -euo pipefail
         mkdir -p ~/.ssh
         printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
         chmod 600 ~/.ssh/deploy_key
-        ssh-keyscan -H "$HOST" >> ~/.ssh/known_hosts 2>/dev/null
+        test -n "$KNOWN_HOSTS"
+        printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+        chmod 600 ~/.ssh/known_hosts
 
         # ship the freshly built binary
-        scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
+        scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
           packages/zig/zig-out/bin/mail "root@$HOST:/tmp/mail-new"
 
-        # swap + restart with an ELF sanity check and rollback on failure
-        ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o StrictHostKeyChecking=accept-new "root@$HOST" '
+        scp -i ~/.ssh/deploy_key scripts/mail-health.py scripts/mail-health-watch.py scripts/setup-mail-health.sh "root@$HOST:/tmp/"
+
+        # Swap only a tested candidate, and roll back if protocol checks fail.
+        ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o StrictHostKeyChecking=yes "root@$HOST" '
           set -e
           test "$(head -c4 /tmp/mail-new | od -An -tx1 | tr -d " ")" = "7f454c46" || { echo "not an ELF binary"; exit 1; }
-          systemctl stop mail || true
-          cp -f /opt/mail/mail-server /opt/mail/mail-server.bak
+          exec 9>/run/mail-health-check.lock
+          flock 9
+          cp -a /opt/mail/mail-server /opt/mail/mail-server.bak
+          rollback() {
+            code=$?
+            trap - EXIT
+            if [ "$code" != 0 ]; then
+              echo "Activation failed; restoring the previous mail binary"
+              restore=$(mktemp /opt/mail/.mail-rollback.XXXXXX)
+              cp -a /opt/mail/mail-server.bak "$restore"
+              mv -f "$restore" /opt/mail/mail-server
+              systemctl restart mail
+            fi
+            exit "$code"
+          }
+          trap rollback EXIT
+          systemctl stop mail
           mv /tmp/mail-new /opt/mail/mail-server
           chmod +x /opt/mail/mail-server
           chown mail-server:mail-server /opt/mail/mail-server
@@ -72,35 +99,22 @@ jobs:
           sleep 3
           active=$(systemctl is-active mail)
           echo "mail service: $active"
-          if [ "$active" != "active" ]; then
+          if [ "$active" != "active" ] || ! python3 /tmp/mail-health.py --host mail.stacksjs.com --connect-host 127.0.0.1; then
             echo "restart failed; rolling back"
-            cp -f /opt/mail/mail-server.bak /opt/mail/mail-server
-            systemctl restart mail
             exit 1
           fi
+          sh /tmp/setup-mail-health.sh /tmp/mail-health.py
+          trap - EXIT
         '
         echo "Deployed to Hetzner ($HOST)."
         export GIT_SSH_COMMAND="ssh -i ~/.ssh/deploy_key -o BatchMode=yes"
         # The deployment script uses ssh/scp, which respect this per-host identity.
         printf 'Host %s\n  IdentityFile ~/.ssh/deploy_key\n  BatchMode yes\n' "$HOST" > ~/.ssh/config
         bun scripts/deploy-webmail.ts "root@$HOST"
+        # Tenant provisioning can rewrite the legacy health wrapper. Install last.
+        ssh -i ~/.ssh/deploy_key -o BatchMode=yes "root@$HOST" "sh /tmp/setup-mail-health.sh /tmp/mail-health.py && systemctl start mail-health.service"
 
-    - name: Verify public mail protocols
+    - name: Verify public mail commands after TLS
       env:
         HOST: ${{ secrets.HETZNER_HOST }}
-      run: |
-        set -euo pipefail
-        # Run from the GitHub runner, outside Hetzner. A local listener check
-        # cannot detect a cloud firewall that dropped the mail ports.
-        for port in 25 143 465 587 993; do
-          timeout 10 bash -c "exec 3<>/dev/tcp/$HOST/$port"
-          echo "public tcp/$port reachable"
-        done
-        # Prove the implicit-TLS endpoints complete a real handshake and serve
-        # the certificate for mail.stacksjs.com, not merely accept a socket.
-        timeout 15 openssl s_client -connect "$HOST:993" -servername mail.stacksjs.com \
-          -verify_hostname mail.stacksjs.com -verify_return_error </dev/null 2>/dev/null \
-          | openssl x509 -noout -checkend 86400
-        timeout 15 openssl s_client -connect "$HOST:465" -servername mail.stacksjs.com \
-          -verify_hostname mail.stacksjs.com -verify_return_error </dev/null 2>/dev/null \
-          | openssl x509 -noout -checkend 86400
+      run: python3 scripts/mail-health.py --host mail.stacksjs.com --connect-host "$HOST"

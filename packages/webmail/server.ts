@@ -21,7 +21,7 @@ async function main(): Promise<void> {
         }
         catch { return Response.json({ message: 'Mail API is unavailable.' }, { status: 502 }) }
       }
-      const assets: Record<string, string> = { '/': 'index.html', '/login': 'login.html', '/forgot': 'recover.html', '/reset': 'recover.html', '/styles.css': 'styles.css' }
+      const assets: Record<string, string> = { '/status': 'status.html', '/': 'index.html', '/login': 'login.html', '/forgot': 'recover.html', '/reset': 'recover.html', '/styles.css': 'styles.css' }
       const file = assets[url.pathname]
       return file ? new Response(Bun.file(`${dist}/${file}`)) : new Response('Not found', { status: 404 })
     },

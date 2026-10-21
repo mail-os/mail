@@ -7,26 +7,55 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   public-mail-health:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 5
     steps:
-      - name: Verify public TCP and TLS
+      - uses: actions/checkout@v6
+      - name: Verify commands after TLS, including padded peer records
+        id: probe
         env:
           HOST: ${{ secrets.HETZNER_HOST }}
+        run: python3 scripts/mail-health.py --host mail.stacksjs.com --connect-host "$HOST" --timeout 4
+      - name: Verify that the host monitor is fresh and healthy
+        id: freshness
+        if: always()
         run: |
-          set -euo pipefail
-          for port in 25 143 465 587 993; do
-            timeout 10 bash -c "exec 3<>/dev/tcp/$HOST/$port"
-            echo "public tcp/$port reachable"
-          done
-          for port in 465 993; do
-            # The certificate covers every hosted mail domain, so its subject CN
-            # is whichever name sorts first. Verify the hostname against the
-            # names the certificate is actually valid for, as deploy.yml does.
-            timeout 15 openssl s_client -connect "$HOST:$port" -servername mail.stacksjs.com \
-              -verify_hostname mail.stacksjs.com -verify_return_error </dev/null 2>/dev/null \
-              | openssl x509 -noout -checkend 86400
-          done
+          python3 - <<'PYTHON'
+          import json, urllib.request
+          with urllib.request.urlopen('https://mail.stacksjs.com/healthz', timeout=10) as response:
+              assert response.status == 200 and json.load(response)['status'] == 'healthy'
+          PYTHON
+      - name: Notify administrators and keep an incident open until recovery
+        if: always()
+        uses: actions/github-script@v8
+        env:
+          PROBE_OUTCOME: ${{ steps.probe.outcome == 'success' && steps.freshness.outcome == 'success' && 'success' || 'failure' }}
+          MAIL_HEALTH_WEBHOOK: ${{ secrets.MAIL_HEALTH_WEBHOOK }}
+        with:
+          script: |
+            const title = 'Mail service health incident (automated)';
+            const { owner, repo } = context.repo;
+            const issues = await github.paginate(github.rest.issues.listForRepo, { owner, repo, state: 'open', creator: 'github-actions[bot]', per_page: 100 });
+            let incident = issues.find(issue => !issue.pull_request && issue.title === title);
+            const failed = process.env.PROBE_OUTCOME !== 'success';
+            const run = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            if (failed && !incident) {
+              incident = (await github.rest.issues.create({ owner, repo, title, body: `Public mail protocol checks failed. Review [the failing run](${run}). This incident remains open until the public checks recover.\n\nAlert delivery: pending` })).data;
+            }
+            if (!incident || (failed && incident.body.includes('Alert delivery: confirmed'))) return;
+            const webhook = process.env.MAIL_HEALTH_WEBHOOK;
+            if (!webhook) throw new Error('Mail health webhook is not configured; incident retained for retry');
+            try {
+              const response = await fetch(webhook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: AbortSignal.timeout(10000), body: JSON.stringify({ content: failed ? `Public mail checks failed. ${incident.html_url} Run: ${run}` : `Public mail checks recovered. ${incident.html_url} Run: ${run}`, allowed_mentions: { parse: [] } }) });
+              if (!response.ok) throw new Error('delivery failed');
+            } catch { throw new Error('Admin alert delivery failed; incident retained for retry'); }
+            if (failed) {
+              await github.rest.issues.update({ owner, repo, issue_number: incident.number, body: incident.body.replace('Alert delivery: pending', 'Alert delivery: confirmed') });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: incident.number, body: `Public mail protocol checks recovered. [Verified run](${run}).` });
+              await github.rest.issues.update({ owner, repo, issue_number: incident.number, state: 'closed', state_reason: 'completed' });
+            }

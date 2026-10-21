@@ -715,3 +715,64 @@ deferred deploy above.
 
 ## Changelog
 - 2026-05-29 — Initial plan + current-state inventory.
+
+## Delivery health and incident visibility
+
+The inbox links to `/status` and shows a banner when monitoring is degraded or
+unavailable. Signed-in mailbox users can see protocol checks and a persistent
+incident history. No message content, recipient addresses, sender IPs or webhook
+credentials are included. Reports older than three minutes are shown as unknown,
+including when polling stops while the page remains open.
+
+On the mail host, install the monitor with:
+
+```sh
+sh scripts/setup-mail-health.sh scripts/mail-health.py
+systemctl start mail-health.service
+systemctl status mail-health.timer mail-health.service
+```
+
+The timer checks commands after verified TLS on SMTP, submission, SMTPS and IMAPS,
+including independently encrypted TLS 1.3 records with zero padding. It also watches
+the delivery journal, disk capacity and write/fsync access as the daemon user. A
+systemd drop-in prevents an older tenant deploy from replacing these checks with
+listener-only checks. Deployments verify a candidate in an isolated mailbox first,
+and roll back activation when real protocol checks fail.
+
+`DISCORD_WEBHOOK_URL` in `/etc/mail/mail.env` sends incident and recovery alerts
+through HTTPS, independent of SMTP. Failed notifications persist in a root-only
+retry queue. The daemon can read only the sanitized status artifact at
+`/var/lib/mail-health/public/status.json`; private state is under
+`/var/lib/mail-health/private/`. A corrupt private state file fails the monitor
+instead of silently discarding pending notifications. Investigate and preserve it
+before repairing it. Do not erase it as routine cleanup.
+
+The public `/healthz` endpoint returns only healthy/unavailable, with HTTP 503 for
+failed or stale monitoring. The five-minute Public Mail Health workflow checks
+this endpoint and the public mail protocols from outside the host. Configure the
+repository secret `MAIL_HEALTH_WEBHOOK` with the administrator's Discord webhook.
+Its first failure opens a GitHub incident and alerts the administrator; repeated
+failures reuse that incident. Recovery alerts and closes the incident. Notification
+failures leave the incident open for retry. GitHub schedules can be delayed, so
+this is a separate backstop to the host's minute timer.
+
+For an immediate external diagnosis:
+
+```sh
+python3 scripts/mail-health.py --host mail.example.com --connect-host SERVER_IP
+python3 scripts/test-mail-health-watch.py
+python3 scripts/test-mail-tls.py packages/zig/zig-out/bin/mail
+```
+
+The last command uses a temporary server and mailbox, including a forced DNSBL
+listing and a forced storage sync failure on Linux. SMTP must return 451 without
+publishing a message when the sync fails. Successful local SMTP delivery writes
+to a hidden temporary file, flushes it, publishes it without overwriting an
+existing message and syncs the directory before acknowledging acceptance.
+
+The AWS receipt incident exposed two independent failures: TLS 1.3 padding was
+mistaken for the inner content type, and a pre-greeting DNSBL disconnect ignored
+the configured score-only policy. TLS padding is decoded according to
+[RFC 8446 section 5.2](https://www.rfc-editor.org/rfc/rfc8446#section-5.2).
+DNSBL rejection is now an explicit opt-in SMTP reply at RCPT. A TLS handshake or
+an open port alone is insufficient evidence that a server can receive mail.
