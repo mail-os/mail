@@ -70,33 +70,55 @@ def send_alert(webhook, content):
             raise RuntimeError('Alert transport rejected the notification')
 
 
+JOURNAL_PAGE_SIZE = 10000
+JOURNAL_MAX_PAGES = 8
+
+
 def journal_checks(state, now):
-    command = ['journalctl', '-u', 'mail.service', '--no-pager', '-o', 'json', '-n', '10000']
-    if state.get('cursor'):
-        command += ['--after-cursor', state['cursor']]
-    else:
-        command += ['--since', '5 minutes ago']
-    result = subprocess.run(command, capture_output=True, timeout=10)
-    if result.returncode and state.get('cursor'):
-        # Journal rotation can invalidate a cursor. Rescan one bounded window.
-        command = command[:command.index('--after-cursor')] + ['--since', '5 minutes ago']
-        result = subprocess.run(command, capture_output=True, timeout=10)
-        if result.returncode == 0:
-            state['failures'] = []
-    result.check_returncode()
-    lines = result.stdout.splitlines()
-    if len(lines) >= 10000:
-        raise RuntimeError('Journal sampling limit exceeded')
-    failures = [failure for failure in state.get('failures', []) if failure['at'] >= now - 300]
-    for line in lines:
-        item = json.loads(line)
-        state['cursor'] = item.get('__CURSOR', state.get('cursor'))
-        message = item.get('MESSAGE', '')
-        at = int(item.get('__REALTIME_TIMESTAMP', now * 1000000)) // 1000000
-        for name, patterns in PATTERNS.items():
-            if any(pattern in message for pattern in patterns):
-                failures.append({'name': name, 'at': at})
-    state['failures'] = failures[-1000:]
+    # Read oldest-first, not the last N entries after a cursor. Tail sampling
+    # both loses intervening errors and gets stuck when it refuses a full page.
+    failures = [failure for failure in state.get('failures', [])
+                if failure.get('seen_at', failure['at']) >= now - 300]
+    known = {(failure['name'], failure.get('cursor')) for failure in failures if failure.get('cursor')}
+    deadline = time.monotonic() + 10
+    state['journal_backlog'] = True
+    for _ in range(JOURNAL_MAX_PAGES):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        command = ['journalctl', '-u', 'mail.service', '--no-pager', '-o', 'json', '-n', f'+{JOURNAL_PAGE_SIZE}']
+        if state.get('cursor'):
+            command += ['--after-cursor', state['cursor']]
+        else:
+            command += ['--since', '5 minutes ago']
+        result = subprocess.run(command, capture_output=True, timeout=remaining)
+        if result.returncode and state.get('cursor'):
+            # Rotation can invalidate a cursor. Keep recent detected errors
+            # and deduplicate the bounded rescan by journal cursor.
+            command = command[:command.index('--after-cursor')] + ['--since', '5 minutes ago']
+            result = subprocess.run(command, capture_output=True, timeout=max(.1, deadline - time.monotonic()))
+        result.check_returncode()
+        lines = result.stdout.splitlines()
+        try:
+            for line in lines:
+                item = json.loads(line)
+                cursor = item['__CURSOR']
+                message = item.get('MESSAGE', '')
+                at = int(item.get('__REALTIME_TIMESTAMP', now * 1000000)) // 1000000
+                for name, patterns in PATTERNS.items():
+                    if any(pattern in message for pattern in patterns) and (name, cursor) not in known:
+                        failures.append({'name': name, 'at': at, 'seen_at': now, 'cursor': cursor})
+                        known.add((name, cursor))
+                state['cursor'] = cursor
+        finally:
+            # Commit progress even when a later page fails or exceeds this run's
+            # budget. Bound each category independently so a TLS flood cannot
+            # erase a detected storage error. No message content enters state.
+            state['failures'] = [failure for name in PATTERNS
+                                 for failure in [f for f in failures if f['name'] == name][-1000:]]
+        if len(lines) < JOURNAL_PAGE_SIZE:
+            state['journal_backlog'] = False
+            break
     return [{'name': name, 'ok': not any(f['name'] == name for f in failures),
              'count': sum(f['name'] == name for f in failures)} for name in PATTERNS]
 
@@ -129,7 +151,7 @@ def run(args):
         checks = [{'name': 'Mail protocol monitor', 'ok': False}]
     try:
         checks += journal_checks(state, now)
-        checks.append({'name': 'Delivery error monitoring', 'ok': True})
+        checks.append({'name': 'Delivery error monitoring', 'ok': not state.get('journal_backlog', False)})
     except Exception:
         checks.append({'name': 'Delivery error monitoring', 'ok': False})
     disk = shutil.disk_usage(args.storage_path)

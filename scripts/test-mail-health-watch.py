@@ -60,6 +60,59 @@ class HealthTests(unittest.TestCase):
             self.assertIn('--after-cursor', run.call_args.args[0])
         self.assertEqual(len(state['failures']), 1)
 
+    def test_journal_pages_oldest_first_without_losing_errors(self):
+        def page(*entries):
+            return subprocess.CompletedProcess([], 0, b''.join((json.dumps(entry)+'\n').encode() for entry in entries))
+        def entry(cursor, message):
+            return {'__CURSOR': cursor, '__REALTIME_TIMESTAMP': '100000000', 'MESSAGE': message}
+        state = {'cursor': 'before', 'failures': []}
+        pages = [page(entry('one', 'ordinary'), entry('two', 'Failed to save message: private')),
+                 page(entry('three', 'TLS decrypt error: private'), entry('four', 'ordinary')), page()]
+        with patch.object(watch, 'JOURNAL_PAGE_SIZE', 2), patch.object(watch.subprocess, 'run', side_effect=pages) as run:
+            checks = watch.journal_checks(state, 1000)
+        self.assertFalse(state['journal_backlog'])
+        self.assertEqual(state['cursor'], 'four')
+        self.assertEqual([check['count'] for check in checks], [1, 1, 0])
+        self.assertNotIn('private', json.dumps(state))
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertTrue(all('+2' in command for command in commands))
+        self.assertEqual([command[-1] for command in commands], ['before', 'two', 'four'])
+        # Old errors newly discovered in a backlog remain visible for a full window.
+        with patch.object(watch.subprocess, 'run', return_value=page()):
+            self.assertEqual(watch.journal_checks(state, 1001)[0]['count'], 1)
+
+    def test_full_page_advances_cursor_and_next_run_recovers(self):
+        entry = {'__CURSOR': 'advanced', '__REALTIME_TIMESTAMP': '1000000000', 'MESSAGE': 'ordinary'}
+        page = subprocess.CompletedProcess([], 0, (json.dumps(entry)+'\n').encode())
+        state = {'cursor': 'before', 'failures': []}
+        with patch.object(watch, 'JOURNAL_PAGE_SIZE', 1), patch.object(watch, 'JOURNAL_MAX_PAGES', 1), patch.object(watch.subprocess, 'run', return_value=page):
+            watch.journal_checks(state, 1000)
+        self.assertTrue(state['journal_backlog'])
+        self.assertEqual(state['cursor'], 'advanced')
+        with patch.object(watch.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, b'')):
+            watch.journal_checks(state, 1001)
+        self.assertFalse(state['journal_backlog'])
+
+    def test_later_parse_failure_keeps_prior_error_and_cursor_progress(self):
+        entry = {'__CURSOR': 'read', '__REALTIME_TIMESTAMP': '1000000000', 'MESSAGE': 'Failed to save message: private'}
+        page = subprocess.CompletedProcess([], 0, (json.dumps(entry)+'\n{invalid\n').encode())
+        state = {'cursor': 'before', 'failures': []}
+        with patch.object(watch.subprocess, 'run', return_value=page):
+            with self.assertRaises(json.JSONDecodeError):
+                watch.journal_checks(state, 1000)
+        self.assertEqual(state['cursor'], 'read')
+        self.assertEqual(state['failures'][0]['name'], 'Storage failures')
+        self.assertTrue(state['journal_backlog'])
+
+    def test_rotated_cursor_preserves_recent_errors_and_deduplicates_rescan(self):
+        entry = {'__CURSOR': 'same', '__REALTIME_TIMESTAMP': '1000000000', 'MESSAGE': 'TLS decrypt error: private'}
+        state = {'cursor': 'rotated', 'failures': [{'name': 'TLS receive errors', 'at': 1000, 'seen_at': 1000, 'cursor': 'same'}]}
+        responses = [subprocess.CompletedProcess([], 1, b''), subprocess.CompletedProcess([], 0, (json.dumps(entry)+'\n').encode())]
+        with patch.object(watch.subprocess, 'run', side_effect=responses):
+            checks = watch.journal_checks(state, 1001)
+        self.assertEqual(checks[0]['count'], 1)
+        self.assertEqual(state['cursor'], 'same')
+
     def test_corrupt_state_never_silently_discards_alert_queue(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / 'state'
