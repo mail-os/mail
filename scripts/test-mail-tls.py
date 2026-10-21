@@ -110,6 +110,16 @@ int getaddrinfo(const char *name, const char *service, const struct addrinfo *hi
         with server(binary, mailbox, cert, key, preload=preload) as port:
             subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name('mail-health.py')), '--host', 'localhost',
                             '--connect-host', '127.0.0.1', '--smtp-port', str(port), '--smtp-only', '--ca-file', str(cert)], check=True)
+            # Random transcript digests expose short ECDSA INTEGER encodings.
+            # A single handshake almost always missed non-minimal leading zeros.
+            ctx = ssl.create_default_context(cafile=cert)
+            ctx.minimum_version = ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+            for _ in range(512):
+                with smtplib.SMTP('localhost', port, timeout=10) as smtp:
+                    smtp.ehlo()
+                    smtp.starttls(context=ctx)
+                    smtp.ehlo()
+            print('PASS 512 independently verified ECDSA TLS 1.3 handshakes', flush=True)
             for version in (ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_3):
                 ctx = ssl.create_default_context(cafile=cert)
                 ctx.minimum_version = ctx.maximum_version = version

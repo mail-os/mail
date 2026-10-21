@@ -194,7 +194,10 @@ def main():
         except Exception as error:
             failed = True
             # Dashboard data never includes server responses, addresses or secrets.
-            checks.append({'name': name, 'ok': False, 'error': type(error).__name__, 'duration_ms': round((time.monotonic() - started) * 1000)})
+            failure = {'name': name, 'ok': False, 'error': type(error).__name__, 'duration_ms': round((time.monotonic() - started) * 1000)}
+            if isinstance(error, ssl.SSLError) and error.reason and error.reason.replace('_', '').isalnum():
+                failure['reason'] = error.reason
+            checks.append(failure)
             if not args.json:
                 print(f'FAIL {name}: {type(error).__name__}: {error}', file=sys.stderr, flush=True)
     if args.json:
