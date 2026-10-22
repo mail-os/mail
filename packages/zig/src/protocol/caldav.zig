@@ -400,6 +400,14 @@ fn appendCollectionHref(
 // CalDAV/CardDAV Session
 // ============================================================================
 
+// HTTP authorization belongs to one request, including on pooled keep-alive
+// connections. Clear the previous identity before routing public endpoints too.
+fn clearRequestAuthentication(allocator: std.mem.Allocator, username: *?[]const u8, authenticated: *bool) void {
+    if (username.*) |value| allocator.free(value);
+    username.* = null;
+    authenticated.* = false;
+}
+
 pub const CalDavSession = struct {
     allocator: std.mem.Allocator,
     connection: socket.Connection,
@@ -418,13 +426,12 @@ pub const CalDavSession = struct {
     }
 
     pub fn deinit(self: *CalDavSession) void {
-        if (self.username) |username| {
-            self.allocator.free(username);
-        }
+        clearRequestAuthentication(self.allocator, &self.username, &self.authenticated);
     }
 
     /// Handle incoming HTTP request
     pub fn handleRequest(self: *CalDavSession, config: *const CalDavConfig) !bool {
+        clearRequestAuthentication(self.allocator, &self.username, &self.authenticated);
         // Initial read for headers (up to 64KB)
         var header_buf: [65536]u8 = undefined;
         const bytes_read = self.connection.read(&header_buf) catch return false;
@@ -548,27 +555,33 @@ pub const CalDavSession = struct {
                 const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
                 if (trimmed.len == 0) break;
 
-                if (std.mem.startsWith(u8, trimmed, "Authorization:")) {
+                if (trimmed.len >= 14 and std.ascii.eqlIgnoreCase(trimmed[0..14], "Authorization:")) {
                     auth_header = std.mem.trim(u8, trimmed[14..], &std.ascii.whitespace);
                     break;
                 }
             }
 
             if (auth_header == null) {
-                try self.sendAuthRequired();
+                try self.sendAuthRequired(false);
                 return true;
             }
 
             // Try Digest auth first, then fall back to Basic
             var validated_username: ?[]const u8 = null;
+            var stale_nonce = false;
 
             if (std.mem.startsWith(u8, auth_header.?, "Digest ")) {
                 validated_username = self.auth_backend.verifyDigestAuthForPeer(
                     self.connection.peerIp(),
                     auth_header.?,
                     method_str,
+                    path,
                     "CalDAV/CardDAV Server",
                 ) catch |err| blk: {
+                    if (err == error.StaleDigestNonce) {
+                        stale_nonce = true;
+                        break :blk null;
+                    }
                     logger.err("CalDAV Digest authentication error: {}", .{err});
                     break :blk null;
                 };
@@ -588,7 +601,7 @@ pub const CalDavSession = struct {
                 logger.info("Successful CalDAV authentication for user: {s}", .{username});
             } else {
                 logger.warn("Failed CalDAV authentication attempt", .{});
-                try self.sendAuthRequired();
+                try self.sendAuthRequired(stale_nonce);
                 return true;
             }
         }
@@ -1877,7 +1890,7 @@ pub const CalDavSession = struct {
     }
 
     /// Send authentication required response with Digest challenge
-    fn sendAuthRequired(self: *CalDavSession) !void {
+    fn sendAuthRequired(self: *CalDavSession, stale: bool) !void {
         const nonce = self.auth_backend.generateNonce() catch {
             // Fallback to Basic auth if nonce generation fails
             const response =
@@ -1894,10 +1907,10 @@ pub const CalDavSession = struct {
         const writer = fbs.writer();
         try writer.print(
             "HTTP/1.1 401 Unauthorized\r\n" ++
-                "WWW-Authenticate: Digest realm=\"CalDAV/CardDAV Server\", nonce=\"{s}\", qop=\"auth\", algorithm=SHA-256\r\n" ++
+                "WWW-Authenticate: Digest realm=\"CalDAV/CardDAV Server\", nonce=\"{s}\", qop=\"auth\", algorithm=SHA-256{s}\r\n" ++
                 "WWW-Authenticate: Basic realm=\"CalDAV/CardDAV Server\"\r\n" ++
                 "Content-Length: 0\r\n\r\n",
-            .{nonce},
+            .{ nonce, if (stale) ", stale=true" else "" },
         );
         _ = try self.connection.write(fbs.getWritten());
     }
@@ -2474,9 +2487,7 @@ const TlsCalDavSession = struct {
     }
 
     pub fn deinit(self: *TlsCalDavSession) void {
-        if (self.username) |username| {
-            self.allocator.free(username);
-        }
+        clearRequestAuthentication(self.allocator, &self.username, &self.authenticated);
     }
 
     fn sendTls(self: *TlsCalDavSession, data: []const u8) !void {
@@ -2685,7 +2696,7 @@ const TlsCalDavSession = struct {
     }
 
     /// Send authentication required response with Digest challenge over TLS
-    fn sendTlsAuthRequired(self: *TlsCalDavSession) !void {
+    fn sendTlsAuthRequired(self: *TlsCalDavSession, stale: bool) !void {
         const nonce = self.auth_backend.generateNonce() catch {
             // Fallback to Basic auth if nonce generation fails
             try self.sendTls("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"CalDAV/CardDAV Server\"\r\nContent-Length: 0\r\n\r\n");
@@ -2698,15 +2709,16 @@ const TlsCalDavSession = struct {
         const writer = fbs.writer();
         try writer.print(
             "HTTP/1.1 401 Unauthorized\r\n" ++
-                "WWW-Authenticate: Digest realm=\"CalDAV/CardDAV Server\", nonce=\"{s}\", qop=\"auth\", algorithm=SHA-256\r\n" ++
+                "WWW-Authenticate: Digest realm=\"CalDAV/CardDAV Server\", nonce=\"{s}\", qop=\"auth\", algorithm=SHA-256{s}\r\n" ++
                 "WWW-Authenticate: Basic realm=\"CalDAV/CardDAV Server\"\r\n" ++
                 "Content-Length: 0\r\n\r\n",
-            .{nonce},
+            .{ nonce, if (stale) ", stale=true" else "" },
         );
         try self.sendTls(fbs.getWritten());
     }
 
     pub fn handleRequest(self: *TlsCalDavSession, config: *const CalDavConfig, request: []const u8) !bool {
+        clearRequestAuthentication(self.allocator, &self.username, &self.authenticated);
         // Debug: log incoming request
         logger.info("CalDAV TLS received request ({d} bytes)", .{request.len});
         if (request.len > 0 and request.len < 500) {
@@ -2790,7 +2802,7 @@ const TlsCalDavSession = struct {
                 const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
                 if (trimmed.len == 0) break;
 
-                if (std.mem.startsWith(u8, trimmed, "Authorization:")) {
+                if (trimmed.len >= 14 and std.ascii.eqlIgnoreCase(trimmed[0..14], "Authorization:")) {
                     auth_header = std.mem.trim(u8, trimmed[14..], &std.ascii.whitespace);
                     break;
                 }
@@ -2798,12 +2810,13 @@ const TlsCalDavSession = struct {
 
             if (auth_header == null) {
                 logger.info("CalDAV: No Authorization header, sending 401", .{});
-                try self.sendTlsAuthRequired();
+                try self.sendTlsAuthRequired(false);
                 return true;
             }
 
             // Try Digest auth first, then fall back to Basic
             var validated_username: ?[]const u8 = null;
+            var stale_nonce = false;
 
             if (std.mem.startsWith(u8, auth_header.?, "Digest ")) {
                 logger.info("CalDAV: Attempting Digest auth", .{});
@@ -2811,8 +2824,13 @@ const TlsCalDavSession = struct {
                     self.connection.peerIp(),
                     auth_header.?,
                     method_str,
+                    path,
                     "CalDAV/CardDAV Server",
                 ) catch |err| blk: {
+                    if (err == error.StaleDigestNonce) {
+                        stale_nonce = true;
+                        break :blk null;
+                    }
                     logger.err("CalDAV TLS Digest authentication error: {}", .{err});
                     break :blk null;
                 };
@@ -2836,7 +2854,7 @@ const TlsCalDavSession = struct {
                 logger.info("Successful CalDAV TLS authentication for user: {s}", .{username});
             } else {
                 logger.warn("CalDAV: Authentication failed, sending 401", .{});
-                try self.sendTlsAuthRequired();
+                try self.sendTlsAuthRequired(stale_nonce);
                 return true;
             }
         }
@@ -3084,4 +3102,67 @@ test "HTTP method parsing" {
     try testing.expectEqual(HttpMethod.mkcalendar, HttpMethod.fromString("MKCALENDAR").?);
     try testing.expectEqual(HttpMethod.report, HttpMethod.fromString("REPORT").?);
     try testing.expect(HttpMethod.fromString("INVALID") == null);
+}
+
+test "security: DAV authenticates each request on a reused connection" {
+    const a = std.testing.allocator;
+    var db = try database.Database.init(a, ":memory:");
+    defer db.deinit();
+    var backend = auth.AuthBackend.init(a, &db);
+    defer backend.deinit();
+    _ = try backend.createUser("alice@example.test", "secret", "alice@example.test");
+    var store = try caldav_store.CalDavStore.init(a, .{});
+    defer store.deinit();
+    var fds: [2]c_int = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, @intCast(@as(u32, std.posix.SOCK.STREAM)), 0, &fds) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    var session = CalDavSession.init(a, .{ .fd = fds[0] }, &backend, &store);
+    defer session.deinit();
+    const config = CalDavConfig{};
+    const requests = [_][]const u8{
+        "OPTIONS / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic YWxpY2VAZXhhbXBsZS50ZXN0OnNlY3JldA==\r\n\r\n",
+        "OPTIONS / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "OPTIONS / HTTP/1.1\r\nHost: localhost\r\nauthorization: Basic YWxpY2U6c2VjcmV0\r\n\r\n",
+    };
+    for (requests, 0..) |request, index| {
+        try std.testing.expectEqual(request.len, @as(usize, @intCast(std.c.write(fds[1], request.ptr, request.len))));
+        try std.testing.expect(try session.handleRequest(&config));
+        var reply: [4096]u8 = undefined;
+        const n = std.c.read(fds[1], &reply, reply.len);
+        try std.testing.expect(n > 0);
+        const expected = if (index == 1) "HTTP/1.1 401" else "HTTP/1.1 200";
+        try std.testing.expect(std.mem.startsWith(u8, reply[0..@intCast(n)], expected));
+        if (index != 1) try std.testing.expectEqualStrings("alice@example.test", session.username.?);
+    }
+}
+
+test "security: DAV rejects a Digest proof signed for a different request target" {
+    const a = std.testing.allocator;
+    var db = try database.Database.init(a, ":memory:");
+    defer db.deinit();
+    _ = try db.createUser("Mufasa", "unused", "mufasa@example.test");
+    try db.exec("UPDATE users SET digest_ha1 = '03669d897755d170477e46b59491df2d' WHERE username = 'Mufasa'");
+    var backend = auth.AuthBackend.init(a, &db);
+    defer backend.deinit();
+    // A precomputed MD5 client proof, with a live server nonce.
+    const nonce = try a.dupe(u8, "dcd98b7102dd2f0e8b11d0f600bfb0c093");
+    try backend.nonce_manager.nonces.put(nonce, .{ .created = currentTimestamp() });
+    var store = try caldav_store.CalDavStore.init(a, .{});
+    defer store.deinit();
+    var fds: [2]c_int = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, @intCast(@as(u32, std.posix.SOCK.STREAM)), 0, &fds) != 0) return error.SocketPairFailed;
+    defer _ = std.c.close(fds[0]);
+    defer _ = std.c.close(fds[1]);
+    var session = CalDavSession.init(a, .{ .fd = fds[0] }, &backend, &store);
+    defer session.deinit();
+    // A proof for /dir/index.html must not authorize another resource.
+    const request = "GET /not-signed HTTP/1.1\r\nHost: localhost\r\nAuthorization: Digest username=\"Mufasa\", realm=\"CalDAV/CardDAV Server\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", uri=\"/dir/index.html\", qop=auth, nc=00000001, cnonce=\"0a4f113b\", response=\"7a97d241e140440ea5e1ea085e7fc6ac\"\r\n\r\n";
+    try std.testing.expectEqual(request.len, @as(usize, @intCast(std.c.write(fds[1], request.ptr, request.len))));
+    try std.testing.expect(try session.handleRequest(&.{}));
+    var reply: [4096]u8 = undefined;
+    const n = std.c.read(fds[1], &reply, reply.len);
+    try std.testing.expect(n > 0);
+    try std.testing.expect(std.mem.startsWith(u8, reply[0..@intCast(n)], "HTTP/1.1 401"));
+    try std.testing.expect(!session.authenticated);
 }

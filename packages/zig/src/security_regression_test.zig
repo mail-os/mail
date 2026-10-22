@@ -6,6 +6,7 @@ comptime {
     _ = @import("core/protocol.zig");
     _ = @import("core/smtp.zig");
     _ = @import("protocol/imap.zig");
+    _ = @import("protocol/caldav.zig");
     _ = @import("protocol/managesieve.zig");
     _ = @import("auth/auth.zig");
     _ = @import("api/webmail_http.zig");

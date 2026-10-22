@@ -67,8 +67,9 @@ pub const DigestAuthParams = struct {
 
 /// Nonce manager for Digest authentication
 pub const NonceManager = struct {
+    const NonceState = struct { created: i64, highest_count: u32 = 0, seen_counts: u64 = 0 };
     allocator: std.mem.Allocator,
-    nonces: std.StringHashMap(i64), // nonce -> creation timestamp
+    nonces: std.StringHashMap(NonceState),
     max_age_seconds: i64 = 300, // 5 minutes
     generation_count: u32 = 0,
     max_nonces: u32 = 4096, // Hard cap to prevent unbounded growth
@@ -77,7 +78,7 @@ pub const NonceManager = struct {
     pub fn init(allocator: std.mem.Allocator) NonceManager {
         return .{
             .allocator = allocator,
-            .nonces = std.StringHashMap(i64).init(allocator),
+            .nonces = std.StringHashMap(NonceState).init(allocator),
         };
     }
 
@@ -104,6 +105,7 @@ pub const NonceManager = struct {
         bytesToHex(&random_bytes, &hex_buf);
 
         const nonce = try self.allocator.dupe(u8, &hex_buf);
+        errdefer self.allocator.free(nonce);
 
         // Deterministic cleanup every 64 generations (instead of random sampling)
         self.generation_count +%= 1;
@@ -115,12 +117,11 @@ pub const NonceManager = struct {
         if (self.nonces.count() >= self.max_nonces) {
             self.cleanupLocked();
             if (self.nonces.count() >= self.max_nonces) {
-                self.allocator.free(nonce);
                 return error.TooManyNonces;
             }
         }
 
-        try self.nonces.put(nonce, now);
+        try self.nonces.put(nonce, .{ .created = now });
         return nonce;
     }
 
@@ -131,7 +132,35 @@ pub const NonceManager = struct {
 
         const created = self.nonces.get(nonce) orelse return false;
         const now = getCurrentTimestamp();
-        return (now - created) < self.max_age_seconds;
+        return (now - created.created) < self.max_age_seconds;
+    }
+
+    /// Claim a proof once while allowing qop=auth clients to increment nc.
+    /// A 64-request window also accepts distinct parallel requests out of order.
+    pub fn consumeNonce(self: *NonceManager, nonce: []const u8, count: ?u32) error{StaleDigestNonce}!bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const state = self.nonces.getPtr(nonce) orelse return error.StaleDigestNonce;
+        if (getCurrentTimestamp() - state.created >= self.max_age_seconds) return error.StaleDigestNonce;
+        if (count) |next| {
+            if (next == 0) return false;
+            if (next > state.highest_count) {
+                const shift = next - state.highest_count;
+                state.seen_counts = if (shift >= 64) 1 else (state.seen_counts << @intCast(shift)) | 1;
+                state.highest_count = next;
+            } else {
+                const behind = state.highest_count - next;
+                if (behind >= 64) return false;
+                const bit = @as(u64, 1) << @intCast(behind);
+                if (state.seen_counts & bit != 0) return false;
+                state.seen_counts |= bit;
+            }
+            return true;
+        }
+        // Legacy proofs without qop have no replay counter and remain one-use.
+        const entry = self.nonces.fetchRemove(nonce).?;
+        self.allocator.free(entry.key);
+        return true;
     }
 
     /// Remove a used nonce (for one-time use)
@@ -159,7 +188,7 @@ pub const NonceManager = struct {
 
         var iter = self.nonces.iterator();
         while (iter.next()) |entry| {
-            if ((now - entry.value_ptr.*) >= self.max_age_seconds) {
+            if ((now - entry.value_ptr.created) >= self.max_age_seconds) {
                 to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
@@ -318,9 +347,13 @@ pub const AuthBackend = struct {
         return username;
     }
 
-    pub fn verifyDigestAuthForPeer(self: *AuthBackend, peer: []const u8, header: []const u8, method: []const u8, realm: []const u8) !?[]const u8 {
+    pub fn verifyDigestAuthForPeer(self: *AuthBackend, peer: []const u8, header: []const u8, method: []const u8, request_target: []const u8, realm: []const u8) !?[]const u8 {
         const attempt = try self.reserveLogin(peer);
-        const username = try self.verifyDigestAuth(header, method, realm);
+        const username = self.verifyDigestAuth(header, method, request_target, realm) catch |err| {
+            // Expired challenges need refreshing, not another failed login.
+            if (err == error.StaleDigestNonce) self.login_limiter.finishAuthSuccess(peer, attempt);
+            return err;
+        };
         if (username != null) self.login_limiter.finishAuthSuccess(peer, attempt);
         return username;
     }
@@ -419,13 +452,15 @@ pub const AuthBackend = struct {
             return null;
         }
 
-        // Return username
-        return try self.allocator.dupe(u8, creds.username);
+        // Return the mailbox identity whose credentials were checked.
+        return try self.canonicalUsername(creds.username, self.allocator);
     }
 
     /// Verify HTTP Digest Auth header and return username if valid
-    /// Supports both SHA-256 (RFC 7616, preferred) and MD5 (RFC 2617, legacy fallback)
-    pub fn verifyDigestAuth(self: *AuthBackend, auth_header: []const u8, method: []const u8, realm: []const u8) !?[]const u8 {
+    /// Supports both SHA-256 (RFC 7616, preferred) and MD5 (RFC 2617, legacy fallback).
+    /// request_target is the actual HTTP request-line path and query, never the
+    /// untrusted uri parameter from the Authorization header.
+    pub fn verifyDigestAuth(self: *AuthBackend, auth_header: []const u8, method: []const u8, request_target: []const u8, realm: []const u8) !?[]const u8 {
         const log = @import("../core/logger.zig");
 
         // Check for "Digest " prefix
@@ -447,19 +482,27 @@ pub const AuthBackend = struct {
             return null;
         }
 
+        // The client's signed URI must match the request being authorized,
+        // including its query string, before any account can be selected.
+        if (!std.mem.eql(u8, params.uri, request_target)) return null;
+
         // Verify nonce is valid
         if (!self.nonce_manager.validateNonce(params.nonce)) {
-            log.warn("Digest auth: invalid/expired nonce", .{});
-            return null;
+            return error.StaleDigestNonce;
         }
 
-        // Normalize username - extract local part if email
-        const normalized_username = blk: {
-            if (std.mem.indexOf(u8, params.username, "@")) |at_pos| {
-                break :blk params.username[0..at_pos];
-            }
-            break :blk params.username;
-        };
+        var nonce_count: ?u32 = null;
+        if (params.qop) |qop| {
+            if (!std.mem.eql(u8, qop, "auth")) return null;
+            const nc = params.nc orelse return null;
+            const cnonce = params.cnonce orelse return null;
+            if (nc.len != 8 or cnonce.len == 0) return null;
+            nonce_count = std.fmt.parseInt(u32, nc, 16) catch return null;
+            if (nonce_count.? == 0) return null;
+        }
+
+        const normalized_username = try self.canonicalUsername(params.username, self.allocator);
+        defer self.allocator.free(normalized_username);
 
         // Get user from database
         var user = self.db.getUserByUsername(normalized_username) catch |err| {
@@ -562,12 +605,14 @@ pub const AuthBackend = struct {
             return null;
         }
 
+        const identity = try self.allocator.dupe(u8, normalized_username);
+        errdefer self.allocator.free(identity);
+        if (!try self.nonce_manager.consumeNonce(params.nonce, nonce_count)) {
+            self.allocator.free(identity);
+            return null;
+        }
         log.info("Digest auth: success", .{});
-
-        // Mark nonce as used (prevents replay attacks)
-        self.nonce_manager.invalidateNonce(params.nonce);
-
-        return try self.allocator.dupe(u8, normalized_username);
+        return identity;
     }
 
     /// Generate a new nonce for Digest authentication
@@ -643,6 +688,11 @@ pub fn decodeBasicAuthCredentials(allocator: std.mem.Allocator, encoded: []const
     };
 }
 
+fn storeDigestParameter(allocator: std.mem.Allocator, slot: *?[]const u8, value: []const u8) !void {
+    if (slot.* != null) return error.InvalidAuthFormat;
+    slot.* = try allocator.dupe(u8, value);
+}
+
 /// Parse HTTP Digest Authentication header
 /// Format: key1="value1", key2="value2", ...
 pub fn parseDigestAuthHeader(allocator: std.mem.Allocator, header: []const u8) !DigestAuthParams {
@@ -655,6 +705,11 @@ pub fn parseDigestAuthHeader(allocator: std.mem.Allocator, header: []const u8) !
     var nc: ?[]const u8 = null;
     var cnonce: ?[]const u8 = null;
     var algorithm: ?[]const u8 = null;
+    errdefer {
+        inline for (.{ &username, &realm, &nonce, &uri, &response, &qop, &nc, &cnonce, &algorithm }) |slot| {
+            if (slot.*) |value| allocator.free(value);
+        }
+    }
 
     // Parse comma-separated key="value" pairs
     var pos: usize = 0;
@@ -703,37 +758,28 @@ pub fn parseDigestAuthHeader(allocator: std.mem.Allocator, header: []const u8) !
 
         // Store parsed value
         if (std.mem.eql(u8, key, "username")) {
-            username = try allocator.dupe(u8, value);
+            try storeDigestParameter(allocator, &username, value);
         } else if (std.mem.eql(u8, key, "realm")) {
-            realm = try allocator.dupe(u8, value);
+            try storeDigestParameter(allocator, &realm, value);
         } else if (std.mem.eql(u8, key, "nonce")) {
-            nonce = try allocator.dupe(u8, value);
+            try storeDigestParameter(allocator, &nonce, value);
         } else if (std.mem.eql(u8, key, "uri")) {
-            uri = try allocator.dupe(u8, value);
+            try storeDigestParameter(allocator, &uri, value);
         } else if (std.mem.eql(u8, key, "response")) {
-            response = try allocator.dupe(u8, value);
+            try storeDigestParameter(allocator, &response, value);
         } else if (std.mem.eql(u8, key, "qop")) {
-            qop = try allocator.dupe(u8, value);
+            try storeDigestParameter(allocator, &qop, value);
         } else if (std.mem.eql(u8, key, "nc")) {
-            nc = try allocator.dupe(u8, value);
+            try storeDigestParameter(allocator, &nc, value);
         } else if (std.mem.eql(u8, key, "cnonce")) {
-            cnonce = try allocator.dupe(u8, value);
+            try storeDigestParameter(allocator, &cnonce, value);
         } else if (std.mem.eql(u8, key, "algorithm")) {
-            algorithm = try allocator.dupe(u8, value);
+            try storeDigestParameter(allocator, &algorithm, value);
         }
     }
 
     // Validate required fields
     if (username == null or realm == null or nonce == null or uri == null or response == null) {
-        if (username) |u| allocator.free(u);
-        if (realm) |r| allocator.free(r);
-        if (nonce) |n| allocator.free(n);
-        if (uri) |u| allocator.free(u);
-        if (response) |r| allocator.free(r);
-        if (qop) |q| allocator.free(q);
-        if (nc) |n| allocator.free(n);
-        if (cnonce) |c| allocator.free(c);
-        if (algorithm) |a| allocator.free(a);
         return error.InvalidAuthFormat;
     }
 
@@ -1438,7 +1484,7 @@ test "security: password Basic and Digest authentication share one peer budget" 
     defer backend.deinit();
     backend.login_limiter.max_auth_attempts = 2;
     try std.testing.expect((try backend.verifyBasicAuthForPeer("192.0.2.1", "invalid")) == null);
-    try std.testing.expect((try backend.verifyDigestAuthForPeer("192.0.2.1", "invalid", "GET", "test")) == null);
+    try std.testing.expect((try backend.verifyDigestAuthForPeer("192.0.2.1", "invalid", "GET", "/", "test")) == null);
     try std.testing.expectError(error.AuthenticationRateLimited, backend.verifyCredentialsForPeer("192.0.2.1", "unknown", "wrong"));
     try std.testing.expect((try backend.verifyBasicAuthForPeer("192.0.2.2", "invalid")) == null);
 }
@@ -1454,4 +1500,133 @@ test "security: authentication budget allocation failures fail closed" {
     backend.login_limiter = security.RateLimiter.init(failing.allocator(), 300, 10, 10, 300);
     try std.testing.expectError(error.OutOfMemory, backend.verifyCredentialsForPeer("192.0.2.1", "unknown", "wrong"));
     try std.testing.expectEqual(@as(u32, 0), backend.login_limiter.auth_counters.count());
+}
+
+test "security: Digest authentication retains a fully qualified mailbox identity" {
+    const a = std.testing.allocator;
+    var db = try database.Database.init(a, ":memory:");
+    defer db.deinit();
+    _ = try db.createUser("Mufasa@one.test", "unused", "Mufasa@one.test");
+    _ = try db.createUser("Mufasa", "unused", "Mufasa@legacy.test");
+    try db.exec("UPDATE users SET digest_ha1 = 'ea5418ab5855d8e098da9e77629d7761' WHERE username = 'Mufasa@one.test'");
+    var backend = AuthBackend.init(a, &db);
+    defer backend.deinit();
+    try backend.nonce_manager.nonces.put(try a.dupe(u8, "dcd98b7102dd2f0e8b11d0f600bfb0c093"), .{ .created = getCurrentTimestamp() });
+    const header = "Digest username=\"Mufasa@one.test\", realm=\"CalDAV/CardDAV Server\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", uri=\"/dir/index.html\", qop=auth, nc=00000001, cnonce=\"0a4f113b\", response=\"ae9f986653b0bf85d9c348cdf314c2ec\"";
+    try std.testing.expect((try backend.verifyDigestAuth(header, "GET", "/elsewhere", "CalDAV/CardDAV Server")) == null);
+    try std.testing.expect((try backend.verifyDigestAuth(header, "GET", "/dir/index.html?changed=1", "CalDAV/CardDAV Server")) == null);
+    const result = (try backend.verifyDigestAuth(header, "GET", "/dir/index.html", "CalDAV/CardDAV Server")) orelse return error.TestExpectedAuthentication;
+    defer a.free(result);
+    try std.testing.expectEqualStrings("Mufasa@one.test", result);
+    try std.testing.expect((try backend.verifyDigestAuth(header, "GET", "/dir/index.html", "CalDAV/CardDAV Server")) == null);
+}
+
+test "security: Digest nonces have one concurrent consumer" {
+    const a = std.testing.allocator;
+    var manager = NonceManager.init(a);
+    defer manager.deinit();
+    const generated = try manager.generateNonce();
+    // The manager frees its map key when a request consumes the proof. Each
+    // HTTP request has its own header copy, represented by this stable slice.
+    const nonce = try a.dupe(u8, generated);
+    defer a.free(nonce);
+    var winners = std.atomic.Value(usize).init(0);
+    var ready = std.atomic.Value(bool).init(false);
+    const Worker = struct {
+        fn run(m: *NonceManager, n: []const u8, count: *std.atomic.Value(usize), gate: *std.atomic.Value(bool)) void {
+            while (!gate.load(.acquire)) std.atomic.spinLoopHint();
+            if (m.consumeNonce(n, 1) catch false) _ = count.fetchAdd(1, .monotonic);
+        }
+    };
+    var workers: [8]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer {
+        ready.store(true, .release);
+        for (workers[0..spawned]) |worker| worker.join();
+    }
+    for (&workers) |*worker| {
+        worker.* = try std.Thread.spawn(.{}, Worker.run, .{ &manager, nonce, &winners, &ready });
+        spawned += 1;
+    }
+    ready.store(true, .release);
+    for (workers) |worker| worker.join();
+    spawned = 0;
+    try std.testing.expectEqual(@as(usize, 1), winners.load(.monotonic));
+    try std.testing.expect(manager.validateNonce(nonce));
+    try std.testing.expect(try manager.consumeNonce(nonce, 3));
+    try std.testing.expect(try manager.consumeNonce(nonce, 2));
+    try std.testing.expect(!try manager.consumeNonce(nonce, 2));
+    try std.testing.expect(try manager.consumeNonce(nonce, null));
+    try std.testing.expect(!manager.validateNonce(nonce));
+}
+
+test "security: Digest nonce insertion failure releases its allocation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var manager = NonceManager.init(failing.allocator());
+    defer manager.deinit();
+    try std.testing.expectError(error.OutOfMemory, manager.generateNonce());
+}
+
+// A client-side MD5 proof fixture, independent of the verifier's HA2 path.
+fn testDigestHeader(allocator: std.mem.Allocator, nonce: []const u8, count: u32) ![]u8 {
+    var count_buf: [8]u8 = undefined;
+    const nc = try std.fmt.bufPrint(&count_buf, "{x:0>8}", .{count});
+    const material = try std.fmt.allocPrint(allocator, "ea5418ab5855d8e098da9e77629d7761:{s}:{s}:0a4f113b:auth:39aff3a2bab6126f332b942af96d3366", .{ nonce, nc });
+    defer allocator.free(material);
+    var digest: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(material, &digest, .{});
+    var hex: [32]u8 = undefined;
+    bytesToHex(&digest, &hex);
+    return std.fmt.allocPrint(allocator, "Digest username=\"Mufasa@one.test\", realm=\"CalDAV/CardDAV Server\", nonce=\"{s}\", uri=\"/dir/index.html\", qop=auth, nc={s}, cnonce=\"0a4f113b\", response=\"{s}\"", .{ nonce, nc, hex });
+}
+
+test "security: repeated Digest requests and stale challenges do not exhaust failed logins" {
+    const a = std.testing.allocator;
+    var db = try database.Database.init(a, ":memory:");
+    defer db.deinit();
+    _ = try db.createUser("Mufasa@one.test", "unused", "Mufasa@one.test");
+    try db.exec("UPDATE users SET digest_ha1 = 'ea5418ab5855d8e098da9e77629d7761' WHERE username = 'Mufasa@one.test'");
+    var backend = AuthBackend.init(a, &db);
+    defer backend.deinit();
+    backend.login_limiter.max_auth_attempts = 1;
+    const nonce = try backend.generateNonce();
+    for (1..21) |count| {
+        const header = try testDigestHeader(a, nonce, @intCast(count));
+        defer a.free(header);
+        const user = (try backend.verifyDigestAuthForPeer("192.0.2.1", header, "GET", "/dir/index.html", "CalDAV/CardDAV Server")) orelse return error.TestExpectedAuthentication;
+        a.free(user);
+    }
+    const expired = try testDigestHeader(a, nonce, 21);
+    defer a.free(expired);
+    backend.nonce_manager.nonces.getPtr(nonce).?.created -= backend.nonce_manager.max_age_seconds;
+    for (0..20) |_| {
+        try std.testing.expectError(error.StaleDigestNonce, backend.verifyDigestAuthForPeer("192.0.2.1", expired, "GET", "/dir/index.html", "CalDAV/CardDAV Server"));
+    }
+    // A fresh challenge still works after repeated stale refreshes.
+    const fresh = try backend.generateNonce();
+    const header = try testDigestHeader(a, fresh, 1);
+    defer a.free(header);
+    const user = (try backend.verifyDigestAuthForPeer("192.0.2.1", header, "GET", "/dir/index.html", "CalDAV/CardDAV Server")) orelse return error.TestExpectedAuthentication;
+    a.free(user);
+}
+
+test "security: Digest nonce expiry between validation and consumption stays stale" {
+    var manager = NonceManager.init(std.testing.allocator);
+    defer manager.deinit();
+    const nonce = try manager.generateNonce();
+    try std.testing.expect(manager.validateNonce(nonce));
+    manager.nonces.getPtr(nonce).?.created -= manager.max_age_seconds;
+    try std.testing.expectError(error.StaleDigestNonce, manager.consumeNonce(nonce, 1));
+}
+
+test "security: Digest header duplicates and allocation failures release all parameters" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.InvalidAuthFormat, parseDigestAuthHeader(a, "username=a,username=b,realm=r,nonce=n,uri=/,response=x"));
+    const Fixture = struct {
+        fn parse(allocator: std.mem.Allocator) !void {
+            var params = try parseDigestAuthHeader(allocator, "username=a,realm=r,nonce=n,uri=/,response=x,qop=auth,nc=00000001,cnonce=c,algorithm=MD5");
+            defer params.deinit(allocator);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Fixture.parse, .{});
 }
