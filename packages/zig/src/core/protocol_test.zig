@@ -946,3 +946,15 @@ test "Session timeout tracking" {
     session.updateActivity();
     try testing.expect(session.last_activity >= old_activity);
 }
+
+test "a relay's signature speaks for its own domain and what is beneath it" {
+    try testing.expect(protocol.relayDomainAligned("votescape.org", "votescape.org"));
+    try testing.expect(protocol.relayDomainAligned("Votescape.ORG", "votescape.org"));
+    try testing.expect(protocol.relayDomainAligned("mail.votescape.org", "votescape.org"));
+    // Not a parent, a look-alike ending, another domain, or nothing.
+    try testing.expect(!protocol.relayDomainAligned("votescape.org", "mail.votescape.org"));
+    try testing.expect(!protocol.relayDomainAligned("notvotescape.org", "votescape.org"));
+    try testing.expect(!protocol.relayDomainAligned("stacksjs.com", "votescape.org"));
+    try testing.expect(!protocol.relayDomainAligned("votescape.org", ""));
+    try testing.expect(!protocol.relayDomainAligned("", "votescape.org"));
+}

@@ -52,6 +52,14 @@ pub const Config = struct {
     /// beyond `hostname` and its parent domain. Lets one mail server host
     /// mailboxes for multiple domains (e.g. "example.org, another.com").
     extra_local_domains: ?[]const u8 = null,
+    /// Comma-separated accounts that send on behalf of other domains: a
+    /// sending service whose customers have each proved their domain to it.
+    /// Such an account may author a message for an address that is not its
+    /// own only when the message already carries a DKIM signature that
+    /// verifies against a key published by that address's domain. Holding a
+    /// key the domain publishes is the authorization; naming the account here
+    /// only lets it present one. Empty by default: nobody relays.
+    relay_accounts: ?[]const u8 = null,
     /// Trap mode: treat EVERY domain as local, so nothing is ever relayed and
     /// every message is delivered into a mailbox here.
     ///
@@ -172,6 +180,19 @@ pub const Config = struct {
         return false;
     }
 
+    /// Whether `account` is named in `relay_accounts`. Case-insensitive, and
+    /// exact: an entry is a whole account name, never a domain or a pattern.
+    pub fn isRelayAccount(self: Config, account: []const u8) bool {
+        if (account.len == 0) return false;
+        const list = self.relay_accounts orelse return false;
+        var it = std.mem.splitScalar(u8, list, ',');
+        while (it.next()) |raw| {
+            const entry = std.mem.trim(u8, raw, " \t");
+            if (entry.len > 0 and std.ascii.eqlIgnoreCase(account, entry)) return true;
+        }
+        return false;
+    }
+
     /// Whether a bind address reaches only this machine.
     ///
     /// `localhost` is included because that is what people type, and it cannot
@@ -193,6 +214,7 @@ pub const Config = struct {
         allocator.free(self.host);
         allocator.free(self.hostname);
         if (self.extra_local_domains) |v| allocator.free(v);
+        if (self.relay_accounts) |v| allocator.free(v);
         if (self.auth_default_domain) |v| allocator.free(v);
         if (self.tls_cert_path) |path| allocator.free(path);
         if (self.tls_key_path) |path| allocator.free(path);
@@ -482,6 +504,13 @@ fn applyEnvironmentVariables(allocator: std.mem.Allocator, cfg: *Config) !void {
     if (env.get("SMTP_LOCAL_DOMAINS")) |value| {
         if (cfg.extra_local_domains) |old| allocator.free(old);
         cfg.extra_local_domains = try allocator.dupe(u8, value);
+    }
+
+    // SMTP_RELAY_ACCOUNTS — comma-separated accounts that may send for a
+    // domain whose published DKIM key their message is signed with
+    if (env.get("SMTP_RELAY_ACCOUNTS")) |value| {
+        if (cfg.relay_accounts) |old| allocator.free(old);
+        cfg.relay_accounts = try allocator.dupe(u8, value);
     }
 
     // SMTP_AUTH_DEFAULT_DOMAIN - qualifies legacy bare mailbox usernames
@@ -782,6 +811,10 @@ fn applyConfigFile(allocator: std.mem.Allocator, cfg: *Config, path: []const u8)
         if (server.getString("local_domains")) |value| {
             if (cfg.extra_local_domains) |old| allocator.free(old);
             cfg.extra_local_domains = try allocator.dupe(u8, value);
+        }
+        if (server.getString("relay_accounts")) |value| {
+            if (cfg.relay_accounts) |old| allocator.free(old);
+            cfg.relay_accounts = try allocator.dupe(u8, value);
         }
         if (server.getBool("catch_all")) |value| {
             cfg.catch_all = value;

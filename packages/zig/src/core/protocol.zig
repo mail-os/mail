@@ -329,6 +329,18 @@ const HeaderBodySplit = struct { headers: []const u8, body: []const u8 };
 /// line-ending convention — BDAT/CHUNKING preserves raw \r\n while the DATA
 /// loop normalizes to \n — so both must be handled; whichever blank line
 /// occurs first is the boundary. A message with no blank line is all headers.
+/// Whether a signature by `signing_domain` speaks for an author at
+/// `author_domain`: the same domain, or the author's is beneath it
+/// (`mail.example.org` under `example.org`). Never the reverse, and never a
+/// mere shared ending: `notexample.org` is not `example.org`.
+pub fn relayDomainAligned(author_domain: []const u8, signing_domain: []const u8) bool {
+    if (author_domain.len == 0 or signing_domain.len == 0) return false;
+    if (std.ascii.eqlIgnoreCase(author_domain, signing_domain)) return true;
+    if (author_domain.len <= signing_domain.len + 1) return false;
+    const tail_start = author_domain.len - signing_domain.len;
+    return author_domain[tail_start - 1] == '.' and std.ascii.eqlIgnoreCase(author_domain[tail_start..], signing_domain);
+}
+
 fn splitHeadersBody(data: []const u8) HeaderBodySplit {
     const crlf = std.mem.indexOf(u8, data, "\r\n\r\n");
     const lf = std.mem.indexOf(u8, data, "\n\n");
@@ -1702,7 +1714,8 @@ pub const Session = struct {
         if (!self.authenticated) return true;
         if (try submission_headers.author(self.allocator, message.items)) |address| {
             defer self.allocator.free(address);
-            return self.maySendAs(address);
+            if (try self.maySendAs(address)) return true;
+            return self.mayRelayAs(address, message.items);
         }
         // Supply the missing required author from an identity already authorized
         // for this account. Never infer it from an untrusted message header.
@@ -1725,6 +1738,38 @@ pub const Session = struct {
         const header = try std.fmt.allocPrint(self.allocator, "From: <{s}>\n", .{sender});
         defer self.allocator.free(header);
         try message.insertSlice(self.allocator, 0, header);
+        return true;
+    }
+
+    /// A relay account sending for somebody else's address.
+    ///
+    /// The account's own word is not enough: it could name any author. What
+    /// it has to show is a DKIM signature on this very message that verifies
+    /// against a key the author's domain publishes in DNS, with the signing
+    /// domain aligned to the author's. Only somebody the domain's owner gave
+    /// a key to can produce that, so the domain has authorized the message
+    /// whichever account carries it. Checked on the message as submitted,
+    /// before this server adds anything to it.
+    fn mayRelayAs(self: *Session, address: []const u8, message: []const u8) bool {
+        const identity = self.authenticated_username orelse return false;
+        if (!self.config.isRelayAccount(identity)) return false;
+        const at = std.mem.lastIndexOfScalar(u8, address, '@') orelse return false;
+        const author_domain = address[at + 1 ..];
+
+        const split = splitHeadersBody(message);
+        var validator = dkim_mod.DKIMValidator.init(self.allocator);
+        const check = validator.validateWithDomain(split.headers, split.body) catch {
+            self.logger.warn("relay refused: {s} as {s}: the signature could not be checked", .{ identity, address });
+            return false;
+        };
+        defer if (check.domain) |d| self.allocator.free(d);
+
+        const signing_domain = check.domain orelse "";
+        if (check.result != .pass or !relayDomainAligned(author_domain, signing_domain)) {
+            self.logger.warn("relay refused: {s} as {s}: dkim={s} d={s}", .{ identity, address, check.result.toString(), signing_domain });
+            return false;
+        }
+        self.logger.info("relay accepted: {s} as {s}, signed by {s}", .{ identity, address, signing_domain });
         return true;
     }
 

@@ -584,6 +584,21 @@ Outbound mail is RSA-SHA256 (relaxed/relaxed) DKIM-signed. With multiple hosted
 domains, each signs with its **own** key so the `d=` aligns with the `From:`
 domain and DMARC passes on DKIM (not only SPF).
 
+
+#### SMTP_RELAY_ACCOUNTS
+
+**Type:** Comma-separated account names
+**Default:** *(none: nobody relays)*
+**Description:** Accounts that send on behalf of other domains, such as a sending service whose customers have each proved their domain to it.
+
+An authenticated submission is normally refused unless its `From` address belongs to the signed-in account (`550 5.7.1 Message author is not authorized for this account`). An account named here may also author a message for another address, on one condition: the message, as submitted, carries a DKIM signature that verifies against a key published in DNS by the author's domain (the signing domain is the author's domain or a parent of it). Holding a key the domain publishes is the authorization; naming the account only lets it present one. A message without such a signature is refused exactly as before, and every decision is logged (`relay accepted` / `relay refused`).
+
+```bash
+SMTP_RELAY_ACCOUNTS=no-reply@commshq.org
+```
+
+Entries are whole account names, matched case-insensitively. A domain or a pattern is not an entry.
+
 #### DKIM_DOMAIN / DKIM_SELECTOR / DKIM_PRIVATE_KEY_PATH
 - **Description:** The **primary** DKIM signer. Also the fallback signer for any
   sender domain that has no dedicated key.

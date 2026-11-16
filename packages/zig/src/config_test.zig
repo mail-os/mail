@@ -352,3 +352,18 @@ test "and starts on every loopback spelling" {
 test "a public bind is fine when it is not a trap" {
     try trapConfig("0.0.0.0", false).validate();
 }
+
+test "nobody relays unless named, and a name is a whole account" {
+    var cfg = trapConfig("127.0.0.1", false);
+    try testing.expect(!cfg.isRelayAccount("no-reply@commshq.org"));
+
+    cfg.relay_accounts = "no-reply@commshq.org, sender@example.net";
+    try testing.expect(cfg.isRelayAccount("no-reply@commshq.org"));
+    try testing.expect(cfg.isRelayAccount("NO-REPLY@CommsHQ.org"));
+    try testing.expect(cfg.isRelayAccount("sender@example.net"));
+    // Not a domain, a prefix, or nothing at all.
+    try testing.expect(!cfg.isRelayAccount("commshq.org"));
+    try testing.expect(!cfg.isRelayAccount("reply@commshq.org"));
+    try testing.expect(!cfg.isRelayAccount("no-reply@commshq.org.evil.example"));
+    try testing.expect(!cfg.isRelayAccount(""));
+}
