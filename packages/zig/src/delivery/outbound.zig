@@ -390,6 +390,8 @@ fn deliverOnce(
         const n = readReply(transport, &recv_buf) catch return error.SmtpRcptToFailed;
         if (n < 3 or !std.mem.startsWith(u8, recv_buf[0..n], "250")) {
             std.log.err("RCPT TO rejected by {s}: {s}", .{ mx_host, recv_buf[0..@min(n, 100)] });
+            // The address does not exist: no later attempt can change that.
+            if (recipientRefusedForGood(recv_buf[0..n])) return error.SmtpRecipientRejected;
             return error.SmtpRcptToFailed;
         }
     }
@@ -636,4 +638,38 @@ fn hasHeader(data: []const u8, header: []const u8) bool {
         }
     }
     return false;
+}
+
+/// Whether a reply to RCPT TO says the address itself cannot receive mail,
+/// now or later: a 5xx whose enhanced code is in the bad-destination class
+/// (5.1.x: no such user, bad domain, moved) or names a disabled mailbox
+/// (5.2.1).
+///
+/// Deliberately narrow. A 5xx with any other code, or none, is as often a
+/// verdict on the sender as on the address (5.7.1 blocked, 5.7.26
+/// unauthenticated), and returning that as "no such address" would have a
+/// sender strike good addresses off its list. Those keep being retried.
+pub fn recipientRefusedForGood(reply: []const u8) bool {
+    if (reply.len < 4 or reply[0] != '5') return false;
+    var i: usize = 3;
+    while (i < reply.len and (reply[i] == ' ' or reply[i] == '-')) : (i += 1) {}
+    const rest = reply[i..];
+    return std.mem.startsWith(u8, rest, "5.1.") or std.mem.startsWith(u8, rest, "5.2.1 ") or std.mem.eql(u8, rest, "5.2.1");
+}
+
+test "only a reply about the address itself ends the attempts" {
+    const testing = std.testing;
+    try testing.expect(recipientRefusedForGood("550-5.1.1 The email account that you tried to reach does not exist."));
+    try testing.expect(recipientRefusedForGood("550 5.1.1 User unknown"));
+    try testing.expect(recipientRefusedForGood("550 5.1.10 Recipient not found"));
+    try testing.expect(recipientRefusedForGood("553 5.1.3 Bad address syntax"));
+    try testing.expect(recipientRefusedForGood("550 5.2.1 The email account is disabled"));
+    // About the sender, temporary, unlabelled, or nothing at all.
+    try testing.expect(!recipientRefusedForGood("550 5.7.1 Our system has detected that this message is likely unsolicited"));
+    try testing.expect(!recipientRefusedForGood("550-5.7.26 This mail is unauthenticated"));
+    try testing.expect(!recipientRefusedForGood("452 4.2.2 The recipient's inbox is out of storage space"));
+    try testing.expect(!recipientRefusedForGood("450 4.1.1 Try again later"));
+    try testing.expect(!recipientRefusedForGood("550 Requested action not taken"));
+    try testing.expect(!recipientRefusedForGood("550 5.2.10 something else"));
+    try testing.expect(!recipientRefusedForGood(""));
 }

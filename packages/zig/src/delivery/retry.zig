@@ -101,6 +101,24 @@ pub fn enqueueFailure(from: []const u8, to: []const u8, data: []const u8) void {
 /// Bytes of the original message quoted in a DSN.
 const dsn_original_bytes = 4096;
 
+/// What a bounce says when the recipient's own server refused the address.
+pub const status_no_such_recipient = "5.1.1";
+/// What a bounce says when this server ran out of attempts: the address may
+/// be good, and a sender must not take it for one that is not.
+pub const status_gave_up = "4.4.7";
+
+/// Return a message to its (local) sender at once: the recipient's server
+/// said the address cannot receive mail, and asking again would only tell it
+/// that this server sends to addresses that do not exist.
+pub fn bounceNow(from: []const u8, to: []const u8, reason: []const u8, data: []const u8) void {
+    const s = state orelse {
+        std.log.err("delivery pipeline not running; no bounce for {s}", .{to});
+        return;
+    };
+    std.log.warn("delivery to {s} refused for good; sending DSN to {s}", .{ to, from });
+    deliverBounceLocally(s, from, to, reason, data[0..@min(data.len, dsn_original_bytes)], status_no_such_recipient);
+}
+
 fn workerLoop(s: *State) void {
     while (s.running.load(.monotonic)) {
         const msg = s.queue.getNextPending() orelse {
@@ -128,6 +146,7 @@ fn workerLoop(s: *State) void {
         ) catch |err| {
             var err_buf: [128]u8 = undefined;
             const err_msg = std.fmt.bufPrint(&err_buf, "delivery failed: {}", .{err}) catch "delivery failed";
+            const refused_for_good = err == error.SmtpRecipientRejected;
 
             const disposition = s.queue.markForRetry(msg.id, err_msg) catch |qerr| {
                 std.log.err("retry queue update failed: {}", .{qerr});
@@ -141,7 +160,7 @@ fn workerLoop(s: *State) void {
                 .permanent => {
                     if (from_copy != null and to_copy != null) {
                         std.log.warn("delivery to {s} permanently failed; sending DSN to {s}", .{ to_copy.?, from_copy.? });
-                        deliverBounceLocally(s, from_copy.?, to_copy.?, err_msg, data_head orelse "");
+                        deliverBounceLocally(s, from_copy.?, to_copy.?, err_msg, data_head orelse "", if (refused_for_good) status_no_such_recipient else status_gave_up);
                     }
                 },
             }
@@ -170,7 +189,7 @@ fn isLocalBounceDomain(hostname: []const u8, extra_local_domains: ?[]const u8, s
     return false;
 }
 
-fn deliverBounceLocally(s: *State, from_addr: []const u8, failed_to: []const u8, error_message: []const u8, original: []const u8) void {
+fn deliverBounceLocally(s: *State, from_addr: []const u8, failed_to: []const u8, error_message: []const u8, original: []const u8, status: []const u8) void {
     // Only local senders get a DSN (no backscatter).
     const at_pos = std.mem.indexOfScalar(u8, from_addr, '@') orelse return;
     const sender_domain = from_addr[at_pos + 1 ..];
@@ -186,7 +205,7 @@ fn deliverBounceLocally(s: *State, from_addr: []const u8, failed_to: []const u8,
 
     var gen = bounce_mod.BounceGenerator.init(s.allocator, s.hostname) catch return;
     defer gen.deinit();
-    const dsn = gen.generateBounce(from_addr, failed_to, error_message, original) catch return;
+    const dsn = gen.generateBounceWithStatus(from_addr, failed_to, error_message, original, status) catch return;
     defer s.allocator.free(dsn);
 
     const ts = time_compat.milliTimestamp();
@@ -261,6 +280,6 @@ test "security: a bounce sender cannot escape the Maildir root" {
     };
     defer s.queue.deinit();
     // Any vulnerable write stays inside this owned scratch directory.
-    deliverBounceLocally(&s, "../escape@test.local", "recipient@external.test", "permanent failure", "Subject: test\n\nbody");
+    deliverBounceLocally(&s, "../escape@test.local", "recipient@external.test", "permanent failure", "Subject: test\n\nbody", status_gave_up);
     try std.testing.expectError(error.FileNotFound, fs_compat.cwd().access("escape", .{}));
 }

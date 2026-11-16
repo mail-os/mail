@@ -2875,6 +2875,13 @@ pub const Session = struct {
             ctx.delivery_method,
             ctx.ses_region,
         ) catch |err| {
+            // The recipient's server says the address does not exist. That
+            // is the answer; it goes back to the sender now, and the address
+            // is not tried again.
+            if (err == error.SmtpRecipientRejected) {
+                retry.bounceNow(ctx.from, ctx.to, "550 5.1.1 the recipient's mail server says this address cannot receive mail", ctx.data);
+                return;
+            }
             std.log.err("Outbound delivery to {s} failed: {} — queueing for retry", .{ ctx.to, err });
             // Persistent retry with backoff; a permanent failure there
             // generates a DSN back to the (local) sender.

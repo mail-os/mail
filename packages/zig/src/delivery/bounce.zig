@@ -32,6 +32,21 @@ pub const BounceGenerator = struct {
         error_message: []const u8,
         original_message: ?[]const u8,
     ) ![]const u8 {
+        return self.generateBounceWithStatus(original_from, original_to, error_message, original_message, "5.0.0");
+    }
+
+    /// A bounce that says, in its machine-readable part, what kind of failure
+    /// it reports. A sender that reads its bounces suppresses an address on a
+    /// `5.1.1` (it does not exist) and must not on a `4.4.7` (this server gave
+    /// up trying): the address may be perfectly good.
+    pub fn generateBounceWithStatus(
+        self: *BounceGenerator,
+        original_from: []const u8,
+        original_to: []const u8,
+        error_message: []const u8,
+        original_message: ?[]const u8,
+        status: []const u8,
+    ) ![]const u8 {
         const timestamp = time_compat.timestamp();
         const date_str = try time_compat.formatRfc5322Date(self.allocator, timestamp);
         defer self.allocator.free(date_str);
@@ -70,7 +85,7 @@ pub const BounceGenerator = struct {
         try self.appendf(&bounce, "Reporting-MTA: dns; {s}\r\n\r\n", .{self.our_hostname});
         try self.appendf(&bounce, "Final-Recipient: rfc822; {s}\r\n", .{original_to});
         try bounce.appendSlice(self.allocator, "Action: failed\r\n");
-        try bounce.appendSlice(self.allocator, "Status: 5.0.0\r\n");
+        try self.appendf(&bounce, "Status: {s}\r\n", .{status});
         try self.appendf(&bounce, "Diagnostic-Code: smtp; {s}\r\n\r\n", .{error_message});
 
         // Original message headers (if available)
