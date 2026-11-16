@@ -56,8 +56,19 @@ def reply(stream, expected):
     raise RuntimeError('Too many SMTP response lines')
 
 
+class ConnectTimeout(Exception):
+    """The TCP connection itself timed out: nothing answered, not even a refusal."""
+
+
+def connect(args, port):
+    try:
+        return socket.create_connection((args.connect_host or args.host, port), args.timeout)
+    except (socket.timeout, TimeoutError) as error:
+        raise ConnectTimeout(f'no answer on port {port}') from error
+
+
 def starttls_socket(args, port):
-    sock = socket.create_connection((args.connect_host or args.host, port), args.timeout)
+    sock = connect(args, port)
     try:
         stream = sock.makefile('rb')
         reply(stream, 220)
@@ -79,7 +90,7 @@ def context(args, version):
 
 
 def smtp(args, port, version, implicit=False):
-    raw = (socket.create_connection((args.connect_host or args.host, port), args.timeout)
+    raw = (connect(args, port)
            if implicit else starttls_socket(args, port))
     with raw:
         with context(args, version).wrap_socket(raw, server_hostname=args.host) as secure:
@@ -171,6 +182,10 @@ def main():
     parser.add_argument('--ca-file', help='Additional test CA bundle')
     parser.add_argument('--timeout', type=float, default=10)
     parser.add_argument('--json', action='store_true', help='Emit a sanitized structured result')
+    parser.add_argument('--allow-blocked-smtp-port', action='store_true',
+                        help='Where this network blocks outbound port 25 (most cloud CI does), report its probes as '
+                             'skipped instead of failed. Only a connection that times out is skipped, only when every '
+                             'port 25 probe timed out and another port answered: a refusal or a protocol error still fails.')
     args = parser.parse_args()
     probes = []
     for version in (ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_3):
@@ -184,13 +199,27 @@ def main():
         probes.append((f'SMTP TLSv1_3 with {padding} padding bytes', lambda p=padding: padded_smtp(args, p)))
     failed = False
     checks = []
+    blocked = []
     for name, run in probes:
         started = time.monotonic()
+        # Once port 25 has gone unanswered, the rest of its probes would each
+        # wait out the same timeout to learn the same thing.
+        on_smtp_port = name.startswith('SMTP ') and not name.startswith('SMTPS')
         try:
+            if on_smtp_port and blocked and args.allow_blocked_smtp_port:
+                raise ConnectTimeout(f'no answer on port {args.smtp_port}')
             run()
             checks.append({'name': name, 'ok': True, 'duration_ms': round((time.monotonic() - started) * 1000)})
             if not args.json:
                 print(f'PASS {name}', flush=True)
+        except ConnectTimeout as error:
+            if on_smtp_port and args.allow_blocked_smtp_port:
+                blocked.append({'name': name, 'ok': False, 'error': 'ConnectTimeout', 'duration_ms': round((time.monotonic() - started) * 1000)})
+                continue
+            failed = True
+            checks.append({'name': name, 'ok': False, 'error': 'ConnectTimeout', 'duration_ms': round((time.monotonic() - started) * 1000)})
+            if not args.json:
+                print(f'FAIL {name}: {type(error).__name__}: {error}', file=sys.stderr, flush=True)
         except Exception as error:
             failed = True
             # Dashboard data never includes server responses, addresses or secrets.
@@ -200,6 +229,21 @@ def main():
             checks.append(failure)
             if not args.json:
                 print(f'FAIL {name}: {type(error).__name__}: {error}', file=sys.stderr, flush=True)
+    if blocked:
+        smtp_probes = sum(1 for name, _ in probes if name.startswith('SMTP ') and not name.startswith('SMTPS'))
+        # Blocked, as opposed to down: port 25 never answered at all, and the
+        # same host answered on another port in this very run.
+        egress_blocked = len(blocked) == smtp_probes and any(check['ok'] for check in checks)
+        for check in blocked:
+            check['skipped'] = egress_blocked
+            checks.append(check)
+            if not args.json:
+                if egress_blocked:
+                    print(f"SKIP {check['name']}: this network blocks outbound port {args.smtp_port}", flush=True)
+                else:
+                    print(f"FAIL {check['name']}: ConnectTimeout", file=sys.stderr, flush=True)
+        if not egress_blocked:
+            failed = True
     if args.json:
         print(json.dumps({'ok': not failed, 'checks': checks}))
     return int(failed)

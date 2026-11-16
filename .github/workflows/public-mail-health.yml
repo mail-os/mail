@@ -19,7 +19,7 @@ jobs:
         id: probe
         env:
           HOST: ${{ secrets.HETZNER_HOST }}
-        run: python3 scripts/mail-health.py --host mail.stacksjs.com --connect-host "$HOST" --timeout 4
+        run: python3 scripts/mail-health.py --host mail.stacksjs.com --connect-host "$HOST" --allow-blocked-smtp-port --timeout 4
       - name: Verify that the host monitor is fresh and healthy
         id: freshness
         if: always()

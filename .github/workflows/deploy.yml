@@ -117,4 +117,4 @@ jobs:
     - name: Verify public mail commands after TLS
       env:
         HOST: ${{ secrets.HETZNER_HOST }}
-      run: python3 scripts/mail-health.py --host mail.stacksjs.com --connect-host "$HOST"
+      run: python3 scripts/mail-health.py --host mail.stacksjs.com --connect-host "$HOST" --allow-blocked-smtp-port
