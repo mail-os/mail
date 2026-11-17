@@ -356,7 +356,9 @@ fn changePasswordAction(ctx: *cli.BaseCommand.ParseContext) !void {
     };
 
     const instance_id = try getInstanceId(ctx, allocator);
-    const remote_params = try buildRemoteParams(allocator, &.{ "user:local", "change-password", username, password });
+    // An operator typing `mail user change-password` is the reset the local
+    // command's --force exists for.
+    const remote_params = try buildRemoteParams(allocator, &.{ "user:local", "change-password", username, password, "--force" });
     defer allocator.free(remote_params);
 
     printStdout("Changing password for {s}...\n", .{username});

@@ -93,11 +93,42 @@ fn verifyAction(ctx: *cli.BaseCommand.ParseContext, _: *database.Database, auth_
     try user_cli.verifyUser(auth_backend, username, password);
 }
 
+/// Whether `change-password` may replace a password that is already set.
+///
+/// Only when the caller says so with `--force`. Application deploys used to
+/// call this on every run with whatever `MAIL_PASSWORD_<LOCALPART>` their own
+/// environment held, and an app that had copied another project's mail config
+/// replaced real people's passwords on a shared box: their mail clients were
+/// locked out until the old hashes were restored from a backup. Those deploy
+/// tools are pinned in apps that are not upgraded together, so the refusal has
+/// to live here, where every version of them ends up. An operator resetting a
+/// password means it and passes `--force`; a tool that manages a service
+/// account's credential on purpose does the same.
+pub fn replacePassword(auth_backend: *auth.AuthBackend, username: []const u8, password: []const u8, force: bool) !void {
+    if (!force) {
+        std.debug.print(
+            "Error: refusing to replace the password of '{s}' without --force.\n" ++
+                "A mailbox's password belongs to the person who uses it; a deploy that\n" ++
+                "replaces it locks their mail clients out. Pass --force to reset it on purpose.\n",
+            .{username},
+        );
+        return error.PasswordReplaceRefused;
+    }
+    try user_cli.changePassword(auth_backend, username, password);
+}
+
+pub const change_password_usage = "Usage: mail user:local change-password <username> [<password> | --password-stdin] --force\n";
+
 fn changePasswordAction(ctx: *cli.BaseCommand.ParseContext, _: *database.Database, auth_backend: *auth.AuthBackend) !void {
     const username = ctx.getArgument(0) orelse {
-        std.debug.print("Error: username is required\nUsage: mail user:local change-password <username> [<password> | --password-stdin]\n", .{});
-        return;
+        std.debug.print("Error: username is required\n{s}", .{change_password_usage});
+        return error.MissingArgument;
     };
+
+    const force = ctx.hasOption("force");
+    // Refused before the password is read, so nothing is consumed from stdin
+    // and the answer is the same whichever way the password was passed.
+    if (!force) return replacePassword(auth_backend, username, "", false);
 
     var stdin_password: ?[]u8 = null;
     defer if (stdin_password) |password| {
@@ -124,11 +155,11 @@ fn changePasswordAction(ctx: *cli.BaseCommand.ParseContext, _: *database.Databas
         }
         break :blk input[0..end];
     } else ctx.getArgument(1) orelse {
-        std.debug.print("Error: password is required\nUsage: mail user:local change-password <username> [<password> | --password-stdin]\n", .{});
-        return;
+        std.debug.print("Error: password is required\n{s}", .{change_password_usage});
+        return error.MissingArgument;
     };
 
-    try user_cli.changePassword(auth_backend, username, password);
+    try replacePassword(auth_backend, username, password, force);
 }
 
 fn recoveryAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Database, _: *auth.AuthBackend) !void {
@@ -210,6 +241,9 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try change_pw_cmd.addArgument(cli.Argument.init("password", "New password", .string).withRequired(false));
     _ = try change_pw_cmd.addOption(
         cli.Option.init("password-stdin", "password-stdin", "Read the new password from standard input", .bool),
+    );
+    _ = try change_pw_cmd.addOption(
+        cli.Option.init("force", "force", "Replace the existing password (required: without it the command refuses)", .bool),
     );
     _ = change_pw_cmd.setAction(withDb(changePasswordAction));
     _ = try cmd.addCommand(change_pw_cmd);

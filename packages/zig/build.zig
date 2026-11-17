@@ -147,6 +147,7 @@ pub fn build(b: *std.Build) void {
         "src/core/version.zig",
         "src/core/log_safe.zig",
         "src/upgrade_test.zig",
+        "src/user_local_test.zig",
     };
 
     // RFC compliance tests

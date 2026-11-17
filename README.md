@@ -168,8 +168,14 @@ mail user:local disable <username>
 mail user:local enable <username>
 mail user:local info <username>
 mail user:local verify <username> <password>
-mail user:local change-password <username> <password>
+mail user:local change-password <username> [<password> | --password-stdin] --force
 ```
+
+`change-password` refuses without `--force`. A mailbox's password belongs to the
+person who uses it, and deploy tooling that called this on every run replaced
+real people's passwords on a shared server. Pass `--force` when you mean to
+reset one. `mail user change-password` (remote) is an operator command and
+passes it for you.
 
 ### `mail migrate`
 
