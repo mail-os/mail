@@ -4511,7 +4511,7 @@ pub const ImapServer = struct {
 
             logger.info("Starting TLS handshake for IMAPS connection", .{});
             var recv_buf: [tls.input_buffer_len]u8 = undefined;
-            const handshake = try self.tlsHandshake(connection, &recv_buf);
+            const handshake = try self.tlsHandshake(connection, &recv_buf, &.{});
             logger.info("IMAPS TLS handshake completed successfully", .{});
             runTlsSession(session, connection, handshake.cipher, recv_buf[0..handshake.leftover_len], .implicit);
             return;
@@ -4520,14 +4520,22 @@ pub const ImapServer = struct {
         // Plain text session (non-SSL)
         try session.sendGreeting();
 
-        var buffer: [4096]u8 = undefined;
+        // Input is framed into lines here, not one command per read(): a
+        // client may pipeline, and after STARTTLS the bytes that follow the
+        // command in the same segment are the start of its ClientHello.
+        var input: [16384]u8 = undefined;
+        var input_len: usize = 0;
         while (session.state != .logout and !session.starttls_requested) {
             // During IDLE: set a short socket timeout so we can poll for new mail
             if (session.idle_mode) {
                 if (!session.idleWaitReadable(connection.fd)) continue;
             }
 
-            const bytes_read = connection.read(&buffer) catch |err| {
+            if (input_len == input.len) {
+                logger.warn("IMAP: command line longer than {d} bytes; closing", .{input.len});
+                break;
+            }
+            const bytes_read = connection.read(input[input_len..]) catch |err| {
                 if (session.idle_mode and (err == error.WouldBlock or err == error.ConnectionTimedOut)) {
                     if (session.state == .selected) {
                         session.idlePollRescan();
@@ -4537,6 +4545,7 @@ pub const ImapServer = struct {
                 break;
             };
             if (bytes_read == 0) break;
+            input_len += bytes_read;
 
             // Restore normal timeout when leaving IDLE
             if (!session.idle_mode) {
@@ -4544,36 +4553,71 @@ pub const ImapServer = struct {
                 std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&no_tv)) catch {};
             }
 
-            // If collecting APPEND literal data, feed bytes to the buffer
-            if (session.append_literal_buf) |buf| {
-                const needed = session.append_literal_size - session.append_literal_pos;
-                const copy_len = @min(needed, bytes_read);
-                @memcpy(buf[session.append_literal_pos..][0..copy_len], buffer[0..copy_len]);
-                session.append_literal_pos += copy_len;
-                if (session.append_literal_pos >= session.append_literal_size) {
-                    session.finalizeAppend() catch |err| {
-                        logger.err("IMAP APPEND finalize error: {}", .{err});
-                    };
-                }
-                continue;
+            const processed = processInput(session, input[0..input_len]);
+            const leftover = input_len - processed;
+            if (processed > 0 and leftover > 0) {
+                std.mem.copyForwards(u8, &input, input[processed..input_len]);
             }
-
-            const line = std.mem.trim(u8, buffer[0..bytes_read], "\r\n");
-            session.processCommand(line) catch |err| {
-                logger.err("IMAP command processing error: {}", .{err});
-                break;
-            };
+            input_len = leftover;
         }
 
-        // STARTTLS upgrade: perform TLS handshake on the existing connection
+        // STARTTLS upgrade: perform TLS handshake on the existing connection.
+        // processInput stopped at the STARTTLS line, so whatever is still in
+        // `input` arrived behind it. It goes to the handshake as TLS records,
+        // never to the session as commands: cleartext injected ahead of the
+        // handshake cannot reach the encrypted session.
         if (session.starttls_requested and self.cert_key_pair != null) {
             logger.info("Starting STARTTLS upgrade on port 143", .{});
             var recv_buf: [tls.input_buffer_len]u8 = undefined;
-            const handshake = self.tlsHandshake(connection, &recv_buf) catch return;
+            const handshake = self.tlsHandshake(connection, &recv_buf, input[0..input_len]) catch return;
             logger.info("STARTTLS handshake completed successfully", .{});
             session.starttls_requested = false;
             runTlsSession(session, connection, handshake.cipher, recv_buf[0..handshake.leftover_len], .starttls);
         }
+    }
+
+    /// Feed client input to the session: complete command lines, and APPEND
+    /// literal bytes while a literal is being collected. Returns how many
+    /// bytes were consumed; the rest is an incomplete line to keep.
+    ///
+    /// Stops right after a line that requests STARTTLS. What follows it was
+    /// sent before TLS began and must not run as commands.
+    fn processInput(session: *ImapSession, input: []const u8) usize {
+        var processed: usize = 0;
+        while (processed < input.len) {
+            // If collecting APPEND literal data, consume bytes directly
+            if (session.append_literal_buf) |buf| {
+                const needed = session.append_literal_size - session.append_literal_pos;
+                const lit_len = @min(needed, input.len - processed);
+                @memcpy(buf[session.append_literal_pos..][0..lit_len], input[processed..][0..lit_len]);
+                session.append_literal_pos += lit_len;
+                processed += lit_len;
+
+                if (session.append_literal_pos >= session.append_literal_size) {
+                    // Literal complete - save message and send OK
+                    session.finalizeAppend() catch |err| {
+                        logger.err("IMAP APPEND finalize error: {}", .{err});
+                    };
+                    // Skip trailing \r\n after literal data
+                    if (processed + 2 <= input.len and input[processed] == '\r' and input[processed + 1] == '\n') {
+                        processed += 2;
+                    }
+                }
+                continue;
+            }
+
+            // Normal: find next \r\n delimited command line
+            const remaining = input[processed..];
+            const line_end = std.mem.indexOf(u8, remaining, "\r\n") orelse break;
+            if (line_end > 0) {
+                session.processCommand(remaining[0..line_end]) catch |err| {
+                    logger.err("IMAP command processing error: {}", .{err});
+                };
+            }
+            processed += line_end + 2; // skip \r\n
+            if (session.state == .logout or session.starttls_requested) break;
+        }
+        return processed;
     }
 
     const TlsHandshake = struct {
@@ -4592,12 +4636,17 @@ pub const ImapServer = struct {
     /// one record does not just lose a command: every later record is then
     /// decrypted with a sequence number one short, and fails as
     /// error.TlsBadRecordMac.
-    fn tlsHandshake(self: *ImapServer, connection: socket.Connection, recv_buf: *[tls.input_buffer_len]u8) !TlsHandshake {
+    ///
+    /// `received` is handshake input already read from the socket (a
+    /// ClientHello sent in the same segment as the STARTTLS command).
+    fn tlsHandshake(self: *ImapServer, connection: socket.Connection, recv_buf: *[tls.input_buffer_len]u8, received: []const u8) !TlsHandshake {
         var tls_server = tls.nonblock.Server.init(.{
             .auth = &self.cert_key_pair.?,
         });
         var send_buf: [tls.output_buffer_len]u8 = undefined;
-        var recv_len: usize = 0;
+        if (received.len > recv_buf.len) return error.TlsHandshakeFailed;
+        @memcpy(recv_buf[0..received.len], received);
+        var recv_len: usize = received.len;
 
         while (!tls_server.done()) {
             const result = tls_server.run(recv_buf[0..recv_len], &send_buf) catch |err| {
@@ -4734,54 +4783,12 @@ pub const ImapServer = struct {
                 @memcpy(cleartext_accum[cleartext_accum_len..][0..copy_len], dec_result.cleartext[0..copy_len]);
                 cleartext_accum_len += copy_len;
 
-                // Process data - command lines or APPEND literal data
-                var processed: usize = 0;
-                while (processed < cleartext_accum_len) {
-                    // If collecting APPEND literal data, consume bytes directly
-                    if (session.append_literal_buf) |buf| {
-                        const needed = session.append_literal_size - session.append_literal_pos;
-                        const available = cleartext_accum_len - processed;
-                        const lit_len = @min(needed, available);
-                        @memcpy(buf[session.append_literal_pos..][0..lit_len], cleartext_accum[processed..][0..lit_len]);
-                        session.append_literal_pos += lit_len;
-                        processed += lit_len;
-
-                        if (session.append_literal_pos >= session.append_literal_size) {
-                            // Literal complete - save message and send OK
-                            session.finalizeAppend() catch |err| {
-                                logger.err("IMAP APPEND finalize error: {}", .{err});
-                            };
-                            // Skip trailing \r\n after literal data
-                            if (processed + 2 <= cleartext_accum_len and
-                                cleartext_accum[processed] == '\r' and cleartext_accum[processed + 1] == '\n')
-                            {
-                                processed += 2;
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Normal: find next \r\n delimited command line
-                    const remaining = cleartext_accum[processed..cleartext_accum_len];
-                    const line_end = std.mem.indexOf(u8, remaining, "\r\n") orelse break;
-                    if (line_end > 0) {
-                        const line = remaining[0..line_end];
-                        session.processCommand(line) catch |err| {
-                            logger.err("IMAP command processing error: {}", .{err});
-                        };
-                    }
-                    processed += line_end + 2; // skip \r\n
-                    if (session.state == .logout) break;
+                const processed = processInput(session, cleartext_accum[0..cleartext_accum_len]);
+                const leftover = cleartext_accum_len - processed;
+                if (processed > 0 and leftover > 0) {
+                    std.mem.copyForwards(u8, &cleartext_accum, cleartext_accum[processed..cleartext_accum_len]);
                 }
-
-                // Move unprocessed data to front
-                if (processed > 0) {
-                    const leftover = cleartext_accum_len - processed;
-                    if (leftover > 0) {
-                        std.mem.copyForwards(u8, &cleartext_accum, cleartext_accum[processed..cleartext_accum_len]);
-                    }
-                    cleartext_accum_len = leftover;
-                }
+                cleartext_accum_len = leftover;
             }
 
             // Remove consumed ciphertext
@@ -5396,9 +5403,20 @@ const TestImapsClient = struct {
         c.inbox_len -= n;
     }
 
+    /// Read one cleartext line (before TLS) into `transcript`.
+    fn readPlainLine(c: *TestImapsClient, transcript: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+        while (std.mem.indexOf(u8, c.inbox[0..c.inbox_len], "\r\n") == null) try c.fill();
+        const end = std.mem.indexOf(u8, c.inbox[0..c.inbox_len], "\r\n").? + 2;
+        try transcript.appendSlice(allocator, c.inbox[0..end]);
+        c.consume(end);
+    }
+
     /// Handshake, but hold back the final flight (the client Finished) and
     /// return it, so the caller decides how it reaches the server.
-    fn handshakeHoldingFinished(c: *TestImapsClient, out: []u8) ![]const u8 {
+    ///
+    /// `starttls` is a STARTTLS command line to send in the same write as the
+    /// ClientHello; the server's cleartext answer to it goes to `transcript`.
+    fn handshakeHoldingFinished(c: *TestImapsClient, starttls: []const u8, transcript: *std.ArrayList(u8), allocator: std.mem.Allocator, out: []u8) ![]const u8 {
         var cli = tls.nonblock.Client.init(.{
             .host = "localhost",
             .root_ca = .empty,
@@ -5406,13 +5424,16 @@ const TestImapsClient = struct {
         });
         var send_buf: [tls.output_buffer_len]u8 = undefined;
         var r = try cli.run(&.{}, &send_buf);
-        try c.writeAll(r.send);
+        @memcpy(out[0..starttls.len], starttls);
+        @memcpy(out[starttls.len..][0..r.send.len], r.send);
+        try c.writeAll(out[0 .. starttls.len + r.send.len]);
+        if (starttls.len > 0) try c.readPlainLine(transcript, allocator);
         while (true) {
-            try c.fill();
             r = try cli.run(c.inbox[0..c.inbox_len], &send_buf);
             c.consume(r.recv_pos);
             if (cli.done()) break;
-            try c.writeAll(r.send);
+            if (r.send.len > 0) try c.writeAll(r.send);
+            if (r.recv_pos == 0 and r.send.len == 0) try c.fill();
         }
         c.conn = tls.nonblock.Connection.init(cli.cipher().?);
         @memcpy(out[0..r.send.len], r.send);
@@ -5471,13 +5492,13 @@ test "IMAPS serves a command sent in the same segment as the client Finished" {
         thread.join();
     }
 
+    var transcript: std.ArrayList(u8) = .empty;
+    defer transcript.deinit(a);
     var flight: [tls.output_buffer_len + 256]u8 = undefined;
-    const finished = try client.handshakeHoldingFinished(&flight);
+    const finished = try client.handshakeHoldingFinished("", &transcript, a, &flight);
     const command = try client.encrypt("a1 NOOP\r\n", flight[finished.len..]);
     try client.writeAll(flight[0 .. finished.len + command.len]);
 
-    var transcript: std.ArrayList(u8) = .empty;
-    defer transcript.deinit(a);
     try client.readUntil(&transcript, a, "a1 OK");
     try ImapTestHarness.expectContains(transcript.items, "* OK");
 
@@ -5488,4 +5509,88 @@ test "IMAPS serves a command sent in the same segment as the client Finished" {
 
     try client.writeAll(try client.encrypt("a3 LOGOUT\r\n", &record));
     try client.readUntil(&transcript, a, "a3 OK");
+}
+
+/// An IMAP server on one end of a socketpair, serving plaintext port 143
+/// (with STARTTLS) on its own thread.
+const TestPlainImap = struct {
+    server: ImapServer,
+    thread: std.Thread,
+    client: TestImapsClient,
+
+    fn start(t: *TestPlainImap, h: *ImapTestHarness) !void {
+        const a = h.allocator;
+        t.server = ImapServer.init(a, .{ .enable_ssl = false }, &h.auth_backend, &h.db);
+        errdefer t.server.deinit();
+        t.server.cert_key_pair = try tls.config.CertKeyPair.fromPem(a, test_tls_cert_pem, test_tls_key_pem);
+        var fds: [2]c_int = undefined;
+        if (std.c.socketpair(std.posix.AF.UNIX, @intCast(@as(u32, std.posix.SOCK.STREAM)), 0, &fds) != 0) return error.SocketPairFailed;
+        const timeout: std.posix.timeval = .{ .sec = 5, .usec = 0 };
+        try std.posix.setsockopt(fds[1], std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
+        t.thread = try std.Thread.spawn(.{}, struct {
+            fn run(s: *ImapServer, fd: c_int) void {
+                s.handleConnection(.{ .fd = fd }, false) catch {};
+            }
+        }.run, .{ &t.server, fds[0] });
+        t.client = .{ .fd = fds[1] };
+    }
+
+    fn stop(t: *TestPlainImap) void {
+        _ = std.c.close(t.client.fd);
+        t.thread.join();
+        t.server.deinit();
+    }
+};
+
+test "STARTTLS takes a ClientHello sent in the same segment as the command" {
+    // RFC 3501 has the client wait for the tagged OK, but a client that sends
+    // its ClientHello straight behind STARTTLS used to lose it: the plaintext
+    // loop took the whole read as one command line, so the handshake never
+    // saw the hello and both sides waited.
+    const a = std.testing.allocator;
+    const h = try ImapTestHarness.create(a);
+    defer h.destroy();
+    var t: TestPlainImap = undefined;
+    try t.start(h);
+    defer t.stop();
+
+    var transcript: std.ArrayList(u8) = .empty;
+    defer transcript.deinit(a);
+    try t.client.readPlainLine(&transcript, a); // greeting
+
+    var flight: [tls.output_buffer_len + 256]u8 = undefined;
+    const finished = try t.client.handshakeHoldingFinished("a1 STARTTLS\r\n", &transcript, a, &flight);
+    try ImapTestHarness.expectContains(transcript.items, "a1 OK");
+    try t.client.writeAll(finished);
+
+    var record: [256]u8 = undefined;
+    try t.client.writeAll(try t.client.encrypt("a2 NOOP\r\n", &record));
+    try t.client.readUntil(&transcript, a, "a2 OK");
+    try t.client.writeAll(try t.client.encrypt("a3 LOGOUT\r\n", &record));
+    try t.client.readUntil(&transcript, a, "a3 OK");
+}
+
+test "cleartext pipelined behind STARTTLS never runs as a command" {
+    // The STARTTLS injection class: commands an attacker appends after
+    // STARTTLS in cleartext must not execute, before or after the upgrade.
+    // Pipelined commands ahead of STARTTLS are still each answered.
+    const a = std.testing.allocator;
+    const h = try ImapTestHarness.create(a);
+    defer h.destroy();
+    var t: TestPlainImap = undefined;
+    try t.start(h);
+    defer t.stop();
+
+    try t.client.writeAll("a0 NOOP\r\na1 STARTTLS\r\na2 LOGOUT\r\n");
+    var transcript: std.ArrayList(u8) = .empty;
+    defer transcript.deinit(a);
+    // Everything the server sends until it gives up on the handshake.
+    while (true) {
+        t.client.fill() catch break;
+    }
+    try transcript.appendSlice(a, t.client.inbox[0..t.client.inbox_len]);
+    try ImapTestHarness.expectContains(transcript.items, "a0 OK");
+    try ImapTestHarness.expectContains(transcript.items, "a1 OK");
+    try std.testing.expect(std.mem.indexOf(u8, transcript.items, "a2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript.items, "BYE") == null);
 }
