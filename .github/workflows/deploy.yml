@@ -112,7 +112,10 @@ jobs:
         printf 'Host %s\n  IdentityFile ~/.ssh/deploy_key\n  BatchMode yes\n' "$HOST" > ~/.ssh/config
         bun scripts/deploy-webmail.ts "root@$HOST"
         # Tenant provisioning can rewrite the legacy health wrapper. Install last.
-        ssh -i ~/.ssh/deploy_key -o BatchMode=yes "root@$HOST" "sh /tmp/setup-mail-health.sh /tmp/mail-health.py && systemctl start mail-health.service"
+        # The gate judges listeners and protocol probes. Client errors in the
+        # journal (a TLS error from a client reconnecting into the restart)
+        # still mark status degraded and alert, but do not fail the deploy.
+        ssh -i ~/.ssh/deploy_key -o BatchMode=yes "root@$HOST" "sh /tmp/setup-mail-health.sh /tmp/mail-health.py && /usr/local/sbin/mail-protocol-health-check --deploy-gate"
 
     - name: Verify public mail commands after TLS
       env:

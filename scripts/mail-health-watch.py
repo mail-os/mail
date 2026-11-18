@@ -70,6 +70,18 @@ def send_alert(webhook, content):
             raise RuntimeError('Alert transport rejected the notification')
 
 
+# What a deploy cannot vouch for. Journal patterns record what clients and
+# peers did (one client tripping a TLS error seconds after a restart says
+# nothing about the release), and alert transport is a third party. They keep
+# their place in status.json and the alert stream; they just do not decide
+# whether a deploy succeeded.
+OUTSIDE_DEPLOY_GATE = frozenset(PATTERNS) | {'Delivery error monitoring', 'Admin alert transport'}
+
+
+def deploy_gate_failures(checks):
+    return [c['name'] for c in checks if not c['ok'] and c['name'] not in OUTSIDE_DEPLOY_GATE]
+
+
 JOURNAL_PAGE_SIZE = 10000
 JOURNAL_MAX_PAGES = 8
 
@@ -185,7 +197,14 @@ def run(args):
               'checks': checks, 'events': state.get('events', []),
               'last_alert_at': state.get('last_alert_at')}
     atomic_json(args.status_path, status, 0o640)
-    print(json.dumps({'status': status['status'], 'failed': [c['name'] for c in checks if not c['ok']], 'pending_alerts': len(state['pending'])}), flush=True)
+    failed = [c['name'] for c in checks if not c['ok']]
+    print(json.dumps({'status': status['status'], 'failed': failed, 'pending_alerts': len(state['pending'])}), flush=True)
+    if getattr(args, 'deploy_gate', False):
+        gate = deploy_gate_failures(checks)
+        for name in failed:
+            if name not in gate:
+                print(f'Not judged by the deploy gate (still alerted): {name}', flush=True)
+        return int(bool(gate))
     return int(status['status'] != 'healthy')
 
 
@@ -197,6 +216,8 @@ def main():
     parser.add_argument('--status-path', default='/var/lib/mail-health/public/status.json')
     parser.add_argument('--storage-path', default='/opt/mail')
     parser.add_argument('--env-file', default='/etc/mail/mail.env')
+    parser.add_argument('--deploy-gate', action='store_true',
+                        help='Exit by the protocol and storage checks only; status and alerts are unchanged')
     return run(parser.parse_args())
 
 

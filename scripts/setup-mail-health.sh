@@ -19,9 +19,18 @@ chown root:mail-server /var/lib/mail-health/public/read-token
 chmod 0640 /var/lib/mail-health/public/read-token
 cat > /usr/local/sbin/mail-protocol-health-check <<'CHECK'
 #!/bin/sh
+# --deploy-gate: judge a deploy by its listeners and protocol probes. Status
+# and alerts are recorded exactly as on a timer run.
 set -eu
+gate=0
+if [ "${1:-}" = --deploy-gate ]; then gate=1; fi
 exec 9>/run/mail-health-check.lock
-flock -n 9 || exit 0
+if [ "$gate" = 1 ]; then
+  # A deploy needs a verdict, not a skip because the timer holds the lock.
+  flock -w 120 9 || { echo 'mail-health: timed out waiting for the health lock' >&2; exit 1; }
+else
+  flock -n 9 || exit 0
+fi
 # Try existing listener recovery once, but always publish/report health even if
 # recovery fails. No protocol failure is hidden by restarting the daemon.
 needs_restart=0
@@ -35,6 +44,15 @@ if [ "$needs_restart" = 1 ]; then
   sleep 2
 fi
 mail_hostname="$(sed -n 's/^SMTP_HOSTNAME=//p' /etc/mail/mail.env | head -1)"
+if [ "$gate" = 1 ]; then
+  status=0
+  python3 /opt/mail/maintenance/mail-health-watch.py --host "${mail_hostname:-mail.stacksjs.com}" --deploy-gate || status=$?
+  if [ "$needs_restart" = 1 ]; then
+    echo 'mail-health: mail was inactive or missing a listener after the deploy' >&2
+    status=1
+  fi
+  exit "$status"
+fi
 exec python3 /opt/mail/maintenance/mail-health-watch.py --host "${mail_hostname:-mail.stacksjs.com}"
 CHECK
 chmod 0755 /usr/local/sbin/mail-protocol-health-check

@@ -45,6 +45,34 @@ class HealthTests(unittest.TestCase):
                 self.assertEqual(args.state_path.stat().st_mode & 0o777, 0o600)
                 self.assertEqual(args.status_path.stat().st_mode & 0o777, 0o640)
 
+    def run_gate(self, root, probe_checks, journal):
+        args = types.SimpleNamespace(state_path=root/'private/state.json', status_path=root/'public/status.json',
+                                     env_file=root/'env', storage_path=root, probe='probe.py', host='mail.example.com',
+                                     deploy_gate=True)
+        args.env_file.write_text('')
+        ok = all(check['ok'] for check in probe_checks)
+        probe = subprocess.CompletedProcess([], 0 if ok else 1, json.dumps({'ok': ok, 'checks': probe_checks}).encode())
+        with patch.object(watch.subprocess, 'run', return_value=probe), patch.object(watch, 'journal_checks', return_value=journal), patch.object(watch.shutil, 'disk_usage', return_value=types.SimpleNamespace(total=10000000000, free=5000000000)):
+            code = watch.run(args)
+        return code, json.loads(args.status_path.read_text()), watch.load_state(args.state_path)
+
+    def test_deploy_gate_passes_a_client_tls_error_but_still_alerts_on_it(self):
+        # One client's TLS error seconds after the restart failed a deploy
+        # whose binary and every protocol probe were fine.
+        with tempfile.TemporaryDirectory() as directory:
+            code, status, state = self.run_gate(pathlib.Path(directory), [{'name': 'IMAPS TLSv1_3', 'ok': True}],
+                                                [{'name': 'TLS receive errors', 'ok': False, 'count': 1}])
+            self.assertEqual(code, 0)
+            self.assertEqual(status['status'], 'degraded')
+            self.assertIn('TLS receive errors', state['active'])
+            self.assertEqual(state['pending'][-1]['summary'], 'Mail needs attention: TLS receive errors')
+
+    def test_deploy_gate_fails_a_broken_protocol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, status, _ = self.run_gate(pathlib.Path(directory), [{'name': 'IMAPS TLSv1_3', 'ok': False}], [])
+            self.assertEqual(code, 1)
+            self.assertEqual(status['status'], 'degraded')
+
     def test_journal_window_and_cursor_no_duplicate_counting(self):
         state = {'failures': [{'name': 'Storage failures', 'at': 1}]}
         entry = {'__CURSOR': 'cursor-1', '__REALTIME_TIMESTAMP': '1000000000',
