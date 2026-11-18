@@ -574,11 +574,15 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         const port_str = env.get("IMAP_PORT") orelse "143";
         break :blk std.fmt.parseInt(u16, port_str, 10) catch 143;
     };
+    const imaps_port: u16 = blk: {
+        const port_str = env.get("IMAPS_PORT") orelse "993";
+        break :blk std.fmt.parseInt(u16, port_str, 10) catch 993;
+    };
 
     if (enable_imap and auth_ptr != null) {
         const imap_config = imap.ImapConfig{
             .port = imap_port,
-            .ssl_port = 993,
+            .ssl_port = imaps_port,
             // The interface SMTP was told to use. A server told to bind
             // 127.0.0.1 meant it, and an IMAP listener that ignored that and
             // took 0.0.0.0 published mailboxes to the local network from a
@@ -596,7 +600,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         imap_server = imap.ImapServer.init(allocator, imap_config, auth_ptr.?, db_ptr);
         log.info("IMAP server configured on port {d}", .{imap_port});
         if (cfg.enable_tls and cfg.tls_cert_path != null) {
-            log.info("IMAPS server configured on port 993 (SSL/TLS)", .{});
+            log.info("IMAPS server configured on port {d} (SSL/TLS)", .{imaps_port});
         }
     }
     defer if (imap_server) |*is| is.deinit();

@@ -4491,6 +4491,9 @@ pub const ImapServer = struct {
 
     /// Handle a client connection
     fn handleConnection(self: *ImapServer, connection: socket.Connection, is_ssl: bool) !void {
+        // The listener is non-blocking, and on BSD/macOS an accepted socket
+        // inherits that. Every read below expects to block.
+        connection.setBlocking();
         var session = try self.allocator.create(ImapSession);
         session.* = ImapSession.init(self.allocator, connection, self.auth_backend, self.db, self.config.enable_gmail_labels);
         defer {
@@ -4499,120 +4502,196 @@ pub const ImapServer = struct {
             connection.close();
         }
 
-        // For IMAPS connections, perform TLS handshake first using nonblock API
-        var tls_cipher: ?tls.Cipher = null;
-
+        // IMAPS: the TLS handshake comes first, then the greeting over TLS.
         if (is_ssl) {
-            // Check if we have a certificate loaded
             if (self.cert_key_pair == null) {
                 logger.err("IMAPS connection attempted but no certificate loaded", .{});
                 return error.TlsNotConfigured;
             }
 
             logger.info("Starting TLS handshake for IMAPS connection", .{});
-
-            // Use nonblock TLS server handshake
-            var tls_server = tls.nonblock.Server.init(.{
-                .auth = &self.cert_key_pair.?,
-            });
-
-            // Buffers for TLS handshake
             var recv_buf: [tls.input_buffer_len]u8 = undefined;
-            var send_buf: [tls.output_buffer_len]u8 = undefined;
-            var recv_len: usize = 0;
-
-            // Perform handshake loop
-            while (!tls_server.done()) {
-                // Run handshake step
-                const result = tls_server.run(recv_buf[0..recv_len], &send_buf) catch |err| {
-                    logger.debug("TLS handshake error: {}", .{err});
-                    return error.TlsHandshakeFailed;
-                };
-
-                // Consume processed bytes
-                if (result.recv_pos > 0) {
-                    const remaining = recv_len - result.recv_pos;
-                    if (remaining > 0) {
-                        std.mem.copyForwards(u8, &recv_buf, recv_buf[result.recv_pos..recv_len]);
-                    }
-                    recv_len = remaining;
-                }
-
-                // Send data to client if any
-                if (result.send.len > 0) {
-                    logger.debug("TLS handshake: preparing to send {d} bytes", .{result.send.len});
-                    var sent: usize = 0;
-                    while (sent < result.send.len) {
-                        const n = connection.write(result.send[sent..]) catch |err| {
-                            logger.debug("TLS handshake write error: {}", .{err});
-                            return error.TlsHandshakeFailed;
-                        };
-                        logger.debug("TLS handshake: wrote {d} bytes (total sent: {d}/{d})", .{ n, sent + n, result.send.len });
-                        if (n == 0) {
-                            logger.debug("TLS handshake: connection closed during write", .{});
-                            return error.TlsHandshakeFailed;
-                        }
-                        sent += n;
-                    }
-                    logger.debug("TLS handshake: finished sending all {d} bytes", .{result.send.len});
-                }
-
-                // Read more data from client if handshake not done
-                if (!tls_server.done()) {
-                    const n = connection.read(recv_buf[recv_len..]) catch |err| {
-                        logger.debug("TLS handshake read error: {}", .{err});
-                        return error.TlsHandshakeFailed;
-                    };
-                    if (n == 0) {
-                        logger.debug("TLS handshake: connection closed during read", .{});
-                        return error.TlsHandshakeFailed;
-                    }
-                    recv_len += n;
-                }
-            }
-
-            tls_cipher = tls_server.cipher();
+            const handshake = try self.tlsHandshake(connection, &recv_buf);
             logger.info("IMAPS TLS handshake completed successfully", .{});
+            runTlsSession(session, connection, handshake.cipher, recv_buf[0..handshake.leftover_len], .implicit);
+            return;
         }
 
-        // Handle session based on whether TLS is active
-        if (tls_cipher) |cipher| {
-            // TLS encrypted session using nonblock connection
-            var tls_conn = tls.nonblock.Connection.init(cipher);
+        // Plain text session (non-SSL)
+        try session.sendGreeting();
 
-            // Set TLS connection on session so all responses are encrypted
-            session.setTlsConnection(&tls_conn);
+        var buffer: [4096]u8 = undefined;
+        while (session.state != .logout and !session.starttls_requested) {
+            // During IDLE: set a short socket timeout so we can poll for new mail
+            if (session.idle_mode) {
+                if (!session.idleWaitReadable(connection.fd)) continue;
+            }
 
-            // Send greeting over TLS (now using session's TLS-aware write)
+            const bytes_read = connection.read(&buffer) catch |err| {
+                if (session.idle_mode and (err == error.WouldBlock or err == error.ConnectionTimedOut)) {
+                    if (session.state == .selected) {
+                        session.idlePollRescan();
+                    }
+                    continue;
+                }
+                break;
+            };
+            if (bytes_read == 0) break;
+
+            // Restore normal timeout when leaving IDLE
+            if (!session.idle_mode) {
+                const no_tv: std.posix.timeval = .{ .sec = 0, .usec = 0 };
+                std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&no_tv)) catch {};
+            }
+
+            // If collecting APPEND literal data, feed bytes to the buffer
+            if (session.append_literal_buf) |buf| {
+                const needed = session.append_literal_size - session.append_literal_pos;
+                const copy_len = @min(needed, bytes_read);
+                @memcpy(buf[session.append_literal_pos..][0..copy_len], buffer[0..copy_len]);
+                session.append_literal_pos += copy_len;
+                if (session.append_literal_pos >= session.append_literal_size) {
+                    session.finalizeAppend() catch |err| {
+                        logger.err("IMAP APPEND finalize error: {}", .{err});
+                    };
+                }
+                continue;
+            }
+
+            const line = std.mem.trim(u8, buffer[0..bytes_read], "\r\n");
+            session.processCommand(line) catch |err| {
+                logger.err("IMAP command processing error: {}", .{err});
+                break;
+            };
+        }
+
+        // STARTTLS upgrade: perform TLS handshake on the existing connection
+        if (session.starttls_requested and self.cert_key_pair != null) {
+            logger.info("Starting STARTTLS upgrade on port 143", .{});
+            var recv_buf: [tls.input_buffer_len]u8 = undefined;
+            const handshake = self.tlsHandshake(connection, &recv_buf) catch return;
+            logger.info("STARTTLS handshake completed successfully", .{});
+            session.starttls_requested = false;
+            runTlsSession(session, connection, handshake.cipher, recv_buf[0..handshake.leftover_len], .starttls);
+        }
+    }
+
+    const TlsHandshake = struct {
+        cipher: tls.Cipher,
+        /// Bytes at the front of the caller's `recv_buf` that arrived after
+        /// the client's final handshake flight.
+        leftover_len: usize,
+    };
+
+    /// Run the server side of a TLS handshake on `connection`.
+    ///
+    /// A client may send application data in the same TCP segment as its
+    /// Finished message: nothing obliges it to wait for the greeting. Those
+    /// bytes are already encrypted under the application keys, so they are
+    /// handed back (at the front of `recv_buf`) rather than dropped. Dropping
+    /// one record does not just lose a command: every later record is then
+    /// decrypted with a sequence number one short, and fails as
+    /// error.TlsBadRecordMac.
+    fn tlsHandshake(self: *ImapServer, connection: socket.Connection, recv_buf: *[tls.input_buffer_len]u8) !TlsHandshake {
+        var tls_server = tls.nonblock.Server.init(.{
+            .auth = &self.cert_key_pair.?,
+        });
+        var send_buf: [tls.output_buffer_len]u8 = undefined;
+        var recv_len: usize = 0;
+
+        while (!tls_server.done()) {
+            const result = tls_server.run(recv_buf[0..recv_len], &send_buf) catch |err| {
+                logger.debug("TLS handshake error: {}", .{err});
+                return error.TlsHandshakeFailed;
+            };
+
+            if (result.recv_pos > 0) {
+                const remaining = recv_len - result.recv_pos;
+                if (remaining > 0) {
+                    std.mem.copyForwards(u8, recv_buf, recv_buf[result.recv_pos..recv_len]);
+                }
+                recv_len = remaining;
+            }
+
+            var sent: usize = 0;
+            while (sent < result.send.len) {
+                const n = connection.write(result.send[sent..]) catch |err| {
+                    logger.debug("TLS handshake write error: {}", .{err});
+                    return error.TlsHandshakeFailed;
+                };
+                if (n == 0) {
+                    logger.debug("TLS handshake: connection closed during write", .{});
+                    return error.TlsHandshakeFailed;
+                }
+                sent += n;
+            }
+
+            if (!tls_server.done()) {
+                const n = connection.read(recv_buf[recv_len..]) catch |err| {
+                    logger.debug("TLS handshake read error: {}", .{err});
+                    return error.TlsHandshakeFailed;
+                };
+                if (n == 0) {
+                    logger.debug("TLS handshake: connection closed during read", .{});
+                    return error.TlsHandshakeFailed;
+                }
+                recv_len += n;
+            }
+        }
+
+        return .{ .cipher = tls_server.cipher().?, .leftover_len = recv_len };
+    }
+
+    const TlsMode = enum {
+        /// IMAPS: the server greets the client once TLS is up.
+        implicit,
+        /// STARTTLS: the greeting was already sent in cleartext.
+        starttls,
+    };
+
+    /// Serve an IMAP session over an established TLS connection until the
+    /// client logs out or disconnects. `handshake_leftover` is ciphertext the
+    /// client sent after its Finished message; it is decrypted before the
+    /// socket is read again, because the client may be waiting for an answer
+    /// to it and send nothing more.
+    fn runTlsSession(session: *ImapSession, connection: socket.Connection, cipher: tls.Cipher, handshake_leftover: []const u8, mode: TlsMode) void {
+        const label = switch (mode) {
+            .implicit => "IMAP TLS",
+            .starttls => "IMAP STARTTLS",
+        };
+
+        var tls_conn = tls.nonblock.Connection.init(cipher);
+        session.setTlsConnection(&tls_conn);
+        defer session.tls_connection = null;
+
+        if (mode == .implicit) {
             session.sendGreeting() catch |err| {
                 logger.err("Failed to send IMAP greeting: {}", .{err});
                 return;
             };
+        }
 
-            // Read and process commands over TLS
-            var recv_buf: [tls.input_buffer_len]u8 = undefined;
-            var cleartext_buf: [16384]u8 = undefined;
-            var ciphertext_accum: [tls.input_buffer_len * 2]u8 = undefined;
-            var ciphertext_len: usize = 0;
-            // Buffer for leftover cleartext (partial lines across TLS records)
-            var cleartext_accum: [16384]u8 = undefined;
-            var cleartext_accum_len: usize = 0;
+        var recv_buf: [tls.input_buffer_len]u8 = undefined;
+        var cleartext_buf: [16384]u8 = undefined;
+        var ciphertext_accum: [tls.input_buffer_len * 2]u8 = undefined;
+        @memcpy(ciphertext_accum[0..handshake_leftover.len], handshake_leftover);
+        var ciphertext_len: usize = handshake_leftover.len;
+        // Buffer for leftover cleartext (partial lines across TLS records)
+        var cleartext_accum: [16384]u8 = undefined;
+        var cleartext_accum_len: usize = 0;
+        // Decrypt what is already buffered before blocking on the socket.
+        var buffered = ciphertext_len > 0;
 
-            // Track IDLE polling state
-            var idle_poll_counter: u32 = 0;
-
-            while (session.state != .logout) {
+        while (session.state != .logout) {
+            if (!buffered) {
                 // During IDLE: set a short socket timeout so we can poll for new mail
                 if (session.idle_mode) {
                     if (!session.idleWaitReadable(connection.fd)) continue;
                 }
 
-                // Read ciphertext from socket
                 const bytes_read = connection.read(recv_buf[0..]) catch |err| {
                     // During IDLE, timeout is expected — poll for new mail
                     if (session.idle_mode and (err == error.WouldBlock or err == error.ConnectionTimedOut)) {
-                        idle_poll_counter += 1;
-                        // Check for new messages every poll cycle (~5 seconds)
                         if (session.state == .selected) {
                             session.idlePollRescan();
                         }
@@ -4622,335 +4701,106 @@ pub const ImapServer = struct {
                 };
                 if (bytes_read == 0) break;
 
-                // If we got data during IDLE, restore normal timeout
-                if (session.idle_mode) {
-                    idle_poll_counter = 0;
-                }
                 // Restore normal (no timeout) when not in IDLE
                 if (!session.idle_mode) {
                     const no_tv: std.posix.timeval = .{ .sec = 0, .usec = 0 };
                     std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&no_tv)) catch {};
                 }
 
-                // Accumulate ciphertext
                 if (ciphertext_len + bytes_read <= ciphertext_accum.len) {
                     @memcpy(ciphertext_accum[ciphertext_len..][0..bytes_read], recv_buf[0..bytes_read]);
                     ciphertext_len += bytes_read;
                 } else {
-                    logger.err("IMAP TLS: ciphertext buffer overflow", .{});
+                    logger.err("{s}: ciphertext buffer overflow", .{label});
                     break;
                 }
-
-                // Try to decrypt
-                const dec_result = tls_conn.decrypt(ciphertext_accum[0..ciphertext_len], &cleartext_buf) catch |err| {
-                    logger.err("TLS decrypt error: {}", .{err});
-                    break;
-                };
-
-                // Handle decrypted data - may contain multiple IMAP commands
-                if (dec_result.cleartext.len > 0) {
-                    // Append to cleartext accumulator
-                    const avail = cleartext_accum.len - cleartext_accum_len;
-                    const copy_len = @min(dec_result.cleartext.len, avail);
-                    @memcpy(cleartext_accum[cleartext_accum_len..][0..copy_len], dec_result.cleartext[0..copy_len]);
-                    cleartext_accum_len += copy_len;
-
-                    // Process data - command lines or APPEND literal data
-                    var processed: usize = 0;
-                    while (processed < cleartext_accum_len) {
-                        // If collecting APPEND literal data, consume bytes directly
-                        if (session.append_literal_buf) |buf| {
-                            const needed = session.append_literal_size - session.append_literal_pos;
-                            const available = cleartext_accum_len - processed;
-                            const lit_len = @min(needed, available);
-                            @memcpy(buf[session.append_literal_pos..][0..lit_len], cleartext_accum[processed..][0..lit_len]);
-                            session.append_literal_pos += lit_len;
-                            processed += lit_len;
-
-                            if (session.append_literal_pos >= session.append_literal_size) {
-                                // Literal complete - save message and send OK
-                                session.finalizeAppend() catch |err| {
-                                    logger.err("IMAP APPEND finalize error: {}", .{err});
-                                };
-                                // Skip trailing \r\n after literal data
-                                if (processed + 2 <= cleartext_accum_len and
-                                    cleartext_accum[processed] == '\r' and cleartext_accum[processed + 1] == '\n')
-                                {
-                                    processed += 2;
-                                }
-                            }
-                            continue;
-                        }
-
-                        // Normal: find next \r\n delimited command line
-                        const remaining = cleartext_accum[processed..cleartext_accum_len];
-                        const line_end = std.mem.indexOf(u8, remaining, "\r\n") orelse break;
-                        if (line_end > 0) {
-                            const line = remaining[0..line_end];
-                            session.processCommand(line) catch |err| {
-                                logger.err("IMAP command processing error: {}", .{err});
-                            };
-                        }
-                        processed += line_end + 2; // skip \r\n
-                        if (session.state == .logout) break;
-                    }
-
-                    // Move unprocessed data to front
-                    if (processed > 0) {
-                        const leftover = cleartext_accum_len - processed;
-                        if (leftover > 0) {
-                            std.mem.copyForwards(u8, &cleartext_accum, cleartext_accum[processed..cleartext_accum_len]);
-                        }
-                        cleartext_accum_len = leftover;
-                    }
-                }
-
-                // Remove consumed ciphertext
-                if (dec_result.ciphertext_pos > 0) {
-                    const remaining = ciphertext_len - dec_result.ciphertext_pos;
-                    if (remaining > 0) {
-                        std.mem.copyForwards(u8, &ciphertext_accum, ciphertext_accum[dec_result.ciphertext_pos..ciphertext_len]);
-                    }
-                    ciphertext_len = remaining;
-                }
-
-                if (dec_result.closed) break;
             }
 
-            // Send close notify
-            var close_buf: [64]u8 = undefined;
-            if (tls_conn.close(&close_buf)) |close_data| {
-                _ = connection.write(close_data) catch {};
-            } else |_| {}
-        } else {
-            // Plain text session (non-SSL)
-            try session.sendGreeting();
-
-            var buffer: [4096]u8 = undefined;
-            while (session.state != .logout and !session.starttls_requested) {
-                // During IDLE: set a short socket timeout so we can poll for new mail
-                if (session.idle_mode) {
-                    if (!session.idleWaitReadable(connection.fd)) continue;
+            const dec_result = tls_conn.decrypt(ciphertext_accum[0..ciphertext_len], &cleartext_buf) catch |err| {
+                switch (mode) {
+                    .implicit => logger.err("TLS decrypt error: {}", .{err}),
+                    .starttls => logger.err("STARTTLS decrypt error: {}", .{err}),
                 }
+                break;
+            };
+            // A full cleartext buffer can leave whole records behind; go
+            // round again without reading until decrypt makes no progress.
+            buffered = dec_result.ciphertext_pos > 0 or dec_result.cleartext.len > 0;
 
-                const bytes_read = connection.read(&buffer) catch |err| {
-                    if (session.idle_mode and (err == error.WouldBlock or err == error.ConnectionTimedOut)) {
-                        if (session.state == .selected) {
-                            session.idlePollRescan();
+            // Handle decrypted data - may contain multiple IMAP commands
+            if (dec_result.cleartext.len > 0) {
+                const avail = cleartext_accum.len - cleartext_accum_len;
+                const copy_len = @min(dec_result.cleartext.len, avail);
+                @memcpy(cleartext_accum[cleartext_accum_len..][0..copy_len], dec_result.cleartext[0..copy_len]);
+                cleartext_accum_len += copy_len;
+
+                // Process data - command lines or APPEND literal data
+                var processed: usize = 0;
+                while (processed < cleartext_accum_len) {
+                    // If collecting APPEND literal data, consume bytes directly
+                    if (session.append_literal_buf) |buf| {
+                        const needed = session.append_literal_size - session.append_literal_pos;
+                        const available = cleartext_accum_len - processed;
+                        const lit_len = @min(needed, available);
+                        @memcpy(buf[session.append_literal_pos..][0..lit_len], cleartext_accum[processed..][0..lit_len]);
+                        session.append_literal_pos += lit_len;
+                        processed += lit_len;
+
+                        if (session.append_literal_pos >= session.append_literal_size) {
+                            // Literal complete - save message and send OK
+                            session.finalizeAppend() catch |err| {
+                                logger.err("IMAP APPEND finalize error: {}", .{err});
+                            };
+                            // Skip trailing \r\n after literal data
+                            if (processed + 2 <= cleartext_accum_len and
+                                cleartext_accum[processed] == '\r' and cleartext_accum[processed + 1] == '\n')
+                            {
+                                processed += 2;
+                            }
                         }
                         continue;
                     }
-                    break;
-                };
-                if (bytes_read == 0) break;
 
-                // Restore normal timeout when leaving IDLE
-                if (!session.idle_mode) {
-                    const no_tv: std.posix.timeval = .{ .sec = 0, .usec = 0 };
-                    std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&no_tv)) catch {};
-                }
-
-                // If collecting APPEND literal data, feed bytes to the buffer
-                if (session.append_literal_buf) |buf| {
-                    const needed = session.append_literal_size - session.append_literal_pos;
-                    const copy_len = @min(needed, bytes_read);
-                    @memcpy(buf[session.append_literal_pos..][0..copy_len], buffer[0..copy_len]);
-                    session.append_literal_pos += copy_len;
-                    if (session.append_literal_pos >= session.append_literal_size) {
-                        session.finalizeAppend() catch |err| {
-                            logger.err("IMAP APPEND finalize error: {}", .{err});
+                    // Normal: find next \r\n delimited command line
+                    const remaining = cleartext_accum[processed..cleartext_accum_len];
+                    const line_end = std.mem.indexOf(u8, remaining, "\r\n") orelse break;
+                    if (line_end > 0) {
+                        const line = remaining[0..line_end];
+                        session.processCommand(line) catch |err| {
+                            logger.err("IMAP command processing error: {}", .{err});
                         };
                     }
-                    continue;
+                    processed += line_end + 2; // skip \r\n
+                    if (session.state == .logout) break;
                 }
 
-                const line = std.mem.trim(u8, buffer[0..bytes_read], "\r\n");
-                session.processCommand(line) catch |err| {
-                    logger.err("IMAP command processing error: {}", .{err});
-                    break;
-                };
-            }
-
-            // STARTTLS upgrade: perform TLS handshake on the existing connection
-            if (session.starttls_requested and self.cert_key_pair != null) {
-                logger.info("Starting STARTTLS upgrade on port 143", .{});
-
-                var tls_server = tls.nonblock.Server.init(.{
-                    .auth = &self.cert_key_pair.?,
-                });
-
-                var recv_buf: [tls.input_buffer_len]u8 = undefined;
-                var send_buf: [tls.output_buffer_len]u8 = undefined;
-                var recv_len: usize = 0;
-
-                // Perform handshake loop
-                var handshake_ok = true;
-                while (!tls_server.done()) {
-                    const result = tls_server.run(recv_buf[0..recv_len], &send_buf) catch |err| {
-                        logger.debug("STARTTLS handshake error: {}", .{err});
-                        handshake_ok = false;
-                        break;
-                    };
-
-                    if (result.recv_pos > 0) {
-                        const remaining = recv_len - result.recv_pos;
-                        if (remaining > 0) {
-                            std.mem.copyForwards(u8, &recv_buf, recv_buf[result.recv_pos..recv_len]);
-                        }
-                        recv_len = remaining;
+                // Move unprocessed data to front
+                if (processed > 0) {
+                    const leftover = cleartext_accum_len - processed;
+                    if (leftover > 0) {
+                        std.mem.copyForwards(u8, &cleartext_accum, cleartext_accum[processed..cleartext_accum_len]);
                     }
-
-                    if (result.send.len > 0) {
-                        var sent: usize = 0;
-                        while (sent < result.send.len) {
-                            const n = connection.write(result.send[sent..]) catch |err| {
-                                logger.debug("STARTTLS handshake write error: {}", .{err});
-                                handshake_ok = false;
-                                break;
-                            };
-                            if (n == 0) {
-                                handshake_ok = false;
-                                break;
-                            }
-                            sent += n;
-                        }
-                        if (!handshake_ok) break;
-                    }
-
-                    if (!tls_server.done()) {
-                        const n = connection.read(recv_buf[recv_len..]) catch |err| {
-                            logger.debug("STARTTLS handshake read error: {}", .{err});
-                            handshake_ok = false;
-                            break;
-                        };
-                        if (n == 0) {
-                            handshake_ok = false;
-                            break;
-                        }
-                        recv_len += n;
-                    }
-                }
-
-                if (handshake_ok) {
-                    if (tls_server.cipher()) |cipher| {
-                        logger.info("STARTTLS handshake completed successfully", .{});
-                        var starttls_tls_conn = tls.nonblock.Connection.init(cipher);
-                        session.setTlsConnection(&starttls_tls_conn);
-                        session.starttls_requested = false;
-
-                        // Enter TLS encrypted read loop (same as IMAPS)
-                        var tls_recv_buf: [tls.input_buffer_len]u8 = undefined;
-                        var cleartext_buf: [16384]u8 = undefined;
-                        var ciphertext_accum: [tls.input_buffer_len * 2]u8 = undefined;
-                        var ciphertext_len: usize = 0;
-                        var cleartext_accum: [16384]u8 = undefined;
-                        var cleartext_accum_len: usize = 0;
-
-                        while (session.state != .logout) {
-                            if (session.idle_mode) {
-                                if (!session.idleWaitReadable(connection.fd)) continue;
-                            }
-
-                            const bytes_read = connection.read(tls_recv_buf[0..]) catch |err| {
-                                if (session.idle_mode and (err == error.WouldBlock or err == error.ConnectionTimedOut)) {
-                                    if (session.state == .selected) {
-                                        session.idlePollRescan();
-                                    }
-                                    continue;
-                                }
-                                break;
-                            };
-                            if (bytes_read == 0) break;
-
-                            if (!session.idle_mode) {
-                                const no_tv: std.posix.timeval = .{ .sec = 0, .usec = 0 };
-                                std.posix.setsockopt(connection.fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&no_tv)) catch {};
-                            }
-
-                            if (ciphertext_len + bytes_read <= ciphertext_accum.len) {
-                                @memcpy(ciphertext_accum[ciphertext_len..][0..bytes_read], tls_recv_buf[0..bytes_read]);
-                                ciphertext_len += bytes_read;
-                            } else {
-                                logger.err("IMAP STARTTLS: ciphertext buffer overflow", .{});
-                                break;
-                            }
-
-                            const dec_result = starttls_tls_conn.decrypt(ciphertext_accum[0..ciphertext_len], &cleartext_buf) catch |err| {
-                                logger.err("STARTTLS decrypt error: {}", .{err});
-                                break;
-                            };
-
-                            if (dec_result.cleartext.len > 0) {
-                                const avail = cleartext_accum.len - cleartext_accum_len;
-                                const copy_len = @min(dec_result.cleartext.len, avail);
-                                @memcpy(cleartext_accum[cleartext_accum_len..][0..copy_len], dec_result.cleartext[0..copy_len]);
-                                cleartext_accum_len += copy_len;
-
-                                var processed: usize = 0;
-                                while (processed < cleartext_accum_len) {
-                                    if (session.append_literal_buf) |buf| {
-                                        const needed = session.append_literal_size - session.append_literal_pos;
-                                        const available = cleartext_accum_len - processed;
-                                        const lit_len = @min(needed, available);
-                                        @memcpy(buf[session.append_literal_pos..][0..lit_len], cleartext_accum[processed..][0..lit_len]);
-                                        session.append_literal_pos += lit_len;
-                                        processed += lit_len;
-                                        if (session.append_literal_pos >= session.append_literal_size) {
-                                            session.finalizeAppend() catch |err| {
-                                                logger.err("IMAP APPEND finalize error: {}", .{err});
-                                            };
-                                            if (processed + 2 <= cleartext_accum_len and
-                                                cleartext_accum[processed] == '\r' and cleartext_accum[processed + 1] == '\n')
-                                            {
-                                                processed += 2;
-                                            }
-                                        }
-                                        continue;
-                                    }
-
-                                    const remaining = cleartext_accum[processed..cleartext_accum_len];
-                                    const line_end = std.mem.indexOf(u8, remaining, "\r\n") orelse break;
-                                    if (line_end > 0) {
-                                        const line = remaining[0..line_end];
-                                        session.processCommand(line) catch |err| {
-                                            logger.err("IMAP command processing error: {}", .{err});
-                                        };
-                                    }
-                                    processed += line_end + 2;
-                                    if (session.state == .logout) break;
-                                }
-
-                                if (processed > 0) {
-                                    const leftover = cleartext_accum_len - processed;
-                                    if (leftover > 0) {
-                                        std.mem.copyForwards(u8, &cleartext_accum, cleartext_accum[processed..cleartext_accum_len]);
-                                    }
-                                    cleartext_accum_len = leftover;
-                                }
-                            }
-
-                            if (dec_result.ciphertext_pos > 0) {
-                                const remaining = ciphertext_len - dec_result.ciphertext_pos;
-                                if (remaining > 0) {
-                                    std.mem.copyForwards(u8, &ciphertext_accum, ciphertext_accum[dec_result.ciphertext_pos..ciphertext_len]);
-                                }
-                                ciphertext_len = remaining;
-                            }
-
-                            if (dec_result.closed) break;
-                        }
-
-                        // Send close notify
-                        var close_buf: [64]u8 = undefined;
-                        if (starttls_tls_conn.close(&close_buf)) |close_data| {
-                            _ = connection.write(close_data) catch {};
-                        } else |_| {}
-                    } else {
-                        logger.err("STARTTLS: no cipher after handshake", .{});
-                    }
+                    cleartext_accum_len = leftover;
                 }
             }
+
+            // Remove consumed ciphertext
+            if (dec_result.ciphertext_pos > 0) {
+                const remaining = ciphertext_len - dec_result.ciphertext_pos;
+                if (remaining > 0) {
+                    std.mem.copyForwards(u8, &ciphertext_accum, ciphertext_accum[dec_result.ciphertext_pos..ciphertext_len]);
+                }
+                ciphertext_len = remaining;
+            }
+
+            if (dec_result.closed) break;
         }
+
+        // Send close notify
+        var close_buf: [64]u8 = undefined;
+        if (tls_conn.close(&close_buf)) |close_data| {
+            _ = connection.write(close_data) catch {};
+        } else |_| {}
     }
 };
 
@@ -5491,4 +5341,151 @@ test "security: IMAP logins retain failed attempts across connections" {
         defer a.free(success);
         try ImapTestHarness.expectContains(success, "c OK LOGIN completed");
     }
+}
+
+// A throwaway self-signed P-256 certificate for "localhost", used only by the
+// TLS tests below.
+const test_tls_cert_pem =
+    \\-----BEGIN CERTIFICATE-----
+    \\MIIBljCCATugAwIBAgIUX1M5wiESaNWziXCrsk7G6Pb5G4wwCgYIKoZIzj0EAwIw
+    \\FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTExODAwMTIzNloYDzIxMjYxMDI1
+    \\MDAxMjM2WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+    \\PQMBBwNCAAQCG1eMT0QI+YgA9kxHRD/WgDYSlakXO8dqV5GFMMotrEi8Jh83a0OS
+    \\66L458DTn6vb2OkuJDHySMHiwRBk9QABo2kwZzAdBgNVHQ4EFgQU5wd/eSQu6P9a
+    \\tNPM8ujEeUW4HIEwHwYDVR0jBBgwFoAU5wd/eSQu6P9atNPM8ujEeUW4HIEwDwYD
+    \\VR0TAQH/BAUwAwEB/zAUBgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0EAwID
+    \\SQAwRgIhAPMS2073H9BocmXv0c1u959MRgha2FKuQ86+9Uc0ieLAAiEAkp+fm5O5
+    \\XoYHJ6Zns0Z8ZZNU9M2XXpv5lFOHRDU/4zw=
+    \\-----END CERTIFICATE-----
+    \\
+;
+const test_tls_key_pem =
+    \\-----BEGIN PRIVATE KEY-----
+    \\MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgTn/Z/mw5nPjcc9iF
+    \\nF9Bjozq0CFkwE43+icOezXSjDihRANCAAQCG1eMT0QI+YgA9kxHRD/WgDYSlakX
+    \\O8dqV5GFMMotrEi8Jh83a0OS66L458DTn6vb2OkuJDHySMHiwRBk9QAB
+    \\-----END PRIVATE KEY-----
+    \\
+;
+
+/// The client end of an IMAPS connection: a blocking socket and the TLS
+/// state to talk through it.
+const TestImapsClient = struct {
+    fd: c_int,
+    conn: tls.nonblock.Connection = undefined,
+    inbox: [tls.input_buffer_len * 2]u8 = undefined,
+    inbox_len: usize = 0,
+
+    fn writeAll(c: *TestImapsClient, bytes: []const u8) !void {
+        var sent: usize = 0;
+        while (sent < bytes.len) {
+            const n = std.c.write(c.fd, bytes[sent..].ptr, bytes.len - sent);
+            if (n <= 0) return error.WriteFailed;
+            sent += @intCast(n);
+        }
+    }
+
+    fn fill(c: *TestImapsClient) !void {
+        const n = std.c.read(c.fd, c.inbox[c.inbox_len..].ptr, c.inbox.len - c.inbox_len);
+        if (n <= 0) return error.ServerClosed;
+        c.inbox_len += @intCast(n);
+    }
+
+    fn consume(c: *TestImapsClient, n: usize) void {
+        std.mem.copyForwards(u8, &c.inbox, c.inbox[n..c.inbox_len]);
+        c.inbox_len -= n;
+    }
+
+    /// Handshake, but hold back the final flight (the client Finished) and
+    /// return it, so the caller decides how it reaches the server.
+    fn handshakeHoldingFinished(c: *TestImapsClient, out: []u8) ![]const u8 {
+        var cli = tls.nonblock.Client.init(.{
+            .host = "localhost",
+            .root_ca = .empty,
+            .insecure_skip_verify = true,
+        });
+        var send_buf: [tls.output_buffer_len]u8 = undefined;
+        var r = try cli.run(&.{}, &send_buf);
+        try c.writeAll(r.send);
+        while (true) {
+            try c.fill();
+            r = try cli.run(c.inbox[0..c.inbox_len], &send_buf);
+            c.consume(r.recv_pos);
+            if (cli.done()) break;
+            try c.writeAll(r.send);
+        }
+        c.conn = tls.nonblock.Connection.init(cli.cipher().?);
+        @memcpy(out[0..r.send.len], r.send);
+        return out[0..r.send.len];
+    }
+
+    fn encrypt(c: *TestImapsClient, cleartext: []const u8, out: []u8) ![]const u8 {
+        const e = try c.conn.encrypt(cleartext, out);
+        return e.ciphertext;
+    }
+
+    /// Read and decrypt until `needle` appears in what the server has sent.
+    fn readUntil(c: *TestImapsClient, transcript: *std.ArrayList(u8), allocator: std.mem.Allocator, needle: []const u8) !void {
+        var cleartext: [16384]u8 = undefined;
+        while (std.mem.indexOf(u8, transcript.items, needle) == null) {
+            const d = try c.conn.decrypt(c.inbox[0..c.inbox_len], &cleartext);
+            try transcript.appendSlice(allocator, d.cleartext);
+            c.consume(d.ciphertext_pos);
+            if (d.closed) {
+                if (std.mem.indexOf(u8, transcript.items, needle) == null) return error.ServerClosed;
+                return;
+            }
+            if (d.ciphertext_pos == 0 and d.cleartext.len == 0) try c.fill();
+        }
+    }
+};
+
+test "IMAPS serves a command sent in the same segment as the client Finished" {
+    // A client does not have to wait for the greeting before it writes: it
+    // can put its first command in the same TCP segment as its Finished.
+    // The handshake used to drop whatever followed the Finished. The command
+    // went unanswered, and the next record was decrypted with the wrong
+    // sequence number and failed as error.TlsBadRecordMac.
+    const a = std.testing.allocator;
+    const h = try ImapTestHarness.create(a);
+    defer h.destroy();
+
+    var server = ImapServer.init(a, .{ .enable_ssl = false }, &h.auth_backend, &h.db);
+    defer server.deinit();
+    server.cert_key_pair = try tls.config.CertKeyPair.fromPem(a, test_tls_cert_pem, test_tls_key_pem);
+
+    var fds: [2]c_int = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, @intCast(@as(u32, std.posix.SOCK.STREAM)), 0, &fds) != 0) return error.SocketPairFailed;
+    // Fail rather than hang when the server never answers.
+    const timeout: std.posix.timeval = .{ .sec = 5, .usec = 0 };
+    try std.posix.setsockopt(fds[1], std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
+
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(s: *ImapServer, fd: c_int) void {
+            s.handleConnection(.{ .fd = fd }, true) catch {};
+        }
+    }.run, .{ &server, fds[0] });
+    var client: TestImapsClient = .{ .fd = fds[1] };
+    defer {
+        _ = std.c.close(client.fd);
+        thread.join();
+    }
+
+    var flight: [tls.output_buffer_len + 256]u8 = undefined;
+    const finished = try client.handshakeHoldingFinished(&flight);
+    const command = try client.encrypt("a1 NOOP\r\n", flight[finished.len..]);
+    try client.writeAll(flight[0 .. finished.len + command.len]);
+
+    var transcript: std.ArrayList(u8) = .empty;
+    defer transcript.deinit(a);
+    try client.readUntil(&transcript, a, "a1 OK");
+    try ImapTestHarness.expectContains(transcript.items, "* OK");
+
+    // The record after it has to decrypt too.
+    var record: [256]u8 = undefined;
+    try client.writeAll(try client.encrypt("a2 NOOP\r\n", &record));
+    try client.readUntil(&transcript, a, "a2 OK");
+
+    try client.writeAll(try client.encrypt("a3 LOGOUT\r\n", &record));
+    try client.readUntil(&transcript, a, "a3 OK");
 }

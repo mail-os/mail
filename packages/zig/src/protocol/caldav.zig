@@ -2381,7 +2381,9 @@ pub const CalDavServer = struct {
                     // will not send another byte. Whether the request piggybacks on
                     // the handshake segment or arrives separately is timing-dependent,
                     // which is why this manifested as an intermittent (~65%) hang.
-                    // (IMAP avoids this only because its server speaks first.)
+                    // IMAP has the same exposure even though its server speaks
+                    // first: a client may still send its first command with its
+                    // Finished (see ImapServer.tlsHandshake).
                     var made_progress = false;
                     if (cipher_len > 0) {
                         const dec = tls_conn.decrypt(recv_buf[0..cipher_len], &cleartext_buf) catch |err| {
