@@ -866,11 +866,10 @@ pub const CalDavStore = struct {
 
     fn activeMailboxId(self: *Self, username: []const u8) !?i64 {
         const db = self.config.account_db orelse return null;
-        const stmt = try db.prepare("SELECT id FROM users WHERE username = ? AND enabled != 0");
-        defer stmt.finalize();
-        try stmt.bind(1, username);
-        if (!try stmt.step()) return error.DavMailboxNotFound;
-        return stmt.columnInt64(0);
+        var mailbox = try db.getUserByUsername(username);
+        defer mailbox.deinit(db.allocator);
+        if (!mailbox.enabled) return error.DavMailboxNotFound;
+        return mailbox.id;
     }
 
     fn findUserIdLocked(self: *Self, username: []const u8, mailbox_id: ?i64) ?u64 {

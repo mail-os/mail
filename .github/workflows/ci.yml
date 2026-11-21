@@ -66,8 +66,10 @@ jobs:
         for _ in $(seq 1 50); do nc -z 127.0.0.1 25825 && break; sleep 0.2; done
         MAIL_E2E_SMTP=127.0.0.1:25825 zig build test-e2e --summary all || { cat "$dir/server.log"; exit 1; }
 
-    - name: Run live webmail and CalDAV tests
-      run: python3 ../../scripts/test-webmail.py zig-out/bin/mail
+    - name: Run live webmail, CalDAV, and ownership migration tests
+      run: |
+        python3 ../../scripts/test-webmail.py zig-out/bin/mail
+        python3 ../../scripts/test-dav-ownership.py
 
     - name: Verify encrypted SMTP receipt, padding and DNSBL policy
       run: |
