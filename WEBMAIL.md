@@ -1,6 +1,6 @@
 # Native webmail
 
-The mail executable embeds an STX client and serves the same account and Maildir
+The mail executable embeds an stx client and serves the same account and Maildir
 used by SMTP and IMAP. Users sign in with their full mailbox address and mail
 password. Deployments expose HTTPS through ts-cloud's native rpx integration;
 webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud.
@@ -29,6 +29,9 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   even if the browser closes; cancellation is available before dispatch starts.
   Outbox records delivery results. A partial retry contains only failed recipients.
   Interrupted dispatch is marked Unknown and requires review before a manual retry.
+- When CalDAV is enabled, Calendar shows a read-only weekly agenda from the
+  account's existing calendars. Recurring series appear separately with their
+  start date. Use a CalDAV client to edit events or view individual occurrences.
 
 ## Password recovery
 
@@ -106,6 +109,13 @@ before a request may affect another mailbox. Disabling or deleting an account
 revokes existing webmail sessions.
 
 - `GET /webmail/api/config` returns effective limits and preferences.
+- `GET /webmail/api/calendars` lists calendars owned by the signed-in account
+  from the same store CalDAV uses. `GET /webmail/api/calendar-events` takes
+  `calendarId`, `start` and `end`. The range uses Unix seconds with an inclusive
+  start and exclusive end, spans at most 366 days, and returns up to 500 stored
+  event summaries. Recurring events include their rules and are returned as
+  candidates for occurrence expansion. The endpoints report 503 when DAV is
+  disabled and 404 for a missing or foreign calendar.
 - `POST /webmail/api/drafts` accepts `draftId`, `draftRevision`, `saveToken` and
   composition fields, including recipient labels, unfinished inputs and staged
   attachment IDs. Repeating the identical save token returns its acknowledgement;
@@ -135,10 +145,43 @@ revokes existing webmail sessions.
 
 Run `bun test`, the strict TypeScript check for webmail composables, Pickier, and
 `zig build test` with the repository's pinned Zig toolchain. `bun run build` in
-`packages/webmail` compiles the embedded STX pages; the Zig build also does this.
+`packages/webmail` compiles the embedded stx pages. The Zig build also does this.
 Live API suites in `packages/webmail/{e2e,ux-e2e}.test.ts` run with
 `MAIL_WEBMAIL_E2E_URL`, `MAIL_WEBMAIL_E2E_USER` and `MAIL_WEBMAIL_E2E_PASSWORD`.
 Use a disposable owned mailbox: these tests send messages and exercise deletion.
+With CalDAV enabled, set `MAIL_WEBMAIL_E2E_CALDAV_URL` to its origin to also
+verify that a CalDAV write appears in the webmail calendar.
+
+### Upgrading persisted DAV data
+
+The new DAV store records collection ownership using the mailbox's database ID.
+Older DAV databases may have collections whose numeric owner has no durable
+mapping. The upgrade keeps those rows and reserves their IDs. Those collections
+stay unavailable until an operator verifies and assigns their owners.
+
+Back up the mail and DAV databases together. Verify each collection using a
+trusted historical mapping or an owner-provided export. A legacy number alone
+cannot prove ownership. Supply only verified assignments in a JSON file.
+
+```json
+[
+  { "kind": "calendar", "id": 12, "mailbox": "owner@example.test" },
+  { "kind": "address_book", "id": 3, "mailbox": "owner@example.test" }
+]
+```
+
+During an offline maintenance window, with the mail daemon stopped, validate
+the assignment file before applying it:
+
+```bash
+python3 scripts/migrate-dav-ownership.py --mail-db ./smtp.db --dav-db ./caldav.db --assignments ./assignments.json
+python3 scripts/migrate-dav-ownership.py --mail-db ./smtp.db --dav-db ./caldav.db --assignments ./assignments.json --apply
+```
+
+The second command applies the complete file in one DAV transaction. An
+existing assignment to the same mailbox is safe to repeat. A different
+registered owner aborts the operation. Verify the assigned collections on a
+restored copy before making the change in production.
 Browser acceptance covers draft recovery, recipient validation, bulk Undo,
 conversation expansion, filtered search, large attachment byte integrity and
 Undo Send, including a mobile viewport.

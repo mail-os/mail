@@ -55,6 +55,7 @@ const health = @import("webmail_health.zig");
 // webmail UI ships as one executable — same single-binary model as admin.html.
 const index_html = @embedFile("webmail_dist/index.html");
 const login_html = @embedFile("webmail_dist/login.html");
+const calendar_html = @embedFile("webmail_dist/calendar.html");
 const recover_html = @embedFile("webmail_dist/recover.html");
 const status_html = @embedFile("webmail_dist/status.html");
 const styles_css = @embedFile("webmail_dist/styles.css");
@@ -91,7 +92,7 @@ pub const WebmailHttpServer = struct {
     db: *database.Database,
     auth: *auth_mod.AuthBackend,
     service: service_mod.Service,
-    contacts: ?*caldav_store.CalDavStore = null,
+    dav_store: ?*caldav_store.CalDavStore = null,
     sessions: session_mod.SessionManager,
     /// Webmail-specific login and authenticated account-change budgets.
     /// Its own internal mutex makes it safe to share across connection threads.
@@ -471,6 +472,8 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.startsWith(u8, p, "/webmail/api/outbox/")) return handleOutboxItem(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/drafts") and std.mem.eql(u8, req.method, "GET")) return handleDraftGet(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/contacts") and std.mem.eql(u8, req.method, "GET")) return handleContacts(server, conn, arena, req);
+    if (std.mem.eql(u8, p, "/webmail/api/calendars") and std.mem.eql(u8, req.method, "GET")) return handleCalendars(server, conn, arena, req);
+    if (std.mem.eql(u8, p, "/webmail/api/calendar-events") and std.mem.eql(u8, req.method, "GET")) return handleCalendarEvents(server, conn, arena, req);
 
     if (std.mem.eql(u8, p, "/webmail/auth/login") and std.mem.eql(u8, req.method, "POST")) {
         return handleLogin(server, conn, arena, req);
@@ -538,6 +541,9 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
         }
         if (std.mem.eql(u8, p, "/status")) {
             return serveAsset(conn, arena, status_html, "text/html; charset=utf-8");
+        }
+        if (std.mem.eql(u8, p, "/calendar")) {
+            return serveAsset(conn, arena, calendar_html, "text/html; charset=utf-8");
         }
         if (std.mem.eql(u8, p, "/login")) {
             return serveAsset(conn, arena, login_html, "text/html; charset=utf-8");
@@ -1124,6 +1130,7 @@ fn handleClientConfig(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
     var sess = (try requireSession(server, conn, arena, req)) orelse return;
     defer sess.deinit(server.allocator);
     var limits = try server.service.limits(sess.username);
+    limits.calendarAvailable = server.dav_store != null;
     if (store.get(arena, server.db, sess.username, "preferences", "settings")) |row| {
         const parsed = try std.json.parseFromSlice(struct { undoSendSeconds: u32 }, arena, row.payload, .{});
         defer parsed.deinit();
@@ -1215,6 +1222,30 @@ fn outboxJson(arena: std.mem.Allocator, row: store.Record) ![]const u8 {
     return service_mod.json(arena, .{ .id = row.id, .state = row.state, .dueAt = row.due_at, .serverTime = time_compat.timestamp(), .message = parsed.value.message, .result = parsed.value.result, .@"error" = parsed.value.error_message });
 }
 
+fn handleCalendars(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const dav = server.dav_store orelse return sendError(conn, arena, 503, "calendar_unavailable", "Calendar is unavailable on this server");
+    const calendars = try dav.snapshotCalendars(arena, sess.username);
+    return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .calendars = calendars }), null);
+}
+
+fn handleCalendarEvents(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const dav = server.dav_store orelse return sendError(conn, arena, 503, "calendar_unavailable", "Calendar is unavailable on this server");
+    const calendar_id = std.fmt.parseInt(u64, req.queryParam(arena, "calendarId") orelse "", 10) catch return sendError(conn, arena, 400, "bad_request", "Invalid calendar ID");
+    const start = std.fmt.parseInt(i64, req.queryParam(arena, "start") orelse "", 10) catch return sendError(conn, arena, 400, "bad_request", "Invalid start timestamp");
+    const end = std.fmt.parseInt(i64, req.queryParam(arena, "end") orelse "", 10) catch return sendError(conn, arena, 400, "bad_request", "Invalid end timestamp");
+    const events = dav.snapshotCalendarEvents(arena, sess.username, calendar_id, start, end) catch |err| switch (err) {
+        error.InvalidRange => return sendError(conn, arena, 400, "bad_request", "Specify a positive calendar window of at most 366 days"),
+        error.CalendarNotFound => return sendError(conn, arena, 404, "not_found", "Calendar not found"),
+        error.TooManyEvents => return sendError(conn, arena, 400, "too_many_events", "This calendar window has more than 500 matching records"),
+        else => return err,
+    };
+    return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .events = events }), null);
+}
+
 fn handleContacts(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
     var sess = (try requireSession(server, conn, arena, req)) orelse return;
     defer sess.deinit(server.allocator);
@@ -1223,7 +1254,7 @@ fn handleContacts(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: 
     var contacts: std.ArrayList(Contact) = .empty;
     var known = std.StringHashMap(void).init(arena);
     defer known.deinit();
-    if (server.contacts) |addressbook| {
+    if (server.dav_store) |addressbook| {
         const saved = try addressbook.suggestContacts(arena, sess.username, query, 10);
         for (saved) |contact| {
             if (!compose.isSafeAddress(contact.address)) continue;

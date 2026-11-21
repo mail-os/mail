@@ -29,6 +29,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const mutex_compat = @import("../core/mutex_compat.zig");
 const database = @import("db_sqlite.zig");
+const accounts = @import("database.zig");
 
 /// Get the current epoch timestamp in seconds (cross-platform).
 fn currentTimestamp() i64 {
@@ -66,6 +67,7 @@ pub const StoreConfig = struct {
     /// mutation, so data survives restarts. When null the store is purely
     /// in-memory (unchanged legacy behavior).
     db_path: ?[]const u8 = null,
+    account_db: ?*accounts.Database = null,
 };
 
 // =============================================================================
@@ -108,6 +110,27 @@ pub const Event = struct {
         confirmed,
         cancelled,
     };
+};
+
+pub const CalendarSummary = struct {
+    id: u64,
+    name: []const u8,
+    description: ?[]const u8,
+    color: ?[]const u8,
+    timezone: []const u8,
+};
+
+pub const CalendarEventSummary = struct {
+    id: u64,
+    uid: []const u8,
+    summary: []const u8,
+    location: ?[]const u8,
+    start: i64,
+    end: ?i64,
+    all_day: bool,
+    recurrence_rule: ?[]const u8,
+    status: Event.EventStatus,
+    etag: []const u8,
 };
 
 pub const AddressBook = struct {
@@ -250,6 +273,7 @@ pub const CalDavStore = struct {
     pub const UserEntry = struct {
         username: []const u8,
         user_id: u64,
+        mailbox_id: ?i64,
     };
 
     pub fn init(allocator: Allocator, config: StoreConfig) !Self {
@@ -273,14 +297,14 @@ pub const CalDavStore = struct {
             .next_contact_id = 1,
         };
 
-        // Optional SQLite persistence: open the file, ensure schema, and hydrate
-        // the in-memory maps from disk. Failures degrade to in-memory rather than
-        // taking the whole server down.
+        // Never serve persisted records until the ownership registry and its
+        // reserved IDs have been loaded successfully.
+        errdefer self.deinit();
         if (config.db_path) |path| {
-            self.conn = database.Connection.open(allocator, path) catch null;
+            self.conn = try database.Connection.open(allocator, path);
             if (self.conn) |*conn| {
-                ensureSchema(conn) catch {};
-                self.loadFromDb() catch {};
+                try ensureSchema(conn);
+                try self.loadFromDb();
             }
         }
 
@@ -289,15 +313,13 @@ pub const CalDavStore = struct {
 
     pub fn deinit(self: *Self) void {
         if (self.conn) |*conn| conn.close();
-        // Free owned collection tags, record tags and record UIDs.
         var cal_iter = self.calendars.iterator();
         while (cal_iter.next()) |entry| {
-            self.allocator.free(entry.value_ptr.ctag);
+            self.freeCalendar(entry.value_ptr.*);
         }
         var event_iter = self.events.iterator();
         while (event_iter.next()) |entry| {
-            self.allocator.free(entry.value_ptr.etag);
-            self.allocator.free(entry.value_ptr.uid);
+            self.freeEvent(entry.value_ptr.*);
         }
         var ab_iter = self.addressbooks.iterator();
         while (ab_iter.next()) |entry| {
@@ -331,6 +353,8 @@ pub const CalDavStore = struct {
 
     fn ensureSchema(conn: *database.Connection) !void {
         try conn.exec(
+            \\CREATE TABLE IF NOT EXISTS dav_users (id INTEGER PRIMARY KEY, username TEXT NOT NULL, mailbox_id INTEGER UNIQUE);
+            \\CREATE UNIQUE INDEX IF NOT EXISTS idx_dav_users_local_name ON dav_users(username) WHERE mailbox_id IS NULL;
             \\CREATE TABLE IF NOT EXISTS dav_calendars (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, description TEXT, color TEXT, timezone TEXT, created_at INTEGER, modified_at INTEGER, sync_token INTEGER, ctag TEXT);
             \\CREATE TABLE IF NOT EXISTS dav_events (id INTEGER PRIMARY KEY, calendar_id INTEGER, uid TEXT, summary TEXT, description TEXT, location TEXT, dtstart INTEGER, dtend INTEGER, all_day INTEGER, rrule TEXT, organizer TEXT, status INTEGER, created_at INTEGER, modified_at INTEGER, etag TEXT, ics_data TEXT);
             \\CREATE TABLE IF NOT EXISTS dav_addressbooks (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, description TEXT, created_at INTEGER, modified_at INTEGER, sync_token INTEGER, ctag TEXT);
@@ -499,6 +523,32 @@ pub const CalDavStore = struct {
         const conn = if (self.conn) |*c| c else return;
 
         {
+            var stmt = try conn.prepare("SELECT id, username, mailbox_id FROM dav_users");
+            defer stmt.finalize();
+            while (try stmt.step()) {
+                const user_id: u64 = @intCast(stmt.columnInt(0));
+                const username = try self.allocator.dupe(u8, try stmt.columnText(1));
+                errdefer self.allocator.free(username);
+                try self.user_ids.append(self.allocator, .{
+                    .username = username,
+                    .user_id = user_id,
+                    .mailbox_id = if (stmt.columnIsNull(2)) null else stmt.columnInt(2),
+                });
+                self.next_user_id = @max(self.next_user_id, user_id + 1);
+            }
+        }
+
+        // Older databases only stored numeric owners. Reserve those IDs
+        // without guessing which authenticated mailbox used them.
+        {
+            var stmt = try conn.prepare("SELECT max(user_id) FROM (SELECT user_id FROM dav_calendars UNION ALL SELECT user_id FROM dav_addressbooks)");
+            defer stmt.finalize();
+            if (try stmt.step() and !stmt.columnIsNull(0)) {
+                self.next_user_id = @max(self.next_user_id, @as(u64, @intCast(stmt.columnInt(0))) + 1);
+            }
+        }
+
+        {
             var stmt = try conn.prepare("SELECT id,user_id,name,description,color,timezone,created_at,modified_at,sync_token,ctag FROM dav_calendars");
             defer stmt.finalize();
             while (stmt.step() catch false) {
@@ -634,27 +684,27 @@ pub const CalDavStore = struct {
 
     /// Get existing user_id for username, or create a new one.
     pub fn getOrCreateUserId(self: *Self, username: []const u8) !u64 {
+        const mailbox_id = try self.activeMailboxId(username);
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Look up existing
-        for (self.user_ids.items) |entry| {
-            if (std.mem.eql(u8, entry.username, username)) {
-                return entry.user_id;
-            }
-        }
-        // Create new
+        if (self.findUserIdLocked(username, mailbox_id)) |id| return id;
+
         const id = self.next_user_id;
+        if (id > std.math.maxInt(i64)) return error.DavUserIdExhausted;
+        const name = try self.allocator.dupe(u8, username);
+        errdefer self.allocator.free(name);
+        try self.user_ids.ensureUnusedCapacity(self.allocator, 1);
+        if (self.conn) |*conn| {
+            var stmt = try conn.prepare("INSERT INTO dav_users (id, username, mailbox_id) VALUES (?, ?, ?)");
+            defer stmt.finalize();
+            try stmt.bindInt(1, @intCast(id));
+            try stmt.bindText(2, name);
+            try bindOptInt(&stmt, 3, mailbox_id);
+            _ = try stmt.step();
+        }
+        self.user_ids.appendAssumeCapacity(.{ .username = name, .user_id = id, .mailbox_id = mailbox_id });
         self.next_user_id += 1;
-        // Dupe the username: the caller's slice is the per-connection auth
-        // buffer, freed when that connection closes. Storing it directly left a
-        // dangling pointer, so the next connection's lookup never matched and
-        // every connection minted a fresh user_id — orphaning the previous
-        // connection's calendars/contacts (EWS/CalDAV read returned nothing).
-        try self.user_ids.append(self.allocator, .{
-            .username = try self.allocator.dupe(u8, username),
-            .user_id = id,
-        });
         return id;
     }
 
@@ -676,14 +726,21 @@ pub const CalDavStore = struct {
 
         const now = currentTimestamp();
         const ctag = try self.generateCtag(id, now);
+        errdefer self.allocator.free(ctag);
+        const own_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(own_name);
+        const own_description = try dupeOptional(self.allocator, description);
+        errdefer if (own_description) |value| self.allocator.free(value);
+        const timezone = try self.allocator.dupe(u8, self.config.default_timezone);
+        errdefer self.allocator.free(timezone);
 
         try self.calendars.put(id, .{
             .id = id,
             .user_id = user_id,
-            .name = name,
-            .description = description,
+            .name = own_name,
+            .description = own_description,
             .color = null,
-            .timezone = self.config.default_timezone,
+            .timezone = timezone,
             .created_at = now,
             .modified_at = now,
             .sync_token = self.current_sync_token,
@@ -692,6 +749,14 @@ pub const CalDavStore = struct {
 
         self.persistCalendar(self.calendars.get(id).?);
         return id;
+    }
+
+    fn freeCalendar(self: *Self, calendar: Calendar) void {
+        self.allocator.free(calendar.name);
+        if (calendar.description) |value| self.allocator.free(value);
+        if (calendar.color) |value| self.allocator.free(value);
+        self.allocator.free(calendar.timezone);
+        self.allocator.free(calendar.ctag);
     }
 
     pub fn getCalendar(self: *Self, id: u64) ?Calendar {
@@ -728,6 +793,98 @@ pub const CalDavStore = struct {
         return result.toOwnedSlice(self.allocator);
     }
 
+    /// Snapshot the account's calendars while the DAV store owns their strings.
+    /// The request arena owns the returned data, including partially built rows.
+    pub fn snapshotCalendars(self: *Self, arena: Allocator, username: []const u8) ![]CalendarSummary {
+        const mailbox_id = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const user_id = self.findUserIdLocked(username, mailbox_id) orelse return &.{};
+        var result: std.ArrayList(CalendarSummary) = .empty;
+        var calendars = self.calendars.valueIterator();
+        while (calendars.next()) |calendar| {
+            if (calendar.user_id != user_id) continue;
+            try result.append(arena, .{
+                .id = calendar.id,
+                .name = try arena.dupe(u8, calendar.name),
+                .description = try dupeOptional(arena, calendar.description),
+                .color = try dupeOptional(arena, calendar.color),
+                .timezone = try arena.dupe(u8, calendar.timezone),
+            });
+        }
+        std.mem.sort(CalendarSummary, result.items, {}, struct {
+            fn lessThan(_: void, left: CalendarSummary, right: CalendarSummary) bool {
+                const order = std.mem.order(u8, left.name, right.name);
+                return order == .lt or (order == .eq and left.id < right.id);
+            }
+        }.lessThan);
+        return result.toOwnedSlice(arena);
+    }
+
+    /// List stored events intersecting a half-open window. Recurring event
+    /// masters that started before its end are returned as candidates, with
+    /// their rules intact for expansion by the calendar UI.
+    pub fn snapshotCalendarEvents(self: *Self, arena: Allocator, username: []const u8, calendar_id: u64, start: i64, end: i64) ![]CalendarEventSummary {
+        if (start >= end or @as(i128, end) - start > 366 * 86400) return error.InvalidRange;
+        const mailbox_id = try self.activeMailboxId(username);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const user_id = self.findUserIdLocked(username, mailbox_id) orelse return error.CalendarNotFound;
+        const calendar = self.calendars.get(calendar_id) orelse return error.CalendarNotFound;
+        if (calendar.user_id != user_id) return error.CalendarNotFound;
+        var result: std.ArrayList(CalendarEventSummary) = .empty;
+        var events = self.events.valueIterator();
+        while (events.next()) |event| {
+            if (event.calendar_id != calendar_id or event.dtstart >= end) continue;
+            const event_end = event.dtend orelse if (event.all_day) event.dtstart +| 86400 else event.dtstart;
+            const overlaps = event_end > start or event.dtstart >= start;
+            if (event.rrule == null and !overlaps) continue;
+            if (result.items.len == 500) return error.TooManyEvents;
+            try result.append(arena, .{
+                .id = event.id,
+                .uid = try arena.dupe(u8, event.uid),
+                .summary = try arena.dupe(u8, event.summary),
+                .location = try dupeOptional(arena, event.location),
+                .start = event.dtstart,
+                .end = event.dtend,
+                .all_day = event.all_day,
+                .recurrence_rule = try dupeOptional(arena, event.rrule),
+                .status = event.status,
+                .etag = try arena.dupe(u8, event.etag),
+            });
+        }
+        std.mem.sort(CalendarEventSummary, result.items, {}, struct {
+            fn lessThan(_: void, left: CalendarEventSummary, right: CalendarEventSummary) bool {
+                return left.start < right.start or (left.start == right.start and left.id < right.id);
+            }
+        }.lessThan);
+        return result.toOwnedSlice(arena);
+    }
+
+    fn activeMailboxId(self: *Self, username: []const u8) !?i64 {
+        const db = self.config.account_db orelse return null;
+        const stmt = try db.prepare("SELECT id FROM users WHERE username = ? AND enabled != 0");
+        defer stmt.finalize();
+        try stmt.bind(1, username);
+        if (!try stmt.step()) return error.DavMailboxNotFound;
+        return stmt.columnInt64(0);
+    }
+
+    fn findUserIdLocked(self: *Self, username: []const u8, mailbox_id: ?i64) ?u64 {
+        for (self.user_ids.items) |entry| {
+            if (entry.mailbox_id != mailbox_id) continue;
+            if (mailbox_id != null or std.mem.eql(u8, entry.username, username)) return entry.user_id;
+        }
+        return null;
+    }
+
+    fn dupeOptional(arena: Allocator, value: ?[]const u8) !?[]const u8 {
+        return if (value) |text| try arena.dupe(u8, text) else null;
+    }
+
     pub fn deleteCalendar(self: *Self, id: u64) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -744,17 +901,10 @@ pub const CalDavStore = struct {
         }
 
         for (events_to_delete.items) |event_id| {
-            if (self.events.getPtr(event_id)) |e| {
-                self.allocator.free(e.etag);
-                self.allocator.free(e.uid);
-            }
-            _ = self.events.remove(event_id);
+            if (self.events.fetchRemove(event_id)) |entry| self.freeEvent(entry.value);
         }
 
-        if (self.calendars.getPtr(id)) |cal| {
-            self.allocator.free(cal.ctag);
-        }
-        _ = self.calendars.remove(id);
+        if (self.calendars.fetchRemove(id)) |entry| self.freeCalendar(entry.value);
         self.dbExecId("DELETE FROM dav_events WHERE calendar_id = {d}", id);
         self.dbExecId("DELETE FROM dav_calendars WHERE id = {d}", id);
     }
@@ -777,24 +927,26 @@ pub const CalDavStore = struct {
         // UID slices belong to the stored record, including caller-supplied IDs.
         const uid = if (data.uid) |value| try self.allocator.dupe(u8, value) else try self.generateUid();
         errdefer if (!inserted) self.allocator.free(uid);
+        const own = try self.ownEventText(data, data.organizer, data.ics_data orelse "");
+        errdefer if (!inserted) self.freeEventText(own);
 
         try self.events.put(id, .{
             .id = id,
             .calendar_id = calendar_id,
             .uid = uid,
-            .summary = data.summary,
-            .description = data.description,
-            .location = data.location,
+            .summary = own.summary,
+            .description = own.description,
+            .location = own.location,
             .dtstart = data.dtstart,
             .dtend = data.dtend,
             .all_day = data.all_day,
-            .rrule = data.rrule,
-            .organizer = data.organizer,
+            .rrule = own.rrule,
+            .organizer = own.organizer,
             .status = data.status,
             .created_at = now,
             .modified_at = now,
             .etag = etag,
-            .ics_data = data.ics_data orelse "",
+            .ics_data = own.ics_data,
         });
 
         inserted = true;
@@ -823,6 +975,63 @@ pub const CalDavStore = struct {
         status: Event.EventStatus = .confirmed,
         ics_data: ?[]const u8 = null,
     };
+
+    const EventText = struct {
+        summary: []const u8,
+        description: ?[]const u8,
+        location: ?[]const u8,
+        rrule: ?[]const u8,
+        organizer: ?[]const u8,
+        ics_data: []const u8,
+
+        fn fromEvent(event: Event) EventText {
+            return .{
+                .summary = event.summary,
+                .description = event.description,
+                .location = event.location,
+                .rrule = event.rrule,
+                .organizer = event.organizer,
+                .ics_data = event.ics_data,
+            };
+        }
+    };
+
+    fn ownEventText(self: *Self, data: EventData, organizer: ?[]const u8, ics_data: []const u8) !EventText {
+        const a = self.allocator;
+        const summary = try a.dupe(u8, data.summary);
+        errdefer a.free(summary);
+        const description = try dupeOptional(a, data.description);
+        errdefer if (description) |value| a.free(value);
+        const location = try dupeOptional(a, data.location);
+        errdefer if (location) |value| a.free(value);
+        const rule = try dupeOptional(a, data.rrule);
+        errdefer if (rule) |value| a.free(value);
+        const owner = try dupeOptional(a, organizer);
+        errdefer if (owner) |value| a.free(value);
+        return .{
+            .summary = summary,
+            .description = description,
+            .location = location,
+            .rrule = rule,
+            .organizer = owner,
+            .ics_data = try a.dupe(u8, ics_data),
+        };
+    }
+
+    fn freeEventText(self: *Self, data: EventText) void {
+        const a = self.allocator;
+        a.free(data.summary);
+        for ([_]?[]const u8{ data.description, data.location, data.rrule, data.organizer }) |item| {
+            if (item) |value| a.free(value);
+        }
+        a.free(data.ics_data);
+    }
+
+    fn freeEvent(self: *Self, event: Event) void {
+        self.freeEventText(EventText.fromEvent(event));
+        self.allocator.free(event.uid);
+        self.allocator.free(event.etag);
+    }
 
     pub fn getEvent(self: *Self, id: u64) ?Event {
         self.mutex.lock();
@@ -866,21 +1075,26 @@ pub const CalDavStore = struct {
             const now = currentTimestamp();
             const old_etag = event.etag;
             const etag = try self.generateEtag(id, now);
+            const own = self.ownEventText(data, event.organizer, data.ics_data orelse event.ics_data) catch |err| {
+                self.allocator.free(etag);
+                return err;
+            };
+            // The map owns the new data from this point onward.
             self.allocator.free(old_etag);
+            self.freeEventText(EventText.fromEvent(event.*));
 
-            event.summary = data.summary;
-            event.description = data.description;
-            event.location = data.location;
+            event.summary = own.summary;
+            event.description = own.description;
+            event.location = own.location;
             event.dtstart = data.dtstart;
             event.dtend = data.dtend;
             event.all_day = data.all_day;
-            event.rrule = data.rrule;
+            event.rrule = own.rrule;
+            event.organizer = own.organizer;
             event.status = data.status;
             event.modified_at = now;
             event.etag = etag;
-            if (data.ics_data) |ics| {
-                event.ics_data = ics;
-            }
+            event.ics_data = own.ics_data;
 
             if (self.config.enable_sync_tokens) {
                 try self.recordChange(event.calendar_id, id, .event, .modified, etag, try self.getEventHref(event.calendar_id, event.uid));
@@ -901,8 +1115,7 @@ pub const CalDavStore = struct {
             const calendar_id = event.calendar_id;
             const href = if (self.config.enable_sync_tokens) try self.getEventHref(calendar_id, event.uid) else null;
             _ = self.events.remove(id);
-            defer self.allocator.free(etag);
-            defer self.allocator.free(event.uid);
+            defer self.freeEvent(event);
             if (href) |value| try self.recordChange(calendar_id, id, .event, .deleted, etag, value);
             try self.updateCalendarCtag(calendar_id);
             self.dbExecId("DELETE FROM dav_events WHERE id = {d}", id);
@@ -1230,22 +1443,19 @@ pub const CalDavStore = struct {
     /// Deep-copy a bounded snapshot while holding the store lock. A concurrent
     /// CardDAV edit must not invalidate webmail's contact names or addresses.
     pub fn suggestContacts(self: *Self, allocator: Allocator, username: []const u8, query: []const u8, requested_limit: usize) ![]ContactSuggestion {
+        const mailbox_id = try self.activeMailboxId(username);
         self.mutex.lock();
         defer self.mutex.unlock();
         const ascii = @import("ascii-compat");
         const limit = @min(requested_limit, 100);
-        var user_id: ?u64 = null;
-        for (self.user_ids.items) |entry| if (std.mem.eql(u8, entry.username, username)) {
-            user_id = entry.user_id;
-            break;
-        };
-        if (user_id == null or limit == 0) return &.{};
+        const user_id = self.findUserIdLocked(username, mailbox_id) orelse return &.{};
+        if (limit == 0) return &.{};
         var result: std.ArrayList(ContactSuggestion) = .empty;
         defer result.deinit(allocator);
         for (self.emails.items) |email| {
             const contact = self.contacts.get(email.contact_id) orelse continue;
             const book = self.addressbooks.get(contact.addressbook_id) orelse continue;
-            if (book.user_id != user_id.?) continue;
+            if (book.user_id != user_id) continue;
             if (query.len > 0 and ascii.indexOfIgnoreCase(email.email, query) == null and ascii.indexOfIgnoreCase(contact.full_name, query) == null) continue;
             var duplicate = false;
             for (result.items) |known| if (std.ascii.eqlIgnoreCase(known.address, email.email)) {
@@ -1901,6 +2111,90 @@ test "calendar operations" {
     const cal = store.getCalendar(cal_id);
     try std.testing.expect(cal != null);
     try std.testing.expectEqualStrings("Test Calendar", cal.?.name);
+}
+
+test "calendar snapshots filter by authenticated account and half-open window" {
+    const allocator = std.testing.allocator;
+    var store = try CalDavStore.init(allocator, .{});
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const request = arena.allocator();
+
+    const owner = "owner@example.test";
+    const guest = "guest@example.test";
+    const personal = try store.createCalendar(try store.getOrCreateUserId(owner), "Personal", "My own dates");
+    const another = try store.createCalendar(try store.getOrCreateUserId(guest), "Private", null);
+    _ = try store.createEvent(another, .{ .summary = "Guest event", .dtstart = 100 });
+    _ = try store.createEvent(personal, .{ .summary = "Before the window", .dtstart = 50, .dtend = 100 });
+    _ = try store.createEvent(personal, .{ .summary = "Overlapping event", .dtstart = 90, .dtend = 110 });
+    _ = try store.createEvent(personal, .{ .summary = "Recurring meeting", .dtstart = 60, .dtend = 70, .rrule = "FREQ=DAILY" });
+    _ = try store.createEvent(personal, .{ .summary = "On the start", .dtstart = 100 });
+    _ = try store.createEvent(personal, .{ .summary = "On the end", .dtstart = 200 });
+
+    const calendars = try store.snapshotCalendars(request, owner);
+    try std.testing.expectEqual(@as(usize, 1), calendars.len);
+    try std.testing.expectEqual(personal, calendars[0].id);
+    try std.testing.expectEqual(@as(usize, 0), (try store.snapshotCalendars(request, "unknown@example.test")).len);
+    try std.testing.expectError(error.CalendarNotFound, store.snapshotCalendarEvents(request, owner, another, 100, 200));
+    try std.testing.expectError(error.InvalidRange, store.snapshotCalendarEvents(request, owner, personal, 100, 100));
+    try std.testing.expectError(error.InvalidRange, store.snapshotCalendarEvents(request, owner, personal, 0, 367 * 86400));
+
+    const events = try store.snapshotCalendarEvents(request, owner, personal, 100, 200);
+    try std.testing.expectEqual(@as(usize, 3), events.len);
+    try std.testing.expectEqualStrings("Recurring meeting", events[0].summary);
+    try std.testing.expectEqualStrings("Overlapping event", events[1].summary);
+    try std.testing.expectEqualStrings("On the start", events[2].summary);
+    try std.testing.expectEqualStrings("FREQ=DAILY", events[0].recurrence_rule.?);
+
+    try store.deleteCalendar(personal);
+    try std.testing.expectEqualStrings("Personal", calendars[0].name);
+    try std.testing.expect(events[0].uid.len > 0);
+    try std.testing.expect(events[0].etag.len > 0);
+}
+
+test "persistent DAV ownership follows mailbox IDs without claiming unassigned collections" {
+    const allocator = std.testing.allocator;
+    var mailbox_db = try accounts.Database.init(allocator, ":memory:");
+    defer mailbox_db.deinit();
+    _ = try mailbox_db.createUser("owner@old.test", "unused", "owner@old.test");
+    _ = try mailbox_db.createUser("guest@other.test", "unused", "guest@other.test");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const directory_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const path = try std.fs.path.join(allocator, &.{ path_buffer[0..directory_len], "dav.db" });
+    defer allocator.free(path);
+    const config: StoreConfig = .{ .db_path = path, .account_db = &mailbox_db };
+    const owner_id = blk: {
+        var store = try CalDavStore.init(allocator, config);
+        defer store.deinit();
+        const id = try store.getOrCreateUserId("owner@old.test");
+        var name = "Personal".*;
+        const calendar = try store.createCalendar(id, &name, null);
+        @memset(&name, 'x');
+        try std.testing.expectEqualStrings("Personal", store.getCalendar(calendar).?.name);
+        _ = try store.createCalendar(42, "Unassigned legacy data", null);
+        break :blk id;
+    };
+
+    var store = try CalDavStore.init(allocator, config);
+    defer store.deinit();
+    try std.testing.expect((try store.getOrCreateUserId("guest@other.test")) > 42);
+    try std.testing.expectEqual(owner_id, try store.getOrCreateUserId("owner@old.test"));
+    _ = try mailbox_db.renameDomain("old.test", "new.test");
+    try std.testing.expectEqual(owner_id, try store.getOrCreateUserId("owner@new.test"));
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const request = arena.allocator();
+    try std.testing.expectEqualStrings("Personal", (try store.snapshotCalendars(request, "owner@new.test"))[0].name);
+    try std.testing.expectEqual(@as(usize, 0), (try store.snapshotCalendars(request, "guest@other.test")).len);
+    try mailbox_db.deleteUser("owner@new.test");
+    _ = try mailbox_db.createUser("owner@new.test", "unused", "owner@new.test");
+    try std.testing.expect((try store.getOrCreateUserId("owner@new.test")) != owner_id);
+    try std.testing.expectEqual(@as(usize, 0), (try store.snapshotCalendars(request, "owner@new.test")).len);
 }
 
 test "event operations" {

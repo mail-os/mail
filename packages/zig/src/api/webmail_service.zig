@@ -48,7 +48,7 @@ const UndoEntry = struct { original: MessageRef, current: MessageRef, before: ma
 const UndoDocument = struct { entries: []const UndoEntry, results: []const ActionResult = &.{} };
 pub const BulkResult = struct { ok: bool, results: []const ActionResult, undoId: ?[]const u8 = null, expiresAt: ?i64 = null };
 pub const Outbox = struct { message: Payload, result: ?compose.SendResult = null, error_message: ?[]const u8 = null };
-pub const Limits = struct { maxFileBytes: usize, maxTotalBytes: usize, maxCount: usize, maxMessageBytes: usize, undoSendSeconds: u32 };
+pub const Limits = struct { maxFileBytes: usize, maxTotalBytes: usize, maxCount: usize, maxMessageBytes: usize, undoSendSeconds: u32, calendarAvailable: bool = false };
 
 pub const Config = struct {
     hostname: []const u8 = "localhost",

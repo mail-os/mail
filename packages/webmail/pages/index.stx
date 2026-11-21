@@ -60,6 +60,7 @@ onUnmounted(() => mail.destroy())
         <span :text="folderName(item.name)"></span><span :if="(item.name === 'Drafts' ? item.total : item.unread) > 0" class="wm-folder-count" :text="item.name === 'Drafts' ? item.total : item.unread"></span>
       </button>
       <button class="wm-folder" :class="{ 'wm-folder--active': !outboxView && folder === '*' }" @click="selectFolder('*')" :disabled="mutating">All mail</button>
+      <a :if="limits.calendarAvailable" class="wm-folder" href="/calendar">Calendar</a>
       <button class="wm-folder" :class="{ 'wm-folder--active': outboxView }" @click="showOutbox()"><span>Outbox</span><span :if="outboxCount > 0" class="wm-folder-count" :text="outboxCount"></span></button>
     </nav>
     <div class="wm-user"><a class="wm-logout" href="/status">Service health</a><span class="wm-user-email" :text="user?.email"></span><button class="wm-logout" @click="showSettings()">Account</button><button class="wm-logout" @click="signOut()" :disabled="sending || savingDraft">Sign out</button></div>

@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Calendar — Mail</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<script client>
+import { useMailCalendar } from '../functions/use-mail-calendar'
+const {
+  account, calendars, activeCalendar, ordinaryEvents, recurringSeries, rangeLabel, loading, error,
+  refresh, selectCalendar, shiftWeek, goToToday, calendarEventDate, destroy,
+} = useMailCalendar(() => navigate('/login', { reload: true }))
+onMount(refresh)
+onUnmounted(destroy)
+</script>
+<main class="calendar-page">
+  <nav class="health-nav" aria-label="Mail navigation"><a href="/">Back to inbox</a><span :if="account" :text="account"></span></nav>
+  <header class="health-header">
+    <div><h1 class="font-semibold text-indigo-600">Calendar</h1><p>View events from your CalDAV calendars.</p></div>
+    <button class="wm-action" @click="refresh()" :disabled="loading">Refresh</button>
+  </header>
+  <div :if="error" class="login-error" role="alert" :text="error"></div>
+  <p :if="loading" role="status">Loading calendar…</p>
+  <p :if="!loading && !error && !calendars.length">Create a calendar in your CalDAV client to see it here.</p>
+  <section :if="account && calendars.length" aria-label="Weekly agenda">
+    <div class="calendar-controls">
+      <div class="calendar-choices" role="group" aria-label="Calendars">
+        <button :for="item in calendars" class="wm-action" @click="selectCalendar(item.id)" :aria-pressed="item.id === activeCalendar" :text="item.name"></button>
+      </div>
+      <div class="calendar-choices" role="group" aria-label="Change date range">
+        <button class="wm-action" @click="shiftWeek(-1)">Previous week</button>
+        <button class="wm-action" @click="goToToday()">Today</button>
+        <button class="wm-action" @click="shiftWeek(1)">Next week</button>
+      </div>
+    </div>
+    <h2 class="calendar-range" :text="rangeLabel" aria-live="polite"></h2>
+    <p :if="!loading && !error && !ordinaryEvents.length">No one-time events this week.</p>
+    <ul class="calendar-events">
+      <li :for="event in ordinaryEvents">
+        <strong :text="event.summary || 'Untitled event'"></strong>
+        <span :text="calendarEventDate(event)"></span>
+        <span :if="event.location" :text="event.location"></span>
+        <span :if="event.status !== 'confirmed'" :text="event.status"></span>
+      </li>
+    </ul>
+    <section :if="recurringSeries.length" class="calendar-series" aria-labelledby="series-heading">
+      <h2 id="series-heading">Recurring series</h2>
+      <p>Open your CalDAV client for individual occurrence dates.</p>
+      <ul class="calendar-events">
+        <li :for="event in recurringSeries">
+          <strong :text="event.summary || 'Untitled series'"></strong>
+          <span :text="'Series start: ' + calendarEventDate(event)"></span>
+        </li>
+      </ul>
+    </section>
+  </section>
+</main>
+</body>
+</html>

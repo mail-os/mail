@@ -251,3 +251,15 @@ dialog.wm-modal::backdrop { background: rgba(20, 20, 35, .4); }
 .wm-health-banner { padding: 10px 18px; background: #fffbeb; color: #92400e; font-size: 13px; border-bottom: 1px solid #fcd34d; }
 .wm-health-banner a { color: inherit; font-weight: 600; }
 @media (max-width: 540px) { .health-page { padding: 20px 16px 40px; } .health-header { align-items: flex-start; } .health-summary, .health-card { padding: 18px; } .health-check { grid-template-columns: minmax(0, 1fr) auto; gap: 8px; } }
+
+.calendar-page { max-width: 62rem; margin: auto; padding: 1.5rem clamp(1rem, 4vw, 2rem) 3rem; }
+.calendar-page .health-nav { display: flex; justify-content: space-between; gap: .75rem; overflow-wrap: anywhere; }
+.calendar-controls, .calendar-choices { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+.calendar-controls { justify-content: space-between; gap: 1rem; margin-block: 1rem; }
+.calendar-choices .wm-action[aria-pressed="true"] { outline: 2px solid currentColor; outline-offset: 1px; }
+.calendar-range { font-size: 1.125rem; font-weight: 650; margin: 1.15rem 0 .75rem; }
+.calendar-events { list-style: none; padding: 0; margin: .5rem 0; }
+.calendar-events li { display: flex; flex-wrap: wrap; align-items: baseline; gap: .35rem .8rem; padding: .7rem 0; border-bottom: 1px solid currentColor; overflow-wrap: anywhere; }
+.calendar-events li strong { flex-basis: 100%; }
+.calendar-series { margin-top: 1.65rem; }
+.calendar-series h2 { font-weight: 650; }

@@ -632,7 +632,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         // Persist CalDAV/CardDAV data to SQLite so calendars/contacts survive
         // restarts (and so the ActiveSync server has real data to sync).
         const caldav_db_path = env.get("CALDAV_DB_PATH") orelse "./caldav.db";
-        caldav_store_inst = try caldav_store_mod.CalDavStore.init(allocator, .{ .db_path = caldav_db_path });
+        caldav_store_inst = try caldav_store_mod.CalDavStore.init(allocator, .{ .db_path = caldav_db_path, .account_db = db_ptr.? });
         log.info("CalDAV/CardDAV store persisting to: {s}", .{caldav_db_path});
 
         const caldav_config = caldav.CalDavConfig{
@@ -656,7 +656,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
             .ses_region = cfg.ses_region,
         };
         caldav_server = caldav.CalDavServer.init(allocator, caldav_config, auth_ptr.?, &caldav_store_inst.?);
-        if (webmail_server) |*ws| ws.contacts = &caldav_store_inst.?;
+        if (webmail_server) |*ws| ws.dav_store = &caldav_store_inst.?;
         log.info("CalDAV/CardDAV server configured on port {d}", .{caldav_port});
         if (cfg.enable_tls and cfg.tls_cert_path != null) {
             log.info("CalDAV SSL server configured on port {d} (HTTPS)", .{caldav_ssl_port});

@@ -710,7 +710,7 @@ pub const CalDavSession = struct {
         }
 
         const parsed = parsePath(path);
-        const user_id = self.getUserId() catch 1;
+        const user_id = try self.getUserId();
 
         // Build XML response using dynamic buffer
         var buf: std.ArrayList(u8) = .empty;
@@ -950,7 +950,7 @@ pub const CalDavSession = struct {
         switch (parsed.path_type) {
             .calendar_collection => {
                 if (parsed.collection) |col_name| {
-                    const user_id = self.getUserId() catch 1;
+                    const user_id = try self.getUserId();
                     if (self.store.getCalendarByName(user_id, col_name)) |cal| {
                         if (self.store.calendars.getPtr(cal.id)) |cal_ptr| {
                             // SECURITY/CORRECTNESS: new_name/new_color point into the
@@ -981,7 +981,7 @@ pub const CalDavSession = struct {
             },
             .addressbook_collection => {
                 if (parsed.collection) |col_name| {
-                    const user_id = self.getUserId() catch 1;
+                    const user_id = try self.getUserId();
                     if (self.store.getAddressBookByName(user_id, col_name)) |ab| {
                         if (self.store.addressbooks.getPtr(ab.id)) |ab_ptr| {
                             // SECURITY/CORRECTNESS: new_name points into the request
@@ -1026,7 +1026,7 @@ pub const CalDavSession = struct {
                     return;
                 };
                 // Look up calendar by name for the user (use user_id=1 as default)
-                const user_id = self.getUserId() catch 1;
+                const user_id = try self.getUserId();
                 const calendars = self.store.getUserCalendars(user_id) catch {
                     try self.sendError(500, "Internal Server Error");
                     return;
@@ -1058,7 +1058,7 @@ pub const CalDavSession = struct {
                     try self.sendError(404, "Not Found");
                     return;
                 };
-                const user_id = self.getUserId() catch 1;
+                const user_id = try self.getUserId();
                 const addressbooks = self.store.getUserAddressBooks(user_id) catch {
                     try self.sendError(500, "Internal Server Error");
                     return;
@@ -1147,7 +1147,7 @@ pub const CalDavSession = struct {
                     try self.sendError(400, "Missing calendar name");
                     return;
                 };
-                const user_id = self.getUserId() catch 1;
+                const user_id = try self.getUserId();
 
                 // Find or create calendar
                 var cal_id: u64 = undefined;
@@ -1234,7 +1234,7 @@ pub const CalDavSession = struct {
                     try self.sendError(400, "Missing addressbook name");
                     return;
                 };
-                const user_id = self.getUserId() catch 1;
+                const user_id = try self.getUserId();
 
                 // Find or create addressbook
                 var ab_id: u64 = undefined;
@@ -1356,7 +1356,7 @@ pub const CalDavSession = struct {
                     try self.sendError(404, "Not Found");
                     return;
                 };
-                const user_id = self.getUserId() catch 1;
+                const user_id = try self.getUserId();
                 const calendars = self.store.getUserCalendars(user_id) catch {
                     try self.sendError(500, "Internal Server Error");
                     return;
@@ -1384,7 +1384,7 @@ pub const CalDavSession = struct {
                     try self.sendError(404, "Not Found");
                     return;
                 };
-                const user_id = self.getUserId() catch 1;
+                const user_id = try self.getUserId();
                 const addressbooks = self.store.getUserAddressBooks(user_id) catch {
                     try self.sendError(500, "Internal Server Error");
                     return;
@@ -1409,7 +1409,7 @@ pub const CalDavSession = struct {
                     try self.sendError(404, "Not Found");
                     return;
                 };
-                const user_id = self.getUserId() catch 1;
+                const user_id = try self.getUserId();
                 const calendars = self.store.getUserCalendars(user_id) catch {
                     try self.sendError(500, "Internal Server Error");
                     return;
@@ -1432,7 +1432,7 @@ pub const CalDavSession = struct {
                     try self.sendError(404, "Not Found");
                     return;
                 };
-                const user_id = self.getUserId() catch 1;
+                const user_id = try self.getUserId();
                 const addressbooks = self.store.getUserAddressBooks(user_id) catch {
                     try self.sendError(500, "Internal Server Error");
                     return;
@@ -1465,7 +1465,7 @@ pub const CalDavSession = struct {
                 try self.sendError(400, "Missing calendar name");
                 return;
             };
-            const user_id = self.getUserId() catch 1;
+            const user_id = try self.getUserId();
             // Check for duplicate
             if (self.store.getCalendarByName(user_id, collection_name) != null) {
                 try self.sendError(405, "Calendar already exists");
@@ -1491,7 +1491,7 @@ pub const CalDavSession = struct {
                 try self.sendError(400, "Missing addressbook name");
                 return;
             };
-            const user_id = self.getUserId() catch 1;
+            const user_id = try self.getUserId();
             // Check for duplicate
             if (self.store.getAddressBookByName(user_id, collection_name) != null) {
                 try self.sendError(405, "Address book already exists");
@@ -1507,7 +1507,7 @@ pub const CalDavSession = struct {
                 try self.sendError(400, "Missing calendar name");
                 return;
             };
-            const user_id = self.getUserId() catch 1;
+            const user_id = try self.getUserId();
             // Check for duplicate
             if (self.store.getCalendarByName(user_id, collection_name) != null) {
                 try self.sendError(405, "Calendar already exists");
@@ -1572,7 +1572,7 @@ pub const CalDavSession = struct {
     /// Handle calendar-query REPORT
     fn handleCalendarQuery(self: *CalDavSession, path: []const u8, request: []const u8) !void {
         const parsed = parsePath(path);
-        const user_id = self.getUserId() catch 1;
+        const user_id = try self.getUserId();
 
         // Parse time-range filter from request body
         var time_range_start: ?i64 = null;
@@ -1639,7 +1639,7 @@ pub const CalDavSession = struct {
     /// Handle calendar-multiget REPORT
     fn handleCalendarMultiget(self: *CalDavSession, path: []const u8, request: []const u8) !void {
         _ = path;
-        const user_id = self.getUserId() catch 1;
+        const user_id = try self.getUserId();
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
@@ -1696,7 +1696,7 @@ pub const CalDavSession = struct {
     fn handleAddressbookQuery(self: *CalDavSession, path: []const u8, request: []const u8) !void {
         _ = request;
         const parsed = parsePath(path);
-        const user_id = self.getUserId() catch 1;
+        const user_id = try self.getUserId();
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
@@ -1738,7 +1738,7 @@ pub const CalDavSession = struct {
     /// Handle addressbook-multiget REPORT
     fn handleAddressbookMultiget(self: *CalDavSession, path: []const u8, request: []const u8) !void {
         _ = path;
-        const user_id = self.getUserId() catch 1;
+        const user_id = try self.getUserId();
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
@@ -1796,7 +1796,7 @@ pub const CalDavSession = struct {
     /// Handle sync-collection REPORT (RFC 6578)
     fn handleSyncCollection(self: *CalDavSession, path: []const u8, request: []const u8) !void {
         const parsed = parsePath(path);
-        const user_id = self.getUserId() catch 1;
+        const user_id = try self.getUserId();
 
         // Parse sync-token from request body
         var sync_token: u64 = 0;

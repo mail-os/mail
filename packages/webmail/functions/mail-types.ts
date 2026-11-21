@@ -67,4 +67,4 @@ export interface OutboxItem { id: string, state: string, dueAt: number, serverTi
 export type BulkAction = 'move' | 'trash' | 'read' | 'unread' | 'flag' | 'unflag' | 'purge'
 export interface ActionResult extends MessageRef { ok: boolean, new_uid: number | null, new_folder: string | null, error_code: string | null }
 export interface BulkResult { ok: boolean, results: ActionResult[], undoId: string | null, expiresAt: number | null }
-export interface MailLimits { maxFileBytes: number, maxTotalBytes: number, maxCount: number, maxMessageBytes: number, undoSendSeconds: number }
+export interface MailLimits { maxFileBytes: number, maxTotalBytes: number, maxCount: number, maxMessageBytes: number, undoSendSeconds: number, calendarAvailable?: boolean }
