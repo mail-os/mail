@@ -1309,6 +1309,23 @@ pub const CalDavStore = struct {
     pub fn exportCalendar(self: *Self, arena: Allocator, username: []const u8, calendar_id: u64) ![]const u8 {
         const mailbox_id = try self.activeMailboxId(username);
         const snapshot = try self.snapshotCalendarExport(arena, username, mailbox_id, calendar_id);
+        return renderCalendarExport(arena, snapshot);
+    }
+
+    /// Used by an operator with a verified local mailbox ID. The mailbox
+    /// may be disabled, but a DAV collection must still belong to that ID.
+    pub fn exportCalendarForMailbox(self: *Self, arena: Allocator, mailbox_id: i64, calendar_id: u64) ![]const u8 {
+        const snapshot = try self.snapshotCalendarExport(arena, "", mailbox_id, calendar_id);
+        return renderCalendarExport(arena, snapshot);
+    }
+
+    pub fn exportOwnerForMailbox(self: *Self, mailbox_id: i64) ?u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.findUserIdLocked("", mailbox_id);
+    }
+
+    fn renderCalendarExport(arena: Allocator, snapshot: ExportSnapshot) ![]const u8 {
         var result = try icalendar.Export.init(arena, snapshot.name);
         for (snapshot.records) |record| switch (record) {
             .document => |document| try result.addDocument(document),

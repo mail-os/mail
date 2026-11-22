@@ -296,6 +296,44 @@ send delay 0–30 seconds. Effective attachment limits also respect mailbox limi
 and the MIME expansion budget under `SMTP_MAX_MESSAGE_SIZE`; the UI displays the
 actual effective limit. A user may choose a 0–30 second send delay in the composer.
 
+## Portable mailbox export
+
+Run the export as a local Mail operator with the same database paths and working
+directory as the server. The command accepts the canonical mailbox username and
+works while that mailbox's sign-in is disabled.
+
+```sh
+mail user:local export person@example.com /private/path/person.tar
+tar -xf /private/path/person.tar -C /private/path/extracted
+```
+
+The operator chooses a new archive path. Mail writes the archive with mode
+`0600` and publishes it after the export succeeds. The source paths default to
+`mail/`, `smtp.db`, and `caldav.db`. Set `MAIL_ROOT`, `SMTP_DB_PATH`, and
+`CALDAV_DB_PATH` to match the local data. Use a quiesced copy of the source
+stores for a point-in-time export across mail and DAV.
+
+- `Maildir/` contains Inbox and named folders in Maildir++ format. Message
+  files retain their original MIME bytes and attachments. Standard flags travel
+  in the filename and the archive carries file modification times.
+- `Calendars/` contains an iCalendar file for each owned calendar. Import them
+  into a calendar client using its ICS import. The existing 16 MiB
+  per-calendar export limit applies.
+- `Contacts/` contains individual vCards grouped by address book. Import the
+  cards into the corresponding address books on the destination.
+- `manifest.json` maps source folder, calendar, and address-book names to their
+  archive paths. Use the manifest when creating IMAP folders with their source
+  names. The destination assigns its own message UIDs.
+
+To move mail into another Mail instance, create each folder from the manifest
+and upload the messages over IMAP using a client that supports APPEND. Use a
+Maildir importer such as Dovecot's when the original received time matters.
+APPEND timestamp preservation is tracked in [#105](https://github.com/mail-os/mail/issues/105).
+[Dovecot import documentation](https://doc.dovecot.org/2.3/admin_manual/importing_mailboxes/)
+
+Use a server backup for same-service recovery of account configuration,
+sharing, and private workflow state.
+
 ## Self-hosted team administration
 
 Run these commands on the Mail host using the service database and a local

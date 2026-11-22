@@ -5,6 +5,8 @@ const database = @import("../storage/database.zig");
 const auth = @import("../auth/auth.zig");
 const env = @import("../core/env.zig");
 const recovery = @import("../api/webmail_recovery.zig");
+const mailbox_export = @import("../storage/mailbox_export.zig");
+const io_compat = @import("../core/io_compat.zig");
 
 const password_input = @import("password_input.zig");
 
@@ -73,6 +75,19 @@ fn infoAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Database, _: *au
         return;
     };
     try user_cli.userInfo(db, allocator, username);
+}
+
+fn exportAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Database, _: *auth.AuthBackend) !void {
+    const username = ctx.getArgument(0) orelse return error.MissingArgument;
+    const destination = ctx.getArgument(1) orelse return error.MissingArgument;
+    const io = io_compat.getIo();
+    const dav_path = env.get("CALDAV_DB_PATH");
+    try mailbox_export.write(ctx.allocator, io, db, username, destination, .{
+        .mail_root = env.get("MAIL_ROOT") orelse "mail",
+        .dav_path = dav_path orelse "./caldav.db",
+        .require_dav = dav_path != null,
+    });
+    std.debug.print("Mailbox export saved to {s}\n", .{destination});
 }
 
 fn verifyAction(ctx: *cli.BaseCommand.ParseContext, _: *database.Database, auth_backend: *auth.AuthBackend) !void {
@@ -202,6 +217,12 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try info_cmd.addArgument(cli.Argument.init("username", "Username to query", .string));
     _ = info_cmd.setAction(withDb(infoAction));
     _ = try cmd.addCommand(info_cmd);
+
+    const export_cmd = try cli.BaseCommand.init(allocator, "export", "Export a mailbox to a portable TAR archive");
+    _ = try export_cmd.addArgument(cli.Argument.init("username", "Canonical mailbox username", .string));
+    _ = try export_cmd.addArgument(cli.Argument.init("output", "Path for a new private archive", .string));
+    _ = export_cmd.setAction(withDb(exportAction));
+    _ = try cmd.addCommand(export_cmd);
 
     // verify
     const verify_cmd = try cli.BaseCommand.init(allocator, "verify", "Verify user credentials");
