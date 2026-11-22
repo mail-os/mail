@@ -54,6 +54,17 @@ async function fitsViewport(page) {
     assert(await page.evaluate(() => document.documentElement.scrollHeight <= innerHeight + 1), 'Mail shell exceeds the viewport')
 }
 
+async function verifySelect(control, minimumHeight = 36) {
+  const appearance = await control.evaluate((select) => {
+    const style = getComputedStyle(select)
+    return { tag: select.tagName, appearance: style.appearance, icon: style.backgroundImage, height: select.getBoundingClientRect().height }
+  })
+  assert.equal(appearance.tag, 'SELECT', 'The picker retains native keyboard and touch behavior')
+  assert.equal(appearance.appearance, 'none')
+  assert.match(appearance.icon, /data:image\/svg\+xml/)
+  assert(appearance.height >= minimumHeight, 'The picker meets the minimum control height')
+}
+
 async function verifyAppearance(page, scheme) {
   await page.emulateMedia({ colorScheme: scheme })
   const theme = await page.evaluate(() => {
@@ -219,6 +230,15 @@ async function desktopJourney(page) {
   await button(page, 'Filters').press('Enter')
   assert.equal(await button(page, 'Filters').getAttribute('aria-expanded'), 'true')
   await page.getByRole('textbox', { name: 'Filter by sender' }).waitFor()
+  const statusFilter = page.getByRole('combobox', { name: 'Filter by message status' })
+  await verifySelect(statusFilter)
+  await statusFilter.focus()
+  assert.equal(await statusFilter.evaluate(node => getComputedStyle(node).outlineStyle), 'solid')
+  if (engine === 'chromium') {
+    await page.emulateMedia({ forcedColors: 'active' })
+    assert.equal(await statusFilter.evaluate(node => getComputedStyle(node).appearance), 'auto')
+    await page.emulateMedia({ forcedColors: 'none' })
+  }
   await button(page, 'Filters').press('Enter')
   await button(page, 'Clear search and filters').click()
   await page.getByText('7 messages', { exact: true }).waitFor()
@@ -400,6 +420,7 @@ async function phoneJourney(page) {
   const body = composer.getByLabel('Message body')
   const send = button(composer, 'Send')
   assert((await send.boundingBox()).height >= 44, 'The phone Send button has a full-size touch target')
+  await verifySelect(composer.getByLabel('Undo Send delay', { exact: true }), 44)
   await subject.fill('Keyboard draft')
   await body.fill('Save this draft when Escape closes the composer.')
   await body.press('Escape')
@@ -442,6 +463,15 @@ async function phoneJourney(page) {
   await button(page, /, 2 events$/).click()
   await page.getByText('Studio review', { exact: true }).waitFor()
   await screenshot(page, 'phone-calendar-day')
+  await button(page, 'Manage calendars').click()
+  const sharing = page.getByRole('region', { name: 'Share a calendar' })
+  const access = sharing.getByRole('combobox', { name: /^Access\b/ })
+  await access.waitFor()
+  await verifySelect(access, 44)
+  await page.locator('.calendar-loading').waitFor({ state: 'hidden' })
+  await fitsViewport(page)
+  await sharing.scrollIntoViewIfNeeded()
+  await screenshot(page, 'phone-calendar-selects')
   await page.goto(url + '/shared')
   await sharedJourney(page, true)
 }
@@ -451,6 +481,7 @@ async function sharedJourney(page, phone = false) {
   const picker = page.getByLabel('Shared inbox', { exact: true })
   const studio = picker.locator('option', { hasText: /studio@hosted\.example\.test/ })
   await studio.waitFor({ state: 'attached' })
+  await verifySelect(picker, phone ? 44 : 36)
   await picker.selectOption(await studio.getAttribute('value'))
   const message = button(page, /Studio proof approval/)
   await message.click()
@@ -489,6 +520,18 @@ async function calendarSharingJourney(captain) {
   await sharing.getByRole('combobox', { name: /^Team\b/ }).selectOption({ label: 'Studio' })
   await sharing.getByLabel('Teammate').fill(sender)
   await sharing.getByRole('combobox', { name: /^Access\b/ }).selectOption('viewer')
+  const controls = sharing.locator('form :is(select, input, button)')
+  const dimensions = await controls.evaluateAll(elements => elements.map(element => {
+    const { y, height } = element.getBoundingClientRect()
+    return { y, height }
+  }))
+  assert.equal(dimensions.length, 5)
+  for (const { y, height } of dimensions) {
+    assert(Math.abs(y - dimensions[0].y) <= 1, 'Calendar sharing controls line up in one row')
+    assert(Math.abs(height - dimensions[0].height) <= 1, 'Calendar sharing controls share a height')
+  }
+  await captain.locator('.calendar-loading').waitFor({ state: 'hidden' })
+  await screenshot(captain, 'desktop-calendar-selects')
   await button(sharing, 'Share calendar').click()
   const role = sharing.getByRole('combobox', { name: `Access for ${sender} to ${calendarLabel}` })
   await role.waitFor()

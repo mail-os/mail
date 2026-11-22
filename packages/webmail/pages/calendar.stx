@@ -70,7 +70,7 @@ onUnmounted(() => { destroy(); destroyReminders() })
     </div>
     <section :if="calendars.length && teams.length" class="calendar-sharing" aria-labelledby="share-calendar-heading">
       <h2 id="share-calendar-heading">Share a calendar</h2>
-      <form class="calendar-import-form" @submit.prevent="grantCalendar()">
+      <form class="calendar-import-form calendar-share-form" @submit.prevent="grantCalendar()">
         <label>Calendar to share<select :value="shareCalendarInput || String(calendars[0]?.id || '')" @change="shareCalendarInput.set($event.target.value)" :disabled="calendarSettingsBusy">
           <option :for="item in calendars" :value="item.id" :text="item.name"></option>
         </select></label>

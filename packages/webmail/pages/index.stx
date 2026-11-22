@@ -349,10 +349,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
           <button :if="unreadAvailable && !readingBatch" type="button" class="wm-action wm-action--accent wm-next-unread" aria-label="Next unread" title="Next unread" aria-keyshortcuts="Shift+N" @click="nextUnread()" :disabled="triageBusy || mutating || readingLoading"><span class="wm-next-unread-label">Next unread</span><span class="mail-icon" data-icon="right" aria-hidden="true"></span></button>
           <div class="wm-tool-group wm-tool-move" role="group" aria-label="Move message">
             <button class="wm-tool" @click="selectedAction('move')" :disabled="mutating" aria-label="Move this message" title="Move this message"><span class="mail-icon" data-icon="folder" aria-hidden="true"></span></button>
-            <div class="wm-move-destination">
-              <select x-model="moveTo" :disabled="mutating" aria-label="Move destination"><option :for="item in folders" :value="item.name" :text="folderName(item.name)"></option></select>
-              <span class="mail-icon" data-icon="down" aria-hidden="true"></span>
-            </div>
+            <select x-model="moveTo" :disabled="mutating" aria-label="Move destination"><option :for="item in folders" :value="item.name" :text="folderName(item.name)"></option></select>
           </div>
           <button :if="selected?.folder === 'Newsletters'" class="wm-action wm-newsletter-toggle" @click="newsletterExpanded.set(!newsletterExpanded())" :aria-pressed="readerExpanded" :text="readerExpanded ? 'Show message list' : 'Expand reader'"></button>
           <button :if="readingBatch && selected?.folder !== 'Archive'" type="button" class="wm-action" @click="triageAndNext('archive')" :disabled="triageBusy || mutating || readingLoading">Archive &amp; next</button>
