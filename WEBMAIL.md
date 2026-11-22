@@ -492,9 +492,18 @@ home. The shared home lists only calendars the teammate can read. Each has a
 stable URL under `/shared-calendars/<teammate>/` and uses the same grants as the
 owner's direct URL. For clients that discover only the first calendar home,
 enter the shared home URL as an additional CalDAV connection with the
-teammate's credentials. Changes can be reconciled with a fresh listing and
-its per-event ETags. Shared calendars keep the owner's sync token, change tag,
-and change journal private.
+teammate's credentials.
+
+Shared calendars support `DAV:sync-collection` with their own opaque
+checkpoints. An empty sync token lists the current public events. Later
+reports return public adds and edits and mark formerly public events as
+removed when they are deleted or made private. Checkpoints are scoped to the
+authenticated teammate, grant, and collection URL type. A revoked grant
+denies access immediately. If a grant changes, the daemon restarts, or a
+checkpoint ages out of the bounded cache, a 403 with
+`DAV:valid-sync-token` tells the client to start again with an empty token.
+If the collection exceeds the checkpoint budget, the sync report returns
+507. Clients can refresh the public listing and compare event ETags.
 
 In both owned and shared collections, a `VEVENT` time range in a
 `calendar-query` report matches any overlapping occurrence. Results include

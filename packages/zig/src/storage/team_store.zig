@@ -42,6 +42,30 @@ pub const schema =
     \\);
     \\CREATE INDEX IF NOT EXISTS mail_team_calendar_grantee ON mail_team_calendar_shares(grantee_id);
     \\CREATE INDEX IF NOT EXISTS mail_team_calendar_source ON mail_team_calendar_shares(source_id);
+    \\CREATE TABLE IF NOT EXISTS mail_team_calendar_share_epochs (
+    \\    team_id TEXT NOT NULL,
+    \\    source_id INTEGER NOT NULL,
+    \\    grantee_id INTEGER NOT NULL,
+    \\    calendar_share_id TEXT NOT NULL,
+    \\    epoch TEXT NOT NULL CHECK(length(epoch)=32),
+    \\    PRIMARY KEY(team_id,source_id,grantee_id,calendar_share_id),
+    \\    FOREIGN KEY(team_id,source_id,grantee_id,calendar_share_id)
+    \\        REFERENCES mail_team_calendar_shares(team_id,source_id,grantee_id,calendar_share_id) ON DELETE CASCADE
+    \\);
+    \\CREATE INDEX IF NOT EXISTS mail_calendar_share_epochs_lookup
+    \\ON mail_team_calendar_share_epochs(grantee_id,source_id,calendar_share_id,team_id);
+    \\CREATE TRIGGER IF NOT EXISTS mail_calendar_grant_epoch_insert AFTER INSERT ON mail_team_calendar_shares
+    \\BEGIN
+    \\    INSERT INTO mail_team_calendar_share_epochs VALUES(NEW.team_id,NEW.source_id,NEW.grantee_id,NEW.calendar_share_id,lower(hex(randomblob(16))));
+    \\END;
+    \\CREATE TRIGGER IF NOT EXISTS mail_calendar_grant_epoch_update AFTER UPDATE OF access ON mail_team_calendar_shares
+    \\WHEN NEW.access<>OLD.access
+    \\BEGIN
+    \\    UPDATE mail_team_calendar_share_epochs SET epoch=lower(hex(randomblob(16)))
+    \\    WHERE team_id=NEW.team_id AND source_id=NEW.source_id AND grantee_id=NEW.grantee_id AND calendar_share_id=NEW.calendar_share_id;
+    \\END;
+    \\INSERT OR IGNORE INTO mail_team_calendar_share_epochs
+    \\SELECT team_id,source_id,grantee_id,calendar_share_id,lower(hex(randomblob(16))) FROM mail_team_calendar_shares;
     \\CREATE TRIGGER IF NOT EXISTS mail_team_keep_owner_delete BEFORE DELETE ON mail_team_members
     \\WHEN OLD.role='owner' AND EXISTS(SELECT 1 FROM mail_teams WHERE id=OLD.team_id)
     \\AND NOT EXISTS(SELECT 1 FROM mail_team_members WHERE team_id=OLD.team_id AND user_id<>OLD.user_id AND role='owner')
@@ -329,6 +353,27 @@ pub fn calendarAccess(tx: Tx, grantee_id: i64, source_id: i64, share_id: Calenda
     try bind(stmt, .{ grantee_id, source_id, key });
     if (!try stmt.step()) return null;
     return std.meta.stringToEnum(CalendarAccess, stmt.columnText(0)) orelse error.InvalidTeamData;
+}
+
+/// Grant instances carry their own epochs so an old checkpoint cannot cross
+/// a revoke/regrant, even when no DAV request observes the intermediate state.
+pub fn calendarGrantEpoch(tx: Tx, grantee_id: i64, source_id: i64, share_id: CalendarShareId) !?[32]u8 {
+    const stmt = try tx.prepare(
+        \\SELECT epoch FROM mail_team_calendar_share_epochs
+        \\WHERE grantee_id=?1 AND source_id=?2 AND calendar_share_id=?3 ORDER BY team_id
+    );
+    defer stmt.finalize();
+    const key: []const u8 = &share_id;
+    try bind(stmt, .{ grantee_id, source_id, key });
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var found = false;
+    while (try stmt.step()) {
+        const epoch = stmt.columnText(0);
+        if (epoch.len != 32) return error.InvalidTeamData;
+        hash.update(epoch);
+        found = true;
+    }
+    return if (found) hash.finalResult() else null;
 }
 
 pub fn list(db: *database.Database, a: Allocator, mailbox: []const u8) ![]Team {

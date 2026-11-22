@@ -158,6 +158,28 @@ def dav_query(client, path, start, end, *, tls=True, timezone="", expected=207, 
     return {item.findtext("{DAV:}href"): item.findtext(f".//{{{CALDAV}}}calendar-data") for item in responses}
 
 
+def dav_sync_body(token="", limit=None):
+    results = "" if limit is None else f"<D:limit><D:nresults>{limit}</D:nresults></D:limit>"
+    return (f'<D:sync-collection xmlns:D="DAV:"><D:sync-token>{token}</D:sync-token>'
+            f"<D:sync-level>1</D:sync-level>{results}<D:prop><D:getetag/></D:prop></D:sync-collection>")
+
+
+def dav_sync(client, path, token="", *, expected=207, limit=None, tls=True):
+    status, _, body = client.request("REPORT", path, dav_sync_body(token, limit),
+                                     {"Depth": "0", "Content-Type": "application/xml"}, tls=tls)
+    assert status == expected, (path, status, body)
+    if expected != 207:
+        if expected in (403, 507):
+            error = "valid-sync-token" if expected == 403 else "number-of-matches-within-limits"
+            assert ET.fromstring(body).find(f"{{DAV:}}{error}") is not None
+        return body
+    document = ET.fromstring(body)
+    return document.findtext("{DAV:}sync-token"), {
+        row.findtext("{DAV:}href"): (row.findtext(".//{DAV:}getetag"), row.findtext("{DAV:}status"))
+        for row in document.findall("{DAV:}response")
+    }
+
+
 def create_calendar(test, owner_session):
     return expect(test.api(owner_session, "calendars", {"name": CALENDAR}), 201)["id"]
 
@@ -513,8 +535,8 @@ def verify_dav_editors(test, scan, owner, viewer, foreign, calendar_id):
         listing = responses(guest_dav.request("PROPFIND", path, headers=xml, tls=tls))
         assert len(listing) == 2 and roadmap in listing, listing
         collection = next(value for href, value in listing.items() if href != roadmap)
-        assert collection.find(".//d:sync-token", dav_xml) is None
-        assert collection.find(".//d:sync-collection", dav_xml) is None
+        assert collection.findtext(".//d:sync-token", namespaces=dav_xml).startswith("urn:mail:shared-sync:")
+        assert collection.find(".//d:sync-collection", dav_xml) is not None
         assert collection.find(".//d:privilege/d:read", dav_xml) is not None
         assert collection.find(".//d:privilege/d:write-content", dav_xml) is None
         assert listing[roadmap].findtext(".//d:getetag", namespaces=dav_xml) == headers["ETag"]
@@ -540,7 +562,7 @@ def verify_dav_editors(test, scan, owner, viewer, foreign, calendar_id):
     token = next(iter(owner_properties.values())).findtext(".//d:sync-token", namespaces=dav_xml)
     assert token
     sync = f'<D:sync-collection xmlns:D="DAV:"><D:sync-token>{token}</D:sync-token><D:sync-level>1</D:sync-level></D:sync-collection>'
-    result(guest_dav.request("REPORT", path, sync, {"Depth": "0", "Content-Type": "application/xml"}), 404)
+    result(guest_dav.request("REPORT", path, sync, {"Depth": "0", "Content-Type": "application/xml"}), 403)
     replacement = content.replace(b"UID:Roadmap", b"UID:Retrospective").replace(b"SUMMARY:Roadmap", b"SUMMARY:Retrospective")
     create = {**ics, "If-None-Match": "*"}
     created, _ = result(guest_dav.request("PUT", draft, replacement, create), 201)
@@ -709,6 +731,100 @@ def verify_dav_discovery(test, owner, viewer, colleague, foreign, calendar_id, e
         assert list(calendars(shared_home)) == [owned_alias]
         assert guest.request("GET", roadmap)[2] == original
     return owned_alias
+
+
+def verify_shared_dav_sync(test, owner, viewer, colleague, foreign):
+    calendar = "Shared checkpoint fixture"
+    captain = test.login(owner)
+    calendar_id = expect(test.api(captain, "calendars", {"name": calendar}), 201)["id"]
+    owner_dav, guest, editor, outsider = (DavClient(test, account) for account in (owner, viewer, colleague, foreign))
+    canonical = calendar_path(owner, calendar)
+
+    def store(uid, label="", classification="PUBLIC", *, expected=201):
+        write_resource(test, owner, calendar, uid, [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail shared checkpoint test//EN", "BEGIN:VEVENT",
+            f"UID:{uid}", "DTSTAMP:20261122T120000Z", "DTSTART:20261210T120000Z", "DURATION:PT1H",
+            f"SUMMARY:{uid} {label}", f"CLASS:{classification}", "END:VEVENT", "END:VCALENDAR", "",
+        ], expected)
+
+    def collection(client):
+        home = f"/shared-calendars/{client.mailbox}/"
+        status, _, payload = client.request("PROPFIND", home, headers={"Depth": "1"})
+        assert status == 207, payload
+        alias, = [row.findtext("{DAV:}href") for row in ET.fromstring(payload).findall("{DAV:}response")
+                  if row.findtext(".//{DAV:}displayname") == calendar]
+        return alias
+
+    for role, user in (("viewer", viewer), ("editor", colleague)):
+        expect(change(test, captain, calendar_id, user, role))
+    alias, editor_alias = collection(guest), collection(editor)
+    for uid in ("publish", "edit", "hide", "delete"):
+        store(uid, classification="PRIVATE" if uid == "publish" else "PUBLIC")
+
+    token, first = dav_sync(guest, alias)
+    assert set(first) == {alias + uid + ".ics" for uid in ("edit", "hide", "delete")}
+    props = guest.request("PROPFIND", alias, headers={"Depth": "0"})
+    assert props[0] == 207 and ET.fromstring(props[2]).findtext(".//{DAV:}sync-token") == token
+    dav_sync(guest, alias, limit=1, expected=507)
+    dav_sync(guest, alias, token[:-1], expected=403)
+    dav_sync(guest, canonical, token, expected=403)
+    dav_sync(editor, editor_alias, token, expected=403)
+    dav_sync(outsider, alias, token, expected=404)
+    owner_token, _ = dav_sync(owner_dav, canonical)
+    dav_sync(guest, alias, owner_token, expected=403)
+
+    store("publish", label="still private", classification="PRIVATE", expected=204)
+    store("never-visible", classification="CONFIDENTIAL")
+    assert dav_sync(guest, alias, token, tls=False) == (token, {})
+    store("publish", expected=204)
+    store("edit", label="updated", expected=204)
+    store("hide", classification="PRIVATE", expected=204)
+    store("create")
+    assert owner_dav.request("DELETE", canonical + "/delete.ics")[0] == 204
+    next_token, delta = dav_sync(guest, alias, token)
+    current = ("publish", "edit", "create")
+    assert set(delta) == {alias + uid + ".ics" for uid in (*current, "hide", "delete")}
+    assert next_token != token
+    for uid in current:
+        event_href = alias + uid + ".ics"
+        result = guest.request("GET", event_href)
+        assert result[0] == 200 and delta[event_href] == (result[1]["ETag"], None)
+    for uid in ("hide", "delete"):
+        assert delta[alias + uid + ".ics"] == (None, "HTTP/1.1 404 Not Found")
+    assert dav_sync(guest, alias, next_token) == (next_token, {})
+
+    content_type = {**guest.auth, "Depth": "0", "Content-Type": "application/xml"}
+    with closing(HTTPSConnection("127.0.0.1", guest.https, context=guest.context, timeout=15)) as client:
+        client.request("REPORT", alias, dav_sync_body(next_token), content_type)
+        with client.getresponse() as response:
+            assert response.status == 207 and response.read()
+        connection = client.sock
+        # Recreate the same grant without making a DAV request in between.
+        expect(change(test, captain, calendar_id, viewer, None))
+        expect(change(test, captain, calendar_id, viewer, "viewer"))
+        client.request("REPORT", alias, dav_sync_body(next_token), content_type)
+        assert client.sock is connection
+        with client.getresponse() as response:
+            assert response.status == 403 and b"valid-sync-token" in response.read()
+        expect(change(test, captain, calendar_id, viewer, "free_busy"))
+        client.request("REPORT", alias, dav_sync_body(next_token), content_type)
+        assert client.sock is connection
+        with client.getresponse() as response:
+            assert response.status == 404 and not response.read()
+        assert dav_busy(guest, alias)
+    expect(change(test, captain, calendar_id, viewer, "viewer"))
+    checkpoint, full = dav_sync(guest, alias)
+    assert set(full) == {alias + uid + ".ics" for uid in current}
+    for revision in range(5):
+        store("edit", label=f"revision {revision}", expected=204)
+        dav_sync(guest, alias)
+    dav_sync(guest, alias, checkpoint, expected=403)
+    _, full = dav_sync(guest, alias)
+    assert set(full) == {alias + uid + ".ics" for uid in current}
+    for user in (viewer, colleague):
+        expect(change(test, captain, calendar_id, user, None))
+    assert owner_dav.request("DELETE", canonical)[0] == 204
+    print("Verified shared CalDAV sync deltas, private-event isolation, scoped checkpoints, pruning, and revoke/regrant on a live TLS connection.")
 
 
 def verify_dav_recurrence_query(test, owner, viewer):
@@ -917,6 +1033,7 @@ def main():
             legacy.commit()
         test = Fixture(args.binary.resolve(strict=True), directory, staging=True)
         test.env.update(SMTP_HOSTNAME="127.0.0.1", CALDAV_PUBLIC_SSL_PORT=test.env["CALDAV_SSL_PORT"])
+        test.env["CALDAV_MAX_SYNC_HISTORY"] = "4"
         test.env.update(SMTP_CLAMAV_TRANSPORT=f"tcp:127.0.0.1:{scan.server_address[1]}",
                         SMTP_CLAMAV_FAIL_MODE="closed", SMTP_CLAMAV_TIMEOUT_MS="8000")
         with test.daemon(), closing(sqlite3.connect(directory / "smtp.db")) as db:
@@ -927,9 +1044,19 @@ def main():
             verify_dav_editors(test, scan, owner, viewer, foreign, calendar_id)
             alias = verify_dav_discovery(test, owner, viewer, colleague, foreign, calendar_id,
                                          args.vdirsyncer.resolve(strict=True) if args.vdirsyncer else None)
+            verify_shared_dav_sync(test, owner, viewer, colleague, foreign)
             verify_dav_recurrence_query(test, owner, viewer)
             verify_dav_advanced_recurrence(test, owner, viewer)
             verify_availability(test, owner, viewer)
+            old_token, _ = dav_sync(DavClient(test, viewer), alias)
+
+        # Reopen with the grant table shape that predates shared sync epochs.
+        with closing(sqlite3.connect(directory / "smtp.db")) as legacy:
+            legacy.executescript("""
+                DROP TRIGGER mail_calendar_grant_epoch_insert;
+                DROP TRIGGER mail_calendar_grant_epoch_update;
+                DROP TABLE mail_team_calendar_share_epochs;
+            """)
 
         with test.daemon():
             invited = test.login(viewer)
@@ -941,6 +1068,9 @@ def main():
             assert dav_busy(guest, path)
             assert guest.request("GET", path + "/Roadmap.ics")[0] == 200
             assert guest.request("GET", alias + "Roadmap.ics")[0] == 200
+            dav_sync(guest, alias, old_token, expected=403)
+            _, recovered = dav_sync(guest, alias)
+            assert list(recovered) == [alias + "Roadmap.ics"]
             assert guest.request("GET", path + "/Budget.ics")[0] == 404
             deleted = DavClient(test, owner).request("DELETE", path)
             assert deleted[0] == 204, deleted

@@ -877,7 +877,12 @@ pub const CalDavSession = struct {
             for (shares) |*item| {
                 var scratch: [2048]u8 = undefined;
                 const display_name = percentDecodeOnce(item.name, &scratch) orelse item.name;
-                try self.appendDavCollection(&buf, a, user, &item.id, .event, null, null, .{ .editable = item.editable, .display_name = display_name, .alias = true });
+                try self.appendDavCollection(&buf, a, user, &item.id, .event, null, null, .{
+                    .editable = item.editable,
+                    .display_name = display_name,
+                    .alias = true,
+                    .supports_sync = self.store.config.enable_sync_tokens,
+                });
             }
         }
         try buf.appendSlice(a, "</D:multistatus>");
@@ -932,6 +937,31 @@ pub const CalDavSession = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const body = httpBody(request);
+        if (method == .propfind and self.store.config.enable_sync_tokens) {
+            const depth = requestHeader(request, "Depth") orelse "0";
+            const sync: ?caldav_store.CalDavStore.DavSharedSync = self.store.snapshotSharedDavSync(a, username, target, if (std.mem.eql(u8, depth, "0")) .version_only else .initial) catch |err| switch (err) {
+                // A large collection can still provide the public ETag listing.
+                error.CalendarExportTooLarge => null,
+                else => return self.sendResourceError(err),
+            };
+            if (sync) |snapshot| {
+                var buf: std.ArrayList(u8) = .empty;
+                try buf.appendSlice(a, dav_multistatus_start);
+                var scratch: [2048]u8 = undefined;
+                const name = percentDecodeOnce(snapshot.name, &scratch) orelse snapshot.name;
+                try self.appendDavCollection(&buf, a, location.user, location.collection, .event, snapshot.report.token, null, .{
+                    .editable = snapshot.editable,
+                    .display_name = name,
+                    .alias = location.shared_alias,
+                    .supports_sync = true,
+                });
+                for (snapshot.report.members) |member| {
+                    try appendDavMemberAt(&buf, a, location.user, location.collection, .event, location.base(), member);
+                }
+                try buf.appendSlice(a, "</D:multistatus>");
+                return self.sendMultistatusResponse(buf.items);
+            }
+        }
         const listing: caldav_store.CalDavStore.SharedDavListing = switch (method) {
             .options => .collection,
             .propfind => if (std.mem.eql(u8, requestHeader(request, "Depth") orelse "0", "0")) .collection else .etags,
@@ -941,6 +971,8 @@ pub const CalDavSession = struct {
                 if (std.mem.eql(u8, root.localName(), "calendar-query")) break :blk .events;
                 if (std.mem.eql(u8, root.localName(), "calendar-multiget"))
                     return self.handleSharedCalendarMultiget(a, username, location, target, xml);
+                if (std.mem.eql(u8, root.localName(), "sync-collection") and self.store.config.enable_sync_tokens)
+                    return self.handleSharedDavSync(a, username, location, target, request, xml);
                 return self.sendError(404, "Not Found");
             },
             else => return self.sendError(404, "Not Found"),
@@ -1148,7 +1180,7 @@ pub const CalDavSession = struct {
         try self.sendMultistatusResponse(buf.items);
     }
 
-    const SharedCollectionProperties = struct { editable: bool, display_name: []const u8, alias: bool };
+    const SharedCollectionProperties = struct { editable: bool, display_name: []const u8, alias: bool, supports_sync: bool = false };
 
     fn appendDavCollection(self: *CalDavSession, buf: *std.ArrayList(u8), a: std.mem.Allocator, username: []const u8, collection: []const u8, kind: caldav_store.SyncChange.ResourceType, token: ?[]const u8, ctag: ?[]const u8, shared: ?SharedCollectionProperties) !void {
         try buf.appendSlice(a, "  <D:response>\n");
@@ -1177,9 +1209,7 @@ pub const CalDavSession = struct {
             .contact => try buf.appendSlice(a, "        <D:supported-report><D:report><CARD:addressbook-query/></D:report></D:supported-report>\n" ++
                 "        <D:supported-report><D:report><CARD:addressbook-multiget/></D:report></D:supported-report>\n"),
         }
-        // The owner journal records private changes. Shared collections expose
-        // only the current list of visible resources and their ETags.
-        if (self.store.config.enable_sync_tokens and token != null) {
+        if (self.store.config.enable_sync_tokens and (token != null or (shared != null and shared.?.supports_sync))) {
             try buf.appendSlice(a, "        <D:supported-report><D:report><D:sync-collection/></D:report></D:supported-report>\n");
         }
         try buf.appendSlice(a, "      </D:supported-report-set>\n");
@@ -1810,11 +1840,39 @@ pub const CalDavSession = struct {
         try self.sendMultistatusResponse(buf.items);
     }
 
+    const SyncOptions = struct { query: caldav_store.DavSyncQuery, limit: usize };
+
+    fn readSyncOptions(request: []const u8, body: []const u8) !SyncOptions {
+        const depth = requestHeader(request, "Depth") orelse "0";
+        if (!std.mem.eql(u8, depth, "0")) return error.InvalidDepth;
+        var rest = body;
+        const token = nextXmlText(&rest, "sync-token") orelse return error.MissingSyncToken;
+        const level = nextXmlText(&rest, "sync-level") orelse return error.MissingSyncLevel;
+        if (!std.mem.eql(u8, level, "1") and !std.mem.eql(u8, level, "infinite")) return error.InvalidSyncLevel;
+        return .{
+            .query = if (token.len == 0) .initial else .{ .after = token },
+            .limit = if (nextXmlText(&rest, "nresults")) |count|
+                std.fmt.parseInt(usize, count, 10) catch return error.InvalidSyncLimit
+            else
+                std.math.maxInt(usize),
+        };
+    }
+
+    fn sendSyncOptionsError(self: *CalDavSession, err: anyerror) !void {
+        const reason = switch (err) {
+            error.InvalidDepth => "Sync REPORT requires Depth: 0",
+            error.MissingSyncToken => "Missing sync-token",
+            error.MissingSyncLevel => "Missing sync-level",
+            error.InvalidSyncLevel => "Invalid sync-level",
+            error.InvalidSyncLimit => "Invalid sync result limit",
+            else => return err,
+        };
+        return self.sendError(400, reason);
+    }
+
     /// Handle sync-collection REPORT on flat calendar and address book collections.
     fn handleSyncCollection(self: *CalDavSession, path: []const u8, request: []const u8, body: []const u8) !void {
         if (!self.store.config.enable_sync_tokens) return self.sendError(501, "Not Implemented");
-        const depth = requestHeader(request, "Depth") orelse "0";
-        if (!std.mem.eql(u8, depth, "0")) return self.sendError(400, "Sync REPORT requires Depth: 0");
         const parsed = parsePath(path);
         const kind: caldav_store.SyncChange.ResourceType = switch (parsed.path_type) {
             .calendar_collection => .event,
@@ -1824,29 +1882,33 @@ pub const CalDavSession = struct {
         const user = parsed.user orelse return self.sendError(404, "Not Found");
         const collection = parsed.collection orelse return self.sendError(404, "Not Found");
         const user_id = try self.getUserId();
-
-        var rest = body;
-        const token = nextXmlText(&rest, "sync-token") orelse return self.sendError(400, "Missing sync-token");
-        const level = nextXmlText(&rest, "sync-level") orelse return self.sendError(400, "Missing sync-level");
-        if (!std.mem.eql(u8, level, "1") and !std.mem.eql(u8, level, "infinite")) return self.sendError(400, "Invalid sync-level");
-
-        const limit = if (nextXmlText(&rest, "nresults")) |count|
-            std.fmt.parseInt(usize, count, 10) catch return self.sendError(400, "Invalid sync result limit")
-        else
-            std.math.maxInt(usize);
+        const options = readSyncOptions(request, body) catch |err| return self.sendSyncOptionsError(err);
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const report = self.store.snapshotDavSync(a, user_id, collection, kind, if (token.len == 0) .initial else .{ .after = token }) catch |err| switch (err) {
+        const report = self.store.snapshotDavSync(a, user_id, collection, kind, options.query) catch |err| switch (err) {
             error.InvalidSyncToken => return self.sendDavReportError("403 Forbidden", "valid-sync-token"),
             error.NotFound => return self.sendError(404, "Not Found"),
             else => return err,
         };
-        if (report.members.len > limit) return self.sendDavReportError("507 Insufficient Storage", "number-of-matches-within-limits");
+        return self.sendSyncResponse(a, user, collection, kind, if (kind == .event) "/calendars/" else "/addressbooks/", report, options.limit);
+    }
 
+    fn handleSharedDavSync(self: *CalDavSession, a: std.mem.Allocator, username: []const u8, location: CalendarPath, target: DavCalendarTarget, request: []const u8, body: []const u8) !void {
+        const options = readSyncOptions(request, body) catch |err| return self.sendSyncOptionsError(err);
+        const snapshot = self.store.snapshotSharedDavSync(a, username, target, options.query) catch |err| switch (err) {
+            error.InvalidSyncToken => return self.sendDavReportError("403 Forbidden", "valid-sync-token"),
+            error.CalendarExportTooLarge => return self.sendDavReportError("507 Insufficient Storage", "number-of-matches-within-limits"),
+            else => return self.sendResourceError(err),
+        };
+        return self.sendSyncResponse(a, location.user, location.collection, .event, location.base(), snapshot.report, options.limit);
+    }
+
+    fn sendSyncResponse(self: *CalDavSession, a: std.mem.Allocator, user: []const u8, collection: []const u8, kind: caldav_store.SyncChange.ResourceType, base: []const u8, report: caldav_store.DavSyncReport, limit: usize) !void {
+        if (report.members.len > limit) return self.sendDavReportError("507 Insufficient Storage", "number-of-matches-within-limits");
         var buf: std.ArrayList(u8) = .empty;
         try buf.appendSlice(a, dav_multistatus_start);
-        for (report.members) |member| try appendDavSyncMember(&buf, a, user, collection, kind, member);
+        for (report.members) |member| try appendDavMemberAt(&buf, a, user, collection, kind, base, member);
         try appendXmlEscaped(&buf, a, "  <D:sync-token>", report.token, "</D:sync-token>\n");
         try buf.appendSlice(a, "</D:multistatus>");
         try self.sendMultistatusResponse(buf.items);

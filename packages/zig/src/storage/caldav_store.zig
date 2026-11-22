@@ -26,6 +26,7 @@
 //! ```
 
 const std = @import("std");
+const shared_sync = @import("dav_shared_sync.zig");
 pub const contact_vcard = @import("contact_vcard.zig");
 const io_compat = @import("../core/io_compat.zig");
 const Allocator = std.mem.Allocator;
@@ -288,21 +289,9 @@ pub const SyncReport = struct {
     more_available: bool,
 };
 
-pub const DavSyncQuery = union(enum) {
-    version_only,
-    initial,
-    after: []const u8,
-};
-
-pub const DavSyncMember = struct {
-    uid: []const u8,
-    etag: ?[]const u8,
-};
-
-pub const DavSyncReport = struct {
-    token: []const u8,
-    members: []const DavSyncMember,
-};
+pub const DavSyncQuery = shared_sync.Query;
+pub const DavSyncMember = shared_sync.Member;
+pub const DavSyncReport = shared_sync.Report;
 
 pub const DavCollection = struct {
     name: []const u8,
@@ -405,6 +394,7 @@ pub const CalDavStore = struct {
     // This changes whenever the in-memory journal is rebuilt. Persisted
     // resources can be enumerated again using an empty DAV token.
     dav_sync_epoch: [16]u8,
+    shared_dav_sync: shared_sync.Store,
 
     // ID generators
     next_calendar_id: u64,
@@ -524,6 +514,7 @@ pub const CalDavStore = struct {
             .sync_changes = .empty,
             .current_sync_token = 1,
             .dav_sync_epoch = undefined,
+            .shared_dav_sync = shared_sync.Store.init(allocator),
             .next_calendar_id = 1,
             .next_event_id = 1,
             .next_addressbook_id = 1,
@@ -580,6 +571,7 @@ pub const CalDavStore = struct {
         for (self.user_ids.items) |entry| self.allocator.free(entry.username);
         self.user_ids.deinit(self.allocator);
         self.sync_changes.deinit(self.allocator);
+        self.shared_dav_sync.deinit();
     }
 
     // -------------------------------------------------------------------------
@@ -1288,15 +1280,18 @@ pub const CalDavStore = struct {
         const share_id = calendar.share_id orelse return null;
         const account_tx = request.account_tx orelse return null;
         const grantee_id = request.mailbox_id orelse return null;
+        const source_id = self.mailboxIdLocked(calendar.user_id) orelse return null;
+        const permission = (try teams.calendarAccess(account_tx, grantee_id, source_id, share_id)) orelse return null;
+        return switch (permission) {
+            .editor => .editor,
+            .viewer => .viewer,
+            .free_busy => .free_busy,
+        };
+    }
+
+    fn mailboxIdLocked(self: *Self, user_id: u64) ?i64 {
         for (self.user_ids.items) |owner| {
-            if (owner.user_id != calendar.user_id) continue;
-            const source_id = owner.mailbox_id orelse return null;
-            const permission = (try teams.calendarAccess(account_tx, grantee_id, source_id, share_id)) orelse return null;
-            return switch (permission) {
-                .editor => .editor,
-                .viewer => .viewer,
-                .free_busy => .free_busy,
-            };
+            if (owner.user_id == user_id) return owner.mailbox_id;
         }
         return null;
     }
@@ -1778,6 +1773,43 @@ pub const CalDavStore = struct {
         defer self.mutex.unlock();
         const calendar = self.getCalendarByName(user_id, collection) orelse return .{};
         return self.snapshotDavCalendarLocked(arena, calendar, .events, .owner);
+    }
+
+    pub const DavSharedSync = struct { name: []const u8, editable: bool, report: DavSyncReport };
+
+    pub fn snapshotSharedDavSync(self: *Self, arena: Allocator, username: []const u8, target: DavCalendarTarget, query: DavSyncQuery) !DavSharedSync {
+        const access = try self.beginCalendarAccess(username, .read);
+        defer access.deinit();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const authorized = try self.sharedDavCalendarLocked(access, target, .read);
+        const share_id = authorized.calendar.share_id orelse return error.CalendarNotFound;
+        const tx = access.account_tx orelse return error.CalendarNotFound;
+        const grantee_id = access.mailbox_id orelse return error.CalendarNotFound;
+        const source_id = self.mailboxIdLocked(authorized.calendar.user_id) orelse return error.CalendarNotFound;
+        const epoch = (try teams.calendarGrantEpoch(tx, grantee_id, source_id, share_id)) orelse return error.CalendarNotFound;
+
+        var scope = std.crypto.hash.sha2.Sha256.init(.{});
+        scope.update(std.mem.asBytes(&grantee_id));
+        scope.update(std.mem.asBytes(&source_id));
+        scope.update(&share_id);
+        scope.update(&epoch);
+        scope.update(@tagName(target));
+
+        var members: std.ArrayList(DavSyncMember) = .empty;
+        var bytes: usize = 0;
+        var events = self.events.valueIterator();
+        while (events.next()) |event| {
+            if (event.calendar_id != authorized.calendar.id or !event.shareable) continue;
+            bytes += @sizeOf(DavSyncMember) + event.uid.len + event.etag.len;
+            if (bytes > shared_sync.max_bytes_per_snapshot) return error.CalendarExportTooLarge;
+            try members.append(arena, .{ .uid = try arena.dupe(u8, event.uid), .etag = try arena.dupe(u8, event.etag) });
+        }
+        return .{
+            .name = try arena.dupe(u8, authorized.calendar.name),
+            .editable = authorized.permission == .editor,
+            .report = try self.shared_dav_sync.snapshot(arena, scope.finalResult(), members.items, query, self.config.max_sync_history),
+        };
     }
 
     fn snapshotDavCalendarLocked(self: *Self, arena: Allocator, calendar: Calendar, listing: SharedDavListing, visibility: enum { owner, shared }) !DavCalendarSnapshot {
