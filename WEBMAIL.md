@@ -144,7 +144,11 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   The reader shows the organizer, the supplied time zone or all-day dates,
   and the original date of a changed occurrence. It shows **Verified sender**
   when the verified author of the message matches the organizer's address.
-  These are read-only previews. Named calendar attachments remain downloadable.
+  Named calendar attachments remain downloadable.
+- When the verified organizer invited your mailbox, choose **Accept**,
+  **Tentative**, or **Decline** to email a response. The invitation shows
+  delivery status and lets you retry a failed response. Check Outbox for
+  delivery details. Use Calendar to add or edit the event itself.
 - Choose **Create event from email** in an open message to start a Calendar
   event with the subject as its title. Edit the title and choose the dates
   before saving. The owner can choose **Open source email** in the saved
@@ -159,6 +163,12 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   sequence, DTSTAMP, and any original occurrence. Wall times are supplied as
   seconds on the organizer's clock with a separate time zone label. Preview
   reads leave calendar resources and outgoing mail untouched.
+- For entries with a corresponding `calendar_rsvps` action, send
+  `POST /webmail/api/calendar-rsvp` with the message ETag in `If-Match`
+  and the message `reference`, invitation `index`, and `response`
+  (`accepted`, `tentative`, or `declined`) in JSON. Use the current
+  `previousSendId` to change a response to the same revision or retry a
+  definite failure. The response includes the decision and Outbox state.
 - `GET /webmail/api/calendar-event-source?reference=…` reads the subject of
   an owned message. Send its reference as `X-Webmail-Source-Message` when
   creating an event in a calendar you own. An owner's event detail includes

@@ -9,7 +9,7 @@
 <body>
 <script client>
 import { mailFolderIcon, senderAddress, senderInitials } from '../functions/mail-utils'
-import { invitationLabel, invitationTime } from '../functions/mail-invitations'
+import { invitationLabel, invitationRevision, invitationResponses, invitationTime, rsvpLabel } from '../functions/mail-invitations'
 import { useWebmail } from '../functions/use-webmail'
 import { useServiceHealth } from '../functions/use-service-health'
 import { reminderDayLink, useCalendarReminders } from '../functions/use-calendar-reminders'
@@ -83,6 +83,7 @@ const {
   refresh, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread,
   toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, retryReader, closeReader, bulkAction, selectedAction,
   nextUnread, readSelection, advanceBatch, triageAndNext, showShortcuts, closeShortcuts, handleShortcut, createEventLink,
+  canRespondToInvitation, respondToInvitation, rsvpBusy, rsvpError,
   undoLastAction, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments,
   saveSendPreference, send, confirmPendingSend, showOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword,
   showConfirmation, confirmAction, saveDraftCopy, resume, tick, preventUnload,
@@ -437,6 +438,17 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
                 <div :if="invite.occurrence"><dt :text="invite.this_and_future ? 'This and later occurrences' : 'Original occurrence'"></dt><dd :text="invitationTime(invite.occurrence)"></dd></div>
                 <div :if="invite.location"><dt>Location</dt><dd :text="invite.location"></dd></div>
               </dl>
+              <div :if="selected.calendar_rsvps?.[index]" class="wm-invitation-rsvp">
+                <p :if="selected.calendar_rsvps[index]?.status" role="status" :text="rsvpLabel(invite, selected.calendar_rsvps[index].status)"></p>
+                <div class="wm-invitation-responses" role="group" aria-label="RSVP to organizer">
+                  <button :for="option in invitationResponses" :key="option.value" type="button" class="wm-action"
+                    @click="respondToInvitation(index, option.value)" :disabled="rsvpBusy || readingLoading || !canRespondToInvitation(index, option.value)"
+                    :aria-pressed="selected.calendar_rsvps[index]?.status && invitationRevision(invite, selected.calendar_rsvps[index].status) === 0 ? selected.calendar_rsvps[index].status.decision.response === option.value : null">
+                    <span class="mail-icon" :data-icon="option.icon" aria-hidden="true"></span><span :text="option.label"></span>
+                  </button>
+                </div>
+                <div :if="rsvpError?.index === index" class="wm-inline-error" role="alert"><span :text="rsvpError.message"></span><button type="button" class="wm-action" @click="retryReader()">Refresh invitation</button></div>
+              </div>
             </article>
           </section>
           <div class="wm-read-attach"><a :for="(attachment, index) in (selected?.attachments || [])" class="wm-attach-chip" :href="attachmentPath(index)" :download="attachment.filename"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span><span :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></span><span class="mail-icon wm-attachment-download" data-icon="download" aria-hidden="true"></span></a></div>
@@ -531,7 +543,8 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         <div :if="['pending', 'failed', 'partial', 'cancelled', 'unknown', 'sent_unfiled'].includes(item.state)" class="wm-outbox-actions">
           <button :if="item.state === 'pending' && item.dueAt > now && item.scheduled" class="wm-action" @click="cancelSend(item.id, true)" :disabled="cancelling"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span>Edit scheduled send</button>
           <button :if="item.state === 'pending' && item.dueAt > now" class="wm-action" @click="cancelSend(item.id)" :disabled="cancelling" :text="item.scheduled ? 'Cancel scheduled send' : 'Undo Send'"></button>
-          <button :if="['failed', 'partial', 'unknown'].includes(item.state) || (item.state === 'cancelled' && !item.scheduled)" class="wm-action" @click="retryOutbox(item.id)">Review and retry</button>
+          <p :if="item.calendarRsvp && ['failed', 'cancelled'].includes(item.state)">Open the invitation to retry this RSVP.</p>
+          <button :if="!item.calendarRsvp && (['failed', 'partial', 'unknown'].includes(item.state) || (item.state === 'cancelled' && !item.scheduled))" class="wm-action" @click="retryOutbox(item.id)">Review and retry</button>
           <button :if="item.state === 'unknown' || item.state === 'sent_unfiled'" class="wm-action" @click="selectFolder('Sent')"><span class="mail-icon" data-icon="send" aria-hidden="true"></span>Check Sent</button>
         </div>
       </article>

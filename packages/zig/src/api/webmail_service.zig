@@ -11,6 +11,7 @@ const fs = @import("../core/fs_compat.zig");
 const time = @import("../core/time_compat.zig");
 const mutex = @import("../core/mutex_compat.zig");
 const maildir = @import("webmail_maildir.zig");
+const calendar_invite = @import("webmail_calendar_invite.zig");
 const compose = @import("webmail_compose.zig");
 const store = @import("webmail_store.zig");
 const message_refs = @import("../storage/message_refs.zig");
@@ -96,6 +97,24 @@ pub const Outbox = struct {
     request_hash: ?[]const u8 = null,
     reply_cutoff_ms: i64 = 0,
     dispatch: ?compose.OutboxDispatch = null,
+    calendarReply: ?struct { key: []const u8, attendee: []const u8, body: []const u8 } = null,
+};
+
+const RsvpDecision = struct {
+    sequence: u32,
+    dtstamp: i64,
+    response: calendar_invite.Response,
+    sendId: []const u8,
+};
+
+pub const RsvpStatus = struct {
+    decision: RsvpDecision,
+    state: []const u8,
+
+    fn read(a: std.mem.Allocator, row: store.Record) !RsvpStatus {
+        const decision = try std.json.parseFromSliceLeaky(RsvpDecision, a, row.payload, .{});
+        return .{ .decision = decision, .state = row.state };
+    }
 };
 pub const Limits = struct {
     maxFileBytes: usize,
@@ -485,21 +504,112 @@ pub const Service = struct {
             try self.checkSharedReply(a, user, from, payload);
         }
         var row = store.Record{ .username = user, .kind = "outbox", .id = id, .payload = serialized, .state = "pending", .revision = 0, .due_at = due_at, .expires_at = 0 };
-        if ((try self.db.hostedLimits(user)) != null) {
-            const bytes = @max(1024 * 1024, 2 * self.config.max_message_bytes);
-            store.checkRecordCapacity(self.db, row, bytes, 1024) catch |err| switch (err) {
-                store.StoreError.OutboxStorageLimit => {
-                    try store.sweep(self.db, now, user);
-                    try store.checkRecordCapacity(self.db, row, bytes, 1024);
-                },
-                else => return err,
-            };
-        }
+        try self.checkOutboxCapacity(row, now);
         row.revision = if (payload.sharedReply) |context|
             try store.enqueueShared(self.db, row, payload.draftId.?, payload.draftRevision, context)
         else
             try store.enqueue(self.db, row, payload.draftId, payload.draftRevision);
         return row;
+    }
+
+    fn checkOutboxCapacity(self: *Service, row: store.Record, now: i64) !void {
+        if ((try self.db.hostedLimits(row.username)) != null) {
+            const bytes = @max(1024 * 1024, 2 * self.config.max_message_bytes);
+            store.checkRecordCapacity(self.db, row, bytes, 1024) catch |err| switch (err) {
+                store.StoreError.OutboxStorageLimit => {
+                    try store.sweep(self.db, now, row.username);
+                    try store.checkRecordCapacity(self.db, row, bytes, 1024);
+                },
+                else => return err,
+            };
+        }
+    }
+
+    fn rsvpRecord(self: *Service, a: std.mem.Allocator, user: []const u8, key: []const u8) !?store.Record {
+        return store.get(a, self.db, user, "calendar-rsvp", key) catch |err| switch (err) {
+            store.StoreError.NotFound => null,
+            else => return err,
+        };
+    }
+
+    pub fn rsvpStatus(self: *Service, a: std.mem.Allocator, user: []const u8, invite: calendar_invite.Invitation) !?RsvpStatus {
+        const key = try invite.key(a);
+        const row = (try self.rsvpRecord(a, user, &key)) orelse return null;
+        return try RsvpStatus.read(a, row);
+    }
+
+    pub fn queueRsvp(self: *Service, a: std.mem.Allocator, user: []const u8, attendee: []const u8, invite: calendar_invite.Invitation, response: calendar_invite.Response, previous_id: ?[]const u8, scanner: ?*clamav.ClamAVScanner, now: i64) !RsvpStatus {
+        if (!invite.canReply(attendee)) return error.CalendarReplyUnavailable;
+        const key = try invite.key(a);
+        self.mutations.lock();
+        defer self.mutations.unlock();
+
+        // An optimistic receipt prevents an older tab from reversing a newer
+        // decision. The transaction also guards callers on separate listeners.
+        const previous = try self.rsvpRecord(a, user, &key);
+        if (previous) |entry| {
+            const status = try RsvpStatus.read(a, entry);
+            const order = switch (std.math.order(invite.preview.sequence, status.decision.sequence)) {
+                .eq => std.math.order(invite.preview.dtstamp, status.decision.dtstamp),
+                else => |different| different,
+            };
+            if (order == .lt) return error.CalendarInvitationStale;
+            const acknowledged = if (previous_id) |id| std.mem.eql(u8, id, status.decision.sendId) else false;
+            const retryable = std.mem.eql(u8, status.state, "failed") or std.mem.eql(u8, status.state, "cancelled");
+            if (order == .eq and response == status.decision.response and !(acknowledged and retryable)) return status;
+            if (std.mem.eql(u8, status.state, "pending") or std.mem.eql(u8, status.state, "sending") or std.mem.eql(u8, status.state, "unknown"))
+                return error.CalendarReplyInProgress;
+            if (order == .eq and !acknowledged) return ServiceError.Conflict;
+        }
+
+        const id = try store.newId(a);
+        const body = try invite.reply(a, attendee, response, now);
+        const allowed = try self.limits(user);
+        if (body.len > @min(allowed.maxFileBytes, allowed.maxTotalBytes) or allowed.maxCount == 0)
+            return ServiceError.AttachmentLimit;
+        try clamav.requireAllowed(scanner, body);
+        const label = switch (response) {
+            .accepted => "Accepted",
+            .tentative => "Tentative",
+            .declined => "Declined",
+        };
+        const summary = invite.preview.summary orelse "Calendar invitation";
+        const subject = if (summary.len <= 512 and compose.isSafeHeaderValue(summary))
+            try std.fmt.allocPrint(a, "{s}: {s}", .{ label, summary })
+        else
+            try std.fmt.allocPrint(a, "{s}: Calendar invitation", .{label});
+        const doc: Outbox = .{
+            .message = .{ .to = &.{invite.preview.organizer}, .subject = subject, .text = subject, .sendId = id },
+            .calendarReply = .{ .key = try a.dupe(u8, &key), .attendee = attendee, .body = body },
+        };
+        const msg = try self.outboxMessage(a, doc, user, attendee);
+        const raw = try compose.buildMime(a, msg, now, "<validation@localhost>");
+        if (raw.len > allowed.maxMessageBytes) return ServiceError.AttachmentLimit;
+        const row: store.Record = .{ .username = user, .kind = "outbox", .id = id, .payload = try json(a, doc), .state = "pending", .revision = 0, .due_at = now, .expires_at = 0 };
+        const decision: RsvpDecision = .{ .sequence = invite.preview.sequence, .dtstamp = invite.preview.dtstamp, .response = response, .sendId = id };
+        try self.checkOutboxCapacity(row, now);
+        try store.enqueueCalendarReply(self.db, row, .{
+            .username = user,
+            .kind = "calendar-rsvp",
+            .id = &key,
+            .payload = try json(a, decision),
+            .state = row.state,
+            .revision = if (previous) |entry| entry.revision else 0,
+            .due_at = 0,
+            .expires_at = 0,
+        });
+        return .{ .decision = decision, .state = row.state };
+    }
+
+    fn outboxMessage(self: *Service, a: std.mem.Allocator, doc: Outbox, user: []const u8, from: []const u8) !compose.Message {
+        var message = try self.payloadMessage(a, doc.message, user, from, false);
+        if (doc.calendarReply) |reply| {
+            if (!std.ascii.eqlIgnoreCase(reply.attendee, from) or reply.body.len == 0) return error.CalendarReplyUnavailable;
+            const attachments = try a.alloc(compose.Attachment, 1);
+            attachments[0] = .{ .filename = "reply.ics", .content_type = "text/calendar; method=REPLY; charset=utf-8", .data = reply.body, .inline_part = true };
+            message.attachments = attachments;
+        }
+        return message;
     }
 
     fn checkSharedReply(self: *Service, a: std.mem.Allocator, actor: []const u8, from: []const u8, payload: Payload) !void {
@@ -586,9 +696,12 @@ pub const Service = struct {
         var doc = parsed.value;
         if (try self.reconcileDelivery(a, row.username, &doc)) {
             try self.finishDispatch(a, row, doc, now);
-        } else if (doc.message.sharedReply != null) {
+        } else if (doc.message.sharedReply != null or doc.calendarReply != null) {
             if (doc.dispatch) |dispatch| if (try self.db.hasAcceptedDelivery(dispatch.delivery_id)) return;
-            doc.error_message = "The server restarted before admitting this shared reply. The saved draft can be retried.";
+            doc.error_message = if (doc.calendarReply != null)
+                "The server restarted before sending this RSVP. Retry from the invitation."
+            else
+                "The server restarted before admitting this shared reply. The saved draft can be retried.";
             try self.finishDispatch(a, row, doc, now);
         }
     }
@@ -605,7 +718,7 @@ pub const Service = struct {
             .limit_notice = if (checkpoint.refused_for_limit) "Some recipient mailboxes are full or disabled." else null,
         };
         if (result.delivered > 0) {
-            result.sent_saved = self.reconcileSent(a, user, doc.message, dispatch) catch |err| blk: {
+            result.sent_saved = self.reconcileSent(a, user, doc.*, dispatch) catch |err| blk: {
                 std.log.warn("webmail could not reconcile the Sent copy: {}", .{err});
                 if (result.limit_notice == null and err == error.HostedStorageFull)
                     result.limit_notice = "Message delivered. Your mailbox is full, so a Sent copy could not be saved.";
@@ -616,11 +729,11 @@ pub const Service = struct {
         return true;
     }
 
-    fn reconcileSent(self: *Service, a: std.mem.Allocator, user: []const u8, payload: Payload, dispatch: compose.OutboxDispatch) !bool {
+    fn reconcileSent(self: *Service, a: std.mem.Allocator, user: []const u8, doc: Outbox, dispatch: compose.OutboxDispatch) !bool {
         if (try self.db.hasFiledDelivery(dispatch.sent_delivery_id)) return true;
         var account = try self.db.getUserByUsername(user);
         defer account.deinit(self.db.allocator);
-        const message = try self.payloadMessage(a, payload, user, dispatch.from_address orelse account.email, false);
+        const message = try self.outboxMessage(a, doc, user, dispatch.from_address orelse account.email);
         return compose.recoverSent(a, message, self.sendConfig(user), dispatch);
     }
 
@@ -644,6 +757,9 @@ pub const Service = struct {
             retained.request_hash = try sendFingerprint(a, doc.message);
             retained.message = .{ .subject = doc.message.subject, .to = doc.message.to, .senderId = doc.message.senderId };
         }
+        if (!std.mem.eql(u8, row.state, "unknown")) {
+            if (retained.calendarReply) |*reply| reply.body = "";
+        }
         row.payload = try json(a, retained);
         row.expires_at = now + store.terminal_retention;
         row.revision = try store.put(self.db, row.*, row.revision);
@@ -657,6 +773,7 @@ pub const Service = struct {
         if (!std.mem.eql(u8, row.state, "unknown")) return ServiceError.Conflict;
         const doc = try std.json.parseFromSlice(Outbox, a, row.payload, .{ .ignore_unknown_fields = true });
         defer doc.deinit();
+        if (doc.value.calendarReply != null) return ServiceError.Conflict;
         if (doc.value.result == null) if (doc.value.dispatch) |dispatch| {
             // Never offer the original envelope when a durable acceptance
             // still needs to be reconciled.
@@ -689,7 +806,7 @@ pub const Service = struct {
         const delegated_id = try doc.message.delegatedSender();
         const from = try self.sendAddress(a, user, account.email, delegated_id);
         try self.checkSharedReply(a, user, from, doc.message);
-        const msg = try self.payloadMessage(a, doc.message, user, from, false);
+        const msg = try self.outboxMessage(a, doc.*, user, from);
         // Recovery files Sent with the address used at admission, even after
         // a grant is revoked or the shared mailbox changes its address.
         doc.dispatch.?.from_address = try a.dupe(u8, from);

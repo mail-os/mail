@@ -2,6 +2,8 @@ import type { PrivateCollection, AttachmentPage, IndexProgress, LibraryAttachmen
 import { batch, derived, effect, state } from '@stacksjs/stx'
 import { createMailApi, MailApiError } from './mail-api'
 import { mailEventLink, takeMailEventLink } from './mail-event-link'
+import type { InvitationResponse, InvitationRsvp } from './mail-invitations'
+import { invitationRevision, rsvpPending } from './mail-invitations'
 import { attentionViews, deadlineLabel, localDateInput, localDeadline } from './mail-attention'
 import { captureListViewport, isShortcutEvent, messageIdentity, messagePageSize, restoreListViewport, triageShortcuts } from './mail-triage'
 import { receiptExcerpt, renderMailReader } from './mail-reader'
@@ -57,6 +59,8 @@ export function useWebmail(ports: WebmailPorts) {
   const threads = state<Conversation[]>([])
   const expandedThreads = state<string[]>([])
   const selected = state<MessageDetail | null>(null)
+  const rsvpBusy = state(false)
+  const rsvpError = state<{ index: number, message: string } | null>(null)
   const loading = state(false)
   const refreshing = state(false)
   const listError = state('')
@@ -208,6 +212,8 @@ export function useWebmail(ports: WebmailPorts) {
   let clockOffset = 0
   let lastRefresh = 0
   let lastOutboxPoll = 0
+  let lastRsvpPoll = 0
+  let pollingRsvp = false
   let pollingOutbox = false
   let outboxRequest = 0
   let senderRequest = 0
@@ -380,6 +386,66 @@ export function useWebmail(ports: WebmailPorts) {
     if (!limits().calendarAvailable || !message?.reference || !account || message.folder === 'Drafts' || senderReview.senderReviewOpen()) return null
     return mailEventLink('/calendar', account, message.reference)
   }
+  function canRespondToInvitation(index: number, response: InvitationResponse): boolean {
+    const message = selected()
+    const invite = message?.calendar_invites?.[index]
+    const action = message?.calendar_rsvps?.[index]
+    if (!invite || !action) return false
+    const status = action.status
+    if (!status) return true
+    if (rsvpPending(status) || status.state === 'unknown') return false
+    const revision = invitationRevision(invite, status)
+    if (revision < 0) return false
+    const delivered = status.state === 'sent' || status.state === 'sent_unfiled'
+    return revision > 0 || !delivered || response !== status.decision.response
+  }
+  async function respondToInvitation(index: number, response: InvitationResponse): Promise<void> {
+    const message = selected()
+    if (!message?.reference || !message.revision || rsvpBusy() || readingLoading() || !canRespondToInvitation(index, response)) return
+    const request = messageRequest
+    rsvpBusy.set(true)
+    rsvpError.set(null)
+    try {
+      const status = await api<InvitationRsvp>('/webmail/api/calendar-rsvp', {
+        method: 'POST',
+        headers: { 'If-Match': message.revision },
+        body: JSON.stringify({ reference: message.reference, index, response, previousSendId: message.calendar_rsvps?.[index]?.status?.decision.sendId }),
+      })
+      const current = selected()
+      if (!destroyed && request === messageRequest && current?.calendar_rsvps) {
+        const actions = [...current.calendar_rsvps]
+        actions[index] = { status }
+        selected.set({ ...current, calendar_rsvps: actions })
+      }
+      void refreshOutbox(true)
+    }
+    catch (cause) {
+      if (request === messageRequest) rsvpError.set({ index, message: errorMessage(cause) })
+    }
+    finally { rsvpBusy.set(false) }
+  }
+  async function pollInvitationReplies(): Promise<void> {
+    const actions = selected()?.calendar_rsvps
+    if (!actions?.some(action => rsvpPending(action?.status)) || pollingRsvp || Date.now() - lastRsvpPoll < 2000) return
+    const request = messageRequest
+    pollingRsvp = true
+    lastRsvpPoll = Date.now()
+    try {
+      const updated = await Promise.all(actions.map(async (action) => {
+        const status = action?.status
+        if (!status || !rsvpPending(status)) return action
+        const item = await api<OutboxItem>(`/webmail/api/outbox/${encodeURIComponent(status.decision.sendId)}`)
+        return { status: { ...status, state: item.state } }
+      }))
+      const current = selected()
+      if (!destroyed && request === messageRequest && current?.calendar_rsvps === actions) {
+        selected.set({ ...current, calendar_rsvps: updated })
+        if (!updated.some(action => rsvpPending(action?.status))) void refreshOutbox(true)
+      }
+    }
+    catch { /* Leave the last known state visible and poll again. */ }
+    finally { pollingRsvp = false }
+  }
   function displaySubject(message: Pick<MessageSummary, 'subject' | 'personal_subject'> | null): string {
     return message?.personal_subject || message?.subject || '(no subject)'
   }
@@ -414,6 +480,7 @@ export function useWebmail(ports: WebmailPorts) {
     reading.set(false)
     readingLoading.set(false)
     readerError.set('')
+    rsvpError.set(null)
     readerTarget.set(null)
     retryReading = null
     followUpFocused.set(false)
@@ -700,6 +767,7 @@ export function useWebmail(ports: WebmailPorts) {
     readerTarget.set(message)
     retryReading = null
     readerError.set('')
+    rsvpError.set(null)
     readingLoading.set(true)
     try {
       if (requireRevision && (!message.reference || !message.revision)) throw new Error('Refresh the attachment list and open the message again.')
@@ -1531,6 +1599,7 @@ export function useWebmail(ports: WebmailPorts) {
     try {
       if (hasComposition()) await draft.flushAll()
       let item = await api<OutboxItem>(`/webmail/api/outbox/${id}`)
+      if (item.calendarRsvp) throw new Error('Open the invitation to retry this RSVP.')
       if (!['failed', 'partial', 'cancelled', 'unknown'].includes(item.state)) throw new Error('This message is already queued or delivered.')
       if (item.scheduled && item.state === 'cancelled') throw new Error('This schedule was cancelled. Edit its saved draft to send it again.')
       if (item.state === 'unknown') {
@@ -1684,6 +1753,7 @@ export function useWebmail(ports: WebmailPorts) {
     now.set(Date.now() / 1000 + clockOffset)
     if (undoAction() && undoRemaining() <= 0) undoAction.set(null)
     if (!user() || authExpired()) return
+    void pollInvitationReplies()
     const pending = (item: OutboxSummary | null) => item?.state === 'sending' || (item?.state === 'pending' && item.dueAt <= now() + 2)
     const pollDelay = outbox().some(pending) || pending(pendingSend()) ? 1000 : outboxView() ? 10000 : 30000
     if (Date.now() - lastOutboxPoll >= pollDelay) void refreshOutbox()
@@ -1694,7 +1764,7 @@ export function useWebmail(ports: WebmailPorts) {
   function preventUnload(event: BeforeUnloadEvent): void { if (hasUnsavedChanges()) { event.preventDefault(); event.returnValue = '' } }
   function destroy(): void { destroyed = true; ++listRequest; ++messageRequest; recipientEditor.destroy(); attachmentEditor.destroy(); draft.destroy(); privateMail.closePrivate(); contactBook.closeContacts(); selectionEffect() }
   return { user, folders, folder, messages, threads, expandedThreads, selected, loading, refreshing, listError, readerError, readerTarget, reading, readingLoading, mutating, error, notice, query, activeQuery, appliedSearchAll, filterLocation, filterSender, filterRecipient, filterFilename, libraryView, libraryFiles, indexProgress, filterAfter, filterBefore, filterStatus, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, formattedReader, remoteImagesAllowed, checked, checkedKeys, selectedCount, isJunkFolder, readerJunkAction, selectionJunkAction, allChecked, someChecked, undoAction, undoRemaining, readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts, pendingSend, sendRemaining, outbox, outboxCount, outboxCounts, outboxSection, outboxViews, outboxEmpty, outboxPageNumber, outboxNext, outboxLoading, outboxError, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, sharedReply, senderId, senderIdentities, missingSender, senderStatus, chooseSender, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...senderReview, ...notifications, ...privateMail, ...contactBook, showContacts, composeSavedCard, collectionView, collectionId, canOpenPrivate,
-    createEventLink,
+    createEventLink, canRespondToInvitation, respondToInvitation, rsvpBusy, rsvpError,
     showCollectionManager, closeCollectionManager, selectCollection, confirmCollectionDeletion, savePrivateLabel, setPrivateMembership, groupSelected, displaySubject, changeNotificationRule, ...recipientEditor, ...attachmentEditor, ...recoverySettings, ...forwardingSettings, ...vacationSettings, ...writing, snippetChoice, signatureChoice, insertSnippet, insertSignature, attentionViews, attentionView, followUpFocused, attentionSaving, attentionSchedule, attentionDate, attentionZone, dueReminders, replyContext, clearFollowUp, selectAttention, nextFollowUp, changeAttention, startAttentionSchedule, saveAttentionSchedule, deadlineLabel, categoryList, newsletterExpanded, readerExpanded, receiptFull, receiptCompact, receiptPreview, senderLabel, sortingSettings, sortingSaving, sortingError, toggleAutomaticSorting, placementText, categoryRule, categoryRuleSaving, saveCategoryRule, showSenderReview, openReviewMessage, reviewMessage, refresh, loadMessages, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread, toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, openAttachmentMessage, showAttachmentLibrary, retryReader, closeReader, nextUnread, readSelection, advanceBatch, triageAndNext, bulkAction, selectedAction, undoLastAction, showShortcuts, closeShortcuts, handleShortcut, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments, saveSendPreference, send, confirmPendingSend, showOutbox, refreshOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword, showConfirmation, confirmAction, saveDraftCopy: draft.saveCopy, mount, resume, tick, preventUnload, destroy, messageIdentity, messagePageSize, folderName, shortDate, fullDate, readableBytes, attachmentPath }
 }
 

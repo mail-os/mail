@@ -573,6 +573,7 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.eql(u8, p, "/webmail/api/calendar-reminders/dismiss") and std.mem.eql(u8, req.method, "POST")) return handleReminderDismiss(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-events") and std.mem.eql(u8, req.method, "GET")) return handleCalendarEvents(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-event-source") and std.mem.eql(u8, req.method, "GET")) return handleCalendarEventSource(server, conn, arena, req);
+    if (std.mem.eql(u8, p, "/webmail/api/calendar-rsvp") and std.mem.eql(u8, req.method, "POST")) return handleCalendarRsvp(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-events") and std.mem.eql(u8, req.method, "POST")) return handleCalendarEventCreate(server, conn, arena, req);
     if (std.mem.startsWith(u8, p, "/webmail/api/calendar-events/")) return handleCalendarEventItem(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-export") and std.mem.eql(u8, req.method, "GET")) return handleCalendarExport(server, conn, arena, req);
@@ -1913,7 +1914,7 @@ fn handleUndo(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.
 fn outboxJson(arena: std.mem.Allocator, row: store.Record) ![]const u8 {
     const parsed = try std.json.parseFromSlice(service_mod.Outbox, arena, row.payload, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    return service_mod.json(arena, .{ .id = row.id, .state = row.state, .dueAt = row.due_at, .serverTime = time_compat.timestamp(), .scheduled = parsed.value.scheduled or parsed.value.message.scheduleAt != null, .message = parsed.value.message, .result = parsed.value.result, .@"error" = parsed.value.error_message });
+    return service_mod.json(arena, .{ .id = row.id, .state = row.state, .dueAt = row.due_at, .serverTime = time_compat.timestamp(), .scheduled = parsed.value.scheduled or parsed.value.message.scheduleAt != null, .calendarRsvp = parsed.value.calendarReply != null, .message = parsed.value.message, .result = parsed.value.result, .@"error" = parsed.value.error_message });
 }
 
 fn handleCalendars(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
@@ -3133,6 +3134,45 @@ fn messageReference(path: []const u8) ?[]const u8 {
     return path[message_ref_prefix.len..];
 }
 
+fn canRsvpToMessage(server: *WebmailHttpServer, msg: maildir.MessageDetail) bool {
+    return maildir.isPersonalFolder(msg.folder) and !msg.flags.deleted and
+        !std.ascii.eqlIgnoreCase(msg.folder, server.service.junkFolder()) and !std.ascii.eqlIgnoreCase(msg.folder, "Trash");
+}
+
+const InvitationAction = struct { status: ?service_mod.RsvpStatus };
+
+fn handleCalendarRsvp(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    if (!isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, a, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const expected = req.header("If-Match") orelse return sendError(conn, a, 428, "revision_required", "Open the invitation before sending a response.");
+    if (!isSingleStrongRevision(expected)) return sendError(conn, a, 400, "invalid_revision", "Send one strong message ETag in If-Match");
+    const request = std.json.parseFromSliceLeaky(struct {
+        reference: []const u8,
+        index: usize,
+        response: calendar_invite.Response,
+        previousSendId: ?[]const u8 = null,
+    }, a, req.body, .{}) catch return sendError(conn, a, 400, "bad_request", "Invalid RSVP");
+    if (!message_refs.valid(request.reference) or request.index >= calendar_invite.max_previews)
+        return sendError(conn, a, 400, "bad_request", "Invalid invitation reference");
+    if (request.previousSendId) |id| if (!store.validId(id))
+        return sendError(conn, a, 400, "bad_request", "Invalid RSVP receipt");
+    const msg = maildir.getByReference(a, server.db, sess.username, request.reference) catch |err| return mapMaildirError(conn, a, err);
+    if (!std.mem.eql(u8, msg.version.?.revision, expected)) return mapMaildirError(conn, a, error.RevisionMismatch);
+    if (!canRsvpToMessage(server, msg)) return sendError(conn, a, 403, "rsvp_unavailable", "Open the invitation in a personal mailbox to respond.");
+    const placement = try message_refs.placement(a, server.db, sess.username, request.reference);
+    const invitations = try calendar_invite.invitations(a, msg.calendar_parts, sess.email, if (placement) |source| source.verified_author else "");
+    if (request.index >= invitations.len) return sendError(conn, a, 404, "invitation_not_found", "No such calendar invitation in this message.");
+    const status = server.service.queueRsvp(a, sess.username, sess.email, invitations[request.index], request.response, request.previousSendId, server.config.scanner, time_compat.timestamp()) catch |err| switch (err) {
+        error.CalendarReplyUnavailable => return sendError(conn, a, 403, "rsvp_unavailable", "RSVP requires a verified organizer and an invitation addressed to this account."),
+        error.CalendarInvitationStale => return sendError(conn, a, 409, "invitation_stale", "A response already exists for a newer version of this invitation."),
+        error.CalendarReplyInProgress => return sendError(conn, a, 409, "rsvp_in_progress", "Check the previous response's delivery in Outbox before sending another."),
+        error.CalendarReplyTimezone => return sendError(conn, a, 422, "invitation_timezone", "This occurrence's time zone could not be verified."),
+        else => return mapServiceError(conn, a, err),
+    };
+    return sendJson(conn, a, 200, try service_mod.json(a, status), null);
+}
+
 fn handleMessageDetail(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
     var sess = (try requireSession(server, conn, arena, req)) orelse return;
     defer sess.deinit(server.allocator);
@@ -3157,8 +3197,17 @@ fn handleMessageDetail(server: *WebmailHttpServer, conn: *webmail_tls.Stream, ar
     const author = if (placement) |value| value.verified_author else "";
     const keys = try service_mod.json(arena, try ids.keys(arena));
     const notifications = try server.db.browserNotificationRules(sess.username, msg.version.?.reference, keys, author);
-    const invitations = try calendar_invite.previews(arena, msg.calendar_parts, sess.username, author);
-    try writeMessageDetail(w, msg, placement, rule, workflow.status(msg.version.?.reference, "", "", "", ids), notifications, invitations, arena);
+    const invitations = try calendar_invite.invitations(arena, msg.calendar_parts, sess.email, author);
+    const previews = try arena.alloc(calendar_invite.Preview, invitations.len);
+    const actions = try arena.alloc(?InvitationAction, invitations.len);
+    for (invitations, previews, actions) |invite, *preview, *action| {
+        preview.* = invite.preview;
+        action.* = if (canRsvpToMessage(server, msg) and invite.canReply(sess.email))
+            .{ .status = try server.service.rsvpStatus(arena, sess.username, invite) }
+        else
+            null;
+    }
+    try writeMessageDetail(w, msg, placement, rule, workflow.status(msg.version.?.reference, "", "", "", ids), notifications, previews, actions, arena);
     try sendRevisionJson(conn, arena, 200, body.items, null, msg.version.?.revision);
 }
 
@@ -3329,7 +3378,7 @@ fn writeMessageSummary(w: anytype, m: maildir.MessageSummary, version: ?maildir.
     try w.writeAll("}");
 }
 
-fn writeMessageDetail(w: anytype, m: maildir.MessageDetail, placement: ?message_refs.Placement, rule: ?categories.Destination, workflow: attention.Status, notifications: database.Database.NotificationRules, invitations: []const calendar_invite.Preview, a: std.mem.Allocator) !void {
+fn writeMessageDetail(w: anytype, m: maildir.MessageDetail, placement: ?message_refs.Placement, rule: ?categories.Destination, workflow: attention.Status, notifications: database.Database.NotificationRules, invitations: []const calendar_invite.Preview, rsvps: []const ?InvitationAction, a: std.mem.Allocator) !void {
     try w.print("{{\"uid\":{d},\"from\":", .{m.uid});
     try writeJsonString(w, m.from);
     try w.writeAll(",\"folder\":");
@@ -3378,6 +3427,8 @@ fn writeMessageDetail(w: anytype, m: maildir.MessageDetail, placement: ?message_
     if (invitations.len != 0) {
         try w.writeAll(",\"calendar_invites\":");
         try w.writeAll(try service_mod.json(a, invitations));
+        try w.writeAll(",\"calendar_rsvps\":");
+        try w.writeAll(try service_mod.json(a, rsvps));
         if (m.calendar_only) try w.writeAll(",\"calendar_only\":true");
     }
     if (placement) |source| {

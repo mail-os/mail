@@ -7,7 +7,7 @@ const clock = @import("../protocol/icalendar_time.zig");
 const Allocator = std.mem.Allocator;
 pub const max_part_bytes = 128 * 1024;
 pub const max_parts = 8;
-const max_previews = 32;
+pub const max_previews = 32;
 
 pub const Method = enum {
     request,
@@ -56,6 +56,102 @@ pub const Preview = struct {
     end: ?WallTime,
 };
 
+pub const Response = enum {
+    accepted,
+    tentative,
+    declined,
+
+    fn partstat(self: Response) []const u8 {
+        return switch (self) {
+            .accepted => "ACCEPTED",
+            .tentative => "TENTATIVE",
+            .declined => "DECLINED",
+        };
+    }
+};
+
+pub const Invitation = struct {
+    preview: Preview,
+    components: []const ical.Component,
+    recurrence: ?ical.Property,
+
+    pub fn canReply(self: Invitation, attendee: []const u8) bool {
+        return self.preview.method == .request and self.preview.organizer_verified and self.preview.for_mailbox and
+            !self.preview.this_and_future and submission.validMailbox(attendee) and !equal(attendee, self.preview.organizer);
+    }
+
+    pub fn key(self: Invitation, a: Allocator) ![64]u8 {
+        const material = try std.json.Stringify.valueAlloc(a, .{
+            .organizer = try std.ascii.allocLowerString(a, self.preview.organizer),
+            .uid = self.preview.uid,
+            .occurrence = self.preview.occurrence,
+        }, .{});
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(material, &digest, .{});
+        return std.fmt.bytesToHex(digest, .lower);
+    }
+
+    pub fn reply(self: Invitation, a: Allocator, attendee: []const u8, response: Response, now: i64) ![]const u8 {
+        if (!self.canReply(attendee)) return error.CalendarReplyUnavailable;
+        var occurrence_line: ?[]const u8 = null;
+        var zone: ?ical.Component = null;
+        if (self.recurrence) |property| {
+            const occurrence = self.preview.occurrence.?;
+            if (property.param("TZID")) |name| {
+                if (std.mem.indexOfScalar(u8, name, '"') != null) return error.CalendarReplyTimezone;
+                for (self.components) |component| {
+                    if (!equal(component.name, "VTIMEZONE")) continue;
+                    const id = (try ical.componentText(a, component, "TZID")) orelse continue;
+                    if (!std.mem.eql(u8, name, id)) continue;
+                    if (zone != null) return error.CalendarReplyTimezone;
+                    zone = component;
+                }
+                if (zone == null) {
+                    if (clock.bundledTimezone(name)) |body| zone = .{ .name = "VTIMEZONE", .bytes = body };
+                }
+                if (zone) |definition| {
+                    _ = clock.Zone.parse(a, definition) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => return error.CalendarReplyTimezone,
+                    };
+                    occurrence_line = try std.fmt.allocPrint(a, "RECURRENCE-ID;TZID=\"{s}\":{s}", .{ name, property.value });
+                } else if (equal(name, "UTC")) {
+                    occurrence_line = try std.fmt.allocPrint(a, "RECURRENCE-ID:{s}Z", .{property.value});
+                } else return error.CalendarReplyTimezone;
+            } else {
+                occurrence_line = try std.fmt.allocPrint(a, "RECURRENCE-ID{s}:{s}", .{ if (occurrence.all_day) ";VALUE=DATE" else "", property.value });
+            }
+        }
+        return ical.schedulingReply(a, .{
+            .uid = self.preview.uid,
+            .stamp = now,
+            .sequence = self.preview.sequence,
+            .organizer_uri = try addressUri(a, self.preview.organizer),
+            .attendee_uri = try addressUri(a, attendee),
+            .participation = response.partstat(),
+            .occurrence_line = occurrence_line,
+            .timezone = zone,
+        }) catch |err| switch (err) {
+            error.InvalidCalendar => error.CalendarReplyTimezone,
+            else => return err,
+        };
+    }
+};
+
+fn addressUri(a: Allocator, address: []const u8) ![]const u8 {
+    var encoded: std.ArrayList(u8) = .empty;
+    try encoded.appendSlice(a, "mailto:");
+    for (address) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "-._~+@", byte) != null) {
+            try encoded.append(a, byte);
+        } else {
+            try encoded.append(a, '%');
+            try encoded.appendSlice(a, &std.fmt.bytesToHex([_]u8{byte}, .upper));
+        }
+    }
+    return encoded.items;
+}
+
 fn equal(left: []const u8, right: []const u8) bool {
     return std.ascii.eqlIgnoreCase(left, right);
 }
@@ -94,8 +190,8 @@ pub fn mimeMethod(content_type: []const u8) ?Method {
     return found;
 }
 
-pub fn previews(a: Allocator, parts: []const Part, mailbox: []const u8, verified_author: []const u8) ![]const Preview {
-    var result: std.ArrayList(Preview) = .empty;
+pub fn invitations(a: Allocator, parts: []const Part, mailbox: []const u8, verified_author: []const u8) ![]const Invitation {
+    var result: std.ArrayList(Invitation) = .empty;
     for (parts) |part| {
         const source = if (std.mem.startsWith(u8, part.body, "\xef\xbb\xbf")) part.body[3..] else part.body;
         const components = ical.components(a, source) catch |err| switch (err) {
@@ -116,7 +212,7 @@ pub fn previews(a: Allocator, parts: []const Part, mailbox: []const u8, verified
         for (components) |component| {
             if (result.items.len == max_previews) return result.items;
             if (!equal(component.name, "VEVENT")) continue;
-            const event = readEvent(a, component, part.method, mailbox, verified_author) catch |err| switch (err) {
+            const event = readEvent(a, components, component, part.method, mailbox, verified_author) catch |err| switch (err) {
                 error.InvalidInvitation => continue,
                 else => return err,
             };
@@ -131,7 +227,7 @@ fn one(slot: *?ical.Property, value: ical.Property) !void {
     slot.* = value;
 }
 
-fn readEvent(a: Allocator, component: ical.Component, method: Method, mailbox: []const u8, verified_author: []const u8) !Preview {
+fn readEvent(a: Allocator, components: []const ical.Component, component: ical.Component, method: Method, mailbox: []const u8, verified_author: []const u8) !Invitation {
     var props = ical.Properties.init(component);
     var uid: ?ical.Property = null;
     var organizer: ?ical.Property = null;
@@ -184,7 +280,7 @@ fn readEvent(a: Allocator, component: ical.Component, method: Method, mailbox: [
             if (stop.all_day != begin.all_day or (same_zone and stop.wall <= begin.wall)) return error.InvalidInvitation;
         }
     }
-    return .{
+    return .{ .components = components, .recurrence = recurrence, .preview = .{
         .method = method,
         .uid = identity,
         .organizer = organizer_address,
@@ -198,7 +294,7 @@ fn readEvent(a: Allocator, component: ical.Component, method: Method, mailbox: [
         .location = try displayText(a, location, 1024),
         .start = begins,
         .end = finish,
-    };
+    } };
 }
 
 fn singleLine(value: []const u8, limit: usize) bool {

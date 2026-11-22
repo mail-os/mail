@@ -1,5 +1,5 @@
 import type { EmbeddedImage } from './mail-reader'
-import type { InvitationPreview } from './mail-invitations'
+import type { InvitationAction, InvitationPreview } from './mail-invitations'
 
 export interface Flags { seen: boolean, answered: boolean, flagged: boolean, draft: boolean, deleted: boolean }
 export interface MessageRef {
@@ -38,6 +38,7 @@ export interface MessageDetail extends MessageSummary {
   attention?: AttentionStatus
   notifications?: MailNotificationRules
   calendar_invites?: InvitationPreview[]
+  calendar_rsvps?: Array<InvitationAction | null>
   calendar_only?: boolean
 }
 export type MailNotificationRule = 'default' | 'notify' | 'quiet'
@@ -137,7 +138,7 @@ export interface ComposePayload {
 export interface DraftAck { ok: boolean, uid: number, draftId: string, revision: number }
 export interface DraftDocument { draftId: string, revision: number, uid: number, state: string, message: ComposePayload }
 export interface SendResult { message_id: string, delivered: number, failed: string[], sent_saved: boolean, unknown?: string[] }
-export interface OutboxSummary { id: string, state: string, dueAt: number, scheduled?: boolean, message: Pick<ComposePayload, 'subject' | 'to'>, result: SendResult | null, error: string | null }
+export interface OutboxSummary { id: string, state: string, dueAt: number, scheduled?: boolean, calendarRsvp?: boolean, message: Pick<ComposePayload, 'subject' | 'to'>, result: SendResult | null, error: string | null }
 export interface OutboxItem extends OutboxSummary { serverTime: number, message: ComposePayload }
 export type OutboxView = 'upcoming' | 'review' | 'history'
 export type OutboxCounts = Record<OutboxView, number>

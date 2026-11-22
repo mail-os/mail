@@ -582,6 +582,20 @@ async function invitationJourney(page, phone = false) {
   await page.getByRole('region', { name: 'Message reader' }).getByText('We have the south room from 10 to noon.', { exact: true }).waitFor()
   await fitsViewport(page)
   await screenshot(page, phone ? 'phone-calendar-invitation' : 'desktop-calendar-invitation')
+  const actions = invitation.getByRole('group', { name: 'RSVP to organizer' })
+  if (phone) {
+    await invitation.getByText('Acceptance sent.', { exact: true }).waitFor()
+    assert(await button(actions, 'Accept').isDisabled(), 'The earlier decision is visible in a second session')
+    if (engine === 'firefox') await button(actions, 'Tentative').click()
+    else await button(actions, 'Tentative').tap()
+    await invitation.getByText('Tentative response sent.', { exact: true }).waitFor()
+  }
+  else {
+    await button(actions, 'Accept').press('Enter')
+    await invitation.getByText('Acceptance sent.', { exact: true }).waitFor()
+  }
+  await fitsViewport(page)
+  await screenshot(page, phone ? 'phone-calendar-rsvp' : 'desktop-calendar-rsvp')
 }
 
 async function mailEventJourney(page, { phone = false, firstCalendar = false } = {}) {

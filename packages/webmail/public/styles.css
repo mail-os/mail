@@ -242,6 +242,12 @@ input[type=checkbox] { accent-color: var(--accent); }
 .wm-invitation dl > div { display: grid; grid-template-columns: minmax(5.5rem, .4fr) minmax(0, 1fr); column-gap: 8px; }
 .wm-invitation dt { color: var(--muted); }
 .wm-invitation dd { margin: 0; }
+.wm-invitation-rsvp { margin-top: 11px; padding-top: 11px; border-top: 1px solid var(--border); }
+.wm-invitation-rsvp > p { margin: 0; color: var(--muted); font-size: 13px; }
+.wm-invitation-rsvp > p + .wm-invitation-responses { margin-top: 8px; }
+.wm-invitation-responses { display: flex; flex-wrap: wrap; gap: 6px; }
+.wm-invitation-responses .wm-action[aria-pressed=true] { background: var(--accent-soft); color: var(--accent); }
+@media (pointer: coarse) { .wm-invitation-responses .wm-action { min-height: 44px; } }
 .wm-invitation-verified { display: inline-block; margin-inline-start: 8px; color: var(--muted); font-size: 11px; }
 .wm-invitation-source { margin-top: 12px; color: var(--muted); font-size: 13px; }
 .wm-invitation-source summary { cursor: pointer; }

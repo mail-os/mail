@@ -111,6 +111,18 @@ def verify_delivery(fixture, sender):
     status, _, body = request(fixture.webmail + "/webmail/api/attachment?" + query,
                               headers=session, context=fixture.tls_context)
     assert status == 200 and body == b"Review the handoff", (status, body)
+    for label, response in (("Accepted", "ACCEPTED"), ("Tentative", "TENTATIVE")):
+        subject = f"{label}: Studio reservation"
+        status, listing = fixture.api(session, "messages?" + urlencode({"folder": "INBOX", "q": subject}))
+        assert status == 200, listing
+        row, = [row for row in listing["items"] if row["subject"] == subject]
+        status, detail = fixture.api(session, "messages/ref/" + row["reference"])
+        assert status == 200, detail
+        reply, = detail["attachments"]
+        assert reply["filename"] == "reply.ics"
+        query = urlencode({"reference": row["reference"], "content_revision": detail["content_revision"], "index": 0})
+        status, _, body = request(fixture.webmail + "/webmail/api/attachment?" + query, headers=session, context=fixture.tls_context)
+        assert status == 200 and b"UID:studio-reservation@example.test" in body and f"PARTSTAT={response}".encode() in body, (status, body)
 
 
 def verify(binary, output, engine):

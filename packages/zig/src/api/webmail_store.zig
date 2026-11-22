@@ -72,6 +72,14 @@ pub fn initSchema(db: *database.Database) !void {
         \\ DELETE FROM mail_shared_reply_claims WHERE actor_id=(SELECT id FROM users WHERE username=NEW.username)
         \\ AND send_id=NEW.id AND NEW.state IN ('cancelled','failed');
         \\END;
+        \\CREATE TRIGGER IF NOT EXISTS webmail_outbox_calendar_rsvp AFTER UPDATE OF state ON webmail_records
+        \\WHEN NEW.kind='outbox' AND NEW.state<>OLD.state AND json_valid(NEW.payload)
+        \\BEGIN
+        \\ UPDATE webmail_records SET state=NEW.state,revision=revision+1
+        \\ WHERE username=NEW.username AND kind='calendar-rsvp'
+        \\ AND id=json_extract(NEW.payload,'$.calendarReply.key')
+        \\ AND json_extract(payload,'$.sendId')=NEW.id;
+        \\END;
         \\CREATE TRIGGER IF NOT EXISTS webmail_cancel_revoked_shared_replies AFTER DELETE ON mail_team_grants
         \\WHEN OLD.scope IN ('mailbox','sender') AND OLD.resource=''
         \\BEGIN
@@ -149,6 +157,7 @@ pub const OutboxSummary = struct {
     state: []const u8,
     dueAt: i64,
     scheduled: bool,
+    calendarRsvp: bool,
     message: struct { subject: []const u8, to: []const []const u8 },
     result: std.json.Value,
     @"error": ?[]const u8,
@@ -185,7 +194,8 @@ fn outboxPageSql(comptime filter: []const u8, comptime key: []const u8, comptime
         " CASE WHEN json_valid(r.payload) THEN json_extract(r.payload,'$.message.to') END," ++
         " CASE WHEN json_valid(r.payload) THEN json_extract(r.payload,'$.scheduled') OR json_extract(r.payload,'$.message.scheduleAt') IS NOT NULL END," ++
         " CASE WHEN json_valid(r.payload) THEN json_extract(r.payload,'$.result') END," ++
-        " CASE WHEN json_valid(r.payload) THEN json_extract(r.payload,'$.error_message') END" ++
+        " CASE WHEN json_valid(r.payload) THEN json_extract(r.payload,'$.error_message') END," ++
+        " CASE WHEN json_valid(r.payload) THEN json_type(r.payload,'$.calendarReply')='object' END" ++
         " FROM totals LEFT JOIN ids ON 1 LEFT JOIN webmail_records r ON r.username=?1 AND r.kind='outbox' AND r.id=ids.id" ++
         " ORDER BY ids.tracked,r." ++ key ++ order ++ ",r.id" ++ order;
 }
@@ -232,6 +242,7 @@ fn readOutboxSummary(a: std.mem.Allocator, s: database.Statement) !OutboxSummary
         .state = try a.dupe(u8, s.columnText(6)),
         .dueAt = s.columnInt64(7),
         .scheduled = s.columnInt64(10) != 0,
+        .calendarRsvp = s.columnInt64(13) != 0,
         .message = .{
             .subject = try a.dupe(u8, s.columnText(8)),
             .to = if (recipients.len == 0) &.{} else try std.json.parseFromSliceLeaky([]const []const u8, a, recipients, .{ .allocate = .alloc_always }),
@@ -312,19 +323,25 @@ pub fn checkRecordCapacity(db: *database.Database, row: Record, max_bytes: usize
     }
 }
 
+const putSql =
+    \\INSERT INTO webmail_records(username,kind,id,payload,state,revision,due_at,expires_at)
+    \\SELECT ?1,?2,?3,?4,?5,1,?6,?7 WHERE ?8=0 OR EXISTS
+    \\(SELECT 1 FROM webmail_records WHERE username=?1 AND kind=?2 AND id=?3 AND revision=?8)
+    \\ON CONFLICT(username,kind,id) DO UPDATE SET payload=excluded.payload,
+    \\state=excluded.state,revision=webmail_records.revision+1,
+    \\due_at=excluded.due_at,expires_at=excluded.expires_at
+    \\WHERE webmail_records.revision=?8
+    \\RETURNING revision
+;
+
 /// expected=0 creates; an existing record needs its last acknowledged revision.
 pub fn put(db: *database.Database, row: Record, expected: i64) !i64 {
-    const s = try db.prepare(
-        \\INSERT INTO webmail_records(username,kind,id,payload,state,revision,due_at,expires_at)
-        \\SELECT ?1,?2,?3,?4,?5,1,?6,?7 WHERE ?8=0 OR EXISTS
-        \\(SELECT 1 FROM webmail_records WHERE username=?1 AND kind=?2 AND id=?3 AND revision=?8)
-        \\ON CONFLICT(username,kind,id) DO UPDATE SET payload=excluded.payload,
-        \\state=excluded.state,revision=webmail_records.revision+1,
-        \\due_at=excluded.due_at,expires_at=excluded.expires_at
-        \\WHERE webmail_records.revision=?8
-        \\RETURNING revision
-    );
+    const s = try db.prepare(putSql);
     defer s.finalize();
+    return putWith(s, row, expected);
+}
+
+fn putWith(s: database.Statement, row: Record, expected: i64) !i64 {
     try s.bind(1, row.username);
     try s.bind(2, row.kind);
     try s.bind(3, row.id);
@@ -389,6 +406,18 @@ pub fn enqueueShared(db: *database.Database, row: Record, draft_id: []const u8, 
     return revision;
 }
 
+pub fn enqueueCalendarReply(db: *database.Database, row: Record, receipt: Record) !void {
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const ledger = try tx.prepare(putSql);
+    defer ledger.finalize();
+    _ = try putWith(ledger, receipt, receipt.revision);
+    const send = try tx.prepare(enqueueSql);
+    defer send.finalize();
+    _ = try enqueueWith(send, row, null, 0);
+    try tx.commit();
+}
+
 fn enqueueWith(s: database.Statement, row: Record, draft_id: ?[]const u8, draft_revision: i64) !i64 {
     try s.bind(1, row.username);
     try s.bind(2, row.id);
@@ -429,7 +458,7 @@ pub fn nextInterruptedDelivery(a: std.mem.Allocator, db: *database.Database, cur
         \\SELECT username,kind,r.id,payload,state,revision,due_at,expires_at,r.rowid
         \\FROM webmail_records AS r
         \\WHERE kind='outbox' AND state='unknown' AND json_extract(r.payload,'$.result') IS NULL AND r.rowid>?1
-        \\AND (json_type(r.payload,'$.message.sharedReply')='object' OR EXISTS(
+        \\AND (json_type(r.payload,'$.message.sharedReply')='object' OR json_type(r.payload,'$.calendarReply')='object' OR EXISTS(
         \\  SELECT 1 FROM accepted_mail AS m WHERE m.id=json_extract(r.payload,'$.dispatch.delivery_id')))
         \\ORDER BY r.rowid LIMIT 1
     );

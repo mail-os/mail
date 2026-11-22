@@ -6,6 +6,8 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from email.message import EmailMessage
+from email import policy
+from email.parser import BytesParser
 import http.client
 import json
 import os
@@ -423,6 +425,156 @@ def check_invitation_previews(test, owner, other):
     assert must(client.request("PROPFIND", home, headers={"Depth": "1"}), 207)[1] == before
     assert test.api(foreign, "messages?folder=INBOX&q=planning")[1]["total"] == 0
     print("Verified MIME invitation previews, explicit time zones, cancellations, ownership, downloads, and unchanged DAV state.")
+
+
+def check_invitation_replies(test):
+    attendee = test.provision("rsvp-attendee", daily=1)
+    organizer = test.provision("rsvp-organizer")
+    session, foreign = test.login(attendee), test.login(organizer)
+    for account in (session, foreign):
+        assert test.api(account, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
+    zone = (
+        "BEGIN:VTIMEZONE", "TZID:Fixture/Studio", "TZURL:https://unused.example.test/zone",
+        "BEGIN:STANDARD", "DTSTART:19700101T000000", "TZOFFSETFROM:-0500", "TZOFFSETTO:-0500",
+        "END:STANDARD", "END:VTIMEZONE",
+    )
+
+    def invite(subject, sequence=2, stamp="110000", occurrence="090000", method="REQUEST", author=organizer, invited=attendee):
+        start = (f"DTSTART;TZID=Fixture/Studio:20261124T{occurrence}",) if method == "REQUEST" else ()
+        source = "\r\n".join((
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail//RSVP Fixture//EN", f"METHOD:{method}",
+            *zone, "BEGIN:VEVENT", "UID:rsvp-series@example.test", f"SEQUENCE:{sequence}", f"DTSTAMP:20261121T{stamp}Z",
+            f"RECURRENCE-ID;TZID=Fixture/Studio:20261124T{occurrence}", *start, f"ORGANIZER:mailto:{author}",
+            f"ATTENDEE:mailto:{invited}", f"ATTENDEE:mailto:{organizer}", "SUMMARY:Studio RSVP",
+            "DESCRIPTION:Private notes from the organizer", "END:VEVENT", "END:VCALENDAR", "",
+        ))
+        message = EmailMessage()
+        message["From"], message["To"], message["Subject"] = organizer, attendee, subject
+        message["Reply-To"] = "unrelated@hosted.example.test"
+        message.set_content(source, subtype="calendar", params={"method": method})
+        with test.smtp(organizer) as smtp:
+            assert smtp.send_message(message) == {}
+        query = urllib.parse.urlencode({"folder": "INBOX", "q": subject})
+        row, = [row for row in test.api(session, "messages?" + query)[1]["items"] if row["subject"] == subject]
+        return detail(row["reference"])
+
+    def detail(reference):
+        return test.api(session, "messages/ref/" + reference)[1]
+
+    def respond(source, response, previous=None, *, account=None, revision=True):
+        fields = (session if account is None else account).copy()
+        if revision:
+            fields["If-Match"] = source["revision"]
+        payload = {"reference": source["reference"], "index": 0, "response": response}
+        if previous:
+            payload["previousSendId"] = previous
+        return test.api(fields, "calendar-rsvp", payload, "POST")
+
+    def wait_for(source, state):
+        for _ in range(80):
+            current = detail(source["reference"])["calendar_rsvps"][0]["status"]
+            if current and current["state"] == state:
+                return current["decision"]["sendId"]
+            time.sleep(0.15)
+        raise AssertionError((state, current))
+
+    def inbox_replies():
+        replies = []
+        with test.imap(organizer) as imap:
+            assert imap.select("INBOX", readonly=True)[0] == "OK"
+            status, ids = imap.uid("SEARCH", None, "ALL")
+            assert status == "OK"
+            for uid in ids[0].split():
+                status, parts = imap.uid("FETCH", uid, "(BODY.PEEK[])")
+                assert status == "OK"
+                raw, = [part[1] for part in parts if isinstance(part, tuple)]
+                message = BytesParser(policy=policy.default).parsebytes(raw)
+                calendar, = [part for part in message.walk() if part.get_content_type() == "text/calendar"]
+                assert calendar.get_param("method") == "REPLY" and calendar.get_content_charset() == "utf-8"
+                assert message["From"].addresses[0].addr_spec == attendee
+                assert message["To"].addresses[0].addr_spec == organizer
+                assert not message.get("Reply-To")
+                text = re.sub(r"\r?\n[ \t]", "", calendar.get_content())
+                assert "METHOD:REPLY" in text and "UID:rsvp-series@example.test" in text
+                assert f"ORGANIZER:mailto:{organizer}" in text
+                assert text.count("ATTENDEE;") == 1 and f":mailto:{attendee}" in text
+                assert 'TZID:Fixture/Studio' in text and "TZOFFSETTO:-0500" in text and "TZURL:" not in text
+                assert "DESCRIPTION:" not in text
+                replies.append(text)
+        return replies
+
+    first = invite("Verified RSVP occurrence")
+    assert first["calendar_rsvps"] == [{"status": None}]
+    assert respond(first, "accepted", revision=False)[0] == 428
+    assert respond(first, "accepted", account=foreign)[0] == 404
+    assert respond(first, "accepted", account={**session, "Origin": "https://unrelated.example.test"})[0] == 403
+    forged = invite("Forwarded RSVP occurrence", author="forwarded@hosted.example.test")
+    assert forged["calendar_rsvps"] == [None] and respond(forged, "accepted")[0] == 403
+    uninvited = invite("Different attendee RSVP occurrence", invited="elsewhere@hosted.example.test")
+    assert uninvited["calendar_rsvps"] == [None] and respond(uninvited, "accepted")[0] == 403
+    cancelled = invite("Cancellation RSVP occurrence", method="CANCEL")
+    assert cancelled["calendar_rsvps"] == [None] and respond(cancelled, "accepted")[0] == 403
+
+    barrier = Barrier(2)
+
+    def duplicate():
+        barrier.wait()
+        return respond(first, "accepted")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        left, right = [future.result() for future in (executor.submit(duplicate), executor.submit(duplicate))]
+    assert left[0] == right[0] == 200, (left, right)
+    first_id = wait_for(first, "sent")
+    assert first_id == left[1]["decision"]["sendId"] == right[1]["decision"]["sendId"]
+    accepted, = inbox_replies()
+    assert "PARTSTAT=ACCEPTED" in accepted and 'RECURRENCE-ID;TZID="Fixture/Studio":20261124T090000' in accepted
+    assert respond(first, "declined")[0] == 409  # A tab without the current receipt cannot reverse the decision.
+    late = invite("Late earlier sequence RSVP", sequence=1, stamp="130000")
+    assert respond(late, "declined")[1]["error"] == "invitation_stale"
+    same_sequence = invite("Same sequence older RSVP", stamp="100000")
+    assert respond(same_sequence, "accepted")[1]["error"] == "invitation_stale"
+
+    updated = invite("Newer RSVP at same sequence", stamp="120000")
+    status, queued = respond(updated, "tentative", first_id)
+    assert status == 200, queued
+    failed_id = wait_for(updated, "failed")
+    assert failed_id == queued["decision"]["sendId"]
+    outbox = test.api(session, "outbox/" + failed_id)[1]
+    assert outbox["calendarRsvp"] and "Daily recipient allowance" in outbox["error"], outbox
+    assert respond(updated, "tentative")[1]["decision"]["sendId"] == failed_id
+    assert len(inbox_replies()) == 1
+    test.provision("rsvp-attendee", daily=5)
+    status, retried = respond(updated, "tentative", failed_id)
+    assert status == 200, retried
+    tentative_id = wait_for(updated, "sent")
+    assert tentative_id != failed_id and tentative_id == retried["decision"]["sendId"]
+    assert respond(updated, "tentative", failed_id)[1]["decision"]["sendId"] == tentative_id
+
+    occurrence = invite("Another occurrence RSVP", occurrence="140000")
+    assert respond(occurrence, "declined")[0] == 200
+    decline_id = wait_for(occurrence, "sent")
+    declines = [text for text in inbox_replies() if "PARTSTAT=DECLINED" in text]
+    assert len(declines) == 1 and 'RECURRENCE-ID;TZID="Fixture/Studio":20261124T140000' in declines[0]
+    print("Verified RSVPs over native HTTPS and IMAP, including all responses, organizer authorization, revision ordering, and quota-safe retries.")
+
+    def prepare_restart():
+        # Model a restart after delivery and Sent filing but before receipt
+        # acknowledgement. Also make another terminal Outbox row eligible for expiry.
+        with sqlite3.connect(test.directory / "smtp.db") as db:
+            db.execute("UPDATE webmail_records SET state='sending',payload=json_remove(payload,'$.result') "
+                       "WHERE username=? AND kind='outbox' AND id=?", (attendee, tentative_id))
+            db.execute("UPDATE webmail_records SET expires_at=1 WHERE username=? AND kind='outbox' AND id=?", (attendee, decline_id))
+
+    def after_restart():
+        session.update(test.login(attendee))
+        assert wait_for(updated, "sent") == tentative_id
+        assert test.api(session, "outbox/" + decline_id)[0] == 404
+        assert respond(occurrence, "declined")[1]["decision"]["sendId"] == decline_id
+        replies = inbox_replies()
+        assert len(replies) == 3 and sum("PARTSTAT=TENTATIVE" in text for text in replies) == 1
+        print("Verified RSVP delivery journal recovery, durable receipts after Outbox expiry, and no duplicate mail after restart.")
+
+    return prepare_restart, after_restart
 
 
 def check_mail_event_source(test, organizer):
@@ -1158,15 +1310,18 @@ def main():
                 expected = check_resources(test, owner, other)
                 check_scanning(DavClient(test, owner), expected)
                 check_invitation_previews(test, owner, other)
+                prepare_rsvp_restart, check_rsvp_restart = check_invitation_replies(test)
                 check_reopened_backlink = check_mail_event_source(test, other)
                 check_calendar_download(test, owner, other)
                 importer, calendar_id, submit = check_calendar_import(test, owner, other)
                 editor, item, resource, revision = check_calendar_writes(test, other)
                 dismissal = check_reminders(test, owner, other)
                 check_saved_properties = check_collection_properties(test, owner, other, expected)
+            prepare_rsvp_restart()
             with test.daemon():
                 client = DavClient(test, owner)
                 check_reopened_backlink()
+                check_rsvp_restart()
                 check_saved_properties()
                 print("Verified CalDAV and CardDAV metadata over HTTP and HTTPS, including rollback, concurrent reads, and restart.")
                 assert test.api(test.login(owner), "calendar-reminders")[1]["dismissed"] == [dismissal]

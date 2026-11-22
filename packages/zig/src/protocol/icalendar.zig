@@ -288,6 +288,64 @@ fn appendEventChanges(output: *Export, edit: EventEdit) !void {
 
 pub const max_export_bytes = 16 * 1024 * 1024;
 
+pub const SchedulingReply = struct {
+    uid: []const u8,
+    stamp: i64,
+    sequence: u32,
+    organizer_uri: []const u8,
+    attendee_uri: []const u8,
+    participation: []const u8,
+    occurrence_line: ?[]const u8 = null,
+    timezone: ?Component = null,
+};
+
+pub fn schedulingReply(a: Allocator, reply: SchedulingReply) ![]const u8 {
+    var output: Export = .{ .allocator = a };
+    try output.headers.appendSlice(a, "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Mail//Calendar RSVP//EN\r\nMETHOD:REPLY\r\n");
+    if (reply.timezone) |zone| try addReplyTimezone(&output, zone);
+    try output.events.appendSlice(a, "BEGIN:VEVENT\r\n");
+    try output.textProperty(&output.events, "UID", reply.uid);
+    try output.dateProperty("DTSTAMP", reply.stamp, false);
+    try output.events.print(a, "SEQUENCE:{d}\r\n", .{reply.sequence});
+    try output.foldedLine(&output.events, try std.fmt.allocPrint(a, "ORGANIZER:{s}", .{reply.organizer_uri}));
+    try output.foldedLine(&output.events, try std.fmt.allocPrint(a, "ATTENDEE;PARTSTAT={s}:{s}", .{ reply.participation, reply.attendee_uri }));
+    if (reply.occurrence_line) |line| try output.foldedLine(&output.events, line);
+    try output.events.appendSlice(a, "END:VEVENT\r\n");
+    return output.finish();
+}
+
+fn addReplyTimezone(output: *Export, zone: Component) !void {
+    const a = output.allocator;
+    const id = (try componentText(a, zone, "TZID")) orelse return error.InvalidCalendar;
+    try output.headers.appendSlice(a, "BEGIN:VTIMEZONE\r\n");
+    try output.textProperty(&output.headers, "TZID", id);
+    // The attendee supplies only the time rules used by RECURRENCE-ID.
+    // Exclude organizer URLs, descriptions, and extension components.
+    for (try childComponents(a, zone)) |child| {
+        const kind: []const u8 = if (std.ascii.eqlIgnoreCase(child.name, "STANDARD"))
+            "STANDARD"
+        else if (std.ascii.eqlIgnoreCase(child.name, "DAYLIGHT"))
+            "DAYLIGHT"
+        else
+            continue;
+        try output.headers.print(a, "BEGIN:{s}\r\n", .{kind});
+        var properties = Properties.init(child);
+        const fields = [_][]const u8{ "DTSTART", "TZOFFSETFROM", "TZOFFSETTO", "RRULE", "RDATE" };
+        var seen: [fields.len]bool = @splat(false);
+        while (try properties.next(a)) |property| {
+            for (fields, 0..) |name, index| {
+                if (!property.named(name)) continue;
+                if (seen[index] and !property.named("RDATE")) return error.InvalidCalendar;
+                seen[index] = true;
+                try output.foldedLine(&output.headers, try std.fmt.allocPrint(a, "{s}:{s}", .{ name, property.value }));
+                break;
+            }
+        }
+        try output.headers.print(a, "END:{s}\r\n", .{kind});
+    }
+    try output.headers.appendSlice(a, "END:VTIMEZONE\r\n");
+}
+
 pub const Export = struct {
     allocator: Allocator,
     zones: std.StringHashMapUnmanaged([]const u8) = .empty,

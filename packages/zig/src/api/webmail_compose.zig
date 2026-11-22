@@ -116,7 +116,7 @@ pub const OutboxDispatch = struct {
 /// A header VALUE must not contain CR/LF (header injection) and stays short
 /// enough to be sane. Addresses additionally must not contain header-special
 /// chars beyond what an address needs.
-fn isSafeHeaderValue(v: []const u8) bool {
+pub fn isSafeHeaderValue(v: []const u8) bool {
     for (v) |c| {
         if (c == '\r' or c == '\n' or c == 0) return false;
     }
