@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from http.client import HTTPSConnection
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import runpy
 import socketserver
 import sqlite3
@@ -20,7 +20,8 @@ from xml.etree import ElementTree as ET
 SCRIPTS = Path(__file__).resolve().parent
 teams = runpy.run_path(str(SCRIPTS / "test-webmail-teams.py"))
 Fixture, command, expect = (teams[name] for name in ("Fixture", "command", "expect"))
-DavClient = runpy.run_path(str(SCRIPTS / "test-dav-https.py"))["DavClient"]
+dav_tests = runpy.run_path(str(SCRIPTS / "test-dav-https.py"))
+DavClient, configure_vdirsyncer = (dav_tests[name] for name in ("DavClient", "configure_vdirsyncer"))
 CALENDAR = "Studio planning"
 AVAILABILITY = "Availability cases"
 CALDAV = "urn:ietf:params:xml:ns:caldav"
@@ -598,6 +599,118 @@ def verify_dav_editors(test, scan, owner, viewer, foreign, calendar_id):
     expect(change(test, captain, calendar_id, viewer, "viewer"))
 
 
+def verify_dav_discovery(test, owner, viewer, colleague, foreign, calendar_id, executable):
+    captain, teammate, invited = test.login(owner), test.login(colleague), test.login(viewer)
+    editor = DavClient(test, colleague)
+    owner_dav, guest, outsider = (DavClient(test, user) for user in (owner, viewer, foreign))
+    collision_id = expect(test.api(teammate, "calendars", {"name": CALENDAR}), 201)["id"]
+    hidden_id = expect(test.api(captain, "calendars", {"name": "Unshared calendar"}), 201)["id"]
+    expect(test.api(invited, "calendars", {"name": "Personal discovery fixture"}), 201)
+    assert hidden_id != calendar_id
+    expect(change(test, teammate, collision_id, viewer, "editor"))
+    dav_xml = {"d": "DAV:", "c": CALDAV}
+
+    def propfind(client, path, depth, *, expected=207, tls=True):
+        status, _, body = client.request("PROPFIND", path, headers={"Depth": str(depth)}, tls=tls)
+        assert status == expected, (path, status, body)
+        return ET.fromstring(body) if expected == 207 else None
+
+    def hrefs(data):
+        return {item.findtext("d:href", namespaces=dav_xml): item for item in data.findall("d:response", dav_xml)}
+
+    def calendars(home, *, tls=True):
+        return {path: row for path, row in hrefs(propfind(guest, home, 1, tls=tls)).items()
+                if row.find(".//d:resourcetype/c:calendar", dav_xml) is not None}
+
+    assert guest.request("PROPFIND", "/", authenticated=False)[0] == 401
+    current = propfind(guest, "/", 0).findtext(".//d:current-user-principal/d:href", namespaces=dav_xml)
+    principal = propfind(guest, current, 0)
+    personal_home, shared_home = [href.text for href in principal.findall(".//c:calendar-home-set/d:href", dav_xml)]
+    assert shared_home.startswith("/shared-calendars/") and personal_home.startswith("/calendars/")
+    assert list(hrefs(propfind(guest, shared_home, 0))) == [shared_home]
+    propfind(outsider, shared_home, 1, expected=404)
+    propfind(owner_dav, shared_home, 1, expected=404)
+    assert list(calendars(personal_home)) == [personal_home + "Personal%20discovery%20fixture/"]
+
+    listing = calendars(shared_home)
+    assert len(listing) == 2
+    assert calendars(shared_home, tls=False).keys() == listing.keys()
+    assert all(href.startswith(shared_home) for href in listing)
+    assert {item.findtext(".//d:displayname", namespaces=dav_xml) for item in listing.values()} == {CALENDAR}
+    owned_alias, = [href for href, item in listing.items() if item.find(".//d:write-content", dav_xml) is None]
+    editor_alias, = [href for href, item in listing.items() if item.find(".//d:write-content", dav_xml) is not None]
+
+    roadmap = owned_alias + "Roadmap.ics"
+    hidden = owned_alias + "Budget.ics"
+    assert list(hrefs(propfind(guest, owned_alias, 1))) == [owned_alias, roadmap]
+    assert guest.request("GET", roadmap)[0] == 200
+    assert guest.request("GET", hidden)[0] == 404
+    assert guest.request("GET", shared_home + "0" * 32 + "/Roadmap.ics")[0] == 404
+    cross_grantee = "/shared-calendars/" + outsider.mailbox + "/" + owned_alias.split("/")[-2] + "/Roadmap.ics"
+    assert outsider.request("GET", cross_grantee)[0] == 404
+    assert set(dav_query(guest, owned_alias, "20261208T100000Z", "20261208T110000Z")) == {roadmap}
+    multiget = (f'<C:calendar-multiget xmlns:C="{CALDAV}" xmlns:D="DAV:"><D:prop><C:calendar-data/></D:prop>'
+                f'<D:href>{roadmap}</D:href><D:href>{hidden}</D:href></C:calendar-multiget>')
+    result = guest.request("REPORT", owned_alias, multiget, {"Content-Type": "application/xml"})
+    assert result[0] == 207, result
+    responses = hrefs(ET.fromstring(result[2]))
+    assert "SUMMARY:Roadmap" in responses[roadmap].findtext(".//c:calendar-data", namespaces=dav_xml)
+    assert responses[hidden].findtext("d:status", namespaces=dav_xml) == "HTTP/1.1 404 Not Found"
+    original = guest.request("GET", roadmap)[2]
+    draft = original.replace(b"UID:Roadmap", b"UID:Discovery").replace(b"SUMMARY:Roadmap", b"SUMMARY:Discovery")
+    headers = {"Content-Type": "text/calendar", "If-None-Match": "*"}
+    assert guest.request("PUT", owned_alias + "Discovery.ics", draft, headers)[0] == 404
+    result = guest.request("PUT", editor_alias + "Discovery.ics", draft, headers)
+    assert result[0] == 201, result
+    assert editor.request("GET", calendar_path(colleague, CALENDAR) + "/Discovery.ics")[2] == draft
+    assert guest.request("DELETE", editor_alias + "Discovery.ics", headers={"If-Match": result[1]["ETag"]})[0] == 204
+    expect(change(test, teammate, collision_id, viewer, None))
+    assert editor.request("DELETE", calendar_path(colleague, CALENDAR))[0] == 204
+    assert owner_dav.request("DELETE", calendar_path(owner, "Unshared calendar"))[0] == 204
+    assert guest.request("DELETE", personal_home + "Personal%20discovery%20fixture/")[0] == 204
+
+    if executable:
+        collection = PurePosixPath(owned_alias).name
+        run, files = configure_vdirsyncer(test, guest, guest.profile(), {"CalDAV": collection}, executable,
+                                        "vdirsyncer-calendar-share", discovery_path=shared_home)
+        run("discover")
+        run("sync")
+        (folder, extension), = files
+        file, = folder.glob("*" + extension)
+        assert file.read_bytes().splitlines() == original.splitlines()
+        expect(change(test, captain, calendar_id, viewer, "editor"))
+        new_file = folder / "Discovery.ics"
+        new_file.write_bytes(draft)
+        run("sync")
+        canonical = calendar_path(owner, CALENDAR) + "/Discovery.ics"
+        assert owner_dav.request("GET", canonical)[2].splitlines() == draft.splitlines()
+        new_file.unlink()
+        run("sync")
+        assert owner_dav.request("GET", canonical)[0] == 404
+        expect(change(test, captain, calendar_id, viewer, "viewer"))
+        print("Verified vdirsyncer discovery of a shared home and bidirectional sync over native HTTPS.")
+
+    with closing(HTTPSConnection("127.0.0.1", guest.https, context=guest.context, timeout=15)) as client:
+        client.request("GET", roadmap, headers=guest.auth)
+        with client.getresponse() as response:
+            assert response.status == 200 and response.read() == original
+        connection = client.sock
+        expect(change(test, captain, calendar_id, viewer, "free_busy"))
+        assert not calendars(shared_home)
+        assert dav_busy(guest, owned_alias) == dav_busy(guest, calendar_path(owner, CALENDAR))
+        client.request("GET", roadmap, headers=guest.auth)
+        assert client.sock is connection
+        with client.getresponse() as response:
+            assert response.status == 404 and not response.read()
+        expect(change(test, captain, calendar_id, viewer, None))
+        assert not calendars(shared_home)
+        dav_busy(guest, owned_alias, status=404)
+        expect(change(test, captain, calendar_id, viewer, "viewer"))
+        assert list(calendars(shared_home)) == [owned_alias]
+        assert guest.request("GET", roadmap)[2] == original
+    return owned_alias
+
+
 def verify_dav_recurrence_query(test, owner, viewer):
     calendar = "Recurring query cases"
     captain = test.login(owner)
@@ -790,6 +903,7 @@ def verify_dav_advanced_recurrence(test, owner, viewer):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
+    parser.add_argument("--vdirsyncer", type=Path)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="mail-calendar-shares-") as scratch, scanner() as scan:
         directory = Path(scratch)
@@ -802,6 +916,7 @@ def main():
             )""")
             legacy.commit()
         test = Fixture(args.binary.resolve(strict=True), directory, staging=True)
+        test.env.update(SMTP_HOSTNAME="127.0.0.1", CALDAV_PUBLIC_SSL_PORT=test.env["CALDAV_SSL_PORT"])
         test.env.update(SMTP_CLAMAV_TRANSPORT=f"tcp:127.0.0.1:{scan.server_address[1]}",
                         SMTP_CLAMAV_FAIL_MODE="closed", SMTP_CLAMAV_TIMEOUT_MS="8000")
         with test.daemon(), closing(sqlite3.connect(directory / "smtp.db")) as db:
@@ -810,6 +925,8 @@ def main():
             calendar_id = verify(test, db, owner, viewer, colleague, foreign)
             verify_editors(test, scan, owner, viewer, colleague, calendar_id)
             verify_dav_editors(test, scan, owner, viewer, foreign, calendar_id)
+            alias = verify_dav_discovery(test, owner, viewer, colleague, foreign, calendar_id,
+                                         args.vdirsyncer.resolve(strict=True) if args.vdirsyncer else None)
             verify_dav_recurrence_query(test, owner, viewer)
             verify_dav_advanced_recurrence(test, owner, viewer)
             verify_availability(test, owner, viewer)
@@ -823,12 +940,14 @@ def main():
             guest = DavClient(test, viewer)
             assert dav_busy(guest, path)
             assert guest.request("GET", path + "/Roadmap.ics")[0] == 200
+            assert guest.request("GET", alias + "Roadmap.ics")[0] == 200
             assert guest.request("GET", path + "/Budget.ics")[0] == 404
             deleted = DavClient(test, owner).request("DELETE", path)
             assert deleted[0] == 204, deleted
             assert shares(test, invited) == []
             expect(test.api(invited, query), 404)
             dav_busy(DavClient(test, viewer), path, status=404)
+            assert guest.request("PROPFIND", alias)[0] == 404
 
         with test.daemon():
             captain, invited = test.login(owner), test.login(viewer)
@@ -838,6 +957,7 @@ def main():
             expect(test.api(invited, event_query(calendar_id)), 404)
             dav_busy(DavClient(test, viewer), calendar_path(owner, CALENDAR), status=404)
             assert DavClient(test, viewer).request("GET", calendar_path(owner, CALENDAR) + "/Replacement.ics")[0] == 404
+            assert DavClient(test, viewer).request("GET", alias + "Replacement.ics")[0] == 404
 
     print("Verified calendar sharing in webmail and CalDAV, including sub-daily rules, range overrides, public event reads and writes, private free/busy, revision races, revocation, restart, and calendar ID reuse.")
 

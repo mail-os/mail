@@ -487,9 +487,14 @@ Viewers and editors can open the shared collection at that same URL.
 `calendar-query` and `calendar-multiget` return public event resources.
 Event URLs also support `GET` and `HEAD`. The collection's
 `DAV:current-user-privilege-set` describes whether the requester can edit.
-Use the shared collection URL directly and refresh the listing to reconcile
-changes. Shared collections are not listed in the teammate's calendar home
-and do not expose the owner's sync token, change tag, or change journal.
+The teammate's CalDAV principal advertises a personal home and a shared
+home. The shared home lists only calendars the teammate can read. Each has a
+stable URL under `/shared-calendars/<teammate>/` and uses the same grants as the
+owner's direct URL. For clients that discover only the first calendar home,
+enter the shared home URL as an additional CalDAV connection with the
+teammate's credentials. Changes can be reconciled with a fresh listing and
+its per-event ETags. Shared calendars keep the owner's sync token, change tag,
+and change journal private.
 
 In both owned and shared collections, a `VEVENT` time range in a
 `calendar-query` report matches any overlapping occurrence. Results include

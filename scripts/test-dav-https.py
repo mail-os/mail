@@ -439,7 +439,7 @@ def check_calendar_writes(test, other):
     return owner, item, resource, final["ETag"]
 
 
-def configure_vdirsyncer(test, client, profiles, collections, executable, directory):
+def configure_vdirsyncer(test, client, profiles, collections, executable, directory, discovery_path="/"):
     # Use the discovered mail profile coordinates with the fixture trust root.
     root = test.directory / directory
     root.mkdir(mode=0o700)
@@ -452,12 +452,13 @@ def configure_vdirsyncer(test, client, profiles, collections, executable, direct
         profile = profiles[prefix]
         host, port = profile[prefix + "HostName"], profile[prefix + "Port"]
         local = root / kind
-        (local / collection).mkdir(parents=True)
-        local_files.append((local / collection, ext))
+        folder = local / urllib.parse.unquote(collection)
+        folder.mkdir(parents=True)
+        local_files.append((folder, ext))
         content += (f'\n[pair {kind}]\na = "{kind}_local"\nb = "{kind}_remote"\ncollections = ["from b"]\n'
                     f'\n[storage {kind}_local]\ntype = "filesystem"\npath = {json.dumps(str(local))}\n'
                     f'fileext = "{ext}"\n\n[storage {kind}_remote]\ntype = "{kind}"\n'
-                    f'url = "https://{host}:{port}/"\nusername = {json.dumps(client.mailbox)}\n'
+                    f'url = {json.dumps(f"https://{host}:{port}{discovery_path}")}\nusername = {json.dumps(client.mailbox)}\n'
                     f'password = {json.dumps(client.password)}\nverify = {json.dumps(str(test.directory / "test.pem"))}\n')
     config.write_text(content)
     config.chmod(0o600)
@@ -500,10 +501,11 @@ def check_native_client(test, client, profiles, expected, executable):
 
 def check_editor_with_native_client(test, client, resource, endpoint, session, executable):
     run, local = configure_vdirsyncer(test, client, client.profile(), {"CalDAV": "Working%20calendar"}, executable, "vdirsyncer-editor")
+    folder, extension = local[0]
+    (folder.parent / "Outside projects").mkdir()
     run("discover")
     run("sync")
-    folder, extension = local[0]
-    file, = folder.parent.rglob("*" + extension)
+    file, = folder.glob("*" + extension)
     original = file.read_bytes()
     assert b"DTSTART;VALUE=DATE:20261201" in original
     changed, replacements = re.subn(rb"(?m)^SUMMARY:[^\r\n]+", b"SUMMARY:Vdirsyncer changed the event", original)

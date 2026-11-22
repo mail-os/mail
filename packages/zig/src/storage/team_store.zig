@@ -286,14 +286,18 @@ pub fn calendarShares(db: *database.Database, a: Allocator, mailbox: []const u8)
     defer tx.deinit();
     const principal = (try identity(tx, mailbox)) orelse return &.{};
     if (!principal.enabled) return &.{};
+    return calendarSharesFor(tx, a, principal.id, false);
+}
+
+pub fn calendarSharesFor(tx: Tx, a: Allocator, user_id: i64, incoming_only: bool) ![]CalendarShare {
     const stmt = try tx.prepare(
         \\SELECT p.team_id,p.source_id,s.username,g.username,p.calendar_share_id,p.access
         \\FROM mail_team_calendar_shares p JOIN users s ON s.id=p.source_id JOIN users g ON g.id=p.grantee_id
-        \\WHERE (p.source_id=?1 OR p.grantee_id=?1) AND s.enabled=1 AND g.enabled=1
+        \\WHERE (p.grantee_id=?1 OR (NOT ?2 AND p.source_id=?1)) AND s.enabled=1 AND g.enabled=1
         \\ORDER BY s.username,g.username,p.team_id,p.calendar_share_id
     );
     defer stmt.finalize();
-    try stmt.bind(1, principal.id);
+    try bind(stmt, .{ user_id, @as(i64, @intFromBool(incoming_only)) });
     var rows: std.ArrayList(CalendarShare) = .empty;
     while (try stmt.step()) {
         const share_id = stmt.columnText(4);

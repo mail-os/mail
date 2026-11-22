@@ -1628,16 +1628,29 @@ pub const CalDavStore = struct {
         sources: []const icalendar_busy.Source,
     };
 
-    pub const DavCalendarTarget = struct { owner: []const u8, collection: []const u8 };
+    pub const DavCalendarTarget = union(enum) {
+        named: struct { owner: []const u8, collection: []const u8 },
+        shared: teams.CalendarShareId,
+    };
     const BusyTarget = union(enum) { web: u64, dav: DavCalendarTarget };
 
     fn resolveDavCalendarLocked(self: *Self, access: CalendarRequest, target: DavCalendarTarget) !Calendar {
+        if (target == .shared) {
+            var calendars = self.calendars.valueIterator();
+            while (calendars.next()) |calendar| {
+                if (calendar.share_id) |id| {
+                    if (std.mem.eql(u8, &id, &target.shared)) return calendar.*;
+                }
+            }
+            return error.CalendarNotFound;
+        }
+        const named = target.named;
         const mailbox_id = if (access.account_tx) |tx|
-            (try teams.activeMailboxId(tx, target.owner)) orelse return error.CalendarNotFound
+            (try teams.activeMailboxId(tx, named.owner)) orelse return error.CalendarNotFound
         else
             null;
-        const owner_id = self.findUserIdLocked(target.owner, mailbox_id) orelse return error.CalendarNotFound;
-        return self.getCalendarByName(owner_id, target.collection) orelse error.CalendarNotFound;
+        const owner_id = self.findUserIdLocked(named.owner, mailbox_id) orelse return error.CalendarNotFound;
+        return self.getCalendarByName(owner_id, named.collection) orelse error.CalendarNotFound;
     }
 
     const SharedDavCalendar = struct { calendar: Calendar, permission: CalendarPermission };
@@ -1645,6 +1658,7 @@ pub const CalDavStore = struct {
     fn sharedDavCalendarLocked(self: *Self, access: CalendarRequest, target: DavCalendarTarget, action: CalendarAction) !SharedDavCalendar {
         const calendar = try self.resolveDavCalendarLocked(access, target);
         const permission = (try self.calendarPermissionLocked(access, calendar)) orelse return error.CalendarNotFound;
+        if (target == .shared and permission == .owner) return error.CalendarNotFound;
         switch (permission) {
             .owner, .editor => {},
             .viewer => if (action == .edit) return error.CalendarNotFound,
@@ -1712,8 +1726,40 @@ pub const CalDavStore = struct {
     pub const DavCalendarSnapshot = struct {
         timezone: []const u8 = "UTC",
         editable: bool = false,
+        name: []const u8 = "",
         members: []const DavCalendarMember = &.{},
     };
+
+    pub const DavSharedCollection = struct { id: teams.CalendarShareId, name: []const u8, editable: bool };
+
+    pub fn snapshotSharedDavCollections(self: *Self, arena: Allocator, username: []const u8) ![]DavSharedCollection {
+        const access = try self.beginCalendarAccess(username, .read);
+        defer access.deinit();
+        const tx = access.account_tx orelse return &.{};
+        const user_id = access.mailbox_id orelse return &.{};
+        const grants = try teams.calendarSharesFor(tx, arena, user_id, true);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const Readable = struct { user_id: u64, editable: bool };
+        var readable: std.AutoHashMapUnmanaged(teams.CalendarShareId, Readable) = .empty;
+        for (grants) |grant| {
+            if (grant.access == .free_busy) continue;
+            const owner = self.findUserIdLocked(grant.source, grant.source_id) orelse continue;
+            const entry = try readable.getOrPut(arena, grant.calendar_share_id);
+            if (!entry.found_existing) entry.value_ptr.* = .{ .user_id = owner, .editable = false };
+            if (entry.value_ptr.user_id == owner and grant.access == .editor) entry.value_ptr.editable = true;
+        }
+        var result: std.ArrayList(DavSharedCollection) = .empty;
+        var calendars = self.calendars.valueIterator();
+        while (calendars.next()) |calendar| {
+            const id = calendar.share_id orelse continue;
+            const grant = readable.get(id) orelse continue;
+            if (calendar.user_id != grant.user_id) continue;
+            try result.append(arena, .{ .id = id, .name = try arena.dupe(u8, calendar.name), .editable = grant.editable });
+        }
+        return result.items;
+    }
 
     pub fn snapshotSharedDavMembers(self: *Self, arena: Allocator, username: []const u8, target: DavCalendarTarget, listing: SharedDavListing) !DavCalendarSnapshot {
         const access = try self.beginCalendarAccess(username, .read);
@@ -1723,6 +1769,7 @@ pub const CalDavStore = struct {
         const authorized = try self.sharedDavCalendarLocked(access, target, .read);
         var snapshot = try self.snapshotDavCalendarLocked(arena, authorized.calendar, listing, .shared);
         snapshot.editable = authorized.permission != .viewer;
+        snapshot.name = try arena.dupe(u8, authorized.calendar.name);
         return snapshot;
     }
 
@@ -1782,7 +1829,8 @@ pub const CalDavStore = struct {
             .web => |id| self.calendars.get(id) orelse return error.CalendarNotFound,
             .dav => |path| try self.resolveDavCalendarLocked(access, path),
         };
-        _ = (try self.calendarPermissionLocked(access, calendar)) orelse return error.CalendarNotFound;
+        const permission = (try self.calendarPermissionLocked(access, calendar)) orelse return error.CalendarNotFound;
+        if (target == .dav and target.dav == .shared and permission == .owner) return error.CalendarNotFound;
         if (!include_members) return .{ .timezone = "UTC", .sources = &.{} };
 
         // Copy a bounded snapshot under the authorization lock, then expand

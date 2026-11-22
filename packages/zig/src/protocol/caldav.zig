@@ -162,6 +162,9 @@ pub const ParsedPath = struct {
         calendars_home,
         calendar_collection,
         calendar_resource,
+        shared_calendars_home,
+        shared_calendar_collection,
+        shared_calendar_resource,
         addressbooks_home,
         addressbook_collection,
         addressbook_resource,
@@ -404,6 +407,16 @@ pub fn parsePath(path: []const u8) ParsedPath {
         }
     }
 
+    if (std.mem.eql(u8, segments[0], "shared-calendars")) {
+        if (seg_count == 2) return .{ .path_type = .shared_calendars_home, .user = segments[1] };
+        if (seg_count == 3) return .{ .path_type = .shared_calendar_collection, .user = segments[1], .collection = segments[2] };
+        if (seg_count == 4) {
+            const filename = segments[3];
+            const uid = if (std.mem.endsWith(u8, filename, ".ics")) filename[0 .. filename.len - 4] else filename;
+            return .{ .path_type = .shared_calendar_resource, .user = segments[1], .collection = segments[2], .resource_uid = uid };
+        }
+    }
+
     // /addressbooks/...
     if (std.mem.eql(u8, segments[0], "addressbooks")) {
         if (seg_count == 1) return .{ .path_type = .addressbooks_home };
@@ -474,7 +487,7 @@ fn appendXmlEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, compt
 fn appendResourceHref(
     buf: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
-    comptime base: []const u8,
+    base: []const u8,
     user: []const u8,
     collection: []const u8,
     uid: []const u8,
@@ -487,7 +500,8 @@ fn appendResourceHref(
     const uid_esc = try xmlEscape(allocator, uid);
     defer allocator.free(uid_esc);
 
-    try buf.appendSlice(allocator, "    <D:href>" ++ base);
+    try buf.appendSlice(allocator, "    <D:href>");
+    try buf.appendSlice(allocator, base);
     try buf.appendSlice(allocator, user_esc);
     try buf.appendSlice(allocator, "/");
     try buf.appendSlice(allocator, coll_esc);
@@ -500,10 +514,14 @@ const dav_multistatus_start = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" ++
     "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n";
 
 fn appendDavSyncMember(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, user: []const u8, collection: []const u8, kind: caldav_store.SyncChange.ResourceType, member: caldav_store.DavSyncMember) !void {
+    return appendDavMemberAt(buf, allocator, user, collection, kind, if (kind == .event) "/calendars/" else "/addressbooks/", member);
+}
+
+fn appendDavMemberAt(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, user: []const u8, collection: []const u8, kind: caldav_store.SyncChange.ResourceType, base: []const u8, member: caldav_store.DavSyncMember) !void {
     try buf.appendSlice(allocator, "  <D:response>\n");
     switch (kind) {
-        .event => try appendResourceHref(buf, allocator, "/calendars/", user, collection, member.uid, ".ics"),
-        .contact => try appendResourceHref(buf, allocator, "/addressbooks/", user, collection, member.uid, ".vcf"),
+        .event => try appendResourceHref(buf, allocator, base, user, collection, member.uid, ".ics"),
+        .contact => try appendResourceHref(buf, allocator, base, user, collection, member.uid, ".vcf"),
     }
     if (member.etag) |etag| {
         try buf.appendSlice(allocator, "    <D:propstat><D:prop>\n");
@@ -526,7 +544,7 @@ fn appendHrefEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, href
 fn appendCollectionHref(
     buf: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
-    comptime base: []const u8,
+    base: []const u8,
     user: []const u8,
     collection: []const u8,
 ) !void {
@@ -535,7 +553,8 @@ fn appendCollectionHref(
     const coll_esc = try xmlEscape(allocator, collection);
     defer allocator.free(coll_esc);
 
-    try buf.appendSlice(allocator, "    <D:href>" ++ base);
+    try buf.appendSlice(allocator, "    <D:href>");
+    try buf.appendSlice(allocator, base);
     try buf.appendSlice(allocator, user_esc);
     try buf.appendSlice(allocator, "/");
     try buf.appendSlice(allocator, coll_esc);
@@ -779,7 +798,18 @@ pub const CalDavSession = struct {
             }
         }
         if (parsed.user) |owner| {
-            if (!try self.ownsPath(owner)) return self.handleSharedCalendar(method, parsed, request, config);
+            const owned = try self.ownsPath(owner);
+            switch (parsed.path_type) {
+                .shared_calendars_home => {
+                    if (!owned or !config.enable_caldav) return self.sendError(404, "Not Found");
+                    return self.handleSharedCalendarHome(method, owner, request);
+                },
+                .shared_calendar_collection, .shared_calendar_resource => {
+                    if (!owned) return self.sendError(404, "Not Found");
+                    return self.handleSharedCalendar(method, parsed, request, config);
+                },
+                else => if (!owned) return self.handleSharedCalendar(method, parsed, request, config),
+            }
         }
         switch (method) {
             .options => try self.handleOptions(),
@@ -811,6 +841,49 @@ pub const CalDavSession = struct {
 
     const DavCalendarTarget = caldav_store.CalDavStore.DavCalendarTarget;
 
+    const CalendarPath = struct {
+        user: []const u8,
+        collection: []const u8,
+        shared_alias: bool = false,
+
+        fn base(self: CalendarPath) []const u8 {
+            return if (self.shared_alias) "/shared-calendars/" else "/calendars/";
+        }
+    };
+
+    fn parseShareId(value: []const u8) ?@FieldType(DavCalendarTarget, "shared") {
+        if (value.len != 32) return null;
+        for (value) |digit| if (!(std.ascii.isDigit(digit) or (digit >= 'a' and digit <= 'f'))) return null;
+        return value[0..32].*;
+    }
+
+    fn handleSharedCalendarHome(self: *CalDavSession, method: HttpMethod, user: []const u8, request: []const u8) !void {
+        if (method == .options) return self.handleOptions();
+        if (method != .propfind) return self.sendError(404, "Not Found");
+        const username = self.username orelse return error.NotAuthenticated;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const depth = requestHeader(request, "Depth") orelse "0";
+        if (!std.mem.eql(u8, depth, "0") and !std.mem.eql(u8, depth, "1") and !std.mem.eql(u8, depth, "infinity"))
+            return self.sendError(400, "Invalid Depth");
+        var buf: std.ArrayList(u8) = .empty;
+        try buf.appendSlice(a, dav_multistatus_start ++ "  <D:response>\n");
+        try appendXmlEscaped(&buf, a, "    <D:href>/shared-calendars/", user, "/</D:href>\n");
+        try buf.appendSlice(a, "    <D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype>" ++
+            "<D:displayname>Shared calendars</D:displayname></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>\n  </D:response>\n");
+        if (!std.mem.eql(u8, depth, "0")) {
+            const shares = self.store.snapshotSharedDavCollections(a, username) catch |err| return self.sendResourceError(err);
+            for (shares) |*item| {
+                var scratch: [2048]u8 = undefined;
+                const display_name = percentDecodeOnce(item.name, &scratch) orelse item.name;
+                try self.appendDavCollection(&buf, a, user, &item.id, .event, null, null, .{ .editable = item.editable, .display_name = display_name, .alias = true });
+            }
+        }
+        try buf.appendSlice(a, "</D:multistatus>");
+        return self.sendMultistatusResponse(buf.items);
+    }
+
     fn handleSharedCalendar(self: *CalDavSession, method: HttpMethod, parsed: ParsedPath, request: []const u8, config: *const CalDavConfig) !void {
         if (!config.enable_caldav) return self.sendError(404, "Not Found");
         const username = self.username orelse return error.NotAuthenticated;
@@ -818,11 +891,16 @@ pub const CalDavSession = struct {
         var owner_buf: [2048]u8 = undefined;
         const owner = percentDecodeOnce(owner_path, &owner_buf) orelse return self.sendError(404, "Not Found");
         const collection = parsed.collection orelse return self.sendError(404, "Not Found");
-        const target: DavCalendarTarget = .{ .owner = owner, .collection = collection };
+        const alias = parsed.path_type == .shared_calendar_collection or parsed.path_type == .shared_calendar_resource;
+        const target: DavCalendarTarget = if (alias)
+            .{ .shared = parseShareId(collection) orelse return self.sendError(404, "Not Found") }
+        else
+            .{ .named = .{ .owner = owner, .collection = collection } };
+        const location: CalendarPath = .{ .user = owner_path, .collection = collection, .shared_alias = alias };
 
-        if (parsed.path_type == .calendar_collection)
-            return self.handleSharedCalendarListing(method, username, owner_path, target, request);
-        if (parsed.path_type != .calendar_resource) return self.sendError(404, "Not Found");
+        if (parsed.path_type == .calendar_collection or parsed.path_type == .shared_calendar_collection)
+            return self.handleSharedCalendarListing(method, username, location, target, request);
+        if (parsed.path_type != .calendar_resource and parsed.path_type != .shared_calendar_resource) return self.sendError(404, "Not Found");
         const uid = parsed.resource_uid orelse return self.sendError(404, "Not Found");
         switch (method) {
             .put => return self.handleCalendarPut(collection, uid, request, config, target),
@@ -841,7 +919,7 @@ pub const CalDavSession = struct {
                 if (method != .propfind) return self.sendDavResource(resource, request, .event, method == .head, true);
                 var buf: std.ArrayList(u8) = .empty;
                 try buf.appendSlice(a, dav_multistatus_start);
-                try appendDavSyncMember(&buf, a, owner_path, collection, .event, .{ .uid = uid, .etag = resource.etag });
+                try appendDavMemberAt(&buf, a, owner_path, collection, .event, location.base(), .{ .uid = uid, .etag = resource.etag });
                 try buf.appendSlice(a, "</D:multistatus>");
                 return self.sendMultistatusResponse(buf.items);
             },
@@ -849,7 +927,7 @@ pub const CalDavSession = struct {
         }
     }
 
-    fn handleSharedCalendarListing(self: *CalDavSession, method: HttpMethod, username: []const u8, owner_path: []const u8, target: DavCalendarTarget, request: []const u8) !void {
+    fn handleSharedCalendarListing(self: *CalDavSession, method: HttpMethod, username: []const u8, location: CalendarPath, target: DavCalendarTarget, request: []const u8) !void {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -862,7 +940,7 @@ pub const CalDavSession = struct {
                 const root = nextXmlOpen(&xml) orelse return self.sendError(404, "Not Found");
                 if (std.mem.eql(u8, root.localName(), "calendar-query")) break :blk .events;
                 if (std.mem.eql(u8, root.localName(), "calendar-multiget"))
-                    return self.handleSharedCalendarMultiget(a, username, target, xml);
+                    return self.handleSharedCalendarMultiget(a, username, location, target, xml);
                 return self.sendError(404, "Not Found");
             },
             else => return self.sendError(404, "Not Found"),
@@ -870,24 +948,26 @@ pub const CalDavSession = struct {
         const snapshot = self.store.snapshotSharedDavMembers(a, username, target, listing) catch |err|
             return self.sendResourceError(err);
         if (method == .options) return self.handleOptions();
-        if (listing == .events) return self.sendCalendarQuery(a, owner_path, target.collection, body, snapshot);
+        if (listing == .events) return self.sendCalendarQuery(a, location, body, snapshot);
         var buf: std.ArrayList(u8) = .empty;
         try buf.appendSlice(a, dav_multistatus_start);
-        try self.appendDavCollection(&buf, a, owner_path, target.collection, .event, null, null, snapshot.editable);
+        var scratch: [2048]u8 = undefined;
+        const name = percentDecodeOnce(snapshot.name, &scratch) orelse snapshot.name;
+        try self.appendDavCollection(&buf, a, location.user, location.collection, .event, null, null, .{ .editable = snapshot.editable, .display_name = name, .alias = location.shared_alias });
         for (snapshot.members) |member| {
-            try appendDavSyncMember(&buf, a, owner_path, target.collection, .event, .{ .uid = member.uid, .etag = member.etag });
+            try appendDavMemberAt(&buf, a, location.user, location.collection, .event, location.base(), .{ .uid = member.uid, .etag = member.etag });
         }
         try buf.appendSlice(a, "</D:multistatus>");
         return self.sendMultistatusResponse(buf.items);
     }
 
-    fn handleSharedCalendarMultiget(self: *CalDavSession, a: std.mem.Allocator, username: []const u8, target: DavCalendarTarget, body: []const u8) !void {
+    fn handleSharedCalendarMultiget(self: *CalDavSession, a: std.mem.Allocator, username: []const u8, location: CalendarPath, target: DavCalendarTarget, body: []const u8) !void {
         const Requested = struct { href: []const u8, uid: ?[]const u8 };
         var requests: std.ArrayList(Requested) = .empty;
         var uids: std.StringHashMapUnmanaged(void) = .empty;
         var xml = body;
         while (nextXmlText(&xml, "href")) |href| {
-            const uid = sharedCalendarHrefUid(target, href);
+            const uid = sharedCalendarHrefUid(location, href);
             if (uid) |name| {
                 if ((try uids.getOrPut(a, name)).found_existing) continue;
             }
@@ -913,13 +993,16 @@ pub const CalDavSession = struct {
         return self.sendMultistatusResponse(buf.items);
     }
 
-    fn sharedCalendarHrefUid(target: DavCalendarTarget, href: []const u8) ?[]const u8 {
+    fn sharedCalendarHrefUid(location: CalendarPath, href: []const u8) ?[]const u8 {
         const item = parsePath(href);
-        if (item.path_type != .calendar_resource or !std.mem.eql(u8, item.collection orelse return null, target.collection))
+        const resource: ParsedPath.PathType = if (location.shared_alias) .shared_calendar_resource else .calendar_resource;
+        if (item.path_type != resource or !std.mem.eql(u8, item.collection orelse return null, location.collection))
             return null;
-        var buffer: [2048]u8 = undefined;
-        const owner = percentDecodeOnce(item.user orelse return null, &buffer) orelse return null;
-        if (!std.mem.eql(u8, owner, target.owner)) return null;
+        var actual: [2048]u8 = undefined;
+        var expected: [2048]u8 = undefined;
+        const person = percentDecodeOnce(item.user orelse return null, &actual) orelse return null;
+        const owner = percentDecodeOnce(location.user, &expected) orelse return null;
+        if (!std.mem.eql(u8, person, owner)) return null;
         return item.resource_uid;
     }
 
@@ -953,8 +1036,6 @@ pub const CalDavSession = struct {
         request: []const u8,
         config: *const CalDavConfig,
     ) !void {
-        _ = config;
-
         const depth_header = requestHeader(request, "Depth") orelse "0";
         const depth: u8 = if (std.mem.eql(u8, depth_header, "1") or std.mem.eql(u8, depth_header, "infinity")) 1 else 0;
 
@@ -995,7 +1076,10 @@ pub const CalDavSession = struct {
                 try buf.appendSlice(self.allocator, "      <D:prop>\n");
                 try buf.appendSlice(self.allocator, "        <D:resourcetype><D:principal/></D:resourcetype>\n");
                 try appendPrint(&buf, self.allocator, "        <D:current-user-principal><D:href>/principals/{s}</D:href></D:current-user-principal>\n", .{username_esc});
-                try appendPrint(&buf, self.allocator, "        <C:calendar-home-set><D:href>/calendars/{s}/</D:href></C:calendar-home-set>\n", .{username_esc});
+                try appendPrint(&buf, self.allocator, "        <C:calendar-home-set><D:href>/calendars/{s}/</D:href>", .{username_esc});
+                if (config.enable_caldav and self.store.config.account_db != null)
+                    try appendPrint(&buf, self.allocator, "<D:href>/shared-calendars/{s}/</D:href>", .{username_esc});
+                try buf.appendSlice(self.allocator, "</C:calendar-home-set>\n");
                 try appendPrint(&buf, self.allocator, "        <CARD:addressbook-home-set><D:href>/addressbooks/{s}/</D:href></CARD:addressbook-home-set>\n", .{username_esc});
                 try buf.appendSlice(self.allocator, "      </D:prop>\n");
                 try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
@@ -1064,20 +1148,26 @@ pub const CalDavSession = struct {
         try self.sendMultistatusResponse(buf.items);
     }
 
-    fn appendDavCollection(self: *CalDavSession, buf: *std.ArrayList(u8), a: std.mem.Allocator, username: []const u8, collection: []const u8, kind: caldav_store.SyncChange.ResourceType, token: ?[]const u8, ctag: ?[]const u8, shared_editable: ?bool) !void {
+    const SharedCollectionProperties = struct { editable: bool, display_name: []const u8, alias: bool };
+
+    fn appendDavCollection(self: *CalDavSession, buf: *std.ArrayList(u8), a: std.mem.Allocator, username: []const u8, collection: []const u8, kind: caldav_store.SyncChange.ResourceType, token: ?[]const u8, ctag: ?[]const u8, shared: ?SharedCollectionProperties) !void {
         try buf.appendSlice(a, "  <D:response>\n");
         switch (kind) {
-            .event => try appendCollectionHref(buf, a, "/calendars/", username, collection),
+            .event => try appendCollectionHref(buf, a, if (shared != null and shared.?.alias) "/shared-calendars/" else "/calendars/", username, collection),
             .contact => try appendCollectionHref(buf, a, "/addressbooks/", username, collection),
         }
         try buf.appendSlice(a, "    <D:propstat><D:prop>\n");
         switch (kind) {
-            .event => try buf.appendSlice(a, "      <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\n" ++
-                "      <C:supported-calendar-component-set><C:comp name=\"VEVENT\"/><C:comp name=\"VTODO\"/></C:supported-calendar-component-set>\n"),
+            .event => {
+                try buf.appendSlice(a, "      <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\n" ++
+                    "      <C:supported-calendar-component-set><C:comp name=\"VEVENT\"/>");
+                if (shared == null) try buf.appendSlice(a, "<C:comp name=\"VTODO\"/>");
+                try buf.appendSlice(a, "</C:supported-calendar-component-set>\n");
+            },
             .contact => try buf.appendSlice(a, "      <D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>\n" ++
                 "      <CARD:supported-address-data><CARD:address-data-type content-type=\"text/vcard\" version=\"3.0\"/></CARD:supported-address-data>\n"),
         }
-        try appendXmlEscaped(buf, a, "      <D:displayname>", collection, "</D:displayname>\n");
+        try appendXmlEscaped(buf, a, "      <D:displayname>", if (shared) |properties| properties.display_name else collection, "</D:displayname>\n");
         if (ctag) |tag| try appendXmlEscaped(buf, a, "      <CS:getctag xmlns:CS=\"http://calendarserver.org/ns/\">", tag, "</CS:getctag>\n");
         try buf.appendSlice(a, "      <D:supported-report-set>\n");
         switch (kind) {
@@ -1096,9 +1186,9 @@ pub const CalDavSession = struct {
         if (self.store.config.enable_sync_tokens) {
             if (token) |value| try appendXmlEscaped(buf, a, "      <D:sync-token>", value, "</D:sync-token>\n");
         }
-        if (shared_editable) |editable| {
+        if (shared) |properties| {
             try buf.appendSlice(a, "      <D:current-user-privilege-set><D:privilege><D:read/></D:privilege>\n");
-            if (editable) try buf.appendSlice(a, "        <D:privilege><D:write-content/></D:privilege><D:privilege><D:bind/></D:privilege><D:privilege><D:unbind/></D:privilege>\n");
+            if (properties.editable) try buf.appendSlice(a, "        <D:privilege><D:write-content/></D:privilege><D:privilege><D:bind/></D:privilege><D:privilege><D:unbind/></D:privilege>\n");
             try buf.appendSlice(a, "      </D:current-user-privilege-set>\n");
         }
         try buf.appendSlice(a, "    </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>\n  </D:response>\n");
@@ -1474,7 +1564,7 @@ pub const CalDavSession = struct {
         const requester = self.username orelse return error.NotAuthenticated;
         const owner_path = parsed.user orelse return self.sendError(404, "Not Found");
         if (parsed.path_type == .calendar_resource and try self.ownsPath(owner_path)) return self.sendError(403, "Forbidden");
-        if (parsed.path_type != .calendar_collection) return self.sendError(404, "Not Found");
+        if (parsed.path_type != .calendar_collection and parsed.path_type != .shared_calendar_collection) return self.sendError(404, "Not Found");
         const collection = parsed.collection orelse return self.sendError(404, "Not Found");
         if (body.len > 8192) return self.sendError(413, "Content Too Large");
         const window = free_busy.parse(body) catch return self.sendError(400, "Invalid free-busy report");
@@ -1483,13 +1573,19 @@ pub const CalDavSession = struct {
         if (include_members and !std.mem.eql(u8, depth, "1") and !std.mem.eql(u8, depth, "infinity"))
             return self.sendError(400, "Invalid Depth");
         var owner_buf: [2048]u8 = undefined;
-        const owner = if (try self.ownsPath(owner_path)) requester else percentDecodeOnce(owner_path, &owner_buf) orelse
-            return self.sendError(404, "Not Found");
+        const owned_path = try self.ownsPath(owner_path);
+        const target: DavCalendarTarget = if (parsed.path_type == .shared_calendar_collection) blk: {
+            if (!owned_path) return self.sendError(404, "Not Found");
+            break :blk .{ .shared = parseShareId(collection) orelse return self.sendError(404, "Not Found") };
+        } else .{ .named = .{
+            .owner = if (owned_path) requester else percentDecodeOnce(owner_path, &owner_buf) orelse return self.sendError(404, "Not Found"),
+            .collection = collection,
+        } };
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const periods = self.store.davCalendarBusyPeriods(a, requester, .{ .owner = owner, .collection = collection }, window, include_members) catch |err| switch (err) {
+        const periods = self.store.davCalendarBusyPeriods(a, requester, target, window, include_members) catch |err| switch (err) {
             error.CalendarNotFound, error.DavMailboxNotFound => return self.sendError(404, "Not Found"),
             error.InvalidRange => return self.sendError(400, "Invalid time range"),
             error.AvailabilityLimit => return self.sendError(413, "Availability calculation limit"),
@@ -1541,10 +1637,10 @@ pub const CalDavSession = struct {
         const a = scratch.allocator();
         const snapshot = self.store.snapshotOwnedDavQuery(a, user_id, collection) catch |err|
             return self.sendResourceError(err);
-        return self.sendCalendarQuery(a, owner, collection, httpBody(request), snapshot);
+        return self.sendCalendarQuery(a, .{ .user = owner, .collection = collection }, httpBody(request), snapshot);
     }
 
-    fn sendCalendarQuery(self: *CalDavSession, a: std.mem.Allocator, owner: []const u8, collection: []const u8, body: []const u8, snapshot: caldav_store.CalDavStore.DavCalendarSnapshot) !void {
+    fn sendCalendarQuery(self: *CalDavSession, a: std.mem.Allocator, location: CalendarPath, body: []const u8, snapshot: caldav_store.CalDavStore.DavCalendarSnapshot) !void {
         const query = calendar_query.parse(a, body) catch |err| switch (err) {
             error.InvalidXml, error.InvalidFilter => return self.sendError(400, "Invalid CalDAV filter"),
             error.InvalidQueryTimezone => return self.sendError(400, "Invalid CalDAV timezone"),
@@ -1564,7 +1660,7 @@ pub const CalDavSession = struct {
                 if (!matches) continue;
             }
             try buf.appendSlice(a, "  <D:response>\n");
-            try appendResourceHref(&buf, a, "/calendars/", owner, collection, member.uid, ".ics");
+            try appendResourceHref(&buf, a, location.base(), location.user, location.collection, member.uid, ".ics");
             try appendMultigetProperties(&buf, a, "C:calendar-data", member.etag, member.source.icalendar);
         }
         try buf.appendSlice(a, "</D:multistatus>");
