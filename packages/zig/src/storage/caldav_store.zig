@@ -1515,7 +1515,7 @@ pub const CalDavStore = struct {
         return .{ .name = try arena.dupe(u8, calendar.name), .records = records.items };
     }
 
-    pub const CalendarWindow = struct { start: i64, end: i64 };
+    pub const CalendarWindow = icalendar_busy.Window;
     pub const ReminderSnapshot = struct {
         events: []CalendarEventSummary = &.{},
         dismissed: [][]const u8 = &.{},
@@ -1620,20 +1620,55 @@ pub const CalDavStore = struct {
         sources: []const icalendar_busy.Source,
     };
 
-    pub fn webCalendarBusyPeriods(self: *Self, arena: Allocator, username: []const u8, id: u64, window: CalendarWindow) ![]icalendar_busy.Period {
-        try validateCalendarQuery(window, "");
-        if (window.start < -62135596800 or window.end >= 253402300800) return error.InvalidRange;
-        const snapshot = try self.snapshotWebCalendarBusyPeriods(arena, username, id);
-        return icalendar_busy.calculate(arena, self.allocator, snapshot.sources, .{ .start = window.start, .end = window.end }, snapshot.timezone);
+    pub const DavBusyTarget = struct { owner: []const u8, collection: []const u8 };
+    const BusyTarget = union(enum) { web: u64, dav: DavBusyTarget };
+
+    pub fn webCalendarBusyPeriods(self: *Self, arena: Allocator, username: []const u8, id: u64, window: CalendarWindow) ![]icalendar_busy.Window {
+        try validateBusyWindow(window);
+        const snapshot = try self.snapshotCalendarBusyPeriods(arena, username, .{ .web = id }, true);
+        const periods = try icalendar_busy.calculate(arena, self.allocator, snapshot.sources, window, snapshot.timezone, .combined);
+        const result = try arena.alloc(icalendar_busy.Window, periods.len);
+        for (result, periods) |*bounds, period| bounds.* = .{ .start = period.start, .end = period.end };
+        return result;
     }
 
-    fn snapshotWebCalendarBusyPeriods(self: *Self, arena: Allocator, username: []const u8, id: u64) !BusySnapshot {
+    pub fn davCalendarBusyPeriods(self: *Self, arena: Allocator, username: []const u8, target: DavBusyTarget, window: CalendarWindow, include_members: bool) ![]icalendar_busy.Period {
+        try validateBusyWindow(window);
+        const snapshot = try self.snapshotCalendarBusyPeriods(arena, username, .{ .dav = target }, include_members);
+        return icalendar_busy.calculate(arena, self.allocator, snapshot.sources, window, snapshot.timezone, .by_type);
+    }
+
+    fn validateBusyWindow(window: CalendarWindow) !void {
+        try validateCalendarQuery(window, "");
+        if (window.start < -62135596800 or window.end >= 253402300800) return error.InvalidRange;
+    }
+
+    fn resolveBusyCalendarLocked(self: *Self, access: CalendarRequest, target: BusyTarget) !Calendar {
+        return switch (target) {
+            .web => |id| self.calendars.get(id) orelse error.CalendarNotFound,
+            .dav => |path| blk: {
+                const mailbox_id = if (access.account_tx) |tx|
+                    (try teams.activeMailboxId(tx, path.owner)) orelse return error.CalendarNotFound
+                else
+                    null;
+                const owner_id = self.findUserIdLocked(path.owner, mailbox_id) orelse return error.CalendarNotFound;
+                var calendars = self.calendars.valueIterator();
+                while (calendars.next()) |calendar| {
+                    if (calendar.user_id == owner_id and std.mem.eql(u8, calendar.name, path.collection)) break :blk calendar.*;
+                }
+                return error.CalendarNotFound;
+            },
+        };
+    }
+
+    fn snapshotCalendarBusyPeriods(self: *Self, arena: Allocator, username: []const u8, target: BusyTarget, include_members: bool) !BusySnapshot {
         const access = try self.beginCalendarAccess(username, .read);
         defer access.deinit();
         self.mutex.lock();
         defer self.mutex.unlock();
-        const calendar = self.calendars.get(id) orelse return error.CalendarNotFound;
+        const calendar = try self.resolveBusyCalendarLocked(access, target);
         _ = (try self.calendarPermissionLocked(access, calendar)) orelse return error.CalendarNotFound;
+        if (!include_members) return .{ .timezone = "UTC", .sources = &.{} };
 
         // Copy a bounded snapshot under the authorization lock, then expand
         // recurrence outside both locks. No calendar source enters the response.
@@ -1641,7 +1676,7 @@ pub const CalDavStore = struct {
         var bytes: usize = 0;
         var events = self.events.valueIterator();
         while (events.next()) |event| {
-            if (event.calendar_id != id) continue;
+            if (event.calendar_id != calendar.id) continue;
             bytes += event.ics_data.len;
             if (bytes > 16 * 1024 * 1024 or sources.items.len == 32_000) return error.AvailabilityLimit;
             try sources.append(arena, .{
@@ -1650,6 +1685,7 @@ pub const CalDavStore = struct {
                 .end = event.dtend,
                 .all_day = event.all_day,
                 .cancelled = event.status == .cancelled,
+                .tentative = event.status == .tentative,
             });
         }
         return .{ .timezone = try arena.dupe(u8, calendar.timezone), .sources = sources.items };

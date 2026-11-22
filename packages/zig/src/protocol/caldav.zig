@@ -10,6 +10,7 @@ const tls = @import("tls");
 const time_compat = @import("../core/time_compat.zig");
 const caldav_store = @import("../storage/caldav_store.zig");
 const calendar_import = @import("../api/webmail_calendar_import.zig");
+const free_busy = @import("caldav_free_busy.zig");
 const autoconfig = @import("../api/autoconfig.zig");
 const eas = @import("eas.zig");
 const ews = @import("ews/ews.zig");
@@ -766,6 +767,16 @@ pub const CalDavSession = struct {
         config: *const CalDavConfig,
     ) !void {
         const parsed = parsePath(path);
+        // Availability is the only REPORT dispatched here for another mailbox.
+        // Its collection lookup and grant check run together in the DAV store.
+        if (method == .report and config.enable_caldav) {
+            const body = httpBody(request);
+            var rest = body;
+            if (nextXmlOpen(&rest)) |root| {
+                if (std.mem.eql(u8, root.localName(), "free-busy-query"))
+                    return self.handleFreeBusy(parsed, request, body);
+            }
+        }
         if (parsed.user) |owner| {
             if (!try self.ownsPath(owner)) return self.sendError(404, "Not Found");
         }
@@ -956,7 +967,8 @@ pub const CalDavSession = struct {
         try buf.appendSlice(a, "      <D:supported-report-set>\n");
         switch (kind) {
             .event => try buf.appendSlice(a, "        <D:supported-report><D:report><C:calendar-query/></D:report></D:supported-report>\n" ++
-                "        <D:supported-report><D:report><C:calendar-multiget/></D:report></D:supported-report>\n"),
+                "        <D:supported-report><D:report><C:calendar-multiget/></D:report></D:supported-report>\n" ++
+                "        <D:supported-report><D:report><C:free-busy-query/></D:report></D:supported-report>\n"),
             .contact => try buf.appendSlice(a, "        <D:supported-report><D:report><CARD:addressbook-query/></D:report></D:supported-report>\n" ++
                 "        <D:supported-report><D:report><CARD:addressbook-multiget/></D:report></D:supported-report>\n"),
         }
@@ -1326,6 +1338,39 @@ pub const CalDavSession = struct {
         } else {
             try self.sendError(400, "Invalid MKCOL path");
         }
+    }
+
+    fn handleFreeBusy(self: *CalDavSession, parsed: ParsedPath, request: []const u8, body: []const u8) !void {
+        const requester = self.username orelse return error.NotAuthenticated;
+        const owner_path = parsed.user orelse return self.sendError(404, "Not Found");
+        if (parsed.path_type == .calendar_resource and try self.ownsPath(owner_path)) return self.sendError(403, "Forbidden");
+        if (parsed.path_type != .calendar_collection) return self.sendError(404, "Not Found");
+        const collection = parsed.collection orelse return self.sendError(404, "Not Found");
+        if (body.len > 8192) return self.sendError(413, "Content Too Large");
+        const window = free_busy.parse(body) catch return self.sendError(400, "Invalid free-busy report");
+        const depth = requestHeader(request, "Depth") orelse "0";
+        const include_members = !std.mem.eql(u8, depth, "0");
+        if (include_members and !std.mem.eql(u8, depth, "1") and !std.mem.eql(u8, depth, "infinity"))
+            return self.sendError(400, "Invalid Depth");
+        var owner_buf: [2048]u8 = undefined;
+        const owner = if (try self.ownsPath(owner_path)) requester else percentDecodeOnce(owner_path, &owner_buf) orelse
+            return self.sendError(404, "Not Found");
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const periods = self.store.davCalendarBusyPeriods(a, requester, .{ .owner = owner, .collection = collection }, window, include_members) catch |err| switch (err) {
+            error.CalendarNotFound, error.DavMailboxNotFound => return self.sendError(404, "Not Found"),
+            error.InvalidRange => return self.sendError(400, "Invalid time range"),
+            error.AvailabilityLimit => return self.sendError(413, "Availability calculation limit"),
+            error.AvailabilityUnsupported, error.InvalidCalendar, error.UnsupportedTimezone => return self.sendError(422, "Availability incomplete"),
+            else => return err,
+        };
+        const content = try free_busy.render(a, window, periods, currentTimestamp());
+        var header: [256]u8 = undefined;
+        try self.writeAll(try std.fmt.bufPrint(&header, "HTTP/1.1 200 OK\r\nContent-Type: text/calendar; charset=utf-8\r\n" ++
+            "Cache-Control: no-store\r\nContent-Length: {d}\r\n\r\n", .{content.len}));
+        try self.writeAll(content);
     }
 
     /// Handle REPORT request (calendar/contact queries)

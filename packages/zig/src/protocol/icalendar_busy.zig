@@ -8,21 +8,37 @@ const Date = clock.Date;
 const day: i64 = 86400;
 
 pub const Window = struct { start: i64, end: i64 };
-pub const Period = struct { start: i64, end: i64 };
+pub const BusyType = enum {
+    busy,
+    tentative,
+    unavailable,
+
+    pub fn label(self: BusyType) []const u8 {
+        return switch (self) {
+            .busy => "BUSY",
+            .tentative => "BUSY-TENTATIVE",
+            .unavailable => "BUSY-UNAVAILABLE",
+        };
+    }
+};
+pub const Period = struct { start: i64, end: i64, kind: BusyType };
+pub const Grouping = enum { combined, by_type };
 pub const Source = struct {
     icalendar: []const u8,
     start: i64,
     end: ?i64,
     all_day: bool,
     cancelled: bool,
+    tentative: bool,
 };
 
-pub fn calculate(a: Allocator, scratch_allocator: Allocator, sources: []const Source, window: Window, timezone: []const u8) ![]Period {
+pub fn calculate(a: Allocator, scratch_allocator: Allocator, sources: []const Source, window: Window, timezone: []const u8, grouping: Grouping) ![]Period {
     var periods: std.ArrayList(Period) = .empty;
     var budget: usize = 250_000;
     for (sources) |source| {
         if (source.icalendar.len == 0) {
-            if (!source.cancelled) try appendPeriod(a, &periods, window, source.start, source.end orelse (source.start +| if (source.all_day) day else 0));
+            const end = source.end orelse (source.start +| if (source.all_day) day else 0);
+            if (!source.cancelled) try appendPeriod(a, &periods, window, source.start, end, if (source.tentative) .tentative else .busy);
             continue;
         }
         var scratch = std.heap.ArenaAllocator.init(scratch_allocator);
@@ -31,23 +47,28 @@ pub fn calculate(a: Allocator, scratch_allocator: Allocator, sources: []const So
     }
     std.mem.sort(Period, periods.items, {}, struct {
         fn lessThan(_: void, left: Period, right: Period) bool {
-            return left.start < right.start;
+            return left.start < right.start or (left.start == right.start and left.end < right.end);
         }
     }.lessThan);
     var count: usize = 0;
+    var previous: [std.meta.tags(BusyType).len]?usize = @splat(null);
     for (periods.items) |period| {
-        if (count > 0 and period.start <= periods.items[count - 1].end) {
-            periods.items[count - 1].end = @max(periods.items[count - 1].end, period.end);
-        } else {
-            periods.items[count] = period;
-            count += 1;
+        const slot = &previous[if (grouping == .combined) 0 else @backingInt(period.kind)];
+        if (slot.*) |index| {
+            if (period.start <= periods.items[index].end) {
+                periods.items[index].end = @max(periods.items[index].end, period.end);
+                continue;
+            }
         }
+        periods.items[count] = period;
+        slot.* = count;
+        count += 1;
     }
     return periods.items[0..count];
 }
 
-fn appendPeriod(a: Allocator, periods: *std.ArrayList(Period), window: Window, start: i64, end: i64) !void {
-    const clipped = Period{ .start = @max(window.start, start), .end = @min(window.end, end) };
+fn appendPeriod(a: Allocator, periods: *std.ArrayList(Period), window: Window, start: i64, end: i64, kind: BusyType) !void {
+    const clipped = Period{ .start = @max(window.start, start), .end = @min(window.end, end), .kind = kind };
     if (clipped.start >= clipped.end) return;
     if (periods.items.len >= 32_000) return error.AvailabilityLimit;
     try periods.append(a, clipped);
@@ -109,8 +130,10 @@ const Event = struct {
     finish: ?ical.Property = null,
     duration: ?[]const u8 = null,
     recurrence_id: ?ical.Property = null,
-    cancelled: ?bool = null,
+    status: ?Status = null,
     transparent: ?bool = null,
+
+    const Status = enum { confirmed, tentative, cancelled };
 
     fn read(a: Allocator, component: ical.Component) !Event {
         var event = Event{ .component = component };
@@ -121,7 +144,12 @@ const Event = struct {
             if (field.named("DURATION")) event.duration = field.value;
             if (field.named("RECURRENCE-ID")) event.recurrence_id = field;
             if (field.named("TRANSP")) event.transparent = std.ascii.eqlIgnoreCase(field.value, "TRANSPARENT");
-            if (field.named("STATUS")) event.cancelled = std.ascii.eqlIgnoreCase(field.value, "CANCELLED");
+            if (field.named("STATUS")) event.status = if (std.ascii.eqlIgnoreCase(field.value, "CANCELLED"))
+                .cancelled
+            else if (std.ascii.eqlIgnoreCase(field.value, "TENTATIVE"))
+                .tentative
+            else
+                .confirmed;
             if (field.named("EXRULE")) return error.AvailabilityUnsupported;
         }
         return event;
@@ -146,6 +174,35 @@ const Event = struct {
     }
 };
 
+fn appendStoredFreeBusy(a: Allocator, periods: *std.ArrayList(Period), scratch: Allocator, component: ical.Component, window: Window) !void {
+    var fields = ical.Properties.init(component);
+    while (try fields.next(scratch)) |field| {
+        if (!field.named("FREEBUSY")) continue;
+        const kind = if (field.param("FBTYPE")) |name| blk: {
+            if (std.ascii.eqlIgnoreCase(name, "FREE")) continue;
+            if (std.ascii.eqlIgnoreCase(name, "BUSY-TENTATIVE")) break :blk BusyType.tentative;
+            if (std.ascii.eqlIgnoreCase(name, "BUSY-UNAVAILABLE")) break :blk BusyType.unavailable;
+            break :blk BusyType.busy;
+        } else .busy;
+        var values = std.mem.splitScalar(u8, field.value, ',');
+        while (values.next()) |value| {
+            const slash = std.mem.indexOfScalar(u8, value, '/') orelse return error.InvalidCalendar;
+            const start = Date.parse(value[0..slash]) orelse return error.InvalidCalendar;
+            if (start.kind != .utc) return error.InvalidCalendar;
+            const right = value[slash + 1 ..];
+            const end = if (clock.duration(right)) |duration|
+                start.epoch() + duration.days * day + duration.seconds
+            else blk: {
+                const date = Date.parse(right) orelse return error.InvalidCalendar;
+                if (date.kind != .utc) return error.InvalidCalendar;
+                break :blk date.epoch();
+            };
+            if (end <= start.epoch()) return error.InvalidCalendar;
+            try appendPeriod(a, periods, window, start.epoch(), end, kind);
+        }
+    }
+}
+
 fn appendResource(a: Allocator, periods: *std.ArrayList(Period), scratch: Allocator, source: []const u8, window: Window, timezone: []const u8, budget: *usize) !void {
     var zones = Zones{};
     var master: ?Event = null;
@@ -164,9 +221,16 @@ fn appendResource(a: Allocator, periods: *std.ArrayList(Period), scratch: Alloca
                 if (master != null) return error.InvalidCalendar;
                 master = event;
             }
-        } else return error.AvailabilityUnsupported;
+        } else if (std.ascii.eqlIgnoreCase(component.name, "VFREEBUSY")) {
+            try appendStoredFreeBusy(a, periods, scratch, component, window);
+        } else if (!std.ascii.eqlIgnoreCase(component.name, "VTODO") and !std.ascii.eqlIgnoreCase(component.name, "VJOURNAL")) {
+            return error.AvailabilityUnsupported;
+        }
     }
-    const event = master orelse return error.InvalidCalendar;
+    const event = master orelse {
+        if (detached.items.len != 0) return error.InvalidCalendar;
+        return;
+    };
     const start_field = event.start orelse return error.InvalidCalendar;
     const fallback = if (std.ascii.eqlIgnoreCase(timezone, "UTC")) null else try zones.get(scratch, timezone);
     const start = try Moment.read(scratch, &zones, start_field.value, start_field, fallback);
@@ -176,13 +240,15 @@ fn appendResource(a: Allocator, periods: *std.ArrayList(Period), scratch: Alloca
         if (original.param("RANGE") != null) return error.AvailabilityUnsupported;
         const recurrence = try Moment.read(scratch, &zones, original.value, original, start.zone);
         if ((try exclude.getOrPut(scratch, recurrence.stamp())).found_existing) return error.InvalidCalendar;
-        if ((item.cancelled orelse event.cancelled orelse false) or (item.transparent orelse event.transparent orelse false)) continue;
+        const status = item.status orelse event.status orelse .confirmed;
+        if (status == .cancelled or (item.transparent orelse event.transparent orelse false)) continue;
         const start_value = item.start orelse return error.InvalidCalendar;
         const moved = try Moment.read(scratch, &zones, start_value.value, start_value, start.zone);
         const length = if (item.finish == null and item.duration == null) try event.length(scratch, &zones, start) else try item.length(scratch, &zones, moved);
-        try appendPeriod(a, periods, window, moved.stamp(), length.end(moved));
+        try appendPeriod(a, periods, window, moved.stamp(), length.end(moved), if (status == .tentative) .tentative else .busy);
     }
-    if ((event.cancelled orelse false) or (event.transparent orelse false)) return;
+    if (event.status == .cancelled or (event.transparent orelse false)) return;
+    const kind: BusyType = if (event.status == .tentative) .tentative else .busy;
 
     var properties = ical.Properties.init(event.component);
     while (try properties.next(scratch)) |property| {
@@ -224,10 +290,10 @@ fn appendResource(a: Allocator, periods: *std.ArrayList(Period), scratch: Alloca
     }
     var explicit = included.iterator();
     while (explicit.next()) |item| {
-        try appendPeriod(a, periods, window, item.key_ptr.*, item.value_ptr.end);
+        try appendPeriod(a, periods, window, item.key_ptr.*, item.value_ptr.end, kind);
         try exclude.put(scratch, item.key_ptr.*, {});
     }
-    var expansion = Expansion{ .a = a, .periods = periods, .window = window, .seed = start, .length = length, .exclude = &exclude, .budget = budget };
+    var expansion = Expansion{ .a = a, .periods = periods, .window = window, .seed = start, .length = length, .kind = kind, .exclude = &exclude, .budget = budget };
     try expansion.append(start);
     properties = ical.Properties.init(event.component);
     while (try properties.next(scratch)) |property| {
@@ -370,13 +436,14 @@ const Expansion = struct {
     window: Window,
     seed: Moment,
     length: Length,
+    kind: BusyType,
     exclude: *const std.AutoHashMapUnmanaged(i64, void),
     budget: *usize,
 
     fn append(self: *Expansion, candidate: Moment) !void {
         const stamp = candidate.stamp();
         if (self.exclude.contains(stamp)) return;
-        try appendPeriod(self.a, self.periods, self.window, stamp, self.length.end(candidate));
+        try appendPeriod(self.a, self.periods, self.window, stamp, self.length.end(candidate), self.kind);
     }
 
     fn rule(self: *Expansion, recur: Rule) !void {

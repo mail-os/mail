@@ -1,4 +1,4 @@
-//! Bounded element traversal for EWS requests that carry item and attachment lists.
+//! Bounded XML element traversal for EWS and DAV requests.
 const std = @import("std");
 
 const whitespace = " \t\r\n";
@@ -6,6 +6,7 @@ const ParseError = error{InvalidXml};
 
 pub const Element = struct {
     name: []const u8,
+    qualified_name: []const u8,
     attributes: []const u8,
     content: []const u8,
 
@@ -78,7 +79,7 @@ pub const Iterator = struct {
         const start = (try self.nextTag()) orelse return null;
         if (start.closing) return error.InvalidXml;
         const local = if (std.mem.indexOfScalar(u8, start.name, ':')) |colon| start.name[colon + 1 ..] else start.name;
-        if (start.empty) return .{ .name = local, .attributes = start.attributes, .content = "" };
+        if (start.empty) return .{ .name = local, .qualified_name = start.name, .attributes = start.attributes, .content = "" };
         const content_start = self.pos;
         var stack: [64][]const u8 = undefined;
         stack[0] = start.name;
@@ -87,7 +88,7 @@ pub const Iterator = struct {
             if (tag.closing) {
                 if (!std.mem.eql(u8, tag.name, stack[depth - 1])) return error.InvalidXml;
                 depth -= 1;
-                if (depth == 0) return .{ .name = local, .attributes = start.attributes, .content = self.input[content_start..tag.start] };
+                if (depth == 0) return .{ .name = local, .qualified_name = start.name, .attributes = start.attributes, .content = self.input[content_start..tag.start] };
             } else if (!tag.empty) {
                 if (depth == stack.len) return error.InvalidXml;
                 stack[depth] = tag.name;

@@ -464,6 +464,24 @@ rules or `RANGE=THISANDFUTURE` overrides. A `413 availability_limit` response
 means the calculation exceeded a limit. Treat either response as unknown
 availability.
 
+CalDAV clients can send a `CALDAV:free-busy-query` report to the URL of an
+individual calendar from the owner's CalDAV collection listing. The URL uses
+the owner's username and the calendar's encoded path name. The report uses the
+same team grants as webmail. Pass UTC iCalendar dates and `Depth: 1` to
+include the calendar's events.
+
+```xml
+<C:free-busy-query xmlns:C="urn:ietf:params:xml:ns:caldav">
+  <C:time-range start="20261208T000000Z" end="20261209T000000Z"/>
+</C:free-busy-query>
+```
+
+The report returns one `VFREEBUSY` component. It merges overlapping or
+adjacent intervals of the same type and preserves tentative and unavailable
+periods. `Depth: 0` returns an empty component after checking access to the
+collection. An unauthorized request returns 404. The free/busy privilege gives
+access to this report only.
+
 ### Shared inboxes
 
 Create a mailbox for the shared address and enroll that account and its

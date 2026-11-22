@@ -5,6 +5,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
+from http.client import HTTPSConnection
 from pathlib import Path
 import runpy
 import socketserver
@@ -21,6 +22,7 @@ Fixture, command, expect = (teams[name] for name in ("Fixture", "command", "expe
 DavClient = runpy.run_path(str(SCRIPTS / "test-dav-https.py"))["DavClient"]
 CALENDAR = "Studio planning"
 AVAILABILITY = "Availability cases"
+CALDAV = "urn:ietf:params:xml:ns:caldav"
 START = int(datetime(2026, 12, 1, tzinfo=timezone.utc).timestamp())
 END = int(datetime(2027, 1, 1, tzinfo=timezone.utc).timestamp())
 REVOKE_DURING_SCAN = "Editor access revoked during scanning"
@@ -106,6 +108,37 @@ def busy_period(start, end):
     return {"start": timestamp(start), "end": timestamp(end)}
 
 
+def calendar_path(owner, calendar):
+    return f"/calendars/{quote(owner, safe='')}/{quote(calendar, safe='')}"
+
+
+def busy_report(start="20261201T000000Z", end="20270101T000000Z"):
+    return (f'<C:free-busy-query xmlns:C="{CALDAV}">'
+            f'<C:time-range start="{start}" end="{end}"/></C:free-busy-query>')
+
+
+def dav_busy(client, path, start="20261201T000000Z", end="20270101T000000Z", *,
+             depth="1", tls=True, authenticated=True, status=200, body=None):
+    if body is None:
+        body = busy_report(start, end)
+    headers = {"Content-Type": "application/xml"}
+    if depth is not None:
+        headers["Depth"] = depth
+    actual, fields, content = client.request("REPORT", path, body, headers, tls=tls, authenticated=authenticated)
+    assert actual == status, (actual, status, content)
+    if status != 200:
+        return
+    assert fields.get_content_type() == "text/calendar"
+    assert fields["Cache-Control"] == "no-store"
+    lines = content.decode().splitlines()
+    assert lines[:4] == ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail//CalDAV//EN", "BEGIN:VFREEBUSY"], lines
+    assert lines[-2:] == ["END:VFREEBUSY", "END:VCALENDAR"], lines
+    assert lines[4].startswith("UID:") and lines[5].startswith("DTSTAMP:"), lines
+    assert lines[6:8] == ["DTSTART:" + start, "DTEND:" + end], lines
+    assert all(line.startswith("FREEBUSY;FBTYPE=") for line in lines[8:-2]), lines
+    return [line.removeprefix("FREEBUSY;FBTYPE=") for line in lines[8:-2]]
+
+
 def create_calendar(test, owner_session):
     return expect(test.api(owner_session, "calendars", {"name": CALENDAR}), 201)["id"]
 
@@ -121,6 +154,13 @@ def verify(test, db, owner, viewer, colleague, foreign):
     write_event(test, owner, "Public-series", recurring=True)
 
     query = event_query(calendar_id)
+    owner_dav, viewer_dav = DavClient(test, owner), DavClient(test, viewer)
+    path = calendar_path(owner, CALENDAR)
+    propfind = owner_dav.request("PROPFIND", path, headers={"Depth": "0"})
+    assert propfind[0] == 207 and b"<C:free-busy-query/>" in propfind[2], propfind
+    dav_busy(owner_dav, path + "/Budget.ics", status=403)
+    dav_busy(viewer_dav, path, authenticated=False, status=401)
+    dav_busy(viewer_dav, path, status=404)
     owners = expect(test.api(captain, query))["events"]
     assert {event["summary"] for event in owners} == {"Roadmap", "Budget", "Confidential", "Public-series"}
     expect(test.api({}, "calendar-shares"), 401)
@@ -129,6 +169,7 @@ def verify(test, db, owner, viewer, colleague, foreign):
     command(test, "team", "grant", "studio", owner, viewer, "calendar", str(calendar_id))
     assert shares(test, invited) == []
     expect(test.api(invited, query), 404)
+    dav_busy(viewer_dav, path, status=404)
 
     expect(change(test, dict(captain, Origin="https://outside.example.test"), calendar_id, viewer, "viewer"), 403)
     expect(change(test, captain, calendar_id, foreign, "viewer"), 404)
@@ -189,11 +230,41 @@ def verify(test, db, owner, viewer, colleague, foreign):
     expect(test.api(invited, f"calendar-export?calendarId={calendar_id}"), 404)
     expect(test.api(teammate, available), 404)
     expect(test.api(outsider, available), 404)
-    expect(change(test, captain, calendar_id, viewer, None))
+    intervals = [
+        "BUSY:20261208T100000Z/20261208T110000Z",
+        "BUSY:20261215T110000Z/20261215T120000Z",
+        "BUSY:20261222T100000Z/20261222T110000Z",
+    ]
+    for tls in (True, False):
+        assert dav_busy(viewer_dav, path, tls=tls) == intervals
+        assert dav_busy(owner_dav, path, tls=tls) == intervals
+        dav_busy(DavClient(test, colleague), path, tls=tls, status=404)
+        dav_busy(DavClient(test, foreign), path, tls=tls, status=404)
+        dav_busy(viewer_dav, path + "/Budget.ics", tls=tls, status=404)
+        for method, target in (("PROPFIND", path), ("GET", path + "/Budget.ics"), ("HEAD", path + "/Roadmap.ics")):
+            assert viewer_dav.request(method, target, tls=tls)[0] == 404
+        listing = f'<C:calendar-query xmlns:C="{CALDAV}"/>'
+        assert viewer_dav.request("REPORT", path, listing, tls=tls)[0] == 404
+    # A connection authenticated before revocation must see the new grant state.
+    with closing(HTTPSConnection("127.0.0.1", viewer_dav.https, context=viewer_dav.context, timeout=15)) as keepalive:
+        headers = {**viewer_dav.auth, "Content-Type": "application/xml", "Depth": "1"}
+        keepalive.request("REPORT", path, busy_report(), headers)
+        with keepalive.getresponse() as first:
+            assert first.status == 200
+            assert b"FREEBUSY;FBTYPE=BUSY:" in first.read()
+        connection = keepalive.sock
+        assert connection is not None
+        expect(change(test, captain, calendar_id, viewer, None))
+        keepalive.request("REPORT", path, busy_report(), headers)
+        assert keepalive.sock is connection
+        with keepalive.getresponse() as revoked:
+            assert revoked.status == 404 and revoked.read() == b""
     expect(change(test, captain, calendar_id, viewer, None))
     assert shares(test, invited) == []
     expect(test.api(invited, query), 404)
     expect(test.api(invited, available), 404)
+    for tls in (True, False):
+        dav_busy(viewer_dav, path, tls=tls, status=404)
 
     expect(change(test, captain, calendar_id, viewer, "viewer"))
     command(test, "team", "member", "studio", viewer, "remove")
@@ -202,6 +273,7 @@ def verify(test, db, owner, viewer, colleague, foreign):
     invited = test.login(viewer)
     assert shares(test, invited) == []
     expect(test.api(invited, query), 404)
+    dav_busy(viewer_dav, path, status=404)
     expect(change(test, captain, calendar_id, viewer, "viewer"))
     audit = db.execute("SELECT action FROM audit_log WHERE action LIKE 'team.calendar.%' ORDER BY id").fetchall()
     assert [action for (action,) in audit] == [
@@ -237,34 +309,75 @@ def verify_availability(test, owner, viewer):
           ))
     store("confidential", "CLASS:CONFIDENTIAL", "DTSTART:20260309T065000Z", "DTEND:20260309T071000Z")
     store("adjacent", "DTSTART:20260309T071000Z", "DTEND:20260309T072000Z", "STATUS:TENTATIVE")
+    store("overlapping-tentative", "DTSTART:20260309T070500Z", "DTEND:20260309T071500Z", "STATUS:TENTATIVE")
     store("date-only", "DTSTART;VALUE=DATE:20260312")
     store("transparent", "DTSTART:20260313T090000Z", "DURATION:PT1H", "TRANSP:TRANSPARENT")
     store("cancelled", "DTSTART:20260314T090000Z", "DURATION:PT1H", "STATUS:CANCELLED")
     store("excluded-boundary", "DTSTART:20260315T000000Z", "DURATION:PT1H")
-    start, end = timestamp("20260307T080000Z"), timestamp("20260315T000000Z")
+    write_resource(test, owner, AVAILABILITY, "stored-availability", [
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail availability fixture//EN",
+        "BEGIN:VFREEBUSY", "UID:stored-availability", stamp,
+        "ATTENDEE:mailto:private@example.test",
+        "FREEBUSY;FBTYPE=BUSY-UNAVAILABLE:20260313T130000Z/PT30M",
+        "FREEBUSY;FBTYPE=FREE:20260314T120000Z/20260314T140000Z",
+        "END:VFREEBUSY", "END:VCALENDAR", "",
+    ])
+    start_date, end_date = "20260307T080000Z", "20260315T000000Z"
+    start, end = timestamp(start_date), timestamp(end_date)
     query = busy_query(calendar_id, start, end)
+    path = calendar_path(owner, AVAILABILITY)
+    viewer_dav = DavClient(test, viewer)
     expect(test.api(invited, query), 404)
+    dav_busy(viewer_dav, path, start_date, end_date, status=404)
     expected = {"busy": [
         busy_period("20260307T080000Z", "20260307T083000Z"),
         busy_period("20260309T063000Z", "20260309T072000Z"),
         busy_period("20260311T130000Z", "20260311T140000Z"),
         busy_period("20260312T000000Z", "20260313T000000Z"),
+        busy_period("20260313T130000Z", "20260313T133000Z"),
     ]}
+    typed = [
+        "BUSY:20260307T080000Z/20260307T083000Z",
+        "BUSY:20260309T063000Z/20260309T071000Z",
+        "BUSY-TENTATIVE:20260309T070500Z/20260309T072000Z",
+        "BUSY:20260311T130000Z/20260311T140000Z",
+        "BUSY:20260312T000000Z/20260313T000000Z",
+        "BUSY-UNAVAILABLE:20260313T130000Z/20260313T133000Z",
+    ]
     for role in ("viewer", "editor", "free_busy"):
         expect(change(test, captain, calendar_id, viewer, role))
         assert expect(test.api(invited, query)) == expected
+        assert dav_busy(viewer_dav, path, start_date, end_date) == typed
     assert expect(test.api(captain, query)) == expected
-    assert expect(test.api(invited, busy_query(calendar_id, timestamp("20260313T000000Z"), end))) == {"busy": []}
+    assert expect(test.api(invited, busy_query(calendar_id, timestamp("20260314T000000Z"), end))) == {"busy": []}
+    assert dav_busy(viewer_dav, path, "20260314T000000Z", end_date) == []
+    assert dav_busy(viewer_dav, path, start_date, end_date, depth=None) == []
+    assert dav_busy(viewer_dav, path, start_date, end_date, depth="infinity") == typed
+    assert dav_busy(viewer_dav, path, start_date, end_date, body=(
+        f"<?xml version='1.0'?><!-- report --><free-busy-query xmlns='{CALDAV}'>"
+        f"<time-range end='{end_date}' start='{start_date}'/></free-busy-query>"
+    )) == typed
     for lower, upper in ((start, start), (end, start), (0, 367 * 86400), (-9223372036854775808, 0)):
         expect(test.api(invited, busy_query(calendar_id, lower, upper)), 400)
+    for lower, upper in ((start_date, start_date), (end_date, start_date), ("20260230T010000Z", end_date),
+                         (start_date.removesuffix("Z"), end_date), (start_date, "20280315T000000Z")):
+        dav_busy(viewer_dav, path, lower, upper, status=400)
+    dav_busy(viewer_dav, path, start_date, end_date, depth="2", status=400)
+    range_xml = f'<C:time-range start="{start_date}" end="{end_date}"/>'
+    for ns, children in (("DAV:", range_xml), (CALDAV, range_xml * 2), (CALDAV, ""),
+                         (CALDAV, range_xml.replace("<C:time-range", '<C:time-range xmlns:C="DAV:"'))):
+        dav_busy(viewer_dav, path, body=f'<C:free-busy-query xmlns:C="{ns}">{children}</C:free-busy-query>', status=400)
 
     unsupported = store("unsupported", "DTSTART:20260314T120000Z", "DURATION:PT15M", "RRULE:FREQ=HOURLY;COUNT=3")
     result = expect(test.api(invited, query), 422)
     assert result["error"] == "availability_incomplete" and "Sensitive" not in repr(result), result
+    dav_busy(viewer_dav, path, start_date, end_date, status=422)
     assert DavClient(test, owner).request("DELETE", unsupported)[0] == 204
     assert expect(test.api(invited, query)) == expected
+    assert dav_busy(viewer_dav, path, start_date, end_date) == typed
     expect(change(test, captain, calendar_id, viewer, None))
     expect(test.api(invited, query), 404)
+    dav_busy(viewer_dav, path, start_date, end_date, status=404)
     assert DavClient(test, owner).request("DELETE", f"/calendars/{owner}/{quote(AVAILABILITY, safe='')}")[0] == 204
 
 
@@ -360,11 +473,13 @@ def main():
             query = event_query(calendar_id)
             assert [item["access"] for item in shares(test, invited)] == ["viewer"]
             assert [row["summary"] for row in expect(test.api(invited, query))["events"]] == ["Roadmap"]
-            path = f"/calendars/{owner}/{quote(CALENDAR, safe='')}"
+            path = calendar_path(owner, CALENDAR)
+            assert dav_busy(DavClient(test, viewer), path)
             deleted = DavClient(test, owner).request("DELETE", path)
             assert deleted[0] == 204, deleted
             assert shares(test, invited) == []
             expect(test.api(invited, query), 404)
+            dav_busy(DavClient(test, viewer), path, status=404)
 
         with test.daemon():
             captain, invited = test.login(owner), test.login(viewer)
@@ -372,8 +487,9 @@ def main():
             write_event(test, owner, "Replacement")
             assert shares(test, invited) == []
             expect(test.api(invited, event_query(calendar_id)), 404)
+            dav_busy(DavClient(test, viewer), calendar_path(owner, CALENDAR), status=404)
 
-    print("Verified calendar share roles, private free/busy with recurrence and time zones, editor CRUD and revision races, revocation, audit rollback, restart, and calendar ID reuse.")
+    print("Verified calendar share roles, private free/busy over webmail and CalDAV, recurrence, time zones, editor revision races, revocation, restart, and calendar ID reuse.")
 
 
 if __name__ == "__main__":
