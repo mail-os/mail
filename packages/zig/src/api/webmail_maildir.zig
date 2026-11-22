@@ -1283,20 +1283,34 @@ pub const DraftWrite = struct {
 
     /// A temporary name is invisible until the complete message is ready.
     pub fn save(self: DraftWrite, allocator: std.mem.Allocator, db: *database.Database, user: []const u8, raw: []const u8) !void {
-        const file = try fs_compat.cwd().createFileExclusive(self.temporary);
-        defer unlinkPath(allocator, self.temporary) catch {};
-        file.writeAll(raw) catch |err| {
-            file.close();
-            return err;
-        };
-        file.close();
-        const at = message_refs.location("Drafts", std.fs.path.basename(self.destination));
-        const transfer = if (self.replacing) try message_refs.stage(allocator, db, user, at, self.destination, at, raw) else null;
-        errdefer if (transfer) |id| message_refs.cancel(db, user, id);
-        if (!renamePath(self.temporary, self.destination)) return MaildirError.WriteFailed;
-        if (transfer) |id| message_refs.finishFile(allocator, db, user, id, at, self.destination);
+        try saveDraftFile(allocator, db, user, self.temporary, self.destination, self.replacing, raw);
     }
 };
+
+/// Replace a draft at its current location, preserving its message identity.
+/// The caller holds the mailbox mutation lock and has verified the snapshot.
+pub fn replaceDraftFile(a: std.mem.Allocator, db: *database.Database, user: []const u8, destination: []const u8, raw: []const u8) !void {
+    try hosted_limits.checkStorage(db, user, raw.len, destination);
+    const directory = std.fs.path.dirname(destination) orelse return MaildirError.WriteFailed;
+    const temporary = try std.fmt.allocPrint(a, "{s}/.draft-{d}.{d}.tmp", .{ directory, time_compat.milliTimestamp(), draft_sequence.fetchAdd(1, .monotonic) });
+    defer a.free(temporary);
+    try saveDraftFile(a, db, user, temporary, destination, true, raw);
+}
+
+fn saveDraftFile(a: std.mem.Allocator, db: *database.Database, user: []const u8, temporary: []const u8, destination: []const u8, replacing: bool, raw: []const u8) !void {
+    const file = try fs_compat.cwd().createFileExclusive(temporary);
+    defer unlinkPath(a, temporary) catch {};
+    file.writeAll(raw) catch |err| {
+        file.close();
+        return err;
+    };
+    file.close();
+    const at = message_refs.location("Drafts", std.fs.path.basename(destination));
+    const transfer = if (replacing) try message_refs.stage(a, db, user, at, destination, at, raw) else null;
+    errdefer if (transfer) |id| message_refs.cancel(db, user, id);
+    if (!renamePath(temporary, destination)) return MaildirError.WriteFailed;
+    if (transfer) |id| message_refs.finishFile(a, db, user, id, at, destination);
+}
 
 /// The caller holds the mailbox mutation lock through the write. This gives
 /// webmail the UID needed to check the draft metadata before replacing the file.

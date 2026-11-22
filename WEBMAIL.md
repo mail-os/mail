@@ -1141,6 +1141,13 @@ webmail sessions and password reset tokens.
   storage before delivery and returns `ErrorQuotaExceeded` if the copy would
   exceed the limit. EWS SendOnly works when the sender's storage is full.
   See the [EWS response codes](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxwscdata/53734587-8b80-4cd8-b0ea-92da6b960d9e).
+- EWS scans file attachment bytes and the assembled message before CreateItem
+  or CreateAttachment writes it. SendItem scans the stored MIME again before
+  delivery or filing Sent. Malware, excessive scan size, and a fail-closed
+  scanner outage return `ErrorVirusDetected`, `ErrorMessageSizeExceeded`, and
+  `ErrorServerBusy` respectively, before charging the sending allowance.
+  EWS can append files to mail drafts. Change attachments on revisioned webmail
+  drafts in webmail so the draft document stays in sync with the MIME.
 - ActiveSync SendMail, SmartReply, and SmartForward use the authenticated
   mailbox for From and the quota.
   It checks a requested Sent copy before delivery and leaves Bcc out of

@@ -207,7 +207,7 @@ fn needsBase64(body: []const u8) bool {
 }
 
 /// Base64-encode `data` wrapped at 76 columns (RFC 2045).
-fn base64Wrapped(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
+pub fn base64Wrapped(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     const enc = std.base64.standard.Encoder;
     const raw = try allocator.alloc(u8, enc.calcSize(data.len));
     defer allocator.free(raw);

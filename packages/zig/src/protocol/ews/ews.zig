@@ -1,4 +1,10 @@
 const std = @import("std");
+const clamav = @import("../../antispam/clamav.zig");
+const xml = @import("xml.zig");
+const file_attachments = @import("attachments.zig");
+const metadata = @import("../../message/attachment_metadata.zig");
+const webmail_maildir = @import("../../api/webmail_maildir.zig");
+const webmail_store = @import("../../api/webmail_store.zig");
 const logger = @import("../../core/logger.zig");
 // NOTE: for a future standalone `zig-ews`, reach the mailbox/store through a
 // callback interface on Context instead of importing these directly.
@@ -44,6 +50,7 @@ pub const Context = struct {
     /// AWS SES region (only used when delivery_method == .ses).
     ses_region: []const u8 = "us-east-1",
     mail_config: ?*const config.Config = null,
+    scanner: ?*clamav.ClamAVScanner = null,
 };
 
 pub const Response = struct {
@@ -122,6 +129,9 @@ pub fn handleSoap(ctx: *Context, soap: []const u8) !Response {
     if (std.mem.eql(u8, op, "SyncFolderItems")) return syncFolderItems(ctx, soap);
     if (std.mem.eql(u8, op, "GetItem")) return getItem(ctx, soap);
     if (std.mem.eql(u8, op, "CreateItem")) return createItem(ctx, soap);
+    if (std.mem.eql(u8, op, "CreateAttachment")) return createAttachment(ctx, soap);
+    if (std.mem.eql(u8, op, "GetAttachment")) return mailResult(ctx, ctx.allocator, "GetAttachment", error.UnsupportedOperation);
+    if (std.mem.eql(u8, op, "DeleteAttachment")) return mailResult(ctx, ctx.allocator, "DeleteAttachment", error.UnsupportedOperation);
     if (std.mem.eql(u8, op, "SendItem")) return sendItem(ctx, soap);
     if (std.mem.eql(u8, op, "DeleteItem")) return deleteItem(ctx, soap);
     if (std.mem.eql(u8, op, "FindFolder")) return findFolder(ctx, soap);
@@ -449,13 +459,15 @@ fn appendItemMessage(buf: *std.ArrayList(u8), aa: std.mem.Allocator, ctx: *Conte
     // Size, DateTimeSent, then the Message-specific ToRecipients, From, IsRead.
     try buf.appendSlice(a, "<m:GetItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode><m:Items><t:Message>");
     try buf.print(a, "<t:MimeContent CharacterSet=\"UTF-8\">{s}</t:MimeContent>", .{mime_b64});
-    try buf.print(a, "<t:ItemId Id=\"{s}\" ChangeKey=\"ck0\"/>", .{xmlEscape(aa, id)});
+    try buf.print(a, "<t:ItemId Id=\"{s}\" ChangeKey=\"{s}\"/>", .{ xmlEscape(aa, id), changeKey(raw) });
     try buf.appendSlice(a, "<t:ItemClass>IPM.Note</t:ItemClass>");
     try buf.print(a, "<t:Subject>{s}</t:Subject>", .{subject});
     try buf.print(a, "<t:Body BodyType=\"Text\">{s}</t:Body>", .{xmlEscape(aa, body)});
     try buf.print(a, "<t:DateTimeReceived>{s}</t:DateTimeReceived>", .{date});
     try buf.print(a, "<t:Size>{d}</t:Size>", .{raw.len});
-    try buf.appendSlice(a, "<t:HasAttachments>false</t:HasAttachments>");
+    const content_type = headerValue(aa, headers, "Content-Type") orelse "";
+    const media_type = std.mem.trimEnd(u8, content_type[0 .. std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len], " \t");
+    try buf.print(a, "<t:HasAttachments>{s}</t:HasAttachments>", .{if (std.ascii.eqlIgnoreCase(media_type, "multipart/mixed")) "true" else "false"});
     try buf.print(a, "<t:DateTimeSent>{s}</t:DateTimeSent>", .{date});
     if (to.email.len > 0) {
         try buf.print(a, "<t:ToRecipients><t:Mailbox><t:Name>{s}</t:Name><t:EmailAddress>{s}</t:EmailAddress></t:Mailbox></t:ToRecipients>", .{ xmlEscape(aa, to.name), xmlEscape(aa, to.email) });
@@ -599,7 +611,7 @@ const MailItem = struct {
     epoch: i64,
 };
 
-const FoundMail = struct { content: []const u8, seen: bool, epoch: i64 };
+const FoundMail = struct { path: []const u8, content: []const u8, seen: bool, epoch: i64 };
 
 fn mailboxDirs(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8) ![][]const u8 {
     try maildir_path.validate(mailbox);
@@ -641,7 +653,7 @@ fn readMailFile(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, basena
             if (std.mem.eql(u8, maildirBaseName(fname), basename)) {
                 const path = std.fmt.allocPrint(a, "{s}/{s}", .{ dir, fname }) catch return null;
                 const content = fs_compat.readFileAlloc(a, path) catch return null;
-                return .{ .content = content, .seen = maildirSeen(fname), .epoch = maildirEpoch(basename) };
+                return .{ .path = path, .content = content, .seen = maildirSeen(fname), .epoch = maildirEpoch(basename) };
             }
         }
     }
@@ -981,6 +993,18 @@ fn appendMailResult(a: std.mem.Allocator, buf: *std.ArrayList(u8), comptime op: 
             error.InvalidAddress => .{ "ErrorInvalidRecipients", "Check the recipient addresses." },
             error.ItemNotFound => .{ "ErrorItemNotFound", "The message could not be found." },
             error.PartialDelivery => .{ "ErrorMessageSubmissionBlocked", "Some recipients received the message. Review delivery before retrying." },
+            error.InvalidXml, error.InvalidMime => .{ "ErrorInvalidRequest", "The message or attachment is not well formed." },
+            error.InvalidBase64 => .{ "ErrorInvalidPropertyValue", "Attachment content must be valid base64." },
+            error.InvalidMimeBase64 => .{ "ErrorMimeContentInvalidBase64String", "MIME content must be valid base64." },
+            error.InvalidAttachment => .{ "ErrorInvalidPropertyValue", "Check the file attachment name, media type, and content." },
+            error.UnsupportedAttachment => .{ "ErrorInvalidOperation", "This operation supports file attachments on mail drafts." },
+            error.UnsupportedOperation => .{ "ErrorInvalidOperation", "This attachment operation is unavailable." },
+            error.ManagedDraft => .{ "ErrorInvalidOperation", "Open this webmail draft in webmail to change its attachments." },
+            error.UnsupportedItem => .{ "ErrorInvalidOperation", "Only email messages are supported in a batch." },
+            error.StaleDraft => .{ "ErrorIrresolvableConflict", "The draft changed. Retrieve its current change key and retry." },
+            error.MalwareDetected => .{ "ErrorVirusDetected", "The malware scanner rejected this message or attachment." },
+            error.MessageTooLarge, error.MalwareScanTooLarge => .{ "ErrorMessageSizeExceeded", "The message or attachment exceeds the allowed size." },
+            error.MalwareScanUnavailable => .{ "ErrorServerBusy", "The malware scanner is temporarily unavailable. Retry the operation." },
             else => .{ "ErrorInternalServerError", "The message could not be processed." },
         };
         try buf.print(a, "<m:" ++ op ++ "ResponseMessage ResponseClass=\"Error\"><m:MessageText>{s}</m:MessageText><m:ResponseCode>{s}</m:ResponseCode></m:" ++ op ++ "ResponseMessage>", .{ message, code });
@@ -995,6 +1019,15 @@ fn mailResult(ctx: *Context, a: std.mem.Allocator, comptime op: []const u8, err:
     try appendMailResult(a, &buf, op, err);
     try buf.appendSlice(a, "</m:ResponseMessages></m:" ++ op ++ "Response>");
     return .{ .body = try envelope(ctx.allocator, buf.items) };
+}
+
+fn maxMailBytes(ctx: *const Context) usize {
+    return if (ctx.mail_config) |settings| settings.max_message_size else clamav.default_max_stream_bytes;
+}
+
+fn scanMail(ctx: *const Context, message: []const u8) !void {
+    if (message.len > maxMailBytes(ctx)) return error.MessageTooLarge;
+    try clamav.requireAllowed(ctx.scanner, message);
 }
 
 fn submitMail(a: std.mem.Allocator, ctx: *Context, recipients: []const []const u8, raw: []const u8, sent_path: ?[]const u8, sent_copy: []const u8) !void {
@@ -1023,103 +1056,210 @@ fn ewsFolderToMailbox(folder: []const u8) []const u8 {
     return folder;
 }
 
-/// CreateItem: build an RFC822 message from the composed EWS Message, deliver it
-/// via the server's outbound path (SES on AWS, direct MX on Hetzner), and save a
-/// copy to Sent (or Drafts for MessageDisposition="SaveOnly").
-fn createItem(ctx: *Context, soap: []const u8) !Response {
-    // Calendar/Contacts creates carry a <t:CalendarItem>/<t:Contact> instead of
-    // a <t:Message>; route those to the CalDAV/CardDAV store.
-    if (elementText(soap, "CalendarItem") != null) return createCalendarItem(ctx, soap);
-    if (elementText(soap, "Contact") != null) return createContactItem(ctx, soap);
+fn childText(parent: xml.Element, name: []const u8) !?[]const u8 {
+    const child = (try parent.child(name)) orelse return null;
+    return child.content;
+}
 
+fn parseFiles(a: std.mem.Allocator, ctx: *Context, container: xml.Element) ![]const file_attachments.File {
+    var result: std.ArrayList(file_attachments.File) = .empty;
+    var children = container.children();
+    var remaining = maxMailBytes(ctx);
+    while (try children.next()) |item| {
+        if (!std.mem.eql(u8, item.name, "FileAttachment")) return error.UnsupportedAttachment;
+        const name = try xmlUnescape(a, (try childText(item, "Name")) orelse return error.InvalidAttachment);
+        const media_type = try xmlUnescape(a, (try childText(item, "ContentType")) orelse "application/octet-stream");
+        if (!metadata.validFilename(name) or !metadata.validContentType(media_type)) return error.InvalidAttachment;
+        const encoded = try xmlUnescape(a, (try childText(item, "Content")) orelse return error.InvalidAttachment);
+        const data = try file_attachments.decode(a, encoded, remaining);
+        remaining -= data.len;
+        const content_id = if (try childText(item, "ContentId")) |value| blk: {
+            const decoded = std.mem.trim(u8, try xmlUnescape(a, value), " \t\r\n");
+            const value_id = if (decoded.len >= 2 and decoded[0] == '<' and decoded[decoded.len - 1] == '>') decoded[1 .. decoded.len - 1] else decoded;
+            if (value_id.len == 0 or value_id.len > 255) return error.InvalidAttachment;
+            for (value_id) |byte| if (byte <= 32 or byte >= 127 or byte == '<' or byte == '>') return error.InvalidAttachment;
+            break :blk value_id;
+        } else null;
+        const inline_text = (try childText(item, "IsInline")) orelse "false";
+        try clamav.requireAllowed(ctx.scanner, data);
+        try result.append(a, .{
+            .id = file_attachments.id(),
+            .name = name,
+            .content_type = media_type,
+            .data = data,
+            .content_id = content_id,
+            .inline_part = std.ascii.eqlIgnoreCase(inline_text, "true") or std.mem.eql(u8, inline_text, "1"),
+        });
+    }
+    return result.items;
+}
+
+fn addFiles(a: std.mem.Allocator, ctx: *Context, raw: []const u8, files: []const file_attachments.File) ![]const u8 {
+    const split = headerBodySplit(raw);
+    return file_attachments.add(a, raw, split.header_end, split.body_start, headerValue(a, raw[0..split.header_end], "Content-Type"), files, maxMailBytes(ctx));
+}
+
+fn createItem(ctx: *Context, soap: []const u8) !Response {
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    const request = xml.operation(soap, "CreateItem") catch |err| return mailResult(ctx, a, "CreateItem", err);
+    const items = (request.child("Items") catch |err| return mailResult(ctx, a, "CreateItem", err)) orelse
+        return mailResult(ctx, a, "CreateItem", error.InvalidXml);
+    var children = items.children();
+    var batch: std.ArrayList(xml.Element) = .empty;
+    while (children.next() catch |err| return mailResult(ctx, a, "CreateItem", err)) |item| try batch.append(a, item);
+    if (batch.items.len == 0) return mailResult(ctx, a, "CreateItem", error.InvalidXml);
+    if (batch.items.len == 1) {
+        const item = batch.items[0];
+        if (std.mem.eql(u8, item.name, "CalendarItem")) return createCalendarItem(ctx, item.content);
+        if (std.mem.eql(u8, item.name, "Contact")) return createContactItem(ctx, item.content);
+    }
 
-    const disposition = attrValue(soap, "MessageDisposition") orelse "SendAndSaveCopy";
+    const disposition = request.attribute("MessageDisposition") orelse "SendAndSaveCopy";
     const do_send = !std.mem.eql(u8, disposition, "SaveOnly");
     const save_copy = !std.mem.eql(u8, disposition, "SendOnly");
+    if (do_send and save_copy and !std.mem.eql(u8, disposition, "SendAndSaveCopy"))
+        return mailResult(ctx, a, "CreateItem", error.InvalidXml);
 
-    // Scope field extraction to the <t:Message> element. Without this, the
-    // prefix-stripping elementText("Body") would match the SOAP envelope's
-    // <soap:Body> (which appears first) and swallow the whole request as the
-    // message body. Subject/recipients are unique, but Message scoping is the
-    // robust fix for any field that collides with an envelope element name.
-    const scope = elementText(soap, "Message") orelse soap;
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(a, "<m:CreateItemResponse><m:ResponseMessages>");
+    for (batch.items) |item| {
+        if (!std.mem.eql(u8, item.name, "Message")) {
+            try appendMailResult(a, &buf, "CreateItem", error.UnsupportedItem);
+            continue;
+        }
+        var scratch = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer scratch.deinit();
+        const saved = createMail(scratch.allocator(), ctx, item, do_send, save_copy) catch |err| {
+            try appendMailResult(a, &buf, "CreateItem", err);
+            continue;
+        };
+        if (saved) |item_id| {
+            try buf.print(a,
+                \\<m:CreateItemResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Items><t:Message><t:ItemId Id="{s}" ChangeKey="{s}"/></t:Message></m:Items></m:CreateItemResponseMessage>
+            , .{ xmlEscape(a, item_id.id), item_id.change_key });
+        } else try appendMailResult(a, &buf, "CreateItem", null);
+    }
+    try buf.appendSlice(a, "</m:ResponseMessages></m:CreateItemResponse>");
+    return .{ .body = try envelope(ctx.allocator, buf.items) };
+}
 
-    const subject = try xmlUnescape(a, elementText(scope, "Subject") orelse "");
-    const body = try xmlUnescape(a, elementText(scope, "Body") orelse "");
-    const body_type = attrValue(scope, "BodyType") orelse "Text";
-    const is_html = std.ascii.eqlIgnoreCase(body_type, "HTML");
+fn changeKey(raw: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
 
-    var to_list = std.ArrayList([]const u8).empty;
-    var cc_list = std.ArrayList([]const u8).empty;
-    var bcc_list = std.ArrayList([]const u8).empty;
-    if (elementText(scope, "ToRecipients")) |blk| collectEmails(a, blk, &to_list) catch |err|
-        return mailResult(ctx, a, "CreateItem", err);
-    if (elementText(scope, "CcRecipients")) |blk| collectEmails(a, blk, &cc_list) catch |err|
-        return mailResult(ctx, a, "CreateItem", err);
-    if (elementText(scope, "BccRecipients")) |blk| collectEmails(a, blk, &bcc_list) catch |err|
-        return mailResult(ctx, a, "CreateItem", err);
-    const recipients = submission.distinctRecipients(a, &.{ to_list.items, cc_list.items, bcc_list.items }) catch |err|
-        return mailResult(ctx, a, "CreateItem", err);
+const SavedItem = struct { id: []const u8, change_key: [64]u8 };
 
-    logger.info("EWS CreateItem: disp={s} subj_len={d} to={d} cc={d} bodytype={s}", .{
-        disposition, subject.len, to_list.items.len, cc_list.items.len, body_type,
-    });
-
-    // Build the RFC822 message.
+fn createMail(a: std.mem.Allocator, ctx: *Context, item: xml.Element, do_send: bool, save_copy: bool) !?SavedItem {
     const epoch = time_compat.timestamp();
     const nanos = time_compat.nanoTimestamp();
     const seq = send_seq.fetchAdd(1, .monotonic);
-    const msgid = try std.fmt.allocPrint(a, "{d}.{d}.{d}@{s}", .{ epoch, nanos, seq, ctx.hostname });
-    const date_hdr = rfc2822Date(a, epoch);
-    const ctype: []const u8 = if (is_html) "text/html; charset=utf-8" else "text/plain; charset=utf-8";
+    const mail = if (try childText(item, "MimeContent")) |value| blk: {
+        const encoded = try xmlUnescape(a, value);
+        const raw = file_attachments.decode(a, encoded, maxMailBytes(ctx)) catch |err|
+            return if (err == error.InvalidBase64) error.InvalidMimeBase64 else err;
+        break :blk try message_headers.prepareClientMime(a, raw, ctx.username);
+    } else try buildMail(a, ctx, item, epoch, nanos, seq);
 
-    var msg = std.ArrayList(u8).empty;
-    try msg.print(a, "From: {s}\r\n", .{ctx.username});
-    const fields = [_][]const u8{ "To", "Cc", "Bcc" };
-    for (fields, [_][]const []const u8{ to_list.items, cc_list.items, bcc_list.items }) |name, addresses| {
-        if (addresses.len == 0) continue;
-        try msg.print(a, "{s}: {s}\r\n", .{ name, try std.mem.join(a, ", ", addresses) });
-    }
-    try msg.print(a, "Subject: {s}\r\n", .{headerSafe(a, subject)});
-    try msg.print(a, "Date: {s}\r\n", .{date_hdr});
-    try msg.print(a, "Message-ID: <{s}>\r\n", .{msgid});
-    try msg.appendSlice(a, "MIME-Version: 1.0\r\n");
-    try msg.print(a, "Content-Type: {s}\r\n", .{ctype});
-    try msg.appendSlice(a, "Content-Transfer-Encoding: 8bit\r\n\r\n");
-    try msg.appendSlice(a, body);
-    if (!std.mem.endsWith(u8, msg.items, "\n")) try msg.appendSlice(a, "\r\n");
-    const message_data = msg.items;
+    const recipients = try submission.distinctRecipients(a, &.{mail.recipients});
+    if (do_send and recipients.len == 0) return error.InvalidAddress;
+    const message_data = if (try item.child("Attachments")) |container|
+        try addFiles(a, ctx, mail.archive, try parseFiles(a, ctx, container))
+    else
+        mail.archive;
+    try scanMail(ctx, message_data);
 
     const target_mailbox: []const u8 = if (do_send) "Sent" else "Drafts";
     const sub: []const u8 = if (do_send) "cur" else "new";
     const suffix: []const u8 = if (do_send) ":2,S" else ":2,D";
     const filename = try std.fmt.allocPrint(a, "{d}.{d}{d}.{s}.eml{s}", .{ epoch, nanos, seq, ctx.hostname, suffix });
-    const item_folder: []const u8 = if (do_send) "sentitems" else "drafts";
-    const path = if (save_copy)
-        savedMailPath(a, ctx, target_mailbox, sub, filename) catch |err| return mailResult(ctx, a, "CreateItem", err)
-    else
-        null;
-
+    const path = if (save_copy) try savedMailPath(a, ctx, target_mailbox, sub, filename) else null;
     if (do_send) {
-        if (recipients.len == 0) return mailResult(ctx, a, "CreateItem", error.InvalidAddress);
-        const raw = if (bcc_list.items.len > 0) try message_headers.withoutBcc(a, message_data) else message_data;
-        submitMail(a, ctx, recipients, raw, path, message_data) catch |err|
-            return mailResult(ctx, a, "CreateItem", err);
+        const raw = try message_headers.withoutBcc(a, message_data);
+        try submitMail(a, ctx, recipients, raw, path, message_data);
     } else if (path) |draft| {
-        hosted_limits.write(ctx.db, a, ctx.username, draft, message_data) catch |err|
-            return mailResult(ctx, a, "CreateItem", err);
+        try hosted_limits.write(ctx.db, a, ctx.username, draft, message_data);
+    }
+    if (path == null) return null;
+    const folder = if (do_send) "sentitems" else "drafts";
+    return .{ .id = try std.fmt.allocPrint(a, "{s}:{s}", .{ folder, maildirBaseName(filename) }), .change_key = changeKey(message_data) };
+}
+
+fn buildMail(a: std.mem.Allocator, ctx: *Context, item: xml.Element, epoch: i64, nanos: i128, seq: u64) !message_headers.ClientMime {
+    const subject = try xmlUnescape(a, (try childText(item, "Subject")) orelse "");
+    const element = try item.child("Body");
+    const body = if (element) |el| try xmlUnescape(a, el.content) else "";
+    const body_type = if (element) |el| el.attribute("BodyType") orelse "Text" else "Text";
+    const ctype: []const u8 = if (std.ascii.eqlIgnoreCase(body_type, "HTML")) "text/html; charset=utf-8" else "text/plain; charset=utf-8";
+
+    var msg: std.ArrayList(u8) = .empty;
+    try msg.print(a, "From: {s}\r\n", .{ctx.username});
+    const fields = [_][]const u8{ "To", "Cc", "Bcc" };
+    const xml_names = [_][]const u8{ "ToRecipients", "CcRecipients", "BccRecipients" };
+    var recipients: std.ArrayList([]const u8) = .empty;
+    for (fields, xml_names) |name, element_name| {
+        const block = (try childText(item, element_name)) orelse continue;
+        const first = recipients.items.len;
+        try collectEmails(a, block, &recipients);
+        for (recipients.items[first..]) |address| if (!submission.isSafeAddress(address)) return error.InvalidAddress;
+        if (recipients.items.len > first) try msg.print(a, "{s}: {s}\r\n", .{ name, try std.mem.join(a, ", ", recipients.items[first..]) });
+    }
+    try msg.print(a, "Subject: {s}\r\n", .{headerSafe(a, subject)});
+    try msg.print(a, "Date: {s}\r\n", .{rfc2822Date(a, epoch)});
+    try msg.print(a, "Message-ID: <{d}.{d}.{d}@{s}>\r\n", .{ epoch, nanos, seq, ctx.hostname });
+    try msg.print(a, "MIME-Version: 1.0\r\nContent-Type: {s}\r\nContent-Transfer-Encoding: 8bit\r\n\r\n", .{ctype});
+    try msg.appendSlice(a, body);
+    if (!std.mem.endsWith(u8, msg.items, "\n")) try msg.appendSlice(a, "\r\n");
+    return .{ .archive = msg.items, .recipients = recipients.items };
+}
+
+fn createAttachment(ctx: *Context, soap: []const u8) !Response {
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    return addAttachmentsToDraft(a, ctx, soap) catch |err| return mailResult(ctx, a, "CreateAttachment", err);
+}
+
+fn addAttachmentsToDraft(a: std.mem.Allocator, ctx: *Context, soap: []const u8) !Response {
+    const request = try xml.operation(soap, "CreateAttachment");
+    const parent = (try request.child("ParentItemId")) orelse return error.InvalidXml;
+    const item_id = try xmlUnescape(a, parent.attribute("Id") orelse return error.InvalidXml);
+    const prefix = "drafts:";
+    if (!std.mem.startsWith(u8, item_id, prefix)) return error.UnsupportedAttachment;
+    const filename = item_id[prefix.len..];
+    const draft = readMailFile(a, ctx, "Drafts", filename) orelse return error.ItemNotFound;
+    if (parent.attribute("ChangeKey")) |key| {
+        if (!std.mem.eql(u8, key, "ck0") and !std.mem.eql(u8, key, &changeKey(draft.content))) return error.StaleDraft;
+    }
+    const container = (try request.child("Attachments")) orelse return error.InvalidXml;
+    const files = try parseFiles(a, ctx, container);
+    if (files.len == 0) return error.InvalidAttachment;
+    const updated = try addFiles(a, ctx, draft.content, files);
+    try scanMail(ctx, updated);
+
+    {
+        ctx.db.lockMailboxes();
+        defer ctx.db.unlockMailboxes();
+        const current = readMailFile(a, ctx, "Drafts", filename) orelse return error.ItemNotFound;
+        if (!std.mem.eql(u8, current.content, draft.content)) return error.StaleDraft;
+        if (try webmail_store.managesDraftFile(ctx.db, ctx.username, filename)) return error.ManagedDraft;
+        try webmail_maildir.replaceDraftFile(a, ctx.db, ctx.username, current.path, updated);
     }
 
-    if (path == null) return mailResult(ctx, a, "CreateItem", null);
-    const item_basename = maildirBaseName(filename);
-    var buf = std.ArrayList(u8).empty;
-    try buf.print(a,
-        \\<m:CreateItemResponse><m:ResponseMessages><m:CreateItemResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Items><t:Message><t:ItemId Id="{s}:{s}" ChangeKey="ck0"/></t:Message></m:Items></m:CreateItemResponseMessage></m:ResponseMessages></m:CreateItemResponse>
-    , .{ item_folder, item_basename });
-    return Response{ .body = try envelope(ctx.allocator, buf.items) };
+    const item = xmlEscape(a, item_id);
+    const updated_key = changeKey(updated);
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(a, "<m:CreateAttachmentResponse><m:ResponseMessages>");
+    for (files) |file| {
+        try buf.print(a,
+            \\<m:CreateAttachmentResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Attachments><t:FileAttachment><t:AttachmentId Id="{s}:{s}" RootItemId="{s}" RootItemChangeKey="{s}"/></t:FileAttachment></m:Attachments></m:CreateAttachmentResponseMessage>
+        , .{ item, file.id, item, updated_key });
+    }
+    try buf.appendSlice(a, "</m:ResponseMessages></m:CreateAttachmentResponse>");
+    return .{ .body = try envelope(ctx.allocator, buf.items) };
 }
 
 // ----------------------------------------------------------------------------
@@ -1234,9 +1374,8 @@ fn createItemOk(ctx: *Context, item_tag: []const u8, full_id: []const u8) !Respo
 }
 
 /// CreateItem carrying a <t:CalendarItem> → store.createEvent.
-fn createCalendarItem(ctx: *Context, soap: []const u8) !Response {
+fn createCalendarItem(ctx: *Context, el: []const u8) !Response {
     const store = ctx.store orelse return createItemError(ctx);
-    const el = elementText(soap, "CalendarItem") orelse return createItemError(ctx);
     const sa = store.allocator;
     const cal_id = resolveCalendarId(ctx) orelse return createItemError(ctx);
 
@@ -1266,9 +1405,8 @@ fn createCalendarItem(ctx: *Context, soap: []const u8) !Response {
 }
 
 /// CreateItem carrying a <t:Contact> → store.createContact (+ emails/phones).
-fn createContactItem(ctx: *Context, soap: []const u8) !Response {
+fn createContactItem(ctx: *Context, el: []const u8) !Response {
     const store = ctx.store orelse return createItemError(ctx);
-    const el = elementText(soap, "Contact") orelse return createItemError(ctx);
     const sa = store.allocator;
     const ab_id = resolveAddressBookId(ctx) orelse return createItemError(ctx);
 
@@ -1442,6 +1580,7 @@ fn sendSavedItem(a: std.mem.Allocator, ctx: *Context, id: []const u8, save_copy:
     const colon = std.mem.indexOfScalar(u8, id, ':') orelse return error.ItemNotFound;
     const mailbox = ewsFolderToMailbox(id[0..colon]);
     const found = readMailFile(a, ctx, mailbox, id[colon + 1 ..]) orelse return error.ItemNotFound;
+    try scanMail(ctx, found.content);
     const split = headerBodySplit(found.content);
     const headers = found.content[0..split.header_end];
     var addresses: std.ArrayList([]const u8) = .empty;

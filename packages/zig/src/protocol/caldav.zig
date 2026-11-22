@@ -1763,6 +1763,7 @@ fn webEws(allocator: std.mem.Allocator, config: *const CalDavConfig, username: ?
         .store = store,
         .delivery_method = config.delivery_method,
         .ses_region = config.ses_region,
+        .scanner = config.scanner,
         .mail_config = config.mail_config,
     };
     const resp = try ews.handleSoap(&ctx, httpBody(request));

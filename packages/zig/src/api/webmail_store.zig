@@ -103,6 +103,22 @@ pub fn findDraft(allocator: std.mem.Allocator, db: *database.Database, user: []c
     return readRecord(allocator, s);
 }
 
+/// The webmail draft document and its MIME file must change together.
+/// Other protocols call this while holding the mailbox mutation lock.
+pub fn managesDraftFile(db: *database.Database, user: []const u8, filename: []const u8) !bool {
+    const uid = (try db.getUidForFile(user, "Drafts", filename)) orelse return false;
+    {
+        const schema = try db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='webmail_records'");
+        defer schema.finalize();
+        if (!try schema.step()) return false;
+    }
+    const stmt = try db.prepare("SELECT 1 FROM webmail_records WHERE username=?1 AND kind='draft' AND json_extract(payload,'$.folder')='Drafts' AND json_extract(payload,'$.uid')=?2 LIMIT 1");
+    defer stmt.finalize();
+    try stmt.bind(1, user);
+    try stmt.bind(2, uid);
+    return stmt.step();
+}
+
 pub fn accountAttachmentLimits(db: *database.Database, user: []const u8) !struct { file: i64, total: i64 } {
     const s = try db.prepare("SELECT attachment_max_size,attachment_max_total FROM users WHERE username=?1");
     defer s.finalize();

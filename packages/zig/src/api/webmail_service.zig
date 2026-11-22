@@ -2,6 +2,7 @@
 //! Draft metadata preserves unfinished recipient entry separately from safe MIME
 //! headers. Undo receipts are server-owned, expiring, and bound to one account.
 const std = @import("std");
+const attachment_metadata = @import("../message/attachment_metadata.zig");
 const clamav = @import("../antispam/clamav.zig");
 const database = @import("../storage/database.zig");
 const auth_mod = @import("../auth/auth.zig");
@@ -742,17 +743,8 @@ pub fn json(a: std.mem.Allocator, value: anytype) ![]const u8 {
     return std.json.Stringify.valueAlloc(a, value, .{});
 }
 
-pub fn validFilename(name: []const u8) bool {
-    if (name.len == 0 or name.len > 255 or !std.unicode.utf8ValidateSlice(name)) return false;
-    for (name) |byte| if (byte < 0x20 or byte == 0x7f or byte == '/' or byte == '\\') return false;
-    return true;
-}
-
-pub fn validContentType(value: []const u8) bool {
-    if (value.len == 0 or value.len > 100 or std.mem.indexOfScalar(u8, value, '/') == null) return false;
-    for (value) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '/' and byte != '-' and byte != '.' and byte != '+') return false;
-    return true;
-}
+pub const validFilename = attachment_metadata.validFilename;
+pub const validContentType = attachment_metadata.validContentType;
 
 fn validDraftAddresses(a: std.mem.Allocator, addresses: []const []const u8) ![]const []const u8 {
     var valid: std.ArrayList([]const u8) = .empty;
