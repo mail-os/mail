@@ -457,12 +457,12 @@ busy periods as `{"busy":[{"start":…,"end":…}]}`. Private and confidential
 events block time. Transparent and cancelled events leave it free.
 
 The server resolves calendar dates and named time zones and applies supported
-daily, weekly, monthly, and yearly recurrence rules, explicit dates, exclusions,
-and individual occurrence overrides. A `422 availability_incomplete` response
-means the server could not calculate all busy times, for example with hourly
-rules or `RANGE=THISANDFUTURE` overrides. A `413 availability_limit` response
-means the calculation exceeded a limit. Treat either response as unknown
-availability.
+sub-daily, daily, weekly, monthly, and yearly rules, explicit dates and
+exclusions, and individual and `RANGE=THISANDFUTURE` overrides.
+A `422 availability_incomplete` response means the server could not calculate
+all busy times, for example for rules that use `BYWEEKNO`. A
+`413 availability_limit` response means the calculation exceeded a limit.
+Treat either response as unknown availability.
 
 CalDAV clients can send a `CALDAV:free-busy-query` report to the URL of an
 individual calendar from the owner's CalDAV collection listing. The URL uses
@@ -494,9 +494,8 @@ and do not expose the owner's sync token, change tag, or change journal.
 In both owned and shared collections, a `VEVENT` time range in a
 `calendar-query` report matches any overlapping occurrence. Results include
 the original resource. The range includes its start and excludes its end.
-Daily, weekly, monthly, and yearly rules, explicit dates and periods,
-exclusions, and individual overrides are supported. A report can supply a
-`VTIMEZONE` for floating times. Transparent events still match.
+Date filters use the same recurrence evaluation as availability. A report can
+supply a `VTIMEZONE` for floating times. Transparent events still match.
 An incomplete calculation returns 422. Exceeding the recurrence work limit
 returns 507.
 

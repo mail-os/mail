@@ -140,6 +140,23 @@ def dav_busy(client, path, start="20261201T000000Z", end="20270101T000000Z", *,
     return [line.removeprefix("FREEBUSY;FBTYPE=") for line in lines[8:-2]]
 
 
+def dav_query(client, path, start, end, *, tls=True, timezone="", expected=207, component="VEVENT", quote_mark='"'):
+    bounds = " ".join(f"{field}={quote_mark}{value}{quote_mark}" for field, value in (("start", start), ("end", end)) if value)
+    zone = f"<C:timezone><![CDATA[{timezone}]]></C:timezone>" if timezone else ""
+    body = (f"<?xml version='1.0'?><C:calendar-query xmlns:C='{CALDAV}' xmlns:D='DAV:'>"
+            "<D:prop><D:getetag/><C:calendar-data/></D:prop>"
+            "<C:filter><C:comp-filter name='VCALENDAR'>"
+            f"<C:comp-filter name='{component}'><C:time-range {bounds}/></C:comp-filter>"
+            f"</C:comp-filter></C:filter>{zone}</C:calendar-query>")
+    headers = {"Depth": "1", "Content-Type": "application/xml"}
+    status, _, data = client.request("REPORT", path, body, headers, tls=tls)
+    assert status == expected, (start, end, status, data)
+    if expected != 207:
+        return data
+    responses = ET.fromstring(data).findall("{DAV:}response")
+    return {item.findtext("{DAV:}href"): item.findtext(f".//{{{CALDAV}}}calendar-data") for item in responses}
+
+
 def create_calendar(test, owner_session):
     return expect(test.api(owner_session, "calendars", {"name": CALENDAR}), 201)["id"]
 
@@ -369,7 +386,7 @@ def verify_availability(test, owner, viewer):
                          (CALDAV, range_xml.replace("<C:time-range", '<C:time-range xmlns:C="DAV:"'))):
         dav_busy(viewer_dav, path, body=f'<C:free-busy-query xmlns:C="{ns}">{children}</C:free-busy-query>', status=400)
 
-    unsupported = store("unsupported", "DTSTART:20260314T120000Z", "DURATION:PT15M", "RRULE:FREQ=HOURLY;COUNT=3")
+    unsupported = store("unsupported", "DTSTART:20260314T120000Z", "DURATION:PT15M", "RRULE:FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO")
     result = expect(test.api(invited, query), 422)
     assert result["error"] == "availability_incomplete" and "Sensitive" not in repr(result), result
     dav_busy(viewer_dav, path, start_date, end_date, status=422)
@@ -624,20 +641,8 @@ def verify_dav_recurrence_query(test, owner, viewer):
     owner_dav, guest_dav = DavClient(test, owner), DavClient(test, viewer)
     expect(change(test, captain, calendar_id, viewer, "viewer"))
 
-    def report(client, tls, start, end, *, timezone="", expected=207, component="VEVENT", quote_mark='"'):
-        bounds = " ".join(f"{field}={quote_mark}{value}{quote_mark}" for field, value in (("start", start), ("end", end)) if value)
-        zone = f"<C:timezone><![CDATA[{timezone}]]></C:timezone>" if timezone else ""
-        body = (f"<?xml version='1.0'?><C:calendar-query xmlns:C='{CALDAV}' xmlns:D='DAV:'>"
-                "<D:prop><D:getetag/><C:calendar-data/></D:prop>"
-                "<C:filter><C:comp-filter name='VCALENDAR'>"
-                f"<C:comp-filter name='{component}'><C:time-range {bounds}/></C:comp-filter>"
-                f"</C:comp-filter></C:filter>{zone}</C:calendar-query>")
-        status, _, data = client.request("REPORT", path, body, headers, tls=tls)
-        assert status == expected, (start, end, status, data)
-        if expected != 207:
-            return data
-        responses = ET.fromstring(data).findall("{DAV:}response")
-        return {item.findtext("{DAV:}href"): item.findtext(f".//{{{CALDAV}}}calendar-data") for item in responses}
+    def report(client, tls, start, end, **options):
+        return dav_query(client, path, start, end, tls=tls, **options)
 
     for client in (owner_dav, guest_dav):
         for tls in (True, False):
@@ -671,7 +676,10 @@ def verify_dav_recurrence_query(test, owner, viewer):
     hourly = store("hourly", *event(
         "hourly", "DTSTART:20261225T090000Z", "DURATION:PT5M", "RRULE:FREQ=HOURLY;COUNT=3",
     ))
-    report(owner_dav, True, "20261225T100000Z", "20261225T100500Z", expected=422)
+    assert set(report(owner_dav, True, "20261225T100000Z", "20261225T100500Z")) == {hourly}
+    assert dav_busy(guest_dav, path, "20261225T100000Z", "20261225T100500Z") == [
+        "BUSY:20261225T100000Z/20261225T100500Z",
+    ]
     assert guest_dav.request("PROPFIND", path, headers=headers)[0] == 207
     assert owner_dav.request("DELETE", hourly)[0] == 204
     store("dense-history", *event(
@@ -679,6 +687,102 @@ def verify_dav_recurrence_query(test, owner, viewer):
     ))
     limited = report(guest_dav, True, "20261225T000000Z", "20261225T000500Z", expected=507)
     assert ET.fromstring(limited).find("{DAV:}number-of-matches-within-limits") is not None
+    expect(change(test, captain, calendar_id, viewer, None))
+    assert owner_dav.request("DELETE", path)[0] == 204
+
+
+def verify_dav_advanced_recurrence(test, owner, viewer):
+    calendar = "Advanced recurrence"
+    captain, invited = test.login(owner), test.login(viewer)
+    calendar_id = expect(test.api(captain, "calendars", {"name": calendar}), 201)["id"]
+    path = calendar_path(owner, calendar)
+    owner_dav, guest = DavClient(test, owner), DavClient(test, viewer)
+
+    def store(uid, *events):
+        lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail advanced recurrence fixture//EN"]
+        for fields in events:
+            lines.extend(("BEGIN:VEVENT", f"UID:{uid}", "DTSTAMP:20261122T120000Z", f"SUMMARY:{uid}", *fields, "END:VEVENT"))
+        write_resource(test, owner, calendar, uid, [*lines, "END:VCALENDAR", ""])
+        return f"{path}/{uid}.ics"
+
+    hourly = store("zoned-hourly",
+                   ("DTSTART;TZID=America/New_York:20260308T013000", "DURATION:PT5M", "RRULE:FREQ=HOURLY;COUNT=4",
+                    "EXDATE;TZID=America/New_York:20260308T043000"),
+                   ("RECURRENCE-ID;TZID=America/New_York:20260308T053000", "DTSTART;TZID=America/New_York:20260308T061500"))
+    minutely = store("minutely", ("DTSTART:20261221T090035Z", "DURATION:PT5S",
+                                  "RRULE:FREQ=MINUTELY;INTERVAL=15;BYSECOND=5,35;BYSETPOS=-1;UNTIL=20261221T091535Z"))
+    secondly = store("secondly", ("DTSTART:20261222T090000Z", "DURATION:PT2S", "RRULE:FREQ=SECONDLY;INTERVAL=10;COUNT=3"))
+    selected = store("selected-hourly", ("DTSTART:20261223T093000Z", "DURATION:PT5M",
+                                        "RRULE:FREQ=HOURLY;BYHOUR=9,11;BYMINUTE=30,45;COUNT=4"))
+    ranged = store("ranged",
+                   ("DTSTART;TZID=America/New_York:20260305T090000", "DURATION:PT30M", "RRULE:FREQ=DAILY;COUNT=10",
+                    "RDATE;VALUE=PERIOD;TZID=America/New_York:20260311T180000/PT15M"),
+                   ("RECURRENCE-ID;RANGE=THISANDFUTURE:20260307T140000Z",
+                    "DTSTART;TZID=America/New_York:20260306T170000", "DURATION:PT90M", "STATUS:TENTATIVE"),
+                   ("RECURRENCE-ID;TZID=America/New_York:20260310T090000",
+                    "DTSTART;TZID=America/New_York:20260310T110000", "DURATION:PT50M"),
+                   ("RECURRENCE-ID;TZID=America/New_York:20260311T090000", "STATUS:CANCELLED"),
+                   ("RECURRENCE-ID;TZID=America/New_York;RANGE=THISANDFUTURE:20260312T090000", "STATUS:CANCELLED"))
+    protected = store("protected-range",
+                      ("DTSTART:20261224T090000Z", "DURATION:PT15M", "RRULE:FREQ=DAILY;COUNT=4"),
+                      ("RECURRENCE-ID;RANGE=THISANDFUTURE:20261225T090000Z", "DTSTART:20261225T100000Z", "CLASS:PRIVATE"))
+
+    windows = [
+        ("20260308T062900Z", "20260308T110000Z", hourly,
+         ["BUSY:20260308T063000Z/20260308T063500Z", "BUSY:20260308T073000Z/20260308T073500Z",
+          "BUSY:20260308T101500Z/20260308T102000Z"]),
+        ("20261221T090035Z", "20261221T093600Z", minutely,
+         ["BUSY:20261221T090035Z/20261221T090040Z", "BUSY:20261221T091535Z/20261221T091540Z"]),
+        ("20261222T090002Z", "20261222T090020Z", secondly, ["BUSY:20261222T090010Z/20261222T090012Z"]),
+        ("20261223T094000Z", "20261223T120000Z", selected,
+         ["BUSY:20261223T094500Z/20261223T095000Z", "BUSY:20261223T113000Z/20261223T113500Z",
+          "BUSY:20261223T114500Z/20261223T115000Z"]),
+        ("20260305T135900Z", "20260305T150000Z", ranged, ["BUSY:20260305T140000Z/20260305T143000Z"]),
+        ("20260306T215900Z", "20260307T000000Z", ranged, ["BUSY-TENTATIVE:20260306T220000Z/20260306T233000Z"]),
+        ("20260307T215900Z", "20260308T000000Z", ranged, ["BUSY-TENTATIVE:20260307T220000Z/20260307T233000Z"]),
+        ("20260308T205900Z", "20260308T230000Z", ranged, ["BUSY-TENTATIVE:20260308T210000Z/20260308T223000Z"]),
+        ("20260310T140000Z", "20260310T160000Z", ranged, ["BUSY:20260310T150000Z/20260310T155000Z"]),
+        ("20260311T055900Z", "20260311T080000Z", ranged, ["BUSY-TENTATIVE:20260311T060000Z/20260311T073000Z"]),
+    ]
+    empty_windows = [
+        ("20260308T083000Z", "20260308T083500Z"),
+        ("20260308T093000Z", "20260308T093500Z"),
+        ("20261221T091540Z", "20261221T093600Z"),
+        ("20261222T090022Z", "20261222T090100Z"),
+        ("20260309T130000Z", "20260309T133000Z"),
+        ("20260309T205900Z", "20260309T230000Z"),
+        ("20260311T130000Z", "20260311T133000Z"),
+        ("20260311T205900Z", "20260314T230000Z"),
+    ]
+    expect(change(test, captain, calendar_id, viewer, "viewer"))
+    for tls in (True, False):
+        for begin, end, href, busy in windows:
+            assert set(dav_query(owner_dav, path, begin, end, tls=tls)) == {href}
+            assert set(dav_query(guest, path, begin, end, tls=tls)) == {href}
+            assert dav_busy(guest, path, begin, end, tls=tls) == busy
+        for begin, end in empty_windows:
+            assert not dav_query(guest, path, begin, end, tls=tls)
+            assert not dav_busy(guest, path, begin, end, tls=tls)
+
+    historic = store("long-running-seconds",
+                     ("DTSTART:20200101T221002Z", "DURATION:PT3S", "RRULE:FREQ=SECONDLY;INTERVAL=10"),
+                     ("RECURRENCE-ID;RANGE=THISANDFUTURE:20261220T115952Z", "DTSTART:20261220T120007Z"))
+    assert set(dav_query(guest, path, "20261220T120008Z", "20261220T120018Z")) == {historic}
+    assert dav_busy(guest, path, "20261220T120008Z", "20261220T120018Z") == [
+        "BUSY:20261220T120008Z/20261220T120010Z", "BUSY:20261220T120017Z/20261220T120018Z",
+    ]
+    assert owner_dav.request("DELETE", historic)[0] == 204
+
+    begin, end = "20261226T100000Z", "20261226T101500Z"
+    assert set(dav_query(owner_dav, path, begin, end)) == {protected}
+    for role in ("viewer", "editor", "free_busy"):
+        expect(change(test, captain, calendar_id, viewer, role))
+        report = dav_query(guest, path, begin, end, expected=404 if role == "free_busy" else 207)
+        assert not report
+        assert guest.request("GET", protected)[0] == 404
+        assert dav_busy(guest, path, begin, end) == ["BUSY:20261226T100000Z/20261226T101500Z"]
+        query = busy_query(calendar_id, timestamp(begin), timestamp(end))
+        assert expect(test.api(invited, query)) == {"busy": [busy_period(begin, end)]}
     expect(change(test, captain, calendar_id, viewer, None))
     assert owner_dav.request("DELETE", path)[0] == 204
 
@@ -707,6 +811,7 @@ def main():
             verify_editors(test, scan, owner, viewer, colleague, calendar_id)
             verify_dav_editors(test, scan, owner, viewer, foreign, calendar_id)
             verify_dav_recurrence_query(test, owner, viewer)
+            verify_dav_advanced_recurrence(test, owner, viewer)
             verify_availability(test, owner, viewer)
 
         with test.daemon():
@@ -734,7 +839,7 @@ def main():
             dav_busy(DavClient(test, viewer), calendar_path(owner, CALENDAR), status=404)
             assert DavClient(test, viewer).request("GET", calendar_path(owner, CALENDAR) + "/Replacement.ics")[0] == 404
 
-    print("Verified calendar sharing in webmail and CalDAV, including recurrence queries, public event reads and writes, private free/busy, revision races, revocation, restart, and calendar ID reuse.")
+    print("Verified calendar sharing in webmail and CalDAV, including sub-daily rules, range overrides, public event reads and writes, private free/busy, revision races, revocation, restart, and calendar ID reuse.")
 
 
 if __name__ == "__main__":

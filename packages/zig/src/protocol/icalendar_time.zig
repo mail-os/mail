@@ -275,6 +275,30 @@ pub const Zone = struct {
         return self.wallOffset(date).gap;
     }
 
+    /// Convert an instant to a wall time that round-trips using this zone's
+    /// first-offset rule for repeated local times.
+    pub fn dateAt(self: Zone, stamp: i64, kind: Date.Kind) ?Date {
+        for (self.rules) |rule| {
+            for ([_]i64{ rule.from, rule.to }) |offset| {
+                const candidate = Date.fromEpoch(stamp + offset, kind);
+                const wall = self.wallOffset(candidate);
+                if (!wall.gap and wall.offset == offset) return candidate;
+            }
+        }
+        return null;
+    }
+
+    pub fn offsetLimit(self: Zone, comptime limit: enum { earliest, latest }) i64 {
+        var extreme = self.rules[0].from;
+        for (self.rules) |rule| {
+            extreme = switch (limit) {
+                .earliest => @min(extreme, rule.from, rule.to),
+                .latest => @max(extreme, rule.from, rule.to),
+            };
+        }
+        return extreme;
+    }
+
     fn wallOffset(self: Zone, date: Date) struct { offset: i64, gap: bool } {
         const wall = date.epoch();
         var earliest = self.rules[0];

@@ -147,6 +147,17 @@ const Moment = struct {
     fn withDate(self: Moment, date: Date) Moment {
         return .{ .date = date, .zone = self.zone };
     }
+
+    fn wallIn(self: Moment, target: ?clock.Zone) !i64 {
+        if (target) |zone| {
+            if (self.zone) |source| {
+                if (zone.rules.ptr == source.rules.ptr) return self.date.epoch();
+            }
+            const date = zone.dateAt(self.stamp(), self.date.kind) orelse return error.AvailabilityUnsupported;
+            return date.epoch();
+        }
+        return self.stamp();
+    }
 };
 
 const Length = union(enum) {
@@ -157,6 +168,13 @@ const Length = union(enum) {
         return switch (self) {
             .exact => |seconds| start.stamp() + seconds,
             .wall => |interval| start.withDate(Date.fromEpoch(start.date.epoch() + interval.days * day, start.date.kind)).stamp() + interval.seconds,
+        };
+    }
+
+    fn wallSeconds(self: Length) i64 {
+        return switch (self) {
+            .exact => |seconds| seconds,
+            .wall => |interval| interval.days * day + interval.seconds,
         };
     }
 };
@@ -171,6 +189,12 @@ const Event = struct {
     transparent: ?bool = null,
 
     const Status = enum { confirmed, tentative, cancelled };
+
+    fn busyKind(self: Event, output: OccurrenceOutput, master: Event) ?BusyType {
+        const status = self.status orelse master.status orelse .confirmed;
+        if (output.ignores(status, self.transparent orelse master.transparent orelse false)) return null;
+        return if (status == .tentative) .tentative else .busy;
+    }
 
     fn read(a: Allocator, component: ical.Component) !Event {
         var event = Event{ .component = component };
@@ -208,6 +232,26 @@ const Event = struct {
             return .{ .wall = interval };
         }
         return if (start.date.kind == .date) .{ .wall = .{ .days = 1 } } else .{ .exact = 0 };
+    }
+};
+
+const RangeEdit = struct {
+    key: i64,
+    replacement: ?Replacement,
+
+    const Replacement = struct {
+        shift: i64,
+        anchor: Moment,
+        length: ?Length,
+        kind: BusyType,
+    };
+
+    fn lessThan(_: void, lhs: RangeEdit, rhs: RangeEdit) bool {
+        return lhs.key < rhs.key;
+    }
+
+    fn anchorOrder(key: i64, item: RangeEdit) std.math.Order {
+        return std.math.order(key, item.key);
     }
 };
 
@@ -280,21 +324,39 @@ fn appendResource(output: OccurrenceOutput, scratch: Allocator, source: []const 
     };
     const start_field = event.start orelse return error.InvalidCalendar;
     const start = try Moment.read(scratch, &zones, start_field.value, start_field, fallback);
+    const length = try event.length(scratch, &zones, start);
     var exclude: std.AutoHashMapUnmanaged(i64, void) = .empty;
+    var ranges: std.ArrayList(RangeEdit) = .empty;
     for (detached.items) |item| {
         const original = item.recurrence_id.?;
-        if (original.param("RANGE") != null) return error.AvailabilityUnsupported;
+        const range = original.param("RANGE");
+        if (range) |value| if (!std.ascii.eqlIgnoreCase(value, "THISANDFUTURE")) return error.AvailabilityUnsupported;
         const recurrence = try Moment.read(scratch, &zones, original.value, original, start.zone);
-        if ((try exclude.getOrPut(scratch, recurrence.stamp())).found_existing) return error.InvalidCalendar;
-        const status = item.status orelse event.status orelse .confirmed;
-        if (output.ignores(status, item.transparent orelse event.transparent orelse false)) continue;
+        const key = recurrence.stamp();
+        if ((try exclude.getOrPut(scratch, key)).found_existing) return error.InvalidCalendar;
+        const kind = item.busyKind(output, event) orelse {
+            if (range != null) try ranges.append(scratch, .{ .key = key, .replacement = null });
+            continue;
+        };
         const start_value = item.start orelse return error.InvalidCalendar;
         const moved = try Moment.read(scratch, &zones, start_value.value, start_value, start.zone);
-        const length = if (item.finish == null and item.duration == null) try event.length(scratch, &zones, start) else try item.length(scratch, &zones, moved);
-        try output.add(moved.stamp(), length.end(moved), if (status == .tentative) .tentative else .busy);
+        if ((moved.date.kind == .date) != (start.date.kind == .date) or (recurrence.date.kind == .date) != (start.date.kind == .date))
+            return error.InvalidCalendar;
+        const modified_length = if (item.finish == null and item.duration == null) null else try item.length(scratch, &zones, moved);
+        if (range != null) try ranges.append(scratch, .{
+            .key = key,
+            .replacement = .{
+                .shift = moved.date.epoch() - try recurrence.wallIn(start.zone),
+                .anchor = moved,
+                .length = modified_length,
+                .kind = kind,
+            },
+        });
+        try output.add(moved.stamp(), (modified_length orelse length).end(moved), kind);
     }
-    if (output.ignores(event.status orelse .confirmed, event.transparent orelse false)) return;
-    const kind: BusyType = if (event.status == .tentative) .tentative else .busy;
+    const kind = event.busyKind(output, event);
+    if (kind == null and ranges.items.len == 0) return;
+    std.mem.sort(RangeEdit, ranges.items, {}, RangeEdit.lessThan);
 
     var properties = ical.Properties.init(event.component);
     while (try properties.next(scratch)) |property| {
@@ -305,10 +367,8 @@ fn appendResource(output: OccurrenceOutput, scratch: Allocator, source: []const 
             try exclude.put(scratch, removed.stamp(), {});
         }
     }
-    const length = try event.length(scratch, &zones, start);
-
     // Explicit RDATE periods can replace the event's usual duration.
-    const ExplicitInstance = struct { end: i64, has_period: bool };
+    const ExplicitInstance = struct { start: Moment, length: ?Length };
     var included: std.AutoHashMapUnmanaged(i64, ExplicitInstance) = .empty;
     properties = ical.Properties.init(event.component);
     while (try properties.next(scratch)) |property| {
@@ -318,36 +378,49 @@ fn appendResource(output: OccurrenceOutput, scratch: Allocator, source: []const 
             const division = std.mem.indexOfScalar(u8, value, '/') orelse value.len;
             const candidate = try Moment.read(scratch, &zones, value[0..division], property, start.zone);
             if (exclude.contains(candidate.stamp())) continue;
-            const end = if (division == value.len) length.end(candidate) else blk: {
+            const period: ?Length = if (division == value.len) null else blk: {
                 const right = value[division + 1 ..];
-                if (clock.duration(right)) |interval| break :blk (Length{ .wall = interval }).end(candidate);
+                if (clock.duration(right)) |interval| break :blk .{ .wall = interval };
                 const finish = try Moment.read(scratch, &zones, right, property, start.zone);
-                break :blk finish.stamp();
+                break :blk .{ .exact = finish.stamp() - candidate.stamp() };
             };
             const explicit = try included.getOrPut(scratch, candidate.stamp());
-            const period = division != value.len;
-            if (period and (candidate.date.kind == .date or end <= candidate.stamp())) return error.InvalidCalendar;
-            if (explicit.found_existing and explicit.value_ptr.has_period) {
-                if (period and explicit.value_ptr.end != end) return error.InvalidCalendar;
-            } else {
-                explicit.value_ptr.* = .{ .end = end, .has_period = period };
+            if (period) |duration| {
+                if (candidate.date.kind == .date or duration.end(candidate) <= candidate.stamp()) return error.InvalidCalendar;
+                if (explicit.found_existing) {
+                    if (explicit.value_ptr.length) |prior| {
+                        if (prior.end(explicit.value_ptr.start) != duration.end(candidate)) return error.InvalidCalendar;
+                        continue;
+                    }
+                }
+            } else if (explicit.found_existing) {
+                continue;
             }
+            explicit.value_ptr.* = .{ .start = candidate, .length = period };
         }
     }
+    var expansion = Expansion{
+        .output = output,
+        .seed = start,
+        .length = length,
+        .kind = kind,
+        .ranges = ranges.items,
+        .exclude = &exclude,
+        .budget = budget,
+    };
     var explicit = included.iterator();
     while (explicit.next()) |item| {
-        try output.add(item.key_ptr.*, item.value_ptr.end, kind);
+        try expansion.add(item.value_ptr.start, item.value_ptr.length orelse length);
         try exclude.put(scratch, item.key_ptr.*, {});
     }
-    var expansion = Expansion{ .output = output, .seed = start, .length = length, .kind = kind, .exclude = &exclude, .budget = budget };
     try expansion.append(start);
     properties = ical.Properties.init(event.component);
     while (try properties.next(scratch)) |property| {
-        if (property.named("RRULE")) try expansion.rule(try Rule.parse(scratch, property.value));
+        if (property.named("RRULE")) try expansion.rule(scratch, try Rule.parse(scratch, property.value));
     }
 }
 
-const Frequency = enum { daily, weekly, monthly, yearly };
+const Frequency = enum { secondly, minutely, hourly, daily, weekly, monthly, yearly };
 const Weekday = struct { day_of_week: i64, ordinal: i8 = 0 };
 
 const Rule = struct {
@@ -359,7 +432,11 @@ const Rule = struct {
     months: u12 = 0,
     weekdays: []const Weekday = &.{},
     month_days: []const i8 = &.{},
+    year_days: []const i16 = &.{},
     positions: []const i16 = &.{},
+    hours: u64 = 0,
+    minutes: u64 = 0,
+    seconds: u64 = 0,
 
     fn parse(a: Allocator, source: []const u8) !Rule {
         var result: Rule = .{ .frequency = .daily };
@@ -387,6 +464,14 @@ const Rule = struct {
                 while (values.next()) |month| result.months |= @as(u12, 1) << @intCast((try int(u8, month, 1, 12)) - 1);
             } else if (std.mem.eql(u8, name, "BYMONTHDAY")) {
                 result.month_days = try intList(i8, a, value, 31);
+            } else if (std.mem.eql(u8, name, "BYYEARDAY")) {
+                result.year_days = try intList(i16, a, value, 366);
+            } else if (std.mem.eql(u8, name, "BYHOUR")) {
+                result.hours = try timeMask(value, 23);
+            } else if (std.mem.eql(u8, name, "BYMINUTE")) {
+                result.minutes = try timeMask(value, 59);
+            } else if (std.mem.eql(u8, name, "BYSECOND")) {
+                result.seconds = try timeMask(value, 60);
             } else if (std.mem.eql(u8, name, "BYSETPOS")) {
                 result.positions = try intList(i16, a, value, 366);
             } else if (std.mem.eql(u8, name, "BYDAY")) {
@@ -404,23 +489,36 @@ const Rule = struct {
         result.frequency = frequency orelse return error.InvalidCalendar;
         if (result.count != null and result.until != null) return error.InvalidCalendar;
         if (result.frequency == .weekly and result.month_days.len != 0) return error.InvalidCalendar;
+        switch (result.frequency) {
+            .daily, .weekly, .monthly => if (result.year_days.len != 0) return error.InvalidCalendar,
+            else => {},
+        }
         for (result.weekdays) |item| {
-            if (item.ordinal != 0 and (result.frequency == .daily or result.frequency == .weekly)) return error.InvalidCalendar;
+            if (item.ordinal != 0 and result.frequency != .monthly and result.frequency != .yearly)
+                return error.InvalidCalendar;
         }
         return result;
     }
 
     fn matches(self: Rule, seed: Date, date: Date) bool {
         if (self.months != 0 and self.months & (@as(u12, 1) << @intCast(date.month - 1)) == 0) return false;
-        if (self.frequency == .yearly and self.months == 0 and self.month_days.len == 0 and self.weekdays.len == 0 and date.month != seed.month)
+        if (self.frequency == .yearly and self.months == 0 and self.month_days.len == 0 and
+            self.year_days.len == 0 and self.weekdays.len == 0 and date.month != seed.month)
             return false;
+        if (self.year_days.len != 0) {
+            const year_start = monthStart(date.year, 0);
+            const year_end = monthStart(date.year + 1, 0);
+            if (!matchesOrdinal(i16, self.year_days, @divFloor(date.epoch() - year_start, day) + 1, @divExact(year_end - year_start, day)))
+                return false;
+        }
         const month_start = dayStart(.{ .year = date.year, .month = date.month, .day = 1, .seconds = 0, .kind = .date });
         const month_end = monthStart(date.year, @as(i64, date.month));
         const days_in_month = @divExact(month_end - month_start, day);
         if (self.month_days.len != 0 and !matchesOrdinal(i8, self.month_days, date.day, days_in_month)) return false;
         if (self.weekdays.len == 0) {
             if (self.frequency == .weekly) return dayOfWeek(date.epoch()) == dayOfWeek(seed.epoch());
-            if ((self.frequency == .monthly or self.frequency == .yearly) and self.month_days.len == 0) return date.day == seed.day;
+            if ((self.frequency == .monthly or self.frequency == .yearly) and self.month_days.len == 0 and self.year_days.len == 0)
+                return date.day == seed.day;
             return true;
         }
         const dow = dayOfWeek(date.epoch());
@@ -437,7 +535,64 @@ const Rule = struct {
         }
         return false;
     }
+
+    fn fixedPeriod(self: Rule) ?i64 {
+        return switch (self.frequency) {
+            .secondly => 1,
+            .minutely => 60,
+            .hourly => 3600,
+            .daily => day,
+            .weekly => 7 * day,
+            .monthly, .yearly => null,
+        };
+    }
+
+    fn firstPeriod(self: Rule, seed: Date) i64 {
+        return switch (self.frequency) {
+            .weekly => dayStart(seed) - @mod(dayOfWeek(seed.epoch()) - self.week_start, 7) * day,
+            .monthly => monthStart(seed.year, @as(i64, seed.month) - 1),
+            .yearly => monthStart(seed.year, 0),
+            else => seed.epoch() - @mod(seed.epoch(), self.fixedPeriod().?),
+        };
+    }
+
+    fn advance(self: Rule, current: i64, periods: i64) i64 {
+        if (self.fixedPeriod()) |seconds| return current + seconds * periods;
+        const date = Date.fromEpoch(current, .date);
+        const months = if (self.frequency == .yearly) 12 * periods else periods;
+        return monthStart(date.year, @as(i64, date.month) - 1 + months);
+    }
+
+    fn clocks(self: Rule, seed: Date, period_start: i64) [3]u64 {
+        if (seed.kind == .date) return @splat(1);
+        const current = @mod(period_start, day);
+        const hourly = @backingInt(self.frequency) <= @backingInt(Frequency.hourly);
+        const minutely = @backingInt(self.frequency) <= @backingInt(Frequency.minutely);
+        return .{
+            selectTime(self.hours, @divFloor(if (hourly) current else seed.seconds, 3600), hourly),
+            selectTime(self.minutes, @mod(@divFloor(if (minutely) current else seed.seconds, 60), 60), minutely),
+            selectTime(self.seconds, @mod(if (self.frequency == .secondly) current else seed.seconds, 60), self.frequency == .secondly),
+        };
+    }
 };
+
+fn timeMask(text: []const u8, maximum: u8) !u64 {
+    var result: u64 = 0;
+    var parts = std.mem.splitScalar(u8, text, ',');
+    while (parts.next()) |part| {
+        if (part.len == 0 or part.len > 2) return error.InvalidCalendar;
+        for (part) |char| if (!std.ascii.isDigit(char)) return error.InvalidCalendar;
+        const value = std.fmt.parseInt(u8, part, 10) catch return error.InvalidCalendar;
+        if (value > maximum) return error.InvalidCalendar;
+        result |= @as(u64, 1) << @intCast(@min(value, 59));
+    }
+    return result;
+}
+
+fn selectTime(mask: u64, value: i64, limit: bool) u64 {
+    const bit = @as(u64, 1) << @intCast(value);
+    return if (mask == 0) bit else if (limit) mask & bit else mask;
+}
 
 fn int(comptime T: type, text: []const u8, minimum: T, maximum: T) !T {
     const value = std.fmt.parseInt(T, text, 10) catch return error.InvalidCalendar;
@@ -480,73 +635,137 @@ const Expansion = struct {
     output: OccurrenceOutput,
     seed: Moment,
     length: Length,
-    kind: BusyType,
+    kind: ?BusyType,
+    ranges: []const RangeEdit,
     exclude: *const std.AutoHashMapUnmanaged(i64, void),
     budget: *usize,
 
-    fn append(self: *Expansion, candidate: Moment) !void {
-        const stamp = candidate.stamp();
-        if (self.exclude.contains(stamp)) return;
-        try self.output.add(stamp, self.length.end(candidate), self.kind);
-    }
-
-    fn rule(self: *Expansion, recur: Rule) !void {
-        const seed = self.seed.date;
-        const initial = dayStart(seed);
-        var current = switch (recur.frequency) {
-            .daily => initial,
-            .weekly => initial - @mod(dayOfWeek(initial) - recur.week_start, 7) * day,
-            .monthly => monthStart(seed.year, @as(i64, seed.month) - 1),
-            .yearly => monthStart(seed.year, 0),
-        };
-        var remaining = if (recur.count) |count| count - 1 else std.math.maxInt(i64);
-        // Date candidates are wall times. A legal UTC offset is less than
-        // a day, so include the neighboring day before cutting off the scan.
-        const until = if (recur.until) |date| date.epoch() else null;
-        const end_of_query = self.output.window.end;
-        const through = @min(end_of_query, until orelse end_of_query) + day;
-        while (current <= through and remaining > 0) {
-            const first = Date.fromEpoch(current, .date);
-            const month = @as(i64, first.month) - 1;
-            const step = switch (recur.frequency) {
-                .daily => current + day,
-                .weekly => current + 7 * day,
-                .monthly => monthStart(first.year, month + 1),
-                .yearly => monthStart(first.year + 1, 0),
-            };
-            var matched: [366]Moment = undefined;
-            var count: usize = 0;
-            var timestamp = current;
-            while (timestamp < step) : (timestamp += day) {
-                if (self.budget.* == 0) return error.AvailabilityLimit;
-                self.budget.* -= 1;
-                const date = Date.fromEpoch(timestamp + seed.seconds, seed.kind);
-                if (!recur.matches(seed, date)) continue;
-                if (self.seed.zone) |zone| {
-                    if (zone.isGap(date)) continue;
-                }
-                matched[count] = self.seed.withDate(date);
-                count += 1;
-            }
-            for (matched[0..count], 1..) |candidate, index| {
-                if (recur.positions.len != 0 and !matchesOrdinal(i16, recur.positions, @intCast(index), @intCast(count))) continue;
-                if (candidate.date.epoch() <= seed.epoch()) continue;
-                const stamp = candidate.stamp();
-                if (stamp >= end_of_query) return;
-                if (until) |end| {
-                    const value = if (recur.until.?.kind == .utc) stamp else candidate.date.epoch();
-                    if (value > end) return;
-                }
-                try self.append(candidate);
-                remaining -= 1;
-                if (remaining == 0) return;
-            }
-            current = switch (recur.frequency) {
-                .daily => current + day * recur.interval,
-                .weekly => current + 7 * day * recur.interval,
-                .monthly => monthStart(first.year, month + recur.interval),
-                .yearly => monthStart(first.year + recur.interval, 0),
-            };
+    fn add(self: *Expansion, candidate: Moment, length: Length) !void {
+        const key = candidate.stamp();
+        if (self.exclude.contains(key)) return;
+        const next = std.sort.upperBound(RangeEdit, self.ranges, key, RangeEdit.anchorOrder);
+        if (next != 0) {
+            const replacement = self.ranges[next - 1].replacement orelse return;
+            const date = Date.fromEpoch(candidate.date.epoch() + replacement.shift, replacement.anchor.date.kind);
+            const moved = replacement.anchor.withDate(date);
+            try self.output.add(moved.stamp(), (replacement.length orelse length).end(moved), replacement.kind);
+        } else if (self.kind) |kind| {
+            try self.output.add(key, length.end(candidate), kind);
         }
     }
+
+    fn append(self: *Expansion, candidate: Moment) !void {
+        try self.add(candidate, self.length);
+    }
+
+    fn spend(self: *Expansion) !void {
+        if (self.budget.* == 0) return error.AvailabilityLimit;
+        self.budget.* -= 1;
+    }
+
+    fn lastWallTime(self: *Expansion, until: ?Date) i64 {
+        // An override can move a later nominal key into the current window.
+        // Bound the scan using the largest possible UTC offset for each shift.
+        var offset = latestOffset(self.seed.zone);
+        for (self.ranges) |range| {
+            if (range.replacement) |replacement|
+                offset = @max(offset, latestOffset(replacement.anchor.zone) - replacement.shift);
+        }
+        const last = self.output.window.end + offset - 1;
+        if (until) |date| return @min(last, date.epoch() + if (date.kind == .utc) latestOffset(self.seed.zone) else 0);
+        return last;
+    }
+
+    fn firstPeriod(self: *Expansion, recur: Rule) i64 {
+        const first = recur.firstPeriod(self.seed.date);
+        if (recur.count != null or @backingInt(recur.frequency) >= @backingInt(Frequency.daily)) return first;
+
+        // With no COUNT to preserve, skip periods whose latest possible end
+        // precedes the window. Keep the occurrence grid anchored to DTSTART.
+        var end_shift = self.length.wallSeconds() - earliestOffset(self.seed.zone);
+        for (self.ranges) |range| {
+            if (range.replacement) |replacement| {
+                end_shift = @max(end_shift, replacement.shift +
+                    (replacement.length orelse self.length).wallSeconds() - earliestOffset(replacement.anchor.zone));
+            }
+        }
+        const first_wall = self.output.window.start - end_shift;
+        const stride = recur.fixedPeriod().? * recur.interval;
+        return first + @divFloor(@max(0, first_wall - first), stride) * stride;
+    }
+
+    fn rule(self: *Expansion, a: Allocator, recur: Rule) !void {
+        const seed = self.seed.date;
+        if (seed.kind == .date and @backingInt(recur.frequency) < @backingInt(Frequency.daily))
+            return error.InvalidCalendar;
+        var remaining = if (recur.count) |count| count - 1 else std.math.maxInt(i64);
+        const through = self.lastWallTime(recur.until);
+        var selected: std.ArrayList(i64) = .empty;
+        defer selected.deinit(a);
+        var current = self.firstPeriod(recur);
+        while (current <= through and remaining > 0) : (current = recur.advance(current, recur.interval)) {
+            selected.clearRetainingCapacity();
+            const stop = recur.advance(current, 1);
+            const clocks = recur.clocks(seed, current);
+            var start_of_day = current - @mod(current, day);
+            while (start_of_day < stop) : (start_of_day += day) {
+                try self.spend();
+                if (!recur.matches(seed, Date.fromEpoch(start_of_day, seed.kind))) continue;
+                var hours = clocks[0];
+                while (takeTime(&hours)) |hour| {
+                    var minutes = clocks[1];
+                    while (takeTime(&minutes)) |minute| {
+                        var seconds = clocks[2];
+                        while (takeTime(&seconds)) |second| {
+                            try self.spend();
+                            const wall = start_of_day + hour * 3600 + minute * 60 + second;
+                            const candidate = self.seed.withDate(Date.fromEpoch(wall, seed.kind));
+                            if (self.seed.zone) |zone| {
+                                if (zone.isGap(candidate.date)) continue;
+                            }
+                            if (recur.positions.len != 0) {
+                                try selected.append(a, wall);
+                            } else if (try self.emit(candidate, through, recur.until, &remaining)) {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            for (selected.items, 1..) |wall, index| {
+                if (!matchesOrdinal(i16, recur.positions, @intCast(index), @intCast(selected.items.len))) continue;
+                const candidate = self.seed.withDate(Date.fromEpoch(wall, seed.kind));
+                if (try self.emit(candidate, through, recur.until, &remaining)) return;
+            }
+        }
+    }
+
+    fn emit(self: *Expansion, candidate: Moment, through: i64, until: ?Date, remaining: *i64) !bool {
+        const wall = candidate.date.epoch();
+        if (wall <= self.seed.date.epoch()) return false;
+        if (wall > through) return true;
+        if (until) |date| {
+            const value = if (date.kind == .utc) candidate.stamp() else wall;
+            if (value > date.epoch()) return true;
+        }
+        try self.append(candidate);
+        // COUNT counts RRULE instances, including those suppressed by EXDATE.
+        remaining.* -= 1;
+        return remaining.* == 0;
+    }
 };
+
+fn latestOffset(zone: ?clock.Zone) i64 {
+    return if (zone) |value| value.offsetLimit(.latest) else 0;
+}
+
+fn earliestOffset(zone: ?clock.Zone) i64 {
+    return if (zone) |value| value.offsetLimit(.earliest) else 0;
+}
+
+fn takeTime(bits: *u64) ?i64 {
+    if (bits.* == 0) return null;
+    const next: i64 = @ctz(bits.*);
+    bits.* &= bits.* - 1;
+    return next;
+}
