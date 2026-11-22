@@ -603,6 +603,13 @@ def check_invitation_replies(test):
     reopened = invite("Reopened occurrence inside range", series=series, sequence=5, occurrence="140000")
     assert availability(reopened) == "current"
 
+    series = "pending-range-change"
+    earlier = invite("Occurrence before changed range", series=series, occurrence="100000")
+    changed = invite("Occurrence inside changed range", series=series, occurrence="140000")
+    invite("Organizer changed a range", series=series, sequence=4, occurrence="120000", future=True)
+    assert availability(earlier) == "current" and availability(changed) == "superseded"
+    assert respond(changed, "accepted")[1]["error"] == "invitation_stale"
+
     series = "pending-series-cancel"
     invite("Entire series cancelled before request", series=series, sequence=4, method="CANCEL", occurrence=None)
     late_series = invite("Series request delivered after cancellation", series=series, sequence=3, occurrence=None)

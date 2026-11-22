@@ -2052,6 +2052,7 @@ pub const Database = struct {
             \\FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
             \\WHERE t.delivery_id=?1 AND t.ordinal=?2 AND t.mailbox_id<>0 AND t.is_primary=1
             \\AND t.folder IN ('new','Newsletters','Receipts') AND m.verified_author=1
+            \\AND t.placement_reason NOT IN ('spam_filter','junk_feedback')
             \\ON CONFLICT(user_id,component,method,future) DO UPDATE SET sequence=excluded.sequence,dtstamp=excluded.dtstamp
             \\WHERE (excluded.sequence,excluded.dtstamp)>(mail_calendar_revisions.sequence,mail_calendar_revisions.dtstamp)
         );
@@ -2090,9 +2091,8 @@ pub const Database = struct {
         const stmt = try context.prepare(
             \\SELECT method FROM mail_calendar_revisions
             \\WHERE user_id=(SELECT id FROM users WHERE username=?1) AND series=?2
-            \\AND ((component=?3 AND future=?4) OR (method='cancel' AND (
-            \\    occurrence_wall IS NULL OR (future=1 AND occurrence_wall<=?5 AND occurrence_zone IS ?6 AND occurrence_day=?7)
-            \\)))
+            \\AND ((component=?3 AND future=?4) OR (method='cancel' AND occurrence_wall IS NULL)
+            \\    OR (future=1 AND occurrence_wall<=?5 AND occurrence_zone IS ?6 AND occurrence_day=?7))
             \\AND ((sequence,dtstamp)>(?8,?9) OR (method='cancel' AND ?10='request' AND (sequence,dtstamp)=(?8,?9)))
             \\ORDER BY sequence DESC,dtstamp DESC,method LIMIT 1
         );
@@ -2541,7 +2541,8 @@ pub const Database = struct {
             \\       t.mailbox_id<>0 AND NOT EXISTS (SELECT 1 FROM users WHERE id=t.mailbox_id AND username=t.mailbox),t.attempts,t.review_copy,
             \\       t.mailbox_id<>0 AND (t.folder IN ('new','Newsletters','Receipts') OR t.placement_reason IN ('junk_feedback','spam_filter'))
             \\          AND (m.verified_author=1 OR t.placement_reason<>'' OR t.reply_author IS NOT NULL),t.verified_forward,
-            \\       IIF(t.is_primary=1 AND t.folder IN ('new','Newsletters','Receipts') AND m.verified_author=1,m.author,''),
+            \\       IIF(t.is_primary=1 AND t.folder IN ('new','Newsletters','Receipts') AND m.verified_author=1
+            \\           AND t.placement_reason NOT IN ('spam_filter','junk_feedback'),m.author,''),
             \\       COALESCE((SELECT email FROM users WHERE id=t.mailbox_id),'')
             \\FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
             \\WHERE t.outcome='pending' AND t.forward_after IS NULL AND t.retry_at<=?1
