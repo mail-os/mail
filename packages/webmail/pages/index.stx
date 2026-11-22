@@ -45,7 +45,7 @@ const {
   readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts,
   pendingSend, sendRemaining, outbox, outboxCount, outboxCounts, outboxSection, outboxViews, outboxEmpty,
   outboxPageNumber, outboxNext, outboxLoading, outboxError, outboxView, cancelling, authExpired, currentFolderName, now,
-  composing, title, senderId, senderIdentities, missingSender, senderStatus, chooseSender, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, saveStatus,
+  composing, title, sharedReply, senderId, senderIdentities, missingSender, senderStatus, chooseSender, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, saveStatus,
   savingDraft, draftError, draftConflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword,
   confirmPassword, passwordError, savingPassword, confirmation, confirming, limits,
   recoveryAddress, recoverySetBy, recoveryInput, recoveryPassword, recoveryError, recoveryNotice, recoveryLoading,
@@ -445,9 +445,9 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
   <form class="wm-composer" @submit.prevent="send()">
     <header class="wm-composer-head"><span class="wm-composer-title"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span><span :text="title"></span></span><button type="button" class="wm-composer-close" @click="closeComposer()" :disabled="sending || savingDraft" aria-label="Close composer" title="Close composer"><span class="mail-icon" data-icon="close" aria-hidden="true"></span></button></header>
     <div class="wm-composer-fields">
-      <div :if="senderIdentities?.length || senderId" class="wm-recipient-field wm-from-field">
+      <div :if="sharedReply || senderIdentities?.length || senderId" class="wm-recipient-field wm-from-field">
         <label for="compose-from">From</label>
-        <select id="compose-from" @change="chooseSender($event)" :disabled="sending || sendUncertain" :aria-describedby="senderStatus ? 'compose-from-status' : null">
+        <select id="compose-from" @change="chooseSender($event)" :disabled="!!sharedReply || sending || sendUncertain" :aria-describedby="senderStatus ? 'compose-from-status' : null">
           <option value="" :selected="!senderId" :text="user?.email"></option>
           <option :for="identity in senderIdentities || []" :key="identity.id" :value="identity.id" :selected="identity.id === senderId" :text="identity.address"></option>
           <option :if="missingSender" :value="senderId" :selected="missingSender">Selected address unavailable</option>

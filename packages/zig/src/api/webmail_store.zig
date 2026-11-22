@@ -2,6 +2,7 @@
 //! keeps queued sends cancellable only before the server dispatch deadline.
 const std = @import("std");
 const database = @import("../storage/database.zig");
+const shared_inbox = @import("../storage/shared_inbox.zig");
 const io_compat = @import("../core/io_compat.zig");
 
 pub const StoreError = error{ Conflict, NotFound, StorageLimit, DraftStorageLimit, OutboxStorageLimit };
@@ -60,6 +61,25 @@ pub fn initSchema(db: *database.Database) !void {
         \\ UPDATE webmail_records SET state='saved',revision=revision+1
         \\ WHERE username=old.username AND kind='draft' AND state='queued'
         \\ AND id=json_extract(old.payload,'$.message.draftId');
+        \\END;
+        \\CREATE TRIGGER IF NOT EXISTS webmail_outbox_shared_reply AFTER UPDATE OF state ON webmail_records
+        \\WHEN NEW.kind='outbox' AND NEW.state<>OLD.state
+        \\BEGIN
+        \\ UPDATE mail_shared_reply_claims SET state=CASE NEW.state
+        \\   WHEN 'sending' THEN 'sending' WHEN 'unknown' THEN 'review' ELSE 'replied' END
+        \\ WHERE actor_id=(SELECT id FROM users WHERE username=NEW.username)
+        \\ AND send_id=NEW.id AND NEW.state IN ('sending','unknown','sent','sent_unfiled','partial');
+        \\ DELETE FROM mail_shared_reply_claims WHERE actor_id=(SELECT id FROM users WHERE username=NEW.username)
+        \\ AND send_id=NEW.id AND NEW.state IN ('cancelled','failed');
+        \\END;
+        \\CREATE TRIGGER IF NOT EXISTS webmail_cancel_revoked_shared_replies AFTER DELETE ON mail_team_grants
+        \\WHEN OLD.scope IN ('mailbox','sender') AND OLD.resource=''
+        \\BEGIN
+        \\ UPDATE webmail_records SET state='cancelled',revision=revision+1,expires_at=unixepoch()+604800,
+        \\   payload=json_set(payload,'$.error_message','Team access changed before delivery. The shared reply was cancelled.')
+        \\ WHERE kind='outbox' AND state='pending' AND username=(SELECT username FROM users WHERE id=OLD.grantee_id)
+        \\ AND EXISTS(SELECT 1 FROM mail_shared_reply_claims r WHERE r.actor_id=OLD.grantee_id
+        \\   AND r.team_id=OLD.team_id AND r.source_id=OLD.source_id AND r.send_id=webmail_records.id AND r.state='queued');
         \\END;
     );
     const has_mime_column = blk: {
@@ -345,14 +365,31 @@ pub fn claimDue(allocator: std.mem.Allocator, db: *database.Database, now: i64) 
 }
 
 /// Admission and freezing the associated draft share the insert transaction.
+const enqueueSql =
+    \\INSERT INTO webmail_records(username,kind,id,payload,state,revision,due_at,expires_at)
+    \\SELECT ?1,'outbox',?2,?3,'pending',1,?4,0 WHERE ?5 IS NULL OR EXISTS
+    \\(SELECT 1 FROM webmail_records WHERE username=?1 AND kind='draft' AND id=?5 AND state='saved' AND revision=?6)
+    \\ON CONFLICT(username,kind,id) DO NOTHING RETURNING revision
+;
+
 pub fn enqueue(db: *database.Database, row: Record, draft_id: ?[]const u8, draft_revision: i64) !i64 {
-    const s = try db.prepare(
-        \\INSERT INTO webmail_records(username,kind,id,payload,state,revision,due_at,expires_at)
-        \\SELECT ?1,'outbox',?2,?3,'pending',1,?4,0 WHERE ?5 IS NULL OR EXISTS
-        \\(SELECT 1 FROM webmail_records WHERE username=?1 AND kind='draft' AND id=?5 AND state='saved' AND revision=?6)
-        \\ON CONFLICT(username,kind,id) DO NOTHING RETURNING revision
-    );
+    const s = try db.prepare(enqueueSql);
     defer s.finalize();
+    return enqueueWith(s, row, draft_id, draft_revision);
+}
+
+pub fn enqueueShared(db: *database.Database, row: Record, draft_id: []const u8, draft_revision: i64, context: shared_inbox.ReplyContext) !i64 {
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    try shared_inbox.reserveReply(tx, row.username, context, row.id, row.due_at);
+    const s = try tx.prepare(enqueueSql);
+    defer s.finalize();
+    const revision = try enqueueWith(s, row, draft_id, draft_revision);
+    try tx.commit();
+    return revision;
+}
+
+fn enqueueWith(s: database.Statement, row: Record, draft_id: ?[]const u8, draft_revision: i64) !i64 {
     try s.bind(1, row.username);
     try s.bind(2, row.id);
     try s.bind(3, row.payload);
@@ -391,8 +428,9 @@ pub fn nextInterruptedDelivery(a: std.mem.Allocator, db: *database.Database, cur
     const stmt = try db.prepare(
         \\SELECT username,kind,r.id,payload,state,revision,due_at,expires_at,r.rowid
         \\FROM webmail_records AS r
-        \\JOIN accepted_mail AS m ON m.id=json_extract(r.payload,'$.dispatch.delivery_id')
         \\WHERE kind='outbox' AND state='unknown' AND json_extract(r.payload,'$.result') IS NULL AND r.rowid>?1
+        \\AND (json_type(r.payload,'$.message.sharedReply')='object' OR EXISTS(
+        \\  SELECT 1 FROM accepted_mail AS m WHERE m.id=json_extract(r.payload,'$.dispatch.delivery_id')))
         \\ORDER BY r.rowid LIMIT 1
     );
     defer stmt.finalize();

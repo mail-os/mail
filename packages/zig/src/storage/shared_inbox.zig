@@ -23,6 +23,23 @@ pub const schema =
     \\);
     \\CREATE INDEX IF NOT EXISTS mail_shared_inbox_reference ON mail_shared_inbox_state(source_id,reference);
     \\CREATE INDEX IF NOT EXISTS mail_shared_inbox_assignee ON mail_shared_inbox_state(team_id,source_id,assignee_id);
+    \\CREATE TABLE IF NOT EXISTS mail_shared_reply_claims (
+    \\    source_id INTEGER NOT NULL,
+    \\    reference TEXT NOT NULL,
+    \\    team_id TEXT NOT NULL,
+    \\    actor_id INTEGER NOT NULL,
+    \\    actor TEXT NOT NULL,
+    \\    send_id TEXT NOT NULL,
+    \\    state TEXT NOT NULL CHECK(state IN ('queued','sending','review','replied')),
+    \\    due_at INTEGER NOT NULL,
+    \\    PRIMARY KEY(source_id,reference),
+    \\    UNIQUE(actor_id,send_id),
+    \\    FOREIGN KEY(source_id,reference) REFERENCES mailbox_message_refs(user_id,reference) ON DELETE CASCADE ON UPDATE CASCADE
+    \\);
+    \\CREATE TRIGGER IF NOT EXISTS mail_shared_reply_account_deleted BEFORE DELETE ON users BEGIN
+    \\    DELETE FROM mail_shared_reply_claims WHERE actor_id=OLD.id AND state='queued';
+    \\    UPDATE mail_shared_reply_claims SET state='review' WHERE actor_id=OLD.id AND state='sending';
+    \\END;
     \\CREATE TRIGGER IF NOT EXISTS mail_shared_inbox_offboard AFTER DELETE ON mail_team_grants
     \\WHEN OLD.scope='mailbox' AND OLD.resource='' BEGIN
     \\    UPDATE mail_shared_inbox_state
@@ -32,6 +49,10 @@ pub const schema =
     \\CREATE TRIGGER IF NOT EXISTS mail_shared_inbox_replaced_ref BEFORE UPDATE OF reference ON mailbox_message_refs
     \\WHEN OLD.reference<>NEW.reference BEGIN
     \\    DELETE FROM mail_shared_inbox_state WHERE source_id=OLD.user_id AND reference=OLD.reference;
+    \\END;
+    \\CREATE TRIGGER IF NOT EXISTS mail_shared_reply_replaced_ref BEFORE UPDATE OF reference ON mailbox_message_refs
+    \\WHEN OLD.reference<>NEW.reference BEGIN
+    \\    DELETE FROM mail_shared_reply_claims WHERE source_id=OLD.user_id AND reference=OLD.reference;
     \\END;
 ;
 
@@ -44,7 +65,7 @@ const selectInboxes =
     \\WHERE viewer.username=?1 AND g.scope='mailbox' AND g.resource=''
 ;
 pub const Inbox = struct { team: []const u8, name: []const u8, id: []const u8, address: []const u8 };
-pub const Source = struct { username: []const u8 };
+pub const Source = struct { username: []const u8, address: []const u8 };
 pub const Target = struct { id: []const u8, address: []const u8 };
 pub const Action = enum { assign, unassign, resolve, reopen };
 pub const Workflow = struct {
@@ -61,6 +82,95 @@ pub const Change = struct {
     revision: i64,
     messageRevision: []const u8,
 };
+
+pub const ReplyContext = struct {
+    team: []const u8,
+    sourceId: []const u8,
+    reference: []const u8,
+    messageRevision: []const u8,
+};
+pub const ReplyDelivery = struct { context: ReplyContext, send_id: []const u8 };
+pub const ReplyStatus = struct {
+    state: enum { queued, sending, review, replied },
+    actor: ?[]const u8,
+    dueAt: ?i64,
+};
+
+const replyScope = selectInboxes ++
+    \\ AND g.team_id=?2 AND g.source_id=?3 AND (viewer.id=source.id OR EXISTS(
+    \\   SELECT 1 FROM mail_team_grants sg WHERE sg.team_id=g.team_id AND sg.source_id=source.id
+    \\   AND sg.grantee_id=viewer.id AND sg.scope='sender' AND sg.resource=''))
+    \\ AND EXISTS(SELECT 1 FROM mailbox_message_refs m WHERE m.user_id=source.id
+    \\   AND m.reference=?4 AND m.folder='INBOX' AND m.next_folder IS NULL)
+    \\ AND NOT EXISTS(SELECT 1 FROM mail_shared_inbox_state w WHERE w.team_id=g.team_id
+    \\   AND w.source_id=source.id AND w.reference=?4
+    \\   AND (w.resolved=1 OR (w.assignee_id IS NOT NULL AND w.assignee_id<>viewer.id)))
+;
+
+fn bindContext(stmt: database.Statement, actor: []const u8, ctx: ReplyContext) !void {
+    try bind(stmt, .{ actor, ctx.team, positiveId(ctx.sourceId) orelse return error.SharedReplyUnavailable, ctx.reference });
+}
+
+pub fn sameReply(left: ?ReplyContext, right: ?ReplyContext) bool {
+    const a = left orelse return right == null;
+    const b = right orelse return false;
+    return std.mem.eql(u8, a.team, b.team) and std.mem.eql(u8, a.sourceId, b.sourceId) and
+        std.mem.eql(u8, a.reference, b.reference) and std.mem.eql(u8, a.messageRevision, b.messageRevision);
+}
+
+pub fn canReply(db: *database.Database, actor: []const u8, ctx: ReplyContext) !bool {
+    const stmt = try db.prepare(replyScope ++ " LIMIT 1");
+    defer stmt.finalize();
+    try bindContext(stmt, actor, ctx);
+    return stmt.step();
+}
+
+pub fn replyStatus(a: Allocator, db: *database.Database, team: []const u8, id: i64, ref: []const u8) !?ReplyStatus {
+    const stmt = try db.prepare("SELECT state,actor,due_at,team_id FROM mail_shared_reply_claims WHERE source_id=?1 AND reference=?2");
+    defer stmt.finalize();
+    try bind(stmt, .{ id, ref });
+    if (!try stmt.step()) return null;
+    const same_team = std.mem.eql(u8, team, stmt.columnText(3));
+    const result: ReplyStatus = .{
+        .state = std.meta.stringToEnum(@FieldType(ReplyStatus, "state"), stmt.columnText(0)) orelse return error.InvalidSharedChange,
+        .actor = if (same_team) try a.dupe(u8, stmt.columnText(1)) else null,
+        .dueAt = if (same_team) stmt.columnInt64(2) else null,
+    };
+    return result;
+}
+
+/// The caller commits the reservation and the draft freeze together.
+pub fn reserveReply(tx: Tx, actor: []const u8, ctx: ReplyContext, send_id: []const u8, due_at: i64) !void {
+    {
+        const permission = try tx.prepare(replyScope ++ " LIMIT 1");
+        defer permission.finalize();
+        try bindContext(permission, actor, ctx);
+        if (!try permission.step()) return error.SharedReplyUnavailable;
+    }
+    const stmt = try tx.prepare(
+        \\INSERT INTO mail_shared_reply_claims(source_id,reference,team_id,actor_id,actor,send_id,state,due_at)
+        \\VALUES(?1,?2,?3,(SELECT id FROM users WHERE username=?4),?4,?5,'queued',?6)
+        \\ON CONFLICT(source_id,reference) DO NOTHING RETURNING 1
+    );
+    defer stmt.finalize();
+    try bind(stmt, .{ positiveId(ctx.sourceId).?, ctx.reference, ctx.team, actor, send_id, due_at });
+    if (!try stmt.step()) return error.SharedReplyConflict;
+    _ = try stmt.step();
+}
+
+/// Runs within the delivery admission transaction, before debit or publication.
+pub fn requireReplyAdmission(tx: Tx, actor: []const u8, address: []const u8, reply: ReplyDelivery) !void {
+    const stmt = try tx.prepare(replyScope ++
+        \\ AND source.email=?5 AND EXISTS(SELECT 1 FROM mail_shared_reply_claims r
+        \\   WHERE r.source_id=source.id AND r.reference=?4 AND r.team_id=g.team_id
+        \\   AND r.actor_id=viewer.id AND r.send_id=?6 AND r.state='sending') LIMIT 1
+    );
+    defer stmt.finalize();
+    try bindContext(stmt, actor, reply.context);
+    try stmt.bind(5, address);
+    try stmt.bind(6, reply.send_id);
+    if (!try stmt.step()) return error.SharedReplyUnavailable;
+}
 
 pub fn positiveId(text: []const u8) ?i64 {
     if (text.len == 0 or text.len > 19 or text[0] == '0') return null;
@@ -100,7 +210,7 @@ pub fn source(a: Allocator, db: *database.Database, actor: []const u8, team: []c
     defer stmt.finalize();
     try bind(stmt, .{ actor, team, id });
     if (!try stmt.step()) return error.SharedInboxNotFound;
-    return .{ .username = try a.dupe(u8, stmt.columnText(3)) };
+    return .{ .username = try a.dupe(u8, stmt.columnText(3)), .address = try a.dupe(u8, stmt.columnText(4)) };
 }
 
 pub fn canDownload(db: *database.Database, actor: []const u8, team: []const u8, id: i64, reference: []const u8) !bool {

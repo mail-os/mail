@@ -25,7 +25,10 @@ interface Detail extends Pick<InboxMessage, 'reference' | 'revision' | 'from' | 
   embedded_images: EmbeddedImage[]
   assignable: Teammate[]
   workflow: Workflow
+  canReply: boolean
+  reply: ReplyStatus | null
 }
+interface ReplyStatus { state: 'queued' | 'sending' | 'review' | 'replied', actor: string | null, dueAt: number | null }
 type Action = 'assign' | 'unassign' | 'resolve' | 'reopen'
 
 const endpoint = '/webmail/api/shared-inboxes'
@@ -43,7 +46,12 @@ export function workflowActivity(workflow: Workflow): string {
   return label ? label + ' ' + workflow.changedBy : ''
 }
 
-export function useSharedInbox(signIn: () => void) {
+export function replyActivity(reply: ReplyStatus): string {
+  const labels = { queued: ['Reply queued', 'Reply queued by'], sending: ['Reply sending', 'Reply sending by'], review: ['Reply awaiting delivery review', 'Reply awaiting delivery review for'], replied: ['Replied', 'Replied by'] }
+  return reply.actor ? labels[reply.state][1] + ' ' + reply.actor : labels[reply.state][0]
+}
+
+export function useSharedInbox(signIn: () => void, openReplyDraft: (uid: number, id: string) => void) {
   const account = state('')
   const inboxes = state<Inbox[]>([])
   const selectedInbox = state('')
@@ -60,6 +68,7 @@ export function useSharedInbox(signIn: () => void) {
   let active = true
   let listRequest = 0
   let detailRequest = 0
+  let pendingReply: { inbox: string, reference: string, revision: string, id: string } | null = null
 
   function closeMessage(): void {
     detailRequest++
@@ -202,6 +211,31 @@ export function useSharedInbox(signIn: () => void) {
     finally { saving.set(false) }
   }
 
+  async function startReply(): Promise<void> {
+    const opened = detail()
+    if (!opened?.canReply || saving() || loading()) return
+    saving.set(true)
+    error.set('')
+    try {
+      const inbox = selectedInbox()
+      if (pendingReply?.inbox !== inbox || pendingReply.reference !== opened.reference || pendingReply.revision !== opened.revision)
+        pendingReply = { inbox, reference: opened.reference, revision: opened.revision, id: crypto.randomUUID() }
+      const result = await api<{ uid: number, draftId: string }>(messagePath(inbox, opened.reference) + '/reply', {
+        method: 'POST', body: JSON.stringify({ draftId: pendingReply.id, messageRevision: opened.revision }),
+      })
+      if (active) openReplyDraft(result.uid, result.draftId)
+    }
+    catch (cause) {
+      if (!active) return
+      if (cause instanceof MailApiError && cause.status < 500) {
+        pendingReply = null
+        await readMessage(opened.reference, false)
+      }
+      error.set(cause instanceof Error ? cause.message : 'Could not prepare the shared reply.')
+    }
+    finally { saving.set(false) }
+  }
+
   async function mount(): Promise<void> {
     try {
       const response = await api<{ user: { username: string } }>('/webmail/auth/me')
@@ -215,6 +249,6 @@ export function useSharedInbox(signIn: () => void) {
   }
 
   return { inboxes, selectedInbox, mailbox, listing, detail, reference, loading, opening, saving, error, ready, formatted,
-    mount, refresh, selectInbox, turnPage, readMessage, closeMessage, attachmentPath, change,
+    mount, refresh, selectInbox, turnPage, readMessage, closeMessage, attachmentPath, change, startReply,
     destroy() { active = false; clear() } }
 }

@@ -8,12 +8,12 @@
 </head>
 <body>
 <script client>
-import { inboxKey, inboxLabel, useSharedInbox, workflowActivity } from '../functions/use-shared-inbox'
+import { inboxKey, inboxLabel, replyActivity, useSharedInbox, workflowActivity } from '../functions/use-shared-inbox'
 import { fullDate, readableBytes, senderAddress, senderInitials, shortDate } from '../functions/mail-utils'
 const {
   inboxes, selectedInbox, mailbox, listing, detail, reference, loading, opening, saving, error, ready, formatted,
-  mount, refresh, selectInbox, turnPage, readMessage, closeMessage, attachmentPath, change, destroy,
-} = useSharedInbox(() => navigate('/login', { reload: true }))
+  mount, refresh, selectInbox, turnPage, readMessage, closeMessage, attachmentPath, change, startReply, destroy,
+} = useSharedInbox(() => navigate('/login', { reload: true }), (uid, id) => navigate('/?sharedReplyDraft=' + uid + '.' + encodeURIComponent(id), { reload: true }))
 const readerHeading = useRef('sharedTitle')
 const listHeading = useRef('sharedListTitle')
 async function openSharedMessage(id) {
@@ -66,6 +66,7 @@ useEventListener('online', refresh)
       <p :if="!reference" class="wm-shared-empty">Select a message to read.</p>
       <article :if="detail" class="wm-shared-message">
         <div class="wm-shared-actions">
+          <button :if="detail.canReply" type="button" class="wm-action wm-action--accent" @click="startReply()" :disabled="saving || loading"><span class="mail-icon" data-icon="reply" aria-hidden="true"></span>Reply</button>
           <div class="wm-shared-assignee"><label for="sharedAssignee">Assigned to</label>
             <select id="sharedAssignee" :disabled="saving || loading" @change="$event.target.value ? change('assign', $event.target.value) : change('unassign')">
               <option value="" :selected="!detail.workflow.assignee">Unassigned</option>
@@ -76,6 +77,7 @@ useEventListener('online', refresh)
           <button type="button" class="wm-action wm-action--accent" @click="change(detail.workflow.resolved ? 'reopen' : 'resolve')" :disabled="saving || loading"><span class="mail-icon" data-icon="check" aria-hidden="true"></span><span :text="detail.workflow.resolved ? 'Reopen' : 'Resolve'"></span></button>
         </div>
         <p class="wm-shared-activity" role="status"><span class="wm-shared-status" :class="{ 'wm-shared-status--resolved': detail.workflow.resolved }" :text="detail.workflow.resolved ? 'Resolved' : 'Open'"></span><span :if="workflowActivity(detail.workflow)" :text="workflowActivity(detail.workflow)"></span><time :if="detail.workflow.changedAt" :text="new Date(detail.workflow.changedAt * 1000).toLocaleString()"></time></p>
+        <p :if="detail.reply" class="wm-shared-activity" role="status"><span class="mail-icon" data-icon="reply" aria-hidden="true"></span><span :text="replyActivity(detail.reply)"></span></p>
         <header class="wm-shared-message-head">
           <h2 ref="sharedTitle" tabindex="-1" :text="detail.subject || '(no subject)'"></h2>
           <div class="wm-shared-sender"><span class="wm-avatar" aria-hidden="true" :text="senderInitials(detail.from)"></span><div><strong :text="senderAddress(detail.from) || detail.from || '(unknown sender)'"></strong><span :if="detail.to" :text="'To ' + detail.to"></span></div><time :text="fullDate(detail.date)"></time></div>

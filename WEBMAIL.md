@@ -348,6 +348,16 @@ while the source mailbox keeps its own folders, sessions, and personal
 metadata. To share attachment downloads, grant `attachments` for the specific
 message reference in that team.
 
+Use **Reply** on an open shared message to prepare a private draft with the
+shared From address and the original reply headers. It requires Inbox access
+and the sender grant in the same team, or ownership of the shared mailbox.
+When a teammate is assigned, they handle the reply. One Outbox send can
+reserve the original message at a time, including scheduled sends. The other
+teammate’s draft stays available if their send conflicts. Removing a team grant
+cancels that teammate’s pending shared reply and restores its draft.
+Cancellation and definite failure release the reservation. A delivered reply or uncertain
+delivery stays marked on the original message to prevent a repeat.
+
 - `GET /webmail/api/shared-inboxes` lists accessible team and mailbox pairs.
 - `GET /webmail/api/shared-inboxes/:team/:id?page=1` returns one Inbox page.
 - `GET /webmail/api/shared-inboxes/:team/:id/messages/:reference` returns the
@@ -357,6 +367,10 @@ message reference in that team.
   `messageRevision`. Use `assign` with an `assignee` ID or use `unassign`,
   `resolve`, or `reopen`. A competing edit returns 409. Revoking the mailbox
   grant clears that teammate’s assignments and prevents further access.
+- `POST .../messages/:reference/reply` accepts the current `messageRevision`
+  and a client-generated `draftId` to prepare the linked draft. Submit it
+  using the Outbox send ID. The server checks the reservation, team access,
+  assignment, and shared address again at delivery admission.
 
 ## API contracts
 

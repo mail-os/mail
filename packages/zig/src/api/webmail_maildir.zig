@@ -993,6 +993,12 @@ pub fn getByReference(a: std.mem.Allocator, db: *database.Database, user: []cons
     return parseDetail(a, file.locator.folder, file.locator.uid, file.name, file.raw, file.version);
 }
 
+pub fn getSharedInboxMessage(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8) !MessageDetail {
+    const message = try getByReference(a, db, user, id);
+    if (!std.mem.eql(u8, message.folder, "INBOX") or message.flags.deleted) return error.SharedInboxNotFound;
+    return message;
+}
+
 fn observeVersion(a: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, uid: i64) !VersionedFile {
     if (!isValidFolderName(folder)) return MaildirError.InvalidFolderName;
     const file = (try findByUid(a, db, user, folder, uid)) orelse return MaildirError.MessageNotFound;

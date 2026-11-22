@@ -1500,6 +1500,7 @@ pub const Database = struct {
         targets: []const DeliveryTarget,
         sender: ?[]const u8 = null,
         delegated_sender_id: ?i64 = null,
+        shared_reply: ?shared_inbox.ReplyDelivery = null,
         charge_recipients: usize = 0,
         receipt: ?ActiveSyncReceipt = null,
         review_release: ?FiledCopy = null,
@@ -1516,6 +1517,9 @@ pub const Database = struct {
         // actor or creating any visible recipient copies.
         if (envelope.delegated_sender_id) |identity| {
             try self.requireDelegatedSenderLocked(envelope.sender orelse return error.SenderIdentityUnavailable, identity, envelope.from);
+        }
+        if (envelope.shared_reply) |reply| {
+            try shared_inbox.requireReplyAdmission(.{ .db = self }, envelope.sender orelse return error.SharedReplyUnavailable, envelope.from, reply);
         }
         var hosted_sender: i64 = 0;
         if (envelope.sender) |sender| {

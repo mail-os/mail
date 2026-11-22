@@ -83,6 +83,7 @@ pub const SendConfig = struct {
     /// Canonical mailbox key of the sender (used for the Sent folder path).
     sender_user: []const u8,
     delegated_sender_id: ?i64 = null,
+    shared_reply: ?@import("../storage/shared_inbox.zig").ReplyDelivery = null,
 
     fn delivery(self: SendConfig) submission.Delivery {
         return .{
@@ -424,6 +425,7 @@ pub fn sendWithJournal(allocator: std.mem.Allocator, msg: Message, cfg: SendConf
     const result = try submission.dispatch(allocator, delivery, msg.from, recipients, raw, .{
         .sender = cfg.sender_user,
         .delegated_sender_id = cfg.delegated_sender_id,
+        .shared_reply = cfg.shared_reply,
         .interactive_id = if (dispatch) |send_record| send_record.delivery_id else null,
     });
     errdefer allocator.free(result.failed);

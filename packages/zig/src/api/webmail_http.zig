@@ -44,6 +44,7 @@ const security = @import("../auth/security.zig");
 const core_config = @import("../core/config.zig");
 const compose = @import("webmail_compose.zig");
 const compose_library = @import("webmail_compose_library.zig");
+const message_submission = @import("../message/submission.zig");
 const webmail_tls = @import("webmail_tls.zig");
 const io_compat = @import("../core/io_compat.zig");
 const tls = @import("tls");
@@ -1329,6 +1330,7 @@ fn handleCompose(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: s
         const row = server.service.queue(arena, sess.username, sess.email, parsed.value, time_compat.timestamp()) catch |err| return mapServiceError(conn, arena, err);
         return sendJson(conn, arena, 200, try outboxJson(arena, row), null);
     }
+    server.service.requireOrdinaryDirectSend(arena, sess.username, parsed.value) catch |err| return mapServiceError(conn, arena, err);
     const delegated_id = parsed.value.delegatedSender() catch |err| return mapServiceError(conn, arena, err);
     const from = server.service.sendAddress(arena, sess.username, sess.email, delegated_id) catch |err| return mapServiceError(conn, arena, err);
     const msg = server.service.payloadMessage(arena, parsed.value, sess.username, from, false) catch |err| return mapServiceError(conn, arena, err);
@@ -1425,6 +1427,9 @@ fn mapServiceError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: any
         error.HostedSendingLimit => sendError(conn, arena, 429, "sending_limit", "Daily recipient allowance exhausted. Try again after midnight UTC."),
         error.HostedSenderDisabled => sendError(conn, arena, 403, "mailbox_disabled", "This mailbox is disabled."),
         error.SenderIdentityUnavailable => sendError(conn, arena, 403, "sender_identity_unavailable", "This From address is no longer available. Choose another address before sending."),
+        error.SharedReplyUnavailable => sendError(conn, arena, 409, "shared_reply_unavailable", "This shared reply is unavailable. Check the original message, assignment, and send access."),
+        error.SharedReplyConflict => sendError(conn, arena, 409, "shared_reply_conflict", "A reply is already queued, sent, or awaiting delivery review for this message."),
+        error.SharedReplyQueueRequired => sendError(conn, arena, 400, "shared_reply_queue_required", "A shared reply requires an Outbox send ID."),
         error.HostedStorageFull => sendError(conn, arena, 507, "mailbox_full", "Mailbox storage is full. Free space before retrying."),
         error.HostedRecipientDisabled => sendError(conn, arena, 409, "recipient_disabled", "A recipient mailbox is disabled."),
         store.StoreError.NotFound => sendError(conn, arena, 404, "not_found", "No such item in this account"),
@@ -1616,8 +1621,9 @@ fn teamError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: anyerror)
 
 fn handleSharedInboxes(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
     const writing = std.mem.eql(u8, req.method, "PUT");
+    const posting = std.mem.eql(u8, req.method, "POST");
     const reading = std.mem.eql(u8, req.method, "GET");
-    if (writing and !isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    if ((writing or posting) and !isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
     var session = (try requireSession(server, conn, a, req)) orelse return;
     defer session.deinit(server.allocator);
     const path = "/webmail/api/shared-inboxes";
@@ -1628,7 +1634,8 @@ fn handleSharedInboxes(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a:
     }
     var parts = std.mem.splitScalar(u8, req.path[path.len + 1 ..], '/');
     const team = parts.next().?;
-    const id = shared_inbox.positiveId(parts.next() orelse "") orelse return sharedInboxError(conn, a, error.SharedInboxNotFound);
+    const source_id = parts.next() orelse "";
+    const id = shared_inbox.positiveId(source_id) orelse return sharedInboxError(conn, a, error.SharedInboxNotFound);
     if (!teams.validTeamId(team)) return sharedInboxError(conn, a, error.SharedInboxNotFound);
     const source = shared_inbox.source(a, server.db, session.username, team, id) catch |err| return sharedInboxError(conn, a, err);
     const section = parts.next() orelse {
@@ -1639,6 +1646,9 @@ fn handleSharedInboxes(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a:
     if (!std.mem.eql(u8, section, "messages") or !message_refs.valid(reference))
         return sharedInboxError(conn, a, error.SharedInboxNotFound);
     const action = parts.next();
+    if (posting and action != null and std.mem.eql(u8, action.?, "reply") and parts.next() == null) {
+        return stageSharedReply(server, conn, a, req, session, source, .{ .team = team, .sourceId = source_id, .reference = reference, .messageRevision = "" });
+    }
     if (writing and action != null and std.mem.eql(u8, action.?, "workflow") and parts.next() == null) {
         if (req.body.len > 8192) return sharedInboxError(conn, a, error.InvalidSharedChange);
         const patch = std.json.parseFromSliceLeaky(shared_inbox.Change, a, req.body, .{}) catch return sharedInboxError(conn, a, error.InvalidSharedChange);
@@ -1653,7 +1663,7 @@ fn handleSharedInboxes(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a:
             return sharedInboxError(conn, a, error.SharedInboxNotFound);
         if (!try shared_inbox.canDownload(server.db, session.username, team, id, reference))
             return sharedInboxError(conn, a, error.SharedAttachmentForbidden);
-        const msg = readSharedMessage(a, server.db, source.username, reference) catch |err| return sharedInboxError(conn, a, err);
+        const msg = maildir.getSharedInboxMessage(a, server.db, source.username, reference) catch |err| return sharedInboxError(conn, a, err);
         const revision = req.queryParam(a, "revision") orelse return sendError(conn, a, 428, "revision_required", "Use a current attachment link.");
         if (!std.mem.eql(u8, msg.version.?.revision, revision)) return sharedInboxError(conn, a, error.RevisionMismatch);
         if (index >= msg.attachments.len) return sharedInboxError(conn, a, error.SharedInboxNotFound);
@@ -1661,13 +1671,20 @@ fn handleSharedInboxes(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a:
             return sharedInboxError(conn, a, error.SharedAttachmentForbidden);
         return sendAttachment(conn, a, msg.attachments[index]);
     }
-    const msg = readSharedMessage(a, server.db, source.username, reference) catch |err| return sharedInboxError(conn, a, err);
+    const msg = maildir.getSharedInboxMessage(a, server.db, source.username, reference) catch |err| return sharedInboxError(conn, a, err);
     const workflow = try shared_inbox.workflow(a, server.db, team, id, reference);
     const assignable = try shared_inbox.targets(a, server.db, team, id);
     const attachments = try shared_inbox.canDownload(server.db, session.username, team, id, reference);
     var body: std.ArrayList(u8) = .empty;
     const w = jw(&body, a);
-    try writeSharedMessage(w, a, msg, workflow, assignable, attachments);
+    const reply = try shared_inbox.replyStatus(a, server.db, team, id, reference);
+    const allowed = reply == null and try shared_inbox.canReply(server.db, session.username, .{
+        .team = team,
+        .sourceId = source_id,
+        .reference = reference,
+        .messageRevision = msg.version.?.revision,
+    });
+    try writeSharedMessage(w, a, msg, workflow, assignable, attachments, reply, allowed);
     _ = shared_inbox.source(a, server.db, session.username, team, id) catch |err| return sharedInboxError(conn, a, err);
     return sendJson(conn, a, 200, body.items, null);
 }
@@ -1705,13 +1722,55 @@ fn changeSharedWorkflow(a: std.mem.Allocator, db: *database.Database, actor: []c
     return shared_inbox.change(a, db, actor, team, id, reference, patch);
 }
 
-fn readSharedMessage(a: std.mem.Allocator, db: *database.Database, source: []const u8, reference: []const u8) !maildir.MessageDetail {
-    const msg = try maildir.getByReference(a, db, source, reference);
-    if (!std.mem.eql(u8, msg.folder, "INBOX") or msg.flags.deleted) return error.SharedInboxNotFound;
-    return msg;
+fn stageSharedReply(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request, session: session_mod.Session, source: shared_inbox.Source, target: shared_inbox.ReplyContext) !void {
+    const Patch = struct { draftId: []const u8, messageRevision: []const u8 };
+    if (req.body.len > 8192) return sharedInboxError(conn, a, error.InvalidSharedChange);
+    const patch = std.json.parseFromSliceLeaky(Patch, a, req.body, .{}) catch return sharedInboxError(conn, a, error.InvalidSharedChange);
+    if (!store.validId(patch.draftId)) return sharedInboxError(conn, a, error.InvalidSharedChange);
+    var context = target;
+    context.messageRevision = patch.messageRevision;
+    if (!try shared_inbox.canReply(server.db, session.username, context)) return sharedInboxError(conn, a, error.SharedReplyUnavailable);
+    if (try shared_inbox.replyStatus(a, server.db, context.team, shared_inbox.positiveId(context.sourceId).?, context.reference) != null)
+        return sharedInboxError(conn, a, error.SharedReplyConflict);
+    const msg = maildir.getSharedInboxMessage(a, server.db, source.username, context.reference) catch |err| return sharedInboxError(conn, a, err);
+    if (!std.mem.eql(u8, msg.version.?.revision, context.messageRevision))
+        return sharedInboxError(conn, a, error.RevisionMismatch);
+    var recipients: std.ArrayList([]const u8) = .empty;
+    message_submission.appendMailboxes(a, if (msg.reply_to.len > 0) msg.reply_to else msg.from, &recipients) catch |err| switch (err) {
+        error.InvalidAddress => return sharedInboxError(conn, a, err),
+        else => return err,
+    };
+    const subject = if (std.ascii.startsWithIgnoreCase(msg.subject, "re:")) msg.subject else try std.fmt.allocPrint(a, "Re: {s}", .{msg.subject});
+    var text: std.ArrayList(u8) = .empty;
+    const w = jw(&text, a);
+    const library = try compose_library.load(a, server.db, session.username);
+    if (library.defaultSignatureId) |default| for (library.signatures) |signature| {
+        if (std.mem.eql(u8, signature.id, default)) {
+            try w.print("\n\n-- \n{s}", .{signature.text});
+            break;
+        }
+    };
+    try w.print("\n\nOn {s}, {s} wrote:\n", .{ msg.date, msg.from });
+    var lines = std.mem.splitScalar(u8, msg.text_body, '\n');
+    while (lines.next()) |line| {
+        if (line.len + text.items.len > 64 * 1024) break;
+        try w.print("> {s}\n", .{line});
+    }
+    const ack = server.service.saveDraft(a, session.username, session.email, .{
+        .draftId = patch.draftId,
+        .saveToken = patch.draftId,
+        .to = recipients.items,
+        .subject = subject,
+        .text = text.items,
+        .inReplyTo = msg.message_id,
+        .references = std.mem.trim(u8, try std.fmt.allocPrint(a, "{s} {s}", .{ msg.references, msg.message_id }), " "),
+        .senderId = if (std.mem.eql(u8, source.username, session.username)) null else context.sourceId,
+        .sharedReply = context,
+    }) catch |err| return sharedInboxError(conn, a, err);
+    return sendJson(conn, a, 200, try service_mod.json(a, ack), null);
 }
 
-fn writeSharedMessage(w: anytype, a: std.mem.Allocator, msg: maildir.MessageDetail, state: shared_inbox.Workflow, targets: []const shared_inbox.Target, downloads: bool) !void {
+fn writeSharedMessage(w: anytype, a: std.mem.Allocator, msg: maildir.MessageDetail, state: shared_inbox.Workflow, targets: []const shared_inbox.Target, downloads: bool, reply: ?shared_inbox.ReplyStatus, allowed: bool) !void {
     try w.writeAll("{\"from\":");
     try writeJsonString(w, msg.from);
     try w.writeAll(",\"subject\":");
@@ -1738,6 +1797,8 @@ fn writeSharedMessage(w: anytype, a: std.mem.Allocator, msg: maildir.MessageDeta
     try w.writeAll(try service_mod.json(a, state));
     try w.writeAll(",\"assignable\":");
     try w.writeAll(try service_mod.json(a, targets));
+    try w.print(",\"canReply\":{},\"reply\":", .{allowed});
+    try w.writeAll(try service_mod.json(a, reply));
     try w.writeByte('}');
 }
 

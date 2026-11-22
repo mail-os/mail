@@ -14,6 +14,7 @@ const maildir = @import("webmail_maildir.zig");
 const compose = @import("webmail_compose.zig");
 const store = @import("webmail_store.zig");
 const message_refs = @import("../storage/message_refs.zig");
+const shared_inbox = @import("../storage/shared_inbox.zig");
 const thread_ids = @import("../message/thread_ids.zig");
 
 pub const ServiceError = error{ InvalidPayload, AttachmentLimit, InvalidAttachment, Conflict, NotFound, InvalidAction, MessageChanged };
@@ -57,6 +58,7 @@ pub const Payload = struct {
         uploadId: ?[]const u8 = null,
     } = &.{},
     senderId: ?[]const u8 = null,
+    sharedReply: ?shared_inbox.ReplyContext = null,
 
     pub fn delegatedSender(self: Payload) !?i64 {
         const id = self.senderId orelse return null;
@@ -405,6 +407,7 @@ pub const Service = struct {
             const doc = try std.json.parseFromSlice(Draft, a, row.payload, .{ .ignore_unknown_fields = true });
             defer doc.deinit();
             if (!std.mem.eql(u8, doc.value.folder, "Drafts") or (!std.mem.eql(u8, row.state, "saved") and !(resume_queued and std.mem.eql(u8, row.state, "queued")))) return ServiceError.Conflict;
+            if (!shared_inbox.sameReply(doc.value.message.sharedReply, payload.sharedReply)) return error.SharedReplyUnavailable;
             if (row.revision != payload.draftRevision) {
                 // A retried acknowledgement must not create a second draft.
                 var retry = payload;
@@ -474,6 +477,12 @@ pub const Service = struct {
         if (payload.draftId) |draft_id| {
             const row = try self.readyDraft(a, user, draft_id);
             if (row.revision != payload.draftRevision or !std.mem.eql(u8, row.state, "saved")) return ServiceError.Conflict;
+            const doc = try std.json.parseFromSliceLeaky(Draft, a, row.payload, .{ .ignore_unknown_fields = true });
+            if (!shared_inbox.sameReply(doc.message.sharedReply, payload.sharedReply)) return error.SharedReplyUnavailable;
+        }
+        if (payload.sharedReply != null) {
+            if (payload.draftId == null or payload.replyContext != null) return error.SharedReplyUnavailable;
+            try self.checkSharedReply(a, user, from, payload);
         }
         var row = store.Record{ .username = user, .kind = "outbox", .id = id, .payload = serialized, .state = "pending", .revision = 0, .due_at = due_at, .expires_at = 0 };
         if ((try self.db.hostedLimits(user)) != null) {
@@ -486,8 +495,38 @@ pub const Service = struct {
                 else => return err,
             };
         }
-        row.revision = try store.enqueue(self.db, row, payload.draftId, payload.draftRevision);
+        row.revision = if (payload.sharedReply) |context|
+            try store.enqueueShared(self.db, row, payload.draftId.?, payload.draftRevision, context)
+        else
+            try store.enqueue(self.db, row, payload.draftId, payload.draftRevision);
         return row;
+    }
+
+    fn checkSharedReply(self: *Service, a: std.mem.Allocator, actor: []const u8, from: []const u8, payload: Payload) !void {
+        const context = payload.sharedReply orelse return;
+        const id = shared_inbox.positiveId(context.sourceId) orelse return error.SharedReplyUnavailable;
+        if (!message_refs.valid(context.reference) or !try shared_inbox.canReply(self.db, actor, context)) return error.SharedReplyUnavailable;
+        const source = shared_inbox.source(a, self.db, actor, context.team, id) catch |err| switch (err) {
+            error.SharedInboxNotFound => return error.SharedReplyUnavailable,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, source.address, from)) return error.SharedReplyUnavailable;
+        const original = maildir.getSharedInboxMessage(a, self.db, source.username, context.reference) catch |err| switch (err) {
+            error.SharedInboxNotFound, maildir.MaildirError.MessageNotFound => return error.SharedReplyUnavailable,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, payload.inReplyTo, original.message_id)) return error.SharedReplyUnavailable;
+    }
+
+    pub fn requireOrdinaryDirectSend(self: *Service, a: std.mem.Allocator, actor: []const u8, payload: Payload) !void {
+        if (payload.sharedReply != null) return error.SharedReplyQueueRequired;
+        const draft_id = payload.draftId orelse return;
+        const row = store.get(a, self.db, actor, "draft", draft_id) catch |err| switch (err) {
+            store.StoreError.NotFound => return,
+            else => return err,
+        };
+        const doc = try std.json.parseFromSliceLeaky(Draft, a, row.payload, .{ .ignore_unknown_fields = true });
+        if (doc.message.sharedReply != null) return error.SharedReplyQueueRequired;
     }
 
     pub fn cancel(self: *Service, a: std.mem.Allocator, user: []const u8, id: []const u8, now: i64) !store.Record {
@@ -514,6 +553,7 @@ pub const Service = struct {
             if (!try self.reconcileDelivery(a, row.username, &doc)) {
                 doc.error_message = switch (err) {
                     error.SenderIdentityUnavailable => "This From address is no longer available. Choose another address before sending.",
+                    error.SharedReplyUnavailable => "This shared reply no longer has permission to send. Check the original message and its assignment.",
                     error.HostedSendingLimit => "Daily recipient allowance exhausted. Try again after midnight UTC.",
                     error.HostedSenderDisabled => "This mailbox is disabled. The message was not sent.",
                     error.HostedStorageFull => "A recipient mailbox is full. Review the recipients before retrying.",
@@ -544,7 +584,13 @@ pub const Service = struct {
         const parsed = try std.json.parseFromSlice(Outbox, a, row.payload, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         var doc = parsed.value;
-        if (try self.reconcileDelivery(a, row.username, &doc)) try self.finishDispatch(a, row, doc, now);
+        if (try self.reconcileDelivery(a, row.username, &doc)) {
+            try self.finishDispatch(a, row, doc, now);
+        } else if (doc.message.sharedReply != null) {
+            if (doc.dispatch) |dispatch| if (try self.db.hasAcceptedDelivery(dispatch.delivery_id)) return;
+            doc.error_message = "The server restarted before admitting this shared reply. The saved draft can be retried.";
+            try self.finishDispatch(a, row, doc, now);
+        }
     }
 
     fn reconcileDelivery(self: *Service, a: std.mem.Allocator, user: []const u8, doc: *Outbox) !bool {
@@ -642,6 +688,7 @@ pub const Service = struct {
         if (!account.enabled) return error.HostedSenderDisabled;
         const delegated_id = try doc.message.delegatedSender();
         const from = try self.sendAddress(a, user, account.email, delegated_id);
+        try self.checkSharedReply(a, user, from, doc.message);
         const msg = try self.payloadMessage(a, doc.message, user, from, false);
         // Recovery files Sent with the address used at admission, even after
         // a grant is revoked or the shared mailbox changes its address.
@@ -650,6 +697,7 @@ pub const Service = struct {
         row.revision = try store.put(self.db, row.*, row.revision);
         var cfg = self.sendConfig(user);
         cfg.delegated_sender_id = delegated_id;
+        if (doc.message.sharedReply) |context| cfg.shared_reply = .{ .context = context, .send_id = row.id };
         doc.result = try compose.sendWithJournal(a, msg, cfg, doc.dispatch);
     }
 
@@ -942,6 +990,7 @@ fn sendFingerprint(a: std.mem.Allocator, payload: Payload) ![]const u8 {
     if (!payload.clearFollowUp) _ = legacy.object.orderedRemove("clearFollowUp");
     if (payload.scheduleAt == null) _ = legacy.object.orderedRemove("scheduleAt");
     if (payload.senderId == null) _ = legacy.object.orderedRemove("senderId");
+    if (payload.sharedReply == null) _ = legacy.object.orderedRemove("sharedReply");
     return fingerprint(a, try json(a, legacy));
 }
 

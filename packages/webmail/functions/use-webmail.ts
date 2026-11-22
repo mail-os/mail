@@ -1,4 +1,4 @@
-import type { PrivateCollection, AttachmentPage, IndexProgress, LibraryAttachment, AttentionStatus, AttentionView, BulkAction, BulkResult, CategoryRule, ComposePayload, Contact, Conversation, DraftAck, DraftDocument, Folder, MailLimits, MailNotificationScope, MessageDetail, MessagePage, MessageRef, MessageSummary, OutboxCounts, OutboxItem, OutboxPage, OutboxSummary, OutboxView, SenderIdentity, User } from './mail-types'
+import type { PrivateCollection, AttachmentPage, IndexProgress, LibraryAttachment, AttentionStatus, AttentionView, BulkAction, BulkResult, CategoryRule, ComposePayload, Contact, Conversation, DraftAck, DraftDocument, Folder, MailLimits, MailNotificationScope, MessageDetail, MessagePage, MessageRef, MessageSummary, OutboxCounts, OutboxItem, OutboxPage, OutboxSummary, OutboxView, SenderIdentity, SharedReplyContext, User } from './mail-types'
 import { batch, derived, effect, state } from '@stacksjs/stx'
 import { createMailApi, MailApiError } from './mail-api'
 import { attentionViews, deadlineLabel, localDateInput, localDeadline } from './mail-attention'
@@ -155,6 +155,7 @@ export function useWebmail(ports: WebmailPorts) {
   const authExpired = state(false)
   const composing = state(false)
   const title = state('New message')
+  const sharedReply = state<SharedReplyContext | null>(null)
   const senderId = state('')
   const senderIdentities = state<SenderIdentity[] | null>(null)
   const missingSender = derived(() => Boolean(senderId() && !senderIdentities()?.some(identity => identity.id === senderId())))
@@ -316,7 +317,7 @@ export function useWebmail(ports: WebmailPorts) {
     catch { return null }
   }
   function content() {
-    return { ...recipientEditor.snapshot(), subject: subject(), text: body(), html: body() === initialText() ? draftHtml() : '', inReplyTo: inReplyTo(), references: references(), attachments: attachmentEditor.snapshot(), replyContext: replyContext(), clearFollowUp: clearFollowUp(), scheduleAt: selectedSchedule(), senderId: senderId() || null }
+    return { ...recipientEditor.snapshot(), subject: subject(), text: body(), html: body() === initialText() ? draftHtml() : '', inReplyTo: inReplyTo(), references: references(), attachments: attachmentEditor.snapshot(), replyContext: replyContext(), clearFollowUp: clearFollowUp(), scheduleAt: selectedSchedule(), senderId: senderId() || null, sharedReply: sharedReply() }
   }
   const draft = useDraftAutosave({ snapshot: content, hasContent: hasComposition, active: () => composing() && !sending(), blocked: () => attachmentEditor.attachmentPending() || authExpired(), save: payload => api<DraftAck>('/webmail/api/drafts', { method: 'POST', body: JSON.stringify(payload) }) })
   const hasUnsavedChanges = derived(() => draft.dirty() || attachmentEditor.attachmentPending())
@@ -1126,6 +1127,7 @@ export function useWebmail(ports: WebmailPorts) {
   function resetComposition(): void {
     batch(() => {
       composing.set(false)
+      sharedReply.set(null)
       senderId.set('')
       senderError.set('')
       subject.set(''); body.set(''); draftHtml.set(''); initialText.set(''); inReplyTo.set(''); references.set(''); replyContext.set(null); clearFollowUp.set(false); composeError.set(''); showCc.set(false); showBcc.set(false)
@@ -1239,6 +1241,7 @@ export function useWebmail(ports: WebmailPorts) {
   function installPayload(payload: ComposePayload, document: DraftDocument | null, metadata: MessageDetail | null = null): void {
     resetComposition()
     batch(() => {
+      sharedReply.set(payload.sharedReply ?? null)
       senderId.set(payload.senderId ?? '')
       recipientEditor.restore({ to: payload.to, cc: payload.cc, bcc: payload.bcc }, payload.recipientInputs || { to: '', cc: '', bcc: '' }, payload.recipientLabels)
       subject.set(payload.subject); body.set(payload.text); initialText.set(payload.text); draftHtml.set(payload.html); inReplyTo.set(payload.inReplyTo); references.set(payload.references); replyContext.set(payload.replyContext)
@@ -1251,7 +1254,7 @@ export function useWebmail(ports: WebmailPorts) {
       showCc.set(Boolean(payload.cc.length || payload.recipientInputs?.cc)); showBcc.set(Boolean(payload.bcc.length || payload.recipientInputs?.bcc))
       attachmentEditor.restore(payload.attachments.filter(item => item.uploadId).map((item, index) => ({ key: crypto.randomUUID(), uploadId: item.uploadId, filename: item.filename, contentType: item.contentType, size: metadata?.attachments[index]?.size ?? item.size ?? 0, progress: 100, status: 'ready' as const })))
       draft.restore(document, content())
-      title.set('Edit draft')
+      title.set(payload.sharedReply ? 'Shared inbox reply' : 'Edit draft')
     })
     showComposer()
   }
@@ -1613,6 +1616,21 @@ export function useWebmail(ports: WebmailPorts) {
     catch (cause) { composeError.set(errorMessage(cause)) }
     finally { confirming.set(false) }
   }
+  async function openSharedReplyDraft(): Promise<void> {
+    if (!globalThis.location?.href) return
+    const page = new URL(globalThis.location.href)
+    const link = page.searchParams.get('sharedReplyDraft')
+    const parts = link?.match(/^([1-9]\d{0,18})\.([a-z0-9-]{16,64})$/i)
+    if (!parts) return
+    const [, uid, id] = parts
+    const document = await api<DraftDocument>('/webmail/api/drafts?uid=' + uid)
+    if (document.draftId !== id || document.state !== 'saved' || !document.message.sharedReply)
+      throw new Error('This shared reply draft is unavailable.')
+    if (destroyed || !user()) return
+    page.searchParams.delete('sharedReplyDraft')
+    globalThis.history.replaceState(null, '', page.href)
+    installPayload(document.message, document)
+  }
   async function mount(): Promise<void> {
     try {
       const result = await api<{ user: User }>('/webmail/auth/me')
@@ -1624,6 +1642,7 @@ export function useWebmail(ports: WebmailPorts) {
       await Promise.all([refresh(), refreshOutbox()])
       void notifications.loadNotificationSettings().catch(() => {})
       void privateMail.loadPrivateCollections()
+      await openSharedReplyDraft()
     }
     catch (cause) { error.set(errorMessage(cause)) }
   }
@@ -1645,7 +1664,7 @@ export function useWebmail(ports: WebmailPorts) {
   }
   function preventUnload(event: BeforeUnloadEvent): void { if (hasUnsavedChanges()) { event.preventDefault(); event.returnValue = '' } }
   function destroy(): void { destroyed = true; ++listRequest; ++messageRequest; recipientEditor.destroy(); attachmentEditor.destroy(); draft.destroy(); privateMail.closePrivate(); contactBook.closeContacts(); selectionEffect() }
-  return { user, folders, folder, messages, threads, expandedThreads, selected, loading, refreshing, listError, readerError, readerTarget, reading, readingLoading, mutating, error, notice, query, activeQuery, appliedSearchAll, filterLocation, filterSender, filterRecipient, filterFilename, libraryView, libraryFiles, indexProgress, filterAfter, filterBefore, filterStatus, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, formattedReader, remoteImagesAllowed, checked, checkedKeys, selectedCount, isJunkFolder, readerJunkAction, selectionJunkAction, allChecked, someChecked, undoAction, undoRemaining, readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts, pendingSend, sendRemaining, outbox, outboxCount, outboxCounts, outboxSection, outboxViews, outboxEmpty, outboxPageNumber, outboxNext, outboxLoading, outboxError, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, senderId, senderIdentities, missingSender, senderStatus, chooseSender, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...senderReview, ...notifications, ...privateMail, ...contactBook, showContacts, composeSavedCard, collectionView, collectionId, canOpenPrivate,
+  return { user, folders, folder, messages, threads, expandedThreads, selected, loading, refreshing, listError, readerError, readerTarget, reading, readingLoading, mutating, error, notice, query, activeQuery, appliedSearchAll, filterLocation, filterSender, filterRecipient, filterFilename, libraryView, libraryFiles, indexProgress, filterAfter, filterBefore, filterStatus, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, formattedReader, remoteImagesAllowed, checked, checkedKeys, selectedCount, isJunkFolder, readerJunkAction, selectionJunkAction, allChecked, someChecked, undoAction, undoRemaining, readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts, pendingSend, sendRemaining, outbox, outboxCount, outboxCounts, outboxSection, outboxViews, outboxEmpty, outboxPageNumber, outboxNext, outboxLoading, outboxError, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, sharedReply, senderId, senderIdentities, missingSender, senderStatus, chooseSender, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...senderReview, ...notifications, ...privateMail, ...contactBook, showContacts, composeSavedCard, collectionView, collectionId, canOpenPrivate,
     showCollectionManager, closeCollectionManager, selectCollection, confirmCollectionDeletion, savePrivateLabel, setPrivateMembership, groupSelected, displaySubject, changeNotificationRule, ...recipientEditor, ...attachmentEditor, ...recoverySettings, ...forwardingSettings, ...vacationSettings, ...writing, snippetChoice, signatureChoice, insertSnippet, insertSignature, attentionViews, attentionView, followUpFocused, attentionSaving, attentionSchedule, attentionDate, attentionZone, dueReminders, replyContext, clearFollowUp, selectAttention, nextFollowUp, changeAttention, startAttentionSchedule, saveAttentionSchedule, deadlineLabel, categoryList, newsletterExpanded, readerExpanded, receiptFull, receiptCompact, receiptPreview, senderLabel, sortingSettings, sortingSaving, sortingError, toggleAutomaticSorting, placementText, categoryRule, categoryRuleSaving, saveCategoryRule, showSenderReview, openReviewMessage, reviewMessage, refresh, loadMessages, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread, toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, openAttachmentMessage, showAttachmentLibrary, retryReader, closeReader, nextUnread, readSelection, advanceBatch, triageAndNext, bulkAction, selectedAction, undoLastAction, showShortcuts, closeShortcuts, handleShortcut, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments, saveSendPreference, send, confirmPendingSend, showOutbox, refreshOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword, showConfirmation, confirmAction, saveDraftCopy: draft.saveCopy, mount, resume, tick, preventUnload, destroy, messageIdentity, messagePageSize, folderName, shortDate, fullDate, readableBytes, attachmentPath }
 }
 

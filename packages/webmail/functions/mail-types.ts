@@ -100,6 +100,7 @@ export interface ComposeAttachment extends Partial<Upload> {
   error?: string
 }
 export interface SenderIdentity { id: string, address: string }
+export interface SharedReplyContext { team: string, sourceId: string, reference: string, messageRevision: string }
 export interface ComposePayload {
   to: string[]
   cc: string[]
@@ -122,6 +123,7 @@ export interface ComposePayload {
   delaySeconds?: number
   scheduleAt?: number | null
   senderId?: string | null
+  sharedReply?: SharedReplyContext | null
 }
 export interface DraftAck { ok: boolean, uid: number, draftId: string, revision: number }
 export interface DraftDocument { draftId: string, revision: number, uid: number, state: string, message: ComposePayload }
