@@ -825,6 +825,18 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-view-modes .wm-action[aria-pressed=true] { background: var(--panel); border-color: var(--border); box-shadow: var(--shadow); }
 .calendar-view-modes .wm-action:hover { background: var(--hover); }
 .calendar-card-mark { display: flex; align-items: center; gap: 8px; color: var(--accent); }
+.calendar-sharing { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
+.calendar-sharing h2 { margin: 0 0 10px; font-size: 16px; }
+.calendar-shared-choice { justify-content: flex-start; text-align: left; white-space: normal; }
+.calendar-shared-choice > span:last-child, .calendar-share-list li > div { display: grid; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
+.calendar-shared-choice small, .calendar-share-list small { color: var(--muted); font-size: 11px; }
+.calendar-share-list { display: grid; gap: 6px; margin-block: 10px 0; padding: 0; list-style: none; }
+.calendar-share-list li { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 9px 11px; border-radius: 8px; background: var(--surface); }
+.calendar-share-list li > div { flex: 1 1 180px; }
+.calendar-share-list li > .mail-icon { color: var(--accent); }
+.calendar-share-list label { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.calendar-share-list select { padding: 5px; border: 1px solid var(--control-border); border-radius: 6px; }
+.calendar-share-notice { margin-block: 0 10px; padding: 9px 12px; border-radius: 8px; background: var(--accent-soft); color: var(--accent); }
 
 [data-icon=conversation] { --mail-symbol: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22black%22 stroke-width=%221.75%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cpath d=%22M4 4h13a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H9l-5 4v-4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm18 5v7a3 3 0 0 1-3 3h-6M6 8h9m-9 3h6%22/%3E%3C/svg%3E"); }
 [data-icon=checklist] { --mail-symbol: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22black%22 stroke-width=%221.75%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cpath d=%22m3 6 2 2 3-4M3 17l2 2 3-4m4-9h9m-9 11h9%22/%3E%3C/svg%3E"); }

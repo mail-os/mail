@@ -381,7 +381,7 @@ async function phoneJourney(page) {
   await page.locator('.calendar-loading').waitFor({ state: 'hidden' })
   await fitsViewport(page)
   await screenshot(page, 'phone-calendar')
-  await button(page, /, 1 event$/).click()
+  await button(page, /, 2 events$/).click()
   await page.getByText('Studio review', { exact: true }).waitFor()
   await screenshot(page, 'phone-calendar-day')
   await page.goto(url + '/shared')
@@ -410,11 +410,133 @@ async function sharedJourney(page, phone = false) {
   await message.waitFor()
 }
 
+async function calendarSharingJourney(captain) {
+  const calendarUrl = `${url}/calendar?day=${day}`
+  await captain.goto(calendarUrl)
+  await button(captain, 'Manage calendars').click()
+  const sharing = captain.getByRole('region', { name: 'Share a calendar' })
+  await sharing.getByLabel('Calendar to share').selectOption({ label: 'Design' })
+  await sharing.getByRole('combobox', { name: /^Team\b/ }).selectOption({ label: 'Studio' })
+  await sharing.getByLabel('Teammate').fill(sender)
+  await sharing.getByRole('combobox', { name: /^Access\b/ }).selectOption('viewer')
+  await button(sharing, 'Share calendar').click()
+  const role = sharing.getByRole('combobox', { name: `Access for ${sender} to Design` })
+  await role.waitFor()
+
+  const context = await browser.newContext({
+    viewport: { width: 390, height: 844 }, colorScheme: 'dark', hasTouch: true,
+    isMobile: engine !== 'firefox', locale: 'en-US', timezoneId: 'UTC', ignoreHTTPSErrors: true,
+  })
+  const teammate = await context.newPage()
+  teammate.setDefaultTimeout(12_000)
+  teammate.on('pageerror', error => errors.push(error.message))
+  await teammate.goto(url + '/login')
+  await teammate.getByLabel('Email or username').fill(sender)
+  await teammate.getByLabel('Password', { exact: true }).fill(password)
+  await button(teammate, 'Sign in').click()
+  await teammate.waitForURL(url + '/')
+  await teammate.goto(calendarUrl)
+  const sharedCalendar = button(teammate, /^Design.*View events/)
+  await sharedCalendar.click()
+  const privateTitle = teammate.getByText('Private budget check', { exact: true })
+  const publicEvent = button(teammate, /Studio review/)
+  await publicEvent.waitFor()
+  assert.equal(await privateTitle.count(), 0)
+  assert.equal(await button(teammate, 'New event').count(), 0)
+  assert.equal(await teammate.getByRole('link', { name: 'Download .ics' }).count(), 0)
+  await fitsViewport(teammate)
+  await screenshot(teammate, 'phone-calendar-viewer')
+  await publicEvent.click()
+  const details = teammate.getByRole('dialog', { name: 'Event details' })
+  await details.getByText('You have view access to this calendar.').waitFor()
+  assert.equal(await details.getByRole('textbox', { name: 'Title' }).isDisabled(), true)
+  assert.equal(await button(details, 'Save event').count(), 0)
+  await screenshot(teammate, 'phone-calendar-viewer-detail')
+
+  const checkAccess = () => teammate.evaluate(() => globalThis.dispatchEvent(new Event('focus')))
+  async function changeRole(access) {
+    const response = captain.waitForResponse(result => result.url().endsWith('/teams/studio/calendar-shares') && result.request().method() === 'PUT')
+    await role.selectOption(access)
+    assert.equal((await response).status(), 200)
+    await checkAccess()
+  }
+
+  await changeRole('editor')
+  await details.waitFor({ state: 'hidden' })
+  await button(teammate, /^Design.*Edit events/).waitFor()
+  await publicEvent.click()
+  const editor = teammate.getByRole('dialog', { name: 'Edit event' })
+  await editor.getByRole('textbox', { name: 'Title' }).fill('Studio review updated')
+  await button(editor, 'Save event').click()
+  await editor.waitFor({ state: 'hidden' })
+  await button(teammate, 'New event').click()
+  const creation = teammate.getByRole('dialog', { name: 'New event' })
+  assert.match(await creation.getByRole('combobox', { name: 'Calendar', exact: true }).locator('option:checked').innerText(), /^Design/)
+  await creation.getByRole('textbox', { name: 'Title' }).fill('Shared draft review')
+  await button(creation, 'Save event').click()
+  await creation.waitFor({ state: 'hidden' })
+  await button(teammate, /Shared draft review/).click()
+  await button(editor, 'Delete event').click()
+  await button(editor, 'Confirm deletion').click()
+  await editor.waitFor({ state: 'hidden' })
+  const updated = button(teammate, /Studio review updated/)
+  await updated.click()
+  await editor.getByRole('textbox', { name: 'Title' }).waitFor()
+
+  const eventsResponse = await captain.request.get(`${url}/webmail/api/calendar-events?q=Studio+review+updated`)
+  assert.equal(eventsResponse.status(), 200)
+  const [publicRow] = (await eventsResponse.json()).events
+  const resource = `${url}/webmail/api/calendar-events/${publicRow.id}`
+  const sourceResponse = await captain.request.get(resource + '?source=1')
+  assert.equal(sourceResponse.status(), 200)
+  const { icalendar } = await sourceResponse.json()
+  const privateResponse = await captain.request.put(resource, {
+    data: icalendar.replace('CLASS:PUBLIC', 'CLASS:PRIVATE'),
+    headers: { Origin: url, 'Content-Type': 'text/calendar', 'If-Match': sourceResponse.headers().etag },
+  })
+  assert.equal(privateResponse.status(), 200)
+  await checkAccess()
+  await editor.waitFor({ state: 'hidden' })
+  await updated.waitFor({ state: 'hidden' })
+  await teammate.getByText('This shared event is no longer available.', { exact: true }).waitFor()
+
+  const restored = await captain.request.put(resource, {
+    data: icalendar,
+    headers: { Origin: url, 'Content-Type': 'text/calendar', 'If-Match': privateResponse.headers().etag },
+  })
+  assert.equal(restored.status(), 200)
+  await checkAccess()
+  await updated.click()
+  await editor.getByRole('textbox', { name: 'Title' }).waitFor()
+  await changeRole('free_busy')
+  await editor.waitFor({ state: 'hidden' })
+  const busy = teammate.getByRole('list', { name: 'Busy periods' })
+  await busy.waitFor()
+  assert.equal(await busy.getByRole('listitem').count(), 2)
+  assert.equal(await privateTitle.count(), 0)
+  assert.equal(await button(teammate, /Studio review updated/).count(), 0)
+  await teammate.setViewportSize({ width: 320, height: 844 })
+  await fitsViewport(teammate)
+  await teammate.setViewportSize({ width: 390, height: 844 })
+  await fitsViewport(teammate)
+  await screenshot(teammate, 'phone-calendar-free-busy')
+
+  await screenshot(captain, 'desktop-calendar-sharing')
+  await button(sharing, `Revoke access for ${sender} to Design`).click()
+  await role.waitFor({ state: 'hidden' })
+  await checkAccess()
+  await teammate.getByText('You no longer have access to this shared calendar.', { exact: true }).waitFor()
+  await busy.waitFor({ state: 'hidden' })
+  await button(teammate, /^Design/).waitFor({ state: 'hidden' })
+  await context.close()
+}
+
 try {
   const desktop = await signIn()
   await desktopJourney(desktop)
   const phone = await signIn({ phone: true })
   await phoneJourney(phone)
+  await calendarSharingJourney(desktop)
   assert.deepEqual(errors, [], 'Browser pages raised uncaught errors')
   process.stdout.write(`${engine} passed the desktop and phone webmail journeys.\n`)
 }

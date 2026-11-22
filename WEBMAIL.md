@@ -428,6 +428,13 @@ membership and grant changes in `audit_log` in the same transaction.
 
 ### Calendar shares
 
+In webmail Calendar, use **Manage calendars** to share an owned calendar
+with a teammate. Choose the team, enter the teammate's full mailbox address,
+and select **View events**, **Edit events**, or **Free/busy only**. Change or
+revoke grants in the same panel. Team members can select incoming shares from
+the calendar list. The browser checks access while the page is open and closes
+shared event details when access changes.
+
 The calendar owner can send `PUT /webmail/api/teams/:id/calendar-shares` with
 `{calendarId, grantee, access}`. Use the ID from their calendar list and
 the teammate's full mailbox address. The access values are `viewer`,

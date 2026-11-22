@@ -51,18 +51,21 @@ def seed_inbox(fixture, owner, sender):
 
 def seed_calendar(fixture, owner):
     now = datetime.now(timezone.utc)
-    start = now.replace(hour=11, minute=0, second=0, microsecond=0)
-    end = start + timedelta(hours=1)
-    event = "\r\n".join([
-        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail browser fixture//EN", "BEGIN:VEVENT",
-        "UID:studio-review", now.strftime("DTSTAMP:%Y%m%dT%H%M%SZ"), start.strftime("DTSTART:%Y%m%dT%H%M%SZ"),
-        end.strftime("DTEND:%Y%m%dT%H%M%SZ"), "SUMMARY:Studio review", "END:VEVENT", "END:VCALENDAR", "",
-    ])
-    result = DavClient(fixture, owner).request(
-        "PUT", f"/calendars/{owner}/Design/studio-review.ics", event, {"Content-Type": "text/calendar"},
-    )
-    assert result[0] == 201, result
-    return start.date().isoformat()
+    client = DavClient(fixture, owner)
+    for uid, title, hour, visibility in (
+        ("studio-review", "Studio review", 11, "PUBLIC"),
+        ("budget-check", "Private budget check", 14, "PRIVATE"),
+    ):
+        start = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        end = start + timedelta(hours=1)
+        event = "\r\n".join([
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail browser fixture//EN", "BEGIN:VEVENT",
+            f"UID:{uid}", now.strftime("DTSTAMP:%Y%m%dT%H%M%SZ"), start.strftime("DTSTART:%Y%m%dT%H%M%SZ"),
+            end.strftime("DTEND:%Y%m%dT%H%M%SZ"), f"SUMMARY:{title}", f"CLASS:{visibility}", "END:VEVENT", "END:VCALENDAR", "",
+        ])
+        result = client.request("PUT", f"/calendars/{owner}/Design/{uid}.ics", event, {"Content-Type": "text/calendar"})
+        assert result[0] == 201, result
+    return now.date().isoformat()
 
 
 def seed_shared_inbox(fixture, owner, sender):
@@ -71,6 +74,7 @@ def seed_shared_inbox(fixture, owner, sender):
     assert fixture.api(session, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
     team_command(fixture, "team", "create", "studio", "Studio", studio)
     team_command(fixture, "team", "member", "studio", owner, "member")
+    team_command(fixture, "team", "member", "studio", sender, "member")
     team_command(fixture, "team", "grant", "studio", studio, owner, "mailbox")
     message = EmailMessage()
     message["From"] = sender

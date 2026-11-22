@@ -1,5 +1,5 @@
 import { derived, state } from '@stacksjs/stx'
-import { createMailApi } from './mail-api'
+import { createMailApi, MailApiError } from './mail-api'
 import type { User } from './mail-types'
 
 import {
@@ -7,8 +7,8 @@ import {
   formatCalendarDay, shiftCalendarDay, startOfZonedDay, zonedDay,
 } from './calendar-dates'
 import type { CalendarView } from './calendar-dates'
-import { calendarColor } from './calendar-types'
-import type { Calendar, CalendarEvent } from './calendar-types'
+import { calendarAccessLabels, calendarColor } from './calendar-types'
+import type { Calendar, CalendarAccess, CalendarEvent, CalendarShare } from './calendar-types'
 import { expandSeries } from './calendar-recurrence'
 import type { CalendarOccurrence } from './calendar-recurrence'
 import { useCalendarEditor } from './use-calendar-editor'
@@ -45,6 +45,10 @@ const calendarViews: { id: CalendarView, name: string }[] = [
 const shortDate: Intl.DateTimeFormatOptions = { dateStyle: 'medium' }
 const dateLabel = new Intl.DateTimeFormat(undefined, { ...shortDate, timeZone: 'UTC' })
 const dateTimeLabel = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' })
+const accessPriority = { free_busy: 0, viewer: 1, editor: 2 }
+
+interface BusyPeriod { start: number, end: number }
+interface CalendarTeam { id: string, name: string }
 
 function calendarEventDate(event: CalendarEvent, zone: string): string {
   const date = new Date(event.start * 1000)
@@ -55,7 +59,30 @@ function calendarEventDate(event: CalendarEvent, zone: string): string {
 export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog) {
   const account = state<string | undefined>(undefined)
   const calendars = state<Calendar[]>([])
+  const shares = state<CalendarShare[]>([])
+  const teams = state<CalendarTeam[]>([])
+  const outgoingShares = derived(() => shares().filter(share => share.source === account()))
+  const sharedCalendars = derived(() => {
+    const incoming = new Map<number, CalendarShare>()
+    for (const share of shares()) {
+      if (share.grantee !== account()) continue
+      const current = incoming.get(share.calendarId)
+      if (!current || accessPriority[share.access] > accessPriority[current.access])
+        incoming.set(share.calendarId, share)
+    }
+    return Array.from(incoming.values())
+  })
   const activeCalendar = state<number | null>(null)
+  const selectedShare = derived(() => sharedCalendars().find(share => share.calendarId === activeCalendar()))
+  const availabilityOnly = derived(() => selectedShare()?.access === 'free_busy')
+  const writableCalendars = derived(() => [
+    ...calendars(),
+    ...sharedCalendars().filter(share => share.access === 'editor').map(share => ({
+      id: share.calendarId, name: `${share.calendarName} · ${share.source}`,
+    })),
+  ])
+  const canCreateEvent = derived(() => activeCalendar() === null
+    ? calendars().length > 0 : writableCalendars().some(calendar => calendar.id === activeCalendar()))
   const target = new URLSearchParams(globalThis.location?.search).get('day')
   const initialDay = target && allDayInstant(target) !== null ? target : undefined
   const view = state<CalendarView>(initialDay ? 'day' : 'week')
@@ -63,12 +90,18 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
   const today = () => zonedDay(Date.now() / 1000, displayZone())
   const focusDay = state(initialDay ?? today())
   const events = state<CalendarEvent[]>([])
+  const busyPeriods = state<BusyPeriod[]>([])
+  const shareNotice = state('')
   const searchInput = state('')
   const searchTerm = state('')
   const calendarSettings = state(false)
   const calendarSettingsError = state('')
   const calendarSettingsBusy = state(false)
   const calendarNameInput = state('')
+  const shareCalendarInput = state('')
+  const shareTeamInput = state('')
+  const shareGranteeInput = state('')
+  const shareAccessInput = state<CalendarAccess>('viewer')
   const range = derived(() => calendarRange(view(), focusDay()))
   const rangeLabel = derived(() => {
     const { start, end } = range()
@@ -102,8 +135,8 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     return { rows, unavailable }
   })
   const recurringSeries = derived(() => occurrences().unavailable)
-  const activeCalendarName = derived(() => calendars().find(item => item.id === activeCalendar())?.name ?? 'All calendars')
-  const downloadCalendar = derived(() => activeCalendar() ?? (calendars().length === 1 ? calendars()[0].id : null))
+  const activeCalendarName = derived(() => selectedShare()?.calendarName ?? calendars().find(item => item.id === activeCalendar())?.name ?? 'All calendars')
+  const downloadCalendar = derived(() => selectedShare() ? null : activeCalendar() ?? (calendars().length === 1 ? calendars()[0].id : null))
   const calendarExport = derived(() => {
     const id = downloadCalendar()
     if (id === null || !account()) return ''
@@ -169,27 +202,54 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     return parts.join(', ')
   })
   let request: AbortController | undefined
+  let shareRequest: AbortController | undefined
   let importRequest: AbortController | undefined
   let settingsRequest: AbortController | undefined
   const api = createMailApi(account, () => {
     request?.abort()
+    shareRequest?.abort()
     importRequest?.abort()
     settingsRequest?.abort()
-    editor.cancelEditorRequests()
+    editor.clearEditor()
     account.set(undefined)
     calendars.set([])
+    shares.set([])
     activeCalendar.set(null)
     events.set([])
+    busyPeriods.set([])
     onAuthError()
   })
 
+  function applyShares(rows: CalendarShare[]) {
+    const accessBefore = selectedShare()?.access
+    const editorId = Number(editor.editorCalendar())
+    const findEditorShare = () => sharedCalendars().find(share => share.calendarId === editorId)
+    const editorBefore = findEditorShare()?.access
+    shares.set(rows.map(share => ({ ...share, calendarName: calendarName(share.calendarName) })))
+    if (editorBefore && editorBefore !== findEditorShare()?.access) editor.clearEditor()
+    const accessAfter = selectedShare()?.access
+    if (accessBefore === accessAfter) return false
+    if (!accessAfter) {
+      activeCalendar.set(null)
+      shareNotice.set('You no longer have access to this shared calendar.')
+    }
+    else if (accessBefore) shareNotice.set('Your access to this calendar changed.')
+    if (accessAfter === 'free_busy' || !accessAfter) {
+      searchTerm.set('')
+      searchInput.set('')
+    }
+    return true
+  }
+
   async function refresh() {
     request?.abort()
+    shareRequest?.abort()
     const pending = new AbortController()
     request = pending
     loading.set(true)
     error.set('')
     events.set([])
+    busyPeriods.set([])
     const signal = AbortSignal.any([pending.signal, AbortSignal.timeout(10_000)])
     try {
       if (!account()) {
@@ -197,33 +257,96 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
         if (pending.signal.aborted) return
         account.set(user.username)
       }
-      const { calendars: visible } = await api<{ calendars: Calendar[] }>('/webmail/api/calendars', { signal })
+      const [{ calendars: visible }, { shares: currentShares }, roster] = await Promise.all([
+        api<{ calendars: Calendar[] }>('/webmail/api/calendars', { signal }),
+        api<{ shares: CalendarShare[] }>('/webmail/api/calendar-shares', { signal }),
+        calendarSettings() ? api<CalendarTeam[]>('/webmail/api/teams', { signal }) : Promise.resolve(null),
+      ])
       if (pending.signal.aborted) return
       calendars.set(visible.map(calendar => ({ ...calendar, name: calendarName(calendar.name) })))
-      if (activeCalendar() !== null && !visible.some(item => item.id === activeCalendar())) activeCalendar.set(null)
-      if (!visible.length) return
-
-      const params = new URLSearchParams()
-      const selected = activeCalendar()
-      if (selected !== null) params.set('calendarId', String(selected))
-      const query = searchTerm()
-      if (query) params.set('q', query)
-      else {
-        const { start, end } = range()
-        const zone = displayZone()
-        params.set('instances', '1')
-        params.set('start', String(Math.min(startOfZonedDay(start, zone), allDayInstant(start)!)))
-        params.set('end', String(Math.max(startOfZonedDay(end, zone), allDayInstant(end)!)))
-      }
-      const result = await api<{ events: CalendarEvent[] }>(`/webmail/api/calendar-events?${params}`, { signal })
-      if (!pending.signal.aborted) events.set(result.events)
+      applyShares(currentShares)
+      if (roster) teams.set(roster)
+      if (activeCalendar() !== null && !selectedShare() && !visible.some(item => item.id === activeCalendar())) activeCalendar.set(null)
+      await loadCalendarView(signal)
     }
     catch (cause) {
       if (!pending.signal.aborted)
         error.set(cause instanceof Error ? cause.message : 'Could not load your calendar.')
     }
     finally {
-      if (request === pending) loading.set(false)
+      if (request === pending) {
+        request = undefined
+        loading.set(false)
+      }
+    }
+  }
+
+  async function loadCalendarView(signal: AbortSignal) {
+    if (!calendars().length && !selectedShare()) return
+    const params = new URLSearchParams()
+    const selected = activeCalendar()
+    if (selected !== null) params.set('calendarId', String(selected))
+    const { start, end } = range()
+    const zone = displayZone()
+    if (availabilityOnly()) {
+      params.set('start', String(startOfZonedDay(start, zone)))
+      params.set('end', String(startOfZonedDay(end, zone)))
+      const result = await api<{ busy: BusyPeriod[] }>(`/webmail/api/calendar-free-busy?${params}`, { signal })
+      if (!signal.aborted) busyPeriods.set(result.busy)
+    }
+    else {
+      const query = searchTerm()
+      if (query) params.set('q', query)
+      else {
+        params.set('instances', '1')
+        params.set('start', String(Math.min(startOfZonedDay(start, zone), allDayInstant(start)!)))
+        params.set('end', String(Math.max(startOfZonedDay(end, zone), allDayInstant(end)!)))
+      }
+      const result = await api<{ events: CalendarEvent[] }>(`/webmail/api/calendar-events?${params}`, { signal })
+      if (!signal.aborted) events.set(result.events)
+    }
+  }
+
+  async function recheckOpenSharedEvent(signal: AbortSignal) {
+    const id = editor.editingId()
+    const calendarId = Number(editor.editorCalendar())
+    if (id === null || !editor.editorOpen() || !sharedCalendars().some(share => share.calendarId === calendarId)) return
+    try {
+      await api(`/webmail/api/calendar-events/${id}`, { signal })
+    }
+    catch (cause) {
+      if (!(cause instanceof MailApiError) || cause.status !== 404) throw cause
+      if (!signal.aborted && editor.editingId() === id && editor.editorOpen()) {
+        editor.clearEditor()
+        shareNotice.set('This shared event is no longer available.')
+      }
+    }
+  }
+
+  async function recheckShares() {
+    if (!account() || request || shareRequest || calendarSettingsBusy()) return
+    const pending = new AbortController()
+    shareRequest = pending
+    const signal = AbortSignal.any([pending.signal, AbortSignal.timeout(10_000)])
+    try {
+      const { shares: current } = await api<{ shares: CalendarShare[] }>('/webmail/api/calendar-shares', { signal })
+      if (signal.aborted) return
+      if (applyShares(current)) await refresh()
+      else if (selectedShare()) {
+        await recheckOpenSharedEvent(signal)
+        await loadCalendarView(signal)
+        if (!signal.aborted) error.set('')
+      }
+    }
+    catch (cause) {
+      if (!pending.signal.aborted && selectedShare()) {
+        events.set([])
+        busyPeriods.set([])
+        error.set(cause instanceof Error ? cause.message : 'Could not refresh the shared calendar.')
+      }
+    }
+    finally {
+      if (shareRequest === pending) shareRequest = undefined
     }
   }
 
@@ -233,7 +356,12 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
   })
 
   function selectCalendar(id: number | null) {
+    shareNotice.set('')
     activeCalendar.set(id)
+    if (availabilityOnly()) {
+      searchTerm.set('')
+      searchInput.set('')
+    }
     return refresh()
   }
 
@@ -282,16 +410,19 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
   }
 
   function openNewEvent(day = focusDay()) {
+    if (!canCreateEvent()) return
     const id = activeCalendar() ?? calendars()[0]?.id
     if (id !== undefined) editor.createEvent(day, id, displayZone())
   }
 
   function openEvent(event: CalendarEvent | CalendarOccurrence) {
-    return editor.editEvent(event, displayZone())
+    const share = sharedCalendars().find(item => item.calendarId === event.calendar_id)
+    if (share?.access === 'free_busy') return
+    return editor.editEvent(event, displayZone(), share?.access === 'viewer')
   }
 
   function nameFor(event: CalendarEvent) {
-    return calendars().find(calendar => calendar.id === event.calendar_id)?.name ?? ''
+    return selectedShare()?.calendarName ?? calendars().find(calendar => calendar.id === event.calendar_id)?.name ?? ''
   }
 
   function eventColor(event: CalendarEvent) {
@@ -299,7 +430,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
   }
 
   async function saveCalendar(write: (signal: AbortSignal) => Promise<void>) {
-    if (calendarSettingsBusy()) return
+    if (calendarSettingsBusy()) return false
     const pending = new AbortController()
     settingsRequest = pending
     calendarSettingsBusy.set(true)
@@ -307,9 +438,11 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     try {
       await write(AbortSignal.any([pending.signal, AbortSignal.timeout(10_000)]))
       if (!pending.signal.aborted) await refresh()
+      return !pending.signal.aborted
     }
     catch (cause) {
       if (!pending.signal.aborted) calendarSettingsError.set(cause instanceof Error ? cause.message : 'Could not save your calendar.')
+      return false
     }
     finally {
       if (settingsRequest === pending) calendarSettingsBusy.set(false)
@@ -335,6 +468,38 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     })
   }
 
+  function toggleCalendarSettings() {
+    calendarSettings.set(!calendarSettings())
+    if (calendarSettings()) return refresh()
+  }
+
+  function writeShare(team: string, calendarId: number, grantee: string, access: CalendarAccess | null) {
+    return saveCalendar(async (signal) => {
+      await api(`/webmail/api/teams/${encodeURIComponent(team)}/calendar-shares`, {
+        method: 'PUT', body: JSON.stringify({ calendarId, grantee, access }), signal,
+      })
+    })
+  }
+
+  async function grantCalendar() {
+    const team = shareTeamInput() || teams()[0]?.id
+    const calendarId = Number(shareCalendarInput()) || calendars()[0]?.id
+    const grantee = shareGranteeInput().trim()
+    if (team && calendarId && grantee && await writeShare(team, calendarId, grantee, shareAccessInput()))
+      shareGranteeInput.set('')
+  }
+
+  function selectGrantAccess(share: CalendarShare, event: Event) {
+    const select = event.target as HTMLSelectElement
+    const access = select.value as CalendarAccess
+    select.value = share.access
+    return writeShare(share.team, share.calendarId, share.grantee, access)
+  }
+
+  function revokeCalendarGrant(share: CalendarShare) {
+    return writeShare(share.team, share.calendarId, share.grantee, null)
+  }
+
   function resetImportResult() {
     importRows.set([])
     importError.set('')
@@ -344,7 +509,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
   function toggleImport() {
     importOpen.set(!importOpen())
     importFile.set(null)
-    importDestination.set(activeCalendar() === null ? 'new' : String(activeCalendar()))
+    importDestination.set(activeCalendar() === null || selectedShare() ? 'new' : String(activeCalendar()))
     newCalendarName.set('')
     resetImportResult()
   }
@@ -404,10 +569,17 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
 
   return {
     account, calendars, activeCalendar, activeCalendarName, calendarExport, calendarColor, eventColor, nameFor,
+    sharedCalendars, selectedShare, availabilityOnly, canCreateEvent, writableCalendars, busyPeriods, shareNotice, recheckShares,
+    busyPeriodLabel: (period: BusyPeriod) => new Intl.DateTimeFormat(undefined, {
+      dateStyle: 'medium', timeStyle: 'short', timeZone: displayZone(),
+    }).formatRange(new Date(period.start * 1000), new Date(period.end * 1000)),
     view, calendarViews, calendarDays, monthWeekdays, recurringSeries, rangeLabel, loading, error,
     searchInput, searchTerm, events, search, clearSearch, focusDay, displayZone, calendarTimeZones,
     refresh, selectCalendar, showView, shiftView, goToToday, showDay, changeDate, changeZone,
-    calendarSettings, calendarSettingsError, calendarSettingsBusy, calendarNameInput, createCalendar, setCalendarColor,
+    calendarSettings, calendarSettingsError, calendarSettingsBusy, calendarNameInput, createCalendar, setCalendarColor, toggleCalendarSettings,
+    teams, outgoingShares, shareCalendarInput, shareTeamInput, shareGranteeInput, shareAccessInput,
+    calendarAccessLabels, grantCalendar, revokeCalendarGrant, selectGrantAccess,
+    teamName: (id: string) => teams().find(team => team.id === id)?.name ?? id,
     openEvent, openNewEvent, calendarEventDate: (event: CalendarEvent) => calendarEventDate(event, displayZone()),
     ...editor,
     ...reminders,
@@ -416,9 +588,10 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     setNewCalendarName, submitImport, importEventDate, importStatusLabels,
     destroy: () => {
       request?.abort()
+      shareRequest?.abort()
       importRequest?.abort()
       settingsRequest?.abort()
-      editor.cancelEditorRequests()
+      editor.clearEditor()
     },
   }
 }

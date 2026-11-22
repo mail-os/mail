@@ -25,7 +25,9 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
   const editorRecurring = state(false)
   const editorOccurrence = state(false)
   const editorHasOccurrence = state(false)
-  const editorReadOnly = state(false)
+  const editorViewer = state(false)
+  const editorProtectedOccurrence = state(false)
+  const editorReadOnly = derived(() => editorViewer() || editorProtectedOccurrence())
   const confirmDelete = state(false)
   const editorCalendar = state('')
   const editorTitle = state('')
@@ -47,7 +49,7 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
   const repeatOptions = derived(() => repeatFrequency() !== 'none' && repeatFrequency() !== 'custom')
   const editorTimeZones = derived(() => calendarTimeZones.includes(editorZone())
     ? calendarTimeZones : [...calendarTimeZones, editorZone()].sort())
-  const editorLabel = derived(() => editingId() === null ? 'New event' : editorRecurring() ? 'Edit series' : editorOccurrence() ? 'Edit occurrence' : 'Edit event')
+  const editorLabel = derived(() => editorViewer() ? 'Event details' : editingId() === null ? 'New event' : editorRecurring() ? 'Edit series' : editorOccurrence() ? 'Edit occurrence' : 'Edit event')
   let initial: { detail: CalendarEventDetail, start: string, end: string, zone: string, repeat: CalendarRepeat, reminder: ReminderChoice } | undefined
   let occurrence: { ref: OccurrenceRef, displayZone: string } | undefined
   let draftSeriesUid: string | undefined
@@ -80,7 +82,8 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
     editorRecurring.set(false)
     editorOccurrence.set(false)
     editorHasOccurrence.set(false)
-    editorReadOnly.set(false)
+    editorViewer.set(false)
+    editorProtectedOccurrence.set(false)
     editorScheduleEditable.set(true)
     editorReminderEditable.set(true)
     editorReminder.set('none')
@@ -144,7 +147,7 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
       editorEnd.set(end)
       editorOccurrence.set(Boolean(selection))
       editorRecurring.set(series)
-      editorReadOnly.set(local?.canEditOccurrence === false)
+      editorProtectedOccurrence.set(local?.canEditOccurrence === false)
       editorScheduleEditable.set(!series || schedule?.editable === true)
       editorReminderEditable.set(Boolean(reminder))
       editorReminder.set(settings.choice)
@@ -163,20 +166,42 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
     }
   }
 
-  function editEvent(event: CalendarEvent | CalendarOccurrence, zone: string) {
+  function editEvent(event: CalendarEvent | CalendarOccurrence, zone: string, readOnly: boolean) {
     if (editorBusy()) return
     initial = undefined
     displayZone = zone
     editingId.set(event.id)
+    editorCalendar.set(String(event.calendar_id))
     editorZone.set(zone)
     occurrence = 'occurrence' in event ? { ref: event.occurrence, displayZone: zone } : undefined
     editorHasOccurrence.set(Boolean(occurrence))
     editorOccurrence.set(Boolean(occurrence))
-    editorReadOnly.set(false)
+    editorViewer.set(readOnly)
+    editorProtectedOccurrence.set(false)
     editorRecurring.set(event.recurring && !occurrence)
     editorLoaded.set(false)
     showEditor()
     return load(event.id, zone)
+  }
+
+  function clearEditor() {
+    pending?.abort()
+    pending = undefined
+    initial = undefined
+    occurrence = undefined
+    draftSeriesUid = undefined
+    dialog.ref.current?.close()
+    editorOpen.set(false)
+    editorBusy.set(false)
+    editorLoaded.set(false)
+    editingId.set(null)
+    editorCalendar.set('')
+    editorTitle.set('')
+    editorLocation.set('')
+    editorDescription.set('')
+    editorStart.set('')
+    editorEnd.set('')
+    editorError.set('')
   }
 
   function reloadEvent() {
@@ -387,13 +412,13 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
 
   return {
     editorOpen, editorBusy, editorLoaded, editorError, editorConflict, editingId, editorLabel,
-    editorRecurring, editorOccurrence, editorHasOccurrence, editorReadOnly, editorCalendar, editorTitle, editorLocation, editorDescription,
+    editorRecurring, editorOccurrence, editorHasOccurrence, editorReadOnly, editorViewer, editorProtectedOccurrence, editorCalendar, editorTitle, editorLocation, editorDescription,
     editorAllDay, editorStart, editorEnd, editorZone, editorScheduleEditable, editorTimeZones,
     editorReminder, editorReminderEditable, otherReminders, reminderOptions,
     repeatFrequency, repeatEvery, repeatEnd, repeatCount, repeatUntil, repeatOptions, changeRepeatEnd,
     confirmDelete, toggleAllDay, setEventBoundary,
     createEvent, editEvent, closeEditor, reloadEvent, saveEvent, deleteEvent, showEventScope,
-    cancelEditorRequests: () => pending?.abort(),
+    clearEditor,
   }
 }
 

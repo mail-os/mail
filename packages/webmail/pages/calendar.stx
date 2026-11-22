@@ -12,12 +12,15 @@ import { useMailCalendar } from '../functions/use-mail-calendar'
 import { reminderDayLink } from '../functions/use-calendar-reminders'
 const {
   account, calendars, activeCalendar, activeCalendarName, calendarExport, calendarColor, eventColor, nameFor,
+  sharedCalendars, selectedShare, availabilityOnly, canCreateEvent, writableCalendars, busyPeriods, busyPeriodLabel, shareNotice, recheckShares,
   view, calendarViews, calendarDays, monthWeekdays, recurringSeries, rangeLabel, loading, error,
   searchInput, searchTerm, events, search, clearSearch, focusDay, displayZone, calendarTimeZones,
   refresh, selectCalendar, showView, shiftView, goToToday, showDay, changeDate, changeZone, calendarEventDate,
-  calendarSettings, calendarSettingsError, calendarSettingsBusy, calendarNameInput, createCalendar, setCalendarColor,
+  calendarSettings, calendarSettingsError, calendarSettingsBusy, calendarNameInput, createCalendar, setCalendarColor, toggleCalendarSettings,
+  teams, outgoingShares, shareCalendarInput, shareTeamInput, shareGranteeInput, shareAccessInput,
+  calendarAccessLabels, grantCalendar, revokeCalendarGrant, selectGrantAccess, teamName,
   openEvent, openNewEvent, editorOpen, editorBusy, editorLoaded, editorError, editorConflict, editingId, editorLabel,
-  editorRecurring, editorOccurrence, editorHasOccurrence, editorReadOnly, editorCalendar, editorTitle, editorLocation, editorDescription,
+  editorRecurring, editorOccurrence, editorHasOccurrence, editorReadOnly, editorViewer, editorProtectedOccurrence, editorCalendar, editorTitle, editorLocation, editorDescription,
   editorAllDay, editorStart, editorEnd, editorZone, editorScheduleEditable, editorTimeZones,
   editorReminder, editorReminderEditable, otherReminders, reminderOptions,
   repeatFrequency, repeatEvery, repeatEnd, repeatCount, repeatUntil, repeatOptions, changeRepeatEnd,
@@ -31,8 +34,11 @@ const {
 async function bootCalendar() { await refresh(); void pollReminders() }
 useInterval(tickReminders, 1000, { whileVisible: true })
 useInterval(pollReminders, 30000, { whileVisible: true })
+useInterval(recheckShares, 30000, { whileVisible: true })
 useEventListener('focus', pollReminders)
+useEventListener('focus', recheckShares)
 useEventListener('online', pollReminders)
+useEventListener('online', recheckShares)
 onMount(bootCalendar)
 onUnmounted(() => { destroy(); destroyReminders() })
 </script>
@@ -41,15 +47,16 @@ onUnmounted(() => { destroy(); destroyReminders() })
   <header class="calendar-header">
     <div class="calendar-heading"><span class="mail-app-mark"><span class="mail-icon" data-icon="calendar" aria-hidden="true"></span></span><h1>Calendar</h1></div>
     <div :if="account" class="calendar-choices">
-      <button class="wm-action" @click="calendarSettings.set(!calendarSettings())" :aria-expanded="calendarSettings" aria-controls="calendar-settings"><span class="mail-icon" data-icon="settings" aria-hidden="true"></span>Manage calendars</button>
+      <button class="wm-action" @click="toggleCalendarSettings()" :aria-expanded="calendarSettings" aria-controls="calendar-settings"><span class="mail-icon" data-icon="settings" aria-hidden="true"></span>Manage calendars</button>
       <button class="wm-action" @click="toggleImport()" :disabled="importBusy" :aria-expanded="importOpen" aria-controls="calendar-import"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Import .ics</button>
       <a :if="calendarExport" class="wm-action" :href="calendarExport"><span class="mail-icon" data-icon="download" aria-hidden="true"></span>Download .ics</a>
-      <button :if="calendars.length" class="wm-action calendar-primary" @click="openNewEvent()"><span class="mail-icon" data-icon="plus" aria-hidden="true"></span>New event</button>
+      <button :if="canCreateEvent" class="wm-action calendar-primary" @click="openNewEvent()"><span class="mail-icon" data-icon="plus" aria-hidden="true"></span>New event</button>
     </div>
   </header>
   <div :if="error" class="login-error" role="alert"><span :text="error"></span> <button class="wm-action" @click="refresh()">Retry</button></div>
+  <p :if="shareNotice" class="calendar-share-notice" role="status" :text="shareNotice"></p>
   <p :if="loading" class="calendar-loading" role="status">Loading calendar…</p>
-  <p :if="!loading && !error && !calendars.length && !importOpen && !calendarSettings">Create a calendar or import an .ics file to get started.</p>
+  <p :if="!loading && !error && !calendars.length && !sharedCalendars.length && !importOpen && !calendarSettings">Create a calendar or import an .ics file to get started.</p>
   <section :if="calendarSettings" id="calendar-settings" class="calendar-import" aria-label="Manage calendars" :aria-busy="calendarSettingsBusy">
     <form class="calendar-import-form" @submit.prevent="createCalendar()">
       <label>Calendar name<input x-model="calendarNameInput" :disabled="calendarSettingsBusy" maxlength="100" required></label>
@@ -59,6 +66,31 @@ onUnmounted(() => { destroy(); destroyReminders() })
     <div :if="calendars.length" class="calendar-colors">
       <label :for="item in calendars"><input type="color" :value="calendarColor(item.color)" :aria-label="'Color for ' + item.name" :disabled="calendarSettingsBusy" @change="setCalendarColor(item, $event)"><span :text="item.name"></span></label>
     </div>
+    <section :if="calendars.length && teams.length" class="calendar-sharing" aria-labelledby="share-calendar-heading">
+      <h2 id="share-calendar-heading">Share a calendar</h2>
+      <form class="calendar-import-form" @submit.prevent="grantCalendar()">
+        <label>Calendar to share<select :value="shareCalendarInput || String(calendars[0]?.id || '')" @change="shareCalendarInput.set($event.target.value)" :disabled="calendarSettingsBusy">
+          <option :for="item in calendars" :value="item.id" :text="item.name"></option>
+        </select></label>
+        <label>Team<select :value="shareTeamInput || teams[0]?.id" @change="shareTeamInput.set($event.target.value)" :disabled="calendarSettingsBusy">
+          <option :for="team in teams" :value="team.id" :text="team.name"></option>
+        </select></label>
+        <label>Teammate<input type="email" x-model="shareGranteeInput" autocomplete="off" placeholder="name@example.com" :disabled="calendarSettingsBusy" required></label>
+        <label>Access<select x-model="shareAccessInput" :disabled="calendarSettingsBusy">
+          <option value="viewer">View events</option><option value="editor">Edit events</option><option value="free_busy">Free/busy only</option>
+        </select></label>
+        <button type="submit" class="wm-action calendar-primary" :disabled="calendarSettingsBusy"><span class="mail-icon" data-icon="people" aria-hidden="true"></span>Share calendar</button>
+      </form>
+      <ul :if="outgoingShares.length" class="calendar-share-list" aria-label="Calendar access you granted">
+        <li :for="share in outgoingShares" :key="share.team + ':' + share.calendarId + ':' + share.grantee">
+          <div><strong :text="share.calendarName"></strong><small :text="share.grantee + ' · ' + teamName(share.team)"></small></div>
+          <label>Access<select :value="share.access" :disabled="calendarSettingsBusy" :aria-label="'Access for ' + share.grantee + ' to ' + share.calendarName" @change="selectGrantAccess(share, $event)">
+            <option value="viewer">View events</option><option value="editor">Edit events</option><option value="free_busy">Free/busy only</option>
+          </select></label>
+          <button type="button" class="wm-action wm-action--danger" :disabled="calendarSettingsBusy" :aria-label="'Revoke access for ' + share.grantee + ' to ' + share.calendarName" @click="revokeCalendarGrant(share)">Revoke access</button>
+        </li>
+      </ul>
+    </section>
   </section>
   <section :if="importOpen" id="calendar-import" class="calendar-import" aria-label="Import calendar" :aria-busy="importBusy">
     <form class="calendar-import-form" @submit.prevent="submitImport('preview')">
@@ -83,20 +115,25 @@ onUnmounted(() => { destroy(); destroyReminders() })
     </ul>
     <button :if="readyCount && !importFinished" class="wm-action" @click="submitImport('import')" :disabled="importBusy">Import events</button>
   </section>
-  <section :if="account && calendars.length" class="calendar-workspace" aria-label="Calendar workspace" :aria-busy="loading">
+  <section :if="account && (calendars.length || sharedCalendars.length)" class="calendar-workspace" aria-label="Calendar workspace" :aria-busy="loading">
     <div class="calendar-controls">
       <div class="calendar-choices calendar-sources" role="group" aria-label="Calendars">
-        <button class="wm-action" @click="selectCalendar(null)" :aria-pressed="activeCalendar === null">All calendars</button>
+        <button :if="calendars.length" class="wm-action" @click="selectCalendar(null)" :aria-pressed="activeCalendar === null" :text="sharedCalendars.length ? 'My calendars' : 'All calendars'"></button>
         <button :for="item in calendars" class="wm-action" @click="selectCalendar(item.id)" :aria-pressed="item.id === activeCalendar">
           <span class="calendar-dot" :style="'background:' + calendarColor(item.color)" aria-hidden="true"></span><span :text="item.name"></span>
         </button>
+        <button :for="share in sharedCalendars" :key="share.calendarId" class="wm-action calendar-shared-choice" @click="selectCalendar(share.calendarId)" :aria-pressed="share.calendarId === activeCalendar">
+          <span class="mail-icon" data-icon="people" aria-hidden="true"></span>
+          <span><strong :text="share.calendarName"></strong><small :text="share.source + ' · ' + calendarAccessLabels[share.access]"></small></span>
+        </button>
       </div>
-      <form class="calendar-choices calendar-search" role="search" @submit.prevent="search()">
+      <form :if="!availabilityOnly && (calendars.length || selectedShare)" class="calendar-choices calendar-search" role="search" @submit.prevent="search()">
         <div class="mail-search-field"><span class="mail-icon" data-icon="search" aria-hidden="true"></span><input class="wm-search" type="search" x-model="searchInput" aria-label="Search events" placeholder="Search events" maxlength="256"><button type="submit" class="wm-search-submit" aria-label="Search" title="Search"><span class="mail-icon" data-icon="arrow-right" aria-hidden="true"></span></button></div>
         <button :if="searchTerm" type="button" class="wm-action" @click="clearSearch()">Clear</button>
       </form>
     </div>
-    <div class="calendar-controls calendar-view-toolbar">
+    <p :if="!calendars.length && !selectedShare">Choose a shared calendar.</p>
+    <div :if="calendars.length || selectedShare" class="calendar-controls calendar-view-toolbar">
       <div class="calendar-choices calendar-view-modes" role="group" aria-label="Calendar view">
         <button :for="mode in calendarViews" class="wm-action" @click="showView(mode.id)" :aria-pressed="!searchTerm && view === mode.id" :text="mode.name"></button>
       </div>
@@ -128,7 +165,19 @@ onUnmounted(() => { destroy(); destroyReminders() })
       </ul>
     </section>
 
-    <section :if="!searchTerm" aria-labelledby="calendar-range">
+    <section :if="availabilityOnly" aria-labelledby="calendar-availability">
+      <h2 id="calendar-availability" class="calendar-range">Free/busy</h2>
+      <p :text="rangeLabel"></p>
+      <p :if="!loading && !error && !busyPeriods.length">No busy times in this period.</p>
+      <ul :if="busyPeriods.length" class="calendar-share-list" aria-label="Busy periods">
+        <li :for="period in busyPeriods" :key="period.start">
+          <span class="mail-icon" data-icon="clock" aria-hidden="true"></span><strong>Busy</strong>
+          <span :text="busyPeriodLabel(period)"></span>
+        </li>
+      </ul>
+    </section>
+
+    <section :if="!searchTerm && !availabilityOnly && (calendars.length || selectedShare)" aria-labelledby="calendar-range">
       <h2 id="calendar-range" class="calendar-range" :text="rangeLabel" aria-live="polite"></h2>
       <p :if="!loading && !error && view === 'agenda' && !calendarDays.length">No events in this period.</p>
       <div :if="view === 'month'" class="calendar-weekdays" aria-hidden="true">
@@ -144,7 +193,7 @@ onUnmounted(() => { destroy(); destroyReminders() })
                 <span :if="day.entries.length > 3" :text="'+' + (day.entries.length - 3)"></span>
               </span>
             </button>
-            <button :if="view !== 'month'" class="calendar-day-add" :aria-label="'New event on ' + day.label" @click="openNewEvent(day.day)"><span class="mail-icon" data-icon="plus" aria-hidden="true"></span></button>
+            <button :if="view !== 'month' && canCreateEvent" class="calendar-day-add" :aria-label="'New event on ' + day.label" @click="openNewEvent(day.day)"><span class="mail-icon" data-icon="plus" aria-hidden="true"></span></button>
           </div>
           <ul class="calendar-day-entries">
             <li :for="entry in day.entries">
@@ -187,12 +236,13 @@ onUnmounted(() => { destroy(); destroyReminders() })
       <button type="button" class="wm-action" :aria-pressed="editorOccurrence" :disabled="editorBusy" @click="showEventScope(true)">This occurrence</button>
       <button type="button" class="wm-action" :aria-pressed="!editorOccurrence" :disabled="editorBusy" @click="showEventScope(false)">Entire series</button>
     </div>
-    <p :if="editorReadOnly" class="calendar-editor-state">This exception also changes later dates. Use CalDAV to edit it.</p>
+    <p :if="editorViewer" class="calendar-editor-state">You have view access to this calendar.</p>
+    <p :if="editorProtectedOccurrence && !editorViewer" class="calendar-editor-state">This exception also changes later dates. Use CalDAV to edit it.</p>
     <fieldset :if="editorLoaded" :disabled="editorBusy || editorConflict || editorReadOnly" class="calendar-editor-fields">
       <label>Title<input x-model="editorTitle" maxlength="512" required autofocus></label>
       <label :if="editingId === null">Calendar
         <select aria-label="Calendar" :value="editorCalendar" @change="editorCalendar.set($event.target.value)">
-          <option :for="item in calendars" :value="item.id" :text="item.name"></option>
+          <option :for="item in writableCalendars" :value="item.id" :text="item.name"></option>
         </select>
       </label>
       <div :if="editorScheduleEditable" class="calendar-editor-time">
@@ -246,7 +296,7 @@ onUnmounted(() => { destroy(); destroyReminders() })
       <p :if="confirmDelete" class="calendar-delete-confirm" role="status" :text="editorRecurring ? 'Delete this series and all of its occurrences?' : editorOccurrence ? 'Delete this occurrence?' : 'Delete this event?'"></p>
       <button :if="confirmDelete" type="button" class="wm-action calendar-delete" @click="deleteEvent()" :disabled="editorBusy || editorConflict">Confirm deletion</button>
       <button :if="confirmDelete" type="button" class="wm-action" @click="confirmDelete.set(false)" :disabled="editorBusy">Keep event</button>
-      <button :if="!confirmDelete" type="button" class="wm-action" @click="closeEditor()" :disabled="editorBusy">Cancel</button>
+      <button :if="!confirmDelete" type="button" class="wm-action" @click="closeEditor()" :disabled="editorBusy" :text="editorViewer ? 'Close' : 'Cancel'"></button>
     </div>
   </form>
 </dialog>

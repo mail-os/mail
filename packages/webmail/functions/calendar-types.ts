@@ -4,6 +4,23 @@ export interface Calendar {
   color: string | null
 }
 
+export type CalendarAccess = 'viewer' | 'editor' | 'free_busy'
+
+export interface CalendarShare {
+  team: string
+  source: string
+  grantee: string
+  calendarId: number
+  calendarName: string
+  access: CalendarAccess
+}
+
+export const calendarAccessLabels = {
+  viewer: 'View events',
+  editor: 'Edit events',
+  free_busy: 'Free/busy only',
+}
+
 export interface CalendarEvent {
   id: number
   calendar_id: number
