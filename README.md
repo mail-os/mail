@@ -145,16 +145,42 @@ mail serve --validate-only
 
 ### `mail user`
 
-Remote user management via AWS SSM.
+Credential commands connect through OpenSSH to an explicit mail host. They
+prompt without echo on a terminal or read the first password line from stdin.
 
 ```bash
-mail user create <email> [--password <pass>] [--instance-id <id>] [--env <env>]
+mail user create <email> --ssh-target mail-admin
+mail user verify <username> --ssh-target mail-admin --password-stdin
+mail user change-password <username> --ssh-target mail-admin --password-stdin
+```
+
+Configure key or agent authentication and verify the host key in OpenSSH before
+running these commands. The default installation directory is `/opt/mail`.
+Use `--remote-dir` for a different absolute directory and `--ssh-config` for an
+alternate OpenSSH config. The remote command needs access to the live Mail
+database. Installations with a separate service account can use
+`--run-as mail-server` with an SSH account authorized for noninteractive sudo.
+Keep sudo stdin logging disabled for these credential commands. Update the
+target's Mail binary before the operator CLI so both support the SSH credential
+stream.
+
+On an SSM-only host, configure [SSH through Session Manager](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-getting-started-enable-ssh-connections.html).
+Pass the configured instance host with `--instance-id` or set `MAIL_INSTANCE_ID`
+to that host. Mail transfers the password inside the SSH stream. If the
+connection fails during a rotation, verify the current credential before
+retrying.
+
+Existing explicit password arguments still work on the invoking machine.
+They remain visible in its process arguments and shell history. Use stdin or
+the prompt for unattended or interactive credential input, respectively.
+
+The remaining remote commands use AWS SSM Run Command.
+
+```bash
 mail user delete <username> [--instance-id <id>] [--env <env>]
 mail user disable <username> [--instance-id <id>] [--env <env>]
 mail user enable <username> [--instance-id <id>] [--env <env>]
 mail user info <username> [--instance-id <id>] [--env <env>]
-mail user verify <username> <password> [--instance-id <id>] [--env <env>]
-mail user change-password <username> <password> [--instance-id <id>] [--env <env>]
 ```
 
 ### `mail user:local`
@@ -178,9 +204,7 @@ For creation with a password from stdin, set the email address with `--email`.
 
 Pass `--force` to rotate an existing mailbox password. The rotation revokes
 browser sessions and pending reset links for that mailbox. The remote
-`mail user change-password` command passes `--force` on the server. For a
-no-echo password prompt during remote administration, run `mail user:local`
-on the mail host.
+`mail user change-password` command passes `--force` on the selected host.
 
 ### `mail migrate`
 

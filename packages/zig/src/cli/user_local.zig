@@ -6,77 +6,7 @@ const auth = @import("../auth/auth.zig");
 const env = @import("../core/env.zig");
 const recovery = @import("../api/webmail_recovery.zig");
 
-const max_input_password_bytes = 4096;
-const PasswordInput = [max_input_password_bytes + 1]u8;
-const password_input_signals = [_]std.posix.SIG{ .HUP, .INT, .QUIT, .TERM, .TSTP };
-var saved_terminal: std.posix.termios = undefined;
-
-fn restoreTerminalOnSignal(signal: std.posix.SIG) callconv(.c) void {
-    _ = std.c.tcsetattr(std.posix.STDIN_FILENO, .NOW, &saved_terminal);
-    std.c._exit(@intCast(128 + @backingInt(signal)));
-}
-
-fn readPasswordLine(buffer: *PasswordInput) ![]const u8 {
-    var length: usize = 0;
-    var byte: [1]u8 = undefined;
-    defer std.crypto.secureZero(u8, &byte);
-    while (try std.posix.read(std.posix.STDIN_FILENO, &byte) != 0 and byte[0] != '\n') {
-        if (length == buffer.len) return error.PasswordTooLong;
-        buffer[length] = byte[0];
-        length += 1;
-    }
-    if (length > 0 and buffer[length - 1] == '\r') length -= 1;
-    if (length > max_input_password_bytes) return error.PasswordTooLong;
-    if (length == 0) return error.EmptyPassword;
-    return buffer[0..length];
-}
-
-fn promptPassword(buffer: *PasswordInput, prompt: []const u8) ![]const u8 {
-    const stdin = std.posix.STDIN_FILENO;
-    if (std.c.isatty(stdin) == 0) return readPasswordLine(buffer);
-
-    saved_terminal = try std.posix.tcgetattr(stdin);
-    const action = std.posix.Sigaction{
-        .handler = .{ .handler = restoreTerminalOnSignal },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    var previous: [password_input_signals.len]std.posix.Sigaction = undefined;
-    for (password_input_signals, &previous) |signal, *old| std.posix.sigaction(signal, &action, old);
-    defer for (password_input_signals, &previous) |signal, *old| std.posix.sigaction(signal, old, null);
-
-    var hidden = saved_terminal;
-    hidden.lflag.ECHO = false;
-    hidden.lflag.ECHONL = false;
-    try std.posix.tcsetattr(stdin, .FLUSH, hidden);
-    defer std.posix.tcsetattr(stdin, .NOW, saved_terminal) catch {};
-
-    std.debug.print("{s}: ", .{prompt});
-    defer std.debug.print("\n", .{});
-    return readPasswordLine(buffer);
-}
-
-fn passwordInput(ctx: *cli.BaseCommand.ParseContext, provided: ?[]const u8, buffer: *PasswordInput, prompt: []const u8) ![]const u8 {
-    if (provided) |password| {
-        if (ctx.hasOption("password-stdin")) {
-            std.debug.print("Error: supply a password argument or --password-stdin\n", .{});
-            return error.ConflictingPasswordSources;
-        }
-        return password;
-    }
-    return promptPassword(buffer, prompt) catch |err| {
-        switch (err) {
-            error.EmptyPassword => std.debug.print("Error: standard input did not contain a password\n", .{}),
-            error.PasswordTooLong => std.debug.print("Error: password exceeds {d} bytes\n", .{max_input_password_bytes}),
-            else => {},
-        }
-        return err;
-    };
-}
-
-fn addPasswordStdinOption(cmd: *cli.BaseCommand) !void {
-    _ = try cmd.addOption(cli.Option.init("password-stdin", "password-stdin", "Read one password line from standard input", .bool));
-}
+const password_input = @import("password_input.zig");
 
 fn withDb(comptime action: fn (*cli.BaseCommand.ParseContext, *database.Database, *auth.AuthBackend) anyerror!void) cli.BaseCommand.CommandAction {
     return struct {
@@ -98,9 +28,9 @@ fn createAction(ctx: *cli.BaseCommand.ParseContext, _: *database.Database, auth_
         return error.MissingArgument;
     };
 
-    var input: PasswordInput = undefined;
+    var input: password_input.Buffer = undefined;
     defer std.crypto.secureZero(u8, &input);
-    const password = try passwordInput(ctx, ctx.getOption("password") orelse ctx.getArgument(1), &input, "New password");
+    const password = try password_input.read(ctx, ctx.getOption("password") orelse ctx.getArgument(1), &input, "New password");
 
     const email = ctx.getOption("email") orelse ctx.getArgument(2);
     const derived = if (email == null and std.mem.indexOfScalar(u8, username, '@') == null)
@@ -108,7 +38,8 @@ fn createAction(ctx: *cli.BaseCommand.ParseContext, _: *database.Database, auth_
     else
         null;
     defer if (derived) |address| ctx.allocator.free(address);
-    try user_cli.createUser(auth_backend, username, password, email orelse derived orelse username);
+    const created = try user_cli.createUser(auth_backend, username, password, email orelse derived orelse username);
+    if (!created and ctx.hasOption("remote-stdin")) return error.UserAlreadyExists;
 }
 
 fn deleteAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Database, _: *auth.AuthBackend) !void {
@@ -149,10 +80,11 @@ fn verifyAction(ctx: *cli.BaseCommand.ParseContext, _: *database.Database, auth_
         std.debug.print("Error: username is required\nUsage: mail user:local verify <username> [<password> | --password-stdin]\n", .{});
         return error.MissingArgument;
     };
-    var input: PasswordInput = undefined;
+    var input: password_input.Buffer = undefined;
     defer std.crypto.secureZero(u8, &input);
-    const password = try passwordInput(ctx, ctx.getArgument(1), &input, "Password");
-    try user_cli.verifyUser(auth_backend, username, password);
+    const password = try password_input.read(ctx, ctx.getArgument(1), &input, "Password");
+    const valid = try user_cli.verifyUser(auth_backend, username, password);
+    if (!valid and ctx.hasOption("remote-stdin")) return error.InvalidCredentials;
 }
 
 /// Whether `change-password` may replace a password that is already set.
@@ -192,9 +124,9 @@ fn changePasswordAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Databa
     // and the answer is the same whichever way the password was passed.
     if (!force) return replacePassword(auth_backend, username, "", false);
 
-    var input: PasswordInput = undefined;
+    var input: password_input.Buffer = undefined;
     defer std.crypto.secureZero(u8, &input);
-    const password = try passwordInput(ctx, ctx.getArgument(1), &input, "New password");
+    const password = try password_input.read(ctx, ctx.getArgument(1), &input, "New password");
 
     var user = db.getUserByUsername(username) catch |err| {
         if (err == database.DatabaseError.NotFound) std.debug.print("Error: user '{s}' not found\n", .{username});
@@ -243,7 +175,7 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
         cli.Option.init("email", "email", "Email address (defaults to the username or username@DOMAIN)", .string)
             .withShort('e'),
     );
-    try addPasswordStdinOption(create_cmd);
+    try password_input.addRemoteOption(create_cmd);
     _ = create_cmd.setAction(withDb(createAction));
     _ = try cmd.addCommand(create_cmd);
 
@@ -275,7 +207,7 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     const verify_cmd = try cli.BaseCommand.init(allocator, "verify", "Verify user credentials");
     _ = try verify_cmd.addArgument(cli.Argument.init("username", "Username", .string));
     _ = try verify_cmd.addArgument(cli.Argument.init("password", "Password (omit to read standard input)", .string).withRequired(false));
-    try addPasswordStdinOption(verify_cmd);
+    try password_input.addRemoteOption(verify_cmd);
     _ = verify_cmd.setAction(withDb(verifyAction));
     _ = try cmd.addCommand(verify_cmd);
 
@@ -283,7 +215,7 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     const change_pw_cmd = try cli.BaseCommand.init(allocator, "change-password", "Change user password");
     _ = try change_pw_cmd.addArgument(cli.Argument.init("username", "Username", .string));
     _ = try change_pw_cmd.addArgument(cli.Argument.init("password", "New password (omit to read standard input)", .string).withRequired(false));
-    try addPasswordStdinOption(change_pw_cmd);
+    try password_input.addRemoteOption(change_pw_cmd);
     _ = try change_pw_cmd.addOption(
         cli.Option.init("force", "force", "Replace the existing password (required: without it the command refuses)", .bool),
     );

@@ -95,7 +95,9 @@ jobs:
         python3 ../../scripts/test-eas-sync-state.py zig-out/bin/mail
 
     - name: Verify user CLI password input and rotation
-      run: python3 ../../scripts/test-user-cli.py zig-out/bin/mail
+      run: |
+        python3 ../../scripts/test-user-cli.py zig-out/bin/mail
+        python3 ../../scripts/test-remote-user-cli.py zig-out/bin/mail
 
     - name: Verify malware scanning across mail and client intake
       run: |

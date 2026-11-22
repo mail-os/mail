@@ -13,14 +13,14 @@ import tempfile
 import termios
 
 
-def check_terminal(command, secret, directory, env, *, cancel=False):
+def check_terminal(command, secret, directory, env, *, cancel=False, prompt=b"password: "):
     master, terminal = pty.openpty()
     original = termios.tcgetattr(terminal)
     try:
         with subprocess.Popen(command, stdin=terminal, stderr=terminal, stdout=terminal, cwd=directory, env=env) as child:
             try:
                 output = b""
-                while b"password: " not in output.lower():
+                while prompt not in output.lower():
                     ready, _, _ = select.select([master], [], [], 5)
                     assert ready, output
                     output += os.read(master, 4096)

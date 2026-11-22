@@ -2,6 +2,8 @@ const std = @import("std");
 const cli = @import("zig-cli");
 const io_compat = @import("../core/io_compat.zig");
 
+const password_input = @import("password_input.zig");
+
 const USER_CLI_PATH = "/opt/mail/mail";
 
 // ============================================================================
@@ -153,16 +155,6 @@ fn buildRemoteParams(allocator: std.mem.Allocator, args: []const []const u8) ![]
     return try allocator.dupe(u8, cmd_parts.items);
 }
 
-fn generatePassword(allocator: std.mem.Allocator) ![]const u8 {
-    const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%&*";
-    var password: [24]u8 = undefined;
-    io_compat.getIo().random(&password);
-    for (&password) |*byte| {
-        byte.* = charset[byte.* % charset.len];
-    }
-    return try allocator.dupe(u8, &password);
-}
-
 fn writeStdout(msg: []const u8) void {
     var buf: [4096]u8 = undefined;
     var file_writer = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &buf);
@@ -182,41 +174,6 @@ fn printStdout(comptime fmt: []const u8, args: anytype) void {
 // ============================================================================
 // Command Actions
 // ============================================================================
-
-fn createAction(ctx: *cli.BaseCommand.ParseContext) !void {
-    const allocator = ctx.allocator;
-    const email = ctx.getArgument(0) orelse {
-        std.debug.print("Error: email address is required\nUsage: mail user create <email> [--password <pw>]\n", .{});
-        return;
-    };
-
-    const instance_id = try getInstanceId(ctx, allocator);
-    const password = ctx.getOption("password") orelse try generatePassword(allocator);
-
-    const username = if (std.mem.indexOf(u8, email, "@")) |at_pos|
-        email[0..at_pos]
-    else
-        email;
-
-    const remote_params = try buildRemoteParams(allocator, &.{ "user:local", "create", username, password, email });
-    defer allocator.free(remote_params);
-
-    printStdout("Creating user {s}...\n", .{email});
-    const result = try runRemoteCommand(allocator, instance_id, remote_params);
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    if (result.success) {
-        printStdout("User created successfully!\n", .{});
-        printStdout("  Email:    {s}\n", .{email});
-        printStdout("  Username: {s}\n", .{username});
-        printStdout("  Password: {s}\n", .{password});
-    } else {
-        std.debug.print("Failed to create user:\n", .{});
-        if (result.stderr.len > 0) std.debug.print("{s}", .{result.stderr});
-        if (result.stdout.len > 0) writeStdout(result.stdout);
-    }
-}
 
 fn deleteAction(ctx: *cli.BaseCommand.ParseContext) !void {
     const allocator = ctx.allocator;
@@ -317,62 +274,138 @@ fn infoAction(ctx: *cli.BaseCommand.ParseContext) !void {
     }
 }
 
-fn verifyAction(ctx: *cli.BaseCommand.ParseContext) !void {
-    const allocator = ctx.allocator;
-    const username = ctx.getArgument(0) orelse {
-        std.debug.print("Error: username is required\nUsage: mail user verify <username> <password>\n", .{});
-        return;
-    };
-    const password = ctx.getArgument(1) orelse {
-        std.debug.print("Error: password is required\nUsage: mail user verify <username> <password>\n", .{});
-        return;
-    };
+const CredentialAction = enum { create, verify, rotate };
 
-    const instance_id = try getInstanceId(ctx, allocator);
-    const remote_params = try buildRemoteParams(allocator, &.{ "user:local", "verify", username, password });
-    defer allocator.free(remote_params);
-
-    const result = try runRemoteCommand(allocator, instance_id, remote_params);
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    if (result.success) {
-        if (result.stdout.len > 0) writeStdout(result.stdout);
-    } else {
-        std.debug.print("Credential verification failed.\n", .{});
-        if (result.stderr.len > 0) std.debug.print("{s}", .{result.stderr});
+fn credentialTarget(ctx: *cli.BaseCommand.ParseContext) ![]const u8 {
+    const host = ctx.getOption("ssh-target");
+    const instance = ctx.getOption("instance-id");
+    if (host != null and instance != null) {
+        std.debug.print("Error: specify one of --ssh-target or --instance-id\n", .{});
+        return error.ConflictingTargets;
     }
+    const configured = if (std.c.getenv("MAIL_INSTANCE_ID")) |value| std.mem.sliceTo(value, 0) else "";
+    const target = host orelse instance orelse configured;
+    if (target.len == 0) {
+        std.debug.print("Error: specify --ssh-target, --instance-id, or MAIL_INSTANCE_ID for credential operations\n", .{});
+        return error.MissingSshTarget;
+    }
+    if (target[0] == '-') return error.InvalidSshTarget;
+    for (target) |c| {
+        if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, "._-@:+[]", c) == null)
+            return error.InvalidSshTarget;
+    }
+    return target;
 }
 
-fn changePasswordAction(ctx: *cli.BaseCommand.ParseContext) !void {
-    const allocator = ctx.allocator;
-    const username = ctx.getArgument(0) orelse {
-        std.debug.print("Error: username is required\nUsage: mail user change-password <username> <password>\n", .{});
-        return;
-    };
-    const password = ctx.getArgument(1) orelse {
-        std.debug.print("Error: password is required\nUsage: mail user change-password <username> <password>\n", .{});
-        return;
-    };
-
-    const instance_id = try getInstanceId(ctx, allocator);
-    // An operator typing `mail user change-password` is the reset the local
-    // command's --force exists for.
-    const remote_params = try buildRemoteParams(allocator, &.{ "user:local", "change-password", username, password, "--force" });
-    defer allocator.free(remote_params);
-
-    printStdout("Changing password for {s}...\n", .{username});
-    const result = try runRemoteCommand(allocator, instance_id, remote_params);
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-
-    if (result.success) {
-        printStdout("Password changed successfully for user '{s}'.\n", .{username});
-    } else {
-        std.debug.print("Failed to change password:\n", .{});
-        if (result.stderr.len > 0) std.debug.print("{s}", .{result.stderr});
-        if (result.stdout.len > 0) writeStdout(result.stdout);
+/// ssh passes the remote command to a shell. Quote each public operand,
+/// including apostrophes in mailbox names and paths.
+fn appendShellArg(a: std.mem.Allocator, command: *std.ArrayList(u8), value: []const u8) !void {
+    try command.appendSlice(a, " '");
+    for (value) |byte| {
+        if (byte == 39) try command.appendSlice(a, "'\\''") else try command.append(a, byte);
     }
+    try command.append(a, 39);
+}
+
+fn sendCredential(io: std.Io, stdin: std.Io.File, password: []const u8) !void {
+    const ignore = std.posix.Sigaction{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    var previous: std.posix.Sigaction = undefined;
+    std.posix.sigaction(.PIPE, &ignore, &previous);
+    defer std.posix.sigaction(.PIPE, &previous, null);
+    try stdin.writeStreamingAll(io, password);
+    // The receiver removes this CR. Any CR already in the password survives.
+    try stdin.writeStreamingAll(io, "\r\n");
+}
+
+fn credentialAction(comptime operation: CredentialAction) cli.BaseCommand.CommandAction {
+    return struct {
+        fn run(ctx: *cli.BaseCommand.ParseContext) !void {
+            const a = ctx.allocator;
+            const target = try credentialTarget(ctx);
+            const account = ctx.getArgument(0) orelse return error.MissingArgument;
+            const username = if (operation == .create)
+                account[0 .. std.mem.indexOfScalar(u8, account, '@') orelse account.len]
+            else
+                account;
+            if (username.len == 0 or username[0] == '-') return error.InvalidUsername;
+            const dir = ctx.getOption("remote-dir") orelse "/opt/mail";
+            if (!std.fs.path.isAbsolute(dir)) return error.InvalidRemoteDirectory;
+
+            var command: std.ArrayList(u8) = .empty;
+            defer command.deinit(a);
+            try command.appendSlice(a, "cd");
+            try appendShellArg(a, &command, dir);
+            try command.appendSlice(a, " || exit 1; " ++
+                "if [ -f ./mail-server ] && [ -x ./mail-server ]; then binary=./mail-server; " ++
+                "else binary=./mail; fi; exec");
+            if (ctx.getOption("run-as")) |remote_user| {
+                if (remote_user.len == 0 or remote_user[0] == '-') return error.InvalidRemoteUser;
+                try command.appendSlice(a, " sudo -n -u");
+                try appendShellArg(a, &command, remote_user);
+                try command.appendSlice(a, " --");
+            }
+            try command.appendSlice(a, " \"$binary\" user:local ");
+            try command.appendSlice(a, switch (operation) {
+                .create => "create",
+                .verify => "verify",
+                .rotate => "change-password",
+            });
+            try appendShellArg(a, &command, username);
+            try command.appendSlice(a, " --remote-stdin");
+            switch (operation) {
+                .create => {
+                    try command.appendSlice(a, " --email");
+                    try appendShellArg(a, &command, account);
+                },
+                .verify => {},
+                // This action is an explicit operator reset, as in the SSM CLI.
+                .rotate => try command.appendSlice(a, " --force"),
+            }
+
+            var argv: std.ArrayList([]const u8) = .empty;
+            defer argv.deinit(a);
+            try argv.appendSlice(a, &.{ "ssh", "-T", "-S", "none", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10", "-o", "StdinNull=no" });
+            if (ctx.getOption("ssh-config")) |path| try argv.appendSlice(a, &.{ "-F", path });
+            try argv.appendSlice(a, &.{ "--", target, command.items });
+
+            const prompt = try std.fmt.allocPrint(a, "{s} for {s} on {s}", .{ if (operation == .verify) "Password" else "New password", account, target });
+            defer a.free(prompt);
+            var input: password_input.Buffer = undefined;
+            defer std.crypto.secureZero(u8, &input);
+            const supplied = if (operation == .create) ctx.getOption("password") else ctx.getArgument(1);
+            const password = try password_input.read(ctx, supplied, &input, prompt);
+            try password_input.validateForwarded(password);
+
+            const io = io_compat.getIo();
+            var child = try std.process.spawn(io, .{ .argv = argv.items, .stdin = .pipe });
+            defer child.kill(io);
+            const stdin = child.stdin.?;
+            const sent = sendCredential(io, stdin, password);
+            stdin.close(io);
+            child.stdin = null;
+            std.crypto.secureZero(u8, &input);
+            const term = try child.wait(io);
+            switch (term) {
+                .exited => |code| {
+                    if (code == 0) return sent;
+                    if (code != 255) return error.RemoteCredentialCommandFailed;
+                },
+                else => {},
+            }
+            std.debug.print("SSH connection to {s} failed. Check the remote outcome before retrying.\n", .{target});
+            return error.SshCredentialConnectionFailed;
+        }
+    }.run;
+}
+
+fn addCredentialOptions(cmd: *cli.BaseCommand) !void {
+    _ = try cmd.addOption(cli.Option.init("ssh-target", "ssh-target", "OpenSSH host or user@host", .string));
+    _ = try cmd.addOption(cli.Option.init("instance-id", "instance-id", "EC2 instance ID configured in OpenSSH", .string));
+    _ = try cmd.addOption(cli.Option.init("ssh-config", "ssh-config", "Path to an alternate OpenSSH config", .string));
+    _ = try cmd.addOption(cli.Option.init("remote-dir", "remote-dir", "Absolute Mail directory on the host (default: /opt/mail)", .string));
+    _ = try cmd.addOption(cli.Option.init("run-as", "run-as", "Remote operating-system account to select with noninteractive sudo", .string));
+    _ = try cmd.addOption(cli.Option.init("env", "env", "Legacy environment label", .string));
+    try password_input.addOption(cmd);
 }
 
 // ============================================================================
@@ -390,17 +423,17 @@ fn addCommonOptions(cmd: *cli.BaseCommand) !void {
 }
 
 pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
-    const user_cmd = try cli.BaseCommand.init(allocator, "user", "Remote user management commands (via SSM)");
+    const user_cmd = try cli.BaseCommand.init(allocator, "user", "Remote user management via SSH and SSM");
 
     // user create
     const create_cmd = try cli.BaseCommand.init(allocator, "create", "Create a new mail user");
     _ = try create_cmd.addArgument(cli.Argument.init("email", "Email address for the new user", .string));
     _ = try create_cmd.addOption(
-        cli.Option.init("password", "password", "Password (auto-generated if not provided)", .string)
+        cli.Option.init("password", "password", "Legacy password argument (omit to read standard input)", .string)
             .withShort('p'),
     );
-    try addCommonOptions(create_cmd);
-    _ = create_cmd.setAction(createAction);
+    try addCredentialOptions(create_cmd);
+    _ = create_cmd.setAction(credentialAction(.create));
     _ = try user_cmd.addCommand(create_cmd);
 
     // user delete
@@ -434,17 +467,17 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     // user verify
     const verify_cmd = try cli.BaseCommand.init(allocator, "verify", "Verify user credentials");
     _ = try verify_cmd.addArgument(cli.Argument.init("username", "Username to verify", .string));
-    _ = try verify_cmd.addArgument(cli.Argument.init("password", "Password to verify", .string));
-    try addCommonOptions(verify_cmd);
-    _ = verify_cmd.setAction(verifyAction);
+    _ = try verify_cmd.addArgument(cli.Argument.init("password", "Password to verify (omit to read standard input)", .string).withRequired(false));
+    try addCredentialOptions(verify_cmd);
+    _ = verify_cmd.setAction(credentialAction(.verify));
     _ = try user_cmd.addCommand(verify_cmd);
 
     // user change-password
     const change_pw_cmd = try cli.BaseCommand.init(allocator, "change-password", "Change user password");
     _ = try change_pw_cmd.addArgument(cli.Argument.init("username", "Username", .string));
-    _ = try change_pw_cmd.addArgument(cli.Argument.init("password", "New password", .string));
-    try addCommonOptions(change_pw_cmd);
-    _ = change_pw_cmd.setAction(changePasswordAction);
+    _ = try change_pw_cmd.addArgument(cli.Argument.init("password", "New password (omit to read standard input)", .string).withRequired(false));
+    try addCredentialOptions(change_pw_cmd);
+    _ = change_pw_cmd.setAction(credentialAction(.rotate));
     _ = try user_cmd.addCommand(change_pw_cmd);
 
     return user_cmd;
