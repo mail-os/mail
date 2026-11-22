@@ -111,6 +111,7 @@ jobs:
         python3 ../../scripts/test-webmail-calendar-shares.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-calendar-day-labels.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-calendar-free-time.py zig-out/bin/mail
+        python3 ../../scripts/test-webmail-calendar-tasks.py zig-out/bin/mail
         python3 ../../scripts/test-mailbox-export.py zig-out/bin/mail
         python3 ../../scripts/test-mail-import.py zig-out/bin/mail
         python3 ../../scripts/test-imap-internaldate.py zig-out/bin/mail

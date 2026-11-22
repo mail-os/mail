@@ -19,6 +19,8 @@ const {
   showDayLabels, showDayLabelEditor, hasDayLabels, labelOnDate, currentDayLabel, canEditDayLabel, editingDayLabel,
   dayLabelDraft, dayLabelSaving, dayLabelConflict, dayLabelError, dayLabelNotice, dayLabelsUnavailable,
   startDayLabel, cancelDayLabel, saveDayLabel,
+  taskPanelOpen, tasksReady, taskBusy, taskError, taskConflict, taskNotice, showCompletedTasks, taskEditor, taskTitle, taskDay,
+  confirmTaskRemoval, visibleTasks, closeTasks, loadTasks, startTaskEdit, cancelTaskEdit, showTasks, saveTask, setTaskCompleted, taskDateLabel,
   freeTimeOpen, freeTimeDate, freeTimeStart, freeTimeEnd, freeTimeMinutes, freeTimeIncludeOwned, freeTimeBusy,
   freeTimeDurations, freeTimeCanIncludeOwned, freeTimeScope, freeTimeResults, freeTimeError, toggleFreeTime, findFreeTime,
   refresh, selectCalendar, showView, shiftView, goToToday, showDay, changeDate, changeZone, calendarEventDate,
@@ -42,6 +44,38 @@ const dayHeading = useRef('dayHeading')
 const labelField = useRef('labelField')
 const labelTrigger = useRef('labelTrigger')
 const freeTimeDateField = useRef('freeTimeDateField')
+const taskHeading = useRef('taskHeading')
+const taskTitleField = useRef('taskTitleField')
+const taskDeleteButton = useRef('taskDeleteButton')
+function changeTaskPanel() {
+  if (taskPanelOpen()) closeTasks()
+  else {
+    void loadTasks()
+    nextTick(() => taskHeading.current?.focus())
+  }
+}
+async function reloadTasks() {
+  await loadTasks()
+  nextTick(() => taskHeading.current?.focus())
+}
+function editTask(task = null) {
+  startTaskEdit(task)
+  nextTick(() => taskTitleField.current?.focus())
+}
+function closeTaskEdit() {
+  cancelTaskEdit()
+  nextTick(() => taskHeading.current?.focus())
+}
+function askToDeleteTask() {
+  confirmTaskRemoval.set(true)
+  nextTick(() => taskDeleteButton.current?.focus())
+}
+async function submitTask(remove = false) {
+  if (await saveTask(remove)) nextTick(() => taskHeading.current?.focus())
+}
+async function toggleTaskCompletion(task) {
+  if (await setTaskCompleted(task)) nextTick(() => taskHeading.current?.focus())
+}
 function changeFreeTimePanel() {
   toggleFreeTime()
   if (freeTimeOpen()) nextTick(() => freeTimeDateField.current?.focus())
@@ -86,15 +120,54 @@ onUnmounted(() => { destroy(); destroyReminders() })
   <header class="calendar-header">
     <div class="calendar-heading"><span class="mail-app-mark"><span class="mail-icon" data-icon="calendar" aria-hidden="true"></span></span><h1>Calendar</h1></div>
     <div :if="account" class="calendar-choices">
+      <button :if="!selectedShare" type="button" class="wm-action" :aria-expanded="taskPanelOpen" aria-controls="calendar-tasks" :disabled="taskBusy" @click="changeTaskPanel()"><span class="mail-icon" data-icon="checklist" aria-hidden="true"></span>Tasks</button>
       <button class="wm-action" @click="toggleCalendarSettings()" :disabled="loading && !calendarSettings" :aria-expanded="calendarSettings" aria-controls="calendar-settings"><span class="mail-icon" data-icon="settings" aria-hidden="true"></span>Manage calendars</button>
       <button class="wm-action" @click="toggleImport()" :disabled="importBusy" :aria-expanded="importOpen" aria-controls="calendar-import"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Import .ics</button>
       <a :if="calendarExport" class="wm-action" :href="calendarExport"><span class="mail-icon" data-icon="download" aria-hidden="true"></span>Download .ics</a>
       <button :if="canCreateEvent" class="wm-action calendar-primary" @click="openNewEvent()"><span class="mail-icon" data-icon="plus" aria-hidden="true"></span>New event</button>
     </div>
   </header>
+  <section :if="taskPanelOpen && !selectedShare" id="calendar-tasks" class="calendar-tasks" aria-labelledby="calendar-tasks-heading">
+    <div class="calendar-tasks-heading">
+      <h2 id="calendar-tasks-heading" tabindex="-1" ref="taskHeading">Personal tasks</h2>
+      <div :if="tasksReady" class="calendar-choices calendar-view-modes calendar-task-status" role="group" aria-label="Task status">
+        <button type="button" class="wm-action" :aria-pressed="!showCompletedTasks" :disabled="taskBusy || taskEditor" @click="showTasks(false)">Open</button>
+        <button type="button" class="wm-action" :aria-pressed="showCompletedTasks" :disabled="taskBusy || taskEditor" @click="showTasks(true)">Completed</button>
+      </div>
+      <button :if="tasksReady && !taskEditor" type="button" class="wm-action calendar-primary" :disabled="taskBusy || taskConflict" @click="editTask()"><span class="mail-icon" data-icon="plus" aria-hidden="true"></span>Add task</button>
+    </div>
+    <p :if="taskBusy && !tasksReady" class="calendar-task-empty" role="status">Loading tasks…</p>
+    <p :if="taskError" class="calendar-label-error" role="alert" :text="taskError"></p>
+    <button :if="taskConflict || (taskError && !tasksReady)" type="button" class="wm-action" :disabled="taskBusy" @click="reloadTasks()">Load latest tasks</button>
+    <form :if="taskEditor" class="calendar-task-form" aria-label="Task details" @submit.prevent="submitTask()">
+      <label>Task title<input ref="taskTitleField" type="text" x-model="taskTitle" :disabled="taskBusy" autocomplete="off" maxlength="240" required></label>
+      <label>Date (optional)<input type="date" x-model="taskDay" :disabled="taskBusy" min="0001-01-01" max="9999-12-31"></label>
+      <div class="calendar-task-actions">
+        <button type="submit" class="wm-action calendar-primary" :disabled="taskBusy || taskConflict" :text="taskEditor.task ? 'Save task' : 'Add task'"></button>
+        <button type="button" class="wm-action" :disabled="taskBusy" @click="closeTaskEdit()">Cancel</button>
+        <button :if="taskEditor.task && !confirmTaskRemoval" type="button" class="wm-action wm-action--danger" :disabled="taskBusy || taskConflict" @click="askToDeleteTask()">Delete task</button>
+        <button :if="confirmTaskRemoval" type="button" class="wm-action wm-action--danger" ref="taskDeleteButton" :disabled="taskBusy || taskConflict" @click="submitTask(true)">Confirm deletion</button>
+      </div>
+    </form>
+    <ul :if="visibleTasks.length" class="calendar-task-list" aria-label="Tasks" :aria-busy="taskBusy">
+      <li :for="task in visibleTasks" :key="task.id">
+        <div class="calendar-task-summary">
+          <strong :text="task.title"></strong>
+          <a :if="task.day && calendars.length" :href="'/calendar?day=' + task.day" :text="taskDateLabel(task.day)"></a>
+          <span :if="!task.day || !calendars.length" :text="taskDateLabel(task.day)"></span>
+        </div>
+        <div class="calendar-task-actions">
+          <button type="button" class="wm-action" :disabled="taskBusy || taskConflict || taskEditor" :aria-label="(task.completed ? 'Reopen ' : 'Complete ') + task.title" @click="toggleTaskCompletion(task)"><span :if="!task.completed" class="mail-icon" data-icon="check" aria-hidden="true"></span><span :text="task.completed ? 'Reopen' : 'Complete'"></span></button>
+          <button type="button" class="wm-action" :disabled="taskBusy || taskConflict || taskEditor" :aria-label="'Edit ' + task.title" @click="editTask(task)">Edit</button>
+        </div>
+      </li>
+    </ul>
+    <p :if="tasksReady && !visibleTasks.length && !taskEditor" class="calendar-task-empty" :text="showCompletedTasks ? 'No completed tasks.' : 'No open tasks.'"></p>
+    <p class="wm-a11y-text" role="status" :text="taskNotice"></p>
+  </section>
   <div :if="error" class="login-error" role="alert"><span :text="error"></span> <button class="wm-action" @click="refresh()">Retry</button></div>
   <p :if="shareNotice" class="calendar-share-notice" role="status" :text="shareNotice"></p>
-  <p :if="loading" class="calendar-loading" role="status">Loading calendar…</p>
+  <p :if="loading && (!account || (!calendars.length && !sharedCalendars.length))" class="calendar-loading" role="status">Loading calendar…</p>
   <p :if="!loading && !error && !calendars.length && !sharedCalendars.length && !importOpen && !calendarSettings">Create a calendar or import an .ics file to get started.</p>
   <section :if="calendarSettings" id="calendar-settings" class="calendar-import" aria-label="Manage calendars" :aria-busy="calendarSettingsBusy">
     <p :if="waitingMailEvent" role="status">Create a calendar to save an event from this email.</p>
@@ -193,6 +266,7 @@ onUnmounted(() => { destroy(); destroyReminders() })
       </label>
     </div>
 
+    <p :if="loading" class="calendar-loading" role="status">Loading calendar…</p>
     <section :if="freeTimeOpen && (calendars.length || selectedShare)" id="calendar-free-time" class="calendar-free-time" aria-labelledby="calendar-free-time-heading" :aria-busy="freeTimeBusy">
       <div class="calendar-free-time-heading">
         <h2 id="calendar-free-time-heading">Find free time</h2>

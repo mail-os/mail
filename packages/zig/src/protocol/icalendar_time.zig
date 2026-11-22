@@ -22,6 +22,12 @@ pub const Date = struct {
 
     pub const Kind = enum { date, local, utc };
 
+    pub fn parseCivil(value: []const u8) ?Date {
+        if (value.len != 10 or value[4] != '-' or value[7] != '-') return null;
+        const compact = value[0..4].* ++ value[5..7].* ++ value[8..10].*;
+        return parse(&compact);
+    }
+
     pub fn parse(value: []const u8) ?Date {
         if (value.len != 8 and value.len != 15 and value.len != 16) return null;
         const year = digits(value[0..4]) orelse return null;

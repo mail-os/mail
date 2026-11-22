@@ -16,6 +16,7 @@ import { expandSeries } from './calendar-recurrence'
 import type { CalendarOccurrence } from './calendar-recurrence'
 import { useCalendarEditor } from './use-calendar-editor'
 import { useCalendarDayLabels } from './use-calendar-day-labels'
+import { useCalendarTasks } from './use-calendar-tasks'
 import { useCalendarFreeTime } from './use-calendar-free-time'
 import { useCalendarReminders } from './use-calendar-reminders'
 import type { CalendarDialog } from './use-calendar-editor'
@@ -230,12 +231,14 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     events.set([])
     busyPeriods.set([])
     dayLabels.clearDayLabels()
+    calendarTasks.closeTasks()
     freeTime.clearFreeTimeResults()
     onAuthError()
   })
   const showDayLabels = derived(() => !selectedShare() && !searchTerm() && calendars().length > 0)
   const showDayLabelEditor = derived(() => showDayLabels() && view() === 'day')
   const dayLabels = useCalendarDayLabels(api, focusDay, showDayLabels, showDayLabelEditor)
+  const calendarTasks = useCalendarTasks(api, () => !!account() && !selectedShare())
   const freeTime = useCalendarFreeTime(api, focusDay, displayZone, () => ({
     id: activeCalendar(),
     name: activeCalendar() === null ? 'My calendars' : activeCalendarName(),
@@ -399,6 +402,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     freeTime.clearFreeTimeResults()
     shareNotice.set('')
     activeCalendar.set(id)
+    if (selectedShare()) calendarTasks.closeTasks()
     if (availabilityOnly()) {
       searchTerm.set('')
       searchInput.set('')
@@ -687,6 +691,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     calendarEventDate: (event: CalendarEvent) => calendarEventDate(event, displayZone()),
     ...editor,
     ...dayLabels,
+    ...calendarTasks,
     ...freeTime,
     showDayLabels, showDayLabelEditor,
     ...reminders,
@@ -701,6 +706,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
       settingsRequest?.abort()
       editor.clearEditor()
       dayLabels.clearDayLabels()
+      calendarTasks.closeTasks()
       freeTime.clearFreeTimeResults()
     },
   }

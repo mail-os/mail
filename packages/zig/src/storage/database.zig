@@ -674,6 +674,15 @@ pub const Database = struct {
             \\    revision INTEGER NOT NULL CHECK(revision > 0),
             \\    PRIMARY KEY(user_id,day)
             \\);
+            \\CREATE TABLE IF NOT EXISTS mail_calendar_tasks (
+            \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    title TEXT NOT NULL,
+            \\    day TEXT,
+            \\    completed INTEGER NOT NULL CHECK(completed IN (0,1)),
+            \\    revision INTEGER NOT NULL CHECK(revision > 0)
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mail_calendar_tasks_owner ON mail_calendar_tasks(user_id);
             \\CREATE TABLE IF NOT EXISTS mail_calendar_revisions (
             \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             \\    component TEXT NOT NULL,

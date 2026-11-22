@@ -123,6 +123,11 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   day. Labels follow that civil date across your personal calendar views and
   devices. They stay private to your mailbox and stay outside CalDAV and
   iCalendar data.
+- Open **Tasks** to add a personal task with an optional date. Edit a task to
+  move it or clear its date. Use **Complete** to move it to the Completed list,
+  where you can reopen it. Dates stay the same across display time zones. Tasks
+  are private to the mailbox, do not reserve time, and stay outside CalDAV and
+  calendar exports.
 - Create, edit, and delete events in the browser. The view and editor each have
   a time zone selector. For all-day events, **Last day** includes that date.
 - Recurring dates appear in the calendar using the stored rule, additional
@@ -224,6 +229,12 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   `label` (a single line of up to 80 characters) and `revision`. Use revision 0
   for a date without a saved revision. Send `label: null` to clear a saved label.
   A cleared date retains its revision, and a stale edit returns `409`.
+- `GET /webmail/api/calendar-tasks` returns the mailbox's personal tasks.
+  `POST` creates a task from `title`, `day`, `completed`, and `revision: 0`.
+  The title is a single line of up to 120 characters. The day is `YYYY-MM-DD`
+  or `null`. `PUT /webmail/api/calendar-tasks/{id}` replaces those fields using
+  the current revision, and `DELETE` at that path takes `{ "revision": … }`.
+  A stale edit or deletion returns `409`. The mailbox can hold up to 500 tasks.
 - `GET /webmail/api/calendar-events?start=…&end=…` lists events in a half-open
   range of up to 366 days. The timestamps are Unix seconds. Pass `calendarId`
   to select one calendar or `q` to search stored event text. A nonempty

@@ -13,15 +13,9 @@ pub const Label = struct {
 pub const Edit = struct { label: ?[]const u8, revision: i64 };
 pub const max_label_bytes = 320;
 
-fn civilDate(value: []const u8) ?Date {
-    if (value.len != 10 or value[4] != '-' or value[7] != '-') return null;
-    const compact = value[0..4].* ++ value[5..7].* ++ value[8..10].*;
-    return Date.parse(&compact);
-}
-
 pub fn list(a: std.mem.Allocator, db: *database.Database, mailbox: []const u8, start: []const u8, end: []const u8) ![]Label {
-    const first = civilDate(start) orelse return error.InvalidDayLabelRange;
-    const last = civilDate(end) orelse return error.InvalidDayLabelRange;
+    const first = Date.parseCivil(start) orelse return error.InvalidDayLabelRange;
+    const last = Date.parseCivil(end) orelse return error.InvalidDayLabelRange;
     const distance = last.epoch() - first.epoch();
     if (distance < 0 or distance >= 366 * 86400) return error.InvalidDayLabelRange;
 
@@ -48,7 +42,7 @@ pub fn list(a: std.mem.Allocator, db: *database.Database, mailbox: []const u8, s
 /// Rows retain a revision after clearing, so stale edits cannot restore text
 /// that the owner removed in another tab.
 pub fn save(db: *database.Database, mailbox: []const u8, day: []const u8, edit: Edit) !Label {
-    if (civilDate(day) == null or edit.revision < 0 or edit.revision == std.math.maxInt(i64))
+    if (Date.parseCivil(day) == null or edit.revision < 0 or edit.revision == std.math.maxInt(i64))
         return error.InvalidDayLabel;
     const label = if (edit.label) |value| blk: {
         const trimmed = std.mem.trim(u8, value, " ");

@@ -60,6 +60,7 @@ const message_refs = @import("../storage/message_refs.zig");
 const ascii_compat = @import("ascii-compat");
 const caldav_store = @import("../storage/caldav_store.zig");
 const calendar_day_labels = @import("../storage/calendar_day_labels.zig");
+const calendar_tasks = @import("../storage/calendar_tasks.zig");
 const caldav = @import("../protocol/caldav.zig");
 const calendar_import = @import("webmail_calendar_import.zig");
 const calendar_invite = @import("webmail_calendar_invite.zig");
@@ -576,6 +577,11 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.eql(u8, p, "/webmail/api/calendar-day-labels") and std.mem.eql(u8, req.method, "GET")) return handleCalendarDayLabels(server, conn, arena, req, null);
     const day_label_path = "/webmail/api/calendar-day-labels/";
     if (std.mem.startsWith(u8, p, day_label_path) and std.mem.eql(u8, req.method, "PUT")) return handleCalendarDayLabels(server, conn, arena, req, p[day_label_path.len..]);
+    const task_path = "/webmail/api/calendar-tasks";
+    if (std.mem.eql(u8, p, task_path) and (std.mem.eql(u8, req.method, "GET") or std.mem.eql(u8, req.method, "POST")))
+        return handleCalendarTasks(server, conn, arena, req, null);
+    if (std.mem.startsWith(u8, p, task_path ++ "/") and (std.mem.eql(u8, req.method, "PUT") or std.mem.eql(u8, req.method, "DELETE")))
+        return handleCalendarTasks(server, conn, arena, req, p[(task_path.len + 1)..]);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-timezone") and std.mem.eql(u8, req.method, "GET")) return handleCalendarTimezone(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-free-busy") and std.mem.eql(u8, req.method, "GET")) return handleCalendarFreeBusy(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-reminders") and std.mem.eql(u8, req.method, "GET")) return handleCalendarReminders(server, conn, arena, req);
@@ -1990,6 +1996,42 @@ fn handleCalendarDayLabels(server: *WebmailHttpServer, conn: *webmail_tls.Stream
         else => return err,
     };
     return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .labels = labels }), null);
+}
+
+fn handleCalendarTasks(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request, id_param: ?[]const u8) !void {
+    const reading = std.mem.eql(u8, req.method, "GET");
+    if (!reading and !isSameOrigin(req)) return sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    if (server.dav_store == null) return sendError(conn, arena, 503, "calendar_unavailable", "Calendar is unavailable on this server");
+    if (reading) {
+        const tasks = try calendar_tasks.list(arena, server.db, sess.username);
+        return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .tasks = tasks }), null);
+    }
+    const id = if (id_param) |value| blk: {
+        const parsed = std.fmt.parseInt(i64, value, 10) catch 0;
+        if (parsed <= 0) return sendError(conn, arena, 400, "invalid_calendar_task", "Enter a valid task ID.");
+        break :blk parsed;
+    } else null;
+    writeCalendarTask(server.db, conn, arena, req, sess.username, id) catch |err| switch (err) {
+        error.InvalidCalendarTask => return sendError(conn, arena, 400, "invalid_calendar_task", "Enter a one-line title of up to 120 characters and a valid date or no date."),
+        error.CalendarTaskChanged => return sendError(conn, arena, 409, "calendar_task_changed", "This task changed or was removed. Load the latest tasks before trying again."),
+        error.CalendarTaskLimit => return sendError(conn, arena, 409, "calendar_task_limit", "The task list is full. Delete a task before adding another."),
+        error.InvalidCalendarTaskOwner => return sendError(conn, arena, 401, "unauthorized", "This mailbox is unavailable."),
+        else => return err,
+    };
+}
+
+fn writeCalendarTask(db: *database.Database, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request, mailbox: []const u8, id: ?i64) !void {
+    if (req.body.len > 2048) return error.InvalidCalendarTask;
+    if (std.mem.eql(u8, req.method, "DELETE")) {
+        const removal = std.json.parseFromSliceLeaky(struct { revision: i64 }, arena, req.body, .{}) catch return error.InvalidCalendarTask;
+        try calendar_tasks.remove(db, mailbox, id orelse return error.InvalidCalendarTask, removal.revision);
+        return sendJson(conn, arena, 200, "{\"removed\":true}", null);
+    }
+    const edit = std.json.parseFromSliceLeaky(calendar_tasks.Edit, arena, req.body, .{}) catch return error.InvalidCalendarTask;
+    const task = try calendar_tasks.save(db, mailbox, id, edit);
+    return sendJson(conn, arena, if (id == null) 201 else 200, try service_mod.json(arena, task), null);
 }
 
 const reminder_history = 86_400;

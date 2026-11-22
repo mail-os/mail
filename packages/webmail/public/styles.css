@@ -498,6 +498,27 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-zone { display: flex; align-items: center; gap: .45rem; color: var(--muted); flex-wrap: wrap; font-size: .8rem; }
 .calendar-source-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
 .calendar-source-tools .calendar-search { flex: 1 1 9rem; width: auto; }
+.calendar-tasks { max-inline-size: 52rem; margin-block: 12px; padding: 14px; border: 1px solid var(--border); border-radius: 9px; background: var(--toolbar); }
+.calendar-tasks > * + * { margin-block-start: 12px; }
+.calendar-tasks-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.calendar-tasks-heading h2 { flex: 1 1 auto; margin: 0; font-size: 16px; font-weight: 650; }
+.calendar-tasks-heading .calendar-task-status { flex-wrap: nowrap; width: auto; }
+.calendar-task-form { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
+.calendar-task-form label { display: grid; gap: 5px; min-width: 0; font-size: 13px; font-weight: 550; }
+.calendar-task-form label:first-child { flex: 1 1 14rem; }
+.calendar-task-form input { width: 100%; min-width: 0; min-block-size: var(--control-height); padding: 4px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); font-size: 13px; line-height: 1.25; }
+.calendar-task-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.calendar-task-list { padding: 0; list-style: none; border: 1px solid var(--border); border-radius: var(--control-radius); background: var(--panel); }
+.calendar-task-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 10px; }
+.calendar-task-list li + li { border-block-start: 1px solid var(--border); }
+.calendar-task-summary { display: grid; gap: 3px; flex: 1 1 12rem; min-width: 0; overflow-wrap: anywhere; font-size: 13px; }
+.calendar-task-summary span, .calendar-task-empty { color: var(--muted); font-size: 12px; }
+.calendar-task-summary a { justify-self: start; color: var(--accent); font-size: 12px; }
+.calendar-task-summary a:hover { text-decoration: underline; }
+@media (max-width: 540px) {
+  .calendar-tasks-heading h2 { flex-basis: 100%; }
+  .calendar-task-form label, .calendar-task-form label:first-child { flex: 1 1 100%; }
+}
 .calendar-free-time { margin-block: 12px; padding: 14px; border: 1px solid var(--border); border-radius: 9px; background: var(--toolbar); }
 .calendar-free-time-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-block-end: 12px; }
 .calendar-free-time-heading h2 { margin: 0; font-size: 16px; }
