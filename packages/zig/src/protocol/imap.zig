@@ -793,6 +793,14 @@ fn parseImapArg(rest: []const u8) ?ParsedImapArg {
     };
 }
 
+fn parseSingleMailboxArg(rest: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trimStart(u8, rest, " \t");
+    const arg = parseImapArg(trimmed) orelse return null;
+    if (arg.rest.len != 0) return null;
+    if (trimmed[0] == '"' and arg.value.len + 1 >= trimmed.len) return null;
+    return arg.value;
+}
+
 /// Rename a file in the same directory using libc.
 fn renameFile(old_path: []const u8, new_path: []const u8) bool {
     var old_buf: [4097]u8 = undefined;
@@ -4239,7 +4247,8 @@ pub const ImapSession = struct {
                 // CREATE mailbox in canonical Maildir++ form. The visible
                 // folder symlink preserves compatibility with older server
                 // paths while external Maildir tools use .Folder/{tmp,new,cur}.
-                const create_name = stripQuotes(parts.next() orelse "");
+                const end = @intFromPtr(cmd_str.ptr) + cmd_str.len - @intFromPtr(line.ptr);
+                const create_name = parseSingleMailboxArg(line[end..]) orelse return self.sendResponse(tag, "BAD", "CREATE requires one mailbox name");
                 if (!isSafeMailboxName(create_name)) {
                     // Rejects empty names and any path-traversal attempt.
                     try self.sendResponse(tag, "NO", "Invalid mailbox name");
@@ -4302,7 +4311,8 @@ pub const ImapSession = struct {
                 try self.handleExamine(tag, mailbox);
             },
             .delete => {
-                const mailbox = stripQuotes(parts.next() orelse "");
+                const end = @intFromPtr(cmd_str.ptr) + cmd_str.len - @intFromPtr(line.ptr);
+                const mailbox = parseSingleMailboxArg(line[end..]) orelse return self.sendResponse(tag, "BAD", "DELETE requires one mailbox name");
                 try self.handleDelete(tag, mailbox);
             },
             .rename => {
