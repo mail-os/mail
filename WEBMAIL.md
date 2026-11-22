@@ -114,6 +114,10 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   unmarked date to open its day view. With a date focused, the arrow keys move
   between days and weeks. Search matches titles, locations, and descriptions
   across dates. Use **Manage calendars** to create a calendar or change its color.
+- Use **Add day label** in Day view to name a date, such as a travel or focus
+  day. Labels follow that civil date across your personal calendar views and
+  devices. They stay private to your mailbox and stay outside CalDAV and
+  iCalendar data.
 - Create, edit, and delete events in the browser. The view and editor each have
   a time zone selector. For all-day events, **Last day** includes that date.
 - Recurring dates appear in the calendar using the stored rule, additional
@@ -204,6 +208,12 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   `POST /webmail/api/calendars` creates one from a JSON `name`. Send
   `PATCH /webmail/api/calendars/{id}` with `color` set to a six-digit hex
   color or `null` to update the color.
+- `GET /webmail/api/calendar-day-labels?start=…&end=…` returns the mailbox's
+  day labels and revisions for an inclusive range of up to 366 civil dates
+  in `YYYY-MM-DD` format. `PUT /webmail/api/calendar-day-labels/{date}` takes
+  `label` (a single line of up to 80 characters) and `revision`. Use revision 0
+  for a date without a saved revision. Send `label: null` to clear a saved label.
+  A cleared date retains its revision, and a stale edit returns `409`.
 - `GET /webmail/api/calendar-events?start=…&end=…` lists events in a half-open
   range of up to 366 days. The timestamps are Unix seconds. Pass `calendarId`
   to select one calendar or `q` to search stored event text. A nonempty

@@ -59,6 +59,7 @@ const thread_ids = @import("../message/thread_ids.zig");
 const message_refs = @import("../storage/message_refs.zig");
 const ascii_compat = @import("ascii-compat");
 const caldav_store = @import("../storage/caldav_store.zig");
+const calendar_day_labels = @import("../storage/calendar_day_labels.zig");
 const caldav = @import("../protocol/caldav.zig");
 const calendar_import = @import("webmail_calendar_import.zig");
 const calendar_invite = @import("webmail_calendar_invite.zig");
@@ -572,6 +573,9 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.eql(u8, p, "/webmail/api/calendars") and std.mem.eql(u8, req.method, "POST")) return handleCalendarCreate(server, conn, arena, req);
     if (std.mem.startsWith(u8, p, "/webmail/api/calendars/") and std.mem.eql(u8, req.method, "PATCH")) return handleCalendarColor(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-shares") and std.mem.eql(u8, req.method, "GET")) return handleCalendarShares(server, conn, arena, req);
+    if (std.mem.eql(u8, p, "/webmail/api/calendar-day-labels") and std.mem.eql(u8, req.method, "GET")) return handleCalendarDayLabels(server, conn, arena, req, null);
+    const day_label_path = "/webmail/api/calendar-day-labels/";
+    if (std.mem.startsWith(u8, p, day_label_path) and std.mem.eql(u8, req.method, "PUT")) return handleCalendarDayLabels(server, conn, arena, req, p[day_label_path.len..]);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-timezone") and std.mem.eql(u8, req.method, "GET")) return handleCalendarTimezone(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-free-busy") and std.mem.eql(u8, req.method, "GET")) return handleCalendarFreeBusy(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-reminders") and std.mem.eql(u8, req.method, "GET")) return handleCalendarReminders(server, conn, arena, req);
@@ -1959,6 +1963,33 @@ fn handleCalendarShares(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a
         });
     }
     return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .shares = rows.items }), null);
+}
+
+fn handleCalendarDayLabels(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request, day: ?[]const u8) !void {
+    if (day != null and !isSameOrigin(req)) return sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    if (server.dav_store == null) return sendError(conn, arena, 503, "calendar_unavailable", "Calendar is unavailable on this server");
+    if (day) |date| {
+        // Bound the JSON document, including escaped UTF-8 and the revision.
+        if (req.body.len > 2048) return sendError(conn, arena, 400, "invalid_day_label", "Enter a day label of up to 80 characters.");
+        const edit = std.json.parseFromSliceLeaky(calendar_day_labels.Edit, arena, req.body, .{}) catch
+            return sendError(conn, arena, 400, "invalid_day_label", "Check the label and revision.");
+        const label = calendar_day_labels.save(server.db, sess.username, date, edit) catch |err| switch (err) {
+            error.InvalidDayLabel => return sendError(conn, arena, 400, "invalid_day_label", "Enter a valid date and a one-line day label of up to 80 characters."),
+            error.DayLabelChanged => return sendError(conn, arena, 409, "day_label_changed", "This day label changed in another window. Load the latest label before editing again."),
+            error.InvalidDayLabelOwner => return sendError(conn, arena, 401, "unauthorized", "This mailbox is unavailable."),
+            else => return err,
+        };
+        return sendJson(conn, arena, 200, try service_mod.json(arena, label), null);
+    }
+    const start = req.queryParam(arena, "start") orelse "";
+    const end = req.queryParam(arena, "end") orelse "";
+    const labels = calendar_day_labels.list(arena, server.db, sess.username, start, end) catch |err| switch (err) {
+        error.InvalidDayLabelRange => return sendError(conn, arena, 400, "invalid_day_label_range", "Choose a range of up to 366 calendar dates."),
+        else => return err,
+    };
+    return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .labels = labels }), null);
 }
 
 const reminder_history = 86_400;

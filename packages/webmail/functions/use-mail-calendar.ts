@@ -15,6 +15,7 @@ import type { BusyPeriod } from './calendar-year'
 import { expandSeries } from './calendar-recurrence'
 import type { CalendarOccurrence } from './calendar-recurrence'
 import { useCalendarEditor } from './use-calendar-editor'
+import { useCalendarDayLabels } from './use-calendar-day-labels'
 import { useCalendarReminders } from './use-calendar-reminders'
 import type { CalendarDialog } from './use-calendar-editor'
 
@@ -172,7 +173,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
           time: eventTime(event, from, until, mode, formatter),
         }))
       from = until
-      if (mode === 'agenda' && !entries.length) continue
+      if (mode === 'agenda' && !entries.length && !dayLabels.labelOnDate(day)) continue
       days.push({
         day, entries, markers: entries.slice(0, 3), dimmed: mode === 'month' && !day.startsWith(thisMonth), today: day === currentDay,
         label: formatCalendarDay(day, { weekday: 'short', month: 'short', day: 'numeric' }),
@@ -227,8 +228,12 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     activeCalendar.set(null)
     events.set([])
     busyPeriods.set([])
+    dayLabels.clearDayLabels()
     onAuthError()
   })
+  const showDayLabels = derived(() => !selectedShare() && !searchTerm() && calendars().length > 0)
+  const showDayLabelEditor = derived(() => showDayLabels() && view() === 'day')
+  const dayLabels = useCalendarDayLabels(api, focusDay, showDayLabels, showDayLabelEditor)
 
   function applyShares(rows: CalendarShare[]) {
     const accessBefore = selectedShare()?.access
@@ -260,6 +265,8 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     error.set('')
     events.set([])
     busyPeriods.set([])
+    const labelRange = { ...range() }
+    dayLabels.prepareDayLabels(labelRange)
     const signal = AbortSignal.any([pending.signal, AbortSignal.timeout(10_000)])
     try {
       if (!account()) {
@@ -277,7 +284,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
       applyShares(currentShares)
       if (roster) teams.set(roster)
       if (activeCalendar() !== null && !selectedShare() && !visible.some(item => item.id === activeCalendar())) activeCalendar.set(null)
-      await loadCalendarView(signal)
+      await Promise.all([loadCalendarView(signal), dayLabels.loadDayLabels(labelRange, signal)])
     }
     catch (cause) {
       if (!pending.signal.aborted)
@@ -668,6 +675,8 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     openEvent, openNewEvent, openMailEvent, sourceEmailLink, waitingMailEvent,
     calendarEventDate: (event: CalendarEvent) => calendarEventDate(event, displayZone()),
     ...editor,
+    ...dayLabels,
+    showDayLabels, showDayLabelEditor,
     ...reminders,
     importOpen, importDestination, newCalendarName, importBusy, importError, importRows, importFinished,
     readyCount, canPreview, resultSummary, toggleImport, selectImportFile, selectImportDestination,
@@ -679,6 +688,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
       importRequest?.abort()
       settingsRequest?.abort()
       editor.clearEditor()
+      dayLabels.clearDayLabels()
     },
   }
 }

@@ -536,13 +536,28 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-year-day:hover { border-color: var(--control-border); background: var(--hover); }
 .calendar-year-day[aria-current=date] { background: var(--primary); color: var(--on-primary); }
 .calendar-year-marker { display: inline-block; inline-size: 4px; block-size: 4px; border-radius: 50%; background: var(--accent); }
-.calendar-year-day .calendar-year-marker { position: absolute; inset-block-end: 2px; inset-inline-start: calc(50% - 2px); background: currentColor; }
+.calendar-year-marks { position: absolute; inset-block-end: 2px; inset-inline: 0; display: flex; justify-content: center; align-items: center; gap: 4px; }
+.calendar-year-marks .calendar-year-marker { background: currentColor; }
+.calendar-day-label-mark { display: inline-block; flex: 0 0 5px; inline-size: 5px; block-size: 5px; border-radius: 1px; background: var(--violet); transform: rotate(45deg); }
+.calendar-year-day[aria-current=date] .calendar-day-label-mark { background: var(--on-primary); }
+.calendar-day-label-text { display: flex; align-items: center; min-inline-size: 0; gap: 7px; color: var(--violet); font-size: 12px; font-weight: 600; }
+.calendar-day-label-text > span:last-child { min-inline-size: 0; overflow-wrap: anywhere; }
+.calendar-board-month .calendar-day-label-text > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.calendar-day .calendar-day-label-text { margin-block: 2px 6px; padding-inline: 3px; }
+.calendar-day-label-editor { margin-block: 0 12px; }
+.calendar-day-label-editor:empty, .calendar-day-label-summary:empty { display: none; }
+.calendar-day-label-summary:not(:empty), .calendar-label-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.calendar-label-form { display: grid; align-items: end; gap: 8px; max-inline-size: 38rem; padding: 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--toolbar); }
+.calendar-label-form label { display: grid; gap: 5px; color: var(--text); font-size: 13px; font-weight: 550; }
+.calendar-label-form input { inline-size: 100%; min-block-size: var(--control-height); padding-inline: 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); }
+.calendar-label-form > .wm-action { justify-self: start; }
+.calendar-label-error { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0; color: var(--danger); font-size: 13px; }
 @media (max-width: 1120px) { .calendar-year { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 @media (max-width: 850px) { .calendar-year { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 600px) { .calendar-year { grid-template-columns: minmax(0, 1fr); } }
 @media (max-width: 860px), (pointer: coarse) {
   .calendar-year { --year-day-height: var(--control-height); }
-  .calendar-year-day .calendar-year-marker { inset-block-end: 5px; }
+  .calendar-year-marks { inset-block-end: 5px; }
 }
 .calendar-board-day .calendar-day, .calendar-board-agenda .calendar-day { padding: .75rem; min-height: 0; }
 .calendar-board-day .calendar-entry, .calendar-board-agenda .calendar-entry { padding: .55rem .7rem; }

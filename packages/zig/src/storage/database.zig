@@ -667,6 +667,13 @@ pub const Database = struct {
             \\    delivered INTEGER NOT NULL DEFAULT 0,
             \\    failed INTEGER NOT NULL DEFAULT 0
             \\);
+            \\CREATE TABLE IF NOT EXISTS mail_calendar_day_labels (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    day TEXT NOT NULL,
+            \\    label TEXT,
+            \\    revision INTEGER NOT NULL CHECK(revision > 0),
+            \\    PRIMARY KEY(user_id,day)
+            \\);
             \\CREATE TABLE IF NOT EXISTS mail_calendar_revisions (
             \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             \\    component TEXT NOT NULL,

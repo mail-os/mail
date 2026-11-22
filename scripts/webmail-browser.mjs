@@ -583,6 +583,16 @@ async function calendarSharingJourney(captain) {
   }
   finally { initialCalendars.resolve() }
   await manage.click()
+  const privateDayLabel = 'Planning note for the owner'
+  const dayLabelResponse = await captain.request.put(`${url}/webmail/api/calendar-day-labels/${day}`, {
+    headers: { Origin: url },
+    data: { label: privateDayLabel, revision: 0 },
+  })
+  assert.equal(dayLabelResponse.status(), 200, await dayLabelResponse.text())
+  const exportPath = await captain.getByRole('link', { name: 'Download .ics' }).getAttribute('href')
+  const exported = await captain.request.get(url + exportPath)
+  assert.equal(exported.status(), 200)
+  assert(!(await exported.text()).includes(privateDayLabel), 'Calendar export omits personal day labels')
   const sharing = captain.getByRole('region', { name: 'Share a calendar' })
   await sharing.getByLabel('Calendar to share').selectOption({ label: calendarLabel })
   await sharing.getByRole('combobox', { name: /^Team\b/ }).selectOption({ label: 'Studio' })
@@ -623,6 +633,8 @@ async function calendarSharingJourney(captain) {
   await publicEvent.waitFor()
   assert.equal(await privateTitle.count(), 0)
   assert.equal(await button(teammate, 'New event').count(), 0)
+  assert.equal(await teammate.getByText(privateDayLabel, { exact: true }).count(), 0)
+  assert.equal(await teammate.getByRole('region', { name: 'Day label', exact: true }).count(), 0)
   assert.equal(await teammate.getByRole('link', { name: 'Download .ics' }).count(), 0)
   await fitsViewport(teammate)
   await screenshot(teammate, 'phone-calendar-viewer')
@@ -644,6 +656,7 @@ async function calendarSharingJourney(captain) {
   await changeRole('editor')
   await details.waitFor({ state: 'hidden' })
   await button(teammate, /^Design & Research.*Edit events/).waitFor()
+  assert.equal(await teammate.getByRole('region', { name: 'Day label', exact: true }).count(), 0)
   await publicEvent.click()
   const editor = teammate.getByRole('dialog', { name: 'Edit event' })
   await editor.getByRole('textbox', { name: 'Title' }).fill('Studio review updated')
@@ -705,6 +718,7 @@ async function calendarSharingJourney(captain) {
   const busyDay = sharedYear.locator(`[data-date="${day}"]`)
   await sharedYear.getByRole('button', { name: /, busy$/ }).first().waitFor()
   assert.match(await busyDay.getAttribute('aria-label'), /, busy$/)
+  assert(!(await busyDay.getAttribute('aria-label')).includes(privateDayLabel))
   assert.equal(await sharedYear.getByRole('button', { name: /\d events?$/ }).count(), 0)
   assert.equal(await privateTitle.count(), 0)
   await fitsViewport(teammate)
@@ -927,6 +941,57 @@ async function yearCalendarJourney(desktop, phone) {
   await phone.setViewportSize({ width: 390, height: 844 })
 }
 
+async function dayLabelJourney(desktop, phone) {
+  const date = '2028-03-01'
+  const calendarUrl = `${url}/calendar?day=${date}`
+  const label = 'Travel <desk>'
+  await desktop.goto(calendarUrl)
+  const panel = desktop.getByRole('region', { name: 'Day label', exact: true })
+  const field = panel.getByRole('textbox', { name: 'Day label' })
+  await button(panel, 'Add day label').click()
+  await desktop.waitForFunction(() => document.activeElement?.getAttribute('data-stx-ref') === 'labelField')
+  await field.fill(label)
+  await button(panel, 'Save label').click()
+  await panel.getByText(label, { exact: true }).waitFor()
+  assert.equal(await panel.locator('desk').count(), 0, 'Day labels render as plain text')
+  await screenshot(desktop, 'desktop-calendar-day-label')
+
+  await button(desktop, 'Agenda').click()
+  await desktop.getByText(label, { exact: true }).waitFor()
+  await button(desktop, 'Month').click()
+  await desktop.getByRole('button', { name: /Mar 1, Travel <desk>$/ }).waitFor()
+  await button(desktop, 'Year').click()
+  const dateCell = desktop.locator(`[data-date="${date}"]`)
+  await desktop.getByRole('button', { name: /March 1, 2028, Travel <desk>$/ }).waitFor()
+  await dateCell.click()
+  await panel.getByText(label, { exact: true }).waitFor()
+  await button(panel, 'Edit day label').click()
+  await field.fill('Uncommitted edit')
+
+  await phone.goto(calendarUrl)
+  const phonePanel = phone.getByRole('region', { name: 'Day label', exact: true })
+  await phone.getByRole('combobox', { name: 'Display time zone' }).selectOption('America/New_York')
+  await button(phonePanel, 'Edit day label').click()
+  const phoneField = phonePanel.getByRole('textbox', { name: 'Day label' })
+  assert.equal(await phoneField.inputValue(), label)
+  await phoneField.fill('Remote work')
+  await fitsViewport(phone)
+  await screenshot(phone, 'phone-calendar-day-label')
+  await button(phonePanel, 'Save label').click()
+  await phonePanel.getByText('Remote work', { exact: true }).waitFor()
+
+  await button(panel, 'Save label').click()
+  await panel.getByRole('alert').filter({ hasText: /changed in another window/ }).waitFor()
+  assert.equal(await field.inputValue(), 'Uncommitted edit')
+  await button(panel, 'Load latest label').click()
+  await panel.getByText('Remote work', { exact: true }).waitFor()
+  await button(panel, 'Edit day label').click()
+  await button(panel, 'Remove label').click()
+  await button(panel, 'Add day label').waitFor()
+  await phone.reload()
+  await button(phonePanel, 'Add day label').waitFor()
+}
+
 async function navigationRequestsJourney(page) {
   await page.goto(url + '/')
   const refresh = button(page, 'Refresh messages')
@@ -997,6 +1062,7 @@ try {
   await mailEventJourney(firstRun, { phone: true, firstCalendar: true })
   await invitationRangeJourney(desktop, phone)
   await yearCalendarJourney(desktop, phone)
+  await dayLabelJourney(desktop, phone)
   await navigationRequestsJourney(desktop)
   assert.deepEqual(errors, [], 'Browser pages raised uncaught errors')
   process.stdout.write(`${engine} passed the desktop and phone webmail journeys.\n`)

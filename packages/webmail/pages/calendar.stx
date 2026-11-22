@@ -16,6 +16,9 @@ const {
   sharedCalendars, selectedShare, availabilityOnly, canCreateEvent, writableCalendars, busyPeriods, busyPeriodLabel, shareNotice, recheckShares,
   view, calendarViews, calendarDays, monthWeekdays, yearMonths, yearTabDay, moveYearFocus, recurringSeries, rangeLabel, loading, error,
   searchInput, searchTerm, events, search, clearSearch, focusDay, displayZone, calendarTimeZones,
+  showDayLabels, showDayLabelEditor, hasDayLabels, labelOnDate, currentDayLabel, canEditDayLabel, editingDayLabel,
+  dayLabelDraft, dayLabelSaving, dayLabelConflict, dayLabelError, dayLabelNotice, dayLabelsUnavailable,
+  startDayLabel, cancelDayLabel, saveDayLabel,
   refresh, selectCalendar, showView, shiftView, goToToday, showDay, changeDate, changeZone, calendarEventDate,
   calendarSettings, calendarSettingsError, calendarSettingsBusy, calendarNameInput, createCalendar, setCalendarColor, toggleCalendarSettings,
   teams, outgoingShares, shareCalendarInput, shareTeamInput, shareGranteeInput, shareAccessInput,
@@ -34,6 +37,25 @@ const {
   visibleReminders, reminderError, dismissingReminder, tickReminders, pollReminders, dismissReminder, destroyReminders,
 } = useMailCalendar(() => navigate('/login', { reload: true }), { ref: useRef('eventDialog'), nextTick })
 const dayHeading = useRef('dayHeading')
+const labelField = useRef('labelField')
+const labelTrigger = useRef('labelTrigger')
+function editLabel() {
+  startDayLabel()
+  nextTick(() => labelField.current?.focus())
+}
+function closeLabel() {
+  if (dayLabelSaving()) return
+  cancelDayLabel()
+  nextTick(() => labelTrigger.current?.focus())
+}
+async function submitLabel(clear = false) {
+  if (await saveDayLabel(clear)) nextTick(() => labelTrigger.current?.focus())
+}
+async function reloadLabel() {
+  cancelDayLabel()
+  await refresh()
+  nextTick(() => labelTrigger.current?.focus())
+}
 function openYearDay(day) {
   void showDay(day)
   nextTick(() => dayHeading.current?.focus())
@@ -179,7 +201,32 @@ onUnmounted(() => { destroy(); destroyReminders() })
     <div :if="!searchTerm && (calendars.length || selectedShare)" :class="{ 'calendar-year-heading': view === 'year' }">
       <h2 id="calendar-range" ref="dayHeading" tabindex="-1" class="calendar-range" :text="availabilityOnly && view !== 'year' ? 'Free/busy' : rangeLabel" aria-live="polite"></h2>
       <span :if="view === 'year'" class="calendar-year-legend"><span class="calendar-year-marker" aria-hidden="true"></span><span :text="availabilityOnly ? 'Busy day' : 'Events scheduled'"></span></span>
+      <span :if="view === 'year' && hasDayLabels" class="calendar-year-legend"><span class="calendar-day-label-mark" aria-hidden="true"></span>Day label</span>
     </div>
+    <div :if="showDayLabels && dayLabelsUnavailable" class="calendar-label-error" role="alert">
+      <span :text="dayLabelsUnavailable"></span><button type="button" class="wm-action" @click="refresh()">Retry day labels</button>
+    </div>
+
+    <section :if="showDayLabelEditor" class="calendar-day-label-editor" aria-label="Day label">
+      <div :if="!editingDayLabel" class="calendar-day-label-summary">
+        <span :if="currentDayLabel" class="calendar-day-label-text">
+          <span class="calendar-day-label-mark" aria-hidden="true"></span><span :text="currentDayLabel"></span>
+        </span>
+        <button ref="labelTrigger" :if="canEditDayLabel" type="button" class="wm-action" @click="editLabel()"
+          :text="currentDayLabel ? 'Edit day label' : 'Add day label'"></button>
+      </div>
+      <form :if="editingDayLabel" class="calendar-label-form" @submit.prevent="submitLabel()" @keydown.escape="closeLabel()">
+        <label>Day label<input ref="labelField" type="text" x-model="dayLabelDraft" :disabled="dayLabelSaving" autocomplete="off" placeholder="e.g. Travel day"></label>
+        <div class="calendar-label-actions">
+          <button type="submit" class="wm-action calendar-primary" :disabled="dayLabelSaving || dayLabelConflict">Save label</button>
+          <button :if="currentDayLabel" type="button" class="wm-action wm-action--danger" :disabled="dayLabelSaving || dayLabelConflict" @click="submitLabel(true)">Remove label</button>
+          <button type="button" class="wm-action" :disabled="dayLabelSaving" @click="closeLabel()">Cancel</button>
+        </div>
+        <p :if="dayLabelError" class="calendar-label-error" role="alert" :text="dayLabelError"></p>
+        <button :if="dayLabelConflict" type="button" class="wm-action" @click="reloadLabel()">Load latest label</button>
+      </form>
+      <p :if="dayLabelNotice" class="wm-a11y-text" role="status" :text="dayLabelNotice"></p>
+    </section>
 
     <section :if="availabilityOnly && view !== 'year'" aria-labelledby="calendar-range">
       <p :text="rangeLabel"></p>
@@ -204,11 +251,15 @@ onUnmounted(() => { destroy(); destroyReminders() })
           <div class="calendar-year-days">
             <button :for="day in month.days" :key="day.date" type="button" class="calendar-year-day"
               :data-date="day.date" :tabindex="day.date === yearTabDay ? 0 : -1"
-              :aria-label="day.label + (day.busy ? ', busy' : day.count ? ', ' + day.count + (day.count === 1 ? ' event' : ' events') : '')"
+              :aria-label="day.label + (day.busy ? ', busy' : day.count ? ', ' + day.count + (day.count === 1 ? ' event' : ' events') : '') + (labelOnDate(day.date) ? ', ' + labelOnDate(day.date) : '')"
+              :title="labelOnDate(day.date) || undefined"
               :aria-current="day.today ? 'date' : undefined" :class="{ 'calendar-year-day--marked': day.busy || day.count }"
               :style="day.number === 1 ? 'grid-column-start:' + month.firstColumn : ''" @click="openYearDay(day.date)">
               <span :text="day.number"></span>
-              <span :if="day.busy || day.count" class="calendar-year-marker" aria-hidden="true"></span>
+              <span :if="day.busy || day.count || labelOnDate(day.date)" class="calendar-year-marks" aria-hidden="true">
+                <span :if="day.busy || day.count" class="calendar-year-marker"></span>
+                <span :if="labelOnDate(day.date)" class="calendar-day-label-mark"></span>
+              </span>
             </button>
           </div>
         </section>
@@ -223,7 +274,7 @@ onUnmounted(() => { destroy(); destroyReminders() })
       <div :class="'calendar-board calendar-board-' + view">
         <section :for="day in calendarDays" :class="'calendar-day' + (day.dimmed ? ' calendar-day-muted' : '') + (day.today ? ' calendar-day-today' : '')" :aria-label="day.label">
           <div class="calendar-day-heading">
-            <button class="calendar-day-link" :aria-label="view === 'month' && day.entries.length ? day.label + ', ' + day.entries.length + (day.entries.length === 1 ? ' event' : ' events') : day.label" :aria-current="day.today ? 'date' : undefined" @click="showDay(day.day)">
+            <button class="calendar-day-link" :aria-label="day.label + (view === 'month' && day.entries.length ? ', ' + day.entries.length + (day.entries.length === 1 ? ' event' : ' events') : '') + (view !== 'day' && labelOnDate(day.day) ? ', ' + labelOnDate(day.day) : '')" :aria-current="day.today ? 'date' : undefined" @click="showDay(day.day)">
               <span :if="view === 'month'" :text="day.number"></span><span :if="view !== 'month'" :text="day.label"></span>
               <span :if="view === 'month' && day.entries.length" class="calendar-month-markers" aria-hidden="true">
                 <span :for="marker in day.markers" class="calendar-dot" :style="'background:' + eventColor(marker)"></span>
@@ -231,6 +282,9 @@ onUnmounted(() => { destroy(); destroyReminders() })
               </span>
             </button>
             <button :if="view !== 'month' && canCreateEvent" class="calendar-day-add" :aria-label="'New event on ' + day.label" @click="openNewEvent(day.day)"><span class="mail-icon" data-icon="plus" aria-hidden="true"></span></button>
+          </div>
+          <div :if="view !== 'day' && labelOnDate(day.day)" class="calendar-day-label-text" :title="labelOnDate(day.day)">
+            <span class="calendar-day-label-mark" aria-hidden="true"></span><span :text="labelOnDate(day.day)"></span>
           </div>
           <ul class="calendar-day-entries">
             <li :for="entry in day.entries">
