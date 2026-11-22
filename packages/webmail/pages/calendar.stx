@@ -34,10 +34,9 @@ const {
   visibleReminders, reminderError, dismissingReminder, tickReminders, pollReminders, dismissReminder, destroyReminders,
 } = useMailCalendar(() => navigate('/login', { reload: true }), { ref: useRef('eventDialog'), nextTick })
 const dayHeading = useRef('dayHeading')
-const availabilityHeading = useRef('availabilityHeading')
 function openYearDay(day) {
   void showDay(day)
-  nextTick(() => (availabilityOnly() ? availabilityHeading : dayHeading).current?.focus())
+  nextTick(() => dayHeading.current?.focus())
 }
 async function bootCalendar() { await refresh(); await openMailEvent(); void pollReminders() }
 useInterval(tickReminders, 1000, { whileVisible: true })
@@ -177,8 +176,12 @@ onUnmounted(() => { destroy(); destroyReminders() })
       </ul>
     </section>
 
-    <section :if="availabilityOnly && view !== 'year'" aria-labelledby="calendar-availability">
-      <h2 id="calendar-availability" ref="availabilityHeading" tabindex="-1" class="calendar-range">Free/busy</h2>
+    <div :if="!searchTerm && (calendars.length || selectedShare)" :class="{ 'calendar-year-heading': view === 'year' }">
+      <h2 id="calendar-range" ref="dayHeading" tabindex="-1" class="calendar-range" :text="availabilityOnly && view !== 'year' ? 'Free/busy' : rangeLabel" aria-live="polite"></h2>
+      <span :if="view === 'year'" class="calendar-year-legend"><span class="calendar-year-marker" aria-hidden="true"></span><span :text="availabilityOnly ? 'Busy day' : 'Events scheduled'"></span></span>
+    </div>
+
+    <section :if="availabilityOnly && view !== 'year'" aria-labelledby="calendar-range">
       <p :text="rangeLabel"></p>
       <p :if="!loading && !error && !busyPeriods.length">No busy times in this period.</p>
       <ul :if="busyPeriods.length" class="calendar-share-list" aria-label="Busy periods">
@@ -190,10 +193,6 @@ onUnmounted(() => { destroy(); destroyReminders() })
     </section>
 
     <section :if="!searchTerm && view === 'year'" aria-label="Year overview">
-      <div class="calendar-year-heading">
-        <h2 class="calendar-range" :text="rangeLabel" aria-live="polite"></h2>
-        <span class="calendar-year-legend"><span class="calendar-year-marker" aria-hidden="true"></span><span :text="availabilityOnly ? 'Busy day' : 'Events scheduled'"></span></span>
-      </div>
       <p :if="!availabilityOnly && recurringSeries.length" role="status">Some recurring dates could not be shown. Open a month or day to check those dates.</p>
       <p id="calendar-year-keys" class="wm-a11y-text">Use the arrow keys to choose a date and Enter to open it.</p>
       <div class="calendar-year" role="group" aria-label="Days of the year" aria-describedby="calendar-year-keys" @keydown="moveYearFocus($event)">
@@ -217,7 +216,6 @@ onUnmounted(() => { destroy(); destroyReminders() })
     </section>
 
     <section :if="!searchTerm && !availabilityOnly && view !== 'year' && (calendars.length || selectedShare)" aria-labelledby="calendar-range">
-      <h2 id="calendar-range" ref="dayHeading" tabindex="-1" class="calendar-range" :text="rangeLabel" aria-live="polite"></h2>
       <p :if="!loading && !error && view === 'agenda' && !calendarDays.length">No events in this period.</p>
       <div :if="view === 'month'" class="calendar-weekdays" aria-hidden="true">
         <span :for="label in monthWeekdays" :text="label"></span>

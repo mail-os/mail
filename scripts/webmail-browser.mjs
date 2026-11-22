@@ -896,7 +896,8 @@ async function yearCalendarJourney(desktop, phone) {
   assert.match(await march.getAttribute('aria-label'), /, 1 event$/)
   assert.match(await leap.getAttribute('aria-label'), /, 1 event$/)
   await fitsViewport(desktop)
-  await screenshot(desktop, 'desktop-calendar-year')
+  await desktop.getByRole('region', { name: 'Calendar workspace' })
+    .screenshot({ path: join(output, 'desktop-calendar-year.png'), animations: 'disabled' })
 
   await leap.press('ArrowRight')
   const marchFirst = year.locator('[data-date="2028-03-01"]')
@@ -905,11 +906,11 @@ async function yearCalendarJourney(desktop, phone) {
   await marchFirst.press('ArrowLeft')
   await leap.press('Enter')
   await heading(desktop, 'Tuesday, February 29, 2028').waitFor()
-  assert(await heading(desktop, 'Tuesday, February 29, 2028').evaluate(node => document.activeElement === node), 'Opening a day focuses its heading')
+  await desktop.waitForFunction(() => document.activeElement?.id === 'calendar-range')
   await button(desktop, /Leap day/).waitFor()
   await button(desktop, 'Year').click()
   await button(desktop, 'Next period').click()
-  await heading(year, '2029').waitFor()
+  await heading(desktop, '2029').waitFor()
   assert.equal(await year.locator('[data-date]').count(), 365)
   assert.equal(await desktop.getByLabel('Jump to date', { exact: true }).inputValue(), '2029-02-28')
 
@@ -921,6 +922,7 @@ async function yearCalendarJourney(desktop, phone) {
   await fitsViewport(phone)
   const february = phoneYear.getByRole('region', { name: 'February', exact: true })
   assert((await february.locator(`[data-date="${leapDay}"]`).boundingBox()).height >= 44)
+  await phone.mouse.move(0, 0)
   await february.screenshot({ path: join(output, 'phone-calendar-year.png'), animations: 'disabled' })
   await phone.setViewportSize({ width: 390, height: 844 })
 }
