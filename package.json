@@ -41,7 +41,8 @@
     "release:dry": "bun scripts/release.ts patch --dry-run"
   },
   "devDependencies": {
-    "better-dx": "^0.2.23"
+    "better-dx": "^0.2.23",
+    "playwright": "1.65.1"
   },
   "workspaces": [
     "packages/*"

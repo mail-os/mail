@@ -51,3 +51,22 @@ calls this ts-cloud integration after deploying the mail executable.
 
 `bun run build` compiles into `packages/zig/src/api/webmail_dist` (generated and
 ignored). `bun test packages/webmail` checks compilation and source conventions.
+
+## Browser acceptance
+
+Run from the repository root with Python 3, Node.js 20 or later, Bun, and the native build
+toolchain available.
+
+```sh
+bun install --frozen-lockfile
+bun run playwright install chromium firefox webkit
+(cd packages/zig && zig build -Doptimize=ReleaseSafe)
+python3 scripts/test-webmail-browser.py packages/zig/zig-out/bin/mail /tmp/mail-browser-screenshots
+```
+
+On Linux, use Playwright's `install --with-deps` if the browser system packages
+are missing. Add `--engine firefox` to run one engine. Each engine starts a
+fresh loopback HTTPS server and creates its own mailboxes, SMTP messages, and
+CalDAV event. The suite checks desktop and phone workflows, including keyboard
+navigation, message search and reading, attachments, delivery, and Calendar.
+The Ubuntu CI job uploads the screenshots for each engine.

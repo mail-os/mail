@@ -29,6 +29,27 @@ jobs:
     - name: Build
       run: zig build -Doptimize=ReleaseSafe
 
+    - name: Install browser test dependencies
+      if: runner.os == 'Linux'
+      working-directory: .
+      run: |
+        bun install --frozen-lockfile
+        bun run playwright install --with-deps chromium firefox webkit
+
+    - name: Run native HTTPS browser journeys
+      if: runner.os == 'Linux'
+      working-directory: .
+      timeout-minutes: 5
+      run: python3 scripts/test-webmail-browser.py packages/zig/zig-out/bin/mail webmail-browser-screenshots
+
+    - name: Upload browser screenshots
+      if: ${{ !cancelled() && runner.os == 'Linux' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: webmail-browser-screenshots
+        path: webmail-browser-screenshots/
+        if-no-files-found: ignore
+
     - name: Run tests
       run: zig build test
 
