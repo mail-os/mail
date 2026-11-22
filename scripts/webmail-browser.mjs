@@ -578,10 +578,15 @@ async function freeTimeJourney(page, phone = false) {
   const slots = panel.getByRole('list', { name: 'Open windows' })
   await check.click()
   await panel.getByRole('status').filter({ hasText: '3 open windows' }).waitFor()
-  assert.deepEqual(await slots.locator('li > span').allTextContents(), [
-    '9:00 AM – 11:00 AM', '12:00 PM – 2:00 PM', '3:00 PM – 5:00 PM',
+  const displayed = await slots.evaluate(list => Array.from(list.querySelectorAll('li'), item => ({
+    time: item.querySelector('span').textContent.replace(/\s+/g, ' ').trim(),
+    duration: item.querySelector('small').textContent.replace(/\s+/g, ' ').trim(),
+  })))
+  assert.deepEqual(displayed, [
+    { time: '9:00 AM – 11:00 AM', duration: '120 min' },
+    { time: '12:00 PM – 2:00 PM', duration: '120 min' },
+    { time: '3:00 PM – 5:00 PM', duration: '120 min' },
   ])
-  assert.deepEqual(await slots.locator('li > small').allTextContents(), ['120 min', '120 min', '120 min'])
   await fitsViewport(page)
   await page.mouse.move(0, 0)
   await panel.screenshot({ path: join(output, phone ? 'phone-calendar-free-time.png' : 'desktop-calendar-free-time.png'), animations: 'disabled' })

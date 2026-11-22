@@ -504,7 +504,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-free-time-heading p { margin: 0; color: var(--muted); font-size: 12px; }
 .calendar-free-time-form { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
 .calendar-free-time-form label { display: grid; gap: 5px; min-width: 0; font-size: 13px; font-weight: 550; }
-.calendar-free-time-form input:not([type=checkbox]) { width: 100%; min-width: 0; min-block-size: var(--control-height); padding: 6px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); }
+.calendar-free-time-form input:not([type=checkbox]) { width: 100%; min-width: 0; min-block-size: var(--control-height); padding: 4px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); font-size: 13px; line-height: 1.25; }
 .calendar-free-time-form .calendar-free-time-personal { display: flex; align-items: center; gap: 6px; flex-basis: 100%; min-block-size: var(--control-height); }
 .calendar-free-time > .calendar-label-error { margin-block-start: 10px; }
 .calendar-free-time-output { display: grid; gap: 8px; margin-block-start: 12px; padding-block-start: 10px; border-block-start: 1px solid var(--border); }
