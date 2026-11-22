@@ -52,7 +52,10 @@ async function verifyAppearance(page, scheme) {
     const pairs = [
       ['--text', '--panel'], ['--muted', '--panel'], ['--muted', '--surface'],
       ['--muted', '--toolbar'], ['--muted', '--selected'], ['--muted', '--sidebar'],
-      ['--accent', '--selected'], ['--on-primary', '--primary'],
+      ['--text', '--list'], ['--muted', '--list'], ['--accent', '--selected'],
+      ['--violet', '--sidebar'], ['--teal', '--sidebar'], ['--warning', '--sidebar'],
+      ['--on-primary', '--primary'], ['--on-primary', '--message-selection'],
+      ['--message-selection-muted', '--message-selection'],
     ]
     return {
       scheme: style.colorScheme,
@@ -66,6 +69,25 @@ async function verifyAppearance(page, scheme) {
   assert.equal(theme.scheme, scheme)
   for (const [ratio, foreground, background] of theme.ratios)
     assert(ratio >= 4.5, `${scheme} ${foreground} on ${background} must reach 4.5:1, got ${ratio.toFixed(2)}`)
+}
+
+async function verifyMessageSelection(message, child) {
+  const appearance = await message.evaluate((node, selector) => {
+    // Resolve the tokens to the browser's computed color serialization.
+    const sample = document.createElement('span')
+    sample.style.cssText = 'display:none;color:var(--on-primary);background:var(--message-selection)'
+    document.body.append(sample)
+    const expected = getComputedStyle(sample)
+    const row = node.closest('.wm-message-row') ?? node
+    const colors = {
+      backgroundMatches: getComputedStyle(row).backgroundColor === expected.backgroundColor,
+      textMatches: getComputedStyle(node.querySelector(selector)).color === expected.color,
+    }
+    sample.remove()
+    return colors
+  }, child)
+  assert(appearance.backgroundMatches && appearance.textMatches,
+    'The selected message uses the high-contrast selection colors')
 }
 
 async function openMailbox(page, name) {
@@ -141,6 +163,7 @@ async function signIn({ phone = false } = {}) {
   const activeFolder = folders(page).locator('[aria-current=page]')
   assert.match(await activeFolder.innerText(), /^Inbox/)
   assert.match(await activeFolder.locator('.mail-icon').evaluate(node => getComputedStyle(node).maskImage), /data:image/)
+  assert.match(await button(page, 'Compose').locator('.mail-icon').evaluate(node => getComputedStyle(node).maskImage), /data:image/)
   assert.match(await page.evaluate(() => getComputedStyle(document.body).fontFamily), /-apple-system/)
   if (phone) await drawer(page).click()
   return page
@@ -182,6 +205,7 @@ async function desktopJourney(page) {
   await button(page, /Tuesday design handoff/).click()
   await heading(page, handoff).waitFor()
   assert.equal(await button(page, /Tuesday design handoff/).getAttribute('aria-current'), 'true')
+  await verifyMessageSelection(button(page, /Tuesday design handoff/), '.wm-msg-from')
   await page.frameLocator('iframe[title="Email content"]').getByText('For Tuesday', { exact: true }).waitFor()
   const sorting = page.getByText('Sender sorting', { exact: true })
   const destination = page.getByLabel(/Future mail from/)
@@ -199,6 +223,7 @@ async function desktopJourney(page) {
   await fitsViewport(page)
   await screenshot(page, 'desktop-inbox-light')
   await verifyAppearance(page, 'dark')
+  await verifyMessageSelection(button(page, /Tuesday design handoff/), '.wm-msg-from')
   await button(page, 'Show plain text').click()
   await page.locator('.wm-read-text').getByText(/Please confirm the sidebar order/).waitFor()
   await screenshot(page, 'desktop-inbox-dark')
@@ -221,6 +246,9 @@ async function desktopJourney(page) {
   await composer.getByText(/handoff-checklist.txt/).waitFor()
   await composer.getByRole('progressbar').waitFor({ state: 'hidden' })
   await screenshot(page, 'desktop-compose')
+  await page.emulateMedia({ colorScheme: 'dark' })
+  await screenshot(page, 'desktop-compose-dark')
+  await page.emulateMedia({ colorScheme: 'light' })
   await composer.getByLabel('Undo Send delay', { exact: true }).selectOption('0')
   await button(composer, 'Send').click()
   await composer.waitFor({ state: 'hidden' })
@@ -234,6 +262,9 @@ async function desktopJourney(page) {
   await page.getByText('Studio review', { exact: true }).waitFor()
   await fitsViewport(page)
   await screenshot(page, 'desktop-calendar')
+  await page.emulateMedia({ colorScheme: 'dark' })
+  await screenshot(page, 'desktop-calendar-dark')
+  await page.emulateMedia({ colorScheme: 'light' })
   await page.getByRole('searchbox', { name: 'Search events' }).fill('Studio review')
   await button(page, 'Search').click()
   await page.getByRole('heading', { name: /^Search results/ }).waitFor()
@@ -290,13 +321,17 @@ async function phoneJourney(page) {
   await page.waitForFunction(() => document.activeElement?.getAttribute('aria-controls') === 'mailNavigation')
   await openReceiptAndDownload(page)
   await heading(page, 'Your receipt #1046').waitFor()
+  await page.locator('.wm-receipt-sender').getByText('Studio Hosting', { exact: true }).waitFor()
   await button(page, 'Reply').waitFor()
   await fitsViewport(page)
   await page.setViewportSize({ width: 320, height: 844 })
   await fitsViewport(page)
   const actions = page.getByRole('group', { name: 'Message actions', exact: true })
   assert((await actions.boundingBox()).height < 124, 'Reader actions fit into two rows on narrow phones')
+  assert((await actions.getByRole('combobox', { name: 'Move destination' }).boundingBox()).height >= 44,
+    'Move destination has a full-size touch target')
   await button(actions, 'Mark junk').waitFor()
+  await screenshot(page, 'phone-reader-narrow')
   await page.setViewportSize({ width: 390, height: 844 })
   await screenshot(page, 'phone-reader')
   await page.emulateMedia({ colorScheme: 'light' })
@@ -315,7 +350,16 @@ async function phoneJourney(page) {
   await button(page, 'Resume draft').click()
   assert.equal(await subject.inputValue(), 'Keyboard draft', 'Escape saved the draft subject')
   assert.equal(await body.inputValue(), 'Save this draft when Escape closes the composer.', 'Escape saved the draft body')
+  for (const width of [320, 390]) {
+    await page.setViewportSize({ width, height: 844 })
+    const sheet = await composer.locator('.wm-composer').boundingBox()
+    assert(sheet && sheet.width === width && Math.abs(sheet.y + sheet.height - 844) < 1, 'Composer is a full-width bottom sheet on phones')
+    await fitsViewport(page)
+  }
   await screenshot(page, 'phone-compose')
+  await page.emulateMedia({ colorScheme: 'light' })
+  await screenshot(page, 'phone-compose-light')
+  await page.emulateMedia({ colorScheme: 'dark' })
   await button(composer, 'Close composer').click()
   await composer.waitFor({ state: 'hidden' })
 
@@ -337,6 +381,9 @@ async function phoneJourney(page) {
   await page.locator('.calendar-loading').waitFor({ state: 'hidden' })
   await fitsViewport(page)
   await screenshot(page, 'phone-calendar')
+  await button(page, /, 1 event$/).click()
+  await page.getByText('Studio review', { exact: true }).waitFor()
+  await screenshot(page, 'phone-calendar-day')
   await page.goto(url + '/shared')
   await sharedJourney(page, true)
 }
@@ -350,6 +397,7 @@ async function sharedJourney(page, phone = false) {
   const message = button(page, /Studio proof approval/)
   await message.click()
   await heading(page, 'Studio proof approval').waitFor()
+  if (!phone) await verifyMessageSelection(message, '.wm-msg-from')
   await page.getByRole('region', { name: 'Shared message reader' })
     .getByText('The revised proof is ready for approval.', { exact: true }).waitFor()
   await button(page, 'Resolve').click()

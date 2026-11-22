@@ -113,7 +113,7 @@ export function renderMailReader(html: string, images: EmbeddedImage[] = [], loa
   const policy = "default-src 'none'; img-src " + sources + "; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"
   const source = '<!doctype html><meta charset="utf-8"><meta name="referrer" content="no-referrer">'
     + '<meta http-equiv="Content-Security-Policy" content="' + policy + '">'
-    + '<style>body{font:15px/1.5 system-ui,sans-serif;color:#202631;overflow-wrap:anywhere}img{max-width:100%;height:auto}pre{white-space:pre-wrap}table{max-width:100%}</style>'
+    + '<style>body{margin:14px 16px;font:15px/1.55 system-ui,-apple-system,BlinkMacSystemFont,sans-serif;color:#202126;overflow-wrap:anywhere}img{max-width:100%;height:auto}pre{white-space:pre-wrap}table{max-width:100%}</style>'
     + output.innerHTML
   return { source, remoteImages }
 }

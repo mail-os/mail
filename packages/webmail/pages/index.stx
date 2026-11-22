@@ -318,7 +318,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       </nav>
       <div :if="readerError" class="wm-inline-error" tabindex="-1" data-reader-focus role="alert"><span :text="readerError"></span><button :if="readerTarget" type="button" class="wm-action" @click="retryReader()" :disabled="readingLoading || triageBusy">Retry message</button></div>
       <p :if="readingLoading" class="wm-a11y-text" role="status">Opening message…</p>
-      <div :if="!selected && !readerError" class="wm-reader-empty" aria-hidden="true"><span class="wm-empty-mark"><span class="mail-icon" :data-icon="libraryView ? 'attach' : 'mail'" aria-hidden="true"></span></span><span :text="readingLoading ? 'Opening message…' : (libraryView ? 'Select an attachment to open its message.' : 'Select a message to read.')"></span></div>
+      <div :if="!selected && !readerError" class="wm-reader-empty" role="status"><span class="wm-empty-mark"><span class="mail-icon" :data-icon="libraryView ? 'attach' : 'mail'" aria-hidden="true"></span></span><span :text="readingLoading ? 'Opening message…' : (libraryView ? 'Select an attachment to open its message.' : 'Select a message to read.')"></span></div>
       <article :if="selected" class="wm-read-body">
         <div :if="senderReviewOpen && senderReviewSelection" class="wm-read-toolbar wm-review-toolbar" :aria-busy="senderReviewSaving">
           <button :if="senderReviewSelection?.folder === 'Declined'" type="button" class="wm-action" @click="reviewMessage('recover')" :disabled="senderReviewSelection?.applying || senderReviewSaving">Recover this message</button>
@@ -343,7 +343,10 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
           <button :if="unreadAvailable && !readingBatch" type="button" class="wm-action wm-action--accent" aria-keyshortcuts="Shift+N" @click="nextUnread()" :disabled="triageBusy || mutating || readingLoading">Next unread<span class="mail-icon" data-icon="right" aria-hidden="true"></span></button>
           <div class="wm-tool-group wm-tool-move" role="group" aria-label="Move message">
             <button class="wm-tool" @click="selectedAction('move')" :disabled="mutating" aria-label="Move this message" title="Move this message"><span class="mail-icon" data-icon="folder" aria-hidden="true"></span></button>
-            <select x-model="moveTo" :disabled="mutating" aria-label="Move destination"><option :for="item in folders" :value="item.name" :text="folderName(item.name)"></option></select>
+            <div class="wm-move-destination">
+              <select x-model="moveTo" :disabled="mutating" aria-label="Move destination"><option :for="item in folders" :value="item.name" :text="folderName(item.name)"></option></select>
+              <span class="mail-icon" data-icon="down" aria-hidden="true"></span>
+            </div>
           </div>
           <button :if="selected?.folder === 'Newsletters'" class="wm-action wm-newsletter-toggle" @click="newsletterExpanded.set(!newsletterExpanded())" :aria-pressed="readerExpanded" :text="readerExpanded ? 'Show message list' : 'Expand reader'"></button>
           <button :if="readingBatch && selected?.folder !== 'Archive'" type="button" class="wm-action" @click="triageAndNext('archive')" :disabled="triageBusy || mutating || readingLoading">Archive &amp; next</button>
@@ -351,7 +354,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         </div>
         <div class="wm-message-heading">
           <div class="wm-message-heading-actions">
-            <span class="wm-folder-badge" :text="folderName(selected?.folder || '')"></span>
+            <span class="wm-folder-badge"><span class="mail-icon" :data-icon="mailFolderIcon(selected?.folder || '')" aria-hidden="true"></span><span :text="folderName(selected?.folder || '')"></span></span>
             <button :if="canOpenPrivate" type="button" class="wm-action wm-action--quiet" :aria-expanded="privateOpen" @click="privateOpen ? closePrivate() : showPrivate()" :disabled="readingLoading || mutating"><span class="mail-icon" data-icon="bookmark" aria-hidden="true"></span>Private tools</button>
           </div>
           <h2 class="wm-read-subject" tabindex="-1" data-reader-focus :text="displaySubject(selected)"></h2>
@@ -396,7 +399,10 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
           </div>
         </section>
         <div :if="receiptCompact" class="wm-receipt-preview">
-          <div class="wm-receipt-meta"><strong :text="selected?.from"></strong><span :text="fullDate(selected?.date || '')"></span></div>
+          <div class="wm-receipt-meta">
+            <div class="wm-receipt-sender"><strong :text="senderLabel(selected?.from || '')"></strong><small :if="senderLabel(selected?.from || '') !== selected?.from" :text="senderAddress(selected?.from || '')"></small></div>
+            <time :text="fullDate(selected?.date || '')"></time>
+          </div>
           <p :if="receiptPreview" class="wm-receipt-excerpt" :text="receiptPreview"></p>
         </div>
         <div :if="!receiptCompact" class="wm-read-meta">
