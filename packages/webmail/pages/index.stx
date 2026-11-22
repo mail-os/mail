@@ -33,6 +33,11 @@ function startComposition() {
   closeFolders()
   compose()
 }
+function cancelComposer(event) {
+  if (event.target !== event.currentTarget) return
+  event.preventDefault()
+  closeComposer()
+}
 const mail = useWebmail({
   composer: useRef('composerDialog'), password: useRef('passwordDialog'),
   confirmation: useRef('confirmDialog'), fileInput: useRef('fileInput'),
@@ -475,7 +480,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
     </div>
   </section>
 </div>
-<dialog :if="composing" ref="composerDialog" class="wm-modal" aria-label="Compose message" @cancel.prevent="closeComposer()">
+<dialog :if="composing" ref="composerDialog" class="wm-modal" aria-label="Compose message" @cancel="cancelComposer($event)">
   <form class="wm-composer" @submit.prevent="send()">
     <header class="wm-composer-head"><span class="wm-composer-title"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span><span :text="title"></span></span><button type="button" class="wm-composer-close" @click="closeComposer()" :disabled="sending || savingDraft" aria-label="Close composer" title="Close composer"><span class="mail-icon" data-icon="close" aria-hidden="true"></span></button></header>
     <div class="wm-composer-fields">
