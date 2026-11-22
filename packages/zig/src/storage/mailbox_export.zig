@@ -8,6 +8,7 @@ const time_compat = @import("../core/time_compat.zig");
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const Tar = std.tar.Writer;
+const archive_path_capacity = 1024;
 const Collection = struct { name: []const u8, path: []const u8 };
 const Manifest = struct {
     mailbox: []const u8,
@@ -162,20 +163,73 @@ fn writeMessages(io: std.Io, archive: *Tar, dir: Dir, path: []const u8, slot: []
         defer file.close(io);
         const before = try file.stat(io);
         if (before.kind != .file) return error.MailboxChangedDuringExport;
-        const seconds: u64 = @intCast(@max(0, before.mtime.toSeconds()));
+        const seconds: i64 = @intCast(@divFloor(before.mtime.nanoseconds, std.time.ns_per_s));
+        // USTAR has eleven unsigned octal digits for the modification time.
+        const ustar_mtime: ?u64 = if (seconds >= 0 and seconds <= std.math.maxInt(u33)) @intCast(seconds) else null;
         // Fresh names prevent collisions when a folder has both storage layouts.
-        var name_buffer: [1024]u8 = undefined;
+        var name_buffer: [archive_path_capacity]u8 = undefined;
         const archive_name = try std.fmt.bufPrint(&name_buffer, "{s}/{s}/{d}.{d}.portable.eml{s}{s}", .{
-            path,                                                              slot,  seconds, sequence.*,
+            path,                                                              slot,  ustar_mtime orelse 0, sequence.*,
             if (std.mem.eql(u8, slot, "cur") or flags.len != 0) ":2," else "", flags,
         });
         sequence.* += 1;
+        var header_name: []const u8 = archive_name;
+        if (ustar_mtime == null) {
+            // Keep the local PAX header immediately before the regular header.
+            // Carry long paths in PAX too, instead of inserting a GNU long-name header here.
+            var probe: Tar.Header = .{};
+            const long_path = if (probe.setPath("", archive_name)) |_| false else |_| true;
+            try writePaxTime(archive.underlying_writer, seconds, if (long_path) archive_name else null);
+            if (long_path) header_name = "Maildir/portable-message";
+        }
         var reader = file.reader(io, &read_buffer);
-        try archive.writeFileStream(archive_name, before.size, &reader.interface, .{ .mode = 0o600, .mtime = seconds });
+        try archive.writeFileStream(header_name, before.size, &reader.interface, .{ .mode = 0o600, .mtime = ustar_mtime orelse 0 });
         const after = try file.stat(io);
         if (after.size != before.size or after.mtime.nanoseconds != before.mtime.nanoseconds)
             return error.MailboxChangedDuringExport;
     }
+}
+
+fn writePaxTime(output: *std.Io.Writer, seconds: i64, path: ?[]const u8) !void {
+    var time_buffer: [24]u8 = undefined;
+    const time = try std.fmt.bufPrint(&time_buffer, "{d}", .{seconds});
+    var record_buffer: [archive_path_capacity + 64]u8 = undefined;
+    var records = std.Io.Writer.fixed(&record_buffer);
+    try writePaxRecord(&records, "mtime", time);
+    if (path) |name| try writePaxRecord(&records, "path", name);
+    const payload = records.buffered();
+
+    // std.tar.Writer has no PAX output API. Reuse its USTAR layout and numeric
+    // fields, then set the local extended-header type and checksum on the bytes.
+    var header: Tar.Header = .{};
+    try header.setPath("", "PaxHeaders/mail-export");
+    try header.setMode(0o600);
+    try header.setSize(payload.len);
+    var bytes = std.mem.asBytes(&header).*;
+    bytes[@offsetOf(Tar.Header, "typeflag")] = 'x';
+    const checksum_offset = @offsetOf(Tar.Header, "checksum");
+    const checksum_field = bytes[checksum_offset..][0..8];
+    @memset(checksum_field, ' ');
+    var checksum: u32 = 0;
+    for (bytes) |byte| checksum += byte;
+    _ = try std.fmt.bufPrint(checksum_field, "{o:0>6}\x00 ", .{checksum});
+
+    try output.writeAll(&bytes);
+    try output.writeAll(payload);
+    const block_size = @sizeOf(Tar.Header);
+    try output.splatByteAll(0, (block_size - payload.len % block_size) % block_size);
+}
+
+fn writePaxRecord(writer: *std.Io.Writer, key: []const u8, value: []const u8) !void {
+    // The decimal length includes itself, the separator, and the final newline.
+    const body_length = key.len + value.len + " =\n".len;
+    var length = body_length + 1;
+    while (true) {
+        const total = body_length + std.math.log10_int(length) + 1;
+        if (length == total) break;
+        length = total;
+    }
+    try writer.print("{d} {s}={s}\n", .{ length, key, value });
 }
 
 fn writeDav(gpa: Allocator, a: Allocator, io: std.Io, db: *database.Database, archive: *Tar, manifest: *Manifest, mailbox_id: i64, options: Options) !void {

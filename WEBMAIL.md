@@ -315,7 +315,9 @@ stores for a point-in-time export across mail and DAV.
 
 - `Maildir/` contains Inbox and named folders in Maildir++ format. Message
   files retain their original MIME bytes and attachments. Standard flags travel
-  in the filename and the archive carries file modification times.
+  in the filename and the archive carries file modification times to the second.
+  Dates outside the USTAR range, including pre-1970 dates, use PAX extended
+  headers. GNU tar and bsdtar preserve these timestamps on extraction.
 - `Calendars/` contains an iCalendar file for each owned calendar. Import them
   into a calendar client using its ICS import. The existing 16 MiB
   per-calendar export limit applies.

@@ -6,11 +6,13 @@ from datetime import datetime
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
+from imaplib import Time2Internaldate
 import json
 import mailbox
 from pathlib import Path
 import runpy
 import stat
+import subprocess
 import tarfile
 import tempfile
 
@@ -20,6 +22,15 @@ Fixture, command = tools["Fixture"], tools["command"]
 DavClient = runpy.run_path(str(SCRIPTS / "test-dav-https.py"))["DavClient"]
 ATTACHMENT = b"Portable attachment content \x00\xff"
 FILE_TIME = 1741212345
+USTAR_MTIME_LIMIT = (1 << 33) - 1
+LONG_FOLDER = "Historical mail " + "x" * 150
+TIMESTAMP_CASES = [
+    ("INBOX", "One second before the epoch", -1),
+    ("INBOX", "The Unix epoch", 0),
+    (LONG_FOLDER, "Historical message in a long folder", -205891200),
+    ("INBOX", "At the USTAR timestamp limit", USTAR_MTIME_LIMIT),
+    ("INBOX", "After the USTAR timestamp limit", USTAR_MTIME_LIMIT + 1),
+]
 EVENT = (
     b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Mail Export Fixture//EN\r\n"
     b"BEGIN:VEVENT\r\nUID:portable-event\r\nDTSTAMP:20260317T100000Z\r\n"
@@ -35,6 +46,11 @@ CARD = (
 def put_dav(client, path, content_type, body):
     result = client.request("PUT", path, body, {"Content-Type": content_type})
     assert result[0] == 201, result
+
+
+def internaldate(response):
+    value = response.split(b'INTERNALDATE "', 1)[1].split(b'"', 1)[0]
+    return datetime.strptime(value.decode(), "%d-%b-%Y %H:%M:%S %z").timestamp()
 
 
 def seed(source):
@@ -60,12 +76,18 @@ def seed(source):
                 assert "CREATE requires one mailbox name" in str(error), error
             else:
                 raise AssertionError(f"CREATE accepted invalid mailbox arguments {invalid}")
-        for folder in ["Projects", "Empty folder"]:
+        for folder in ["Projects", "Empty folder", LONG_FOLDER]:
             assert imap.create('"' + folder + '"')[0] == "OK"
         assert imap.create('"Temporary folder"')[0] == "OK"
         assert imap.delete('"Temporary folder"')[0] == "OK"
         assert imap.append("Projects", r"(\Seen \Flagged)", FILE_TIME, raw)[0] == "OK"
         assert imap.append("Sent", r"(\Seen \Answered)", None, raw)[0] == "OK"
+        for folder, subject, received_at in TIMESTAMP_CASES:
+            message = EmailMessage(policy=policy.SMTP)
+            message["From"] = message["To"] = owner
+            message["Subject"] = subject
+            message.set_content("Verify the archive preserves the original received time.")
+            assert imap.append(f'"{folder}"', None, Time2Internaldate(received_at), message.as_bytes())[0] == "OK"
 
     owner_dir = source.directory / "mail" / owner
     # Imported or upgraded installations may have both the old flat directory
@@ -106,12 +128,26 @@ def inspect(source, owner, archive, extracted, original):
     with tarfile.open(archive) as data:
         assert len(set(data.getnames())) == len(data.getnames())
         assert all(member.isfile() or member.isdir() for member in data.getmembers())
-        data.extractall(extracted, filter="data")
+        members_by_subject = {}
+        for member in data.getmembers():
+            if member.isfile() and ".eml" in member.name:
+                with data.extractfile(member) as content:
+                    message = BytesParser(policy=policy.default).parse(content)
+                members_by_subject[message["Subject"]] = member
+        for folder, subject, received_at in TIMESTAMP_CASES:
+            member = members_by_subject[subject]
+            assert member.mtime == received_at, (subject, member.mtime, received_at)
+            expected_pax_mtime = str(received_at) if not 0 <= received_at <= USTAR_MTIME_LIMIT else None
+            assert member.pax_headers.get("mtime") == expected_pax_mtime
+            if folder == LONG_FOLDER:
+                assert member.pax_headers.get("path") == member.name
+        assert "mtime" not in members_by_subject["Legacy project copy"].pax_headers
+    subprocess.run(["tar", "-xf", str(archive), "-C", str(extracted)], check=True)
 
     manifest = json.loads((extracted / "manifest.json").read_bytes())
     assert manifest["version"] == 1 and manifest["mailbox"] == owner
     folders = {item["name"]: extracted / item["path"] for item in manifest["folders"]}
-    assert set(folders) == {"INBOX", "Projects", "Empty folder", "Sent"}, folders
+    assert set(folders) == {"INBOX", "Projects", "Empty folder", "Sent", LONG_FOLDER}, folders
     assert {item["name"] for item in manifest["calendars"]} == {"Design"}
     assert {item["name"] for item in manifest["addressBooks"]} == {"Friends"}
     assert not list(folders["INBOX"].joinpath("tmp").iterdir())
@@ -123,7 +159,13 @@ def inspect(source, owner, archive, extracted, original):
 
     # Read the extract with an independent Maildir implementation.
     portable = mailbox.Maildir(str(folders["INBOX"]), create=False)
-    assert {item["Subject"] for item in portable} == {"Portable inbox"}
+    assert {item["Subject"] for item in portable} == {
+        "Portable inbox", *(subject for folder, subject, _ in TIMESTAMP_CASES if folder == "INBOX"),
+    }
+    for folder, subject, received_at in TIMESTAMP_CASES:
+        maildir = portable if folder == "INBOX" else portable.get_folder(folder)
+        item, = [message for message in maildir if message["Subject"] == subject]
+        assert item.get_date() == received_at, (subject, item.get_date(), received_at)
     project_box = portable.get_folder("Projects")
     assert {item["Subject"]: item.get_flags() for item in project_box} == {
         "Portable project attachment": "FS", "Legacy project copy": "D",
@@ -157,18 +199,25 @@ def transfer(destination, extracted, manifest):
                 for file in (path / slot).iterdir():
                     flags = file.name.partition(":2,")[2]
                     encoded = "(" + " ".join(flag_map[flag] for flag in flags) + ")"
-                    assert imap.append(quoted, encoded, file.stat().st_mtime, file.read_bytes())[0] == "OK"
+                    date_arg = Time2Internaldate(file.stat().st_mtime)
+                    assert imap.append(quoted, encoded, date_arg, file.read_bytes())[0] == "OK"
         assert imap.select('"Projects"') == ("OK", [b"2"])
         result, rows = imap.search(None, "FLAGGED")
         assert result == "OK" and len(rows[0].split()) == 1
         result, rows = imap.fetch(rows[0], "(BODY.PEEK[] INTERNALDATE)")
         message = BytesParser(policy=policy.default).parsebytes(rows[0][1])
         assert result == "OK" and message["Subject"] == "Portable project attachment"
-        date = rows[0][0].split(b'INTERNALDATE "', 1)[1].split(b'"', 1)[0]
-        assert datetime.strptime(date.decode(), "%d-%b-%Y %H:%M:%S %z").timestamp() == FILE_TIME
+        assert internaldate(rows[0][0]) == FILE_TIME
         part, = message.iter_attachments()
         assert part.get_filename() == "fixture.bin" and part.get_payload(decode=True) == ATTACHMENT
         assert imap.select('"Empty folder"') == ("OK", [b"0"])
+        for folder, subject, received_at in TIMESTAMP_CASES:
+            assert imap.select(f'"{folder}"')[0] == "OK"
+            result, rows = imap.search(None, "SUBJECT", f'"{subject}"')
+            assert result == "OK" and len(rows[0].split()) == 1, (subject, rows)
+            result, rows = imap.fetch(rows[0], "(INTERNALDATE)")
+            assert result == "OK"
+            assert internaldate(rows[0]) == received_at
 
     client = DavClient(destination, owner)
     calendar, = manifest["calendars"]
@@ -201,7 +250,7 @@ def main():
         destination = Fixture(binary, root / "destination", staging=True)
         with destination.daemon():
             transfer(destination, root / "extracted", manifest)
-    print("Verified private portable export and transfer of messages, flags, folders, calendar, and contacts.")
+    print("Verified private portable export and transfer of messages, received times, flags, folders, calendar, and contacts.")
 
 
 if __name__ == "__main__":
