@@ -332,6 +332,32 @@ revokes existing webmail sessions and deletes grants in both directions.
 Role changes revoke the affected user's webmail sessions. The server records
 membership and grant changes in `audit_log` in the same transaction.
 
+### Shared inboxes
+
+Create a mailbox for the shared address and enroll that account and its
+teammates in the same team. For example, the operator can grant
+`mail team grant studio studio@example.com alex@example.com mailbox`. Direct
+mail for the address lands in its own Inbox. Forwarding aliases redirect to
+other mailboxes, and catch-all routing handles otherwise-unmatched addresses.
+The mailbox grant shares work on a mailbox. A teammate still signs in to their
+personal account. Grant `sender` separately to allow sending from the address.
+
+Open **Shared inboxes** in webmail to read incoming messages, assign a teammate,
+resolve or reopen work, and see who changed it. The view covers the Inbox,
+while the source mailbox keeps its own folders, sessions, and personal
+metadata. To share attachment downloads, grant `attachments` for the specific
+message reference in that team.
+
+- `GET /webmail/api/shared-inboxes` lists accessible team and mailbox pairs.
+- `GET /webmail/api/shared-inboxes/:team/:id?page=1` returns one Inbox page.
+- `GET /webmail/api/shared-inboxes/:team/:id/messages/:reference` returns the
+  shared message and workflow. Its attachment links require both the mailbox
+  grant and the per-message attachment grant for teammates.
+- `PUT .../messages/:reference/workflow` accepts `action`, `revision`, and
+  `messageRevision`. Use `assign` with an `assignee` ID or use `unassign`,
+  `resolve`, or `reopen`. A competing edit returns 409. Revoking the mailbox
+  grant clears that teammate’s assignments and prevents further access.
+
 ## API contracts
 
 All mutations require a session and same-origin request. Clients include

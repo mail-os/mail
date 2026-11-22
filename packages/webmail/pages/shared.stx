@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Shared inboxes · Mail</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<script client>
+import { inboxKey, inboxLabel, useSharedInbox, workflowActivity } from '../functions/use-shared-inbox'
+import { fullDate, readableBytes, senderAddress, senderInitials, shortDate } from '../functions/mail-utils'
+const {
+  inboxes, selectedInbox, mailbox, listing, detail, reference, loading, opening, saving, error, ready, formatted,
+  mount, refresh, selectInbox, turnPage, readMessage, closeMessage, attachmentPath, change, destroy,
+} = useSharedInbox(() => navigate('/login', { reload: true }))
+const readerHeading = useRef('sharedTitle')
+const listHeading = useRef('sharedListTitle')
+async function openSharedMessage(id) {
+  await readMessage(id)
+  nextTick(() => readerHeading.current?.focus())
+}
+function backToList() {
+  closeMessage()
+  nextTick(() => listHeading.current?.focus())
+}
+onMount(mount)
+onUnmounted(destroy)
+useInterval(refresh, 15000, { whileVisible: true })
+useEventListener('focus', refresh)
+useEventListener('online', refresh)
+</script>
+<main class="wm-shared-page" :class="{ 'wm-shared-reading': !!reference }">
+  <header class="wm-shared-header">
+    <a class="wm-action wm-shared-back" href="/"><span class="mail-icon" data-icon="back" aria-hidden="true"></span>Mail</a>
+    <span class="mail-app-mark"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span></span>
+    <h1>Shared inboxes</h1>
+    <div :if="inboxes.length" class="wm-shared-switch"><label class="wm-a11y-text" for="sharedInboxPicker">Shared inbox</label><select id="sharedInboxPicker" @change="selectInbox($event.target.value)" :disabled="saving">
+      <option :if="!selectedInbox" value="">Choose an inbox</option>
+      <option :for="inbox in inboxes" :key="inboxKey(inbox)" :value="inboxKey(inbox)" :selected="inboxKey(inbox) === selectedInbox" :text="inboxLabel(inbox)"></option>
+    </select></div>
+    <button type="button" class="wm-action" @click="refresh()" :disabled="saving || loading" aria-label="Refresh shared inbox" title="Refresh shared inbox"><span class="mail-icon" data-icon="refresh" aria-hidden="true"></span></button>
+  </header>
+  <p :if="error" class="wm-inline-error wm-shared-error" role="alert" :text="error"></p>
+  <p :if="!ready" class="wm-shared-empty" role="status">Opening shared inboxes…</p>
+  <p :if="ready && !inboxes.length && !error" class="wm-shared-empty">You have no shared inboxes.</p>
+  <div :if="mailbox" class="wm-shared-workspace">
+    <section class="wm-shared-list" aria-label="Shared messages" :aria-busy="loading">
+      <header class="wm-shared-list-head"><span class="mail-icon" data-icon="inbox" aria-hidden="true"></span><div><h2 ref="sharedListTitle" tabindex="-1" :text="mailbox?.address"></h2><p :if="listing" :text="listing.total + (listing.total === 1 ? ' message' : ' messages')"></p></div></header>
+      <p :if="listing && !listing.items.length" class="wm-shared-empty">No messages in this inbox.</p>
+      <button :for="row in (listing?.items || [])" :key="row.message.reference" type="button" class="wm-msg wm-shared-row" @click="openSharedMessage(row.message.reference)" :disabled="saving" :aria-current="row.message.reference === reference ? 'true' : null">
+        <span class="wm-msg-row"><span class="wm-msg-from" :text="senderAddress(row.message.from) || row.message.from || '(unknown sender)'"></span><time class="wm-msg-date" :text="shortDate(row.message.date)"></time></span>
+        <span class="wm-msg-subject" :text="row.message.subject || '(no subject)'"></span>
+        <span :if="row.message.snippet" class="wm-msg-snippet" :text="row.message.snippet"></span>
+        <span class="wm-shared-labels"><span class="wm-shared-status" :class="{ 'wm-shared-status--resolved': row.workflow.resolved }" :text="row.workflow.resolved ? 'Resolved' : 'Open'"></span><span :text="row.workflow.assignee?.address || 'Unassigned'"></span></span>
+      </button>
+      <footer :if="listing && (listing.more || listing.page > 1)" class="wm-pagination">
+        <button type="button" @click="turnPage(-1)" :disabled="loading || saving || listing.page === 1">Previous</button>
+        <span :text="'Page ' + listing.page"></span>
+        <button type="button" @click="turnPage(1)" :disabled="loading || saving || !listing.more">Next</button>
+      </footer>
+    </section>
+    <section class="wm-shared-reader" aria-label="Shared message reader" :aria-busy="opening">
+      <button :if="reference" type="button" class="wm-action wm-shared-reader-back" @click="backToList()" :disabled="saving"><span class="mail-icon" data-icon="back" aria-hidden="true"></span>Back to messages</button>
+      <p :if="opening" class="wm-shared-empty" role="status">Opening message…</p>
+      <p :if="!reference" class="wm-shared-empty">Select a message to read.</p>
+      <article :if="detail" class="wm-shared-message">
+        <div class="wm-shared-actions">
+          <div class="wm-shared-assignee"><label for="sharedAssignee">Assigned to</label>
+            <select id="sharedAssignee" :disabled="saving || loading" @change="$event.target.value ? change('assign', $event.target.value) : change('unassign')">
+              <option value="" :selected="!detail.workflow.assignee">Unassigned</option>
+              <option :for="person in detail.assignable" :key="person.id" :value="person.id" :selected="detail.workflow.assignee?.id === person.id" :text="person.address"></option>
+              <option :if="detail.workflow.assignee && !detail.assignable.some(person => person.id === detail.workflow.assignee.id)" :value="detail.workflow.assignee.id" :selected="true" :text="detail.workflow.assignee.address + ' (unavailable)'"></option>
+            </select>
+          </div>
+          <button type="button" class="wm-action wm-action--accent" @click="change(detail.workflow.resolved ? 'reopen' : 'resolve')" :disabled="saving || loading"><span class="mail-icon" data-icon="check" aria-hidden="true"></span><span :text="detail.workflow.resolved ? 'Reopen' : 'Resolve'"></span></button>
+        </div>
+        <p class="wm-shared-activity" role="status"><span class="wm-shared-status" :class="{ 'wm-shared-status--resolved': detail.workflow.resolved }" :text="detail.workflow.resolved ? 'Resolved' : 'Open'"></span><span :if="workflowActivity(detail.workflow)" :text="workflowActivity(detail.workflow)"></span><time :if="detail.workflow.changedAt" :text="new Date(detail.workflow.changedAt * 1000).toLocaleString()"></time></p>
+        <header class="wm-shared-message-head">
+          <h2 ref="sharedTitle" tabindex="-1" :text="detail.subject || '(no subject)'"></h2>
+          <div class="wm-shared-sender"><span class="wm-avatar" aria-hidden="true" :text="senderInitials(detail.from)"></span><div><strong :text="senderAddress(detail.from) || detail.from || '(unknown sender)'"></strong><span :if="detail.to" :text="'To ' + detail.to"></span></div><time :text="fullDate(detail.date)"></time></div>
+        </header>
+        <div :if="detail.attachments.length" class="wm-read-attach"><a :for="(attachment, index) in detail.attachments" class="wm-attach-chip" :href="attachmentPath(index)" :download="attachment.filename"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span><span :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></span></a></div>
+        <p :if="detail.hasAttachments && !detail.attachments.length" class="wm-shared-activity"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span>Attachment access required</p>
+        <iframe :if="detail.html" class="wm-read-html wm-shared-html" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" title="Email content" :srcdoc="formatted.source"></iframe>
+        <pre :if="!detail.html" class="wm-shared-text" :text="detail.text"></pre>
+      </article>
+    </section>
+  </div>
+</main>
+</body>
+</html>

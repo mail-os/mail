@@ -309,6 +309,23 @@ pub fn listMessagePage(
     per_page: usize,
     query: []const u8,
 ) !MessagePage {
+    return listPage(allocator, db, user, folder, page, per_page, query, false);
+}
+
+pub fn listSharedInboxPage(a: std.mem.Allocator, db: *database.Database, user: []const u8, page: usize, per_page: usize) !MessagePage {
+    return listPage(a, db, user, "INBOX", page, per_page, "", true);
+}
+
+fn listPage(
+    allocator: std.mem.Allocator,
+    db: *database.Database,
+    user: []const u8,
+    folder: []const u8,
+    page: usize,
+    per_page: usize,
+    query: []const u8,
+    shared: bool,
+) !MessagePage {
     if (!isValidFolderName(folder)) return MaildirError.InvalidFolderName;
     _ = try db.getOrCreateMailbox(user, folder);
     const refs = try collectFiles(allocator, user, folder);
@@ -320,6 +337,8 @@ pub fn listMessagePage(
     while (remaining > 0) {
         remaining -= 1;
         const r = refs[remaining];
+        const flags = flagsFrom(r.name);
+        if (shared and flags.deleted) continue;
         if (query.len == 0 and (total < start or out.items.len >= per_page)) {
             total += 1;
             continue;
@@ -328,7 +347,11 @@ pub fn listMessagePage(
         defer scratch.deinit();
         const a = scratch.allocator();
         const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ r.dir, r.name });
-        const raw = fs_compat.readFileAlloc(a, path) catch continue;
+        const captured: FileSnapshot = if (shared) snapFile(a, db, path) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        } else .{ .raw = fs_compat.readFileAlloc(a, path) catch continue, .stamp = "" };
+        const raw = captured.raw;
         const headers = parseHeaders(a, raw) catch HeaderSet{};
         const body = extractBody(a, raw, .preview) catch BodyParts{};
         if (query.len > 0 and !matchesQuery(headers, body, query)) continue;
@@ -342,7 +365,7 @@ pub fn listMessagePage(
             .subject = try allocator.dupe(u8, headers.subject),
             .date = try allocator.dupe(u8, headers.date),
             .snippet = try makeSnippet(allocator, body.text),
-            .flags = flagsFrom(r.name),
+            .flags = flags,
             .has_attachments = body.has_attachments,
             .size = raw.len,
             .folder = try allocator.dupe(u8, folder),
@@ -350,6 +373,7 @@ pub fn listMessagePage(
             .in_reply_to = try allocator.dupe(u8, headers.in_reply_to),
             .references = try allocator.dupe(u8, headers.references),
             .timestamp = messageTimestamp(headers.date, r.name),
+            .snapshot = if (shared) .{ .file = r, .stamp = try allocator.dupe(u8, captured.stamp), .digest = message_refs.digest(raw) } else null,
         });
     }
     return .{ .items = try out.toOwnedSlice(allocator), .total = total };
@@ -952,6 +976,13 @@ pub fn checkRevision(a: std.mem.Allocator, db: *database.Database, user: []const
     const entry = try resolveVersioned(a, db, user, id);
     if (!std.mem.eql(u8, entry.version.revision, expected)) return MaildirError.RevisionMismatch;
     return entry.locator;
+}
+
+/// The caller holds the mailbox lock through the shared workflow mutation.
+pub fn checkSharedInboxRevision(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8, expected: []const u8) !void {
+    const entry = try resolveVersioned(a, db, user, id);
+    if (!std.mem.eql(u8, entry.locator.folder, "INBOX") or flagsFrom(entry.name).deleted) return MaildirError.MessageNotFound;
+    if (!std.mem.eql(u8, entry.version.revision, expected)) return MaildirError.RevisionMismatch;
 }
 
 pub fn getByReference(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8) !MessageDetail {

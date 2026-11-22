@@ -34,6 +34,7 @@ const time_compat = @import("../core/time_compat.zig");
 const logger = @import("../core/logger.zig");
 const database = @import("../storage/database.zig");
 const teams = @import("../storage/team_store.zig");
+const shared_inbox = @import("../storage/shared_inbox.zig");
 const auth_mod = @import("../auth/auth.zig");
 const session_mod = @import("webmail_session.zig");
 const maildir = @import("webmail_maildir.zig");
@@ -75,6 +76,7 @@ pub const ProvisioningConfig = struct {
 const index_html = @embedFile("webmail_dist/index.html");
 const login_html = @embedFile("webmail_dist/login.html");
 const calendar_html = @embedFile("webmail_dist/calendar.html");
+const shared_html = @embedFile("webmail_dist/shared.html");
 const calendar_timezones = @embedFile("webmail_dist/calendar_timezones.ics");
 const recover_html = @embedFile("webmail_dist/recover.html");
 const status_html = @embedFile("webmail_dist/status.html");
@@ -517,6 +519,8 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
         (std.mem.eql(u8, req.method, "GET") or std.mem.eql(u8, req.method, "PUT"))) return handleComposeLibrary(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/teams") or std.mem.startsWith(u8, p, "/webmail/api/teams/"))
         return handleTeams(server, conn, arena, req);
+    if (std.mem.eql(u8, p, "/webmail/api/shared-inboxes") or std.mem.startsWith(u8, p, "/webmail/api/shared-inboxes/"))
+        return handleSharedInboxes(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/sender-review/status") and std.mem.eql(u8, req.method, "GET")) return handleSenderReviewStatus(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/sender-review") and std.mem.eql(u8, req.method, "GET")) return handleSenderReviewList(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/sender-review") and std.mem.eql(u8, req.method, "PUT")) return handleSenderReviewSettings(server, conn, arena, req);
@@ -643,6 +647,9 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
         }
         if (std.mem.eql(u8, p, "/calendar")) {
             return serveAsset(conn, arena, calendar_html, "text/html; charset=utf-8");
+        }
+        if (std.mem.eql(u8, p, "/shared")) {
+            return serveAsset(conn, arena, shared_html, "text/html; charset=utf-8");
         }
         if (std.mem.eql(u8, p, "/login")) {
             return serveAsset(conn, arena, login_html, "text/html; charset=utf-8");
@@ -1295,7 +1302,10 @@ fn handleAttachment(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
         break :blk maildir.getVersionedMessage(arena, server.db, sess.username, folder, uid) catch |err| return mapMaildirError(conn, arena, err);
     };
     if (index >= message.attachments.len) return sendError(conn, arena, 404, "not_found", "No such attachment");
-    const att = message.attachments[index];
+    return sendAttachment(conn, arena, message.attachments[index]);
+}
+
+fn sendAttachment(conn: *webmail_tls.Stream, arena: std.mem.Allocator, att: maildir.AttachmentInfo) !void {
     const header = try std.fmt.allocPrint(arena, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: {s}\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: sandbox\r\nConnection: close\r\n\r\n", .{ try attachmentDisposition(arena, att.filename), att.data.len });
     try writeAll(conn, header);
     try writeAll(conn, att.data);
@@ -1498,6 +1508,7 @@ fn handleClientConfig(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
     defer sess.deinit(server.allocator);
     var limits = try server.service.limits(sess.username);
     limits.calendarAvailable = server.dav_store != null;
+    limits.sharedInboxesAvailable = try shared_inbox.available(server.db, sess.username);
     if (store.get(arena, server.db, sess.username, "preferences", "settings")) |row| {
         const parsed = try std.json.parseFromSlice(struct { undoSendSeconds: u32 }, arena, row.payload, .{});
         defer parsed.deinit();
@@ -1600,6 +1611,144 @@ fn teamError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: anyerror)
         error.DisabledTeamAccount => sendError(conn, arena, 409, "team_account_disabled", "Activate the mailbox before granting team access."),
         error.InvalidTeamData => sendError(conn, arena, 400, "invalid_team_data", "Check the team, mailbox, role, or resource."),
         else => mapServiceError(conn, arena, err),
+    };
+}
+
+fn handleSharedInboxes(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    const writing = std.mem.eql(u8, req.method, "PUT");
+    const reading = std.mem.eql(u8, req.method, "GET");
+    if (writing and !isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    var session = (try requireSession(server, conn, a, req)) orelse return;
+    defer session.deinit(server.allocator);
+    const path = "/webmail/api/shared-inboxes";
+    if (std.mem.eql(u8, req.path, path)) {
+        if (!reading) return sharedInboxError(conn, a, error.SharedInboxNotFound);
+        const inboxes = shared_inbox.list(a, server.db, session.username) catch |err| return sharedInboxError(conn, a, err);
+        return sendJson(conn, a, 200, try service_mod.json(a, inboxes), null);
+    }
+    var parts = std.mem.splitScalar(u8, req.path[path.len + 1 ..], '/');
+    const team = parts.next().?;
+    const id = shared_inbox.positiveId(parts.next() orelse "") orelse return sharedInboxError(conn, a, error.SharedInboxNotFound);
+    if (!teams.validTeamId(team)) return sharedInboxError(conn, a, error.SharedInboxNotFound);
+    const source = shared_inbox.source(a, server.db, session.username, team, id) catch |err| return sharedInboxError(conn, a, err);
+    const section = parts.next() orelse {
+        if (!reading) return sharedInboxError(conn, a, error.SharedInboxNotFound);
+        return sharedInboxPage(server, conn, a, req, session.username, team, id, source.username);
+    };
+    const reference = parts.next() orelse "";
+    if (!std.mem.eql(u8, section, "messages") or !message_refs.valid(reference))
+        return sharedInboxError(conn, a, error.SharedInboxNotFound);
+    const action = parts.next();
+    if (writing and action != null and std.mem.eql(u8, action.?, "workflow") and parts.next() == null) {
+        if (req.body.len > 8192) return sharedInboxError(conn, a, error.InvalidSharedChange);
+        const patch = std.json.parseFromSliceLeaky(shared_inbox.Change, a, req.body, .{}) catch return sharedInboxError(conn, a, error.InvalidSharedChange);
+        const changed = changeSharedWorkflow(a, server.db, session.username, team, id, source.username, reference, patch) catch |err|
+            return sharedInboxError(conn, a, err);
+        return sendJson(conn, a, 200, try service_mod.json(a, changed), null);
+    }
+    if (!reading) return sharedInboxError(conn, a, error.SharedInboxNotFound);
+    if (action) |part| {
+        const index = std.fmt.parseInt(usize, parts.next() orelse "", 10) catch return sharedInboxError(conn, a, error.SharedInboxNotFound);
+        if (!std.mem.eql(u8, part, "attachments") or parts.next() != null)
+            return sharedInboxError(conn, a, error.SharedInboxNotFound);
+        if (!try shared_inbox.canDownload(server.db, session.username, team, id, reference))
+            return sharedInboxError(conn, a, error.SharedAttachmentForbidden);
+        const msg = readSharedMessage(a, server.db, source.username, reference) catch |err| return sharedInboxError(conn, a, err);
+        const revision = req.queryParam(a, "revision") orelse return sendError(conn, a, 428, "revision_required", "Use a current attachment link.");
+        if (!std.mem.eql(u8, msg.version.?.revision, revision)) return sharedInboxError(conn, a, error.RevisionMismatch);
+        if (index >= msg.attachments.len) return sharedInboxError(conn, a, error.SharedInboxNotFound);
+        if (!try shared_inbox.canDownload(server.db, session.username, team, id, reference))
+            return sharedInboxError(conn, a, error.SharedAttachmentForbidden);
+        return sendAttachment(conn, a, msg.attachments[index]);
+    }
+    const msg = readSharedMessage(a, server.db, source.username, reference) catch |err| return sharedInboxError(conn, a, err);
+    const workflow = try shared_inbox.workflow(a, server.db, team, id, reference);
+    const assignable = try shared_inbox.targets(a, server.db, team, id);
+    const attachments = try shared_inbox.canDownload(server.db, session.username, team, id, reference);
+    var body: std.ArrayList(u8) = .empty;
+    const w = jw(&body, a);
+    try writeSharedMessage(w, a, msg, workflow, assignable, attachments);
+    _ = shared_inbox.source(a, server.db, session.username, team, id) catch |err| return sharedInboxError(conn, a, err);
+    return sendJson(conn, a, 200, body.items, null);
+}
+
+fn sharedInboxPage(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request, actor: []const u8, team: []const u8, id: i64, source: []const u8) !void {
+    const per_page = 25;
+    const requested = @max(parseUintParam(req, a, "page", 1), 1);
+    var page = maildir.listSharedInboxPage(a, server.db, source, requested, per_page) catch |err| return sharedInboxError(conn, a, err);
+    const last = @max(1, page.total / per_page + @intFromBool(page.total % per_page != 0));
+    const current = @min(last, requested);
+    if (requested > current) page = try maildir.listSharedInboxPage(a, server.db, source, current, per_page);
+    var body: std.ArrayList(u8) = .empty;
+    const w = jw(&body, a);
+    try w.print("{{\"page\":{d},\"total\":{d},\"more\":{},\"items\":[", .{ current, page.total, current < last });
+    var first = true;
+    for (page.items) |item| {
+        const version = (try maildir.summaryVersion(a, server.db, source, item)) orelse continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("{\"message\":");
+        try writeMessageSummary(w, item, version);
+        try w.writeAll(",\"workflow\":");
+        try w.writeAll(try service_mod.json(a, try shared_inbox.workflow(a, server.db, team, id, version.reference)));
+        try w.writeByte('}');
+    }
+    try w.writeAll("]}");
+    _ = shared_inbox.source(a, server.db, actor, team, id) catch |err| return sharedInboxError(conn, a, err);
+    return sendJson(conn, a, 200, body.items, null);
+}
+
+fn changeSharedWorkflow(a: std.mem.Allocator, db: *database.Database, actor: []const u8, team: []const u8, id: i64, source: []const u8, reference: []const u8, patch: shared_inbox.Change) !shared_inbox.Workflow {
+    db.lockMailboxes();
+    defer db.unlockMailboxes();
+    try maildir.checkSharedInboxRevision(a, db, source, reference, patch.messageRevision);
+    return shared_inbox.change(a, db, actor, team, id, reference, patch);
+}
+
+fn readSharedMessage(a: std.mem.Allocator, db: *database.Database, source: []const u8, reference: []const u8) !maildir.MessageDetail {
+    const msg = try maildir.getByReference(a, db, source, reference);
+    if (!std.mem.eql(u8, msg.folder, "INBOX") or msg.flags.deleted) return error.SharedInboxNotFound;
+    return msg;
+}
+
+fn writeSharedMessage(w: anytype, a: std.mem.Allocator, msg: maildir.MessageDetail, state: shared_inbox.Workflow, targets: []const shared_inbox.Target, downloads: bool) !void {
+    try w.writeAll("{\"from\":");
+    try writeJsonString(w, msg.from);
+    try w.writeAll(",\"subject\":");
+    try writeJsonString(w, msg.subject);
+    try w.writeAll(",\"date\":");
+    try writeJsonString(w, msg.date);
+    try w.writeAll(",\"to\":");
+    try writeJsonString(w, msg.to);
+    try w.writeAll(",\"text\":");
+    try writeJsonString(w, msg.text_body);
+    try w.writeAll(",\"html\":");
+    try writeJsonString(w, msg.html_body);
+    try writeVersion(w, msg.version);
+    try w.print(",\"hasAttachments\":{},\"attachments\":[", .{msg.attachments.len > 0});
+    if (downloads) for (msg.attachments, 0..) |att, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll("{\"filename\":");
+        try writeJsonString(w, att.filename);
+        try w.print(",\"size\":{d}}}", .{att.size});
+    };
+    try w.writeAll("],\"embedded_images\":[");
+    if (downloads and msg.html_body.len > 0) try writeEmbeddedImages(w, a, msg.attachments);
+    try w.writeAll("],\"workflow\":");
+    try w.writeAll(try service_mod.json(a, state));
+    try w.writeAll(",\"assignable\":");
+    try w.writeAll(try service_mod.json(a, targets));
+    try w.writeByte('}');
+}
+
+fn sharedInboxError(conn: *webmail_tls.Stream, a: std.mem.Allocator, err: anyerror) !void {
+    return switch (err) {
+        error.SharedInboxNotFound, maildir.MaildirError.MessageNotFound => sendError(conn, a, 404, "shared_inbox_not_found", "This shared inbox or message is unavailable."),
+        error.SharedInboxConflict => sendError(conn, a, 409, "shared_inbox_conflict", "A teammate changed this message. Review the latest assignment and status."),
+        error.AssigneeUnavailable => sendError(conn, a, 409, "assignee_unavailable", "That teammate no longer has access to this inbox."),
+        error.SharedAttachmentForbidden => sendError(conn, a, 403, "shared_attachment_forbidden", "You do not have access to this message’s attachments."),
+        error.InvalidSharedChange => sendError(conn, a, 400, "invalid_shared_change", "Check the requested assignment or status."),
+        else => mapServiceError(conn, a, err),
     };
 }
 

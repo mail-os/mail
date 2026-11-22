@@ -102,6 +102,7 @@ pub const Limits = struct {
     maxMessageBytes: usize,
     undoSendSeconds: u32,
     calendarAvailable: bool = false,
+    sharedInboxesAvailable: bool = false,
     junkFolder: []const u8 = "Junk",
 };
 

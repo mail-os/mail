@@ -109,6 +109,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         </button>
         <button class="wm-folder" :aria-current="!libraryView && !outboxView && !senderReviewOpen && !collectionId && folder === '*' ? 'page' : null" @click="selectFolder('*')" :disabled="mutating"><span class="mail-icon" data-icon="layers" aria-hidden="true"></span><span class="wm-folder-name">All mail</span></button>
         <button class="wm-folder" :aria-current="outboxView ? 'page' : null" @click="showOutbox()"><span class="mail-icon" data-icon="outbox" aria-hidden="true"></span><span class="wm-folder-name">Outbox</span><span :if="outboxCount > 0" class="wm-folder-count" :text="outboxCount"></span></button>
+        <a :if="limits.sharedInboxesAvailable" class="wm-folder" href="/shared"><span class="mail-icon" data-icon="folder" aria-hidden="true"></span><span class="wm-folder-name">Shared inboxes</span></a>
       </div>
       <div class="wm-nav-group">
         <span class="wm-nav-label">Collections</span>

@@ -6,6 +6,7 @@ const categories = @import("../message/categories.zig");
 const forwarding_wire = @import("../message/forwarding.zig");
 const vacation_wire = @import("../message/vacation.zig");
 const team_store = @import("team_store.zig");
+const shared_inbox = @import("shared_inbox.zig");
 
 // SQLITE_TRANSIENT == (sqlite3_destructor_type)-1 — tells SQLite to make its own
 // copy of bound text/blob at bind time. We declare sqlite3_bind_text ourselves
@@ -844,6 +845,7 @@ pub const Database = struct {
         );
         try self.initAuditTable();
         try self.exec(team_store.schema);
+        try self.exec(shared_inbox.schema);
     }
 
     pub fn exec(self: *Database, sql: []const u8) !void {
