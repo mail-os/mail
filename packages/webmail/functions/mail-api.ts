@@ -4,6 +4,18 @@ export class MailApiError extends Error {
   constructor(message: string, readonly status: number, readonly code: string) { super(message) }
 }
 
+let pageReads = new AbortController()
+
+export function cancelMailReads(event: Event): void {
+  // WebKit cancels outstanding fetches before pagehide. If the page asked
+  // the browser to confirm leaving, wait until it actually leaves.
+  if (!event.defaultPrevented) pageReads.abort()
+}
+
+export function restoreMailReads(event: PageTransitionEvent): void {
+  if (event.persisted) pageReads = new AbortController()
+}
+
 export function createMailApi(account: () => string | undefined, onAuthError: (error: MailApiError) => void, isCurrent = () => true) {
   let pinnedAccount: string | undefined
   let accountChanged = false
@@ -22,8 +34,13 @@ export function createMailApi(account: () => string | undefined, onAuthError: (e
     pinnedAccount ||= username
     if (pinnedAccount) headers.set('X-Webmail-Account', encodeURIComponent(pinnedAccount))
     if (options.body && typeof options.body === 'string') headers.set('Content-Type', 'application/json')
-    const response = await fetch(path, { ...options, headers, credentials: 'same-origin', cache: 'no-store' })
+    const method = options.method?.toUpperCase() ?? 'GET'
+    let signal = options.signal
+    if (method === 'GET' || method === 'HEAD')
+      signal = signal ? AbortSignal.any([pageReads.signal, signal]) : pageReads.signal
+    const response = await fetch(path, { ...options, headers, signal, credentials: 'same-origin', cache: 'no-store' })
     const result = await response.json().catch(() => ({}))
+    signal?.throwIfAborted()
     if (accountChanged || !isCurrent()) throw changed()
     if (!response.ok) {
       const error = new MailApiError(result.message || 'The request failed. Please try again.', response.status, result.code || result.error || 'request_failed')

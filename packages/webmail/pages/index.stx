@@ -8,6 +8,7 @@
 </head>
 <body>
 <script client>
+import { cancelMailReads, restoreMailReads } from '../functions/mail-api'
 import { mailFolderIcon, senderAddress, senderInitials } from '../functions/mail-utils'
 import { invitationLabel, invitationRevision, invitationResponses, invitationTime, rsvpLabel } from '../functions/mail-invitations'
 import { useWebmail } from '../functions/use-webmail'
@@ -117,7 +118,9 @@ useInterval(() => tick(), 1000, { whileVisible: true })
 useInterval(tickReminders, 1000, { whileVisible: true })
 useInterval(pollReminders, 30000, { whileVisible: true })
 useInterval(pollNotifications, 15000, { whileVisible: false })
-useEventListener('beforeunload', preventUnload)
+useEventListener('beforeunload', event => { preventUnload(event); cancelMailReads(event) })
+useEventListener('pagehide', cancelMailReads)
+useEventListener('pageshow', restoreMailReads)
 useEventListener('keydown', handleShortcut)
 useEventListener('online', resume)
 useEventListener('focus', resume)

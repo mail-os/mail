@@ -8,6 +8,7 @@
 </head>
 <body>
 <script client>
+import { cancelMailReads, restoreMailReads } from '../functions/mail-api'
 import { useMailCalendar } from '../functions/use-mail-calendar'
 import { reminderDayLink } from '../functions/use-calendar-reminders'
 const {
@@ -40,7 +41,10 @@ useEventListener('focus', pollReminders)
 useEventListener('focus', recheckShares)
 useEventListener('online', pollReminders)
 useEventListener('online', recheckShares)
+useEventListener('beforeunload', cancelMailReads)
 onMount(bootCalendar)
+useEventListener('pagehide', cancelMailReads)
+useEventListener('pageshow', restoreMailReads)
 onUnmounted(() => { destroy(); destroyReminders() })
 </script>
 <main class="calendar-page">

@@ -8,6 +8,7 @@
 </head>
 <body>
 <script client>
+import { cancelMailReads, restoreMailReads } from '../functions/mail-api'
 import { inboxKey, inboxLabel, replyActivity, useSharedInbox, workflowActivity } from '../functions/use-shared-inbox'
 import { fullDate, readableBytes, senderAddress, senderInitials, shortDate } from '../functions/mail-utils'
 const {
@@ -24,7 +25,10 @@ function backToList() {
   closeMessage()
   nextTick(() => listHeading.current?.focus())
 }
+useEventListener('beforeunload', cancelMailReads)
 onMount(mount)
+useEventListener('pagehide', cancelMailReads)
+useEventListener('pageshow', restoreMailReads)
 onUnmounted(destroy)
 useInterval(refresh, 15000, { whileVisible: true })
 useEventListener('focus', refresh)

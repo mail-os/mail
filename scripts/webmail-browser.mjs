@@ -775,6 +775,63 @@ async function mailEventJourney(page, { phone = false, firstCalendar = false } =
   await page.getByRole('region', { name: 'Message reader' }).getByText('Here is the handoff for Thursday.', { exact: true }).waitFor()
 }
 
+async function navigationRequestsJourney(page) {
+  await page.goto(url + '/')
+  const refresh = button(page, 'Refresh messages')
+  await refresh.waitFor()
+
+  const messagePath = /\/webmail\/api\/messages\?/
+  const unavailable = route => route.fulfill({ status: 503, json: { message: 'Mailbox temporarily unavailable.' } })
+  await page.route(messagePath, unavailable, { times: 1 })
+  await refresh.click()
+  await page.getByRole('alert').filter({ hasText: 'Mailbox temporarily unavailable.' }).waitFor()
+  const retry = button(page, 'Retry messages')
+  await retry.click()
+  await retry.waitFor({ state: 'hidden' })
+
+  // Keep every read started by Refresh pending through the native link
+  // navigation. Record the abort in the outgoing document before it is gone.
+  const paths = ['messages', 'folders', 'sender-review/status', 'attention'].map(path => '/webmail/api/' + path)
+  const key = 'mail-navigation-cancelled-reads'
+  await page.evaluate(({ paths, key }) => {
+    const fetchRequest = globalThis.fetch
+    sessionStorage.removeItem(key)
+    globalThis.fetch = (input, init) => {
+      const path = new URL(input, location.href).pathname
+      if (paths.includes(path)) {
+        init?.signal?.addEventListener('abort', () => {
+          const cancelled = JSON.parse(sessionStorage.getItem(key) ?? '[]')
+          sessionStorage.setItem(key, JSON.stringify([...cancelled, path]))
+        }, { once: true })
+      }
+      return fetchRequest(input, init)
+    }
+  }, { paths, key })
+  const delayed = request => request.method() === 'GET' && paths.includes(new URL(request.url()).pathname)
+  const release = Promise.withResolvers()
+  const holdRead = async route => {
+    if (!delayed(route.request())) return route.fallback()
+    await release.promise
+    await route.abort().catch(() => {}) // The browser may already have discarded the request.
+  }
+  const apiPath = /\/webmail\/api\//
+  await page.route(apiPath, holdRead)
+  try {
+    await Promise.all([
+      ...paths.map(path => page.waitForRequest(request => delayed(request) && new URL(request.url()).pathname === path)),
+      refresh.click(),
+    ])
+    await page.getByRole('link', { name: 'Calendar', exact: true }).click()
+    await page.getByRole('region', { name: 'Calendar workspace' }).waitFor()
+    const cancelled = await page.evaluate(key => JSON.parse(sessionStorage.getItem(key) ?? '[]'), key)
+    assert.deepEqual([...new Set(cancelled)].sort(), paths.sort(), 'Leaving Mail cancels all pending refresh reads')
+  }
+  finally {
+    release.resolve()
+    await page.unroute(apiPath, holdRead)
+  }
+}
+
 try {
   const desktop = await signIn()
   await desktopJourney(desktop)
@@ -787,6 +844,7 @@ try {
   const firstRun = await signIn({ phone: true, account: newcomer, initialSubject: 'Studio launch notes' })
   await mailEventJourney(firstRun, { phone: true, firstCalendar: true })
   await invitationRangeJourney(desktop, phone)
+  await navigationRequestsJourney(desktop)
   assert.deepEqual(errors, [], 'Browser pages raised uncaught errors')
   process.stdout.write(`${engine} passed the desktop and phone webmail journeys.\n`)
 }

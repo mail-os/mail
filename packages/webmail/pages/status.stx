@@ -8,9 +8,13 @@
 </head>
 <body>
 <script client>
+import { cancelMailReads, restoreMailReads } from '../functions/mail-api'
 import { useServiceHealth } from '../functions/use-service-health'
 const { snapshot, status, label, checkedAt, busy, error, refresh, tick } = useServiceHealth()
+useEventListener('beforeunload', cancelMailReads)
 onMount(refresh)
+useEventListener('pagehide', cancelMailReads)
+useEventListener('pageshow', restoreMailReads)
 useInterval(refresh, 30000, { whileVisible: true })
 useInterval(tick, 1000, { whileVisible: true })
 </script>
