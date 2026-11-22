@@ -115,6 +115,13 @@ const Zones = struct {
     parsed: std.StringHashMapUnmanaged(clock.Zone) = .empty,
     embedded: std.StringHashMapUnmanaged(ical.Component) = .empty,
 
+    fn include(self: *Zones, a: Allocator, component: ical.Component) !void {
+        const name = try ical.componentText(a, component, "TZID") orelse return error.InvalidCalendar;
+        const entry = try self.embedded.getOrPut(a, name);
+        if (entry.found_existing and !std.mem.eql(u8, entry.value_ptr.bytes, component.bytes)) return error.InvalidCalendar;
+        entry.value_ptr.* = component;
+    }
+
     fn get(self: *Zones, a: Allocator, name: []const u8) !clock.Zone {
         if (self.parsed.get(name)) |value| return value;
         const component: ical.Component = self.embedded.get(name) orelse .{
@@ -159,6 +166,178 @@ const Moment = struct {
         return self.stamp();
     }
 };
+
+/// Find and move range anchors on the original recurrence grid. Explicit
+/// occurrence overrides occupy their own slots and are skipped by projection.
+pub const RangeProjection = struct {
+    zones: Zones = .{},
+    seed: Moment,
+    seed_field: ical.Property,
+    master: ical.Component,
+
+    pub const Nominal = struct {
+        field: ical.Property,
+        period: ?Length = null,
+    };
+
+    pub fn init(a: Allocator, master: ical.Component, components: []const ical.Component) !RangeProjection {
+        var zones: Zones = .{};
+        for (components) |component| {
+            if (std.ascii.eqlIgnoreCase(component.name, "VTIMEZONE")) try zones.include(a, component);
+        }
+        const event = try Event.read(a, master);
+        const field = event.start orelse return error.InvalidCalendar;
+        const seed = try Moment.read(a, &zones, field.value, field, null);
+        return .{ .zones = zones, .seed = seed, .seed_field = field, .master = master };
+    }
+
+    pub fn stamp(self: *RangeProjection, a: Allocator, field: ical.Property) !i64 {
+        const moment = try Moment.read(a, &self.zones, field.value, field, self.seed.zone);
+        return moment.stamp();
+    }
+
+    pub fn next(self: *RangeProjection, a: Allocator, after: i64, before: i64, occupied: []const i64, budget: *usize) !?Nominal {
+        if (after >= before) return null;
+        var excluded: std.AutoHashMapUnmanaged(i64, void) = .empty;
+        for (occupied) |key| try excluded.put(a, key, {});
+        var fields = ical.Properties.init(self.master);
+        while (try fields.next(a)) |field| {
+            if (!field.named("EXDATE")) continue;
+            var values = std.mem.splitScalar(u8, field.value, ',');
+            while (values.next()) |value| {
+                const removed = try Moment.read(a, &self.zones, value, field, self.seed.zone);
+                try excluded.put(a, removed.stamp(), {});
+            }
+        }
+        var search: NominalSearch = .{ .after = after, .before = before };
+        _ = search.consider(self.seed, null, &excluded);
+        fields = ical.Properties.init(self.master);
+        while (try fields.next(a)) |field| {
+            if (!field.named("RDATE")) continue;
+            var values = std.mem.splitScalar(u8, field.value, ',');
+            while (values.next()) |value| {
+                const split = std.mem.indexOfScalar(u8, value, '/') orelse value.len;
+                const start = try Moment.read(a, &self.zones, value[0..split], field, self.seed.zone);
+                const period: ?Length = if (split == value.len) null else blk: {
+                    const end = value[split + 1 ..];
+                    if (clock.duration(end)) |length| break :blk .{ .wall = length };
+                    const finish = try Moment.read(a, &self.zones, end, field, self.seed.zone);
+                    break :blk .{ .exact = finish.stamp() - start.stamp() };
+                };
+                if (period) |length| {
+                    if (start.date.kind == .date or length.end(start) <= start.stamp()) return error.InvalidCalendar;
+                }
+                _ = search.consider(start, period, &excluded);
+            }
+        }
+        var expansion = Expansion{
+            .output = .{ .window = .{ .start = after, .end = before } },
+            .seed = self.seed,
+            .length = .{ .exact = 0 },
+            .kind = null,
+            .ranges = &.{},
+            .exclude = &excluded,
+            .budget = budget,
+            .nominal = &search,
+        };
+        fields = ical.Properties.init(self.master);
+        while (try fields.next(a)) |field| {
+            if (!field.named("RRULE")) continue;
+            expansion.output.window.end = if (search.best) |best| best.start.stamp() + 1 else before;
+            try expansion.rule(a, try Rule.parse(a, field.value));
+        }
+        const best = search.best orelse return null;
+        const wall = try best.start.wallIn(self.seed.zone);
+        const date = Date.fromEpoch(wall, self.seed.date.kind);
+        if (self.seed.withDate(date).stamp() != best.start.stamp()) return error.AvailabilityUnsupported;
+        var field = self.seed_field;
+        field.name = "RECURRENCE-ID";
+        field.value = try formatDate(a, date);
+        return .{ .field = field, .period = best.period };
+    }
+
+    pub fn move(self: *RangeProjection, a: Allocator, component: ical.Component, anchor: Nominal, future: bool) !ical.Component {
+        const event = try Event.read(a, component);
+        const original = event.recurrence_id orelse return error.InvalidCalendar;
+        const old_anchor = try Moment.read(a, &self.zones, original.value, original, self.seed.zone);
+        const new_anchor = try Moment.read(a, &self.zones, anchor.field.value, anchor.field, self.seed.zone);
+        const delta = try new_anchor.wallIn(self.seed.zone) - try old_anchor.wallIn(self.seed.zone);
+        if ((old_anchor.date.kind == .date) != (new_anchor.date.kind == .date)) return error.InvalidCalendar;
+        const start_field = event.start orelse return error.InvalidCalendar;
+        const start = try Moment.read(a, &self.zones, start_field.value, start_field, self.seed.zone);
+        const shifted = start.withDate(Date.fromEpoch(start.date.epoch() + delta, start.date.kind));
+
+        var output: ical.Export = .{ .allocator = a };
+        try output.events.appendSlice(a, "BEGIN:VEVENT\r\n");
+        var properties = ical.Properties.init(component);
+        while (try properties.next(a)) |property| {
+            if (property.named("RECURRENCE-ID")) {
+                const kind = if (new_anchor.date.kind == .date) ";VALUE=DATE" else "";
+                const tz = if (anchor.field.param("TZID")) |name| try std.fmt.allocPrint(a, ";TZID=\"{s}\"", .{name}) else "";
+                const range = if (future) ";RANGE=THISANDFUTURE" else "";
+                try output.foldedLine(&output.events, try std.fmt.allocPrint(a, "RECURRENCE-ID{s}{s}{s}:{s}", .{ kind, tz, range, anchor.field.value }));
+            } else if (property.named("DTSTART")) {
+                try emitProperty(&output, property, try formatDate(a, shifted.date));
+            } else if (property.named("DTEND")) {
+                const previous_end = try Moment.read(a, &self.zones, property.value, property, start.zone);
+                const end = (try event.length(a, &self.zones, start)).end(shifted);
+                try emitDateEnd(&output, property, previous_end, end);
+            } else {
+                try emitProperty(&output, property, property.value);
+            }
+        }
+        if (anchor.period) |length| {
+            if (!future and event.finish == null and event.duration == null) {
+                try emitDateEnd(&output, .{ .name = "DTEND", .params = start_field.params, .value = "" }, shifted, length.end(shifted));
+            }
+        }
+        for (try ical.childComponents(a, component)) |child| try output.addComponent(&output.events, a, child);
+        try output.events.appendSlice(a, "END:VEVENT\r\n");
+        return .{ .name = "VEVENT", .bytes = output.events.items };
+    }
+};
+
+const NominalSearch = struct {
+    after: i64,
+    before: i64,
+    best: ?struct { start: Moment, period: ?Length } = null,
+
+    fn consider(self: *NominalSearch, candidate: Moment, period: ?Length, excluded: *const std.AutoHashMapUnmanaged(i64, void)) bool {
+        const key = candidate.stamp();
+        if (key <= self.after or key >= self.before or excluded.contains(key)) return false;
+        if (self.best) |best| {
+            if (key > best.start.stamp() or (key == best.start.stamp() and period == null)) return true;
+        }
+        self.best = .{ .start = candidate, .period = period };
+        return true;
+    }
+};
+
+fn emitProperty(output: *ical.Export, property: ical.Property, value: []const u8) !void {
+    const params = if (property.params.len > 0) ";" else "";
+    try output.foldedLine(&output.events, try std.fmt.allocPrint(output.allocator, "{s}{s}{s}:{s}", .{ property.name, params, property.params, value }));
+}
+
+fn emitDateEnd(output: *ical.Export, property: ical.Property, template: Moment, end: i64) !void {
+    const local = if (template.zone) |zone| zone.dateAt(end, template.date.kind) else Date.fromEpoch(end, template.date.kind);
+    if (local) |date| {
+        try emitProperty(output, property, try formatDate(output.allocator, date));
+    } else {
+        if (template.date.kind == .date) return error.InvalidCalendar;
+        try emitProperty(output, .{ .name = property.name, .params = "", .value = "" }, try formatDate(output.allocator, Date.fromEpoch(end, .utc)));
+    }
+}
+
+fn formatDate(a: Allocator, date: Date) ![]const u8 {
+    if (date.year < 1 or date.year > 9999) return error.InvalidCalendar;
+    const year: u16 = @intCast(date.year);
+    const seconds: u32 = @intCast(date.seconds);
+    if (date.kind == .date) return std.fmt.allocPrint(a, "{d:0>4}{d:0>2}{d:0>2}", .{ year, date.month, date.day });
+    return std.fmt.allocPrint(a, "{d:0>4}{d:0>2}{d:0>2}T{d:0>2}{d:0>2}{d:0>2}{s}", .{
+        year,                               date.month, date.day, seconds / 3600, seconds / 60 % 60, seconds % 60,
+        if (date.kind == .utc) "Z" else "",
+    });
+}
 
 const Length = union(enum) {
     exact: i64,
@@ -290,10 +469,7 @@ fn appendResource(output: OccurrenceOutput, scratch: Allocator, source: []const 
     var detached: std.ArrayList(Event) = .empty;
     for (try ical.components(scratch, source)) |component| {
         if (std.ascii.eqlIgnoreCase(component.name, "VTIMEZONE")) {
-            const name = try ical.componentText(scratch, component, "TZID") orelse return error.InvalidCalendar;
-            const result = try zones.embedded.getOrPut(scratch, name);
-            if (result.found_existing and !std.mem.eql(u8, result.value_ptr.bytes, component.bytes)) return error.InvalidCalendar;
-            result.value_ptr.* = component;
+            try zones.include(scratch, component);
         } else if (std.ascii.eqlIgnoreCase(component.name, "VEVENT")) {
             const event = try Event.read(scratch, component);
             if (event.recurrence_id != null) {
@@ -639,6 +815,7 @@ const Expansion = struct {
     ranges: []const RangeEdit,
     exclude: *const std.AutoHashMapUnmanaged(i64, void),
     budget: *usize,
+    nominal: ?*NominalSearch = null,
 
     fn add(self: *Expansion, candidate: Moment, length: Length) !void {
         const key = candidate.stamp();
@@ -678,6 +855,19 @@ const Expansion = struct {
 
     fn firstPeriod(self: *Expansion, recur: Rule) i64 {
         const first = recur.firstPeriod(self.seed.date);
+        if (self.nominal) |search| {
+            if (recur.count != null) return first;
+            const threshold = Date.fromEpoch(search.after + earliestOffset(self.seed.zone), self.seed.date.kind);
+            const aligned = recur.firstPeriod(threshold);
+            const periods = if (recur.fixedPeriod()) |seconds|
+                @divFloor(aligned - first, seconds)
+            else blk: {
+                const seed_period = Date.fromEpoch(first, .date);
+                const months = (threshold.year - seed_period.year) * 12 + @as(i64, threshold.month) - @as(i64, seed_period.month);
+                break :blk if (recur.frequency == .yearly) @divFloor(months, 12) else months;
+            };
+            return recur.advance(first, @divFloor(@max(0, periods), recur.interval) * recur.interval);
+        }
         if (recur.count != null or @backingInt(recur.frequency) >= @backingInt(Frequency.daily)) return first;
 
         // With no COUNT to preserve, skip periods whose latest possible end
@@ -748,7 +938,11 @@ const Expansion = struct {
             const value = if (date.kind == .utc) candidate.stamp() else wall;
             if (value > date.epoch()) return true;
         }
-        try self.append(candidate);
+        if (self.nominal) |search| {
+            if (search.consider(candidate, null, self.exclude)) return true;
+        } else {
+            try self.append(candidate);
+        }
         // COUNT counts RRULE instances, including those suppressed by EXDATE.
         remaining.* -= 1;
         return remaining.* == 0;

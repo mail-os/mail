@@ -121,6 +121,7 @@ pub const Event = struct {
     source_message: ?MessageReference = null,
     invitation_key: ?[64]u8 = null,
     invitation_revisions: ?[]const u8 = null,
+    invitation_projections: ?[]const u8 = null,
 
     pub const EventStatus = enum {
         tentative,
@@ -627,6 +628,7 @@ pub const CalDavStore = struct {
         try ensureTextColumn(conn, "dav_events", "source_message_ref");
         try ensureTextColumn(conn, "dav_events", "invitation_key");
         try ensureTextColumn(conn, "dav_events", "invitation_revisions");
+        try ensureTextColumn(conn, "dav_events", "invitation_projections");
         try conn.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_dav_calendar_share_id ON dav_calendars(share_id) WHERE share_id IS NOT NULL");
     }
 
@@ -685,7 +687,7 @@ pub const CalDavStore = struct {
 
     fn persistEvent(self: *Self, ev: Event) !void {
         const conn = if (self.conn) |*c| c else return;
-        var stmt = try conn.prepare("INSERT OR REPLACE INTO dav_events (id,calendar_id,uid,summary,description,location,dtstart,dtend,all_day,rrule,organizer,status,created_at,modified_at,etag,ics_data,source_message_ref,invitation_key,invitation_revisions) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        var stmt = try conn.prepare("INSERT OR REPLACE INTO dav_events (id,calendar_id,uid,summary,description,location,dtstart,dtend,all_day,rrule,organizer,status,created_at,modified_at,etag,ics_data,source_message_ref,invitation_key,invitation_revisions,invitation_projections) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         defer stmt.finalize();
         try stmt.bindInt(1, @intCast(ev.id));
         try stmt.bindInt(2, @intCast(ev.calendar_id));
@@ -706,6 +708,7 @@ pub const CalDavStore = struct {
         try bindOptText(&stmt, 17, if (ev.source_message) |*reference| reference else null);
         try bindOptText(&stmt, 18, if (ev.invitation_key) |*key| key else null);
         try bindOptText(&stmt, 19, ev.invitation_revisions);
+        try bindOptText(&stmt, 20, ev.invitation_projections);
         _ = try stmt.step();
     }
 
@@ -856,7 +859,7 @@ pub const CalDavStore = struct {
             }
         }
         {
-            var stmt = try conn.prepare("SELECT id,calendar_id,uid,summary,description,location,dtstart,dtend,all_day,rrule,organizer,status,created_at,modified_at,etag,ics_data,source_message_ref,invitation_key,invitation_revisions FROM dav_events");
+            var stmt = try conn.prepare("SELECT id,calendar_id,uid,summary,description,location,dtstart,dtend,all_day,rrule,organizer,status,created_at,modified_at,etag,ics_data,source_message_ref,invitation_key,invitation_revisions,invitation_projections FROM dav_events");
             defer stmt.finalize();
             while (stmt.step() catch false) {
                 const id: u64 = @intCast(stmt.columnInt(0));
@@ -892,6 +895,7 @@ pub const CalDavStore = struct {
                     .source_message = if (message.len == @sizeOf(MessageReference)) message[0..@sizeOf(MessageReference)].* else null,
                     .invitation_key = invitation_key,
                     .invitation_revisions = self.dupColOpt(&stmt, 18),
+                    .invitation_projections = self.dupColOpt(&stmt, 19),
                 });
                 self.bumpIds(id, 0, .event);
             }
@@ -1428,7 +1432,7 @@ pub const CalDavStore = struct {
     }
 
     pub const InvitationTarget = struct { id: u64, calendarId: u64, etag: []const u8 };
-    pub const InvitationSnapshot = struct { detail: CalendarEventDetail, revisions: []const u8 };
+    pub const InvitationSnapshot = struct { detail: CalendarEventDetail, revisions: []const u8, projections: ?[]const u8 };
     pub const InvitationAction = struct { target: ?InvitationTarget, applied: bool = false };
 
     fn invitationEventLocked(self: *Self, owner: u64, key: [64]u8) ?Event {
@@ -1475,6 +1479,7 @@ pub const CalDavStore = struct {
         return .{
             .detail = try snapshotEventDetail(a, event, true),
             .revisions = try a.dupe(u8, event.invitation_revisions orelse return error.InvalidCalendar),
+            .projections = try dupeOptional(a, event.invitation_projections),
         };
     }
 
@@ -2243,6 +2248,8 @@ pub const CalDavStore = struct {
         errdefer self.freeEventText(own);
         const invitation_revisions = try dupeOptional(self.allocator, data.invitation_revisions);
         errdefer if (invitation_revisions) |value| self.allocator.free(value);
+        const invitation_projections = try dupeOptional(self.allocator, data.invitation_projections);
+        errdefer if (invitation_projections) |value| self.allocator.free(value);
 
         const event = Event{
             .id = id,
@@ -2267,6 +2274,7 @@ pub const CalDavStore = struct {
             .source_message = data.source_message,
             .invitation_key = data.invitation_key,
             .invitation_revisions = invitation_revisions,
+            .invitation_projections = invitation_projections,
         };
         try self.events.ensureUnusedCapacity(1);
         try self.commitEventMutationLocked(event, .created);
@@ -2331,6 +2339,7 @@ pub const CalDavStore = struct {
         source_message: ?MessageReference = null,
         invitation_key: ?[64]u8 = null,
         invitation_revisions: ?[]const u8 = null,
+        invitation_projections: ?[]const u8 = null,
     };
 
     const EventText = struct {
@@ -2389,6 +2398,7 @@ pub const CalDavStore = struct {
         self.allocator.free(event.uid);
         self.allocator.free(event.etag);
         if (event.invitation_revisions) |value| self.allocator.free(value);
+        if (event.invitation_projections) |value| self.allocator.free(value);
     }
 
     pub fn getEvent(self: *Self, id: u64) ?Event {
@@ -2439,6 +2449,11 @@ pub const CalDavStore = struct {
         errdefer self.freeEventText(own);
         const invitation_revisions = try dupeOptional(self.allocator, data.invitation_revisions);
         errdefer if (invitation_revisions) |value| self.allocator.free(value);
+        const invitation_projections = if (invitation_revisions != null)
+            try dupeOptional(self.allocator, data.invitation_projections)
+        else
+            null;
+        errdefer if (invitation_projections) |value| self.allocator.free(value);
 
         var event = old;
         event.summary = own.summary;
@@ -2456,10 +2471,14 @@ pub const CalDavStore = struct {
         event.modified_at = currentTimestamp();
         event.etag = etag;
         event.ics_data = own.ics_data;
-        if (invitation_revisions) |value| event.invitation_revisions = value;
+        if (invitation_revisions) |value| {
+            event.invitation_revisions = value;
+            event.invitation_projections = invitation_projections;
+        }
         try self.commitEventMutationLocked(event, .modified);
         if (invitation_revisions != null) {
             if (old.invitation_revisions) |value| self.allocator.free(value);
+            if (old.invitation_projections) |value| self.allocator.free(value);
         }
         self.allocator.free(old.etag);
         self.freeEventText(EventText.fromEvent(old));

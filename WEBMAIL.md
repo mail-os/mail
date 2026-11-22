@@ -159,6 +159,8 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   copy of a verified invitation. Choose **Apply to Calendar** or **Apply
   cancellation** on a later message from the same organizer to update that
   copy. Updates can affect one occurrence, a future range, or the series.
+  A one-off change at the start of a saved future range keeps the organizer's
+  schedule for later occurrences.
   CalDAV clients see each saved change. The saved event links back to the
   original email. The invitation's external links and alarms stay in the
   email. Saving an invitation and sending an RSVP are separate actions.

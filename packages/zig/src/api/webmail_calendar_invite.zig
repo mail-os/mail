@@ -72,6 +72,39 @@ pub const Revision = struct {
     }
 };
 
+/// Revision metadata stays private to the saved Calendar resource. A range
+/// may have a different physical RECURRENCE-ID when its original slot has
+/// an individual change. Keep the organizer's identity and ordering intact.
+pub const AppliedRevision = struct {
+    revision: Revision,
+    projection: ?Projection = null,
+
+    pub const Projection = struct {
+        component: [64]u8,
+        original_anchor: ical.Property,
+        physical_anchor: ?WallTime = null,
+        omitted_event: ?[]const u8 = null,
+        generated: []const [32]u8 = &.{},
+    };
+
+    pub fn read(a: Allocator, stored: []const u8, projections: ?[]const u8) ![]const AppliedRevision {
+        const revisions = try std.json.parseFromSliceLeaky([]const Revision, a, stored, .{});
+        const applied = try a.alloc(AppliedRevision, revisions.len);
+        for (revisions, applied) |revision, *item| item.* = .{ .revision = revision };
+        if (projections) |metadata| {
+            for (try std.json.parseFromSliceLeaky([]const Projection, a, metadata, .{})) |projection| {
+                for (applied) |*item| {
+                    if (item.revision.this_and_future and std.mem.eql(u8, &item.revision.component, &projection.component)) {
+                        item.projection = projection;
+                        break;
+                    }
+                }
+            }
+        }
+        return applied;
+    }
+};
+
 pub const Response = enum {
     accepted,
     tentative,

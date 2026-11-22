@@ -2229,6 +2229,8 @@ fn calendarWriteError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: 
         error.CalendarHistoryPending => sendError(conn, arena, 503, "calendar_history_pending", "Mail is checking earlier invitations. Refresh this message and try again."),
         error.InvitationEventRequired => sendError(conn, arena, 409, "invitation_event_required", "Add the original invitation to Calendar first."),
         error.InvitationScopeConflict => sendError(conn, arena, 409, "invitation_scope_conflict", "This occurrence already anchors a change to future events."),
+        error.AvailabilityUnsupported => sendError(conn, arena, 422, "invitation_recurrence_unsupported", "Mail could not resolve this recurrence."),
+        error.AvailabilityLimit => sendError(conn, arena, 422, "invitation_recurrence_limit", "Mail could not expand this recurrence within its limits."),
         error.UnsupportedTimezone, error.ConflictingTimezone => sendError(conn, arena, 422, "invitation_timezone", "This event's time zone could not be verified."),
         error.InvalidCalendar, error.NoPrimaryEvent => sendError(conn, arena, 422, "invalid_calendar_event", "This stored calendar resource has no single editable primary event"),
         error.SharedEventMustBePublic => sendError(conn, arena, 422, "shared_event_must_be_public", "Shared calendar edits must use public events"),
@@ -3201,6 +3203,9 @@ fn handleInvitationEvent(server: *WebmailHttpServer, conn: *webmail_tls.Stream, 
         };
     } else null;
     if (data) |change| {
+        const projections_size = if (change.invitation_projections) |bytes| bytes.len else 0;
+        if (change.invitation_revisions.?.len + projections_size > dav.config.max_event_size)
+            return calendarWriteError(conn, a, error.EventTooLarge);
         checkCalendarEventBody(server, a, dav, change.ics_data.?) catch |err| return calendarWriteError(conn, a, err);
     }
     const saved = dav.saveInvitationEvent(sess.username, revision, invite.preview.uid, request.calendarId, event, data) catch |err| return calendarWriteError(conn, a, err);

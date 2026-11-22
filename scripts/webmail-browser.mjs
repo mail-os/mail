@@ -619,6 +619,38 @@ async function invitationJourney(page, phone = false) {
   }
 }
 
+async function invitationRangeJourney(desktop, phone) {
+  await desktop.goto(url + '/')
+  await openMailbox(desktop, /^Archive(?:\s|$)/)
+  for (const subject of [/Studio sessions moved from Friday/, /Friday studio session only moved again/]) {
+    await button(desktop, subject).click()
+    const invitation = desktop.getByRole('region', { name: 'Calendar invitations', exact: true })
+    await button(invitation, 'Apply to Calendar').click()
+    await invitation.getByText('Saved in Calendar.', { exact: true }).waitFor()
+  }
+  await screenshot(desktop, 'desktop-calendar-range-update')
+
+  await desktop.goto(url + '/calendar?day=2026-11-27')
+  await button(desktop, 'Week').click()
+  const exact = button(desktop, /Friday studio reservation/)
+  const future = button(desktop, /Studio reservation series/)
+  await exact.waitFor()
+  await future.waitFor()
+  assert.match(await exact.locator('.calendar-entry-time').textContent(), /^8:00(?:\s*PM)?\s*–\s*10:00\s*PM$/)
+  assert.match(await future.locator('.calendar-entry-time').textContent(), /^6:00(?:\s*PM)?\s*–\s*8:00\s*PM$/)
+  await fitsViewport(desktop)
+  await screenshot(desktop, 'desktop-calendar-range-week')
+
+  await phone.goto(url + '/calendar?day=2026-11-28')
+  await button(phone, 'Day').click()
+  const later = button(phone, /Studio reservation series/)
+  await later.waitFor()
+  assert.match(await later.locator('.calendar-entry-time').textContent(), /^6:00(?:\s*PM)?\s*–\s*8:00\s*PM$/)
+  assert.equal(await button(phone, /Friday studio reservation/).count(), 0)
+  await fitsViewport(phone)
+  await screenshot(phone, 'phone-calendar-range-day')
+}
+
 async function mailEventJourney(page, { phone = false, firstCalendar = false } = {}) {
   await verifyAppearance(page, phone ? 'dark' : 'light')
   await page.goto(url + '/')
@@ -678,6 +710,7 @@ try {
   await mailEventJourney(desktop)
   const firstRun = await signIn({ phone: true, account: newcomer, initialSubject: 'Studio launch notes' })
   await mailEventJourney(firstRun, { phone: true, firstCalendar: true })
+  await invitationRangeJourney(desktop, phone)
   assert.deepEqual(errors, [], 'Browser pages raised uncaught errors')
   process.stdout.write(`${engine} passed the desktop and phone webmail journeys.\n`)
 }

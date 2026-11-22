@@ -50,6 +50,7 @@ def seed_inbox(fixture, owner, sender):
                 "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail//Browser Fixture//EN", "METHOD:REQUEST",
                 "BEGIN:VEVENT", "UID:studio-reservation@example.test", "DTSTAMP:20261121T100000Z",
                 "DTSTART;TZID=America/New_York:20261126T100000", "DTEND;TZID=America/New_York:20261126T120000",
+                "RRULE:FREQ=DAILY;COUNT=3",
                 f"ORGANIZER:mailto:{sender}", f"ATTENDEE:mailto:{owner}", "SUMMARY:Studio reservation",
                 "LOCATION:South room <Studio>", "END:VEVENT", "END:VCALENDAR", "",
             ))
@@ -82,7 +83,16 @@ def seed_calendar(fixture, owner):
     return now.date().isoformat()
 
 
-def seed_cancelled_invitation(fixture, owner, sender):
+def archive_fixture(fixture, session, subject):
+    status, listing = fixture.api(session, "messages?" + urlencode({"folder": "INBOX", "q": subject}))
+    assert status == 200, listing
+    row, = [row for row in listing["items"] if row["subject"] == subject]
+    target = {field: row[field] for field in ("uid", "folder", "reference", "revision")}
+    status, result = fixture.api(session, "bulk", {"action": "move", "folder": "Archive", "messages": [target]})
+    assert status == 200 and result["ok"], result
+
+
+def seed_invitation_updates(fixture, owner, sender):
     session = fixture.login(owner)
     for sequence, method, subject in ((0, "REQUEST", "Team breakfast invitation"), (1, "CANCEL", "Team breakfast cancelled")):
         source = "\r\n".join([
@@ -97,12 +107,26 @@ def seed_cancelled_invitation(fixture, owner, sender):
         message.add_alternative(source, subtype="calendar", params={"method": method})
         with fixture.smtp(sender) as connection:
             assert connection.send_message(message) == {}
-        status, listing = fixture.api(session, "messages?" + urlencode({"folder": "INBOX", "q": subject}))
-        assert status == 200, listing
-        row, = [row for row in listing["items"] if row["subject"] == subject]
-        target = {field: row[field] for field in ("uid", "folder", "reference", "revision")}
-        status, result = fixture.api(session, "bulk", {"action": "move", "folder": "Archive", "messages": [target]})
-        assert status == 200 and result["ok"], result
+        archive_fixture(fixture, session, subject)
+
+    for sequence, range_parameter, start, subject, title in (
+        (1, ";RANGE=THISANDFUTURE", "130000", "Studio sessions moved from Friday", "Studio reservation series"),
+        (2, "", "150000", "Friday studio session only moved again", "Friday studio reservation"),
+    ):
+        source = "\r\n".join([
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail browser fixture//EN", "METHOD:REQUEST",
+            "BEGIN:VEVENT", "UID:studio-reservation@example.test", f"SEQUENCE:{sequence}", "DTSTAMP:20261121T100000Z",
+            f"RECURRENCE-ID{range_parameter};TZID=America/New_York:20261127T100000",
+            f"DTSTART;TZID=America/New_York:20261127T{start}", "DURATION:PT2H", f"SUMMARY:{title}",
+            f"ORGANIZER:mailto:{sender}", f"ATTENDEE:mailto:{owner}", "END:VEVENT", "END:VCALENDAR", "",
+        ])
+        message = EmailMessage()
+        message["From"], message["To"], message["Subject"] = sender, owner, subject
+        message.set_content("Here is the updated studio booking.")
+        message.add_alternative(source, subtype="calendar", params={"method": "REQUEST"})
+        with fixture.smtp(sender) as connection:
+            assert connection.send_message(message) == {}
+        archive_fixture(fixture, session, subject)
 
 
 def seed_shared_inbox(fixture, owner, sender):
@@ -159,7 +183,7 @@ def verify(binary, output, engine):
             assert fixture.api(session, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
             assert fixture.api(session, "category-settings", {"automatic": True}, "PUT")[0] == 200
             seed_inbox(fixture, owner, sender)
-            seed_cancelled_invitation(fixture, owner, sender)
+            seed_invitation_updates(fixture, owner, sender)
             newcomer_session = fixture.login(newcomer)
             assert fixture.api(newcomer_session, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
             note = EmailMessage()

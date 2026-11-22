@@ -765,8 +765,9 @@ def check_mail_event_source(test, organizer):
     return verify_reopened
 
 
-def check_invitation_calendar(test, organizer):
+def check_invitation_calendar(test):
     attendee = test.provision("invite-calendar-owner")
+    organizer = test.provision("invite-calendar-organizer", daily=50)
     different_organizer = test.provision("invite-other-organizer")
     session, sender_session = test.login(attendee), test.login(organizer)
     assert test.api(session, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
@@ -777,19 +778,21 @@ def check_invitation_calendar(test, organizer):
     collection = f"/calendars/{attendee}/Invitations/"
     uid = "organizer-series@example.test"
 
-    def deliver(subject, sequence, *, method="REQUEST", occurrence=None, start=None, future=False, room="Studio", sender=organizer, offset="-0500"):
+    def deliver(subject, sequence, *, method="REQUEST", occurrence=None, start=None, future=False, room="Studio", sender=organizer, offset="-0500",
+                duration="DURATION:PT1H", recurrence_fields=("RRULE:FREQ=DAILY;COUNT=6",), daylight=()):
         tzid = "Fixture/Studio"
         recurrence = () if occurrence is None else (
             f"RECURRENCE-ID{';RANGE=THISANDFUTURE' if future else ''};TZID={tzid}:202611{occurrence}T090000",
         )
         dates = () if method == "CANCEL" else (
-            f"DTSTART;TZID={tzid}:202611{occurrence or '23'}T{start or '090000'}", "DURATION:PT1H",
+            f"DTSTART;TZID={tzid}:202611{occurrence or '23'}T{start or '090000'}", *((duration,) if duration else ()),
         )
-        rule = ("RRULE:FREQ=DAILY;COUNT=6",) if method == "REQUEST" and occurrence is None else ()
+        rule = recurrence_fields if method == "REQUEST" and occurrence is None else ()
         source = "\r\n".join((
             "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail//Invitation Calendar Fixture//EN", f"METHOD:{method}",
             "BEGIN:VTIMEZONE", f"TZID:{tzid}", "TZURL:https://unused.example.test/zone",
-            "BEGIN:STANDARD", "DTSTART:19700101T000000", f"TZOFFSETFROM:{offset}", f"TZOFFSETTO:{offset}", "END:STANDARD", "END:VTIMEZONE",
+            "BEGIN:STANDARD", "DTSTART:19700101T000000", f"TZOFFSETFROM:{offset}", f"TZOFFSETTO:{offset}", "END:STANDARD",
+            *daylight, "END:VTIMEZONE",
             "BEGIN:VEVENT", f"UID:{uid}", f"SEQUENCE:{sequence}", "DTSTAMP:20261121T100000Z",
             f"ORGANIZER:mailto:{sender}", f"ATTENDEE:mailto:{attendee}", "ATTENDEE:mailto:another@example.test",
             *recurrence, *dates, *rule, "SUMMARY:Studio shift", f"LOCATION:{room}", "URL:https://unused.example.test/event",
@@ -821,11 +824,16 @@ def check_invitation_calendar(test, organizer):
         assert status == 200, current
         return current["calendar_invitation_events"][0]
 
-    def busy(*expected):
+    def busy(*expected, lengths=None):
         xml = f'<C:free-busy-query xmlns:C="{CALDAV}"><C:time-range start="20261123T000000Z" end="20261129T000000Z"/></C:free-busy-query>'
         _, data = must(client.request("REPORT", collection, xml, {"Content-Type": "application/xml", "Depth": "1"}), 200)
-        starts = [line.split(":", 1)[1].split("/", 1)[0] for line in data.decode().splitlines() if line.startswith("FREEBUSY;")]
+        periods = [line.split(":", 1)[1].split("/", 1) for line in data.decode().splitlines() if line.startswith("FREEBUSY;")]
+        starts = [start for start, _ in periods]
         assert starts == list(expected), (starts, expected, data)
+        if lengths is not None:
+            def parse(date):
+                return datetime.strptime(date, "%Y%m%dT%H%M%SZ")
+            assert [(parse(end) - parse(start)).total_seconds() for start, end in periods] == lengths, data
 
     first = deliver("Original organizer series", 1)
     assert first["calendar_invitation_events"] == [{"target": None, "applied": False}]
@@ -882,39 +890,106 @@ def check_invitation_calendar(test, organizer):
     assert status == 200 and event["changed"], event
     busy("20261123T140000Z", "20261124T160000Z", *(f"202611{day}T140000Z" for day in range(25, 29)))
 
-    shifted = deliver("Organizer shifted future occurrences", 5, occurrence=25, start="120000", future=True)
+    shifted = deliver("Organizer shifted future occurrences", 5, occurrence=25, start="120000", future=True,
+                      duration="DTEND;TZID=Fixture/Studio:20261125T140000")
     status, event = apply(shifted, event)
     assert status == 200 and event["changed"], event
     busy("20261123T140000Z", "20261124T160000Z", *(f"202611{day}T170000Z" for day in range(25, 29)))
 
-    cancelled = deliver("Organizer cancelled Thursday", 6, method="CANCEL", occurrence=26)
+    exact = deliver("Organizer moved Wednesday only at the range anchor", 6, occurrence=25, start="130000")
+    status, event = apply(exact, event)
+    assert status == 200 and event["changed"], event
+    busy("20261123T140000Z", "20261124T160000Z", "20261125T180000Z", *(f"202611{day}T170000Z" for day in range(26, 29)),
+         lengths=[3600, 3600, 3600, 7200, 7200, 7200])
+    assert action(shifted)["applied"] and action(exact)["applied"]
+    assert apply(shifted, event)[1] == {**event, "changed": False}
+    _, projected = must(client.request("GET", path), 200)
+    assert projected.count(b"RANGE=THISANDFUTURE") == 1 and b"20261126T090000" in projected
+    assert projected.count(b"UID:" + uid.encode()) == 4
+
+    cancelled = deliver("Organizer cancelled the new physical range anchor", 7, method="CANCEL", occurrence=26)
     status, event = apply(cancelled, event)
     assert status == 200, event
-    busy("20261123T140000Z", "20261124T160000Z", "20261125T170000Z", "20261127T170000Z", "20261128T170000Z")
+    busy("20261123T140000Z", "20261124T160000Z", "20261125T180000Z", "20261127T170000Z", "20261128T170000Z")
 
-    end_range = deliver("Organizer cancelled the rest of the week", 7, method="CANCEL", occurrence=27, future=True)
+    end_range = deliver("Organizer cancelled the rest of the week", 8, method="CANCEL", occurrence=27, future=True)
     status, event = apply(end_range, event)
     assert status == 200, event
-    busy("20261123T140000Z", "20261124T160000Z", "20261125T170000Z")
-
-    whole = deliver("Organizer cancelled the series", 8, method="CANCEL")
-    status, event = apply(whole, event)
-    assert status == 200 and event["changed"], event
-    assert detail(event)["event"]["status"] == "cancelled"
-    busy()
-    _, changes = sync_report(client, collection, token)
+    busy("20261123T140000Z", "20261124T160000Z", "20261125T180000Z")
+    assert action(shifted)["applied"]
+    token, changes = sync_report(client, collection, token)
     assert changes == {path: event["etag"]}, changes
-    print("Verified linked Calendar creation, local alarm preservation, CalDAV revisions, and ordered updates and cancellations for instances, ranges, and whole series.")
+    print("Verified linked Calendar creation, local alarm preservation, CalDAV revisions, ordered updates and cancellations, and range anchor changes.")
 
     def after_restart():
+        nonlocal event, uid
         session.update(test.login(attendee))
         assert detail(event)["source_message"] == first["reference"]
+        assert must(client.request("GET", path), 200)[0]["ETag"] == event["etag"]
+        sync_report(client, collection, token, status=403)
+        resumed_token, members = sync_report(client, collection)
+        assert members == {path: event["etag"]}, members
+        busy("20261123T140000Z", "20261124T160000Z", "20261125T180000Z")
+        reopened = deliver("Organizer reopened one occurrence of the cancelled range", 9, occurrence=27, start="113000")
+        status, event = apply(reopened, event)
+        assert status == 200 and event["changed"], event
+        busy("20261123T140000Z", "20261124T160000Z", "20261125T180000Z", "20261127T163000Z")
+        assert action(end_range)["applied"]
+        whole = deliver("Organizer cancelled the series", 10, method="CANCEL")
+        status, event = apply(whole, event)
+        assert status == 200 and event["changed"], event
+        assert detail(event)["event"]["status"] == "cancelled"
         assert action(whole)["applied"]
         assert apply(whole, event)[1] == {**event, "changed": False}
         assert apply(moved, event)[0] == 409
         busy()
+        _, changes = sync_report(client, collection, resumed_token)
+        assert changes == {path: event["etag"]}, changes
         assert must(client.request("GET", path), 200)[0]["ETag"] == event["etag"]
-        print("Verified organizer Calendar revisions, source links, and duplicate handling after restart.")
+
+        uid = "period-series@example.test"
+        source = deliver("Original series with explicit dates and exclusions", 1, recurrence_fields=(
+            "RRULE:FREQ=DAILY;COUNT=6", "EXDATE;TZID=Fixture/Studio:20261125T090000",
+            "RDATE;VALUE=PERIOD;TZID=Fixture/Studio:20261126T100000/PT2H",
+        ))
+        status, period = apply(source)
+        assert status == 201, period
+        later = deliver("Organizer shifted a range with a custom period", 2, occurrence=24, start="120000", future=True, duration=None)
+        status, period = apply(later, period)
+        assert status == 200, period
+        # Replace the next regular slot as well, forcing the explicit period
+        # to be materialized before the range can move to Friday.
+        thursday = deliver("Organiser shifted Thursday individually", 3, occurrence=26, start="190000")
+        status, period = apply(thursday, period)
+        assert status == 200, period
+        tuesday = deliver("Organiser shifted the original range anchor individually", 4, occurrence=24, start="080000")
+        status, period = apply(tuesday, period)
+        assert status == 200, period
+        busy("20261123T140000Z", "20261124T130000Z", "20261126T180000Z", "20261127T000000Z",
+             "20261127T170000Z", "20261128T170000Z", lengths=[3600, 3600, 7200, 3600, 3600, 3600])
+        assert action(later)["applied"]
+        friday = deliver("Organiser cancelled the projected Friday anchor", 5, method="CANCEL", occurrence=27)
+        status, period = apply(friday, period)
+        assert status == 200, period
+        busy("20261123T140000Z", "20261124T130000Z", "20261126T180000Z", "20261127T000000Z",
+             "20261128T170000Z", lengths=[3600, 3600, 7200, 3600, 3600])
+        assert apply(deliver("Organiser cancelled the series with explicit dates", 6, method="CANCEL"), period)[0] == 200
+        busy()
+
+        uid = "daylight-series@example.test"
+        daylight = ("BEGIN:DAYLIGHT", "DTSTART:20261126T020000", "TZOFFSETFROM:-0500", "TZOFFSETTO:-0400", "END:DAYLIGHT")
+        status, crossing = apply(deliver("Original series crossing a daylight saving change", 1, daylight=daylight))
+        assert status == 201, crossing
+        shift = deliver("Organiser moved the range before the clock change", 2, occurrence=25, future=True, start="120000",
+                        duration="DTEND;TZID=Fixture/Studio:20261125T143000", daylight=daylight)
+        status, crossing = apply(shift, crossing)
+        assert status == 200, crossing
+        single = deliver("Organiser moved only the anchor before the clock change", 3, occurrence=25, start="113000", daylight=daylight)
+        status, crossing = apply(single, crossing)
+        assert status == 200, crossing
+        busy("20261123T140000Z", "20261124T140000Z", "20261125T163000Z",
+             *(f"202611{day}T160000Z" for day in range(26, 29)), lengths=[3600, 3600, 3600, 9000, 9000, 9000])
+        print("Verified saved range projection after restart, exact reinstatement, RDATE periods, EXDATE, daylight saving changes, and stable CalDAV resource identity.")
 
     return after_restart
 
@@ -1634,7 +1709,7 @@ def check_calendar_upgrade(binary, previous):
         for table, old_columns in previous_columns.items():
             new_columns = upgraded_columns[table]
             assert new_columns[:len(old_columns)] == old_columns
-            expected = {"source_message_ref", "invitation_key", "invitation_revisions"} if table == "dav_events" else {"display_name"}
+            expected = {"source_message_ref", "invitation_key", "invitation_revisions", "invitation_projections"} if table == "dav_events" else {"display_name"}
             assert expected <= {column[1] for column in new_columns}
         test.binary = previous
         with test.daemon():
@@ -1714,7 +1789,7 @@ def main():
                 check_scanning(DavClient(test, owner), expected)
                 check_invitation_previews(test, owner, other)
                 prepare_rsvp_restart, check_rsvp_restart = check_invitation_replies(test)
-                check_saved_invitation = check_invitation_calendar(test, other)
+                check_saved_invitation = check_invitation_calendar(test)
                 check_reopened_backlink = check_mail_event_source(test, other)
                 check_calendar_download(test, owner, other)
                 importer, calendar_id, submit = check_calendar_import(test, owner, other)

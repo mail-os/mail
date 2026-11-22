@@ -5,7 +5,9 @@ const invites = @import("webmail_calendar_invite.zig");
 const dav = @import("../storage/caldav_store.zig");
 const ical = @import("../protocol/icalendar.zig");
 const clock = @import("../protocol/icalendar_time.zig");
+const recurrence = @import("../protocol/icalendar_busy.zig");
 const Allocator = std.mem.Allocator;
+const AppliedRevision = invites.AppliedRevision;
 
 fn revisionOrder(left: invites.Revision, right: invites.Revision) std.math.Order {
     const sequence = std.math.order(left.sequence, right.sequence);
@@ -15,8 +17,8 @@ fn revisionOrder(left: invites.Revision, right: invites.Revision) std.math.Order
     return std.math.order(@intFromBool(left.method == .cancel), @intFromBool(right.method == .cancel));
 }
 
-fn covers(change: invites.Revision, instance: ?invites.WallTime, key: [64]u8) bool {
-    if (std.mem.eql(u8, &change.component, &key)) return true;
+fn covers(change: invites.Revision, instance: ?invites.WallTime, key: [64]u8, future: bool) bool {
+    if (std.mem.eql(u8, &change.component, &key)) return change.this_and_future or !future;
     const anchor = change.occurrence orelse return change.method == .cancel;
     if (!change.this_and_future) return false;
     const occurrence = instance orelse return false;
@@ -24,17 +26,84 @@ fn covers(change: invites.Revision, instance: ?invites.WallTime, key: [64]u8) bo
         std.mem.eql(u8, occurrence.zone orelse "", anchor.zone orelse "");
 }
 
-fn revisionFor(items: []const invites.Revision, key: [64]u8) ?invites.Revision {
-    for (items) |item| if (std.mem.eql(u8, &item.component, &key)) return item;
-    return null;
+const Slot = struct {
+    event: ical.Component,
+    anchor: ?ical.Property,
+    occurrence: ?invites.WallTime,
+    key: [64]u8,
+    future: bool,
+    version: ?invites.Revision = null,
+
+    fn read(a: Allocator, invite: invites.Invitation, event: ical.Component) !Slot {
+        var properties = ical.Properties.init(event);
+        const anchor = while (try properties.next(a)) |property| {
+            if (property.named("RECURRENCE-ID")) break property;
+        } else null;
+        const occurrence = if (anchor) |field| invites.WallTime.read(field) orelse return error.InvalidCalendar else null;
+        return .{
+            .event = event,
+            .anchor = anchor,
+            .occurrence = occurrence,
+            .key = try invite.keyForOccurrence(a, occurrence),
+            .future = if (anchor) |field| std.ascii.eqlIgnoreCase(field.param("RANGE") orelse "", "THISANDFUTURE") else false,
+        };
+    }
+
+    fn matches(self: Slot, revision: invites.Revision) bool {
+        return self.future == revision.this_and_future and std.mem.eql(u8, &self.key, &revision.component);
+    }
+};
+
+fn digest(component: ical.Component) [32]u8 {
+    var result: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(component.bytes, &result, .{});
+    return result;
 }
 
-fn occurrenceTime(a: Allocator, item: ical.Component) !?invites.WallTime {
-    var properties = ical.Properties.init(item);
-    while (try properties.next(a)) |property| {
-        if (property.named("RECURRENCE-ID")) return invites.WallTime.read(property) orelse error.InvalidCalendar;
+fn savedSlots(a: Allocator, invite: invites.Invitation, original: []const ical.Component, previous: []const AppliedRevision) !std.ArrayList(Slot) {
+    var slots: std.ArrayList(Slot) = .empty;
+    var generated: std.AutoHashMapUnmanaged([32]u8, void) = .empty;
+    var physical: std.AutoHashMapUnmanaged(struct { [64]u8, bool }, AppliedRevision) = .empty;
+    for (previous) |item| {
+        var key = item.revision.component;
+        if (item.projection) |projection| {
+            for (projection.generated) |fingerprint| try generated.put(a, fingerprint, {});
+            if (projection.omitted_event) |body| {
+                var slot = try Slot.read(a, invite, .{ .name = "VEVENT", .bytes = body });
+                slot.version = item.revision;
+                try slots.append(a, slot);
+                continue;
+            }
+            key = try invite.keyForOccurrence(a, projection.physical_anchor orelse return error.InvalidCalendar);
+        }
+        try physical.put(a, .{ key, item.revision.this_and_future }, item);
     }
-    return null;
+    var project: ?recurrence.RangeProjection = null;
+    for (original) |event| {
+        if (!std.ascii.eqlIgnoreCase(event.name, "VEVENT")) continue;
+        var slot = try Slot.read(a, invite, event);
+        if (physical.get(.{ slot.key, slot.future })) |item| {
+            if (item.projection) |projection| {
+                if (project == null) {
+                    const master = try masterEvent(a, original);
+                    project = try recurrence.RangeProjection.init(a, master, original);
+                }
+                const canonical = try project.?.move(a, event, .{ .field = projection.original_anchor }, true);
+                slot = try Slot.read(a, invite, canonical);
+            }
+            slot.version = item.revision;
+        } else if (generated.count() != 0 and generated.contains(digest(event))) continue;
+        try slots.append(a, slot);
+    }
+    return slots;
+}
+
+fn masterEvent(a: Allocator, components: []const ical.Component) !ical.Component {
+    for (components) |component| {
+        if (!std.ascii.eqlIgnoreCase(component.name, "VEVENT")) continue;
+        if (try ical.componentText(a, component, "RECURRENCE-ID") == null) return component;
+    }
+    return error.NoPrimaryEvent;
 }
 
 const organizer_fields = [_][]const u8{
@@ -58,7 +127,7 @@ fn organizerProperty(output: *ical.Export, property: ical.Property, name: []cons
         if (property.param("VALUE")) |value| {
             if (!std.ascii.eqlIgnoreCase(value, "DATE") and !std.ascii.eqlIgnoreCase(value, "DATE-TIME") and
                 !(property.named("RDATE") and std.ascii.eqlIgnoreCase(value, "PERIOD"))) return error.InvalidCalendar;
-            try line.print(a, ";VALUE:{s}", .{value});
+            try line.print(a, ";VALUE={s}", .{value});
         }
         if (property.param("TZID")) |value| {
             if (std.mem.indexOfAny(u8, value, "\"\r\n\x00") != null) return error.InvalidCalendar;
@@ -157,50 +226,147 @@ fn appendTimezones(output: *ical.Export, incoming: []const ical.Component, store
     }
 }
 
+fn projectRanges(output: *ical.Export, slots: []const Slot, versions: []AppliedRevision) !void {
+    const a = output.allocator;
+    var master: ?ical.Component = null;
+    var has_ranges = false;
+    var has_exact = false;
+    for (slots) |slot| {
+        if (slot.anchor == null) master = slot.event;
+        has_ranges = has_ranges or slot.future;
+        has_exact = has_exact or (slot.anchor != null and !slot.future);
+    }
+    if (!has_ranges or !has_exact) return;
+    // Read the same validated zone definitions that will be exported.
+    const zone_document = try std.mem.concat(a, u8, &.{ output.headers.items, "END:VCALENDAR\r\n" });
+    var projection = try recurrence.RangeProjection.init(a, master orelse return error.NoPrimaryEvent, try ical.components(a, zone_document));
+    var occupied: std.ArrayList(i64) = .empty;
+    var exact: std.AutoHashMapUnmanaged(i64, [64]u8) = .empty;
+    var ranged: std.AutoHashMapUnmanaged(i64, [64]u8) = .empty;
+    const keys = try a.alloc(?i64, slots.len);
+    for (slots, keys) |slot, *key| {
+        key.* = null;
+        if (slot.anchor) |field| {
+            const stamp = try projection.stamp(a, field);
+            key.* = stamp;
+            try occupied.append(a, stamp);
+            const index = if (slot.future) &ranged else &exact;
+            const entry = try index.getOrPut(a, stamp);
+            if (entry.found_existing) return error.InvalidCalendar;
+            entry.value_ptr.* = slot.key;
+        }
+    }
+    var range_keys = ranged.keyIterator();
+    while (range_keys.next()) |anchor| {
+        if (exact.contains(anchor.*)) break;
+    } else return;
+    const exclusive_end = (clock.Date{ .year = 10000, .month = 1, .day = 1, .seconds = 0, .kind = .utc }).epoch();
+    var budget = recurrence.expansion_budget;
+    output.events.clearRetainingCapacity();
+    for (slots, keys) |slot, key| {
+        const individual = if (slot.future) exact.get(key.?) else null;
+        if (individual == null) {
+            try output.addComponent(&output.events, a, slot.event);
+            continue;
+        }
+        if (!std.mem.eql(u8, &slot.key, &individual.?)) return error.InvitationScopeConflict;
+        const applied = slot.version orelse return error.InvitationScopeConflict;
+        const entry = for (versions) |*item| {
+            if (item.revision.sameVersion(applied)) break item;
+        } else return error.InvalidCalendar;
+        var upper = exclusive_end;
+        var anchors = ranged.keyIterator();
+        while (anchors.next()) |anchor| {
+            if (anchor.* > key.?) upper = @min(upper, anchor.*);
+        }
+        const inherits_period = applied.method != .cancel and
+            try ical.componentText(a, slot.event, "DTEND") == null and try ical.componentText(a, slot.event, "DURATION") == null;
+        var state: AppliedRevision.Projection = .{ .component = applied.component, .original_anchor = slot.anchor.? };
+        var generated: std.ArrayList([32]u8) = .empty;
+        var after = key.?;
+        while (try projection.next(a, after, upper, occupied.items, &budget)) |next| {
+            if (inherits_period and next.period != null) {
+                // A detached range's duration governs every later instance.
+                // Give an RDATE period its own exception when it would
+                // otherwise impose its custom length on the rest of the range.
+                const occurrence = try projection.move(a, slot.event, next, false);
+                try output.addComponent(&output.events, a, occurrence);
+                try generated.append(a, digest(occurrence));
+                after = try projection.stamp(a, next.field);
+                continue;
+            }
+            const range = try projection.move(a, slot.event, next, true);
+            try output.addComponent(&output.events, a, range);
+            state.physical_anchor = invites.WallTime.read(next.field) orelse return error.InvalidCalendar;
+            break;
+        } else {
+            state.omitted_event = slot.event.bytes;
+        }
+        state.generated = generated.items;
+        entry.projection = state;
+    }
+}
+
 /// Prepare and validate outside the storage locks. The caller commits this
 /// document against the same event ETag and current mail revision.
 pub fn prepare(a: Allocator, invite: invites.Invitation, attendee: []const u8, revision: invites.Revision, source: dav.MessageReference, saved: ?dav.CalDavStore.InvitationSnapshot) !?dav.CalDavStore.EventData {
     if (saved == null and (revision.method == .cancel or revision.occurrence != null)) return error.InvitationEventRequired;
     const original = if (saved) |entry| try ical.components(a, entry.detail.ics_data) else &.{};
-    const previous = if (saved) |entry| try std.json.parseFromSliceLeaky([]const invites.Revision, a, entry.revisions, .{}) else &.{};
-    var versions: std.ArrayList(invites.Revision) = .empty;
-    for (previous) |item| {
-        const same = std.mem.eql(u8, &item.component, &revision.component);
+    const previous = if (saved) |entry| try AppliedRevision.read(a, entry.revisions, entry.projections) else &.{};
+    var versions: std.ArrayList(AppliedRevision) = .empty;
+    for (previous) |record| {
+        const item = record.revision;
         const order = revisionOrder(item, revision);
-        if (covers(item, revision.occurrence, revision.component) and order == .gt) return error.CalendarInvitationStale;
+        if (covers(item, revision.occurrence, revision.component, revision.this_and_future) and order == .gt) return error.CalendarInvitationStale;
         if (item.sameVersion(revision)) return null;
-        if (same and item.this_and_future and !revision.this_and_future) return error.InvitationScopeConflict;
-        if (!covers(revision, item.occurrence, item.component) or order == .gt) try versions.append(a, item);
+        if (!covers(revision, item.occurrence, item.component, item.this_and_future) or order == .gt)
+            try versions.append(a, .{ .revision = item });
     }
-    try versions.append(a, revision);
+    try versions.append(a, .{ .revision = revision });
 
     var output: ical.Export = .{ .allocator = a };
     try output.headers.appendSlice(a, "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Mail//Calendar Invitation//EN\r\n");
+    var slots = try savedSlots(a, invite, original, previous);
     var existing: ?ical.Component = null;
-    for (original) |item| {
-        if (!std.ascii.eqlIgnoreCase(item.name, "VEVENT")) continue;
-        const occurrence = try occurrenceTime(a, item);
-        const key = try invite.keyForOccurrence(a, occurrence);
-        if (std.mem.eql(u8, &key, &revision.component)) {
+    var kept: usize = 0;
+    for (slots.items) |slot| {
+        if (slot.matches(revision)) {
             if (existing != null) return error.InvalidCalendar;
-            existing = item;
+            existing = slot.event;
             continue;
         }
-        if (covers(revision, occurrence, key)) {
-            if (revisionFor(previous, key)) |item_revision| {
+        if (covers(revision, slot.occurrence, slot.key, slot.future)) {
+            if (slot.version) |item_revision| {
                 if (revisionOrder(item_revision, revision) != .gt) continue;
             } else if (revision.method == .cancel and revision.occurrence == null) continue;
         }
-        try output.addComponent(&output.events, a, item);
+        slots.items[kept] = slot;
+        kept += 1;
+        try output.addComponent(&output.events, a, slot.event);
     }
+    slots.items.len = kept;
+    const changed_start = output.events.items.len;
     try writeChange(&output, invite, attendee, existing);
+    const changed = try a.dupe(u8, output.events.items[changed_start..]);
+    var updated = try Slot.read(a, invite, .{ .name = "VEVENT", .bytes = changed });
+    updated.version = revision;
+    try slots.append(a, updated);
     try appendTimezones(&output, invite.components, original);
+    try projectRanges(&output, slots.items, versions.items);
 
     const body = try output.finish();
     var data = try calendar.prepareDocument(a, body, invite.preview.uid);
     data.uid = if (saved) |entry| entry.detail.event.uid else try ical.resourceUid(a, invite.preview.uid);
     data.source_message = source;
     data.invitation_key = revision.series;
-    data.invitation_revisions = try std.json.Stringify.valueAlloc(a, versions.items, .{});
+    const revisions = try a.alloc(invites.Revision, versions.items.len);
+    var projections: std.ArrayList(AppliedRevision.Projection) = .empty;
+    for (versions.items, revisions) |item, *stored| {
+        stored.* = item.revision;
+        if (item.projection) |projection| try projections.append(a, projection);
+    }
+    data.invitation_revisions = try std.json.Stringify.valueAlloc(a, revisions, .{});
+    if (projections.items.len > 0)
+        data.invitation_projections = try std.json.Stringify.valueAlloc(a, projections.items, .{});
     return data;
 }
