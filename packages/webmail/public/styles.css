@@ -959,6 +959,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-message-toolbar .wm-action:hover { background: var(--hover); }
 .wm-message-toolbar .wm-action--accent { color: var(--accent); }
 .wm-tool-group { gap: 1px; padding: 0 7px 0 0; border-color: var(--border); }
+.wm-tool-organize { padding-inline-end: 0; border-inline-end: 0; }
+.wm-tool-trash { margin-inline-start: -7px; }
 .wm-tool { color: var(--muted); }
 .wm-tool .mail-icon { width: 18px; height: 18px; }
 .wm-tool:hover { color: var(--text); }
@@ -1073,8 +1075,9 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-read-toolbar { gap: 6px; margin-bottom: 16px; padding-block: 8px; }
   .wm-message-toolbar { row-gap: 2px; column-gap: 4px; padding-inline: 4px; }
   .wm-message-toolbar .wm-tool-group { gap: 0; padding-inline-end: 0; border-inline-end: 0; }
+  .wm-tool-trash { margin-inline-start: -4px; }
   .wm-message-toolbar .wm-tool { width: 44px; min-width: 44px; min-height: 44px; }
-  .wm-message-toolbar .wm-junk-action { min-width: 44px; min-height: 44px; justify-content: center; }
+  .wm-message-toolbar :is(.wm-junk-action, .wm-next-unread) { min-width: 44px; min-height: 44px; justify-content: center; }
   .wm-junk-label { display: none; }
   .wm-message-toolbar::after { content: ''; flex-basis: 100%; height: 0; }
   .wm-message-toolbar > :is(.wm-action, .wm-tool-move) { order: 1; }
@@ -1091,6 +1094,9 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 }
 @media (max-width: 360px) {
   .wm-brand > span:last-child { display: none; }
+  .wm-tool-trash { order: 1; margin-inline-start: 0; }
+  .wm-next-unread-label { display: none; }
+  .wm-message-toolbar .wm-tool-move select { inline-size: 88px; }
 }
 @media (max-width: 490px) {
   dialog.wm-modal:has(> .wm-composer) { align-items: flex-end; padding: 0; }

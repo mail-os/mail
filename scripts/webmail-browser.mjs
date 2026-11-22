@@ -359,15 +359,15 @@ async function phoneJourney(page) {
   await page.setViewportSize({ width: 320, height: 844 })
   await fitsViewport(page)
   const actions = page.getByRole('group', { name: 'Message actions', exact: true })
+  await screenshot(page, 'phone-reader-narrow')
   assert((await actions.boundingBox()).height < 124, 'Reader actions fit into two rows on narrow phones')
-  for (const name of ['Reply', 'Reply all', 'Forward', 'Archive message', 'Flag', 'Mark unread', 'Trash', 'Mark junk']) {
+  for (const name of ['Reply', 'Reply all', 'Forward', 'Archive message', 'Flag', 'Mark unread', 'Trash', 'Mark junk', 'Next unread', 'Move this message']) {
     const control = await button(actions, name).boundingBox()
     assert(control.width >= 44 && control.height >= 44, `${name} has a full-size touch target`)
   }
   assert((await actions.getByRole('combobox', { name: 'Move destination' }).boundingBox()).height >= 44,
     'Move destination has a full-size touch target')
   await button(actions, 'Mark junk').waitFor()
-  await screenshot(page, 'phone-reader-narrow')
   await page.setViewportSize({ width: 390, height: 844 })
   await screenshot(page, 'phone-reader')
   await page.emulateMedia({ colorScheme: 'light' })
