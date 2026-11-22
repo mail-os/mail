@@ -9,6 +9,7 @@ import shlex
 import smtplib
 import socket
 import ssl
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -34,6 +35,8 @@ def server(binary, directory, cert, key, reject=False, preload=None, fail_sync=F
                SMTP_ENABLE_WEBMAIL='false', SMTPS_PORT=str(free_port()), SUBMISSION_PORT=str(free_port()))
     if fail_sync:
         env['MAIL_TEST_FAIL_SYNC'] = '1'
+    else:
+        env.pop('MAIL_TEST_FAIL_SYNC', None)
     if preload:
         env['LD_PRELOAD'] = str(preload)
     with (directory / 'server.log').open('w') as log:
@@ -151,22 +154,34 @@ int getaddrinfo(const char *name, const char *service, const struct addrinfo *hi
                 print('PASS opt-in DNSBL rejection returns an explicit SMTP 554 at RCPT', flush=True)
             failed = root / 'storage-failure'
             failed.mkdir()
+            message = b'Subject: storage-failure-must-recover\r\n\r\naccepted in journal\r\n'
             with server(binary, failed, cert, key, preload=preload, fail_sync=True) as port:
                 with smtplib.SMTP('localhost', port, local_hostname='mail-health.stacksjs.com', timeout=10) as smtp:
                     smtp.ehlo()
                     smtp.starttls(context=ssl.create_default_context(cafile=cert))
                     smtp.ehlo()
-                    try:
-                        smtp.sendmail('sender@example.test', ['recipient@example.test'],
-                                      'Subject: storage-failure-must-retry\r\n\r\nnot acknowledged\r\n')
-                    except smtplib.SMTPDataError as error:
-                        if error.smtp_code != 451:
-                            raise RuntimeError(f'Storage failure returned {error.smtp_code}, expected retryable 451')
-                    else:
-                        raise RuntimeError('Storage sync failure was incorrectly acknowledged')
+                    smtp.sendmail('sender@example.test', ['recipient@example.test'], message)
+                with contextlib.closing(sqlite3.connect(failed / 'smtp.db')) as db:
+                    id_, raw, outcome, attempts, reserved = db.execute(
+                        'SELECT m.id,m.mime,t.outcome,t.attempts,t.queued_bytes FROM accepted_mail m '
+                        'JOIN accepted_mail_targets t ON t.delivery_id=m.id'
+                    ).fetchone()
+                if outcome != 'pending' or attempts < 1 or reserved != len(raw):
+                    raise RuntimeError(f'Expected a pending delivery with {len(raw)} reserved bytes after sync failure, got {(outcome, attempts, reserved)}')
+                if not raw.replace(b'\r\n', b'\n').rstrip(b'\n').endswith(message.replace(b'\r\n', b'\n').rstrip(b'\n')):
+                    raise RuntimeError('The pending delivery did not retain the submitted subject and body')
                 if any(p.is_file() for p in (failed / 'mail').rglob('*')):
                     raise RuntimeError('Storage failure exposed a partial or unsynced mailbox message')
-                print('PASS storage sync failure returns SMTP 451 without publishing a message', flush=True)
+            with server(binary, failed, cert, key, preload=preload):
+                with contextlib.closing(sqlite3.connect(failed / 'smtp.db')) as db:
+                    result = db.execute(
+                        'SELECT m.complete,t.outcome,t.queued_bytes FROM accepted_mail m '
+                        'JOIN accepted_mail_targets t ON t.delivery_id=m.id WHERE m.id=?', (id_,)
+                    ).fetchall()
+                copies = [p.read_bytes() for p in (failed / 'mail').rglob('*') if p.is_file()]
+                if result != [(1, 'filed', 0)] or copies != [raw]:
+                    raise RuntimeError('Storage recovery failed to publish one exact copy and release its reservation')
+            print('PASS storage sync failure leaves an accepted journal record and recovery publishes one exact copy', flush=True)
     return 0
 
 
