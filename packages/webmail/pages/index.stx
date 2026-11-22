@@ -43,7 +43,8 @@ const {
   moveTo, showHtml, formattedReader, remoteImagesAllowed, checkedKeys, selectedCount, allChecked, someChecked, undoAction, undoRemaining,
   isJunkFolder, readerJunkAction, selectionJunkAction,
   readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts,
-  pendingSend, sendRemaining, outbox, outboxCount, outboxView, cancelling, authExpired, currentFolderName, now,
+  pendingSend, sendRemaining, outbox, outboxCount, outboxCounts, outboxSection, outboxViews, outboxEmpty,
+  outboxPageNumber, outboxNext, outboxLoading, outboxError, outboxView, cancelling, authExpired, currentFolderName, now,
   composing, title, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, saveStatus,
   savingDraft, draftError, draftConflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword,
   confirmPassword, passwordError, savingPassword, confirmation, confirming, limits,
@@ -59,7 +60,7 @@ const {
   toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, retryReader, closeReader, bulkAction, selectedAction,
   nextUnread, readSelection, advanceBatch, triageAndNext, showShortcuts, closeShortcuts, handleShortcut,
   undoLastAction, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments,
-  saveSendPreference, send, confirmPendingSend, showOutbox, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword,
+  saveSendPreference, send, confirmPendingSend, showOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword,
   showConfirmation, confirmAction, saveDraftCopy, resume, tick, preventUnload,
   senderReviewStatus, senderReviewOpen, senderReviewView, senderReviewPage, senderReviewMore, senderReviewLoading,
   senderReviewSaving, senderReviewError, senderReviewSelection, senderReviewRules, senderReviewGroups,
@@ -399,7 +400,19 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         </details>
       </article>
     </section>
-    <section :if="outboxView" class="wm-outbox" aria-label="Outbox"><header class="wm-list-head"><h1>Outbox</h1></header><p :if="error" role="alert" class="login-error" :text="error"></p><p :if="outbox.length === 0" class="wm-state">No queued messages.</p>
+    <section :if="outboxView" class="wm-outbox" aria-label="Outbox">
+      <header class="wm-list-head"><h1>Outbox</h1></header>
+      <nav class="wm-outbox-views" aria-label="Outbox views">
+        <button :for="view in outboxViews" :key="view.id" type="button" class="wm-action" :aria-pressed="outboxSection === view.id" @click="selectOutboxView(view.id)"><span :text="view.label"></span><span class="wm-outbox-count" :text="outboxCounts[view.id]"></span></button>
+      </nav>
+      <p :if="outboxError || error" role="alert" class="login-error" :text="outboxError || error"></p>
+      <p :if="outboxLoading" role="status" class="wm-state">Loading messages…</p>
+      <p :if="!outboxLoading && !outboxError && outbox.length === 0" class="wm-state" :text="outboxEmpty"></p>
+      <nav :if="outboxPageNumber > 1 || outboxNext" class="wm-pagination wm-outbox-pagination" aria-label="Outbox pages">
+        <button type="button" @click="turnOutboxPage(false)" :disabled="outboxLoading || outboxPageNumber <= 1">Previous</button>
+        <span role="status" :text="'Page ' + outboxPageNumber"></span>
+        <button type="button" @click="turnOutboxPage(true)" :disabled="outboxLoading || !outboxNext">Next</button>
+      </nav>
       <article :for="item in outbox" :key="item.id" class="wm-outbox-item">
         <div>
           <div class="wm-outbox-title">

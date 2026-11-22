@@ -2083,6 +2083,30 @@ fn collectContacts(a: std.mem.Allocator, result: *std.ArrayList(Contact), known:
 fn handleOutboxList(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
     var sess = (try requireSession(server, conn, arena, req)) orelse return;
     defer sess.deinit(server.allocator);
+    if (req.queryParam(arena, "view")) |value| {
+        const view = std.meta.stringToEnum(store.OutboxView, value) orelse
+            return sendError(conn, arena, 400, "invalid_outbox_view", "Choose a valid Outbox view.");
+        const after = req.queryParam(arena, "after");
+        const track = req.queryParam(arena, "track");
+        if (after) |id| {
+            if (view == .overview or !store.validId(id)) return sendError(conn, arena, 400, "invalid_outbox_cursor", "Choose a valid Outbox cursor.");
+        }
+        if (track) |id| {
+            if (!store.validId(id)) return sendError(conn, arena, 400, "invalid_outbox_id", "Choose a valid Outbox message.");
+        }
+        const page = store.outboxPage(arena, server.db, sess.username, view, after, track) catch |err| {
+            if (err == store.StoreError.NotFound)
+                return sendError(conn, arena, 404, "outbox_cursor_expired", "This Outbox page has changed. Open the first page.");
+            return mapServiceError(conn, arena, err);
+        };
+        return sendJson(conn, arena, 200, try service_mod.json(arena, .{
+            .items = page.items,
+            .counts = page.counts,
+            .nextCursor = page.nextCursor,
+            .tracked = page.tracked,
+            .serverTime = time_compat.timestamp(),
+        }), null);
+    }
     const rows = try store.list(arena, server.db, sess.username, "outbox", 100);
     var body: std.ArrayList(u8) = .empty;
     const w = jw(&body, arena);

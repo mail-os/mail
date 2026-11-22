@@ -329,7 +329,13 @@ revokes existing webmail sessions.
   cancels a pending send before its deadline. In webmail, **Edit scheduled send**
   pauses the original schedule and opens the draft with its send time selected.
   Set the next schedule explicitly after editing. A reviewed Unknown record
-  may be resolved explicitly.
+  may be resolved explicitly. Use `GET /webmail/api/outbox?view=upcoming`
+  for bounded summaries ordered by the earliest send time, or use
+  `view=review` and `view=history` for their respective lists. Pass the returned
+  `nextCursor` as `after` for the next page. Expired or foreign cursors return
+  `outbox_cursor_expired`. Use `view=overview` for account totals alone and
+  `track=<sendId>` to include the current status of a send on any page. The
+  request without a view continues to return the legacy array.
 - `POST /webmail/auth/forgot` `{address}` always returns `{ok:true}` (429 when
   the IP is over its limit). `POST /webmail/auth/reset/verify` `{token}` returns
   `{account}` without spending the token; `POST /webmail/auth/reset`

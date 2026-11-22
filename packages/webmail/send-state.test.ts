@@ -29,7 +29,13 @@ for (const lostAcknowledgement of [false, true]) {
         if (!confirmationAvailable) return Response.json({ message: 'Temporarily unavailable' }, { status: 503 })
         result = queued
       }
-      else if (path === '/webmail/api/outbox') result = queued ? [queued] : []
+      else if (path.startsWith('/webmail/api/outbox?')) result = {
+        items: [],
+        counts: { upcoming: queued ? 1 : 0, review: 0, history: 0 },
+        nextCursor: null,
+        tracked: queued,
+        serverTime: Math.floor(Date.now() / 1000),
+      }
       else throw new Error(`Unexpected request ${path}`)
       return Response.json(result)
     }) as typeof fetch
@@ -72,6 +78,9 @@ test('a stale draft save clears the old account even while a read is in flight',
     if (path === '/webmail/auth/me') return Response.json({ user: { username, email: username } })
     expect(new Headers(options?.headers).get('X-Webmail-Account')).toBe(encodeURIComponent(username))
     if (path === '/webmail/api/config') return Response.json({ undoSendSeconds: 10 })
+    if (path.startsWith('/webmail/api/outbox?')) return Response.json({
+      items: [], counts: { upcoming: 0, review: 0, history: 0 }, nextCursor: null, tracked: null, serverTime: 1,
+    })
     if (path.startsWith('/webmail/api/messages?')) return Response.json({ items: [], threads: [], page: 1, total: 0 })
     if (path === '/webmail/api/address-book') return pendingContacts
     if (path === '/webmail/api/drafts') return Response.json({ error: 'account_changed' }, { status: 409 })
@@ -98,6 +107,44 @@ test('a stale draft save clears the old account even while a read is in flight',
     const count = requests.length
     await mail.showContacts()
     expect(requests).toHaveLength(count)
+  }
+  finally { mail.destroy(); globalThis.fetch = previous }
+})
+
+test('an older Outbox response cannot overwrite the selected view', async () => {
+  const previous = globalThis.fetch
+  const username = 'owned@example.test'
+  let finishUpcoming!: (response: Response) => void
+  const pendingUpcoming = new Promise<Response>(resolve => { finishUpcoming = resolve })
+  const page = (items: unknown[] = []) => ({
+    items, counts: { upcoming: 125, review: 1, history: 0 }, nextCursor: null, tracked: null, serverTime: 1,
+  })
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const path = String(input)
+    if (path === '/webmail/auth/me') return Response.json({ user: { username, email: username } })
+    if (path === '/webmail/api/config') return Response.json({ undoSendSeconds: 10 })
+    if (path === '/webmail/api/outbox?view=upcoming') return pendingUpcoming
+    if (path === '/webmail/api/outbox?view=review') return Response.json(page([{ id: 'failed', state: 'failed' }]))
+    if (path === '/webmail/api/outbox?view=overview') return Response.json(page())
+    if (path.startsWith('/webmail/api/messages?')) return Response.json({ items: [], threads: [], page: 1, total: 0 })
+    return Response.json([])
+  }) as typeof fetch
+  const mail = useWebmail({
+    composer: { current: null }, password: { current: null }, confirmation: { current: null },
+    fileInput: { current: null }, selectAll: { current: null }, messageList: { current: null },
+    messageReader: { current: null }, shortcutsDialog: { current: null }, collectionsDialog: { current: null },
+    contactsDialog: { current: null }, navigate: () => {}, nextTick: callback => callback(),
+  })
+  try {
+    await mail.mount()
+    const upcoming = mail.showOutbox()
+    await mail.selectOutboxView('review')
+    finishUpcoming(Response.json(page([{ id: 'scheduled', state: 'pending' }])))
+    await upcoming
+    expect(mail.outboxSection()).toBe('review')
+    expect(mail.outbox().map(item => item.id)).toEqual(['failed'])
+    expect(mail.outboxCount()).toBe(126)
+    expect(mail.outboxLoading()).toBe(false)
   }
   finally { mail.destroy(); globalThis.fetch = previous }
 })

@@ -256,8 +256,11 @@ input[type=checkbox] { accent-color: var(--accent); }
 .wm-state { padding: 32px 18px; color: var(--muted); text-align: center; }
 .wm-boot { padding: 20vh 20px; text-align: center; color: var(--muted); }
 .wm-outbox { grid-column: 1 / -1; overflow-y: auto; padding-bottom: 24px; }
-.wm-outbox .wm-list-head { align-items: baseline; flex-wrap: wrap; }
-.wm-outbox .wm-list-head p { color: var(--muted); font-size: 12px; margin: 0; }
+.wm-outbox-views { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 16px; }
+.wm-outbox-views .wm-action { display: inline-flex; align-items: center; gap: 7px; }
+.wm-outbox-views .wm-action[aria-pressed=true] { background: var(--accent-soft); border-color: var(--selection-edge); color: var(--accent); }
+.wm-outbox-count { font-variant-numeric: tabular-nums; color: var(--muted); }
+.wm-outbox-pagination { margin: 0 16px; }
 .wm-outbox-item { display: flex; gap: 16px; align-items: center; justify-content: space-between; margin: 16px; padding: 20px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); }
 .wm-outbox-title, .wm-outbox-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .wm-outbox-item h2 { font-size: 15px; margin: 0; overflow-wrap: anywhere; }

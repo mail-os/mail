@@ -37,6 +37,7 @@ pub fn initSchema(db: *database.Database) !void {
         \\ FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE
         \\);
         \\CREATE INDEX IF NOT EXISTS webmail_pending ON webmail_records(kind,state,due_at);
+        \\CREATE INDEX IF NOT EXISTS webmail_outbox_time ON webmail_records(username,due_at,id) WHERE kind='outbox';
         \\CREATE INDEX IF NOT EXISTS webmail_record_expiry ON webmail_records(expires_at) WHERE expires_at>0;
         \\CREATE TABLE IF NOT EXISTS webmail_uploads (
         \\ username TEXT NOT NULL, id TEXT NOT NULL, filename TEXT NOT NULL,
@@ -119,6 +120,105 @@ pub fn list(allocator: std.mem.Allocator, db: *database.Database, user: []const 
     var rows: std.ArrayList(Record) = .empty;
     while (try s.step()) try rows.append(allocator, try readRecord(allocator, s));
     return rows.toOwnedSlice(allocator);
+}
+
+pub const OutboxView = enum { overview, upcoming, review, history };
+pub const OutboxCounts = struct { upcoming: i64, review: i64, history: i64 };
+pub const OutboxSummary = struct {
+    id: []const u8,
+    state: []const u8,
+    dueAt: i64,
+    scheduled: bool,
+    message: struct { subject: []const u8, to: []const []const u8 },
+    result: std.json.Value,
+    @"error": ?[]const u8,
+};
+pub const OutboxPage = struct {
+    items: []const OutboxSummary,
+    counts: OutboxCounts,
+    nextCursor: ?[]const u8,
+    tracked: ?OutboxSummary,
+};
+
+const upcoming_states = "state IN ('pending','sending')";
+const review_states = "state IN ('unknown','failed','partial','sent_unfiled')";
+const history_states = "state IN ('sent','cancelled','resolved')";
+const outbox_page_size = 20;
+
+fn outboxPageSql(comptime filter: []const u8, comptime key: []const u8, comptime ascending: bool) []const u8 {
+    const scope = " FROM webmail_records WHERE username=?1 AND kind='outbox'";
+    const order = if (ascending) " ASC" else " DESC";
+    const compare = if (ascending) ">" else "<";
+    // Resolve the cursor within the same account and SQLite read snapshot as
+    // the counts and page. The cursor's record can move to a different view.
+    return "WITH anchor AS (SELECT " ++ key ++ ",id" ++ scope ++ " AND id=?2)," ++
+        " totals AS (SELECT COUNT(*) FILTER (WHERE " ++ upcoming_states ++ ") AS upcoming," ++
+        " COUNT(*) FILTER (WHERE " ++ review_states ++ ") AS review," ++
+        " COUNT(*) FILTER (WHERE " ++ history_states ++ ") AS history" ++ scope ++ ")," ++
+        " page AS (SELECT id" ++ scope ++ " AND (" ++ filter ++ ")" ++
+        " AND (?2 IS NULL OR (" ++ key ++ ",id)" ++ compare ++ "(SELECT * FROM anchor))" ++
+        " ORDER BY " ++ key ++ order ++ ",id" ++ order ++ " LIMIT ?4)," ++
+        " ids AS (SELECT id,0 AS tracked FROM page UNION ALL SELECT id,1" ++ scope ++ " AND id=?3)" ++
+        " SELECT upcoming,review,history,?2 IS NULL OR EXISTS(SELECT 1 FROM anchor)," ++
+        " ids.tracked,r.id,r.state,r.due_at," ++
+        " CASE WHEN json_valid(r.payload) THEN json_extract(r.payload,'$.message.subject') END," ++
+        " CASE WHEN json_valid(r.payload) THEN json_extract(r.payload,'$.message.to') END," ++
+        " CASE WHEN json_valid(r.payload) THEN json_extract(r.payload,'$.scheduled') OR json_extract(r.payload,'$.message.scheduleAt') IS NOT NULL END," ++
+        " CASE WHEN json_valid(r.payload) THEN json_extract(r.payload,'$.result') END," ++
+        " CASE WHEN json_valid(r.payload) THEN json_extract(r.payload,'$.error_message') END" ++
+        " FROM totals LEFT JOIN ids ON 1 LEFT JOIN webmail_records r ON r.username=?1 AND r.kind='outbox' AND r.id=ids.id" ++
+        " ORDER BY ids.tracked,r." ++ key ++ order ++ ",r.id" ++ order;
+}
+
+pub fn outboxPage(a: std.mem.Allocator, db: *database.Database, user: []const u8, view: OutboxView, after: ?[]const u8, track: ?[]const u8) !OutboxPage {
+    const s = try db.prepare(switch (view) {
+        .overview => outboxPageSql("0", "due_at", true),
+        .upcoming => outboxPageSql(upcoming_states, "due_at", true),
+        .review => outboxPageSql(review_states, "due_at", false),
+        .history => outboxPageSql(history_states, "expires_at", false),
+    });
+    defer s.finalize();
+    try s.bind(1, user);
+    try s.bindOpt(2, after);
+    try s.bindOpt(3, track);
+    try s.bind(4, outbox_page_size + 1);
+    if (!try s.step()) unreachable; // Counts always produce a row.
+    if (s.columnInt64(3) == 0) return StoreError.NotFound;
+    const counts = OutboxCounts{ .upcoming = s.columnInt64(0), .review = s.columnInt64(1), .history = s.columnInt64(2) };
+    var items: std.ArrayList(OutboxSummary) = .empty;
+    var tracked: ?OutboxSummary = null;
+    var next: ?[]const u8 = null;
+    while (true) {
+        const id = s.columnText(5);
+        if (id.len == 0) break;
+        if (s.columnInt64(4) != 0) {
+            tracked = try readOutboxSummary(a, s);
+        } else if (items.items.len == outbox_page_size) {
+            next = items.items[items.items.len - 1].id;
+        } else {
+            try items.append(a, try readOutboxSummary(a, s));
+        }
+        if (!try s.step()) break;
+    }
+    return .{ .items = items.items, .counts = counts, .nextCursor = next, .tracked = tracked };
+}
+
+fn readOutboxSummary(a: std.mem.Allocator, s: database.Statement) !OutboxSummary {
+    const recipients = s.columnText(9);
+    const result = s.columnText(11);
+    const message_error = s.columnText(12);
+    return .{
+        .id = try a.dupe(u8, s.columnText(5)),
+        .state = try a.dupe(u8, s.columnText(6)),
+        .dueAt = s.columnInt64(7),
+        .scheduled = s.columnInt64(10) != 0,
+        .message = .{
+            .subject = try a.dupe(u8, s.columnText(8)),
+            .to = if (recipients.len == 0) &.{} else try std.json.parseFromSliceLeaky([]const []const u8, a, recipients, .{ .allocate = .alloc_always }),
+        },
+        .result = if (result.len == 0) .null else try std.json.parseFromSliceLeaky(std.json.Value, a, result, .{ .allocate = .alloc_always }),
+        .@"error" = if (message_error.len == 0) null else try a.dupe(u8, message_error),
+    };
 }
 
 pub fn findDraft(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, uid: i64) !Record {
