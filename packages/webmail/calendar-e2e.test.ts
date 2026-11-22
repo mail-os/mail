@@ -1,5 +1,6 @@
 /** Run against a disposable webmail account and the same server's CalDAV endpoint. */
 import { expect, test } from 'bun:test'
+import { nativeFetch } from './native-e2e-fetch'
 
 const base = process.env.MAIL_WEBMAIL_E2E_URL
 const dav = process.env.MAIL_WEBMAIL_E2E_CALDAV_URL
@@ -13,26 +14,26 @@ test.skipIf(!base || !dav || !username || !password)('CalDAV writes appear in th
   const recurring = new URL('recurring.ics', collection)
   const timezone = new URL('second-timezone.ics', collection)
   const authorization = `Basic ${btoa(`${username}:${password}`)}`
-  const requestDav = (url: URL, method: string, body?: string) => fetch(url, {
+  const requestDav = (url: URL, method: string, body?: string) => nativeFetch(url, {
     method,
     body,
     headers: { Authorization: authorization, ...(body ? { 'Content-Type': 'text/calendar; charset=utf-8' } : {}) },
     redirect: 'error',
     signal: AbortSignal.timeout(5000),
   })
-  const login = await fetch(new URL('/webmail/auth/login', base), {
+  const login = await nativeFetch(new URL('/webmail/auth/login', base), {
     method: 'POST',
     headers: { Origin: base!, 'Content-Type': 'application/json' },
     body: JSON.stringify({ username, password }),
   })
   expect(login.status).toBe(200)
   const cookie = login.headers.get('set-cookie')!.split(';', 1)[0]
-  const requestWebmail = (path: string) => fetch(new URL(path, base), {
+  const requestWebmail = (path: string) => nativeFetch(new URL(path, base), {
     headers: { Cookie: cookie, 'X-Webmail-Account': encodeURIComponent(username!) },
     signal: AbortSignal.timeout(5000),
   })
-  expect((await fetch(new URL('/webmail/api/calendars', base))).status).toBe(401)
-  expect((await fetch(new URL('/webmail/api/calendar-export?calendarId=1', base))).status).toBe(401)
+  expect((await nativeFetch(new URL('/webmail/api/calendars', base))).status).toBe(401)
+  expect((await nativeFetch(new URL('/webmail/api/calendar-export?calendarId=1', base))).status).toBe(401)
   const page = await requestWebmail('/calendar')
   expect(page.status).toBe(200)
   expect(await page.text()).toContain('Download .ics')

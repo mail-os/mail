@@ -1,5 +1,6 @@
 /** Run against a disposable account: MAIL_WEBMAIL_E2E_URL/USER/PASSWORD. */
 import { expect, test } from 'bun:test'
+import { nativeFetch } from './native-e2e-fetch'
 
 const base = process.env.MAIL_WEBMAIL_E2E_URL
 const username = process.env.MAIL_WEBMAIL_E2E_USER
@@ -10,7 +11,7 @@ test.skipIf(!base || !username || !password)('live HTTPS webmail mailbox and acc
     throw new Error('Use a disposable E2E account with a password of at least 12 characters so password restoration can succeed.')
   let cookie = ''
   async function request(path: string, method = 'GET', body?: unknown): Promise<Response> {
-    return fetch(new URL(path, base), {
+    return nativeFetch(new URL(path, base), {
       method,
       headers: { 'Content-Type': 'application/json', Origin: base!, Cookie: cookie },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -21,7 +22,7 @@ test.skipIf(!base || !username || !password)('live HTTPS webmail mailbox and acc
     expect(response.status).toBe(200)
     return response.json()
   }
-  const foreignLogin = await fetch(new URL('/webmail/auth/login', base), {
+  const foreignLogin = await nativeFetch(new URL('/webmail/auth/login', base), {
     method: 'POST', headers: { 'Content-Type': 'application/json', Origin: 'https://example.invalid' },
     body: JSON.stringify({ username, password }),
   })
@@ -59,7 +60,7 @@ test.skipIf(!base || !username || !password)('live HTTPS webmail mailbox and acc
   }
   const trash = await json('/webmail/api/messages?folder=Trash')
   expect(trash.items.some((message: any) => message.subject === subject)).toBe(true)
-  const crossOrigin = await fetch(new URL('/webmail/auth/password', base), {
+  const crossOrigin = await nativeFetch(new URL('/webmail/auth/password', base), {
     method: 'POST', headers: { Origin: 'https://example.invalid', Cookie: cookie },
     body: JSON.stringify({ currentPassword: password, newPassword: 'must-not-be-applied' }),
   })
@@ -81,14 +82,14 @@ test.skipIf(!base || !username || !password)('live HTTPS webmail mailbox and acc
 }, 60000)
 
 test.skipIf(!base || !username || !password)('webmail drafts, attachments, search, moves and partial delivery', async () => {
-  const login = await fetch(new URL('/webmail/auth/login', base), {
+  const login = await nativeFetch(new URL('/webmail/auth/login', base), {
     method: 'POST', headers: { 'Content-Type': 'application/json', Origin: base! },
     body: JSON.stringify({ username, password }),
   })
   expect(login.status).toBe(200)
   const cookie = login.headers.get('set-cookie')!.split(';')[0]
   async function request(path: string, method = 'GET', body?: unknown): Promise<Response> {
-    return fetch(new URL(path, base), {
+    return nativeFetch(new URL(path, base), {
       method, headers: { 'Content-Type': 'application/json', Origin: base!, Cookie: cookie },
       body: body === undefined ? undefined : JSON.stringify(body),
     })
@@ -115,7 +116,7 @@ test.skipIf(!base || !username || !password)('webmail drafts, attachments, searc
   expect(download.status).toBe(200)
   expect(download.headers.get('content-disposition')).toContain("filename*=UTF-8''")
   expect([...new Uint8Array(await download.arrayBuffer())]).toEqual([0, 1, 2, 255])
-  expect((await fetch(new URL(downloadPath, base))).status).toBe(401)
+  expect((await nativeFetch(new URL(downloadPath, base))).status).toBe(401)
   expect((await request(`/webmail/api/attachment?folder=Drafts&uid=${draft.uid}&index=1`)).status).toBe(404)
   const missing = `missing-${crypto.randomUUID()}@${username!.split('@')[1]}`
   const needle = `tail-${crypto.randomUUID()}`
