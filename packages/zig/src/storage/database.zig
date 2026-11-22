@@ -1468,6 +1468,24 @@ pub const Database = struct {
         interactive_remote: bool = false,
     };
 
+    pub fn delegatedSenderAddress(self: *Database, a: std.mem.Allocator, user: []const u8, identity: i64) !?[]const u8 {
+        const stmt = try self.prepare(team_store.senderIdentityQuery ++ " AND source.id=?2");
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, identity);
+        if (!try stmt.step()) return null;
+        return try a.dupe(u8, stmt.columnText(1));
+    }
+
+    fn requireDelegatedSenderLocked(self: *Database, user: []const u8, identity: i64, address: []const u8) !void {
+        const stmt = try self.prepareLocked(team_store.senderIdentityQuery ++ " AND source.id=?2 AND source.email=?3");
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, identity);
+        try stmt.bind(3, address);
+        if (!try stmt.step()) return error.SenderIdentityUnavailable;
+    }
+
     pub const DeliveryEnvelope = struct {
         id: []const u8,
         from: []const u8,
@@ -1479,6 +1497,7 @@ pub const Database = struct {
         accepted_ms: i64,
         targets: []const DeliveryTarget,
         sender: ?[]const u8 = null,
+        delegated_sender_id: ?i64 = null,
         charge_recipients: usize = 0,
         receipt: ?ActiveSyncReceipt = null,
         review_release: ?FiledCopy = null,
@@ -1491,6 +1510,11 @@ pub const Database = struct {
         defer self.mutex.unlock();
         try self.execLocked("BEGIN IMMEDIATE");
         errdefer self.execLocked("ROLLBACK") catch {};
+        // Serialize revocation and delivery admission, before debiting the
+        // actor or creating any visible recipient copies.
+        if (envelope.delegated_sender_id) |identity| {
+            try self.requireDelegatedSenderLocked(envelope.sender orelse return error.SenderIdentityUnavailable, identity, envelope.from);
+        }
         var hosted_sender: i64 = 0;
         if (envelope.sender) |sender| {
             if (envelope.receipt) |receipt| try self.recordActiveSyncReceiptLocked(sender, receipt, envelope.accepted_at);

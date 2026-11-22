@@ -511,6 +511,7 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     }
     if (std.mem.eql(u8, p, "/webmail/api/health") and std.mem.eql(u8, req.method, "GET")) return handleHealth(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/config") and std.mem.eql(u8, req.method, "GET")) return handleClientConfig(server, conn, arena, req);
+    if (std.mem.eql(u8, p, "/webmail/api/sender-identities") and std.mem.eql(u8, req.method, "GET")) return handleSenderIdentities(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/preferences") and std.mem.eql(u8, req.method, "PUT")) return handlePreferences(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/compose-library") and
         (std.mem.eql(u8, req.method, "GET") or std.mem.eql(u8, req.method, "PUT"))) return handleComposeLibrary(server, conn, arena, req);
@@ -1303,7 +1304,7 @@ fn handleAttachment(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
 /// POST /webmail/api/compose
 /// { to:[...], cc:[...], bcc:[...], subject, text, html, inReplyTo?, references? }
 /// Sends through the shared delivery path (DKIM-signed) and saves to Sent.
-/// The From address is always the session user — never client-supplied.
+/// An optional senderId selects a mailbox that granted this account send access.
 fn handleCompose(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
     if (!isSameOrigin(req)) return sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected");
     var sess = (try requireSession(server, conn, arena, req)) orelse return;
@@ -1318,7 +1319,9 @@ fn handleCompose(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: s
         const row = server.service.queue(arena, sess.username, sess.email, parsed.value, time_compat.timestamp()) catch |err| return mapServiceError(conn, arena, err);
         return sendJson(conn, arena, 200, try outboxJson(arena, row), null);
     }
-    const msg = server.service.payloadMessage(arena, parsed.value, sess.username, sess.email, false) catch |err| return mapServiceError(conn, arena, err);
+    const delegated_id = parsed.value.delegatedSender() catch |err| return mapServiceError(conn, arena, err);
+    const from = server.service.sendAddress(arena, sess.username, sess.email, delegated_id) catch |err| return mapServiceError(conn, arena, err);
+    const msg = server.service.payloadMessage(arena, parsed.value, sess.username, from, false) catch |err| return mapServiceError(conn, arena, err);
     if (msg.to.len + msg.cc.len + msg.bcc.len > 100) return sendError(conn, arena, 400, "bad_request", "Use at most 100 recipients");
 
     const cfg = compose.SendConfig{
@@ -1326,6 +1329,7 @@ fn handleCompose(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: s
         .delivery_method = server.config.delivery_method,
         .ses_region = server.config.ses_region,
         .sender_user = sess.username,
+        .delegated_sender_id = delegated_id,
         .mail_config = server.config.mail_config,
         .auth = server.auth,
     };
@@ -1410,6 +1414,7 @@ fn mapServiceError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: any
         service_mod.ServiceError.InvalidPayload, service_mod.ServiceError.InvalidAction, service_mod.ServiceError.InvalidAttachment, compose.ComposeError.InvalidAddress, compose.ComposeError.InvalidHeader, compose.ComposeError.NoRecipients => sendError(conn, arena, 400, "bad_request", "Check the recipients, headers and attachment limits"),
         error.HostedSendingLimit => sendError(conn, arena, 429, "sending_limit", "Daily recipient allowance exhausted. Try again after midnight UTC."),
         error.HostedSenderDisabled => sendError(conn, arena, 403, "mailbox_disabled", "This mailbox is disabled."),
+        error.SenderIdentityUnavailable => sendError(conn, arena, 403, "sender_identity_unavailable", "This From address is no longer available. Choose another address before sending."),
         error.HostedStorageFull => sendError(conn, arena, 507, "mailbox_full", "Mailbox storage is full. Free space before retrying."),
         error.HostedRecipientDisabled => sendError(conn, arena, 409, "recipient_disabled", "A recipient mailbox is disabled."),
         store.StoreError.NotFound => sendError(conn, arena, 404, "not_found", "No such item in this account"),
@@ -1537,6 +1542,17 @@ fn handleComposeLibrary(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a
         else => return mapServiceError(conn, arena, err),
     };
     return sendJson(conn, arena, 200, try service_mod.json(arena, library), null);
+}
+
+fn handleSenderIdentities(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    var session = (try requireSession(server, conn, a, req)) orelse return;
+    defer session.deinit(server.allocator);
+    const identities = teams.senderIdentities(server.db, a, session.username) catch |err| return mapServiceError(conn, a, err);
+    var available: std.ArrayList(teams.SenderIdentity) = .empty;
+    for (identities) |identity| {
+        if (compose.isSafeAddress(identity.address)) try available.append(a, identity);
+    }
+    return sendJson(conn, a, 200, try service_mod.json(a, available.items), null);
 }
 
 fn handleTeams(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {

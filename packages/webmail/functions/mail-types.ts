@@ -99,6 +99,7 @@ export interface ComposeAttachment extends Partial<Upload> {
   status: 'uploading' | 'loading' | 'ready' | 'failed'
   error?: string
 }
+export interface SenderIdentity { id: string, address: string }
 export interface ComposePayload {
   to: string[]
   cc: string[]
@@ -120,6 +121,7 @@ export interface ComposePayload {
   sendId?: string
   delaySeconds?: number
   scheduleAt?: number | null
+  senderId?: string | null
 }
 export interface DraftAck { ok: boolean, uid: number, draftId: string, revision: number }
 export interface DraftDocument { draftId: string, revision: number, uid: number, state: string, message: ComposePayload }

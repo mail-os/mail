@@ -82,6 +82,7 @@ pub const SendConfig = struct {
     auth: ?*auth_mod.AuthBackend = null,
     /// Canonical mailbox key of the sender (used for the Sent folder path).
     sender_user: []const u8,
+    delegated_sender_id: ?i64 = null,
 
     fn delivery(self: SendConfig) submission.Delivery {
         return .{
@@ -104,6 +105,7 @@ pub const SendResult = struct {
 };
 
 pub const OutboxDispatch = struct {
+    from_address: ?[]const u8 = null,
     delivery_id: []const u8,
     sent_delivery_id: []const u8,
     message_id: []const u8,
@@ -421,6 +423,7 @@ pub fn sendWithJournal(allocator: std.mem.Allocator, msg: Message, cfg: SendConf
     const delivery = cfg.delivery();
     const result = try submission.dispatch(allocator, delivery, msg.from, recipients, raw, .{
         .sender = cfg.sender_user,
+        .delegated_sender_id = cfg.delegated_sender_id,
         .interactive_id = if (dispatch) |send_record| send_record.delivery_id else null,
     });
     errdefer allocator.free(result.failed);

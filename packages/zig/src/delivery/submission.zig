@@ -115,6 +115,7 @@ const RawSubmission = struct {
 
 pub const DispatchOptions = struct {
     sender: ?[]const u8 = null,
+    delegated_sender_id: ?i64 = null,
     sent: ?SentCopy = null,
     interactive_id: ?[]const u8 = null,
     receipt: ?database.Database.ActiveSyncReceipt = null,
@@ -133,7 +134,7 @@ pub const DispatchResult = struct {
 /// app submissions keep their synchronous delivery results for partial-send UI.
 pub fn dispatch(a: std.mem.Allocator, cfg: Delivery, from: []const u8, recipients: []const []const u8, raw: []const u8, options: DispatchOptions) !DispatchResult {
     if (recipients.len == 0) return error.NoRecipients;
-    if (options.interactive_id != null and cfg.db == null) return error.DatabaseUnavailable;
+    if ((options.interactive_id != null or options.delegated_sender_id != null) and cfg.db == null) return error.DatabaseUnavailable;
     const failed = try a.alloc([]const u8, recipients.len);
     errdefer a.free(failed);
     const errors = try a.alloc(?anyerror, recipients.len);
@@ -261,6 +262,7 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
         .accepted_ms = time_compat.milliTimestamp(),
         .targets = plan.targets.items,
         .sender = options.sender,
+        .delegated_sender_id = options.delegated_sender_id,
         .charge_recipients = recipients.len,
         .receipt = options.receipt,
     });

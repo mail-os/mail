@@ -56,6 +56,14 @@ pub const Payload = struct {
         data: []const u8 = "",
         uploadId: ?[]const u8 = null,
     } = &.{},
+    senderId: ?[]const u8 = null,
+
+    pub fn delegatedSender(self: Payload) !?i64 {
+        const id = self.senderId orelse return null;
+        if (id.len == 0 or id.len > 19 or id[0] == '0') return ServiceError.InvalidPayload;
+        for (id) |byte| if (!std.ascii.isDigit(byte)) return ServiceError.InvalidPayload;
+        return std.fmt.parseInt(i64, id, 10) catch return ServiceError.InvalidPayload;
+    }
 };
 pub const Draft = struct { uid: i64, folder: []const u8 = "Drafts", message: Payload };
 pub const DraftAttachmentEdit = union(enum) {
@@ -197,6 +205,7 @@ pub const Service = struct {
     }
 
     pub fn payloadMessage(self: *Service, a: std.mem.Allocator, payload: Payload, user: []const u8, email: []const u8, draft: bool) !compose.Message {
+        if (draft) _ = try payload.delegatedSender();
         const allowed = try self.limits(user);
         if (payload.attachments.len > allowed.maxCount or payload.to.len + payload.cc.len + payload.bcc.len > 100 or payload.subject.len > 2000 or payload.text.len > 256 * 1024 or payload.html.len > 256 * 1024) return ServiceError.InvalidPayload;
         for ([_][]const u8{ payload.recipientInputs.to, payload.recipientInputs.cc, payload.recipientInputs.bcc }) |input| if (input.len > 2000) return ServiceError.InvalidPayload;
@@ -223,6 +232,13 @@ pub const Service = struct {
             .attachments = try attachments.toOwnedSlice(a),
             .include_bcc = draft,
         };
+    }
+
+    pub fn sendAddress(self: *Service, a: std.mem.Allocator, user: []const u8, own_address: []const u8, delegated_id: ?i64) ![]const u8 {
+        const id = delegated_id orelse return own_address;
+        const address = (try self.db.delegatedSenderAddress(a, user, id)) orelse return error.SenderIdentityUnavailable;
+        if (!compose.isSafeAddress(address)) return error.SenderIdentityUnavailable;
+        return address;
     }
 
     fn resolveAttachment(self: *Service, a: std.mem.Allocator, user: []const u8, attachment: std.meta.Elem(@FieldType(Payload, "attachments")), limit: usize) !compose.Attachment {
@@ -448,7 +464,8 @@ pub const Service = struct {
             if (delay > 30) return ServiceError.InvalidPayload;
             break :blk now + delay;
         };
-        const msg = try self.payloadMessage(a, payload, user, email, false);
+        const from = try self.sendAddress(a, user, email, try payload.delegatedSender());
+        const msg = try self.payloadMessage(a, payload, user, from, false);
         if (msg.to.len + msg.cc.len + msg.bcc.len == 0) return compose.ComposeError.NoRecipients;
         for ([_][]const []const u8{ msg.to, msg.cc, msg.bcc }) |addresses| for (addresses) |address| if (!compose.isSafeAddress(address)) return compose.ComposeError.InvalidAddress;
         const raw = try compose.buildMime(a, msg, now, "<validation@localhost>");
@@ -492,12 +509,10 @@ pub const Service = struct {
             .message_id = try std.fmt.allocPrint(a, "<{s}@{s}>", .{ delivery_id, self.config.hostname }),
             .message_date = time.timestamp(),
         };
-        // Save the server-generated journal key before releasing any recipient.
-        row.payload = try json(a, doc);
-        row.revision = try store.put(self.db, row, row.revision);
-        self.deliver(a, row.username, &doc) catch |err| {
+        self.deliver(a, &row, &doc) catch |err| {
             if (!try self.reconcileDelivery(a, row.username, &doc)) {
                 doc.error_message = switch (err) {
+                    error.SenderIdentityUnavailable => "This From address is no longer available. Choose another address before sending.",
                     error.HostedSendingLimit => "Daily recipient allowance exhausted. Try again after midnight UTC.",
                     error.HostedSenderDisabled => "This mailbox is disabled. The message was not sent.",
                     error.HostedStorageFull => "A recipient mailbox is full. Review the recipients before retrying.",
@@ -558,7 +573,7 @@ pub const Service = struct {
         if (try self.db.hasFiledDelivery(dispatch.sent_delivery_id)) return true;
         var account = try self.db.getUserByUsername(user);
         defer account.deinit(self.db.allocator);
-        const message = try self.payloadMessage(a, payload, user, account.email, false);
+        const message = try self.payloadMessage(a, payload, user, dispatch.from_address orelse account.email, false);
         return compose.recoverSent(a, message, self.sendConfig(user), dispatch);
     }
 
@@ -580,7 +595,7 @@ pub const Service = struct {
             (try self.db.hostedLimits(row.username)) != null;
         if (compact) {
             retained.request_hash = try sendFingerprint(a, doc.message);
-            retained.message = .{ .subject = doc.message.subject, .to = doc.message.to };
+            retained.message = .{ .subject = doc.message.subject, .to = doc.message.to, .senderId = doc.message.senderId };
         }
         row.payload = try json(a, retained);
         row.expires_at = now + store.terminal_retention;
@@ -619,12 +634,22 @@ pub const Service = struct {
         return row;
     }
 
-    fn deliver(self: *Service, a: std.mem.Allocator, user: []const u8, doc: *Outbox) !void {
+    fn deliver(self: *Service, a: std.mem.Allocator, row: *store.Record, doc: *Outbox) !void {
+        const user = row.username;
         var account = try self.db.getUserByUsername(user);
         defer account.deinit(self.db.allocator);
         if (!account.enabled) return error.HostedSenderDisabled;
-        const msg = try self.payloadMessage(a, doc.message, user, account.email, false);
-        doc.result = try compose.sendWithJournal(a, msg, self.sendConfig(user), doc.dispatch);
+        const delegated_id = try doc.message.delegatedSender();
+        const from = try self.sendAddress(a, user, account.email, delegated_id);
+        const msg = try self.payloadMessage(a, doc.message, user, from, false);
+        // Recovery files Sent with the address used at admission, even after
+        // a grant is revoked or the shared mailbox changes its address.
+        doc.dispatch.?.from_address = try a.dupe(u8, from);
+        row.payload = try json(a, doc.*);
+        row.revision = try store.put(self.db, row.*, row.revision);
+        var cfg = self.sendConfig(user);
+        cfg.delegated_sender_id = delegated_id;
+        doc.result = try compose.sendWithJournal(a, msg, cfg, doc.dispatch);
     }
 
     fn sendConfig(self: *Service, user: []const u8) compose.SendConfig {
@@ -910,12 +935,12 @@ fn failedLabels(a: std.mem.Allocator, addresses: []const []const u8, labels: []c
 
 fn sendFingerprint(a: std.mem.Allocator, payload: Payload) ![]const u8 {
     const raw = try json(a, payload);
-    if (payload.clearFollowUp and payload.scheduleAt != null) return fingerprint(a, raw);
     // Compact receipts retain the request digest after the message is pruned.
     // Omit new optional fields when absent to match receipts from older builds.
     var legacy = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
     if (!payload.clearFollowUp) _ = legacy.object.orderedRemove("clearFollowUp");
     if (payload.scheduleAt == null) _ = legacy.object.orderedRemove("scheduleAt");
+    if (payload.senderId == null) _ = legacy.object.orderedRemove("senderId");
     return fingerprint(a, try json(a, legacy));
 }
 

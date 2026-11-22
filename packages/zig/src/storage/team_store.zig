@@ -45,6 +45,14 @@ pub const Actor = union(enum) { mailbox: []const u8, operator: []const u8 };
 pub const Team = struct { id: []const u8, name: []const u8, role: ?Role = null };
 pub const Member = struct { mailbox: []const u8, role: Role, enabled: bool };
 pub const Grant = struct { source: []const u8, grantee: []const u8, scope: Scope, resource: []const u8 = "" };
+pub const SenderIdentity = struct { id: []const u8, address: []const u8 };
+pub const senderIdentityQuery =
+    \\SELECT DISTINCT source.id, source.email FROM mail_team_grants g
+    \\JOIN users actor ON actor.id=g.grantee_id
+    \\JOIN users source ON source.id=g.source_id
+    \\WHERE actor.username=?1 AND actor.enabled=1 AND source.enabled=1
+    \\AND g.scope='sender' AND g.resource=''
+;
 pub const Details = struct { team: Team, members: []Member, grants: []Grant };
 const Identity = struct { id: i64, enabled: bool };
 
@@ -224,6 +232,18 @@ pub fn list(db: *database.Database, a: Allocator, mailbox: []const u8) ![]Team {
         .id = try a.dupe(u8, stmt.columnText(0)),
         .name = try a.dupe(u8, stmt.columnText(1)),
         .role = std.meta.stringToEnum(Role, stmt.columnText(2)) orelse return error.InvalidTeamData,
+    });
+    return rows.toOwnedSlice(a);
+}
+
+pub fn senderIdentities(db: *database.Database, a: Allocator, mailbox: []const u8) ![]SenderIdentity {
+    const stmt = try db.prepare(senderIdentityQuery ++ " ORDER BY source.email");
+    defer stmt.finalize();
+    try stmt.bind(1, mailbox);
+    var rows: std.ArrayList(SenderIdentity) = .empty;
+    while (try stmt.step()) try rows.append(a, .{
+        .id = try std.fmt.allocPrint(a, "{d}", .{stmt.columnInt64(0)}),
+        .address = try a.dupe(u8, stmt.columnText(1)),
     });
     return rows.toOwnedSlice(a);
 }

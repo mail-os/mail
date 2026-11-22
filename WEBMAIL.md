@@ -354,6 +354,13 @@ revokes existing webmail sessions.
   the current `revision`. A stale revision returns 409. Webmail inserts the
   default signature into new compositions, including replies and forwards,
   and keeps the resulting text in saved drafts and scheduled messages.
+- `GET /webmail/api/sender-identities` lists active delegated addresses with
+  their `id` values. Compose and drafts accept an optional `senderId`. The server
+  checks the grant when queuing and again in the delivery admission
+  transaction. The signed-in mailbox owns the draft, Outbox, Sent copy, and
+  recipient usage. When a grant is revoked before admission, the Outbox marks
+  the send failed and preserves its draft so the sender can choose a different
+  address. Recovery uses the From address recorded at admission.
 - `POST /webmail/api/uploads?filename=...&contentType=...&uploadId=...` stages
   raw bytes. Repeating an ID and identical content succeeds; different content
   conflicts. `DELETE /webmail/api/uploads/:id` removes an unused owned upload.
