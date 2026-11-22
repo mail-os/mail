@@ -48,13 +48,22 @@ pub fn fileFingerprint(a: Allocator, path: []const u8) !FileIdentity {
     return fileIdentity(a, path, true);
 }
 
+pub fn openFileFingerprint(a: Allocator, fd: std.c.fd_t) !FileIdentity {
+    return statIdentity(a, fd, null, true);
+}
+
 fn fileIdentity(a: Allocator, path: []const u8, fingerprint: bool) !FileIdentity {
     const file = try a.dupeSentinel(u8, path, 0);
     defer a.free(file);
+    return statIdentity(a, std.c.AT.FDCWD, file, fingerprint);
+}
+
+fn statIdentity(a: Allocator, fd: std.c.fd_t, path: ?[*:0]const u8, fingerprint: bool) !FileIdentity {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         var stat: linux.Statx = std.mem.zeroes(linux.Statx);
-        const result = linux.statx(linux.AT.FDCWD, file, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true, .INO = true, .BTIME = true, .MTIME = true, .SIZE = fingerprint }, &stat);
+        const flags: u32 = if (path == null) linux.AT.EMPTY_PATH else linux.AT.SYMLINK_NOFOLLOW;
+        const result = linux.statx(fd, path orelse "", flags, .{ .TYPE = true, .INO = true, .BTIME = true, .MTIME = true, .SIZE = fingerprint }, &stat);
         if (linux.errno(result) != .SUCCESS or !stat.mask.INO or !stat.mask.TYPE or !std.c.S.ISREG(stat.mode)) return error.FileNotFound;
         if (!stat.mask.BTIME and !stat.mask.MTIME) return error.FileNotFound;
         const born = if (stat.mask.BTIME) stat.btime else stat.mtime;
@@ -66,7 +75,8 @@ fn fileIdentity(a: Allocator, path: []const u8, fingerprint: bool) !FileIdentity
         };
     }
     var stat: std.c.Stat = undefined;
-    if (std.c.fstatat(std.c.AT.FDCWD, file, &stat, std.c.AT.SYMLINK_NOFOLLOW) != 0 or !std.c.S.ISREG(stat.mode)) return error.FileNotFound;
+    const result = if (path) |name| std.c.fstatat(fd, name, &stat, std.c.AT.SYMLINK_NOFOLLOW) else std.c.fstat(fd, &stat);
+    if (result != 0 or !std.c.S.ISREG(stat.mode)) return error.FileNotFound;
     const born = if (@hasDecl(std.c.Stat, "birthtime")) stat.birthtime() else stat.mtime();
     const timestamp = if (born.sec == 0 and born.nsec == 0) stat.mtime() else born;
     const stamp = try std.fmt.allocPrint(a, "{d}:{d}:{d}:{d}", .{ stat.dev, stat.ino, timestamp.sec, timestamp.nsec });

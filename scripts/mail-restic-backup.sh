@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Create a transactionally consistent local archive, then copy it into an
+# Create a local archive from SQLite snapshots and Maildir, then copy it into an
 # authenticated, client-side encrypted Restic repository. S3's SSE-KMS remains
 # enabled as a second encryption layer; Restic encryption happens first.
 
@@ -34,7 +34,7 @@ set +a
 : "${AWS_SECRET_ACCESS_KEY:?AWS_SECRET_ACCESS_KEY is required}"
 
 umask 077
-"${BACKUP_SCRIPT}"
+MAIL_DIR="${MAIL_ROOT}" "${BACKUP_SCRIPT}"
 
 latest="$(find -L "${MAIL_ROOT}/backups" -maxdepth 1 -type f -name 'mail-backup-*.tgz' \
   -printf '%T@ %p\n' | sort -nr | head -1 | cut -d' ' -f2-)"

@@ -164,14 +164,43 @@ buddy mail:storage:restic:configure --profile stacks
 buddy mail:storage:restore:check --profile stacks
 ```
 
-The daily job creates a verified SQLite-consistent local snapshot, uploads it
-through Restic, applies 7 daily / 5 weekly / 12 monthly retention, prunes,
-and performs a repository data check. The restore check downloads the newest
-snapshot to a temporary directory on the encrypted filesystem, validates both
-archives, runs SQLite `quick_check`, and confirms that mail and forwarding data
-are present. An hourly health timer fails when the encrypted mount is missing,
-usage crosses configured thresholds, or the newest successful off-host backup
-is stale.
+The daily job creates a local archive, uploads it through Restic, applies 7
+daily / 5 weekly / 12 monthly retention, prunes, and checks the repository.
+The archive takes online snapshots of the SQLite databases and captures Maildir
+separately. Quiesce writers when a restore must represent the same point in
+time across all three stores.
+
+The backup records a SHA-256 digest for each webmail or Sender Review message
+whose file still matches its recorded Maildir identity. The restore check
+downloads the newest snapshot to a temporary directory on the encrypted
+filesystem, verifies the archives and message digests, runs SQLite
+`quick_check`, and checks that mail and forwarding data are present. An hourly
+health timer fails when the encrypted mount is missing, usage crosses configured
+thresholds, or the newest successful off-host backup is stale.
+
+After extracting an authenticated Restic backup on the recovery volume, rebind
+message identities before starting Mail:
+
+```bash
+mail backup rebind-local /path/to/extracted/smtp.db /path/to/extracted/mail
+```
+
+Rebinding verifies the archived bytes before updating any identity and rolls
+back the transaction when a recorded file is missing or changed. It preserves
+existing webmail links, Calendar email backlinks, and verified sender metadata
+for the recorded messages. Older archives predate these digests. Use them to
+recover Maildir files and IMAP UIDs. Webmail will create new links when it
+encounters messages whose original identities cannot be verified.
+
+Run the local rehearsal with Python 3.12 or later, GNU tar, SQLite, and Restic.
+It also checks that an offline domain rename preserves restored message and
+calendar identities.
+The optional previous binary runs the scheduled-send worker and SMTP listener
+against the restored mailbox before the current binary reopens it.
+
+```bash
+python3 scripts/test-mail-backup-restore.py /path/to/mail --previous /path/to/previous-mail
+```
 
 ## Recovery order
 
@@ -180,7 +209,8 @@ is stale.
 3. Unlock `/var/lib/mail-storage.luks`.
 4. Start `mail.service` and validate SQLite plus Maildir counts.
 5. If the volume is unavailable, restore the latest Restic snapshot and its
-   environment archive onto a newly encrypted volume.
+   environment archive onto a newly encrypted volume. Rebind the extracted
+   message identities before starting Mail.
 
 Implementation and operational follow-up are tracked in
 [mail-os/mail#4](https://github.com/mail-os/mail/issues/4).

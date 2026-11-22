@@ -4,6 +4,8 @@ set -euo pipefail
 MAIL_DIR="${MAIL_DIR:-/opt/mail}"
 BACKUP_DIR="${BACKUP_DIR:-${MAIL_DIR}/backups}"
 RETAIN_DAYS="${RETAIN_DAYS:-7}"
+MAIL_BACKUP_BIN="${MAIL_BACKUP_BIN:-${MAIL_DIR}/mail-server}"
+MAIL_BACKUP_ENV_FILE="${MAIL_BACKUP_ENV_FILE-/etc/mail/mail.env}"
 
 [[ "${MAIL_DIR}" == /* && "${MAIL_DIR}" != "/" ]] || {
   echo "mail-backup: MAIL_DIR must be an absolute non-root path" >&2
@@ -14,7 +16,12 @@ RETAIN_DAYS="${RETAIN_DAYS:-7}"
   exit 1
 }
 
-install -d -m 0700 -o root -g root "${BACKUP_DIR}"
+if [[ "${EUID}" -eq 0 ]]; then
+  install -d -m 0700 -o root -g root "${BACKUP_DIR}"
+else
+  install -d -m 0700 "${BACKUP_DIR}"
+fi
+umask 077
 
 timestamp="$(date -u +%Y%m%d-%H%M%S)"
 output="${BACKUP_DIR}/mail-backup-${timestamp}.tgz"
@@ -37,6 +44,10 @@ for database in smtp.db caldav.db; do
   fi
 done
 
+if [[ -f "${work_dir}/smtp.db" && -d "${MAIL_DIR}/mail" ]]; then
+  "${MAIL_BACKUP_BIN}" backup capture-local "${work_dir}/smtp.db" "${MAIL_DIR}/mail"
+fi
+
 declare -a persistent=()
 for path in mail dkim forwards.json forwards.sieve cert-backups; do
   [[ -e "${MAIL_DIR}/${path}" ]] && persistent+=("${path}")
@@ -49,9 +60,9 @@ tar tzf "${partial}" >/dev/null
 chmod 0600 "${partial}"
 mv "${partial}" "${output}"
 
-if [[ -f /etc/mail/mail.env ]]; then
+if [[ -f "${MAIL_BACKUP_ENV_FILE}" ]]; then
   env_output="${output%.tgz}.env.tar"
-  tar cf "${env_output}.partial" -C /etc/mail mail.env
+  tar cf "${env_output}.partial" -C "$(dirname "${MAIL_BACKUP_ENV_FILE}")" "$(basename "${MAIL_BACKUP_ENV_FILE}")"
   tar tf "${env_output}.partial" >/dev/null
   chmod 0600 "${env_output}.partial"
   mv "${env_output}.partial" "${env_output}"

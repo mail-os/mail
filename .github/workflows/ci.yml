@@ -53,6 +53,12 @@ jobs:
     - name: Run tests
       run: zig build test
 
+    - name: Verify native archive and Restic recovery
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get install -y --no-install-recommends restic sqlite3
+        python3 ../../scripts/test-mail-backup-restore.py zig-out/bin/mail
+
     # tests/ sat at the repo root after packages/zig was split out, where
     # build.zig could not reach it, so these suites went unrun (and rotted)
     # for months. Running them here keeps that from happening again.

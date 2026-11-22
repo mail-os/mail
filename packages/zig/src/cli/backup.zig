@@ -1,6 +1,9 @@
 const std = @import("std");
 const cli = @import("zig-cli");
 const io_compat = @import("../core/io_compat.zig");
+const fs = @import("../core/fs_compat.zig");
+const database = @import("../storage/database.zig");
+const identity = @import("../storage/backup_identity.zig");
 
 const MAIL_CLI_PATH = "/opt/mail/packages/zig/zig-out/bin/mail";
 
@@ -363,6 +366,31 @@ fn addCommonOptions(cmd: *cli.BaseCommand) !void {
     );
 }
 
+fn localIdentityAction(ctx: *cli.BaseCommand.ParseContext, comptime restore: bool) !void {
+    const snapshot = ctx.getArgument(0) orelse return error.MissingBackupDatabase;
+    const mail_root = ctx.getArgument(1) orelse return error.MissingBackupMaildir;
+    // Opening an absent SQLite path would create an empty database.
+    try fs.cwd().access(snapshot, .{});
+    try fs.cwd().access(mail_root, .{});
+    var db = try database.Database.init(ctx.allocator, snapshot);
+    defer db.deinit();
+    if (restore) {
+        const rebound = try identity.rebind(&db, ctx.allocator, mail_root);
+        printStdout("Rebound {d} verified message identities in the restored database.\n", .{rebound});
+    } else {
+        const result = try identity.capture(&db, ctx.allocator, mail_root);
+        printStdout("Recorded {d} message identities in the backup database ({d} unavailable).\n", .{ result.recorded, result.unavailable });
+    }
+}
+
+fn captureLocalAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    try localIdentityAction(ctx, false);
+}
+
+fn rebindLocalAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    try localIdentityAction(ctx, true);
+}
+
 pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     const backup_cmd = try cli.BaseCommand.init(allocator, "backup", "Backup and restore mail server data");
 
@@ -396,6 +424,18 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     );
     _ = status_cmd.setAction(statusAction);
     _ = try backup_cmd.addCommand(status_cmd);
+
+    const capture_cmd = try cli.BaseCommand.init(allocator, "capture-local", "Record verified file identities in a local backup database");
+    _ = try capture_cmd.addArgument(cli.Argument.init("snapshot-db", "Path to the SMTP database copy", .string));
+    _ = try capture_cmd.addArgument(cli.Argument.init("source-maildir", "Path to the source mail directory", .string));
+    _ = capture_cmd.setAction(captureLocalAction);
+    _ = try backup_cmd.addCommand(capture_cmd);
+
+    const rebind_cmd = try cli.BaseCommand.init(allocator, "rebind-local", "Restore verified file identities in an offline local backup");
+    _ = try rebind_cmd.addArgument(cli.Argument.init("restored-db", "Path to the extracted SMTP database", .string));
+    _ = try rebind_cmd.addArgument(cli.Argument.init("restored-maildir", "Path to the extracted mail directory", .string));
+    _ = rebind_cmd.setAction(rebindLocalAction);
+    _ = try backup_cmd.addCommand(rebind_cmd);
 
     return backup_cmd;
 }
