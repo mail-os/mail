@@ -322,8 +322,11 @@ Use an operator-owned directory with restricted access. The private SQLite
 checkpoint and its lock record progress for one account pair and mapping. Keep
 them together and reuse the checkpoint when resuming. The importer reads the
 source without changing read state. It keeps the message bytes, attachment
-contents, received time, and Mail's five standard persistent flags. The
-JSON-line report lists imported and failed UIDs and any unsupported flags.
+contents, received time, and Mail's five standard persistent flags. It also
+preserves valid IMAP keywords with a destination that advertises
+`XMAILDIR-KEYWORDS`. The JSON-line report lists imported and failed UIDs and
+any unsupported flags. Each Mail folder supports up to 26 permanent keywords.
+Mail refuses an APPEND that would exceed the folder's keyword capacity.
 
 The checkpoint identifies each completed message by source folder, UIDVALIDITY,
 and UID. Identical messages with different UIDs are each copied. The importer
@@ -362,6 +365,8 @@ stores for a point-in-time export across mail and DAV.
 - `Maildir/` contains Inbox and named folders in Maildir++ format. Message
   files retain their original MIME bytes and attachments. Standard flags travel
   in the filename and the archive carries file modification times to the second.
+  In folders with IMAP keywords, `dovecot-keywords` maps lowercase filename
+  flags to their names, with index 0 for `a` through index 25 for `z`.
   Dates outside the USTAR range, including pre-1970 dates, use PAX extended
   headers. GNU tar and bsdtar preserve these timestamps on extraction.
 - `Calendars/` contains an iCalendar file for each owned calendar. Import them
@@ -375,7 +380,9 @@ stores for a point-in-time export across mail and DAV.
 
 To move mail into another Mail instance, create each folder from the manifest
 and upload its messages over IMAP. Pass the archived flags and file modification
-time to APPEND to preserve the original received time. Mail uses the current time
+time to APPEND to preserve the original received time. Translate lowercase
+flags through the folder's `dovecot-keywords` file and pass the names as IMAP
+keywords. Mail uses the current time
 when a client omits it. Backdated imports still arrive at the end of the
 destination folder. A Maildir importer such as Dovecot's can also read the
 extracted folders directly. [Dovecot import documentation](https://doc.dovecot.org/2.3/admin_manual/importing_mailboxes/)

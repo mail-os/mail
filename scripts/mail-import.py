@@ -185,10 +185,23 @@ def fetch_message(client, uid):
     identity = UID.search(prefix + b" " + after)
     if identity is None or int(identity[1]) != uid or size != len(raw) or int(LITERAL.search(prefix)[1]) != size:
         raise TransferError("IMAP returned different message bytes or size")
-    supported = [SYSTEM_FLAGS[flag.lower()] for flag in flags if flag.lower() in SYSTEM_FLAGS]
-    omitted = [flag.decode("utf-8", errors="replace") for flag in flags
-               if flag.lower() not in SYSTEM_FLAGS and flag.lower() != b"\\recent"]
-    return raw, date, instant, b"(" + b" ".join(supported) + b")", omitted
+    return raw, date, instant, flags
+
+
+def append_flags(flags, keywords_supported):
+    supported = []
+    omitted = []
+    for flag in flags:
+        lower = flag.lower()
+        if lower in SYSTEM_FLAGS:
+            supported.append(SYSTEM_FLAGS[lower])
+        elif lower != b"\\recent":
+            valid = 0 < len(flag) <= 255 and all(32 < byte < 127 and byte not in b'(){}%*"\\]' for byte in flag)
+            if keywords_supported and valid:
+                supported.append(flag)
+            else:
+                omitted.append(flag.decode("utf-8", errors="replace"))
+    return b"(" + b" ".join(supported) + b")", omitted
 
 
 @contextmanager
@@ -278,7 +291,7 @@ def resolve_message(db, destination, name, source_uid, result, destination_next)
         raise TransferError("The destination UID predates this attempt")
     if db.execute("SELECT 1 FROM messages WHERE folder = ? AND destination_uid = ?", (name, destination_uid)).fetchone():
         raise TransferError("This destination UID is already attributed to another source message")
-    raw, _, instant, _, _ = fetch_message(destination, destination_uid)
+    raw, _, instant, _ = fetch_message(destination, destination_uid)
     if instant != row[2] or hashlib.sha256(raw).hexdigest() != row[1]:
         raise TransferError("The destination UID does not match the attempted message bytes and received time")
     with db:
@@ -287,7 +300,8 @@ def resolve_message(db, destination, name, source_uid, result, destination_next)
     report("resolved", source=name, uid=source_uid, destination_uid=destination_uid)
 
 
-def import_folder(db, source, destination, source_name, destination_name, wire_target, source_state, destination_state):
+def import_folder(db, source, destination, source_name, destination_name, wire_target, source_state, destination_state,
+                  keywords_supported):
     pending = db.execute("SELECT uid, destination_floor FROM messages WHERE folder = ? AND status = 'uncertain'",
                          (source_name,)).fetchone()
     if pending:
@@ -302,7 +316,8 @@ def import_folder(db, source, destination, source_name, destination_name, wire_t
             skipped += 1
             continue
         try:
-            raw, date, instant, flags, omitted = fetch_message(source, uid)
+            raw, date, instant, source_flags = fetch_message(source, uid)
+            flags, omitted = append_flags(source_flags, keywords_supported)
         except TransferError as error:
             errors += 1
             report("error", source=source_name, uid=uid, reason=str(error))
@@ -323,7 +338,7 @@ def import_folder(db, source, destination, source_name, destination_name, wire_t
             # These are definitive pre-write rejections from Mail. Other
             # outcomes stay uncertain because publication may have begun.
             reply = values[0] or b""
-            rejected = reply.upper().startswith((b"[OVERQUOTA]", b"[TOOBIG]", b"[NOPERM]"))
+            rejected = reply.upper().startswith((b"[OVERQUOTA]", b"[TOOBIG]", b"[NOPERM]", b"[LIMIT]"))
             if rejected:
                 with db:
                     db.execute("DELETE FROM messages WHERE folder = ? AND uid = ?", (source_name, uid))
@@ -403,7 +418,7 @@ def valid_uid(value):
     return re.fullmatch(r"[0-9]{1,10}", value) is not None and 0 < int(value) <= MAX_UID
 
 
-def execute(args, mapping, source, destination, db=None):
+def execute(args, mapping, source, destination, db=None, *, keywords_supported=False):
     source_folders = list_folders(source, decode_names=True)
     destination_folders = list_folders(destination, decode_names=False)
     if not mapping:
@@ -438,7 +453,8 @@ def execute(args, mapping, source, destination, db=None):
                 _, source_uid, result = args.resolve
                 resolve_message(db, destination, name, int(source_uid), result, destination_state[2])
             else:
-                errors += import_folder(db, source, destination, name, target, wire_target, source_state, destination_state)
+                errors += import_folder(db, source, destination, name, target, wire_target, source_state,
+                                        destination_state, keywords_supported)
         except TransferError as error:
             report("error", source=name, destination=target, reason=str(error))
             errors += 1
@@ -489,12 +505,13 @@ def main():
                 raise TransferError("Source and destination resolve to the same mailbox")
             if not writing:
                 return execute(args, mapping, origin, target)
-            status, capabilities = target.capability()
-            if status != "OK" or not any(b"UIDPLUS" in value.upper().split() for value in capabilities if value):
+            status, response = target.capability()
+            capabilities = {feature for value in response if value for feature in value.upper().split()}
+            if status != "OK" or b"UIDPLUS" not in capabilities:
                 raise TransferError("The destination must support UIDPLUS to confirm copied messages")
             identity = json.dumps([1, source, destination, sorted(mapping.items())])
             with journal(args.state, identity) as db:
-                return execute(args, mapping, origin, target, db)
+                return execute(args, mapping, origin, target, db, keywords_supported=b"XMAILDIR-KEYWORDS" in capabilities)
     except TransferError as error:
         report("error", reason=str(error))
     except ssl.SSLCertVerificationError:

@@ -203,24 +203,6 @@ test "MaildirFlags - toSuffix alphabetical order" {
     try testing.expectEqualStrings(":2,DFRST", result);
 }
 
-test "MaildirFlags - applyAction add flags" {
-    var flags = imap.MaildirFlags{};
-    flags.applyAction("+FLAGS (\\Seen)");
-    try testing.expect(flags.seen);
-    try testing.expect(!flags.flagged);
-
-    flags.applyAction("+FLAGS (\\Flagged)");
-    try testing.expect(flags.seen);
-    try testing.expect(flags.flagged);
-}
-
-test "MaildirFlags - applyAction remove flags" {
-    var flags = imap.MaildirFlags{ .seen = true, .flagged = true };
-    flags.applyAction("-FLAGS (\\Seen)");
-    try testing.expect(!flags.seen);
-    try testing.expect(flags.flagged);
-}
-
 test "MaildirFlags - roundtrip parse-format-parse" {
     const original_name = "msg.eml:2,FRS";
     const flags = imap.MaildirFlags.fromFilename(original_name);

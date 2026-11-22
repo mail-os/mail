@@ -3165,6 +3165,7 @@ fn mapMaildirError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: any
         maildir.MaildirError.MessageNotFound => sendError(conn, arena, 404, "not_found", "Message not found"),
         maildir.MaildirError.InvalidFolderName => sendError(conn, arena, 400, "bad_request", "Invalid folder"),
         maildir.MaildirError.Conflict => sendError(conn, arena, 409, "conflict", "Message changed concurrently; retry"),
+        error.KeywordLimit => sendError(conn, arena, 409, "keyword_limit", "The destination folder has no room for these message keywords"),
         maildir.MaildirError.RevisionMismatch => sendError(conn, arena, 412, "revision_mismatch", "Message changed; reload it before retrying"),
         else => sendError(conn, arena, 500, "server_error", "Operation failed"),
     };

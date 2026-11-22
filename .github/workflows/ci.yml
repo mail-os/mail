@@ -105,6 +105,7 @@ jobs:
         python3 ../../scripts/test-mailbox-export.py zig-out/bin/mail
         python3 ../../scripts/test-mail-import.py zig-out/bin/mail
         python3 ../../scripts/test-imap-internaldate.py zig-out/bin/mail
+        python3 ../../scripts/test-imap-keywords.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-forwarding.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-vacation.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-junk.py zig-out/bin/mail

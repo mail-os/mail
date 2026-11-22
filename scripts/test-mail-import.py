@@ -24,7 +24,7 @@ HISTORICAL = datetime(1969, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 SOURCE_ARCHIVE = "Résumé historique"
 TARGET_ARCHIVE = "Old project archive"
-FLAGS = r"(\Flagged \Answered)"
+FLAGS = r"(\Flagged \Answered ProjectReviewed)"
 
 
 def mime_message(owner, subject):
@@ -138,7 +138,7 @@ def verify_transfer(source, origin, destination, target, root):
     destination.provision(target.split("@")[0])
     resumed = run(source, origin, destination, target, state, mapping, "--apply")
     assert [row["uid"] for row in resumed if row["event"] == "imported" and row["source"] == "INBOX"] == [second_uid]
-    flags = {b"\\Flagged", b"\\Answered"}
+    flags = {b"\\Flagged", b"\\Answered", b"ProjectReviewed"}
     imported = messages(destination, target, "INBOX")
     assert [message[1:] for message in imported] == [(HISTORICAL, flags, raw)] * 2
     assert messages(destination, target, TARGET_ARCHIVE)[0][1:] == (EPOCH, {b"\\Seen", b"\\Draft", b"\\Deleted"}, archive_raw)

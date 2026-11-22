@@ -13,6 +13,7 @@ const log_safe = @import("../core/log_safe.zig");
 const tls_mod = @import("../core/tls.zig");
 const tls = @import("tls");
 const hosted_limits = @import("../storage/hosted_limits.zig");
+const maildir_keywords = @import("../storage/maildir_keywords.zig");
 const message_refs = @import("../storage/message_refs.zig");
 const durable_maildir = @import("../core/durable_maildir.zig");
 const fs_compat = @import("../core/fs_compat.zig");
@@ -116,6 +117,7 @@ pub const ImapCapability = enum {
     thread,
     special_use, // RFC 6154 - SPECIAL-USE for Gmail-style folders
     move, // RFC 6851 - MOVE extension
+    maildir_keywords,
 
     pub fn toString(self: ImapCapability) []const u8 {
         return switch (self) {
@@ -133,6 +135,7 @@ pub const ImapCapability = enum {
             .thread => "THREAD",
             .special_use => "SPECIAL-USE",
             .move => "MOVE",
+            .maildir_keywords => "XMAILDIR-KEYWORDS",
         };
     }
 };
@@ -499,6 +502,7 @@ pub const MaildirFlags = struct {
     flagged: bool = false,
     draft: bool = false,
     deleted: bool = false,
+    keywords: maildir_keywords.Bits = 0,
 
     /// Parse flags from a Maildir filename (e.g. "1234.eml:2,SF" -> seen+flagged).
     pub fn fromFilename(filename: []const u8) MaildirFlags {
@@ -516,6 +520,7 @@ pub const MaildirFlags = struct {
                 }
             }
         }
+        flags.keywords = maildir_keywords.fromFilename(filename);
         return flags;
     }
 
@@ -559,7 +564,7 @@ pub const MaildirFlags = struct {
     }
 
     /// Build the `:2,XXX` suffix string.
-    pub fn toSuffix(self: MaildirFlags, buf: *[16]u8) []const u8 {
+    pub fn toSuffix(self: MaildirFlags, buf: []u8) []const u8 {
         var fbs = io_compat.fixedBufferStream(buf);
         const writer = fbs.writer();
         writer.writeAll(":2,") catch {};
@@ -569,40 +574,84 @@ pub const MaildirFlags = struct {
         if (self.answered) writer.writeAll("R") catch {};
         if (self.seen) writer.writeAll("S") catch {};
         if (self.deleted) writer.writeAll("T") catch {};
+        maildir_keywords.writeLetters(writer, self.keywords) catch {};
         return fbs.getWritten();
     }
+};
 
-    /// Apply a STORE flags action string to current flags.
-    /// `action` looks like "+FLAGS (\\Seen \\Flagged)" or "-FLAGS.SILENT (\\Deleted)" etc.
-    pub fn applyAction(self: *MaildirFlags, action: []const u8) void {
-        const is_add = action.len > 0 and action[0] == '+';
-        const is_remove = action.len > 0 and action[0] == '-';
+const FlagMode = enum { replace, add, remove };
 
-        if (ascii_compat.indexOfIgnoreCase(action, "\\Seen")) |_| {
-            if (is_add) self.seen = true else if (is_remove) self.seen = false;
+const FlagList = struct {
+    system: MaildirFlags = .{},
+    keywords: [maildir_keywords.count][]const u8 = undefined,
+    keyword_count: usize = 0,
+
+    fn parse(raw: []const u8) !FlagList {
+        var result: FlagList = .{};
+        var words = std.mem.tokenizeAny(u8, raw, " \t");
+        while (words.next()) |word| {
+            if (std.ascii.eqlIgnoreCase(word, "\\Seen")) result.system.seen = true else if (std.ascii.eqlIgnoreCase(word, "\\Answered")) result.system.answered = true else if (std.ascii.eqlIgnoreCase(word, "\\Flagged")) result.system.flagged = true else if (std.ascii.eqlIgnoreCase(word, "\\Draft")) result.system.draft = true else if (std.ascii.eqlIgnoreCase(word, "\\Deleted")) result.system.deleted = true else {
+                if (!maildir_keywords.validName(word)) return error.InvalidKeyword;
+                for (result.keywords[0..result.keyword_count]) |old| {
+                    if (std.ascii.eqlIgnoreCase(old, word)) break;
+                } else {
+                    if (result.keyword_count == result.keywords.len) return error.KeywordLimit;
+                    result.keywords[result.keyword_count] = word;
+                    result.keyword_count += 1;
+                }
+            }
         }
-        if (ascii_compat.indexOfIgnoreCase(action, "\\Answered")) |_| {
-            if (is_add) self.answered = true else if (is_remove) self.answered = false;
-        }
-        if (ascii_compat.indexOfIgnoreCase(action, "\\Flagged")) |_| {
-            if (is_add) self.flagged = true else if (is_remove) self.flagged = false;
-        }
-        if (ascii_compat.indexOfIgnoreCase(action, "\\Draft")) |_| {
-            if (is_add) self.draft = true else if (is_remove) self.draft = false;
-        }
-        if (ascii_compat.indexOfIgnoreCase(action, "\\Deleted")) |_| {
-            if (is_add) self.deleted = true else if (is_remove) self.deleted = false;
-        }
-        // For FLAGS (no + or -), replace all flags
-        if (!is_add and !is_remove) {
-            self.seen = ascii_compat.indexOfIgnoreCase(action, "\\Seen") != null;
-            self.answered = ascii_compat.indexOfIgnoreCase(action, "\\Answered") != null;
-            self.flagged = ascii_compat.indexOfIgnoreCase(action, "\\Flagged") != null;
-            self.draft = ascii_compat.indexOfIgnoreCase(action, "\\Draft") != null;
-            self.deleted = ascii_compat.indexOfIgnoreCase(action, "\\Deleted") != null;
-        }
+        return result;
+    }
+
+    fn resolve(self: *const FlagList, names: *maildir_keywords.Names, mode: FlagMode) !MaildirFlags {
+        var result = self.system;
+        for (self.keywords[0..self.keyword_count]) |word|
+            result.keywords |= if (mode == .remove) names.find(word) else try names.insert(word);
+        return result;
     }
 };
+
+const StoreFlags = struct {
+    mode: FlagMode,
+    silent: bool,
+    flags: FlagList,
+
+    fn parse(raw: []const u8) !StoreFlags {
+        const end = std.mem.indexOfAny(u8, raw, " \t") orelse return error.InvalidStoreFlags;
+        const operation = raw[0..end];
+        const mode: FlagMode = if (std.mem.startsWith(u8, operation, "+")) .add else if (std.mem.startsWith(u8, operation, "-")) .remove else .replace;
+        const command = if (mode == .replace) operation else operation[1..];
+        const silent = std.ascii.eqlIgnoreCase(command, "FLAGS.SILENT");
+        if (!silent and !std.ascii.eqlIgnoreCase(command, "FLAGS")) return error.InvalidStoreFlags;
+        const list = std.mem.trim(u8, raw[end..], " \t");
+        if (list.len == 0) return error.InvalidStoreFlags;
+        const inner = if (list[0] == '(' and list[list.len - 1] == ')') list[1 .. list.len - 1] else list;
+        return .{ .mode = mode, .silent = silent, .flags = try FlagList.parse(inner) };
+    }
+};
+
+fn applyStoreFlags(before: MaildirFlags, requested: MaildirFlags, mode: FlagMode) MaildirFlags {
+    return switch (mode) {
+        .replace => requested,
+        .add => .{
+            .seen = before.seen or requested.seen,
+            .answered = before.answered or requested.answered,
+            .flagged = before.flagged or requested.flagged,
+            .draft = before.draft or requested.draft,
+            .deleted = before.deleted or requested.deleted,
+            .keywords = before.keywords | requested.keywords,
+        },
+        .remove => .{
+            .seen = before.seen and !requested.seen,
+            .answered = before.answered and !requested.answered,
+            .flagged = before.flagged and !requested.flagged,
+            .draft = before.draft and !requested.draft,
+            .deleted = before.deleted and !requested.deleted,
+            .keywords = before.keywords & ~requested.keywords,
+        },
+    };
+}
 
 const AggregateMailboxEntry = struct {
     filename: []const u8,
@@ -1239,7 +1288,7 @@ pub const ImapSession = struct {
 
     fn writeMessageFlagsLocked(self: *ImapSession, idx: usize, filename: []const u8, flags: MaildirFlags) bool {
         const base = MaildirFlags.baseName(filename);
-        var suffix_buf: [16]u8 = undefined;
+        var suffix_buf: [maildir_keywords.suffix_capacity]u8 = undefined;
         const suffix = flags.toSuffix(&suffix_buf);
         var new_name_buf: [512]u8 = undefined;
         const new_name = std.fmt.bufPrint(&new_name_buf, "{s}{s}", .{ base, suffix }) catch return false;
@@ -1279,6 +1328,7 @@ pub const ImapSession = struct {
         const detail = switch (err) {
             error.HostedStorageFull => "[OVERQUOTA] Mailbox storage is full",
             error.HostedRecipientDisabled => "[NOPERM] Mailbox is disabled",
+            error.KeywordLimit => "[LIMIT] Mailbox keyword limit reached",
             else => "[SERVERBUG] Mailbox write failed",
         };
         try self.sendResponse(tag, "NO", detail);
@@ -2014,23 +2064,17 @@ pub const ImapSession = struct {
         // this, sent/draft copies saved by clients land on disk flagless and
         // surface as "unread" in folder counts (STATUS UNSEEN, webmail, and
         // client badges such as Apple Mail's).
-        var msg_flags = MaildirFlags{};
-        if (self.append_flags) |fs| {
-            // No +/- prefix: applyAction treats the list as the full flag set.
-            msg_flags.applyAction(fs);
-        } else if (std.ascii.eqlIgnoreCase(mailbox, "Sent") or std.ascii.eqlIgnoreCase(mailbox, "Drafts")) {
+        var flags = if (self.append_flags) |raw| FlagList.parse(raw) catch
+            return self.sendResponse(tag, "BAD", "Invalid APPEND flags") else FlagList{};
+        if (self.append_flags == null and (std.ascii.eqlIgnoreCase(mailbox, "Sent") or std.ascii.eqlIgnoreCase(mailbox, "Drafts"))) {
             // Clients that omit the flag list for Sent/Drafts still expect
             // those copies to be read — they are the user's own messages.
-            msg_flags.seen = true;
+            flags.system.seen = true;
         }
-        var suffix_buf: [16]u8 = undefined;
         const internal_date = self.append_internal_date orelse time_compat.timestamp();
-        const filepath = try self.allocUniqueMaildirPath(folder_dir, msg_flags.toSuffix(&suffix_buf), internal_date);
-        defer self.allocator.free(filepath);
-
-        fs_compat.cwd().makePath(folder_dir) catch |err| return self.sendMaildirWriteError(tag, err);
-        hosted_limits.writeWithMtime(self.auth_backend.db, self.allocator, username, filepath, data[0..size], internal_date) catch |err|
+        const filepath = self.writeAppend(username, folder_dir, &flags, data[0..size], internal_date) catch |err|
             return self.sendMaildirWriteError(tag, err);
+        defer self.allocator.free(filepath);
 
         std.log.info("IMAP APPEND: Saved {d} bytes to {s}", .{ size, filepath });
 
@@ -2071,6 +2115,11 @@ pub const ImapSession = struct {
         }
 
         // Send OK, including APPENDUID only when we have a real UID/UIDVALIDITY.
+        if (flags.keyword_count != 0 and !self.mailbox_is_virtual) {
+            if (self.mailbox_name) |selected| {
+                if (std.mem.eql(u8, append_canon, selected)) try self.sendFlagCapabilities(false);
+            }
+        }
         if (assigned_uid) |uid| {
             var resp_buf: [256]u8 = undefined;
             var fbs = io_compat.fixedBufferStream(&resp_buf);
@@ -2082,6 +2131,28 @@ pub const ImapSession = struct {
         } else {
             try self.sendResponse(tag, "OK", "APPEND completed");
         }
+    }
+
+    fn writeAppend(self: *ImapSession, user: []const u8, dir: []const u8, flags: *const FlagList, raw: []const u8, date: i64) ![]u8 {
+        const db = self.auth_backend.db;
+        db.lockMailboxes();
+        defer db.unlockMailboxes();
+        try hosted_limits.checkStorage(db, user, raw.len, null);
+        try fs_compat.cwd().makePath(dir);
+        var resolved = flags.system;
+        if (flags.keyword_count != 0) {
+            var scratch = std.heap.ArenaAllocator.init(self.allocator);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            var mapping = try maildir_keywords.Mapping.open(a, dir);
+            resolved = try flags.resolve(&mapping.names, .replace);
+            try mapping.save(a);
+        }
+        var suffix: [maildir_keywords.suffix_capacity]u8 = undefined;
+        const path = try self.allocUniqueMaildirPath(dir, resolved.toSuffix(&suffix), date);
+        errdefer self.allocator.free(path);
+        try durable_maildir.writeWithMtime(self.allocator, path, raw, date);
+        return path;
     }
 
     /// Count messages in a mailbox folder
@@ -2307,7 +2378,7 @@ pub const ImapSession = struct {
 
     /// Send greeting
     pub fn sendGreeting(self: *ImapSession) !void {
-        const greeting = "* OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN AUTH=LOGIN IDLE NAMESPACE UIDPLUS SPECIAL-USE MOVE] Mail Server IMAP4rev1 ready\r\n";
+        const greeting = "* OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN AUTH=LOGIN IDLE NAMESPACE UIDPLUS SPECIAL-USE MOVE XMAILDIR-KEYWORDS] Mail Server IMAP4rev1 ready\r\n";
         try self.writeData(greeting);
     }
 
@@ -2324,6 +2395,11 @@ pub const ImapSession = struct {
     /// Send untagged response
     pub fn sendUntagged(self: *ImapSession, message: []const u8) !void {
         var buf: [4096]u8 = undefined;
+        if (message.len > buf.len - "* \r\n".len) {
+            const frame = try std.fmt.allocPrint(self.allocator, "* {s}\r\n", .{message});
+            defer self.allocator.free(frame);
+            return self.writeData(frame);
+        }
         var fbs = io_compat.fixedBufferStream(&buf);
         const writer = fbs.writer();
         try writer.print("* {s}\r\n", .{message});
@@ -2343,6 +2419,7 @@ pub const ImapSession = struct {
             .uidplus,
             .special_use, // RFC 6154 - Gmail-style folders
             .move, // RFC 6851
+            .maildir_keywords,
         };
 
         var buf: [1024]u8 = undefined;
@@ -2851,11 +2928,47 @@ pub const ImapSession = struct {
         defer self.allocator.free(uidnext_msg);
         try self.sendUntagged(uidnext_msg);
 
-        try self.sendUntagged("FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)");
-        try self.sendUntagged("OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \\*)]");
+        try self.sendFlagCapabilities(true);
 
         self.state = .selected;
         try self.sendResponse(tag, "OK", if (self.mailbox_read_only) "[READ-ONLY] EXAMINE completed" else "[READ-WRITE] SELECT completed");
+    }
+
+    fn sendFlagCapabilities(self: *ImapSession, announce_flags: bool) !void {
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var names: maildir_keywords.Names = .{};
+        var allow_new = false;
+        if (!self.mailbox_is_virtual) {
+            if (self.mailbox_dir) |dir| {
+                if (maildir_keywords.Mapping.open(a, dir)) |mapping| {
+                    names = mapping.names;
+                    allow_new = names.hasCapacity();
+                } else |err| {
+                    if (err == error.FileNotFound) allow_new = true;
+                }
+            }
+        }
+        var out: std.Io.Writer.Allocating = .init(a);
+        try out.writer.writeAll("\\Answered \\Flagged \\Deleted \\Seen \\Draft");
+        try names.writeImap(&out.writer, names.defined(), true);
+        const list = out.written();
+        if (announce_flags) try self.sendUntagged(try std.fmt.allocPrint(a, "FLAGS ({s})", .{list}));
+        const permanent = if (self.mailbox_read_only) "" else list;
+        const wildcard = if (allow_new and !self.mailbox_read_only) " \\*" else "";
+        try self.sendUntagged(try std.fmt.allocPrint(a, "OK [PERMANENTFLAGS ({s}{s})]", .{ permanent, wildcard }));
+    }
+
+    fn formatMessageFlags(self: *ImapSession, a: std.mem.Allocator, index: usize, flags: MaildirFlags, system: *[256]u8) ![]const u8 {
+        const standard = flags.toImapString(system);
+        if (flags.keywords == 0) return standard;
+        const dir = self.selectedMessageDirForIndex(index) orelse return error.NoMailboxSelected;
+        const mapping = try maildir_keywords.Mapping.open(a, dir);
+        var out: std.Io.Writer.Allocating = .init(a);
+        try out.writer.writeAll(standard);
+        try mapping.names.writeImap(&out.writer, flags.keywords, standard.len != 0);
+        return out.written();
     }
 
     /// Handle FETCH command
@@ -2949,12 +3062,14 @@ pub const ImapSession = struct {
             // them since this session listed the mailbox.
             const filename = self.adoptCurrentName(&resolver, seq - 1) orelse continue;
             const uid = self.getUidForSeq(seq);
+            var flag_scratch = std.heap.ArenaAllocator.init(self.allocator);
+            defer flag_scratch.deinit();
 
             // For metadata-only requests (FLAGS, UID, RFC822.SIZE), skip reading file content
             if (metadata_only) {
                 const msg_flags = MaildirFlags.fromFilename(filename);
                 var flag_str_buf: [256]u8 = undefined;
-                const flag_str = msg_flags.toImapString(&flag_str_buf);
+                const flag_str = try self.formatMessageFlags(flag_scratch.allocator(), seq - 1, msg_flags, &flag_str_buf);
 
                 if (want_rfc822_size) {
                     const filepath = self.allocSelectedMessagePath(seq - 1, filename) catch continue;
@@ -3077,7 +3192,7 @@ pub const ImapSession = struct {
             }
 
             var flag_str_buf: [256]u8 = undefined;
-            const flag_str = msg_flags.toImapString(&flag_str_buf);
+            const flag_str = try self.formatMessageFlags(flag_scratch.allocator(), seq - 1, msg_flags, &flag_str_buf);
 
             // Build optional parts. Allocate dynamically so a long
             // BODYSTRUCTURE is not truncated by a fixed-size buffer.
@@ -3540,9 +3655,10 @@ pub const ImapSession = struct {
         for (sources, destinations) |source, *destination| {
             const content = try fs_compat.readFileAlloc(self.allocator, source);
             defer self.allocator.free(content);
-            const flags = MaildirFlags.fromFilename(std.fs.path.basename(source));
+            var flags = MaildirFlags.fromFilename(std.fs.path.basename(source));
+            flags.keywords = try maildir_keywords.transferredBits(a, std.fs.path.dirname(source).?, dir, flags.keywords);
             const internal_date = storedInternalDate(source);
-            var suffix: [16]u8 = undefined;
+            var suffix: [maildir_keywords.suffix_capacity]u8 = undefined;
             const path = try self.allocUniqueMaildirPath(dir, flags.toSuffix(&suffix), internal_date);
             defer self.allocator.free(path);
             destination.* = try a.dupe(u8, path);
@@ -3648,9 +3764,11 @@ pub const ImapSession = struct {
         const name = self.adoptCurrentName(names, idx) orelse return error.FileNotFound;
         const source_path = try self.allocSelectedMessagePath(idx, name);
         defer self.allocator.free(source_path);
-        var suffix: [16]u8 = undefined;
+        var suffix: [maildir_keywords.suffix_capacity]u8 = undefined;
         const internal_date = storedInternalDate(name);
-        const destination_path = try self.allocUniqueMaildirPath(dir, MaildirFlags.fromFilename(name).toSuffix(&suffix), internal_date);
+        var flags = MaildirFlags.fromFilename(name);
+        flags.keywords = try maildir_keywords.transferredBits(a, std.fs.path.dirname(source_path).?, dir, flags.keywords);
+        const destination_path = try self.allocUniqueMaildirPath(dir, flags.toSuffix(&suffix), internal_date);
         defer self.allocator.free(destination_path);
         const destination = try a.dupe(u8, std.fs.path.basename(destination_path));
         const raw = try fs_compat.readFileAlloc(a, source_path);
@@ -3701,6 +3819,9 @@ pub const ImapSession = struct {
             return;
         }
 
+        const db = self.auth_backend.db;
+        db.lockMailboxes();
+        defer db.unlockMailboxes();
         const dir_path = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local_part, name });
         defer self.allocator.free(dir_path);
 
@@ -3759,6 +3880,9 @@ pub const ImapSession = struct {
                 child_buf[child_path.len] = 0;
                 _ = std.c.rmdir(@ptrCast(&child_buf));
             }
+            const mapping_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ canonical, maildir_keywords.mapping_name });
+            defer self.allocator.free(mapping_path);
+            fs_compat.cwd().deleteFile(mapping_path) catch {};
             var canonical_buf: [4097]u8 = undefined;
             const canonical_path = std.fmt.bufPrint(&canonical_buf, "{s}", .{canonical}) catch {
                 try self.sendResponse(tag, "NO", "DELETE failed");
@@ -3774,6 +3898,9 @@ pub const ImapSession = struct {
             return;
         }
 
+        const mapping_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, maildir_keywords.mapping_name });
+        defer self.allocator.free(mapping_path);
+        fs_compat.cwd().deleteFile(mapping_path) catch {};
         var dir_buf: [4097]u8 = undefined;
         const dir_written = std.fmt.bufPrint(&dir_buf, "{s}", .{dir_path}) catch {
             try self.sendResponse(tag, "OK", "DELETE completed");
@@ -3869,16 +3996,24 @@ pub const ImapSession = struct {
             try self.sendResponse(tag, "NO", "Must select mailbox first");
             return;
         }
+        if (self.mailbox_read_only) return self.sendResponse(tag, "NO", "[READ-ONLY] Cannot change flags");
+
+        const action = StoreFlags.parse(flags_action) catch |err| switch (err) {
+            error.KeywordLimit => return self.sendMaildirWriteError(tag, err),
+            else => return self.sendResponse(tag, "BAD", "Invalid STORE flags"),
+        };
+        if (self.mailbox_is_virtual and action.flags.keyword_count != 0)
+            return self.sendResponse(tag, "NO", "[CANNOT] Set keywords in the message's own folder");
 
         const files = self.mailbox_files orelse {
             try self.sendResponse(tag, "OK", "STORE completed");
             return;
         };
 
-        const is_silent = ascii_compat.indexOfIgnoreCase(flags_action, ".SILENT") != null;
         var resolver = MaildirNameResolver.init(self.allocator);
         defer resolver.deinit();
         var failed = false;
+        var limit_reached = false;
 
         var iter = SequenceIterator.init(sequence_set, files.len);
         while (iter.next()) |seq| {
@@ -3887,6 +4022,9 @@ pub const ImapSession = struct {
 
             // Start from the flags on disk, not the ones cached at SELECT:
             // another connection may have changed them since.
+            var scratch = std.heap.ArenaAllocator.init(self.allocator);
+            defer scratch.deinit();
+            const a = scratch.allocator();
             var stored = false;
             const flags = blk: {
                 const db = self.auth_backend.db;
@@ -3897,27 +4035,38 @@ pub const ImapSession = struct {
                     continue;
                 };
                 const before = MaildirFlags.fromFilename(filename);
-                var next = before;
-                next.applyAction(flags_action);
+                var requested = action.flags.system;
+                if (action.flags.keyword_count != 0) {
+                    const dir = self.selectedMessageDirForIndex(idx) orelse break :blk before;
+                    var mapping = maildir_keywords.Mapping.open(a, dir) catch break :blk before;
+                    requested = action.flags.resolve(&mapping.names, action.mode) catch |err| {
+                        limit_reached = limit_reached or err == error.KeywordLimit;
+                        break :blk before;
+                    };
+                    mapping.save(a) catch break :blk before;
+                    limit_reached = limit_reached or !mapping.names.hasCapacity();
+                }
+                const next = applyStoreFlags(before, requested, action.mode);
                 stored = self.writeMessageFlagsLocked(idx, filename, next);
                 break :blk if (stored) next else before;
             };
             if (!stored) failed = true;
-            if (is_silent and stored) continue;
+            if (action.silent and stored) continue;
 
             // Always include UID: a UID STORE (which Apple Mail uses to mark
             // read/unread) requires the UID in the FETCH response so the client
             // can correlate the flag change to its UID-keyed message and update
             // its unread count. Without it the badge never reflects the change.
             var flag_str_buf: [256]u8 = undefined;
-            const flag_str = flags.toImapString(&flag_str_buf);
+            const flag_str = try self.formatMessageFlags(a, idx, flags, &flag_str_buf);
             const uid = self.getUidForSeq(seq);
-            var resp_buf: [512]u8 = undefined;
-            var fbs = io_compat.fixedBufferStream(&resp_buf);
-            fbs.writer().print("{d} FETCH (UID {d} FLAGS ({s}))", .{ seq, uid, flag_str }) catch continue;
-            self.sendUntagged(fbs.getWritten()) catch continue;
+            try self.sendUntagged(try std.fmt.allocPrint(a, "{d} FETCH (UID {d} FLAGS ({s}))", .{ seq, uid, flag_str }));
         }
 
+        if (limit_reached) {
+            try self.sendFlagCapabilities(false);
+            if (failed) return self.sendMaildirWriteError(tag, error.KeywordLimit);
+        }
         if (failed) {
             try self.sendResponse(tag, "NO", "STORE failed for some messages; their current flags were sent");
         } else {
@@ -4263,6 +4412,12 @@ pub const ImapSession = struct {
                             if (!isSafeMailboxName(mailbox)) {
                                 try self.sendResponse(tag, "NO", "[TRYCREATE] Invalid mailbox name");
                                 return;
+                            }
+                            if (parsed.flags) |raw| {
+                                _ = FlagList.parse(raw) catch |err| switch (err) {
+                                    error.KeywordLimit => return self.sendMaildirWriteError(tag, err),
+                                    else => return self.sendResponse(tag, "BAD", "Invalid APPEND flags"),
+                                };
                             }
 
                             // Set up pending append state
@@ -5082,14 +5237,40 @@ test "APPEND timestamps validate dates, offsets, and optional arguments" {
 test "APPEND flag list maps to Maildir flags" {
     const testing = std.testing;
 
-    var flags = MaildirFlags{};
-    flags.applyAction("\\Seen \\Draft");
+    const flags = (try FlagList.parse("\\Seen \\Draft")).system;
     try testing.expect(flags.seen);
     try testing.expect(flags.draft);
     try testing.expect(!flags.flagged);
 
     var suffix_buf: [16]u8 = undefined;
     try testing.expectEqualStrings(":2,DS", flags.toSuffix(&suffix_buf));
+}
+
+test "STORE adds and removes exact system flags and case-insensitive keywords" {
+    const add = try StoreFlags.parse("+FLAGS.SILENT (\\Seen Review)");
+    var names: maildir_keywords.Names = .{};
+    const first = applyStoreFlags(.{}, try add.flags.resolve(&names, add.mode), add.mode);
+    try std.testing.expect(add.silent and first.seen and !first.flagged);
+    const more = try StoreFlags.parse("+FLAGS (\\Flagged review)");
+    const second = applyStoreFlags(first, try more.flags.resolve(&names, more.mode), more.mode);
+    try std.testing.expect(second.seen and second.flagged);
+    try std.testing.expectEqual(first.keywords, second.keywords);
+    const remove = try StoreFlags.parse("-FLAGS (\\Seen REVIEW)");
+    const last = applyStoreFlags(second, try remove.flags.resolve(&names, remove.mode), remove.mode);
+    try std.testing.expect(!last.seen and last.flagged);
+    try std.testing.expectEqual(@as(maildir_keywords.Bits, 0), last.keywords);
+}
+
+test "STORE replaces flags and refuses malformed atoms" {
+    var names: maildir_keywords.Names = .{};
+    const requested = try StoreFlags.parse("FLAGS (\\Answered Ledger)");
+    const first = applyStoreFlags(.{ .seen = true }, try requested.flags.resolve(&names, requested.mode), requested.mode);
+    try std.testing.expect(first.answered and !first.seen and first.keywords != 0);
+    const empty = try StoreFlags.parse("FLAGS ()");
+    try std.testing.expectEqual(MaildirFlags{}, applyStoreFlags(first, try empty.flags.resolve(&names, empty.mode), empty.mode));
+    try std.testing.expectError(error.InvalidKeyword, StoreFlags.parse("FLAGS (\\Unknown)"));
+    try std.testing.expectError(error.InvalidKeyword, StoreFlags.parse("FLAGS (invalid%atom)"));
+    try std.testing.expectError(error.InvalidStoreFlags, StoreFlags.parse("ADDFLAGS (Ledger)"));
 }
 
 test "IMAP message flags" {

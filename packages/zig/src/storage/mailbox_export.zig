@@ -2,6 +2,7 @@
 const std = @import("std");
 const database = @import("database.zig");
 const dav_store = @import("caldav_store.zig");
+const maildir_keywords = @import("maildir_keywords.zig");
 const submission = @import("../delivery/submission.zig");
 const time_compat = @import("../core/time_compat.zig");
 
@@ -74,7 +75,9 @@ fn writeMail(a: Allocator, io: std.Io, archive: *Tar, manifest: *Manifest, mail_
     const user_dir = try openOptionalDir(root, io, username) orelse return;
     defer user_dir.close(io);
     var sequence: u64 = 0;
-    try writeSlots(io, archive, user_dir, "Maildir", &sequence);
+    var inbox_keywords: maildir_keywords.Names = .{};
+    try writeSlots(a, io, archive, user_dir, "Maildir", &inbox_keywords, &sequence);
+    try writeKeywordMap(a, archive, "Maildir", &inbox_keywords);
 
     var folders: std.StringArrayHashMapUnmanaged(Folder) = .empty;
     var entries = user_dir.iterate();
@@ -101,16 +104,19 @@ fn writeMail(a: Allocator, io: std.Io, archive: *Tar, manifest: *Manifest, mail_
         try writeMaildir(a, archive, path);
         try archive.writeFileBytes(try std.fmt.allocPrint(a, "{s}/maildirfolder", .{path}), "", .{ .mode = 0o600 });
         try manifest.folders.append(a, .{ .name = name, .path = path });
+        var keywords: maildir_keywords.Names = .{};
         if (folder.canonical) {
             const source = try openOptionalDir(user_dir, io, source_name) orelse return error.MailboxChangedDuringExport;
             defer source.close(io);
-            try writeSlots(io, archive, source, path, &sequence);
+            try writeSlots(a, io, archive, source, path, &keywords, &sequence);
         }
         if (folder.flat) {
             const source = try openOptionalDir(user_dir, io, name) orelse return error.MailboxChangedDuringExport;
             defer source.close(io);
-            try writeMessages(io, archive, source, path, "cur", &sequence);
+            const source_keywords = try maildir_keywords.load(a, io, source);
+            try writeMessages(io, archive, source, path, "cur", &source_keywords, &keywords, &sequence);
         }
+        try writeKeywordMap(a, archive, path, &keywords);
     }
 }
 
@@ -139,26 +145,39 @@ fn writeMaildir(a: Allocator, archive: *Tar, path: []const u8) !void {
     }
 }
 
-fn writeSlots(io: std.Io, archive: *Tar, parent: Dir, path: []const u8, sequence: *u64) !void {
+fn writeKeywordMap(a: Allocator, archive: *Tar, path: []const u8, keywords: *const maildir_keywords.Names) !void {
+    if (keywords.defined() == 0) return;
+    const name = try std.fmt.allocPrint(a, "{s}/{s}", .{ path, maildir_keywords.mapping_name });
+    try archive.writeFileBytes(name, try keywords.encode(a), .{ .mode = 0o600 });
+}
+
+fn writeSlots(a: Allocator, io: std.Io, archive: *Tar, parent: Dir, path: []const u8, keywords: *maildir_keywords.Names, sequence: *u64) !void {
+    const source_keywords = try maildir_keywords.load(a, io, parent);
     inline for (.{ "cur", "new" }) |slot| {
         if (try openOptionalDir(parent, io, slot)) |dir| {
             defer dir.close(io);
-            try writeMessages(io, archive, dir, path, slot, sequence);
+            try writeMessages(io, archive, dir, path, slot, &source_keywords, keywords, sequence);
         }
     }
 }
 
-fn writeMessages(io: std.Io, archive: *Tar, dir: Dir, path: []const u8, slot: []const u8, sequence: *u64) !void {
+fn writeMessages(io: std.Io, archive: *Tar, dir: Dir, path: []const u8, slot: []const u8, source_keywords: *const maildir_keywords.Names, keywords: *maildir_keywords.Names, sequence: *u64) !void {
     var iterator = dir.iterate();
     var read_buffer: [32 * 1024]u8 = undefined;
     while (try iterator.next(io)) |entry| {
         if (entry.kind != .file) continue;
         const marker = std.mem.indexOf(u8, entry.name, ".eml:2,");
         if (marker == null and !std.mem.endsWith(u8, entry.name, ".eml")) continue;
-        const flags = if (marker) |index| entry.name[index + ".eml:2,".len ..] else "";
-        for (flags) |flag| {
+        const stored_flags = if (marker) |index| entry.name[index + ".eml:2,".len ..] else "";
+        var flag_buffer: [256]u8 = undefined;
+        var flags_writer = std.Io.Writer.fixed(&flag_buffer);
+        for (stored_flags) |flag| {
             if (!std.ascii.isAlphabetic(flag)) return error.InvalidMaildirFlags;
+            if (std.ascii.isUpper(flag)) try flags_writer.writeAll(&.{flag});
         }
+        const bits = try keywords.translate(source_keywords, maildir_keywords.fromFilename(entry.name));
+        try maildir_keywords.writeLetters(&flags_writer, bits);
+        const flags = flags_writer.buffered();
         const file = try dir.openFile(io, entry.name, .{ .follow_symlinks = false });
         defer file.close(io);
         const before = try file.stat(io);

@@ -34,6 +34,7 @@ const ascii_compat = @import("ascii-compat");
 const fs_compat = @import("../core/fs_compat.zig");
 const hosted_limits = @import("../storage/hosted_limits.zig");
 const database = @import("../storage/database.zig");
+const maildir_keywords = @import("../storage/maildir_keywords.zig");
 const message_refs = @import("../storage/message_refs.zig");
 const imap = @import("../protocol/imap.zig");
 const time_compat = @import("../core/time_compat.zig");
@@ -1153,36 +1154,6 @@ fn isSafeName(name: []const u8) bool {
     return true;
 }
 
-/// Build the `:2,FLAGS` Maildir suffix from a Flags value (alphabetical order,
-/// matching imap.MaildirFlags.toSuffix: D,F,R,S,T).
-fn suffixFor(flags: Flags, buf: []u8) []const u8 {
-    var n: usize = 0;
-    const prefix = ":2,";
-    @memcpy(buf[0..prefix.len], prefix);
-    n = prefix.len;
-    if (flags.draft) {
-        buf[n] = 'D';
-        n += 1;
-    }
-    if (flags.flagged) {
-        buf[n] = 'F';
-        n += 1;
-    }
-    if (flags.answered) {
-        buf[n] = 'R';
-        n += 1;
-    }
-    if (flags.seen) {
-        buf[n] = 'S';
-        n += 1;
-    }
-    if (flags.deleted) {
-        buf[n] = 'T';
-        n += 1;
-    }
-    return buf[0..n];
-}
-
 /// Set the flags on a message (by UID) by renaming its Maildir file's suffix.
 /// The base name (and thus the UID) is unchanged. Returns the resulting Flags.
 pub fn setFlags(
@@ -1212,8 +1183,16 @@ pub fn setFlagsLocked(allocator: std.mem.Allocator, db: *database.Database, user
         if (!isSafeName(ref.name)) return MaildirError.WriteFailed;
 
         const base = imap.MaildirFlags.baseName(ref.name);
-        var suffix_buf: [16]u8 = undefined;
-        const suffix = suffixFor(flags, &suffix_buf);
+        const full_flags: imap.MaildirFlags = .{
+            .seen = flags.seen,
+            .answered = flags.answered,
+            .flagged = flags.flagged,
+            .draft = flags.draft,
+            .deleted = flags.deleted,
+            .keywords = maildir_keywords.fromFilename(ref.name),
+        };
+        var suffix_buf: [maildir_keywords.suffix_capacity]u8 = undefined;
+        const suffix = full_flags.toSuffix(&suffix_buf);
         const new_name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ base, suffix });
 
         if (std.mem.eql(u8, ref.name, new_name)) return flags; // already in the desired state
@@ -1266,7 +1245,10 @@ pub fn moveWithFeedbackLocked(allocator: std.mem.Allocator, db: *database.Databa
     fs_compat.ensureDir(dst_dir) catch {};
 
     const old_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ref.dir, ref.name });
-    const new_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dst_dir, ref.name });
+    const source_bits = maildir_keywords.fromFilename(ref.name);
+    const target_bits = try maildir_keywords.transferredBits(allocator, ref.dir, dst_dir, source_bits);
+    const target_name = if (source_bits == target_bits) ref.name else try maildir_keywords.withBits(allocator, ref.name, target_bits);
+    const new_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dst_dir, target_name });
 
     // Assign the destination UID FIRST. UID keying is on the base name, so this
     // is correct regardless of the physical move; doing it before the move means

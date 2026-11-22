@@ -80,7 +80,7 @@ def seed(source):
             assert imap.create('"' + folder + '"')[0] == "OK"
         assert imap.create('"Temporary folder"')[0] == "OK"
         assert imap.delete('"Temporary folder"')[0] == "OK"
-        assert imap.append("Projects", r"(\Seen \Flagged)", FILE_TIME, raw)[0] == "OK"
+        assert imap.append("Projects", r"(\Seen \Flagged ProjectReviewed)", FILE_TIME, raw)[0] == "OK"
         assert imap.append("Sent", r"(\Seen \Answered)", None, raw)[0] == "OK"
         for folder, subject, received_at in TIMESTAMP_CASES:
             message = EmailMessage(policy=policy.SMTP)
@@ -94,7 +94,8 @@ def seed(source):
     # and the current Maildir++ directory. Include both without duplicating an alias.
     (owner_dir / "Projects").unlink()
     (owner_dir / "Projects").mkdir()
-    (owner_dir / "Projects" / "legacy.eml:2,D").write_bytes(raw.replace(b"Portable project attachment", b"Legacy project copy"))
+    (owner_dir / "Projects" / "dovecot-keywords").write_text("0 LegacyOnly\n")
+    (owner_dir / "Projects" / "legacy.eml:2,Da").write_bytes(raw.replace(b"Portable project attachment", b"Legacy project copy"))
     foreign_mail, = (source.directory / "mail" / foreign / "new").glob("*.eml")
     (owner_dir / "new" / "foreign-link.eml").symlink_to(foreign_mail)
     (owner_dir / "ForeignFolder").symlink_to(foreign_mail.parent, target_is_directory=True)
@@ -154,7 +155,8 @@ def inspect(source, owner, archive, extracted, original):
     assert not list(folders["Empty folder"].joinpath("cur").iterdir())
     projects = sorted(folders["Projects"].joinpath("cur").iterdir())
     assert len(projects) == 2
-    flagged, = [path for path in projects if path.name.endswith(":2,FS")]
+    assert (folders["Projects"] / "dovecot-keywords").read_text() == "0 ProjectReviewed\n1 LegacyOnly\n"
+    flagged, = [path for path in projects if path.name.endswith(":2,FSa")]
     assert flagged.stat().st_mtime == FILE_TIME and flagged.read_bytes() == original
 
     # Read the extract with an independent Maildir implementation.
@@ -168,7 +170,7 @@ def inspect(source, owner, archive, extracted, original):
         assert item.get_date() == received_at, (subject, item.get_date(), received_at)
     project_box = portable.get_folder("Projects")
     assert {item["Subject"]: item.get_flags() for item in project_box} == {
-        "Portable project attachment": "FS", "Legacy project copy": "D",
+        "Portable project attachment": "FSa", "Legacy project copy": "Db",
     }
     assert len(portable.get_folder("Empty folder")) == 0
     assert {item["Subject"]: item.get_flags() for item in portable.get_folder("Sent")} == {
@@ -195,19 +197,26 @@ def transfer(destination, extracted, manifest):
             if name != "INBOX":
                 assert imap.create(quoted)[0] == "OK"
             path = extracted / folder["path"]
+            mapping = path / "dovecot-keywords"
+            keywords = {}
+            if mapping.exists():
+                for line in mapping.read_text().splitlines():
+                    index, keyword = line.split()
+                    keywords[chr(ord("a") + int(index))] = keyword
             for slot in ("new", "cur"):
                 for file in (path / slot).iterdir():
                     flags = file.name.partition(":2,")[2]
-                    encoded = "(" + " ".join(flag_map[flag] for flag in flags) + ")"
+                    encoded = "(" + " ".join((keywords if flag.islower() else flag_map)[flag] for flag in flags) + ")"
                     date_arg = Time2Internaldate(file.stat().st_mtime)
                     assert imap.append(quoted, encoded, date_arg, file.read_bytes())[0] == "OK"
         assert imap.select('"Projects"') == ("OK", [b"2"])
         result, rows = imap.search(None, "FLAGGED")
         assert result == "OK" and len(rows[0].split()) == 1
-        result, rows = imap.fetch(rows[0], "(BODY.PEEK[] INTERNALDATE)")
+        result, rows = imap.fetch(rows[0], "(BODY.PEEK[] INTERNALDATE FLAGS)")
         message = BytesParser(policy=policy.default).parsebytes(rows[0][1])
         assert result == "OK" and message["Subject"] == "Portable project attachment"
         assert internaldate(rows[0][0]) == FILE_TIME
+        assert b"ProjectReviewed" in rows[0][0]
         part, = message.iter_attachments()
         assert part.get_filename() == "fixture.bin" and part.get_payload(decode=True) == ATTACHMENT
         assert imap.select('"Empty folder"') == ("OK", [b"0"])
