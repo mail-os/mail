@@ -16,6 +16,7 @@ SCRIPTS = Path(__file__).resolve().parent
 hosted = runpy.run_path(str(SCRIPTS / "test-hosted-limits.py"))
 Fixture, request = hosted["Fixture"], hosted["request"]
 DavClient = runpy.run_path(str(SCRIPTS / "test-dav-https.py"))["DavClient"]
+team_command = runpy.run_path(str(SCRIPTS / "test-webmail-teams.py"))["command"]
 ENGINES = ("chromium", "firefox", "webkit")
 RECEIPT = b"Receipt 1046 for Studio Hosting\n"
 
@@ -64,6 +65,22 @@ def seed_calendar(fixture, owner):
     return start.date().isoformat()
 
 
+def seed_shared_inbox(fixture, owner, sender):
+    studio = fixture.provision("studio")
+    session = fixture.login(studio)
+    assert fixture.api(session, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
+    team_command(fixture, "team", "create", "studio", "Studio", studio)
+    team_command(fixture, "team", "member", "studio", owner, "member")
+    team_command(fixture, "team", "grant", "studio", studio, owner, "mailbox")
+    message = EmailMessage()
+    message["From"] = sender
+    message["To"] = studio
+    message["Subject"] = "Studio proof approval"
+    message.set_content("The revised proof is ready for approval.")
+    with fixture.smtp(sender) as connection:
+        assert connection.send_message(message) == {}
+
+
 def verify_delivery(fixture, sender):
     session = fixture.login(sender)
     status, listing = fixture.api(session, "messages?folder=INBOX&q=Browser+acceptance+handoff")
@@ -88,6 +105,7 @@ def verify(binary, output, engine):
             assert fixture.api(session, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
             assert fixture.api(session, "category-settings", {"automatic": True}, "PUT")[0] == 200
             seed_inbox(fixture, owner, sender)
+            seed_shared_inbox(fixture, owner, sender)
             day = seed_calendar(fixture, owner)
             env = dict(os.environ, MAIL_BROWSER_URL=fixture.webmail, MAIL_BROWSER_OWNER=owner,
                        MAIL_BROWSER_SENDER=sender, MAIL_BROWSER_PASSWORD=fixture.password, MAIL_BROWSER_DAY=day,

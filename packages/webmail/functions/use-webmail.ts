@@ -636,7 +636,11 @@ export function useWebmail(ports: WebmailPorts) {
     const rows = event?.shiftKey ? rangeSelection(visibleMessages(), selectionAnchor, message, messageIdentity) : [message]
     const result = new Map(checked().map(ref => [messageIdentity(ref), ref]))
     for (const row of rows) { if (wanted) result.set(messageIdentity(row), messageRef(row)); else result.delete(messageIdentity(row)) }
-    if (result.size > 100) { notice.set('Select up to 100 messages at a time.'); return }
+    if (result.size > 100) {
+      event?.preventDefault()
+      notice.set('Select up to 100 messages at a time.')
+      return
+    }
     checked.set([...result.values()])
     selectionAnchor = messageIdentity(message)
   }
@@ -658,7 +662,11 @@ export function useWebmail(ports: WebmailPorts) {
     const wanted = !members.every(message => checkedKeys().includes(messageIdentity(message)))
     const result = new Map(checked().map(ref => [messageIdentity(ref), ref]))
     for (const message of members) { if (wanted) result.set(messageIdentity(message), messageRef(message)); else result.delete(messageIdentity(message)) }
-    if (result.size > 100) { notice.set('This conversation exceeds the selection limit. Expand it and select up to 100 messages.'); return }
+    if (result.size > 100) {
+      event.preventDefault()
+      notice.set('This conversation exceeds the selection limit. Expand it and select up to 100 messages.')
+      return
+    }
     checked.set([...result.values()])
     selectionAnchor = messageIdentity(thread.latest)
   }

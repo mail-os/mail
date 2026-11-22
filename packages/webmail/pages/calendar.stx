@@ -144,7 +144,7 @@ onUnmounted(() => { destroy(); destroyReminders() })
                 <span :if="day.entries.length > 3" :text="'+' + (day.entries.length - 3)"></span>
               </span>
             </button>
-            <button :if="view !== 'month'" class="calendar-day-add" :aria-label="'New event on ' + day.label" @click="openNewEvent(day.day)">+</button>
+            <button :if="view !== 'month'" class="calendar-day-add" :aria-label="'New event on ' + day.label" @click="openNewEvent(day.day)"><span class="mail-icon" data-icon="plus" aria-hidden="true"></span></button>
           </div>
           <ul class="calendar-day-entries">
             <li :for="entry in day.entries">

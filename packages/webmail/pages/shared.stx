@@ -33,7 +33,7 @@ useEventListener('online', refresh)
 <main class="wm-shared-page" :class="{ 'wm-shared-reading': !!reference }">
   <header class="wm-shared-header">
     <a class="wm-action wm-shared-back" href="/"><span class="mail-icon" data-icon="back" aria-hidden="true"></span>Mail</a>
-    <span class="mail-app-mark"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span></span>
+    <span class="mail-app-mark"><span class="mail-icon" data-icon="people" aria-hidden="true"></span></span>
     <h1>Shared inboxes</h1>
     <div :if="inboxes.length" class="wm-shared-switch"><label class="wm-a11y-text" for="sharedInboxPicker">Shared inbox</label><select id="sharedInboxPicker" @change="selectInbox($event.target.value)" :disabled="saving">
       <option :if="!selectedInbox" value="">Choose an inbox</option>

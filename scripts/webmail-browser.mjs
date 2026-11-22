@@ -51,6 +51,7 @@ async function verifyAppearance(page, scheme) {
     }
     const pairs = [
       ['--text', '--panel'], ['--muted', '--panel'], ['--muted', '--surface'],
+      ['--muted', '--toolbar'], ['--muted', '--selected'], ['--muted', '--sidebar'],
       ['--accent', '--selected'], ['--on-primary', '--primary'],
     ]
     return {
@@ -156,11 +157,14 @@ async function desktopJourney(page) {
   assert.equal(await conversations.isChecked(), false)
   await conversations.press('Space')
   assert.equal(await conversations.isChecked(), true)
+  await button(page, 'Select').press('Enter')
   const selectAll = page.getByRole('checkbox', { name: 'Select messages on this page' })
   await selectAll.check()
   await page.getByText('7 selected', { exact: true }).waitFor()
-  await button(page, 'Clear').click()
-  assert.equal(await selectAll.isChecked(), false)
+  await button(page, 'Done').press('Enter')
+  assert.equal(await selectAll.isVisible(), false)
+  assert.equal(await button(page, 'Select').getAttribute('aria-expanded'), 'false')
+  assert.equal(await button(page, 'Select').evaluate(node => node === document.activeElement), true)
 
   const search = page.getByRole('searchbox', { name: 'Search messages' })
   await search.focus()
@@ -177,7 +181,15 @@ async function desktopJourney(page) {
 
   await button(page, /Tuesday design handoff/).click()
   await heading(page, handoff).waitFor()
+  assert.equal(await button(page, /Tuesday design handoff/).getAttribute('aria-current'), 'true')
   await page.frameLocator('iframe[title="Email content"]').getByText('For Tuesday', { exact: true }).waitFor()
+  const sorting = page.getByText('Sender sorting', { exact: true })
+  const destination = page.getByLabel(/Future mail from/)
+  assert.equal(await destination.isVisible(), false)
+  await sorting.click()
+  await destination.waitFor()
+  await sorting.click()
+  await destination.waitFor({ state: 'hidden' })
   const tools = page.getByRole('group', { name: 'Message actions', exact: true })
   for (const name of ['Reply', 'Reply all', 'Forward', 'Flag', 'Mark unread', 'Move this message', 'Trash']) {
     const control = button(tools, name)
@@ -228,6 +240,9 @@ async function desktopJourney(page) {
   await page.getByText('Studio review', { exact: true }).waitFor()
   await button(page, 'Clear').click()
 
+  await page.goto(url)
+  await page.getByRole('link', { name: 'Shared inboxes', exact: true }).click()
+  await sharedJourney(page)
   await page.goto(url + '/status')
   await heading(page, 'Mail delivery').waitFor()
   await screenshot(page, 'desktop-service-health')
@@ -245,6 +260,17 @@ async function phoneJourney(page) {
   await page.emulateMedia({ colorScheme: 'light' })
   await screenshot(page, 'phone-inbox-light')
   await page.emulateMedia({ colorScheme: 'dark' })
+
+  const firstCheckbox = page.locator('.wm-message-check').first()
+  assert.equal(await firstCheckbox.isVisible(), false)
+  await button(page, 'Select').click()
+  await firstCheckbox.click()
+  await page.getByText('1 selected', { exact: true }).waitFor()
+  assert.equal(await firstCheckbox.isChecked(), true)
+  await screenshot(page, 'phone-selection')
+  await button(page, 'Done').click()
+  assert.equal(await firstCheckbox.isVisible(), false)
+  assert.equal(await firstCheckbox.isChecked(), false)
 
   for (const width of [320, 390, 620, 860, 861]) {
     await page.setViewportSize({ width, height: 844 })
@@ -311,6 +337,29 @@ async function phoneJourney(page) {
   await page.locator('.calendar-loading').waitFor({ state: 'hidden' })
   await fitsViewport(page)
   await screenshot(page, 'phone-calendar')
+  await page.goto(url + '/shared')
+  await sharedJourney(page, true)
+}
+
+async function sharedJourney(page, phone = false) {
+  await heading(page, 'Shared inboxes').waitFor()
+  const picker = page.getByLabel('Shared inbox', { exact: true })
+  const studio = picker.locator('option', { hasText: /studio@hosted\.example\.test/ })
+  await studio.waitFor({ state: 'attached' })
+  await picker.selectOption(await studio.getAttribute('value'))
+  const message = button(page, /Studio proof approval/)
+  await message.click()
+  await heading(page, 'Studio proof approval').waitFor()
+  await page.getByRole('region', { name: 'Shared message reader' })
+    .getByText('The revised proof is ready for approval.', { exact: true }).waitFor()
+  await button(page, 'Resolve').click()
+  await button(page, 'Reopen').waitFor()
+  await fitsViewport(page)
+  await screenshot(page, phone ? 'phone-shared' : 'desktop-shared')
+  await button(page, 'Reopen').click()
+  await button(page, 'Resolve').waitFor()
+  await button(page, 'Back to messages').click()
+  await message.waitFor()
 }
 
 try {

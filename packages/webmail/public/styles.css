@@ -1,24 +1,24 @@
-/* Neutral window chrome keeps blue reserved for navigation and actions. */
+/* Cool neutrals and a blue accent are shared across workspaces and dialogs. */
 :root {
   color-scheme: light;
   --app-font: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", sans-serif;
-  --bg: #eef0f4;
+  --bg: #eaf0f8;
   --panel: #ffffff;
-  --sidebar: #eef0f4;
-  --surface: #f2f3f6;
-  --toolbar: #f7f8fa;
-  --hover: #e9ecf1;
-  --text: #20232a;
-  --muted: #596170;
-  --border: #dce0e7;
+  --sidebar: #eef2f8;
+  --surface: #eff2f7;
+  --toolbar: #fafbfe;
+  --hover: #e7edf5;
+  --text: #182132;
+  --muted: #546177;
+  --border: #dbe2ed;
   --field-border: #777884;
-  --accent: #0758bd;
-  --primary: #0661ce;
+  --accent: #0755b4;
+  --primary: #0865d6;
   --primary-hover: #004da9;
   --on-primary: #ffffff;
-  --accent-soft: #edf4ff;
-  --selected: #e0ecff;
-  --selection-edge: #166fda;
+  --accent-soft: #edf5ff;
+  --selected: #dfedff;
+  --selection-edge: #0874e8;
   --danger: #b42429;
   --danger-soft: #fff0ef;
   --warning: #794515;
@@ -35,21 +35,21 @@
 @media (prefers-color-scheme: dark) {
   :root {
     color-scheme: dark;
-    --bg: #1c1e23;
+    --bg: #171b24;
     --panel: #24262c;
-    --sidebar: #1c1e23;
-    --surface: #2d3038;
-    --toolbar: #292c33;
-    --hover: #353943;
-    --text: #f2f3f6;
-    --muted: #b4bccb;
-    --border: #3b3f49;
+    --sidebar: #1e2430;
+    --surface: #2c3442;
+    --toolbar: #272e3a;
+    --hover: #353f50;
+    --text: #f1f4fa;
+    --muted: #b6c1d4;
+    --border: #3a4557;
     --field-border: #777886;
-    --accent: #94c6ff;
+    --accent: #a2cfff;
     --primary: #1a66c4;
     --primary-hover: #1557a9;
-    --accent-soft: #263953;
-    --selected: #29486d;
+    --accent-soft: #263d5c;
+    --selected: #2b496d;
     --selection-edge: #68b2ff;
     --danger: #ffaaa4;
     --danger-soft: #492c32;
@@ -191,9 +191,10 @@ input[type=checkbox] { accent-color: var(--accent); }
 .wm-library-row a { text-decoration: none; color: var(--accent); }
 .wm-category-section { margin: 0; padding: 8px 12px; background: var(--surface); color: var(--muted); font-size: 12px; font-weight: 650; border-bottom: 1px solid var(--border); }
 .wm-workspace-error { padding: 8px 12px; flex-shrink: 0; }
-.wm-notification-rules { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); font-size: 13px; }
-.wm-notification-rules summary { color: var(--accent); cursor: pointer; font-weight: 600; }
-.wm-notification-rules summary .mail-icon { width: 14px; height: 14px; margin: 0 5px -2px; }
+.wm-sender-sorting, .wm-notification-rules { margin-top: 9px; padding: 9px 11px; border-radius: 8px; background: var(--toolbar); font-size: 13px; }
+:is(.wm-sender-sorting, .wm-notification-rules) summary { color: var(--muted); cursor: pointer; font-weight: 600; }
+:is(.wm-sender-sorting, .wm-notification-rules) summary:hover { color: var(--accent); }
+:is(.wm-sender-sorting, .wm-notification-rules) summary .mail-icon { width: 14px; height: 14px; margin: 0 5px -2px; }
 .wm-notification-fields { display: flex; flex-wrap: wrap; gap: 10px 16px; margin-top: 10px; }
 .wm-notification-fields label { display: grid; gap: 4px; min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
 .wm-notification-fields select { max-width: 100%; width: fit-content; padding: 6px; border: 1px solid var(--field-border); border-radius: 6px; background: var(--panel); color: var(--text); }
@@ -247,7 +248,7 @@ input[type=checkbox] { accent-color: var(--accent); }
 .wm-receipt-meta > span { color: var(--muted); }
 .wm-receipt-excerpt { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; margin: 10px 0 0; color: var(--text); line-height: 1.5; white-space: pre-line; }
 .wm-placement { margin: 12px 0; color: var(--muted); font-size: 12px; }
-.wm-category-rule { display: grid; gap: 8px; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); font-size: 13px; overflow-wrap: anywhere; }
+.wm-category-rule { display: grid; gap: 8px; margin-top: 10px; font-size: 13px; overflow-wrap: anywhere; }
 .wm-category-rule > div { display: flex; flex-wrap: wrap; gap: 8px; }
 .wm-category-rule select { min-width: 0; padding: 6px; border: 1px solid var(--field-border); border-radius: 6px; background: var(--panel); color: var(--text); }
 .wm-state { padding: 32px 18px; color: var(--muted); text-align: center; }
@@ -616,7 +617,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-msg-subject .wm-msg-flag { color: var(--warning); }
 .wm-msg-date { font-variant-numeric: tabular-nums; }
 @media (hover: hover) and (pointer: fine) {
-  .wm-message-row:not(:hover, :focus-within) .wm-message-check:not(:checked, [aria-checked=mixed]) { opacity: 0; }
+  .wm-list:not(.wm-list--selecting) .wm-message-row:not(:hover, :focus-within) .wm-message-check { opacity: 0; }
+  .wm-message-row:hover::before, .wm-message-row:focus-within::before { opacity: 0; }
 }
 .wm-category-section { margin: 3px 0 4px; padding: 7px 10px; border: 0; border-radius: 6px; }
 .wm-reader-empty { display: flex; flex: 1; min-height: 190px; flex-direction: column; align-items: center; justify-content: center; gap: 13px; color: var(--muted); padding: 26px; text-align: center; }
@@ -689,9 +691,10 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-account-heading p { margin: 1px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .wm-account-header-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .wm-account-header .login-error { flex-basis: 100%; margin: 0; }
-.wm-modal .wm-account-settings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 0 20px; width: 100%; max-width: none; min-height: 0; overflow: auto; margin: 0; padding: 18px; border: 0; border-radius: 0; box-shadow: none; }
-.wm-account-settings .login-recovery { margin: 0; padding: 14px 0; }
-.wm-account-settings .login-recovery:first-child { padding-top: 0; border: 0; }
+.wm-modal .wm-account-settings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 12px; width: 100%; max-width: none; min-height: 0; overflow: auto; margin: 0; padding: 14px; border: 0; border-radius: 0; background: var(--toolbar); box-shadow: none; }
+.wm-account-settings .login-recovery { margin: 0; padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); }
+.wm-account-settings h2 { display: flex; align-items: center; gap: 7px; }
+.wm-account-settings h2 .mail-icon { color: var(--accent); }
 .wm-account-settings .login-sub { margin-bottom: 12px; }
 .wm-account-settings button { width: auto; margin-top: 12px; padding: 7px 10px; font-size: 12px; }
 .wm-account-settings input { padding: 8px 10px; }
@@ -819,23 +822,28 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 [data-icon=unread-mail] { --mail-symbol: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22black%22 stroke-width=%221.75%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cpath d=%22M14 6H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-6m-18-3 9 5 4-2.2%22/%3E%3Ccircle cx=%2219.5%22 cy=%226%22 r=%222.5%22 fill=%22black%22 stroke=%22none%22/%3E%3C/svg%3E"); }
 
 .wm { background: var(--bg); }
-.wm-folders { border-inline-end: 0; }
+.wm-folders { border-inline-end: 1px solid var(--border); background: linear-gradient(155deg, var(--sidebar) 40%, var(--bg)); }
 .wm-brand { letter-spacing: -.025em; }
 .wm-brand .mail-app-mark { box-shadow: 0 2px 5px rgb(9 84 179 / .18); }
 .wm-compose-btn { min-height: 40px; border-radius: 10px; }
+.wm-folder-list, .wm-nav-secondary { gap: 8px; }
 .wm-nav-group { gap: 1px; }
-.wm-nav-label { margin: 4px 11px; }
-.wm-folder { min-height: 30px; padding-inline: 10px; }
-.wm-folder[aria-current=page] { box-shadow: none; }
+.wm-nav-label { margin: 4px 10px; }
+.wm-folder { min-height: 28px; padding-inline: 10px; }
+.wm-folder .mail-icon { color: var(--muted); }
+.wm-folder:where(:hover, :focus-visible, [aria-current=page]) .mail-icon, .wm-folder .mail-icon[data-icon=inbox] { color: var(--accent); }
+.wm-folder[aria-current=page] { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--selection-edge), transparent 84%); }
 .wm-folder-count { border-radius: 6px; }
 .wm-folder[aria-current=page] .wm-folder-count { background: var(--panel); }
 .wm-user { padding: 10px 5px 0; }
 .wm-account-actions { justify-content: space-between; }
-.wm-list-head { padding: 15px 18px 6px; min-height: 62px; }
-.wm-list-head h1 { font-size: clamp(23px, 2.3vw, 29px); letter-spacing: -.04em; }
+.wm-list-head { padding: 17px 18px 7px; min-height: 66px; }
+.wm-list-head h1 { font-size: 25px; letter-spacing: -.033em; }
 .wm-list-total { font-variant-numeric: tabular-nums; }
 .wm-search-form { padding: 7px 14px 4px; }
+.wm-list-head, .wm-search-form, .wm-list-options { background: var(--toolbar); }
 .mail-search-field { background: var(--surface); border-color: transparent; border-radius: 9px; }
+.mail-search-field > .mail-icon { width: 15px; height: 15px; }
 .wm-search { font-size: 14px; }
 .wm-search-submit, .wm-search-filters { border-radius: 8px; }
 .wm-list-options { gap: 4px; min-height: 43px; padding: 5px 12px; }
@@ -846,33 +854,49 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-list-toggle:has(input:checked, input[aria-checked=mixed]) { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 .wm-list-toggle:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 1px; }
 .wm-list-toggle:has(input:disabled) { opacity: .5; cursor: default; }
+.wm-list-options .wm-select-all { display: none; }
+.wm-list--selecting .wm-list-options .wm-select-all { display: inline-flex; }
+.wm-selection-mode { min-height: 31px; }
 .wm-list-body { padding: 6px 8px; }
-.wm-message-row { border-radius: 9px; min-height: 78px; }
-.wm-message-row--active, .wm-message-row--active:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent), transparent 79%); }
+.wm-message-row { border: 0; border-radius: 8px; min-height: 73px; }
+.wm-message-row:not(.wm-message-row--active)::after { position: absolute; content: ''; inset: auto 10px 0 26px; border-bottom: 1px solid var(--border); pointer-events: none; }
+.wm-message-row--active, .wm-message-row--active:hover { box-shadow: inset 3px 0 var(--selection-edge); }
 .wm-message-row--active .wm-msg-from { color: var(--accent); }
 .wm-message-row--unread::before { top: 17px; }
-.wm-message-check { margin-top: 33px; }
-.wm-msg { padding-block: 10px; }
+.wm-list--selecting .wm-message-row::before, .wm-message-row:has(.wm-message-check:focus-visible)::before { opacity: 0; }
+.wm-message-check { position: absolute; top: 12px; left: 6px; width: 14px; height: 14px; margin: 0; z-index: 1; }
+.wm-list--selecting .wm-message-check { opacity: 1; }
+.wm-msg { min-height: inherit; padding: 10px 10px 10px 26px; }
+.wm-thread-members .wm-msg { padding-inline-start: 26px; }
 .wm-msg-from { font-weight: 600; }
 .wm-msg-snippet { line-height: 1.4; }
+.wm-thread-count { display: inline-flex; align-items: center; gap: 2px; padding-inline: 3px 5px; }
+.wm-msg-subject .wm-thread-count .mail-icon { width: 12px; height: 12px; color: inherit; }
+@media (max-width: 860px), (hover: none), (pointer: coarse) {
+  .wm-list:not(.wm-list--selecting) .wm-message-check { visibility: hidden; }
+}
 .wm-list-empty { display: grid; justify-items: center; align-content: center; min-height: 220px; gap: 12px; padding: 20px; color: var(--muted); text-align: center; }
 .wm-empty-mark { color: var(--accent); background: var(--accent-soft); }
 .wm-empty-mark .mail-icon { width: 26px; height: 26px; color: inherit; }
 .wm-list-empty .wm-empty-mark { width: 46px; height: 46px; border-radius: 13px; }
 .wm-list-empty .wm-empty-mark .mail-icon { width: 22px; height: 22px; }
-.wm-reader-empty { background: var(--toolbar); }
-.wm-message-toolbar { position: sticky; top: 0; z-index: 1; gap: 6px; padding-block: 9px; }
+.wm-reader-empty { background: radial-gradient(ellipse at 50% 30%, var(--panel) 15%, var(--toolbar) 75%); }
+.wm-message-toolbar { position: sticky; top: 0; z-index: 1; gap: 7px; padding-block: 10px; }
 .wm-message-toolbar .wm-action { background: transparent; border-color: transparent; }
 .wm-message-toolbar .wm-action:hover { background: var(--hover); }
 .wm-message-toolbar .wm-action--accent { background: var(--accent-soft); }
+.wm-tool-group { gap: 2px; padding: 2px; border: 0; border-radius: 9px; background: var(--surface); }
 .wm-tool { color: var(--muted); }
 .wm-tool:hover { color: var(--text); }
 .wm-tool--danger:hover { color: var(--danger); }
+.wm-tool-move { padding-inline-end: 6px; }
 .wm-tool-move select { border-color: transparent; background: var(--surface); }
-.wm-message-heading .wm-folder-badge { background: var(--accent-soft); color: var(--accent); }
-.wm-read-meta .wm-avatar { width: 42px; height: 42px; }
-.wm-read-html { min-height: clamp(240px, 31dvh, 380px); }
-.wm-format-control .wm-action { background: var(--surface); border-color: transparent; color: var(--muted); }
+.wm-read-body > :not(.wm-read-toolbar) { max-width: 780px; margin-inline: auto; }
+.wm-read-body > .wm-read-text { margin-inline: auto; padding-inline-end: clamp(0px, 4vw, 36px); }
+.wm-message-heading .wm-folder-badge { background: var(--surface); color: var(--muted); }
+.wm-read-meta .wm-avatar { width: 42px; height: 42px; background: linear-gradient(160deg, var(--selected), var(--accent-soft)); }
+.wm-read-html { min-height: clamp(200px, 28dvh, 345px); }
+.wm-format-control .wm-action { background: transparent; border-color: transparent; color: var(--muted); }
 .wm-format-control .wm-action:hover { background: var(--hover); color: var(--text); }
 
 .wm-composer-title { font-size: 17px; }
@@ -883,21 +907,33 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-recipient-box--invalid { border-color: var(--danger); }
 .wm-subject-field input, .wm-from-field select { padding-inline: 9px; }
 .wm-composer-body { min-height: clamp(150px, 26dvh, 250px); padding: 10px 2px; border-color: transparent; }
-.wm-dropzone, .wm-compose-attachments li { background: var(--surface); }
+.wm-dropzone, .wm-compose-attachments li { background: var(--toolbar); }
+.wm-compose-attachments li > .mail-icon { color: var(--accent); }
+.wm-composer-foot > .wm-action { min-height: 36px; background: transparent; border-color: transparent; }
+.wm-composer-foot > .wm-action:hover { background: var(--hover); }
+.wm-composer-foot > .wm-action--danger:hover { background: var(--danger-soft); }
 .wm-composer-foot .wm-send-btn { min-height: 40px; border-radius: 9px; }
 
-.mail-auth-page { background: var(--bg); }
 .mail-auth-page .login { border-color: var(--border); }
+.mail-auth-page .login form { margin-top: 20px; }
+.mail-auth-page .login input { background: var(--toolbar); }
+.mail-auth-page .login input:focus { background: var(--panel); }
 .calendar-workspace, .health-summary, .health-card { border-radius: 16px; }
 .calendar-view-toolbar { border-color: transparent; background: var(--toolbar); }
 .calendar-view-modes .wm-action[aria-pressed=true] { color: var(--accent); }
+.calendar-day-today { background: var(--toolbar); }
+.calendar-day-today .calendar-day-link { background: var(--selected); }
+.calendar-day-add { display: grid; place-items: center; color: var(--muted); }
+.calendar-day-add .mail-icon { width: 14px; height: 14px; }
+.calendar-entry { background: color-mix(in srgb, var(--calendar-color) 10%, var(--panel)); }
 .calendar-zone { flex-wrap: nowrap; }
 .calendar-zone select { width: auto; max-width: min(12.5rem, 49vw); }
 .wm-shared-list-head { background: var(--toolbar); }
 .wm-shared-row[aria-current=true] .wm-msg-from { color: var(--accent); }
 
 @media (min-width: 861px) {
-  .wm-workspace { margin: 10px 10px 10px 0; overflow: hidden; border: 1px solid var(--border); border-radius: 14px; background: var(--panel); box-shadow: var(--shadow); }
+  .wm-workspace { overflow: hidden; background: var(--panel); }
+  .wm-compose-btn { margin-inline: 0; }
   .wm-list { background: var(--panel); }
 }
 @media (min-width: 1081px) {
@@ -906,7 +942,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm--newsletter-expanded .wm-columns, .wm--reply-focused .wm-columns { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 860px) {
-  .wm-folders { grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px; padding: 8px 12px; }
+  .wm-folders { grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px; padding: 8px 12px; border-inline-end: 0; }
   .wm-brand { padding: 0 3px; gap: 6px; }
   .wm-brand .mail-app-mark { width: 30px; height: 30px; }
   .wm-folders .wm-folders-toggle { display: inline-flex; min-height: 44px; padding-inline: 9px; }
@@ -935,7 +971,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-read-body { --reader-gutter: 16px; padding-bottom: 24px; }
   .wm-back { display: inline-flex; gap: 6px; align-items: center; min-height: 38px; margin-block: 3px 6px; }
   .wm-list-head h1 { font-size: 29px; }
-  .wm-list-options .wm-list-toggle { min-height: 36px; }
+  .wm-list-options :is(.wm-list-toggle, .wm-selection-mode) { min-height: 40px; }
+  .wm-message-check { left: 3px; top: 9px; width: 20px; height: 20px; }
   .wm-read-sender { flex-direction: column; }
   .calendar-view-modes { flex-wrap: nowrap; }
 }
@@ -982,13 +1019,13 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-shared-list-head p { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
 .wm-shared-row { display: grid; gap: 4px; width: calc(100% - 12px); margin: 4px 6px; padding: 11px 12px; border: 0; border-radius: 8px; background: transparent; text-align: left; color: var(--text); font: inherit; cursor: pointer; }
 .wm-shared-row:hover { background: var(--hover); }
-.wm-shared-row[aria-current=true] { background: var(--selected); }
+.wm-shared-row[aria-current=true] { background: var(--selected); box-shadow: inset 3px 0 var(--selection-edge); }
 .wm-shared-row .wm-msg-from, .wm-shared-row .wm-msg-subject, .wm-shared-row .wm-msg-snippet { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wm-shared-labels { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .wm-shared-status { padding: 3px 7px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); font-size: 11px; font-weight: 650; }
 .wm-shared-status--resolved { background: var(--success-soft); color: var(--success); }
 .wm-shared-reader-back { margin: 12px 16px 0; }
-.wm-shared-message { padding: 16px 24px 24px; overflow-wrap: anywhere; }
+.wm-shared-message { max-width: 840px; margin-inline: auto; padding: 16px 24px 24px; overflow-wrap: anywhere; }
 .wm-shared-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .wm-shared-assignee { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--muted); font-size: 13px; }
 .wm-shared-assignee select { min-width: 0; }
