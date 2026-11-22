@@ -4,7 +4,7 @@
 import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from email import policy
 from email.parser import BytesParser
 import http.client
@@ -295,7 +295,7 @@ class Fixture:
         raise AssertionError(f"Outbox send {send_id} did not reach {expected}")
 
     def count(self, mailbox):
-        with sqlite3.connect(self.directory / "smtp.db") as db:
+        with closing(sqlite3.connect(self.directory / "smtp.db")) as db:
             row = db.execute(
                 "SELECT recipients FROM hosted_sending_usage JOIN users ON users.id=user_id WHERE username=?",
                 (mailbox,),

@@ -183,10 +183,9 @@ def main():
     signatures = args.database.resolve()
     with tempfile.TemporaryDirectory(prefix="mail-ews-scan-", dir="/tmp") as directory:
         root = Path(directory)
-        first_scanner = root / "scanner-first"
-        recovered_scanner = root / "scanner-recovered"
-        first_scanner.mkdir()
-        recovered_scanner.mkdir()
+        scanner_dir = root / "scanner"
+        scanner_dir.mkdir()
+        endpoint = scanner_dir / "scanner.sock"
         test = hosted.Fixture(args.binary.resolve(strict=True), root, staging=True)
         with test.daemon():
             owner = test.provision("ews-scan-owner")
@@ -194,25 +193,22 @@ def main():
             blind = test.provision("ews-scan-blind")
             # An already-stored draft must be rescanned at SendItem.
             infected = item_id(check(test, owner, create("SaveOnly", message(sink, file_xml(clamav.EICAR))), "NoError"))
-        with clamav.scanner(first_scanner, executable, signatures) as endpoint:
-            test.env.update(SMTP_CLAMAV_TRANSPORT=f"unix:{endpoint}", SMTP_CLAMAV_FAIL_MODE="closed")
-            with test.daemon():
-                draft = verify_enabled(test, owner, sink, blind, infected)
-            test.env["SMTP_CLAMAV_MAX_STREAM_BYTES"] = "1024"
-            with test.daemon():
-                verify_size(test, owner, sink, 1024)
-            del test.env["SMTP_CLAMAV_MAX_STREAM_BYTES"]
-        print("Verified EWS CreateItem, CreateAttachment and SendItem refusals, per-item batch results, unchanged drafts and sending usage, and the exact scanner byte boundary.")
-        test.env["SMTP_CLAMAV_TRANSPORT"] = f"unix:{root / 'missing.sock'}"
+        test.env.update(SMTP_CLAMAV_TRANSPORT=f"unix:{endpoint}", SMTP_CLAMAV_FAIL_MODE="closed")
         with test.daemon():
+            with clamav.scanner(scanner_dir, executable, signatures):
+                draft = verify_enabled(test, owner, sink, blind, infected)
+            endpoint.unlink(missing_ok=True)
             used = verify_outage(test, owner, sink, draft)
-        with clamav.scanner(recovered_scanner, executable, signatures) as endpoint:
-            test.env["SMTP_CLAMAV_TRANSPORT"] = f"unix:{endpoint}"
-            with test.daemon():
+            with clamav.scanner(scanner_dir, executable, signatures):
                 check(test, owner, attach(draft, file_xml(CLEAN, "after-outage.txt")), "NoError")
                 check(test, owner, hosted.send_ews_items(draft["Id"]), "NoError")
                 assert test.count(owner) == used + 2
-        print("Verified fail-closed EWS results and successful retry after scanner recovery.")
+        endpoint.unlink(missing_ok=True)
+        print("Verified EWS mail and file intake, batch results, and recovery from a scanner outage without restarting Mail.")
+        test.env["SMTP_CLAMAV_MAX_STREAM_BYTES"] = "1024"
+        with clamav.scanner(scanner_dir, executable, signatures), test.daemon():
+            verify_size(test, owner, sink, 1024)
+        print("Verified the exact EWS scan-size boundary and rejection one byte over without a write or debit.")
 
 
 if __name__ == "__main__":
