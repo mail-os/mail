@@ -20,12 +20,25 @@ if (engine === 'chromium') {
 }
 const browser = await engines[engine].launch(launchOptions)
 const errors = []
+const diagnostics = []
 const handoff = 'Tuesday design handoff'
 const sentSubject = 'Browser acceptance handoff'
 const button = (page, name) => page.getByRole('button', { name, exact: typeof name === 'string' })
 const heading = (page, name) => page.getByRole('heading', { name, exact: true })
 const folders = page => page.getByRole('navigation', { name: 'Mail folders' })
 const drawer = page => button(page, 'Mailboxes')
+
+function observePage(page) {
+  page.on('pageerror', error => errors.push(error.message))
+  page.on('console', (entry) => {
+    if (entry.type() === 'error') diagnostics.push(`${new URL(page.url()).pathname} console: ${entry.text()}`)
+  })
+  page.on('requestfailed', (request) => {
+    const path = new URL(request.url()).pathname
+    if (request.isNavigationRequest() || path.startsWith('/webmail/'))
+      diagnostics.push(`${request.method()} ${path}: ${request.failure()?.errorText}`)
+  })
+}
 
 async function screenshot(page, name) {
   await mkdir(output, { recursive: true })
@@ -151,7 +164,7 @@ async function signIn({ phone = false } = {}) {
   })
   const page = await context.newPage()
   page.setDefaultTimeout(12_000)
-  page.on('pageerror', error => errors.push(error.message))
+  observePage(page)
   await page.goto(url + '/login')
   await heading(page, 'Sign in to Mail').waitFor()
   await screenshot(page, phone ? 'phone-sign-in' : 'desktop-sign-in')
@@ -429,7 +442,7 @@ async function calendarSharingJourney(captain) {
   })
   const teammate = await context.newPage()
   teammate.setDefaultTimeout(12_000)
-  teammate.on('pageerror', error => errors.push(error.message))
+  observePage(teammate)
   await teammate.goto(url + '/login')
   await teammate.getByLabel('Email or username').fill(sender)
   await teammate.getByLabel('Password', { exact: true }).fill(password)
@@ -542,6 +555,7 @@ try {
 }
 catch (error) {
   if (errors.length) process.stderr.write(`Uncaught browser errors:\n${errors.join('\n')}\n`)
+  if (diagnostics.length) process.stderr.write(`Browser diagnostics:\n${diagnostics.slice(-20).join('\n')}\n`)
   for (const context of browser.contexts()) {
     for (const [index, page] of context.pages().entries()) {
       const appearance = (page.viewportSize()?.width ?? 0) <= 860 ? 'phone' : 'desktop'
