@@ -9,6 +9,7 @@
 <body>
 <script client>
 import { mailFolderIcon, senderAddress, senderInitials } from '../functions/mail-utils'
+import { invitationLabel, invitationTime } from '../functions/mail-invitations'
 import { useWebmail } from '../functions/use-webmail'
 import { useServiceHealth } from '../functions/use-service-health'
 import { reminderDayLink, useCalendarReminders } from '../functions/use-calendar-reminders'
@@ -424,6 +425,19 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
             </div>
           </div>
           <p :if="placementText && !senderReviewOpen" class="wm-placement wm-placement-info"><span class="mail-icon" data-icon="info" aria-hidden="true"></span><span :text="placementText"></span></p>
+          <section :if="selected?.calendar_invites?.length" class="wm-invitations" aria-label="Calendar invitations">
+            <article :for="(invite, index) in selected.calendar_invites" :key="index" class="wm-invitation">
+              <p class="wm-invitation-kind"><span class="mail-icon" data-icon="calendar" aria-hidden="true"></span><span :text="invitationLabel(invite)"></span></p>
+              <h3 :text="invite.summary || (invite.method === 'cancel' ? 'Canceled event' : 'Untitled event')"></h3>
+              <dl>
+                <div><dt>Organizer</dt><dd><span :text="invite.organizer"></span><span :if="invite.organizer_verified" class="wm-invitation-verified">Verified sender</span></dd></div>
+                <div :if="invite.start"><dt>Starts</dt><dd :text="invitationTime(invite.start)"></dd></div>
+                <div :if="invite.end"><dt :text="invite.end.all_day ? 'Last day' : 'Ends'"></dt><dd :text="invitationTime(invite.end, true)"></dd></div>
+                <div :if="invite.occurrence"><dt :text="invite.this_and_future ? 'This and later occurrences' : 'Original occurrence'"></dt><dd :text="invitationTime(invite.occurrence)"></dd></div>
+                <div :if="invite.location"><dt>Location</dt><dd :text="invite.location"></dd></div>
+              </dl>
+            </article>
+          </section>
           <div class="wm-read-attach"><a :for="(attachment, index) in (selected?.attachments || [])" class="wm-attach-chip" :href="attachmentPath(index)" :download="attachment.filename"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span><span :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></span><span class="mail-icon wm-attachment-download" data-icon="download" aria-hidden="true"></span></a></div>
           <div class="wm-format-control">
             <button :if="selected?.folder === 'Receipts'" class="wm-action" @click="receiptFull.set(!receiptFull())" :aria-expanded="receiptFull"><span class="mail-icon" data-icon="receipt" aria-hidden="true"></span><span :text="receiptFull ? 'Show receipt summary' : 'Read full receipt'"></span></button>
@@ -438,7 +452,11 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
           <template :if="!receiptCompact && selected?.html && showHtml">
             <iframe class="wm-read-html" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" title="Email content" :srcdoc="formattedReader.source"></iframe>
           </template>
-          <pre :if="!receiptCompact && (!selected?.html || !showHtml)" class="wm-read-text" :text="selected?.text || 'No plain-text version is available.'"></pre>
+          <pre :if="!receiptCompact && !selected?.calendar_only && (!selected?.html || !showHtml)" class="wm-read-text" :text="selected?.text || 'No plain-text version is available.'"></pre>
+          <details :if="selected?.calendar_only && selected?.text" class="wm-invitation-source">
+            <summary>Show invitation source</summary>
+            <pre class="wm-read-text" :text="selected.text"></pre>
+          </details>
         </div>
         <section :if="selected?.reference && !senderReviewOpen && selected?.folder !== 'Drafts'" class="wm-reader-attention" aria-label="Message follow-up" :aria-busy="attentionSaving">
           <div class="wm-reader-attention-actions">

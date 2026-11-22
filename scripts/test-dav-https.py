@@ -5,6 +5,7 @@ import argparse
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from email.message import EmailMessage
 import http.client
 import json
 import os
@@ -320,6 +321,107 @@ def check_collection_properties(test, owner, other, expected):
 
     verify_saved()
     return verify_saved
+
+
+def check_invitation_previews(test, owner, other):
+    session, foreign = test.login(owner), test.login(other)
+    assert test.api(session, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
+    client = DavClient(test, owner)
+    home = f"/calendars/{owner}/"
+    before = must(client.request("PROPFIND", home, headers={"Depth": "1"}), 207)[1]
+    dav_state = test.api(session, "calendars")
+
+    def event(method, *fields, organizer=other, attendee=owner, sequence=0):
+        return "\r\n".join(("BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail//Invitation Fixture//EN",
+                          "METHOD:" + method, "BEGIN:VEVENT", "UID:planning@example.test",
+                          "DTSTAMP:20261121T100000Z", f"SEQUENCE:{sequence}", f"ORGANIZER:mailto:{organizer}",
+                          f"ATTENDEE:mailto:{attendee}", *fields, "END:VEVENT", "END:VCALENDAR", ""))
+
+    def deliver(subject, message):
+        message["From"] = other
+        message["To"] = owner
+        message["Subject"] = subject
+        with test.smtp(other) as smtp:
+            assert smtp.send_message(message) == {}
+        query = urllib.parse.urlencode({"folder": "INBOX", "q": subject})
+        status, result = test.api(session, "messages?" + query)
+        assert status == 200
+        row, = [row for row in result["items"] if row["subject"] == subject]
+        endpoint = "messages/ref/" + row["reference"]
+        status, detail = test.api(session, endpoint)
+        assert status == 200, detail
+        assert test.api(foreign, endpoint)[0] == 404
+        assert test.api({}, endpoint)[0] == 401
+        return detail
+
+    source = event("REQUEST", "DTSTART;TZID=America/New_York:20261124T103000", "DTEND;TZID=America/New_York:20261124T113000",
+                   "RECURRENCE-ID;TZID=America/New_York:20261124T090000", r"SUMMARY:Design\, café <Preview>",
+                   "LOCATION:South studio", sequence=2)
+    message = EmailMessage()
+    message.set_content("The revised invitation includes the studio.")
+    message.add_alternative(source, subtype="calendar", params={"METHOD": "REQUEST"}, cte="quoted-printable")
+    message.add_attachment(source, subtype="calendar", params={"method": "request"}, filename="invite.ics", cte="base64")
+    detail = deliver("Calendar preview updated", message)
+    row, = detail["calendar_invites"]
+
+    def wall_at(hour, minute=0):
+        return int(datetime(2026, 11, 24, hour, minute, tzinfo=timezone.utc).timestamp())
+
+    def wall(hour, minute=0):
+        return {"wall": wall_at(hour, minute), "zone": "America/New_York", "all_day": False}
+
+    assert row == {"method": "request", "uid": "planning@example.test", "organizer": other,
+                   "organizer_verified": True, "for_mailbox": True, "sequence": 2,
+                   "dtstamp": int(datetime(2026, 11, 21, 10, tzinfo=timezone.utc).timestamp()),
+                   "occurrence": wall(9), "this_and_future": False, "summary": "Design, café <Preview>",
+                   "location": "South studio", "start": wall(10, 30), "end": wall(11, 30)}, row
+    assert "revised invitation" in detail["text"] and not detail.get("calendar_only")
+    attachment, = detail["attachments"]
+    assert attachment["filename"] == "invite.ics"
+    query = urllib.parse.urlencode({"reference": detail["reference"], "content_revision": detail["content_revision"], "index": 0})
+    downloaded = hosted.request(test.webmail + "/webmail/api/attachment?" + query, headers=session, context=test.tls_context)
+    assert downloaded[0] == 200 and downloaded[2].decode().splitlines() == source.splitlines()
+
+    cancel = EmailMessage()
+    cancel.set_content(event("CANCEL", "RECURRENCE-ID;RANGE=THISANDFUTURE;TZID=America/New_York:20261124T090000",
+                             sequence=3), subtype="calendar", params={"method": "CANCEL"})
+    detail = deliver("Calendar preview canceled occurrence", cancel)
+    row, = detail["calendar_invites"]
+    assert detail["calendar_only"] is True and row["method"] == "cancel" and row["sequence"] == 3
+    assert row["occurrence"] == wall(9) and row["this_and_future"] and row["start"] is None
+
+    copied = EmailMessage()
+    copied.set_content(event("REQUEST", "DTSTART;VALUE=DATE:20261124", "DTEND;VALUE=DATE:20261125", "SUMMARY:Personal day",
+                            organizer="forwarded@example.test", attendee="someone-else@example.test"),
+                      subtype="calendar", params={"method": "REQUEST"})
+    detail = deliver("Calendar preview forwarded all day", copied)
+    row, = detail["calendar_invites"]
+    assert not row["organizer_verified"] and not row["for_mailbox"] and row["organizer"] == "forwarded@example.test"
+    assert row["start"] == {"wall": wall_at(0), "zone": None, "all_day": True}
+    assert row["end"]["wall"] == wall_at(0) + 86400
+
+    invalid = EmailMessage()
+    invalid.set_content("Keep this literal --calendar-fixture string in the body.")
+    invalid.add_attachment(source, subtype="calendar", params={"method": "CANCEL"}, filename="mismatch.ics")
+    invalid.add_attachment(source, subtype="calendar", filename="ordinary.ics")
+    invalid.add_attachment(source, subtype="calendar", params={"x-method": "REQUEST"}, filename="other.ics")
+    duplicated = source.replace("SUMMARY:", "UID:other-event@example.test\r\nSUMMARY:")
+    invalid.add_attachment(duplicated, subtype="calendar", params={"method": "REQUEST"}, filename="duplicate.ics")
+    invalid.add_attachment(source, subtype="calendar", params={"method": "REQUEST"}, filename="encoding.ics")
+    invalid.get_payload()[-1].replace_header("Content-Transfer-Encoding", "x-unknown")
+    invalid.set_boundary("calendar-fixture")
+    fake_part = f"Content-Type: text/calendar; method=REQUEST\r\n\r\n{source.replace('café', 'cafe')}"
+    invalid.preamble = fake_part
+    invalid.epilogue = fake_part
+    detail = deliver("Calendar preview ignored MIME", invalid)
+    assert "calendar_invites" not in detail and "--calendar-fixture string in the body." in detail["text"]
+    assert [part["filename"] for part in detail["attachments"]] == [
+        "mismatch.ics", "ordinary.ics", "other.ics", "duplicate.ics", "encoding.ics",
+    ]
+    assert test.api(session, "calendars") == dav_state
+    assert must(client.request("PROPFIND", home, headers={"Depth": "1"}), 207)[1] == before
+    assert test.api(foreign, "messages?folder=INBOX&q=planning")[1]["total"] == 0
+    print("Verified MIME invitation previews, explicit time zones, cancellations, ownership, downloads, and unchanged DAV state.")
 
 
 def check_calendar_download(test, owner, other):
@@ -960,6 +1062,7 @@ def main():
                 other = test.provision("dav-other")
                 expected = check_resources(test, owner, other)
                 check_scanning(DavClient(test, owner), expected)
+                check_invitation_previews(test, owner, other)
                 check_calendar_download(test, owner, other)
                 importer, calendar_id, submit = check_calendar_import(test, owner, other)
                 editor, item, resource, revision = check_calendar_writes(test, other)

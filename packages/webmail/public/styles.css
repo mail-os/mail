@@ -234,6 +234,17 @@ input[type=checkbox] { accent-color: var(--accent); }
 .wm-read-toolbar { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 20px; }
 .wm-read-subject { font-size: 22px; line-height: 1.35; margin: 10px 0 20px; overflow-wrap: anywhere; }
 .wm-read-attach { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+.wm-invitations { display: grid; gap: 10px; margin-block: 16px; }
+.wm-invitation { padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--toolbar); overflow-wrap: anywhere; }
+.wm-invitation-kind { display: flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 650; color: var(--accent); }
+.wm-invitation h3 { margin: 6px 0 10px; font-size: 17px; font-weight: 700; }
+.wm-invitation dl { display: grid; gap: 5px; margin: 0; font-size: 13px; }
+.wm-invitation dl > div { display: grid; grid-template-columns: minmax(5.5rem, .4fr) minmax(0, 1fr); column-gap: 8px; }
+.wm-invitation dt { color: var(--muted); }
+.wm-invitation dd { margin: 0; }
+.wm-invitation-verified { display: inline-block; margin-inline-start: 8px; color: var(--muted); font-size: 11px; }
+.wm-invitation-source { margin-top: 12px; color: var(--muted); font-size: 13px; }
+.wm-invitation-source summary { cursor: pointer; }
 .wm-read-attach:not(:has(.wm-attach-chip)), .wm-format-control:not(:has(button, .wm-image-status)) { display: none; }
 .wm-attach-chip { display: inline-flex; align-items: center; gap: 7px; max-width: 100%; padding: 7px 10px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; color: var(--accent); font-size: 12px; text-decoration: none; overflow-wrap: anywhere; }
 .wm-attach-chip:hover { background: var(--hover); }

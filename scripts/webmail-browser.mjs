@@ -551,11 +551,29 @@ async function calendarSharingJourney(captain) {
   await context.close()
 }
 
+async function invitationJourney(page, phone = false) {
+  await page.goto(url + '/')
+  await button(page, /Thursday studio reservation/).click()
+  const invitation = page.getByRole('region', { name: 'Calendar invitations', exact: true })
+  await heading(invitation, 'Studio reservation').waitFor()
+  await invitation.getByText('Calendar invitation', { exact: true }).waitFor()
+  await invitation.getByText(sender, { exact: true }).waitFor()
+  await invitation.getByText('Verified sender', { exact: true }).waitFor()
+  assert.equal(await invitation.getByText(/America\/New_York/).count(), 2)
+  await invitation.getByText('South room <Studio>', { exact: true }).waitFor()
+  assert.equal(await invitation.locator('studio').count(), 0)
+  await page.getByRole('region', { name: 'Message reader' }).getByText('We have the south room from 10 to noon.', { exact: true }).waitFor()
+  await fitsViewport(page)
+  await screenshot(page, phone ? 'phone-calendar-invitation' : 'desktop-calendar-invitation')
+}
+
 try {
   const desktop = await signIn()
   await desktopJourney(desktop)
   const phone = await signIn({ phone: true })
   await phoneJourney(phone)
+  await invitationJourney(desktop)
+  await invitationJourney(phone, true)
   await calendarSharingJourney(desktop)
   assert.deepEqual(errors, [], 'Browser pages raised uncaught errors')
   process.stdout.write(`${engine} passed the desktop and phone webmail journeys.\n`)

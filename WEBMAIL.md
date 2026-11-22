@@ -140,9 +140,19 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   preview the file before importing. The preview shows event dates and reports
   individual errors. Imports skip matching event UIDs in the destination.
   Files may contain up to 1,000 events or occurrences and be up to 1 MiB.
+- Open a scheduling email to preview an invitation, update, or cancellation.
+  The reader shows the organizer, the supplied time zone or all-day dates,
+  and the original date of a changed occurrence. It shows **Verified sender**
+  when the verified author of the message matches the organizer's address.
+  These are read-only previews. Named calendar attachments remain downloadable.
 
 ### Calendar API
 
+- Message details include `calendar_invites` for recognized `text/calendar`
+  `REQUEST` and `CANCEL` parts. Each entry includes the organizer, UID,
+  sequence, DTSTAMP, and any original occurrence. Wall times are supplied as
+  seconds on the organizer's clock with a separate time zone label. Preview
+  reads leave calendar resources and outgoing mail untouched.
 - `GET /webmail/api/calendars` lists the signed-in mailbox's calendars.
   `POST /webmail/api/calendars` creates one from a JSON `name`. Send
   `PATCH /webmail/api/calendars/{id}` with `color` set to a six-digit hex

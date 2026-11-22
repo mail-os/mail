@@ -1,4 +1,5 @@
 import type { EmbeddedImage } from './mail-reader'
+import type { InvitationPreview } from './mail-invitations'
 
 export interface Flags { seen: boolean, answered: boolean, flagged: boolean, draft: boolean, deleted: boolean }
 export interface MessageRef {
@@ -36,6 +37,8 @@ export interface MessageDetail extends MessageSummary {
   placement?: MessagePlacement
   attention?: AttentionStatus
   notifications?: MailNotificationRules
+  calendar_invites?: InvitationPreview[]
+  calendar_only?: boolean
 }
 export type MailNotificationRule = 'default' | 'notify' | 'quiet'
 export type MailNotificationScope = 'sender' | 'thread'

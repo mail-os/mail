@@ -61,6 +61,7 @@ const ascii_compat = @import("ascii-compat");
 const caldav_store = @import("../storage/caldav_store.zig");
 const caldav = @import("../protocol/caldav.zig");
 const calendar_import = @import("webmail_calendar_import.zig");
+const calendar_invite = @import("webmail_calendar_invite.zig");
 const calendar_events = @import("webmail_calendar_events.zig");
 const calendar_clock = @import("../protocol/icalendar_time.zig");
 const recovery = @import("webmail_recovery.zig");
@@ -3133,7 +3134,8 @@ fn handleMessageDetail(server: *WebmailHttpServer, conn: *webmail_tls.Stream, ar
     const author = if (placement) |value| value.verified_author else "";
     const keys = try service_mod.json(arena, try ids.keys(arena));
     const notifications = try server.db.browserNotificationRules(sess.username, msg.version.?.reference, keys, author);
-    try writeMessageDetail(w, msg, placement, rule, workflow.status(msg.version.?.reference, "", "", "", ids), notifications, arena);
+    const invitations = try calendar_invite.previews(arena, msg.calendar_parts, sess.username, author);
+    try writeMessageDetail(w, msg, placement, rule, workflow.status(msg.version.?.reference, "", "", "", ids), notifications, invitations, arena);
     try sendRevisionJson(conn, arena, 200, body.items, null, msg.version.?.revision);
 }
 
@@ -3304,7 +3306,7 @@ fn writeMessageSummary(w: anytype, m: maildir.MessageSummary, version: ?maildir.
     try w.writeAll("}");
 }
 
-fn writeMessageDetail(w: anytype, m: maildir.MessageDetail, placement: ?message_refs.Placement, rule: ?categories.Destination, workflow: attention.Status, notifications: database.Database.NotificationRules, a: std.mem.Allocator) !void {
+fn writeMessageDetail(w: anytype, m: maildir.MessageDetail, placement: ?message_refs.Placement, rule: ?categories.Destination, workflow: attention.Status, notifications: database.Database.NotificationRules, invitations: []const calendar_invite.Preview, a: std.mem.Allocator) !void {
     try w.print("{{\"uid\":{d},\"from\":", .{m.uid});
     try writeJsonString(w, m.from);
     try w.writeAll(",\"folder\":");
@@ -3350,6 +3352,11 @@ fn writeMessageDetail(w: anytype, m: maildir.MessageDetail, placement: ?message_
     try w.writeAll(try service_mod.json(a, workflow));
     try w.writeAll(",\"notifications\":");
     try w.writeAll(try service_mod.json(a, notifications));
+    if (invitations.len != 0) {
+        try w.writeAll(",\"calendar_invites\":");
+        try w.writeAll(try service_mod.json(a, invitations));
+        if (m.calendar_only) try w.writeAll(",\"calendar_only\":true");
+    }
     if (placement) |source| {
         try w.writeAll(",\"placement\":{\"original_folder\":");
         try writeJsonString(w, source.original_folder);

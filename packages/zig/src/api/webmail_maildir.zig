@@ -26,6 +26,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const categories = @import("../message/categories.zig");
 const attention = @import("webmail_attention.zig");
+const calendar_invite = @import("webmail_calendar_invite.zig");
 const search_index = @import("webmail_index.zig");
 const html_text = @import("../antispam/html_text.zig");
 const thread_ids = @import("../message/thread_ids.zig");
@@ -123,6 +124,8 @@ pub const MessageDetail = struct {
     html_body: []const u8,
     flags: Flags,
     attachments: []const AttachmentInfo,
+    calendar_parts: []const calendar_invite.Part = &.{},
+    calendar_only: bool = false,
     size: u64,
 };
 
@@ -911,6 +914,8 @@ fn parseDetail(allocator: std.mem.Allocator, folder: []const u8, uid: i64, name:
         .html_body = body.html,
         .flags = flagsFrom(name),
         .attachments = body.attachments,
+        .calendar_parts = body.calendar_parts,
+        .calendar_only = body.calendar_parts.len != 0 and calendar_invite.mimeMethod(headers.content_type) != null,
         .size = raw.len,
     };
 }
@@ -1414,6 +1419,7 @@ const BodyParts = struct {
     html: []const u8 = "",
     has_attachments: bool = false,
     attachments: []const AttachmentInfo = &[_]AttachmentInfo{},
+    calendar_parts: []const calendar_invite.Part = &.{},
 };
 
 /// Find the end of the header block (the blank line). Returns the index just
@@ -1508,23 +1514,27 @@ fn extractBody(allocator: std.mem.Allocator, raw: []const u8, mode: BodyMode) !B
     const body = if (he < raw.len) raw[he..] else "";
 
     const ctype = try getHeader(allocator, header_block, "Content-Type");
+    var parts: std.ArrayList(calendar_invite.Part) = .empty;
 
-    if (ascii_compat.indexOfIgnoreCase(ctype, "multipart/") != null) {
-        return parseMultipartMode(allocator, ctype, body, 0, mode);
+    if (std.ascii.startsWithIgnoreCase(ctype, "multipart/")) {
+        var parsed = try parseMultipartMode(allocator, ctype, body, 0, mode, &parts);
+        parsed.calendar_parts = parts.items;
+        return parsed;
     }
 
     const cte = try getHeader(allocator, header_block, "Content-Transfer-Encoding");
+    if (mode == .full) try captureCalendarPart(allocator, &parts, ctype, cte, body);
     if (try attachmentName(allocator, header_block, ctype)) |name| {
         if (mode == .preview) return .{ .has_attachments = true };
         const files = try allocator.alloc(AttachmentInfo, 1);
         files[0] = try readAttachment(allocator, body, ctype, cte, name, mode);
-        return .{ .has_attachments = true, .attachments = files };
+        return .{ .has_attachments = true, .attachments = files, .calendar_parts = parts.items };
     }
     const decoded = decodeBody(allocator, body, cte) catch body;
     if (ascii_compat.indexOfIgnoreCase(ctype, "text/html") != null) {
         return BodyParts{ .html = decoded, .text = "" };
     }
-    return BodyParts{ .text = decoded, .html = "" };
+    return .{ .text = decoded, .calendar_parts = parts.items };
 }
 
 /// Cap on nested multipart depth. A crafted message with deeply nested
@@ -1532,11 +1542,22 @@ fn extractBody(allocator: std.mem.Allocator, raw: []const u8, mode: BodyMode) !B
 /// overflows. Real mail nests 2-3 levels; 10 is generous.
 const max_multipart_depth = 10;
 
-fn parseMultipart(allocator: std.mem.Allocator, ctype: []const u8, body: []const u8, depth: u32) !BodyParts {
-    return parseMultipartMode(allocator, ctype, body, depth, .full);
+const MultipartBoundary = struct { start: usize, after: usize, closes: bool };
+
+fn nextMultipartBoundary(body: []const u8, delimiter: []const u8, from: usize) ?MultipartBoundary {
+    var offset = from;
+    while (std.mem.indexOfPos(u8, body, offset, delimiter)) |start| {
+        offset = start + delimiter.len;
+        if (start != 0 and body[start - 1] != '\n') continue;
+        const end = std.mem.indexOfScalarPos(u8, body, offset, '\n') orelse body.len;
+        const tail = std.mem.trimEnd(u8, body[offset..end], " \t\r");
+        if (tail.len == 0 or std.mem.eql(u8, tail, "--"))
+            return .{ .start = start, .after = @min(end + 1, body.len), .closes = tail.len != 0 };
+    }
+    return null;
 }
 
-fn parseMultipartMode(allocator: std.mem.Allocator, ctype: []const u8, body: []const u8, depth: u32, mode: BodyMode) !BodyParts {
+fn parseMultipartMode(allocator: std.mem.Allocator, ctype: []const u8, body: []const u8, depth: u32, mode: BodyMode, calendar_parts: *std.ArrayList(calendar_invite.Part)) !BodyParts {
     // Bound recursion: beyond the cap, treat the remainder as opaque text.
     if (depth >= max_multipart_depth) return BodyParts{ .text = body };
 
@@ -1549,10 +1570,12 @@ fn parseMultipartMode(allocator: std.mem.Allocator, ctype: []const u8, body: []c
     var result = BodyParts{};
     var attachments: std.ArrayList(AttachmentInfo) = .empty;
 
-    var it = std.mem.splitSequence(u8, body, delim);
-    while (it.next()) |part_raw| {
-        const part = std.mem.trim(u8, part_raw, "\r\n");
-        if (part.len == 0 or std.mem.eql(u8, part, "--")) continue;
+    var marker = nextMultipartBoundary(body, delim, 0) orelse return .{ .text = body };
+    while (!marker.closes) {
+        const next = nextMultipartBoundary(body, delim, marker.after);
+        const part = std.mem.trim(u8, body[marker.after..if (next) |boundary_line| boundary_line.start else body.len], "\r\n");
+        marker = next orelse .{ .start = body.len, .after = body.len, .closes = true };
+        if (part.len == 0) continue;
 
         const phe = headerEnd(part);
         const part_headers = part[0..phe];
@@ -1560,6 +1583,7 @@ fn parseMultipartMode(allocator: std.mem.Allocator, ctype: []const u8, body: []c
 
         const pct = try getHeader(allocator, part_headers, "Content-Type");
         const pcte = try getHeader(allocator, part_headers, "Content-Transfer-Encoding");
+        if (mode == .full and next != null) try captureCalendarPart(allocator, calendar_parts, pct, pcte, part_body);
         if (try attachmentName(allocator, part_headers, pct)) |name| {
             result.has_attachments = true;
             if (mode != .preview) try attachments.append(allocator, try readAttachment(allocator, part_body, pct, pcte, name, mode));
@@ -1570,9 +1594,9 @@ fn parseMultipartMode(allocator: std.mem.Allocator, ctype: []const u8, body: []c
             result.html = decodeBody(allocator, part_body, pcte) catch part_body;
         } else if (ascii_compat.indexOfIgnoreCase(pct, "text/plain") != null and result.text.len == 0) {
             result.text = decodeBody(allocator, part_body, pcte) catch part_body;
-        } else if (ascii_compat.indexOfIgnoreCase(pct, "multipart/") != null) {
+        } else if (std.ascii.startsWithIgnoreCase(pct, "multipart/")) {
             // Nested multipart (e.g. multipart/alternative inside multipart/mixed).
-            const nested = parseMultipartMode(allocator, pct, part_body, depth + 1, mode) catch BodyParts{};
+            const nested = parseMultipartMode(allocator, pct, part_body, depth + 1, mode, calendar_parts) catch BodyParts{};
             if (result.text.len == 0) result.text = nested.text;
             if (result.html.len == 0) result.html = nested.html;
             if (nested.has_attachments) result.has_attachments = true;
@@ -1582,6 +1606,26 @@ fn parseMultipartMode(allocator: std.mem.Allocator, ctype: []const u8, body: []c
 
     result.attachments = try attachments.toOwnedSlice(allocator);
     return result;
+}
+
+fn captureCalendarPart(a: std.mem.Allocator, parts: *std.ArrayList(calendar_invite.Part), mime: []const u8, encoding: []const u8, raw: []const u8) !void {
+    if (parts.items.len >= calendar_invite.max_parts or raw.len > calendar_invite.max_part_bytes * 4) return;
+    const method = calendar_invite.mimeMethod(mime) orelse return;
+    const decoded = if (std.ascii.eqlIgnoreCase(encoding, "base64")) decodeBase64(a, raw) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    } else if (std.ascii.eqlIgnoreCase(encoding, "quoted-printable"))
+        try decodeQuotedPrintable(a, raw)
+    else if (encoding.len == 0 or std.ascii.eqlIgnoreCase(encoding, "7bit") or std.ascii.eqlIgnoreCase(encoding, "8bit") or std.ascii.eqlIgnoreCase(encoding, "binary"))
+        raw
+    else
+        return;
+    const body = std.mem.trimEnd(u8, decoded, "\r\n");
+    if (body.len == 0 or body.len > calendar_invite.max_part_bytes) return;
+    for (parts.items) |part| {
+        if (part.method == method and std.mem.eql(u8, part.body, body)) return;
+    }
+    try parts.append(a, .{ .method = method, .body = body });
 }
 
 const AttachmentName = struct { filename: []const u8, id: []const u8 };

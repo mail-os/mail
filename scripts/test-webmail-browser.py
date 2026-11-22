@@ -45,6 +45,15 @@ def seed_inbox(fixture, owner, sender):
             message.add_alternative(f"<p><strong>For Tuesday</strong></p><p>{body}</p>", subtype="html")
         if index == 3:
             message.add_attachment(RECEIPT, maintype="text", subtype="plain", filename="receipt-1046.txt")
+        if subject == "Thursday studio reservation":
+            invite = "\r\n".join((
+                "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail//Browser Fixture//EN", "METHOD:REQUEST",
+                "BEGIN:VEVENT", "UID:studio-reservation@example.test", "DTSTAMP:20261121T100000Z",
+                "DTSTART;TZID=America/New_York:20261126T100000", "DTEND;TZID=America/New_York:20261126T120000",
+                f"ORGANIZER:mailto:{sender}", f"ATTENDEE:mailto:{owner}", "SUMMARY:Studio reservation",
+                "LOCATION:South room <Studio>", "END:VEVENT", "END:VCALENDAR", "",
+            ))
+            message.add_alternative(invite, subtype="calendar", params={"method": "REQUEST"})
         with fixture.smtp(sender) as connection:
             assert connection.send_message(message, from_addr=sender, to_addrs=[owner]) == {}
 
