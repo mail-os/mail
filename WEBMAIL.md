@@ -482,6 +482,22 @@ periods. `Depth: 0` returns an empty component after checking access to the
 collection. An unauthorized request returns 404. The free/busy privilege gives
 access to this report only.
 
+Viewers and editors can open the shared collection at that same URL.
+`PROPFIND` with `Depth: 1` lists public event URLs and ETags, and
+`calendar-query` and `calendar-multiget` return public event resources.
+Event URLs also support `GET` and `HEAD`. The collection's
+`DAV:current-user-privilege-set` describes whether the requester can edit.
+Use the shared collection URL directly and refresh the listing to reconcile
+changes. Shared collections are not listed in the teammate's calendar home
+and do not expose the owner's sync token, change tag, or change journal.
+
+Editors can `PUT` and `DELETE` public events in the existing shared
+collection. Use `If-None-Match: *` to create and `If-Match` with the latest
+ETag to update or delete. Private and confidential resources return 404,
+including recurring resources with a private or confidential occurrence.
+An editor's attempt to save a non-public replacement returns 422. The server
+checks the current grant on each request and again after scanning a write.
+
 ### Shared inboxes
 
 Create a mailbox for the shared address and enroll that account and its

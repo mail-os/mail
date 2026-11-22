@@ -14,6 +14,7 @@ import struct
 import tempfile
 from threading import Barrier, Event, Thread
 from urllib.parse import quote, urlencode
+from xml.etree import ElementTree as ET
 
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -444,6 +445,142 @@ def verify_editors(test, scan, owner, viewer, colleague, calendar_id):
     expect(change(test, owner_session, calendar_id, colleague, None))
 
 
+def verify_dav_editors(test, scan, owner, viewer, foreign, calendar_id):
+    captain, invited = test.login(owner), test.login(viewer)
+    owner_dav, guest_dav, other_dav = (DavClient(test, mailbox) for mailbox in (owner, viewer, foreign))
+    path = calendar_path(owner, CALENDAR)
+    roadmap = path + "/Roadmap.ics"
+    draft = path + "/Retrospective.ics"
+    hidden = [path + f"/{name}.ics" for name in ("Budget", "Confidential", "Public-series", "Missing")]
+    dav_xml = {"d": "DAV:", "c": CALDAV}
+    query = (f'<C:calendar-query xmlns:C="{CALDAV}" xmlns:D="DAV:">'
+             '<D:prop><D:getetag/><C:calendar-data/></D:prop><C:filter>'
+             '<C:comp-filter name="VCALENDAR"><C:comp-filter name="VEVENT">'
+             '<C:time-range start="20261208T000000Z" end="20261209T000000Z"/>'
+             '</C:comp-filter></C:comp-filter></C:filter></C:calendar-query>')
+    unrelated = calendar_path(viewer, CALENDAR) + "/Roadmap.ics"
+    multiget = (f'<C:calendar-multiget xmlns:C="{CALDAV}" xmlns:D="DAV:"><D:prop><D:getetag/><C:calendar-data/></D:prop>'
+                + "".join(f"<D:href>{href}</D:href>" for href in [roadmap, *hidden, unrelated])
+                + "</C:calendar-multiget>")
+    xml = {"Depth": "1", "Content-Type": "application/xml"}
+    ics = {"Content-Type": "text/calendar"}
+
+    def result(res, expected):
+        assert res[0] == expected, res
+        return res[1], res[2]
+
+    def responses(res):
+        _, raw = result(res, 207)
+        root = ET.fromstring(raw)
+        return {item.findtext("d:href", namespaces=dav_xml): item for item in root.findall("d:response", dav_xml)}
+
+    assert guest_dav.request("GET", roadmap, authenticated=False)[0] == 401
+    assert other_dav.request("GET", roadmap)[0] == 404
+    assert other_dav.request("OPTIONS", path)[0] == 404
+    expect(change(test, captain, calendar_id, viewer, "viewer"))
+    for tls in (True, False):
+        headers, content = result(guest_dav.request("GET", roadmap, tls=tls), 200)
+        assert b"SUMMARY:Roadmap" in content and headers["Cache-Control"] == "private, no-store"
+        head, head_body = result(guest_dav.request("HEAD", roadmap, tls=tls), 200)
+        assert head["ETag"] == headers["ETag"] and int(head["Content-Length"]) == len(content) and head_body == b""
+        result(guest_dav.request("GET", roadmap, headers={"If-None-Match": headers["ETag"]}, tls=tls), 304)
+        for href in hidden:
+            failure_headers, failure_body = result(guest_dav.request("GET", href, headers={"If-Match": "*"}, tls=tls), 404)
+            assert "ETag" not in failure_headers and failure_body == b""
+            result(guest_dav.request("PROPFIND", href, tls=tls), 404)
+            result(guest_dav.request("OPTIONS", href, tls=tls), 404)
+        options, _ = result(guest_dav.request("OPTIONS", path, tls=tls), 200)
+        assert "calendar-access" in options["DAV"]
+
+        listing = responses(guest_dav.request("PROPFIND", path, headers=xml, tls=tls))
+        assert len(listing) == 2 and roadmap in listing, listing
+        collection = next(value for href, value in listing.items() if href != roadmap)
+        assert collection.find(".//d:sync-token", dav_xml) is None
+        assert collection.find(".//d:sync-collection", dav_xml) is None
+        assert collection.find(".//d:privilege/d:read", dav_xml) is not None
+        assert collection.find(".//d:privilege/d:write-content", dav_xml) is None
+        assert listing[roadmap].findtext(".//d:getetag", namespaces=dav_xml) == headers["ETag"]
+        assert list(responses(guest_dav.request("PROPFIND", roadmap, tls=tls))) == [roadmap]
+        matching = responses(guest_dav.request("REPORT", path, query, xml, tls=tls))
+        assert list(matching) == [roadmap]
+        assert "SUMMARY:Roadmap" in matching[roadmap].findtext(".//c:calendar-data", namespaces=dav_xml)
+        later = query.replace("20261208", "20261224").replace("20261209", "20261225")
+        assert not responses(guest_dav.request("REPORT", path, later, xml, tls=tls))
+        requested = responses(guest_dav.request("REPORT", path, multiget, xml, tls=tls))
+        assert requested[roadmap].findtext(".//d:getetag", namespaces=dav_xml) == headers["ETag"]
+        for href in [*hidden, unrelated]:
+            assert requested[href].findtext("d:status", namespaces=dav_xml) == "HTTP/1.1 404 Not Found"
+            assert requested[href].find(".//c:calendar-data", dav_xml) is None
+        result(guest_dav.request("PUT", roadmap, content, ics, tls=tls), 404)
+        result(guest_dav.request("PUT", draft, content, ics, tls=tls), 404)
+        result(guest_dav.request("DELETE", roadmap, tls=tls), 404)
+
+    expect(change(test, captain, calendar_id, viewer, "editor"))
+    _, properties = result(guest_dav.request("PROPFIND", path), 207)
+    assert b"<D:write-content/>" in properties and b"<D:write-properties/>" not in properties
+    owner_properties = responses(owner_dav.request("PROPFIND", path))
+    token = next(iter(owner_properties.values())).findtext(".//d:sync-token", namespaces=dav_xml)
+    assert token
+    sync = f'<D:sync-collection xmlns:D="DAV:"><D:sync-token>{token}</D:sync-token><D:sync-level>1</D:sync-level></D:sync-collection>'
+    result(guest_dav.request("REPORT", path, sync, {"Depth": "0", "Content-Type": "application/xml"}), 404)
+    replacement = content.replace(b"UID:Roadmap", b"UID:Retrospective").replace(b"SUMMARY:Roadmap", b"SUMMARY:Retrospective")
+    create = {**ics, "If-None-Match": "*"}
+    created, _ = result(guest_dav.request("PUT", draft, replacement, create), 201)
+    result(guest_dav.request("PUT", draft, replacement, create), 412)
+    assert result(owner_dav.request("GET", draft), 200)[0]["ETag"] == created["ETag"]
+    original = {**ics, "If-Match": created["ETag"]}
+    result(guest_dav.request("PUT", draft, replacement.replace(b"CLASS:PUBLIC", b"CLASS:PRIVATE"), original), 422)
+    result(guest_dav.request("PUT", hidden[0], replacement, create), 404)
+    result(guest_dav.request("DELETE", hidden[0]), 404)
+    result(guest_dav.request("DELETE", path), 404)
+    result(guest_dav.request("PROPPATCH", path, "<propertyupdate/>", xml), 404)
+    result(guest_dav.request("PROPFIND", f"/calendars/{owner}/"), 404)
+    amended = replacement.replace(b"SUMMARY:Retrospective", b"SUMMARY:New retrospective")
+    updated, _ = result(guest_dav.request("PUT", draft, amended, original, tls=False), 204)
+    assert updated["ETag"] != created["ETag"]
+    result(guest_dav.request("DELETE", draft, headers=original), 412)
+    assert expect(test.api(invited, event_query(calendar_id, q="New retrospective")))["events"][0]["etag"] == updated["ETag"]
+
+    scan.scanning.clear()
+    scan.resume.clear()
+    latest = {**ics, "If-Match": updated["ETag"]}
+    content_to_scan = amended.replace(b"New retrospective", REVOKE_DURING_SCAN.encode())
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(guest_dav.request, "PUT", draft, content_to_scan, latest)
+        try:
+            assert scan.scanning.wait(timeout=5), "Delegated CalDAV edit did not reach scanning"
+            expect(change(test, captain, calendar_id, viewer, "viewer"))
+        finally:
+            scan.resume.set()
+        result(pending.result(), 404)
+    assert result(owner_dav.request("GET", draft), 200)[1] == amended
+    result(guest_dav.request("DELETE", draft, headers=latest), 404)
+    expect(change(test, captain, calendar_id, viewer, "editor"))
+    result(guest_dav.request("DELETE", draft, headers=latest), 204)
+    result(owner_dav.request("GET", draft), 404)
+
+    with closing(HTTPSConnection("127.0.0.1", guest_dav.https, context=guest_dav.context, timeout=15)) as client:
+        client.request("GET", roadmap, headers=guest_dav.auth)
+        with client.getresponse() as reader:
+            assert reader.status == 200 and b"Roadmap" in reader.read()
+            etag = reader.headers["ETag"]
+        connection = client.sock
+        assert connection is not None
+        write_event(test, owner, "Roadmap", "PRIVATE", expected=204)
+        client.request("GET", roadmap, headers={**guest_dav.auth, "If-None-Match": etag})
+        assert client.sock is connection
+        with client.getresponse() as private:
+            assert private.status == 404 and "ETag" not in private.headers and private.read() == b""
+        assert not responses(guest_dav.request("REPORT", path, query, xml))
+        write_event(test, owner, "Roadmap", "PUBLIC", expected=204)
+        expect(change(test, captain, calendar_id, viewer, None))
+        client.request("PROPFIND", path, headers={**guest_dav.auth, **xml})
+        assert client.sock is connection
+        with client.getresponse() as revoked:
+            assert revoked.status == 404 and revoked.read() == b""
+    expect(change(test, captain, calendar_id, viewer, "viewer"))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
@@ -466,6 +603,7 @@ def main():
             command(test, "team", "create", "studio", "Studio", owner)
             calendar_id = verify(test, db, owner, viewer, colleague, foreign)
             verify_editors(test, scan, owner, viewer, colleague, calendar_id)
+            verify_dav_editors(test, scan, owner, viewer, foreign, calendar_id)
             verify_availability(test, owner, viewer)
 
         with test.daemon():
@@ -474,7 +612,10 @@ def main():
             assert [item["access"] for item in shares(test, invited)] == ["viewer"]
             assert [row["summary"] for row in expect(test.api(invited, query))["events"]] == ["Roadmap"]
             path = calendar_path(owner, CALENDAR)
-            assert dav_busy(DavClient(test, viewer), path)
+            guest = DavClient(test, viewer)
+            assert dav_busy(guest, path)
+            assert guest.request("GET", path + "/Roadmap.ics")[0] == 200
+            assert guest.request("GET", path + "/Budget.ics")[0] == 404
             deleted = DavClient(test, owner).request("DELETE", path)
             assert deleted[0] == 204, deleted
             assert shares(test, invited) == []
@@ -488,8 +629,9 @@ def main():
             assert shares(test, invited) == []
             expect(test.api(invited, event_query(calendar_id)), 404)
             dav_busy(DavClient(test, viewer), calendar_path(owner, CALENDAR), status=404)
+            assert DavClient(test, viewer).request("GET", calendar_path(owner, CALENDAR) + "/Replacement.ics")[0] == 404
 
-    print("Verified calendar share roles, private free/busy over webmail and CalDAV, recurrence, time zones, editor revision races, revocation, restart, and calendar ID reuse.")
+    print("Verified calendar sharing in webmail and CalDAV, including public event reads and writes, private free/busy, revision races, revocation, restart, and calendar ID reuse.")
 
 
 if __name__ == "__main__":
