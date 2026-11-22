@@ -69,6 +69,7 @@ async function verifyAppearance(page, scheme) {
       ['--muted', '--toolbar'], ['--muted', '--selected'], ['--muted', '--sidebar'],
       ['--text', '--list'], ['--muted', '--list'], ['--accent', '--selected'],
       ['--violet', '--sidebar'], ['--teal', '--sidebar'], ['--warning', '--sidebar'],
+      ['--accent', '--accent-soft'], ['--warning', '--warning-soft'],
       ['--on-primary', '--primary'], ['--message-selection-text', '--message-selection'],
       ['--message-selection-muted', '--message-selection'],
     ]
@@ -230,10 +231,13 @@ async function desktopJourney(page) {
   const sorting = page.getByText('Sender sorting', { exact: true })
   const destination = page.getByLabel(/Future mail from/)
   assert.equal(await destination.isVisible(), false)
-  await sorting.click()
+  const indicator = sorting.locator('.wm-disclosure-indicator')
+  assert.match(await indicator.evaluate(node => getComputedStyle(node).maskImage), /data:image/)
+  await sorting.press('Enter')
   await destination.waitFor()
-  await sorting.click()
+  await sorting.press('Enter')
   await destination.waitFor({ state: 'hidden' })
+  await sorting.blur()
   const tools = page.getByRole('group', { name: 'Message actions', exact: true })
   for (const name of ['Reply', 'Reply all', 'Forward', 'Archive message', 'Flag', 'Mark unread', 'Move this message', 'Trash']) {
     const control = button(tools, name)
@@ -245,12 +249,15 @@ async function desktopJourney(page) {
   await paper.locator('iframe[title="Email content"]').contentFrame().getByText('For Tuesday').waitFor()
   assert(await paper.evaluate(node => getComputedStyle(node).boxShadow === 'none'),
     'The message sits directly on the reading surface')
+  await page.locator('.wm-message-row--active:not(.wm-message-row--unread)').waitFor()
+  await page.mouse.move(1410, 910)
   await screenshot(page, 'desktop-inbox-light')
   await verifyAppearance(page, 'dark')
   await verifyMessageSelection(button(page, /Tuesday design handoff/), '.wm-msg-from')
   await button(page, 'Show plain text').click()
   await page.locator('.wm-read-text').getByText(/Please confirm the sidebar order/).waitFor()
   assert.match(await button(page, 'Show formatted email').locator('.mail-icon').evaluate(node => getComputedStyle(node).maskImage), /data:image/)
+  await page.mouse.move(1410, 910)
   await screenshot(page, 'desktop-inbox-dark')
   await page.emulateMedia({ colorScheme: 'light' })
   await button(tools, 'Archive message').press('Enter')
@@ -353,6 +360,7 @@ async function phoneJourney(page) {
   await page.waitForFunction(() => document.activeElement?.getAttribute('aria-controls') === 'mailNavigation')
   await openReceiptAndDownload(page)
   await heading(page, 'Your receipt #1046').waitFor()
+  await page.locator('.wm-receipt-meta .wm-avatar').waitFor()
   await page.locator('.wm-receipt-sender').getByText('Studio Hosting', { exact: true }).waitFor()
   await button(page, 'Reply').waitFor()
   await fitsViewport(page)
@@ -368,6 +376,17 @@ async function phoneJourney(page) {
   assert((await actions.getByRole('combobox', { name: 'Move destination' }).boundingBox()).height >= 44,
     'Move destination has a full-size touch target')
   await button(actions, 'Mark junk').waitFor()
+  await page.setViewportSize({ width: 390, height: 540 })
+  const reader = page.getByRole('region', { name: 'Message reader' })
+  const back = button(reader, 'Back to messages')
+  const originalBack = await back.boundingBox()
+  await reader.evaluate(node => { node.scrollTop = node.scrollHeight })
+  assert(await reader.evaluate(node => node.scrollTop > 0), 'The short phone viewport scrolls the reader')
+  const scrolledBack = await back.boundingBox()
+  assert.equal(scrolledBack.y, originalBack.y, 'Back to messages remains visible while scrolling')
+  assert((await actions.boundingBox()).y >= scrolledBack.y + scrolledBack.height,
+    'Message actions stay below the Back button while scrolling')
+  await reader.evaluate(node => { node.scrollTop = 0 })
   await page.setViewportSize({ width: 390, height: 844 })
   await screenshot(page, 'phone-reader')
   await page.emulateMedia({ colorScheme: 'light' })
@@ -379,6 +398,8 @@ async function phoneJourney(page) {
   const composer = page.getByRole('dialog', { name: 'Compose message' })
   const subject = composer.getByLabel('Subject', { exact: true })
   const body = composer.getByLabel('Message body')
+  const send = button(composer, 'Send')
+  assert((await send.boundingBox()).height >= 44, 'The phone Send button has a full-size touch target')
   await subject.fill('Keyboard draft')
   await body.fill('Save this draft when Escape closes the composer.')
   await body.press('Escape')

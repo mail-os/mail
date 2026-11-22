@@ -200,7 +200,7 @@ onUnmounted(() => { destroy(); destroyReminders() })
           <ul class="calendar-day-entries">
             <li :for="entry in day.entries">
               <button @click="openEvent(entry)" :class="'calendar-entry' + (entry.all_day ? ' calendar-entry-all-day' : '')" :style="'--calendar-color:' + eventColor(entry)" :title="entry.summary + ' · ' + nameFor(entry)">
-                <span class="calendar-entry-time" :text="entry.time"></span>
+                <span class="calendar-entry-time"><span class="mail-icon" :data-icon="entry.all_day ? 'calendar' : 'clock'" aria-hidden="true"></span><span :text="entry.time"></span></span>
                 <strong :text="entry.summary || 'Untitled event'"></strong>
                 <span :if="view === 'agenda' || view === 'day'" class="calendar-entry-meta" :text="entry.location || nameFor(entry)"></span>
                 <span :if="entry.status !== 'confirmed'" class="calendar-entry-meta" :text="entry.status"></span>
@@ -229,8 +229,8 @@ onUnmounted(() => { destroy(); destroyReminders() })
 <dialog :if="editorOpen" ref="eventDialog" class="wm-modal" aria-labelledby="calendar-editor-title" @cancel.prevent="closeEditor()">
   <form class="wm-composer calendar-editor" @submit.prevent="saveEvent()" :aria-busy="editorBusy">
     <div class="wm-composer-head">
-      <h2 id="calendar-editor-title" :text="editorLabel"></h2>
-      <button type="button" class="wm-composer-close" aria-label="Close editor" :disabled="editorBusy" @click="closeEditor()">✕</button>
+      <h2 id="calendar-editor-title" class="wm-composer-title"><span class="mail-icon" data-icon="calendar" aria-hidden="true"></span><span :text="editorLabel"></span></h2>
+      <button type="button" class="wm-composer-close" aria-label="Close editor" :disabled="editorBusy" @click="closeEditor()"><span class="mail-icon" data-icon="close" aria-hidden="true"></span></button>
     </div>
     <p :if="editorError" class="wm-composer-error" role="alert" :text="editorError"></p>
     <p :if="!editorLoaded && editorBusy" class="calendar-editor-state" role="status">Opening event…</p>
