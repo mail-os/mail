@@ -443,7 +443,19 @@ Editors can create, update, and delete public events through the calendar event
 API. Updates and deletions use the same `If-Match` requirement as owner edits.
 Mail checks the grant again when it writes the event, after preparing and
 scanning the request. Calendar exports require ownership. Free/busy grants
-currently appear in share metadata.
+allow `GET /webmail/api/calendar-free-busy?calendarId=…&start=…&end=…`.
+Owners, viewers, and editors can also query availability. Supply Unix seconds
+for a half-open range of at most 366 days. The response contains only merged
+busy periods as `{"busy":[{"start":…,"end":…}]}`. Private and confidential
+events block time. Transparent and cancelled events leave it free.
+
+The server resolves calendar dates and named time zones and applies supported
+daily, weekly, monthly, and yearly recurrence rules, explicit dates, exclusions,
+and individual occurrence overrides. A `422 availability_incomplete` response
+means the server could not calculate all busy times, for example with hourly
+rules or `RANGE=THISANDFUTURE` overrides. A `413 availability_limit` response
+means the calculation exceeded a limit. Treat either response as unknown
+availability.
 
 ### Shared inboxes
 

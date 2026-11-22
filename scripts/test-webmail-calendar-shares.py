@@ -20,6 +20,7 @@ teams = runpy.run_path(str(SCRIPTS / "test-webmail-teams.py"))
 Fixture, command, expect = (teams[name] for name in ("Fixture", "command", "expect"))
 DavClient = runpy.run_path(str(SCRIPTS / "test-dav-https.py"))["DavClient"]
 CALENDAR = "Studio planning"
+AVAILABILITY = "Availability cases"
 START = int(datetime(2026, 12, 1, tzinfo=timezone.utc).timestamp())
 END = int(datetime(2027, 1, 1, tzinfo=timezone.utc).timestamp())
 REVOKE_DURING_SCAN = "Editor access revoked during scanning"
@@ -68,9 +69,14 @@ def write_event(test, owner, name, classification="", recurring=False, expected=
             "SUMMARY:private occurrence", "CLASS:PRIVA", " TE",
         ])
     data.extend(["END:VEVENT", "END:VCALENDAR", ""])
-    path = f"/calendars/{owner}/{quote(CALENDAR, safe='')}/{name}.ics"
+    write_resource(test, owner, CALENDAR, name, data, expected)
+
+
+def write_resource(test, owner, calendar, name, data, expected=201):
+    path = f"/calendars/{owner}/{quote(calendar, safe='')}/{name}.ics"
     result = DavClient(test, owner).request("PUT", path, "\r\n".join(data), {"Content-Type": "text/calendar"})
     assert result[0] == expected, result
+    return path
 
 
 def change(test, session, calendar_id, grantee, access, team="studio"):
@@ -86,6 +92,18 @@ def shares(test, session):
 def event_query(calendar_id, **filters):
     return "calendar-events?" + urlencode(dict(calendarId=calendar_id, start=START, end=END,
                                               instances=1, **filters))
+
+
+def busy_query(calendar_id, start=START, end=END):
+    return "calendar-free-busy?" + urlencode(dict(calendarId=calendar_id, start=start, end=end))
+
+
+def timestamp(value):
+    return int(datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).timestamp())
+
+
+def busy_period(start, end):
+    return {"start": timestamp(start), "end": timestamp(end)}
 
 
 def create_calendar(test, owner_session):
@@ -160,10 +178,22 @@ def verify(test, db, owner, viewer, colleague, foreign):
     expect(change(test, captain, calendar_id, viewer, "free_busy"))
     assert shares(test, invited) == [dict(expected, access="free_busy")]
     expect(test.api(invited, query), 404)
+    available = busy_query(calendar_id)
+    expect(test.api({}, available), 401)
+    assert expect(test.api(invited, available)) == {"busy": [
+        busy_period("20261208T100000Z", "20261208T110000Z"),
+        busy_period("20261215T110000Z", "20261215T120000Z"),
+        busy_period("20261222T100000Z", "20261222T110000Z"),
+    ]}
+    expect(test.api(invited, f"calendar-events/{row['id']}?source=1"), 404)
+    expect(test.api(invited, f"calendar-export?calendarId={calendar_id}"), 404)
+    expect(test.api(teammate, available), 404)
+    expect(test.api(outsider, available), 404)
     expect(change(test, captain, calendar_id, viewer, None))
     expect(change(test, captain, calendar_id, viewer, None))
     assert shares(test, invited) == []
     expect(test.api(invited, query), 404)
+    expect(test.api(invited, available), 404)
 
     expect(change(test, captain, calendar_id, viewer, "viewer"))
     command(test, "team", "member", "studio", viewer, "remove")
@@ -179,6 +209,63 @@ def verify(test, db, owner, viewer, colleague, foreign):
         "team.calendar.share", "team.calendar.share",
     ], audit
     return calendar_id
+
+
+def verify_availability(test, owner, viewer):
+    captain, invited = test.login(owner), test.login(viewer)
+    calendar_id = expect(test.api(captain, "calendars", {"name": AVAILABILITY}), 201)["id"]
+    stamp = "DTSTAMP:20260301T000000Z"
+
+    def store(name, *properties, exceptions=()):
+        return write_resource(test, owner, AVAILABILITY, name, [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail availability fixture//EN",
+            "BEGIN:VEVENT", f"UID:{name}", stamp, f"SUMMARY:Sensitive {name}",
+            *properties, "END:VEVENT", *exceptions, "END:VCALENDAR", "",
+        ])
+
+    store("private-series", "CLASS:PRIVATE", "DTSTART;TZID=America/New_York:20260307T023000",
+          "DURATION:PT1H", "RRULE:FREQ=DAILY;COUNT=4",
+          "RDATE;VALUE=PERIOD;TZID=America/New_York:20260309T023000/PT30M",
+          "RDATE;TZID=America/New_York:20260313T023000",
+          "EXDATE;TZID=America/New_York:20260313T023000",
+          exceptions=(
+              "BEGIN:VEVENT", "UID:private-series", stamp,
+              "RECURRENCE-ID;TZID=America/New_York:20260310T023000", "DTSTART:20260311T130000Z",
+              "END:VEVENT",
+              "BEGIN:VEVENT", "UID:private-series", stamp,
+              "RECURRENCE-ID;TZID=America/New_York:20260311T023000", "STATUS:CANCELLED", "END:VEVENT",
+          ))
+    store("confidential", "CLASS:CONFIDENTIAL", "DTSTART:20260309T065000Z", "DTEND:20260309T071000Z")
+    store("adjacent", "DTSTART:20260309T071000Z", "DTEND:20260309T072000Z", "STATUS:TENTATIVE")
+    store("date-only", "DTSTART;VALUE=DATE:20260312")
+    store("transparent", "DTSTART:20260313T090000Z", "DURATION:PT1H", "TRANSP:TRANSPARENT")
+    store("cancelled", "DTSTART:20260314T090000Z", "DURATION:PT1H", "STATUS:CANCELLED")
+    store("excluded-boundary", "DTSTART:20260315T000000Z", "DURATION:PT1H")
+    start, end = timestamp("20260307T080000Z"), timestamp("20260315T000000Z")
+    query = busy_query(calendar_id, start, end)
+    expect(test.api(invited, query), 404)
+    expected = {"busy": [
+        busy_period("20260307T080000Z", "20260307T083000Z"),
+        busy_period("20260309T063000Z", "20260309T072000Z"),
+        busy_period("20260311T130000Z", "20260311T140000Z"),
+        busy_period("20260312T000000Z", "20260313T000000Z"),
+    ]}
+    for role in ("viewer", "editor", "free_busy"):
+        expect(change(test, captain, calendar_id, viewer, role))
+        assert expect(test.api(invited, query)) == expected
+    assert expect(test.api(captain, query)) == expected
+    assert expect(test.api(invited, busy_query(calendar_id, timestamp("20260313T000000Z"), end))) == {"busy": []}
+    for lower, upper in ((start, start), (end, start), (0, 367 * 86400), (-9223372036854775808, 0)):
+        expect(test.api(invited, busy_query(calendar_id, lower, upper)), 400)
+
+    unsupported = store("unsupported", "DTSTART:20260314T120000Z", "DURATION:PT15M", "RRULE:FREQ=HOURLY;COUNT=3")
+    result = expect(test.api(invited, query), 422)
+    assert result["error"] == "availability_incomplete" and "Sensitive" not in repr(result), result
+    assert DavClient(test, owner).request("DELETE", unsupported)[0] == 204
+    assert expect(test.api(invited, query)) == expected
+    expect(change(test, captain, calendar_id, viewer, None))
+    expect(test.api(invited, query), 404)
+    assert DavClient(test, owner).request("DELETE", f"/calendars/{owner}/{quote(AVAILABILITY, safe='')}")[0] == 204
 
 
 def verify_editors(test, scan, owner, viewer, colleague, calendar_id):
@@ -266,6 +353,7 @@ def main():
             command(test, "team", "create", "studio", "Studio", owner)
             calendar_id = verify(test, db, owner, viewer, colleague, foreign)
             verify_editors(test, scan, owner, viewer, colleague, calendar_id)
+            verify_availability(test, owner, viewer)
 
         with test.daemon():
             invited = test.login(viewer)
@@ -285,7 +373,7 @@ def main():
             assert shares(test, invited) == []
             expect(test.api(invited, event_query(calendar_id)), 404)
 
-    print("Verified calendar share roles, editor CRUD and revision races, private event isolation, revocation during scanning, audit rollback, restart, and calendar ID reuse.")
+    print("Verified calendar share roles, private free/busy with recurrence and time zones, editor CRUD and revision races, revocation, audit rollback, restart, and calendar ID reuse.")
 
 
 if __name__ == "__main__":

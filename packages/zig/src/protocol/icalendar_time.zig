@@ -2,6 +2,17 @@ const std = @import("std");
 const icalendar = @import("icalendar.zig");
 const Allocator = std.mem.Allocator;
 
+pub fn bundledTimezone(name: []const u8) ?[]const u8 {
+    const catalog = @embedFile("../api/webmail_dist/calendar_timezones.ics");
+    var buf: [160]u8 = undefined;
+    const marker = std.fmt.bufPrint(&buf, "BEGIN:VTIMEZONE\r\nTZID:{s}\r\n", .{name}) catch return null;
+    const start = std.mem.indexOf(u8, catalog, marker) orelse return null;
+    const after = start + marker.len;
+    const suffix = "END:VTIMEZONE\r\n";
+    const end = std.mem.indexOfPos(u8, catalog, after, suffix) orelse return null;
+    return catalog[start .. end + suffix.len];
+}
+
 pub const Date = struct {
     year: i64,
     month: u8,
@@ -257,13 +268,22 @@ pub const Zone = struct {
     }
 
     pub fn offsetAt(self: Zone, date: Date) i64 {
+        return self.wallOffset(date).offset;
+    }
+
+    pub fn isGap(self: Zone, date: Date) bool {
+        return self.wallOffset(date).gap;
+    }
+
+    fn wallOffset(self: Zone, date: Date) struct { offset: i64, gap: bool } {
         const wall = date.epoch();
         var earliest = self.rules[0];
         var latest: ?Transition = null;
+        var gap = false;
         for (self.rules) |rule| {
             if (rule.start.epoch() - rule.from < earliest.start.epoch() - earliest.from) earliest = rule;
-            _ = consider(&latest, rule, rule.start.epoch(), wall);
-            for (rule.dates.items) |extra| _ = consider(&latest, rule, extra.epoch() + if (extra.kind == .utc) rule.from else @as(i64, 0), wall);
+            _ = consider(&latest, &gap, rule, rule.start.epoch(), wall);
+            for (rule.dates.items) |extra| _ = consider(&latest, &gap, rule, extra.epoch() + if (extra.kind == .utc) rule.from else @as(i64, 0), wall);
             if (rule.rule) |yearly| {
                 if (yearly.count) |count| {
                     var remaining = count - 1; // DTSTART is the first occurrence.
@@ -272,7 +292,7 @@ pub const Zone = struct {
                         const occurrence = yearly.occurrence(rule.start, year) orelse continue;
                         const local = occurrence.epoch();
                         if (local <= rule.start.epoch()) continue;
-                        if (!consider(&latest, rule, local, wall)) break;
+                        if (!consider(&latest, &gap, rule, local, wall)) break;
                         remaining -= 1;
                     }
                     continue;
@@ -290,20 +310,23 @@ pub const Zone = struct {
                     if (yearly.until) |until| {
                         if (local - (if (until.kind == .utc) rule.from else @as(i64, 0)) > until.epoch()) continue;
                     }
-                    if (consider(&latest, rule, local, wall)) break;
+                    if (consider(&latest, &gap, rule, local, wall)) break;
                 }
             }
         }
-        return if (latest) |transition| transition.offset else earliest.from;
+        return .{ .offset = if (latest) |transition| transition.offset else earliest.from, .gap = gap };
     }
 };
 
 const Transition = struct { onset: i64, offset: i64 };
 
-fn consider(latest: *?Transition, rule: Observance, local: i64, wall: i64) bool {
+fn consider(latest: *?Transition, gap: *bool, rule: Observance, local: i64, wall: i64) bool {
     // RFC 5545 uses the offset before a forward jump for times in the gap.
     const effective = local + @max(rule.to - rule.from, 0);
-    if (wall < effective) return false;
+    if (wall < effective) {
+        if (wall >= local) gap.* = true;
+        return false;
+    }
     if (latest.* == null or latest.*.?.onset < effective) latest.* = .{ .onset = effective, .offset = rule.to };
     return true;
 }

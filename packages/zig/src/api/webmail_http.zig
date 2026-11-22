@@ -62,6 +62,7 @@ const caldav_store = @import("../storage/caldav_store.zig");
 const caldav = @import("../protocol/caldav.zig");
 const calendar_import = @import("webmail_calendar_import.zig");
 const calendar_events = @import("webmail_calendar_events.zig");
+const calendar_clock = @import("../protocol/icalendar_time.zig");
 const recovery = @import("webmail_recovery.zig");
 const health = @import("webmail_health.zig");
 const password_hasher = @import("../auth/password.zig");
@@ -78,7 +79,6 @@ const index_html = @embedFile("webmail_dist/index.html");
 const login_html = @embedFile("webmail_dist/login.html");
 const calendar_html = @embedFile("webmail_dist/calendar.html");
 const shared_html = @embedFile("webmail_dist/shared.html");
-const calendar_timezones = @embedFile("webmail_dist/calendar_timezones.ics");
 const recover_html = @embedFile("webmail_dist/recover.html");
 const status_html = @embedFile("webmail_dist/status.html");
 const styles_css = @embedFile("webmail_dist/styles.css");
@@ -567,6 +567,7 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.startsWith(u8, p, "/webmail/api/calendars/") and std.mem.eql(u8, req.method, "PATCH")) return handleCalendarColor(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-shares") and std.mem.eql(u8, req.method, "GET")) return handleCalendarShares(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-timezone") and std.mem.eql(u8, req.method, "GET")) return handleCalendarTimezone(server, conn, arena, req);
+    if (std.mem.eql(u8, p, "/webmail/api/calendar-free-busy") and std.mem.eql(u8, req.method, "GET")) return handleCalendarFreeBusy(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-reminders") and std.mem.eql(u8, req.method, "GET")) return handleCalendarReminders(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-reminders/dismiss") and std.mem.eql(u8, req.method, "POST")) return handleReminderDismiss(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-events") and std.mem.eql(u8, req.method, "GET")) return handleCalendarEvents(server, conn, arena, req);
@@ -2002,13 +2003,29 @@ fn handleCalendarTimezone(server: *WebmailHttpServer, conn: *webmail_tls.Stream,
     if (zone.len == 0 or zone.len > 100) return sendError(conn, arena, 400, "bad_request", "Enter an IANA time zone");
     for (zone) |byte| if (!std.ascii.isAlphanumeric(byte) and std.mem.indexOfScalar(u8, "_+./-", byte) == null)
         return sendError(conn, arena, 400, "bad_request", "Enter an IANA time zone");
-    const marker = try std.fmt.allocPrint(arena, "BEGIN:VTIMEZONE\r\nTZID:{s}\r\n", .{zone});
-    const start = std.mem.indexOf(u8, calendar_timezones, marker) orelse
+    const source = calendar_clock.bundledTimezone(zone) orelse
         return sendError(conn, arena, 404, "timezone_not_found", "The server has no definition for this time zone");
-    const suffix = "END:VTIMEZONE\r\n";
-    const relative_end = std.mem.indexOf(u8, calendar_timezones[start + marker.len ..], suffix) orelse return error.InvalidTimezoneData;
-    const source = calendar_timezones[start .. start + marker.len + relative_end + suffix.len];
     return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .icalendar = source }), null);
+}
+
+fn handleCalendarFreeBusy(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const dav = server.dav_store orelse return sendError(conn, arena, 503, "calendar_unavailable", "Calendar is unavailable on this server");
+    const calendar_id = std.fmt.parseInt(u64, req.queryParam(arena, "calendarId") orelse "", 10) catch
+        return sendError(conn, arena, 400, "bad_request", "Invalid calendar ID");
+    const start = std.fmt.parseInt(i64, req.queryParam(arena, "start") orelse "", 10) catch
+        return sendError(conn, arena, 400, "bad_request", "Invalid start timestamp");
+    const end = std.fmt.parseInt(i64, req.queryParam(arena, "end") orelse "", 10) catch
+        return sendError(conn, arena, 400, "bad_request", "Invalid end timestamp");
+    const result = dav.webCalendarBusyPeriods(arena, sess.username, calendar_id, .{ .start = start, .end = end }) catch |err| switch (err) {
+        error.InvalidRange => return sendError(conn, arena, 400, "bad_request", "Specify a positive calendar window of at most 366 days"),
+        error.CalendarNotFound, error.DavMailboxNotFound => return sendError(conn, arena, 404, "not_found", "Calendar not found"),
+        error.AvailabilityLimit => return sendError(conn, arena, 413, "availability_limit", "The calendar exceeds the availability calculation limit"),
+        error.AvailabilityUnsupported, error.UnsupportedTimezone, error.InvalidCalendar => return sendError(conn, arena, 422, "availability_incomplete", "Some busy times could not be calculated"),
+        else => return err,
+    };
+    return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .busy = result }), null);
 }
 
 fn handleCalendarCreate(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {

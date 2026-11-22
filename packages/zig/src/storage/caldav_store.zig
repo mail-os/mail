@@ -34,6 +34,7 @@ const database = @import("db_sqlite.zig");
 const accounts = @import("database.zig");
 const teams = @import("team_store.zig");
 const icalendar = @import("../protocol/icalendar.zig");
+const icalendar_busy = @import("../protocol/icalendar_busy.zig");
 const reminder = @import("../protocol/icalendar_reminder.zig");
 
 /// Get the current epoch timestamp in seconds (cross-platform).
@@ -1612,6 +1613,46 @@ pub const CalDavStore = struct {
         const permission = (try self.calendarPermissionLocked(access, calendar)) orelse return error.CalendarNotFound;
         if (permission == .free_busy) return error.CalendarNotFound;
         return self.queryCalendarEventsLocked(arena, calendar.user_id, id, window, query, include_series, if (permission == .owner) .owner else .shared);
+    }
+
+    const BusySnapshot = struct {
+        timezone: []const u8,
+        sources: []const icalendar_busy.Source,
+    };
+
+    pub fn webCalendarBusyPeriods(self: *Self, arena: Allocator, username: []const u8, id: u64, window: CalendarWindow) ![]icalendar_busy.Period {
+        try validateCalendarQuery(window, "");
+        if (window.start < -62135596800 or window.end >= 253402300800) return error.InvalidRange;
+        const snapshot = try self.snapshotWebCalendarBusyPeriods(arena, username, id);
+        return icalendar_busy.calculate(arena, self.allocator, snapshot.sources, .{ .start = window.start, .end = window.end }, snapshot.timezone);
+    }
+
+    fn snapshotWebCalendarBusyPeriods(self: *Self, arena: Allocator, username: []const u8, id: u64) !BusySnapshot {
+        const access = try self.beginCalendarAccess(username, .read);
+        defer access.deinit();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const calendar = self.calendars.get(id) orelse return error.CalendarNotFound;
+        _ = (try self.calendarPermissionLocked(access, calendar)) orelse return error.CalendarNotFound;
+
+        // Copy a bounded snapshot under the authorization lock, then expand
+        // recurrence outside both locks. No calendar source enters the response.
+        var sources: std.ArrayList(icalendar_busy.Source) = .empty;
+        var bytes: usize = 0;
+        var events = self.events.valueIterator();
+        while (events.next()) |event| {
+            if (event.calendar_id != id) continue;
+            bytes += event.ics_data.len;
+            if (bytes > 16 * 1024 * 1024 or sources.items.len == 32_000) return error.AvailabilityLimit;
+            try sources.append(arena, .{
+                .icalendar = try arena.dupe(u8, event.ics_data),
+                .start = event.dtstart,
+                .end = event.dtend,
+                .all_day = event.all_day,
+                .cancelled = event.status == .cancelled,
+            });
+        }
+        return .{ .timezone = try arena.dupe(u8, calendar.timezone), .sources = sources.items };
     }
 
     fn validateCalendarQuery(window: ?CalendarWindow, query: []const u8) !void {
