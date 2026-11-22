@@ -7,6 +7,7 @@ const forwarding_wire = @import("../message/forwarding.zig");
 const vacation_wire = @import("../message/vacation.zig");
 const team_store = @import("team_store.zig");
 const shared_inbox = @import("shared_inbox.zig");
+const calendar_invite = @import("../api/webmail_calendar_invite.zig");
 
 // SQLITE_TRANSIENT == (sqlite3_destructor_type)-1 — tells SQLite to make its own
 // copy of bound text/blob at bind time. We declare sqlite3_bind_text ourselves
@@ -660,6 +661,20 @@ pub const Database = struct {
             \\CREATE INDEX IF NOT EXISTS accepted_mail_retry ON accepted_mail_targets(retry_at,delivery_id) WHERE outcome='pending';
             \\CREATE INDEX IF NOT EXISTS accepted_mail_reservations ON accepted_mail_targets(mailbox) WHERE outcome='pending';
             \\CREATE INDEX IF NOT EXISTS accepted_mail_retention ON accepted_mail(accepted_at) WHERE complete=1;
+            \\CREATE TABLE IF NOT EXISTS mail_calendar_revisions (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    component TEXT NOT NULL,
+            \\    series TEXT NOT NULL,
+            \\    method TEXT NOT NULL CHECK(method IN ('request','cancel')),
+            \\    future INTEGER NOT NULL,
+            \\    sequence INTEGER NOT NULL,
+            \\    dtstamp INTEGER NOT NULL,
+            \\    occurrence_wall INTEGER,
+            \\    occurrence_zone TEXT,
+            \\    occurrence_day INTEGER,
+            \\    PRIMARY KEY(user_id,component,method,future)
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mail_calendar_revision_series ON mail_calendar_revisions(user_id,series);
             \\CREATE TABLE IF NOT EXISTS accepted_mail_effects (
             \\    delivery_id TEXT NOT NULL,
             \\    ordinal INTEGER NOT NULL,
@@ -1501,6 +1516,7 @@ pub const Database = struct {
         sender: ?[]const u8 = null,
         delegated_sender_id: ?i64 = null,
         shared_reply: ?shared_inbox.ReplyDelivery = null,
+        calendar_reply: ?calendar_invite.Revision = null,
         charge_recipients: usize = 0,
         receipt: ?ActiveSyncReceipt = null,
         review_release: ?FiledCopy = null,
@@ -1520,6 +1536,9 @@ pub const Database = struct {
         }
         if (envelope.shared_reply) |reply| {
             try shared_inbox.requireReplyAdmission(.{ .db = self }, envelope.sender orelse return error.SharedReplyUnavailable, envelope.from, reply);
+        }
+        if (envelope.calendar_reply) |revision| {
+            try requireCurrentCalendarInvitation(Transaction{ .db = self }, envelope.sender orelse return error.CalendarReplyUnavailable, revision);
         }
         var hosted_sender: i64 = 0;
         if (envelope.sender) |sender| {
@@ -1584,6 +1603,7 @@ pub const Database = struct {
             try insert.reset();
             if (released) |file| {
                 try self.recordPlacementLocked(envelope.id, @intCast(ordinal), file);
+                try self.recordCalendarRevisionsLocked(envelope.id, @intCast(ordinal), file.calendar_revisions);
                 const muted = try self.attentionArrivalLocked(envelope.id, @intCast(ordinal), file.attention);
                 try self.stageDeliveryEffectsLocked(envelope.id, @intCast(ordinal), file, muted);
                 try self.stageBrowserNotificationLocked(envelope.id, @intCast(ordinal), file, muted);
@@ -1856,6 +1876,7 @@ pub const Database = struct {
         size: ?usize = null,
         attention: ?AttentionArrival = null,
         notification_key: []const u8 = "",
+        calendar_revisions: []const calendar_invite.Revision = &.{},
     };
 
     pub fn finishReviewPlacement(self: *Database, user: []const u8, operation: []const u8, placed: ?FiledCopy) !void {
@@ -1927,6 +1948,7 @@ pub const Database = struct {
         try self.releaseForwardTargetsLocked(id, ordinal, filed != null);
         if (filed) |file| {
             try self.recordPlacementLocked(id, ordinal, file);
+            try self.recordCalendarRevisionsLocked(id, ordinal, file.calendar_revisions);
             const muted = try self.attentionArrivalLocked(id, ordinal, file.attention);
             try self.stageDeliveryEffectsLocked(id, ordinal, file, muted);
             try self.stageBrowserNotificationLocked(id, ordinal, file, muted);
@@ -2020,6 +2042,79 @@ pub const Database = struct {
         try stmt.bind(3, file.basename);
         try stmt.bind(4, file.stamp);
         _ = try stmt.step();
+    }
+
+    fn recordCalendarRevisionsLocked(self: *Database, id: []const u8, ordinal: i64, revisions: []const calendar_invite.Revision) !void {
+        if (revisions.len == 0) return;
+        const stmt = try self.prepareLocked(
+            \\INSERT INTO mail_calendar_revisions(user_id,component,series,method,future,sequence,dtstamp,occurrence_wall,occurrence_zone,occurrence_day)
+            \\SELECT t.mailbox_id,?3,?4,?5,?6,?7,?8,?9,?10,?11
+            \\FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
+            \\WHERE t.delivery_id=?1 AND t.ordinal=?2 AND t.mailbox_id<>0 AND t.is_primary=1
+            \\AND t.folder IN ('new','Newsletters','Receipts') AND m.verified_author=1
+            \\ON CONFLICT(user_id,component,method,future) DO UPDATE SET sequence=excluded.sequence,dtstamp=excluded.dtstamp
+            \\WHERE (excluded.sequence,excluded.dtstamp)>(mail_calendar_revisions.sequence,mail_calendar_revisions.dtstamp)
+        );
+        defer stmt.finalize();
+        for (revisions) |revision| {
+            try stmt.bind(1, id);
+            try stmt.bind(2, ordinal);
+            try stmt.bind(3, @as([]const u8, &revision.component));
+            try stmt.bind(4, @as([]const u8, &revision.series));
+            try stmt.bind(5, @tagName(revision.method));
+            try stmt.bind(6, @intFromBool(revision.this_and_future));
+            try stmt.bind(7, revision.sequence);
+            try stmt.bind(8, revision.dtstamp);
+            try bindOccurrence(stmt, 9, revision.occurrence);
+            _ = try stmt.step();
+            try stmt.reset();
+        }
+    }
+
+    fn bindOccurrence(stmt: Statement, first: usize, occurrence: ?calendar_invite.WallTime) !void {
+        if (occurrence) |value| {
+            try stmt.bind(first, value.wall);
+            try stmt.bindOpt(first + 1, value.zone);
+            try stmt.bind(first + 2, @intFromBool(value.all_day));
+        } else {
+            for (0..3) |offset| try stmt.bindNull(first + offset);
+        }
+    }
+
+    pub const InvitationDisposition = enum { current, superseded, cancelled };
+
+    /// Compare the exact recurrence with later requests and applicable
+    /// cancellations. Separate cancellation records keep whole-series and
+    /// range tombstones effective even if the organizer later reopens a series.
+    pub fn calendarInvitationDisposition(context: anytype, user: []const u8, revision: calendar_invite.Revision) !InvitationDisposition {
+        const stmt = try context.prepare(
+            \\SELECT method FROM mail_calendar_revisions
+            \\WHERE user_id=(SELECT id FROM users WHERE username=?1) AND series=?2
+            \\AND ((component=?3 AND future=?4) OR (method='cancel' AND (
+            \\    occurrence_wall IS NULL OR (future=1 AND occurrence_wall<=?5 AND occurrence_zone IS ?6 AND occurrence_day=?7)
+            \\)))
+            \\AND ((sequence,dtstamp)>(?8,?9) OR (method='cancel' AND ?10='request' AND (sequence,dtstamp)=(?8,?9)))
+            \\ORDER BY sequence DESC,dtstamp DESC,method LIMIT 1
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, @as([]const u8, &revision.series));
+        try stmt.bind(3, @as([]const u8, &revision.component));
+        try stmt.bind(4, @intFromBool(revision.this_and_future));
+        try bindOccurrence(stmt, 5, revision.occurrence);
+        try stmt.bind(8, revision.sequence);
+        try stmt.bind(9, revision.dtstamp);
+        try stmt.bind(10, @tagName(revision.method));
+        if (!try stmt.step()) return .current;
+        return if (std.mem.eql(u8, stmt.columnText(0), "cancel")) .cancelled else .superseded;
+    }
+
+    pub fn requireCurrentCalendarInvitation(context: anytype, user: []const u8, revision: calendar_invite.Revision) !void {
+        switch (try calendarInvitationDisposition(context, user, revision)) {
+            .current => {},
+            .superseded => return error.CalendarInvitationStale,
+            .cancelled => return error.CalendarInvitationCancelled,
+        }
     }
 
     fn stageDeliveryEffectsLocked(self: *Database, id: []const u8, ordinal: i64, file: FiledCopy, muted: bool) !void {
@@ -2434,6 +2529,8 @@ pub const Database = struct {
         attempts: u8,
         review_copy: bool,
         track_placement: bool,
+        calendar_author: []const u8,
+        calendar_attendee: []const u8,
     };
 
     pub fn pendingDelivery(self: *Database, a: std.mem.Allocator, id: ?[]const u8, now: i64) !?PendingDelivery {
@@ -2443,7 +2540,9 @@ pub const Database = struct {
             \\SELECT m.id,t.ordinal,t.mailbox,t.folder,COALESCE(t.reply_mime,m.mime),m.accepted_ms,
             \\       t.mailbox_id<>0 AND NOT EXISTS (SELECT 1 FROM users WHERE id=t.mailbox_id AND username=t.mailbox),t.attempts,t.review_copy,
             \\       t.mailbox_id<>0 AND (t.folder IN ('new','Newsletters','Receipts') OR t.placement_reason IN ('junk_feedback','spam_filter'))
-            \\          AND (m.verified_author=1 OR t.placement_reason<>'' OR t.reply_author IS NOT NULL),t.verified_forward
+            \\          AND (m.verified_author=1 OR t.placement_reason<>'' OR t.reply_author IS NOT NULL),t.verified_forward,
+            \\       IIF(t.is_primary=1 AND t.folder IN ('new','Newsletters','Receipts') AND m.verified_author=1,m.author,''),
+            \\       COALESCE((SELECT email FROM users WHERE id=t.mailbox_id),'')
             \\FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
             \\WHERE t.outcome='pending' AND t.forward_after IS NULL AND t.retry_at<=?1
         ;
@@ -2466,6 +2565,8 @@ pub const Database = struct {
             .attempts = @intCast(stmt.columnInt64(7)),
             .review_copy = stmt.columnInt64(8) != 0,
             .track_placement = stmt.columnInt64(9) != 0,
+            .calendar_author = try a.dupe(u8, stmt.columnText(11)),
+            .calendar_attendee = try a.dupe(u8, stmt.columnText(12)),
         };
     }
 

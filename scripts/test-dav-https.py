@@ -429,7 +429,8 @@ def check_invitation_previews(test, owner, other):
 
 def check_invitation_replies(test):
     attendee = test.provision("rsvp-attendee", daily=1)
-    organizer = test.provision("rsvp-organizer")
+    organizer = test.provision("rsvp-organizer", daily=100)
+    other_organizer = test.provision("rsvp-other-organizer")
     session, foreign = test.login(attendee), test.login(organizer)
     for account in (session, foreign):
         assert test.api(account, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
@@ -439,21 +440,28 @@ def check_invitation_replies(test):
         "END:STANDARD", "END:VTIMEZONE",
     )
 
-    def invite(subject, sequence=2, stamp="110000", occurrence="090000", method="REQUEST", author=organizer, invited=attendee):
-        start = (f"DTSTART;TZID=Fixture/Studio:20261124T{occurrence}",) if method == "REQUEST" else ()
+    def invite(subject, sequence=2, stamp="110000", occurrence="090000", method="REQUEST", author=organizer,
+               invited=attendee, series="rsvp-series", future=False, sender=organizer, held=False):
+        start_time = occurrence or "090000"
+        start = (f"DTSTART;TZID=Fixture/Studio:20261124T{start_time}",) if method == "REQUEST" else ()
+        scope = ";RANGE=THISANDFUTURE" if future else ""
+        recurrence = (f"RECURRENCE-ID{scope};TZID=Fixture/Studio:20261124T{occurrence}",) if occurrence else ()
         source = "\r\n".join((
             "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail//RSVP Fixture//EN", f"METHOD:{method}",
-            *zone, "BEGIN:VEVENT", "UID:rsvp-series@example.test", f"SEQUENCE:{sequence}", f"DTSTAMP:20261121T{stamp}Z",
-            f"RECURRENCE-ID;TZID=Fixture/Studio:20261124T{occurrence}", *start, f"ORGANIZER:mailto:{author}",
+            *zone, "BEGIN:VEVENT", f"UID:{series}@example.test", f"SEQUENCE:{sequence}", f"DTSTAMP:20261121T{stamp}Z",
+            *recurrence, *start, f"ORGANIZER:mailto:{author}",
             f"ATTENDEE:mailto:{invited}", f"ATTENDEE:mailto:{organizer}", "SUMMARY:Studio RSVP",
             "DESCRIPTION:Private notes from the organizer", "END:VEVENT", "END:VCALENDAR", "",
         ))
         message = EmailMessage()
-        message["From"], message["To"], message["Subject"] = organizer, attendee, subject
+        message["From"], message["To"], message["Subject"] = sender, attendee, subject
         message["Reply-To"] = "unrelated@hosted.example.test"
         message.set_content(source, subtype="calendar", params={"method": method})
-        with test.smtp(organizer) as smtp:
+        with test.smtp(sender) as smtp:
             assert smtp.send_message(message) == {}
+        if held:
+            item, = [row for row in test.api(session, "sender-review?view=pending")[1]["items"] if row["subject"] == subject]
+            return item
         query = urllib.parse.urlencode({"folder": "INBOX", "q": subject})
         row, = [row for row in test.api(session, "messages?" + query)[1]["items"] if row["subject"] == subject]
         return detail(row["reference"])
@@ -504,7 +512,7 @@ def check_invitation_replies(test):
         return replies
 
     first = invite("Verified RSVP occurrence")
-    assert first["calendar_rsvps"] == [{"status": None}]
+    assert first["calendar_rsvps"] == [{"status": None, "availability": "current"}]
     assert respond(first, "accepted", revision=False)[0] == 428
     assert respond(first, "accepted", account=foreign)[0] == 404
     assert respond(first, "accepted", account={**session, "Origin": "https://unrelated.example.test"})[0] == 403
@@ -512,7 +520,7 @@ def check_invitation_replies(test):
     assert forged["calendar_rsvps"] == [None] and respond(forged, "accepted")[0] == 403
     uninvited = invite("Different attendee RSVP occurrence", invited="elsewhere@hosted.example.test")
     assert uninvited["calendar_rsvps"] == [None] and respond(uninvited, "accepted")[0] == 403
-    cancelled = invite("Cancellation RSVP occurrence", method="CANCEL")
+    cancelled = invite("Cancellation RSVP occurrence", method="CANCEL", series="other-series")
     assert cancelled["calendar_rsvps"] == [None] and respond(cancelled, "accepted")[0] == 403
 
     barrier = Barrier(2)
@@ -557,6 +565,72 @@ def check_invitation_replies(test):
     assert len(declines) == 1 and 'RECURRENCE-ID;TZID="Fixture/Studio":20261124T140000' in declines[0]
     print("Verified RSVPs over native HTTPS and IMAP, including all responses, organizer authorization, revision ordering, and quota-safe retries.")
 
+    def availability(source):
+        return detail(source["reference"])["calendar_rsvps"][0]["availability"]
+
+    # Deliver the update before the attendee has responded to either request.
+    series = "pending-update"
+    initial = invite("Unanswered original request", series=series)
+    latest = invite("Unanswered updated request", series=series, stamp="120000")
+    late_copy = invite("Repeated original before answer", series=series)
+    assert availability(initial) == availability(late_copy) == "superseded"
+    assert availability(latest) == "current"
+    assert respond(initial, "accepted")[1]["error"] == "invitation_stale"
+    invite("Cancellation by a different organizer", series=series, sequence=4, method="CANCEL",
+           author=other_organizer, sender=other_organizer)
+    invite("Unverified organizer field on cancellation", series=series, sequence=5, method="CANCEL",
+           sender=other_organizer)
+    assert availability(latest) == "current"
+    cancellation = invite("Cancellation before any response", series=series, sequence=3, method="CANCEL")
+    assert availability(latest) == "cancelled"
+    assert respond(latest, "accepted")[1]["error"] == "invitation_cancelled"
+    for action in ("trash", "purge"):
+        target = {field: cancellation[field] for field in ("uid", "folder", "reference", "revision")}
+        status, result = test.api(session, "bulk", {"action": action, "messages": [target]})
+        assert status == 200 and result["ok"], result
+        if action == "trash":
+            cancellation = detail(cancellation["reference"])
+    assert test.api(session, "messages/ref/" + cancellation["reference"])[0] == 404
+    assert availability(latest) == "cancelled"
+
+    series = "pending-range-cancel"
+    invite("Range cancelled first", series=series, sequence=4, method="CANCEL", occurrence="120000", future=True)
+    before_range = invite("Occurrence before cancelled range", series=series, occurrence="100000")
+    at_range = invite("Occurrence at cancelled range", series=series, occurrence="120000")
+    after_range = invite("Occurrence inside cancelled range", series=series, occurrence="140000")
+    assert [availability(item) for item in (before_range, at_range, after_range)] == ["current", "cancelled", "cancelled"]
+    assert respond(after_range, "accepted")[1]["error"] == "invitation_cancelled"
+    reopened = invite("Reopened occurrence inside range", series=series, sequence=5, occurrence="140000")
+    assert availability(reopened) == "current"
+
+    series = "pending-series-cancel"
+    invite("Entire series cancelled before request", series=series, sequence=4, method="CANCEL", occurrence=None)
+    late_series = invite("Series request delivered after cancellation", series=series, sequence=3, occurrence=None)
+    late_instance = invite("Series instance delivered after cancellation", series=series, sequence=3)
+    assert availability(late_series) == availability(late_instance) == "cancelled"
+    new_series = invite("Entire series reinstated", series=series, sequence=5, occurrence=None)
+    assert availability(new_series) == "current" and availability(late_instance) == "cancelled"
+
+    initial = invite("Reviewed series request", series="reviewed-series")
+    assert test.api(session, "sender-review", {"setting": "enable"}, "PUT")[0] == 200
+    held = invite("Held cancellation", series="reviewed-series", sequence=3, method="CANCEL", held=True)
+    assert availability(initial) == "current"
+    fields = {**session, "If-Match": held["revision"]}
+    status, result = test.api(fields, "sender-review/decision", {
+        "reference": held["reference"], "action": "allow", "apply_to_sender": True, "rule_revision": held["rule_revision"],
+    }, "POST")
+    assert status == 200, result
+    for _ in range(80):
+        if availability(initial) == "cancelled":
+            break
+        time.sleep(0.15)
+    assert availability(initial) == "cancelled"
+    assert test.api(session, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
+
+    obsolete = invite("Cancel earlier queued reply on restart", sequence=3, method="CANCEL")
+    assert obsolete["calendar_invites"][0]["method"] == "cancel"
+    print("Verified arrival order before RSVP, including verified sender boundaries, single instances, ranges, and whole-series cancellation.")
+
     def prepare_restart():
         # Model a restart after delivery and Sent filing but before receipt
         # acknowledgement. Also make another terminal Outbox row eligible for expiry.
@@ -564,12 +638,25 @@ def check_invitation_replies(test):
             db.execute("UPDATE webmail_records SET state='sending',payload=json_remove(payload,'$.result') "
                        "WHERE username=? AND kind='outbox' AND id=?", (attendee, tentative_id))
             db.execute("UPDATE webmail_records SET expires_at=1 WHERE username=? AND kind='outbox' AND id=?", (attendee, decline_id))
+            # Replay an older, previously unadmitted Outbox attempt as if it
+            # had stayed queued while the organizer's cancellation arrived.
+            db.execute("UPDATE webmail_records SET state='pending',due_at=0,payload=json_set(payload,'$.calendarReply.body',?) "
+                       "WHERE username=? AND kind='outbox' AND id=?", (accepted, attendee, failed_id))
 
     def after_restart():
         session.update(test.login(attendee))
         assert wait_for(updated, "sent") == tentative_id
         assert test.api(session, "outbox/" + decline_id)[0] == 404
         assert respond(occurrence, "declined")[1]["decision"]["sendId"] == decline_id
+        assert respond(latest, "accepted")[1]["error"] == "invitation_cancelled"
+        assert availability(late_instance) == "cancelled"
+        for _ in range(80):
+            obsolete_send = test.api(session, "outbox/" + failed_id)[1]
+            if obsolete_send["state"] == "failed":
+                break
+            time.sleep(0.15)
+        assert obsolete_send["state"] == "failed" and "cancelled" in obsolete_send["error"], obsolete_send
+        assert test.count(attendee) == 3
         replies = inbox_replies()
         assert len(replies) == 3 and sum("PARTSTAT=TENTATIVE" in text for text in replies) == 1
         print("Verified RSVP delivery journal recovery, durable receipts after Outbox expiry, and no duplicate mail after restart.")
@@ -1174,8 +1261,27 @@ def check_calendar_upgrade(binary, previous):
     with tempfile.TemporaryDirectory(prefix="mail-dav-upgrade-", dir="/tmp") as directory:
         root = Path(directory)
         test = hosted.Fixture(previous, root, staging=True)
+
+        def deliver_scheduling(subject, method, sequence):
+            message = EmailMessage()
+            message["From"], message["To"], message["Subject"] = organizer, owner, subject
+            message.set_content("\r\n".join((
+                "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail upgrade fixture//EN", f"METHOD:{method}",
+                "BEGIN:VEVENT", "UID:upgrade-invitation@example.test", "DTSTAMP:20261121T100000Z",
+                f"SEQUENCE:{sequence}", f"ORGANIZER:mailto:{organizer}", f"ATTENDEE:mailto:{owner}",
+                "DTSTART:20261126T100000Z", "END:VEVENT", "END:VCALENDAR", "",
+            )), subtype="calendar", params={"method": method})
+            with test.smtp(organizer) as smtp:
+                assert smtp.send_message(message) == {}
+
         with test.daemon():
             owner = test.provision("upgrade-owner")
+            organizer = test.provision("upgrade-organizer")
+            owner_session = test.login(owner)
+            assert test.api(owner_session, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
+            deliver_scheduling("Legacy calendar invitation", "REQUEST", 0)
+            query = urllib.parse.urlencode({"folder": "INBOX", "q": "Legacy calendar invitation"})
+            original, = test.api(owner_session, "messages?" + query)[1]["items"]
             client = DavClient(test, owner)
             resource = f"/calendars/{owner}/Legacy/old-path.ics"
             contact = f"/addressbooks/{owner}/Legacy/old-contact.vcf"
@@ -1204,6 +1310,10 @@ def check_calendar_upgrade(binary, previous):
         test.binary = binary
         with test.daemon():
             session = test.login(owner)
+            endpoint = "messages/ref/" + original["reference"]
+            assert test.api(session, endpoint)[1]["calendar_rsvps"][0]["availability"] == "current"
+            deliver_scheduling("Cancellation after mail upgrade", "CANCEL", 1)
+            assert test.api(session, endpoint)[1]["calendar_rsvps"][0]["availability"] == "cancelled"
             assert test.api(session, listing)[1]["events"] == [event]
             reminders = test.api(session, "calendar-reminders")[1]["events"]
             assert [entry["id"] for entry in reminders] == [event["id"]]

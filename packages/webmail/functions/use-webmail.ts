@@ -384,6 +384,10 @@ export function useWebmail(ports: WebmailPorts) {
     const message = selected()
     const account = user()?.username
     if (!limits().calendarAvailable || !message?.reference || !account || message.folder === 'Drafts' || senderReview.senderReviewOpen()) return null
+    if (message.calendar_invites?.length && !message.calendar_invites.some((invite, index) => {
+      const availability = message.calendar_rsvps?.[index]?.availability
+      return invite.method === 'request' && (!availability || availability === 'current')
+    })) return null
     return mailEventLink('/calendar', account, message.reference)
   }
   function canRespondToInvitation(index: number, response: InvitationResponse): boolean {
@@ -391,6 +395,7 @@ export function useWebmail(ports: WebmailPorts) {
     const invite = message?.calendar_invites?.[index]
     const action = message?.calendar_rsvps?.[index]
     if (!invite || !action) return false
+    if (action.availability && action.availability !== 'current') return false
     const status = action.status
     if (!status) return true
     if (rsvpPending(status) || status.state === 'unknown') return false
@@ -435,7 +440,7 @@ export function useWebmail(ports: WebmailPorts) {
         const status = action?.status
         if (!status || !rsvpPending(status)) return action
         const item = await api<OutboxItem>(`/webmail/api/outbox/${encodeURIComponent(status.decision.sendId)}`)
-        return { status: { ...status, state: item.state } }
+        return { ...action, status: { ...status, state: item.state } }
       }))
       const current = selected()
       if (!destroyed && request === messageRequest && current?.calendar_rsvps === actions) {

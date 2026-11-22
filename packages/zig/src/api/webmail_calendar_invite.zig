@@ -1,4 +1,4 @@
-//! Read-only previews for VEVENT scheduling messages (RFC 5546 and RFC 6047).
+//! VEVENT scheduling messages carried by email (RFC 5546 and RFC 6047).
 const std = @import("std");
 const submission = @import("../message/submission.zig");
 const ical = @import("../protocol/icalendar.zig");
@@ -56,6 +56,16 @@ pub const Preview = struct {
     end: ?WallTime,
 };
 
+pub const Revision = struct {
+    component: [64]u8,
+    series: [64]u8,
+    method: Method,
+    sequence: u32,
+    dtstamp: i64,
+    occurrence: ?WallTime,
+    this_and_future: bool,
+};
+
 pub const Response = enum {
     accepted,
     tentative,
@@ -76,15 +86,36 @@ pub const Invitation = struct {
     recurrence: ?ical.Property,
 
     pub fn canReply(self: Invitation, attendee: []const u8) bool {
-        return self.preview.method == .request and self.preview.organizer_verified and self.preview.for_mailbox and
-            !self.preview.this_and_future and submission.validMailbox(attendee) and !equal(attendee, self.preview.organizer);
+        return self.preview.method == .request and !self.preview.this_and_future and self.canTrack(attendee);
+    }
+
+    pub fn canTrack(self: Invitation, attendee: []const u8) bool {
+        return self.preview.organizer_verified and self.preview.for_mailbox and
+            submission.validMailbox(attendee) and !equal(attendee, self.preview.organizer);
+    }
+
+    pub fn revision(self: Invitation, a: Allocator) !Revision {
+        const series = try self.keyForOccurrence(a, null);
+        return .{
+            .component = if (self.preview.occurrence) |occurrence| try self.keyForOccurrence(a, occurrence) else series,
+            .series = series,
+            .method = self.preview.method,
+            .sequence = self.preview.sequence,
+            .dtstamp = self.preview.dtstamp,
+            .occurrence = self.preview.occurrence,
+            .this_and_future = self.preview.this_and_future,
+        };
     }
 
     pub fn key(self: Invitation, a: Allocator) ![64]u8 {
+        return self.keyForOccurrence(a, self.preview.occurrence);
+    }
+
+    fn keyForOccurrence(self: Invitation, a: Allocator, occurrence: ?WallTime) ![64]u8 {
         const material = try std.json.Stringify.valueAlloc(a, .{
             .organizer = try std.ascii.allocLowerString(a, self.preview.organizer),
             .uid = self.preview.uid,
-            .occurrence = self.preview.occurrence,
+            .occurrence = occurrence,
         }, .{});
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(material, &digest, .{});

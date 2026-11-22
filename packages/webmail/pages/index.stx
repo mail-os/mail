@@ -440,7 +440,9 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
               </dl>
               <div :if="selected.calendar_rsvps?.[index]" class="wm-invitation-rsvp">
                 <p :if="selected.calendar_rsvps[index]?.status" role="status" :text="rsvpLabel(invite, selected.calendar_rsvps[index].status)"></p>
-                <div class="wm-invitation-responses" role="group" aria-label="RSVP to organizer">
+                <p :if="selected.calendar_rsvps[index]?.availability === 'superseded'">The organizer sent a newer invitation.</p>
+                <p :if="selected.calendar_rsvps[index]?.availability === 'cancelled'">The organizer cancelled this invitation.</p>
+                <div :if="!selected.calendar_rsvps[index]?.availability || selected.calendar_rsvps[index].availability === 'current'" class="wm-invitation-responses" role="group" aria-label="RSVP to organizer">
                   <button :for="option in invitationResponses" :key="option.value" type="button" class="wm-action"
                     @click="respondToInvitation(index, option.value)" :disabled="rsvpBusy || readingLoading || !canRespondToInvitation(index, option.value)"
                     :aria-pressed="selected.calendar_rsvps[index]?.status && invitationRevision(invite, selected.calendar_rsvps[index].status) === 0 ? selected.calendar_rsvps[index].status.decision.response === option.value : null">

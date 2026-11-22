@@ -118,6 +118,7 @@ pub const DispatchOptions = struct {
     sender: ?[]const u8 = null,
     delegated_sender_id: ?i64 = null,
     shared_reply: ?shared_inbox.ReplyDelivery = null,
+    calendar_reply: ?@import("../api/webmail_calendar_invite.zig").Revision = null,
     sent: ?SentCopy = null,
     interactive_id: ?[]const u8 = null,
     receipt: ?database.Database.ActiveSyncReceipt = null,
@@ -266,6 +267,7 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
         .sender = options.sender,
         .delegated_sender_id = options.delegated_sender_id,
         .shared_reply = options.shared_reply,
+        .calendar_reply = options.calendar_reply,
         .charge_recipients = recipients.len,
         .receipt = options.receipt,
     });

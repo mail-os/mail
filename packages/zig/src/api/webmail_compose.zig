@@ -84,6 +84,7 @@ pub const SendConfig = struct {
     sender_user: []const u8,
     delegated_sender_id: ?i64 = null,
     shared_reply: ?@import("../storage/shared_inbox.zig").ReplyDelivery = null,
+    calendar_reply: ?@import("webmail_calendar_invite.zig").Revision = null,
 
     fn delivery(self: SendConfig) submission.Delivery {
         return .{
@@ -426,6 +427,7 @@ pub fn sendWithJournal(allocator: std.mem.Allocator, msg: Message, cfg: SendConf
         .sender = cfg.sender_user,
         .delegated_sender_id = cfg.delegated_sender_id,
         .shared_reply = cfg.shared_reply,
+        .calendar_reply = cfg.calendar_reply,
         .interactive_id = if (dispatch) |send_record| send_record.delivery_id else null,
     });
     errdefer allocator.free(result.failed);

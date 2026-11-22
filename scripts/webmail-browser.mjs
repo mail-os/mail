@@ -600,6 +600,14 @@ async function invitationJourney(page, phone = false) {
   await invitation.getByText(phone ? 'Tentative response sent.' : 'Acceptance sent.', { exact: true }).waitFor()
   await fitsViewport(page)
   await screenshot(page, phone ? 'phone-calendar-rsvp' : 'desktop-calendar-rsvp')
+  if (!phone) {
+    await openMailbox(page, /^Archive(?:\s|$)/)
+    await button(page, /Team breakfast invitation/).click()
+    await page.getByText('The organizer cancelled this invitation.', { exact: true }).waitFor()
+    assert.equal(await page.getByRole('group', { name: 'RSVP to organizer' }).count(), 0)
+    assert.equal(await page.getByRole('link', { name: 'Create event from email', exact: true }).count(), 0)
+    await screenshot(page, 'desktop-cancelled-invitation')
+  }
 }
 
 async function mailEventJourney(page, { phone = false, firstCalendar = false } = {}) {

@@ -15,6 +15,7 @@ const io = @import("../core/io_compat.zig");
 const logger = @import("../core/logger.zig");
 const path = @import("../core/maildir_path.zig");
 const message_refs = @import("../storage/message_refs.zig");
+const mailbox_mime = @import("../api/webmail_maildir.zig");
 const sieve = @import("../features/sieve.zig");
 const submission_headers = @import("../message/submission.zig");
 const thread_ids = @import("../message/thread_ids.zig");
@@ -329,6 +330,7 @@ fn drain(allocator: Allocator, db: *Database, id: ?[]const u8, limit: usize) !vo
             try browserNotificationKey(a, target.mime, attention)
         else
             "";
+        const revisions = try mailbox_mime.calendarRevisions(a, target.mime, target.calendar_attendee, target.calendar_author);
         const file = fileTarget(a, target, filename) catch |err| {
             std.log.warn("accepted delivery {s}/{d} is awaiting local storage: {}", .{ target.id, target.ordinal, err });
             const wait_seconds = @as(i64, 2) << @as(u6, @intCast(target.attempts));
@@ -349,6 +351,7 @@ fn drain(allocator: Allocator, db: *Database, id: ?[]const u8, limit: usize) !vo
             .size = target.mime.len,
             .attention = attention,
             .notification_key = notification_key,
+            .calendar_revisions = revisions,
         }) catch |err| {
             // Leave the reservation intact. Do not let an active mailbox
             // session move a file whose checkpoint could not be committed.

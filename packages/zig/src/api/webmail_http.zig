@@ -3139,7 +3139,10 @@ fn canRsvpToMessage(server: *WebmailHttpServer, msg: maildir.MessageDetail) bool
         !std.ascii.eqlIgnoreCase(msg.folder, server.service.junkFolder()) and !std.ascii.eqlIgnoreCase(msg.folder, "Trash");
 }
 
-const InvitationAction = struct { status: ?service_mod.RsvpStatus };
+const InvitationAction = struct {
+    status: ?service_mod.RsvpStatus,
+    availability: database.Database.InvitationDisposition,
+};
 
 fn handleCalendarRsvp(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
     if (!isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
@@ -3165,7 +3168,8 @@ fn handleCalendarRsvp(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: 
     if (request.index >= invitations.len) return sendError(conn, a, 404, "invitation_not_found", "No such calendar invitation in this message.");
     const status = server.service.queueRsvp(a, sess.username, sess.email, invitations[request.index], request.response, request.previousSendId, server.config.scanner, time_compat.timestamp()) catch |err| switch (err) {
         error.CalendarReplyUnavailable => return sendError(conn, a, 403, "rsvp_unavailable", "RSVP requires a verified organizer and an invitation addressed to this account."),
-        error.CalendarInvitationStale => return sendError(conn, a, 409, "invitation_stale", "A response already exists for a newer version of this invitation."),
+        error.CalendarInvitationStale => return sendError(conn, a, 409, "invitation_stale", "The organizer sent a newer version of this invitation."),
+        error.CalendarInvitationCancelled => return sendError(conn, a, 409, "invitation_cancelled", "The organizer cancelled this invitation."),
         error.CalendarReplyInProgress => return sendError(conn, a, 409, "rsvp_in_progress", "Check the previous response's delivery in Outbox before sending another."),
         error.CalendarReplyTimezone => return sendError(conn, a, 422, "invitation_timezone", "This occurrence's time zone could not be verified."),
         else => return mapServiceError(conn, a, err),
@@ -3203,7 +3207,10 @@ fn handleMessageDetail(server: *WebmailHttpServer, conn: *webmail_tls.Stream, ar
     for (invitations, previews, actions) |invite, *preview, *action| {
         preview.* = invite.preview;
         action.* = if (canRsvpToMessage(server, msg) and invite.canReply(sess.email))
-            .{ .status = try server.service.rsvpStatus(arena, sess.username, invite) }
+            .{
+                .status = try server.service.rsvpStatus(arena, sess.username, invite),
+                .availability = try database.Database.calendarInvitationDisposition(server.db, sess.username, try invite.revision(arena)),
+            }
         else
             null;
     }

@@ -25,7 +25,10 @@ export interface InvitationRsvp {
   decision: { sequence: number, dtstamp: number, response: InvitationResponse, sendId: string }
   state: string
 }
-export interface InvitationAction { status: InvitationRsvp | null }
+export interface InvitationAction {
+  status: InvitationRsvp | null
+  availability?: 'current' | 'superseded' | 'cancelled'
+}
 
 export const invitationResponses = [
   { value: 'accepted', label: 'Accept', icon: 'check' },

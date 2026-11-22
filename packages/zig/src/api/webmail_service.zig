@@ -97,7 +97,12 @@ pub const Outbox = struct {
     request_hash: ?[]const u8 = null,
     reply_cutoff_ms: i64 = 0,
     dispatch: ?compose.OutboxDispatch = null,
-    calendarReply: ?struct { key: []const u8, attendee: []const u8, body: []const u8 } = null,
+    calendarReply: ?struct {
+        key: []const u8,
+        attendee: []const u8,
+        body: []const u8,
+        revision: ?calendar_invite.Revision = null,
+    } = null,
 };
 
 const RsvpDecision = struct {
@@ -540,9 +545,11 @@ pub const Service = struct {
 
     pub fn queueRsvp(self: *Service, a: std.mem.Allocator, user: []const u8, attendee: []const u8, invite: calendar_invite.Invitation, response: calendar_invite.Response, previous_id: ?[]const u8, scanner: ?*clamav.ClamAVScanner, now: i64) !RsvpStatus {
         if (!invite.canReply(attendee)) return error.CalendarReplyUnavailable;
-        const key = try invite.key(a);
+        const revision = try invite.revision(a);
+        const key = revision.component;
         self.mutations.lock();
         defer self.mutations.unlock();
+        try database.Database.requireCurrentCalendarInvitation(self.db, user, revision);
 
         // An optimistic receipt prevents an older tab from reversing a newer
         // decision. The transaction also guards callers on separate listeners.
@@ -580,7 +587,7 @@ pub const Service = struct {
             try std.fmt.allocPrint(a, "{s}: Calendar invitation", .{label});
         const doc: Outbox = .{
             .message = .{ .to = &.{invite.preview.organizer}, .subject = subject, .text = subject, .sendId = id },
-            .calendarReply = .{ .key = try a.dupe(u8, &key), .attendee = attendee, .body = body },
+            .calendarReply = .{ .key = &key, .attendee = attendee, .body = body, .revision = revision },
         };
         const msg = try self.outboxMessage(a, doc, user, attendee);
         const raw = try compose.buildMime(a, msg, now, "<validation@localhost>");
@@ -597,7 +604,7 @@ pub const Service = struct {
             .revision = if (previous) |entry| entry.revision else 0,
             .due_at = 0,
             .expires_at = 0,
-        });
+        }, revision);
         return .{ .decision = decision, .state = row.state };
     }
 
@@ -664,6 +671,8 @@ pub const Service = struct {
                 doc.error_message = switch (err) {
                     error.SenderIdentityUnavailable => "This From address is no longer available. Choose another address before sending.",
                     error.SharedReplyUnavailable => "This shared reply no longer has permission to send. Check the original message and its assignment.",
+                    error.CalendarInvitationStale => "The organizer sent an updated invitation before this RSVP could be sent.",
+                    error.CalendarInvitationCancelled => "The organizer cancelled this invitation before this RSVP could be sent.",
                     error.HostedSendingLimit => "Daily recipient allowance exhausted. Try again after midnight UTC.",
                     error.HostedSenderDisabled => "This mailbox is disabled. The message was not sent.",
                     error.HostedStorageFull => "A recipient mailbox is full. Review the recipients before retrying.",
@@ -815,6 +824,7 @@ pub const Service = struct {
         var cfg = self.sendConfig(user);
         cfg.delegated_sender_id = delegated_id;
         if (doc.message.sharedReply) |context| cfg.shared_reply = .{ .context = context, .send_id = row.id };
+        if (doc.calendarReply) |reply| cfg.calendar_reply = reply.revision;
         doc.result = try compose.sendWithJournal(a, msg, cfg, doc.dispatch);
     }
 

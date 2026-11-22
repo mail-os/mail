@@ -2,6 +2,7 @@
 //! keeps queued sends cancellable only before the server dispatch deadline.
 const std = @import("std");
 const database = @import("../storage/database.zig");
+const calendar_invite = @import("webmail_calendar_invite.zig");
 const shared_inbox = @import("../storage/shared_inbox.zig");
 const io_compat = @import("../core/io_compat.zig");
 
@@ -406,9 +407,10 @@ pub fn enqueueShared(db: *database.Database, row: Record, draft_id: []const u8, 
     return revision;
 }
 
-pub fn enqueueCalendarReply(db: *database.Database, row: Record, receipt: Record) !void {
+pub fn enqueueCalendarReply(db: *database.Database, row: Record, receipt: Record, revision: calendar_invite.Revision) !void {
     var tx = try db.beginTransaction(.write);
     defer tx.deinit();
+    try database.Database.requireCurrentCalendarInvitation(tx, row.username, revision);
     const ledger = try tx.prepare(putSql);
     defer ledger.finalize();
     _ = try putWith(ledger, receipt, receipt.revision);

@@ -286,7 +286,7 @@ fn process(a: Allocator, db: *Database, job: Job, hostname: []const u8, mail_con
     if (fs.cwd().access(original_dir, .{})) try durable.syncDirectory(a, original_dir) else |_| {}
     try durable.syncDirectory(a, std.fs.path.dirname(current.path).?);
     const attention = try routing.attentionArrival(a, current.raw);
-    const placed: Database.FiledCopy = .{
+    var placed: Database.FiledCopy = .{
         .basename = row.basename,
         .stamp = current.stamp,
         .attention = attention,
@@ -295,6 +295,11 @@ fn process(a: Allocator, db: *Database, job: Job, hostname: []const u8, mail_con
     if (!std.mem.eql(u8, destination, "INBOX")) return db.finishReviewPlacement(job.user, operation, placed);
 
     const identity: routing.SenderIdentity = .{ .author = row.author, .verified = row.verified };
+    if (identity.verified) {
+        var mailbox = try db.getUserByUsername(job.user);
+        defer mailbox.deinit(db.allocator);
+        placed.calendar_revisions = try maildir.calendarRevisions(a, current.raw, mailbox.email, identity.author);
+    }
     var plan: routing.Plan = .{
         .allocator = a,
         .db = db,

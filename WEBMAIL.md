@@ -149,6 +149,9 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   **Tentative**, or **Decline** to email a response. The invitation shows
   delivery status and lets you retry a failed response. Check Outbox for
   delivery details. Use Calendar to add or edit the event itself.
+- A newer invitation or cancellation from the verified organizer disables
+  replies to the affected revision. This applies to messages delivered to
+  the mailbox and to approved messages released from Sender Review.
 - Choose **Create event from email** in an open message to start a Calendar
   event with the subject as its title. Edit the title and choose the dates
   before saving. The owner can choose **Open source email** in the saved

@@ -195,7 +195,7 @@ const FileRef = struct {
     name: []const u8,
 };
 
-const BodyMode = enum { preview, metadata, full };
+const BodyMode = enum { preview, metadata, full, calendar };
 
 /// Collect the message files for a folder, in stable IMAP order. The returned
 /// slices are arena-allocated.
@@ -1523,6 +1523,18 @@ fn extractBestBody(allocator: std.mem.Allocator, raw: []const u8) !BodyParts {
     return extractBody(allocator, raw, .full);
 }
 
+/// Use the same MIME boundaries and transfer rules as the message reader
+/// without decoding unrelated body parts or attachments during delivery.
+pub fn calendarRevisions(a: std.mem.Allocator, raw: []const u8, attendee: []const u8, verified_author: []const u8) ![]const calendar_invite.Revision {
+    if (verified_author.len == 0 or ascii_compat.indexOfIgnoreCase(raw, "text/calendar") == null) return &.{};
+    const body = try extractBody(a, raw, .calendar);
+    var revisions: std.ArrayList(calendar_invite.Revision) = .empty;
+    for (try calendar_invite.invitations(a, body.calendar_parts, attendee, verified_author)) |invite| {
+        if (invite.canTrack(attendee)) try revisions.append(a, try invite.revision(a));
+    }
+    return revisions.items;
+}
+
 fn extractBody(allocator: std.mem.Allocator, raw: []const u8, mode: BodyMode) !BodyParts {
     const he = headerEnd(raw);
     const header_block = raw[0..he];
@@ -1538,7 +1550,8 @@ fn extractBody(allocator: std.mem.Allocator, raw: []const u8, mode: BodyMode) !B
     }
 
     const cte = try getHeader(allocator, header_block, "Content-Transfer-Encoding");
-    if (mode == .full) try captureCalendarPart(allocator, &parts, ctype, cte, body);
+    if (mode == .full or mode == .calendar) try captureCalendarPart(allocator, &parts, ctype, cte, body);
+    if (mode == .calendar) return .{ .calendar_parts = parts.items };
     if (try attachmentName(allocator, header_block, ctype)) |name| {
         if (mode == .preview) return .{ .has_attachments = true };
         const files = try allocator.alloc(AttachmentInfo, 1);
@@ -1598,10 +1611,17 @@ fn parseMultipartMode(allocator: std.mem.Allocator, ctype: []const u8, body: []c
 
         const pct = try getHeader(allocator, part_headers, "Content-Type");
         const pcte = try getHeader(allocator, part_headers, "Content-Transfer-Encoding");
-        if (mode == .full and next != null) try captureCalendarPart(allocator, calendar_parts, pct, pcte, part_body);
-        if (try attachmentName(allocator, part_headers, pct)) |name| {
+        if ((mode == .full or mode == .calendar) and next != null)
+            try captureCalendarPart(allocator, calendar_parts, pct, pcte, part_body);
+        const name = try attachmentName(allocator, part_headers, pct);
+        if (mode == .calendar) {
+            if (name == null and std.ascii.startsWithIgnoreCase(pct, "multipart/"))
+                _ = try parseMultipartMode(allocator, pct, part_body, depth + 1, mode, calendar_parts);
+            continue;
+        }
+        if (name) |attachment_name| {
             result.has_attachments = true;
-            if (mode != .preview) try attachments.append(allocator, try readAttachment(allocator, part_body, pct, pcte, name, mode));
+            if (mode != .preview) try attachments.append(allocator, try readAttachment(allocator, part_body, pct, pcte, attachment_name, mode));
             continue;
         }
 
