@@ -13,3 +13,15 @@ index d1c352080fb52c5a0d50b1eb3fe74f3f4d804a46..a5a9b0175b1185023ca3aab9db1a7e9b
        else
          output += `
  ${scriptsHtml}`;
+diff --git a/dist/client-script.js b/dist/client-script.js
+--- a/dist/client-script.js
++++ b/dist/client-script.js
+@@ -303,7 +303,7 @@ function transformAutoImportsUncached(code) {
+         aliases.push(`${localName} = ${importedName}`);
+     }
+     const replacement = aliases.length > 0 ? `var ${aliases.join(", ")}; /* [auto-import processed] */` : "// [auto-import processed]";
+-    transformedCode = transformedCode.replace(match[0], replacement);
++    transformedCode = transformedCode.replace(match[0], () => replacement);
+   }
+   const locallyDeclared = collectLocalBindings(transformedCode);
+   for (const symbol of STX_AUTO_IMPORTS) {

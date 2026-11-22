@@ -1,4 +1,4 @@
-import { renderString, renderTemplate } from '@stacksjs/stx'
+import { renderString, renderTemplate, transformAutoImports } from '@stacksjs/stx'
 import { expect, test } from 'bun:test'
 import { join } from 'node:path'
 import { buildWebmail, stylesheetUrl, webmailPages } from './build'
@@ -11,6 +11,13 @@ test('standalone stx script insertion preserves literal JavaScript replacement p
   <p :text="label"></p>
 </body></html>`)
   expect(html.includes(text)).toBe(true)
+})
+
+test('stx keeps dollar signs in minified runtime import aliases', () => {
+  const source = 'import { derived as $$, state as $0 } from "@stacksjs/stx";\nconst value = $$(() => $0(1))'
+  const transformed = transformAutoImports(source)
+  expect(transformed.code).toContain('var $$ = derived, $0 = state;')
+  expect(transformed.stxImports).toEqual(['derived', 'state'])
 })
 
 test('deployments fingerprint styles so existing browsers fetch updated controls', async () => {
