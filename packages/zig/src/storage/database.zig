@@ -5,6 +5,7 @@ const sqlite = @import("sqlite");
 const categories = @import("../message/categories.zig");
 const forwarding_wire = @import("../message/forwarding.zig");
 const vacation_wire = @import("../message/vacation.zig");
+const team_store = @import("team_store.zig");
 
 // SQLITE_TRANSIENT == (sqlite3_destructor_type)-1 — tells SQLite to make its own
 // copy of bound text/blob at bind time. We declare sqlite3_bind_text ourselves
@@ -841,6 +842,8 @@ pub const Database = struct {
             \\CREATE INDEX IF NOT EXISTS idx_webmail_sessions_sid ON webmail_sessions(session_id);
             \\CREATE INDEX IF NOT EXISTS idx_webmail_sessions_expires ON webmail_sessions(expires_at);
         );
+        try self.initAuditTable();
+        try self.exec(team_store.schema);
     }
 
     pub fn exec(self: *Database, sql: []const u8) !void {
@@ -883,6 +886,32 @@ pub const Database = struct {
             .stmt = stmt.?,
             .allocator = self.allocator,
         };
+    }
+
+    pub const Transaction = struct {
+        db: *Database,
+        committed: bool = false,
+
+        pub fn prepare(self: Transaction, sql: []const u8) !Statement {
+            return self.db.prepareLocked(sql);
+        }
+
+        pub fn commit(self: *Transaction) !void {
+            try self.db.execLocked("COMMIT");
+            self.committed = true;
+        }
+
+        pub fn deinit(self: Transaction) void {
+            if (!self.committed) self.db.execLocked("ROLLBACK") catch {};
+            self.db.mutex.unlock();
+        }
+    };
+
+    pub fn beginTransaction(self: *Database, mode: enum { read, write }) !Transaction {
+        self.mutex.lock();
+        errdefer self.mutex.unlock();
+        try self.execLocked(if (mode == .write) "BEGIN IMMEDIATE" else "BEGIN");
+        return .{ .db = self };
     }
 
     pub const ProvisioningChange = struct {
@@ -2721,8 +2750,9 @@ pub const Database = struct {
     }
 
     pub fn deleteUser(self: *Database, username: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        var tx = try self.beginTransaction(.write);
+        defer tx.deinit();
+        try team_store.beforeAccountDeletion(tx, username);
 
         try self.deleteUserSessionsLocked(username);
         try self.deleteUserResetTokensLocked(username);
@@ -2748,6 +2778,7 @@ pub const Database = struct {
         if (rc != sqlite.SQLITE_DONE) {
             return DatabaseError.StepFailed;
         }
+        try tx.commit();
     }
 
     // ── Webmail browser sessions ────────────────────────────────────────────
@@ -3153,20 +3184,7 @@ pub const Database = struct {
             \\CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_log(actor);
         ;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
-        defer self.allocator.free(sql_z);
-
-        var errmsg: [*c]u8 = null;
-        const rc = sqlite.sqlite3_exec(self.db, sql_z.ptr, null, null, &errmsg);
-        if (rc != sqlite.SQLITE_OK) {
-            if (errmsg != null) {
-                sqlite.sqlite3_free(errmsg);
-            }
-            return DatabaseError.InitFailed;
-        }
+        try self.exec(sql);
     }
 
     /// Insert an audit log entry

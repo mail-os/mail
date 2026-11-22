@@ -33,6 +33,7 @@ const socket = @import("../core/socket_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const logger = @import("../core/logger.zig");
 const database = @import("../storage/database.zig");
+const teams = @import("../storage/team_store.zig");
 const auth_mod = @import("../auth/auth.zig");
 const session_mod = @import("webmail_session.zig");
 const maildir = @import("webmail_maildir.zig");
@@ -513,6 +514,8 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.eql(u8, p, "/webmail/api/preferences") and std.mem.eql(u8, req.method, "PUT")) return handlePreferences(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/compose-library") and
         (std.mem.eql(u8, req.method, "GET") or std.mem.eql(u8, req.method, "PUT"))) return handleComposeLibrary(server, conn, arena, req);
+    if (std.mem.eql(u8, p, "/webmail/api/teams") or std.mem.startsWith(u8, p, "/webmail/api/teams/"))
+        return handleTeams(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/sender-review/status") and std.mem.eql(u8, req.method, "GET")) return handleSenderReviewStatus(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/sender-review") and std.mem.eql(u8, req.method, "GET")) return handleSenderReviewList(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/sender-review") and std.mem.eql(u8, req.method, "PUT")) return handleSenderReviewSettings(server, conn, arena, req);
@@ -1534,6 +1537,54 @@ fn handleComposeLibrary(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a
         else => return mapServiceError(conn, arena, err),
     };
     return sendJson(conn, arena, 200, try service_mod.json(arena, library), null);
+}
+
+fn handleTeams(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
+    const editing = std.mem.eql(u8, req.method, "PUT");
+    const reading = std.mem.eql(u8, req.method, "GET");
+    if (editing and !isSameOrigin(req)) return sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const path = "/webmail/api/teams";
+    if (std.mem.eql(u8, req.path, path) and reading) {
+        const rows = teams.list(server.db, arena, sess.username) catch |err| return teamError(conn, arena, err);
+        return sendJson(conn, arena, 200, try service_mod.json(arena, rows), null);
+    }
+    if (req.path.len <= path.len) return teamError(conn, arena, error.TeamNotFound);
+    var parts = std.mem.splitScalar(u8, req.path[path.len + 1 ..], '/');
+    const team = parts.next().?;
+    const action = parts.next();
+    if (!teams.validTeamId(team) or parts.next() != null) return teamError(conn, arena, error.TeamNotFound);
+    const actor: teams.Actor = .{ .mailbox = sess.username };
+    if (reading and action == null) {
+        const detail = teams.details(server.db, arena, actor, team) catch |err| return teamError(conn, arena, err);
+        return sendJson(conn, arena, 200, try service_mod.json(arena, detail), null);
+    }
+    if (!editing or action == null) return teamError(conn, arena, error.TeamNotFound);
+    if (req.body.len > 8192) return teamError(conn, arena, error.InvalidTeamData);
+    if (std.mem.eql(u8, action.?, "members")) {
+        const body = std.json.parseFromSliceLeaky(struct { mailbox: []const u8, role: ?teams.Role }, arena, req.body, .{}) catch
+            return teamError(conn, arena, error.InvalidTeamData);
+        teams.setMember(server.db, arena, actor, team, body.mailbox, body.role) catch |err| return teamError(conn, arena, err);
+    } else if (std.mem.eql(u8, action.?, "grants")) {
+        const Body = struct { source: []const u8, grantee: []const u8, scope: teams.Scope, resource: []const u8 = "", allowed: bool };
+        const body = std.json.parseFromSliceLeaky(Body, arena, req.body, .{}) catch return teamError(conn, arena, error.InvalidTeamData);
+        teams.setGrant(server.db, arena, actor, team, .{ .source = body.source, .grantee = body.grantee, .scope = body.scope, .resource = body.resource }, body.allowed) catch |err|
+            return teamError(conn, arena, err);
+    } else return teamError(conn, arena, error.TeamNotFound);
+    return sendJson(conn, arena, 200, "{\"ok\":true}", null);
+}
+
+fn teamError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: anyerror) !void {
+    return switch (err) {
+        error.TeamNotFound => sendError(conn, arena, 404, "team_not_found", "Team not found."),
+        error.TeamMemberNotFound => sendError(conn, arena, 404, "team_member_not_found", "Mailbox or team member not found."),
+        error.TeamForbidden => sendError(conn, arena, 403, "team_forbidden", "You do not have permission to change this team or grant."),
+        error.LastTeamOwner => sendError(conn, arena, 409, "last_team_owner", "Assign another owner before changing this membership."),
+        error.DisabledTeamAccount => sendError(conn, arena, 409, "team_account_disabled", "Activate the mailbox before granting team access."),
+        error.InvalidTeamData => sendError(conn, arena, 400, "invalid_team_data", "Check the team, mailbox, role, or resource."),
+        else => mapServiceError(conn, arena, err),
+    };
 }
 
 fn handleUpload(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {

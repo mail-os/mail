@@ -8,6 +8,7 @@ const user_remote = @import("cli/user_remote.zig");
 const user_local = @import("cli/user_local.zig");
 const migrate_mod = @import("cli/migrate.zig");
 const domain_mod = @import("cli/domain.zig");
+const team_mod = @import("cli/team.zig");
 const gdpr_mod = @import("cli/gdpr.zig");
 const search_mod = @import("cli/search.zig");
 const benchmark_mod = @import("cli/benchmark.zig");
@@ -20,8 +21,8 @@ fn isHelp(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h");
 }
 
-fn showUserHelp(root: *cli.BaseCommand, args: []const []const u8, allocator: std.mem.Allocator) !bool {
-    if (!std.mem.eql(u8, args[0], "user") and !std.mem.eql(u8, args[0], "user:local")) return false;
+fn showCommandHelp(root: *cli.BaseCommand, args: []const []const u8, allocator: std.mem.Allocator) !bool {
+    if (!std.mem.eql(u8, args[0], "user") and !std.mem.eql(u8, args[0], "user:local") and !std.mem.eql(u8, args[0], "team")) return false;
     const group = root.findSubcommand(args[0]).?;
     var help = cli.Help.init(allocator);
     if (args.len == 1 or isHelp(args[1])) {
@@ -31,7 +32,7 @@ fn showUserHelp(root: *cli.BaseCommand, args: []const []const u8, allocator: std
 
     const action = group.findSubcommand(args[1]) orelse {
         std.debug.print("Error: unknown {s} command '{s}'. Run 'mail {s} --help' to list commands.\n", .{ group.name, args[1], group.name });
-        return error.UnknownUserCommand;
+        return error.UnknownSubcommand;
     };
     var index: usize = 2;
     while (index < args.len) : (index += 1) {
@@ -63,6 +64,7 @@ pub fn main(init: std.process.Init) !void {
     _ = try root_cmd.addCommand(try user_local.setup(allocator));
     _ = try root_cmd.addCommand(try migrate_mod.setup(allocator));
     _ = try root_cmd.addCommand(try domain_mod.setup(allocator));
+    _ = try root_cmd.addCommand(try team_mod.setup(allocator));
     _ = try root_cmd.addCommand(try gdpr_mod.setup(allocator));
     _ = try root_cmd.addCommand(try search_mod.setup(allocator));
     _ = try root_cmd.addCommand(try benchmark_mod.setup(allocator));
@@ -87,11 +89,11 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    const user_help = showUserHelp(root_cmd, args_list.items, allocator) catch |err| switch (err) {
-        error.UnknownUserCommand => std.process.exit(1),
+    const shown_help = showCommandHelp(root_cmd, args_list.items, allocator) catch |err| switch (err) {
+        error.UnknownSubcommand => std.process.exit(1),
         else => return err,
     };
-    if (user_help) return;
+    if (shown_help) return;
 
     var parser = cli.Parser.init(allocator);
     parser.parse(root_cmd, args_list.items) catch |err| {

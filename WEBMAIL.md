@@ -296,6 +296,42 @@ send delay 0–30 seconds. Effective attachment limits also respect mailbox limi
 and the MIME expansion budget under `SMTP_MAX_MESSAGE_SIZE`; the UI displays the
 actual effective limit. A user may choose a 0–30 second send delay in the composer.
 
+## Self-hosted team administration
+
+Run these commands on the Mail host using the service database and a local
+operator account that can write to it. The mailboxes must already exist.
+
+```sh
+mail team create studio "Studio" owner@example.com
+mail team member studio colleague@example.com member
+mail team grant studio owner@example.com colleague@example.com sender
+mail team show studio
+mail team revoke studio owner@example.com colleague@example.com sender
+mail team member studio colleague@example.com remove
+```
+
+The API exposes roster and grant records through `GET /webmail/api/teams`
+and `GET /webmail/api/teams/:id`. Team members see their own membership and
+grants they participate in. Owners and admins see the full team. Local
+operators enroll mailboxes. Owners manage existing roles with
+`PUT /webmail/api/teams/:id/members` and `{mailbox, role}`. A null role removes
+the membership. Admins may remove ordinary members.
+
+`PUT /webmail/api/teams/:id/grants` accepts
+`{source, grantee, scope, resource, allowed}`. Both mailboxes must be on the
+team. A member can grant or revoke access to their own resources. Owners and
+admins can also revoke grants within the team. The scopes `mailbox`, `sender`,
+and `search` take an empty resource. The scopes `calendar`, `attachments`, and
+`comments` take a specific resource ID. See the team workflow issues for
+the rollout of these permissions to mail and calendar clients.
+
+Assign a replacement before deleting, removing, or demoting the final owner.
+A suspended mailbox retains its assigned role and cannot use its credentials.
+The local operator can appoint an enabled replacement. Membership removal
+revokes existing webmail sessions and deletes grants in both directions.
+Role changes revoke the affected user's webmail sessions. The server records
+membership and grant changes in `audit_log` in the same transaction.
+
 ## API contracts
 
 All mutations require a session and same-origin request. Clients include
