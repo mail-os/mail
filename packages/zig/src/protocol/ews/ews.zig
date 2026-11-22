@@ -884,61 +884,7 @@ fn elementText(soap: []const u8, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Decode the XML entities EWS uses to escape Subject/Body text.
-fn xmlUnescape(a: std.mem.Allocator, s: []const u8) ![]u8 {
-    var buf = std.ArrayList(u8).empty;
-    errdefer buf.deinit(a);
-    var i: usize = 0;
-    while (i < s.len) {
-        if (s[i] == '&') {
-            if (std.mem.startsWith(u8, s[i..], "&amp;")) {
-                try buf.append(a, '&');
-                i += 5;
-                continue;
-            }
-            if (std.mem.startsWith(u8, s[i..], "&lt;")) {
-                try buf.append(a, '<');
-                i += 4;
-                continue;
-            }
-            if (std.mem.startsWith(u8, s[i..], "&gt;")) {
-                try buf.append(a, '>');
-                i += 4;
-                continue;
-            }
-            if (std.mem.startsWith(u8, s[i..], "&quot;")) {
-                try buf.append(a, '"');
-                i += 6;
-                continue;
-            }
-            if (std.mem.startsWith(u8, s[i..], "&apos;")) {
-                try buf.append(a, '\'');
-                i += 6;
-                continue;
-            }
-            if (std.mem.startsWith(u8, s[i..], "&#")) {
-                if (std.mem.indexOfScalarPos(u8, s, i, ';')) |semi| {
-                    const num = s[i + 2 .. semi];
-                    const cp: ?u21 = if (num.len > 1 and (num[0] == 'x' or num[0] == 'X'))
-                        (std.fmt.parseInt(u21, num[1..], 16) catch null)
-                    else
-                        (std.fmt.parseInt(u21, num, 10) catch null);
-                    if (cp) |code| {
-                        var utf8: [4]u8 = undefined;
-                        if (std.unicode.utf8Encode(code, &utf8)) |n| {
-                            try buf.appendSlice(a, utf8[0..n]);
-                            i = semi + 1;
-                            continue;
-                        } else |_| {}
-                    }
-                }
-            }
-        }
-        try buf.append(a, s[i]);
-        i += 1;
-    }
-    return buf.toOwnedSlice(a);
-}
+const xmlUnescape = xml.unescapeText;
 
 /// Collect the `<t:EmailAddress>` values inside a recipients block.
 fn collectEmails(a: std.mem.Allocator, block: []const u8, out: *std.ArrayList([]const u8)) !void {

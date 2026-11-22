@@ -1640,7 +1640,7 @@ pub const CalDavStore = struct {
         return self.getCalendarByName(owner_id, target.collection) orelse error.CalendarNotFound;
     }
 
-    const SharedDavCalendar = struct { id: u64, permission: CalendarPermission };
+    const SharedDavCalendar = struct { calendar: Calendar, permission: CalendarPermission };
 
     fn sharedDavCalendarLocked(self: *Self, access: CalendarRequest, target: DavCalendarTarget, action: CalendarAction) !SharedDavCalendar {
         const calendar = try self.resolveDavCalendarLocked(access, target);
@@ -1650,7 +1650,7 @@ pub const CalDavStore = struct {
             .viewer => if (action == .edit) return error.CalendarNotFound,
             .free_busy => return error.CalendarNotFound,
         }
-        return .{ .id = calendar.id, .permission = permission };
+        return .{ .calendar = calendar, .permission = permission };
     }
 
     fn sharedDavEventLocked(self: *Self, calendar_id: u64, uid: []const u8) !?Event {
@@ -1665,7 +1665,7 @@ pub const CalDavStore = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const calendar = try self.sharedDavCalendarLocked(access, target, .read);
-        const event = (try self.sharedDavEventLocked(calendar.id, uid)) orelse return error.EventNotFound;
+        const event = (try self.sharedDavEventLocked(calendar.calendar.id, uid)) orelse return error.EventNotFound;
         return copyEventResource(arena, event);
     }
 
@@ -1677,7 +1677,7 @@ pub const CalDavStore = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const calendar = try self.sharedDavCalendarLocked(access, target, .edit);
-        _ = try self.sharedDavEventLocked(calendar.id, uid);
+        _ = try self.sharedDavEventLocked(calendar.calendar.id, uid);
     }
 
     pub fn putSharedDavEvent(self: *Self, username: []const u8, target: DavCalendarTarget, uid: []const u8, conditions: ResourceConditions, data: EventData) !PutResource {
@@ -1686,9 +1686,9 @@ pub const CalDavStore = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const calendar = try self.sharedDavCalendarLocked(access, target, .edit);
-        const existing = try self.sharedDavEventLocked(calendar.id, uid);
+        const existing = try self.sharedDavEventLocked(calendar.calendar.id, uid);
         try self.validateSharedEdit(.editor, data.ics_data orelse "");
-        return self.putEventResourceLocked(calendar.id, existing, conditions, data);
+        return self.putEventResourceLocked(calendar.calendar.id, existing, conditions, data);
     }
 
     pub fn deleteSharedDavEvent(self: *Self, username: []const u8, target: DavCalendarTarget, uid: []const u8, conditions: ResourceConditions) !void {
@@ -1697,59 +1697,60 @@ pub const CalDavStore = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const calendar = try self.sharedDavCalendarLocked(access, target, .edit);
-        const event = (try self.sharedDavEventLocked(calendar.id, uid)) orelse return error.EventNotFound;
+        const event = (try self.sharedDavEventLocked(calendar.calendar.id, uid)) orelse return error.EventNotFound;
         if (!conditions.allows(event.etag)) return error.PreconditionFailed;
         try self.deleteEventLocked(event.id);
     }
 
-    pub const SharedDavMember = struct { uid: []const u8, etag: []const u8, body: []const u8 };
-    pub const DavDateFilter = struct {
-        start: ?i64 = null,
-        end: ?i64 = null,
-
-        pub fn matches(self: DavDateFilter, event: Event) bool {
-            if (self.start) |start| if ((event.dtend orelse event.dtstart) < start) return false;
-            if (self.end) |end| if (event.dtstart >= end) return false;
-            return true;
-        }
-    };
+    pub const DavCalendarMember = struct { uid: []const u8, etag: []const u8, source: icalendar_busy.Source };
     pub const SharedDavListing = union(enum) {
         collection,
         etags,
-        events: DavDateFilter,
+        events,
         requested: std.StringHashMapUnmanaged(void),
     };
-    pub const SharedDavSnapshot = struct { editable: bool, members: []const SharedDavMember = &.{} };
+    pub const DavCalendarSnapshot = struct {
+        timezone: []const u8 = "UTC",
+        editable: bool = false,
+        members: []const DavCalendarMember = &.{},
+    };
 
-    pub fn snapshotSharedDavMembers(self: *Self, arena: Allocator, username: []const u8, target: DavCalendarTarget, listing: SharedDavListing) !SharedDavSnapshot {
+    pub fn snapshotSharedDavMembers(self: *Self, arena: Allocator, username: []const u8, target: DavCalendarTarget, listing: SharedDavListing) !DavCalendarSnapshot {
         const access = try self.beginCalendarAccess(username, .read);
         defer access.deinit();
         self.mutex.lock();
         defer self.mutex.unlock();
-        const calendar = try self.sharedDavCalendarLocked(access, target, .read);
-        var snapshot: SharedDavSnapshot = .{ .editable = calendar.permission != .viewer };
-        if (listing == .collection) return snapshot;
-        var members: std.ArrayList(SharedDavMember) = .empty;
+        const authorized = try self.sharedDavCalendarLocked(access, target, .read);
+        var snapshot = try self.snapshotDavCalendarLocked(arena, authorized.calendar, listing, .shared);
+        snapshot.editable = authorized.permission != .viewer;
+        return snapshot;
+    }
+
+    pub fn snapshotOwnedDavQuery(self: *Self, arena: Allocator, user_id: u64, collection: []const u8) !DavCalendarSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const calendar = self.getCalendarByName(user_id, collection) orelse return .{};
+        return self.snapshotDavCalendarLocked(arena, calendar, .events, .owner);
+    }
+
+    fn snapshotDavCalendarLocked(self: *Self, arena: Allocator, calendar: Calendar, listing: SharedDavListing, visibility: enum { owner, shared }) !DavCalendarSnapshot {
+        if (listing == .collection) return .{};
+        var members: std.ArrayList(DavCalendarMember) = .empty;
         var bytes: usize = 0;
         var events = self.events.valueIterator();
         while (events.next()) |event| {
-            if (event.calendar_id != calendar.id or !event.shareable) continue;
-            switch (listing) {
-                .events => |filter| if (!filter.matches(event.*)) continue,
-                .requested => |uids| if (!uids.contains(event.uid)) continue,
-                else => {},
-            }
+            if (event.calendar_id != calendar.id or (visibility == .shared and !event.shareable)) continue;
+            if (listing == .requested and !listing.requested.contains(event.uid)) continue;
             const body = if (listing == .etags) "" else event.ics_data;
             bytes += event.uid.len + event.etag.len + body.len;
             if (bytes > icalendar.max_export_bytes) return error.CalendarExportTooLarge;
             try members.append(arena, .{
                 .uid = try arena.dupe(u8, event.uid),
                 .etag = try arena.dupe(u8, event.etag),
-                .body = try arena.dupe(u8, body),
+                .source = try copyCalendarSource(arena, event.*, body),
             });
         }
-        snapshot.members = members.items;
-        return snapshot;
+        return .{ .timezone = try arena.dupe(u8, calendar.timezone), .members = members.items };
     }
 
     pub fn webCalendarBusyPeriods(self: *Self, arena: Allocator, username: []const u8, id: u64, window: CalendarWindow) ![]icalendar_busy.Window {
@@ -1793,16 +1794,20 @@ pub const CalDavStore = struct {
             if (event.calendar_id != calendar.id) continue;
             bytes += event.ics_data.len;
             if (bytes > 16 * 1024 * 1024 or sources.items.len == 32_000) return error.AvailabilityLimit;
-            try sources.append(arena, .{
-                .icalendar = try arena.dupe(u8, event.ics_data),
-                .start = event.dtstart,
-                .end = event.dtend,
-                .all_day = event.all_day,
-                .cancelled = event.status == .cancelled,
-                .tentative = event.status == .tentative,
-            });
+            try sources.append(arena, try copyCalendarSource(arena, event.*, event.ics_data));
         }
         return .{ .timezone = try arena.dupe(u8, calendar.timezone), .sources = sources.items };
+    }
+
+    fn copyCalendarSource(arena: Allocator, event: Event, body: []const u8) !icalendar_busy.Source {
+        return .{
+            .icalendar = try arena.dupe(u8, body),
+            .start = event.dtstart,
+            .end = event.dtend,
+            .all_day = event.all_day,
+            .cancelled = event.status == .cancelled,
+            .tentative = event.status == .tentative,
+        };
     }
 
     fn validateCalendarQuery(window: ?CalendarWindow, query: []const u8) !void {

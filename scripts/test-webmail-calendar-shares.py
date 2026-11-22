@@ -581,6 +581,108 @@ def verify_dav_editors(test, scan, owner, viewer, foreign, calendar_id):
     expect(change(test, captain, calendar_id, viewer, "viewer"))
 
 
+def verify_dav_recurrence_query(test, owner, viewer):
+    calendar = "Recurring query cases"
+    captain = test.login(owner)
+    calendar_id = expect(test.api(captain, "calendars", {"name": calendar}), 201)["id"]
+    path = calendar_path(owner, calendar)
+    stamp = "DTSTAMP:20261122T120000Z"
+
+    def event(uid, *fields):
+        return ("BEGIN:VEVENT", f"UID:{uid}", stamp, f"SUMMARY:{uid}", *fields, "END:VEVENT")
+
+    def store(uid, *components):
+        write_resource(test, owner, calendar, uid, [
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail recurrence query fixture//EN",
+            *components, "END:VCALENDAR", "",
+        ])
+        return f"{path}/{uid}.ics"
+
+    weekly = store("weekly", *event(
+        "weekly", "DTSTART:20261208T100000Z", "DTEND:20261208T110000Z", "RRULE:FREQ=WEEKLY;COUNT=5",
+        "EXDATE:20261222T100000Z", "RDATE;VALUE=PERIOD:20270104T103000Z/PT15M",
+    ), *event("weekly", "RECURRENCE-ID:20261215T100000Z", "DTSTART:20261216T120000Z"),
+        *event("weekly", "RECURRENCE-ID:20261229T100000Z", "STATUS:CANCELLED"))
+    zoned = store("zoned", *event(
+        "zoned", "DTSTART;TZID=America/New_York:20260307T090000", "DURATION:PT1H", "RRULE:FREQ=DAILY;COUNT=3",
+    ))
+    all_day = store("all-day", *event("all-day", "DTSTART;VALUE=DATE:20261201", "RRULE:FREQ=DAILY;COUNT=2"))
+    floating = store("floating", *event("floating", "DTSTART:20261205T090000"))
+    transparent = store("transparent", *event(
+        "transparent", "DTSTART:20261210T100000Z", "DURATION:PT30M", "TRANSP:TRANSPARENT",
+    ))
+    store("cancelled", *event("cancelled", "DTSTART:20261210T100000Z", "DURATION:PT30M", "STATUS:CANCELLED"))
+    protected = store("protected", *event(
+        "protected", "DTSTART:20261208T100000Z", "DURATION:PT1H", "RRULE:FREQ=WEEKLY;COUNT=2",
+    ), *event("protected", "RECURRENCE-ID:20261215T100000Z", "DTSTART:20261216T120000Z", "CLASS:PRIVATE"))
+    fixed_timezone = "\r\n".join([
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail test timezone//EN", "BEGIN:VTIMEZONE",
+        "TZID:Fixture", "BEGIN:STANDARD", "DTSTART:19700101T000000",
+        "TZOFFSETFROM:-0500", "TZOFFSETTO:-0500", "END:STANDARD", "END:VTIMEZONE", "END:VCALENDAR",
+    ])
+    headers = {"Depth": "1", "Content-Type": "application/xml"}
+    owner_dav, guest_dav = DavClient(test, owner), DavClient(test, viewer)
+    expect(change(test, captain, calendar_id, viewer, "viewer"))
+
+    def report(client, tls, start, end, *, timezone="", expected=207, component="VEVENT", quote_mark='"'):
+        bounds = " ".join(f"{field}={quote_mark}{value}{quote_mark}" for field, value in (("start", start), ("end", end)) if value)
+        zone = f"<C:timezone><![CDATA[{timezone}]]></C:timezone>" if timezone else ""
+        body = (f"<?xml version='1.0'?><C:calendar-query xmlns:C='{CALDAV}' xmlns:D='DAV:'>"
+                "<D:prop><D:getetag/><C:calendar-data/></D:prop>"
+                "<C:filter><C:comp-filter name='VCALENDAR'>"
+                f"<C:comp-filter name='{component}'><C:time-range {bounds}/></C:comp-filter>"
+                f"</C:comp-filter></C:filter>{zone}</C:calendar-query>")
+        status, _, data = client.request("REPORT", path, body, headers, tls=tls)
+        assert status == expected, (start, end, status, data)
+        if expected != 207:
+            return data
+        responses = ET.fromstring(data).findall("{DAV:}response")
+        return {item.findtext("{DAV:}href"): item.findtext(f".//{{{CALDAV}}}calendar-data") for item in responses}
+
+    for client in (owner_dav, guest_dav):
+        for tls in (True, False):
+            # The moved instance inherits the master's duration. The original
+            # slot, EXDATE, and cancelled override have no matching occurrence.
+            moved = report(client, tls, "20261216T125959Z", "20261216T130000Z")
+            assert set(moved) == ({weekly, protected} if client is owner_dav else {weekly}), moved
+            assert "RECURRENCE-ID:20261215T100000Z" in moved[weekly]
+            for night in ("15", "22", "29"):
+                assert not report(client, tls, f"202612{night}T100000Z", f"202612{night}T110000Z")
+            assert not report(client, tls, "20261216T130000Z", "20261216T140000Z")
+            assert not report(client, tls, "20261216T110000Z", "20261216T120000Z")
+            assert set(report(client, tls, "20270104T104459Z", "20270104T104500Z")) == {weekly}
+            assert not report(client, tls, "20270104T104500Z", "20270104T110000Z")
+            assert set(report(client, tls, "20270105T100000Z", "20270105T100100Z", quote_mark="'")) == {weekly}
+            assert set(report(client, tls, "20260309T130000Z", "20260309T130100Z")) == {zoned}
+            assert not report(client, tls, "20260309T140000Z", "20260309T140100Z")
+            assert set(report(client, tls, "20261202T235959Z", "20261203T000000Z")) == {all_day}
+            assert not report(client, tls, "20261203T000000Z", "20261203T000100Z")
+            assert set(report(client, tls, "20261203T000000Z", "20261203T000100Z", timezone=fixed_timezone)) == {all_day}
+            assert set(report(client, tls, "20261205T090000Z", "20261205T090001Z")) == {floating}
+            assert not report(client, tls, "20261205T085959Z", "20261205T090000Z")
+            assert set(report(client, tls, "20261205T140000Z", "20261205T140001Z", timezone=fixed_timezone)) == {floating}
+            assert set(report(client, tls, "20261210T100000Z", "20261210T103000Z")) == {transparent}
+            assert set(report(client, tls, "20270104T103000Z", None)) == {weekly}
+            assert set(report(client, tls, None, "20260307T140001Z")) == {zoned}
+            report(client, tls, "20260230T000000Z", "20260301T000000Z", expected=400)
+            report(client, tls, "20261203T000000Z", "20261203T000000Z", expected=400)
+            invalid = report(client, tls, "20261201T000000Z", "20261202T000000Z", component="VTODO", expected=403)
+            assert ET.fromstring(invalid).find(f"{{{CALDAV}}}supported-filter") is not None
+    hourly = store("hourly", *event(
+        "hourly", "DTSTART:20261225T090000Z", "DURATION:PT5M", "RRULE:FREQ=HOURLY;COUNT=3",
+    ))
+    report(owner_dav, True, "20261225T100000Z", "20261225T100500Z", expected=422)
+    assert guest_dav.request("PROPFIND", path, headers=headers)[0] == 207
+    assert owner_dav.request("DELETE", hourly)[0] == 204
+    store("dense-history", *event(
+        "dense-history", "DTSTART:10000101T000000Z", "DURATION:PT5M", "RRULE:FREQ=DAILY",
+    ))
+    limited = report(guest_dav, True, "20261225T000000Z", "20261225T000500Z", expected=507)
+    assert ET.fromstring(limited).find("{DAV:}number-of-matches-within-limits") is not None
+    expect(change(test, captain, calendar_id, viewer, None))
+    assert owner_dav.request("DELETE", path)[0] == 204
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
@@ -604,6 +706,7 @@ def main():
             calendar_id = verify(test, db, owner, viewer, colleague, foreign)
             verify_editors(test, scan, owner, viewer, colleague, calendar_id)
             verify_dav_editors(test, scan, owner, viewer, foreign, calendar_id)
+            verify_dav_recurrence_query(test, owner, viewer)
             verify_availability(test, owner, viewer)
 
         with test.daemon():
@@ -631,7 +734,7 @@ def main():
             dav_busy(DavClient(test, viewer), calendar_path(owner, CALENDAR), status=404)
             assert DavClient(test, viewer).request("GET", calendar_path(owner, CALENDAR) + "/Replacement.ics")[0] == 404
 
-    print("Verified calendar sharing in webmail and CalDAV, including public event reads and writes, private free/busy, revision races, revocation, restart, and calendar ID reuse.")
+    print("Verified calendar sharing in webmail and CalDAV, including recurrence queries, public event reads and writes, private free/busy, revision races, revocation, restart, and calendar ID reuse.")
 
 
 if __name__ == "__main__":

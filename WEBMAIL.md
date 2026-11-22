@@ -491,6 +491,15 @@ Use the shared collection URL directly and refresh the listing to reconcile
 changes. Shared collections are not listed in the teammate's calendar home
 and do not expose the owner's sync token, change tag, or change journal.
 
+In both owned and shared collections, a `VEVENT` time range in a
+`calendar-query` report matches any overlapping occurrence. Results include
+the original resource. The range includes its start and excludes its end.
+Daily, weekly, monthly, and yearly rules, explicit dates and periods,
+exclusions, and individual overrides are supported. A report can supply a
+`VTIMEZONE` for floating times. Transparent events still match.
+An incomplete calculation returns 422. Exceeding the recurrence work limit
+returns 507.
+
 Editors can `PUT` and `DELETE` public events in the existing shared
 collection. Use `If-None-Match: *` to create and `If-Match` with the latest
 ETag to update or delete. Private and confidential resources return 404,

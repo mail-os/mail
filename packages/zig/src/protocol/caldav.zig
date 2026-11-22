@@ -11,6 +11,8 @@ const time_compat = @import("../core/time_compat.zig");
 const caldav_store = @import("../storage/caldav_store.zig");
 const calendar_import = @import("../api/webmail_calendar_import.zig");
 const free_busy = @import("caldav_free_busy.zig");
+const calendar_query = @import("caldav_query.zig");
+const recurrence = @import("icalendar_busy.zig");
 const autoconfig = @import("../api/autoconfig.zig");
 const eas = @import("eas.zig");
 const ews = @import("ews/ews.zig");
@@ -858,7 +860,7 @@ pub const CalDavSession = struct {
             .report => blk: {
                 var xml = body;
                 const root = nextXmlOpen(&xml) orelse return self.sendError(404, "Not Found");
-                if (std.mem.eql(u8, root.localName(), "calendar-query")) break :blk .{ .events = calendarDateFilter(body) };
+                if (std.mem.eql(u8, root.localName(), "calendar-query")) break :blk .events;
                 if (std.mem.eql(u8, root.localName(), "calendar-multiget"))
                     return self.handleSharedCalendarMultiget(a, username, target, xml);
                 return self.sendError(404, "Not Found");
@@ -868,17 +870,12 @@ pub const CalDavSession = struct {
         const snapshot = self.store.snapshotSharedDavMembers(a, username, target, listing) catch |err|
             return self.sendResourceError(err);
         if (method == .options) return self.handleOptions();
+        if (listing == .events) return self.sendCalendarQuery(a, owner_path, target.collection, body, snapshot);
         var buf: std.ArrayList(u8) = .empty;
         try buf.appendSlice(a, dav_multistatus_start);
-        if (method == .propfind) try self.appendDavCollection(&buf, a, owner_path, target.collection, .event, null, null, snapshot.editable);
+        try self.appendDavCollection(&buf, a, owner_path, target.collection, .event, null, null, snapshot.editable);
         for (snapshot.members) |member| {
-            if (method == .propfind) {
-                try appendDavSyncMember(&buf, a, owner_path, target.collection, .event, .{ .uid = member.uid, .etag = member.etag });
-            } else {
-                try buf.appendSlice(a, "  <D:response>\n");
-                try appendResourceHref(&buf, a, "/calendars/", owner_path, target.collection, member.uid, ".ics");
-                try appendMultigetProperties(&buf, a, "C:calendar-data", member.etag, member.body);
-            }
+            try appendDavSyncMember(&buf, a, owner_path, target.collection, .event, .{ .uid = member.uid, .etag = member.etag });
         }
         try buf.appendSlice(a, "</D:multistatus>");
         return self.sendMultistatusResponse(buf.items);
@@ -898,7 +895,7 @@ pub const CalDavSession = struct {
         }
         const snapshot = self.store.snapshotSharedDavMembers(a, username, target, .{ .requested = uids }) catch |err|
             return self.sendResourceError(err);
-        var members: std.StringHashMapUnmanaged(caldav_store.CalDavStore.SharedDavMember) = .empty;
+        var members: std.StringHashMapUnmanaged(caldav_store.CalDavStore.DavCalendarMember) = .empty;
         for (snapshot.members) |member| try members.put(a, member.uid, member);
 
         var buf: std.ArrayList(u8) = .empty;
@@ -907,7 +904,7 @@ pub const CalDavSession = struct {
             try buf.appendSlice(a, "  <D:response>\n");
             try appendHrefEscaped(&buf, a, item.href);
             if (if (item.uid) |uid| members.get(uid) else null) |member| {
-                try appendMultigetProperties(&buf, a, "C:calendar-data", member.etag, member.body);
+                try appendMultigetProperties(&buf, a, "C:calendar-data", member.etag, member.source.icalendar);
             } else {
                 try appendMultigetProperties(&buf, a, "C:calendar-data", null, "");
             }
@@ -1534,85 +1531,44 @@ pub const CalDavSession = struct {
         }
     }
 
-    /// Parse iCalendar date from XML attribute value (YYYYMMDDTHHMMSSZ)
-    fn parseIcalDateFromXml(value: []const u8) ?i64 {
-        if (value.len < 8) return null;
-        var year = std.fmt.parseInt(i64, value[0..4], 10) catch return null;
-        var month = std.fmt.parseInt(i64, value[4..6], 10) catch return null;
-        const day = std.fmt.parseInt(i64, value[6..8], 10) catch return null;
-        // Compute days since epoch
-        if (month <= 2) {
-            year -= 1;
-            month += 12;
-        }
-        const days = 365 * year + @divFloor(year, 4) - @divFloor(year, 100) + @divFloor(year, 400) + @divFloor((153 * (month - 3) + 2), 5) + day - 1 - 719468;
-        if (value.len >= 15 and value[8] == 'T') {
-            const hour = std.fmt.parseInt(i64, value[9..11], 10) catch return null;
-            const minute = std.fmt.parseInt(i64, value[11..13], 10) catch return null;
-            const second = std.fmt.parseInt(i64, value[13..15], 10) catch return null;
-            return days * 86400 + hour * 3600 + minute * 60 + second;
-        }
-        return days * 86400;
-    }
-
-    fn calendarDateFilter(body: []const u8) caldav_store.CalDavStore.DavDateFilter {
-        var filter: caldav_store.CalDavStore.DavDateFilter = .{};
-        if (std.mem.indexOf(u8, body, "time-range")) |_| {
-            if (std.mem.indexOf(u8, body, "start=\"")) |s| {
-                const val_start = s + 7;
-                if (std.mem.indexOf(u8, body[val_start..], "\"")) |val_end| {
-                    filter.start = parseIcalDateFromXml(body[val_start .. val_start + val_end]);
-                }
-            }
-            if (std.mem.indexOf(u8, body, "end=\"")) |s| {
-                const val_start = s + 5;
-                if (std.mem.indexOf(u8, body[val_start..], "\"")) |val_end| {
-                    filter.end = parseIcalDateFromXml(body[val_start .. val_start + val_end]);
-                }
-            }
-        }
-        return filter;
-    }
-
-    /// Handle calendar-query REPORT
     fn handleCalendarQuery(self: *CalDavSession, path: []const u8, request: []const u8) !void {
         const parsed = parsePath(path);
         const user_id = try self.getUserId();
-        const filter = calendarDateFilter(httpBody(request));
+        const collection = parsed.collection orelse "default";
+        const owner = parsed.user orelse "user";
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const snapshot = self.store.snapshotOwnedDavQuery(a, user_id, collection) catch |err|
+            return self.sendResourceError(err);
+        return self.sendCalendarQuery(a, owner, collection, httpBody(request), snapshot);
+    }
 
+    fn sendCalendarQuery(self: *CalDavSession, a: std.mem.Allocator, owner: []const u8, collection: []const u8, body: []const u8, snapshot: caldav_store.CalDavStore.DavCalendarSnapshot) !void {
+        const query = calendar_query.parse(a, body) catch |err| switch (err) {
+            error.InvalidXml, error.InvalidFilter => return self.sendError(400, "Invalid CalDAV filter"),
+            error.InvalidQueryTimezone => return self.sendError(400, "Invalid CalDAV timezone"),
+            error.UnsupportedFilter => return self.sendCalDavReportError("403 Forbidden", "supported-filter"),
+            else => return err,
+        };
+        var budget = recurrence.expansion_budget;
         var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.allocator);
-
-        try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-        try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n");
-
-        const collection_name = parsed.collection orelse "default";
-        const username = parsed.user orelse "user";
-
-        const calendars = self.store.getUserCalendars(user_id) catch &[_]caldav_store.Calendar{};
-        for (calendars) |cal| {
-            if (std.mem.eql(u8, cal.name, collection_name)) {
-                const events = self.store.getCalendarEvents(cal.id) catch &[_]caldav_store.Event{};
-                for (events) |event| {
-                    if (!filter.matches(event)) continue;
-                    try buf.appendSlice(self.allocator, "  <D:response>\n");
-                    try appendResourceHref(&buf, self.allocator, "/calendars/", username, collection_name, event.uid, ".ics");
-                    try buf.appendSlice(self.allocator, "    <D:propstat>\n");
-                    try buf.appendSlice(self.allocator, "      <D:prop>\n");
-                    try appendXmlEscaped(&buf, self.allocator, "        <D:getetag>", event.etag, "</D:getetag>\n");
-                    if (event.ics_data.len > 0) {
-                        try appendXmlEscaped(&buf, self.allocator, "        <C:calendar-data>", event.ics_data, "</C:calendar-data>\n");
-                    }
-                    try buf.appendSlice(self.allocator, "      </D:prop>\n");
-                    try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                    try buf.appendSlice(self.allocator, "    </D:propstat>\n");
-                    try buf.appendSlice(self.allocator, "  </D:response>\n");
-                }
-                break;
+        try buf.appendSlice(a, dav_multistatus_start);
+        for (snapshot.members) |member| {
+            if (query.window) |window| {
+                const matches = recurrence.overlaps(self.allocator, member.source, window, snapshot.timezone, query.timezone, &budget) catch |err| switch (err) {
+                    error.AvailabilityLimit => return self.sendDavReportError("507 Insufficient Storage", "number-of-matches-within-limits"),
+                    error.AvailabilityUnsupported, error.InvalidCalendar, error.UnsupportedTimezone => return self.sendError(422, "Calendar recurrence query incomplete"),
+                    else => return err,
+                };
+                if (!matches) continue;
             }
+            try buf.appendSlice(a, "  <D:response>\n");
+            try appendResourceHref(&buf, a, "/calendars/", owner, collection, member.uid, ".ics");
+            try appendMultigetProperties(&buf, a, "C:calendar-data", member.etag, member.source.icalendar);
         }
-        try buf.appendSlice(self.allocator, "</D:multistatus>");
-        try self.sendMultistatusResponse(buf.items);
+        try buf.appendSlice(a, "</D:multistatus>");
+        return self.sendMultistatusResponse(buf.items);
     }
 
     const XmlOpen = struct {
@@ -1669,9 +1625,11 @@ pub const CalDavSession = struct {
         if (etag) |version| {
             try buf.appendSlice(a, "    <D:propstat><D:prop>\n");
             try appendXmlEscaped(buf, a, "      <D:getetag>", version, "</D:getetag>\n");
-            try appendPrint(buf, a, "      <{s}>", .{payload_tag});
-            try appendXmlEscaped(buf, a, "", body, "");
-            try appendPrint(buf, a, "</{s}>\n", .{payload_tag});
+            if (body.len != 0) {
+                try appendPrint(buf, a, "      <{s}>", .{payload_tag});
+                try appendXmlEscaped(buf, a, "", body, "");
+                try appendPrint(buf, a, "</{s}>\n", .{payload_tag});
+            }
             try buf.appendSlice(a, "    </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>\n");
         } else {
             try buf.appendSlice(a, "    <D:status>HTTP/1.1 404 Not Found</D:status>\n");
@@ -1799,8 +1757,16 @@ pub const CalDavSession = struct {
     }
 
     fn sendDavReportError(self: *CalDavSession, status: []const u8, condition: []const u8) !void {
-        var body_buf: [128]u8 = undefined;
-        const body = try std.fmt.bufPrint(&body_buf, "<D:error xmlns:D=\"DAV:\"><D:{s}/></D:error>", .{condition});
+        var buf: [128]u8 = undefined;
+        return self.sendReportError(status, try std.fmt.bufPrint(&buf, "<D:error xmlns:D=\"DAV:\"><D:{s}/></D:error>", .{condition}));
+    }
+
+    fn sendCalDavReportError(self: *CalDavSession, status: []const u8, condition: []const u8) !void {
+        var buf: [192]u8 = undefined;
+        return self.sendReportError(status, try std.fmt.bufPrint(&buf, "<D:error xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><C:{s}/></D:error>", .{condition}));
+    }
+
+    fn sendReportError(self: *CalDavSession, status: []const u8, body: []const u8) !void {
         var header_buf: [192]u8 = undefined;
         const header = try std.fmt.bufPrint(&header_buf, "HTTP/1.1 {s}\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: {d}\r\n\r\n", .{ status, body.len });
         try self.writeAll(header);
