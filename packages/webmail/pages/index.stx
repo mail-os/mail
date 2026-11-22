@@ -19,6 +19,20 @@ useInterval(health.tick, 1000, { whileVisible: true })
 onMount(health.refresh)
 const ready = state(false)
 const foldersExpanded = state(false)
+const foldersToggle = useRef('foldersToggle')
+function closeFolders(restoreFocus = false) {
+  if (!foldersExpanded()) return
+  foldersExpanded.set(false)
+  if (restoreFocus) nextTick(() => foldersToggle.current?.focus())
+}
+function activateMailbox(event) {
+  const control = event.target?.closest('button, a')
+  if (control) closeFolders(control.getAttribute('aria-haspopup') !== 'dialog')
+}
+function startComposition() {
+  closeFolders()
+  compose()
+}
 const mail = useWebmail({
   composer: useRef('composerDialog'), password: useRef('passwordDialog'),
   confirmation: useRef('confirmDialog'), fileInput: useRef('fileInput'),
@@ -97,43 +111,47 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
 </script>
 <main :if="!ready || !user" class="wm-boot"><p role="status" :text="error || 'Opening your inbox…'"></p><button :if="error" @click="boot()">Retry connection</button></main>
 <div :if="ready && user" class="wm" :class="{ 'wm--reading': reading, 'wm--newsletter-expanded': readerExpanded, 'wm--reply-focused': followUpFocused }">
-  <aside class="wm-folders" :class="{ 'wm-folders--expanded': foldersExpanded }">
+  <aside class="wm-folders" :class="{ 'wm-folders--expanded': foldersExpanded }" @keydown.escape="closeFolders(true)">
     <div class="wm-brand"><span class="mail-app-mark"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span></span><span>Mail</span></div>
-    <button type="button" class="wm-folders-toggle wm-action" :aria-expanded="foldersExpanded" aria-controls="mailFolders" @click="foldersExpanded.set(!foldersExpanded())"><span class="mail-icon" data-icon="sidebar" aria-hidden="true"></span>Mailboxes</button>
-    <button class="wm-compose-btn" @click="compose()" :disabled="sending || sendUncertain"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span><span :text="hasComposition ? 'Resume draft' : 'Compose'"></span></button>
-    <nav id="mailFolders" class="wm-folder-list" aria-label="Mail folders" @click="foldersExpanded.set(false)">
-      <div class="wm-nav-group">
-        <span class="wm-nav-label">Mailboxes</span>
-        <button :for="item in coreFolders" :key="item.name" class="wm-folder" @click="selectFolder(item.name)" :disabled="mutating" :aria-current="!libraryView && !outboxView && !senderReviewOpen && !attentionView && item.name === folder ? 'page' : null">
-          <span class="mail-icon" :data-icon="isJunkFolder(item.name) ? 'shield' : mailFolderIcon(item.name)" aria-hidden="true"></span><span class="wm-folder-name" :text="folderName(item.name)"></span><span :if="(item.name === 'Drafts' ? item.total : item.unread) > 0" class="wm-folder-count" :text="item.name === 'Drafts' ? item.total : item.unread"></span>
-        </button>
-        <button class="wm-folder" :aria-current="!libraryView && !outboxView && !senderReviewOpen && !collectionId && folder === '*' ? 'page' : null" @click="selectFolder('*')" :disabled="mutating"><span class="mail-icon" data-icon="layers" aria-hidden="true"></span><span class="wm-folder-name">All mail</span></button>
-        <button class="wm-folder" :aria-current="outboxView ? 'page' : null" @click="showOutbox()"><span class="mail-icon" data-icon="outbox" aria-hidden="true"></span><span class="wm-folder-name">Outbox</span><span :if="outboxCount > 0" class="wm-folder-count" :text="outboxCount"></span></button>
-        <a :if="limits.sharedInboxesAvailable" class="wm-folder" href="/shared"><span class="mail-icon" data-icon="folder" aria-hidden="true"></span><span class="wm-folder-name">Shared inboxes</span></a>
+    <button ref="foldersToggle" type="button" class="wm-folders-toggle wm-action" :aria-expanded="foldersExpanded" aria-controls="mailNavigation" @click="foldersExpanded.set(!foldersExpanded())"><span class="mail-icon" data-icon="sidebar" aria-hidden="true"></span>Mailboxes<span class="mail-icon wm-mailboxes-indicator" data-icon="down" aria-hidden="true"></span></button>
+    <button type="button" class="wm-compose-btn" @click="startComposition()" :disabled="sending || sendUncertain"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span><span :text="hasComposition ? 'Resume draft' : 'Compose'"></span></button>
+    <div id="mailNavigation" class="wm-navigation">
+      <nav class="wm-folder-list" aria-label="Mail folders" @click="activateMailbox($event)">
+        <div class="wm-nav-group">
+          <span class="wm-nav-label">Mailboxes</span>
+          <button :for="item in coreFolders" :key="item.name" class="wm-folder" @click="selectFolder(item.name)" :disabled="mutating" :aria-current="!libraryView && !outboxView && !senderReviewOpen && !attentionView && item.name === folder ? 'page' : null">
+            <span class="mail-icon" :data-icon="isJunkFolder(item.name) ? 'shield' : mailFolderIcon(item.name)" aria-hidden="true"></span><span class="wm-folder-name" :text="folderName(item.name)"></span><span :if="(item.name === 'Drafts' ? item.total : item.unread) > 0" class="wm-folder-count" :text="item.name === 'Drafts' ? item.total : item.unread"></span>
+          </button>
+          <button class="wm-folder" :aria-current="!libraryView && !outboxView && !senderReviewOpen && !collectionId && folder === '*' ? 'page' : null" @click="selectFolder('*')" :disabled="mutating"><span class="mail-icon" data-icon="layers" aria-hidden="true"></span><span class="wm-folder-name">All mail</span></button>
+          <button class="wm-folder" :aria-current="outboxView ? 'page' : null" @click="showOutbox()"><span class="mail-icon" data-icon="outbox" aria-hidden="true"></span><span class="wm-folder-name">Outbox</span><span :if="outboxCount > 0" class="wm-folder-count" :text="outboxCount"></span></button>
+          <a :if="limits.sharedInboxesAvailable" class="wm-folder" href="/shared"><span class="mail-icon" data-icon="people" aria-hidden="true"></span><span class="wm-folder-name">Shared inboxes</span></a>
+        </div>
+        <div class="wm-nav-secondary">
+          <div class="wm-nav-group">
+            <span class="wm-nav-label">Collections</span>
+            <button :for="item in categoryFolders" :key="item.name" class="wm-folder" @click="selectFolder(item.name)" :disabled="mutating" :aria-current="!outboxView && !senderReviewOpen && !attentionView && item.name === folder ? 'page' : null">
+              <span class="mail-icon" :data-icon="mailFolderIcon(item.name)" aria-hidden="true"></span><span class="wm-folder-name" :text="folderName(item.name)"></span><span :if="item.unread > 0" class="wm-folder-count" :text="item.unread"></span>
+            </button>
+            <button class="wm-folder" :aria-current="libraryView ? 'page' : null" @click="showAttachmentLibrary()" :disabled="mutating"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span><span class="wm-folder-name">Attachments</span></button>
+            <button :if="senderReviewStatus" class="wm-folder" :aria-current="senderReviewOpen ? 'page' : null" @click="showSenderReview()" :disabled="mutating"><span class="mail-icon" data-icon="shield" aria-hidden="true"></span><span class="wm-folder-name">Sender Review</span><span :if="senderReviewStatus?.pending > 0" class="wm-folder-count" :text="senderReviewStatus?.pending"></span></button>
+          </div>
+          <div class="wm-nav-group">
+            <span class="wm-nav-label">Personal</span>
+            <a :if="limits.calendarAvailable" class="wm-folder" href="/calendar"><span class="mail-icon" data-icon="calendar" aria-hidden="true"></span><span class="wm-folder-name">Calendar</span></a>
+            <button :if="limits.calendarAvailable" type="button" class="wm-folder" @click="showContacts()" aria-haspopup="dialog"><span class="mail-icon" data-icon="contacts" aria-hidden="true"></span><span class="wm-folder-name">Contacts</span></button>
+            <button type="button" class="wm-folder" @click="showCollectionManager()" aria-haspopup="dialog"><span class="mail-icon" data-icon="bookmark" aria-hidden="true"></span><span class="wm-folder-name">My collections</span></button>
+            <button :for="item in privateCollections" :key="item.id" type="button" class="wm-folder" :aria-current="collectionId === item.id ? 'page' : null" @click="selectCollection(item)" :disabled="mutating"><span class="mail-icon" data-icon="folder" aria-hidden="true"></span><span class="wm-folder-name" :text="item.name"></span></button>
+          </div>
+          <div class="wm-nav-group">
+            <span class="wm-nav-label">Workflows</span>
+            <button :for="item in attentionViews" :key="item.name" class="wm-folder" :aria-current="attentionView === item.name ? 'page' : null" @click="selectAttention(item.name)" :disabled="mutating"><span class="mail-icon" :data-icon="mailFolderIcon(item.name)" aria-hidden="true"></span><span class="wm-folder-name" :text="item.label"></span><span :if="item.name === 'reminders' && dueReminders > 0" class="wm-folder-count" :text="dueReminders"></span></button>
+          </div>
+        </div>
+      </nav>
+      <div class="wm-user">
+        <div class="wm-user-identity"><span class="wm-avatar" aria-hidden="true" :text="senderInitials(user?.email || '')"></span><span class="wm-user-email" :title="user?.email" :text="user?.email"></span></div>
+        <div class="wm-account-actions"><button class="wm-logout" type="button" aria-label="Keyboard shortcuts" aria-keyshortcuts="?" title="Keyboard shortcuts" @click="showShortcuts()"><span class="mail-icon" data-icon="keyboard" aria-hidden="true"></span></button><button class="wm-logout" aria-label="Account" title="Account" @click="showSettings()"><span class="mail-icon" data-icon="settings" aria-hidden="true"></span></button><a class="wm-logout" aria-label="Service health" :title="health.label()" href="/status"><span class="mail-icon" data-icon="pulse" aria-hidden="true"></span></a><button class="wm-logout" aria-label="Sign out" title="Sign out" @click="leaveAccount()" :disabled="sending || savingDraft || leavingAccount"><span class="mail-icon" data-icon="exit" aria-hidden="true"></span></button></div>
       </div>
-      <div class="wm-nav-group">
-        <span class="wm-nav-label">Collections</span>
-        <button :for="item in categoryFolders" :key="item.name" class="wm-folder" @click="selectFolder(item.name)" :disabled="mutating" :aria-current="!outboxView && !senderReviewOpen && !attentionView && item.name === folder ? 'page' : null">
-          <span class="mail-icon" :data-icon="mailFolderIcon(item.name)" aria-hidden="true"></span><span class="wm-folder-name" :text="folderName(item.name)"></span><span :if="item.unread > 0" class="wm-folder-count" :text="item.unread"></span>
-        </button>
-        <button class="wm-folder" :aria-current="libraryView ? 'page' : null" @click="showAttachmentLibrary()" :disabled="mutating"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span><span class="wm-folder-name">Attachments</span></button>
-        <button :if="senderReviewStatus" class="wm-folder" :aria-current="senderReviewOpen ? 'page' : null" @click="showSenderReview()" :disabled="mutating"><span class="mail-icon" data-icon="shield" aria-hidden="true"></span><span class="wm-folder-name">Sender Review</span><span :if="senderReviewStatus?.pending > 0" class="wm-folder-count" :text="senderReviewStatus?.pending"></span></button>
-      </div>
-      <div class="wm-nav-group">
-        <span class="wm-nav-label">Personal</span>
-        <button :if="limits.calendarAvailable" type="button" class="wm-folder" @click="showContacts()" aria-haspopup="dialog"><span class="mail-icon" data-icon="contacts" aria-hidden="true"></span><span class="wm-folder-name">Contacts</span></button>
-        <button type="button" class="wm-folder" @click="showCollectionManager()" aria-haspopup="dialog"><span class="mail-icon" data-icon="bookmark" aria-hidden="true"></span><span class="wm-folder-name">My collections</span></button>
-        <button :for="item in privateCollections" :key="item.id" type="button" class="wm-folder" :aria-current="collectionId === item.id ? 'page' : null" @click="selectCollection(item)" :disabled="mutating"><span class="mail-icon" data-icon="folder" aria-hidden="true"></span><span class="wm-folder-name" :text="item.name"></span></button>
-      </div>
-      <div class="wm-nav-group">
-        <span class="wm-nav-label">Workflows</span>
-        <button :for="item in attentionViews" :key="item.name" class="wm-folder" :aria-current="attentionView === item.name ? 'page' : null" @click="selectAttention(item.name)" :disabled="mutating"><span class="mail-icon" :data-icon="mailFolderIcon(item.name)" aria-hidden="true"></span><span class="wm-folder-name" :text="item.label"></span><span :if="item.name === 'reminders' && dueReminders > 0" class="wm-folder-count" :text="dueReminders"></span></button>
-        <a :if="limits.calendarAvailable" class="wm-folder" href="/calendar"><span class="mail-icon" data-icon="calendar" aria-hidden="true"></span><span class="wm-folder-name">Calendar</span></a>
-      </div>
-    </nav>
-    <div class="wm-user">
-      <div class="wm-user-identity"><span class="wm-avatar" aria-hidden="true" :text="senderInitials(user?.email || '')"></span><span class="wm-user-email" :title="user?.email" :text="user?.email"></span></div>
-      <div class="wm-account-actions"><button class="wm-logout" type="button" aria-label="Keyboard shortcuts" aria-keyshortcuts="?" title="Keyboard shortcuts" @click="showShortcuts()"><span class="mail-icon" data-icon="keyboard" aria-hidden="true"></span></button><button class="wm-logout" aria-label="Account" title="Account" @click="showSettings()"><span class="mail-icon" data-icon="settings" aria-hidden="true"></span></button><a class="wm-logout" aria-label="Service health" :title="health.label()" href="/status"><span class="mail-icon" data-icon="pulse" aria-hidden="true"></span></a><button class="wm-logout" aria-label="Sign out" title="Sign out" @click="leaveAccount()" :disabled="sending || savingDraft || leavingAccount"><span class="mail-icon" data-icon="exit" aria-hidden="true"></span></button></div>
     </div>
   </aside>
   <section class="wm-workspace">
@@ -148,9 +166,9 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
     <p :if="error && !outboxView" class="login-error wm-workspace-error" role="alert" :text="error"></p>
     <div class="wm-columns">
     <section :if="!outboxView && !senderReviewOpen" class="wm-list" :aria-label="libraryView ? 'Attachment library' : 'Messages'">
-      <header class="wm-list-head"><div class="wm-list-heading"><h1 class="wm-list-title" :text="currentFolderName"></h1><span :if="!loading && !indexProgress" class="wm-list-total" :text="matchingTotal + (libraryView ? (matchingTotal === 1 ? ' attachment' : ' attachments') : (matchingTotal === 1 ? ' message' : ' messages'))"></span></div><button :if="attentionView === 'follow_up' && total > 0" type="button" class="wm-action" @click="nextFollowUp()" :disabled="loading || readingLoading || mutating">Next reply</button><button :if="unreadAvailable && !reading" type="button" class="wm-action" aria-keyshortcuts="Shift+N" @click="nextUnread()" :disabled="loading || triageBusy || readingLoading || mutating">Next unread</button><button class="wm-refresh" @click="refresh(true)" :disabled="loading || refreshing" :aria-label="libraryView ? 'Refresh attachments' : 'Refresh messages'"><span class="mail-icon" data-icon="refresh" aria-hidden="true"></span></button></header>
+      <header class="wm-list-head"><div class="wm-list-heading"><h1 class="wm-list-title" :text="currentFolderName"></h1><span :if="!loading && !indexProgress" class="wm-list-total" :text="matchingTotal + (libraryView ? (matchingTotal === 1 ? ' attachment' : ' attachments') : (matchingTotal === 1 ? ' message' : ' messages'))"></span></div><button :if="attentionView === 'follow_up' && total > 0" type="button" class="wm-action" @click="nextFollowUp()" :disabled="loading || readingLoading || mutating">Next reply</button><button :if="unreadAvailable && !reading" type="button" class="wm-action wm-action--quiet" aria-keyshortcuts="Shift+N" @click="nextUnread()" :disabled="loading || triageBusy || readingLoading || mutating"><span class="mail-icon" data-icon="down" aria-hidden="true"></span>Next unread</button><button type="button" class="wm-refresh" @click="refresh(true)" :disabled="loading || refreshing" :aria-label="libraryView ? 'Refresh attachments' : 'Refresh messages'" :title="libraryView ? 'Refresh attachments' : 'Refresh messages'"><span class="mail-icon" data-icon="refresh" aria-hidden="true"></span></button></header>
       <form class="wm-search-form" role="search" @submit.prevent="search()">
-        <div class="wm-search-row"><div class="mail-search-field"><span class="mail-icon" data-icon="search" aria-hidden="true"></span><input type="search" class="wm-search" x-model="query" maxlength="256" :placeholder="libraryView ? 'Find a filename' : 'Search mail'" :aria-label="libraryView ? 'Search attachments' : 'Search messages'"></div><button class="wm-action mail-icon-button" type="submit" :disabled="loading" aria-label="Search" title="Search"><span class="mail-icon" data-icon="arrow-right" aria-hidden="true"></span></button><button class="wm-action mail-icon-button" type="button" @click="filtersOpen.set(!filtersOpen())" :aria-expanded="filtersOpen" aria-controls="mailFilters" aria-label="Filters" title="Filters"><span class="mail-icon" data-icon="filters" aria-hidden="true"></span></button></div>
+        <div class="wm-search-row"><div class="mail-search-field"><span class="mail-icon" data-icon="search" aria-hidden="true"></span><input type="search" class="wm-search" x-model="query" maxlength="256" :placeholder="libraryView ? 'Find a filename' : 'Search mail'" :aria-label="libraryView ? 'Search attachments' : 'Search messages'"><button type="submit" class="wm-search-submit" :disabled="loading" aria-label="Search" title="Search"><span class="mail-icon" data-icon="arrow-right" aria-hidden="true"></span></button></div><button class="wm-action mail-icon-button wm-search-filters" type="button" @click="filtersOpen.set(!filtersOpen())" :aria-expanded="filtersOpen" aria-controls="mailFilters" aria-label="Filters" title="Filters"><span class="mail-icon" data-icon="filters" aria-hidden="true"></span></button></div>
         <div :if="filtersOpen" id="mailFilters" class="wm-filter-panel">
           <label>Sender<input type="text" x-model="filterSender" maxlength="256" placeholder="Name or email" aria-label="Filter by sender"></label>
           <label>Recipient<input type="text" x-model="filterRecipient" maxlength="256" placeholder="Name or email" aria-label="Filter by recipient"></label>
@@ -301,7 +319,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         <div class="wm-message-heading">
           <div class="wm-message-heading-actions">
             <span class="wm-folder-badge" :text="folderName(selected?.folder || '')"></span>
-            <button :if="canOpenPrivate" type="button" class="wm-action" :aria-expanded="privateOpen" @click="privateOpen ? closePrivate() : showPrivate()" :disabled="readingLoading || mutating"><span class="mail-icon" data-icon="bookmark" aria-hidden="true"></span>Private tools</button>
+            <button :if="canOpenPrivate" type="button" class="wm-action wm-action--quiet" :aria-expanded="privateOpen" @click="privateOpen ? closePrivate() : showPrivate()" :disabled="readingLoading || mutating"><span class="mail-icon" data-icon="bookmark" aria-hidden="true"></span>Private tools</button>
           </div>
           <h2 class="wm-read-subject" tabindex="-1" data-reader-focus :text="displaySubject(selected)"></h2>
           <p :if="selected?.personal_subject" class="wm-original-subject"><span>Original subject</span> <span :text="selected?.subject || '(no subject)'"></span></p>
@@ -348,7 +366,23 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
           <div class="wm-receipt-meta"><strong :text="selected?.from"></strong><span :text="fullDate(selected?.date || '')"></span></div>
           <p :if="receiptPreview" class="wm-receipt-excerpt" :text="receiptPreview"></p>
         </div>
-        <div :if="!receiptCompact" class="wm-read-meta"><div class="wm-read-sender"><span class="wm-avatar" aria-hidden="true" :text="senderInitials(selected?.from || '')"></span><div><strong :text="senderLabel(selected?.from || '')"></strong><small :if="senderLabel(selected?.from || '') !== selected?.from" :text="senderAddress(selected?.from || '')"></small></div></div><div><span class="wm-read-label">To</span><span :text="selected?.to"></span></div><div :if="senderReviewSelection && senderReviewSelection.recipient !== selected?.to"><span class="wm-read-label">Delivered to</span><span :text="senderReviewSelection?.recipient"></span></div><div :if="senderReviewSelection?.envelope_from && senderReviewSelection?.envelope_from !== senderReviewSelection?.author"><span class="wm-read-label">Envelope sender</span><span :text="senderReviewSelection?.envelope_from"></span></div><div :if="selected?.cc"><span class="wm-read-label">Cc</span><span :text="selected?.cc"></span></div><div :if="selected?.bcc"><span class="wm-read-label">Bcc</span><span :text="selected?.bcc"></span></div><div :if="selected?.reply_to"><span class="wm-read-label">Reply to</span><span :text="selected?.reply_to"></span></div><div><span class="wm-read-label">Date</span><span :text="fullDate(selected?.date || '')"></span></div></div>
+        <div :if="!receiptCompact" class="wm-read-meta">
+          <span class="wm-avatar" aria-hidden="true" :text="senderInitials(selected?.from || '')"></span>
+          <div class="wm-read-envelope">
+            <div class="wm-read-sender">
+              <div><strong :text="senderLabel(selected?.from || '')"></strong><small :if="senderLabel(selected?.from || '') !== selected?.from" :text="senderAddress(selected?.from || '')"></small></div>
+              <time :text="fullDate(selected?.date || '')"></time>
+            </div>
+            <dl class="wm-read-addresses">
+              <div><dt>To</dt><dd :text="selected?.to"></dd></div>
+              <div :if="selected?.cc"><dt>Cc</dt><dd :text="selected?.cc"></dd></div>
+              <div :if="selected?.bcc"><dt>Bcc</dt><dd :text="selected?.bcc"></dd></div>
+              <div :if="selected?.reply_to"><dt>Reply to</dt><dd :text="selected?.reply_to"></dd></div>
+              <div :if="senderReviewSelection && senderReviewSelection.recipient !== selected?.to"><dt>Delivered to</dt><dd :text="senderReviewSelection?.recipient"></dd></div>
+              <div :if="senderReviewSelection?.envelope_from && senderReviewSelection?.envelope_from !== senderReviewSelection?.author"><dt>Envelope sender</dt><dd :text="senderReviewSelection?.envelope_from"></dd></div>
+            </dl>
+          </div>
+        </div>
         <p :if="placementText && !senderReviewOpen" class="wm-placement wm-placement-info"><span class="mail-icon" data-icon="info" aria-hidden="true"></span><span :text="placementText"></span></p>
         <div class="wm-read-attach"><a :for="(attachment, index) in (selected?.attachments || [])" class="wm-attach-chip" :href="attachmentPath(index)" :download="attachment.filename"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span><span :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></span></a></div>
         <div class="wm-format-control">
@@ -471,7 +505,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       </div></div>
       <div class="wm-cc-controls"><button type="button" class="wm-clear-search" @click="showCc.set(!showCc())" :disabled="ccRecipients.length > 0 || !!ccInput" :text="showCc ? 'Hide Cc' : 'Add Cc'"></button><button type="button" class="wm-clear-search" @click="showBcc.set(!showBcc())" :disabled="bccRecipients.length > 0 || !!bccInput" :text="showBcc ? 'Hide Bcc' : 'Add Bcc'"></button><span :if="recipientSearching" aria-hidden="true">Looking for contacts…</span></div>
       <p :if="recipientErrors.length > 0" class="wm-composer-error" role="alert" :text="'Check recipient addresses: ' + recipientErrors.join(', ')"></p>
-      <label for="composeSubject">Subject</label><input id="composeSubject" type="text" x-model="subject" :disabled="sending || sendUncertain" maxlength="500">
+      <div class="wm-recipient-field wm-subject-field"><label for="composeSubject">Subject</label><input id="composeSubject" type="text" x-model="subject" :disabled="sending || sendUncertain" maxlength="500"></div>
     </div>
     <textarea class="wm-composer-body" x-model="body" :disabled="sending || sendUncertain" aria-label="Message body" placeholder="Write your message…"></textarea>
     <details :if="writingLibrary?.snippets.length || writingLibrary?.signatures.length" class="wm-writing-insert">
