@@ -265,7 +265,27 @@ fn one(slot: *?ical.Property, value: ical.Property) !void {
     slot.* = value;
 }
 
-fn readEvent(a: Allocator, components: []const ical.Component, component: ical.Component, method: Method, mailbox: []const u8, verified_author: []const u8) !Invitation {
+/// Earlier Outbox rows retained the generated REPLY and stored the
+/// organizer's original sequence and stamp separately in the decision.
+pub fn queuedReplyRevision(a: Allocator, body: []const u8, attendee: []const u8, organizer: []const u8, key_value: []const u8, sequence: u32, original_stamp: i64) !Revision {
+    const components = try ical.components(a, body);
+    const method = (try ical.componentText(a, .{ .name = "VCALENDAR", .bytes = body }, "METHOD")) orelse return error.InvalidInvitation;
+    if (!equal(method, "REPLY")) return error.InvalidInvitation;
+    var event: ?ical.Component = null;
+    for (components) |component| {
+        if (!equal(component.name, "VEVENT")) continue;
+        if (event != null) return error.InvalidInvitation;
+        event = component;
+    }
+    var reply = try readEvent(a, components, event orelse return error.InvalidInvitation, null, attendee, organizer);
+    if (!reply.canReply(attendee) or reply.preview.sequence != sequence) return error.InvalidInvitation;
+    reply.preview.dtstamp = original_stamp;
+    const revision = try reply.revision(a);
+    if (!std.mem.eql(u8, &revision.component, key_value)) return error.InvalidInvitation;
+    return revision;
+}
+
+fn readEvent(a: Allocator, components: []const ical.Component, component: ical.Component, method: ?Method, mailbox: []const u8, verified_author: []const u8) !Invitation {
     var props = ical.Properties.init(component);
     var uid: ?ical.Property = null;
     var organizer: ?ical.Property = null;
@@ -319,7 +339,7 @@ fn readEvent(a: Allocator, components: []const ical.Component, component: ical.C
         }
     }
     return .{ .components = components, .component = component, .recurrence = recurrence, .preview = .{
-        .method = method,
+        .method = method orelse .request,
         .uid = identity,
         .organizer = organizer_address,
         .organizer_verified = equal(verified_author, organizer_address),

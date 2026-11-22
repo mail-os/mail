@@ -414,6 +414,7 @@ pub const Database = struct {
             \\    intake_folder TEXT NOT NULL DEFAULT '',
             \\    placement_reason TEXT NOT NULL DEFAULT '',
             \\    verified_author TEXT NOT NULL DEFAULT '',
+            \\    calendar_history_checked INTEGER NOT NULL DEFAULT 0,
             \\    PRIMARY KEY(user_id,reference),
             \\    UNIQUE(user_id,folder,basename)
             \\);
@@ -756,6 +757,8 @@ pub const Database = struct {
         self.exec("ALTER TABLE mailbox_message_refs ADD COLUMN intake_folder TEXT NOT NULL DEFAULT ''") catch {};
         self.exec("ALTER TABLE mailbox_message_refs ADD COLUMN placement_reason TEXT NOT NULL DEFAULT ''") catch {};
         self.exec("ALTER TABLE mailbox_message_refs ADD COLUMN verified_author TEXT NOT NULL DEFAULT ''") catch {};
+        self.exec("ALTER TABLE mailbox_message_refs ADD COLUMN calendar_history_checked INTEGER NOT NULL DEFAULT 0") catch {};
+        try self.exec("CREATE INDEX IF NOT EXISTS mailbox_calendar_history ON mailbox_message_refs(user_id,verified_author COLLATE NOCASE,reference) WHERE " ++ pending_calendar_history);
         self.exec("ALTER TABLE mailbox_message_refs ADD COLUMN next_junk_action TEXT") catch {};
         self.exec("ALTER TABLE mailbox_message_refs ADD COLUMN next_junk_receipt TEXT") catch {};
         // Finalize the feedback with the recorded Maildir handoff. This also
@@ -2025,15 +2028,15 @@ pub const Database = struct {
     fn recordPlacementLocked(self: *Database, id: []const u8, ordinal: i64, file: FiledCopy) !void {
         if (file.stamp.len == 0) return;
         const stmt = try self.prepareLocked(
-            \\INSERT INTO mailbox_message_refs(user_id,reference,folder,basename,file_stamp,intake_folder,placement_reason,verified_author)
+            \\INSERT INTO mailbox_message_refs(user_id,reference,folder,basename,file_stamp,intake_folder,placement_reason,verified_author,calendar_history_checked)
             \\SELECT t.mailbox_id,lower(hex(randomblob(16))),IIF(t.folder='new','INBOX',t.folder),?3,?4,
-            \\       IIF(t.folder='new','INBOX',t.folder),t.placement_reason,COALESCE(t.reply_author,IIF(m.verified_author=1,m.author,''))
+            \\       IIF(t.folder='new','INBOX',t.folder),t.placement_reason,COALESCE(t.reply_author,IIF(m.verified_author=1,m.author,'')),1
             \\FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
             \\WHERE t.delivery_id=?1 AND t.ordinal=?2 AND t.mailbox_id<>0
             \\      AND (t.folder IN ('new','Newsletters','Receipts') OR t.placement_reason IN ('junk_feedback','spam_filter'))
             \\      AND (m.verified_author=1 OR t.placement_reason<>'' OR t.reply_author IS NOT NULL)
             \\ON CONFLICT(user_id,folder,basename) DO UPDATE SET intake_folder=excluded.intake_folder,
-            \\  placement_reason=excluded.placement_reason,verified_author=excluded.verified_author
+            \\  placement_reason=excluded.placement_reason,verified_author=excluded.verified_author,calendar_history_checked=1
             \\WHERE mailbox_message_refs.file_stamp=excluded.file_stamp
         );
         defer stmt.finalize();
@@ -2044,32 +2047,103 @@ pub const Database = struct {
         _ = try stmt.step();
     }
 
+    const calendar_revision_insert =
+        \\INSERT INTO mail_calendar_revisions(user_id,component,series,method,future,sequence,dtstamp,occurrence_wall,occurrence_zone,occurrence_day)
+    ++ " SELECT ";
+    const calendar_revision_values = ",?3,?4,?5,?6,?7,?8,?9,?10,?11 ";
+    const calendar_revision_merge =
+        \\ ON CONFLICT(user_id,component,method,future) DO UPDATE SET sequence=excluded.sequence,dtstamp=excluded.dtstamp
+        \\ WHERE (excluded.sequence,excluded.dtstamp)>(mail_calendar_revisions.sequence,mail_calendar_revisions.dtstamp)
+    ;
+
     fn recordCalendarRevisionsLocked(self: *Database, id: []const u8, ordinal: i64, revisions: []const calendar_invite.Revision) !void {
         if (revisions.len == 0) return;
-        const stmt = try self.prepareLocked(
-            \\INSERT INTO mail_calendar_revisions(user_id,component,series,method,future,sequence,dtstamp,occurrence_wall,occurrence_zone,occurrence_day)
-            \\SELECT t.mailbox_id,?3,?4,?5,?6,?7,?8,?9,?10,?11
+        const stmt = try self.prepareLocked(calendar_revision_insert ++ "t.mailbox_id" ++ calendar_revision_values ++
             \\FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
             \\WHERE t.delivery_id=?1 AND t.ordinal=?2 AND t.mailbox_id<>0 AND t.is_primary=1
             \\AND t.folder IN ('new','Newsletters','Receipts') AND m.verified_author=1
             \\AND t.placement_reason NOT IN ('spam_filter','junk_feedback')
-            \\ON CONFLICT(user_id,component,method,future) DO UPDATE SET sequence=excluded.sequence,dtstamp=excluded.dtstamp
-            \\WHERE (excluded.sequence,excluded.dtstamp)>(mail_calendar_revisions.sequence,mail_calendar_revisions.dtstamp)
-        );
+        ++ calendar_revision_merge);
         defer stmt.finalize();
         for (revisions) |revision| {
             try stmt.bind(1, id);
             try stmt.bind(2, ordinal);
-            try stmt.bind(3, @as([]const u8, &revision.component));
-            try stmt.bind(4, @as([]const u8, &revision.series));
-            try stmt.bind(5, @tagName(revision.method));
-            try stmt.bind(6, @intFromBool(revision.this_and_future));
-            try stmt.bind(7, revision.sequence);
-            try stmt.bind(8, revision.dtstamp);
-            try bindOccurrence(stmt, 9, revision.occurrence);
+            try bindCalendarRevision(stmt, revision);
             _ = try stmt.step();
             try stmt.reset();
         }
+    }
+
+    fn bindCalendarRevision(stmt: Statement, revision: calendar_invite.Revision) !void {
+        try stmt.bind(3, @as([]const u8, &revision.component));
+        try stmt.bind(4, @as([]const u8, &revision.series));
+        try stmt.bind(5, @tagName(revision.method));
+        try stmt.bind(6, @intFromBool(revision.this_and_future));
+        try stmt.bind(7, revision.sequence);
+        try stmt.bind(8, revision.dtstamp);
+        try bindOccurrence(stmt, 9, revision.occurrence);
+    }
+
+    pub const pending_calendar_history = "calendar_history_checked=0 AND verified_author<>'' " ++
+        "AND intake_folder IN ('INBOX','Newsletters','Receipts') AND placement_reason NOT IN ('spam_filter','junk_feedback')";
+
+    pub const CalendarHistoryScope = struct { user: []const u8, author: []const u8 };
+    pub const CalendarHistoryMessage = struct {
+        owner: i64,
+        username: []const u8,
+        attendee: []const u8,
+        author: []const u8,
+        reference: []const u8,
+    };
+
+    pub fn nextCalendarHistory(self: *Database, a: std.mem.Allocator, scope: ?CalendarHistoryScope) !?CalendarHistoryMessage {
+        const base =
+            \\SELECT u.id,u.username,u.email,m.verified_author,m.reference
+            \\FROM mailbox_message_refs m JOIN users u ON u.id=m.user_id
+        ++ " WHERE " ++ pending_calendar_history;
+        const stmt = try self.prepare(if (scope != null)
+            base ++ " AND m.user_id=(SELECT id FROM users WHERE username=?1) AND m.verified_author=?2 COLLATE NOCASE ORDER BY m.reference LIMIT 1"
+        else
+            base ++ " ORDER BY m.user_id,m.verified_author COLLATE NOCASE,m.reference LIMIT 1");
+        defer stmt.finalize();
+        if (scope) |target| {
+            try stmt.bind(1, target.user);
+            try stmt.bind(2, target.author);
+        }
+        if (!try stmt.step()) return null;
+        return .{
+            .owner = stmt.columnInt64(0),
+            .username = try a.dupe(u8, stmt.columnText(1)),
+            .attendee = try a.dupe(u8, stmt.columnText(2)),
+            .author = try a.dupe(u8, stmt.columnText(3)),
+            .reference = try a.dupe(u8, stmt.columnText(4)),
+        };
+    }
+
+    /// Commit the revisions and the scan checkpoint together. Live delivery
+    /// uses the same ordering rule, so replay or a concurrent arrival wins
+    /// only when it carries a newer organizer revision.
+    pub fn finishCalendarHistory(self: *Database, source: CalendarHistoryMessage, revisions: []const calendar_invite.Revision) !void {
+        var tx = try self.beginTransaction(.write);
+        defer tx.deinit();
+        if (revisions.len != 0) {
+            const stmt = try tx.prepare(calendar_revision_insert ++ "user_id" ++ calendar_revision_values ++
+                "FROM mailbox_message_refs WHERE user_id=?1 AND reference=?2 AND " ++ pending_calendar_history ++ calendar_revision_merge);
+            defer stmt.finalize();
+            for (revisions) |revision| {
+                try stmt.bind(1, source.owner);
+                try stmt.bind(2, source.reference);
+                try bindCalendarRevision(stmt, revision);
+                _ = try stmt.step();
+                try stmt.reset();
+            }
+        }
+        const stmt = try tx.prepare("UPDATE mailbox_message_refs SET calendar_history_checked=1 WHERE user_id=?1 AND reference=?2");
+        defer stmt.finalize();
+        try stmt.bind(1, source.owner);
+        try stmt.bind(2, source.reference);
+        _ = try stmt.step();
+        try tx.commit();
     }
 
     fn bindOccurrence(stmt: Statement, first: usize, occurrence: ?calendar_invite.WallTime) !void {

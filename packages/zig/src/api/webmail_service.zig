@@ -673,6 +673,7 @@ pub const Service = struct {
                     error.SharedReplyUnavailable => "This shared reply no longer has permission to send. Check the original message and its assignment.",
                     error.CalendarInvitationStale => "The organizer sent an updated invitation before this RSVP could be sent.",
                     error.CalendarInvitationCancelled => "The organizer cancelled this invitation before this RSVP could be sent.",
+                    error.CalendarReplyNeedsReview => "Open the invitation and retry this RSVP after the upgrade.",
                     error.HostedSendingLimit => "Daily recipient allowance exhausted. Try again after midnight UTC.",
                     error.HostedSenderDisabled => "This mailbox is disabled. The message was not sent.",
                     error.HostedStorageFull => "A recipient mailbox is full. Review the recipients before retrying.",
@@ -815,6 +816,16 @@ pub const Service = struct {
         const delegated_id = try doc.message.delegatedSender();
         const from = try self.sendAddress(a, user, account.email, delegated_id);
         try self.checkSharedReply(a, user, from, doc.message);
+        if (doc.calendarReply) |*reply| if (reply.revision == null) {
+            if (doc.message.to.len != 1) return error.CalendarReplyNeedsReview;
+            const receipt = (try self.rsvpRecord(a, user, reply.key)) orelse return error.CalendarReplyNeedsReview;
+            const decision = (try RsvpStatus.read(a, receipt)).decision;
+            if (!std.mem.eql(u8, decision.sendId, row.id)) return error.CalendarReplyNeedsReview;
+            reply.revision = calendar_invite.queuedReplyRevision(a, reply.body, reply.attendee, doc.message.to[0], reply.key, decision.sequence, decision.dtstamp) catch |err| switch (err) {
+                error.InvalidCalendar, error.InvalidInvitation => return error.CalendarReplyNeedsReview,
+                else => return err,
+            };
+        };
         const msg = try self.outboxMessage(a, doc.*, user, from);
         // Recovery files Sent with the address used at admission, even after
         // a grant is revoked or the shared mailbox changes its address.

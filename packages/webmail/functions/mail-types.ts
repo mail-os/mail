@@ -40,6 +40,7 @@ export interface MessageDetail extends MessageSummary {
   calendar_invites?: InvitationPreview[]
   calendar_rsvps?: Array<InvitationAction | null>
   calendar_invitation_events?: Array<InvitationCalendarAction | null>
+  calendar_history_pending?: boolean
   calendar_only?: boolean
 }
 export type MailNotificationRule = 'default' | 'notify' | 'quiet'

@@ -152,6 +152,9 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
 - A newer invitation or cancellation from the verified organizer disables
   replies to the affected revision. This applies to messages delivered to
   the mailbox and to approved messages released from Sender Review.
+  After an upgrade, Mail checks retained messages with verified delivery
+  records for earlier organizer changes. If the reader is still checking
+  history, refresh the invitation before replying or applying it to Calendar.
 - Choose **Add to Calendar** and select a calendar you own to save a private
   copy of a verified invitation. Choose **Apply to Calendar** or **Apply
   cancellation** on a later message from the same organizer to update that
@@ -172,7 +175,10 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   `REQUEST` and `CANCEL` parts. Each entry includes the organizer, UID,
   sequence, DTSTAMP, and any original occurrence. Wall times are supplied as
   seconds on the organizer's clock with a separate time zone label. Preview
-  reads leave calendar resources and outgoing mail untouched.
+  reads leave calendar resources and outgoing mail untouched. If
+  `calendar_history_pending` is true, refresh the message to obtain the
+  invitation actions after Mail checks earlier deliveries. An invitation
+  write can return `503 calendar_history_pending` during that check.
 - For entries with a corresponding `calendar_rsvps` action, send
   `POST /webmail/api/calendar-rsvp` with the message ETag in `If-Match`
   and the message `reference`, invitation `index`, and `response`

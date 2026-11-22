@@ -431,6 +431,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
           </div>
           <p :if="placementText && !senderReviewOpen" class="wm-placement wm-placement-info"><span class="mail-icon" data-icon="info" aria-hidden="true"></span><span :text="placementText"></span></p>
           <section :if="selected?.calendar_invites?.length" class="wm-invitations" aria-label="Calendar invitations">
+            <div :if="selected.calendar_history_pending" class="wm-invitation-calendar"><span role="status">Mail is checking earlier invitations.</span><button type="button" class="wm-action" @click="retryReader()">Refresh invitation</button></div>
             <article :for="(invite, index) in selected.calendar_invites" :key="index" class="wm-invitation">
               <p class="wm-invitation-kind"><span class="mail-icon" data-icon="calendar" aria-hidden="true"></span><span :text="invitationLabel(invite)"></span></p>
               <h3 :text="invite.summary || (invite.method === 'cancel' ? 'Canceled event' : 'Untitled event')"></h3>

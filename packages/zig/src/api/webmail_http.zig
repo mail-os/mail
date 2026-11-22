@@ -293,6 +293,10 @@ fn deliveryWorker(server: *WebmailHttpServer) void {
             logger.err("Sender Review recovery failed: {}", .{err});
             break :blk false;
         };
+        _ = maildir.indexCalendarHistory(server.db, null) catch |err| blk: {
+            logger.err("Calendar history recovery failed: {}", .{err});
+            break :blk false;
+        };
         scratch.deinit();
         if (!delivered and !reviewed) time_compat.sleepMs(200);
     }
@@ -2222,6 +2226,7 @@ fn calendarWriteError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: 
         error.PreconditionFailed => sendError(conn, arena, 412, "event_changed", "The event changed. Reload it before saving"),
         error.CalendarInvitationStale => sendError(conn, arena, 409, "invitation_stale", "A newer organizer revision is available."),
         error.CalendarInvitationCancelled => sendError(conn, arena, 409, "invitation_cancelled", "The organizer cancelled this invitation."),
+        error.CalendarHistoryPending => sendError(conn, arena, 503, "calendar_history_pending", "Mail is checking earlier invitations. Refresh this message and try again."),
         error.InvitationEventRequired => sendError(conn, arena, 409, "invitation_event_required", "Add the original invitation to Calendar first."),
         error.InvitationScopeConflict => sendError(conn, arena, 409, "invitation_scope_conflict", "This occurrence already anchors a change to future events."),
         error.UnsupportedTimezone, error.ConflictingTimezone => sendError(conn, arena, 422, "invitation_timezone", "This event's time zone could not be verified."),
@@ -3153,6 +3158,10 @@ const InvitationAction = struct {
 
 const CalendarInvitationAction = caldav_store.CalDavStore.InvitationAction;
 
+fn checkCalendarHistory(db: *database.Database, user: []const u8, organizer: []const u8) !void {
+    if (!try maildir.indexCalendarHistory(db, .{ .user = user, .author = organizer })) return error.CalendarHistoryPending;
+}
+
 fn handleInvitationEvent(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
     if (!isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
     var sess = (try requireSession(server, conn, a, req)) orelse return;
@@ -3176,6 +3185,7 @@ fn handleInvitationEvent(server: *WebmailHttpServer, conn: *webmail_tls.Stream, 
     if (request.index >= invitations.len) return sendError(conn, a, 404, "invitation_not_found", "No such calendar invitation in this message.");
     const invite = invitations[request.index];
     if (!invite.canTrack(sess.email)) return sendError(conn, a, 403, "invitation_unavailable", "Saving this invitation requires a verified organizer and an invitation addressed to this account.");
+    checkCalendarHistory(server.db, sess.username, invite.preview.organizer) catch |err| return calendarWriteError(conn, a, err);
     const revision = try invite.revision(a);
     database.Database.requireCurrentCalendarInvitation(server.db, sess.username, revision) catch |err| return calendarWriteError(conn, a, err);
     const before = dav.snapshotInvitationEvent(a, sess.username, revision.series) catch |err| return calendarWriteError(conn, a, err);
@@ -3224,7 +3234,9 @@ fn handleCalendarRsvp(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: 
     const placement = try message_refs.placement(a, server.db, sess.username, request.reference);
     const invitations = try calendar_invite.invitations(a, msg.calendar_parts, sess.email, if (placement) |source| source.verified_author else "");
     if (request.index >= invitations.len) return sendError(conn, a, 404, "invitation_not_found", "No such calendar invitation in this message.");
-    const status = server.service.queueRsvp(a, sess.username, sess.email, invitations[request.index], request.response, request.previousSendId, server.config.scanner, time_compat.timestamp()) catch |err| switch (err) {
+    const invite = invitations[request.index];
+    if (invite.canReply(sess.email)) checkCalendarHistory(server.db, sess.username, invite.preview.organizer) catch |err| return calendarWriteError(conn, a, err);
+    const status = server.service.queueRsvp(a, sess.username, sess.email, invite, request.response, request.previousSendId, server.config.scanner, time_compat.timestamp()) catch |err| switch (err) {
         error.CalendarReplyUnavailable => return sendError(conn, a, 403, "rsvp_unavailable", "RSVP requires a verified organizer and an invitation addressed to this account."),
         error.CalendarInvitationStale => return sendError(conn, a, 409, "invitation_stale", "The organizer sent a newer version of this invitation."),
         error.CalendarInvitationCancelled => return sendError(conn, a, 409, "invitation_cancelled", "The organizer cancelled this invitation."),
@@ -3264,11 +3276,19 @@ fn handleMessageDetail(server: *WebmailHttpServer, conn: *webmail_tls.Stream, ar
     const actions = try arena.alloc(?InvitationAction, invitations.len);
     const calendar_actions = try arena.alloc(?CalendarInvitationAction, invitations.len);
     const eligible_folder = canRsvpToMessage(server, msg);
+    const history_pending = pending: {
+        if (!eligible_folder) break :pending false;
+        for (invitations) |invite| {
+            if (invite.canTrack(sess.email))
+                break :pending !try maildir.indexCalendarHistory(server.db, .{ .user = sess.username, .author = invite.preview.organizer });
+        }
+        break :pending false;
+    };
     for (invitations, previews, actions, calendar_actions) |invite, *preview, *action, *calendar_action| {
         preview.* = invite.preview;
         action.* = null;
         calendar_action.* = null;
-        if (!eligible_folder or !invite.canTrack(sess.email)) continue;
+        if (!eligible_folder or history_pending or !invite.canTrack(sess.email)) continue;
         const revision = try invite.revision(arena);
         const availability = try database.Database.calendarInvitationDisposition(server.db, sess.username, revision);
         if (invite.canReply(sess.email)) {
@@ -3282,7 +3302,7 @@ fn handleMessageDetail(server: *WebmailHttpServer, conn: *webmail_tls.Stream, ar
             calendar_action.* = try dav.snapshotInvitationAction(arena, sess.username, revision);
         }
     }
-    try writeMessageDetail(w, msg, placement, rule, workflow.status(msg.version.?.reference, "", "", "", ids), notifications, previews, actions, calendar_actions, arena);
+    try writeMessageDetail(w, msg, placement, rule, workflow.status(msg.version.?.reference, "", "", "", ids), notifications, previews, actions, calendar_actions, history_pending, arena);
     try sendRevisionJson(conn, arena, 200, body.items, null, msg.version.?.revision);
 }
 
@@ -3453,7 +3473,7 @@ fn writeMessageSummary(w: anytype, m: maildir.MessageSummary, version: ?maildir.
     try w.writeAll("}");
 }
 
-fn writeMessageDetail(w: anytype, m: maildir.MessageDetail, placement: ?message_refs.Placement, rule: ?categories.Destination, workflow: attention.Status, notifications: database.Database.NotificationRules, invitations: []const calendar_invite.Preview, rsvps: []const ?InvitationAction, calendar_actions: []const ?CalendarInvitationAction, a: std.mem.Allocator) !void {
+fn writeMessageDetail(w: anytype, m: maildir.MessageDetail, placement: ?message_refs.Placement, rule: ?categories.Destination, workflow: attention.Status, notifications: database.Database.NotificationRules, invitations: []const calendar_invite.Preview, rsvps: []const ?InvitationAction, calendar_actions: []const ?CalendarInvitationAction, history_pending: bool, a: std.mem.Allocator) !void {
     try w.print("{{\"uid\":{d},\"from\":", .{m.uid});
     try writeJsonString(w, m.from);
     try w.writeAll(",\"folder\":");
@@ -3506,6 +3526,7 @@ fn writeMessageDetail(w: anytype, m: maildir.MessageDetail, placement: ?message_
         try w.writeAll(try service_mod.json(a, rsvps));
         try w.writeAll(",\"calendar_invitation_events\":");
         try w.writeAll(try service_mod.json(a, calendar_actions));
+        if (history_pending) try w.writeAll(",\"calendar_history_pending\":true");
         if (m.calendar_only) try w.writeAll(",\"calendar_only\":true");
     }
     if (placement) |source| {

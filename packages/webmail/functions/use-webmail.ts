@@ -388,7 +388,7 @@ export function useWebmail(ports: WebmailPorts) {
     const message = selected()
     const account = user()?.username
     if (!limits().calendarAvailable || !message?.reference || !account || message.folder === 'Drafts' || senderReview.senderReviewOpen()) return null
-    if (message.calendar_invitation_events?.some(Boolean)) return null
+    if (message.calendar_history_pending || message.calendar_invitation_events?.some(Boolean)) return null
     if (message.calendar_invites?.length && !message.calendar_invites.some((invite, index) => {
       const availability = message.calendar_rsvps?.[index]?.availability
       return invite.method === 'request' && (!availability || availability === 'current')

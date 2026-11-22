@@ -370,8 +370,13 @@ pub fn remove(db: *database.Database, user: []const u8, kind: []const u8, id: []
 pub fn claimDue(allocator: std.mem.Allocator, db: *database.Database, now: i64) !?Record {
     const s = try db.prepare(
         \\UPDATE webmail_records SET state='sending',revision=revision+1
-        \\WHERE rowid=(SELECT rowid FROM webmail_records WHERE kind='outbox'
-        \\AND state='pending' AND due_at<=?1 ORDER BY due_at LIMIT 1) AND state='pending'
+        \\WHERE rowid=(SELECT r.rowid FROM webmail_records r WHERE kind='outbox' AND state='pending' AND due_at<=?1
+        \\AND NOT EXISTS (SELECT 1 FROM mailbox_message_refs m JOIN users u ON u.id=m.user_id
+        \\   WHERE u.username=r.username AND m.verified_author=CASE WHEN json_valid(r.payload) THEN
+        \\      CASE WHEN json_type(r.payload,'$.calendarReply')='object' THEN json_extract(r.payload,'$.message.to[0]') END
+        \\   END COLLATE NOCASE
+    ++ " AND " ++ database.Database.pending_calendar_history ++ ") " ++
+        \\ORDER BY due_at LIMIT 1) AND state='pending'
         \\RETURNING username,kind,id,payload,state,revision,due_at,expires_at
     );
     defer s.finalize();

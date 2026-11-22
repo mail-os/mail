@@ -943,11 +943,35 @@ fn makeVersion(a: std.mem.Allocator, id: []const u8, at: MessageLocator, name: [
 }
 
 fn fileAt(a: std.mem.Allocator, user: []const u8, location: message_refs.Location) !?FileRef {
-    for (try collectFiles(a, user, location.folder)) |file| {
-        if (std.mem.eql(u8, location.basename, database.maildirBaseName(file.name))) return file;
+    return fileIn(try collectFiles(a, user, location.folder), location.basename);
+}
+
+fn fileIn(files: []const FileRef, basename: []const u8) ?FileRef {
+    for (files) |file| {
+        if (std.mem.eql(u8, basename, database.maildirBaseName(file.name))) return file;
     }
     return null;
 }
+
+/// Reuse one directory listing across a history batch. A pending rename or
+/// changed file stamp falls back to a fresh lookup under the mailbox lock.
+const HistoryFolder = struct {
+    arena: std.heap.ArenaAllocator,
+    user: []const u8 = "",
+    name: []const u8 = "",
+    files: []const FileRef = &.{},
+
+    fn lookup(self: *HistoryFolder, user: []const u8, at: message_refs.Location) !?FileRef {
+        if (!std.mem.eql(u8, self.user, user) or !std.mem.eql(u8, self.name, at.folder)) {
+            _ = self.arena.reset(.retain_capacity);
+            const a = self.arena.allocator();
+            self.user = try a.dupe(u8, user);
+            self.name = try a.dupe(u8, at.folder);
+            self.files = try collectFiles(a, user, at.folder);
+        }
+        return fileIn(self.files, at.basename);
+    }
+};
 
 fn matchesStamp(a: std.mem.Allocator, file: FileRef, stamp: []const u8) !bool {
     const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ file.dir, file.name });
@@ -958,11 +982,25 @@ fn matchesStamp(a: std.mem.Allocator, file: FileRef, stamp: []const u8) !bool {
     return std.mem.eql(u8, stamp, actual);
 }
 
-pub fn resolveVersioned(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8) !VersionedFile {
+const ReferencedFile = struct {
+    file: FileRef,
+    folder: []const u8,
+    path: []const u8,
+    stamp: []const u8,
+    raw: []const u8,
+};
+
+fn resolveReferenceFile(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8, history: ?*HistoryFolder) !ReferencedFile {
     if (!message_refs.valid(id)) return MaildirError.MessageNotFound;
     const entry = (try message_refs.lookup(a, db, user, id)) orelse return MaildirError.MessageNotFound;
     var at = entry.location;
-    var current = try fileAt(a, user, at);
+    var current: ?FileRef = null;
+    if (history) |cached| {
+        if (try cached.lookup(user, at)) |file| {
+            if (try matchesStamp(a, file, entry.stamp)) current = file;
+        }
+    }
+    if (current == null) current = try fileAt(a, user, at);
     const recovering = current == null or !try matchesStamp(a, current.?, entry.stamp);
     if (recovering) {
         const pending = entry.pending orelse return MaildirError.MessageNotFound;
@@ -973,16 +1011,56 @@ pub fn resolveVersioned(a: std.mem.Allocator, db: *database.Database, user: []co
     const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ file.dir, file.name });
     const stamp = try message_refs.fileStamp(a, path);
     const raw = try fs_compat.readFileAlloc(a, path);
-    const checksum = message_refs.digest(raw);
     if (recovering) {
+        const checksum = message_refs.digest(raw);
         if (!std.mem.eql(u8, &checksum, entry.pending.?.digest)) return MaildirError.MessageNotFound;
         try message_refs.finish(db, user, id, at, stamp);
     }
-    _ = try db.getOrCreateMailbox(user, at.folder);
-    preassignUids(db, user, at.folder, try collectFiles(a, user, at.folder));
-    const uid = (try db.getUidForFile(user, at.folder, file.name)) orelse return MaildirError.MessageNotFound;
-    const locator: MessageLocator = .{ .folder = at.folder, .uid = uid };
-    return .{ .locator = locator, .name = file.name, .path = path, .stamp = stamp, .raw = raw, .version = try makeVersion(a, id, locator, file.name, &checksum) };
+    return .{ .file = file, .folder = at.folder, .path = path, .stamp = stamp, .raw = raw };
+}
+
+pub fn resolveVersioned(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8) !VersionedFile {
+    const entry = try resolveReferenceFile(a, db, user, id, null);
+    _ = try db.getOrCreateMailbox(user, entry.folder);
+    preassignUids(db, user, entry.folder, try collectFiles(a, user, entry.folder));
+    const uid = (try db.getUidForFile(user, entry.folder, entry.file.name)) orelse return MaildirError.MessageNotFound;
+    const locator: MessageLocator = .{ .folder = entry.folder, .uid = uid };
+    const checksum = message_refs.digest(entry.raw);
+    return .{
+        .locator = locator,
+        .name = entry.file.name,
+        .path = entry.path,
+        .stamp = entry.stamp,
+        .raw = entry.raw,
+        .version = try makeVersion(a, id, locator, entry.file.name, &checksum),
+    };
+}
+
+/// Scan a bounded batch under the same per-message lock as Maildir moves.
+/// A missing or replaced file can no longer authenticate its old contents.
+/// Return true when all pending history in this scope has been checked.
+pub fn indexCalendarHistory(db: *database.Database, scope: ?database.Database.CalendarHistoryScope) !bool {
+    var arena = std.heap.ArenaAllocator.init(db.allocator);
+    defer arena.deinit();
+    var history: HistoryFolder = .{ .arena = std.heap.ArenaAllocator.init(db.allocator) };
+    defer history.arena.deinit();
+    for (0..12) |_| {
+        _ = arena.reset(.retain_capacity);
+        const a = arena.allocator();
+        db.lockMailboxes();
+        defer db.unlockMailboxes();
+        const source = (try db.nextCalendarHistory(a, scope)) orelse return true;
+        const file = resolveReferenceFile(a, db, source.username, source.reference, &history) catch |err| switch (err) {
+            error.MessageNotFound, error.FileNotFound => {
+                try db.finishCalendarHistory(source, &.{});
+                continue;
+            },
+            else => return err,
+        };
+        const revisions = try calendarRevisions(a, file.raw, source.attendee, source.author);
+        try db.finishCalendarHistory(source, revisions);
+    }
+    return try db.nextCalendarHistory(arena.allocator(), scope) == null;
 }
 
 /// The caller holds the mailbox lock for the complete conditional operation.

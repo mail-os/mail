@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from email.message import EmailMessage
 from email import policy
 from email.parser import BytesParser
+import hashlib
 import http.client
 import json
 import os
@@ -1418,6 +1419,137 @@ def check_sync_collections(binary):
     print("Verified DAV sync tokens, current listings, deletion and pruned history over HTTP and HTTPS, plus ActiveSync calendar and contacts.")
 
 
+def check_calendar_history(binary, previous=None):
+    with tempfile.TemporaryDirectory(prefix="mail-calendar-history-", dir="/tmp") as directory:
+        root = Path(directory)
+        test = hosted.Fixture(previous or binary, root, staging=True)
+
+        def deliver(subject, series, sequence, *, method="REQUEST", occurrence=None, future=False, sender=None):
+            sender = sender or organizer
+            recurrence = () if occurrence is None else (
+                f"RECURRENCE-ID{';RANGE=THISANDFUTURE' if future else ''}:20261126T{occurrence}Z",
+            )
+            message = EmailMessage()
+            message["From"], message["To"], message["Subject"] = sender, owner, subject
+            message.set_content("\r\n".join((
+                "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail//Calendar history fixture//EN", f"METHOD:{method}",
+                "BEGIN:VEVENT", f"UID:{series}@example.test", "DTSTAMP:20261121T100000Z", f"SEQUENCE:{sequence}",
+                f"ORGANIZER:mailto:{organizer}", f"ATTENDEE:mailto:{owner}", *recurrence,
+                f"DTSTART:20261126T{occurrence or '090000'}Z", "END:VEVENT", "END:VCALENDAR", "",
+            )), subtype="calendar", params={"method": method})
+            with test.smtp(sender) as smtp:
+                assert smtp.send_message(message) == {}
+            query = urllib.parse.urlencode({"folder": "INBOX", "q": subject})
+            row, = [item for item in test.api(session, "messages?" + query)[1]["items"] if item["subject"] == subject]
+            return row
+
+        def detail(mail):
+            status, body = test.api(session, "messages/ref/" + mail["reference"])
+            assert status == 200, body
+            return body
+
+        def queue_legacy(db, series, sequence, occurrence=None):
+            uid = f"{series}@example.test"
+            when = None
+            recurrence = ()
+            if occurrence:
+                recurrence = (f"RECURRENCE-ID:20261126T{occurrence}Z",)
+                wall = datetime.strptime("20261126" + occurrence, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+                when = {"wall": int(wall.timestamp()), "zone": "UTC", "all_day": False}
+            key = hashlib.sha256(json.dumps({"organizer": organizer, "uid": uid, "occurrence": when},
+                                             separators=(",", ":")).encode()).hexdigest()
+            send_id = key[:32]
+            reply = "\r\n".join((
+                "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail//REPLY fixture//EN", "METHOD:REPLY",
+                "BEGIN:VEVENT", f"UID:{uid}", "DTSTAMP:20261122T110000Z", f"SEQUENCE:{sequence}",
+                f"ORGANIZER:mailto:{organizer}", f"ATTENDEE;PARTSTAT=ACCEPTED:mailto:{owner}", *recurrence,
+                "END:VEVENT", "END:VCALENDAR", "",
+            ))
+            payload = {"message": {"to": [organizer], "subject": "Legacy RSVP", "text": "Legacy RSVP", "sendId": send_id},
+                       "calendarReply": {"key": key, "attendee": owner, "body": reply}}
+            decision = {"sequence": sequence, "dtstamp": int(datetime(2026, 11, 21, 10, tzinfo=timezone.utc).timestamp()),
+                        "response": "accepted", "sendId": send_id}
+            for kind, record_id, record in (("outbox", send_id, payload), ("calendar-rsvp", key, decision)):
+                db.execute("INSERT INTO webmail_records(username,kind,id,payload,state,revision) VALUES (?,?,?,?, 'pending',1)",
+                           (owner, kind, record_id, json.dumps(record)))
+            return send_id
+
+        with test.daemon():
+            owner = test.provision("history-owner")
+            organizer = test.provision("history-organizer")
+            stranger = test.provision("history-stranger")
+            session = test.login(owner)
+            assert test.api(session, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
+            status, calendar = test.api(session, "calendars", {"name": "Calendar history"})
+            assert status == 201, calendar
+            latest = deliver("Updated invite archived before upgrade", "updated", 3)
+            old = deliver("Older invite delivered out of order", "updated", 1)
+            deliver("Cancellation by an unrelated authenticated sender", "updated", 99, method="CANCEL", sender=stranger)
+            fields = {**session, "If-Match": latest["revision"]}
+            assert test.api(fields, "messages/ref/" + latest["reference"], {"folder": "Archive"}, "PUT")[0] == 200
+            cancelled = deliver("Initial series to cancel", "cancelled", 0)
+            deliver("Entire series cancelled before upgrade", "cancelled", 2, method="CANCEL")
+            before = deliver("Occurrence before the old range", "range", 0, occurrence="090000")
+            inside = deliver("Occurrence inside the old range", "range", 0, occurrence="130000")
+            deliver("Future range cancelled before upgrade", "range", 4, method="CANCEL", occurrence="120000", future=True)
+
+        # A previous executable exercises the schema upgrade. The default
+        # CI run also tests an empty ledger with unchecked message references.
+        with sqlite3.connect(root / "smtp.db") as db:
+            tracked = db.execute("SELECT 1 FROM sqlite_master WHERE name='mail_calendar_revisions'").fetchone()
+            if tracked is None:
+                print("Confirmed the previous Mail binary wrote the fixture without arrival tracking.")
+            db.execute("DROP TABLE IF EXISTS mail_calendar_revisions")
+            if "calendar_history_checked" in {row[1] for row in db.execute("PRAGMA table_info(mailbox_message_refs)")}:
+                db.execute("UPDATE mailbox_message_refs SET calendar_history_checked=0")
+            archived = db.execute("SELECT folder,verified_author FROM mailbox_message_refs WHERE reference=?", (latest["reference"],)).fetchone()
+            assert archived == ("Archive", organizer), archived
+            obsolete_reply = queue_legacy(db, "updated", 1)
+            current_reply = queue_legacy(db, "range", 0, "090000")
+
+        test.binary = binary
+
+        def check_disposition(mail, expected, error=None):
+            opened = detail(mail)
+            assert not opened.get("calendar_history_pending"), opened
+            assert opened["calendar_rsvps"][0]["availability"] == expected, opened
+            if error:
+                headers = {**session, "If-Match": opened["revision"]}
+                params = {"reference": opened["reference"], "index": 0}
+                assert test.api(headers, "calendar-rsvp", {**params, "response": "accepted"})[1]["error"] == error
+                assert test.api(headers, "calendar-invitation-event", {**params, "calendarId": calendar["id"]})[1]["error"] == error
+
+        with test.daemon():
+            session = test.login(owner)
+            check_disposition(old, "superseded", "invitation_stale")
+            check_disposition(latest, "current")
+            check_disposition(cancelled, "cancelled", "invitation_cancelled")
+            check_disposition(before, "current")
+            check_disposition(inside, "cancelled", "invitation_cancelled")
+            for _ in range(80):
+                rejected = test.api(session, "outbox/" + obsolete_reply)[1]
+                sent = test.api(session, "outbox/" + current_reply)[1]
+                if rejected["state"] != "pending" and sent["state"] == "sent":
+                    break
+                time.sleep(0.15)
+            assert rejected["state"] == "failed" and "updated invitation" in rejected["error"], rejected
+            assert sent["state"] == "sent", sent
+            assert test.count(owner) == 1
+            newest = deliver("Newer live delivery after the upgrade", "updated", 7)
+            check_disposition(latest, "superseded", "invitation_stale")
+            check_disposition(newest, "current")
+
+        with sqlite3.connect(root / "smtp.db") as db:
+            assert db.execute("SELECT COUNT(*) FROM mail_calendar_revisions").fetchone() == (6,)
+            assert db.execute("SELECT COUNT(*) FROM mailbox_message_refs WHERE calendar_history_checked=0").fetchone() == (0,)
+        with test.daemon():
+            session = test.login(owner)
+            check_disposition(newest, "current")
+            check_disposition(old, "superseded", "invitation_stale")
+            check_disposition(inside, "cancelled", "invitation_cancelled")
+        print("Verified pre-tracking invitations across upgrade and restart, including archived revisions, cancellations, sender boundaries, queued RSVPs, and newer deliveries.")
+
+
 def check_calendar_upgrade(binary, previous):
     with tempfile.TemporaryDirectory(prefix="mail-dav-upgrade-", dir="/tmp") as directory:
         root = Path(directory)
@@ -1636,6 +1768,7 @@ def main():
                     must(client.request("GET", path, tls=False), 404)
         print("Verified native HTTPS DAV CRUD, HTTP parity, conditional races, size limits, scanner refusal and restart.")
     check_sync_collections(args.binary.resolve(strict=True))
+    check_calendar_history(args.binary.resolve(strict=True), args.upgrade_from.resolve(strict=True) if args.upgrade_from else None)
     if args.upgrade_from:
         check_calendar_upgrade(args.binary.resolve(strict=True), args.upgrade_from.resolve(strict=True))
 
