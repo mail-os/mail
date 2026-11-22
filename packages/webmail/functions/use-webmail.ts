@@ -154,6 +154,13 @@ export function useWebmail(ports: WebmailPorts) {
   const sendUncertain = state(false)
   const composeError = state('')
   const sendDelay = state(10)
+  const scheduleOpen = state(false)
+  const scheduleDate = state('')
+  const scheduleZoneFormat = new Intl.DateTimeFormat(undefined, { timeZoneName: 'long' })
+  const scheduleZone = derived(() => {
+    const selected = selectedSchedule()
+    return scheduleZoneFormat.formatToParts(selected == null ? Date.now() : selected * 1000).find(part => part.type === 'timeZoneName')?.value || attentionZone
+  })
   const sendDelayOptions = derived(() => [...new Set([0, 5, 10, 30, sendDelay()])].sort((left, right) => left - right))
   const settings = state(false)
   const leavingAccount = state(false)
@@ -259,8 +266,13 @@ export function useWebmail(ports: WebmailPorts) {
     if (cause instanceof MailApiError && (cause.status === 401 || cause.code === 'account_changed')) onAuthError(cause)
   }, id => api(`/webmail/api/uploads/${id}`, { method: 'DELETE' }))
   const hasComposition = derived(() => Boolean(subject() || body() || draftHtml() || attachmentEditor.attachments().length || recipientEditor.toRecipients().length || recipientEditor.ccRecipients().length || recipientEditor.bccRecipients().length || recipientEditor.toInput() || recipientEditor.ccInput() || recipientEditor.bccInput()))
+  function selectedSchedule(): number | null {
+    if (!scheduleOpen()) return null
+    try { return localDeadline(scheduleDate(), -Infinity) }
+    catch { return null }
+  }
   function content() {
-    return { ...recipientEditor.snapshot(), subject: subject(), text: body(), html: body() === initialText() ? draftHtml() : '', inReplyTo: inReplyTo(), references: references(), attachments: attachmentEditor.snapshot(), replyContext: replyContext(), clearFollowUp: clearFollowUp() }
+    return { ...recipientEditor.snapshot(), subject: subject(), text: body(), html: body() === initialText() ? draftHtml() : '', inReplyTo: inReplyTo(), references: references(), attachments: attachmentEditor.snapshot(), replyContext: replyContext(), clearFollowUp: clearFollowUp(), scheduleAt: selectedSchedule() }
   }
   const draft = useDraftAutosave({ snapshot: content, hasContent: hasComposition, active: () => composing() && !sending(), blocked: () => attachmentEditor.attachmentPending() || authExpired(), save: payload => api<DraftAck>('/webmail/api/drafts', { method: 'POST', body: JSON.stringify(payload) }) })
   const hasUnsavedChanges = derived(() => draft.dirty() || attachmentEditor.attachmentPending())
@@ -298,7 +310,7 @@ export function useWebmail(ports: WebmailPorts) {
     return Boolean(activeQuery() || filter.sender || filter.recipient || filter.filename || filter.after || filter.before || filter.status !== 'any' || filter.flagged || filter.attachments || (filter.location && filter.location !== folder()))
   })
   const undoRemaining = derived(() => Math.min(30, Math.max(0, Math.ceil((undoAction()?.expiresAt ?? 0) - now()))))
-  const sendRemaining = derived(() => Math.max(0, Math.ceil((pendingSend()?.dueAt ?? 0) - now())))
+  const sendRemaining = derived(() => pendingSend()?.scheduled ? 0 : Math.max(0, Math.ceil((pendingSend()?.dueAt ?? 0) - now())))
   const outboxCount = derived(() => outbox().filter(item => ['pending', 'sending', 'failed', 'partial', 'unknown', 'sent_unfiled'].includes(item.state)).length)
   const currentFolderName = derived(() => {
     if (outboxView()) return 'Outbox'
@@ -1073,6 +1085,7 @@ export function useWebmail(ports: WebmailPorts) {
       subject.set(''); body.set(''); draftHtml.set(''); initialText.set(''); inReplyTo.set(''); references.set(''); replyContext.set(null); clearFollowUp.set(false); composeError.set(''); showCc.set(false); showBcc.set(false)
       recipientEditor.restore({ to: [], cc: [], bcc: [] }, { to: '', cc: '', bcc: '' })
       attachmentEditor.restore([])
+      scheduleOpen.set(false); scheduleDate.set('')
       if (!destroyed) draft.restore(null, content())
       lastQueuedPayload = null
       sendUncertain.set(false)
@@ -1132,6 +1145,11 @@ export function useWebmail(ports: WebmailPorts) {
       recipientEditor.restore({ to: payload.to, cc: payload.cc, bcc: payload.bcc }, payload.recipientInputs || { to: '', cc: '', bcc: '' }, payload.recipientLabels)
       subject.set(payload.subject); body.set(payload.text); initialText.set(payload.text); draftHtml.set(payload.html); inReplyTo.set(payload.inReplyTo); references.set(payload.references); replyContext.set(payload.replyContext)
       clearFollowUp.set(!!payload.clearFollowUp)
+      const sendTime = payload.scheduleAt ? new Date(payload.scheduleAt * 1000) : null
+      if (sendTime && Number.isFinite(sendTime.getTime())) {
+        scheduleOpen.set(true)
+        scheduleDate.set(localDateInput(sendTime))
+      }
       showCc.set(Boolean(payload.cc.length || payload.recipientInputs?.cc)); showBcc.set(Boolean(payload.bcc.length || payload.recipientInputs?.bcc))
       attachmentEditor.restore(payload.attachments.filter(item => item.uploadId).map((item, index) => ({ key: crypto.randomUUID(), uploadId: item.uploadId, filename: item.filename, contentType: item.contentType, size: metadata?.attachments[index]?.size ?? item.size ?? 0, progress: 100, status: 'ready' as const })))
       draft.restore(document, content())
@@ -1191,6 +1209,11 @@ export function useWebmail(ports: WebmailPorts) {
     const message = selected()
     if (message?.folder === 'Drafts' && message.uid === payload.draftUid) closeReader()
   }
+  function chooseSendTime(): void {
+    scheduleDate.set(localDateInput(new Date(now() * 1000 + 3_600_000)))
+    scheduleOpen.set(true)
+    ports.nextTick(() => ports.composer.current?.querySelector<HTMLInputElement>('#composeSendTime')?.focus())
+  }
   async function send(): Promise<void> {
     if (sending() || sendUncertain() || attachmentEditor.attachmentPending()) return
     composeError.set('')
@@ -1200,10 +1223,15 @@ export function useWebmail(ports: WebmailPorts) {
     if (invalid) { composeError.set(`Check this email address: ${invalid.raw}`); return }
     if (!values.length || values.length > 100) { composeError.set(values.length ? 'Use at most 100 recipients.' : 'Add at least one recipient.'); return }
     if (new TextEncoder().encode(body()).length > 256 * 1024) { composeError.set('Keep the message body under 256 KiB.'); return }
+    const scheduleAt = selectedSchedule()
+    if (scheduleOpen() && (scheduleAt == null || scheduleAt <= now() || scheduleAt > now() + 365 * 86400)) {
+      composeError.set('Choose a valid local send time in the next 365 days.')
+      return
+    }
     sending.set(true)
     try {
       await draft.flushAll()
-      const payload = lastQueuedPayload ?? { ...content(), draftId: draft.id(), draftUid: draft.uid(), draftRevision: draft.revision(), saveToken: '', sendId: crypto.randomUUID(), delaySeconds: sendDelay() }
+      const payload = lastQueuedPayload ?? { ...content(), draftId: draft.id(), draftUid: draft.uid(), draftRevision: draft.revision(), saveToken: '', sendId: crypto.randomUUID(), ...(scheduleAt == null ? { delaySeconds: sendDelay() } : { scheduleAt }) }
       lastQueuedPayload = payload
       let queued: OutboxItem
       try { queued = await api<OutboxItem>('/webmail/api/compose', { method: 'POST', body: JSON.stringify(payload) }) }
@@ -1217,7 +1245,7 @@ export function useWebmail(ports: WebmailPorts) {
       closeQueuedDraft(payload)
       clockOffset = queued.serverTime - Date.now() / 1000
       now.set(Date.now() / 1000 + clockOffset)
-      notice.set(queued.state === 'pending' && queued.dueAt > queued.serverTime ? `Message queued. Undo Send is available for ${queued.dueAt - queued.serverTime} seconds.` : 'Message queued for delivery.')
+      notice.set(queued.scheduled ? 'Message scheduled for ' + deadlineLabel(queued.dueAt) + '.' : queued.state === 'pending' && queued.dueAt > queued.serverTime ? `Message queued. Undo Send is available for ${queued.dueAt - queued.serverTime} seconds.` : 'Message queued for delivery.')
       resetComposition()
       await refreshOutbox()
       await refresh(true)
@@ -1286,21 +1314,38 @@ export function useWebmail(ports: WebmailPorts) {
     clearSelection()
     await refreshOutbox()
   }
-  async function cancelSend(id = pendingSend()?.id): Promise<void> {
-    if (!id || cancelling()) return
+  async function cancelSend(id = pendingSend()?.id, edit = false): Promise<void> {
+    if (!id || cancelling() || sending() || sendUncertain()) return
     cancelling.set(true)
+    error.set('')
     try {
+      if (edit && hasComposition()) await draft.flushAll()
       const cancelled = await api<OutboxItem>(`/webmail/api/outbox/${id}`, { method: 'DELETE' })
-      pendingSend.set(null)
+      if (pendingSend()?.id === id) pendingSend.set(null)
+      outbox.set(outbox().map(item => item.id === id ? cancelled : item))
       notice.set('Send cancelled. Nothing was dispatched.')
+      if (cancelled.scheduled && !edit) {
+        await refreshOutbox()
+        if (!outboxView()) await refresh(true)
+        return
+      }
       if (hasComposition()) await draft.flushAll()
       let document: DraftDocument | null = null
       let metadata: MessageDetail | null = null
       if (cancelled.message.draftUid) {
         try { document = await api<DraftDocument>(`/webmail/api/drafts?uid=${cancelled.message.draftUid}`); metadata = await api<MessageDetail>(messagePath({ uid: document.uid, folder: 'Drafts' })) }
-        catch { document = null }
+        catch (cause) {
+          if (cancelled.scheduled) throw cause
+          document = null
+        }
       }
-      installPayload(document?.message || cancelled.message, document, metadata)
+      if (document && document.state !== 'saved') throw new Error('This draft is already queued. Refresh Outbox to see its status.')
+      const payload = document?.message || cancelled.message
+      installPayload(edit ? { ...payload, scheduleAt: cancelled.dueAt } : payload, document, metadata)
+      if (edit) {
+        title.set('Scheduled send paused')
+        notice.set('Schedule paused. Save this draft or choose a new send time.')
+      }
       await refreshOutbox()
     }
     catch (cause) { error.set(cause instanceof MailApiError && cause.status === 409 ? 'The cancellation window has closed. Check Outbox for the delivery result.' : errorMessage(cause)); await refreshOutbox() }
@@ -1312,6 +1357,7 @@ export function useWebmail(ports: WebmailPorts) {
       if (hasComposition()) await draft.flushAll()
       let item = await api<OutboxItem>(`/webmail/api/outbox/${id}`)
       if (!['failed', 'partial', 'cancelled', 'unknown'].includes(item.state)) throw new Error('This message is already queued or delivered.')
+      if (item.scheduled && item.state === 'cancelled') throw new Error('This schedule was cancelled. Edit its saved draft to send it again.')
       if (item.state === 'unknown') {
         if (!reviewed) { reviewUnknown(id); return }
         item = await api<OutboxItem>(`/webmail/api/outbox/${id}`, { method: 'PATCH', body: JSON.stringify({ reviewed: true }) })
@@ -1321,14 +1367,14 @@ export function useWebmail(ports: WebmailPorts) {
           const document = await api<DraftDocument>(`/webmail/api/drafts?uid=${item.message.draftUid}`)
           if (document.state === 'saved') {
             const metadata = await api<MessageDetail>(messagePath({ uid: document.uid, folder: 'Drafts' }))
-            installPayload(document.message, document, metadata)
+            installPayload({ ...document.message, scheduleAt: null }, document, metadata)
             title.set('Review unsent recipients')
             return
           }
         }
         catch { /* The original draft may have been moved or deleted; keep a copy. */ }
       }
-      const payload = { ...item.message }
+      const payload = { ...item.message, scheduleAt: null }
       if (item.result) {
         const retry = new Set([...item.result.failed, ...(item.result.unknown || [])].map(address => address.toLowerCase()))
         payload.to = payload.to.filter(address => retry.has(address.toLowerCase()))
@@ -1433,16 +1479,16 @@ export function useWebmail(ports: WebmailPorts) {
     now.set(Date.now() / 1000 + clockOffset)
     if (undoAction() && undoRemaining() <= 0) undoAction.set(null)
     if (!user() || authExpired()) return
-    const pending = outbox().some(item => item.state === 'pending' || item.state === 'sending') || pendingSend()?.state === 'pending' || pendingSend()?.state === 'sending'
-    if ((pending || outboxView()) && Date.now() - lastOutboxPoll >= 1000) void refreshOutbox()
+    const pending = (item: OutboxItem | null) => item?.state === 'sending' || (item?.state === 'pending' && item.dueAt <= now() + 2)
+    const pollDelay = outbox().some(pending) || pending(pendingSend()) ? 1000 : outboxView() ? 10000 : 30000
+    if (Date.now() - lastOutboxPoll >= pollDelay) void refreshOutbox()
     if (Date.now() - lastRefresh >= 30000 && !loading() && !refreshing() && !mutating() && !settings() && !confirmation()) {
       void refresh(true)
-      void refreshOutbox()
     }
   }
   function preventUnload(event: BeforeUnloadEvent): void { if (hasUnsavedChanges()) { event.preventDefault(); event.returnValue = '' } }
   function destroy(): void { destroyed = true; ++listRequest; ++messageRequest; recipientEditor.destroy(); attachmentEditor.destroy(); draft.destroy(); privateMail.closePrivate(); contactBook.closeContacts(); selectionEffect() }
-  return { user, folders, folder, messages, threads, expandedThreads, selected, loading, refreshing, listError, readerError, readerTarget, reading, readingLoading, mutating, error, notice, query, activeQuery, appliedSearchAll, filterLocation, filterSender, filterRecipient, filterFilename, libraryView, libraryFiles, indexProgress, filterAfter, filterBefore, filterStatus, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, formattedReader, remoteImagesAllowed, checked, checkedKeys, selectedCount, isJunkFolder, readerJunkAction, selectionJunkAction, allChecked, someChecked, undoAction, undoRemaining, readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts, pendingSend, sendRemaining, outbox, outboxCount, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...senderReview, ...notifications, ...privateMail, ...contactBook, showContacts, composeSavedCard, collectionView, collectionId, canOpenPrivate,
+  return { user, folders, folder, messages, threads, expandedThreads, selected, loading, refreshing, listError, readerError, readerTarget, reading, readingLoading, mutating, error, notice, query, activeQuery, appliedSearchAll, filterLocation, filterSender, filterRecipient, filterFilename, libraryView, libraryFiles, indexProgress, filterAfter, filterBefore, filterStatus, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, formattedReader, remoteImagesAllowed, checked, checkedKeys, selectedCount, isJunkFolder, readerJunkAction, selectionJunkAction, allChecked, someChecked, undoAction, undoRemaining, readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts, pendingSend, sendRemaining, outbox, outboxCount, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...senderReview, ...notifications, ...privateMail, ...contactBook, showContacts, composeSavedCard, collectionView, collectionId, canOpenPrivate,
     showCollectionManager, closeCollectionManager, selectCollection, confirmCollectionDeletion, savePrivateLabel, setPrivateMembership, groupSelected, displaySubject, changeNotificationRule, ...recipientEditor, ...attachmentEditor, ...recoverySettings, ...forwardingSettings, ...vacationSettings, attentionViews, attentionView, followUpFocused, attentionSaving, attentionSchedule, attentionDate, attentionZone, dueReminders, replyContext, clearFollowUp, selectAttention, nextFollowUp, changeAttention, startAttentionSchedule, saveAttentionSchedule, deadlineLabel, categoryList, newsletterExpanded, readerExpanded, receiptFull, receiptCompact, receiptPreview, senderLabel, sortingSettings, sortingSaving, sortingError, toggleAutomaticSorting, placementText, categoryRule, categoryRuleSaving, saveCategoryRule, showSenderReview, openReviewMessage, reviewMessage, refresh, loadMessages, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread, toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, openAttachmentMessage, showAttachmentLibrary, retryReader, closeReader, nextUnread, readSelection, advanceBatch, triageAndNext, bulkAction, selectedAction, undoLastAction, showShortcuts, closeShortcuts, handleShortcut, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments, saveSendPreference, send, confirmPendingSend, showOutbox, refreshOutbox, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword, showConfirmation, confirmAction, saveDraftCopy: draft.saveCopy, mount, resume, tick, preventUnload, destroy, messageIdentity, messagePageSize, folderName, shortDate, fullDate, readableBytes, attachmentPath }
 }
 

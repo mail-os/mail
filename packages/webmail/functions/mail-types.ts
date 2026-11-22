@@ -119,11 +119,12 @@ export interface ComposePayload {
   clearFollowUp?: boolean
   sendId?: string
   delaySeconds?: number
+  scheduleAt?: number | null
 }
 export interface DraftAck { ok: boolean, uid: number, draftId: string, revision: number }
 export interface DraftDocument { draftId: string, revision: number, uid: number, state: string, message: ComposePayload }
 export interface SendResult { message_id: string, delivered: number, failed: string[], sent_saved: boolean, unknown?: string[] }
-export interface OutboxItem { id: string, state: string, dueAt: number, serverTime: number, message: ComposePayload, result: SendResult | null, error: string | null }
+export interface OutboxItem { id: string, state: string, dueAt: number, serverTime: number, scheduled?: boolean, message: ComposePayload, result: SendResult | null, error: string | null }
 export type BulkAction = 'move' | 'trash' | 'read' | 'unread' | 'flag' | 'unflag' | 'purge' | 'junk' | 'not_junk'
 export interface ActionResult extends MessageRef { ok: boolean, new_uid: number | null, new_folder: string | null, error_code: string | null }
 export interface BulkResult { ok: boolean, results: ActionResult[], undoId: string | null, expiresAt: number | null }

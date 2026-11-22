@@ -321,10 +321,15 @@ revokes existing webmail sessions.
   Its `junk` and `not_junk` actions require a stable message reference and
   current revision for each item.
   `POST /webmail/api/undo/:id` restores an unchanged receipt once, idempotently.
-- `POST /webmail/api/compose` with a stable `sendId` queues a validated message;
-  `delaySeconds` controls the hold. Replaying the same ID cannot dispatch twice.
-  `GET /webmail/api/outbox` exposes results; `DELETE /webmail/api/outbox/:id`
-  cancels a pending send. A reviewed Unknown record may be resolved explicitly.
+- `POST /webmail/api/compose` with a stable `sendId` queues a validated message.
+  Set `delaySeconds` for an Undo Send hold or `scheduleAt` to an integer Unix
+  timestamp within the next 365 days. The Outbox keeps the scheduled message
+  across server restarts. Replaying the same ID cannot dispatch twice.
+  `GET /webmail/api/outbox` exposes results and `DELETE /webmail/api/outbox/:id`
+  cancels a pending send before its deadline. In webmail, **Edit scheduled send**
+  pauses the original schedule and opens the draft with its send time selected.
+  Set the next schedule explicitly after editing. A reviewed Unknown record
+  may be resolved explicitly.
 - `POST /webmail/auth/forgot` `{address}` always returns `{ok:true}` (429 when
   the IP is over its limit). `POST /webmail/auth/reset/verify` `{token}` returns
   `{account}` without spending the token; `POST /webmail/auth/reset`

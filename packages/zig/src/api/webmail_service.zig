@@ -17,6 +17,7 @@ const message_refs = @import("../storage/message_refs.zig");
 const thread_ids = @import("../message/thread_ids.zig");
 
 pub const ServiceError = error{ InvalidPayload, AttachmentLimit, InvalidAttachment, Conflict, NotFound, InvalidAction, MessageChanged };
+pub const max_schedule_seconds = 365 * 24 * 60 * 60;
 
 fn decodeInlineAttachment(a: std.mem.Allocator, encoded: []const u8, limit: usize) ![]u8 {
     const decoder = std.base64.standard.Decoder;
@@ -43,6 +44,7 @@ pub const Payload = struct {
     saveToken: []const u8 = "",
     sendId: ?[]const u8 = null,
     delaySeconds: ?u32 = null,
+    scheduleAt: ?i64 = null,
     recipientInputs: struct { to: []const u8 = "", cc: []const u8 = "", bcc: []const u8 = "" } = .{},
     recipientLabels: struct { to: []const []const u8 = &.{}, cc: []const []const u8 = &.{}, bcc: []const []const u8 = &.{} } = .{},
     replyContext: ?MessageRef = null,
@@ -78,6 +80,7 @@ const UndoDocument = struct { entries: []const UndoEntry, results: []const Actio
 pub const BulkResult = struct { ok: bool, results: []const ActionResult, undoId: ?[]const u8 = null, expiresAt: ?i64 = null };
 pub const Outbox = struct {
     message: Payload,
+    scheduled: bool = false,
     result: ?compose.SendResult = null,
     error_message: ?[]const u8 = null,
     request_hash: ?[]const u8 = null,
@@ -424,9 +427,7 @@ pub const Service = struct {
         defer self.mutations.unlock();
         const id = payload.sendId orelse return ServiceError.InvalidPayload;
         if (!store.validId(id)) return ServiceError.InvalidPayload;
-        const delay = payload.delaySeconds orelse self.config.undo_send_seconds;
-        if (delay > 30) return ServiceError.InvalidPayload;
-        const serialized = try json(a, Outbox{ .message = payload, .reply_cutoff_ms = time.milliTimestamp() });
+        const serialized = try json(a, Outbox{ .message = payload, .scheduled = payload.scheduleAt != null, .reply_cutoff_ms = time.milliTimestamp() });
         if (store.get(a, self.db, user, "outbox", id)) |known| {
             const parsed = try std.json.parseFromSlice(Outbox, a, known.payload, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
@@ -438,6 +439,15 @@ pub const Service = struct {
             if (!matches) return ServiceError.Conflict;
             return known;
         } else |err| if (err != store.StoreError.NotFound) return err;
+        const due_at = if (payload.scheduleAt) |schedule_at| blk: {
+            if (payload.delaySeconds != null or schedule_at <= now or schedule_at > now + max_schedule_seconds)
+                return error.InvalidSendSchedule;
+            break :blk schedule_at;
+        } else blk: {
+            const delay = payload.delaySeconds orelse self.config.undo_send_seconds;
+            if (delay > 30) return ServiceError.InvalidPayload;
+            break :blk now + delay;
+        };
         const msg = try self.payloadMessage(a, payload, user, email, false);
         if (msg.to.len + msg.cc.len + msg.bcc.len == 0) return compose.ComposeError.NoRecipients;
         for ([_][]const []const u8{ msg.to, msg.cc, msg.bcc }) |addresses| for (addresses) |address| if (!compose.isSafeAddress(address)) return compose.ComposeError.InvalidAddress;
@@ -447,7 +457,7 @@ pub const Service = struct {
             const row = try self.readyDraft(a, user, draft_id);
             if (row.revision != payload.draftRevision or !std.mem.eql(u8, row.state, "saved")) return ServiceError.Conflict;
         }
-        var row = store.Record{ .username = user, .kind = "outbox", .id = id, .payload = serialized, .state = "pending", .revision = 0, .due_at = now + delay, .expires_at = 0 };
+        var row = store.Record{ .username = user, .kind = "outbox", .id = id, .payload = serialized, .state = "pending", .revision = 0, .due_at = due_at, .expires_at = 0 };
         if ((try self.db.hostedLimits(user)) != null) {
             const bytes = @max(1024 * 1024, 2 * self.config.max_message_bytes);
             store.checkRecordCapacity(self.db, row, bytes, 1024) catch |err| switch (err) {
@@ -458,12 +468,7 @@ pub const Service = struct {
                 else => return err,
             };
         }
-        row.revision = try store.put(self.db, row, 0);
-        if (payload.draftId) |draft_id| {
-            var draft = try store.get(a, self.db, user, "draft", draft_id);
-            draft.state = "queued";
-            draft.revision = try store.put(self.db, draft, draft.revision);
-        }
+        row.revision = try store.enqueue(self.db, row, payload.draftId, payload.draftRevision);
         return row;
     }
 
@@ -472,17 +477,7 @@ pub const Service = struct {
         defer self.mutations.unlock();
         const existing = try store.get(a, self.db, user, "outbox", id);
         if (std.mem.eql(u8, existing.state, "cancelled")) return existing;
-        const row = try store.cancelSend(a, self.db, user, id, now);
-        const doc = try std.json.parseFromSlice(Outbox, a, row.payload, .{ .ignore_unknown_fields = true });
-        defer doc.deinit();
-        if (doc.value.message.draftId) |draft_id| {
-            var draft = store.get(a, self.db, user, "draft", draft_id) catch return row;
-            if (std.mem.eql(u8, draft.state, "queued")) {
-                draft.state = "saved";
-                _ = try store.put(self.db, draft, draft.revision);
-            }
-        }
-        return row;
+        return store.cancelSend(a, self.db, user, id, now);
     }
 
     pub fn dispatchDue(self: *Service, a: std.mem.Allocator, now: i64) !bool {
@@ -686,6 +681,7 @@ pub const Service = struct {
         }
         if (!std.mem.eql(u8, draft.value.folder, "Drafts")) return ServiceError.Conflict;
         var retry = draft.value.message;
+        retry.scheduleAt = null;
         if (doc.result) |result| {
             retry.recipientLabels.to = try failedLabels(a, retry.to, retry.recipientLabels.to, result.failed);
             retry.recipientLabels.cc = try failedLabels(a, retry.cc, retry.recipientLabels.cc, result.failed);
@@ -914,10 +910,12 @@ fn failedLabels(a: std.mem.Allocator, addresses: []const []const u8, labels: []c
 
 fn sendFingerprint(a: std.mem.Allocator, payload: Payload) ![]const u8 {
     const raw = try json(a, payload);
-    if (payload.clearFollowUp) return fingerprint(a, raw);
-    // Keep hashes from compact Outbox rows written before the toggle exists.
+    if (payload.clearFollowUp and payload.scheduleAt != null) return fingerprint(a, raw);
+    // Compact receipts retain the request digest after the message is pruned.
+    // Omit new optional fields when absent to match receipts from older builds.
     var legacy = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
-    _ = legacy.object.orderedRemove("clearFollowUp");
+    if (!payload.clearFollowUp) _ = legacy.object.orderedRemove("clearFollowUp");
+    if (payload.scheduleAt == null) _ = legacy.object.orderedRemove("scheduleAt");
     return fingerprint(a, try json(a, legacy));
 }
 

@@ -262,6 +262,7 @@ input[type=checkbox] { accent-color: var(--accent); }
 .wm-outbox-title, .wm-outbox-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .wm-outbox-item h2 { font-size: 15px; margin: 0; overflow-wrap: anywhere; }
 .wm-outbox-item p { font-size: 13px; color: var(--muted); margin: 8px 0 0; overflow-wrap: anywhere; }
+.wm-outbox-time { display: flex; gap: 6px; align-items: center; }
 .wm-outbox-status { display: inline-block; font-size: 11px; background: var(--accent-soft); color: var(--accent); padding: 4px 8px; border-radius: 5px; }
 .wm-outbox-status--review { background: var(--warning-soft); color: var(--warning); }
 .wm-review-welcome { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--accent-soft); }
@@ -321,6 +322,10 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-draft-conflict { display: flex; gap: 8px; padding: 0 20px; }
 .wm-draft-status { padding: 12px 20px; color: var(--muted); font-size: 11px; }
 .wm-composer-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 14px 20px; border-top: 1px solid var(--border); background: var(--panel); position: sticky; bottom: 0; z-index: 2; }
+.wm-send-schedule { display: flex; flex: 1 0 100%; align-items: center; flex-wrap: wrap; gap: 8px; padding-bottom: 8px; }
+.wm-send-schedule label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 650; }
+.wm-send-schedule input { min-height: 36px; max-width: 100%; border: 1px solid var(--border); border-radius: 8px; padding: 6px 9px; color: var(--text); background: var(--panel); font: inherit; }
+.wm-send-schedule small { color: var(--muted); font-size: 12px; }
 .wm-send-delay { display: flex; align-items: center; gap: 5px; margin-left: auto; font-size: 11px; color: var(--muted); }
 .wm-send-delay select { border: 1px solid var(--border); border-radius: 5px; padding: 5px; background: var(--panel); font-size: 11px; }
 .wm-modal .login { margin: auto; width: min(94vw, 400px); }

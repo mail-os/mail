@@ -1305,6 +1305,8 @@ fn handleCompose(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: s
 
     const parsed = std.json.parseFromSlice(ComposePayload, arena, req.body, .{ .ignore_unknown_fields = true }) catch return sendError(conn, arena, 400, "bad_request", "Invalid compose JSON");
     defer parsed.deinit();
+    if (parsed.value.scheduleAt != null and parsed.value.sendId == null)
+        return sendError(conn, arena, 400, "invalid_send_schedule", "A scheduled message requires a send ID.");
     server.service.scanInlineAttachments(server.config.scanner, arena, sess.username, parsed.value) catch |err| return mapServiceError(conn, arena, err);
     if (parsed.value.sendId != null) {
         const row = server.service.queue(arena, sess.username, sess.email, parsed.value, time_compat.timestamp()) catch |err| return mapServiceError(conn, arena, err);
@@ -1391,6 +1393,7 @@ fn handleFolders(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: s
 fn mapServiceError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: anyerror) !void {
     return switch (err) {
         service_mod.ServiceError.Conflict => sendError(conn, arena, 409, "conflict", "This item changed in another window or its undo window expired. Refresh before retrying."),
+        error.InvalidSendSchedule => sendError(conn, arena, 400, "invalid_send_schedule", "Choose a future send time within 365 days. Use either a schedule or an Undo Send delay."),
         service_mod.ServiceError.AttachmentLimit => sendError(conn, arena, 413, "attachment_limit", "The message exceeds your configured size limit"),
         error.MalwareDetected => sendError(conn, arena, 422, "malware_detected", "Attachment rejected by malware scanner"),
         error.MalwareScanTooLarge => sendError(conn, arena, 413, "scan_limit", "Attachment exceeds scanner size limit"),
@@ -1592,7 +1595,7 @@ fn handleUndo(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.
 fn outboxJson(arena: std.mem.Allocator, row: store.Record) ![]const u8 {
     const parsed = try std.json.parseFromSlice(service_mod.Outbox, arena, row.payload, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
-    return service_mod.json(arena, .{ .id = row.id, .state = row.state, .dueAt = row.due_at, .serverTime = time_compat.timestamp(), .message = parsed.value.message, .result = parsed.value.result, .@"error" = parsed.value.error_message });
+    return service_mod.json(arena, .{ .id = row.id, .state = row.state, .dueAt = row.due_at, .serverTime = time_compat.timestamp(), .scheduled = parsed.value.scheduled or parsed.value.message.scheduleAt != null, .message = parsed.value.message, .result = parsed.value.result, .@"error" = parsed.value.error_message });
 }
 
 fn handleCalendars(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {

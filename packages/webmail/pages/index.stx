@@ -45,7 +45,7 @@ const {
   readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts,
   pendingSend, sendRemaining, outbox, outboxCount, outboxView, cancelling, authExpired, currentFolderName, now,
   composing, title, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, saveStatus,
-  savingDraft, draftError, draftConflict, sendDelay, sendDelayOptions, settings, currentPassword, newPassword,
+  savingDraft, draftError, draftConflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword,
   confirmPassword, passwordError, savingPassword, confirmation, confirming, limits,
   recoveryAddress, recoverySetBy, recoveryInput, recoveryPassword, recoveryError, recoveryNotice, recoveryLoading,
   savingRecovery, saveRecovery,
@@ -399,13 +399,14 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         </details>
       </article>
     </section>
-    <section :if="outboxView" class="wm-outbox" aria-label="Outbox"><header class="wm-list-head"><h1>Outbox</h1><p>Messages wait here during the Undo Send window.</p></header><p :if="error" role="alert" class="login-error" :text="error"></p><p :if="outbox.length === 0" class="wm-state">No queued messages.</p>
+    <section :if="outboxView" class="wm-outbox" aria-label="Outbox"><header class="wm-list-head"><h1>Outbox</h1></header><p :if="error" role="alert" class="login-error" :text="error"></p><p :if="outbox.length === 0" class="wm-state">No queued messages.</p>
       <article :for="item in outbox" :key="item.id" class="wm-outbox-item">
         <div>
           <div class="wm-outbox-title">
             <h2 :text="item.message.subject || '(no subject)'"></h2>
-            <span class="wm-outbox-status" :class="{ 'wm-outbox-status--review': item.state === 'unknown' }" :text="item.state === 'pending' ? 'Waiting to send' : item.state === 'sending' ? 'Sending…' : item.state === 'sent' ? 'Delivered' : item.state === 'cancelled' ? 'Cancelled' : item.state === 'partial' ? 'Partially delivered' : item.state === 'sent_unfiled' ? 'Delivered; Sent copy unavailable' : item.state === 'unknown' ? 'Needs review' : item.state === 'resolved' ? 'Reviewed' : 'Delivery failed'"></span>
+            <span class="wm-outbox-status" :class="{ 'wm-outbox-status--review': item.state === 'unknown' }" :text="item.state === 'pending' ? (item.scheduled ? 'Scheduled' : 'Waiting to send') : item.state === 'sending' ? 'Sending…' : item.state === 'sent' ? 'Delivered' : item.state === 'cancelled' ? 'Cancelled' : item.state === 'partial' ? 'Partially delivered' : item.state === 'sent_unfiled' ? 'Delivered; Sent copy unavailable' : item.state === 'unknown' ? 'Needs review' : item.state === 'resolved' ? 'Reviewed' : 'Delivery failed'"></span>
           </div>
+          <p :if="item.state === 'pending' && item.scheduled" class="wm-outbox-time"><span class="mail-icon" data-icon="clock" aria-hidden="true"></span><span :text="deadlineLabel(item.dueAt)"></span></p>
           <p :if="item.message.to.length" :text="item.message.to.join(', ')"></p>
           <p :if="item.error" :text="item.error"></p>
           <p :if="item.result?.unknown?.length" :text="'Delivery unconfirmed: ' + item.result.unknown.join(', ')"></p>
@@ -413,8 +414,9 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
           <p :if="item.result?.unknown?.length && item.result?.delivered" :text="'Confirmed recipients: ' + item.result.delivered"></p>
         </div>
         <div :if="['pending', 'failed', 'partial', 'cancelled', 'unknown', 'sent_unfiled'].includes(item.state)" class="wm-outbox-actions">
-          <button :if="item.state === 'pending' && item.dueAt > now" class="wm-action" @click="cancelSend(item.id)" :disabled="cancelling">Undo Send</button>
-          <button :if="['failed', 'partial', 'cancelled', 'unknown'].includes(item.state)" class="wm-action" @click="retryOutbox(item.id)">Review and retry</button>
+          <button :if="item.state === 'pending' && item.dueAt > now && item.scheduled" class="wm-action" @click="cancelSend(item.id, true)" :disabled="cancelling"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span>Edit scheduled send</button>
+          <button :if="item.state === 'pending' && item.dueAt > now" class="wm-action" @click="cancelSend(item.id)" :disabled="cancelling" :text="item.scheduled ? 'Cancel scheduled send' : 'Undo Send'"></button>
+          <button :if="['failed', 'partial', 'unknown'].includes(item.state) || (item.state === 'cancelled' && !item.scheduled)" class="wm-action" @click="retryOutbox(item.id)">Review and retry</button>
           <button :if="item.state === 'unknown' || item.state === 'sent_unfiled'" class="wm-action" @click="selectFolder('Sent')"><span class="mail-icon" data-icon="send" aria-hidden="true"></span>Check Sent</button>
         </div>
       </article>
@@ -453,7 +455,19 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
     <ul :if="attachments.length" class="wm-compose-attachments"><li :for="attachment in attachments"><div><span :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></span><progress :if="attachment.status === 'uploading' || attachment.status === 'loading'" max="100" :value="attachment.status === 'loading' ? undefined : attachment.progress" :aria-label="(attachment.status === 'loading' ? 'Loading ' : 'Uploading ') + attachment.filename"></progress><small :if="attachment.status === 'uploading' || attachment.status === 'loading'" aria-hidden="true" :text="attachment.status === 'loading' ? 'Loading…' : attachment.progress === 100 ? 'Processing…' : attachment.progress + '%' "></small><p :if="attachment.error" class="wm-composer-error" :text="attachment.error"></p></div><button :if="attachment.status === 'failed'" type="button" class="wm-action" @click="retryAttachment(attachment.key)" :disabled="sending || sendUncertain">Retry upload</button><button type="button" class="wm-action" @click="removeAttachment(attachment.key)" :disabled="sending || sendUncertain" :aria-label="'Remove attachment ' + attachment.filename">Remove</button></li></ul>
     <p :if="composeError || draftError" class="wm-composer-error" role="alert" :text="composeError || draftError"></p><div :if="sendUncertain" class="wm-draft-conflict"><button type="button" class="wm-action" @click="confirmPendingSend()" :disabled="sending">Confirm send status</button></div><div :if="draftConflict" class="wm-draft-conflict"><button type="button" class="wm-action" @click="saveDraftCopy()">Save a copy</button><button type="button" class="wm-action" @click="showConfirmation('reload-draft')">Reload saved draft</button></div>
     <div class="wm-draft-status" role="status" aria-live="polite" aria-atomic="true" :text="saveStatus"></div>
-    <footer class="wm-composer-foot"><button class="wm-send-btn" type="submit" :disabled="sending || sendUncertain || savingDraft || attachmentPending || draftConflict || authExpired"><span class="mail-icon" data-icon="send" aria-hidden="true"></span><span :text="sending ? 'Queuing…' : 'Send'"></span></button><button class="wm-action" type="button" @click="saveDraft()" :disabled="sending || savingDraft || attachmentPending" :text="savingDraft ? 'Saving…' : 'Save draft'"></button><button class="wm-action" type="button" @click="showConfirmation('discard')" :disabled="sending || savingDraft">Discard</button><label class="wm-send-delay">Undo Send<select aria-label="Undo Send delay" x-model.number="sendDelay" @change="saveSendPreference()" :disabled="sending || sendUncertain"><option :for="value in sendDelayOptions" :value="value" :text="value === 0 ? 'Off' : value + ' seconds'"></option></select></label></footer>
+    <footer class="wm-composer-foot">
+      <div :if="scheduleOpen" id="composeSchedule" class="wm-send-schedule">
+        <label for="composeSendTime"><span class="mail-icon" data-icon="clock" aria-hidden="true"></span>Send at</label>
+        <input id="composeSendTime" type="datetime-local" x-model="scheduleDate" aria-describedby="composeTimeZone" :disabled="sending || sendUncertain">
+        <small id="composeTimeZone" :text="scheduleZone"></small>
+        <button type="button" class="wm-action" @click="scheduleOpen.set(false)" :disabled="sending || sendUncertain">Send now instead</button>
+      </div>
+      <button class="wm-send-btn" type="submit" :disabled="sending || sendUncertain || savingDraft || attachmentPending || draftConflict || authExpired"><span class="mail-icon" :data-icon="scheduleOpen ? 'clock' : 'send'" aria-hidden="true"></span><span :text="sending ? 'Queuing…' : scheduleOpen ? 'Schedule send' : 'Send'"></span></button>
+      <button :if="!scheduleOpen" class="wm-action" type="button" @click="chooseSendTime()" :disabled="sending || sendUncertain"><span class="mail-icon" data-icon="clock" aria-hidden="true"></span>Send later</button>
+      <button class="wm-action" type="button" @click="saveDraft()" :disabled="sending || savingDraft || attachmentPending" :text="savingDraft ? 'Saving…' : 'Save draft'"></button>
+      <button class="wm-action" type="button" @click="showConfirmation('discard')" :disabled="sending || savingDraft">Discard</button>
+      <label :if="!scheduleOpen" class="wm-send-delay">Undo Send<select aria-label="Undo Send delay" x-model.number="sendDelay" @change="saveSendPreference()" :disabled="sending || sendUncertain"><option :for="value in sendDelayOptions" :value="value" :text="value === 0 ? 'Off' : value + ' seconds'"></option></select></label>
+    </footer>
   </form>
 </dialog>
 <dialog :if="settings" ref="passwordDialog" class="wm-modal wm-password-dialog" aria-label="Account settings" @cancel.prevent="settings.set(false)"><div class="wm-account-panel">

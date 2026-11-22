@@ -45,6 +45,21 @@ pub fn initSchema(db: *database.Database) !void {
         \\ FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE
         \\);
         \\CREATE INDEX IF NOT EXISTS webmail_upload_expiry ON webmail_uploads(expires_at);
+        \\CREATE TRIGGER IF NOT EXISTS webmail_enqueue_draft AFTER INSERT ON webmail_records
+        \\WHEN new.kind='outbox' AND new.state='pending' AND json_valid(new.payload)
+        \\BEGIN
+        \\ UPDATE webmail_records SET state='queued',revision=revision+1
+        \\ WHERE username=new.username AND kind='draft' AND state='saved'
+        \\ AND id=json_extract(new.payload,'$.message.draftId')
+        \\ AND revision=json_extract(new.payload,'$.message.draftRevision');
+        \\END;
+        \\CREATE TRIGGER IF NOT EXISTS webmail_cancel_queued_draft AFTER UPDATE OF state ON webmail_records
+        \\WHEN old.kind='outbox' AND old.state='pending' AND new.state='cancelled' AND json_valid(old.payload)
+        \\BEGIN
+        \\ UPDATE webmail_records SET state='saved',revision=revision+1
+        \\ WHERE username=old.username AND kind='draft' AND state='queued'
+        \\ AND id=json_extract(old.payload,'$.message.draftId');
+        \\END;
     );
     const has_mime_column = blk: {
         const s = try db.prepare("SELECT 1 FROM pragma_table_info('webmail_uploads') WHERE name='mime'");
@@ -227,6 +242,27 @@ pub fn claimDue(allocator: std.mem.Allocator, db: *database.Database, now: i64) 
     const row = try readRecord(allocator, s);
     _ = try s.step();
     return row;
+}
+
+/// Admission and freezing the associated draft share the insert transaction.
+pub fn enqueue(db: *database.Database, row: Record, draft_id: ?[]const u8, draft_revision: i64) !i64 {
+    const s = try db.prepare(
+        \\INSERT INTO webmail_records(username,kind,id,payload,state,revision,due_at,expires_at)
+        \\SELECT ?1,'outbox',?2,?3,'pending',1,?4,0 WHERE ?5 IS NULL OR EXISTS
+        \\(SELECT 1 FROM webmail_records WHERE username=?1 AND kind='draft' AND id=?5 AND state='saved' AND revision=?6)
+        \\ON CONFLICT(username,kind,id) DO NOTHING RETURNING revision
+    );
+    defer s.finalize();
+    try s.bind(1, row.username);
+    try s.bind(2, row.id);
+    try s.bind(3, row.payload);
+    try s.bind(4, row.due_at);
+    try s.bindOpt(5, draft_id);
+    try s.bind(6, draft_revision);
+    if (!try s.step()) return StoreError.Conflict;
+    const revision = s.columnInt64(0);
+    _ = try s.step();
+    return revision;
 }
 
 pub fn cancelSend(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8, now: i64) !Record {
