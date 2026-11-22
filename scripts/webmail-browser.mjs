@@ -66,13 +66,13 @@ async function verifySelect(control, minimumHeight = 36) {
 }
 
 async function verifyControlRow(container, selector, height, sameRow = true) {
-  const controls = await container.locator(selector).evaluateAll(nodes => nodes.map((node) => {
+  const controls = await container.evaluate((group, selector) => Array.from(group.querySelectorAll(selector), (node) => {
     const style = getComputedStyle(node)
     const box = node.getBoundingClientRect()
     const borderChannels = style.getPropertyValue('--control-border').trim().slice(1).match(/../g)
     const border = `rgb(${borderChannels.map(channel => Number.parseInt(channel, 16)).join(', ')})`
     return {
-      name: node.getAttribute('aria-label') || node.labels?.[0]?.textContent.trim() || node.textContent.trim(),
+      name: node.getAttribute('aria-label') || node.id || node.tagName,
       height: box.height,
       top: box.top,
       bottom: box.bottom,
@@ -82,7 +82,7 @@ async function verifyControlRow(container, selector, height, sameRow = true) {
       borderMatches: style.borderColor === border && style.borderWidth === '1px',
       radius: style.borderRadius,
     }
-  }))
+  }), selector)
   assert(controls.length > 1, 'A control group must have multiple visible controls')
   for (const control of controls) {
     assert(Math.abs(control.height - height) < 0.5, `${control.name} should be ${height}px tall, got ${control.height}px`)
