@@ -170,12 +170,17 @@ pub const Typesense = struct {
             path.appendSlice(allocator, "&sort_by=") catch return error.OutOfMemory;
             http.appendUrlEncoded(&path, allocator, s) catch return error.OutOfMemory;
         }
+        if (params.include_fields) |fields| {
+            path.appendSlice(allocator, "&include_fields=") catch return error.OutOfMemory;
+            http.appendUrlEncoded(&path, allocator, fields) catch return error.OutOfMemory;
+        }
 
         const resp = try self.request(allocator, "GET", path.items, null);
         defer resp.deinit(allocator);
         if (!resp.ok()) return error.RequestFailed;
 
-        const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{}) catch return error.BadResponse;
+        // The response body is freed on return, including strings inside it.
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp.body, .{ .allocate = .alloc_always }) catch return error.BadResponse;
         return .{ .parsed = parsed };
     }
 };

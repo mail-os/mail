@@ -50,6 +50,8 @@ pub const SearchParams = struct {
     filter_by: ?[]const u8 = null,
     /// Comma-separated "field:asc|desc" list, if any.
     sort_by: ?[]const u8 = null,
+    /// Comma-separated document fields to return in hits, if specified.
+    include_fields: ?[]const u8 = null,
     page: u32 = 1,
     per_page: u32 = 50,
 };

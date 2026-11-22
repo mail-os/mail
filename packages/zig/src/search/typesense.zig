@@ -11,7 +11,7 @@
 //!   - keeps the index in sync as mail is delivered/appended/expunged
 //!     (best-effort, on a detached thread — search must never block or
 //!     fail mail handling)
-//!   - answers IMAP SEARCH text criteria with matching maildir base names
+//!   - answers IMAP SEARCH text criteria with matching message identities
 //!
 //! Enabled when TYPESENSE_API_KEY is set (host/port default to
 //! 127.0.0.1:8108; override with TYPESENSE_HOST / TYPESENSE_PORT).
@@ -114,10 +114,11 @@ fn ensureReady(allocator: std.mem.Allocator, engine: *const se.Typesense) bool {
 // Document identity
 // =============================================================================
 
+pub const MessageId = [32]u8;
+
 /// Stable document id: hex SHA-256 over the identity triple, truncated to
-/// 32 chars. Keyed on the maildir BASE name (flag suffix stripped) so the
-/// id survives flag renames.
-pub fn docId(out: *[32]u8, username: []const u8, mailbox: []const u8, base_filename: []const u8) []const u8 {
+/// 32 chars. The base filename omits the flag suffix so the id survives renames.
+pub fn docId(out: *MessageId, username: []const u8, mailbox: []const u8, base_filename: []const u8) []const u8 {
     var h = Sha256.init(.{});
     h.update(username);
     h.update(&[_]u8{0});
@@ -248,16 +249,17 @@ pub fn deleteMessage(allocator: std.mem.Allocator, username: []const u8, mailbox
 // Search
 // =============================================================================
 
-/// Search messages for `query` over `query_by` fields, filtered to one
-/// user and optionally one mailbox. Returns matching maildir base
-/// filenames; caller frees each entry and the slice.
-pub fn searchFilenames(
+pub const MessageIds = std.AutoHashMapUnmanaged(MessageId, void);
+
+/// Return a complete set of index hits scoped to the user and optional mailbox.
+/// The caller owns the set. An incomplete result must fall back to a file scan.
+pub fn searchMessageIds(
     allocator: std.mem.Allocator,
     username: []const u8,
     mailbox: ?[]const u8,
     query: []const u8,
     query_by: []const u8,
-) ![][]u8 {
+) !MessageIds {
     const engine = loadEngine() orelse return error.Disabled;
 
     var filter: std.ArrayList(u8) = .empty;
@@ -271,28 +273,55 @@ pub fn searchFilenames(
         try filter.appendSlice(allocator, "`");
     }
 
-    var result = try engine.search(allocator, collection, .{
+    var params: se.SearchParams = .{
         .query = query,
         .query_by = query_by,
         .filter_by = filter.items,
+        .include_fields = "id",
         .per_page = 250,
-    });
-    defer result.deinit();
+    };
+    var ids: MessageIds = .empty;
+    errdefer ids.deinit(allocator);
+    var expected_total: ?u64 = null;
+    while (true) {
+        var result = try engine.search(allocator, collection, params);
+        defer result.deinit();
 
-    var out: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (out.items) |f| allocator.free(f);
-        out.deinit(allocator);
+        const total = try completeHitCount(&result);
+        if (expected_total) |previous| {
+            if (total != previous) return error.IncompleteSearch;
+        }
+        expected_total = total;
+
+        const before = ids.count();
+        var hits = result.hits();
+        while (hits.next()) |doc| {
+            const id = se.SearchResponse.docString(doc, "id");
+            if (id.len != @sizeOf(MessageId)) return error.IncompleteSearch;
+            for (id) |byte| {
+                if (!std.ascii.isHex(byte) or std.ascii.isUpper(byte)) return error.IncompleteSearch;
+            }
+            const entry = try ids.getOrPut(allocator, id[0..@sizeOf(MessageId)].*);
+            if (entry.found_existing) return error.IncompleteSearch;
+        }
+        if (ids.count() - before != @min(params.per_page, total - before))
+            return error.IncompleteSearch;
+        if (ids.count() == total) return ids;
+        if (params.page == std.math.maxInt(u32)) return error.IncompleteSearch;
+        params.page += 1;
     }
+}
 
-    var it = result.hits();
-    while (it.next()) |doc| {
-        const fname = se.SearchResponse.docString(doc, "filename");
-        if (fname.len == 0) continue;
-        try out.append(allocator, try allocator.dupe(u8, fname));
+fn completeHitCount(result: *const se.SearchResponse) !u64 {
+    const root = result.parsed.value;
+    if (root != .object) return error.IncompleteSearch;
+    const found = root.object.get("found") orelse return error.IncompleteSearch;
+    const hits = root.object.get("hits") orelse return error.IncompleteSearch;
+    if (found != .integer or found.integer < 0 or hits != .array) return error.IncompleteSearch;
+    if (root.object.get("search_cutoff")) |cutoff| {
+        if (cutoff != .bool or cutoff.bool) return error.IncompleteSearch;
     }
-
-    return out.toOwnedSlice(allocator);
+    return @intCast(found.integer);
 }
 
 /// A full search hit (for the webmail/REST surface). All slices are owned

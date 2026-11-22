@@ -3299,23 +3299,11 @@ pub const ImapSession = struct {
         return .{ .username = username, .mailbox = self.mailbox_name orelse "INBOX" };
     }
 
-    const SearchHits = std.StringHashMapUnmanaged(void);
-
-    fn searchTextIndex(self: *ImapSession, a: std.mem.Allocator, term: search.Text) !?SearchHits {
+    fn searchTextIndex(self: *ImapSession, term: search.Text) !?typesense.MessageIds {
         const ident = self.searchIdentity() orelse return null;
         const field = term.index_field orelse return null;
         if (term.term.len == 0) return null;
-
-        const names = try typesense.searchFilenames(self.allocator, ident.username, ident.mailbox, term.term, field);
-        defer {
-            for (names) |name| self.allocator.free(name);
-            self.allocator.free(names);
-        }
-        var hits: SearchHits = .empty;
-        for (names) |name| {
-            if (!hits.contains(name)) try hits.put(a, try a.dupe(u8, name), {});
-        }
-        return hits;
+        return try typesense.searchMessageIds(self.allocator, ident.username, ident.mailbox, term.term, field);
     }
 
     const SearchMessage = struct {
@@ -3331,7 +3319,8 @@ pub const ImapSession = struct {
         max_seq: i64,
         max_uid: i64,
         terms: []const search.Text,
-        indexed: []const ?SearchHits,
+        indexed: []const ?typesense.MessageIds,
+        index_id: ?typesense.MessageId = null,
         filename: ?[]const u8 = null,
         filepath: ?[]const u8 = null,
         content: ?[]const u8 = null,
@@ -3376,8 +3365,17 @@ pub const ImapSession = struct {
         }
 
         fn matchesText(self: *SearchMessage, id: usize) !bool {
-            if (self.indexed[id]) |hits|
-                return hits.contains(MaildirFlags.baseName(try self.name()));
+            if (self.indexed[id]) |hits| {
+                if (self.index_id == null) {
+                    const user = self.session.username orelse return error.NoMailboxSelected;
+                    const mailbox = self.session.sourceMailboxForIndex(self.seq - 1);
+                    const base = MaildirFlags.baseName(try self.name());
+                    var message_id: typesense.MessageId = undefined;
+                    _ = typesense.docId(&message_id, user, mailbox, base);
+                    self.index_id = message_id;
+                }
+                return hits.contains(self.index_id.?);
+            }
 
             const term = self.terms[id];
             const content = try self.read();
@@ -3459,9 +3457,14 @@ pub const ImapSession = struct {
         };
 
         const count = if (self.mailbox_files) |files| files.len else 0;
-        const indexed = try a.alloc(?SearchHits, query.text.len);
+        const indexed = try a.alloc(?typesense.MessageIds, query.text.len);
         for (query.text, indexed) |term, *hits| {
-            hits.* = if (count > 0 and typesense.enabled()) self.searchTextIndex(a, term) catch null else null;
+            hits.* = if (count > 0 and typesense.enabled()) self.searchTextIndex(term) catch null else null;
+        }
+        defer {
+            for (indexed) |*hits| {
+                if (hits.*) |*set| set.deinit(self.allocator);
+            }
         }
 
         var max_uid: i64 = 0;
