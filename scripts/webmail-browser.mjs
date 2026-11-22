@@ -5,9 +5,10 @@ import { join } from 'node:path'
 import { chromium, firefox, webkit } from 'playwright'
 
 const { MAIL_BROWSER_URL: url, MAIL_BROWSER_OWNER: owner, MAIL_BROWSER_SENDER: sender, MAIL_BROWSER_PASSWORD: password, MAIL_BROWSER_DAY: day, MAIL_BROWSER_CERT: certificate } = process.env
+const { MAIL_BROWSER_NEWCOMER: newcomer } = process.env
 const [engine, output] = process.argv.slice(2)
 const engines = { chromium, firefox, webkit }
-assert(Object.hasOwn(engines, engine) && output && url && owner && sender && password && day && certificate, 'Run through test-webmail-browser.py')
+assert(Object.hasOwn(engines, engine) && output && url && owner && sender && password && day && certificate && newcomer, 'Run through test-webmail-browser.py')
 assert.match(url, /^https:\/\/127\.0\.0\.1:\d+$/, 'Browser tests require a disposable loopback HTTPS server')
 
 const launchOptions = {}
@@ -151,7 +152,7 @@ async function openReceiptAndDownload(page) {
   finally { await page.unroute(messagePath, holdMarkRead) }
 }
 
-async function signIn({ phone = false } = {}) {
+async function signIn({ phone = false, account = owner, initialSubject = handoff } = {}) {
   const context = await browser.newContext({
     viewport: phone ? { width: 390, height: 844 } : { width: 1440, height: 940 },
     colorScheme: phone ? 'dark' : 'light',
@@ -169,10 +170,10 @@ async function signIn({ phone = false } = {}) {
   await page.goto(url + '/login')
   await heading(page, 'Sign in to Mail').waitFor()
   await screenshot(page, phone ? 'phone-sign-in' : 'desktop-sign-in')
-  await page.getByLabel('Email or username').fill(owner)
+  await page.getByLabel('Email or username').fill(account)
   await page.getByLabel('Password', { exact: true }).fill(password)
   await button(page, 'Sign in').click()
-  await button(page, /Tuesday design handoff/).waitFor()
+  await button(page, new RegExp(initialSubject)).waitFor()
   if (phone) await drawer(page).click()
   const activeFolder = folders(page).locator('[aria-current=page]')
   assert.match(await activeFolder.innerText(), /^Inbox/)
@@ -567,6 +568,54 @@ async function invitationJourney(page, phone = false) {
   await screenshot(page, phone ? 'phone-calendar-invitation' : 'desktop-calendar-invitation')
 }
 
+async function mailEventJourney(page, { phone = false, firstCalendar = false } = {}) {
+  await verifyAppearance(page, phone ? 'dark' : 'light')
+  await page.goto(url + '/')
+  await button(page, /Studio launch notes/).click()
+  const create = page.getByRole('link', { name: 'Create event from email' })
+  assert.match(await create.getAttribute('href'), /^\/calendar#account=.*&message=[a-f0-9]{32}$/)
+  await create.click()
+  if (firstCalendar) {
+    const settings = page.getByRole('region', { name: 'Manage calendars' })
+    await settings.getByText('Create a calendar to save an event from this email.').waitFor()
+    await settings.getByLabel('Calendar name').fill('Personal calendar')
+    await button(settings, 'Create calendar').click()
+  }
+  const draft = page.getByRole('dialog', { name: 'New event' })
+  await draft.waitFor()
+  assert.equal(await draft.getByRole('textbox', { name: 'Title' }).inputValue(), 'Studio launch notes')
+  assert.equal(await draft.getByRole('textbox', { name: 'Description' }).inputValue(), '')
+  await draft.getByText('A private link to the source email will be saved with this event.').waitFor()
+  assert.equal(new URL(page.url()).hash, '')
+  const title = phone ? 'Phone launch review' : 'Desktop launch review'
+  await draft.getByRole('textbox', { name: 'Title' }).fill(title)
+  const save = button(draft, 'Save event')
+  const primaryAppearance = await save.evaluate(node => {
+    const theme = document.createElement('span')
+    theme.style.cssText = 'color:var(--on-primary);background:var(--primary)'
+    node.append(theme)
+    const expected = getComputedStyle(theme)
+    const buttonStyle = getComputedStyle(node)
+    const usesPrimary = buttonStyle.color === expected.color && buttonStyle.backgroundColor === expected.backgroundColor
+    theme.remove()
+    return usesPrimary
+  })
+  assert(primaryAppearance, 'Save event uses the visible Calendar primary colors')
+  await screenshot(page, phone ? 'phone-new-event-from-email' : 'desktop-new-event-from-email')
+  await save.click()
+  await draft.waitFor({ state: 'hidden' })
+  if (phone) await button(page, 'Day').click()
+  await button(page, new RegExp(title)).click()
+  const saved = page.getByRole('dialog', { name: 'Edit event' })
+  const source = saved.getByRole('link', { name: 'Open source email' })
+  await source.waitFor()
+  await screenshot(page, phone ? 'phone-event-backlink' : 'desktop-event-backlink')
+  await source.click()
+  await heading(page, 'Studio launch notes').waitFor()
+  assert.equal(new URL(page.url()).hash, '')
+  await page.getByRole('region', { name: 'Message reader' }).getByText('Here is the handoff for Thursday.', { exact: true }).waitFor()
+}
+
 try {
   const desktop = await signIn()
   await desktopJourney(desktop)
@@ -575,6 +624,9 @@ try {
   await invitationJourney(desktop)
   await invitationJourney(phone, true)
   await calendarSharingJourney(desktop)
+  await mailEventJourney(desktop)
+  const firstRun = await signIn({ phone: true, account: newcomer, initialSubject: 'Studio launch notes' })
+  await mailEventJourney(firstRun, { phone: true, firstCalendar: true })
   assert.deepEqual(errors, [], 'Browser pages raised uncaught errors')
   process.stdout.write(`${engine} passed the desktop and phone webmail journeys.\n`)
 }

@@ -43,6 +43,7 @@ export interface CalendarEventDetail {
   calendarId: number
   description: string | null
   icalendar?: string | null
+  source_message?: string | null
 }
 
 export function calendarColor(color: string | null | undefined): string {

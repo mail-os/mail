@@ -145,6 +145,12 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   and the original date of a changed occurrence. It shows **Verified sender**
   when the verified author of the message matches the organizer's address.
   These are read-only previews. Named calendar attachments remain downloadable.
+- Choose **Create event from email** in an open message to start a Calendar
+  event with the subject as its title. Edit the title and choose the dates
+  before saving. The owner can choose **Open source email** in the saved
+  event editor. The private link follows a mailbox move and is hidden once
+  the source email is permanently deleted. Shared calendars and ICS exports
+  expose event fields without the source link.
 
 ### Calendar API
 
@@ -153,6 +159,10 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   sequence, DTSTAMP, and any original occurrence. Wall times are supplied as
   seconds on the organizer's clock with a separate time zone label. Preview
   reads leave calendar resources and outgoing mail untouched.
+- `GET /webmail/api/calendar-event-source?reference=…` reads the subject of
+  an owned message. Send its reference as `X-Webmail-Source-Message` when
+  creating an event in a calendar you own. An owner's event detail includes
+  `source_message` while the email is available.
 - `GET /webmail/api/calendars` lists the signed-in mailbox's calendars.
   `POST /webmail/api/calendars` creates one from a JSON `name`. Send
   `PATCH /webmail/api/calendars/{id}` with `color` set to a six-digit hex

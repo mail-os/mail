@@ -1,6 +1,7 @@
 import type { PrivateCollection, AttachmentPage, IndexProgress, LibraryAttachment, AttentionStatus, AttentionView, BulkAction, BulkResult, CategoryRule, ComposePayload, Contact, Conversation, DraftAck, DraftDocument, Folder, MailLimits, MailNotificationScope, MessageDetail, MessagePage, MessageRef, MessageSummary, OutboxCounts, OutboxItem, OutboxPage, OutboxSummary, OutboxView, SenderIdentity, SharedReplyContext, User } from './mail-types'
 import { batch, derived, effect, state } from '@stacksjs/stx'
 import { createMailApi, MailApiError } from './mail-api'
+import { mailEventLink, takeMailEventLink } from './mail-event-link'
 import { attentionViews, deadlineLabel, localDateInput, localDeadline } from './mail-attention'
 import { captureListViewport, isShortcutEvent, messageIdentity, messagePageSize, restoreListViewport, triageShortcuts } from './mail-triage'
 import { receiptExcerpt, renderMailReader } from './mail-reader'
@@ -372,6 +373,12 @@ export function useWebmail(ports: WebmailPorts) {
   }
   function messageRef(message: MessageRef): MessageRef {
     return { uid: message.uid, folder: message.folder, reference: message.reference, revision: message.revision }
+  }
+  function createEventLink(): string | null {
+    const message = selected()
+    const account = user()?.username
+    if (!limits().calendarAvailable || !message?.reference || !account || message.folder === 'Drafts' || senderReview.senderReviewOpen()) return null
+    return mailEventLink('/calendar', account, message.reference)
   }
   function displaySubject(message: Pick<MessageSummary, 'subject' | 'personal_subject'> | null): string {
     return message?.personal_subject || message?.subject || '(no subject)'
@@ -1652,6 +1659,16 @@ export function useWebmail(ports: WebmailPorts) {
       void notifications.loadNotificationSettings().catch(() => {})
       void privateMail.loadPrivateCollections()
       await openSharedReplyDraft()
+      const source = takeMailEventLink('/')
+      if (source) {
+        if (source.account !== result.user.username) throw new Error('Sign in to the mailbox that owns the source email.')
+        const opened = await openMessage({ uid: 0, folder: '', reference: source.reference }, false)
+        const message = selected()
+        if (opened === 'opened' && message?.reference === source.reference && message.folder !== folder()) {
+          folder.set(message.folder)
+          void refresh(true)
+        }
+      }
     }
     catch (cause) { error.set(errorMessage(cause)) }
   }
@@ -1674,6 +1691,7 @@ export function useWebmail(ports: WebmailPorts) {
   function preventUnload(event: BeforeUnloadEvent): void { if (hasUnsavedChanges()) { event.preventDefault(); event.returnValue = '' } }
   function destroy(): void { destroyed = true; ++listRequest; ++messageRequest; recipientEditor.destroy(); attachmentEditor.destroy(); draft.destroy(); privateMail.closePrivate(); contactBook.closeContacts(); selectionEffect() }
   return { user, folders, folder, messages, threads, expandedThreads, selected, loading, refreshing, listError, readerError, readerTarget, reading, readingLoading, mutating, error, notice, query, activeQuery, appliedSearchAll, filterLocation, filterSender, filterRecipient, filterFilename, libraryView, libraryFiles, indexProgress, filterAfter, filterBefore, filterStatus, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, formattedReader, remoteImagesAllowed, checked, checkedKeys, selectedCount, isJunkFolder, readerJunkAction, selectionJunkAction, allChecked, someChecked, undoAction, undoRemaining, readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts, pendingSend, sendRemaining, outbox, outboxCount, outboxCounts, outboxSection, outboxViews, outboxEmpty, outboxPageNumber, outboxNext, outboxLoading, outboxError, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, sharedReply, senderId, senderIdentities, missingSender, senderStatus, chooseSender, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...senderReview, ...notifications, ...privateMail, ...contactBook, showContacts, composeSavedCard, collectionView, collectionId, canOpenPrivate,
+    createEventLink,
     showCollectionManager, closeCollectionManager, selectCollection, confirmCollectionDeletion, savePrivateLabel, setPrivateMembership, groupSelected, displaySubject, changeNotificationRule, ...recipientEditor, ...attachmentEditor, ...recoverySettings, ...forwardingSettings, ...vacationSettings, ...writing, snippetChoice, signatureChoice, insertSnippet, insertSignature, attentionViews, attentionView, followUpFocused, attentionSaving, attentionSchedule, attentionDate, attentionZone, dueReminders, replyContext, clearFollowUp, selectAttention, nextFollowUp, changeAttention, startAttentionSchedule, saveAttentionSchedule, deadlineLabel, categoryList, newsletterExpanded, readerExpanded, receiptFull, receiptCompact, receiptPreview, senderLabel, sortingSettings, sortingSaving, sortingError, toggleAutomaticSorting, placementText, categoryRule, categoryRuleSaving, saveCategoryRule, showSenderReview, openReviewMessage, reviewMessage, refresh, loadMessages, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread, toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, openAttachmentMessage, showAttachmentLibrary, retryReader, closeReader, nextUnread, readSelection, advanceBatch, triageAndNext, bulkAction, selectedAction, undoLastAction, showShortcuts, closeShortcuts, handleShortcut, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments, saveSendPreference, send, confirmPendingSend, showOutbox, refreshOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword, showConfirmation, confirmAction, saveDraftCopy: draft.saveCopy, mount, resume, tick, preventUnload, destroy, messageIdentity, messagePageSize, folderName, shortDate, fullDate, readableBytes, attachmentPath }
 }
 

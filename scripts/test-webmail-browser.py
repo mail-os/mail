@@ -119,14 +119,23 @@ def verify(binary, output, engine):
         with fixture.daemon():
             owner = fixture.provision("alex.chen")
             sender = fixture.provision("morgan.lee")
+            newcomer = fixture.provision("jordan.kim")
             session = fixture.login(owner)
             assert fixture.api(session, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
             assert fixture.api(session, "category-settings", {"automatic": True}, "PUT")[0] == 200
             seed_inbox(fixture, owner, sender)
+            newcomer_session = fixture.login(newcomer)
+            assert fixture.api(newcomer_session, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
+            note = EmailMessage()
+            note["From"], note["To"], note["Subject"] = sender, newcomer, "Studio launch notes"
+            note.set_content("Here is the handoff for Thursday.")
+            with fixture.smtp(sender) as connection:
+                assert connection.send_message(note) == {}
             seed_shared_inbox(fixture, owner, sender)
             day = seed_calendar(fixture, owner)
             env = dict(os.environ, MAIL_BROWSER_URL=fixture.webmail, MAIL_BROWSER_OWNER=owner,
                        MAIL_BROWSER_SENDER=sender, MAIL_BROWSER_PASSWORD=fixture.password, MAIL_BROWSER_DAY=day,
+                       MAIL_BROWSER_NEWCOMER=newcomer,
                        MAIL_BROWSER_CERT=fixture.env["SMTP_TLS_CERT"])
             subprocess.run(["node", str(SCRIPTS / "webmail-browser.mjs"), engine, str(output / engine)],
                            env=env, check=True)

@@ -33,6 +33,7 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
   const editorTitle = state('')
   const editorLocation = state('')
   const editorDescription = state('')
+  const editorSourceMessage = state<string | null>(null)
   const editorAllDay = state(false)
   const editorStart = state('')
   const editorEnd = state('')
@@ -72,7 +73,7 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
     if (wasStale) void refresh()
   }
 
-  function createEvent(day: string, calendarId: number, zone: string) {
+  function createEvent(day: string, calendarId: number, zone: string, source?: { reference: string, subject: string }) {
     if (editorBusy()) return
     initial = undefined
     occurrence = undefined
@@ -90,7 +91,8 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
     otherReminders.set(0)
     loadRepeat(defaultRepeat)
     editorCalendar.set(String(calendarId))
-    editorTitle.set('')
+    editorTitle.set(source?.subject ?? '')
+    editorSourceMessage.set(source?.reference ?? null)
     editorLocation.set('')
     editorDescription.set('')
     editorZone.set(zone)
@@ -111,6 +113,7 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
         signal: AbortSignal.any([request.signal, AbortSignal.timeout(10_000)]),
       })
       if (request.signal.aborted) return
+      editorSourceMessage.set(detail.source_message ?? null)
       const local = selection && detail.icalendar ? readOccurrence(detail.event, detail.icalendar, selection.displayZone, selection.ref) : null
       if (selection && !local) {
         editorError.set('This occurrence changed or no longer exists. Close the editor to refresh the calendar.')
@@ -197,6 +200,7 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
     editingId.set(null)
     editorCalendar.set('')
     editorTitle.set('')
+    editorSourceMessage.set(null)
     editorLocation.set('')
     editorDescription.set('')
     editorStart.set('')
@@ -329,10 +333,17 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
       }
       else {
         await api('/webmail/api/calendar-events', {
-          method: 'POST', body: JSON.stringify({ ...changes, calendarId: Number(editorCalendar()) }), signal,
+          method: 'POST', headers: sourceMessageHeaders(), body: JSON.stringify({ ...changes, calendarId: Number(editorCalendar()) }), signal,
         })
       }
     })
+  }
+
+  function sourceMessageHeaders(): Headers {
+    const headers = new Headers()
+    const reference = editorSourceMessage()
+    if (reference) headers.set('X-Webmail-Source-Message', reference)
+    return headers
   }
 
   async function saveSeries(detail: CalendarEventDetail | undefined, clock: CalendarWallTime, repeat: CalendarRepeat,
@@ -356,7 +367,7 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
     else {
       const query = new URLSearchParams({ calendarId: editorCalendar() })
       await api(`/webmail/api/calendar-events?${query}`, {
-        method: 'POST', body: new Blob([source], { type: 'text/calendar;charset=utf-8' }), signal,
+        method: 'POST', headers: sourceMessageHeaders(), body: new Blob([source], { type: 'text/calendar;charset=utf-8' }), signal,
       })
     }
   }
@@ -413,6 +424,7 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
   return {
     editorOpen, editorBusy, editorLoaded, editorError, editorConflict, editingId, editorLabel,
     editorRecurring, editorOccurrence, editorHasOccurrence, editorReadOnly, editorViewer, editorProtectedOccurrence, editorCalendar, editorTitle, editorLocation, editorDescription,
+    editorSourceMessage,
     editorAllDay, editorStart, editorEnd, editorZone, editorScheduleEditable, editorTimeZones,
     editorReminder, editorReminderEditable, otherReminders, reminderOptions,
     repeatFrequency, repeatEvery, repeatEnd, repeatCount, repeatUntil, repeatOptions, changeRepeatEnd,

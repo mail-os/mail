@@ -82,7 +82,7 @@ const {
   attachmentRemaining, attachmentPending, attachmentUploading, removeAttachment, retryAttachment,
   refresh, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread,
   toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, retryReader, closeReader, bulkAction, selectedAction,
-  nextUnread, readSelection, advanceBatch, triageAndNext, showShortcuts, closeShortcuts, handleShortcut,
+  nextUnread, readSelection, advanceBatch, triageAndNext, showShortcuts, closeShortcuts, handleShortcut, createEventLink,
   undoLastAction, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments,
   saveSendPreference, send, confirmPendingSend, showOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword,
   showConfirmation, confirmAction, saveDraftCopy, resume, tick, preventUnload,
@@ -440,6 +440,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
           </section>
           <div class="wm-read-attach"><a :for="(attachment, index) in (selected?.attachments || [])" class="wm-attach-chip" :href="attachmentPath(index)" :download="attachment.filename"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span><span :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></span><span class="mail-icon wm-attachment-download" data-icon="download" aria-hidden="true"></span></a></div>
           <div class="wm-format-control">
+            <a :if="createEventLink()" class="wm-action" :href="createEventLink()"><span class="mail-icon" data-icon="calendar" aria-hidden="true"></span>Create event from email</a>
             <button :if="selected?.folder === 'Receipts'" class="wm-action" @click="receiptFull.set(!receiptFull())" :aria-expanded="receiptFull"><span class="mail-icon" data-icon="receipt" aria-hidden="true"></span><span :text="receiptFull ? 'Show receipt summary' : 'Read full receipt'"></span></button>
             <button :if="selected?.html && !receiptCompact" class="wm-action" @click="showHtml.set(!showHtml())"><span class="mail-icon" :data-icon="showHtml ? 'document' : 'preview'" aria-hidden="true"></span><span :text="showHtml ? 'Show plain text' : 'Show formatted email'"></span></button>
             <span :if="selected?.html && !receiptCompact && showHtml && formattedReader.remoteImages > 0" class="wm-image-status">

@@ -245,7 +245,7 @@ input[type=checkbox] { accent-color: var(--accent); }
 .wm-invitation-verified { display: inline-block; margin-inline-start: 8px; color: var(--muted); font-size: 11px; }
 .wm-invitation-source { margin-top: 12px; color: var(--muted); font-size: 13px; }
 .wm-invitation-source summary { cursor: pointer; }
-.wm-read-attach:not(:has(.wm-attach-chip)), .wm-format-control:not(:has(button, .wm-image-status)) { display: none; }
+.wm-read-attach:not(:has(.wm-attach-chip)), .wm-format-control:not(:has(.wm-action, .wm-image-status)) { display: none; }
 .wm-attach-chip { display: inline-flex; align-items: center; gap: 7px; max-width: 100%; padding: 7px 10px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; color: var(--accent); font-size: 12px; text-decoration: none; overflow-wrap: anywhere; }
 .wm-attach-chip:hover { background: var(--hover); }
 .wm-attach-chip .mail-icon { width: 15px; height: 15px; }
@@ -995,8 +995,9 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-composer-body { min-height: clamp(150px, 24dvh, 240px); padding: 10px 2px; border-color: transparent; font-size: 15px; }
 .wm-dropzone, .wm-compose-attachments li { background: var(--toolbar); }
 .wm-compose-attachments li > .mail-icon { color: var(--accent); }
-.wm-composer-foot > .wm-action { min-height: 36px; background: transparent; border-color: transparent; }
-.wm-composer-foot > .wm-action:hover { background: var(--hover); }
+.wm-composer-foot > .wm-action { min-height: 36px; }
+.wm-composer-foot > .wm-action:not(.calendar-primary) { background: transparent; border-color: transparent; }
+.wm-composer-foot > .wm-action:not(.calendar-primary):hover { background: var(--hover); }
 .wm-composer-foot > .wm-action--danger:hover { background: var(--danger-soft); }
 .wm-composer-foot .wm-send-btn { min-height: 38px; border-radius: 8px; }
 

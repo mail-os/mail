@@ -1,5 +1,6 @@
 import { derived, state } from '@stacksjs/stx'
 import { createMailApi, MailApiError } from './mail-api'
+import { mailEventLink, takeMailEventLink } from './mail-event-link'
 import type { User } from './mail-types'
 
 import {
@@ -98,6 +99,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
   const calendarSettingsError = state('')
   const calendarSettingsBusy = state(false)
   const calendarNameInput = state('')
+  const waitingMailEvent = state<{ reference: string, subject: string } | null>(null)
   const shareCalendarInput = state('')
   const shareTeamInput = state('')
   const shareGranteeInput = state('')
@@ -202,6 +204,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     return parts.join(', ')
   })
   let request: AbortController | undefined
+  let mailSourceRequest: AbortController | undefined
   let shareRequest: AbortController | undefined
   let importRequest: AbortController | undefined
   let settingsRequest: AbortController | undefined
@@ -415,6 +418,44 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     if (id !== undefined) editor.createEvent(day, id, displayZone())
   }
 
+  async function openMailEvent() {
+    const link = takeMailEventLink('/calendar')
+    if (!link) return
+    if (link.account !== account()) {
+      error.set('Sign in to the mailbox that owns the source email.')
+      return
+    }
+    const pending = new AbortController()
+    mailSourceRequest = pending
+    const query = new URLSearchParams({ reference: link.reference })
+    try {
+      const { subject } = await api<{ subject: string }>(`/webmail/api/calendar-event-source?${query}`, {
+        signal: AbortSignal.any([pending.signal, AbortSignal.timeout(10_000)]),
+      })
+      if (pending.signal.aborted) return
+      const source = { reference: link.reference, subject }
+      const calendar = calendars()[0]
+      if (calendar) editor.createEvent(focusDay(), calendar.id, displayZone(), source)
+      else {
+        waitingMailEvent.set(source)
+        calendarSettings.set(true)
+      }
+    }
+    catch (cause) {
+      if (!pending.signal.aborted)
+        error.set(cause instanceof Error ? cause.message : 'Could not open the source email.')
+    }
+    finally {
+      if (mailSourceRequest === pending) mailSourceRequest = undefined
+    }
+  }
+
+  function sourceEmailLink(): string | null {
+    const username = account()
+    const reference = editor.editorSourceMessage()
+    return username && reference ? mailEventLink('/', username, reference) : null
+  }
+
   function openEvent(event: CalendarEvent | CalendarOccurrence) {
     const share = sharedCalendars().find(item => item.calendarId === event.calendar_id)
     if (share?.access === 'free_busy') return
@@ -449,16 +490,24 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     }
   }
 
-  function createCalendar() {
+  async function createCalendar() {
     const name = calendarNameInput().trim()
     if (!name) return
-    return saveCalendar(async (signal) => {
+    const saved = await saveCalendar(async (signal) => {
       const created = await api<{ id: number }>('/webmail/api/calendars', { method: 'POST', body: JSON.stringify({ name }), signal })
       if (!signal.aborted) {
         activeCalendar.set(created.id)
         calendarNameInput.set('')
       }
     })
+    const source = waitingMailEvent()
+    const calendar = calendars().find(item => item.id === activeCalendar())
+    if (saved && source && calendar) {
+      waitingMailEvent.set(null)
+      calendarSettings.set(false)
+      editor.createEvent(focusDay(), calendar.id, displayZone(), source)
+    }
+    return saved
   }
 
   function setCalendarColor(calendar: Calendar, change: Event) {
@@ -580,7 +629,8 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     teams, outgoingShares, shareCalendarInput, shareTeamInput, shareGranteeInput, shareAccessInput,
     calendarAccessLabels, grantCalendar, revokeCalendarGrant, selectGrantAccess,
     teamName: (id: string) => teams().find(team => team.id === id)?.name ?? id,
-    openEvent, openNewEvent, calendarEventDate: (event: CalendarEvent) => calendarEventDate(event, displayZone()),
+    openEvent, openNewEvent, openMailEvent, sourceEmailLink, waitingMailEvent,
+    calendarEventDate: (event: CalendarEvent) => calendarEventDate(event, displayZone()),
     ...editor,
     ...reminders,
     importOpen, importDestination, newCalendarName, importBusy, importError, importRows, importFinished,
@@ -588,6 +638,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     setNewCalendarName, submitImport, importEventDate, importStatusLabels,
     destroy: () => {
       request?.abort()
+      mailSourceRequest?.abort()
       shareRequest?.abort()
       importRequest?.abort()
       settingsRequest?.abort()

@@ -27,6 +27,7 @@ import xml.etree.ElementTree as ET
 SCRIPTS = Path(__file__).resolve().parent
 hosted = SimpleNamespace(**runpy.run_path(str(SCRIPTS / "test-hosted-limits.py")))
 clamav = SimpleNamespace(**runpy.run_path(str(SCRIPTS / "test-smtp-clamav.py")))
+team_command = runpy.run_path(str(SCRIPTS / "test-webmail-teams.py"))["command"]
 COLLECTIONS = {"CalDAV": "staging-events", "CardDAV": "staging-contacts"}
 DAV = {"d": "DAV:"}
 CALDAV = "urn:ietf:params:xml:ns:caldav"
@@ -422,6 +423,99 @@ def check_invitation_previews(test, owner, other):
     assert must(client.request("PROPFIND", home, headers={"Depth": "1"}), 207)[1] == before
     assert test.api(foreign, "messages?folder=INBOX&q=planning")[1]["total"] == 0
     print("Verified MIME invitation previews, explicit time zones, cancellations, ownership, downloads, and unchanged DAV state.")
+
+
+def check_mail_event_source(test, organizer):
+    owner = test.provision("dav-linked-owner")
+    session, guest = test.login(owner), test.login(organizer)
+    for account in (session, guest):
+        assert test.api(account, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
+    message = EmailMessage()
+    message["From"], message["To"], message["Subject"] = organizer, owner, "Plan the review meeting"
+    message.set_content("Private email body. Keep this out of the event.")
+    with test.smtp(organizer) as smtp:
+        assert smtp.send_message(message, to_addrs=[owner, organizer]) == {}
+    query = urllib.parse.urlencode({"folder": "INBOX", "q": "Plan the review meeting"})
+    msg, = test.api(session, "messages?" + query)[1]["items"]
+    guest_msg, = test.api(guest, "messages?" + query)[1]["items"]
+    assert msg["reference"] != guest_msg["reference"]
+    source_path = "calendar-event-source?reference=" + msg["reference"]
+    assert test.api(session, source_path) == (200, {"subject": "Plan the review meeting"})
+    assert test.api(guest, source_path)[0] == 404 and test.api({}, source_path)[0] == 401
+    assert test.api(session, "calendar-event-source?reference=bad")[0] == 404
+
+    _, calendar = test.api(session, "calendars", {"name": "Email planning"})
+    calendar_id = calendar["id"]
+    team_command(test, "team", "create", "linked-calendar", "Linked Calendar", owner)
+    team_command(test, "team", "member", "linked-calendar", organizer, "member")
+    rights = {"calendarId": calendar_id, "grantee": organizer, "access": "editor"}
+    assert test.api(session, "teams/linked-calendar/calendar-shares", rights, "PUT")[0] == 200
+    header = {**session, "X-Webmail-Source-Message": msg["reference"]}
+    guest_header = {**guest, "X-Webmail-Source-Message": guest_msg["reference"]}
+    payload = {"calendarId": calendar_id, "summary": "Review meeting", "time": {"start": 1795532400, "end": 1795536000}}
+    assert test.api(guest_header, "calendar-events", payload)[0] == 404
+    assert test.api({**session, "X-Webmail-Source-Message": guest_msg["reference"]}, "calendar-events", payload)[0] == 404
+    assert test.api({**header, "Origin": "https://foreign.example.test"}, "calendar-events", payload)[0] == 403
+    assert test.api(session, f"calendar-events?calendarId={calendar_id}&q=Review")[1]["events"] == []
+    with sqlite3.connect(test.env["CALDAV_DB_PATH"]) as db:
+        db.execute("CREATE TRIGGER refuse_linked_event BEFORE INSERT ON dav_events WHEN NEW.source_message_ref IS NOT NULL "
+                   "BEGIN SELECT RAISE(ABORT, 'fixture backlink failure'); END")
+        db.commit()
+        try:
+            failed, error = test.api(header, "calendar-events", payload)
+            assert failed == 500 and error["error"] == "calendar_storage_error", error
+            assert test.api(session, f"calendar-events?calendarId={calendar_id}&q=Review")[1]["events"] == []
+        finally:
+            db.execute("DROP TRIGGER refuse_linked_event")
+    status, created = test.api(header, "calendar-events", payload)
+    assert status == 201, created
+    event = "calendar-events/" + str(created["id"])
+    status, detail = test.api(session, event + "?source=1")
+    assert status == 200 and detail["source_message"] == msg["reference"]
+    assert msg["reference"] not in detail["icalendar"] and "Private email body" not in detail["icalendar"]
+    status, shared = test.api(guest, event + "?source=1")
+    assert status == 200 and shared["source_message"] is None
+    assert msg["reference"] not in json.dumps(shared)
+    client = DavClient(test, owner)
+    resource = f"/calendars/{owner}/Email%20planning/{created['uid']}.ics"
+    dav_headers, content = must(client.request("GET", resource), 200)
+    assert msg["reference"].encode() not in content and b"Private email body" not in content
+    body = content.replace(b"SUMMARY:Review meeting", b"SUMMARY:Review completed")
+    must(client.request("PUT", resource, body, {"Content-Type": "text/calendar", "If-Match": dav_headers["ETag"]}), 204)
+
+    native = (b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:mail-backed-series\r\n"
+              b"DTSTAMP:20261121T100000Z\r\nDTSTART:20261204T150000Z\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\n"
+              b"SUMMARY:Linked weekly review\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
+    status, _, raw = hosted.request(test.webmail + f"/webmail/api/calendar-events?calendarId={calendar_id}", native,
+                                    {**header, "Content-Type": "text/calendar"}, "POST", test.tls_context)
+    assert status == 201, raw
+    series = "calendar-events/" + str(json.loads(raw)["id"])
+    assert test.api(session, series)[1]["source_message"] == msg["reference"]
+    export = hosted.request(test.webmail + f"/webmail/api/calendar-export?calendarId={calendar_id}", headers=session,
+                            context=test.tls_context)
+    assert export[0] == 200 and msg["reference"].encode() not in export[2] and b"RRULE:FREQ=WEEKLY;COUNT=3" in export[2]
+
+    def verify_reopened():
+        fresh = test.login(owner)
+        detail = test.api(fresh, event)[1]
+        assert detail["source_message"] == msg["reference"] and detail["event"]["summary"] == "Review completed"
+        assert test.api(fresh, series)[1]["source_message"] == msg["reference"]
+        message_path = "messages/ref/" + msg["reference"]
+        old = test.api(fresh, message_path)[1]
+        status, moved = test.api({**fresh, "If-Match": old["revision"]}, message_path, {"folder": "Archive"}, "PUT")
+        assert status == 200 and moved["reference"] == msg["reference"]
+        assert test.api(fresh, source_path) == (200, {"subject": "Plan the review meeting"})
+        assert test.api(fresh, event)[1]["source_message"] == msg["reference"]
+        status, trashed = test.api({**fresh, "If-Match": moved["revision"]}, message_path, {"folder": "Trash"}, "PUT")
+        assert status == 200
+        purged = test.api({**fresh, "If-Match": trashed["revision"]}, message_path, method="DELETE")
+        assert purged[0] == 200 and purged[1]["ok"], purged
+        assert test.api(fresh, source_path)[0] == 404
+        assert test.api(fresh, event)[1]["source_message"] is None and test.api(fresh, series)[1]["source_message"] is None
+        must(client.request("GET", resource), 200)
+        print("Verified private message backlinks in native Calendar, including rollback, shared-editor denial, DAV edits, restart, move, and purge.")
+
+    return verify_reopened
 
 
 def check_calendar_download(test, owner, other):
@@ -949,9 +1043,9 @@ def check_calendar_upgrade(binary, previous):
 
         def schema():
             with sqlite3.connect(root / "caldav.db") as db:
-                tables = ("dav_calendars", "dav_addressbooks")
+                tables = ("dav_calendars", "dav_addressbooks", "dav_events")
                 columns = {table: db.execute(f"PRAGMA table_info({table})").fetchall() for table in tables}
-                other = db.execute("SELECT type, name, sql FROM sqlite_master WHERE name NOT IN (?, ?) ORDER BY type, name", tables)
+                other = db.execute("SELECT type, name, sql FROM sqlite_master WHERE name NOT IN (?, ?, ?) ORDER BY type, name", tables)
                 return set(other), columns
 
         previous_schema, previous_columns = schema()
@@ -985,7 +1079,8 @@ def check_calendar_upgrade(binary, previous):
         for table, old_columns in previous_columns.items():
             new_columns = upgraded_columns[table]
             assert new_columns[:len(old_columns)] == old_columns
-            assert "display_name" in {column[1] for column in new_columns}
+            expected = "source_message_ref" if table == "dav_events" else "display_name"
+            assert expected in {column[1] for column in new_columns}
         test.binary = previous
         with test.daemon():
             row, = test.api(test.login(owner), listing)[1]["events"]
@@ -1063,6 +1158,7 @@ def main():
                 expected = check_resources(test, owner, other)
                 check_scanning(DavClient(test, owner), expected)
                 check_invitation_previews(test, owner, other)
+                check_reopened_backlink = check_mail_event_source(test, other)
                 check_calendar_download(test, owner, other)
                 importer, calendar_id, submit = check_calendar_import(test, owner, other)
                 editor, item, resource, revision = check_calendar_writes(test, other)
@@ -1070,6 +1166,7 @@ def main():
                 check_saved_properties = check_collection_properties(test, owner, other, expected)
             with test.daemon():
                 client = DavClient(test, owner)
+                check_reopened_backlink()
                 check_saved_properties()
                 print("Verified CalDAV and CardDAV metadata over HTTP and HTTPS, including rollback, concurrent reads, and restart.")
                 assert test.api(test.login(owner), "calendar-reminders")[1]["dismissed"] == [dismissal]

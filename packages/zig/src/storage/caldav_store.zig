@@ -117,6 +117,7 @@ pub const Event = struct {
     modified_at: i64,
     etag: []const u8,
     ics_data: []const u8, // Raw ICS data
+    source_message: ?MessageReference = null,
 
     pub const EventStatus = enum {
         tentative,
@@ -124,6 +125,8 @@ pub const Event = struct {
         cancelled,
     };
 };
+
+pub const MessageReference = [32]u8;
 
 pub const CalendarSummary = struct {
     id: u64,
@@ -157,6 +160,7 @@ pub const CalendarEventDetail = struct {
     organizer: ?[]const u8,
     modified_at: i64,
     ics_data: []const u8,
+    source_message: ?MessageReference = null,
 };
 
 pub const ActiveSyncResource = struct { id: u64, etag: []const u8 };
@@ -602,7 +606,7 @@ pub const CalDavStore = struct {
             \\CREATE TABLE IF NOT EXISTS dav_users (id INTEGER PRIMARY KEY, username TEXT NOT NULL, mailbox_id INTEGER UNIQUE);
             \\CREATE UNIQUE INDEX IF NOT EXISTS idx_dav_users_local_name ON dav_users(username) WHERE mailbox_id IS NULL;
             \\CREATE TABLE IF NOT EXISTS dav_calendars (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, description TEXT, color TEXT, timezone TEXT, created_at INTEGER, modified_at INTEGER, sync_token INTEGER, ctag TEXT, share_id TEXT, display_name TEXT);
-            \\CREATE TABLE IF NOT EXISTS dav_events (id INTEGER PRIMARY KEY, calendar_id INTEGER, uid TEXT, summary TEXT, description TEXT, location TEXT, dtstart INTEGER, dtend INTEGER, all_day INTEGER, rrule TEXT, organizer TEXT, status INTEGER, created_at INTEGER, modified_at INTEGER, etag TEXT, ics_data TEXT);
+            \\CREATE TABLE IF NOT EXISTS dav_events (id INTEGER PRIMARY KEY, calendar_id INTEGER, uid TEXT, summary TEXT, description TEXT, location TEXT, dtstart INTEGER, dtend INTEGER, all_day INTEGER, rrule TEXT, organizer TEXT, status INTEGER, created_at INTEGER, modified_at INTEGER, etag TEXT, ics_data TEXT, source_message_ref TEXT);
             \\CREATE TABLE IF NOT EXISTS dav_addressbooks (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, description TEXT, created_at INTEGER, modified_at INTEGER, sync_token INTEGER, ctag TEXT, display_name TEXT);
             \\CREATE TABLE IF NOT EXISTS dav_contacts (id INTEGER PRIMARY KEY, addressbook_id INTEGER, uid TEXT, full_name TEXT, given_name TEXT, family_name TEXT, nickname TEXT, organization TEXT, title TEXT, birthday INTEGER, note TEXT, photo_url TEXT, created_at INTEGER, modified_at INTEGER, etag TEXT, vcf_data TEXT);
             \\CREATE TABLE IF NOT EXISTS dav_emails (contact_id INTEGER, email TEXT, email_type INTEGER, is_primary INTEGER);
@@ -617,6 +621,7 @@ pub const CalDavStore = struct {
         try ensureTextColumn(conn, "dav_calendars", "share_id");
         try ensureTextColumn(conn, "dav_calendars", "display_name");
         try ensureTextColumn(conn, "dav_addressbooks", "display_name");
+        try ensureTextColumn(conn, "dav_events", "source_message_ref");
         try conn.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_dav_calendar_share_id ON dav_calendars(share_id) WHERE share_id IS NOT NULL");
     }
 
@@ -675,7 +680,7 @@ pub const CalDavStore = struct {
 
     fn persistEvent(self: *Self, ev: Event) !void {
         const conn = if (self.conn) |*c| c else return;
-        var stmt = try conn.prepare("INSERT OR REPLACE INTO dav_events (id,calendar_id,uid,summary,description,location,dtstart,dtend,all_day,rrule,organizer,status,created_at,modified_at,etag,ics_data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        var stmt = try conn.prepare("INSERT OR REPLACE INTO dav_events (id,calendar_id,uid,summary,description,location,dtstart,dtend,all_day,rrule,organizer,status,created_at,modified_at,etag,ics_data,source_message_ref) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         defer stmt.finalize();
         try stmt.bindInt(1, @intCast(ev.id));
         try stmt.bindInt(2, @intCast(ev.calendar_id));
@@ -693,6 +698,7 @@ pub const CalDavStore = struct {
         try stmt.bindInt(14, ev.modified_at);
         try stmt.bindText(15, ev.etag);
         try stmt.bindText(16, ev.ics_data);
+        try bindOptText(&stmt, 17, if (ev.source_message) |*reference| reference else null);
         _ = try stmt.step();
     }
 
@@ -843,12 +849,13 @@ pub const CalDavStore = struct {
             }
         }
         {
-            var stmt = try conn.prepare("SELECT id,calendar_id,uid,summary,description,location,dtstart,dtend,all_day,rrule,organizer,status,created_at,modified_at,etag,ics_data FROM dav_events");
+            var stmt = try conn.prepare("SELECT id,calendar_id,uid,summary,description,location,dtstart,dtend,all_day,rrule,organizer,status,created_at,modified_at,etag,ics_data,source_message_ref FROM dav_events");
             defer stmt.finalize();
             while (stmt.step() catch false) {
                 const id: u64 = @intCast(stmt.columnInt(0));
                 const rule = self.dupColOpt(&stmt, 9);
                 const source = self.dupCol(&stmt, 15);
+                const message = if (stmt.columnIsNull(16)) "" else try stmt.columnText(16);
                 try self.events.put(id, .{
                     .id = id,
                     .calendar_id = @intCast(stmt.columnInt(1)),
@@ -873,6 +880,7 @@ pub const CalDavStore = struct {
                     .modified_at = stmt.columnInt(13),
                     .etag = self.dupCol(&stmt, 14),
                     .ics_data = source,
+                    .source_message = if (message.len == @sizeOf(MessageReference)) message[0..@sizeOf(MessageReference)].* else null,
                 });
                 self.bumpIds(id, 0, .event);
             }
@@ -1250,7 +1258,7 @@ pub const CalDavStore = struct {
         const mailbox_id = try self.activeMailboxId(username);
         self.mutex.lock();
         defer self.mutex.unlock();
-        return snapshotEventDetail(arena, try self.ownedEventLocked(username, mailbox_id, id));
+        return snapshotEventDetail(arena, try self.ownedEventLocked(username, mailbox_id, id), true);
     }
 
     pub fn snapshotWebCalendarEvent(self: *Self, arena: Allocator, username: []const u8, id: u64, action: CalendarAction) !CalendarEventDetail {
@@ -1259,10 +1267,10 @@ pub const CalDavStore = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const allowed = try self.webEventLocked(access, id, action);
-        return snapshotEventDetail(arena, allowed.event);
+        return snapshotEventDetail(arena, allowed.event, allowed.permission == .owner);
     }
 
-    fn snapshotEventDetail(arena: Allocator, event: Event) !CalendarEventDetail {
+    fn snapshotEventDetail(arena: Allocator, event: Event, owner: bool) !CalendarEventDetail {
         return .{
             .event = try summarizeEvent(arena, event),
             .calendar_id = event.calendar_id,
@@ -1270,6 +1278,7 @@ pub const CalDavStore = struct {
             .organizer = try dupeOptional(arena, event.organizer),
             .modified_at = event.modified_at,
             .ics_data = try arena.dupe(u8, event.ics_data),
+            .source_message = if (owner) event.source_message else null,
         };
     }
 
@@ -1415,6 +1424,7 @@ pub const CalDavStore = struct {
         const calendar = self.calendars.get(calendar_id) orelse return error.CalendarNotFound;
         const permission = (try self.calendarPermissionLocked(access, calendar)) orelse return error.CalendarNotFound;
         if (permission != .owner and permission != .editor) return error.CalendarNotFound;
+        if (data.source_message != null and permission != .owner) return error.CalendarNotFound;
         try self.validateSharedEdit(permission, data.ics_data orelse "");
         if (data.uid) |uid| {
             if (self.getEventByUid(calendar_id, uid) != null) return error.EventAlreadyExists;
@@ -2158,6 +2168,7 @@ pub const CalDavStore = struct {
             .modified_at = now,
             .etag = etag,
             .ics_data = own.ics_data,
+            .source_message = data.source_message,
         };
         try self.events.ensureUnusedCapacity(1);
         try self.commitEventMutationLocked(event, .created);
@@ -2219,6 +2230,7 @@ pub const CalDavStore = struct {
         organizer: ?[]const u8 = null,
         status: Event.EventStatus = .confirmed,
         ics_data: ?[]const u8 = null,
+        source_message: ?MessageReference = null,
     };
 
     const EventText = struct {

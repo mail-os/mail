@@ -572,6 +572,7 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.eql(u8, p, "/webmail/api/calendar-reminders") and std.mem.eql(u8, req.method, "GET")) return handleCalendarReminders(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-reminders/dismiss") and std.mem.eql(u8, req.method, "POST")) return handleReminderDismiss(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-events") and std.mem.eql(u8, req.method, "GET")) return handleCalendarEvents(server, conn, arena, req);
+    if (std.mem.eql(u8, p, "/webmail/api/calendar-event-source") and std.mem.eql(u8, req.method, "GET")) return handleCalendarEventSource(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-events") and std.mem.eql(u8, req.method, "POST")) return handleCalendarEventCreate(server, conn, arena, req);
     if (std.mem.startsWith(u8, p, "/webmail/api/calendar-events/")) return handleCalendarEventItem(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-export") and std.mem.eql(u8, req.method, "GET")) return handleCalendarExport(server, conn, arena, req);
@@ -2091,12 +2092,21 @@ fn handleCalendarEvents(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a
     return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .events = events }), null);
 }
 
+fn handleCalendarEventSource(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    if (server.dav_store == null) return sendError(conn, arena, 503, "calendar_unavailable", "Calendar is unavailable on this server");
+    const reference = req.queryParam(arena, "reference") orelse return mapMaildirError(conn, arena, error.MessageNotFound);
+    const subject = maildir.calendarSourceSubject(arena, server.db, sess.username, reference) catch |err| return mapMaildirError(conn, arena, err);
+    return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .subject = subject }), null);
+}
+
 fn handleCalendarEventCreate(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
     if (!isSameOrigin(req)) return sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected");
     var sess = (try requireSession(server, conn, arena, req)) orelse return;
     defer sess.deinit(server.allocator);
     const dav = server.dav_store orelse return sendError(conn, arena, 503, "calendar_unavailable", "Calendar is unavailable on this server");
-    const calendar_id, const data = if (isICalendar(req)) resource: {
+    const calendar_id, var data = if (isICalendar(req)) resource: {
         const id = std.fmt.parseInt(u64, req.queryParam(arena, "calendarId") orelse "", 10) catch
             return sendError(conn, arena, 400, "bad_request", "Invalid calendar ID");
         if (req.body.len > dav.config.max_event_size) return calendarWriteError(conn, arena, error.EventTooLarge);
@@ -2108,6 +2118,10 @@ fn handleCalendarEventCreate(server: *WebmailHttpServer, conn: *webmail_tls.Stre
         const prepared = calendar_events.prepareCreate(arena, payload) catch |err| return calendarWriteError(conn, arena, err);
         break :json .{ payload.calendarId, prepared };
     };
+    if (req.header("X-Webmail-Source-Message")) |reference| {
+        _ = maildir.calendarSourceSubject(arena, server.db, sess.username, reference) catch |err| return mapMaildirError(conn, arena, err);
+        data.source_message = reference[0..@sizeOf(caldav_store.MessageReference)].*;
+    }
     checkCalendarEventBody(server, arena, dav, data.ics_data.?) catch |err| return calendarWriteError(conn, arena, err);
     const created = dav.createWebCalendarEvent(sess.username, calendar_id, data) catch |err| return calendarWriteError(conn, arena, err);
     return sendRevisionJson(conn, arena, 201, try service_mod.json(arena, .{
@@ -2133,12 +2147,20 @@ fn handleCalendarEventItem(server: *WebmailHttpServer, conn: *webmail_tls.Stream
     if (get) {
         const detail = dav.snapshotWebCalendarEvent(arena, sess.username, event_id, .read) catch |err| return calendarWriteError(conn, arena, err);
         const include_source = std.mem.eql(u8, req.queryParam(arena, "source") orelse "", "1");
+        const source_message: ?[]const u8 = if (detail.source_message) |*reference| source: {
+            _ = maildir.calendarSourceSubject(arena, server.db, sess.username, reference) catch |err| switch (err) {
+                error.MessageNotFound, error.FileNotFound => break :source null,
+                else => return err,
+            };
+            break :source reference;
+        } else null;
         return sendRevisionJson(conn, arena, 200, try service_mod.json(arena, .{
             .event = detail.event,
             .calendarId = detail.calendar_id,
             .description = detail.description,
             .organizer = detail.organizer,
             .icalendar = if (include_source) @as(?[]const u8, detail.ics_data) else null,
+            .source_message = source_message,
         }), null, detail.event.etag);
     }
 
@@ -2201,6 +2223,7 @@ fn calendarWriteError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: 
         error.EventTooLarge, error.CalendarExportTooLarge, error.MalwareScanTooLarge => sendError(conn, arena, 413, "event_too_large", "The event exceeds the allowed size"),
         error.MalwareDetected, error.InvalidDavBinary => sendError(conn, arena, 422, "event_rejected", "The calendar resource did not pass attachment scanning"),
         error.MalwareScanUnavailable => sendError(conn, arena, 503, "scanner_unavailable", "The malware scanner is unavailable. Try again later"),
+        error.PrepareFailed, error.ExecuteFailed, error.BindFailed, error.StepFailed => sendError(conn, arena, 500, "calendar_storage_error", "Calendar storage request failed. Try again."),
         else => err,
     };
 }

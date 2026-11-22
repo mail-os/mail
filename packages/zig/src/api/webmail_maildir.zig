@@ -1007,6 +1007,21 @@ pub fn getByReference(a: std.mem.Allocator, db: *database.Database, user: []cons
     return parseDetail(a, file.locator.folder, file.locator.uid, file.name, file.raw, file.version);
 }
 
+/// Resolve the user's own message and read only the header needed to seed
+/// the calendar editor. The stable reference follows normal mailbox moves.
+pub fn calendarSourceSubject(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8) ![]const u8 {
+    db.lockMailboxes();
+    defer db.unlockMailboxes();
+    const file = try resolveVersioned(a, db, user, id);
+    if (!isPersonalFolder(file.locator.folder)) return MaildirError.MessageNotFound;
+    const subject = std.mem.trim(u8, try mimeHeader(a, file.raw, "Subject"), " \t\r\n");
+    if (!std.unicode.utf8ValidateSlice(subject)) return "";
+    for (subject) |byte| if ((byte < 32 and byte != '\t') or byte == 127) return "";
+    var length = @min(subject.len, 512);
+    while (length < subject.len and subject[length] & 0xc0 == 0x80) length -= 1;
+    return subject[0..length];
+}
+
 pub fn getSharedInboxMessage(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8) !MessageDetail {
     const message = try getByReference(a, db, user, id);
     if (!std.mem.eql(u8, message.folder, "INBOX") or message.flags.deleted) return error.SharedInboxNotFound;

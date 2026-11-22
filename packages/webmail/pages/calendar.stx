@@ -20,6 +20,7 @@ const {
   teams, outgoingShares, shareCalendarInput, shareTeamInput, shareGranteeInput, shareAccessInput,
   calendarAccessLabels, grantCalendar, revokeCalendarGrant, selectGrantAccess, teamName,
   openEvent, openNewEvent, editorOpen, editorBusy, editorLoaded, editorError, editorConflict, editingId, editorLabel,
+  openMailEvent, sourceEmailLink, waitingMailEvent, editorSourceMessage,
   editorRecurring, editorOccurrence, editorHasOccurrence, editorReadOnly, editorViewer, editorProtectedOccurrence, editorCalendar, editorTitle, editorLocation, editorDescription,
   editorAllDay, editorStart, editorEnd, editorZone, editorScheduleEditable, editorTimeZones,
   editorReminder, editorReminderEditable, otherReminders, reminderOptions,
@@ -31,7 +32,7 @@ const {
   setNewCalendarName, submitImport, importEventDate, importStatusLabels, destroy,
   visibleReminders, reminderError, dismissingReminder, tickReminders, pollReminders, dismissReminder, destroyReminders,
 } = useMailCalendar(() => navigate('/login', { reload: true }), { ref: useRef('eventDialog'), nextTick })
-async function bootCalendar() { await refresh(); void pollReminders() }
+async function bootCalendar() { await refresh(); await openMailEvent(); void pollReminders() }
 useInterval(tickReminders, 1000, { whileVisible: true })
 useInterval(pollReminders, 30000, { whileVisible: true })
 useInterval(recheckShares, 30000, { whileVisible: true })
@@ -58,6 +59,7 @@ onUnmounted(() => { destroy(); destroyReminders() })
   <p :if="loading" class="calendar-loading" role="status">Loading calendar…</p>
   <p :if="!loading && !error && !calendars.length && !sharedCalendars.length && !importOpen && !calendarSettings">Create a calendar or import an .ics file to get started.</p>
   <section :if="calendarSettings" id="calendar-settings" class="calendar-import" aria-label="Manage calendars" :aria-busy="calendarSettingsBusy">
+    <p :if="waitingMailEvent" role="status">Create a calendar to save an event from this email.</p>
     <form class="calendar-import-form" @submit.prevent="createCalendar()">
       <label>Calendar name<input x-model="calendarNameInput" :disabled="calendarSettingsBusy" maxlength="100" required></label>
       <button type="submit" class="wm-action" :disabled="calendarSettingsBusy">Create calendar</button>
@@ -238,11 +240,13 @@ onUnmounted(() => { destroy(); destroyReminders() })
     </div>
     <p :if="editorViewer" class="calendar-editor-state">You have view access to this calendar.</p>
     <p :if="editorProtectedOccurrence && !editorViewer" class="calendar-editor-state">This exception also changes later dates. Use CalDAV to edit it.</p>
+    <p :if="editorLoaded && editorSourceMessage && editingId === null" class="calendar-editor-state">A private link to the source email will be saved with this event.</p>
+    <div :if="editorLoaded && editorSourceMessage && editingId !== null" class="calendar-editor-state"><a class="wm-action" :href="sourceEmailLink()"><span class="mail-icon" data-icon="inbox" aria-hidden="true"></span>Open source email</a></div>
     <fieldset :if="editorLoaded" :disabled="editorBusy || editorConflict || editorReadOnly" class="calendar-editor-fields">
       <label>Title<input x-model="editorTitle" maxlength="512" required autofocus></label>
       <label :if="editingId === null">Calendar
         <select aria-label="Calendar" :value="editorCalendar" @change="editorCalendar.set($event.target.value)">
-          <option :for="item in writableCalendars" :value="item.id" :text="item.name"></option>
+          <option :for="item in (editorSourceMessage ? calendars : writableCalendars)" :value="item.id" :text="item.name"></option>
         </select>
       </label>
       <div :if="editorScheduleEditable" class="calendar-editor-time">
