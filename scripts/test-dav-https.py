@@ -764,6 +764,160 @@ def check_mail_event_source(test, organizer):
     return verify_reopened
 
 
+def check_invitation_calendar(test, organizer):
+    attendee = test.provision("invite-calendar-owner")
+    different_organizer = test.provision("invite-other-organizer")
+    session, sender_session = test.login(attendee), test.login(organizer)
+    assert test.api(session, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
+    status, cal = test.api(session, "calendars", {"name": "Invitations"})
+    assert status == 201, cal
+    calendar_id = cal["id"]
+    client = DavClient(test, attendee)
+    collection = f"/calendars/{attendee}/Invitations/"
+    uid = "organizer-series@example.test"
+
+    def deliver(subject, sequence, *, method="REQUEST", occurrence=None, start=None, future=False, room="Studio", sender=organizer, offset="-0500"):
+        tzid = "Fixture/Studio"
+        recurrence = () if occurrence is None else (
+            f"RECURRENCE-ID{';RANGE=THISANDFUTURE' if future else ''};TZID={tzid}:202611{occurrence}T090000",
+        )
+        dates = () if method == "CANCEL" else (
+            f"DTSTART;TZID={tzid}:202611{occurrence or '23'}T{start or '090000'}", "DURATION:PT1H",
+        )
+        rule = ("RRULE:FREQ=DAILY;COUNT=6",) if method == "REQUEST" and occurrence is None else ()
+        source = "\r\n".join((
+            "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail//Invitation Calendar Fixture//EN", f"METHOD:{method}",
+            "BEGIN:VTIMEZONE", f"TZID:{tzid}", "TZURL:https://unused.example.test/zone",
+            "BEGIN:STANDARD", "DTSTART:19700101T000000", f"TZOFFSETFROM:{offset}", f"TZOFFSETTO:{offset}", "END:STANDARD", "END:VTIMEZONE",
+            "BEGIN:VEVENT", f"UID:{uid}", f"SEQUENCE:{sequence}", "DTSTAMP:20261121T100000Z",
+            f"ORGANIZER:mailto:{sender}", f"ATTENDEE:mailto:{attendee}", "ATTENDEE:mailto:another@example.test",
+            *recurrence, *dates, *rule, "SUMMARY:Studio shift", f"LOCATION:{room}", "URL:https://unused.example.test/event",
+            "BEGIN:VALARM", "ACTION:DISPLAY", "TRIGGER:-PT5M", "DESCRIPTION:Organizer alarm", "END:VALARM", "END:VEVENT", "END:VCALENDAR", "",
+        ))
+        message = EmailMessage()
+        message["From"], message["To"], message["Subject"] = sender, attendee, subject
+        message.set_content(source, subtype="calendar", params={"method": method})
+        with test.smtp(sender) as smtp:
+            assert smtp.send_message(message) == {}
+        query = urllib.parse.urlencode({"folder": "INBOX", "q": subject})
+        row, = [row for row in test.api(session, "messages?" + query)[1]["items"] if row["subject"] == subject]
+        return test.api(session, "messages/ref/" + row["reference"])[1]
+
+    def apply(mail, event=None, *, account=None):
+        fields = {**(session if account is None else account), "If-Match": mail["revision"]}
+        data = {"reference": mail["reference"], "index": 0, "calendarId": calendar_id}
+        if event:
+            data["eventRevision"] = event["etag"]
+        return test.api(fields, "calendar-invitation-event", data, "POST")
+
+    def detail(event):
+        status, body = test.api(session, f"calendar-events/{event['id']}?source=1")
+        assert status == 200, body
+        return body
+
+    def action(mail):
+        status, current = test.api(session, "messages/ref/" + mail["reference"])
+        assert status == 200, current
+        return current["calendar_invitation_events"][0]
+
+    def busy(*expected):
+        xml = f'<C:free-busy-query xmlns:C="{CALDAV}"><C:time-range start="20261123T000000Z" end="20261129T000000Z"/></C:free-busy-query>'
+        _, data = must(client.request("REPORT", collection, xml, {"Content-Type": "application/xml", "Depth": "1"}), 200)
+        starts = [line.split(":", 1)[1].split("/", 1)[0] for line in data.decode().splitlines() if line.startswith("FREEBUSY;")]
+        assert starts == list(expected), (starts, expected, data)
+
+    first = deliver("Original organizer series", 1)
+    assert first["calendar_invitation_events"] == [{"target": None, "applied": False}]
+    unrelated = collection + "other-client-filename.ics"
+    same_uid = "\r\n".join((
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Mail//Unrelated Calendar fixture//EN",
+        "BEGIN:VEVENT", f"UID:{uid}", "DTSTAMP:20261121T100000Z", "DTSTART:20261201T090000Z",
+        "SUMMARY:Imported from another client", "END:VEVENT", "END:VCALENDAR", "",
+    ))
+    must(client.request("PUT", unrelated, same_uid, {"Content-Type": "text/calendar", "If-None-Match": "*"}), 201)
+    status, conflict = apply(first)
+    assert status == 409 and conflict["error"] == "event_exists", conflict
+    must(client.request("DELETE", unrelated), 204)
+    token, _ = sync_report(client, collection)
+    assert apply(first, account=sender_session)[0] == 404
+    status, event = apply(first)
+    assert status == 201 and event["changed"], event
+    token, members = sync_report(client, collection, token)
+    path, = members
+    assert members[path] == event["etag"]
+    data = detail(event)
+    assert data["source_message"] == first["reference"]
+    assert "UID:" + uid in data["icalendar"] and "CLASS:PRIVATE" in data["icalendar"]
+    for omitted in ("METHOD:", "another@example.test", "TZURL:", "URL:", "VALARM"):
+        assert omitted not in data["icalendar"], omitted
+    assert apply(first)[1] == {**event, "changed": False}
+    target = {key: event[key] for key in ("id", "calendarId", "etag")}
+    assert action(first) == {"target": target, "applied": True}
+    busy(*(f"202611{day}T140000Z" for day in range(23, 29)))
+
+    alarm = "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nDESCRIPTION:Personal reminder\r\nEND:VALARM\r\n"
+    local = data["icalendar"].replace("END:VEVENT", alarm + "END:VEVENT", 1)
+    fields, _ = must(client.request("PUT", path, local, {"Content-Type": "text/calendar", "If-Match": event["etag"]}), 204)
+    update = deliver("Organizer updated an event", 2, room="New studio")
+    assert update["calendar_invitation_events"] == [{"target": {**target, "etag": fields["ETag"]}, "applied": False}]
+    assert apply(update, event)[0] == 412
+    status, event = apply(update, {**event, "etag": fields["ETag"]})
+    assert status == 200 and event["changed"], event
+    assert detail(event)["event"]["location"] == "New studio"
+    assert alarm in detail(event)["icalendar"]
+    assert detail(event)["source_message"] == first["reference"]
+    assert apply(first, event)[0] == 409
+    foreign = deliver("An unrelated organizer used the same UID", 9, sender=different_organizer)
+    assert foreign["calendar_invitation_events"] == [{"target": None, "applied": False}]
+    assert apply(foreign)[1]["error"] == "event_exists"
+
+    conflict = deliver("Organizer used a conflicting time zone", 3, occurrence=24, start="110000", offset="-1000")
+    status, refusal = apply(conflict, event)
+    assert status == 422 and refusal["error"] == "invitation_timezone", refusal
+    busy(*(f"202611{day}T140000Z" for day in range(23, 29)))
+
+    moved = deliver("Organizer moved Tuesday", 4, occurrence=24, start="110000")
+    status, event = apply(moved, event)
+    assert status == 200 and event["changed"], event
+    busy("20261123T140000Z", "20261124T160000Z", *(f"202611{day}T140000Z" for day in range(25, 29)))
+
+    shifted = deliver("Organizer shifted future occurrences", 5, occurrence=25, start="120000", future=True)
+    status, event = apply(shifted, event)
+    assert status == 200 and event["changed"], event
+    busy("20261123T140000Z", "20261124T160000Z", *(f"202611{day}T170000Z" for day in range(25, 29)))
+
+    cancelled = deliver("Organizer cancelled Thursday", 6, method="CANCEL", occurrence=26)
+    status, event = apply(cancelled, event)
+    assert status == 200, event
+    busy("20261123T140000Z", "20261124T160000Z", "20261125T170000Z", "20261127T170000Z", "20261128T170000Z")
+
+    end_range = deliver("Organizer cancelled the rest of the week", 7, method="CANCEL", occurrence=27, future=True)
+    status, event = apply(end_range, event)
+    assert status == 200, event
+    busy("20261123T140000Z", "20261124T160000Z", "20261125T170000Z")
+
+    whole = deliver("Organizer cancelled the series", 8, method="CANCEL")
+    status, event = apply(whole, event)
+    assert status == 200 and event["changed"], event
+    assert detail(event)["event"]["status"] == "cancelled"
+    busy()
+    _, changes = sync_report(client, collection, token)
+    assert changes == {path: event["etag"]}, changes
+    print("Verified linked Calendar creation, local alarm preservation, CalDAV revisions, and ordered updates and cancellations for instances, ranges, and whole series.")
+
+    def after_restart():
+        session.update(test.login(attendee))
+        assert detail(event)["source_message"] == first["reference"]
+        assert action(whole)["applied"]
+        assert apply(whole, event)[1] == {**event, "changed": False}
+        assert apply(moved, event)[0] == 409
+        busy()
+        assert must(client.request("GET", path), 200)[0]["ETag"] == event["etag"]
+        print("Verified organizer Calendar revisions, source links, and duplicate handling after restart.")
+
+    return after_restart
+
+
 def check_calendar_download(test, owner, other):
     owner_session = test.login(owner)
     status, result = test.api(owner_session, "calendars")
@@ -1348,8 +1502,8 @@ def check_calendar_upgrade(binary, previous):
         for table, old_columns in previous_columns.items():
             new_columns = upgraded_columns[table]
             assert new_columns[:len(old_columns)] == old_columns
-            expected = "source_message_ref" if table == "dav_events" else "display_name"
-            assert expected in {column[1] for column in new_columns}
+            expected = {"source_message_ref", "invitation_key", "invitation_revisions"} if table == "dav_events" else {"display_name"}
+            assert expected <= {column[1] for column in new_columns}
         test.binary = previous
         with test.daemon():
             row, = test.api(test.login(owner), listing)[1]["events"]
@@ -1428,6 +1582,7 @@ def main():
                 check_scanning(DavClient(test, owner), expected)
                 check_invitation_previews(test, owner, other)
                 prepare_rsvp_restart, check_rsvp_restart = check_invitation_replies(test)
+                check_saved_invitation = check_invitation_calendar(test, other)
                 check_reopened_backlink = check_mail_event_source(test, other)
                 check_calendar_download(test, owner, other)
                 importer, calendar_id, submit = check_calendar_import(test, owner, other)
@@ -1439,6 +1594,7 @@ def main():
                 client = DavClient(test, owner)
                 check_reopened_backlink()
                 check_rsvp_restart()
+                check_saved_invitation()
                 check_saved_properties()
                 print("Verified CalDAV and CardDAV metadata over HTTP and HTTPS, including rollback, concurrent reads, and restart.")
                 assert test.api(test.login(owner), "calendar-reminders")[1]["dismissed"] == [dismissal]

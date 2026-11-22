@@ -302,7 +302,7 @@ pub const SchedulingReply = struct {
 pub fn schedulingReply(a: Allocator, reply: SchedulingReply) ![]const u8 {
     var output: Export = .{ .allocator = a };
     try output.headers.appendSlice(a, "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Mail//Calendar RSVP//EN\r\nMETHOD:REPLY\r\n");
-    if (reply.timezone) |zone| try addReplyTimezone(&output, zone);
+    if (reply.timezone) |zone| try addSchedulingTimezone(&output, zone);
     try output.events.appendSlice(a, "BEGIN:VEVENT\r\n");
     try output.textProperty(&output.events, "UID", reply.uid);
     try output.dateProperty("DTSTAMP", reply.stamp, false);
@@ -314,13 +314,13 @@ pub fn schedulingReply(a: Allocator, reply: SchedulingReply) ![]const u8 {
     return output.finish();
 }
 
-fn addReplyTimezone(output: *Export, zone: Component) !void {
+pub fn addSchedulingTimezone(output: *Export, zone: Component) !void {
     const a = output.allocator;
     const id = (try componentText(a, zone, "TZID")) orelse return error.InvalidCalendar;
     try output.headers.appendSlice(a, "BEGIN:VTIMEZONE\r\n");
     try output.textProperty(&output.headers, "TZID", id);
-    // The attendee supplies only the time rules used by RECURRENCE-ID.
-    // Exclude organizer URLs, descriptions, and extension components.
+    // Scheduling consumers need the time rules, without organizer URLs
+    // or extension components.
     for (try childComponents(a, zone)) |child| {
         const kind: []const u8 = if (std.ascii.eqlIgnoreCase(child.name, "STANDARD"))
             "STANDARD"
@@ -394,7 +394,7 @@ pub const Export = struct {
         return try right.next(a) == null;
     }
 
-    fn addComponent(self: *Export, target: *std.ArrayList(u8), a: Allocator, component: Component) !void {
+    pub fn addComponent(self: *Export, target: *std.ArrayList(u8), a: Allocator, component: Component) !void {
         var lines = Lines{ .source = component.bytes };
         while (try lines.next(a)) |line| {
             if (line.text.len > 0) try self.foldedLine(target, line.text);
@@ -484,7 +484,7 @@ pub const Export = struct {
         try self.foldedLine(target, line.items);
     }
 
-    fn foldedLine(self: *Export, target: *std.ArrayList(u8), line: []const u8) !void {
+    pub fn foldedLine(self: *Export, target: *std.ArrayList(u8), line: []const u8) !void {
         var remaining = line;
         var width: usize = 75;
         while (remaining.len > width) {

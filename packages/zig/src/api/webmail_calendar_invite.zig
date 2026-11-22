@@ -27,7 +27,7 @@ pub const WallTime = struct {
     zone: ?[]const u8,
     all_day: bool,
 
-    fn read(property: ical.Property) ?WallTime {
+    pub fn read(property: ical.Property) ?WallTime {
         const date = clock.Date.parse(property.value) orelse return null;
         const zone = property.param("TZID");
         if (zone) |name| {
@@ -64,6 +64,12 @@ pub const Revision = struct {
     dtstamp: i64,
     occurrence: ?WallTime,
     this_and_future: bool,
+
+    pub fn sameVersion(self: Revision, other: Revision) bool {
+        return self.sequence == other.sequence and self.dtstamp == other.dtstamp and
+            self.method == other.method and self.this_and_future == other.this_and_future and
+            std.mem.eql(u8, &self.component, &other.component);
+    }
 };
 
 pub const Response = enum {
@@ -83,6 +89,7 @@ pub const Response = enum {
 pub const Invitation = struct {
     preview: Preview,
     components: []const ical.Component,
+    component: ical.Component,
     recurrence: ?ical.Property,
 
     pub fn canReply(self: Invitation, attendee: []const u8) bool {
@@ -111,7 +118,7 @@ pub const Invitation = struct {
         return self.keyForOccurrence(a, self.preview.occurrence);
     }
 
-    fn keyForOccurrence(self: Invitation, a: Allocator, occurrence: ?WallTime) ![64]u8 {
+    pub fn keyForOccurrence(self: Invitation, a: Allocator, occurrence: ?WallTime) ![64]u8 {
         const material = try std.json.Stringify.valueAlloc(a, .{
             .organizer = try std.ascii.allocLowerString(a, self.preview.organizer),
             .uid = self.preview.uid,
@@ -169,7 +176,7 @@ pub const Invitation = struct {
     }
 };
 
-fn addressUri(a: Allocator, address: []const u8) ![]const u8 {
+pub fn addressUri(a: Allocator, address: []const u8) ![]const u8 {
     var encoded: std.ArrayList(u8) = .empty;
     try encoded.appendSlice(a, "mailto:");
     for (address) |byte| {
@@ -311,7 +318,7 @@ fn readEvent(a: Allocator, components: []const ical.Component, component: ical.C
             if (stop.all_day != begin.all_day or (same_zone and stop.wall <= begin.wall)) return error.InvalidInvitation;
         }
     }
-    return .{ .components = components, .recurrence = recurrence, .preview = .{
+    return .{ .components = components, .component = component, .recurrence = recurrence, .preview = .{
         .method = method,
         .uid = identity,
         .organizer = organizer_address,

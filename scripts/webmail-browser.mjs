@@ -601,12 +601,21 @@ async function invitationJourney(page, phone = false) {
   await fitsViewport(page)
   await screenshot(page, phone ? 'phone-calendar-rsvp' : 'desktop-calendar-rsvp')
   if (!phone) {
+    await button(invitation, 'Add to Calendar').click()
+    await invitation.getByRole('combobox', { name: 'Calendar', exact: true }).waitFor()
+    await button(invitation, 'Save invitation').click()
+    await invitation.getByText('Saved in Calendar.', { exact: true }).waitFor()
+    await screenshot(page, 'desktop-saved-calendar-invitation')
     await openMailbox(page, /^Archive(?:\s|$)/)
     await button(page, /Team breakfast invitation/).click()
     await page.getByText('The organizer cancelled this invitation.', { exact: true }).waitFor()
     assert.equal(await page.getByRole('group', { name: 'RSVP to organizer' }).count(), 0)
     assert.equal(await page.getByRole('link', { name: 'Create event from email', exact: true }).count(), 0)
     await screenshot(page, 'desktop-cancelled-invitation')
+  }
+  else {
+    await invitation.getByText('Saved in Calendar.', { exact: true }).waitFor()
+    await screenshot(page, 'phone-saved-calendar-invitation')
   }
 }
 

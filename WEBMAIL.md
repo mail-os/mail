@@ -148,10 +148,17 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
 - When the verified organizer invited your mailbox, choose **Accept**,
   **Tentative**, or **Decline** to email a response. The invitation shows
   delivery status and lets you retry a failed response. Check Outbox for
-  delivery details. Use Calendar to add or edit the event itself.
+  delivery details.
 - A newer invitation or cancellation from the verified organizer disables
   replies to the affected revision. This applies to messages delivered to
   the mailbox and to approved messages released from Sender Review.
+- Choose **Add to Calendar** and select a calendar you own to save a private
+  copy of a verified invitation. Choose **Apply to Calendar** or **Apply
+  cancellation** on a later message from the same organizer to update that
+  copy. Updates can affect one occurrence, a future range, or the series.
+  CalDAV clients see each saved change. The saved event links back to the
+  original email. The invitation's external links and alarms stay in the
+  email. Saving an invitation and sending an RSVP are separate actions.
 - Choose **Create event from email** in an open message to start a Calendar
   event with the subject as its title. Edit the title and choose the dates
   before saving. The owner can choose **Open source email** in the saved
@@ -172,6 +179,13 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   (`accepted`, `tentative`, or `declined`) in JSON. Use the current
   `previousSendId` to change a response to the same revision or retry a
   definite failure. The response includes the decision and Outbox state.
+- A `calendar_invitation_events` action offers the verified invitation's
+  Calendar operation. Send `POST /webmail/api/calendar-invitation-event`
+  with the message ETag in `If-Match` and its `reference` and invitation
+  `index` in JSON. Pass an owned `calendarId` for a new event or the
+  target's `eventRevision` to apply a change to an existing event. The
+  response returns the event ID, calendar ID, current ETag, and whether
+  the operation changed the event.
 - `GET /webmail/api/calendar-event-source?reference=…` reads the subject of
   an owned message. Send its reference as `X-Webmail-Source-Message` when
   creating an event in a calendar you own. An owner's event detail includes

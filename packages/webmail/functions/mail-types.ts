@@ -1,5 +1,5 @@
 import type { EmbeddedImage } from './mail-reader'
-import type { InvitationAction, InvitationPreview } from './mail-invitations'
+import type { InvitationAction, InvitationCalendarAction, InvitationPreview } from './mail-invitations'
 
 export interface Flags { seen: boolean, answered: boolean, flagged: boolean, draft: boolean, deleted: boolean }
 export interface MessageRef {
@@ -39,6 +39,7 @@ export interface MessageDetail extends MessageSummary {
   notifications?: MailNotificationRules
   calendar_invites?: InvitationPreview[]
   calendar_rsvps?: Array<InvitationAction | null>
+  calendar_invitation_events?: Array<InvitationCalendarAction | null>
   calendar_only?: boolean
 }
 export type MailNotificationRule = 'default' | 'notify' | 'quiet'

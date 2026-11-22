@@ -247,7 +247,12 @@ input[type=checkbox] { accent-color: var(--accent); }
 .wm-invitation-rsvp > p + .wm-invitation-responses { margin-top: 8px; }
 .wm-invitation-responses { display: flex; flex-wrap: wrap; gap: 6px; }
 .wm-invitation-responses .wm-action[aria-pressed=true] { background: var(--accent-soft); color: var(--accent); }
-@media (pointer: coarse) { .wm-invitation-responses .wm-action { min-height: 44px; } }
+.wm-invitation-calendar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 11px; }
+.wm-invitation-saved { display: inline-flex; align-items: center; gap: 6px; margin: 0; color: var(--muted); }
+.wm-invitation-saved .mail-icon { color: var(--accent); }
+.wm-invitation-destination, .wm-invitation-destination label { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.wm-invitation-destination select { max-width: 100%; padding: 6px 9px; border: 1px solid var(--field-border); border-radius: 6px; color: var(--text); background: var(--panel); }
+@media (pointer: coarse) { .wm-invitation-responses .wm-action, .wm-invitation-calendar .wm-action { min-height: 44px; } }
 .wm-invitation-verified { display: inline-block; margin-inline-start: 8px; color: var(--muted); font-size: 11px; }
 .wm-invitation-source { margin-top: 12px; color: var(--muted); font-size: 13px; }
 .wm-invitation-source summary { cursor: pointer; }

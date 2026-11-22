@@ -37,6 +37,7 @@ const teams = @import("team_store.zig");
 const icalendar = @import("../protocol/icalendar.zig");
 const icalendar_busy = @import("../protocol/icalendar_busy.zig");
 const reminder = @import("../protocol/icalendar_reminder.zig");
+const calendar_invite = @import("../api/webmail_calendar_invite.zig");
 
 /// Get the current epoch timestamp in seconds (cross-platform).
 fn currentTimestamp() i64 {
@@ -118,6 +119,8 @@ pub const Event = struct {
     etag: []const u8,
     ics_data: []const u8, // Raw ICS data
     source_message: ?MessageReference = null,
+    invitation_key: ?[64]u8 = null,
+    invitation_revisions: ?[]const u8 = null,
 
     pub const EventStatus = enum {
         tentative,
@@ -622,6 +625,8 @@ pub const CalDavStore = struct {
         try ensureTextColumn(conn, "dav_calendars", "display_name");
         try ensureTextColumn(conn, "dav_addressbooks", "display_name");
         try ensureTextColumn(conn, "dav_events", "source_message_ref");
+        try ensureTextColumn(conn, "dav_events", "invitation_key");
+        try ensureTextColumn(conn, "dav_events", "invitation_revisions");
         try conn.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_dav_calendar_share_id ON dav_calendars(share_id) WHERE share_id IS NOT NULL");
     }
 
@@ -680,7 +685,7 @@ pub const CalDavStore = struct {
 
     fn persistEvent(self: *Self, ev: Event) !void {
         const conn = if (self.conn) |*c| c else return;
-        var stmt = try conn.prepare("INSERT OR REPLACE INTO dav_events (id,calendar_id,uid,summary,description,location,dtstart,dtend,all_day,rrule,organizer,status,created_at,modified_at,etag,ics_data,source_message_ref) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        var stmt = try conn.prepare("INSERT OR REPLACE INTO dav_events (id,calendar_id,uid,summary,description,location,dtstart,dtend,all_day,rrule,organizer,status,created_at,modified_at,etag,ics_data,source_message_ref,invitation_key,invitation_revisions) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         defer stmt.finalize();
         try stmt.bindInt(1, @intCast(ev.id));
         try stmt.bindInt(2, @intCast(ev.calendar_id));
@@ -699,6 +704,8 @@ pub const CalDavStore = struct {
         try stmt.bindText(15, ev.etag);
         try stmt.bindText(16, ev.ics_data);
         try bindOptText(&stmt, 17, if (ev.source_message) |*reference| reference else null);
+        try bindOptText(&stmt, 18, if (ev.invitation_key) |*key| key else null);
+        try bindOptText(&stmt, 19, ev.invitation_revisions);
         _ = try stmt.step();
     }
 
@@ -849,13 +856,15 @@ pub const CalDavStore = struct {
             }
         }
         {
-            var stmt = try conn.prepare("SELECT id,calendar_id,uid,summary,description,location,dtstart,dtend,all_day,rrule,organizer,status,created_at,modified_at,etag,ics_data,source_message_ref FROM dav_events");
+            var stmt = try conn.prepare("SELECT id,calendar_id,uid,summary,description,location,dtstart,dtend,all_day,rrule,organizer,status,created_at,modified_at,etag,ics_data,source_message_ref,invitation_key,invitation_revisions FROM dav_events");
             defer stmt.finalize();
             while (stmt.step() catch false) {
                 const id: u64 = @intCast(stmt.columnInt(0));
                 const rule = self.dupColOpt(&stmt, 9);
                 const source = self.dupCol(&stmt, 15);
                 const message = if (stmt.columnIsNull(16)) "" else try stmt.columnText(16);
+                const key = if (stmt.columnIsNull(17)) "" else try stmt.columnText(17);
+                const invitation_key = if (key.len == 64) key[0..64].* else null;
                 try self.events.put(id, .{
                     .id = id,
                     .calendar_id = @intCast(stmt.columnInt(1)),
@@ -881,6 +890,8 @@ pub const CalDavStore = struct {
                     .etag = self.dupCol(&stmt, 14),
                     .ics_data = source,
                     .source_message = if (message.len == @sizeOf(MessageReference)) message[0..@sizeOf(MessageReference)].* else null,
+                    .invitation_key = invitation_key,
+                    .invitation_revisions = self.dupColOpt(&stmt, 18),
                 });
                 self.bumpIds(id, 0, .event);
             }
@@ -1414,6 +1425,89 @@ pub const CalDavStore = struct {
 
     fn validateSharedEdit(self: *Self, permission: CalendarPermission, source: []const u8) !void {
         if (permission == .editor and !publicCalendarResource(self.allocator, source)) return error.SharedEventMustBePublic;
+    }
+
+    pub const InvitationTarget = struct { id: u64, calendarId: u64, etag: []const u8 };
+    pub const InvitationSnapshot = struct { detail: CalendarEventDetail, revisions: []const u8 };
+    pub const InvitationAction = struct { target: ?InvitationTarget, applied: bool = false };
+
+    fn invitationEventLocked(self: *Self, owner: u64, key: [64]u8) ?Event {
+        var events = self.events.valueIterator();
+        while (events.next()) |event| {
+            const invitation_key = event.invitation_key orelse continue;
+            if (!std.mem.eql(u8, &invitation_key, &key)) continue;
+            const calendar = self.calendars.get(event.calendar_id) orelse continue;
+            if (calendar.user_id == owner) return event.*;
+        }
+        return null;
+    }
+
+    pub fn snapshotInvitationAction(self: *Self, a: Allocator, username: []const u8, revision: calendar_invite.Revision) !?InvitationAction {
+        const mailbox = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.findUserIdLocked(username, mailbox)) |owner| {
+            if (self.invitationEventLocked(owner, revision.series)) |event| {
+                const stored = event.invitation_revisions orelse return error.InvalidCalendar;
+                const previous = try std.json.parseFromSliceLeaky([]const calendar_invite.Revision, a, stored, .{});
+                var applied = false;
+                for (previous) |item| {
+                    if (item.sameVersion(revision)) {
+                        applied = true;
+                        break;
+                    }
+                }
+                return .{
+                    .target = .{ .id = event.id, .calendarId = event.calendar_id, .etag = try a.dupe(u8, event.etag) },
+                    .applied = applied,
+                };
+            }
+        }
+        return if (revision.method == .request and revision.occurrence == null) .{ .target = null } else null;
+    }
+
+    pub fn snapshotInvitationEvent(self: *Self, a: Allocator, username: []const u8, key: [64]u8) !?InvitationSnapshot {
+        const mailbox = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const owner = self.findUserIdLocked(username, mailbox) orelse return null;
+        const event = self.invitationEventLocked(owner, key) orelse return null;
+        return .{
+            .detail = try snapshotEventDetail(a, event, true),
+            .revisions = try a.dupe(u8, event.invitation_revisions orelse return error.InvalidCalendar),
+        };
+    }
+
+    /// Serialize organizer delivery and Calendar edits while the prepared
+    /// document and its tracking data commit with the DAV resource revision.
+    pub fn saveInvitationEvent(self: *Self, username: []const u8, revision: calendar_invite.Revision, logical_uid: []const u8, calendar_id: ?u64, expected: ?InvitationTarget, data: ?EventData) !CreatedMailboxEvent {
+        const access = try self.beginCalendarAccess(username, .write);
+        defer access.deinit();
+        if (access.account_tx) |tx| try accounts.Database.requireCurrentCalendarInvitation(tx, username, revision);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const owner = self.findUserIdLocked(access.username, access.mailbox_id) orelse return error.CalendarNotFound;
+        if (self.invitationEventLocked(owner, revision.series)) |event| {
+            const version = expected orelse return error.PreconditionFailed;
+            if (event.id != version.id or !std.mem.eql(u8, version.etag, event.etag)) return error.PreconditionFailed;
+            if (calendar_id) |id| if (id != event.calendar_id) return error.CalendarNotFound;
+            if (data) |change| try self.updateEventLocked(event.id, change);
+            return .{ .id = event.id, .revision = PutResource.init(false, self.events.get(event.id).?.etag) };
+        }
+        if (expected != null) return error.PreconditionFailed;
+        if (revision.method == .cancel or revision.occurrence != null) return error.InvitationEventRequired;
+        const id = calendar_id orelse return error.CalendarNotFound;
+        const calendar = self.calendars.get(id) orelse return error.CalendarNotFound;
+        if (calendar.user_id != owner) return error.CalendarNotFound;
+        const change = data orelse return error.InvalidCalendar;
+        if (self.getEventByUid(id, change.uid orelse return error.InvalidCalendar) != null) return error.EventAlreadyExists;
+        var wanted: std.StringHashMapUnmanaged(bool) = .empty;
+        defer wanted.deinit(self.allocator);
+        try wanted.put(self.allocator, logical_uid, false);
+        try self.findExistingImportUids(&wanted, id);
+        if (wanted.get(logical_uid).?) return error.EventAlreadyExists;
+        const saved = try self.createEventLocked(id, change);
+        return .{ .id = saved, .revision = PutResource.init(true, self.events.get(saved).?.etag) };
     }
 
     pub fn createWebCalendarEvent(self: *Self, username: []const u8, calendar_id: u64, data: EventData) !CreatedMailboxEvent {
@@ -2147,6 +2241,8 @@ pub const CalDavStore = struct {
         errdefer self.allocator.free(uid);
         const own = try self.ownEventText(data, data.organizer, data.ics_data orelse "");
         errdefer self.freeEventText(own);
+        const invitation_revisions = try dupeOptional(self.allocator, data.invitation_revisions);
+        errdefer if (invitation_revisions) |value| self.allocator.free(value);
 
         const event = Event{
             .id = id,
@@ -2169,6 +2265,8 @@ pub const CalDavStore = struct {
             .etag = etag,
             .ics_data = own.ics_data,
             .source_message = data.source_message,
+            .invitation_key = data.invitation_key,
+            .invitation_revisions = invitation_revisions,
         };
         try self.events.ensureUnusedCapacity(1);
         try self.commitEventMutationLocked(event, .created);
@@ -2231,6 +2329,8 @@ pub const CalDavStore = struct {
         status: Event.EventStatus = .confirmed,
         ics_data: ?[]const u8 = null,
         source_message: ?MessageReference = null,
+        invitation_key: ?[64]u8 = null,
+        invitation_revisions: ?[]const u8 = null,
     };
 
     const EventText = struct {
@@ -2288,6 +2388,7 @@ pub const CalDavStore = struct {
         self.freeEventText(EventText.fromEvent(event));
         self.allocator.free(event.uid);
         self.allocator.free(event.etag);
+        if (event.invitation_revisions) |value| self.allocator.free(value);
     }
 
     pub fn getEvent(self: *Self, id: u64) ?Event {
@@ -2336,6 +2437,8 @@ pub const CalDavStore = struct {
         errdefer self.allocator.free(etag);
         const own = try self.ownEventText(data, old.organizer, data.ics_data orelse old.ics_data);
         errdefer self.freeEventText(own);
+        const invitation_revisions = try dupeOptional(self.allocator, data.invitation_revisions);
+        errdefer if (invitation_revisions) |value| self.allocator.free(value);
 
         var event = old;
         event.summary = own.summary;
@@ -2353,7 +2456,11 @@ pub const CalDavStore = struct {
         event.modified_at = currentTimestamp();
         event.etag = etag;
         event.ics_data = own.ics_data;
+        if (invitation_revisions) |value| event.invitation_revisions = value;
         try self.commitEventMutationLocked(event, .modified);
+        if (invitation_revisions != null) {
+            if (old.invitation_revisions) |value| self.allocator.free(value);
+        }
         self.allocator.free(old.etag);
         self.freeEventText(EventText.fromEvent(old));
     }

@@ -2,7 +2,8 @@ import type { PrivateCollection, AttachmentPage, IndexProgress, LibraryAttachmen
 import { batch, derived, effect, state } from '@stacksjs/stx'
 import { createMailApi, MailApiError } from './mail-api'
 import { mailEventLink, takeMailEventLink } from './mail-event-link'
-import type { InvitationResponse, InvitationRsvp } from './mail-invitations'
+import type { InvitationCalendarTarget, InvitationResponse, InvitationRsvp } from './mail-invitations'
+import type { Calendar } from './calendar-types'
 import { invitationRevision, rsvpPending } from './mail-invitations'
 import { attentionViews, deadlineLabel, localDateInput, localDeadline } from './mail-attention'
 import { captureListViewport, isShortcutEvent, messageIdentity, messagePageSize, restoreListViewport, triageShortcuts } from './mail-triage'
@@ -61,6 +62,9 @@ export function useWebmail(ports: WebmailPorts) {
   const selected = state<MessageDetail | null>(null)
   const rsvpBusy = state(false)
   const rsvpError = state<{ index: number, message: string } | null>(null)
+  const invitationCalendar = state<{ index: number, choices?: Calendar[], error?: string } | null>(null)
+  const invitationDestination = state('')
+  const invitationCalendarBusy = state(false)
   const loading = state(false)
   const refreshing = state(false)
   const listError = state('')
@@ -384,11 +388,56 @@ export function useWebmail(ports: WebmailPorts) {
     const message = selected()
     const account = user()?.username
     if (!limits().calendarAvailable || !message?.reference || !account || message.folder === 'Drafts' || senderReview.senderReviewOpen()) return null
+    if (message.calendar_invitation_events?.some(Boolean)) return null
     if (message.calendar_invites?.length && !message.calendar_invites.some((invite, index) => {
       const availability = message.calendar_rsvps?.[index]?.availability
       return invite.method === 'request' && (!availability || availability === 'current')
     })) return null
     return mailEventLink('/calendar', account, message.reference)
+  }
+  async function chooseInvitationCalendar(index: number): Promise<void> {
+    if (invitationCalendarBusy() || readingLoading()) return
+    const request = messageRequest
+    invitationCalendar.set({ index })
+    invitationCalendarBusy.set(true)
+    try {
+      const { calendars } = await api<{ calendars: Calendar[] }>('/webmail/api/calendars')
+      if (!destroyed && request === messageRequest) {
+        invitationDestination.set(String(calendars[0]?.id ?? ''))
+        invitationCalendar.set({ index, choices: calendars })
+      }
+    }
+    catch (cause) {
+      if (request === messageRequest) invitationCalendar.set({ index, error: errorMessage(cause) })
+    }
+    finally { invitationCalendarBusy.set(false) }
+  }
+  async function saveInvitationCalendar(index: number): Promise<void> {
+    const message = selected()
+    const action = message?.calendar_invitation_events?.[index]
+    if (invitationCalendarBusy() || readingLoading() || !message?.reference || !message.revision || !action || action.applied) return
+    const calendarId = action.target?.calendarId ?? Number(invitationDestination())
+    if (!calendarId) return
+    const request = messageRequest
+    invitationCalendar.set({ index })
+    invitationCalendarBusy.set(true)
+    try {
+      const result = await api<InvitationCalendarTarget>('/webmail/api/calendar-invitation-event', {
+        method: 'POST',
+        headers: { 'If-Match': message.revision },
+        body: JSON.stringify({ reference: message.reference, index, calendarId, eventRevision: action.target?.etag }),
+      })
+      const current = selected()
+      if (!destroyed && request === messageRequest && current?.calendar_invitation_events) {
+        const actions = [...current.calendar_invitation_events]
+        actions[index] = { target: { id: result.id, calendarId: result.calendarId, etag: result.etag }, applied: true }
+        selected.set({ ...current, calendar_invitation_events: actions })
+      }
+    }
+    catch (cause) {
+      if (request === messageRequest) invitationCalendar.set({ index, error: errorMessage(cause) })
+    }
+    finally { invitationCalendarBusy.set(false) }
   }
   function canRespondToInvitation(index: number, response: InvitationResponse): boolean {
     const message = selected()
@@ -479,6 +528,7 @@ export function useWebmail(ports: WebmailPorts) {
     readingViewport = null
     ++messageRequest
     selected.set(null)
+    invitationCalendar.set(null)
     privateMail.closePrivate()
     remoteImagesAllowed.set(false)
     senderReview.senderReviewSelection.set(null)
@@ -767,6 +817,7 @@ export function useWebmail(ports: WebmailPorts) {
   async function openMessage(message: MessageRef & { personal_subject?: string }, autoRead = true, skipSeen = false, skipMissing = false, requireRevision = false): Promise<OpenResult> {
     if (mutating()) return 'cancelled'
     const request = ++messageRequest
+    invitationCalendar.set(null)
     privateMail.closePrivate()
     const viewport = !reading() ? captureListViewport(ports.messageList.current) : null
     readerTarget.set(message)
@@ -1770,6 +1821,7 @@ export function useWebmail(ports: WebmailPorts) {
   function destroy(): void { destroyed = true; ++listRequest; ++messageRequest; recipientEditor.destroy(); attachmentEditor.destroy(); draft.destroy(); privateMail.closePrivate(); contactBook.closeContacts(); selectionEffect() }
   return { user, folders, folder, messages, threads, expandedThreads, selected, loading, refreshing, listError, readerError, readerTarget, reading, readingLoading, mutating, error, notice, query, activeQuery, appliedSearchAll, filterLocation, filterSender, filterRecipient, filterFilename, libraryView, libraryFiles, indexProgress, filterAfter, filterBefore, filterStatus, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, formattedReader, remoteImagesAllowed, checked, checkedKeys, selectedCount, isJunkFolder, readerJunkAction, selectionJunkAction, allChecked, someChecked, undoAction, undoRemaining, readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts, pendingSend, sendRemaining, outbox, outboxCount, outboxCounts, outboxSection, outboxViews, outboxEmpty, outboxPageNumber, outboxNext, outboxLoading, outboxError, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, sharedReply, senderId, senderIdentities, missingSender, senderStatus, chooseSender, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...senderReview, ...notifications, ...privateMail, ...contactBook, showContacts, composeSavedCard, collectionView, collectionId, canOpenPrivate,
     createEventLink, canRespondToInvitation, respondToInvitation, rsvpBusy, rsvpError,
+    invitationCalendar, invitationCalendarBusy, invitationDestination, chooseInvitationCalendar, saveInvitationCalendar,
     showCollectionManager, closeCollectionManager, selectCollection, confirmCollectionDeletion, savePrivateLabel, setPrivateMembership, groupSelected, displaySubject, changeNotificationRule, ...recipientEditor, ...attachmentEditor, ...recoverySettings, ...forwardingSettings, ...vacationSettings, ...writing, snippetChoice, signatureChoice, insertSnippet, insertSignature, attentionViews, attentionView, followUpFocused, attentionSaving, attentionSchedule, attentionDate, attentionZone, dueReminders, replyContext, clearFollowUp, selectAttention, nextFollowUp, changeAttention, startAttentionSchedule, saveAttentionSchedule, deadlineLabel, categoryList, newsletterExpanded, readerExpanded, receiptFull, receiptCompact, receiptPreview, senderLabel, sortingSettings, sortingSaving, sortingError, toggleAutomaticSorting, placementText, categoryRule, categoryRuleSaving, saveCategoryRule, showSenderReview, openReviewMessage, reviewMessage, refresh, loadMessages, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread, toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, openAttachmentMessage, showAttachmentLibrary, retryReader, closeReader, nextUnread, readSelection, advanceBatch, triageAndNext, bulkAction, selectedAction, undoLastAction, showShortcuts, closeShortcuts, handleShortcut, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments, saveSendPreference, send, confirmPendingSend, showOutbox, refreshOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword, showConfirmation, confirmAction, saveDraftCopy: draft.saveCopy, mount, resume, tick, preventUnload, destroy, messageIdentity, messagePageSize, folderName, shortDate, fullDate, readableBytes, attachmentPath }
 }
 

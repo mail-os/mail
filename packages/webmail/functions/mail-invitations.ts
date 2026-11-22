@@ -29,6 +29,8 @@ export interface InvitationAction {
   status: InvitationRsvp | null
   availability?: 'current' | 'superseded' | 'cancelled'
 }
+export interface InvitationCalendarTarget { id: number, calendarId: number, etag: string }
+export interface InvitationCalendarAction { target: InvitationCalendarTarget | null, applied: boolean }
 
 export const invitationResponses = [
   { value: 'accepted', label: 'Accept', icon: 'check' },

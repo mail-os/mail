@@ -84,6 +84,7 @@ const {
   toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, retryReader, closeReader, bulkAction, selectedAction,
   nextUnread, readSelection, advanceBatch, triageAndNext, showShortcuts, closeShortcuts, handleShortcut, createEventLink,
   canRespondToInvitation, respondToInvitation, rsvpBusy, rsvpError,
+  invitationCalendar, invitationCalendarBusy, invitationDestination, chooseInvitationCalendar, saveInvitationCalendar,
   undoLastAction, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments,
   saveSendPreference, send, confirmPendingSend, showOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword,
   showConfirmation, confirmAction, saveDraftCopy, resume, tick, preventUnload,
@@ -450,6 +451,19 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
                   </button>
                 </div>
                 <div :if="rsvpError?.index === index" class="wm-inline-error" role="alert"><span :text="rsvpError.message"></span><button type="button" class="wm-action" @click="retryReader()">Refresh invitation</button></div>
+              </div>
+              <div :if="selected.calendar_invitation_events?.[index]" class="wm-invitation-calendar">
+                <p :if="selected.calendar_invitation_events[index].applied" class="wm-invitation-saved" role="status"><span class="mail-icon" data-icon="check" aria-hidden="true"></span><span :text="invite.method === 'cancel' ? 'Cancellation applied in Calendar.' : 'Saved in Calendar.'"></span></p>
+                <button :else-if="selected.calendar_invitation_events[index].target" type="button" class="wm-action" :disabled="invitationCalendarBusy || readingLoading" @click="saveInvitationCalendar(index)">
+                  <span class="mail-icon" data-icon="calendar" aria-hidden="true"></span><span :text="invite.method === 'cancel' ? 'Apply cancellation' : 'Apply to Calendar'"></span>
+                </button>
+                <button :else type="button" class="wm-action" :disabled="invitationCalendarBusy || readingLoading" @click="chooseInvitationCalendar(index)"><span class="mail-icon" data-icon="calendar" aria-hidden="true"></span>Add to Calendar</button>
+                <form :if="invitationCalendar?.index === index && invitationCalendar?.choices?.length" class="wm-invitation-destination" @submit.prevent="saveInvitationCalendar(index)">
+                  <label>Calendar <select x-model="invitationDestination"><option :for="item in invitationCalendar.choices" :key="item.id" :value="String(item.id)" :text="item.display_name || item.name"></option></select></label>
+                  <button type="submit" class="wm-action calendar-primary" :disabled="invitationCalendarBusy || !invitationDestination">Save invitation</button>
+                </form>
+                <a :if="invitationCalendar?.index === index && invitationCalendar?.choices?.length === 0" href="/calendar">Create a calendar</a>
+                <div :if="invitationCalendar?.index === index && invitationCalendar?.error" class="wm-inline-error" role="alert"><span :text="invitationCalendar.error"></span><button type="button" class="wm-action" @click="retryReader()">Refresh invitation</button></div>
               </div>
             </article>
           </section>

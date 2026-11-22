@@ -63,6 +63,7 @@ const caldav = @import("../protocol/caldav.zig");
 const calendar_import = @import("webmail_calendar_import.zig");
 const calendar_invite = @import("webmail_calendar_invite.zig");
 const calendar_events = @import("webmail_calendar_events.zig");
+const invitation_events = @import("webmail_invitation_events.zig");
 const calendar_clock = @import("../protocol/icalendar_time.zig");
 const recovery = @import("webmail_recovery.zig");
 const health = @import("webmail_health.zig");
@@ -574,6 +575,7 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.eql(u8, p, "/webmail/api/calendar-events") and std.mem.eql(u8, req.method, "GET")) return handleCalendarEvents(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-event-source") and std.mem.eql(u8, req.method, "GET")) return handleCalendarEventSource(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-rsvp") and std.mem.eql(u8, req.method, "POST")) return handleCalendarRsvp(server, conn, arena, req);
+    if (std.mem.eql(u8, p, "/webmail/api/calendar-invitation-event") and std.mem.eql(u8, req.method, "POST")) return handleInvitationEvent(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-events") and std.mem.eql(u8, req.method, "POST")) return handleCalendarEventCreate(server, conn, arena, req);
     if (std.mem.startsWith(u8, p, "/webmail/api/calendar-events/")) return handleCalendarEventItem(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-export") and std.mem.eql(u8, req.method, "GET")) return handleCalendarExport(server, conn, arena, req);
@@ -2218,6 +2220,11 @@ fn calendarWriteError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: 
         error.InvalidEventTime => sendError(conn, arena, 400, "invalid_event_time", "Enter valid times. An end must follow the start and all-day dates must be at UTC midnight"),
         error.EmptyEventEdit => sendError(conn, arena, 400, "empty_event_edit", "Provide at least one event change"),
         error.PreconditionFailed => sendError(conn, arena, 412, "event_changed", "The event changed. Reload it before saving"),
+        error.CalendarInvitationStale => sendError(conn, arena, 409, "invitation_stale", "A newer organizer revision is available."),
+        error.CalendarInvitationCancelled => sendError(conn, arena, 409, "invitation_cancelled", "The organizer cancelled this invitation."),
+        error.InvitationEventRequired => sendError(conn, arena, 409, "invitation_event_required", "Add the original invitation to Calendar first."),
+        error.InvitationScopeConflict => sendError(conn, arena, 409, "invitation_scope_conflict", "This occurrence already anchors a change to future events."),
+        error.UnsupportedTimezone, error.ConflictingTimezone => sendError(conn, arena, 422, "invitation_timezone", "This event's time zone could not be verified."),
         error.InvalidCalendar, error.NoPrimaryEvent => sendError(conn, arena, 422, "invalid_calendar_event", "This stored calendar resource has no single editable primary event"),
         error.SharedEventMustBePublic => sendError(conn, arena, 422, "shared_event_must_be_public", "Shared calendar edits must use public events"),
         error.RecurringTimeEdit => sendError(conn, arena, 422, "recurring_event_time", "Edit recurring event times through a CalDAV client"),
@@ -3144,6 +3151,57 @@ const InvitationAction = struct {
     availability: database.Database.InvitationDisposition,
 };
 
+const CalendarInvitationAction = caldav_store.CalDavStore.InvitationAction;
+
+fn handleInvitationEvent(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    if (!isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, a, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const dav = server.dav_store orelse return sendError(conn, a, 503, "calendar_unavailable", "Calendar is unavailable on this server");
+    const expected = req.header("If-Match") orelse return sendError(conn, a, 428, "revision_required", "Open the invitation before saving it.");
+    if (!isSingleStrongRevision(expected)) return sendError(conn, a, 400, "invalid_revision", "Send one strong message ETag in If-Match");
+    const request = std.json.parseFromSliceLeaky(struct {
+        reference: []const u8,
+        index: usize,
+        calendarId: ?u64 = null,
+        eventRevision: ?[]const u8 = null,
+    }, a, req.body, .{}) catch return sendError(conn, a, 400, "bad_request", "Invalid calendar invitation");
+    if (!message_refs.valid(request.reference) or request.index >= calendar_invite.max_previews)
+        return sendError(conn, a, 400, "bad_request", "Invalid invitation reference");
+    const msg = maildir.getByReference(a, server.db, sess.username, request.reference) catch |err| return mapMaildirError(conn, a, err);
+    if (!std.mem.eql(u8, msg.version.?.revision, expected)) return mapMaildirError(conn, a, error.RevisionMismatch);
+    if (!canRsvpToMessage(server, msg)) return sendError(conn, a, 403, "invitation_unavailable", "Open the invitation in a personal mailbox.");
+    const placement = try message_refs.placement(a, server.db, sess.username, request.reference);
+    const invitations = try calendar_invite.invitations(a, msg.calendar_parts, sess.email, if (placement) |source| source.verified_author else "");
+    if (request.index >= invitations.len) return sendError(conn, a, 404, "invitation_not_found", "No such calendar invitation in this message.");
+    const invite = invitations[request.index];
+    if (!invite.canTrack(sess.email)) return sendError(conn, a, 403, "invitation_unavailable", "Saving this invitation requires a verified organizer and an invitation addressed to this account.");
+    const revision = try invite.revision(a);
+    database.Database.requireCurrentCalendarInvitation(server.db, sess.username, revision) catch |err| return calendarWriteError(conn, a, err);
+    const before = dav.snapshotInvitationEvent(a, sess.username, revision.series) catch |err| return calendarWriteError(conn, a, err);
+    const reference = request.reference[0..@sizeOf(caldav_store.MessageReference)].*;
+    const data = invitation_events.prepare(a, invite, sess.email, revision, reference, before) catch |err| return calendarWriteError(conn, a, err);
+    const event = if (before) |saved| event: {
+        if (data != null and (request.eventRevision == null or !std.mem.eql(u8, request.eventRevision.?, saved.detail.event.etag)))
+            return calendarWriteError(conn, a, error.PreconditionFailed);
+        break :event caldav_store.CalDavStore.InvitationTarget{
+            .id = saved.detail.event.id,
+            .calendarId = saved.detail.calendar_id,
+            .etag = saved.detail.event.etag,
+        };
+    } else null;
+    if (data) |change| {
+        checkCalendarEventBody(server, a, dav, change.ics_data.?) catch |err| return calendarWriteError(conn, a, err);
+    }
+    const saved = dav.saveInvitationEvent(sess.username, revision, invite.preview.uid, request.calendarId, event, data) catch |err| return calendarWriteError(conn, a, err);
+    return sendRevisionJson(conn, a, if (before == null) 201 else 200, try service_mod.json(a, .{
+        .id = saved.id,
+        .calendarId = if (event) |target| target.calendarId else request.calendarId.?,
+        .etag = saved.revision.etag(),
+        .changed = data != null,
+    }), null, saved.revision.etag());
+}
+
 fn handleCalendarRsvp(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
     if (!isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
     var sess = (try requireSession(server, conn, a, req)) orelse return;
@@ -3204,17 +3262,27 @@ fn handleMessageDetail(server: *WebmailHttpServer, conn: *webmail_tls.Stream, ar
     const invitations = try calendar_invite.invitations(arena, msg.calendar_parts, sess.email, author);
     const previews = try arena.alloc(calendar_invite.Preview, invitations.len);
     const actions = try arena.alloc(?InvitationAction, invitations.len);
-    for (invitations, previews, actions) |invite, *preview, *action| {
+    const calendar_actions = try arena.alloc(?CalendarInvitationAction, invitations.len);
+    const eligible_folder = canRsvpToMessage(server, msg);
+    for (invitations, previews, actions, calendar_actions) |invite, *preview, *action, *calendar_action| {
         preview.* = invite.preview;
-        action.* = if (canRsvpToMessage(server, msg) and invite.canReply(sess.email))
-            .{
+        action.* = null;
+        calendar_action.* = null;
+        if (!eligible_folder or !invite.canTrack(sess.email)) continue;
+        const revision = try invite.revision(arena);
+        const availability = try database.Database.calendarInvitationDisposition(server.db, sess.username, revision);
+        if (invite.canReply(sess.email)) {
+            action.* = .{
                 .status = try server.service.rsvpStatus(arena, sess.username, invite),
-                .availability = try database.Database.calendarInvitationDisposition(server.db, sess.username, try invite.revision(arena)),
-            }
-        else
-            null;
+                .availability = availability,
+            };
+        }
+        if (server.dav_store) |dav| {
+            if (availability != .current) continue;
+            calendar_action.* = try dav.snapshotInvitationAction(arena, sess.username, revision);
+        }
     }
-    try writeMessageDetail(w, msg, placement, rule, workflow.status(msg.version.?.reference, "", "", "", ids), notifications, previews, actions, arena);
+    try writeMessageDetail(w, msg, placement, rule, workflow.status(msg.version.?.reference, "", "", "", ids), notifications, previews, actions, calendar_actions, arena);
     try sendRevisionJson(conn, arena, 200, body.items, null, msg.version.?.revision);
 }
 
@@ -3385,7 +3453,7 @@ fn writeMessageSummary(w: anytype, m: maildir.MessageSummary, version: ?maildir.
     try w.writeAll("}");
 }
 
-fn writeMessageDetail(w: anytype, m: maildir.MessageDetail, placement: ?message_refs.Placement, rule: ?categories.Destination, workflow: attention.Status, notifications: database.Database.NotificationRules, invitations: []const calendar_invite.Preview, rsvps: []const ?InvitationAction, a: std.mem.Allocator) !void {
+fn writeMessageDetail(w: anytype, m: maildir.MessageDetail, placement: ?message_refs.Placement, rule: ?categories.Destination, workflow: attention.Status, notifications: database.Database.NotificationRules, invitations: []const calendar_invite.Preview, rsvps: []const ?InvitationAction, calendar_actions: []const ?CalendarInvitationAction, a: std.mem.Allocator) !void {
     try w.print("{{\"uid\":{d},\"from\":", .{m.uid});
     try writeJsonString(w, m.from);
     try w.writeAll(",\"folder\":");
@@ -3436,6 +3504,8 @@ fn writeMessageDetail(w: anytype, m: maildir.MessageDetail, placement: ?message_
         try w.writeAll(try service_mod.json(a, invitations));
         try w.writeAll(",\"calendar_rsvps\":");
         try w.writeAll(try service_mod.json(a, rsvps));
+        try w.writeAll(",\"calendar_invitation_events\":");
+        try w.writeAll(try service_mod.json(a, calendar_actions));
         if (m.calendar_only) try w.writeAll(",\"calendar_only\":true");
     }
     if (placement) |source| {
