@@ -313,6 +313,11 @@ revokes existing webmail sessions.
   composition fields, including recipient labels, unfinished inputs and staged
   attachment IDs. Repeating the identical save token returns its acknowledgement;
   a stale revision returns 409. `GET /webmail/api/drafts/:id` restores metadata.
+- `GET /webmail/api/compose-library` returns the account's plain-text snippets,
+  signatures and optional `defaultSignatureId`. `PUT` replaces the library using
+  the current `revision`. A stale revision returns 409. Webmail inserts the
+  default signature into new compositions, including replies and forwards,
+  and keeps the resulting text in saved drafts and scheduled messages.
 - `POST /webmail/api/uploads?filename=...&contentType=...&uploadId=...` stages
   raw bytes. Repeating an ID and identical content succeeds; different content
   conflicts. `DELETE /webmail/api/uploads/:id` removes an unused owned upload.

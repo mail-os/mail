@@ -41,6 +41,7 @@ const personal = @import("webmail_private.zig");
 const security = @import("../auth/security.zig");
 const core_config = @import("../core/config.zig");
 const compose = @import("webmail_compose.zig");
+const compose_library = @import("webmail_compose_library.zig");
 const webmail_tls = @import("webmail_tls.zig");
 const io_compat = @import("../core/io_compat.zig");
 const tls = @import("tls");
@@ -510,6 +511,8 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.eql(u8, p, "/webmail/api/health") and std.mem.eql(u8, req.method, "GET")) return handleHealth(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/config") and std.mem.eql(u8, req.method, "GET")) return handleClientConfig(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/preferences") and std.mem.eql(u8, req.method, "PUT")) return handlePreferences(server, conn, arena, req);
+    if (std.mem.eql(u8, p, "/webmail/api/compose-library") and
+        (std.mem.eql(u8, req.method, "GET") or std.mem.eql(u8, req.method, "PUT"))) return handleComposeLibrary(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/sender-review/status") and std.mem.eql(u8, req.method, "GET")) return handleSenderReviewStatus(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/sender-review") and std.mem.eql(u8, req.method, "GET")) return handleSenderReviewList(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/sender-review") and std.mem.eql(u8, req.method, "PUT")) return handleSenderReviewSettings(server, conn, arena, req);
@@ -1510,6 +1513,27 @@ fn handlePreferences(server: *WebmailHttpServer, conn: *webmail_tls.Stream, aren
     };
     _ = try store.put(server.db, .{ .username = sess.username, .kind = "preferences", .id = "settings", .payload = try service_mod.json(arena, parsed.value), .state = "saved", .revision = 0, .due_at = 0, .expires_at = 0 }, if (previous) |row| row.revision else 0);
     return sendJson(conn, arena, 200, "{\"ok\":true}", null);
+}
+
+fn handleComposeLibrary(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
+    const editing = std.mem.eql(u8, req.method, "PUT");
+    if (editing and !isSameOrigin(req)) return sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    if (!editing) {
+        const library = compose_library.load(arena, server.db, sess.username) catch |err| return mapServiceError(conn, arena, err);
+        return sendJson(conn, arena, 200, try service_mod.json(arena, library), null);
+    }
+    if (req.body.len > compose_library.max_bytes)
+        return sendError(conn, arena, 400, "invalid_compose_library", "Writing tools can use up to 128 KiB.");
+    const requested = std.json.parseFromSliceLeaky(compose_library.Library, arena, req.body, .{}) catch
+        return sendError(conn, arena, 400, "invalid_compose_library", "Check the writing tools data.");
+    const library = compose_library.save(arena, server.db, sess.username, requested) catch |err| switch (err) {
+        error.InvalidComposeLibrary => return sendError(conn, arena, 400, "invalid_compose_library", "Check your snippet and signature names, text, and default signature."),
+        store.StoreError.Conflict => return sendError(conn, arena, 409, "compose_library_changed", "Writing tools changed in another window. Reload before saving."),
+        else => return mapServiceError(conn, arena, err),
+    };
+    return sendJson(conn, arena, 200, try service_mod.json(arena, library), null);
 }
 
 fn handleUpload(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {

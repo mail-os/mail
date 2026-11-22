@@ -52,6 +52,9 @@ const {
   savingRecovery, saveRecovery,
   forwarding, forwardingAddress, forwardingPassword, forwardingCode, forwardingBusy, forwardingError, forwardingNotice, changeForwarding,
   vacation, vacationEnabled, vacationSubject, vacationBody, vacationStart, vacationEnd, vacationBusy, vacationError, vacationNotice, saveVacationSettings,
+  writingLibrary, writingKind, writingId, writingName, writingText, writingBusy, writingError, writingNotice, writingEntries,
+  chooseWritingKind, editWritingEntry, loadWritingLibrary, saveWritingEntry, removeWritingEntry, changeDefaultSignature,
+  snippetChoice, signatureChoice, insertSnippet, insertSignature,
   toRecipients, ccRecipients, bccRecipients, toInput, ccInput, bccInput, recipientFocus, suggestions,
   suggestionIndex, recipientSearching, recipientErrors, lookup, chooseContact, removeRecipient,
   editRecipient, recipientKeydown, recipientBlur, attachments, dragging, attachmentBytes,
@@ -461,6 +464,19 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       <label for="composeSubject">Subject</label><input id="composeSubject" type="text" x-model="subject" :disabled="sending || sendUncertain" maxlength="500">
     </div>
     <textarea class="wm-composer-body" x-model="body" :disabled="sending || sendUncertain" aria-label="Message body" placeholder="Write your message…"></textarea>
+    <details :if="writingLibrary?.snippets.length || writingLibrary?.signatures.length" class="wm-writing-insert">
+      <summary>Writing tools</summary>
+      <div :if="writingLibrary?.snippets.length" class="wm-writing-control">
+        <label for="composeSnippet">Snippet</label>
+        <select id="composeSnippet" x-model="snippetChoice" :disabled="sending || sendUncertain"><option value="">Choose…</option><option :for="entry in writingLibrary.snippets" :key="entry.id" :value="entry.id" :text="entry.name"></option></select>
+        <button type="button" class="wm-action" @click="insertSnippet()" :disabled="!snippetChoice || sending || sendUncertain"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span>Insert snippet</button>
+      </div>
+      <div :if="writingLibrary?.signatures.length" class="wm-writing-control">
+        <label for="composeSignature">Signature</label>
+        <select id="composeSignature" x-model="signatureChoice" :disabled="sending || sendUncertain"><option value="">Choose…</option><option :for="entry in writingLibrary.signatures" :key="entry.id" :value="entry.id" :text="entry.name"></option></select>
+        <button type="button" class="wm-action" @click="insertSignature()" :disabled="!signatureChoice || sending || sendUncertain"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span>Insert signature</button>
+      </div>
+    </details>
     <label :if="replyContext?.reference" class="wm-reply-clear"><input type="checkbox" x-model="clearFollowUp" :disabled="sending || sendUncertain">Clear Follow-up after successful delivery</label>
     <div class="wm-dropzone" :class="{ 'wm-dropzone--active': dragging }" @dragover.prevent="dragging.set(true)" @dragleave="dragging.set(false)" @drop.prevent="dropAttachments($event)">
       <label class="wm-action"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span>Add attachments<input ref="fileInput" class="wm-file-input" type="file" multiple aria-label="Add attachments" @change="attachFiles()" :disabled="sending || attachmentUploading || limits.maxCount === 0"></label><span>or drop files here</span><small :text="readableBytes(attachmentBytes()) + ' used · ' + readableBytes(attachmentRemaining()) + ' remaining'"></small>
@@ -493,6 +509,40 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
   <p :if="accountChangeError" class="login-error" role="alert" :text="accountChangeError"></p>
 </header>
 <div class="login wm-account-settings">
+<section class="login-recovery wm-writing-settings" aria-labelledby="writingHeading">
+  <h2 id="writingHeading"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span>Writing tools</h2>
+  <div class="wm-private-tabs" role="group" aria-label="Writing tool type">
+    <button type="button" class="wm-action" :aria-pressed="writingKind === 'snippets'" @click="chooseWritingKind('snippets')" :disabled="writingBusy">Snippets</button>
+    <button type="button" class="wm-action" :aria-pressed="writingKind === 'signatures'" @click="chooseWritingKind('signatures')" :disabled="writingBusy">Signatures</button>
+  </div>
+  <p :if="writingBusy && !writingLibrary" role="status" class="login-sub">Loading writing tools…</p>
+  <p :if="writingNotice" role="status" class="login-sub" :text="writingNotice"></p>
+  <p :if="writingError" role="alert" class="login-error" :text="writingError"></p>
+  <button :if="writingError" type="button" class="wm-action" @click="loadWritingLibrary(true)" :disabled="writingBusy">Reload writing tools</button>
+  <div :if="writingLibrary" class="wm-writing-grid">
+    <div class="wm-writing-list">
+      <ul :if="writingEntries.length" class="wm-writing-entries">
+        <li :for="entry in writingEntries" :key="entry.id" class="wm-writing-row">
+          <button type="button" class="wm-action wm-writing-entry" :aria-pressed="writingId === entry.id" @click="editWritingEntry(entry)" :disabled="writingBusy"><span class="mail-icon" data-icon="document" aria-hidden="true"></span><span :text="entry.name"></span></button>
+          <button type="button" class="wm-action wm-action--danger wm-writing-remove" @click="removeWritingEntry(entry.id)" :disabled="writingBusy" :aria-label="'Remove ' + entry.name" :title="'Remove ' + entry.name"><span class="mail-icon" data-icon="trash" aria-hidden="true"></span></button>
+        </li>
+      </ul>
+      <p :if="writingEntries.length === 0" class="login-sub" :text="writingKind === 'snippets' ? 'No saved snippets.' : 'No saved signatures.'"></p>
+      <label :if="writingKind === 'signatures' && writingLibrary.signatures.length" for="writingDefault">Default signature</label>
+      <select :if="writingKind === 'signatures' && writingLibrary.signatures.length" id="writingDefault" :value="writingLibrary.defaultSignatureId || ''" @change="changeDefaultSignature($event)" :disabled="writingBusy">
+        <option value="">None</option><option :for="entry in writingLibrary.signatures" :key="entry.id" :value="entry.id" :text="entry.name"></option>
+      </select>
+    </div>
+    <form class="wm-private-form" @submit.prevent="saveWritingEntry()">
+      <label for="writingName">Name</label><input id="writingName" type="text" x-model="writingName" maxlength="80" required :disabled="writingBusy">
+      <label for="writingText" :text="writingKind === 'snippets' ? 'Snippet text' : 'Signature text'"></label><textarea id="writingText" x-model="writingText" rows="3" :maxlength="writingKind === 'snippets' ? 8192 : 4096" required :disabled="writingBusy"></textarea>
+      <div class="wm-private-actions">
+        <button type="submit" class="wm-action wm-writing-save" :disabled="writingBusy || !writingName.trim() || !writingText.trim()" :text="writingKind === 'snippets' ? 'Save snippet' : 'Save signature'"></button>
+        <button :if="writingId" type="button" class="wm-action" @click="editWritingEntry()" :disabled="writingBusy"><span class="mail-icon" data-icon="plus" aria-hidden="true"></span>New entry</button>
+      </div>
+    </form>
+  </div>
+</section>
 <form class="login-recovery" @submit.prevent="changePassword()"><h2>Change password</h2><p class="login-sub">Updates your webmail, SMTP and IMAP credentials.</p><label for="currentPassword">Current password</label><input id="currentPassword" type="password" x-model="currentPassword" autocomplete="current-password" required><label for="newPassword">New password</label><input id="newPassword" type="password" x-model="newPassword" autocomplete="new-password" minlength="12" required><label for="confirmPassword">Confirm password</label><input id="confirmPassword" type="password" x-model="confirmPassword" autocomplete="new-password" minlength="12" required><p :if="passwordError" role="alert" class="login-error" :text="passwordError"></p><button type="submit" :disabled="savingPassword" :text="savingPassword ? 'Saving…' : 'Change password'"></button></form>
 <form class="login-recovery" aria-labelledby="recoveryHeading" @submit.prevent="saveRecovery()"><h2 id="recoveryHeading">Recovery address</h2><p class="login-sub" :if="recoveryLoading">Loading…</p><p class="login-sub" :if="!recoveryLoading && recoveryAddress">Password reset links go to <strong :text="recoveryAddress"></strong><span :if="recoverySetBy === 'operator'"> (set by your mail administrator)</span>.</p><p class="login-sub" :if="!recoveryLoading && !recoveryAddress">None set. Without one, a forgotten password can only be reset by your mail administrator.</p><label for="recoveryInput">Recovery email</label><input id="recoveryInput" type="email" x-model.trim="recoveryInput" autocomplete="email" placeholder="you@another-provider.com"><label for="recoveryPassword">Current password</label><input id="recoveryPassword" type="password" x-model="recoveryPassword" autocomplete="current-password"><p :if="recoveryError" role="alert" class="login-error" :text="recoveryError"></p><p :if="recoveryNotice" role="status" class="login-sub" :text="recoveryNotice"></p><button type="submit" class="login-secondary" :disabled="savingRecovery || recoveryLoading" :text="savingRecovery ? 'Saving…' : 'Save recovery address'"></button></form>
 <section class="login-recovery wm-forwarding" aria-labelledby="forwardingHeading">

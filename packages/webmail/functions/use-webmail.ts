@@ -16,6 +16,7 @@ import { useSenderReview } from './use-sender-review'
 import { useMailNotifications } from './use-mail-notifications'
 import { usePrivateMail } from './use-private-mail'
 import { useAddressBook } from './use-address-book'
+import { useComposeLibrary } from './use-compose-library'
 
 interface Ref<T> { current: T | null }
 const categoryFolders = ['Newsletters', 'Receipts']
@@ -156,6 +157,9 @@ export function useWebmail(ports: WebmailPorts) {
   const title = state('New message')
   const subject = state('')
   const body = state('')
+  const automaticSignature = state('')
+  const snippetChoice = state('')
+  const signatureChoice = state('')
   const draftHtml = state('')
   const initialText = state('')
   const inReplyTo = state('')
@@ -212,6 +216,7 @@ export function useWebmail(ports: WebmailPorts) {
     contactBook.closeContacts()
     forwardingSettings.clearForwarding()
     vacationSettings.clearVacationSettings()
+    writing.clearWritingLibrary()
     privateMail.privateCollections.set([])
     draft.destroy()
     resetComposition()
@@ -241,6 +246,7 @@ export function useWebmail(ports: WebmailPorts) {
     else if (!user()) ports.navigate('/login', { reload: true })
   }
   const api = createMailApi(() => user()?.username, onAuthError, () => !destroyed)
+  const writing = useComposeLibrary(api)
   const notifications = useMailNotifications(api, () => user()?.username)
   const senderReview = useSenderReview(api)
   const privateMail = usePrivateMail(api, selected)
@@ -261,10 +267,13 @@ export function useWebmail(ports: WebmailPorts) {
     contactBook.contactsBusy.set(true)
     try {
       if (hasComposition()) await draft.flushAll()
+      await writing.loadWritingLibrary()
+      if (destroyed || !user() || authExpired()) return
       contactBook.closeContacts()
       resetComposition()
       recipientEditor.restore({ to: addresses, cc: [], bcc: [] }, { to: '', cc: '', bcc: '' })
       title.set('New message')
+      applyDefaultSignature()
       showComposer()
     }
     catch (cause) { contactBook.contactsError.set(errorMessage(cause)) }
@@ -281,7 +290,7 @@ export function useWebmail(ports: WebmailPorts) {
   const attachmentEditor = useAttachments(() => user()?.username, limits, cause => {
     if (cause instanceof MailApiError && (cause.status === 401 || cause.code === 'account_changed')) onAuthError(cause)
   }, id => api(`/webmail/api/uploads/${id}`, { method: 'DELETE' }))
-  const hasComposition = derived(() => Boolean(subject() || body() || draftHtml() || attachmentEditor.attachments().length || recipientEditor.toRecipients().length || recipientEditor.ccRecipients().length || recipientEditor.bccRecipients().length || recipientEditor.toInput() || recipientEditor.ccInput() || recipientEditor.bccInput()))
+  const hasComposition = derived(() => Boolean(subject() || (body() && body() !== automaticSignature()) || draftHtml() || attachmentEditor.attachments().length || recipientEditor.toRecipients().length || recipientEditor.ccRecipients().length || recipientEditor.bccRecipients().length || recipientEditor.toInput() || recipientEditor.ccInput() || recipientEditor.bccInput()))
   function selectedSchedule(): number | null {
     if (!scheduleOpen()) return null
     try { return localDeadline(scheduleDate(), -Infinity) }
@@ -1102,6 +1111,9 @@ export function useWebmail(ports: WebmailPorts) {
       recipientEditor.restore({ to: [], cc: [], bcc: [] }, { to: '', cc: '', bcc: '' })
       attachmentEditor.restore([])
       scheduleOpen.set(false); scheduleDate.set('')
+      automaticSignature.set('')
+      snippetChoice.set('')
+      signatureChoice.set('')
       if (!destroyed) draft.restore(null, content())
       lastQueuedPayload = null
       sendUncertain.set(false)
@@ -1118,6 +1130,9 @@ export function useWebmail(ports: WebmailPorts) {
     try { if (hasComposition()) await draft.flushAll() }
     catch (cause) { composeError.set(errorMessage(cause)); showComposer(); return }
     const original = selected()
+    await writing.loadWritingLibrary()
+    if (destroyed || !user() || authExpired()) return
+    if (mode === 'new' && composing()) return
     resetComposition()
     if (mode !== 'new' && original) {
       const own = user()?.email.toLowerCase()
@@ -1140,8 +1155,49 @@ export function useWebmail(ports: WebmailPorts) {
       if (mode === 'forward') void importAttachments(original)
     }
     else title.set('New message')
+    applyDefaultSignature()
     showComposer()
   }
+  function applyDefaultSignature(): void {
+    const library = writing.writingLibrary()
+    const signature = library?.signatures.find(entry => entry.id === library.defaultSignatureId)
+    if (signature) {
+      const block = separatorSignature(signature.text)
+      if (!body()) automaticSignature.set(block)
+      body.set(block + body())
+    }
+  }
+  function composeBody(): HTMLTextAreaElement | null {
+    return ports.composer.current?.querySelector<HTMLTextAreaElement>('.wm-composer-body') ?? null
+  }
+  function focusComposeBody(position: number): void {
+    ports.nextTick(() => {
+      const editor = composeBody()
+      editor?.focus()
+      editor?.setSelectionRange(position, position)
+    })
+  }
+  function insertSnippet(): void {
+    const snippet = writing.writingLibrary()?.snippets.find(entry => entry.id === snippetChoice())
+    if (!snippet || sending() || sendUncertain()) return
+    const editor = composeBody()
+    const start = editor?.selectionStart ?? body().length
+    const end = editor?.selectionEnd ?? start
+    const text = snippet.text.replace(/\r\n?/g, '\n')
+    body.set(body().slice(0, start) + text + body().slice(end))
+    snippetChoice.set('')
+    focusComposeBody(start + text.length)
+  }
+  function insertSignature(): void {
+    const signature = writing.writingLibrary()?.signatures.find(entry => entry.id === signatureChoice())
+    if (!signature || sending() || sendUncertain()) return
+    const block = separatorSignature(signature.text)
+    const current = body()
+    if (!current.endsWith(block) && !current.includes(block + '\n')) body.set(current + block)
+    signatureChoice.set('')
+    focusComposeBody(body().length)
+  }
+  function separatorSignature(text: string): string { return '\n\n-- \n' + text.replace(/\r\n?/g, '\n') }
   async function importAttachments(message: MessageDetail): Promise<void> {
     try {
       await attachmentEditor.addRemoteFiles(message.attachments.map((item, index) => ({
@@ -1490,6 +1546,7 @@ export function useWebmail(ports: WebmailPorts) {
     void recoverySettings.loadRecovery()
     void forwardingSettings.loadForwarding()
     void vacationSettings.loadVacationSettings()
+    void writing.loadWritingLibrary(true)
     void loadSortingSettings()
     void notifications.loadNotificationSettings().catch(() => {})
     ports.nextTick(() => { if (!ports.password.current?.open) ports.password.current?.showModal() })
@@ -1531,6 +1588,7 @@ export function useWebmail(ports: WebmailPorts) {
       user.set(result.user)
       const config = await api<MailLimits>('/webmail/api/config')
       limits.set(config); sendDelay.set(config.undoSendSeconds)
+      void writing.loadWritingLibrary()
       await Promise.all([refresh(), refreshOutbox()])
       void notifications.loadNotificationSettings().catch(() => {})
       void privateMail.loadPrivateCollections()
@@ -1556,7 +1614,7 @@ export function useWebmail(ports: WebmailPorts) {
   function preventUnload(event: BeforeUnloadEvent): void { if (hasUnsavedChanges()) { event.preventDefault(); event.returnValue = '' } }
   function destroy(): void { destroyed = true; ++listRequest; ++messageRequest; recipientEditor.destroy(); attachmentEditor.destroy(); draft.destroy(); privateMail.closePrivate(); contactBook.closeContacts(); selectionEffect() }
   return { user, folders, folder, messages, threads, expandedThreads, selected, loading, refreshing, listError, readerError, readerTarget, reading, readingLoading, mutating, error, notice, query, activeQuery, appliedSearchAll, filterLocation, filterSender, filterRecipient, filterFilename, libraryView, libraryFiles, indexProgress, filterAfter, filterBefore, filterStatus, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, formattedReader, remoteImagesAllowed, checked, checkedKeys, selectedCount, isJunkFolder, readerJunkAction, selectionJunkAction, allChecked, someChecked, undoAction, undoRemaining, readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts, pendingSend, sendRemaining, outbox, outboxCount, outboxCounts, outboxSection, outboxViews, outboxEmpty, outboxPageNumber, outboxNext, outboxLoading, outboxError, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...senderReview, ...notifications, ...privateMail, ...contactBook, showContacts, composeSavedCard, collectionView, collectionId, canOpenPrivate,
-    showCollectionManager, closeCollectionManager, selectCollection, confirmCollectionDeletion, savePrivateLabel, setPrivateMembership, groupSelected, displaySubject, changeNotificationRule, ...recipientEditor, ...attachmentEditor, ...recoverySettings, ...forwardingSettings, ...vacationSettings, attentionViews, attentionView, followUpFocused, attentionSaving, attentionSchedule, attentionDate, attentionZone, dueReminders, replyContext, clearFollowUp, selectAttention, nextFollowUp, changeAttention, startAttentionSchedule, saveAttentionSchedule, deadlineLabel, categoryList, newsletterExpanded, readerExpanded, receiptFull, receiptCompact, receiptPreview, senderLabel, sortingSettings, sortingSaving, sortingError, toggleAutomaticSorting, placementText, categoryRule, categoryRuleSaving, saveCategoryRule, showSenderReview, openReviewMessage, reviewMessage, refresh, loadMessages, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread, toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, openAttachmentMessage, showAttachmentLibrary, retryReader, closeReader, nextUnread, readSelection, advanceBatch, triageAndNext, bulkAction, selectedAction, undoLastAction, showShortcuts, closeShortcuts, handleShortcut, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments, saveSendPreference, send, confirmPendingSend, showOutbox, refreshOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword, showConfirmation, confirmAction, saveDraftCopy: draft.saveCopy, mount, resume, tick, preventUnload, destroy, messageIdentity, messagePageSize, folderName, shortDate, fullDate, readableBytes, attachmentPath }
+    showCollectionManager, closeCollectionManager, selectCollection, confirmCollectionDeletion, savePrivateLabel, setPrivateMembership, groupSelected, displaySubject, changeNotificationRule, ...recipientEditor, ...attachmentEditor, ...recoverySettings, ...forwardingSettings, ...vacationSettings, ...writing, snippetChoice, signatureChoice, insertSnippet, insertSignature, attentionViews, attentionView, followUpFocused, attentionSaving, attentionSchedule, attentionDate, attentionZone, dueReminders, replyContext, clearFollowUp, selectAttention, nextFollowUp, changeAttention, startAttentionSchedule, saveAttentionSchedule, deadlineLabel, categoryList, newsletterExpanded, readerExpanded, receiptFull, receiptCompact, receiptPreview, senderLabel, sortingSettings, sortingSaving, sortingError, toggleAutomaticSorting, placementText, categoryRule, categoryRuleSaving, saveCategoryRule, showSenderReview, openReviewMessage, reviewMessage, refresh, loadMessages, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread, toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, openAttachmentMessage, showAttachmentLibrary, retryReader, closeReader, nextUnread, readSelection, advanceBatch, triageAndNext, bulkAction, selectedAction, undoLastAction, showShortcuts, closeShortcuts, handleShortcut, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments, saveSendPreference, send, confirmPendingSend, showOutbox, refreshOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword, showConfirmation, confirmAction, saveDraftCopy: draft.saveCopy, mount, resume, tick, preventUnload, destroy, messageIdentity, messagePageSize, folderName, shortDate, fullDate, readableBytes, attachmentPath }
 }
 
 function errorMessage(cause: unknown): string { return cause instanceof Error ? cause.message : 'Something went wrong. Please try again.' }
