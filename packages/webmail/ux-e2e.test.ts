@@ -72,7 +72,9 @@ test.skipIf(!enabled)('binary uploads exceed the old cap and retain exact bytes 
   expect((await replay.json() as any).uploadId).toBe(uploadId)
   const changed = data.slice()
   changed[0] = 255
-  expect((await fetch(uploadUrl, { method: 'POST', headers: uploadHeaders, body: changed })).status).toBe(409)
+  const conflict = await fetch(uploadUrl, { method: 'POST', headers: uploadHeaders, body: changed })
+  expect(conflict.status).toBe(409)
+  expect(await conflict.json()).toMatchObject({ error: 'upload_changed' })
   const saved = await api.json('/webmail/api/drafts', 'POST', { draftId: crypto.randomUUID(), saveToken: crypto.randomUUID(), subject: `UX binary ${crypto.randomUUID()}`, text: 'Binary test', attachments: [{ uploadId: item.uploadId }] })
   const detail = await api.json(`/webmail/api/messages/${saved.uid}?folder=Drafts`)
   expect(detail.attachments[0].size).toBe(count)
