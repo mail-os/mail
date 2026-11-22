@@ -586,14 +586,18 @@ async function invitationJourney(page, phone = false) {
   if (phone) {
     await invitation.getByText('Acceptance sent.', { exact: true }).waitFor()
     assert(await button(actions, 'Accept').isDisabled(), 'The earlier decision is visible in a second session')
-    if (engine === 'firefox') await button(actions, 'Tentative').click()
-    else await button(actions, 'Tentative').tap()
-    await invitation.getByText('Tentative response sent.', { exact: true }).waitFor()
   }
-  else {
-    await button(actions, 'Accept').press('Enter')
-    await invitation.getByText('Acceptance sent.', { exact: true }).waitFor()
-  }
+  // Marking an invitation read changes its ETag. Wait for the reader to
+  // apply the new revision and re-enable the controls before pressing Enter.
+  const action = button(actions, phone ? 'Tentative' : 'Accept').and(page.locator(':enabled'))
+  await action.waitFor()
+  const [queued] = await Promise.all([
+    page.waitForResponse(response => response.request().method() === 'POST'
+      && new URL(response.url()).pathname === '/webmail/api/calendar-rsvp'),
+    phone ? (engine === 'firefox' ? action.click() : action.tap()) : action.press('Enter'),
+  ])
+  assert.equal(queued.status(), 200)
+  await invitation.getByText(phone ? 'Tentative response sent.' : 'Acceptance sent.', { exact: true }).waitFor()
   await fitsViewport(page)
   await screenshot(page, phone ? 'phone-calendar-rsvp' : 'desktop-calendar-rsvp')
 }
