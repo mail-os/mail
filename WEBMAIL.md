@@ -1247,6 +1247,34 @@ deferred deploy above.
 **Acceptance**
 - Lighthouse/a11y baseline met; E2E suite green; usable one-handed on mobile.
 
+### Native indexed search benchmark
+
+Build the Mail binary in ReleaseSafe or ReleaseFast and use the same build
+mode, machine, and filesystem for both sides of a comparison.
+
+```bash
+python3 scripts/benchmark-webmail-search.py /path/to/baseline-mail \
+  --revision <baseline-commit> --output /tmp/mail-search-baseline.json
+python3 scripts/benchmark-webmail-search.py /path/to/candidate-mail \
+  --revision <candidate-commit> --output /tmp/mail-search-candidate.json \
+  --baseline-report /tmp/mail-search-baseline.json --enforce
+```
+
+The fixture uses seed 71, 50,000 messages in Inbox and Archive, and
+certificate-verified HTTPS on loopback. It verifies reference search counts
+before recording first-page latency for rare terms, common terms, empty
+results, and sender-filtered conversations. It records the cold indexing run
+separately. Each case discards two warmups and uses nearest-rank p95 over 20
+samples. The `mail-list` Server-Timing duration measures the server handler
+through JSON serialization, including authentication work. HTTPS duration
+also includes transport and provides an upper bound for older binaries.
+
+`--enforce` requires warm server p95 at or below 1,000 ms in each case. With a
+baseline report it also requires HTTPS p95 within 10% of that report for the
+same fixture and environment. Main-branch CI publishes the results alongside
+the native benchmark artifact. Use a disposable host with an idle workload to
+record release-to-release baselines.
+
 ---
 
 ## API Contract (draft)

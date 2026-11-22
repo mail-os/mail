@@ -257,6 +257,17 @@ fn preassignUids(db: *database.Database, user: []const u8, folder: []const u8, r
     }
 }
 
+fn syncFolderUids(a: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, refs: []const FileRef) !?[]i64 {
+    if (refs.len == 0) return &.{};
+    const names = try a.alloc([]const u8, refs.len);
+    defer a.free(names);
+    for (refs, names) |ref, *name| name.* = ref.name;
+    return db.syncMailboxUids(a, user, folder, names) catch {
+        preassignUids(db, user, folder, refs);
+        return null;
+    };
+}
+
 /// List visible standard and custom folders with total and unread counts.
 pub fn listFolders(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, junk_folder: []const u8) ![]FolderInfo {
     var out: std.ArrayList(FolderInfo) = .empty;
@@ -524,7 +535,7 @@ pub fn queryMessages(allocator: std.mem.Allocator, db: *database.Database, user:
         if (options.unread_queue and std.ascii.eqlIgnoreCase(folder, "Drafts")) continue;
         _ = try db.getOrCreateMailbox(user, folder);
         const refs = try collectFiles(allocator, user, folder);
-        preassignUids(db, user, folder, refs);
+        const uids = try syncFolderUids(allocator, db, user, folder, refs);
         for (refs, 0..) |ref, index| {
             const basename = database.maildirBaseName(ref.name);
             if (options.attention_view) |kind| {
@@ -565,7 +576,7 @@ pub fn queryMessages(allocator: std.mem.Allocator, db: *database.Database, user:
                 (options.query.len == 0 or matchesQuery(headers, body, options.query));
             if (!matches and !options.include_context) continue;
             try rows.append(allocator, .{
-                .uid = uidFor(db, user, folder, ref.name, @intCast(index + 1)),
+                .uid = if (uids) |assigned| assigned[index] else uidFor(db, user, folder, ref.name, @intCast(index + 1)),
                 .folder = try allocator.dupe(u8, folder),
                 .from = try allocator.dupe(u8, headers.from),
                 .to = try allocator.dupe(u8, headers.to),
@@ -617,17 +628,18 @@ fn queryIndexed(a: std.mem.Allocator, db: *database.Database, user: []const u8, 
         // File names and their UIDs must be assigned in IMAP order. The
         // catalogue uses the same folder and Maildir basename as webmail.
         const refs = try collectFiles(a, user, folder);
-        preassignUids(db, user, folder, refs);
+        const uids = try syncFolderUids(temporary, db, user, folder, refs);
         var cached = try search_index.load(temporary, db, user, folder, options.query);
         var live = std.StringHashMap(void).init(temporary);
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
         for (refs, 0..) |ref, index| {
             const basename = database.maildirBaseName(ref.name);
             try live.put(basename, {});
             if (options.attention_view) |kind| {
                 if (!options.attention_snapshot.?.mayContain(kind, folder, basename)) continue;
             }
-            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            defer scratch.deinit();
+            _ = scratch.reset(.retain_capacity);
             const work = scratch.allocator();
             const path = try std.fmt.allocPrint(work, "{s}/{s}", .{ ref.dir, ref.name });
             const identity = message_refs.fileFingerprint(work, path) catch |err| switch (err) {
@@ -687,7 +699,7 @@ fn queryIndexed(a: std.mem.Allocator, db: *database.Database, user: []const u8, 
                 file.content_type = try a.dupe(u8, file.content_type);
             }
             try rows.append(a, .{
-                .uid = uidFor(db, user, folder, ref.name, @intCast(index + 1)),
+                .uid = if (uids) |assigned| assigned[index] else uidFor(db, user, folder, ref.name, @intCast(index + 1)),
                 .folder = folder,
                 .from = try a.dupe(u8, doc.sender),
                 .to = try a.dupe(u8, doc.recipient),

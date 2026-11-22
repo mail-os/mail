@@ -37,14 +37,18 @@ pub const Progress = struct {
 };
 
 pub fn load(a: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, query: []const u8) !std.StringHashMap(Document) {
-    // Bind one quoted literal. Narrow matches through FTS where trigram has
-    // enough input, and retain the previous ASCII substring semantics.
+    // Collect the folder's FTS candidates once. Filtering the FTS cursor
+    // by every document rowid repeats the same trigram search per message.
     const literal = try ftsLiteral(a, query);
     const stmt = try db.prepare(
         \\SELECT basename,fingerprint,digest,sender,recipient,cc,bcc,subject,sent_date,message_id,in_reply_to,reply_chain,snippet,attachment_metadata,
         \\ CASE WHEN ?3='' THEN 1
-        \\      WHEN ?4<>'' AND NOT EXISTS(SELECT 1 FROM webmail_search_text
-        \\            WHERE rowid=d.id AND webmail_search_text MATCH ?4) THEN 0
+        \\      WHEN ?4<>'' AND d.id NOT IN (
+        \\          SELECT webmail_search_text.rowid FROM webmail_search_text
+        \\          CROSS JOIN webmail_search_docs m ON m.id=webmail_search_text.rowid
+        \\          WHERE webmail_search_text MATCH ?4
+        \\          AND m.user_id=(SELECT id FROM users WHERE username=?1) AND m.folder=?2
+        \\      ) THEN 0
         \\      ELSE instr(lower(sender),lower(?3))>0 OR instr(lower(recipient),lower(?3))>0
         \\        OR instr(lower(cc),lower(?3))>0 OR instr(lower(bcc),lower(?3))>0
         \\        OR instr(lower(subject),lower(?3))>0 OR instr(lower(body_text),lower(?3))>0

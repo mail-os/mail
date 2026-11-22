@@ -350,8 +350,15 @@ jobs:
           echo '{"note": "benchmark binary not found"}' > benchmark-results.json
         fi
 
+    - name: Verify indexed webmail latency
+      timeout-minutes: 10
+      run: python3 ../../scripts/benchmark-webmail-search.py zig-out/bin/mail --revision "$GITHUB_SHA" --output webmail-search-results.json --enforce
+
     - name: Upload benchmark results
+      if: ${{ !cancelled() }}
       uses: actions/upload-artifact@v4
       with:
         name: benchmark-results
-        path: packages/zig/benchmark-results.json
+        path: |
+          packages/zig/benchmark-results.json
+          packages/zig/webmail-search-results.json

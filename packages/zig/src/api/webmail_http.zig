@@ -2923,6 +2923,8 @@ fn writeSearchIndex(w: anytype, progress: search_index.Progress) !void {
 }
 
 fn handleMessageList(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
+    const io = io_compat.getIo();
+    const started = std.Io.Clock.awake.now(io);
     var sess = (try requireSession(server, conn, arena, req)) orelse return;
     defer sess.deinit(server.allocator);
 
@@ -3008,7 +3010,9 @@ fn handleMessageList(server: *WebmailHttpServer, conn: *webmail_tls.Stream, aren
         try w.writeAll("]}");
     };
     try w.writeAll("]}");
-    try sendJson(conn, arena, 200, body.items, null);
+    const elapsed = std.Io.Clock.awake.now(io).nanoseconds - started.nanoseconds;
+    const elapsed_ms = @as(f64, @floatFromInt(elapsed)) / std.time.ns_per_ms;
+    try sendJsonWithHeaders(conn, arena, 200, body.items, .{ .list_duration_ms = elapsed_ms });
 }
 
 fn handleAttachmentLibrary(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
@@ -3743,6 +3747,16 @@ fn sendJson(conn: *webmail_tls.Stream, arena: std.mem.Allocator, status: u16, js
 }
 
 fn sendRevisionJson(conn: *webmail_tls.Stream, arena: std.mem.Allocator, status: u16, json_body: []const u8, set_cookie: ?[]const u8, etag: ?[]const u8) !void {
+    return sendJsonWithHeaders(conn, arena, status, json_body, .{ .set_cookie = set_cookie, .etag = etag });
+}
+
+const JsonHeaders = struct {
+    set_cookie: ?[]const u8 = null,
+    etag: ?[]const u8 = null,
+    list_duration_ms: ?f64 = null,
+};
+
+fn sendJsonWithHeaders(conn: *webmail_tls.Stream, arena: std.mem.Allocator, status: u16, json_body: []const u8, headers: JsonHeaders) !void {
     var resp: std.ArrayList(u8) = .empty;
     const w = jw(&resp, arena);
     try w.print("HTTP/1.1 {d} {s}\r\n", .{ status, statusText(status) });
@@ -3750,8 +3764,9 @@ fn sendRevisionJson(conn: *webmail_tls.Stream, arena: std.mem.Allocator, status:
     try w.print("Content-Length: {d}\r\n", .{json_body.len});
     try w.writeAll("Cache-Control: no-store\r\n");
     try w.writeAll("X-Content-Type-Options: nosniff\r\n");
-    if (etag) |tag| try w.print("ETag: {s}\r\n", .{tag});
-    if (set_cookie) |c| {
+    if (headers.etag) |tag| try w.print("ETag: {s}\r\n", .{tag});
+    if (headers.list_duration_ms) |ms| try w.print("Server-Timing: mail-list;dur={d:.2}\r\n", .{ms});
+    if (headers.set_cookie) |c| {
         try w.print("Set-Cookie: {s}\r\n", .{c});
     }
     try w.writeAll("Connection: close\r\n\r\n");
