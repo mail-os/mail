@@ -296,6 +296,52 @@ send delay 0–30 seconds. Effective attachment limits also respect mailbox limi
 and the MIME expansion budget under `SMTP_MAX_MESSAGE_SIZE`; the UI displays the
 actual effective limit. A user may choose a 0–30 second send delay in the composer.
 
+## Import a mailbox over IMAP
+
+Run `scripts/mail-import.py` with Python 3.12 or later and separate logins for
+the old mailbox and the destination Mail account. Both connections use
+certificate-verified IMAPS. Use mailbox-specific or app passwords. The command
+prompts for them, or reads the source and destination passwords on separate
+lines with `--password-stdin`. For a private CA use `--source-ca` or
+`--destination-ca`.
+
+```sh
+python3 scripts/mail-import.py \
+  --source-host imap.old.example --source-user person@old.example \
+  --destination-host imap.new.example --destination-user person@new.example \
+  --folder INBOX INBOX --folder "Projects/2024" "Projects 2024"
+```
+
+This previews the mapping and message counts. Omit the folder arguments to
+list selectable source folders. Map each source folder to a distinct Mail
+folder, including empty folders. Mail uses single-level folder names, so choose
+a flat destination name for each nested source folder.
+
+To copy, rerun the mapped command with `--apply --state /private/import/mail.sqlite`.
+Use an operator-owned directory with restricted access. The private SQLite
+checkpoint and its lock record progress for one account pair and mapping. Keep
+them together and reuse the checkpoint when resuming. The importer reads the
+source without changing read state. It keeps the message bytes, attachment
+contents, received time, and Mail's five standard persistent flags. The
+JSON-line report lists imported and failed UIDs and any unsupported flags.
+
+The checkpoint identifies each completed message by source folder, UIDVALIDITY,
+and UID. Identical messages with different UIDs are each copied. The importer
+stops a folder if either side changes UIDVALIDITY. For the final cutover, pause
+source writes and rerun the same command to pick up new UIDs. Existing copies
+keep their destination state when source flags, moves, or deletions change.
+
+If a connection drops before the importer can record the APPEND result, it
+holds that folder to avoid a duplicate. Inspect the destination and confirm
+which UID belongs to the attempted copy. Rerun the same mapped command and
+checkpoint with `--resolve "Source folder" SOURCE_UID DESTINATION_UID` in place
+of `--apply`. Resolution verifies the destination generation, message bytes,
+and received time before crediting the copy. Then rerun `--apply` to continue.
+If you confirm the interrupted request has stopped and the copy was never
+accepted, use `uncommitted` in place of `DESTINATION_UID`. The importer clears
+the attempt only if the destination's UIDNEXT is still the one recorded before
+the attempt.
+
 ## Portable mailbox export
 
 Run the export as a local Mail operator with the same database paths and working
