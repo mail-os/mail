@@ -48,7 +48,7 @@ onUnmounted(() => { destroy(); destroyReminders() })
   <header class="calendar-header">
     <div class="calendar-heading"><span class="mail-app-mark"><span class="mail-icon" data-icon="calendar" aria-hidden="true"></span></span><h1>Calendar</h1></div>
     <div :if="account" class="calendar-choices">
-      <button class="wm-action" @click="toggleCalendarSettings()" :aria-expanded="calendarSettings" aria-controls="calendar-settings"><span class="mail-icon" data-icon="settings" aria-hidden="true"></span>Manage calendars</button>
+      <button class="wm-action" @click="toggleCalendarSettings()" :disabled="loading && !calendarSettings" :aria-expanded="calendarSettings" aria-controls="calendar-settings"><span class="mail-icon" data-icon="settings" aria-hidden="true"></span>Manage calendars</button>
       <button class="wm-action" @click="toggleImport()" :disabled="importBusy" :aria-expanded="importOpen" aria-controls="calendar-import"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Import .ics</button>
       <a :if="calendarExport" class="wm-action" :href="calendarExport"><span class="mail-icon" data-icon="download" aria-hidden="true"></span>Download .ics</a>
       <button :if="canCreateEvent" class="wm-action calendar-primary" @click="openNewEvent()"><span class="mail-icon" data-icon="plus" aria-hidden="true"></span>New event</button>

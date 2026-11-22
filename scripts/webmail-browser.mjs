@@ -470,8 +470,20 @@ async function sharedJourney(page, phone = false) {
 
 async function calendarSharingJourney(captain) {
   const calendarUrl = `${url}/calendar?day=${day}`
-  await captain.goto(calendarUrl)
-  await button(captain, 'Manage calendars').click()
+  const initialCalendars = Promise.withResolvers()
+  await captain.route(/\/webmail\/api\/calendars$/, async (route) => {
+    // Download and New event can shift the header while calendars are loading.
+    await initialCalendars.promise
+    await route.continue()
+  }, { times: 1 })
+  const manage = button(captain, 'Manage calendars')
+  try {
+    await captain.goto(calendarUrl)
+    await manage.waitFor()
+    assert(await manage.isDisabled(), 'Manage calendars waits for the initial calendar controls to settle')
+  }
+  finally { initialCalendars.resolve() }
+  await manage.click()
   const sharing = captain.getByRole('region', { name: 'Share a calendar' })
   await sharing.getByLabel('Calendar to share').selectOption({ label: calendarLabel })
   await sharing.getByRole('combobox', { name: /^Team\b/ }).selectOption({ label: 'Studio' })
