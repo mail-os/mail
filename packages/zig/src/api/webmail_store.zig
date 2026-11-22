@@ -213,6 +213,21 @@ pub fn recoverInterrupted(db: *database.Database) !void {
     try db.exec("UPDATE webmail_records SET state='unknown',revision=revision+1 WHERE kind='outbox' AND state='sending'");
 }
 
+pub fn nextInterruptedDelivery(a: std.mem.Allocator, db: *database.Database, cursor: *i64) !?Record {
+    const stmt = try db.prepare(
+        \\SELECT username,kind,r.id,payload,state,revision,due_at,expires_at,r.rowid
+        \\FROM webmail_records AS r
+        \\JOIN accepted_mail AS m ON m.id=json_extract(r.payload,'$.dispatch.delivery_id')
+        \\WHERE kind='outbox' AND state='unknown' AND json_extract(r.payload,'$.result') IS NULL AND r.rowid>?1
+        \\ORDER BY r.rowid LIMIT 1
+    );
+    defer stmt.finalize();
+    try stmt.bind(1, cursor.*);
+    if (!try stmt.step()) return null;
+    cursor.* = stmt.columnInt64(8);
+    return try readRecord(a, stmt);
+}
+
 pub fn addUpload(db: *database.Database, user: []const u8, upload: Upload, now: i64, max_staged_bytes: usize, max_count: usize) !void {
     const s = try db.prepare(
         \\INSERT INTO webmail_uploads(username,id,filename,content_type,data,size,expires_at)

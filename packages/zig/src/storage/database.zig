@@ -1436,6 +1436,7 @@ pub const Database = struct {
         review_copy: bool = false,
         placement_reason: ?categories.Reason = null,
         refusal: ?[]const u8 = null,
+        interactive_remote: bool = false,
     };
 
     pub const DeliveryEnvelope = struct {
@@ -1490,7 +1491,7 @@ pub const Database = struct {
             if (target.refusal == null and target.reply != null)
                 target.refusal = try self.admitVacationLocked(target.forward_owner.?, target.recipient, envelope.accepted_at);
             const pending = target.refusal == null and target.mailbox.len > 0 and released == null;
-            var outcome = target.refusal orelse if (released != null) "filed" else if (pending) "pending" else "queued";
+            var outcome = target.refusal orelse if (target.interactive_remote) "remote_unattempted" else if (released != null) "filed" else if (pending) "pending" else "queued";
             if (std.mem.eql(u8, outcome, "queued")) {
                 var owner = hosted_sender;
                 if (target.forward_owner) |user| {
@@ -1560,6 +1561,74 @@ pub const Database = struct {
         try insert.bind(6, owner);
         try insert.bind(7, @as([]const u8, if (target.forward_after == null) "pending" else "awaiting_local"));
         _ = try insert.step();
+    }
+
+    pub fn checkpointInteractiveRecipient(self: *Database, id: []const u8, recipient: []const u8, phase: enum { starting, delivered, failed }) !void {
+        const stmt = try self.prepare(
+            \\UPDATE accepted_mail_targets SET outcome=?3
+            \\WHERE delivery_id=?1 AND recipient=?2 AND is_primary=1 AND outcome=?4 RETURNING 1
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, id);
+        try stmt.bind(2, recipient);
+        try stmt.bind(3, @as([]const u8, switch (phase) {
+            .starting => "remote_unknown",
+            .delivered => "remote_delivered",
+            .failed => "remote_failed",
+        }));
+        try stmt.bind(4, @as([]const u8, if (phase == .starting) "remote_unattempted" else "remote_unknown"));
+        if (!try stmt.step()) return error.NotFound;
+        _ = try stmt.step();
+    }
+
+    pub const InteractiveDelivery = struct {
+        delivered: usize = 0,
+        failed: []const []const u8 = &.{},
+        unknown: []const []const u8 = &.{},
+        refused_for_limit: bool = false,
+    };
+
+    /// Inspect only the original envelope, excluding forwards and vacation replies.
+    pub fn interactiveDelivery(self: *Database, a: std.mem.Allocator, id: []const u8) !?InteractiveDelivery {
+        const stmt = try self.prepare(
+            \\SELECT recipient,outcome FROM accepted_mail_targets
+            \\WHERE delivery_id=?1 AND is_primary=1 ORDER BY ordinal
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, id);
+        if (!try stmt.step()) return null;
+        var result: InteractiveDelivery = .{};
+        var failed: std.ArrayList([]const u8) = .empty;
+        var unknown: std.ArrayList([]const u8) = .empty;
+        while (true) {
+            const outcome = stmt.columnText(1);
+            if (std.mem.eql(u8, outcome, "pending") or std.mem.eql(u8, outcome, "filed") or std.mem.eql(u8, outcome, "remote_delivered")) {
+                result.delivered += 1;
+            } else if (std.mem.eql(u8, outcome, "remote_unknown")) {
+                try unknown.append(a, try a.dupe(u8, stmt.columnText(0)));
+            } else {
+                try failed.append(a, try a.dupe(u8, stmt.columnText(0)));
+                result.refused_for_limit = result.refused_for_limit or std.mem.eql(u8, outcome, "recipient_storage_full") or std.mem.eql(u8, outcome, "recipient_disabled");
+            }
+            if (!try stmt.step()) break;
+        }
+        result.failed = try failed.toOwnedSlice(a);
+        result.unknown = try unknown.toOwnedSlice(a);
+        return result;
+    }
+
+    pub fn hasAcceptedDelivery(self: *Database, id: []const u8) !bool {
+        const stmt = try self.prepare("SELECT 1 FROM accepted_mail WHERE id=?1");
+        defer stmt.finalize();
+        try stmt.bind(1, id);
+        return stmt.step();
+    }
+
+    pub fn hasFiledDelivery(self: *Database, id: []const u8) !bool {
+        const stmt = try self.prepare("SELECT 1 FROM accepted_mail_targets WHERE delivery_id=?1 AND outcome='filed' LIMIT 1");
+        defer stmt.finalize();
+        try stmt.bind(1, id);
+        return stmt.step();
     }
 
     pub fn reservedDeliveryBytes(self: *Database, mailbox: []const u8) !u64 {
@@ -2355,7 +2424,25 @@ pub const Database = struct {
     pub fn sweepDeliveryJournal(self: *Database, before: i64) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const stmt = try self.prepareLocked("DELETE FROM accepted_mail WHERE id IN (SELECT id FROM accepted_mail WHERE complete=1 AND accepted_at<?1 LIMIT 500)");
+        const webmail_enabled = blk: {
+            const schema = try self.prepareLocked("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='webmail_records'");
+            defer schema.finalize();
+            break :blk try schema.step();
+        };
+        const prune = "DELETE FROM accepted_mail WHERE id IN (SELECT id FROM accepted_mail WHERE complete=1 AND accepted_at<?1";
+        const stmt = try self.prepareLocked(if (webmail_enabled)
+            \\WITH interrupted AS MATERIALIZED (
+            \\ SELECT json_extract(payload,'$.dispatch.delivery_id') AS delivery,
+            \\        json_extract(payload,'$.dispatch.sent_delivery_id') AS sent
+            \\ FROM webmail_records WHERE kind='outbox' AND state IN ('sending','unknown')
+            \\ AND json_extract(payload,'$.result') IS NULL
+            \\), protected AS (
+            \\ SELECT delivery AS id FROM interrupted WHERE delivery IS NOT NULL
+            \\ UNION ALL SELECT sent FROM interrupted WHERE sent IS NOT NULL
+            \\)
+        ++ " " ++ prune ++ " AND id NOT IN (SELECT id FROM protected) LIMIT 500)"
+        else
+            prune ++ " LIMIT 500)");
         defer stmt.finalize();
         try stmt.bind(1, before);
         _ = try stmt.step();

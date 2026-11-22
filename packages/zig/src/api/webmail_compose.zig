@@ -97,6 +97,14 @@ pub const SendResult = struct {
     failed: []const []const u8, // recipients delivery failed for (arena-allocated)
     sent_saved: bool,
     limit_notice: ?[]const u8 = null,
+    unknown: []const []const u8 = &.{},
+};
+
+pub const OutboxDispatch = struct {
+    delivery_id: []const u8,
+    sent_delivery_id: []const u8,
+    message_id: []const u8,
+    message_date: i64,
 };
 
 /// A header VALUE must not contain CR/LF (header injection) and stays short
@@ -381,11 +389,15 @@ var nameSeq = std.atomic.Value(u64).init(0);
 
 /// Build + send a composed message. Returns the generated Message-ID.
 pub fn send(allocator: std.mem.Allocator, msg: Message, cfg: SendConfig) !SendResult {
+    return sendWithJournal(allocator, msg, cfg, null);
+}
+
+pub fn sendWithJournal(allocator: std.mem.Allocator, msg: Message, cfg: SendConfig, dispatch: ?OutboxDispatch) !SendResult {
     if (msg.to.len == 0 and msg.cc.len == 0 and msg.bcc.len == 0) return ComposeError.NoRecipients;
 
-    const ts = time_compat.timestamp();
+    const ts = if (dispatch) |send_record| send_record.message_date else time_compat.timestamp();
     const seq = nameSeq.fetchAdd(1, .monotonic);
-    const msgid = try std.fmt.allocPrint(allocator, "<{d}.{d}@{s}>", .{ ts, seq, cfg.hostname });
+    const msgid = if (dispatch) |send_record| send_record.message_id else try std.fmt.allocPrint(allocator, "<{d}.{d}@{s}>", .{ ts, seq, cfg.hostname });
 
     const raw = try buildMime(allocator, msg, ts, msgid);
     var private_msg = msg;
@@ -397,8 +409,10 @@ pub fn send(allocator: std.mem.Allocator, msg: Message, cfg: SendConfig) !SendRe
     const recipients = try submission.distinctRecipients(allocator, &.{ msg.to, msg.cc, msg.bcc });
     defer allocator.free(recipients);
     const delivery = cfg.delivery();
-    const db = delivery.db;
-    const result = try submission.dispatch(allocator, delivery, msg.from, recipients, raw, .{ .sender = cfg.sender_user });
+    const result = try submission.dispatch(allocator, delivery, msg.from, recipients, raw, .{
+        .sender = cfg.sender_user,
+        .interactive_id = if (dispatch) |send_record| send_record.delivery_id else null,
+    });
     errdefer allocator.free(result.failed);
     const first_limit_error = result.first_limit_error;
     if (result.delivered == 0 and first_limit_error != null) return first_limit_error.?;
@@ -408,8 +422,8 @@ pub fn send(allocator: std.mem.Allocator, msg: Message, cfg: SendConfig) !SendRe
     var sent_saved = false;
     var limit_notice: ?[]const u8 = if (first_limit_error != null) "Some recipient mailboxes are full or disabled." else null;
     if (result.delivered > 0) {
-        if (submission.writeMaildir(allocator, db, cfg.sender_user, "Sent", sent_raw)) {
-            sent_saved = true;
+        if (fileSent(allocator, cfg, sent_raw, if (dispatch) |send_record| send_record.sent_delivery_id else null)) |saved| {
+            sent_saved = saved;
         } else |err| {
             if (err == error.HostedStorageFull and limit_notice == null)
                 limit_notice = "Message delivered. Your mailbox is full, so a Sent copy could not be saved.";
@@ -418,6 +432,20 @@ pub fn send(allocator: std.mem.Allocator, msg: Message, cfg: SendConfig) !SendRe
     }
 
     return .{ .message_id = msgid, .delivered = result.delivered, .failed = result.failed, .sent_saved = sent_saved, .limit_notice = limit_notice };
+}
+
+pub fn recoverSent(a: std.mem.Allocator, msg: Message, cfg: SendConfig, dispatch: OutboxDispatch) !bool {
+    var private_msg = msg;
+    private_msg.include_bcc = true;
+    const raw = try buildMime(a, private_msg, dispatch.message_date, dispatch.message_id);
+    return fileSent(a, cfg, raw, dispatch.sent_delivery_id);
+}
+
+fn fileSent(a: std.mem.Allocator, cfg: SendConfig, raw: []const u8, id: ?[]const u8) !bool {
+    const db = cfg.delivery().db;
+    if (id) |value| return submission.fileInteractiveSent(a, db orelse return error.DatabaseUnavailable, cfg.sender_user, value, raw);
+    try submission.writeMaildir(a, db, cfg.sender_user, "Sent", raw);
+    return true;
 }
 
 /// Deliver a message the server writes on its own behalf (password reset

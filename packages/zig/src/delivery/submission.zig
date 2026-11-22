@@ -116,6 +116,7 @@ const RawSubmission = struct {
 pub const DispatchOptions = struct {
     sender: ?[]const u8 = null,
     sent: ?SentCopy = null,
+    interactive_id: ?[]const u8 = null,
     receipt: ?database.Database.ActiveSyncReceipt = null,
     account_notice: bool = false,
     recipient_id: ?i64 = null,
@@ -132,6 +133,7 @@ pub const DispatchResult = struct {
 /// app submissions keep their synchronous delivery results for partial-send UI.
 pub fn dispatch(a: std.mem.Allocator, cfg: Delivery, from: []const u8, recipients: []const []const u8, raw: []const u8, options: DispatchOptions) !DispatchResult {
     if (recipients.len == 0) return error.NoRecipients;
+    if (options.interactive_id != null and cfg.db == null) return error.DatabaseUnavailable;
     const failed = try a.alloc([]const u8, recipients.len);
     errdefer a.free(failed);
     const errors = try a.alloc(?anyerror, recipients.len);
@@ -143,9 +145,10 @@ pub fn dispatch(a: std.mem.Allocator, cfg: Delivery, from: []const u8, recipient
     const remote = try temp.alloc(bool, recipients.len);
     @memset(remote, false);
     if (cfg.db) |db| {
-        const id = routing.newId();
-        try acceptLocal(temp, cfg, db, from, recipients, raw, options, &id, remote, errors);
-        routing.publish(a, db, &id);
+        const generated_id = routing.newId();
+        const id = options.interactive_id orelse &generated_id;
+        try acceptLocal(temp, cfg, db, from, recipients, raw, options, id, remote, errors);
+        routing.publish(a, db, id);
     } else {
         for (recipients, 0..) |recipient, i| {
             const user = localMailbox(temp, cfg, recipient) catch |err| {
@@ -163,9 +166,13 @@ pub fn dispatch(a: std.mem.Allocator, cfg: Delivery, from: []const u8, recipient
     var result: DispatchResult = .{ .failed = undefined };
     for (recipients, remote, errors) |recipient, deliver_remote, local_error| {
         const failure: ?anyerror = if (deliver_remote) blk: {
+            if (options.interactive_id) |id| try cfg.db.?.checkpointInteractiveRecipient(id, recipient, .starting);
             outbound.deliverToRemote(a, from, recipient, raw, cfg.hostname, cfg.delivery_method, cfg.ses_region) catch |err| break :blk err;
             break :blk null;
         } else local_error;
+        if (deliver_remote) if (options.interactive_id) |id| {
+            try cfg.db.?.checkpointInteractiveRecipient(id, recipient, if (failure == null) .delivered else .failed);
+        };
         if (failure) |err| {
             std.log.warn("Message delivery to {s} failed: {}", .{ recipient, err });
             if (result.first_error == null) result.first_error = err;
@@ -231,13 +238,16 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
                 errors[i] = err;
                 try plan.add(target);
             };
-        } else remote[i] = true;
+        } else {
+            remote[i] = true;
+            if (options.interactive_id != null) try plan.add(.{ .recipient = recipient, .interactive_remote = true });
+        }
     }
     const primary_count = plan.targets.items.len;
     if (!options.account_notice) {
         for (0..primary_count) |i| {
             const target = plan.targets.items[i];
-            if (target.refusal == null and target.forward_allowed) try plan.forward(i, from, cfg.hostname, cfg.mail_config, identity);
+            if (target.refusal == null and !target.interactive_remote and target.forward_allowed) try plan.forward(i, from, cfg.hostname, cfg.mail_config, identity);
         }
         try plan.vacationReplies(primary_count, from, cfg.hostname, cfg.mail_config, identity, now);
     }
@@ -284,6 +294,27 @@ pub fn writeMaildir(allocator: std.mem.Allocator, db: ?*database.Database, user:
     const path = try maildirPath(allocator, user, subdir, "");
     defer allocator.free(path);
     try hosted_limits.write(db, allocator, user, path, raw);
+}
+
+/// Reserve and file an Outbox Sent copy under its own durable delivery ID.
+pub fn fileInteractiveSent(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8, raw: []const u8) !bool {
+    {
+        db.lockMailboxes();
+        defer db.unlockMailboxes();
+        if (!try db.hasAcceptedDelivery(id)) {
+            try hosted_limits.checkStorage(db, user, raw.len, null);
+            try db.acceptDelivery(.{
+                .id = id,
+                .from = user,
+                .mime = raw,
+                .accepted_at = time_compat.timestamp(),
+                .accepted_ms = time_compat.milliTimestamp(),
+                .targets = &.{.{ .recipient = user, .mailbox = user, .folder = "Sent" }},
+            });
+        }
+    }
+    routing.publish(a, db, id);
+    return db.hasFiledDelivery(id);
 }
 
 var nameSeq = std.atomic.Value(u64).init(0);

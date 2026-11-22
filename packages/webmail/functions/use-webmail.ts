@@ -1329,11 +1329,11 @@ export function useWebmail(ports: WebmailPorts) {
         catch { /* The original draft may have been moved or deleted; keep a copy. */ }
       }
       const payload = { ...item.message }
-      if (item.result?.failed.length) {
-        const failed = new Set(item.result.failed.map(address => address.toLowerCase()))
-        payload.to = payload.to.filter(address => failed.has(address.toLowerCase()))
-        payload.cc = payload.cc.filter(address => failed.has(address.toLowerCase()))
-        payload.bcc = payload.bcc.filter(address => failed.has(address.toLowerCase()))
+      if (item.result) {
+        const retry = new Set([...item.result.failed, ...(item.result.unknown || [])].map(address => address.toLowerCase()))
+        payload.to = payload.to.filter(address => retry.has(address.toLowerCase()))
+        payload.cc = payload.cc.filter(address => retry.has(address.toLowerCase()))
+        payload.bcc = payload.bcc.filter(address => retry.has(address.toLowerCase()))
         payload.recipientLabels = { to: [], cc: [], bcc: [] }
       }
       installPayload(payload, null)

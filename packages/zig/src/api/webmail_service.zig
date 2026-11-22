@@ -76,6 +76,7 @@ pub const Outbox = struct {
     error_message: ?[]const u8 = null,
     request_hash: ?[]const u8 = null,
     reply_cutoff_ms: i64 = 0,
+    dispatch: ?compose.OutboxDispatch = null,
 };
 pub const Limits = struct {
     maxFileBytes: usize,
@@ -349,21 +350,97 @@ pub const Service = struct {
         const parsed = try std.json.parseFromSlice(Outbox, a, row.payload, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         var doc = parsed.value;
-        self.deliver(a, row.username, &doc) catch |err| {
-            row.state = "failed";
-            doc.error_message = switch (err) {
-                error.HostedSendingLimit => "Daily recipient allowance exhausted. Try again after midnight UTC.",
-                error.HostedSenderDisabled => "This mailbox is disabled. The message was not sent.",
-                error.HostedStorageFull => "A recipient mailbox is full. Review the recipients before retrying.",
-                error.HostedRecipientDisabled => "A recipient mailbox is disabled. Review the recipients before retrying.",
-                else => "Delivery failed. Review this message before retrying.",
-            };
+        const delivery_id = try store.newId(a);
+        doc.dispatch = .{
+            .delivery_id = delivery_id,
+            .sent_delivery_id = try store.newId(a),
+            .message_id = try std.fmt.allocPrint(a, "<{s}@{s}>", .{ delivery_id, self.config.hostname }),
+            .message_date = time.timestamp(),
         };
-        if (doc.result) |result| {
-            row.state = if (result.failed.len == 0) (if (result.sent_saved) "sent" else "sent_unfiled") else (if (result.delivered > 0) "partial" else "failed");
-            doc.error_message = result.limit_notice;
+        // Save the server-generated journal key before releasing any recipient.
+        row.payload = try json(a, doc);
+        row.revision = try store.put(self.db, row, row.revision);
+        self.deliver(a, row.username, &doc) catch |err| {
+            if (!try self.reconcileDelivery(a, row.username, &doc)) {
+                doc.error_message = switch (err) {
+                    error.HostedSendingLimit => "Daily recipient allowance exhausted. Try again after midnight UTC.",
+                    error.HostedSenderDisabled => "This mailbox is disabled. The message was not sent.",
+                    error.HostedStorageFull => "A recipient mailbox is full. Review the recipients before retrying.",
+                    error.HostedRecipientDisabled => "A recipient mailbox is disabled. Review the recipients before retrying.",
+                    else => "Delivery failed. Review this message before retrying.",
+                };
+            }
+        };
+        try self.finishDispatch(a, &row, doc, now);
+        return true;
+    }
+
+    pub fn recoverInterrupted(self: *Service, now: i64) !void {
+        try store.recoverInterrupted(self.db);
+        var cursor: i64 = 0;
+        while (true) {
+            var scratch = std.heap.ArenaAllocator.init(self.db.allocator);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            var row = (try store.nextInterruptedDelivery(a, self.db, &cursor)) orelse break;
+            self.recoverDispatch(a, &row, now) catch |err| {
+                std.log.warn("could not reconcile interrupted webmail dispatch: {}", .{err});
+            };
         }
+    }
+
+    fn recoverDispatch(self: *Service, a: std.mem.Allocator, row: *store.Record, now: i64) !void {
+        const parsed = try std.json.parseFromSlice(Outbox, a, row.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        var doc = parsed.value;
+        if (try self.reconcileDelivery(a, row.username, &doc)) try self.finishDispatch(a, row, doc, now);
+    }
+
+    fn reconcileDelivery(self: *Service, a: std.mem.Allocator, user: []const u8, doc: *Outbox) !bool {
+        const dispatch = doc.dispatch orelse return false;
+        const checkpoint = (try self.db.interactiveDelivery(a, dispatch.delivery_id)) orelse return false;
+        var result: compose.SendResult = .{
+            .message_id = dispatch.message_id,
+            .delivered = checkpoint.delivered,
+            .failed = checkpoint.failed,
+            .unknown = checkpoint.unknown,
+            .sent_saved = false,
+            .limit_notice = if (checkpoint.refused_for_limit) "Some recipient mailboxes are full or disabled." else null,
+        };
+        if (result.delivered > 0) {
+            result.sent_saved = self.reconcileSent(a, user, doc.message, dispatch) catch |err| blk: {
+                std.log.warn("webmail could not reconcile the Sent copy: {}", .{err});
+                if (result.limit_notice == null and err == error.HostedStorageFull)
+                    result.limit_notice = "Message delivered. Your mailbox is full, so a Sent copy could not be saved.";
+                break :blk false;
+            };
+        }
+        doc.result = result;
+        return true;
+    }
+
+    fn reconcileSent(self: *Service, a: std.mem.Allocator, user: []const u8, payload: Payload, dispatch: compose.OutboxDispatch) !bool {
+        if (try self.db.hasFiledDelivery(dispatch.sent_delivery_id)) return true;
+        var account = try self.db.getUserByUsername(user);
+        defer account.deinit(self.db.allocator);
+        const message = try self.payloadMessage(a, payload, user, account.email, false);
+        return compose.recoverSent(a, message, self.sendConfig(user), dispatch);
+    }
+
+    fn finishDispatch(self: *Service, a: std.mem.Allocator, row: *store.Record, doc: Outbox, now: i64) !void {
         var retained = doc;
+        row.state = "failed";
+        if (doc.result) |result| {
+            row.state = if (result.unknown.len > 0) "unknown" else if (result.failed.len == 0) (if (result.sent_saved) "sent" else "sent_unfiled") else (if (result.delivered > 0) "partial" else "failed");
+            retained.error_message = result.limit_notice;
+            if (result.delivered > 0) if (doc.message.replyContext) |context| {
+                self.finishReply(a, row.username, context, doc) catch |err| std.log.warn("could not update the replied-to message: {}", .{err});
+            };
+        }
+        if (!std.mem.eql(u8, row.state, "unknown")) self.finishDraft(a, row.username, doc) catch |err| {
+            std.log.warn("webmail could not reconcile the draft after delivery: {}", .{err});
+            retained.error_message = "Draft cleanup needs attention. Review the delivery result in Outbox before sending again.";
+        };
         const compact = (std.mem.eql(u8, row.state, "sent") or std.mem.eql(u8, row.state, "sent_unfiled")) and
             (try self.db.hostedLimits(row.username)) != null;
         if (compact) {
@@ -372,14 +449,7 @@ pub const Service = struct {
         }
         row.payload = try json(a, retained);
         row.expires_at = now + store.terminal_retention;
-        row.revision = try store.put(self.db, row, row.revision);
-        self.finishDraft(a, row.username, doc) catch |err| {
-            std.log.warn("webmail could not reconcile the draft after delivery: {}", .{err});
-            retained.error_message = "Draft cleanup needs attention. Review the delivery result in Outbox before sending again.";
-            row.payload = try json(a, retained);
-            _ = try store.put(self.db, row, row.revision);
-        };
-        return true;
+        row.revision = try store.put(self.db, row.*, row.revision);
     }
 
     pub fn resolveUnknown(self: *Service, a: std.mem.Allocator, user: []const u8, id: []const u8, now: i64) !store.Record {
@@ -390,7 +460,16 @@ pub const Service = struct {
         if (!std.mem.eql(u8, row.state, "unknown")) return ServiceError.Conflict;
         const doc = try std.json.parseFromSlice(Outbox, a, row.payload, .{ .ignore_unknown_fields = true });
         defer doc.deinit();
-        if (doc.value.message.draftId) |draft_id| {
+        if (doc.value.result == null) if (doc.value.dispatch) |dispatch| {
+            // Never offer the original envelope when a durable acceptance
+            // still needs to be reconciled.
+            if (try self.db.hasAcceptedDelivery(dispatch.delivery_id)) return ServiceError.Conflict;
+        };
+        if (doc.value.result) |result| {
+            var retry = doc.value;
+            retry.result.?.failed = try std.mem.concat(a, []const u8, &.{ result.failed, result.unknown });
+            try self.finishDraftLocked(a, user, retry);
+        } else if (doc.value.message.draftId) |draft_id| {
             if (store.get(a, self.db, user, "draft", draft_id)) |previous| {
                 var draft = previous;
                 if (std.mem.eql(u8, draft.state, "queued")) {
@@ -410,12 +489,11 @@ pub const Service = struct {
         defer account.deinit(self.db.allocator);
         if (!account.enabled) return error.HostedSenderDisabled;
         const msg = try self.payloadMessage(a, doc.message, user, account.email, false);
-        doc.result = try compose.send(a, msg, .{ .hostname = self.config.hostname, .delivery_method = self.config.delivery_method, .ses_region = self.config.ses_region, .sender_user = user, .mail_config = self.config.mail_config, .auth = self.auth });
-        if (doc.result.?.delivered > 0) {
-            if (doc.message.replyContext) |context| {
-                self.finishReply(a, user, context, doc.*) catch |err| std.log.warn("could not update the replied-to message: {}", .{err});
-            }
-        }
+        doc.result = try compose.sendWithJournal(a, msg, self.sendConfig(user), doc.dispatch);
+    }
+
+    fn sendConfig(self: *Service, user: []const u8) compose.SendConfig {
+        return .{ .hostname = self.config.hostname, .delivery_method = self.config.delivery_method, .ses_region = self.config.ses_region, .sender_user = user, .mail_config = self.config.mail_config, .auth = self.auth };
     }
 
     fn finishReply(self: *Service, a: std.mem.Allocator, user: []const u8, context: MessageRef, doc: Outbox) !void {
@@ -423,7 +501,7 @@ pub const Service = struct {
         defer self.db.unlockMailboxes();
         if (context.reference) |reference| {
             const original = try maildir.resolveVersioned(a, self.db, user, reference);
-            if (doc.message.clearFollowUp and doc.result.?.failed.len == 0 and doc.reply_cutoff_ms > 0) {
+            if (doc.message.clearFollowUp and doc.result.?.failed.len == 0 and doc.result.?.unknown.len == 0 and doc.reply_cutoff_ms > 0) {
                 const ids = try thread_ids.parse(a, original.raw);
                 const keys = try std.json.Stringify.valueAlloc(a, try ids.keys(a), .{});
                 try self.db.clearFollowUp(user, reference, keys, doc.reply_cutoff_ms);
@@ -441,16 +519,27 @@ pub const Service = struct {
     }
 
     fn finishDraft(self: *Service, a: std.mem.Allocator, user: []const u8, doc: Outbox) !void {
-        const id = doc.message.draftId orelse return;
         self.mutations.lock();
         defer self.mutations.unlock();
-        const row = store.get(a, self.db, user, "draft", id) catch return;
+        try self.finishDraftLocked(a, user, doc);
+    }
+
+    fn finishDraftLocked(self: *Service, a: std.mem.Allocator, user: []const u8, doc: Outbox) !void {
+        const id = doc.message.draftId orelse return;
+        const row = store.get(a, self.db, user, "draft", id) catch |err| {
+            if (err == store.StoreError.NotFound) return;
+            return err;
+        };
         if (!std.mem.eql(u8, row.state, "queued")) return;
         const draft = try std.json.parseFromSlice(Draft, a, row.payload, .{ .ignore_unknown_fields = true });
         defer draft.deinit();
         if (doc.result) |result| {
             if (result.failed.len == 0 and result.delivered > 0) {
-                if (std.mem.eql(u8, draft.value.folder, "Drafts")) _ = try maildir.moveMessage(a, self.db, user, "Drafts", draft.value.uid, "Trash");
+                if (std.mem.eql(u8, draft.value.folder, "Drafts")) _ = maildir.moveMessage(a, self.db, user, "Drafts", draft.value.uid, "Trash") catch |err| blk: {
+                    if (err != maildir.MaildirError.MessageNotFound) return err;
+                    // A previous cleanup may have moved the file before dropping the draft record.
+                    break :blk 0;
+                };
                 try store.remove(self.db, user, "draft", id);
                 return;
             }

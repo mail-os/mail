@@ -103,8 +103,11 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   idempotent. Downloaded attachments retain their original bytes.
 - Undo Send holds the message on the server for a configurable interval. It works
   even if the browser closes; cancellation is available before dispatch starts.
-  Outbox records delivery results. A partial retry contains only failed recipients.
-  Interrupted dispatch is marked Unknown and requires review before a manual retry.
+  Outbox records delivery results. After a restart, the delivery journal restores
+  accepted local recipients and confirmed remote results, then reconciles the Sent
+  copy and draft. Remote attempts without a recorded outcome appear as Unknown
+  and require review before a manual retry. Confirmed recipients are omitted from
+  the retry draft.
 - When CalDAV is enabled, Calendar offers day, week, month, and 30-day agenda
   views across all calendars or one selected calendar. Search matches titles,
   locations, and descriptions across dates. Use **Manage calendars** to create

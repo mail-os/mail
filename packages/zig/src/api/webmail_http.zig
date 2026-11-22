@@ -207,7 +207,7 @@ pub const WebmailHttpServer = struct {
 
         const worker = if (!is_private) blk: {
             self.sessions.sweep();
-            try store.recoverInterrupted(self.db);
+            try self.service.recoverInterrupted(time_compat.timestamp());
             self.service.sweep(time_compat.timestamp()) catch |err| logger.warn("Webmail state cleanup failed: {}", .{err});
             break :blk try std.Thread.spawn(.{}, deliveryWorker, .{self});
         } else null;
