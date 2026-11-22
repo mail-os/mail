@@ -162,20 +162,25 @@ mail user change-password <username> <password> [--instance-id <id>] [--env <env
 Local user management (direct database access).
 
 ```bash
-mail user:local create <username> <password> <email>
+mail user:local create <username> [<password> [<email>]] [--email <email>]
 mail user:local delete <username>
 mail user:local disable <username>
 mail user:local enable <username>
 mail user:local info <username>
-mail user:local verify <username> <password>
+mail user:local verify <username> [<password> | --password-stdin]
 mail user:local change-password <username> [<password> | --password-stdin] --force
 ```
 
-`change-password` refuses without `--force`. A mailbox's password belongs to the
-person who uses it, and deploy tooling that called this on every run replaced
-real people's passwords on a shared server. Pass `--force` when you mean to
-reset one. `mail user change-password` (remote) is an operator command and
-passes it for you.
+`create`, `verify`, and `change-password` prompt without echo when you omit
+the password in a terminal. With redirected input they read the first password
+line. You can also use `--password-stdin` to specify that source explicitly.
+For creation with a password from stdin, set the email address with `--email`.
+
+Pass `--force` to rotate an existing mailbox password. The rotation revokes
+browser sessions and pending reset links for that mailbox. The remote
+`mail user change-password` command passes `--force` on the server. For a
+no-echo password prompt during remote administration, run `mail user:local`
+on the mail host.
 
 ### `mail migrate`
 

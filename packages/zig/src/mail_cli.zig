@@ -16,6 +16,36 @@ const upgrade_mod = @import("cli/upgrade.zig");
 const version_mod = @import("cli/version.zig");
 const version = @import("core/version.zig");
 
+fn isHelp(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h");
+}
+
+fn showUserHelp(root: *cli.BaseCommand, args: []const []const u8, allocator: std.mem.Allocator) !bool {
+    if (!std.mem.eql(u8, args[0], "user") and !std.mem.eql(u8, args[0], "user:local")) return false;
+    const group = root.findSubcommand(args[0]).?;
+    var help = cli.Help.init(allocator);
+    if (args.len == 1 or isHelp(args[1])) {
+        try help.generate(group, "mail", version.version);
+        return true;
+    }
+
+    const action = group.findSubcommand(args[1]) orelse {
+        std.debug.print("Error: unknown {s} command '{s}'. Run 'mail {s} --help' to list commands.\n", .{ group.name, args[1], group.name });
+        return error.UnknownUserCommand;
+    };
+    var index: usize = 2;
+    while (index < args.len) : (index += 1) {
+        if (isHelp(args[index])) {
+            try help.generate(action, "mail", version.version);
+            return true;
+        }
+        if (action.findOption(args[index])) |option| {
+            if (option.option_type != .bool) index += 1;
+        }
+    }
+    return false;
+}
+
 pub fn main(init: std.process.Init) !void {
     io_compat.initIo(init.io);
 
@@ -56,6 +86,12 @@ pub fn main(init: std.process.Init) !void {
         try help.generate(root_cmd, "mail", version.version);
         return;
     }
+
+    const user_help = showUserHelp(root_cmd, args_list.items, allocator) catch |err| switch (err) {
+        error.UnknownUserCommand => std.process.exit(1),
+        else => return err,
+    };
+    if (user_help) return;
 
     var parser = cli.Parser.init(allocator);
     parser.parse(root_cmd, args_list.items) catch |err| {
