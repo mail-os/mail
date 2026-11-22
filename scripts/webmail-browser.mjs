@@ -74,6 +74,8 @@ async function verifyAppearance(page, scheme) {
     ]
     return {
       scheme: style.colorScheme,
+      font: getComputedStyle(document.body).fontFamily,
+      fontStack: style.getPropertyValue('--app-font').trim(),
       ratios: pairs.map(([foreground, background]) => {
         const a = luminance(foreground)
         const b = luminance(background)
@@ -82,6 +84,8 @@ async function verifyAppearance(page, scheme) {
     }
   })
   assert.equal(theme.scheme, scheme)
+  assert.match(theme.fontStack, /^-apple-system,\s*BlinkMacSystemFont,\s*system-ui/i)
+  assert.match(theme.font, /^-apple-system,/i)
   for (const [ratio, foreground, background] of theme.ratios)
     assert(ratio >= 4.5, `${scheme} ${foreground} on ${background} must reach 4.5:1, got ${ratio.toFixed(2)}`)
 }
@@ -187,6 +191,7 @@ async function signIn({ phone = false, account = owner, initialSubject = handoff
 async function desktopJourney(page) {
   await verifyAppearance(page, 'light')
   await page.locator('.wm-reader-empty').waitFor()
+  assert.equal(await button(page, /Tuesday design handoff/).getAttribute('aria-description'), 'Unread')
   await screenshot(page, 'desktop-mailbox')
   const conversations = page.getByRole('checkbox', { name: 'Conversations' })
   await conversations.focus()
@@ -230,7 +235,7 @@ async function desktopJourney(page) {
   await sorting.click()
   await destination.waitFor({ state: 'hidden' })
   const tools = page.getByRole('group', { name: 'Message actions', exact: true })
-  for (const name of ['Reply', 'Reply all', 'Forward', 'Flag', 'Mark unread', 'Move this message', 'Trash']) {
+  for (const name of ['Reply', 'Reply all', 'Forward', 'Archive message', 'Flag', 'Mark unread', 'Move this message', 'Trash']) {
     const control = button(tools, name)
     await control.waitFor()
     assert.match(await control.locator('.mail-icon').evaluate(node => getComputedStyle(node).maskImage), /data:image/)
@@ -238,8 +243,8 @@ async function desktopJourney(page) {
   await fitsViewport(page)
   const paper = page.locator('.wm-message-paper')
   await paper.locator('iframe[title="Email content"]').contentFrame().getByText('For Tuesday').waitFor()
-  assert(await paper.evaluate(node => getComputedStyle(node).backgroundColor !== getComputedStyle(node.closest('.wm-read')).backgroundColor),
-    'The message has a distinct reading surface')
+  assert(await paper.evaluate(node => getComputedStyle(node).boxShadow === 'none'),
+    'The message sits directly on the reading surface')
   await screenshot(page, 'desktop-inbox-light')
   await verifyAppearance(page, 'dark')
   await verifyMessageSelection(button(page, /Tuesday design handoff/), '.wm-msg-from')
@@ -248,6 +253,12 @@ async function desktopJourney(page) {
   assert.match(await button(page, 'Show formatted email').locator('.mail-icon').evaluate(node => getComputedStyle(node).maskImage), /data:image/)
   await screenshot(page, 'desktop-inbox-dark')
   await page.emulateMedia({ colorScheme: 'light' })
+  await button(tools, 'Archive message').press('Enter')
+  await page.getByText('Message moved to Archive.', { exact: true }).waitFor()
+  await button(page, /Tuesday design handoff/).waitFor({ state: 'hidden' })
+  await button(page, 'Undo last action').click()
+  await button(page, /Tuesday design handoff/).click()
+  await heading(page, handoff).waitFor()
   await button(tools, 'Flag').click()
   await button(tools, 'Unflag').waitFor()
 
@@ -349,6 +360,10 @@ async function phoneJourney(page) {
   await fitsViewport(page)
   const actions = page.getByRole('group', { name: 'Message actions', exact: true })
   assert((await actions.boundingBox()).height < 124, 'Reader actions fit into two rows on narrow phones')
+  for (const name of ['Reply', 'Reply all', 'Forward', 'Archive message', 'Flag', 'Mark unread', 'Trash', 'Mark junk']) {
+    const control = await button(actions, name).boundingBox()
+    assert(control.width >= 44 && control.height >= 44, `${name} has a full-size touch target`)
+  }
   assert((await actions.getByRole('combobox', { name: 'Move destination' }).boundingBox()).height >= 44,
     'Move destination has a full-size touch target')
   await button(actions, 'Mark junk').waitFor()
@@ -393,6 +408,7 @@ async function phoneJourney(page) {
   await account.waitFor({ state: 'hidden' })
   await openMailbox(page, /^Outbox(?:\s|$)/)
   await heading(page, 'Outbox').waitFor()
+  await heading(page, sentSubject).waitFor()
   assert(!await folders(page).isVisible(), 'Outbox selection closes the drawer')
   await screenshot(page, 'phone-outbox')
   await toggle.click()

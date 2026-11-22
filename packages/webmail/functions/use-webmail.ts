@@ -1022,7 +1022,10 @@ export function useWebmail(ports: WebmailPorts) {
     finally { mutating.set(false) }
   }
   async function bulkAction(action: BulkAction, destination?: string): Promise<void> { await performBulk(action, checked(), destination) }
-  async function selectedAction(action: BulkAction): Promise<void> { const item = selected(); if (item) await performBulk(action, [messageRef(item)]) }
+  async function selectedAction(action: BulkAction, destination?: string): Promise<void> {
+    const item = selected()
+    if (item) await performBulk(action, [messageRef(item)], destination)
+  }
   async function triageAndNext(action: 'archive' | 'trash'): Promise<void> {
     const current = selected()
     const mode = readingBatch()
