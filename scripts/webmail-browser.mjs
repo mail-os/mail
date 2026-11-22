@@ -520,11 +520,11 @@ async function calendarSharingJourney(captain) {
   await sharing.getByRole('combobox', { name: /^Team\b/ }).selectOption({ label: 'Studio' })
   await sharing.getByLabel('Teammate').fill(sender)
   await sharing.getByRole('combobox', { name: /^Access\b/ }).selectOption('viewer')
-  const controls = sharing.locator('form :is(select, input, button)')
-  const dimensions = await controls.evaluateAll(elements => elements.map(element => {
-    const { y, height } = element.getBoundingClientRect()
-    return { y, height }
-  }))
+  const dimensions = await sharing.evaluate(section =>
+    Array.from(section.querySelectorAll('form select, form input, form button'), (element) => {
+      const { y, height } = element.getBoundingClientRect()
+      return { y, height }
+    }))
   assert.equal(dimensions.length, 5)
   for (const { y, height } of dimensions) {
     assert(Math.abs(y - dimensions[0].y) <= 1, 'Calendar sharing controls line up in one row')
