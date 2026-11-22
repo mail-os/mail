@@ -14,8 +14,8 @@ Fixture = runpy.run_path(str(Path(__file__).with_name("test-hosted-limits.py")))
 RAW = b"Subject: Persistent flags\r\nDate: Tue, 4 Mar 2025 12:00:00 +0000\r\n\r\nMessage body\r\n"
 
 
-def append(client, folder, flags, expected="OK"):
-    status, response = client.append(folder, flags, None, RAW)
+def append(client, folder, flags, expected="OK", raw=RAW):
+    status, response = client.append(folder, flags, None, raw)
     assert status == expected, (status, response)
     if expected == "OK":
         return client.response("APPENDUID")[1][0].split()[1]
@@ -28,6 +28,78 @@ def flags(client, uid):
     selected = [row for row in rows if row and b"UID " + uid + b" " in row]
     assert status == "OK" and selected, (status, rows)
     return set(imaplib.ParseFlags(selected[-1]))
+
+
+def search(client, query, *expected, uid=True):
+    status, rows = client.uid("SEARCH", None, query) if uid else client.search(None, query)
+    assert status == "OK" and rows[0].split() == list(expected), (query, status, rows, expected)
+
+
+def verify_search(fixture, owner):
+    with fixture.imap(owner) as client:
+        for folder in ("SearchA", "SearchB", "SearchEmpty"):
+            assert client.create(folder)[0] == "OK"
+        marked = append(client, "SearchA", "(Reviewed ALL UID SEEN)", raw=RAW.replace(
+            b"Persistent flags", b"Special KEYWORD",
+        ).replace(b"\r\n\r\n", b'\r\nX-Status: first\r\n continued\r\nX-Quote: Search "KEYWORD"\r\n\r\n', 1))
+        plain = append(client, "SearchA", r"(\Seen Plain)")
+        first_letter = append(client, "SearchB", "(Other)")
+        second_letter = append(client, "SearchB", "(Reviewed)", raw=RAW.replace(
+            b"Persistent flags", b"Different Maildir mapping",
+        ))
+
+        assert client.select("SearchEmpty")[1] == [b"0"]
+        search(client, "UNKEYWORD Reviewed")
+        assert client.select("SearchA")[1] == [b"2"]
+        search(client, "KEYWORD reviewed", marked)
+        search(client, "UNKEYWORD REVIEWED", plain)
+        search(client, "KEYWORD missing")
+        search(client, "UNKEYWORD Missing", marked, plain)
+        search(client, "ALL (KEYWORD Reviewed NOT SEEN)", marked)
+        search(client, 'OR (KEYWORD Reviewed SUBJECT "Special KEYWORD") (SEEN NOT KEYWORD Reviewed)', marked, plain)
+        search(client, "KEYWORD ALL KEYWORD UID KEYWORD SEEN", marked)
+        search(client, "UID " + marked.decode() + ":* UNKEYWORD Reviewed", plain)
+        search(client, "UID *", plain, uid=False)
+        search(client, "1 KEYWORD Reviewed", b"1", uid=False)
+        search(client, "KEYWORD Reviewed 2")
+        search(client, "SUBJECT KEYWORD", marked)
+        search(client, 'SUBJECT "Special KEYWORD" KEYWORD Reviewed', marked)
+        search(client, 'HEADER X-Status "first continued"', marked)
+        search(client, 'HEADER X-Status ""', marked)
+        search(client, r'HEADER X-Quote "Search \"KEYWORD\""', marked)
+        search(client, 'BODY "Message body" ALL KEYWORD Reviewed', marked)
+        search(client, "SENTON 4-Mar-2025 KEYWORD Reviewed", marked)
+        try:
+            client.uid("SEARCH", None, "KEYWORD")
+        except imaplib.IMAP4.error as error:
+            assert "Invalid SEARCH criteria" in str(error)
+        else:
+            raise AssertionError("SEARCH accepted a missing keyword")
+
+        assert client.select("SearchB")[1] == [b"2"]
+        search(client, "KEYWORD Reviewed", second_letter)
+        search(client, "UNKEYWORD Reviewed", first_letter)
+
+        assert client.select('"All Mail"')[0] == "OK"
+        status, rows = client.uid("SEARCH", None, 'OR SUBJECT "Special KEYWORD" SUBJECT "Different Maildir mapping"')
+        assert status == "OK" and len(rows[0].split()) == 2, (status, rows)
+        search(client, "KEYWORD Reviewed", *rows[0].split())
+        assert client.select("SearchB")[1] == [b"2"]
+
+        # A selected session still has cached filenames when another
+        # connection renames them by modifying flags.
+        with fixture.imap(owner) as writer:
+            assert writer.select("SearchB")[0] == "OK"
+            assert writer.uid("STORE", second_letter, "-FLAGS.SILENT", "(reviewed)")[0] == "OK"
+            assert writer.uid("STORE", first_letter, "+FLAGS.SILENT", "(REVIEWED LateKeyword)")[0] == "OK"
+        search(client, "KEYWORD Reviewed KEYWORD latekeyword", first_letter)
+        search(client, "UNKEYWORD Reviewed", second_letter)
+
+        # Sequence numbers compact after expunge. UIDs retain their values.
+        assert client.uid("STORE", first_letter, "+FLAGS.SILENT", r"(\Deleted)")[0] == "OK"
+        assert client.expunge()[0] == "OK"
+        search(client, "1 UNKEYWORD Reviewed", b"1", uid=False)
+        search(client, "1 UNKEYWORD Reviewed", second_letter)
 
 
 def verify_lifecycle(fixture, owner, other):
@@ -141,6 +213,7 @@ def main():
             owner = fixture.provision("keyword-owner")
             other = fixture.provision("keyword-other")
             moved = verify_lifecycle(fixture, owner, other)
+            verify_search(fixture, owner)
         with fixture.daemon(), fixture.imap(owner) as client:
             assert client.select("Archive")[1] == [b"3"]
             assert flags(client, str(moved)) == {b"\\Answered", b"ProjectReviewed"}
@@ -148,7 +221,7 @@ def main():
             assert client.select('"Renamed archive"')[1] == [b"3"]
             assert b"ProjectReviewed" in client.response("FLAGS")[1][0]
             assert client.delete('"Renamed archive"')[0] == "OK"
-    print("Verified keyword persistence, capacity, namespace remapping, webmail changes, read-only access, restart, rename, and isolation.")
+    print("Verified keyword persistence, capacity, namespace remapping, webmail changes, read-only access, restart, rename, isolation, SEARCH, and UID SEARCH.")
 
 
 if __name__ == "__main__":

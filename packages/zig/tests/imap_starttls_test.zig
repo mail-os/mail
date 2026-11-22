@@ -333,24 +333,24 @@ test "MaildirFlags.toImapString empty flags" {
     try testing.expectEqual(@as(usize, 0), result.len);
 }
 
-test "MaildirFlags.applyAction adds flags with +FLAGS" {
-    var flags = imap.MaildirFlags{ .seen = true };
-    flags.applyAction("+FLAGS (\\Flagged \\Answered)");
+test "MaildirFlags.applyStoreFlags adds flags with +FLAGS" {
+    const before = imap.MaildirFlags{ .seen = true };
+    const flags = before.applyStoreFlags(.{ .flagged = true, .answered = true }, .add);
     try testing.expect(flags.seen); // preserved
     try testing.expect(flags.flagged); // added
     try testing.expect(flags.answered); // added
 }
 
-test "MaildirFlags.applyAction removes flags with -FLAGS" {
-    var flags = imap.MaildirFlags{ .seen = true, .flagged = true };
-    flags.applyAction("-FLAGS (\\Seen)");
+test "MaildirFlags.applyStoreFlags removes flags with -FLAGS" {
+    const before = imap.MaildirFlags{ .seen = true, .flagged = true };
+    const flags = before.applyStoreFlags(.{ .seen = true }, .remove);
     try testing.expect(!flags.seen); // removed
     try testing.expect(flags.flagged); // preserved
 }
 
-test "MaildirFlags.applyAction replaces all flags with FLAGS" {
-    var flags = imap.MaildirFlags{ .seen = true, .flagged = true, .answered = true };
-    flags.applyAction("FLAGS (\\Deleted)");
+test "MaildirFlags.applyStoreFlags replaces all flags with FLAGS" {
+    const before = imap.MaildirFlags{ .seen = true, .flagged = true, .answered = true };
+    const flags = before.applyStoreFlags(.{ .deleted = true }, .replace);
     try testing.expect(!flags.seen);
     try testing.expect(!flags.flagged);
     try testing.expect(!flags.answered);

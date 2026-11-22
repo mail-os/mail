@@ -12,6 +12,7 @@ const logger = @import("../core/logger.zig");
 const log_safe = @import("../core/log_safe.zig");
 const tls_mod = @import("../core/tls.zig");
 const tls = @import("tls");
+const search = @import("imap_search.zig");
 const hosted_limits = @import("../storage/hosted_limits.zig");
 const maildir_keywords = @import("../storage/maildir_keywords.zig");
 const message_refs = @import("../storage/message_refs.zig");
@@ -577,6 +578,28 @@ pub const MaildirFlags = struct {
         maildir_keywords.writeLetters(writer, self.keywords) catch {};
         return fbs.getWritten();
     }
+
+    pub fn applyStoreFlags(before: MaildirFlags, requested: MaildirFlags, mode: FlagMode) MaildirFlags {
+        return switch (mode) {
+            .replace => requested,
+            .add => .{
+                .seen = before.seen or requested.seen,
+                .answered = before.answered or requested.answered,
+                .flagged = before.flagged or requested.flagged,
+                .draft = before.draft or requested.draft,
+                .deleted = before.deleted or requested.deleted,
+                .keywords = before.keywords | requested.keywords,
+            },
+            .remove => .{
+                .seen = before.seen and !requested.seen,
+                .answered = before.answered and !requested.answered,
+                .flagged = before.flagged and !requested.flagged,
+                .draft = before.draft and !requested.draft,
+                .deleted = before.deleted and !requested.deleted,
+                .keywords = before.keywords & ~requested.keywords,
+            },
+        };
+    }
 };
 
 const FlagMode = enum { replace, add, remove };
@@ -630,28 +653,6 @@ const StoreFlags = struct {
         return .{ .mode = mode, .silent = silent, .flags = try FlagList.parse(inner) };
     }
 };
-
-fn applyStoreFlags(before: MaildirFlags, requested: MaildirFlags, mode: FlagMode) MaildirFlags {
-    return switch (mode) {
-        .replace => requested,
-        .add => .{
-            .seen = before.seen or requested.seen,
-            .answered = before.answered or requested.answered,
-            .flagged = before.flagged or requested.flagged,
-            .draft = before.draft or requested.draft,
-            .deleted = before.deleted or requested.deleted,
-            .keywords = before.keywords | requested.keywords,
-        },
-        .remove => .{
-            .seen = before.seen and !requested.seen,
-            .answered = before.answered and !requested.answered,
-            .flagged = before.flagged and !requested.flagged,
-            .draft = before.draft and !requested.draft,
-            .deleted = before.deleted and !requested.deleted,
-            .keywords = before.keywords & ~requested.keywords,
-        },
-    };
-}
 
 const AggregateMailboxEntry = struct {
     filename: []const u8,
@@ -743,6 +744,20 @@ fn storedInternalDate(filename: []const u8) ?i64 {
     return if (seconds >= earliest_internal_date and seconds <= latest_internal_date) seconds else null;
 }
 
+fn filenameInternalDate(filename: []const u8) ?i64 {
+    if (storedInternalDate(filename)) |seconds| return seconds;
+    const base = MaildirFlags.baseName(std.fs.path.basename(filename));
+    const stem = if (std.mem.endsWith(u8, base, ".eml")) base[0 .. base.len - 4] else base;
+    const millis = std.fmt.parseInt(i64, stem, 10) catch return null;
+    return @divFloor(millis, 1000);
+}
+
+fn legacyInternalDate(header: []const u8, buf: *[64]u8) []const u8 {
+    const start = (std.mem.indexOf(u8, header, "Date: ") orelse return "01-Jan-2026 00:00:00 +0000") + 6;
+    const raw = header[start .. std.mem.indexOfAnyPos(u8, header, start, "\r\n") orelse header.len];
+    return parseAndFormatRfc2822Date(raw, buf) orelse raw;
+}
+
 pub fn parseMessageSortKey(filename: []const u8) i64 {
     const basename = if (std.mem.lastIndexOfScalar(u8, filename, '/')) |pos| filename[pos + 1 ..] else filename;
     const no_flags = MaildirFlags.baseName(basename);
@@ -802,44 +817,6 @@ fn matchListPattern(pattern: []const u8, name: []const u8) bool {
         }
     }
     return ni >= name.len;
-}
-
-/// Extract a quoted or unquoted argument from the remainder of a string.
-/// e.g. `" \"hello world\" ..."` -> `"hello world"`, `" foo ..."` -> `"foo"`.
-fn extractQuotedArg(rest: []const u8) []const u8 {
-    const trimmed = std.mem.trim(u8, rest, " \t");
-    if (trimmed.len == 0) return "";
-    if (trimmed[0] == '"') {
-        // Quoted: find closing quote
-        if (std.mem.indexOfScalarPos(u8, trimmed, 1, '"')) |end| {
-            return trimmed[1..end];
-        }
-        return trimmed[1..]; // unclosed quote — take rest
-    }
-    // Unquoted: take until space or end
-    const end = std.mem.indexOfScalar(u8, trimmed, ' ') orelse trimmed.len;
-    return trimmed[0..end];
-}
-
-/// Case-insensitively check whether `criteria` contains `keyword` as a
-/// standalone token (delimited by start/end of string, whitespace, or
-/// parentheses) rather than as a substring of a larger word. Used by SEARCH so
-/// that e.g. a quoted search term cannot accidentally trigger a keyword match.
-fn hasCriteriaToken(criteria: []const u8, keyword: []const u8) bool {
-    if (keyword.len == 0) return false;
-    var search_from: usize = 0;
-    while (ascii_compat.indexOfIgnoreCasePos(criteria, search_from, keyword)) |pos| {
-        const before_ok = pos == 0 or isCriteriaDelimiter(criteria[pos - 1]);
-        const after_idx = pos + keyword.len;
-        const after_ok = after_idx >= criteria.len or isCriteriaDelimiter(criteria[after_idx]);
-        if (before_ok and after_ok) return true;
-        search_from = pos + 1;
-    }
-    return false;
-}
-
-fn isCriteriaDelimiter(c: u8) bool {
-    return c == ' ' or c == '\t' or c == '(' or c == ')';
 }
 
 const ParsedImapArg = struct {
@@ -1000,6 +977,31 @@ fn headerEnd(content: []const u8) usize {
         pos = next;
     }
     return content.len;
+}
+
+/// Match an exact field name and search its unfolded value. An empty term
+/// checks for the presence of the named field.
+fn searchHeader(a: std.mem.Allocator, header: []const u8, field: []const u8, term: []const u8) !?[]const u8 {
+    var lines = std.mem.splitScalar(u8, header, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len == 0) break;
+        if (line[0] == ' ' or line[0] == '\t') continue;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..colon], field)) continue;
+
+        var value = line[colon + 1 ..];
+        var unfolded: std.ArrayList(u8) = .empty;
+        while (lines.peek()) |continuation| {
+            if (continuation.len == 0 or (continuation[0] != ' ' and continuation[0] != '\t')) break;
+            _ = lines.next();
+            if (unfolded.items.len == 0) try unfolded.appendSlice(a, value);
+            try unfolded.appendSlice(a, std.mem.trimEnd(u8, continuation, "\r"));
+        }
+        if (unfolded.items.len != 0) value = unfolded.items;
+        if (ascii_compat.indexOfIgnoreCase(value, term) != null) return value;
+    }
+    return null;
 }
 
 /// A header section requested by FETCH: `BODY[HEADER]`,
@@ -3109,26 +3111,10 @@ pub const ImapSession = struct {
             // Use the recorded internal date. Older messages keep their
             // existing timestamp or Date-header fallback.
             var date_buf: [64]u8 = undefined;
-            var date_str: []const u8 = "01-Jan-2026 00:00:00 +0000";
-            // Try to parse epoch millis from filename (e.g., "1772259313773.eml")
-            const basename = if (std.mem.lastIndexOfScalar(u8, filename, '/')) |pos| filename[pos + 1 ..] else filename;
-            const base_no_flags = MaildirFlags.baseName(basename);
-            const name_no_ext = if (std.mem.endsWith(u8, base_no_flags, ".eml")) base_no_flags[0 .. base_no_flags.len - 4] else base_no_flags;
-            if (storedInternalDate(filename)) |seconds| {
-                date_str = formatImapDate(seconds, &date_buf);
-            } else if (std.fmt.parseInt(i64, name_no_ext, 10)) |epoch_ms| {
-                date_str = formatImapDate(@divFloor(epoch_ms, 1000), &date_buf);
-            } else |_| {
-                // Try Date header
-                if (std.mem.indexOf(u8, header, "Date: ")) |date_pos| {
-                    const date_start = date_pos + 6;
-                    const date_line_end = std.mem.indexOfScalarPos(u8, header, date_start, '\r') orelse
-                        std.mem.indexOfScalarPos(u8, header, date_start, '\n') orelse header.len;
-                    const raw_date = header[date_start..date_line_end];
-                    // Try to parse RFC 2822 date and reformat
-                    date_str = parseAndFormatRfc2822Date(raw_date, &date_buf) orelse raw_date;
-                }
-            }
+            const date_str = if (filenameInternalDate(filename)) |seconds|
+                formatImapDate(seconds, &date_buf)
+            else
+                legacyInternalDate(header, &date_buf);
 
             // Determine content type for BODYSTRUCTURE
             var content_type: []const u8 = "text/plain";
@@ -3278,9 +3264,6 @@ pub const ImapSession = struct {
         try self.sendResponse(tag, "OK", "FETCH completed");
     }
 
-    /// Handle SEARCH command — evaluate criteria against messages.
-    /// Supports: ALL, SEEN, UNSEEN, FLAGGED, UNFLAGGED, DELETED, UNDELETED,
-    /// ANSWERED, UNANSWERED, DRAFT, UNDRAFT, FROM, SUBJECT, SINCE, BEFORE.
     const SearchIdentity = struct {
         username: []const u8,
         mailbox: ?[]const u8,
@@ -3316,87 +3299,140 @@ pub const ImapSession = struct {
         return .{ .username = username, .mailbox = self.mailbox_name orelse "INBOX" };
     }
 
-    /// Find `keyword` as a standalone criteria token and return the index
-    /// just past it (where its argument starts), or null.
-    fn findCriteriaToken(criteria: []const u8, keyword: []const u8) ?usize {
-        var search_from: usize = 0;
-        while (ascii_compat.indexOfIgnoreCasePos(criteria, search_from, keyword)) |pos| {
-            const before_ok = pos == 0 or isCriteriaDelimiter(criteria[pos - 1]);
-            const after_idx = pos + keyword.len;
-            const after_ok = after_idx >= criteria.len or isCriteriaDelimiter(criteria[after_idx]);
-            if (before_ok and after_ok) return after_idx;
-            search_from = pos + 1;
-        }
-        return null;
-    }
+    const SearchHits = std.StringHashMapUnmanaged(void);
 
-    /// Run the text criteria (FROM/TO/SUBJECT/BODY/TEXT) against the
-    /// Typesense index, intersecting per-criterion result sets (IMAP
-    /// criteria are ANDed). Returns null when no text criterion is present;
-    /// errors bubble up so the caller can fall back to the file scan.
-    /// Keys are owned base filenames (free each + deinit).
-    fn typesenseSearchMatches(self: *ImapSession, criteria: []const u8) !?std.StringHashMap(void) {
+    fn searchTextIndex(self: *ImapSession, a: std.mem.Allocator, term: search.Text) !?SearchHits {
         const ident = self.searchIdentity() orelse return null;
+        const field = term.index_field orelse return null;
+        if (term.term.len == 0) return null;
 
-        const Criterion = struct { keyword: []const u8, query_by: []const u8 };
-        const criterion_table = [_]Criterion{
-            .{ .keyword = "FROM", .query_by = "sender" },
-            .{ .keyword = "SUBJECT", .query_by = "subject" },
-            .{ .keyword = "TO", .query_by = "recipients" },
-            .{ .keyword = "BODY", .query_by = "body" },
-            .{ .keyword = "TEXT", .query_by = "subject,sender,recipients,body" },
-        };
+        const names = try typesense.searchFilenames(self.allocator, ident.username, ident.mailbox, term.term, field);
+        defer {
+            for (names) |name| self.allocator.free(name);
+            self.allocator.free(names);
+        }
+        var hits: SearchHits = .empty;
+        for (names) |name| {
+            if (!hits.contains(name)) try hits.put(a, try a.dupe(u8, name), {});
+        }
+        return hits;
+    }
 
-        var result: ?std.StringHashMap(void) = null;
-        errdefer if (result) |*m| freeMatchSet(self.allocator, m);
+    const SearchMessage = struct {
+        const KeywordMaps = std.StringHashMapUnmanaged(maildir_keywords.Names);
 
-        for (criterion_table) |c| {
-            const arg_start = findCriteriaToken(criteria, c.keyword) orelse continue;
-            const term = extractQuotedArg(criteria[arg_start..]);
-            if (term.len == 0) continue;
+        session: *ImapSession,
+        resolver: *MaildirNameResolver,
+        keyword_maps: *KeywordMaps,
+        query_allocator: std.mem.Allocator,
+        allocator: std.mem.Allocator,
+        seq: usize,
+        uid: i64,
+        max_seq: i64,
+        max_uid: i64,
+        terms: []const search.Text,
+        indexed: []const ?SearchHits,
+        filename: ?[]const u8 = null,
+        filepath: ?[]const u8 = null,
+        content: ?[]const u8 = null,
 
-            const names = try typesense.searchFilenames(self.allocator, ident.username, ident.mailbox, term, c.query_by);
-            defer {
-                for (names) |n| self.allocator.free(n);
-                self.allocator.free(names);
-            }
-
-            if (result == null) {
-                var m = std.StringHashMap(void).init(self.allocator);
-                errdefer freeMatchSet(self.allocator, &m);
-                for (names) |n| {
-                    if (m.contains(n)) continue;
-                    const key = try self.allocator.dupe(u8, n);
-                    errdefer self.allocator.free(key);
-                    try m.put(key, {});
-                }
-                result = m;
-            } else {
-                // Intersect: drop existing keys absent from this criterion's hits
-                var keep = std.StringHashMap(void).init(self.allocator);
-                defer keep.deinit();
-                for (names) |n| try keep.put(n, {});
-
-                var stale: std.ArrayList([]const u8) = .empty;
-                defer stale.deinit(self.allocator);
-                var it = result.?.keyIterator();
-                while (it.next()) |k| {
-                    if (!keep.contains(k.*)) try stale.append(self.allocator, k.*);
-                }
-                for (stale.items) |k| {
-                    if (result.?.fetchRemove(k)) |removed| self.allocator.free(removed.key);
-                }
-            }
+        fn name(self: *SearchMessage) ![]const u8 {
+            if (self.filename) |value| return value;
+            const value = self.session.adoptCurrentName(self.resolver, self.seq - 1) orelse return error.FileNotFound;
+            self.filename = value;
+            return value;
         }
 
-        return result;
-    }
+        fn path(self: *SearchMessage) ![]const u8 {
+            if (self.filepath) |value| return value;
+            const dir = self.session.selectedMessageDirForIndex(self.seq - 1) orelse return error.NoMailboxSelected;
+            const value = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir, try self.name() });
+            self.filepath = value;
+            return value;
+        }
 
-    fn freeMatchSet(allocator: std.mem.Allocator, m: *std.StringHashMap(void)) void {
-        var it = m.keyIterator();
-        while (it.next()) |k| allocator.free(k.*);
-        m.deinit();
-    }
+        fn read(self: *SearchMessage) ![]const u8 {
+            if (self.content) |value| return value;
+            const value = try fs_compat.readFileAlloc(self.allocator, try self.path());
+            self.content = value;
+            return value;
+        }
+
+        fn hasKeyword(self: *SearchMessage, keyword: []const u8) !bool {
+            const bits = MaildirFlags.fromFilename(try self.name()).keywords;
+            if (bits == 0) return false;
+            const dir = self.session.selectedMessageDirForIndex(self.seq - 1) orelse return error.NoMailboxSelected;
+            const a = self.query_allocator;
+            if (self.keyword_maps.getPtr(dir)) |names| {
+                // A STORE from another connection may have introduced a letter
+                // after this search cached the mapping.
+                if (bits & ~names.defined() != 0)
+                    names.* = (try maildir_keywords.Mapping.open(a, dir)).names;
+                return bits & names.find(keyword) != 0;
+            }
+            const names = (try maildir_keywords.Mapping.open(a, dir)).names;
+            try self.keyword_maps.put(a, dir, names);
+            return bits & names.find(keyword) != 0;
+        }
+
+        fn matchesText(self: *SearchMessage, id: usize) !bool {
+            if (self.indexed[id]) |hits|
+                return hits.contains(MaildirFlags.baseName(try self.name()));
+
+            const term = self.terms[id];
+            const content = try self.read();
+            return switch (term.field) {
+                .message => ascii_compat.indexOfIgnoreCase(content, term.term) != null,
+                .body => ascii_compat.indexOfIgnoreCase(content[headerEnd(content)..], term.term) != null,
+                .header => (try searchHeader(self.allocator, content[0..headerEnd(content)], term.header, term.term)) != null,
+            };
+        }
+
+        fn matchesDate(self: *SearchMessage, criterion: search.Date) !bool {
+            var date_buf: [64]u8 = undefined;
+            const formatted = if (criterion.sent) blk: {
+                const content = try self.read();
+                const raw = try searchHeader(self.allocator, content[0..headerEnd(content)], "Date", "") orelse return false;
+                break :blk parseAndFormatRfc2822Date(raw, &date_buf) orelse return false;
+            } else if (filenameInternalDate(try self.name())) |seconds|
+                formatImapDate(seconds, &date_buf)
+            else blk: {
+                const content = try self.read();
+                break :blk legacyInternalDate(content[0..headerEnd(content)], &date_buf);
+            };
+            const day = search.parseDay(formatted[0 .. std.mem.indexOfScalar(u8, formatted, ' ') orelse formatted.len]) orelse return false;
+            return switch (criterion.relation) {
+                .before => day < criterion.day,
+                .on => day == criterion.day,
+                .since => day >= criterion.day,
+            };
+        }
+
+        pub fn matchesLeaf(self: *SearchMessage, predicate: search.Node) !bool {
+            return switch (predicate) {
+                .flag => |flag| blk: {
+                    const flags = MaildirFlags.fromFilename(try self.name());
+                    const set = switch (flag.name) {
+                        .answered => flags.answered,
+                        .deleted => flags.deleted,
+                        .draft => flags.draft,
+                        .flagged => flags.flagged,
+                        .seen => flags.seen,
+                    };
+                    break :blk set == flag.required;
+                },
+                .keyword => |keyword| (try self.hasKeyword(keyword.name)) == keyword.required,
+                .set => |set| if (set.uid) set.contains(self.uid, self.max_uid) else set.contains(@intCast(self.seq), self.max_seq),
+                .text => |id| self.matchesText(id),
+                .date => |criterion| self.matchesDate(criterion),
+                .size => |size| blk: {
+                    const bytes = try fs_compat.getFileSize(try self.path());
+                    break :blk if (size.larger) bytes > size.bytes else bytes < size.bytes;
+                },
+                else => unreachable,
+            };
+        }
+    };
 
     fn handleSearch(self: *ImapSession, tag: []const u8, criteria: []const u8) !void {
         return self.handleSearchImpl(tag, criteria, false);
@@ -3412,159 +3448,64 @@ pub const ImapSession = struct {
             return;
         }
 
-        const files = self.mailbox_files orelse {
-            try self.sendUntagged("SEARCH");
-            try self.sendResponse(tag, "OK", "SEARCH completed");
-            return;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const query = search.parse(a, if (criteria.len == 0) "ALL" else criteria) catch |err| switch (err) {
+            error.UnsupportedCharset => return self.sendResponse(tag, "NO", "[BADCHARSET (US-ASCII UTF-8)] Unsupported search charset"),
+            error.UnsupportedSearchKey => return self.sendResponse(tag, "BAD", "Unsupported SEARCH key"),
+            error.InvalidSearch => return self.sendResponse(tag, "BAD", "Invalid SEARCH criteria"),
+            else => return err,
         };
 
-        // Parse criteria (case insensitive). Match keywords as whitespace- or
-        // paren-delimited tokens, not bare substrings, so a FROM/SUBJECT term
-        // like "marshall" cannot be mistaken for the ALL key (which would
-        // otherwise match every message).
-        const is_all = criteria.len == 0 or hasCriteriaToken(criteria, "ALL");
-        const want_seen = ascii_compat.indexOfIgnoreCase(criteria, "SEEN") != null and
-            ascii_compat.indexOfIgnoreCase(criteria, "UNSEEN") == null;
-        const want_unseen = ascii_compat.indexOfIgnoreCase(criteria, "UNSEEN") != null;
-        const want_flagged = ascii_compat.indexOfIgnoreCase(criteria, "FLAGGED") != null and
-            ascii_compat.indexOfIgnoreCase(criteria, "UNFLAGGED") == null;
-        const want_unflagged = ascii_compat.indexOfIgnoreCase(criteria, "UNFLAGGED") != null;
-        const want_deleted = ascii_compat.indexOfIgnoreCase(criteria, "DELETED") != null and
-            ascii_compat.indexOfIgnoreCase(criteria, "UNDELETED") == null;
-        const want_undeleted = ascii_compat.indexOfIgnoreCase(criteria, "UNDELETED") != null;
-        const want_answered = ascii_compat.indexOfIgnoreCase(criteria, "ANSWERED") != null and
-            ascii_compat.indexOfIgnoreCase(criteria, "UNANSWERED") == null;
-        const want_unanswered = ascii_compat.indexOfIgnoreCase(criteria, "UNANSWERED") != null;
-
-        // Parse UID range criteria (e.g. "UID 4:*", "UID 1,3,5")
-        var uid_range_start: i64 = 0;
-        var uid_range_end: i64 = std.math.maxInt(i64);
-        var has_uid_range = false;
-        if (ascii_compat.indexOfIgnoreCase(criteria, "UID")) |uid_pos| {
-            // Make sure this is the UID keyword, not part of another word
-            const after_uid = uid_pos + 3;
-            if (after_uid < criteria.len) {
-                const rest = std.mem.trim(u8, criteria[after_uid..], " \t");
-                if (rest.len > 0) {
-                    has_uid_range = true;
-                    if (std.mem.indexOf(u8, rest, ":")) |colon| {
-                        uid_range_start = std.fmt.parseInt(i64, rest[0..colon], 10) catch 1;
-                        const end_part = rest[colon + 1 ..];
-                        // End part might have trailing spaces or other criteria
-                        const end_token = if (std.mem.indexOfAny(u8, end_part, " \t")) |sp| end_part[0..sp] else end_part;
-                        if (std.mem.eql(u8, end_token, "*")) {
-                            uid_range_end = std.math.maxInt(i64);
-                        } else {
-                            uid_range_end = std.fmt.parseInt(i64, end_token, 10) catch std.math.maxInt(i64);
-                        }
-                    } else {
-                        // Single UID value
-                        const uid_token = if (std.mem.indexOfAny(u8, rest, " \t")) |sp| rest[0..sp] else rest;
-                        const single_uid = std.fmt.parseInt(i64, uid_token, 10) catch 0;
-                        if (single_uid > 0) {
-                            uid_range_start = single_uid;
-                            uid_range_end = single_uid;
-                        }
-                    }
-                }
-            }
+        const count = if (self.mailbox_files) |files| files.len else 0;
+        const indexed = try a.alloc(?SearchHits, query.text.len);
+        for (query.text, indexed) |term, *hits| {
+            hits.* = if (count > 0 and typesense.enabled()) self.searchTextIndex(a, term) catch null else null;
         }
 
-        // Resolve text criteria (FROM/TO/SUBJECT/BODY/TEXT) through the
-        // Typesense index when available: one indexed query instead of
-        // reading every message file. On error (engine down, not indexed)
-        // fall back to the per-file scan below.
-        var ts_matches: ?std.StringHashMap(void) = null;
-        defer if (ts_matches) |*m| freeMatchSet(self.allocator, m);
-        if (!is_all and typesense.enabled()) {
-            ts_matches = self.typesenseSearchMatches(criteria) catch null;
+        var max_uid: i64 = 0;
+        if (self.mailbox_uids) |uids| {
+            for (uids) |uid| max_uid = @max(max_uid, uid);
+        } else {
+            max_uid = @intCast(count);
         }
 
-        var buf: [8192]u8 = undefined;
-        var fbs = io_compat.fixedBufferStream(&buf);
-        const writer = fbs.writer();
-        writer.writeAll("SEARCH") catch {};
+        var resolver = MaildirNameResolver.init(self.allocator);
+        defer resolver.deinit();
+        var keyword_maps: SearchMessage.KeywordMaps = .empty;
+        var response = std.Io.Writer.Allocating.init(self.allocator);
+        defer response.deinit();
+        try response.writer.writeAll("SEARCH");
 
-        for (files, 0..) |filename, i| {
+        for (0..count) |i| {
+            var scratch = std.heap.ArenaAllocator.init(self.allocator);
+            defer scratch.deinit();
             const seq = i + 1;
-            const uid = self.getUidForSeq(seq);
-            const flags = MaildirFlags.fromFilename(filename);
-
-            // Filter by UID range if specified
-            if (has_uid_range) {
-                if (uid < uid_range_start or uid > uid_range_end) continue;
-            }
-
-            // Evaluate flag-based criteria
-            if (!is_all) {
-                if (want_seen and !flags.seen) continue;
-                if (want_unseen and flags.seen) continue;
-                if (want_flagged and !flags.flagged) continue;
-                if (want_unflagged and flags.flagged) continue;
-                if (want_deleted and !flags.deleted) continue;
-                if (want_undeleted and flags.deleted) continue;
-                if (want_answered and !flags.answered) continue;
-                if (want_unanswered and flags.answered) continue;
-
-                // Text-based criteria, indexed path: membership in the
-                // Typesense result set (keyed by maildir base name).
-                if (ts_matches) |*m| {
-                    if (!m.contains(MaildirFlags.baseName(filename))) continue;
-                }
-
-                // Text-based criteria, fallback path: FROM, SUBJECT —
-                // require reading the file
-                const need_content = ts_matches == null and
-                    (ascii_compat.indexOfIgnoreCase(criteria, "FROM") != null or
-                        ascii_compat.indexOfIgnoreCase(criteria, "SUBJECT") != null);
-                if (need_content) {
-                    const filepath = self.allocSelectedMessagePath(i, filename) catch continue;
-                    defer self.allocator.free(filepath);
-                    const content = fs_compat.readFileAlloc(self.allocator, filepath) catch continue;
-                    defer self.allocator.free(content);
-
-                    // Find header boundary
-                    const hdr_end = if (std.mem.indexOf(u8, content, "\r\n\r\n")) |p| p else if (std.mem.indexOf(u8, content, "\n\n")) |p| p else content.len;
-                    const hdr = content[0..hdr_end];
-
-                    var matches = true;
-                    // Extract FROM search term
-                    if (ascii_compat.indexOfIgnoreCase(criteria, "FROM")) |from_pos| {
-                        const after = criteria[from_pos + 4 ..];
-                        const term = extractQuotedArg(after);
-                        if (term.len > 0) {
-                            if (ascii_compat.indexOfIgnoreCase(hdr, "From:")) |fp| {
-                                const from_line_end = std.mem.indexOfScalarPos(u8, hdr, fp, '\n') orelse hdr.len;
-                                const from_line = hdr[fp..from_line_end];
-                                if (ascii_compat.indexOfIgnoreCase(from_line, term) == null) matches = false;
-                            } else {
-                                matches = false;
-                            }
-                        }
-                    }
-                    // Extract SUBJECT search term
-                    if (ascii_compat.indexOfIgnoreCase(criteria, "SUBJECT")) |subj_pos| {
-                        const after = criteria[subj_pos + 7 ..];
-                        const term = extractQuotedArg(after);
-                        if (term.len > 0) {
-                            if (ascii_compat.indexOfIgnoreCase(hdr, "Subject:")) |sp| {
-                                const subj_line_end = std.mem.indexOfScalarPos(u8, hdr, sp, '\n') orelse hdr.len;
-                                const subj_line = hdr[sp..subj_line_end];
-                                if (ascii_compat.indexOfIgnoreCase(subj_line, term) == null) matches = false;
-                            } else {
-                                matches = false;
-                            }
-                        }
-                    }
-                    if (!matches) continue;
-                }
-            }
-
-            const result_id: i64 = if (is_uid) uid else @intCast(seq);
-            writer.print(" {d}", .{result_id}) catch break;
+            var message = SearchMessage{
+                .session = self,
+                .resolver = &resolver,
+                .keyword_maps = &keyword_maps,
+                .query_allocator = a,
+                .allocator = scratch.allocator(),
+                .seq = seq,
+                .uid = self.getUidForSeq(seq),
+                .max_seq = @intCast(count),
+                .max_uid = max_uid,
+                .terms = query.text,
+                .indexed = indexed,
+            };
+            const matches = query.root.matches(&message) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => {
+                    std.log.warn("Could not evaluate IMAP SEARCH: {s}", .{@errorName(err)});
+                    return self.sendResponse(tag, "NO", "[SERVERBUG] Could not search mailbox");
+                },
+            };
+            if (matches) try response.writer.print(" {d}", .{if (is_uid) message.uid else @as(i64, @intCast(seq))});
         }
 
-        try self.sendUntagged(fbs.getWritten());
+        try self.sendUntagged(response.written());
         try self.sendResponse(tag, "OK", "SEARCH completed");
     }
 
@@ -4046,7 +3987,7 @@ pub const ImapSession = struct {
                     mapping.save(a) catch break :blk before;
                     limit_reached = limit_reached or !mapping.names.hasCapacity();
                 }
-                const next = applyStoreFlags(before, requested, action.mode);
+                const next = before.applyStoreFlags(requested, action.mode);
                 stored = self.writeMessageFlagsLocked(idx, filename, next);
                 break :blk if (stored) next else before;
             };
@@ -5249,14 +5190,14 @@ test "APPEND flag list maps to Maildir flags" {
 test "STORE adds and removes exact system flags and case-insensitive keywords" {
     const add = try StoreFlags.parse("+FLAGS.SILENT (\\Seen Review)");
     var names: maildir_keywords.Names = .{};
-    const first = applyStoreFlags(.{}, try add.flags.resolve(&names, add.mode), add.mode);
+    const first = (MaildirFlags{}).applyStoreFlags(try add.flags.resolve(&names, add.mode), add.mode);
     try std.testing.expect(add.silent and first.seen and !first.flagged);
     const more = try StoreFlags.parse("+FLAGS (\\Flagged review)");
-    const second = applyStoreFlags(first, try more.flags.resolve(&names, more.mode), more.mode);
+    const second = first.applyStoreFlags(try more.flags.resolve(&names, more.mode), more.mode);
     try std.testing.expect(second.seen and second.flagged);
     try std.testing.expectEqual(first.keywords, second.keywords);
     const remove = try StoreFlags.parse("-FLAGS (\\Seen REVIEW)");
-    const last = applyStoreFlags(second, try remove.flags.resolve(&names, remove.mode), remove.mode);
+    const last = second.applyStoreFlags(try remove.flags.resolve(&names, remove.mode), remove.mode);
     try std.testing.expect(!last.seen and last.flagged);
     try std.testing.expectEqual(@as(maildir_keywords.Bits, 0), last.keywords);
 }
@@ -5264,10 +5205,10 @@ test "STORE adds and removes exact system flags and case-insensitive keywords" {
 test "STORE replaces flags and refuses malformed atoms" {
     var names: maildir_keywords.Names = .{};
     const requested = try StoreFlags.parse("FLAGS (\\Answered Ledger)");
-    const first = applyStoreFlags(.{ .seen = true }, try requested.flags.resolve(&names, requested.mode), requested.mode);
+    const first = (MaildirFlags{ .seen = true }).applyStoreFlags(try requested.flags.resolve(&names, requested.mode), requested.mode);
     try std.testing.expect(first.answered and !first.seen and first.keywords != 0);
     const empty = try StoreFlags.parse("FLAGS ()");
-    try std.testing.expectEqual(MaildirFlags{}, applyStoreFlags(first, try empty.flags.resolve(&names, empty.mode), empty.mode));
+    try std.testing.expectEqual(MaildirFlags{}, first.applyStoreFlags(try empty.flags.resolve(&names, empty.mode), empty.mode));
     try std.testing.expectError(error.InvalidKeyword, StoreFlags.parse("FLAGS (\\Unknown)"));
     try std.testing.expectError(error.InvalidKeyword, StoreFlags.parse("FLAGS (invalid%atom)"));
     try std.testing.expectError(error.InvalidStoreFlags, StoreFlags.parse("ADDFLAGS (Ledger)"));

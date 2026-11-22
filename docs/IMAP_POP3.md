@@ -206,7 +206,15 @@ A008 OK SEARCH completed
 A009 SEARCH SINCE 1-Jan-2024
 * SEARCH 4 5
 A009 OK SEARCH completed
+
+# Search saved keywords and return message UIDs
+A010 UID SEARCH KEYWORD Reviewed UNKEYWORD NeedsReply
+* SEARCH 42 57
+A010 OK SEARCH completed
 ```
+
+Keyword names are case-insensitive. Mail resolves them against each message's
+folder, including when searching across folders in a virtual mailbox.
 
 ### Set Message Flags
 
