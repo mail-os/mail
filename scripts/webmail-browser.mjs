@@ -69,11 +69,8 @@ async function verifyControlRow(container, selector, height, sameRow = true) {
   const controls = await container.locator(selector).evaluateAll(nodes => nodes.map((node) => {
     const style = getComputedStyle(node)
     const box = node.getBoundingClientRect()
-    const sample = document.createElement('span')
-    sample.style.color = 'var(--control-border)'
-    node.parentElement.append(sample)
-    const border = getComputedStyle(sample).color
-    sample.remove()
+    const borderChannels = style.getPropertyValue('--control-border').trim().slice(1).match(/../g)
+    const border = `rgb(${borderChannels.map(channel => Number.parseInt(channel, 16)).join(', ')})`
     return {
       name: node.getAttribute('aria-label') || node.labels?.[0]?.textContent.trim() || node.textContent.trim(),
       height: box.height,
@@ -591,13 +588,13 @@ async function calendarSharingJourney(captain) {
   await sharing.getByLabel('Teammate').fill(sender)
   await sharing.getByRole('combobox', { name: /^Access\b/ }).selectOption('viewer')
   await heading(captain, 'Share a calendar').click()
+  await captain.locator('.calendar-loading').waitFor({ state: 'hidden' })
   const shareForm = sharing.locator('form')
   assert.equal((await verifyControlRow(shareForm, 'select, input, button', 36)).length, 5)
   await captain.emulateMedia({ colorScheme: 'dark' })
   await verifyControlRow(shareForm, 'select, input, button', 36)
   await screenshot(captain, 'desktop-calendar-selects-dark')
   await captain.emulateMedia({ colorScheme: 'light' })
-  await captain.locator('.calendar-loading').waitFor({ state: 'hidden' })
   await screenshot(captain, 'desktop-calendar-selects')
   await button(sharing, 'Share calendar').click()
   const role = captain.getByRole('combobox', { name: `Access for ${sender} to ${calendarLabel}` })
