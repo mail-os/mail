@@ -45,7 +45,7 @@ test "autosave preserves unfinished recipients, names, bytes and conditional rev
     const binary = try a.alloc(u8, 1024 * 1024);
     @memset(binary, 0xff);
     binary[0] = 0;
-    try store.addUpload(&db, user, .{ .id = "2234567890123456", .filename = "large.bin", .content_type = "application/octet-stream", .data = binary }, 100, 2 * 1024 * 1024);
+    try store.addUpload(&db, user, .{ .id = "2234567890123456", .filename = "large.bin", .content_type = "application/octet-stream", .data = binary }, 100, 2 * 1024 * 1024, 128);
     payload.draftRevision = second.revision;
     payload.saveToken = "save-three";
     payload.attachments = &.{.{ .uploadId = "2234567890123456" }};

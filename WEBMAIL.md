@@ -15,13 +15,89 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   Bulk archive, move, read/unread, flag and Trash return per-message results.
   Recoverable actions offer Undo for 30 seconds, with fresh UIDs on restored moves.
   Permanent deletion requires explicit confirmation and has no Undo.
+- Choose **Next unread** to read through the active folder or search, including
+  unread messages beyond the current page. It wraps to earlier unread mail when
+  it reaches the end. Choose **Read selected** to work through a batch in order.
+  Use **Archive & next** or **Trash & next** to continue after filing a message.
+  **Keyboard shortcuts** lists the keys for reading, selection, and Undo.
+- Local sends are acknowledged after the server records their recipient
+  outcomes and reserves storage. If a Maildir write is interrupted, recovery
+  finishes the accepted copy. Inbox counts, search indexing, and arrival
+  webhooks follow committed Inbox delivery.
+- Sender Review groups held messages by sender and shows their verification
+  and envelope destination. **Allow sender** releases held mail and sets the
+  rule for future verified messages. **Allow and reply** opens an editable
+  reply. **Decline sender** sends held and future verified mail to Declined.
+  Recover a single message from Declined or edit the sender's rule in Decisions.
+- A decision on an unverified copy applies to that message only. New hosted
+  mailboxes enable Sender Review when the user completes inbox setup. Existing
+  mailboxes can turn it on in Account settings. Turning it off lets new mail
+  reach the inbox while preserving the existing review list and decisions.
+- **Mark junk** moves one message or a selection into Junk. **Not junk**
+  returns messages to their previous folder when it still exists, or to Inbox.
+  **Undo** reverses the move and its feedback. The folder and message changes
+  are visible in IMAP.
+- Junk feedback affects future mail from the same verified sender in your
+  mailbox. Marking an unauthenticated message changes only that copy. Not Junk
+  can recover a future soft spam classification, subject to Sender Review.
+  Malware and SMTP rejections still apply. Ordinary moves do not change the
+  sender preference.
+- Newsletters and Receipts are mailbox folders shared with IMAP. The web views
+  group messages by sender under **Unread** and **Previously read**. Newsletters
+  open in an expanded reader. Receipts open with a short preview and attachment
+  links, with the full message one click away.
+- Formatted mail blocks remote images by default, including during batch
+  reading. **Load remote images** applies to the open message until you leave
+  it. Images embedded in the message can display offline. **Show plain text**
+  switches to the sender's text version, when available. Receipt previews
+  display text only.
+- Turn on **Browser notifications** in Account and allow the browser prompt.
+  A signed-in browser with webmail open can show “You have new mail.” Set
+  **Notification rules** in the reader for a thread or verified sender.
+  Thread rules take precedence over sender rules. Muted threads and threads
+  still snoozed at delivery stay quiet.
+- Turn on **Automatic sorting** in Account to file new messages from verified
+  senders using mailing-list headers and common receipt subject lines. Sender
+  Review runs first. **Move this message** changes the current copy. **Save
+  sender rule** applies your chosen folder to future verified mail from that
+  sender. Choose **Use account sorting** to clear the rule. The reader shows
+  where the message was delivered and why.
+- Add a conversation to **Follow-up** and choose **Next reply** to work through
+  the queue one conversation at a time. A reply can clear the mark after
+  successful delivery. **Saved** keeps the specific message, including when
+  the message moves to another folder.
+- **Snooze thread** hides the conversation from webmail's Inbox and category
+  views until the selected local time or a new reply. **Mute thread** keeps
+  the conversation out of those views and suppresses arrival notifications
+  until you unmute it. Messages remain available in **All mail** and IMAP.
+- In Sent, choose **Remind me if no reply** and pick a deadline in your
+  browser's time zone. A reply cancels the reminder. Due reminders appear
+  in webmail and can be dismissed there. Automatic replies keep scheduled
+  snoozes and reminders in place.
 - To/Cc/Bcc use recipient chips, keyboard contact selection and inline validation.
   Suggestions combine the account's CardDAV contacts with recent correspondents.
   Cc/Bcc remain collapsed until requested or restored from an existing draft.
-- Search supports all folders, sender, dates, unread, flagged and attachments.
-  Filtering and conversation grouping precede pagination. Conversations use
+- Search supports folder, sender, recipient, date, message status, flag, and
+  attachment filename filters. Mail builds a private SQLite index as needed and
+  displays progress while it indexes existing messages. The index checks live
+  Maildir files for new, changed, moved, and deleted messages. Filtering and
+  conversation grouping precede pagination. Conversations use
   Message-ID/In-Reply-To/References; unrelated messages with the same subject stay
   separate. Expanded members retain their own folder, UID and actions.
+- **Attachments** lists matching files across folders. Search by filename or
+  use the message filters to narrow the files. Each entry opens its source
+  message or downloads the file. Both actions verify the account and message
+  revision again.
+- Open **Private tools** to add a conversation note, save an excerpt as a
+  clip, set a personal subject, or add the conversation to **My collections**.
+  The reader shows the original subject alongside a personal subject.
+  Collections follow messages across folders. Notes and saved clips remain
+  available from the other messages in a conversation after one copy is
+  permanently deleted.
+- Select messages in a mail list and choose **Group selected** to join their
+  conversations. **Undo** removes that grouping for 30 seconds. Personal
+  changes stay in webmail. Replies, forwards, and IMAP clients use the
+  original messages and headers.
 - Attachments upload as binary data with progress, retry, removal and drag/drop.
   Account-scoped staging IDs survive draft recovery and make upload retries
   idempotent. Downloaded attachments retain their original bytes.
@@ -29,9 +105,126 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   even if the browser closes; cancellation is available before dispatch starts.
   Outbox records delivery results. A partial retry contains only failed recipients.
   Interrupted dispatch is marked Unknown and requires review before a manual retry.
-- When CalDAV is enabled, Calendar shows a read-only weekly agenda from the
-  account's existing calendars. Recurring series appear separately with their
-  start date. Use a CalDAV client to edit events or view individual occurrences.
+- When CalDAV is enabled, Calendar offers day, week, month, and 30-day agenda
+  views across all calendars or one selected calendar. Search matches titles,
+  locations, and descriptions across dates. Use **Manage calendars** to create
+  a calendar or change its color.
+- Create, edit, and delete events in the browser. The view and editor each have
+  a time zone selector. For all-day events, **Last day** includes that date.
+- Recurring dates appear in the calendar using the stored rule, additional
+  dates, skips, and moved or cancelled exceptions. Set **Repeat** to create a
+  daily, weekly, monthly, or yearly series with an interval, count or last
+  date. Timed series keep their local time in the selected time zone.
+- Open a date to edit or cancel one occurrence, or choose **Entire series**
+  to edit the repeat schedule. Skips and detached occurrence IDs follow a
+  compatible series shift, while moved appointments keep their existing
+  dates and times. Webmail rejects a schedule that would orphan an exception.
+  Use CalDAV for an exception that changes this and all future occurrences
+  or for a resource with incompatible start and end time zones.
+- Use **Reminder** to set a display alarm at the start of an event or at
+  a preset lead time. You can set a different reminder on one occurrence.
+  The inbox and calendar show due reminders during a signed-in webmail
+  session and catch up on the previous 24 hours when you return. Dismissing
+  a reminder applies to that mailbox across webmail sessions.
+- Imported display alarms can use absolute times, start or end offsets,
+  repeats, and CalDAV acknowledgements. All-day relative alarms use local
+  midnight in the browser's configured time zone. CalDAV clients handle
+  audio and email alarms.
+- Select a calendar and choose **Download .ics** to export the entire calendar,
+  including events outside the visible week. The download retains stored
+  timezone definitions, recurring exceptions, alarms, and provider properties.
+- Choose **Import .ics**, select an existing calendar or enter a new name, and
+  preview the file before importing. The preview shows event dates and reports
+  individual errors. Imports skip matching event UIDs in the destination.
+  Files may contain up to 1,000 events or occurrences and be up to 1 MiB.
+
+### Calendar API
+
+- `GET /webmail/api/calendars` lists the signed-in mailbox's calendars.
+  `POST /webmail/api/calendars` creates one from a JSON `name`. Send
+  `PATCH /webmail/api/calendars/{id}` with `color` set to a six-digit hex
+  color or `null` to update the color.
+- `GET /webmail/api/calendar-events?start=…&end=…` lists events in a half-open
+  range of up to 366 days. The timestamps are Unix seconds. Pass `calendarId`
+  to select one calendar or `q` to search stored event text. A nonempty
+  `q` can be used without a range. Each row identifies its `calendar_id`
+  and responses are limited to 500 matching records.
+  In a date window, `instances=1` includes iCalendar source for recurrence
+  candidates. The combined source is limited to 4 MiB.
+- `POST /webmail/api/calendar-events` creates an event from `calendarId`,
+  `summary` and `time`, with optional `description` and `location`. The
+  `time` object contains `start`, optional `end`, and optional `allDay`.
+  All-day dates use UTC midnight and the end date is exclusive.
+- To create an event from a full iCalendar resource, use
+  `POST /webmail/api/calendar-events?calendarId=…` with `text/calendar`.
+  The resource contains one master and may include its timezone definitions
+  and exceptions. `GET /webmail/api/calendar-timezone?zone=…` returns a
+  VTIMEZONE definition from the binary's bundled IANA data.
+- `GET /webmail/api/calendar-events/{id}` returns the event and its `ETag`.
+  Pass that ETag unchanged in `If-Match` when updating with `PATCH` or removing
+  with `DELETE`. A stale version returns `412` so the client can reload it.
+  A patch may set `summary`, `description`, `location` or `time`. An empty
+  description or location clears that field. Time changes on recurring events
+  still use CalDAV. Other patches retain alarms, time zones, recurrence
+  exceptions and imported properties.
+- Use `GET /webmail/api/calendar-events/{id}?source=1` to retrieve the
+  underlying iCalendar alongside its revision. `PUT` on the same item
+  accepts `text/calendar` with one master and its exceptions, all with the
+  original UID. It uses the same strong `If-Match` check and attachment scan.
+  An occurrence edit writes a detached event with its original
+  `RECURRENCE-ID`. Cancelling an occurrence marks that detached event
+  `STATUS:CANCELLED`.
+- `GET /webmail/api/calendar-reminders` returns the server time, the
+  reminder window, candidate event resources, and dismissed reminder
+  keys for the signed-in mailbox. `POST /webmail/api/calendar-reminders/dismiss`
+  accepts `eventId`, `key`, and the due timestamp. Dismissal is idempotent.
+
+## Calendar and contacts clients
+
+Use the public DAV HTTPS address and your full mailbox address to connect a
+CalDAV or CardDAV client. The profile at
+`/email.mobileconfig?email=user%40example.com&services=dav` on that address lists
+the host, public port, username and principal path for both services. If your
+public DAV port differs from 443, set `CALDAV_PUBLIC_SSL_PORT` to the public
+port so the profile points clients to the right place.
+
+Vdirsyncer 0.19.2 was tested with both a `caldav` and a `carddav` storage. Set
+each storage's `url` to the HTTPS origin from the profile and `username` to
+the full mailbox address. With the certificate trusted, `vdirsyncer discover`
+finds the collections and `vdirsyncer sync` transfers additions, edits and
+deletions.
+
+Open **Contacts** in webmail to browse your CardDAV address books, edit contact
+addresses and notes, and maintain groups. **Email group** opens a draft with
+the group’s available addresses for review. Edits appear in CardDAV clients at
+their next sync. When a client edits the same card first, webmail asks you to
+reload it before saving.
+
+Choose **Account → Switch account** to save your current draft and return to
+sign-in. Drafts and pending sends stay with the originating mailbox. Tabs that
+still show the previous mailbox reload when they detect the new account.
+
+Mail keeps up to `CALDAV_MAX_SYNC_HISTORY` recent changes in memory for
+incremental DAV reports. The default is 10,000 changes across calendars and
+address books. If history is pruned or the server restarts, clients with an
+expired sync token can request the current collection with an empty token.
+
+## Vacation replies
+
+In **Account → Vacation reply**, enter a subject and plain-text message,
+choose optional start and end times, and save with **Send vacation replies**
+checked. Times are entered in your local timezone. Without a start time the
+rule starts immediately. Without an end time it stays on until you turn it off.
+
+Replies go to verified envelope senders whose messages name your mailbox in a
+recipient header. Mail from mailing lists, system or automated senders,
+forwarded copies, and messages filed in Junk or held for Sender Review do not
+trigger a reply. Each qualifying sender can get one reply every seven days.
+Hosted replies use the mailbox's daily sending allowance. A reply is released
+after the original is filed. Changes apply to mail accepted after you save.
+The reply uses your saved text and links to the original through its threading
+headers. See [RFC 3834](https://www.rfc-editor.org/rfc/rfc3834.html) for the
+automatic-response conventions.
 
 ## Password recovery
 
@@ -109,13 +302,10 @@ before a request may affect another mailbox. Disabling or deleting an account
 revokes existing webmail sessions.
 
 - `GET /webmail/api/config` returns effective limits and preferences.
-- `GET /webmail/api/calendars` lists calendars owned by the signed-in account
-  from the same store CalDAV uses. `GET /webmail/api/calendar-events` takes
-  `calendarId`, `start` and `end`. The range uses Unix seconds with an inclusive
-  start and exclusive end, spans at most 366 days, and returns up to 500 stored
-  event summaries. Recurring events include their rules and are returned as
-  candidates for occurrence expansion. The endpoints report 503 when DAV is
-  disabled and 404 for a missing or foreign calendar.
+- The [calendar API](#calendar-api) uses the same store as CalDAV. Recurring
+  event summaries include their rules as candidates for occurrence expansion.
+  The endpoints report 503 when DAV is disabled and 404 for a missing or
+  foreign calendar.
 - `POST /webmail/api/drafts` accepts `draftId`, `draftRevision`, `saveToken` and
   composition fields, including recipient labels, unfinished inputs and staged
   attachment IDs. Repeating the identical save token returns its acknowledgement;
@@ -125,6 +315,8 @@ revokes existing webmail sessions.
   conflicts. `DELETE /webmail/api/uploads/:id` removes an unused owned upload.
 - `POST /webmail/api/bulk` validates up to 100 folder/UID references before
   mutation and returns individual results plus an optional Undo receipt.
+  Its `junk` and `not_junk` actions require a stable message reference and
+  current revision for each item.
   `POST /webmail/api/undo/:id` restores an unchanged receipt once, idempotently.
 - `POST /webmail/api/compose` with a stable `sendId` queues a validated message;
   `delaySeconds` controls the hold. Replaying the same ID cannot dispatch twice.
@@ -138,8 +330,47 @@ revokes existing webmail sessions.
 - `GET /webmail/auth/recovery` returns `{recovery, setBy}`;
   `PUT /webmail/auth/recovery` `{currentPassword, recovery}` changes it, and an
   empty `recovery` removes it.
+- `GET /webmail/api/forwarding` returns `{address, pendingAddress, expiresAt,
+  revision}`. `POST` accepts the current `revision` and an `action` of
+  `request`, `confirm`, `cancel`, or `disable`. A request needs `address`
+  and `currentPassword`, confirmation needs `code`, and disabling needs
+  `currentPassword`. A stale revision returns 412. See
+  [mailbox forwarding](docs/FORWARDING.md#mailbox-forwarding).
+- `GET /webmail/api/vacation` returns `{enabled, subject, body, startsAt,
+  endsAt, revision}`. Send those fields in `PUT` to change the rule. The times
+  are optional Unix seconds, with an inclusive start and an exclusive end.
+  A stale revision returns 412.
 - Existing immediate-compose and message endpoints remain compatible with the
   native SDK and older clients. New clients use the durable draft and queue APIs.
+
+### Hosted compose storage
+
+Hosted mailboxes have separate budgets for temporary SQLite data. Maildir
+messages, including any saved Draft or Sent copy, still count toward the
+mailbox byte quota. Recipient allowances are charged when mail is dispatched.
+
+| SQLite data | Byte budget per hosted mailbox | Record limit |
+| --- | --- | --- |
+| Staged uploads | Twice the effective attachment total, with a 1 MiB minimum | 128 |
+| Draft metadata | Twice the server message-size limit, with a 1 MiB minimum | 200 |
+| Outbox | Twice the server message-size limit, with a 1 MiB minimum | 1,024 |
+
+The record budgets use serialized UTF-8 bytes. Pending, sending, and unknown
+Outbox entries reserve 64 KiB each for the eventual delivery result. New data
+that would exceed a budget returns HTTP 413. A draft replacement can reuse its
+existing space. Older rows count toward the limits and are retained under the
+same expiration rules. API clients can read or retry the same acknowledged
+draft or send while the applicable budget is full.
+
+Unused uploads can be deleted immediately. Unreferenced uploads expire 24
+hours after staging. A draft or retryable Outbox item keeps its referenced
+uploads available. Permanently deleting a draft releases its metadata budget.
+Successful sends keep a small receipt and request digest for seven days, so a
+repeat of the same send ID can still recover its result after attachments are
+released. Failed, partial, cancelled, and reviewed entries remain available
+for seven days. An interrupted send keeps its complete payload and attachments
+until the mailbox owner reviews it. Account removal cascades to these SQLite
+records. SQLite reuses freed pages for future writes.
 
 ## Validation and release
 
@@ -695,6 +926,12 @@ deferred deploy above.
 - `PUT  /webmail/api/messages/:uid` `{flags?, folder?}` → updated message (flag/move)
 - `DELETE /webmail/api/messages/:uid` → move to Trash (or purge if already Trash)
 
+Message listings and details include the mailbox-scoped `reference` and `revision`.
+`GET /webmail/api/messages/ref/:reference` follows the message across folder moves and returns its current `folder`, `uid`, and strong `ETag`. A flag change keeps the reference and changes the revision. A copy gets its own reference. An expunged message or a reference from another account returns `404`.
+
+`PUT` and `DELETE` on the reference URL require the last `ETag` in `If-Match`.
+Missing preconditions return `428` and stale revisions return `412`. For `POST /webmail/api/bulk`, pass `reference` and `revision` alongside `uid` and `folder` for each selected message. A stale revision rejects the selection before any action runs. Existing UID routes remain available for older clients.
+
 **Compose / drafts**
 - `POST /webmail/api/compose` `{to, cc, bcc, subject, html, text, attachments[], inReplyTo?}` → `{queued:true, id}`
 - `POST /webmail/api/drafts` / `PUT /webmail/api/drafts/:id` / `DELETE /webmail/api/drafts/:id`
@@ -835,3 +1072,122 @@ maximum report age and require the complete expected check inventory. Route
 incidents and recoveries through an independent alert channel as well as any
 email notifications. Public health, certificate and TCP monitors should run
 outside the mail host to detect host, routing and listener outages independently.
+
+## Private hosted provisioning
+
+Set `SMTP_PROVISIONING_PORT`, `SMTP_PROVISIONING_DOMAIN`, and
+`SMTP_PROVISIONING_TOKEN` to start the version 1 provisioning listener. The
+token is a 32-byte random secret encoded as 64 hex characters. The listener
+binds exclusively to `127.0.0.1` and exposes no browser routes. The ordinary
+webmail listener exposes no provisioning routes. Keep the app on the same
+host or use a private authenticated tunnel when it runs on another host.
+
+The provisionable domain must already be a local SMTP domain. Hosting
+configuration remains the source of truth for domain routing and DNS.
+Provisioning is unavailable in catch-all mode. Each request uses the
+provisioning bearer token. Requests with a browser Origin or Cookie are
+rejected.
+
+- `GET /provisioning/v1/status` returns `version` and the allowed `domain`.
+- `GET /provisioning/v1/domain?name=...` confirms the configured provisionable
+  domain.
+- `GET /provisioning/v1/mailbox?mailbox=...&actor=...` observes a managed
+  mailbox's current revision, storage quota, daily recipient allowance and enabled state.
+- `POST /provisioning/v1/mailbox` accepts `mailbox`, `actor`, `operation_id`,
+  `revision`, `quota_bytes`, `send_recipients_per_day`, and `enabled`.
+  Set both limits to positive values for free signup. Omitted or zero
+  `send_recipients_per_day` preserves compatibility with older clients
+  that did not set an allowance. Revision 1 also accepts
+  `initial_password` and `initial_recovery`. The same latest operation can be
+  repeated. Creating the mailbox and recording ownership happen in one
+  SQLite transaction. The initial password is used only on the first
+  successful creation. Changes advance by one revision. An old request or an
+  operation ID reused for another change conflicts. The listener never takes
+  ownership of an existing unmanaged mailbox.
+
+The actor is a stable opaque ID for the app's verified signup, and an actor
+can own one mailbox. Suspension disables mailbox authentication and revokes
+webmail sessions and password reset tokens.
+
+### Limits across mail clients
+
+- Storage counts stored message bytes in the mailbox's Maildir, including
+  Inbox, Junk, Drafts, Sent, Trash and custom folders. Permanent deletion frees
+  storage. Moving to Trash keeps the bytes allocated. Replacing a draft
+  requires space only for its growth. Webmail's existing attachment staging
+  and Outbox records are held separately from Maildir.
+- SMTP DATA and BDAT return `452 4.2.2` if a local destination lacks space
+  and `550 5.2.1` if it is disabled. The server checks all local recipients
+  before publishing a transaction. Webmail reports full storage on draft
+  saves and local delivery. If mail was delivered but the Sent copy would
+  exceed the quota, Outbox reports delivery and the missing copy.
+- IMAP APPEND, COPY and UID COPY use the same Maildir quota and return
+  tagged `NO [OVERQUOTA]` when the operation exceeds it. A multi-message COPY
+  checks its total size before creating any destination copies.
+- One allowance covers distinct envelope recipients per submission, including
+  local recipients and To, Cc and Bcc in webmail, EWS and ActiveSync. It resets
+  at midnight UTC.
+  SMTP returns `452 4.7.0` at exhaustion. Immediate webmail sends return
+  `429`. Outbox checks the allowance at dispatch and reports failures there.
+  Webmail reserves the attempted recipients before delivery, so failed or
+  partial delivery can still use the allowance. SMTP delivery retries use
+  their original reservation. A provisioning revision does not reset usage.
+- EWS CreateItem and SendItem return `ErrorSubmissionQuotaExceeded` at the
+  sending limit. Saving a draft uses mailbox storage without spending the
+  sending allowance. When a caller requests a Sent copy, EWS checks its
+  storage before delivery and returns `ErrorQuotaExceeded` if the copy would
+  exceed the limit. EWS SendOnly works when the sender's storage is full.
+  See the [EWS response codes](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-oxwscdata/53734587-8b80-4cd8-b0ea-92da6b960d9e).
+- ActiveSync SendMail, SmartReply, and SmartForward use the authenticated
+  mailbox for From and the quota.
+  It checks a requested Sent copy before delivery and leaves Bcc out of
+  delivered MIME. WBXML responses use status `113` for mailbox storage,
+  `115` for the sending allowance, and `118` for a repeated accepted
+  ClientId. Mail remembers an accepted WBXML ClientId for seven days per
+  account and device. This prevents duplicate sends and charges after a lost response.
+  Older raw MIME clients receive HTTP `507` for storage and `503` for
+  a depleted allowance. See the [ActiveSync status codes](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-ascmd/95cb9d7c-d33d-4b94-9366-d59911c7a060).
+  SmartReply and SmartForward resolve the original from that account's Sync
+  item ID or Search `LongId`. The server adds the original display body for
+  replies and retains its MIME attachments for forwards. WBXML `ReplaceMime`
+  uses the complete client content with shared sender and Bcc handling. The
+  quota check uses the final stored message after adding any original content.
+  A malformed recurrence `InstanceId` returns `104`. A valid occurrence
+  returns `147` until calendar scheduling MIME is available in [#47](https://github.com/mail-os/mail/issues/47).
+  See [SmartReply](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-ascmd/419e4fc2-d0cb-419e-a94d-df4b8da0c98f)
+  and [SmartForward](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-ascmd/7dd31ff2-7b47-4968-a6ed-79ebbd3cceb8).
+- ActiveSync mailbox Search matches keywords in decoded mail headers and
+  plain-text bodies in the synchronized mail folders. It supports a folder
+  filter, date bounds and up to 50 results per page. Searches that would
+  examine more than 10,000 messages or read more than 256 MiB return a
+  Search timeout so clients can narrow the query. A Search `LongId` remains
+  usable across flag changes and restarts in the same account. After moving
+  an item to a different folder, search again for its new ID. See the
+  [ActiveSync Search command](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-ascmd/8211179b-14f3-44ab-9de6-b69ca2a48c4e).
+- ActiveSync Sync, GetItemEstimate, and Ping reconcile each mailbox, device,
+  and collection independently. Mail state uses message IDs and read flags.
+  Calendar and Contacts state uses resource revisions, so pruning the DAV
+  change journal does not discard unseen changes. The device gets a new
+  opaque Sync key when it initializes a collection or acknowledges changes.
+  Each mailbox and device also keeps its own Ping heartbeat and watched folders.
+  The first Ping supplies both settings, and later requests can reuse them.
+  Clients upgrading from the older shared state receive an invalid-key
+  response and must restart that collection with key `0`. The old tables are
+  retained for rollback. Deleting a mailbox removes its new snapshots.
+  See the [ActiveSync Sync key reference](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-ascmd/bb649593-c793-415e-912e-e7da9b7319bf).
+- The account is checked again when an SMTP submission is accepted or
+  Outbox dispatches. Persisted SMTP retries for suspended accounts are held
+  until re-enabled. SMTP workers and Outbox jobs that already began dispatch
+  can finish. Limits are enforced within a single Mail daemon writing the
+  mailbox store. See [#61](https://github.com/mail-os/mail/issues/61) for
+  the broader hosted rollout.
+
+Run the boundary check against the compiled Mail binary.
+
+```sh
+python3 scripts/test-hosted-limits.py packages/zig/zig-out/bin/mail
+```
+
+Add `--staging` to use the staging profile in an isolated fixture with a
+temporary TLS certificate. This exercises SMTP and IMAP over STARTTLS and
+implicit TLS, and webmail, EWS, and ActiveSync over HTTPS.

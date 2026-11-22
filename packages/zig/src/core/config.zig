@@ -4,6 +4,7 @@ const config_profiles = @import("config_profiles.zig");
 const toml = @import("toml.zig");
 const env = @import("env.zig");
 const io_compat = @import("io_compat.zig");
+const clamav = @import("../antispam/clamav.zig");
 
 pub const ValidationError = error{
     InvalidPort,
@@ -16,6 +17,7 @@ pub const ValidationError = error{
     InvalidRateLimit,
     InvalidTLSConfiguration,
     InvalidWebhookConfiguration,
+    InvalidClamAVConfiguration,
     TLSCertificateNotFound,
     TLSKeyNotFound,
     InvalidHostnameFormat,
@@ -135,6 +137,10 @@ pub const Config = struct {
     // false (default), checks are advisory/log-only and never block mail.
     antispam_enforce: bool = false,
 
+    /// Enabled by SMTP_CLAMAV_TRANSPORT. The address borrows the environment
+    /// value until the daemon initializes its scanner and copies the address.
+    clamav_scan: ?clamav.Config = null,
+
     // Content-based spam scoring. Combines SPF/DKIM/DMARC verdicts, DNSBL
     // listings, reverse-DNS/HELO sanity and message heuristics into a score.
     // Mail at/above `spam_junk_threshold` is filed into the Junk mailbox; mail
@@ -206,7 +212,18 @@ pub const Config = struct {
 
     /// Maildir subfolder that spam is delivered into. Defaults to "Junk".
     pub fn junkFolder(self: Config) []const u8 {
-        return self.spam_junk_folder orelse "Junk";
+        const name = self.spam_junk_folder orelse return "Junk";
+        if (name.len == 0 or name.len > 128 or std.mem.trim(u8, name, " ").len == 0) return "Junk";
+        for (name) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and byte != ' ' and byte != '_' and byte != '-') return "Junk";
+        }
+        for ([_][]const u8{
+            "INBOX", "new",      "cur",     "tmp",       "Sent",   "Drafts", "Trash",   "Archive",    "Screening", "Declined", "Newsletters", "Receipts",
+            "All",   "All Mail", "Starred", "Important", "Social", "Forums", "Updates", "Promotions", "Notes",
+        }) |reserved| {
+            if (std.ascii.eqlIgnoreCase(name, reserved)) return "Junk";
+        }
+        return name;
     }
 
     pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
@@ -226,6 +243,13 @@ pub const Config = struct {
 
     /// Validates the configuration and returns detailed error messages
     pub fn validate(self: Config) ValidationError!void {
+        if (self.clamav_scan) |scanner| {
+            clamav.ClamAVScanner.validate(scanner) catch {
+                std.debug.print("Configuration Error: Invalid SMTP ClamAV transport, timeout, or size limit\n", .{});
+                return error.InvalidClamAVConfiguration;
+            };
+        }
+
         // Validate port range (0 for random port in testing, 1-65535 otherwise)
         // Port 0 is allowed and means the OS will assign a random available port
         _ = self.port; // Port 0 is valid for testing scenarios
@@ -410,6 +434,10 @@ pub fn loadConfig(allocator: std.mem.Allocator, cli_args: args.Args) !Config {
     try applyCommandLineArgs(allocator, &cfg, cli_args);
 
     // Validate the final configuration
+    errdefer cfg.deinit(allocator);
+    if (env.get("SMTP_CLAMAV_TRANSPORT")) |value| {
+        if (value.len > 0) cfg.clamav_scan = try loadClamAVConfig(value);
+    }
     try cfg.validate();
 
     return cfg;
@@ -479,6 +507,33 @@ fn loadDefaultsFromProfile(allocator: std.mem.Allocator, profile: config_profile
         .enable_managesieve = false,
         .managesieve_port = 4190,
         .enable_milter = false,
+    };
+}
+
+fn loadClamAVConfig(endpoint: []const u8) !clamav.Config {
+    var scanner = clamav.Config{
+        .transport = clamav.Transport.parse(endpoint) catch {
+            std.debug.print("Configuration Error: SMTP_CLAMAV_TRANSPORT requires a Unix socket path or TCP IP:port\n", .{});
+            return error.InvalidClamAVConfiguration;
+        },
+    };
+    if (env.get("SMTP_CLAMAV_FAIL_MODE")) |value| {
+        scanner.fail_mode = clamav.FailMode.parse(value) orelse {
+            std.debug.print("Configuration Error: SMTP_CLAMAV_FAIL_MODE must be open or closed\n", .{});
+            return error.InvalidClamAVConfiguration;
+        };
+    }
+    scanner.connect_timeout_ms = try clamavOption(u32, "SMTP_CLAMAV_CONNECT_TIMEOUT_MS", scanner.connect_timeout_ms);
+    scanner.timeout_ms = try clamavOption(u32, "SMTP_CLAMAV_TIMEOUT_MS", scanner.timeout_ms);
+    scanner.max_stream_bytes = try clamavOption(usize, "SMTP_CLAMAV_MAX_STREAM_BYTES", scanner.max_stream_bytes);
+    return scanner;
+}
+
+fn clamavOption(comptime T: type, name: [:0]const u8, default: T) !T {
+    const value = env.get(name) orelse return default;
+    return std.fmt.parseInt(T, value, 10) catch {
+        std.debug.print("Configuration Error: {s} requires a positive integer\n", .{name});
+        return error.InvalidClamAVConfiguration;
     };
 }
 

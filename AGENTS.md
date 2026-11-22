@@ -270,7 +270,7 @@ Source: `src/domain_migrate.zig` (planning), `src/cli/domain.zig` (CLI),
 ## Frontend
 
 - Use **stx** for templating — never write vanilla JS (`var`, `document.*`, `window.*`) in stx templates
-- Use **crosswind** as the default CSS framework which enables standard Tailwind-like utility classes
+- Use **ts-css** as the default CSS framework for Tailwind-like utility classes
 - stx `<script>` tags should only contain stx-compatible code (signals, composables, directives)
 
 ## Dependencies

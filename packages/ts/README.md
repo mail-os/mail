@@ -126,3 +126,28 @@ Where the difference comes from is written up in
 ## License
 
 MIT
+
+## Private hosted provisioning
+
+The Mail provisioning client uses the daemon's dedicated loopback-only
+listener. See the [server contract](https://github.com/mail-os/mail/blob/main/WEBMAIL.md#private-hosted-provisioning)
+for deployment settings and operation semantics.
+
+```ts
+import { createMailProvisioningClient } from '@stacksjs/mail'
+
+const mail = createMailProvisioningClient({
+  baseUrl: 'http://127.0.0.1:8091',
+  token: process.env.MAIL_PROVISIONING_TOKEN!,
+})
+
+const { domain } = await mail.status()
+const account = await mail.mailbox(`reader@${domain}`, verifiedSignupId)
+```
+
+Call `apply` with an application-generated operation ID and a monotonic
+revision. Pass `quota_bytes` and `send_recipients_per_day` for a free
+mailbox. The allowance counts recipients across SMTP and webmail and resets
+at midnight UTC. On uncertain creation, observe the mailbox with the same actor and
+repeat the operation when needed. Keep provisioning credentials and the SDK
+on the application server.

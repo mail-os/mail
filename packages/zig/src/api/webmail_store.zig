@@ -4,7 +4,10 @@ const std = @import("std");
 const database = @import("../storage/database.zig");
 const io_compat = @import("../core/io_compat.zig");
 
-pub const StoreError = error{ Conflict, NotFound, StorageLimit };
+pub const StoreError = error{ Conflict, NotFound, StorageLimit, DraftStorageLimit, OutboxStorageLimit };
+pub const terminal_retention = 7 * 86400;
+// Up to 100 bounded envelope addresses may be repeated in the delivery result.
+const outbox_result_reserve = 64 * 1024;
 pub const Record = struct {
     username: []const u8,
     kind: []const u8,
@@ -27,12 +30,14 @@ pub fn initSchema(db: *database.Database) !void {
         \\ FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE
         \\);
         \\CREATE INDEX IF NOT EXISTS webmail_pending ON webmail_records(kind,state,due_at);
+        \\CREATE INDEX IF NOT EXISTS webmail_record_expiry ON webmail_records(expires_at) WHERE expires_at>0;
         \\CREATE TABLE IF NOT EXISTS webmail_uploads (
         \\ username TEXT NOT NULL, id TEXT NOT NULL, filename TEXT NOT NULL,
         \\ content_type TEXT NOT NULL, data BLOB NOT NULL, size INTEGER NOT NULL,
         \\ expires_at INTEGER NOT NULL, PRIMARY KEY(username,id),
         \\ FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE
         \\);
+        \\CREATE INDEX IF NOT EXISTS webmail_upload_expiry ON webmail_uploads(expires_at);
     );
 }
 
@@ -78,7 +83,7 @@ pub fn get(allocator: std.mem.Allocator, db: *database.Database, user: []const u
 }
 
 pub fn list(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, kind: []const u8, limit: usize) ![]Record {
-    const s = try db.prepare("SELECT username,kind,id,payload,state,revision,due_at,expires_at FROM webmail_records WHERE username=?1 AND kind=?2 ORDER BY rowid DESC LIMIT ?3");
+    const s = try db.prepare("SELECT username,kind,id,payload,state,revision,due_at,expires_at FROM webmail_records WHERE username=?1 AND kind=?2 ORDER BY (state IN ('pending','sending','unknown')) DESC,rowid DESC LIMIT ?3");
     defer s.finalize();
     try s.bind(1, user);
     try s.bind(2, kind);
@@ -104,6 +109,34 @@ pub fn accountAttachmentLimits(db: *database.Database, user: []const u8) !struct
     try s.bind(1, user);
     if (!try s.step()) return StoreError.NotFound;
     return .{ .file = s.columnInt64(0), .total = s.columnInt64(1) };
+}
+
+/// The caller serializes webmail mutations through the service, including the
+/// corresponding Maildir write. Growth is refused without evicting old rows.
+pub fn checkRecordCapacity(db: *database.Database, row: Record, max_bytes: usize, max_count: usize) !void {
+    const outbox = std.mem.eql(u8, row.kind, "outbox");
+    const reserve: usize = if (outbox) outbox_result_reserve else 0;
+    const s = try db.prepare(
+        \\SELECT COALESCE(SUM(bytes),0), COUNT(*), MAX(CASE WHEN id=?3 THEN bytes END)
+        \\FROM (SELECT id,length(CAST(payload AS BLOB)) +
+        \\ CASE WHEN state IN ('pending','sending','unknown') THEN ?4 ELSE 0 END AS bytes
+        \\ FROM webmail_records WHERE username=?1 AND kind=?2)
+    );
+    defer s.finalize();
+    try s.bind(1, row.username);
+    try s.bind(2, row.kind);
+    try s.bind(3, row.id);
+    try s.bind(4, reserve);
+    if (!try s.step()) unreachable;
+    const old_bytes = s.columnInt64Opt(2);
+    const previous: usize = @intCast(old_bytes orelse 0);
+    const total: usize = @intCast(s.columnInt64(0));
+    const count: usize = @intCast(s.columnInt64(1));
+    const needed = row.payload.len + reserve;
+    if (old_bytes != null and needed <= previous) return;
+    if ((old_bytes == null and count >= max_count) or needed > max_bytes -| (total - previous)) {
+        return if (outbox) StoreError.OutboxStorageLimit else StoreError.DraftStorageLimit;
+    }
 }
 
 /// expected=0 creates; an existing record needs its last acknowledged revision.
@@ -168,7 +201,7 @@ pub fn cancelSend(allocator: std.mem.Allocator, db: *database.Database, user: []
     try s.bind(1, user);
     try s.bind(2, id);
     try s.bind(3, now);
-    try s.bind(4, now + 7 * 86400);
+    try s.bind(4, now + terminal_retention);
     if (!try s.step()) return StoreError.Conflict;
     const row = try readRecord(allocator, s);
     _ = try s.step();
@@ -180,11 +213,11 @@ pub fn recoverInterrupted(db: *database.Database) !void {
     try db.exec("UPDATE webmail_records SET state='unknown',revision=revision+1 WHERE kind='outbox' AND state='sending'");
 }
 
-pub fn addUpload(db: *database.Database, user: []const u8, upload: Upload, now: i64, max_staged_bytes: usize) !void {
+pub fn addUpload(db: *database.Database, user: []const u8, upload: Upload, now: i64, max_staged_bytes: usize, max_count: usize) !void {
     const s = try db.prepare(
         \\INSERT INTO webmail_uploads(username,id,filename,content_type,data,size,expires_at)
         \\SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE
-        \\(SELECT COALESCE(SUM(size),0) FROM webmail_uploads WHERE username=?1)+?6<=?8
+        \\(SELECT COALESCE(SUM(size),0)+?6<=?8 AND COUNT(*)<?9 FROM webmail_uploads WHERE username=?1)
         \\RETURNING id
     );
     defer s.finalize();
@@ -196,6 +229,7 @@ pub fn addUpload(db: *database.Database, user: []const u8, upload: Upload, now: 
     try s.bind(6, upload.data.len);
     try s.bind(7, now + 86400);
     try s.bind(8, max_staged_bytes);
+    try s.bind(9, max_count);
     if (!try s.step()) return StoreError.StorageLimit;
     _ = try s.step();
 }
@@ -214,10 +248,14 @@ pub fn getUpload(allocator: std.mem.Allocator, db: *database.Database, user: []c
     };
 }
 
+const join_attachments = "FROM webmail_records AS r, " ++
+    "json_each(CASE WHEN json_valid(r.payload) THEN r.payload END,'$.message.attachments') AS attachment";
+const attachment_id = "CASE WHEN attachment.type='object' THEN json_extract(attachment.value,'$.uploadId') END";
+
 pub fn removeUpload(db: *database.Database, user: []const u8, id: []const u8) !void {
     const s = try db.prepare(
-        \\DELETE FROM webmail_uploads WHERE username=?1 AND id=?2 AND NOT EXISTS
-        \\(SELECT 1 FROM webmail_records WHERE username=?1 AND kind IN ('draft','outbox') AND instr(payload,?2)>0)
+        "DELETE FROM webmail_uploads WHERE username=?1 AND id=?2 AND NOT EXISTS (SELECT 1 " ++ join_attachments ++
+            " WHERE r.username=?1 AND r.kind IN ('draft','outbox') AND " ++ attachment_id ++ "=?2)",
     );
     defer s.finalize();
     try s.bind(1, user);
@@ -225,19 +263,27 @@ pub fn removeUpload(db: *database.Database, user: []const u8, id: []const u8) !v
     _ = try s.step();
 }
 
-pub fn sweep(db: *database.Database, now: i64) !void {
-    var s = try db.prepare("DELETE FROM webmail_records WHERE expires_at>0 AND expires_at<=?1 AND state NOT IN ('pending','sending','unknown')");
-    try s.bind(1, now);
-    _ = try s.step();
-    s.finalize();
-    s = try db.prepare(
-        \\DELETE FROM webmail_uploads WHERE expires_at<=?1 AND NOT EXISTS
-        \\(SELECT 1 FROM webmail_records WHERE webmail_records.username=webmail_uploads.username
-        \\AND kind IN ('draft','outbox') AND instr(payload,webmail_uploads.id)>0)
+pub fn sweep(db: *database.Database, now: i64, user: ?[]const u8) !void {
+    {
+        const records = try db.prepare("DELETE FROM webmail_records WHERE expires_at>0 AND expires_at<=?1 AND state NOT IN ('pending','sending','unknown') AND (?2='' OR username=?2)");
+        defer records.finalize();
+        try records.bind(1, now);
+        try records.bind(2, user orelse "");
+        _ = try records.step();
+    }
+    const uploads = try db.prepare(
+        // Parse each mailbox record once, and only when it has expired uploads.
+        "WITH refs(username,id) AS MATERIALIZED (SELECT DISTINCT r.username," ++ attachment_id ++ " " ++ join_attachments ++
+            \\ WHERE r.kind IN ('draft','outbox') AND (?2='' OR r.username=?2)
+            \\ AND EXISTS (SELECT 1 FROM webmail_uploads AS u WHERE u.username=r.username AND u.expires_at<=?1))
+            \\DELETE FROM webmail_uploads WHERE expires_at<=?1 AND (?2='' OR username=?2)
+            \\ AND NOT EXISTS (SELECT 1 FROM refs WHERE refs.username=webmail_uploads.username AND refs.id=webmail_uploads.id)
+        ,
     );
-    defer s.finalize();
-    try s.bind(1, now);
-    _ = try s.step();
+    defer uploads.finalize();
+    try uploads.bind(1, now);
+    try uploads.bind(2, user orelse "");
+    _ = try uploads.step();
 }
 
 test "draft revisions, queued-send claims and cancellation are account-scoped" {
@@ -287,14 +333,14 @@ test "binary uploads preserve bytes, ownership and staged storage limits" {
     try initSchema(&db);
     _ = try db.createUser("one@example.com", "test-hash", "one@example.com");
     const upload = Upload{ .id = "1234567890123456", .filename = "bytes.bin", .content_type = "application/octet-stream", .data = &.{ 0, 255, 128, 13, 10 } };
-    try addUpload(&db, "one@example.com", upload, 100, 5);
+    try addUpload(&db, "one@example.com", upload, 100, 5, 10);
     try t.expectEqualSlices(u8, upload.data, (try getUpload(a, &db, "one@example.com", upload.id)).data);
     try t.expectError(StoreError.NotFound, getUpload(a, &db, "two@example.com", upload.id));
     var next = upload;
     next.id = "2234567890123456";
-    try t.expectError(StoreError.StorageLimit, addUpload(&db, "one@example.com", next, 100, 5));
+    try t.expectError(StoreError.StorageLimit, addUpload(&db, "one@example.com", next, 100, 5, 10));
     try removeUpload(&db, "two@example.com", upload.id);
     _ = try getUpload(a, &db, "one@example.com", upload.id);
-    try sweep(&db, 86501);
+    try sweep(&db, 86501, null);
     try t.expectError(StoreError.NotFound, getUpload(a, &db, "one@example.com", upload.id));
 }

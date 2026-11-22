@@ -87,6 +87,10 @@ pub fn sendWebhook(allocator: std.mem.Allocator, cfg: WebhookConfig, payload: We
     }
     const fd: posix.socket_t = @intCast(raw_fd);
     defer _ = std.c.close(fd);
+    const timeout = @max(1, cfg.timeout_ms);
+    const tv: posix.timeval = .{ .sec = @intCast(timeout / 1000), .usec = @intCast((timeout % 1000) * 1000) };
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
 
     // Connect
     const sockaddr = posix.sockaddr.in{

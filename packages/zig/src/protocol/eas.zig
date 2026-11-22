@@ -1,8 +1,17 @@
 const std = @import("std");
+const clamav = @import("../antispam/clamav.zig");
+const smart_mime = @import("../message/smart_mime.zig");
+const message_headers = @import("../message/submission.zig");
+const submission = @import("../delivery/submission.zig");
+const config = @import("../core/config.zig");
 const wbxml = @import("wbxml.zig");
 const database = @import("../storage/database.zig");
 const caldav_store = @import("../storage/caldav_store.zig");
+const search = @import("eas_search.zig");
+const sync_state = @import("eas_state.zig");
+const webmail_maildir = @import("../api/webmail_maildir.zig");
 const fs_compat = @import("../core/fs_compat.zig");
+const io_compat = @import("../core/io_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 /// Exchange ActiveSync command handlers (MS-ASCMD), transport-agnostic.
@@ -12,14 +21,10 @@ const time_compat = @import("../core/time_compat.zig");
 /// the query string (`?Cmd=`, `DeviceId=`).
 ///
 /// Data sources:
-///   * Email — the Maildir, with a persistent per-(device,collection) item
+///   * Email — the Maildir, with a persistent per-mailbox, device and collection
 ///     snapshot in SQLite so Add/Change(read flag)/Delete are computed by diff.
-///   * Calendar / Contacts — the CalDAV/CardDAV in-memory store, using its
-///     sync-token change log for Add/Change/Delete.
-///
-/// NOTE: the CalDAV store is in-memory and non-persistent (see caldav_store.zig);
-/// calendar/contacts items exist only for the current server uptime. That is a
-/// storage-layer limitation shared with CalDAV, independent of this protocol code.
+///   * Calendar / Contacts — revisions from the persistent CalDAV/CardDAV
+///     store, compared with the same per-mailbox snapshot.
 const CONTENT_TYPE = "application/vnd.ms-sync.wbxml";
 
 /// Maximum email items emitted in a single Sync response.
@@ -36,11 +41,21 @@ pub const Context = struct {
     store: *caldav_store.CalDavStore,
     /// Login identity (full email address).
     username: []const u8,
-    /// Maildir directory name for this user (local part of the address).
+    /// Maildir key. Hosted accounts use their canonical full address.
     local_part: []const u8,
     /// Device identifier from the query string (sync state is keyed on it).
     device_id: []const u8,
+    protocol_version: u8 = 141,
+    hosted: bool = false,
+    mail_config: ?*const config.Config = null,
+    scanner: ?*clamav.ClamAVScanner = null,
+    send_format: SendFormat = .wbxml,
+    save_legacy_copy: bool = false,
+    legacy_source: MessageSource = .{},
+    legacy_forward_attachment: bool = false,
 };
+
+pub const SendFormat = enum { wbxml, mime, invalid };
 
 pub const Response = struct {
     status: u16 = 200,
@@ -86,14 +101,569 @@ fn folderById(id: []const u8) ?FolderDef {
 /// Route an EAS command to its handler. `cmd` is the `Cmd` query value; `body`
 /// is the raw WBXML request body (possibly empty).
 pub fn dispatch(ctx: *Context, cmd: []const u8, body: []const u8) !Response {
-    ensureStateTables(ctx.db) catch {};
+    if (std.ascii.eqlIgnoreCase(cmd, "SendMail")) return handleComposeMail(ctx, .send_mail, body);
+    if (std.ascii.eqlIgnoreCase(cmd, "SmartReply")) return handleComposeMail(ctx, .smart_reply, body);
+    if (std.ascii.eqlIgnoreCase(cmd, "SmartForward")) return handleComposeMail(ctx, .smart_forward, body);
+    if (std.ascii.eqlIgnoreCase(cmd, "Search")) return handleSearch(ctx, body);
+    for ([_][]const u8{ "MoveItems", "FolderCreate", "FolderUpdate", "FolderDelete" }) |unsupported| {
+        if (std.ascii.eqlIgnoreCase(cmd, unsupported)) return .{ .status = 501 };
+    }
     if (std.mem.eql(u8, cmd, "Provision")) return handleProvision(ctx, body);
     if (std.mem.eql(u8, cmd, "FolderSync")) return handleFolderSync(ctx, body);
-    if (std.mem.eql(u8, cmd, "Sync")) return handleSync(ctx, body);
-    if (std.mem.eql(u8, cmd, "GetItemEstimate")) return handleGetItemEstimate(ctx, body);
-    if (std.mem.eql(u8, cmd, "Ping")) return handlePing(ctx, body);
-    if (std.mem.eql(u8, cmd, "SendMail")) return Response{ .status = 200 };
-    return Response{ .status = 200 };
+    const command = std.meta.stringToEnum(enum { Sync, GetItemEstimate, Ping }, cmd) orelse return .{ .status = 501 };
+    if (!validDevice(ctx.device_id)) return .{ .status = 400 };
+    var user = ctx.db.getUserByUsername(ctx.username) catch |err| return .{ .status = if (err == error.NotFound) 401 else 503 };
+    defer user.deinit(ctx.db.allocator);
+    if (!user.enabled) return .{ .status = 403 };
+    const account = sync_state.Account{ .db = ctx.db, .user_id = user.id, .device_id = ctx.device_id };
+    return switch (command) {
+        .Sync => handleSync(ctx, account, body),
+        .GetItemEstimate => handleGetItemEstimate(ctx, account, body),
+        .Ping => handlePing(ctx, account, body),
+    };
+}
+
+fn validDevice(id: []const u8) bool {
+    if (id.len == 0 or id.len > 32) return false;
+    for (id) |byte| if (!std.ascii.isAlphanumeric(byte)) return false;
+    return true;
+}
+
+// ComposeMail in EAS 14.x uses opaque WBXML MIME. Older advertised clients
+// submit MIME directly and receive HTTP errors instead of ComposeMail status.
+const SendStatus = enum(u8) {
+    protocol_error = 103,
+    invalid_datetime = 104,
+    invalid_id_combination = 105,
+    invalid_ids = 106,
+    invalid_mime = 107,
+    invalid_device = 108,
+    retry_later = 111,
+    mailbox_quota = 113,
+    send_quota = 115,
+    invalid_recipient = 116,
+    already_accepted = 118,
+    no_recipients = 119,
+    submission_failed = 120,
+    message_too_large = 122,
+    no_mailbox = 123,
+    access_denied = 130,
+    unsupported_item = 147,
+    item_not_found = 150,
+};
+
+const ComposeCommand = enum(u8) {
+    send_mail = wbxml.ComposeMail.SendMail,
+    smart_forward = wbxml.ComposeMail.SmartForward,
+    smart_reply = wbxml.ComposeMail.SmartReply,
+};
+
+fn sendError(ctx: *Context, op: ComposeCommand, status: SendStatus) !Response {
+    if (ctx.send_format != .wbxml) return .{ .status = switch (status) {
+        .mailbox_quota => 507,
+        .send_quota => 503,
+        .access_denied, .no_mailbox => 403,
+        .message_too_large => 413,
+        .retry_later => 503,
+        .submission_failed => 500,
+        .item_not_found => 404,
+        .unsupported_item => 501,
+        else => 400,
+    } };
+    var w = wbxml.Writer.init(ctx.allocator);
+    errdefer w.deinit();
+    try w.writeHeader();
+    try w.startTag(wbxml.Page.compose_mail, @backingInt(op));
+    try w.elementInt(wbxml.Page.compose_mail, wbxml.ComposeMail.Status, @backingInt(status));
+    try w.end();
+    return .{ .body = try w.toOwnedSlice() };
+}
+
+pub const MessageSource = struct {
+    folder_id: ?[]const u8 = null,
+    item_id: ?[]const u8 = null,
+    long_id: ?[]const u8 = null,
+    instance_id: ?[]const u8 = null,
+};
+
+const SendRequest = struct {
+    mime: []const u8,
+    save_copy: bool = false,
+    client_id: ?[]const u8 = null,
+    source: ?MessageSource = null,
+    replace_mime: bool = false,
+};
+
+fn composeMailRequest(a: std.mem.Allocator, op: ComposeCommand, body: []const u8) !SendRequest {
+    const root = try wbxml.decode(a, body);
+    const page = wbxml.Page.compose_mail;
+    const tags = wbxml.ComposeMail;
+    if (root.children.items.len != 1) return error.InvalidRequest;
+    const command = root.children.items[0];
+    if (command.page != page or command.token != @backingInt(op) or command.text != null) return error.InvalidRequest;
+    var mime: ?[]const u8 = null;
+    var client_id: ?[]const u8 = null;
+    var save_copy = false;
+    var source: ?MessageSource = null;
+    var replace_mime = false;
+    for (command.children.items) |node| {
+        if (node.page != page) return error.InvalidRequest;
+        if (node.token == tags.Source) {
+            if (op == .send_mail or source != null) return error.InvalidRequest;
+            source = try composeSource(node);
+            continue;
+        }
+        if (node.children.items.len != 0) return error.InvalidRequest;
+        switch (node.token) {
+            tags.Mime => {
+                if (mime != null or !node.is_opaque) return error.InvalidMime;
+                mime = node.text orelse return error.InvalidMime;
+            },
+            tags.ClientId => {
+                if (client_id != null or node.is_opaque) return error.InvalidRequest;
+                const value = node.text orelse return error.InvalidRequest;
+                const characters = std.unicode.utf8CountCodepoints(value) catch return error.InvalidRequest;
+                if (characters == 0 or characters > 40) return error.InvalidRequest;
+                for (value) |b| {
+                    if (b < 32 or b == 127) return error.InvalidRequest;
+                }
+                client_id = value;
+            },
+            tags.SaveInSentItems => {
+                if (save_copy or node.text != null) return error.InvalidRequest;
+                save_copy = true;
+            },
+            tags.ReplaceMime => {
+                if (op == .send_mail or replace_mime or node.text != null) return error.InvalidRequest;
+                replace_mime = true;
+            },
+            tags.AccountId => return error.AlternateAccount,
+            else => return error.InvalidRequest,
+        }
+    }
+    if (op != .send_mail and source == null) return error.InvalidIds;
+    return .{
+        .mime = mime orelse return error.InvalidMime,
+        .client_id = client_id orelse return error.InvalidRequest,
+        .save_copy = save_copy,
+        .source = source,
+        .replace_mime = replace_mime,
+    };
+}
+
+fn composeSource(node: wbxml.Node) !MessageSource {
+    const tags = wbxml.ComposeMail;
+    if (node.text != null) return error.InvalidIds;
+    var source: MessageSource = .{};
+    for (node.children.items) |child| {
+        if (child.page != wbxml.Page.compose_mail or child.is_opaque or child.children.items.len != 0) return error.InvalidIds;
+        const value = child.text orelse return error.InvalidIds;
+        if (value.len == 0 or value.len > 256) return error.InvalidIds;
+        const slot = switch (child.token) {
+            tags.FolderId => &source.folder_id,
+            tags.ItemId => &source.item_id,
+            tags.LongId => &source.long_id,
+            tags.InstanceId => &source.instance_id,
+            else => return error.InvalidIds,
+        };
+        if (slot.* != null) return error.InvalidIdCombination;
+        slot.* = value;
+    }
+    return source;
+}
+
+fn handleComposeMail(ctx: *Context, op: ComposeCommand, body: []const u8) !Response {
+    if (ctx.send_format == .invalid) return .{ .status = 400 };
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const req = if (ctx.send_format == .wbxml)
+        composeMailRequest(a, op, body) catch |err| return sendError(ctx, op, switch (err) {
+            error.AlternateAccount => .access_denied,
+            error.InvalidMime => .invalid_mime,
+            error.InvalidIds, error.InvalidIdCombination => sourceStatus(err),
+            error.OutOfMemory => .retry_later,
+            else => .protocol_error,
+        })
+    else
+        SendRequest{
+            .mime = body,
+            .save_copy = ctx.save_legacy_copy,
+            .source = if (op == .send_mail) null else ctx.legacy_source,
+        };
+    if (req.client_id != null and !validDevice(ctx.device_id)) return sendError(ctx, op, .invalid_device);
+
+    const limits = ctx.mail_config orelse return sendError(ctx, op, .retry_later);
+    if (req.mime.len > limits.max_message_size) return sendError(ctx, op, .message_too_large);
+    var user = ctx.db.getUserByUsername(ctx.username) catch |err| return sendError(ctx, op, if (err == error.NotFound) .no_mailbox else .retry_later);
+    defer user.deinit(ctx.db.allocator);
+    if (!user.enabled) return sendError(ctx, op, .access_denied);
+
+    const message = message_headers.prepareClientMime(a, req.mime, user.email) catch |err|
+        return sendError(ctx, op, switch (err) {
+            error.InvalidAddress => .invalid_recipient,
+            error.OutOfMemory => .retry_later,
+            else => .invalid_mime,
+        });
+    const receipt: ?database.Database.ActiveSyncReceipt = if (req.client_id) |id| .{ .device_id = ctx.device_id, .client_id = id } else null;
+    // A replay of an accepted operation needs neither the original item nor
+    // another scan. The send reservation repeats this check under lock.
+    if (receipt) |accepted| {
+        if (ctx.db.activeSyncAccepted(ctx.username, accepted, time_compat.timestamp()) catch
+            return sendError(ctx, op, .retry_later)) return sendError(ctx, op, .already_accepted);
+    }
+    const archive = if (req.source) |source| blk: {
+        const original = sourceMime(a, ctx, user.id, source, !req.replace_mime, limits.max_message_size) catch |err|
+            return sendError(ctx, op, sourceStatus(err));
+        if (req.replace_mime) break :blk message.archive;
+        const mode: smart_mime.Mode = if (op == .smart_reply) .reply else if (ctx.legacy_forward_attachment) .attachment else .forward;
+        break :blk smart_mime.withOriginal(a, message.archive, original, mode, limits.max_message_size) catch |err|
+            return sendError(ctx, op, switch (err) {
+                error.MessageTooLarge => .message_too_large,
+                error.OutOfMemory => .retry_later,
+                else => .invalid_mime,
+            });
+    } else message.archive;
+    if (archive.len > limits.max_message_size) return sendError(ctx, op, .message_too_large);
+    const recipients = submission.distinctRecipients(a, &.{message.recipients}) catch |err|
+        return sendError(ctx, op, if (err == error.InvalidAddress) .invalid_recipient else .retry_later);
+    if (recipients.len == 0) return sendError(ctx, op, .no_recipients);
+    // SmartReply and SmartForward can add content from the original message.
+    // Scan the assembled MIME before allocating a receipt or filing a copy.
+    clamav.requireAllowed(ctx.scanner, archive) catch |err| return sendError(ctx, op, switch (err) {
+        error.MalwareDetected => .submission_failed,
+        error.MalwareScanTooLarge => .message_too_large,
+        error.MalwareScanUnavailable => .retry_later,
+    });
+    const raw = try message_headers.withoutBcc(a, archive);
+    const sent_path = if (req.save_copy)
+        submission.maildirPath(a, ctx.local_part, "Sent", ":2,S") catch return sendError(ctx, op, .retry_later)
+    else
+        null;
+
+    submission.sendRaw(a, .{
+        .hostname = limits.hostname,
+        .delivery_method = limits.delivery_method,
+        .ses_region = limits.ses_region,
+        .mail_config = limits,
+        .db = ctx.db,
+    }, .{
+        .mailbox = ctx.username,
+        .from = user.email,
+        .recipients = recipients,
+        .raw = raw,
+        .sent = if (sent_path) |path| .{ .path = path, .bytes = archive } else null,
+        .receipt = receipt,
+    }) catch |err| return sendError(ctx, op, switch (err) {
+        error.HostedStorageFull => .mailbox_quota,
+        error.HostedSendingLimit => .send_quota,
+        error.HostedSenderDisabled, error.HostedRecipientDisabled => .access_denied,
+        error.MessagePreviouslySent => .already_accepted,
+        error.InvalidAddress => .invalid_recipient,
+        else => .submission_failed,
+    });
+    return .{};
+}
+
+fn sourceStatus(err: anyerror) SendStatus {
+    return switch (err) {
+        error.InvalidIds => .invalid_ids,
+        error.InvalidDateTime => .invalid_datetime,
+        error.InvalidIdCombination => .invalid_id_combination,
+        error.ItemNotFound => .item_not_found,
+        error.UnsupportedItem => .unsupported_item,
+        error.AmbiguousMailbox => .access_denied,
+        error.MessageTooLarge => .message_too_large,
+        else => .retry_later,
+    };
+}
+
+fn sourceMime(a: std.mem.Allocator, ctx: *Context, user_id: i64, source: MessageSource, include_contents: bool, max_bytes: usize) ![]const u8 {
+    if (source.long_id != null and (source.item_id != null or source.folder_id != null)) return error.InvalidIdCombination;
+    if (source.instance_id) |instance| {
+        if (search.utcMilliseconds(instance) == null) return error.InvalidDateTime;
+        return error.UnsupportedItem; // Calendar occurrences need scheduling MIME, not mail quoting.
+    }
+    ctx.db.lockMailboxes();
+    defer ctx.db.unlockMailboxes();
+    try requireMailboxOwner(a, ctx);
+
+    const reference = if (source.long_id) |id| try resolveSearchId(a, ctx, user_id, id) else blk: {
+        const folder = folderById(source.folder_id orelse "1") orelse return error.ItemNotFound;
+        if (folder.mailbox == null) return error.UnsupportedItem;
+        break :blk MailReference{ .folder = folder, .uid = try itemUid(folder.id, source.item_id orelse return error.InvalidIds) };
+    };
+    const folder = reference.folder;
+    const mailbox = folder.mailbox orelse return error.UnsupportedItem;
+    const base = (try ctx.db.getFilenameForUid(a, ctx.username, mailbox, reference.uid)) orelse return error.ItemNotFound;
+    for (try mailboxDirs(a, ctx, mailbox)) |dir| {
+        const files = fs_compat.listEmlFiles(a, dir) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        for (files) |name| {
+            if (!std.mem.eql(u8, base, maildirBaseName(name))) continue;
+            const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, name });
+            const size = fs_compat.getFileSize(path) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            if (!include_contents) return "";
+            if (size > max_bytes) return error.MessageTooLarge;
+            const bytes = fs_compat.readFileAlloc(a, path) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            if (bytes.len > max_bytes) return error.MessageTooLarge;
+            return bytes;
+        }
+    }
+    return error.ItemNotFound;
+}
+
+fn itemUid(folder_id: []const u8, item: []const u8) !i64 {
+    if (item.len == 0 or item.len > 64) return error.InvalidIds;
+    const uid_text = if (std.mem.indexOfScalar(u8, item, ':')) |colon| blk: {
+        if (!std.mem.eql(u8, folder_id, item[0..colon])) return error.InvalidIdCombination;
+        break :blk item[colon + 1 ..];
+    } else item;
+    if (uid_text.len == 0) return error.InvalidIds;
+    for (uid_text) |byte| {
+        if (!std.ascii.isDigit(byte)) return error.InvalidIds;
+    }
+    const uid = std.fmt.parseInt(i64, uid_text, 10) catch return error.InvalidIds;
+    if (uid < 1) return error.InvalidIds;
+    return uid;
+}
+
+fn requireMailboxOwner(a: std.mem.Allocator, ctx: *Context) !void {
+    // Legacy EAS roots use a short name. Resolve a source there only when
+    // that key uniquely identifies the authenticated mailbox.
+    if (!std.mem.eql(u8, ctx.local_part, ctx.username)) {
+        if (try ctx.db.userExists(ctx.local_part)) return error.AmbiguousMailbox;
+        const owner = (try ctx.db.uniqueUsernameForLocalPart(ctx.local_part, a)) orelse return error.AmbiguousMailbox;
+        if (!std.mem.eql(u8, owner, ctx.username)) return error.AmbiguousMailbox;
+    }
+}
+
+// A Search LongId is valid only for the issuing account and the original
+// UID in its folder. A move or UID generation change requires another search.
+const MailReference = struct { folder: FolderDef, uid: i64 };
+const SearchKey = [32]u8;
+
+fn searchKey(db: *database.Database, user_id: i64, create: bool) !SearchKey {
+    if (create) {
+        const put = try db.prepare("INSERT OR IGNORE INTO eas_search_keys(user_id,key) VALUES (?1,?2)");
+        defer put.finalize();
+        var key: SearchKey = undefined;
+        io_compat.randomBytes(&key);
+        try put.bind(1, user_id);
+        try put.bindBlob(2, &key);
+        _ = try put.step();
+    }
+    const get = try db.prepare("SELECT hex(key) FROM eas_search_keys WHERE user_id=?1");
+    defer get.finalize();
+    try get.bind(1, user_id);
+    if (!try get.step()) return error.ItemNotFound;
+    const raw = get.columnText(0);
+    if (raw.len != 2 * @sizeOf(SearchKey)) return error.InvalidSearchKey;
+    var key: SearchKey = undefined;
+    _ = try std.fmt.hexToBytes(&key, raw);
+    return key;
+}
+
+fn searchSignature(key: SearchKey, folder_id: []const u8, uid: i64, validity: i64, filename: []const u8) [64]u8 {
+    const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac = Hmac.init(&key);
+    mac.update("mail/eas-search/v1\x00");
+    var numbers: [16]u8 = undefined;
+    std.mem.writeInt(i64, numbers[0..8], uid, .big);
+    std.mem.writeInt(i64, numbers[8..16], validity, .big);
+    mac.update(&numbers);
+    mac.update(folder_id);
+    mac.update("\x00");
+    mac.update(filename);
+    var digest: [Hmac.mac_length]u8 = undefined;
+    mac.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn resolveSearchId(a: std.mem.Allocator, ctx: *Context, user_id: i64, id: []const u8) !MailReference {
+    var parts = std.mem.splitScalar(u8, id, ':');
+    if (!std.mem.eql(u8, parts.first(), "s1")) return error.ItemNotFound;
+    const folder = folderById(parts.next() orelse return error.ItemNotFound) orelse return error.ItemNotFound;
+    const mailbox = folder.mailbox orelse return error.ItemNotFound;
+    const uid = itemUid(folder.id, parts.next() orelse return error.ItemNotFound) catch return error.ItemNotFound;
+    const tag = parts.next() orelse return error.ItemNotFound;
+    if (tag.len != 64 or parts.next() != null) return error.ItemNotFound;
+    const key = try searchKey(ctx.db, user_id, false);
+    const base = (try ctx.db.getFilenameForUid(a, ctx.username, mailbox, uid)) orelse return error.ItemNotFound;
+    const generation = try ctx.db.getOrCreateMailbox(ctx.username, mailbox);
+    const expected = searchSignature(key, folder.id, uid, generation.uidvalidity, base);
+    if (!std.crypto.timing_safe.eql([64]u8, expected, tag[0..64].*)) return error.ItemNotFound;
+    return .{ .folder = folder, .uid = uid };
+}
+
+const SearchItem = struct { mail: MailItem, folder: FolderDef, validity: i64 };
+
+fn handleSearch(ctx: *Context, body: []const u8) !Response {
+    if (ctx.protocol_version < 120) return .{ .status = 501 };
+    if (body.len > 16 * 1024) return .{ .status = 400 };
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const page = wbxml.Page.search;
+    const S = wbxml.Search;
+    const root = wbxml.decode(a, body) catch return .{ .status = 400 };
+    if (root.children.items.len != 1) return .{ .status = 400 };
+    const command = root.child(page, S.Search) orelse return .{ .status = 400 };
+    const query = search.parse(command.*) catch return searchStatus(ctx, 2);
+    if (query.collection) |id| {
+        const folder = folderById(id) orelse return searchStatus(ctx, 11);
+        if (folder.mailbox == null) return searchStatus(ctx, 2);
+    }
+    requireMailboxOwner(a, ctx) catch |err| return searchStatus(ctx, if (err == error.AmbiguousMailbox) 5 else 3);
+    return searchMailbox(ctx, a, query) catch |err| searchStatus(ctx, if (err == error.SearchLimit) 10 else 3);
+}
+
+fn searchStatus(ctx: *Context, status: u8) !Response {
+    var w = wbxml.Writer.init(ctx.allocator);
+    errdefer w.deinit();
+    try startSearchResponse(&w, status);
+    try w.end(); // Store
+    try w.end(); // Response
+    try w.end(); // Search
+    return .{ .body = try w.toOwnedSlice() };
+}
+
+fn startSearchResponse(w: *wbxml.Writer, status: u8) !void {
+    const S = wbxml.Search;
+    const page = wbxml.Page.search;
+    try w.writeHeader();
+    try w.startTag(page, S.Search);
+    try w.element(page, S.Status, "1");
+    try w.startTag(page, S.Response);
+    try w.startTag(page, S.Store);
+    try w.elementInt(page, S.Status, status);
+}
+
+fn searchCandidates(ctx: *Context, a: std.mem.Allocator, query: search.Query) ![]SearchItem {
+    ctx.db.lockMailboxes();
+    defer ctx.db.unlockMailboxes();
+    var candidates: std.ArrayList(SearchItem) = .empty;
+    for (FOLDERS) |folder| {
+        const mailbox = folder.mailbox orelse continue;
+        if (query.collection) |id| if (!std.mem.eql(u8, id, folder.id)) continue;
+        var items: std.ArrayList(MailItem) = .empty;
+        try collectMail(a, ctx, mailbox, 10_000 - candidates.items.len, &items);
+        if (items.items.len == 0) continue;
+        const generation = try ctx.db.getOrCreateMailbox(ctx.username, mailbox);
+        var seen: std.AutoHashMapUnmanaged(i64, void) = .empty;
+        for (items.items) |item| {
+            if ((try seen.getOrPut(a, item.uid)).found_existing) continue;
+            try candidates.append(a, .{ .mail = item, .folder = folder, .validity = generation.uidvalidity });
+        }
+    }
+    return candidates.items;
+}
+
+fn searchMailbox(ctx: *Context, a: std.mem.Allocator, query: search.Query) !Response {
+    const S = wbxml.Search;
+    const page = wbxml.Page.search;
+    var user = try ctx.db.getUserByUsername(ctx.username);
+    defer user.deinit(ctx.db.allocator);
+    if (!user.enabled) return searchStatus(ctx, 5);
+    const candidates = try searchCandidates(ctx, a, query);
+    std.mem.sort(SearchItem, candidates, {}, struct {
+        fn less(_: void, left: SearchItem, right: SearchItem) bool {
+            if (left.mail.epoch != right.mail.epoch) return left.mail.epoch > right.mail.epoch;
+            if (left.folder.kind != right.folder.kind) return left.folder.kind < right.folder.kind;
+            return left.mail.uid > right.mail.uid;
+        }
+    }.less);
+    var w = wbxml.Writer.init(ctx.allocator);
+    errdefer w.deinit();
+    try startSearchResponse(&w, 1);
+    var scanned: u64 = 0;
+    var total: usize = 0;
+    var emitted: usize = 0;
+    var key: ?SearchKey = null;
+    for (candidates) |item| {
+        const epoch = item.mail.epoch;
+        const timestamp = std.math.mul(i64, epoch, 1000) catch continue;
+        if (query.after) |after| if (timestamp <= after) continue;
+        if (query.before) |before| if (timestamp >= before) continue;
+        const bytes = fs_compat.getFileSize(item.mail.path) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        if (bytes > 256 * 1024 * 1024 - scanned) return error.SearchLimit;
+        scanned += bytes;
+        var scratch = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer scratch.deinit();
+        const temp = scratch.allocator();
+        const raw = fs_compat.readFileAlloc(temp, item.mail.path) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        const hit = (try webmail_maildir.matchMime(temp, raw, query.keywords orelse "")) orelse continue;
+        const index = total;
+        total += 1;
+        if (index < query.first or emitted == query.count) continue;
+        if (key == null) key = try searchKey(ctx.db, user.id, true);
+        try writeSearchResult(temp, &w, key.?, item, hit, query.body_limit);
+        emitted += 1;
+    }
+    if (emitted > 0) {
+        try w.element(page, S.Range, try std.fmt.allocPrint(a, "{d}-{d}", .{ query.first, query.first + emitted - 1 }));
+    } else {
+        try w.emptyTag(page, S.Result);
+    }
+    try w.elementInt(page, S.Total, @intCast(total));
+    try w.end(); // Store
+    try w.end(); // Response
+    try w.end(); // Search
+    return .{ .body = try w.toOwnedSlice() };
+}
+
+fn boundedSearchText(value: []const u8, limit: usize) []const u8 {
+    var end = @min(value.len, limit);
+    while (end > 0 and end < value.len and value[end] & 0xc0 == 0x80) end -= 1;
+    return if (std.unicode.utf8ValidateSlice(value[0..end])) value[0..end] else "";
+}
+
+fn writeSearchResult(a: std.mem.Allocator, w: *wbxml.Writer, key: SearchKey, hit: SearchItem, match: webmail_maildir.SearchMatch, body_limit: ?usize) !void {
+    const S = wbxml.Search;
+    const page = wbxml.Page.search;
+    const A = wbxml.AirSync;
+    const E = wbxml.Email;
+    const B = wbxml.AirSyncBase;
+    const uid = hit.mail.uid;
+    const base = maildirBaseName(std.fs.path.basename(hit.mail.path));
+    const signature = searchSignature(key, hit.folder.id, uid, hit.validity, base);
+    const id = try std.fmt.allocPrint(a, "s1:{s}:{d}:{s}", .{ hit.folder.id, uid, &signature });
+    try w.startTag(page, S.Result);
+    try w.element(wbxml.Page.air_sync, A.FolderType, "Email");
+    try w.element(page, S.LongId, id);
+    try w.element(wbxml.Page.air_sync, A.FolderId, hit.folder.id);
+    try w.startTag(page, S.Properties);
+    try w.element(wbxml.Page.email, E.Subject, boundedSearchText(match.subject, 2048));
+    try w.element(wbxml.Page.email, E.From, boundedSearchText(match.from, 2048));
+    try w.element(wbxml.Page.email, E.To, boundedSearchText(match.to, 2048));
+    try w.element(wbxml.Page.email, E.DateReceived, isoFromEpoch(a, hit.mail.epoch));
+    try w.element(wbxml.Page.email, E.Read, if (hit.mail.seen) "1" else "0");
+    try w.element(wbxml.Page.email, E.MessageClass, "IPM.Note");
+    if (body_limit) |limit| {
+        const data = boundedSearchText(match.text, limit);
+        try w.startTag(wbxml.Page.air_sync_base, B.Body);
+        try w.element(wbxml.Page.air_sync_base, B.Type, "1");
+        try w.elementInt(wbxml.Page.air_sync_base, B.EstimatedDataSize, @intCast(match.text.len));
+        try w.element(wbxml.Page.air_sync_base, B.Truncated, if (data.len < match.text.len) "1" else "0");
+        if (data.len > 0) try w.element(wbxml.Page.air_sync_base, B.Data, data);
+        try w.end(); // Body
+    }
+    try w.end(); // Properties
+    try w.end(); // Result
 }
 
 // ============================================================================
@@ -102,10 +672,12 @@ pub fn dispatch(ctx: *Context, cmd: []const u8, body: []const u8) !Response {
 
 fn handleProvision(ctx: *Context, body: []const u8) !Response {
     var is_ack = false;
+    var page = wbxml.Page.provision;
     if (body.len > 0) {
         var root = wbxml.decode(ctx.allocator, body) catch wbxml.Node{ .page = 0xFF, .token = 0xFF };
         defer root.deinit(ctx.allocator);
-        if (root.find(wbxml.Page.provision, wbxml.Provision.PolicyKey) != null) is_ack = true;
+        if (root.child(13, wbxml.Provision.Provision) != null) page = 13;
+        is_ack = root.find(page, wbxml.Provision.PolicyKey) != null;
     }
 
     var w = wbxml.Writer.init(ctx.allocator);
@@ -113,7 +685,6 @@ fn handleProvision(ctx: *Context, body: []const u8) !Response {
     try w.writeHeader();
 
     const P = wbxml.Provision;
-    const page = wbxml.Page.provision;
 
     try w.startTag(page, P.Provision);
     try w.element(page, P.Status, "1");
@@ -185,7 +756,7 @@ fn handleFolderSync(ctx: *Context, body: []const u8) !Response {
 // Sync (MS-ASCMD §2.2.2.20)
 // ============================================================================
 
-fn handleSync(ctx: *Context, body: []const u8) !Response {
+fn handleSync(ctx: *Context, account: sync_state.Account, body: []const u8) !Response {
     var w = wbxml.Writer.init(ctx.allocator);
     errdefer w.deinit();
     try w.writeHeader();
@@ -197,21 +768,35 @@ fn handleSync(ctx: *Context, body: []const u8) !Response {
     try w.startTag(page, A.Folders);
 
     if (body.len > 0) {
-        var root = try wbxml.decode(ctx.allocator, body);
+        var root = wbxml.decode(ctx.allocator, body) catch {
+            w.deinit();
+            return .{ .status = 400 };
+        };
         defer root.deinit(ctx.allocator);
-
         if (root.child(page, A.Synchronize)) |sync_root| {
             const folders_node = sync_root.child(page, A.Folders) orelse sync_root;
             for (folders_node.children.items) |*coll| {
                 if (coll.token != A.Folder or coll.page != page) continue;
                 const collection_id = coll.childText(page, A.FolderId) orelse continue;
-                const req_key = coll.childText(page, A.SyncKey) orelse "0";
+                const req_key = coll.childText(page, A.SyncKey) orelse "";
                 const folder = folderById(collection_id) orelse continue;
-                if (folder.mailbox) |mailbox| {
-                    writeMailCollection(ctx, &w, collection_id, mailbox, req_key) catch {};
-                } else {
-                    writeDavCollection(ctx, &w, folder, req_key) catch {};
+                if (coll.child(page, A.Perform)) |commands| {
+                    if (commands.children.items.len != 0) {
+                        try writeSyncStatus(&w, collection_id, req_key, "6");
+                        continue;
+                    }
                 }
+                const length = w.buf.items.len;
+                const code_page = w.current_page;
+                writeSyncCollection(ctx, account, &w, folder, req_key) catch |err| {
+                    w.buf.shrinkRetainingCapacity(length);
+                    w.current_page = code_page;
+                    if (err == error.InvalidSyncKey) {
+                        try writeSyncStatus(&w, collection_id, "0", "3");
+                    } else {
+                        try writeSyncStatus(&w, collection_id, req_key, "5");
+                    }
+                };
             }
         }
     }
@@ -221,411 +806,272 @@ fn handleSync(ctx: *Context, body: []const u8) !Response {
     return Response{ .body = try w.toOwnedSlice() };
 }
 
-// ---------------------------------------------------------------------------
-// Email collection sync (Maildir + SQLite snapshot diff)
-// ---------------------------------------------------------------------------
-
-fn writeMailCollection(ctx: *Context, w: *wbxml.Writer, collection_id: []const u8, mailbox: []const u8, req_key: []const u8) !void {
-    const A = wbxml.AirSync;
-    const page = wbxml.Page.air_sync;
-
-    try w.startTag(page, A.Folder);
-    try w.element(page, A.FolderId, collection_id);
-
-    const stored_key = getSyncKey(ctx, collection_id);
-
-    if (std.mem.eql(u8, req_key, "0")) {
-        clearItemState(ctx, collection_id) catch {};
-        setSyncKey(ctx, collection_id, 1, 0) catch {};
-        try w.element(page, A.SyncKey, "1");
-        try w.element(page, A.Status, "1");
-        try w.end();
-        return;
-    }
-    const req_key_n = std.fmt.parseInt(i64, req_key, 10) catch -1;
-    if (req_key_n != stored_key) {
-        try w.element(page, A.SyncKey, "0");
-        try w.element(page, A.Status, "3");
-        try w.end();
-        return;
-    }
-
-    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var items = std.ArrayList(MailItem).empty;
-    collectMail(a, ctx, mailbox, &items) catch {};
-
-    // Previous snapshot: server_id -> tag (read flag "0"/"1").
-    var snap = std.StringHashMap([]const u8).init(a);
-    loadItemState(a, ctx, collection_id, &snap) catch {};
-
-    const Op = struct { kind: u8, server_id: []const u8, item: ?MailItem };
-    var ops = std.ArrayList(Op).empty;
-    var current = std.StringHashMap(void).init(a);
-
-    for (items.items) |it| {
-        const sid = std.fmt.allocPrint(a, "{s}:{d}", .{ collection_id, it.uid }) catch continue;
-        current.put(sid, {}) catch {};
-        const tag: []const u8 = if (it.seen) "1" else "0";
-        if (snap.get(sid)) |old_tag| {
-            if (!std.mem.eql(u8, old_tag, tag)) ops.append(a, .{ .kind = A.Modify, .server_id = sid, .item = it }) catch {};
-        } else {
-            ops.append(a, .{ .kind = A.Add, .server_id = sid, .item = it }) catch {};
-        }
-    }
-    var snap_it = snap.iterator();
-    while (snap_it.next()) |e| {
-        if (!current.contains(e.key_ptr.*)) {
-            ops.append(a, .{ .kind = A.Remove, .server_id = e.key_ptr.*, .item = null }) catch {};
-        }
-    }
-
-    const total = ops.items.len;
-    const emit = @min(total, SYNC_WINDOW);
-    const more = total > emit;
-    const next_key = stored_key + 1;
-
-    try w.elementInt(page, A.SyncKey, next_key);
-    try w.element(page, A.Status, "1");
-
-    if (emit > 0) {
-        try w.startTag(page, A.Perform);
-        for (ops.items[0..emit]) |op| {
-            switch (op.kind) {
-                A.Add, A.Modify => {
-                    try w.startTag(page, op.kind);
-                    try w.element(page, A.ServerEntryId, op.server_id);
-                    try w.startTag(page, A.Data);
-                    writeMailAppData(a, w, op.item.?) catch {};
-                    try w.end(); // Data
-                    try w.end(); // Add/Change
-                    const tag: []const u8 = if (op.item.?.seen) "1" else "0";
-                    upsertItem(ctx, collection_id, op.server_id, tag) catch {};
-                },
-                A.Remove => {
-                    try w.startTag(page, A.Remove);
-                    try w.element(page, A.ServerEntryId, op.server_id);
-                    try w.end();
-                    deleteItem(ctx, collection_id, op.server_id) catch {};
-                },
-                else => {},
-            }
-        }
-        try w.end(); // Perform
-    }
-    if (more) try w.emptyTag(page, A.MoreAvailable);
-
-    setSyncKey(ctx, collection_id, next_key, 0) catch {};
-    try w.end(); // Folder
+fn writeSyncStatus(w: *wbxml.Writer, collection: []const u8, key: []const u8, status: []const u8) !void {
+    try beginSyncCollection(w, collection, key, status);
+    try w.end();
 }
 
-// ---------------------------------------------------------------------------
-// Calendar / Contacts collection sync (CalDAV store change log)
-// ---------------------------------------------------------------------------
-
-fn writeDavCollection(ctx: *Context, w: *wbxml.Writer, folder: FolderDef, req_key: []const u8) !void {
+fn beginSyncCollection(w: *wbxml.Writer, collection: []const u8, key: []const u8, status: []const u8) !void {
     const A = wbxml.AirSync;
     const page = wbxml.Page.air_sync;
-
     try w.startTag(page, A.Folder);
-    try w.element(page, A.FolderId, folder.id);
+    try w.element(page, A.FolderId, collection);
+    try w.element(page, A.SyncKey, key);
+    try w.element(page, A.Status, status);
+}
 
-    const stored_key = getSyncKey(ctx, folder.id);
+const SyncItem = struct {
+    id: []const u8,
+    tag: []const u8,
+    data: union(enum) { mail: MailItem, event: u64, contact: u64 },
+};
 
-    if (std.mem.eql(u8, req_key, "0")) {
-        setSyncKey(ctx, folder.id, 1, 0) catch {};
-        try w.element(page, A.SyncKey, "1");
-        try w.element(page, A.Status, "1");
-        try w.end();
-        return;
+const SyncChange = struct {
+    kind: u8,
+    id: []const u8,
+    item: ?SyncItem = null,
+};
+
+fn collectionChanges(a: std.mem.Allocator, ctx: *Context, folder: FolderDef, previous: sync_state.Items) ![]SyncChange {
+    const A = wbxml.AirSync;
+    var current: std.StringHashMapUnmanaged(void) = .empty;
+    var changes: std.ArrayList(SyncChange) = .empty;
+    if (folder.mailbox) |mailbox| {
+        var mail: std.ArrayList(MailItem) = .empty;
+        {
+            ctx.db.lockMailboxes();
+            defer ctx.db.unlockMailboxes();
+            try requireMailboxOwner(a, ctx);
+            try collectMail(a, ctx, mailbox, std.math.maxInt(usize), &mail);
+        }
+        for (mail.items) |message| {
+            const id = try std.fmt.allocPrint(a, "{s}:{d}", .{ folder.id, message.uid });
+            if ((try current.getOrPut(a, id)).found_existing) continue;
+            const tag: []const u8 = if (message.seen) "1" else "0";
+            try appendChanged(a, &changes, previous, .{ .id = id, .tag = tag, .data = .{ .mail = message } });
+        }
+    } else {
+        const items = try ctx.store.snapshotActiveSyncResources(a, ctx.username, folder.is_calendar);
+        for (items) |item| {
+            const id = try std.fmt.allocPrint(a, "{d}", .{item.id});
+            try current.put(a, id, {});
+            try appendChanged(a, &changes, previous, .{
+                .id = id,
+                .tag = item.etag,
+                .data = if (folder.is_calendar) .{ .event = item.id } else .{ .contact = item.id },
+            });
+        }
     }
-    const req_key_n = std.fmt.parseInt(i64, req_key, 10) catch -1;
-    if (req_key_n != stored_key) {
-        try w.element(page, A.SyncKey, "0");
-        try w.element(page, A.Status, "3");
-        try w.end();
-        return;
+    var seen = previous.keyIterator();
+    while (seen.next()) |id| {
+        if (!current.contains(id.*)) try changes.append(a, .{ .kind = A.Remove, .id = id.* });
     }
+    return changes.items;
+}
 
+fn appendChanged(a: std.mem.Allocator, changes: *std.ArrayList(SyncChange), previous: sync_state.Items, item: SyncItem) !void {
+    const A = wbxml.AirSync;
+    const old = previous.get(item.id);
+    if (old) |tag| {
+        if (std.mem.eql(u8, tag, item.tag)) return;
+    }
+    try changes.append(a, .{ .kind = if (old == null) A.Add else A.Modify, .id = item.id, .item = item });
+}
+
+fn writeSyncCollection(ctx: *Context, account: sync_state.Account, w: *wbxml.Writer, folder: FolderDef, requested_key: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    const page = wbxml.Page.air_sync;
+    const A = wbxml.AirSync;
 
-    const store_coll = resolveStoreCollection(ctx, folder.is_calendar) orelse {
-        // No backing calendar/addressbook yet — nothing to send. Echo the
-        // client's key (do NOT advance) so the next sync still matches.
-        try w.element(page, A.SyncKey, req_key);
-        try w.element(page, A.Status, "1");
-        try w.end();
-        return;
-    };
-
-    const since = getSyncToken(ctx, folder.id);
-
-    // Build the operations to send. `new_token` is the sync-token baseline to
-    // persist once we've sent them.
-    const Op = struct { kind: u8, rid: u64 };
-    var ops = std.ArrayList(Op).empty;
-    var new_token: i64 = since;
-
-    if (since == 0) {
-        // First data sync (or the first after a restart, where the in-memory
-        // change log is empty but data was loaded from SQLite): enumerate ALL
-        // current items as Adds rather than relying on the change log.
-        new_token = @intCast(ctx.store.getSyncToken(store_coll, folder.is_calendar));
-        if (folder.is_calendar) {
-            const events = ctx.store.getCalendarEvents(store_coll) catch &[_]caldav_store.Event{};
-            defer ctx.allocator.free(events);
-            for (events) |ev| ops.append(a, .{ .kind = A.Add, .rid = ev.id }) catch {};
-        } else {
-            const contacts = ctx.store.getAddressBookContacts(store_coll) catch &[_]caldav_store.Contact{};
-            defer ctx.allocator.free(contacts);
-            for (contacts) |ct| ops.append(a, .{ .kind = A.Add, .rid = ct.id }) catch {};
-        }
-    } else {
-        // Incremental: collapse the change log (create+modify -> Add,
-        // *+delete -> Delete, create+delete -> skip).
-        const report = ctx.store.getChangesSince(store_coll, @intCast(since), folder.is_calendar) catch caldav_store.SyncReport{
-            .changes = &.{},
-            .new_sync_token = @intCast(since),
-            .more_available = false,
-        };
-        defer ctx.allocator.free(report.changes);
-        new_token = @intCast(report.new_sync_token);
-
-        const Agg = struct { has_create: bool, deleted: bool };
-        var byId = std.AutoHashMap(u64, Agg).init(a);
-        var order = std.ArrayList(u64).empty;
-        for (report.changes) |ch| {
-            const gop = byId.getOrPut(ch.resource_id) catch continue;
-            if (!gop.found_existing) {
-                gop.value_ptr.* = .{ .has_create = false, .deleted = false };
-                order.append(a, ch.resource_id) catch {};
-            }
-            switch (ch.change_type) {
-                .created => gop.value_ptr.has_create = true,
-                .deleted => gop.value_ptr.deleted = true,
-                .modified => {},
-            }
-        }
-        for (order.items) |rid| {
-            const agg = byId.get(rid).?;
-            if (agg.deleted and agg.has_create) continue; // client never saw it
-            const kind: u8 = if (agg.deleted) A.Remove else if (agg.has_create) A.Add else A.Modify;
-            ops.append(a, .{ .kind = kind, .rid = rid }) catch {};
-        }
-    }
-
-    // No changes: echo the client's key (don't signal a change). Still persist
-    // the advanced token so the next incremental sync has the right baseline.
-    if (ops.items.len == 0) {
-        if (new_token != since) setSyncKey(ctx, folder.id, stored_key, new_token) catch {};
-        try w.element(page, A.SyncKey, req_key);
-        try w.element(page, A.Status, "1");
-        try w.end();
+    if (std.mem.eql(u8, requested_key, "0")) {
+        const key = try sync_state.newKey(a);
+        try writeSyncStatus(w, folder.id, key, "1");
+        try account.reset(folder.id, key);
         return;
     }
+    const snapshot = (try account.load(a, folder.id)) orelse return error.InvalidSyncKey;
+    if (!std.mem.eql(u8, snapshot.key, requested_key)) return error.InvalidSyncKey;
+    var items = snapshot.items;
+    const pending = try collectionChanges(a, ctx, folder, items);
+    if (pending.len == 0) return writeSyncStatus(w, folder.id, requested_key, "1");
 
-    // Changes to send: advance the key and emit the commands.
-    const next_key = stored_key + 1;
-    try w.elementInt(page, A.SyncKey, next_key);
-    try w.element(page, A.Status, "1");
+    const key = try sync_state.newKey(a);
+    try beginSyncCollection(w, folder.id, key, "1");
     try w.startTag(page, A.Perform);
-    for (ops.items) |op| {
-        const sid = std.fmt.allocPrint(a, "{d}", .{op.rid}) catch continue;
-        if (op.kind == A.Remove) {
-            try w.startTag(page, A.Remove);
-            try w.element(page, A.ServerEntryId, sid);
-            try w.end();
-            continue;
-        }
-        // Fetch the item before emitting so we can skip cleanly if it vanished.
-        if (folder.is_calendar) {
-            const ev = ctx.store.getEvent(op.rid) orelse continue;
-            try w.startTag(page, op.kind);
-            try w.element(page, A.ServerEntryId, sid);
-            try w.startTag(page, A.Data);
-            writeEventAppData(a, w, ev) catch {};
-            try w.end(); // Data
-            try w.end(); // Add/Change
+    const window = @min(SYNC_WINDOW, pending.len);
+    var emitted: usize = 0;
+    for (pending[0..window]) |change| {
+        const length = w.buf.items.len;
+        const code_page = w.current_page;
+        writeSyncChange(a, ctx, w, change) catch |err| switch (err) {
+            error.FileNotFound, error.EventNotFound, error.ContactNotFound, error.RevisionChanged => {
+                w.buf.shrinkRetainingCapacity(length);
+                w.current_page = code_page;
+                continue;
+            },
+            else => return err,
+        };
+        if (change.item) |item| {
+            try items.put(a, item.id, item.tag);
         } else {
-            const ct = ctx.store.getContact(op.rid) orelse continue;
-            try w.startTag(page, op.kind);
-            try w.element(page, A.ServerEntryId, sid);
-            try w.startTag(page, A.Data);
-            writeContactAppData(a, w, ctx, ct) catch {};
-            try w.end(); // Data
-            try w.end(); // Add/Change
+            _ = items.remove(change.id);
         }
+        emitted += 1;
     }
     try w.end(); // Perform
-
-    setSyncKey(ctx, folder.id, next_key, new_token) catch {};
-    try w.end(); // Folder
+    if (emitted < pending.len) try w.emptyTag(page, A.MoreAvailable);
+    try w.end(); // Collection
+    try account.advance(a, folder.id, requested_key, key, items);
 }
 
-/// Resolve the EAS Calendar/Contacts folder to the user's first store
-/// collection id, or null if the user has none.
-fn resolveStoreCollection(ctx: *Context, is_calendar: bool) ?u64 {
-    const user_id = ctx.store.getOrCreateUserId(ctx.username) catch return null;
-    if (is_calendar) {
-        const cals = ctx.store.getUserCalendars(user_id) catch return null;
-        defer ctx.allocator.free(cals);
-        if (cals.len == 0) return null;
-        return cals[0].id;
-    } else {
-        const abs = ctx.store.getUserAddressBooks(user_id) catch return null;
-        defer ctx.allocator.free(abs);
-        if (abs.len == 0) return null;
-        return abs[0].id;
+fn writeSyncChange(a: std.mem.Allocator, ctx: *Context, w: *wbxml.Writer, change: SyncChange) !void {
+    const A = wbxml.AirSync;
+    const page = wbxml.Page.air_sync;
+    try w.startTag(page, change.kind);
+    try w.element(page, A.ServerEntryId, change.id);
+    if (change.item) |item| {
+        try w.startTag(page, A.Data);
+        switch (item.data) {
+            .mail => |mail| try writeMailAppData(a, w, mail),
+            .event => |id| {
+                const event = try ctx.store.snapshotMailboxEvent(a, ctx.username, id);
+                if (!std.mem.eql(u8, item.tag, event.event.etag)) return error.RevisionChanged;
+                try writeEventAppData(a, w, event);
+            },
+            .contact => |id| {
+                const contact = try ctx.store.snapshotActiveSyncContact(a, ctx.username, id);
+                if (!std.mem.eql(u8, item.tag, contact.etag)) return error.RevisionChanged;
+                try writeContactAppData(w, contact);
+            },
+        }
+        try w.end(); // ApplicationData
     }
+    try w.end(); // Add/Change/Delete
 }
 
 // ============================================================================
 // GetItemEstimate / Ping
 // ============================================================================
 
-fn handleGetItemEstimate(ctx: *Context, body: []const u8) !Response {
+fn handleGetItemEstimate(ctx: *Context, account: sync_state.Account, body: []const u8) !Response {
+    var root = wbxml.decode(ctx.allocator, body) catch return .{ .status = 400 };
+    defer root.deinit(ctx.allocator);
+    const G = wbxml.GetItemEstimate;
+    const page = wbxml.Page.get_item_estimate;
+    const command = root.child(page, G.GetItemEstimate) orelse return .{ .status = 400 };
+    const folders = command.child(page, G.Folders) orelse return .{ .status = 400 };
+
     var w = wbxml.Writer.init(ctx.allocator);
     errdefer w.deinit();
     try w.writeHeader();
-
-    const G = wbxml.GetItemEstimate;
-    const page = wbxml.Page.get_item_estimate;
-
-    var collection_id: []const u8 = "1";
-    if (body.len > 0) {
-        var root = wbxml.decode(ctx.allocator, body) catch wbxml.Node{ .page = 0xFF, .token = 0xFF };
-        defer root.deinit(ctx.allocator);
-        if (root.find(page, G.FolderId)) |f| {
-            if (f.text) |t| collection_id = t;
-        }
-    }
-
     try w.startTag(page, G.GetItemEstimate);
-    try w.startTag(page, G.Response);
-    try w.element(page, G.Status, "1");
-    try w.startTag(page, G.Folder);
-    try w.element(page, G.FolderId, collection_id);
-    try w.elementInt(page, G.Estimate, estimatePending(ctx, collection_id));
-    try w.end();
-    try w.end();
-    try w.end();
-
-    return Response{ .body = try w.toOwnedSlice() };
-}
-
-/// Count of pending changes for the collection (best-effort hint for the client).
-fn estimatePending(ctx: *Context, collection_id: []const u8) i64 {
-    const folder = folderById(collection_id) orelse return 0;
-    if (folder.mailbox) |mailbox| {
+    for (folders.children.items) |*collection| {
+        if (collection.page != page or collection.token != G.Folder) continue;
+        const id = collection.childText(page, G.FolderId) orelse "";
+        const key = collection.childText(wbxml.Page.air_sync, wbxml.AirSync.SyncKey) orelse "";
         var arena = std.heap.ArenaAllocator.init(ctx.allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        return @intCast(mailChangeCount(a, ctx, collection_id, mailbox));
-    }
-    const store_coll = resolveStoreCollection(ctx, folder.is_calendar) orelse return 0;
-    const since = getSyncToken(ctx, collection_id);
-    const report = ctx.store.getChangesSince(store_coll, @intCast(since), folder.is_calendar) catch return 0;
-    defer ctx.allocator.free(report.changes);
-    return @intCast(report.changes.len);
-}
-
-fn handlePing(ctx: *Context, body: []const u8) !Response {
-    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var heartbeat: u64 = PING_MAX_HEARTBEAT_S;
-    var folder_ids = std.ArrayList([]const u8).empty;
-
-    if (body.len > 0) {
-        var root = wbxml.decode(ctx.allocator, body) catch wbxml.Node{ .page = 0xFF, .token = 0xFF };
-        defer root.deinit(ctx.allocator);
-        if (root.find(wbxml.Page.ping, wbxml.Ping.LifeTime)) |lt| {
-            if (lt.text) |t| heartbeat = std.fmt.parseInt(u64, t, 10) catch PING_MAX_HEARTBEAT_S;
-        }
-        // Collect monitored folder ids (dupe into arena: source tree is freed here).
-        if (root.find(wbxml.Page.ping, wbxml.Ping.Folders)) |folders| {
-            for (folders.children.items) |*f| {
-                if (f.token != wbxml.Ping.Folder or f.page != wbxml.Page.ping) continue;
-                if (f.childText(wbxml.Page.ping, wbxml.Ping.ServerEntryId)) |id| {
-                    folder_ids.append(a, a.dupe(u8, id) catch continue) catch {};
+        var status: u8 = 2;
+        var count: usize = 0;
+        if (folderById(id)) |folder| {
+            if (try account.load(a, id)) |snapshot| {
+                status = 4;
+                if (std.mem.eql(u8, snapshot.key, key)) {
+                    count = (try collectionChanges(a, ctx, folder, snapshot.items)).len;
+                    status = 1;
                 }
+            } else {
+                status = 3;
             }
         }
+        try w.startTag(page, G.Response);
+        try w.elementInt(page, G.Status, status);
+        try w.startTag(page, G.Folder);
+        try w.element(page, G.FolderId, id);
+        if (status == 1) try w.elementInt(page, G.Estimate, @intCast(count));
+        try w.end(); // Collection
+        try w.end(); // Response
     }
-    if (heartbeat > PING_MAX_HEARTBEAT_S) heartbeat = PING_MAX_HEARTBEAT_S;
-    if (heartbeat < PING_INTERVAL_S) heartbeat = PING_INTERVAL_S;
+    try w.end(); // GetItemEstimate
+    return .{ .body = try w.toOwnedSlice() };
+}
 
-    var changed = std.ArrayList([]const u8).empty;
-    const iterations = heartbeat / PING_INTERVAL_S;
-    var i: u64 = 0;
-    while (i < iterations) : (i += 1) {
-        for (folder_ids.items) |fid| {
-            if (collectionHasChanges(ctx, fid)) changed.append(a, fid) catch {};
+fn handlePing(ctx: *Context, account: sync_state.Account, body: []const u8) !Response {
+    const Pg = wbxml.Ping;
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const request_allocator = arena.allocator();
+    var page = wbxml.Page.ping;
+    var heartbeat: ?u64 = null;
+    var ids: [FOLDERS.len][]const u8 = undefined;
+    var requested_folders: ?[]const []const u8 = null;
+    if (body.len != 0) {
+        const root = wbxml.decode(request_allocator, body) catch return pingResponse(ctx, page, 4, &.{});
+        if (root.child(11, Pg.Ping) != null) page = 11;
+        const command = root.child(page, Pg.Ping) orelse return pingResponse(ctx, page, 4, &.{});
+        if (command.childText(page, Pg.LifeTime)) |value| {
+            const interval = std.fmt.parseInt(u64, value, 10) catch return pingResponse(ctx, page, 4, &.{});
+            heartbeat = std.math.clamp(interval, PING_INTERVAL_S, PING_MAX_HEARTBEAT_S);
         }
-        if (changed.items.len > 0) break;
-        time_compat.sleep(PING_INTERVAL_S * std.time.ns_per_s);
+        if (command.child(page, Pg.Folders)) |folders| {
+            if (folders.children.items.len > ids.len) return pingResponse(ctx, page, 6, &.{});
+            if (folders.children.items.len == 0) return pingResponse(ctx, page, 4, &.{});
+            for (folders.children.items, 0..) |*node, index| {
+                if (node.page != page or node.token != Pg.Folder) return pingResponse(ctx, page, 4, &.{});
+                const id = node.childText(page, Pg.ServerEntryId) orelse return pingResponse(ctx, page, 4, &.{});
+                const folder = folderById(id) orelse return pingResponse(ctx, page, 7, &.{});
+                ids[index] = folder.id;
+            }
+            requested_folders = ids[0..folders.children.items.len];
+        }
+        if (heartbeat == null and requested_folders == null) return pingResponse(ctx, page, 3, &.{});
     }
 
+    const settings = (account.ping(request_allocator, heartbeat, requested_folders) catch
+        return pingResponse(ctx, page, 8, &.{})) orelse return pingResponse(ctx, page, 3, &.{});
+    var remaining = settings.heartbeat;
+    while (true) {
+        var changed: [FOLDERS.len][]const u8 = undefined;
+        var count: usize = 0;
+        for (settings.folders) |id| {
+            const folder = folderById(id) orelse return pingResponse(ctx, page, 7, &.{});
+            var round_arena = std.heap.ArenaAllocator.init(ctx.allocator);
+            defer round_arena.deinit();
+            const a = round_arena.allocator();
+            const snapshot = account.load(a, folder.id) catch return pingResponse(ctx, page, 8, &.{});
+            const items: sync_state.Items = if (snapshot) |state| state.items else .empty;
+            const pending = collectionChanges(a, ctx, folder, items) catch return pingResponse(ctx, page, 8, &.{});
+            if (pending.len != 0) {
+                changed[count] = folder.id;
+                count += 1;
+            }
+        }
+        if (count != 0) return pingResponse(ctx, page, 2, changed[0..count]);
+        if (remaining == 0) return pingResponse(ctx, page, 1, &.{});
+        const delay: u64 = @min(remaining, PING_INTERVAL_S);
+        time_compat.sleep(delay * std.time.ns_per_s);
+        remaining -= delay;
+    }
+}
+
+fn pingResponse(ctx: *Context, page: u8, status: u8, changes: []const []const u8) !Response {
+    const Pg = wbxml.Ping;
     var w = wbxml.Writer.init(ctx.allocator);
     errdefer w.deinit();
     try w.writeHeader();
-    const Pg = wbxml.Ping;
-    const page = wbxml.Page.ping;
     try w.startTag(page, Pg.Ping);
-    if (changed.items.len > 0) {
-        // Status 2: changes detected in the listed folders.
-        try w.element(page, Pg.Status, "2");
+    try w.elementInt(page, Pg.Status, status);
+    if (changes.len != 0) {
         try w.startTag(page, Pg.Folders);
-        for (changed.items) |fid| try w.element(page, Pg.Folder, fid);
+        for (changes) |id| try w.element(page, Pg.Folder, id);
         try w.end();
-    } else {
-        // Status 1: heartbeat expired with no changes.
-        try w.element(page, Pg.Status, "1");
     }
+    if (status == 6) try w.elementInt(page, Pg.MaxFolders, FOLDERS.len);
     try w.end();
-    return Response{ .body = try w.toOwnedSlice() };
-}
-
-/// Read-only check: does the collection have unsynced changes right now?
-fn collectionHasChanges(ctx: *Context, collection_id: []const u8) bool {
-    const folder = folderById(collection_id) orelse return false;
-    if (folder.mailbox) |mailbox| {
-        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
-        defer arena.deinit();
-        return mailChangeCount(arena.allocator(), ctx, collection_id, mailbox) > 0;
-    }
-    const store_coll = resolveStoreCollection(ctx, folder.is_calendar) orelse return false;
-    const since = getSyncToken(ctx, collection_id);
-    return ctx.store.getSyncToken(store_coll, folder.is_calendar) > @as(u64, @intCast(since));
-}
-
-/// Number of email Add+Change+Delete pending versus the stored snapshot.
-fn mailChangeCount(a: std.mem.Allocator, ctx: *Context, collection_id: []const u8, mailbox: []const u8) usize {
-    var items = std.ArrayList(MailItem).empty;
-    collectMail(a, ctx, mailbox, &items) catch return 0;
-    var snap = std.StringHashMap([]const u8).init(a);
-    loadItemState(a, ctx, collection_id, &snap) catch return 0;
-
-    var current = std.StringHashMap(void).init(a);
-    var count: usize = 0;
-    for (items.items) |it| {
-        const sid = std.fmt.allocPrint(a, "{s}:{d}", .{ collection_id, it.uid }) catch continue;
-        current.put(sid, {}) catch {};
-        const tag: []const u8 = if (it.seen) "1" else "0";
-        if (snap.get(sid)) |old| {
-            if (!std.mem.eql(u8, old, tag)) count += 1;
-        } else count += 1;
-    }
-    var it = snap.iterator();
-    while (it.next()) |e| {
-        if (!current.contains(e.key_ptr.*)) count += 1;
-    }
-    return count;
+    return .{ .body = try w.toOwnedSlice() };
 }
 
 // ============================================================================
@@ -639,19 +1085,23 @@ const MailItem = struct {
     epoch: i64,
 };
 
-fn collectMail(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, out: *std.ArrayList(MailItem)) !void {
-    if (std.mem.eql(u8, mailbox, "INBOX")) {
-        try collectDir(a, ctx, mailbox, try std.fmt.allocPrint(a, "mail/{s}/new", .{ctx.local_part}), out);
-        try collectDir(a, ctx, mailbox, try std.fmt.allocPrint(a, "mail/{s}/cur", .{ctx.local_part}), out);
-    } else {
-        const base = try std.fmt.allocPrint(a, "mail/{s}/{s}", .{ ctx.local_part, mailbox });
-        try collectDir(a, ctx, mailbox, try std.fmt.allocPrint(a, "{s}/new", .{base}), out);
-        try collectDir(a, ctx, mailbox, try std.fmt.allocPrint(a, "{s}/cur", .{base}), out);
-    }
+fn mailboxDirs(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8) ![][]const u8 {
+    const root = try std.fmt.allocPrint(a, "mail/{s}", .{ctx.local_part});
+    const inbox = std.mem.eql(u8, mailbox, "INBOX");
+    const base = if (inbox) root else try std.fmt.allocPrint(a, "{s}/{s}", .{ root, mailbox });
+    const new = try std.fmt.allocPrint(a, "{s}/new", .{base});
+    const cur = try std.fmt.allocPrint(a, "{s}/cur", .{base});
+    if (!inbox and (ctx.hosted or std.mem.eql(u8, mailbox, "Sent"))) return a.dupe([]const u8, &.{ base, new, cur });
+    return a.dupe([]const u8, &.{ new, cur });
 }
 
-fn collectDir(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, dir_path: []const u8, out: *std.ArrayList(MailItem)) !void {
+fn collectMail(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, limit: usize, out: *std.ArrayList(MailItem)) !void {
+    for (try mailboxDirs(a, ctx, mailbox)) |dir| try collectDir(a, ctx, mailbox, dir, limit, out);
+}
+
+fn collectDir(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, dir_path: []const u8, limit: usize, out: *std.ArrayList(MailItem)) !void {
     const files = fs_compat.listEmlFiles(a, dir_path) catch return;
+    if (files.len > limit - out.items.len) return error.SearchLimit;
     for (files) |fname| {
         const base = maildirBaseName(fname);
         const uid = ctx.db.getUidForFile(ctx.username, mailbox, base) catch null orelse
@@ -681,7 +1131,9 @@ fn maildirEpoch(base: []const u8) i64 {
     var end: usize = 0;
     while (end < base.len and base[end] >= '0' and base[end] <= '9') end += 1;
     if (end == 0) return 0;
-    return std.fmt.parseInt(i64, base[0..end], 10) catch 0;
+    const stamp = std.fmt.parseInt(i64, base[0..end], 10) catch return 0;
+    const seconds = if (stamp > 9_999_999_999) @divTrunc(stamp, 1000) else stamp;
+    return if (seconds <= 253_402_300_799) seconds else 0;
 }
 
 // ============================================================================
@@ -692,7 +1144,7 @@ fn writeMailAppData(a: std.mem.Allocator, w: *wbxml.Writer, it: MailItem) !void 
     const E = wbxml.Email;
     const B = wbxml.AirSyncBase;
 
-    const raw: []const u8 = fs_compat.readFileAlloc(a, it.path) catch "";
+    const raw = try fs_compat.readFileAlloc(a, it.path);
     const split = headerBodySplit(raw);
     const headers = raw[0..split.header_end];
     const body_raw = raw[split.body_start..];
@@ -720,26 +1172,27 @@ fn writeMailAppData(a: std.mem.Allocator, w: *wbxml.Writer, it: MailItem) !void 
     try w.end(); // Body
 }
 
-fn writeEventAppData(a: std.mem.Allocator, w: *wbxml.Writer, ev: caldav_store.Event) !void {
+fn writeEventAppData(a: std.mem.Allocator, w: *wbxml.Writer, detail: caldav_store.CalendarEventDetail) !void {
     const C = wbxml.Calendar;
     const B = wbxml.AirSyncBase;
     const page = wbxml.Page.calendar;
 
+    const ev = detail.event;
     try w.element(page, C.UID, ev.uid);
     try w.element(page, C.Subject, ev.summary);
     if (ev.location) |loc| try w.element(page, C.Location, loc);
-    try w.element(page, C.StartTime, compactFromEpoch(a, ev.dtstart));
-    try w.element(page, C.EndTime, compactFromEpoch(a, ev.dtend orelse (ev.dtstart + 3600)));
-    try w.element(page, C.DtStamp, compactFromEpoch(a, ev.modified_at));
+    try w.element(page, C.StartTime, compactFromEpoch(a, ev.start));
+    try w.element(page, C.EndTime, compactFromEpoch(a, ev.end orelse (ev.start + 3600)));
+    try w.element(page, C.DtStamp, compactFromEpoch(a, detail.modified_at));
     try w.element(page, C.AllDayEvent, if (ev.all_day) "1" else "0");
     try w.element(page, C.BusyStatus, "2"); // busy
     try w.element(page, C.Sensitivity, "0"); // normal
     try w.element(page, C.MeetingStatus, "0"); // not a meeting
-    if (ev.organizer) |org| {
+    if (detail.organizer) |org| {
         try w.element(page, C.OrganizerEmail, org);
         try w.element(page, C.OrganizerName, org);
     }
-    if (ev.description) |desc| {
+    if (detail.description) |desc| {
         try w.startTag(wbxml.Page.air_sync_base, B.Body);
         try w.element(wbxml.Page.air_sync_base, B.Type, "1");
         try w.elementInt(wbxml.Page.air_sync_base, B.EstimatedDataSize, @intCast(desc.len));
@@ -751,7 +1204,7 @@ fn writeEventAppData(a: std.mem.Allocator, w: *wbxml.Writer, ev: caldav_store.Ev
     }
 }
 
-fn writeContactAppData(a: std.mem.Allocator, w: *wbxml.Writer, ctx: *Context, c: caldav_store.Contact) !void {
+fn writeContactAppData(w: *wbxml.Writer, c: caldav_store.ActiveSyncContact) !void {
     const K = wbxml.Contacts;
     const B = wbxml.AirSyncBase;
     const page = wbxml.Page.contacts;
@@ -762,15 +1215,11 @@ fn writeContactAppData(a: std.mem.Allocator, w: *wbxml.Writer, ctx: *Context, c:
     if (c.organization) |v| try w.element(page, K.CompanyName, v);
     if (c.title) |v| try w.element(page, K.JobTitle, v);
 
-    const emails = ctx.store.getContactEmails(c.id);
-    defer ctx.allocator.free(emails);
-    if (emails.len > 0) try w.element(page, K.Email1Address, emails[0].email);
-    if (emails.len > 1) try w.element(page, K.Email2Address, emails[1].email);
-    if (emails.len > 2) try w.element(page, K.Email3Address, emails[2].email);
+    if (c.emails.len > 0) try w.element(page, K.Email1Address, c.emails[0]);
+    if (c.emails.len > 1) try w.element(page, K.Email2Address, c.emails[1]);
+    if (c.emails.len > 2) try w.element(page, K.Email3Address, c.emails[2]);
 
-    const phones = ctx.store.getContactPhones(c.id);
-    defer ctx.allocator.free(phones);
-    for (phones) |ph| {
+    for (c.phones) |ph| {
         switch (ph.phone_type) {
             .mobile => try w.element(page, K.MobilePhoneNumber, ph.number),
             .home => try w.element(page, K.HomePhoneNumber, ph.number),
@@ -789,7 +1238,6 @@ fn writeContactAppData(a: std.mem.Allocator, w: *wbxml.Writer, ctx: *Context, c:
         try w.end();
         try w.end();
     }
-    _ = a;
 }
 
 // ============================================================================
@@ -863,120 +1311,6 @@ fn civilFromEpoch(epoch: i64) Civil {
         .second = ds.getSecondsIntoMinute(),
     };
 }
-
-// ============================================================================
-// Per-device sync + item state (SQLite)
-// ============================================================================
-
-fn ensureStateTables(db: *database.Database) !void {
-    try db.exec(
-        \\CREATE TABLE IF NOT EXISTS eas_sync_state (
-        \\  device_id TEXT NOT NULL,
-        \\  collection_id TEXT NOT NULL,
-        \\  sync_key INTEGER NOT NULL DEFAULT 0,
-        \\  token INTEGER NOT NULL DEFAULT 0,
-        \\  PRIMARY KEY (device_id, collection_id)
-        \\);
-    );
-    try db.exec(
-        \\CREATE TABLE IF NOT EXISTS eas_item_state (
-        \\  device_id TEXT NOT NULL,
-        \\  collection_id TEXT NOT NULL,
-        \\  server_id TEXT NOT NULL,
-        \\  tag TEXT NOT NULL,
-        \\  PRIMARY KEY (device_id, collection_id, server_id)
-        \\);
-    );
-}
-
-fn getSyncKey(ctx: *Context, collection_id: []const u8) i64 {
-    var stmt = ctx.db.prepare(
-        "SELECT sync_key FROM eas_sync_state WHERE device_id = ?1 AND collection_id = ?2",
-    ) catch return 0;
-    defer stmt.finalize();
-    stmt.bind(1, ctx.device_id) catch return 0;
-    stmt.bind(2, collection_id) catch return 0;
-    if (stmt.step() catch false) return stmt.columnInt64(0);
-    return 0;
-}
-
-fn getSyncToken(ctx: *Context, collection_id: []const u8) i64 {
-    var stmt = ctx.db.prepare(
-        "SELECT token FROM eas_sync_state WHERE device_id = ?1 AND collection_id = ?2",
-    ) catch return 0;
-    defer stmt.finalize();
-    stmt.bind(1, ctx.device_id) catch return 0;
-    stmt.bind(2, collection_id) catch return 0;
-    if (stmt.step() catch false) return stmt.columnInt64(0);
-    return 0;
-}
-
-fn setSyncKey(ctx: *Context, collection_id: []const u8, sync_key: i64, token: i64) !void {
-    var stmt = try ctx.db.prepare(
-        \\INSERT INTO eas_sync_state (device_id, collection_id, sync_key, token)
-        \\VALUES (?1, ?2, ?3, ?4)
-        \\ON CONFLICT(device_id, collection_id) DO UPDATE SET sync_key = ?3, token = ?4
-    );
-    defer stmt.finalize();
-    try stmt.bind(1, ctx.device_id);
-    try stmt.bind(2, collection_id);
-    try stmt.bind(3, sync_key);
-    try stmt.bind(4, token);
-    _ = try stmt.step();
-}
-
-fn loadItemState(a: std.mem.Allocator, ctx: *Context, collection_id: []const u8, out: *std.StringHashMap([]const u8)) !void {
-    var stmt = try ctx.db.prepare(
-        "SELECT server_id, tag FROM eas_item_state WHERE device_id = ?1 AND collection_id = ?2",
-    );
-    defer stmt.finalize();
-    try stmt.bind(1, ctx.device_id);
-    try stmt.bind(2, collection_id);
-    while (stmt.step() catch false) {
-        const sid = try a.dupe(u8, stmt.columnText(0));
-        const tag = try a.dupe(u8, stmt.columnText(1));
-        try out.put(sid, tag);
-    }
-}
-
-fn upsertItem(ctx: *Context, collection_id: []const u8, server_id: []const u8, tag: []const u8) !void {
-    var stmt = try ctx.db.prepare(
-        \\INSERT INTO eas_item_state (device_id, collection_id, server_id, tag)
-        \\VALUES (?1, ?2, ?3, ?4)
-        \\ON CONFLICT(device_id, collection_id, server_id) DO UPDATE SET tag = ?4
-    );
-    defer stmt.finalize();
-    try stmt.bind(1, ctx.device_id);
-    try stmt.bind(2, collection_id);
-    try stmt.bind(3, server_id);
-    try stmt.bind(4, tag);
-    _ = try stmt.step();
-}
-
-fn deleteItem(ctx: *Context, collection_id: []const u8, server_id: []const u8) !void {
-    var stmt = try ctx.db.prepare(
-        "DELETE FROM eas_item_state WHERE device_id = ?1 AND collection_id = ?2 AND server_id = ?3",
-    );
-    defer stmt.finalize();
-    try stmt.bind(1, ctx.device_id);
-    try stmt.bind(2, collection_id);
-    try stmt.bind(3, server_id);
-    _ = try stmt.step();
-}
-
-fn clearItemState(ctx: *Context, collection_id: []const u8) !void {
-    var stmt = try ctx.db.prepare(
-        "DELETE FROM eas_item_state WHERE device_id = ?1 AND collection_id = ?2",
-    );
-    defer stmt.finalize();
-    try stmt.bind(1, ctx.device_id);
-    try stmt.bind(2, collection_id);
-    _ = try stmt.step();
-}
-
-// ============================================================================
-// Tests
-// ============================================================================
 
 test "maildir helpers" {
     try std.testing.expectEqualStrings("1700000000.abc", maildirBaseName("1700000000.abc:2,S"));

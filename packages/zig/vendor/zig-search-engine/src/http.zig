@@ -4,6 +4,7 @@
 //! are de-chunked defensively.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("types.zig");
 
 fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
@@ -52,11 +53,16 @@ fn tcpConnect(host: [:0]const u8, port: u16, timeout_seconds: u32) types.Error!s
     defer std.c.freeaddrinfo(result.?);
 
     const family: c_uint = @intCast(std.posix.AF.INET);
-    const sock_type: c_uint = @intCast(@as(u32, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC));
+    const sock_type: c_uint = @intCast(@as(u32, std.posix.SOCK.STREAM) |
+        (if (builtin.os.tag == .linux) @as(u32, std.posix.SOCK.CLOEXEC) else 0));
     const raw_fd = std.c.socket(family, sock_type, 0);
     if (raw_fd < 0) return error.ConnectFailed;
     const sock: std.posix.socket_t = @intCast(raw_fd);
     errdefer _ = std.c.close(sock);
+    if (builtin.os.tag != .linux) {
+        const flags = std.c.fcntl(sock, std.c.F.GETFD, @as(c_int, 0));
+        if (flags < 0 or std.c.fcntl(sock, std.c.F.SETFD, flags | std.c.FD_CLOEXEC) < 0) return error.ConnectFailed;
+    }
 
     const tv: std.posix.timeval = .{ .sec = @intCast(timeout_seconds), .usec = 0 };
     std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};

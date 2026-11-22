@@ -12,7 +12,7 @@ pub fn validMailbox(value: []const u8) bool {
     return true;
 }
 
-fn mailbox(value: []const u8) ![]const u8 {
+pub fn mailbox(value: []const u8) ![]const u8 {
     const trimmed = std.mem.trim(u8, value, " \t\r");
     if (std.mem.indexOfScalar(u8, trimmed, '<')) |open| {
         const close = std.mem.indexOfScalarPos(u8, trimmed, open + 1, '>') orelse return error.InvalidFrom;
@@ -72,6 +72,112 @@ pub fn author(allocator: std.mem.Allocator, message: []const u8) !?[]u8 {
     }
     if (!found) return null;
     return try allocator.dupe(u8, try mailbox(value.items));
+}
+
+pub const ClientMime = struct {
+    archive: []const u8,
+    recipients: [][]const u8,
+};
+
+/// Read the envelope from the top-level To/Cc/Bcc fields and bind From to
+/// the authenticated account. Keep the MIME body, attachments and private
+/// Bcc header intact for the requested Sent copy. Outputs use the caller arena.
+pub fn prepareClientMime(a: std.mem.Allocator, raw: []const u8, sender: []const u8) !ClientMime {
+    if (!validMailbox(sender)) return error.InvalidFrom;
+    var archive: std.ArrayList(u8) = .empty;
+    var address_value: std.ArrayList(u8) = .empty;
+    var recipients: std.ArrayList([]const u8) = .empty;
+    try archive.print(a, "From: {s}\r\n", .{sender});
+
+    var collecting = false;
+    var keep = false;
+    var at_start = true;
+    var pos: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, raw, pos, '\n')) |newline| {
+        const line = std.mem.trimEnd(u8, raw[pos..newline], "\r");
+        pos = newline + 1;
+        for (line) |byte| {
+            if ((byte < 32 and byte != '\t') or byte == 127) return error.InvalidMime;
+        }
+        if (line.len == 0) {
+            if (collecting) try appendMailboxes(a, address_value.items, &recipients);
+            try archive.appendSlice(a, "\r\n");
+            try archive.appendSlice(a, raw[pos..]);
+            return .{ .archive = try archive.toOwnedSlice(a), .recipients = try recipients.toOwnedSlice(a) };
+        }
+        const continuation = line[0] == ' ' or line[0] == '\t';
+        if (continuation) {
+            if (at_start) return error.InvalidMime;
+            if (collecting) {
+                try address_value.append(a, ' ');
+                try address_value.appendSlice(a, std.mem.trim(u8, line, " \t"));
+            }
+        } else {
+            at_start = false;
+            if (collecting) try appendMailboxes(a, address_value.items, &recipients);
+            address_value.clearRetainingCapacity();
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidMime;
+            const name = line[0..colon];
+            if (name.len == 0) return error.InvalidMime;
+            for (name) |byte| {
+                if (byte < 33 or byte > 126) return error.InvalidMime;
+            }
+            collecting = std.ascii.eqlIgnoreCase(name, "To") or std.ascii.eqlIgnoreCase(name, "Cc") or std.ascii.eqlIgnoreCase(name, "Bcc");
+            if (collecting) try address_value.appendSlice(a, line[colon + 1 ..]);
+            keep = !std.ascii.eqlIgnoreCase(name, "From") and !std.ascii.eqlIgnoreCase(name, "Sender") and
+                !std.ascii.eqlIgnoreCase(name, "Return-Path") and !std.ascii.startsWithIgnoreCase(name, "Resent-");
+        }
+        if (keep) {
+            try archive.appendSlice(a, line);
+            try archive.appendSlice(a, "\r\n");
+        }
+    }
+    return error.InvalidMime;
+}
+
+pub fn appendMailboxes(a: std.mem.Allocator, list: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var start: usize = 0;
+    var quoted = false;
+    var escaped = false;
+    for (list, 0..) |byte, index| {
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (quoted and byte == '\\') {
+            escaped = true;
+        } else if (byte == '"') {
+            quoted = !quoted;
+        } else if (!quoted and byte == ',') {
+            const address = mailbox(list[start..index]) catch return error.InvalidAddress;
+            try out.append(a, try a.dupe(u8, address));
+            start = index + 1;
+        }
+    }
+    if (quoted or escaped) return error.InvalidAddress;
+    if (start == 0 and std.mem.trim(u8, list, " \t").len == 0) return;
+    const address = mailbox(list[start..]) catch return error.InvalidAddress;
+    try out.append(a, try a.dupe(u8, address));
+}
+
+/// Bcc lives only in the stored copy. Remove the field and any folded lines
+/// from a draft before submitting its MIME to recipients.
+pub fn withoutBcc(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    const body_start = if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |end| end + 4 else if (std.mem.indexOf(u8, raw, "\n\n")) |end| end + 2 else raw.len;
+    const headers = raw[0..body_start];
+    var buf: std.ArrayList(u8) = .empty;
+    var dropping = false;
+    var pos: usize = 0;
+    while (pos < headers.len) {
+        const end = if (std.mem.indexOfScalarPos(u8, headers, pos, '\n')) |newline| newline + 1 else headers.len;
+        const line = headers[pos..end];
+        const continuation = line[0] == ' ' or line[0] == '\t';
+        if (!continuation) dropping = line.len >= 4 and std.ascii.eqlIgnoreCase(line[0..4], "Bcc:");
+        if (!dropping) try buf.appendSlice(a, line);
+        pos = end;
+    }
+    try buf.appendSlice(a, raw[body_start..]);
+    return buf.toOwnedSlice(a);
 }
 
 test "security: submission From has one unambiguous author" {

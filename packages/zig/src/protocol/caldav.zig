@@ -1,12 +1,15 @@
 const std = @import("std");
+const clamav = @import("../antispam/clamav.zig");
 const posix = std.posix;
 const socket = @import("../core/socket_compat.zig");
 const io_compat = @import("../core/io_compat.zig");
 const auth = @import("../auth/auth.zig");
+const security = @import("../auth/security.zig");
 const logger = @import("../core/logger.zig");
 const tls = @import("tls");
 const time_compat = @import("../core/time_compat.zig");
 const caldav_store = @import("../storage/caldav_store.zig");
+const calendar_import = @import("../api/webmail_calendar_import.zig");
 const autoconfig = @import("../api/autoconfig.zig");
 const eas = @import("eas.zig");
 const ews = @import("ews/ews.zig");
@@ -19,6 +22,25 @@ fn currentTimestamp() i64 {
     const rc = std.c.clock_gettime(.REALTIME, &ts);
     if (rc != 0) return 0;
     return ts.sec;
+}
+
+fn legacyDavEvent(body: []const u8) caldav_store.CalDavStore.EventData {
+    const event = caldav_store.IcsParser.parseEvent(body) orelse return .{
+        .summary = "Untitled",
+        .dtstart = currentTimestamp(),
+        .ics_data = body,
+    };
+    return .{
+        .summary = event.summary orelse "Untitled",
+        .description = event.description,
+        .location = event.location,
+        .dtstart = event.dtstart orelse currentTimestamp(),
+        .dtend = event.dtend,
+        .all_day = event.all_day,
+        .rrule = event.rrule,
+        .organizer = event.organizer,
+        .ics_data = body,
+    };
 }
 
 /// CalDAV/CardDAV Server Implementation
@@ -71,6 +93,8 @@ pub const CalDavConfig = struct {
     mta_sts_mode: []const u8 = "enforce",
     // Outbound delivery (used by EWS CreateItem/SendItem to actually send mail).
     delivery_method: core_config.DeliveryMethod = .direct,
+    mail_config: ?*const core_config.Config = null,
+    scanner: ?*clamav.ClamAVScanner = null,
     ses_region: []const u8 = "us-east-1",
 };
 
@@ -80,6 +104,7 @@ pub const CalDavConfig = struct {
 
 pub const HttpMethod = enum {
     get,
+    head,
     put,
     post,
     delete,
@@ -98,6 +123,7 @@ pub const HttpMethod = enum {
 
         const methods = std.StaticStringMap(HttpMethod).initComptime(.{
             .{ "GET", .get },
+            .{ "HEAD", .head },
             .{ "PUT", .put },
             .{ "POST", .post },
             .{ "DELETE", .delete },
@@ -141,27 +167,52 @@ pub const ParsedPath = struct {
     };
 };
 
-/// Determine the total byte length of the first complete HTTP request in `buf`,
-/// honoring Content-Length. Returns null if the request is not yet complete
-/// (headers not fully received, or body shorter than Content-Length).
-fn httpRequestLength(buf: []const u8) ?usize {
-    const header_end = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return null;
-    const body_start = header_end + 4;
-    const headers = buf[0..header_end];
+fn resourceKind(path_type: ParsedPath.PathType) ?caldav_store.SyncChange.ResourceType {
+    return switch (path_type) {
+        .calendar_resource => .event,
+        .addressbook_resource => .contact,
+        else => null,
+    };
+}
 
-    var content_length: usize = 0;
-    var h_lines = std.mem.splitSequence(u8, headers, "\r\n");
-    while (h_lines.next()) |hline| {
-        if (hline.len >= 15 and std.ascii.eqlIgnoreCase(hline[0..15], "content-length:")) {
-            const val = std.mem.trim(u8, hline[15..], &std.ascii.whitespace);
-            content_length = std.fmt.parseInt(usize, val, 10) catch 0;
-            break;
+fn resourceConditions(request: []const u8) caldav_store.ResourceConditions {
+    return .{
+        .if_match = requestHeader(request, "If-Match"),
+        .if_none_match = requestHeader(request, "If-None-Match"),
+    };
+}
+
+const max_dav_header_bytes = 64 * 1024;
+
+/// Frame a request before dispatch, with the same limits for HTTP and HTTPS.
+fn httpRequestLength(buf: []const u8, max_body: usize) error{ InvalidFraming, RequestTooLarge }!?usize {
+    const header_end = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse {
+        if (buf.len >= max_dav_header_bytes) return error.RequestTooLarge;
+        return null;
+    };
+    const body_start = header_end + 4;
+    if (body_start > max_dav_header_bytes) return error.RequestTooLarge;
+
+    var content_length: ?usize = null;
+    var lines = std.mem.splitSequence(u8, buf[0..header_end], "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidFraming;
+        const name = line[0..colon];
+        if (std.ascii.eqlIgnoreCase(name, "Transfer-Encoding")) return error.InvalidFraming;
+        if (std.ascii.eqlIgnoreCase(name, "Content-Length")) {
+            if (content_length != null) return error.InvalidFraming;
+            const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            for (value) |byte| {
+                if (!std.ascii.isDigit(byte)) return error.InvalidFraming;
+            }
+            content_length = std.fmt.parseInt(usize, value, 10) catch return error.InvalidFraming;
         }
     }
-
-    const total = body_start + content_length;
-    if (buf.len < total) return null;
-    return total;
+    const length = content_length orelse 0;
+    if (length > max_body) return error.RequestTooLarge;
+    const total = std.math.add(usize, body_start, length) catch return error.RequestTooLarge;
+    return if (buf.len < total) null else total;
 }
 
 /// Percent-decode `input` once into `out`, returning the decoded slice.
@@ -191,6 +242,78 @@ fn percentDecodeOnce(input: []const u8, out: []u8) ?[]const u8 {
         }
     }
     return out[0..oi];
+}
+
+fn unquotedDelimiter(input: []const u8, delimiter: u8) ?usize {
+    var quoted = false;
+    for (input, 0..) |byte, index| {
+        if (byte == '"') quoted = !quoted;
+        if (byte == delimiter and !quoted) return index;
+    }
+    return null;
+}
+
+fn davFieldIsBase64(field: []const u8) bool {
+    var parameters = field;
+    while (unquotedDelimiter(parameters, ';')) |semicolon| {
+        parameters = parameters[semicolon + 1 ..];
+        const parameter = parameters[0 .. unquotedDelimiter(parameters, ';') orelse parameters.len];
+        const equals = std.mem.indexOfScalar(u8, parameter, '=') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(parameter[0..equals], "ENCODING")) continue;
+        const encoding = std.mem.trim(u8, parameter[equals + 1 ..], "\"");
+        return std.ascii.eqlIgnoreCase(encoding, "BASE64") or std.ascii.eqlIgnoreCase(encoding, "B");
+    }
+    return false;
+}
+
+fn scanDavField(a: std.mem.Allocator, scanner: *clamav.ClamAVScanner, line: []const u8) !void {
+    const colon = unquotedDelimiter(line, ':') orelse return;
+    const value = line[colon + 1 ..];
+    var unescaped: ?[]u8 = null;
+    defer if (unescaped) |buffer| a.free(buffer);
+    const encoded = if (davFieldIsBase64(line[0..colon])) value else blk: {
+        // vCard 4.0 embeds binary objects in data URIs. Remote URLs are never fetched.
+        if (!std.ascii.startsWithIgnoreCase(value, "data:")) return;
+        const comma = std.mem.indexOfScalar(u8, value, ',') orelse return;
+        const uri_data = value[comma + 1 ..];
+        const bytes = try a.alloc(u8, uri_data.len);
+        unescaped = bytes;
+        const decoded_uri = percentDecodeOnce(uri_data, bytes) orelse unreachable;
+        const metadata = value[0..comma];
+        const marker = ";base64";
+        if (metadata.len < marker.len or !std.ascii.eqlIgnoreCase(metadata[metadata.len - marker.len ..], marker)) {
+            return clamav.requireAllowed(scanner, decoded_uri);
+        }
+        break :blk decoded_uri;
+    };
+    const decoder = std.base64.standard.Decoder;
+    const size = decoder.calcSizeForSlice(encoded) catch return error.InvalidDavBinary;
+    const bytes = try a.alloc(u8, size);
+    defer a.free(bytes);
+    decoder.decode(bytes, encoded) catch return error.InvalidDavBinary;
+    try clamav.requireAllowed(scanner, bytes);
+}
+
+pub fn scanDavResource(a: std.mem.Allocator, scanner: ?*clamav.ClamAVScanner, body: []const u8) !void {
+    const active = scanner orelse return;
+    try clamav.requireAllowed(active, body);
+
+    // Both iCalendar and vCard fold long content lines. Unfold only for the
+    // scan so resource bytes, ETags, and existing parsers stay the same.
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    var unfolded: std.ArrayList(u8) = .empty;
+    defer unfolded.deinit(a);
+    while (lines.next()) |first| {
+        const line = std.mem.trimEnd(u8, first, "\r");
+        unfolded.clearRetainingCapacity();
+        while (lines.peek()) |next| {
+            if (next.len == 0 or (next[0] != ' ' and next[0] != '\t')) break;
+            if (unfolded.items.len == 0) try unfolded.appendSlice(a, line);
+            try unfolded.appendSlice(a, std.mem.trimEnd(u8, next[1..], "\r"));
+            _ = lines.next();
+        }
+        try scanDavField(a, active, if (unfolded.items.len > 0) unfolded.items else line);
+    }
 }
 
 /// Returns true if a percent-decoded path is unsafe (traversal, control chars,
@@ -369,6 +492,25 @@ fn appendResourceHref(
     try buf.appendSlice(allocator, ext ++ "</D:href>\n");
 }
 
+const dav_multistatus_start = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" ++
+    "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n";
+
+fn appendDavSyncMember(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, user: []const u8, collection: []const u8, kind: caldav_store.SyncChange.ResourceType, member: caldav_store.DavSyncMember) !void {
+    try buf.appendSlice(allocator, "  <D:response>\n");
+    switch (kind) {
+        .event => try appendResourceHref(buf, allocator, "/calendars/", user, collection, member.uid, ".ics"),
+        .contact => try appendResourceHref(buf, allocator, "/addressbooks/", user, collection, member.uid, ".vcf"),
+    }
+    if (member.etag) |etag| {
+        try buf.appendSlice(allocator, "    <D:propstat><D:prop>\n");
+        try appendXmlEscaped(buf, allocator, "      <D:getetag>", etag, "</D:getetag>\n");
+        try buf.appendSlice(allocator, "    </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>\n");
+    } else {
+        try buf.appendSlice(allocator, "    <D:status>HTTP/1.1 404 Not Found</D:status>\n");
+    }
+    try buf.appendSlice(allocator, "  </D:response>\n");
+}
+
 /// Append a plain <D:href> element with the href value XML-escaped.
 fn appendHrefEscaped(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, href: []const u8) !void {
     try appendXmlEscaped(buf, allocator, "    <D:href>", href, "</D:href>\n");
@@ -411,6 +553,8 @@ fn clearRequestAuthentication(allocator: std.mem.Allocator, username: *?[]const 
 pub const CalDavSession = struct {
     allocator: std.mem.Allocator,
     connection: socket.Connection,
+    tls_conn: ?*tls.nonblock.Connection = null,
+    request_buf: std.ArrayList(u8) = .empty,
     username: ?[]const u8 = null,
     authenticated: bool = false,
     auth_backend: *auth.AuthBackend,
@@ -427,67 +571,43 @@ pub const CalDavSession = struct {
 
     pub fn deinit(self: *CalDavSession) void {
         clearRequestAuthentication(self.allocator, &self.username, &self.authenticated);
+        self.request_buf.deinit(self.allocator);
     }
 
-    /// Handle incoming HTTP request
+    /// Read available bytes from a plain connection.
     pub fn handleRequest(self: *CalDavSession, config: *const CalDavConfig) !bool {
-        clearRequestAuthentication(self.allocator, &self.username, &self.authenticated);
-        // Initial read for headers (up to 64KB)
-        var header_buf: [65536]u8 = undefined;
-        const bytes_read = self.connection.read(&header_buf) catch return false;
+        var buf: [16 * 1024]u8 = undefined;
+        const received = self.connection.read(&buf) catch return false;
+        if (received == 0) return false;
+        return self.receive(config, buf[0..received]);
+    }
 
-        if (bytes_read == 0) {
-            return false; // Connection closed
-        }
-
-        // Check if we need to read more data based on Content-Length
-        var request_data: ?[]u8 = null;
-        defer if (request_data) |rd| self.allocator.free(rd);
-
-        const initial = header_buf[0..bytes_read];
-        const request = blk: {
-            // Find Content-Length header and end of headers
-            if (std.mem.indexOf(u8, initial, "\r\n\r\n")) |header_end| {
-                const headers = initial[0..header_end];
-                const body_start = header_end + 4;
-                const body_received = bytes_read - body_start;
-
-                // Parse Content-Length
-                var content_length: usize = 0;
-                var h_lines = std.mem.splitSequence(u8, headers, "\r\n");
-                while (h_lines.next()) |hline| {
-                    if (hline.len >= 15 and std.ascii.eqlIgnoreCase(hline[0..15], "content-length:")) {
-                        const val = std.mem.trim(u8, hline[15..], &std.ascii.whitespace);
-                        content_length = std.fmt.parseInt(usize, val, 10) catch 0;
-                        break;
-                    }
+    fn receive(self: *CalDavSession, config: *const CalDavConfig, bytes: []const u8) !bool {
+        try self.request_buf.appendSlice(self.allocator, bytes);
+        while (true) {
+            const length = httpRequestLength(self.request_buf.items, config.max_resource_size) catch |err| {
+                switch (err) {
+                    error.InvalidFraming => try self.sendError(400, "Bad Request"),
+                    error.RequestTooLarge => try self.sendError(413, "Content Too Large"),
                 }
-
-                // SECURITY: Reject requests with bodies exceeding max_resource_size
-                if (content_length > config.max_resource_size) {
-                    try self.sendError(413, "Request Entity Too Large");
-                    return true;
-                }
-
-                if (content_length > 0 and content_length > body_received) {
-                    // Need to read more body data
-                    const total_size = body_start + content_length;
-                    var full_buf = try self.allocator.alloc(u8, total_size);
-                    @memcpy(full_buf[0..bytes_read], initial);
-
-                    var total_read = bytes_read;
-                    while (total_read < total_size) {
-                        const n = self.connection.read(full_buf[total_read..total_size]) catch break;
-                        if (n == 0) break;
-                        total_read += n;
-                    }
-                    request_data = full_buf;
-                    break :blk full_buf[0..total_read];
+                return false;
+            } orelse return true;
+            const request = self.request_buf.items[0..length];
+            if (!try self.dispatchRequest(config, request)) return false;
+            if (requestHeader(request, "Connection")) |connection| {
+                var values = std.mem.splitScalar(u8, connection, ',');
+                while (values.next()) |value| {
+                    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, value, " \t"), "close")) return false;
                 }
             }
-            break :blk initial;
-        };
+            const remaining = self.request_buf.items[length..];
+            std.mem.copyForwards(u8, self.request_buf.items[0..remaining.len], remaining);
+            self.request_buf.shrinkRetainingCapacity(remaining.len);
+        }
+    }
 
+    fn dispatchRequest(self: *CalDavSession, config: *const CalDavConfig, request: []const u8) !bool {
+        clearRequestAuthentication(self.allocator, &self.username, &self.authenticated);
         // Parse HTTP request line
         var lines = std.mem.splitScalar(u8, request, '\n');
         const request_line = lines.next() orelse return false;
@@ -502,11 +622,11 @@ pub const CalDavSession = struct {
         };
 
         // Handle .well-known autodiscovery BEFORE authentication (per RFC 5785)
-        if (std.mem.startsWith(u8, path, "/.well-known/caldav")) {
+        if (method != .propfind and std.mem.startsWith(u8, path, "/.well-known/caldav")) {
             try self.sendWellKnownRedirect("/calendars/");
             return true;
         }
-        if (std.mem.startsWith(u8, path, "/.well-known/carddav")) {
+        if (method != .propfind and std.mem.startsWith(u8, path, "/.well-known/carddav")) {
             try self.sendWellKnownRedirect("/addressbooks/");
             return true;
         }
@@ -524,10 +644,8 @@ pub const CalDavSession = struct {
             return true;
         }
 
-        // --- Web services that work behind a TLS-terminating proxy (rpx) ---
-        // These mirror the TLS server's 443 routes so the unified macOS Exchange
-        // (EWS) account AND Calendar/Contacts autodiscovery work when the box's
-        // 443 is owned by a shared reverse proxy. Unauthenticated ones first.
+        // Discovery and Exchange endpoints use the same handlers on either
+        // transport. The discovery routes below run before authentication.
         if (method == .get and std.mem.startsWith(u8, path, "/email.mobileconfig")) {
             const wr = webMobileconfig(self.allocator, config, path) catch {
                 try self.sendError(400, "Bad Request");
@@ -544,7 +662,7 @@ pub const CalDavSession = struct {
             return true;
         }
         if (method == .options and std.mem.startsWith(u8, path, "/Microsoft-Server-ActiveSync")) {
-            try self.writeAllPlain(ACTIVESYNC_OPTIONS_RESPONSE);
+            try self.writeAll(ACTIVESYNC_OPTIONS_RESPONSE);
             return true;
         }
 
@@ -606,10 +724,9 @@ pub const CalDavSession = struct {
             }
         }
 
-        // Authenticated web services (EWS / autodiscover / ActiveSync) behind
-        // the reverse proxy. macOS Mail/Calendar/Contacts talk EWS here.
+        // Authenticated Exchange web services.
         if (method == .post and std.mem.startsWith(u8, path, "/Microsoft-Server-ActiveSync")) {
-            const wr = try webActiveSync(self.allocator, self.auth_backend.db, self.store, self.username, path, request);
+            const wr = try webActiveSync(self.allocator, config, self.auth_backend.db, self.store, self.username, path, request);
             defer if (wr.body.len > 0) self.allocator.free(wr.body);
             try self.sendWeb(wr);
             return true;
@@ -647,18 +764,36 @@ pub const CalDavSession = struct {
         request: []const u8,
         config: *const CalDavConfig,
     ) !void {
+        const parsed = parsePath(path);
+        if (parsed.user) |owner| {
+            if (!try self.ownsPath(owner)) return self.sendError(404, "Not Found");
+        }
         switch (method) {
-            .options => try self.handleOptions(path),
+            .options => try self.handleOptions(),
             .propfind => try self.handlePropfind(path, request, config),
             .proppatch => try self.handleProppatch(path, request, config),
-            .get => try self.handleGet(path, config),
+            .get, .head => try self.handleGet(path, request, method == .head),
             .put => try self.handlePut(path, request, config),
-            .delete => try self.handleDelete(path, config),
+            .delete => try self.handleDelete(path, request),
             .mkcalendar => try self.handleMkcalendar(path, config),
             .mkcol => try self.handleMkcol(path, config),
             .report => try self.handleReport(path, request, config),
             else => try self.sendError(501, "Not Implemented"),
         }
+    }
+
+    fn ownsPath(self: *CalDavSession, owner: []const u8) !bool {
+        const username = self.username orelse return false;
+        var buffer: [2048]u8 = undefined;
+        const decoded = percentDecodeOnce(owner, &buffer) orelse return false;
+        if (std.mem.eql(u8, decoded, username)) return true;
+        const db = self.auth_backend.db;
+        var user = db.getUserByUsername(username) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        defer user.deinit(db.allocator);
+        return std.mem.eql(u8, decoded, user.email);
     }
 
     /// Send .well-known redirect
@@ -670,20 +805,18 @@ pub const CalDavSession = struct {
             "HTTP/1.1 301 Moved Permanently\r\nLocation: {s}\r\nContent-Length: 0\r\n\r\n",
             .{location},
         );
-        _ = try self.connection.write(fbs.getWritten());
+        try self.writeAll(fbs.getWritten());
     }
 
     /// Handle OPTIONS request (WebDAV/CalDAV/CardDAV capabilities)
-    fn handleOptions(self: *CalDavSession, path: []const u8) !void {
-        _ = path;
-
+    fn handleOptions(self: *CalDavSession) !void {
         const response =
             "HTTP/1.1 200 OK\r\n" ++
-            "DAV: 1, 2, 3, calendar-access, addressbook\r\n" ++
-            "Allow: OPTIONS, GET, HEAD, POST, PUT, DELETE, PROPFIND, PROPPATCH, MKCALENDAR, MKCOL, REPORT\r\n" ++
+            "DAV: 1, 3, calendar-access, addressbook\r\n" ++
+            "Allow: OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCALENDAR, MKCOL, REPORT\r\n" ++
             "Content-Length: 0\r\n\r\n";
 
-        _ = try self.connection.write(response);
+        try self.writeAll(response);
     }
 
     /// Handle PROPFIND request (property discovery)
@@ -695,19 +828,8 @@ pub const CalDavSession = struct {
     ) !void {
         _ = config;
 
-        // Parse Depth header (0 = resource only, 1 = resource + children)
-        var depth: u8 = 0;
-        var lines = std.mem.splitScalar(u8, request, '\n');
-        while (lines.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
-            if (trimmed.len == 0) break;
-            if (std.mem.startsWith(u8, trimmed, "Depth:")) {
-                const depth_val = std.mem.trim(u8, trimmed[6..], &std.ascii.whitespace);
-                if (std.mem.eql(u8, depth_val, "1")) depth = 1;
-                if (std.mem.eql(u8, depth_val, "infinity")) depth = 1;
-                break;
-            }
-        }
+        const depth_header = requestHeader(request, "Depth") orelse "0";
+        const depth: u8 = if (std.mem.eql(u8, depth_header, "1") or std.mem.eql(u8, depth_header, "infinity")) 1 else 0;
 
         const parsed = parsePath(path);
         const user_id = try self.getUserId();
@@ -727,7 +849,7 @@ pub const CalDavSession = struct {
                 try buf.appendSlice(self.allocator, "      <D:prop>\n");
                 try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/></D:resourcetype>\n");
                 const username = self.username orelse "user";
-                try appendPrint(&buf, self.allocator, "        <D:current-user-principal><D:href>/principals/{s}</D:href></D:current-user-principal>\n", .{username});
+                try appendXmlEscaped(&buf, self.allocator, "        <D:current-user-principal><D:href>/principals/", username, "</D:href></D:current-user-principal>\n");
                 try buf.appendSlice(self.allocator, "      </D:prop>\n");
                 try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
                 try buf.appendSlice(self.allocator, "    </D:propstat>\n");
@@ -754,135 +876,8 @@ pub const CalDavSession = struct {
                 try buf.appendSlice(self.allocator, "  </D:response>\n");
                 try buf.appendSlice(self.allocator, "</D:multistatus>");
             },
-            .calendars_home => {
-                try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-                try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n");
-                // List user's calendars
-                const calendars = self.store.getUserCalendars(user_id) catch &[_]caldav_store.Calendar{};
-                for (calendars) |cal| {
-                    try buf.appendSlice(self.allocator, "  <D:response>\n");
-                    const username = parsed.user orelse "user";
-                    try appendCollectionHref(&buf, self.allocator, "/calendars/", username, cal.name);
-                    try buf.appendSlice(self.allocator, "    <D:propstat>\n");
-                    try buf.appendSlice(self.allocator, "      <D:prop>\n");
-                    try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\n");
-                    try appendXmlEscaped(&buf, self.allocator, "        <D:displayname>", cal.name, "</D:displayname>\n");
-                    try appendPrint(&buf, self.allocator, "        <CS:getctag xmlns:CS=\"http://calendarserver.org/ns/\">{s}</CS:getctag>\n", .{cal.ctag});
-                    try appendPrint(&buf, self.allocator, "        <D:sync-token>http://mail/sync/{d}</D:sync-token>\n", .{cal.sync_token});
-                    try buf.appendSlice(self.allocator, "      </D:prop>\n");
-                    try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                    try buf.appendSlice(self.allocator, "    </D:propstat>\n");
-                    try buf.appendSlice(self.allocator, "  </D:response>\n");
-                }
-                try buf.appendSlice(self.allocator, "</D:multistatus>");
-            },
-            .calendar_collection => {
-                try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-                try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n");
-
-                const collection_name = parsed.collection orelse "default";
-                const username = parsed.user orelse "user";
-
-                // Collection itself
-                try buf.appendSlice(self.allocator, "  <D:response>\n");
-                try appendCollectionHref(&buf, self.allocator, "/calendars/", username, collection_name);
-                try buf.appendSlice(self.allocator, "    <D:propstat>\n");
-                try buf.appendSlice(self.allocator, "      <D:prop>\n");
-                try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\n");
-                try appendXmlEscaped(&buf, self.allocator, "        <D:displayname>", collection_name, "</D:displayname>\n");
-                try buf.appendSlice(self.allocator, "        <C:supported-calendar-component-set><C:comp name=\"VEVENT\"/><C:comp name=\"VTODO\"/></C:supported-calendar-component-set>\n");
-                try buf.appendSlice(self.allocator, "      </D:prop>\n");
-                try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                try buf.appendSlice(self.allocator, "    </D:propstat>\n");
-                try buf.appendSlice(self.allocator, "  </D:response>\n");
-
-                // List events if Depth: 1
-                if (depth >= 1) {
-                    const calendars = self.store.getUserCalendars(user_id) catch &[_]caldav_store.Calendar{};
-                    for (calendars) |cal| {
-                        if (std.mem.eql(u8, cal.name, collection_name)) {
-                            const events = self.store.getCalendarEvents(cal.id) catch &[_]caldav_store.Event{};
-                            for (events) |event| {
-                                try buf.appendSlice(self.allocator, "  <D:response>\n");
-                                try appendResourceHref(&buf, self.allocator, "/calendars/", username, collection_name, event.uid, ".ics");
-                                try buf.appendSlice(self.allocator, "    <D:propstat>\n");
-                                try buf.appendSlice(self.allocator, "      <D:prop>\n");
-                                try appendXmlEscaped(&buf, self.allocator, "        <D:getetag>", event.etag, "</D:getetag>\n");
-                                try buf.appendSlice(self.allocator, "      </D:prop>\n");
-                                try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                                try buf.appendSlice(self.allocator, "    </D:propstat>\n");
-                                try buf.appendSlice(self.allocator, "  </D:response>\n");
-                            }
-                            break;
-                        }
-                    }
-                }
-                try buf.appendSlice(self.allocator, "</D:multistatus>");
-            },
-            .addressbooks_home => {
-                try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-                try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
-                const addressbooks = self.store.getUserAddressBooks(user_id) catch &[_]caldav_store.AddressBook{};
-                for (addressbooks) |ab| {
-                    try buf.appendSlice(self.allocator, "  <D:response>\n");
-                    const username = parsed.user orelse "user";
-                    try appendCollectionHref(&buf, self.allocator, "/addressbooks/", username, ab.name);
-                    try buf.appendSlice(self.allocator, "    <D:propstat>\n");
-                    try buf.appendSlice(self.allocator, "      <D:prop>\n");
-                    try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>\n");
-                    try appendXmlEscaped(&buf, self.allocator, "        <D:displayname>", ab.name, "</D:displayname>\n");
-                    try appendPrint(&buf, self.allocator, "        <CS:getctag xmlns:CS=\"http://calendarserver.org/ns/\">{s}</CS:getctag>\n", .{ab.ctag});
-                    try appendPrint(&buf, self.allocator, "        <D:sync-token>http://mail/sync/{d}</D:sync-token>\n", .{ab.sync_token});
-                    try buf.appendSlice(self.allocator, "        <CARD:supported-address-data><CARD:address-data-type content-type=\"text/vcard\" version=\"3.0\"/></CARD:supported-address-data>\n");
-                    try buf.appendSlice(self.allocator, "      </D:prop>\n");
-                    try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                    try buf.appendSlice(self.allocator, "    </D:propstat>\n");
-                    try buf.appendSlice(self.allocator, "  </D:response>\n");
-                }
-                try buf.appendSlice(self.allocator, "</D:multistatus>");
-            },
-            .addressbook_collection => {
-                try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-                try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
-
-                const collection_name = parsed.collection orelse "default";
-                const username = parsed.user orelse "user";
-
-                // Collection itself
-                try buf.appendSlice(self.allocator, "  <D:response>\n");
-                try appendCollectionHref(&buf, self.allocator, "/addressbooks/", username, collection_name);
-                try buf.appendSlice(self.allocator, "    <D:propstat>\n");
-                try buf.appendSlice(self.allocator, "      <D:prop>\n");
-                try buf.appendSlice(self.allocator, "        <D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>\n");
-                try appendXmlEscaped(&buf, self.allocator, "        <D:displayname>", collection_name, "</D:displayname>\n");
-                try buf.appendSlice(self.allocator, "        <CARD:supported-address-data><CARD:address-data-type content-type=\"text/vcard\" version=\"3.0\"/></CARD:supported-address-data>\n");
-                try buf.appendSlice(self.allocator, "      </D:prop>\n");
-                try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                try buf.appendSlice(self.allocator, "    </D:propstat>\n");
-                try buf.appendSlice(self.allocator, "  </D:response>\n");
-
-                // List contacts if Depth: 1
-                if (depth >= 1) {
-                    const addressbooks = self.store.getUserAddressBooks(user_id) catch &[_]caldav_store.AddressBook{};
-                    for (addressbooks) |ab| {
-                        if (std.mem.eql(u8, ab.name, collection_name)) {
-                            const contacts = self.store.getAddressBookContacts(ab.id) catch &[_]caldav_store.Contact{};
-                            for (contacts) |contact| {
-                                try buf.appendSlice(self.allocator, "  <D:response>\n");
-                                try appendResourceHref(&buf, self.allocator, "/addressbooks/", username, collection_name, contact.uid, ".vcf");
-                                try buf.appendSlice(self.allocator, "    <D:propstat>\n");
-                                try buf.appendSlice(self.allocator, "      <D:prop>\n");
-                                try appendXmlEscaped(&buf, self.allocator, "        <D:getetag>", contact.etag, "</D:getetag>\n");
-                                try buf.appendSlice(self.allocator, "      </D:prop>\n");
-                                try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                                try buf.appendSlice(self.allocator, "    </D:propstat>\n");
-                                try buf.appendSlice(self.allocator, "  </D:response>\n");
-                            }
-                            break;
-                        }
-                    }
-                }
-                try buf.appendSlice(self.allocator, "</D:multistatus>");
+            .calendars_home, .addressbooks_home, .calendar_collection, .addressbook_collection => {
+                return self.handleCollectionPropfind(parsed, user_id, depth);
             },
             else => {
                 // Fallback: generic PROPFIND response for the path
@@ -910,8 +905,66 @@ pub const CalDavSession = struct {
             .{body.len},
         );
 
-        _ = try self.connection.write(header_fbs.getWritten());
-        _ = try self.connection.write(body);
+        try self.writeAll(header_fbs.getWritten());
+        try self.writeAll(body);
+    }
+
+    fn handleCollectionPropfind(self: *CalDavSession, parsed: ParsedPath, user_id: u64, depth: u8) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const kind: caldav_store.SyncChange.ResourceType = switch (parsed.path_type) {
+            .calendars_home, .calendar_collection => .event,
+            else => .contact,
+        };
+        const username = parsed.user orelse self.username orelse return error.NotAuthenticated;
+        var buf: std.ArrayList(u8) = .empty;
+        try buf.appendSlice(a, dav_multistatus_start);
+        if (parsed.collection) |collection| {
+            const report = self.store.snapshotDavSync(a, user_id, collection, kind, if (depth > 0) .initial else .version_only) catch |err| switch (err) {
+                error.NotFound => return self.sendError(404, "Not Found"),
+                else => return err,
+            };
+            try self.appendDavCollection(&buf, a, username, collection, kind, report.token, null);
+            for (report.members) |member| try appendDavSyncMember(&buf, a, username, collection, kind, member);
+        } else {
+            const collections = try self.store.snapshotDavCollections(a, user_id, kind);
+            for (collections) |collection| {
+                try self.appendDavCollection(&buf, a, username, collection.name, kind, collection.token, collection.ctag);
+            }
+        }
+        try buf.appendSlice(a, "</D:multistatus>");
+        try self.sendMultistatusResponse(buf.items);
+    }
+
+    fn appendDavCollection(self: *CalDavSession, buf: *std.ArrayList(u8), a: std.mem.Allocator, username: []const u8, collection: []const u8, kind: caldav_store.SyncChange.ResourceType, token: []const u8, ctag: ?[]const u8) !void {
+        try buf.appendSlice(a, "  <D:response>\n");
+        switch (kind) {
+            .event => try appendCollectionHref(buf, a, "/calendars/", username, collection),
+            .contact => try appendCollectionHref(buf, a, "/addressbooks/", username, collection),
+        }
+        try buf.appendSlice(a, "    <D:propstat><D:prop>\n");
+        switch (kind) {
+            .event => try buf.appendSlice(a, "      <D:resourcetype><D:collection/><C:calendar/></D:resourcetype>\n" ++
+                "      <C:supported-calendar-component-set><C:comp name=\"VEVENT\"/><C:comp name=\"VTODO\"/></C:supported-calendar-component-set>\n"),
+            .contact => try buf.appendSlice(a, "      <D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>\n" ++
+                "      <CARD:supported-address-data><CARD:address-data-type content-type=\"text/vcard\" version=\"3.0\"/></CARD:supported-address-data>\n"),
+        }
+        try appendXmlEscaped(buf, a, "      <D:displayname>", collection, "</D:displayname>\n");
+        if (ctag) |tag| try appendXmlEscaped(buf, a, "      <CS:getctag xmlns:CS=\"http://calendarserver.org/ns/\">", tag, "</CS:getctag>\n");
+        try buf.appendSlice(a, "      <D:supported-report-set>\n");
+        switch (kind) {
+            .event => try buf.appendSlice(a, "        <D:supported-report><D:report><C:calendar-query/></D:report></D:supported-report>\n" ++
+                "        <D:supported-report><D:report><C:calendar-multiget/></D:report></D:supported-report>\n"),
+            .contact => try buf.appendSlice(a, "        <D:supported-report><D:report><CARD:addressbook-query/></D:report></D:supported-report>\n" ++
+                "        <D:supported-report><D:report><CARD:addressbook-multiget/></D:report></D:supported-report>\n"),
+        }
+        if (self.store.config.enable_sync_tokens) {
+            try buf.appendSlice(a, "        <D:supported-report><D:report><D:sync-collection/></D:report></D:supported-report>\n");
+        }
+        try buf.appendSlice(a, "      </D:supported-report-set>\n");
+        if (self.store.config.enable_sync_tokens) try appendXmlEscaped(buf, a, "      <D:sync-token>", token, "</D:sync-token>\n");
+        try buf.appendSlice(a, "    </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>\n  </D:response>\n");
     }
 
     /// Handle PROPPATCH request (modify properties on calendar/addressbook)
@@ -973,7 +1026,7 @@ pub const CalDavSession = struct {
                             "    </D:propstat>\n" ++
                             "  </D:response>\n" ++
                             "</D:multistatus>\n";
-                        _ = try self.connection.write(resp);
+                        try self.writeAll(resp);
                         return;
                     }
                 }
@@ -1000,7 +1053,7 @@ pub const CalDavSession = struct {
                             "    </D:propstat>\n" ++
                             "  </D:response>\n" ++
                             "</D:multistatus>\n";
-                        _ = try self.connection.write(resp);
+                        try self.writeAll(resp);
                         return;
                     }
                 }
@@ -1011,98 +1064,66 @@ pub const CalDavSession = struct {
     }
 
     /// Handle GET request (retrieve calendar/contact resource)
-    fn handleGet(self: *CalDavSession, path: []const u8, config: *const CalDavConfig) !void {
-        _ = config;
+    fn handleGet(self: *CalDavSession, path: []const u8, request: []const u8, headers_only: bool) !void {
         const parsed = parsePath(path);
+        const kind = resourceKind(parsed.path_type) orelse return self.sendError(404, "Not Found");
+        const uid = parsed.resource_uid orelse return self.sendError(404, "Not Found");
+        const name = parsed.collection orelse return self.sendError(404, "Not Found");
+        const user_id = try self.getUserId();
+        const resource = (self.store.getResource(user_id, name, uid, kind) catch |err|
+            return self.sendResourceError(err)) orelse return self.sendError(404, "Not Found");
+        defer self.store.allocator.free(resource.etag);
+        defer self.store.allocator.free(resource.body);
 
-        switch (parsed.path_type) {
-            .calendar_resource => {
-                const uid = parsed.resource_uid orelse {
-                    try self.sendError(404, "Not Found");
-                    return;
-                };
-                const collection_name = parsed.collection orelse {
-                    try self.sendError(404, "Not Found");
-                    return;
-                };
-                // Look up calendar by name for the user (use user_id=1 as default)
-                const user_id = try self.getUserId();
-                const calendars = self.store.getUserCalendars(user_id) catch {
-                    try self.sendError(500, "Internal Server Error");
-                    return;
-                };
-                var calendar_id: ?u64 = null;
-                for (calendars) |cal| {
-                    if (std.mem.eql(u8, cal.name, collection_name)) {
-                        calendar_id = cal.id;
-                        break;
-                    }
-                }
-                const cal_id = calendar_id orelse {
-                    try self.sendError(404, "Not Found");
-                    return;
-                };
-                const event = self.store.getEventByUid(cal_id, uid) orelse {
-                    try self.sendError(404, "Not Found");
-                    return;
-                };
-                const ics_data = if (event.ics_data.len > 0) event.ics_data else "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n";
-                try self.sendResourceResponse("text/calendar", event.etag, ics_data);
-            },
-            .addressbook_resource => {
-                const uid = parsed.resource_uid orelse {
-                    try self.sendError(404, "Not Found");
-                    return;
-                };
-                const collection_name = parsed.collection orelse {
-                    try self.sendError(404, "Not Found");
-                    return;
-                };
-                const user_id = try self.getUserId();
-                const addressbooks = self.store.getUserAddressBooks(user_id) catch {
-                    try self.sendError(500, "Internal Server Error");
-                    return;
-                };
-                var ab_id: ?u64 = null;
-                for (addressbooks) |ab| {
-                    if (std.mem.eql(u8, ab.name, collection_name)) {
-                        ab_id = ab.id;
-                        break;
-                    }
-                }
-                const addressbook_id = ab_id orelse {
-                    try self.sendError(404, "Not Found");
-                    return;
-                };
-                const contact = self.store.getContactByUid(addressbook_id, uid) orelse {
-                    try self.sendError(404, "Not Found");
-                    return;
-                };
-                const generated_vcf: ?[]u8 = if (contact.vcf_data.len == 0) (self.store.generateVcf(contact) catch {
-                    try self.sendError(500, "Internal Server Error");
-                    return;
-                }) else null;
-                defer if (generated_vcf) |g| self.allocator.free(g);
-                const vcf_data: []const u8 = generated_vcf orelse contact.vcf_data;
-                try self.sendResourceResponse("text/vcard", contact.etag, vcf_data);
-            },
-            else => {
-                try self.sendError(404, "Not Found");
-            },
+        const conditions = resourceConditions(request);
+        if (!(caldav_store.ResourceConditions{ .if_match = conditions.if_match }).allows(resource.etag)) {
+            return self.sendError(412, "Precondition Failed");
         }
+        if (!conditions.allows(resource.etag)) return self.sendTaggedResponse(.not_modified, resource.etag);
+
+        var buffer: [512]u8 = undefined;
+        const content_type: []const u8 = if (kind == .event) "text/calendar" else "text/vcard";
+        const header = try std.fmt.bufPrint(
+            &buffer,
+            "HTTP/1.1 200 OK\r\nContent-Type: {s}; charset=utf-8\r\nETag: {s}\r\nContent-Length: {d}\r\n\r\n",
+            .{ content_type, resource.etag, resource.body.len },
+        );
+        try self.writeAll(header);
+        if (!headers_only) try self.writeAll(resource.body);
     }
 
-    /// Send a resource response with Content-Type, ETag, and body
-    fn sendResourceResponse(self: *CalDavSession, content_type: []const u8, etag: []const u8, body: []const u8) !void {
-        var header_buf: [512]u8 = undefined;
-        var fbs = io_compat.fixedBufferStream(&header_buf);
-        const writer = fbs.writer();
-        try writer.print(
-            "HTTP/1.1 200 OK\r\nContent-Type: {s}; charset=utf-8\r\nETag: {s}\r\nContent-Length: {d}\r\n\r\n",
-            .{ content_type, etag, body.len },
-        );
-        _ = try self.connection.write(fbs.getWritten());
-        _ = try self.connection.write(body);
+    fn sendTaggedResponse(self: *CalDavSession, status: enum { created, updated, not_modified }, etag: []const u8) !void {
+        var buffer: [256]u8 = undefined;
+        const reason = switch (status) {
+            .created => "201 Created",
+            .updated => "204 No Content",
+            .not_modified => "304 Not Modified",
+        };
+        const length = if (status == .created) "Content-Length: 0\r\n" else "";
+        const response = try std.fmt.bufPrint(&buffer, "HTTP/1.1 {s}\r\nETag: {s}\r\n{s}\r\n", .{ reason, etag, length });
+        try self.writeAll(response);
+    }
+
+    fn sendResourceError(self: *CalDavSession, err: anyerror) !void {
+        return switch (err) {
+            error.NotFound => self.sendError(404, "Not Found"),
+            error.PreconditionFailed => self.sendError(412, "Precondition Failed"),
+            error.WrongCollectionType => self.sendError(400, "Path is not a calendar"),
+            else => self.sendError(500, "Internal Server Error"),
+        };
+    }
+
+    fn checkPutContent(self: *CalDavSession, config: *const CalDavConfig, body: []const u8) !bool {
+        scanDavResource(self.allocator, config.scanner, body) catch |err| {
+            switch (err) {
+                error.MalwareDetected => try self.sendError(422, "Resource rejected by malware scanner"),
+                error.InvalidDavBinary => try self.sendError(422, "Invalid embedded binary resource"),
+                error.MalwareScanTooLarge => try self.sendError(413, "Resource exceeds scanner size limit"),
+                error.MalwareScanUnavailable, error.OutOfMemory => try self.sendError(503, "Malware scanner unavailable"),
+            }
+            return false;
+        };
+        return true;
     }
 
     /// Handle PUT request (create/update calendar/contact resource)
@@ -1112,26 +1133,10 @@ pub const CalDavSession = struct {
         request: []const u8,
         config: *const CalDavConfig,
     ) !void {
-        _ = config;
         const parsed = parsePath(path);
 
-        // Extract body from request
-        const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse {
-            try self.sendError(400, "Bad Request");
-            return;
-        };
-        const body = request[body_start + 4 ..];
-
-        // Extract If-Match header for conflict detection
-        var if_match: ?[]const u8 = null;
-        var lines = std.mem.splitScalar(u8, request[0..body_start], '\n');
-        while (lines.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
-            if (std.mem.startsWith(u8, trimmed, "If-Match:")) {
-                if_match = std.mem.trim(u8, trimmed[9..], &std.ascii.whitespace);
-                break;
-            }
-        }
+        const body = httpBody(request);
+        const conditions = resourceConditions(request);
 
         switch (parsed.path_type) {
             .calendar_resource => {
@@ -1147,79 +1152,17 @@ pub const CalDavSession = struct {
                     try self.sendError(400, "Missing calendar name");
                     return;
                 };
+                if (!try self.checkPutContent(config, body)) return;
                 const user_id = try self.getUserId();
 
-                // Find or create calendar
-                var cal_id: u64 = undefined;
-                if (self.store.getAddressBookByName(user_id, collection_name)) |_| {
-                    // Wrong type - this is an addressbook path
-                    try self.sendError(400, "Path is not a calendar");
-                    return;
-                }
-                const calendars = self.store.getUserCalendars(user_id) catch {
-                    try self.sendError(500, "Internal Server Error");
-                    return;
-                };
-                var found = false;
-                for (calendars) |cal| {
-                    if (std.mem.eql(u8, cal.name, collection_name)) {
-                        cal_id = cal.id;
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    cal_id = self.store.createCalendar(user_id, collection_name, null) catch {
-                        try self.sendError(500, "Internal Server Error");
-                        return;
-                    };
-                }
+                var scratch = std.heap.ArenaAllocator.init(self.allocator);
+                defer scratch.deinit();
+                var event_data = (try calendar_import.indexDavEvent(scratch.allocator(), body)) orelse legacyDavEvent(body);
+                event_data.uid = uid;
 
-                // Parse the full event from the ICS so the structured fields
-                // (start/end/location/description/recurrence) are stored —
-                // EAS/EWS/webmail read these, not the raw ICS. Previously only
-                // the summary was kept and dtstart was stamped with the current
-                // time, so every event showed up as "now" with no end/location.
-                const parsed_event = caldav_store.IcsParser.parseEvent(body);
-                const summary = if (parsed_event) |e| (e.summary orelse "Untitled") else "Untitled";
-                const event_data = caldav_store.CalDavStore.EventData{
-                    .uid = uid,
-                    .summary = summary,
-                    .description = if (parsed_event) |e| e.description else null,
-                    .location = if (parsed_event) |e| e.location else null,
-                    // Fall back to "now" only if the ICS truly lacks DTSTART.
-                    .dtstart = if (parsed_event) |e| (e.dtstart orelse currentTimestamp()) else currentTimestamp(),
-                    .dtend = if (parsed_event) |e| e.dtend else null,
-                    .all_day = if (parsed_event) |e| e.all_day else false,
-                    .rrule = if (parsed_event) |e| e.rrule else null,
-                    .organizer = if (parsed_event) |e| e.organizer else null,
-                    .ics_data = body,
-                };
-
-                // Check if this is an update
-                if (self.store.getEventIdByUid(cal_id, uid)) |event_id| {
-                    // Update existing: check ETag if If-Match provided
-                    if (if_match) |etag| {
-                        if (self.store.getEvent(event_id)) |existing| {
-                            if (!std.mem.eql(u8, existing.etag, etag)) {
-                                try self.sendError(412, "Precondition Failed");
-                                return;
-                            }
-                        }
-                    }
-                    self.store.updateEvent(event_id, event_data) catch {
-                        try self.sendError(500, "Internal Server Error");
-                        return;
-                    };
-                    try self.sendSuccess(204, "No Content");
-                } else {
-                    // Create new
-                    _ = self.store.createEvent(cal_id, event_data) catch {
-                        try self.sendError(500, "Internal Server Error");
-                        return;
-                    };
-                    try self.sendSuccess(201, "Created");
-                }
+                const result = self.store.putEventResource(user_id, collection_name, uid, conditions, event_data) catch |err|
+                    return self.sendResourceError(err);
+                try self.sendTaggedResponse(if (result.created) .created else .updated, result.etag());
             },
             .addressbook_resource => {
                 if (std.mem.indexOf(u8, body, "BEGIN:VCARD") == null) {
@@ -1234,106 +1177,15 @@ pub const CalDavSession = struct {
                     try self.sendError(400, "Missing addressbook name");
                     return;
                 };
+                if (!try self.checkPutContent(config, body)) return;
                 const user_id = try self.getUserId();
 
-                // Find or create addressbook
-                var ab_id: u64 = undefined;
-                const addressbooks = self.store.getUserAddressBooks(user_id) catch {
-                    try self.sendError(500, "Internal Server Error");
-                    return;
-                };
-                var found_ab = false;
-                for (addressbooks) |ab| {
-                    if (std.mem.eql(u8, ab.name, collection_name)) {
-                        ab_id = ab.id;
-                        found_ab = true;
-                        break;
-                    }
-                }
-                if (!found_ab) {
-                    ab_id = self.store.createAddressBook(user_id, collection_name, null) catch {
-                        try self.sendError(500, "Internal Server Error");
-                        return;
-                    };
-                }
-
-                // Parse the full vCard so name parts, emails, and phones are
-                // stored (EAS/EWS/webmail read these structured fields).
-                // Previously only full_name was kept, so contacts synced with
-                // no email or phone numbers.
-                const parsed_contact = caldav_store.VcfParser.parseContact(body);
-                const full_name = if (parsed_contact) |c| (c.full_name orelse "Unknown") else "Unknown";
-
-                // Build email/phone arrays from the parsed vCard. The vCard
-                // parser doesn't track per-entry type, so first entry is
-                // marked primary and the rest default to .other.
-                const Store = caldav_store.CalDavStore;
-                var email_buf: [8]Store.EmailData = undefined;
-                var phone_buf: [8]Store.PhoneData = undefined;
-                var emails: []const Store.EmailData = &.{};
-                var phones: []const Store.PhoneData = &.{};
-                if (parsed_contact) |c| {
-                    // Carry the parsed TYPE (work/home/mobile/...) and PREF
-                    // through; if no entry is flagged PREF, the first is primary.
-                    const ne = @min(c.email_count, email_buf.len);
-                    var any_email_pref = false;
-                    for (0..ne) |i| {
-                        if (c.email_pref[i]) any_email_pref = true;
-                    }
-                    for (0..ne) |i| email_buf[i] = .{
-                        .email = c.emails[i],
-                        .email_type = c.email_types[i],
-                        .is_primary = if (any_email_pref) c.email_pref[i] else i == 0,
-                    };
-                    emails = email_buf[0..ne];
-
-                    const np = @min(c.phone_count, phone_buf.len);
-                    var any_phone_pref = false;
-                    for (0..np) |i| {
-                        if (c.phone_pref[i]) any_phone_pref = true;
-                    }
-                    for (0..np) |i| phone_buf[i] = .{
-                        .number = c.phones[i],
-                        .phone_type = c.phone_types[i],
-                        .is_primary = if (any_phone_pref) c.phone_pref[i] else i == 0,
-                    };
-                    phones = phone_buf[0..np];
-                }
-                const contact_data = Store.ContactData{
-                    .uid = uid,
-                    .full_name = full_name,
-                    .given_name = if (parsed_contact) |c| c.given_name else null,
-                    .family_name = if (parsed_contact) |c| c.family_name else null,
-                    .nickname = if (parsed_contact) |c| c.nickname else null,
-                    .organization = if (parsed_contact) |c| c.organization else null,
-                    .title = if (parsed_contact) |c| c.title else null,
-                    .vcf_data = body,
-                    .emails = emails,
-                    .phones = phones,
-                };
-
-                // Check if this is an update
-                if (self.store.getContactIdByUid(ab_id, uid)) |contact_id| {
-                    if (if_match) |etag| {
-                        if (self.store.getContact(contact_id)) |existing| {
-                            if (!std.mem.eql(u8, existing.etag, etag)) {
-                                try self.sendError(412, "Precondition Failed");
-                                return;
-                            }
-                        }
-                    }
-                    self.store.updateContact(contact_id, contact_data) catch {
-                        try self.sendError(500, "Internal Server Error");
-                        return;
-                    };
-                    try self.sendSuccess(204, "No Content");
-                } else {
-                    _ = self.store.createContact(ab_id, contact_data) catch {
-                        try self.sendError(500, "Internal Server Error");
-                        return;
-                    };
-                    try self.sendSuccess(201, "Created");
-                }
+                var scratch = std.heap.ArenaAllocator.init(self.allocator);
+                defer scratch.deinit();
+                const contact_data = try caldav_store.contactDataFromVcf(scratch.allocator(), uid, body);
+                const result = self.store.putContactResource(user_id, collection_name, uid, conditions, contact_data) catch |err|
+                    return self.sendResourceError(err);
+                try self.sendTaggedResponse(if (result.created) .created else .updated, result.etag());
             },
             else => {
                 try self.sendError(400, "Invalid PUT path");
@@ -1342,66 +1194,18 @@ pub const CalDavSession = struct {
     }
 
     /// Handle DELETE request (delete calendar/contact resource)
-    fn handleDelete(self: *CalDavSession, path: []const u8, config: *const CalDavConfig) !void {
-        _ = config;
+    fn handleDelete(self: *CalDavSession, path: []const u8, request: []const u8) !void {
         const parsed = parsePath(path);
 
         switch (parsed.path_type) {
-            .calendar_resource => {
-                const uid = parsed.resource_uid orelse {
-                    try self.sendError(404, "Not Found");
-                    return;
-                };
-                const collection_name = parsed.collection orelse {
-                    try self.sendError(404, "Not Found");
-                    return;
-                };
+            .calendar_resource, .addressbook_resource => {
+                const kind = resourceKind(parsed.path_type).?;
+                const uid = parsed.resource_uid orelse return self.sendError(404, "Not Found");
+                const collection = parsed.collection orelse return self.sendError(404, "Not Found");
                 const user_id = try self.getUserId();
-                const calendars = self.store.getUserCalendars(user_id) catch {
-                    try self.sendError(500, "Internal Server Error");
-                    return;
-                };
-                for (calendars) |cal| {
-                    if (std.mem.eql(u8, cal.name, collection_name)) {
-                        if (self.store.getEventIdByUid(cal.id, uid)) |event_id| {
-                            self.store.deleteEvent(event_id) catch {
-                                try self.sendError(500, "Internal Server Error");
-                                return;
-                            };
-                            try self.sendSuccess(204, "No Content");
-                            return;
-                        }
-                    }
-                }
-                try self.sendError(404, "Not Found");
-            },
-            .addressbook_resource => {
-                const uid = parsed.resource_uid orelse {
-                    try self.sendError(404, "Not Found");
-                    return;
-                };
-                const collection_name = parsed.collection orelse {
-                    try self.sendError(404, "Not Found");
-                    return;
-                };
-                const user_id = try self.getUserId();
-                const addressbooks = self.store.getUserAddressBooks(user_id) catch {
-                    try self.sendError(500, "Internal Server Error");
-                    return;
-                };
-                for (addressbooks) |ab| {
-                    if (std.mem.eql(u8, ab.name, collection_name)) {
-                        if (self.store.getContactIdByUid(ab.id, uid)) |contact_id| {
-                            self.store.deleteContact(contact_id) catch {
-                                try self.sendError(500, "Internal Server Error");
-                                return;
-                            };
-                            try self.sendSuccess(204, "No Content");
-                            return;
-                        }
-                    }
-                }
-                try self.sendError(404, "Not Found");
+                self.store.deleteResource(user_id, collection, uid, kind, resourceConditions(request)) catch |err|
+                    return self.sendResourceError(err);
+                return self.sendSuccess(204, "No Content");
             },
             .calendar_collection => {
                 // Delete entire calendar
@@ -1532,17 +1336,20 @@ pub const CalDavSession = struct {
     ) !void {
         _ = config;
 
-        // Check report type
-        if (std.mem.indexOf(u8, request, "calendar-query") != null) {
+        const body = httpBody(request);
+        var rest = body;
+        const report = nextXmlOpen(&rest) orelse return self.sendError(400, "Missing report");
+        const report_name = report.localName();
+        if (std.mem.eql(u8, report_name, "calendar-query")) {
             try self.handleCalendarQuery(path, request);
-        } else if (std.mem.indexOf(u8, request, "calendar-multiget") != null) {
-            try self.handleCalendarMultiget(path, request);
-        } else if (std.mem.indexOf(u8, request, "addressbook-query") != null) {
+        } else if (std.mem.eql(u8, report_name, "calendar-multiget")) {
+            try self.handleMultiget(path, body, .event);
+        } else if (std.mem.eql(u8, report_name, "addressbook-query")) {
             try self.handleAddressbookQuery(path, request);
-        } else if (std.mem.indexOf(u8, request, "addressbook-multiget") != null) {
-            try self.handleAddressbookMultiget(path, request);
-        } else if (std.mem.indexOf(u8, request, "sync-collection") != null) {
-            try self.handleSyncCollection(path, request);
+        } else if (std.mem.eql(u8, report_name, "addressbook-multiget")) {
+            try self.handleMultiget(path, body, .contact);
+        } else if (std.mem.eql(u8, report_name, "sync-collection")) {
+            try self.handleSyncCollection(path, request, rest);
         } else {
             try self.sendError(400, "Invalid report type");
         }
@@ -1636,58 +1443,92 @@ pub const CalDavSession = struct {
         try self.sendMultistatusResponse(buf.items);
     }
 
-    /// Handle calendar-multiget REPORT
-    fn handleCalendarMultiget(self: *CalDavSession, path: []const u8, request: []const u8) !void {
-        _ = path;
-        const user_id = try self.getUserId();
+    const XmlOpen = struct {
+        name: []const u8,
+        empty: bool,
 
+        fn localName(self: XmlOpen) []const u8 {
+            return if (std.mem.lastIndexOfScalar(u8, self.name, ':')) |colon| self.name[colon + 1 ..] else self.name;
+        }
+    };
+
+    fn nextXmlOpen(body: *[]const u8) ?XmlOpen {
+        while (std.mem.indexOfScalar(u8, body.*, '<')) |start| {
+            const tail = body.*[start + 1 ..];
+            if (std.mem.startsWith(u8, tail, "!--")) {
+                const end = std.mem.indexOf(u8, tail[3..], "-->") orelse return null;
+                body.* = tail[3 + end + 3 ..];
+                continue;
+            }
+            if (std.mem.startsWith(u8, tail, "?")) {
+                const end = std.mem.indexOf(u8, tail, "?>") orelse return null;
+                body.* = tail[end + 2 ..];
+                continue;
+            }
+            const end = std.mem.indexOfScalar(u8, tail, '>') orelse return null;
+            const tag = std.mem.trimEnd(u8, tail[0..end], " \t\r\n");
+            body.* = tail[end + 1 ..];
+            if (tag.len == 0 or tag[0] == '/' or tag[0] == '!') continue;
+            const name_end = std.mem.indexOfAny(u8, tag, " \t\r\n/") orelse tag.len;
+            if (name_end == 0) continue;
+            return .{ .name = tag[0..name_end], .empty = tag[tag.len - 1] == '/' };
+        }
+        return null;
+    }
+
+    /// Read a leaf element with either a prefixed or default namespace.
+    fn nextXmlText(body: *[]const u8, name: []const u8) ?[]const u8 {
+        while (nextXmlOpen(body)) |tag| {
+            if (!std.mem.eql(u8, tag.localName(), name)) continue;
+            if (tag.empty) return "";
+            const close = std.mem.indexOfScalar(u8, body.*, '<') orelse return null;
+            const value = std.mem.trim(u8, body.*[0..close], " \t\r\n");
+            body.* = body.*[close..];
+            const close_end = std.mem.indexOfScalar(u8, body.*, '>') orelse return null;
+            const closing = std.mem.trimEnd(u8, body.*[0..close_end], " \t\r\n");
+            if (!std.mem.startsWith(u8, closing, "</") or !std.mem.eql(u8, closing[2..], tag.name)) return null;
+            body.* = body.*[close_end + 1 ..];
+            return value;
+        }
+        return null;
+    }
+
+    fn handleMultiget(self: *CalDavSession, path: []const u8, body: []const u8, kind: caldav_store.SyncChange.ResourceType) !void {
+        const parsed = parsePath(path);
+        const collection = parsed.collection orelse return self.sendError(404, "Not Found");
+        const user_id = try self.getUserId();
+        const payload_tag: []const u8 = if (kind == .event) "C:calendar-data" else "CARD:address-data";
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
+        try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+        try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
 
-        try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-        try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\">\n");
-
-        // Parse <D:href> elements from request body
-        const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse request.len;
-        const body = if (body_start + 4 <= request.len) request[body_start + 4 ..] else "";
-
-        var search_pos: usize = 0;
-        while (std.mem.indexOf(u8, body[search_pos..], "<D:href>")) |href_start| {
-            const abs_start = search_pos + href_start + 8;
-            if (std.mem.indexOf(u8, body[abs_start..], "</D:href>")) |href_end| {
-                const href = body[abs_start .. abs_start + href_end];
-                const href_parsed = parsePath(href);
-                if (href_parsed.path_type == .calendar_resource) {
-                    if (href_parsed.resource_uid) |uid| {
-                        if (href_parsed.collection) |coll| {
-                            // Find calendar and event
-                            const calendars = self.store.getUserCalendars(user_id) catch &[_]caldav_store.Calendar{};
-                            for (calendars) |cal| {
-                                if (std.mem.eql(u8, cal.name, coll)) {
-                                    if (self.store.getEventByUid(cal.id, uid)) |event| {
-                                        try buf.appendSlice(self.allocator, "  <D:response>\n");
-                                        try appendHrefEscaped(&buf, self.allocator, href);
-                                        try buf.appendSlice(self.allocator, "    <D:propstat>\n");
-                                        try buf.appendSlice(self.allocator, "      <D:prop>\n");
-                                        try appendXmlEscaped(&buf, self.allocator, "        <D:getetag>", event.etag, "</D:getetag>\n");
-                                        if (event.ics_data.len > 0) {
-                                            try appendXmlEscaped(&buf, self.allocator, "        <C:calendar-data>", event.ics_data, "</C:calendar-data>\n");
-                                        }
-                                        try buf.appendSlice(self.allocator, "      </D:prop>\n");
-                                        try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                                        try buf.appendSlice(self.allocator, "    </D:propstat>\n");
-                                        try buf.appendSlice(self.allocator, "  </D:response>\n");
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                search_pos = abs_start + href_end + 9;
-            } else break;
+        var remaining = body;
+        while (nextXmlText(&remaining, "href")) |href| {
+            // These hrefs must be resources in the selected, authenticated collection.
+            const item = parsePath(href);
+            const item_collection = item.collection orelse continue;
+            const uid = item.resource_uid orelse continue;
+            const owner = item.user orelse continue;
+            if (resourceKind(item.path_type) != kind or !std.mem.eql(u8, item_collection, collection) or
+                !try self.ownsPath(owner)) continue;
+            const resource = try self.store.getResource(user_id, collection, uid, kind);
+            try buf.appendSlice(self.allocator, "  <D:response>\n");
+            try appendHrefEscaped(&buf, self.allocator, href);
+            if (resource) |version| {
+                defer self.store.allocator.free(version.body);
+                defer self.store.allocator.free(version.etag);
+                try buf.appendSlice(self.allocator, "    <D:propstat><D:prop>\n");
+                try appendXmlEscaped(&buf, self.allocator, "      <D:getetag>", version.etag, "</D:getetag>\n");
+                try appendPrint(&buf, self.allocator, "      <{s}>", .{payload_tag});
+                try appendXmlEscaped(&buf, self.allocator, "", version.body, "");
+                try appendPrint(&buf, self.allocator, "</{s}>\n", .{payload_tag});
+                try buf.appendSlice(self.allocator, "    </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>\n");
+            } else {
+                try buf.appendSlice(self.allocator, "    <D:status>HTTP/1.1 404 Not Found</D:status>\n");
+            }
+            try buf.appendSlice(self.allocator, "  </D:response>\n");
         }
-
         try buf.appendSlice(self.allocator, "</D:multistatus>");
         try self.sendMultistatusResponse(buf.items);
     }
@@ -1735,145 +1576,55 @@ pub const CalDavSession = struct {
         try self.sendMultistatusResponse(buf.items);
     }
 
-    /// Handle addressbook-multiget REPORT
-    fn handleAddressbookMultiget(self: *CalDavSession, path: []const u8, request: []const u8) !void {
-        _ = path;
+    /// Handle sync-collection REPORT on flat calendar and address book collections.
+    fn handleSyncCollection(self: *CalDavSession, path: []const u8, request: []const u8, body: []const u8) !void {
+        if (!self.store.config.enable_sync_tokens) return self.sendError(501, "Not Implemented");
+        const depth = requestHeader(request, "Depth") orelse "0";
+        if (!std.mem.eql(u8, depth, "0")) return self.sendError(400, "Sync REPORT requires Depth: 0");
+        const parsed = parsePath(path);
+        const kind: caldav_store.SyncChange.ResourceType = switch (parsed.path_type) {
+            .calendar_collection => .event,
+            .addressbook_collection => .contact,
+            else => return self.sendError(404, "Not Found"),
+        };
+        const user = parsed.user orelse return self.sendError(404, "Not Found");
+        const collection = parsed.collection orelse return self.sendError(404, "Not Found");
         const user_id = try self.getUserId();
 
+        var rest = body;
+        const token = nextXmlText(&rest, "sync-token") orelse return self.sendError(400, "Missing sync-token");
+        const level = nextXmlText(&rest, "sync-level") orelse return self.sendError(400, "Missing sync-level");
+        if (!std.mem.eql(u8, level, "1") and !std.mem.eql(u8, level, "infinite")) return self.sendError(400, "Invalid sync-level");
+
+        const limit = if (nextXmlText(&rest, "nresults")) |count|
+            std.fmt.parseInt(usize, count, 10) catch return self.sendError(400, "Invalid sync result limit")
+        else
+            std.math.maxInt(usize);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const report = self.store.snapshotDavSync(a, user_id, collection, kind, if (token.len == 0) .initial else .{ .after = token }) catch |err| switch (err) {
+            error.InvalidSyncToken => return self.sendDavReportError("403 Forbidden", "valid-sync-token"),
+            error.NotFound => return self.sendError(404, "Not Found"),
+            else => return err,
+        };
+        if (report.members.len > limit) return self.sendDavReportError("507 Insufficient Storage", "number-of-matches-within-limits");
+
         var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.allocator);
-
-        try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-        try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n");
-
-        // Parse <D:href> elements from request body
-        const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse request.len;
-        const body = if (body_start + 4 <= request.len) request[body_start + 4 ..] else "";
-
-        var search_pos: usize = 0;
-        while (std.mem.indexOf(u8, body[search_pos..], "<D:href>")) |href_start| {
-            const abs_start = search_pos + href_start + 8;
-            if (std.mem.indexOf(u8, body[abs_start..], "</D:href>")) |href_end| {
-                const href = body[abs_start .. abs_start + href_end];
-                const href_parsed = parsePath(href);
-                if (href_parsed.path_type == .addressbook_resource) {
-                    if (href_parsed.resource_uid) |uid| {
-                        if (href_parsed.collection) |coll| {
-                            const addressbooks = self.store.getUserAddressBooks(user_id) catch &[_]caldav_store.AddressBook{};
-                            for (addressbooks) |ab| {
-                                if (std.mem.eql(u8, ab.name, coll)) {
-                                    if (self.store.getContactByUid(ab.id, uid)) |contact| {
-                                        try buf.appendSlice(self.allocator, "  <D:response>\n");
-                                        try appendHrefEscaped(&buf, self.allocator, href);
-                                        try buf.appendSlice(self.allocator, "    <D:propstat>\n");
-                                        try buf.appendSlice(self.allocator, "      <D:prop>\n");
-                                        try appendXmlEscaped(&buf, self.allocator, "        <D:getetag>", contact.etag, "</D:getetag>\n");
-                                        const gen_vcf: ?[]u8 = if (contact.vcf_data.len == 0) (self.store.generateVcf(contact) catch null) else null;
-                                        defer if (gen_vcf) |g| self.allocator.free(g);
-                                        const vcf: []const u8 = gen_vcf orelse contact.vcf_data;
-                                        if (vcf.len > 0) {
-                                            try appendXmlEscaped(&buf, self.allocator, "        <CARD:address-data>", vcf, "</CARD:address-data>\n");
-                                        }
-                                        try buf.appendSlice(self.allocator, "      </D:prop>\n");
-                                        try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                                        try buf.appendSlice(self.allocator, "    </D:propstat>\n");
-                                        try buf.appendSlice(self.allocator, "  </D:response>\n");
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                search_pos = abs_start + href_end + 9;
-            } else break;
-        }
-
-        try buf.appendSlice(self.allocator, "</D:multistatus>");
+        try buf.appendSlice(a, dav_multistatus_start);
+        for (report.members) |member| try appendDavSyncMember(&buf, a, user, collection, kind, member);
+        try appendXmlEscaped(&buf, a, "  <D:sync-token>", report.token, "</D:sync-token>\n");
+        try buf.appendSlice(a, "</D:multistatus>");
         try self.sendMultistatusResponse(buf.items);
     }
 
-    /// Handle sync-collection REPORT (RFC 6578)
-    fn handleSyncCollection(self: *CalDavSession, path: []const u8, request: []const u8) !void {
-        const parsed = parsePath(path);
-        const user_id = try self.getUserId();
-
-        // Parse sync-token from request body
-        var sync_token: u64 = 0;
-        const body_start = std.mem.indexOf(u8, request, "\r\n\r\n") orelse request.len;
-        const body = if (body_start + 4 <= request.len) request[body_start + 4 ..] else "";
-
-        if (std.mem.indexOf(u8, body, "<D:sync-token>")) |token_start| {
-            const abs_start = token_start + 14;
-            if (std.mem.indexOf(u8, body[abs_start..], "</D:sync-token>")) |token_end| {
-                const token_str = body[abs_start .. abs_start + token_end];
-                // Token format: "http://..." or just a number
-                if (std.mem.lastIndexOf(u8, token_str, "/")) |slash| {
-                    sync_token = std.fmt.parseInt(u64, token_str[slash + 1 ..], 10) catch 0;
-                } else {
-                    sync_token = std.fmt.parseInt(u64, token_str, 10) catch 0;
-                }
-            }
-        }
-
-        const is_calendar = parsed.path_type == .calendar_collection;
-
-        // Find collection ID
-        var collection_id: u64 = 0;
-        if (parsed.collection) |coll_name| {
-            if (is_calendar) {
-                const calendars = self.store.getUserCalendars(user_id) catch &[_]caldav_store.Calendar{};
-                for (calendars) |cal| {
-                    if (std.mem.eql(u8, cal.name, coll_name)) {
-                        collection_id = cal.id;
-                        break;
-                    }
-                }
-            } else {
-                const addressbooks = self.store.getUserAddressBooks(user_id) catch &[_]caldav_store.AddressBook{};
-                for (addressbooks) |ab| {
-                    if (std.mem.eql(u8, ab.name, coll_name)) {
-                        collection_id = ab.id;
-                        break;
-                    }
-                }
-            }
-        }
-
-        const report = self.store.getChangesSince(collection_id, sync_token, is_calendar) catch {
-            try self.sendError(500, "Internal Server Error");
-            return;
-        };
-        // getChangesSince allocates the changes slice with the store allocator; the
-        // SyncChange entries themselves alias store-owned strings, so only free the
-        // slice (not its elements).
-        defer self.store.allocator.free(report.changes);
-
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.allocator);
-
-        try buf.appendSlice(self.allocator, "<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
-        try buf.appendSlice(self.allocator, "<D:multistatus xmlns:D=\"DAV:\">\n");
-
-        for (report.changes) |change| {
-            try buf.appendSlice(self.allocator, "  <D:response>\n");
-            try appendHrefEscaped(&buf, self.allocator, change.href);
-            if (change.change_type == .deleted) {
-                try buf.appendSlice(self.allocator, "    <D:status>HTTP/1.1 404 Not Found</D:status>\n");
-            } else {
-                try buf.appendSlice(self.allocator, "    <D:propstat>\n");
-                try buf.appendSlice(self.allocator, "      <D:prop>\n");
-                try appendXmlEscaped(&buf, self.allocator, "        <D:getetag>", change.etag, "</D:getetag>\n");
-                try buf.appendSlice(self.allocator, "      </D:prop>\n");
-                try buf.appendSlice(self.allocator, "      <D:status>HTTP/1.1 200 OK</D:status>\n");
-                try buf.appendSlice(self.allocator, "    </D:propstat>\n");
-            }
-            try buf.appendSlice(self.allocator, "  </D:response>\n");
-        }
-
-        try appendPrint(&buf, self.allocator, "  <D:sync-token>http://mail/sync/{d}</D:sync-token>\n", .{report.new_sync_token});
-        try buf.appendSlice(self.allocator, "</D:multistatus>");
-        try self.sendMultistatusResponse(buf.items);
+    fn sendDavReportError(self: *CalDavSession, status: []const u8, condition: []const u8) !void {
+        var body_buf: [128]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "<D:error xmlns:D=\"DAV:\"><D:{s}/></D:error>", .{condition});
+        var header_buf: [192]u8 = undefined;
+        const header = try std.fmt.bufPrint(&header_buf, "HTTP/1.1 {s}\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: {d}\r\n\r\n", .{ status, body.len });
+        try self.writeAll(header);
+        try self.writeAll(body);
     }
 
     /// Send a 207 Multi-Status response with the given body
@@ -1885,8 +1636,8 @@ pub const CalDavSession = struct {
             "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: {d}\r\n\r\n",
             .{body.len},
         );
-        _ = try self.connection.write(fbs.getWritten());
-        _ = try self.connection.write(body);
+        try self.writeAll(fbs.getWritten());
+        try self.writeAll(body);
     }
 
     /// Send authentication required response with Digest challenge
@@ -1897,7 +1648,7 @@ pub const CalDavSession = struct {
                 "HTTP/1.1 401 Unauthorized\r\n" ++
                 "WWW-Authenticate: Basic realm=\"CalDAV/CardDAV Server\"\r\n" ++
                 "Content-Length: 0\r\n\r\n";
-            _ = try self.connection.write(response);
+            try self.writeAll(response);
             return;
         };
         // Note: Don't free nonce here - it's owned by the NonceManager and will be freed when invalidated
@@ -1912,7 +1663,7 @@ pub const CalDavSession = struct {
                 "Content-Length: 0\r\n\r\n",
             .{ nonce, if (stale) ", stale=true" else "" },
         );
-        _ = try self.connection.write(fbs.getWritten());
+        try self.writeAll(fbs.getWritten());
     }
 
     /// Send error response
@@ -1921,7 +1672,7 @@ pub const CalDavSession = struct {
         var fbs = io_compat.fixedBufferStream(&buf);
         const writer = fbs.writer();
         try writer.print("HTTP/1.1 {d} {s}\r\nContent-Length: 0\r\n\r\n", .{ code, message });
-        _ = try self.connection.write(fbs.getWritten());
+        try self.writeAll(fbs.getWritten());
     }
 
     /// Send success response
@@ -1929,12 +1680,14 @@ pub const CalDavSession = struct {
         var buf: [256]u8 = undefined;
         var fbs = io_compat.fixedBufferStream(&buf);
         const writer = fbs.writer();
-        try writer.print("HTTP/1.1 {d} {s}\r\nContent-Length: 0\r\n\r\n", .{ code, message });
-        _ = try self.connection.write(fbs.getWritten());
+        const length = if (code == 204) "" else "Content-Length: 0\r\n";
+        try writer.print("HTTP/1.1 {d} {s}\r\n{s}\r\n", .{ code, message, length });
+        try self.writeAll(fbs.getWritten());
     }
 
     /// Write all bytes to the plain socket (connection.write may be partial).
-    fn writeAllPlain(self: *CalDavSession, data: []const u8) !void {
+    fn writeAll(self: *CalDavSession, data: []const u8) !void {
+        if (self.tls_conn) |connection| return self.writeTls(connection, data);
         var off: usize = 0;
         while (off < data.len) {
             const n = try self.connection.write(data[off..]);
@@ -1943,17 +1696,36 @@ pub const CalDavSession = struct {
         }
     }
 
-    /// Send a WebResponse (EWS/autodiscover/EAS/mobileconfig) over the plain
-    /// socket. Used when these services run behind a TLS-terminating reverse
-    /// proxy (rpx on the shared box) instead of the mail server's own 443.
+    fn writeTls(self: *CalDavSession, connection: *tls.nonblock.Connection, data: []const u8) !void {
+        // A single TLS record carries at most ~16 KiB of cleartext. Chunk larger
+        // payloads (e.g. an EWS mailbox listing) so each encrypt() call fits one
+        // record — encrypting the whole thing at once overflows the record and
+        // fails (previously surfaced as error.WriteFailed with a 0-byte body).
+        const max_chunk: usize = 15000;
+        var pos: usize = 0;
+        while (pos < data.len) {
+            const end = @min(pos + max_chunk, data.len);
+            var send_buf: [tls.output_buffer_len]u8 = undefined;
+            const enc_result = try connection.encrypt(data[pos..end], &send_buf);
+            var sent: usize = 0;
+            while (sent < enc_result.ciphertext.len) {
+                const n = try self.connection.write(enc_result.ciphertext[sent..]);
+                if (n == 0) return error.ConnectionClosed;
+                sent += n;
+            }
+            pos = end;
+        }
+    }
+
+    /// Send an Exchange or mobile-profile response on the current transport.
     fn sendWeb(self: *CalDavSession, wr: WebResponse) !void {
         var hdr: [384]u8 = undefined;
         const header = if (wr.disposition) |d|
             try std.fmt.bufPrint(&hdr, "HTTP/1.1 {d} OK\r\nContent-Type: {s}\r\nContent-Disposition: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n", .{ wr.status, wr.content_type, d, wr.body.len })
         else
             try std.fmt.bufPrint(&hdr, "HTTP/1.1 {d} OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n", .{ wr.status, wr.content_type, wr.body.len });
-        try self.writeAllPlain(header);
-        if (wr.body.len > 0) try self.writeAllPlain(wr.body);
+        try self.writeAll(header);
+        if (wr.body.len > 0) try self.writeAll(wr.body);
     }
 };
 
@@ -1978,39 +1750,170 @@ fn httpBody(request: []const u8) []const u8 {
 
 /// EWS SOAP → response (body owned by allocator).
 fn webEws(allocator: std.mem.Allocator, config: *const CalDavConfig, username: ?[]const u8, store: *caldav_store.CalDavStore, db: *database.Database, request: []const u8) !WebResponse {
-    const user = username orelse "";
-    const local_part = if (std.mem.indexOfScalar(u8, user, '@')) |i| user[0..i] else user;
+    const user = username orelse return error.Unauthenticated;
+    const managed = (try db.hostedLimits(user)) != null;
+    const legacy_key = if (std.mem.indexOfScalar(u8, user, '@')) |i| user[0..i] else user;
     var ctx = ews.Context{
         .allocator = allocator,
         .username = user,
-        .local_part = local_part,
+        .local_part = if (managed) user else legacy_key,
+        .hosted = managed,
         .hostname = config.public_hostname,
         .db = db,
         .store = store,
         .delivery_method = config.delivery_method,
         .ses_region = config.ses_region,
+        .mail_config = config.mail_config,
     };
     const resp = try ews.handleSoap(&ctx, httpBody(request));
     return .{ .status = resp.status, .content_type = resp.content_type, .body = resp.body };
 }
 
-/// Exchange ActiveSync (WBXML) → response.
-fn webActiveSync(allocator: std.mem.Allocator, db: *database.Database, store: *caldav_store.CalDavStore, username: ?[]const u8, path: []const u8, request: []const u8) !WebResponse {
-    const query: ?[]const u8 = if (std.mem.indexOfScalar(u8, path, '?')) |q| path[q + 1 ..] else null;
-    const cmd = autoconfig.extractQueryParam(query, "Cmd") orelse "";
-    const device_id = autoconfig.extractQueryParam(query, "DeviceId") orelse "unknown";
-    const user = username orelse "";
-    const local_part = if (std.mem.indexOfScalar(u8, user, '@')) |i| user[0..i] else user;
+/// Exchange ActiveSync dispatch shared by HTTP and HTTPS.
+fn webActiveSync(allocator: std.mem.Allocator, config: *const CalDavConfig, db: *database.Database, store: *caldav_store.CalDavStore, username: ?[]const u8, path: []const u8, request: []const u8) !WebResponse {
+    const user = username orelse return .{ .status = 401 };
+    const query_start = std.mem.indexOfScalar(u8, path, '?') orelse return .{ .status = 400 };
+    const query = path[query_start + 1 ..];
+    var binary_query: [1024]u8 = undefined;
+    var folder_buffer: [256]u8 = undefined;
+    var item_buffer: [256]u8 = undefined;
+    var long_id_buffer: [1024]u8 = undefined;
+    const params = if (autoconfig.extractQueryParam(query, "Cmd")) |cmd| ActiveSyncQuery{
+        .cmd = cmd,
+        .device_id = autoconfig.extractQueryParam(query, "DeviceId") orelse "",
+        .version = easVersion(requestHeader(request, "MS-ASProtocolVersion")),
+        .save_legacy_copy = std.ascii.eqlIgnoreCase(autoconfig.extractQueryParam(query, "SaveInSent") orelse "", "T"),
+        .source = .{
+            .folder_id = if (autoconfig.extractQueryParam(query, "CollectionId")) |id|
+                (percentDecodeOnce(id, &folder_buffer) orelse return .{ .status = 400 })
+            else
+                null,
+            .item_id = if (autoconfig.extractQueryParam(query, "ItemId")) |id|
+                (percentDecodeOnce(id, &item_buffer) orelse return .{ .status = 400 })
+            else
+                null,
+            .long_id = if (autoconfig.extractQueryParam(query, "LongId")) |id|
+                (percentDecodeOnce(id, &long_id_buffer) orelse return .{ .status = 400 })
+            else
+                null,
+            .instance_id = autoconfig.extractQueryParam(query, "Occurrence"),
+        },
+    } else decodeActiveSyncQuery(query, &binary_query) catch |err|
+        return .{ .status = if (err == error.UnsupportedCommand) 501 else 400 };
+    const managed = (try db.hostedLimits(user)) != null;
+    const legacy_key = if (std.mem.indexOfScalar(u8, user, '@')) |i| user[0..i] else user;
+    const content_type = requestHeader(request, "Content-Type") orelse "";
+    const semi = std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
+    const mime = std.ascii.eqlIgnoreCase(std.mem.trim(u8, content_type[0..semi], " \t"), "message/rfc822");
     var ctx = eas.Context{
         .allocator = allocator,
         .db = db,
         .store = store,
         .username = user,
-        .local_part = local_part,
-        .device_id = device_id,
+        .local_part = if (managed) user else legacy_key,
+        .device_id = params.device_id,
+        .protocol_version = params.version,
+        .hosted = managed,
+        .mail_config = config.mail_config,
+        .scanner = config.scanner,
+        .send_format = switch (params.version) {
+            25, 120, 121 => if (mime) .mime else .invalid,
+            140, 141 => if (mime) .invalid else .wbxml,
+            else => .invalid,
+        },
+        .save_legacy_copy = params.save_legacy_copy,
+        .legacy_source = params.source,
+        .legacy_forward_attachment = params.version == 25,
     };
-    const resp = try eas.dispatch(&ctx, cmd, httpBody(request));
+    const resp = try eas.dispatch(&ctx, params.cmd, httpBody(request));
     return .{ .status = resp.status, .content_type = resp.content_type, .body = resp.body };
+}
+
+const ActiveSyncQuery = struct {
+    cmd: []const u8,
+    device_id: []const u8,
+    version: u8,
+    save_legacy_copy: bool = false,
+    source: eas.MessageSource = .{},
+};
+
+fn requestHeader(request: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, request, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        if (line.len == 0) break;
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(name, line[0..colon])) return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
+}
+
+fn easVersion(header: ?[]const u8) u8 {
+    const value = header orelse return 141;
+    const versions = [_][]const u8{ "2.5", "12.0", "12.1", "14.0", "14.1" };
+    for (versions, [_]u8{ 25, 120, 121, 140, 141 }) |name, version| {
+        if (std.mem.eql(u8, value, name)) return version;
+    }
+    return 0;
+}
+
+fn readQueryField(rest: *[]const u8) ![]const u8 {
+    if (rest.len == 0) return error.InvalidQuery;
+    const length = rest.*[0];
+    if (rest.len - 1 < length) return error.InvalidQuery;
+    const field = rest.*[1 .. 1 + @as(usize, length)];
+    rest.* = rest.*[1 + @as(usize, length) ..];
+    return field;
+}
+
+/// MS-ASHTTP base64 query layout. Client-supplied User is never an identity.
+fn decodeActiveSyncQuery(query: []const u8, buffer: []u8) !ActiveSyncQuery {
+    var uri_buffer: [2048]u8 = undefined;
+    const encoded = percentDecodeOnce(query, &uri_buffer) orelse return error.InvalidQuery;
+    const decoder = std.base64.standard.Decoder;
+    const size = try decoder.calcSizeForSlice(encoded);
+    if (size < 7 or size > buffer.len) return error.InvalidQuery;
+    try decoder.decode(buffer[0..size], encoded);
+    const version = buffer[0];
+    const cmd: []const u8 = switch (buffer[1]) {
+        0 => "Sync",
+        1 => "SendMail",
+        2 => "SmartForward",
+        3 => "SmartReply",
+        9 => "FolderSync",
+        14 => "GetItemEstimate",
+        16 => "Search",
+        18 => "Ping",
+        20 => "Provision",
+        else => return error.UnsupportedCommand,
+    };
+    var rest: []const u8 = buffer[4..size];
+    const device_id = try readQueryField(&rest);
+    const policy_key = try readQueryField(&rest);
+    if (policy_key.len != 0 and policy_key.len != 4) return error.InvalidQuery;
+    _ = try readQueryField(&rest); // device type
+    var save_copy = false;
+    var source: eas.MessageSource = .{};
+    while (rest.len != 0) {
+        const tag = rest[0];
+        rest = rest[1..];
+        const value = try readQueryField(&rest);
+        if (tag == 7 and buffer[1] >= 1 and buffer[1] <= 3) {
+            if (value.len != 1) return error.InvalidQuery;
+            save_copy = value[0] & 1 != 0;
+        } else if (buffer[1] == 2 or buffer[1] == 3) {
+            const field = switch (tag) {
+                1 => &source.folder_id,
+                3 => &source.item_id,
+                4 => &source.long_id,
+                6 => &source.instance_id,
+                else => continue,
+            };
+            if (field.* != null) return error.InvalidQuery;
+            field.* = value;
+        }
+    }
+    return .{ .cmd = cmd, .device_id = device_id, .version = version, .save_legacy_copy = save_copy, .source = source };
 }
 
 /// Autodiscover v1 XML (Outlook/EXCH for macOS, MobileSync for iOS).
@@ -2051,7 +1954,12 @@ fn nextProfileNonce(buf: []u8) []const u8 {
 /// Apple .mobileconfig profile (Mail+CalDAV+CardDAV, or ?services=eas/dav).
 fn webMobileconfig(allocator: std.mem.Allocator, config: *const CalDavConfig, path: []const u8) !WebResponse {
     const query: ?[]const u8 = if (std.mem.indexOfScalar(u8, path, '?')) |q| path[q + 1 ..] else null;
-    const email = autoconfig.extractQueryParam(query, "email") orelse return error.MissingEmail;
+    const encoded_email = autoconfig.extractQueryParam(query, "email") orelse return error.MissingEmail;
+    var email_buffer: [254]u8 = undefined;
+    const email = percentDecodeOnce(encoded_email, &email_buffer) orelse return error.InvalidEmail;
+    if (!security.validateEmailAddress(email)) return error.InvalidEmail;
+    const escaped_email = try xmlEscape(allocator, email);
+    defer allocator.free(escaped_email);
     const services = autoconfig.extractQueryParam(query, "services");
     const dav_only = services != null and std.mem.eql(u8, services.?, "dav");
     const eas_only = services != null and std.mem.eql(u8, services.?, "eas");
@@ -2071,7 +1979,7 @@ fn webMobileconfig(allocator: std.mem.Allocator, config: *const CalDavConfig, pa
         .caldav_port = config.public_dav_port,
         .profile_nonce = nextProfileNonce(&nonce_buf),
     };
-    const profile = try autoconfig.generateAppleMobileconfig(allocator, ac, email);
+    const profile = try autoconfig.generateAppleMobileconfig(allocator, ac, escaped_email);
     return .{ .content_type = "application/x-apple-aspen-config; charset=utf-8", .body = profile, .disposition = "attachment; filename=\"mail.mobileconfig\"" };
 }
 
@@ -2080,7 +1988,7 @@ const ACTIVESYNC_OPTIONS_RESPONSE =
     "HTTP/1.1 200 OK\r\n" ++
     "MS-Server-ActiveSync: 14.1\r\n" ++
     "MS-ASProtocolVersions: 2.5,12.0,12.1,14.0,14.1\r\n" ++
-    "MS-ASProtocolCommands: Sync,SendMail,SmartForward,SmartReply,GetAttachment,FolderSync,FolderCreate,FolderDelete,FolderUpdate,MoveItems,GetItemEstimate,MeetingResponse,Search,Settings,Ping,ItemOperations,Provision,ResolveRecipients,ValidateCert\r\n" ++
+    "MS-ASProtocolCommands: Sync,SendMail,SmartForward,SmartReply,FolderSync,GetItemEstimate,Ping,Provision,Search\r\n" ++
     "Public: OPTIONS,POST\r\n" ++
     "Allow: OPTIONS,POST\r\n" ++
     "Content-Length: 0\r\n\r\n";
@@ -2268,6 +2176,7 @@ pub const CalDavServer = struct {
 
     /// Handle client connection
     fn handleConnection(self: *CalDavServer, connection: socket.Connection, is_ssl: bool) !void {
+        connection.setBlocking();
         // Bound how long a (TLS handshake or request) read can block, so an idle
         // keep-alive or stuck client eventually releases this connection's thread
         // instead of pinning it forever.
@@ -2356,14 +2265,7 @@ pub const CalDavServer = struct {
                 var tls_conn = tls.nonblock.Connection.init(cipher);
                 var cleartext_buf: [tls.input_buffer_len]u8 = undefined;
 
-                var tls_session = TlsCalDavSession.init(self.allocator, connection, self.auth_backend, self.store, &tls_conn);
-                defer tls_session.deinit();
-
-                // Accumulate decrypted cleartext until a full HTTP request (headers
-                // + Content-Length body) has been received, then dispatch. This
-                // prevents truncating large PUTs (bug: previously capped at 8192).
-                var request_accum: std.ArrayList(u8) = .empty;
-                defer request_accum.deinit(self.allocator);
+                session.tls_conn = &tls_conn;
 
                 // `cipher_len` tracks ciphertext buffered at the front of recv_buf,
                 // including any partial TLS record left unconsumed by a previous
@@ -2404,24 +2306,7 @@ pub const CalDavServer = struct {
 
                         if (dec.cleartext.len > 0) {
                             made_progress = true;
-                            // SECURITY: bound total buffered request size.
-                            if (request_accum.items.len + dec.cleartext.len > self.config.max_resource_size) {
-                                try tls_session.sendTls("HTTP/1.1 413 Request Entity Too Large\r\nContent-Length: 0\r\n\r\n");
-                                break;
-                            }
-                            try request_accum.appendSlice(self.allocator, dec.cleartext);
-                        }
-
-                        // Dispatch every complete request currently buffered (handles
-                        // pipelining), keeping any trailing partial request.
-                        while (httpRequestLength(request_accum.items)) |req_len| {
-                            _ = tls_session.handleRequest(&self.config, request_accum.items[0..req_len]) catch {};
-                            // Drop the consumed request, shifting any remainder down.
-                            const remaining = request_accum.items.len - req_len;
-                            if (remaining > 0) {
-                                std.mem.copyForwards(u8, request_accum.items[0..remaining], request_accum.items[req_len..]);
-                            }
-                            request_accum.shrinkRetainingCapacity(remaining);
+                            if (!try session.receive(&self.config, dec.cleartext)) break;
                         }
                     }
 
@@ -2459,627 +2344,6 @@ pub const CalDavServer = struct {
             // set at the top bounds idle keep-alive connections.
             while (session.handleRequest(&self.config) catch false) {}
         }
-    }
-};
-
-/// TLS-wrapped CalDAV session for encrypted connections
-const TlsCalDavSession = struct {
-    allocator: std.mem.Allocator,
-    connection: socket.Connection,
-    username: ?[]const u8 = null,
-    authenticated: bool = false,
-    auth_backend: *auth.AuthBackend,
-    store: *caldav_store.CalDavStore,
-    tls_conn: *tls.nonblock.Connection,
-
-    pub fn init(
-        allocator: std.mem.Allocator,
-        connection: socket.Connection,
-        auth_backend: *auth.AuthBackend,
-        store: *caldav_store.CalDavStore,
-        tls_conn: *tls.nonblock.Connection,
-    ) TlsCalDavSession {
-        return .{
-            .allocator = allocator,
-            .connection = connection,
-            .auth_backend = auth_backend,
-            .store = store,
-            .tls_conn = tls_conn,
-        };
-    }
-
-    pub fn deinit(self: *TlsCalDavSession) void {
-        clearRequestAuthentication(self.allocator, &self.username, &self.authenticated);
-    }
-
-    fn sendTls(self: *TlsCalDavSession, data: []const u8) !void {
-        // A single TLS record carries at most ~16 KiB of cleartext. Chunk larger
-        // payloads (e.g. an EWS mailbox listing) so each encrypt() call fits one
-        // record — encrypting the whole thing at once overflows the record and
-        // fails (previously surfaced as error.WriteFailed with a 0-byte body).
-        const max_chunk: usize = 15000;
-        var pos: usize = 0;
-        while (pos < data.len) {
-            const end = @min(pos + max_chunk, data.len);
-            var send_buf: [tls.output_buffer_len]u8 = undefined;
-            const enc_result = try self.tls_conn.encrypt(data[pos..end], &send_buf);
-            var sent: usize = 0;
-            while (sent < enc_result.ciphertext.len) {
-                const n = try self.connection.write(enc_result.ciphertext[sent..]);
-                if (n == 0) return error.ConnectionClosed;
-                sent += n;
-            }
-            pos = end;
-        }
-    }
-
-    /// Generate and send an Apple .mobileconfig profile for the email given in
-    /// the `?email=` query parameter. Bundles IMAP/SMTP (Mail + Notes), CalDAV
-    /// (Calendar) and CardDAV (Contacts) so one install configures everything.
-    fn serveMobileconfig(self: *TlsCalDavSession, config: *const CalDavConfig, path: []const u8) !void {
-        const query: ?[]const u8 = if (std.mem.indexOfScalar(u8, path, '?')) |q| path[q + 1 ..] else null;
-        const email = autoconfig.extractQueryParam(query, "email") orelse {
-            const msg = "Missing ?email=you@domain query parameter.\n";
-            var hdr: [128]u8 = undefined;
-            const resp = try std.fmt.bufPrint(&hdr, "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{msg.len});
-            try self.sendTls(resp);
-            try self.sendTls(msg);
-            return;
-        };
-
-        // `?services=dav` emits a Calendar/Contacts-only profile (no IMAP/SMTP
-        // email payload) so it cannot collide with an email account the user
-        // already has configured. `?services=eas` emits a single unified
-        // Exchange ActiveSync account (Mail+Contacts+Calendars+Notes with
-        // toggles, like Google). Default includes the separate IMAP/CalDAV/
-        // CardDAV payloads.
-        const services = autoconfig.extractQueryParam(query, "services");
-        const dav_only = services != null and std.mem.eql(u8, services.?, "dav");
-        const eas_only = services != null and std.mem.eql(u8, services.?, "eas");
-
-        const domain = autoconfig.extractDomainFromEmail(email) orelse "localhost";
-        var nonce_buf: [40]u8 = undefined;
-        const ac = autoconfig.AutoconfigConfig{
-            .hostname = config.public_hostname,
-            .domain = domain,
-            .imaps_port = config.imaps_port,
-            .smtp_port = config.submission_port,
-            .display_name = config.display_name,
-            // EAS is a single account covering everything, so when requested it
-            // replaces the separate IMAP/CalDAV/CardDAV payloads to avoid dupes.
-            .enable_email = !dav_only and !eas_only,
-            .enable_carddav = config.enable_carddav and !eas_only,
-            .enable_caldav_profile = config.enable_caldav and !eas_only,
-            .enable_eas = eas_only,
-            .caldav_hostname = config.public_hostname,
-            .caldav_port = config.public_dav_port,
-            .profile_nonce = nextProfileNonce(&nonce_buf),
-        };
-
-        const profile = try autoconfig.generateAppleMobileconfig(self.allocator, ac, email);
-        defer self.allocator.free(profile);
-
-        var hdr: [256]u8 = undefined;
-        const header = try std.fmt.bufPrint(
-            &hdr,
-            "HTTP/1.1 200 OK\r\n" ++
-                "Content-Type: application/x-apple-aspen-config; charset=utf-8\r\n" ++
-                "Content-Disposition: attachment; filename=\"mail.mobileconfig\"\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "Cache-Control: no-cache, no-store\r\n" ++
-                "Connection: close\r\n\r\n",
-            .{profile.len},
-        );
-        try self.sendTls(header);
-        try self.sendTls(profile);
-    }
-
-    /// Dispatch an Exchange ActiveSync command. The full HTTP request (headers
-    /// + WBXML body) is in `request`; the command and device id come from the
-    /// query string. The response is WBXML written back over TLS.
-    fn serveActiveSync(self: *TlsCalDavSession, path: []const u8, request: []const u8) !void {
-        const query: ?[]const u8 = if (std.mem.indexOfScalar(u8, path, '?')) |q| path[q + 1 ..] else null;
-        const cmd = autoconfig.extractQueryParam(query, "Cmd") orelse "";
-        const device_id = autoconfig.extractQueryParam(query, "DeviceId") orelse "unknown";
-
-        const body: []const u8 = if (std.mem.indexOf(u8, request, "\r\n\r\n")) |i| request[i + 4 ..] else "";
-
-        const user = self.username orelse "";
-        const local_part = if (std.mem.indexOfScalar(u8, user, '@')) |i| user[0..i] else user;
-
-        var ctx = eas.Context{
-            .allocator = self.allocator,
-            .db = self.auth_backend.db,
-            .store = self.store,
-            .username = user,
-            .local_part = local_part,
-            .device_id = device_id,
-        };
-
-        const resp = try eas.dispatch(&ctx, cmd, body);
-        defer if (resp.body.len > 0) self.allocator.free(resp.body);
-
-        var hdr: [256]u8 = undefined;
-        const header = try std.fmt.bufPrint(
-            &hdr,
-            "HTTP/1.1 {d} OK\r\n" ++
-                "Content-Type: {s}\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "Connection: keep-alive\r\n\r\n",
-            .{ resp.status, resp.content_type, resp.body.len },
-        );
-        try self.sendTls(header);
-        if (resp.body.len > 0) try self.sendTls(resp.body);
-    }
-
-    /// Respond to an Autodiscover **v1 XML** request. macOS desktop Exchange
-    /// uses the Outlook (EXCH) schema and needs an EwsUrl; iOS uses the
-    /// MobileSync (ActiveSync) schema. We pick based on the AcceptableResponse
-    /// Schema the client advertises in its request body.
-    fn serveAutodiscover(self: *TlsCalDavSession, config: *const CalDavConfig, request: []const u8) !void {
-        const user = self.username orelse "user";
-        const body: []const u8 = if (std.mem.indexOf(u8, request, "\r\n\r\n")) |i| request[i + 4 ..] else "";
-        const wants_mobilesync = std.mem.indexOf(u8, body, "mobilesync") != null;
-        logger.info("Autodiscover v1: schema={s} user={s}", .{ if (wants_mobilesync) "mobilesync" else "outlook/exch", user });
-
-        const xml = if (wants_mobilesync)
-            try ews.autodiscover.buildMobileSyncXml(self.allocator, user, config.public_hostname)
-        else
-            try ews.autodiscover.buildOutlookExchXml(self.allocator, user, config.public_hostname);
-        defer self.allocator.free(xml);
-
-        var hdr: [256]u8 = undefined;
-        const header = try std.fmt.bufPrint(
-            &hdr,
-            "HTTP/1.1 200 OK\r\n" ++
-                "Content-Type: application/xml; charset=utf-8\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "Connection: keep-alive\r\n\r\n",
-            .{xml.len},
-        );
-        try self.sendTls(header);
-        try self.sendTls(xml);
-    }
-
-    /// Autodiscover v2 (JSON): tell macOS the EWS (or ActiveSync) endpoint URL.
-    /// Unauthenticated per the protocol.
-    fn serveAutodiscoverV2(self: *TlsCalDavSession, config: *const CalDavConfig, path: []const u8) !void {
-        const protocol = ews.autodiscover.protocolParam(path);
-        const url = try ews.autodiscover.urlForProtocol(self.allocator, config.public_hostname, protocol);
-        defer self.allocator.free(url);
-        const json = try ews.autodiscover.buildJson(self.allocator, protocol, url);
-        defer self.allocator.free(json);
-
-        var hdr: [256]u8 = undefined;
-        const header = try std.fmt.bufPrint(
-            &hdr,
-            "HTTP/1.1 200 OK\r\n" ++
-                "Content-Type: application/json; charset=utf-8\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "Connection: keep-alive\r\n\r\n",
-            .{json.len},
-        );
-        try self.sendTls(header);
-        try self.sendTls(json);
-    }
-
-    /// Dispatch an EWS SOAP request to the EWS module and return its response.
-    fn serveEws(self: *TlsCalDavSession, config: *const CalDavConfig, request: []const u8) !void {
-        const body: []const u8 = if (std.mem.indexOf(u8, request, "\r\n\r\n")) |i| request[i + 4 ..] else "";
-
-        const user = self.username orelse "";
-        const local_part = if (std.mem.indexOfScalar(u8, user, '@')) |i| user[0..i] else user;
-
-        var ctx = ews.Context{
-            .allocator = self.allocator,
-            .username = user,
-            .local_part = local_part,
-            .hostname = config.public_hostname,
-            .db = self.auth_backend.db,
-            .store = self.store,
-            .delivery_method = config.delivery_method,
-            .ses_region = config.ses_region,
-        };
-
-        const resp = try ews.handleSoap(&ctx, body);
-        defer if (resp.body.len > 0) self.allocator.free(resp.body);
-
-        var hdr: [256]u8 = undefined;
-        const header = try std.fmt.bufPrint(
-            &hdr,
-            "HTTP/1.1 {d} OK\r\n" ++
-                "Content-Type: {s}\r\n" ++
-                "Content-Length: {d}\r\n" ++
-                "Connection: keep-alive\r\n\r\n",
-            .{ resp.status, resp.content_type, resp.body.len },
-        );
-        try self.sendTls(header);
-        if (resp.body.len > 0) try self.sendTls(resp.body);
-    }
-
-    /// Send authentication required response with Digest challenge over TLS
-    fn sendTlsAuthRequired(self: *TlsCalDavSession, stale: bool) !void {
-        const nonce = self.auth_backend.generateNonce() catch {
-            // Fallback to Basic auth if nonce generation fails
-            try self.sendTls("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"CalDAV/CardDAV Server\"\r\nContent-Length: 0\r\n\r\n");
-            return;
-        };
-        // Note: Don't free nonce here - it's owned by the NonceManager and will be freed when invalidated
-
-        var buf: [512]u8 = undefined;
-        var fbs = io_compat.fixedBufferStream(&buf);
-        const writer = fbs.writer();
-        try writer.print(
-            "HTTP/1.1 401 Unauthorized\r\n" ++
-                "WWW-Authenticate: Digest realm=\"CalDAV/CardDAV Server\", nonce=\"{s}\", qop=\"auth\", algorithm=SHA-256{s}\r\n" ++
-                "WWW-Authenticate: Basic realm=\"CalDAV/CardDAV Server\"\r\n" ++
-                "Content-Length: 0\r\n\r\n",
-            .{ nonce, if (stale) ", stale=true" else "" },
-        );
-        try self.sendTls(fbs.getWritten());
-    }
-
-    pub fn handleRequest(self: *TlsCalDavSession, config: *const CalDavConfig, request: []const u8) !bool {
-        clearRequestAuthentication(self.allocator, &self.username, &self.authenticated);
-        // Debug: log incoming request
-        logger.info("CalDAV TLS received request ({d} bytes)", .{request.len});
-        if (request.len > 0 and request.len < 500) {
-            logger.info("CalDAV request: {s}", .{request});
-        }
-
-        // Parse HTTP request line
-        var lines = std.mem.splitScalar(u8, request, '\n');
-        const request_line = lines.next() orelse return false;
-
-        var parts = std.mem.splitScalar(u8, request_line, ' ');
-        const method_str = parts.next() orelse return false;
-        const path = parts.next() orelse return false;
-
-        const method = HttpMethod.fromString(method_str) orelse {
-            try self.sendTls("HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n");
-            return true;
-        };
-
-        // Handle .well-known autodiscovery
-        // For PROPFIND, we need to authenticate and return proper discovery response
-        // For GET, we can redirect
-        const is_well_known_caldav = std.mem.startsWith(u8, path, "/.well-known/caldav");
-        const is_well_known_carddav = std.mem.startsWith(u8, path, "/.well-known/carddav");
-
-        if (is_well_known_caldav or is_well_known_carddav) {
-            // For non-PROPFIND methods, just redirect
-            if (method != .propfind) {
-                if (is_well_known_caldav) {
-                    try self.sendTls("HTTP/1.1 301 Moved Permanently\r\nLocation: /calendars/\r\nContent-Length: 0\r\n\r\n");
-                } else {
-                    try self.sendTls("HTTP/1.1 301 Moved Permanently\r\nLocation: /addressbooks/\r\nContent-Length: 0\r\n\r\n");
-                }
-                return true;
-            }
-            // For PROPFIND, fall through to authentication and handle below
-        }
-
-        // Serve the downloadable Apple configuration profile (unauthenticated:
-        // it carries no secrets, only server names/ports, and the user must
-        // supply their password when installing). One install configures Mail,
-        // Notes, Calendar and Contacts together.
-        if (method == .get and std.mem.startsWith(u8, path, "/email.mobileconfig")) {
-            self.serveMobileconfig(config, path) catch |err| {
-                logger.err("CalDAV: mobileconfig generation failed: {}", .{err});
-                self.sendTls("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n") catch {};
-            };
-            return true;
-        }
-
-        // Autodiscover v2 (JSON) — UNauthenticated GET that macOS uses to locate
-        // the EWS endpoint: /autodiscover/autodiscover.json/v1.0/{email}?Protocol=EWS
-        if (method == .get and std.mem.startsWith(u8, path, "/autodiscover/autodiscover.json")) {
-            self.serveAutodiscoverV2(config, path) catch |err| {
-                logger.err("Autodiscover v2 failed: {}", .{err});
-                self.sendTls("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n") catch {};
-            };
-            return true;
-        }
-
-        // Exchange ActiveSync capability discovery. iOS issues OPTIONS to the
-        // ActiveSync endpoint before setting up the account; answer it without
-        // requiring auth so the client learns the supported versions/commands.
-        if (method == .options and std.mem.startsWith(u8, path, "/Microsoft-Server-ActiveSync")) {
-            try self.sendTls(
-                "HTTP/1.1 200 OK\r\n" ++
-                    "MS-Server-ActiveSync: 14.1\r\n" ++
-                    "MS-ASProtocolVersions: 2.5,12.0,12.1,14.0,14.1\r\n" ++
-                    "MS-ASProtocolCommands: Sync,SendMail,SmartForward,SmartReply,GetAttachment,FolderSync,FolderCreate,FolderDelete,FolderUpdate,MoveItems,GetItemEstimate,MeetingResponse,Search,Settings,Ping,ItemOperations,Provision,ResolveRecipients,ValidateCert\r\n" ++
-                    "Public: OPTIONS,POST\r\n" ++
-                    "Allow: OPTIONS,POST\r\n" ++
-                    "Content-Length: 0\r\n\r\n",
-            );
-            return true;
-        }
-
-        // Check authentication (Digest or Basic Auth)
-        if (!self.authenticated) {
-            var auth_header: ?[]const u8 = null;
-            while (lines.next()) |line| {
-                const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
-                if (trimmed.len == 0) break;
-
-                if (trimmed.len >= 14 and std.ascii.eqlIgnoreCase(trimmed[0..14], "Authorization:")) {
-                    auth_header = std.mem.trim(u8, trimmed[14..], &std.ascii.whitespace);
-                    break;
-                }
-            }
-
-            if (auth_header == null) {
-                logger.info("CalDAV: No Authorization header, sending 401", .{});
-                try self.sendTlsAuthRequired(false);
-                return true;
-            }
-
-            // Try Digest auth first, then fall back to Basic
-            var validated_username: ?[]const u8 = null;
-            var stale_nonce = false;
-
-            if (std.mem.startsWith(u8, auth_header.?, "Digest ")) {
-                logger.info("CalDAV: Attempting Digest auth", .{});
-                validated_username = self.auth_backend.verifyDigestAuthForPeer(
-                    self.connection.peerIp(),
-                    auth_header.?,
-                    method_str,
-                    path,
-                    "CalDAV/CardDAV Server",
-                ) catch |err| blk: {
-                    if (err == error.StaleDigestNonce) {
-                        stale_nonce = true;
-                        break :blk null;
-                    }
-                    logger.err("CalDAV TLS Digest authentication error: {}", .{err});
-                    break :blk null;
-                };
-                if (validated_username == null) {
-                    logger.warn("CalDAV: Digest auth returned null (failed verification)", .{});
-                }
-            }
-
-            // Fall back to Basic auth if Digest didn't work
-            if (validated_username == null and std.mem.startsWith(u8, auth_header.?, "Basic ")) {
-                logger.info("CalDAV: Attempting Basic auth", .{});
-                validated_username = self.auth_backend.verifyBasicAuthForPeer(self.connection.peerIp(), auth_header.?) catch |err| blk: {
-                    logger.err("CalDAV TLS Basic authentication error: {}", .{err});
-                    break :blk null;
-                };
-            }
-
-            if (validated_username) |username| {
-                self.authenticated = true;
-                self.username = username;
-                logger.info("Successful CalDAV TLS authentication for user: {s}", .{username});
-            } else {
-                logger.warn("CalDAV: Authentication failed, sending 401", .{});
-                try self.sendTlsAuthRequired(stale_nonce);
-                return true;
-            }
-        }
-
-        // Exchange ActiveSync command dispatch (authenticated). All EAS commands
-        // are POSTed to this endpoint with the command in the `?Cmd=` query.
-        if (method == .post and std.mem.startsWith(u8, path, "/Microsoft-Server-ActiveSync")) {
-            self.serveActiveSync(path, request) catch |err| {
-                logger.err("ActiveSync dispatch failed: {}", .{err});
-                self.sendTls("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n") catch {};
-            };
-            return true;
-        }
-
-        // Exchange autodiscover (authenticated). macOS/iOS "Add Exchange
-        // account" POSTs here to discover the ActiveSync URL. Match either
-        // capitalization.
-        if (method == .post and
-            (std.mem.startsWith(u8, path, "/autodiscover/") or std.mem.startsWith(u8, path, "/Autodiscover/")))
-        {
-            self.serveAutodiscover(config, request) catch |err| {
-                logger.err("Autodiscover failed: {}", .{err});
-                self.sendTls("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n") catch {};
-            };
-            return true;
-        }
-
-        // Exchange Web Services (authenticated SOAP). macOS Mail/Calendar/
-        // Contacts talk EWS here.
-        if (method == .post and
-            (std.mem.startsWith(u8, path, "/EWS/") or std.mem.startsWith(u8, path, "/ews/")))
-        {
-            self.serveEws(config, request) catch |err| {
-                logger.err("EWS failed: {}", .{err});
-                self.sendTls("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n") catch {};
-            };
-            return true;
-        }
-
-        // Handle OPTIONS for CalDAV capabilities
-        if (method == .options) {
-            try self.sendTls(
-                "HTTP/1.1 200 OK\r\n" ++
-                    "DAV: 1, 2, 3, calendar-access, addressbook\r\n" ++
-                    "Allow: OPTIONS, GET, HEAD, POST, PUT, DELETE, PROPFIND, PROPPATCH, MKCALENDAR, MKCOL, REPORT\r\n" ++
-                    "Content-Length: 0\r\n\r\n",
-            );
-            return true;
-        }
-
-        // Handle PROPFIND
-        if (method == .propfind) {
-            // Get the authenticated username for principal URLs
-            const username = self.username orelse "user";
-
-            // Check path type for different responses
-            const is_addressbook = std.mem.startsWith(u8, path, "/addressbooks");
-            const is_principals = std.mem.startsWith(u8, path, "/principals");
-            const is_well_known = std.mem.startsWith(u8, path, "/.well-known/");
-            const is_root = std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "") or is_well_known;
-
-            var response_body_buf: [4096]u8 = undefined;
-            var response_fbs = io_compat.fixedBufferStream(&response_body_buf);
-            const response_writer = response_fbs.writer();
-
-            // TODO(security): `path` and `username` are written into the XML below
-            // unescaped. The non-TLS PROPFIND path (handlePropfind) XML-escapes all
-            // dynamic values; this TLS stub still uses a fixed-buffer writer. It
-            // should be migrated to the ArrayList + appendXmlEscaped helpers used
-            // elsewhere so `<` `>` `&` `"` `'` in the path/username are escaped.
-
-            if (is_principals or is_root) {
-                // Principal discovery - return current-user-principal, calendar-home-set, addressbook-home-set
-                try response_writer.writeAll(
-                    \\<?xml version="1.0" encoding="utf-8" ?>
-                    \\<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:CARD="urn:ietf:params:xml:ns:carddav">
-                    \\  <D:response>
-                    \\    <D:href>
-                );
-                try response_writer.writeAll(path);
-                try response_writer.writeAll(
-                    \\</D:href>
-                    \\    <D:propstat>
-                    \\      <D:prop>
-                    \\        <D:current-user-principal>
-                    \\          <D:href>/principals/
-                );
-                try response_writer.writeAll(username);
-                try response_writer.writeAll(
-                    \\/</D:href>
-                    \\        </D:current-user-principal>
-                    \\        <C:calendar-home-set>
-                    \\          <D:href>/calendars/
-                );
-                try response_writer.writeAll(username);
-                try response_writer.writeAll(
-                    \\/</D:href>
-                    \\        </C:calendar-home-set>
-                    \\        <CARD:addressbook-home-set>
-                    \\          <D:href>/addressbooks/
-                );
-                try response_writer.writeAll(username);
-                try response_writer.writeAll(
-                    \\/</D:href>
-                    \\        </CARD:addressbook-home-set>
-                    \\        <D:resourcetype>
-                    \\          <D:principal/>
-                    \\        </D:resourcetype>
-                    \\        <D:displayname>
-                );
-                try response_writer.writeAll(username);
-                try response_writer.writeAll(
-                    \\</D:displayname>
-                    \\      </D:prop>
-                    \\      <D:status>HTTP/1.1 200 OK</D:status>
-                    \\    </D:propstat>
-                    \\  </D:response>
-                    \\</D:multistatus>
-                );
-            } else if (is_addressbook) {
-                // CardDAV response for addressbooks
-                try response_writer.writeAll(
-                    \\<?xml version="1.0" encoding="utf-8" ?>
-                    \\<D:multistatus xmlns:D="DAV:" xmlns:CARD="urn:ietf:params:xml:ns:carddav" xmlns:C="urn:ietf:params:xml:ns:caldav">
-                    \\  <D:response>
-                    \\    <D:href>
-                );
-                try response_writer.writeAll(path);
-                try response_writer.writeAll(
-                    \\</D:href>
-                    \\    <D:propstat>
-                    \\      <D:prop>
-                    \\        <D:current-user-principal>
-                    \\          <D:href>/principals/
-                );
-                try response_writer.writeAll(username);
-                try response_writer.writeAll(
-                    \\/</D:href>
-                    \\        </D:current-user-principal>
-                    \\        <D:resourcetype>
-                    \\          <D:collection/>
-                    \\          <CARD:addressbook/>
-                    \\        </D:resourcetype>
-                    \\        <D:displayname>Contacts</D:displayname>
-                    \\        <CARD:supported-address-data>
-                    \\          <CARD:address-data-type content-type="text/vcard" version="3.0"/>
-                    \\          <CARD:address-data-type content-type="text/vcard" version="4.0"/>
-                    \\        </CARD:supported-address-data>
-                    \\        <CARD:addressbook-home-set>
-                    \\          <D:href>/addressbooks/
-                );
-                try response_writer.writeAll(username);
-                try response_writer.writeAll(
-                    \\/</D:href>
-                    \\        </CARD:addressbook-home-set>
-                    \\      </D:prop>
-                    \\      <D:status>HTTP/1.1 200 OK</D:status>
-                    \\    </D:propstat>
-                    \\  </D:response>
-                    \\</D:multistatus>
-                );
-            } else {
-                // CalDAV response for calendars
-                try response_writer.writeAll(
-                    \\<?xml version="1.0" encoding="utf-8" ?>
-                    \\<D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:CARD="urn:ietf:params:xml:ns:carddav">
-                    \\  <D:response>
-                    \\    <D:href>
-                );
-                try response_writer.writeAll(path);
-                try response_writer.writeAll(
-                    \\</D:href>
-                    \\    <D:propstat>
-                    \\      <D:prop>
-                    \\        <D:current-user-principal>
-                    \\          <D:href>/principals/
-                );
-                try response_writer.writeAll(username);
-                try response_writer.writeAll(
-                    \\/</D:href>
-                    \\        </D:current-user-principal>
-                    \\        <D:resourcetype>
-                    \\          <D:collection/>
-                    \\          <C:calendar/>
-                    \\        </D:resourcetype>
-                    \\        <D:displayname>Calendar</D:displayname>
-                    \\        <C:supported-calendar-component-set>
-                    \\          <C:comp name="VEVENT"/>
-                    \\          <C:comp name="VTODO"/>
-                    \\        </C:supported-calendar-component-set>
-                    \\        <C:calendar-home-set>
-                    \\          <D:href>/calendars/
-                );
-                try response_writer.writeAll(username);
-                try response_writer.writeAll(
-                    \\/</D:href>
-                    \\        </C:calendar-home-set>
-                    \\      </D:prop>
-                    \\      <D:status>HTTP/1.1 200 OK</D:status>
-                    \\    </D:propstat>
-                    \\  </D:response>
-                    \\</D:multistatus>
-                );
-            }
-
-            const response_body = response_fbs.getWritten();
-
-            var header_buf: [256]u8 = undefined;
-            var fbs = io_compat.fixedBufferStream(&header_buf);
-            const writer = fbs.writer();
-            try writer.print(
-                "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: {d}\r\n\r\n",
-                .{response_body.len},
-            );
-
-            try self.sendTls(fbs.getWritten());
-            try self.sendTls(response_body);
-            return true;
-        }
-
-        // Default: not implemented
-        try self.sendTls("HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n");
-        return true;
     }
 };
 

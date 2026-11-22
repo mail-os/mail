@@ -333,7 +333,7 @@ pub const ActiveSyncSession = struct {
         const response =
             \\HTTP/1.1 200 OK
             \\MS-ASProtocolVersions: 2.5,12.0,12.1,14.0,14.1,16.0,16.1
-            \\MS-ASProtocolCommands: Sync,SendMail,SmartForward,SmartReply,GetAttachment,FolderSync,FolderCreate,FolderDelete,FolderUpdate,MoveItems,GetItemEstimate,MeetingResponse,Search,Settings,Ping,ItemOperations,Provision,ResolveRecipients,ValidateCert
+            \\MS-ASProtocolCommands: Sync,GetAttachment,FolderSync,FolderCreate,FolderDelete,FolderUpdate,MoveItems,GetItemEstimate,MeetingResponse,Search,Settings,Ping,ItemOperations,Provision,ResolveRecipients,ValidateCert
             \\Public: OPTIONS,POST
             \\Allow: OPTIONS,POST
             \\Content-Length: 0
@@ -466,19 +466,11 @@ pub const ActiveSyncSession = struct {
         try self.sendXmlResponse(response_body);
     }
 
-    /// Handle SendMail command
+    /// The standalone adapter has no delivery backend. The daemon's
+    /// quota-checked SendMail endpoint is served by the CalDAV listener.
     fn handleSendMail(self: *ActiveSyncSession, body: []const u8) !void {
         _ = body;
-
-        // Return success
-        const response =
-            \\HTTP/1.1 200 OK
-            \\Content-Length: 0
-            \\
-            \\
-        ;
-
-        _ = try self.stream.write(response);
+        _ = try self.stream.write("HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\n\r\n");
     }
 
     /// Handle Search command

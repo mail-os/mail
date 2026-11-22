@@ -7,7 +7,7 @@
   <title>Reset password — Mail</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
-<body>
+<body class="mail-auth-page">
 <script client>
 import { newPasswordProblem, resetErrorMessage, tokenFromHash } from '../functions/recovery'
 // request: ask for a link · sent: asked · checking: reading a link
@@ -80,7 +80,7 @@ function startOver() { error.set(''); token.set(''); mode.set('request') }
 onMount(checkLink)
 </script>
 <main class="login">
-  <div class="mb-4 font-semibold text-indigo-600 text-sm tracking-wide">MAIL</div>
+  <div class="mail-app-mark"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span></div>
 
   <section :if="mode === 'request'">
     <h1>Forgot your password?</h1>

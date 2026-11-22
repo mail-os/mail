@@ -33,7 +33,12 @@ for (const lostAcknowledgement of [false, true]) {
       else throw new Error(`Unexpected request ${path}`)
       return Response.json(result)
     }) as typeof fetch
-    const mail = useWebmail({ composer: { current: null }, password: { current: null }, confirmation: { current: null }, fileInput: { current: null }, selectAll: { current: null }, navigate: () => {}, nextTick: callback => callback() })
+    const mail = useWebmail({
+      composer: { current: null }, password: { current: null }, confirmation: { current: null },
+      fileInput: { current: null }, selectAll: { current: null }, messageList: { current: null },
+      messageReader: { current: null }, shortcutsDialog: { current: null }, collectionsDialog: { current: null },
+      contactsDialog: { current: null }, navigate: () => {}, nextTick: callback => callback(),
+    })
     try {
       await mail.mount()
       mail.selected.set(message)
@@ -53,3 +58,46 @@ for (const lostAcknowledgement of [false, true]) {
     finally { mail.destroy(); globalThis.fetch = previous }
   })
 }
+
+test('a stale draft save clears the old account even while a read is in flight', async () => {
+  const username = 'first@example.test'
+  const previous = globalThis.fetch
+  const navigation: string[] = []
+  let finishContacts!: (response: Response) => void
+  const pendingContacts = new Promise<Response>(resolve => { finishContacts = resolve })
+  const requests: string[] = []
+  globalThis.fetch = (async (input: RequestInfo | URL, options?: RequestInit) => {
+    const path = String(input)
+    requests.push(path)
+    if (path === '/webmail/auth/me') return Response.json({ user: { username, email: username } })
+    expect(new Headers(options?.headers).get('X-Webmail-Account')).toBe(encodeURIComponent(username))
+    if (path === '/webmail/api/config') return Response.json({ undoSendSeconds: 10 })
+    if (path.startsWith('/webmail/api/messages?')) return Response.json({ items: [], threads: [], page: 1, total: 0 })
+    if (path === '/webmail/api/address-book') return pendingContacts
+    if (path === '/webmail/api/drafts') return Response.json({ error: 'account_changed' }, { status: 409 })
+    return Response.json([])
+  }) as typeof fetch
+  const mail = useWebmail({
+    composer: { current: null }, password: { current: null }, confirmation: { current: null },
+    fileInput: { current: null }, selectAll: { current: null }, messageList: { current: null },
+    messageReader: { current: null }, shortcutsDialog: { current: null }, collectionsDialog: { current: null },
+    contactsDialog: { current: null }, navigate: path => { navigation.push(path) }, nextTick: callback => callback(),
+  })
+  try {
+    await mail.mount()
+    const read = mail.showContacts()
+    await mail.compose()
+    mail.subject.set('The previous account’s draft')
+    await mail.saveDraft()
+    finishContacts(Response.json({ book: 'contacts', books: ['contacts'], cards: [] }))
+    await read
+    expect(navigation).toEqual(['/login'])
+    expect(mail.user()).toBeNull()
+    expect(mail.subject()).toBe('')
+    expect(mail.addressBook()).toBeNull()
+    const count = requests.length
+    await mail.showContacts()
+    expect(requests).toHaveLength(count)
+  }
+  finally { mail.destroy(); globalThis.fetch = previous }
+})

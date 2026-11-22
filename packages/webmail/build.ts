@@ -2,6 +2,7 @@
 import { renderTemplate } from '@stacksjs/stx'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { calendarTimeZoneCatalog } from './build-calendar-timezones'
 
 export function stylesheetUrl(styles: Uint8Array): string {
   const hash = new Bun.CryptoHasher('sha256').update(styles).digest('hex').slice(0, 16)
@@ -24,6 +25,8 @@ export async function buildWebmail(): Promise<void> {
     await writeFile(join(dist, `${page}.html`), html.replace('href="/styles.css"', `href="${stylesheetUrl(styles)}"`))
   }
   await writeFile(join(dist, 'styles.css'), styles)
+  await writeFile(join(dist, 'mail-notifications.js'), await readFile(join(root, 'public/mail-notifications.js')))
+  await writeFile(join(dist, 'calendar_timezones.ics'), calendarTimeZoneCatalog())
 }
 
 if (import.meta.main) {

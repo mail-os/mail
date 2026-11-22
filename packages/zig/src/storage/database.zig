@@ -2,6 +2,9 @@ const std = @import("std");
 const mutex_compat = @import("../core/mutex_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const sqlite = @import("sqlite");
+const categories = @import("../message/categories.zig");
+const forwarding_wire = @import("../message/forwarding.zig");
+const vacation_wire = @import("../message/vacation.zig");
 
 // SQLITE_TRANSIENT == (sqlite3_destructor_type)-1 — tells SQLite to make its own
 // copy of bound text/blob at bind time. We declare sqlite3_bind_text ourselves
@@ -57,6 +60,7 @@ pub fn maildirBaseName(filename: []const u8) []const u8 {
 pub const Statement = struct {
     stmt: *sqlite.sqlite3_stmt,
     allocator: std.mem.Allocator,
+    mutex: ?*mutex_compat.Mutex = null,
 
     pub fn finalize(self: Statement) void {
         _ = sqlite.sqlite3_finalize(self.stmt);
@@ -94,6 +98,8 @@ pub const Statement = struct {
     }
 
     pub fn step(self: Statement) !bool {
+        if (self.mutex) |mutex| mutex.lock();
+        defer if (self.mutex) |mutex| mutex.unlock();
         const rc = sqlite.sqlite3_step(self.stmt);
         if (rc == sqlite.SQLITE_ROW) {
             return true;
@@ -119,6 +125,13 @@ pub const Statement = struct {
             return ptr[0..@intCast(len)];
         }
         return &[_]u8{};
+    }
+
+    pub fn columnBlob(self: Statement, index: usize) []const u8 {
+        const col: c_int = @intCast(index);
+        const ptr = sqlite.sqlite3_column_blob(self.stmt, col) orelse return "";
+        const len: usize = @intCast(sqlite.sqlite3_column_bytes(self.stmt, col));
+        return @as([*]const u8, @ptrCast(ptr))[0..len];
     }
 
     /// Check if column is NULL
@@ -242,6 +255,7 @@ pub const Database = struct {
     db: ?*sqlite.sqlite3,
     allocator: std.mem.Allocator,
     mutex: mutex_compat.Mutex,
+    mailbox_mutations: std.c.pthread_mutex_t = .{},
 
     pub fn init(allocator: std.mem.Allocator, db_path: []const u8) !Database {
         var db: ?*sqlite.sqlite3 = null;
@@ -274,6 +288,7 @@ pub const Database = struct {
     }
 
     pub fn deinit(self: *Database) void {
+        _ = std.c.pthread_mutex_destroy(&self.mailbox_mutations);
         if (self.db) |db| {
             _ = sqlite.sqlite3_close(db);
         }
@@ -286,9 +301,9 @@ pub const Database = struct {
         const wal_pragma = "PRAGMA journal_mode=WAL;";
         try self.exec(wal_pragma);
 
-        // Set synchronous mode to NORMAL for better performance with WAL
-        // NORMAL is safe with WAL mode and provides good durability guarantees
-        const sync_pragma = "PRAGMA synchronous=NORMAL;";
+        // Mail admission may acknowledge immediately after a commit. Sync the
+        // WAL at each commit so a power failure cannot undo accepted mail.
+        const sync_pragma = "PRAGMA synchronous=FULL;";
         try self.exec(sync_pragma);
 
         // Set a reasonable busy timeout (5 seconds)
@@ -360,6 +375,407 @@ pub const Database = struct {
         // is that error.
         self.exec("ALTER TABLE users ADD COLUMN recovery_email TEXT;") catch {};
         self.exec("ALTER TABLE users ADD COLUMN recovery_source TEXT;") catch {};
+
+        try self.exec(
+            \\CREATE TABLE IF NOT EXISTS provisioned_mailboxes (
+            \\    mailbox TEXT PRIMARY KEY,
+            \\    user_id INTEGER NOT NULL,
+            \\    actor TEXT NOT NULL UNIQUE,
+            \\    operation_id TEXT NOT NULL UNIQUE,
+            \\    revision INTEGER NOT NULL,
+            \\    requested_quota INTEGER NOT NULL,
+            \\    requested_enabled INTEGER NOT NULL,
+            \\    initial_recovery TEXT NOT NULL,
+            \\    send_recipients_per_day INTEGER NOT NULL DEFAULT 0
+            \\);
+            \\CREATE TABLE IF NOT EXISTS provisioning_operations (
+            \\    operation_id TEXT PRIMARY KEY,
+            \\    mailbox TEXT NOT NULL,
+            \\    revision INTEGER NOT NULL
+            \\);
+            \\CREATE TABLE IF NOT EXISTS eas_search_keys (
+            \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            \\    key BLOB NOT NULL CHECK(length(key)=32)
+            \\);
+            \\CREATE TABLE IF NOT EXISTS mailbox_message_refs (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    reference TEXT NOT NULL,
+            \\    folder TEXT NOT NULL,
+            \\    basename TEXT NOT NULL,
+            \\    file_stamp TEXT NOT NULL,
+            \\    next_folder TEXT,
+            \\    next_basename TEXT,
+            \\    next_digest TEXT,
+            \\    next_junk_action TEXT,
+            \\    next_junk_receipt TEXT,
+            \\    intake_folder TEXT NOT NULL DEFAULT '',
+            \\    placement_reason TEXT NOT NULL DEFAULT '',
+            \\    verified_author TEXT NOT NULL DEFAULT '',
+            \\    PRIMARY KEY(user_id,reference),
+            \\    UNIQUE(user_id,folder,basename)
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mailbox_message_refs_pending ON mailbox_message_refs(user_id,next_folder,next_basename) WHERE next_folder IS NOT NULL;
+            \\CREATE TABLE IF NOT EXISTS mailbox_junk_feedback (
+            \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    reference TEXT NOT NULL,
+            \\    receipt TEXT NOT NULL UNIQUE,
+            \\    author TEXT NOT NULL COLLATE NOCASE,
+            \\    action TEXT NOT NULL CHECK(action IN ('junk','not_junk')),
+            \\    source_folder TEXT NOT NULL,
+            \\    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mailbox_junk_by_author ON mailbox_junk_feedback(user_id,author,id DESC) WHERE author<>'';
+            \\CREATE INDEX IF NOT EXISTS mailbox_junk_by_message ON mailbox_junk_feedback(user_id,reference,id DESC);
+            \\CREATE INDEX IF NOT EXISTS mailbox_junk_age ON mailbox_junk_feedback(created_at);
+            \\CREATE TABLE IF NOT EXISTS webmail_search_docs (
+            \\    id INTEGER PRIMARY KEY,
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    folder TEXT NOT NULL,
+            \\    basename TEXT NOT NULL,
+            \\    fingerprint TEXT NOT NULL,
+            \\    digest TEXT NOT NULL,
+            \\    sender TEXT NOT NULL,
+            \\    recipient TEXT NOT NULL,
+            \\    cc TEXT NOT NULL,
+            \\    bcc TEXT NOT NULL,
+            \\    subject TEXT NOT NULL,
+            \\    sent_date TEXT NOT NULL,
+            \\    message_id TEXT NOT NULL,
+            \\    in_reply_to TEXT NOT NULL,
+            \\    reply_chain TEXT NOT NULL,
+            \\    snippet TEXT NOT NULL,
+            \\    body_text TEXT NOT NULL,
+            \\    attachment_metadata TEXT NOT NULL,
+            \\    UNIQUE(user_id,folder,basename)
+            \\);
+            \\CREATE VIRTUAL TABLE IF NOT EXISTS webmail_search_text USING fts5(
+            \\    sender,recipient,cc,bcc,subject,body_text,content='webmail_search_docs',tokenize='trigram'
+            \\);
+            \\CREATE TRIGGER IF NOT EXISTS webmail_search_insert AFTER INSERT ON webmail_search_docs BEGIN
+            \\    INSERT INTO webmail_search_text(rowid,sender,recipient,cc,bcc,subject,body_text)
+            \\    VALUES(new.id,new.sender,new.recipient,new.cc,new.bcc,new.subject,new.body_text);
+            \\END;
+            \\CREATE TRIGGER IF NOT EXISTS webmail_search_delete AFTER DELETE ON webmail_search_docs BEGIN
+            \\    INSERT INTO webmail_search_text(webmail_search_text,rowid,sender,recipient,cc,bcc,subject,body_text)
+            \\    VALUES('delete',old.id,old.sender,old.recipient,old.cc,old.bcc,old.subject,old.body_text);
+            \\END;
+            \\CREATE TRIGGER IF NOT EXISTS webmail_search_update AFTER UPDATE ON webmail_search_docs BEGIN
+            \\    INSERT INTO webmail_search_text(webmail_search_text,rowid,sender,recipient,cc,bcc,subject,body_text)
+            \\    VALUES('delete',old.id,old.sender,old.recipient,old.cc,old.bcc,old.subject,old.body_text);
+            \\    INSERT INTO webmail_search_text(rowid,sender,recipient,cc,bcc,subject,body_text)
+            \\    VALUES(new.id,new.sender,new.recipient,new.cc,new.bcc,new.subject,new.body_text);
+            \\END;
+            \\CREATE TABLE IF NOT EXISTS mail_private_anchors (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    reference TEXT NOT NULL,
+            \\    wire_ids TEXT NOT NULL,
+            \\    PRIMARY KEY(user_id,reference)
+            \\);
+            \\CREATE TABLE IF NOT EXISTS mail_private_entries (
+            \\    user_id INTEGER NOT NULL,
+            \\    id TEXT NOT NULL DEFAULT (lower(hex(randomblob(16)))),
+            \\    anchor TEXT NOT NULL,
+            \\    kind TEXT NOT NULL CHECK(kind IN ('note','clip')),
+            \\    body TEXT NOT NULL,
+            \\    source_subject TEXT NOT NULL DEFAULT '',
+            \\    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            \\    revision INTEGER NOT NULL DEFAULT 1,
+            \\    PRIMARY KEY(user_id,id),
+            \\    FOREIGN KEY(user_id,anchor) REFERENCES mail_private_anchors(user_id,reference) ON DELETE CASCADE
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mail_private_entries_anchor ON mail_private_entries(user_id,anchor);
+            \\CREATE TABLE IF NOT EXISTS mail_private_labels (
+            \\    user_id INTEGER NOT NULL,
+            \\    anchor TEXT NOT NULL,
+            \\    label TEXT NOT NULL,
+            \\    revision TEXT NOT NULL,
+            \\    changed_ms INTEGER NOT NULL,
+            \\    PRIMARY KEY(user_id,anchor),
+            \\    FOREIGN KEY(user_id,anchor) REFERENCES mail_private_anchors(user_id,reference) ON DELETE CASCADE
+            \\);
+            \\CREATE TABLE IF NOT EXISTS mail_private_groups (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    id TEXT NOT NULL DEFAULT (lower(hex(randomblob(16)))),
+            \\    anchors TEXT NOT NULL,
+            \\    undo_until INTEGER NOT NULL,
+            \\    PRIMARY KEY(user_id,id)
+            \\);
+            \\CREATE TABLE IF NOT EXISTS mail_private_collections (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    id TEXT NOT NULL DEFAULT (lower(hex(randomblob(16)))),
+            \\    name TEXT NOT NULL COLLATE NOCASE,
+            \\    revision INTEGER NOT NULL DEFAULT 1,
+            \\    PRIMARY KEY(user_id,id),
+            \\    UNIQUE(user_id,name)
+            \\);
+            \\CREATE TABLE IF NOT EXISTS mail_private_members (
+            \\    user_id INTEGER NOT NULL,
+            \\    collection TEXT NOT NULL,
+            \\    anchor TEXT NOT NULL,
+            \\    PRIMARY KEY(user_id,collection,anchor),
+            \\    FOREIGN KEY(user_id,collection) REFERENCES mail_private_collections(user_id,id) ON DELETE CASCADE,
+            \\    FOREIGN KEY(user_id,anchor) REFERENCES mail_private_anchors(user_id,reference) ON DELETE CASCADE
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mail_private_member_anchor ON mail_private_members(user_id,anchor);
+            \\CREATE TABLE IF NOT EXISTS mail_attention (
+            \\    user_id INTEGER NOT NULL,
+            \\    reference TEXT NOT NULL,
+            \\    kind TEXT NOT NULL CHECK(kind IN ('follow_up','saved','snoozed','muted','reminders')),
+            \\    deadline INTEGER NOT NULL,
+            \\    changed_ms INTEGER NOT NULL,
+            \\    wire_ids TEXT NOT NULL,
+            \\    waiting_id TEXT NOT NULL DEFAULT '',
+            \\    PRIMARY KEY(user_id,reference,kind),
+            \\    FOREIGN KEY(user_id,reference) REFERENCES mailbox_message_refs(user_id,reference) ON DELETE CASCADE ON UPDATE CASCADE
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mail_attention_kind ON mail_attention(user_id,kind,deadline);
+            \\CREATE TRIGGER IF NOT EXISTS mail_attention_replaced_ref BEFORE UPDATE OF reference ON mailbox_message_refs
+            \\WHEN OLD.reference<>NEW.reference BEGIN
+            \\    DELETE FROM mail_attention WHERE user_id=OLD.user_id AND reference=OLD.reference;
+            \\END;
+            \\CREATE TABLE IF NOT EXISTS mail_attention_replies (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    parent_id TEXT NOT NULL,
+            \\    last_ms INTEGER NOT NULL,
+            \\    PRIMARY KEY(user_id,parent_id)
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mail_attention_reply_retention ON mail_attention_replies(last_ms);
+            \\CREATE TABLE IF NOT EXISTS mail_notification_settings (
+            \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            \\    enabled INTEGER NOT NULL CHECK(enabled IN (0,1))
+            \\);
+            \\CREATE TABLE IF NOT EXISTS mail_notification_senders (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    author TEXT NOT NULL COLLATE NOCASE,
+            \\    rule TEXT NOT NULL CHECK(rule IN ('notify','quiet')),
+            \\    PRIMARY KEY(user_id,author)
+            \\);
+            \\CREATE TABLE IF NOT EXISTS mail_notification_threads (
+            \\    user_id INTEGER NOT NULL,
+            \\    reference TEXT NOT NULL,
+            \\    wire_ids TEXT NOT NULL,
+            \\    rule TEXT NOT NULL CHECK(rule IN ('notify','quiet')),
+            \\    PRIMARY KEY(user_id,reference),
+            \\    FOREIGN KEY(user_id,reference) REFERENCES mailbox_message_refs(user_id,reference) ON DELETE CASCADE ON UPDATE CASCADE
+            \\);
+            \\CREATE TRIGGER IF NOT EXISTS mail_notification_replaced_ref BEFORE UPDATE OF reference ON mailbox_message_refs
+            \\WHEN OLD.reference<>NEW.reference BEGIN
+            \\    DELETE FROM mail_notification_threads WHERE user_id=OLD.user_id AND reference=OLD.reference;
+            \\END;
+            \\CREATE TABLE IF NOT EXISTS mail_notification_events (
+            \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    event_key TEXT NOT NULL,
+            \\    folder TEXT NOT NULL,
+            \\    author TEXT NOT NULL,
+            \\    own_id TEXT,
+            \\    parents_json TEXT NOT NULL,
+            \\    created_at INTEGER NOT NULL,
+            \\    claimed_at INTEGER,
+            \\    UNIQUE(user_id,event_key)
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mail_notification_pending ON mail_notification_events(user_id,id) WHERE claimed_at IS NULL;
+            \\CREATE INDEX IF NOT EXISTS mail_notification_retention ON mail_notification_events(created_at);
+            \\CREATE TABLE IF NOT EXISTS mail_category_settings (
+            \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            \\    automatic INTEGER NOT NULL
+            \\);
+            \\CREATE TABLE IF NOT EXISTS mailbox_forwarding (
+            \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            \\    address TEXT,
+            \\    destination_id INTEGER,
+            \\    pending_address TEXT,
+            \\    pending_destination_id INTEGER,
+            \\    code_hash BLOB,
+            \\    expires_at INTEGER,
+            \\    attempts INTEGER NOT NULL DEFAULT 0,
+            \\    revision INTEGER NOT NULL DEFAULT 1
+            \\);
+            \\CREATE TABLE IF NOT EXISTS mailbox_forwarding_requests (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    address TEXT NOT NULL COLLATE NOCASE,
+            \\    requested_at INTEGER NOT NULL
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mailbox_forward_requests_time ON mailbox_forwarding_requests(requested_at);
+            \\CREATE INDEX IF NOT EXISTS mailbox_forward_requests_owner ON mailbox_forwarding_requests(user_id,requested_at);
+            \\CREATE INDEX IF NOT EXISTS mailbox_forward_requests_address ON mailbox_forwarding_requests(address,requested_at);
+            \\CREATE TABLE IF NOT EXISTS mailbox_vacation (
+            \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            \\    enabled INTEGER NOT NULL,
+            \\    subject TEXT NOT NULL,
+            \\    body TEXT NOT NULL,
+            \\    starts_at INTEGER,
+            \\    ends_at INTEGER,
+            \\    revision INTEGER NOT NULL DEFAULT 1
+            \\);
+            \\CREATE TABLE IF NOT EXISTS mailbox_vacation_sends (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    correspondent TEXT NOT NULL COLLATE NOCASE,
+            \\    accepted_at INTEGER NOT NULL,
+            \\    PRIMARY KEY(user_id,correspondent)
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mailbox_vacation_sends_owner_time ON mailbox_vacation_sends(user_id,accepted_at);
+            \\CREATE INDEX IF NOT EXISTS mailbox_vacation_sends_expiry ON mailbox_vacation_sends(accepted_at);
+            \\CREATE TABLE IF NOT EXISTS mail_category_rules (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    author TEXT NOT NULL COLLATE NOCASE,
+            \\    destination TEXT NOT NULL CHECK(destination IN ('inbox','newsletters','receipts')),
+            \\    PRIMARY KEY(user_id,author)
+            \\);
+            \\CREATE TABLE IF NOT EXISTS accepted_mail (
+            \\    id TEXT PRIMARY KEY,
+            \\    accepted_at INTEGER NOT NULL,
+            \\    accepted_ms INTEGER NOT NULL,
+            \\    envelope_from TEXT NOT NULL,
+            \\    author TEXT NOT NULL,
+            \\    verified_author INTEGER NOT NULL,
+            \\    remote_addr TEXT NOT NULL,
+            \\    mime BLOB NOT NULL,
+            \\    complete INTEGER NOT NULL DEFAULT 0
+            \\);
+            \\CREATE TABLE IF NOT EXISTS accepted_mail_targets (
+            \\    delivery_id TEXT NOT NULL REFERENCES accepted_mail(id) ON DELETE CASCADE,
+            \\    ordinal INTEGER NOT NULL,
+            \\    recipient TEXT NOT NULL,
+            \\    mailbox TEXT NOT NULL,
+            \\    mailbox_id INTEGER NOT NULL,
+            \\    folder TEXT NOT NULL,
+            \\    outcome TEXT NOT NULL,
+            \\    queued_bytes INTEGER NOT NULL,
+            \\    retry_at INTEGER NOT NULL,
+            \\    attempts INTEGER NOT NULL DEFAULT 0,
+            \\    is_primary INTEGER NOT NULL,
+            \\    review_copy INTEGER NOT NULL DEFAULT 0,
+            \\    placement_reason TEXT NOT NULL DEFAULT '',
+            \\    forward_after INTEGER,
+            \\    verified_forward INTEGER NOT NULL DEFAULT 0,
+            \\    reply_author TEXT,
+            \\    reply_from TEXT,
+            \\    reply_mime BLOB,
+            \\    PRIMARY KEY(delivery_id,ordinal)
+            \\);
+            \\CREATE INDEX IF NOT EXISTS accepted_mail_retry ON accepted_mail_targets(retry_at,delivery_id) WHERE outcome='pending';
+            \\CREATE INDEX IF NOT EXISTS accepted_mail_reservations ON accepted_mail_targets(mailbox) WHERE outcome='pending';
+            \\CREATE INDEX IF NOT EXISTS accepted_mail_retention ON accepted_mail(accepted_at) WHERE complete=1;
+            \\CREATE TABLE IF NOT EXISTS accepted_mail_effects (
+            \\    delivery_id TEXT NOT NULL,
+            \\    ordinal INTEGER NOT NULL,
+            \\    filename TEXT NOT NULL,
+            \\    size INTEGER NOT NULL,
+            \\    indexed INTEGER NOT NULL DEFAULT 0,
+            \\    notified INTEGER NOT NULL,
+            \\    PRIMARY KEY(delivery_id,ordinal),
+            \\    FOREIGN KEY(delivery_id,ordinal) REFERENCES accepted_mail_targets(delivery_id,ordinal) ON DELETE CASCADE
+            \\);
+            \\CREATE INDEX IF NOT EXISTS accepted_mail_pending_effects ON accepted_mail_effects(delivery_id,ordinal) WHERE indexed=0 OR notified=0;
+            \\CREATE TABLE IF NOT EXISTS sender_screening (
+            \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            \\    enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+            \\    onboarding_pending INTEGER NOT NULL DEFAULT 0
+            \\);
+            \\CREATE TABLE IF NOT EXISTS sender_screening_rules (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    author TEXT NOT NULL COLLATE NOCASE,
+            \\    action TEXT NOT NULL CHECK(action IN ('allow','decline')),
+            \\    forward INTEGER NOT NULL DEFAULT 1 CHECK(forward IN (0,1)),
+            \\    revision INTEGER NOT NULL DEFAULT 1,
+            \\    PRIMARY KEY(user_id,author)
+            \\);
+            \\CREATE TABLE IF NOT EXISTS sender_review_messages (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    basename TEXT NOT NULL,
+            \\    folder TEXT NOT NULL,
+            \\    envelope_from TEXT NOT NULL,
+            \\    author TEXT NOT NULL,
+            \\    verified_author INTEGER NOT NULL,
+            \\    recipient TEXT NOT NULL DEFAULT '',
+            \\    remote_addr TEXT NOT NULL DEFAULT '',
+            \\    file_stamp TEXT NOT NULL DEFAULT '',
+            \\    reference TEXT,
+            \\    next_folder TEXT,
+            \\    operation TEXT,
+            \\    forward_release INTEGER NOT NULL DEFAULT 0,
+            \\    retry_at INTEGER NOT NULL DEFAULT 0,
+            \\    PRIMARY KEY(user_id,basename)
+            \\);
+            \\CREATE TABLE IF NOT EXISTS eas_mailbox_state (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    device_id TEXT NOT NULL,
+            \\    collection_id TEXT NOT NULL,
+            \\    sync_key TEXT NOT NULL,
+            \\    items TEXT NOT NULL,
+            \\    PRIMARY KEY (user_id, device_id, collection_id)
+            \\);
+            \\CREATE TABLE IF NOT EXISTS eas_mailbox_ping (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    device_id TEXT NOT NULL,
+            \\    heartbeat INTEGER NOT NULL,
+            \\    folders TEXT NOT NULL,
+            \\    PRIMARY KEY (user_id, device_id)
+            \\);
+            \\CREATE TABLE IF NOT EXISTS eas_accepted_submissions (
+            \\    username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE ON UPDATE CASCADE,
+            \\    device_id TEXT NOT NULL,
+            \\    client_id TEXT NOT NULL,
+            \\    accepted_at INTEGER NOT NULL,
+            \\    PRIMARY KEY (username, device_id, client_id)
+            \\);
+            \\CREATE INDEX IF NOT EXISTS idx_eas_accepted_at ON eas_accepted_submissions(username, accepted_at);
+            \\CREATE TABLE IF NOT EXISTS hosted_sending_usage (
+            \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            \\    utc_day INTEGER NOT NULL,
+            \\    recipients INTEGER NOT NULL
+            \\);
+        );
+        // The routing-only build already created these three tables. Keep
+        // its review copies and default legacy rules to revision one.
+        self.exec("ALTER TABLE accepted_mail_targets ADD COLUMN review_copy INTEGER") catch {};
+        self.exec("ALTER TABLE accepted_mail_targets ADD COLUMN placement_reason TEXT NOT NULL DEFAULT ''") catch {};
+        self.exec("ALTER TABLE accepted_mail_targets ADD COLUMN verified_forward INTEGER NOT NULL DEFAULT 0") catch {};
+        self.exec("ALTER TABLE accepted_mail_targets ADD COLUMN reply_author TEXT") catch {};
+        self.exec("ALTER TABLE accepted_mail_targets ADD COLUMN reply_from TEXT") catch {};
+        self.exec("ALTER TABLE accepted_mail_targets ADD COLUMN reply_mime BLOB") catch {};
+        self.exec("ALTER TABLE mailbox_message_refs ADD COLUMN intake_folder TEXT NOT NULL DEFAULT ''") catch {};
+        self.exec("ALTER TABLE mailbox_message_refs ADD COLUMN placement_reason TEXT NOT NULL DEFAULT ''") catch {};
+        self.exec("ALTER TABLE mailbox_message_refs ADD COLUMN verified_author TEXT NOT NULL DEFAULT ''") catch {};
+        self.exec("ALTER TABLE mailbox_message_refs ADD COLUMN next_junk_action TEXT") catch {};
+        self.exec("ALTER TABLE mailbox_message_refs ADD COLUMN next_junk_receipt TEXT") catch {};
+        // Finalize the feedback with the recorded Maildir handoff. This also
+        // runs when a client read recovers a rename after a process restart.
+        try self.exec(
+            \\CREATE TRIGGER IF NOT EXISTS mailbox_junk_handoff AFTER UPDATE OF folder ON mailbox_message_refs
+            \\WHEN OLD.next_junk_receipt IS NOT NULL AND OLD.folder<>NEW.folder AND OLD.next_folder=NEW.folder AND OLD.next_basename=NEW.basename
+            \\BEGIN
+            \\    INSERT OR IGNORE INTO mailbox_junk_feedback(user_id,reference,receipt,author,action,source_folder)
+            \\      SELECT OLD.user_id,OLD.reference,OLD.next_junk_receipt,OLD.verified_author,OLD.next_junk_action,OLD.folder
+            \\      WHERE OLD.next_junk_action IN ('junk','not_junk');
+            \\    DELETE FROM mailbox_junk_feedback WHERE OLD.next_junk_action='undo' AND user_id=OLD.user_id AND reference=OLD.reference AND receipt=OLD.next_junk_receipt;
+            \\END;
+        );
+        try self.exec("UPDATE accepted_mail_targets SET review_copy=(folder IN ('Screening','Declined')) WHERE review_copy IS NULL");
+        self.exec("ALTER TABLE sender_screening ADD COLUMN onboarding_pending INTEGER NOT NULL DEFAULT 0") catch {};
+        self.exec("ALTER TABLE sender_screening_rules ADD COLUMN revision INTEGER NOT NULL DEFAULT 1") catch {};
+        for ([_][]const u8{
+            "recipient TEXT NOT NULL DEFAULT ''",
+            "remote_addr TEXT NOT NULL DEFAULT ''",
+            "file_stamp TEXT NOT NULL DEFAULT ''",
+            "reference TEXT",
+            "next_folder TEXT",
+            "operation TEXT",
+            "forward_release INTEGER NOT NULL DEFAULT 0",
+            "retry_at INTEGER NOT NULL DEFAULT 0",
+        }) |column| {
+            const sql = try std.fmt.allocPrint(self.allocator, "ALTER TABLE sender_review_messages ADD COLUMN {s}", .{column});
+            defer self.allocator.free(sql);
+            self.exec(sql) catch {};
+        }
+        try self.exec(
+            \\CREATE INDEX IF NOT EXISTS sender_review_folder ON sender_review_messages(user_id,folder,basename);
+            \\CREATE INDEX IF NOT EXISTS sender_review_author ON sender_review_messages(user_id,author COLLATE NOCASE) WHERE verified_author=1;
+            \\CREATE INDEX IF NOT EXISTS sender_review_work ON sender_review_messages(retry_at,operation) WHERE operation IS NOT NULL;
+        );
+        self.exec("ALTER TABLE provisioned_mailboxes ADD COLUMN send_recipients_per_day INTEGER NOT NULL DEFAULT 0") catch {};
         self.exec("ALTER TABLE users ADD COLUMN recovery_updated_at INTEGER;") catch {};
 
         // Single-use password reset tokens (see src/api/webmail_recovery.zig).
@@ -448,7 +864,12 @@ pub const Database = struct {
     pub fn prepare(self: *Database, sql: []const u8) !Statement {
         self.mutex.lock();
         defer self.mutex.unlock();
+        var stmt = try self.prepareLocked(sql);
+        stmt.mutex = &self.mutex;
+        return stmt;
+    }
 
+    fn prepareLocked(self: *Database, sql: []const u8) !Statement {
         const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
         defer self.allocator.free(sql_z);
 
@@ -462,6 +883,1571 @@ pub const Database = struct {
             .stmt = stmt.?,
             .allocator = self.allocator,
         };
+    }
+
+    pub const ProvisioningChange = struct {
+        mailbox: []const u8,
+        actor: []const u8,
+        operation_id: []const u8,
+        revision: i64,
+        quota_bytes: i64,
+        send_recipients_per_day: i64 = 0,
+        enabled: bool,
+        initial_recovery: ?[]const u8 = null,
+        initial_password_hash: ?[]const u8 = null,
+    };
+
+    pub const ProvisioningState = struct {
+        mailbox: []const u8,
+        revision: i64,
+        quota_bytes: i64,
+        send_recipients_per_day: i64 = 0,
+        enabled: bool,
+    };
+
+    fn provisioningStateLocked(self: *Database, mailbox: []const u8, actor: []const u8) !ProvisioningState {
+        const stmt = try self.prepareLocked(
+            "SELECT p.revision, u.quota_limit, u.enabled, p.send_recipients_per_day FROM provisioned_mailboxes p JOIN users u ON u.id = p.user_id AND u.username = p.mailbox WHERE p.mailbox = ? AND p.actor = ?",
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, mailbox);
+        try stmt.bind(2, actor);
+        if (!try stmt.step()) return error.MailboxNotFound;
+        return .{ .mailbox = mailbox, .revision = stmt.columnInt64(0), .quota_bytes = stmt.columnInt64(1), .enabled = stmt.columnInt64(2) != 0, .send_recipients_per_day = stmt.columnInt64(3) };
+    }
+
+    pub fn provisioningState(self: *Database, mailbox: []const u8, actor: []const u8) !ProvisioningState {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.provisioningStateLocked(mailbox, actor);
+    }
+
+    /// Commit account creation and its operation record together. Existing
+    /// operator-managed accounts are never adopted by provisioning.
+    pub fn applyProvisioning(self: *Database, change: ProvisioningChange) !ProvisioningState {
+        self.lockMailboxes();
+        defer self.unlockMailboxes();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.execLocked("BEGIN IMMEDIATE");
+        errdefer self.execLocked("ROLLBACK") catch {};
+        {
+            const operation = try self.prepareLocked("SELECT mailbox, revision FROM provisioning_operations WHERE operation_id = ?");
+            defer operation.finalize();
+            try operation.bind(1, change.operation_id);
+            if (try operation.step() and (!std.mem.eql(u8, operation.columnText(0), change.mailbox) or operation.columnInt64(1) != change.revision))
+                return error.OperationConflict;
+        }
+        const record = try self.prepareLocked(
+            "SELECT actor, operation_id, revision, requested_quota, requested_enabled, initial_recovery, user_id, send_recipients_per_day FROM provisioned_mailboxes WHERE mailbox = ?",
+        );
+        defer record.finalize();
+        try record.bind(1, change.mailbox);
+        const now = time_compat.timestamp();
+        if (try record.step()) {
+            if (!std.mem.eql(u8, record.columnText(0), change.actor)) return error.MailboxUnavailable;
+            const previous = record.columnInt64(2);
+            const same_operation = std.mem.eql(u8, record.columnText(1), change.operation_id);
+            if (same_operation) {
+                if (previous != change.revision or record.columnInt64(3) != change.quota_bytes or record.columnInt64(7) != change.send_recipients_per_day or
+                    (record.columnInt64(4) != 0) != change.enabled or
+                    (change.initial_recovery != null and !std.mem.eql(u8, record.columnText(5), change.initial_recovery.?)))
+                    return error.OperationConflict;
+            } else {
+                if (change.revision - 1 != previous) return error.StaleRevision;
+                const update = try self.prepareLocked("UPDATE users SET quota_limit = ?, enabled = ?, updated_at = ? WHERE id = ? AND username = ?");
+                defer update.finalize();
+                try update.bind(1, change.quota_bytes);
+                try update.bind(2, @as(i64, @intFromBool(change.enabled)));
+                try update.bind(3, now);
+                try update.bind(4, record.columnInt64(6));
+                try update.bind(5, change.mailbox);
+                _ = try update.step();
+                if (sqlite.sqlite3_changes(self.db) == 0) return error.MailboxNotFound;
+                if (!change.enabled) {
+                    try self.deleteUserSessionsLocked(change.mailbox);
+                    try self.deleteUserResetTokensLocked(change.mailbox);
+                }
+                const next = try self.prepareLocked("UPDATE provisioned_mailboxes SET operation_id = ?, revision = ?, requested_quota = ?, requested_enabled = ?, send_recipients_per_day = ? WHERE mailbox = ?");
+                defer next.finalize();
+                try next.bind(1, change.operation_id);
+                try next.bind(2, change.revision);
+                try next.bind(3, change.quota_bytes);
+                try next.bind(4, @as(i64, @intFromBool(change.enabled)));
+                try next.bind(5, change.send_recipients_per_day);
+                try next.bind(6, change.mailbox);
+                _ = try next.step();
+            }
+        } else {
+            if (change.revision != 1) return error.StaleRevision;
+            const password = change.initial_password_hash orelse return error.IncompleteCreate;
+            const recovery_address = change.initial_recovery orelse return error.IncompleteCreate;
+            {
+                const occupied = try self.prepareLocked("SELECT 1 FROM users WHERE username = ? OR email = ? UNION ALL SELECT 1 FROM provisioned_mailboxes WHERE actor = ? LIMIT 1");
+                defer occupied.finalize();
+                try occupied.bind(1, change.mailbox);
+                try occupied.bind(2, change.mailbox);
+                try occupied.bind(3, change.actor);
+                if (try occupied.step()) return error.MailboxUnavailable;
+            }
+            const user = try self.prepareLocked(
+                "INSERT INTO users(username, email, password_hash, enabled, quota_limit, recovery_email, recovery_source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'operator', ?, ?)",
+            );
+            defer user.finalize();
+            try user.bind(1, change.mailbox);
+            try user.bind(2, change.mailbox);
+            try user.bind(3, password);
+            try user.bind(4, @as(i64, @intFromBool(change.enabled)));
+            try user.bind(5, change.quota_bytes);
+            try user.bind(6, recovery_address);
+            try user.bind(7, now);
+            try user.bind(8, now);
+            _ = try user.step();
+            const id = sqlite.sqlite3_last_insert_rowid(self.db);
+            {
+                const onboarding = try self.prepareLocked("INSERT INTO sender_screening(user_id,enabled,onboarding_pending) VALUES (?1,0,1)");
+                defer onboarding.finalize();
+                try onboarding.bind(1, id);
+                _ = try onboarding.step();
+            }
+            const insert = try self.prepareLocked("INSERT INTO provisioned_mailboxes (mailbox, user_id, actor, operation_id, revision, requested_quota, requested_enabled, initial_recovery, send_recipients_per_day) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            defer insert.finalize();
+            try insert.bind(1, change.mailbox);
+            try insert.bind(2, id);
+            try insert.bind(3, change.actor);
+            try insert.bind(4, change.operation_id);
+            try insert.bind(5, change.revision);
+            try insert.bind(6, change.quota_bytes);
+            try insert.bind(7, @as(i64, @intFromBool(change.enabled)));
+            try insert.bind(8, recovery_address);
+            try insert.bind(9, change.send_recipients_per_day);
+            _ = try insert.step();
+        }
+        const operation = try self.prepareLocked("INSERT OR IGNORE INTO provisioning_operations VALUES (?, ?, ?)");
+        defer operation.finalize();
+        try operation.bind(1, change.operation_id);
+        try operation.bind(2, change.mailbox);
+        try operation.bind(3, change.revision);
+        _ = try operation.step();
+        const state = try self.provisioningStateLocked(change.mailbox, change.actor);
+        try self.execLocked("COMMIT");
+        return state;
+    }
+
+    // Take this lock before the SQLite mutex when a Maildir change must be
+    // serialized with a quota check or a provisioning revision.
+    pub fn lockMailboxes(self: *Database) void {
+        if (std.c.pthread_mutex_lock(&self.mailbox_mutations) != .SUCCESS) unreachable;
+    }
+
+    pub fn unlockMailboxes(self: *Database) void {
+        if (std.c.pthread_mutex_unlock(&self.mailbox_mutations) != .SUCCESS) unreachable;
+    }
+
+    pub const HostedLimits = struct {
+        user_id: i64,
+        enabled: bool,
+        quota_bytes: u64,
+        send_recipients_per_day: i64,
+    };
+
+    pub fn hostedLimits(self: *Database, mailbox: []const u8) !?HostedLimits {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.hostedLimitsLocked(mailbox);
+    }
+
+    fn hostedLimitsLocked(self: *Database, mailbox: []const u8) !?HostedLimits {
+        const stmt = try self.prepareLocked(
+            "SELECT u.id, u.enabled, u.quota_limit, p.send_recipients_per_day FROM provisioned_mailboxes p JOIN users u ON u.id = p.user_id AND u.username = p.mailbox WHERE p.mailbox = ?",
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, mailbox);
+        if (!try stmt.step()) return null;
+        return .{
+            .user_id = stmt.columnInt64(0),
+            .enabled = stmt.columnInt64(1) != 0,
+            .quota_bytes = @intCast(@max(0, stmt.columnInt64(2))),
+            .send_recipients_per_day = stmt.columnInt64(3),
+        };
+    }
+
+    pub fn hostedSenderActive(self: *Database, user_id: i64) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const stmt = try self.prepareLocked(
+            "SELECT 1 FROM provisioned_mailboxes p JOIN users u ON u.id = p.user_id AND u.username = p.mailbox WHERE u.id = ? AND u.enabled = 1",
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user_id);
+        return stmt.step();
+    }
+
+    pub const ActiveSyncReceipt = struct {
+        device_id: []const u8,
+        client_id: []const u8,
+    };
+
+    const eas_receipt_lifetime = 7 * 86400;
+
+    pub fn activeSyncAccepted(self: *Database, mailbox: []const u8, receipt: ActiveSyncReceipt, now: i64) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const stmt = try self.prepareLocked(
+            "SELECT 1 FROM eas_accepted_submissions WHERE username = ? AND device_id = ? AND client_id = ? AND accepted_at >= ?",
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, mailbox);
+        try stmt.bind(2, receipt.device_id);
+        try stmt.bind(3, receipt.client_id);
+        try stmt.bind(4, now - eas_receipt_lifetime);
+        return stmt.step();
+    }
+
+    /// Commit the retry receipt and the recipient debit together, before
+    /// attempting delivery. Used under the mailbox mutation lock.
+    pub fn acceptActiveSyncSend(self: *Database, mailbox: []const u8, receipt: ActiveSyncReceipt, recipients: usize, now: i64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.execLocked("BEGIN IMMEDIATE");
+        errdefer self.execLocked("ROLLBACK") catch {};
+        try self.recordActiveSyncReceiptLocked(mailbox, receipt, now);
+        try self.chargeHostedSendLocked(mailbox, recipients, now);
+        try self.execLocked("COMMIT");
+    }
+
+    fn recordActiveSyncReceiptLocked(self: *Database, mailbox: []const u8, receipt: ActiveSyncReceipt, now: i64) !void {
+        {
+            const sweep = try self.prepareLocked("DELETE FROM eas_accepted_submissions WHERE username = ? AND accepted_at < ?");
+            defer sweep.finalize();
+            try sweep.bind(1, mailbox);
+            try sweep.bind(2, now - eas_receipt_lifetime);
+            _ = try sweep.step();
+        }
+        {
+            const insert = try self.prepareLocked("INSERT OR IGNORE INTO eas_accepted_submissions VALUES (?, ?, ?, ?)");
+            defer insert.finalize();
+            try insert.bind(1, mailbox);
+            try insert.bind(2, receipt.device_id);
+            try insert.bind(3, receipt.client_id);
+            try insert.bind(4, now);
+            _ = try insert.step();
+            if (sqlite.sqlite3_changes(self.db) == 0) return error.MessagePreviouslySent;
+        }
+    }
+
+    /// Called under the mailbox mutation lock before publishing SMTP files.
+    pub fn checkHostedSend(self: *Database, mailbox: []const u8, recipients: usize, now: i64) !?i64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const limits = (try self.hostedLimitsLocked(mailbox)) orelse return null;
+        if (!limits.enabled) return error.HostedSenderDisabled;
+        const limit = limits.send_recipients_per_day;
+        if (limit == 0) return limits.user_id;
+        if (recipients > @as(u64, @intCast(limit))) return error.HostedSendingLimit;
+
+        const stmt = try self.prepareLocked("SELECT utc_day, recipients FROM hosted_sending_usage WHERE user_id = ?");
+        defer stmt.finalize();
+        try stmt.bind(1, limits.user_id);
+        const day = @divFloor(now, 86400);
+        if (try stmt.step() and (stmt.columnInt64(0) > day or
+            (stmt.columnInt64(0) == day and stmt.columnInt64(1) > limit - @as(i64, @intCast(recipients)))))
+            return error.HostedSendingLimit;
+        return limits.user_id;
+    }
+
+    /// Reserve the distinct envelope recipients of an accepted submission on
+    /// the UTC day of dispatch. A retry of an already accepted SMTP message
+    /// uses its original reservation.
+    pub fn chargeHostedSend(self: *Database, mailbox: []const u8, recipients: usize, now: i64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return self.chargeHostedSendLocked(mailbox, recipients, now);
+    }
+
+    fn chargeHostedSendLocked(self: *Database, mailbox: []const u8, recipients: usize, now: i64) !void {
+        const limits = (try self.hostedLimitsLocked(mailbox)) orelse return;
+        if (!limits.enabled) return error.HostedSenderDisabled;
+        const limit = limits.send_recipients_per_day;
+        if (limit == 0) return; // Older provisioning clients omitted a sending allowance.
+        if (recipients > @as(u64, @intCast(limit))) return error.HostedSendingLimit;
+
+        const stmt = try self.prepareLocked(
+            \\INSERT INTO hosted_sending_usage (user_id, utc_day, recipients) VALUES (?1, ?2, ?3)
+            \\ON CONFLICT (user_id) DO UPDATE SET utc_day = excluded.utc_day,
+            \\    recipients = CASE WHEN hosted_sending_usage.utc_day = excluded.utc_day
+            \\        THEN hosted_sending_usage.recipients + excluded.recipients ELSE excluded.recipients END
+            \\WHERE hosted_sending_usage.utc_day < excluded.utc_day OR
+            \\    (hosted_sending_usage.utc_day = excluded.utc_day AND hosted_sending_usage.recipients <= ?4 - excluded.recipients)
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, limits.user_id);
+        try stmt.bind(2, @divFloor(now, 86400));
+        try stmt.bind(3, @as(i64, @intCast(recipients)));
+        try stmt.bind(4, limit);
+        _ = try stmt.step();
+        if (sqlite.sqlite3_changes(self.db) == 0) return error.HostedSendingLimit;
+    }
+
+    pub const ForwardingSettings = struct {
+        address: ?[]const u8 = null,
+        pendingAddress: ?[]const u8 = null,
+        expiresAt: ?i64 = null,
+        revision: i64 = 0,
+    };
+
+    pub const ForwardDestination = struct {
+        address: []const u8,
+        mailbox_id: ?i64,
+    };
+
+    pub const ForwardRequest = struct {
+        destination: ForwardDestination,
+        hash: [32]u8,
+        now: i64,
+        expires: i64,
+    };
+
+    pub fn enabledMailboxId(self: *Database, user: []const u8) !?i64 {
+        const stmt = try self.prepare("SELECT id FROM users WHERE username=?1 AND enabled=1");
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        return if (try stmt.step()) stmt.columnInt64(0) else null;
+    }
+
+    pub fn forwardingSettings(self: *Database, a: std.mem.Allocator, user: []const u8) !ForwardingSettings {
+        const stmt = try self.prepare("SELECT f.address,f.pending_address,f.expires_at,f.revision FROM mailbox_forwarding f JOIN users u ON u.id=f.user_id WHERE u.username=?1");
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        if (!try stmt.step()) return .{};
+        return .{
+            .address = if (stmt.columnTextOpt(0)) |address| try a.dupe(u8, address) else null,
+            .pendingAddress = if (stmt.columnTextOpt(1)) |address| try a.dupe(u8, address) else null,
+            .expiresAt = stmt.columnInt64Opt(2),
+            .revision = stmt.columnInt64(3),
+        };
+    }
+
+    pub fn verifiedForward(self: *Database, a: std.mem.Allocator, user: []const u8) !?ForwardDestination {
+        const stmt = try self.prepare("SELECT f.address,f.destination_id FROM mailbox_forwarding f JOIN users u ON u.id=f.user_id WHERE u.username=?1 AND u.enabled=1 AND f.address IS NOT NULL");
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        if (!try stmt.step()) return null;
+        return .{ .address = try a.dupe(u8, stmt.columnText(0)), .mailbox_id = stmt.columnInt64Opt(1) };
+    }
+
+    pub fn startForwardRequest(self: *Database, user: []const u8, revision: i64, request: ForwardRequest) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.execLocked("BEGIN IMMEDIATE");
+        errdefer self.execLocked("ROLLBACK") catch {};
+        {
+            const prune = try self.prepareLocked("DELETE FROM mailbox_forwarding_requests WHERE requested_at<=?1");
+            defer prune.finalize();
+            try prune.bind(1, request.now - 3600);
+            _ = try prune.step();
+        }
+        const owner = try self.prepareLocked(
+            \\SELECT u.id,COALESCE(f.revision,0),f.address,f.destination_id,
+            \\       (SELECT COUNT(*) FROM mailbox_forwarding_requests WHERE user_id=u.id),
+            \\       (SELECT MAX(requested_at) FROM mailbox_forwarding_requests WHERE user_id=u.id),
+            \\       (SELECT COUNT(*) FROM mailbox_forwarding_requests WHERE address=?2)
+            \\FROM users u LEFT JOIN mailbox_forwarding f ON f.user_id=u.id WHERE u.username=?1 AND u.enabled=1
+        );
+        defer owner.finalize();
+        try owner.bind(1, user);
+        try owner.bind(2, request.destination.address);
+        if (!try owner.step()) return error.NotFound;
+        if (owner.columnInt64(1) != revision) return error.PreconditionFailed;
+        if (owner.columnTextOpt(2)) |address| {
+            if (std.mem.eql(u8, address, request.destination.address) and owner.columnInt64Opt(3) == request.destination.mailbox_id)
+                return error.ForwardAlreadyActive;
+        }
+        if (owner.columnInt64(4) >= 3 or owner.columnInt64(6) >= 5 or
+            (owner.columnInt64Opt(5) orelse 0) > request.now - 60) return error.ForwardRateLimited;
+        const user_id = owner.columnInt64(0);
+        const update = try self.prepareLocked(
+            \\INSERT INTO mailbox_forwarding(user_id,pending_address,pending_destination_id,code_hash,expires_at,attempts) VALUES (?1,?2,?3,?4,?5,8)
+            \\ON CONFLICT(user_id) DO UPDATE SET pending_address=excluded.pending_address,pending_destination_id=excluded.pending_destination_id,
+            \\code_hash=excluded.code_hash,expires_at=excluded.expires_at,attempts=excluded.attempts,revision=revision+1
+        );
+        defer update.finalize();
+        try update.bind(1, user_id);
+        try update.bind(2, request.destination.address);
+        try update.bindOpt(3, request.destination.mailbox_id);
+        try update.bindBlob(4, &request.hash);
+        try update.bind(5, request.expires);
+        _ = try update.step();
+        const log = try self.prepareLocked("INSERT INTO mailbox_forwarding_requests(user_id,address,requested_at) VALUES (?1,?2,?3)");
+        defer log.finalize();
+        try log.bind(1, user_id);
+        try log.bind(2, request.destination.address);
+        try log.bind(3, request.now);
+        _ = try log.step();
+        try self.execLocked("COMMIT");
+    }
+
+    pub fn confirmForwardRequest(self: *Database, user: []const u8, revision: i64, hash: [32]u8, now: i64) !bool {
+        self.lockMailboxes();
+        defer self.unlockMailboxes();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.execLocked("BEGIN IMMEDIATE");
+        defer self.execLocked("ROLLBACK") catch {};
+        const state = try self.prepareLocked(
+            \\SELECT f.user_id,f.revision,f.code_hash,f.expires_at,f.attempts,
+            \\       f.pending_destination_id IS NULL OR EXISTS(SELECT 1 FROM users v WHERE v.id=f.pending_destination_id AND v.enabled=1)
+            \\FROM mailbox_forwarding f JOIN users u ON u.id=f.user_id WHERE u.username=?1 AND u.enabled=1
+        );
+        defer state.finalize();
+        try state.bind(1, user);
+        if (!try state.step()) return false;
+        if (state.columnInt64(1) != revision) return error.PreconditionFailed;
+        const stored = state.columnBlob(2);
+        if (stored.len != hash.len or state.columnInt64(3) <= now or state.columnInt64(4) <= 0 or state.columnInt64(5) == 0) return false;
+        const matched = std.crypto.timing_safe.eql([32]u8, stored[0..32].*, hash);
+        const update = try self.prepareLocked(if (matched)
+            \\UPDATE mailbox_forwarding SET address=pending_address,destination_id=pending_destination_id,
+            \\pending_address=NULL,pending_destination_id=NULL,code_hash=NULL,expires_at=NULL,attempts=0,revision=revision+1 WHERE user_id=?1
+        else
+            "UPDATE mailbox_forwarding SET attempts=attempts-1 WHERE user_id=?1");
+        defer update.finalize();
+        try update.bind(1, state.columnInt64(0));
+        _ = try update.step();
+        try self.execLocked("COMMIT");
+        return matched;
+    }
+
+    pub fn clearForwarding(self: *Database, user: []const u8, revision: i64, pending_only: bool) !void {
+        self.lockMailboxes();
+        defer self.unlockMailboxes();
+        const stmt = try self.prepare(if (pending_only)
+            \\UPDATE mailbox_forwarding SET pending_address=NULL,pending_destination_id=NULL,code_hash=NULL,expires_at=NULL,attempts=0,revision=revision+1
+            \\WHERE user_id=(SELECT id FROM users WHERE username=?1 AND enabled=1) AND revision=?2 RETURNING revision
+        else
+            \\UPDATE mailbox_forwarding SET address=NULL,destination_id=NULL,pending_address=NULL,pending_destination_id=NULL,code_hash=NULL,expires_at=NULL,attempts=0,revision=revision+1
+            \\WHERE user_id=(SELECT id FROM users WHERE username=?1 AND enabled=1) AND revision=?2 RETURNING revision
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, revision);
+        if (!try stmt.step()) return error.PreconditionFailed;
+    }
+
+    pub const VacationSettings = struct {
+        enabled: bool = false,
+        subject: []const u8 = "Out of office",
+        body: []const u8 = "",
+        startsAt: ?i64 = null,
+        endsAt: ?i64 = null,
+        revision: i64 = 0,
+    };
+
+    pub fn vacationSettings(self: *Database, a: std.mem.Allocator, user: []const u8) !VacationSettings {
+        const stmt = try self.prepare("SELECT v.enabled,v.subject,v.body,v.starts_at,v.ends_at,v.revision FROM mailbox_vacation v JOIN users u ON u.id=v.user_id WHERE u.username=?1");
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        if (!try stmt.step()) return .{};
+        return .{
+            .enabled = stmt.columnInt64(0) != 0,
+            .subject = try a.dupe(u8, stmt.columnText(1)),
+            .body = try a.dupe(u8, stmt.columnText(2)),
+            .startsAt = stmt.columnInt64Opt(3),
+            .endsAt = stmt.columnInt64Opt(4),
+            .revision = stmt.columnInt64(5),
+        };
+    }
+
+    pub fn setVacationSettings(self: *Database, user: []const u8, settings: VacationSettings) !i64 {
+        self.lockMailboxes();
+        defer self.unlockMailboxes();
+        const stmt = try self.prepare(
+            \\INSERT INTO mailbox_vacation(user_id,enabled,subject,body,starts_at,ends_at)
+            \\SELECT id,?2,?3,?4,?5,?6 FROM users
+            \\WHERE username=?1 AND enabled=1 AND (?7=0 OR EXISTS(SELECT 1 FROM mailbox_vacation WHERE user_id=users.id))
+            \\ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled,subject=excluded.subject,body=excluded.body,
+            \\       starts_at=excluded.starts_at,ends_at=excluded.ends_at,revision=revision+1
+            \\WHERE revision=?7 RETURNING revision
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, @intFromBool(settings.enabled));
+        try stmt.bind(3, settings.subject);
+        try stmt.bind(4, settings.body);
+        try stmt.bindOpt(5, settings.startsAt);
+        try stmt.bindOpt(6, settings.endsAt);
+        try stmt.bind(7, settings.revision);
+        if (!try stmt.step()) return error.PreconditionFailed;
+        return stmt.columnInt64(0);
+    }
+
+    /// Reserve a reply and its hosted debit in the delivery transaction. A
+    /// cooldown is recorded for admitted replies, including pending retries.
+    fn admitVacationLocked(self: *Database, user: []const u8, recipient: []const u8, now: i64) !?[]const u8 {
+        const check = try self.prepareLocked(
+            \\SELECT u.id,
+            \\       EXISTS(SELECT 1 FROM mailbox_vacation_sends WHERE user_id=u.id AND correspondent=?2 AND accepted_at>?3),
+            \\       (SELECT COUNT(*) FROM mailbox_vacation_sends WHERE user_id=u.id AND accepted_at>=?4)
+            \\FROM users u JOIN mailbox_vacation v ON v.user_id=u.id AND v.enabled=1
+            \\WHERE u.username=?1 AND u.enabled=1 AND (v.starts_at IS NULL OR v.starts_at<=?5) AND (v.ends_at IS NULL OR v.ends_at>?5)
+        );
+        defer check.finalize();
+        try check.bind(1, user);
+        try check.bind(2, recipient);
+        try check.bind(3, now - vacation_wire.cooldown_seconds);
+        try check.bind(4, @divFloor(now, 86400) * 86400);
+        try check.bind(5, now);
+        if (!try check.step()) return "vacation_inactive";
+        if (check.columnInt64(1) != 0) return "vacation_repeat";
+        if (check.columnInt64(2) >= vacation_wire.daily_limit) return "vacation_daily_limit";
+        self.chargeHostedSendLocked(user, 1, now) catch |err| switch (err) {
+            error.HostedSendingLimit => return "vacation_allowance",
+            error.HostedSenderDisabled => return "vacation_inactive",
+            else => return err,
+        };
+        const receipt = try self.prepareLocked(
+            \\INSERT INTO mailbox_vacation_sends(user_id,correspondent,accepted_at) VALUES (?1,?2,?3)
+            \\ON CONFLICT(user_id,correspondent) DO UPDATE SET accepted_at=excluded.accepted_at
+        );
+        defer receipt.finalize();
+        try receipt.bind(1, check.columnInt64(0));
+        try receipt.bind(2, recipient);
+        try receipt.bind(3, now);
+        _ = try receipt.step();
+        return null;
+    }
+
+    pub const VacationReply = struct { author: []const u8, from: []const u8, mime: []const u8 };
+
+    pub const DeliveryTarget = struct {
+        recipient: []const u8,
+        mailbox: []const u8 = "",
+        folder: []const u8 = "",
+        forward_owner: ?[]const u8 = null,
+        forward_after: ?usize = null,
+        verified_forward: bool = false,
+        outbound_from: ?[]const u8 = null,
+        outbound_subject: []const u8 = "",
+        reply: ?VacationReply = null,
+        forward_allowed: bool = true,
+        review_copy: bool = false,
+        placement_reason: ?categories.Reason = null,
+        refusal: ?[]const u8 = null,
+    };
+
+    pub const DeliveryEnvelope = struct {
+        id: []const u8,
+        from: []const u8,
+        author: []const u8 = "",
+        verified_author: bool = false,
+        notification_origin: []const u8 = "",
+        mime: []const u8,
+        accepted_at: i64,
+        accepted_ms: i64,
+        targets: []const DeliveryTarget,
+        sender: ?[]const u8 = null,
+        charge_recipients: usize = 0,
+        receipt: ?ActiveSyncReceipt = null,
+        review_release: ?FiledCopy = null,
+    };
+
+    /// Reserve the hosted envelope and persist its complete routing decision
+    /// before any local copy becomes visible or the SMTP transaction is acknowledged.
+    pub fn acceptDelivery(self: *Database, envelope: DeliveryEnvelope) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.execLocked("BEGIN IMMEDIATE");
+        errdefer self.execLocked("ROLLBACK") catch {};
+        var hosted_sender: i64 = 0;
+        if (envelope.sender) |sender| {
+            if (envelope.receipt) |receipt| try self.recordActiveSyncReceiptLocked(sender, receipt, envelope.accepted_at);
+            try self.chargeHostedSendLocked(sender, envelope.charge_recipients, envelope.accepted_at);
+            if (try self.hostedLimitsLocked(sender)) |limits| hosted_sender = limits.user_id;
+        }
+        {
+            const insert = try self.prepareLocked("INSERT INTO accepted_mail(id,accepted_at,mime,envelope_from,author,verified_author,remote_addr,accepted_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)");
+            defer insert.finalize();
+            try insert.bind(1, envelope.id);
+            try insert.bind(2, envelope.accepted_at);
+            try insert.bindBlob(3, envelope.mime);
+            try insert.bind(4, envelope.from);
+            try insert.bind(5, envelope.author);
+            try insert.bind(6, @as(u8, @intFromBool(envelope.verified_author)));
+            try insert.bind(7, envelope.notification_origin);
+            try insert.bind(8, envelope.accepted_ms);
+            _ = try insert.step();
+        }
+        const insert = try self.prepareLocked("INSERT INTO accepted_mail_targets(delivery_id,ordinal,recipient,mailbox,folder,outcome,queued_bytes,retry_at,mailbox_id,is_primary,forward_after,review_copy,placement_reason,verified_forward,reply_author,reply_from,reply_mime) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,COALESCE((SELECT id FROM users WHERE username=?4),0),?9,?10,?11,?12,?13,?14,?15,?16)");
+        defer insert.finalize();
+        var has_local = false;
+        for (envelope.targets, 0..) |planned, ordinal| {
+            const released = if (ordinal == 0) envelope.review_release else null;
+            var target = planned;
+            if (envelope.review_release != null and target.forward_after == 0) target.forward_after = null;
+            if (target.refusal == null and target.reply != null)
+                target.refusal = try self.admitVacationLocked(target.forward_owner.?, target.recipient, envelope.accepted_at);
+            const pending = target.refusal == null and target.mailbox.len > 0 and released == null;
+            var outcome = target.refusal orelse if (released != null) "filed" else if (pending) "pending" else "queued";
+            if (std.mem.eql(u8, outcome, "queued")) {
+                var owner = hosted_sender;
+                if (target.forward_owner) |user| {
+                    owner = if (try self.hostedLimitsLocked(user)) |limits| limits.user_id else 0;
+                    if (target.reply == null) self.chargeHostedSendLocked(user, 1, envelope.accepted_at) catch |err| switch (err) {
+                        error.HostedSendingLimit => outcome = "forward_allowance",
+                        error.HostedSenderDisabled => outcome = "forward_disabled",
+                        else => return err,
+                    };
+                }
+                if (std.mem.eql(u8, outcome, "queued")) try self.queueAcceptedRemoteLocked(envelope, ordinal, target, owner);
+            }
+            try insert.bind(1, envelope.id);
+            try insert.bind(2, ordinal);
+            try insert.bind(3, target.recipient);
+            try insert.bind(4, target.mailbox);
+            try insert.bind(5, target.folder);
+            try insert.bind(6, outcome);
+            const local_bytes = if (target.reply) |reply| reply.mime.len else envelope.mime.len + if (target.verified_forward) forwarding_wire.loop_header.len else @as(usize, 0);
+            try insert.bind(7, @as(usize, if (pending) local_bytes else 0));
+            try insert.bind(8, envelope.accepted_at);
+            try insert.bind(9, @as(u8, @intFromBool(target.forward_owner == null)));
+            try insert.bindOpt(10, target.forward_after);
+            try insert.bind(11, @intFromBool(target.review_copy));
+            try insert.bind(12, if (target.placement_reason) |reason| @tagName(reason) else "");
+            try insert.bind(13, @intFromBool(target.verified_forward));
+            try insert.bindOpt(14, if (target.reply) |reply| reply.author else null);
+            try insert.bindOpt(15, if (target.reply) |reply| reply.from else null);
+            if (target.reply != null and pending) try insert.bindBlob(16, target.reply.?.mime) else try insert.bindNull(16);
+            _ = try insert.step();
+            try insert.reset();
+            if (released) |file| {
+                try self.recordPlacementLocked(envelope.id, @intCast(ordinal), file);
+                const muted = try self.attentionArrivalLocked(envelope.id, @intCast(ordinal), file.attention);
+                try self.stageDeliveryEffectsLocked(envelope.id, @intCast(ordinal), file, muted);
+                try self.stageBrowserNotificationLocked(envelope.id, @intCast(ordinal), file, muted);
+                const remove = try self.prepareLocked("DELETE FROM sender_review_messages WHERE user_id=(SELECT id FROM users WHERE username=?1) AND operation=?2");
+                defer remove.finalize();
+                try remove.bind(1, target.mailbox);
+                try remove.bind(2, envelope.id);
+                _ = try remove.step();
+                if (sqlite.sqlite3_changes(self.db) != 1) return error.ReviewChanged;
+            }
+            has_local = has_local or pending;
+        }
+        if (!has_local) try self.compactDeliveryLocked(envelope.id);
+        try self.execLocked("COMMIT");
+    }
+
+    fn queueAcceptedRemoteLocked(self: *Database, envelope: DeliveryEnvelope, ordinal: usize, target: DeliveryTarget, owner: i64) !void {
+        const id = try std.fmt.allocPrint(self.allocator, "route-{s}-{d}", .{ envelope.id, ordinal });
+        defer self.allocator.free(id);
+        const insert = try self.prepareLocked(
+            "INSERT INTO message_queue(id,from_addr,to_addr,message_data,status,next_retry,created_at,updated_at,hosted_user_id) VALUES (?1,?2,?3,?4,?7,?5,?5,?5,?6)",
+        );
+        defer insert.finalize();
+        try insert.bind(1, id);
+        try insert.bind(2, if (target.reply) |reply| reply.from else target.outbound_from orelse envelope.from);
+        try insert.bind(3, target.recipient);
+        const forwarded = if (target.outbound_from) |address|
+            try forwarding_wire.wrap(self.allocator, address, target.recipient, target.outbound_subject, envelope.mime)
+        else
+            null;
+        defer if (forwarded) |mime| self.allocator.free(mime);
+        try insert.bindBlob(4, if (target.reply) |reply| reply.mime else forwarded orelse envelope.mime);
+        try insert.bind(5, envelope.accepted_at);
+        try insert.bind(6, owner);
+        try insert.bind(7, @as([]const u8, if (target.forward_after == null) "pending" else "awaiting_local"));
+        _ = try insert.step();
+    }
+
+    pub fn reservedDeliveryBytes(self: *Database, mailbox: []const u8) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const stmt = try self.prepareLocked("SELECT COALESCE(SUM(queued_bytes),0) FROM accepted_mail_targets WHERE mailbox=?1 AND outcome='pending'");
+        defer stmt.finalize();
+        try stmt.bind(1, mailbox);
+        if (!try stmt.step()) return error.NotFound;
+        return @intCast(stmt.columnInt64(0));
+    }
+
+    pub fn finishQueuedDelivery(self: *Database, queue_id: []const u8, delivered: bool) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.execLocked("BEGIN IMMEDIATE");
+        errdefer self.execLocked("ROLLBACK") catch {};
+        if (std.mem.startsWith(u8, queue_id, "route-") and queue_id.len > 39 and queue_id[38] == '-') {
+            const ordinal = try std.fmt.parseInt(i64, queue_id[39..], 10);
+            const update = try self.prepareLocked("UPDATE accepted_mail_targets SET outcome=?3 WHERE delivery_id=?1 AND ordinal=?2 AND outcome='queued'");
+            defer update.finalize();
+            try update.bind(1, @as([]const u8, queue_id[6..38]));
+            try update.bind(2, ordinal);
+            try update.bind(3, @as([]const u8, if (delivered) "remote_delivered" else "remote_failed"));
+            _ = try update.step();
+        }
+        const remove = try self.prepareLocked("DELETE FROM message_queue WHERE id=?1");
+        defer remove.finalize();
+        try remove.bind(1, queue_id);
+        _ = try remove.step();
+        try self.execLocked("COMMIT");
+    }
+
+    pub const SenderRoute = enum { allow, allow_without_forward, review, decline };
+
+    pub const SenderReviewStatus = struct { enabled: bool = false, onboarding_pending: bool = false, pending: i64 = 0 };
+
+    pub fn senderReviewStatus(self: *Database, user: []const u8) !SenderReviewStatus {
+        const stmt = try self.prepare(
+            \\SELECT COALESCE(s.enabled,0),COALESCE(s.onboarding_pending,0),
+            \\       (SELECT COUNT(*) FROM sender_review_messages r WHERE r.user_id=u.id AND r.folder='Screening')
+            \\FROM users u LEFT JOIN sender_screening s ON s.user_id=u.id WHERE u.username=?1
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        if (!try stmt.step()) return error.NotFound;
+        return .{ .enabled = stmt.columnInt64(0) != 0, .onboarding_pending = stmt.columnInt64(1) != 0, .pending = stmt.columnInt64(2) };
+    }
+
+    pub const ScreeningSetting = enum { enable, disable, onboard };
+
+    /// The caller holds the mailbox lock so intake sees a single policy revision.
+    pub fn setSenderScreening(self: *Database, user: []const u8, setting: ScreeningSetting) !void {
+        if (setting == .onboard) {
+            const stmt = try self.prepare("UPDATE sender_screening SET enabled=1,onboarding_pending=0 WHERE user_id=(SELECT id FROM users WHERE username=?1) AND onboarding_pending=1");
+            defer stmt.finalize();
+            try stmt.bind(1, user);
+            _ = try stmt.step();
+            return;
+        }
+        const stmt = try self.prepare(
+            \\INSERT INTO sender_screening(user_id,enabled,onboarding_pending) SELECT id,?2,0 FROM users WHERE username=?1
+            \\ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled,onboarding_pending=0
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, @intFromBool(setting == .enable));
+        _ = try stmt.step();
+    }
+
+    pub const SenderDecision = enum { allow, decline, reset, recover };
+    pub const SenderDecisionScope = union(enum) {
+        author: struct { address: []const u8, revision: i64, forward: ?bool = null },
+        copy: struct { basename: []const u8, reference: []const u8, stamp: []const u8 },
+    };
+
+    /// Commit the future rule and the work for existing held copies together.
+    /// With a per-copy decision the caller has already checked its ETag and
+    /// stamped provenance. No future rule is created for that operation.
+    pub fn scheduleSenderDecision(self: *Database, user: []const u8, scope: SenderDecisionScope, decision: SenderDecision) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.execLocked("BEGIN IMMEDIATE");
+        errdefer self.execLocked("ROLLBACK") catch {};
+        const destination: []const u8 = switch (decision) {
+            .allow, .recover => "INBOX",
+            .decline => "Declined",
+            .reset => "Screening",
+        };
+        switch (scope) {
+            .copy => |copy| {
+                if (decision == .reset) return error.InvalidReviewDecision;
+                const stmt = try self.prepareLocked(
+                    \\UPDATE sender_review_messages SET next_folder=?3,reference=?4,
+                    \\  verified_author=(verified_author AND file_stamp<>''),file_stamp=?5,
+                    \\  operation=lower(hex(randomblob(16))),retry_at=0,
+                    \\  forward_release=(?6=1 AND NOT (verified_author=1 AND file_stamp<>'' AND EXISTS(
+                    \\    SELECT 1 FROM sender_screening_rules p JOIN sender_screening s ON s.user_id=p.user_id AND s.enabled=1
+                    \\    WHERE p.user_id=sender_review_messages.user_id AND p.author=sender_review_messages.author AND p.forward=0)))
+                    \\WHERE user_id=(SELECT id FROM users WHERE username=?1) AND basename=?2 AND operation IS NULL AND folder<>?3
+                );
+                defer stmt.finalize();
+                try stmt.bind(1, user);
+                try stmt.bind(2, copy.basename);
+                try stmt.bind(3, destination);
+                try stmt.bind(4, copy.reference);
+                try stmt.bind(5, copy.stamp);
+                try stmt.bind(6, @intFromBool(decision == .allow));
+                _ = try stmt.step();
+                if (sqlite.sqlite3_changes(self.db) == 0) return error.ReviewChanged;
+            },
+            .author => |author| {
+                if (decision == .recover) return error.InvalidReviewDecision;
+                const existing = try self.prepareLocked(
+                    \\SELECT COALESCE(p.revision,0),COALESCE(p.forward,1),EXISTS(
+                    \\  SELECT 1 FROM sender_review_messages r WHERE r.user_id=u.id AND r.author=?2 COLLATE NOCASE
+                    \\  AND r.verified_author=1 AND r.file_stamp<>'' AND r.operation IS NOT NULL)
+                    \\FROM users u LEFT JOIN sender_screening_rules p ON p.user_id=u.id AND p.author=?2 WHERE u.username=?1
+                );
+                defer existing.finalize();
+                try existing.bind(1, user);
+                try existing.bind(2, author.address);
+                if (!try existing.step() or existing.columnInt64(0) != author.revision) return error.ReviewChanged;
+                if (existing.columnInt64(2) != 0) return error.ReviewInProgress;
+                const forward = author.forward orelse (existing.columnInt64(1) != 0);
+                if (decision == .reset) {
+                    if (author.revision == 0) return error.ReviewChanged;
+                    const delete = try self.prepareLocked("DELETE FROM sender_screening_rules WHERE user_id=(SELECT id FROM users WHERE username=?1) AND author=?2");
+                    defer delete.finalize();
+                    try delete.bind(1, user);
+                    try delete.bind(2, author.address);
+                    _ = try delete.step();
+                } else {
+                    const rule = try self.prepareLocked(
+                        \\INSERT INTO sender_screening_rules(user_id,author,action,forward,revision)
+                        \\SELECT id,?2,?3,?4,(random() & 4503599627370495)+1 FROM users WHERE username=?1
+                        \\ON CONFLICT(user_id,author) DO UPDATE SET action=excluded.action,forward=excluded.forward,revision=excluded.revision
+                    );
+                    defer rule.finalize();
+                    try rule.bind(1, user);
+                    try rule.bind(2, author.address);
+                    try rule.bind(3, @as([]const u8, @tagName(decision)));
+                    try rule.bind(4, @intFromBool(forward));
+                    _ = try rule.step();
+                }
+                const copies = try self.prepareLocked(
+                    \\UPDATE sender_review_messages SET next_folder=?3,operation=lower(hex(randomblob(16))),forward_release=?4,retry_at=0
+                    \\WHERE user_id=(SELECT id FROM users WHERE username=?1) AND author=?2 COLLATE NOCASE AND verified_author=1 AND file_stamp<>'' AND folder<>?3
+                );
+                defer copies.finalize();
+                try copies.bind(1, user);
+                try copies.bind(2, author.address);
+                try copies.bind(3, destination);
+                try copies.bind(4, @intFromBool(forward and decision == .allow));
+                _ = try copies.step();
+            },
+        }
+        try self.execLocked("COMMIT");
+    }
+
+    pub const AttentionKind = enum { follow_up, saved, snoozed, muted, reminders };
+    pub const AttentionArrival = struct { own: ?[]const u8, parents_json: []const u8, automatic: bool };
+    pub const FiledCopy = struct {
+        basename: []const u8,
+        stamp: []const u8 = "",
+        size: ?usize = null,
+        attention: ?AttentionArrival = null,
+        notification_key: []const u8 = "",
+    };
+
+    pub fn finishReviewPlacement(self: *Database, user: []const u8, operation: []const u8, placed: ?FiledCopy) !void {
+        const stmt = try self.prepare(if (placed != null)
+            "UPDATE sender_review_messages SET folder=next_folder,file_stamp=?3,next_folder=NULL,operation=NULL,forward_release=0,retry_at=0 WHERE user_id=(SELECT id FROM users WHERE username=?1) AND operation=?2"
+        else
+            "DELETE FROM sender_review_messages WHERE user_id=(SELECT id FROM users WHERE username=?1) AND operation=?2");
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, operation);
+        if (placed) |file| try stmt.bind(3, file.stamp);
+        _ = try stmt.step();
+    }
+
+    pub fn senderRoute(self: *Database, mailbox: []const u8, verified_author: ?[]const u8) !SenderRoute {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const stmt = try self.prepareLocked(
+            \\SELECT r.action,r.forward FROM users u JOIN sender_screening s ON s.user_id=u.id AND s.enabled=1
+            \\LEFT JOIN sender_screening_rules r ON r.user_id=u.id AND r.author=?2 WHERE u.username=?1
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, mailbox);
+        try stmt.bindOpt(2, verified_author);
+        if (!try stmt.step()) return .allow;
+        if (stmt.columnIsNull(0)) return .review;
+        if (std.mem.eql(u8, stmt.columnText(0), "decline")) return .decline;
+        return if (stmt.columnInt64(1) != 0) .allow else .allow_without_forward;
+    }
+
+    pub const JunkDecision = enum { junk, not_junk };
+
+    pub fn junkPreference(self: *Database, user: []const u8, verified_author: []const u8) !?JunkDecision {
+        if (verified_author.len == 0) return null;
+        const stmt = try self.prepare(
+            \\SELECT action FROM mailbox_junk_feedback
+            \\WHERE user_id=(SELECT id FROM users WHERE username=?1) AND author=?2 AND author<>'' ORDER BY id DESC LIMIT 1
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, verified_author);
+        return if (try stmt.step()) std.meta.stringToEnum(JunkDecision, stmt.columnText(0)) else null;
+    }
+
+    pub fn junkSource(self: *Database, a: std.mem.Allocator, user: []const u8, reference: []const u8) !?[]const u8 {
+        const stmt = try self.prepare(
+            \\SELECT action,source_folder FROM mailbox_junk_feedback
+            \\WHERE user_id=(SELECT id FROM users WHERE username=?1) AND reference=?2 ORDER BY id DESC LIMIT 1
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, reference);
+        if (!try stmt.step() or !std.mem.eql(u8, stmt.columnText(0), "junk")) return null;
+        return try a.dupe(u8, stmt.columnText(1));
+    }
+
+    pub fn finishDeliveryTarget(self: *Database, id: []const u8, ordinal: i64, outcome: []const u8, filed: ?FiledCopy) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.execLocked("BEGIN IMMEDIATE");
+        errdefer self.execLocked("ROLLBACK") catch {};
+        const update = try self.prepareLocked("UPDATE accepted_mail_targets SET outcome=?3,queued_bytes=0,reply_mime=NULL WHERE delivery_id=?1 AND ordinal=?2 AND outcome='pending'");
+        defer update.finalize();
+        try update.bind(1, id);
+        try update.bind(2, ordinal);
+        try update.bind(3, outcome);
+        _ = try update.step();
+        if (sqlite.sqlite3_changes(self.db) == 0) return error.NotFound;
+        try self.releaseForwardTargetsLocked(id, ordinal, filed != null);
+        if (filed) |file| {
+            try self.recordPlacementLocked(id, ordinal, file);
+            const muted = try self.attentionArrivalLocked(id, ordinal, file.attention);
+            try self.stageDeliveryEffectsLocked(id, ordinal, file, muted);
+            try self.stageBrowserNotificationLocked(id, ordinal, file, muted);
+            const review = try self.prepareLocked(
+                \\INSERT OR IGNORE INTO sender_review_messages(user_id,basename,folder,envelope_from,author,verified_author,recipient,remote_addr,file_stamp,
+                \\  next_folder,operation,forward_release)
+                \\SELECT t.mailbox_id,?3,t.folder,COALESCE(t.reply_from,m.envelope_from),COALESCE(t.reply_author,m.author),m.verified_author OR t.reply_author IS NOT NULL,t.recipient,m.remote_addr,?4,
+                \\  CASE WHEN r.action='allow' THEN 'INBOX' WHEN r.action='decline' AND t.folder<>'Declined' THEN 'Declined'
+                \\       WHEN r.action IS NULL AND s.enabled=1 AND t.folder='Declined' THEN 'Screening' END,
+                \\  CASE WHEN r.action='allow' OR (r.action='decline' AND t.folder<>'Declined')
+                \\       OR (r.action IS NULL AND s.enabled=1 AND t.folder='Declined') THEN lower(hex(randomblob(16))) END,
+                \\  CASE WHEN r.action='allow' THEN r.forward ELSE 0 END
+                \\FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
+                \\LEFT JOIN sender_screening s ON s.user_id=t.mailbox_id
+                \\LEFT JOIN sender_screening_rules r ON r.user_id=t.mailbox_id AND r.author=COALESCE(t.reply_author,m.author) AND (m.verified_author=1 OR t.reply_author IS NOT NULL) AND s.enabled=1
+                \\WHERE t.delivery_id=?1 AND t.ordinal=?2 AND t.mailbox_id<>0 AND t.review_copy=1
+            );
+            defer review.finalize();
+            try review.bind(1, id);
+            try review.bind(2, ordinal);
+            try review.bind(3, file.basename);
+            try review.bind(4, file.stamp);
+            _ = try review.step();
+        }
+        try self.compactDeliveryLocked(id);
+        try self.execLocked("COMMIT");
+    }
+
+    pub const CategoryPolicy = struct { automatic: bool = false, destination: ?categories.Destination = null };
+
+    pub fn categoryPolicy(self: *Database, user: []const u8, author: []const u8) !CategoryPolicy {
+        const stmt = try self.prepare(
+            \\SELECT COALESCE(s.automatic,0),r.destination FROM users u
+            \\LEFT JOIN mail_category_settings s ON s.user_id=u.id
+            \\LEFT JOIN mail_category_rules r ON r.user_id=u.id AND r.author=?2
+            \\WHERE u.username=?1
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, author);
+        if (!try stmt.step()) return .{};
+        return .{
+            .automatic = stmt.columnInt64(0) != 0,
+            .destination = std.meta.stringToEnum(categories.Destination, stmt.columnText(1)),
+        };
+    }
+
+    pub fn setCategorySettings(self: *Database, user: []const u8, automatic: bool) !void {
+        const stmt = try self.prepare(
+            \\INSERT INTO mail_category_settings(user_id,automatic)
+            \\SELECT id,?2 FROM users WHERE username=?1
+            \\ON CONFLICT(user_id) DO UPDATE SET automatic=excluded.automatic
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, @intFromBool(automatic));
+        _ = try stmt.step();
+    }
+
+    pub fn setCategoryRule(self: *Database, user: []const u8, author: []const u8, destination: ?categories.Destination) !void {
+        const stmt = try self.prepare(if (destination != null)
+            \\INSERT INTO mail_category_rules(user_id,author,destination)
+            \\SELECT id,?2,?3 FROM users WHERE username=?1
+            \\ON CONFLICT(user_id,author) DO UPDATE SET destination=excluded.destination
+        else
+            "DELETE FROM mail_category_rules WHERE user_id=(SELECT id FROM users WHERE username=?1) AND author=?2");
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, author);
+        if (destination) |value| try stmt.bind(3, @tagName(value));
+        _ = try stmt.step();
+    }
+
+    fn recordPlacementLocked(self: *Database, id: []const u8, ordinal: i64, file: FiledCopy) !void {
+        if (file.stamp.len == 0) return;
+        const stmt = try self.prepareLocked(
+            \\INSERT INTO mailbox_message_refs(user_id,reference,folder,basename,file_stamp,intake_folder,placement_reason,verified_author)
+            \\SELECT t.mailbox_id,lower(hex(randomblob(16))),IIF(t.folder='new','INBOX',t.folder),?3,?4,
+            \\       IIF(t.folder='new','INBOX',t.folder),t.placement_reason,COALESCE(t.reply_author,IIF(m.verified_author=1,m.author,''))
+            \\FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
+            \\WHERE t.delivery_id=?1 AND t.ordinal=?2 AND t.mailbox_id<>0
+            \\      AND (t.folder IN ('new','Newsletters','Receipts') OR t.placement_reason IN ('junk_feedback','spam_filter'))
+            \\      AND (m.verified_author=1 OR t.placement_reason<>'' OR t.reply_author IS NOT NULL)
+            \\ON CONFLICT(user_id,folder,basename) DO UPDATE SET intake_folder=excluded.intake_folder,
+            \\  placement_reason=excluded.placement_reason,verified_author=excluded.verified_author
+            \\WHERE mailbox_message_refs.file_stamp=excluded.file_stamp
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, id);
+        try stmt.bind(2, ordinal);
+        try stmt.bind(3, file.basename);
+        try stmt.bind(4, file.stamp);
+        _ = try stmt.step();
+    }
+
+    fn stageDeliveryEffectsLocked(self: *Database, id: []const u8, ordinal: i64, file: FiledCopy, muted: bool) !void {
+        const effect = try self.prepareLocked(
+            \\INSERT OR IGNORE INTO accepted_mail_effects(delivery_id,ordinal,filename,size,notified)
+            \\SELECT t.delivery_id,t.ordinal,?3,COALESCE(?6,length(m.mime)+t.verified_forward*?5),?4 OR NOT (t.is_primary AND t.folder='new')
+            \\FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
+            \\WHERE t.delivery_id=?1 AND t.ordinal=?2 AND t.folder IN ('new','Newsletters','Receipts') AND t.outcome='filed'
+        );
+        defer effect.finalize();
+        try effect.bind(1, id);
+        try effect.bind(2, ordinal);
+        try effect.bind(3, file.basename);
+        try effect.bind(4, @intFromBool(muted));
+        try effect.bind(5, forwarding_wire.loop_header.len);
+        try effect.bindOpt(6, file.size);
+        _ = try effect.step();
+    }
+
+    pub const NotificationRule = enum { default, notify, quiet };
+    pub const NotificationScope = enum { sender, thread };
+    pub const NotificationRules = struct {
+        verified_author: []const u8,
+        sender: NotificationRule = .default,
+        thread: NotificationRule = .default,
+    };
+
+    pub fn browserNotificationsEnabled(self: *Database, username: []const u8) !bool {
+        const stmt = try self.prepare("SELECT s.enabled FROM mail_notification_settings s JOIN users u ON u.id=s.user_id WHERE u.username=?1");
+        defer stmt.finalize();
+        try stmt.bind(1, username);
+        return try stmt.step() and stmt.columnInt64(0) != 0;
+    }
+
+    pub fn setBrowserNotifications(self: *Database, username: []const u8, enabled: bool) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.execLocked("BEGIN IMMEDIATE");
+        errdefer self.execLocked("ROLLBACK") catch {};
+        const setting = try self.prepareLocked(
+            \\INSERT INTO mail_notification_settings(user_id,enabled) SELECT id,?2 FROM users WHERE username=?1
+            \\ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled
+        );
+        defer setting.finalize();
+        try setting.bind(1, username);
+        try setting.bind(2, @intFromBool(enabled));
+        _ = try setting.step();
+        if (!enabled) {
+            const clear = try self.prepareLocked("UPDATE mail_notification_events SET claimed_at=unixepoch() WHERE user_id=(SELECT id FROM users WHERE username=?1) AND claimed_at IS NULL");
+            defer clear.finalize();
+            try clear.bind(1, username);
+            _ = try clear.step();
+        }
+        try self.execLocked("COMMIT");
+    }
+
+    const notification_thread_match =
+        " AND (reference=?2 OR EXISTS(SELECT 1 FROM json_each(wire_ids) a JOIN json_each(?3) b USING(value)))";
+
+    pub fn browserNotificationRules(self: *Database, username: []const u8, reference: []const u8, keys: []const u8, author: []const u8) !NotificationRules {
+        var rules: NotificationRules = .{ .verified_author = author };
+        {
+            const stmt = try self.prepare(
+                "SELECT rule FROM mail_notification_threads WHERE user_id=(SELECT id FROM users WHERE username=?1)" ++
+                    notification_thread_match ++ " ORDER BY rowid DESC LIMIT 1",
+            );
+            defer stmt.finalize();
+            try stmt.bind(1, username);
+            try stmt.bind(2, reference);
+            try stmt.bind(3, keys);
+            if (try stmt.step()) rules.thread = std.meta.stringToEnum(NotificationRule, stmt.columnText(0)) orelse .default;
+        }
+        if (author.len > 0) {
+            const stmt = try self.prepare("SELECT rule FROM mail_notification_senders WHERE user_id=(SELECT id FROM users WHERE username=?1) AND author=?2");
+            defer stmt.finalize();
+            try stmt.bind(1, username);
+            try stmt.bind(2, author);
+            if (try stmt.step()) rules.sender = std.meta.stringToEnum(NotificationRule, stmt.columnText(0)) orelse .default;
+        }
+        return rules;
+    }
+
+    pub fn setBrowserNotificationRule(self: *Database, username: []const u8, reference: []const u8, keys: []const u8, author: []const u8, scope: NotificationScope, rule: NotificationRule) !void {
+        if (scope == .sender) {
+            if (author.len == 0) return error.UnverifiedSender;
+            const stmt = try self.prepare(if (rule == .default)
+                "DELETE FROM mail_notification_senders WHERE user_id=(SELECT id FROM users WHERE username=?1) AND author=?2"
+            else
+                \\INSERT INTO mail_notification_senders(user_id,author,rule) SELECT id,?2,?3 FROM users WHERE username=?1
+                \\ON CONFLICT(user_id,author) DO UPDATE SET rule=excluded.rule
+            );
+            defer stmt.finalize();
+            try stmt.bind(1, username);
+            try stmt.bind(2, author);
+            if (rule != .default) try stmt.bind(3, @tagName(rule));
+            _ = try stmt.step();
+            return;
+        }
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.execLocked("BEGIN IMMEDIATE");
+        errdefer self.execLocked("ROLLBACK") catch {};
+        const combined = if (rule != .default) blk: {
+            const existing = try self.prepareLocked(
+                \\SELECT json_group_array(value) FROM (
+                \\    SELECT value FROM json_each(?3)
+                \\    UNION
+                \\    SELECT j.value FROM mail_notification_threads n, json_each(n.wire_ids) j
+                \\    WHERE n.user_id=(SELECT id FROM users WHERE username=?1)
+                ++ notification_thread_match ++ " LIMIT 192)",
+            );
+            defer existing.finalize();
+            try existing.bind(1, username);
+            try existing.bind(2, reference);
+            try existing.bind(3, keys);
+            if (!try existing.step()) return error.DatabaseError;
+            break :blk try self.allocator.dupe(u8, existing.columnText(0));
+        } else null;
+        defer if (combined) |value| self.allocator.free(value);
+        const clear = try self.prepareLocked(
+            "DELETE FROM mail_notification_threads WHERE user_id=(SELECT id FROM users WHERE username=?1)" ++ notification_thread_match,
+        );
+        defer clear.finalize();
+        try clear.bind(1, username);
+        try clear.bind(2, reference);
+        try clear.bind(3, keys);
+        _ = try clear.step();
+        if (combined) |value| {
+            const insert = try self.prepareLocked(
+                "INSERT INTO mail_notification_threads(user_id,reference,wire_ids,rule) SELECT id,?2,?3,?4 FROM users WHERE username=?1",
+            );
+            defer insert.finalize();
+            try insert.bind(1, username);
+            try insert.bind(2, reference);
+            try insert.bind(3, value);
+            try insert.bind(4, @tagName(rule));
+            _ = try insert.step();
+        }
+        try self.execLocked("COMMIT");
+    }
+
+    const notification_rule =
+        \\ AND COALESCE(
+        \\  (SELECT t.rule FROM mail_notification_threads t WHERE t.user_id=n.user_id
+        \\   AND EXISTS(SELECT 1 FROM json_each(t.wire_ids) WHERE value=n.own_id OR value IN (SELECT value FROM json_each(n.parents_json)))
+        \\   ORDER BY t.rowid DESC LIMIT 1),
+        \\  (SELECT s.rule FROM mail_notification_senders s WHERE s.user_id=n.user_id AND s.author=n.author),
+        \\  IIF(n.folder='new','notify','quiet'))='notify'
+    ;
+
+    fn stageBrowserNotificationLocked(self: *Database, id: []const u8, ordinal: i64, file: FiledCopy, muted: bool) !void {
+        const own = if (file.attention) |item| item.own else null;
+        const parents = if (file.attention) |item| item.parents_json else "[]";
+        if (own != null and !std.mem.eql(u8, parents, "[]")) {
+            const learn = try self.prepareLocked(
+                \\UPDATE mail_notification_threads AS n SET wire_ids=json_insert(wire_ids,'$[#]',?3)
+                \\WHERE n.user_id=(SELECT mailbox_id FROM accepted_mail_targets
+                \\  WHERE delivery_id=?1 AND ordinal=?2 AND folder IN ('new','Newsletters','Receipts'))
+                \\  AND json_array_length(wire_ids)<192 AND ?3 NOT IN (SELECT value FROM json_each(wire_ids))
+                \\  AND EXISTS(SELECT 1 FROM json_each(wire_ids) a JOIN json_each(?4) b USING(value))
+            );
+            defer learn.finalize();
+            try learn.bind(1, id);
+            try learn.bind(2, ordinal);
+            try learn.bindOpt(3, own);
+            try learn.bind(4, parents);
+            _ = try learn.step();
+        }
+        if (muted or file.notification_key.len == 0) return;
+        const record = try self.prepareLocked(
+            \\WITH n AS (
+            \\ SELECT t.mailbox_id AS user_id, IIF(m.verified_author=1,'v:','u:')||lower(m.author)||':'||?3 AS event_key,
+            \\  t.folder, IIF(m.verified_author=1,m.author,'') AS author, ?4 AS own_id, ?5 AS parents_json
+            \\ FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
+            \\ JOIN mail_notification_settings prefs ON prefs.user_id=t.mailbox_id AND prefs.enabled=1
+            \\ WHERE t.delivery_id=?1 AND t.ordinal=?2 AND t.folder IN ('new','Newsletters','Receipts')
+            \\   AND (m.verified_author=0 OR m.author<>t.mailbox COLLATE NOCASE)
+            \\)
+            \\INSERT OR IGNORE INTO mail_notification_events(user_id,event_key,folder,author,own_id,parents_json,created_at)
+            \\SELECT user_id,event_key,folder,author,own_id,parents_json,unixepoch() FROM n WHERE 1
+            ++ notification_rule,
+        );
+        defer record.finalize();
+        try record.bind(1, id);
+        try record.bind(2, ordinal);
+        try record.bind(3, file.notification_key);
+        try record.bindOpt(4, own);
+        try record.bind(5, parents);
+        _ = try record.step();
+    }
+
+    /// One database claim per delivery across tabs, restarts and devices.
+    /// Return only opaque notification IDs. Mail data stays in the mailbox.
+    pub fn claimBrowserNotifications(self: *Database, a: std.mem.Allocator, username: []const u8) ![]i64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.execLocked("BEGIN IMMEDIATE");
+        errdefer self.execLocked("ROLLBACK") catch {};
+        const stmt = try self.prepareLocked(
+            \\SELECT n.id, (NOT EXISTS(SELECT 1 FROM mail_attention m WHERE m.user_id=n.user_id
+            \\     AND (m.kind='muted' OR (m.kind='snoozed' AND m.deadline>unixepoch()))
+            \\     AND EXISTS(SELECT 1 FROM json_each(m.wire_ids) WHERE value=n.own_id OR value IN (SELECT value FROM json_each(n.parents_json))))
+            ++ notification_rule ++
+                \\)
+                \\FROM mail_notification_events n
+                \\JOIN users u ON u.id=n.user_id JOIN mail_notification_settings s ON s.user_id=n.user_id AND s.enabled=1
+                \\WHERE u.username=?1 AND n.claimed_at IS NULL AND n.created_at>=unixepoch()-180
+                \\ORDER BY n.id LIMIT 10
+            ,
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, username);
+        var ids: std.ArrayList(i64) = .empty;
+        var last: ?i64 = null;
+        while (try stmt.step()) {
+            last = stmt.columnInt64(0);
+            if (stmt.columnInt64(1) != 0) try ids.append(a, last.?);
+        }
+        // Retire muted or silenced arrivals alongside the advertised IDs, so
+        // a later policy change cannot turn an older delivery into an alert.
+        if (last) |id| {
+            const claim = try self.prepareLocked("UPDATE mail_notification_events SET claimed_at=unixepoch() WHERE user_id=(SELECT id FROM users WHERE username=?1) AND claimed_at IS NULL AND id<=?2");
+            defer claim.finalize();
+            try claim.bind(1, username);
+            try claim.bind(2, id);
+            _ = try claim.step();
+        }
+        const result = try ids.toOwnedSlice(a);
+        try self.execLocked("COMMIT");
+        return result;
+    }
+
+    const attention_match = " AND (reference=?3 OR (?4 AND EXISTS(SELECT 1 FROM json_each(wire_ids) a JOIN json_each(?5) b USING(value)))";
+
+    // Call with the mailbox lock so a reply and a user's update have a single
+    // ordering shared with Maildir publication.
+    pub fn changeAttention(self: *Database, user: []const u8, reference: []const u8, kind: AttentionKind, enabled: bool, deadline: i64, changed_ms: i64, keys: []const u8, waiting_id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.execLocked("BEGIN IMMEDIATE");
+        errdefer self.execLocked("ROLLBACK") catch {};
+        if (enabled and kind == .reminders) {
+            const earlier = try self.prepareLocked("SELECT 1 FROM mail_attention_replies WHERE user_id=(SELECT id FROM users WHERE username=?1) AND parent_id=?2");
+            defer earlier.finalize();
+            try earlier.bind(1, user);
+            try earlier.bind(2, waiting_id);
+            if (try earlier.step()) return error.AlreadyReplied;
+        }
+        const threads = kind != .saved and kind != .reminders;
+        const combined: ?[]const u8 = if (enabled and threads) blk: {
+            const s = try self.prepareLocked(
+                \\SELECT json_group_array(value) FROM (
+                \\  SELECT value FROM json_each(?5)
+                \\  UNION ALL
+                \\  SELECT DISTINCT j.value FROM mail_attention m, json_each(m.wire_ids) j
+                \\  WHERE m.user_id=(SELECT id FROM users WHERE username=?1) AND m.kind=?2
+                ++ attention_match ++
+                    ") AND j.value NOT IN (SELECT value FROM json_each(?5)) LIMIT 192)",
+            );
+            defer s.finalize();
+            try s.bind(1, user);
+            try s.bind(2, @tagName(kind));
+            try s.bind(3, reference);
+            try s.bind(4, @as(u8, 1));
+            try s.bind(5, keys);
+            if (!try s.step()) return error.NotFound;
+            break :blk try self.allocator.dupe(u8, s.columnText(0));
+        } else null;
+        defer if (combined) |value| self.allocator.free(value);
+        const previous = try self.prepareLocked(
+            "DELETE FROM mail_attention WHERE user_id=(SELECT id FROM users WHERE username=?1) AND kind=?2" ++ attention_match ++
+                " OR (kind='reminders' AND waiting_id=?6 AND ?6<>''))",
+        );
+        defer previous.finalize();
+        try previous.bind(1, user);
+        try previous.bind(2, @tagName(kind));
+        try previous.bind(3, reference);
+        try previous.bind(4, @intFromBool(threads));
+        try previous.bind(5, keys);
+        try previous.bind(6, waiting_id);
+        _ = try previous.step();
+        if (enabled) {
+            const insert = try self.prepareLocked(
+                \\INSERT INTO mail_attention(user_id,reference,kind,deadline,changed_ms,wire_ids,waiting_id)
+                \\SELECT id,?2,?3,?4,?5,?6,?7 FROM users WHERE username=?1
+            );
+            defer insert.finalize();
+            try insert.bind(1, user);
+            try insert.bind(2, reference);
+            try insert.bind(3, @tagName(kind));
+            try insert.bind(4, deadline);
+            try insert.bind(5, changed_ms);
+            try insert.bind(6, combined orelse keys);
+            try insert.bind(7, waiting_id);
+            _ = try insert.step();
+        }
+        try self.execLocked("COMMIT");
+    }
+
+    pub fn clearFollowUp(self: *Database, user: []const u8, reference: []const u8, keys: []const u8, before_ms: i64) !void {
+        const stmt = try self.prepare(
+            "DELETE FROM mail_attention WHERE user_id=(SELECT id FROM users WHERE username=?1) AND kind=?2 AND changed_ms<=?6" ++ attention_match ++ ")",
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, @as([]const u8, "follow_up"));
+        try stmt.bind(3, reference);
+        try stmt.bind(4, @as(u8, 1));
+        try stmt.bind(5, keys);
+        try stmt.bind(6, before_ms);
+        _ = try stmt.step();
+    }
+
+    fn attentionArrivalLocked(self: *Database, id: []const u8, ordinal: i64, attention: ?AttentionArrival) !bool {
+        const arrival = attention orelse return false;
+        const event = try self.prepareLocked(
+            \\SELECT t.mailbox_id,m.accepted_ms,m.author<>t.mailbox COLLATE NOCASE
+            \\FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
+            \\WHERE t.delivery_id=?1 AND t.ordinal=?2 AND t.mailbox_id<>0 AND t.folder IN ('new','Newsletters','Receipts')
+        );
+        defer event.finalize();
+        try event.bind(1, id);
+        try event.bind(2, ordinal);
+        if (!try event.step()) return false;
+        const user = event.columnInt64(0);
+        const received = event.columnInt64(1);
+        const has_parents = !std.mem.eql(u8, arrival.parents_json, "[]");
+        if (has_parents and !arrival.automatic and event.columnInt64(2) != 0) {
+            const reply = try self.prepareLocked(
+                \\INSERT INTO mail_attention_replies(user_id,parent_id,last_ms) SELECT ?1,value,?2 FROM json_each(?3) WHERE 1
+                \\ON CONFLICT(user_id,parent_id) DO UPDATE SET last_ms=MAX(last_ms,excluded.last_ms)
+            );
+            defer reply.finalize();
+            try reply.bind(1, user);
+            try reply.bind(2, received);
+            try reply.bind(3, arrival.parents_json);
+            _ = try reply.step();
+            const wake = try self.prepareLocked(
+                \\DELETE FROM mail_attention AS m WHERE m.user_id=?1 AND m.changed_ms<=?2 AND (
+                \\ (m.kind='snoozed' AND EXISTS(SELECT 1 FROM json_each(m.wire_ids) a JOIN json_each(?3) b USING(value))) OR
+                \\ (m.kind='reminders' AND m.waiting_id IN (SELECT value FROM json_each(?3))))
+            );
+            defer wake.finalize();
+            try wake.bind(1, user);
+            try wake.bind(2, received);
+            try wake.bind(3, arrival.parents_json);
+            _ = try wake.step();
+        }
+        if (has_parents) if (arrival.own) |own| {
+            const learn = try self.prepareLocked(
+                \\UPDATE mail_attention AS m SET wire_ids=json_insert(wire_ids,'$[#]',?3)
+                \\WHERE m.user_id=?1 AND m.kind IN ('muted','snoozed','follow_up') AND json_array_length(wire_ids)<192
+                \\  AND ?3 NOT IN (SELECT value FROM json_each(wire_ids))
+                \\  AND EXISTS(SELECT 1 FROM json_each(m.wire_ids) a JOIN json_each(?2) b USING(value))
+            );
+            defer learn.finalize();
+            try learn.bind(1, user);
+            try learn.bind(2, arrival.parents_json);
+            try learn.bind(3, own);
+            _ = try learn.step();
+        };
+        const mute = try self.prepareLocked(
+            \\SELECT 1 FROM mail_attention AS m WHERE m.user_id=?1
+            \\AND (m.kind='muted' OR (m.kind='snoozed' AND m.deadline>unixepoch()))
+            \\AND EXISTS(SELECT 1 FROM json_each(m.wire_ids) WHERE value=?3 OR value IN (SELECT value FROM json_each(?2))) LIMIT 1
+        );
+        defer mute.finalize();
+        try mute.bind(1, user);
+        try mute.bind(2, arrival.parents_json);
+        try mute.bindOpt(3, arrival.own);
+        return mute.step();
+    }
+
+    fn releaseForwardTargetsLocked(self: *Database, id: []const u8, ordinal: i64, filed: bool) !void {
+        const outbound_target = try self.prepareLocked("SELECT 1 FROM accepted_mail_targets WHERE delivery_id=?1 AND forward_after=?2 AND outcome='queued' LIMIT 1");
+        defer outbound_target.finalize();
+        try outbound_target.bind(1, id);
+        try outbound_target.bind(2, ordinal);
+        if (try outbound_target.step()) {
+            const filters = " WHERE status='awaiting_local' AND id IN (SELECT 'route-'||delivery_id||'-'||ordinal FROM accepted_mail_targets WHERE delivery_id=?1 AND forward_after=?2 AND outcome='queued')";
+            const remote = try self.prepareLocked(if (filed) "UPDATE message_queue SET status='pending'" ++ filters else "DELETE FROM message_queue" ++ filters);
+            defer remote.finalize();
+            try remote.bind(1, id);
+            try remote.bind(2, ordinal);
+            _ = try remote.step();
+        }
+        const local = try self.prepareLocked(
+            if (filed) "UPDATE accepted_mail_targets SET forward_after=NULL WHERE delivery_id=?1 AND forward_after=?2" else "UPDATE accepted_mail_targets SET outcome='forward_source_removed',queued_bytes=0,reply_mime=NULL WHERE delivery_id=?1 AND forward_after=?2 AND outcome IN ('pending','queued')",
+        );
+        defer local.finalize();
+        try local.bind(1, id);
+        try local.bind(2, ordinal);
+        _ = try local.step();
+    }
+
+    fn compactDeliveryLocked(self: *Database, id: []const u8) !void {
+        const stmt = try self.prepareLocked("UPDATE accepted_mail SET complete=1,mime=x'' WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM accepted_mail_targets WHERE delivery_id=?1 AND outcome='pending')");
+        defer stmt.finalize();
+        try stmt.bind(1, id);
+        _ = try stmt.step();
+    }
+
+    pub const PendingDelivery = struct {
+        id: []const u8,
+        ordinal: i64,
+        mailbox: []const u8,
+        folder: []const u8,
+        mime: []const u8,
+        accepted_ms: i64,
+        mailbox_removed: bool,
+        attempts: u8,
+        review_copy: bool,
+        track_placement: bool,
+    };
+
+    pub fn pendingDelivery(self: *Database, a: std.mem.Allocator, id: ?[]const u8, now: i64) !?PendingDelivery {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const selection =
+            \\SELECT m.id,t.ordinal,t.mailbox,t.folder,COALESCE(t.reply_mime,m.mime),m.accepted_ms,
+            \\       t.mailbox_id<>0 AND NOT EXISTS (SELECT 1 FROM users WHERE id=t.mailbox_id AND username=t.mailbox),t.attempts,t.review_copy,
+            \\       t.mailbox_id<>0 AND (t.folder IN ('new','Newsletters','Receipts') OR t.placement_reason IN ('junk_feedback','spam_filter'))
+            \\          AND (m.verified_author=1 OR t.placement_reason<>'' OR t.reply_author IS NOT NULL),t.verified_forward
+            \\FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
+            \\WHERE t.outcome='pending' AND t.forward_after IS NULL AND t.retry_at<=?1
+        ;
+        const stmt = try self.prepareLocked(if (id != null)
+            selection ++ " AND t.delivery_id=?2 ORDER BY t.ordinal LIMIT 1"
+        else
+            selection ++ " ORDER BY t.retry_at,t.delivery_id,t.ordinal LIMIT 1");
+        defer stmt.finalize();
+        try stmt.bind(1, now);
+        if (id) |value| try stmt.bind(2, value);
+        if (!try stmt.step()) return null;
+        return .{
+            .id = try a.dupe(u8, stmt.columnText(0)),
+            .ordinal = stmt.columnInt64(1),
+            .mailbox = try a.dupe(u8, stmt.columnText(2)),
+            .folder = try a.dupe(u8, stmt.columnText(3)),
+            .mime = if (stmt.columnInt64(10) != 0) try std.mem.concat(a, u8, &.{ forwarding_wire.loop_header, stmt.columnBlob(4) }) else try a.dupe(u8, stmt.columnBlob(4)),
+            .accepted_ms = stmt.columnInt64(5),
+            .mailbox_removed = stmt.columnInt64(6) != 0,
+            .attempts = @intCast(stmt.columnInt64(7)),
+            .review_copy = stmt.columnInt64(8) != 0,
+            .track_placement = stmt.columnInt64(9) != 0,
+        };
+    }
+
+    pub fn delayDeliveryTarget(self: *Database, target: PendingDelivery, retry_at: i64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const stmt = try self.prepareLocked("UPDATE accepted_mail_targets SET retry_at=?3,attempts=MIN(attempts+1,8) WHERE delivery_id=?1 AND ordinal=?2 AND outcome='pending'");
+        defer stmt.finalize();
+        try stmt.bind(1, target.id);
+        try stmt.bind(2, target.ordinal);
+        try stmt.bind(3, retry_at);
+        _ = try stmt.step();
+    }
+
+    pub fn sweepDeliveryJournal(self: *Database, before: i64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const stmt = try self.prepareLocked("DELETE FROM accepted_mail WHERE id IN (SELECT id FROM accepted_mail WHERE complete=1 AND accepted_at<?1 LIMIT 500)");
+        defer stmt.finalize();
+        try stmt.bind(1, before);
+        _ = try stmt.step();
+        const replies = try self.prepareLocked("DELETE FROM mail_attention_replies WHERE rowid IN (SELECT rowid FROM mail_attention_replies WHERE last_ms<?1 LIMIT 500)");
+        defer replies.finalize();
+        try replies.bind(1, (before - 90 * 86400) * 1000);
+        _ = try replies.step();
+        const notices = try self.prepareLocked("DELETE FROM mail_notification_events WHERE id IN (SELECT id FROM mail_notification_events WHERE created_at<?1 LIMIT 500)");
+        defer notices.finalize();
+        try notices.bind(1, before);
+        _ = try notices.step();
+        const replies_sent = try self.prepareLocked("DELETE FROM mailbox_vacation_sends WHERE rowid IN (SELECT rowid FROM mailbox_vacation_sends WHERE accepted_at<=?1 LIMIT 500)");
+        defer replies_sent.finalize();
+        try replies_sent.bind(1, before);
+        _ = try replies_sent.step();
+        const feedback = try self.prepareLocked(
+            \\DELETE FROM mailbox_junk_feedback WHERE id IN (
+            \\ SELECT f.id FROM mailbox_junk_feedback f WHERE f.created_at<?1
+            \\ AND (f.author='' OR EXISTS(SELECT 1 FROM mailbox_junk_feedback newer
+            \\      WHERE newer.user_id=f.user_id AND newer.author=f.author AND newer.author<>'' AND newer.id>f.id AND newer.created_at<?1))
+            \\ AND (NOT EXISTS(SELECT 1 FROM mailbox_message_refs m WHERE m.user_id=f.user_id AND m.reference=f.reference)
+            \\      OR EXISTS(SELECT 1 FROM mailbox_junk_feedback newer WHERE newer.user_id=f.user_id AND newer.reference=f.reference AND newer.id>f.id AND newer.created_at<?1))
+            \\ LIMIT 500
+            \\)
+        );
+        defer feedback.finalize();
+        try feedback.bind(1, before);
+        _ = try feedback.step();
+    }
+
+    pub const DeliveryEffect = struct {
+        id: []const u8,
+        ordinal: i64,
+        recipient: []const u8,
+        mailbox: []const u8,
+        mailbox_removed: bool,
+        filename: []const u8,
+        folder: []const u8,
+        size: usize,
+        from: []const u8,
+        remote_addr: []const u8,
+        accepted_at: i64,
+        index_pending: bool,
+        notice_pending: bool,
+    };
+
+    pub fn nextDeliveryEffect(self: *Database, a: std.mem.Allocator) !?DeliveryEffect {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const stmt = try self.prepareLocked(
+            \\SELECT e.delivery_id,e.ordinal,t.recipient,COALESCE(u.username,t.mailbox),t.mailbox_id<>0 AND u.id IS NULL,e.filename,e.size,
+            \\       COALESCE(t.reply_from,m.envelope_from),m.remote_addr,m.accepted_at,e.indexed=0,e.notified=0,t.folder
+            \\FROM accepted_mail_effects e JOIN accepted_mail_targets t USING(delivery_id,ordinal)
+            \\JOIN accepted_mail m ON m.id=e.delivery_id LEFT JOIN users u ON u.id=t.mailbox_id
+            \\WHERE e.indexed=0 OR e.notified=0 ORDER BY e.delivery_id,e.ordinal LIMIT 1
+        );
+        defer stmt.finalize();
+        if (!try stmt.step()) return null;
+        return .{
+            .id = try a.dupe(u8, stmt.columnText(0)),
+            .ordinal = stmt.columnInt64(1),
+            .recipient = try a.dupe(u8, stmt.columnText(2)),
+            .mailbox = try a.dupe(u8, stmt.columnText(3)),
+            .mailbox_removed = stmt.columnInt64(4) != 0,
+            .filename = try a.dupe(u8, stmt.columnText(5)),
+            .size = @intCast(stmt.columnInt64(6)),
+            .from = try a.dupe(u8, stmt.columnText(7)),
+            .remote_addr = try a.dupe(u8, stmt.columnText(8)),
+            .accepted_at = stmt.columnInt64(9),
+            .index_pending = stmt.columnInt64(10) != 0,
+            .notice_pending = stmt.columnInt64(11) != 0,
+            .folder = try a.dupe(u8, stmt.columnText(12)),
+        };
+    }
+
+    pub fn finishDeliveryEffect(self: *Database, effect: DeliveryEffect) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const stmt = try self.prepareLocked("UPDATE accepted_mail_effects SET indexed=1,notified=1 WHERE delivery_id=?1 AND ordinal=?2");
+        defer stmt.finalize();
+        try stmt.bind(1, effect.id);
+        try stmt.bind(2, effect.ordinal);
+        _ = try stmt.step();
+    }
+
+    pub fn retryAcceptedDeliveriesOnStartup(self: *Database, now: i64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const stmt = try self.prepareLocked("UPDATE accepted_mail_targets SET retry_at=?1 WHERE outcome='pending' AND retry_at>?1");
+        defer stmt.finalize();
+        try stmt.bind(1, now);
+        _ = try stmt.step();
     }
 
     pub fn createUser(
@@ -1662,6 +3648,9 @@ pub const Database = struct {
 
         try self.execLocked("BEGIN IMMEDIATE");
         errdefer self.execLocked("ROLLBACK") catch {};
+        // Older webmail tables reference username without ON UPDATE CASCADE.
+        // Rewrite both sides inside one transaction and validate at commit.
+        try self.execLocked("PRAGMA defer_foreign_keys=ON");
 
         // `substr(x, 1, length(x) - <old_len>) || <suffix>` rebuilds the address
         // from its local part, so a local part containing '@' survives intact.
@@ -1670,6 +3659,9 @@ pub const Database = struct {
             "UPDATE users SET email = substr(email, 1, length(email) - ?3) || ?2 WHERE email LIKE ?1 ESCAPE '\\'",
             "UPDATE imap_mailboxes SET username = substr(username, 1, length(username) - ?3) || ?2 WHERE username LIKE ?1 ESCAPE '\\'",
             "UPDATE imap_uids SET username = substr(username, 1, length(username) - ?3) || ?2 WHERE username LIKE ?1 ESCAPE '\\'",
+            "UPDATE provisioned_mailboxes SET mailbox = substr(mailbox, 1, length(mailbox) - ?3) || ?2 WHERE mailbox LIKE ?1 ESCAPE '\\'",
+            "UPDATE provisioning_operations SET mailbox = substr(mailbox, 1, length(mailbox) - ?3) || ?2 WHERE mailbox LIKE ?1 ESCAPE '\\'",
+            "UPDATE accepted_mail_targets SET mailbox = substr(mailbox, 1, length(mailbox) - ?3) || ?2 WHERE outcome = 'pending' AND mailbox LIKE ?1 ESCAPE '\\'",
         };
 
         var moved: u32 = 0;
@@ -1688,6 +3680,18 @@ pub const Database = struct {
             if (i == 0) moved = @intCast(sqlite.sqlite3_changes(self.db));
         }
 
+        for ([_][]const u8{ "webmail_records", "webmail_uploads" }) |table| {
+            if (!try self.schemaHasTableLocked(table)) continue;
+            const sql = try std.fmt.allocPrint(self.allocator, "UPDATE {s} SET username=substr(username,1,length(username)-?3)||?2 WHERE username LIKE ?1 ESCAPE '\\'", .{table});
+            defer self.allocator.free(sql);
+            const update = try self.prepareLocked(sql);
+            defer update.finalize();
+            try update.bind(1, pattern);
+            try update.bind(2, suffix);
+            try update.bind(3, old_len);
+            _ = try update.step();
+        }
+
         // Sessions and reset links carry the old address, so they are voided
         // rather than rewritten. Both are cheap to obtain again.
         for ([_][:0]const u8{
@@ -1701,9 +3705,22 @@ pub const Database = struct {
             try checkBind(sqlite3_bind_text_raw(stmt, 1, pattern.ptr, @intCast(pattern.len), SQLITE_TRANSIENT_PTR));
             if (sqlite.sqlite3_step(stmt) != sqlite.SQLITE_DONE) return DatabaseError.StepFailed;
         }
+        if (try self.schemaHasTableLocked("password_reset_tokens")) {
+            const delete = try self.prepareLocked("DELETE FROM password_reset_tokens WHERE username LIKE ?1 ESCAPE '\\'");
+            defer delete.finalize();
+            try delete.bind(1, pattern);
+            _ = try delete.step();
+        }
 
         try self.execLocked("COMMIT");
         return moved;
+    }
+
+    fn schemaHasTableLocked(self: *Database, name: []const u8) !bool {
+        const statement = try self.prepareLocked("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1");
+        defer statement.finalize();
+        try statement.bind(1, name);
+        return statement.step();
     }
 
     // ── IMAP UID persistence ──────────────────────────────────────────
@@ -1796,6 +3813,22 @@ pub const Database = struct {
             return sqlite.sqlite3_column_int64(stmt, 0);
         }
         return null;
+    }
+
+    /// Resolve a client-visible UID within one account and mailbox.
+    pub fn getFilenameForUid(self: *Database, allocator: std.mem.Allocator, user: []const u8, mailbox: []const u8, uid: i64) !?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const stmt = try self.prepareLocked(
+            "SELECT filename FROM imap_uids WHERE username = ? AND mailbox = ? AND uid = ?",
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, mailbox);
+        try stmt.bind(3, uid);
+        if (!try stmt.step()) return null;
+        return try allocator.dupe(u8, stmt.columnText(0));
     }
 
     /// Bulk getUidForFile/assignUid for an entire mailbox: one lock, one
@@ -2172,3 +4205,89 @@ pub const Database = struct {
         return 1;
     }
 };
+
+test "hosted sending allowance rolls over at midnight UTC and survives provisioning revisions" {
+    const t = std.testing;
+    var db = try Database.init(t.allocator, ":memory:");
+    defer db.deinit();
+
+    var change: Database.ProvisioningChange = .{
+        .mailbox = "limit@example.test",
+        .actor = "signup-owned-limit",
+        .operation_id = "signup-daily-limit",
+        .revision = 1,
+        .quota_bytes = 1024,
+        .send_recipients_per_day = 2,
+        .enabled = true,
+        .initial_password_hash = "test-only-hash",
+        .initial_recovery = "limit@recovery.test",
+    };
+    _ = try db.applyProvisioning(change);
+    change.send_recipients_per_day = 3;
+    try t.expectError(error.OperationConflict, db.applyProvisioning(change));
+    try t.expectError(error.HostedSendingLimit, db.chargeHostedSend(change.mailbox, 3, 86399));
+    try db.chargeHostedSend(change.mailbox, 2, 86399);
+    try t.expectError(error.HostedSendingLimit, db.chargeHostedSend(change.mailbox, 1, 86399));
+
+    change.revision = 2;
+    change.operation_id = "signup-raised-limit";
+    _ = try db.applyProvisioning(change);
+    try db.chargeHostedSend(change.mailbox, 1, 86399);
+    try t.expectError(error.HostedSendingLimit, db.chargeHostedSend(change.mailbox, 1, 86399));
+    try db.chargeHostedSend(change.mailbox, 3, 86400);
+    try t.expectError(error.HostedSendingLimit, db.chargeHostedSend(change.mailbox, 1, 86400));
+    try t.expectError(error.HostedSendingLimit, db.chargeHostedSend(change.mailbox, 1, 86399));
+}
+
+test "provisioning owns the account, replays the latest operation, and rejects stale work" {
+    var db = try Database.init(std.testing.allocator, ":memory:");
+    defer db.deinit();
+
+    const initial: Database.ProvisioningChange = .{
+        .mailbox = "owner@example.test",
+        .actor = "signup-owner-00001",
+        .operation_id = "signup-create-0001",
+        .revision = 1,
+        .quota_bytes = 1024,
+        .enabled = true,
+        .initial_password_hash = "test-only-hash",
+        .initial_recovery = "owner@recovery.test",
+    };
+    const created = try db.applyProvisioning(initial);
+    try std.testing.expectEqual(@as(i64, 1), created.revision);
+    const replay = try db.applyProvisioning(initial);
+    try std.testing.expectEqualDeep(created, replay);
+    var mismatch = initial;
+    mismatch.quota_bytes = 2048;
+    try std.testing.expectError(error.OperationConflict, db.applyProvisioning(mismatch));
+    mismatch = initial;
+    mismatch.actor = "signup-other-00002";
+    try std.testing.expectError(error.MailboxUnavailable, db.applyProvisioning(mismatch));
+    var other_address = initial;
+    other_address.mailbox = "second@example.test";
+    other_address.operation_id = "signup-second-0002";
+    try std.testing.expectError(error.MailboxUnavailable, db.applyProvisioning(other_address));
+
+    var suspension: Database.ProvisioningChange = .{
+        .mailbox = initial.mailbox,
+        .actor = initial.actor,
+        .operation_id = "signup-disable-003",
+        .revision = 2,
+        .quota_bytes = 3072,
+        .enabled = false,
+    };
+    try std.testing.expect(!(try db.applyProvisioning(suspension)).enabled);
+    try std.testing.expectEqual(@as(i64, 3072), (try db.provisioningState(initial.mailbox, initial.actor)).quota_bytes);
+    try std.testing.expectError(error.StaleRevision, db.applyProvisioning(initial));
+    suspension.revision = 3;
+    suspension.operation_id = initial.operation_id;
+    try std.testing.expectError(error.OperationConflict, db.applyProvisioning(suspension));
+    try std.testing.expectError(error.MailboxNotFound, db.provisioningState(initial.mailbox, "signup-unrelated"));
+
+    _ = try db.createUser("operator@example.test", "unused", "operator@example.test");
+    var operator = initial;
+    operator.mailbox = "operator@example.test";
+    operator.actor = "another-signup-owner";
+    operator.operation_id = "another-signup-op";
+    try std.testing.expectError(error.MailboxUnavailable, db.applyProvisioning(operator));
+}

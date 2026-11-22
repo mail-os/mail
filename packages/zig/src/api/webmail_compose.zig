@@ -15,12 +15,11 @@
 //! use; deliverToRemote also rejects unsafe envelope addresses as a backstop.
 
 const std = @import("std");
+const submission = @import("../delivery/submission.zig");
 const fs_compat = @import("../core/fs_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
-const outbound = @import("../delivery/outbound.zig");
 const core_config = @import("../core/config.zig");
 const auth_mod = @import("../auth/auth.zig");
-const aliases = @import("../delivery/aliases.zig");
 
 pub const ComposeError = error{
     NoRecipients,
@@ -69,6 +68,7 @@ pub const Message = struct {
     /// Mark a message the server wrote itself (RFC 3834), so vacation
     /// responders and auto-forwarders do not answer it.
     auto_submitted: bool = false,
+    notice_recipient_id: ?i64 = null,
 };
 
 pub const SendConfig = struct {
@@ -79,13 +79,24 @@ pub const SendConfig = struct {
     auth: ?*auth_mod.AuthBackend = null,
     /// Canonical mailbox key of the sender (used for the Sent folder path).
     sender_user: []const u8,
+
+    fn delivery(self: SendConfig) submission.Delivery {
+        return .{
+            .hostname = self.hostname,
+            .delivery_method = self.delivery_method,
+            .ses_region = self.ses_region,
+            .mail_config = self.mail_config,
+            .db = if (self.auth) |auth| auth.db else null,
+        };
+    }
 };
 
 pub const SendResult = struct {
     message_id: []const u8,
-    delivered: usize, // recipients delivery SUCCEEDED for
+    delivered: usize, // recipients accepted locally or delivered to a remote server
     failed: []const []const u8, // recipients delivery failed for (arena-allocated)
     sent_saved: bool,
+    limit_notice: ?[]const u8 = null,
 };
 
 /// A header VALUE must not contain CR/LF (header injection) and stays short
@@ -98,35 +109,7 @@ fn isSafeHeaderValue(v: []const u8) bool {
     return true;
 }
 
-pub fn isSafeAddress(a: []const u8) bool {
-    if (a.len == 0 or a.len > 320) return false;
-    for (a) |c| {
-        // Reject header-injection chars, and '/' '\' (which would let a crafted
-        // local-part escape the mail/{user}/ path on local delivery) plus '..'.
-        // The '\' set also matches outbound.zig's validator so a webmail-accepted
-        // address never fails the outbound backstop.
-        if (c <= 0x20 or c == 0x7f or c == ',' or c == ';' or c == ':' or c == '"' or c == '<' or c == '>' or c == '/' or c == '\\') return false;
-    }
-    if (std.mem.indexOf(u8, a, "..") != null) return false;
-    // Must look like an address (one @, non-empty local/domain, no leading dot).
-    const at = std.mem.indexOfScalar(u8, a, '@') orelse return false;
-    if (at == 0 or at == a.len - 1) return false;
-    if (a[0] == '.') return false;
-    if (std.mem.indexOfScalarPos(u8, a, at + 1, '@') != null) return false;
-    return true;
-}
-
-/// A Maildir user (local-part) must be a single safe path component — defense in
-/// depth for the mail/{user}/... path even though isSafeAddress already guards.
-fn isSafeLocalPart(user: []const u8) bool {
-    if (user.len == 0 or user.len > 256) return false;
-    if (user[0] == '.') return false;
-    for (user) |c| {
-        if (c == '/' or c == '\\' or c == 0) return false;
-    }
-    if (std.mem.indexOf(u8, user, "..") != null) return false;
-    return true;
-}
+pub const isSafeAddress = submission.isSafeAddress;
 
 /// RFC 5322 date, e.g. "Mon, 01 Jun 2026 10:00:00 +0000" (UTC).
 fn formatDate(allocator: std.mem.Allocator, ts: i64) ![]const u8 {
@@ -394,69 +377,6 @@ fn writeBodyCrlf(allocator: std.mem.Allocator, out: *std.ArrayList(u8), body: []
     }
 }
 
-/// Local iff the recipient domain is our hostname or its parent domain. This is
-/// an EXACT mirror of the SMTP delivery path (core/protocol.zig saveMessage:
-/// "mail.stacksjs.com" accepts "stacksjs.com" as local). It must stay identical
-/// so webmail and SMTP route the same recipient the same way — do not "fix" the
-/// parent-domain acceptance without changing the SMTP path too.
-fn isLocalDomain(domain: []const u8, hostname: []const u8) bool {
-    if (std.mem.eql(u8, domain, hostname)) return true;
-    if (std.mem.indexOfScalar(u8, hostname, '.')) |dot| {
-        if (std.mem.eql(u8, domain, hostname[dot + 1 ..])) return true;
-    }
-    return false;
-}
-
-/// Deliver `raw` to one recipient: local -> Maildir INBOX, remote -> outbound.
-/// Returns an error on failure so the caller can report it to the user (no more
-/// silent best-effort losses).
-fn deliverOne(allocator: std.mem.Allocator, cfg: SendConfig, from: []const u8, rcpt: []const u8, raw: []const u8) !void {
-    if (!isSafeAddress(rcpt)) return ComposeError.InvalidAddress;
-    const at = std.mem.indexOfScalar(u8, rcpt, '@');
-    const domain = if (at) |p| rcpt[p + 1 ..] else "";
-    const is_local = if (cfg.mail_config) |config| config.isLocalDomain(domain) else isLocalDomain(domain, cfg.hostname);
-    if (at != null and is_local) {
-        const user = if (cfg.mail_config != null and cfg.mail_config.?.catch_all)
-            try allocator.dupe(u8, cfg.mail_config.?.catch_all_mailbox)
-        else if (cfg.auth != null and (cfg.auth.?.db.userExists(rcpt) catch false))
-            try allocator.dupe(u8, rcpt)
-        else
-            try aliases.resolve(allocator, rcpt[0..at.?]);
-        defer allocator.free(user);
-        if (!isSafeLocalPart(user)) return ComposeError.InvalidAddress;
-        if (cfg.auth) |auth| {
-            if (!(try auth.db.userExists(user))) return ComposeError.InvalidAddress;
-        }
-        try writeMaildir(allocator, user, "new", raw);
-    } else {
-        try outbound.deliverToRemote(allocator, from, rcpt, raw, cfg.hostname, cfg.delivery_method, cfg.ses_region);
-    }
-}
-
-/// Write a message into mail/{user}/{subdir}/{name}. subdir is "new" (INBOX
-/// delivery) or "Sent". Uses O_EXCL + retry so two writers picking the same
-/// name never silently overwrite each other. `user` MUST already be validated
-/// by isSafeLocalPart (callers do this).
-fn writeMaildir(allocator: std.mem.Allocator, user: []const u8, subdir: []const u8, raw: []const u8) !void {
-    if (!isSafeLocalPart(user)) return ComposeError.InvalidAddress;
-    const dir = try std.fmt.allocPrint(allocator, "mail/{s}/{s}", .{ user, subdir });
-    fs_compat.ensureDir(dir) catch {};
-    var attempt: u8 = 0;
-    while (attempt < 16) : (attempt += 1) {
-        const seq = nameSeq.fetchAdd(1, .monotonic);
-        // Name carries ms time + a process counter + attempt for uniqueness.
-        const path = try std.fmt.allocPrint(allocator, "{s}/{d}.{d}p{d}.eml", .{ dir, time_compat.milliTimestamp(), seq, attempt });
-        const f = fs_compat.cwd().createFileExclusive(path) catch |err| {
-            if (err == error.PathAlreadyExists) continue; // collision; pick a new name
-            return err;
-        };
-        defer f.close();
-        try f.writeAll(raw);
-        return;
-    }
-    return ComposeError.BuildFailed;
-}
-
 var nameSeq = std.atomic.Value(u64).init(0);
 
 /// Build + send a composed message. Returns the generated Message-ID.
@@ -472,38 +392,32 @@ pub fn send(allocator: std.mem.Allocator, msg: Message, cfg: SendConfig) !SendRe
     private_msg.include_bcc = true;
     const sent_raw = try buildMime(allocator, private_msg, ts, msgid);
 
-    // Deliver to every recipient (To + Cc + Bcc). Bcc recipients receive the
-    // message but are not in the headers (buildMime never emits a Bcc header).
-    // Track real successes + failures so the caller can tell the user the truth.
-    var delivered: usize = 0;
-    var failed: std.ArrayList([]const u8) = .empty;
-    var attempted: std.StringHashMap(void) = .init(allocator);
-    defer attempted.deinit();
-    const all_groups = [_][]const []const u8{ msg.to, msg.cc, msg.bcc };
-    for (all_groups) |group| {
-        for (group) |r| {
-            const key = try std.ascii.allocLowerString(allocator, r);
-            const entry = try attempted.getOrPut(key);
-            if (entry.found_existing) continue;
-            if (deliverOne(allocator, cfg, msg.from, r, raw)) {
-                delivered += 1;
-            } else |err| {
-                std.log.warn("webmail delivery to {s} failed: {}", .{ r, err });
-                try failed.append(allocator, r);
-            }
-        }
-    }
+    // To, Cc and Bcc share one allowance. Keep only the first occurrence of
+    // each address, and reserve the full envelope before starting delivery.
+    const recipients = try submission.distinctRecipients(allocator, &.{ msg.to, msg.cc, msg.bcc });
+    defer allocator.free(recipients);
+    const delivery = cfg.delivery();
+    const db = delivery.db;
+    const result = try submission.dispatch(allocator, delivery, msg.from, recipients, raw, .{ .sender = cfg.sender_user });
+    errdefer allocator.free(result.failed);
+    const first_limit_error = result.first_limit_error;
+    if (result.delivered == 0 and first_limit_error != null) return first_limit_error.?;
 
     // Save a copy to the sender's Sent folder (best-effort; doesn't affect the
     // delivered count, but a failure is logged).
     var sent_saved = false;
-    if (delivered > 0) {
-        if (writeMaildir(allocator, cfg.sender_user, "Sent", sent_raw)) {
+    var limit_notice: ?[]const u8 = if (first_limit_error != null) "Some recipient mailboxes are full or disabled." else null;
+    if (result.delivered > 0) {
+        if (submission.writeMaildir(allocator, db, cfg.sender_user, "Sent", sent_raw)) {
             sent_saved = true;
-        } else |err| std.log.warn("webmail: failed to save to Sent: {}", .{err});
+        } else |err| {
+            if (err == error.HostedStorageFull and limit_notice == null)
+                limit_notice = "Message delivered. Your mailbox is full, so a Sent copy could not be saved.";
+            std.log.warn("webmail: failed to save to Sent: {}", .{err});
+        }
     }
 
-    return .{ .message_id = msgid, .delivered = delivered, .failed = try failed.toOwnedSlice(allocator), .sent_saved = sent_saved };
+    return .{ .message_id = msgid, .delivered = result.delivered, .failed = result.failed, .sent_saved = sent_saved, .limit_notice = limit_notice };
 }
 
 /// Deliver a message the server writes on its own behalf (password reset
@@ -515,7 +429,7 @@ pub fn deliverSystem(allocator: std.mem.Allocator, msg: Message, cfg: SendConfig
     const seq = nameSeq.fetchAdd(1, .monotonic);
     const msgid = try std.fmt.allocPrint(allocator, "<{d}.{d}@{s}>", .{ ts, seq, cfg.hostname });
     const raw = try buildMime(allocator, msg, ts, msgid);
-    for (msg.to) |recipient| try deliverOne(allocator, cfg, msg.from, recipient, raw);
+    for (msg.to) |recipient| try submission.deliverNotice(allocator, cfg.delivery(), msg.from, recipient, raw, msg.notice_recipient_id);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -537,11 +451,11 @@ test "isSafeAddress rejects injection, path traversal, and malformed" {
 
 test "isSafeLocalPart guards the maildir path component" {
     const t = std.testing;
-    try t.expect(isSafeLocalPart("alice"));
-    try t.expect(!isSafeLocalPart("../../etc"));
-    try t.expect(!isSafeLocalPart("a/b"));
-    try t.expect(!isSafeLocalPart(".hidden"));
-    try t.expect(!isSafeLocalPart(""));
+    try t.expect(submission.isSafeLocalPart("alice"));
+    try t.expect(!submission.isSafeLocalPart("../../etc"));
+    try t.expect(!submission.isSafeLocalPart("a/b"));
+    try t.expect(!submission.isSafeLocalPart(".hidden"));
+    try t.expect(!submission.isSafeLocalPart(""));
 }
 
 test "buildMime validates bcc and uses base64 for non-ASCII" {

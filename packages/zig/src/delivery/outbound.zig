@@ -551,40 +551,39 @@ fn deliverViaSes(
     );
     defer allocator.free(json_input);
 
-    // Write JSON to temp file
-    const timestamp = time_compat.milliTimestamp();
-    const tmp_path_z = try std.fmt.allocPrint(allocator, "/tmp/ses-input-{d}.json", .{timestamp});
-    defer allocator.free(tmp_path_z);
-
-    const path_z = try allocator.dupeSentinel(u8, tmp_path_z, 0);
+    // Raw MIME can include account verification and password reset secrets.
+    var nonce: [16]u8 = undefined;
+    io_compat.randomBytes(&nonce);
+    const path = try std.fmt.allocPrint(allocator, "/tmp/ses-input-{s}.json", .{std.fmt.bytesToHex(nonce, .lower)});
+    defer allocator.free(path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     const fd = std.c.open(path_z.ptr, .{
         .ACCMODE = .WRONLY,
         .CREAT = true,
-        .TRUNC = true,
+        .EXCL = true,
         .CLOEXEC = true,
-    }, @as(std.c.mode_t, 0o644));
+    }, @as(std.c.mode_t, 0o600));
     if (fd < 0) return error.TempFileCreateFailed;
-
-    var written: usize = 0;
-    while (written < json_input.len) {
-        const n = std.c.write(fd, json_input[written..].ptr, json_input.len - written);
-        if (n <= 0) {
-            _ = std.c.close(fd);
-            return error.TempFileWriteFailed;
+    defer _ = std.c.unlink(path_z.ptr);
+    {
+        defer _ = std.c.close(fd);
+        var written: usize = 0;
+        while (written < json_input.len) {
+            const n = std.c.write(fd, json_input[written..].ptr, json_input.len - written);
+            if (n <= 0) return error.TempFileWriteFailed;
+            written += @intCast(n);
         }
-        written += @intCast(n);
     }
-    _ = std.c.close(fd);
 
     // Build file:// argument for AWS CLI
-    const file_arg = try std.fmt.allocPrint(allocator, "file://{s}", .{tmp_path_z});
+    const file_arg = try std.fmt.allocPrint(allocator, "file://{s}", .{path});
     defer allocator.free(file_arg);
 
     const io = io_compat.getIo();
 
-    // Spawn `aws ses send-raw-email --cli-input-json file:///tmp/ses-input-{ts}.json`
+    // Pass the file path so the raw MIME never appears in the command arguments.
     var child = try std.process.spawn(io, .{
         .argv = &[_][]const u8{
             "aws",            "ses",
@@ -595,9 +594,6 @@ fn deliverViaSes(
     });
 
     const term = try child.wait(io);
-
-    // Clean up temp file
-    _ = std.c.unlink(path_z.ptr);
 
     // Check exit status
     switch (term) {

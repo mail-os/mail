@@ -38,6 +38,32 @@ pub fn write(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !
     const dst = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(dst);
     if (link(src, dst) != 0) return error.MaildirPublishFailed;
+    try syncParents(allocator, path, directory);
+}
+
+/// Resume a journaled write. The path belongs to just one recipient outcome.
+/// Validate any copy found after a restart before finalizing its checkpoint.
+pub fn resumeWrite(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return error.InvalidMaildirPath;
+    const directory = path[0..slash];
+    const temporary = try std.fmt.allocPrint(allocator, "{s}/.pending-{s}", .{ directory, path[slash + 1 ..] });
+    defer allocator.free(temporary);
+    fs.cwd().deleteFile(temporary) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    if (fs.cwd().access(path, .{})) {
+        const existing = try fs.readFileAlloc(allocator, path);
+        defer allocator.free(existing);
+        if (!std.mem.eql(u8, data, existing)) return error.MaildirDeliveryConflict;
+        return syncParents(allocator, path, directory);
+    } else |err| switch (err) {
+        error.FileNotFound => return write(allocator, path, data),
+        else => return err,
+    }
+}
+
+fn syncParents(allocator: std.mem.Allocator, path: []const u8, directory: []const u8) !void {
     // Sync the destination and its parent chain, including newly made mailboxes.
     var current = directory;
     while (current.len > 0) {
@@ -46,6 +72,11 @@ pub fn write(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !
         current = current[0..parent];
     }
     try syncDir(allocator, if (std.mem.startsWith(u8, path, "/")) "/" else ".");
+}
+
+/// A journal can finalize a rename only after its directory entries are synced.
+pub fn syncDirectory(allocator: std.mem.Allocator, directory: []const u8) !void {
+    try syncParents(allocator, directory, directory);
 }
 
 test "durable publication preserves an existing message and cleans failed temporary writes" {

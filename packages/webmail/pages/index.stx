@@ -8,8 +8,11 @@
 </head>
 <body>
 <script client>
+import { mailFolderIcon, senderAddress, senderInitials } from '../functions/mail-utils'
 import { useWebmail } from '../functions/use-webmail'
 import { useServiceHealth } from '../functions/use-service-health'
+import { reminderDayLink, useCalendarReminders } from '../functions/use-calendar-reminders'
+import { vacationStatus } from '../functions/use-vacation-settings'
 const health = useServiceHealth()
 useInterval(health.refresh, 30000, { whileVisible: true })
 useInterval(health.tick, 1000, { whileVisible: true })
@@ -18,118 +21,371 @@ const ready = state(false)
 const mail = useWebmail({
   composer: useRef('composerDialog'), password: useRef('passwordDialog'),
   confirmation: useRef('confirmDialog'), fileInput: useRef('fileInput'),
-  selectAll: useRef('selectAll'), navigate, nextTick,
+  selectAll: useRef('selectAll'), messageList: useRef('messageList'), messageReader: useRef('messageReader'),
+  shortcutsDialog: useRef('shortcutsDialog'), collectionsDialog: useRef('collectionsDialog'), contactsDialog: useRef('contactsDialog'), navigate, nextTick,
 })
 const {
-  user, folders, folder, messages, threads, expandedThreads, selected, loading, reading, readingLoading,
-  mutating, error, notice, query, searchAll, filterSender, filterAfter, filterBefore, filterUnread,
+  user, folders, folder, messages, threads, expandedThreads, selected, loading, refreshing, listError, readerError, readerTarget, reading, readingLoading,
+  mutating, error, notice, query, appliedSearchAll, filterLocation, filterSender, filterRecipient, filterFilename, filterAfter, filterBefore, filterStatus,
+  libraryView, libraryFiles, indexProgress, showAttachmentLibrary, openAttachmentMessage,
+  collectionId, canOpenPrivate, privateOpen, privateTab, privateTools, privateBusy, privateError, privateEntries,
+  editingNote, noteText, clipText, privateLabel, showPrivate, closePrivate, editPrivateNote, cancelPrivateNote,
+  savePrivateNote, removePrivateEntry, startPrivateClip, savePrivateClip, savePrivateLabel, setPrivateMembership,
+  privateCollections, collectionsOpen, collectionsBusy, collectionsError, collectionName, editingCollection, deletingCollection,
+  selectCollection, showCollectionManager, closeCollectionManager, editPrivateCollection, clearCollectionEditor,
+  savePrivateCollection, confirmCollectionDeletion, groupSelected, displaySubject,
+  contactsOpen, addressBook, contactsBusy, contactsError, contactQuery, contactView, activeCard, contactDraft,
+  contactName, contactEmails, contactNote, memberUIDs, confirmCardRemoval, visibleCards, memberOptions, linkedMembers,
+  setCard, loadContacts, closeContacts, newContact, changeContactView, toggleContactMember, saveContact, deleteContact,
+  showContacts, composeSavedCard,
   filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal,
-  moveTo, showHtml, checkedKeys, selectedCount, allChecked, someChecked, undoAction, undoRemaining,
+  moveTo, showHtml, formattedReader, remoteImagesAllowed, checkedKeys, selectedCount, allChecked, someChecked, undoAction, undoRemaining,
+  isJunkFolder, readerJunkAction, selectionJunkAction,
+  readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts,
   pendingSend, sendRemaining, outbox, outboxCount, outboxView, cancelling, authExpired, currentFolderName, now,
   composing, title, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, saveStatus,
   savingDraft, draftError, draftConflict, sendDelay, sendDelayOptions, settings, currentPassword, newPassword,
   confirmPassword, passwordError, savingPassword, confirmation, confirming, limits,
   recoveryAddress, recoverySetBy, recoveryInput, recoveryPassword, recoveryError, recoveryNotice, recoveryLoading,
   savingRecovery, saveRecovery,
+  forwarding, forwardingAddress, forwardingPassword, forwardingCode, forwardingBusy, forwardingError, forwardingNotice, changeForwarding,
+  vacation, vacationEnabled, vacationSubject, vacationBody, vacationStart, vacationEnd, vacationBusy, vacationError, vacationNotice, saveVacationSettings,
   toRecipients, ccRecipients, bccRecipients, toInput, ccInput, bccInput, recipientFocus, suggestions,
   suggestionIndex, recipientSearching, recipientErrors, lookup, chooseContact, removeRecipient,
   editRecipient, recipientKeydown, recipientBlur, attachments, dragging, attachmentBytes,
   attachmentRemaining, attachmentPending, attachmentUploading, removeAttachment, retryAttachment,
   refresh, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread,
-  toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openMessage, closeReader, bulkAction, selectedAction,
+  toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, retryReader, closeReader, bulkAction, selectedAction,
+  nextUnread, readSelection, advanceBatch, triageAndNext, showShortcuts, closeShortcuts, handleShortcut,
   undoLastAction, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments,
-  saveSendPreference, send, confirmPendingSend, showOutbox, cancelSend, retryOutbox, signOut, showSettings, changePassword,
+  saveSendPreference, send, confirmPendingSend, showOutbox, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword,
   showConfirmation, confirmAction, saveDraftCopy, resume, tick, preventUnload,
-  messageKey, folderName, shortDate, fullDate, readableBytes, safeHtml, attachmentPath,
+  senderReviewStatus, senderReviewOpen, senderReviewView, senderReviewPage, senderReviewMore, senderReviewLoading,
+  senderReviewSaving, senderReviewError, senderReviewSelection, senderReviewRules, senderReviewGroups,
+  showSenderReview, openReviewMessage, reviewMessage, setSenderReview, decideSenderReview,
+  categoryList, newsletterExpanded, readerExpanded, receiptFull, receiptCompact, receiptPreview, senderLabel, sortingSettings,
+  sortingSaving, sortingError, toggleAutomaticSorting, placementText, categoryRule, categoryRuleSaving, saveCategoryRule,
+  attentionViews, attentionView, followUpFocused, attentionSaving, attentionSchedule, attentionDate, attentionZone,
+  dueReminders, replyContext, clearFollowUp, selectAttention, nextFollowUp, changeAttention, startAttentionSchedule, saveAttentionSchedule, deadlineLabel,
+  messageIdentity, messagePageSize, folderName, shortDate, fullDate, readableBytes, attachmentPath,
+  notificationsAvailable, notificationEnabled, notificationHere, notificationBusy, notificationError,
+  notificationRuleBusy, notificationRuleError, changeNotificationSettings, changeNotificationRule, pollNotifications,
 } = mail
-async function boot() { ready.set(false); await mail.mount(); ready.set(true) }
+const categoryNames = ['Newsletters', 'Receipts']
+const coreFolders = derived(() => folders().filter(item => !categoryNames.includes(item.name)))
+const categoryFolders = derived(() => folders().filter(item => categoryNames.includes(item.name)))
+const { visibleReminders, reminderError, dismissingReminder, tickReminders, pollReminders, dismissReminder, destroyReminders } =
+  useCalendarReminders(() => user()?.username, () => ready() && limits().calendarAvailable)
+async function boot() { ready.set(false); await mail.mount(); ready.set(true); void pollReminders() }
 useInterval(() => tick(), 1000, { whileVisible: true })
+useInterval(tickReminders, 1000, { whileVisible: true })
+useInterval(pollReminders, 30000, { whileVisible: true })
+useInterval(pollNotifications, 15000, { whileVisible: false })
 useEventListener('beforeunload', preventUnload)
+useEventListener('keydown', handleShortcut)
 useEventListener('online', resume)
 useEventListener('focus', resume)
+useEventListener('focus', pollReminders)
+useEventListener('online', pollReminders)
 onMount(boot)
-onUnmounted(() => mail.destroy())
+onUnmounted(() => { mail.destroy(); destroyReminders() })
 </script>
 <main :if="!ready || !user" class="wm-boot"><p role="status" :text="error || 'Opening your inbox…'"></p><button :if="error" @click="boot()">Retry connection</button></main>
-<div :if="ready && user" class="wm" :class="{ 'wm--reading': reading }">
+<div :if="ready && user" class="wm" :class="{ 'wm--reading': reading, 'wm--newsletter-expanded': readerExpanded, 'wm--reply-focused': followUpFocused }">
   <aside class="wm-folders">
-    <div class="font-semibold text-indigo-600 wm-brand">Mail</div>
-    <button class="wm-compose-btn" @click="compose()" :disabled="sending || sendUncertain" :text="hasComposition ? 'Resume draft' : 'Compose'"></button>
+    <div class="wm-brand"><span class="mail-app-mark"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span></span><span>Mail</span></div>
+    <button class="wm-compose-btn" @click="compose()" :disabled="sending || sendUncertain"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span><span :text="hasComposition ? 'Resume draft' : 'Compose'"></span></button>
     <nav class="wm-folder-list" aria-label="Mail folders">
-      <button :for="item in folders" class="wm-folder" :class="{ 'wm-folder--active': !outboxView && item.name === folder }" @click="selectFolder(item.name)" :disabled="mutating" :aria-current="!outboxView && item.name === folder ? 'page' : null">
-        <span :text="folderName(item.name)"></span><span :if="(item.name === 'Drafts' ? item.total : item.unread) > 0" class="wm-folder-count" :text="item.name === 'Drafts' ? item.total : item.unread"></span>
-      </button>
-      <button class="wm-folder" :class="{ 'wm-folder--active': !outboxView && folder === '*' }" @click="selectFolder('*')" :disabled="mutating">All mail</button>
-      <a :if="limits.calendarAvailable" class="wm-folder" href="/calendar">Calendar</a>
-      <button class="wm-folder" :class="{ 'wm-folder--active': outboxView }" @click="showOutbox()"><span>Outbox</span><span :if="outboxCount > 0" class="wm-folder-count" :text="outboxCount"></span></button>
+      <div class="wm-nav-group">
+        <span class="wm-nav-label">Mailboxes</span>
+        <button :for="item in coreFolders" :key="item.name" class="wm-folder" @click="selectFolder(item.name)" :disabled="mutating" :aria-current="!libraryView && !outboxView && !senderReviewOpen && !attentionView && item.name === folder ? 'page' : null">
+          <span class="mail-icon" :data-icon="isJunkFolder(item.name) ? 'shield' : mailFolderIcon(item.name)" aria-hidden="true"></span><span class="wm-folder-name" :text="folderName(item.name)"></span><span :if="(item.name === 'Drafts' ? item.total : item.unread) > 0" class="wm-folder-count" :text="item.name === 'Drafts' ? item.total : item.unread"></span>
+        </button>
+        <button class="wm-folder" :aria-current="!libraryView && !outboxView && !senderReviewOpen && !collectionId && folder === '*' ? 'page' : null" @click="selectFolder('*')" :disabled="mutating"><span class="mail-icon" data-icon="layers" aria-hidden="true"></span><span class="wm-folder-name">All mail</span></button>
+        <button class="wm-folder" :aria-current="outboxView ? 'page' : null" @click="showOutbox()"><span class="mail-icon" data-icon="outbox" aria-hidden="true"></span><span class="wm-folder-name">Outbox</span><span :if="outboxCount > 0" class="wm-folder-count" :text="outboxCount"></span></button>
+      </div>
+      <div class="wm-nav-group">
+        <span class="wm-nav-label">Collections</span>
+        <button :for="item in categoryFolders" :key="item.name" class="wm-folder" @click="selectFolder(item.name)" :disabled="mutating" :aria-current="!outboxView && !senderReviewOpen && !attentionView && item.name === folder ? 'page' : null">
+          <span class="mail-icon" :data-icon="mailFolderIcon(item.name)" aria-hidden="true"></span><span class="wm-folder-name" :text="folderName(item.name)"></span><span :if="item.unread > 0" class="wm-folder-count" :text="item.unread"></span>
+        </button>
+        <button class="wm-folder" :aria-current="libraryView ? 'page' : null" @click="showAttachmentLibrary()" :disabled="mutating"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span><span class="wm-folder-name">Attachments</span></button>
+        <button :if="senderReviewStatus" class="wm-folder" :aria-current="senderReviewOpen ? 'page' : null" @click="showSenderReview()" :disabled="mutating"><span class="mail-icon" data-icon="shield" aria-hidden="true"></span><span class="wm-folder-name">Sender Review</span><span :if="senderReviewStatus?.pending > 0" class="wm-folder-count" :text="senderReviewStatus?.pending"></span></button>
+      </div>
+      <div class="wm-nav-group">
+        <span class="wm-nav-label">Personal</span>
+        <button :if="limits.calendarAvailable" type="button" class="wm-folder" @click="showContacts()" aria-haspopup="dialog"><span class="mail-icon" data-icon="contacts" aria-hidden="true"></span><span class="wm-folder-name">Contacts</span></button>
+        <button type="button" class="wm-folder" @click="showCollectionManager()" aria-haspopup="dialog"><span class="mail-icon" data-icon="bookmark" aria-hidden="true"></span><span class="wm-folder-name">My collections</span></button>
+        <button :for="item in privateCollections" :key="item.id" type="button" class="wm-folder" :aria-current="collectionId === item.id ? 'page' : null" @click="selectCollection(item)" :disabled="mutating"><span class="mail-icon" data-icon="folder" aria-hidden="true"></span><span class="wm-folder-name" :text="item.name"></span></button>
+      </div>
+      <div class="wm-nav-group">
+        <span class="wm-nav-label">Workflows</span>
+        <button :for="item in attentionViews" :key="item.name" class="wm-folder" :aria-current="attentionView === item.name ? 'page' : null" @click="selectAttention(item.name)" :disabled="mutating"><span class="mail-icon" :data-icon="mailFolderIcon(item.name)" aria-hidden="true"></span><span class="wm-folder-name" :text="item.label"></span><span :if="item.name === 'reminders' && dueReminders > 0" class="wm-folder-count" :text="dueReminders"></span></button>
+        <a :if="limits.calendarAvailable" class="wm-folder" href="/calendar"><span class="mail-icon" data-icon="calendar" aria-hidden="true"></span><span class="wm-folder-name">Calendar</span></a>
+      </div>
     </nav>
-    <div class="wm-user"><a class="wm-logout" href="/status">Service health</a><span class="wm-user-email" :text="user?.email"></span><button class="wm-logout" @click="showSettings()">Account</button><button class="wm-logout" @click="signOut()" :disabled="sending || savingDraft">Sign out</button></div>
+    <div class="wm-user">
+      <div class="wm-user-identity"><span class="wm-avatar" aria-hidden="true" :text="senderInitials(user?.email || '')"></span><span class="wm-user-email" :title="user?.email" :text="user?.email"></span></div>
+      <div class="wm-account-actions"><button class="wm-logout" type="button" aria-label="Keyboard shortcuts" aria-keyshortcuts="?" title="Keyboard shortcuts" @click="showShortcuts()"><span class="mail-icon" data-icon="keyboard" aria-hidden="true"></span></button><button class="wm-logout" aria-label="Account" title="Account" @click="showSettings()"><span class="mail-icon" data-icon="settings" aria-hidden="true"></span></button><a class="wm-logout" aria-label="Service health" title="Service health" href="/status"><span class="mail-icon" data-icon="pulse" aria-hidden="true"></span></a><button class="wm-logout" aria-label="Sign out" title="Sign out" @click="leaveAccount()" :disabled="sending || savingDraft || leavingAccount"><span class="mail-icon" data-icon="exit" aria-hidden="true"></span></button></div>
+    </div>
   </aside>
   <section class="wm-workspace">
-    <div :if="health.status() !== 'healthy'" class="wm-health-banner" role="status"><span :text="health.label()"></span>. <a href="/status">View service health</a></div>
+    <section :if="senderReviewStatus?.onboarding_pending" class="wm-review-welcome" aria-label="Mailbox setup">
+      <div><h2>Set up your inbox</h2><p>Sender Review holds mail from new senders until you decide what reaches your inbox. You can turn it off in Account settings.</p><p :if="senderReviewError" role="alert" :text="senderReviewError"></p></div>
+      <button type="button" class="wm-action" @click="setSenderReview('onboard')" :disabled="senderReviewSaving">Continue to inbox</button>
+    </section>
+    <div :if="health.status() !== 'healthy'" class="wm-health-banner" :class="{ 'wm-health-banner--info': health.status() === 'unknown' }" role="status"><span class="mail-icon" data-icon="pulse" aria-hidden="true"></span><span :text="health.label()"></span><a href="/status">View service health</a></div>
     <div :if="authExpired" class="wm-session" role="alert">Your session expired. <a href="/login" target="_blank" rel="noopener">Sign in again</a>, then return here to save your changes.</div>
-    <div :if="notice" class="wm-notice" role="status"><span :text="notice"></span><button :if="undoAction && undoRemaining > 0" class="wm-action" @click="undoLastAction()" :disabled="mutating" aria-label="Undo last action">Undo <span aria-hidden="true" :text="'(' + undoRemaining + 's)' "></span></button><button :if="pendingSend?.state === 'pending' && sendRemaining > 0" class="wm-action" @click="cancelSend()" :disabled="cancelling" aria-label="Undo send">Undo Send <span aria-hidden="true" :text="'(' + sendRemaining + 's)' "></span></button></div>
+    <div :if="notice" class="wm-notice" role="status"><span :text="notice"></span><button :if="undoAction && undoRemaining > 0" class="wm-action" @click="undoLastAction()" :disabled="mutating" aria-label="Undo last action" aria-keyshortcuts="Shift+U">Undo <span aria-hidden="true" :text="'(' + undoRemaining + 's)' "></span></button><button :if="pendingSend?.state === 'pending' && sendRemaining > 0" class="wm-action" @click="cancelSend()" :disabled="cancelling" aria-label="Undo send">Undo Send <span aria-hidden="true" :text="'(' + sendRemaining + 's)' "></span></button></div>
+    <div :if="dueReminders > 0 && attentionView !== 'reminders'" class="wm-notice" role="status"><span :text="dueReminders === 1 ? 'One no-reply reminder is due.' : dueReminders + ' no-reply reminders are due.'"></span><button type="button" class="wm-action" @click="selectAttention('reminders')">View reminders</button></div>
+    <p :if="error && !outboxView" class="login-error wm-workspace-error" role="alert" :text="error"></p>
     <div class="wm-columns">
-    <section :if="!outboxView" class="wm-list" aria-label="Messages">
-      <header class="wm-list-head"><h1 class="wm-list-title" :text="currentFolderName"></h1><button class="wm-refresh" @click="refresh()" :disabled="loading" aria-label="Refresh messages">Refresh</button></header>
+    <section :if="!outboxView && !senderReviewOpen" class="wm-list" :aria-label="libraryView ? 'Attachment library' : 'Messages'">
+      <header class="wm-list-head"><div class="wm-list-heading"><h1 class="wm-list-title" :text="currentFolderName"></h1><span :if="!loading && !indexProgress" class="wm-list-total" :text="matchingTotal + (libraryView ? (matchingTotal === 1 ? ' attachment' : ' attachments') : (matchingTotal === 1 ? ' message' : ' messages'))"></span></div><button :if="attentionView === 'follow_up' && total > 0" type="button" class="wm-action" @click="nextFollowUp()" :disabled="loading || readingLoading || mutating">Next reply</button><button :if="unreadAvailable && !reading" type="button" class="wm-action" aria-keyshortcuts="Shift+N" @click="nextUnread()" :disabled="loading || triageBusy || readingLoading || mutating">Next unread</button><button class="wm-refresh" @click="refresh(true)" :disabled="loading || refreshing" :aria-label="libraryView ? 'Refresh attachments' : 'Refresh messages'"><span class="mail-icon" data-icon="refresh" aria-hidden="true"></span></button></header>
       <form class="wm-search-form" role="search" @submit.prevent="search()">
-        <div class="wm-search-row"><input type="search" class="wm-search" x-model="query" maxlength="256" :placeholder="searchAll ? 'Search all folders' : 'Search this folder'" aria-label="Search messages"><button class="wm-action" type="submit" :disabled="loading">Search</button><button class="wm-action" type="button" @click="filtersOpen.set(!filtersOpen())" :aria-expanded="filtersOpen" aria-controls="mailFilters">Filters</button></div>
+        <div class="wm-search-row"><div class="mail-search-field"><span class="mail-icon" data-icon="search" aria-hidden="true"></span><input type="search" class="wm-search" x-model="query" maxlength="256" :placeholder="libraryView ? 'Find a filename' : 'Search mail'" :aria-label="libraryView ? 'Search attachments' : 'Search messages'"></div><button class="wm-action mail-icon-button" type="submit" :disabled="loading" aria-label="Search" title="Search"><span class="mail-icon" data-icon="arrow-right" aria-hidden="true"></span></button><button class="wm-action mail-icon-button" type="button" @click="filtersOpen.set(!filtersOpen())" :aria-expanded="filtersOpen" aria-controls="mailFilters" aria-label="Filters" title="Filters"><span class="mail-icon" data-icon="filters" aria-hidden="true"></span></button></div>
         <div :if="filtersOpen" id="mailFilters" class="wm-filter-panel">
           <label>Sender<input type="text" x-model="filterSender" maxlength="256" placeholder="Name or email" aria-label="Filter by sender"></label>
+          <label>Recipient<input type="text" x-model="filterRecipient" maxlength="256" placeholder="Name or email" aria-label="Filter by recipient"></label>
+          <label :if="!libraryView">Filename<input type="text" x-model="filterFilename" maxlength="256" aria-label="Filter by filename"></label>
+          <label :if="!attentionView && !collectionId">Search in<select x-model="filterLocation" aria-label="Search in folder">
+            <option value="" :text="folder === '*' ? 'All folders' : 'Current folder'"></option>
+            <option :if="folder !== '*'" value="*">All folders</option>
+            <option :for="item in folders" :key="item.name" :value="item.name" :text="folderName(item.name)"></option>
+          </select></label>
           <div class="wm-filter-dates"><label>After<input type="date" x-model="filterAfter" aria-label="After date"></label><label>Before<input type="date" x-model="filterBefore" aria-label="Before date"></label></div>
-          <div class="wm-filter-checks"><label><input type="checkbox" x-model="filterUnread">Unread</label><label><input type="checkbox" x-model="filterFlagged">Flagged</label><label><input type="checkbox" x-model="filterAttachments">Has attachments</label><label><input type="checkbox" x-model="searchAll">All folders</label></div>
+          <label>Message status<select x-model="filterStatus" aria-label="Filter by message status"><option value="any">Any status</option><option value="unread">Unread</option><option value="read">Read</option><option value="answered">Replied</option></select></label>
+          <div class="wm-filter-checks"><label><input type="checkbox" x-model="filterFlagged">Flagged</label><label :if="!libraryView"><input type="checkbox" x-model="filterAttachments">Has attachments</label></div>
           <button class="wm-action" type="submit" :disabled="loading">Apply filters</button>
         </div>
         <button :if="filterActive" class="wm-clear-search" type="button" @click="clearSearch()">Clear search and filters</button>
       </form>
-      <div class="wm-list-options"><label :if="folder !== 'Drafts'"><input type="checkbox" x-model="conversations" @change="changeConversationView()">Conversations</label><span :text="matchingTotal + (matchingTotal === 1 ? ' message' : ' messages')"></span></div>
-      <div class="wm-selection-bar"><label class="wm-select-all"><input ref="selectAll" type="checkbox" :checked="allChecked" :aria-checked="someChecked ? 'mixed' : allChecked ? 'true' : 'false'" @change="toggleAll()" :disabled="loading || mutating" aria-label="Select messages on this page"><span :text="selectedCount ? selectedCount + ' selected' : 'Select messages'"></span></label><button :if="selectedCount > 0" class="wm-clear-search" @click="clearSelection()">Clear</button></div>
+      <div :if="!libraryView" class="wm-list-options"><span :if="categoryList">Grouped by sender</span><label :if="!attentionView && !categoryList && folder !== 'Drafts'"><input type="checkbox" x-model="conversations" @change="changeConversationView()">Conversations</label><div class="wm-selection-bar"><label class="wm-select-all"><input ref="selectAll" type="checkbox" :checked="allChecked" :aria-checked="someChecked ? 'mixed' : allChecked ? 'true' : 'false'" @change="toggleAll()" :disabled="loading || mutating" aria-label="Select messages on this page"><span :text="selectedCount ? selectedCount + ' selected' : 'Select messages'"></span></label><button :if="selectedCount > 0" class="wm-clear-search" @click="clearSelection()">Clear</button></div></div>
       <div :if="selectedCount > 0" class="wm-bulk-toolbar" aria-label="Selected message actions">
+        <button type="button" class="wm-action wm-action--accent" @click="readSelection()" :disabled="loading || readingLoading || triageBusy || mutating"><span class="mail-icon" data-icon="layers" aria-hidden="true"></span>Read selected</button>
+        <button :if="selectedCount > 1 && !categoryList && !attentionView && folder !== 'Drafts'" type="button" class="wm-action" @click="groupSelected()" :disabled="loading || readingLoading || triageBusy || mutating">Group selected</button>
         <button class="wm-action" @click="bulkAction('move', 'Archive')" :disabled="mutating">Archive</button><button class="wm-action" @click="bulkAction('move')" :disabled="mutating">Move</button><select x-model="moveTo" :disabled="mutating" aria-label="Bulk move destination"><option :for="item in folders" :value="item.name" :text="folderName(item.name)"></option></select>
-        <button class="wm-action" @click="bulkAction('read')" :disabled="mutating">Mark read</button><button class="wm-action" @click="bulkAction('unread')" :disabled="mutating">Mark unread</button><button class="wm-action" @click="bulkAction('flag')" :disabled="mutating">Flag</button>
+        <button class="wm-action" @click="bulkAction('read')" :disabled="mutating">Mark read</button><button class="wm-action" @click="bulkAction('unread')" :disabled="mutating"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span><span>Mark unread</span></button><button class="wm-action" @click="bulkAction('flag')" :disabled="mutating">Flag</button><button class="wm-action" @click="bulkAction('unflag')" :disabled="mutating">Unflag</button>
+        <button :if="selectionJunkAction" class="wm-action" @click="bulkAction(selectionJunkAction())" :disabled="mutating || readingLoading" title="Junk feedback applies to future mail from verified senders"><span class="mail-icon" data-icon="shield" aria-hidden="true"></span><span :text="selectionJunkAction === 'not_junk' ? 'Not junk' : 'Mark junk'"></span></button>
         <button class="wm-action wm-action--danger" @click="bulkAction(folder() === 'Trash' ? 'purge' : 'trash')" :disabled="mutating" :text="folder === 'Trash' ? 'Delete permanently' : 'Trash'"></button>
       </div>
-      <p :if="error" class="login-error" role="alert" :text="error"></p>
-      <div class="wm-list-body" :aria-busy="loading">
-        <p :if="loading" class="wm-state" role="status">Loading messages…</p>
-        <p :if="!loading && total === 0" class="wm-state" role="status" :text="filterActive ? 'No messages match your search.' : 'No messages in this folder.'"></p>
-        <div :for="thread in threads" class="wm-thread">
-          <div class="wm-message-row" :class="{ 'wm-message-row--unread': thread.unread > 0 }">
-            <input class="wm-message-check" type="checkbox" :checked="threadChecked(thread)" :aria-checked="threadPartial(thread) ? 'mixed' : threadChecked(thread) ? 'true' : 'false'" @click.stop.prevent="toggleThreadSelection(thread, $event)" :disabled="mutating" :aria-label="'Select conversation: ' + (thread.latest.subject || '(no subject)')">
-            <button class="wm-msg" @click="thread.count > 1 ? toggleThread(thread.id) : openMessage(thread.latest)" :aria-expanded="thread.count > 1 ? expandedThreads.includes(thread.id) : null" :disabled="mutating">
-              <span class="wm-msg-row"><span class="wm-msg-from" :text="thread.latest.from"></span><span class="wm-msg-date" :title="fullDate(thread.latest.date)" :text="shortDate(thread.latest.date)"></span></span>
-              <span class="wm-msg-subject"><span :text="(thread.latest.flags?.flagged ? '★ ' : '') + (thread.latest.has_attachments ? '📎 ' : '') + (thread.latest.subject || '(no subject)')"></span><span :if="thread.count > 1" class="wm-thread-count" :text="thread.count"></span></span>
+      <div :if="listError" class="wm-inline-error" role="alert"><span :text="listError"></span><button type="button" class="wm-action" @click="refresh(true)" :disabled="refreshing || loading">Retry messages</button></div>
+      <p :if="refreshing" class="wm-a11y-text" role="status">Refreshing messages…</p>
+      <p :if="triageBusy && !reading" class="wm-a11y-text" role="status">Finding the next message…</p>
+      <div :if="indexProgress" class="wm-index-status" role="status">
+        <span :text="'Indexing ' + indexProgress.indexed + ' of ' + indexProgress.total + ' messages…'"></span>
+        <progress :value="indexProgress.indexed" :max="indexProgress.total" aria-label="Search index progress"></progress>
+      </div>
+      <div class="wm-list-body" ref="messageList" tabindex="-1" :aria-busy="loading || triageBusy">
+        <p :if="loading && !indexProgress" class="wm-state" role="status" :text="libraryView ? 'Loading attachments…' : 'Loading messages…'"></p>
+        <p :if="!loading && !indexProgress && !listError && total === 0" class="wm-state" role="status" :text="libraryView ? 'No attachments match your search.' : (filterActive ? 'No messages match your search.' : (collectionId ? 'No conversations in this collection.' : 'No messages in this folder.'))"></p>
+        <div :for="file in libraryFiles" :key="file.message.reference + ':' + file.index" class="wm-library-row" :class="{ 'wm-message-row--active': selected?.reference === file.message.reference }">
+          <button type="button" class="wm-library-message" @click="openAttachmentMessage(file)" :disabled="readingLoading || mutating" :aria-label="'Open message for ' + file.filename">
+            <span class="wm-library-icon"><span class="mail-icon" data-icon="document" aria-hidden="true"></span></span>
+            <span class="wm-library-info">
+              <strong :text="file.filename"></strong>
+              <span :text="file.message.subject || '(no subject)'"></span>
+              <small :text="senderLabel(file.message.from) + ' · ' + folderName(file.message.folder) + ' · ' + readableBytes(file.size)"></small>
+            </span>
+          </button>
+          <a class="wm-action mail-icon-button" :href="attachmentPath(file.index, file.message)" :download="file.filename" :aria-label="'Download ' + file.filename" :title="'Download ' + file.filename"><span class="mail-icon" data-icon="download" aria-hidden="true"></span></a>
+        </div>
+        <div :for="(thread, index) in threads" :key="thread.id" class="wm-thread">
+          <h2 :if="categoryList && (index === 0 || (thread.unread === 0 && threads[index - 1]?.unread > 0))" class="wm-category-section" :text="thread.unread > 0 ? 'Unread' : 'Previously read'"></h2>
+          <div class="wm-message-row" :data-list-row="'group:' + thread.id" :class="{ 'wm-message-row--active': thread.count === 1 && selected && messageIdentity(thread.latest) === messageIdentity(selected), 'wm-message-row--unread': thread.unread > 0 }">
+            <input class="wm-message-check" data-list-control="select" type="checkbox" :checked="threadChecked(thread)" :aria-checked="threadPartial(thread) ? 'mixed' : threadChecked(thread) ? 'true' : 'false'" @click.stop.prevent="toggleThreadSelection(thread, $event)" :disabled="mutating" :aria-label="categoryList ? 'Select messages from ' + thread.latest.from : 'Select conversation: ' + (thread.latest.subject || '(no subject)')">
+            <button class="wm-msg" data-list-control="open" @click="thread.count > 1 ? toggleThread(thread.id) : openListMessage(thread.latest)" :aria-expanded="thread.count > 1 ? expandedThreads.includes(thread.id) : null" :disabled="mutating">
+              <span class="wm-msg-row"><span class="wm-msg-from" :title="thread.latest.from" :text="senderLabel(thread.latest.from)"></span><span class="wm-msg-date" :title="fullDate(thread.latest.date)" :text="shortDate(thread.latest.date)"></span></span>
+              <span class="wm-msg-subject"><span :text="(thread.latest.flags?.flagged ? '★ ' : '') + (thread.latest.has_attachments ? '📎 ' : '') + displaySubject(thread.latest)"></span><span :if="thread.count > 1" class="wm-thread-count" :text="thread.count"></span></span>
               <span class="wm-msg-snippet" :text="thread.latest.snippet"></span>
             </button>
           </div>
           <div :if="thread.count > 1 && expandedThreads.includes(thread.id)" class="wm-thread-members">
-            <div :for="message in thread.members" class="wm-message-row" :class="{ 'wm-message-row--active': selected && messageKey(message) === messageKey(selected), 'wm-message-row--unread': !message.flags.seen }">
-              <input class="wm-message-check" type="checkbox" :checked="checkedKeys.includes(messageKey(message))" @click.stop.prevent="toggleSelection(message, $event)" :disabled="mutating" :aria-label="'Select message: ' + (message.subject || '(no subject)')">
-              <button class="wm-msg" @click="openMessage(message)" :disabled="mutating"><span class="wm-msg-row"><span class="wm-msg-from" :text="message.from"></span><span class="wm-msg-date" :text="shortDate(message.date)"></span></span><span class="wm-msg-subject" :text="message.subject || '(no subject)'"></span><span :if="searchAll" class="wm-folder-badge" :text="folderName(message.folder)"></span><span class="wm-msg-snippet" :text="message.snippet"></span></button>
+            <div :for="message in thread.members" :key="messageIdentity(message)" :data-list-row="messageIdentity(message)" class="wm-message-row" :class="{ 'wm-message-row--active': selected && messageIdentity(message) === messageIdentity(selected), 'wm-message-row--unread': !message.flags.seen }">
+              <input class="wm-message-check" data-list-control="select" type="checkbox" :checked="checkedKeys.includes(messageIdentity(message))" @click.stop.prevent="toggleSelection(message, $event)" :disabled="mutating" :aria-label="'Select message: ' + (message.subject || '(no subject)')">
+              <button class="wm-msg" data-list-control="open" @click="openListMessage(message)" :disabled="mutating"><span class="wm-msg-row"><span class="wm-msg-from" :title="message.from" :text="senderLabel(message.from)"></span><span class="wm-msg-date" :text="shortDate(message.date)"></span></span><span class="wm-msg-subject" :text="displaySubject(message)"></span><span :if="appliedSearchAll" class="wm-folder-badge" :text="folderName(message.folder)"></span><span class="wm-msg-snippet" :text="message.snippet"></span></button>
             </div>
           </div>
         </div>
-        <div :for="message in messages" class="wm-message-row" :class="{ 'wm-message-row--active': selected && messageKey(message) === messageKey(selected), 'wm-message-row--unread': !message.flags.seen }">
-          <input class="wm-message-check" type="checkbox" :checked="checkedKeys.includes(messageKey(message))" @click.stop.prevent="toggleSelection(message, $event)" :disabled="mutating" :aria-label="'Select message: ' + (message.subject || '(no subject)')">
-          <button class="wm-msg" @click="openMessage(message)" :disabled="mutating"><span class="wm-msg-row"><span class="wm-msg-from" :text="message.from"></span><span class="wm-msg-date" :title="fullDate(message.date)" :text="shortDate(message.date)"></span></span><span class="wm-msg-subject" :text="(message.flags.flagged ? '★ ' : '') + (message.has_attachments ? '📎 ' : '') + (message.flags.answered ? '↩ ' : '') + (message.subject || '(no subject)')"></span><span :if="searchAll" class="wm-folder-badge" :text="folderName(message.folder)"></span><span class="wm-msg-snippet" :text="message.snippet"></span></button>
+        <div :for="message in messages" :key="messageIdentity(message)" :data-list-row="messageIdentity(message)" class="wm-message-row" :class="{ 'wm-message-row--active': selected && messageIdentity(message) === messageIdentity(selected), 'wm-message-row--unread': !message.flags.seen }">
+          <input class="wm-message-check" data-list-control="select" type="checkbox" :checked="checkedKeys.includes(messageIdentity(message))" @click.stop.prevent="toggleSelection(message, $event)" :disabled="mutating" :aria-label="'Select message: ' + (message.subject || '(no subject)')">
+          <button class="wm-msg" data-list-control="open" @click="openListMessage(message)" :disabled="mutating"><span class="wm-msg-row"><span class="wm-msg-from" :title="message.from" :text="senderLabel(message.from)"></span><span class="wm-msg-date" :title="fullDate(message.date)" :text="shortDate(message.date)"></span></span><span class="wm-msg-subject" :text="(message.flags.flagged ? '★ ' : '') + (message.has_attachments ? '📎 ' : '') + (message.flags.answered ? '↩ ' : '') + displaySubject(message)"></span><span :if="appliedSearchAll || attentionView" class="wm-folder-badge" :text="folderName(message.folder)"></span><span :if="message.attention_deadline" class="wm-msg-date" :text="(attentionView === 'reminders' && message.attention_deadline <= now ? 'Due · ' : '') + deadlineLabel(message.attention_deadline)"></span><span class="wm-msg-snippet" :text="message.snippet"></span></button>
         </div>
       </div>
-      <footer class="wm-pagination"><button @click="turnPage(-1)" :disabled="page <= 1 || loading || mutating">Previous</button><span :text="'Page ' + page + ' of ' + Math.max(1, Math.ceil(total / 50))"></span><button @click="turnPage(1)" :disabled="page * 50 >= total || loading || mutating">Next</button></footer>
+      <footer class="wm-pagination"><button @click="turnPage(-1)" :disabled="page <= 1 || loading || mutating">Previous</button><span :text="'Page ' + page + ' of ' + Math.max(1, Math.ceil(total / messagePageSize))"></span><button @click="turnPage(1)" :disabled="page * messagePageSize >= total || loading || mutating">Next</button></footer>
     </section>
-    <section :if="!outboxView" class="wm-read" aria-label="Message reader">
-      <button class="wm-back" @click="reading.set(false)" :disabled="mutating">Back to messages</button>
-      <p :if="!selected" class="wm-state" role="status" :text="readingLoading ? 'Opening message…' : 'Select a message to read.'"></p>
+    <section :if="senderReviewOpen" class="wm-list wm-review" aria-label="Sender Review">
+      <header class="wm-list-head"><h1 class="wm-list-title">Sender Review</h1><button type="button" class="wm-refresh" @click="refresh()" :disabled="senderReviewLoading || senderReviewSaving">Refresh</button></header>
+      <nav class="wm-review-tabs" aria-label="Sender Review views">
+        <button type="button" class="wm-action" :aria-pressed="senderReviewView === 'pending'" @click="showSenderReview('pending')" :disabled="senderReviewSaving">Pending</button>
+        <button type="button" class="wm-action" :aria-pressed="senderReviewView === 'declined'" @click="showSenderReview('declined')" :disabled="senderReviewSaving">Declined</button>
+        <button type="button" class="wm-action" :aria-pressed="senderReviewView === 'decisions'" @click="showSenderReview('decisions')" :disabled="senderReviewSaving">Decisions</button>
+      </nav>
+      <p :if="senderReviewError" class="login-error" role="alert" :text="senderReviewError"></p>
+      <div class="wm-list-body" :aria-busy="senderReviewLoading || senderReviewSaving">
+        <p :if="senderReviewLoading" class="wm-state" role="status">Loading Sender Review…</p>
+        <p :if="!senderReviewLoading && senderReviewView !== 'decisions' && senderReviewGroups.length === 0" class="wm-state" :text="senderReviewView === 'pending' ? 'No senders are waiting for review.' : 'No declined messages.'"></p>
+        <p :if="!senderReviewLoading && senderReviewView === 'decisions' && senderReviewRules.length === 0" class="wm-state">No saved sender decisions.</p>
+        <article :for="group in senderReviewGroups" class="wm-review-group">
+          <header><h2 :text="group.name"></h2><span class="wm-review-badge" :class="{ 'wm-review-badge--unverified': !group.verified }" :text="group.verified ? 'Verified sender' : 'Unverified sender'"></span></header>
+          <button :for="item in group.messages" type="button" class="wm-msg wm-review-message" :class="{ 'wm-review-message--selected': senderReviewSelection?.reference === item.reference }" @click="openReviewMessage(item)" :disabled="senderReviewSaving">
+            <span class="wm-msg-row"><span class="wm-msg-subject" :text="item.subject || '(no subject)'"></span><span class="wm-msg-date" :text="shortDate(item.date)"></span></span>
+            <span class="wm-msg-snippet" :text="'Delivered to ' + item.recipient"></span>
+            <span :if="item.applying" class="wm-msg-snippet">Applying decision…</span>
+          </button>
+        </article>
+        <article :for="rule in senderReviewRules" class="wm-review-group wm-review-rule">
+          <header><h2 :text="rule.author"></h2><span class="wm-review-badge" :class="{ 'wm-review-badge--unverified': rule.action === 'decline' }" :text="rule.action === 'allow' ? 'Allowed' : 'Declined'"></span></header>
+          <div class="wm-review-rule-actions">
+            <button type="button" class="wm-action" @click="decideSenderReview(rule.action === 'allow' ? 'decline' : 'allow', rule)" :disabled="senderReviewLoading || senderReviewSaving" :text="rule.action === 'allow' ? 'Decline sender' : 'Allow sender'"></button>
+            <button :if="rule.action === 'allow'" type="button" class="wm-action" @click="decideSenderReview('allow', rule, !rule.forward)" :disabled="senderReviewLoading || senderReviewSaving" :text="rule.forward ? 'Turn off forwarding' : 'Turn on forwarding'"></button>
+            <button type="button" class="wm-action" @click="decideSenderReview('reset', rule)" :disabled="senderReviewLoading || senderReviewSaving">Reset decision</button>
+          </div>
+        </article>
+      </div>
+      <footer :if="senderReviewPage > 1 || senderReviewMore" class="wm-pagination">
+        <button type="button" @click="showSenderReview(senderReviewView, senderReviewPage - 1)" :disabled="senderReviewPage <= 1 || senderReviewLoading || senderReviewSaving">Previous</button>
+        <span :text="'Page ' + senderReviewPage"></span>
+        <button type="button" @click="showSenderReview(senderReviewView, senderReviewPage + 1)" :disabled="!senderReviewMore || senderReviewLoading || senderReviewSaving">Next</button>
+      </footer>
+    </section>
+    <section :if="!outboxView" class="wm-read" ref="messageReader" aria-label="Message reader" :aria-busy="readingLoading">
+      <button :if="!followUpFocused && !readingBatch" class="wm-back" @click="closeReader(true)" :disabled="mutating"><span class="mail-icon" data-icon="back" aria-hidden="true"></span>Back to messages</button>
+      <div :if="followUpFocused" class="wm-follow-up-nav"><button type="button" class="wm-action" @click="closeReader(true)" :disabled="mutating">Back to reply queue</button><button type="button" class="wm-action" @click="nextFollowUp()" :disabled="loading || readingLoading || mutating">Next reply</button></div>
+      <nav :if="readingBatch" class="wm-batch-nav" aria-label="Reading batch">
+        <button type="button" class="wm-action" @click="closeReader(true)" :disabled="mutating"><span class="mail-icon" data-icon="back" aria-hidden="true"></span>Back to messages</button>
+        <span class="wm-batch-progress" role="status" :text="readingBatch.kind === 'selected' ? (readingBatch.index + 1) + ' of ' + readingBatch.items.length : readingBatch.read + ' unread opened'"></span>
+        <button :if="readingBatch.kind === 'selected'" type="button" class="wm-action" @click="advanceBatch(-1)" :disabled="readingBatch.index <= 0 || triageBusy || mutating || readingLoading">Previous</button>
+        <button type="button" class="wm-action wm-action--accent" aria-keyshortcuts="Shift+J" @click="advanceBatch()" :disabled="triageBusy || mutating || readingLoading || (readingBatch.kind === 'selected' && readingBatch.index + 1 >= readingBatch.items.length)" :text="readingBatch.kind === 'unread' ? 'Next unread' : 'Next selected'"></button>
+      </nav>
+      <div :if="readerError" class="wm-inline-error" tabindex="-1" data-reader-focus role="alert"><span :text="readerError"></span><button :if="readerTarget" type="button" class="wm-action" @click="retryReader()" :disabled="readingLoading || triageBusy">Retry message</button></div>
+      <p :if="readingLoading" class="wm-a11y-text" role="status">Opening message…</p>
+      <div :if="!selected && !readerError" class="wm-reader-empty" aria-hidden="true"><span class="mail-icon" :data-icon="libraryView ? 'attach' : 'mail'" aria-hidden="true"></span><span :text="readingLoading ? 'Opening message…' : (libraryView ? 'Select an attachment to open its message.' : 'Select a message to read.')"></span></div>
       <article :if="selected" class="wm-read-body">
-        <div class="wm-read-toolbar" :aria-busy="mutating">
-          <button :if="selected?.folder === 'Drafts'" class="wm-action" @click="editDraft()" :disabled="mutating">Edit draft</button>
-          <button :if="selected?.folder !== 'Drafts'" class="wm-action" @click="compose('reply')" :disabled="mutating">Reply</button><button :if="selected?.folder !== 'Drafts'" class="wm-action" @click="compose('all')" :disabled="mutating">Reply all</button><button :if="selected?.folder !== 'Drafts'" class="wm-action" @click="compose('forward')" :disabled="mutating">Forward</button>
-          <button class="wm-action" @click="selectedAction(selected?.flags?.flagged ? 'unflag' : 'flag')" :disabled="mutating" :text="selected?.flags?.flagged ? 'Unflag' : 'Flag'"></button><button class="wm-action" @click="selectedAction('unread')" :disabled="mutating">Mark unread</button><button class="wm-action" @click="selectedAction('move')" :disabled="mutating">Move</button><select x-model="moveTo" :disabled="mutating" aria-label="Move destination"><option :for="item in folders" :value="item.name" :text="folderName(item.name)"></option></select><button class="wm-action wm-action--danger" @click="selectedAction(selected?.folder === 'Trash' ? 'purge' : 'trash')" :disabled="mutating" :text="selected?.folder === 'Trash' ? 'Delete permanently' : 'Trash'"></button>
+        <div :if="senderReviewOpen && senderReviewSelection" class="wm-read-toolbar wm-review-toolbar" :aria-busy="senderReviewSaving">
+          <button :if="senderReviewSelection?.folder === 'Declined'" type="button" class="wm-action" @click="reviewMessage('recover')" :disabled="senderReviewSelection?.applying || senderReviewSaving">Recover this message</button>
+          <button :if="senderReviewSelection?.folder === 'Screening' || senderReviewSelection?.verified" type="button" class="wm-action" @click="reviewMessage('allow')" :disabled="senderReviewSelection?.applying || senderReviewSaving" :text="senderReviewSelection?.verified ? 'Allow sender' : 'Allow this message'"></button>
+          <button :if="senderReviewSelection?.folder === 'Screening'" type="button" class="wm-action" @click="reviewMessage('allow', true)" :disabled="senderReviewSelection?.applying || senderReviewSaving">Allow and reply</button>
+          <button :if="senderReviewSelection?.folder === 'Screening'" type="button" class="wm-action wm-action--danger" @click="reviewMessage('decline')" :disabled="senderReviewSelection?.applying || senderReviewSaving" :text="senderReviewSelection?.verified ? 'Decline sender' : 'Decline this message'"></button>
         </div>
-        <span class="wm-folder-badge" :text="folderName(selected?.folder || '')"></span><h2 class="wm-read-subject" :text="selected?.subject || '(no subject)'"></h2>
-        <div class="wm-read-meta"><div><span class="wm-read-label">From</span><span :text="selected?.from"></span></div><div><span class="wm-read-label">To</span><span :text="selected?.to"></span></div><div :if="selected?.cc"><span class="wm-read-label">Cc</span><span :text="selected?.cc"></span></div><div :if="selected?.bcc"><span class="wm-read-label">Bcc</span><span :text="selected?.bcc"></span></div><div :if="selected?.reply_to"><span class="wm-read-label">Reply to</span><span :text="selected?.reply_to"></span></div><div><span class="wm-read-label">Date</span><span :text="fullDate(selected?.date || '')"></span></div></div>
+        <p :if="senderReviewOpen && senderReviewSelection && !senderReviewSelection.verified" class="wm-review-copy">This sender is unverified. Your decision applies to this message only.</p>
+        <div :if="!senderReviewOpen" class="wm-read-toolbar" :aria-busy="mutating">
+          <button :if="unreadAvailable && !readingBatch" type="button" class="wm-action wm-action--accent" aria-keyshortcuts="Shift+N" @click="nextUnread()" :disabled="triageBusy || mutating || readingLoading">Next unread</button>
+          <button :if="readingBatch && selected?.folder !== 'Archive'" type="button" class="wm-action" @click="triageAndNext('archive')" :disabled="triageBusy || mutating || readingLoading">Archive &amp; next</button>
+          <button :if="readingBatch && selected?.folder !== 'Trash'" type="button" class="wm-action" @click="triageAndNext('trash')" :disabled="triageBusy || mutating || readingLoading">Trash &amp; next</button>
+          <button :if="selected?.folder === 'Drafts'" class="wm-action" @click="editDraft()" :disabled="mutating"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span><span>Edit draft</span></button>
+          <button :if="selected?.folder !== 'Drafts'" class="wm-action" @click="compose('reply')" :disabled="mutating"><span class="mail-icon" data-icon="reply" aria-hidden="true"></span><span>Reply</span></button><button :if="selected?.folder !== 'Drafts'" class="wm-action" @click="compose('all')" :disabled="mutating"><span class="mail-icon" data-icon="reply-all" aria-hidden="true"></span><span>Reply all</span></button><button :if="selected?.folder !== 'Drafts'" class="wm-action" @click="compose('forward')" :disabled="mutating"><span class="mail-icon" data-icon="forward" aria-hidden="true"></span><span>Forward</span></button>
+          <button :if="selected?.folder === 'Newsletters'" class="wm-action wm-newsletter-toggle" @click="newsletterExpanded.set(!newsletterExpanded())" :aria-pressed="readerExpanded" :text="readerExpanded ? 'Show message list' : 'Expand reader'"></button>
+          <button class="wm-action" @click="selectedAction(selected?.flags?.flagged ? 'unflag' : 'flag')" :disabled="mutating"><span class="mail-icon" data-icon="flag" aria-hidden="true"></span><span :text="selected?.flags?.flagged ? 'Unflag' : 'Flag'"></span></button>
+          <button class="wm-action" @click="selectedAction('unread')" :disabled="mutating"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span><span>Mark unread</span></button>
+          <button class="wm-action" @click="selectedAction('move')" :disabled="mutating"><span class="mail-icon" data-icon="folder" aria-hidden="true"></span><span>Move this message</span></button><select x-model="moveTo" :disabled="mutating" aria-label="Move destination"><option :for="item in folders" :value="item.name" :text="folderName(item.name)"></option></select>
+          <button :if="readerJunkAction" class="wm-action wm-junk-action" :class="{ 'wm-action--accent': readerJunkAction === 'not_junk' }" @click="selectedAction(readerJunkAction())" :disabled="mutating || readingLoading" title="Junk feedback applies to future mail from verified senders"><span class="mail-icon" data-icon="shield" aria-hidden="true"></span><span :text="readerJunkAction === 'not_junk' ? 'Not junk' : 'Mark junk'"></span></button>
+          <button class="wm-action wm-action--danger" @click="selectedAction(selected?.folder === 'Trash' ? 'purge' : 'trash')" :disabled="mutating"><span class="mail-icon" data-icon="trash" aria-hidden="true"></span><span :text="selected?.folder === 'Trash' ? 'Delete permanently' : 'Trash'"></span></button>
+        </div>
+        <div class="wm-message-heading">
+          <div class="wm-message-heading-actions">
+            <span class="wm-folder-badge" :text="folderName(selected?.folder || '')"></span>
+            <button :if="canOpenPrivate" type="button" class="wm-action" :aria-expanded="privateOpen" @click="privateOpen ? closePrivate() : showPrivate()" :disabled="readingLoading || mutating"><span class="mail-icon" data-icon="bookmark" aria-hidden="true"></span>Private tools</button>
+          </div>
+          <h2 class="wm-read-subject" tabindex="-1" data-reader-focus :text="displaySubject(selected)"></h2>
+          <p :if="selected?.personal_subject" class="wm-original-subject"><span>Original subject</span> <span :text="selected?.subject || '(no subject)'"></span></p>
+        </div>
+        <section :if="canOpenPrivate && privateOpen" class="wm-private-panel" aria-label="Private conversation tools" :aria-busy="privateBusy">
+          <div class="wm-private-tabs" role="group" aria-label="Private tools views">
+            <button class="wm-action" type="button" :aria-pressed="privateTab === 'notes'" @click="privateTab.set('notes')">Notes</button>
+            <button class="wm-action" type="button" :aria-pressed="privateTab === 'clips'" @click="privateTab.set('clips')">Clips</button>
+            <button class="wm-action" type="button" :aria-pressed="privateTab === 'organize'" @click="privateTab.set('organize')">Organize</button>
+          </div>
+          <p :if="privateBusy && !privateTools" class="wm-state" role="status">Loading private tools…</p>
+          <p :if="privateError" class="login-error" role="alert" :text="privateError"></p>
+          <div :if="privateTools && privateTab !== 'organize'" class="wm-private-entries">
+            <article :for="entry in privateEntries" :key="entry.id" class="wm-private-entry">
+              <span :if="entry.kind === 'clip'" class="wm-private-clip-source" :text="entry.source_subject || '(no subject)'"></span>
+              <p :text="entry.body"></p>
+              <div class="wm-private-actions">
+                <button :if="entry.kind === 'note'" type="button" class="wm-action" @click="editPrivateNote(entry)" :disabled="privateBusy">Edit note</button>
+                <button type="button" class="wm-action wm-action--danger" @click="removePrivateEntry(entry)" :disabled="privateBusy" :text="entry.kind === 'clip' ? 'Remove clip' : 'Remove note'"></button>
+              </div>
+            </article>
+          </div>
+          <form :if="privateTools && privateTab === 'notes'" class="wm-private-form" @submit.prevent="savePrivateNote()">
+            <label>Private note<textarea x-model="noteText" rows="3" maxlength="8192" required :disabled="privateBusy"></textarea></label>
+            <div class="wm-private-actions"><button class="wm-action wm-action--accent" type="submit" :disabled="privateBusy || !noteText.trim()" :text="editingNote ? 'Save note changes' : 'Add note'"></button><button :if="editingNote" type="button" class="wm-action" @click="cancelPrivateNote()" :disabled="privateBusy">Cancel</button></div>
+          </form>
+          <form :if="privateTools && privateTab === 'clips'" class="wm-private-form" @submit.prevent="savePrivateClip()">
+            <label>Message excerpt<textarea x-model="clipText" rows="3" maxlength="2048" required :disabled="privateBusy" placeholder="Paste an excerpt from the message"></textarea></label>
+            <div class="wm-private-actions"><button class="wm-action wm-action--accent" type="submit" :disabled="privateBusy || !clipText.trim()">Save clip</button><button type="button" class="wm-action" @click="startPrivateClip()" :disabled="privateBusy || !privateTools?.clip_source.trim()">Use opening text</button></div>
+          </form>
+          <div :if="privateTools && privateTab === 'organize'" class="wm-private-organize">
+            <form class="wm-private-form" @submit.prevent="savePrivateLabel()">
+              <label>Personal subject<input type="text" x-model="privateLabel" maxlength="120" :disabled="privateBusy"></label>
+              <button type="submit" class="wm-action wm-action--accent" :disabled="privateBusy || privateLabel.trim() === privateTools?.label.value">Save subject</button>
+            </form>
+            <fieldset class="wm-private-membership">
+              <legend>My collections</legend>
+              <label :for="item in privateTools?.collections || []" :key="item.id"><input type="checkbox" :checked="item.included" @change="setPrivateMembership(item, $event)" :disabled="privateBusy"><span :text="item.name"></span></label>
+              <button type="button" class="wm-action" @click="showCollectionManager()">Manage collections</button>
+            </fieldset>
+          </div>
+        </section>
+        <section :if="selected?.reference && !senderReviewOpen && selected?.folder !== 'Drafts'" class="wm-reader-attention" aria-label="Message follow-up" :aria-busy="attentionSaving">
+          <div class="wm-reader-attention-actions">
+            <button type="button" class="wm-action" @click="changeAttention('follow_up', !selected?.attention?.follow_up)" :disabled="attentionSaving || readingLoading" :text="selected?.attention?.follow_up ? 'Remove from Follow-up' : 'Add to Follow-up'"></button>
+            <button type="button" class="wm-action" @click="changeAttention('saved', !selected?.attention?.saved)" :disabled="attentionSaving || readingLoading" :text="selected?.attention?.saved ? 'Remove from Saved' : 'Save message'"></button>
+            <button type="button" class="wm-action" @click="startAttentionSchedule('snoozed')" :disabled="attentionSaving || readingLoading" :text="selected?.attention?.snooze_until ? 'Change snooze' : 'Snooze thread'"></button>
+            <button :if="selected?.attention?.snooze_until" type="button" class="wm-action" @click="changeAttention('snoozed', false)" :disabled="attentionSaving || readingLoading">Wake now</button>
+            <button type="button" class="wm-action" @click="changeAttention('muted', !selected?.attention?.muted)" :disabled="attentionSaving || readingLoading" :text="selected?.attention?.muted ? 'Unmute thread' : 'Mute thread'"></button>
+            <button :if="selected?.folder === 'Sent' && selected?.message_id" type="button" class="wm-action" @click="startAttentionSchedule('reminders')" :disabled="attentionSaving || readingLoading" :text="selected?.attention?.remind_at ? 'Change reminder' : 'Remind me if no reply'"></button>
+            <button :if="selected?.attention?.remind_at" type="button" class="wm-action" @click="changeAttention('reminders', false)" :disabled="attentionSaving || readingLoading" :text="selected?.attention?.remind_at <= now ? 'Dismiss reminder' : 'Cancel reminder'"></button>
+          </div>
+          <p :if="selected?.attention?.snooze_until" class="wm-placement" :text="'Snoozed until ' + deadlineLabel(selected?.attention?.snooze_until)"></p>
+          <p :if="selected?.attention?.remind_at" class="wm-placement" :text="(selected?.attention?.remind_at <= now ? 'Reminder due since ' : 'Remind if no reply on ') + deadlineLabel(selected?.attention?.remind_at)"></p>
+          <form :if="attentionSchedule" class="wm-attention-schedule" @submit.prevent="saveAttentionSchedule()">
+            <label for="attentionDate"><span :text="attentionSchedule === 'snoozed' ? 'Wake this thread' : 'Remind me'"></span> <span :text="'(' + attentionZone + ')'"></span></label>
+            <div><input id="attentionDate" type="datetime-local" x-model="attentionDate" required :disabled="attentionSaving"><button type="submit" class="wm-action" :disabled="attentionSaving" :text="attentionSchedule === 'snoozed' ? 'Save snooze' : 'Save reminder'"></button><button type="button" class="wm-action" @click="attentionSchedule.set(null)" :disabled="attentionSaving">Cancel</button></div>
+          </form>
+        </section>
+        <div :if="receiptCompact" class="wm-receipt-preview">
+          <div class="wm-receipt-meta"><strong :text="selected?.from"></strong><span :text="fullDate(selected?.date || '')"></span></div>
+          <p :if="receiptPreview" class="wm-receipt-excerpt" :text="receiptPreview"></p>
+        </div>
+        <div :if="!receiptCompact" class="wm-read-meta"><div class="wm-read-sender"><span class="wm-avatar" aria-hidden="true" :text="senderInitials(selected?.from || '')"></span><div><strong :text="senderLabel(selected?.from || '')"></strong><small :if="senderLabel(selected?.from || '') !== selected?.from" :text="senderAddress(selected?.from || '')"></small></div></div><div><span class="wm-read-label">To</span><span :text="selected?.to"></span></div><div :if="senderReviewSelection && senderReviewSelection.recipient !== selected?.to"><span class="wm-read-label">Delivered to</span><span :text="senderReviewSelection?.recipient"></span></div><div :if="senderReviewSelection?.envelope_from && senderReviewSelection?.envelope_from !== senderReviewSelection?.author"><span class="wm-read-label">Envelope sender</span><span :text="senderReviewSelection?.envelope_from"></span></div><div :if="selected?.cc"><span class="wm-read-label">Cc</span><span :text="selected?.cc"></span></div><div :if="selected?.bcc"><span class="wm-read-label">Bcc</span><span :text="selected?.bcc"></span></div><div :if="selected?.reply_to"><span class="wm-read-label">Reply to</span><span :text="selected?.reply_to"></span></div><div><span class="wm-read-label">Date</span><span :text="fullDate(selected?.date || '')"></span></div></div>
+        <p :if="placementText && !senderReviewOpen" class="wm-placement wm-placement-info"><span class="mail-icon" data-icon="info" aria-hidden="true"></span><span :text="placementText"></span></p>
         <div class="wm-read-attach"><a :for="(attachment, index) in (selected?.attachments || [])" class="wm-attach-chip" :href="attachmentPath(index)" :download="attachment.filename" :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></a></div>
-        <div :if="selected?.html" class="wm-format-control"><button class="wm-action" @click="showHtml.set(!showHtml())" :text="showHtml ? 'Show plain text' : 'Show formatted email'"></button><span>Remote images are blocked.</span></div>
-        <iframe :if="selected?.html && showHtml" class="wm-read-html" sandbox="" referrerpolicy="no-referrer" title="Email content" :srcdoc="safeHtml(selected?.html || '')"></iframe><pre :if="!selected?.html || !showHtml" class="wm-read-text" :text="selected?.text || 'No plain-text version is available.'"></pre>
+        <div class="wm-format-control">
+          <button :if="selected?.folder === 'Receipts'" class="wm-action" @click="receiptFull.set(!receiptFull())" :aria-expanded="receiptFull" :text="receiptFull ? 'Show receipt summary' : 'Read full receipt'"></button>
+          <button :if="selected?.html && !receiptCompact" class="wm-action" @click="showHtml.set(!showHtml())" :text="showHtml ? 'Show plain text' : 'Show formatted email'"></button>
+          <span :if="selected?.html && !receiptCompact && showHtml && formattedReader.remoteImages > 0" class="wm-image-status">
+            <span class="mail-icon" :data-icon="remoteImagesAllowed ? 'info' : 'shield'" aria-hidden="true"></span>
+            <span :text="remoteImagesAllowed ? 'Remote images are allowed for this open message.' : 'Remote images are blocked.'"></span>
+          </span>
+          <button :if="selected?.html && !receiptCompact && showHtml && formattedReader.remoteImages > 0" class="wm-action"
+            @click="remoteImagesAllowed.set(!remoteImagesAllowed())" :text="remoteImagesAllowed ? 'Block remote images' : 'Load remote images'"></button>
+        </div>
+        <template :if="!receiptCompact && selected?.html && showHtml">
+          <iframe class="wm-read-html" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" title="Email content" :srcdoc="formattedReader.source"></iframe>
+        </template>
+        <pre :if="!receiptCompact && (!selected?.html || !showHtml)" class="wm-read-text" :text="selected?.text || 'No plain-text version is available.'"></pre>
+        <form :if="selected?.placement?.verified_author && !senderReviewOpen && !isJunkFolder(selected?.folder)" class="wm-category-rule" @submit.prevent="saveCategoryRule()">
+          <label for="categoryDestination">Future mail from <strong :text="selected?.placement?.verified_author"></strong></label>
+          <div><select id="categoryDestination" x-model="categoryRule" :disabled="categoryRuleSaving || readingLoading"><option value="automatic">Use account sorting</option><option value="inbox">Inbox</option><option value="newsletters">Newsletters</option><option value="receipts">Receipts</option></select><button type="submit" class="wm-action" :disabled="categoryRuleSaving || readingLoading || categoryRule === selected?.placement?.rule">Save sender rule</button></div>
+        </form>
+        <details :if="selected?.reference && selected?.notifications && !senderReviewOpen && selected?.folder !== 'Drafts'" class="wm-notification-rules">
+          <summary><span class="mail-icon" data-icon="bell" aria-hidden="true"></span>Notification rules</summary>
+          <div class="wm-notification-fields">
+            <label>Browser notifications for this thread
+              <select :value="selected?.notifications?.thread" @change="changeNotificationRule('thread', $event)" :disabled="notificationRuleBusy || readingLoading">
+                <option value="default">Use sender or mailbox setting</option><option value="notify">Notify</option><option value="quiet">Quiet</option>
+              </select>
+            </label>
+            <label :if="selected?.notifications?.verified_author">Browser notifications for this sender <strong :text="selected?.notifications?.verified_author"></strong>
+              <select :value="selected?.notifications?.sender" @change="changeNotificationRule('sender', $event)" :disabled="notificationRuleBusy || readingLoading">
+                <option value="default">Use mailbox setting</option><option value="notify">Notify</option><option value="quiet">Quiet</option>
+              </select>
+            </label>
+            <p :if="notificationRuleError" class="login-error" role="alert" :text="notificationRuleError"></p>
+          </div>
+        </details>
       </article>
     </section>
     <section :if="outboxView" class="wm-outbox" aria-label="Outbox"><header class="wm-list-head"><h1>Outbox</h1><p>Messages wait here during the Undo Send window.</p></header><p :if="error" role="alert" class="login-error" :text="error"></p><p :if="outbox.length === 0" class="wm-state">No queued messages.</p>
@@ -140,7 +396,7 @@ onUnmounted(() => mail.destroy())
 </div>
 <dialog :if="composing" ref="composerDialog" class="wm-modal" aria-label="Compose message" @cancel.prevent="closeComposer()">
   <form class="wm-composer" @submit.prevent="send()">
-    <header class="wm-composer-head"><span :text="title"></span><button type="button" class="wm-composer-close" @click="closeComposer()" :disabled="sending || savingDraft" aria-label="Close composer">Close</button></header>
+    <header class="wm-composer-head"><span class="wm-composer-title"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span><span :text="title"></span></span><button type="button" class="wm-composer-close" @click="closeComposer()" :disabled="sending || savingDraft" aria-label="Close composer" title="Close composer"><span class="mail-icon" data-icon="close" aria-hidden="true"></span></button></header>
     <div class="wm-composer-fields">
       <div class="wm-recipient-field"><label for="recipient-to">To</label><div class="wm-recipient-box" :class="{ 'wm-recipient-box--invalid': toRecipients.some(item => !item.valid) }">
         <div :for="(item, index) in toRecipients" class="wm-recipient-chip" :class="{ 'wm-recipient-chip--invalid': !item.valid }"><button type="button" @click="editRecipient('to', index)" :disabled="sending || sendUncertain" :title="item.address" :text="item.name || item.address || item.raw"></button><button type="button" @click="removeRecipient('to', index)" :disabled="sending || sendUncertain" :aria-label="'Remove recipient ' + item.address">×</button></div>
@@ -162,17 +418,171 @@ onUnmounted(() => mail.destroy())
       <label for="composeSubject">Subject</label><input id="composeSubject" type="text" x-model="subject" :disabled="sending || sendUncertain" maxlength="500">
     </div>
     <textarea class="wm-composer-body" x-model="body" :disabled="sending || sendUncertain" aria-label="Message body" placeholder="Write your message…"></textarea>
+    <label :if="replyContext?.reference" class="wm-reply-clear"><input type="checkbox" x-model="clearFollowUp" :disabled="sending || sendUncertain">Clear Follow-up after successful delivery</label>
     <div class="wm-dropzone" :class="{ 'wm-dropzone--active': dragging }" @dragover.prevent="dragging.set(true)" @dragleave="dragging.set(false)" @drop.prevent="dropAttachments($event)">
-      <label class="wm-action">Add attachments<input ref="fileInput" class="wm-file-input" type="file" multiple aria-label="Add attachments" @change="attachFiles()" :disabled="sending || attachmentUploading || limits.maxCount === 0"></label><span>or drop files here</span><small :text="readableBytes(attachmentBytes()) + ' used · ' + readableBytes(attachmentRemaining()) + ' remaining'"></small>
+      <label class="wm-action"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span>Add attachments<input ref="fileInput" class="wm-file-input" type="file" multiple aria-label="Add attachments" @change="attachFiles()" :disabled="sending || attachmentUploading || limits.maxCount === 0"></label><span>or drop files here</span><small :text="readableBytes(attachmentBytes()) + ' used · ' + readableBytes(attachmentRemaining()) + ' remaining'"></small>
     </div>
     <ul :if="attachments.length" class="wm-compose-attachments"><li :for="attachment in attachments"><div><span :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></span><progress :if="attachment.status === 'uploading' || attachment.status === 'loading'" max="100" :value="attachment.status === 'loading' ? undefined : attachment.progress" :aria-label="(attachment.status === 'loading' ? 'Loading ' : 'Uploading ') + attachment.filename"></progress><small :if="attachment.status === 'uploading' || attachment.status === 'loading'" aria-hidden="true" :text="attachment.status === 'loading' ? 'Loading…' : attachment.progress === 100 ? 'Processing…' : attachment.progress + '%' "></small><p :if="attachment.error" class="wm-composer-error" :text="attachment.error"></p></div><button :if="attachment.status === 'failed'" type="button" class="wm-action" @click="retryAttachment(attachment.key)" :disabled="sending || sendUncertain">Retry upload</button><button type="button" class="wm-action" @click="removeAttachment(attachment.key)" :disabled="sending || sendUncertain" :aria-label="'Remove attachment ' + attachment.filename">Remove</button></li></ul>
     <p :if="composeError || draftError" class="wm-composer-error" role="alert" :text="composeError || draftError"></p><div :if="sendUncertain" class="wm-draft-conflict"><button type="button" class="wm-action" @click="confirmPendingSend()" :disabled="sending">Confirm send status</button></div><div :if="draftConflict" class="wm-draft-conflict"><button type="button" class="wm-action" @click="saveDraftCopy()">Save a copy</button><button type="button" class="wm-action" @click="showConfirmation('reload-draft')">Reload saved draft</button></div>
     <div class="wm-draft-status" role="status" aria-live="polite" aria-atomic="true" :text="saveStatus"></div>
-    <footer class="wm-composer-foot"><button class="wm-send-btn" type="submit" :disabled="sending || sendUncertain || savingDraft || attachmentPending || draftConflict || authExpired" :text="sending ? 'Queuing…' : 'Send'"></button><button class="wm-action" type="button" @click="saveDraft()" :disabled="sending || savingDraft || attachmentPending" :text="savingDraft ? 'Saving…' : 'Save draft'"></button><button class="wm-action" type="button" @click="showConfirmation('discard')" :disabled="sending || savingDraft">Discard</button><label class="wm-send-delay">Undo Send<select x-model.number="sendDelay" @change="saveSendPreference()" :disabled="sending || sendUncertain"><option :for="value in sendDelayOptions" :value="value" :text="value === 0 ? 'Off' : value + ' seconds'"></option></select></label></footer>
+    <footer class="wm-composer-foot"><button class="wm-send-btn" type="submit" :disabled="sending || sendUncertain || savingDraft || attachmentPending || draftConflict || authExpired"><span class="mail-icon" data-icon="send" aria-hidden="true"></span><span :text="sending ? 'Queuing…' : 'Send'"></span></button><button class="wm-action" type="button" @click="saveDraft()" :disabled="sending || savingDraft || attachmentPending" :text="savingDraft ? 'Saving…' : 'Save draft'"></button><button class="wm-action" type="button" @click="showConfirmation('discard')" :disabled="sending || savingDraft">Discard</button><label class="wm-send-delay">Undo Send<select aria-label="Undo Send delay" x-model.number="sendDelay" @change="saveSendPreference()" :disabled="sending || sendUncertain"><option :for="value in sendDelayOptions" :value="value" :text="value === 0 ? 'Off' : value + ' seconds'"></option></select></label></footer>
   </form>
 </dialog>
-<dialog :if="settings" ref="passwordDialog" class="wm-modal wm-password-dialog" aria-label="Account settings" @cancel.prevent="settings.set(false)"><div class="login"><form @submit.prevent="changePassword()"><h1>Change password</h1><p class="login-sub">Updates your webmail, SMTP and IMAP credentials.</p><label for="currentPassword">Current password</label><input id="currentPassword" type="password" x-model="currentPassword" autocomplete="current-password" required autofocus><label for="newPassword">New password</label><input id="newPassword" type="password" x-model="newPassword" autocomplete="new-password" minlength="12" required><label for="confirmPassword">Confirm password</label><input id="confirmPassword" type="password" x-model="confirmPassword" autocomplete="new-password" minlength="12" required><p :if="passwordError" role="alert" class="login-error" :text="passwordError"></p><button type="submit" :disabled="savingPassword" :text="savingPassword ? 'Saving…' : 'Change password'"></button><button type="button" @click="settings.set(false)" :disabled="savingPassword || savingRecovery">Close</button></form>
-<form class="login-recovery" aria-labelledby="recoveryHeading" @submit.prevent="saveRecovery()"><h2 id="recoveryHeading">Recovery address</h2><p class="login-sub" :if="recoveryLoading">Loading…</p><p class="login-sub" :if="!recoveryLoading && recoveryAddress">Password reset links go to <strong :text="recoveryAddress"></strong><span :if="recoverySetBy === 'operator'"> (set by your mail administrator)</span>.</p><p class="login-sub" :if="!recoveryLoading && !recoveryAddress">None set. Without one, a forgotten password can only be reset by your mail administrator.</p><label for="recoveryInput">Recovery email</label><input id="recoveryInput" type="email" x-model.trim="recoveryInput" autocomplete="email" placeholder="you@another-provider.com"><label for="recoveryPassword">Current password</label><input id="recoveryPassword" type="password" x-model="recoveryPassword" autocomplete="current-password"><p :if="recoveryError" role="alert" class="login-error" :text="recoveryError"></p><p :if="recoveryNotice" role="status" class="login-sub" :text="recoveryNotice"></p><button type="submit" class="login-secondary" :disabled="savingRecovery || recoveryLoading" :text="savingRecovery ? 'Saving…' : 'Save recovery address'"></button></form></div></dialog>
+<dialog :if="settings" ref="passwordDialog" class="wm-modal wm-password-dialog" aria-label="Account settings" @cancel.prevent="settings.set(false)"><div class="wm-account-panel">
+<header class="wm-account-header">
+  <div class="wm-account-heading"><span class="wm-avatar" aria-hidden="true" :text="senderInitials(user?.email || '')"></span><div><h1>Account</h1><p :text="user?.email"></p></div></div>
+  <div class="wm-account-header-actions">
+    <button type="button" class="wm-action wm-action--accent" @click="leaveAccount()" :disabled="leavingAccount || sending || mutating"><span class="mail-icon" data-icon="exit" aria-hidden="true"></span><span :text="leavingAccount ? 'Saving and signing out…' : 'Switch account'"></span></button>
+    <button type="button" class="wm-action" @click="settings.set(false)" :disabled="savingPassword || savingRecovery" autofocus>Close</button>
+  </div>
+  <p :if="accountChangeError" class="login-error" role="alert" :text="accountChangeError"></p>
+</header>
+<div class="login wm-account-settings">
+<form class="login-recovery" @submit.prevent="changePassword()"><h2>Change password</h2><p class="login-sub">Updates your webmail, SMTP and IMAP credentials.</p><label for="currentPassword">Current password</label><input id="currentPassword" type="password" x-model="currentPassword" autocomplete="current-password" required><label for="newPassword">New password</label><input id="newPassword" type="password" x-model="newPassword" autocomplete="new-password" minlength="12" required><label for="confirmPassword">Confirm password</label><input id="confirmPassword" type="password" x-model="confirmPassword" autocomplete="new-password" minlength="12" required><p :if="passwordError" role="alert" class="login-error" :text="passwordError"></p><button type="submit" :disabled="savingPassword" :text="savingPassword ? 'Saving…' : 'Change password'"></button></form>
+<form class="login-recovery" aria-labelledby="recoveryHeading" @submit.prevent="saveRecovery()"><h2 id="recoveryHeading">Recovery address</h2><p class="login-sub" :if="recoveryLoading">Loading…</p><p class="login-sub" :if="!recoveryLoading && recoveryAddress">Password reset links go to <strong :text="recoveryAddress"></strong><span :if="recoverySetBy === 'operator'"> (set by your mail administrator)</span>.</p><p class="login-sub" :if="!recoveryLoading && !recoveryAddress">None set. Without one, a forgotten password can only be reset by your mail administrator.</p><label for="recoveryInput">Recovery email</label><input id="recoveryInput" type="email" x-model.trim="recoveryInput" autocomplete="email" placeholder="you@another-provider.com"><label for="recoveryPassword">Current password</label><input id="recoveryPassword" type="password" x-model="recoveryPassword" autocomplete="current-password"><p :if="recoveryError" role="alert" class="login-error" :text="recoveryError"></p><p :if="recoveryNotice" role="status" class="login-sub" :text="recoveryNotice"></p><button type="submit" class="login-secondary" :disabled="savingRecovery || recoveryLoading" :text="savingRecovery ? 'Saving…' : 'Save recovery address'"></button></form>
+<section class="login-recovery wm-forwarding" aria-labelledby="forwardingHeading">
+  <h2 id="forwardingHeading"><span class="mail-icon" data-icon="forward" aria-hidden="true"></span>Forwarding</h2>
+  <p :if="forwarding?.address" class="login-sub">New mail is copied to <strong :text="forwarding?.address"></strong>.</p>
+  <p :if="forwarding && !forwarding.address" class="login-sub">Forward new mail to a verified address and keep a copy in this mailbox.</p>
+  <p :if="!forwarding && forwardingBusy" class="login-sub" role="status">Loading forwarding…</p>
+  <p :if="forwardingError" class="login-error" role="alert" :text="forwardingError"></p>
+  <p :if="forwardingNotice" class="login-sub" role="status" :text="forwardingNotice"></p>
+  <form :if="forwarding?.pendingAddress" class="wm-forwarding-confirm" @submit.prevent="changeForwarding('confirm')">
+    <p :if="forwarding?.expiresAt > now" class="login-sub" role="status">Enter the code sent to <strong :text="forwarding?.pendingAddress"></strong>.</p>
+    <p :if="forwarding?.expiresAt <= now" class="login-sub" role="status">This code expired. Send a new code below.</p>
+    <label :if="forwarding?.expiresAt > now" for="forwardingCode">Verification code</label>
+    <input :if="forwarding?.expiresAt > now" id="forwardingCode" x-model.trim="forwardingCode" type="text" autocomplete="one-time-code" autocapitalize="off" spellcheck="false" maxlength="32" minlength="32" required :disabled="forwardingBusy">
+    <div class="wm-private-actions">
+      <button :if="forwarding?.expiresAt > now" type="submit" :disabled="forwardingBusy">Confirm forwarding</button>
+      <button type="button" class="login-secondary" @click="changeForwarding('cancel')" :disabled="forwardingBusy">Cancel request</button>
+    </div>
+  </form>
+  <form :if="forwarding" @submit.prevent="changeForwarding('request')">
+    <label for="forwardingAddress">Destination email</label>
+    <input id="forwardingAddress" x-model.trim="forwardingAddress" type="email" autocomplete="off" maxlength="254" required :disabled="forwardingBusy">
+    <label for="forwardingPassword">Current password</label>
+    <input id="forwardingPassword" x-model="forwardingPassword" type="password" autocomplete="current-password" required :disabled="forwardingBusy">
+    <div class="wm-private-actions">
+      <button type="submit" class="login-secondary" :disabled="forwardingBusy" :text="forwarding?.pendingAddress === forwardingAddress ? 'Send a new code' : 'Send verification code'"></button>
+      <button :if="forwarding?.address" type="button" class="login-secondary wm-forwarding-disable" @click="changeForwarding('disable')" :disabled="forwardingBusy || !forwardingPassword">Turn off forwarding</button>
+    </div>
+  </form>
+</section>
+<section class="login-recovery wm-vacation" aria-labelledby="vacationHeading">
+  <div class="wm-vacation-heading"><h2 id="vacationHeading"><span class="mail-icon" data-icon="clock" aria-hidden="true"></span>Vacation reply</h2><span :if="vacation" class="wm-vacation-status" :text="vacationStatus(vacation, now)"></span></div>
+  <p :if="!vacation && vacationBusy" class="login-sub" role="status">Loading vacation reply…</p>
+  <p :if="vacationError" class="login-error" role="alert" :text="vacationError"></p>
+  <p :if="vacationNotice" class="login-sub" role="status" :text="vacationNotice"></p>
+  <form :if="vacation" @submit.prevent="saveVacationSettings()">
+    <label class="wm-vacation-toggle"><input type="checkbox" x-model="vacationEnabled" :disabled="vacationBusy"> Send vacation replies</label>
+    <label for="vacationSubject">Subject</label><input id="vacationSubject" type="text" x-model.trim="vacationSubject" maxlength="256" required :disabled="vacationBusy">
+    <label for="vacationBody">Reply message</label><textarea id="vacationBody" x-model="vacationBody" maxlength="8192" rows="4" :required="vacationEnabled" :disabled="vacationBusy"></textarea>
+    <label for="vacationStart">Start time <span class="wm-vacation-optional">(optional)</span></label><input id="vacationStart" type="datetime-local" x-model="vacationStart" :disabled="vacationBusy">
+    <label for="vacationEnd">End time <span class="wm-vacation-optional">(optional)</span></label><input id="vacationEnd" type="datetime-local" x-model="vacationEnd" :disabled="vacationBusy">
+    <button type="submit" class="login-secondary" :disabled="vacationBusy">Save vacation reply</button>
+  </form>
+</section>
+<section :if="senderReviewStatus" class="login-recovery" aria-labelledby="senderReviewHeading">
+  <h2 id="senderReviewHeading">Sender Review</h2>
+  <p class="login-sub">Hold mail from new senders until you decide what reaches your inbox.</p>
+  <p :if="senderReviewError" class="login-error" role="alert" :text="senderReviewError"></p>
+  <button type="button" class="login-secondary" @click="setSenderReview(senderReviewStatus?.enabled ? 'disable' : 'enable')" :disabled="senderReviewSaving" :text="senderReviewStatus?.enabled ? 'Turn off Sender Review' : 'Turn on Sender Review'"></button>
+</section>
+<section class="login-recovery" aria-labelledby="sortingHeading">
+  <h2 id="sortingHeading">Automatic sorting</h2>
+  <p class="login-sub">File new mail from verified senders in Newsletters or Receipts when the message matches. Sender Review decisions and your sender rules still apply.</p>
+  <p :if="sortingError" class="login-error" role="alert" :text="sortingError"></p>
+  <button :if="sortingSettings" type="button" class="login-secondary" @click="toggleAutomaticSorting()" :disabled="sortingSaving" :text="sortingSettings?.automatic ? 'Turn off automatic sorting' : 'Turn on automatic sorting'"></button>
+</section>
+<section class="login-recovery" aria-labelledby="notificationHeading">
+  <h2 id="notificationHeading">Browser notifications</h2>
+  <p class="login-sub">Receive a private “You have new mail” alert while webmail is open.</p>
+  <p :if="notificationError" class="login-error" role="alert" :text="notificationError"></p>
+  <p :if="!notificationsAvailable" class="login-sub">This browser does not support mail alerts here.</p>
+  <button :if="notificationsAvailable && !notificationHere" type="button" class="login-secondary" @click="changeNotificationSettings(true)" :disabled="notificationBusy">Turn on browser notifications</button>
+  <button :if="notificationEnabled" type="button" class="login-secondary" @click="changeNotificationSettings(false)" :disabled="notificationBusy">Turn off browser notifications</button>
+</section></div></div></dialog>
+<dialog :if="contactsOpen" ref="contactsDialog" class="wm-modal wm-contacts-dialog" aria-labelledby="wm-contacts-title" @cancel.prevent="!contactsBusy && closeContacts()">
+  <section class="wm-contacts">
+    <header class="wm-contacts-head">
+      <h2 id="wm-contacts-title"><span class="mail-icon" data-icon="contacts" aria-hidden="true"></span>Contacts</h2>
+      <label :if="addressBook && addressBook.books.length > 1">Address book <select @change="loadContacts($event.target.value)" :disabled="contactsBusy"><option :for="book in addressBook?.books || []" :key="book" :value="book" :selected="book === addressBook?.book" :text="book"></option></select></label>
+      <button type="button" class="wm-action" @click="closeContacts()" :disabled="contactsBusy" autofocus>Close</button>
+    </header>
+    <p :if="contactsError" class="wm-inline-error" role="alert" :text="contactsError"></p>
+    <p :if="contactsBusy && !addressBook" class="wm-state" role="status">Loading contacts…</p>
+    <div :if="addressBook" class="wm-contacts-split" :aria-busy="contactsBusy">
+      <section class="wm-contacts-list" aria-label="Address book cards">
+        <div class="wm-private-tabs" role="group" aria-label="Card type">
+          <button type="button" class="wm-action" :aria-pressed="contactView === 'contact'" @click="changeContactView('contact')" :disabled="contactsBusy">People</button>
+          <button type="button" class="wm-action" :aria-pressed="contactView === 'group'" @click="changeContactView('group')" :disabled="contactsBusy">Groups</button>
+        </div>
+        <div class="wm-contact-search mail-search-field"><span class="mail-icon" data-icon="search" aria-hidden="true"></span><input type="search" class="wm-search" x-model="contactQuery" aria-label="Search address book" placeholder="Search address book"></div>
+        <div class="wm-contact-rows">
+          <button :for="card in visibleCards" :key="card.uid" type="button" class="wm-contact-row" :aria-pressed="activeCard?.uid === card.uid" @click="setCard(card)" :disabled="contactsBusy"><span class="mail-icon" :data-icon="card.kind === 'group' ? 'layers' : 'contacts'" aria-hidden="true"></span><span><strong :text="card.name"></strong><small :if="card.kind === 'contact' && card.emails.length" :text="card.emails[0]"></small><small :if="card.kind === 'group'" :text="card.members.length + (card.members.length === 1 ? ' member' : ' members')"></small></span></button>
+          <p :if="visibleCards.length === 0" class="wm-state" :text="contactView === 'group' ? 'No groups found.' : 'No contacts found.'"></p>
+        </div>
+        <button type="button" class="wm-action wm-action--accent" @click="newContact(contactView)" :disabled="contactsBusy"><span class="mail-icon" data-icon="plus" aria-hidden="true"></span><span :text="contactView === 'group' ? 'New group' : 'New contact'"></span></button>
+      </section>
+      <section class="wm-contact-detail" aria-label="Card editor">
+        <p :if="!contactDraft" class="wm-state">Select a card or create one.</p>
+        <form :if="contactDraft" class="wm-private-form" @submit.prevent="saveContact()">
+          <label>Name<input type="text" x-model="contactName" maxlength="256" required :disabled="contactsBusy"></label>
+          <label :if="contactDraft === 'contact'">Email addresses<textarea x-model="contactEmails" rows="3" placeholder="One address per line" :disabled="contactsBusy"></textarea></label>
+          <fieldset :if="contactDraft === 'group'" class="wm-private-membership wm-contact-members">
+            <legend>Members</legend>
+            <label :for="item in memberOptions" :key="item.uid"><input type="checkbox" :checked="memberUIDs.includes(item.uid)" @change="toggleContactMember(item.uid, $event)" :disabled="contactsBusy"><span :text="item.name"></span></label>
+            <p :if="memberOptions.length === 0" class="wm-state">Add people to this address book to build a group.</p>
+            <p :if="linkedMembers > 0" class="wm-state" :text="linkedMembers + (linkedMembers === 1 ? ' linked member is kept on this card.' : ' linked members are kept on this card.')"></p>
+          </fieldset>
+          <label>Notes<textarea x-model="contactNote" rows="4" maxlength="8192" :disabled="contactsBusy"></textarea></label>
+          <div class="wm-private-actions">
+            <button type="submit" class="wm-action wm-action--accent" :disabled="contactsBusy || !contactName.trim()" :text="activeCard ? 'Save changes' : (contactDraft === 'group' ? 'Create group' : 'Create contact')"></button>
+            <button :if="activeCard && (activeCard.emails.length || activeCard.members.length)" type="button" class="wm-action" @click="composeSavedCard()" :disabled="contactsBusy" :text="activeCard.kind === 'group' ? 'Email group' : 'Email contact'"></button>
+            <button :if="activeCard && !confirmCardRemoval" type="button" class="wm-action wm-action--danger" @click="confirmCardRemoval.set(true)" :disabled="contactsBusy">Remove</button>
+            <button :if="confirmCardRemoval" type="button" class="wm-action wm-action--danger" @click="deleteContact()" :disabled="contactsBusy" :text="contactDraft === 'group' ? 'Delete group' : 'Delete contact'"></button>
+            <button :if="confirmCardRemoval" type="button" class="wm-action" @click="confirmCardRemoval.set(false)" :disabled="contactsBusy">Cancel</button>
+          </div>
+        </form>
+      </section>
+    </div>
+  </section>
+</dialog>
+<dialog :if="collectionsOpen" ref="collectionsDialog" class="wm-modal" aria-labelledby="wm-collections-title" @cancel.prevent="closeCollectionManager()">
+  <section class="wm-shortcuts wm-collection-manager">
+    <header><h2 id="wm-collections-title">My collections</h2><button type="button" class="wm-action" @click="closeCollectionManager()" :disabled="collectionsBusy">Close</button></header>
+    <p :if="collectionsError" class="login-error" role="alert" :text="collectionsError"></p>
+    <form class="wm-private-form" @submit.prevent="savePrivateCollection()">
+      <label>Collection name<input type="text" x-model="collectionName" maxlength="80" required autofocus :disabled="collectionsBusy"></label>
+      <div class="wm-private-actions"><button type="submit" class="wm-action wm-action--accent" :disabled="collectionsBusy || !collectionName.trim()" :text="editingCollection ? 'Save name' : 'Create collection'"></button><button :if="editingCollection" type="button" class="wm-action" @click="clearCollectionEditor()" :disabled="collectionsBusy">Cancel rename</button></div>
+    </form>
+    <div :for="item in privateCollections" :key="item.id" class="wm-collection-row">
+      <button type="button" class="wm-collection-link" @click="selectCollection(item)" :disabled="collectionsBusy"><span class="mail-icon" data-icon="folder" aria-hidden="true"></span><span :text="item.name"></span></button>
+      <div :if="deletingCollection?.id !== item.id" class="wm-private-actions"><button type="button" class="wm-action" @click="editPrivateCollection(item)" :disabled="collectionsBusy">Rename</button><button type="button" class="wm-action wm-action--danger" @click="deletingCollection.set(item)" :disabled="collectionsBusy">Remove</button></div>
+      <div :if="deletingCollection?.id === item.id" class="wm-private-actions"><button type="button" class="wm-action wm-action--danger" @click="confirmCollectionDeletion()" :disabled="collectionsBusy">Delete collection</button><button type="button" class="wm-action" @click="deletingCollection.set(null)" :disabled="collectionsBusy">Cancel</button></div>
+    </div>
+  </section>
+</dialog>
+<dialog :if="shortcutsOpen" ref="shortcutsDialog" class="wm-modal" aria-labelledby="wm-shortcuts-title" @cancel.prevent="closeShortcuts()">
+  <section class="wm-shortcuts">
+    <header><h2 id="wm-shortcuts-title">Keyboard shortcuts</h2><button type="button" class="wm-action" @click="closeShortcuts()" autofocus>Close shortcuts</button></header>
+    <dl><div :for="item in triageShortcuts" :key="item.key"><dt :text="item.label"></dt><dd><kbd :text="item.key"></kbd></dd></div></dl>
+  </section>
+</dialog>
 <dialog :if="confirmation" ref="confirmDialog" class="wm-confirm-dialog wm-modal" aria-label="Confirm action" @cancel.prevent="confirmation.set('')"><div class="login"><h1 :text="confirmation === 'purge' ? 'Delete permanently?' : confirmation === 'reload-draft' ? 'Reload saved draft?' : confirmation === 'retry-unknown' ? 'Review an interrupted delivery?' : 'Discard this draft?'"></h1><p class="login-sub" :text="confirmation === 'purge' ? 'These messages cannot be recovered after deletion.' : confirmation === 'reload-draft' ? 'Your local changes will be replaced with the latest saved version. Save a copy to keep both.' : confirmation === 'retry-unknown' ? 'This message may already have arrived. Check Sent and the delivery result before retrying. A retry could send a duplicate.' : 'Your saved draft will move to Trash. Unsaved changes will be discarded.'"></p><button @click="confirmation.set('')" :disabled="confirming" autofocus>Keep working</button><button @click="confirmAction()" :disabled="confirming" :text="confirming ? 'Working…' : confirmation === 'purge' ? 'Delete permanently' : confirmation === 'reload-draft' ? 'Reload saved version' : confirmation === 'retry-unknown' ? 'I checked Sent; review the message' : 'Discard draft'"></button></div></dialog>
+<aside :if="visibleReminders.length || reminderError" class="calendar-notice-stack" aria-label="Calendar reminders">
+  <p :if="reminderError" class="calendar-notice-error" role="status" :text="reminderError"></p>
+  <div :for="item in visibleReminders" class="calendar-notice">
+    <div aria-live="polite">
+      <p class="calendar-notice-label">Calendar reminder</p>
+      <p class="calendar-notice-title" :text="item.summary"></p>
+      <p :if="item.message && item.message !== item.summary" class="calendar-notice-message" :text="item.message"></p>
+    </div>
+    <div class="calendar-notice-actions">
+      <a class="wm-action" :href="reminderDayLink(item)">View day</a>
+      <button type="button" class="wm-action" @click="dismissReminder(item)" :disabled="dismissingReminder !== ''" :aria-label="'Dismiss reminder for ' + item.summary">Dismiss</button>
+    </div>
+  </div>
+</aside>
 </body>
 </html>

@@ -1,0 +1,289 @@
+//! Shared recipient validation and local delivery for interactive submissions.
+const std = @import("std");
+const hosted_limits = @import("../storage/hosted_limits.zig");
+const durable_maildir = @import("../core/durable_maildir.zig");
+const database = @import("../storage/database.zig");
+const fs_compat = @import("../core/fs_compat.zig");
+const time_compat = @import("../core/time_compat.zig");
+const outbound = @import("outbound.zig");
+const core_config = @import("../core/config.zig");
+const routing = @import("local_routing.zig");
+
+pub const Delivery = struct {
+    hostname: []const u8,
+    delivery_method: core_config.DeliveryMethod,
+    ses_region: []const u8,
+    mail_config: ?*const core_config.Config = null,
+    db: ?*database.Database = null,
+    local_hosted_only: bool = false,
+};
+
+pub fn isSafeAddress(a: []const u8) bool {
+    if (a.len == 0 or a.len > 320) return false;
+    for (a) |c| {
+        // Reject header-injection chars, and '/' '\' (which would let a crafted
+        // local-part escape the mail/{user}/ path on local delivery) plus '..'.
+        // The '\' set also matches outbound.zig's validator so a webmail-accepted
+        // address never fails the outbound backstop.
+        if (c <= 0x20 or c == 0x7f or c == ',' or c == ';' or c == ':' or c == '"' or c == '<' or c == '>' or c == '/' or c == '\\') return false;
+    }
+    if (std.mem.indexOf(u8, a, "..") != null) return false;
+    // Must look like an address (one @, non-empty local/domain, no leading dot).
+    const at = std.mem.indexOfScalar(u8, a, '@') orelse return false;
+    if (at == 0 or at == a.len - 1) return false;
+    if (a[0] == '.') return false;
+    if (std.mem.indexOfScalarPos(u8, a, at + 1, '@') != null) return false;
+    return true;
+}
+
+/// A Maildir user (local-part) must be a single safe path component — defense in
+/// depth for the mail/{user}/... path even though isSafeAddress already guards.
+pub fn isSafeLocalPart(user: []const u8) bool {
+    if (user.len == 0 or user.len > 256) return false;
+    if (user[0] == '.') return false;
+    for (user) |c| {
+        if (c == '/' or c == '\\' or c == 0) return false;
+    }
+    if (std.mem.indexOf(u8, user, "..") != null) return false;
+    return true;
+}
+
+/// One reservation covers the actual envelope, including blind copies.
+pub fn distinctRecipients(a: std.mem.Allocator, groups: []const []const []const u8) ![][]const u8 {
+    var recipients: std.ArrayList([]const u8) = .empty;
+    var seen = std.StringHashMap(void).init(a);
+    defer {
+        var keys = seen.keyIterator();
+        while (keys.next()) |key| a.free(key.*);
+        seen.deinit();
+    }
+    errdefer recipients.deinit(a);
+    for (groups) |group| {
+        for (group) |address| {
+            if (!isSafeAddress(address)) return error.InvalidAddress;
+            const key = try std.ascii.allocLowerString(a, address);
+            const entry = seen.getOrPut(key) catch |err| {
+                a.free(key);
+                return err;
+            };
+            if (entry.found_existing) {
+                a.free(key);
+                continue;
+            }
+            try recipients.append(a, address);
+        }
+    }
+    return recipients.toOwnedSlice(a);
+}
+
+fn localMailbox(a: std.mem.Allocator, cfg: Delivery, recipient: []const u8) !?[]const u8 {
+    if (!isSafeAddress(recipient)) return error.InvalidAddress;
+    if (!routing.isLocal(recipient, cfg.hostname, cfg.mail_config)) return null;
+    const user = try routing.resolveMailbox(a, cfg.db, cfg.mail_config, recipient);
+    errdefer a.free(user);
+    if (!isSafeLocalPart(user)) return error.InvalidAddress;
+    if (cfg.local_hosted_only) {
+        if (cfg.db == null or (try cfg.db.?.hostedLimits(user)) == null) {
+            a.free(user);
+            return null;
+        }
+    }
+    if (cfg.db) |db| if (!(try db.userExists(user))) return error.InvalidAddress;
+    return user;
+}
+
+pub fn deliverNotice(a: std.mem.Allocator, cfg: Delivery, from: []const u8, rcpt: []const u8, raw: []const u8, mailbox_id: ?i64) !void {
+    if (mailbox_id != null and cfg.db == null) return error.DatabaseUnavailable;
+    const result = try dispatch(a, cfg, from, &.{rcpt}, raw, .{ .account_notice = true, .recipient_id = mailbox_id });
+    defer a.free(result.failed);
+    if (result.first_error) |err| return err;
+}
+
+pub const SentCopy = struct {
+    path: []const u8,
+    bytes: []const u8,
+};
+
+const RawSubmission = struct {
+    mailbox: []const u8,
+    from: []const u8,
+    recipients: []const []const u8,
+    raw: []const u8,
+    sent: ?SentCopy = null,
+    receipt: ?database.Database.ActiveSyncReceipt = null,
+};
+
+pub const DispatchOptions = struct {
+    sender: ?[]const u8 = null,
+    sent: ?SentCopy = null,
+    receipt: ?database.Database.ActiveSyncReceipt = null,
+    account_notice: bool = false,
+    recipient_id: ?i64 = null,
+};
+
+pub const DispatchResult = struct {
+    delivered: usize = 0,
+    failed: []const []const u8,
+    first_error: ?anyerror = null,
+    first_limit_error: ?anyerror = null,
+};
+
+/// Check and admit all local recipients as one journaled operation. Remote
+/// app submissions keep their synchronous delivery results for partial-send UI.
+pub fn dispatch(a: std.mem.Allocator, cfg: Delivery, from: []const u8, recipients: []const []const u8, raw: []const u8, options: DispatchOptions) !DispatchResult {
+    if (recipients.len == 0) return error.NoRecipients;
+    const failed = try a.alloc([]const u8, recipients.len);
+    errdefer a.free(failed);
+    const errors = try a.alloc(?anyerror, recipients.len);
+    defer a.free(errors);
+    @memset(errors, null);
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const temp = scratch.allocator();
+    const remote = try temp.alloc(bool, recipients.len);
+    @memset(remote, false);
+    if (cfg.db) |db| {
+        const id = routing.newId();
+        try acceptLocal(temp, cfg, db, from, recipients, raw, options, &id, remote, errors);
+        routing.publish(a, db, &id);
+    } else {
+        for (recipients, 0..) |recipient, i| {
+            const user = localMailbox(temp, cfg, recipient) catch |err| {
+                errors[i] = err;
+                continue;
+            };
+            if (user) |mailbox| {
+                writeMaildir(a, null, mailbox, "new", raw) catch |err| {
+                    errors[i] = err;
+                };
+            } else remote[i] = true;
+        }
+    }
+    var count: usize = 0;
+    var result: DispatchResult = .{ .failed = undefined };
+    for (recipients, remote, errors) |recipient, deliver_remote, local_error| {
+        const failure: ?anyerror = if (deliver_remote) blk: {
+            outbound.deliverToRemote(a, from, recipient, raw, cfg.hostname, cfg.delivery_method, cfg.ses_region) catch |err| break :blk err;
+            break :blk null;
+        } else local_error;
+        if (failure) |err| {
+            std.log.warn("Message delivery to {s} failed: {}", .{ recipient, err });
+            if (result.first_error == null) result.first_error = err;
+            if (result.first_limit_error == null and (err == error.HostedStorageFull or err == error.HostedRecipientDisabled)) result.first_limit_error = err;
+            failed[count] = recipient;
+            count += 1;
+        } else result.delivered += 1;
+    }
+    result.failed = try a.realloc(failed, count);
+    return result;
+}
+
+fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from: []const u8, recipients: []const []const u8, raw: []const u8, options: DispatchOptions, id: []const u8, remote: []bool, errors: []?anyerror) !void {
+    db.lockMailboxes();
+    defer db.unlockMailboxes();
+    const now = time_compat.timestamp();
+    if (options.sender) |sender| {
+        if (options.receipt) |receipt| {
+            if (try db.activeSyncAccepted(sender, receipt, now)) return error.MessagePreviouslySent;
+        }
+        _ = try db.checkHostedSend(sender, recipients.len, now);
+    }
+    var sent_written = false;
+    errdefer if (sent_written) fs_compat.cwd().deleteFile(options.sent.?.path) catch {};
+    if (options.sent) |copy| {
+        try hosted_limits.checkStorage(db, options.sender.?, copy.bytes.len, null);
+        try durable_maildir.write(a, copy.path, copy.bytes);
+        sent_written = true;
+    }
+
+    const identity = try routing.SenderIdentity.fromHeaders(a, raw, true);
+    var plan: routing.Plan = .{
+        .allocator = a,
+        .db = db,
+        .bytes = raw.len,
+        .raw = raw,
+        .junk_folder = if (cfg.mail_config) |config| config.junkFolder() else "Junk",
+        .automatic_category = if (identity.verified) routing.categories.classify(raw) else null,
+    };
+    for (recipients, 0..) |recipient, i| {
+        const user = localMailbox(a, cfg, recipient) catch |err| switch (err) {
+            error.InvalidAddress => {
+                errors[i] = err;
+                try plan.add(.{ .recipient = recipient, .refusal = "invalid_recipient" });
+                continue;
+            },
+            else => return err,
+        };
+        if (options.recipient_id) |expected| {
+            const current = if (user) |mailbox| try db.enabledMailboxId(mailbox) else null;
+            if (current != expected) return error.InvalidAddress;
+        }
+        if (user) |mailbox| {
+            var target: routing.Target = .{ .recipient = recipient, .mailbox = mailbox, .folder = "new" };
+            if (!options.account_notice) try plan.classify(&target, identity);
+            plan.addLocal(target) catch |err| {
+                target.refusal = switch (err) {
+                    error.HostedStorageFull => "recipient_storage_full",
+                    error.HostedRecipientDisabled => "recipient_disabled",
+                    error.InvalidMailboxPath => "invalid_recipient",
+                    else => return err,
+                };
+                errors[i] = err;
+                try plan.add(target);
+            };
+        } else remote[i] = true;
+    }
+    const primary_count = plan.targets.items.len;
+    if (!options.account_notice) {
+        for (0..primary_count) |i| {
+            const target = plan.targets.items[i];
+            if (target.refusal == null and target.forward_allowed) try plan.forward(i, from, cfg.hostname, cfg.mail_config, identity);
+        }
+        try plan.vacationReplies(primary_count, from, cfg.hostname, cfg.mail_config, identity, now);
+    }
+    try db.acceptDelivery(.{
+        .id = id,
+        .from = from,
+        .author = identity.author,
+        .verified_author = identity.verified,
+        .mime = raw,
+        .accepted_at = now,
+        .accepted_ms = time_compat.milliTimestamp(),
+        .targets = plan.targets.items,
+        .sender = options.sender,
+        .charge_recipients = recipients.len,
+        .receipt = options.receipt,
+    });
+}
+
+pub fn sendRaw(a: std.mem.Allocator, cfg: Delivery, message: RawSubmission) !void {
+    if (cfg.db == null) return error.DatabaseUnavailable;
+    const result = try dispatch(a, cfg, message.from, message.recipients, message.raw, .{
+        .sender = message.mailbox,
+        .sent = message.sent,
+        .receipt = message.receipt,
+    });
+    defer a.free(result.failed);
+    if (result.delivered == 0) {
+        if (message.sent) |copy| fs_compat.cwd().deleteFile(copy.path) catch {};
+        return result.first_error orelse error.NoRecipients;
+    }
+    if (result.failed.len > 0) return error.PartialDelivery;
+}
+
+pub fn maildirPath(a: std.mem.Allocator, user: []const u8, subdir: []const u8, suffix: []const u8) ![]const u8 {
+    if (!isSafeLocalPart(user)) return error.InvalidAddress;
+    const dir = try std.fmt.allocPrint(a, "mail/{s}/{s}", .{ user, subdir });
+    defer a.free(dir);
+    try fs_compat.cwd().makePath(dir);
+    const seq = nameSeq.fetchAdd(1, .monotonic);
+    return std.fmt.allocPrint(a, "{s}/{d}.{d}.submission.eml{s}", .{ dir, time_compat.milliTimestamp(), seq, suffix });
+}
+
+pub fn writeMaildir(allocator: std.mem.Allocator, db: ?*database.Database, user: []const u8, subdir: []const u8, raw: []const u8) !void {
+    const path = try maildirPath(allocator, user, subdir, "");
+    defer allocator.free(path);
+    try hosted_limits.write(db, allocator, user, path, raw);
+}
+
+var nameSeq = std.atomic.Value(u64).init(0);

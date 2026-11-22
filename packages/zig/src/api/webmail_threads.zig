@@ -1,8 +1,10 @@
-//! Conversation grouping uses wire identifiers, never subject similarity.
+//! Conversation grouping uses wire identifiers and explicit private groups.
 //! Union-find handles missing ancestors, forward references and cycles without
 //! recursion. Individual folder/UID identities remain available for actions.
 const std = @import("std");
 const maildir = @import("webmail_maildir.zig");
+const submission = @import("../message/submission.zig");
+const thread_ids = @import("../message/thread_ids.zig");
 
 pub const Thread = struct {
     id: []const u8,
@@ -12,13 +14,63 @@ pub const Thread = struct {
     matching: usize,
 };
 
-const Graph = struct {
+/// Maildir rows arrive newest first. Keep that order within each read
+/// section so a sender can have an unread bundle and a read bundle.
+pub fn bundleSenders(a: std.mem.Allocator, rows: []const maildir.MessageSummary) ![]Thread {
+    var grouped: std.ArrayList(Thread) = .empty;
+    for ([_]bool{ false, true }) |seen| {
+        var by_sender: std.StringHashMapUnmanaged(usize) = .empty;
+        defer by_sender.deinit(a);
+        var lists: std.ArrayList(std.ArrayList(maildir.MessageSummary)) = .empty;
+        defer lists.deinit(a);
+        var ids: std.ArrayList([]const u8) = .empty;
+        defer ids.deinit(a);
+        for (rows) |row| {
+            if (row.flags.seen != seen) continue;
+            const sender = submission.mailbox(row.from) catch std.mem.trim(u8, row.from, " \t");
+            const key = if (sender.len > 0)
+                try std.ascii.allocLowerString(a, sender)
+            else
+                try std.fmt.allocPrint(a, "unknown:{d}", .{row.uid});
+            const slot = try by_sender.getOrPut(a, key);
+            if (!slot.found_existing) {
+                slot.value_ptr.* = lists.items.len;
+                try lists.append(a, .empty);
+                try ids.append(a, try std.fmt.allocPrint(a, "{s}:{s}", .{ if (seen) "read" else "unread", key }));
+            }
+            try lists.items[slot.value_ptr.*].append(a, row);
+        }
+        for (lists.items, ids.items) |*list, id| {
+            const members = try list.toOwnedSlice(a);
+            try grouped.append(a, .{
+                .id = id,
+                .latest = members[0],
+                .members = members,
+                .unread = if (seen) 0 else members.len,
+                .matching = members.len,
+            });
+        }
+    }
+    return grouped.toOwnedSlice(a);
+}
+
+pub const Graph = struct {
     allocator: std.mem.Allocator,
     ids: std.StringHashMap(usize),
     parents: std.ArrayList(usize) = .empty,
     names: std.ArrayList([]const u8) = .empty,
 
-    fn node(self: *Graph, id: []const u8) !usize {
+    pub fn init(a: std.mem.Allocator) Graph {
+        return .{ .allocator = a, .ids = std.StringHashMap(usize).init(a) };
+    }
+
+    pub fn deinit(self: *Graph) void {
+        self.ids.deinit();
+        self.parents.deinit(self.allocator);
+        self.names.deinit(self.allocator);
+    }
+
+    pub fn node(self: *Graph, id: []const u8) !usize {
         if (self.ids.get(id)) |known| return known;
         const index = self.parents.items.len;
         const owned = try self.allocator.dupe(u8, id);
@@ -28,7 +80,7 @@ const Graph = struct {
         return index;
     }
 
-    fn root(self: *Graph, index: usize) usize {
+    pub fn root(self: *Graph, index: usize) usize {
         var result = index;
         while (self.parents.items[result] != result) result = self.parents.items[result];
         var current = index;
@@ -40,7 +92,7 @@ const Graph = struct {
         return result;
     }
 
-    fn join(self: *Graph, left: usize, right: usize) void {
+    pub fn join(self: *Graph, left: usize, right: usize) void {
         const a = self.root(left);
         const b = self.root(right);
         if (a == b) return;
@@ -51,31 +103,16 @@ const Graph = struct {
             self.parents.items[a] = b;
     }
 
-    fn references(self: *Graph, owner: usize, field: []const u8) !void {
+    pub fn references(self: *Graph, owner: usize, field: []const u8) !void {
         if (field.len > 8192) return;
-        var start: usize = 0;
-        var count: usize = 0;
-        while (count < 64) : (count += 1) {
-            const open = std.mem.indexOfScalarPos(u8, field, start, '<') orelse break;
-            const close = std.mem.indexOfScalarPos(u8, field, open + 1, '>') orelse break;
-            const id = field[open .. close + 1];
-            start = close + 1;
-            if (id.len > 320 or std.mem.indexOfScalar(u8, id, '@') == null) continue;
-            var valid = true;
-            for (id[1 .. id.len - 1]) |byte| if (byte <= 0x20 or byte == 0x7f or byte == '<' or byte == '>') {
-                valid = false;
-                break;
-            };
-            if (valid) self.join(owner, try self.node(id));
-        }
+        var ids: thread_ids.Iterator = .{ .text = field };
+        while (ids.next()) |id| self.join(owner, try self.node(id));
     }
 };
 
 pub fn group(allocator: std.mem.Allocator, rows: []const maildir.MessageSummary) ![]Thread {
-    var graph = Graph{ .allocator = allocator, .ids = std.StringHashMap(usize).init(allocator) };
-    defer graph.ids.deinit();
-    defer graph.parents.deinit(allocator);
-    defer graph.names.deinit(allocator);
+    var graph = Graph.init(allocator);
+    defer graph.deinit();
     const row_nodes = try allocator.alloc(usize, rows.len);
     for (rows, 0..) |row, index| {
         const fallback = try std.fmt.allocPrint(allocator, "maildir:{s}:{d}", .{ row.folder, row.uid });
@@ -84,6 +121,7 @@ pub fn group(allocator: std.mem.Allocator, rows: []const maildir.MessageSummary)
         try graph.references(owner, row.message_id);
         try graph.references(owner, row.in_reply_to);
         try graph.references(owner, row.references);
+        if (row.manual_component) |component| graph.join(owner, try graph.node(component));
     }
     var roots = std.AutoHashMap(usize, usize).init(allocator);
     defer roots.deinit();

@@ -56,6 +56,21 @@ export function mergeRecipients(current: Recipient[], additions: Recipient[]): R
 
 export function messageKey(message: MessageRef): string { return `${encodeURIComponent(message.folder)}:${message.uid}` }
 export function folderName(folder: string): string { return folder === 'INBOX' ? 'Inbox' : folder === '*' ? 'All mail' : folder }
+const folderIcons: Record<string, string> = {
+  INBOX: 'inbox', Newsletters: 'newsletter', Receipts: 'receipt', Sent: 'send', Drafts: 'document',
+  Trash: 'trash', Junk: 'shield', Archive: 'archive', follow_up: 'flag', saved: 'bookmark',
+  snoozed: 'clock', muted: 'muted', reminders: 'bell',
+}
+export function mailFolderIcon(folder: string): string { return folderIcons[folder] || 'folder' }
+export function senderAddress(from: string): string { return recipient(from).address }
+export function senderInitials(from: string): string {
+  const sender = recipient(from)
+  const name = sender.name || sender.address.split('@')[0]
+  const parts = name.split(/[^\p{L}\p{N}]+/u).filter(Boolean)
+  const first = Array.from(parts[0] || '')[0]
+  const last = parts.length > 1 ? Array.from(parts[parts.length - 1])[0] : ''
+  return first ? (first + last).toLocaleUpperCase() : '?'
+}
 export function readableBytes(value: number): string {
   if (value < 1024) return `${value} B`
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`
@@ -69,9 +84,6 @@ export function fullDate(value: string): string {
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })
 }
-export function safeHtml(html: string): string {
-  return `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'">${html}`
-}
 export function dateBoundary(value: string, end = false): number | null {
   if (!value) return null
   const date = new Date(`${value}T00:00:00`)
@@ -79,8 +91,8 @@ export function dateBoundary(value: string, end = false): number | null {
   if (end) { date.setDate(date.getDate() + 1); date.setMilliseconds(-1) }
   return Math.floor(date.getTime() / 1000)
 }
-export function rangeSelection<T extends MessageRef>(rows: T[], anchor: string | null, target: T): T[] {
-  const end = rows.findIndex(row => messageKey(row) === messageKey(target))
-  const start = rows.findIndex(row => messageKey(row) === anchor)
+export function rangeSelection<T extends MessageRef>(rows: T[], anchor: string | null, target: T, key = messageKey): T[] {
+  const end = rows.findIndex(row => key(row) === key(target))
+  const start = rows.findIndex(row => key(row) === anchor)
   return start < 0 || end < 0 ? [target] : rows.slice(Math.min(start, end), Math.max(start, end) + 1)
 }

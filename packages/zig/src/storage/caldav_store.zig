@@ -26,10 +26,14 @@
 //! ```
 
 const std = @import("std");
+pub const contact_vcard = @import("contact_vcard.zig");
+const io_compat = @import("../core/io_compat.zig");
 const Allocator = std.mem.Allocator;
 const mutex_compat = @import("../core/mutex_compat.zig");
 const database = @import("db_sqlite.zig");
 const accounts = @import("database.zig");
+const icalendar = @import("../protocol/icalendar.zig");
+const reminder = @import("../protocol/icalendar_reminder.zig");
 
 /// Get the current epoch timestamp in seconds (cross-platform).
 fn currentTimestamp() i64 {
@@ -84,6 +88,7 @@ pub const Calendar = struct {
     created_at: i64,
     modified_at: i64,
     sync_token: u64,
+    dav_history_floor: u64 = 0,
     ctag: []const u8, // Collection tag
 };
 
@@ -98,6 +103,8 @@ pub const Event = struct {
     dtend: ?i64,
     all_day: bool,
     rrule: ?[]const u8,
+    recurring: bool = false,
+    reminder_coverage: reminder.Coverage = .{},
     organizer: ?[]const u8,
     status: EventStatus,
     created_at: i64,
@@ -122,6 +129,7 @@ pub const CalendarSummary = struct {
 
 pub const CalendarEventSummary = struct {
     id: u64,
+    calendar_id: u64,
     uid: []const u8,
     summary: []const u8,
     location: ?[]const u8,
@@ -129,8 +137,33 @@ pub const CalendarEventSummary = struct {
     end: ?i64,
     all_day: bool,
     recurrence_rule: ?[]const u8,
+    recurring: bool,
+    icalendar: ?[]const u8 = null,
     status: Event.EventStatus,
     etag: []const u8,
+};
+
+pub const CalendarEventDetail = struct {
+    event: CalendarEventSummary,
+    calendar_id: u64,
+    description: ?[]const u8,
+    organizer: ?[]const u8,
+    modified_at: i64,
+    ics_data: []const u8,
+};
+
+pub const ActiveSyncResource = struct { id: u64, etag: []const u8 };
+
+pub const ActiveSyncContact = struct {
+    etag: []const u8,
+    full_name: []const u8,
+    given_name: ?[]const u8,
+    family_name: ?[]const u8,
+    organization: ?[]const u8,
+    title: ?[]const u8,
+    note: ?[]const u8,
+    emails: []const []const u8,
+    phones: []const PhoneNumber,
 };
 
 pub const AddressBook = struct {
@@ -141,6 +174,7 @@ pub const AddressBook = struct {
     created_at: i64,
     modified_at: i64,
     sync_token: u64,
+    dav_history_floor: u64 = 0,
     ctag: []const u8,
 };
 
@@ -170,6 +204,31 @@ pub const EmailAddress = struct {
     is_primary: bool,
 
     pub const EmailType = enum { home, work, other };
+};
+
+pub const ContactCard = struct {
+    uid: []const u8,
+    card_uid: []const u8,
+    name: []const u8,
+    note: []const u8,
+    kind: contact_vcard.Kind,
+    emails: []const []const u8,
+    members: []const []const u8,
+    etag: []const u8,
+};
+
+pub const AddressBookSnapshot = struct {
+    books: []const []const u8,
+    book: []const u8,
+    cards: []const ContactCard,
+};
+
+pub const ContactEdit = struct {
+    kind: contact_vcard.Kind,
+    name: []const u8,
+    note: []const u8 = "",
+    emails: []const []const u8 = &.{},
+    members: []const []const u8 = &.{},
 };
 
 pub const ContactSuggestion = struct { name: []const u8, address: []const u8 };
@@ -212,7 +271,7 @@ pub const SyncChange = struct {
     change_type: ChangeType,
     token: u64,
     etag: []const u8,
-    href: []const u8,
+    uid: []const u8,
     timestamp: i64,
 
     pub const ResourceType = enum { event, contact };
@@ -224,6 +283,82 @@ pub const SyncReport = struct {
     new_sync_token: u64,
     more_available: bool,
 };
+
+pub const DavSyncQuery = union(enum) {
+    version_only,
+    initial,
+    after: []const u8,
+};
+
+pub const DavSyncMember = struct {
+    uid: []const u8,
+    etag: ?[]const u8,
+};
+
+pub const DavSyncReport = struct {
+    token: []const u8,
+    members: []const DavSyncMember,
+};
+
+pub const DavCollection = struct {
+    name: []const u8,
+    ctag: []const u8,
+    token: []const u8,
+};
+
+pub const ResourceConditions = struct {
+    if_match: ?[]const u8 = null,
+    if_none_match: ?[]const u8 = null,
+
+    pub fn allows(self: ResourceConditions, etag: ?[]const u8) bool {
+        if (self.if_match) |tags| {
+            if (!matchesAny(tags, etag, false)) return false;
+        }
+        if (self.if_none_match) |tags| {
+            if (matchesAny(tags, etag, true)) return false;
+        }
+        return true;
+    }
+
+    fn matchesAny(tags: []const u8, current: ?[]const u8, weak: bool) bool {
+        const etag = current orelse return false;
+        if (std.mem.eql(u8, tags, "*")) return true;
+        var start: usize = 0;
+        var quoted = false;
+        for (tags, 0..) |byte, index| {
+            if (byte == '"') quoted = !quoted;
+            if (byte == ',' and !quoted) {
+                if (matches(tags[start..index], etag, weak)) return true;
+                start = index + 1;
+            }
+        }
+        return matches(tags[start..], etag, weak);
+    }
+
+    fn matches(incoming: []const u8, etag: []const u8, weak: bool) bool {
+        const candidate = std.mem.trim(u8, incoming, " \t");
+        const tag = if (weak and std.mem.startsWith(u8, candidate, "W/")) candidate[2..] else candidate;
+        return std.mem.eql(u8, tag, etag);
+    }
+};
+
+pub const PutResource = struct {
+    created: bool,
+    etag_buf: [64]u8 = undefined,
+    etag_len: usize,
+
+    fn init(created: bool, value: []const u8) PutResource {
+        var result = PutResource{ .created = created, .etag_len = value.len };
+        @memcpy(result.etag_buf[0..value.len], value);
+        return result;
+    }
+
+    pub fn etag(self: *const PutResource) []const u8 {
+        return self.etag_buf[0..self.etag_len];
+    }
+};
+
+pub const Resource = struct { body: []u8, etag: []u8 };
 
 // =============================================================================
 // CalDAV Store
@@ -263,6 +398,9 @@ pub const CalDavStore = struct {
     // Sync history
     sync_changes: std.ArrayList(SyncChange),
     current_sync_token: u64,
+    // This changes whenever the in-memory journal is rebuilt. Persisted
+    // resources can be enumerated again using an empty DAV token.
+    dav_sync_epoch: [16]u8,
 
     // ID generators
     next_calendar_id: u64,
@@ -275,6 +413,88 @@ pub const CalDavStore = struct {
         user_id: u64,
         mailbox_id: ?i64,
     };
+
+    /// Resolve the owned collection, evaluate the precondition, and write the
+    /// resource under the same lock, including a first PUT into a new collection.
+    pub fn putEventResource(self: *Self, user_id: u64, collection: []const u8, uid: []const u8, conditions: ResourceConditions, data: EventData) !PutResource {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.getAddressBookByName(user_id, collection) != null) return error.WrongCollectionType;
+        const calendar_id = if (self.getCalendarByName(user_id, collection)) |item| item.id else blk: {
+            if (!conditions.allows(null)) return error.PreconditionFailed;
+            break :blk try self.createCalendarLocked(user_id, collection, null);
+        };
+        if (self.getEventByUid(calendar_id, uid)) |event| {
+            if (!conditions.allows(event.etag)) return error.PreconditionFailed;
+            try self.updateEventLocked(event.id, data);
+            return PutResource.init(false, self.events.get(event.id).?.etag);
+        }
+        if (!conditions.allows(null)) return error.PreconditionFailed;
+        const id = try self.createEventLocked(calendar_id, data);
+        return PutResource.init(true, self.events.get(id).?.etag);
+    }
+
+    pub fn putContactResource(self: *Self, user_id: u64, collection: []const u8, uid: []const u8, conditions: ResourceConditions, data: ContactData) !PutResource {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const book_id = if (self.getAddressBookByName(user_id, collection)) |item| item.id else blk: {
+            if (!conditions.allows(null)) return error.PreconditionFailed;
+            break :blk try self.createAddressBookLocked(user_id, collection, null);
+        };
+        if (self.getContactByUid(book_id, uid)) |contact| {
+            if (!conditions.allows(contact.etag)) return error.PreconditionFailed;
+            try self.updateContactLocked(contact.id, data);
+            return PutResource.init(false, self.contacts.get(contact.id).?.etag);
+        }
+        if (!conditions.allows(null)) return error.PreconditionFailed;
+        const id = try self.createContactLocked(book_id, data);
+        return PutResource.init(true, self.contacts.get(id).?.etag);
+    }
+
+    /// The resource and its ETag must describe the same version even if a
+    /// different connection updates or deletes it during the response.
+    pub fn getResource(self: *Self, user_id: u64, collection: []const u8, uid: []const u8, kind: SyncChange.ResourceType) !?Resource {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const a = self.allocator;
+        switch (kind) {
+            .event => {
+                const calendar = self.getCalendarByName(user_id, collection) orelse return null;
+                const event = self.getEventByUid(calendar.id, uid) orelse return null;
+                const etag = try a.dupe(u8, event.etag);
+                errdefer a.free(etag);
+                const body = if (event.ics_data.len > 0) event.ics_data else "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n";
+                return .{ .etag = etag, .body = try a.dupe(u8, body) };
+            },
+            .contact => {
+                const book = self.getAddressBookByName(user_id, collection) orelse return null;
+                const contact = self.getContactByUid(book.id, uid) orelse return null;
+                const etag = try a.dupe(u8, contact.etag);
+                errdefer a.free(etag);
+                return .{ .etag = etag, .body = try self.generateVcfLocked(contact) };
+            },
+        }
+    }
+
+    pub fn deleteResource(self: *Self, user_id: u64, collection: []const u8, uid: []const u8, kind: SyncChange.ResourceType, conditions: ResourceConditions) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const missing = if (conditions.allows(null)) error.NotFound else error.PreconditionFailed;
+        switch (kind) {
+            .event => {
+                const calendar = self.getCalendarByName(user_id, collection) orelse return missing;
+                const event = self.getEventByUid(calendar.id, uid) orelse return missing;
+                if (!conditions.allows(event.etag)) return error.PreconditionFailed;
+                try self.deleteEventLocked(event.id);
+            },
+            .contact => {
+                const book = self.getAddressBookByName(user_id, collection) orelse return missing;
+                const contact = self.getContactByUid(book.id, uid) orelse return missing;
+                if (!conditions.allows(contact.etag)) return error.PreconditionFailed;
+                try self.deleteContactLocked(contact.id);
+            },
+        }
+    }
 
     pub fn init(allocator: Allocator, config: StoreConfig) !Self {
         var self = Self{
@@ -291,11 +511,13 @@ pub const CalDavStore = struct {
             .next_user_id = 1,
             .sync_changes = .empty,
             .current_sync_token = 1,
+            .dav_sync_epoch = undefined,
             .next_calendar_id = 1,
             .next_event_id = 1,
             .next_addressbook_id = 1,
             .next_contact_id = 1,
         };
+        io_compat.randomBytes(&self.dav_sync_epoch);
 
         // Never serve persisted records until the ownership registry and its
         // reserved IDs have been loaded successfully.
@@ -323,22 +545,23 @@ pub const CalDavStore = struct {
         }
         var ab_iter = self.addressbooks.iterator();
         while (ab_iter.next()) |entry| {
-            self.allocator.free(entry.value_ptr.ctag);
+            self.freeAddressBook(entry.value_ptr.*);
         }
         var contact_iter = self.contacts.iterator();
         while (contact_iter.next()) |entry| {
-            self.allocator.free(entry.value_ptr.etag);
-            self.allocator.free(entry.value_ptr.uid);
+            self.freeContact(entry.value_ptr.*);
         }
         // Free allocated etag/href strings in sync changes (both owned by the store)
         for (self.sync_changes.items) |change| {
             self.allocator.free(change.etag);
-            self.allocator.free(change.href);
+            self.allocator.free(change.uid);
         }
         self.calendars.deinit();
         self.events.deinit();
         self.addressbooks.deinit();
         self.contacts.deinit();
+        for (self.emails.items) |email| self.allocator.free(email.email);
+        for (self.phones.items) |phone| self.allocator.free(phone.number);
         self.emails.deinit(self.allocator);
         self.phones.deinit(self.allocator);
         self.addresses.deinit(self.allocator);
@@ -362,6 +585,8 @@ pub const CalDavStore = struct {
             \\CREATE TABLE IF NOT EXISTS dav_emails (contact_id INTEGER, email TEXT, email_type INTEGER, is_primary INTEGER);
             \\CREATE TABLE IF NOT EXISTS dav_phones (contact_id INTEGER, number TEXT, phone_type INTEGER, is_primary INTEGER);
             \\CREATE INDEX IF NOT EXISTS idx_dav_events_cal ON dav_events(calendar_id);
+            \\CREATE TABLE IF NOT EXISTS dav_reminder_dismissals (user_id INTEGER NOT NULL, reminder_key TEXT NOT NULL, due_at INTEGER NOT NULL, PRIMARY KEY(user_id, reminder_key));
+            \\CREATE INDEX IF NOT EXISTS idx_dav_reminder_due ON dav_reminder_dismissals(due_at);
             \\CREATE INDEX IF NOT EXISTS idx_dav_contacts_ab ON dav_contacts(addressbook_id);
             \\CREATE INDEX IF NOT EXISTS idx_dav_emails_c ON dav_emails(contact_id);
             \\CREATE INDEX IF NOT EXISTS idx_dav_phones_c ON dav_phones(contact_id);
@@ -393,44 +618,44 @@ pub const CalDavStore = struct {
         conn.exec(sql) catch {};
     }
 
-    fn persistCalendar(self: *Self, cal: Calendar) void {
+    fn persistCalendar(self: *Self, cal: Calendar) !void {
         const conn = if (self.conn) |*c| c else return;
-        var stmt = conn.prepare("INSERT OR REPLACE INTO dav_calendars (id,user_id,name,description,color,timezone,created_at,modified_at,sync_token,ctag) VALUES (?,?,?,?,?,?,?,?,?,?)") catch return;
+        var stmt = try conn.prepare("INSERT OR REPLACE INTO dav_calendars (id,user_id,name,description,color,timezone,created_at,modified_at,sync_token,ctag) VALUES (?,?,?,?,?,?,?,?,?,?)");
         defer stmt.finalize();
-        stmt.bindInt(1, @intCast(cal.id)) catch return;
-        stmt.bindInt(2, @intCast(cal.user_id)) catch return;
-        stmt.bindText(3, cal.name) catch return;
-        bindOptText(&stmt, 4, cal.description) catch return;
-        bindOptText(&stmt, 5, cal.color) catch return;
-        stmt.bindText(6, cal.timezone) catch return;
-        stmt.bindInt(7, cal.created_at) catch return;
-        stmt.bindInt(8, cal.modified_at) catch return;
-        stmt.bindInt(9, @intCast(cal.sync_token)) catch return;
-        stmt.bindText(10, cal.ctag) catch return;
-        _ = stmt.step() catch return;
+        try stmt.bindInt(1, @intCast(cal.id));
+        try stmt.bindInt(2, @intCast(cal.user_id));
+        try stmt.bindText(3, cal.name);
+        try bindOptText(&stmt, 4, cal.description);
+        try bindOptText(&stmt, 5, cal.color);
+        try stmt.bindText(6, cal.timezone);
+        try stmt.bindInt(7, cal.created_at);
+        try stmt.bindInt(8, cal.modified_at);
+        try stmt.bindInt(9, @intCast(cal.sync_token));
+        try stmt.bindText(10, cal.ctag);
+        _ = try stmt.step();
     }
 
-    fn persistEvent(self: *Self, ev: Event) void {
+    fn persistEvent(self: *Self, ev: Event) !void {
         const conn = if (self.conn) |*c| c else return;
-        var stmt = conn.prepare("INSERT OR REPLACE INTO dav_events (id,calendar_id,uid,summary,description,location,dtstart,dtend,all_day,rrule,organizer,status,created_at,modified_at,etag,ics_data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)") catch return;
+        var stmt = try conn.prepare("INSERT OR REPLACE INTO dav_events (id,calendar_id,uid,summary,description,location,dtstart,dtend,all_day,rrule,organizer,status,created_at,modified_at,etag,ics_data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
         defer stmt.finalize();
-        stmt.bindInt(1, @intCast(ev.id)) catch return;
-        stmt.bindInt(2, @intCast(ev.calendar_id)) catch return;
-        stmt.bindText(3, ev.uid) catch return;
-        stmt.bindText(4, ev.summary) catch return;
-        bindOptText(&stmt, 5, ev.description) catch return;
-        bindOptText(&stmt, 6, ev.location) catch return;
-        stmt.bindInt(7, ev.dtstart) catch return;
-        bindOptInt(&stmt, 8, ev.dtend) catch return;
-        stmt.bindInt(9, if (ev.all_day) 1 else 0) catch return;
-        bindOptText(&stmt, 10, ev.rrule) catch return;
-        bindOptText(&stmt, 11, ev.organizer) catch return;
-        stmt.bindInt(12, @backingInt(ev.status)) catch return;
-        stmt.bindInt(13, ev.created_at) catch return;
-        stmt.bindInt(14, ev.modified_at) catch return;
-        stmt.bindText(15, ev.etag) catch return;
-        stmt.bindText(16, ev.ics_data) catch return;
-        _ = stmt.step() catch return;
+        try stmt.bindInt(1, @intCast(ev.id));
+        try stmt.bindInt(2, @intCast(ev.calendar_id));
+        try stmt.bindText(3, ev.uid);
+        try stmt.bindText(4, ev.summary);
+        try bindOptText(&stmt, 5, ev.description);
+        try bindOptText(&stmt, 6, ev.location);
+        try stmt.bindInt(7, ev.dtstart);
+        try bindOptInt(&stmt, 8, ev.dtend);
+        try stmt.bindInt(9, if (ev.all_day) 1 else 0);
+        try bindOptText(&stmt, 10, ev.rrule);
+        try bindOptText(&stmt, 11, ev.organizer);
+        try stmt.bindInt(12, @backingInt(ev.status));
+        try stmt.bindInt(13, ev.created_at);
+        try stmt.bindInt(14, ev.modified_at);
+        try stmt.bindText(15, ev.etag);
+        try stmt.bindText(16, ev.ics_data);
+        _ = try stmt.step();
     }
 
     fn persistAddressBook(self: *Self, ab: AddressBook) void {
@@ -573,6 +798,8 @@ pub const CalDavStore = struct {
             defer stmt.finalize();
             while (stmt.step() catch false) {
                 const id: u64 = @intCast(stmt.columnInt(0));
+                const rule = self.dupColOpt(&stmt, 9);
+                const source = self.dupCol(&stmt, 15);
                 try self.events.put(id, .{
                     .id = id,
                     .calendar_id = @intCast(stmt.columnInt(1)),
@@ -583,7 +810,9 @@ pub const CalDavStore = struct {
                     .dtstart = stmt.columnInt(6),
                     .dtend = if (stmt.columnIsNull(7)) null else stmt.columnInt(7),
                     .all_day = stmt.columnInt(8) != 0,
-                    .rrule = self.dupColOpt(&stmt, 9),
+                    .rrule = rule,
+                    .recurring = rule != null or icalendar.hasRecurrence(source),
+                    .reminder_coverage = try reminder.coverage(self.allocator, source),
                     .organizer = self.dupColOpt(&stmt, 10),
                     .status = switch (stmt.columnInt(11)) {
                         0 => .tentative,
@@ -593,7 +822,7 @@ pub const CalDavStore = struct {
                     .created_at = stmt.columnInt(12),
                     .modified_at = stmt.columnInt(13),
                     .etag = self.dupCol(&stmt, 14),
-                    .ics_data = self.dupCol(&stmt, 15),
+                    .ics_data = source,
                 });
                 self.bumpIds(id, 0, .event);
             }
@@ -687,7 +916,10 @@ pub const CalDavStore = struct {
         const mailbox_id = try self.activeMailboxId(username);
         self.mutex.lock();
         defer self.mutex.unlock();
+        return self.getOrCreateUserIdLocked(username, mailbox_id);
+    }
 
+    fn getOrCreateUserIdLocked(self: *Self, username: []const u8, mailbox_id: ?i64) !u64 {
         if (self.findUserIdLocked(username, mailbox_id)) |id| return id;
 
         const id = self.next_user_id;
@@ -720,7 +952,15 @@ pub const CalDavStore = struct {
     ) !u64 {
         self.mutex.lock();
         defer self.mutex.unlock();
+        return self.createCalendarLocked(user_id, name, description);
+    }
 
+    fn createCalendarLocked(
+        self: *Self,
+        user_id: u64,
+        name: []const u8,
+        description: ?[]const u8,
+    ) !u64 {
         const id = self.next_calendar_id;
         self.next_calendar_id += 1;
 
@@ -734,7 +974,7 @@ pub const CalDavStore = struct {
         const timezone = try self.allocator.dupe(u8, self.config.default_timezone);
         errdefer self.allocator.free(timezone);
 
-        try self.calendars.put(id, .{
+        const calendar = Calendar{
             .id = id,
             .user_id = user_id,
             .name = own_name,
@@ -745,9 +985,10 @@ pub const CalDavStore = struct {
             .modified_at = now,
             .sync_token = self.current_sync_token,
             .ctag = ctag,
-        });
-
-        self.persistCalendar(self.calendars.get(id).?);
+        };
+        try self.calendars.ensureUnusedCapacity(1);
+        try self.persistCalendar(calendar);
+        self.calendars.putAssumeCapacity(id, calendar);
         return id;
     }
 
@@ -822,39 +1063,418 @@ pub const CalDavStore = struct {
         return result.toOwnedSlice(arena);
     }
 
-    /// List stored events intersecting a half-open window. Recurring event
-    /// masters that started before its end are returned as candidates, with
-    /// their rules intact for expansion by the calendar UI.
-    pub fn snapshotCalendarEvents(self: *Self, arena: Allocator, username: []const u8, calendar_id: u64, start: i64, end: i64) ![]CalendarEventSummary {
-        if (start >= end or @as(i128, end) - start > 366 * 86400) return error.InvalidRange;
+    pub fn createMailboxCalendar(self: *Self, username: []const u8, name: []const u8) !u64 {
         const mailbox_id = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const owner = try self.getOrCreateUserIdLocked(username, mailbox_id);
+        if (self.getCalendarByName(owner, name) != null or self.getAddressBookByName(owner, name) != null) return error.CalendarNameConflict;
+        return self.createCalendarLocked(owner, name, null);
+    }
 
+    pub fn setMailboxCalendarColor(self: *Self, username: []const u8, id: u64, color: ?[]const u8) !void {
+        const mailbox_id = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const calendar = self.calendars.getPtr(id) orelse return error.CalendarNotFound;
+        if (self.findUserIdLocked(username, mailbox_id) != calendar.user_id) return error.CalendarNotFound;
+        const new_color = try dupeOptional(self.allocator, color);
+        errdefer if (new_color) |value| self.allocator.free(value);
+        var updated = calendar.*;
+        updated.color = new_color;
+        try self.persistCalendar(updated);
+        if (calendar.color) |value| self.allocator.free(value);
+        calendar.color = new_color;
+    }
+
+    pub fn snapshotMailboxEvent(self: *Self, arena: Allocator, username: []const u8, id: u64) !CalendarEventDetail {
+        const mailbox_id = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const event = try self.ownedEventLocked(username, mailbox_id, id);
+        return .{
+            .event = try summarizeEvent(arena, event),
+            .calendar_id = event.calendar_id,
+            .description = try dupeOptional(arena, event.description),
+            .organizer = try dupeOptional(arena, event.organizer),
+            .modified_at = event.modified_at,
+            .ics_data = try arena.dupe(u8, event.ics_data),
+        };
+    }
+
+    /// ActiveSync exposes one calendar and address book. Select the first
+    /// created collection consistently across restarts and copy its revisions.
+    pub fn snapshotActiveSyncResources(self: *Self, arena: Allocator, username: []const u8, is_calendar: bool) ![]ActiveSyncResource {
+        const mailbox_id = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const owner = self.findUserIdLocked(username, mailbox_id) orelse return &.{};
+        var result: std.ArrayList(ActiveSyncResource) = .empty;
+        if (is_calendar) {
+            const id = firstOwnedCollection(self.calendars.valueIterator(), owner) orelse return &.{};
+            var items = self.events.valueIterator();
+            while (items.next()) |event| {
+                if (event.calendar_id == id) try result.append(arena, .{ .id = event.id, .etag = try arena.dupe(u8, event.etag) });
+            }
+        } else {
+            const id = firstOwnedCollection(self.addressbooks.valueIterator(), owner) orelse return &.{};
+            var items = self.contacts.valueIterator();
+            while (items.next()) |contact| {
+                if (contact.addressbook_id == id) try result.append(arena, .{ .id = contact.id, .etag = try arena.dupe(u8, contact.etag) });
+            }
+        }
+        std.mem.sort(ActiveSyncResource, result.items, {}, struct {
+            fn lessThan(_: void, left: ActiveSyncResource, right: ActiveSyncResource) bool {
+                return left.id < right.id;
+            }
+        }.lessThan);
+        return result.items;
+    }
+
+    fn firstOwnedCollection(iterator: anytype, owner: u64) ?u64 {
+        var collections = iterator;
+        var first: ?u64 = null;
+        while (collections.next()) |collection| {
+            if (collection.user_id == owner and (first == null or collection.id < first.?)) first = collection.id;
+        }
+        return first;
+    }
+
+    pub fn snapshotActiveSyncContact(self: *Self, arena: Allocator, username: []const u8, id: u64) !ActiveSyncContact {
+        const mailbox_id = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const contact = self.contacts.get(id) orelse return error.ContactNotFound;
+        const book = self.addressbooks.get(contact.addressbook_id) orelse return error.ContactNotFound;
+        if (self.findUserIdLocked(username, mailbox_id) != book.user_id) return error.ContactNotFound;
+        var emails: std.ArrayList([]const u8) = .empty;
+        var phones: std.ArrayList(PhoneNumber) = .empty;
+        for (self.emails.items) |entry| {
+            if (entry.contact_id != id) continue;
+            try emails.append(arena, try arena.dupe(u8, entry.email));
+            if (emails.items.len == 3) break;
+        }
+        for (self.phones.items) |entry| {
+            if (entry.contact_id != id) continue;
+            var owned = entry;
+            owned.number = try arena.dupe(u8, entry.number);
+            try phones.append(arena, owned);
+        }
+        return .{
+            .etag = try arena.dupe(u8, contact.etag),
+            .full_name = try arena.dupe(u8, contact.full_name),
+            .given_name = try dupeOptional(arena, contact.given_name),
+            .family_name = try dupeOptional(arena, contact.family_name),
+            .organization = try dupeOptional(arena, contact.organization),
+            .title = try dupeOptional(arena, contact.title),
+            .note = try dupeOptional(arena, contact.note),
+            .emails = emails.items,
+            .phones = phones.items,
+        };
+    }
+
+    pub const CreatedMailboxEvent = struct { id: u64, revision: PutResource };
+
+    pub fn createMailboxEvent(self: *Self, username: []const u8, calendar_id: u64, data: EventData) !CreatedMailboxEvent {
+        const mailbox_id = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const calendar = self.calendars.get(calendar_id) orelse return error.CalendarNotFound;
+        if (self.findUserIdLocked(username, mailbox_id) != calendar.user_id) return error.CalendarNotFound;
+        if (data.uid) |uid| {
+            if (self.getEventByUid(calendar_id, uid) != null) return error.EventAlreadyExists;
+        }
+        const id = try self.createEventLocked(calendar_id, data);
+        return .{ .id = id, .revision = PutResource.init(true, self.events.get(id).?.etag) };
+    }
+
+    pub fn updateMailboxEvent(self: *Self, username: []const u8, id: u64, expected: []const u8, data: EventData) !PutResource {
+        const mailbox_id = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const event = try self.ownedEventLocked(username, mailbox_id, id);
+        if (!std.mem.eql(u8, expected, event.etag)) return error.PreconditionFailed;
+        try self.updateEventLocked(id, data);
+        return PutResource.init(false, self.events.get(id).?.etag);
+    }
+
+    pub fn deleteMailboxEvent(self: *Self, username: []const u8, id: u64, expected: []const u8) !void {
+        const mailbox_id = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const event = try self.ownedEventLocked(username, mailbox_id, id);
+        if (!std.mem.eql(u8, expected, event.etag)) return error.PreconditionFailed;
+        try self.deleteEventLocked(id);
+    }
+
+    fn ownedEventLocked(self: *Self, username: []const u8, mailbox_id: ?i64, id: u64) !Event {
+        const event = self.events.get(id) orelse return error.EventNotFound;
+        const calendar = self.calendars.get(event.calendar_id) orelse return error.EventNotFound;
+        if (self.findUserIdLocked(username, mailbox_id) != calendar.user_id) return error.EventNotFound;
+        return event;
+    }
+
+    pub const ImportDestination = union(enum) { existing: u64, name: []const u8 };
+    pub const ImportEvent = struct { uid: []const u8, data: EventData };
+    pub const ImportStatus = enum { ready, imported, skipped, failed };
+    pub const ImportResult = struct { calendar_id: ?u64, statuses: []ImportStatus };
+
+    /// Match logical iCalendar UIDs across filenames, and serialize lookup and
+    /// insertion against concurrent imports and DAV writes for this mailbox.
+    pub fn importEvents(self: *Self, arena: Allocator, username: []const u8, destination: ImportDestination, items: []const ?ImportEvent, preview: bool) !ImportResult {
+        const mailbox_id = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const owner_id = self.findUserIdLocked(username, mailbox_id);
+        var calendar_id: ?u64 = switch (destination) {
+            .existing => |id| blk: {
+                const calendar = self.calendars.get(id) orelse return error.CalendarNotFound;
+                if (owner_id != calendar.user_id) return error.CalendarNotFound;
+                break :blk id;
+            },
+            .name => |name| if (owner_id) |id| blk: {
+                if (self.getAddressBookByName(id, name) != null) return error.CalendarNameConflict;
+                break :blk if (self.getCalendarByName(id, name)) |calendar| calendar.id else null;
+            } else null,
+        };
+
+        var wanted: std.StringHashMapUnmanaged(bool) = .empty;
+        for (items) |maybe| if (maybe) |event| try wanted.put(arena, event.uid, false);
+        if (calendar_id) |id| try self.findExistingImportUids(&wanted, id);
+
+        const statuses = try arena.alloc(ImportStatus, items.len);
+        @memset(statuses, .failed);
+        for (items, statuses) |maybe, *status| {
+            const event = maybe orelse continue;
+            const existing = wanted.getPtr(event.uid).?;
+            if (existing.*) {
+                status.* = .skipped;
+                continue;
+            }
+            if (preview) {
+                status.* = .ready;
+                continue;
+            }
+            if (calendar_id == null) {
+                const user_id = try self.getOrCreateUserIdLocked(username, mailbox_id);
+                calendar_id = try self.createCalendarLocked(user_id, destination.name, null);
+            }
+            if (self.getEventByUid(calendar_id.?, event.data.uid.?) != null) continue;
+            _ = self.createEventLocked(calendar_id.?, event.data) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                std.log.warn("Could not store imported calendar event: {s}", .{@errorName(err)});
+                continue;
+            };
+            existing.* = true;
+            status.* = .imported;
+        }
+        return .{ .calendar_id = calendar_id, .statuses = statuses };
+    }
+
+    fn findExistingImportUids(self: *Self, wanted: *std.StringHashMapUnmanaged(bool), calendar_id: u64) !void {
+        if (wanted.count() == 0) return;
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var events = self.events.valueIterator();
+        while (events.next()) |event| {
+            if (event.calendar_id != calendar_id) continue;
+            if (wanted.getPtr(event.uid)) |present| present.* = true;
+            if (event.ics_data.len == 0) continue;
+            _ = scratch.reset(.retain_capacity);
+            const children = icalendar.components(a, event.ics_data) catch |err| switch (err) {
+                error.InvalidCalendar => continue,
+                else => return err,
+            };
+            for (children) |item| {
+                if (!std.ascii.eqlIgnoreCase(item.name, "VEVENT")) continue;
+                const uid = try icalendar.componentText(a, item, "UID") orelse continue;
+                if (wanted.getPtr(uid)) |present| present.* = true;
+            }
+        }
+    }
+
+    const ExportRecord = union(enum) {
+        document: []const u8,
+        event: icalendar.Export.Event,
+    };
+
+    const ExportSnapshot = struct {
+        name: []const u8,
+        records: []const ExportRecord,
+    };
+
+    pub fn exportCalendar(self: *Self, arena: Allocator, username: []const u8, calendar_id: u64) ![]const u8 {
+        const mailbox_id = try self.activeMailboxId(username);
+        const snapshot = try self.snapshotCalendarExport(arena, username, mailbox_id, calendar_id);
+        var result = try icalendar.Export.init(arena, snapshot.name);
+        for (snapshot.records) |record| switch (record) {
+            .document => |document| try result.addDocument(document),
+            .event => |event| try result.addEvent(event),
+        };
+        return result.finish();
+    }
+
+    fn snapshotCalendarExport(self: *Self, arena: Allocator, username: []const u8, mailbox_id: ?i64, calendar_id: u64) !ExportSnapshot {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         const user_id = self.findUserIdLocked(username, mailbox_id) orelse return error.CalendarNotFound;
         const calendar = self.calendars.get(calendar_id) orelse return error.CalendarNotFound;
         if (calendar.user_id != user_id) return error.CalendarNotFound;
+        var records: std.ArrayList(ExportRecord) = .empty;
+        var bytes: usize = 0;
+        var events = self.events.valueIterator();
+        const empty: []const u8 = "";
+        while (events.next()) |event| {
+            if (event.calendar_id != calendar_id) continue;
+            bytes += if (event.ics_data.len > 0) event.ics_data.len else 128 + event.uid.len + event.summary.len +
+                (event.description orelse empty).len + (event.location orelse empty).len +
+                (event.organizer orelse empty).len + (event.rrule orelse empty).len;
+            if (bytes > icalendar.max_export_bytes) return error.CalendarExportTooLarge;
+            try records.append(arena, if (event.ics_data.len > 0)
+                .{ .document = try arena.dupe(u8, event.ics_data) }
+            else
+                .{ .event = .{
+                    .uid = try arena.dupe(u8, event.uid),
+                    .modified_at = event.modified_at,
+                    .summary = try arena.dupe(u8, event.summary),
+                    .description = try dupeOptional(arena, event.description),
+                    .location = try dupeOptional(arena, event.location),
+                    .organizer = try dupeOptional(arena, event.organizer),
+                    .start = event.dtstart,
+                    .end = event.dtend,
+                    .all_day = event.all_day,
+                    .recurrence = try dupeOptional(arena, event.rrule),
+                    .status = switch (event.status) {
+                        .tentative => "TENTATIVE",
+                        .confirmed => "CONFIRMED",
+                        .cancelled => "CANCELLED",
+                    },
+                } });
+        }
+        return .{ .name = try arena.dupe(u8, calendar.name), .records = records.items };
+    }
+
+    pub const CalendarWindow = struct { start: i64, end: i64 };
+    pub const ReminderSnapshot = struct {
+        events: []CalendarEventSummary = &.{},
+        dismissed: [][]const u8 = &.{},
+    };
+
+    pub fn snapshotReminderSources(self: *Self, a: Allocator, username: []const u8, window: CalendarWindow) !ReminderSnapshot {
+        const mailbox_id = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const owner = self.findUserIdLocked(username, mailbox_id) orelse return .{};
+
+        var events: std.ArrayList(CalendarEventSummary) = .empty;
+        var source_bytes: usize = 0;
+        var rows = self.events.valueIterator();
+        while (rows.next()) |event| {
+            const calendar = self.calendars.get(event.calendar_id) orelse continue;
+            if (calendar.user_id != owner or event.status == .cancelled) continue;
+            if (!event.reminder_coverage.mayFire(window.start, window.end, event.dtstart, event.dtend, event.recurring)) continue;
+            source_bytes += event.ics_data.len;
+            if (events.items.len >= 500 or source_bytes > 4 * 1024 * 1024) return error.TooManySeriesBytes;
+            var summary = try summarizeEvent(a, event.*);
+            summary.icalendar = try a.dupe(u8, event.ics_data);
+            try events.append(a, summary);
+        }
+        var dismissed: std.ArrayList([]const u8) = .empty;
+        if (self.conn) |*conn| {
+            var stmt = try conn.prepare("SELECT reminder_key FROM dav_reminder_dismissals WHERE user_id=? AND due_at>=?");
+            defer stmt.finalize();
+            try stmt.bindInt(1, @intCast(owner));
+            try stmt.bindInt(2, window.start);
+            while (try stmt.step()) try dismissed.append(a, try a.dupe(u8, try stmt.columnText(0)));
+        }
+        return .{ .events = try events.toOwnedSlice(a), .dismissed = try dismissed.toOwnedSlice(a) };
+    }
+
+    pub fn dismissReminder(self: *Self, username: []const u8, id: u64, key: []const u8, due: i64, cutoff: i64) !void {
+        const mailbox_id = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const event = try self.ownedEventLocked(username, mailbox_id, id);
+        const owner = self.calendars.get(event.calendar_id).?.user_id;
+        const conn = if (self.conn) |*c| c else return error.ReminderStorageUnavailable;
+        var prune = try conn.prepare("DELETE FROM dav_reminder_dismissals WHERE due_at<?");
+        defer prune.finalize();
+        try prune.bindInt(1, cutoff);
+        _ = try prune.step();
+        var stmt = try conn.prepare(
+            "INSERT OR IGNORE INTO dav_reminder_dismissals (user_id, reminder_key, due_at) " ++
+                "SELECT ?1, ?2, ?3 WHERE (SELECT count(*) FROM dav_reminder_dismissals WHERE user_id=?1) < 2048",
+        );
+        defer stmt.finalize();
+        try stmt.bindInt(1, @intCast(owner));
+        try stmt.bindText(2, key);
+        try stmt.bindInt(3, due);
+        _ = try stmt.step();
+        var verify = try conn.prepare("SELECT 1 FROM dav_reminder_dismissals WHERE user_id=? AND reminder_key=?");
+        defer verify.finalize();
+        try verify.bindInt(1, @intCast(owner));
+        try verify.bindText(2, key);
+        if (!try verify.step()) return error.TooManyDismissals;
+    }
+
+    pub fn snapshotCalendarEvents(self: *Self, arena: Allocator, username: []const u8, calendar_id: u64, start: i64, end: i64) ![]CalendarEventSummary {
+        return self.queryMailboxEvents(arena, username, calendar_id, .{ .start = start, .end = end }, "", false);
+    }
+
+    /// List owned events intersecting a half-open window, or search their
+    /// stored fields. Recurring masters are returned as candidate series.
+    pub fn queryMailboxEvents(self: *Self, arena: Allocator, username: []const u8, calendar_id: ?u64, window: ?CalendarWindow, query: []const u8, include_series: bool) ![]CalendarEventSummary {
+        const ascii = @import("ascii-compat");
+        if (window) |range| {
+            if (range.start >= range.end or @as(i128, range.end) - range.start > 366 * 86400) return error.InvalidRange;
+        } else if (query.len == 0) return error.InvalidRange;
+        const mailbox_id = try self.activeMailboxId(username);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const user_id = self.findUserIdLocked(username, mailbox_id) orelse {
+            if (calendar_id != null) return error.CalendarNotFound;
+            return &.{};
+        };
+        if (calendar_id) |id| {
+            const calendar = self.calendars.get(id) orelse return error.CalendarNotFound;
+            if (calendar.user_id != user_id) return error.CalendarNotFound;
+        }
         var result: std.ArrayList(CalendarEventSummary) = .empty;
+        var source_bytes: usize = 0;
         var events = self.events.valueIterator();
         while (events.next()) |event| {
-            if (event.calendar_id != calendar_id or event.dtstart >= end) continue;
-            const event_end = event.dtend orelse if (event.all_day) event.dtstart +| 86400 else event.dtstart;
-            const overlaps = event_end > start or event.dtstart >= start;
-            if (event.rrule == null and !overlaps) continue;
+            if (calendar_id) |id| {
+                if (event.calendar_id != id) continue;
+            } else {
+                const calendar = self.calendars.get(event.calendar_id) orelse continue;
+                if (calendar.user_id != user_id) continue;
+            }
+            const recurring = event.recurring;
+            if (window) |range| {
+                // A detached instance can be moved to either side of the master.
+                if ((!recurring or !include_series) and event.dtstart >= range.end) continue;
+                if (!recurring) {
+                    const event_end = event.dtend orelse if (event.all_day) event.dtstart +| 86400 else event.dtstart;
+                    if (event_end <= range.start and event.dtstart < range.start) continue;
+                }
+            }
+            if (query.len > 0 and ascii.indexOfIgnoreCase(event.summary, query) == null and
+                ascii.indexOfIgnoreCase(event.location orelse "", query) == null and
+                ascii.indexOfIgnoreCase(event.description orelse "", query) == null) continue;
             if (result.items.len == 500) return error.TooManyEvents;
-            try result.append(arena, .{
-                .id = event.id,
-                .uid = try arena.dupe(u8, event.uid),
-                .summary = try arena.dupe(u8, event.summary),
-                .location = try dupeOptional(arena, event.location),
-                .start = event.dtstart,
-                .end = event.dtend,
-                .all_day = event.all_day,
-                .recurrence_rule = try dupeOptional(arena, event.rrule),
-                .status = event.status,
-                .etag = try arena.dupe(u8, event.etag),
-            });
+            var summary = try summarizeEvent(arena, event.*);
+            if (include_series and recurring and event.ics_data.len > 0) {
+                source_bytes += event.ics_data.len;
+                if (source_bytes > 4 * 1024 * 1024) return error.TooManySeriesBytes;
+                summary.icalendar = try arena.dupe(u8, event.ics_data);
+            }
+            try result.append(arena, summary);
         }
         std.mem.sort(CalendarEventSummary, result.items, {}, struct {
             fn lessThan(_: void, left: CalendarEventSummary, right: CalendarEventSummary) bool {
@@ -862,6 +1482,23 @@ pub const CalDavStore = struct {
             }
         }.lessThan);
         return result.toOwnedSlice(arena);
+    }
+
+    fn summarizeEvent(arena: Allocator, event: Event) !CalendarEventSummary {
+        return .{
+            .id = event.id,
+            .calendar_id = event.calendar_id,
+            .uid = try arena.dupe(u8, event.uid),
+            .summary = try arena.dupe(u8, event.summary),
+            .location = try dupeOptional(arena, event.location),
+            .start = event.dtstart,
+            .end = event.dtend,
+            .all_day = event.all_day,
+            .recurrence_rule = try dupeOptional(arena, event.rrule),
+            .recurring = event.recurring,
+            .status = event.status,
+            .etag = try arena.dupe(u8, event.etag),
+        };
     }
 
     fn activeMailboxId(self: *Self, username: []const u8) !?i64 {
@@ -915,21 +1552,23 @@ pub const CalDavStore = struct {
     pub fn createEvent(self: *Self, calendar_id: u64, data: EventData) !u64 {
         self.mutex.lock();
         defer self.mutex.unlock();
+        return self.createEventLocked(calendar_id, data);
+    }
 
+    fn createEventLocked(self: *Self, calendar_id: u64, data: EventData) !u64 {
         const id = self.next_event_id;
         self.next_event_id += 1;
 
         const now = currentTimestamp();
-        var inserted = false;
-        const etag = try self.generateEtag(id, now);
-        errdefer if (!inserted) self.allocator.free(etag);
+        const etag = try self.generateEtag(id);
+        errdefer self.allocator.free(etag);
         // UID slices belong to the stored record, including caller-supplied IDs.
         const uid = if (data.uid) |value| try self.allocator.dupe(u8, value) else try self.generateUid();
-        errdefer if (!inserted) self.allocator.free(uid);
+        errdefer self.allocator.free(uid);
         const own = try self.ownEventText(data, data.organizer, data.ics_data orelse "");
-        errdefer if (!inserted) self.freeEventText(own);
+        errdefer self.freeEventText(own);
 
-        try self.events.put(id, .{
+        const event = Event{
             .id = id,
             .calendar_id = calendar_id,
             .uid = uid,
@@ -940,25 +1579,61 @@ pub const CalDavStore = struct {
             .dtend = data.dtend,
             .all_day = data.all_day,
             .rrule = own.rrule,
+            .recurring = own.rrule != null or icalendar.hasRecurrence(own.ics_data),
+            .reminder_coverage = try reminder.coverage(self.allocator, own.ics_data),
             .organizer = own.organizer,
             .status = data.status,
             .created_at = now,
             .modified_at = now,
             .etag = etag,
             .ics_data = own.ics_data,
-        });
-
-        inserted = true;
-        // Record sync change
-        if (self.config.enable_sync_tokens) {
-            try self.recordChange(calendar_id, id, .event, .created, etag, try self.getEventHref(calendar_id, uid));
-        }
-
-        // Update calendar ctag
-        try self.updateCalendarCtag(calendar_id);
-        self.persistEvent(self.events.get(id).?);
-
+        };
+        try self.events.ensureUnusedCapacity(1);
+        try self.commitEventMutationLocked(event, .created);
         return id;
+    }
+
+    /// Publish event, calendar revision, and sync history only after SQLite
+    /// commits both rows. A create reserves map capacity before this call.
+    fn commitEventMutationLocked(self: *Self, event: Event, kind: SyncChange.ChangeType) !void {
+        const change = if (self.config.enable_sync_tokens)
+            try self.prepareChange(event.calendar_id, event.id, .event, kind, event.etag, event.uid)
+        else
+            null;
+        errdefer if (change) |item| self.freeChange(item);
+        var calendar = self.calendars.get(event.calendar_id);
+        if (calendar) |*updated| {
+            updated.modified_at = currentTimestamp();
+            updated.sync_token = if (change) |item| item.token else self.current_sync_token;
+            updated.ctag = try std.fmt.allocPrint(self.allocator, "ctag-{d}-{d}-{s}", .{ event.calendar_id, updated.sync_token, event.etag });
+        }
+        errdefer if (calendar) |updated| self.allocator.free(updated.ctag);
+
+        if (self.conn) |*conn| {
+            try conn.beginTransaction();
+            errdefer conn.rollback() catch {};
+            if (kind == .deleted) {
+                var stmt = try conn.prepare("DELETE FROM dav_events WHERE id = ?");
+                defer stmt.finalize();
+                try stmt.bindInt(1, @intCast(event.id));
+                _ = try stmt.step();
+            } else {
+                try self.persistEvent(event);
+            }
+            if (calendar) |updated| try self.persistCalendar(updated);
+            try conn.commit();
+        }
+        if (kind == .deleted) {
+            _ = self.events.remove(event.id);
+        } else {
+            self.events.putAssumeCapacity(event.id, event);
+        }
+        if (calendar) |updated| {
+            const live = self.calendars.getPtr(event.calendar_id).?;
+            self.allocator.free(live.ctag);
+            live.* = updated;
+        }
+        if (change) |item| self.publishChange(item);
     }
 
     pub const EventData = struct {
@@ -1069,56 +1744,46 @@ pub const CalDavStore = struct {
     pub fn updateEvent(self: *Self, id: u64, data: EventData) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        return self.updateEventLocked(id, data);
+    }
 
-        if (self.events.getPtr(id)) |event| {
-            const now = currentTimestamp();
-            const old_etag = event.etag;
-            const etag = try self.generateEtag(id, now);
-            const own = self.ownEventText(data, event.organizer, data.ics_data orelse event.ics_data) catch |err| {
-                self.allocator.free(etag);
-                return err;
-            };
-            // The map owns the new data from this point onward.
-            self.allocator.free(old_etag);
-            self.freeEventText(EventText.fromEvent(event.*));
+    fn updateEventLocked(self: *Self, id: u64, data: EventData) !void {
+        const old = self.events.get(id) orelse return error.EventNotFound;
+        const etag = try self.generateEtag(id);
+        errdefer self.allocator.free(etag);
+        const own = try self.ownEventText(data, old.organizer, data.ics_data orelse old.ics_data);
+        errdefer self.freeEventText(own);
 
-            event.summary = own.summary;
-            event.description = own.description;
-            event.location = own.location;
-            event.dtstart = data.dtstart;
-            event.dtend = data.dtend;
-            event.all_day = data.all_day;
-            event.rrule = own.rrule;
-            event.organizer = own.organizer;
-            event.status = data.status;
-            event.modified_at = now;
-            event.etag = etag;
-            event.ics_data = own.ics_data;
-
-            if (self.config.enable_sync_tokens) {
-                try self.recordChange(event.calendar_id, id, .event, .modified, etag, try self.getEventHref(event.calendar_id, event.uid));
-            }
-            try self.updateCalendarCtag(event.calendar_id);
-            self.persistEvent(event.*);
-        } else {
-            return error.EventNotFound;
-        }
+        var event = old;
+        event.summary = own.summary;
+        event.description = own.description;
+        event.location = own.location;
+        event.dtstart = data.dtstart;
+        event.dtend = data.dtend;
+        event.all_day = data.all_day;
+        event.rrule = own.rrule;
+        event.recurring = own.rrule != null or icalendar.hasRecurrence(own.ics_data);
+        event.reminder_coverage = try reminder.coverage(self.allocator, own.ics_data);
+        event.organizer = own.organizer;
+        event.status = data.status;
+        event.modified_at = currentTimestamp();
+        event.etag = etag;
+        event.ics_data = own.ics_data;
+        try self.commitEventMutationLocked(event, .modified);
+        self.allocator.free(old.etag);
+        self.freeEventText(EventText.fromEvent(old));
     }
 
     pub fn deleteEvent(self: *Self, id: u64) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        return self.deleteEventLocked(id);
+    }
 
-        if (self.events.get(id)) |event| {
-            const etag = event.etag;
-            const calendar_id = event.calendar_id;
-            const href = if (self.config.enable_sync_tokens) try self.getEventHref(calendar_id, event.uid) else null;
-            _ = self.events.remove(id);
-            defer self.freeEvent(event);
-            if (href) |value| try self.recordChange(calendar_id, id, .event, .deleted, etag, value);
-            try self.updateCalendarCtag(calendar_id);
-            self.dbExecId("DELETE FROM dav_events WHERE id = {d}", id);
-        }
+    fn deleteEventLocked(self: *Self, id: u64) !void {
+        const event = self.events.get(id) orelse return;
+        try self.commitEventMutationLocked(event, .deleted);
+        self.freeEvent(event);
     }
 
     // -------------------------------------------------------------------------
@@ -1133,18 +1798,31 @@ pub const CalDavStore = struct {
     ) !u64 {
         self.mutex.lock();
         defer self.mutex.unlock();
+        return self.createAddressBookLocked(user_id, name, description);
+    }
 
+    fn createAddressBookLocked(
+        self: *Self,
+        user_id: u64,
+        name: []const u8,
+        description: ?[]const u8,
+    ) !u64 {
         const id = self.next_addressbook_id;
         self.next_addressbook_id += 1;
 
         const now = currentTimestamp();
         const ctag = try self.generateCtag(id, now);
+        errdefer self.allocator.free(ctag);
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        const owned_description = try dupeOptional(self.allocator, description);
+        errdefer if (owned_description) |text| self.allocator.free(text);
 
         try self.addressbooks.put(id, .{
             .id = id,
             .user_id = user_id,
-            .name = name,
-            .description = description,
+            .name = owned_name,
+            .description = owned_description,
             .created_at = now,
             .modified_at = now,
             .sync_token = self.current_sync_token,
@@ -1153,6 +1831,12 @@ pub const CalDavStore = struct {
 
         self.persistAddressBook(self.addressbooks.get(id).?);
         return id;
+    }
+
+    fn freeAddressBook(self: *Self, book: AddressBook) void {
+        self.allocator.free(book.ctag);
+        self.allocator.free(book.name);
+        if (book.description) |description| self.allocator.free(description);
     }
 
     pub fn getAddressBook(self: *Self, id: u64) ?AddressBook {
@@ -1202,36 +1886,11 @@ pub const CalDavStore = struct {
         }
 
         for (contacts_to_delete.items) |contact_id| {
-            // Free allocated etag before removing
-            if (self.contacts.getPtr(contact_id)) |c| {
-                self.allocator.free(c.etag);
-                self.allocator.free(c.uid);
-            }
-            // Remove associated emails and phones
-            var i: usize = 0;
-            while (i < self.emails.items.len) {
-                if (self.emails.items[i].contact_id == contact_id) {
-                    _ = self.emails.orderedRemove(i);
-                } else {
-                    i += 1;
-                }
-            }
-            i = 0;
-            while (i < self.phones.items.len) {
-                if (self.phones.items[i].contact_id == contact_id) {
-                    _ = self.phones.orderedRemove(i);
-                } else {
-                    i += 1;
-                }
-            }
-            _ = self.contacts.remove(contact_id);
+            if (self.contacts.fetchRemove(contact_id)) |entry| self.freeContact(entry.value);
+            self.removeContactRelations(contact_id);
         }
 
-        // Free allocated ctag before removing
-        if (self.addressbooks.getPtr(id)) |ab| {
-            self.allocator.free(ab.ctag);
-        }
-        _ = self.addressbooks.remove(id);
+        if (self.addressbooks.fetchRemove(id)) |entry| self.freeAddressBook(entry.value);
         self.dbExecId("DELETE FROM dav_emails WHERE contact_id IN (SELECT id FROM dav_contacts WHERE addressbook_id = {d})", id);
         self.dbExecId("DELETE FROM dav_phones WHERE contact_id IN (SELECT id FROM dav_contacts WHERE addressbook_id = {d})", id);
         self.dbExecId("DELETE FROM dav_contacts WHERE addressbook_id = {d}", id);
@@ -1242,22 +1901,198 @@ pub const CalDavStore = struct {
     // Contact Operations
     // -------------------------------------------------------------------------
 
-    pub fn createContact(self: *Self, addressbook_id: u64, data: ContactData) !u64 {
+    pub const default_address_book = "contacts";
+
+    /// Use the same ownership map as CardDAV and ActiveSync. The response owns
+    /// its strings and is safe to use once the DAV store lock is released.
+    pub fn snapshotContactBook(self: *Self, a: Allocator, username: []const u8, requested: ?[]const u8) !AddressBookSnapshot {
+        const mailbox_id = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const user_id = self.findUserIdLocked(username, mailbox_id);
+        var names: std.ArrayList([]const u8) = .empty;
+        if (user_id) |id| {
+            var books = self.addressbooks.valueIterator();
+            while (books.next()) |book| {
+                if (book.user_id == id and std.unicode.utf8ValidateSlice(book.name))
+                    try names.append(a, try a.dupe(u8, book.name));
+            }
+        }
+        if (names.items.len == 0) try names.append(a, default_address_book);
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn less(_: void, left: []const u8, right: []const u8) bool {
+                return std.ascii.orderIgnoreCase(left, right) == .lt;
+            }
+        }.less);
+        const chosen = requested orelse names.items[0];
+        const book = if (user_id) |id| self.getAddressBookByName(id, chosen) else null;
+        if (book == null and !std.mem.eql(u8, chosen, default_address_book)) return error.AddressBookNotFound;
+        return .{
+            .books = try names.toOwnedSlice(a),
+            .book = chosen,
+            .cards = if (book) |current| try self.contactCardsLocked(a, current.id) else &.{},
+        };
+    }
+
+    fn contactCardsLocked(self: *Self, a: Allocator, book: u64) ![]ContactCard {
+        var cards: std.ArrayList(ContactCard) = .empty;
+        var iter = self.contacts.valueIterator();
+        while (iter.next()) |contact| {
+            if (contact.addressbook_id != book or !std.unicode.utf8ValidateSlice(contact.uid)) continue;
+            var scratch = std.heap.ArenaAllocator.init(self.allocator);
+            defer scratch.deinit();
+            const fields = try contact_vcard.read(scratch.allocator(), contact.vcf_data);
+            var addresses: std.ArrayList([]const u8) = .empty;
+            for (fields.emails) |email| {
+                if (std.unicode.utf8ValidateSlice(email)) try addresses.append(a, try a.dupe(u8, email));
+            }
+            if (contact.vcf_data.len == 0) for (self.emails.items) |email| {
+                if (email.contact_id == contact.id and std.unicode.utf8ValidateSlice(email.email))
+                    try addresses.append(a, try a.dupe(u8, email.email));
+            };
+            const name = if (fields.name.len > 0) fields.name else contact.full_name;
+            const note = if (fields.note.len > 0) fields.note else contact.note orelse "";
+            const identifier = if (fields.uid.len > 0 and std.unicode.utf8ValidateSlice(fields.uid)) fields.uid else contact.uid;
+            var members: std.ArrayList([]const u8) = .empty;
+            for (fields.members) |member| {
+                if (std.unicode.utf8ValidateSlice(member)) try members.append(a, try a.dupe(u8, member));
+            }
+            try cards.append(a, .{
+                .uid = try a.dupe(u8, contact.uid),
+                .card_uid = try a.dupe(u8, identifier),
+                .name = if (std.unicode.utf8ValidateSlice(name)) try a.dupe(u8, name) else "Unnamed contact",
+                .note = if (std.unicode.utf8ValidateSlice(note)) try a.dupe(u8, note) else "",
+                .kind = fields.kind,
+                .emails = try addresses.toOwnedSlice(a),
+                .members = try members.toOwnedSlice(a),
+                .etag = try a.dupe(u8, contact.etag),
+            });
+        }
+        std.mem.sort(ContactCard, cards.items, {}, struct {
+            fn less(_: void, left: ContactCard, right: ContactCard) bool {
+                const order = std.ascii.orderIgnoreCase(left.name, right.name);
+                return order == .lt or (order == .eq and std.mem.order(u8, left.uid, right.uid) == .lt);
+            }
+        }.less);
+        return cards.toOwnedSlice(a);
+    }
+
+    pub fn editOwnedContact(self: *Self, a: Allocator, username: []const u8, collection: []const u8, resource: ?[]const u8, conditions: ResourceConditions, edit: ContactEdit) !PutResource {
+        const mailbox_id = try self.activeMailboxId(username);
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        if (resource != null and self.findUserIdLocked(username, mailbox_id) == null) return error.ContactNotFound;
+        const owner = try self.getOrCreateUserIdLocked(username, mailbox_id);
+        const existing_book = self.getAddressBookByName(owner, collection);
+        if (existing_book == null and (resource != null or !std.mem.eql(u8, collection, default_address_book)))
+            return error.ContactNotFound;
+        const old = if (resource) |uid| self.getContactByUid(existing_book.?.id, uid) orelse return error.ContactNotFound else null;
+        if (!conditions.allows(if (old) |contact| contact.etag else null)) return error.PreconditionFailed;
+
+        var random: [16]u8 = undefined;
+        io_compat.randomBytes(&random);
+        const uid = resource orelse try contact_vcard.uuid(a, &random);
+        const raw = if (old) |contact| try self.generateVcfLocked(contact) else "";
+        defer if (old != null) self.allocator.free(raw);
+        const original = try contact_vcard.read(a, raw);
+        if (old != null and original.kind != edit.kind) return error.InvalidContact;
+        const members = if (edit.kind == .group) try self.editedGroupMembers(a, existing_book, uid, original.members, edit.members) else &.{};
+        const updated = try contact_vcard.apply(a, raw, uid, .{
+            .kind = edit.kind,
+            .name = edit.name,
+            .note = edit.note,
+            .emails = if (edit.kind == .contact) edit.emails else &.{},
+            .members = members,
+        });
+        var data = try contactDataFromVcf(a, uid, updated);
+        if (old) |contact| {
+            data.birthday = contact.birthday;
+            data.photo_url = contact.photo_url;
+            try self.updateContactLocked(contact.id, data);
+            return PutResource.init(false, self.contacts.get(contact.id).?.etag);
+        }
+        const book = if (existing_book) |existing| existing.id else try self.createAddressBookLocked(owner, collection, null);
+        const id = try self.createContactLocked(book, data);
+        return PutResource.init(true, self.contacts.get(id).?.etag);
+    }
+
+    fn editedGroupMembers(self: *Self, a: Allocator, book: ?AddressBook, group_uid: []const u8, old: []const []const u8, selected: []const []const u8) ![]const []const u8 {
+        const cards = if (book) |value| try self.contactCardsLocked(a, value.id) else &.{};
+        var result: std.ArrayList([]const u8) = .empty;
+        // External, unresolved, and nested references may belong to another
+        // CardDAV client's workflow. Preserve them during a local edit.
+        for (old) |uri| {
+            for (cards) |card| {
+                if (card.kind == .contact and memberMatches(card, uri)) break;
+            } else {
+                try result.append(a, uri);
+            }
+        }
+        for (selected) |uid| {
+            if (std.mem.eql(u8, uid, group_uid)) return error.InvalidGroupMember;
+            for (cards) |card| {
+                if (!std.mem.eql(u8, card.uid, uid) or card.kind != .contact) continue;
+                const identity = contact_vcard.cardIdentifier(card.card_uid);
+                const uri = if (contact_vcard.isUuid(identity))
+                    try std.fmt.allocPrint(a, "urn:uuid:{s}", .{identity})
+                else if (std.ascii.startsWithIgnoreCase(card.card_uid, "urn:") or std.ascii.startsWithIgnoreCase(card.card_uid, "https:"))
+                    card.card_uid
+                else if (card.emails.len > 0)
+                    try std.fmt.allocPrint(a, "mailto:{s}", .{card.emails[0]})
+                else
+                    return error.InvalidGroupMember;
+                for (uri) |byte| if (byte <= ' ' or byte == 0x7f) return error.InvalidGroupMember;
+                for (result.items) |known| {
+                    if (std.mem.eql(u8, uri, known)) break;
+                } else try result.append(a, uri);
+                break;
+            } else return error.InvalidGroupMember;
+        }
+        return result.toOwnedSlice(a);
+    }
+
+    fn memberMatches(card: ContactCard, uri: []const u8) bool {
+        if (std.ascii.startsWithIgnoreCase(uri, "mailto:")) {
+            for (card.emails) |email| if (std.ascii.eqlIgnoreCase(email, uri[7..])) return true;
+            return false;
+        }
+        const left = contact_vcard.cardIdentifier(card.card_uid);
+        const right = contact_vcard.cardIdentifier(uri);
+        if (contact_vcard.isUuid(left) and contact_vcard.isUuid(right)) return std.ascii.eqlIgnoreCase(left, right);
+        return std.mem.eql(u8, left, right);
+    }
+
+    pub fn removeOwnedContact(self: *Self, username: []const u8, collection: []const u8, uid: []const u8, expected: []const u8) !void {
+        const mailbox_id = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const user = self.findUserIdLocked(username, mailbox_id) orelse return error.ContactNotFound;
+        const book = self.getAddressBookByName(user, collection) orelse return error.ContactNotFound;
+        const contact = self.getContactByUid(book.id, uid) orelse return error.ContactNotFound;
+        if (!std.mem.eql(u8, contact.etag, expected)) return error.PreconditionFailed;
+        try self.deleteContactLocked(contact.id);
+    }
+
+    pub fn createContact(self: *Self, addressbook_id: u64, data: ContactData) !u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.createContactLocked(addressbook_id, data);
+    }
+
+    fn createContactLocked(self: *Self, addressbook_id: u64, data: ContactData) !u64 {
         const id = self.next_contact_id;
         self.next_contact_id += 1;
 
         const now = currentTimestamp();
         var inserted = false;
-        const etag = try self.generateEtag(id, now);
+        const etag = try self.generateEtag(id);
         errdefer if (!inserted) self.allocator.free(etag);
         // UID slices belong to the stored record, including caller-supplied IDs.
         const uid = if (data.uid) |value| try self.allocator.dupe(u8, value) else try self.generateUid();
         errdefer if (!inserted) self.allocator.free(uid);
 
-        try self.contacts.put(id, .{
+        const contact = try self.ownContactText(.{
             .id = id,
             .addressbook_id = addressbook_id,
             .uid = uid,
@@ -1276,32 +2111,17 @@ pub const CalDavStore = struct {
             .vcf_data = data.vcf_data orelse "",
         });
 
+        errdefer if (!inserted) self.freeContactText(contact);
+        try self.contacts.ensureUnusedCapacity(1);
+        try self.replaceContactRelations(id, data);
+        self.contacts.putAssumeCapacity(id, contact);
         inserted = true;
-        // Add emails
-        for (data.emails) |email| {
-            try self.emails.append(self.allocator, .{
-                .contact_id = id,
-                .email = email.email,
-                .email_type = email.email_type,
-                .is_primary = email.is_primary,
-            });
-        }
-
-        // Add phones
-        for (data.phones) |phone| {
-            try self.phones.append(self.allocator, .{
-                .contact_id = id,
-                .number = phone.number,
-                .phone_type = phone.phone_type,
-                .is_primary = phone.is_primary,
-            });
-        }
 
         if (self.config.enable_sync_tokens) {
-            try self.recordChange(addressbook_id, id, .contact, .created, etag, try self.getContactHref(addressbook_id, uid));
+            try self.recordChange(addressbook_id, id, .contact, .created, etag, uid);
         }
         try self.updateAddressBookCtag(addressbook_id);
-        if (self.contacts.get(id)) |ct| self.persistContact(ct);
+        self.persistContact(contact);
 
         return id;
     }
@@ -1334,6 +2154,86 @@ pub const CalDavStore = struct {
         is_primary: bool = false,
     };
 
+    const optional_contact_fields = [_][]const u8{
+        "given_name", "family_name", "nickname", "organization", "title", "note", "photo_url",
+    };
+
+    fn ownContactText(self: *Self, contact: Contact) !Contact {
+        const a = self.allocator;
+        var owned = contact;
+        owned.full_name = "";
+        owned.vcf_data = "";
+        inline for (optional_contact_fields) |field| @field(owned, field) = null;
+        errdefer self.freeContactText(owned);
+        owned.full_name = try a.dupe(u8, contact.full_name);
+        owned.vcf_data = try a.dupe(u8, contact.vcf_data);
+        inline for (optional_contact_fields) |field| @field(owned, field) = try dupeOptional(a, @field(contact, field));
+        return owned;
+    }
+
+    fn freeContactText(self: *Self, contact: Contact) void {
+        self.allocator.free(contact.full_name);
+        self.allocator.free(contact.vcf_data);
+        inline for (optional_contact_fields) |field| {
+            if (@field(contact, field)) |value| self.allocator.free(value);
+        }
+    }
+
+    fn freeContact(self: *Self, contact: Contact) void {
+        self.freeContactText(contact);
+        self.allocator.free(contact.uid);
+        self.allocator.free(contact.etag);
+    }
+
+    fn removeContactRelations(self: *Self, id: u64) void {
+        var index: usize = 0;
+        while (index < self.emails.items.len) {
+            if (self.emails.items[index].contact_id == id) {
+                self.allocator.free(self.emails.orderedRemove(index).email);
+            } else {
+                index += 1;
+            }
+        }
+        index = 0;
+        while (index < self.phones.items.len) {
+            if (self.phones.items[index].contact_id == id) {
+                self.allocator.free(self.phones.orderedRemove(index).number);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    fn replaceContactRelations(self: *Self, id: u64, data: ContactData) !void {
+        const a = self.allocator;
+        var emails: std.ArrayList(EmailAddress) = .empty;
+        defer emails.deinit(a);
+        errdefer for (emails.items) |email| a.free(email.email);
+        var phones: std.ArrayList(PhoneNumber) = .empty;
+        defer phones.deinit(a);
+        errdefer for (phones.items) |phone| a.free(phone.number);
+        try emails.ensureTotalCapacity(a, data.emails.len);
+        try phones.ensureTotalCapacity(a, data.phones.len);
+
+        for (data.emails) |email| emails.appendAssumeCapacity(.{
+            .contact_id = id,
+            .email = try a.dupe(u8, email.email),
+            .email_type = email.email_type,
+            .is_primary = email.is_primary,
+        });
+        for (data.phones) |phone| phones.appendAssumeCapacity(.{
+            .contact_id = id,
+            .number = try a.dupe(u8, phone.number),
+            .phone_type = phone.phone_type,
+            .is_primary = phone.is_primary,
+        });
+        try self.emails.ensureUnusedCapacity(a, emails.items.len);
+        try self.phones.ensureUnusedCapacity(a, phones.items.len);
+        self.removeContactRelations(id);
+        self.emails.appendSliceAssumeCapacity(emails.items);
+        self.phones.appendSliceAssumeCapacity(phones.items);
+    }
+
     pub fn getContact(self: *Self, id: u64) ?Contact {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1354,66 +2254,33 @@ pub const CalDavStore = struct {
     pub fn updateContact(self: *Self, id: u64, data: ContactData) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        return self.updateContactLocked(id, data);
+    }
 
+    fn updateContactLocked(self: *Self, id: u64, data: ContactData) !void {
         if (self.contacts.getPtr(id)) |contact| {
             const now = currentTimestamp();
-            const old_etag = contact.etag;
-            const etag = try self.generateEtag(id, now);
-            self.allocator.free(old_etag);
+            const etag = try self.generateEtag(id);
+            var replaced = false;
+            errdefer if (!replaced) self.allocator.free(etag);
 
-            contact.full_name = data.full_name;
-            contact.given_name = data.given_name;
-            contact.family_name = data.family_name;
-            contact.nickname = data.nickname;
-            contact.organization = data.organization;
-            contact.title = data.title;
-            contact.birthday = data.birthday;
-            contact.note = data.note;
-            contact.photo_url = data.photo_url;
-            contact.modified_at = now;
-            contact.etag = etag;
-            if (data.vcf_data) |vcf| {
-                contact.vcf_data = vcf;
-            }
-
-            // Update emails: remove old, add new
-            var i: usize = 0;
-            while (i < self.emails.items.len) {
-                if (self.emails.items[i].contact_id == id) {
-                    _ = self.emails.orderedRemove(i);
-                } else {
-                    i += 1;
-                }
-            }
-            for (data.emails) |email| {
-                try self.emails.append(self.allocator, .{
-                    .contact_id = id,
-                    .email = email.email,
-                    .email_type = email.email_type,
-                    .is_primary = email.is_primary,
-                });
-            }
-
-            // Update phones: remove old, add new
-            i = 0;
-            while (i < self.phones.items.len) {
-                if (self.phones.items[i].contact_id == id) {
-                    _ = self.phones.orderedRemove(i);
-                } else {
-                    i += 1;
-                }
-            }
-            for (data.phones) |phone| {
-                try self.phones.append(self.allocator, .{
-                    .contact_id = id,
-                    .number = phone.number,
-                    .phone_type = phone.phone_type,
-                    .is_primary = phone.is_primary,
-                });
-            }
+            var updated = contact.*;
+            updated.full_name = data.full_name;
+            inline for (optional_contact_fields) |field| @field(updated, field) = @field(data, field);
+            updated.birthday = data.birthday;
+            updated.modified_at = now;
+            updated.etag = etag;
+            updated.vcf_data = data.vcf_data orelse contact.vcf_data;
+            const owned = try self.ownContactText(updated);
+            errdefer if (!replaced) self.freeContactText(owned);
+            try self.replaceContactRelations(id, data);
+            self.allocator.free(contact.etag);
+            self.freeContactText(contact.*);
+            contact.* = owned;
+            replaced = true;
 
             if (self.config.enable_sync_tokens) {
-                try self.recordChange(contact.addressbook_id, id, .contact, .modified, etag, try self.getContactHref(contact.addressbook_id, contact.uid));
+                try self.recordChange(contact.addressbook_id, id, .contact, .modified, etag, contact.uid);
             }
             try self.updateAddressBookCtag(contact.addressbook_id);
             self.persistContact(contact.*);
@@ -1548,34 +2415,17 @@ pub const CalDavStore = struct {
     pub fn deleteContact(self: *Self, id: u64) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        return self.deleteContactLocked(id);
+    }
 
+    fn deleteContactLocked(self: *Self, id: u64) !void {
         if (self.contacts.get(id)) |contact| {
             const etag = contact.etag;
             const addressbook_id = contact.addressbook_id;
-            const href = if (self.config.enable_sync_tokens) try self.getContactHref(addressbook_id, contact.uid) else null;
-            // Remove associated emails and phones
-            var i: usize = 0;
-            while (i < self.emails.items.len) {
-                if (self.emails.items[i].contact_id == id) {
-                    _ = self.emails.orderedRemove(i);
-                } else {
-                    i += 1;
-                }
-            }
-
-            i = 0;
-            while (i < self.phones.items.len) {
-                if (self.phones.items[i].contact_id == id) {
-                    _ = self.phones.orderedRemove(i);
-                } else {
-                    i += 1;
-                }
-            }
-
+            if (self.config.enable_sync_tokens) try self.recordChange(addressbook_id, id, .contact, .deleted, etag, contact.uid);
+            self.removeContactRelations(id);
             _ = self.contacts.remove(id);
-            defer self.allocator.free(etag);
-            defer self.allocator.free(contact.uid);
-            if (href) |value| try self.recordChange(addressbook_id, id, .contact, .deleted, etag, value);
+            defer self.freeContact(contact);
             try self.updateAddressBookCtag(addressbook_id);
             self.dbExecId("DELETE FROM dav_contacts WHERE id = {d}", id);
             self.dbExecId("DELETE FROM dav_emails WHERE contact_id = {d}", id);
@@ -1628,11 +2478,108 @@ pub const CalDavStore = struct {
         };
     }
 
-    /// Record a sync change. The `href` slice is owned by the store after this
-    /// call (ownership transferred from the caller). The `etag` slice is NOT
-    /// taken over: it is duplicated here so the SyncChange owns an independent
-    /// copy and does not alias the live Event/Contact etag (which may be freed
-    /// by a later update/delete -> use-after-free).
+    fn davSyncPrefix(self: *const Self, buf: []u8, kind: SyncChange.ResourceType, collection_id: u64) ![]const u8 {
+        const epoch = std.fmt.bytesToHex(self.dav_sync_epoch, .lower);
+        return std.fmt.bufPrint(buf, "urn:mail:dav-sync:{s}:{s}:{d}:", .{ epoch, @tagName(kind), collection_id });
+    }
+
+    /// Copy the visible collections for a Depth: 1 home-set response.
+    pub fn snapshotDavCollections(self: *Self, arena: Allocator, user_id: u64, kind: SyncChange.ResourceType) ![]DavCollection {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return switch (kind) {
+            .event => self.snapshotDavCollectionList(arena, user_id, kind, self.calendars.valueIterator()),
+            .contact => self.snapshotDavCollectionList(arena, user_id, kind, self.addressbooks.valueIterator()),
+        };
+    }
+
+    fn snapshotDavCollectionList(self: *const Self, arena: Allocator, user_id: u64, kind: SyncChange.ResourceType, iterator: anytype) ![]DavCollection {
+        var entries = iterator;
+        var result: std.ArrayList(DavCollection) = .empty;
+        while (entries.next()) |collection| {
+            if (collection.user_id != user_id) continue;
+            var prefix_buf: [96]u8 = undefined;
+            const prefix = try self.davSyncPrefix(&prefix_buf, kind, collection.id);
+            try result.append(arena, .{
+                .name = try arena.dupe(u8, collection.name),
+                .ctag = try arena.dupe(u8, collection.ctag),
+                .token = try std.fmt.allocPrint(arena, "{s}{d}", .{ prefix, collection.sync_token }),
+            });
+        }
+        return result.items;
+    }
+
+    /// Snapshot both the collection version and its members under the store
+    /// lock. The request arena owns all copies and the rendered token.
+    pub fn snapshotDavSync(self: *Self, arena: Allocator, user_id: u64, collection: []const u8, kind: SyncChange.ResourceType, query: DavSyncQuery) !DavSyncReport {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const Version = struct { id: u64, revision: u64, floor: u64 };
+        const version: Version = switch (kind) {
+            .event => if (self.getCalendarByName(user_id, collection)) |cal|
+                .{ .id = cal.id, .revision = cal.sync_token, .floor = cal.dav_history_floor }
+            else
+                return error.NotFound,
+            .contact => if (self.getAddressBookByName(user_id, collection)) |book|
+                .{ .id = book.id, .revision = book.sync_token, .floor = book.dav_history_floor }
+            else
+                return error.NotFound,
+        };
+
+        var prefix_buf: [96]u8 = undefined;
+        const prefix = try self.davSyncPrefix(&prefix_buf, kind, version.id);
+        var members: std.ArrayList(DavSyncMember) = .empty;
+        switch (query) {
+            .version_only => {},
+            .initial => switch (kind) {
+                .event => {
+                    var events = self.events.valueIterator();
+                    while (events.next()) |item| {
+                        if (item.calendar_id == version.id) try members.append(arena, .{
+                            .uid = try arena.dupe(u8, item.uid),
+                            .etag = try arena.dupe(u8, item.etag),
+                        });
+                    }
+                },
+                .contact => {
+                    var contacts = self.contacts.valueIterator();
+                    while (contacts.next()) |item| {
+                        if (item.addressbook_id == version.id) try members.append(arena, .{
+                            .uid = try arena.dupe(u8, item.uid),
+                            .etag = try arena.dupe(u8, item.etag),
+                        });
+                    }
+                },
+            },
+            .after => |token| {
+                if (!std.mem.startsWith(u8, token, prefix)) return error.InvalidSyncToken;
+                const digits = token[prefix.len..];
+                for (digits) |digit| if (!std.ascii.isDigit(digit)) return error.InvalidSyncToken;
+                const since = std.fmt.parseInt(u64, digits, 10) catch return error.InvalidSyncToken;
+                if (since < version.floor or since > version.revision) return error.InvalidSyncToken;
+
+                // The newest change determines whether each URL is live or
+                // removed, including after a delete and recreate at that URL.
+                var seen: std.StringHashMapUnmanaged(void) = .empty;
+                var index = self.sync_changes.items.len;
+                while (index > 0) {
+                    index -= 1;
+                    const change = self.sync_changes.items[index];
+                    if (change.token <= since) break;
+                    if (change.resource_type != kind or change.collection_id != version.id) continue;
+                    if ((try seen.getOrPut(arena, change.uid)).found_existing) continue;
+                    try members.append(arena, .{
+                        .uid = try arena.dupe(u8, change.uid),
+                        .etag = if (change.change_type == .deleted) null else try arena.dupe(u8, change.etag),
+                    });
+                }
+                std.mem.reverse(DavSyncMember, members.items);
+            },
+        }
+        return .{ .token = try std.fmt.allocPrint(arena, "{s}{d}", .{ prefix, version.revision }), .members = members.items };
+    }
+
+    /// The journal owns independent copies, including the UID of deleted items.
     fn recordChange(
         self: *Self,
         collection_id: u64,
@@ -1640,49 +2587,61 @@ pub const CalDavStore = struct {
         resource_type: SyncChange.ResourceType,
         change_type: SyncChange.ChangeType,
         etag: []const u8,
-        href: []const u8,
+        uid: []const u8,
     ) !void {
-        if (!self.config.enable_sync_tokens) {
-            // Caller transferred ownership of href; free it since we won't store it.
-            self.allocator.free(href);
-            return;
-        }
+        self.publishChange(try self.prepareChange(collection_id, resource_id, resource_type, change_type, etag, uid));
+    }
 
-        self.current_sync_token += 1;
-
-        errdefer self.allocator.free(href);
+    fn prepareChange(
+        self: *Self,
+        collection_id: u64,
+        resource_id: u64,
+        resource_type: SyncChange.ResourceType,
+        change_type: SyncChange.ChangeType,
+        etag: []const u8,
+        uid: []const u8,
+    ) !SyncChange {
+        const owned_uid = try self.allocator.dupe(u8, uid);
+        errdefer self.allocator.free(owned_uid);
         const owned_etag = try self.allocator.dupe(u8, etag);
         errdefer self.allocator.free(owned_etag);
+        const token = self.current_sync_token + 1;
 
-        try self.sync_changes.append(self.allocator, .{
+        try self.sync_changes.ensureUnusedCapacity(self.allocator, 1);
+        return .{
             .resource_id = resource_id,
             .collection_id = collection_id,
             .resource_type = resource_type,
             .change_type = change_type,
-            .token = self.current_sync_token,
+            .token = token,
             .etag = owned_etag,
-            .href = href,
+            .uid = owned_uid,
             .timestamp = currentTimestamp(),
-        });
+        };
+    }
+
+    fn freeChange(self: *Self, item: SyncChange) void {
+        self.allocator.free(item.uid);
+        self.allocator.free(item.etag);
+    }
+
+    fn publishChange(self: *Self, change: SyncChange) void {
+        self.sync_changes.appendAssumeCapacity(change);
+        self.current_sync_token = change.token;
 
         // Prune old history, bounding retained changes. Free owned strings of
         // any pruned entries to avoid leaks.
         while (self.sync_changes.items.len > self.config.max_sync_history) {
             const removed = self.sync_changes.orderedRemove(0);
-            self.allocator.free(removed.etag);
-            self.allocator.free(removed.href);
-        }
-    }
-
-    fn updateCalendarCtag(self: *Self, calendar_id: u64) !void {
-        if (self.calendars.getPtr(calendar_id)) |cal| {
-            const now = currentTimestamp();
-            const old_ctag = cal.ctag;
-            cal.ctag = try self.generateCtag(calendar_id, now);
-            self.allocator.free(old_ctag);
-            cal.modified_at = now;
-            cal.sync_token = self.current_sync_token;
-            self.persistCalendar(cal.*);
+            self.freeChange(removed);
+            switch (removed.resource_type) {
+                .event => if (self.calendars.getPtr(removed.collection_id)) |cal| {
+                    cal.dav_history_floor = removed.token;
+                },
+                .contact => if (self.addressbooks.getPtr(removed.collection_id)) |book| {
+                    book.dav_history_floor = removed.token;
+                },
+            }
         }
     }
 
@@ -1704,6 +2663,12 @@ pub const CalDavStore = struct {
 
     /// Generate a vCard 3.0 string from a Contact and its associated data
     pub fn generateVcf(self: *Self, contact: Contact) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.generateVcfLocked(self.contacts.get(contact.id) orelse return error.ContactNotFound);
+    }
+
+    fn generateVcfLocked(self: *Self, contact: Contact) ![]u8 {
         // If the contact already has raw vcf_data, return it
         if (contact.vcf_data.len > 0) {
             return try self.allocator.dupe(u8, contact.vcf_data);
@@ -1755,11 +2720,7 @@ pub const CalDavStore = struct {
         }
 
         // NOTE
-        if (contact.note) |n| {
-            try buf.appendSlice(self.allocator, "NOTE:");
-            try buf.appendSlice(self.allocator, n);
-            try buf.appendSlice(self.allocator, "\r\n");
-        }
+        if (contact.note) |n| try contact_vcard.appendText(self.allocator, &buf, "NOTE", n);
 
         // PHOTO
         if (contact.photo_url) |photo| {
@@ -1769,9 +2730,8 @@ pub const CalDavStore = struct {
         }
 
         // Emails
-        const emails = self.getContactEmails(contact.id);
-        defer self.allocator.free(emails);
-        for (emails) |email| {
+        for (self.emails.items) |email| {
+            if (email.contact_id != contact.id) continue;
             try buf.appendSlice(self.allocator, "EMAIL;TYPE=INTERNET");
             switch (email.email_type) {
                 .home => try buf.appendSlice(self.allocator, ";TYPE=HOME"),
@@ -1784,9 +2744,8 @@ pub const CalDavStore = struct {
         }
 
         // Phones
-        const phones = self.getContactPhones(contact.id);
-        defer self.allocator.free(phones);
-        for (phones) |phone| {
+        for (self.phones.items) |phone| {
+            if (phone.contact_id != contact.id) continue;
             try buf.appendSlice(self.allocator, "TEL");
             switch (phone.phone_type) {
                 .home => try buf.appendSlice(self.allocator, ";TYPE=HOME"),
@@ -1814,8 +2773,10 @@ pub const CalDavStore = struct {
     // Helper Functions
     // -------------------------------------------------------------------------
 
-    fn generateEtag(self: *Self, id: u64, timestamp: i64) ![]const u8 {
-        return try std.fmt.allocPrint(self.allocator, "\"{d}-{d}\"", .{ id, timestamp });
+    fn generateEtag(self: *Self, id: u64) ![]const u8 {
+        var revision: [16]u8 = undefined;
+        io_compat.randomBytes(&revision);
+        return std.fmt.allocPrint(self.allocator, "\"{x}-{s}\"", .{ id, std.fmt.bytesToHex(revision, .lower) });
     }
 
     fn generateCtag(self: *Self, id: u64, timestamp: i64) ![]const u8 {
@@ -1828,14 +2789,6 @@ pub const CalDavStore = struct {
         const counter = self.next_event_id +% self.next_contact_id;
         const seed = @as(u64, @bitCast(timestamp)) *% 6364136223846793005 +% counter;
         return try std.fmt.allocPrint(self.allocator, "{x}-{x}@localhost", .{ timestamp, seed });
-    }
-
-    fn getEventHref(self: *Self, calendar_id: u64, uid: []const u8) ![]const u8 {
-        return try std.fmt.allocPrint(self.allocator, "/calendars/{d}/{s}.ics", .{ calendar_id, uid });
-    }
-
-    fn getContactHref(self: *Self, addressbook_id: u64, uid: []const u8) ![]const u8 {
-        return try std.fmt.allocPrint(self.allocator, "/addressbooks/{d}/{s}.vcf", .{ addressbook_id, uid });
     }
 };
 
@@ -1949,6 +2902,40 @@ pub const IcsParser = struct {
 // VCF Parser (vCard)
 // =============================================================================
 
+/// Populate the structured store from the same wire card for webmail and
+/// CardDAV clients. The original card remains the source for DAV downloads.
+pub fn contactDataFromVcf(a: Allocator, resource_uid: []const u8, raw: []const u8) !CalDavStore.ContactData {
+    const parsed = VcfParser.parseContact(try contact_vcard.unfold(a, raw)) orelse
+        return .{ .uid = resource_uid, .vcf_data = raw, .full_name = "Unknown" };
+    const emails = try a.alloc(CalDavStore.EmailData, parsed.email_count);
+    const phones = try a.alloc(CalDavStore.PhoneData, parsed.phone_count);
+    const email_preferred = std.mem.indexOfScalar(bool, parsed.email_pref[0..parsed.email_count], true) != null;
+    const phone_preferred = std.mem.indexOfScalar(bool, parsed.phone_pref[0..parsed.phone_count], true) != null;
+    for (emails, 0..) |*item, i| item.* = .{
+        .email = try contact_vcard.decode(a, parsed.emails[i]),
+        .email_type = parsed.email_types[i],
+        .is_primary = if (email_preferred) parsed.email_pref[i] else i == 0,
+    };
+    for (phones, 0..) |*item, i| item.* = .{
+        .number = try contact_vcard.decode(a, parsed.phones[i]),
+        .phone_type = parsed.phone_types[i],
+        .is_primary = if (phone_preferred) parsed.phone_pref[i] else i == 0,
+    };
+    return .{
+        .uid = resource_uid,
+        .full_name = try contact_vcard.decode(a, parsed.full_name orelse "Unknown"),
+        .given_name = if (parsed.given_name) |value| try contact_vcard.decode(a, value) else null,
+        .family_name = if (parsed.family_name) |value| try contact_vcard.decode(a, value) else null,
+        .nickname = if (parsed.nickname) |value| try contact_vcard.decode(a, value) else null,
+        .organization = if (parsed.organization) |value| try contact_vcard.decode(a, value) else null,
+        .title = if (parsed.title) |value| try contact_vcard.decode(a, value) else null,
+        .note = if (parsed.note) |value| try contact_vcard.decode(a, value) else null,
+        .vcf_data = raw,
+        .emails = emails,
+        .phones = phones,
+    };
+}
+
 pub const VcfParser = struct {
     const MAX_MULTI_VALUES = 8;
 
@@ -1963,13 +2950,11 @@ pub const VcfParser = struct {
             const line = std.mem.trimEnd(u8, raw_logical, "\r");
             // Split a content line into its property part (NAME;params) and
             // value (everything after the first unquoted colon).
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-            const prop = line[0..colon];
-            const value = line[colon + 1 ..];
-            // Property name is up to the first ';' (params follow).
-            const semi = std.mem.indexOfScalar(u8, prop, ';');
-            const name = if (semi) |s| prop[0..s] else prop;
-            const params = if (semi) |s| prop[s + 1 ..] else "";
+            const field = contact_vcard.property(line) orelse continue;
+            const value = field.value;
+            const name = field.name;
+            const prop = line[0 .. line.len - value.len - 1];
+            const params = if (std.mem.indexOfScalar(u8, prop, ';')) |semi| prop[semi + 1 ..] else "";
 
             if (std.ascii.eqlIgnoreCase(name, "FN")) {
                 contact.full_name = value;
@@ -1998,6 +2983,8 @@ pub const VcfParser = struct {
                 contact.title = value;
             } else if (std.ascii.eqlIgnoreCase(name, "NICKNAME")) {
                 contact.nickname = value;
+            } else if (std.ascii.eqlIgnoreCase(name, "NOTE")) {
+                contact.note = value;
             } else if (std.ascii.eqlIgnoreCase(name, "UID")) {
                 contact.uid = value;
             }
@@ -2068,6 +3055,7 @@ pub const VcfParser = struct {
         family_name: ?[]const u8 = null,
         nickname: ?[]const u8 = null,
         title: ?[]const u8 = null,
+        note: ?[]const u8 = null,
         emails: [MAX_MULTI_VALUES][]const u8 = @splat(""),
         email_types: [MAX_MULTI_VALUES]EmailAddress.EmailType = @splat(.other),
         email_pref: [MAX_MULTI_VALUES]bool = @splat(false),
@@ -2352,6 +3340,92 @@ test "vcf parsing: typed emails/phones, pref, structured ORG" {
     try std.testing.expectEqual(EmailAddress.EmailType.home, c.email_types[1]);
     try std.testing.expect(c.email_pref[0]); // TYPE=...,PREF
     try std.testing.expectEqualStrings("grace@example.com", c.emails[1]);
+}
+
+test "calendar import can retry a failed SQLite write without an in-memory or sync record" {
+    var store = try CalDavStore.init(std.testing.allocator, .{ .db_path = ":memory:" });
+    defer store.deinit();
+    const account = "owner@example.test";
+    const owner = try store.getOrCreateUserId(account);
+    const calendar = try store.createCalendar(owner, "Personal", null);
+    const token = store.getSyncToken(calendar, true);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const items = [_]?CalDavStore.ImportEvent{.{
+        .uid = "retry@example.test",
+        .data = .{ .uid = "retry-resource", .summary = "Test", .dtstart = 1 },
+    }};
+    try store.conn.?.exec("CREATE TRIGGER reject_fixture BEFORE INSERT ON dav_events BEGIN SELECT RAISE(ABORT, 'fixture failure'); END");
+    const rejected = try store.importEvents(a, account, .{ .existing = calendar }, &items, false);
+    try std.testing.expectEqual(CalDavStore.ImportStatus.failed, rejected.statuses[0]);
+    try std.testing.expectEqual(token, store.getSyncToken(calendar, true));
+    try std.testing.expectEqual(@as(usize, 0), store.events.count());
+
+    try store.conn.?.exec("DROP TRIGGER reject_fixture");
+    const accepted = try store.importEvents(a, account, .{ .existing = calendar }, &items, false);
+    try std.testing.expectEqual(CalDavStore.ImportStatus.imported, accepted.statuses[0]);
+    try std.testing.expectEqual(@as(usize, 1), store.events.count());
+}
+
+test "event edit and delete roll back together with the calendar revision" {
+    var store = try CalDavStore.init(std.testing.allocator, .{ .db_path = ":memory:" });
+    defer store.deinit();
+    const account = "owner@example.test";
+    const calendar = try store.createMailboxCalendar(account, "Personal");
+    const event = try store.createMailboxEvent(account, calendar, .{ .summary = "Before", .dtstart = 100 });
+    const old_tag = event.revision.etag();
+    const token = store.getSyncToken(calendar, true);
+    try store.conn.?.exec("CREATE TRIGGER reject_revision BEFORE INSERT ON dav_calendars BEGIN SELECT RAISE(ABORT, 'fixture failure'); END");
+    try std.testing.expectError(error.StepFailed, store.updateMailboxEvent(account, event.id, old_tag, .{ .summary = "After", .dtstart = 200 }));
+    try std.testing.expectError(error.StepFailed, store.deleteMailboxEvent(account, event.id, old_tag));
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const snapshot = try store.snapshotMailboxEvent(arena.allocator(), account, event.id);
+    try std.testing.expectEqualStrings("Before", snapshot.event.summary);
+    try std.testing.expectEqualStrings(old_tag, snapshot.event.etag);
+    try std.testing.expectEqual(token, store.getSyncToken(calendar, true));
+    {
+        var stmt = try store.conn.?.prepare("SELECT summary, etag FROM dav_events");
+        defer stmt.finalize();
+        try std.testing.expect(try stmt.step());
+        try std.testing.expectEqualStrings("Before", try stmt.columnText(0));
+        try std.testing.expectEqualStrings(old_tag, try stmt.columnText(1));
+        try std.testing.expect(!try stmt.step());
+    }
+    try store.conn.?.exec("DROP TRIGGER reject_revision");
+    const revision = try store.updateMailboxEvent(account, event.id, old_tag, .{ .summary = "After", .dtstart = 200 });
+    try std.testing.expectError(error.PreconditionFailed, store.deleteMailboxEvent(account, event.id, old_tag));
+    try store.deleteMailboxEvent(account, event.id, revision.etag());
+    try std.testing.expectError(error.EventNotFound, store.snapshotMailboxEvent(arena.allocator(), account, event.id));
+}
+
+test "calendar export renders legacy events and rejects another mailbox's calendar" {
+    var store = try CalDavStore.init(std.testing.allocator, .{});
+    defer store.deinit();
+    const owner = "owner@example.test";
+    const user_id = try store.getOrCreateUserId(owner);
+    const calendar_id = try store.createCalendar(user_id, "Work, home", null);
+    _ = try store.createEvent(calendar_id, .{
+        .uid = "legacy@example.test",
+        .summary = "Planning; design",
+        .dtstart = -86400,
+        .dtend = 0,
+        .all_day = true,
+        .description = "First line\r\nSecond line",
+        .rrule = "FREQ=YEARLY",
+    });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectError(error.CalendarNotFound, store.exportCalendar(a, "other@example.test", calendar_id));
+    const ics = try store.exportCalendar(a, owner, calendar_id);
+    const items = try icalendar.components(a, ics);
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expect(std.mem.indexOf(u8, ics, "X-WR-CALNAME:Work\\, home\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ics, "DTSTART;VALUE=DATE:19691231\r\nDTEND;VALUE=DATE:19700101\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ics, "SUMMARY:Planning\\; design\r\nDESCRIPTION:First line\\nSecond line\r\n") != null);
 }
 
 test "DAV record UID ownership survives caller mutation and collection deletion" {

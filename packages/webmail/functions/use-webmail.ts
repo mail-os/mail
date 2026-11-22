@@ -1,19 +1,42 @@
-import type { BulkAction, BulkResult, ComposePayload, Contact, Conversation, DraftAck, DraftDocument, Folder, MailLimits, MessageDetail, MessagePage, MessageRef, MessageSummary, OutboxItem, User } from './mail-types'
+import type { PrivateCollection, AttachmentPage, IndexProgress, LibraryAttachment, AttentionStatus, AttentionView, BulkAction, BulkResult, CategoryRule, ComposePayload, Contact, Conversation, DraftAck, DraftDocument, Folder, MailLimits, MailNotificationScope, MessageDetail, MessagePage, MessageRef, MessageSummary, OutboxItem, User } from './mail-types'
 import { batch, derived, effect, state } from '@stacksjs/stx'
 import { createMailApi, MailApiError } from './mail-api'
-import { dateBoundary, folderName, fullDate, messageKey, rangeSelection, readableBytes, recipients, safeHtml, shortDate } from './mail-utils'
+import { attentionViews, deadlineLabel, localDateInput, localDeadline } from './mail-attention'
+import { captureListViewport, isShortcutEvent, messageIdentity, messagePageSize, restoreListViewport, triageShortcuts } from './mail-triage'
+import { receiptExcerpt, renderMailReader } from './mail-reader'
+import { dateBoundary, folderName, fullDate, messageKey, rangeSelection, readableBytes, recipient, recipients, shortDate } from './mail-utils'
 import { useAttachments } from './use-attachments'
 import { useDraftAutosave } from './use-draft-autosave'
 import { useRecipientEditor } from './use-recipient-editor'
 import { useRecoverySettings } from './use-recovery-settings'
+import { useForwarding } from './use-forwarding'
+import { useVacationSettings } from './use-vacation-settings'
+import type { ReviewAction, ReviewItem, ReviewView } from './use-sender-review'
+import { useSenderReview } from './use-sender-review'
+import { useMailNotifications } from './use-mail-notifications'
+import { usePrivateMail } from './use-private-mail'
+import { useAddressBook } from './use-address-book'
 
 interface Ref<T> { current: T | null }
+const categoryFolders = ['Newsletters', 'Receipts']
+const categorySettingsPath = '/webmail/api/category-settings'
+interface CategorySettings { automatic: boolean }
+type ReadingBatch = { kind: 'unread', read: number } | { kind: 'selected', items: MessageRef[], index: number }
+type OpenResult = 'opened' | 'seen' | 'missing' | 'failed' | 'cancelled'
+type ReadingPosition = Pick<MessageSummary, 'timestamp' | 'folder' | 'uid'>
+const emptyFilters = { location: '', sender: '', recipient: '', filename: '', after: '', before: '', status: 'any', flagged: false, attachments: false }
+
 export interface WebmailPorts {
   composer: Ref<HTMLDialogElement>
   password: Ref<HTMLDialogElement>
   confirmation: Ref<HTMLDialogElement>
   fileInput: Ref<HTMLInputElement>
   selectAll: Ref<HTMLInputElement>
+  messageList: Ref<HTMLElement>
+  messageReader: Ref<HTMLElement>
+  shortcutsDialog: Ref<HTMLDialogElement>
+  collectionsDialog: Ref<HTMLDialogElement>
+  contactsDialog: Ref<HTMLDialogElement>
   navigate: (path: string, options?: { reload?: boolean }) => unknown
   nextTick: (callback: () => void) => unknown
 }
@@ -27,6 +50,10 @@ export function useWebmail(ports: WebmailPorts) {
   const expandedThreads = state<string[]>([])
   const selected = state<MessageDetail | null>(null)
   const loading = state(false)
+  const refreshing = state(false)
+  const listError = state('')
+  const readerError = state('')
+  const readerTarget = state<MessageRef | null>(null)
   const reading = state(false)
   const readingLoading = state(false)
   const mutating = state(false)
@@ -34,11 +61,59 @@ export function useWebmail(ports: WebmailPorts) {
   const notice = state('')
   const query = state('')
   const activeQuery = state('')
-  const searchAll = state(false)
+  const appliedFilters = state(emptyFilters)
+  const libraryView = state(false)
+  const collectionId = state<string | null>(null)
+  const libraryFiles = state<LibraryAttachment[]>([])
+  const indexProgress = state<IndexProgress | null>(null)
+  const searchFolder = derived(() => appliedFilters().location || folder())
+  const appliedSearchAll = derived(() => searchFolder() !== folder() || folder() === '*')
+  const filterLocation = state('')
+  const attentionView = state<AttentionView | null>(null)
+  const followUpFocused = state(false)
+  const attentionSaving = state(false)
+  const attentionSchedule = state<'snoozed' | 'reminders' | null>(null)
+  const attentionDate = state('')
+  const attentionZone = Intl.DateTimeFormat().resolvedOptions().timeZone
+  const dueReminders = state(0)
+  const categoryList = derived(() => !libraryView() && !attentionView() && !appliedSearchAll() && categoryFolders.includes(folder()))
+  const newsletterExpanded = state(true)
+  const receiptFull = state(false)
+  const remoteImagesAllowed = state(false)
+  const readerExpanded = derived(() => reading() && selected()?.folder === 'Newsletters' && newsletterExpanded())
+  const receiptCompact = derived(() => selected()?.folder === 'Receipts' && !receiptFull())
+  const receiptPreview = derived(() => {
+    const item = selected()
+    return item && receiptCompact() ? receiptExcerpt(item.text || '', item.html || '') : ''
+  })
+  const sortingSettings = state<CategorySettings | null>(null)
+  const sortingSaving = state(false)
+  const sortingError = state('')
+  const categoryRule = state<CategoryRule>('automatic')
+  const categoryRuleSaving = state(false)
+  const placementText = derived(() => {
+    const item = selected()
+    if (!item) return ''
+    const source = item.placement
+    if (!source) return categoryFolders.includes(item.folder) ? 'This copy is filed in ' + folderName(item.folder) + '.' : ''
+    if (item.folder !== source.original_folder) return 'Delivered to ' + folderName(source.original_folder) + '. This copy is now in ' + folderName(item.folder) + '.'
+    switch (source.reason) {
+      case 'sender_rule': return 'Filed here by a rule for this sender.'
+      case 'mailing_list': return 'Filed in Newsletters because it came from a mailing list.'
+      case 'receipt_subject': return 'Filed in Receipts because the subject looks like a receipt, invoice, or order confirmation.'
+      case 'sender_review': return 'Released to Inbox from Sender Review.'
+      case 'spam_filter': return 'The spam filter placed this message here.'
+      case 'junk_feedback': return 'Filed here based on your Junk feedback for this sender.'
+      case 'not_junk_feedback': return 'Delivered to Inbox based on your Not Junk feedback for this sender.'
+      default: return ''
+    }
+  })
   const filterSender = state('')
+  const filterRecipient = state('')
+  const filterFilename = state('')
   const filterAfter = state('')
   const filterBefore = state('')
-  const filterUnread = state(false)
+  const filterStatus = state('any')
   const filterFlagged = state(false)
   const filterAttachments = state(false)
   const filtersOpen = state(false)
@@ -48,8 +123,15 @@ export function useWebmail(ports: WebmailPorts) {
   const matchingTotal = state(0)
   const moveTo = state('Archive')
   const showHtml = state(true)
+  const formattedReader = derived(() => {
+    const item = selected()
+    return renderMailReader(item?.html || '', item?.embedded_images, remoteImagesAllowed())
+  })
   const checked = state<MessageRef[]>([])
-  const undoAction = state<{ id: string, expiresAt: number } | null>(null)
+  const readingBatch = state<ReadingBatch | null>(null)
+  const triageBusy = state(false)
+  const shortcutsOpen = state(false)
+  const undoAction = state<{ id: string, expiresAt: number, kind?: 'group' } | null>(null)
   const now = state(Date.now() / 1000)
   const outbox = state<OutboxItem[]>([])
   const pendingSend = state<OutboxItem | null>(null)
@@ -65,6 +147,7 @@ export function useWebmail(ports: WebmailPorts) {
   const inReplyTo = state('')
   const references = state('')
   const replyContext = state<MessageRef | null>(null)
+  const clearFollowUp = state(false)
   const showCc = state(false)
   const showBcc = state(false)
   const sending = state(false)
@@ -73,6 +156,8 @@ export function useWebmail(ports: WebmailPorts) {
   const sendDelay = state(10)
   const sendDelayOptions = derived(() => [...new Set([0, 5, 10, 30, sendDelay()])].sort((left, right) => left - right))
   const settings = state(false)
+  const leavingAccount = state(false)
+  const accountChangeError = state('')
   const currentPassword = state('')
   const newPassword = state('')
   const confirmPassword = state('')
@@ -83,6 +168,10 @@ export function useWebmail(ports: WebmailPorts) {
   const limits = state<MailLimits>({ maxFileBytes: 0, maxTotalBytes: 0, maxCount: 0, maxMessageBytes: 0, undoSendSeconds: 10 })
   let listRequest = 0
   let messageRequest = 0
+  let triageRequest = 0
+  let readingViewport: ReturnType<typeof captureListViewport> = null
+  let retryReading: (() => Promise<void>) | null = null
+  let shortcutsTrigger: HTMLElement | null = null
   let selectionAnchor: string | null = null
   let clockOffset = 0
   let lastRefresh = 0
@@ -94,28 +183,84 @@ export function useWebmail(ports: WebmailPorts) {
   let lastQueuedPayload: ComposePayload | null = null
   const announcedSends = new Set<string>()
 
-  function onAuthError(cause: MailApiError): void {
-    authExpired.set(true)
-    if (cause.code === 'account_changed') {
-      // Never move a private composition into a newly signed-in account.
-      closeReader()
+  function clearAccountState(): void {
+    destroyed = true
+    invalidateList()
+    closeReader()
+    contactBook.closeContacts()
+    forwardingSettings.clearForwarding()
+    vacationSettings.clearVacationSettings()
+    privateMail.privateCollections.set([])
+    draft.destroy()
+    resetComposition()
+    recipientEditor.destroy()
+    batch(() => {
+      user.set(null)
       messages.set([])
       threads.set([])
+      folders.set([])
+      libraryFiles.set([])
+      outbox.set([])
       checked.set([])
-      composing.set(false)
-      batch(() => { subject.set(''); body.set(''); draftHtml.set(''); recipientEditor.restore({ to: [], cc: [], bcc: [] }, { to: '', cc: '', bcc: '' }); attachmentEditor.destroy(); user.set(null) })
-      draft.destroy()
+      undoAction.set(null)
+      pendingSend.set(null)
+      settings.set(false)
+    })
+  }
+
+  function onAuthError(cause: MailApiError): void {
+    if (destroyed) return
+    authExpired.set(true)
+    if (cause.code === 'account_changed') {
+      clearAccountState()
       ports.navigate('/login', { reload: true })
     }
     else if (!user()) ports.navigate('/login', { reload: true })
   }
-  const api = createMailApi(() => user()?.username, onAuthError)
+  const api = createMailApi(() => user()?.username, onAuthError, () => !destroyed)
+  const notifications = useMailNotifications(api, () => user()?.username)
+  const senderReview = useSenderReview(api)
+  const privateMail = usePrivateMail(api, selected)
+  const contactBook = useAddressBook(api)
+  async function showContacts(): Promise<void> {
+    if (contactBook.contactsOpen()) return
+    contactBook.contactsOpen.set(true)
+    ports.nextTick(() => { if (contactBook.contactsOpen() && !ports.contactsDialog.current?.open) ports.contactsDialog.current?.showModal() })
+    await contactBook.loadContacts()
+  }
+  async function composeSavedCard(): Promise<void> {
+    const addresses = contactBook.savedContactRecipients()
+    if (addresses.length === 0) {
+      contactBook.contactsError.set('This card has no available email addresses.')
+      return
+    }
+    if (sending() || mutating() || contactBook.contactsBusy()) return
+    contactBook.contactsBusy.set(true)
+    try {
+      if (hasComposition()) await draft.flushAll()
+      contactBook.closeContacts()
+      resetComposition()
+      recipientEditor.restore({ to: addresses, cc: [], bcc: [] }, { to: '', cc: '', bcc: '' })
+      title.set('New message')
+      showComposer()
+    }
+    catch (cause) { contactBook.contactsError.set(errorMessage(cause)) }
+    finally { contactBook.contactsBusy.set(false) }
+  }
+
+  const collectionView = derived(() => privateMail.privateCollections().find(item => item.id === collectionId()) || null)
+  const canOpenPrivate = derived(() => Boolean(selected()?.reference && selected()?.folder !== 'Drafts' && !senderReview.senderReviewOpen()))
+
   const recipientEditor = useRecipientEditor(value => api<Contact[]>(`/webmail/api/contacts?q=${encodeURIComponent(value)}`))
   const recoverySettings = useRecoverySettings(api, () => user()?.username || '')
-  const attachmentEditor = useAttachments(() => user()?.username, limits, cause => { if (cause instanceof MailApiError && cause.status === 401) onAuthError(cause) }, id => api(`/webmail/api/uploads/${id}`, { method: 'DELETE' }))
+  const forwardingSettings = useForwarding(api)
+  const vacationSettings = useVacationSettings(api)
+  const attachmentEditor = useAttachments(() => user()?.username, limits, cause => {
+    if (cause instanceof MailApiError && (cause.status === 401 || cause.code === 'account_changed')) onAuthError(cause)
+  }, id => api(`/webmail/api/uploads/${id}`, { method: 'DELETE' }))
   const hasComposition = derived(() => Boolean(subject() || body() || draftHtml() || attachmentEditor.attachments().length || recipientEditor.toRecipients().length || recipientEditor.ccRecipients().length || recipientEditor.bccRecipients().length || recipientEditor.toInput() || recipientEditor.ccInput() || recipientEditor.bccInput()))
   function content() {
-    return { ...recipientEditor.snapshot(), subject: subject(), text: body(), html: body() === initialText() ? draftHtml() : '', inReplyTo: inReplyTo(), references: references(), attachments: attachmentEditor.snapshot(), replyContext: replyContext() }
+    return { ...recipientEditor.snapshot(), subject: subject(), text: body(), html: body() === initialText() ? draftHtml() : '', inReplyTo: inReplyTo(), references: references(), attachments: attachmentEditor.snapshot(), replyContext: replyContext(), clearFollowUp: clearFollowUp() }
   }
   const draft = useDraftAutosave({ snapshot: content, hasContent: hasComposition, active: () => composing() && !sending(), blocked: () => attachmentEditor.attachmentPending() || authExpired(), save: payload => api<DraftAck>('/webmail/api/drafts', { method: 'POST', body: JSON.stringify(payload) }) })
   const hasUnsavedChanges = derived(() => draft.dirty() || attachmentEditor.attachmentPending())
@@ -129,116 +274,626 @@ export function useWebmail(ports: WebmailPorts) {
     if (draft.status() === 'error') return 'Draft not saved. Your changes are still here.'
     return hasComposition() ? 'Unsaved changes' : 'Drafts save automatically as you type.'
   })
-  const visibleMessages = derived(() => conversations() && folder() !== 'Drafts' ? threads().flatMap(thread => thread.members.filter(message => message.matches_filters !== false)) : messages())
-  const checkedKeys = derived(() => checked().map(messageKey))
+  const visibleMessages = derived(() => threads().length ? threads().flatMap(thread => thread.members.filter(message => message.matches_filters !== false)) : messages())
+  const checkedKeys = derived(() => checked().map(messageIdentity))
   const selectedCount = derived(() => checked().length)
-  const allChecked = derived(() => visibleMessages().length > 0 && visibleMessages().every(message => checkedKeys().includes(messageKey(message))))
-  const someChecked = derived(() => !allChecked() && visibleMessages().some(message => checkedKeys().includes(messageKey(message))))
-  const filterActive = derived(() => Boolean(activeQuery() || filterSender() || filterAfter() || filterBefore() || filterUnread() || filterFlagged() || filterAttachments() || searchAll()))
+  function isJunkFolder(name: string): boolean { return name === 'Junk' || name === limits().junkFolder }
+  function junkActionFor(name: string): 'junk' | 'not_junk' | null {
+    if (isJunkFolder(name)) return 'not_junk'
+    if (['sent', 'drafts', 'trash', 'screening', 'declined'].includes(name.toLowerCase())) return null
+    return 'junk'
+  }
+  const readerJunkAction = derived(() => selected() ? junkActionFor(selected()!.folder) : null)
+  const selectionJunkAction = derived(() => {
+    const messages = checked()
+    if (!messages.length) return null
+    const action = junkActionFor(messages[0].folder)
+    return messages.every(item => junkActionFor(item.folder) === action) ? action : null
+  })
+  const allChecked = derived(() => visibleMessages().length > 0 && visibleMessages().every(message => checkedKeys().includes(messageIdentity(message))))
+  const someChecked = derived(() => !allChecked() && visibleMessages().some(message => checkedKeys().includes(messageIdentity(message))))
+  const unreadAvailable = derived(() => !libraryView() && !outboxView() && !senderReview.senderReviewOpen() && !attentionView() && appliedFilters().status !== 'read' && (appliedSearchAll() || folder() !== 'Drafts'))
+  const filterActive = derived(() => {
+    const filter = appliedFilters()
+    return Boolean(activeQuery() || filter.sender || filter.recipient || filter.filename || filter.after || filter.before || filter.status !== 'any' || filter.flagged || filter.attachments || (filter.location && filter.location !== folder()))
+  })
   const undoRemaining = derived(() => Math.min(30, Math.max(0, Math.ceil((undoAction()?.expiresAt ?? 0) - now()))))
   const sendRemaining = derived(() => Math.max(0, Math.ceil((pendingSend()?.dueAt ?? 0) - now())))
   const outboxCount = derived(() => outbox().filter(item => ['pending', 'sending', 'failed', 'partial', 'unknown', 'sent_unfiled'].includes(item.state)).length)
-  const currentFolderName = derived(() => outboxView() ? 'Outbox' : folderName(searchAll() ? '*' : folder()))
+  const currentFolderName = derived(() => {
+    if (outboxView()) return 'Outbox'
+    if (libraryView()) return 'Attachments'
+    if (collectionView()) return collectionView()!.name
+    return attentionViews.find(item => item.name === attentionView())?.label || folderName(searchFolder())
+  })
   const selectionEffect = effect(() => { const partial = someChecked(); if (ports.selectAll.current) ports.selectAll.current.indeterminate = partial })
 
-  function messagePath(message: MessageRef): string { return `/webmail/api/messages/${message.uid}?folder=${encodeURIComponent(message.folder)}` }
-  function attachmentPath(index: number, message: MessageRef | null = selected()): string {
-    return `/webmail/api/attachment?uid=${message?.uid}&folder=${encodeURIComponent(message?.folder || folder())}&index=${index}&account=${encodeURIComponent(user()?.username || '')}`
+  function messagePath(message: MessageRef): string {
+    return message.reference
+      ? `/webmail/api/messages/ref/${encodeURIComponent(message.reference)}`
+      : `/webmail/api/messages/${message.uid}?folder=${encodeURIComponent(message.folder)}`
   }
-  function closeReader(): void { selected.set(null); reading.set(false); readingLoading.set(false); ++messageRequest }
-  async function loadFolders(): Promise<void> { folders.set(await api<Folder[]>('/webmail/api/folders')) }
-  async function loadMessages(quiet = false): Promise<void> {
-    if (outboxView()) return
-    const request = ++listRequest
-    const name = searchAll() ? '*' : folder()
-    if (!quiet) { loading.set(true); messages.set([]); threads.set([]) }
-    error.set('')
-    try {
-      const after = dateBoundary(filterAfter())
-      const before = dateBoundary(filterBefore(), true)
-      if (after !== null && before !== null && before < after) throw new Error('End date must follow start date.')
-      const params = new URLSearchParams({ folder: name, page: String(page()), per_page: '50', q: activeQuery(), from: filterSender().trim(), unread: String(filterUnread()), flagged: String(filterFlagged()), attachments: String(filterAttachments()), conversations: String(conversations() && folder() !== 'Drafts') })
-      if (after !== null) params.set('after', String(after))
-      if (before !== null) params.set('before', String(before))
-      const result = await api<MessagePage>(`/webmail/api/messages?${params}`)
-      if (destroyed || request !== listRequest) return
-      batch(() => { messages.set(result.items || []); threads.set(result.threads || []); total.set(result.total); matchingTotal.set(result.message_total); page.set(result.page) })
-      const detail = selected()
-      if (detail) {
-        const summary = [...result.items, ...result.threads.flatMap(thread => thread.members)].find(item => messageKey(item) === messageKey(detail))
-        if (summary) selected.set({ ...detail, flags: summary.flags })
-      }
-      ports.nextTick(() => { if (ports.selectAll.current) ports.selectAll.current.indeterminate = someChecked() })
+  function messageRef(message: MessageRef): MessageRef {
+    return { uid: message.uid, folder: message.folder, reference: message.reference, revision: message.revision }
+  }
+  function displaySubject(message: Pick<MessageSummary, 'subject' | 'personal_subject'> | null): string {
+    return message?.personal_subject || message?.subject || '(no subject)'
+  }
+  function senderLabel(from: string): string { return recipient(from).name || from }
+  function attachmentPath(index: number, message: MessageRef | null = selected()): string {
+    const params = new URLSearchParams({ index: String(index), account: user()?.username || '' })
+    if (message?.reference && message.revision) {
+      params.set('reference', message.reference)
+      params.set('revision', message.revision)
     }
-    catch (cause) { if (request === listRequest) error.set(errorMessage(cause)) }
-    finally { if (request === listRequest) loading.set(false) }
+    else {
+      params.set('uid', String(message?.uid))
+      params.set('folder', message?.folder || folder())
+    }
+    return `/webmail/api/attachment?${params}`
+  }
+  function cancelBatch(): void {
+    ++triageRequest
+    readingBatch.set(null)
+    triageBusy.set(false)
+  }
+  function closeReader(restoreFocus = false): void {
+    cancelBatch()
+    const saved = readingViewport
+    readingViewport = null
+    ++messageRequest
+    selected.set(null)
+    privateMail.closePrivate()
+    remoteImagesAllowed.set(false)
+    senderReview.senderReviewSelection.set(null)
+    reading.set(false)
+    readingLoading.set(false)
+    readerError.set('')
+    readerTarget.set(null)
+    retryReading = null
+    followUpFocused.set(false)
+    attentionSchedule.set(null)
+    if (restoreFocus) ports.nextTick(() => {
+      if (saved) restoreListViewport(saved, true)
+      else ports.messageList.current?.focus({ preventScroll: true })
+    })
+  }
+  async function loadFolders(): Promise<void> { folders.set(await api<Folder[]>('/webmail/api/folders')) }
+  function listParams(): URLSearchParams {
+    const filter = appliedFilters()
+    const after = dateBoundary(filter.after)
+    const before = dateBoundary(filter.before, true)
+    if (after !== null && before !== null && before < after) throw new Error('End date must follow start date.')
+    const params = new URLSearchParams({
+      folder: searchFolder(), page: String(page()), per_page: String(messagePageSize), q: libraryView() ? '' : activeQuery(),
+      from: filter.sender, to: filter.recipient, filename: filter.filename, index_budget: '256', status: filter.status, flagged: String(filter.flagged), attachments: String(filter.attachments),
+      conversations: String(conversations() && folder() !== 'Drafts'), bundles: String(categoryList()),
+    })
+    const workflow = attentionView()
+    if (workflow) params.set('attention', workflow)
+    if (!libraryView()) params.set('personal', 'true')
+    const collection = collectionId()
+    if (collection) params.set('collection', collection)
+    if (after !== null) params.set('after', String(after))
+    if (before !== null) params.set('before', String(before))
+    return params
+  }
+  function invalidateList(): void {
+    ++listRequest
+    loading.set(false)
+    refreshing.set(false)
+    listError.set('')
+    indexProgress.set(null)
+  }
+  async function loadMessages(quiet = false): Promise<boolean> {
+    if (outboxView() || senderReview.senderReviewOpen() || (quiet && loading())) return false
+    const request = ++listRequest
+    refreshing.set(quiet)
+    if (!quiet) {
+      loading.set(true)
+      messages.set([])
+      threads.set([])
+      libraryFiles.set([])
+      indexProgress.set(null)
+    }
+    try {
+      const route = libraryView() ? 'attachments' : 'messages'
+      const path = `/webmail/api/${route}?${listParams()}`
+      let result = await api<MessagePage | AttachmentPage>(path)
+      while (result.index?.pending && !destroyed && request === listRequest) {
+        indexProgress.set(result.index)
+        await new Promise(resolve => setTimeout(resolve, 75))
+        if (destroyed || request !== listRequest) return false
+        result = await api<MessagePage | AttachmentPage>(path)
+      }
+      if (destroyed || request !== listRequest) return false
+      const viewport = quiet ? captureListViewport(ports.messageList.current) : null
+      batch(() => {
+        if ('message_total' in result) {
+          messages.set(result.items || [])
+          threads.set(result.threads || [])
+          matchingTotal.set(result.message_total)
+        }
+        else {
+          libraryFiles.set(result.items)
+          matchingTotal.set(result.total)
+        }
+        indexProgress.set(null)
+        total.set(result.total)
+        page.set(result.page)
+        listError.set('')
+      })
+      ports.nextTick(() => {
+        if (request !== listRequest) return
+        if (ports.selectAll.current) ports.selectAll.current.indeterminate = someChecked()
+        if (quiet) restoreListViewport(viewport)
+        else if (ports.messageList.current) ports.messageList.current.scrollTop = 0
+      })
+      return true
+    }
+    catch (cause) {
+      if (request === listRequest) listError.set(errorMessage(cause))
+      return false
+    }
+    finally {
+      if (request === listRequest) {
+        loading.set(false)
+        refreshing.set(false)
+        indexProgress.set(null)
+      }
+    }
   }
   async function refresh(quiet = false): Promise<void> {
     lastRefresh = Date.now()
-    await Promise.all([loadMessages(quiet), loadFolders().catch(cause => error.set(errorMessage(cause)))])
+    const reviewOpen = senderReview.senderReviewOpen()
+    await Promise.all([
+      reviewOpen ? senderReview.loadSenderReview() : loadMessages(quiet),
+      loadFolders().catch(cause => error.set(errorMessage(cause))),
+      reviewOpen ? Promise.resolve() : senderReview.refreshSenderReviewStatus().catch(() => {}),
+      refreshAttention().catch(() => {}),
+    ])
+  }
+  async function refreshAttention(): Promise<void> {
+    const before = selected()
+    const status = before?.attention
+    const marked = status?.saved || status?.follow_up || status?.muted || status?.snooze_until || status?.remind_at
+    const reference = marked && !readingLoading() && !attentionSaving() ? before?.reference : null
+    const request = reference ? '?reference=' + encodeURIComponent(reference) : ''
+    const result = await api<{ due_reminders: number, attention: AttentionStatus | null }>('/webmail/api/attention' + request)
+    dueReminders.set(result.due_reminders)
+    if (before && reference && result.attention && selected() === before && !attentionSaving()) selected.set({ ...before, attention: result.attention })
   }
   function clearSelection(): void { checked.set([]); selectionAnchor = null }
-  async function selectFolder(name: string): Promise<void> {
+  function resetSearch(): void {
+    batch(() => {
+      query.set('')
+      activeQuery.set('')
+      appliedFilters.set(emptyFilters)
+      filterLocation.set('')
+      filterSender.set('')
+      filterRecipient.set('')
+      filterFilename.set('')
+      filterAfter.set('')
+      filterBefore.set('')
+      filterStatus.set('any')
+      filterFlagged.set(false)
+      filterAttachments.set(false)
+      page.set(1)
+    })
+  }
+  async function selectFolder(name: string, workflow: AttentionView | null = null, library = false, collection: string | null = null): Promise<void> {
     if (mutating()) return
-    batch(() => { folder.set(name); outboxView.set(false); page.set(1); query.set(''); activeQuery.set(''); searchAll.set(name === '*'); filterSender.set(''); filterAfter.set(''); filterBefore.set(''); filterUnread.set(false); filterFlagged.set(false); filterAttachments.set(false); expandedThreads.set([]) })
+    senderReview.closeSenderReview()
+    batch(() => {
+      folder.set(name)
+      attentionView.set(workflow)
+      libraryView.set(library)
+      collectionId.set(collection)
+      outboxView.set(false)
+      expandedThreads.set([])
+      resetSearch()
+    })
     clearSelection()
     closeReader()
     await refresh()
   }
-  async function search(): Promise<void> { page.set(1); activeQuery.set(query().trim()); clearSelection(); closeReader(); await loadMessages() }
+  async function showAttachmentLibrary(): Promise<void> { await selectFolder('*', null, true) }
+  async function selectCollection(item: PrivateCollection): Promise<void> {
+    closeCollectionManager()
+    await selectFolder('*', null, false, item.id)
+  }
+  async function showCollectionManager(): Promise<void> {
+    if (privateMail.collectionsOpen()) return
+    privateMail.clearCollectionEditor()
+    privateMail.collectionsError.set('')
+    privateMail.collectionsOpen.set(true)
+    ports.nextTick(() => { if (privateMail.collectionsOpen() && !ports.collectionsDialog.current?.open) ports.collectionsDialog.current?.showModal() })
+    await privateMail.loadPrivateCollections()
+  }
+  function closeCollectionManager(): void {
+    privateMail.collectionsOpen.set(false)
+    privateMail.clearCollectionEditor()
+  }
+  async function confirmCollectionDeletion(): Promise<void> {
+    const id = privateMail.deletingCollection()?.id
+    if (id && await privateMail.deletePrivateCollection() && collectionId() === id) {
+      closeCollectionManager()
+      await selectFolder('*')
+    }
+  }
+  async function savePrivateLabel(): Promise<void> {
+    const reference = selected()?.reference
+    const result = await privateMail.storePrivateLabel()
+    const current = selected()
+    if (result && current && current.reference === reference) {
+      selected.set({ ...current, personal_subject: result.label.value })
+      await refresh(true)
+    }
+  }
+  async function setPrivateMembership(item: PrivateCollection, event: Event): Promise<void> {
+    if (await privateMail.changePrivateMembership(item, event) && collectionId()) await loadMessages(true)
+  }
+
+  async function selectAttention(view: AttentionView): Promise<void> { await selectFolder('INBOX', view) }
+  async function nextFollowUp(): Promise<void> {
+    if (loading() || readingLoading() || mutating() || attentionView() !== 'follow_up') return
+    const rows = messages()
+    const current = selected()
+    const index = current ? rows.findIndex(item => item.reference === current.reference) : -1
+    let next = rows[index + 1]
+    if (!next && page() * messagePageSize < total()) {
+      page.update(value => value + 1)
+      clearSelection()
+      await loadMessages()
+      next = messages()[0]
+    }
+    if (!next) { notice.set('You’re at the end of the reply queue.'); return }
+    followUpFocused.set(true)
+    await openMessage(next)
+  }
+  async function search(): Promise<void> {
+    appliedFilters.set({
+      location: attentionView() || collectionId() ? '' : filterLocation(), sender: filterSender().trim(), recipient: filterRecipient().trim(),
+      filename: (libraryView() ? query() : filterFilename()).trim(), after: filterAfter(), before: filterBefore(),
+      status: filterStatus(), flagged: filterFlagged(), attachments: filterAttachments(),
+    })
+    page.set(1)
+    activeQuery.set(query().trim())
+    clearSelection()
+    closeReader()
+    await loadMessages()
+  }
   async function clearSearch(): Promise<void> {
-    batch(() => { query.set(''); activeQuery.set(''); filterSender.set(''); filterAfter.set(''); filterBefore.set(''); filterUnread.set(false); filterFlagged.set(false); filterAttachments.set(false); searchAll.set(folder() === '*'); page.set(1) })
+    cancelBatch()
+    resetSearch()
     clearSelection()
     await loadMessages()
   }
-  async function changeConversationView(): Promise<void> { clearSelection(); expandedThreads.set([]); page.set(1); await loadMessages() }
+  async function changeConversationView(): Promise<void> { cancelBatch(); clearSelection(); expandedThreads.set([]); page.set(1); await loadMessages() }
   async function turnPage(delta: number): Promise<void> { if (loading() || mutating()) return; page.update(value => Math.max(1, value + delta)); closeReader(); await loadMessages() }
   function toggleThread(id: string): void { expandedThreads.update(ids => ids.includes(id) ? ids.filter(value => value !== id) : [...ids, id]) }
-  function toggleSelection(message: MessageSummary, event: MouseEvent): void {
-    event.stopPropagation()
-    const wanted = !checkedKeys().includes(messageKey(message))
-    const rows = event.shiftKey ? rangeSelection(visibleMessages(), selectionAnchor, message) : [message]
-    const result = new Map(checked().map(ref => [messageKey(ref), ref]))
-    for (const row of rows) { if (wanted) result.set(messageKey(row), { uid: row.uid, folder: row.folder }); else result.delete(messageKey(row)) }
+  function toggleSelection(message: MessageSummary, event?: MouseEvent): void {
+    event?.stopPropagation()
+    const wanted = !checkedKeys().includes(messageIdentity(message))
+    const rows = event?.shiftKey ? rangeSelection(visibleMessages(), selectionAnchor, message, messageIdentity) : [message]
+    const result = new Map(checked().map(ref => [messageIdentity(ref), ref]))
+    for (const row of rows) { if (wanted) result.set(messageIdentity(row), messageRef(row)); else result.delete(messageIdentity(row)) }
     if (result.size > 100) { notice.set('Select up to 100 messages at a time.'); return }
     checked.set([...result.values()])
-    selectionAnchor = messageKey(message)
+    selectionAnchor = messageIdentity(message)
   }
   function toggleAll(): void {
-    if (allChecked()) { clearSelection(); return }
-    const result = new Map(checked().map(ref => [messageKey(ref), ref]))
-    for (const message of visibleMessages()) { if (result.size >= 100) break; result.set(messageKey(message), { uid: message.uid, folder: message.folder }) }
+    if (allChecked()) {
+      const pageKeys = new Set(visibleMessages().map(messageIdentity))
+      checked.update(items => items.filter(item => !pageKeys.has(messageIdentity(item))))
+      selectionAnchor = null
+      return
+    }
+    const result = new Map(checked().map(ref => [messageIdentity(ref), ref]))
+    for (const message of visibleMessages()) { if (result.size >= 100) break; result.set(messageIdentity(message), messageRef(message)) }
     checked.set([...result.values()])
     if (visibleMessages().length > 100) notice.set('Selected the first 100 matching messages. Process these before selecting more.')
   }
   function toggleThreadSelection(thread: Conversation, event: MouseEvent): void {
     event.stopPropagation()
     const members = thread.members.filter(message => message.matches_filters !== false)
-    const wanted = !members.every(message => checkedKeys().includes(messageKey(message)))
-    const result = new Map(checked().map(ref => [messageKey(ref), ref]))
-    for (const message of members) { if (wanted) result.set(messageKey(message), { uid: message.uid, folder: message.folder }); else result.delete(messageKey(message)) }
+    const wanted = !members.every(message => checkedKeys().includes(messageIdentity(message)))
+    const result = new Map(checked().map(ref => [messageIdentity(ref), ref]))
+    for (const message of members) { if (wanted) result.set(messageIdentity(message), messageRef(message)); else result.delete(messageIdentity(message)) }
     if (result.size > 100) { notice.set('This conversation exceeds the selection limit. Expand it and select up to 100 messages.'); return }
     checked.set([...result.values()])
-    selectionAnchor = messageKey(thread.latest)
+    selectionAnchor = messageIdentity(thread.latest)
   }
-  function threadChecked(thread: Conversation): boolean { return thread.members.filter(message => message.matches_filters !== false).every(message => checkedKeys().includes(messageKey(message))) }
-  function threadPartial(thread: Conversation): boolean { return !threadChecked(thread) && thread.members.some(message => checkedKeys().includes(messageKey(message))) }
-  async function openMessage(message: MessageRef): Promise<void> {
-    if (mutating()) return
+  function threadChecked(thread: Conversation): boolean { return thread.members.filter(message => message.matches_filters !== false).every(message => checkedKeys().includes(messageIdentity(message))) }
+  function threadPartial(thread: Conversation): boolean { return !threadChecked(thread) && thread.members.some(message => checkedKeys().includes(messageIdentity(message))) }
+  function focusReader(request: number): void {
+    ports.nextTick(() => {
+      if (request !== messageRequest || !reading()) return
+      const reader = ports.messageReader.current
+      if (!reader) return
+      reader.scrollTop = 0
+      reader.querySelector<HTMLElement>('[data-reader-focus]')?.focus({ preventScroll: true })
+    })
+  }
+  function updateOwnSelection(before: MessageRef, after: MessageRef): void {
+    const key = messageIdentity(before)
+    checked.update(items => items.map(item => messageIdentity(item) === key && item.revision === before.revision ? messageRef(after) : item))
+  }
+  async function openMessage(message: MessageRef & { personal_subject?: string }, autoRead = true, skipSeen = false, skipMissing = false, requireRevision = false): Promise<OpenResult> {
+    if (mutating()) return 'cancelled'
     const request = ++messageRequest
-    reading.set(true); readingLoading.set(true); selected.set(null); showHtml.set(true); error.set('')
+    privateMail.closePrivate()
+    const viewport = !reading() ? captureListViewport(ports.messageList.current) : null
+    readerTarget.set(message)
+    retryReading = null
+    readerError.set('')
+    readingLoading.set(true)
     try {
-      const detail = await api<MessageDetail>(messagePath(message))
-      if (destroyed || request !== messageRequest) return
-      selected.set({ ...detail, folder: message.folder })
-      if (!detail.flags.seen) {
-        await api(messagePath(message), { method: 'PUT', body: JSON.stringify({ flags: { ...detail.flags, seen: true } }) })
-        if (request === messageRequest) selected.set({ ...detail, folder: message.folder, flags: { ...detail.flags, seen: true } })
-        await refresh(true)
+      if (requireRevision && (!message.reference || !message.revision)) throw new Error('Refresh the attachment list and open the message again.')
+      const detail = await api<MessageDetail>(messagePath(message), requireRevision ? { headers: { 'If-Match': message.revision! } } : undefined)
+      detail.folder ||= message.folder
+      detail.personal_subject = message.personal_subject
+      if (destroyed || request !== messageRequest) return 'cancelled'
+      if (skipSeen && detail.flags.seen) return 'seen'
+      if (viewport) readingViewport = viewport
+      batch(() => {
+        reading.set(true)
+        selected.set(detail)
+        showHtml.set(true)
+        newsletterExpanded.set(true)
+        receiptFull.set(false)
+        remoteImagesAllowed.set(false)
+        attentionSchedule.set(null)
+        categoryRule.set(detail.placement?.rule || 'automatic')
+      })
+      focusReader(request)
+      if (autoRead && detail.folder !== 'Drafts' && !detail.flags.seen) {
+        await markOpenedMessageRead(detail, request)
+        if (request === messageRequest) void refresh(true)
+      }
+      return 'opened'
+    }
+    catch (cause) {
+      if (destroyed || request !== messageRequest) return 'cancelled'
+      if (skipMissing && cause instanceof MailApiError && cause.status === 404) return 'missing'
+      if (viewport) readingViewport = viewport
+      readerError.set(errorMessage(cause))
+      reading.set(true)
+      focusReader(request)
+      return 'failed'
+    }
+    finally { if (request === messageRequest) readingLoading.set(false) }
+  }
+  async function markOpenedMessageRead(detail: MessageDetail, request: number): Promise<void> {
+    let current = detail
+    for (let attempt = 0; attempt < 2 && !current.flags.seen && request === messageRequest; attempt++) {
+      try {
+        const result = await api<MessageRef>(messagePath(current), {
+          method: 'PUT',
+          headers: current.revision ? { 'If-Match': current.revision } : undefined,
+          body: JSON.stringify({ flags: { ...current.flags, seen: true } }),
+        })
+        const updated = { ...current, ...result, flags: { ...current.flags, seen: true } }
+        updateOwnSelection(current, updated)
+        if (request === messageRequest) selected.set(updated)
+        return
+      }
+      catch (cause) {
+        if (!(cause instanceof MailApiError) || cause.status !== 412 || attempt > 0) throw cause
+        current = await api<MessageDetail>(messagePath(current))
+        if (request === messageRequest) selected.set(current)
+      }
+    }
+  }
+  async function openListMessage(message: MessageRef): Promise<void> {
+    cancelBatch()
+    followUpFocused.set(false)
+    await openMessage(message)
+  }
+  async function retryReader(): Promise<void> {
+    if (retryReading) { await retryReading(); return }
+    const target = readerTarget()
+    if (target) await openMessage(target, !senderReview.senderReviewOpen(), false, false, libraryView())
+  }
+  async function runTriage(work: (request: number) => Promise<void>): Promise<void> {
+    if (loading() || readingLoading() || mutating() || triageBusy() || authExpired()) return
+    const request = ++triageRequest
+    triageBusy.set(true)
+    readerError.set('')
+    error.set('')
+    try { await work(request) }
+    catch (cause) {
+      if (request === triageRequest) error.set(errorMessage(cause))
+    }
+    finally {
+      if (request === triageRequest) triageBusy.set(false)
+    }
+  }
+  async function nextUnread(start = selected()): Promise<void> {
+    if (!unreadAvailable()) return
+    await runTriage(async (request) => {
+      const params = listParams()
+      params.set('queue', 'unread')
+      let previous: ReadingPosition | null = start
+      const attempted = new Set<string>()
+      for (let attempt = 0; attempt < 10; attempt++) {
+        if (previous && Number.isFinite(previous.timestamp)) {
+          params.set('cursor_time', String(previous.timestamp))
+          params.set('cursor_folder', previous.folder)
+          params.set('cursor_uid', String(previous.uid))
+        }
+        const listing = await api<MessagePage>(`/webmail/api/messages?${params}`)
+        if (destroyed || request !== triageRequest) return
+        const next = listing.items[0]
+        if (!next || attempted.has(messageIdentity(next))) {
+          notice.set('No unread messages match this view.')
+          return
+        }
+        attempted.add(messageIdentity(next))
+        previous = next
+        const result = await openMessage(next, true, true, true)
+        if (request !== triageRequest || result === 'cancelled') return
+        if (result === 'opened') {
+          const current = readingBatch()
+          readingBatch.set({ kind: 'unread', read: (current?.kind === 'unread' ? current.read : 0) + 1 })
+          return
+        }
+        if (result === 'failed') {
+          retryReading = () => nextUnread(start)
+          return
+        }
+      }
+      notice.set('Unread messages changed while loading. Try Next unread again.')
+    })
+  }
+  async function readSelection(): Promise<void> {
+    const items = new Map(checked().map(item => [messageIdentity(item), item]))
+    if (!items.size) return
+    const ordered: MessageRef[] = []
+    for (const message of visibleMessages()) {
+      const key = messageIdentity(message)
+      const item = items.get(key)
+      if (item) {
+        ordered.push(item)
+        items.delete(key)
+      }
+    }
+    ordered.push(...items.values())
+    await openSelectedBatch({ kind: 'selected', items: ordered, index: -1 }, 1)
+  }
+  async function openSelectedBatch(mode: Extract<ReadingBatch, { kind: 'selected' }>, delta: number): Promise<void> {
+    await runTriage(async (request) => {
+      for (let index = mode.index + delta; index >= 0 && index < mode.items.length; index += delta) {
+        const result = await openMessage(mode.items[index], true, false, true)
+        if (request !== triageRequest || result === 'cancelled') return
+        if (result === 'failed') {
+          retryReading = () => openSelectedBatch(mode, delta)
+          return
+        }
+        if (result === 'opened') {
+          readingBatch.set({ ...mode, index })
+          return
+        }
+      }
+      notice.set(delta > 0 ? 'You’ve reached the end of this batch.' : 'You’re at the beginning of this batch.')
+    })
+  }
+  async function advanceBatch(delta = 1): Promise<void> {
+    const mode = readingBatch()
+    if (mode?.kind === 'selected') await openSelectedBatch(mode, delta)
+    else if (delta > 0 && mode?.kind === 'unread') await nextUnread()
+  }
+  async function changeAttention(kind: AttentionView, enabled: boolean, deadline = 0): Promise<void> {
+    const item = selected()
+    if (!item?.reference || !item.revision || attentionSaving() || readingLoading()) return
+    const request = messageRequest
+    attentionSaving.set(true)
+    error.set('')
+    try {
+      const status = await api<AttentionStatus>('/webmail/api/attention', {
+        method: 'PUT',
+        headers: { 'If-Match': item.revision },
+        body: JSON.stringify({ reference: item.reference, kind, enabled, deadline }),
+      })
+      if (request === messageRequest) {
+        const current = selected()
+        if (current) selected.set({ ...current, attention: status })
+        attentionSchedule.set(null)
+      }
+      await refresh(true)
+    }
+    catch (cause) { if (request === messageRequest) error.set(errorMessage(cause)) }
+    finally { attentionSaving.set(false) }
+  }
+  function startAttentionSchedule(kind: 'snoozed' | 'reminders'): void {
+    attentionSchedule.set(kind)
+    const current = kind === 'snoozed' ? selected()?.attention?.snooze_until : selected()?.attention?.remind_at
+    const suggested = new Date(Date.now() + (kind === 'snoozed' ? 1 : 48) * 3_600_000)
+    attentionDate.set(localDateInput(current && current * 1000 > Date.now() ? new Date(current * 1000) : suggested))
+  }
+  async function saveAttentionSchedule(): Promise<void> {
+    const kind = attentionSchedule()
+    if (!kind) return
+    try { await changeAttention(kind, true, localDeadline(attentionDate())) }
+    catch (cause) { error.set(errorMessage(cause)) }
+  }
+  async function saveCategoryRule(): Promise<void> {
+    const item = selected()
+    if (!item?.reference || !item.revision || !item.placement?.verified_author || readingLoading() || categoryRuleSaving()) return
+    const request = messageRequest
+    categoryRuleSaving.set(true)
+    error.set('')
+    try {
+      const result = await api<{ destination: CategoryRule }>('/webmail/api/category-rule', {
+        method: 'PUT',
+        headers: { 'If-Match': item.revision },
+        body: JSON.stringify({ reference: item.reference, destination: categoryRule() }),
+      })
+      if (request === messageRequest) {
+        const latest = selected()
+        if (latest?.placement) selected.set({ ...latest, placement: { ...latest.placement, rule: result.destination } })
+        notice.set(result.destination === 'automatic' ? 'Sender rule cleared for future mail.' : 'Sender rule saved for future mail.')
       }
     }
     catch (cause) { if (request === messageRequest) error.set(errorMessage(cause)) }
-    finally { if (request === messageRequest) readingLoading.set(false) }
+    finally { categoryRuleSaving.set(false) }
+  }
+  async function loadSortingSettings(): Promise<void> {
+    sortingError.set('')
+    sortingSettings.set(null)
+    try { sortingSettings.set(await api<CategorySettings>(categorySettingsPath)) }
+    catch (cause) { sortingError.set(errorMessage(cause)) }
+  }
+  async function toggleAutomaticSorting(): Promise<void> {
+    const current = sortingSettings()
+    if (!current || sortingSaving()) return
+    sortingSaving.set(true)
+    sortingError.set('')
+    try {
+      sortingSettings.set(await api<CategorySettings>(categorySettingsPath, {
+        method: 'PUT',
+        body: JSON.stringify({ automatic: !current.automatic }),
+      }))
+    }
+    catch (cause) { sortingError.set(errorMessage(cause)) }
+    finally { sortingSaving.set(false) }
+  }
+  async function showSenderReview(view: ReviewView = 'pending', page = 1): Promise<void> {
+    if (mutating() || senderReview.senderReviewSaving()) return
+    closeReader()
+    invalidateList()
+    clearSelection()
+    outboxView.set(false)
+    attentionView.set(null)
+    libraryView.set(false)
+    collectionId.set(null)
+    senderReview.senderReviewOpen.set(true)
+    await senderReview.loadSenderReview(view, page)
+  }
+
+  async function openAttachmentMessage(file: LibraryAttachment): Promise<void> {
+    await openMessage(file.message, true, false, false, true)
+  }
+
+  async function openReviewMessage(item: ReviewItem): Promise<void> {
+    senderReview.senderReviewSelection.set(item)
+    await openMessage(item, false)
+  }
+
+  async function reviewMessage(action: ReviewAction, reply = false): Promise<void> {
+    const item = senderReview.senderReviewSelection()
+    if (!item || item.applying || readingLoading() || senderReview.senderReviewSaving()) return
+    if (!await senderReview.decideSenderReview(action, item)) return
+    const applying = senderReview.senderReviewGroups().some(group => group.messages.some(message => message.reference === item.reference && message.applying))
+    closeReader()
+    await loadFolders().catch(cause => error.set(errorMessage(cause)))
+    if (reply) {
+      await openMessage(item, false)
+      if (selected()?.reference === item.reference) await compose('reply')
+      closeReader()
+    }
+    const sender = item.verified && action !== 'recover'
+    notice.set(applying ? 'Decision saved. Moving mail…' : action === 'decline' ? (sender ? 'Sender declined.' : 'Message declined.') : action === 'recover' ? 'Message recovered.' : sender ? 'Sender allowed.' : 'Message allowed.')
   }
   function showConfirmation(action: string, refs: MessageRef[] = []): void {
     confirmationRefs = refs
@@ -247,52 +902,178 @@ export function useWebmail(ports: WebmailPorts) {
   }
   function actionNotice(action: BulkAction, count: number, destination: string): string {
     const label = count === 1 ? 'Message' : `${count} messages`
+    if (action === 'junk') return `${label} moved to ${folderName(limits().junkFolder || 'Junk')}.`
+    if (action === 'not_junk') return count === 1 ? 'Message recovered.' : `${label} recovered.`
     return action === 'move' ? `${label} moved to ${folderName(destination)}.` : action === 'trash' ? `${label} moved to Trash.` : action === 'read' ? `${label} marked read.` : action === 'unread' ? `${label} marked unread.` : action === 'flag' ? `${label} flagged.` : action === 'unflag' ? `${label} unflagged.` : `${label} permanently deleted.`
   }
-  async function performBulk(action: BulkAction, refs: MessageRef[], destination = moveTo(), confirmed = false): Promise<void> {
-    if (mutating() || !refs.length) return
-    if (action === 'purge' && !confirmed) { showConfirmation('purge', refs); return }
+  async function performBulk(action: BulkAction, refs: MessageRef[], destination = moveTo(), confirmed = false, keepReader = false): Promise<boolean> {
+    if (mutating() || readingLoading() || !refs.length) return false
+    if (refs.some(ref => ref.reference === null || ref.revision === null)) {
+      await refresh(true)
+      error.set('A message changed while the list was loading. Review the messages and select them again.')
+      return false
+    }
+    if (action === 'purge' && !confirmed) { showConfirmation('purge', refs); return false }
     mutating.set(true); error.set('')
     try {
       const result = await api<BulkResult>('/webmail/api/bulk', { method: 'POST', body: JSON.stringify({ action, messages: refs, folder: destination }) })
       const succeeded = result.results.filter(item => item.ok)
       const failed = result.results.filter(item => !item.ok)
-      checked.set(failed.map(item => ({ uid: item.uid, folder: item.folder })))
-      undoAction.set(result.undoId && result.expiresAt ? { id: result.undoId, expiresAt: result.expiresAt } : null)
-      notice.set(actionNotice(action, succeeded.length, destination) + (failed.length ? ` ${failed.length} could not be changed; they remain selected.` : ''))
+      const completed = new Set(refs.filter(ref => succeeded.some(item => messageKey(item) === messageKey(ref))).map(messageIdentity))
+      checked.update(items => items.filter(item => !completed.has(messageIdentity(item))))
+      if (result.undoId && result.expiresAt) undoAction.set({ id: result.undoId, expiresAt: result.expiresAt })
+      if (succeeded.length) notice.set(actionNotice(action, succeeded.length, destination))
+      if (failed.length) error.set(`${failed.length} ${failed.length === 1 ? 'message could' : 'messages could'} not be changed.`)
       const current = selected()
-      if (current && succeeded.some(item => messageKey(item) === messageKey(current))) {
-        if (['move', 'trash', 'purge'].includes(action)) closeReader()
-        else selected.set({ ...current, flags: { ...current.flags, ...(action === 'read' || action === 'unread' ? { seen: action === 'read' } : { flagged: action === 'flag' }) } })
+      if (current && completed.has(messageIdentity(current))) {
+        if (['move', 'trash', 'purge', 'junk', 'not_junk'].includes(action)) {
+          if (keepReader) selected.set(null)
+          else closeReader(true)
+        }
+        else {
+          const updated = await api<MessageDetail>(messagePath(current))
+          if (selected() === current) selected.set({ ...updated, folder: updated.folder || current.folder })
+        }
       }
       await refresh(true)
+      return result.ok && succeeded.length > 0
+    }
+    catch (cause) {
+      if (cause instanceof MailApiError && cause.status === 412) {
+        await refresh(true)
+        error.set('A message changed after you selected it. Review the current messages and reselect before trying again.')
+      }
+      else error.set(errorMessage(cause))
+      return false
+    }
+    finally { mutating.set(false) }
+  }
+  async function bulkAction(action: BulkAction, destination?: string): Promise<void> { await performBulk(action, checked(), destination) }
+  async function selectedAction(action: BulkAction): Promise<void> { const item = selected(); if (item) await performBulk(action, [messageRef(item)]) }
+  async function triageAndNext(action: 'archive' | 'trash'): Promise<void> {
+    const current = selected()
+    const mode = readingBatch()
+    if (!current || !mode || triageBusy()) return
+    const request = triageRequest
+    const moved = await performBulk(action === 'archive' ? 'move' : 'trash', [messageRef(current)], 'Archive', false, true)
+    if (!moved || request !== triageRequest) return
+    if (mode.kind === 'unread') await nextUnread(current)
+    else await openSelectedBatch(mode, 1)
+    if (!selected() && !readerError()) closeReader(true)
+  }
+  async function groupSelected(): Promise<void> {
+    const rows = checked()
+    if (rows.length < 2 || mutating() || readingLoading()) return
+    if (rows.some(item => !item.reference || !item.revision || item.folder === 'Drafts')) {
+      error.set('Choose at least two saved messages to group.')
+      return
+    }
+    mutating.set(true)
+    error.set('')
+    try {
+      const messages = rows.map(item => ({ reference: item.reference, revision: item.revision }))
+      const result = await api<{ undoId: string, expiresAt: number }>('/webmail/api/private/group', { method: 'POST', body: JSON.stringify({ messages }) })
+      undoAction.set({ id: result.undoId, expiresAt: result.expiresAt, kind: 'group' })
+      notice.set('Messages grouped.')
+      conversations.set(true)
+      expandedThreads.set([])
+      clearSelection()
+      closeReader()
+      await loadMessages()
     }
     catch (cause) { error.set(errorMessage(cause)) }
     finally { mutating.set(false) }
   }
-  async function bulkAction(action: BulkAction, destination?: string): Promise<void> { await performBulk(action, checked(), destination) }
-  async function selectedAction(action: BulkAction): Promise<void> { const item = selected(); if (item) await performBulk(action, [{ uid: item.uid, folder: item.folder }]) }
   async function undoLastAction(): Promise<void> {
     const receipt = undoAction()
-    if (!receipt || undoRemaining() <= 0 || mutating()) return
+    if (!receipt || undoRemaining() <= 0 || mutating() || readingLoading() || triageBusy()) return
     mutating.set(true)
     try {
+      if (receipt.kind === 'group') {
+        await api('/webmail/api/private/undo-group', { method: 'POST', body: JSON.stringify({ id: receipt.id }) })
+        undoAction.set(null)
+        notice.set('Grouping undone.')
+        expandedThreads.set([])
+        closeReader()
+        await loadMessages()
+        return
+      }
       const result = await api<BulkResult>(`/webmail/api/undo/${receipt.id}`, { method: 'POST', body: '{}' })
       undoAction.set(null)
       notice.set(result.ok ? 'Action undone.' : 'Some messages changed since that action and could not be restored.')
-      clearSelection(); closeReader(); await refresh(true)
+      const current = selected()
+      if (current && result.results.some(item => item.ok && (messageKey(item) === messageKey(current) || (item.new_uid === current.uid && item.new_folder === current.folder)))) {
+        const updated = await api<MessageDetail>(messagePath(current))
+        if (selected() === current) {
+          selected.set(updated)
+          updateOwnSelection(current, updated)
+        }
+      }
+      await refresh(true)
     }
     catch (cause) { error.set(errorMessage(cause)); undoAction.set(null) }
     finally { mutating.set(false) }
+  }
+  function showShortcuts(): void {
+    if (shortcutsOpen() || composing() || settings() || confirmation()) return
+    shortcutsTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    shortcutsOpen.set(true)
+    ports.nextTick(() => { if (shortcutsOpen() && !ports.shortcutsDialog.current?.open) ports.shortcutsDialog.current?.showModal() })
+  }
+  function closeShortcuts(): void {
+    shortcutsOpen.set(false)
+    const trigger = shortcutsTrigger
+    shortcutsTrigger = null
+    ports.nextTick(() => { if (trigger?.isConnected) trigger.focus({ preventScroll: true }) })
+  }
+  function handleShortcut(event: KeyboardEvent): void {
+    if (!isShortcutEvent(event) || !user() || authExpired() || composing() || settings() || confirmation() || shortcutsOpen() || privateMail.collectionsOpen() || contactBook.contactsOpen()) return
+    if (event.key === '?') {
+      event.preventDefault()
+      showShortcuts()
+      return
+    }
+    if (outboxView() || senderReview.senderReviewOpen()) return
+    if (event.key === 'Escape' && reading() && !mutating()) {
+      event.preventDefault()
+      closeReader(true)
+      return
+    }
+    if (!event.shiftKey || mutating() || triageBusy() || readingLoading() || loading()) return
+    const current = selected()
+    const key = event.key.toLowerCase()
+    if (key === 'n' && unreadAvailable()) {
+      event.preventDefault()
+      void nextUnread()
+    }
+    else if (key === 'j' && readingBatch()) {
+      event.preventDefault()
+      void advanceBatch()
+    }
+    else if (key === 'x' && current) {
+      event.preventDefault()
+      toggleSelection(current)
+    }
+    else if (key === 'e' && (checked().length || current)) {
+      event.preventDefault()
+      const selection = checked()
+      if (selection.length) void bulkAction('move', 'Archive')
+      else if (readingBatch()) void triageAndNext('archive')
+      else if (current) void performBulk('move', [messageRef(current)], 'Archive')
+    }
+    else if (key === 'u' && undoAction()) {
+      event.preventDefault()
+      void undoLastAction()
+    }
   }
 
   function resetComposition(): void {
     batch(() => {
       composing.set(false)
-      subject.set(''); body.set(''); draftHtml.set(''); initialText.set(''); inReplyTo.set(''); references.set(''); replyContext.set(null); composeError.set(''); showCc.set(false); showBcc.set(false)
+      subject.set(''); body.set(''); draftHtml.set(''); initialText.set(''); inReplyTo.set(''); references.set(''); replyContext.set(null); clearFollowUp.set(false); composeError.set(''); showCc.set(false); showBcc.set(false)
       recipientEditor.restore({ to: [], cc: [], bcc: [] }, { to: '', cc: '', bcc: '' })
       attachmentEditor.restore([])
-      draft.restore(null, content())
+      if (!destroyed) draft.restore(null, content())
       lastQueuedPayload = null
       sendUncertain.set(false)
     })
@@ -320,7 +1101,12 @@ export function useWebmail(ports: WebmailPorts) {
       subject.set(`${mode === 'forward' ? 'Fwd: ' : /^re:/i.test(original.subject) ? '' : 'Re: '}${original.subject}`)
       title.set(mode === 'forward' ? 'Forward' : mode === 'all' ? 'Reply all' : 'Reply')
       body.set(`\n\nOn ${original.date}, ${original.from} wrote:\n${(original.text || '').split('\n').map(line => `> ${line}`).join('\n')}`)
-      if (mode !== 'forward') { inReplyTo.set(original.message_id); references.set(`${original.references || ''} ${original.message_id}`.trim()); replyContext.set({ uid: original.uid, folder: original.folder }) }
+      if (mode !== 'forward') {
+        inReplyTo.set(original.message_id)
+        references.set(`${original.references || ''} ${original.message_id}`.trim())
+        replyContext.set(messageRef(original))
+        clearFollowUp.set(followUpFocused() && !!original.attention?.follow_up)
+      }
       showCc.set(mode === 'all' && cc.length > 0)
       if (mode === 'forward') void importAttachments(original)
     }
@@ -345,6 +1131,7 @@ export function useWebmail(ports: WebmailPorts) {
     batch(() => {
       recipientEditor.restore({ to: payload.to, cc: payload.cc, bcc: payload.bcc }, payload.recipientInputs || { to: '', cc: '', bcc: '' }, payload.recipientLabels)
       subject.set(payload.subject); body.set(payload.text); initialText.set(payload.text); draftHtml.set(payload.html); inReplyTo.set(payload.inReplyTo); references.set(payload.references); replyContext.set(payload.replyContext)
+      clearFollowUp.set(!!payload.clearFollowUp)
       showCc.set(Boolean(payload.cc.length || payload.recipientInputs?.cc)); showBcc.set(Boolean(payload.bcc.length || payload.recipientInputs?.bcc))
       attachmentEditor.restore(payload.attachments.filter(item => item.uploadId).map((item, index) => ({ key: crypto.randomUUID(), uploadId: item.uploadId, filename: item.filename, contentType: item.contentType, size: metadata?.attachments[index]?.size ?? item.size ?? 0, progress: 100, status: 'ready' as const })))
       draft.restore(document, content())
@@ -488,7 +1275,17 @@ export function useWebmail(ports: WebmailPorts) {
     catch (cause) { if (outboxView()) error.set(errorMessage(cause)) }
     finally { pollingOutbox = false }
   }
-  async function showOutbox(): Promise<void> { outboxView.set(true); closeReader(); clearSelection(); await refreshOutbox() }
+  async function showOutbox(): Promise<void> {
+    senderReview.closeSenderReview()
+    attentionView.set(null)
+    libraryView.set(false)
+    collectionId.set(null)
+    outboxView.set(true)
+    closeReader()
+    invalidateList()
+    clearSelection()
+    await refreshOutbox()
+  }
   async function cancelSend(id = pendingSend()?.id): Promise<void> {
     if (!id || cancelling()) return
     cancelling.set(true)
@@ -544,12 +1341,46 @@ export function useWebmail(ports: WebmailPorts) {
     }
     catch (cause) { error.set(errorMessage(cause)) }
   }
-  async function signOut(): Promise<void> {
-    if (sending()) return
-    try { if (hasComposition()) await draft.flushAll(); await api('/webmail/auth/logout', { method: 'POST', body: '{}' }); resetComposition(); ports.navigate('/login', { reload: true }) }
-    catch (cause) { error.set(errorMessage(cause)) }
+  async function leaveAccount(): Promise<void> {
+    if (sending() || mutating() || leavingAccount()) return
+    leavingAccount.set(true)
+    accountChangeError.set('')
+    try {
+      if (hasComposition()) await draft.flushAll()
+      await api('/webmail/auth/logout', { method: 'POST', body: '{}' })
+      clearAccountState()
+      ports.navigate('/login', { reload: true })
+    }
+    catch (cause) {
+      const message = errorMessage(cause)
+      if (settings()) accountChangeError.set(message)
+      else error.set(message)
+    }
+    finally { leavingAccount.set(false) }
   }
-  function showSettings(): void { settings.set(true); passwordError.set(''); void recoverySettings.loadRecovery(); ports.nextTick(() => { if (!ports.password.current?.open) ports.password.current?.showModal() }) }
+  async function changeNotificationRule(scope: MailNotificationScope, event: Event): Promise<void> {
+    const item = selected()
+    const select = event.target instanceof HTMLSelectElement ? event.target : null
+    const value = select?.value
+    if (!item?.notifications || !select || readingLoading() || (value !== 'default' && value !== 'notify' && value !== 'quiet')) return
+    const result = await notifications.saveNotificationRule(item, scope, value)
+    const current = selected()
+    if (current && current.reference === item.reference) {
+      if (result) selected.set({ ...current, notifications: result })
+      else select.value = item.notifications[scope]
+    }
+  }
+  function showSettings(): void {
+    settings.set(true)
+    passwordError.set('')
+    accountChangeError.set('')
+    void recoverySettings.loadRecovery()
+    void forwardingSettings.loadForwarding()
+    void vacationSettings.loadVacationSettings()
+    void loadSortingSettings()
+    void notifications.loadNotificationSettings().catch(() => {})
+    ports.nextTick(() => { if (!ports.password.current?.open) ports.password.current?.showModal() })
+  }
   async function changePassword(): Promise<void> {
     if (savingPassword()) return
     passwordError.set('')
@@ -588,6 +1419,8 @@ export function useWebmail(ports: WebmailPorts) {
       const config = await api<MailLimits>('/webmail/api/config')
       limits.set(config); sendDelay.set(config.undoSendSeconds)
       await Promise.all([refresh(), refreshOutbox()])
+      void notifications.loadNotificationSettings().catch(() => {})
+      void privateMail.loadPrivateCollections()
     }
     catch (cause) { error.set(errorMessage(cause)) }
   }
@@ -602,11 +1435,15 @@ export function useWebmail(ports: WebmailPorts) {
     if (!user() || authExpired()) return
     const pending = outbox().some(item => item.state === 'pending' || item.state === 'sending') || pendingSend()?.state === 'pending' || pendingSend()?.state === 'sending'
     if ((pending || outboxView()) && Date.now() - lastOutboxPoll >= 1000) void refreshOutbox()
-    if (Date.now() - lastRefresh >= 30000 && !loading() && !mutating() && !composing() && !settings() && !confirmation()) { void refresh(true); void refreshOutbox() }
+    if (Date.now() - lastRefresh >= 30000 && !loading() && !refreshing() && !mutating() && !settings() && !confirmation()) {
+      void refresh(true)
+      void refreshOutbox()
+    }
   }
   function preventUnload(event: BeforeUnloadEvent): void { if (hasUnsavedChanges()) { event.preventDefault(); event.returnValue = '' } }
-  function destroy(): void { destroyed = true; ++listRequest; ++messageRequest; recipientEditor.destroy(); attachmentEditor.destroy(); draft.destroy(); selectionEffect() }
-  return { user, folders, folder, messages, threads, expandedThreads, selected, loading, reading, readingLoading, mutating, error, notice, query, activeQuery, searchAll, filterSender, filterAfter, filterBefore, filterUnread, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, checked, checkedKeys, selectedCount, allChecked, someChecked, undoAction, undoRemaining, pendingSend, sendRemaining, outbox, outboxCount, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...recipientEditor, ...attachmentEditor, ...recoverySettings, refresh, loadMessages, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread, toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openMessage, closeReader, bulkAction, selectedAction, undoLastAction, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments, saveSendPreference, send, confirmPendingSend, showOutbox, refreshOutbox, cancelSend, retryOutbox, signOut, showSettings, changePassword, showConfirmation, confirmAction, saveDraftCopy: draft.saveCopy, mount, resume, tick, preventUnload, destroy, messageKey, folderName, shortDate, fullDate, readableBytes, safeHtml, attachmentPath }
+  function destroy(): void { destroyed = true; ++listRequest; ++messageRequest; recipientEditor.destroy(); attachmentEditor.destroy(); draft.destroy(); privateMail.closePrivate(); contactBook.closeContacts(); selectionEffect() }
+  return { user, folders, folder, messages, threads, expandedThreads, selected, loading, refreshing, listError, readerError, readerTarget, reading, readingLoading, mutating, error, notice, query, activeQuery, appliedSearchAll, filterLocation, filterSender, filterRecipient, filterFilename, libraryView, libraryFiles, indexProgress, filterAfter, filterBefore, filterStatus, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, formattedReader, remoteImagesAllowed, checked, checkedKeys, selectedCount, isJunkFolder, readerJunkAction, selectionJunkAction, allChecked, someChecked, undoAction, undoRemaining, readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts, pendingSend, sendRemaining, outbox, outboxCount, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...senderReview, ...notifications, ...privateMail, ...contactBook, showContacts, composeSavedCard, collectionView, collectionId, canOpenPrivate,
+    showCollectionManager, closeCollectionManager, selectCollection, confirmCollectionDeletion, savePrivateLabel, setPrivateMembership, groupSelected, displaySubject, changeNotificationRule, ...recipientEditor, ...attachmentEditor, ...recoverySettings, ...forwardingSettings, ...vacationSettings, attentionViews, attentionView, followUpFocused, attentionSaving, attentionSchedule, attentionDate, attentionZone, dueReminders, replyContext, clearFollowUp, selectAttention, nextFollowUp, changeAttention, startAttentionSchedule, saveAttentionSchedule, deadlineLabel, categoryList, newsletterExpanded, readerExpanded, receiptFull, receiptCompact, receiptPreview, senderLabel, sortingSettings, sortingSaving, sortingError, toggleAutomaticSorting, placementText, categoryRule, categoryRuleSaving, saveCategoryRule, showSenderReview, openReviewMessage, reviewMessage, refresh, loadMessages, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread, toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, openAttachmentMessage, showAttachmentLibrary, retryReader, closeReader, nextUnread, readSelection, advanceBatch, triageAndNext, bulkAction, selectedAction, undoLastAction, showShortcuts, closeShortcuts, handleShortcut, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments, saveSendPreference, send, confirmPendingSend, showOutbox, refreshOutbox, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword, showConfirmation, confirmAction, saveDraftCopy: draft.saveCopy, mount, resume, tick, preventUnload, destroy, messageIdentity, messagePageSize, folderName, shortDate, fullDate, readableBytes, attachmentPath }
 }
 
 function errorMessage(cause: unknown): string { return cause instanceof Error ? cause.message : 'Something went wrong. Please try again.' }

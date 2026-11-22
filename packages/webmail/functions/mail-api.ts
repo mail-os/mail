@@ -4,16 +4,30 @@ export class MailApiError extends Error {
   constructor(message: string, readonly status: number, readonly code: string) { super(message) }
 }
 
-export function createMailApi(account: () => string | undefined, onAuthError: (error: MailApiError) => void) {
+export function createMailApi(account: () => string | undefined, onAuthError: (error: MailApiError) => void, isCurrent = () => true) {
+  let pinnedAccount: string | undefined
+  let accountChanged = false
+  const changed = () => new MailApiError('The signed-in account changed. Reload this tab before continuing.', 409, 'account_changed')
+
   return async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+    if (accountChanged || !isCurrent()) throw changed()
     const headers = new Headers(options.headers)
     const username = account()
-    if (username) headers.set('X-Webmail-Account', encodeURIComponent(username))
+    if (username && pinnedAccount && username !== pinnedAccount) {
+      accountChanged = true
+      const error = changed()
+      onAuthError(error)
+      throw error
+    }
+    pinnedAccount ||= username
+    if (pinnedAccount) headers.set('X-Webmail-Account', encodeURIComponent(pinnedAccount))
     if (options.body && typeof options.body === 'string') headers.set('Content-Type', 'application/json')
     const response = await fetch(path, { ...options, headers, credentials: 'same-origin', cache: 'no-store' })
     const result = await response.json().catch(() => ({}))
+    if (accountChanged || !isCurrent()) throw changed()
     if (!response.ok) {
       const error = new MailApiError(result.message || 'The request failed. Please try again.', response.status, result.code || result.error || 'request_failed')
+      if (error.code === 'account_changed') accountChanged = true
       if (error.status === 401 || error.code === 'account_changed') onAuthError(error)
       throw error
     }

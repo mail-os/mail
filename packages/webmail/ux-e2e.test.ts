@@ -1,4 +1,5 @@
 /** Run with the same disposable-account variables as e2e.test.ts. */
+import type { MessageDetail, MessagePage, MessageSummary } from './functions/mail-types'
 import { expect, test } from 'bun:test'
 
 const base = process.env.MAIL_WEBMAIL_E2E_URL
@@ -144,6 +145,49 @@ test.skipIf(!enabled)('Undo Send holds dispatch, while delivery remains independ
     const list = await api.json(`/webmail/api/messages?folder=${folder}&q=${encodeURIComponent(payload.subject)}`)
     expect(list.total).toBe(1)
     await api.json(`/webmail/api/messages/${list.items[0].uid}?folder=${folder}`, 'DELETE')
+  }
+  await api.json('/webmail/auth/logout', 'POST', {})
+}, 30_000)
+
+test.skipIf(!enabled)('next unread follows stable positions across pages and wraps without marking mail', async () => {
+  const api = await client()
+  const subject = 'UX triage ' + crypto.randomUUID()
+  for (const title of ['A', 'B', 'C', 'D']) {
+    await api.json('/webmail/api/compose', 'POST', { to: [username], subject: subject + ' ' + title, text: 'Triage test' })
+  }
+  const path = '/webmail/api/messages?' + new URLSearchParams({ folder: 'INBOX', q: subject }).toString()
+  const original: MessagePage = await api.json(path)
+  const [first, skipped, third, last] = original.items
+  expect(original.items).toHaveLength(4)
+  const queue = (row?: MessageSummary) => {
+    const cursor = row ? new URLSearchParams({ cursor_time: String(row.timestamp), cursor_folder: row.folder, cursor_uid: String(row.uid) }) : null
+    return path + '&queue=unread&conversations=true&per_page=1&page=3' + (cursor ? '&' + cursor.toString() : '')
+  }
+  const before: MessagePage = await api.json(queue())
+  expect(before.items.map(row => row.reference)).toEqual([first.reference])
+  expect(before.total).toBe(4)
+  expect(before.threads).toEqual([])
+  expect((await api.request(queue() + '&cursor_uid=0')).status).toBe(400)
+  const detail: MessageDetail = await api.json('/webmail/api/messages/ref/' + first.reference)
+  expect(detail.flags.seen).toBe(false)
+  expect(detail.timestamp).toBe(first.timestamp)
+
+  const { uid, folder, reference, revision } = skipped
+  const mark = await api.json('/webmail/api/bulk', 'POST', { action: 'read', messages: [{ uid, folder, reference, revision }] })
+  const next: MessagePage = await api.json(queue(first))
+  expect(next.items.map(row => row.reference)).toEqual([third.reference])
+  expect(next.total).toBe(3)
+  const wrapped: MessagePage = await api.json(queue(last))
+  expect(wrapped.items.map(row => row.reference)).toEqual([first.reference])
+
+  const stillUnread: MessagePage = await api.json(path + '&unread=true')
+  expect(stillUnread.items.map(row => row.reference)).toEqual([first, third, last].map(row => row.reference))
+  await api.json('/webmail/api/undo/' + mark.undoId, 'POST', {})
+  const restored: MessagePage = await api.json(queue(first))
+  expect(restored.items[0].reference).toBe(skipped.reference)
+  for (const folder of ['INBOX', 'Sent']) {
+    const listing: MessagePage = await api.json('/webmail/api/messages?' + new URLSearchParams({ folder, q: subject }).toString())
+    for (const message of listing.items) await api.json('/webmail/api/messages/' + message.uid + '?folder=' + folder, 'DELETE')
   }
   await api.json('/webmail/auth/logout', 'POST', {})
 }, 30_000)

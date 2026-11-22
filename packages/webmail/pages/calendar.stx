@@ -9,54 +9,261 @@
 <body>
 <script client>
 import { useMailCalendar } from '../functions/use-mail-calendar'
+import { reminderDayLink } from '../functions/use-calendar-reminders'
 const {
-  account, calendars, activeCalendar, ordinaryEvents, recurringSeries, rangeLabel, loading, error,
-  refresh, selectCalendar, shiftWeek, goToToday, calendarEventDate, destroy,
-} = useMailCalendar(() => navigate('/login', { reload: true }))
-onMount(refresh)
-onUnmounted(destroy)
+  account, calendars, activeCalendar, activeCalendarName, calendarExport, calendarColor, eventColor, nameFor,
+  view, calendarViews, calendarDays, monthWeekdays, recurringSeries, rangeLabel, loading, error,
+  searchInput, searchTerm, events, search, clearSearch, focusDay, displayZone, calendarTimeZones,
+  refresh, selectCalendar, showView, shiftView, goToToday, showDay, changeDate, changeZone, calendarEventDate,
+  calendarSettings, calendarSettingsError, calendarSettingsBusy, calendarNameInput, createCalendar, setCalendarColor,
+  openEvent, openNewEvent, editorOpen, editorBusy, editorLoaded, editorError, editorConflict, editingId, editorLabel,
+  editorRecurring, editorOccurrence, editorHasOccurrence, editorReadOnly, editorCalendar, editorTitle, editorLocation, editorDescription,
+  editorAllDay, editorStart, editorEnd, editorZone, editorScheduleEditable, editorTimeZones,
+  editorReminder, editorReminderEditable, otherReminders, reminderOptions,
+  repeatFrequency, repeatEvery, repeatEnd, repeatCount, repeatUntil, repeatOptions, changeRepeatEnd,
+  confirmDelete, toggleAllDay, setEventBoundary,
+  closeEditor, reloadEvent, saveEvent, deleteEvent, showEventScope,
+  importOpen, importDestination, newCalendarName, importBusy, importError, importRows, importFinished,
+  readyCount, canPreview, resultSummary, toggleImport, selectImportFile, selectImportDestination,
+  setNewCalendarName, submitImport, importEventDate, importStatusLabels, destroy,
+  visibleReminders, reminderError, dismissingReminder, tickReminders, pollReminders, dismissReminder, destroyReminders,
+} = useMailCalendar(() => navigate('/login', { reload: true }), { ref: useRef('eventDialog'), nextTick })
+async function bootCalendar() { await refresh(); void pollReminders() }
+useInterval(tickReminders, 1000, { whileVisible: true })
+useInterval(pollReminders, 30000, { whileVisible: true })
+useEventListener('focus', pollReminders)
+useEventListener('online', pollReminders)
+onMount(bootCalendar)
+onUnmounted(() => { destroy(); destroyReminders() })
 </script>
 <main class="calendar-page">
-  <nav class="health-nav" aria-label="Mail navigation"><a href="/">Back to inbox</a><span :if="account" :text="account"></span></nav>
-  <header class="health-header">
-    <div><h1 class="font-semibold text-indigo-600">Calendar</h1><p>View events from your CalDAV calendars.</p></div>
-    <button class="wm-action" @click="refresh()" :disabled="loading">Refresh</button>
-  </header>
-  <div :if="error" class="login-error" role="alert" :text="error"></div>
-  <p :if="loading" role="status">Loading calendar…</p>
-  <p :if="!loading && !error && !calendars.length">Create a calendar in your CalDAV client to see it here.</p>
-  <section :if="account && calendars.length" aria-label="Weekly agenda">
-    <div class="calendar-controls">
-      <div class="calendar-choices" role="group" aria-label="Calendars">
-        <button :for="item in calendars" class="wm-action" @click="selectCalendar(item.id)" :aria-pressed="item.id === activeCalendar" :text="item.name"></button>
-      </div>
-      <div class="calendar-choices" role="group" aria-label="Change date range">
-        <button class="wm-action" @click="shiftWeek(-1)">Previous week</button>
-        <button class="wm-action" @click="goToToday()">Today</button>
-        <button class="wm-action" @click="shiftWeek(1)">Next week</button>
-      </div>
+  <nav class="calendar-nav" aria-label="Mail navigation"><a href="/"><span class="mail-icon" data-icon="back" aria-hidden="true"></span>Back to inbox</a><span :if="account" :text="account"></span></nav>
+  <header class="calendar-header">
+    <div class="calendar-heading"><span class="mail-app-mark"><span class="mail-icon" data-icon="calendar" aria-hidden="true"></span></span><h1>Calendar</h1></div>
+    <div :if="account" class="calendar-choices">
+      <button class="wm-action" @click="calendarSettings.set(!calendarSettings())" :aria-expanded="calendarSettings" aria-controls="calendar-settings"><span class="mail-icon" data-icon="settings" aria-hidden="true"></span>Manage calendars</button>
+      <button class="wm-action" @click="toggleImport()" :disabled="importBusy" :aria-expanded="importOpen" aria-controls="calendar-import"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Import .ics</button>
+      <a :if="calendarExport" class="wm-action" :href="calendarExport"><span class="mail-icon" data-icon="download" aria-hidden="true"></span>Download .ics</a>
+      <button :if="calendars.length" class="wm-action calendar-primary" @click="openNewEvent()"><span class="mail-icon" data-icon="plus" aria-hidden="true"></span>New event</button>
     </div>
-    <h2 class="calendar-range" :text="rangeLabel" aria-live="polite"></h2>
-    <p :if="!loading && !error && !ordinaryEvents.length">No one-time events this week.</p>
-    <ul class="calendar-events">
-      <li :for="event in ordinaryEvents">
-        <strong :text="event.summary || 'Untitled event'"></strong>
-        <span :text="calendarEventDate(event)"></span>
-        <span :if="event.location" :text="event.location"></span>
-        <span :if="event.status !== 'confirmed'" :text="event.status"></span>
+  </header>
+  <div :if="error" class="login-error" role="alert"><span :text="error"></span> <button class="wm-action" @click="refresh()">Retry</button></div>
+  <p :if="loading" class="calendar-loading" role="status">Loading calendar…</p>
+  <p :if="!loading && !error && !calendars.length && !importOpen && !calendarSettings">Create a calendar or import an .ics file to get started.</p>
+  <section :if="calendarSettings" id="calendar-settings" class="calendar-import" aria-label="Manage calendars" :aria-busy="calendarSettingsBusy">
+    <form class="calendar-import-form" @submit.prevent="createCalendar()">
+      <label>Calendar name<input x-model="calendarNameInput" :disabled="calendarSettingsBusy" maxlength="100" required></label>
+      <button type="submit" class="wm-action" :disabled="calendarSettingsBusy">Create calendar</button>
+    </form>
+    <div :if="calendarSettingsError" class="login-error" role="alert" :text="calendarSettingsError"></div>
+    <div :if="calendars.length" class="calendar-colors">
+      <label :for="item in calendars"><input type="color" :value="calendarColor(item.color)" :aria-label="'Color for ' + item.name" :disabled="calendarSettingsBusy" @change="setCalendarColor(item, $event)"><span :text="item.name"></span></label>
+    </div>
+  </section>
+  <section :if="importOpen" id="calendar-import" class="calendar-import" aria-label="Import calendar" :aria-busy="importBusy">
+    <form class="calendar-import-form" @submit.prevent="submitImport('preview')">
+      <label>Calendar file<input type="file" accept=".ics,text/calendar" @change="selectImportFile($event)" :disabled="importBusy"></label>
+      <label>Destination calendar<select :value="importDestination" @change="selectImportDestination($event)" :disabled="importBusy">
+        <option value="new">Create a calendar</option>
+        <option :for="item in calendars" :value="item.id" :text="item.name"></option>
+      </select></label>
+      <label :if="importDestination === 'new'">New calendar name<input :value="newCalendarName" @input="setNewCalendarName($event)" :disabled="importBusy" maxlength="100" required></label>
+      <button type="submit" class="wm-action" :disabled="!canPreview">Preview</button>
+    </form>
+    <div :if="importError" class="login-error" role="alert" :text="importError"></div>
+    <p :if="importBusy" role="status">Reading calendar file…</p>
+    <p :if="importRows.length" role="status" :text="resultSummary"></p>
+    <ul :if="importRows.length" class="calendar-events calendar-import-results" aria-label="Event results">
+      <li :for="event in importRows">
+        <strong :text="event.summary"></strong>
+        <span :if="event.start !== null" :text="importEventDate(event)"></span>
+        <span :text="importStatusLabels[event.status]"></span>
+        <span :if="event.message" :text="event.message"></span>
       </li>
     </ul>
-    <section :if="recurringSeries.length" class="calendar-series" aria-labelledby="series-heading">
-      <h2 id="series-heading">Recurring series</h2>
-      <p>Open your CalDAV client for individual occurrence dates.</p>
-      <ul class="calendar-events">
-        <li :for="event in recurringSeries">
-          <strong :text="event.summary || 'Untitled series'"></strong>
-          <span :text="'Series start: ' + calendarEventDate(event)"></span>
+    <button :if="readyCount && !importFinished" class="wm-action" @click="submitImport('import')" :disabled="importBusy">Import events</button>
+  </section>
+  <section :if="account && calendars.length" class="calendar-workspace" aria-label="Calendar workspace" :aria-busy="loading">
+    <div class="calendar-controls">
+      <div class="calendar-choices calendar-sources" role="group" aria-label="Calendars">
+        <button class="wm-action" @click="selectCalendar(null)" :aria-pressed="activeCalendar === null">All calendars</button>
+        <button :for="item in calendars" class="wm-action" @click="selectCalendar(item.id)" :aria-pressed="item.id === activeCalendar">
+          <span class="calendar-dot" :style="'background:' + calendarColor(item.color)" aria-hidden="true"></span><span :text="item.name"></span>
+        </button>
+      </div>
+      <form class="calendar-choices calendar-search" role="search" @submit.prevent="search()">
+        <input type="search" x-model="searchInput" aria-label="Search events" placeholder="Search events" maxlength="256">
+        <button type="submit" class="wm-action">Search</button>
+        <button :if="searchTerm" type="button" class="wm-action" @click="clearSearch()">Clear</button>
+      </form>
+    </div>
+    <div class="calendar-controls calendar-view-toolbar">
+      <div class="calendar-choices calendar-view-modes" role="group" aria-label="Calendar view">
+        <button :for="mode in calendarViews" class="wm-action" @click="showView(mode.id)" :aria-pressed="!searchTerm && view === mode.id" :text="mode.name"></button>
+      </div>
+      <div :if="!searchTerm" class="calendar-choices calendar-period" role="group" aria-label="Change date range">
+        <button class="wm-action calendar-arrow" @click="shiftView(-1)" aria-label="Previous period"><span class="mail-icon" data-icon="left" aria-hidden="true"></span></button>
+        <button class="wm-action" @click="goToToday()">Today</button>
+        <button class="wm-action calendar-arrow" @click="shiftView(1)" aria-label="Next period"><span class="mail-icon" data-icon="right" aria-hidden="true"></span></button>
+        <input type="date" aria-label="Jump to date" :value="focusDay" @change="changeDate($event)">
+      </div>
+      <label class="calendar-zone">Display time zone
+        <select aria-label="Display time zone" :value="displayZone" @change="changeZone($event)">
+          <option :for="zone in calendarTimeZones" :value="zone" :text="zone"></option>
+        </select>
+      </label>
+    </div>
+
+    <section :if="searchTerm" aria-labelledby="calendar-search-results">
+      <h2 id="calendar-search-results" class="calendar-range" :text="'Search results · ' + activeCalendarName"></h2>
+      <p :if="!loading && !error && !events.length">No events match this search.</p>
+      <ul class="calendar-result-list">
+        <li :for="event in events">
+          <button class="calendar-result" @click="openEvent(event)" :style="'--calendar-color:' + eventColor(event)">
+            <strong :text="event.summary || 'Untitled event'"></strong>
+            <span :text="(event.recurring ? 'Series start · ' : '') + calendarEventDate(event)"></span>
+            <span :text="nameFor(event)"></span>
+            <span :if="event.location" :text="event.location"></span>
+          </button>
         </li>
       </ul>
     </section>
+
+    <section :if="!searchTerm" aria-labelledby="calendar-range">
+      <h2 id="calendar-range" class="calendar-range" :text="rangeLabel" aria-live="polite"></h2>
+      <p :if="!loading && !error && view === 'agenda' && !calendarDays.length">No events in this period.</p>
+      <div :if="view === 'month'" class="calendar-weekdays" aria-hidden="true">
+        <span :for="label in monthWeekdays" :text="label"></span>
+      </div>
+      <div :class="'calendar-board calendar-board-' + view">
+        <section :for="day in calendarDays" :class="'calendar-day' + (day.dimmed ? ' calendar-day-muted' : '') + (day.today ? ' calendar-day-today' : '')" :aria-label="day.label">
+          <div class="calendar-day-heading">
+            <button class="calendar-day-link" :aria-label="view === 'month' && day.entries.length ? day.label + ', ' + day.entries.length + (day.entries.length === 1 ? ' event' : ' events') : day.label" :aria-current="day.today ? 'date' : undefined" @click="showDay(day.day)">
+              <span :if="view === 'month'" :text="day.number"></span><span :if="view !== 'month'" :text="day.label"></span>
+              <span :if="view === 'month' && day.entries.length" class="calendar-month-markers" aria-hidden="true">
+                <span :for="marker in day.markers" class="calendar-dot" :style="'background:' + eventColor(marker)"></span>
+                <span :if="day.entries.length > 3" :text="'+' + (day.entries.length - 3)"></span>
+              </span>
+            </button>
+            <button :if="view !== 'month'" class="calendar-day-add" :aria-label="'New event on ' + day.label" @click="openNewEvent(day.day)">+</button>
+          </div>
+          <ul class="calendar-day-entries">
+            <li :for="entry in day.entries">
+              <button @click="openEvent(entry)" :class="'calendar-entry' + (entry.all_day ? ' calendar-entry-all-day' : '')" :style="'--calendar-color:' + eventColor(entry)" :title="entry.summary + ' · ' + nameFor(entry)">
+                <span class="calendar-entry-time" :text="entry.time"></span>
+                <strong :text="entry.summary || 'Untitled event'"></strong>
+                <span :if="view === 'agenda' || view === 'day'" class="calendar-entry-meta" :text="entry.location || nameFor(entry)"></span>
+                <span :if="entry.status !== 'confirmed'" class="calendar-entry-meta" :text="entry.status"></span>
+              </button>
+            </li>
+          </ul>
+          <p :if="view === 'day' && !day.entries.length && !loading && !error" class="calendar-day-empty">No events on this day.</p>
+        </section>
+      </div>
+      <section :if="recurringSeries.length" class="calendar-series" aria-labelledby="series-heading">
+        <h2 id="series-heading">Recurring dates unavailable</h2>
+        <p>Use CalDAV to view individual dates for these series.</p>
+        <ul class="calendar-result-list">
+          <li :for="event in recurringSeries">
+            <button class="calendar-result" @click="openEvent(event)" :style="'--calendar-color:' + eventColor(event)">
+              <strong :text="event.summary || 'Untitled series'"></strong>
+              <span :text="'Series start · ' + calendarEventDate(event)"></span>
+              <span :text="nameFor(event)"></span>
+            </button>
+          </li>
+        </ul>
+      </section>
+    </section>
   </section>
 </main>
+<dialog :if="editorOpen" ref="eventDialog" class="wm-modal" aria-labelledby="calendar-editor-title" @cancel.prevent="closeEditor()">
+  <form class="wm-composer calendar-editor" @submit.prevent="saveEvent()" :aria-busy="editorBusy">
+    <div class="wm-composer-head">
+      <h2 id="calendar-editor-title" :text="editorLabel"></h2>
+      <button type="button" class="wm-composer-close" aria-label="Close editor" :disabled="editorBusy" @click="closeEditor()">✕</button>
+    </div>
+    <p :if="editorError" class="wm-composer-error" role="alert" :text="editorError"></p>
+    <p :if="!editorLoaded && editorBusy" class="calendar-editor-state" role="status">Opening event…</p>
+    <div :if="editorHasOccurrence && editorLoaded" class="calendar-choices calendar-editor-scope" role="group" aria-label="Edit scope">
+      <button type="button" class="wm-action" :aria-pressed="editorOccurrence" :disabled="editorBusy" @click="showEventScope(true)">This occurrence</button>
+      <button type="button" class="wm-action" :aria-pressed="!editorOccurrence" :disabled="editorBusy" @click="showEventScope(false)">Entire series</button>
+    </div>
+    <p :if="editorReadOnly" class="calendar-editor-state">This exception also changes later dates. Use CalDAV to edit it.</p>
+    <fieldset :if="editorLoaded" :disabled="editorBusy || editorConflict || editorReadOnly" class="calendar-editor-fields">
+      <label>Title<input x-model="editorTitle" maxlength="512" required autofocus></label>
+      <label :if="editingId === null">Calendar
+        <select aria-label="Calendar" :value="editorCalendar" @change="editorCalendar.set($event.target.value)">
+          <option :for="item in calendars" :value="item.id" :text="item.name"></option>
+        </select>
+      </label>
+      <div :if="editorScheduleEditable" class="calendar-editor-time">
+        <label class="calendar-all-day"><input type="checkbox" :checked="editorAllDay" @change="toggleAllDay($event)">All day</label>
+        <div :if="editorAllDay" class="calendar-editor-pair">
+          <label>Start date<input type="date" :value="editorStart" @input="setEventBoundary('start', $event)" required></label>
+          <label>Last day<input type="date" :value="editorEnd" @input="setEventBoundary('end', $event)"></label>
+        </div>
+        <div :if="!editorAllDay">
+          <div class="calendar-editor-pair">
+            <label>Starts<input type="datetime-local" step="1" :value="editorStart" @input="setEventBoundary('start', $event)" required></label>
+            <label>Ends<input type="datetime-local" step="1" :value="editorEnd" @input="setEventBoundary('end', $event)"></label>
+          </div>
+          <label>Event time zone<select aria-label="Event time zone" :value="editorZone" @change="editorZone.set($event.target.value)">
+            <option :for="zone in editorTimeZones" :value="zone" :text="zone"></option>
+          </select></label>
+        </div>
+      </div>
+      <div :if="editorScheduleEditable && !editorOccurrence" class="calendar-editor-repeat">
+        <label>Repeat<select aria-label="Repeat" :value="repeatFrequency" @change="repeatFrequency.set($event.target.value)">
+          <option value="none">Does not repeat</option>
+          <option value="daily">Daily</option>
+          <option value="weekly">Weekly</option>
+          <option value="monthly">Monthly</option>
+          <option value="yearly">Yearly</option>
+          <option :if="repeatFrequency === 'custom'" value="custom">Keep custom rule</option>
+        </select></label>
+        <div :if="repeatOptions" class="calendar-editor-pair">
+          <label>Repeat interval<input type="number" :value="repeatEvery" @input="repeatEvery.set(Number($event.target.value))" min="1" max="999" required></label>
+          <label>Repeat ends<select aria-label="Repeat ends" :value="repeatEnd" @change="changeRepeatEnd($event)">
+            <option value="never">Never</option>
+            <option value="count">After a number of occurrences</option>
+            <option value="date">On a date</option>
+          </select></label>
+        </div>
+        <label :if="repeatOptions && repeatEnd === 'count'">Occurrences<input type="number" :value="repeatCount" @input="repeatCount.set(Number($event.target.value))" min="1" max="9999" required></label>
+        <label :if="repeatOptions && repeatEnd === 'date'">Last repeat date<input type="date" :value="repeatUntil" @input="repeatUntil.set($event.target.value)" required></label>
+      </div>
+      <p :if="editorRecurring && !editorScheduleEditable" class="calendar-editor-hint">Use CalDAV to change this series’ time zones or schedule.</p>
+      <label :if="editorReminderEditable">Reminder<select aria-label="Reminder" :value="editorReminder" @change="editorReminder.set($event.target.value)">
+        <option :for="choice in reminderOptions" :value="choice.id" :text="choice.label"></option>
+      </select></label>
+      <p :if="otherReminders" class="calendar-editor-hint" :text="'Additional calendar alarms: ' + otherReminders"></p>
+      <label>Location<input x-model="editorLocation" maxlength="1024"></label>
+      <label>Description<textarea x-model="editorDescription" rows="4" maxlength="65536"></textarea></label>
+    </fieldset>
+    <div class="wm-composer-foot calendar-editor-actions">
+      <button :if="editorLoaded && !confirmDelete && !editorReadOnly" type="submit" class="wm-action calendar-primary" :disabled="editorBusy || editorConflict">Save event</button>
+      <button :if="editorConflict || (!editorLoaded && !editorBusy && editorError)" type="button" class="wm-action" @click="reloadEvent()" :disabled="editorBusy">Reload event</button>
+      <button :if="editorLoaded && editingId !== null && !confirmDelete && !editorReadOnly" type="button" class="wm-action calendar-delete" @click="confirmDelete.set(true)" :disabled="editorBusy || editorConflict" :text="editorRecurring ? 'Delete series' : editorOccurrence ? 'Delete occurrence' : 'Delete event'"></button>
+      <p :if="confirmDelete" class="calendar-delete-confirm" role="status" :text="editorRecurring ? 'Delete this series and all of its occurrences?' : editorOccurrence ? 'Delete this occurrence?' : 'Delete this event?'"></p>
+      <button :if="confirmDelete" type="button" class="wm-action calendar-delete" @click="deleteEvent()" :disabled="editorBusy || editorConflict">Confirm deletion</button>
+      <button :if="confirmDelete" type="button" class="wm-action" @click="confirmDelete.set(false)" :disabled="editorBusy">Keep event</button>
+      <button :if="!confirmDelete" type="button" class="wm-action" @click="closeEditor()" :disabled="editorBusy">Cancel</button>
+    </div>
+  </form>
+</dialog>
+<aside :if="visibleReminders.length || reminderError" class="calendar-notice-stack" aria-label="Calendar reminders">
+  <p :if="reminderError" class="calendar-notice-error" role="status" :text="reminderError"></p>
+  <div :for="item in visibleReminders" class="calendar-notice">
+    <div aria-live="polite">
+      <p class="calendar-notice-label">Calendar reminder</p>
+      <p class="calendar-notice-title" :text="item.summary"></p>
+      <p :if="item.message && item.message !== item.summary" class="calendar-notice-message" :text="item.message"></p>
+    </div>
+    <div class="calendar-notice-actions">
+      <a class="wm-action" :href="reminderDayLink(item)">View day</a>
+      <button type="button" class="wm-action" @click="dismissReminder(item)" :disabled="dismissingReminder !== ''" :aria-label="'Dismiss reminder for ' + item.summary">Dismiss</button>
+    </div>
+  </div>
+</aside>
 </body>
 </html>

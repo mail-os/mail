@@ -42,15 +42,56 @@ pub const Page = struct {
     pub const calendar: u8 = 4;
     pub const get_item_estimate: u8 = 6;
     pub const folder_hierarchy: u8 = 7;
-    pub const ping: u8 = 11;
-    pub const provision: u8 = 13;
-    pub const gal: u8 = 14;
+    pub const ping: u8 = 13;
+    pub const provision: u8 = 14;
+    pub const gal: u8 = 16;
+    pub const search: u8 = 15;
     pub const air_sync_base: u8 = 17;
+    pub const compose_mail: u8 = 21;
+};
+
+pub const Search = struct {
+    pub const Search: u8 = 0x05;
+    pub const Store: u8 = 0x07;
+    pub const Name: u8 = 0x08;
+    pub const Query: u8 = 0x09;
+    pub const Options: u8 = 0x0a;
+    pub const Range: u8 = 0x0b;
+    pub const Status: u8 = 0x0c;
+    pub const Response: u8 = 0x0d;
+    pub const Result: u8 = 0x0e;
+    pub const Properties: u8 = 0x0f;
+    pub const Total: u8 = 0x10;
+    pub const Value: u8 = 0x12;
+    pub const And: u8 = 0x13;
+    pub const FreeText: u8 = 0x15;
+    pub const DeepTraversal: u8 = 0x17;
+    pub const LongId: u8 = 0x18;
+    pub const RebuildResults: u8 = 0x19;
+    pub const LessThan: u8 = 0x1a;
+    pub const GreaterThan: u8 = 0x1b;
 };
 
 // ============================================================================
 // Tag tokens, grouped by page (bare token values, no flags)
 // ============================================================================
+
+pub const ComposeMail = struct {
+    pub const SendMail: u8 = 0x05;
+    pub const SmartForward: u8 = 0x06;
+    pub const SmartReply: u8 = 0x07;
+    pub const SaveInSentItems: u8 = 0x08;
+    pub const ReplaceMime: u8 = 0x09;
+    pub const Source: u8 = 0x0b;
+    pub const FolderId: u8 = 0x0c;
+    pub const ItemId: u8 = 0x0d;
+    pub const LongId: u8 = 0x0e;
+    pub const InstanceId: u8 = 0x0f;
+    pub const Mime: u8 = 0x10;
+    pub const ClientId: u8 = 0x11;
+    pub const Status: u8 = 0x12;
+    pub const AccountId: u8 = 0x13;
+};
 
 pub const AirSync = struct {
     pub const Synchronize: u8 = 0x05;
@@ -368,6 +409,8 @@ pub const DecodeError = error{
     Truncated,
     InvalidHeader,
     UnexpectedEnd,
+    InvalidToken,
+    LimitExceeded,
 };
 
 /// A decoded element. `text` slices into the source buffer (which must outlive
@@ -376,6 +419,7 @@ pub const Node = struct {
     page: u8,
     token: u8,
     text: ?[]const u8 = null,
+    is_opaque: bool = false,
     children: std.ArrayList(Node) = .empty,
 
     pub fn deinit(self: *Node, allocator: std.mem.Allocator) void {
@@ -421,12 +465,13 @@ const Cursor = struct {
 
     fn mbUint(self: *Cursor) DecodeError!u32 {
         var result: u32 = 0;
-        while (true) {
+        for (0..5) |_| {
             const b = try self.byte();
+            if (result > std.math.maxInt(u32) >> 7) return DecodeError.InvalidHeader;
             result = (result << 7) | (b & 0x7F);
-            if (b & 0x80 == 0) break;
+            if (b & 0x80 == 0) return result;
         }
-        return result;
+        return DecodeError.InvalidHeader;
     }
 };
 
@@ -447,16 +492,18 @@ pub fn decode(allocator: std.mem.Allocator, data: []const u8) !Node {
     var root = Node{ .page = 0xFF, .token = 0xFF };
     errdefer root.deinit(allocator);
 
-    try parseChildren(allocator, &cur, &root);
+    try parseChildren(allocator, &cur, &root, 0);
     return root;
 }
 
 /// Parse elements into `parent.children` until an END token or EOF.
-fn parseChildren(allocator: std.mem.Allocator, cur: *Cursor, parent: *Node) !void {
+fn parseChildren(allocator: std.mem.Allocator, cur: *Cursor, parent: *Node, depth: usize) !void {
+    if (depth > 64) return DecodeError.LimitExceeded;
     while (cur.pos < cur.data.len) {
         const b = cur.data[cur.pos];
         switch (b) {
             END => {
+                if (depth == 0) return DecodeError.UnexpectedEnd;
                 cur.pos += 1;
                 return;
             },
@@ -465,6 +512,7 @@ fn parseChildren(allocator: std.mem.Allocator, cur: *Cursor, parent: *Node) !voi
                 cur.page = try cur.byte();
             },
             STR_I => {
+                if (depth == 0 or parent.text != null) return DecodeError.InvalidToken;
                 cur.pos += 1;
                 const start = cur.pos;
                 while (cur.pos < cur.data.len and cur.data[cur.pos] != 0) cur.pos += 1;
@@ -473,24 +521,28 @@ fn parseChildren(allocator: std.mem.Allocator, cur: *Cursor, parent: *Node) !voi
                 cur.pos += 1; // consume NUL
             },
             OPAQUE => {
+                if (depth == 0 or parent.text != null) return DecodeError.InvalidToken;
                 cur.pos += 1;
                 const len = try cur.mbUint();
                 if (cur.pos + len > cur.data.len) return DecodeError.Truncated;
                 parent.text = cur.data[cur.pos .. cur.pos + len];
+                parent.is_opaque = true;
                 cur.pos += len;
             },
             else => {
+                if (b & 0x80 != 0 or b & TOKEN_MASK < 5) return DecodeError.InvalidToken;
                 cur.pos += 1;
                 const has_content = (b & HAS_CONTENT) != 0;
                 var node = Node{ .page = cur.page, .token = b & TOKEN_MASK };
                 errdefer node.deinit(allocator);
                 if (has_content) {
-                    try parseChildren(allocator, cur, &node);
+                    try parseChildren(allocator, cur, &node, depth + 1);
                 }
                 try parent.children.append(allocator, node);
             },
         }
     }
+    if (depth != 0) return DecodeError.Truncated;
 }
 
 // ============================================================================

@@ -2,13 +2,11 @@ const std = @import("std");
 const time_compat = @import("time_compat.zig");
 const io_compat = @import("io_compat.zig");
 const fs_compat = @import("fs_compat.zig");
-const durable_maildir = @import("durable_maildir.zig");
 const socket = @import("socket_compat.zig");
 const config = @import("config.zig");
 const auth = @import("../auth/auth.zig");
 const logger = @import("logger.zig");
 const security = @import("../auth/security.zig");
-const webhook = @import("../features/webhook.zig");
 const greylist_mod = @import("../antispam/greylist.zig");
 const spf_mod = @import("../antispam/spf.zig");
 const dkim_mod = @import("../antispam/dkim.zig");
@@ -16,52 +14,15 @@ const dmarc_mod = @import("../antispam/dmarc.zig");
 const arc_mod = @import("../antispam/arc.zig");
 const dnsbl_mod = @import("../antispam/dnsbl.zig");
 const spam_filter = @import("../antispam/spam_filter.zig");
+const clamav = @import("../antispam/clamav.zig");
 const tls_mod = @import("tls.zig");
 const chunking = @import("../protocol/chunking.zig");
 const tls = @import("tls");
-const outbound = @import("../delivery/outbound.zig");
-const retry = @import("../delivery/retry.zig");
 const aliases = @import("../delivery/aliases.zig");
+const routing = @import("../delivery/local_routing.zig");
+const database = @import("../storage/database.zig");
 const maildir_path = @import("maildir_path.zig");
 const submission_headers = @import("../message/submission.zig");
-const typesense = @import("../search/typesense.zig");
-const sieve = @import("../features/sieve.zig");
-
-/// Maximum number of in-flight detached outbound/forward delivery worker
-/// threads across the whole process. Without a cap, a flood of recipients
-/// could spawn unbounded threads and exhaust resources.
-const max_outbound_workers: usize = 64;
-
-/// Current number of in-flight outbound/forward worker threads. Incremented
-/// before spawning a worker and decremented when the worker exits.
-var outbound_worker_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
-
-/// Monotonic suffix for Maildir names. Millisecond timestamps alone collide
-/// under concurrent delivery and `createFile` would truncate the first message.
-var maildir_sequence: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
-
-fn maildirBasename(buf: []u8) ![]const u8 {
-    const ts = time_compat.milliTimestamp();
-    const seq = maildir_sequence.fetchAdd(1, .monotonic);
-    return std.fmt.bufPrint(buf, "{d}.{d}.eml", .{ ts, seq });
-}
-
-/// Try to reserve a slot for a new outbound worker. Returns true if a slot was
-/// reserved (caller must ensure the worker decrements the counter on exit),
-/// false if the in-flight limit has been reached.
-fn tryReserveOutboundSlot() bool {
-    while (true) {
-        const cur = outbound_worker_count.load(.monotonic);
-        if (cur >= max_outbound_workers) return false;
-        if (outbound_worker_count.cmpxchgWeak(cur, cur + 1, .monotonic, .monotonic) == null) {
-            return true;
-        }
-    }
-}
-
-fn releaseOutboundSlot() void {
-    _ = outbound_worker_count.fetchSub(1, .monotonic);
-}
 
 fn shouldRunInboundPipeline(authenticated: bool, antispam_check: bool, spam_filter_enabled: bool) bool {
     return !authenticated and (antispam_check or spam_filter_enabled);
@@ -87,6 +48,37 @@ fn sanitizeForLog(input: []const u8) [256]u8 {
 
 fn sanitizedSlice(buf: *const [256]u8, len: usize) []const u8 {
     return buf[0..@min(len, 255)];
+}
+
+/// The stored verdict comes from this server. Drop any supplied verdict fields
+/// and their continuation lines while leaving the MIME body untouched.
+fn removeScanHeaders(message: *std.ArrayList(u8)) void {
+    const bytes = message.items;
+    var read: usize = 0;
+    var kept: usize = 0;
+    var dropping = false;
+    while (read < bytes.len) {
+        const end = if (std.mem.indexOfScalarPos(u8, bytes, read, '\n')) |newline| newline + 1 else bytes.len;
+        const line = bytes[read..end];
+        const field = std.mem.trimEnd(u8, line, "\r\n");
+        if (field.len == 0) break;
+        if (field[0] != ' ' and field[0] != '\t') {
+            dropping = if (std.mem.indexOfScalar(u8, field, ':')) |colon|
+                std.ascii.eqlIgnoreCase(std.mem.trimEnd(u8, field[0..colon], " \t"), "X-Virus-Scanned")
+            else
+                false;
+        }
+        if (!dropping) {
+            if (kept != read) std.mem.copyForwards(u8, bytes[kept .. kept + line.len], line);
+            kept += line.len;
+        }
+        read = end;
+    }
+    if (kept != read) {
+        const rest = bytes[read..];
+        std.mem.copyForwards(u8, bytes[kept .. kept + rest.len], rest);
+        message.shrinkRetainingCapacity(kept + rest.len);
+    }
 }
 
 /// The base64 of a SASL response, with "=" (RFC 4954 §4: a response of
@@ -311,13 +303,10 @@ test "a failed user lookup never becomes a bounce" {
     try std.testing.expect(localRecipientKnown(broken, "anyone@chrisbreuer.me", fakeAliases));
 }
 
-test "maildir basenames are unique within one millisecond" {
-    var a_buf: [64]u8 = undefined;
-    var b_buf: [64]u8 = undefined;
-    const a = try maildirBasename(&a_buf);
-    const b = try maildirBasename(&b_buf);
-    try std.testing.expect(!std.mem.eql(u8, a, b));
-    try std.testing.expect(std.mem.endsWith(u8, a, ".eml"));
+test "accepted SMTP envelopes get distinct recovery identifiers" {
+    const first = routing.newId();
+    const second = routing.newId();
+    try std.testing.expect(!std.mem.eql(u8, &first, &second));
 }
 
 /// Process-wide counter for synthesized Message-IDs.
@@ -1080,7 +1069,9 @@ pub const Session = struct {
     last_activity: i64,
     tls_context: ?*tls_mod.TlsContext,
     auth_backend: ?*auth.AuthBackend,
+    delivery_db: ?*database.Database = null,
     greylist: ?*greylist_mod.Greylist,
+    scanner: ?*clamav.ClamAVScanner = null,
     // TLS I/O buffers and reader/writer stored at session scope for lifetime management
     tls_input_buf: ?[]u8,
     tls_output_buf: ?[]u8,
@@ -1131,6 +1122,7 @@ pub const Session = struct {
             .last_activity = now,
             .tls_context = tls_context,
             .auth_backend = auth_backend,
+            .delivery_db = if (auth_backend) |backend| backend.db else null,
             .greylist = greylist,
             .tls_input_buf = null,
             .tls_output_buf = null,
@@ -1645,6 +1637,19 @@ pub const Session = struct {
             }
         }
 
+        if (is_local and self.auth_backend != null) {
+            const key = try self.mailboxKey(addr);
+            defer self.allocator.free(key);
+            const limits = self.auth_backend.?.db.hostedLimits(key) catch {
+                try self.sendResponse(writer, 451, "4.3.0 Recipient lookup temporarily unavailable", null);
+                return;
+            };
+            if (limits != null and !limits.?.enabled) {
+                try self.sendResponse(writer, 550, "5.2.1 Recipient mailbox is disabled", null);
+                return;
+            }
+        }
+
         // Check greylisting if enabled (skip for authenticated users)
         if (self.greylist != null and !self.authenticated) {
             const greylist = self.greylist.?;
@@ -1689,6 +1694,12 @@ pub const Session = struct {
             }
         }
 
+        for (self.rcpt_to.items) |previous| {
+            if (std.mem.eql(u8, addr, previous)) {
+                try self.sendResponse(writer, 250, "OK", null);
+                return;
+            }
+        }
         try self.rcpt_to.append(self.allocator, try self.allocator.dupe(u8, addr));
 
         self.state = .RcptTo;
@@ -1874,11 +1885,13 @@ pub const Session = struct {
         // already trusted via AUTH. Records an Authentication-Results header
         // and is advisory unless SMTP_ANTISPAM_ENFORCE is set.
         var to_junk = false;
+        var verified_author = self.authenticated;
         if (shouldRunInboundPipeline(self.authenticated, self.config.antispam_check, self.config.spam_filter_enabled)) {
             const auth_res: InboundAuth = if (self.config.antispam_check)
                 self.runInboundAntispam(&message_data)
             else
                 .{};
+            verified_author = auth_res.verified_author;
             if (self.config.antispam_check and auth_res.reject_policy) {
                 try self.sendResponse(writer, 550, "5.7.1 Message rejected by mail authentication policy", null);
                 // Reset WITHOUT a response — handleRset() answers the RSET
@@ -1909,12 +1922,7 @@ pub const Session = struct {
 
         // Save the message. Spam that scored into the Junk band is delivered to
         // the recipient's Junk mailbox instead of the inbox.
-        self.saveMessage(message_data.items, to_junk) catch |err| {
-            self.logger.err("Failed to save message: {}", .{err});
-            try self.sendResponse(writer, 451, "4.3.0 Temporary storage failure; please retry", null);
-            self.resetTransactionState();
-            return;
-        };
+        if (!try self.saveScannedMessage(writer, &message_data, to_junk, verified_author)) return;
 
         const sender_str: []const u8 = self.mail_from orelse "unknown";
         const safe_sender = sanitizeForLog(sender_str);
@@ -1923,47 +1931,6 @@ pub const Session = struct {
             self.rcpt_to.items.len,
             message_data.items.len,
         );
-
-        // === Inbound processing pipeline (new features) ===
-        // 1. ARC chain validation (if enabled via SMTP_ENABLE_ARC)
-        // The ARC validator checks the chain of ARC sets in message headers.
-        // Results are logged and can influence downstream processing.
-
-        // 2. Sieve filtering (if enabled via SMTP_ENABLE_SIEVE)
-        // Per-recipient Sieve scripts are evaluated to determine message
-        // disposition (keep, fileinto, redirect, discard, reject).
-
-        // 3. BIMI lookup (if enabled via SMTP_ENABLE_BIMI and DMARC passed)
-        // Brand indicator lookup is performed for domains with valid BIMI records.
-
-        // 4. List-Unsubscribe header injection (if enabled via SMTP_ENABLE_LIST_UNSUBSCRIBE)
-        // RFC 8058 one-click unsubscribe headers are added for mailing list messages.
-
-        // 5. Milter callbacks (if enabled via SMTP_ENABLE_MILTER)
-        // External mail filters are invoked via the Milter binary protocol.
-        // Callbacks: connect, helo, mail_from, rcpt_to, headers, body, eom.
-
-        // Send webhook notification if configured
-        if (self.config.webhook_enabled) {
-            const webhook_cfg = webhook.WebhookConfig{
-                .url = self.config.webhook_url,
-                .enabled = self.config.webhook_enabled,
-                .timeout_ms = 5000,
-            };
-
-            const payload = webhook.WebhookPayload{
-                .from = self.mail_from orelse "unknown",
-                .recipients = self.rcpt_to.items,
-                .size = message_data.items.len,
-                .timestamp = time_compat.timestamp(),
-                .remote_addr = self.remote_addr,
-            };
-
-            // Send webhook in background (don't block on webhook delivery)
-            webhook.sendWebhook(self.allocator, webhook_cfg, payload, self.logger) catch |err| {
-                self.logger.warn("Webhook delivery failed: {}", .{err});
-            };
-        }
 
         try self.sendResponse(writer, 250, "OK: Message accepted for delivery", null);
 
@@ -1978,6 +1945,7 @@ pub const Session = struct {
         spf: spf_mod.SPFResult = .none,
         dkim: dkim_mod.DKIMResult = .neutral,
         dmarc: dmarc_mod.DMARCResult = .none,
+        verified_author: bool = false,
         /// True only when enforcement is on AND DMARC failed AND the From
         /// domain publishes p=reject.
         reject_policy: bool = false,
@@ -1996,7 +1964,9 @@ pub const Session = struct {
         const mail_from = self.mail_from orelse "";
         const helo = self.client_hostname orelse "";
         const spf_domain = domainOf(mail_from);
-        const from_domain = extractFromDomain(headers) orelse spf_domain;
+        const author = submission_headers.author(self.allocator, message_data.items) catch null;
+        defer if (author) |value| self.allocator.free(value);
+        const from_domain = if (author) |value| domainOf(value) else extractFromDomain(headers) orelse spf_domain;
 
         var spf_v = spf_mod.SPFValidator.init(self.allocator);
         const spf_res = spf_v.validate(self.remote_addr, mail_from, helo) catch spf_mod.SPFResult.temperror;
@@ -2032,6 +2002,7 @@ pub const Session = struct {
             .spf = spf_res,
             .dkim = dkim_res,
             .dmarc = dmarc_res,
+            .verified_author = author != null and dmarc_res == .pass,
             .reject_policy = self.config.antispam_enforce and dmarc_res == .fail and dmarc_eval.policy == .reject,
         };
 
@@ -2222,24 +2193,21 @@ pub const Session = struct {
                 var msg_buf: std.ArrayList(u8) = .empty;
                 defer msg_buf.deinit(self.allocator);
                 var to_junk = false;
-                const have_copy = blk: {
-                    msg_buf.appendSlice(self.allocator, message) catch break :blk false;
-                    break :blk true;
-                };
+                var verified_author = self.authenticated;
                 // The same trace and submission headers as the DATA path: a
                 // client that submits with CHUNKING used to skip both.
-                if (!have_copy) {
+                msg_buf.appendSlice(self.allocator, message) catch {
                     try self.sendResponse(writer, 451, "Temporary message processing failure", null);
                     self.resetTransactionState();
                     return;
-                }
+                };
                 if (!(self.authorizeSubmission(&msg_buf) catch false)) {
                     try self.sendResponse(writer, 550, "5.7.1 Message author is not authorized for this account", null);
                     self.resetTransactionState();
                     return;
                 }
                 self.stampAcceptedMessage(&msg_buf);
-                if (have_copy and shouldRunInboundPipeline(
+                if (shouldRunInboundPipeline(
                     self.authenticated,
                     self.config.antispam_check,
                     self.config.spam_filter_enabled,
@@ -2248,6 +2216,7 @@ pub const Session = struct {
                         self.runInboundAntispam(&msg_buf)
                     else
                         .{};
+                    verified_author = auth_res.verified_author;
                     if (self.config.antispam_check and auth_res.reject_policy) {
                         try self.sendResponse(writer, 550, "5.7.1 Message rejected by mail authentication policy", null);
                         // Full transaction reset (frees the BDAT session and
@@ -2270,43 +2239,13 @@ pub const Session = struct {
                     }
                 }
 
-                // Save the message (the scored copy when available, else raw).
-                const to_save = if (have_copy) msg_buf.items else message;
-                self.saveMessage(to_save, to_junk) catch |err| {
-                    try self.sendResponse(writer, 554, "Transaction failed", null);
-                    self.logger.err("Failed to save message: {}", .{err});
-                    var s = session.*;
-                    s.deinit();
-                    self.bdat_session = null;
-                    return;
-                };
+                if (!try self.saveScannedMessage(writer, &msg_buf, to_junk, verified_author)) return;
 
                 self.logger.logMessageReceived(
                     self.mail_from orelse "unknown",
                     self.rcpt_to.items.len,
                     message.len,
                 );
-
-                // Send webhook notification if configured
-                if (self.config.webhook_enabled) {
-                    const webhook_cfg = webhook.WebhookConfig{
-                        .url = self.config.webhook_url,
-                        .enabled = self.config.webhook_enabled,
-                        .timeout_ms = 5000,
-                    };
-
-                    const payload = webhook.WebhookPayload{
-                        .from = self.mail_from orelse "unknown",
-                        .recipients = self.rcpt_to.items,
-                        .size = message.len,
-                        .timestamp = time_compat.timestamp(),
-                        .remote_addr = self.remote_addr,
-                    };
-
-                    webhook.sendWebhook(self.allocator, webhook_cfg, payload, self.logger) catch |err| {
-                        self.logger.warn("Webhook delivery failed: {}", .{err});
-                    };
-                }
 
                 try self.sendResponse(writer, 250, "OK: Message accepted for delivery", null);
 
@@ -2714,428 +2653,130 @@ pub const Session = struct {
         _ = writer;
     }
 
-    fn saveMessage(self: *Session, data: []const u8, to_junk: bool) !void {
-        const cwd = fs_compat.cwd();
-        const sender = self.mail_from orelse "unknown";
-        // Spam goes into the recipient's Junk mailbox (a flat Maildir subfolder,
-        // mail/<user>/<Junk>/), everything else into the inbox (mail/<user>/new).
-        const sub = if (to_junk) self.config.junkFolder() else "new";
+    fn mailboxKey(self: *Session, rcpt: []const u8) ![]const u8 {
+        const db = if (self.auth_backend) |ab| ab.db else null;
+        return routing.resolveMailbox(self.allocator, db, &self.config, rcpt);
+    }
 
-        for (self.rcpt_to.items) |rcpt| {
-            // Determine if recipient is local or external
-            // Compare against hostname and its parent domain (mail.stacksjs.com -> stacksjs.com)
-            const is_local = if (std.mem.indexOf(u8, rcpt, "@")) |at_pos|
-                self.config.isLocalDomain(rcpt[at_pos + 1 ..])
-            else
-                true;
-
-            if (is_local) {
-                // Local delivery: save to Maildir.
-                //
-                // Per-domain isolated mailbox: if the full recipient address is
-                // itself a registered user (e.g. info@a.com), deliver to
-                // mail/{full-address}/ so info@a.com and info@b.com stay distinct
-                // — matching the canonical maildir key IMAP authenticates against.
-                //
-                // Otherwise fall back to the local-part resolved through the
-                // aliases file (postmaster@, abuse@, tlsrpt@, ... → a real user),
-                // the legacy single-namespace path.
-                const raw_local = if (std.mem.indexOf(u8, rcpt, "@")) |at_pos|
-                    rcpt[0..at_pos]
-                else
-                    rcpt;
-                const is_isolated = if (self.auth_backend) |ab|
-                    (ab.db.userExists(rcpt) catch false)
-                else
-                    false;
-                // A trap files everything into one mailbox, whoever it was
-                // addressed to. That is what makes it readable: a developer
-                // wants the list of what the application just sent, not a
-                // mailbox per fixture address. See `Config.catch_all_mailbox`.
-                const username = if (self.config.catch_all)
-                    try self.allocator.dupe(u8, self.config.catch_all_mailbox)
-                else if (is_isolated) try self.allocator.dupe(u8, rcpt) else try aliases.resolve(self.allocator, raw_local);
-                defer self.allocator.free(username);
-                try maildir_path.validate(username);
-                try maildir_path.validate(sub);
-
-                const new_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ username, sub });
-                defer self.allocator.free(new_dir);
-                cwd.makePath(new_dir) catch |err| {
-                    self.logger.err("Failed to create mailbox directory {s}: {}", .{ new_dir, err });
-                    return error.MaildirCreateFailed;
-                };
-
-                var base_buf: [64]u8 = undefined;
-                const basename = try maildirBasename(&base_buf);
-                const filename = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}/{s}", .{ username, sub, basename });
-                defer self.allocator.free(filename);
-
-                durable_maildir.write(self.allocator, filename, data) catch |err| {
-                    self.logger.err("Failed to save message: {}", .{err});
-                    return err;
-                };
-
-                self.logger.debug("Message saved to {s}", .{filename});
-
-                // Spam is not indexed for inbox search and is never auto-forwarded
-                // (forwarding spam would just relay it to the user's other address).
-                if (to_junk) continue;
-
-                // Index for full-text search (best-effort, detached thread)
-                typesense.indexMessageAsync(self.allocator, username, "INBOX", basename, data);
-
-                // Check for auto-forwarding rules
-                self.checkAndForward(username, sender, data) catch |err| {
-                    self.logger.err("Forward check failed for {s}: {}", .{ username, err });
-                };
-            } else {
-                // External delivery: relay via SES in a background thread
-                // so we don't block the SMTP session (Apple Mail times out otherwise).
-                // Bound the number of in-flight worker threads to avoid resource
-                // exhaustion from a flood of recipients.
-                if (!tryReserveOutboundSlot()) {
-                    self.logger.warn("Outbound worker limit reached; queueing delivery to {s}", .{rcpt});
-                    retry.enqueueFailure(sender, rcpt, data);
-                    continue;
-                }
-                self.logger.info("Queueing outbound delivery to: {s}", .{rcpt});
-                const bg = self.allocator.create(OutboundContext) catch {
-                    releaseOutboundSlot();
-                    retry.enqueueFailure(sender, rcpt, data);
-                    continue;
-                };
-                bg.* = .{
-                    .allocator = self.allocator,
-                    .from = self.allocator.dupe(u8, sender) catch {
-                        self.allocator.destroy(bg);
-                        releaseOutboundSlot();
-                        retry.enqueueFailure(sender, rcpt, data);
-                        continue;
-                    },
-                    .to = self.allocator.dupe(u8, rcpt) catch {
-                        self.allocator.free(bg.from);
-                        self.allocator.destroy(bg);
-                        releaseOutboundSlot();
-                        retry.enqueueFailure(sender, rcpt, data);
-                        continue;
-                    },
-                    .data = self.allocator.dupe(u8, data) catch {
-                        self.allocator.free(bg.from);
-                        self.allocator.free(bg.to);
-                        self.allocator.destroy(bg);
-                        releaseOutboundSlot();
-                        retry.enqueueFailure(sender, rcpt, data);
-                        continue;
-                    },
-                    .hostname = self.config.hostname,
-                    .delivery_method = self.config.delivery_method,
-                    .ses_region = self.config.ses_region,
-                };
-                const thread = std.Thread.spawn(.{}, outboundWorker, .{bg}) catch |err| {
-                    self.logger.err("Failed to spawn outbound thread for {s}: {}", .{ rcpt, err });
-                    self.allocator.free(bg.data);
-                    self.allocator.free(bg.to);
-                    self.allocator.free(bg.from);
-                    self.allocator.destroy(bg);
-                    releaseOutboundSlot();
-                    retry.enqueueFailure(sender, rcpt, data);
-                    continue;
-                };
-                thread.detach();
-            }
+    fn sendSaveError(self: *Session, writer: anytype, err: anyerror) !void {
+        self.logger.err("Failed to save message: {}", .{err});
+        switch (err) {
+            error.HostedStorageFull => try self.sendResponse(writer, 452, "4.2.2 Recipient mailbox storage is full", null),
+            error.HostedRecipientDisabled => try self.sendResponse(writer, 550, "5.2.1 Recipient mailbox is disabled", null),
+            error.HostedSenderDisabled => try self.sendResponse(writer, 550, "5.7.1 Sender mailbox is disabled", null),
+            error.HostedSendingLimit => try self.sendResponse(writer, 452, "4.7.0 Daily recipient allowance exhausted; retry after midnight UTC", null),
+            else => try self.sendResponse(writer, 451, "4.3.0 Temporary storage failure; please retry", null),
         }
     }
 
-    const OutboundContext = struct {
-        allocator: std.mem.Allocator,
-        from: []u8,
-        to: []u8,
-        data: []u8,
-        hostname: []const u8,
-        delivery_method: config.DeliveryMethod,
-        ses_region: []const u8,
-    };
-
-    fn outboundWorker(ctx: *OutboundContext) void {
-        defer {
-            ctx.allocator.free(ctx.data);
-            ctx.allocator.free(ctx.to);
-            ctx.allocator.free(ctx.from);
-            ctx.allocator.destroy(ctx);
-            // Release the in-flight worker slot reserved before spawning.
-            releaseOutboundSlot();
-        }
-        outbound.deliverToRemote(
-            ctx.allocator,
-            ctx.from,
-            ctx.to,
-            ctx.data,
-            ctx.hostname,
-            ctx.delivery_method,
-            ctx.ses_region,
-        ) catch |err| {
-            // The recipient's server says the address does not exist. That
-            // is the answer; it goes back to the sender now, and the address
-            // is not tried again.
-            if (err == error.SmtpRecipientRejected) {
-                retry.bounceNow(ctx.from, ctx.to, "550 5.1.1 the recipient's mail server says this address cannot receive mail", ctx.data);
-                return;
+    /// The final intake step shared by DATA and BDAT LAST. A refusal happens
+    /// before mail is published, queued, or charged against a hosted allowance.
+    fn saveScannedMessage(self: *Session, writer: anytype, message: *std.ArrayList(u8), to_junk: bool, verified_author: bool) !bool {
+        if (self.scanner) |scanner| {
+            const accepted = self.scanIncoming(writer, scanner, message) catch |err| switch (err) {
+                error.OutOfMemory => blk: {
+                    self.logger.err("Failed to complete SMTP malware scan: {}", .{err});
+                    try self.sendResponse(writer, 451, "4.3.0 Temporary message processing failure", null);
+                    break :blk false;
+                },
+                else => return err,
+            };
+            if (!accepted) {
+                self.resetTransactionState();
+                return false;
             }
-            std.log.err("Outbound delivery to {s} failed: {} — queueing for retry", .{ ctx.to, err });
-            // Persistent retry with backoff; a permanent failure there
-            // generates a DSN back to the (local) sender.
-            retry.enqueueFailure(ctx.from, ctx.to, ctx.data);
+        }
+        self.saveMessage(message.items, to_junk, verified_author) catch |err| {
+            try self.sendSaveError(writer, err);
+            self.resetTransactionState();
+            return false;
         };
+        return true;
     }
 
-    fn forwardMessage(self: *Session, username: []const u8, sender: []const u8, data: []const u8, forward_to: []const u8) !void {
-        self.logger.info("Auto-forwarding from {s} to {s}", .{ username, forward_to });
-
-        const is_local_forward = if (std.mem.indexOf(u8, forward_to, "@")) |at_pos|
-            self.config.isLocalDomain(forward_to[at_pos + 1 ..])
-        else
-            true;
-
-        if (is_local_forward) {
-            const fwd_is_isolated = if (self.auth_backend) |ab|
-                (ab.db.userExists(forward_to) catch false)
-            else
-                false;
-            const fwd_username = if (fwd_is_isolated)
-                try self.allocator.dupe(u8, forward_to)
-            else if (std.mem.indexOf(u8, forward_to, "@")) |at_pos|
-                try aliases.resolve(self.allocator, forward_to[0..at_pos])
-            else
-                try aliases.resolve(self.allocator, forward_to);
-            defer self.allocator.free(fwd_username);
-            try maildir_path.validate(fwd_username);
-
-            const cwd = fs_compat.cwd();
-            const fwd_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{fwd_username});
-            defer self.allocator.free(fwd_dir);
-            cwd.makePath(fwd_dir) catch return error.ForwardDirectoryFailed;
-
-            var fwd_base_buf: [64]u8 = undefined;
-            const fwd_basename = maildirBasename(&fwd_base_buf) catch return error.ForwardNameFailed;
-            const fwd_filename = try std.fmt.allocPrint(self.allocator, "mail/{s}/new/{s}", .{ fwd_username, fwd_basename });
-            defer self.allocator.free(fwd_filename);
-
-            durable_maildir.write(self.allocator, fwd_filename, data) catch |err| {
-                self.logger.err("Failed to save message: {}", .{err});
-                return err;
-            };
-            self.logger.info("Local forward from {s} to {s} saved to {s}", .{ username, fwd_username, fwd_filename });
-            return;
+    fn scanIncoming(self: *Session, writer: anytype, scanner: *clamav.ClamAVScanner, message: *std.ArrayList(u8)) !bool {
+        removeScanHeaders(message);
+        const verdict = try scanner.scanMessage(message.items);
+        defer verdict.deinit(scanner.allocator);
+        switch (scanner.disposition(verdict)) {
+            .deliver => {
+                const header = switch (verdict) {
+                    .clean => "X-Virus-Scanned: clean\r\n",
+                    .unavailable => "X-Virus-Scanned: unavailable\r\n",
+                    .too_large => "X-Virus-Scanned: too-large\r\n",
+                    .skipped => "X-Virus-Scanned: skipped\r\n",
+                    .infected => unreachable,
+                };
+                try message.insertSlice(self.allocator, 0, header);
+                return true;
+            },
+            .tempfail => try self.sendResponse(writer, 451, "4.7.0 Malware scanner unavailable; please retry", null),
+            .reject => switch (verdict) {
+                .infected => |name| {
+                    var buf: [255]u8 = undefined;
+                    const signature = clamav.safeSignature(name, &buf);
+                    self.logger.warn("SMTP malware rejected from {s}: {s}", .{ self.remote_addr, signature });
+                    try self.sendResponse(writer, 554, "5.7.1 Message rejected by malware scanner:", signature);
+                },
+                .too_large => try self.sendResponse(writer, 552, "5.3.4 Message exceeds scanner size limit", null),
+                else => unreachable,
+            },
         }
-
-        if (!tryReserveOutboundSlot()) {
-            self.logger.warn("Outbound worker limit reached; queueing forward to {s}", .{forward_to});
-            retry.enqueueFailure(sender, forward_to, data);
-            return;
-        }
-        const bg = self.allocator.create(OutboundContext) catch {
-            releaseOutboundSlot();
-            retry.enqueueFailure(sender, forward_to, data);
-            return;
-        };
-        bg.* = .{
-            .allocator = self.allocator,
-            .from = self.allocator.dupe(u8, sender) catch {
-                self.allocator.destroy(bg);
-                releaseOutboundSlot();
-                retry.enqueueFailure(sender, forward_to, data);
-                return;
-            },
-            .to = self.allocator.dupe(u8, forward_to) catch {
-                self.allocator.free(bg.from);
-                self.allocator.destroy(bg);
-                releaseOutboundSlot();
-                retry.enqueueFailure(sender, forward_to, data);
-                return;
-            },
-            .data = self.allocator.dupe(u8, data) catch {
-                self.allocator.free(bg.from);
-                self.allocator.free(bg.to);
-                self.allocator.destroy(bg);
-                releaseOutboundSlot();
-                retry.enqueueFailure(sender, forward_to, data);
-                return;
-            },
-            .hostname = self.config.hostname,
-            .delivery_method = self.config.delivery_method,
-            .ses_region = self.config.ses_region,
-        };
-        const thread = std.Thread.spawn(.{}, outboundWorker, .{bg}) catch |err| {
-            self.logger.err("Failed to spawn forward thread to {s}: {}", .{ forward_to, err });
-            self.allocator.free(bg.data);
-            self.allocator.free(bg.to);
-            self.allocator.free(bg.from);
-            self.allocator.destroy(bg);
-            releaseOutboundSlot();
-            retry.enqueueFailure(sender, forward_to, data);
-            return;
-        };
-        thread.detach();
+        return false;
     }
 
-    /// Evaluate the standard RFC 5228 forwarding script. `forwards.json`
-    /// remains a compatibility fallback for installations not yet migrated.
-    fn checkAndForward(self: *Session, username: []const u8, sender: []const u8, data: []const u8) !void {
-        if (fs_compat.readFileAlloc(self.allocator, "forwards.sieve")) |source| {
-            defer self.allocator.free(source);
-            var parser = sieve.SieveParser.init(self.allocator);
-            defer parser.deinit();
-            var script = parser.parse(source) catch |err| {
-                self.logger.err("Invalid forwards.sieve: {}", .{err});
-                return error.InvalidForwardScript;
+    fn saveMessage(self: *Session, data: []const u8, to_junk: bool, verified_author: bool) !void {
+        const db = self.delivery_db orelse return error.DatabaseUnavailable;
+        const sender = self.mail_from orelse "";
+        const id = routing.newId();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const folder = if (to_junk) self.config.junkFolder() else "new";
+        const identity = try routing.SenderIdentity.fromHeaders(a, data, verified_author);
+        {
+            db.lockMailboxes();
+            defer db.unlockMailboxes();
+            var plan: routing.Plan = .{
+                .allocator = a,
+                .db = db,
+                .bytes = data.len,
+                .raw = data,
+                .junk_folder = self.config.junkFolder(),
+                .automatic_category = if (identity.verified and !to_junk) routing.categories.classify(data) else null,
             };
-            defer script.deinit();
-            if (!script.is_valid) return error.InvalidForwardScript;
-
-            var message = sieve.SieveMessage.init(self.allocator);
-            defer message.deinit();
-            message.envelope_from = sender;
-            message.envelope_to = username;
-
-            var evaluator = sieve.SieveEvaluator.init(self.allocator);
-            const actions = try evaluator.evaluate(&script, &message);
-            defer self.allocator.free(actions);
-            for (actions) |action| {
-                if (action.action_type == .redirect) {
-                    if (action.argument) |target| try self.forwardMessage(username, sender, data, target);
+            for (self.rcpt_to.items) |recipient| {
+                if (routing.isLocal(recipient, self.config.hostname, &self.config)) {
+                    const mailbox = try routing.resolveMailbox(a, db, &self.config, recipient);
+                    var target: routing.Target = .{ .recipient = recipient, .mailbox = mailbox, .folder = folder };
+                    try plan.classify(&target, identity);
+                    try plan.addLocal(target);
+                } else {
+                    try plan.add(.{ .recipient = recipient });
                 }
             }
-            return;
-        } else |_| {}
-
-        const contents = fs_compat.readFileAlloc(self.allocator, "forwards.json") catch return;
-        defer self.allocator.free(contents);
-        if (contents.len == 0) return;
-
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, contents, .{}) catch return;
-        defer parsed.deinit();
-
-        const obj = switch (parsed.value) {
-            .object => |o| o,
-            else => return,
-        };
-
-        const targets = obj.get(username) orelse return;
-        const arr = switch (targets) {
-            .array => |a| a,
-            else => return,
-        };
-
-        for (arr.items) |item| {
-            const forward_to = switch (item) {
-                .string => |s| s,
-                else => continue,
-            };
-
-            self.logger.info("Auto-forwarding from {s} to {s}", .{ username, forward_to });
-
-            // Is the forward target a local address? Use the same
-            // isLocalDomain() test as inbound delivery — not just a
-            // hostname/parent comparison — so a forward to any configured
-            // local domain (SMTP_LOCAL_DOMAINS), including a second tenant on
-            // this same box (e.g. no-reply@verygoodadblock.org ->
-            // chris@verygoodadblock.org), is delivered straight to the local
-            // Maildir instead of being relayed back out over SMTP.
-            const is_local_forward = if (std.mem.indexOf(u8, forward_to, "@")) |at_pos|
-                self.config.isLocalDomain(forward_to[at_pos + 1 ..])
-            else
-                true;
-
-            if (is_local_forward) {
-                // Local forward: save directly to recipient's mailbox.
-                // Mirror inbound delivery's isolation rule so the copy lands
-                // in the right Maildir: if the full target address is itself a
-                // registered user (per-domain isolated mailbox, e.g.
-                // chris@verygoodadblock.org) key off the full address;
-                // otherwise resolve the local-part through the aliases file
-                // (role mailboxes like postmaster@, abuse@).
-                const fwd_is_isolated = if (self.auth_backend) |ab|
-                    (ab.db.userExists(forward_to) catch false)
-                else
-                    false;
-                const fwd_username = if (fwd_is_isolated)
-                    try self.allocator.dupe(u8, forward_to)
-                else if (std.mem.indexOf(u8, forward_to, "@")) |at_pos|
-                    try aliases.resolve(self.allocator, forward_to[0..at_pos])
-                else
-                    try aliases.resolve(self.allocator, forward_to);
-                defer self.allocator.free(fwd_username);
-                try maildir_path.validate(fwd_username);
-
-                const cwd = fs_compat.cwd();
-                const fwd_dir = std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{fwd_username}) catch return error.OutOfMemory;
-                defer self.allocator.free(fwd_dir);
-                cwd.makePath(fwd_dir) catch return error.ForwardDirectoryFailed;
-
-                var fwd_base_buf: [64]u8 = undefined;
-                const fwd_basename = maildirBasename(&fwd_base_buf) catch return error.ForwardNameFailed;
-                const fwd_filename = std.fmt.allocPrint(self.allocator, "mail/{s}/new/{s}", .{ fwd_username, fwd_basename }) catch return error.OutOfMemory;
-                defer self.allocator.free(fwd_filename);
-
-                durable_maildir.write(self.allocator, fwd_filename, data) catch |err| {
-                    self.logger.err("Failed to save message: {}", .{err});
-                    return err;
-                };
-                self.logger.info("Local forward from {s} to {s} saved to {s}", .{ username, fwd_username, fwd_filename });
-            } else {
-                // External forward: relay via SES. Bound the number of in-flight
-                // worker threads to avoid resource exhaustion.
-                if (!tryReserveOutboundSlot()) {
-                    self.logger.warn("Outbound worker limit reached; queueing forward to {s}", .{forward_to});
-                    retry.enqueueFailure(sender, forward_to, data);
-                    continue;
-                }
-                const bg = self.allocator.create(OutboundContext) catch {
-                    releaseOutboundSlot();
-                    retry.enqueueFailure(sender, forward_to, data);
-                    continue;
-                };
-                bg.* = .{
-                    .allocator = self.allocator,
-                    .from = self.allocator.dupe(u8, sender) catch {
-                        self.allocator.destroy(bg);
-                        releaseOutboundSlot();
-                        retry.enqueueFailure(sender, forward_to, data);
-                        continue;
-                    },
-                    .to = self.allocator.dupe(u8, forward_to) catch {
-                        self.allocator.free(bg.from);
-                        self.allocator.destroy(bg);
-                        releaseOutboundSlot();
-                        retry.enqueueFailure(sender, forward_to, data);
-                        continue;
-                    },
-                    .data = self.allocator.dupe(u8, data) catch {
-                        self.allocator.free(bg.from);
-                        self.allocator.free(bg.to);
-                        self.allocator.destroy(bg);
-                        releaseOutboundSlot();
-                        retry.enqueueFailure(sender, forward_to, data);
-                        continue;
-                    },
-                    .hostname = self.config.hostname,
-                    .delivery_method = self.config.delivery_method,
-                    .ses_region = self.config.ses_region,
-                };
-                const thread = std.Thread.spawn(.{}, outboundWorker, .{bg}) catch |err| {
-                    self.logger.err("Failed to spawn forward thread to {s}: {}", .{ forward_to, err });
-                    self.allocator.free(bg.data);
-                    self.allocator.free(bg.to);
-                    self.allocator.free(bg.from);
-                    self.allocator.destroy(bg);
-                    releaseOutboundSlot();
-                    retry.enqueueFailure(sender, forward_to, data);
-                    continue;
-                };
-                thread.detach();
+            const primary_count = plan.targets.items.len;
+            for (0..primary_count) |index| {
+                const target = plan.targets.items[index];
+                if (target.mailbox.len > 0 and target.forward_allowed) try plan.forward(index, sender, self.config.hostname, &self.config, identity);
             }
+            const now = time_compat.timestamp();
+            try plan.vacationReplies(primary_count, sender, self.config.hostname, &self.config, identity, now);
+            try db.acceptDelivery(.{
+                .id = &id,
+                .from = sender,
+                .author = identity.author,
+                .verified_author = identity.verified,
+                .notification_origin = self.remote_addr,
+                .mime = data,
+                .accepted_at = now,
+                .accepted_ms = time_compat.milliTimestamp(),
+                .targets = plan.targets.items,
+                .sender = self.authenticated_username,
+                .charge_recipients = self.rcpt_to.items.len,
+            });
         }
+        routing.publish(self.allocator, db, &id);
     }
 };
 
@@ -3183,6 +2824,7 @@ const SmtpTestHarness = struct {
     prev_cwd_len: usize = 0,
     log: logger.Logger,
     rate_limiter: security.RateLimiter,
+    delivery_db: database.Database,
     peer: c_int,
     session: Session,
 
@@ -3206,6 +2848,8 @@ const SmtpTestHarness = struct {
 
         h.log = try logger.Logger.init(allocator, .critical, null);
         h.rate_limiter = security.RateLimiter.init(allocator, 60, 1000, 1000, 3600);
+        h.delivery_db = try database.Database.init(allocator, ":memory:");
+        errdefer h.delivery_db.deinit();
 
         var fds: [2]c_int = undefined;
         if (std.c.socketpair(std.posix.AF.UNIX, @intCast(@as(u32, std.posix.SOCK.STREAM)), 0, &fds) != 0) return error.SocketPairFailed;
@@ -3246,6 +2890,7 @@ const SmtpTestHarness = struct {
             .spam_filter_enabled = false,
         };
         h.session = try Session.init(allocator, .{ .fd = fds[0] }, cfg, &h.log, "127.0.0.1", &h.rate_limiter, null, null, null);
+        h.session.delivery_db = &h.delivery_db;
         return h;
     }
 
@@ -3253,6 +2898,7 @@ const SmtpTestHarness = struct {
         const allocator = h.allocator;
         _ = std.c.close(h.session.connection.fd);
         h.session.deinit();
+        h.delivery_db.deinit();
         _ = std.c.close(h.peer);
         h.rate_limiter.deinit();
         h.log.deinit();
@@ -3426,8 +3072,9 @@ test "security: Maildir writes reject traversal from recipients and forwards" {
     defer h.destroy();
     h.session.mail_from = try a.dupe(u8, "sender@example.com");
     try h.session.rcpt_to.append(a, try a.dupe(u8, "../escape@test.local"));
-    try std.testing.expectError(error.InvalidMailboxPath, h.session.saveMessage("subject: test\n\nbody", false));
-    try std.testing.expectError(error.InvalidMailboxPath, h.session.forwardMessage("uplink", "sender@example.com", "body", "../escape@test.local"));
+    try std.testing.expectError(error.InvalidMailboxPath, h.session.saveMessage("subject: test\n\nbody", false, false));
+    var plan: routing.Plan = .{ .allocator = a, .db = h.session.delivery_db.?, .bytes = 4 };
+    try std.testing.expectError(error.InvalidMailboxPath, plan.addLocal(.{ .recipient = "../escape@test.local", .mailbox = "../escape", .folder = "new" }));
 }
 
 test "security: STARTTLS clears the plaintext envelope identity and buffered commands" {
@@ -3534,7 +3181,6 @@ test "security: legacy sender names cannot claim an isolated mailbox" {
     const a = std.testing.allocator;
     const h = try SmtpTestHarness.create(a, 4096);
     defer h.destroy();
-    const database = @import("../storage/database.zig");
     var db = try database.Database.init(a, ":memory:");
     defer db.deinit();
     _ = try db.createUser("info", "unused", "info@test.local");

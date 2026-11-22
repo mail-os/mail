@@ -7,7 +7,9 @@ const env = @import("core/env.zig");
 const database = @import("storage/database.zig");
 const auth = @import("auth/auth.zig");
 const greylist_mod = @import("antispam/greylist.zig");
+const clamav = @import("antispam/clamav.zig");
 const delivery_retry = @import("delivery/retry.zig");
+const local_routing = @import("delivery/local_routing.zig");
 const imap = @import("protocol/imap.zig");
 const caldav = @import("protocol/caldav.zig");
 const caldav_store_mod = @import("storage/caldav_store.zig");
@@ -177,10 +179,13 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     defer global_reload_manager = null;
     log.info("Hot reload manager initialized (send SIGHUP to reload configuration)", .{});
 
-    // Initialize database and auth backend if auth is enabled
-    var db: ?database.Database = null;
+    // The acceptance journal is needed on SMTP-only installations, too.
+    const db_path = env.get("SMTP_DB_PATH") orelse "./smtp.db";
+    log.info("Initializing database at: {s}", .{db_path});
+    var db = try database.Database.init(allocator, db_path);
+    defer db.deinit();
     var auth_backend: ?auth.AuthBackend = null;
-    var db_ptr: ?*database.Database = null;
+    const db_ptr: ?*database.Database = &db;
     var auth_ptr: ?*auth.AuthBackend = null;
 
     // The database and auth backend exist whenever *anything* needs them, and
@@ -193,15 +198,12 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     // That combination is not exotic. It is exactly a development mail catcher:
     // no SMTP AUTH, because there are no accounts to authenticate, and a
     // webmail UI, because reading the caught mail is the entire point.
-    if (cfg.enable_auth or cfg.enable_webmail) {
-        const db_path = env.get("SMTP_DB_PATH") orelse "./smtp.db";
-        log.info("Initializing database at: {s}", .{db_path});
-
-        db = try database.Database.init(allocator, db_path);
-        errdefer if (db) |*d| d.deinit();
-
-        db_ptr = &db.?;
-        auth_backend = auth.AuthBackend.init(allocator, db_ptr.?);
+    const provisioning_port: ?u16 = if (env.get("SMTP_PROVISIONING_PORT")) |value|
+        std.fmt.parseInt(u16, value, 10) catch return error.InvalidProvisioningPort
+    else
+        null;
+    if (cfg.enable_auth or cfg.enable_webmail or provisioning_port != null) {
+        auth_backend = auth.AuthBackend.init(allocator, &db);
         const auth_default_domain = cfg.auth_default_domain orelse if (std.mem.indexOfScalar(u8, cfg.hostname, '.')) |dot|
             cfg.hostname[dot + 1 ..]
         else
@@ -239,15 +241,22 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         log.info("Authentication disabled", .{});
     }
 
-    defer if (db) |*d| d.deinit();
-
-    // Start the outbound retry + DSN pipeline (persistent queue in the main
-    // DB; failed first attempts get exponential-backoff retries, and a
-    // permanent failure delivers a bounce to the local sender).
-    if (db_ptr) |dptr| {
-        delivery_retry.start(allocator, dptr, cfg.hostname, cfg.extra_local_domains, cfg.delivery_method, cfg.ses_region) catch |err| {
-            log.warn("Outbound retry pipeline failed to start: {} (failed deliveries will be dropped)", .{err});
-        };
+    // Recover published copies before clients can move or delete them.
+    try local_routing.recover(allocator, &db);
+    try delivery_retry.start(allocator, &db, cfg.hostname, cfg.extra_local_domains, cfg.delivery_method, cfg.ses_region);
+    defer delivery_retry.stop();
+    var stop_routing: std.atomic.Value(bool) = .init(false);
+    const recovery_thread = try std.Thread.spawn(.{}, local_routing.runRecovery, .{ allocator, &db, &stop_routing });
+    defer {
+        stop_routing.store(true, .release);
+        recovery_thread.join();
+    }
+    const effects_thread = try std.Thread.spawn(.{}, local_routing.runEffects, .{
+        allocator, &db, &stop_routing, &reload_manager, &log,
+    });
+    defer {
+        stop_routing.store(true, .release);
+        effects_thread.join();
     }
 
     // Initialize greylisting if enabled
@@ -506,6 +515,18 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     }
     defer if (managesieve_server) |*ms| ms.deinit();
 
+    var content_scanner = if (cfg.clamav_scan) |scanner_config|
+        try clamav.ClamAVScanner.init(allocator, scanner_config)
+    else
+        null;
+    defer if (content_scanner) |*scanner| scanner.deinit();
+    const scanner: ?*clamav.ClamAVScanner = if (content_scanner) |*active| active else null;
+    if (scanner) |active| {
+        log.info("Malware scanning enabled (transport={s}, fail mode={s}, scan limit={d} bytes)", .{
+            @tagName(active.config.transport), @tagName(active.config.fail_mode), active.config.max_stream_bytes,
+        });
+    }
+
     // Initialize Webmail HTTP server (browser client API). Requires auth+DB.
     var webmail_server: ?webmail_http.WebmailHttpServer = null;
     var webmail_thread: ?std.Thread = null;
@@ -524,6 +545,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
                 .max_attachment_total_bytes = cfg.webmail_attachment_max_total,
                 .max_attachment_count = cfg.webmail_attachment_max_count,
                 .undo_send_seconds = cfg.webmail_undo_send_seconds,
+                .scanner = scanner,
                 // Outbound send settings: mirror the server's so webmail mail is
                 // delivered + DKIM-signed identically to SMTP submission.
                 .hostname = cfg.hostname,
@@ -542,6 +564,31 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     }
     defer if (webmail_server) |*ws| ws.deinit();
 
+    var provisioning_server: ?webmail_http.WebmailHttpServer = null;
+    var provisioning_thread: ?std.Thread = null;
+    defer if (provisioning_server) |*listener| {
+        listener.requestStop();
+        if (provisioning_thread) |thread| thread.join();
+        listener.deinit();
+    };
+    if (provisioning_port) |port| {
+        const token = env.get("SMTP_PROVISIONING_TOKEN") orelse return error.MissingProvisioningToken;
+        const domain = env.get("SMTP_PROVISIONING_DOMAIN") orelse return error.MissingProvisioningDomain;
+        if (port == 0 or port == cfg.port or (cfg.enable_webmail and port == cfg.webmail_port) or
+            cfg.catch_all or !cfg.isLocalDomain(domain)) return error.InvalidProvisioningConfiguration;
+        provisioning_server = try webmail_http.WebmailHttpServer.init(allocator, .{
+            .port = port,
+            .mail_config = &cfg,
+            .provisioning = .{ .token = token, .domain = domain },
+        }, db_ptr.?, auth_ptr.?);
+        try provisioning_server.?.bind();
+        provisioning_thread = try std.Thread.spawn(.{}, struct {
+            fn run(listener: *webmail_http.WebmailHttpServer) void {
+                listener.start() catch |err| std.log.err("Provisioning listener stopped: {}", .{err});
+            }
+        }.run, .{&provisioning_server.?});
+    }
+
     // Initialize Milter support
     _ = cfg.enable_milter; // Used by protocol.zig hooks
     if (cfg.enable_milter) {
@@ -551,6 +598,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     // Create and start SMTP server
     var server = try smtp.Server.init(allocator, cfg, &log, db_ptr, auth_ptr, greylist_ptr);
     defer server.deinit();
+    server.scanner = scanner;
 
     // Start SMTPS (port 465) if TLS is enabled
     var smtps_thread: ?std.Thread = null;
@@ -592,12 +640,14 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
             .max_connections = @intCast(cfg.max_connections),
             .cert_path = cfg.tls_cert_path,
             .key_path = cfg.tls_key_path,
+            .junk_folder = cfg.junkFolder(),
             .enable_gmail_labels = if (env.get("IMAP_GMAIL_LABELS_ENABLED")) |value|
                 std.ascii.eqlIgnoreCase(value, "true") or std.mem.eql(u8, value, "1")
             else
                 true,
         };
         imap_server = imap.ImapServer.init(allocator, imap_config, auth_ptr.?, db_ptr);
+        imap_server.?.scanner = scanner;
         log.info("IMAP server configured on port {d}", .{imap_port});
         if (cfg.enable_tls and cfg.tls_cert_path != null) {
             log.info("IMAPS server configured on port {d} (SSL/TLS)", .{imaps_port});
@@ -632,10 +682,15 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         // Persist CalDAV/CardDAV data to SQLite so calendars/contacts survive
         // restarts (and so the ActiveSync server has real data to sync).
         const caldav_db_path = env.get("CALDAV_DB_PATH") orelse "./caldav.db";
-        caldav_store_inst = try caldav_store_mod.CalDavStore.init(allocator, .{ .db_path = caldav_db_path, .account_db = db_ptr.? });
+        var store_config = caldav_store_mod.StoreConfig{ .db_path = caldav_db_path, .account_db = db_ptr.? };
+        if (env.get("CALDAV_MAX_SYNC_HISTORY")) |value| {
+            store_config.max_sync_history = std.fmt.parseInt(u32, value, 10) catch store_config.max_sync_history;
+        }
+        caldav_store_inst = try caldav_store_mod.CalDavStore.init(allocator, store_config);
         log.info("CalDAV/CardDAV store persisting to: {s}", .{caldav_db_path});
 
         const caldav_config = caldav.CalDavConfig{
+            .scanner = scanner,
             .port = caldav_port,
             .ssl_port = caldav_ssl_port,
             // Same reason as IMAP above: honour the interface the server was
@@ -653,6 +708,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
             // MTA-STS policy mode (default enforce); override with MTA_STS_MODE=testing.
             .mta_sts_mode = env.get("MTA_STS_MODE") orelse "enforce",
             .delivery_method = cfg.delivery_method,
+            .mail_config = &cfg,
             .ses_region = cfg.ses_region,
         };
         caldav_server = caldav.CalDavServer.init(allocator, caldav_config, auth_ptr.?, &caldav_store_inst.?);

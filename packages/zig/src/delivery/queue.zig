@@ -44,6 +44,7 @@ pub const QueuedMessage = struct {
     created_at: i64,
     updated_at: i64,
     error_message: ?[]const u8,
+    hosted_user_id: i64 = 0,
 
     pub fn deinit(self: *QueuedMessage, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -113,7 +114,8 @@ pub const MessageQueue = struct {
                 \\    next_retry INTEGER NOT NULL,
                 \\    created_at INTEGER NOT NULL,
                 \\    updated_at INTEGER NOT NULL,
-                \\    error_message TEXT
+                \\    error_message TEXT,
+                \\    hosted_user_id INTEGER NOT NULL DEFAULT 0
                 \\);
                 \\
                 \\CREATE INDEX IF NOT EXISTS idx_queue_status ON message_queue(status);
@@ -121,72 +123,70 @@ pub const MessageQueue = struct {
             ;
 
             try db.exec(schema);
+            db.exec("ALTER TABLE message_queue ADD COLUMN hosted_user_id INTEGER NOT NULL DEFAULT 0") catch {};
         }
     }
 
     /// Load messages from database into memory
     fn loadFromDB(self: *MessageQueue) !void {
         if (self.db) |db| {
-            const query =
-                \\SELECT id, from_addr, to_addr, message_data, status, attempts,
-                \\       max_attempts, next_retry, created_at, updated_at, error_message
-                \\FROM message_queue
-                \\WHERE status IN ('pending', 'retry', 'processing')
-                \\ORDER BY created_at ASC
-            ;
-
-            var stmt = try db.prepare(query);
+            const query = queueColumns ++ " WHERE status IN ('pending','retry','processing') ORDER BY created_at";
+            const stmt = try db.prepare(query);
             defer stmt.finalize();
-
             var max_id: u64 = 0;
-
             while (try stmt.step()) {
-                const msg = try self.allocator.create(QueuedMessage);
-                errdefer self.allocator.destroy(msg);
-
-                const id = stmt.columnText(0);
-                const from_addr = stmt.columnText(1);
-                const to_addr = stmt.columnText(2);
-                const message_data = stmt.columnText(3);
-                const status_str = stmt.columnText(4);
-                const error_msg_text = stmt.columnText(10);
-
-                const owned_id = try self.allocator.dupe(u8, id);
-                errdefer self.allocator.free(owned_id);
-                const owned_from = try self.allocator.dupe(u8, from_addr);
-                errdefer self.allocator.free(owned_from);
-                const owned_to = try self.allocator.dupe(u8, to_addr);
-                errdefer self.allocator.free(owned_to);
-                const owned_data = try self.allocator.dupe(u8, message_data);
-                errdefer self.allocator.free(owned_data);
-                const owned_error = if (error_msg_text.len > 0) try self.allocator.dupe(u8, error_msg_text) else null;
-                errdefer if (owned_error) |value| self.allocator.free(value);
-                const status = try MessageStatus.fromString(status_str);
-                msg.* = .{
-                    .id = owned_id,
-                    .from = owned_from,
-                    .to = owned_to,
-                    .data = owned_data,
-                    .status = if (status == .processing) .pending else status,
-                    .attempts = @intCast(stmt.columnInt64(5)),
-                    .max_attempts = @intCast(stmt.columnInt64(6)),
-                    .next_retry = stmt.columnInt64(7),
-                    .created_at = stmt.columnInt64(8),
-                    .updated_at = stmt.columnInt64(9),
-                    .error_message = owned_error,
-                };
-
-                try self.messages.append(self.allocator, msg);
-                errdefer _ = self.messages.pop();
-                try self.index.put(self.allocator, msg.id, self.messages.items.len - 1);
-
-                // Track highest ID for next_id
-                if (std.fmt.parseInt(u64, id, 10)) |id_num| {
-                    if (id_num > max_id) max_id = id_num;
+                try self.appendFromDB(stmt);
+                if (std.fmt.parseInt(u64, stmt.columnText(0), 10)) |id| {
+                    max_id = @max(max_id, id);
                 } else |_| {}
             }
-
             self.next_id = max_id + 1;
+        }
+    }
+
+    const queueColumns = "SELECT id,from_addr,to_addr,message_data,status,attempts,max_attempts,next_retry,created_at,updated_at,error_message,hosted_user_id FROM message_queue";
+
+    fn appendFromDB(self: *MessageQueue, stmt: database.Statement) !void {
+        const msg = try self.allocator.create(QueuedMessage);
+        errdefer self.allocator.destroy(msg);
+        const id = try self.allocator.dupe(u8, stmt.columnText(0));
+        errdefer self.allocator.free(id);
+        const from = try self.allocator.dupe(u8, stmt.columnText(1));
+        errdefer self.allocator.free(from);
+        const to = try self.allocator.dupe(u8, stmt.columnText(2));
+        errdefer self.allocator.free(to);
+        const data = try self.allocator.dupe(u8, stmt.columnBlob(3));
+        errdefer self.allocator.free(data);
+        const message = stmt.columnText(10);
+        const previous_error = if (message.len > 0) try self.allocator.dupe(u8, message) else null;
+        errdefer if (previous_error) |value| self.allocator.free(value);
+        const status = try MessageStatus.fromString(stmt.columnText(4));
+        msg.* = .{
+            .id = id,
+            .from = from,
+            .to = to,
+            .data = data,
+            .status = if (status == .processing) .pending else status,
+            .attempts = @intCast(stmt.columnInt64(5)),
+            .max_attempts = @intCast(stmt.columnInt64(6)),
+            .next_retry = stmt.columnInt64(7),
+            .created_at = stmt.columnInt64(8),
+            .updated_at = stmt.columnInt64(9),
+            .error_message = previous_error,
+            .hosted_user_id = stmt.columnInt64(11),
+        };
+        try self.messages.append(self.allocator, msg);
+        errdefer _ = self.messages.pop();
+        try self.index.put(self.allocator, id, self.messages.items.len - 1);
+    }
+
+    fn loadDueAcceptances(self: *MessageQueue, now: i64) !void {
+        const db = self.db orelse return;
+        const stmt = try db.prepare(queueColumns ++ " WHERE id GLOB 'route-*' AND status='pending' AND next_retry<=?1 ORDER BY created_at LIMIT 16");
+        defer stmt.finalize();
+        try stmt.bind(1, now);
+        while (try stmt.step()) {
+            if (!self.index.contains(stmt.columnText(0))) try self.appendFromDB(stmt);
         }
     }
 
@@ -196,8 +196,8 @@ pub const MessageQueue = struct {
             const sql =
                 \\INSERT OR REPLACE INTO message_queue
                 \\(id, from_addr, to_addr, message_data, status, attempts, max_attempts,
-                \\ next_retry, created_at, updated_at, error_message)
-                \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                \\ next_retry, created_at, updated_at, error_message, hosted_user_id)
+                \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ;
 
             var stmt = try db.prepare(sql);
@@ -206,7 +206,7 @@ pub const MessageQueue = struct {
             try stmt.bind(1, msg.id);
             try stmt.bind(2, msg.from);
             try stmt.bind(3, msg.to);
-            try stmt.bind(4, msg.data);
+            try stmt.bindBlob(4, msg.data);
             try stmt.bind(5, msg.status.toString());
             try stmt.bind(6, @as(i64, @intCast(msg.attempts)));
             try stmt.bind(7, @as(i64, @intCast(msg.max_attempts)));
@@ -214,22 +214,15 @@ pub const MessageQueue = struct {
             try stmt.bind(9, msg.created_at);
             try stmt.bind(10, msg.updated_at);
             try stmt.bind(11, msg.error_message orelse "");
+            try stmt.bind(12, msg.hosted_user_id);
 
             _ = try stmt.step();
         }
     }
 
     /// Delete message from database
-    fn deleteFromDB(self: *MessageQueue, id: []const u8) !void {
-        if (self.db) |db| {
-            const sql = "DELETE FROM message_queue WHERE id = ?1";
-
-            var stmt = try db.prepare(sql);
-            defer stmt.finalize();
-
-            try stmt.bind(1, id);
-            _ = try stmt.step();
-        }
+    fn deleteFromDB(self: *MessageQueue, id: []const u8, delivered: bool) !void {
+        if (self.db) |db| try db.finishQueuedDelivery(id, delivered);
     }
 
     pub fn deinit(self: *MessageQueue) void {
@@ -251,6 +244,10 @@ pub const MessageQueue = struct {
         to: []const u8,
         data: []const u8,
     ) ![]const u8 {
+        return self.enqueueForHostedUser(from, to, data, 0);
+    }
+
+    pub fn enqueueForHostedUser(self: *MessageQueue, from: []const u8, to: []const u8, data: []const u8, hosted_user_id: i64) ![]const u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -282,6 +279,7 @@ pub const MessageQueue = struct {
             .created_at = now,
             .updated_at = now,
             .error_message = null,
+            .hosted_user_id = hosted_user_id,
         };
 
         try self.messages.append(self.allocator, msg);
@@ -315,6 +313,7 @@ pub const MessageQueue = struct {
         defer self.mutex.unlock();
 
         const now = time_compat.timestamp();
+        self.loadDueAcceptances(now) catch |err| std.log.err("could not load accepted outbound deliveries: {}", .{err});
 
         for (self.messages.items) |msg| {
             if ((msg.status == .pending or msg.status == .retry) and msg.next_retry <= now) {
@@ -345,7 +344,7 @@ pub const MessageQueue = struct {
         msg.updated_at = time_compat.timestamp();
 
         // Delete from database
-        try self.deleteFromDB(id);
+        try self.deleteFromDB(id, true);
 
         // Remove from queue after successful delivery
         self.removeAt(i);
@@ -384,9 +383,7 @@ pub const MessageQueue = struct {
         updated.updated_at = now;
 
         if (msg.attempts >= msg.max_attempts) {
-            updated.status = .failed;
-            try self.persistMessage(&updated);
-            try self.deleteFromDB(id);
+            try self.deleteFromDB(id, false);
             self.removeAt(i);
             self.allocator.free(next_error);
             return .permanent;
@@ -399,6 +396,33 @@ pub const MessageQueue = struct {
             msg.* = updated;
             return .scheduled;
         }
+    }
+
+    pub fn markRejected(self: *MessageQueue, id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const i = self.index.get(id) orelse return error.MessageNotFound;
+        const msg = self.messages.items[i];
+        errdefer {
+            msg.status = .retry;
+            msg.next_retry = time_compat.timestamp() + 60;
+        }
+        try self.deleteFromDB(id, false);
+        self.removeAt(i);
+    }
+
+    /// Release a claim held by a suspended sender without spending a retry.
+    pub fn hold(self: *MessageQueue, id: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const i = self.index.get(id) orelse return error.MessageNotFound;
+        const msg = self.messages.items[i];
+        msg.status = .retry;
+        msg.attempts -|= 1;
+        msg.updated_at = time_compat.timestamp();
+        msg.next_retry = msg.updated_at + 60;
+        try self.persistMessage(msg);
     }
 
     /// Get queue statistics
@@ -550,6 +574,38 @@ test "security: restart recovers persisted worker claims" {
     var restored = try MessageQueue.initWithDB(a, &db);
     defer restored.deinit();
     try std.testing.expect(restored.getNextPending() != null);
+}
+
+test "accepted outbound copy waits for its local source and checkpoints its final outcome" {
+    const t = std.testing;
+    var db = try database.Database.init(t.allocator, ":memory:");
+    defer db.deinit();
+    var queue = try MessageQueue.initWithDB(t.allocator, &db);
+    defer queue.deinit();
+    const id: []const u8 = "00000000000000000000000000000001";
+    const raw = "Subject: binary\r\n\r\n\x00\xff";
+    try db.acceptDelivery(.{
+        .id = id,
+        .from = "sender@example.test",
+        .mime = raw,
+        .accepted_at = time_compat.timestamp(),
+        .accepted_ms = time_compat.milliTimestamp(),
+        .targets = &.{
+            .{ .recipient = "local@example.test", .mailbox = "local", .folder = "new" },
+            .{ .recipient = "remote@example.test", .forward_after = 0, .forward_owner = "local" },
+        },
+    });
+    try t.expect(queue.getNextPending() == null);
+    try db.finishDeliveryTarget(id, 0, "filed", .{ .basename = "fixture.eml" });
+    const message = queue.getNextPending() orelse return error.MissingQueuedDelivery;
+    try t.expectEqualSlices(u8, raw, message.data);
+    try queue.markDelivered(message.id);
+    const outcome = try db.prepare("SELECT outcome FROM accepted_mail_targets WHERE delivery_id=?1 AND ordinal=1");
+    defer outcome.finalize();
+    try outcome.bind(1, id);
+    try t.expect(try outcome.step());
+    try t.expectEqualStrings("remote_delivered", outcome.columnText(0));
+    try t.expect(queue.getNextPending() == null);
 }
 
 fn allocationFailureLoad(a: std.mem.Allocator, db: *database.Database) !void {

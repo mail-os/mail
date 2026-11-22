@@ -463,9 +463,38 @@ SMTP_GREETING_TIMEOUT_SECONDS=10
   single DNSBL listing scores ~6 (→ Junk, not rejected, on its own).
 
 #### SMTP_JUNK_FOLDER
-- **Description:** Maildir subfolder spam is delivered into (`mail/<user>/<folder>/`).
+- **Description:** Maildir subfolder for the spam filter and webmail's **Mark junk** action (`mail/<user>/<folder>/`). IMAP advertises it as the `\Junk` mailbox. Use a non-reserved name with letters, digits, spaces, underscores, or hyphens.
 - **Type:** String
 - **Default:** `Junk`
+
+#### Malware scanning
+
+Set `SMTP_CLAMAV_TRANSPORT` to scan SMTP DATA and BDAT LAST, including
+authenticated submissions, IMAP APPEND, ActiveSync mail sending, CalDAV and
+CardDAV PUT, and webmail attachments. ClamAV and zavd speak the same scanner protocol.
+The transport accepts a Unix socket path such as `unix:/run/clamav/clamd.ctl` or
+an IP and port such as `tcp:127.0.0.1:3310`. Restart Mail after changing the
+scanner settings.
+
+| Variable | Default | Behavior |
+| --- | --- | --- |
+| `SMTP_CLAMAV_TRANSPORT` | Unset | Enables the scanner and selects its socket. |
+| `SMTP_CLAMAV_FAIL_MODE` | `open` | `open` allows delivery if the scanner fails or cannot scan the message size. `closed` defers failures and refuses messages beyond the scan limit. |
+| `SMTP_CLAMAV_CONNECT_TIMEOUT_MS` | `2000` | Deadline for connecting to the scanner. |
+| `SMTP_CLAMAV_TIMEOUT_MS` | `30000` | Deadline for sending the message and reading the verdict after connecting. |
+| `SMTP_CLAMAV_MAX_STREAM_BYTES` | `26214400` | Maximum bytes streamed to the scanner. Match this to the daemon's stream limit and the SMTP message limit, allowing for server-added headers. |
+
+Mail refuses infected messages with SMTP `554` and the signature name in either
+fail mode. Fail-closed uses `451` when the scanner is unavailable and `552` when
+the message exceeds the scanner's size limit. Accepted mail carries a server
+`X-Virus-Scanned` header with `clean`, `unavailable`, or `too-large`.
+
+IMAP refuses a blocked APPEND with a tagged `NO`. ActiveSync scans the final
+MIME for SendMail, SmartReply, and SmartForward, including original attachments
+added by the server. The HTTP CalDAV and CardDAV resource handlers check the
+resource body and inline binary values before writing. DAV PUT and webmail
+attachment requests return HTTP `422` for an infected payload, `413` for a size
+refusal, and `503` when fail-closed scanning needs a retry.
 
 #### SMTP_ENABLE_DNSBL
 - **Description:** Enable DNSBL/RBL checking of the connecting IP. When enabled,

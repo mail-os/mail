@@ -23,9 +23,18 @@
 //! correctness-sensitive module.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const categories = @import("../message/categories.zig");
+const attention = @import("webmail_attention.zig");
+const search_index = @import("webmail_index.zig");
+const html_text = @import("../antispam/html_text.zig");
+const thread_ids = @import("../message/thread_ids.zig");
+const typesense = @import("../search/typesense.zig");
 const ascii_compat = @import("ascii-compat");
 const fs_compat = @import("../core/fs_compat.zig");
+const hosted_limits = @import("../storage/hosted_limits.zig");
 const database = @import("../storage/database.zig");
+const message_refs = @import("../storage/message_refs.zig");
 const imap = @import("../protocol/imap.zig");
 const time_compat = @import("../core/time_compat.zig");
 
@@ -34,11 +43,14 @@ pub const MaildirError = error{
     MessageNotFound,
     WriteFailed,
     Conflict,
+    RevisionMismatch,
 };
 
 /// The set of folders webmail exposes. Order is the display order.
 pub const standard_folders = [_][]const u8{
     "INBOX",
+    "Newsletters",
+    "Receipts",
     "Sent",
     "Drafts",
     "Trash",
@@ -78,11 +90,21 @@ pub const MessageSummary = struct {
     references: []const u8 = "",
     timestamp: i64 = 0,
     matches_filters: bool = true,
+    snapshot: ?SummarySnapshot = null,
+    attention_deadline: i64 = 0,
+    indexed_attachments: []const search_index.Attachment = &.{},
+    personal_subject: ?[]const u8 = null,
+    manual_component: ?[]const u8 = null,
 };
+
+const SummarySnapshot = struct { file: FileRef, stamp: []const u8, digest: [64]u8, fingerprint: ?[]const u8 = null };
 
 /// A fully parsed message for the reading pane.
 pub const MessageDetail = struct {
     uid: i64,
+    folder: []const u8 = "INBOX",
+    timestamp: i64 = 0,
+    version: ?MessageVersion = null,
     from: []const u8,
     to: []const u8,
     cc: []const u8,
@@ -103,11 +125,31 @@ pub const MessageDetail = struct {
     size: u64,
 };
 
+pub const MessageVersion = struct { reference: []const u8, revision: []const u8 };
+
+pub const MessageLocator = struct { folder: []const u8, uid: i64 };
+
+pub const SummaryLocation = struct { folder: []const u8, basename: []const u8, stamp: []const u8 };
+
+pub fn summaryLocation(row: MessageSummary) ?SummaryLocation {
+    const snapshot = row.snapshot orelse return null;
+    const location = message_refs.location(row.folder, snapshot.file.name);
+    return .{ .folder = location.folder, .basename = location.basename, .stamp = snapshot.stamp };
+}
+
+pub fn isPersonalFolder(folder: []const u8) bool {
+    for ([_][]const u8{ "Drafts", "Screening", "Declined" }) |hidden| {
+        if (std.ascii.eqlIgnoreCase(folder, hidden)) return false;
+    }
+    return true;
+}
+
 pub const AttachmentInfo = struct {
     filename: []const u8,
     content_type: []const u8,
     size: usize,
     data: []const u8 = "",
+    content_id: []const u8 = "",
 };
 
 /// Validate a folder name against path traversal and separators. We only allow
@@ -144,6 +186,8 @@ const FileRef = struct {
     dir: []const u8,
     name: []const u8,
 };
+
+const BodyMode = enum { preview, metadata, full };
 
 /// Collect the message files for a folder, in stable IMAP order. The returned
 /// slices are arena-allocated.
@@ -205,10 +249,15 @@ fn preassignUids(db: *database.Database, user: []const u8, folder: []const u8, r
     }
 }
 
-/// List the standard folders with total + unread counts.
-pub fn listFolders(allocator: std.mem.Allocator, user: []const u8) ![]FolderInfo {
+/// List visible standard and custom folders with total and unread counts.
+pub fn listFolders(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, junk_folder: []const u8) ![]FolderInfo {
     var out: std.ArrayList(FolderInfo) = .empty;
-    for (standard_folders) |folder| {
+    var names: std.ArrayList([]const u8) = .empty;
+    try names.appendSlice(allocator, try folderNames(allocator, db, user));
+    for (names.items) |folder| {
+        if (std.mem.eql(u8, folder, junk_folder)) break;
+    } else try names.append(allocator, junk_folder);
+    for (names.items) |folder| {
         const refs = collectFiles(allocator, user, folder) catch &[_]FileRef{};
         var unread: usize = 0;
         for (refs) |r| {
@@ -222,6 +271,16 @@ pub fn listFolders(allocator: std.mem.Allocator, user: []const u8) ![]FolderInfo
         });
     }
     return out.toOwnedSlice(allocator);
+}
+
+pub fn folderExists(allocator: std.mem.Allocator, user: []const u8, folder: []const u8) !bool {
+    if (!isValidFolderName(folder)) return false;
+    if (std.ascii.eqlIgnoreCase(folder, "INBOX")) return true;
+    const path = try std.fmt.allocPrintSentinel(allocator, "mail/{s}/{s}", .{ user, folder }, 0);
+    defer allocator.free(path);
+    const directory = std.c.opendir(path) orelse return false;
+    _ = std.c.closedir(directory);
+    return true;
 }
 
 /// List message summaries for a folder, newest first, paginated.
@@ -271,7 +330,7 @@ pub fn listMessagePage(
         const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ r.dir, r.name });
         const raw = fs_compat.readFileAlloc(a, path) catch continue;
         const headers = parseHeaders(a, raw) catch HeaderSet{};
-        const body = extractBody(a, raw, false) catch BodyParts{};
+        const body = extractBody(a, raw, .preview) catch BodyParts{};
         if (query.len > 0 and !matchesQuery(headers, body, query)) continue;
         const position = total;
         total += 1;
@@ -303,16 +362,41 @@ fn matchesQuery(headers: HeaderSet, body: BodyParts, query: []const u8) bool {
     return false;
 }
 
+pub const SearchMatch = struct { from: []const u8, to: []const u8, subject: []const u8, text: []const u8 };
+
+/// Search decoded headers and plain text without decoding binary attachments.
+pub fn matchMime(allocator: std.mem.Allocator, raw: []const u8, keywords: []const u8) !?SearchMatch {
+    const headers = try parseHeaders(allocator, raw);
+    const body = try extractBody(allocator, raw, .preview);
+    var terms = std.mem.tokenizeAny(u8, keywords, &std.ascii.whitespace);
+    while (terms.next()) |term| {
+        if (!matchesQuery(headers, body, term)) return null;
+    }
+    return .{ .from = headers.from, .to = headers.to, .subject = headers.subject, .text = body.text };
+}
+
 pub const QueryOptions = struct {
+    include_versions: bool = false,
     folder: []const u8 = "INBOX",
     query: []const u8 = "",
     sender: []const u8 = "",
+    recipient: []const u8 = "",
+    filename: []const u8 = "",
     after: ?i64 = null,
     before: ?i64 = null,
     unread: bool = false,
+    read: bool = false,
+    answered: bool = false,
     flagged: bool = false,
     attachments: bool = false,
     include_context: bool = false,
+    attention_snapshot: ?attention.Snapshot = null,
+    attention_view: ?attention.Kind = null,
+    headers_only: bool = false,
+    unread_queue: bool = false,
+    list_attachments: bool = false,
+    index_budget: usize = std.math.maxInt(usize),
+    index_progress: ?*search_index.Progress = null,
 };
 
 /// Includes custom folders already known to IMAP. All results stay within the
@@ -325,15 +409,69 @@ pub fn folderNames(allocator: std.mem.Allocator, db: *database.Database, user: [
     try s.bind(1, user);
     while (try s.step()) {
         const name = s.columnText(0);
-        if (!isValidFolderName(name)) continue;
+        if (!isValidFolderName(name) or std.ascii.eqlIgnoreCase(name, "Screening") or std.ascii.eqlIgnoreCase(name, "Declined")) continue;
         var exists = false;
-        for (names.items) |known| if (std.ascii.eqlIgnoreCase(known, name)) {
+        for (names.items) |known| {
+            // Existing custom folders may differ from the category only by
+            // case. Keep them searchable on case-sensitive Maildir volumes.
+            if (!std.ascii.eqlIgnoreCase(known, name)) continue;
+            if (categories.isCategory(known) and !std.mem.eql(u8, known, name) and
+                !try sameFolderDirectory(allocator, user, known, name)) continue;
             exists = true;
             break;
-        };
+        }
         if (!exists) try names.append(allocator, try allocator.dupe(u8, name));
     }
     return names.toOwnedSlice(allocator);
+}
+
+fn sameFolderDirectory(a: std.mem.Allocator, user: []const u8, first: []const u8, second: []const u8) !bool {
+    const left = try std.fmt.allocPrintSentinel(a, "mail/{s}/{s}", .{ user, first }, 0);
+    const right = try std.fmt.allocPrintSentinel(a, "mail/{s}/{s}", .{ user, second }, 0);
+    defer a.free(left);
+    defer a.free(right);
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var l = std.mem.zeroes(linux.Statx);
+        var r = std.mem.zeroes(linux.Statx);
+        if (linux.errno(linux.statx(linux.AT.FDCWD, left, linux.AT.SYMLINK_NOFOLLOW, .{ .INO = true }, &l)) != .SUCCESS or !l.mask.INO) return false;
+        if (linux.errno(linux.statx(linux.AT.FDCWD, right, linux.AT.SYMLINK_NOFOLLOW, .{ .INO = true }, &r)) != .SUCCESS or !r.mask.INO) return false;
+        return l.ino == r.ino and l.dev_major == r.dev_major and l.dev_minor == r.dev_minor;
+    }
+    var l: std.c.Stat = undefined;
+    var r: std.c.Stat = undefined;
+    if (std.c.fstatat(std.c.AT.FDCWD, left, &l, std.c.AT.SYMLINK_NOFOLLOW) != 0) return false;
+    if (std.c.fstatat(std.c.AT.FDCWD, right, &r, std.c.AT.SYMLINK_NOFOLLOW) != 0) return false;
+    return l.ino == r.ino and l.dev == r.dev;
+}
+
+/// Header-only conversation links across this account's visible mail. A
+/// private action can retain a link through an intermediate reply without
+/// reading or indexing every attachment in the account.
+pub fn conversationLinks(a: std.mem.Allocator, db: *database.Database, user: []const u8) ![][]const []const u8 {
+    var links: std.ArrayList([]const []const u8) = .empty;
+    var header: [32 * 1024]u8 = undefined;
+    for (try folderNames(a, db, user)) |folder| {
+        if (!isPersonalFolder(folder)) continue;
+        var scan = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scan.deinit();
+        for (try collectFiles(scan.allocator(), user, folder)) |ref| {
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const temporary = scratch.allocator();
+            const path = try std.fmt.allocPrint(temporary, "{s}/{s}", .{ ref.dir, ref.name });
+            const file = fs_compat.cwd().openFile(path, .{}) catch continue;
+            defer file.close();
+            const length = file.readAll(&header) catch continue;
+            const ids = try thread_ids.parse(temporary, header[0..length]);
+            const keys = try ids.keys(temporary);
+            if (keys.len < 2) continue;
+            const owned = try a.alloc([]const u8, keys.len);
+            for (keys, owned) |key, *item| item.* = try a.dupe(u8, key);
+            try links.append(a, owned);
+        }
+    }
+    return links.toOwnedSlice(a);
 }
 
 /// Scan once, filter before pagination, and avoid decoding binary attachments
@@ -342,26 +480,51 @@ pub fn queryMessages(allocator: std.mem.Allocator, db: *database.Database, user:
     const names = if (std.mem.eql(u8, options.folder, "*")) try folderNames(allocator, db, user) else blk: {
         if (!isValidFolderName(options.folder)) return MaildirError.InvalidFolderName;
         const one = try allocator.alloc([]const u8, 1);
-        one[0] = options.folder;
+        one[0] = if (std.ascii.eqlIgnoreCase(options.folder, "INBOX")) "INBOX" else options.folder;
         break :blk one;
     };
+    if (options.query.len > 0 or options.sender.len > 0 or options.recipient.len > 0 or options.filename.len > 0 or
+        options.attachments or options.list_attachments or options.after != null or options.before != null or
+        options.read or options.answered or options.flagged or (options.unread and !options.unread_queue))
+        return queryIndexed(allocator, db, user, names, options);
     var rows: std.ArrayList(MessageSummary) = .empty;
     for (names) |folder| {
+        if (options.unread_queue and std.ascii.eqlIgnoreCase(folder, "Drafts")) continue;
         _ = try db.getOrCreateMailbox(user, folder);
         const refs = try collectFiles(allocator, user, folder);
         preassignUids(db, user, folder, refs);
         for (refs, 0..) |ref, index| {
+            const basename = database.maildirBaseName(ref.name);
+            if (options.attention_view) |kind| {
+                if (!options.attention_snapshot.?.mayContain(kind, folder, basename)) continue;
+            }
             const flags = flagsFrom(ref.name);
+            if (options.unread_queue and flags.deleted) continue;
             const flags_match = !(options.unread and flags.seen) and !(options.flagged and !flags.flagged);
             if (!flags_match and !options.include_context) continue;
             var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer scratch.deinit();
             const a = scratch.allocator();
             const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ ref.dir, ref.name });
-            const raw = fs_compat.readFileAlloc(a, path) catch continue;
+            const stamped = options.include_versions or options.attention_snapshot != null;
+            const captured: FileSnapshot = if (stamped) snapFile(a, db, path) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            } else .{ .raw = fs_compat.readFileAlloc(a, path) catch continue, .stamp = "" };
+            const raw = captured.raw;
+            const attention_deadline: i64 = if (options.attention_view) |kind|
+                options.attention_snapshot.?.deadline(kind, folder, basename, captured.stamp) orelse continue
+            else
+                0;
+            if (options.attention_view == null and attention.isInboxView(options.folder)) {
+                if (options.attention_snapshot) |snapshot| {
+                    const status = snapshot.status("", folder, basename, captured.stamp, try thread_ids.parse(a, raw));
+                    if (status.muted or status.snooze_until != null) continue;
+                }
+            }
             const headers = parseHeaders(a, raw) catch HeaderSet{};
             const stamp = messageTimestamp(headers.date, ref.name);
-            const body = extractBody(a, raw, false) catch BodyParts{};
+            const body = if (options.headers_only) BodyParts{} else extractBody(a, raw, .preview) catch BodyParts{};
             const matches = flags_match and
                 (options.sender.len == 0 or ascii_compat.indexOfIgnoreCase(headers.from, options.sender) != null) and
                 (options.after == null or stamp >= options.after.?) and
@@ -385,18 +548,243 @@ pub fn queryMessages(allocator: std.mem.Allocator, db: *database.Database, user:
                 .has_attachments = body.has_attachments,
                 .size = raw.len,
                 .matches_filters = matches,
+                .attention_deadline = attention_deadline,
+                .snapshot = if (options.include_versions) .{
+                    .file = ref,
+                    .stamp = try allocator.dupe(u8, captured.stamp),
+                    .digest = message_refs.digest(raw),
+                } else null,
             });
         }
     }
-    std.mem.sort(MessageSummary, rows.items, {}, struct {
+    sortSummaries(rows.items);
+    return rows.toOwnedSlice(allocator);
+}
+
+fn sortSummaries(rows: []MessageSummary) void {
+    std.mem.sort(MessageSummary, rows, {}, struct {
         fn lessThan(_: void, left: MessageSummary, right: MessageSummary) bool {
-            if (left.timestamp != right.timestamp) return left.timestamp > right.timestamp;
-            const order = std.mem.order(u8, left.folder, right.folder);
-            if (order != .eq) return order == .lt;
-            return left.uid > right.uid;
+            if (left.attention_deadline != right.attention_deadline) return left.attention_deadline < right.attention_deadline;
+            return messagePosition(left).before(messagePosition(right));
         }
     }.lessThan);
-    return rows.toOwnedSlice(allocator);
+}
+
+fn queryIndexed(a: std.mem.Allocator, db: *database.Database, user: []const u8, folders: []const []const u8, options: QueryOptions) ![]MessageSummary {
+    var rows: std.ArrayList(MessageSummary) = .empty;
+    var progress: search_index.Progress = .{};
+    var remaining = options.index_budget;
+    for (folders) |folder| {
+        // Review copies appear only in the explicit Sender Review workspace.
+        if (std.ascii.eqlIgnoreCase(folder, "Screening") or std.ascii.eqlIgnoreCase(folder, "Declined")) continue;
+        if (options.unread_queue and std.ascii.eqlIgnoreCase(folder, "Drafts")) continue;
+        var scope = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scope.deinit();
+        const temporary = scope.allocator();
+        _ = try db.getOrCreateMailbox(user, folder);
+        // File names and their UIDs must be assigned in IMAP order. The
+        // catalogue uses the same folder and Maildir basename as webmail.
+        const refs = try collectFiles(a, user, folder);
+        preassignUids(db, user, folder, refs);
+        var cached = try search_index.load(temporary, db, user, folder, options.query);
+        var live = std.StringHashMap(void).init(temporary);
+        for (refs, 0..) |ref, index| {
+            const basename = database.maildirBaseName(ref.name);
+            try live.put(basename, {});
+            if (options.attention_view) |kind| {
+                if (!options.attention_snapshot.?.mayContain(kind, folder, basename)) continue;
+            }
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const work = scratch.allocator();
+            const path = try std.fmt.allocPrint(work, "{s}/{s}", .{ ref.dir, ref.name });
+            const identity = message_refs.fileFingerprint(work, path) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            const doc = document: {
+                if (cached.get(basename)) |item| {
+                    if (std.mem.eql(u8, item.fingerprint, identity.fingerprint)) break :document item;
+                }
+                if (remaining == 0) {
+                    progress.total += 1;
+                    continue;
+                }
+                const item = (try indexFile(work, db, user, folder, basename, path, identity.fingerprint, options.query)) orelse continue;
+                remaining -= 1;
+                break :document item;
+            };
+            progress.total += 1;
+            progress.indexed += 1;
+            const flags = flagsFrom(ref.name);
+            if (options.unread_queue and flags.deleted) continue;
+            const deadline = if (options.attention_view) |kind|
+                options.attention_snapshot.?.deadline(kind, folder, basename, identity.stamp) orelse continue
+            else
+                0;
+            if (options.attention_view == null and attention.isInboxView(options.folder)) {
+                if (options.attention_snapshot) |workflow| {
+                    const ids = try thread_ids.fromFields(work, doc.message_id, doc.in_reply_to, doc.references);
+                    const status = workflow.status("", folder, basename, identity.stamp, ids);
+                    if (status.muted or status.snooze_until != null) continue;
+                }
+            }
+            const timestamp = messageTimestamp(doc.date, ref.name);
+            const has_attachments = !std.mem.eql(u8, doc.attachment_metadata, "[]");
+            const matches_message = doc.matches and
+                (!options.unread or !flags.seen) and (!options.read or flags.seen) and
+                (!options.answered or flags.answered) and (!options.flagged or flags.flagged) and
+                contains(doc.sender, options.sender) and
+                (contains(doc.recipient, options.recipient) or contains(doc.cc, options.recipient) or contains(doc.bcc, options.recipient)) and
+                (options.after == null or timestamp >= options.after.?) and
+                (options.before == null or timestamp <= options.before.?) and
+                (!options.attachments or has_attachments);
+            var files: std.ArrayList(search_index.Attachment) = .empty;
+            if (matches_message and has_attachments and (options.list_attachments or options.filename.len > 0)) {
+                const metadata = try std.json.parseFromSliceLeaky([]const search_index.Attachment, work, doc.attachment_metadata, .{});
+                for (metadata) |file| if (contains(file.filename, options.filename)) {
+                    try files.append(work, file);
+                };
+            }
+            const matches = matches_message and
+                (!(options.list_attachments or options.filename.len > 0) or files.items.len > 0);
+            if (!matches and !options.include_context) continue;
+            const attachments: []search_index.Attachment = if (options.list_attachments) try a.dupe(search_index.Attachment, files.items) else &.{};
+            for (attachments) |*file| {
+                file.filename = try a.dupe(u8, file.filename);
+                file.content_type = try a.dupe(u8, file.content_type);
+            }
+            try rows.append(a, .{
+                .uid = uidFor(db, user, folder, ref.name, @intCast(index + 1)),
+                .folder = folder,
+                .from = try a.dupe(u8, doc.sender),
+                .to = try a.dupe(u8, doc.recipient),
+                .subject = try a.dupe(u8, doc.subject),
+                .date = try a.dupe(u8, doc.date),
+                .message_id = try a.dupe(u8, doc.message_id),
+                .in_reply_to = try a.dupe(u8, doc.in_reply_to),
+                .references = try a.dupe(u8, doc.references),
+                .timestamp = timestamp,
+                .snippet = try a.dupe(u8, doc.snippet),
+                .flags = flags,
+                .has_attachments = has_attachments,
+                .size = identity.size,
+                .matches_filters = matches,
+                .attention_deadline = deadline,
+                .indexed_attachments = attachments,
+                .snapshot = if (options.include_versions) .{
+                    .file = ref,
+                    .stamp = try a.dupe(u8, identity.stamp),
+                    .digest = doc.digest,
+                    .fingerprint = try a.dupe(u8, identity.fingerprint),
+                } else null,
+            });
+        }
+        if (cached.count() > 0) {
+            var keys = cached.keyIterator();
+            while (keys.next()) |name| {
+                if (live.contains(name.*)) continue;
+                try pruneSearchFolder(temporary, db, user, folder, &cached, &live);
+                break;
+            }
+        }
+    }
+    if (std.mem.eql(u8, options.folder, "*")) {
+        db.lockMailboxes();
+        defer db.unlockMailboxes();
+        const current = try folderNames(a, db, user);
+        try search_index.pruneFolders(db, user, try std.json.Stringify.valueAlloc(a, current, .{}));
+    }
+    if (options.index_progress) |report| report.* = progress;
+    if (!progress.complete()) return rows.items[0..0];
+    sortSummaries(rows.items);
+    return rows.toOwnedSlice(a);
+}
+
+fn pruneSearchFolder(a: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, cached: *std.StringHashMap(search_index.Document), live: *std.StringHashMap(void)) !void {
+    db.lockMailboxes();
+    defer db.unlockMailboxes();
+    // A folder may have changed since enumeration. Recheck before
+    // removing a document another request could need.
+    for (try collectFiles(a, user, folder)) |file| try live.put(database.maildirBaseName(file.name), {});
+    var previous = cached.iterator();
+    while (previous.next()) |record| {
+        if (!live.contains(record.key_ptr.*))
+            try search_index.prune(db, user, folder, record.key_ptr.*, record.value_ptr.fingerprint);
+    }
+}
+
+fn contains(value: []const u8, needle: []const u8) bool {
+    return needle.len == 0 or ascii_compat.indexOfIgnoreCase(value, needle) != null;
+}
+
+fn indexFile(a: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, basename: []const u8, path: []const u8, fingerprint: []const u8, query: []const u8) !?search_index.Document {
+    const raw = fs_compat.readFileAlloc(a, path) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    const headers = try parseHeaders(a, raw);
+    var body = try extractBody(a, raw, .metadata);
+    if (body.text.len == 0 and body.html.len > 0) body.text = html_text.extract(body.html, try a.alloc(u8, body.html.len));
+    var metadata: std.ArrayList(search_index.Attachment) = .empty;
+    for (body.attachments, 0..) |file, index| {
+        try metadata.append(a, .{
+            .filename = if (std.unicode.utf8ValidateSlice(file.filename)) file.filename else "attachment",
+            .content_type = if (std.unicode.utf8ValidateSlice(file.content_type)) file.content_type else "application/octet-stream",
+            .size = file.size,
+            .index = index,
+        });
+    }
+    const doc: search_index.Document = .{
+        .fingerprint = fingerprint,
+        .digest = message_refs.digest(raw),
+        .sender = headers.from,
+        .recipient = headers.to,
+        .cc = headers.cc,
+        .bcc = headers.bcc,
+        .subject = headers.subject,
+        .date = headers.date,
+        .message_id = headers.message_id,
+        .in_reply_to = headers.in_reply_to,
+        .references = headers.references,
+        .snippet = try makeSnippet(a, body.text),
+        .attachment_metadata = try std.json.Stringify.valueAlloc(a, metadata.items, .{}),
+        .matches = query.len == 0 or matchesQuery(headers, body, query) or contains(headers.bcc, query),
+    };
+    db.lockMailboxes();
+    defer db.unlockMailboxes();
+    const fresh = message_refs.fileFingerprint(a, path) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    if (!std.mem.eql(u8, fingerprint, fresh.fingerprint)) return null;
+    try search_index.store(db, user, folder, basename, doc, body.text);
+    return doc;
+}
+
+pub const MessagePosition = struct {
+    timestamp: i64,
+    folder: []const u8,
+    uid: i64,
+
+    pub fn before(left: MessagePosition, right: MessagePosition) bool {
+        if (left.timestamp != right.timestamp) return left.timestamp > right.timestamp;
+        const order = std.mem.order(u8, left.folder, right.folder);
+        if (order != .eq) return order == .lt;
+        return left.uid > right.uid;
+    }
+};
+
+pub fn messagePosition(row: MessageSummary) MessagePosition {
+    return .{ .timestamp = row.timestamp, .folder = row.folder, .uid = row.uid };
+}
+
+const FileSnapshot = struct { raw: []const u8, stamp: []const u8 };
+
+fn snapFile(a: std.mem.Allocator, db: *database.Database, path: []const u8) !FileSnapshot {
+    db.lockMailboxes();
+    defer db.unlockMailboxes();
+    return .{ .stamp = try message_refs.fileStamp(a, path), .raw = try fs_compat.readFileAlloc(a, path) };
 }
 
 pub fn rawMessage(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, uid: i64) ![]const u8 {
@@ -466,42 +854,206 @@ pub fn getMessage(
 ) !MessageDetail {
     if (!isValidFolderName(folder)) return MaildirError.InvalidFolderName;
     _ = db.getOrCreateMailbox(user, folder) catch {};
+    const file = (try findByUid(allocator, db, user, folder, uid)) orelse return MaildirError.MessageNotFound;
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ file.dir, file.name });
+    const raw = try fs_compat.readFileAlloc(allocator, path);
+    return parseDetail(allocator, folder, uid, file.name, raw, null);
+}
 
-    const refs = try collectFiles(allocator, user, folder);
+fn parseDetail(allocator: std.mem.Allocator, folder: []const u8, uid: i64, name: []const u8, raw: []const u8, version: ?MessageVersion) MessageDetail {
+    const headers = parseHeaders(allocator, raw) catch HeaderSet{};
+    const body = extractBestBody(allocator, raw) catch BodyParts{};
+    return .{
+        .uid = uid,
+        .folder = folder,
+        .timestamp = messageTimestamp(headers.date, name),
+        .version = version,
+        .from = headers.from,
+        .to = headers.to,
+        .cc = headers.cc,
+        .bcc = headers.bcc,
+        .reply_to = headers.reply_to,
+        .in_reply_to = headers.in_reply_to,
+        .references = headers.references,
+        .subject = headers.subject,
+        .date = headers.date,
+        .message_id = headers.message_id,
+        .text_body = body.text,
+        .html_body = body.html,
+        .flags = flagsFrom(name),
+        .attachments = body.attachments,
+        .size = raw.len,
+    };
+}
 
-    // Assign UIDs oldest-first (IMAP order) so the lookup matches IMAP and
-    // listMessages regardless of call order.
-    preassignUids(db, user, folder, refs);
+pub const VersionedFile = struct {
+    locator: MessageLocator,
+    name: []const u8,
+    path: []const u8,
+    stamp: []const u8,
+    raw: []const u8,
+    version: MessageVersion,
+};
 
-    for (refs, 0..) |r, idx| {
-        const file_uid = uidFor(db, user, folder, r.name, @intCast(idx + 1));
-        if (file_uid != uid) continue;
+fn makeVersion(a: std.mem.Allocator, id: []const u8, at: MessageLocator, name: []const u8, raw_digest: []const u8) !MessageVersion {
+    var sha: std.crypto.hash.sha2.Sha256 = .init(.{});
+    const metadata = try std.fmt.allocPrint(a, "{s}\x00{s}\x00{d}\x00{s}\x00", .{ id, at.folder, at.uid, name });
+    sha.update(metadata);
+    sha.update(raw_digest);
+    const hex = std.fmt.bytesToHex(sha.finalResult(), .lower);
+    return .{ .reference = id, .revision = try std.fmt.allocPrint(a, "\"{s}\"", .{&hex}) };
+}
 
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ r.dir, r.name });
-        const raw = try fs_compat.readFileAlloc(allocator, path);
-        const headers = parseHeaders(allocator, raw) catch HeaderSet{};
-        const body = extractBestBody(allocator, raw) catch BodyParts{};
-
-        return MessageDetail{
-            .uid = uid,
-            .from = headers.from,
-            .to = headers.to,
-            .cc = headers.cc,
-            .bcc = headers.bcc,
-            .reply_to = headers.reply_to,
-            .in_reply_to = headers.in_reply_to,
-            .references = headers.references,
-            .subject = headers.subject,
-            .date = headers.date,
-            .message_id = headers.message_id,
-            .text_body = body.text,
-            .html_body = body.html,
-            .flags = flagsFrom(r.name),
-            .attachments = body.attachments,
-            .size = raw.len,
-        };
+fn fileAt(a: std.mem.Allocator, user: []const u8, location: message_refs.Location) !?FileRef {
+    for (try collectFiles(a, user, location.folder)) |file| {
+        if (std.mem.eql(u8, location.basename, database.maildirBaseName(file.name))) return file;
     }
-    return MaildirError.MessageNotFound;
+    return null;
+}
+
+fn matchesStamp(a: std.mem.Allocator, file: FileRef, stamp: []const u8) !bool {
+    const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ file.dir, file.name });
+    const actual = message_refs.fileStamp(a, path) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return std.mem.eql(u8, stamp, actual);
+}
+
+pub fn resolveVersioned(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8) !VersionedFile {
+    if (!message_refs.valid(id)) return MaildirError.MessageNotFound;
+    const entry = (try message_refs.lookup(a, db, user, id)) orelse return MaildirError.MessageNotFound;
+    var at = entry.location;
+    var current = try fileAt(a, user, at);
+    const recovering = current == null or !try matchesStamp(a, current.?, entry.stamp);
+    if (recovering) {
+        const pending = entry.pending orelse return MaildirError.MessageNotFound;
+        at = pending.location;
+        current = try fileAt(a, user, at);
+    }
+    const file = current orelse return MaildirError.MessageNotFound;
+    const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ file.dir, file.name });
+    const stamp = try message_refs.fileStamp(a, path);
+    const raw = try fs_compat.readFileAlloc(a, path);
+    const checksum = message_refs.digest(raw);
+    if (recovering) {
+        if (!std.mem.eql(u8, &checksum, entry.pending.?.digest)) return MaildirError.MessageNotFound;
+        try message_refs.finish(db, user, id, at, stamp);
+    }
+    _ = try db.getOrCreateMailbox(user, at.folder);
+    preassignUids(db, user, at.folder, try collectFiles(a, user, at.folder));
+    const uid = (try db.getUidForFile(user, at.folder, file.name)) orelse return MaildirError.MessageNotFound;
+    const locator: MessageLocator = .{ .folder = at.folder, .uid = uid };
+    return .{ .locator = locator, .name = file.name, .path = path, .stamp = stamp, .raw = raw, .version = try makeVersion(a, id, locator, file.name, &checksum) };
+}
+
+/// The caller holds the mailbox lock for the complete conditional operation.
+pub fn checkRevision(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8, expected: []const u8) !MessageLocator {
+    const entry = try resolveVersioned(a, db, user, id);
+    if (!std.mem.eql(u8, entry.version.revision, expected)) return MaildirError.RevisionMismatch;
+    return entry.locator;
+}
+
+pub fn getByReference(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8) !MessageDetail {
+    db.lockMailboxes();
+    const entry = resolveVersioned(a, db, user, id);
+    db.unlockMailboxes();
+    const file = try entry;
+    return parseDetail(a, file.locator.folder, file.locator.uid, file.name, file.raw, file.version);
+}
+
+fn observeVersion(a: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, uid: i64) !VersionedFile {
+    if (!isValidFolderName(folder)) return MaildirError.InvalidFolderName;
+    const file = (try findByUid(a, db, user, folder, uid)) orelse return MaildirError.MessageNotFound;
+    return versionForFile(a, db, user, folder, uid, file);
+}
+
+/// Resolve a journaled Sender Review copy under the mailbox mutation lock.
+pub fn observeReviewFile(a: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, basename: []const u8, expected_stamp: []const u8) !VersionedFile {
+    if (!std.mem.eql(u8, folder, "Screening") and !std.mem.eql(u8, folder, "Declined")) return MaildirError.InvalidFolderName;
+    const file = (try fileAt(a, user, .{ .folder = folder, .basename = basename })) orelse return MaildirError.MessageNotFound;
+    if (expected_stamp.len != 0 and !try matchesStamp(a, file, expected_stamp)) return MaildirError.MessageNotFound;
+    preassignUids(db, user, folder, try collectFiles(a, user, folder));
+    const uid = (try db.getUidForFile(user, folder, file.name)) orelse return MaildirError.MessageNotFound;
+    return versionForFile(a, db, user, folder, uid, file);
+}
+
+fn versionForFile(a: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, uid: i64, file: FileRef) !VersionedFile {
+    const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ file.dir, file.name });
+    const stamp = try message_refs.fileStamp(a, path);
+    const raw = try fs_compat.readFileAlloc(a, path);
+    const at = message_refs.location(folder, file.name);
+    const locator: MessageLocator = .{ .folder = at.folder, .uid = uid };
+    const checksum = message_refs.digest(raw);
+    const id = try observeReference(a, db, user, at, stamp, &checksum);
+    return .{ .locator = locator, .name = file.name, .path = path, .stamp = stamp, .raw = raw, .version = try makeVersion(a, id, locator, file.name, &checksum) };
+}
+
+pub fn reviewHeaders(a: std.mem.Allocator, raw: []const u8) !struct { from: []const u8, subject: []const u8, date: []const u8 } {
+    const headers = try parseHeaders(a, raw);
+    return .{ .from = headers.from, .subject = headers.subject, .date = headers.date };
+}
+
+/// Return the message text a private clip can quote. HTML-only mail uses the
+/// same text extraction as search and leaves tag attributes out of clips.
+pub fn clipText(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
+    const body = try extractBody(a, raw, .preview);
+    const text = if (body.text.len > 0) body.text else html_text.extract(body.html, try a.alloc(u8, body.html.len));
+    if (std.mem.indexOfScalar(u8, text, '\r') == null and std.unicode.utf8ValidateSlice(text)) return text;
+    var clean: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '\r') {
+            try clean.append(a, '\n');
+            i += if (i + 1 < text.len and text[i + 1] == '\n') @as(usize, 2) else 1;
+            continue;
+        }
+        const length = std.unicode.utf8ByteSequenceLength(text[i]) catch 0;
+        if (length == 0 or i + length > text.len or !std.unicode.utf8ValidateSlice(text[i .. i + length])) {
+            try clean.appendSlice(a, "\u{fffd}");
+            i += 1;
+        } else {
+            try clean.appendSlice(a, text[i .. i + length]);
+            i += length;
+        }
+    }
+    return clean.toOwnedSlice(a);
+}
+
+fn observeReference(a: std.mem.Allocator, db: *database.Database, user: []const u8, at: message_refs.Location, stamp: []const u8, checksum: []const u8) ![]const u8 {
+    if (try message_refs.recoverAt(a, db, user, at, stamp, checksum)) |id| return id;
+    return message_refs.issue(a, db, user, at, stamp);
+}
+
+/// Register only the rows that will be returned after pagination.
+pub fn summaryVersion(a: std.mem.Allocator, db: *database.Database, user: []const u8, row: MessageSummary) !?MessageVersion {
+    const snapshot = row.snapshot orelse return null;
+    db.lockMailboxes();
+    defer db.unlockMailboxes();
+    if (snapshot.fingerprint) |expected| {
+        const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ snapshot.file.dir, snapshot.file.name });
+        const identity = message_refs.fileFingerprint(a, path) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, expected, identity.fingerprint)) return null;
+    } else if (!try matchesStamp(a, snapshot.file, snapshot.stamp)) return null;
+    const at = message_refs.location(row.folder, snapshot.file.name);
+    const id = try observeReference(a, db, user, at, snapshot.stamp, &snapshot.digest);
+    return try makeVersion(a, id, .{ .folder = at.folder, .uid = row.uid }, snapshot.file.name, &snapshot.digest);
+}
+
+/// The caller holds the mailbox lock.
+pub fn versionAt(a: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, uid: i64) !MessageVersion {
+    return (try observeVersion(a, db, user, folder, uid)).version;
+}
+
+pub fn getVersionedMessage(a: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, uid: i64) !MessageDetail {
+    db.lockMailboxes();
+    const entry = observeVersion(a, db, user, folder, uid);
+    db.unlockMailboxes();
+    const file = try entry;
+    return parseDetail(a, file.locator.folder, file.locator.uid, file.name, file.raw, file.version);
 }
 
 // ── Write operations (flags / move / delete) ─────────────────────────────────
@@ -596,6 +1148,12 @@ pub fn setFlags(
     uid: i64,
     flags: Flags,
 ) !Flags {
+    db.lockMailboxes();
+    defer db.unlockMailboxes();
+    return setFlagsLocked(allocator, db, user, folder, uid, flags);
+}
+
+pub fn setFlagsLocked(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, uid: i64, flags: Flags) !Flags {
     if (!isValidFolderName(folder)) return MaildirError.InvalidFolderName;
     _ = db.getOrCreateMailbox(user, folder) catch {};
 
@@ -635,8 +1193,20 @@ pub fn moveMessage(
     uid: i64,
     dst_folder: []const u8,
 ) !i64 {
+    db.lockMailboxes();
+    defer db.unlockMailboxes();
+    return moveMessageLocked(allocator, db, user, src_folder, uid, dst_folder);
+}
+
+pub fn moveMessageLocked(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, src_folder: []const u8, uid: i64, dst_folder: []const u8) !i64 {
+    return moveWithFeedbackLocked(allocator, db, user, src_folder, uid, dst_folder, null);
+}
+
+pub fn moveWithFeedbackLocked(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, src_folder: []const u8, uid: i64, dst_folder: []const u8, junk: ?message_refs.JunkChange) !i64 {
     if (!isValidFolderName(src_folder) or !isValidFolderName(dst_folder)) return MaildirError.InvalidFolderName;
-    if (std.mem.eql(u8, src_folder, dst_folder)) return uid;
+    const source_folder = message_refs.location(src_folder, "").folder;
+    const target_folder = message_refs.location(dst_folder, "").folder;
+    if (std.mem.eql(u8, source_folder, target_folder)) return uid;
     _ = db.getOrCreateMailbox(user, src_folder) catch {};
     _ = db.getOrCreateMailbox(user, dst_folder) catch {};
 
@@ -658,8 +1228,13 @@ pub fn moveMessage(
     // a UID failure aborts cleanly without leaving an orphaned file, and the
     // returned UID is always the real destination UID (never a stale source one).
     // A destination that already contains this name must not be overwritten.
-    if (fs_compat.cwd().access(new_path, .{})) return MaildirError.Conflict else |_| {}
+    const source = message_refs.location(src_folder, ref.name);
+    const target = message_refs.location(dst_folder, ref.name);
+    if (try fileAt(allocator, user, target) != null) return MaildirError.Conflict;
     const dst_uid = try db.assignFreshUid(user, dst_folder, ref.name);
+    const transfer = try message_refs.stageMove(allocator, db, user, source, old_path, target, null, junk);
+    if (junk != null and transfer == null) return MaildirError.Conflict;
+    errdefer if (transfer) |id| message_refs.cancel(db, user, id);
 
     // Prefer an atomic rename; fall back to copy+unlink across filesystems.
     if (!renamePath(old_path, new_path)) {
@@ -679,14 +1254,53 @@ pub fn moveMessage(
         };
     }
 
+    if (transfer) |id| message_refs.finishFile(allocator, db, user, id, target, new_path);
+    message_refs.forgetReviewCopy(db, user, source) catch |err| std.log.warn("could not retire a manually moved review copy: {}", .{err});
+    if (typesense.enabled() and (junk != null or categories.isCategory(source_folder) or categories.isCategory(target_folder))) {
+        if (fs_compat.readFileAlloc(allocator, new_path)) |raw| {
+            defer allocator.free(raw);
+            typesense.indexMessageAsync(std.heap.page_allocator, user, target_folder, ref.name, raw);
+        } else |err| std.log.warn("could not read moved mail for search: {}", .{err});
+    }
     return dst_uid;
 }
 
 var draft_sequence = std.atomic.Value(u64).init(0);
 
-/// Replace a draft atomically while preserving its UID. A temporary filename
-/// is invisible to Maildir readers until the complete message is ready.
-pub fn saveDraft(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, raw: []const u8, existing: ?i64) !i64 {
+pub const DraftWrite = struct {
+    uid: i64,
+    temporary: []const u8,
+    destination: []const u8,
+    replacing: bool,
+
+    pub fn forgetUid(self: DraftWrite, db: *database.Database, user: []const u8) void {
+        const s = db.prepare("DELETE FROM imap_uids WHERE username=?1 AND mailbox='Drafts' AND uid=?2") catch return;
+        defer s.finalize();
+        s.bind(1, user) catch return;
+        s.bind(2, self.uid) catch return;
+        _ = s.step() catch return;
+    }
+
+    /// A temporary name is invisible until the complete message is ready.
+    pub fn save(self: DraftWrite, allocator: std.mem.Allocator, db: *database.Database, user: []const u8, raw: []const u8) !void {
+        const file = try fs_compat.cwd().createFileExclusive(self.temporary);
+        defer unlinkPath(allocator, self.temporary) catch {};
+        file.writeAll(raw) catch |err| {
+            file.close();
+            return err;
+        };
+        file.close();
+        const at = message_refs.location("Drafts", std.fs.path.basename(self.destination));
+        const transfer = if (self.replacing) try message_refs.stage(allocator, db, user, at, self.destination, at, raw) else null;
+        errdefer if (transfer) |id| message_refs.cancel(db, user, id);
+        if (!renamePath(self.temporary, self.destination)) return MaildirError.WriteFailed;
+        if (transfer) |id| message_refs.finishFile(allocator, db, user, id, at, self.destination);
+    }
+};
+
+/// The caller holds the mailbox mutation lock through the write. This gives
+/// webmail the UID needed to check the draft metadata before replacing the file.
+pub fn prepareDraft(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, bytes: usize, existing: ?i64) !DraftWrite {
     _ = try db.getOrCreateMailbox(user, "Drafts");
     const dir = try std.fmt.allocPrint(allocator, "mail/{s}/Drafts", .{user});
     try fs_compat.ensureDir(dir);
@@ -698,16 +1312,9 @@ pub fn saveDraft(allocator: std.mem.Allocator, db: *database.Database, user: []c
     } else try std.fmt.allocPrint(allocator, "{d}.{d}.eml:2,DS", .{ now, seq });
     const temporary = try std.fmt.allocPrint(allocator, "{s}/.draft-{d}.{d}.tmp", .{ dir, now, seq });
     const destination = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, name });
+    try hosted_limits.checkStorage(db, user, bytes, if (existing != null) destination else null);
     const uid = try db.assignUid(user, "Drafts", name);
-    const file = try fs_compat.cwd().createFileExclusive(temporary);
-    defer unlinkPath(allocator, temporary) catch {};
-    file.writeAll(raw) catch |err| {
-        file.close();
-        return err;
-    };
-    file.close();
-    if (!renamePath(temporary, destination)) return MaildirError.WriteFailed;
-    return uid;
+    return .{ .uid = uid, .temporary = temporary, .destination = destination, .replacing = existing != null };
 }
 
 /// Delete a message (by UID): move it to Trash, or permanently unlink if it is
@@ -719,6 +1326,12 @@ pub fn deleteMessage(
     folder: []const u8,
     uid: i64,
 ) !void {
+    db.lockMailboxes();
+    defer db.unlockMailboxes();
+    return deleteMessageLocked(allocator, db, user, folder, uid);
+}
+
+pub fn deleteMessageLocked(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, uid: i64) !void {
     if (!isValidFolderName(folder)) return MaildirError.InvalidFolderName;
 
     if (std.ascii.eqlIgnoreCase(folder, "Trash")) {
@@ -728,10 +1341,11 @@ pub fn deleteMessage(
         if (!isSafeName(ref.name)) return MaildirError.WriteFailed;
         const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ref.dir, ref.name });
         try unlinkPath(allocator, path); // propagate failure — don't report a phantom success
+        message_refs.forget(db, user, message_refs.location(folder, ref.name)) catch |err| std.log.warn("could not retire webmail message reference: {}", .{err});
         return;
     }
 
-    _ = try moveMessage(allocator, db, user, folder, uid, "Trash");
+    _ = try moveMessageLocked(allocator, db, user, folder, uid, "Trash");
 }
 
 // ── Minimal RFC 5322 / MIME parsing ──────────────────────────────────────────
@@ -840,10 +1454,10 @@ fn parseHeaders(allocator: std.mem.Allocator, raw: []const u8) !HeaderSet {
 ///   - simple multipart/* (splits on boundary, picks text + html parts)
 /// Quoted-printable and base64 transfer encodings are decoded for text parts.
 fn extractBestBody(allocator: std.mem.Allocator, raw: []const u8) !BodyParts {
-    return extractBody(allocator, raw, true);
+    return extractBody(allocator, raw, .full);
 }
 
-fn extractBody(allocator: std.mem.Allocator, raw: []const u8, attachment_data: bool) !BodyParts {
+fn extractBody(allocator: std.mem.Allocator, raw: []const u8, mode: BodyMode) !BodyParts {
     const he = headerEnd(raw);
     const header_block = raw[0..he];
     const body = if (he < raw.len) raw[he..] else "";
@@ -851,10 +1465,16 @@ fn extractBody(allocator: std.mem.Allocator, raw: []const u8, attachment_data: b
     const ctype = try getHeader(allocator, header_block, "Content-Type");
 
     if (ascii_compat.indexOfIgnoreCase(ctype, "multipart/") != null) {
-        return parseMultipartMode(allocator, ctype, body, 0, attachment_data);
+        return parseMultipartMode(allocator, ctype, body, 0, mode);
     }
 
     const cte = try getHeader(allocator, header_block, "Content-Transfer-Encoding");
+    if (try attachmentName(allocator, header_block, ctype)) |name| {
+        if (mode == .preview) return .{ .has_attachments = true };
+        const files = try allocator.alloc(AttachmentInfo, 1);
+        files[0] = try readAttachment(allocator, body, ctype, cte, name, mode);
+        return .{ .has_attachments = true, .attachments = files };
+    }
     const decoded = decodeBody(allocator, body, cte) catch body;
     if (ascii_compat.indexOfIgnoreCase(ctype, "text/html") != null) {
         return BodyParts{ .html = decoded, .text = "" };
@@ -868,10 +1488,10 @@ fn extractBody(allocator: std.mem.Allocator, raw: []const u8, attachment_data: b
 const max_multipart_depth = 10;
 
 fn parseMultipart(allocator: std.mem.Allocator, ctype: []const u8, body: []const u8, depth: u32) !BodyParts {
-    return parseMultipartMode(allocator, ctype, body, depth, true);
+    return parseMultipartMode(allocator, ctype, body, depth, .full);
 }
 
-fn parseMultipartMode(allocator: std.mem.Allocator, ctype: []const u8, body: []const u8, depth: u32, attachment_data: bool) !BodyParts {
+fn parseMultipartMode(allocator: std.mem.Allocator, ctype: []const u8, body: []const u8, depth: u32, mode: BodyMode) !BodyParts {
     // Bound recursion: beyond the cap, treat the remainder as opaque text.
     if (depth >= max_multipart_depth) return BodyParts{ .text = body };
 
@@ -895,21 +1515,9 @@ fn parseMultipartMode(allocator: std.mem.Allocator, ctype: []const u8, body: []c
 
         const pct = try getHeader(allocator, part_headers, "Content-Type");
         const pcte = try getHeader(allocator, part_headers, "Content-Transfer-Encoding");
-        const pcd = try getHeader(allocator, part_headers, "Content-Disposition");
-
-        // Attachment if disposition says so or there's a filename.
-        if (ascii_compat.indexOfIgnoreCase(pcd, "attachment") != null or
-            ascii_compat.indexOfIgnoreCase(pcd, "filename") != null)
-        {
+        if (try attachmentName(allocator, part_headers, pct)) |name| {
             result.has_attachments = true;
-            if (!attachment_data) continue;
-            const decoded = try decodeBody(allocator, part_body, pcte);
-            try attachments.append(allocator, .{
-                .filename = extractParam(allocator, pcd, "filename") catch "attachment",
-                .content_type = if (pct.len > 0) pct else "application/octet-stream",
-                .size = decoded.len,
-                .data = decoded,
-            });
+            if (mode != .preview) try attachments.append(allocator, try readAttachment(allocator, part_body, pct, pcte, name, mode));
             continue;
         }
 
@@ -919,7 +1527,7 @@ fn parseMultipartMode(allocator: std.mem.Allocator, ctype: []const u8, body: []c
             result.text = decodeBody(allocator, part_body, pcte) catch part_body;
         } else if (ascii_compat.indexOfIgnoreCase(pct, "multipart/") != null) {
             // Nested multipart (e.g. multipart/alternative inside multipart/mixed).
-            const nested = parseMultipartMode(allocator, pct, part_body, depth + 1, attachment_data) catch BodyParts{};
+            const nested = parseMultipartMode(allocator, pct, part_body, depth + 1, mode) catch BodyParts{};
             if (result.text.len == 0) result.text = nested.text;
             if (result.html.len == 0) result.html = nested.html;
             if (nested.has_attachments) result.has_attachments = true;
@@ -929,6 +1537,71 @@ fn parseMultipartMode(allocator: std.mem.Allocator, ctype: []const u8, body: []c
 
     result.attachments = try attachments.toOwnedSlice(allocator);
     return result;
+}
+
+const AttachmentName = struct { filename: []const u8, id: []const u8 };
+
+fn attachmentName(a: std.mem.Allocator, headers: []const u8, mime: []const u8) !?AttachmentName {
+    const disposition = try getHeader(a, headers, "Content-Disposition");
+    const id = if (std.ascii.startsWithIgnoreCase(mime, "image/"))
+        contentId(try getHeader(a, headers, "Content-ID"))
+    else
+        "";
+    const extended = try extractParam(a, disposition, "filename*");
+    if (extended.len > 0) {
+        if (std.mem.indexOfScalar(u8, extended, '\'')) |charset_end| {
+            if (std.mem.indexOfScalarPos(u8, extended, charset_end + 1, '\'')) |lang_end| {
+                const encoded = extended[lang_end + 1 ..];
+                const decoded = std.Uri.percentDecodeBackwards(try a.alloc(u8, encoded.len), encoded);
+                if (decoded.len > 0 and std.unicode.utf8ValidateSlice(decoded)) return .{ .filename = decoded, .id = id };
+            }
+        }
+    }
+    const filename = try extractParam(a, disposition, "filename");
+    if (filename.len > 0) return .{ .filename = filename, .id = id };
+    if (!std.ascii.startsWithIgnoreCase(mime, "multipart/")) {
+        const name = try extractParam(a, mime, "name");
+        if (name.len > 0) return .{ .filename = name, .id = id };
+    }
+    if (id.len > 0) return .{ .filename = "inline-image", .id = id };
+    const separator = std.mem.indexOfScalar(u8, disposition, ';') orelse disposition.len;
+    const kind = std.mem.trim(u8, disposition[0..separator], " \t");
+    if (std.ascii.eqlIgnoreCase(kind, "attachment")) return .{ .filename = "attachment", .id = "" };
+    return null;
+}
+
+fn readAttachment(a: std.mem.Allocator, raw: []const u8, mime: []const u8, encoding: []const u8, name: AttachmentName, mode: BodyMode) !AttachmentInfo {
+    const data = if (mode == .full) try decodeBody(a, raw, encoding) else "";
+    return .{
+        .filename = name.filename,
+        .content_type = if (mime.len > 0) mime else "application/octet-stream",
+        .size = if (mode == .full) data.len else try attachmentSize(a, raw, encoding),
+        .data = data,
+        .content_id = name.id,
+    };
+}
+
+fn contentId(s: []const u8) []const u8 {
+    const trimmed = std.mem.trim(u8, s, " \t\r\n");
+    const id = if (trimmed.len >= 2 and trimmed[0] == '<' and trimmed[trimmed.len - 1] == '>') trimmed[1 .. trimmed.len - 1] else trimmed;
+    if (id.len > 320) return "";
+    for (id) |byte| {
+        if (!std.ascii.isPrint(byte) or byte == ' ' or byte == '<' or byte == '>') return "";
+    }
+    return id;
+}
+
+pub fn embeddedImageType(att: AttachmentInfo) ?[]const u8 {
+    if (att.content_id.len == 0 or att.data.len == 0 or att.data.len > 2 * 1024 * 1024) return null;
+    const end = std.mem.indexOfScalar(u8, att.content_type, ';') orelse att.content_type.len;
+    const mime = std.mem.trim(u8, att.content_type[0..end], " \t");
+    const data = att.data;
+    if (std.ascii.eqlIgnoreCase(mime, "image/png") and std.mem.startsWith(u8, data, "\x89PNG\r\n\x1a\n")) return "image/png";
+    if (std.ascii.eqlIgnoreCase(mime, "image/jpeg") and std.mem.startsWith(u8, data, "\xff\xd8\xff")) return "image/jpeg";
+    if (std.ascii.eqlIgnoreCase(mime, "image/gif") and (std.mem.startsWith(u8, data, "GIF87a") or std.mem.startsWith(u8, data, "GIF89a"))) return "image/gif";
+    if (std.ascii.eqlIgnoreCase(mime, "image/webp") and data.len >= 12 and std.mem.eql(u8, data[0..4], "RIFF") and std.mem.eql(u8, data[8..12], "WEBP")) return "image/webp";
+    if (std.ascii.eqlIgnoreCase(mime, "image/avif") and data.len >= 12 and std.mem.eql(u8, data[4..12], "ftypavif")) return "image/avif";
+    return null;
 }
 
 // RFC 2046: a boundary is at most 70 characters. Capping it prevents a crafted
@@ -984,6 +1657,25 @@ fn decodeBody(allocator: std.mem.Allocator, body: []const u8, cte: []const u8) !
         return decodeQuotedPrintable(allocator, body) catch body;
     }
     return body;
+}
+
+fn attachmentSize(a: std.mem.Allocator, body: []const u8, cte: []const u8) !usize {
+    if (ascii_compat.indexOfIgnoreCase(cte, "base64") == null) return (try decodeBody(a, body, cte)).len;
+    var length: usize = 0;
+    var padding: usize = 0;
+    var last: u8 = 0;
+    for (body) |c| switch (c) {
+        ' ', '\t', '\r', '\n' => continue,
+        '=' => padding += 1,
+        else => {
+            if (padding != 0) return body.len;
+            last = @intCast(std.mem.indexOfScalar(u8, &std.base64.standard_alphabet_chars, c) orelse return body.len);
+            length += 1;
+        },
+    };
+    if (padding > 2 or (length + padding) % 4 != 0 or (padding == 1 and last % 4 != 0) or
+        (padding == 2 and last % 16 != 0)) return body.len;
+    return length * 6 / 8;
 }
 
 fn decodeBase64(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
@@ -1323,6 +2015,14 @@ test "search includes complete decoded text and reply headers survive parsing" {
     try t.expect(!matchesQuery(headers, .{ .text = text }, "absent"));
 }
 
+fn writeTestDraft(a: std.mem.Allocator, db: *database.Database, user: []const u8, raw: []const u8, existing: ?i64) !i64 {
+    db.lockMailboxes();
+    defer db.unlockMailboxes();
+    const write = try prepareDraft(a, db, user, raw.len, existing);
+    try write.save(a, db, user, raw);
+    return write.uid;
+}
+
 test "first draft initializes UIDNEXT and replacement preserves identity" {
     const t = std.testing;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
@@ -1333,10 +2033,10 @@ test "first draft initializes UIDNEXT and replacement preserves identity" {
     const user = try std.fmt.allocPrint(a, "webmail-drafts-{d}", .{time_compat.milliTimestamp()});
     const root = try std.fmt.allocPrint(a, "mail/{s}", .{user});
     defer fs_compat.cwd().deleteTree(root) catch {};
-    const first = try saveDraft(a, &db, user, "Subject: first\r\n\r\nOld body", null);
-    const same = try saveDraft(a, &db, user, "Subject: first\r\n\r\nNew body", first);
+    const first = try writeTestDraft(a, &db, user, "Subject: first\r\n\r\nOld body", null);
+    const same = try writeTestDraft(a, &db, user, "Subject: first\r\n\r\nNew body", first);
     try t.expectEqual(first, same);
-    const second = try saveDraft(a, &db, user, "Subject: second\r\n\r\nSecond body", null);
+    const second = try writeTestDraft(a, &db, user, "Subject: second\r\n\r\nSecond body", null);
     try t.expect(second > first);
     const messages = try listMessages(a, &db, user, "Drafts", 1, 50);
     try t.expectEqual(@as(usize, 2), messages.len);
@@ -1361,7 +2061,7 @@ test "moving a message back into a folder never resurrects its old UID" {
     const user = try std.fmt.allocPrint(a, "webmail-moves-{d}", .{time_compat.milliTimestamp()});
     const root = try std.fmt.allocPrint(a, "mail/{s}", .{user});
     defer fs_compat.cwd().deleteTree(root) catch {};
-    const original = try saveDraft(a, &db, user, "Subject: move\r\n\r\nBody", null);
+    const original = try writeTestDraft(a, &db, user, "Subject: move\r\n\r\nBody", null);
     const archived = try moveMessage(a, &db, user, "Drafts", original, "Archive");
     const restored = try moveMessage(a, &db, user, "Archive", archived, "Drafts");
     try t.expect(restored > original);

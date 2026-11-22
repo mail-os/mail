@@ -15,7 +15,7 @@
 //!     later instead of the mail being delivered unscanned or lost.
 //!
 //! `disposition` turns a verdict into deliver, reject, or tempfail under the
-//! configured mode. Wiring that into the SMTP DATA path is separate work.
+//! configured mode.
 
 const std = @import("std");
 const posix = std.posix;
@@ -144,6 +144,37 @@ pub const Disposition = enum {
     tempfail,
 };
 
+pub const IntakeError = error{ MalwareDetected, MalwareScanUnavailable, MalwareScanTooLarge };
+
+/// Check client data before handing it to storage or submission. The SMTP
+/// path uses the same verdict and policy directly to stamp its trace header.
+pub fn requireAllowed(scanner: ?*ClamAVScanner, payload: []const u8) IntakeError!void {
+    const active = scanner orelse return;
+    const verdict = active.scanMessage(payload) catch return error.MalwareScanUnavailable;
+    defer verdict.deinit(active.allocator);
+    return switch (active.disposition(verdict)) {
+        .deliver => {},
+        .tempfail => error.MalwareScanUnavailable,
+        .reject => switch (verdict) {
+            .infected => |name| blk: {
+                var buffer: [255]u8 = undefined;
+                log.warn("intake rejected by malware scanner: {s}", .{safeSignature(name, &buffer)});
+                break :blk error.MalwareDetected;
+            },
+            .too_large => error.MalwareScanTooLarge,
+            else => unreachable,
+        },
+    };
+}
+
+pub fn safeSignature(name: []const u8, buffer: []u8) []const u8 {
+    const signature = buffer[0..@min(name.len, buffer.len)];
+    for (signature, name[0..signature.len]) |*dest, byte| {
+        dest.* = if (std.ascii.isPrint(byte)) byte else '?';
+    }
+    return signature;
+}
+
 pub const ScanStats = struct {
     total_scans: usize = 0,
     clean_messages: usize = 0,
@@ -179,7 +210,7 @@ pub const ClamAVScanner = struct {
         }
     }
 
-    fn validate(config: Config) ConfigError!void {
+    pub fn validate(config: Config) ConfigError!void {
         switch (config.transport) {
             .unix => |path| {
                 if (path.len == 0 or path.len >= unix_path_capacity) return error.InvalidSocketPath;
@@ -204,7 +235,7 @@ pub const ClamAVScanner = struct {
             .unavailable => |failure| log.warn("scanner unavailable ({s}); fail mode {s}: message {s}", .{
                 @tagName(failure),
                 @tagName(self.config.fail_mode),
-                if (self.config.fail_mode == .open) "delivered unscanned" else "deferred",
+                if (self.config.fail_mode == .open) "allowed without a scan" else "deferred",
             }),
             .too_large => log.warn("message of {d} bytes exceeds the scan limit; fail mode {s}", .{
                 message.len,

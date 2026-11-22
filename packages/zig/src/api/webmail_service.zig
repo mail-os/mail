@@ -2,6 +2,7 @@
 //! Draft metadata preserves unfinished recipient entry separately from safe MIME
 //! headers. Undo receipts are server-owned, expiring, and bound to one account.
 const std = @import("std");
+const clamav = @import("../antispam/clamav.zig");
 const database = @import("../storage/database.zig");
 const auth_mod = @import("../auth/auth.zig");
 const core_config = @import("../core/config.zig");
@@ -10,8 +11,21 @@ const mutex = @import("../core/mutex_compat.zig");
 const maildir = @import("webmail_maildir.zig");
 const compose = @import("webmail_compose.zig");
 const store = @import("webmail_store.zig");
+const message_refs = @import("../storage/message_refs.zig");
+const thread_ids = @import("../message/thread_ids.zig");
 
 pub const ServiceError = error{ InvalidPayload, AttachmentLimit, InvalidAttachment, Conflict, NotFound, InvalidAction, MessageChanged };
+
+fn decodeInlineAttachment(a: std.mem.Allocator, encoded: []const u8, limit: usize) ![]u8 {
+    const decoder = std.base64.standard.Decoder;
+    const size = decoder.calcSizeForSlice(encoded) catch return ServiceError.InvalidAttachment;
+    if (size > limit) return ServiceError.AttachmentLimit;
+    const bytes = try a.alloc(u8, size);
+    errdefer a.free(bytes);
+    decoder.decode(bytes, encoded) catch return ServiceError.InvalidAttachment;
+    return bytes;
+}
+
 pub const Payload = struct {
     to: []const []const u8 = &.{},
     cc: []const []const u8 = &.{},
@@ -30,6 +44,7 @@ pub const Payload = struct {
     recipientInputs: struct { to: []const u8 = "", cc: []const u8 = "", bcc: []const u8 = "" } = .{},
     recipientLabels: struct { to: []const []const u8 = &.{}, cc: []const []const u8 = &.{}, bcc: []const []const u8 = &.{} } = .{},
     replyContext: ?MessageRef = null,
+    clearFollowUp: bool = false,
     attachments: []const struct {
         filename: []const u8 = "",
         contentType: []const u8 = "application/octet-stream",
@@ -40,15 +55,37 @@ pub const Payload = struct {
 };
 pub const Draft = struct { uid: i64, folder: []const u8 = "Drafts", message: Payload };
 pub const DraftAck = struct { ok: bool = true, uid: i64, draftId: []const u8, revision: i64 };
-pub const MessageRef = struct { uid: i64, folder: []const u8 };
-pub const BulkAction = enum { move, trash, read, unread, flag, unflag, purge };
+pub const MessageRef = struct { uid: i64, folder: []const u8, reference: ?[]const u8 = null, revision: ?[]const u8 = null };
+pub const BulkAction = enum { move, trash, read, unread, flag, unflag, purge, delete, junk, not_junk };
 pub const BulkPayload = struct { action: BulkAction, messages: []const MessageRef, folder: []const u8 = "Archive" };
 pub const ActionResult = struct { uid: i64, folder: []const u8, ok: bool, new_uid: ?i64 = null, new_folder: ?[]const u8 = null, error_code: ?[]const u8 = null };
-const UndoEntry = struct { original: MessageRef, current: MessageRef, before: maildir.Flags, after: maildir.Flags, fingerprint: []const u8, moved: bool };
+const UndoEntry = struct {
+    original: MessageRef,
+    current: MessageRef,
+    before: maildir.Flags,
+    after: maildir.Flags,
+    fingerprint: []const u8,
+    moved: bool,
+    junkReceipt: ?[]const u8 = null,
+};
 const UndoDocument = struct { entries: []const UndoEntry, results: []const ActionResult = &.{} };
 pub const BulkResult = struct { ok: bool, results: []const ActionResult, undoId: ?[]const u8 = null, expiresAt: ?i64 = null };
-pub const Outbox = struct { message: Payload, result: ?compose.SendResult = null, error_message: ?[]const u8 = null };
-pub const Limits = struct { maxFileBytes: usize, maxTotalBytes: usize, maxCount: usize, maxMessageBytes: usize, undoSendSeconds: u32, calendarAvailable: bool = false };
+pub const Outbox = struct {
+    message: Payload,
+    result: ?compose.SendResult = null,
+    error_message: ?[]const u8 = null,
+    request_hash: ?[]const u8 = null,
+    reply_cutoff_ms: i64 = 0,
+};
+pub const Limits = struct {
+    maxFileBytes: usize,
+    maxTotalBytes: usize,
+    maxCount: usize,
+    maxMessageBytes: usize,
+    undoSendSeconds: u32,
+    calendarAvailable: bool = false,
+    junkFolder: []const u8 = "Junk",
+};
 
 pub const Config = struct {
     hostname: []const u8 = "localhost",
@@ -84,7 +121,67 @@ pub const Service = struct {
             .maxCount = self.config.max_count,
             .maxMessageBytes = self.config.max_message_bytes,
             .undoSendSeconds = self.config.undo_send_seconds,
+            .junkFolder = self.junkFolder(),
         };
+    }
+
+    pub fn junkFolder(self: *const Service) []const u8 {
+        return if (self.config.mail_config) |config| config.junkFolder() else "Junk";
+    }
+
+    fn isJunkFolder(self: *const Service, folder: []const u8) bool {
+        return std.mem.eql(u8, folder, self.junkFolder()) or std.mem.eql(u8, folder, "Junk");
+    }
+
+    fn canMarkJunk(self: *const Service, folder: []const u8) bool {
+        if (self.isJunkFolder(folder)) return false;
+        for ([_][]const u8{ "Sent", "Drafts", "Trash", "Screening", "Declined" }) |protected| {
+            if (std.ascii.eqlIgnoreCase(folder, protected)) return false;
+        }
+        return true;
+    }
+
+    fn recoverJunkFolder(self: *const Service, a: std.mem.Allocator, user: []const u8, reference: []const u8) ![]const u8 {
+        const source = (try self.db.junkSource(a, user, reference)) orelse return "INBOX";
+        if (!self.canMarkJunk(source) or !(try maildir.folderExists(a, user, source))) return "INBOX";
+        return source;
+    }
+
+    pub fn stageUpload(self: *Service, user: []const u8, upload: store.Upload, allowed: Limits, now: i64) !void {
+        // The caller holds mutations across the idempotent lookup and insert.
+        const hosted = (try self.db.hostedLimits(user)) != null;
+        const bytes = @max(allowed.maxTotalBytes * (if (hosted) @as(usize, 2) else 10), 1024 * 1024);
+        const count: usize = if (hosted) 128 else std.math.maxInt(i64);
+        store.addUpload(self.db, user, upload, now, bytes, count) catch |err| switch (err) {
+            store.StoreError.StorageLimit => {
+                try store.sweep(self.db, now, user);
+                try store.addUpload(self.db, user, upload, now, bytes, count);
+            },
+            else => return err,
+        };
+    }
+
+    pub fn sweep(self: *Service, now: i64) !void {
+        self.mutations.lock();
+        defer self.mutations.unlock();
+        try store.sweep(self.db, now, null);
+    }
+
+    /// Legacy clients can submit base64 attachments without staging an upload.
+    /// Check them at request time, outside the shared webmail mutation lock.
+    pub fn scanInlineAttachments(self: *Service, scanner: ?*clamav.ClamAVScanner, a: std.mem.Allocator, user: []const u8, payload: Payload) !void {
+        const active = scanner orelse return;
+        if (payload.attachments.len == 0) return;
+        const allowed = try self.limits(user);
+        if (payload.attachments.len > allowed.maxCount) return ServiceError.AttachmentLimit;
+        var total: usize = 0;
+        for (payload.attachments) |attachment| {
+            if (attachment.uploadId != null) continue;
+            const bytes = try decodeInlineAttachment(a, attachment.data, @min(allowed.maxFileBytes, allowed.maxTotalBytes - total));
+            defer a.free(bytes);
+            total += bytes.len;
+            try clamav.requireAllowed(active, bytes);
+        }
     }
 
     pub fn payloadMessage(self: *Service, a: std.mem.Allocator, payload: Payload, user: []const u8, email: []const u8, draft: bool) !compose.Message {
@@ -103,13 +200,7 @@ pub const Service = struct {
                 name = upload.filename;
                 content_type = upload.content_type;
                 break :blk upload.data;
-            } else blk: {
-                const size = std.base64.standard.Decoder.calcSizeForSlice(attachment.data) catch return ServiceError.InvalidAttachment;
-                if (size > allowed.maxFileBytes) return ServiceError.AttachmentLimit;
-                const buffer = try a.alloc(u8, size);
-                std.base64.standard.Decoder.decode(buffer, attachment.data) catch return ServiceError.InvalidAttachment;
-                break :blk buffer;
-            };
+            } else try decodeInlineAttachment(a, attachment.data, allowed.maxFileBytes);
             if (!validFilename(name) or !validContentType(content_type)) return ServiceError.InvalidAttachment;
             total = std.math.add(usize, total, bytes.len) catch return ServiceError.AttachmentLimit;
             if (bytes.len > allowed.maxFileBytes or total > allowed.maxTotalBytes) return ServiceError.AttachmentLimit;
@@ -167,11 +258,22 @@ pub const Service = struct {
         const msg = try self.payloadMessage(a, payload, user, email, true);
         const raw = try compose.buildMime(a, msg, time.timestamp(), try std.fmt.allocPrint(a, "<draft.{s}@{s}>", .{ id, self.config.hostname }));
         if (raw.len > self.config.max_message_bytes) return ServiceError.AttachmentLimit;
-        const uid = try maildir.saveDraft(a, self.db, user, raw, existing);
-        var saved = payload;
-        saved.draftId = id;
-        saved.draftUid = uid;
-        const record = store.Record{ .username = user, .kind = "draft", .id = id, .payload = try json(a, Draft{ .uid = uid, .message = saved }), .state = "saved", .revision = expected, .due_at = 0, .expires_at = 0 };
+        self.db.lockMailboxes();
+        defer self.db.unlockMailboxes();
+        const write = try maildir.prepareDraft(a, self.db, user, raw.len, existing);
+        const uid = write.uid;
+        const record: store.Record = blk: {
+            errdefer if (existing == null) write.forgetUid(self.db, user);
+            var saved = payload;
+            saved.draftId = id;
+            saved.draftUid = uid;
+            const record = store.Record{ .username = user, .kind = "draft", .id = id, .payload = try json(a, Draft{ .uid = uid, .message = saved }), .state = "saved", .revision = expected, .due_at = 0, .expires_at = 0 };
+            if (!resume_queued and (try self.db.hostedLimits(user)) != null) {
+                try store.checkRecordCapacity(self.db, record, @max(1024 * 1024, 2 * self.config.max_message_bytes), 200);
+            }
+            try write.save(a, self.db, user, raw);
+            break :blk record;
+        };
         const revision = try store.put(self.db, record, expected);
         return .{ .uid = uid, .draftId = id, .revision = revision };
     }
@@ -183,11 +285,16 @@ pub const Service = struct {
         if (!store.validId(id)) return ServiceError.InvalidPayload;
         const delay = payload.delaySeconds orelse self.config.undo_send_seconds;
         if (delay > 30) return ServiceError.InvalidPayload;
-        const serialized = try json(a, Outbox{ .message = payload });
+        const serialized = try json(a, Outbox{ .message = payload, .reply_cutoff_ms = time.milliTimestamp() });
         if (store.get(a, self.db, user, "outbox", id)) |known| {
             const parsed = try std.json.parseFromSlice(Outbox, a, known.payload, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            if (!std.mem.eql(u8, try json(a, parsed.value.message), try json(a, payload))) return ServiceError.Conflict;
+            const incoming = try json(a, payload);
+            const matches = if (parsed.value.request_hash) |digest|
+                std.mem.eql(u8, digest, try sendFingerprint(a, payload))
+            else
+                std.mem.eql(u8, try json(a, parsed.value.message), incoming);
+            if (!matches) return ServiceError.Conflict;
             return known;
         } else |err| if (err != store.StoreError.NotFound) return err;
         const msg = try self.payloadMessage(a, payload, user, email, false);
@@ -200,6 +307,16 @@ pub const Service = struct {
             if (row.revision != payload.draftRevision or !std.mem.eql(u8, row.state, "saved")) return ServiceError.Conflict;
         }
         var row = store.Record{ .username = user, .kind = "outbox", .id = id, .payload = serialized, .state = "pending", .revision = 0, .due_at = now + delay, .expires_at = 0 };
+        if ((try self.db.hostedLimits(user)) != null) {
+            const bytes = @max(1024 * 1024, 2 * self.config.max_message_bytes);
+            store.checkRecordCapacity(self.db, row, bytes, 1024) catch |err| switch (err) {
+                store.StoreError.OutboxStorageLimit => {
+                    try store.sweep(self.db, now, user);
+                    try store.checkRecordCapacity(self.db, row, bytes, 1024);
+                },
+                else => return err,
+            };
+        }
         row.revision = try store.put(self.db, row, 0);
         if (payload.draftId) |draft_id| {
             var draft = try store.get(a, self.db, user, "draft", draft_id);
@@ -232,18 +349,34 @@ pub const Service = struct {
         const parsed = try std.json.parseFromSlice(Outbox, a, row.payload, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         var doc = parsed.value;
-        self.deliver(a, row.username, &doc) catch {
+        self.deliver(a, row.username, &doc) catch |err| {
             row.state = "failed";
-            doc.error_message = "Delivery failed. Review this message before retrying.";
+            doc.error_message = switch (err) {
+                error.HostedSendingLimit => "Daily recipient allowance exhausted. Try again after midnight UTC.",
+                error.HostedSenderDisabled => "This mailbox is disabled. The message was not sent.",
+                error.HostedStorageFull => "A recipient mailbox is full. Review the recipients before retrying.",
+                error.HostedRecipientDisabled => "A recipient mailbox is disabled. Review the recipients before retrying.",
+                else => "Delivery failed. Review this message before retrying.",
+            };
         };
-        if (doc.result) |result| row.state = if (result.failed.len == 0) (if (result.sent_saved) "sent" else "sent_unfiled") else (if (result.delivered > 0) "partial" else "failed");
-        row.payload = try json(a, doc);
-        row.expires_at = now + 7 * 86400;
+        if (doc.result) |result| {
+            row.state = if (result.failed.len == 0) (if (result.sent_saved) "sent" else "sent_unfiled") else (if (result.delivered > 0) "partial" else "failed");
+            doc.error_message = result.limit_notice;
+        }
+        var retained = doc;
+        const compact = (std.mem.eql(u8, row.state, "sent") or std.mem.eql(u8, row.state, "sent_unfiled")) and
+            (try self.db.hostedLimits(row.username)) != null;
+        if (compact) {
+            retained.request_hash = try sendFingerprint(a, doc.message);
+            retained.message = .{ .subject = doc.message.subject, .to = doc.message.to };
+        }
+        row.payload = try json(a, retained);
+        row.expires_at = now + store.terminal_retention;
         row.revision = try store.put(self.db, row, row.revision);
         self.finishDraft(a, row.username, doc) catch |err| {
             std.log.warn("webmail could not reconcile the draft after delivery: {}", .{err});
-            doc.error_message = "Draft cleanup needs attention. Review the delivery result in Outbox before sending again.";
-            row.payload = try json(a, doc);
+            retained.error_message = "Draft cleanup needs attention. Review the delivery result in Outbox before sending again.";
+            row.payload = try json(a, retained);
             _ = try store.put(self.db, row, row.revision);
         };
         return true;
@@ -267,7 +400,7 @@ pub const Service = struct {
             } else |err| if (err != store.StoreError.NotFound) return err;
         }
         row.state = "resolved";
-        row.expires_at = now + 7 * 86400;
+        row.expires_at = now + store.terminal_retention;
         row.revision = try store.put(self.db, row, row.revision);
         return row;
     }
@@ -275,16 +408,35 @@ pub const Service = struct {
     fn deliver(self: *Service, a: std.mem.Allocator, user: []const u8, doc: *Outbox) !void {
         var account = try self.db.getUserByUsername(user);
         defer account.deinit(self.db.allocator);
-        if (!account.enabled) return ServiceError.InvalidPayload;
+        if (!account.enabled) return error.HostedSenderDisabled;
         const msg = try self.payloadMessage(a, doc.message, user, account.email, false);
         doc.result = try compose.send(a, msg, .{ .hostname = self.config.hostname, .delivery_method = self.config.delivery_method, .ses_region = self.config.ses_region, .sender_user = user, .mail_config = self.config.mail_config, .auth = self.auth });
         if (doc.result.?.delivered > 0) {
             if (doc.message.replyContext) |context| {
-                const replied = maildir.getMessage(a, self.db, user, context.folder, context.uid) catch return;
-                var flags = replied.flags;
-                flags.answered = true;
-                _ = maildir.setFlags(a, self.db, user, context.folder, context.uid, flags) catch {};
+                self.finishReply(a, user, context, doc.*) catch |err| std.log.warn("could not update the replied-to message: {}", .{err});
             }
+        }
+    }
+
+    fn finishReply(self: *Service, a: std.mem.Allocator, user: []const u8, context: MessageRef, doc: Outbox) !void {
+        self.db.lockMailboxes();
+        defer self.db.unlockMailboxes();
+        if (context.reference) |reference| {
+            const original = try maildir.resolveVersioned(a, self.db, user, reference);
+            if (doc.message.clearFollowUp and doc.result.?.failed.len == 0 and doc.reply_cutoff_ms > 0) {
+                const ids = try thread_ids.parse(a, original.raw);
+                const keys = try std.json.Stringify.valueAlloc(a, try ids.keys(a), .{});
+                try self.db.clearFollowUp(user, reference, keys, doc.reply_cutoff_ms);
+            }
+            const detail = try maildir.getMessage(a, self.db, user, original.locator.folder, original.locator.uid);
+            var flags = detail.flags;
+            flags.answered = true;
+            _ = try maildir.setFlagsLocked(a, self.db, user, original.locator.folder, original.locator.uid, flags);
+        } else {
+            const detail = try maildir.getMessage(a, self.db, user, context.folder, context.uid);
+            var flags = detail.flags;
+            flags.answered = true;
+            _ = try maildir.setFlagsLocked(a, self.db, user, context.folder, context.uid, flags);
         }
     }
 
@@ -342,19 +494,33 @@ pub const Service = struct {
         defer self.mutations.unlock();
         if (payload.messages.len == 0 or payload.messages.len > 100) return ServiceError.InvalidPayload;
         if (payload.action == .move and !maildir.isValidFolderName(payload.folder)) return ServiceError.InvalidAction;
+        const gives_feedback = payload.action == .junk or payload.action == .not_junk;
+        self.db.lockMailboxes();
+        defer self.db.unlockMailboxes();
+        const selection = try a.dupe(MessageRef, payload.messages);
         // Preflight the complete selection, without retaining decoded attachments.
-        for (payload.messages, 0..) |ref, index| {
-            if (ref.uid < 1 or !maildir.isValidFolderName(ref.folder)) return ServiceError.InvalidPayload;
-            if (payload.action == .purge and !std.mem.eql(u8, ref.folder, "Trash")) return ServiceError.InvalidAction;
-            for (payload.messages[0..index]) |prior| if (prior.uid == ref.uid and std.mem.eql(u8, prior.folder, ref.folder)) return ServiceError.InvalidPayload;
+        for (selection, 0..) |*ref, index| {
             var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer scratch.deinit();
-            _ = try maildir.rawMessage(scratch.allocator(), self.db, user, ref.folder, ref.uid);
+            if (ref.reference) |id| {
+                const expected = ref.revision orelse return ServiceError.InvalidPayload;
+                const locator = try maildir.checkRevision(scratch.allocator(), self.db, user, id, expected);
+                ref.uid = locator.uid;
+                ref.folder = try a.dupe(u8, locator.folder);
+            } else {
+                if (gives_feedback or ref.revision != null or ref.uid < 1 or !maildir.isValidFolderName(ref.folder)) return ServiceError.InvalidPayload;
+                if (std.ascii.eqlIgnoreCase(ref.folder, "INBOX")) ref.folder = "INBOX";
+                _ = try maildir.rawMessage(scratch.allocator(), self.db, user, ref.folder, ref.uid);
+            }
+            if (payload.action == .purge and !std.mem.eql(u8, ref.folder, "Trash")) return ServiceError.InvalidAction;
+            if (payload.action == .junk and !self.canMarkJunk(ref.folder)) return ServiceError.InvalidAction;
+            if (payload.action == .not_junk and !self.isJunkFolder(ref.folder)) return ServiceError.InvalidAction;
+            for (selection[0..index]) |prior| if (prior.uid == ref.uid and std.mem.eql(u8, prior.folder, ref.folder)) return ServiceError.InvalidPayload;
         }
         var entries: std.ArrayList(UndoEntry) = .empty;
         var results: std.ArrayList(ActionResult) = .empty;
         var all_ok = true;
-        for (payload.messages) |ref| {
+        for (selection) |ref| {
             var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer scratch.deinit();
             const temp = scratch.allocator();
@@ -365,14 +531,24 @@ pub const Service = struct {
             };
             var after = item.flags;
             var destination = ref;
-            const moved = payload.action == .move or payload.action == .trash;
+            const feedback: ?message_refs.JunkChange = if (gives_feedback) .{
+                .action = if (payload.action == .junk) .junk else .not_junk,
+                .receipt = try store.newId(a),
+            } else null;
+            const purge = payload.action == .purge or (payload.action == .delete and std.mem.eql(u8, ref.folder, "Trash"));
+            const moved = gives_feedback or payload.action == .move or payload.action == .trash or (payload.action == .delete and !purge);
             const action_ok = blk: {
-                if (payload.action == .purge) {
-                    maildir.deleteMessage(temp, self.db, user, ref.folder, ref.uid) catch break :blk false;
+                if (purge) {
+                    maildir.deleteMessageLocked(temp, self.db, user, ref.folder, ref.uid) catch break :blk false;
                     self.updateDraftLocation(a, user, ref, null) catch {};
                 } else if (moved) {
-                    destination.folder = if (payload.action == .trash) "Trash" else payload.folder;
-                    destination.uid = maildir.moveMessage(temp, self.db, user, ref.folder, ref.uid, destination.folder) catch break :blk false;
+                    destination.folder = switch (payload.action) {
+                        .move => payload.folder,
+                        .junk => self.junkFolder(),
+                        .not_junk => try self.recoverJunkFolder(a, user, ref.reference.?),
+                        else => "Trash",
+                    };
+                    destination.uid = maildir.moveWithFeedbackLocked(temp, self.db, user, ref.folder, ref.uid, destination.folder, feedback) catch break :blk false;
                     self.updateDraftLocation(a, user, ref, destination) catch {};
                 } else {
                     switch (payload.action) {
@@ -382,13 +558,26 @@ pub const Service = struct {
                         .unflag => after.flagged = false,
                         else => unreachable,
                     }
-                    _ = maildir.setFlags(temp, self.db, user, ref.folder, ref.uid, after) catch break :blk false;
+                    _ = maildir.setFlagsLocked(temp, self.db, user, ref.folder, ref.uid, after) catch break :blk false;
                 }
                 break :blk true;
             };
-            if (action_ok and payload.action != .purge) {
+            if (action_ok and !purge) {
                 const raw = try maildir.rawMessage(temp, self.db, user, destination.folder, destination.uid);
-                try entries.append(a, .{ .original = ref, .current = destination, .before = item.flags, .after = after, .fingerprint = try fingerprint(a, raw), .moved = moved });
+                if (ref.reference != null) {
+                    const version = try maildir.versionAt(temp, self.db, user, destination.folder, destination.uid);
+                    destination.reference = try a.dupe(u8, version.reference);
+                    destination.revision = try a.dupe(u8, version.revision);
+                }
+                try entries.append(a, .{
+                    .original = ref,
+                    .current = destination,
+                    .before = item.flags,
+                    .after = after,
+                    .fingerprint = try fingerprint(a, raw),
+                    .moved = moved,
+                    .junkReceipt = if (feedback) |change| change.receipt else null,
+                });
             }
             all_ok = all_ok and action_ok;
             try results.append(a, .{ .uid = ref.uid, .folder = ref.folder, .ok = action_ok, .new_uid = if (action_ok) destination.uid else null, .new_folder = if (action_ok) destination.folder else null, .error_code = if (action_ok) null else "operation_failed" });
@@ -435,18 +624,27 @@ pub const Service = struct {
     }
 
     fn restore(self: *Service, a: std.mem.Allocator, user: []const u8, entry: UndoEntry) !MessageRef {
+        self.db.lockMailboxes();
+        defer self.db.unlockMailboxes();
         var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer scratch.deinit();
         const temp = scratch.allocator();
+        if (entry.current.reference) |id| {
+            _ = maildir.checkRevision(temp, self.db, user, id, entry.current.revision.?) catch |err| switch (err) {
+                maildir.MaildirError.MessageNotFound, maildir.MaildirError.RevisionMismatch => return ServiceError.MessageChanged,
+                else => return err,
+            };
+        }
         const message = try maildir.getMessage(temp, self.db, user, entry.current.folder, entry.current.uid);
         const raw = try maildir.rawMessage(temp, self.db, user, entry.current.folder, entry.current.uid);
         if (!std.meta.eql(message.flags, entry.after) or !std.mem.eql(u8, try fingerprint(temp, raw), entry.fingerprint)) return ServiceError.MessageChanged;
         var location = entry.current;
         if (entry.moved and !std.mem.eql(u8, entry.current.folder, entry.original.folder)) {
             location.folder = entry.original.folder;
-            location.uid = try maildir.moveMessage(temp, self.db, user, entry.current.folder, entry.current.uid, location.folder);
+            const feedback: ?message_refs.JunkChange = if (entry.junkReceipt) |receipt| .{ .action = .undo, .receipt = receipt } else null;
+            location.uid = try maildir.moveWithFeedbackLocked(temp, self.db, user, entry.current.folder, entry.current.uid, location.folder, feedback);
             try self.updateDraftLocation(a, user, entry.current, location);
-        } else _ = try maildir.setFlags(temp, self.db, user, location.folder, location.uid, entry.before);
+        } else _ = try maildir.setFlagsLocked(temp, self.db, user, location.folder, location.uid, entry.before);
         return location;
     }
 };
@@ -492,6 +690,15 @@ fn failedLabels(a: std.mem.Allocator, addresses: []const []const u8, labels: []c
         break;
     };
     return output.toOwnedSlice(a);
+}
+
+fn sendFingerprint(a: std.mem.Allocator, payload: Payload) ![]const u8 {
+    const raw = try json(a, payload);
+    if (payload.clearFollowUp) return fingerprint(a, raw);
+    // Keep hashes from compact Outbox rows written before the toggle exists.
+    var legacy = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{});
+    _ = legacy.object.orderedRemove("clearFollowUp");
+    return fingerprint(a, try json(a, legacy));
 }
 
 fn fingerprint(a: std.mem.Allocator, raw: []const u8) ![]const u8 {

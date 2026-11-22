@@ -1585,27 +1585,70 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
 
   /webmail/api/search:
-    post:
+    get:
       tags:
         - Webmail
       summary: Search messages
-      description: Search messages with various criteria.
+      description: Search the signed-in mailbox and verify matches against live Maildir files.
       operationId: searchWebmailMessages
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/WebmailSearchRequest'
+      parameters:
+        - in: query
+          name: q
+          required: true
+          schema: { type: string, maxLength: 256 }
+        - in: query
+          name: folder
+          schema: { type: string, default: '*' }
+        - in: query
+          name: from
+          schema: { type: string }
+        - in: query
+          name: to
+          schema: { type: string }
+        - in: query
+          name: filename
+          schema: { type: string }
+        - in: query
+          name: after
+          description: Earliest message timestamp in Unix seconds.
+          schema: { type: integer }
+        - in: query
+          name: before
+          description: Latest message timestamp in Unix seconds.
+          schema: { type: integer }
+        - in: query
+          name: status
+          schema: { type: string, enum: [any, read, unread, answered] }
+        - in: query
+          name: flagged
+          schema: { type: boolean }
+        - in: query
+          name: attachments
+          schema: { type: boolean }
+        - in: query
+          name: page
+          schema: { type: integer, minimum: 1, default: 1 }
+        - in: query
+          name: per_page
+          schema: { type: integer, minimum: 1, maximum: 200 }
+        - in: query
+          name: index_budget
+          description: Limit new or changed messages indexed per request and report pending progress.
+          schema: { type: integer, minimum: 1, maximum: 512 }
       responses:
         '200':
-          description: Search results
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/WebmailSearchResponse'
+          description: Page of search hits and index progress. Pending pages have no hits.
 
   /webmail/api/attachments:
+    get:
+      tags:
+        - Webmail
+      summary: List attachments
+      description: Uses the message search filters. Each result includes its file metadata and a versioned source message.
+      operationId: listWebmailAttachments
+      responses:
+        '200':
+          description: Page of attachment results and index progress. Pending pages have no results.
     post:
       tags:
         - Webmail

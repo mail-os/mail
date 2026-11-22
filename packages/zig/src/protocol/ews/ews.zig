@@ -6,7 +6,10 @@ const database = @import("../../storage/database.zig");
 const caldav_store = @import("../../storage/caldav_store.zig");
 const fs_compat = @import("../../core/fs_compat.zig");
 const time_compat = @import("../../core/time_compat.zig");
-const outbound = @import("../../delivery/outbound.zig");
+const submission = @import("../../delivery/submission.zig");
+const hosted_limits = @import("../../storage/hosted_limits.zig");
+const message_headers = @import("../../message/submission.zig");
+const maildir_path = @import("../../core/maildir_path.zig");
 const config = @import("../../core/config.zig");
 
 pub const autodiscover = @import("autodiscover.zig");
@@ -27,8 +30,9 @@ pub const Context = struct {
     allocator: std.mem.Allocator,
     /// Authenticated user (full email).
     username: []const u8,
-    /// Maildir directory name for the user (local part of the address).
+    /// Canonical Maildir key for hosted accounts, legacy local part otherwise.
     local_part: []const u8,
+    hosted: bool = false,
     /// Public hostname (for self-referential URLs).
     hostname: []const u8,
     /// Database (IMAP UID mapping for stable item ids).
@@ -39,6 +43,7 @@ pub const Context = struct {
     delivery_method: config.DeliveryMethod = .direct,
     /// AWS SES region (only used when delivery_method == .ses).
     ses_region: []const u8 = "us-east-1",
+    mail_config: ?*const config.Config = null,
 };
 
 pub const Response = struct {
@@ -111,9 +116,6 @@ fn folderById(id: []const u8) ?FolderDef {
 pub fn handleSoap(ctx: *Context, soap: []const u8) !Response {
     const op = extractOperation(soap);
     logger.info("EWS: op={s} user={s} bytes={d}", .{ op, ctx.username, soap.len });
-    // Log a chunk of the request so the exact macOS SOAP can be implemented.
-    const peek = soap[0..@min(soap.len, 1400)];
-    logger.info("EWS req: {s}", .{peek});
 
     if (std.mem.eql(u8, op, "GetFolder")) return getFolder(ctx, soap);
     if (std.mem.eql(u8, op, "SyncFolderHierarchy")) return syncFolderHierarchy(ctx, soap);
@@ -599,18 +601,21 @@ const MailItem = struct {
 
 const FoundMail = struct { content: []const u8, seen: bool, epoch: i64 };
 
-fn mailboxDirs(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8) ![2][]const u8 {
+fn mailboxDirs(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8) ![][]const u8 {
+    try maildir_path.validate(mailbox);
     if (std.mem.eql(u8, mailbox, "INBOX")) {
-        return .{
+        return a.dupe([]const u8, &.{
             try std.fmt.allocPrint(a, "mail/{s}/new", .{ctx.local_part}),
             try std.fmt.allocPrint(a, "mail/{s}/cur", .{ctx.local_part}),
-        };
+        });
     }
     const base = try std.fmt.allocPrint(a, "mail/{s}/{s}", .{ ctx.local_part, mailbox });
-    return .{
+    const nested = [_][]const u8{
         try std.fmt.allocPrint(a, "{s}/new", .{base}),
         try std.fmt.allocPrint(a, "{s}/cur", .{base}),
     };
+    if (ctx.hosted) return a.dupe([]const u8, &.{ base, nested[0], nested[1] });
+    return a.dupe([]const u8, &nested);
 }
 
 fn collectMail(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, out: *std.ArrayList(MailItem)) !void {
@@ -899,16 +904,21 @@ fn xmlUnescape(a: std.mem.Allocator, s: []const u8) ![]u8 {
 
 /// Collect the `<t:EmailAddress>` values inside a recipients block.
 fn collectEmails(a: std.mem.Allocator, block: []const u8, out: *std.ArrayList([]const u8)) !void {
-    const tag = "EmailAddress>";
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, block, i, tag)) |p| {
-        const vstart = p + tag.len;
-        const close = std.mem.indexOfScalarPos(u8, block, vstart, '<') orelse break;
-        const email = std.mem.trim(u8, block[vstart..close], " \t\r\n");
-        if (email.len > 0 and std.mem.indexOfScalar(u8, email, '@') != null) {
-            try out.append(a, email);
-        }
-        i = close + 1;
+    var pos: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, block, pos, '<')) |start| {
+        const end = std.mem.indexOfScalarPos(u8, block, start + 1, '>') orelse break;
+        const tag = block[start + 1 .. end];
+        pos = end + 1;
+        if (tag.len == 0 or tag[0] == '/') continue;
+        const name_end = std.mem.indexOfAny(u8, tag, " \t\r\n/") orelse tag.len;
+        const name = tag[0..name_end];
+        const local = if (std.mem.indexOfScalar(u8, name, ':')) |colon| name[colon + 1 ..] else name;
+        if (!std.mem.eql(u8, local, "EmailAddress")) continue;
+        if (tag[tag.len - 1] == '/') return error.InvalidAddress;
+        const close = std.mem.indexOfScalarPos(u8, block, pos, '<') orelse return error.InvalidAddress;
+        const email = std.mem.trim(u8, block[pos..close], " \t\r\n");
+        try out.append(a, try xmlUnescape(a, email));
+        pos = close;
     }
 }
 
@@ -952,14 +962,56 @@ fn rfc2822Date(a: std.mem.Allocator, epoch: i64) []const u8 {
     }) catch "Thu, 01 Jan 1970 00:00:00 +0000";
 }
 
-/// Write `data` into mail/{user}/{mailbox}/{sub}/{filename} (Maildir).
-fn saveToMailbox(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, sub: []const u8, filename: []const u8, data: []const u8) !void {
-    const dir = try std.fmt.allocPrint(a, "mail/{s}/{s}/{s}", .{ ctx.local_part, mailbox, sub });
-    fs_compat.cwd().makePath(dir) catch {};
-    const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, filename });
-    const file = try fs_compat.cwd().createFile(path, .{});
-    defer file.close();
-    try file.writeAll(data);
+fn savedMailPath(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, sub: []const u8, filename: []const u8) ![]const u8 {
+    const dir = if (ctx.hosted)
+        try std.fmt.allocPrint(a, "mail/{s}/{s}", .{ ctx.local_part, mailbox })
+    else
+        try std.fmt.allocPrint(a, "mail/{s}/{s}/{s}", .{ ctx.local_part, mailbox, sub });
+    try fs_compat.cwd().makePath(dir);
+    return std.fmt.allocPrint(a, "{s}/{s}", .{ dir, filename });
+}
+
+fn appendMailResult(a: std.mem.Allocator, buf: *std.ArrayList(u8), comptime op: []const u8, err: ?anyerror) !void {
+    if (err) |failure| {
+        const code, const message = switch (failure) {
+            error.HostedSendingLimit => .{ "ErrorSubmissionQuotaExceeded", "Daily recipient allowance exhausted. Try again after midnight UTC." },
+            error.HostedStorageFull => .{ "ErrorQuotaExceeded", "Mailbox storage is full." },
+            error.HostedRecipientDisabled, error.HostedSenderDisabled => .{ "ErrorAccessDenied", "Mailbox is disabled." },
+            error.NoRecipients => .{ "ErrorMissingRecipients", "At least one recipient is required." },
+            error.InvalidAddress => .{ "ErrorInvalidRecipients", "Check the recipient addresses." },
+            error.ItemNotFound => .{ "ErrorItemNotFound", "The message could not be found." },
+            error.PartialDelivery => .{ "ErrorMessageSubmissionBlocked", "Some recipients received the message. Review delivery before retrying." },
+            else => .{ "ErrorInternalServerError", "The message could not be processed." },
+        };
+        try buf.print(a, "<m:" ++ op ++ "ResponseMessage ResponseClass=\"Error\"><m:MessageText>{s}</m:MessageText><m:ResponseCode>{s}</m:ResponseCode></m:" ++ op ++ "ResponseMessage>", .{ message, code });
+    } else {
+        try buf.appendSlice(a, "<m:" ++ op ++ "ResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode></m:" ++ op ++ "ResponseMessage>");
+    }
+}
+
+fn mailResult(ctx: *Context, a: std.mem.Allocator, comptime op: []const u8, err: ?anyerror) !Response {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(a, "<m:" ++ op ++ "Response><m:ResponseMessages>");
+    try appendMailResult(a, &buf, op, err);
+    try buf.appendSlice(a, "</m:ResponseMessages></m:" ++ op ++ "Response>");
+    return .{ .body = try envelope(ctx.allocator, buf.items) };
+}
+
+fn submitMail(a: std.mem.Allocator, ctx: *Context, recipients: []const []const u8, raw: []const u8, sent_path: ?[]const u8, sent_copy: []const u8) !void {
+    try submission.sendRaw(a, .{
+        .hostname = ctx.hostname,
+        .mail_config = ctx.mail_config,
+        .delivery_method = ctx.delivery_method,
+        .ses_region = ctx.ses_region,
+        .db = ctx.db,
+        .local_hosted_only = true,
+    }, .{
+        .mailbox = ctx.username,
+        .from = ctx.username,
+        .recipients = recipients,
+        .raw = raw,
+        .sent = if (sent_path) |path| .{ .path = path, .bytes = sent_copy } else null,
+    });
 }
 
 /// Map an EWS distinguished folder id back to the Maildir mailbox name.
@@ -1002,8 +1054,15 @@ fn createItem(ctx: *Context, soap: []const u8) !Response {
 
     var to_list = std.ArrayList([]const u8).empty;
     var cc_list = std.ArrayList([]const u8).empty;
-    if (elementText(scope, "ToRecipients")) |blk| try collectEmails(a, blk, &to_list);
-    if (elementText(scope, "CcRecipients")) |blk| try collectEmails(a, blk, &cc_list);
+    var bcc_list = std.ArrayList([]const u8).empty;
+    if (elementText(scope, "ToRecipients")) |blk| collectEmails(a, blk, &to_list) catch |err|
+        return mailResult(ctx, a, "CreateItem", err);
+    if (elementText(scope, "CcRecipients")) |blk| collectEmails(a, blk, &cc_list) catch |err|
+        return mailResult(ctx, a, "CreateItem", err);
+    if (elementText(scope, "BccRecipients")) |blk| collectEmails(a, blk, &bcc_list) catch |err|
+        return mailResult(ctx, a, "CreateItem", err);
+    const recipients = submission.distinctRecipients(a, &.{ to_list.items, cc_list.items, bcc_list.items }) catch |err|
+        return mailResult(ctx, a, "CreateItem", err);
 
     logger.info("EWS CreateItem: disp={s} subj_len={d} to={d} cc={d} bodytype={s}", .{
         disposition, subject.len, to_list.items.len, cc_list.items.len, body_type,
@@ -1019,21 +1078,10 @@ fn createItem(ctx: *Context, soap: []const u8) !Response {
 
     var msg = std.ArrayList(u8).empty;
     try msg.print(a, "From: {s}\r\n", .{ctx.username});
-    if (to_list.items.len > 0) {
-        try msg.appendSlice(a, "To: ");
-        for (to_list.items, 0..) |r, idx| {
-            if (idx > 0) try msg.appendSlice(a, ", ");
-            try msg.appendSlice(a, headerSafe(a, r));
-        }
-        try msg.appendSlice(a, "\r\n");
-    }
-    if (cc_list.items.len > 0) {
-        try msg.appendSlice(a, "Cc: ");
-        for (cc_list.items, 0..) |r, idx| {
-            if (idx > 0) try msg.appendSlice(a, ", ");
-            try msg.appendSlice(a, headerSafe(a, r));
-        }
-        try msg.appendSlice(a, "\r\n");
+    const fields = [_][]const u8{ "To", "Cc", "Bcc" };
+    for (fields, [_][]const []const u8{ to_list.items, cc_list.items, bcc_list.items }) |name, addresses| {
+        if (addresses.len == 0) continue;
+        try msg.print(a, "{s}: {s}\r\n", .{ name, try std.mem.join(a, ", ", addresses) });
     }
     try msg.print(a, "Subject: {s}\r\n", .{headerSafe(a, subject)});
     try msg.print(a, "Date: {s}\r\n", .{date_hdr});
@@ -1045,36 +1093,27 @@ fn createItem(ctx: *Context, soap: []const u8) !Response {
     if (!std.mem.endsWith(u8, msg.items, "\n")) try msg.appendSlice(a, "\r\n");
     const message_data = msg.items;
 
-    // Deliver to every recipient (To + Cc).
-    var delivered: usize = 0;
-    var failed: usize = 0;
-    if (do_send) {
-        var all = std.ArrayList([]const u8).empty;
-        try all.appendSlice(a, to_list.items);
-        try all.appendSlice(a, cc_list.items);
-        for (all.items) |rcpt| {
-            outbound.deliverToRemote(ctx.allocator, ctx.username, rcpt, message_data, ctx.hostname, ctx.delivery_method, ctx.ses_region) catch |err| {
-                logger.err("EWS CreateItem: delivery to {s} failed: {s}", .{ rcpt, @errorName(err) });
-                failed += 1;
-                continue;
-            };
-            delivered += 1;
-        }
-        logger.info("EWS CreateItem: delivered={d} failed={d}", .{ delivered, failed });
-    }
-
-    // Save a copy: Sent (read) for sends, Drafts (unread) for SaveOnly.
     const target_mailbox: []const u8 = if (do_send) "Sent" else "Drafts";
     const sub: []const u8 = if (do_send) "cur" else "new";
-    const suffix: []const u8 = if (do_send) ":2,S" else ":2,";
+    const suffix: []const u8 = if (do_send) ":2,S" else ":2,D";
     const filename = try std.fmt.allocPrint(a, "{d}.{d}{d}.{s}.eml{s}", .{ epoch, nanos, seq, ctx.hostname, suffix });
     const item_folder: []const u8 = if (do_send) "sentitems" else "drafts";
-    if (save_copy) {
-        saveToMailbox(a, ctx, target_mailbox, sub, filename, message_data) catch |err| {
-            logger.err("EWS CreateItem: save to {s} failed: {s}", .{ target_mailbox, @errorName(err) });
-        };
+    const path = if (save_copy)
+        savedMailPath(a, ctx, target_mailbox, sub, filename) catch |err| return mailResult(ctx, a, "CreateItem", err)
+    else
+        null;
+
+    if (do_send) {
+        if (recipients.len == 0) return mailResult(ctx, a, "CreateItem", error.InvalidAddress);
+        const raw = if (bcc_list.items.len > 0) try message_headers.withoutBcc(a, message_data) else message_data;
+        submitMail(a, ctx, recipients, raw, path, message_data) catch |err|
+            return mailResult(ctx, a, "CreateItem", err);
+    } else if (path) |draft| {
+        hosted_limits.write(ctx.db, a, ctx.username, draft, message_data) catch |err|
+            return mailResult(ctx, a, "CreateItem", err);
     }
 
+    if (path == null) return mailResult(ctx, a, "CreateItem", null);
     const item_basename = maildirBaseName(filename);
     var buf = std.ArrayList(u8).empty;
     try buf.print(a,
@@ -1388,47 +1427,33 @@ fn sendItem(ctx: *Context, soap: []const u8) !Response {
     var buf = std.ArrayList(u8).empty;
     try buf.appendSlice(a, "<m:SendItemResponse><m:ResponseMessages>");
     for (ids.items) |id| {
-        var ok = true;
-        const colon = std.mem.indexOfScalar(u8, id, ':');
-        if (colon) |cpos| {
-            const folder = id[0..cpos];
-            const basename = id[cpos + 1 ..];
-            const mailbox = ewsFolderToMailbox(folder);
-            if (readMailFile(a, ctx, mailbox, basename)) |found| {
-                const split = headerBodySplit(found.content);
-                const headers = found.content[0..split.header_end];
-                var rcpts = std.ArrayList([]const u8).empty;
-                try collectHeaderAddrs(a, headers, "To", &rcpts);
-                try collectHeaderAddrs(a, headers, "Cc", &rcpts);
-                for (rcpts.items) |rcpt| {
-                    outbound.deliverToRemote(ctx.allocator, ctx.username, rcpt, found.content, ctx.hostname, ctx.delivery_method, ctx.ses_region) catch |err| {
-                        logger.err("EWS SendItem: delivery to {s} failed: {s}", .{ rcpt, @errorName(err) });
-                        ok = false;
-                    };
-                }
-                if (save_copy) {
-                    const epoch = time_compat.timestamp();
-                    const seq = send_seq.fetchAdd(1, .monotonic);
-                    const fname = try std.fmt.allocPrint(a, "{d}.{d}.{s}.eml:2,S", .{ epoch, seq, ctx.hostname });
-                    saveToMailbox(a, ctx, "Sent", "cur", fname, found.content) catch {};
-                }
-            } else {
-                logger.err("EWS SendItem: item {s} not found", .{id});
-                ok = false;
-            }
-        } else ok = false;
-
-        if (ok) {
-            try buf.appendSlice(a, "<m:SendItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode></m:SendItemResponseMessage>");
-        } else {
-            try buf.appendSlice(a, "<m:SendItemResponseMessage ResponseClass=\"Error\"><m:MessageText>Item could not be sent</m:MessageText><m:ResponseCode>ErrorItemNotFound</m:ResponseCode></m:SendItemResponseMessage>");
-        }
+        sendSavedItem(a, ctx, id, save_copy) catch |err| {
+            try appendMailResult(a, &buf, "SendItem", err);
+            continue;
+        };
+        try appendMailResult(a, &buf, "SendItem", null);
     }
-    if (ids.items.len == 0) {
-        try buf.appendSlice(a, "<m:SendItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode></m:SendItemResponseMessage>");
-    }
+    if (ids.items.len == 0) try appendMailResult(a, &buf, "SendItem", error.ItemNotFound);
     try buf.appendSlice(a, "</m:ResponseMessages></m:SendItemResponse>");
     return Response{ .body = try envelope(ctx.allocator, buf.items) };
+}
+
+fn sendSavedItem(a: std.mem.Allocator, ctx: *Context, id: []const u8, save_copy: bool) !void {
+    const colon = std.mem.indexOfScalar(u8, id, ':') orelse return error.ItemNotFound;
+    const mailbox = ewsFolderToMailbox(id[0..colon]);
+    const found = readMailFile(a, ctx, mailbox, id[colon + 1 ..]) orelse return error.ItemNotFound;
+    const split = headerBodySplit(found.content);
+    const headers = found.content[0..split.header_end];
+    var addresses: std.ArrayList([]const u8) = .empty;
+    for ([_][]const u8{ "To", "Cc", "Bcc" }) |field| try collectHeaderAddrs(a, headers, field, &addresses);
+    const recipients = try submission.distinctRecipients(a, &.{addresses.items});
+    const raw = if (headerValue(a, headers, "Bcc") != null) try message_headers.withoutBcc(a, found.content) else found.content;
+    const path = if (save_copy) blk: {
+        const seq = send_seq.fetchAdd(1, .monotonic);
+        const filename = try std.fmt.allocPrint(a, "{d}.{d}.{s}.eml:2,S", .{ time_compat.timestamp(), seq, ctx.hostname });
+        break :blk try savedMailPath(a, ctx, "Sent", "cur", filename);
+    } else null;
+    try submitMail(a, ctx, recipients, raw, path, found.content);
 }
 
 fn findFolder(ctx: *Context, soap: []const u8) !Response {

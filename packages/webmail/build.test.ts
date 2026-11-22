@@ -29,10 +29,11 @@ for (const page of webmailPages) {
     expect(html).not.toContain('type="module" src=')
     if (html.includes('__stxModules['))
       expect(html).toMatch(/<script\b[^>]*data-stx-modules/)
+    expect(html).toContain('class="mail-icon"')
     if (page !== 'status')
-      expect(html).toContain('text-indigo-600')
+      expect(html).toContain('class="mail-app-mark"')
     if (page === 'index') {
-      expect(html).toContain('sandbox=""')
+      expect(html).toContain('sandbox="allow-popups allow-popups-to-escape-sandbox"')
       expect(html).toContain('/webmail/auth/password')
       expect(html).toContain('/webmail/auth/recovery')
     }

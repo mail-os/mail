@@ -361,3 +361,91 @@ export class MailAdminClient {
 export function createMailAdminClient(options: MailAdminClientOptions): MailAdminClient {
   return new MailAdminClient(options)
 }
+
+export interface MailProvisioningOptions {
+  baseUrl: string
+  token: string
+  fetch?: typeof fetch
+}
+
+export interface ProvisionedMailbox {
+  mailbox: string
+  revision: number
+  quota_bytes: number
+  send_recipients_per_day?: number
+  enabled: boolean
+}
+
+export interface MailProvisioningChange extends ProvisionedMailbox {
+  actor: string
+  operation_id: string
+  initial_recovery?: string
+  initial_password?: string
+}
+
+export class MailProvisioningError extends Error {
+  constructor(public status: number, public code: string, message: string) {
+    super(message)
+    this.name = 'MailProvisioningError'
+  }
+}
+
+/** Server-side client for the daemon's dedicated private listener. */
+export class MailProvisioningClient {
+  private readonly origin: string
+
+  constructor(private readonly options: MailProvisioningOptions) {
+    const url = new URL(options.baseUrl)
+    if ((url.protocol !== 'https:' && !(url.protocol === 'http:' && url.hostname === '127.0.0.1'))
+      || url.username || url.password || url.search || url.hash || url.pathname !== '/') {
+      throw new TypeError('Use a private HTTPS origin or an HTTP listener on 127.0.0.1.')
+    }
+    if (!/^[a-f\d]{64}$/i.test(options.token))
+      throw new TypeError('Provisioning requires a 64-character hexadecimal token.')
+    this.origin = url.origin
+  }
+
+  private async request<T>(path: string, data?: MailProvisioningChange): Promise<T> {
+    const response = await (this.options.fetch ?? fetch)(`${this.origin}/provisioning/v1/${path}`, {
+      method: data ? 'POST' : 'GET',
+      headers: {
+        'Authorization': `Bearer ${this.options.token}`,
+        'Accept': 'application/json',
+        ...(data ? { 'Content-Type': 'application/json' } : {}),
+      },
+      body: data ? JSON.stringify(data) : undefined,
+      cache: 'no-store',
+      redirect: 'error',
+      signal: AbortSignal.timeout(8_000),
+    })
+    const body = await response.json().catch(() => null)
+    if (!response.ok || !body || typeof body !== 'object') {
+      const code = typeof body?.error === 'string' ? body.error : 'provisioning_unavailable'
+      throw new MailProvisioningError(response.status, code, 'Mail provisioning request failed.')
+    }
+    return body as T
+  }
+
+  async status(): Promise<{ version: 1, domain: string }> {
+    const result = await this.request<{ version: number, domain: string }>('status')
+    if (result.version !== 1 || typeof result.domain !== 'string')
+      throw new MailProvisioningError(502, 'incompatible_version', 'Unsupported Mail provisioning API version.')
+    return { version: 1, domain: result.domain }
+  }
+
+  domain(name: string): Promise<{ name: string, configured: boolean }> {
+    return this.request(`domain?${new URLSearchParams({ name })}`)
+  }
+
+  mailbox(mailbox: string, actor: string): Promise<ProvisionedMailbox> {
+    return this.request(`mailbox?${new URLSearchParams({ mailbox, actor })}`)
+  }
+
+  apply(change: MailProvisioningChange): Promise<ProvisionedMailbox> {
+    return this.request('mailbox', change)
+  }
+}
+
+export function createMailProvisioningClient(options: MailProvisioningOptions): MailProvisioningClient {
+  return new MailProvisioningClient(options)
+}

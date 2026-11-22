@@ -1,4 +1,5 @@
 const std = @import("std");
+const webhook = @import("../features/webhook.zig");
 const mutex_compat = @import("mutex_compat.zig");
 const time_compat = @import("time_compat.zig");
 const config = @import("config.zig");
@@ -144,6 +145,16 @@ pub const HotReloadManager = struct {
         if (old.enable_json_logging != new_config.enable_json_logging) {
             logger.info("Config change: enable_json_logging {} -> {}", .{ old.enable_json_logging, new_config.enable_json_logging });
         }
+    }
+
+    /// Copy settings for use by a worker after the reload lock is released.
+    pub fn snapshotWebhook(self: *HotReloadManager, allocator: std.mem.Allocator) !webhook.WebhookConfig {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const current = self.current_config;
+        const enabled = current.webhook_enabled;
+        const url = if (enabled and current.webhook_url != null) try allocator.dupe(u8, current.webhook_url.?) else null;
+        return .{ .url = url, .enabled = enabled, .timeout_ms = 5000 };
     }
 
     /// Get reload statistics

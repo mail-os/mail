@@ -1,12 +1,6 @@
-//! Retry + DSN pipeline for failed outbound deliveries.
-//!
-//! The SMTP session's detached outbound workers make exactly one delivery
-//! attempt. Before this module, a failure was logged and the message
-//! silently dropped — the sender never learned their mail didn't arrive.
-//! Now a failure lands in the DB-backed MessageQueue (persistent across
-//! restarts), a background worker retries with the queue's exponential
-//! backoff (2^n minutes, 5 attempts), and a permanent failure generates an
-//! RFC 3464 DSN delivered into the LOCAL sender's maildir.
+//! Dispatch accepted outbound mail, retry transient failures, and deliver a
+//! local DSN after permanent failure. SMTP records the first attempt in the
+//! persistent queue in the same transaction as its local delivery outcomes.
 //!
 //! Bounces are only ever delivered locally: the outbound queue carries
 //! mail submitted by our own authenticated users, and never bouncing to
@@ -22,6 +16,7 @@ const database = @import("../storage/database.zig");
 const queue_mod = @import("queue.zig");
 const outbound = @import("outbound.zig");
 const bounce_mod = @import("bounce.zig");
+const hosted_limits = @import("../storage/hosted_limits.zig");
 const typesense = @import("../search/typesense.zig");
 
 const State = struct {
@@ -33,11 +28,12 @@ const State = struct {
     delivery_method: config.DeliveryMethod,
     ses_region: []const u8,
     running: std.atomic.Value(bool),
+    threads: [4]?std.Thread = @splat(null),
 };
 
 var state: ?*State = null;
 
-const poll_interval_ms: u32 = 30_000;
+const poll_interval_ms: u32 = 1_000;
 
 /// Initialize the retry queue (persisted in the main DB) and spawn the
 /// background worker. Call once at startup, after the database is open.
@@ -78,24 +74,45 @@ pub fn start(
         std.log.info("delivery retry queue: {d} message(s) pending from previous run", .{pending.total});
     }
 
-    const thread = try std.Thread.spawn(.{}, workerLoop, .{s});
+    errdefer {
+        s.running.store(false, .release);
+        for (s.threads) |thread| if (thread) |worker| worker.join();
+    }
+    for (&s.threads) |*thread| thread.* = try std.Thread.spawn(.{}, workerLoop, .{s});
     state = s;
-    thread.detach();
+}
+
+pub fn stop() void {
+    const s = state orelse return;
+    s.running.store(false, .release);
+    for (s.threads) |thread| if (thread) |worker| worker.join();
+    s.queue.deinit();
+    s.allocator.free(s.hostname);
+    if (s.extra_local_domains) |domains| s.allocator.free(domains);
+    s.allocator.free(s.ses_region);
+    s.allocator.destroy(s);
+    state = null;
 }
 
 /// Record a failed first-attempt delivery for retry. Best-effort: if the
 /// pipeline isn't running, the failure is logged and dropped (matching the
 /// old behavior).
-pub fn enqueueFailure(from: []const u8, to: []const u8, data: []const u8) void {
+pub fn enqueueFailure(from: []const u8, to: []const u8, data: []const u8, hosted_user_id: i64) void {
     const s = state orelse {
         std.log.err("delivery retry queue not running; dropping failed delivery to {s}", .{to});
         return;
     };
-    _ = s.queue.enqueue(from, to, data) catch |err| {
+    _ = s.queue.enqueueForHostedUser(from, to, data, hosted_user_id) catch |err| {
         std.log.err("failed to enqueue retry for {s}: {}", .{ to, err });
         return;
     };
     std.log.info("delivery to {s} queued for retry", .{to});
+}
+
+pub fn senderCanDispatch(hosted_user_id: i64) bool {
+    if (hosted_user_id == 0) return true;
+    const s = state orelse return false;
+    return s.db.hostedSenderActive(hosted_user_id) catch false;
 }
 
 /// Bytes of the original message quoted in a DSN.
@@ -120,11 +137,16 @@ pub fn bounceNow(from: []const u8, to: []const u8, reason: []const u8, data: []c
 }
 
 fn workerLoop(s: *State) void {
-    while (s.running.load(.monotonic)) {
+    while (s.running.load(.acquire)) {
         const msg = s.queue.getNextPending() orelse {
             time_compat.sleepMs(poll_interval_ms);
             continue;
         };
+
+        if (msg.hosted_user_id != 0 and !(s.db.hostedSenderActive(msg.hosted_user_id) catch false)) {
+            s.queue.hold(msg.id) catch |err| std.log.err("could not hold the suspended sender's delivery: {}", .{err});
+            continue;
+        }
 
         // Copies for the bounce path: a permanent markForRetry frees the
         // queued message, so nothing from `msg` may be touched after it.
@@ -148,7 +170,11 @@ fn workerLoop(s: *State) void {
             const err_msg = std.fmt.bufPrint(&err_buf, "delivery failed: {}", .{err}) catch "delivery failed";
             const refused_for_good = err == error.SmtpRecipientRejected;
 
-            const disposition = s.queue.markForRetry(msg.id, err_msg) catch |qerr| {
+            const update: anyerror!queue_mod.MessageQueue.RetryDisposition = if (refused_for_good) blk: {
+                s.queue.markRejected(msg.id) catch |reject_err| break :blk reject_err;
+                break :blk .permanent;
+            } else s.queue.markForRetry(msg.id, err_msg);
+            const disposition = update catch |qerr| {
                 std.log.err("retry queue update failed: {}", .{qerr});
                 continue;
             };
@@ -219,16 +245,10 @@ fn deliverBounceLocally(s: *State, from_addr: []const u8, failed_to: []const u8,
     const path = std.fmt.allocPrint(s.allocator, "{s}/{d}.{d}.eml", .{ dir, ts, nonce }) catch return;
     defer s.allocator.free(path);
 
-    const file = fs_compat.cwd().createFileExclusive(path) catch |err| {
+    hosted_limits.write(s.db, s.allocator, mailbox, path, dsn) catch |err| {
         std.log.err("failed to write DSN for {s}: {}", .{ from_addr, err });
         return;
     };
-    file.writeAll(dsn) catch {
-        file.close();
-        fs_compat.cwd().deleteFile(path) catch {};
-        return;
-    };
-    file.close();
 
     std.log.info("DSN delivered to {s} for failed delivery to {s}", .{ from_addr, failed_to });
 

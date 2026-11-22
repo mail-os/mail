@@ -10,6 +10,7 @@ const security = @import("../auth/security.zig");
 const tls_mod = @import("tls.zig");
 const dnsbl = @import("../antispam/dnsbl.zig");
 const greylist_mod = @import("../antispam/greylist.zig");
+const clamav = @import("../antispam/clamav.zig");
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
@@ -24,6 +25,7 @@ pub const Server = struct {
     auth_backend: ?*auth.AuthBackend,
     dnsbl_checker: ?dnsbl.DnsblChecker,
     greylist: ?*greylist_mod.Greylist,
+    scanner: ?*clamav.ClamAVScanner = null,
 
     fn tryReserveConnection(self: *Server) bool {
         while (true) {
@@ -251,6 +253,8 @@ pub const Server = struct {
         };
         defer session.deinit();
         session.submission = ctx.submission;
+        session.scanner = ctx.server.scanner;
+        session.delivery_db = ctx.server.db;
 
         // For SMTPS (port 465), perform TLS handshake before SMTP banner
         if (ctx.implicit_tls) {

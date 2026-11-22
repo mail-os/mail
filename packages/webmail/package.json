@@ -12,6 +12,8 @@
   "dependencies": {
     "@stacksjs/stx": "0.2.645",
     "@stacksjs/ts-css": "0.3.17",
-    "bun-plugin-stx": "0.2.645"
+    "bun-plugin-stx": "0.2.645",
+    "ical.js": "2.2.1",
+    "moment-timezone": "0.6.6"
   }
 }

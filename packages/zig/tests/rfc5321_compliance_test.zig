@@ -110,6 +110,8 @@ const Server = struct {
         defer log.deinit();
         var rate_limiter = mail_pkg.security.RateLimiter.init(allocator, 60, 1000, 1000, 3600);
         defer rate_limiter.deinit();
+        var db = mail_pkg.database.Database.init(allocator, ":memory:") catch return;
+        defer db.deinit();
 
         const cfg = mail_pkg.config.Config{
             .host = "127.0.0.1",
@@ -142,6 +144,7 @@ const Server = struct {
         };
         var session = mail_pkg.smtp.Session.init(allocator, .{ .fd = fd }, cfg, &log, "127.0.0.1", &rate_limiter, null, null, null) catch return;
         defer session.deinit();
+        session.delivery_db = &db;
         session.handle() catch {};
     }
 };

@@ -6,7 +6,7 @@
   <title>Sign in — Mail</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
-<body>
+<body class="mail-auth-page">
 <script client>
 const username = state('')
 const password = state('')
@@ -31,9 +31,8 @@ async function signIn() {
 }
 </script>
 <main class="login">
-  <div class="mb-4 font-semibold text-indigo-600 text-sm tracking-wide">MAIL</div>
-  <h1>Your inbox, ready.</h1>
-  <p class="login-sub">Sign in with your mail account credentials.</p>
+  <div class="mail-app-mark"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span></div>
+  <h1>Sign in to Mail</h1>
   <form @submit.prevent="signIn()">
     <label for="email">Email or username</label>
     <input id="email" type="text" x-model.trim="username" autocomplete="username" placeholder="you@example.com" required autofocus>
