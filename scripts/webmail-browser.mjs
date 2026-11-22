@@ -65,6 +65,57 @@ async function verifySelect(control, minimumHeight = 36) {
   assert(appearance.height >= minimumHeight, 'The picker meets the minimum control height')
 }
 
+async function verifyControlRow(container, selector, height, sameRow = true) {
+  const controls = await container.locator(selector).evaluateAll(nodes => nodes.map((node) => {
+    const style = getComputedStyle(node)
+    const box = node.getBoundingClientRect()
+    const sample = document.createElement('span')
+    sample.style.color = 'var(--control-border)'
+    node.parentElement.append(sample)
+    const border = getComputedStyle(sample).color
+    sample.remove()
+    return {
+      name: node.getAttribute('aria-label') || node.labels?.[0]?.textContent.trim() || node.textContent.trim(),
+      height: box.height,
+      top: box.top,
+      bottom: box.bottom,
+      left: box.left,
+      right: box.right,
+      neutral: !node.classList.contains('calendar-primary'),
+      borderMatches: style.borderColor === border && style.borderWidth === '1px',
+      radius: style.borderRadius,
+    }
+  }))
+  assert(controls.length > 1, 'A control group must have multiple visible controls')
+  for (const control of controls) {
+    assert(Math.abs(control.height - height) < 0.5, `${control.name} should be ${height}px tall, got ${control.height}px`)
+    assert.equal(control.radius, '8px', `${control.name} should use the shared control radius`)
+    if (control.neutral) assert(control.borderMatches, `${control.name} should use the shared one-pixel border`)
+    if (sameRow) assert(Math.abs(control.top - controls[0].top) < 0.5, `${control.name} should align with the first control`)
+  }
+  return controls
+}
+
+async function verifyCalendarPeriod(page, label, height, stacked = false) {
+  const group = page.getByRole('group', { name: 'Change date range' })
+  const controls = await verifyControlRow(page.locator('.calendar-view-toolbar'), '.calendar-period > *, .calendar-zone select', height, false)
+  assert.equal(controls.length, 5)
+  const row = controls.slice(0, stacked ? 3 : 4)
+  for (let index = 1; index < row.length; index++) {
+    assert(Math.abs(row[index].top - row[0].top) < 0.5, 'Date navigation buttons should align')
+    assert(Math.abs(row[index].left - row[index - 1].right - 6) < 0.5, 'Date controls should have matching 6px gaps')
+  }
+  const date = controls[3]
+  assert(date.right - date.left >= 136, 'Jump to date leaves room for the native date and picker')
+  if (height === 36) assert(Math.abs(controls[4].top - date.top) < 0.5, 'The time zone picker aligns with the desktop date controls')
+  if (stacked) {
+    assert(Math.abs(date.top - row[0].bottom - 6) < 0.5, 'Jump to date has the same gap below date navigation')
+    assert(Math.abs(date.left - row[0].left) < 0.5 && Math.abs(date.right - row[2].right) < 0.5, 'Jump to date spans the date navigation row')
+  }
+  await mkdir(output, { recursive: true })
+  await group.screenshot({ path: join(output, `${label}-date-controls.png`), animations: 'disabled' })
+}
+
 async function verifyAppearance(page, scheme) {
   await page.emulateMedia({ colorScheme: scheme })
   const theme = await page.evaluate(() => {
@@ -84,10 +135,16 @@ async function verifyAppearance(page, scheme) {
       ['--on-primary', '--primary'], ['--message-selection-text', '--message-selection'],
       ['--message-selection-muted', '--message-selection'],
     ]
+    const borders = ['--panel', '--toolbar', '--surface', '--sidebar'].map(background => {
+      const a = luminance('--control-border')
+      const b = luminance(background)
+      return [(Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05), background]
+    })
     return {
       scheme: style.colorScheme,
       font: getComputedStyle(document.body).fontFamily,
       fontStack: style.getPropertyValue('--app-font').trim(),
+      borders,
       ratios: pairs.map(([foreground, background]) => {
         const a = luminance(foreground)
         const b = luminance(background)
@@ -100,6 +157,8 @@ async function verifyAppearance(page, scheme) {
   assert.match(theme.font, /^-apple-system,/i)
   for (const [ratio, foreground, background] of theme.ratios)
     assert(ratio >= 4.5, `${scheme} ${foreground} on ${background} must reach 4.5:1, got ${ratio.toFixed(2)}`)
+  for (const [ratio, background] of theme.borders)
+    assert(ratio >= 3, `${scheme} control borders on ${background} must reach 3:1, got ${ratio.toFixed(2)}`)
 }
 
 async function verifyMessageSelection(message, child) {
@@ -320,8 +379,10 @@ async function desktopJourney(page) {
   await page.getByText('Studio review', { exact: true }).waitFor()
   await fitsViewport(page)
   await screenshot(page, 'desktop-calendar')
+  await verifyCalendarPeriod(page, 'desktop-light', 36)
   await page.emulateMedia({ colorScheme: 'dark' })
   await screenshot(page, 'desktop-calendar-dark')
+  await verifyCalendarPeriod(page, 'desktop-dark', 36)
   await page.emulateMedia({ colorScheme: 'light' })
   await page.getByRole('searchbox', { name: 'Search events' }).fill('Studio review')
   await button(page, 'Search').click()
@@ -460,6 +521,14 @@ async function phoneJourney(page) {
   await page.locator('.calendar-loading').waitFor({ state: 'hidden' })
   await fitsViewport(page)
   await screenshot(page, 'phone-calendar')
+  await verifyCalendarPeriod(page, 'phone-dark', 44)
+  await page.setViewportSize({ width: 320, height: 844 })
+  await fitsViewport(page)
+  await verifyCalendarPeriod(page, 'narrow-phone-dark', 44, true)
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.emulateMedia({ colorScheme: 'light' })
+  await verifyCalendarPeriod(page, 'phone-light', 44)
+  await page.emulateMedia({ colorScheme: 'dark' })
   await button(page, /, 2 events$/).click()
   await page.getByText('Studio review', { exact: true }).waitFor()
   await screenshot(page, 'phone-calendar-day')
@@ -468,6 +537,7 @@ async function phoneJourney(page) {
   const access = sharing.getByRole('combobox', { name: /^Access\b/ })
   await access.waitFor()
   await verifySelect(access, 44)
+  await verifyControlRow(sharing.locator('form'), 'select, input, button', 44, false)
   await page.locator('.calendar-loading').waitFor({ state: 'hidden' })
   await fitsViewport(page)
   await sharing.scrollIntoViewIfNeeded()
@@ -520,21 +590,19 @@ async function calendarSharingJourney(captain) {
   await sharing.getByRole('combobox', { name: /^Team\b/ }).selectOption({ label: 'Studio' })
   await sharing.getByLabel('Teammate').fill(sender)
   await sharing.getByRole('combobox', { name: /^Access\b/ }).selectOption('viewer')
-  const dimensions = await sharing.evaluate(section =>
-    Array.from(section.querySelectorAll('form select, form input, form button'), (element) => {
-      const { y, height } = element.getBoundingClientRect()
-      return { y, height }
-    }))
-  assert.equal(dimensions.length, 5)
-  for (const { y, height } of dimensions) {
-    assert(Math.abs(y - dimensions[0].y) <= 1, 'Calendar sharing controls line up in one row')
-    assert(Math.abs(height - dimensions[0].height) <= 1, 'Calendar sharing controls share a height')
-  }
+  await heading(captain, 'Share a calendar').click()
+  const shareForm = sharing.locator('form')
+  assert.equal((await verifyControlRow(shareForm, 'select, input, button', 36)).length, 5)
+  await captain.emulateMedia({ colorScheme: 'dark' })
+  await verifyControlRow(shareForm, 'select, input, button', 36)
+  await screenshot(captain, 'desktop-calendar-selects-dark')
+  await captain.emulateMedia({ colorScheme: 'light' })
   await captain.locator('.calendar-loading').waitFor({ state: 'hidden' })
   await screenshot(captain, 'desktop-calendar-selects')
   await button(sharing, 'Share calendar').click()
-  const role = sharing.getByRole('combobox', { name: `Access for ${sender} to ${calendarLabel}` })
+  const role = captain.getByRole('combobox', { name: `Access for ${sender} to ${calendarLabel}` })
   await role.waitFor()
+  await verifyControlRow(sharing.getByRole('listitem').filter({ has: role }), 'select, button', 36)
 
   const context = await browser.newContext({
     viewport: { width: 390, height: 844 }, colorScheme: 'dark', hasTouch: true,
