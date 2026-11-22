@@ -2,6 +2,7 @@
 import { renderTemplate } from '@stacksjs/stx'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { Script } from 'node:vm'
 import { calendarTimeZoneCatalog } from './build-calendar-timezones'
 
 export function stylesheetUrl(styles: Uint8Array): string {
@@ -20,8 +21,12 @@ export async function buildWebmail(): Promise<void> {
     const html = await renderTemplate(join(root, `pages/${page}.stx`), { injectCSS: true })
     if (!html.includes('data-stx') || html.includes('<script client>'))
       throw new Error(`STX did not compile ${page}`)
-    if (html.includes('__stxModules[') && !/<script\b[^>]*data-stx-modules/.test(html))
-      throw new Error(`STX did not bundle the client module registry for ${page}`)
+    if (html.includes('__stxModules[')) {
+      const registry = html.match(/<script\b[^>]*data-stx-modules[^>]*>([\s\S]*?)<\/script>/)
+      if (!registry)
+        throw new Error(`STX did not bundle the client module registry for ${page}`)
+      new Script(registry[1], { filename: `${page}.html (stx module registry)` })
+    }
     await writeFile(join(dist, `${page}.html`), html.replace('href="/styles.css"', `href="${stylesheetUrl(styles)}"`))
   }
   await writeFile(join(dist, 'styles.css'), styles)

@@ -1,0 +1,15 @@
+diff --git a/dist/render.js b/dist/render.js
+index d1c352080fb52c5a0d50b1eb3fe74f3f4d804a46..a5a9b0175b1185023ca3aab9db1a7e9b3bd6ca53 100644
+--- a/dist/render.js
++++ b/dist/render.js
+@@ -139,8 +139,8 @@ ${clientScripts.join(`
+       })), scriptsHtml = [await buildModulesTag(transformedScripts, { ...options, buildMode: "compile" }), ...transformedScripts].filter(Boolean).join(`
+ `);
+       if (output.match(/(<\/body>)/i))
+-        output = output.replace(/(<\/body>)/i, `${scriptsHtml}
+-$1`);
++        output = output.replace(/<\/body>/i, (closeTag) => `${scriptsHtml}
++${closeTag}`);
+       else
+         output += `
+ ${scriptsHtml}`;

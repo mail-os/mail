@@ -216,6 +216,7 @@ try {
   process.stdout.write(`${engine} passed the desktop and phone webmail journeys.\n`)
 }
 catch (error) {
+  if (errors.length) process.stderr.write(`Uncaught browser errors:\n${errors.join('\n')}\n`)
   for (const context of browser.contexts()) {
     for (const [index, page] of context.pages().entries()) {
       const appearance = (page.viewportSize()?.width ?? 0) <= 860 ? 'phone' : 'desktop'

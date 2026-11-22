@@ -51,6 +51,9 @@ calls this ts-cloud integration after deploying the mail executable.
 
 `bun run build` compiles into `packages/zig/src/api/webmail_dist` (generated and
 ignored). `bun test packages/webmail` checks compilation and source conventions.
+The workspace applies a small patch to stx 0.2.645 so standalone rendering
+preserves JavaScript when inserting bundled scripts. Remove the patch when
+upgrading to a release that includes the upstream body insertion fix.
 
 ## Browser acceptance
 

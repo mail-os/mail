@@ -1,7 +1,17 @@
-import { renderTemplate } from '@stacksjs/stx'
+import { renderString, renderTemplate } from '@stacksjs/stx'
 import { expect, test } from 'bun:test'
 import { join } from 'node:path'
 import { buildWebmail, stylesheetUrl, webmailPages } from './build'
+
+test('standalone stx script insertion preserves literal JavaScript replacement patterns', async () => {
+  const text = '$&|$1|$$'
+  const html = await renderString(`<!doctype html>
+<html><head><title>Script fixture</title></head><body>
+  <script client>const label = ${JSON.stringify(text)}</script>
+  <p :text="label"></p>
+</body></html>`)
+  expect(html.includes(text)).toBe(true)
+})
 
 test('deployments fingerprint styles so existing browsers fetch updated controls', async () => {
   const first = new TextEncoder().encode('.wm-folders { display: none; }')

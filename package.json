@@ -49,5 +49,8 @@
   ],
   "git-hooks": {
     "commit-msg": "bunx --bun @stacksjs/gitlint --edit .git/COMMIT_EDITMSG"
+  },
+  "patchedDependencies": {
+    "@stacksjs/stx@0.2.645": "patches/@stacksjs%2Fstx@0.2.645.patch"
   }
 }
