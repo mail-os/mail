@@ -2,12 +2,16 @@
 """Verify team calendar grants, private event isolation, and revocation."""
 
 import argparse
-from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import runpy
+import socketserver
 import sqlite3
+import struct
 import tempfile
+from threading import Barrier, Event, Thread
 from urllib.parse import quote, urlencode
 
 
@@ -18,6 +22,33 @@ DavClient = runpy.run_path(str(SCRIPTS / "test-dav-https.py"))["DavClient"]
 CALENDAR = "Studio planning"
 START = int(datetime(2026, 12, 1, tzinfo=timezone.utc).timestamp())
 END = int(datetime(2027, 1, 1, tzinfo=timezone.utc).timestamp())
+REVOKE_DURING_SCAN = "Editor access revoked during scanning"
+
+
+class CalendarScan(socketserver.StreamRequestHandler):
+    def handle(self):
+        assert self.rfile.read(10) == b"zINSTREAM\x00"
+        data = bytearray()
+        while size := struct.unpack("!I", self.rfile.read(4))[0]:
+            data.extend(self.rfile.read(size))
+        if REVOKE_DURING_SCAN.encode() in data:
+            self.server.scanning.set()
+            assert self.server.resume.wait(timeout=8), "Calendar edit was never released"
+        self.wfile.write(b"stream: OK\x00")
+
+
+@contextmanager
+def scanner():
+    with socketserver.ThreadingTCPServer(("127.0.0.1", 0), CalendarScan) as server:
+        server.scanning, server.resume = Event(), Event()
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield server
+        finally:
+            server.resume.set()
+            server.shutdown()
+            thread.join()
 
 
 def write_event(test, owner, name, classification="", recurring=False, expected=201):
@@ -102,6 +133,9 @@ def verify(test, db, owner, viewer, colleague, foreign):
     assert [event["summary"] for event in rows] == ["Roadmap"], rows
     assert "private occurrence" not in repr(rows)
     row, = rows
+    detail = expect(test.api(invited, f"calendar-events/{row['id']}?source=1"))
+    assert detail["description"] == "description of Roadmap"
+    assert "SUMMARY:Roadmap" in detail["icalendar"]
     expect(test.api(dict(invited, **{"If-Match": row["etag"]}), f"calendar-events/{row['id']}",
                     {"summary": "Viewer edit"}, "PATCH"), 404)
     assert expect(test.api(invited, event_query(calendar_id, q="description of Budget")))["events"] == []
@@ -147,11 +181,74 @@ def verify(test, db, owner, viewer, colleague, foreign):
     return calendar_id
 
 
+def verify_editors(test, scan, owner, viewer, colleague, calendar_id):
+    owner_session, editor, coeditor = (test.login(account) for account in (owner, viewer, colleague))
+    query = event_query(calendar_id)
+    event = {"calendarId": calendar_id, "summary": "Planning sync",
+             "time": {"start": START + 86400, "end": START + 90000}}
+    expect(test.api(editor, "calendar-events", event, "POST"), 404)
+    for mailbox in (viewer, colleague):
+        expect(change(test, owner_session, calendar_id, mailbox, "editor"))
+
+    created = expect(test.api(editor, "calendar-events", event, "POST"), 201)
+    item = f"calendar-events/{created['id']}"
+    detail = expect(test.api(owner_session, item + "?source=1"))
+    assert detail["event"]["summary"] == "Planning sync"
+    base = dict(editor, **{"If-Match": created["etag"]})
+    other = dict(coeditor, **{"If-Match": created["etag"]})
+    gate = Barrier(2, timeout=5)
+
+    def edit(pair):
+        session, title = pair
+        gate.wait()
+        return test.api(session, item, {"summary": title}, "PATCH")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(edit, [(base, "Editorial review"), (other, "Studio check-in")]))
+    assert sorted(result[0] for result in results) == [200, 412], results
+    detail = expect(test.api(editor, item + "?source=1"))
+    latest = dict(editor, **{"If-Match": detail["event"]["etag"], "Content-Type": "text/calendar"})
+    content = detail["icalendar"].replace("SUMMARY:" + detail["event"]["summary"], "SUMMARY:Final review")
+    private_content = content.replace("END:VEVENT", "CLASS:PRIVATE\r\nEND:VEVENT")
+    expect(test.api(latest, item, private_content.encode(), "PUT"), 422, "shared_event_must_be_public")
+    replaced = expect(test.api(latest, item, content.encode(), "PUT"))
+    assert expect(test.api(owner_session, item))["event"]["summary"] == "Final review"
+    dav_path = f"/calendars/{owner}/{quote(CALENDAR, safe='')}/{created['uid']}.ics"
+    status, headers, raw = DavClient(test, owner).request("GET", dav_path)
+    assert status == 200 and headers["ETag"] == replaced["etag"] and b"SUMMARY:Final review" in raw
+
+    private, = expect(test.api(owner_session, event_query(calendar_id, q="description of Budget")))["events"]
+    private_item = f"calendar-events/{private['id']}"
+    expect(test.api(editor, private_item + "?source=1"), 404)
+    private_tag = dict(editor, **{"If-Match": private["etag"]})
+    expect(test.api(private_tag, private_item, {"summary": "Hidden edit"}, "PATCH"), 404)
+    expect(test.api(private_tag, private_item, method="DELETE"), 404)
+
+    # Hold the edit after its initial authorization, while scanning the
+    # replacement body. A downgrade must take effect before the DAV write.
+    latest["If-Match"] = replaced["etag"]
+    pending_content = content.replace("Final review", REVOKE_DURING_SCAN).encode()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(test.api, latest, item, pending_content, "PUT")
+        try:
+            assert scan.scanning.wait(timeout=5), "Editor request did not reach scanning"
+            expect(change(test, owner_session, calendar_id, viewer, "viewer"))
+        finally:
+            scan.resume.set()
+        expect(pending.result(), 404)
+    assert expect(test.api(editor, item))["event"]["summary"] == "Final review"
+    expect(test.api(latest, item, method="DELETE"), 404)
+    expect(test.api(dict(coeditor, **{"If-Match": replaced["etag"]}), item, method="DELETE"), 204)
+    expect(test.api(owner_session, item), 404)
+    assert [row["summary"] for row in expect(test.api(editor, query))["events"]] == ["Roadmap"]
+    expect(change(test, owner_session, calendar_id, colleague, None))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     args = parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix="mail-calendar-shares-") as scratch:
+    with tempfile.TemporaryDirectory(prefix="mail-calendar-shares-") as scratch, scanner() as scan:
         directory = Path(scratch)
         # Open the previous DAV schema to exercise migration in the real daemon.
         with closing(sqlite3.connect(directory / "caldav.db")) as legacy:
@@ -162,10 +259,13 @@ def main():
             )""")
             legacy.commit()
         test = Fixture(args.binary.resolve(strict=True), directory, staging=True)
+        test.env.update(SMTP_CLAMAV_TRANSPORT=f"tcp:127.0.0.1:{scan.server_address[1]}",
+                        SMTP_CLAMAV_FAIL_MODE="closed", SMTP_CLAMAV_TIMEOUT_MS="8000")
         with test.daemon(), closing(sqlite3.connect(directory / "smtp.db")) as db:
             owner, viewer, colleague, foreign = (test.provision(name) for name in ("owner", "viewer", "teammate", "elsewhere"))
             command(test, "team", "create", "studio", "Studio", owner)
             calendar_id = verify(test, db, owner, viewer, colleague, foreign)
+            verify_editors(test, scan, owner, viewer, colleague, calendar_id)
 
         with test.daemon():
             invited = test.login(viewer)
@@ -185,7 +285,7 @@ def main():
             assert shares(test, invited) == []
             expect(test.api(invited, event_query(calendar_id)), 404)
 
-    print("Verified calendar share roles, private and recurring event isolation, live revocation, audit rollback, restart, and calendar ID reuse.")
+    print("Verified calendar share roles, editor CRUD and revision races, private event isolation, revocation during scanning, audit rollback, restart, and calendar ID reuse.")
 
 
 if __name__ == "__main__":

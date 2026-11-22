@@ -1155,7 +1155,19 @@ pub const CalDavStore = struct {
         const mailbox_id = try self.activeMailboxId(username);
         self.mutex.lock();
         defer self.mutex.unlock();
-        const event = try self.ownedEventLocked(username, mailbox_id, id);
+        return snapshotEventDetail(arena, try self.ownedEventLocked(username, mailbox_id, id));
+    }
+
+    pub fn snapshotWebCalendarEvent(self: *Self, arena: Allocator, username: []const u8, id: u64, action: CalendarAction) !CalendarEventDetail {
+        const access = try self.beginCalendarAccess(username, .read);
+        defer access.deinit();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const allowed = try self.webEventLocked(access, id, action);
+        return snapshotEventDetail(arena, allowed.event);
+    }
+
+    fn snapshotEventDetail(arena: Allocator, event: Event) !CalendarEventDetail {
         return .{
             .event = try summarizeEvent(arena, event),
             .calendar_id = event.calendar_id,
@@ -1239,12 +1251,73 @@ pub const CalDavStore = struct {
 
     pub const CreatedMailboxEvent = struct { id: u64, revision: PutResource };
 
-    pub fn createMailboxEvent(self: *Self, username: []const u8, calendar_id: u64, data: EventData) !CreatedMailboxEvent {
-        const mailbox_id = try self.activeMailboxId(username);
+    pub const CalendarAction = enum { read, edit };
+    const CalendarPermission = enum { owner, editor, viewer, free_busy };
+    const CalendarRequest = struct {
+        username: []const u8,
+        mailbox_id: ?i64 = null,
+        account_tx: ?accounts.Database.Transaction = null,
+
+        fn deinit(self: CalendarRequest) void {
+            if (self.account_tx) |tx| tx.deinit();
+        }
+    };
+
+    /// Take the account transaction before the DAV mutex. Grant changes and
+    /// membership removal must wait until an admitted shared edit commits.
+    /// BEGIN IMMEDIATE also serializes against the local operator's CLI.
+    fn beginCalendarAccess(self: *Self, username: []const u8, mode: enum { read, write }) !CalendarRequest {
+        const db = self.config.account_db orelse return .{ .username = username };
+        const tx = try db.beginTransaction(if (mode == .write) .write else .read);
+        errdefer tx.deinit();
+        const mailbox_id = (try teams.activeMailboxId(tx, username)) orelse return error.DavMailboxNotFound;
+        return .{ .username = username, .mailbox_id = mailbox_id, .account_tx = tx };
+    }
+
+    fn calendarPermissionLocked(self: *Self, request: CalendarRequest, calendar: Calendar) !?CalendarPermission {
+        if (self.findUserIdLocked(request.username, request.mailbox_id) == calendar.user_id) return .owner;
+        const share_id = calendar.share_id orelse return null;
+        const account_tx = request.account_tx orelse return null;
+        const grantee_id = request.mailbox_id orelse return null;
+        for (self.user_ids.items) |owner| {
+            if (owner.user_id != calendar.user_id) continue;
+            const source_id = owner.mailbox_id orelse return null;
+            const permission = (try teams.calendarAccess(account_tx, grantee_id, source_id, share_id)) orelse return null;
+            return switch (permission) {
+                .editor => .editor,
+                .viewer => .viewer,
+                .free_busy => .free_busy,
+            };
+        }
+        return null;
+    }
+
+    fn webEventLocked(self: *Self, access: CalendarRequest, id: u64, action: CalendarAction) !struct { event: Event, permission: CalendarPermission } {
+        const event = self.events.get(id) orelse return error.EventNotFound;
+        const calendar = self.calendars.get(event.calendar_id) orelse return error.EventNotFound;
+        const permission = (try self.calendarPermissionLocked(access, calendar)) orelse return error.EventNotFound;
+        switch (permission) {
+            .owner => {},
+            .editor => if (!event.shareable) return error.EventNotFound,
+            .viewer => if (action == .edit or !event.shareable) return error.EventNotFound,
+            .free_busy => return error.EventNotFound,
+        }
+        return .{ .event = event, .permission = permission };
+    }
+
+    fn validateSharedEdit(self: *Self, permission: CalendarPermission, source: []const u8) !void {
+        if (permission == .editor and !publicCalendarResource(self.allocator, source)) return error.SharedEventMustBePublic;
+    }
+
+    pub fn createWebCalendarEvent(self: *Self, username: []const u8, calendar_id: u64, data: EventData) !CreatedMailboxEvent {
+        const access = try self.beginCalendarAccess(username, .write);
+        defer access.deinit();
         self.mutex.lock();
         defer self.mutex.unlock();
         const calendar = self.calendars.get(calendar_id) orelse return error.CalendarNotFound;
-        if (self.findUserIdLocked(username, mailbox_id) != calendar.user_id) return error.CalendarNotFound;
+        const permission = (try self.calendarPermissionLocked(access, calendar)) orelse return error.CalendarNotFound;
+        if (permission != .owner and permission != .editor) return error.CalendarNotFound;
+        try self.validateSharedEdit(permission, data.ics_data orelse "");
         if (data.uid) |uid| {
             if (self.getEventByUid(calendar_id, uid) != null) return error.EventAlreadyExists;
         }
@@ -1252,22 +1325,25 @@ pub const CalDavStore = struct {
         return .{ .id = id, .revision = PutResource.init(true, self.events.get(id).?.etag) };
     }
 
-    pub fn updateMailboxEvent(self: *Self, username: []const u8, id: u64, expected: []const u8, data: EventData) !PutResource {
-        const mailbox_id = try self.activeMailboxId(username);
+    pub fn updateWebCalendarEvent(self: *Self, username: []const u8, id: u64, expected: []const u8, data: EventData) !PutResource {
+        const access = try self.beginCalendarAccess(username, .write);
+        defer access.deinit();
         self.mutex.lock();
         defer self.mutex.unlock();
-        const event = try self.ownedEventLocked(username, mailbox_id, id);
-        if (!std.mem.eql(u8, expected, event.etag)) return error.PreconditionFailed;
+        const allowed = try self.webEventLocked(access, id, .edit);
+        if (!std.mem.eql(u8, expected, allowed.event.etag)) return error.PreconditionFailed;
+        try self.validateSharedEdit(allowed.permission, data.ics_data orelse allowed.event.ics_data);
         try self.updateEventLocked(id, data);
         return PutResource.init(false, self.events.get(id).?.etag);
     }
 
-    pub fn deleteMailboxEvent(self: *Self, username: []const u8, id: u64, expected: []const u8) !void {
-        const mailbox_id = try self.activeMailboxId(username);
+    pub fn deleteWebCalendarEvent(self: *Self, username: []const u8, id: u64, expected: []const u8) !void {
+        const access = try self.beginCalendarAccess(username, .write);
+        defer access.deinit();
         self.mutex.lock();
         defer self.mutex.unlock();
-        const event = try self.ownedEventLocked(username, mailbox_id, id);
-        if (!std.mem.eql(u8, expected, event.etag)) return error.PreconditionFailed;
+        const allowed = try self.webEventLocked(access, id, .edit);
+        if (!std.mem.eql(u8, expected, allowed.event.etag)) return error.PreconditionFailed;
         try self.deleteEventLocked(id);
     }
 
@@ -1525,16 +1601,17 @@ pub const CalDavStore = struct {
         return self.queryCalendarEventsLocked(arena, user_id, calendar_id, window, query, include_series, .owner);
     }
 
-    pub fn querySharedCalendarEvents(self: *Self, arena: Allocator, share: teams.CalendarShare, calendar_id: u64, window: ?CalendarWindow, query: []const u8, include_series: bool) ![]CalendarEventSummary {
+    pub fn queryWebCalendarEvents(self: *Self, arena: Allocator, username: []const u8, calendar_id: ?u64, window: ?CalendarWindow, query: []const u8, include_series: bool) ![]CalendarEventSummary {
+        const id = calendar_id orelse return self.queryMailboxEvents(arena, username, null, window, query, include_series);
         try validateCalendarQuery(window, query);
-        if (share.access == .free_busy) return error.CalendarNotFound;
+        const access = try self.beginCalendarAccess(username, .read);
+        defer access.deinit();
         self.mutex.lock();
         defer self.mutex.unlock();
-        const owner = self.findUserIdLocked("", share.source_id) orelse return error.CalendarNotFound;
-        const calendar = self.calendars.get(calendar_id) orelse return error.CalendarNotFound;
-        const share_id = calendar.share_id orelse return error.CalendarNotFound;
-        if (calendar.user_id != owner or !std.mem.eql(u8, &share_id, &share.calendar_share_id)) return error.CalendarNotFound;
-        return self.queryCalendarEventsLocked(arena, owner, calendar_id, window, query, include_series, .shared);
+        const calendar = self.calendars.get(id) orelse return error.CalendarNotFound;
+        const permission = (try self.calendarPermissionLocked(access, calendar)) orelse return error.CalendarNotFound;
+        if (permission == .free_busy) return error.CalendarNotFound;
+        return self.queryCalendarEventsLocked(arena, calendar.user_id, id, window, query, include_series, if (permission == .owner) .owner else .shared);
     }
 
     fn validateCalendarQuery(window: ?CalendarWindow, query: []const u8) !void {
@@ -3497,12 +3574,12 @@ test "event edit and delete roll back together with the calendar revision" {
     defer store.deinit();
     const account = "owner@example.test";
     const calendar = try store.createMailboxCalendar(account, "Personal");
-    const event = try store.createMailboxEvent(account, calendar, .{ .summary = "Before", .dtstart = 100 });
+    const event = try store.createWebCalendarEvent(account, calendar, .{ .summary = "Before", .dtstart = 100 });
     const old_tag = event.revision.etag();
     const token = store.getSyncToken(calendar, true);
     try store.conn.?.exec("CREATE TRIGGER reject_revision BEFORE INSERT ON dav_calendars BEGIN SELECT RAISE(ABORT, 'fixture failure'); END");
-    try std.testing.expectError(error.StepFailed, store.updateMailboxEvent(account, event.id, old_tag, .{ .summary = "After", .dtstart = 200 }));
-    try std.testing.expectError(error.StepFailed, store.deleteMailboxEvent(account, event.id, old_tag));
+    try std.testing.expectError(error.StepFailed, store.updateWebCalendarEvent(account, event.id, old_tag, .{ .summary = "After", .dtstart = 200 }));
+    try std.testing.expectError(error.StepFailed, store.deleteWebCalendarEvent(account, event.id, old_tag));
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -3519,9 +3596,9 @@ test "event edit and delete roll back together with the calendar revision" {
         try std.testing.expect(!try stmt.step());
     }
     try store.conn.?.exec("DROP TRIGGER reject_revision");
-    const revision = try store.updateMailboxEvent(account, event.id, old_tag, .{ .summary = "After", .dtstart = 200 });
-    try std.testing.expectError(error.PreconditionFailed, store.deleteMailboxEvent(account, event.id, old_tag));
-    try store.deleteMailboxEvent(account, event.id, revision.etag());
+    const revision = try store.updateWebCalendarEvent(account, event.id, old_tag, .{ .summary = "After", .dtstart = 200 });
+    try std.testing.expectError(error.PreconditionFailed, store.deleteWebCalendarEvent(account, event.id, old_tag));
+    try store.deleteWebCalendarEvent(account, event.id, revision.etag());
     try std.testing.expectError(error.EventNotFound, store.snapshotMailboxEvent(arena.allocator(), account, event.id));
 }
 

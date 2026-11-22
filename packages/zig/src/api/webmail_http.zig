@@ -2061,30 +2061,14 @@ fn handleCalendarEvents(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a
         .end = std.fmt.parseInt(i64, end orelse "", 10) catch return sendError(conn, arena, 400, "bad_request", "Invalid end timestamp"),
     } else null;
     const include_series = std.mem.eql(u8, req.queryParam(arena, "instances") orelse "", "1");
-    const events = listCalendarEvents(server, dav, arena, sess.username, calendar_id, window, query, include_series) catch |err| switch (err) {
+    const events = dav.queryWebCalendarEvents(arena, sess.username, calendar_id, window, query, include_series) catch |err| switch (err) {
         error.InvalidRange => return sendError(conn, arena, 400, "bad_request", "Specify a positive calendar window of at most 366 days"),
-        error.CalendarNotFound => return sendError(conn, arena, 404, "not_found", "Calendar not found"),
+        error.CalendarNotFound, error.DavMailboxNotFound => return sendError(conn, arena, 404, "not_found", "Calendar not found"),
         error.TooManyEvents => return sendError(conn, arena, 400, "too_many_events", "More than 500 events match. Narrow your search or select a calendar or shorter view."),
         error.TooManySeriesBytes => return sendError(conn, arena, 413, "calendar_series_too_large", "Recurring event data exceeds this view's limit. Select one calendar."),
         else => return err,
     };
     return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .events = events }), null);
-}
-
-fn listCalendarEvents(server: *WebmailHttpServer, dav: *caldav_store.CalDavStore, a: std.mem.Allocator, username: []const u8, calendar_id: ?u64, window: ?caldav_store.CalDavStore.CalendarWindow, query: []const u8, include_series: bool) ![]caldav_store.CalendarEventSummary {
-    return dav.queryMailboxEvents(a, username, calendar_id, window, query, include_series) catch |err| {
-        if (err != error.CalendarNotFound) return err;
-        const id = calendar_id orelse return err;
-        const shares = try teams.calendarShares(server.db, a, username);
-        for (shares) |share| {
-            if (!std.mem.eql(u8, share.grantee, username) or share.access == .free_busy) continue;
-            return dav.querySharedCalendarEvents(a, share, id, window, query, include_series) catch |shared_err| {
-                if (shared_err == error.CalendarNotFound) continue;
-                return shared_err;
-            };
-        }
-        return error.CalendarNotFound;
-    };
 }
 
 fn handleCalendarEventCreate(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
@@ -2105,7 +2089,7 @@ fn handleCalendarEventCreate(server: *WebmailHttpServer, conn: *webmail_tls.Stre
         break :json .{ payload.calendarId, prepared };
     };
     checkCalendarEventBody(server, arena, dav, data.ics_data.?) catch |err| return calendarWriteError(conn, arena, err);
-    const created = dav.createMailboxEvent(sess.username, calendar_id, data) catch |err| return calendarWriteError(conn, arena, err);
+    const created = dav.createWebCalendarEvent(sess.username, calendar_id, data) catch |err| return calendarWriteError(conn, arena, err);
     return sendRevisionJson(conn, arena, 201, try service_mod.json(arena, .{
         .id = created.id,
         .calendarId = calendar_id,
@@ -2127,7 +2111,7 @@ fn handleCalendarEventItem(server: *WebmailHttpServer, conn: *webmail_tls.Stream
     const event_id = std.fmt.parseInt(u64, req.path["/webmail/api/calendar-events/".len..], 10) catch
         return sendError(conn, arena, 400, "bad_request", "Invalid event ID");
     if (get) {
-        const detail = dav.snapshotMailboxEvent(arena, sess.username, event_id) catch |err| return calendarWriteError(conn, arena, err);
+        const detail = dav.snapshotWebCalendarEvent(arena, sess.username, event_id, .read) catch |err| return calendarWriteError(conn, arena, err);
         const include_source = std.mem.eql(u8, req.queryParam(arena, "source") orelse "", "1");
         return sendRevisionJson(conn, arena, 200, try service_mod.json(arena, .{
             .event = detail.event,
@@ -2142,11 +2126,11 @@ fn handleCalendarEventItem(server: *WebmailHttpServer, conn: *webmail_tls.Stream
         return sendError(conn, arena, 428, "revision_required", "Read the event and send its ETag in If-Match");
     if (!isSingleStrongRevision(expected)) return sendError(conn, arena, 400, "invalid_revision", "Send one strong event ETag in If-Match");
     if (delete) {
-        dav.deleteMailboxEvent(sess.username, event_id, expected) catch |err| return calendarWriteError(conn, arena, err);
+        dav.deleteWebCalendarEvent(sess.username, event_id, expected) catch |err| return calendarWriteError(conn, arena, err);
         return sendStatus(conn, arena, 204, "No Content", null);
     }
 
-    const stored = dav.snapshotMailboxEvent(arena, sess.username, event_id) catch |err| return calendarWriteError(conn, arena, err);
+    const stored = dav.snapshotWebCalendarEvent(arena, sess.username, event_id, .edit) catch |err| return calendarWriteError(conn, arena, err);
     if (!std.mem.eql(u8, stored.event.etag, expected)) return calendarWriteError(conn, arena, error.PreconditionFailed);
     const data = if (put) data: {
         if (!isICalendar(req))
@@ -2159,7 +2143,7 @@ fn handleCalendarEventItem(server: *WebmailHttpServer, conn: *webmail_tls.Stream
         break :data calendar_events.prepareEdit(arena, stored, payload) catch |err| return calendarWriteError(conn, arena, err);
     };
     checkCalendarEventBody(server, arena, dav, data.ics_data.?) catch |err| return calendarWriteError(conn, arena, err);
-    const revision = dav.updateMailboxEvent(sess.username, event_id, expected, data) catch |err| return calendarWriteError(conn, arena, err);
+    const revision = dav.updateWebCalendarEvent(sess.username, event_id, expected, data) catch |err| return calendarWriteError(conn, arena, err);
     return sendRevisionJson(conn, arena, 200, try service_mod.json(arena, .{ .id = event_id, .etag = revision.etag() }), null, revision.etag());
 }
 
@@ -2182,7 +2166,7 @@ fn checkCalendarEventBody(server: *WebmailHttpServer, arena: std.mem.Allocator, 
 
 fn calendarWriteError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: anyerror) !void {
     return switch (err) {
-        error.CalendarNotFound, error.EventNotFound => sendError(conn, arena, 404, "not_found", "Calendar or event not found"),
+        error.CalendarNotFound, error.EventNotFound, error.DavMailboxNotFound => sendError(conn, arena, 404, "not_found", "Calendar or event not found"),
         error.CalendarNameConflict => sendError(conn, arena, 409, "calendar_name_conflict", "This name is already in use"),
         error.EventAlreadyExists => sendError(conn, arena, 409, "event_exists", "An event with this UID already exists"),
         error.InvalidCalendarName => sendError(conn, arena, 400, "invalid_calendar_name", "Enter a calendar name of at most 100 bytes without slashes or consecutive dots"),
@@ -2192,6 +2176,7 @@ fn calendarWriteError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: 
         error.EmptyEventEdit => sendError(conn, arena, 400, "empty_event_edit", "Provide at least one event change"),
         error.PreconditionFailed => sendError(conn, arena, 412, "event_changed", "The event changed. Reload it before saving"),
         error.InvalidCalendar, error.NoPrimaryEvent => sendError(conn, arena, 422, "invalid_calendar_event", "This stored calendar resource has no single editable primary event"),
+        error.SharedEventMustBePublic => sendError(conn, arena, 422, "shared_event_must_be_public", "Shared calendar edits must use public events"),
         error.RecurringTimeEdit => sendError(conn, arena, 422, "recurring_event_time", "Edit recurring event times through a CalDAV client"),
         error.EventTooLarge, error.CalendarExportTooLarge, error.MalwareScanTooLarge => sendError(conn, arena, 413, "event_too_large", "The event exceeds the allowed size"),
         error.MalwareDetected, error.InvalidDavBinary => sendError(conn, arena, 422, "event_rejected", "The calendar resource did not pass attachment scanning"),

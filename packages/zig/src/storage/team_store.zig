@@ -114,6 +114,11 @@ fn identity(tx: Tx, mailbox: []const u8) !?Identity {
     return .{ .id = stmt.columnInt64(0), .enabled = stmt.columnInt64(1) != 0 };
 }
 
+pub fn activeMailboxId(tx: Tx, mailbox: []const u8) !?i64 {
+    const user = (try identity(tx, mailbox)) orelse return null;
+    return if (user.enabled) user.id else null;
+}
+
 fn memberRole(tx: Tx, team: []const u8, id: i64) !?Role {
     const stmt = try tx.prepare("SELECT role FROM mail_team_members WHERE team_id=?1 AND user_id=?2");
     defer stmt.finalize();
@@ -303,6 +308,23 @@ pub fn calendarShares(db: *database.Database, a: Allocator, mailbox: []const u8)
         });
     }
     return rows.toOwnedSlice(a);
+}
+
+/// Resolve the strongest current grant for one exact calendar. The caller
+/// holds the account transaction through the corresponding DAV operation.
+pub fn calendarAccess(tx: Tx, grantee_id: i64, source_id: i64, share_id: CalendarShareId) !?CalendarAccess {
+    const stmt = try tx.prepare(
+        \\SELECT p.access FROM mail_team_calendar_shares p
+        \\JOIN users s ON s.id=p.source_id AND s.enabled=1
+        \\WHERE p.grantee_id=?1 AND p.source_id=?2 AND p.calendar_share_id=?3
+        \\ORDER BY CASE p.access WHEN 'editor' THEN 1 WHEN 'viewer' THEN 2 ELSE 3 END
+        \\LIMIT 1
+    );
+    defer stmt.finalize();
+    const key: []const u8 = &share_id;
+    try bind(stmt, .{ grantee_id, source_id, key });
+    if (!try stmt.step()) return null;
+    return std.meta.stringToEnum(CalendarAccess, stmt.columnText(0)) orelse error.InvalidTeamData;
 }
 
 pub fn list(db: *database.Database, a: Allocator, mailbox: []const u8) ![]Team {

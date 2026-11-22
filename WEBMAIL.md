@@ -435,10 +435,15 @@ the teammate's full mailbox address. The access values are `viewer`,
 
 `GET /webmail/api/calendar-shares` lists the signed-in mailbox's incoming and
 outgoing shares. Viewer and editor grants allow public event listings via
-`GET /webmail/api/calendar-events` with the shared `calendarId`. A resource
-with any private or confidential instance stays out of shared listings and
-search. The event mutation and export endpoints require calendar ownership.
-Free/busy grants currently appear in share metadata.
+`GET /webmail/api/calendar-events` with the shared `calendarId`, and public
+event details via `GET /webmail/api/calendar-events/{id}`. Resources with
+private or confidential instances stay out of shared results.
+
+Editors can create, update, and delete public events through the calendar event
+API. Updates and deletions use the same `If-Match` requirement as owner edits.
+Mail checks the grant again when it writes the event, after preparing and
+scanning the request. Calendar exports require ownership. Free/busy grants
+currently appear in share metadata.
 
 ### Shared inboxes
 
