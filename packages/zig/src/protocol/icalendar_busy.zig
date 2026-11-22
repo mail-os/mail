@@ -31,6 +31,7 @@ pub const Source = struct {
     all_day: bool,
     cancelled: bool,
     tentative: bool,
+    timezone: ?[]const u8 = null,
 };
 
 pub fn calculate(a: Allocator, scratch_allocator: Allocator, sources: []const Source, window: Window, timezone: []const u8, grouping: Grouping) ![]Period {
@@ -45,7 +46,7 @@ pub fn calculate(a: Allocator, scratch_allocator: Allocator, sources: []const So
         }
         var scratch = std.heap.ArenaAllocator.init(scratch_allocator);
         defer scratch.deinit();
-        try appendResource(output, scratch.allocator(), source.icalendar, timezone, null, &budget);
+        try appendResource(output, scratch.allocator(), source.icalendar, source.timezone orelse timezone, null, &budget);
     }
     std.mem.sort(Period, periods.items, {}, struct {
         fn lessThan(_: void, left: Period, right: Period) bool {
@@ -67,6 +68,32 @@ pub fn calculate(a: Allocator, scratch_allocator: Allocator, sources: []const So
         count += 1;
     }
     return periods.items[0..count];
+}
+
+test "combined busy periods preserve each calendar's floating time zone" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:floating\r\n" ++
+        "DTSTART:20281106T090000\r\nDTEND:20281106T100000\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    const source: Source = .{
+        .icalendar = ics,
+        .start = 0,
+        .end = null,
+        .all_day = false,
+        .cancelled = false,
+        .tentative = false,
+    };
+    var new_york = source;
+    new_york.timezone = "America/New_York";
+    const periods = try calculate(arena.allocator(), a, &.{ source, new_york }, .{
+        .start = Date.parse("20281106T000000Z").?.epoch(),
+        .end = Date.parse("20281107T000000Z").?.epoch(),
+    }, "UTC", .combined);
+    try std.testing.expectEqualSlices(Period, &.{
+        .{ .start = Date.parse("20281106T090000Z").?.epoch(), .end = Date.parse("20281106T100000Z").?.epoch(), .kind = .busy },
+        .{ .start = Date.parse("20281106T140000Z").?.epoch(), .end = Date.parse("20281106T150000Z").?.epoch(), .kind = .busy },
+    }, periods);
 }
 
 pub fn overlaps(a: Allocator, source: Source, window: Window, timezone: []const u8, query_zone: ?clock.Zone, budget: *usize) !bool {

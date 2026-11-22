@@ -19,6 +19,8 @@ const {
   showDayLabels, showDayLabelEditor, hasDayLabels, labelOnDate, currentDayLabel, canEditDayLabel, editingDayLabel,
   dayLabelDraft, dayLabelSaving, dayLabelConflict, dayLabelError, dayLabelNotice, dayLabelsUnavailable,
   startDayLabel, cancelDayLabel, saveDayLabel,
+  freeTimeOpen, freeTimeDate, freeTimeStart, freeTimeEnd, freeTimeMinutes, freeTimeIncludeOwned, freeTimeBusy,
+  freeTimeDurations, freeTimeCanIncludeOwned, freeTimeScope, freeTimeResults, freeTimeError, toggleFreeTime, findFreeTime,
   refresh, selectCalendar, showView, shiftView, goToToday, showDay, changeDate, changeZone, calendarEventDate,
   calendarSettings, calendarSettingsError, calendarSettingsBusy, calendarNameInput, createCalendar, setCalendarColor, toggleCalendarSettings,
   teams, outgoingShares, shareCalendarInput, shareTeamInput, shareGranteeInput, shareAccessInput,
@@ -39,6 +41,11 @@ const {
 const dayHeading = useRef('dayHeading')
 const labelField = useRef('labelField')
 const labelTrigger = useRef('labelTrigger')
+const freeTimeDateField = useRef('freeTimeDateField')
+function changeFreeTimePanel() {
+  toggleFreeTime()
+  if (freeTimeOpen()) nextTick(() => freeTimeDateField.current?.focus())
+}
 function editLabel() {
   startDayLabel()
   nextTick(() => labelField.current?.focus())
@@ -160,10 +167,13 @@ onUnmounted(() => { destroy(); destroyReminders() })
           <span><strong :text="share.calendarName"></strong><small :text="share.source + ' · ' + calendarAccessLabels[share.access]"></small></span>
         </button>
       </div>
-      <form :if="!availabilityOnly && (calendars.length || selectedShare)" class="calendar-choices calendar-search" role="search" @submit.prevent="search()">
-        <div class="mail-search-field"><span class="mail-icon" data-icon="search" aria-hidden="true"></span><input class="wm-search" type="search" x-model="searchInput" aria-label="Search events" placeholder="Search events" maxlength="256"><button type="submit" class="wm-search-submit" aria-label="Search" title="Search"><span class="mail-icon" data-icon="arrow-right" aria-hidden="true"></span></button></div>
-        <button :if="searchTerm" type="button" class="wm-action" @click="clearSearch()">Clear</button>
-      </form>
+      <div :if="calendars.length || selectedShare" class="calendar-source-tools">
+        <form :if="!availabilityOnly" class="calendar-choices calendar-search" role="search" @submit.prevent="search()">
+          <div class="mail-search-field"><span class="mail-icon" data-icon="search" aria-hidden="true"></span><input class="wm-search" type="search" x-model="searchInput" aria-label="Search events" placeholder="Search events" maxlength="256"><button type="submit" class="wm-search-submit" aria-label="Search" title="Search"><span class="mail-icon" data-icon="arrow-right" aria-hidden="true"></span></button></div>
+          <button :if="searchTerm" type="button" class="wm-action" @click="clearSearch()">Clear</button>
+        </form>
+        <button type="button" class="wm-action" :aria-expanded="freeTimeOpen" aria-controls="calendar-free-time" @click="changeFreeTimePanel()"><span class="mail-icon" data-icon="clock" aria-hidden="true"></span>Find free time</button>
+      </div>
     </div>
     <p :if="!calendars.length && !selectedShare">Choose a shared calendar.</p>
     <div :if="calendars.length || selectedShare" class="calendar-controls calendar-view-toolbar">
@@ -182,6 +192,30 @@ onUnmounted(() => { destroy(); destroyReminders() })
         </select>
       </label>
     </div>
+
+    <section :if="freeTimeOpen && (calendars.length || selectedShare)" id="calendar-free-time" class="calendar-free-time" aria-labelledby="calendar-free-time-heading" :aria-busy="freeTimeBusy">
+      <div class="calendar-free-time-heading">
+        <h2 id="calendar-free-time-heading">Find free time</h2>
+        <p :text="freeTimeScope + ' · ' + displayZone"></p>
+      </div>
+      <form class="calendar-free-time-form" @submit.prevent="findFreeTime()">
+        <label>Date<input ref="freeTimeDateField" type="date" x-model="freeTimeDate" required :disabled="freeTimeBusy"></label>
+        <label>From<input type="time" x-model="freeTimeStart" required :disabled="freeTimeBusy"></label>
+        <label>To<input type="time" x-model="freeTimeEnd" required :disabled="freeTimeBusy"></label>
+        <label>Minimum duration<select x-model="freeTimeMinutes" :disabled="freeTimeBusy">
+          <option :for="minutes in freeTimeDurations" :value="String(minutes)" :text="minutes + ' min'"></option>
+        </select></label>
+        <button type="submit" class="wm-action calendar-primary" :disabled="freeTimeBusy" :text="freeTimeBusy ? 'Checking…' : 'Check availability'"></button>
+        <label :if="freeTimeCanIncludeOwned" class="calendar-free-time-personal"><input type="checkbox" :checked="freeTimeIncludeOwned" @change="freeTimeIncludeOwned.set($event.target.checked)" :disabled="freeTimeBusy">Include my calendars</label>
+      </form>
+      <p :if="freeTimeError" class="calendar-label-error" role="alert" :text="freeTimeError"></p>
+      <div :if="freeTimeResults" class="calendar-free-time-output">
+        <p role="status" :text="freeTimeResults.length ? freeTimeResults.length + (freeTimeResults.length === 1 ? ' open window' : ' open windows') : 'No open windows match this duration.'"></p>
+        <ul :if="freeTimeResults.length" class="calendar-free-time-results" aria-label="Open windows">
+          <li :for="slot in freeTimeResults" :key="slot.start"><span :text="slot.time"></span><small :text="slot.minutes + ' min'"></small></li>
+        </ul>
+      </div>
+    </section>
 
     <section :if="searchTerm" aria-labelledby="calendar-search-results">
       <h2 id="calendar-search-results" class="calendar-range" :text="'Search results · ' + activeCalendarName"></h2>

@@ -496,6 +496,28 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-search { flex-wrap: nowrap; }
 .calendar-search input { width: min(14rem, 100%); }
 .calendar-zone { display: flex; align-items: center; gap: .45rem; color: var(--muted); flex-wrap: wrap; font-size: .8rem; }
+.calendar-source-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+.calendar-source-tools .calendar-search { flex: 1 1 9rem; width: auto; }
+.calendar-free-time { margin-block: 12px; padding: 14px; border: 1px solid var(--border); border-radius: 9px; background: var(--toolbar); }
+.calendar-free-time-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-block-end: 12px; }
+.calendar-free-time-heading h2 { margin: 0; font-size: 16px; }
+.calendar-free-time-heading p { margin: 0; color: var(--muted); font-size: 12px; }
+.calendar-free-time-form { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
+.calendar-free-time-form label { display: grid; gap: 5px; min-width: 0; font-size: 13px; font-weight: 550; }
+.calendar-free-time-form input:not([type=checkbox]) { width: 100%; min-width: 0; min-block-size: var(--control-height); padding: 6px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); }
+.calendar-free-time-form .calendar-free-time-personal { display: flex; align-items: center; gap: 6px; flex-basis: 100%; min-block-size: var(--control-height); }
+.calendar-free-time > .calendar-label-error { margin-block-start: 10px; }
+.calendar-free-time-output { display: grid; gap: 8px; margin-block-start: 12px; padding-block-start: 10px; border-block-start: 1px solid var(--border); }
+.calendar-free-time-output > p { margin: 0; font-size: 13px; font-weight: 600; }
+.calendar-free-time-results { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr)); gap: 6px; margin: 0; padding: 0; list-style: none; }
+.calendar-free-time-results li { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); font-variant-numeric: tabular-nums; }
+.calendar-free-time-results small { color: var(--muted); }
+@media (max-width: 600px) {
+  .calendar-source-tools { width: 100%; }
+  .calendar-free-time-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .calendar-free-time-form > label:first-child, .calendar-free-time-form > .calendar-free-time-personal { grid-column: 1 / -1; }
+  .calendar-free-time-form > button { justify-content: center; padding-inline: 6px; }
+}
 
 .calendar-board, .calendar-weekdays { display: grid; }
 .calendar-board { gap: 1px; }

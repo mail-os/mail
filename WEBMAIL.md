@@ -114,6 +114,11 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   unmarked date to open its day view. With a date focused, the arrow keys move
   between days and weeks. Search matches titles, locations, and descriptions
   across dates. Use **Manage calendars** to create a calendar or change its color.
+- **Find free time** checks a date, time range, and minimum duration in the
+  display time zone. It uses your personal calendars or the selected calendar.
+  When checking a shared calendar, you can include your own calendars to find
+  overlapping availability. Results show open intervals and exclude busy time,
+  including busy periods from events whose details are private.
 - Use **Add day label** in Day view to name a date, such as a travel or focus
   day. Labels follow that civil date across your personal calendar views and
   devices. They stay private to your mailbox and stay outside CalDAV and
@@ -208,6 +213,11 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   `POST /webmail/api/calendars` creates one from a JSON `name`. Send
   `PATCH /webmail/api/calendars/{id}` with `color` set to a six-digit hex
   color or `null` to update the color.
+- `GET /webmail/api/calendar-free-busy?start=…&end=…` returns merged busy
+  periods for your personal calendars. Pass `calendarId` to check a single
+  authorized calendar. Add `includeOwned=1` to combine that calendar's busy
+  time with your own. The window uses Unix seconds, with an exclusive end and
+  a maximum span of 366 days. The response contains interval boundaries.
 - `GET /webmail/api/calendar-day-labels?start=…&end=…` returns the mailbox's
   day labels and revisions for an inclusive range of up to 366 civil dates
   in `YYYY-MM-DD` format. `PUT /webmail/api/calendar-day-labels/{date}` takes

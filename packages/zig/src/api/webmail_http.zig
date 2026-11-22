@@ -2054,13 +2054,16 @@ fn handleCalendarFreeBusy(server: *WebmailHttpServer, conn: *webmail_tls.Stream,
     var sess = (try requireSession(server, conn, arena, req)) orelse return;
     defer sess.deinit(server.allocator);
     const dav = server.dav_store orelse return sendError(conn, arena, 503, "calendar_unavailable", "Calendar is unavailable on this server");
-    const calendar_id = std.fmt.parseInt(u64, req.queryParam(arena, "calendarId") orelse "", 10) catch
-        return sendError(conn, arena, 400, "bad_request", "Invalid calendar ID");
+    const calendar_id: ?u64 = if (req.queryParam(arena, "calendarId")) |id|
+        std.fmt.parseInt(u64, id, 10) catch return sendError(conn, arena, 400, "bad_request", "Invalid calendar ID")
+    else
+        null;
+    const include_owned = std.mem.eql(u8, req.queryParam(arena, "includeOwned") orelse "", "1");
     const start = std.fmt.parseInt(i64, req.queryParam(arena, "start") orelse "", 10) catch
         return sendError(conn, arena, 400, "bad_request", "Invalid start timestamp");
     const end = std.fmt.parseInt(i64, req.queryParam(arena, "end") orelse "", 10) catch
         return sendError(conn, arena, 400, "bad_request", "Invalid end timestamp");
-    const result = dav.webCalendarBusyPeriods(arena, sess.username, calendar_id, .{ .start = start, .end = end }) catch |err| switch (err) {
+    const result = dav.webCalendarBusyPeriods(arena, sess.username, .{ .id = calendar_id, .include_owned = include_owned }, .{ .start = start, .end = end }) catch |err| switch (err) {
         error.InvalidRange => return sendError(conn, arena, 400, "bad_request", "Specify a positive calendar window of at most 366 days"),
         error.CalendarNotFound, error.DavMailboxNotFound => return sendError(conn, arena, 404, "not_found", "Calendar not found"),
         error.AvailabilityLimit => return sendError(conn, arena, 413, "availability_limit", "The calendar exceeds the availability calculation limit"),

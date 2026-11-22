@@ -16,6 +16,7 @@ import { expandSeries } from './calendar-recurrence'
 import type { CalendarOccurrence } from './calendar-recurrence'
 import { useCalendarEditor } from './use-calendar-editor'
 import { useCalendarDayLabels } from './use-calendar-day-labels'
+import { useCalendarFreeTime } from './use-calendar-free-time'
 import { useCalendarReminders } from './use-calendar-reminders'
 import type { CalendarDialog } from './use-calendar-editor'
 
@@ -229,11 +230,18 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     events.set([])
     busyPeriods.set([])
     dayLabels.clearDayLabels()
+    freeTime.clearFreeTimeResults()
     onAuthError()
   })
   const showDayLabels = derived(() => !selectedShare() && !searchTerm() && calendars().length > 0)
   const showDayLabelEditor = derived(() => showDayLabels() && view() === 'day')
   const dayLabels = useCalendarDayLabels(api, focusDay, showDayLabels, showDayLabelEditor)
+  const freeTime = useCalendarFreeTime(api, focusDay, displayZone, () => ({
+    id: activeCalendar(),
+    name: activeCalendar() === null ? 'My calendars' : activeCalendarName(),
+    access: selectedShare()?.access,
+    canIncludeOwned: !!selectedShare() && calendars().length > 0,
+  }))
 
   function applyShares(rows: CalendarShare[]) {
     const accessBefore = selectedShare()?.access
@@ -244,6 +252,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     if (editorBefore && editorBefore !== findEditorShare()?.access) editor.clearEditor()
     const accessAfter = selectedShare()?.access
     if (accessBefore === accessAfter) return false
+    freeTime.clearFreeTimeResults()
     if (!accessAfter) {
       activeCalendar.set(null)
       shareNotice.set('You no longer have access to this shared calendar.')
@@ -387,6 +396,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
   })
 
   function selectCalendar(id: number | null) {
+    freeTime.clearFreeTimeResults()
     shareNotice.set('')
     activeCalendar.set(id)
     if (availabilityOnly()) {
@@ -430,6 +440,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
   }
 
   function changeZone(change: Event) {
+    freeTime.clearFreeTimeResults()
     displayZone.set((change.target as HTMLSelectElement).value)
     return refresh()
   }
@@ -676,6 +687,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     calendarEventDate: (event: CalendarEvent) => calendarEventDate(event, displayZone()),
     ...editor,
     ...dayLabels,
+    ...freeTime,
     showDayLabels, showDayLabelEditor,
     ...reminders,
     importOpen, importDestination, newCalendarName, importBusy, importError, importRows, importFinished,
@@ -689,6 +701,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
       settingsRequest?.abort()
       editor.clearEditor()
       dayLabels.clearDayLabels()
+      freeTime.clearFreeTimeResults()
     },
   }
 }

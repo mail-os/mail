@@ -1830,7 +1830,11 @@ pub const CalDavStore = struct {
         named: struct { owner: []const u8, collection: []const u8 },
         shared: teams.CalendarShareId,
     };
-    const BusyTarget = union(enum) { web: u64, dav: DavCalendarTarget };
+    pub const WebBusyCalendars = struct {
+        id: ?u64,
+        include_owned: bool = false,
+    };
+    const BusyTarget = union(enum) { web: WebBusyCalendars, dav: DavCalendarTarget };
 
     fn resolveDavCalendarLocked(self: *Self, access: CalendarRequest, target: DavCalendarTarget) !Calendar {
         if (target == .shared) {
@@ -2036,9 +2040,9 @@ pub const CalDavStore = struct {
         return .{ .timezone = try arena.dupe(u8, calendar.timezone), .members = members.items };
     }
 
-    pub fn webCalendarBusyPeriods(self: *Self, arena: Allocator, username: []const u8, id: u64, window: CalendarWindow) ![]icalendar_busy.Window {
+    pub fn webCalendarBusyPeriods(self: *Self, arena: Allocator, username: []const u8, calendars: WebBusyCalendars, window: CalendarWindow) ![]icalendar_busy.Window {
         try validateBusyWindow(window);
-        const snapshot = try self.snapshotCalendarBusyPeriods(arena, username, .{ .web = id }, true);
+        const snapshot = try self.snapshotCalendarBusyPeriods(arena, username, .{ .web = calendars }, true);
         const periods = try icalendar_busy.calculate(arena, self.allocator, snapshot.sources, window, snapshot.timezone, .combined);
         const result = try arena.alloc(icalendar_busy.Window, periods.len);
         for (result, periods) |*bounds, period| bounds.* = .{ .start = period.start, .end = period.end };
@@ -2061,26 +2065,45 @@ pub const CalDavStore = struct {
         defer access.deinit();
         self.mutex.lock();
         defer self.mutex.unlock();
-        const calendar = switch (target) {
-            .web => |id| self.calendars.get(id) orelse return error.CalendarNotFound,
+        const calendar: ?Calendar = switch (target) {
+            .web => |web| if (web.id) |id| self.calendars.get(id) orelse return error.CalendarNotFound else null,
             .dav => |path| try self.resolveDavCalendarLocked(access, path),
         };
-        const permission = (try self.calendarPermissionLocked(access, calendar)) orelse return error.CalendarNotFound;
-        if (target == .dav and target.dav == .shared and permission == .owner) return error.CalendarNotFound;
+        if (calendar) |selected| {
+            const permission = (try self.calendarPermissionLocked(access, selected)) orelse return error.CalendarNotFound;
+            if (target == .dav and target.dav == .shared and permission == .owner) return error.CalendarNotFound;
+        }
         if (!include_members) return .{ .timezone = "UTC", .sources = &.{} };
+        const owned = if (target == .web and (calendar == null or target.web.include_owned))
+            self.findUserIdLocked(username, access.mailbox_id)
+        else
+            null;
 
         // Copy a bounded snapshot under the authorization lock, then expand
         // recurrence outside both locks. No calendar source enters the response.
         var sources: std.ArrayList(icalendar_busy.Source) = .empty;
+        var owned_zones: std.AutoHashMapUnmanaged(u64, []const u8) = .empty;
         var bytes: usize = 0;
         var events = self.events.valueIterator();
         while (events.next()) |event| {
-            if (event.calendar_id != calendar.id) continue;
+            const zone: ?[]const u8 = zone: {
+                if (calendar) |selected| {
+                    if (event.calendar_id == selected.id) break :zone null;
+                }
+                const user_id = owned orelse continue;
+                const personal = self.calendars.get(event.calendar_id) orelse continue;
+                if (personal.user_id != user_id) continue;
+                const entry = try owned_zones.getOrPut(arena, personal.id);
+                if (!entry.found_existing) entry.value_ptr.* = try arena.dupe(u8, personal.timezone);
+                break :zone entry.value_ptr.*;
+            };
             bytes += event.ics_data.len;
             if (bytes > 16 * 1024 * 1024 or sources.items.len == 32_000) return error.AvailabilityLimit;
-            try sources.append(arena, try copyCalendarSource(arena, event.*, event.ics_data));
+            var source = try copyCalendarSource(arena, event.*, event.ics_data);
+            source.timezone = zone;
+            try sources.append(arena, source);
         }
-        return .{ .timezone = try arena.dupe(u8, calendar.timezone), .sources = sources.items };
+        return .{ .timezone = if (calendar) |selected| try arena.dupe(u8, selected.timezone) else "UTC", .sources = sources.items };
     }
 
     fn copyCalendarSource(arena: Allocator, event: Event, body: []const u8) !icalendar_busy.Source {

@@ -567,6 +567,42 @@ async function sharedJourney(page, phone = false) {
   await message.waitFor()
 }
 
+async function freeTimeJourney(page, phone = false) {
+  await page.goto(`${url}/calendar?day=${day}`)
+  await button(page, 'Find free time').click()
+  const panel = page.getByRole('region', { name: 'Find free time' })
+  await page.waitForFunction(() => document.activeElement?.getAttribute('data-stx-ref') === 'freeTimeDateField')
+  if (phone) await page.setViewportSize({ width: 320, height: 844 })
+  await verifyControlRow(panel.locator('form'), 'input, select, button', phone ? 44 : 36, !phone)
+  const check = button(panel, 'Check availability')
+  const slots = panel.getByRole('list', { name: 'Open windows' })
+  await check.click()
+  await panel.getByRole('status').filter({ hasText: '3 open windows' }).waitFor()
+  assert.deepEqual(await slots.locator('li > span').allTextContents(), [
+    '9:00 AM – 11:00 AM', '12:00 PM – 2:00 PM', '3:00 PM – 5:00 PM',
+  ])
+  assert.deepEqual(await slots.locator('li > small').allTextContents(), ['120 min', '120 min', '120 min'])
+  await fitsViewport(page)
+  await page.mouse.move(0, 0)
+  await panel.screenshot({ path: join(output, phone ? 'phone-calendar-free-time.png' : 'desktop-calendar-free-time.png'), animations: 'disabled' })
+  await panel.getByLabel('From', { exact: true }).fill('10:40')
+  await panel.getByLabel('To', { exact: true }).fill('15:30')
+  await panel.getByLabel('Minimum duration').selectOption('120')
+  assert.equal(await slots.count(), 0, 'Changing the search window clears stale availability')
+  await check.click()
+  await panel.getByRole('status').filter({ hasText: '1 open window' }).waitFor()
+  await slots.getByText('12:00 PM – 2:00 PM', { exact: true }).waitFor()
+
+  const calculation = /\/webmail\/api\/calendar-free-busy\?/
+  await page.route(calculation, route => route.fulfill({
+    status: 422, json: { error: 'availability_incomplete', message: 'Some busy times could not be calculated' },
+  }), { times: 1 })
+  await check.click()
+  await panel.getByRole('alert').filter({ hasText: 'Some busy times could not be calculated' }).waitFor()
+  assert.equal(await slots.count(), 0, 'Incomplete calculations show no open times')
+  if (phone) await page.setViewportSize({ width: 390, height: 844 })
+}
+
 async function calendarSharingJourney(captain) {
   const calendarUrl = `${url}/calendar?day=${day}`
   const initialCalendars = Promise.withResolvers()
@@ -725,12 +761,44 @@ async function calendarSharingJourney(captain) {
   await busyDay.click()
   await busy.waitFor()
 
+  const ownCalendar = await teammate.request.post(url + '/webmail/api/calendars', {
+    headers: { Origin: url },
+    data: { name: 'My planning' },
+  })
+  assert.equal(ownCalendar.status(), 201)
+  const { id: ownCalendarId } = await ownCalendar.json()
+  const personalEvent = await teammate.request.post(url + '/webmail/api/calendar-events', {
+    headers: { Origin: url },
+    data: {
+      calendarId: ownCalendarId, summary: 'My own appointment',
+      time: { start: Date.parse(day + 'T12:30:00Z') / 1000, end: Date.parse(day + 'T13:00:00Z') / 1000 },
+    },
+  })
+  assert.equal(personalEvent.status(), 201, await personalEvent.text())
+  await button(teammate, 'Day').click()
+  await button(teammate, 'My planning').waitFor()
+  await busy.waitFor()
+  await button(teammate, 'Find free time').click()
+  const availability = teammate.getByRole('region', { name: 'Find free time' })
+  const include = availability.getByRole('checkbox', { name: 'Include my calendars' })
+  assert(await include.isChecked())
+  const check = button(availability, 'Check availability')
+  await check.click()
+  await availability.getByRole('status').filter({ hasText: '4 open windows' }).waitFor()
+  await include.uncheck()
+  await check.click()
+  await availability.getByRole('status').filter({ hasText: '3 open windows' }).waitFor()
+  const slots = availability.getByRole('list', { name: 'Open windows' })
+  await slots.getByText('12:00 PM – 2:00 PM', { exact: true }).waitFor()
+  assert.equal(await availability.getByText('Private budget check', { exact: true }).count(), 0)
+
   await screenshot(captain, 'desktop-calendar-sharing')
   await button(sharing, `Revoke access for ${sender} to ${calendarLabel}`).click()
   await role.waitFor({ state: 'hidden' })
   await checkAccess()
   await teammate.getByText('You no longer have access to this shared calendar.', { exact: true }).waitFor()
   await busy.waitFor({ state: 'hidden' })
+  await slots.waitFor({ state: 'hidden' })
   await button(teammate, /^Design & Research/).waitFor({ state: 'hidden' })
   await context.close()
 }
@@ -1056,6 +1124,8 @@ try {
   await phoneJourney(phone)
   await invitationJourney(desktop)
   await invitationJourney(phone, true)
+  await freeTimeJourney(desktop)
+  await freeTimeJourney(phone, true)
   await calendarSharingJourney(desktop)
   await mailEventJourney(desktop)
   const firstRun = await signIn({ phone: true, account: newcomer, initialSubject: 'Studio launch notes' })
