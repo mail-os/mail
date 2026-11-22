@@ -103,6 +103,7 @@ jobs:
         python3 ../../scripts/test-webmail-shared-replies.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-contacts.py zig-out/bin/mail
         python3 ../../scripts/test-mailbox-export.py zig-out/bin/mail
+        python3 ../../scripts/test-imap-internaldate.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-forwarding.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-vacation.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-junk.py zig-out/bin/mail

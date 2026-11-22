@@ -76,8 +76,12 @@ fn countBytes(path: [:0]const u8, allowance: u64, depth: usize) !u64 {
 }
 
 pub fn write(db: ?*db_mod.Database, allocator: std.mem.Allocator, user: []const u8, path: []const u8, data: []const u8) !void {
+    try writeWithMtime(db, allocator, user, path, data, null);
+}
+
+pub fn writeWithMtime(db: ?*db_mod.Database, allocator: std.mem.Allocator, user: []const u8, path: []const u8, data: []const u8, mtime: ?i64) !void {
     if (db) |database| database.lockMailboxes();
     defer if (db) |database| database.unlockMailboxes();
     if (db) |database| try checkStorage(database, user, data.len, null);
-    try durable_maildir.write(allocator, path, data);
+    try durable_maildir.writeWithMtime(allocator, path, data, mtime);
 }

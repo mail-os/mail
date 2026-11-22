@@ -2,12 +2,12 @@
 """Export a disabled mailbox and transfer the archive to a fresh Mail instance."""
 
 import argparse
+from datetime import datetime
 from email import policy
 from email.message import EmailMessage
 from email.parser import BytesParser
 import json
 import mailbox
-import os
 from pathlib import Path
 import runpy
 import stat
@@ -64,12 +64,10 @@ def seed(source):
             assert imap.create('"' + folder + '"')[0] == "OK"
         assert imap.create('"Temporary folder"')[0] == "OK"
         assert imap.delete('"Temporary folder"')[0] == "OK"
-        assert imap.append("Projects", r"(\Seen \Flagged)", None, raw)[0] == "OK"
+        assert imap.append("Projects", r"(\Seen \Flagged)", FILE_TIME, raw)[0] == "OK"
         assert imap.append("Sent", r"(\Seen \Answered)", None, raw)[0] == "OK"
 
     owner_dir = source.directory / "mail" / owner
-    project_message, = (owner_dir / ".Projects" / "cur").glob("*.eml*")
-    os.utime(project_message, (FILE_TIME, FILE_TIME))
     # Imported or upgraded installations may have both the old flat directory
     # and the current Maildir++ directory. Include both without duplicating an alias.
     (owner_dir / "Projects").unlink()
@@ -163,9 +161,11 @@ def transfer(destination, extracted, manifest):
         assert imap.select('"Projects"') == ("OK", [b"2"])
         result, rows = imap.search(None, "FLAGGED")
         assert result == "OK" and len(rows[0].split()) == 1
-        result, rows = imap.fetch(rows[0], "(BODY.PEEK[])")
+        result, rows = imap.fetch(rows[0], "(BODY.PEEK[] INTERNALDATE)")
         message = BytesParser(policy=policy.default).parsebytes(rows[0][1])
         assert result == "OK" and message["Subject"] == "Portable project attachment"
+        date = rows[0][0].split(b'INTERNALDATE "', 1)[1].split(b'"', 1)[0]
+        assert datetime.strptime(date.decode(), "%d-%b-%Y %H:%M:%S %z").timestamp() == FILE_TIME
         part, = message.iter_attachments()
         assert part.get_filename() == "fixture.bin" and part.get_payload(decode=True) == ATTACHMENT
         assert imap.select('"Empty folder"') == ("OK", [b"0"])

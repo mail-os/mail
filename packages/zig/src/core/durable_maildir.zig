@@ -24,6 +24,10 @@ fn syncDir(allocator: std.mem.Allocator, path: []const u8) !void {
 }
 
 pub fn write(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !void {
+    try writeWithMtime(allocator, path, data, null);
+}
+
+pub fn writeWithMtime(allocator: std.mem.Allocator, path: []const u8, data: []const u8, mtime: ?i64) !void {
     const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return error.InvalidMaildirPath;
     const directory = path[0..slash];
     const temporary = try std.fmt.allocPrint(allocator, "{s}/.pending-{s}", .{ directory, path[slash + 1 ..] });
@@ -32,6 +36,10 @@ pub fn write(allocator: std.mem.Allocator, path: []const u8, data: []const u8) !
     defer file.close();
     defer fs.cwd().deleteFile(temporary) catch {};
     try file.writeAll(data);
+    if (mtime) |seconds| {
+        const times = [2]std.c.timespec{ std.c.UTIME.OMIT, .{ .sec = @intCast(seconds), .nsec = 0 } };
+        if (std.c.futimens(file.handle, &times) != 0) return error.MaildirTimestampFailed;
+    }
     try syncFd(file.handle);
     const src = try allocator.dupeSentinel(u8, temporary, 0);
     defer allocator.free(src);

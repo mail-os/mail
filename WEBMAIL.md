@@ -326,10 +326,11 @@ stores for a point-in-time export across mail and DAV.
   names. The destination assigns its own message UIDs.
 
 To move mail into another Mail instance, create each folder from the manifest
-and upload the messages over IMAP using a client that supports APPEND. Use a
-Maildir importer such as Dovecot's when the original received time matters.
-APPEND timestamp preservation is tracked in [#105](https://github.com/mail-os/mail/issues/105).
-[Dovecot import documentation](https://doc.dovecot.org/2.3/admin_manual/importing_mailboxes/)
+and upload its messages over IMAP. Pass the archived flags and file modification
+time to APPEND to preserve the original received time. Mail uses the current time
+when a client omits it. Backdated imports still arrive at the end of the
+destination folder. A Maildir importer such as Dovecot's can also read the
+extracted folders directly. [Dovecot import documentation](https://doc.dovecot.org/2.3/admin_manual/importing_mailboxes/)
 
 Use a server backup for same-service recovery of account configuration,
 sharing, and private workflow state.

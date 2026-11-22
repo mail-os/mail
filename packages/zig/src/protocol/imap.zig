@@ -613,42 +613,85 @@ const AggregateMailboxEntry = struct {
 
 const AppendArgs = struct {
     mailbox: []const u8,
-    flags: ?[]const u8,
+    flags: ?[]const u8 = null,
+    internal_date: ?i64 = null,
 };
 
 /// Parse the APPEND arguments that precede the `{N}` literal:
-/// `mailbox [(\Flag ...)] ["date-time"]`. The mailbox may be quoted
-/// (e.g. `"All Mail"`); the flag list and the obsolete date-time are
-/// optional per RFC 3501 Section 6.3.11. The date-time is accepted and
-/// ignored — filenames carry their own arrival timestamp.
-fn parseAppendArgs(args_raw: []const u8) AppendArgs {
+/// `mailbox [(\Flag ...)] ["date-time"]`.
+fn parseAppendArgs(args_raw: []const u8) !AppendArgs {
     const args = std.mem.trim(u8, args_raw, " \t");
-    var result = AppendArgs{ .mailbox = "INBOX", .flags = null };
-    if (args.len == 0) return result;
-
-    var cursor: usize = 0;
-    if (args[0] == '"') {
-        if (std.mem.indexOfScalarPos(u8, args, 1, '"')) |q| {
-            result.mailbox = args[1..q];
-            cursor = q + 1;
-        } else {
-            // Unterminated quote — take the rest as the mailbox name.
-            result.mailbox = args[1..];
-            return result;
-        }
-    } else {
-        const sp = std.mem.indexOfScalar(u8, args, ' ') orelse args.len;
-        result.mailbox = args[0..sp];
-        cursor = sp;
+    const mailbox = parseImapArg(args) orelse return .{ .mailbox = "INBOX" };
+    if (args[0] == '"' and mailbox.value.len + 1 >= args.len) return error.InvalidAppendArgs;
+    var result: AppendArgs = .{ .mailbox = mailbox.value };
+    var tail = mailbox.rest;
+    if (std.mem.startsWith(u8, tail, "(")) {
+        const close = std.mem.indexOfScalar(u8, tail, ')') orelse return error.InvalidAppendArgs;
+        result.flags = tail[1..close];
+        tail = std.mem.trimStart(u8, tail[close + 1 ..], " \t");
     }
-
-    const tail = std.mem.trim(u8, args[cursor..], " \t");
-    if (tail.len > 0 and tail[0] == '(') {
-        if (std.mem.indexOfScalar(u8, tail, ')')) |cp| {
-            result.flags = tail[1..cp];
-        }
+    if (tail.len != 0) {
+        if (tail.len < 2 or tail[0] != '"' or tail[tail.len - 1] != '"')
+            return error.InvalidAppendDate;
+        result.internal_date = try parseAppendDate(tail[1 .. tail.len - 1]);
     }
     return result;
+}
+
+const imap_months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+fn daysBeforeYear(year: i64) i64 {
+    const completed = year - 1;
+    return completed * 365 + @divFloor(completed, 4) - @divFloor(completed, 100) + @divFloor(completed, 400);
+}
+
+const earliest_internal_date = (daysBeforeYear(1) - daysBeforeYear(1970)) * 86400;
+const latest_internal_date = (daysBeforeYear(10000) - daysBeforeYear(1970)) * 86400 - 1;
+
+fn parseDateDigits(digits: []const u8) !u16 {
+    for (digits) |digit| {
+        if (!std.ascii.isDigit(digit)) return error.InvalidAppendDate;
+    }
+    return std.fmt.parseUnsigned(u16, digits, 10) catch return error.InvalidAppendDate;
+}
+
+fn parseAppendDate(date: []const u8) !i64 {
+    if (date.len != 26 or date[2] != '-' or date[6] != '-' or date[11] != ' ' or date[14] != ':' or
+        date[17] != ':' or date[20] != ' ' or (date[21] != '+' and date[21] != '-'))
+        return error.InvalidAppendDate;
+    const year = try parseDateDigits(date[7..11]);
+    if (year == 0) return error.InvalidAppendDate;
+    const month = for (imap_months, 1..) |label, number| {
+        if (std.ascii.eqlIgnoreCase(date[3..6], label)) break @as(std.time.epoch.Month, @fromBackingInt(@intCast(number)));
+    } else return error.InvalidAppendDate;
+    const day = try parseDateDigits(if (date[0] == ' ') date[1..2] else date[0..2]);
+    const hour = try parseDateDigits(date[12..14]);
+    const minute = try parseDateDigits(date[15..17]);
+    const second = try parseDateDigits(date[18..20]);
+    const zone_hour = try parseDateDigits(date[22..24]);
+    const zone_minute = try parseDateDigits(date[24..26]);
+    if (day == 0 or day > std.time.epoch.getDaysInMonth(year, month) or hour > 23 or minute > 59 or
+        second > 59 or zone_hour > 23 or zone_minute > 59)
+        return error.InvalidAppendDate;
+
+    var day_index = daysBeforeYear(year) - daysBeforeYear(1970) + @as(i64, day) - 1;
+    for (1..@backingInt(month)) |m| day_index += std.time.epoch.getDaysInMonth(year, @fromBackingInt(@intCast(m)));
+    const offset = @as(i64, zone_hour) * 3600 + @as(i64, zone_minute) * 60;
+    const local = day_index * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second;
+    const utc = local - if (date[21] == '+') offset else -offset;
+    if (utc < earliest_internal_date or utc > latest_internal_date) return error.InvalidAppendDate;
+    return utc;
+}
+
+/// Keep the persisted date separate from the numeric filename prefix that
+/// determines sequence order. Copy and move can change that prefix.
+fn storedInternalDate(filename: []const u8) ?i64 {
+    const basename = MaildirFlags.baseName(std.fs.path.basename(filename));
+    if (!std.mem.endsWith(u8, basename, ".eml")) return null;
+    const stem = basename[0 .. basename.len - ".eml".len];
+    const start = std.mem.lastIndexOf(u8, stem, ",I=") orelse return null;
+    const seconds = std.fmt.parseInt(i64, stem[start + ",I=".len ..], 10) catch return null;
+    return if (seconds >= earliest_internal_date and seconds <= latest_internal_date) seconds else null;
 }
 
 pub fn parseMessageSortKey(filename: []const u8) i64 {
@@ -1084,6 +1127,7 @@ pub const ImapSession = struct {
     append_tag: ?[]u8 = null,
     append_mailbox: ?[]u8 = null,
     append_flags: ?[]u8 = null,
+    append_internal_date: ?i64 = null,
     append_literal_size: usize = 0,
     append_literal_buf: ?[]u8 = null,
     append_literal_pos: usize = 0,
@@ -1223,9 +1267,11 @@ pub const ImapSession = struct {
 
     /// Build a destination name unique across IMAP threads, including when
     /// two new files carry different flags but share the same timestamp.
-    fn allocUniqueMaildirPath(self: *ImapSession, dir: []const u8, flag_suffix: []const u8) ![]u8 {
-        return std.fmt.allocPrint(self.allocator, "{s}/{d}.{d}.imap.{d}.eml{s}", .{
-            dir, time_compat.milliTimestamp(), getpid(), maildir_write_sequence.fetchAdd(1, .monotonic), flag_suffix,
+    fn allocUniqueMaildirPath(self: *ImapSession, dir: []const u8, flag_suffix: []const u8, internal_date: ?i64) ![]u8 {
+        var date_buf: [32]u8 = undefined;
+        const date = if (internal_date) |seconds| try std.fmt.bufPrint(&date_buf, ",I={d}", .{seconds}) else "";
+        return std.fmt.allocPrint(self.allocator, "{s}/{d}.{d}.imap.{d}{s}.eml{s}", .{
+            dir, time_compat.milliTimestamp(), getpid(), maildir_write_sequence.fetchAdd(1, .monotonic), date, flag_suffix,
         });
     }
 
@@ -1918,6 +1964,7 @@ pub const ImapSession = struct {
             self.allocator.free(f);
             self.append_flags = null;
         }
+        self.append_internal_date = null;
         if (self.append_literal_buf) |b| {
             self.allocator.free(b);
             self.append_literal_buf = null;
@@ -1977,11 +2024,12 @@ pub const ImapSession = struct {
             msg_flags.seen = true;
         }
         var suffix_buf: [16]u8 = undefined;
-        const filepath = try self.allocUniqueMaildirPath(folder_dir, msg_flags.toSuffix(&suffix_buf));
+        const internal_date = self.append_internal_date orelse time_compat.timestamp();
+        const filepath = try self.allocUniqueMaildirPath(folder_dir, msg_flags.toSuffix(&suffix_buf), internal_date);
         defer self.allocator.free(filepath);
 
         fs_compat.cwd().makePath(folder_dir) catch |err| return self.sendMaildirWriteError(tag, err);
-        hosted_limits.write(self.auth_backend.db, self.allocator, username, filepath, data[0..size]) catch |err|
+        hosted_limits.writeWithMtime(self.auth_backend.db, self.allocator, username, filepath, data[0..size], internal_date) catch |err|
             return self.sendMaildirWriteError(tag, err);
 
         std.log.info("IMAP APPEND: Saved {d} bytes to {s}", .{ size, filepath });
@@ -2943,14 +2991,17 @@ pub const ImapSession = struct {
             const header = content[0..header_end];
             const body = content[header_end..];
 
-            // Extract INTERNALDATE - try filename timestamp first, then Date header
+            // Use the recorded internal date. Older messages keep their
+            // existing timestamp or Date-header fallback.
             var date_buf: [64]u8 = undefined;
             var date_str: []const u8 = "01-Jan-2026 00:00:00 +0000";
             // Try to parse epoch millis from filename (e.g., "1772259313773.eml")
             const basename = if (std.mem.lastIndexOfScalar(u8, filename, '/')) |pos| filename[pos + 1 ..] else filename;
             const base_no_flags = MaildirFlags.baseName(basename);
             const name_no_ext = if (std.mem.endsWith(u8, base_no_flags, ".eml")) base_no_flags[0 .. base_no_flags.len - 4] else base_no_flags;
-            if (std.fmt.parseInt(i64, name_no_ext, 10)) |epoch_ms| {
+            if (storedInternalDate(filename)) |seconds| {
+                date_str = formatImapDate(seconds, &date_buf);
+            } else if (std.fmt.parseInt(i64, name_no_ext, 10)) |epoch_ms| {
                 date_str = formatImapDate(@divFloor(epoch_ms, 1000), &date_buf);
             } else |_| {
                 // Try Date header
@@ -3490,11 +3541,12 @@ pub const ImapSession = struct {
             const content = try fs_compat.readFileAlloc(self.allocator, source);
             defer self.allocator.free(content);
             const flags = MaildirFlags.fromFilename(std.fs.path.basename(source));
+            const internal_date = storedInternalDate(source);
             var suffix: [16]u8 = undefined;
-            const path = try self.allocUniqueMaildirPath(dir, flags.toSuffix(&suffix));
+            const path = try self.allocUniqueMaildirPath(dir, flags.toSuffix(&suffix), internal_date);
             defer self.allocator.free(path);
             destination.* = try a.dupe(u8, path);
-            try durable_maildir.write(self.allocator, path, content);
+            try durable_maildir.writeWithMtime(self.allocator, path, content, internal_date);
             published += 1;
         }
         return destinations;
@@ -3597,7 +3649,8 @@ pub const ImapSession = struct {
         const source_path = try self.allocSelectedMessagePath(idx, name);
         defer self.allocator.free(source_path);
         var suffix: [16]u8 = undefined;
-        const destination_path = try self.allocUniqueMaildirPath(dir, MaildirFlags.fromFilename(name).toSuffix(&suffix));
+        const internal_date = storedInternalDate(name);
+        const destination_path = try self.allocUniqueMaildirPath(dir, MaildirFlags.fromFilename(name).toSuffix(&suffix), internal_date);
         defer self.allocator.free(destination_path);
         const destination = try a.dupe(u8, std.fs.path.basename(destination_path));
         const raw = try fs_compat.readFileAlloc(a, source_path);
@@ -3606,7 +3659,7 @@ pub const ImapSession = struct {
         const transfer = try message_refs.stage(a, db, user, source, source_path, target, raw);
         errdefer if (transfer) |id| message_refs.cancel(db, user, id);
         if (!renameFile(source_path, destination_path)) {
-            try durable_maildir.write(self.allocator, destination_path, raw);
+            try durable_maildir.writeWithMtime(self.allocator, destination_path, raw, internal_date);
             errdefer fs_compat.cwd().deleteFile(destination_path) catch {};
             try fs_compat.cwd().deleteFile(source_path);
         }
@@ -4198,7 +4251,11 @@ pub const ImapSession = struct {
                             //   APPEND "Sent" (\Seen) "14-Jul-2026 09:58:00 +0000" {1234}
                             // Parsing from `rest` (not the space-split `parts`)
                             // keeps quoted names with spaces ("All Mail") intact.
-                            const parsed = parseAppendArgs(rest[0..brace_start]);
+                            const parsed = parseAppendArgs(rest[0..brace_start]) catch |err| {
+                                if (err == error.InvalidAppendDate)
+                                    return self.sendResponse(tag, "NO", "Invalid APPEND date-time");
+                                return self.sendResponse(tag, "BAD", "Invalid APPEND arguments");
+                            };
                             const mailbox = parsed.mailbox;
 
                             // Reject invalid/unsafe mailbox names up front rather
@@ -4212,6 +4269,7 @@ pub const ImapSession = struct {
                             self.cleanupAppend();
                             self.append_tag = try self.allocator.dupe(u8, tag);
                             self.append_mailbox = try self.allocator.dupe(u8, mailbox);
+                            self.append_internal_date = parsed.internal_date;
                             if (parsed.flags) |fs| {
                                 self.append_flags = try self.allocator.dupe(u8, fs);
                             }
@@ -4843,8 +4901,6 @@ pub const ImapServer = struct {
 
 /// Format epoch seconds as IMAP INTERNALDATE: "DD-Mon-YYYY HH:MM:SS +0000"
 fn formatImapDate(epoch_secs: i64, buf: *[64]u8) []const u8 {
-    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-
     // Convert epoch seconds to date components
     const SECS_PER_DAY: i64 = 86400;
     var days = @divFloor(epoch_secs, SECS_PER_DAY);
@@ -4871,7 +4927,7 @@ fn formatImapDate(epoch_secs: i64, buf: *[64]u8) []const u8 {
     const month_idx: u32 = if (mp < 10) mp + 3 else mp - 9; // [1, 12]
     const year: i64 = if (month_idx <= 2) y + 1 else y;
 
-    const mon = months[@as(usize, month_idx) - 1];
+    const mon = imap_months[@as(usize, month_idx) - 1];
     const len = (std.fmt.bufPrint(buf, "{d:0>2}-{s}-{d} {d:0>2}:{d:0>2}:{d:0>2} +0000", .{
         day, mon, year, hours, mins, secs,
     }) catch return "01-Jan-2026 00:00:00 +0000").len;
@@ -4978,25 +5034,49 @@ test "Gmail-style mailboxes are configurable and All Mail is not canonical" {
 test "parseAppendArgs parses mailbox, flags and date-time" {
     const testing = std.testing;
 
-    const bare = parseAppendArgs("INBOX");
+    const bare = try parseAppendArgs("INBOX");
     try testing.expectEqualStrings("INBOX", bare.mailbox);
     try testing.expect(bare.flags == null);
+    try testing.expect(bare.internal_date == null);
 
-    const quoted = parseAppendArgs("\"All Mail\" (\\Seen)");
+    const quoted = try parseAppendArgs("\"All Mail\" (\\Seen)");
     try testing.expectEqualStrings("All Mail", quoted.mailbox);
     try testing.expectEqualStrings("\\Seen", quoted.flags.?);
 
-    const with_date = parseAppendArgs("\"Sent\" (\\Seen \\Draft) \"14-Jul-2026 09:58:00 +0000\"");
+    const with_date = try parseAppendArgs("\"Sent\" (\\Seen \\Draft) \"14-Jul-2026 09:58:00 +0000\"");
     try testing.expectEqualStrings("Sent", with_date.mailbox);
     try testing.expectEqualStrings("\\Seen \\Draft", with_date.flags.?);
+    try testing.expectEqual(try parseAppendDate("14-Jul-2026 09:58:00 +0000"), with_date.internal_date.?);
 
-    const empty_flags = parseAppendArgs("Drafts ()");
+    const empty_flags = try parseAppendArgs("Drafts ()");
     try testing.expectEqualStrings("Drafts", empty_flags.mailbox);
     try testing.expectEqualStrings("", empty_flags.flags.?);
 
-    const date_only = parseAppendArgs("INBOX \"14-Jul-2026 09:58:00 +0000\"");
+    const date_only = try parseAppendArgs("INBOX \"14-Jul-2026 15:28:00 +0530\"");
     try testing.expectEqualStrings("INBOX", date_only.mailbox);
     try testing.expect(date_only.flags == null);
+    try testing.expectEqual(with_date.internal_date, date_only.internal_date);
+}
+
+test "APPEND timestamps validate dates, offsets, and optional arguments" {
+    const testing = std.testing;
+    try testing.expectEqual(@as(i64, -1), try parseAppendDate("31-Dec-1969 23:59:59 +0000"));
+    try testing.expectEqual(@as(i64, 0), try parseAppendDate(" 1-Jan-1970 05:45:00 +0545"));
+    try testing.expectEqual(@as(i64, 0), try parseAppendDate("31-Dec-1969 16:00:00 -0800"));
+    try testing.expectEqual(@as(i64, 1709164800), try parseAppendDate("29-feb-2024 00:00:00 +0000"));
+    for ([_][]const u8{
+        "29-Feb-2025 00:00:00 +0000",
+        " 0-Jan-2025 00:00:00 +0000",
+        " 1-Jan-0000 00:00:00 +0000",
+        " 1-Jan-2025 24:00:00 +0000",
+        " 1-Jan-2025 00:60:00 +0000",
+        " 1-Jan-2025 00:00:60 +0000",
+        " 1-Jan-2025 00:00:00 +2460",
+        " 1-Jan-2025 00:00:00 +0560",
+    }) |invalid| try testing.expectError(error.InvalidAppendDate, parseAppendDate(invalid));
+    try testing.expectError(error.InvalidAppendDate, parseAppendArgs("INBOX () \" 1-Jan-2025 00:00:00 +0000\" extra"));
+    try testing.expectError(error.InvalidAppendArgs, parseAppendArgs("INBOX (\\Seen"));
+    try testing.expectError(error.InvalidAppendArgs, parseAppendArgs("\"Incomplete mailbox"));
 }
 
 test "APPEND flag list maps to Maildir flags" {
