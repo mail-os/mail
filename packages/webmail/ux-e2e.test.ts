@@ -12,7 +12,7 @@ async function client() {
   expect(login.status).toBe(200)
   const cookie = login.headers.get('set-cookie')!.split(';')[0]
   async function request(path: string, method = 'GET', body?: unknown, extraHeaders?: Record<string, string>) {
-    return fetch(new URL(path, base), { method, cache: 'no-store', headers: { Cookie: cookie, Origin: base!, 'Content-Type': 'application/json', 'X-Webmail-Account': encodeURIComponent(username!), ...extraHeaders }, body: body === undefined ? undefined : JSON.stringify(body) })
+    return fetch(new URL(path, base), { method, keepalive: false, cache: 'no-store', headers: { Cookie: cookie, Origin: base!, 'Content-Type': 'application/json', 'X-Webmail-Account': encodeURIComponent(username!), ...extraHeaders }, body: body === undefined ? undefined : JSON.stringify(body) })
   }
   async function json(path: string, method = 'GET', body?: unknown): Promise<any> {
     const response = await request(path, method, body)
@@ -61,7 +61,8 @@ test.skipIf(!enabled)('binary uploads exceed the old cap and retain exact bytes 
   const data = Uint8Array.from({ length: count }, (value, index) => index % 256)
   const uploadId = crypto.randomUUID()
   const uploadUrl = new URL(`/webmail/api/uploads?filename=acceptance.bin&contentType=application%2Foctet-stream&uploadId=${uploadId}`, base)
-  const uploadHeaders = { Cookie: api.cookie, Origin: base!, 'X-Webmail-Account': encodeURIComponent(username!), 'Content-Type': 'application/octet-stream' }
+  // The native HTTP listener closes the connection after each response.
+  const uploadHeaders = { Cookie: api.cookie, Origin: base!, 'X-Webmail-Account': encodeURIComponent(username!), 'Content-Type': 'application/octet-stream', Connection: 'close' }
   const upload = await fetch(uploadUrl, { method: 'POST', headers: uploadHeaders, body: data })
   expect(upload.status).toBe(200)
   const item = await upload.json() as any
