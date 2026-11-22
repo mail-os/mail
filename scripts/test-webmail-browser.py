@@ -90,7 +90,8 @@ def verify(binary, output, engine):
             seed_inbox(fixture, owner, sender)
             day = seed_calendar(fixture, owner)
             env = dict(os.environ, MAIL_BROWSER_URL=fixture.webmail, MAIL_BROWSER_OWNER=owner,
-                       MAIL_BROWSER_SENDER=sender, MAIL_BROWSER_PASSWORD=fixture.password, MAIL_BROWSER_DAY=day)
+                       MAIL_BROWSER_SENDER=sender, MAIL_BROWSER_PASSWORD=fixture.password, MAIL_BROWSER_DAY=day,
+                       MAIL_BROWSER_CERT=fixture.env["SMTP_TLS_CERT"])
             subprocess.run(["node", str(SCRIPTS / "webmail-browser.mjs"), engine, str(output / engine)],
                            env=env, check=True)
             verify_delivery(fixture, sender)

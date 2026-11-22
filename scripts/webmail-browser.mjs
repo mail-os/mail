@@ -1,15 +1,24 @@
 import assert from 'node:assert/strict'
-import { mkdir } from 'node:fs/promises'
+import { createHash, X509Certificate } from 'node:crypto'
+import { mkdir, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { chromium, firefox, webkit } from 'playwright'
 
-const { MAIL_BROWSER_URL: url, MAIL_BROWSER_OWNER: owner, MAIL_BROWSER_SENDER: sender, MAIL_BROWSER_PASSWORD: password, MAIL_BROWSER_DAY: day } = process.env
+const { MAIL_BROWSER_URL: url, MAIL_BROWSER_OWNER: owner, MAIL_BROWSER_SENDER: sender, MAIL_BROWSER_PASSWORD: password, MAIL_BROWSER_DAY: day, MAIL_BROWSER_CERT: certificate } = process.env
 const [engine, output] = process.argv.slice(2)
 const engines = { chromium, firefox, webkit }
-assert(Object.hasOwn(engines, engine) && output && url && owner && sender && password && day, 'Run through test-webmail-browser.py')
+assert(Object.hasOwn(engines, engine) && output && url && owner && sender && password && day && certificate, 'Run through test-webmail-browser.py')
 assert.match(url, /^https:\/\/127\.0\.0\.1:\d+$/, 'Browser tests require a disposable loopback HTTPS server')
 
-const browser = await engines[engine].launch()
+const launchOptions = {}
+if (engine === 'chromium') {
+  // Chromium downloads use the browser's certificate verification. Trust only
+  // the freshly generated key for this loopback fixture.
+  const { publicKey } = new X509Certificate(await readFile(certificate))
+  const pin = createHash('sha256').update(publicKey.export({ type: 'spki', format: 'der' })).digest('base64')
+  launchOptions.args = [`--ignore-certificate-errors-spki-list=${pin}`]
+}
+const browser = await engines[engine].launch(launchOptions)
 const errors = []
 const handoff = 'Tuesday design handoff'
 const sentSubject = 'Browser acceptance handoff'
@@ -60,6 +69,49 @@ async function verifyAppearance(page, scheme) {
 
 async function openMailbox(page, name) {
   await button(folders(page), name).click()
+}
+
+async function openReceiptAndDownload(page) {
+  const messagePath = /\/webmail\/api\/messages\/ref\/[^/?]+$/
+  const isMarkRead = request => request.method() === 'PUT' && messagePath.test(request.url())
+  const attachment = page.getByRole('link', { name: /receipt-1046.txt/ })
+  let download
+  let saved
+  let downloadError
+  const holdMarkRead = async (route) => {
+    if (!isMarkRead(route.request())) return route.continue()
+    const response = await route.fetch()
+    try {
+      // The server has committed the read flag. The browser still has the
+      // attachment link it rendered before receiving the new message revision.
+      const href = await attachment.getAttribute('href')
+      download = await page.request.get(new URL(href, url).href)
+      if (engine === 'chromium' && download.ok()) {
+        const [file] = await Promise.all([
+          page.waitForEvent('download', { timeout: 5000 }),
+          attachment.click({ timeout: 5000 }),
+        ])
+        saved = { name: file.suggestedFilename(), text: await readFile(await file.path(), 'utf8') }
+      }
+    }
+    catch (error) { downloadError = error }
+    finally { await route.fulfill({ response }) }
+  }
+  await page.route(messagePath, holdMarkRead)
+  try {
+    const [marked] = await Promise.all([
+      page.waitForResponse(response => isMarkRead(response.request())),
+      button(page, /Your receipt #1046/).click(),
+    ])
+    assert.equal(marked.status(), 200, 'The automatic read flag was committed')
+    assert.notEqual((await marked.json()).revision, marked.request().headers()['if-match'])
+    assert.ifError(downloadError)
+    assert.equal(download?.status(), 200, 'Attachment downloads while the mark-read response is held')
+    assert.equal(await download.text(), 'Receipt 1046 for Studio Hosting\n')
+    if (engine === 'chromium')
+      assert.deepEqual(saved, { name: 'receipt-1046.txt', text: 'Receipt 1046 for Studio Hosting\n' })
+  }
+  finally { await page.unroute(messagePath, holdMarkRead) }
 }
 
 async function signIn({ phone = false } = {}) {
@@ -210,12 +262,8 @@ async function phoneJourney(page) {
   await openMailbox(page, /^Receipts(?:\s|$)/)
   assert.equal(await toggle.getAttribute('aria-expanded'), 'false')
   await page.waitForFunction(() => document.activeElement?.getAttribute('aria-controls') === 'mailNavigation')
-  await button(page, /Your receipt #1046/).click()
+  await openReceiptAndDownload(page)
   await heading(page, 'Your receipt #1046').waitFor()
-  const attachment = page.getByRole('link', { name: /receipt-1046.txt/ })
-  const response = await page.request.get(new URL(await attachment.getAttribute('href'), url).href)
-  assert.equal(response.status(), 200)
-  assert.equal(await response.text(), 'Receipt 1046 for Studio Hosting\n')
   await button(page, 'Reply').waitFor()
   await fitsViewport(page)
   await page.setViewportSize({ width: 320, height: 844 })

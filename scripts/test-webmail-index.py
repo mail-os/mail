@@ -46,9 +46,9 @@ def run(binary, previous):
             assert status == 200, (path, params, status, result)
             return result
 
-        def download(session, item, expected=200):
+        def download(session, item, expected=200, *, version="content_revision"):
             row = item["message"]
-            params = {"reference": row["reference"], "revision": row["revision"], "index": item["index"]}
+            params = {"reference": row["reference"], version: row[version], "index": item["index"]}
             status, response, data = request(test.webmail + "/webmail/api/attachment?" + urlencode(params),
                                              headers=session, context=test.tls_context)
             assert status == expected, (status, data)
@@ -117,6 +117,7 @@ def run(binary, previous):
             download(bob, target, 404)
             download(alice, other, 404)
             assert download(alice, target)[1] == PAYLOAD
+            assert download(alice, target, version="revision")[1] == PAYLOAD
 
             with test.imap(owner) as imap:
                 assert imap.select("INBOX")[0] == "OK"
@@ -129,7 +130,9 @@ def run(binary, previous):
             detail = "messages/ref/" + oldest["reference"]
             assert test.api(dict(alice, **{"If-Match": oldest["revision"]}), detail)[0] == 412
             assert test.api(dict(alice, **{"If-Match": updated["revision"]}), detail)[0] == 200
-            download(alice, target, 412)
+            assert updated["content_revision"] == oldest["content_revision"]
+            assert download(alice, target)[1] == PAYLOAD
+            download(alice, target, 412, version="revision")
 
             with test.imap(owner) as imap:
                 assert imap.select("INBOX")[0] == "OK"
@@ -138,7 +141,8 @@ def run(binary, previous):
             moved = items(alice, "attachments", folder="Research", filename="survey.csv")["items"][0]
             assert moved["message"]["reference"] == oldest["reference"]
             assert download(alice, moved)[1] == PAYLOAD
-            download(alice, target, 412)
+            assert download(alice, target)[1] == PAYLOAD
+            download(alice, target, 412, version="revision")
             print("Verified bounded index progress, query and attachment filters, pagination, cross-account ACLs, IMAP flags and moves.")
 
         with test.daemon():
@@ -152,6 +156,8 @@ def run(binary, previous):
             doc_path.write_bytes(replacement.as_bytes(policy=SMTP))
             assert items(alice, "attachments", folder="Research", filename="survey.csv")["total"] == 0
             fresh = items(alice, "attachments", folder="Research", filename="replacement.txt")["items"][0]
+            assert fresh["message"]["reference"] == moved["message"]["reference"]
+            assert fresh["message"]["content_revision"] != moved["message"]["content_revision"]
             assert download(alice, fresh)[1] == PAYLOAD
             download(alice, moved, 412)
             doc_path.unlink()
@@ -171,6 +177,10 @@ def run(binary, previous):
             assert items(alice, "attachments", folder="*", filename="résumé")["total"] == 0
             with closing(sqlite3.connect(directory / "smtp.db")) as sql:
                 assert sql.execute("SELECT count(*) FROM webmail_search_docs WHERE folder='Research'").fetchone() == (0,)
+            last_download = first_files["items"][0]
+            assert download(alice, last_download)[1] == PAYLOAD
+            test.provision("alice", enabled=False)
+            download(alice, last_download, 401)
             print("Verified index persistence, in-place Maildir changes, pruning, and revocation of stale downloads.")
 
 

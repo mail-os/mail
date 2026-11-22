@@ -1075,6 +1075,12 @@ Message listings and details include the mailbox-scoped `reference` and `revisio
 `PUT` and `DELETE` on the reference URL require the last `ETag` in `If-Match`.
 Missing preconditions return `428` and stale revisions return `412`. For `POST /webmail/api/bulk`, pass `reference` and `revision` alongside `uid` and `folder` for each selected message. A stale revision rejects the selection before any action runs. Existing UID routes remain available for older clients.
 
+For personal mailbox attachments, pass `reference`, `content_revision`, and the
+zero-based `index` to `GET /webmail/api/attachment`. The content revision comes
+from the message or attachment library response and stays valid through flag
+changes. Changed MIME bytes cause `412`. The older `revision` parameter still
+accepts the full message revision, including flags.
+
 **Compose / drafts**
 - `POST /webmail/api/compose` `{to, cc, bcc, subject, html, text, attachments[], inReplyTo?}` → `{queued:true, id}`
 - `POST /webmail/api/drafts` / `PUT /webmail/api/drafts/:id` / `DELETE /webmail/api/drafts/:id`

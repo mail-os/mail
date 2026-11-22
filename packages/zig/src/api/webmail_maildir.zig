@@ -125,7 +125,11 @@ pub const MessageDetail = struct {
     size: u64,
 };
 
-pub const MessageVersion = struct { reference: []const u8, revision: []const u8 };
+pub const MessageVersion = struct {
+    reference: []const u8,
+    revision: []const u8,
+    content_revision: [64]u8,
+};
 
 pub const MessageLocator = struct { folder: []const u8, uid: i64 };
 
@@ -919,13 +923,17 @@ pub const VersionedFile = struct {
     version: MessageVersion,
 };
 
-fn makeVersion(a: std.mem.Allocator, id: []const u8, at: MessageLocator, name: []const u8, raw_digest: []const u8) !MessageVersion {
+fn makeVersion(a: std.mem.Allocator, id: []const u8, at: MessageLocator, name: []const u8, raw_digest: *const [64]u8) !MessageVersion {
     var sha: std.crypto.hash.sha2.Sha256 = .init(.{});
     const metadata = try std.fmt.allocPrint(a, "{s}\x00{s}\x00{d}\x00{s}\x00", .{ id, at.folder, at.uid, name });
     sha.update(metadata);
     sha.update(raw_digest);
     const hex = std.fmt.bytesToHex(sha.finalResult(), .lower);
-    return .{ .reference = id, .revision = try std.fmt.allocPrint(a, "\"{s}\"", .{&hex}) };
+    return .{
+        .reference = id,
+        .revision = try std.fmt.allocPrint(a, "\"{s}\"", .{&hex}),
+        .content_revision = raw_digest.*,
+    };
 }
 
 fn fileAt(a: std.mem.Allocator, user: []const u8, location: message_refs.Location) !?FileRef {

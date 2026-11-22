@@ -379,9 +379,10 @@ export function useWebmail(ports: WebmailPorts) {
   function senderLabel(from: string): string { return recipient(from).name || from }
   function attachmentPath(index: number, message: MessageRef | null = selected()): string {
     const params = new URLSearchParams({ index: String(index), account: user()?.username || '' })
-    if (message?.reference && message.revision) {
+    const revision = message?.content_revision || message?.revision
+    if (message?.reference && revision) {
       params.set('reference', message.reference)
-      params.set('revision', message.revision)
+      params.set(message.content_revision ? 'content_revision' : 'revision', revision)
     }
     else {
       params.set('uid', String(message?.uid))

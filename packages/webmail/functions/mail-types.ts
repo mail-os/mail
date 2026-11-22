@@ -1,7 +1,13 @@
 import type { EmbeddedImage } from './mail-reader'
 
 export interface Flags { seen: boolean, answered: boolean, flagged: boolean, draft: boolean, deleted: boolean }
-export interface MessageRef { uid: number, folder: string, reference?: string | null, revision?: string | null }
+export interface MessageRef {
+  uid: number
+  folder: string
+  reference?: string | null
+  revision?: string | null
+  content_revision?: string
+}
 export interface MessageSummary extends MessageRef {
   from: string
   to: string

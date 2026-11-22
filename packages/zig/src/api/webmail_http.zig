@@ -1293,9 +1293,14 @@ fn handleAttachment(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     defer sess.deinit(server.allocator);
     const index = std.fmt.parseInt(usize, req.queryParam(arena, "index") orelse "", 10) catch return sendError(conn, arena, 400, "bad_request", "Invalid attachment index");
     const message = if (req.queryParam(arena, "reference")) |reference| blk: {
-        const revision = req.queryParam(arena, "revision") orelse return sendError(conn, arena, 428, "revision_required", "Use a current attachment link");
+        const revision = req.queryParam(arena, "revision");
+        const content_revision = req.queryParam(arena, "content_revision");
+        if (revision != null and content_revision != null) return sendError(conn, arena, 400, "invalid_revision", "Use one attachment revision");
+        const expected = content_revision orelse revision orelse return sendError(conn, arena, 428, "revision_required", "Use a current attachment link");
         const current = maildir.getByReference(arena, server.db, sess.username, reference) catch |err| return mapMaildirError(conn, arena, err);
-        if (!std.mem.eql(u8, current.version.?.revision, revision)) return mapMaildirError(conn, arena, error.RevisionMismatch);
+        // Maildir renames for flags leave the MIME bytes unchanged.
+        const actual = if (content_revision != null) &current.version.?.content_revision else current.version.?.revision;
+        if (!std.mem.eql(u8, actual, expected)) return mapMaildirError(conn, arena, error.RevisionMismatch);
         break :blk current;
     } else blk: {
         const folder = req.queryParam(arena, "folder") orelse "INBOX";
@@ -1783,7 +1788,7 @@ fn writeSharedMessage(w: anytype, a: std.mem.Allocator, msg: maildir.MessageDeta
     try writeJsonString(w, msg.text_body);
     try w.writeAll(",\"html\":");
     try writeJsonString(w, msg.html_body);
-    try writeVersion(w, msg.version);
+    try writeVersion(w, msg.version, false);
     try w.print(",\"hasAttachments\":{},\"attachments\":[", .{msg.attachments.len > 0});
     if (downloads) for (msg.attachments, 0..) |att, i| {
         if (i > 0) try w.writeByte(',');
@@ -3197,11 +3202,17 @@ fn writeFlags(w: anytype, flags: maildir.Flags) !void {
     );
 }
 
-fn writeVersion(w: anytype, version: ?maildir.MessageVersion) !void {
+fn writeVersion(w: anytype, version: ?maildir.MessageVersion, include_content_revision: bool) !void {
     try w.writeAll(",\"reference\":");
     if (version) |value| try writeJsonString(w, value.reference) else try w.writeAll("null");
     try w.writeAll(",\"revision\":");
-    if (version) |value| try writeJsonString(w, value.revision) else try w.writeAll("null");
+    if (version) |value| {
+        try writeJsonString(w, value.revision);
+        if (include_content_revision) {
+            try w.writeAll(",\"content_revision\":");
+            try writeJsonString(w, &value.content_revision);
+        }
+    } else try w.writeAll("null");
 }
 
 fn writeMessageSummary(w: anytype, m: maildir.MessageSummary, version: ?maildir.MessageVersion) !void {
@@ -3219,7 +3230,7 @@ fn writeMessageSummary(w: anytype, m: maildir.MessageSummary, version: ?maildir.
     try writeJsonString(w, m.date);
     try w.writeAll(",\"folder\":");
     try writeJsonString(w, m.folder);
-    try writeVersion(w, version);
+    try writeVersion(w, version, m.has_attachments);
     try w.writeAll(",\"message_id\":");
     try writeJsonString(w, m.message_id);
     try w.writeAll(",\"in_reply_to\":");
@@ -3241,7 +3252,7 @@ fn writeMessageDetail(w: anytype, m: maildir.MessageDetail, placement: ?message_
     try w.writeAll(",\"folder\":");
     try writeJsonString(w, m.folder);
     try w.print(",\"timestamp\":{d}", .{m.timestamp});
-    try writeVersion(w, m.version);
+    try writeVersion(w, m.version, m.attachments.len != 0);
     try w.writeAll(",\"to\":");
     try writeJsonString(w, m.to);
     try w.writeAll(",\"cc\":");
