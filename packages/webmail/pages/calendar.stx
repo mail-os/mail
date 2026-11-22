@@ -64,7 +64,7 @@ onUnmounted(() => { destroy(); destroyReminders() })
   <p :if="!loading && !error && !calendars.length && !sharedCalendars.length && !importOpen && !calendarSettings">Create a calendar or import an .ics file to get started.</p>
   <section :if="calendarSettings" id="calendar-settings" class="calendar-import" aria-label="Manage calendars" :aria-busy="calendarSettingsBusy">
     <p :if="waitingMailEvent" role="status">Create a calendar to save an event from this email.</p>
-    <form class="calendar-import-form" @submit.prevent="createCalendar()">
+    <form class="calendar-import-form calendar-create-form" @submit.prevent="createCalendar()">
       <label>Calendar name<input x-model="calendarNameInput" :disabled="calendarSettingsBusy" maxlength="100" required></label>
       <button type="submit" class="wm-action" :disabled="calendarSettingsBusy">Create calendar</button>
     </form>

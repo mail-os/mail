@@ -463,6 +463,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-import-form input { min-width: 0; max-width: 100%; min-block-size: var(--control-height); padding: 6px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); }
 .calendar-import-form input[type=file] { padding-block: 3px; }
 .calendar-import-form input::file-selector-button { min-block-size: calc(var(--control-height) - 8px); margin-inline-end: 8px; border: 0; border-radius: 5px; background: var(--surface); color: var(--text); font: inherit; }
+.calendar-create-form { display: grid; grid-template-columns: minmax(0, 12.5rem) max-content; justify-content: start; }
 .calendar-share-form { gap: 10px 12px; max-width: 68rem; }
 .calendar-share-form > label { flex: 1 1 9rem; }
 .calendar-share-form > label:has(input) { flex-basis: 14rem; }
