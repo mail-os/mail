@@ -64,7 +64,7 @@ useEventListener('online', refresh)
       <button :if="reference" type="button" class="wm-action wm-shared-reader-back" @click="backToList()" :disabled="saving"><span class="mail-icon" data-icon="back" aria-hidden="true"></span>Back to messages</button>
       <p :if="opening" class="wm-shared-empty" role="status">Opening message…</p>
       <p :if="!reference" class="wm-shared-empty">Select a message to read.</p>
-      <article :if="detail" class="wm-shared-message">
+      <article :if="detail" class="wm-shared-message wm-message-paper">
         <div class="wm-shared-actions">
           <button :if="detail.canReply" type="button" class="wm-action wm-action--accent" @click="startReply()" :disabled="saving || loading"><span class="mail-icon" data-icon="reply" aria-hidden="true"></span>Reply</button>
           <div class="wm-shared-assignee"><label for="sharedAssignee">Assigned to</label>
@@ -82,7 +82,7 @@ useEventListener('online', refresh)
           <h2 ref="sharedTitle" tabindex="-1" :text="detail.subject || '(no subject)'"></h2>
           <div class="wm-shared-sender"><span class="wm-avatar" aria-hidden="true" :text="senderInitials(detail.from)"></span><div><strong :text="senderAddress(detail.from) || detail.from || '(unknown sender)'"></strong><span :if="detail.to" :text="'To ' + detail.to"></span></div><time :text="fullDate(detail.date)"></time></div>
         </header>
-        <div :if="detail.attachments.length" class="wm-read-attach"><a :for="(attachment, index) in detail.attachments" class="wm-attach-chip" :href="attachmentPath(index)" :download="attachment.filename"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span><span :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></span></a></div>
+        <div :if="detail.attachments.length" class="wm-read-attach"><a :for="(attachment, index) in detail.attachments" class="wm-attach-chip" :href="attachmentPath(index)" :download="attachment.filename"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span><span :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></span><span class="mail-icon wm-attachment-download" data-icon="download" aria-hidden="true"></span></a></div>
         <p :if="detail.hasAttachments && !detail.attachments.length" class="wm-shared-activity"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span>Attachment access required</p>
         <iframe :if="detail.html" class="wm-read-html wm-shared-html" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" title="Email content" :srcdoc="formatted.source"></iframe>
         <pre :if="!detail.html" class="wm-shared-text" :text="detail.text"></pre>

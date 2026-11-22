@@ -126,7 +126,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
 <main :if="!ready || !user" class="wm-boot"><p role="status" :text="error || 'Opening your inbox…'"></p><button :if="error" @click="boot()">Retry connection</button></main>
 <div :if="ready && user" class="wm" :class="{ 'wm--reading': reading, 'wm--newsletter-expanded': readerExpanded, 'wm--reply-focused': followUpFocused }">
   <aside class="wm-folders" aria-label="Mail navigation" :class="{ 'wm-folders--expanded': foldersExpanded }" @keydown.escape="closeFolders(true)">
-    <div class="wm-brand"><span class="mail-app-mark"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span></span><span>Mail</span></div>
+    <div class="wm-brand"><span class="mail-app-mark" role="img" aria-label="Mail"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span></span><span aria-hidden="true">Mail</span></div>
     <button ref="foldersToggle" type="button" class="wm-folders-toggle wm-action" :aria-expanded="foldersExpanded" aria-controls="mailNavigation" @click="foldersExpanded.set(!foldersExpanded())"><span class="mail-icon" data-icon="sidebar" aria-hidden="true"></span>Mailboxes<span class="mail-icon wm-mailboxes-indicator" data-icon="down" aria-hidden="true"></span></button>
     <button type="button" class="wm-compose-btn" @click="startComposition()" :disabled="sending || sendUncertain"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span><span :text="hasComposition ? 'Resume draft' : 'Compose'"></span></button>
     <div id="mailNavigation" class="wm-navigation">
@@ -352,92 +352,94 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
           <button :if="readingBatch && selected?.folder !== 'Archive'" type="button" class="wm-action" @click="triageAndNext('archive')" :disabled="triageBusy || mutating || readingLoading">Archive &amp; next</button>
           <button :if="readingBatch && selected?.folder !== 'Trash'" type="button" class="wm-action" @click="triageAndNext('trash')" :disabled="triageBusy || mutating || readingLoading">Trash &amp; next</button>
         </div>
-        <div class="wm-message-heading">
-          <div class="wm-message-heading-actions">
-            <span class="wm-folder-badge"><span class="mail-icon" :data-icon="mailFolderIcon(selected?.folder || '')" aria-hidden="true"></span><span :text="folderName(selected?.folder || '')"></span></span>
-            <button :if="canOpenPrivate" type="button" class="wm-action wm-action--quiet" :aria-expanded="privateOpen" @click="privateOpen ? closePrivate() : showPrivate()" :disabled="readingLoading || mutating"><span class="mail-icon" data-icon="bookmark" aria-hidden="true"></span>Private tools</button>
+        <div class="wm-message-paper">
+          <div class="wm-message-heading">
+            <div class="wm-message-heading-actions">
+              <span class="wm-folder-badge"><span class="mail-icon" :data-icon="mailFolderIcon(selected?.folder || '')" aria-hidden="true"></span><span :text="folderName(selected?.folder || '')"></span></span>
+              <button :if="canOpenPrivate" type="button" class="wm-action wm-action--quiet" :aria-expanded="privateOpen" @click="privateOpen ? closePrivate() : showPrivate()" :disabled="readingLoading || mutating"><span class="mail-icon" data-icon="bookmark" aria-hidden="true"></span>Private tools</button>
+            </div>
+            <h2 class="wm-read-subject" tabindex="-1" data-reader-focus :text="displaySubject(selected)"></h2>
+            <p :if="selected?.personal_subject" class="wm-original-subject"><span>Original subject</span> <span :text="selected?.subject || '(no subject)'"></span></p>
           </div>
-          <h2 class="wm-read-subject" tabindex="-1" data-reader-focus :text="displaySubject(selected)"></h2>
-          <p :if="selected?.personal_subject" class="wm-original-subject"><span>Original subject</span> <span :text="selected?.subject || '(no subject)'"></span></p>
-        </div>
-        <section :if="canOpenPrivate && privateOpen" class="wm-private-panel" aria-label="Private conversation tools" :aria-busy="privateBusy">
-          <div class="wm-private-tabs" role="group" aria-label="Private tools views">
-            <button class="wm-action" type="button" :aria-pressed="privateTab === 'notes'" @click="privateTab.set('notes')">Notes</button>
-            <button class="wm-action" type="button" :aria-pressed="privateTab === 'clips'" @click="privateTab.set('clips')">Clips</button>
-            <button class="wm-action" type="button" :aria-pressed="privateTab === 'organize'" @click="privateTab.set('organize')">Organize</button>
-          </div>
-          <p :if="privateBusy && !privateTools" class="wm-state" role="status">Loading private tools…</p>
-          <p :if="privateError" class="login-error" role="alert" :text="privateError"></p>
-          <div :if="privateTools && privateTab !== 'organize'" class="wm-private-entries">
-            <article :for="entry in privateEntries" :key="entry.id" class="wm-private-entry">
-              <span :if="entry.kind === 'clip'" class="wm-private-clip-source" :text="entry.source_subject || '(no subject)'"></span>
-              <p :text="entry.body"></p>
-              <div class="wm-private-actions">
-                <button :if="entry.kind === 'note'" type="button" class="wm-action" @click="editPrivateNote(entry)" :disabled="privateBusy">Edit note</button>
-                <button type="button" class="wm-action wm-action--danger" @click="removePrivateEntry(entry)" :disabled="privateBusy" :text="entry.kind === 'clip' ? 'Remove clip' : 'Remove note'"></button>
-              </div>
-            </article>
-          </div>
-          <form :if="privateTools && privateTab === 'notes'" class="wm-private-form" @submit.prevent="savePrivateNote()">
-            <label>Private note<textarea x-model="noteText" rows="3" maxlength="8192" required :disabled="privateBusy"></textarea></label>
-            <div class="wm-private-actions"><button class="wm-action wm-action--accent" type="submit" :disabled="privateBusy || !noteText.trim()" :text="editingNote ? 'Save note changes' : 'Add note'"></button><button :if="editingNote" type="button" class="wm-action" @click="cancelPrivateNote()" :disabled="privateBusy">Cancel</button></div>
-          </form>
-          <form :if="privateTools && privateTab === 'clips'" class="wm-private-form" @submit.prevent="savePrivateClip()">
-            <label>Message excerpt<textarea x-model="clipText" rows="3" maxlength="2048" required :disabled="privateBusy" placeholder="Paste an excerpt from the message"></textarea></label>
-            <div class="wm-private-actions"><button class="wm-action wm-action--accent" type="submit" :disabled="privateBusy || !clipText.trim()">Save clip</button><button type="button" class="wm-action" @click="startPrivateClip()" :disabled="privateBusy || !privateTools?.clip_source.trim()">Use opening text</button></div>
-          </form>
-          <div :if="privateTools && privateTab === 'organize'" class="wm-private-organize">
-            <form class="wm-private-form" @submit.prevent="savePrivateLabel()">
-              <label>Personal subject<input type="text" x-model="privateLabel" maxlength="120" :disabled="privateBusy"></label>
-              <button type="submit" class="wm-action wm-action--accent" :disabled="privateBusy || privateLabel.trim() === privateTools?.label.value">Save subject</button>
+          <section :if="canOpenPrivate && privateOpen" class="wm-private-panel" aria-label="Private conversation tools" :aria-busy="privateBusy">
+            <div class="wm-private-tabs" role="group" aria-label="Private tools views">
+              <button class="wm-action" type="button" :aria-pressed="privateTab === 'notes'" @click="privateTab.set('notes')">Notes</button>
+              <button class="wm-action" type="button" :aria-pressed="privateTab === 'clips'" @click="privateTab.set('clips')">Clips</button>
+              <button class="wm-action" type="button" :aria-pressed="privateTab === 'organize'" @click="privateTab.set('organize')">Organize</button>
+            </div>
+            <p :if="privateBusy && !privateTools" class="wm-state" role="status">Loading private tools…</p>
+            <p :if="privateError" class="login-error" role="alert" :text="privateError"></p>
+            <div :if="privateTools && privateTab !== 'organize'" class="wm-private-entries">
+              <article :for="entry in privateEntries" :key="entry.id" class="wm-private-entry">
+                <span :if="entry.kind === 'clip'" class="wm-private-clip-source" :text="entry.source_subject || '(no subject)'"></span>
+                <p :text="entry.body"></p>
+                <div class="wm-private-actions">
+                  <button :if="entry.kind === 'note'" type="button" class="wm-action" @click="editPrivateNote(entry)" :disabled="privateBusy">Edit note</button>
+                  <button type="button" class="wm-action wm-action--danger" @click="removePrivateEntry(entry)" :disabled="privateBusy" :text="entry.kind === 'clip' ? 'Remove clip' : 'Remove note'"></button>
+                </div>
+              </article>
+            </div>
+            <form :if="privateTools && privateTab === 'notes'" class="wm-private-form" @submit.prevent="savePrivateNote()">
+              <label>Private note<textarea x-model="noteText" rows="3" maxlength="8192" required :disabled="privateBusy"></textarea></label>
+              <div class="wm-private-actions"><button class="wm-action wm-action--accent" type="submit" :disabled="privateBusy || !noteText.trim()" :text="editingNote ? 'Save note changes' : 'Add note'"></button><button :if="editingNote" type="button" class="wm-action" @click="cancelPrivateNote()" :disabled="privateBusy">Cancel</button></div>
             </form>
-            <fieldset class="wm-private-membership">
-              <legend>My collections</legend>
-              <label :for="item in privateTools?.collections || []" :key="item.id"><input type="checkbox" :checked="item.included" @change="setPrivateMembership(item, $event)" :disabled="privateBusy"><span :text="item.name"></span></label>
-              <button type="button" class="wm-action" @click="showCollectionManager()">Manage collections</button>
-            </fieldset>
-          </div>
-        </section>
-        <div :if="receiptCompact" class="wm-receipt-preview">
-          <div class="wm-receipt-meta">
-            <div class="wm-receipt-sender"><strong :text="senderLabel(selected?.from || '')"></strong><small :if="senderLabel(selected?.from || '') !== selected?.from" :text="senderAddress(selected?.from || '')"></small></div>
-            <time :text="fullDate(selected?.date || '')"></time>
-          </div>
-          <p :if="receiptPreview" class="wm-receipt-excerpt" :text="receiptPreview"></p>
-        </div>
-        <div :if="!receiptCompact" class="wm-read-meta">
-          <span class="wm-avatar" aria-hidden="true" :text="senderInitials(selected?.from || '')"></span>
-          <div class="wm-read-envelope">
-            <div class="wm-read-sender">
-              <div><strong :text="senderLabel(selected?.from || '')"></strong><small :if="senderLabel(selected?.from || '') !== selected?.from" :text="senderAddress(selected?.from || '')"></small></div>
+            <form :if="privateTools && privateTab === 'clips'" class="wm-private-form" @submit.prevent="savePrivateClip()">
+              <label>Message excerpt<textarea x-model="clipText" rows="3" maxlength="2048" required :disabled="privateBusy" placeholder="Paste an excerpt from the message"></textarea></label>
+              <div class="wm-private-actions"><button class="wm-action wm-action--accent" type="submit" :disabled="privateBusy || !clipText.trim()">Save clip</button><button type="button" class="wm-action" @click="startPrivateClip()" :disabled="privateBusy || !privateTools?.clip_source.trim()">Use opening text</button></div>
+            </form>
+            <div :if="privateTools && privateTab === 'organize'" class="wm-private-organize">
+              <form class="wm-private-form" @submit.prevent="savePrivateLabel()">
+                <label>Personal subject<input type="text" x-model="privateLabel" maxlength="120" :disabled="privateBusy"></label>
+                <button type="submit" class="wm-action wm-action--accent" :disabled="privateBusy || privateLabel.trim() === privateTools?.label.value">Save subject</button>
+              </form>
+              <fieldset class="wm-private-membership">
+                <legend>My collections</legend>
+                <label :for="item in privateTools?.collections || []" :key="item.id"><input type="checkbox" :checked="item.included" @change="setPrivateMembership(item, $event)" :disabled="privateBusy"><span :text="item.name"></span></label>
+                <button type="button" class="wm-action" @click="showCollectionManager()">Manage collections</button>
+              </fieldset>
+            </div>
+          </section>
+          <div :if="receiptCompact" class="wm-receipt-preview">
+            <div class="wm-receipt-meta">
+              <div class="wm-receipt-sender"><strong :text="senderLabel(selected?.from || '')"></strong><small :if="senderLabel(selected?.from || '') !== selected?.from" :text="senderAddress(selected?.from || '')"></small></div>
               <time :text="fullDate(selected?.date || '')"></time>
             </div>
-            <dl class="wm-read-addresses">
-              <div><dt>To</dt><dd :text="selected?.to"></dd></div>
-              <div :if="selected?.cc"><dt>Cc</dt><dd :text="selected?.cc"></dd></div>
-              <div :if="selected?.bcc"><dt>Bcc</dt><dd :text="selected?.bcc"></dd></div>
-              <div :if="selected?.reply_to"><dt>Reply to</dt><dd :text="selected?.reply_to"></dd></div>
-              <div :if="senderReviewSelection && senderReviewSelection.recipient !== selected?.to"><dt>Delivered to</dt><dd :text="senderReviewSelection?.recipient"></dd></div>
-              <div :if="senderReviewSelection?.envelope_from && senderReviewSelection?.envelope_from !== senderReviewSelection?.author"><dt>Envelope sender</dt><dd :text="senderReviewSelection?.envelope_from"></dd></div>
-            </dl>
+            <p :if="receiptPreview" class="wm-receipt-excerpt" :text="receiptPreview"></p>
           </div>
+          <div :if="!receiptCompact" class="wm-read-meta">
+            <span class="wm-avatar" aria-hidden="true" :text="senderInitials(selected?.from || '')"></span>
+            <div class="wm-read-envelope">
+              <div class="wm-read-sender">
+                <div><strong :text="senderLabel(selected?.from || '')"></strong><small :if="senderLabel(selected?.from || '') !== selected?.from" :text="senderAddress(selected?.from || '')"></small></div>
+                <time :text="fullDate(selected?.date || '')"></time>
+              </div>
+              <dl class="wm-read-addresses">
+                <div><dt>To</dt><dd :text="selected?.to"></dd></div>
+                <div :if="selected?.cc"><dt>Cc</dt><dd :text="selected?.cc"></dd></div>
+                <div :if="selected?.bcc"><dt>Bcc</dt><dd :text="selected?.bcc"></dd></div>
+                <div :if="selected?.reply_to"><dt>Reply to</dt><dd :text="selected?.reply_to"></dd></div>
+                <div :if="senderReviewSelection && senderReviewSelection.recipient !== selected?.to"><dt>Delivered to</dt><dd :text="senderReviewSelection?.recipient"></dd></div>
+                <div :if="senderReviewSelection?.envelope_from && senderReviewSelection?.envelope_from !== senderReviewSelection?.author"><dt>Envelope sender</dt><dd :text="senderReviewSelection?.envelope_from"></dd></div>
+              </dl>
+            </div>
+          </div>
+          <p :if="placementText && !senderReviewOpen" class="wm-placement wm-placement-info"><span class="mail-icon" data-icon="info" aria-hidden="true"></span><span :text="placementText"></span></p>
+          <div class="wm-read-attach"><a :for="(attachment, index) in (selected?.attachments || [])" class="wm-attach-chip" :href="attachmentPath(index)" :download="attachment.filename"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span><span :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></span><span class="mail-icon wm-attachment-download" data-icon="download" aria-hidden="true"></span></a></div>
+          <div class="wm-format-control">
+            <button :if="selected?.folder === 'Receipts'" class="wm-action" @click="receiptFull.set(!receiptFull())" :aria-expanded="receiptFull"><span class="mail-icon" data-icon="receipt" aria-hidden="true"></span><span :text="receiptFull ? 'Show receipt summary' : 'Read full receipt'"></span></button>
+            <button :if="selected?.html && !receiptCompact" class="wm-action" @click="showHtml.set(!showHtml())"><span class="mail-icon" :data-icon="showHtml ? 'document' : 'preview'" aria-hidden="true"></span><span :text="showHtml ? 'Show plain text' : 'Show formatted email'"></span></button>
+            <span :if="selected?.html && !receiptCompact && showHtml && formattedReader.remoteImages > 0" class="wm-image-status">
+              <span class="mail-icon" :data-icon="remoteImagesAllowed ? 'info' : 'shield'" aria-hidden="true"></span>
+              <span :text="remoteImagesAllowed ? 'Remote images are allowed for this open message.' : 'Remote images are blocked.'"></span>
+            </span>
+            <button :if="selected?.html && !receiptCompact && showHtml && formattedReader.remoteImages > 0" class="wm-action"
+              @click="remoteImagesAllowed.set(!remoteImagesAllowed())" :text="remoteImagesAllowed ? 'Block remote images' : 'Load remote images'"></button>
+          </div>
+          <template :if="!receiptCompact && selected?.html && showHtml">
+            <iframe class="wm-read-html" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" title="Email content" :srcdoc="formattedReader.source"></iframe>
+          </template>
+          <pre :if="!receiptCompact && (!selected?.html || !showHtml)" class="wm-read-text" :text="selected?.text || 'No plain-text version is available.'"></pre>
         </div>
-        <p :if="placementText && !senderReviewOpen" class="wm-placement wm-placement-info"><span class="mail-icon" data-icon="info" aria-hidden="true"></span><span :text="placementText"></span></p>
-        <div class="wm-read-attach"><a :for="(attachment, index) in (selected?.attachments || [])" class="wm-attach-chip" :href="attachmentPath(index)" :download="attachment.filename"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span><span :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></span></a></div>
-        <div class="wm-format-control">
-          <button :if="selected?.folder === 'Receipts'" class="wm-action" @click="receiptFull.set(!receiptFull())" :aria-expanded="receiptFull" :text="receiptFull ? 'Show receipt summary' : 'Read full receipt'"></button>
-          <button :if="selected?.html && !receiptCompact" class="wm-action" @click="showHtml.set(!showHtml())" :text="showHtml ? 'Show plain text' : 'Show formatted email'"></button>
-          <span :if="selected?.html && !receiptCompact && showHtml && formattedReader.remoteImages > 0" class="wm-image-status">
-            <span class="mail-icon" :data-icon="remoteImagesAllowed ? 'info' : 'shield'" aria-hidden="true"></span>
-            <span :text="remoteImagesAllowed ? 'Remote images are allowed for this open message.' : 'Remote images are blocked.'"></span>
-          </span>
-          <button :if="selected?.html && !receiptCompact && showHtml && formattedReader.remoteImages > 0" class="wm-action"
-            @click="remoteImagesAllowed.set(!remoteImagesAllowed())" :text="remoteImagesAllowed ? 'Block remote images' : 'Load remote images'"></button>
-        </div>
-        <template :if="!receiptCompact && selected?.html && showHtml">
-          <iframe class="wm-read-html" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" title="Email content" :srcdoc="formattedReader.source"></iframe>
-        </template>
-        <pre :if="!receiptCompact && (!selected?.html || !showHtml)" class="wm-read-text" :text="selected?.text || 'No plain-text version is available.'"></pre>
         <section :if="selected?.reference && !senderReviewOpen && selected?.folder !== 'Drafts'" class="wm-reader-attention" aria-label="Message follow-up" :aria-busy="attentionSaving">
           <div class="wm-reader-attention-actions">
             <button type="button" class="wm-action" @click="changeAttention('follow_up', !selected?.attention?.follow_up)" :disabled="attentionSaving || readingLoading"><span class="mail-icon" data-icon="flag" aria-hidden="true"></span><span :text="selected?.attention?.follow_up ? 'Remove from Follow-up' : 'Add to Follow-up'"></span></button>
@@ -497,7 +499,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         <div>
           <div class="wm-outbox-title">
             <h2 :text="item.message.subject || '(no subject)'"></h2>
-            <span class="wm-outbox-status" :class="{ 'wm-outbox-status--review': item.state === 'unknown' }" :text="item.state === 'pending' ? (item.scheduled ? 'Scheduled' : 'Waiting to send') : item.state === 'sending' ? 'Sending…' : item.state === 'sent' ? 'Delivered' : item.state === 'cancelled' ? 'Cancelled' : item.state === 'partial' ? 'Partially delivered' : item.state === 'sent_unfiled' ? 'Delivered; Sent copy unavailable' : item.state === 'unknown' ? 'Needs review' : item.state === 'resolved' ? 'Reviewed' : 'Delivery failed'"></span>
+            <span class="wm-outbox-status" :class="{ 'wm-outbox-status--review': item.state === 'unknown', 'wm-outbox-status--delivered': item.state === 'sent' }" :text="item.state === 'pending' ? (item.scheduled ? 'Scheduled' : 'Waiting to send') : item.state === 'sending' ? 'Sending…' : item.state === 'sent' ? 'Delivered' : item.state === 'cancelled' ? 'Cancelled' : item.state === 'partial' ? 'Partially delivered' : item.state === 'sent_unfiled' ? 'Delivered; Sent copy unavailable' : item.state === 'unknown' ? 'Needs review' : item.state === 'resolved' ? 'Reviewed' : 'Delivery failed'"></span>
           </div>
           <p :if="item.state === 'pending' && item.scheduled" class="wm-outbox-time"><span class="mail-icon" data-icon="clock" aria-hidden="true"></span><span :text="deadlineLabel(item.dueAt)"></span></p>
           <p :if="item.message.to.length" :text="item.message.to.join(', ')"></p>

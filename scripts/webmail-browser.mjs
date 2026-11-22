@@ -67,7 +67,7 @@ async function verifyAppearance(page, scheme) {
       ['--muted', '--toolbar'], ['--muted', '--selected'], ['--muted', '--sidebar'],
       ['--text', '--list'], ['--muted', '--list'], ['--accent', '--selected'],
       ['--violet', '--sidebar'], ['--teal', '--sidebar'], ['--warning', '--sidebar'],
-      ['--on-primary', '--primary'], ['--on-primary', '--message-selection'],
+      ['--on-primary', '--primary'], ['--message-selection-text', '--message-selection'],
       ['--message-selection-muted', '--message-selection'],
     ]
     return {
@@ -88,7 +88,7 @@ async function verifyMessageSelection(message, child) {
   const appearance = await message.evaluate((node, selector) => {
     // Resolve the tokens to the browser's computed color serialization.
     const sample = document.createElement('span')
-    sample.style.cssText = 'display:none;color:var(--on-primary);background:var(--message-selection)'
+    sample.style.cssText = 'display:none;color:var(--message-selection-text);background:var(--message-selection)'
     document.body.append(sample)
     const expected = getComputedStyle(sample)
     const row = node.closest('.wm-message-row') ?? node
@@ -234,11 +234,16 @@ async function desktopJourney(page) {
     assert.match(await control.locator('.mail-icon').evaluate(node => getComputedStyle(node).maskImage), /data:image/)
   }
   await fitsViewport(page)
+  const paper = page.locator('.wm-message-paper')
+  await paper.locator('iframe[title="Email content"]').contentFrame().getByText('For Tuesday').waitFor()
+  assert(await paper.evaluate(node => getComputedStyle(node).backgroundColor !== getComputedStyle(node.closest('.wm-read')).backgroundColor),
+    'The message has a distinct reading surface')
   await screenshot(page, 'desktop-inbox-light')
   await verifyAppearance(page, 'dark')
   await verifyMessageSelection(button(page, /Tuesday design handoff/), '.wm-msg-from')
   await button(page, 'Show plain text').click()
   await page.locator('.wm-read-text').getByText(/Please confirm the sidebar order/).waitFor()
+  assert.match(await button(page, 'Show formatted email').locator('.mail-icon').evaluate(node => getComputedStyle(node).maskImage), /data:image/)
   await screenshot(page, 'desktop-inbox-dark')
   await page.emulateMedia({ colorScheme: 'light' })
   await button(tools, 'Flag').click()
@@ -328,6 +333,7 @@ async function phoneJourney(page) {
   assert(!await folders(page).isVisible(), 'Escape closes the drawer and restores focus')
   if (engine === 'firefox') await toggle.click()
   else await toggle.tap()
+  assert((await button(folders(page), /^Inbox(?:\s|$)/).boundingBox()).height >= 44, 'Mailboxes have full-size touch targets')
   await screenshot(page, 'phone-mailboxes')
   await openMailbox(page, /^Receipts(?:\s|$)/)
   assert.equal(await toggle.getAttribute('aria-expanded'), 'false')
