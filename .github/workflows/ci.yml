@@ -148,6 +148,7 @@ jobs:
     - name: Verify encrypted SMTP receipt, padding and DNSBL policy
       run: |
         python3 ../../scripts/test-mail-health-watch.py
+        python3 ../../scripts/test-mail-delivery-alerts.py zig-out/bin/mail
         python3 ../../scripts/test-mail-tls.py zig-out/bin/mail
 
     - name: Check formatting

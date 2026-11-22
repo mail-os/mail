@@ -839,13 +839,25 @@ sudo -u smtp sqlite3 /var/lib/mail/smtp.db "PRAGMA busy_timeout=10000;"
 sudo systemctl restart mail
 ```
 
-**Issue: Queue Backup**
-```bash
-# Check queue size
-curl -s http://localhost:8080/api/queue | jq .queue_size
+**Outbound queue and delivery alerts**
 
-# Process queue manually if needed
-# (Queue processor runs automatically)
+On hosts with the Mail health timer installed, the watchdog reads the SMTP
+database configured by `SMTP_DB_PATH` in `/etc/mail/mail.env`. It raises an
+incident when queued outbound deliveries in pending, processing, or retry
+state exceed 1,000. A separate incident fires when terminal failures exceed
+5% of completed outbound queue recipients in the current and previous 14 UTC
+minute buckets. A recipient enters the denominator when the queue records
+delivery or a terminal failure.
+
+The watchdog sends incident and recovery notifications through its persisted
+Discord outbox. A database read failure retains any active incident and
+reports the monitoring failure. A slow notification receiver leaves SMTP
+processing independent of alert delivery.
+
+```bash
+systemctl status mail-health.timer
+journalctl -u mail-health.service -n 30 --no-pager
+sudo cat /var/lib/mail-health/public/status.json
 ```
 
 ---

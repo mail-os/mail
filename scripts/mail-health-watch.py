@@ -5,10 +5,12 @@ Runs as root from a systemd timer. Only status.json is readable by mail-server;
 webhook credentials, journal cursors and the retry queue remain root-private.
 """
 import argparse
+from contextlib import closing
 import json
 import os
 import pathlib
 import shutil
+import sqlite3
 import subprocess
 import time
 import urllib.parse
@@ -20,6 +22,9 @@ PATTERNS = {
     'Storage failures': ('Failed to save message:', 'Failed to write message data', 'Failed to create message file', 'Failed to create mailbox directory', 'Forward check failed', 'Failed to write forward data'),
     'Pre-greeting DNSBL rejections': ('DNSBL check failed', 'blocked by DNSBL', 'is blacklisted', 'IP blacklisted in DNSBL'),
 }
+QUEUE_CHECK = 'Outbound queue depth'
+BOUNCE_CHECK = 'Queued delivery failure rate'
+DELIVERY_STATS_CHECK = 'Outbound delivery statistics'
 
 
 def atomic_json(path, value, mode):
@@ -51,10 +56,11 @@ def load_state(path):
     # Corrupt state must fail the unit, never silently discard pending alerts.
 
 
-def webhook_from_env(path):
+def env_setting(path, key):
+    prefix = key + '='
     for line in pathlib.Path(path).read_text().splitlines():
-        if line.startswith('DISCORD_WEBHOOK_URL='):
-            return line.split('=', 1)[1].strip().strip('\"\'')
+        if line.startswith(prefix):
+            return line[len(prefix):].strip().strip('\"\'')
     return ''
 
 
@@ -75,7 +81,9 @@ def send_alert(webhook, content):
 # nothing about the release), and alert transport is a third party. They keep
 # their place in status.json and the alert stream; they just do not decide
 # whether a deploy succeeded.
-OUTSIDE_DEPLOY_GATE = frozenset(PATTERNS) | {'Delivery error monitoring', 'Admin alert transport'}
+OUTSIDE_DEPLOY_GATE = frozenset(PATTERNS) | {
+    'Delivery error monitoring', 'Admin alert transport', QUEUE_CHECK, BOUNCE_CHECK, DELIVERY_STATS_CHECK,
+}
 
 
 def deploy_gate_failures(checks):
@@ -135,6 +143,34 @@ def journal_checks(state, now):
              'count': sum(f['name'] == name for f in failures)} for name in PATTERNS]
 
 
+def delivery_checks(path, state, now):
+    previous = set(state.get('active', []))
+    try:
+        uri = pathlib.Path(path).resolve().as_uri() + '?mode=ro'
+        with closing(sqlite3.connect(uri, uri=True, timeout=2)) as db:
+            db.execute('BEGIN')
+            depth, = db.execute(
+                "SELECT COUNT(*) FROM message_queue WHERE status IN ('pending','retry','processing')"
+            ).fetchone()
+            minute = now // 60
+            delivered, failed = db.execute(
+                'SELECT COALESCE(SUM(delivered),0), COALESCE(SUM(failed),0) '
+                'FROM outbound_delivery_minutes WHERE minute BETWEEN ? AND ?',
+                (minute - 14, minute),
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        # A read failure must not announce recovery for an existing incident.
+        return [{'name': name, 'ok': False} for name in (QUEUE_CHECK, BOUNCE_CHECK) if name in previous] + [
+            {'name': DELIVERY_STATS_CHECK, 'ok': False},
+        ]
+    completed = delivered + failed
+    return [
+        {'name': QUEUE_CHECK, 'ok': depth <= 1000, 'count': depth},
+        {'name': BOUNCE_CHECK, 'ok': 100 * failed <= 5 * completed, 'count': failed, 'completed': completed},
+        {'name': DELIVERY_STATS_CHECK, 'ok': True},
+    ]
+
+
 def reconcile(state, checks, now):
     active = sorted(check['name'] for check in checks if not check['ok'])
     previous = state.get('active', [])
@@ -166,6 +202,12 @@ def run(args):
         checks.append({'name': 'Delivery error monitoring', 'ok': not state.get('journal_backlog', False)})
     except Exception:
         checks.append({'name': 'Delivery error monitoring', 'ok': False})
+    try:
+        configured_database = env_setting(args.env_file, 'SMTP_DB_PATH')
+    except OSError:
+        configured_database = ''
+    database = args.database_path or pathlib.Path(args.storage_path) / (configured_database or 'smtp.db')
+    checks += delivery_checks(database, state, now)
     disk = shutil.disk_usage(args.storage_path)
     checks.append({'name': 'Mail storage free space', 'ok': disk.free > max(512 * 1024 * 1024, disk.total // 20)})
     storage_probe = "import os,sys,tempfile; f=tempfile.NamedTemporaryFile(dir=sys.argv[1],prefix='.health-',delete=True); f.write(b'mail health'); f.flush(); os.fsync(f.fileno()); f.close()"
@@ -179,7 +221,7 @@ def run(args):
     atomic_json(args.state_path, state, 0o600)
     notification_ok = False
     try:
-        webhook = webhook_from_env(args.env_file)
+        webhook = env_setting(args.env_file, 'DISCORD_WEBHOOK_URL')
         if webhook:
             for event in list(state['pending'])[:4]:
                 stamp = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(event['at']))
@@ -215,6 +257,8 @@ def main():
     parser.add_argument('--state-path', default='/var/lib/mail-health/private/state.json')
     parser.add_argument('--status-path', default='/var/lib/mail-health/public/status.json')
     parser.add_argument('--storage-path', default='/opt/mail')
+    parser.add_argument('--database-path', type=pathlib.Path,
+                        help='Override SMTP_DB_PATH from the mail environment file')
     parser.add_argument('--env-file', default='/etc/mail/mail.env')
     parser.add_argument('--deploy-gate', action='store_true',
                         help='Exit by the protocol and storage checks only; status and alerts are unchanged')

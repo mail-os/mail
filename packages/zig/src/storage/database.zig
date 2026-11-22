@@ -662,6 +662,11 @@ pub const Database = struct {
             \\CREATE INDEX IF NOT EXISTS accepted_mail_retry ON accepted_mail_targets(retry_at,delivery_id) WHERE outcome='pending';
             \\CREATE INDEX IF NOT EXISTS accepted_mail_reservations ON accepted_mail_targets(mailbox) WHERE outcome='pending';
             \\CREATE INDEX IF NOT EXISTS accepted_mail_retention ON accepted_mail(accepted_at) WHERE complete=1;
+            \\CREATE TABLE IF NOT EXISTS outbound_delivery_minutes (
+            \\    minute INTEGER PRIMARY KEY,
+            \\    delivered INTEGER NOT NULL DEFAULT 0,
+            \\    failed INTEGER NOT NULL DEFAULT 0
+            \\);
             \\CREATE TABLE IF NOT EXISTS mail_calendar_revisions (
             \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             \\    component TEXT NOT NULL,
@@ -1737,11 +1742,37 @@ pub const Database = struct {
             try update.bind(3, @as([]const u8, if (delivered) "remote_delivered" else "remote_failed"));
             _ = try update.step();
         }
-        const remove = try self.prepareLocked("DELETE FROM message_queue WHERE id=?1");
-        defer remove.finalize();
-        try remove.bind(1, queue_id);
-        _ = try remove.step();
+        {
+            const remove = try self.prepareLocked("DELETE FROM message_queue WHERE id=?1 RETURNING id");
+            defer remove.finalize();
+            try remove.bind(1, queue_id);
+            const removed = try remove.step();
+            if (removed) {
+                _ = try remove.step();
+                try self.recordQueuedOutcomeLocked(delivered);
+            }
+        }
         try self.execLocked("COMMIT");
+    }
+
+    /// Record one terminal recipient outcome in the same transaction as the
+    /// queue deletion. Retries and duplicate completion calls are excluded.
+    fn recordQueuedOutcomeLocked(self: *Database, delivered: bool) !void {
+        const minute = @divFloor(time_compat.timestamp(), 60);
+        const outcome = try self.prepareLocked(
+            \\INSERT INTO outbound_delivery_minutes(minute,delivered,failed) VALUES (?1,?2,?3)
+            \\ON CONFLICT(minute) DO UPDATE SET delivered=delivered+excluded.delivered,failed=failed+excluded.failed
+        );
+        defer outcome.finalize();
+        try outcome.bind(1, minute);
+        try outcome.bind(2, @as(i64, @intFromBool(delivered)));
+        try outcome.bind(3, @as(i64, @intFromBool(!delivered)));
+        _ = try outcome.step();
+
+        const prune = try self.prepareLocked("DELETE FROM outbound_delivery_minutes WHERE minute<?1");
+        defer prune.finalize();
+        try prune.bind(1, minute - 59);
+        _ = try prune.step();
     }
 
     pub const SenderRoute = enum { allow, allow_without_forward, review, decline };

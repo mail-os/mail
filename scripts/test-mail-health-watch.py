@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import pathlib
+import sqlite3
 import subprocess
 import tempfile
 import types
@@ -15,6 +16,37 @@ spec.loader.exec_module(watch)
 
 
 class HealthTests(unittest.TestCase):
+    def test_delivery_minute_window_and_depth_at_threshold(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / 'smtp db.sqlite'
+            db = sqlite3.connect(path)
+            try:
+                db.executescript("""
+                    CREATE TABLE message_queue (status TEXT);
+                    INSERT INTO message_queue VALUES ('pending'), ('retry'), ('processing'), ('staged');
+                    CREATE TABLE outbound_delivery_minutes (minute INTEGER, delivered INTEGER, failed INTEGER);
+                    INSERT INTO outbound_delivery_minutes VALUES (85,0,500), (86,19,1), (101,0,500);
+                """)
+            finally:
+                db.close()
+            queue, failure, monitor = watch.delivery_checks(path, {}, 100 * 60 + 59)
+            self.assertEqual(queue, {'name': watch.QUEUE_CHECK, 'ok': True, 'count': 3})
+            self.assertEqual(failure, {'name': watch.BOUNCE_CHECK, 'ok': True, 'count': 1, 'completed': 20})
+            self.assertTrue(monitor['ok'])
+            self.assertTrue(watch.delivery_checks(path, {}, 101 * 60)[0]['ok'])
+            self.assertFalse(watch.delivery_checks(path, {}, 101 * 60)[1]['ok'])
+
+    def test_delivery_telemetry_read_failure_preserves_open_incident(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / 'absent.db'
+            state = {'active': [watch.BOUNCE_CHECK]}
+            failure, monitor = watch.delivery_checks(path, state, 100)
+            self.assertEqual(failure['name'], watch.BOUNCE_CHECK)
+            self.assertFalse(failure['ok'])
+            self.assertFalse(monitor['ok'])
+            self.assertFalse(path.exists())
+            self.assertEqual(watch.deploy_gate_failures([failure, monitor]), [])
+
     def test_incident_recovery_and_no_repeated_notifications(self):
         state = {'checked_at': 1, 'active': [], 'events': [], 'pending': []}
         watch.reconcile(state, [{'name': 'TLS receive errors', 'ok': False}], 100)
@@ -29,9 +61,10 @@ class HealthTests(unittest.TestCase):
             env = root / 'env'
             env.write_text('DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/private-secret\n')
             args = types.SimpleNamespace(state_path=root/'private/state.json', status_path=root/'public/status.json',
-                                         env_file=env, storage_path=root, probe='probe.py', host='mail.example.com')
+                                         env_file=env, storage_path=root, probe='probe.py', host='mail.example.com',
+                                         database_path=None)
             probe = subprocess.CompletedProcess([], 0, json.dumps({'ok': True, 'checks': [{'name': 'SMTP', 'ok': True}]}).encode())
-            with patch.object(watch.subprocess, 'run', return_value=probe), patch.object(watch, 'journal_checks', return_value=[]), patch.object(watch.shutil, 'disk_usage', return_value=types.SimpleNamespace(total=10000000000, free=5000000000)):
+            with patch.object(watch.subprocess, 'run', return_value=probe), patch.object(watch, 'journal_checks', return_value=[]), patch.object(watch, 'delivery_checks', return_value=[]), patch.object(watch.shutil, 'disk_usage', return_value=types.SimpleNamespace(total=10000000000, free=5000000000)):
                 with patch.object(watch, 'send_alert', side_effect=RuntimeError('secret')):
                     self.assertEqual(watch.run(args), 1)
                 self.assertEqual(len(watch.load_state(args.state_path)['pending']), 1)
@@ -48,11 +81,11 @@ class HealthTests(unittest.TestCase):
     def run_gate(self, root, probe_checks, journal):
         args = types.SimpleNamespace(state_path=root/'private/state.json', status_path=root/'public/status.json',
                                      env_file=root/'env', storage_path=root, probe='probe.py', host='mail.example.com',
-                                     deploy_gate=True)
+                                     deploy_gate=True, database_path=None)
         args.env_file.write_text('')
         ok = all(check['ok'] for check in probe_checks)
         probe = subprocess.CompletedProcess([], 0 if ok else 1, json.dumps({'ok': ok, 'checks': probe_checks}).encode())
-        with patch.object(watch.subprocess, 'run', return_value=probe), patch.object(watch, 'journal_checks', return_value=journal), patch.object(watch.shutil, 'disk_usage', return_value=types.SimpleNamespace(total=10000000000, free=5000000000)):
+        with patch.object(watch.subprocess, 'run', return_value=probe), patch.object(watch, 'journal_checks', return_value=journal), patch.object(watch, 'delivery_checks', return_value=[]), patch.object(watch.shutil, 'disk_usage', return_value=types.SimpleNamespace(total=10000000000, free=5000000000)):
             code = watch.run(args)
         return code, json.loads(args.status_path.read_text()), watch.load_state(args.state_path)
 
