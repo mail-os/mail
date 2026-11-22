@@ -9,6 +9,7 @@ const logger = @import("../core/logger.zig");
 const tls = @import("tls");
 const time_compat = @import("../core/time_compat.zig");
 const caldav_store = @import("../storage/caldav_store.zig");
+const dav_properties = @import("caldav_properties.zig");
 const calendar_import = @import("../api/webmail_calendar_import.zig");
 const free_busy = @import("caldav_free_busy.zig");
 const calendar_query = @import("caldav_query.zig");
@@ -511,7 +512,8 @@ fn appendResourceHref(
 }
 
 const dav_multistatus_start = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" ++
-    "<D:multistatus xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:CARD=\"urn:ietf:params:xml:ns:carddav\">\n";
+    "<D:multistatus xmlns:D=\"" ++ dav_properties.dav ++ "\" xmlns:C=\"" ++ dav_properties.caldav ++
+    "\" xmlns:CARD=\"" ++ dav_properties.carddav ++ "\" xmlns:A=\"" ++ dav_properties.ical ++ "\">\n";
 
 fn appendDavSyncMember(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, user: []const u8, collection: []const u8, kind: caldav_store.SyncChange.ResourceType, member: caldav_store.DavSyncMember) !void {
     return appendDavMemberAt(buf, allocator, user, collection, kind, if (kind == .event) "/calendars/" else "/addressbooks/", member);
@@ -814,7 +816,7 @@ pub const CalDavSession = struct {
         switch (method) {
             .options => try self.handleOptions(),
             .propfind => try self.handlePropfind(path, request, config),
-            .proppatch => try self.handleProppatch(path, request, config),
+            .proppatch => try self.handleProppatch(parsed, request, config),
             .get, .head => try self.handleGet(path, request, method == .head),
             .put => try self.handlePut(path, request, config),
             .delete => try self.handleDelete(path, request),
@@ -875,11 +877,8 @@ pub const CalDavSession = struct {
         if (!std.mem.eql(u8, depth, "0")) {
             const shares = self.store.snapshotSharedDavCollections(a, username) catch |err| return self.sendResourceError(err);
             for (shares) |*item| {
-                var scratch: [2048]u8 = undefined;
-                const display_name = percentDecodeOnce(item.name, &scratch) orelse item.name;
-                try self.appendDavCollection(&buf, a, user, &item.id, .event, null, null, .{
+                try self.appendDavCollection(&buf, a, user, &item.id, .event, item.properties, null, null, .{
                     .editable = item.editable,
-                    .display_name = display_name,
                     .alias = true,
                     .supports_sync = self.store.config.enable_sync_tokens,
                 });
@@ -947,11 +946,8 @@ pub const CalDavSession = struct {
             if (sync) |snapshot| {
                 var buf: std.ArrayList(u8) = .empty;
                 try buf.appendSlice(a, dav_multistatus_start);
-                var scratch: [2048]u8 = undefined;
-                const name = percentDecodeOnce(snapshot.name, &scratch) orelse snapshot.name;
-                try self.appendDavCollection(&buf, a, location.user, location.collection, .event, snapshot.report.token, null, .{
+                try self.appendDavCollection(&buf, a, location.user, location.collection, .event, snapshot.properties, snapshot.report.token, null, .{
                     .editable = snapshot.editable,
-                    .display_name = name,
                     .alias = location.shared_alias,
                     .supports_sync = true,
                 });
@@ -983,9 +979,7 @@ pub const CalDavSession = struct {
         if (listing == .events) return self.sendCalendarQuery(a, location, body, snapshot);
         var buf: std.ArrayList(u8) = .empty;
         try buf.appendSlice(a, dav_multistatus_start);
-        var scratch: [2048]u8 = undefined;
-        const name = percentDecodeOnce(snapshot.name, &scratch) orelse snapshot.name;
-        try self.appendDavCollection(&buf, a, location.user, location.collection, .event, null, null, .{ .editable = snapshot.editable, .display_name = name, .alias = location.shared_alias });
+        try self.appendDavCollection(&buf, a, location.user, location.collection, .event, snapshot.properties, null, null, .{ .editable = snapshot.editable, .alias = location.shared_alias });
         for (snapshot.members) |member| {
             try appendDavMemberAt(&buf, a, location.user, location.collection, .event, location.base(), .{ .uid = member.uid, .etag = member.etag });
         }
@@ -1144,7 +1138,7 @@ pub const CalDavSession = struct {
         var header_fbs = io_compat.fixedBufferStream(&header_buf);
         const header_writer = header_fbs.writer();
         try header_writer.print(
-            "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: {d}\r\n\r\n",
+            "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {d}\r\n\r\n",
             .{body.len},
         );
 
@@ -1164,25 +1158,25 @@ pub const CalDavSession = struct {
         var buf: std.ArrayList(u8) = .empty;
         try buf.appendSlice(a, dav_multistatus_start);
         if (parsed.collection) |collection| {
-            const report = self.store.snapshotDavSync(a, user_id, collection, kind, if (depth > 0) .initial else .version_only) catch |err| switch (err) {
+            const snapshot = self.store.snapshotDavPropfind(a, user_id, collection, kind, if (depth > 0) .initial else .version_only) catch |err| switch (err) {
                 error.NotFound => return self.sendError(404, "Not Found"),
                 else => return err,
             };
-            try self.appendDavCollection(&buf, a, username, collection, kind, report.token, null, null);
-            for (report.members) |member| try appendDavSyncMember(&buf, a, username, collection, kind, member);
+            try self.appendDavCollection(&buf, a, username, collection, kind, snapshot.properties, snapshot.report.token, null, null);
+            for (snapshot.report.members) |member| try appendDavSyncMember(&buf, a, username, collection, kind, member);
         } else {
             const collections = try self.store.snapshotDavCollections(a, user_id, kind);
             for (collections) |collection| {
-                try self.appendDavCollection(&buf, a, username, collection.name, kind, collection.token, collection.ctag, null);
+                try self.appendDavCollection(&buf, a, username, collection.name, kind, collection.properties, collection.token, collection.ctag, null);
             }
         }
         try buf.appendSlice(a, "</D:multistatus>");
         try self.sendMultistatusResponse(buf.items);
     }
 
-    const SharedCollectionProperties = struct { editable: bool, display_name: []const u8, alias: bool, supports_sync: bool = false };
+    const SharedCollectionProperties = struct { editable: bool, alias: bool, supports_sync: bool = false };
 
-    fn appendDavCollection(self: *CalDavSession, buf: *std.ArrayList(u8), a: std.mem.Allocator, username: []const u8, collection: []const u8, kind: caldav_store.SyncChange.ResourceType, token: ?[]const u8, ctag: ?[]const u8, shared: ?SharedCollectionProperties) !void {
+    fn appendDavCollection(self: *CalDavSession, buf: *std.ArrayList(u8), a: std.mem.Allocator, username: []const u8, collection: []const u8, kind: caldav_store.SyncChange.ResourceType, properties: caldav_store.DavCollectionProperties, token: ?[]const u8, ctag: ?[]const u8, shared: ?SharedCollectionProperties) !void {
         try buf.appendSlice(a, "  <D:response>\n");
         switch (kind) {
             .event => try appendCollectionHref(buf, a, if (shared != null and shared.?.alias) "/shared-calendars/" else "/calendars/", username, collection),
@@ -1199,7 +1193,14 @@ pub const CalDavSession = struct {
             .contact => try buf.appendSlice(a, "      <D:resourcetype><D:collection/><CARD:addressbook/></D:resourcetype>\n" ++
                 "      <CARD:supported-address-data><CARD:address-data-type content-type=\"text/vcard\" version=\"3.0\"/></CARD:supported-address-data>\n"),
         }
-        try appendXmlEscaped(buf, a, "      <D:displayname>", if (shared) |properties| properties.display_name else collection, "</D:displayname>\n");
+        var scratch: [2048]u8 = undefined;
+        const fallback = if (shared != null) percentDecodeOnce(properties.name, &scratch) orelse properties.name else collection;
+        try appendXmlEscaped(buf, a, "      <D:displayname>", properties.display_name orelse fallback, "</D:displayname>\n");
+        if (properties.description) |description| switch (kind) {
+            .event => try appendXmlEscaped(buf, a, "      <C:calendar-description>", description, "</C:calendar-description>\n"),
+            .contact => try appendXmlEscaped(buf, a, "      <CARD:addressbook-description>", description, "</CARD:addressbook-description>\n"),
+        };
+        if (properties.color) |color| try appendXmlEscaped(buf, a, "      <A:calendar-color>", color, "</A:calendar-color>\n");
         if (ctag) |tag| try appendXmlEscaped(buf, a, "      <CS:getctag xmlns:CS=\"http://calendarserver.org/ns/\">", tag, "</CS:getctag>\n");
         try buf.appendSlice(a, "      <D:supported-report-set>\n");
         switch (kind) {
@@ -1216,108 +1217,56 @@ pub const CalDavSession = struct {
         if (self.store.config.enable_sync_tokens) {
             if (token) |value| try appendXmlEscaped(buf, a, "      <D:sync-token>", value, "</D:sync-token>\n");
         }
-        if (shared) |properties| {
+        if (shared) |access| {
             try buf.appendSlice(a, "      <D:current-user-privilege-set><D:privilege><D:read/></D:privilege>\n");
-            if (properties.editable) try buf.appendSlice(a, "        <D:privilege><D:write-content/></D:privilege><D:privilege><D:bind/></D:privilege><D:privilege><D:unbind/></D:privilege>\n");
+            if (access.editable) try buf.appendSlice(a, "        <D:privilege><D:write-content/></D:privilege><D:privilege><D:bind/></D:privilege><D:privilege><D:unbind/></D:privilege>\n");
             try buf.appendSlice(a, "      </D:current-user-privilege-set>\n");
         }
         try buf.appendSlice(a, "    </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>\n  </D:response>\n");
     }
 
-    /// Handle PROPPATCH request (modify properties on calendar/addressbook)
-    fn handleProppatch(
-        self: *CalDavSession,
-        path: []const u8,
-        request: []const u8,
-        config: *const CalDavConfig,
-    ) !void {
-        _ = config;
-        const parsed = parsePath(path);
+    /// Handle PROPPATCH on an owned calendar or address book.
+    fn handleProppatch(self: *CalDavSession, parsed: ParsedPath, request: []const u8, config: *const CalDavConfig) !void {
+        const kind: caldav_store.SyncChange.ResourceType = switch (parsed.path_type) {
+            .calendar_collection => if (config.enable_caldav) .event else return self.sendError(404, "Not Found"),
+            .addressbook_collection => if (config.enable_carddav) .contact else return self.sendError(404, "Not Found"),
+            else => return self.sendError(501, "PROPPATCH not supported on this resource"),
+        };
+        const name = parsed.collection orelse return self.sendError(404, "Not Found");
+        const username = parsed.user orelse return self.sendError(404, "Not Found");
+        const user_id = try self.getUserId();
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const update = dav_properties.parse(a, httpBody(request), kind) catch |err| switch (err) {
+            error.InvalidXml => return self.sendError(400, "Invalid propertyupdate XML"),
+            error.PropertyUpdateTooLarge => return self.sendError(413, "Property update is too large"),
+            else => return self.sendResourceError(err),
+        };
 
-        // Extract body from request
-        var body: []const u8 = "";
-        if (std.mem.indexOf(u8, request, "\r\n\r\n")) |idx| {
-            body = request[idx + 4 ..];
-        }
-
-        // Parse displayname and calendar-color from the XML body
-        var new_name: ?[]const u8 = null;
-        var new_color: ?[]const u8 = null;
-
-        if (std.mem.indexOf(u8, body, "<D:displayname>")) |start| {
-            const val_start = start + 15;
-            if (std.mem.indexOf(u8, body[val_start..], "</D:displayname>")) |end| {
-                new_name = body[val_start .. val_start + end];
-            }
-        }
-        if (std.mem.indexOf(u8, body, "<A:calendar-color>")) |start| {
-            const val_start = start + 18;
-            if (std.mem.indexOf(u8, body[val_start..], "</A:calendar-color>")) |end| {
-                new_color = body[val_start .. val_start + end];
-            }
-        }
-
-        switch (parsed.path_type) {
-            .calendar_collection => {
-                if (parsed.collection) |col_name| {
-                    const user_id = try self.getUserId();
-                    if (self.store.getCalendarByName(user_id, col_name)) |cal| {
-                        if (self.store.calendars.getPtr(cal.id)) |cal_ptr| {
-                            // SECURITY/CORRECTNESS: new_name/new_color point into the
-                            // request buffer, which is freed after this request. Dupe
-                            // with the store allocator so the stored slices stay valid.
-                            if (new_name) |name| {
-                                cal_ptr.name = try self.store.allocator.dupe(u8, name);
-                            }
-                            if (new_color) |color| {
-                                cal_ptr.color = try self.store.allocator.dupe(u8, color);
-                            }
-                        }
-                        // Return 207 Multi-Status success
-                        const resp = "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\n\r\n" ++
-                            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" ++
-                            "<D:multistatus xmlns:D=\"DAV:\">\n" ++
-                            "  <D:response>\n" ++
-                            "    <D:propstat>\n" ++
-                            "      <D:status>HTTP/1.1 200 OK</D:status>\n" ++
-                            "    </D:propstat>\n" ++
-                            "  </D:response>\n" ++
-                            "</D:multistatus>\n";
-                        try self.writeAll(resp);
-                        return;
-                    }
-                }
-                try self.sendError(404, "Not Found");
+        self.store.patchOwnedDavCollection(user_id, name, kind, update.patch) catch |err| switch (err) {
+            error.NotFound => return self.sendError(404, "Not Found"),
+            else => {
+                for (update.results.items) |*result| result.status = .store_failed;
             },
-            .addressbook_collection => {
-                if (parsed.collection) |col_name| {
-                    const user_id = try self.getUserId();
-                    if (self.store.getAddressBookByName(user_id, col_name)) |ab| {
-                        if (self.store.addressbooks.getPtr(ab.id)) |ab_ptr| {
-                            // SECURITY/CORRECTNESS: new_name points into the request
-                            // buffer (freed after this request). Dupe with the store
-                            // allocator so the stored slice stays valid.
-                            if (new_name) |name| {
-                                ab_ptr.name = try self.store.allocator.dupe(u8, name);
-                            }
-                        }
-                        const resp = "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\n\r\n" ++
-                            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" ++
-                            "<D:multistatus xmlns:D=\"DAV:\">\n" ++
-                            "  <D:response>\n" ++
-                            "    <D:propstat>\n" ++
-                            "      <D:status>HTTP/1.1 200 OK</D:status>\n" ++
-                            "    </D:propstat>\n" ++
-                            "  </D:response>\n" ++
-                            "</D:multistatus>\n";
-                        try self.writeAll(resp);
-                        return;
-                    }
-                }
-                try self.sendError(404, "Not Found");
-            },
-            else => try self.sendError(501, "PROPPATCH not supported on this resource"),
+        };
+        var buf: std.ArrayList(u8) = .empty;
+        try buf.appendSlice(a, dav_multistatus_start ++ "  <D:response>\n");
+        try appendCollectionHref(&buf, a, if (kind == .event) "/calendars/" else "/addressbooks/", username, name);
+        for (update.results.items) |result| {
+            try buf.appendSlice(a, "    <D:propstat><D:prop><");
+            const xml_prefix = std.mem.eql(u8, result.namespace, dav_properties.xml_namespace);
+            if (xml_prefix) try buf.appendSlice(a, "xml:") else if (result.namespace.len != 0) try buf.appendSlice(a, "P:");
+            try buf.appendSlice(a, result.name);
+            if (result.namespace.len != 0 and !xml_prefix)
+                try appendXmlEscaped(&buf, a, " xmlns:P=\"", result.namespace, "\"");
+            try appendPrint(&buf, a, "/></D:prop><D:status>HTTP/1.1 {s}</D:status>", .{result.status.line()});
+            if (result.status == .protected)
+                try buf.appendSlice(a, "<D:error><D:cannot-modify-protected-property/></D:error>");
+            try buf.appendSlice(a, "</D:propstat>\n");
         }
+        try buf.appendSlice(a, "  </D:response>\n</D:multistatus>");
+        return self.sendMultistatusResponse(buf.items);
     }
 
     /// Handle GET request (retrieve calendar/contact resource)
@@ -1937,7 +1886,7 @@ pub const CalDavSession = struct {
         var fbs = io_compat.fixedBufferStream(&header_buf);
         const writer = fbs.writer();
         try writer.print(
-            "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\nContent-Length: {d}\r\n\r\n",
+            "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: {d}\r\n\r\n",
             .{body.len},
         );
         try self.writeAll(fbs.getWritten());

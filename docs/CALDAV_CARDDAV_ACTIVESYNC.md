@@ -259,6 +259,16 @@ Content-Type: application/xml
 
 ---
 
+## Rename and Describe DAV Collections
+
+Collection owners can use `PROPPATCH` to set or remove `DAV:displayname`, the CalDAV `calendar-description`, or the CardDAV `addressbook-description`. Calendars also support `calendar-color` in the `http://apple.com/ns/ical/` namespace with `#RRGGBB` or `#RRGGBBAA` values.
+
+Updates persist across restarts. Use the original collection URL and member URLs after a rename. `PROPFIND` reports the new metadata on both the owner's collection and any shared CalDAV aliases. Sharing grants let recipients read the metadata, and the owner controls updates.
+
+Each instruction has its own status in the `207 Multi-Status` response. If one property update fails, the server rolls back the complete request.
+
+---
+
 ## CardDAV Usage
 
 ### Create an Address Book

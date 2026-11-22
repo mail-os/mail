@@ -225,7 +225,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     const editorId = Number(editor.editorCalendar())
     const findEditorShare = () => sharedCalendars().find(share => share.calendarId === editorId)
     const editorBefore = findEditorShare()?.access
-    shares.set(rows.map(share => ({ ...share, calendarName: calendarName(share.calendarName) })))
+    shares.set(rows.map(share => ({ ...share, calendarName: share.displayName ?? calendarName(share.calendarName) })))
     if (editorBefore && editorBefore !== findEditorShare()?.access) editor.clearEditor()
     const accessAfter = selectedShare()?.access
     if (accessBefore === accessAfter) return false
@@ -263,7 +263,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
         calendarSettings() ? api<CalendarTeam[]>('/webmail/api/teams', { signal }) : Promise.resolve(null),
       ])
       if (pending.signal.aborted) return
-      calendars.set(visible.map(calendar => ({ ...calendar, name: calendarName(calendar.name) })))
+      calendars.set(visible.map(calendar => ({ ...calendar, name: calendar.display_name ?? calendarName(calendar.name) })))
       applyShares(currentShares)
       if (roster) teams.set(roster)
       if (activeCalendar() !== null && !selectedShare() && !visible.some(item => item.id === activeCalendar())) activeCalendar.set(null)

@@ -28,6 +28,9 @@ hosted = SimpleNamespace(**runpy.run_path(str(SCRIPTS / "test-hosted-limits.py")
 clamav = SimpleNamespace(**runpy.run_path(str(SCRIPTS / "test-smtp-clamav.py")))
 COLLECTIONS = {"CalDAV": "staging-events", "CardDAV": "staging-contacts"}
 DAV = {"d": "DAV:"}
+CALDAV = "urn:ietf:params:xml:ns:caldav"
+CARDDAV = "urn:ietf:params:xml:ns:carddav"
+ICAL = "http://apple.com/ns/ical/"
 
 
 class DavClient:
@@ -163,6 +166,160 @@ def check_scanning(client, expected):
         must(client.request("PUT", path, bad, {"Content-Type": media, "If-Match": etag}), 422)
         headers, body = must(client.request("GET", path), 200)
         assert body == saved and etag == headers["ETag"]
+
+
+def check_collection_properties(test, owner, other, expected):
+    client, foreign = DavClient(test, owner), DavClient(test, other)
+    d = "{DAV:}"
+    xml = {"Content-Type": "application/xml"}
+    checks = []
+
+    def update(instructions):
+        return f'<propertyupdate xmlns="DAV:">{instructions}</propertyupdate>'.encode()
+
+    def statuses(payload, collection):
+        response, = ET.fromstring(payload).findall(d + "response")
+        assert response.findtext(d + "href") == collection
+        return {prop.tag: int(row.findtext(d + "status").split()[1])
+                for row in response.findall(d + "propstat") for prop in row.find(d + "prop")}
+
+    def properties(payload, collection):
+        row, = [row for row in ET.fromstring(payload).findall(d + "response")
+                if row.findtext(d + "href") == collection]
+        return {prop.tag: prop.text for prop in row.findall(f"{d}propstat/{d}prop/*")}
+
+    def discover(collection, *, tls=True, home=False):
+        path = collection.rstrip("/").rsplit("/", 1)[0] + "/" if home else collection
+        _, payload = must(client.request("PROPFIND", path, headers={"Depth": "1" if home else "0"}, tls=tls), 207)
+        return properties(payload, collection)
+
+    for tls, (path, _, etag) in zip((True, False), expected):
+        collection = path.rsplit("/", 1)[0] + "/"
+        slug = collection.rstrip("/").rsplit("/", 1)[1]
+        is_calendar = path.endswith(".ics")
+        ns, local = (CALDAV, "calendar-description") if is_calendar else (CARDDAV, "addressbook-description")
+        name, description, color = d + "displayname", f"{{{ns}}}{local}", f"{{{ICAL}}}calendar-color"
+        sync_token = discover(collection)[d + "sync-token"]
+        color_instruction = f'<h:calendar-color xmlns:h="{ICAL}">#127A42CC</h:calendar-color>' if is_calendar else ""
+        set_values = update(f'<set><prop><displayname>Projects &amp; clients %20</displayname>'
+                            f'<note:{local} xmlns:note="{ns}"><![CDATA[Notes <for>]]> everyone &#x2603;</note:{local}>'
+                            f'{color_instruction}</prop></set>')
+        # The 207 must be fully readable while the server keeps the same socket
+        # open for the following authenticated request.
+        connection = (http.client.HTTPSConnection("127.0.0.1", client.https, context=client.context, timeout=15)
+                      if tls else http.client.HTTPConnection("127.0.0.1", client.http, timeout=15))
+        try:
+            connection.connect()
+            stream = connection.sock
+            connection.request("PROPPATCH", collection, set_values, {**client.auth, **xml})
+            response = connection.getresponse()
+            payload = response.read()
+            assert response.status == 207 and int(response.headers["Content-Length"]) == len(payload)
+            assert response.headers["Cache-Control"] == "no-store"
+            wanted = {name: 200, description: 200}
+            if is_calendar:
+                wanted[color] = 200
+            assert statuses(payload, collection) == wanted
+            connection.request("PROPFIND", collection, headers={**client.auth, "Depth": "0"})
+            assert connection.sock is stream
+            response = connection.getresponse()
+            assert response.status == 207 and properties(response.read(), collection)[name] == "Projects & clients %20"
+        finally:
+            connection.close()
+
+        baseline = discover(collection, tls=not tls, home=True)
+        assert baseline[name] == "Projects & clients %20" and baseline[description] == "Notes <for> everyone ☃"
+        assert baseline.get(color) == ("#127A42CC" if is_calendar else None)
+        assert baseline[d + "sync-token"] == sync_token
+        alternate = collection.replace(slug + "/", urllib.parse.quote(baseline[name]) + "/")
+        must(client.request("PROPFIND", alternate, headers={"Depth": "0"}, tls=tls), 404)
+        for secure in (True, False):
+            must(foreign.request("PROPPATCH", collection, set_values, xml, tls=secure), 404)
+            must(client.request("PROPPATCH", alternate, set_values, xml, tls=secure), 404)
+            must(client.request("PROPPATCH", collection, set_values, xml, tls=secure, authenticated=False), 401)
+
+        blocked = update('<set><prop><displayname>Rollback</displayname><getetag/>'
+                         '<displayname xmlns="urn:other&amp;namespace"/></prop></set>')
+        _, body = must(client.request("PROPPATCH", collection, blocked, xml, tls=tls), 207)
+        assert statuses(body, collection) == {name: 424, d + "getetag": 403, "{urn:other&namespace}displayname": 403}
+        assert ET.fromstring(body).find(f".//{d}cannot-modify-protected-property") is not None
+        invalid = (f'<h:calendar-color xmlns:h="{ICAL}">blue</h:calendar-color>' if is_calendar
+                   else f'<{local} xmlns="{ns}"><bad/></{local}>')
+        _, body = must(client.request("PROPPATCH", collection, update(f'<set><prop><displayname/><!---->{invalid}</prop></set>'), xml), 207)
+        assert statuses(body, collection) == {name: 424, color if is_calendar else description: 409}
+        wrong_root = b'<propertyupdate xmlns="urn:fake"><set><prop><displayname>X</displayname></prop></set></propertyupdate>'
+        must(client.request("PROPPATCH", collection, wrong_root, xml), 400)
+        must(client.request("PROPPATCH", collection, update('<set><prop><ghost:displayname/></prop></set>'), xml), 400)
+        must(client.request("PROPPATCH", collection, update('text<set><prop><displayname/></prop></set>'), xml), 400)
+
+        table = "dav_calendars" if is_calendar else "dav_addressbooks"
+        with sqlite3.connect(test.env["CALDAV_DB_PATH"]) as db:
+            db.execute(f"CREATE TRIGGER reject_dav_property_fixture BEFORE UPDATE OF display_name ON {table} "
+                       "BEGIN SELECT RAISE(ABORT, 'fixture write failure'); END")
+            db.commit()
+            try:
+                _, body = must(client.request("PROPPATCH", collection, update('<remove><prop><displayname/></prop></remove>'), xml), 207)
+                assert statuses(body, collection) == {name: 500}
+                assert discover(collection)[name] == baseline[name]
+                assert db.execute(f"SELECT display_name FROM {table} WHERE name=?", (slug,)).fetchone() == (baseline[name],)
+            finally:
+                db.execute("DROP TRIGGER reject_dav_property_fixture")
+
+        ready = Barrier(3)
+
+        def write_pairs():
+            ready.wait(timeout=5)
+            for i in range(12):
+                value = f"Version {i}"
+                changes = update(f'<set><prop><displayname>{value}</displayname>'
+                                 f'<{local} xmlns="{ns}">{value}</{local}></prop></set>')
+                _, result = must(client.request("PROPPATCH", collection, changes, xml, tls=tls), 207)
+                assert statuses(result, collection) == {name: 200, description: 200}
+
+        def read_pairs(secure):
+            ready.wait(timeout=5)
+            for _ in range(14):
+                values = discover(collection, tls=secure, home=secure)
+                assert ((values[name], values[description]) == (baseline[name], baseline[description])
+                        or values[name] == values[description] and values[name].startswith("Version ")), values
+
+        with ThreadPoolExecutor(max_workers=3) as workers:
+            for result in (workers.submit(write_pairs), workers.submit(read_pairs, True), workers.submit(read_pairs, False)):
+                result.result()
+
+        removals = update(f'<remove><prop><displayname/><{local} xmlns="{ns}"/>'
+                          + (f'<calendar-color xmlns="{ICAL}"/>' if is_calendar else "") + '</prop></remove>')
+        _, body = must(client.request("PROPPATCH", collection, removals, xml, tls=tls), 207)
+        assert statuses(body, collection) == wanted
+        values = discover(collection, tls=not tls)
+        assert values[name] == slug and description not in values and color not in values
+
+        repeated = update('<set><prop><displayname>First instruction</displayname></prop></set>'
+                          '<remove><prop><displayname/></prop></remove>'
+                          f'<set><prop><displayname>Projects &amp; clients %20</displayname>'
+                          f'<{local} xmlns="{ns}">Notes &lt;for&gt; everyone ☃</{local}>'
+                          f'{color_instruction}</prop></set>')
+        _, body = must(client.request("PROPPATCH", collection, repeated, xml, tls=tls), 207)
+        assert statuses(body, collection) == wanted
+        assert discover(collection)[d + "sync-token"] == sync_token
+        checks.append((collection, path, etag, {key: baseline[key] for key in wanted}))
+
+    def verify_saved():
+        for collection, path, etag, baseline in checks:
+            sync_token = discover(collection)[d + "sync-token"]
+            for tls in (True, False):
+                for home in (True, False):
+                    values = discover(collection, tls=tls, home=home)
+                    assert all(values[key] == value for key, value in baseline.items()), values
+                    assert values[d + "sync-token"] == sync_token
+                assert must(client.request("GET", path, tls=tls), 200)[0]["ETag"] == etag
+        status, rows = test.api(test.login(owner), "calendars")
+        assert status == 200
+        row, = [row for row in rows["calendars"] if row["name"] == COLLECTIONS["CalDAV"]]
+        assert row["display_name"] == "Projects & clients %20" and row["color"] == "#127A42CC"
+
+    verify_saved()
+    return verify_saved
 
 
 def check_calendar_download(test, owner, other):
@@ -673,6 +830,7 @@ def check_calendar_upgrade(binary, previous):
             owner = test.provision("upgrade-owner")
             client = DavClient(test, owner)
             resource = f"/calendars/{owner}/Legacy/old-path.ics"
+            contact = f"/addressbooks/{owner}/Legacy/old-contact.vcf"
             alarm = datetime.fromtimestamp(int(time.time()) - 60, timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             raw = (b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:legacy-event\r\n"
                    b"DTSTART:20261121T120000Z\r\nSUMMARY:Previous version\r\nX-MAIL-FIXTURE:keep\r\n"
@@ -680,6 +838,8 @@ def check_calendar_upgrade(binary, previous):
                    b"TRIGGER;VALUE=DATE-TIME:" + alarm.encode() + b"\r\nEND:VALARM\r\n"
                    b"END:VEVENT\r\nEND:VCALENDAR\r\n")
             previous_headers, _ = must(client.request("PUT", resource, raw, {"Content-Type": "text/calendar"}), 201)
+            vcard = b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:old-contact\r\nFN:Old Contact\r\nEND:VCARD\r\n"
+            contact_headers, _ = must(client.request("PUT", contact, vcard, {"Content-Type": "text/vcard"}), 201)
             calendar, = test.api(test.login(owner), "calendars")[1]["calendars"]
             start = int(datetime(2026, 11, 21, 12, tzinfo=timezone.utc).timestamp())
             listing = f"calendar-events?calendarId={calendar['id']}&start={start}&end={start + 3600}"
@@ -687,9 +847,12 @@ def check_calendar_upgrade(binary, previous):
 
         def schema():
             with sqlite3.connect(root / "caldav.db") as db:
-                return db.execute("SELECT type, name, sql FROM sqlite_master ORDER BY type, name").fetchall()
+                tables = ("dav_calendars", "dav_addressbooks")
+                columns = {table: db.execute(f"PRAGMA table_info({table})").fetchall() for table in tables}
+                other = db.execute("SELECT type, name, sql FROM sqlite_master WHERE name NOT IN (?, ?) ORDER BY type, name", tables)
+                return set(other), columns
 
-        previous_schema = schema()
+        previous_schema, previous_columns = schema()
         test.binary = binary
         with test.daemon():
             session = test.login(owner)
@@ -703,18 +866,33 @@ def check_calendar_upgrade(binary, previous):
             changed, _ = must(hosted.request(endpoint, {"summary": "Updated by new version"}, headers, "PATCH", test.tls_context), 200)
             assert changed["ETag"] != head["ETag"]
 
-        upgraded_schema = schema()
-        assert set(previous_schema) <= set(upgraded_schema)
-        assert {row[1] for row in set(upgraded_schema) - set(previous_schema)} <= {
+            for path in (resource, contact):
+                collection = path.rsplit("/", 1)[0] + "/"
+                patch = b'<D:propertyupdate xmlns:D="DAV:"><D:set><D:prop><D:displayname>Renamed legacy</D:displayname></D:prop></D:set></D:propertyupdate>'
+                _, payload = must(client.request("PROPPATCH", collection, patch, {"Content-Type": "application/xml"}), 207)
+                assert "200 OK" in ET.fromstring(payload).findtext(".//d:status", namespaces=DAV)
+                _, payload = must(client.request("PROPFIND", collection, headers={"Depth": "0"}), 207)
+                assert ET.fromstring(payload).findtext(".//d:displayname", namespaces=DAV) == "Renamed legacy"
+
+        upgraded_schema, upgraded_columns = schema()
+        assert previous_schema <= upgraded_schema
+        assert {row[1] for row in upgraded_schema - previous_schema} <= {
             "dav_reminder_dismissals", "idx_dav_reminder_due", "sqlite_autoindex_dav_reminder_dismissals_1",
+            "idx_dav_calendar_share_id",
         }
+        for table, old_columns in previous_columns.items():
+            new_columns = upgraded_columns[table]
+            assert new_columns[:len(old_columns)] == old_columns
+            assert "display_name" in {column[1] for column in new_columns}
         test.binary = previous
         with test.daemon():
             row, = test.api(test.login(owner), listing)[1]["events"]
             assert row["id"] == event["id"] and row["summary"] == "Updated by new version" and row["etag"] == changed["ETag"]
             _, data = must(client.request("GET", resource), 200)
             assert b"UID:legacy-event\r\n" in data and b"X-MAIL-FIXTURE:keep\r\n" in data
-    print("Verified upgrade and reopening with the previous binary after the additive reminders migration.")
+            headers, data = must(client.request("GET", contact), 200)
+            assert headers["ETag"] == contact_headers["ETag"] and data == vcard
+    print("Verified collection metadata migration and reopening event and contact URLs with the previous binary.")
 
 
 def check_reminders(test, owner, other):
@@ -786,8 +964,11 @@ def main():
                 importer, calendar_id, submit = check_calendar_import(test, owner, other)
                 editor, item, resource, revision = check_calendar_writes(test, other)
                 dismissal = check_reminders(test, owner, other)
+                check_saved_properties = check_collection_properties(test, owner, other, expected)
             with test.daemon():
                 client = DavClient(test, owner)
+                check_saved_properties()
+                print("Verified CalDAV and CardDAV metadata over HTTP and HTTPS, including rollback, concurrent reads, and restart.")
                 assert test.api(test.login(owner), "calendar-reminders")[1]["dismissed"] == [dismissal]
                 print("Verified webmail reminder selection, account isolation, idempotent dismissal and persistence after restart.")
                 for path, body, etag in expected:

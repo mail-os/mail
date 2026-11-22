@@ -221,7 +221,7 @@ def verify(test, db, owner, viewer, colleague, foreign):
     expect(change(test, captain, calendar_id, viewer, "viewer"))
 
     expected = {"team": "studio", "source": owner, "grantee": viewer, "calendarId": calendar_id,
-                "calendarName": quote(CALENDAR, safe=""), "access": "viewer"}
+                "calendarName": quote(CALENDAR, safe=""), "displayName": None, "access": "viewer"}
     incoming, outgoing = shares(test, invited), shares(test, captain)
     assert incoming == outgoing == [expected], (incoming, outgoing, expected)
     assert shares(test, teammate) == shares(test, outsider) == []
@@ -630,7 +630,7 @@ def verify_dav_discovery(test, owner, viewer, colleague, foreign, calendar_id, e
     expect(test.api(invited, "calendars", {"name": "Personal discovery fixture"}), 201)
     assert hidden_id != calendar_id
     expect(change(test, teammate, collision_id, viewer, "editor"))
-    dav_xml = {"d": "DAV:", "c": CALDAV}
+    dav_xml = {"d": "DAV:", "c": CALDAV, "a": "http://apple.com/ns/ical/"}
 
     def propfind(client, path, depth, *, expected=207, tls=True):
         status, _, body = client.request("PROPFIND", path, headers={"Depth": str(depth)}, tls=tls)
@@ -661,6 +661,27 @@ def verify_dav_discovery(test, owner, viewer, colleague, foreign, calendar_id, e
     assert {item.findtext(".//d:displayname", namespaces=dav_xml) for item in listing.values()} == {CALENDAR}
     owned_alias, = [href for href, item in listing.items() if item.find(".//d:write-content", dav_xml) is None]
     editor_alias, = [href for href, item in listing.items() if item.find(".//d:write-content", dav_xml) is not None]
+
+    metadata = (f'<D:propertyupdate xmlns:D="DAV:" xmlns:C="{CALDAV}" xmlns:A="{dav_xml["a"]}">'
+                '<D:set><D:prop><D:displayname>Shared %20 &amp; renamed</D:displayname>'
+                '<C:calendar-description>Shared planning</C:calendar-description><A:calendar-color>#007AFF</A:calendar-color>'
+                '</D:prop></D:set></D:propertyupdate>')
+    owned_path = calendar_path(owner, CALENDAR) + "/"
+    xml_headers = {"Content-Type": "application/xml"}
+    assert guest.request("PROPPATCH", editor_alias, metadata, xml_headers)[0] == 404
+    assert guest.request("PROPPATCH", owned_path, metadata, xml_headers)[0] == 404
+    status, _, payload = owner_dav.request("PROPPATCH", owned_path, metadata, xml_headers, tls=False)
+    assert status == 207 and len(ET.fromstring(payload).findall(".//d:status", dav_xml)) == 3
+    for tls in (True, False):
+        updated = calendars(shared_home, tls=tls)
+        assert updated.keys() == listing.keys()
+        assert updated[editor_alias].findtext(".//d:displayname", namespaces=dav_xml) == CALENDAR
+        for row in (updated[owned_alias], hrefs(propfind(guest, owned_alias, 0, tls=tls))[owned_alias]):
+            assert row.findtext(".//d:displayname", namespaces=dav_xml) == "Shared %20 & renamed"
+            assert row.findtext(".//c:calendar-description", namespaces=dav_xml) == "Shared planning"
+            assert row.findtext(".//a:calendar-color", namespaces=dav_xml) == "#007AFF"
+    grant, = [row for row in shares(test, invited) if row["source"] == owner]
+    assert grant["calendarName"] == quote(CALENDAR, safe="") and grant["displayName"] == "Shared %20 & renamed"
 
     roadmap = owned_alias + "Roadmap.ics"
     hidden = owned_alias + "Budget.ics"
@@ -1065,6 +1086,8 @@ def main():
             assert [row["summary"] for row in expect(test.api(invited, query))["events"]] == ["Roadmap"]
             path = calendar_path(owner, CALENDAR)
             guest = DavClient(test, viewer)
+            status, _, body = guest.request("PROPFIND", alias, headers={"Depth": "0"})
+            assert status == 207 and ET.fromstring(body).findtext(".//{DAV:}displayname") == "Shared %20 & renamed"
             assert dav_busy(guest, path)
             assert guest.request("GET", path + "/Roadmap.ics")[0] == 200
             assert guest.request("GET", alias + "Roadmap.ics")[0] == 200

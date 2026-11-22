@@ -85,6 +85,7 @@ pub const Calendar = struct {
     id: u64,
     user_id: u64,
     name: []const u8,
+    display_name: ?[]const u8 = null,
     description: ?[]const u8,
     color: ?[]const u8,
     timezone: []const u8,
@@ -127,6 +128,7 @@ pub const Event = struct {
 pub const CalendarSummary = struct {
     id: u64,
     name: []const u8,
+    display_name: ?[]const u8 = null,
     description: ?[]const u8,
     color: ?[]const u8,
     timezone: []const u8,
@@ -175,6 +177,7 @@ pub const AddressBook = struct {
     id: u64,
     user_id: u64,
     name: []const u8,
+    display_name: ?[]const u8 = null,
     description: ?[]const u8,
     created_at: i64,
     modified_at: i64,
@@ -297,6 +300,22 @@ pub const DavCollection = struct {
     name: []const u8,
     ctag: []const u8,
     token: []const u8,
+    properties: DavCollectionProperties,
+};
+
+pub const DavCollectionProperties = struct {
+    name: []const u8 = "",
+    display_name: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    color: ?[]const u8 = null,
+};
+
+pub const CollectionProperty = union(enum) { keep, remove, set: []const u8 };
+
+pub const CollectionPropertyPatch = struct {
+    display_name: CollectionProperty = .keep,
+    description: CollectionProperty = .keep,
+    color: CollectionProperty = .keep,
 };
 
 pub const ResourceConditions = struct {
@@ -582,9 +601,9 @@ pub const CalDavStore = struct {
         try conn.exec(
             \\CREATE TABLE IF NOT EXISTS dav_users (id INTEGER PRIMARY KEY, username TEXT NOT NULL, mailbox_id INTEGER UNIQUE);
             \\CREATE UNIQUE INDEX IF NOT EXISTS idx_dav_users_local_name ON dav_users(username) WHERE mailbox_id IS NULL;
-            \\CREATE TABLE IF NOT EXISTS dav_calendars (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, description TEXT, color TEXT, timezone TEXT, created_at INTEGER, modified_at INTEGER, sync_token INTEGER, ctag TEXT, share_id TEXT);
+            \\CREATE TABLE IF NOT EXISTS dav_calendars (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, description TEXT, color TEXT, timezone TEXT, created_at INTEGER, modified_at INTEGER, sync_token INTEGER, ctag TEXT, share_id TEXT, display_name TEXT);
             \\CREATE TABLE IF NOT EXISTS dav_events (id INTEGER PRIMARY KEY, calendar_id INTEGER, uid TEXT, summary TEXT, description TEXT, location TEXT, dtstart INTEGER, dtend INTEGER, all_day INTEGER, rrule TEXT, organizer TEXT, status INTEGER, created_at INTEGER, modified_at INTEGER, etag TEXT, ics_data TEXT);
-            \\CREATE TABLE IF NOT EXISTS dav_addressbooks (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, description TEXT, created_at INTEGER, modified_at INTEGER, sync_token INTEGER, ctag TEXT);
+            \\CREATE TABLE IF NOT EXISTS dav_addressbooks (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, description TEXT, created_at INTEGER, modified_at INTEGER, sync_token INTEGER, ctag TEXT, display_name TEXT);
             \\CREATE TABLE IF NOT EXISTS dav_contacts (id INTEGER PRIMARY KEY, addressbook_id INTEGER, uid TEXT, full_name TEXT, given_name TEXT, family_name TEXT, nickname TEXT, organization TEXT, title TEXT, birthday INTEGER, note TEXT, photo_url TEXT, created_at INTEGER, modified_at INTEGER, etag TEXT, vcf_data TEXT);
             \\CREATE TABLE IF NOT EXISTS dav_emails (contact_id INTEGER, email TEXT, email_type INTEGER, is_primary INTEGER);
             \\CREATE TABLE IF NOT EXISTS dav_phones (contact_id INTEGER, number TEXT, phone_type INTEGER, is_primary INTEGER);
@@ -595,13 +614,19 @@ pub const CalDavStore = struct {
             \\CREATE INDEX IF NOT EXISTS idx_dav_emails_c ON dav_emails(contact_id);
             \\CREATE INDEX IF NOT EXISTS idx_dav_phones_c ON dav_phones(contact_id);
         );
-        const has_share_id = blk: {
-            var columns = try conn.prepare("SELECT 1 FROM pragma_table_info('dav_calendars') WHERE name='share_id'");
+        try ensureTextColumn(conn, "dav_calendars", "share_id");
+        try ensureTextColumn(conn, "dav_calendars", "display_name");
+        try ensureTextColumn(conn, "dav_addressbooks", "display_name");
+        try conn.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_dav_calendar_share_id ON dav_calendars(share_id) WHERE share_id IS NOT NULL");
+    }
+
+    fn ensureTextColumn(conn: *database.Connection, comptime table: []const u8, comptime column: []const u8) !void {
+        const exists = blk: {
+            var columns = try conn.prepare("SELECT 1 FROM pragma_table_info('" ++ table ++ "') WHERE name='" ++ column ++ "'");
             defer columns.finalize();
             break :blk try columns.step();
         };
-        if (!has_share_id) try conn.exec("ALTER TABLE dav_calendars ADD COLUMN share_id TEXT");
-        try conn.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_dav_calendar_share_id ON dav_calendars(share_id) WHERE share_id IS NOT NULL");
+        if (!exists) try conn.exec("ALTER TABLE " ++ table ++ " ADD COLUMN " ++ column ++ " TEXT");
     }
 
     fn bindOptText(stmt: *database.Statement, idx: c_int, v: ?[]const u8) !void {
@@ -631,7 +656,7 @@ pub const CalDavStore = struct {
 
     fn persistCalendar(self: *Self, cal: Calendar) !void {
         const conn = if (self.conn) |*c| c else return;
-        var stmt = try conn.prepare("INSERT OR REPLACE INTO dav_calendars (id,user_id,name,description,color,timezone,created_at,modified_at,sync_token,ctag,share_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)");
+        var stmt = try conn.prepare("INSERT OR REPLACE INTO dav_calendars (id,user_id,name,description,color,timezone,created_at,modified_at,sync_token,ctag,share_id,display_name) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
         defer stmt.finalize();
         try stmt.bindInt(1, @intCast(cal.id));
         try stmt.bindInt(2, @intCast(cal.user_id));
@@ -644,6 +669,7 @@ pub const CalDavStore = struct {
         try stmt.bindInt(9, @intCast(cal.sync_token));
         try stmt.bindText(10, cal.ctag);
         try bindOptText(&stmt, 11, if (cal.share_id) |*value| value else null);
+        try bindOptText(&stmt, 12, cal.display_name);
         _ = try stmt.step();
     }
 
@@ -672,7 +698,7 @@ pub const CalDavStore = struct {
 
     fn persistAddressBook(self: *Self, ab: AddressBook) void {
         const conn = if (self.conn) |*c| c else return;
-        var stmt = conn.prepare("INSERT OR REPLACE INTO dav_addressbooks (id,user_id,name,description,created_at,modified_at,sync_token,ctag) VALUES (?,?,?,?,?,?,?,?)") catch return;
+        var stmt = conn.prepare("INSERT OR REPLACE INTO dav_addressbooks (id,user_id,name,description,created_at,modified_at,sync_token,ctag,display_name) VALUES (?,?,?,?,?,?,?,?,?)") catch return;
         defer stmt.finalize();
         stmt.bindInt(1, @intCast(ab.id)) catch return;
         stmt.bindInt(2, @intCast(ab.user_id)) catch return;
@@ -682,6 +708,7 @@ pub const CalDavStore = struct {
         stmt.bindInt(6, ab.modified_at) catch return;
         stmt.bindInt(7, @intCast(ab.sync_token)) catch return;
         stmt.bindText(8, ab.ctag) catch return;
+        bindOptText(&stmt, 9, ab.display_name) catch return;
         _ = stmt.step() catch return;
     }
 
@@ -786,7 +813,7 @@ pub const CalDavStore = struct {
         }
 
         {
-            var stmt = try conn.prepare("SELECT id,user_id,name,description,color,timezone,created_at,modified_at,sync_token,ctag,share_id FROM dav_calendars");
+            var stmt = try conn.prepare("SELECT id,user_id,name,description,color,timezone,created_at,modified_at,sync_token,ctag,share_id,display_name FROM dav_calendars");
             defer stmt.finalize();
             while (stmt.step() catch false) {
                 const id: u64 = @intCast(stmt.columnInt(0));
@@ -810,6 +837,7 @@ pub const CalDavStore = struct {
                     .sync_token = @intCast(stmt.columnInt(8)),
                     .ctag = self.dupCol(&stmt, 9),
                     .share_id = share_id,
+                    .display_name = self.dupColOpt(&stmt, 11),
                 });
                 self.bumpIds(id, @intCast(stmt.columnInt(8)), .calendar);
             }
@@ -850,7 +878,7 @@ pub const CalDavStore = struct {
             }
         }
         {
-            var stmt = try conn.prepare("SELECT id,user_id,name,description,created_at,modified_at,sync_token,ctag FROM dav_addressbooks");
+            var stmt = try conn.prepare("SELECT id,user_id,name,description,created_at,modified_at,sync_token,ctag,display_name FROM dav_addressbooks");
             defer stmt.finalize();
             while (stmt.step() catch false) {
                 const id: u64 = @intCast(stmt.columnInt(0));
@@ -863,6 +891,7 @@ pub const CalDavStore = struct {
                     .modified_at = stmt.columnInt(5),
                     .sync_token = @intCast(stmt.columnInt(6)),
                     .ctag = self.dupCol(&stmt, 7),
+                    .display_name = self.dupColOpt(&stmt, 8),
                 });
                 self.bumpIds(id, @intCast(stmt.columnInt(6)), .addressbook);
             }
@@ -1016,6 +1045,7 @@ pub const CalDavStore = struct {
 
     fn freeCalendar(self: *Self, calendar: Calendar) void {
         self.allocator.free(calendar.name);
+        if (calendar.display_name) |value| self.allocator.free(value);
         if (calendar.description) |value| self.allocator.free(value);
         if (calendar.color) |value| self.allocator.free(value);
         self.allocator.free(calendar.timezone);
@@ -1071,6 +1101,7 @@ pub const CalDavStore = struct {
             try result.append(arena, .{
                 .id = calendar.id,
                 .name = try arena.dupe(u8, calendar.name),
+                .display_name = try dupeOptional(arena, calendar.display_name),
                 .description = try dupeOptional(arena, calendar.description),
                 .color = try dupeOptional(arena, calendar.color),
                 .timezone = try arena.dupe(u8, calendar.timezone),
@@ -1120,7 +1151,7 @@ pub const CalDavStore = struct {
         return share_id;
     }
 
-    pub const SharedCalendar = struct { id: u64, name: []const u8 };
+    pub const SharedCalendar = struct { id: u64, name: []const u8, display_name: ?[]const u8 };
 
     pub fn snapshotSharedCalendar(self: *Self, arena: Allocator, source_id: i64, share_id: teams.CalendarShareId) !?SharedCalendar {
         self.mutex.lock();
@@ -1131,7 +1162,7 @@ pub const CalDavStore = struct {
             if (calendar.user_id != owner) continue;
             const current = calendar.share_id orelse continue;
             if (std.mem.eql(u8, &current, &share_id))
-                return .{ .id = calendar.id, .name = try arena.dupe(u8, calendar.name) };
+                return .{ .id = calendar.id, .name = try arena.dupe(u8, calendar.name), .display_name = try dupeOptional(arena, calendar.display_name) };
         }
         return null;
     }
@@ -1143,13 +1174,76 @@ pub const CalDavStore = struct {
 
         const calendar = self.calendars.getPtr(id) orelse return error.CalendarNotFound;
         if (self.findUserIdLocked(username, mailbox_id) != calendar.user_id) return error.CalendarNotFound;
-        const new_color = try dupeOptional(self.allocator, color);
-        errdefer if (new_color) |value| self.allocator.free(value);
-        var updated = calendar.*;
-        updated.color = new_color;
-        try self.persistCalendar(updated);
-        if (calendar.color) |value| self.allocator.free(value);
-        calendar.color = new_color;
+        try self.applyDavPropertiesLocked(calendar, .{ .color = if (color) |value| .{ .set = value } else .remove });
+    }
+
+    pub fn patchOwnedDavCollection(self: *Self, user_id: u64, name: []const u8, kind: SyncChange.ResourceType, patch: CollectionPropertyPatch) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return switch (try self.findDavCollectionLocked(user_id, name, kind)) {
+            inline else => |collection| self.applyDavPropertiesLocked(collection, patch),
+        };
+    }
+
+    const PropertyEdit = struct {
+        value: ?[]const u8,
+        changed: bool,
+
+        fn prepare(a: Allocator, previous: ?[]const u8, change: CollectionProperty) !PropertyEdit {
+            switch (change) {
+                .keep => return .{ .value = previous, .changed = false },
+                .remove => return .{ .value = null, .changed = previous != null },
+                .set => |value| {
+                    if (previous) |old| {
+                        if (std.mem.eql(u8, old, value)) return .{ .value = old, .changed = false };
+                    }
+                    return .{ .value = try a.dupe(u8, value), .changed = true };
+                },
+            }
+        }
+
+        fn freeIfChanged(self: PropertyEdit, a: Allocator, value: ?[]const u8) void {
+            if (self.changed) if (value) |text| a.free(text);
+        }
+    };
+
+    /// Both webmail and DAV metadata writes commit a single complete row.
+    /// Publish new slices only after persistence succeeds.
+    fn applyDavPropertiesLocked(self: *Self, collection: anytype, patch: CollectionPropertyPatch) !void {
+        const a = self.allocator;
+        const is_calendar = @TypeOf(collection.*) == Calendar;
+        const old_color = if (is_calendar) collection.color else null;
+        if (!is_calendar and patch.color != .keep) return error.UnsupportedProperty;
+        const name = try PropertyEdit.prepare(a, collection.display_name, patch.display_name);
+        errdefer name.freeIfChanged(a, name.value);
+        const description = try PropertyEdit.prepare(a, collection.description, patch.description);
+        errdefer description.freeIfChanged(a, description.value);
+        const color = try PropertyEdit.prepare(a, old_color, patch.color);
+        errdefer color.freeIfChanged(a, color.value);
+        if (!name.changed and !description.changed and !color.changed) return;
+
+        const modified_at = currentTimestamp();
+        if (self.conn) |*conn| {
+            var stmt = try conn.prepare(if (is_calendar)
+                "UPDATE dav_calendars SET display_name=?1, description=?2, modified_at=?3, color=?5 WHERE id=?4"
+            else
+                "UPDATE dav_addressbooks SET display_name=?1, description=?2, modified_at=?3 WHERE id=?4");
+            defer stmt.finalize();
+            try bindOptText(&stmt, 1, name.value);
+            try bindOptText(&stmt, 2, description.value);
+            try stmt.bindInt(3, modified_at);
+            try stmt.bindInt(4, @intCast(collection.id));
+            if (is_calendar) try bindOptText(&stmt, 5, color.value);
+            _ = try stmt.step();
+            if (conn.changesCount() != 1) return error.StepFailed;
+        }
+        name.freeIfChanged(a, collection.display_name);
+        description.freeIfChanged(a, collection.description);
+        color.freeIfChanged(a, old_color);
+        collection.display_name = name.value;
+        collection.description = description.value;
+        collection.modified_at = modified_at;
+        if (is_calendar) collection.color = color.value;
     }
 
     pub fn snapshotMailboxEvent(self: *Self, arena: Allocator, username: []const u8, id: u64) !CalendarEventDetail {
@@ -1721,11 +1815,11 @@ pub const CalDavStore = struct {
     pub const DavCalendarSnapshot = struct {
         timezone: []const u8 = "UTC",
         editable: bool = false,
-        name: []const u8 = "",
+        properties: DavCollectionProperties = .{},
         members: []const DavCalendarMember = &.{},
     };
 
-    pub const DavSharedCollection = struct { id: teams.CalendarShareId, name: []const u8, editable: bool };
+    pub const DavSharedCollection = struct { id: teams.CalendarShareId, properties: DavCollectionProperties, editable: bool };
 
     pub fn snapshotSharedDavCollections(self: *Self, arena: Allocator, username: []const u8) ![]DavSharedCollection {
         const access = try self.beginCalendarAccess(username, .read);
@@ -1751,7 +1845,7 @@ pub const CalDavStore = struct {
             const id = calendar.share_id orelse continue;
             const grant = readable.get(id) orelse continue;
             if (calendar.user_id != grant.user_id) continue;
-            try result.append(arena, .{ .id = id, .name = try arena.dupe(u8, calendar.name), .editable = grant.editable });
+            try result.append(arena, .{ .id = id, .properties = try snapshotCollectionProperties(arena, calendar.*), .editable = grant.editable });
         }
         return result.items;
     }
@@ -1764,7 +1858,8 @@ pub const CalDavStore = struct {
         const authorized = try self.sharedDavCalendarLocked(access, target, .read);
         var snapshot = try self.snapshotDavCalendarLocked(arena, authorized.calendar, listing, .shared);
         snapshot.editable = authorized.permission != .viewer;
-        snapshot.name = try arena.dupe(u8, authorized.calendar.name);
+        if (listing == .collection or listing == .etags)
+            snapshot.properties = try snapshotCollectionProperties(arena, authorized.calendar);
         return snapshot;
     }
 
@@ -1775,7 +1870,7 @@ pub const CalDavStore = struct {
         return self.snapshotDavCalendarLocked(arena, calendar, .events, .owner);
     }
 
-    pub const DavSharedSync = struct { name: []const u8, editable: bool, report: DavSyncReport };
+    pub const DavSharedSync = struct { properties: DavCollectionProperties, editable: bool, report: DavSyncReport };
 
     pub fn snapshotSharedDavSync(self: *Self, arena: Allocator, username: []const u8, target: DavCalendarTarget, query: DavSyncQuery) !DavSharedSync {
         const access = try self.beginCalendarAccess(username, .read);
@@ -1806,7 +1901,7 @@ pub const CalDavStore = struct {
             try members.append(arena, .{ .uid = try arena.dupe(u8, event.uid), .etag = try arena.dupe(u8, event.etag) });
         }
         return .{
-            .name = try arena.dupe(u8, authorized.calendar.name),
+            .properties = if (query != .after) try snapshotCollectionProperties(arena, authorized.calendar) else .{},
             .editable = authorized.permission == .editor,
             .report = try self.shared_dav_sync.snapshot(arena, scope.finalResult(), members.items, query, self.config.max_sync_history),
         };
@@ -2313,6 +2408,7 @@ pub const CalDavStore = struct {
     fn freeAddressBook(self: *Self, book: AddressBook) void {
         self.allocator.free(book.ctag);
         self.allocator.free(book.name);
+        if (book.display_name) |value| self.allocator.free(value);
         if (book.description) |description| self.allocator.free(description);
     }
 
@@ -2970,6 +3066,15 @@ pub const CalDavStore = struct {
         };
     }
 
+    fn snapshotCollectionProperties(a: Allocator, collection: anytype) !DavCollectionProperties {
+        return .{
+            .name = try a.dupe(u8, collection.name),
+            .display_name = try dupeOptional(a, collection.display_name),
+            .description = try dupeOptional(a, collection.description),
+            .color = if (@hasField(@TypeOf(collection), "color")) try dupeOptional(a, collection.color) else null,
+        };
+    }
+
     fn snapshotDavCollectionList(self: *const Self, arena: Allocator, user_id: u64, kind: SyncChange.ResourceType, iterator: anytype) ![]DavCollection {
         var entries = iterator;
         var result: std.ArrayList(DavCollection) = .empty;
@@ -2977,30 +3082,55 @@ pub const CalDavStore = struct {
             if (collection.user_id != user_id) continue;
             var prefix_buf: [96]u8 = undefined;
             const prefix = try self.davSyncPrefix(&prefix_buf, kind, collection.id);
+            const properties = try snapshotCollectionProperties(arena, collection.*);
             try result.append(arena, .{
-                .name = try arena.dupe(u8, collection.name),
+                .name = properties.name,
                 .ctag = try arena.dupe(u8, collection.ctag),
                 .token = try std.fmt.allocPrint(arena, "{s}{d}", .{ prefix, collection.sync_token }),
+                .properties = properties,
             });
         }
         return result.items;
     }
 
-    /// Snapshot both the collection version and its members under the store
-    /// lock. The request arena owns all copies and the rendered token.
-    pub fn snapshotDavSync(self: *Self, arena: Allocator, user_id: u64, collection: []const u8, kind: SyncChange.ResourceType, query: DavSyncQuery) !DavSyncReport {
+    const DavCollectionRef = union(SyncChange.ResourceType) {
+        event: *Calendar,
+        contact: *AddressBook,
+    };
+
+    fn findDavCollectionLocked(self: *Self, user_id: u64, name: []const u8, kind: SyncChange.ResourceType) !DavCollectionRef {
+        return switch (kind) {
+            .event => .{ .event = self.calendars.getPtr((self.getCalendarByName(user_id, name) orelse return error.NotFound).id).? },
+            .contact => .{ .contact = self.addressbooks.getPtr((self.getAddressBookByName(user_id, name) orelse return error.NotFound).id).? },
+        };
+    }
+
+    pub const DavPropfind = struct { properties: DavCollectionProperties, report: DavSyncReport };
+
+    /// The metadata and member versions are copied from one locked view.
+    pub fn snapshotDavPropfind(self: *Self, arena: Allocator, user_id: u64, name: []const u8, kind: SyncChange.ResourceType, query: DavSyncQuery) !DavPropfind {
         self.mutex.lock();
         defer self.mutex.unlock();
+        const collection = try self.findDavCollectionLocked(user_id, name, kind);
+        return .{
+            .properties = switch (collection) {
+                inline else => |item| try snapshotCollectionProperties(arena, item.*),
+            },
+            .report = try self.snapshotDavSyncLocked(arena, collection, query),
+        };
+    }
+
+    pub fn snapshotDavSync(self: *Self, arena: Allocator, user_id: u64, name: []const u8, kind: SyncChange.ResourceType, query: DavSyncQuery) !DavSyncReport {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.snapshotDavSyncLocked(arena, try self.findDavCollectionLocked(user_id, name, kind), query);
+    }
+
+    fn snapshotDavSyncLocked(self: *Self, arena: Allocator, collection: DavCollectionRef, query: DavSyncQuery) !DavSyncReport {
+        const kind = std.meta.activeTag(collection);
         const Version = struct { id: u64, revision: u64, floor: u64 };
-        const version: Version = switch (kind) {
-            .event => if (self.getCalendarByName(user_id, collection)) |cal|
-                .{ .id = cal.id, .revision = cal.sync_token, .floor = cal.dav_history_floor }
-            else
-                return error.NotFound,
-            .contact => if (self.getAddressBookByName(user_id, collection)) |book|
-                .{ .id = book.id, .revision = book.sync_token, .floor = book.dav_history_floor }
-            else
-                return error.NotFound,
+        const version: Version = switch (collection) {
+            inline else => |item| .{ .id = item.id, .revision = item.sync_token, .floor = item.dav_history_floor },
         };
 
         var prefix_buf: [96]u8 = undefined;

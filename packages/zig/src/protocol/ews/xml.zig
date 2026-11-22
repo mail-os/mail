@@ -42,13 +42,16 @@ const Tag = struct { name: []const u8, attributes: []const u8, start: usize, clo
 pub const Iterator = struct {
     input: []const u8,
     pos: usize = 0,
+    element_only: bool = false,
 
-    fn nextTag(self: *Iterator) ParseError!?Tag {
+    fn nextTag(self: *Iterator, element_only: bool) ParseError!?Tag {
         while (std.mem.indexOfScalarPos(u8, self.input, self.pos, '<')) |start| {
+            if (element_only and std.mem.trim(u8, self.input[self.pos..start], whitespace).len != 0) return error.InvalidXml;
             const tail = self.input[start + 1 ..];
             const skipped: ?struct { prefix: []const u8, suffix: []const u8 } =
                 if (std.mem.startsWith(u8, tail, "!--")) .{ .prefix = "!--", .suffix = "-->" } else if (std.mem.startsWith(u8, tail, "![CDATA[")) .{ .prefix = "![CDATA[", .suffix = "]]>" } else if (std.mem.startsWith(u8, tail, "?")) .{ .prefix = "?", .suffix = "?>" } else null;
             if (skipped) |section| {
+                if (element_only and std.mem.eql(u8, section.prefix, "![CDATA[")) return error.InvalidXml;
                 const end = std.mem.indexOfPos(u8, tail, section.prefix.len, section.suffix) orelse return error.InvalidXml;
                 self.pos = start + 1 + end + section.suffix.len;
                 continue;
@@ -72,11 +75,12 @@ pub const Iterator = struct {
             if (name.len == 0 or name[0] == '!' or (closing and empty)) return error.InvalidXml;
             return .{ .name = name, .attributes = inside[name_end..], .start = start, .closing = closing, .empty = empty };
         }
+        if (element_only and std.mem.trim(u8, self.input[self.pos..], whitespace).len != 0) return error.InvalidXml;
         return null;
     }
 
     pub fn next(self: *Iterator) ParseError!?Element {
-        const start = (try self.nextTag()) orelse return null;
+        const start = (try self.nextTag(self.element_only)) orelse return null;
         if (start.closing) return error.InvalidXml;
         const local = if (std.mem.indexOfScalar(u8, start.name, ':')) |colon| start.name[colon + 1 ..] else start.name;
         if (start.empty) return .{ .name = local, .qualified_name = start.name, .attributes = start.attributes, .content = "" };
@@ -84,7 +88,7 @@ pub const Iterator = struct {
         var stack: [64][]const u8 = undefined;
         stack[0] = start.name;
         var depth: usize = 1;
-        while (try self.nextTag()) |tag| {
+        while (try self.nextTag(false)) |tag| {
             if (tag.closing) {
                 if (!std.mem.eql(u8, tag.name, stack[depth - 1])) return error.InvalidXml;
                 depth -= 1;

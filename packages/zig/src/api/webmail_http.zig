@@ -1933,6 +1933,7 @@ fn handleCalendarShares(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a
         grantee: []const u8,
         calendarId: u64,
         calendarName: []const u8,
+        displayName: ?[]const u8,
         access: teams.CalendarAccess,
     };
     var rows: std.ArrayList(CalendarShare) = .empty;
@@ -1944,6 +1945,7 @@ fn handleCalendarShares(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a
             .grantee = share.grantee,
             .calendarId = calendar.id,
             .calendarName = calendar.name,
+            .displayName = calendar.display_name,
             .access = share.access,
         });
     }

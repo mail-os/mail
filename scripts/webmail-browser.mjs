@@ -23,6 +23,7 @@ const errors = []
 const diagnostics = []
 const handoff = 'Tuesday design handoff'
 const sentSubject = 'Browser acceptance handoff'
+const calendarLabel = 'Design & Research'
 const button = (page, name) => page.getByRole('button', { name, exact: typeof name === 'string' })
 const heading = (page, name) => page.getByRole('heading', { name, exact: true })
 const folders = page => page.getByRole('navigation', { name: 'Mail folders' })
@@ -434,12 +435,12 @@ async function calendarSharingJourney(captain) {
   await captain.goto(calendarUrl)
   await button(captain, 'Manage calendars').click()
   const sharing = captain.getByRole('region', { name: 'Share a calendar' })
-  await sharing.getByLabel('Calendar to share').selectOption({ label: 'Design' })
+  await sharing.getByLabel('Calendar to share').selectOption({ label: calendarLabel })
   await sharing.getByRole('combobox', { name: /^Team\b/ }).selectOption({ label: 'Studio' })
   await sharing.getByLabel('Teammate').fill(sender)
   await sharing.getByRole('combobox', { name: /^Access\b/ }).selectOption('viewer')
   await button(sharing, 'Share calendar').click()
-  const role = sharing.getByRole('combobox', { name: `Access for ${sender} to Design` })
+  const role = sharing.getByRole('combobox', { name: `Access for ${sender} to ${calendarLabel}` })
   await role.waitFor()
 
   const context = await browser.newContext({
@@ -455,7 +456,7 @@ async function calendarSharingJourney(captain) {
   await button(teammate, 'Sign in').click()
   await teammate.waitForURL(url + '/')
   await teammate.goto(calendarUrl)
-  const sharedCalendar = button(teammate, /^Design.*View events/)
+  const sharedCalendar = button(teammate, /^Design & Research.*View events/)
   await sharedCalendar.click()
   const privateTitle = teammate.getByText('Private budget check', { exact: true })
   const publicEvent = button(teammate, /Studio review/)
@@ -482,7 +483,7 @@ async function calendarSharingJourney(captain) {
 
   await changeRole('editor')
   await details.waitFor({ state: 'hidden' })
-  await button(teammate, /^Design.*Edit events/).waitFor()
+  await button(teammate, /^Design & Research.*Edit events/).waitFor()
   await publicEvent.click()
   const editor = teammate.getByRole('dialog', { name: 'Edit event' })
   await editor.getByRole('textbox', { name: 'Title' }).fill('Studio review updated')
@@ -490,7 +491,7 @@ async function calendarSharingJourney(captain) {
   await editor.waitFor({ state: 'hidden' })
   await button(teammate, 'New event').click()
   const creation = teammate.getByRole('dialog', { name: 'New event' })
-  assert.match(await creation.getByRole('combobox', { name: 'Calendar', exact: true }).locator('option:checked').innerText(), /^Design/)
+  assert.match(await creation.getByRole('combobox', { name: 'Calendar', exact: true }).locator('option:checked').innerText(), /^Design & Research/)
   await creation.getByRole('textbox', { name: 'Title' }).fill('Shared draft review')
   await button(creation, 'Save event').click()
   await creation.waitFor({ state: 'hidden' })
@@ -541,12 +542,12 @@ async function calendarSharingJourney(captain) {
   await screenshot(teammate, 'phone-calendar-free-busy')
 
   await screenshot(captain, 'desktop-calendar-sharing')
-  await button(sharing, `Revoke access for ${sender} to Design`).click()
+  await button(sharing, `Revoke access for ${sender} to ${calendarLabel}`).click()
   await role.waitFor({ state: 'hidden' })
   await checkAccess()
   await teammate.getByText('You no longer have access to this shared calendar.', { exact: true }).waitFor()
   await busy.waitFor({ state: 'hidden' })
-  await button(teammate, /^Design/).waitFor({ state: 'hidden' })
+  await button(teammate, /^Design & Research/).waitFor({ state: 'hidden' })
   await context.close()
 }
 

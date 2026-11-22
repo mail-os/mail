@@ -65,6 +65,11 @@ def seed_calendar(fixture, owner):
         ])
         result = client.request("PUT", f"/calendars/{owner}/Design/{uid}.ics", event, {"Content-Type": "text/calendar"})
         assert result[0] == 201, result
+    metadata = ('<D:propertyupdate xmlns:D="DAV:" xmlns:A="http://apple.com/ns/ical/">'
+                '<D:set><D:prop><D:displayname>Design &amp; Research</D:displayname><A:calendar-color>#007AFF</A:calendar-color>'
+                '</D:prop></D:set></D:propertyupdate>')
+    status, _, payload = client.request("PROPPATCH", f"/calendars/{owner}/Design/", metadata, {"Content-Type": "application/xml"})
+    assert status == 207 and payload.count(b"200 OK") == 2, (status, payload)
     return now.date().isoformat()
 
 

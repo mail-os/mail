@@ -1,6 +1,7 @@
 export interface Calendar {
   id: number
   name: string
+  display_name?: string | null
   color: string | null
 }
 
@@ -12,6 +13,7 @@ export interface CalendarShare {
   grantee: string
   calendarId: number
   calendarName: string
+  displayName?: string | null
   access: CalendarAccess
 }
 
