@@ -565,6 +565,7 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.eql(u8, p, "/webmail/api/calendars") and std.mem.eql(u8, req.method, "GET")) return handleCalendars(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendars") and std.mem.eql(u8, req.method, "POST")) return handleCalendarCreate(server, conn, arena, req);
     if (std.mem.startsWith(u8, p, "/webmail/api/calendars/") and std.mem.eql(u8, req.method, "PATCH")) return handleCalendarColor(server, conn, arena, req);
+    if (std.mem.eql(u8, p, "/webmail/api/calendar-shares") and std.mem.eql(u8, req.method, "GET")) return handleCalendarShares(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-timezone") and std.mem.eql(u8, req.method, "GET")) return handleCalendarTimezone(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-reminders") and std.mem.eql(u8, req.method, "GET")) return handleCalendarReminders(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-reminders/dismiss") and std.mem.eql(u8, req.method, "POST")) return handleReminderDismiss(server, conn, arena, req);
@@ -1608,6 +1609,14 @@ fn handleTeams(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std
         const body = std.json.parseFromSliceLeaky(Body, arena, req.body, .{}) catch return teamError(conn, arena, error.InvalidTeamData);
         teams.setGrant(server.db, arena, actor, team, .{ .source = body.source, .grantee = body.grantee, .scope = body.scope, .resource = body.resource }, body.allowed) catch |err|
             return teamError(conn, arena, err);
+    } else if (std.mem.eql(u8, action.?, "calendar-shares")) {
+        const dav = server.dav_store orelse return sendError(conn, arena, 503, "calendar_unavailable", "Calendar is unavailable on this server");
+        const Body = struct { calendarId: u64, grantee: []const u8, access: ?teams.CalendarAccess };
+        const body = std.json.parseFromSliceLeaky(Body, arena, req.body, .{}) catch return teamError(conn, arena, error.InvalidTeamData);
+        const share_id = dav.mailboxCalendarShareId(sess.username, body.calendarId, body.access != null) catch |err|
+            return calendarWriteError(conn, arena, err);
+        teams.setCalendarShare(server.db, arena, sess.username, team, body.grantee, share_id, body.access) catch |err|
+            return teamError(conn, arena, err);
     } else return teamError(conn, arena, error.TeamNotFound);
     return sendJson(conn, arena, 200, "{\"ok\":true}", null);
 }
@@ -1912,6 +1921,34 @@ fn handleCalendars(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena:
     return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .calendars = calendars }), null);
 }
 
+fn handleCalendarShares(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const dav = server.dav_store orelse return sendError(conn, arena, 503, "calendar_unavailable", "Calendar is unavailable on this server");
+    const shares = try teams.calendarShares(server.db, arena, sess.username);
+    const CalendarShare = struct {
+        team: []const u8,
+        source: []const u8,
+        grantee: []const u8,
+        calendarId: u64,
+        calendarName: []const u8,
+        access: teams.CalendarAccess,
+    };
+    var rows: std.ArrayList(CalendarShare) = .empty;
+    for (shares) |share| {
+        const calendar = (try dav.snapshotSharedCalendar(arena, share.source_id, share.calendar_share_id)) orelse continue;
+        try rows.append(arena, .{
+            .team = share.team,
+            .source = share.source,
+            .grantee = share.grantee,
+            .calendarId = calendar.id,
+            .calendarName = calendar.name,
+            .access = share.access,
+        });
+    }
+    return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .shares = rows.items }), null);
+}
+
 const reminder_history = 86_400;
 
 fn handleCalendarReminders(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
@@ -2024,7 +2061,7 @@ fn handleCalendarEvents(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a
         .end = std.fmt.parseInt(i64, end orelse "", 10) catch return sendError(conn, arena, 400, "bad_request", "Invalid end timestamp"),
     } else null;
     const include_series = std.mem.eql(u8, req.queryParam(arena, "instances") orelse "", "1");
-    const events = dav.queryMailboxEvents(arena, sess.username, calendar_id, window, query, include_series) catch |err| switch (err) {
+    const events = listCalendarEvents(server, dav, arena, sess.username, calendar_id, window, query, include_series) catch |err| switch (err) {
         error.InvalidRange => return sendError(conn, arena, 400, "bad_request", "Specify a positive calendar window of at most 366 days"),
         error.CalendarNotFound => return sendError(conn, arena, 404, "not_found", "Calendar not found"),
         error.TooManyEvents => return sendError(conn, arena, 400, "too_many_events", "More than 500 events match. Narrow your search or select a calendar or shorter view."),
@@ -2032,6 +2069,22 @@ fn handleCalendarEvents(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a
         else => return err,
     };
     return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .events = events }), null);
+}
+
+fn listCalendarEvents(server: *WebmailHttpServer, dav: *caldav_store.CalDavStore, a: std.mem.Allocator, username: []const u8, calendar_id: ?u64, window: ?caldav_store.CalDavStore.CalendarWindow, query: []const u8, include_series: bool) ![]caldav_store.CalendarEventSummary {
+    return dav.queryMailboxEvents(a, username, calendar_id, window, query, include_series) catch |err| {
+        if (err != error.CalendarNotFound) return err;
+        const id = calendar_id orelse return err;
+        const shares = try teams.calendarShares(server.db, a, username);
+        for (shares) |share| {
+            if (!std.mem.eql(u8, share.grantee, username) or share.access == .free_busy) continue;
+            return dav.querySharedCalendarEvents(a, share, id, window, query, include_series) catch |shared_err| {
+                if (shared_err == error.CalendarNotFound) continue;
+                return shared_err;
+            };
+        }
+        return error.CalendarNotFound;
+    };
 }
 
 fn handleCalendarEventCreate(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {

@@ -426,6 +426,20 @@ revokes existing webmail sessions and deletes grants in both directions.
 Role changes revoke the affected user's webmail sessions. The server records
 membership and grant changes in `audit_log` in the same transaction.
 
+### Calendar shares
+
+The calendar owner can send `PUT /webmail/api/teams/:id/calendar-shares` with
+`{calendarId, grantee, access}`. Use the ID from their calendar list and
+the teammate's full mailbox address. The access values are `viewer`,
+`editor`, and `free_busy`. Send `null` to revoke that share.
+
+`GET /webmail/api/calendar-shares` lists the signed-in mailbox's incoming and
+outgoing shares. Viewer and editor grants allow public event listings via
+`GET /webmail/api/calendar-events` with the shared `calendarId`. A resource
+with any private or confidential instance stays out of shared listings and
+search. The event mutation and export endpoints require calendar ownership.
+Free/busy grants currently appear in share metadata.
+
 ### Shared inboxes
 
 Create a mailbox for the shared address and enroll that account and its

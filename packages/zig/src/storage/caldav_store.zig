@@ -32,6 +32,7 @@ const Allocator = std.mem.Allocator;
 const mutex_compat = @import("../core/mutex_compat.zig");
 const database = @import("db_sqlite.zig");
 const accounts = @import("database.zig");
+const teams = @import("team_store.zig");
 const icalendar = @import("../protocol/icalendar.zig");
 const reminder = @import("../protocol/icalendar_reminder.zig");
 
@@ -90,6 +91,7 @@ pub const Calendar = struct {
     sync_token: u64,
     dav_history_floor: u64 = 0,
     ctag: []const u8, // Collection tag
+    share_id: ?teams.CalendarShareId = null,
 };
 
 pub const Event = struct {
@@ -104,6 +106,7 @@ pub const Event = struct {
     all_day: bool,
     rrule: ?[]const u8,
     recurring: bool = false,
+    shareable: bool = false,
     reminder_coverage: reminder.Coverage = .{},
     organizer: ?[]const u8,
     status: EventStatus,
@@ -578,7 +581,7 @@ pub const CalDavStore = struct {
         try conn.exec(
             \\CREATE TABLE IF NOT EXISTS dav_users (id INTEGER PRIMARY KEY, username TEXT NOT NULL, mailbox_id INTEGER UNIQUE);
             \\CREATE UNIQUE INDEX IF NOT EXISTS idx_dav_users_local_name ON dav_users(username) WHERE mailbox_id IS NULL;
-            \\CREATE TABLE IF NOT EXISTS dav_calendars (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, description TEXT, color TEXT, timezone TEXT, created_at INTEGER, modified_at INTEGER, sync_token INTEGER, ctag TEXT);
+            \\CREATE TABLE IF NOT EXISTS dav_calendars (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, description TEXT, color TEXT, timezone TEXT, created_at INTEGER, modified_at INTEGER, sync_token INTEGER, ctag TEXT, share_id TEXT);
             \\CREATE TABLE IF NOT EXISTS dav_events (id INTEGER PRIMARY KEY, calendar_id INTEGER, uid TEXT, summary TEXT, description TEXT, location TEXT, dtstart INTEGER, dtend INTEGER, all_day INTEGER, rrule TEXT, organizer TEXT, status INTEGER, created_at INTEGER, modified_at INTEGER, etag TEXT, ics_data TEXT);
             \\CREATE TABLE IF NOT EXISTS dav_addressbooks (id INTEGER PRIMARY KEY, user_id INTEGER, name TEXT, description TEXT, created_at INTEGER, modified_at INTEGER, sync_token INTEGER, ctag TEXT);
             \\CREATE TABLE IF NOT EXISTS dav_contacts (id INTEGER PRIMARY KEY, addressbook_id INTEGER, uid TEXT, full_name TEXT, given_name TEXT, family_name TEXT, nickname TEXT, organization TEXT, title TEXT, birthday INTEGER, note TEXT, photo_url TEXT, created_at INTEGER, modified_at INTEGER, etag TEXT, vcf_data TEXT);
@@ -591,6 +594,13 @@ pub const CalDavStore = struct {
             \\CREATE INDEX IF NOT EXISTS idx_dav_emails_c ON dav_emails(contact_id);
             \\CREATE INDEX IF NOT EXISTS idx_dav_phones_c ON dav_phones(contact_id);
         );
+        const has_share_id = blk: {
+            var columns = try conn.prepare("SELECT 1 FROM pragma_table_info('dav_calendars') WHERE name='share_id'");
+            defer columns.finalize();
+            break :blk try columns.step();
+        };
+        if (!has_share_id) try conn.exec("ALTER TABLE dav_calendars ADD COLUMN share_id TEXT");
+        try conn.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_dav_calendar_share_id ON dav_calendars(share_id) WHERE share_id IS NOT NULL");
     }
 
     fn bindOptText(stmt: *database.Statement, idx: c_int, v: ?[]const u8) !void {
@@ -620,7 +630,7 @@ pub const CalDavStore = struct {
 
     fn persistCalendar(self: *Self, cal: Calendar) !void {
         const conn = if (self.conn) |*c| c else return;
-        var stmt = try conn.prepare("INSERT OR REPLACE INTO dav_calendars (id,user_id,name,description,color,timezone,created_at,modified_at,sync_token,ctag) VALUES (?,?,?,?,?,?,?,?,?,?)");
+        var stmt = try conn.prepare("INSERT OR REPLACE INTO dav_calendars (id,user_id,name,description,color,timezone,created_at,modified_at,sync_token,ctag,share_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)");
         defer stmt.finalize();
         try stmt.bindInt(1, @intCast(cal.id));
         try stmt.bindInt(2, @intCast(cal.user_id));
@@ -632,6 +642,7 @@ pub const CalDavStore = struct {
         try stmt.bindInt(8, cal.modified_at);
         try stmt.bindInt(9, @intCast(cal.sync_token));
         try stmt.bindText(10, cal.ctag);
+        try bindOptText(&stmt, 11, if (cal.share_id) |*value| value else null);
         _ = try stmt.step();
     }
 
@@ -774,10 +785,18 @@ pub const CalDavStore = struct {
         }
 
         {
-            var stmt = try conn.prepare("SELECT id,user_id,name,description,color,timezone,created_at,modified_at,sync_token,ctag FROM dav_calendars");
+            var stmt = try conn.prepare("SELECT id,user_id,name,description,color,timezone,created_at,modified_at,sync_token,ctag,share_id FROM dav_calendars");
             defer stmt.finalize();
             while (stmt.step() catch false) {
                 const id: u64 = @intCast(stmt.columnInt(0));
+                const share_id = if (stmt.columnIsNull(10)) null else blk: {
+                    const value = try stmt.columnText(10);
+                    if (value.len != @sizeOf(teams.CalendarShareId)) return error.InvalidCalendarShareId;
+                    for (value) |byte| {
+                        if (!std.ascii.isHex(byte) or std.ascii.isUpper(byte)) return error.InvalidCalendarShareId;
+                    }
+                    break :blk value[0..@sizeOf(teams.CalendarShareId)].*;
+                };
                 try self.calendars.put(id, .{
                     .id = id,
                     .user_id = @intCast(stmt.columnInt(1)),
@@ -789,6 +808,7 @@ pub const CalDavStore = struct {
                     .modified_at = stmt.columnInt(7),
                     .sync_token = @intCast(stmt.columnInt(8)),
                     .ctag = self.dupCol(&stmt, 9),
+                    .share_id = share_id,
                 });
                 self.bumpIds(id, @intCast(stmt.columnInt(8)), .calendar);
             }
@@ -812,6 +832,7 @@ pub const CalDavStore = struct {
                     .all_day = stmt.columnInt(8) != 0,
                     .rrule = rule,
                     .recurring = rule != null or icalendar.hasRecurrence(source),
+                    .shareable = publicCalendarResource(self.allocator, source),
                     .reminder_coverage = try reminder.coverage(self.allocator, source),
                     .organizer = self.dupColOpt(&stmt, 10),
                     .status = switch (stmt.columnInt(11)) {
@@ -1070,6 +1091,48 @@ pub const CalDavStore = struct {
         const owner = try self.getOrCreateUserIdLocked(username, mailbox_id);
         if (self.getCalendarByName(owner, name) != null or self.getAddressBookByName(owner, name) != null) return error.CalendarNameConflict;
         return self.createCalendarLocked(owner, name, null);
+    }
+
+    /// Sharing follows this particular calendar even when its numeric ID,
+    /// display name, or owner's address is reused or changes.
+    pub fn mailboxCalendarShareId(self: *Self, username: []const u8, id: u64, create: bool) !teams.CalendarShareId {
+        const mailbox_id = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const calendar = self.calendars.getPtr(id) orelse return error.CalendarNotFound;
+        if (self.findUserIdLocked(username, mailbox_id) != calendar.user_id) return error.CalendarNotFound;
+        if (calendar.share_id) |share_id| return share_id;
+        if (!create) return error.CalendarNotFound;
+
+        var random: [16]u8 = undefined;
+        io_compat.randomBytes(&random);
+        const share_id = std.fmt.bytesToHex(random, .lower);
+        // Updating the identifier does not change DAV collection revisions.
+        if (self.conn) |*conn| {
+            var stmt = try conn.prepare("UPDATE dav_calendars SET share_id=? WHERE id=?");
+            defer stmt.finalize();
+            try stmt.bindText(1, &share_id);
+            try stmt.bindInt(2, @intCast(id));
+            _ = try stmt.step();
+        }
+        calendar.share_id = share_id;
+        return share_id;
+    }
+
+    pub const SharedCalendar = struct { id: u64, name: []const u8 };
+
+    pub fn snapshotSharedCalendar(self: *Self, arena: Allocator, source_id: i64, share_id: teams.CalendarShareId) !?SharedCalendar {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const owner = self.findUserIdLocked("", source_id) orelse return null;
+        var calendars = self.calendars.valueIterator();
+        while (calendars.next()) |calendar| {
+            if (calendar.user_id != owner) continue;
+            const current = calendar.share_id orelse continue;
+            if (std.mem.eql(u8, &current, &share_id))
+                return .{ .id = calendar.id, .name = try arena.dupe(u8, calendar.name) };
+        }
+        return null;
     }
 
     pub fn setMailboxCalendarColor(self: *Self, username: []const u8, id: u64, color: ?[]const u8) !void {
@@ -1445,10 +1508,7 @@ pub const CalDavStore = struct {
     /// List owned events intersecting a half-open window, or search their
     /// stored fields. Recurring masters are returned as candidate series.
     pub fn queryMailboxEvents(self: *Self, arena: Allocator, username: []const u8, calendar_id: ?u64, window: ?CalendarWindow, query: []const u8, include_series: bool) ![]CalendarEventSummary {
-        const ascii = @import("ascii-compat");
-        if (window) |range| {
-            if (range.start >= range.end or @as(i128, range.end) - range.start > 366 * 86400) return error.InvalidRange;
-        } else if (query.len == 0) return error.InvalidRange;
+        try validateCalendarQuery(window, query);
         const mailbox_id = try self.activeMailboxId(username);
 
         self.mutex.lock();
@@ -1462,6 +1522,29 @@ pub const CalDavStore = struct {
             const calendar = self.calendars.get(id) orelse return error.CalendarNotFound;
             if (calendar.user_id != user_id) return error.CalendarNotFound;
         }
+        return self.queryCalendarEventsLocked(arena, user_id, calendar_id, window, query, include_series, .owner);
+    }
+
+    pub fn querySharedCalendarEvents(self: *Self, arena: Allocator, share: teams.CalendarShare, calendar_id: u64, window: ?CalendarWindow, query: []const u8, include_series: bool) ![]CalendarEventSummary {
+        try validateCalendarQuery(window, query);
+        if (share.access == .free_busy) return error.CalendarNotFound;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const owner = self.findUserIdLocked("", share.source_id) orelse return error.CalendarNotFound;
+        const calendar = self.calendars.get(calendar_id) orelse return error.CalendarNotFound;
+        const share_id = calendar.share_id orelse return error.CalendarNotFound;
+        if (calendar.user_id != owner or !std.mem.eql(u8, &share_id, &share.calendar_share_id)) return error.CalendarNotFound;
+        return self.queryCalendarEventsLocked(arena, owner, calendar_id, window, query, include_series, .shared);
+    }
+
+    fn validateCalendarQuery(window: ?CalendarWindow, query: []const u8) !void {
+        if (window) |range| {
+            if (range.start >= range.end or @as(i128, range.end) - range.start > 366 * 86400) return error.InvalidRange;
+        } else if (query.len == 0) return error.InvalidRange;
+    }
+
+    fn queryCalendarEventsLocked(self: *Self, arena: Allocator, user_id: u64, calendar_id: ?u64, window: ?CalendarWindow, query: []const u8, include_series: bool, visibility: enum { owner, shared }) ![]CalendarEventSummary {
+        const ascii = @import("ascii-compat");
         var result: std.ArrayList(CalendarEventSummary) = .empty;
         var source_bytes: usize = 0;
         var events = self.events.valueIterator();
@@ -1472,6 +1555,7 @@ pub const CalDavStore = struct {
                 const calendar = self.calendars.get(event.calendar_id) orelse continue;
                 if (calendar.user_id != user_id) continue;
             }
+            if (visibility == .shared and !event.shareable) continue;
             const recurring = event.recurring;
             if (window) |range| {
                 // A detached instance can be moved to either side of the master.
@@ -1499,6 +1583,27 @@ pub const CalDavStore = struct {
             }
         }.lessThan);
         return result.toOwnedSlice(arena);
+    }
+
+    fn publicCalendarResource(allocator: Allocator, source: []const u8) bool {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const components = icalendar.components(a, source) catch return false;
+        var found_event = false;
+        for (components) |component| {
+            if (std.ascii.eqlIgnoreCase(component.name, "VTIMEZONE")) continue;
+            if (!std.ascii.eqlIgnoreCase(component.name, "VEVENT")) return false;
+            found_event = true;
+            var properties = icalendar.Properties.init(component);
+            while (properties.next(a) catch return false) |property| {
+                // An exception may carry a different classification from
+                // its master. Never return a resource containing a private occurrence.
+                if (property.named("CLASS") and !std.ascii.eqlIgnoreCase(property.value, "PUBLIC"))
+                    return false;
+            }
+        }
+        return found_event;
     }
 
     fn summarizeEvent(arena: Allocator, event: Event) !CalendarEventSummary {
@@ -1597,6 +1702,7 @@ pub const CalDavStore = struct {
             .all_day = data.all_day,
             .rrule = own.rrule,
             .recurring = own.rrule != null or icalendar.hasRecurrence(own.ics_data),
+            .shareable = publicCalendarResource(self.allocator, own.ics_data),
             .reminder_coverage = try reminder.coverage(self.allocator, own.ics_data),
             .organizer = own.organizer,
             .status = data.status,
@@ -1780,6 +1886,7 @@ pub const CalDavStore = struct {
         event.all_day = data.all_day;
         event.rrule = own.rrule;
         event.recurring = own.rrule != null or icalendar.hasRecurrence(own.ics_data);
+        event.shareable = publicCalendarResource(self.allocator, own.ics_data);
         event.reminder_coverage = try reminder.coverage(self.allocator, own.ics_data);
         event.organizer = own.organizer;
         event.status = data.status;

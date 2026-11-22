@@ -29,6 +29,19 @@ pub const schema =
     \\    FOREIGN KEY(team_id,grantee_id) REFERENCES mail_team_members(team_id,user_id) ON DELETE CASCADE
     \\);
     \\CREATE INDEX IF NOT EXISTS mail_team_grants_grantee ON mail_team_grants(team_id,grantee_id);
+    \\CREATE TABLE IF NOT EXISTS mail_team_calendar_shares (
+    \\    team_id TEXT NOT NULL,
+    \\    source_id INTEGER NOT NULL,
+    \\    grantee_id INTEGER NOT NULL,
+    \\    calendar_share_id TEXT NOT NULL CHECK(length(calendar_share_id)=32),
+    \\    access TEXT NOT NULL CHECK(access IN ('free_busy','viewer','editor')),
+    \\    CHECK(source_id <> grantee_id),
+    \\    PRIMARY KEY(team_id,source_id,grantee_id,calendar_share_id),
+    \\    FOREIGN KEY(team_id,source_id) REFERENCES mail_team_members(team_id,user_id) ON DELETE CASCADE,
+    \\    FOREIGN KEY(team_id,grantee_id) REFERENCES mail_team_members(team_id,user_id) ON DELETE CASCADE
+    \\);
+    \\CREATE INDEX IF NOT EXISTS mail_team_calendar_grantee ON mail_team_calendar_shares(grantee_id);
+    \\CREATE INDEX IF NOT EXISTS mail_team_calendar_source ON mail_team_calendar_shares(source_id);
     \\CREATE TRIGGER IF NOT EXISTS mail_team_keep_owner_delete BEFORE DELETE ON mail_team_members
     \\WHEN OLD.role='owner' AND EXISTS(SELECT 1 FROM mail_teams WHERE id=OLD.team_id)
     \\AND NOT EXISTS(SELECT 1 FROM mail_team_members WHERE team_id=OLD.team_id AND user_id<>OLD.user_id AND role='owner')
@@ -45,6 +58,16 @@ pub const Actor = union(enum) { mailbox: []const u8, operator: []const u8 };
 pub const Team = struct { id: []const u8, name: []const u8, role: ?Role = null };
 pub const Member = struct { mailbox: []const u8, role: Role, enabled: bool };
 pub const Grant = struct { source: []const u8, grantee: []const u8, scope: Scope, resource: []const u8 = "" };
+pub const CalendarAccess = enum { free_busy, viewer, editor };
+pub const CalendarShareId = [32]u8;
+pub const CalendarShare = struct {
+    team: []const u8,
+    source_id: i64,
+    source: []const u8,
+    grantee: []const u8,
+    calendar_share_id: CalendarShareId,
+    access: CalendarAccess,
+};
 pub const SenderIdentity = struct { id: []const u8, address: []const u8 };
 pub const senderIdentityQuery =
     \\SELECT DISTINCT source.id, source.email FROM mail_team_grants g
@@ -195,16 +218,7 @@ pub fn setGrant(db: *database.Database, a: Allocator, actor: Actor, team: []cons
     defer tx.deinit();
     const principal = try access(tx, team, actor);
     if (!validGrant(grant)) return error.InvalidTeamData;
-    // A team administrator can revoke any grant. Granting access to someone
-    // else's resources requires the local operator or the resource owner.
-    if (actor == .mailbox and !std.mem.eql(u8, actor.mailbox, grant.source) and (allowed or principal.role == .member))
-        return error.TeamForbidden;
-    const source = (try identity(tx, grant.source)) orelse return error.TeamMemberNotFound;
-    const grantee = (try identity(tx, grant.grantee)) orelse return error.TeamMemberNotFound;
-    if (try memberRole(tx, team, source.id) == null or try memberRole(tx, team, grantee.id) == null)
-        return error.TeamMemberNotFound;
-    if (source.id == grantee.id) return error.InvalidTeamData;
-    if (allowed and (!source.enabled or !grantee.enabled)) return error.DisabledTeamAccount;
+    const source_id, const grantee_id = try authorizeGrant(tx, principal, actor, team, grant.source, grant.grantee, allowed);
     const sql = if (allowed)
         "INSERT INTO mail_team_grants(team_id,source_id,grantee_id,scope,resource) VALUES(?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING RETURNING 1"
     else
@@ -212,12 +226,83 @@ pub fn setGrant(db: *database.Database, a: Allocator, actor: Actor, team: []cons
     const changed = blk: {
         const stmt = try tx.prepare(sql);
         defer stmt.finalize();
-        try bind(stmt, .{ team, source.id, grantee.id, @tagName(grant.scope), grant.resource });
+        try bind(stmt, .{ team, source_id, grantee_id, @tagName(grant.scope), grant.resource });
         break :blk try stmt.step();
     };
     if (!changed) return;
     try audit(tx, a, actor, team, if (allowed) "team.grant" else "team.revoke", grant);
     try tx.commit();
+}
+
+fn authorizeGrant(tx: Tx, principal: Access, actor: Actor, team: []const u8, source_name: []const u8, grantee_name: []const u8, allowed: bool) !struct { i64, i64 } {
+    // A team administrator can revoke any grant. Granting access to someone
+    // else's resources requires the local operator or the resource owner.
+    if (actor == .mailbox and !std.mem.eql(u8, actor.mailbox, source_name) and (allowed or principal.role == .member))
+        return error.TeamForbidden;
+    const source = (try identity(tx, source_name)) orelse return error.TeamMemberNotFound;
+    const grantee = (try identity(tx, grantee_name)) orelse return error.TeamMemberNotFound;
+    if (try memberRole(tx, team, source.id) == null or try memberRole(tx, team, grantee.id) == null)
+        return error.TeamMemberNotFound;
+    if (source.id == grantee.id) return error.InvalidTeamData;
+    if (allowed and (!source.enabled or !grantee.enabled)) return error.DisabledTeamAccount;
+    return .{ source.id, grantee.id };
+}
+
+pub fn setCalendarShare(db: *database.Database, a: Allocator, owner: []const u8, team: []const u8, grantee: []const u8, share_id: CalendarShareId, policy: ?CalendarAccess) !void {
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const actor: Actor = .{ .mailbox = owner };
+    const principal = try access(tx, team, actor);
+    const source_id, const grantee_id = try authorizeGrant(tx, principal, actor, team, owner, grantee, policy != null);
+    const share_key: []const u8 = &share_id;
+    const changed = blk: {
+        const stmt = try tx.prepare(if (policy != null)
+            \\INSERT INTO mail_team_calendar_shares(team_id,source_id,grantee_id,calendar_share_id,access) VALUES(?1,?2,?3,?4,?5)
+            \\ON CONFLICT(team_id,source_id,grantee_id,calendar_share_id) DO UPDATE SET access=excluded.access
+            \\WHERE access<>excluded.access RETURNING 1
+        else
+            "DELETE FROM mail_team_calendar_shares WHERE team_id=?1 AND source_id=?2 AND grantee_id=?3 AND calendar_share_id=?4 RETURNING 1");
+        defer stmt.finalize();
+        try bind(stmt, .{ team, source_id, grantee_id, share_key });
+        if (policy) |role| try stmt.bind(5, @tagName(role));
+        break :blk try stmt.step();
+    };
+    if (!changed) return;
+    try audit(tx, a, actor, team, if (policy != null) "team.calendar.share" else "team.calendar.revoke", .{
+        .grantee = grantee,
+        .calendarShareId = share_key,
+        .access = policy,
+    });
+    try tx.commit();
+}
+
+pub fn calendarShares(db: *database.Database, a: Allocator, mailbox: []const u8) ![]CalendarShare {
+    var tx = try db.beginTransaction(.read);
+    defer tx.deinit();
+    const principal = (try identity(tx, mailbox)) orelse return &.{};
+    if (!principal.enabled) return &.{};
+    const stmt = try tx.prepare(
+        \\SELECT p.team_id,p.source_id,s.username,g.username,p.calendar_share_id,p.access
+        \\FROM mail_team_calendar_shares p JOIN users s ON s.id=p.source_id JOIN users g ON g.id=p.grantee_id
+        \\WHERE (p.source_id=?1 OR p.grantee_id=?1) AND s.enabled=1 AND g.enabled=1
+        \\ORDER BY s.username,g.username,p.team_id,p.calendar_share_id
+    );
+    defer stmt.finalize();
+    try stmt.bind(1, principal.id);
+    var rows: std.ArrayList(CalendarShare) = .empty;
+    while (try stmt.step()) {
+        const share_id = stmt.columnText(4);
+        if (share_id.len != @sizeOf(CalendarShareId)) return error.InvalidTeamData;
+        try rows.append(a, .{
+            .team = try a.dupe(u8, stmt.columnText(0)),
+            .source_id = stmt.columnInt64(1),
+            .source = try a.dupe(u8, stmt.columnText(2)),
+            .grantee = try a.dupe(u8, stmt.columnText(3)),
+            .calendar_share_id = share_id[0..@sizeOf(CalendarShareId)].*,
+            .access = std.meta.stringToEnum(CalendarAccess, stmt.columnText(5)) orelse return error.InvalidTeamData,
+        });
+    }
+    return rows.toOwnedSlice(a);
 }
 
 pub fn list(db: *database.Database, a: Allocator, mailbox: []const u8) ![]Team {
