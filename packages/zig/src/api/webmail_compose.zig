@@ -50,6 +50,9 @@ pub const Attachment = struct {
     content_type: []const u8,
     /// Raw (already-decoded) bytes of the attachment.
     data: []const u8,
+    mime_id: ?[32]u8 = null,
+    content_id: []const u8 = "",
+    inline_part: bool = false,
 };
 
 pub const Message = struct {
@@ -307,8 +310,15 @@ pub fn buildMime(allocator: std.mem.Allocator, msg: Message, ts: i64, msgid: []c
             try w.print("--{s}\r\n", .{boundary});
             try w.print("Content-Type: {s}\r\n", .{att.content_type});
             try w.writeAll("Content-Transfer-Encoding: base64\r\n");
+            if (msg.include_bcc) {
+                if (att.mime_id) |mime_id| try w.print("X-Mail-Ews-Attachment-Id: {s}\r\n", .{mime_id});
+            }
+            if (att.content_id.len > 0) {
+                if (!isSafeHeaderValue(att.content_id)) return ComposeError.InvalidHeader;
+                try w.print("Content-ID: <{s}>\r\n", .{att.content_id});
+            }
             // Quote/backslash in a filename must not terminate its parameter.
-            try w.writeAll("Content-Disposition: attachment; filename=\"");
+            try w.print("Content-Disposition: {s}; filename=\"", .{if (att.inline_part) "inline" else "attachment"});
             for (att.filename) |c| {
                 if (c == '"' or c == '\\') try w.writeAll("\\");
                 try out.append(allocator, c);

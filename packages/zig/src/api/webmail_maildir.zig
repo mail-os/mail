@@ -1445,6 +1445,10 @@ fn getHeader(allocator: std.mem.Allocator, header_block: []const u8, name: []con
     return "";
 }
 
+pub fn mimeHeader(a: std.mem.Allocator, raw: []const u8, name: []const u8) ![]const u8 {
+    return getHeader(a, raw[0..headerEnd(raw)], name);
+}
+
 fn parseHeaders(allocator: std.mem.Allocator, raw: []const u8) !HeaderSet {
     const he = headerEnd(raw);
     const block = raw[0..he];
@@ -1554,6 +1558,18 @@ fn parseMultipartMode(allocator: std.mem.Allocator, ctype: []const u8, body: []c
 }
 
 const AttachmentName = struct { filename: []const u8, id: []const u8 };
+
+/// Read one already-framed MIME entity using the same file conventions as webmail.
+pub fn inspectAttachment(a: std.mem.Allocator, raw: []const u8, include_data: bool) !?AttachmentInfo {
+    const end = headerEnd(raw);
+    const headers = raw[0..end];
+    const mime = try getHeader(a, headers, "Content-Type");
+    const name = (try attachmentName(a, headers, mime)) orelse return null;
+    const encoding = try getHeader(a, headers, "Content-Transfer-Encoding");
+    var info = try readAttachment(a, raw[end..], mime, encoding, name, if (include_data) .full else .metadata);
+    info.content_id = contentId(try getHeader(a, headers, "Content-ID"));
+    return info;
+}
 
 fn attachmentName(a: std.mem.Allocator, headers: []const u8, mime: []const u8) !?AttachmentName {
     const disposition = try getHeader(a, headers, "Content-Disposition");

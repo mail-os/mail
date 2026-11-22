@@ -5,6 +5,7 @@ const file_attachments = @import("attachments.zig");
 const metadata = @import("../../message/attachment_metadata.zig");
 const webmail_maildir = @import("../../api/webmail_maildir.zig");
 const webmail_store = @import("../../api/webmail_store.zig");
+const webmail_service = @import("../../api/webmail_service.zig");
 const logger = @import("../../core/logger.zig");
 // NOTE: for a future standalone `zig-ews`, reach the mailbox/store through a
 // callback interface on Context instead of importing these directly.
@@ -51,6 +52,7 @@ pub const Context = struct {
     ses_region: []const u8 = "us-east-1",
     mail_config: ?*const config.Config = null,
     scanner: ?*clamav.ClamAVScanner = null,
+    draft_service: ?*webmail_service.Service = null,
 };
 
 pub const Response = struct {
@@ -130,8 +132,8 @@ pub fn handleSoap(ctx: *Context, soap: []const u8) !Response {
     if (std.mem.eql(u8, op, "GetItem")) return getItem(ctx, soap);
     if (std.mem.eql(u8, op, "CreateItem")) return createItem(ctx, soap);
     if (std.mem.eql(u8, op, "CreateAttachment")) return createAttachment(ctx, soap);
-    if (std.mem.eql(u8, op, "GetAttachment")) return mailResult(ctx, ctx.allocator, "GetAttachment", error.UnsupportedOperation);
-    if (std.mem.eql(u8, op, "DeleteAttachment")) return mailResult(ctx, ctx.allocator, "DeleteAttachment", error.UnsupportedOperation);
+    if (std.mem.eql(u8, op, "GetAttachment")) return attachmentOperation(ctx, soap, "GetAttachment");
+    if (std.mem.eql(u8, op, "DeleteAttachment")) return attachmentOperation(ctx, soap, "DeleteAttachment");
     if (std.mem.eql(u8, op, "SendItem")) return sendItem(ctx, soap);
     if (std.mem.eql(u8, op, "DeleteItem")) return deleteItem(ctx, soap);
     if (std.mem.eql(u8, op, "FindFolder")) return findFolder(ctx, soap);
@@ -453,9 +455,10 @@ fn appendItemMessage(buf: *std.ArrayList(u8), aa: std.mem.Allocator, ctx: *Conte
     // lets macOS render the real MIME (HTML parts, attachments) itself.
     const mime_b64 = aa.alloc(u8, std.base64.standard.Encoder.calcSize(raw.len)) catch return error.NotFound;
     _ = std.base64.standard.Encoder.encode(mime_b64, raw);
+    const parts = file_attachments.list(aa, raw) catch &.{};
 
     // Element order follows the EWS Item/Message xs:sequence (macOS parses it
-    // strictly): MimeContent, ItemId, ItemClass, Subject, Body, DateTimeReceived,
+    // strictly): MimeContent, ItemId, ItemClass, Subject, Body, Attachments, DateTimeReceived,
     // Size, DateTimeSent, then the Message-specific ToRecipients, From, IsRead.
     try buf.appendSlice(a, "<m:GetItemResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode><m:Items><t:Message>");
     try buf.print(a, "<t:MimeContent CharacterSet=\"UTF-8\">{s}</t:MimeContent>", .{mime_b64});
@@ -463,11 +466,14 @@ fn appendItemMessage(buf: *std.ArrayList(u8), aa: std.mem.Allocator, ctx: *Conte
     try buf.appendSlice(a, "<t:ItemClass>IPM.Note</t:ItemClass>");
     try buf.print(a, "<t:Subject>{s}</t:Subject>", .{subject});
     try buf.print(a, "<t:Body BodyType=\"Text\">{s}</t:Body>", .{xmlEscape(aa, body)});
+    if (parts.len > 0) {
+        try buf.appendSlice(a, "<t:Attachments>");
+        for (parts) |part| try appendFileAttachment(a, aa, buf, ctx, id, part, null);
+        try buf.appendSlice(a, "</t:Attachments>");
+    }
     try buf.print(a, "<t:DateTimeReceived>{s}</t:DateTimeReceived>", .{date});
     try buf.print(a, "<t:Size>{d}</t:Size>", .{raw.len});
-    const content_type = headerValue(aa, headers, "Content-Type") orelse "";
-    const media_type = std.mem.trimEnd(u8, content_type[0 .. std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len], " \t");
-    try buf.print(a, "<t:HasAttachments>{s}</t:HasAttachments>", .{if (std.ascii.eqlIgnoreCase(media_type, "multipart/mixed")) "true" else "false"});
+    try buf.print(a, "<t:HasAttachments>{s}</t:HasAttachments>", .{if (parts.len > 0) "true" else "false"});
     try buf.print(a, "<t:DateTimeSent>{s}</t:DateTimeSent>", .{date});
     if (to.email.len > 0) {
         try buf.print(a, "<t:ToRecipients><t:Mailbox><t:Name>{s}</t:Name><t:EmailAddress>{s}</t:EmailAddress></t:Mailbox></t:ToRecipients>", .{ xmlEscape(aa, to.name), xmlEscape(aa, to.email) });
@@ -627,6 +633,13 @@ fn mailboxDirs(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8) ![][]co
         try std.fmt.allocPrint(a, "{s}/cur", .{base}),
     };
     if (ctx.hosted) return a.dupe([]const u8, &.{ base, nested[0], nested[1] });
+    // Webmail drafts use the canonical account even when native EWS still
+    // writes its own legacy drafts under the account's local part.
+    if (std.mem.eql(u8, mailbox, "Drafts") and !std.mem.eql(u8, ctx.username, ctx.local_part)) {
+        try maildir_path.validate(ctx.username);
+        const canonical = try std.fmt.allocPrint(a, "mail/{s}/Drafts", .{ctx.username});
+        return a.dupe([]const u8, &.{ canonical, nested[0], nested[1] });
+    }
     return a.dupe([]const u8, &nested);
 }
 
@@ -779,21 +792,34 @@ fn ewsDate(a: std.mem.Allocator, epoch: i64) []const u8 {
     }) catch "1970-01-01T00:00:00Z";
 }
 
-/// Escape text for XML and strip characters illegal in XML 1.0 (control chars),
-/// so raw MIME bodies can't corrupt the SOAP response (which macOS parses strictly).
+/// Escape XML text and replace invalid UTF-8 from legacy MIME headers and bodies.
 fn xmlEscape(a: std.mem.Allocator, s: []const u8) []const u8 {
     var buf = std.ArrayList(u8).empty;
-    for (s) |c| {
-        switch (c) {
+    var index: usize = 0;
+    while (index < s.len) {
+        switch (s[index]) {
             '&' => buf.appendSlice(a, "&amp;") catch {},
             '<' => buf.appendSlice(a, "&lt;") catch {},
             '>' => buf.appendSlice(a, "&gt;") catch {},
             '"' => buf.appendSlice(a, "&quot;") catch {},
             '\'' => buf.appendSlice(a, "&apos;") catch {},
-            '\t', '\n', '\r' => buf.append(a, c) catch {},
+            '\t', '\n', '\r' => buf.append(a, s[index]) catch {},
             0...8, 11, 12, 14...31 => {}, // illegal in XML 1.0 — drop
-            else => buf.append(a, c) catch {},
+            0x80...0xff => {
+                const len = std.unicode.utf8ByteSequenceLength(s[index]) catch 0;
+                if (len != 0 and len <= s.len - index) {
+                    const bytes = s[index..][0..len];
+                    if (std.unicode.utf8Decode(bytes)) |codepoint| {
+                        if (codepoint != 0xfffe and codepoint != 0xffff) buf.appendSlice(a, bytes) catch {};
+                        index += len;
+                        continue;
+                    } else |_| {}
+                }
+                buf.appendSlice(a, "\u{FFFD}") catch {};
+            },
+            else => buf.append(a, s[index]) catch {},
         }
+        index += 1;
     }
     return buf.items;
 }
@@ -987,7 +1013,7 @@ fn appendMailResult(a: std.mem.Allocator, buf: *std.ArrayList(u8), comptime op: 
     if (err) |failure| {
         const code, const message = switch (failure) {
             error.HostedSendingLimit => .{ "ErrorSubmissionQuotaExceeded", "Daily recipient allowance exhausted. Try again after midnight UTC." },
-            error.HostedStorageFull => .{ "ErrorQuotaExceeded", "Mailbox storage is full." },
+            error.HostedStorageFull, error.StorageLimit, error.DraftStorageLimit => .{ "ErrorQuotaExceeded", "Mailbox storage is full." },
             error.HostedRecipientDisabled, error.HostedSenderDisabled => .{ "ErrorAccessDenied", "Mailbox is disabled." },
             error.NoRecipients => .{ "ErrorMissingRecipients", "At least one recipient is required." },
             error.InvalidAddress => .{ "ErrorInvalidRecipients", "Check the recipient addresses." },
@@ -997,13 +1023,13 @@ fn appendMailResult(a: std.mem.Allocator, buf: *std.ArrayList(u8), comptime op: 
             error.InvalidBase64 => .{ "ErrorInvalidPropertyValue", "Attachment content must be valid base64." },
             error.InvalidMimeBase64 => .{ "ErrorMimeContentInvalidBase64String", "MIME content must be valid base64." },
             error.InvalidAttachment => .{ "ErrorInvalidPropertyValue", "Check the file attachment name, media type, and content." },
+            error.InvalidAttachmentId => .{ "ErrorInvalidAttachmentId", "The attachment could not be found." },
             error.UnsupportedAttachment => .{ "ErrorInvalidOperation", "This operation supports file attachments on mail drafts." },
-            error.UnsupportedOperation => .{ "ErrorInvalidOperation", "This attachment operation is unavailable." },
             error.ManagedDraft => .{ "ErrorInvalidOperation", "Open this webmail draft in webmail to change its attachments." },
             error.UnsupportedItem => .{ "ErrorInvalidOperation", "Only email messages are supported in a batch." },
-            error.StaleDraft => .{ "ErrorIrresolvableConflict", "The draft changed. Retrieve its current change key and retry." },
+            error.StaleDraft, error.Conflict => .{ "ErrorIrresolvableConflict", "The draft changed or is queued for sending. Retrieve its current change key and retry." },
             error.MalwareDetected => .{ "ErrorVirusDetected", "The malware scanner rejected this message or attachment." },
-            error.MessageTooLarge, error.MalwareScanTooLarge => .{ "ErrorMessageSizeExceeded", "The message or attachment exceeds the allowed size." },
+            error.MessageTooLarge, error.MalwareScanTooLarge, error.AttachmentLimit => .{ "ErrorMessageSizeExceeded", "The message or attachment exceeds the allowed size." },
             error.MalwareScanUnavailable => .{ "ErrorServerBusy", "The malware scanner is temporarily unavailable. Retry the operation." },
             else => .{ "ErrorInternalServerError", "The message could not be processed." },
         };
@@ -1223,6 +1249,116 @@ fn createAttachment(ctx: *Context, soap: []const u8) !Response {
     return addAttachmentsToDraft(a, ctx, soap) catch |err| return mailResult(ctx, a, "CreateAttachment", err);
 }
 
+fn attachmentScope(ctx: *const Context) [32]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(ctx.username, &digest, .{});
+    return std.fmt.bytesToHex(digest[0..16].*, .lower);
+}
+
+fn appendFileAttachment(a: std.mem.Allocator, scratch: std.mem.Allocator, buf: *std.ArrayList(u8), ctx: *Context, item: []const u8, part: file_attachments.Part, content: ?[]const u8) !void {
+    try buf.print(a, "<t:FileAttachment><t:AttachmentId Id=\"{s}:{s}:{s}\"/>", .{ attachmentScope(ctx), xmlEscape(scratch, item), part.id });
+    try buf.print(a, "<t:Name>{s}</t:Name><t:ContentType>{s}</t:ContentType>", .{ xmlEscape(scratch, part.info.filename), xmlEscape(scratch, part.info.content_type) });
+    if (part.info.content_id.len > 0)
+        try buf.print(a, "<t:ContentId>{s}</t:ContentId>", .{xmlEscape(scratch, part.info.content_id)});
+    try buf.print(a, "<t:Size>{d}</t:Size><t:IsInline>{s}</t:IsInline>", .{ part.info.size, if (part.inline_part) "true" else "false" });
+    if (content) |bytes| {
+        const encoder = std.base64.standard.Encoder;
+        try buf.appendSlice(a, "<t:Content>");
+        _ = encoder.encode(try buf.addManyAsSlice(a, encoder.calcSize(bytes.len)), bytes);
+        try buf.appendSlice(a, "</t:Content>");
+    }
+    try buf.appendSlice(a, "</t:FileAttachment>");
+}
+
+fn attachmentOperation(ctx: *Context, soap: []const u8, comptime op: []const u8) !Response {
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const request = xml.operation(soap, op) catch |err| return mailResult(ctx, a, op, err);
+    const ids = (try request.child("AttachmentIds")) orelse return mailResult(ctx, a, op, error.InvalidXml);
+    var count: usize = 0;
+    var elements = ids.children();
+    while (try elements.next()) |_| {
+        count += 1;
+        if (count > 100) return mailResult(ctx, a, op, error.InvalidXml);
+    }
+    if (count == 0) return mailResult(ctx, a, op, error.InvalidXml);
+    var buf: std.ArrayList(u8) = .empty;
+    var remaining = maxMailBytes(ctx);
+    try buf.appendSlice(a, "<m:" ++ op ++ "Response><m:ResponseMessages>");
+    elements = ids.children();
+    while (try elements.next()) |element| {
+        var item_arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer item_arena.deinit();
+        const start = buf.items.len;
+        appendAttachmentResult(a, item_arena.allocator(), &buf, &remaining, ctx, element, op) catch |err| {
+            buf.shrinkRetainingCapacity(start);
+            try appendMailResult(a, &buf, op, err);
+        };
+    }
+    try buf.appendSlice(a, "</m:ResponseMessages></m:" ++ op ++ "Response>");
+    return .{ .body = try envelope(ctx.allocator, buf.items) };
+}
+
+fn appendAttachmentResult(a: std.mem.Allocator, scratch: std.mem.Allocator, buf: *std.ArrayList(u8), remaining: *usize, ctx: *Context, element: xml.Element, comptime op: []const u8) !void {
+    if (!std.mem.eql(u8, element.name, "AttachmentId")) return error.InvalidAttachmentId;
+    const id = try xmlUnescape(scratch, element.attribute("Id") orelse return error.InvalidAttachmentId);
+    const scope = attachmentScope(ctx);
+    if (id.len <= scope.len or id[scope.len] != ':' or !std.mem.eql(u8, id[0..scope.len], &scope))
+        return error.InvalidAttachmentId;
+    const root_end = std.mem.lastIndexOfScalar(u8, id, ':') orelse unreachable;
+    if (root_end <= scope.len or !file_attachments.isId(id[root_end + 1 ..])) return error.InvalidAttachmentId;
+    const item = id[scope.len + 1 .. root_end];
+    const folder_end = std.mem.indexOfScalar(u8, item, ':') orelse return error.InvalidAttachmentId;
+    const folder = folderById(item[0..folder_end]) orelse return error.InvalidAttachmentId;
+    const mailbox = folder.mailbox orelse return error.UnsupportedAttachment;
+    const basename = item[folder_end + 1 ..];
+    const found = readMailFile(scratch, ctx, mailbox, basename) orelse return error.InvalidAttachmentId;
+    const parts = try file_attachments.list(scratch, found.content);
+    const index = for (parts, 0..) |part, index| {
+        if (std.mem.eql(u8, &part.id, id[root_end + 1 ..])) break index;
+    } else return error.InvalidAttachmentId;
+
+    if (comptime std.mem.eql(u8, op, "GetAttachment")) {
+        const part = parts[index];
+        if (part.info.size > remaining.*) return error.MessageTooLarge;
+        const content = try part.readData(scratch, found.content);
+        if (content.len > remaining.*) return error.MessageTooLarge;
+        try buf.appendSlice(a, "<m:GetAttachmentResponseMessage ResponseClass=\"Success\"><m:ResponseCode>NoError</m:ResponseCode><m:Attachments>");
+        try appendFileAttachment(a, scratch, buf, ctx, item, part, content);
+        try buf.appendSlice(a, "</m:Attachments></m:GetAttachmentResponseMessage>");
+        remaining.* -= content.len;
+    } else {
+        if (!std.mem.eql(u8, folder.id, "drafts")) return error.UnsupportedAttachment;
+        if (element.attribute("RootItemChangeKey")) |key| {
+            if (!std.mem.eql(u8, key, &changeKey(found.content))) return error.StaleDraft;
+        }
+        const updated = try file_attachments.remove(scratch, found.content, parts, index);
+        const part = parts[index];
+        try replaceDraftAttachments(scratch, ctx, basename, found, updated, .{ .remove = .{
+            .index = index,
+            .count = parts.len,
+            .filename = part.info.filename,
+            .content_type = part.info.content_type,
+            .data = try part.readData(scratch, found.content),
+        } });
+        try buf.print(a,
+            \\<m:DeleteAttachmentResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:RootItemId RootItemId="{s}" RootItemChangeKey="{s}"/></m:DeleteAttachmentResponseMessage>
+        , .{ xmlEscape(scratch, item), changeKey(updated) });
+    }
+}
+
+fn replaceDraftAttachments(a: std.mem.Allocator, ctx: *Context, filename: []const u8, previous: FoundMail, updated: []const u8, edit: webmail_service.DraftAttachmentEdit) !void {
+    try scanMail(ctx, updated);
+    if (ctx.draft_service) |service| return service.editDraftAttachments(a, ctx.username, previous.path, previous.content, updated, edit);
+    ctx.db.lockMailboxes();
+    defer ctx.db.unlockMailboxes();
+    const current = readMailFile(a, ctx, "Drafts", filename) orelse return error.ItemNotFound;
+    if (!std.mem.eql(u8, current.content, previous.content)) return error.StaleDraft;
+    if (try webmail_store.managesDraftFile(ctx.db, ctx.username, filename)) return error.ManagedDraft;
+    try webmail_maildir.replaceDraftFile(a, ctx.db, ctx.username, current.path, updated);
+}
+
 fn addAttachmentsToDraft(a: std.mem.Allocator, ctx: *Context, soap: []const u8) !Response {
     const request = try xml.operation(soap, "CreateAttachment");
     const parent = (try request.child("ParentItemId")) orelse return error.InvalidXml;
@@ -1238,25 +1374,26 @@ fn addAttachmentsToDraft(a: std.mem.Allocator, ctx: *Context, soap: []const u8) 
     const files = try parseFiles(a, ctx, container);
     if (files.len == 0) return error.InvalidAttachment;
     const updated = try addFiles(a, ctx, draft.content, files);
-    try scanMail(ctx, updated);
-
-    {
-        ctx.db.lockMailboxes();
-        defer ctx.db.unlockMailboxes();
-        const current = readMailFile(a, ctx, "Drafts", filename) orelse return error.ItemNotFound;
-        if (!std.mem.eql(u8, current.content, draft.content)) return error.StaleDraft;
-        if (try webmail_store.managesDraftFile(ctx.db, ctx.username, filename)) return error.ManagedDraft;
-        try webmail_maildir.replaceDraftFile(a, ctx.db, ctx.username, current.path, updated);
-    }
+    const uploads = try a.alloc(webmail_store.Upload, files.len);
+    for (files, uploads) |*file, *upload| upload.* = .{
+        .id = &file.id,
+        .filename = file.name,
+        .content_type = file.content_type,
+        .data = file.data,
+        .content_id = file.content_id orelse "",
+        .inline_part = file.inline_part,
+    };
+    try replaceDraftAttachments(a, ctx, filename, draft, updated, .{ .add = uploads });
 
     const item = xmlEscape(a, item_id);
+    const scope = attachmentScope(ctx);
     const updated_key = changeKey(updated);
     var buf: std.ArrayList(u8) = .empty;
     try buf.appendSlice(a, "<m:CreateAttachmentResponse><m:ResponseMessages>");
     for (files) |file| {
         try buf.print(a,
-            \\<m:CreateAttachmentResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Attachments><t:FileAttachment><t:AttachmentId Id="{s}:{s}" RootItemId="{s}" RootItemChangeKey="{s}"/></t:FileAttachment></m:Attachments></m:CreateAttachmentResponseMessage>
-        , .{ item, file.id, item, updated_key });
+            \\<m:CreateAttachmentResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:Attachments><t:FileAttachment><t:AttachmentId Id="{s}:{s}:{s}" RootItemId="{s}" RootItemChangeKey="{s}"/></t:FileAttachment></m:Attachments></m:CreateAttachmentResponseMessage>
+        , .{ scope, item, file.id, item, updated_key });
     }
     try buf.appendSlice(a, "</m:ResponseMessages></m:CreateAttachmentResponse>");
     return .{ .body = try envelope(ctx.allocator, buf.items) };

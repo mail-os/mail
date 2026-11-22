@@ -82,7 +82,7 @@ def check_uploads(test, db):
     assert db.execute("SELECT SUM(size) FROM webmail_uploads WHERE username=?", (user,)).fetchone() == (MIB,)
     assert test.bytes(user) == 0
     with db:
-        db.executemany("INSERT INTO webmail_uploads VALUES (?,?, 'empty.bin','application/octet-stream',X'',0,?)",
+        db.executemany("INSERT INTO webmail_uploads(username,id,filename,content_type,data,size,expires_at) VALUES (?,?, 'empty.bin','application/octet-stream',X'',0,?)",
                        ((user, secrets.token_hex(16), int(time.time()) + 1000) for _ in range(124)))
     limited(upload(test, session, secrets.token_hex(16), b""), "staging_limit")
     ok(test.api(session, f"uploads/{accepted}", method="DELETE"))

@@ -83,6 +83,7 @@ jobs:
         python3 ../../scripts/test-webmail-junk.py zig-out/bin/mail
         python3 ../../scripts/test-dav-ownership.py
         python3 ../../scripts/test-dav-https.py zig-out/bin/mail
+        python3 ../../scripts/test-ews-attachment-lifecycle.py zig-out/bin/mail
 
     - name: Verify hosted storage and sending limits
       run: |

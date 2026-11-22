@@ -1146,8 +1146,10 @@ webmail sessions and password reset tokens.
   delivery or filing Sent. Malware, excessive scan size, and a fail-closed
   scanner outage return `ErrorVirusDetected`, `ErrorMessageSizeExceeded`, and
   `ErrorServerBusy` respectively, before charging the sending allowance.
-  EWS can append files to mail drafts. Change attachments on revisioned webmail
-  drafts in webmail so the draft document stays in sync with the MIME.
+  GetItem lists file attachment IDs and GetAttachment returns their bytes.
+  CreateAttachment and DeleteAttachment update saved mail drafts and advance
+  the webmail draft revision when one exists. Edits to drafts queued in Outbox
+  return `ErrorIrresolvableConflict` while the queued copy is active.
 - ActiveSync SendMail, SmartReply, and SmartForward use the authenticated
   mailbox for From and the quota.
   It checks a requested Sent copy before delivery and leaves Bcc out of

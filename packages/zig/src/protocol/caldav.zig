@@ -95,6 +95,7 @@ pub const CalDavConfig = struct {
     delivery_method: core_config.DeliveryMethod = .direct,
     mail_config: ?*const core_config.Config = null,
     scanner: ?*clamav.ClamAVScanner = null,
+    draft_service: ?*@import("../api/webmail_service.zig").Service = null,
     ses_region: []const u8 = "us-east-1",
 };
 
@@ -1764,6 +1765,7 @@ fn webEws(allocator: std.mem.Allocator, config: *const CalDavConfig, username: ?
         .delivery_method = config.delivery_method,
         .ses_region = config.ses_region,
         .scanner = config.scanner,
+        .draft_service = config.draft_service,
         .mail_config = config.mail_config,
     };
     const resp = try ews.handleSoap(&ctx, httpBody(request));

@@ -134,15 +134,17 @@ def verify_enabled(test, owner, sink, blind, infected_id):
     assert wire["From"] == owner and files == [("intake.txt", CLEAN)]
     assert test.count(owner) == 3
 
-    # EWS must not replace the MIME underneath a revisioned webmail draft.
+    # A rejected EWS edit must leave the webmail revision and MIME untouched.
     session = test.login(owner)
     status, draft = test.api(session, "drafts", {"draftId": secrets.token_hex(16), "subject": "Webmail-owned scan test", "to": [sink]})
     assert status == 200, draft
     saved, = (test.directory / "mail" / owner / "Drafts").glob("*.eml:2,DS")
     webmail_file = saved.read_bytes()
     webmail_item = {"Id": "drafts:" + saved.name.split(":2,", 1)[0], "ChangeKey": "ck0"}
-    check(test, owner, attach(webmail_item, second), "ErrorInvalidOperation")
+    check(test, owner, attach(webmail_item, infected), VIRUS)
     assert saved.read_bytes() == webmail_file
+    status, loaded = test.api(session, f"drafts?uid={draft['uid']}")
+    assert status == 200 and loaded["revision"] == draft["revision"] and not loaded["message"]["attachments"], loaded
     return key
 
 

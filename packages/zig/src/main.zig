@@ -691,6 +691,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
 
         const caldav_config = caldav.CalDavConfig{
             .scanner = scanner,
+            .draft_service = if (webmail_server) |*ws| &ws.service else null,
             .port = caldav_port,
             .ssl_port = caldav_ssl_port,
             // Same reason as IMAP above: honour the interface the server was

@@ -1564,7 +1564,7 @@ fn handleDraftGet(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: 
     var sess = (try requireSession(server, conn, arena, req)) orelse return;
     defer sess.deinit(server.allocator);
     const uid = @as(i64, @intCast(parseUintParam(req, arena, "uid", 0)));
-    const row = store.findDraft(arena, server.db, sess.username, req.queryParam(arena, "folder") orelse "Drafts", uid) catch |err| return mapServiceError(conn, arena, err);
+    const row = server.service.loadDraft(arena, sess.username, req.queryParam(arena, "folder") orelse "Drafts", uid) catch |err| return mapServiceError(conn, arena, err);
     const parsed = try std.json.parseFromSlice(service_mod.Draft, arena, row.payload, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .draftId = row.id, .revision = row.revision, .state = row.state, .uid = parsed.value.uid, .message = parsed.value.message }), null);

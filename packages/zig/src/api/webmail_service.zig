@@ -7,6 +7,7 @@ const clamav = @import("../antispam/clamav.zig");
 const database = @import("../storage/database.zig");
 const auth_mod = @import("../auth/auth.zig");
 const core_config = @import("../core/config.zig");
+const fs = @import("../core/fs_compat.zig");
 const time = @import("../core/time_compat.zig");
 const mutex = @import("../core/mutex_compat.zig");
 const maildir = @import("webmail_maildir.zig");
@@ -55,6 +56,10 @@ pub const Payload = struct {
     } = &.{},
 };
 pub const Draft = struct { uid: i64, folder: []const u8 = "Drafts", message: Payload };
+pub const DraftAttachmentEdit = union(enum) {
+    add: []const store.Upload,
+    remove: struct { index: usize, count: usize, filename: []const u8, content_type: []const u8, data: []const u8 },
+};
 pub const DraftAck = struct { ok: bool = true, uid: i64, draftId: []const u8, revision: i64 };
 pub const MessageRef = struct { uid: i64, folder: []const u8, reference: ?[]const u8 = null, revision: ?[]const u8 = null };
 pub const BulkAction = enum { move, trash, read, unread, flag, unflag, purge, delete, junk, not_junk };
@@ -109,7 +114,9 @@ pub const Service = struct {
 
     pub fn init(db: *database.Database, auth: *auth_mod.AuthBackend, config: Config) !Service {
         try store.initSchema(db);
-        return .{ .db = db, .auth = auth, .config = config };
+        var service: Service = .{ .db = db, .auth = auth, .config = config };
+        try service.recoverDraftEdits();
+        return service;
     }
 
     pub fn limits(self: *Service, user: []const u8) !Limits {
@@ -194,19 +201,11 @@ pub const Service = struct {
         var attachments: std.ArrayList(compose.Attachment) = .empty;
         var total: usize = 0;
         for (payload.attachments) |attachment| {
-            var name = attachment.filename;
-            var content_type = attachment.contentType;
-            const bytes = if (attachment.uploadId) |id| blk: {
-                if (!store.validId(id)) return ServiceError.InvalidAttachment;
-                const upload = try store.getUpload(a, self.db, user, id);
-                name = upload.filename;
-                content_type = upload.content_type;
-                break :blk upload.data;
-            } else try decodeInlineAttachment(a, attachment.data, allowed.maxFileBytes);
-            if (!validFilename(name) or !validContentType(content_type)) return ServiceError.InvalidAttachment;
-            total = std.math.add(usize, total, bytes.len) catch return ServiceError.AttachmentLimit;
-            if (bytes.len > allowed.maxFileBytes or total > allowed.maxTotalBytes) return ServiceError.AttachmentLimit;
-            try attachments.append(a, .{ .filename = name, .content_type = content_type, .data = bytes });
+            const file = try self.resolveAttachment(a, user, attachment, allowed.maxFileBytes);
+            if (!validFilename(file.filename) or !validContentType(file.content_type)) return ServiceError.InvalidAttachment;
+            total = std.math.add(usize, total, file.data.len) catch return ServiceError.AttachmentLimit;
+            if (file.data.len > allowed.maxFileBytes or total > allowed.maxTotalBytes) return ServiceError.AttachmentLimit;
+            try attachments.append(a, file);
         }
         return .{
             .from = email,
@@ -223,6 +222,146 @@ pub const Service = struct {
         };
     }
 
+    fn resolveAttachment(self: *Service, a: std.mem.Allocator, user: []const u8, attachment: std.meta.Elem(@FieldType(Payload, "attachments")), limit: usize) !compose.Attachment {
+        if (attachment.uploadId) |id| {
+            if (!store.validId(id)) return ServiceError.InvalidAttachment;
+            const upload = try store.getUpload(a, self.db, user, id);
+            const mime_id = if (id.len == 32 and std.mem.indexOfNone(u8, id, "0123456789abcdef") == null)
+                id[0..32].*
+            else
+                (try fingerprint(a, id))[0..32].*;
+            return .{ .filename = upload.filename, .content_type = upload.content_type, .data = upload.data, .mime_id = mime_id, .content_id = upload.content_id, .inline_part = upload.inline_part };
+        }
+        return .{ .filename = attachment.filename, .content_type = attachment.contentType, .data = try decodeInlineAttachment(a, attachment.data, limit) };
+    }
+
+    /// Coordinate edits with webmail autosave and the frozen Outbox snapshot.
+    /// Store the new draft document before replacing the file so startup can
+    /// finish a write that stopped between the Maildir rename and SQLite update.
+    pub fn editDraftAttachments(self: *Service, a: std.mem.Allocator, user: []const u8, path: []const u8, previous: []const u8, raw: []const u8, edit: DraftAttachmentEdit) !void {
+        self.mutations.lock();
+        defer self.mutations.unlock();
+        self.db.lockMailboxes();
+        defer self.db.unlockMailboxes();
+        const current = fs.readFileAlloc(a, path) catch return ServiceError.Conflict;
+        if (!std.mem.eql(u8, previous, current)) return ServiceError.Conflict;
+        const uid = (try self.db.getUidForFile(user, "Drafts", std.fs.path.basename(path))) orelse
+            return maildir.replaceDraftFile(a, self.db, user, path, raw);
+        var row = store.findDraft(a, self.db, user, "Drafts", uid) catch |err| {
+            if (err == store.StoreError.NotFound) return maildir.replaceDraftFile(a, self.db, user, path, raw);
+            return err;
+        };
+        if (try self.settleDraftEdit(a, user, row.id)) row = try store.get(a, self.db, user, "draft", row.id);
+        if (!std.mem.eql(u8, row.state, "saved")) return ServiceError.Conflict;
+        var draft = try std.json.parseFromSliceLeaky(Draft, a, row.payload, .{ .ignore_unknown_fields = true });
+
+        const had = draft.message.attachments;
+        var staged: []const store.Upload = &.{};
+        errdefer for (staged) |upload| store.removeUpload(self.db, user, upload.id) catch {};
+        switch (edit) {
+            .add => |uploads| {
+                const allowed = try self.limits(user);
+                if (uploads.len > allowed.maxCount -| had.len) return ServiceError.AttachmentLimit;
+                const attachments = try a.alloc(std.meta.Elem(@FieldType(Payload, "attachments")), had.len + uploads.len);
+                @memcpy(attachments[0..had.len], had);
+                for (uploads, attachments[had.len..], 0..) |upload, *attachment, index| {
+                    if (upload.data.len > allowed.maxFileBytes) return ServiceError.AttachmentLimit;
+                    try self.stageUpload(user, upload, allowed, time.timestamp());
+                    staged = uploads[0 .. index + 1];
+                    attachment.* = .{ .uploadId = upload.id, .filename = upload.filename, .contentType = upload.content_type, .size = upload.data.len };
+                }
+                draft.message.attachments = attachments;
+                _ = try self.payloadMessage(a, draft.message, user, user, true);
+            },
+            .remove => |file| {
+                if (had.len != file.count or file.index >= had.len) return ServiceError.Conflict;
+                const attachment = try self.resolveAttachment(a, user, had[file.index], self.config.max_message_bytes);
+                if (!std.mem.eql(u8, attachment.filename, file.filename) or
+                    !std.ascii.eqlIgnoreCase(attachment.content_type, file.content_type) or
+                    !std.mem.eql(u8, attachment.data, file.data)) return ServiceError.Conflict;
+                draft.message.attachments = try std.mem.concat(a, std.meta.Elem(@FieldType(Payload, "attachments")), &.{ had[0..file.index], had[file.index + 1 ..] });
+            },
+        }
+        draft.message.saveToken = "";
+        draft.message.draftRevision = row.revision + 1;
+        row.payload = try json(a, draft);
+        if ((try self.db.hostedLimits(user)) != null)
+            try store.checkRecordCapacity(self.db, row, @max(1024 * 1024, 2 * self.config.max_message_bytes), 200);
+
+        var pending = row;
+        pending.kind = "draft-edit";
+        pending.state = try fingerprint(a, raw);
+        pending.due_at = row.revision;
+        _ = try store.put(self.db, pending, 0);
+        maildir.replaceDraftFile(a, self.db, user, path, raw) catch |err| {
+            store.remove(self.db, user, pending.kind, pending.id) catch {};
+            return err;
+        };
+        _ = store.put(self.db, row, row.revision) catch |err| {
+            // If the rollback also fails, keep the intent for recovery.
+            maildir.replaceDraftFile(a, self.db, user, path, previous) catch return err;
+            store.remove(self.db, user, pending.kind, pending.id) catch {};
+            return err;
+        };
+        store.remove(self.db, user, pending.kind, pending.id) catch {};
+    }
+
+    fn recoverDraftEdits(self: *Service) !void {
+        self.db.lockMailboxes();
+        defer self.db.unlockMailboxes();
+        var cursor: i64 = 0;
+        while (true) {
+            var arena = std.heap.ArenaAllocator.init(self.db.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const pending = (try store.nextDraftEdit(a, self.db, &cursor)) orelse break;
+            try self.finishDraftEdit(a, pending);
+        }
+    }
+
+    fn settleDraftEdit(self: *Service, a: std.mem.Allocator, user: []const u8, id: []const u8) !bool {
+        const pending = store.get(a, self.db, user, "draft-edit", id) catch |err| {
+            if (err == store.StoreError.NotFound) return false;
+            return err;
+        };
+        try self.finishDraftEdit(a, pending);
+        return true;
+    }
+
+    fn finishDraftEdit(self: *Service, a: std.mem.Allocator, pending: store.Record) !void {
+        const row = store.get(a, self.db, pending.username, "draft", pending.id) catch |err| {
+            if (err != store.StoreError.NotFound) return err;
+            return store.remove(self.db, pending.username, pending.kind, pending.id);
+        };
+        if (row.revision == pending.due_at and std.mem.eql(u8, row.state, "saved")) {
+            const draft = try std.json.parseFromSliceLeaky(Draft, a, pending.payload, .{ .ignore_unknown_fields = true });
+            const raw = maildir.rawMessage(a, self.db, row.username, draft.folder, draft.uid) catch |err| {
+                if (err != maildir.MaildirError.MessageNotFound and err != error.FileNotFound) return err;
+                return store.remove(self.db, pending.username, pending.kind, pending.id);
+            };
+            if (std.mem.eql(u8, pending.state, try fingerprint(a, raw))) {
+                var updated = row;
+                updated.payload = pending.payload;
+                _ = try store.put(self.db, updated, row.revision);
+            }
+        }
+        try store.remove(self.db, pending.username, pending.kind, pending.id);
+    }
+
+    pub fn loadDraft(self: *Service, a: std.mem.Allocator, user: []const u8, folder: []const u8, uid: i64) !store.Record {
+        self.mutations.lock();
+        defer self.mutations.unlock();
+        const row = try store.findDraft(a, self.db, user, folder, uid);
+        return self.readyDraft(a, user, row.id);
+    }
+
+    fn readyDraft(self: *Service, a: std.mem.Allocator, user: []const u8, id: []const u8) !store.Record {
+        self.db.lockMailboxes();
+        defer self.db.unlockMailboxes();
+        _ = try self.settleDraftEdit(a, user, id);
+        return store.get(a, self.db, user, "draft", id);
+    }
+
     pub fn saveDraft(self: *Service, a: std.mem.Allocator, user: []const u8, email: []const u8, payload: Payload) !DraftAck {
         self.mutations.lock();
         defer self.mutations.unlock();
@@ -236,7 +375,7 @@ pub const Service = struct {
     fn saveDraftState(self: *Service, a: std.mem.Allocator, user: []const u8, email: []const u8, payload: Payload, resume_queued: bool) !DraftAck {
         const id = payload.draftId orelse try store.newId(a);
         if (!store.validId(id) or payload.draftRevision < 0 or payload.saveToken.len > 64) return ServiceError.InvalidPayload;
-        const previous: ?store.Record = store.get(a, self.db, user, "draft", id) catch |err| blk: {
+        const previous: ?store.Record = self.readyDraft(a, user, id) catch |err| blk: {
             if (err != store.StoreError.NotFound) return err;
             break :blk null;
         };
@@ -305,7 +444,7 @@ pub const Service = struct {
         const raw = try compose.buildMime(a, msg, now, "<validation@localhost>");
         if (raw.len > self.config.max_message_bytes) return ServiceError.AttachmentLimit;
         if (payload.draftId) |draft_id| {
-            const row = try store.get(a, self.db, user, "draft", draft_id);
+            const row = try self.readyDraft(a, user, draft_id);
             if (row.revision != payload.draftRevision or !std.mem.eql(u8, row.state, "saved")) return ServiceError.Conflict;
         }
         var row = store.Record{ .username = user, .kind = "outbox", .id = id, .payload = serialized, .state = "pending", .revision = 0, .due_at = now + delay, .expires_at = 0 };

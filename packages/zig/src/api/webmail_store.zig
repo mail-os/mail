@@ -18,7 +18,14 @@ pub const Record = struct {
     due_at: i64,
     expires_at: i64,
 };
-pub const Upload = struct { id: []const u8, filename: []const u8, content_type: []const u8, data: []const u8 };
+pub const Upload = struct {
+    id: []const u8,
+    filename: []const u8,
+    content_type: []const u8,
+    data: []const u8,
+    content_id: []const u8 = "",
+    inline_part: bool = false,
+};
 
 pub fn initSchema(db: *database.Database) !void {
     try db.exec(
@@ -34,11 +41,17 @@ pub fn initSchema(db: *database.Database) !void {
         \\CREATE TABLE IF NOT EXISTS webmail_uploads (
         \\ username TEXT NOT NULL, id TEXT NOT NULL, filename TEXT NOT NULL,
         \\ content_type TEXT NOT NULL, data BLOB NOT NULL, size INTEGER NOT NULL,
-        \\ expires_at INTEGER NOT NULL, PRIMARY KEY(username,id),
+        \\ expires_at INTEGER NOT NULL, mime TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(username,id),
         \\ FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE
         \\);
         \\CREATE INDEX IF NOT EXISTS webmail_upload_expiry ON webmail_uploads(expires_at);
     );
+    const has_mime_column = blk: {
+        const s = try db.prepare("SELECT 1 FROM pragma_table_info('webmail_uploads') WHERE name='mime'");
+        defer s.finalize();
+        break :blk try s.step();
+    };
+    if (!has_mime_column) try db.exec("ALTER TABLE webmail_uploads ADD COLUMN mime TEXT NOT NULL DEFAULT '{}'");
 }
 
 pub fn newId(allocator: std.mem.Allocator) ![]const u8 {
@@ -101,6 +114,15 @@ pub fn findDraft(allocator: std.mem.Allocator, db: *database.Database, user: []c
     try s.bind(3, folder);
     if (!try s.step()) return StoreError.NotFound;
     return readRecord(allocator, s);
+}
+
+pub fn nextDraftEdit(a: std.mem.Allocator, db: *database.Database, cursor: *i64) !?Record {
+    const s = try db.prepare("SELECT username,kind,id,payload,state,revision,due_at,expires_at,rowid FROM webmail_records WHERE kind='draft-edit' AND rowid>?1 ORDER BY rowid LIMIT 1");
+    defer s.finalize();
+    try s.bind(1, cursor.*);
+    if (!try s.step()) return null;
+    cursor.* = s.columnInt64(8);
+    return try readRecord(a, s);
 }
 
 /// The webmail draft document and its MIME file must change together.
@@ -246,8 +268,8 @@ pub fn nextInterruptedDelivery(a: std.mem.Allocator, db: *database.Database, cur
 
 pub fn addUpload(db: *database.Database, user: []const u8, upload: Upload, now: i64, max_staged_bytes: usize, max_count: usize) !void {
     const s = try db.prepare(
-        \\INSERT INTO webmail_uploads(username,id,filename,content_type,data,size,expires_at)
-        \\SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE
+        \\INSERT INTO webmail_uploads(username,id,filename,content_type,data,size,expires_at,mime)
+        \\SELECT ?1,?2,?3,?4,?5,?6,?7,json_object('contentId',?10,'inline',?11) WHERE
         \\(SELECT COALESCE(SUM(size),0)+?6<=?8 AND COUNT(*)<?9 FROM webmail_uploads WHERE username=?1)
         \\RETURNING id
     );
@@ -261,12 +283,14 @@ pub fn addUpload(db: *database.Database, user: []const u8, upload: Upload, now: 
     try s.bind(7, now + 86400);
     try s.bind(8, max_staged_bytes);
     try s.bind(9, max_count);
+    try s.bind(10, upload.content_id);
+    try s.bind(11, @as(i64, @intFromBool(upload.inline_part)));
     if (!try s.step()) return StoreError.StorageLimit;
     _ = try s.step();
 }
 
 pub fn getUpload(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8) !Upload {
-    const s = try db.prepare("SELECT id,filename,content_type,data FROM webmail_uploads WHERE username=?1 AND id=?2");
+    const s = try db.prepare("SELECT id,filename,content_type,data,json_extract(mime,'$.contentId'),json_extract(mime,'$.inline') FROM webmail_uploads WHERE username=?1 AND id=?2");
     defer s.finalize();
     try s.bind(1, user);
     try s.bind(2, id);
@@ -276,6 +300,8 @@ pub fn getUpload(allocator: std.mem.Allocator, db: *database.Database, user: []c
         .filename = try allocator.dupe(u8, s.columnText(1)),
         .content_type = try allocator.dupe(u8, s.columnText(2)),
         .data = try allocator.dupe(u8, s.columnText(3)),
+        .content_id = try allocator.dupe(u8, s.columnText(4)),
+        .inline_part = s.columnInt64(5) != 0,
     };
 }
 
@@ -286,7 +312,7 @@ const attachment_id = "CASE WHEN attachment.type='object' THEN json_extract(atta
 pub fn removeUpload(db: *database.Database, user: []const u8, id: []const u8) !void {
     const s = try db.prepare(
         "DELETE FROM webmail_uploads WHERE username=?1 AND id=?2 AND NOT EXISTS (SELECT 1 " ++ join_attachments ++
-            " WHERE r.username=?1 AND r.kind IN ('draft','outbox') AND " ++ attachment_id ++ "=?2)",
+            " WHERE r.username=?1 AND r.kind IN ('draft','outbox','draft-edit') AND " ++ attachment_id ++ "=?2)",
     );
     defer s.finalize();
     try s.bind(1, user);
@@ -305,7 +331,7 @@ pub fn sweep(db: *database.Database, now: i64, user: ?[]const u8) !void {
     const uploads = try db.prepare(
         // Parse each mailbox record once, and only when it has expired uploads.
         "WITH refs(username,id) AS MATERIALIZED (SELECT DISTINCT r.username," ++ attachment_id ++ " " ++ join_attachments ++
-            \\ WHERE r.kind IN ('draft','outbox') AND (?2='' OR r.username=?2)
+            \\ WHERE r.kind IN ('draft','outbox','draft-edit') AND (?2='' OR r.username=?2)
             \\ AND EXISTS (SELECT 1 FROM webmail_uploads AS u WHERE u.username=r.username AND u.expires_at<=?1))
             \\DELETE FROM webmail_uploads WHERE expires_at<=?1 AND (?2='' OR username=?2)
             \\ AND NOT EXISTS (SELECT 1 FROM refs WHERE refs.username=webmail_uploads.username AND refs.id=webmail_uploads.id)
