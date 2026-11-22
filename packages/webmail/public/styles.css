@@ -2,23 +2,23 @@
 :root {
   color-scheme: light;
   --app-font: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", sans-serif;
-  --bg: #f2f3f6;
+  --bg: #eef0f4;
   --panel: #ffffff;
-  --sidebar: #edf0f5;
-  --surface: #f1f3f7;
-  --toolbar: #f8f9fb;
-  --hover: #e7ebf2;
-  --text: #1c2028;
-  --muted: #555d6c;
-  --border: #dbe0e8;
+  --sidebar: #eef0f4;
+  --surface: #f2f3f6;
+  --toolbar: #f7f8fa;
+  --hover: #e9ecf1;
+  --text: #20232a;
+  --muted: #596170;
+  --border: #dce0e7;
   --field-border: #777884;
-  --accent: #0059bd;
-  --primary: #0064d6;
-  --primary-hover: #004fae;
+  --accent: #0758bd;
+  --primary: #0661ce;
+  --primary-hover: #004da9;
   --on-primary: #ffffff;
-  --accent-soft: #edf5ff;
-  --selected: #deebfc;
-  --selection-edge: #086acb;
+  --accent-soft: #edf4ff;
+  --selected: #e0ecff;
+  --selection-edge: #166fda;
   --danger: #b42429;
   --danger-soft: #fff0ef;
   --warning: #794515;
@@ -35,21 +35,21 @@
 @media (prefers-color-scheme: dark) {
   :root {
     color-scheme: dark;
-    --bg: #191b20;
-    --panel: #22252b;
-    --sidebar: #272b33;
-    --surface: #2c313a;
-    --toolbar: #262a31;
-    --hover: #333944;
-    --text: #f0f2f6;
-    --muted: #b3bbc9;
-    --border: #3b4350;
+    --bg: #1c1e23;
+    --panel: #24262c;
+    --sidebar: #1c1e23;
+    --surface: #2d3038;
+    --toolbar: #292c33;
+    --hover: #353943;
+    --text: #f2f3f6;
+    --muted: #b4bccb;
+    --border: #3b3f49;
     --field-border: #777886;
-    --accent: #91c7ff;
+    --accent: #94c6ff;
     --primary: #1a66c4;
     --primary-hover: #1557a9;
     --accent-soft: #263953;
-    --selected: #203e64;
+    --selected: #29486d;
     --selection-edge: #68b2ff;
     --danger: #ffaaa4;
     --danger-soft: #492c32;
@@ -806,7 +806,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-heading { display: inline-flex; align-items: center; gap: 11px; }
 .calendar-heading h1 { color: var(--text); }
 .calendar-workspace { border: 1px solid var(--border); border-radius: 14px; padding: clamp(10px, 2vw, 18px); background: var(--panel); box-shadow: var(--shadow); }
-.calendar-search .mail-search-field { min-width: min(12rem, 45vw); }
+.calendar-search .mail-search-field { min-width: min(12rem, 45vw); padding-inline-end: 4px; }
 .calendar-search .wm-search { width: 100%; }
 .calendar-view-modes { gap: 2px; padding: 3px; background: var(--surface); border-radius: 8px; }
 .calendar-view-modes .wm-action { background: transparent; border-color: transparent; }
@@ -814,19 +814,105 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-view-modes .wm-action:hover { background: var(--hover); }
 .calendar-card-mark { display: flex; align-items: center; gap: 8px; color: var(--accent); }
 
+[data-icon=conversation] { --mail-symbol: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22black%22 stroke-width=%221.75%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cpath d=%22M4 4h13a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2H9l-5 4v-4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Zm18 5v7a3 3 0 0 1-3 3h-6M6 8h9m-9 3h6%22/%3E%3C/svg%3E"); }
+[data-icon=checklist] { --mail-symbol: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22black%22 stroke-width=%221.75%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cpath d=%22m3 6 2 2 3-4M3 17l2 2 3-4m4-9h9m-9 11h9%22/%3E%3C/svg%3E"); }
+[data-icon=unread-mail] { --mail-symbol: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22black%22 stroke-width=%221.75%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cpath d=%22M14 6H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-6m-18-3 9 5 4-2.2%22/%3E%3Ccircle cx=%2219.5%22 cy=%226%22 r=%222.5%22 fill=%22black%22 stroke=%22none%22/%3E%3C/svg%3E"); }
+
+.wm { background: var(--bg); }
+.wm-folders { border-inline-end: 0; }
+.wm-brand { letter-spacing: -.025em; }
+.wm-brand .mail-app-mark { box-shadow: 0 2px 5px rgb(9 84 179 / .18); }
+.wm-compose-btn { min-height: 40px; border-radius: 10px; }
+.wm-nav-group { gap: 1px; }
+.wm-nav-label { margin: 4px 11px; }
+.wm-folder { min-height: 30px; padding-inline: 10px; }
+.wm-folder[aria-current=page] { box-shadow: none; }
+.wm-folder-count { border-radius: 6px; }
+.wm-folder[aria-current=page] .wm-folder-count { background: var(--panel); }
+.wm-user { padding: 10px 5px 0; }
+.wm-account-actions { justify-content: space-between; }
+.wm-list-head { padding: 15px 18px 6px; min-height: 62px; }
+.wm-list-head h1 { font-size: clamp(23px, 2.3vw, 29px); letter-spacing: -.04em; }
+.wm-list-total { font-variant-numeric: tabular-nums; }
+.wm-search-form { padding: 7px 14px 4px; }
+.mail-search-field { background: var(--surface); border-color: transparent; border-radius: 9px; }
+.wm-search { font-size: 14px; }
+.wm-search-submit, .wm-search-filters { border-radius: 8px; }
+.wm-list-options { gap: 4px; min-height: 43px; padding: 5px 12px; }
+.wm-list-toggle { position: relative; border-radius: 7px; padding: 5px 7px; min-height: 31px; cursor: pointer; white-space: nowrap; }
+.wm-list-toggle .mail-icon { width: 16px; height: 16px; }
+.wm-list-toggle input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: inherit; }
+.wm-list-toggle:hover { background: var(--hover); color: var(--text); }
+.wm-list-toggle:has(input:checked, input[aria-checked=mixed]) { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.wm-list-toggle:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 1px; }
+.wm-list-toggle:has(input:disabled) { opacity: .5; cursor: default; }
+.wm-list-body { padding: 6px 8px; }
+.wm-message-row { border-radius: 9px; min-height: 78px; }
+.wm-message-row--active, .wm-message-row--active:hover { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent), transparent 79%); }
+.wm-message-row--active .wm-msg-from { color: var(--accent); }
+.wm-message-row--unread::before { top: 17px; }
+.wm-message-check { margin-top: 33px; }
+.wm-msg { padding-block: 10px; }
+.wm-msg-from { font-weight: 600; }
+.wm-msg-snippet { line-height: 1.4; }
+.wm-list-empty { display: grid; justify-items: center; align-content: center; min-height: 220px; gap: 12px; padding: 20px; color: var(--muted); text-align: center; }
+.wm-empty-mark { color: var(--accent); background: var(--accent-soft); }
+.wm-empty-mark .mail-icon { width: 26px; height: 26px; color: inherit; }
+.wm-list-empty .wm-empty-mark { width: 46px; height: 46px; border-radius: 13px; }
+.wm-list-empty .wm-empty-mark .mail-icon { width: 22px; height: 22px; }
+.wm-reader-empty { background: var(--toolbar); }
+.wm-message-toolbar { position: sticky; top: 0; z-index: 1; gap: 6px; padding-block: 9px; }
+.wm-message-toolbar .wm-action { background: transparent; border-color: transparent; }
+.wm-message-toolbar .wm-action:hover { background: var(--hover); }
+.wm-message-toolbar .wm-action--accent { background: var(--accent-soft); }
+.wm-tool { color: var(--muted); }
+.wm-tool:hover { color: var(--text); }
+.wm-tool--danger:hover { color: var(--danger); }
+.wm-tool-move select { border-color: transparent; background: var(--surface); }
+.wm-message-heading .wm-folder-badge { background: var(--accent-soft); color: var(--accent); }
+.wm-read-meta .wm-avatar { width: 42px; height: 42px; }
+.wm-read-html { min-height: clamp(240px, 31dvh, 380px); }
+.wm-format-control .wm-action { background: var(--surface); border-color: transparent; color: var(--muted); }
+.wm-format-control .wm-action:hover { background: var(--hover); color: var(--text); }
+
+.wm-composer-title { font-size: 17px; }
+.wm-composer-fields { gap: 4px; }
+.wm-composer-fields .wm-recipient-field { align-items: center; min-height: 39px; border-bottom: 1px solid var(--border); }
+.wm-composer-fields .wm-recipient-field > label { padding-top: 0; }
+.wm-recipient-box, .wm-subject-field input, .wm-from-field select { border-color: transparent; }
+.wm-recipient-box--invalid { border-color: var(--danger); }
+.wm-subject-field input, .wm-from-field select { padding-inline: 9px; }
+.wm-composer-body { min-height: clamp(150px, 26dvh, 250px); padding: 10px 2px; border-color: transparent; }
+.wm-dropzone, .wm-compose-attachments li { background: var(--surface); }
+.wm-composer-foot .wm-send-btn { min-height: 40px; border-radius: 9px; }
+
+.mail-auth-page { background: var(--bg); }
+.mail-auth-page .login { border-color: var(--border); }
+.calendar-workspace, .health-summary, .health-card { border-radius: 16px; }
+.calendar-view-toolbar { border-color: transparent; background: var(--toolbar); }
+.calendar-view-modes .wm-action[aria-pressed=true] { color: var(--accent); }
+.calendar-zone { flex-wrap: nowrap; }
+.calendar-zone select { width: auto; max-width: min(12.5rem, 49vw); }
+.wm-shared-list-head { background: var(--toolbar); }
+.wm-shared-row[aria-current=true] .wm-msg-from { color: var(--accent); }
+
+@media (min-width: 861px) {
+  .wm-workspace { margin: 10px 10px 10px 0; overflow: hidden; border: 1px solid var(--border); border-radius: 14px; background: var(--panel); box-shadow: var(--shadow); }
+  .wm-list { background: var(--panel); }
+}
 @media (min-width: 1081px) {
-  .wm { grid-template-columns: 218px minmax(0, 1fr); }
-  .wm-columns { grid-template-columns: clamp(304px, 26vw, 382px) minmax(0, 1fr); }
+  .wm { grid-template-columns: 222px minmax(0, 1fr); }
+  .wm-columns { grid-template-columns: clamp(304px, 25vw, 370px) minmax(0, 1fr); }
   .wm--newsletter-expanded .wm-columns, .wm--reply-focused .wm-columns { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 860px) {
-  .wm-folders { grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px; padding: 9px 12px; }
+  .wm-folders { grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px; padding: 8px 12px; }
   .wm-brand { padding: 0 3px; gap: 6px; }
   .wm-brand .mail-app-mark { width: 30px; height: 30px; }
-  .wm-folders .wm-folders-toggle { display: inline-flex; min-height: 40px; padding-inline: 9px; }
+  .wm-folders .wm-folders-toggle { display: inline-flex; min-height: 44px; padding-inline: 9px; }
   .wm-folders-toggle[aria-expanded=true] { background: var(--selected); color: var(--accent); }
   .wm-folders-toggle[aria-expanded=true] .wm-mailboxes-indicator { transform: rotate(180deg); }
-  .wm-compose-btn { margin: 0; min-height: 40px; padding-inline: 9px; }
+  .wm-compose-btn { margin: 0; min-height: 44px; padding-inline: 9px; }
   .wm-navigation { display: none; grid-column: 1 / -1; }
   .wm-folders--expanded .wm-navigation { display: flex; }
   .wm-folder-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; align-items: start; max-height: 48dvh; overflow: auto; overscroll-behavior: contain; }
@@ -837,11 +923,32 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-user-email { flex-basis: auto; }
   .wm-logout { width: 33px; height: 33px; }
   .wm-read-toolbar { gap: 6px; margin-bottom: 16px; padding-block: 8px; }
+  .wm-message-toolbar { row-gap: 3px; }
+  .wm-message-toolbar .wm-tool-group { gap: 1px; padding-inline-end: 5px; }
+  .wm-message-toolbar .wm-tool { width: 36px; min-width: 36px; min-height: 44px; }
+  .wm-message-toolbar .wm-junk-action { min-width: 40px; min-height: 44px; justify-content: center; }
+  .wm-junk-label { display: none; }
+  .wm-message-toolbar::after { content: ''; flex-basis: 100%; height: 0; }
+  .wm-message-toolbar > :is(.wm-action:not(.wm-junk-action), .wm-tool-move) { order: 1; }
+  .wm-message-toolbar .wm-tool-move { border-inline-end: 0; }
+  .wm-read :is(h2, button, select, summary, a):focus-visible { scroll-margin-top: 112px; }
   .wm-read-body { --reader-gutter: 16px; padding-bottom: 24px; }
   .wm-back { display: inline-flex; gap: 6px; align-items: center; min-height: 38px; margin-block: 3px 6px; }
-  .wm-tool { min-width: 36px; min-height: 36px; }
+  .wm-list-head h1 { font-size: 29px; }
+  .wm-list-options .wm-list-toggle { min-height: 36px; }
   .wm-read-sender { flex-direction: column; }
   .calendar-view-modes { flex-wrap: nowrap; }
+}
+@media (max-width: 490px) {
+  .calendar-page { padding-block-start: 12px; }
+  .calendar-nav { flex-wrap: nowrap; min-height: 36px; gap: 10px; }
+  .calendar-nav a { flex-shrink: 0; }
+  .calendar-nav > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .calendar-header { margin-block: 12px; }
+  .calendar-header .mail-app-mark { width: 31px; height: 31px; }
+  .calendar-header .mail-app-mark .mail-icon { width: 21px; height: 21px; }
+  .calendar-controls { margin-block: 6px; }
+  .calendar-range { margin-block: 12px 7px; }
 }
 @media (min-width: 620px) and (max-width: 860px) {
   .wm-folder-list { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -850,10 +957,12 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 @media (max-width: 380px) {
   .wm-brand { font-size: 16px; }
   .wm-folders-toggle .mail-icon { display: none; }
+  .wm-brand > span:last-child { overflow: hidden; text-overflow: ellipsis; }
+  .wm-list-options { flex-wrap: wrap; }
 }
 @media (forced-colors: active) {
   .mail-icon { forced-color-adjust: none; background: CanvasText; }
-  .wm-folder[aria-current=page], .wm-message-row--active, .wm-tool[aria-pressed=true] { outline: 1px solid Highlight; outline-offset: -1px; }
+  .wm-folder[aria-current=page], .wm-message-row--active, .wm-tool[aria-pressed=true], .wm-list-toggle:has(input:checked, input[aria-checked=mixed]) { outline: 1px solid Highlight; outline-offset: -1px; }
 }
 
 [data-icon=check] { --mail-symbol: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22black%22 stroke-width=%221.75%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cpath d=%22m5 12 4 4L19 6%22/%3E%3C/svg%3E"); }

@@ -78,7 +78,11 @@ export function readableBytes(value: number): string {
 }
 export function shortDate(value: string): string {
   const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : date.toLocaleDateString([], { month: 'short', day: 'numeric' })
+  if (Number.isNaN(date.getTime())) return value
+  const today = new Date()
+  if (date.toDateString() === today.toDateString())
+    return date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+  return date.toLocaleDateString([], { month: 'short', day: 'numeric', year: date.getFullYear() === today.getFullYear() ? undefined : 'numeric' })
 }
 export function fullDate(value: string): string {
   const date = new Date(value)

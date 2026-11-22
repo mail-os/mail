@@ -26,6 +26,10 @@ def seed_inbox(fixture, owner, sender):
         ("Avery Patel", "Studio launch notes", "Here is the handoff for Thursday."),
         ("Jordan Kim", "Workshop agenda", "I set aside time for the accessibility review."),
         ("Studio Hosting", "Your receipt #1046", "Your November payment of $18.00 was received."),
+        ("Casey Rivera", "Feedback on the print proofs", "The cover looks good. I left two notes on the inside spread."),
+        ("Sam Taylor", "Thursday studio reservation", "We have the south room from 10 to noon."),
+        ("Priya Raman", "November research interviews", "Two interviewees confirmed their availability."),
+        ("Jamie Park", "Photos from the site visit", "I added the entrance and reception photos to the shared folder."),
     ]
     now = datetime.now(timezone.utc)
     for index, (name, subject, body) in enumerate(samples):

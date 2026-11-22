@@ -92,8 +92,7 @@ onUnmounted(() => { destroy(); destroyReminders() })
         </button>
       </div>
       <form class="calendar-choices calendar-search" role="search" @submit.prevent="search()">
-        <div class="mail-search-field"><span class="mail-icon" data-icon="search" aria-hidden="true"></span><input class="wm-search" type="search" x-model="searchInput" aria-label="Search events" placeholder="Search events" maxlength="256"></div>
-        <button type="submit" class="wm-action">Search</button>
+        <div class="mail-search-field"><span class="mail-icon" data-icon="search" aria-hidden="true"></span><input class="wm-search" type="search" x-model="searchInput" aria-label="Search events" placeholder="Search events" maxlength="256"><button type="submit" class="wm-search-submit" aria-label="Search" title="Search"><span class="mail-icon" data-icon="arrow-right" aria-hidden="true"></span></button></div>
         <button :if="searchTerm" type="button" class="wm-action" @click="clearSearch()">Clear</button>
       </form>
     </div>

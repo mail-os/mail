@@ -30,6 +30,34 @@ async function fitsViewport(page) {
     assert(await page.evaluate(() => document.documentElement.scrollHeight <= innerHeight + 1), 'Mail shell exceeds the viewport')
 }
 
+async function verifyAppearance(page, scheme) {
+  await page.emulateMedia({ colorScheme: scheme })
+  const theme = await page.evaluate(() => {
+    const style = getComputedStyle(document.documentElement)
+    const luminance = token => {
+      const hex = style.getPropertyValue(token).trim().slice(1)
+      const levels = hex.match(/../g).map(byte => Number.parseInt(byte, 16) / 255)
+      const [red, green, blue] = levels.map(value => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4)
+      return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+    }
+    const pairs = [
+      ['--text', '--panel'], ['--muted', '--panel'], ['--muted', '--surface'],
+      ['--accent', '--selected'], ['--on-primary', '--primary'],
+    ]
+    return {
+      scheme: style.colorScheme,
+      ratios: pairs.map(([foreground, background]) => {
+        const a = luminance(foreground)
+        const b = luminance(background)
+        return [(Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05), foreground, background]
+      }),
+    }
+  })
+  assert.equal(theme.scheme, scheme)
+  for (const [ratio, foreground, background] of theme.ratios)
+    assert(ratio >= 4.5, `${scheme} ${foreground} on ${background} must reach 4.5:1, got ${ratio.toFixed(2)}`)
+}
+
 async function openMailbox(page, name) {
   await button(folders(page), name).click()
 }
@@ -66,6 +94,22 @@ async function signIn({ phone = false } = {}) {
 }
 
 async function desktopJourney(page) {
+  await verifyAppearance(page, 'light')
+  await page.locator('.wm-reader-empty').waitFor()
+  await screenshot(page, 'desktop-mailbox')
+  const conversations = page.getByRole('checkbox', { name: 'Conversations' })
+  await conversations.focus()
+  assert.equal(await conversations.evaluate(input => getComputedStyle(input.parentElement).outlineStyle), 'solid')
+  await conversations.press('Space')
+  assert.equal(await conversations.isChecked(), false)
+  await conversations.press('Space')
+  assert.equal(await conversations.isChecked(), true)
+  const selectAll = page.getByRole('checkbox', { name: 'Select messages on this page' })
+  await selectAll.check()
+  await page.getByText('7 selected', { exact: true }).waitFor()
+  await button(page, 'Clear').click()
+  assert.equal(await selectAll.isChecked(), false)
+
   const search = page.getByRole('searchbox', { name: 'Search messages' })
   await search.focus()
   assert.equal(await search.evaluate(input => getComputedStyle(input.parentElement).outlineStyle), 'solid')
@@ -77,7 +121,7 @@ async function desktopJourney(page) {
   await page.getByRole('textbox', { name: 'Filter by sender' }).waitFor()
   await button(page, 'Filters').press('Enter')
   await button(page, 'Clear search and filters').click()
-  await page.getByText('3 messages', { exact: true }).waitFor()
+  await page.getByText('7 messages', { exact: true }).waitFor()
 
   await button(page, /Tuesday design handoff/).click()
   await heading(page, handoff).waitFor()
@@ -90,8 +134,7 @@ async function desktopJourney(page) {
   }
   await fitsViewport(page)
   await screenshot(page, 'desktop-inbox-light')
-  await page.emulateMedia({ colorScheme: 'dark' })
-  assert(await page.evaluate(() => matchMedia('(prefers-color-scheme: dark)').matches))
+  await verifyAppearance(page, 'dark')
   await button(page, 'Show plain text').click()
   await page.locator('.wm-read-text').getByText(/Please confirm the sidebar order/).waitFor()
   await screenshot(page, 'desktop-inbox-dark')
@@ -127,6 +170,11 @@ async function desktopJourney(page) {
   await page.getByText('Studio review', { exact: true }).waitFor()
   await fitsViewport(page)
   await screenshot(page, 'desktop-calendar')
+  await page.getByRole('searchbox', { name: 'Search events' }).fill('Studio review')
+  await button(page, 'Search').click()
+  await page.getByRole('heading', { name: /^Search results/ }).waitFor()
+  await page.getByText('Studio review', { exact: true }).waitFor()
+  await button(page, 'Clear').click()
 
   await page.goto(url + '/status')
   await heading(page, 'Mail delivery').waitFor()
@@ -170,7 +218,16 @@ async function phoneJourney(page) {
   assert.equal(await response.text(), 'Receipt 1046 for Studio Hosting\n')
   await button(page, 'Reply').waitFor()
   await fitsViewport(page)
+  await page.setViewportSize({ width: 320, height: 844 })
+  await fitsViewport(page)
+  const actions = page.getByRole('group', { name: 'Message actions', exact: true })
+  assert((await actions.boundingBox()).height < 124, 'Reader actions fit into two rows on narrow phones')
+  await button(actions, 'Mark junk').waitFor()
+  await page.setViewportSize({ width: 390, height: 844 })
   await screenshot(page, 'phone-reader')
+  await page.emulateMedia({ colorScheme: 'light' })
+  await screenshot(page, 'phone-reader-light')
+  await page.emulateMedia({ colorScheme: 'dark' })
   await button(page, 'Back to messages').click()
 
   await button(page, 'Compose').click()
@@ -198,6 +255,7 @@ async function phoneJourney(page) {
   await openMailbox(page, /^Outbox(?:\s|$)/)
   await heading(page, 'Outbox').waitFor()
   assert(!await folders(page).isVisible(), 'Outbox selection closes the drawer')
+  await screenshot(page, 'phone-outbox')
   await toggle.click()
   await page.getByRole('link', { name: 'Calendar', exact: true }).click()
   await page.getByRole('region', { name: 'Calendar workspace' }).waitFor()

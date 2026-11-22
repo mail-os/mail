@@ -116,7 +116,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
 </script>
 <main :if="!ready || !user" class="wm-boot"><p role="status" :text="error || 'Opening your inbox…'"></p><button :if="error" @click="boot()">Retry connection</button></main>
 <div :if="ready && user" class="wm" :class="{ 'wm--reading': reading, 'wm--newsletter-expanded': readerExpanded, 'wm--reply-focused': followUpFocused }">
-  <aside class="wm-folders" :class="{ 'wm-folders--expanded': foldersExpanded }" @keydown.escape="closeFolders(true)">
+  <aside class="wm-folders" aria-label="Mail navigation" :class="{ 'wm-folders--expanded': foldersExpanded }" @keydown.escape="closeFolders(true)">
     <div class="wm-brand"><span class="mail-app-mark"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span></span><span>Mail</span></div>
     <button ref="foldersToggle" type="button" class="wm-folders-toggle wm-action" :aria-expanded="foldersExpanded" aria-controls="mailNavigation" @click="foldersExpanded.set(!foldersExpanded())"><span class="mail-icon" data-icon="sidebar" aria-hidden="true"></span>Mailboxes<span class="mail-icon wm-mailboxes-indicator" data-icon="down" aria-hidden="true"></span></button>
     <button type="button" class="wm-compose-btn" @click="startComposition()" :disabled="sending || sendUncertain"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span><span :text="hasComposition ? 'Resume draft' : 'Compose'"></span></button>
@@ -190,7 +190,20 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         </div>
         <button :if="filterActive" class="wm-clear-search" type="button" @click="clearSearch()">Clear search and filters</button>
       </form>
-      <div :if="!libraryView" class="wm-list-options"><span :if="categoryList">Grouped by sender</span><label :if="!attentionView && !categoryList && folder !== 'Drafts'"><input type="checkbox" x-model="conversations" @change="changeConversationView()">Conversations</label><div class="wm-selection-bar"><label class="wm-select-all"><input ref="selectAll" type="checkbox" :checked="allChecked" :aria-checked="someChecked ? 'mixed' : allChecked ? 'true' : 'false'" @change="toggleAll()" :disabled="loading || mutating" aria-label="Select messages on this page"><span :text="selectedCount ? selectedCount + ' selected' : 'Select messages'"></span></label><button :if="selectedCount > 0" class="wm-clear-search" @click="clearSelection()">Clear</button></div></div>
+      <div :if="!libraryView" class="wm-list-options">
+        <span :if="categoryList">Grouped by sender</span>
+        <label :if="!attentionView && !categoryList && folder !== 'Drafts'" class="wm-list-toggle">
+          <input type="checkbox" x-model="conversations" @change="changeConversationView()">
+          <span class="mail-icon" data-icon="conversation" aria-hidden="true"></span><span>Conversations</span>
+        </label>
+        <div class="wm-selection-bar">
+          <label class="wm-list-toggle wm-select-all">
+            <input ref="selectAll" type="checkbox" :checked="allChecked" :aria-checked="someChecked ? 'mixed' : allChecked ? 'true' : 'false'" @change="toggleAll()" :disabled="loading || mutating" aria-label="Select messages on this page">
+            <span class="mail-icon" data-icon="checklist" aria-hidden="true"></span><span :text="selectedCount ? selectedCount + ' selected' : 'Select messages'"></span>
+          </label>
+          <button :if="selectedCount > 0" class="wm-clear-search" @click="clearSelection()">Clear</button>
+        </div>
+      </div>
       <div :if="selectedCount > 0" class="wm-bulk-toolbar" aria-label="Selected message actions">
         <button type="button" class="wm-action wm-action--accent" @click="readSelection()" :disabled="loading || readingLoading || triageBusy || mutating"><span class="mail-icon" data-icon="layers" aria-hidden="true"></span>Read selected</button>
         <button :if="selectedCount > 1 && !categoryList && !attentionView && folder !== 'Drafts'" type="button" class="wm-action" @click="groupSelected()" :disabled="loading || readingLoading || triageBusy || mutating">Group selected</button>
@@ -208,7 +221,10 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       </div>
       <div class="wm-list-body" ref="messageList" tabindex="-1" :aria-busy="loading || triageBusy">
         <p :if="loading && !indexProgress" class="wm-state" role="status" :text="libraryView ? 'Loading attachments…' : 'Loading messages…'"></p>
-        <p :if="!loading && !indexProgress && !listError && total === 0" class="wm-state" role="status" :text="libraryView ? 'No attachments match your search.' : (filterActive ? 'No messages match your search.' : (collectionId ? 'No conversations in this collection.' : 'No messages in this folder.'))"></p>
+        <div :if="!loading && !indexProgress && !listError && total === 0" class="wm-list-empty" role="status">
+          <span class="wm-empty-mark"><span class="mail-icon" :data-icon="libraryView ? 'attach' : (filterActive ? 'search' : 'inbox')" aria-hidden="true"></span></span>
+          <span :text="libraryView ? 'No attachments match your search.' : (filterActive ? 'No messages match your search.' : (collectionId ? 'No conversations in this collection.' : 'No messages in this folder.'))"></span>
+        </div>
         <div :for="file in libraryFiles" :key="file.message.reference + ':' + file.index" class="wm-library-row" :class="{ 'wm-message-row--active': selected?.reference === file.message.reference }">
           <button type="button" class="wm-library-message" @click="openAttachmentMessage(file)" :disabled="readingLoading || mutating" :aria-label="'Open message for ' + file.filename">
             <span class="wm-library-icon"><span class="mail-icon" data-icon="document" aria-hidden="true"></span></span>
@@ -308,15 +324,15 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
           </div>
           <div class="wm-tool-group" role="group" aria-label="Message status">
             <button class="wm-tool" @click="selectedAction(selected?.flags?.flagged ? 'unflag' : 'flag')" :disabled="mutating" :aria-label="selected?.flags?.flagged ? 'Unflag' : 'Flag'" :title="selected?.flags?.flagged ? 'Unflag' : 'Flag'" :aria-pressed="selected?.flags?.flagged"><span class="mail-icon" data-icon="flag" aria-hidden="true"></span></button>
-            <button class="wm-tool" @click="selectedAction('unread')" :disabled="mutating" aria-label="Mark unread" title="Mark unread"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span></button>
+            <button class="wm-tool" @click="selectedAction('unread')" :disabled="mutating" aria-label="Mark unread" title="Mark unread"><span class="mail-icon" data-icon="unread-mail" aria-hidden="true"></span></button>
             <button class="wm-tool wm-tool--danger" @click="selectedAction(selected?.folder === 'Trash' ? 'purge' : 'trash')" :disabled="mutating" :aria-label="selected?.folder === 'Trash' ? 'Delete permanently' : 'Trash'" :title="selected?.folder === 'Trash' ? 'Delete permanently' : 'Trash'"><span class="mail-icon" data-icon="trash" aria-hidden="true"></span></button>
           </div>
+          <button :if="readerJunkAction" class="wm-action wm-junk-action" :class="{ 'wm-action--accent': readerJunkAction === 'not_junk' }" @click="selectedAction(readerJunkAction())" :disabled="mutating || readingLoading" :aria-label="readerJunkAction === 'not_junk' ? 'Not junk' : 'Mark junk'" title="Junk feedback applies to future mail from verified senders"><span class="mail-icon" data-icon="shield" aria-hidden="true"></span><span class="wm-junk-label" :text="readerJunkAction === 'not_junk' ? 'Not junk' : 'Mark junk'"></span></button>
           <button :if="unreadAvailable && !readingBatch" type="button" class="wm-action wm-action--accent" aria-keyshortcuts="Shift+N" @click="nextUnread()" :disabled="triageBusy || mutating || readingLoading">Next unread<span class="mail-icon" data-icon="right" aria-hidden="true"></span></button>
           <div class="wm-tool-group wm-tool-move" role="group" aria-label="Move message">
             <button class="wm-tool" @click="selectedAction('move')" :disabled="mutating" aria-label="Move this message" title="Move this message"><span class="mail-icon" data-icon="folder" aria-hidden="true"></span></button>
             <select x-model="moveTo" :disabled="mutating" aria-label="Move destination"><option :for="item in folders" :value="item.name" :text="folderName(item.name)"></option></select>
           </div>
-          <button :if="readerJunkAction" class="wm-action wm-junk-action" :class="{ 'wm-action--accent': readerJunkAction === 'not_junk' }" @click="selectedAction(readerJunkAction())" :disabled="mutating || readingLoading" title="Junk feedback applies to future mail from verified senders"><span class="mail-icon" data-icon="shield" aria-hidden="true"></span><span :text="readerJunkAction === 'not_junk' ? 'Not junk' : 'Mark junk'"></span></button>
           <button :if="selected?.folder === 'Newsletters'" class="wm-action wm-newsletter-toggle" @click="newsletterExpanded.set(!newsletterExpanded())" :aria-pressed="readerExpanded" :text="readerExpanded ? 'Show message list' : 'Expand reader'"></button>
           <button :if="readingBatch && selected?.folder !== 'Archive'" type="button" class="wm-action" @click="triageAndNext('archive')" :disabled="triageBusy || mutating || readingLoading">Archive &amp; next</button>
           <button :if="readingBatch && selected?.folder !== 'Trash'" type="button" class="wm-action" @click="triageAndNext('trash')" :disabled="triageBusy || mutating || readingLoading">Trash &amp; next</button>
