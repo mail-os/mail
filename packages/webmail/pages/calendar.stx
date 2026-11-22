@@ -14,7 +14,7 @@ import { reminderDayLink } from '../functions/use-calendar-reminders'
 const {
   account, calendars, activeCalendar, activeCalendarName, calendarExport, calendarColor, eventColor, nameFor,
   sharedCalendars, selectedShare, availabilityOnly, canCreateEvent, writableCalendars, busyPeriods, busyPeriodLabel, shareNotice, recheckShares,
-  view, calendarViews, calendarDays, monthWeekdays, recurringSeries, rangeLabel, loading, error,
+  view, calendarViews, calendarDays, monthWeekdays, yearMonths, yearTabDay, moveYearFocus, recurringSeries, rangeLabel, loading, error,
   searchInput, searchTerm, events, search, clearSearch, focusDay, displayZone, calendarTimeZones,
   refresh, selectCalendar, showView, shiftView, goToToday, showDay, changeDate, changeZone, calendarEventDate,
   calendarSettings, calendarSettingsError, calendarSettingsBusy, calendarNameInput, createCalendar, setCalendarColor, toggleCalendarSettings,
@@ -33,6 +33,12 @@ const {
   setNewCalendarName, submitImport, importEventDate, importStatusLabels, destroy,
   visibleReminders, reminderError, dismissingReminder, tickReminders, pollReminders, dismissReminder, destroyReminders,
 } = useMailCalendar(() => navigate('/login', { reload: true }), { ref: useRef('eventDialog'), nextTick })
+const dayHeading = useRef('dayHeading')
+const availabilityHeading = useRef('availabilityHeading')
+function openYearDay(day) {
+  void showDay(day)
+  nextTick(() => (availabilityOnly() ? availabilityHeading : dayHeading).current?.focus())
+}
 async function bootCalendar() { await refresh(); await openMailEvent(); void pollReminders() }
 useInterval(tickReminders, 1000, { whileVisible: true })
 useInterval(pollReminders, 30000, { whileVisible: true })
@@ -171,8 +177,8 @@ onUnmounted(() => { destroy(); destroyReminders() })
       </ul>
     </section>
 
-    <section :if="availabilityOnly" aria-labelledby="calendar-availability">
-      <h2 id="calendar-availability" class="calendar-range">Free/busy</h2>
+    <section :if="availabilityOnly && view !== 'year'" aria-labelledby="calendar-availability">
+      <h2 id="calendar-availability" ref="availabilityHeading" tabindex="-1" class="calendar-range">Free/busy</h2>
       <p :text="rangeLabel"></p>
       <p :if="!loading && !error && !busyPeriods.length">No busy times in this period.</p>
       <ul :if="busyPeriods.length" class="calendar-share-list" aria-label="Busy periods">
@@ -183,8 +189,35 @@ onUnmounted(() => { destroy(); destroyReminders() })
       </ul>
     </section>
 
-    <section :if="!searchTerm && !availabilityOnly && (calendars.length || selectedShare)" aria-labelledby="calendar-range">
-      <h2 id="calendar-range" class="calendar-range" :text="rangeLabel" aria-live="polite"></h2>
+    <section :if="!searchTerm && view === 'year'" aria-label="Year overview">
+      <div class="calendar-year-heading">
+        <h2 class="calendar-range" :text="rangeLabel" aria-live="polite"></h2>
+        <span class="calendar-year-legend"><span class="calendar-year-marker" aria-hidden="true"></span><span :text="availabilityOnly ? 'Busy day' : 'Events scheduled'"></span></span>
+      </div>
+      <p :if="!availabilityOnly && recurringSeries.length" role="status">Some recurring dates could not be shown. Open a month or day to check those dates.</p>
+      <p id="calendar-year-keys" class="wm-a11y-text">Use the arrow keys to choose a date and Enter to open it.</p>
+      <div class="calendar-year" role="group" aria-label="Days of the year" aria-describedby="calendar-year-keys" @keydown="moveYearFocus($event)">
+        <section :for="month in yearMonths" :key="month.id" class="calendar-year-month" :aria-label="month.name">
+          <h3 :text="month.name"></h3>
+          <div class="calendar-year-weekdays" aria-hidden="true">
+            <span :for="label in monthWeekdays" :text="label"></span>
+          </div>
+          <div class="calendar-year-days">
+            <button :for="day in month.days" :key="day.date" type="button" class="calendar-year-day"
+              :data-date="day.date" :tabindex="day.date === yearTabDay ? 0 : -1"
+              :aria-label="day.label + (day.busy ? ', busy' : day.count ? ', ' + day.count + (day.count === 1 ? ' event' : ' events') : '')"
+              :aria-current="day.today ? 'date' : undefined" :class="{ 'calendar-year-day--marked': day.busy || day.count }"
+              :style="day.number === 1 ? 'grid-column-start:' + month.firstColumn : ''" @click="openYearDay(day.date)">
+              <span :text="day.number"></span>
+              <span :if="day.busy || day.count" class="calendar-year-marker" aria-hidden="true"></span>
+            </button>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <section :if="!searchTerm && !availabilityOnly && view !== 'year' && (calendars.length || selectedShare)" aria-labelledby="calendar-range">
+      <h2 id="calendar-range" ref="dayHeading" tabindex="-1" class="calendar-range" :text="rangeLabel" aria-live="polite"></h2>
       <p :if="!loading && !error && view === 'agenda' && !calendarDays.length">No events in this period.</p>
       <div :if="view === 'month'" class="calendar-weekdays" aria-hidden="true">
         <span :for="label in monthWeekdays" :text="label"></span>

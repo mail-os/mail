@@ -10,6 +10,8 @@ import {
 import type { CalendarView } from './calendar-dates'
 import { calendarAccessLabels, calendarColor } from './calendar-types'
 import type { Calendar, CalendarAccess, CalendarEvent, CalendarShare } from './calendar-types'
+import { calendarYear, calendarYearWindows, nextYearDate } from './calendar-year'
+import type { BusyPeriod } from './calendar-year'
 import { expandSeries } from './calendar-recurrence'
 import type { CalendarOccurrence } from './calendar-recurrence'
 import { useCalendarEditor } from './use-calendar-editor'
@@ -41,14 +43,13 @@ function calendarName(name: string): string {
 
 const calendarViews: { id: CalendarView, name: string }[] = [
   { id: 'day', name: 'Day' }, { id: 'week', name: 'Week' },
-  { id: 'month', name: 'Month' }, { id: 'agenda', name: 'Agenda' },
+  { id: 'month', name: 'Month' }, { id: 'year', name: 'Year' }, { id: 'agenda', name: 'Agenda' },
 ]
 const shortDate: Intl.DateTimeFormatOptions = { dateStyle: 'medium' }
 const dateLabel = new Intl.DateTimeFormat(undefined, { ...shortDate, timeZone: 'UTC' })
 const dateTimeLabel = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' })
 const accessPriority = { free_busy: 0, viewer: 1, editor: 2 }
 
-interface BusyPeriod { start: number, end: number }
 interface CalendarTeam { id: string, name: string }
 
 function calendarEventDate(event: CalendarEvent, zone: string): string {
@@ -90,6 +91,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
   const displayZone = state(browserTimeZone)
   const today = () => zonedDay(Date.now() / 1000, displayZone())
   const focusDay = state(initialDay ?? today())
+  const yearFocus = state('')
   const events = state<CalendarEvent[]>([])
   const busyPeriods = state<BusyPeriod[]>([])
   const shareNotice = state('')
@@ -110,6 +112,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     switch (view()) {
       case 'day': return formatCalendarDay(start, { dateStyle: 'full' })
       case 'month': return formatCalendarDay(focusDay(), { month: 'long', year: 'numeric' })
+      case 'year': return formatCalendarDay(start, { year: 'numeric' })
       default: return `${formatCalendarDay(start, shortDate)} – ${formatCalendarDay(addCalendarDays(end, -1), shortDate)}`
     }
   })
@@ -146,7 +149,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     return `/webmail/api/calendar-export?${params}`
   })
   const calendarDays = derived(() => {
-    if (searchTerm()) return []
+    if (searchTerm() || view() === 'year') return []
     const { start, end } = range()
     const mode = view()
     const zone = displayZone()
@@ -178,6 +181,10 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     }
     return days
   })
+  const yearMonths = derived(() => view() === 'year' && !searchTerm()
+    ? calendarYear(focusDay(), displayZone(), today(), availabilityOnly() ? [] : occurrences().rows, busyPeriods())
+    : [])
+  const yearTabDay = derived(() => yearFocus().slice(0, 4) === focusDay().slice(0, 4) ? yearFocus() : focusDay())
   const monthWeekdays = Array.from({ length: 7 }, (_, index) =>
     formatCalendarDay(addCalendarDays('2026-01-05', index), { weekday: 'short' }))
   const loading = state(true)
@@ -289,24 +296,38 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     const params = new URLSearchParams()
     const selected = activeCalendar()
     if (selected !== null) params.set('calendarId', String(selected))
-    const { start, end } = range()
+    const windows = view() === 'year' ? calendarYearWindows(focusDay()) : [range()]
     const zone = displayZone()
+    function windowParams(start: string, end: string, includeAllDay: boolean) {
+      const query = new URLSearchParams(params)
+      const from = startOfZonedDay(start, zone)
+      const until = startOfZonedDay(end, zone)
+      query.set('start', String(includeAllDay ? Math.min(from, allDayInstant(start)!) : from))
+      query.set('end', String(includeAllDay ? Math.max(until, allDayInstant(end)!) : until))
+      return query
+    }
     if (availabilityOnly()) {
-      params.set('start', String(startOfZonedDay(start, zone)))
-      params.set('end', String(startOfZonedDay(end, zone)))
-      const result = await api<{ busy: BusyPeriod[] }>(`/webmail/api/calendar-free-busy?${params}`, { signal })
-      if (!signal.aborted) busyPeriods.set(result.busy)
+      const results = await Promise.all(windows.map(({ start, end }) =>
+        api<{ busy: BusyPeriod[] }>(`/webmail/api/calendar-free-busy?${windowParams(start, end, false)}`, { signal })))
+      if (!signal.aborted) busyPeriods.set(results.flatMap(result => result.busy))
     }
     else {
       const query = searchTerm()
-      if (query) params.set('q', query)
-      else {
-        params.set('instances', '1')
-        params.set('start', String(Math.min(startOfZonedDay(start, zone), allDayInstant(start)!)))
-        params.set('end', String(Math.max(startOfZonedDay(end, zone), allDayInstant(end)!)))
+      if (query) {
+        params.set('q', query)
+        const result = await api<{ events: CalendarEvent[] }>(`/webmail/api/calendar-events?${params}`, { signal })
+        if (!signal.aborted) events.set(result.events)
+        return
       }
-      const result = await api<{ events: CalendarEvent[] }>(`/webmail/api/calendar-events?${params}`, { signal })
-      if (!signal.aborted) events.set(result.events)
+      params.set('instances', '1')
+      const results = await Promise.all(windows.map(({ start, end }) =>
+        api<{ events: CalendarEvent[] }>(`/webmail/api/calendar-events?${windowParams(start, end, true)}`, { signal })))
+      if (!signal.aborted) {
+        // Range queries can return the same series or multi-day event.
+        const unique = new Map<number, CalendarEvent>()
+        for (const result of results) for (const event of result.events) unique.set(event.id, event)
+        events.set([...unique.values()])
+      }
     }
   }
 
@@ -369,6 +390,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
   }
 
   function showView(mode: CalendarView) {
+    if (mode === 'year') yearFocus.set('')
     view.set(mode)
     searchTerm.set('')
     searchInput.set('')
@@ -376,11 +398,13 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
   }
 
   function shiftView(count: number) {
+    yearFocus.set('')
     focusDay.set(shiftCalendarDay(view(), focusDay(), count))
     return refresh()
   }
 
   function goToToday() {
+    yearFocus.set('')
     focusDay.set(today())
     return refresh()
   }
@@ -393,6 +417,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
   function changeDate(change: Event) {
     const day = (change.target as HTMLInputElement).value
     if (allDayInstant(day) === null) return
+    yearFocus.set('')
     focusDay.set(day)
     return refresh()
   }
@@ -400,6 +425,17 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
   function changeZone(change: Event) {
     displayZone.set((change.target as HTMLSelectElement).value)
     return refresh()
+  }
+
+  function moveYearFocus(event: KeyboardEvent) {
+    const current = event.target
+    if (!(current instanceof HTMLButtonElement) || !current.dataset.date || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+    const next = nextYearDate(current.dataset.date, event.key)
+    if (!next) return
+    event.preventDefault()
+    yearFocus.set(next)
+    const grid = event.currentTarget as HTMLElement
+    grid.querySelector<HTMLButtonElement>(`[data-date="${next}"]`)?.focus()
   }
 
   function search() {
@@ -622,7 +658,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     busyPeriodLabel: (period: BusyPeriod) => new Intl.DateTimeFormat(undefined, {
       dateStyle: 'medium', timeStyle: 'short', timeZone: displayZone(),
     }).formatRange(new Date(period.start * 1000), new Date(period.end * 1000)),
-    view, calendarViews, calendarDays, monthWeekdays, recurringSeries, rangeLabel, loading, error,
+    view, calendarViews, calendarDays, monthWeekdays, yearMonths, yearTabDay, moveYearFocus, recurringSeries, rangeLabel, loading, error,
     searchInput, searchTerm, events, search, clearSearch, focusDay, displayZone, calendarTimeZones,
     refresh, selectCalendar, showView, shiftView, goToToday, showDay, changeDate, changeZone,
     calendarSettings, calendarSettingsError, calendarSettingsBusy, calendarNameInput, createCalendar, setCalendarColor, toggleCalendarSettings,

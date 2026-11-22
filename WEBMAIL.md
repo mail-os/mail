@@ -108,10 +108,12 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   copy and draft. Remote attempts without a recorded outcome appear as Unknown
   and require review before a manual retry. Confirmed recipients are omitted from
   the retry draft.
-- When CalDAV is enabled, Calendar offers day, week, month, and 30-day agenda
-  views across all calendars or one selected calendar. Search matches titles,
-  locations, and descriptions across dates. Use **Manage calendars** to create
-  a calendar or change its color.
+- When CalDAV is enabled, Calendar offers day, week, month, year, and 30-day agenda
+  views across all calendars or one selected calendar. Year marks days with
+  events, or busy days for an availability-only share. Select a marked or
+  unmarked date to open its day view. With a date focused, the arrow keys move
+  between days and weeks. Search matches titles, locations, and descriptions
+  across dates. Use **Manage calendars** to create a calendar or change its color.
 - Create, edit, and delete events in the browser. The view and editor each have
   a time zone selector. For all-day events, **Last day** includes that date.
 - Recurring dates appear in the calendar using the stored rule, additional

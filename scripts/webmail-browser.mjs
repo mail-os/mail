@@ -700,6 +700,16 @@ async function calendarSharingJourney(captain) {
   await teammate.setViewportSize({ width: 390, height: 844 })
   await fitsViewport(teammate)
   await screenshot(teammate, 'phone-calendar-free-busy')
+  await button(teammate, 'Year').click()
+  const sharedYear = teammate.getByRole('region', { name: 'Year overview' })
+  const busyDay = sharedYear.locator(`[data-date="${day}"]`)
+  await sharedYear.getByRole('button', { name: /, busy$/ }).first().waitFor()
+  assert.match(await busyDay.getAttribute('aria-label'), /, busy$/)
+  assert.equal(await sharedYear.getByRole('button', { name: /\d events?$/ }).count(), 0)
+  assert.equal(await privateTitle.count(), 0)
+  await fitsViewport(teammate)
+  await busyDay.click()
+  await busy.waitFor()
 
   await screenshot(captain, 'desktop-calendar-sharing')
   await button(sharing, `Revoke access for ${sender} to ${calendarLabel}`).click()
@@ -842,6 +852,79 @@ async function mailEventJourney(page, { phone = false, firstCalendar = false } =
   await page.getByRole('region', { name: 'Message reader' }).getByText('Here is the handoff for Thursday.', { exact: true }).waitFor()
 }
 
+async function yearCalendarJourney(desktop, phone) {
+  const leapDay = '2028-02-29'
+  const calendarUrl = `${url}/calendar?day=${leapDay}`
+  await desktop.goto(calendarUrl)
+  const listing = await desktop.request.get(url + '/webmail/api/calendars')
+  assert.equal(listing.status(), 200)
+  const { calendars } = await listing.json()
+  const calendar = calendars.find(item => item.display_name === calendarLabel)
+  assert(calendar, 'The browser fixture calendar must exist')
+
+  async function createEvent(uid, fields) {
+    const icalendar = [
+      'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Mail browser fixture//EN', 'BEGIN:VEVENT',
+      `UID:${uid}@mail.example`, 'DTSTAMP:20261122T100000Z', ...fields, 'END:VEVENT', 'END:VCALENDAR', '',
+    ].join('\r\n')
+    const response = await desktop.request.post(`${url}/webmail/api/calendar-events?calendarId=${calendar.id}`, {
+      headers: { Origin: url, 'Content-Type': 'text/calendar' },
+      data: icalendar,
+    })
+    assert.equal(response.status(), 201, await response.text())
+  }
+
+  await createEvent('leap-day', ['DTSTART;VALUE=DATE:20280229', 'DTEND;VALUE=DATE:20280301', 'SUMMARY:Leap day'])
+  await createEvent('quarter-handoff', ['DTSTART:20280401T003000Z', 'DURATION:PT1H', 'SUMMARY:Quarter handoff'])
+  await createEvent('weekly-planning', ['DTSTART:20280325T120000Z', 'DURATION:PT1H', 'RRULE:FREQ=WEEKLY;COUNT=3', 'SUMMARY:Weekly planning'])
+
+  await button(desktop, 'Year').click()
+  const year = desktop.getByRole('region', { name: 'Year overview' })
+  const leap = year.locator(`[data-date="${leapDay}"]`)
+  await year.getByRole('button', { name: /February 29, 2028, 1 event$/ }).waitFor()
+  assert.equal(await year.getByRole('heading', { level: 3 }).count(), 12)
+  assert.equal(await year.locator('[data-date]').count(), 366)
+  assert.equal(await year.locator('[tabindex="0"]').count(), 1)
+  assert.equal(await year.locator('.calendar-year').evaluate(grid => getComputedStyle(grid).gridTemplateColumns.split(' ').length), 4)
+  assert.equal(await leap.getAttribute('tabindex'), '0')
+  const april = year.locator('[data-date="2028-04-01"]')
+  const march = year.locator('[data-date="2028-03-31"]')
+  assert.match(await april.getAttribute('aria-label'), /, 2 events$/)
+  await desktop.getByRole('combobox', { name: 'Display time zone' }).selectOption('America/New_York')
+  await year.getByRole('button', { name: /March 31, 2028, 1 event$/ }).waitFor()
+  assert.match(await april.getAttribute('aria-label'), /, 1 event$/)
+  assert.match(await march.getAttribute('aria-label'), /, 1 event$/)
+  assert.match(await leap.getAttribute('aria-label'), /, 1 event$/)
+  await fitsViewport(desktop)
+  await screenshot(desktop, 'desktop-calendar-year')
+
+  await leap.press('ArrowRight')
+  const marchFirst = year.locator('[data-date="2028-03-01"]')
+  assert(await marchFirst.evaluate(node => document.activeElement === node), 'Arrow navigation moves focus to the next date')
+  assert.equal(await year.locator('[tabindex="0"]').count(), 1)
+  await marchFirst.press('ArrowLeft')
+  await leap.press('Enter')
+  await heading(desktop, 'Tuesday, February 29, 2028').waitFor()
+  assert(await heading(desktop, 'Tuesday, February 29, 2028').evaluate(node => document.activeElement === node), 'Opening a day focuses its heading')
+  await button(desktop, /Leap day/).waitFor()
+  await button(desktop, 'Year').click()
+  await button(desktop, 'Next period').click()
+  await heading(year, '2029').waitFor()
+  assert.equal(await year.locator('[data-date]').count(), 365)
+  assert.equal(await desktop.getByLabel('Jump to date', { exact: true }).inputValue(), '2029-02-28')
+
+  await phone.goto(calendarUrl)
+  await button(phone, 'Year').click()
+  const phoneYear = phone.getByRole('region', { name: 'Year overview' })
+  await phoneYear.getByRole('button', { name: /February 29, 2028, 1 event$/ }).waitFor()
+  await phone.setViewportSize({ width: 320, height: 844 })
+  await fitsViewport(phone)
+  const february = phoneYear.getByRole('region', { name: 'February', exact: true })
+  assert((await february.locator(`[data-date="${leapDay}"]`).boundingBox()).height >= 44)
+  await february.screenshot({ path: join(output, 'phone-calendar-year.png'), animations: 'disabled' })
+  await phone.setViewportSize({ width: 390, height: 844 })
+}
+
 async function navigationRequestsJourney(page) {
   await page.goto(url + '/')
   const refresh = button(page, 'Refresh messages')
@@ -911,6 +994,7 @@ try {
   const firstRun = await signIn({ phone: true, account: newcomer, initialSubject: 'Studio launch notes' })
   await mailEventJourney(firstRun, { phone: true, firstCalendar: true })
   await invitationRangeJourney(desktop, phone)
+  await yearCalendarJourney(desktop, phone)
   await navigationRequestsJourney(desktop)
   assert.deepEqual(errors, [], 'Browser pages raised uncaught errors')
   process.stdout.write(`${engine} passed the desktop and phone webmail journeys.\n`)

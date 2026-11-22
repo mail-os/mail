@@ -1,4 +1,4 @@
-export type CalendarView = 'day' | 'week' | 'month' | 'agenda'
+export type CalendarView = 'day' | 'week' | 'month' | 'year' | 'agenda'
 
 const daySeconds = 86_400
 const zonedFormatters = new Map<string, Intl.DateTimeFormat>()
@@ -72,7 +72,7 @@ function weekStart(day: string): string {
   return addCalendarDays(day, -((weekday + 6) % 7))
 }
 
-function monthStart(day: string, shift: number): string {
+export function monthStart(day: string, shift: number): string {
   const date = new Date(`${day.slice(0, 7)}-01T00:00:00Z`)
   date.setUTCMonth(date.getUTCMonth() + shift)
   return date.toISOString().slice(0, 10)
@@ -89,12 +89,21 @@ export function calendarRange(view: CalendarView, day: string): { start: string,
       const start = weekStart(monthStart(day, 0))
       return { start, end: addCalendarDays(weekStart(addCalendarDays(monthStart(day, 1), -1)), 7) }
     }
+    case 'year': {
+      const start = day.slice(0, 4) + '-01-01'
+      return { start, end: monthStart(start, 12) }
+    }
     case 'agenda': return { start: day, end: addCalendarDays(day, 30) }
   }
 }
 
 export function shiftCalendarDay(view: CalendarView, day: string, count: number): string {
   if (view === 'month') return monthStart(day, count)
+  if (view === 'year') {
+    const month = monthStart(day, count * 12)
+    const last = Number(addCalendarDays(monthStart(month, 1), -1).slice(8))
+    return month.slice(0, 8) + String(Math.min(Number(day.slice(8)), last)).padStart(2, '0')
+  }
   return addCalendarDays(day, count * (view === 'week' ? 7 : view === 'agenda' ? 30 : 1))
 }
 

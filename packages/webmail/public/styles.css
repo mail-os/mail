@@ -523,6 +523,27 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-entry-time, .calendar-entry-meta, .calendar-result span, .calendar-day-empty { color: var(--muted); font-size: .75rem; }
 .calendar-board-month .calendar-entry { font-size: .8125rem; }
 .calendar-month-markers { display: none; }
+.calendar-year-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-block: 16px 12px; }
+.calendar-year-heading .calendar-range { margin: 0; }
+.calendar-year-legend { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+.calendar-year { --year-day-height: 24px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.calendar-year-month { min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); }
+.calendar-year-month h3 { margin: 0 0 8px; font-size: 14px; font-weight: 650; }
+.calendar-year-weekdays, .calendar-year-days { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 2px; }
+.calendar-year-weekdays { margin-bottom: 4px; color: var(--muted); font-size: 10px; text-align: center; }
+.calendar-year-day { position: relative; display: grid; place-content: center; min-block-size: var(--year-day-height); padding: 0; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--text); font-size: 13px; font-variant-numeric: tabular-nums; }
+.calendar-year-day--marked { background: var(--accent-soft); color: var(--accent); font-weight: 650; }
+.calendar-year-day:hover { border-color: var(--control-border); background: var(--hover); }
+.calendar-year-day[aria-current=date] { background: var(--primary); color: var(--on-primary); }
+.calendar-year-marker { display: inline-block; inline-size: 4px; block-size: 4px; border-radius: 50%; background: var(--accent); }
+.calendar-year-day .calendar-year-marker { position: absolute; inset-block-end: 2px; inset-inline-start: calc(50% - 2px); background: currentColor; }
+@media (max-width: 1120px) { .calendar-year { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 850px) { .calendar-year { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 600px) { .calendar-year { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 860px), (pointer: coarse) {
+  .calendar-year { --year-day-height: var(--control-height); }
+  .calendar-year-day .calendar-year-marker { inset-block-end: 5px; }
+}
 .calendar-board-day .calendar-day, .calendar-board-agenda .calendar-day { padding: .75rem; min-height: 0; }
 .calendar-board-day .calendar-entry, .calendar-board-agenda .calendar-entry { padding: .55rem .7rem; }
 .calendar-result { padding: .65rem .75rem; background: var(--panel); grid-template-columns: minmax(10rem, 1.2fr) repeat(3, minmax(0, 1fr)); align-items: baseline; }

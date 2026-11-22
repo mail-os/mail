@@ -3,6 +3,7 @@ import {
   allDayInstant, calendarRange, eventOverlaps, instantForLocal, shiftCalendarDay,
   startOfZonedDay, zonedDay,
 } from './functions/calendar-dates'
+import { calendarYear, calendarYearWindows, nextYearDate } from './functions/calendar-year'
 
 const zone = 'America/New_York'
 
@@ -42,4 +43,37 @@ test('weeks align on Mondays and month navigation includes adjacent dates', () =
   expect(shiftCalendarDay('month', '2026-01-31', -1)).toBe('2025-12-01')
   expect(shiftCalendarDay('month', '2026-01-31', 1)).toBe('2026-02-01')
   expect(shiftCalendarDay('agenda', '2026-12-15', 1)).toBe('2027-01-14')
+})
+
+test('year navigation preserves the civil date and bounds the calendar requests', () => {
+  expect(calendarRange('year', '2028-02-29')).toEqual({ start: '2028-01-01', end: '2029-01-01' })
+  expect(shiftCalendarDay('year', '2028-02-29', 1)).toBe('2029-02-28')
+  expect(shiftCalendarDay('year', '2028-02-29', -4)).toBe('2024-02-29')
+  expect(calendarYearWindows('2028-02-29')).toEqual([
+    { start: '2028-01-01', end: '2028-04-01' },
+    { start: '2028-04-01', end: '2028-07-01' },
+    { start: '2028-07-01', end: '2028-10-01' },
+    { start: '2028-10-01', end: '2029-01-01' },
+  ])
+  expect(nextYearDate('2028-02-29', 'ArrowRight')).toBe('2028-03-01')
+  expect(nextYearDate('2028-02-29', 'ArrowUp')).toBe('2028-02-22')
+  expect(nextYearDate('2028-12-31', 'ArrowDown')).toBe('2028-12-31')
+  expect(nextYearDate('2028-01-02', 'Home')).toBe('2028-01-01')
+  expect(nextYearDate('2028-02-29', 'Tab')).toBeNull()
+})
+
+test('year marks retain all-day dates and use the display zone for timed events and busy periods', () => {
+  const stamp = (iso: string) => Date.parse(iso) / 1000
+  const months = calendarYear('2028-03-01', zone, '2028-02-29', [
+    { start: stamp('2028-02-29T00:00Z'), end: stamp('2028-03-01T00:00Z'), all_day: true },
+    { start: stamp('2028-04-01T03:30Z'), end: stamp('2028-04-01T04:00Z'), all_day: false },
+    { start: stamp('2028-03-12T06:45Z'), end: stamp('2028-03-12T07:15Z'), all_day: false },
+  ], [{ start: stamp('2028-04-01T03:30Z'), end: stamp('2028-04-01T04:00Z') }])
+  expect(months).toHaveLength(12)
+  expect(months[0].firstColumn).toBe(6)
+  expect(months.flatMap(month => month.days)).toHaveLength(366)
+  expect(months[1].days.at(-1)).toMatchObject({ date: '2028-02-29', today: true, count: 1, busy: false })
+  expect(months[2].days[11]).toMatchObject({ date: '2028-03-12', count: 1, busy: false })
+  expect(months[2].days.at(-1)).toMatchObject({ date: '2028-03-31', count: 1, busy: true })
+  expect(months[3].days[0]).toMatchObject({ date: '2028-04-01', count: 0, busy: false })
 })
