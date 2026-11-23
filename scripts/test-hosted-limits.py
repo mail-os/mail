@@ -941,7 +941,8 @@ def check_smart_mail(test, sink):
                       subject="Smart reply edited", payload=b"Edited reply only")
     assert send(reply, edited, "missing", refer=None) == 106
     assert send(forward, edited, "mismatch", refer=("4", source[1])) == 105
-    assert send(reply, edited, "calendar", refer=("5", "5:1")) == 147
+    assert send(reply, edited, "calendar", refer=("5", "5:1")) == 150
+    assert send(reply, edited, "contacts", refer=("6", "6:1")) == 147
     assert send(forward, edited, "stale", refer=("1", "1:999999")) == 150
     assert test.count(owner) == 0 and test.bytes(owner) == baseline
 
