@@ -1545,9 +1545,12 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .calendar-view-toolbar { gap: 8px; }
   .calendar-view-modes, .calendar-period, .calendar-zone { width: 100%; }
   .calendar-view-modes .wm-action { flex: 1 0 auto; justify-content: center; padding-inline: 5px; }
-  .calendar-period-buttons { flex: 1 0 auto; }
-  .calendar-today { flex: 1; }
-  .calendar-jump { flex: 1 0 9.5rem; }
+  .calendar-period-buttons {
+    flex: 1 0 calc(2 * var(--control-height) + 3.75rem + 2 * var(--calendar-control-gap));
+    min-inline-size: 0;
+  }
+  .calendar-today { flex: 1; padding-inline: 7px; }
+  .calendar-jump { flex: 1 0 9.25rem; }
   .calendar-zone { justify-content: space-between; white-space: nowrap; }
   .calendar-zone select { flex: 1 1 0; max-width: 60%; }
   .calendar-range { margin-block: 12px 7px; }

@@ -168,7 +168,7 @@ async function verifyCalendarPeriod(page, label, height) {
     assert(Math.abs(arrow.right - arrow.left - height) < 0.5, 'Previous and next have square hit areas')
   }
   const date = controls[3]
-  assert(date.right - date.left >= 152, 'Jump to date leaves room for the native date and picker')
+  assert(date.right - date.left >= (width <= 490 ? 148 : 152), 'Jump to date leaves room for the native date and picker')
   const datePicker = button(group, 'Open date picker')
   const pickerIcon = await datePicker.locator('.mail-icon').boundingBox()
   assert.equal(pickerIcon.width, 16)
