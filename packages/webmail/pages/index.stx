@@ -951,6 +951,15 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
     </div>
   </div>
 </section>
+<details class="login-recovery wm-install-help">
+  <summary><span class="mail-icon" data-icon="download" aria-hidden="true"></span>Install Mail<span class="mail-icon wm-install-chevron" data-icon="down" aria-hidden="true"></span></summary>
+  <dl>
+    <dt>Chrome on desktop</dt><dd>Open <strong>Cast, save, and share</strong> in the browser menu, then choose <strong>Install page as app</strong>.</dd>
+    <dt>Chrome on Android</dt><dd>Choose <strong>Add to Home screen</strong> from the browser menu, then select <strong>Install</strong>.</dd>
+    <dt>Safari on Mac</dt><dd>Choose <strong>Add to Dock</strong> from the Share menu.</dd>
+    <dt>Safari on iPhone or iPad</dt><dd>Choose <strong>Add to Home Screen</strong> from the Share menu and turn on <strong>Open as Web App</strong>.</dd>
+  </dl>
+</details>
 <section class="login-recovery" aria-labelledby="notificationHeading">
   <h2 id="notificationHeading"><span class="mail-icon" data-icon="bell" aria-hidden="true"></span>Browser notifications</h2>
   <p class="login-sub">Receive a private “You have new mail” alert while webmail is open.</p>

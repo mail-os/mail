@@ -786,6 +786,13 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
         if (std.mem.eql(u8, p, "/styles.css")) {
             return serveAsset(conn, arena, styles_css, "text/css; charset=utf-8");
         }
+        if (std.mem.eql(u8, p, "/mail.webmanifest")) {
+            return serveAsset(conn, arena, @embedFile("webmail_dist/mail.webmanifest"), "application/manifest+json; charset=utf-8");
+        }
+        inline for (.{ "mail-icon-192.png", "mail-icon-512.png", "mail-icon-maskable.png" }) |icon| {
+            if (std.mem.eql(u8, p, "/" ++ icon))
+                return serveAsset(conn, arena, @embedFile("webmail_dist/" ++ icon), "image/png");
+        }
         if (std.mem.eql(u8, p, "/mail-notifications.js")) {
             return serveAsset(conn, arena, notifications_worker, "application/javascript; charset=utf-8");
         }

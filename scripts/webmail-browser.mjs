@@ -2082,10 +2082,81 @@ async function retentionJourney(phone) {
   assert((await result.json()).items.some(message => message.subject === 'Archived planning notes'))
 }
 
+async function verifyInstallableWebmail(page) {
+  const path = '/mail.webmanifest'
+  assert.equal(await page.locator('link[rel=manifest]').getAttribute('href'), path)
+  const guest = await browser.newContext({ ignoreHTTPSErrors: true })
+  try {
+    const response = await guest.request.get(url + path)
+    assert.equal(response.status(), 200)
+    assert.match(response.headers()['content-type'], /^application\/manifest\+json/)
+    assert.equal(response.headers()['set-cookie'], undefined)
+    const manifest = await response.json()
+    assert.deepEqual([manifest.name, manifest.id, manifest.scope, manifest.start_url, manifest.display],
+      ['Mail', '/', '/', '/', 'standalone'])
+    assert.deepEqual(manifest.icons.map(icon => [icon.sizes, icon.purpose]), [
+      ['192x192', 'any'], ['512x512', 'any'], ['512x512', 'maskable'],
+    ])
+    for (const { src, sizes } of manifest.icons) {
+      assert.equal(new URL(src, url).origin, url)
+      const icon = await guest.request.get(new URL(src, url).href)
+      assert.equal(icon.status(), 200)
+      assert.equal(icon.headers()['content-type'], 'image/png')
+      assert.equal(icon.headers()['set-cookie'], undefined)
+      const png = await icon.body()
+      assert.equal(png.subarray(0, 8).toString('hex'), '89504e470d0a1a0a')
+      assert.equal(`${png.readUInt32BE(16)}x${png.readUInt32BE(20)}`, sizes)
+    }
+    const launch = await guest.newPage()
+    await launch.goto(url + manifest.start_url)
+    await heading(launch, 'Sign in to Mail').waitFor()
+    assert.equal(await launch.locator('link[rel=manifest]').getAttribute('href'), path)
+    assert.equal(await launch.locator('link[rel=apple-touch-icon]').getAttribute('href'), '/mail-icon-maskable.png')
+    assert.deepEqual(await launch.evaluate(() => caches.keys()), [])
+    const unauthenticated = await guest.request.get(url + '/webmail/api/messages')
+    assert.equal(unauthenticated.status(), 401, 'Launching an installed app still requires a mailbox session')
+  }
+  finally { await guest.close() }
+  if (engine === 'chromium') {
+    const cdp = await page.context().newCDPSession(page)
+    try {
+      const info = await cdp.send('Page.getAppManifest')
+      assert.equal(info.url, url + path)
+      assert.deepEqual(info.errors, [])
+      assert.deepEqual(await cdp.send('Page.getInstallabilityErrors'), { installabilityErrors: [] })
+    }
+    finally { await cdp.detach() }
+  }
+}
+
+async function installGuideJourney(page, phone = false) {
+  const viewport = page.viewportSize()
+  if (phone) {
+    await page.setViewportSize({ width: 320, height: 844 })
+    await drawer(page).click()
+  }
+  await button(page, 'Account').click()
+  const settings = page.getByRole('dialog', { name: 'Account settings' })
+  const help = settings.locator('.wm-install-help')
+  const summary = help.locator('summary')
+  assert((await summary.boundingBox()).height >= (phone ? 44 : 36))
+  await summary.press('Enter')
+  await help.getByText('Add to Home Screen', { exact: true }).waitFor()
+  await fitsViewport(page)
+  await help.screenshot({ path: join(output, phone ? 'phone-install-mail.png' : 'desktop-install-mail.png'), animations: 'disabled' })
+  await button(settings, 'Close').click()
+  if (phone) await page.setViewportSize(viewport)
+  await page.goto(url + '/')
+  await button(page, new RegExp(handoff)).waitFor()
+}
+
 try {
   const desktop = await signIn()
+  await verifyInstallableWebmail(desktop)
+  await installGuideJourney(desktop)
   await desktopJourney(desktop)
   const phone = await signIn({ phone: true })
+  await installGuideJourney(phone, true)
   await phoneJourney(phone)
   await invitationJourney(desktop)
   await invitationJourney(phone, true)

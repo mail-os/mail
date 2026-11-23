@@ -1,6 +1,6 @@
 /** Compile stx pages and embed their runtime and ts-css in the mail binary. */
 import { renderTemplate } from '@stacksjs/stx'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { Script } from 'node:vm'
 import { calendarTimeZoneCatalog } from './build-calendar-timezones'
@@ -11,6 +11,21 @@ export function stylesheetUrl(styles: Uint8Array): string {
 }
 
 export const webmailPages = ['index', 'login', 'recover', 'status', 'calendar', 'shared', 'combined', 'snapshot', 'file-link'] as const
+export const webmailAppPages = new Set(['index', 'login', 'calendar', 'shared', 'combined'])
+export const webmailAppAssets: Record<string, string> = {
+  'mail.webmanifest': 'application/manifest+json; charset=utf-8',
+  'mail-icon-192.png': 'image/png',
+  'mail-icon-512.png': 'image/png',
+  'mail-icon-maskable.png': 'image/png',
+}
+
+const webmailAppHead = [
+  '<link rel="manifest" href="/mail.webmanifest">',
+  '<link rel="icon" href="/mail-icon-192.png" sizes="192x192" type="image/png">',
+  '<link rel="apple-touch-icon" href="/mail-icon-maskable.png">',
+  '<meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">',
+  '<meta name="theme-color" content="#191a1e" media="(prefers-color-scheme: dark)">',
+].join('\n  ')
 
 export async function buildWebmail(): Promise<void> {
   const root = import.meta.dir
@@ -27,10 +42,13 @@ export async function buildWebmail(): Promise<void> {
         throw new Error(`STX did not bundle the client module registry for ${page}`)
       new Script(registry[1], { filename: `${page}.html (stx module registry)` })
     }
-    await writeFile(join(dist, `${page}.html`), html.replace('href="/styles.css"', `href="${stylesheetUrl(styles)}"`))
+    const styled = html.replace('href="/styles.css"', `href="${stylesheetUrl(styles)}"`)
+    const compiled = webmailAppPages.has(page) ? styled.replace('</head>', `  ${webmailAppHead}\n</head>`) : styled
+    await writeFile(join(dist, `${page}.html`), compiled)
   }
   await writeFile(join(dist, 'styles.css'), styles)
-  await writeFile(join(dist, 'mail-notifications.js'), await readFile(join(root, 'public/mail-notifications.js')))
+  for (const name of ['mail-notifications.js', ...Object.keys(webmailAppAssets)])
+    await copyFile(join(root, 'public', name), join(dist, name))
   await writeFile(join(dist, 'calendar_timezones.ics'), calendarTimeZoneCatalog())
 }
 

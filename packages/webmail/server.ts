@@ -1,5 +1,5 @@
 /** Development server uses the same STX build that ships in the mail binary. */
-import { buildWebmail } from './build'
+import { buildWebmail, webmailAppAssets } from './build'
 
 async function main(): Promise<void> {
   await buildWebmail()
@@ -21,6 +21,9 @@ async function main(): Promise<void> {
         }
         catch { return Response.json({ message: 'Mail API is unavailable.' }, { status: 502 }) }
       }
+      const appAsset = url.pathname.slice(1)
+      if (Object.hasOwn(webmailAppAssets, appAsset))
+        return new Response(Bun.file(`${dist}/${appAsset}`), { headers: { 'Content-Type': webmailAppAssets[appAsset] } })
       const assets: Record<string, string> = { '/calendar': 'calendar.html', '/shared': 'shared.html', '/combined': 'combined.html', '/status': 'status.html', '/': 'index.html', '/login': 'login.html', '/forgot': 'recover.html', '/reset': 'recover.html', '/styles.css': 'styles.css' }
       const file = assets[url.pathname]
       return file ? new Response(Bun.file(`${dist}/${file}`)) : new Response('Not found', { status: 404 })

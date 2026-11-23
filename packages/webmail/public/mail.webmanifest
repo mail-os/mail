@@ -1,0 +1,15 @@
+{
+  "id": "/",
+  "name": "Mail",
+  "short_name": "Mail",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f1f2f5",
+  "theme_color": "#f6f7f9",
+  "icons": [
+    { "src": "/mail-icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/mail-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/mail-icon-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

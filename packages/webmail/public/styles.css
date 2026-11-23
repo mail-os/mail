@@ -1082,6 +1082,18 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-retention-recovery { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
 .wm-retention-recovery h3 { margin: 0 0 5px; font-size: 14px; }
 .wm-retention-recovery li button { margin-top: 0; }
+.wm-account-settings .wm-install-help { padding-block: 6px; }
+.wm-install-help summary { display: flex; align-items: center; gap: 8px; min-block-size: var(--control-height); font-weight: 650; cursor: pointer; }
+.wm-install-help summary::-webkit-details-marker { display: none; }
+.wm-install-help summary .mail-icon:first-child { color: var(--accent); }
+.wm-install-help summary .wm-install-chevron { margin-inline-start: auto; }
+.wm-install-help[open] .wm-install-chevron { transform: rotate(180deg); }
+.wm-install-help summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--control-radius); }
+.wm-install-help dl { margin: 0; padding-block: 4px 8px; font-size: 13px; line-height: 1.45; }
+.wm-install-help dt { font-weight: 600; }
+.wm-install-help dd { margin: 2px 0 10px; color: var(--muted); }
+.wm-install-help dd:last-child { margin-block-end: 0; }
+@media (display-mode: standalone) { .wm-account-settings .wm-install-help { display: none; } }
 .wm-vacation-heading, .wm-vacation-heading h2 { display: flex; align-items: center; gap: 6px; }
 .wm-vacation-heading { justify-content: space-between; }
 .wm-vacation-heading h2 { margin: 0; }

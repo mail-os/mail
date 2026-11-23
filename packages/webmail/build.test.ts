@@ -1,7 +1,7 @@
 import { renderString, renderTemplate, transformAutoImports } from '@stacksjs/stx'
 import { expect, test } from 'bun:test'
 import { join } from 'node:path'
-import { buildWebmail, stylesheetUrl, webmailPages } from './build'
+import { buildWebmail, stylesheetUrl, webmailAppAssets, webmailAppPages, webmailPages } from './build'
 
 test('standalone stx script insertion preserves literal JavaScript replacement patterns', async () => {
   const text = '$&|$1|$$'
@@ -29,6 +29,13 @@ test('deployments fingerprint styles so existing browsers fetch updated controls
   for (const page of webmailPages) {
     const html = await Bun.file(join(import.meta.dir, `../zig/src/api/webmail_dist/${page}.html`)).text()
     expect(html).toMatch(/href="\/styles\.css\?v=[0-9a-f]{16}"/)
+    expect(html.includes('rel="manifest" href="/mail.webmanifest"')).toBe(webmailAppPages.has(page))
+    expect(html.includes('rel="apple-touch-icon" href="/mail-icon-maskable.png"')).toBe(webmailAppPages.has(page))
+  }
+  for (const name of Object.keys(webmailAppAssets)) {
+    const publicAsset = Bun.file(join(import.meta.dir, 'public', name))
+    const embeddedAsset = Bun.file(join(import.meta.dir, '../zig/src/api/webmail_dist', name))
+    expect(await embeddedAsset.bytes()).toEqual(await publicAsset.bytes())
   }
 })
 

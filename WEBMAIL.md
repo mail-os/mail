@@ -5,6 +5,21 @@ used by SMTP and IMAP. Users sign in with their full mailbox address and mail
 password. Deployments expose HTTPS through ts-cloud's native rpx integration;
 webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud.
 
+## Install Mail
+
+Open Mail at your HTTPS address. In **Account → Install Mail**, find the
+steps for your browser. Chrome on desktop uses
+**Cast, save, and share → Install page as app**.
+On a Mac, use Safari's **Add to Dock**. On an iPhone or iPad, use Safari's
+**Add to Home Screen** and turn on **Open as Web App**.
+[Chrome installation](https://support.google.com/chrome/answer/9658361)
+· [Safari on Mac](https://support.apple.com/en-us/104996)
+· [Safari on iPhone](https://support.apple.com/guide/iphone/open-as-web-app-iphea86e5236/ios)
+
+The installed app opens your inbox through the same account sign-in. It
+requires a connection to your Mail server. Browser notifications remain an
+opt-in under Account settings. See the [client and automation decisions](docs/CLIENT_SURFACES.md).
+
 ## Mailbox experience
 
 - Drafts autosave while the composer remains open. Server acknowledgements drive
