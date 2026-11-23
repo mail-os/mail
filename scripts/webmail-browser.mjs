@@ -845,6 +845,49 @@ async function calendarToolsJourney(desktop, phone) {
   await phone.setViewportSize({ width: 390, height: 844 })
 }
 
+async function shareLaterReply(desktop, viewer, originalUrl, originalSubject) {
+  const replyText = 'Please use the updated billing contact for the next payment.'
+  const replySubject = `Re: ${originalSubject}`
+  await button(desktop, 'Reply').click()
+  const composer = desktop.getByRole('dialog', { name: 'Compose message' })
+  const body = composer.getByLabel('Message body')
+  const quote = await body.inputValue()
+  assert.match(quote, /> Your November payment of \$18\.00 was received\./)
+  await body.fill(replyText + quote)
+  await composer.getByLabel('Undo Send delay', { exact: true }).selectOption('0')
+  await button(composer, 'Send').click()
+  await composer.waitFor({ state: 'hidden' })
+
+  await openMailbox(desktop, /^Sent(?:\s|$)/)
+  await button(desktop, /Re: Your receipt #1046/).click()
+  await heading(desktop, replySubject).waitFor()
+  await viewer.goto(originalUrl)
+  await heading(viewer, originalSubject).waitFor()
+  assert.equal(await viewer.getByText(replyText).count(), 0, 'The original link never picks up a sent reply')
+
+  await button(desktop, 'Share snapshot').click()
+  const dialog = desktop.getByRole('dialog', { name: 'Share a snapshot' })
+  const preview = dialog.getByRole('region', { name: 'Snapshot preview' })
+  await heading(preview, replySubject).waitFor()
+  assert.equal(await preview.locator('.wm-snapshot-message').count(), 1)
+  const approved = await preview.locator('.wm-snapshot-body').textContent()
+  assert(approved.includes(replyText) && approved.includes('> Your November payment'))
+  await dialog.getByLabel('Link expires in').selectOption('86400')
+  await dialog.locator('.wm-snapshot-panel').screenshot({ path: join(output, 'desktop-later-reply-preview.png'), animations: 'disabled' })
+  await button(dialog, 'Create link').click()
+  const created = desktop.getByRole('dialog', { name: 'Snapshot link created' })
+  const replyUrl = await created.getByRole('textbox', { name: 'Snapshot link' }).inputValue()
+  assert.notEqual(replyUrl, originalUrl)
+  await button(created, 'Close').click()
+
+  await viewer.goto(replyUrl)
+  await heading(viewer, replySubject).waitFor()
+  assert.equal(await viewer.locator('.wm-snapshot-message').count(), 1)
+  assert.equal(await viewer.locator('.wm-snapshot-body').textContent(), approved)
+  await screenshot(viewer, 'phone-later-reply-viewer')
+  return replySubject
+}
+
 async function snapshotSharingJourney(desktop, phone) {
   const subject = 'Your receipt #1046'
   await desktop.goto(url + '/')
@@ -915,15 +958,25 @@ async function snapshotSharingJourney(desktop, phone) {
     await fitsViewport(viewer)
     await screenshot(viewer, 'phone-snapshot-viewer')
 
+    const replySubject = await shareLaterReply(desktop, viewer, singleUrl, subject)
     await button(desktop, 'Account').click()
     const account = desktop.getByRole('dialog', { name: 'Account settings' })
     await button(account, 'Manage shared links').click()
     const manager = desktop.getByRole('dialog', { name: 'Shared links' })
+    const revokeReply = button(manager, `Revoke link for ${replySubject}`)
+    await revokeReply.click()
+    await button(manager.getByRole('group', { name: 'Confirm revocation' }), 'Revoke link').click()
+    await revokeReply.waitFor({ state: 'hidden' })
+    await viewer.reload()
+    await viewer.getByText(/This snapshot link is unavailable/).waitFor()
+    await viewer.goto(singleUrl)
+    await heading(viewer, subject).waitFor()
+    assert.equal(await viewer.locator('.wm-snapshot-message').count(), 1)
     const revoke = button(manager, `Revoke link for ${subject}`)
     await revoke.click()
     await button(manager.getByRole('group', { name: 'Confirm revocation' }), 'Revoke link').click()
     await revoke.waitFor({ state: 'hidden' })
-    await viewer.goto(singleUrl)
+    await viewer.reload()
     await viewer.getByText(/This snapshot link is unavailable/).waitFor()
     assert.equal(await heading(viewer, subject).count(), 0)
     await viewer.goto(bulkUrl)

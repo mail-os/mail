@@ -158,6 +158,15 @@ def verify_delivery(fixture, sender):
     status, _, body = request(fixture.webmail + "/webmail/api/attachment?" + query,
                               headers=session, context=fixture.tls_context)
     assert status == 200 and body == b"Review the handoff", (status, body)
+    reply_subject = "Re: Your receipt #1046"
+    query = urlencode({"folder": "INBOX", "conversations": "false", "q": reply_subject})
+    status, listing = fixture.api(session, "messages?" + query)
+    assert status == 200, listing
+    row, = [row for row in listing["items"] if row["subject"] == reply_subject]
+    status, detail = fixture.api(session, "messages/ref/" + row["reference"])
+    assert status == 200 and detail["in_reply_to"] == "<browser-fixture-3@hosted.example.test>", detail
+    assert "Please use the updated billing contact" in detail["text"]
+    assert "> Your November payment of $18.00 was received." in detail["text"]
     for label, response in (("Accepted", "ACCEPTED"), ("Tentative", "TENTATIVE")):
         subject = f"{label}: Studio reservation"
         status, listing = fixture.api(session, "messages?" + urlencode({"folder": "INBOX", "q": subject}))

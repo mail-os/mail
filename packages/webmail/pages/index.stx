@@ -1002,7 +1002,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
     <p :if="snapshotError" class="wm-inline-error" role="alert" :text="snapshotError"></p>
     <p :if="snapshotNotice" class="wm-snapshot-muted" role="status" :text="snapshotNotice"></p>
     <div :if="snapshotMode === 'preview'" class="wm-snapshot-workflow">
-      <p class="wm-snapshot-muted">Anyone with the link can read the text shown here until it expires or you revoke it. The snapshot contains only these messages. Attachments, images, and later replies stay in Mail.</p>
+      <p class="wm-snapshot-muted">Anyone with the link can read this preview, including quoted text, until the link expires or you revoke it. Attachments and images stay in Mail. To share a later reply, open it and create a new link.</p>
       <p :if="snapshotBusy && !snapshotPreview" role="status">Preparing preview…</p>
       <button :if="!snapshotPreview && snapshotError && snapshotCanRefresh()" type="button" class="wm-action" :disabled="snapshotBusy" @click="refreshSnapshotPreview()">Refresh preview</button>
       <div :if="snapshotPreview" class="wm-snapshot-messages" role="region" aria-label="Snapshot preview" tabindex="0">

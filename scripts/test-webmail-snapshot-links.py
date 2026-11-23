@@ -29,7 +29,7 @@ def append(imap, address, subject, content, *, is_html=False, folder="INBOX", re
     elif subject == "Original message":
         message["Message-ID"] = "<snapshot-original@example.test>"
     message.set_content(content, subtype="html" if is_html else "plain")
-    if subject == "Original message":
+    if subject == "Original message" or replies:
         message.add_attachment(b"private attachment", maintype="application", subtype="octet-stream", filename="private.bin")
     assert imap.append(folder, None, None, message.as_bytes(policy=SMTP))[0] == "OK"
 
@@ -95,8 +95,29 @@ def verify(fixture):
         with sqlite3.connect(fixture.directory / "smtp.db") as db:
             assert db.execute("SELECT token_hash FROM mail_snapshot_links WHERE id=?", (link["id"],)).fetchone() == (hashlib.sha256(token.encode()).hexdigest(),)
 
+        later_text = "The schedule moved to Thursday.\n\n> The reader will see this text."
         with fixture.imap(owner) as imap:
-            append(imap, owner, "Later reply", "Snapshot readers must never see this.", replies=True)
+            append(imap, owner, "Later reply", later_text, replies=True)
+        assert view(token) == frozen, "A reply must not change a previously issued link"
+        fresh_rows = call(session, "messages?conversations=false")["items"]
+        reply, = [row for row in fresh_rows if row["subject"] == "Later reply"]
+        reply_selection = {"references": [reply["reference"]]}
+        reply_preview = call(session, LINKS + "/preview", reply_selection)
+        reply_item, = reply_preview["messages"]
+        assert reply_item["subject"] == "Later reply"
+        assert reply_item["text"].replace("\r\n", "\n").strip() == later_text, reply_item
+        assert set(reply_item) == {"subject", "from", "timestamp", "text"}
+        assert "private-recipient" not in str(reply_item) and "private.bin" not in str(reply_item)
+        assert call(session, LINKS) == {"links": [link]}, "Previewing the reply requires a separate approval"
+        fresh = call(session, LINKS, {**reply_selection, "digest": reply_preview["digest"], "lifetime": 86400}, status=201)
+        assert fresh["token"] != token and abs(fresh["link"]["expires_at"] - time.time() - 86400) < 10
+        assert view(fresh["token"]) == {"messages": [reply_item], "expires_at": fresh["link"]["expires_at"]}
+        call(other, f"{LINKS}/{fresh['link']['id']}", method="DELETE", status=404)
+        assert call(session, f"{LINKS}/{fresh['link']['id']}", method="DELETE") == {"revoked": True}
+        view(fresh["token"], 404)
+        assert view(token) == frozen, "Revoking a reply link must not revoke the original link"
+
+        with fixture.imap(owner) as imap:
             assert imap.select("INBOX")[0] == "OK"
             result, messages = imap.search(None, "HEADER", "Message-ID", "<snapshot-original@example.test>")
             assert result == "OK" and messages[0]

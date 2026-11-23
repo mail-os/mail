@@ -101,10 +101,13 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
 - Choose **Share snapshot** in the reader or after selecting up to ten messages.
   The preview shows the original subjects, senders, dates, and readable text that
   the link will expose. Choose a lifetime of one hour, 24 hours, or seven days.
-  Anyone with the link can read the fixed snapshot without an account. Images,
-  attachments, and later replies stay in Mail. Copy the link when it is issued.
-  Open **Account** → **Shared links** to revoke it and stop future access. A
-  mailbox can have up to 20 active links, each with at most 128 KiB of data.
+  Anyone with the link can read the fixed snapshot without an account. Quoted
+  text in the preview is included. Images and attachments stay in Mail.
+  To share a later reply, open that message and choose **Share snapshot** again.
+  Review the reply and any quoted text, then send the new link to the people
+  you want to see it. Copy each link when it is issued. Open **Account** →
+  **Shared links** to revoke a link and stop future access. A mailbox can have
+  up to 20 active links, each with at most 128 KiB of data.
 - Attachments upload as binary data with progress, retry, removal and drag/drop.
   Account-scoped staging IDs survive draft recovery and make upload retries
   idempotent. Downloaded attachments retain their original bytes.
