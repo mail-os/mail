@@ -33,6 +33,16 @@ aws ssm start-session --target STAGING_INSTANCE_ID \
   --parameters 'portNumber=8099,localPortNumber=8099'
 ```
 
+With the tunnel open, run the deployed quota verifier from the Mail repository and supply the staging token in `MAIL_STAGING_PROVISIONING_TOKEN`. The TLS clients verify the staging hostname. The verifier allocates a fresh `qa-` mailbox prefix, checks exact storage and sending boundaries, and clears and suspends its synthetic mailboxes on exit. Keep the printed prefix with the deployment record.
+
+```bash
+python3 scripts/test-hosted-staging.py \
+  --host mail.staging.example.com --domain staging.example.com \
+  --provisioning-url http://127.0.0.1:8099
+```
+
+Use `--fixture /path/to/mail` to exercise the same client against a disposable TLS server. The verifier exercises SMTP submission, webmail, IMAP, EWS, ActiveSync, and private provisioning. The daemon restart, suspended SMTP retry, and UTC rollover tests continue to run in `scripts/test-hosted-limits.py --staging` with disposable daemon state.
+
 For the local Stacks test process, set `MAIL_PROVISIONING_URL` to `http://127.0.0.1:8099`, `MAIL_PROVISIONING_TOKEN` to the staging token, `MAIL_FREE_SIGNUP_DOMAIN` to the staging mailbox domain, and `MAIL_WEBMAIL_ORIGIN` to the webmail URL from the stack output. Use a disposable signup database and configure the free-tier limits for the test. Record the deployed Mail, app, and SDK revisions and test results in #55, #57, and #61.
 
 ---

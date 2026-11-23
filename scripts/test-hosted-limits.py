@@ -62,7 +62,128 @@ def request(url, payload=None, headers=None, method=None, context=None, timeout=
         return error.code, error.headers, error.read()
 
 
-class Fixture:
+class MailClient:
+    hostname = "127.0.0.1"
+    http = staticmethod(request)
+
+    def login(self, mailbox):
+        session = {"Origin": self.webmail}
+        status, headers, raw = self.http(self.webmail + "/webmail/auth/login",
+                                       {"username": mailbox, "password": self.password}, session,
+                                       context=self.tls_context)
+        assert status == 200, (status, raw)
+        cookie = headers["Set-Cookie"].split(";")
+        if self.staging:
+            assert "secure" in {part.strip().lower() for part in cookie[1:]}
+        session["Cookie"] = cookie[0]
+        return session
+
+    def api(self, session, path, payload=None, method=None):
+        status, _, raw = self.http(self.webmail + "/webmail/api/" + path, payload, session, method,
+                                 context=self.tls_context)
+        return status, json.loads(raw) if raw else None
+
+    @contextmanager
+    def smtp(self, identity=None):
+        port = self.submission_port if self.staging and identity else self.smtp_port
+        with smtplib.SMTP(self.hostname, port, local_hostname="client.example.test", timeout=10) as client:
+            client.ehlo()
+            if self.staging:
+                client.starttls(context=self.tls_context)
+                client.ehlo()
+            if identity:
+                client.login(identity, self.password)
+            yield client
+
+    def check_staging_smtp(self):
+        for port in (self.smtp_port, self.submission_port):
+            with smtplib.SMTP(self.hostname, port, local_hostname="client.example.test", timeout=10) as client:
+                assert client.ehlo()[0] == 250
+                assert client.has_extn("starttls") and not client.has_extn("auth")
+                code, message = client.mail(EXTERNAL)
+                assert code == 530 and b"STARTTLS" in message, (code, message)
+
+    @contextmanager
+    def imap(self, mailbox):
+        with imaplib.IMAP4(self.hostname, self.imap_port, timeout=10) as client:
+            if self.staging:
+                assert client.starttls(ssl_context=self.tls_context)[0] == "OK"
+            assert client.login(mailbox, self.password)[0] == "OK"
+            yield client
+
+    def ews(self, mailbox, operation, *, fragmented=False):
+        # Use the bare login to check that EWS charges the canonical account.
+        name = mailbox.split("@")[0]
+        token = base64.b64encode(f"{name}:{self.password}".encode()).decode()
+        soap = (
+            '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+            'xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages" '
+            'xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">'
+            f"<s:Body>{operation}</s:Body></s:Envelope>"
+        )
+        if not fragmented:
+            return self.http(self.ews_url, soap.encode(),
+                           {"Authorization": f"Basic {token}", "Content-Type": "text/xml"},
+                           context=self.tls_context)
+
+        url = urllib.parse.urlsplit(self.ews_url)
+        body = soap.encode()
+        headers = (f"POST {url.path} HTTP/1.1\r\nHost: {url.netloc}\r\n"
+                   f"Authorization: Basic {token}\r\nContent-Type: text/xml\r\n"
+                   f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode()
+        with socket.create_connection((url.hostname, url.port), timeout=10) as sock:
+            stream = (self.tls_context.wrap_socket(sock, server_hostname=url.hostname)
+                      if self.staging else nullcontext(sock))
+            with stream as conn:
+                for fragment in (headers[:30], headers[30:], body[:21], body[21:]):
+                    conn.sendall(fragment)
+                    time.sleep(0.025)
+                response = http.client.HTTPResponse(conn)
+                response.begin()
+                return response.status, response.headers, response.read()
+
+    def eas(self, mailbox, body, *, command="SendMail", device="QuotaDevice", legacy=False,
+            save=False, encoded=False, source=None, version=None, timeout=10):
+        name = mailbox.split("@")[0]
+        token = base64.b64encode(f"{name}:{self.password}".encode()).decode()
+        headers = {"Authorization": f"Basic {token}",
+                   "Content-Type": "message/rfc822" if legacy else "application/vnd.ms-sync.wbxml"}
+        if encoded:
+            commands = {"SendMail": 1, "Sync": 0, "SmartForward": 2, "SmartReply": 3,
+                        "GetItemEstimate": 14, "Search": 16, "Ping": 18}
+            packed = bytes([121 if legacy else 141, commands[command], 9, 4, len(device)])
+            packed += device.encode() + b"\x00\x0aSmartPhone"
+            if save:
+                packed += b"\x07\x01\x01"
+            if source:
+                for tag, value in ((1, source[0]), (3, source[1])):
+                    packed += bytes([tag, len(value)]) + value.encode()
+            query = urllib.parse.quote(base64.b64encode(packed).decode(), safe="")
+        else:
+            headers["MS-ASProtocolVersion"] = version or ("12.1" if legacy else "14.1")
+            # Authentication selects the account for sending and quota usage.
+            params = {"Cmd": command, "User": "different-user", "DeviceId": device,
+                      "DeviceType": "SmartPhone", "SaveInSent": "T" if save else "F"}
+            if source:
+                params.update(CollectionId=source[0], ItemId=source[1])
+            query = urllib.parse.urlencode(params)
+        return self.http(self.eas_url + "?" + query, body, headers, context=self.tls_context, timeout=timeout)
+
+    def deliver(self, to, *, identity=None, chunked=False, subject="Boundary", body=None):
+        sender = identity or EXTERNAL
+        recipients = [to] if isinstance(to, str) else to
+        with self.smtp(identity) as client:
+            return smtp_message(client, sender, recipients, subject, body, chunked)
+
+    def expunge(self, session, folder):
+        status, listing = self.api(session, "messages?" + urllib.parse.urlencode({"folder": folder}))
+        assert status == 200, listing
+        for item in listing["items"]:
+            status, result = self.api(session, f"messages/{item['uid']}?folder={folder}", method="DELETE")
+            assert status in (200, 204), (status, result)
+
+
+class Fixture(MailClient):
     def __init__(self, binary, directory, *, tls=False, staging=False):
         self.binary = binary
         self.directory = directory
@@ -164,125 +285,9 @@ class Fixture:
         self.specs[mailbox] = change
         return mailbox
 
-    def login(self, mailbox):
-        session = {"Origin": self.webmail}
-        status, headers, raw = request(self.webmail + "/webmail/auth/login",
-                                       {"username": mailbox, "password": self.password}, session,
-                                       context=self.tls_context)
-        assert status == 200, (status, raw)
-        cookie = headers["Set-Cookie"].split(";")
-        if self.staging:
-            assert "secure" in {part.strip().lower() for part in cookie[1:]}
-        session["Cookie"] = cookie[0]
-        return session
-
-    def api(self, session, path, payload=None, method=None):
-        status, _, raw = request(self.webmail + "/webmail/api/" + path, payload, session, method,
-                                 context=self.tls_context)
-        return status, json.loads(raw) if raw else None
-
-    @contextmanager
-    def smtp(self, identity=None):
-        port = self.submission_port if self.staging and identity else self.smtp_port
-        with smtplib.SMTP("127.0.0.1", port, local_hostname="client.example.test", timeout=10) as client:
-            client.ehlo()
-            if self.staging:
-                client.starttls(context=self.tls_context)
-                client.ehlo()
-            if identity:
-                client.login(identity, self.password)
-            yield client
-
-    def check_staging_smtp(self):
-        for port in (self.smtp_port, self.submission_port):
-            with smtplib.SMTP("127.0.0.1", port, local_hostname="client.example.test", timeout=10) as client:
-                assert client.ehlo()[0] == 250
-                assert client.has_extn("starttls") and not client.has_extn("auth")
-                code, message = client.mail(EXTERNAL)
-                assert code == 530 and b"STARTTLS" in message, (code, message)
-
-    @contextmanager
-    def imap(self, mailbox):
-        with imaplib.IMAP4("127.0.0.1", self.imap_port, timeout=10) as client:
-            if self.staging:
-                assert client.starttls(ssl_context=self.tls_context)[0] == "OK"
-            assert client.login(mailbox, self.password)[0] == "OK"
-            yield client
-
-    def ews(self, mailbox, operation, *, fragmented=False):
-        # Use the bare login to check that EWS charges the canonical account.
-        name = mailbox.split("@")[0]
-        token = base64.b64encode(f"{name}:{self.password}".encode()).decode()
-        soap = (
-            '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
-            'xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages" '
-            'xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types">'
-            f"<s:Body>{operation}</s:Body></s:Envelope>"
-        )
-        if not fragmented:
-            return request(self.ews_url, soap.encode(),
-                           {"Authorization": f"Basic {token}", "Content-Type": "text/xml"},
-                           context=self.tls_context)
-
-        url = urllib.parse.urlsplit(self.ews_url)
-        body = soap.encode()
-        headers = (f"POST {url.path} HTTP/1.1\r\nHost: {url.netloc}\r\n"
-                   f"Authorization: Basic {token}\r\nContent-Type: text/xml\r\n"
-                   f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n").encode()
-        with socket.create_connection((url.hostname, url.port), timeout=10) as sock:
-            stream = (self.tls_context.wrap_socket(sock, server_hostname=url.hostname)
-                      if self.staging else nullcontext(sock))
-            with stream as conn:
-                for fragment in (headers[:30], headers[30:], body[:21], body[21:]):
-                    conn.sendall(fragment)
-                    time.sleep(0.025)
-                response = http.client.HTTPResponse(conn)
-                response.begin()
-                return response.status, response.headers, response.read()
-
-    def eas(self, mailbox, body, *, command="SendMail", device="QuotaDevice", legacy=False,
-            save=False, encoded=False, source=None, version=None, timeout=10):
-        name = mailbox.split("@")[0]
-        token = base64.b64encode(f"{name}:{self.password}".encode()).decode()
-        headers = {"Authorization": f"Basic {token}",
-                   "Content-Type": "message/rfc822" if legacy else "application/vnd.ms-sync.wbxml"}
-        if encoded:
-            commands = {"SendMail": 1, "Sync": 0, "SmartForward": 2, "SmartReply": 3,
-                        "GetItemEstimate": 14, "Search": 16, "Ping": 18}
-            packed = bytes([121 if legacy else 141, commands[command], 9, 4, len(device)])
-            packed += device.encode() + b"\x00\x0aSmartPhone"
-            if save:
-                packed += b"\x07\x01\x01"
-            if source:
-                for tag, value in ((1, source[0]), (3, source[1])):
-                    packed += bytes([tag, len(value)]) + value.encode()
-            query = urllib.parse.quote(base64.b64encode(packed).decode(), safe="")
-        else:
-            headers["MS-ASProtocolVersion"] = version or ("12.1" if legacy else "14.1")
-            # Authentication selects the account for sending and quota usage.
-            params = {"Cmd": command, "User": "different-user", "DeviceId": device,
-                      "DeviceType": "SmartPhone", "SaveInSent": "T" if save else "F"}
-            if source:
-                params.update(CollectionId=source[0], ItemId=source[1])
-            query = urllib.parse.urlencode(params)
-        return request(self.eas_url + "?" + query, body, headers, context=self.tls_context, timeout=timeout)
-
-    def deliver(self, to, *, identity=None, chunked=False, subject="Boundary", body=None):
-        sender = identity or EXTERNAL
-        recipients = [to] if isinstance(to, str) else to
-        with self.smtp(identity) as client:
-            return smtp_message(client, sender, recipients, subject, body, chunked)
-
     def bytes(self, mailbox):
         return sum(file.stat().st_size for file in (self.directory / "mail" / mailbox).rglob("*.eml*")
                    if file.is_file() and not file.name.startswith("."))
-
-    def expunge(self, session, folder):
-        status, listing = self.api(session, "messages?" + urllib.parse.urlencode({"folder": folder}))
-        assert status == 200, listing
-        for item in listing["items"]:
-            status, result = self.api(session, f"messages/{item['uid']}?folder={folder}", method="DELETE")
-            assert status in (200, 204), (status, result)
 
     def outbox(self, session, send_id, expected):
         for _ in range(80):
