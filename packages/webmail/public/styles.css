@@ -870,6 +870,37 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-message-heading .wm-folder-badge { padding: 4px 8px; background: var(--surface); color: var(--muted); font-weight: 600; }
 .wm-message-heading-actions { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
 .wm-message-heading-actions .wm-folder-badge { align-self: center; }
+.wm-message-sharing { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; min-width: 0; }
+.wm-snapshot-panel { display: grid; gap: 12px; width: min(100%, 640px); max-height: 90dvh; overflow: auto; padding: 16px; border: 1px solid var(--border); border-radius: 14px; background: var(--panel); box-shadow: var(--app-shadow); }
+.wm-snapshot-dialog-heading { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.wm-snapshot-dialog-heading h2 { margin: 0; font-size: 18px; font-weight: 680; }
+.wm-snapshot-workflow, .wm-snapshot-messages { display: grid; gap: 10px; min-width: 0; }
+.wm-snapshot-workflow > p, .wm-snapshot-muted { margin: 0; color: var(--muted); font-size: 13px; }
+.wm-snapshot-workflow > .wm-snapshot-messages { max-height: 42dvh; overflow: auto; overscroll-behavior: contain; border-radius: 9px; }
+.wm-snapshot-messages:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.wm-snapshot-message { min-width: 0; padding: 13px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); overflow-wrap: anywhere; }
+.wm-snapshot-message :is(h2, h3) { margin: 0; font-size: 16px; font-weight: 650; }
+.wm-snapshot-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-block: 4px 10px; color: var(--muted); font-size: 12px; }
+.wm-snapshot-body { margin: 0; white-space: pre-wrap; font-size: 14px; line-height: 1.5; }
+.wm-snapshot-empty { margin: 0; color: var(--muted); font-size: 13px; }
+.wm-snapshot-form, .wm-snapshot-confirm { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+.wm-snapshot-form label { display: grid; gap: 5px; min-width: 0; font-size: 13px; font-weight: 550; }
+.wm-snapshot-form .wm-snapshot-url { flex: 1 1 16rem; }
+.wm-snapshot-form input { width: 100%; min-width: 0; min-height: var(--control-height); padding: 4px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); font-size: 13px; line-height: 1.25; }
+.wm-snapshot-form .wm-snapshot-primary { color: var(--on-primary); background: var(--primary); border-color: var(--primary); }
+.wm-snapshot-form .wm-snapshot-primary:hover { background: var(--primary-hover); }
+.wm-snapshot-links { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.wm-snapshot-links li, .wm-snapshot-confirm { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 9px; border: 1px solid var(--border); border-radius: var(--control-radius); background: var(--toolbar); }
+.wm-snapshot-links li > div, .wm-snapshot-confirm p { flex: 1 1 12rem; min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 13px; }
+.wm-snapshot-page { display: grid; gap: 14px; width: min(100%, 48rem); margin: 0 auto; padding: clamp(16px, 4vw, 32px); }
+.wm-snapshot-header { display: flex; align-items: center; gap: 10px; }
+.wm-snapshot-header h1 { margin: 0; font-size: clamp(20px, 4vw, 27px); font-weight: 680; }
+.wm-snapshot-header p { margin: 3px 0 0; color: var(--muted); font-size: 13px; }
+@media (max-width: 460px) {
+  .wm-snapshot-panel { padding: 12px; }
+  .wm-snapshot-form label { flex: 1 1 100%; }
+  .wm-snapshot-form > button { width: 100%; justify-content: center; }
+}
 .wm-original-subject { display: flex; flex-wrap: wrap; gap: 3px 8px; margin: 4px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .wm-original-subject > :first-child { font-weight: 650; }
 .wm-private-panel { display: grid; gap: 12px; padding: 12px; margin-bottom: 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); font-size: 13px; }

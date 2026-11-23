@@ -15,6 +15,8 @@ import { useWebmail } from '../functions/use-webmail'
 import { useServiceHealth } from '../functions/use-service-health'
 import { reminderDayLink, useCalendarReminders } from '../functions/use-calendar-reminders'
 import { vacationStatus } from '../functions/use-vacation-settings'
+import { snapshotDate } from '../functions/mail-snapshot'
+import { snapshotLifetimes } from '../functions/use-message-snapshots'
 const health = useServiceHealth()
 useInterval(health.refresh, 30000, { whileVisible: true })
 useInterval(health.tick, 1000, { whileVisible: true })
@@ -23,6 +25,8 @@ const ready = state(false)
 const foldersExpanded = state(false)
 const selectingMessages = state(false)
 const foldersToggle = useRef('foldersToggle')
+const snapshotDialog = useRef('snapshotDialog')
+const snapshotUrlField = useRef('snapshotUrlField')
 function closeFolders(restoreFocus = false) {
   if (!foldersExpanded()) return
   foldersExpanded.set(false)
@@ -86,6 +90,9 @@ const {
   nextUnread, readSelection, advanceBatch, triageAndNext, showShortcuts, closeShortcuts, handleShortcut, createEventLink,
   canRespondToInvitation, respondToInvitation, rsvpBusy, rsvpError,
   invitationCalendar, invitationCalendarBusy, invitationDestination, chooseInvitationCalendar, saveInvitationCalendar,
+  snapshotMode, snapshotBusy, snapshotError, snapshotNotice, snapshotLifetime, snapshotPreview, snapshotIssued, snapshotLinks,
+  snapshotRevoke, snapshotCanRefresh, refreshSnapshotPreview, createSnapshot, manageSnapshots, revokeSnapshot, copySnapshotUrl,
+  closeSnapshots, canShareSnapshot, shareMessageSnapshot, shareSelectedSnapshot,
   undoLastAction, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments,
   saveSendPreference, send, confirmPendingSend, showOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword,
   showConfirmation, confirmAction, saveDraftCopy, resume, tick, preventUnload,
@@ -100,6 +107,27 @@ const {
   notificationsAvailable, notificationEnabled, notificationHere, notificationBusy, notificationError,
   notificationRuleBusy, notificationRuleError, changeNotificationSettings, changeNotificationRule, pollNotifications,
 } = mail
+function showSnapshotDialog() {
+  nextTick(() => { if (!snapshotDialog.current?.open) snapshotDialog.current?.showModal() })
+}
+function openSnapshotPreview(bulk = false) {
+  if (bulk) shareSelectedSnapshot()
+  else shareMessageSnapshot()
+  showSnapshotDialog()
+}
+function openSnapshotManager() {
+  manageSnapshots()
+  showSnapshotDialog()
+}
+function closeSnapshotDialog() {
+  if (snapshotBusy()) return
+  snapshotDialog.current?.close()
+  closeSnapshots()
+}
+async function publishSnapshot() {
+  await createSnapshot()
+  if (snapshotIssued()) nextTick(() => snapshotUrlField.current?.focus())
+}
 const categoryNames = ['Newsletters', 'Receipts']
 const selectionMode = derived(() => selectingMessages() || selectedCount() > 0)
 function toggleSelectionMode() {
@@ -224,6 +252,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       </div>
       <div :if="selectedCount > 0" class="wm-bulk-toolbar" aria-label="Selected message actions">
         <button type="button" class="wm-action wm-action--accent" @click="readSelection()" :disabled="loading || readingLoading || triageBusy || mutating"><span class="mail-icon" data-icon="layers" aria-hidden="true"></span>Read selected</button>
+        <button :if="folder !== 'Drafts' && folder !== 'Trash' && !isJunkFolder(folder)" type="button" class="wm-action" aria-haspopup="dialog" :disabled="loading || mutating" @click="openSnapshotPreview(true)"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Share snapshot</button>
         <button :if="selectedCount > 1 && !categoryList && !attentionView && folder !== 'Drafts'" type="button" class="wm-action" @click="groupSelected()" :disabled="loading || readingLoading || triageBusy || mutating">Group selected</button>
         <button class="wm-action" @click="bulkAction('move', 'Archive')" :disabled="mutating"><span class="mail-icon" data-icon="archive" aria-hidden="true"></span>Archive</button><button class="wm-action" @click="bulkAction('move')" :disabled="mutating"><span class="mail-icon" data-icon="folder" aria-hidden="true"></span>Move</button><select x-model="moveTo" :disabled="mutating" aria-label="Bulk move destination"><option :for="item in folders" :value="item.name" :text="folderName(item.name)"></option></select>
         <button class="wm-action" @click="bulkAction('read')" :disabled="mutating">Mark read</button><button class="wm-action" @click="bulkAction('unread')" :disabled="mutating"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span><span>Mark unread</span></button><button class="wm-action" @click="bulkAction('flag')" :disabled="mutating">Flag</button><button class="wm-action" @click="bulkAction('unflag')" :disabled="mutating">Unflag</button>
@@ -362,7 +391,10 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
           <div class="wm-message-heading">
             <div class="wm-message-heading-actions">
               <span class="wm-folder-badge"><span class="mail-icon" :data-icon="mailFolderIcon(selected?.folder || '')" aria-hidden="true"></span><span :text="folderName(selected?.folder || '')"></span></span>
-              <button :if="canOpenPrivate" type="button" class="wm-action wm-action--quiet" :aria-expanded="privateOpen" @click="privateOpen ? closePrivate() : showPrivate()" :disabled="readingLoading || mutating"><span class="mail-icon" data-icon="bookmark" aria-hidden="true"></span>Private tools</button>
+              <div class="wm-message-sharing">
+                <button :if="canShareSnapshot" type="button" class="wm-action wm-action--quiet" aria-haspopup="dialog" @click="openSnapshotPreview()" :disabled="readingLoading || mutating"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Share snapshot</button>
+                <button :if="canOpenPrivate" type="button" class="wm-action wm-action--quiet" :aria-expanded="privateOpen" @click="privateOpen ? closePrivate() : showPrivate()" :disabled="readingLoading || mutating"><span class="mail-icon" data-icon="bookmark" aria-hidden="true"></span>Private tools</button>
+              </div>
             </div>
             <h2 class="wm-read-subject" tabindex="-1" data-reader-focus :text="displaySubject(selected)"></h2>
             <p :if="selected?.personal_subject" class="wm-original-subject"><span>Original subject</span> <span :text="selected?.subject || '(no subject)'"></span></p>
@@ -650,6 +682,11 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
   <p :if="accountChangeError" class="login-error" role="alert" :text="accountChangeError"></p>
 </header>
 <div class="login wm-account-settings">
+<section class="login-recovery" aria-labelledby="snapshotSettingsHeading">
+  <h2 id="snapshotSettingsHeading"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Shared links</h2>
+  <p class="login-sub">Review or revoke the snapshot links you’ve created.</p>
+  <button type="button" class="wm-action" aria-haspopup="dialog" @click="openSnapshotManager()">Manage shared links</button>
+</section>
 <form class="login-recovery" @submit.prevent="changePassword()"><h2><span class="mail-icon" data-icon="shield" aria-hidden="true"></span>Change password</h2><p class="login-sub">Updates your webmail, SMTP and IMAP credentials.</p><label for="currentPassword">Current password</label><input id="currentPassword" type="password" x-model="currentPassword" autocomplete="current-password" required><label for="newPassword">New password</label><input id="newPassword" type="password" x-model="newPassword" autocomplete="new-password" minlength="12" required><label for="confirmPassword">Confirm password</label><input id="confirmPassword" type="password" x-model="confirmPassword" autocomplete="new-password" minlength="12" required><p :if="passwordError" role="alert" class="login-error" :text="passwordError"></p><button type="submit" :disabled="savingPassword" :text="savingPassword ? 'Saving…' : 'Change password'"></button></form>
 <form class="login-recovery" aria-labelledby="recoveryHeading" @submit.prevent="saveRecovery()"><h2 id="recoveryHeading"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span>Recovery address</h2><p class="login-sub" :if="recoveryLoading">Loading…</p><p class="login-sub" :if="!recoveryLoading && recoveryAddress">Password reset links go to <strong :text="recoveryAddress"></strong><span :if="recoverySetBy === 'operator'"> (set by your mail administrator)</span>.</p><p class="login-sub" :if="!recoveryLoading && !recoveryAddress">None set. Without one, a forgotten password can only be reset by your mail administrator.</p><label for="recoveryInput">Recovery email</label><input id="recoveryInput" type="email" x-model.trim="recoveryInput" autocomplete="email" placeholder="you@another-provider.com"><label for="recoveryPassword">Current password</label><input id="recoveryPassword" type="password" x-model="recoveryPassword" autocomplete="current-password"><p :if="recoveryError" role="alert" class="login-error" :text="recoveryError"></p><p :if="recoveryNotice" role="status" class="login-sub" :text="recoveryNotice"></p><button type="submit" class="login-secondary" :disabled="savingRecovery || recoveryLoading" :text="savingRecovery ? 'Saving…' : 'Save recovery address'"></button></form>
 <section class="login-recovery wm-forwarding" aria-labelledby="forwardingHeading">
@@ -813,6 +850,59 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
   <section class="wm-shortcuts">
     <header><h2 id="wm-shortcuts-title">Keyboard shortcuts</h2><button type="button" class="wm-action" @click="closeShortcuts()" autofocus>Close shortcuts</button></header>
     <dl><div :for="item in triageShortcuts" :key="item.key"><dt :text="item.label"></dt><dd><kbd :text="item.key"></kbd></dd></div></dl>
+  </section>
+</dialog>
+<dialog :if="snapshotMode" ref="snapshotDialog" class="wm-modal wm-snapshot-dialog" aria-labelledby="wm-snapshot-title" @cancel.prevent="closeSnapshotDialog()">
+  <section class="wm-snapshot-panel">
+    <header class="wm-snapshot-dialog-heading">
+      <h2 id="wm-snapshot-title" :text="snapshotMode === 'manage' ? 'Shared links' : snapshotMode === 'issued' ? 'Snapshot link created' : 'Share a snapshot'"></h2>
+      <button type="button" class="wm-action" :disabled="snapshotBusy" @click="closeSnapshotDialog()" autofocus>Close</button>
+    </header>
+    <p :if="snapshotError" class="wm-inline-error" role="alert" :text="snapshotError"></p>
+    <p :if="snapshotNotice" class="wm-snapshot-muted" role="status" :text="snapshotNotice"></p>
+    <div :if="snapshotMode === 'preview'" class="wm-snapshot-workflow">
+      <p class="wm-snapshot-muted">Anyone with the link can read the text shown here until it expires or you revoke it. The snapshot contains only these messages. Attachments, images, and later replies stay in Mail.</p>
+      <p :if="snapshotBusy && !snapshotPreview" role="status">Preparing preview…</p>
+      <button :if="!snapshotPreview && snapshotError && snapshotCanRefresh()" type="button" class="wm-action" :disabled="snapshotBusy" @click="refreshSnapshotPreview()">Refresh preview</button>
+      <div :if="snapshotPreview" class="wm-snapshot-messages" role="region" aria-label="Snapshot preview" tabindex="0">
+        <article :for="message in snapshotPreview.messages" class="wm-snapshot-message">
+          <h3 :text="message.subject || '(No subject)'"></h3>
+          <div class="wm-snapshot-meta"><span :text="message.from || 'Unknown sender'"></span><span :text="snapshotDate(message.timestamp)"></span></div>
+          <p :if="message.text" class="wm-snapshot-body" :text="message.text"></p>
+          <p :if="!message.text" class="wm-snapshot-empty">No readable text in this message.</p>
+        </article>
+      </div>
+      <form :if="snapshotPreview" class="wm-snapshot-form" @submit.prevent="publishSnapshot()">
+        <label>Link expires in<select x-model="snapshotLifetime" :disabled="snapshotBusy">
+          <option :for="lifetime in snapshotLifetimes" :key="lifetime.seconds" :value="String(lifetime.seconds)" :text="lifetime.label"></option>
+        </select></label>
+        <button type="submit" class="wm-action wm-snapshot-primary" :disabled="snapshotBusy">Create link</button>
+      </form>
+    </div>
+    <div :if="snapshotMode === 'issued' && snapshotIssued" class="wm-snapshot-workflow">
+      <p class="wm-snapshot-muted" :text="'Available until ' + snapshotDate(snapshotIssued.link.expires_at)"></p>
+      <div class="wm-snapshot-form">
+        <label class="wm-snapshot-url">Snapshot link<input ref="snapshotUrlField" type="text" spellcheck="false" readonly :value="snapshotIssued.url" @focus="$event.target.select()"></label>
+        <button type="button" class="wm-action wm-snapshot-primary" @click="copySnapshotUrl()">Copy link</button>
+      </div>
+      <p class="wm-snapshot-muted">Copy the link before closing. You can revoke it later from Account settings.</p>
+    </div>
+    <div :if="snapshotMode === 'manage'" class="wm-snapshot-workflow">
+      <p :if="snapshotBusy && !snapshotLinks.length" role="status">Loading shared links…</p>
+      <p :if="!snapshotBusy && !snapshotLinks.length && !snapshotError" class="wm-snapshot-muted">You have no active snapshot links.</p>
+      <button :if="!snapshotLinks.length && snapshotError" type="button" class="wm-action" :disabled="snapshotBusy" @click="openSnapshotManager()">Retry shared links</button>
+      <ul :if="snapshotLinks.length" class="wm-snapshot-links" aria-label="Active snapshot links">
+        <li :for="link in snapshotLinks" :key="link.id">
+          <div><strong :text="link.subject || '(No subject)'"></strong><p class="wm-snapshot-muted" :text="link.message_count + (link.message_count === 1 ? ' message' : ' messages') + ' · Expires ' + snapshotDate(link.expires_at)"></p></div>
+          <button type="button" class="wm-action wm-action--danger" :disabled="snapshotBusy || snapshotRevoke" @click="snapshotRevoke.set(link)" :aria-label="'Revoke link for ' + (link.subject || '(No subject)')">Revoke</button>
+        </li>
+      </ul>
+      <div :if="snapshotRevoke" class="wm-snapshot-confirm" role="group" aria-label="Confirm revocation">
+        <p>Revoke access for anyone with this link?</p>
+        <button type="button" class="wm-action wm-action--danger" :disabled="snapshotBusy" @click="revokeSnapshot()">Revoke link</button>
+        <button type="button" class="wm-action" :disabled="snapshotBusy" @click="snapshotRevoke.set(null)">Cancel</button>
+      </div>
+    </div>
   </section>
 </dialog>
 <dialog :if="confirmation" ref="confirmDialog" class="wm-confirm-dialog wm-modal" aria-label="Confirm action" @cancel.prevent="confirmation.set('')"><div class="login"><h1 :text="confirmation === 'purge' ? 'Delete permanently?' : confirmation === 'reload-draft' ? 'Reload saved draft?' : confirmation === 'retry-unknown' ? 'Review an interrupted delivery?' : 'Discard this draft?'"></h1><p class="login-sub" :text="confirmation === 'purge' ? 'These messages cannot be recovered after deletion.' : confirmation === 'reload-draft' ? 'Your local changes will be replaced with the latest saved version. Save a copy to keep both.' : confirmation === 'retry-unknown' ? 'Check Sent and the recorded recipient outcomes before retrying. Retrying an unconfirmed address could send a duplicate.' : 'Your saved draft will move to Trash. Unsaved changes will be discarded.'"></p><button @click="confirmation.set('')" :disabled="confirming" autofocus>Keep working</button><button @click="confirmAction()" :disabled="confirming" :text="confirming ? 'Working…' : confirmation === 'purge' ? 'Delete permanently' : confirmation === 'reload-draft' ? 'Reload saved version' : confirmation === 'retry-unknown' ? 'I checked Sent; review the message' : 'Discard draft'"></button></div></dialog>

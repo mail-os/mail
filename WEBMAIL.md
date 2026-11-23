@@ -98,6 +98,13 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   conversations. **Undo** removes that grouping for 30 seconds. Personal
   changes stay in webmail. Replies, forwards, and IMAP clients use the
   original messages and headers.
+- Choose **Share snapshot** in the reader or after selecting up to ten messages.
+  The preview shows the original subjects, senders, dates, and readable text that
+  the link will expose. Choose a lifetime of one hour, 24 hours, or seven days.
+  Anyone with the link can read the fixed snapshot without an account. Images,
+  attachments, and later replies stay in Mail. Copy the link when it is issued.
+  Open **Account** → **Shared links** to revoke it and stop future access. A
+  mailbox can have up to 20 active links, each with at most 128 KiB of data.
 - Attachments upload as binary data with progress, retry, removal and drag/drop.
   Account-scoped staging IDs survive draft recovery and make upload retries
   idempotent. Downloaded attachments retain their original bytes.
@@ -675,6 +682,18 @@ before a request may affect another mailbox. Disabling or deleting an account
 revokes existing webmail sessions.
 
 - `GET /webmail/api/config` returns effective limits and preferences.
+- `POST /webmail/api/snapshot-links/preview` accepts `references` for one to ten
+  owned messages. Its `messages` array exposes `subject`, `from`, `timestamp`,
+  and `text`. Formatted messages without a plain-text body use extracted text.
+  `POST /webmail/api/snapshot-links` accepts those references, the preview’s
+  `digest`, and a `lifetime` of `3600`, `86400`, or `604800` seconds. It returns
+  the owner’s link metadata and the bearer `token` once. A changed preview
+  returns `409`. `GET /webmail/api/snapshot-links` lists active link metadata;
+  `DELETE /webmail/api/snapshot-links/{id}` revokes the owner’s link.
+- The viewer opens `/snapshot#token=…` and sends the token in the request body
+  to `POST /webmail/public/snapshot`. It sends no session cookie and receives
+  `{messages, expires_at}` with caching disabled. A malformed, expired,
+  revoked, or suspended mailbox’s token returns the same `404` response.
 - The [calendar API](#calendar-api) uses the same store as CalDAV. Recurring
   event summaries include their rules as candidates for occurrence expansion.
   The endpoints report 503 when DAV is disabled and 404 for a missing or

@@ -21,6 +21,7 @@ import { useMailNotifications } from './use-mail-notifications'
 import { usePrivateMail } from './use-private-mail'
 import { useAddressBook } from './use-address-book'
 import { useComposeLibrary } from './use-compose-library'
+import { useMessageSnapshots } from './use-message-snapshots'
 
 interface Ref<T> { current: T | null }
 const categoryFolders = ['Newsletters', 'Receipts']
@@ -231,6 +232,7 @@ export function useWebmail(ports: WebmailPorts) {
     destroyed = true
     invalidateList()
     closeReader()
+    snapshots.closeSnapshots()
     contactBook.closeContacts()
     forwardingSettings.clearForwarding()
     vacationSettings.clearVacationSettings()
@@ -265,6 +267,7 @@ export function useWebmail(ports: WebmailPorts) {
     else if (!user()) ports.navigate('/login', { reload: true })
   }
   const api = createMailApi(() => user()?.username, onAuthError, () => !destroyed)
+  const snapshots = useMessageSnapshots(api)
   async function loadSenderIdentities(): Promise<void> {
     const request = ++senderRequest
     try {
@@ -346,6 +349,17 @@ export function useWebmail(ports: WebmailPorts) {
   const checkedKeys = derived(() => checked().map(messageIdentity))
   const selectedCount = derived(() => checked().length)
   function isJunkFolder(name: string): boolean { return name === 'Junk' || name === limits().junkFolder }
+  const canShareSnapshot = derived(() => {
+    const item = selected()
+    return !!item?.reference && !['Drafts', 'Trash', 'Screening', 'Declined'].includes(item.folder)
+      && !isJunkFolder(item.folder) && !item.flags.deleted && !item.flags.draft && !senderReview.senderReviewOpen()
+  })
+  function shareMessageSnapshot() {
+    if (canShareSnapshot()) snapshots.previewSnapshot([selected()?.reference])
+  }
+  function shareSelectedSnapshot() {
+    snapshots.previewSnapshot(checked().map(item => item.reference))
+  }
   function junkActionFor(name: string): 'junk' | 'not_junk' | null {
     if (isJunkFolder(name)) return 'not_junk'
     if (['sent', 'drafts', 'trash', 'screening', 'declined'].includes(name.toLowerCase())) return null
@@ -1818,9 +1832,21 @@ export function useWebmail(ports: WebmailPorts) {
     }
   }
   function preventUnload(event: BeforeUnloadEvent): void { if (hasUnsavedChanges()) { event.preventDefault(); event.returnValue = '' } }
-  function destroy(): void { destroyed = true; ++listRequest; ++messageRequest; recipientEditor.destroy(); attachmentEditor.destroy(); draft.destroy(); privateMail.closePrivate(); contactBook.closeContacts(); selectionEffect() }
+  function destroy(): void {
+    destroyed = true
+    ++listRequest
+    ++messageRequest
+    recipientEditor.destroy()
+    attachmentEditor.destroy()
+    draft.destroy()
+    privateMail.closePrivate()
+    contactBook.closeContacts()
+    snapshots.closeSnapshots()
+    selectionEffect()
+  }
   return { user, folders, folder, messages, threads, expandedThreads, selected, loading, refreshing, listError, readerError, readerTarget, reading, readingLoading, mutating, error, notice, query, activeQuery, appliedSearchAll, filterLocation, filterSender, filterRecipient, filterFilename, libraryView, libraryFiles, indexProgress, filterAfter, filterBefore, filterStatus, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, formattedReader, remoteImagesAllowed, checked, checkedKeys, selectedCount, isJunkFolder, readerJunkAction, selectionJunkAction, allChecked, someChecked, undoAction, undoRemaining, readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts, pendingSend, sendRemaining, outbox, outboxCount, outboxCounts, outboxSection, outboxViews, outboxEmpty, outboxPageNumber, outboxNext, outboxLoading, outboxError, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, sharedReply, senderId, senderIdentities, missingSender, senderStatus, chooseSender, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...senderReview, ...notifications, ...privateMail, ...contactBook, showContacts, composeSavedCard, collectionView, collectionId, canOpenPrivate,
     createEventLink, canRespondToInvitation, respondToInvitation, rsvpBusy, rsvpError,
+    ...snapshots, canShareSnapshot, shareMessageSnapshot, shareSelectedSnapshot,
     invitationCalendar, invitationCalendarBusy, invitationDestination, chooseInvitationCalendar, saveInvitationCalendar,
     showCollectionManager, closeCollectionManager, selectCollection, confirmCollectionDeletion, savePrivateLabel, setPrivateMembership, groupSelected, displaySubject, changeNotificationRule, ...recipientEditor, ...attachmentEditor, ...recoverySettings, ...forwardingSettings, ...vacationSettings, ...writing, snippetChoice, signatureChoice, insertSnippet, insertSignature, attentionViews, attentionView, followUpFocused, attentionSaving, attentionSchedule, attentionDate, attentionZone, dueReminders, replyContext, clearFollowUp, selectAttention, nextFollowUp, changeAttention, startAttentionSchedule, saveAttentionSchedule, deadlineLabel, categoryList, newsletterExpanded, readerExpanded, receiptFull, receiptCompact, receiptPreview, senderLabel, sortingSettings, sortingSaving, sortingError, toggleAutomaticSorting, placementText, categoryRule, categoryRuleSaving, saveCategoryRule, showSenderReview, openReviewMessage, reviewMessage, refresh, loadMessages, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread, toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, openAttachmentMessage, showAttachmentLibrary, retryReader, closeReader, nextUnread, readSelection, advanceBatch, triageAndNext, bulkAction, selectedAction, undoLastAction, showShortcuts, closeShortcuts, handleShortcut, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments, saveSendPreference, send, confirmPendingSend, showOutbox, refreshOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword, showConfirmation, confirmAction, saveDraftCopy: draft.saveCopy, mount, resume, tick, preventUnload, destroy, messageIdentity, messagePageSize, folderName, shortDate, fullDate, readableBytes, attachmentPath }
 }

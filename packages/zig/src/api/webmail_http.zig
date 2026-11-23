@@ -62,6 +62,7 @@ const caldav_store = @import("../storage/caldav_store.zig");
 const calendar_day_labels = @import("../storage/calendar_day_labels.zig");
 const calendar_tasks = @import("../storage/calendar_tasks.zig");
 const calendar_tools = @import("../storage/calendar_tools.zig");
+const snapshots = @import("webmail_snapshots.zig");
 const caldav = @import("../protocol/caldav.zig");
 const calendar_import = @import("webmail_calendar_import.zig");
 const calendar_invite = @import("webmail_calendar_invite.zig");
@@ -85,6 +86,7 @@ const login_html = @embedFile("webmail_dist/login.html");
 const calendar_html = @embedFile("webmail_dist/calendar.html");
 const shared_html = @embedFile("webmail_dist/shared.html");
 const recover_html = @embedFile("webmail_dist/recover.html");
+const snapshot_html = @embedFile("webmail_dist/snapshot.html");
 const status_html = @embedFile("webmail_dist/status.html");
 const styles_css = @embedFile("webmail_dist/styles.css");
 const notifications_worker = @embedFile("webmail_dist/mail-notifications.js");
@@ -219,6 +221,7 @@ pub const WebmailHttpServer = struct {
             self.sessions.sweep();
             try self.service.recoverInterrupted(time_compat.timestamp());
             self.service.sweep(time_compat.timestamp()) catch |err| logger.warn("Webmail state cleanup failed: {}", .{err});
+            snapshots.sweep(self.db, time_compat.timestamp()) catch |err| logger.warn("Snapshot link cleanup failed: {}", .{err});
             break :blk try std.Thread.spawn(.{}, deliveryWorker, .{self});
         } else null;
         defer {
@@ -238,6 +241,7 @@ pub const WebmailHttpServer = struct {
                 last_sweep = now;
                 self.sessions.sweep();
                 self.service.sweep(now) catch |err| logger.warn("Webmail state cleanup failed: {}", .{err});
+                snapshots.sweep(self.db, now) catch |err| logger.warn("Snapshot link cleanup failed: {}", .{err});
             }
 
             const connection = self.listener.?.accept() catch |err| {
@@ -562,6 +566,13 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.eql(u8, p, "/webmail/api/private/undo-group") and std.mem.eql(u8, req.method, "POST"))
         return handlePrivateGroupUndo(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/uploads") and std.mem.eql(u8, req.method, "POST")) return handleUpload(server, conn, arena, req);
+    const snapshot_path = "/webmail/api/snapshot-links";
+    if (std.mem.eql(u8, p, snapshot_path) and std.mem.eql(u8, req.method, "GET")) return handleSnapshotList(server, conn, arena, req);
+    if (std.mem.eql(u8, p, snapshot_path) and std.mem.eql(u8, req.method, "POST")) return handleSnapshotCreate(server, conn, arena, req, false);
+    if (std.mem.eql(u8, p, snapshot_path ++ "/preview") and std.mem.eql(u8, req.method, "POST")) return handleSnapshotCreate(server, conn, arena, req, true);
+    if (std.mem.startsWith(u8, p, snapshot_path ++ "/") and std.mem.eql(u8, req.method, "DELETE"))
+        return handleSnapshotRevoke(server, conn, arena, req, p[(snapshot_path.len + 1)..]);
+    if (std.mem.eql(u8, p, "/webmail/public/snapshot") and std.mem.eql(u8, req.method, "POST")) return handleSnapshotView(server, conn, arena, req);
     if (std.mem.startsWith(u8, p, "/webmail/api/uploads/") and std.mem.eql(u8, req.method, "DELETE")) return handleUploadDelete(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/bulk") and std.mem.eql(u8, req.method, "POST")) return handleBulk(server, conn, arena, req);
     if (std.mem.startsWith(u8, p, "/webmail/api/undo/") and std.mem.eql(u8, req.method, "POST")) return handleUndo(server, conn, arena, req);
@@ -675,6 +686,9 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
         }
         if (std.mem.eql(u8, p, "/shared")) {
             return serveAsset(conn, arena, shared_html, "text/html; charset=utf-8");
+        }
+        if (std.mem.eql(u8, p, "/snapshot")) {
+            return serveAsset(conn, arena, snapshot_html, "text/html; charset=utf-8");
         }
         if (std.mem.eql(u8, p, "/login")) {
             return serveAsset(conn, arena, login_html, "text/html; charset=utf-8");
@@ -3360,6 +3374,65 @@ fn handleCalendarRsvp(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: 
         else => return mapServiceError(conn, a, err),
     };
     return sendJson(conn, a, 200, try service_mod.json(a, status), null);
+}
+
+fn handleSnapshotList(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    var sess = (try requireSession(server, conn, a, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const links = try snapshots.list(a, server.db, sess.username, time_compat.timestamp());
+    return sendJson(conn, a, 200, try service_mod.json(a, .{ .links = links }), null);
+}
+
+fn handleSnapshotCreate(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request, preview: bool) !void {
+    if (!isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, a, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const RequestBody = struct { references: []const []const u8, digest: ?[]const u8 = null, lifetime: ?i64 = null };
+    if (req.body.len > 2048) return sendError(conn, a, 400, "invalid_snapshot", "Choose up to ten messages.");
+    const input = std.json.parseFromSliceLeaky(RequestBody, a, req.body, .{}) catch
+        return sendError(conn, a, 400, "invalid_snapshot", "Choose up to ten messages.");
+    if (!preview and (!snapshots.validDigest(input.digest orelse "") or !snapshots.validLifetime(input.lifetime orelse 0)))
+        return sendError(conn, a, 400, "invalid_snapshot", "Review the snapshot and choose an expiry before creating the link.");
+    const prepared = snapshots.prepare(a, server.db, sess.username, input.references, server.service.junkFolder()) catch |err| switch (err) {
+        error.InvalidSnapshotSelection => return sendError(conn, a, 400, "invalid_snapshot", "Choose one to ten distinct messages."),
+        error.SnapshotTooLarge => return sendError(conn, a, 413, "snapshot_too_large", "This snapshot is larger than 128 KiB. Choose fewer or smaller messages."),
+        error.SnapshotTextUnavailable => return sendError(conn, a, 422, "snapshot_text_unavailable", "A message has text that could not be shared."),
+        else => return mapMaildirError(conn, a, err),
+    };
+    if (preview) return sendJson(conn, a, 200, try service_mod.json(a, .{
+        .messages = prepared.messages,
+        .digest = @as([]const u8, &prepared.digest),
+    }), null);
+    if (!std.mem.eql(u8, &prepared.digest, input.digest.?))
+        return sendError(conn, a, 409, "snapshot_changed", "The messages changed. Open a new preview before sharing.");
+    const issued = snapshots.create(server.db, sess.username, prepared, input.lifetime.?, time_compat.timestamp()) catch |err| switch (err) {
+        error.SnapshotOwnerUnavailable => return sendError(conn, a, 401, "unauthorized", "This mailbox is unavailable."),
+        error.TooManySnapshotLinks => return sendError(conn, a, 409, "snapshot_limit", "You can have up to 20 active snapshot links. Revoke one before sharing again."),
+        else => return err,
+    };
+    return sendJson(conn, a, 201, try service_mod.json(a, .{ .link = issued.link, .token = @as([]const u8, &issued.token) }), null);
+}
+
+fn handleSnapshotRevoke(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request, id_param: []const u8) !void {
+    if (!isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, a, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const id = std.fmt.parseInt(i64, id_param, 10) catch 0;
+    if (id <= 0 or !try snapshots.revoke(server.db, sess.username, id))
+        return sendError(conn, a, 404, "snapshot_unavailable", "This snapshot link is unavailable.");
+    return sendJson(conn, a, 200, "{\"revoked\":true}", null);
+}
+
+fn handleSnapshotView(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    if (!isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    const unavailable = "This snapshot link is unavailable.";
+    if (req.body.len > 256) return sendError(conn, a, 404, "snapshot_unavailable", unavailable);
+    const input = std.json.parseFromSliceLeaky(struct { token: []const u8 }, a, req.body, .{}) catch
+        return sendError(conn, a, 404, "snapshot_unavailable", unavailable);
+    const view = (try snapshots.read(a, server.db, input.token, time_compat.timestamp())) orelse
+        return sendError(conn, a, 404, "snapshot_unavailable", unavailable);
+    const body = try std.fmt.allocPrint(a, "{{\"expires_at\":{d},\"messages\":{s}}}", .{ view.expires_at, view.payload });
+    return sendJson(conn, a, 200, body, null);
 }
 
 fn handleMessageDetail(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {

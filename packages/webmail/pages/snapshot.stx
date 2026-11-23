@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex, noarchive, nofollow">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; connect-src 'self'; style-src 'self' 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'">
+  <title>Shared message snapshot — Mail</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<script client>
+import { openSnapshot, reloadSnapshot, snapshotDate } from '../functions/mail-snapshot'
+import { tokenFromHash } from '../functions/recovery'
+const snapshot = state(null)
+const busy = state(true)
+const error = state('')
+let request = null
+async function readSnapshot() {
+  request?.abort()
+  const pending = new AbortController()
+  request = pending
+  snapshot.set(null)
+  busy.set(true)
+  error.set('')
+  try {
+    const token = tokenFromHash(useRoute().hash)
+    const result = token ? await openSnapshot(token, pending.signal) : null
+    if (request === pending) snapshot.set(result)
+  }
+  catch {
+    if (request === pending) error.set('Could not open this snapshot. Try again.')
+  }
+  finally {
+    if (request === pending) busy.set(false)
+  }
+}
+onMount(readSnapshot)
+useEventListener('hashchange', reloadSnapshot)
+useEventListener('pageshow', (event) => { if (event.persisted) reloadSnapshot() })
+onUnmounted(() => request?.abort())
+</script>
+<main class="wm-snapshot-page">
+  <header class="wm-snapshot-header">
+    <span class="mail-app-mark"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span></span>
+    <div><h1>Shared message snapshot</h1><p :if="snapshot" :text="'Available until ' + snapshotDate(snapshot.expires_at)"></p></div>
+  </header>
+  <p :if="busy" role="status">Opening snapshot…</p>
+  <div :if="error" class="wm-inline-error" role="alert"><span :text="error"></span><button type="button" class="wm-action" @click="readSnapshot()">Try again</button></div>
+  <p :if="!busy && !snapshot && !error" class="wm-snapshot-empty" role="status">This snapshot link is unavailable. It may have expired or been revoked.</p>
+  <div :if="snapshot" class="wm-snapshot-messages">
+    <article :for="message in snapshot.messages" class="wm-snapshot-message">
+      <h2 :text="message.subject || '(No subject)'"></h2>
+      <div class="wm-snapshot-meta"><span :text="message.from || 'Unknown sender'"></span><span :text="snapshotDate(message.timestamp)"></span></div>
+      <p :if="message.text" class="wm-snapshot-body" :text="message.text"></p>
+      <p :if="!message.text" class="wm-snapshot-empty">No readable text in this message.</p>
+    </article>
+  </div>
+</main>
+</body>
+</html>

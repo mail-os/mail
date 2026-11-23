@@ -683,6 +683,17 @@ pub const Database = struct {
             \\    revision INTEGER NOT NULL CHECK(revision > 0)
             \\);
             \\CREATE INDEX IF NOT EXISTS mail_calendar_tasks_owner ON mail_calendar_tasks(user_id);
+            \\CREATE TABLE IF NOT EXISTS mail_snapshot_links (
+            \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    token_hash TEXT NOT NULL UNIQUE,
+            \\    payload TEXT NOT NULL,
+            \\    subject TEXT NOT NULL,
+            \\    message_count INTEGER NOT NULL,
+            \\    expires_at INTEGER NOT NULL
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mail_snapshot_links_owner ON mail_snapshot_links(user_id,expires_at);
+            \\CREATE INDEX IF NOT EXISTS mail_snapshot_links_expiry ON mail_snapshot_links(expires_at);
             \\CREATE TABLE IF NOT EXISTS mail_calendar_tools (
             \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
             \\    payload TEXT NOT NULL,

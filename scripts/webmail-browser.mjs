@@ -78,7 +78,7 @@ async function verifyControlRow(container, selector, height, sameRow = true) {
       bottom: box.bottom,
       left: box.left,
       right: box.right,
-      neutral: !node.classList.contains('calendar-primary'),
+      neutral: !node.matches('.calendar-primary, .wm-snapshot-primary'),
       borderMatches: style.borderColor === border && style.borderWidth === '1px',
       radius: style.borderRadius,
     }
@@ -799,6 +799,96 @@ async function calendarToolsJourney(desktop, phone) {
   await phone.setViewportSize({ width: 390, height: 844 })
 }
 
+async function snapshotSharingJourney(desktop, phone) {
+  const subject = 'Your receipt #1046'
+  await desktop.goto(url + '/')
+  await openMailbox(desktop, /^Receipts(?:\s|$)/)
+  await button(desktop, /Your receipt #1046/).click()
+  await heading(desktop, subject).waitFor()
+  const share = button(desktop, 'Share snapshot')
+  await share.click()
+  const previewDialog = desktop.getByRole('dialog', { name: 'Share a snapshot' })
+  const preview = previewDialog.getByRole('region', { name: 'Snapshot preview' })
+  await preview.getByText('Your November payment of $18.00 was received.', { exact: true }).waitFor()
+  assert.equal(await preview.getByText('receipt-1046.txt', { exact: true }).count(), 0)
+  await verifyControlRow(previewDialog.locator('form'), 'select, button', 36)
+  const unpublished = await desktop.request.get(url + '/webmail/api/snapshot-links')
+  assert.deepEqual(await unpublished.json(), { links: [] })
+  await previewDialog.getByLabel('Link expires in').selectOption('3600')
+  await previewDialog.locator('.wm-snapshot-panel').screenshot({ path: join(output, 'desktop-snapshot-preview.png'), animations: 'disabled' })
+  await button(previewDialog, 'Create link').click()
+  const created = desktop.getByRole('dialog', { name: 'Snapshot link created' })
+  const linkField = created.getByRole('textbox', { name: 'Snapshot link' })
+  await linkField.waitFor()
+  await desktop.waitForFunction(() => document.activeElement?.getAttribute('data-stx-ref') === 'snapshotUrlField')
+  const singleUrl = await linkField.inputValue()
+  assert.equal(new URL(singleUrl).pathname, '/snapshot')
+  assert.match(new URL(singleUrl).hash, /^#token=[0-9a-f]{64}$/)
+  await button(created, 'Close').click()
+
+  await phone.setViewportSize({ width: 320, height: 844 })
+  await phone.goto(url + '/')
+  await button(phone, 'Select').click()
+  await phone.getByRole('checkbox', { name: 'Select conversation: Studio launch notes', exact: true }).check()
+  await phone.getByRole('checkbox', { name: 'Select conversation: November research interviews', exact: true }).check()
+  await phone.getByText('2 selected', { exact: true }).waitFor()
+  const bulk = phone.getByLabel('Selected message actions')
+  await button(bulk, 'Share snapshot').click()
+  const mobilePreview = phone.getByRole('dialog', { name: 'Share a snapshot' })
+  const mobileMessages = mobilePreview.getByRole('region', { name: 'Snapshot preview' })
+  await heading(mobileMessages, 'Studio launch notes').waitFor()
+  await heading(mobileMessages, 'November research interviews').waitFor()
+  await verifyControlRow(mobilePreview.locator('form'), 'select, button', 44, false)
+  await fitsViewport(phone)
+  await mobilePreview.locator('.wm-snapshot-panel').screenshot({ path: join(output, 'phone-snapshot-preview.png'), animations: 'disabled' })
+  await button(mobilePreview, 'Create link').click()
+  const mobileCreated = phone.getByRole('dialog', { name: 'Snapshot link created' })
+  const bulkUrl = await mobileCreated.getByRole('textbox', { name: 'Snapshot link' }).inputValue()
+  await button(mobileCreated, 'Close').click()
+
+  const viewerContext = await browser.newContext({ viewport: { width: 320, height: 844 }, colorScheme: 'dark',
+    ignoreHTTPSErrors: true, locale: 'en-US', timezoneId: 'UTC' })
+  try {
+    const viewer = await viewerContext.newPage()
+    viewer.setDefaultTimeout(12_000)
+    observePage(viewer)
+    const externalRequests = []
+    viewer.on('request', (request) => { if (new URL(request.url()).origin !== url) externalRequests.push(request.url()) })
+    await viewer.goto(singleUrl)
+    await heading(viewer, subject).waitFor()
+    await viewer.getByText('Your November payment of $18.00 was received.', { exact: true }).waitFor()
+    assert.equal(await viewer.getByText(/receipt-1046\.txt/).count(), 0)
+    await viewer.goto(bulkUrl)
+    await heading(viewer, 'Studio launch notes').waitFor()
+    await heading(viewer, 'November research interviews').waitFor()
+    assert.equal(await heading(viewer, subject).count(), 0)
+    assert.equal(await viewer.locator('.wm-snapshot-message').count(), 2)
+    assert.equal(await viewer.getByRole('alert').count(), 0)
+    assert.deepEqual(await viewerContext.cookies(), [])
+    assert.deepEqual(externalRequests, [], 'Snapshot viewing never requests remote content')
+    await fitsViewport(viewer)
+    await screenshot(viewer, 'phone-snapshot-viewer')
+
+    await button(desktop, 'Account').click()
+    const account = desktop.getByRole('dialog', { name: 'Account settings' })
+    await button(account, 'Manage shared links').click()
+    const manager = desktop.getByRole('dialog', { name: 'Shared links' })
+    const revoke = button(manager, `Revoke link for ${subject}`)
+    await revoke.click()
+    await button(manager.getByRole('group', { name: 'Confirm revocation' }), 'Revoke link').click()
+    await revoke.waitFor({ state: 'hidden' })
+    await viewer.goto(singleUrl)
+    await viewer.getByText(/This snapshot link is unavailable/).waitFor()
+    assert.equal(await heading(viewer, subject).count(), 0)
+    await viewer.goto(bulkUrl)
+    await heading(viewer, 'Studio launch notes').waitFor()
+    await button(manager, 'Close').click()
+    await button(account, 'Close').click()
+  }
+  finally { await viewerContext.close() }
+  await phone.setViewportSize({ width: 390, height: 844 })
+}
+
 async function freeTimeJourney(page, phone = false) {
   await page.goto(`${url}/calendar?day=${day}`)
   await button(page, 'Find free time').click()
@@ -1404,6 +1494,7 @@ try {
   await calendarTasksJourney(desktop)
   await calendarTasksJourney(phone, true)
   await calendarToolsJourney(desktop, phone)
+  await snapshotSharingJourney(desktop, phone)
   await navigationRequestsJourney(desktop)
   assert.deepEqual(errors, [], 'Browser pages raised uncaught errors')
   process.stdout.write(`${engine} passed the desktop and phone webmail journeys.\n`)
