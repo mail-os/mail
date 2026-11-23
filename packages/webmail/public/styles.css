@@ -11,8 +11,8 @@
   --hover: #e5e9f0;
   --text: #20232c;
   --muted: #515966;
-  --border: #d9dde5;
-  --control-border: #85878e;
+  --border: #d9dce3;
+  --control-border: #84858c;
   --control-height: 36px;
   --control-radius: 8px;
   --control-font-size: .8125rem;
@@ -54,7 +54,7 @@
     --hover: #363943;
     --text: #f5f5f8;
     --muted: #b7bcc9;
-    --border: #41434f;
+    --border: #41434b;
     --control-border: #7e818a;
     --select-chevron: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Cpath d=%22m4 6 4 4 4-4%22 fill=%22none%22 stroke=%22%23b7bcc9%22 stroke-width=%221.5%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22/%3E%3C/svg%3E");
     --accent: #94c4ff;
@@ -155,9 +155,12 @@ body {
 }
 :where(input, select, textarea) { font-weight: 400; }
 input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
+:where(input:not([type=checkbox], [type=radio], [type=hidden], [type=file], [hidden], .wm-file-input), select) {
+  block-size: var(--control-height);
+  padding-block: 0;
+}
 :where(input[type=date], input[type=time], input[type=datetime-local], select) {
   appearance: none;
-  block-size: var(--control-height);
 }
 :where(input[type=date], input[type=time], input[type=datetime-local]) {
   font-variant-numeric: tabular-nums;
@@ -165,6 +168,7 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
 }
 /* Keep WebKit's native date editor inside the same box as the other fields. */
 input::-webkit-date-and-time-value { margin: 0; min-height: 0; text-align: start; }
+input::-webkit-datetime-edit { padding: 0; }
 :where(input[type=file]:not(.wm-file-input)) { padding: 3px; }
 input::file-selector-button {
   min-block-size: calc(var(--control-height) - 8px);
@@ -180,13 +184,22 @@ input::file-selector-button {
 input:not(:disabled)::file-selector-button:hover { background: var(--hover); }
 select {
   padding-inline-end: calc(var(--control-inline-padding) + 18px);
-  background: var(--panel) var(--select-chevron) right var(--control-inline-padding) center / 14px no-repeat;
+  background-image: var(--select-chevron);
+  background-position: right var(--control-inline-padding) center;
+  background-size: 14px;
+  background-repeat: no-repeat;
   text-overflow: ellipsis;
   cursor: pointer;
 }
 select:dir(rtl) { background-position: left var(--control-inline-padding) center; }
 select:hover:not(:disabled) { background-color: var(--toolbar); }
-select:disabled { opacity: .55; cursor: default; }
+:is(input:not([type=checkbox], [type=radio], [type=hidden], .wm-file-input), select, textarea):disabled {
+  background-color: var(--surface);
+  color: var(--muted);
+  -webkit-text-fill-color: currentColor;
+  opacity: 1;
+  cursor: default;
+}
 @media (max-width: 860px), (pointer: coarse) { :root { --control-height: 44px; } }
 @media (forced-colors: active) {
   :is(input[type=date], input[type=time], input[type=datetime-local], select) { appearance: auto; }
@@ -434,9 +447,10 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-recipient-box { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; position: relative; min-width: 0; padding: 5px; border: 1px solid var(--control-border); border-radius: 8px; }
 .wm-recipient-box:focus-within { border-color: var(--accent); }
 .wm-recipient-box--invalid { border-color: var(--danger); }
-.wm-recipient-box > input { flex: 1; min-width: min(100%, 10rem); min-block-size: 0; padding: 5px; border: 0; outline: 0; background: transparent; font-size: inherit; }
+.wm-recipient-box > input { flex: 1; min-width: min(100%, 10rem); block-size: auto; min-block-size: 0; padding: 5px; border: 0; outline: 0; background: transparent; font-size: inherit; }
 .wm-recipient-chip { display: flex; max-width: 100%; border-radius: 5px; background: var(--accent-soft); color: var(--accent); }
 .wm-recipient-chip button { min-width: 0; border: 0; background: transparent; color: inherit; padding: 5px 7px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wm-recipient-chip button:last-child { flex-shrink: 0; }
 .wm-recipient-chip--invalid { background: var(--danger-soft); color: var(--danger); }
 .wm-recipient-suggestions { position: absolute; z-index: 4; top: calc(100% + 4px); left: 0; right: 0; max-height: 220px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); box-shadow: 0 8px 30px rgba(0, 0, 0, .12); }
 .wm-recipient-suggestions button { display: flex; flex-direction: column; gap: 3px; width: 100%; padding: 10px; border: 0; background: transparent; text-align: left; }
@@ -465,8 +479,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-send-schedule { display: flex; flex: 1 0 100%; align-items: center; flex-wrap: wrap; gap: 8px; padding-bottom: 8px; }
 .wm-send-schedule label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 650; }
 .wm-send-schedule small { color: var(--muted); font-size: 12px; }
-.wm-send-delay { display: flex; align-items: center; gap: 5px; margin-left: auto; font-size: 11px; color: var(--muted); }
-.wm-send-delay select { font-size: 12px; }
+.wm-send-delay { display: flex; align-items: center; gap: 6px; margin-inline-start: auto; font-size: 12px; color: var(--muted); }
 .wm-modal .login { margin: auto; width: min(94vw, 400px); }
 @media (max-width: 1080px) and (min-width: 861px) { .wm { grid-template-columns: 170px minmax(0, 1fr); } .wm-columns { grid-template-columns: minmax(280px, 330px) minmax(0, 1fr); } .wm-read-body { padding: 16px; } }
 @media (min-width: 861px) { .wm--newsletter-expanded .wm-columns, .wm--reply-focused .wm-columns { grid-template-columns: minmax(0, 1fr); } }
@@ -559,7 +572,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-period, .calendar-view-modes { gap: 6px; }
 .calendar-view-picker { display: none; }
 .calendar-period-buttons { display: flex; align-items: center; gap: 6px; }
-.calendar-period .wm-action { justify-content: center; }
+.calendar-period .wm-action { block-size: var(--control-height); justify-content: center; }
 .calendar-period .calendar-arrow { inline-size: var(--control-height); padding-inline: 0; }
 .calendar-period input { inline-size: 9rem; }
 .calendar-search { flex-wrap: nowrap; }
@@ -652,7 +665,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-free-time-heading p { margin: 0; color: var(--muted); font-size: 12px; }
 .calendar-free-time-form { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
 .calendar-free-time-form label { display: grid; gap: 5px; min-width: 0; font-size: 13px; font-weight: 550; }
-.calendar-free-time-form input:not([type=checkbox]) { width: 100%; }
+.calendar-free-time-form :is(input:not([type=checkbox]), select) { width: 100%; }
 .calendar-free-time-form .calendar-free-time-personal { display: flex; align-items: center; gap: 6px; flex-basis: 100%; min-block-size: var(--control-height); }
 .calendar-free-time > .calendar-label-error { margin-block-start: 10px; }
 .calendar-free-time-output { display: grid; gap: 8px; margin-block-start: 12px; padding-block-start: 10px; border-block-start: 1px solid var(--border); }
@@ -875,7 +888,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-search-filters[aria-expanded=true] .mail-icon { color: var(--accent); }
 .mail-search-field { display: flex; align-items: center; flex: 1; min-width: 0; min-block-size: var(--control-height); gap: 6px; padding-inline: 9px; border: 1px solid var(--control-border); border-radius: var(--control-radius); background: var(--surface); color: var(--muted); }
 .mail-search-field:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
-.mail-search-field .wm-search { min-block-size: 0; border: 0; outline: 0; padding: 7px 0; background: transparent; }
+.mail-search-field .wm-search { block-size: auto; min-block-size: 0; border: 0; outline: 0; padding: 7px 0; background: transparent; }
 .wm-search-form .mail-search-field { padding-inline-end: 3px; }
 .wm-search-submit { display: inline-grid; place-items: center; flex: 0 0 29px; min-height: 28px; border: 0; border-radius: 5px; padding: 0; background: transparent; color: var(--muted); }
 .wm-search-submit:hover { background: var(--hover); color: var(--accent); }
@@ -1342,11 +1355,11 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-composer-close { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 7px; }
 .wm-composer-close:hover { background: var(--hover); color: var(--text); }
 .wm-composer-fields { gap: 2px; }
-.wm-composer-fields .wm-recipient-field { align-items: center; min-height: 39px; border-bottom: 1px solid var(--border); }
+.wm-composer-fields .wm-recipient-field { align-items: center; min-block-size: calc(var(--control-height) + 1px); border-block-end: 1px solid var(--border); }
 .wm-composer-fields .wm-recipient-field > label { padding-top: 0; }
 .wm-recipient-box, .wm-subject-field input { border-color: transparent; }
 .wm-recipient-box--invalid { border-color: var(--danger); }
-.wm-subject-field input { padding-inline: 9px; }
+.wm-subject-field input { padding-inline: var(--control-inline-padding); }
 .wm-composer-body { min-height: clamp(150px, 24dvh, 240px); padding: 10px 2px; border-color: transparent; font-size: 15px; }
 .wm-dropzone { border-color: transparent; background: var(--toolbar); }
 .wm-dropzone--active { border-color: var(--accent); background: var(--accent-soft); }
@@ -1355,8 +1368,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-composer-foot > .wm-action:not(.calendar-primary) { background: transparent; border-color: transparent; }
 .wm-composer-foot > .wm-action:not(.calendar-primary):hover { background: var(--hover); }
 .wm-composer-foot > .wm-action--danger:hover { background: var(--danger-soft); }
-.wm-composer-foot .wm-send-btn { min-block-size: var(--control-height); padding-block: 6px; border-radius: var(--control-radius); }
-.wm-composer-foot .wm-send-delay { gap: 6px; }
+.wm-composer-foot .wm-send-btn { min-block-size: var(--control-height); padding-block: 6px; border-radius: var(--control-radius); font-size: var(--control-font-size); }
 .wm-composer-foot .wm-send-delay .mail-icon { width: 14px; height: 14px; }
 
 .mail-auth-page .login { border-color: var(--border); }
@@ -1387,6 +1399,11 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 @media (max-width: 960px) {
   .calendar-share-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .calendar-share-form > label:has(input) { grid-column: 1 / -1; }
+}
+@media (700px < width <= 960px) {
+  .calendar-share-form { grid-template-columns: minmax(0, 2fr) minmax(0, 1.2fr) minmax(max-content, .85fr); }
+  .calendar-share-form > :first-child { grid-column: span 2; }
+  .calendar-share-form > label:has(input) { grid-column: auto; }
 }
 
 @media (min-width: 861px) {
@@ -1451,8 +1468,9 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   dialog.wm-modal:has(> .wm-composer) { align-items: flex-end; padding: 0; }
   .wm-composer { width: 100%; max-height: 96dvh; border-radius: 17px 17px 0 0; }
   .wm-composer-close { width: 44px; height: 44px; }
-  .wm-composer-foot { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
-  .wm-composer-foot > .wm-action, .wm-composer-foot .wm-send-btn { min-height: 44px; }
+  .wm-composer-foot { gap: 6px; padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+  .wm-composer-foot > :is(.wm-action, .wm-send-btn) { flex: 1 0 auto; justify-content: center; padding-inline: 8px; }
+  .wm-composer-foot .wm-send-delay { flex: 1 0 auto; justify-content: end; margin-inline-start: 0; }
   .calendar-page { padding-block-start: 12px; }
   .calendar-nav { flex-wrap: nowrap; min-height: 36px; gap: 10px; }
   .calendar-nav a { flex-shrink: 0; }
@@ -1477,6 +1495,18 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .calendar-view-toolbar .calendar-view-modes { display: none; }
   .calendar-view-picker, .calendar-zone { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 60%); align-items: center; gap: 8px; width: 100%; color: var(--muted); font-size: .8rem; white-space: normal; }
   :is(.calendar-view-picker, .calendar-zone) select { width: 100%; max-width: none; }
+}
+@media (max-width: 360px) {
+  .wm-composer-foot { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .wm-composer-foot > :is(.wm-send-delay, .wm-send-schedule) { grid-column: 1 / -1; }
+  .wm-composer-foot .wm-send-delay { justify-content: start; }
+  .wm-send-delay select { margin-inline-start: auto; }
+}
+@media (max-width: 490px) and (pointer: coarse) {
+  .wm-dropzone { gap: 6px; }
+  .wm-dropzone > span { display: none; }
+  .wm-dropzone > .wm-action { flex: 1 0 auto; justify-content: center; padding-inline: 6px; }
+  .wm-dropzone small { order: 1; flex-basis: 100%; text-align: end; }
 }
 @media (min-width: 620px) and (max-width: 860px) {
   .wm-folder-list { grid-template-columns: repeat(4, minmax(0, 1fr)); }

@@ -98,7 +98,7 @@ async function verifyControlRow(container, selector, height, sameRow = true) {
     const box = node.getBoundingClientRect()
     const borderChannels = style.getPropertyValue('--control-border').trim().slice(1).match(/../g)
     const border = `rgb(${borderChannels.map(channel => Number.parseInt(channel, 16)).join(', ')})`
-    const neutral = !node.matches('.calendar-primary, .wm-snapshot-primary, .wm-list-toggle, .wm-action--quiet, .mail-auth-page button:not(.login-secondary)')
+    const neutral = !node.matches('.calendar-primary, .wm-snapshot-primary, .wm-list-toggle, .wm-action--quiet, .wm-send-btn, .wm-composer-foot > .wm-action, .mail-auth-page button:not(.login-secondary)')
     return {
       name: node.getAttribute('aria-label') || node.id || node.tagName,
       height: box.height,
@@ -108,6 +108,7 @@ async function verifyControlRow(container, selector, height, sameRow = true) {
       right: box.right,
       neutral,
       borderMatches: style.border === `1px solid ${border}`,
+      opacity: style.opacity,
       radius: style.borderRadius,
       fontSize: style.fontSize,
     }
@@ -117,9 +118,11 @@ async function verifyControlRow(container, selector, height, sameRow = true) {
     assert(Math.abs(control.height - height) < 0.5, `${control.name} should be ${height}px tall, got ${control.height}px`)
     assert.equal(control.radius, '8px', `${control.name} should use the shared control radius`)
     if (control.neutral) assert(control.borderMatches, `${control.name} should use the shared one-pixel border`)
-    if (sameRow) {
-      assert(Math.abs(control.top - controls[0].top) < 0.5, `${control.name} should align with the first control`)
-      assert(Math.abs(control.bottom - controls[0].bottom) < 0.5, `${control.name} should align at the bottom`)
+    for (const other of controls) {
+      if (sameRow || (control.top < other.bottom - 0.5 && control.bottom > other.top + 0.5)) {
+        assert(Math.abs(control.top - other.top) < 0.5, `${control.name} and ${other.name} should align at the top`)
+        assert(Math.abs(control.bottom - other.bottom) < 0.5, `${control.name} and ${other.name} should align at the bottom`)
+      }
     }
   }
   return controls
@@ -214,6 +217,22 @@ async function verifyReaderToolbar(toolbar, height) {
       if (control.top < other.bottom - 0.5 && control.bottom > other.top + 0.5)
         assert(Math.abs(control.top - other.top) < 0.5, `${control.name} and ${other.name} should align on their row`)
     }
+  }
+}
+
+async function verifyComposerControls(composer, height) {
+  const controls = await verifyControlRow(composer.locator('.wm-composer-foot'), 'button, select', height, false)
+  assert.equal(controls.length, 5)
+  assert(controls.every(control => control.fontSize === controls[0].fontSize), 'Composer actions and the Undo Send picker share a text size')
+  for (const row of await composer.locator('.wm-recipient-field').all()) {
+    assert((await row.boundingBox()).height >= height + 0.5, 'Composer fields reserve a full control height above their divider')
+  }
+  if ((composer.page().viewportSize()?.width ?? Infinity) <= 360) {
+    const [send, later, draft, discard, delay] = controls
+    assert(Math.abs(send.left - draft.left) < 0.5 && Math.abs(send.right - draft.right) < 0.5, 'Send and Save draft use the same column')
+    assert(Math.abs(later.left - discard.left) < 0.5 && Math.abs(later.right - delay.right) < 0.5, 'Send later, Discard, and Undo Send reach the same trailing edge')
+    verifyControlGaps([send, later], 6)
+    verifyControlGaps([draft, discard], 6)
   }
 }
 
@@ -468,6 +487,7 @@ async function desktopJourney(page) {
   await picker.setFiles({ name: 'handoff-checklist.txt', mimeType: 'text/plain', buffer: Buffer.from('Review the handoff') })
   await composer.getByText(/handoff-checklist.txt/).waitFor()
   await composer.getByRole('progressbar').waitFor({ state: 'hidden' })
+  await verifyComposerControls(composer, 36)
   await screenshot(page, 'desktop-compose')
   await page.emulateMedia({ colorScheme: 'dark' })
   await screenshot(page, 'desktop-compose-dark')
@@ -609,7 +629,9 @@ async function phoneJourney(page) {
     await page.setViewportSize({ width, height: 844 })
     const sheet = await composer.locator('.wm-composer').boundingBox()
     assert(sheet && sheet.width === width && Math.abs(sheet.y + sheet.height - 844) < 1, 'Composer is a full-width bottom sheet on phones')
+    await verifyComposerControls(composer, 44)
     await fitsViewport(page)
+    if (width === 320) await screenshot(page, 'narrow-phone-compose-dark')
   }
   await screenshot(page, 'phone-compose')
   await page.emulateMedia({ colorScheme: 'light' })
@@ -1433,13 +1455,37 @@ async function calendarSharingJourney(captain) {
   await screenshot(captain, 'desktop-calendar-selects-dark')
   await captain.setViewportSize({ width: 861, height: 940 })
   await fitsViewport(captain)
-  await verifyControlRow(shareForm, 'select, input, button', 36, false)
+  const tabletControls = await verifyControlRow(shareForm, 'select, input, button', 36, false)
+  const [tabletCalendar, tabletTeam, tabletEmail, tabletAccess, tabletSubmit] = tabletControls
+  assert(Math.abs(tabletCalendar.top - tabletTeam.top) < 0.5, 'Calendar and team align on the first row')
+  assert(Math.abs(tabletEmail.top - tabletAccess.top) < 0.5 && Math.abs(tabletEmail.top - tabletSubmit.top) < 0.5,
+    'Teammate, access, and submit align on the second row')
+  assert(Math.abs(tabletCalendar.left - tabletEmail.left) < 0.5 && Math.abs(tabletTeam.right - tabletSubmit.right) < 0.5,
+    'Both share-form rows reach the same left and right edges')
+  verifyControlGaps(tabletControls.slice(0, 2), 12)
+  verifyControlGaps(tabletControls.slice(2), 12)
   await verifySelectedOptionFits(sharing.getByLabel('Calendar to share'))
   await shareForm.screenshot({ path: join(output, 'tablet-calendar-sharing-dark.png'), animations: 'disabled' })
   await captain.setViewportSize({ width: 1440, height: 940 })
   await captain.emulateMedia({ colorScheme: 'light' })
   await screenshot(captain, 'desktop-calendar-selects')
-  await button(sharing, 'Share calendar').click()
+  // Hold the live write long enough to inspect the actual pending form.
+  const resumeShare = Promise.withResolvers()
+  await captain.route(/\/teams\/studio\/calendar-shares$/, async (route) => {
+    await resumeShare.promise
+    await route.continue()
+  }, { times: 1 })
+  try {
+    await Promise.all([
+      captain.waitForRequest(request => request.url().endsWith('/teams/studio/calendar-shares') && request.method() === 'PUT'),
+      button(sharing, 'Share calendar').click(),
+    ])
+    for (const field of await shareForm.locator('input, select').all()) assert(await field.isDisabled())
+    const disabledFields = await verifyControlRow(shareForm, 'input, select', 36)
+    assert(disabledFields.every(field => field.opacity === '1'), 'Disabled fields keep the shared border at full opacity')
+    await shareForm.screenshot({ path: join(output, 'desktop-calendar-sharing-pending.png'), animations: 'disabled' })
+  }
+  finally { resumeShare.resolve() }
   const role = captain.getByRole('combobox', { name: `Access for ${sender} to ${calendarLabel}` })
   await role.waitFor()
   await verifyControlRow(sharing.getByRole('listitem').filter({ has: role }), 'select, button', 36)
