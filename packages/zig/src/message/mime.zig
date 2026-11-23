@@ -48,6 +48,9 @@ pub const MimePart = struct {
     name: ?[]u8,
     /// Nesting depth: 1 for a direct child of the parsed multipart.
     depth: u8,
+    /// The part belongs to the enclosing message's display body, outside
+    /// attachment containers and attached messages.
+    display_candidate: bool,
     /// What the transfer decoder tolerated.
     decode_flags: lib.decode.Flags,
 
@@ -161,6 +164,7 @@ const Origin = struct {
     depth: u8 = 0,
     multipart_levels: u8 = 0,
     in_message: bool = false,
+    in_attachment: bool = false,
 };
 
 fn walkEntity(shared: *Shared, header: []const u8, input: []const u8, origin: Origin) ParseError!void {
@@ -202,6 +206,7 @@ const Collector = struct {
     kinds: [depth_slots]lib.Kind = undefined,
     multipart_levels: [depth_slots]u8 = undefined,
     in_message: [depth_slots]bool = undefined,
+    in_attachment: [depth_slots]bool = undefined,
 
     const Builder = struct {
         index: u32,
@@ -285,11 +290,14 @@ const Collector = struct {
         if (d == 0) {
             levels = self.origin.multipart_levels;
             self.in_message[0] = self.origin.in_message;
+            self.in_attachment[0] = self.origin.in_attachment;
         } else {
             const parent_is_message = self.kinds[d - 1] == .message;
             levels = if (parent_is_message) 0 else self.multipart_levels[d - 1];
             self.in_message[d] = self.in_message[d - 1] or parent_is_message;
+            self.in_attachment[d] = self.in_attachment[d - 1];
         }
+        self.in_attachment[d] = self.in_attachment[d] or p.disposition == .attachment or p.filename != null or p.name != null;
         if (p.kind == .multipart) levels += 1;
         self.kinds[d] = p.kind;
         self.multipart_levels[d] = levels;
@@ -320,6 +328,7 @@ const Collector = struct {
                 .filename = filename,
                 .name = name,
                 .depth = self.origin.depth + p.depth,
+                .display_candidate = !self.in_attachment[p.depth] and !self.in_message[p.depth] and !p.content_type.isEmbeddedMessage(),
                 .decode_flags = .{},
             },
         };
@@ -367,6 +376,7 @@ const Collector = struct {
             // The container counted as a leaf here; the nested walk adds its level.
             .multipart_levels = self.multipart_levels[rel],
             .in_message = self.in_message[rel],
+            .in_attachment = self.in_attachment[rel],
         });
     }
 };

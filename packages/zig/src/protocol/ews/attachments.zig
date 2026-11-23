@@ -68,11 +68,10 @@ pub fn add(a: std.mem.Allocator, raw: []const u8, header_end: usize, body_start:
     if (body_start <= header_end) return error.InvalidMime;
     var output: std.ArrayList(u8) = .empty;
     if (content_type) |value| {
-        var parsed = try mime.ContentType.parse(a, value);
-        defer parsed.deinit();
+        const parsed = mime.ContentType.parse(value) catch return error.InvalidMime;
         if (parsed.isMultipart() and std.ascii.eqlIgnoreCase(parsed.media_subtype, "mixed")) {
             const boundary = parsed.boundary orelse return error.InvalidMime;
-            if (boundary.len == 0 or boundary.len > mime.MultipartParser.MAX_BOUNDARY_LENGTH) return error.InvalidMime;
+            mime.validateBoundary(boundary) catch return error.InvalidMime;
             const before_close = body_start + (closingDelimiter(raw[body_start..], boundary) orelse return error.InvalidMime);
             try output.appendSlice(a, raw[0..before_close]);
             try appendFiles(a, &output, boundary, files, limit);
@@ -198,10 +197,9 @@ fn collect(a: std.mem.Allocator, raw: []const u8, start: usize, entity_start: us
 
     const ctype = try maildir.mimeHeader(a, entity, "Content-Type");
     if (!std.ascii.startsWithIgnoreCase(ctype, "multipart/")) return;
-    var parsed = try mime.ContentType.parse(a, ctype);
-    defer parsed.deinit();
+    const parsed = mime.ContentType.parse(ctype) catch return error.InvalidMime;
     const boundary = parsed.boundary orelse return error.InvalidMime;
-    if (boundary.len == 0 or boundary.len > mime.MultipartParser.MAX_BOUNDARY_LENGTH) return error.InvalidMime;
+    mime.validateBoundary(boundary) catch return error.InvalidMime;
     const body_start = if (std.mem.indexOf(u8, entity, "\r\n\r\n")) |i| i + 4 else if (std.mem.indexOf(u8, entity, "\n\n")) |i| i + 2 else return error.InvalidMime;
     const body = entity[body_start..];
     const absolute = entity_start + body_start;

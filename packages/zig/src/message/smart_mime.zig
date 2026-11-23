@@ -92,38 +92,13 @@ const Display = struct {
     body: []const u8,
 };
 
-fn partHeader(part: mime.MimePart, name: []const u8) []const u8 {
-    var it = part.headers.iterator();
-    while (it.next()) |entry| {
-        if (isHeader(entry.key_ptr.*, name)) return entry.value_ptr.*;
-    }
-    return "";
-}
+const DisplayKind = enum { plain, html };
 
-/// Replies quote a display body. Forwards retain the original MIME tree,
-/// including attachments. Carry the display part's encoding and charset.
-fn displayBody(a: std.mem.Allocator, body: []const u8, kind: []const u8, encoding: []const u8, disposition: []const u8, depth: usize) !?Display {
-    if (depth >= mime.MultipartParser.MAX_MIME_DEPTH) return error.InvalidMime;
-    if (std.ascii.startsWithIgnoreCase(disposition, "attachment")) return null;
-    if (kind.len == 0) return .{ .kind = "text/plain", .encoding = encoding, .body = body };
-    var content_type = try mime.ContentType.parse(a, kind);
-    defer content_type.deinit();
-    if (isHeader(content_type.media_type, "text") and
-        (isHeader(content_type.media_subtype, "plain") or isHeader(content_type.media_subtype, "html")))
-    {
-        return .{ .kind = kind, .encoding = encoding, .body = body };
-    }
-    if (!content_type.isMultipart()) return null;
-    const boundary = content_type.boundary orelse return error.InvalidMime;
-    var parser = mime.MultipartParser.init(a);
-    const parts = try parser.parse(body, boundary);
-    var html: ?Display = null;
-    for (parts) |part| {
-        const shown = (try displayBody(a, part.body, partHeader(part, "Content-Type"), partHeader(part, "Content-Transfer-Encoding"), partHeader(part, "Content-Disposition"), depth + 1)) orelse continue;
-        if (std.ascii.startsWithIgnoreCase(shown.kind, "text/plain")) return shown;
-        if (html == null) html = shown;
-    }
-    return html;
+fn displayKind(content_type: mime.ContentType) ?DisplayKind {
+    if (!isHeader(content_type.media_type, "text")) return null;
+    if (isHeader(content_type.media_subtype, "plain")) return .plain;
+    if (isHeader(content_type.media_subtype, "html")) return .html;
+    return null;
 }
 
 /// Use a fresh boundary of fixed length and verify that neither message
@@ -140,23 +115,36 @@ fn newBoundary(client: []const u8, original: []const u8, buffer: *[42]u8) ![]con
     return error.InvalidMime;
 }
 
-/// DATA stores LF line endings. The multipart decoder reads CRLF delimiters;
-/// normalize the quote input only, preserving the forwarded MIME bytes.
+/// Replies use the first plain-text display part or fall back to HTML. Keep
+/// the part's raw transfer encoding and charset when copying its body.
 fn replyBody(a: std.mem.Allocator, source: Message) !?Display {
     const kind = try headerValue(a, source.headers, "Content-Type");
-    var body = source.body;
-    if (std.ascii.startsWithIgnoreCase(kind, "multipart/") and std.mem.indexOfScalar(u8, body, '\n') != null) {
-        var normalized: std.ArrayList(u8) = .empty;
-        var pos: usize = 0;
-        while (std.mem.indexOfScalarPos(u8, body, pos, '\n')) |end| {
-            try normalized.appendSlice(a, std.mem.trimEnd(u8, body[pos..end], "\r"));
-            try normalized.appendSlice(a, "\r\n");
-            pos = end + 1;
-        }
-        try normalized.appendSlice(a, body[pos..]);
-        body = try normalized.toOwnedSlice(a);
+    const disposition = try headerValue(a, source.headers, "Content-Disposition");
+    if (std.ascii.startsWithIgnoreCase(disposition, "attachment")) return null;
+    const original = if (kind.len == 0) "text/plain" else kind;
+    const content_type = mime.ContentType.parse(original) catch return error.InvalidMime;
+    if (displayKind(content_type) != null) return .{
+        .kind = original,
+        .encoding = try headerValue(a, source.headers, "Content-Transfer-Encoding"),
+        .body = source.body,
+    };
+    if (!content_type.isMultipart()) return null;
+    const boundary = content_type.boundary orelse return error.InvalidMime;
+    var parser = mime.MultipartParser.init(a);
+    const parts = try parser.parse(source.body, boundary);
+    var html: ?Display = null;
+    for (parts) |part| {
+        if (!part.display_candidate) continue;
+        const shown = if (part.content_type) |ct| displayKind(ct) orelse continue else .plain;
+        const display: Display = .{
+            .kind = part.headers.get("Content-Type") orelse "text/plain",
+            .encoding = part.headers.get("Content-Transfer-Encoding") orelse "",
+            .body = part.body,
+        };
+        if (shown == .plain) return display;
+        if (html == null) html = display;
     }
-    return displayBody(a, body, kind, try headerValue(a, source.headers, "Content-Transfer-Encoding"), try headerValue(a, source.headers, "Content-Disposition"), 0);
+    return html;
 }
 
 /// Add the source to the outgoing message without inheriting its envelope.
@@ -196,4 +184,19 @@ pub fn withOriginal(a: std.mem.Allocator, client: []const u8, original: []const 
     try result.print(a, "--{s}--\r\n", .{boundary});
     if (result.items.len > max_bytes) return error.MessageTooLarge;
     return result.toOwnedSlice(a);
+}
+
+test "a reply quotes the display body outside attached messages" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const original =
+        "Content-Type: multipart/mixed; boundary=sample\n\n" ++
+        "--sample\nContent-Type: message/rfc822\nContent-Disposition: attachment\n\n" ++
+        "From: sender@example.test\nContent-Type: text/plain\n\nAttached note\n" ++
+        "--sample\nContent-Type: text/html; charset=utf-8\nContent-Transfer-Encoding: base64\n\n" ++
+        "PHA+Qm9keTwvcD4=\n--sample--\n";
+    const quote = (try replyBody(arena.allocator(), try Message.parse(original))).?;
+    try std.testing.expectEqualStrings("text/html; charset=utf-8", quote.kind);
+    try std.testing.expectEqualStrings("base64", quote.encoding);
+    try std.testing.expectEqualStrings("PHA+Qm9keTwvcD4=", std.mem.trimEnd(u8, quote.body, "\r\n"));
 }
