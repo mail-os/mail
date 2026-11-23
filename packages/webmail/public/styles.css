@@ -564,6 +564,22 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   line-height: 1.25;
 }
 .calendar-import-form :is(input, select) { width: 100%; }
+.calendar-ics-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) max-content;
+  gap: 12px;
+  max-inline-size: 56rem;
+}
+.calendar-ics-form:where(:has(.calendar-ics-name)) { grid-template-columns: minmax(0, 1.4fr) repeat(2, minmax(0, 1fr)) max-content; }
+.calendar-ics-form button { justify-content: center; }
+@media (490px < width <= 740px) {
+  .calendar-ics-form { grid-template-columns: minmax(0, 1fr) max-content; }
+  .calendar-ics-form:where(:has(.calendar-ics-name)) { grid-template-columns: repeat(2, minmax(0, 1fr)) max-content; }
+  .calendar-ics-form > label:first-child { grid-column: 1 / -1; }
+}
+@media (max-width: 490px) {
+  .calendar-ics-form { grid-template-columns: minmax(0, 1fr); }
+}
 .calendar-create-form { display: grid; grid-template-columns: minmax(0, 12.5rem) max-content; justify-content: start; }
 .calendar-share-form { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, .8fr) minmax(0, 1.65fr) minmax(0, 1fr) max-content; gap: 12px; max-inline-size: 68rem; }
 .calendar-share-form > button { justify-content: center; }
@@ -1126,8 +1142,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-writing-settings h2 { display: flex; gap: 6px; align-items: center; margin-bottom: 10px; }
 .wm-writing-settings h2 .mail-icon { color: var(--accent); }
 .wm-writing-settings .wm-private-tabs { width: fit-content; padding: 3px; gap: 2px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg); }
-.wm-writing-settings .wm-action { margin: 0; background: var(--panel); border: 1px solid var(--control-border); color: var(--text); }
-.wm-writing-settings .wm-action:hover { background: var(--bg); }
+.wm-writing-settings .wm-action { margin: 0; background: var(--panel); border: 1px solid var(--control-border); color: var(--text); font-size: var(--control-font-size); }
+.wm-writing-settings .wm-action:hover:where(:not(:disabled)) { background: var(--bg); }
 .wm-writing-settings .wm-private-tabs .wm-action { border-color: transparent; background: transparent; }
 .wm-writing-settings .wm-private-tabs .wm-action[aria-pressed=true] { border-color: var(--control-border); background: var(--panel); color: var(--accent); }
 .wm-writing-settings .wm-private-tabs + p { margin-top: 8px; }
@@ -1142,8 +1158,10 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-writing-settings .wm-writing-remove:hover { background: var(--danger-soft); color: var(--danger); }
 .wm-writing-settings .wm-writing-remove .mail-icon { color: var(--muted); }
 .wm-writing-settings .wm-writing-remove:hover .mail-icon { color: inherit; }
-.wm-writing-settings .wm-writing-save { background: var(--primary); border-color: var(--primary); color: var(--on-primary); }
-.wm-writing-settings .wm-writing-save:hover { background: var(--primary-hover); }
+.wm-writing-settings .wm-private-form { gap: 12px; }
+.wm-writing-settings .wm-private-form label { margin: 0; }
+.wm-writing-settings .wm-writing-save { background: var(--primary); color: var(--on-primary); }
+.wm-writing-settings .wm-writing-save:hover:not(:disabled) { background: var(--primary-hover); }
 .wm-writing-insert { margin: 0 20px 10px; font-size: 13px; }
 .wm-writing-insert summary { width: fit-content; font-weight: 550; color: var(--accent); cursor: pointer; }
 .wm-writing-control { display: grid; grid-template-columns: 60px minmax(0, 220px) auto; align-items: center; justify-content: start; gap: 8px; margin-top: 8px; }

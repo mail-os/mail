@@ -343,13 +343,13 @@ onUnmounted(() => { destroy(); destroyReminders() })
     </section>
   </section>
   <section :if="importOpen" id="calendar-import" class="calendar-import" aria-label="Import calendar" :aria-busy="importBusy">
-    <form class="calendar-import-form" @submit.prevent="submitImport('preview')">
+    <form class="calendar-import-form calendar-ics-form" @submit.prevent="submitImport('preview')">
       <label>Calendar file<input type="file" accept=".ics,text/calendar" @change="selectImportFile($event)" :disabled="importBusy"></label>
       <label>Destination calendar<select :value="importDestination" @change="selectImportDestination($event)" :disabled="importBusy">
         <option value="new">Create a calendar</option>
         <option :for="item in calendars" :value="item.id" :text="item.name"></option>
       </select></label>
-      <label :if="importDestination === 'new'">New calendar name<input :value="newCalendarName" @input="setNewCalendarName($event)" :disabled="importBusy" maxlength="100" required></label>
+      <label :if="importDestination === 'new'" class="calendar-ics-name">New calendar name<input :value="newCalendarName" @input="setNewCalendarName($event)" :disabled="importBusy" maxlength="100" required></label>
       <button type="submit" class="wm-action" :disabled="!canPreview">Preview</button>
     </form>
     <div :if="importError" class="login-error" role="alert" :text="importError"></div>

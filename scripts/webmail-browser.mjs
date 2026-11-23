@@ -2725,6 +2725,98 @@ async function installGuideJourney(page, phone = false) {
   await button(page, new RegExp(handoff)).waitFor()
 }
 
+async function calendarImportControlsJourney(page, phone = false) {
+  const viewport = page.viewportSize()
+  if (phone) await page.setViewportSize({ width: 320, height: 844 })
+  await verifyAppearance(page, phone ? 'dark' : 'light')
+  await page.goto(`${url}/calendar?day=${day}`)
+  await button(page, 'Today').waitFor()
+  await button(page, 'Import .ics').click()
+  const panel = page.getByRole('region', { name: 'Import calendar' })
+  const form = panel.locator('form')
+  const destination = panel.getByLabel('Destination calendar')
+  const newName = panel.getByLabel('New calendar name')
+  const preview = button(panel, 'Preview')
+  const selector = 'input, select, button'
+  const label = phone ? 'phone' : 'desktop'
+  const height = phone ? 44 : 36
+  const controls = await verifyControlRow(form, selector, height, !phone)
+  assert.equal(controls.length, 4)
+  await verifySelect(destination, height)
+  assert(await preview.isDisabled())
+  if (phone) {
+    assert(controls.every(control => control.left === controls[0].left && control.right === controls[0].right),
+      'Import fields and Preview share both column edges at 320px')
+    assert(Math.abs(controls[3].top - controls[2].bottom - 12) < 0.5, 'Preview starts 12px below the name field')
+  }
+  else {
+    verifyControlGaps(controls, 12)
+    for (const width of [490, 491, 640, 740, 741, 861]) {
+      await page.setViewportSize({ width, height: viewport.height })
+      const responsive = await verifyControlRow(form, selector, width <= 860 ? 44 : 36, width > 740)
+      await verifySelectedOptionFits(destination)
+      await fitsViewport(page)
+      if (width > 490 && width <= 740) {
+        verifyControlGaps(responsive.slice(1), 12)
+        assert(Math.abs(responsive[0].left - responsive[1].left) < 0.5 && Math.abs(responsive[0].right - responsive[3].right) < 0.5,
+          'The tablet file field spans the destination, name, and Preview row')
+      }
+    }
+    await page.setViewportSize(viewport)
+  }
+  await verifyPaintedControlBorders(form, selector, controls, `${label}-calendar-import`)
+
+  const title = `${label} calendar import check`
+  await panel.getByLabel('Calendar file').setInputFiles({
+    name: 'planning-review.ics', mimeType: 'text/calendar',
+    buffer: Buffer.from([
+      'BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Mail//Browser//EN', 'BEGIN:VEVENT',
+      `UID:${label}-calendar-import@example.test`, 'DTSTAMP:20261121T100000Z',
+      'DTSTART:20261122T110000Z', 'DTEND:20261122T120000Z', `SUMMARY:${title}`,
+      'END:VEVENT', 'END:VCALENDAR', '',
+    ].join('\r\n')),
+  })
+  if (phone) {
+    await destination.selectOption({ label: calendarLabel })
+    await newName.waitFor({ state: 'hidden' })
+  }
+  else await newName.fill('Imported planning')
+  await preview.click()
+  await panel.getByRole('status').filter({ hasText: '1 ready' }).waitFor()
+  await panel.getByRole('list', { name: 'Event results' }).getByText(title, { exact: true }).waitFor()
+  await button(panel, 'Import events').click()
+  await panel.getByRole('status').filter({ hasText: '1 imported' }).waitFor()
+  await fitsViewport(page)
+  if (phone) await page.setViewportSize(viewport)
+}
+
+async function writingControlJourney(page) {
+  await verifyAppearance(page, 'dark')
+  await page.goto(url + '/')
+  await button(page, 'Account').click()
+  const settings = page.getByRole('dialog', { name: 'Account settings' })
+  const form = settings.locator('.wm-writing-settings form')
+  const name = form.getByLabel('Name', { exact: true })
+  const snippet = form.getByLabel('Snippet text')
+  const save = button(form, 'Save snippet')
+  await save.waitFor()
+  assert(await save.isDisabled())
+  const selector = 'input, button'
+  const controls = await verifyControlRow(form, selector, 36, false)
+  assert.equal(controls[0].fontSize, controls[1].fontSize)
+  for (const field of [name, snippet]) {
+    assert.equal(await field.locator('..').evaluate(label => getComputedStyle(label).rowGap), '6px')
+  }
+  await verifyPaintedControlBorders(form, selector, controls, 'writing-tools-disabled')
+  await name.fill('Review handoff')
+  await snippet.fill('I reviewed the handoff and added my notes.')
+  await save.hover()
+  await verifyPaintedControlBorders(form, selector, await verifyControlRow(form, selector, 36, false), 'writing-tools-ready')
+  await save.click()
+  await button(settings, 'Review handoff').waitFor()
+  await button(settings, 'Close').click()
+}
+
 try {
   const desktop = await signIn()
   await verifyInstallableWebmail(desktop)
@@ -2758,6 +2850,9 @@ try {
   await forwardingFilterJourney(desktop, phone)
   await retentionJourney(firstRun)
   await assistantGrantJourney(firstRun)
+  await calendarImportControlsJourney(desktop)
+  await calendarImportControlsJourney(phone, true)
+  await writingControlJourney(desktop)
   assert.deepEqual(errors, [], 'Browser pages raised uncaught errors')
   process.stdout.write(`${engine} passed the desktop and phone webmail journeys.\n`)
 }

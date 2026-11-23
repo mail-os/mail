@@ -1051,8 +1051,8 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       </select>
     </div>
     <form class="wm-private-form" @submit.prevent="saveWritingEntry()">
-      <label for="writingName">Name</label><input id="writingName" type="text" x-model="writingName" maxlength="80" required :disabled="writingBusy">
-      <label for="writingText" :text="writingKind === 'snippets' ? 'Snippet text' : 'Signature text'"></label><textarea id="writingText" x-model="writingText" rows="3" :maxlength="writingKind === 'snippets' ? 8192 : 4096" required :disabled="writingBusy"></textarea>
+      <label>Name<input id="writingName" type="text" x-model="writingName" maxlength="80" required :disabled="writingBusy"></label>
+      <label><span :text="writingKind === 'snippets' ? 'Snippet text' : 'Signature text'"></span><textarea id="writingText" x-model="writingText" rows="3" :maxlength="writingKind === 'snippets' ? 8192 : 4096" required :disabled="writingBusy"></textarea></label>
       <div class="wm-private-actions">
         <button type="submit" class="wm-action wm-writing-save" :disabled="writingBusy || !writingName.trim() || !writingText.trim()" :text="writingKind === 'snippets' ? 'Save snippet' : 'Save signature'"></button>
         <button :if="writingId" type="button" class="wm-action" @click="editWritingEntry()" :disabled="writingBusy"><span class="mail-icon" data-icon="plus" aria-hidden="true"></span>New entry</button>
