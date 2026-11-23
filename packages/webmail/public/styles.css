@@ -745,7 +745,9 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-free-time-heading p { margin: 0; color: var(--muted); font-size: 12px; }
 .calendar-free-time-form { display: grid; grid-template-columns: 9.5rem repeat(3, 8rem) minmax(9rem, max-content); align-items: end; gap: 8px; }
 .calendar-free-time-form :is(input:not([type=checkbox]), select) { width: 100%; }
-.calendar-free-time-form > button { justify-content: center; }
+.calendar-free-time-form > button { display: grid; place-items: center; }
+.calendar-free-time-form > button > span { grid-area: 1 / 1; }
+.calendar-free-time-form > button > span[aria-hidden=true] { visibility: hidden; }
 .calendar-free-time-form .calendar-free-time-personal { display: flex; align-items: center; gap: 6px; grid-column: 1 / -1; min-block-size: var(--control-height); }
 .calendar-free-time > .calendar-label-error { margin-block-start: 10px; }
 .calendar-free-time-output { display: grid; gap: 8px; margin-block-start: 12px; padding-block-start: 10px; border-block-start: 1px solid var(--border); }

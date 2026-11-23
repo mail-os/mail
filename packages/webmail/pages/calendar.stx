@@ -427,7 +427,10 @@ onUnmounted(() => { destroy(); destroyReminders() })
         <label>Minimum duration<select x-model="freeTimeMinutes" :disabled="freeTimeBusy">
           <option :for="minutes in freeTimeDurations" :value="String(minutes)" :text="minutes + ' min'"></option>
         </select></label>
-        <button type="submit" class="wm-action calendar-primary" :disabled="freeTimeBusy" :text="freeTimeBusy ? 'Checking…' : 'Check availability'"></button>
+        <button type="submit" class="wm-action calendar-primary" :disabled="freeTimeBusy">
+          <span :aria-hidden="freeTimeBusy">Check availability</span>
+          <span :aria-hidden="!freeTimeBusy">Checking…</span>
+        </button>
         <label :if="freeTimeCanIncludeOwned" class="calendar-free-time-personal"><input type="checkbox" :checked="freeTimeIncludeOwned" @change="freeTimeIncludeOwned.set($event.target.checked)" :disabled="freeTimeBusy">Include my calendars</label>
       </form>
       <p :if="freeTimeError" class="calendar-label-error" role="alert" :text="freeTimeError"></p>
