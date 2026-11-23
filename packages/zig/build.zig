@@ -45,6 +45,15 @@ pub fn build(b: *std.Build) void {
     });
     const zig_cli_module = zig_cli_dep.module("zig_cli");
 
+    // zig-mime: the streaming MIME walker shared with the scan engine.
+    // Imported as "zig-mime" so it is never confused with the in-tree adapter
+    // (src/message/mime.zig), which tests reach as `mail.mime`.
+    const zig_mime_dep = b.dependency("zig_mime", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zig_mime_module = zig_mime_dep.module("mime");
+
     // Add zig-search-engine dependency (Typesense-backed full-text search)
     const search_engine_dep = b.dependency("search_engine", .{
         .target = target,
@@ -83,6 +92,7 @@ pub fn build(b: *std.Build) void {
     mail_module.addImport("tls", tls_module);
     mail_module.addImport("search-engine", search_engine_module);
     mail_module.addImport("zig-cli", zig_cli_module);
+    mail_module.addImport("zig-mime", zig_mime_module);
     mail_module.addImport("sqlite", sqlite_module);
     mail_module.addImport("ascii-compat", ascii_compat_module);
     mail_module.addImport("build-options", build_options_module);
@@ -144,6 +154,7 @@ pub fn build(b: *std.Build) void {
         "src/antispam/spam_filter.zig",
         "src/dkim_verify_test.zig",
         "src/clamav_test.zig",
+        "src/mime_test.zig",
         "src/domain_migrate_test.zig",
         "src/core/version.zig",
         "src/core/log_safe.zig",
@@ -189,6 +200,7 @@ pub fn build(b: *std.Build) void {
         // upgrade_test roots at src/ and reaches cli/upgrade.zig, which builds
         // its command surface with zig-cli.
         test_module.addImport("zig-cli", zig_cli_module);
+        test_module.addImport("zig-mime", zig_mime_module);
         linkVendoredSqlite(test_module);
 
         const unit_tests = b.addTest(.{
@@ -213,6 +225,7 @@ pub fn build(b: *std.Build) void {
     mail_test_module.addImport("sqlite", sqlite_module);
     mail_test_module.addImport("ascii-compat", ascii_compat_module);
     mail_test_module.addImport("build-options", build_options_module);
+    mail_test_module.addImport("zig-mime", zig_mime_module);
     linkVendoredSqlite(mail_test_module);
 
     for (rfc_compliance_tests) |test_file| {
@@ -254,18 +267,23 @@ pub fn build(b: *std.Build) void {
 
     // Fuzzing tests
     const fuzz_step = b.step("test-fuzz", "Run fuzzing tests");
-    const fuzz_module = b.createModule(.{
-        .root_source_file = b.path("tests/fuzz_test.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    fuzz_module.addImport("mail", mail_test_module);
-    const fuzz_tests = b.addTest(.{
-        .root_module = fuzz_module,
-    });
-    const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
-    fuzz_step.dependOn(&run_fuzz_tests.step);
+    const fuzz_tests = [_][]const u8{
+        "tests/fuzz_test.zig",
+        "tests/fuzz_mime_parser.zig",
+    };
+    for (fuzz_tests) |test_file| {
+        const fuzz_module = b.createModule(.{
+            .root_source_file = b.path(test_file),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        fuzz_module.addImport("mail", mail_test_module);
+        const run_fuzz_tests = b.addRunArtifact(b.addTest(.{
+            .root_module = fuzz_module,
+        }));
+        fuzz_step.dependOn(&run_fuzz_tests.step);
+    }
 
     // All tests step
     const test_all_step = b.step("test-all", "Run all tests (unit + rfc + e2e + fuzz)");
@@ -305,12 +323,20 @@ fn buildForTarget(
         .optimize = optimize,
     });
 
+    // zig-mime picks its SIMD vector width from the target at comptime, so
+    // each cross target needs its own instance too.
+    const target_mime = b.dependency("zig_mime", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/mail_cli.zig"),
         .target = target,
         .optimize = optimize,
     });
     root_module.addImport("tls", target_tls.module("tls"));
+    root_module.addImport("zig-mime", target_mime.module("mime"));
     root_module.addImport("search-engine", search_engine_module);
     root_module.addImport("zig-cli", zig_cli_module);
     root_module.addImport("sqlite", sqliteModule(b, target, optimize));

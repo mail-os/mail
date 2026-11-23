@@ -47,33 +47,30 @@ mkdir -p corpus/smtp_protocol
 
 ### 2. MIME Parser Fuzzer
 
-Tests MIME message parsing for robustness against malformed MIME content.
+Randomized tests against the mail server's MIME parser: the `mail.mime`
+adapter (`src/message/mime.zig`) and the zig-mime walker behind it. They run
+with fixed seeds, so a failure reproduces.
 
 **File:** `tests/fuzz_mime_parser.zig`
 
 **Coverage:**
-- MIME header parsing
-- Content-Type parsing
-- Multipart boundary extraction
-- Base64 decoding
-- Quoted-Printable decoding
-
-**Build:**
-```bash
-zig build-exe tests/fuzz_mime_parser.zig \
-  -fsanitize=fuzzer \
-  -fsanitize=address \
-  -fsanitize=undefined \
-  --name fuzz_mime_parser
-```
+- Any bytes through `MultipartParser.parse`: parts or a depth/part-limit error, never a crash or a leak
+- Allocation failure at every point frees everything
+- The walk gives the same events whether the stream arrives whole, in random chunks or one byte at a time
+- Bare-LF and CRLF framing of the same message yield the same attachments
+- Base64 and quoted-printable decoders give the same output however the input is split
 
 **Run:**
 ```bash
-# Generate initial corpus
-mkdir -p corpus/mime_parser
+cd packages/zig
+zig build test-fuzz
+```
 
-# Run fuzzer
-./fuzz_mime_parser corpus/mime_parser
+The seed corpus is in the file (`seeds`). Long fuzzing runs of the walker live
+upstream in [zig-utils/zig-mime](https://github.com/zig-utils/zig-mime):
+
+```bash
+zig build fuzz -Dfuzz-iterations=1000000
 ```
 
 ---
@@ -262,39 +259,8 @@ echo "RCPT TO:<user@@example.com>" > corpus/smtp_protocol/rcpt_invalid.txt
 
 ### MIME Parser Seeds
 
-```bash
-mkdir -p corpus/mime_parser
-
-# Simple text message
-cat > corpus/mime_parser/text_plain.txt << 'EOF'
-Content-Type: text/plain; charset=utf-8
-Content-Transfer-Encoding: 7bit
-
-Hello, World!
-EOF
-
-# Multipart message
-cat > corpus/mime_parser/multipart.txt << 'EOF'
-Content-Type: multipart/mixed; boundary="boundary123"
-
---boundary123
-Content-Type: text/plain
-
-Part 1
---boundary123
-Content-Type: text/html
-
-<p>Part 2</p>
---boundary123--
-EOF
-
-# Base64 encoded
-cat > corpus/mime_parser/base64.txt << 'EOF'
-Content-Transfer-Encoding: base64
-
-SGVsbG8sIFdvcmxkIQ==
-EOF
-```
+The MIME seeds live in `tests/fuzz_mime_parser.zig` (`seeds`), each message in
+a CRLF and a bare-LF form.
 
 ---
 
@@ -366,13 +332,11 @@ jobs:
       - name: Build fuzz targets
         run: |
           zig build-exe tests/fuzz_smtp_protocol.zig -fsanitize=fuzzer
-          zig build-exe tests/fuzz_mime_parser.zig -fsanitize=fuzzer
 
       - name: Run fuzzing
         run: |
-          mkdir -p corpus/smtp_protocol corpus/mime_parser
+          mkdir -p corpus/smtp_protocol
           timeout 3000 ./fuzz_smtp_protocol corpus/smtp_protocol || true
-          timeout 3000 ./fuzz_mime_parser corpus/mime_parser || true
 
       - name: Upload crashes
         if: failure()
@@ -405,18 +369,11 @@ zig build-exe $SRC/mail/tests/fuzz_smtp_protocol.zig \
   -fsanitize=address \
   --name fuzz_smtp_protocol
 
-zig build-exe $SRC/mail/tests/fuzz_mime_parser.zig \
-  -fsanitize=fuzzer \
-  -fsanitize=address \
-  --name fuzz_mime_parser
-
 # Copy to output
 cp fuzz_smtp_protocol $OUT/
-cp fuzz_mime_parser $OUT/
 
 # Copy seed corpus
 cp -r corpus/smtp_protocol $OUT/fuzz_smtp_protocol_seed_corpus/
-cp -r corpus/mime_parser $OUT/fuzz_mime_parser_seed_corpus/
 ```
 
 ---

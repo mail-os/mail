@@ -5,7 +5,6 @@ const testing = std.testing;
 const security = @import("../src/auth/security.zig");
 const email_validator = @import("../src/core/email_validator.zig");
 const headers = @import("../src/message/headers.zig");
-const mime = @import("../src/message/mime.zig");
 
 /// OWASP-based security test suite for SMTP server
 /// Tests cover common attack vectors and security best practices
@@ -163,36 +162,6 @@ test "security: validate email address length limits" {
     );
 }
 
-test "security: enforce maximum MIME nesting depth" {
-    var parser = mime.MultipartParser.init(testing.allocator);
-
-    // Simulate deep nesting by setting depth
-    parser.current_depth = 10; // At max
-
-    const message =
-        \\--boundary
-        \\Content-Type: text/plain
-        \\
-        \\test
-        \\--boundary--
-    ;
-
-    // Should reject due to depth limit
-    const result = parser.parse(message, "boundary");
-    try testing.expectError(error.MimeDepthExceeded, result);
-}
-
-test "security: enforce MIME boundary length limits" {
-    var parser = mime.MultipartParser.init(testing.allocator);
-
-    // Boundary with 71 characters (too long)
-    const long_boundary = "a" ** 71;
-    const message = "--" ++ long_boundary ++ "\r\ntest\r\n--" ++ long_boundary ++ "--";
-
-    const result = parser.parse(message, long_boundary);
-    try testing.expectError(error.BoundaryTooLong, result);
-}
-
 test "security: enforce RFC 5322 header line length" {
     var parser = headers.HeaderParser.init(testing.allocator);
 
@@ -339,16 +308,6 @@ test "security: prevent email spoofing via display name" {
     }
 }
 
-test "security: prevent buffer overflow with large inputs" {
-    // Test that parser handles large inputs safely
-    const huge_boundary = "a" ** 1000;
-    var parser = mime.MultipartParser.init(testing.allocator);
-
-    const result = parser.parse("test", huge_boundary);
-    // Should error with BoundaryTooLong, not crash
-    try testing.expectError(error.BoundaryTooLong, result);
-}
-
 test "security: validate email local part characters" {
     const emails_with_special_chars = [_][]const u8{
         "user<script>@example.com",
@@ -399,20 +358,6 @@ test "security: enforce domain label length limits" {
 
     const result = email_validator.EmailValidator.validate(email);
     try testing.expectError(error.DomainLabelTooLong, result);
-}
-
-test "security: prevent MIME bomb attacks" {
-    // MIME bombs use deeply nested MIME to cause resource exhaustion
-    // Our depth limit of 10 should prevent this
-    var parser = mime.MultipartParser.init(testing.allocator);
-
-    // Set to maximum allowed depth
-    parser.current_depth = mime.MultipartParser.MAX_MIME_DEPTH;
-
-    const message = "--boundary\r\ntest\r\n--boundary--";
-    const result = parser.parse(message, "boundary");
-
-    try testing.expectError(error.MimeDepthExceeded, result);
 }
 
 test "security: validate IPv6 addresses in email domain literals" {
