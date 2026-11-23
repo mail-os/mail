@@ -355,6 +355,181 @@ test "MIME: parser accepts boundary at exactly 70 chars" {
     try testing.expect(true);
 }
 
+// Ported from tests/security_test.zig, which no build step compiles.
+test "MIME: enforce maximum nesting depth" {
+    var parser = mail.mime.MultipartParser.init(testing.allocator);
+    // No multipart level may open at all.
+    parser.max_depth = 0;
+    const message = "--boundary\r\nContent-Type: text/plain\r\n\r\ntest\r\n--boundary--";
+    try testing.expectError(error.MimeDepthExceeded, parser.parse(message, "boundary"));
+}
+
+test "MIME: enforce boundary length limit" {
+    var parser = mail.mime.MultipartParser.init(testing.allocator);
+    const long_boundary = repeat("a", 71);
+    const message = "--" ++ long_boundary ++ "\r\ntest\r\n--" ++ long_boundary ++ "--";
+    try testing.expectError(error.BoundaryTooLong, parser.parse(message, long_boundary));
+}
+
+test "MIME: a huge boundary is rejected, not overflowed" {
+    var parser = mail.mime.MultipartParser.init(testing.allocator);
+    try testing.expectError(error.BoundaryTooLong, parser.parse("test", repeat("a", 1000)));
+}
+
+test "MIME: depth limit stops a MIME bomb" {
+    var parser = mail.mime.MultipartParser.init(testing.allocator);
+    parser.max_depth = 0;
+    const message = "--boundary\r\ntest\r\n--boundary--";
+    try testing.expectError(error.MimeDepthExceeded, parser.parse(message, "boundary"));
+}
+
+/// `levels` multiparts nested inside each other around one text/plain leaf.
+/// Boundaries share one width so none is a prefix of another.
+fn nestedMultipart(allocator: std.mem.Allocator, levels: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (0..levels - 1) |i| {
+        try out.print(allocator, "--b{d:0>2}x\r\nContent-Type: multipart/mixed; boundary=\"b{d:0>2}x\"\r\n\r\n", .{ i, i + 1 });
+    }
+    try out.print(allocator, "--b{d:0>2}x\r\nContent-Type: text/plain\r\n\r\nleaf\r\n", .{levels - 1});
+    var i = levels;
+    while (i > 0) {
+        i -= 1;
+        try out.print(allocator, "--b{d:0>2}x--\r\n", .{i});
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "MIME: ten nested levels parse, the eleventh is refused" {
+    var parser = mail.mime.MultipartParser.init(testing.allocator);
+
+    const ten = try nestedMultipart(testing.allocator, 10);
+    defer testing.allocator.free(ten);
+    const parts = try parser.parse(ten, "b00x");
+    defer parser.freeParts(parts);
+    try testing.expectEqual(@as(usize, 1), parts.len);
+
+    const eleven = try nestedMultipart(testing.allocator, 11);
+    defer testing.allocator.free(eleven);
+    try testing.expectError(error.MimeDepthExceeded, parser.parse(eleven, "b00x"));
+}
+
+test "MIME: an empty boundary is refused" {
+    var parser = mail.mime.MultipartParser.init(testing.allocator);
+    try testing.expectError(error.InvalidBoundary, parser.parse("--\r\n\r\nx\r\n----\r\n", ""));
+}
+
+// ============================================================================
+// MIME: evasion regressions (mail-os/mail#23)
+// ============================================================================
+// Each message hides an attachment behind framing the old CRLF-only splitter
+// misread. They use only the API both parsers share so they can be run
+// against either.
+
+test "MIME evasion: an all bare-LF message still yields its attachment" {
+    var parser = mail.mime.MultipartParser.init(testing.allocator);
+    const message = "--b\nContent-Type: text/plain\n\nhello\n--b\n" ++
+        "Content-Type: application/octet-stream; name=\"payload.exe\"\n" ++
+        "Content-Transfer-Encoding: base64\n" ++
+        "Content-Disposition: attachment; filename=\"payload.exe\"\n\n" ++
+        "TVqQAAMAAAAEAAAA\n--b--\n";
+    const parts = try parser.parse(message, "b");
+    defer parser.freeParts(parts);
+    try testing.expectEqual(@as(usize, 2), parts.len);
+    try testing.expectEqualStrings("hello", parts[0].body);
+    try testing.expectEqualStrings("TVqQAAMAAAAEAAAA", parts[1].body);
+    const disposition = parts[1].headers.get("Content-Disposition") orelse return error.TestExpectedDisposition;
+    try testing.expect(std.mem.indexOf(u8, disposition, "payload.exe") != null);
+    try testing.expectEqualStrings("octet-stream", parts[1].content_type.?.media_subtype);
+}
+
+test "MIME evasion: a bare-LF header terminator under CRLF delimiters" {
+    var parser = mail.mime.MultipartParser.init(testing.allocator);
+    const message = "--b\r\nContent-Type: application/octet-stream\n" ++
+        "Content-Disposition: attachment; filename=\"evil.exe\"\n\nTVqQ\r\n--b--\r\n";
+    const parts = try parser.parse(message, "b");
+    defer parser.freeParts(parts);
+    try testing.expectEqual(@as(usize, 1), parts.len);
+    try testing.expectEqualStrings("TVqQ", parts[0].body);
+    try testing.expect(parts[0].headers.get("Content-Disposition") != null);
+    try testing.expectEqualStrings("octet-stream", parts[0].content_type.?.media_subtype);
+}
+
+test "MIME evasion: a bare-LF delimiter smuggled after a CRLF part" {
+    var parser = mail.mime.MultipartParser.init(testing.allocator);
+    const message = "--b\r\nContent-Type: text/plain\r\n\r\nhello\n--b\n" ++
+        "Content-Type: application/octet-stream\n" ++
+        "Content-Disposition: attachment; filename=\"x.exe\"\n\nTVqQ\r\n--b--\r\n";
+    const parts = try parser.parse(message, "b");
+    defer parser.freeParts(parts);
+    try testing.expectEqual(@as(usize, 2), parts.len);
+    try testing.expectEqualStrings("hello", parts[0].body);
+    try testing.expectEqualStrings("TVqQ", parts[1].body);
+    try testing.expect(parts[1].headers.get("Content-Disposition") != null);
+}
+
+test "MIME evasion: an invalid Content-Type does not hide the other parts" {
+    var parser = mail.mime.MultipartParser.init(testing.allocator);
+    const message = "--b\r\nContent-Type: garbage\r\n\r\nx\r\n--b\r\n" ++
+        "Content-Type: application/octet-stream\r\n" ++
+        "Content-Disposition: attachment; filename=\"a.exe\"\r\n\r\nTVqQ\r\n--b--\r\n";
+    const parts = try parser.parse(message, "b");
+    defer parser.freeParts(parts);
+    try testing.expectEqual(@as(usize, 2), parts.len);
+    try testing.expectEqualStrings("TVqQ", parts[1].body);
+}
+
+test "MIME evasion: lowercase field names are still seen" {
+    var parser = mail.mime.MultipartParser.init(testing.allocator);
+    const message = "--b\r\ncontent-type: application/octet-stream\r\n" ++
+        "content-disposition: attachment; filename=\"a.exe\"\r\n\r\nTVqQ\r\n--b--\r\n";
+    const parts = try parser.parse(message, "b");
+    defer parser.freeParts(parts);
+    try testing.expectEqual(@as(usize, 1), parts.len);
+    try testing.expect(parts[0].headers.get("Content-Disposition") != null);
+    try testing.expect(parts[0].content_type != null);
+    try testing.expectEqualStrings("octet-stream", parts[0].content_type.?.media_subtype);
+}
+
+test "MIME evasion: a part without header fields keeps its body" {
+    var parser = mail.mime.MultipartParser.init(testing.allocator);
+    const parts = try parser.parse("--b\r\n\r\nhello\r\n--b--\r\n", "b");
+    defer parser.freeParts(parts);
+    try testing.expectEqual(@as(usize, 1), parts.len);
+    try testing.expectEqualStrings("hello", parts[0].body);
+    try testing.expect(parts[0].content_type == null);
+}
+
+test "MIME evasion: an attachment inside a nested multipart is returned" {
+    var parser = mail.mime.MultipartParser.init(testing.allocator);
+    const message = "--outer\r\nContent-Type: multipart/alternative; boundary=\"inner\"\r\n\r\n" ++
+        "--inner\r\nContent-Type: text/plain\r\n\r\ntext\r\n" ++
+        "--inner\r\nContent-Type: application/octet-stream\r\n" ++
+        "Content-Disposition: attachment; filename=\"n.exe\"\r\n\r\nTVqQ\r\n" ++
+        "--inner--\r\n--outer--\r\n";
+    const parts = try parser.parse(message, "outer");
+    defer parser.freeParts(parts);
+    try testing.expectEqual(@as(usize, 2), parts.len);
+    try testing.expectEqualStrings("TVqQ", parts[1].body);
+    try testing.expect(parts[1].headers.get("Content-Disposition") != null);
+}
+
+test "MIME evasion: a delimiter must start a line" {
+    var parser = mail.mime.MultipartParser.init(testing.allocator);
+    const parts = try parser.parse("--b\r\nContent-Type: text/plain\r\n\r\nsee x--b here\r\n--b--\r\n", "b");
+    defer parser.freeParts(parts);
+    try testing.expectEqual(@as(usize, 1), parts.len);
+    try testing.expectEqualStrings("see x--b here", parts[0].body);
+}
+
+test "MIME evasion: a binary body keeps its trailing newline" {
+    var parser = mail.mime.MultipartParser.init(testing.allocator);
+    const parts = try parser.parse("--b\r\nContent-Type: application/octet-stream\r\n\r\nab\n\r\n--b--\r\n", "b");
+    defer parser.freeParts(parts);
+    try testing.expectEqual(@as(usize, 1), parts.len);
+    try testing.expectEqualStrings("ab\n", parts[0].body);
+}
+
 // ============================================================================
 // io_compat randomBytes Tests (DKIM crash fix)
 // ============================================================================
