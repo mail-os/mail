@@ -15,7 +15,6 @@ const snapshots = @import("../api/webmail_snapshots.zig");
 const message_refs = @import("../storage/message_refs.zig");
 const maildir_folders = @import("../storage/maildir_folders.zig");
 const folder_edits = @import("../storage/folder_edits.zig");
-const maildir_index = @import("../search/maildir_index.zig");
 const thread_ids = @import("../message/thread_ids.zig");
 const fs_compat = @import("../core/fs_compat.zig");
 const io_compat = @import("../core/io_compat.zig");
@@ -1093,22 +1092,13 @@ fn editFolder(ctx: *Context, account: sync_state.Account, body: []const u8, toke
     const base = try std.fmt.allocPrint(a, "mail/{s}", .{ctx.local_part});
     const root = (try maildir_folders.open(io, .cwd(), base)) orelse return error.UnknownFolder;
     defer root.close(io);
-    const layout = (try maildir_folders.layout(io, root, name)) orelse return error.UnknownFolder;
-    const physical = try folder_edits.physicalName(a, name, layout);
-    const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ base, physical });
-    var edit = folder_edits.Edit{
-        .id = next_key,
-        .root_name = ctx.local_part,
-        .source = name,
-        .destination = destination,
-        .stamp = try message_refs.directoryStamp(a, path),
-        .layout = layout,
+    var edit = folder_edits.Edit.init(a, root, ctx.local_part, name, destination) catch |err| switch (err) {
+        error.FileNotFound => return error.UnknownFolder,
+        else => return err,
     };
-    try maildir_index.markFolderEditLocked(a, ctx.db, ctx.username, !std.mem.eql(u8, ctx.username, ctx.local_part), root, layout, name, destination);
-    try edit.record(ctx.db);
-    defer edit.settle(a, ctx.db, root) catch |err| std.log.warn("could not settle ActiveSync folder edit: {}", .{err});
-    try edit.apply(a, root);
-    try account.editFolder(a, hierarchy_collection, key, next_key, snapshot, ctx.username, id, name, destination);
+    try edit.stage(a, ctx.db, root, ctx.username);
+    defer edit.finish(a, ctx.db, root);
+    try account.editFolder(a, hierarchy_collection, key, next_key, snapshot, ctx.username, id, edit);
     edit.committed = true;
     return .{ .body = encoded };
 }

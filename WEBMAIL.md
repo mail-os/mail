@@ -1656,6 +1656,8 @@ record release-to-release baselines.
 Message listings and details include the mailbox-scoped `reference` and `revision`.
 `GET /webmail/api/messages/ref/:reference` follows the message across folder moves and returns its current `folder`, `uid`, and strong `ETag`. A flag change keeps the reference and changes the revision. A copy gets its own reference. An expunged message or a reference from another account returns `404`.
 
+An IMAP folder rename preserves message UIDs and `UIDNEXT`. A reused destination name uses a `UIDVALIDITY` newer than its previous incarnation.
+
 `PUT` and `DELETE` on the reference URL require the last `ETag` in `If-Match`.
 Missing preconditions return `428` and stale revisions return `412`. For `POST /webmail/api/bulk`, pass `reference` and `revision` alongside `uid` and `folder` for each selected message. A stale revision rejects the selection before any action runs. Existing UID routes remain available for older clients.
 

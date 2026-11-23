@@ -6,6 +6,8 @@ const refs = @import("message_refs.zig");
 const paths = @import("../core/maildir_path.zig");
 const durable = @import("../core/durable_maildir.zig");
 const io_compat = @import("../core/io_compat.zig");
+const time = @import("../core/time_compat.zig");
+const index = @import("../search/maildir_index.zig");
 
 const Allocator = std.mem.Allocator;
 const Database = database.Database;
@@ -20,8 +22,33 @@ pub const Edit = struct {
     layout: folders.Layout,
     committed: bool = false,
 
-    /// Call with the mailbox mutation lock held, before changing the filesystem.
-    pub fn record(self: Edit, db: *Database) !void {
+    pub fn init(a: Allocator, root: Dir, root_name: []const u8, source: []const u8, destination: ?[]const u8) !Edit {
+        try paths.validate(root_name);
+        if (destination) |name| try folders.validateName(name);
+        const layout = (try folders.layout(io_compat.getIo(), root, source)) orelse return error.FileNotFound;
+        const physical = try physicalName(a, source, layout);
+        const path = try std.fmt.allocPrint(a, "mail/{s}/{s}", .{ root_name, physical });
+        var nonce: [16]u8 = undefined;
+        io_compat.randomBytes(&nonce);
+        return .{
+            .id = try a.dupe(u8, &std.fmt.bytesToHex(nonce, .lower)),
+            .root_name = root_name,
+            .source = source,
+            .destination = destination,
+            .stamp = try refs.directoryStamp(a, path),
+            .layout = layout,
+        };
+    }
+
+    /// Hold the mailbox mutation lock through stage, metadata commit and settle.
+    pub fn stage(self: Edit, a: Allocator, db: *Database, root: Dir, user: []const u8) !void {
+        try index.markFolderEditLocked(a, db, user, !std.mem.eql(u8, user, self.root_name), root, self.layout, self.source, self.destination);
+        try self.record(db);
+        errdefer self.finish(a, db, root);
+        try self.apply(a, root);
+    }
+
+    fn record(self: Edit, db: *Database) !void {
         const stmt = try db.prepare("INSERT INTO eas_folder_edits(id,mailbox_root,source,destination,stamp,maildir_plus) VALUES(?1,?2,?3,?4,?5,?6)");
         defer stmt.finalize();
         try stmt.bind(1, self.id);
@@ -33,13 +60,13 @@ pub const Edit = struct {
         _ = try stmt.step();
     }
 
-    pub fn apply(self: Edit, a: Allocator, root: Dir) !void {
+    fn apply(self: Edit, a: Allocator, root: Dir) !void {
         const io = io_compat.getIo();
         const location = try self.locations(a);
         if (self.destination) |name| {
             // A case-only rename can name the same directory on a Mac. The
             // actual publish below still refuses to replace any other object.
-            if (!std.ascii.eqlIgnoreCase(name, self.source)) try requireUnused(a, io, root, name, null);
+            try requireUnused(a, io, root, name, self.source);
         }
         try Dir.renamePreserve(root, location.source, root, location.staged, io);
         if (self.layout == .maildir_plus) try root.deleteFile(io, self.source);
@@ -51,9 +78,63 @@ pub const Edit = struct {
         try durable.syncDirectory(a, location.root);
     }
 
+    /// Commit the shared metadata and this journal checkpoint together with
+    /// any protocol-specific state the caller adds to the transaction.
+    pub fn applyMetadata(self: Edit, tx: Database.Transaction, user: []const u8) !void {
+        const retired = self.destination orelse self.source;
+        for ([_][]const u8{
+            "DELETE FROM imap_uids WHERE username=?1 AND mailbox=?2",
+            "DELETE FROM imap_mailboxes WHERE username=?1 AND mailbox=?2",
+            "DELETE FROM mailbox_message_refs WHERE user_id=(SELECT id FROM users WHERE username=?1) AND folder=?2",
+            "UPDATE mailbox_message_refs SET next_folder=NULL,next_basename=NULL,next_digest=NULL,next_junk_action=NULL,next_junk_receipt=NULL,next_retention_at=NULL WHERE user_id=(SELECT id FROM users WHERE username=?1) AND next_folder=?2",
+        }) |sql| {
+            const stmt = try tx.prepare(sql);
+            defer stmt.finalize();
+            try stmt.bind(1, user);
+            try stmt.bind(2, retired);
+            _ = try stmt.step();
+        }
+        if (self.destination) |destination| {
+            const source = try tx.prepare(
+                \\INSERT INTO imap_mailboxes(username,mailbox,uidvalidity,uidnext)
+                \\VALUES(?1,?2,MAX(?3,COALESCE((SELECT uidvalidity+1 FROM imap_mailbox_generations WHERE username=?1 AND mailbox=?2),0)),
+                \\       (SELECT COALESCE(MAX(uid),0)+1 FROM imap_uids WHERE username=?1 AND mailbox=?2))
+                \\ON CONFLICT(username,mailbox) DO NOTHING
+            );
+            defer source.finalize();
+            try source.bind(1, user);
+            try source.bind(2, self.source);
+            try source.bind(3, time.timestamp());
+            _ = try source.step();
+            for ([_][]const u8{
+                \\UPDATE imap_mailboxes SET mailbox=?3,uidvalidity=MAX(uidvalidity,COALESCE((SELECT uidvalidity+1 FROM imap_mailbox_generations WHERE username=?1 AND mailbox=?3),0))
+                \\WHERE username=?1 AND mailbox=?2
+                ,
+                "UPDATE imap_uids SET mailbox=?3 WHERE username=?1 AND mailbox=?2",
+            }) |sql| {
+                const stmt = try tx.prepare(sql);
+                defer stmt.finalize();
+                try stmt.bind(1, user);
+                try stmt.bind(2, self.source);
+                try stmt.bind(3, destination);
+                _ = try stmt.step();
+            }
+            try refs.renameFolderIn(tx, user, self.source, destination);
+        }
+        const checkpoint = try tx.prepare("UPDATE eas_folder_edits SET committed=1 WHERE id=?1 AND committed=0 RETURNING 1");
+        defer checkpoint.finalize();
+        try checkpoint.bind(1, self.id);
+        if (!try checkpoint.step()) return error.FolderEditConflict;
+        _ = try checkpoint.step();
+    }
+
+    pub fn finish(self: Edit, a: Allocator, db: *Database, root: Dir) void {
+        self.settle(a, db, root) catch |err| std.log.warn("could not settle mailbox folder edit: {}", .{err});
+    }
+
     /// A committed delete can be purged. Before commit, restore the original
     /// directory and alias, including after an interrupted case-only rename.
-    pub fn settle(self: Edit, a: Allocator, db: *Database, root: Dir) !void {
+    fn settle(self: Edit, a: Allocator, db: *Database, root: Dir) !void {
         const io = io_compat.getIo();
         const location = try self.locations(a);
         if (self.committed) {
@@ -89,8 +170,8 @@ pub const Edit = struct {
     fn locations(self: Edit, a: Allocator) !Locations {
         try paths.validate(self.root_name);
         try paths.validate(self.id);
-        try paths.validate(self.source);
-        if (self.destination) |name| try paths.validate(name);
+        try folders.validateName(self.source);
+        if (self.destination) |name| try folders.validateName(name);
         return .{
             .root = try std.fmt.allocPrint(a, "mail/{s}", .{self.root_name}),
             .source = try physicalName(a, self.source, self.layout),

@@ -340,13 +340,6 @@ pub fn forgetReviewCopy(db: *database.Database, user: []const u8, source: Locati
     _ = try stmt.step();
 }
 
-pub fn renameFolder(db: *database.Database, user: []const u8, source: []const u8, destination: []const u8) !void {
-    var tx = try db.beginTransaction(.write);
-    defer tx.deinit();
-    try renameFolderIn(tx, user, source, destination);
-    try tx.commit();
-}
-
 pub fn renameFolderIn(tx: database.Database.Transaction, user: []const u8, source: []const u8, destination: []const u8) !void {
     const s = try tx.prepare("UPDATE OR REPLACE mailbox_message_refs SET folder=CASE WHEN folder=?2 THEN ?3 ELSE folder END, next_folder=CASE WHEN next_folder=?2 THEN ?3 ELSE next_folder END WHERE " ++ owner ++ " AND (folder=?2 OR next_folder=?2)");
     defer s.finalize();

@@ -53,14 +53,14 @@ fn stripQuotes(s: []const u8) []const u8 {
 /// clients is "/", but this server stores folders as flat single-level names,
 /// so a legitimate mailbox name never contains a path separator.
 fn isSafeMailboxName(raw: []const u8) bool {
-    const name = stripQuotes(raw);
-    if (name.len == 0 or name.len > 255) return false;
-    if (name[0] == '.') return false;
-    for (name) |c| {
-        if (c == '/' or c == '\\' or c == 0) return false;
-    }
-    if (std.mem.indexOf(u8, name, "..") != null) return false;
+    maildir_folders.validateName(stripQuotes(raw)) catch return false;
     return true;
+}
+
+fn canonicalMailboxName(name: []const u8) []const u8 {
+    if (std.ascii.eqlIgnoreCase(name, "INBOX")) return "INBOX";
+    if (std.ascii.eqlIgnoreCase(name, "All Mail") or std.ascii.eqlIgnoreCase(name, "All")) return "All Mail";
+    return name;
 }
 
 /// IMAP4rev1 Server Implementation (RFC 3501)
@@ -1970,6 +1970,10 @@ pub const ImapSession = struct {
         const db = self.auth_backend.db;
         db.lockMailboxes();
         defer db.unlockMailboxes();
+        try self.reloadGroupedMessagesLocked(user);
+    }
+
+    fn reloadGroupedMessagesLocked(self: *ImapSession, user: []const u8) !void {
         self.freeSelectedMessageLists();
         if (self.mailbox_is_virtual) try self.loadAggregateMailboxFiles(user) else try self.loadInboxFiles(user);
         self.syncUids() catch {};
@@ -1980,6 +1984,10 @@ pub const ImapSession = struct {
         const db = self.auth_backend.db;
         db.lockMailboxes();
         defer db.unlockMailboxes();
+        return self.reloadFolderMessagesLocked(dir, only_if_count_changed);
+    }
+
+    fn reloadFolderMessagesLocked(self: *ImapSession, dir: []const u8, only_if_count_changed: bool) !bool {
         const files = try fs_compat.listEmlFiles(self.allocator, dir);
         const old_count = if (self.mailbox_files) |previous| previous.len else 0;
         if (only_if_count_changed and files.len == old_count) {
@@ -2139,49 +2147,19 @@ pub const ImapSession = struct {
             flags.system.seen = true;
         }
         const internal_date = self.append_internal_date orelse time_compat.timestamp();
-        const filepath = self.writeAppend(username, mailbox, folder_dir, &flags, data[0..size], internal_date) catch |err|
+        const assigned = self.writeAppend(username, mailbox, folder_dir, &flags, data[0..size], internal_date) catch |err|
             return self.sendMaildirWriteError(tag, err);
-        defer self.allocator.free(filepath);
-
-        std.log.info("IMAP APPEND: Saved {d} bytes to {s}", .{ size, filepath });
-
-        // The UID key for this message is its on-disk base filename (matching
-        // how syncUids/getUidForFile key the imap_uids table).
-        const uid_key = std.fs.path.basename(filepath);
-
-        // Use the mailbox's real UIDVALIDITY (matching SELECT/STATUS) so clients
-        // don't invalidate their UID cache for the folder after an append.
-        const append_canon = if (std.ascii.eqlIgnoreCase(mailbox, "All Mail") or std.ascii.eqlIgnoreCase(mailbox, "All"))
-            "All Mail"
-        else if (std.ascii.eqlIgnoreCase(mailbox, "INBOX"))
-            "INBOX"
-        else
-            mailbox;
-
-        // Assign a real UID via the database (matching SELECT/FETCH). Only
-        // report APPENDUID when we actually have an authoritative UID; never
-        // fabricate one from the file count.
-        var append_uidvalidity: i64 = 0;
-        var assigned_uid: ?i64 = null;
-        if (self.db) |db| {
-            if (db.getOrCreateMailbox(local_part, append_canon)) |info| {
-                append_uidvalidity = info.uidvalidity;
-                if (db.assignUid(local_part, append_canon, uid_key)) |new_uid| {
-                    assigned_uid = new_uid;
-                } else |_| {}
-            } else |_| {}
-        }
 
         // Send OK, including APPENDUID only when we have a real UID/UIDVALIDITY.
         if (flags.keyword_count != 0 and !self.mailbox_is_virtual) {
             if (self.mailbox_name) |selected| {
-                if (std.mem.eql(u8, append_canon, selected)) try self.sendFlagCapabilities(false);
+                if (std.mem.eql(u8, canonicalMailboxName(mailbox), selected)) try self.sendFlagCapabilities(false);
             }
         }
-        if (assigned_uid) |uid| {
+        if (assigned) |identity| {
             var resp_buf: [256]u8 = undefined;
             var fbs = io_compat.fixedBufferStream(&resp_buf);
-            fbs.writer().print("[APPENDUID {d} {d}] APPEND completed", .{ append_uidvalidity, uid }) catch {
+            fbs.writer().print("[APPENDUID {d} {d}] APPEND completed", .{ identity.validity, identity.uid }) catch {
                 try self.sendResponse(tag, "OK", "APPEND completed");
                 return;
             };
@@ -2191,7 +2169,9 @@ pub const ImapSession = struct {
         }
     }
 
-    fn writeAppend(self: *ImapSession, user: []const u8, mailbox: []const u8, dir: []const u8, flags: *const FlagList, raw: []const u8, date: i64) ![]u8 {
+    const AppendIdentity = struct { validity: i64, uid: i64 };
+
+    fn writeAppend(self: *ImapSession, user: []const u8, mailbox: []const u8, dir: []const u8, flags: *const FlagList, raw: []const u8, date: i64) !?AppendIdentity {
         const db = self.auth_backend.db;
         db.lockMailboxes();
         defer db.unlockMailboxes();
@@ -2208,7 +2188,7 @@ pub const ImapSession = struct {
         }
         var suffix: [maildir_keywords.suffix_capacity]u8 = undefined;
         const path = try self.allocUniqueMaildirPath(dir, resolved.toSuffix(&suffix), date);
-        errdefer self.allocator.free(path);
+        defer self.allocator.free(path);
         try maildir_index.markLocked(db, user, false, &.{message_refs.location(mailbox, std.fs.path.basename(path))});
         try durable_maildir.writeWithMtime(self.allocator, path, raw, date);
         if (std.mem.eql(u8, mailbox, "Sent") and !resolved.deleted and !resolved.draft) {
@@ -2217,7 +2197,15 @@ pub const ImapSession = struct {
             sent_replies.observeCopy(scratch.allocator(), db, user, path, raw) catch |err|
                 std.log.warn("could not record a client-filed Sent copy: {}", .{err});
         }
-        return path;
+        std.log.info("IMAP APPEND: Saved {d} bytes to {s}", .{ raw.len, path });
+
+        // Keep APPENDUID assignment in the same mutation window as the
+        // Maildir publication so RENAME cannot split the message and its UID.
+        const uid_db = self.db orelse return null;
+        const uid_mailbox = canonicalMailboxName(mailbox);
+        const info = uid_db.getOrCreateMailbox(user, uid_mailbox) catch return null;
+        const uid = uid_db.assignUid(user, uid_mailbox, std.fs.path.basename(path)) catch return null;
+        return .{ .validity = info.uidvalidity, .uid = uid };
     }
 
     /// Count messages in a mailbox folder
@@ -2634,35 +2622,29 @@ pub const ImapSession = struct {
             return;
         }
 
-        const stats = self.countMailboxStats(clean_mailbox);
-
         // Derive UIDVALIDITY/UIDNEXT from the database so STATUS matches what
         // SELECT reports. If STATUS advertises different values than SELECT,
         // clients such as Apple Mail treat the mailbox as invalidated on every
         // poll, repeatedly discard their cache, and fail to show unread counts.
-        const canonical_mailbox = if (std.ascii.eqlIgnoreCase(clean_mailbox, "All Mail") or std.ascii.eqlIgnoreCase(clean_mailbox, "All"))
-            "All Mail"
-        else if (std.ascii.eqlIgnoreCase(clean_mailbox, "INBOX"))
-            "INBOX"
-        else
-            clean_mailbox;
+        const canonical_mailbox = canonicalMailboxName(clean_mailbox);
+        var stats: MailboxStats = undefined;
         var uidvalidity: i64 = 1;
-        var uidnext: i64 = @as(i64, @intCast(stats.messages)) + 1;
-        if (self.db) |db| {
-            if (self.username) |full_username| {
-                const local_part = full_username;
-                if (db.getOrCreateMailbox(local_part, canonical_mailbox)) |info| {
-                    uidvalidity = info.uidvalidity;
-                    // UIDNEXT has to exceed every UID in the mailbox, including
-                    // the ones its messages have not been given yet. Those were
-                    // assigned only on SELECT, so a mailbox never selected
-                    // reported e.g. MESSAGES 12 UIDNEXT 1, and then UIDNEXT 13
-                    // once it had been.
-                    if (want_uidnext) self.assignUidsForStatus(db, local_part, canonical_mailbox);
-                    if (db.getUidNext(local_part, canonical_mailbox)) |next| {
-                        uidnext = next;
+        var uidnext: i64 = 1;
+        {
+            const db = self.auth_backend.db;
+            db.lockMailboxes();
+            defer db.unlockMailboxes();
+            stats = self.countMailboxStats(clean_mailbox);
+            uidnext = @as(i64, @intCast(stats.messages)) + 1;
+            if (self.db) |uid_db| {
+                if (self.username) |user| {
+                    if (uid_db.getOrCreateMailbox(user, canonical_mailbox)) |info| {
+                        uidvalidity = info.uidvalidity;
+                        // Assign UIDs to files a client has not selected yet.
+                        if (want_uidnext) self.assignUidsForStatus(uid_db, user, canonical_mailbox);
+                        uidnext = uid_db.getUidNext(user, canonical_mailbox) catch uidnext;
                     } else |_| {}
-                } else |_| {}
+                }
             }
         }
 
@@ -2899,61 +2881,51 @@ pub const ImapSession = struct {
             try self.sendResponse(tag, "NO", "[NONEXISTENT] Mailbox does not exist");
             return;
         }
-        const is_all_mail = std.ascii.eqlIgnoreCase(mailbox, "All Mail") or std.ascii.eqlIgnoreCase(mailbox, "All");
+        const canonical = canonicalMailboxName(mailbox);
+        self.mailbox_name = try self.allocator.dupe(u8, canonical);
+        self.mailbox_is_virtual = std.mem.eql(u8, canonical, "All Mail");
+        const is_inbox = std.mem.eql(u8, canonical, "INBOX");
+        const dir = if (self.mailbox_is_virtual)
+            try std.fmt.allocPrint(self.allocator, "mail/{s}", .{username})
+        else
+            try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ username, if (is_inbox) "new" else mailbox });
+        self.mailbox_dir = dir;
 
-        // Store mailbox name for UID persistence
-        const canonical_mailbox = if (is_all_mail) "All Mail" else if (std.ascii.eqlIgnoreCase(mailbox, "INBOX")) "INBOX" else mailbox;
-        self.mailbox_name = try self.allocator.dupe(u8, canonical_mailbox);
-
-        if (is_all_mail) {
-            self.mailbox_is_virtual = true;
-            self.mailbox_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}", .{username});
-            try self.reloadGroupedMessages(username);
-
-            const msg_count = if (self.mailbox_files) |f| f.len else 0;
-            // RECENT reported as 0 (see note in the INBOX branch below).
-            try self.sendSelectResponse(tag, username, msg_count, 0);
-            return;
+        var count: usize = 0;
+        var validity: i64 = 1;
+        var uidnext: i64 = 1;
+        {
+            const db = self.auth_backend.db;
+            db.lockMailboxes();
+            defer db.unlockMailboxes();
+            if (self.mailbox_is_virtual or is_inbox) {
+                // INBOX aggregates new and cur. All Mail scans the account.
+                try self.reloadGroupedMessagesLocked(username);
+            } else {
+                fs_compat.ensureDir(dir) catch {};
+                _ = self.reloadFolderMessagesLocked(dir, false) catch false;
+            }
+            count = if (self.mailbox_files) |files| files.len else 0;
+            uidnext = @as(i64, @intCast(count)) + 1;
+            if (self.db) |uid_db| {
+                if (uid_db.getOrCreateMailbox(username, canonical)) |info| {
+                    validity = info.uidvalidity;
+                    uidnext = info.uidnext;
+                } else |_| {}
+                self.mailbox_uidvalidity = validity;
+            }
         }
-
-        const is_inbox = std.ascii.eqlIgnoreCase(mailbox, "INBOX");
-
-        if (is_inbox) {
-            // INBOX aggregates the maildir new/ and cur/ directories so messages
-            // are not lost if they are ever moved into cur/. mailbox_dir points
-            // at new/ (where fresh mail is delivered) for rescan purposes.
-            self.mailbox_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/new", .{username});
-            try self.reloadGroupedMessages(username);
-            const msg_count = if (self.mailbox_files) |f| f.len else 0;
-            // RECENT is reported as 0: this server does not track the \Recent
-            // flag, and reporting the unseen count as RECENT made clients
-            // re-trigger "new mail" on every SELECT. Unread state is conveyed
-            // via UNSEEN and per-message \Seen flags instead.
-            try self.sendSelectResponse(tag, username, msg_count, 0);
-            return;
-        }
-
-        // Non-INBOX folders store messages directly in the folder directory.
-        const user_dir = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ username, mailbox });
-
-        // Ensure directory exists for standard mailboxes (Sent, Drafts, Trash, Junk, Archive)
-        fs_compat.ensureDir(user_dir) catch {};
-
-        self.mailbox_dir = user_dir;
-        _ = self.reloadFolderMessages(user_dir, false) catch false;
-        const msg_count = if (self.mailbox_files) |f| f.len else 0;
-        try self.sendSelectResponse(tag, username, msg_count, 0);
+        try self.sendSelectResponse(tag, count, validity, uidnext);
     }
 
-    /// Send the SELECT/EXAMINE response with proper UIDVALIDITY and UIDNEXT.
-    fn sendSelectResponse(self: *ImapSession, tag: []const u8, username: []const u8, msg_count: usize, recent_count: usize) !void {
+    /// Send the mailbox snapshot captured before releasing the mutation lock.
+    fn sendSelectResponse(self: *ImapSession, tag: []const u8, msg_count: usize, uidvalidity: i64, uidnext: i64) !void {
         const exists_msg = try std.fmt.allocPrint(self.allocator, "{d} EXISTS", .{msg_count});
         defer self.allocator.free(exists_msg);
         try self.sendUntagged(exists_msg);
 
-        const recent_msg = try std.fmt.allocPrint(self.allocator, "{d} RECENT", .{recent_count});
-        defer self.allocator.free(recent_msg);
-        try self.sendUntagged(recent_msg);
+        // This server uses \Seen and UNSEEN for unread state.
+        try self.sendUntagged("0 RECENT");
 
         var first_unseen: usize = 0;
         if (self.mailbox_files) |mfiles| {
@@ -2969,20 +2941,6 @@ pub const ImapSession = struct {
             const unseen_msg = try std.fmt.allocPrint(self.allocator, "OK [UNSEEN {d}]", .{first_unseen});
             defer self.allocator.free(unseen_msg);
             try self.sendUntagged(unseen_msg);
-        }
-
-        // Get UIDVALIDITY and UIDNEXT from database
-        const mbox_name = self.mailbox_name orelse "INBOX";
-        var uidvalidity: i64 = 1;
-        var uidnext: i64 = @as(i64, @intCast(msg_count)) + 1;
-        if (self.db) |db| {
-            if (db.getOrCreateMailbox(username, mbox_name)) |info| {
-                uidvalidity = info.uidvalidity;
-                if (db.getUidNext(username, mbox_name)) |next| {
-                    uidnext = next;
-                } else |_| {}
-            } else |_| {}
-            self.mailbox_uidvalidity = uidvalidity;
         }
 
         const uidvalidity_msg = try std.fmt.allocPrint(self.allocator, "OK [UIDVALIDITY {d}]", .{uidvalidity});
@@ -3790,30 +3748,24 @@ pub const ImapSession = struct {
             try self.sendResponse(tag, "NO", "Not authenticated");
             return;
         };
-        const local_part = full_username;
-
         const old = stripQuotes(old_name);
         const new = stripQuotes(new_name);
 
-        if (std.ascii.eqlIgnoreCase(old, "INBOX")) {
-            try self.sendResponse(tag, "NO", "Cannot rename INBOX");
-            return;
+        for ([_][]const u8{ "INBOX", "new", "cur", "tmp" }) |reserved| {
+            if (std.ascii.eqlIgnoreCase(old, reserved) or std.ascii.eqlIgnoreCase(new, reserved))
+                return self.sendResponse(tag, "NO", "Cannot rename INBOX or its Maildir slots");
         }
 
-        const old_path = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local_part, old });
-        defer self.allocator.free(old_path);
-        const new_path = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local_part, new });
-        defer self.allocator.free(new_path);
-
-        if (self.renameMailboxOnDisk(local_part, old, new, old_path, new_path)) {
-            std.log.info("IMAP RENAME: {s} -> {s}", .{ old, new });
-            try self.sendResponse(tag, "OK", "RENAME completed");
-        } else |err| {
-            try self.sendMaildirWriteError(tag, err);
-        }
+        self.renameMailboxOnDisk(full_username, old, new) catch |err| return switch (err) {
+            error.FileNotFound => self.sendResponse(tag, "NO", "[NONEXISTENT] Mailbox does not exist"),
+            error.PathAlreadyExists => self.sendResponse(tag, "NO", "[ALREADYEXISTS] Destination mailbox exists"),
+            else => self.sendMaildirWriteError(tag, err),
+        };
+        std.log.info("IMAP RENAME: {s} -> {s}", .{ old, new });
+        try self.sendResponse(tag, "OK", "RENAME completed");
     }
 
-    fn renameMailboxOnDisk(self: *ImapSession, user: []const u8, old: []const u8, new: []const u8, old_path: []const u8, new_path: []const u8) !void {
+    fn renameMailboxOnDisk(self: *ImapSession, user: []const u8, old: []const u8, new: []const u8) !void {
         const db = self.auth_backend.db;
         db.lockMailboxes();
         defer db.unlockMailboxes();
@@ -3825,30 +3777,16 @@ pub const ImapSession = struct {
         const base = try std.fmt.allocPrint(a, "mail/{s}", .{user});
         const root = (try maildir_folders.open(io, .cwd(), base)) orelse return error.FileNotFound;
         defer root.close(io);
-        try folder_edits.requireUnused(a, io, root, new, if (std.ascii.eqlIgnoreCase(old, new)) old else null);
-        if (!pathIsSymlink(old_path)) {
-            if (!renameFile(old_path, new_path)) return error.RenameFailed;
-            errdefer _ = renameFile(new_path, old_path);
-            try message_refs.renameFolder(db, user, old, new);
-            return;
-        }
-
-        const old_canonical = try std.fmt.allocPrint(self.allocator, "mail/{s}/.{s}", .{ user, old });
-        defer self.allocator.free(old_canonical);
-        const new_canonical = try std.fmt.allocPrint(self.allocator, "mail/{s}/.{s}", .{ user, new });
-        defer self.allocator.free(new_canonical);
-        const new_target = try std.fmt.allocPrint(self.allocator, ".{s}/cur", .{new});
-        defer self.allocator.free(new_target);
-        const old_target = try std.fmt.allocPrint(self.allocator, ".{s}/cur", .{old});
-        defer self.allocator.free(old_target);
-
-        if (!renameFile(old_canonical, new_canonical)) return error.RenameFailed;
-        errdefer _ = renameFile(new_canonical, old_canonical);
-        try fs_compat.cwd().deleteFile(old_path);
-        errdefer _ = createRelativeSymlink(old_target, old_path);
-        if (!createRelativeSymlink(new_target, new_path)) return error.RenameFailed;
-        errdefer fs_compat.cwd().deleteFile(new_path) catch {};
-        try message_refs.renameFolder(db, user, old, new);
+        const source = try maildir_folders.storedName(a, io, root, old);
+        var edit = try folder_edits.Edit.init(a, root, user, source, new);
+        if (std.mem.eql(u8, source, new)) return;
+        try edit.stage(a, db, root, user);
+        defer edit.finish(a, db, root);
+        var tx = try db.beginTransaction(.write);
+        defer tx.deinit();
+        try edit.applyMetadata(tx, user);
+        try tx.commit();
+        edit.committed = true;
     }
 
     /// Handle STORE command — set/add/remove message flags.

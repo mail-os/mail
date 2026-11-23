@@ -166,13 +166,26 @@ def exercise_maildir_plus_folder(test, index, owner):
     verify_search(test, index, owner, "Research", 1, indexed=True)
 
 
+def exercise_imap_folder_rename(test, index, owner):
+    index.failed_writes = {"DELETE", "POST"}
+    with test.imap(owner) as client:
+        assert client.rename("Research", "Studies")[0] == "OK"
+    assert {name for name, _ in pending(test)} == {"Research", "Studies"}
+    verify_search(test, index, owner, "Studies", 1, indexed=False)
+    verify_search(test, index, owner, '"All Mail"', 1, indexed=False)
+    index.failed_writes = set()
+    wait_for(lambda: not pending(test) and subject_folders(index, owner) == {"Studies"},
+             "IMAP RENAME should update the indexed location and remove the old document")
+    verify_search(test, index, owner, "Studies", 1, indexed=True)
+
+
 def exercise_native_folder_edits(test, index, owner):
     hierarchy, edit = folder_suite["hierarchy"], folder_suite["edit"]
     key, folders = hierarchy(test, owner)
-    folder = folder_suite["added_folder"](folders, "Research")
+    folder = folder_suite["added_folder"](folders, "Studies")
     index.failed_writes = {"DELETE", "POST"}
     key = edit(test, owner, key, folder, "Planning")
-    assert {name for name, _ in pending(test)} == {"Research", "Planning"}
+    assert {name for name, _ in pending(test)} == {"Studies", "Planning"}
     verify_search(test, index, owner, "Planning", 1, indexed=False)
     verify_search(test, index, owner, '"All Mail"', 1, indexed=False)
     index.failed_writes = set()
@@ -209,11 +222,12 @@ def main():
                 exercise_inflight_retry(test, index, owner)
                 exercise_inflight_search(test, index, owner, peer)
                 exercise_maildir_plus_folder(test, index, owner)
+                exercise_imap_folder_rename(test, index, owner)
                 exercise_native_folder_edits(test, index, owner)
         finally:
             index.shutdown()
             thread.join()
-    print("Verified native ActiveSync and webmail moves, destination and aggregate search, negation, and index recovery across restart and concurrent requests.")
+    print("Verified native moves and folder edits, folder and aggregate search, and index recovery across restart and concurrent requests.")
 
 
 if __name__ == "__main__":
