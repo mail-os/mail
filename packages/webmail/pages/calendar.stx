@@ -47,6 +47,7 @@ const freeTimeDateField = useRef('freeTimeDateField')
 const taskHeading = useRef('taskHeading')
 const taskTitleField = useRef('taskTitleField')
 const taskDeleteButton = useRef('taskDeleteButton')
+const taskSaveButton = useRef('taskSaveButton')
 function changeTaskPanel() {
   if (taskPanelOpen()) closeTasks()
   else {
@@ -69,6 +70,10 @@ function closeTaskEdit() {
 function askToDeleteTask() {
   confirmTaskRemoval.set(true)
   nextTick(() => taskDeleteButton.current?.focus())
+}
+function clearTaskDate() {
+  taskDay.set('')
+  nextTick(() => taskSaveButton.current?.focus())
 }
 async function submitTask(remove = false) {
   if (await saveTask(remove)) nextTick(() => taskHeading.current?.focus())
@@ -141,9 +146,15 @@ onUnmounted(() => { destroy(); destroyReminders() })
     <button :if="taskConflict || (taskError && !tasksReady)" type="button" class="wm-action" :disabled="taskBusy" @click="reloadTasks()">Load latest tasks</button>
     <form :if="taskEditor" class="calendar-task-form" aria-label="Task details" @submit.prevent="submitTask()">
       <label>Task title<input ref="taskTitleField" type="text" x-model="taskTitle" :disabled="taskBusy" autocomplete="off" maxlength="240" required></label>
-      <label>Date (optional)<input type="date" x-model="taskDay" :disabled="taskBusy" min="0001-01-01" max="9999-12-31"></label>
+      <div class="calendar-task-date">
+        <label for="calendar-task-day">Date (optional)</label>
+        <div class="calendar-task-actions">
+          <input id="calendar-task-day" type="date" :value="taskDay" @input="taskDay.set($event.target.value)" @change="taskDay.set($event.target.value)" :disabled="taskBusy" min="0001-01-01" max="9999-12-31">
+          <button :if="taskDay" type="button" class="wm-action calendar-task-clear" :disabled="taskBusy" aria-label="Clear date" title="Clear date" @click="clearTaskDate()"><span class="mail-icon" data-icon="close" aria-hidden="true"></span></button>
+        </div>
+      </div>
       <div class="calendar-task-actions">
-        <button type="submit" class="wm-action calendar-primary" :disabled="taskBusy || taskConflict" :text="taskEditor.task ? 'Save task' : 'Add task'"></button>
+        <button ref="taskSaveButton" type="submit" class="wm-action calendar-primary" :disabled="taskBusy || taskConflict" :text="taskEditor.task ? 'Save task' : 'Add task'"></button>
         <button type="button" class="wm-action" :disabled="taskBusy" @click="closeTaskEdit()">Cancel</button>
         <button :if="taskEditor.task && !confirmTaskRemoval" type="button" class="wm-action wm-action--danger" :disabled="taskBusy || taskConflict" @click="askToDeleteTask()">Delete task</button>
         <button :if="confirmTaskRemoval" type="button" class="wm-action wm-action--danger" ref="taskDeleteButton" :disabled="taskBusy || taskConflict" @click="submitTask(true)">Confirm deletion</button>
