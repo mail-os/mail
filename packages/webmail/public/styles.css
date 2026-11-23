@@ -176,6 +176,8 @@ input::-webkit-date-and-time-value { margin: 0; min-height: 0; text-align: start
 input::-webkit-datetime-edit { display: flex; align-items: center; block-size: calc(var(--control-height) - 2px); padding: 0; }
 @media (forced-colors: none) {
   input::-webkit-calendar-picker-indicator { opacity: .72; }
+  /* WebKit dims the native date and time segments independently. */
+  input:disabled::-webkit-datetime-edit { -webkit-text-fill-color: var(--date-edit-disabled-text, var(--control-disabled-text)); }
 }
 :where(input[type=file]:not(.wm-file-input)) { padding: 3px; }
 input::file-selector-button {
@@ -675,7 +677,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-task-date-placeholder { display: none; }
 @media (forced-colors: none) {
   /* Some native date inputs show today's date as their empty placeholder. */
-  .calendar-task-date-field[data-empty=true] input:not(:focus) { color: transparent; -webkit-text-fill-color: transparent; }
+  .calendar-task-date-field[data-empty=true] input:not(:focus) { --date-edit-disabled-text: transparent; color: transparent; -webkit-text-fill-color: transparent; }
   .calendar-task-date-field:not(:focus-within) .calendar-task-date-placeholder { position: absolute; inset-block: 0; inset-inline-start: calc(1px + var(--control-inline-padding)); display: flex; align-items: center; color: var(--muted); font-size: var(--control-font-size); pointer-events: none; }
 }
 .calendar-task-clear { flex: 0 0 var(--control-height); justify-content: center; padding-inline: 0; }

@@ -114,6 +114,7 @@ async function verifyControlRow(container, selector, height, sameRow = true) {
     const quiet = node.matches('.wm-list-toggle, .wm-action--quiet, .wm-composer-foot > .wm-action:not(.wm-snapshot-primary)')
     return {
       name: node.getAttribute('aria-label') || node.querySelector('input[aria-label]')?.getAttribute('aria-label') || node.id
+        || node.labels?.[0]?.firstChild?.textContent?.trim()
         || (node.tagName === 'BUTTON' ? node.textContent.trim() : node.tagName),
       height: box.height,
       top: box.top,
@@ -272,7 +273,7 @@ async function verifyCalendarPeriod(page, label, height) {
     [...views, ...controls], `${label}-calendar-toolbar`)
 }
 
-async function verifyPaintedControlBorders(container, selector, controls, name) {
+async function verifyPaintedControlBorders(container, selector, controls, name, checkDisabledText = false) {
   const centers = await container.evaluate((group, selector) => {
     const box = group.getBoundingClientRect()
     const pixels = devicePixelRatio
@@ -282,6 +283,7 @@ async function verifyPaintedControlBorders(container, selector, controls, name) 
       const x = Math.floor((left + width / 2 - box.left) * pixels)
       const y = Math.floor((top + height / 2 - box.top) * pixels)
       return [{
+        textArea: { x: Math.ceil((left - box.left + 8) * pixels), y: y - 8 * pixels, width: Math.floor((width - 44) * pixels), height: 16 * pixels },
         edges: [
           { side: 'left', x: Math.floor((left - box.left) * pixels), y, dx: 1, dy: 0 },
           { side: 'right', x: Math.ceil((right - box.left) * pixels) - 1, y, dx: 1, dy: 0 },
@@ -294,7 +296,7 @@ async function verifyPaintedControlBorders(container, selector, controls, name) 
   assert.equal(centers.length, controls.length, 'Every visible control has a position in the screenshot')
   const neutralEdges = centers.flatMap((center, index) => controls[index].neutral ? [{ ...center, name: controls[index].name }] : [])
   const capture = await container.screenshot({ path: join(output, `${name}.png`), animations: 'disabled', scale: 'device' })
-  const mismatches = await container.evaluate(async (node, { png, centers }) => {
+  const mismatches = await container.evaluate(async (node, { png, centers, checkDisabledText }) => {
     const pixels = Uint8Array.from(atob(png), char => char.charCodeAt(0))
     const bitmap = await createImageBitmap(new Blob([pixels], { type: 'image/png' }))
     const canvas = document.createElement('canvas')
@@ -302,10 +304,11 @@ async function verifyPaintedControlBorders(container, selector, controls, name) 
     canvas.height = bitmap.height
     const context = canvas.getContext('2d')
     context.drawImage(bitmap, 0, 0)
-    const hex = getComputedStyle(node).getPropertyValue('--control-border').trim()
-    const border = hex.slice(1).match(/../g).map(channel => Number.parseInt(channel, 16))
+    const style = getComputedStyle(node)
+    const channels = property => style.getPropertyValue(property).trim().slice(1).match(/../g).map(channel => Number.parseInt(channel, 16))
+    const border = channels('--control-border')
     const tolerance = Math.ceil(2 * devicePixelRatio)
-    return centers.flatMap(({ name, edges }) => edges.flatMap(({ side, x, y, dx, dy }) => {
+    const borders = centers.flatMap(({ name, edges }) => edges.flatMap(({ side, x, y, dx, dy }) => {
       // Fractional viewport and screenshot origins can snap to different pixels.
       const startX = Math.max(0, x - tolerance * dx)
       const startY = Math.max(0, y - tolerance * dy)
@@ -317,8 +320,19 @@ async function verifyPaintedControlBorders(container, selector, controls, name) 
       }
       return [{ name, side, x, y, samples: Array.from(strip) }]
     }))
-  }, { png: capture.toString('base64'), centers: neutralEdges })
-  assert.deepEqual(mismatches, [], 'Visible straight edges should paint the shared border color')
+    const disabledText = channels('--control-disabled-text')
+    const text = checkDisabledText ? centers.flatMap(({ name, textArea }) => {
+      const { x, y, width, height } = textArea
+      const ink = context.getImageData(x, y, width, height).data
+      for (let pixel = 0; pixel < ink.length; pixel += 4) {
+        if (disabledText.every((channel, offset) => Math.abs(ink[pixel + offset] - channel) <= 12)) return []
+      }
+      return [name]
+    }) : []
+    return { borders, text }
+  }, { png: capture.toString('base64'), centers: neutralEdges, checkDisabledText })
+  assert.deepEqual(mismatches.borders, [], 'Visible straight edges should paint the shared border color')
+  assert.deepEqual(mismatches.text, [], 'Disabled controls should paint their text in the shared disabled color')
 }
 
 async function verifyDateTextAlignment(page, capture, date) {
@@ -1854,7 +1868,7 @@ async function freeTimeJourney(page, phone = false) {
     assert(pending.every((control, index) => control.opacity === '1'
       && Math.abs((control.right - control.left) - (controls[index].right - controls[index].left)) < 0.5),
       'The availability form keeps control widths and full-opacity borders while checking')
-    await verifyPaintedControlBorders(form, 'input, select, button', pending, phone ? 'phone-availability-pending' : 'desktop-availability-pending')
+    await verifyPaintedControlBorders(form, 'input, select, button', pending, phone ? 'phone-availability-pending' : 'desktop-availability-pending', true)
   }
   finally { resumeAvailability.resolve() }
   await panel.getByRole('status').filter({ hasText: '3 open windows' }).waitFor()
