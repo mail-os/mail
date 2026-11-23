@@ -135,6 +135,7 @@ export interface ComposePayload {
   delaySeconds?: number
   scheduleAt?: number | null
   senderId?: string | null
+  externalReview?: string
   sharedReply?: SharedReplyContext | null
 }
 export interface DraftAck { ok: boolean, uid: number, draftId: string, revision: number }

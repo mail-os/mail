@@ -154,6 +154,7 @@ def verify_legacy_replay(test, db, writer, target):
     legacy = pending["message"]
     del legacy["senderId"]
     del legacy["sharedReply"]
+    legacy.pop("externalReview", None)
     checksum = hashlib.sha256(json.dumps(legacy, separators=(",", ":")).encode()).hexdigest()
     deliver_now(db, payload)
     test.outbox(user, payload["sendId"], "sent")

@@ -559,6 +559,8 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.eql(u8, p, "/webmail/api/health") and std.mem.eql(u8, req.method, "GET")) return handleHealth(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/config") and std.mem.eql(u8, req.method, "GET")) return handleClientConfig(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/sender-identities") and std.mem.eql(u8, req.method, "GET")) return handleSenderIdentities(server, conn, arena, req);
+    if (std.mem.eql(u8, p, "/webmail/api/external-sender-review") and std.mem.eql(u8, req.method, "POST")) return handleExternalSenderReview(server, conn, arena, req);
+    if (std.mem.eql(u8, p, "/webmail/api/external-sender-verification")) return handleExternalSenderVerification(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/preferences") and std.mem.eql(u8, req.method, "PUT")) return handlePreferences(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/compose-library") and
         (std.mem.eql(u8, req.method, "GET") or std.mem.eql(u8, req.method, "PUT"))) return handleComposeLibrary(server, conn, arena, req);
@@ -1519,6 +1521,11 @@ fn mapServiceError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: any
         error.HostedSendingLimit => sendError(conn, arena, 429, "sending_limit", "Daily recipient allowance exhausted. Try again after midnight UTC."),
         error.HostedSenderDisabled => sendError(conn, arena, 403, "mailbox_disabled", "This mailbox is disabled."),
         error.SenderIdentityUnavailable => sendError(conn, arena, 403, "sender_identity_unavailable", "This From address is no longer available. Choose another address before sending."),
+        error.ExternalSenderUnavailable => sendError(conn, arena, 403, "external_sender_unavailable", "This external From address is unavailable."),
+        error.ExternalReviewRequired => sendError(conn, arena, 409, "external_review_required", "Review the external From address and every recipient before sending."),
+        error.ExternalSenderAlreadyVerified => sendError(conn, arena, 409, "external_sender_verified", "This external From address is already verified."),
+        error.ExternalSenderRateLimited => sendError(conn, arena, 429, "rate_limited", "Wait one minute before requesting another code."),
+        error.InvalidExternalSenderCode => sendError(conn, arena, 400, "invalid_external_sender_code", "This code is incorrect, expired, or already used."),
         error.SharedReplyUnavailable => sendError(conn, arena, 409, "shared_reply_unavailable", "This shared reply is unavailable. Check the original message, assignment, and send access."),
         error.SharedReplyConflict => sendError(conn, arena, 409, "shared_reply_conflict", "A reply is already queued, sent, or awaiting delivery review for this message."),
         error.SharedReplyQueueRequired => sendError(conn, arena, 400, "shared_reply_queue_required", "A shared reply requires an Outbox send ID."),
@@ -1661,7 +1668,74 @@ fn handleSenderIdentities(server: *WebmailHttpServer, conn: *webmail_tls.Stream,
     for (identities) |identity| {
         if (compose.isSafeAddress(identity.address)) try available.append(a, identity);
     }
+    @import("webmail_external_senders.zig").choices(a, server.db, server.service.externalSendersFile(), session.username, &available) catch |err| {
+        if (err != error.ExternalSenderUnavailable) return mapServiceError(conn, a, err);
+    };
     return sendJson(conn, a, 200, try service_mod.json(a, available.items), null);
+}
+
+fn handleExternalSenderReview(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    if (!isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    var session = (try requireSession(server, conn, a, req)) orelse return;
+    defer session.deinit(server.allocator);
+    if (req.body.len > 64 * 1024) return mapServiceError(conn, a, service_mod.ServiceError.InvalidPayload);
+    const request = std.json.parseFromSliceLeaky(service_mod.ExternalReviewRequest, a, req.body, .{}) catch
+        return mapServiceError(conn, a, service_mod.ServiceError.InvalidPayload);
+    const review = server.service.reviewExternalSend(a, session.username, request) catch |err| return mapServiceError(conn, a, err);
+    return sendJson(conn, a, 200, try service_mod.json(a, review), null);
+}
+
+fn handleExternalSenderVerification(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    const external = @import("webmail_external_senders.zig");
+    const get = std.mem.eql(u8, req.method, "GET");
+    if (!get and !std.mem.eql(u8, req.method, "POST")) return sendError(conn, a, 405, "method_not_allowed", "Use GET or POST.");
+    if (!get and !isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    var session = (try requireSession(server, conn, a, req)) orelse return;
+    defer session.deinit(server.allocator);
+    const path = server.service.externalSendersFile();
+    const now = time_compat.timestamp();
+    if (!get) {
+        const Change = struct { id: []const u8, action: enum { request, confirm, revoke }, code: []const u8 = "" };
+        if (req.body.len > 1024) return mapServiceError(conn, a, service_mod.ServiceError.InvalidPayload);
+        const change = std.json.parseFromSliceLeaky(Change, a, req.body, .{}) catch
+            return mapServiceError(conn, a, service_mod.ServiceError.InvalidPayload);
+        const grant = external.find(a, path, session.username, change.id) catch |err| return mapServiceError(conn, a, err);
+        switch (change.action) {
+            .request => sendExternalSenderCode(server, grant, now) catch |err| return mapServiceError(conn, a, err),
+            .confirm => external.confirmProof(a, server.db, grant, change.code, now) catch |err| return mapServiceError(conn, a, err),
+            .revoke => external.revokeProof(a, server.db, grant, now) catch |err| return mapServiceError(conn, a, err),
+        }
+    }
+    const states = external.statuses(a, server.db, path, session.username, now) catch |err| return mapServiceError(conn, a, err);
+    return sendJson(conn, a, 200, try service_mod.json(a, states), null);
+}
+
+fn sendExternalSenderCode(server: *WebmailHttpServer, grant: @import("webmail_external_senders.zig").Grant, now: i64) !void {
+    var job = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    errdefer job.deinit();
+    const a = job.allocator();
+    const owner = try a.dupe(u8, grant.mailbox);
+    const destination = resolveForwardDestination(server, a, owner, grant.address) catch return error.ExternalSenderUnavailable;
+    const to = try a.dupe([]const u8, &.{try a.dupe(u8, destination.address)});
+    const from = try recovery.senderFor(a, owner, server.config.hostname);
+    const code = try @import("webmail_external_senders.zig").requestProof(a, server.db, grant, now);
+    const message: compose.Message = .{
+        .from = from,
+        .to = to,
+        .subject = "Verify an external From address",
+        .text_body = try std.fmt.allocPrint(a,
+            \\Mail account {s} requested to send from this address.
+            \\
+            \\Enter this code in that account's External From addresses settings within 30 minutes:
+            \\
+            \\{s}
+            \\
+            \\If you did not request this, ignore this message.
+        , .{ owner, code }),
+        .auto_submitted = true,
+        .notice_recipient_id = destination.mailbox_id,
+    };
+    dispatchSystemMail(server, job, message, "external From verification code", owner);
 }
 
 fn handleTeams(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {

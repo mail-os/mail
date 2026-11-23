@@ -125,7 +125,7 @@ fn isSafeAddress(addr: []const u8) bool {
 /// Validate an MX hostname before using it in a shell command. Only allow
 /// characters valid in DNS hostnames ([A-Za-z0-9.-]) to prevent shell
 /// injection via the `dig` invocation.
-fn isSafeHostname(host: []const u8) bool {
+pub fn isSafeHostname(host: []const u8) bool {
     if (host.len == 0 or host.len > 253) return false;
     for (host) |c| {
         const ok = (c >= 'A' and c <= 'Z') or
@@ -141,7 +141,7 @@ fn isSafeHostname(host: []const u8) bool {
 /// endings to CRLF and re-apply dot-stuffing (RFC 5321 section 4.5.2) by
 /// prepending '.' to any line that begins with '.'. The returned buffer is
 /// owned by the caller and must be freed with `allocator.free`.
-fn normalizeForSmtp(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
+pub fn normalizeForSmtp(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 

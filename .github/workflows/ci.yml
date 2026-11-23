@@ -42,6 +42,12 @@ jobs:
       timeout-minutes: 5
       run: python3 scripts/test-webmail-browser.py packages/zig/zig-out/bin/mail webmail-browser-screenshots
 
+    - name: Verify external From in the browser
+      if: runner.os == 'Linux'
+      working-directory: .
+      timeout-minutes: 2
+      run: python3 scripts/test-webmail-external-senders.py packages/zig/zig-out/bin/mail --browser chromium --screenshots webmail-browser-screenshots
+
     - name: Upload browser screenshots
       if: ${{ !cancelled() && runner.os == 'Linux' }}
       uses: actions/upload-artifact@v4
@@ -137,6 +143,7 @@ jobs:
         python3 ../../scripts/test-webmail-scheduled-send.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-writing-tools.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-sender-identities.py zig-out/bin/mail
+        python3 ../../scripts/test-webmail-external-senders.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-outbox-pages.py zig-out/bin/mail
         python3 ../../scripts/test-eas-search.py zig-out/bin/mail
         python3 ../../scripts/test-eas-sync-state.py zig-out/bin/mail

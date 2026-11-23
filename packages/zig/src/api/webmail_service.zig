@@ -2,6 +2,8 @@
 //! Draft metadata preserves unfinished recipient entry separately from safe MIME
 //! headers. Undo receipts are server-owned, expiring, and bound to one account.
 const std = @import("std");
+const external_senders = @import("webmail_external_senders.zig");
+const io_compat = @import("../core/io_compat.zig");
 const attachment_metadata = @import("../message/attachment_metadata.zig");
 const clamav = @import("../antispam/clamav.zig");
 const database = @import("../storage/database.zig");
@@ -59,14 +61,37 @@ pub const Payload = struct {
         uploadId: ?[]const u8 = null,
     } = &.{},
     senderId: ?[]const u8 = null,
+    externalReview: ?[]const u8 = null,
     sharedReply: ?shared_inbox.ReplyContext = null,
 
     pub fn delegatedSender(self: Payload) !?i64 {
         const id = self.senderId orelse return null;
+        if (try self.externalSender() != null) return null;
         if (id.len == 0 or id.len > 19 or id[0] == '0') return ServiceError.InvalidPayload;
         for (id) |byte| if (!std.ascii.isDigit(byte)) return ServiceError.InvalidPayload;
         return std.fmt.parseInt(i64, id, 10) catch return ServiceError.InvalidPayload;
     }
+
+    pub fn externalSender(self: Payload) !?[]const u8 {
+        const id = self.senderId orelse return null;
+        if (!std.mem.startsWith(u8, id, external_senders.prefix)) return null;
+        if (!external_senders.validId(id)) return ServiceError.InvalidPayload;
+        return id;
+    }
+};
+pub const ExternalReviewRequest = struct {
+    senderId: []const u8,
+    to: []const []const u8 = &.{},
+    cc: []const []const u8 = &.{},
+    bcc: []const []const u8 = &.{},
+};
+pub const ExternalReview = struct {
+    account: []const u8,
+    from: []const u8,
+    to: []const []const u8,
+    cc: []const []const u8,
+    bcc: []const []const u8,
+    token: []const u8,
 };
 pub const Draft = struct { uid: i64, folder: []const u8 = "Drafts", message: Payload };
 pub const DraftAttachmentEdit = union(enum) {
@@ -96,6 +121,7 @@ pub const Outbox = struct {
     error_message: ?[]const u8 = null,
     request_hash: ?[]const u8 = null,
     expected_from: ?[]const u8 = null,
+    external_binding: ?[]const u8 = null,
     reply_cutoff_ms: i64 = 0,
     dispatch: ?compose.OutboxDispatch = null,
     calendarReply: ?struct {
@@ -151,10 +177,12 @@ pub const Service = struct {
     auth: *auth_mod.AuthBackend,
     config: Config,
     mutations: mutex.Mutex = .{},
+    external_review_key: [32]u8 = undefined,
 
     pub fn init(db: *database.Database, auth: *auth_mod.AuthBackend, config: Config) !Service {
         try store.initSchema(db);
         var service: Service = .{ .db = db, .auth = auth, .config = config };
+        io_compat.randomBytes(&service.external_review_key);
         try service.recoverDraftEdits();
         return service;
     }
@@ -268,6 +296,37 @@ pub const Service = struct {
         const address = (try self.db.delegatedSenderAddress(a, user, id)) orelse return error.SenderIdentityUnavailable;
         if (!compose.isSafeAddress(address)) return error.SenderIdentityUnavailable;
         return address;
+    }
+
+    pub fn externalSendersFile(self: *const Service) ?[]const u8 {
+        return if (self.config.mail_config) |cfg| cfg.webmail_external_senders_file else null;
+    }
+
+    pub fn reviewExternalSend(self: *Service, a: std.mem.Allocator, user: []const u8, request: ExternalReviewRequest) !ExternalReview {
+        const grant = try external_senders.find(a, self.externalSendersFile(), user, request.senderId);
+        const binding = (try external_senders.verifiedBinding(a, self.db, grant)) orelse return error.ExternalSenderUnavailable;
+        return self.reviewExternalEnvelope(a, grant, request, binding);
+    }
+
+    fn reviewExternalEnvelope(self: *Service, a: std.mem.Allocator, grant: external_senders.Grant, request: ExternalReviewRequest, binding: []const u8) !ExternalReview {
+        const count = request.to.len + request.cc.len + request.bcc.len;
+        if (count == 0) return compose.ComposeError.NoRecipients;
+        if (count > 100) return ServiceError.InvalidPayload;
+        for ([_][]const []const u8{ request.to, request.cc, request.bcc }) |addresses| {
+            for (addresses) |address| if (!compose.isSafeAddress(address)) return compose.ComposeError.InvalidAddress;
+        }
+        const input = try json(a, .{ .grant = binding, .request = request });
+        var mac: [32]u8 = undefined;
+        std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, input, &self.external_review_key);
+        const token = std.fmt.bytesToHex(mac, .lower);
+        return .{
+            .account = grant.mailbox,
+            .from = grant.address,
+            .to = request.to,
+            .cc = request.cc,
+            .bcc = request.bcc,
+            .token = try a.dupe(u8, &token),
+        };
     }
 
     fn resolveAttachment(self: *Service, a: std.mem.Allocator, user: []const u8, attachment: std.meta.Elem(@FieldType(Payload, "attachments")), limit: usize) !compose.Attachment {
@@ -473,7 +532,6 @@ pub const Service = struct {
         defer self.mutations.unlock();
         const id = payload.sendId orelse return ServiceError.InvalidPayload;
         if (!store.validId(id)) return ServiceError.InvalidPayload;
-        const serialized = try json(a, Outbox{ .message = payload, .scheduled = payload.scheduleAt != null, .reply_cutoff_ms = time.milliTimestamp() });
         if (store.get(a, self.db, user, "outbox", id)) |known| {
             const parsed = try std.json.parseFromSlice(Outbox, a, known.payload, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
@@ -494,7 +552,19 @@ pub const Service = struct {
             if (delay > 30) return ServiceError.InvalidPayload;
             break :blk now + delay;
         };
-        const from = try self.sendAddress(a, user, email, try payload.delegatedSender());
+        const external_id = try payload.externalSender();
+        var queued: Outbox = .{ .message = payload, .scheduled = payload.scheduleAt != null, .reply_cutoff_ms = time.milliTimestamp() };
+        const from = if (external_id) |sender_id| blk: {
+            if (payload.sharedReply != null) return error.ExternalSenderUnavailable;
+            const grant = try external_senders.find(a, self.externalSendersFile(), user, sender_id);
+            const binding = (try external_senders.verifiedBinding(a, self.db, grant)) orelse return error.ExternalSenderUnavailable;
+            const review = try self.reviewExternalEnvelope(a, grant, .{ .senderId = sender_id, .to = payload.to, .cc = payload.cc, .bcc = payload.bcc }, binding);
+            const supplied = payload.externalReview orelse return error.ExternalReviewRequired;
+            if (supplied.len != 64 or !std.crypto.timing_safe.eql([64]u8, supplied[0..64].*, review.token[0..64].*)) return error.ExternalReviewRequired;
+            queued.external_binding = binding;
+            queued.expected_from = grant.address;
+            break :blk grant.address;
+        } else try self.sendAddress(a, user, email, try payload.delegatedSender());
         const msg = try self.payloadMessage(a, payload, user, from, false);
         if (msg.to.len + msg.cc.len + msg.bcc.len == 0) return compose.ComposeError.NoRecipients;
         for ([_][]const []const u8{ msg.to, msg.cc, msg.bcc }) |addresses| for (addresses) |address| if (!compose.isSafeAddress(address)) return compose.ComposeError.InvalidAddress;
@@ -510,7 +580,7 @@ pub const Service = struct {
             if (payload.draftId == null or payload.replyContext != null) return error.SharedReplyUnavailable;
             try self.checkSharedReply(a, user, from, payload);
         }
-        var row = store.Record{ .username = user, .kind = "outbox", .id = id, .payload = serialized, .state = "pending", .revision = 0, .due_at = due_at, .expires_at = 0 };
+        var row = store.Record{ .username = user, .kind = "outbox", .id = id, .payload = try json(a, queued), .state = "pending", .revision = 0, .due_at = due_at, .expires_at = 0 };
         try self.checkOutboxCapacity(row, now);
         row.revision = if (payload.sharedReply) |context|
             try store.enqueueShared(self.db, row, payload.draftId.?, payload.draftRevision, context)
@@ -642,6 +712,7 @@ pub const Service = struct {
     }
 
     pub fn requireOrdinaryDirectSend(self: *Service, a: std.mem.Allocator, actor: []const u8, payload: Payload) !void {
+        if (try payload.externalSender() != null) return error.ExternalReviewRequired;
         if (payload.sharedReply != null) return error.SharedReplyQueueRequired;
         const draft_id = payload.draftId orelse return;
         const row = store.get(a, self.db, actor, "draft", draft_id) catch |err| switch (err) {
@@ -676,6 +747,7 @@ pub const Service = struct {
             if (!try self.reconcileDelivery(a, row.username, &doc)) {
                 doc.error_message = switch (err) {
                     error.SenderIdentityUnavailable => "This From address is no longer available. Choose another address before sending.",
+                    error.ExternalSenderUnavailable => "The external From address or its provider is no longer authorized. Review this message before sending.",
                     error.SharedReplyUnavailable => "This shared reply no longer has permission to send. Check the original message and its assignment.",
                     error.CalendarInvitationStale => "The organizer sent an updated invitation before this RSVP could be sent.",
                     error.CalendarInvitationCancelled => "The organizer cancelled this invitation before this RSVP could be sent.",
@@ -820,7 +892,14 @@ pub const Service = struct {
         defer account.deinit(self.db.allocator);
         if (!account.enabled) return error.HostedSenderDisabled;
         const delegated_id = try doc.message.delegatedSender();
-        const from = try self.sendAddress(a, user, account.email, delegated_id);
+        const external_id = try doc.message.externalSender();
+        const grant: ?external_senders.Grant = if (external_id) |id| try external_senders.find(a, self.externalSendersFile(), user, id) else null;
+        const from = if (grant) |approved| blk: {
+            const binding = doc.external_binding orelse return error.ExternalSenderUnavailable;
+            const current = (try external_senders.verifiedBinding(a, self.db, approved)) orelse return error.ExternalSenderUnavailable;
+            if (!std.mem.eql(u8, binding, current)) return error.ExternalSenderUnavailable;
+            break :blk approved.address;
+        } else try self.sendAddress(a, user, account.email, delegated_id);
         if (doc.expected_from) |expected| {
             if (!std.mem.eql(u8, from, expected)) return error.SenderIdentityUnavailable;
         }
@@ -843,6 +922,15 @@ pub const Service = struct {
         row.revision = try store.put(self.db, row.*, row.revision);
         var cfg = self.sendConfig(user);
         cfg.delegated_sender_id = delegated_id;
+        const secret = if (grant) |approved| try external_senders.readFile(a, approved.password_file, 352) else null;
+        defer if (secret) |bytes| {
+            std.crypto.secureZero(u8, bytes);
+            a.free(bytes);
+        };
+        if (grant) |approved| cfg.external_provider = .{
+            .config = approved.provider(std.mem.trimEnd(u8, secret.?, "\r\n")),
+            .identity = .{ .id = approved.id, .generation = doc.external_binding.? },
+        };
         if (doc.message.sharedReply) |context| cfg.shared_reply = .{ .context = context, .send_id = row.id };
         if (doc.calendarReply) |reply| cfg.calendar_reply = reply.revision;
         doc.result = try compose.sendWithJournal(a, msg, cfg, doc.dispatch);
@@ -1137,6 +1225,7 @@ fn sendFingerprint(a: std.mem.Allocator, payload: Payload) ![]const u8 {
     if (!payload.clearFollowUp) _ = legacy.object.orderedRemove("clearFollowUp");
     if (payload.scheduleAt == null) _ = legacy.object.orderedRemove("scheduleAt");
     if (payload.senderId == null) _ = legacy.object.orderedRemove("senderId");
+    if (payload.externalReview == null) _ = legacy.object.orderedRemove("externalReview");
     if (payload.sharedReply == null) _ = legacy.object.orderedRemove("sharedReply");
     return fingerprint(a, try json(a, legacy));
 }

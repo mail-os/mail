@@ -15,6 +15,7 @@
 //! use; deliverToRemote also rejects unsafe envelope addresses as a backstop.
 
 const std = @import("std");
+const database = @import("../storage/database.zig");
 const submission = @import("../delivery/submission.zig");
 const fs_compat = @import("../core/fs_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
@@ -83,6 +84,10 @@ pub const SendConfig = struct {
     /// Canonical mailbox key of the sender (used for the Sent folder path).
     sender_user: []const u8,
     delegated_sender_id: ?i64 = null,
+    external_provider: ?struct {
+        config: @import("../delivery/smtp_provider.zig").Config,
+        identity: database.Database.ExternalSenderAdmission,
+    } = null,
     shared_reply: ?@import("../storage/shared_inbox.zig").ReplyDelivery = null,
     calendar_reply: ?@import("webmail_calendar_invite.zig").Revision = null,
 
@@ -423,13 +428,16 @@ pub fn sendWithJournal(allocator: std.mem.Allocator, msg: Message, cfg: SendConf
     const recipients = try submission.distinctRecipients(allocator, &.{ msg.to, msg.cc, msg.bcc });
     defer allocator.free(recipients);
     const delivery = cfg.delivery();
-    const result = try submission.dispatch(allocator, delivery, msg.from, recipients, raw, .{
-        .sender = cfg.sender_user,
-        .delegated_sender_id = cfg.delegated_sender_id,
-        .shared_reply = cfg.shared_reply,
-        .calendar_reply = cfg.calendar_reply,
-        .interactive_id = if (dispatch) |send_record| send_record.delivery_id else null,
-    });
+    const result = if (cfg.external_provider) |provider|
+        try submission.dispatchExternal(allocator, delivery, provider.config, msg.from, recipients, raw, cfg.sender_user, (dispatch orelse return error.ExternalReviewRequired).delivery_id, provider.identity)
+    else
+        try submission.dispatch(allocator, delivery, msg.from, recipients, raw, .{
+            .sender = cfg.sender_user,
+            .delegated_sender_id = cfg.delegated_sender_id,
+            .shared_reply = cfg.shared_reply,
+            .calendar_reply = cfg.calendar_reply,
+            .interactive_id = if (dispatch) |send_record| send_record.delivery_id else null,
+        });
     errdefer allocator.free(result.failed);
     const first_limit_error = result.first_limit_error;
     if (result.delivered == 0 and first_limit_error != null) return first_limit_error.?;
@@ -437,7 +445,7 @@ pub fn sendWithJournal(allocator: std.mem.Allocator, msg: Message, cfg: SendConf
     // Save a copy to the sender's Sent folder (best-effort; doesn't affect the
     // delivered count, but a failure is logged).
     var sent_saved = false;
-    var limit_notice: ?[]const u8 = if (first_limit_error != null) "Some recipient mailboxes are full or disabled." else null;
+    var limit_notice: ?[]const u8 = if (first_limit_error != null) "Some recipient mailboxes are full or disabled." else result.notice;
     if (result.delivered > 0) {
         if (fileSent(allocator, cfg, sent_raw, if (dispatch) |send_record| send_record.sent_delivery_id else null)) |saved| {
             sent_saved = saved;
@@ -448,7 +456,7 @@ pub fn sendWithJournal(allocator: std.mem.Allocator, msg: Message, cfg: SendConf
         }
     }
 
-    return .{ .message_id = msgid, .delivered = result.delivered, .failed = result.failed, .sent_saved = sent_saved, .limit_notice = limit_notice };
+    return .{ .message_id = msgid, .delivered = result.delivered, .failed = result.failed, .unknown = result.unknown, .sent_saved = sent_saved, .limit_notice = limit_notice };
 }
 
 pub fn recoverSent(a: std.mem.Allocator, msg: Message, cfg: SendConfig, dispatch: OutboxDispatch) !bool {

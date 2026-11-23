@@ -1555,6 +1555,8 @@ pub const Database = struct {
         if (!try stmt.step()) return error.SenderIdentityUnavailable;
     }
 
+    pub const ExternalSenderAdmission = struct { id: []const u8, generation: []const u8 };
+
     pub const DeliveryEnvelope = struct {
         id: []const u8,
         from: []const u8,
@@ -1567,6 +1569,7 @@ pub const Database = struct {
         targets: []const DeliveryTarget,
         sender: ?[]const u8 = null,
         delegated_sender_id: ?i64 = null,
+        external_sender: ?ExternalSenderAdmission = null,
         shared_reply: ?shared_inbox.ReplyDelivery = null,
         calendar_reply: ?calendar_invite.Revision = null,
         charge_recipients: usize = 0,
@@ -1585,6 +1588,19 @@ pub const Database = struct {
         // actor or creating any visible recipient copies.
         if (envelope.delegated_sender_id) |identity| {
             try self.requireDelegatedSenderLocked(envelope.sender orelse return error.SenderIdentityUnavailable, identity, envelope.from);
+        }
+        if (envelope.external_sender) |identity| {
+            const stmt = try self.prepareLocked(
+                \\SELECT 1 FROM webmail_records
+                \\WHERE username=?1 AND kind='external-sender-proof' AND id=?2 AND state='verified'
+                \\AND json_extract(payload,'$.generation')=?3
+                \\AND EXISTS(SELECT 1 FROM users WHERE username=?1 AND enabled=1)
+            );
+            defer stmt.finalize();
+            try stmt.bind(1, envelope.sender orelse return error.ExternalSenderUnavailable);
+            try stmt.bind(2, identity.id);
+            try stmt.bind(3, identity.generation);
+            if (!try stmt.step()) return error.ExternalSenderUnavailable;
         }
         if (envelope.shared_reply) |reply| {
             try shared_inbox.requireReplyAdmission(.{ .db = self }, envelope.sender orelse return error.SharedReplyUnavailable, envelope.from, reply);
@@ -1694,12 +1710,35 @@ pub const Database = struct {
         _ = try insert.step();
     }
 
-    pub fn checkpointInteractiveRecipient(self: *Database, id: []const u8, recipient: []const u8, phase: enum { starting, delivered, failed }) !void {
-        const stmt = try self.prepare(
-            \\UPDATE accepted_mail_targets SET outcome=?3
-            \\WHERE delivery_id=?1 AND recipient=?2 AND is_primary=1 AND outcome=?4 RETURNING 1
-        );
+    const InteractivePhase = enum { starting, delivered, failed };
+    const interactive_phase_sql =
+        \\UPDATE accepted_mail_targets SET outcome=?3
+        \\WHERE delivery_id=?1 AND recipient=?2 AND is_primary=1 AND outcome=?4 RETURNING 1
+    ;
+
+    pub fn checkpointInteractiveRecipient(self: *Database, id: []const u8, recipient: []const u8, phase: InteractivePhase) !void {
+        const stmt = try self.prepare(interactive_phase_sql);
         defer stmt.finalize();
+        try checkpointRecipient(stmt, id, recipient, phase);
+    }
+
+    /// The confirmed result of one remote DATA transaction applies to every
+    /// accepted recipient, even if the worker stops while recording it.
+    pub fn checkpointInteractiveRecipients(self: *Database, id: []const u8, recipients: []const []const u8, phase: InteractivePhase) !void {
+        var tx = try self.beginTransaction(.write);
+        defer tx.deinit();
+        {
+            const stmt = try tx.prepare(interactive_phase_sql);
+            defer stmt.finalize();
+            for (recipients) |recipient| {
+                try checkpointRecipient(stmt, id, recipient, phase);
+                try stmt.reset();
+            }
+        }
+        try tx.commit();
+    }
+
+    fn checkpointRecipient(stmt: Statement, id: []const u8, recipient: []const u8, phase: InteractivePhase) !void {
         try stmt.bind(1, id);
         try stmt.bind(2, recipient);
         try stmt.bind(3, @as([]const u8, switch (phase) {

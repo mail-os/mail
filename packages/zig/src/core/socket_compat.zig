@@ -278,7 +278,10 @@ pub const Connection = struct {
     }
 
     pub fn write(self: Connection, data: []const u8) !usize {
-        const result = std.c.write(self.fd, data.ptr, data.len);
+        const result = if (@hasDecl(std.c.MSG, "NOSIGNAL"))
+            std.c.send(self.fd, data.ptr, data.len, std.c.MSG.NOSIGNAL)
+        else
+            std.c.write(self.fd, data.ptr, data.len);
         if (result < 0) return error.Unexpected;
         return @intCast(result);
     }

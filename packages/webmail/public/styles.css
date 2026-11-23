@@ -902,6 +902,18 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-reply-text { display: grid; gap: 5px; min-width: 0; font-size: 13px; font-weight: 550; }
 .wm-reply-text textarea { width: 100%; min-height: 88px; padding: 8px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); font: inherit; font-weight: 400; resize: vertical; }
 .wm-reply-actions { justify-content: end; }
+.wm-external-send-review { flex-shrink: 0; max-block-size: min(40dvh, 20rem); overflow: auto; margin: 8px 20px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--control-radius); background: var(--toolbar); }
+.wm-external-send-review h2 { font-size: 15px; }
+.wm-external-send-review dl { display: grid; gap: 6px; margin: 8px 0 0; font-size: 13px; }
+.wm-external-send-review dl > div { display: grid; grid-template-columns: 4rem minmax(0, 1fr); gap: 8px; }
+.wm-external-send-review dt { color: var(--muted); }
+.wm-external-send-review dd { margin: 0; overflow-wrap: anywhere; }
+.wm-external-senders select { width: 100%; }
+@media (max-width: 420px) {
+  .wm-external-send-review { margin-inline: 12px; }
+  .wm-external-send-review dl > div { grid-template-columns: 3rem minmax(0, 1fr); gap: 8px; }
+  .wm-external-send-review dl > .wm-external-identity { grid-template-columns: minmax(0, 1fr); gap: 3px; }
+}
 .wm-snapshot-links { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
 .wm-snapshot-links li, .wm-snapshot-confirm { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 9px; border: 1px solid var(--border); border-radius: var(--control-radius); background: var(--toolbar); }
 .wm-snapshot-links li > div, .wm-snapshot-confirm p { flex: 1 1 12rem; min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 13px; }

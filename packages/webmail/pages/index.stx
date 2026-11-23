@@ -73,11 +73,14 @@ const {
   pendingSend, sendRemaining, outbox, outboxCount, outboxCounts, outboxSection, outboxViews, outboxEmpty,
   outboxPageNumber, outboxNext, outboxLoading, outboxError, outboxView, cancelling, authExpired, currentFolderName, now,
   composing, title, sharedReply, senderId, senderIdentities, missingSender, senderStatus, chooseSender, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, saveStatus,
+  externalSender, externalSendReview, cancelExternalReview,
   savingDraft, draftError, draftConflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword,
   confirmPassword, passwordError, savingPassword, confirmation, confirming, limits,
   recoveryAddress, recoverySetBy, recoveryInput, recoveryPassword, recoveryError, recoveryNotice, recoveryLoading,
   savingRecovery, saveRecovery,
   forwarding, forwardingAddress, forwardingPassword, forwardingCode, forwardingBusy, forwardingError, forwardingNotice, changeForwarding,
+  externalAddresses, externalAddress, externalAddressId, externalCode, externalAddressBusy, externalAddressError, externalAddressNotice,
+  selectExternalAddress, verifyExternalAddress,
   vacation, vacationEnabled, vacationSubject, vacationBody, vacationStart, vacationEnd, vacationBusy, vacationError, vacationNotice, saveVacationSettings,
   writingLibrary, writingKind, writingId, writingName, writingText, writingBusy, writingError, writingNotice, writingEntries,
   chooseWritingKind, editWritingEntry, loadWritingLibrary, saveWritingEntry, removeWritingEntry, changeDefaultSignature,
@@ -708,6 +711,19 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
     <ul :if="attachments.length" class="wm-compose-attachments"><li :for="attachment in attachments"><span class="mail-icon" data-icon="document" aria-hidden="true"></span><div><span :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></span><progress :if="attachment.status === 'uploading' || attachment.status === 'loading'" max="100" :value="attachment.status === 'loading' ? undefined : attachment.progress" :aria-label="(attachment.status === 'loading' ? 'Loading ' : 'Uploading ') + attachment.filename"></progress><small :if="attachment.status === 'uploading' || attachment.status === 'loading'" aria-hidden="true" :text="attachment.status === 'loading' ? 'Loading…' : attachment.progress === 100 ? 'Processing…' : attachment.progress + '%' "></small><p :if="attachment.error" class="wm-composer-error" :text="attachment.error"></p></div><button :if="attachment.status === 'failed'" type="button" class="wm-action" @click="retryAttachment(attachment.key)" :disabled="sending || sendUncertain">Retry upload</button><button type="button" class="wm-action" @click="removeAttachment(attachment.key)" :disabled="sending || sendUncertain" :aria-label="'Remove attachment ' + attachment.filename" title="Remove attachment"><span class="mail-icon" data-icon="close" aria-hidden="true"></span></button></li></ul>
     <p :if="composeError || draftError" class="wm-composer-error" role="alert" :text="composeError || draftError"></p><div :if="sendUncertain" class="wm-draft-conflict"><button type="button" class="wm-action" @click="confirmPendingSend()" :disabled="sending">Confirm send status</button></div><div :if="draftConflict" class="wm-draft-conflict"><button type="button" class="wm-action" @click="saveDraftCopy()">Save a copy</button><button type="button" class="wm-action" @click="showConfirmation('reload-draft')">Reload saved draft</button></div>
     <div class="wm-draft-status" role="status" aria-live="polite" aria-atomic="true" :text="saveStatus"></div>
+    <section :if="externalSendReview && !sendUncertain" id="composeExternalReview" class="wm-external-send-review" aria-labelledby="composeExternalTitle" tabindex="-1">
+      <div class="wm-snapshot-dialog-heading">
+        <h2 id="composeExternalTitle">Review send</h2>
+        <button type="button" class="wm-action" @click="cancelExternalReview()" :disabled="sending">Back to editing</button>
+      </div>
+      <dl>
+        <div class="wm-external-identity"><dt>Account</dt><dd :text="externalSendReview.account"></dd></div>
+        <div class="wm-external-identity"><dt>From</dt><dd :text="externalSendReview.from"></dd></div>
+        <div :if="externalSendReview.to.length"><dt>To</dt><dd :text="externalSendReview.to.join(', ')"></dd></div>
+        <div :if="externalSendReview.cc.length"><dt>Cc</dt><dd :text="externalSendReview.cc.join(', ')"></dd></div>
+        <div :if="externalSendReview.bcc.length"><dt>Bcc</dt><dd :text="externalSendReview.bcc.join(', ')"></dd></div>
+      </dl>
+    </section>
     <footer class="wm-composer-foot">
       <div :if="scheduleOpen" id="composeSchedule" class="wm-send-schedule">
         <label for="composeSendTime"><span class="mail-icon" data-icon="clock" aria-hidden="true"></span>Send at</label>
@@ -715,7 +731,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         <small id="composeTimeZone" :text="scheduleZone"></small>
         <button type="button" class="wm-action" @click="scheduleOpen.set(false)" :disabled="sending || sendUncertain">Send now instead</button>
       </div>
-      <button class="wm-send-btn" type="submit" :disabled="sending || sendUncertain || savingDraft || attachmentPending || fileLinkUploading || draftConflict || authExpired"><span class="mail-icon" :data-icon="scheduleOpen ? 'clock' : 'send'" aria-hidden="true"></span><span :text="sending ? 'Queuing…' : scheduleOpen ? 'Schedule send' : 'Send'"></span></button>
+      <button class="wm-send-btn" type="submit" :disabled="sending || sendUncertain || savingDraft || attachmentPending || fileLinkUploading || draftConflict || authExpired"><span class="mail-icon" :data-icon="scheduleOpen ? 'clock' : 'send'" aria-hidden="true"></span><span :text="sending ? (externalSender && !externalSendReview ? 'Loading review…' : 'Queuing…') : externalSender && !externalSendReview ? 'Review send' : scheduleOpen ? 'Schedule send' : 'Send'"></span></button>
       <button :if="!scheduleOpen" class="wm-action" type="button" @click="chooseSendTime()" :disabled="sending || sendUncertain"><span class="mail-icon" data-icon="clock" aria-hidden="true"></span>Send later</button>
       <button class="wm-action" type="button" @click="saveDraft()" :disabled="sending || savingDraft || attachmentPending || fileLinkUploading"><span class="mail-icon" data-icon="document" aria-hidden="true"></span><span :text="savingDraft ? 'Saving…' : 'Save draft'"></span></button>
       <button class="wm-action wm-action--danger" type="button" @click="showConfirmation('discard')" :disabled="sending || savingDraft || fileLinkUploading"><span class="mail-icon" data-icon="trash" aria-hidden="true"></span>Discard</button>
@@ -788,6 +804,24 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       <button :if="forwarding?.address" type="button" class="login-secondary wm-forwarding-disable" @click="changeForwarding('disable')" :disabled="forwardingBusy || !forwardingPassword">Turn off forwarding</button>
     </div>
   </form>
+</section>
+<section :if="externalAddresses.length || externalAddressError" class="login-recovery wm-external-senders" aria-labelledby="externalAddressesHeading">
+  <h2 id="externalAddressesHeading"><span class="mail-icon" data-icon="send" aria-hidden="true"></span>External From addresses</h2>
+  <label :if="externalAddresses.length" for="externalAddress">Address</label>
+  <select :if="externalAddresses.length" id="externalAddress" @change="selectExternalAddress($event)" :disabled="externalAddressBusy">
+    <option :for="entry in externalAddresses" :key="entry.id" :value="entry.id" :selected="entry.id === externalAddressId" :text="entry.address"></option>
+  </select>
+  <p :if="externalAddressError" class="login-error" role="alert" :text="externalAddressError"></p>
+  <p :if="externalAddressNotice" class="login-sub" role="status" :text="externalAddressNotice"></p>
+  <p :if="externalAddress?.state === 'verified' && !externalAddressNotice" class="login-sub">Verified and available in Compose.</p>
+  <p :if="externalAddress?.state === 'unverified'" class="login-sub">Verify access to this address to use it in Compose.</p>
+  <form :if="externalAddress?.state === 'pending'" @submit.prevent="verifyExternalAddress('confirm')">
+    <label for="externalSenderCode">Code sent to this address</label>
+    <input id="externalSenderCode" type="text" x-model.trim="externalCode" autocomplete="one-time-code" autocapitalize="off" spellcheck="false" minlength="32" maxlength="32" :disabled="externalAddressBusy" required>
+    <button type="submit" :disabled="externalAddressBusy">Verify address</button>
+  </form>
+  <button :if="externalAddress && externalAddress.state !== 'verified'" type="button" class="login-secondary" @click="verifyExternalAddress('request')" :disabled="externalAddressBusy" :text="externalAddress.state === 'pending' ? 'Send a new code' : 'Send verification code'"></button>
+  <button :if="externalAddress?.state === 'verified'" type="button" class="login-secondary" @click="verifyExternalAddress('revoke')" :disabled="externalAddressBusy">Revoke verification</button>
 </section>
 <section class="login-recovery wm-vacation" aria-labelledby="vacationHeading">
   <div class="wm-vacation-heading"><h2 id="vacationHeading"><span class="mail-icon" data-icon="clock" aria-hidden="true"></span>Vacation reply</h2><span :if="vacation" class="wm-vacation-status" :text="vacationStatus(vacation, now)"></span></div>

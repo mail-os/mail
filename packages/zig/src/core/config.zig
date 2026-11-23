@@ -126,6 +126,7 @@ pub const Config = struct {
     webmail_attachment_max_total: usize = 20 * 1024 * 1024,
     webmail_attachment_max_count: usize = 20,
     webmail_undo_send_seconds: u32 = 10,
+    webmail_external_senders_file: ?[]const u8 = null,
 
     // Require STARTTLS (or implicit TLS) before AUTH is offered/accepted.
     // Default off to avoid locking out existing plaintext-auth clients.
@@ -239,6 +240,7 @@ pub const Config = struct {
         if (self.acme_email) |email| allocator.free(email);
         if (self.list_unsubscribe_url) |url| allocator.free(url);
         if (self.spam_junk_folder) |v| allocator.free(v);
+        if (self.webmail_external_senders_file) |path| allocator.free(path);
     }
 
     /// Validates the configuration and returns detailed error messages
@@ -803,6 +805,7 @@ fn applyEnvironmentVariables(allocator: std.mem.Allocator, cfg: *Config) !void {
     if (env.get("SMTP_WEBMAIL_ATTACHMENT_MAX_TOTAL")) |value| cfg.webmail_attachment_max_total = std.fmt.parseInt(usize, value, 10) catch cfg.webmail_attachment_max_total;
     if (env.get("SMTP_WEBMAIL_ATTACHMENT_MAX_COUNT")) |value| cfg.webmail_attachment_max_count = std.fmt.parseInt(usize, value, 10) catch cfg.webmail_attachment_max_count;
     if (env.get("SMTP_WEBMAIL_UNDO_SEND_SECONDS")) |value| cfg.webmail_undo_send_seconds = std.fmt.parseInt(u32, value, 10) catch cfg.webmail_undo_send_seconds;
+    if (env.get("SMTP_WEBMAIL_EXTERNAL_SENDERS_FILE")) |value| cfg.webmail_external_senders_file = try allocator.dupe(u8, value);
 
     // SMTP_DELIVERY_METHOD (ses or direct)
     if (env.get("SMTP_DELIVERY_METHOD")) |value| {

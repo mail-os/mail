@@ -9,6 +9,7 @@ const time_compat = @import("../core/time_compat.zig");
 const outbound = @import("outbound.zig");
 const core_config = @import("../core/config.zig");
 const routing = @import("local_routing.zig");
+const smtp_provider = @import("smtp_provider.zig");
 
 pub const Delivery = struct {
     hostname: []const u8,
@@ -131,7 +132,46 @@ pub const DispatchResult = struct {
     failed: []const []const u8,
     first_error: ?anyerror = null,
     first_limit_error: ?anyerror = null,
+    unknown: []const []const u8 = &.{},
+    notice: ?[]const u8 = null,
 };
+
+pub fn dispatchExternal(a: std.mem.Allocator, cfg: Delivery, provider: smtp_provider.Config, from: []const u8, recipients: []const []const u8, raw: []const u8, sender: []const u8, id: []const u8, identity: database.Database.ExternalSenderAdmission) !DispatchResult {
+    const db = cfg.db orelse return error.DatabaseUnavailable;
+    if (!isSafeAddress(from) or recipients.len == 0) return error.InvalidAddress;
+    const targets = try a.alloc(database.Database.DeliveryTarget, recipients.len);
+    defer a.free(targets);
+    for (recipients, targets) |recipient, *target| {
+        if (!isSafeAddress(recipient)) return error.InvalidAddress;
+        target.* = .{ .recipient = recipient, .interactive_remote = true };
+    }
+    try db.acceptDelivery(.{
+        .id = id,
+        .from = from,
+        .author = from,
+        .mime = raw,
+        .accepted_at = time_compat.timestamp(),
+        .accepted_ms = time_compat.milliTimestamp(),
+        .targets = targets,
+        .sender = sender,
+        .external_sender = identity,
+        .charge_recipients = recipients.len,
+    });
+    var notice: ?[]const u8 = null;
+    smtp_provider.submit(a, provider, .{ .db = db, .delivery_id = id }, cfg.hostname, from, recipients, raw) catch |err| {
+        notice = switch (err) {
+            error.ProviderUnavailable => "The external SMTP provider did not complete this submission.",
+            error.ProviderTlsUnavailable => "The external SMTP provider could not be verified over TLS.",
+            error.ProviderAuthenticationFailed => "The external SMTP provider rejected authentication.",
+            error.ProviderEnvelopeRejected => "The external SMTP provider refused the sender or recipients.",
+            error.ProviderMessageRejected => "The external SMTP provider rejected the message.",
+            error.ProviderDeliveryUnknown => "The external SMTP provider did not confirm acceptance. Review this delivery before retrying.",
+            else => return err,
+        };
+    };
+    const outcome = (try db.interactiveDelivery(a, id)) orelse return error.ProviderUnavailable;
+    return .{ .delivered = outcome.delivered, .failed = outcome.failed, .unknown = outcome.unknown, .notice = notice };
+}
 
 /// Check and admit all local recipients as one journaled operation. Remote
 /// app submissions keep their synchronous delivery results for partial-send UI.

@@ -28,11 +28,20 @@ pub const ClientTlsError = error{HandshakeFailed};
 ///
 /// Opportunistic: the server certificate is not validated.
 pub fn clientHandshake(conn: socket.Connection, host: []const u8) !Stream {
-    var client = tls.nonblock.Client.init(.{
+    return handshake(conn, .{
         .host = host,
         .root_ca = .empty,
         .insecure_skip_verify = true,
     });
+}
+
+/// Authenticated SMTP submission requires verification of the chain and host.
+pub fn verifiedHandshake(conn: socket.Connection, host: []const u8, roots: std.crypto.Certificate.Bundle) !Stream {
+    return handshake(conn, .{ .host = host, .root_ca = roots });
+}
+
+fn handshake(conn: socket.Connection, options: tls.config.Client) !Stream {
+    var client = tls.nonblock.Client.init(options);
 
     var recv_buf: [tls.input_buffer_len]u8 = undefined;
     var send_buf: [tls.output_buffer_len]u8 = undefined;

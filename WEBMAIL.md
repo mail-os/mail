@@ -127,6 +127,13 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   to send to each recipient individually. Each reply keeps its own subject and
   thread and appears separately in Outbox. The account’s Undo Send delay and
   sending allowance apply to each reply.
+- When an administrator has approved an external From address, open **Account**
+  → **External From addresses** and verify the code delivered to that address.
+  In Compose, select the address and choose **Review send** to check the sending
+  account and every To, Cc, and Bcc recipient before queueing. The message uses
+  the approved SMTP provider, appears in the Mail account’s Outbox, and files a
+  Sent copy there after confirmed acceptance. Revoking verification stops
+  pending messages that used that grant.
 - When CalDAV is enabled, Calendar offers day, week, month, year, and 30-day agenda
   views across all calendars or one selected calendar. Year marks days with
   events, or busy days for an availability-only share. Select a marked or
@@ -421,6 +428,38 @@ send delay 0–30 seconds. Effective attachment limits also respect mailbox limi
 and the MIME expansion budget under `SMTP_MAX_MESSAGE_SIZE`; the UI displays the
 actual effective limit. A user may choose a 0–30 second send delay in the composer.
 
+### External SMTP providers
+
+Set `SMTP_WEBMAIL_EXTERNAL_SENDERS_FILE` to the absolute path of an
+operator-managed JSON file. Each entry uses the mailbox’s canonical username
+and grants it permission to use an address and provider account. Approve only
+addresses the provider allows that account to send from. The mailbox owner
+must also verify a code delivered to the address before it can be used.
+
+```json
+[
+  {
+    "id": "external-studio",
+    "mailbox": "alex@mail.example",
+    "address": "alex@studio.example",
+    "host": "smtp.studio.example",
+    "port": 587,
+    "username": "alex@studio.example",
+    "password_file": "/etc/mail/secrets/studio-smtp-password"
+  }
+]
+```
+
+Use an SMTP provider that supports STARTTLS and AUTH PLAIN over the verified
+connection. The password file holds the SMTP password or app password and
+should be readable only by the service account. Use an absolute `ca_file` for
+a provider with a private CA. Trust uses the system roots by default. Update
+the grant file atomically. Removing an entry stops its pending sends. Use a
+new ID when regranting a removed identity so earlier approvals cannot carry
+over. The Account settings revoke action also invalidates every previous
+approval for that address. Provider responses after DATA are recorded in
+Outbox. An unconfirmed acceptance requires review before retrying.
+
 ## Import a mailbox over IMAP
 
 Run `scripts/mail-import.py` with Python 3.12 or later and separate logins for
@@ -694,6 +733,17 @@ before a request may affect another mailbox. Disabling or deleting an account
 revokes existing webmail sessions.
 
 - `GET /webmail/api/config` returns effective limits and preferences.
+- `GET /webmail/api/external-sender-verification` returns current verification
+  state for operator-approved addresses belonging to the signed-in mailbox.
+  `POST` to the same path accepts `{id,action,code?}`. The `request` action
+  emails a single-use code with a 30-minute lifetime to the approved address.
+  `confirm` verifies it and `revoke` invalidates it for future or queued sends.
+  Confirmed addresses appear in `GET /webmail/api/sender-identities`. Submit
+  `{senderId,to,cc,bcc}` to `POST /webmail/api/external-sender-review` to get
+  the sending account, actual From address, recipient groups, and review
+  `token`. Send through `POST /webmail/api/compose` with a `sendId`, the
+  reviewed envelope, and the token as `externalReview`. Changing the address,
+  recipients, or provider grant requires a fresh review.
 - `POST /webmail/api/reply-batches/preview` accepts up to twenty owned message
   `references` and returns the sending `account`, `from` address, individual
   `replies`, and review `digest`. `POST /webmail/api/reply-batches` accepts the
