@@ -1013,6 +1013,7 @@ async function calendarTasksJourney(page, phone = false) {
   assert(await button(taskStatus, 'Open').isDisabled())
   assert(await button(taskStatus, 'Completed').isDisabled())
   const statusControls = await verifyControlRow(taskStatus, 'button', phone ? 44 : 36)
+  verifyControlGaps(statusControls, 8)
   assert(statusControls.every(control => control.opacity === '1' && control.borderMatches),
     'Task status buttons keep their borders while editing')
   await title.fill(name)
@@ -1797,6 +1798,29 @@ async function freeTimeJourney(page, phone = false) {
   const form = panel.locator('form')
   const controls = await verifyControlRow(form, 'input, select, button', phone ? 44 : 36, !phone)
   const [date, from, to, duration, availability] = controls
+  if (!phone) {
+    verifyControlGaps(controls, 8)
+    assert(Math.abs(from.right - from.left - 128) < 0.5 && Math.abs(to.right - to.left - 128) < 0.5,
+      'From and To reserve the same room for text and native clock indicators in every browser')
+    const viewport = page.viewportSize()
+    for (const width of [375, 376, 600, 601, 860, 861]) {
+      await page.setViewportSize({ width, height: viewport.height })
+      const responsive = await verifyControlRow(form, 'input, select, button', width > 860 ? 36 : 44, width > 860)
+      const [startDate, startTime, endTime, minimum, submit] = responsive
+      verifyControlGaps([startTime, endTime], 8)
+      assert(Math.abs((startTime.right - startTime.left) - (endTime.right - endTime.left)) < 0.5,
+        'The time fields align in equal columns')
+      if (width > 600 && width <= 860) {
+        verifyControlGaps([startDate, startTime, endTime], 8)
+        verifyControlGaps([minimum, submit], 8)
+        assert(minimum.top > startDate.bottom && Math.abs(minimum.left - startDate.left) < 0.5 && Math.abs(submit.right - endTime.right) < 0.5,
+          'Availability fields and the submit action share their column edges across rows')
+      }
+      if (width === 601) await verifyPaintedControlBorders(form, 'input, select, button', responsive, 'tablet-601-availability-controls')
+      await fitsViewport(page)
+    }
+    await page.setViewportSize(viewport)
+  }
   if (phone) {
     for (const control of [duration, availability]) {
       assert(Math.abs(control.left - date.left) < 0.5 && Math.abs(control.right - date.right) < 0.5,
@@ -1815,7 +1839,24 @@ async function freeTimeJourney(page, phone = false) {
   })
   assert(buttonInset >= 10, 'Check availability has room inside both borders')
   const slots = panel.getByRole('list', { name: 'Open windows' })
-  await check.click()
+  const calculation = /\/webmail\/api\/calendar-free-busy\?/
+  const resumeAvailability = Promise.withResolvers()
+  await page.route(calculation, async (route) => {
+    await resumeAvailability.promise
+    await route.continue()
+  }, { times: 1 })
+  try {
+    await check.click()
+    const checking = button(panel, 'Checking…')
+    await checking.waitFor()
+    assert(await checking.isDisabled())
+    const pending = await verifyControlRow(form, 'input, select, button', phone ? 44 : 36, !phone)
+    assert(pending.every((control, index) => control.opacity === '1'
+      && Math.abs((control.right - control.left) - (controls[index].right - controls[index].left)) < 0.5),
+      'The availability form keeps control widths and full-opacity borders while checking')
+    await verifyPaintedControlBorders(form, 'input, select, button', pending, phone ? 'phone-availability-pending' : 'desktop-availability-pending')
+  }
+  finally { resumeAvailability.resolve() }
   await panel.getByRole('status').filter({ hasText: '3 open windows' }).waitFor()
   const displayed = await slots.evaluate(list => Array.from(list.querySelectorAll('li'), item => ({
     time: item.querySelector('span').textContent.replace(/\s+/g, ' ').trim(),
@@ -1828,6 +1869,7 @@ async function freeTimeJourney(page, phone = false) {
   ])
   await fitsViewport(page)
   await page.mouse.move(0, 0)
+  await verifyPaintedControlBorders(form, 'input, select, button', controls, phone ? 'phone-availability-controls' : 'desktop-availability-controls')
   await panel.screenshot({ path: join(output, phone ? 'phone-calendar-free-time.png' : 'desktop-calendar-free-time.png'), animations: 'disabled' })
   if (phone) {
     await page.emulateMedia({ colorScheme: 'light' })
@@ -1842,7 +1884,6 @@ async function freeTimeJourney(page, phone = false) {
   await panel.getByRole('status').filter({ hasText: '1 open window' }).waitFor()
   await slots.getByText('12:00 PM – 2:00 PM', { exact: true }).waitFor()
 
-  const calculation = /\/webmail\/api\/calendar-free-busy\?/
   await page.route(calculation, route => route.fulfill({
     status: 422, json: { error: 'availability_incomplete', message: 'Some busy times could not be calculated' },
   }), { times: 1 })
@@ -1850,6 +1891,33 @@ async function freeTimeJourney(page, phone = false) {
   await panel.getByRole('alert').filter({ hasText: 'Some busy times could not be calculated' }).waitFor()
   assert.equal(await slots.count(), 0, 'Incomplete calculations show no open times')
   if (phone) await page.setViewportSize({ width: 390, height: 844 })
+}
+
+async function calendarEventControlJourney(page) {
+  const viewport = page.viewportSize()
+  await page.goto(`${url}/calendar?day=${day}`)
+  await button(page, 'New event').click()
+  const dialog = page.getByRole('dialog', { name: 'New event' })
+  const fields = dialog.locator('.calendar-editor-fields')
+  const repeat = fields.getByLabel('Repeat', { exact: true })
+  const repeatEnds = fields.getByLabel('Repeat ends', { exact: true })
+  await repeat.selectOption({ label: 'Weekly' })
+  await repeatEnds.selectOption('count')
+
+  const selector = 'input:not([type=checkbox]), select'
+  for (const [width, scheme] of [[1440, 'light'], [601, 'dark'], [491, 'light'], [320, 'dark']]) {
+    await page.setViewportSize({ width, height: 1400 })
+    await page.emulateMedia({ colorScheme: scheme })
+    const height = width > 860 ? 36 : 44
+    const controls = await verifyControlRow(fields, selector, height, false)
+    await verifyPaintedControlBorders(fields, selector, controls, `event-editor-${width}-${scheme}`)
+    await verifySelectedOptionFits(repeatEnds)
+    await fitsViewport(page)
+  }
+  await button(dialog, 'Cancel').click()
+  await dialog.waitFor({ state: 'hidden' })
+  await page.setViewportSize(viewport)
+  await page.emulateMedia({ colorScheme: 'light' })
 }
 
 async function calendarSharingJourney(captain) {
@@ -2829,6 +2897,7 @@ try {
   await phoneJourney(phone)
   await invitationJourney(desktop)
   await invitationJourney(phone, true)
+  await calendarEventControlJourney(desktop)
   await freeTimeJourney(desktop)
   await freeTimeJourney(phone, true)
   await calendarSharingJourney(desktop)
