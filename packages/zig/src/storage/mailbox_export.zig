@@ -1,5 +1,6 @@
 //! Portable, operator-owned export of one canonical mailbox.
 const std = @import("std");
+const calendar_workflow = @import("calendar_workflow_transfer.zig");
 const database = @import("database.zig");
 const dav_store = @import("caldav_store.zig");
 const maildir_keywords = @import("maildir_keywords.zig");
@@ -42,6 +43,9 @@ pub fn write(gpa: Allocator, io: std.Io, db: *database.Database, username: []con
     var manifest: Manifest = .{ .mailbox = user.username };
     try writeMail(a, io, &archive, &manifest, options.mail_root, user.username);
     try writeDav(gpa, a, io, db, &archive, &manifest, user.id, options);
+    const workflow = try calendar_workflow.snapshot(a, db, user.id);
+    const portable_workflow = try std.json.Stringify.valueAlloc(a, workflow, .{});
+    try archive.writeFileBytes(calendar_workflow.archive_path, portable_workflow, .{ .mode = 0o600 });
 
     const json = try std.json.Stringify.valueAlloc(a, .{
         .version = 1,
@@ -49,6 +53,7 @@ pub fn write(gpa: Allocator, io: std.Io, db: *database.Database, username: []con
         .folders = manifest.folders.items,
         .calendars = manifest.calendars.items,
         .addressBooks = manifest.addressBooks.items,
+        .calendarWorkflow = calendar_workflow.archive_path,
     }, .{ .whitespace = .indent_2 });
     try archive.writeFileBytes("manifest.json", json, .{ .mode = 0o600 });
     try archive.finishPedantically();

@@ -631,9 +631,15 @@ stores for a point-in-time export across mail and DAV.
   per-calendar export limit applies.
 - `Contacts/` contains individual vCards grouped by address book. Import the
   cards into the corresponding address books on the destination.
+- `CalendarWorkflow.json` is the version 1 document for private Calendar
+  workflow. It includes task titles, optional civil dates and completion state,
+  current day labels, and the same Personal tools document available from
+  Calendar. An account without saved Personal tools has `personalTools: null`.
 - `manifest.json` maps source folder, calendar, and address-book names to their
-  archive paths. Use the manifest when creating IMAP folders with their source
-  names. The destination assigns its own message UIDs.
+  archive paths. The `calendarWorkflow` entry points to the workflow document.
+  Earlier archives contain the mail and DAV paths. Use the manifest when
+  creating IMAP folders with their source names. The destination assigns its
+  own message UIDs.
 
 To move mail into another Mail instance, create each folder from the manifest
 and upload its messages over IMAP. Pass the archived flags and file modification
@@ -644,8 +650,23 @@ when a client omits it. Backdated imports still arrive at the end of the
 destination folder. A Maildir importer such as Dovecot's can also read the
 extracted folders directly. [Dovecot import documentation](https://doc.dovecot.org/2.3/admin_manual/importing_mailboxes/)
 
-Use a server backup for same-service recovery of account configuration,
-sharing, and private workflow state.
+In Mutt, open an extracted folder with `mutt -R -f /private/path/extracted/Maildir`.
+Use the folder path in the manifest for a named folder. Copy messages to a
+local mailbox with Mutt's copy command. [Mutt mailbox formats](https://www.mutt.org/doc/manual/#mailbox-formats)
+
+Restore the workflow document on the destination with `SMTP_DB_PATH` set to
+its database. Choose the canonical username of an enabled destination mailbox.
+
+```sh
+mail user:local import-calendar-workflow new@example.net /private/path/extracted/CalendarWorkflow.json
+```
+
+The command imports the populated sections in a single transaction. Each of
+those sections must be empty on the destination. Imported tasks get local IDs
+and every imported record starts at revision 1. A repeated import into a
+populated section reports a conflict. Use the exported iCalendar and vCard
+files to restore events and contacts. Use a server backup for same-service
+recovery of account configuration, sharing, and message-linked workflows.
 
 ## Self-hosted team administration
 

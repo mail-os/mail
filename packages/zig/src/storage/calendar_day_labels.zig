@@ -39,19 +39,21 @@ pub fn list(a: std.mem.Allocator, db: *database.Database, mailbox: []const u8, s
     return rows.toOwnedSlice(a);
 }
 
+pub fn validateLabel(value: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, value, " ");
+    if (trimmed.len == 0 or trimmed.len > max_label_bytes or
+        (std.unicode.utf8CountCodepoints(trimmed) catch return error.InvalidDayLabel) > 80)
+        return error.InvalidDayLabel;
+    for (trimmed) |byte| if (byte < 32 or byte == 127) return error.InvalidDayLabel;
+    return trimmed;
+}
+
 /// Rows retain a revision after clearing, so stale edits cannot restore text
 /// that the owner removed in another tab.
 pub fn save(db: *database.Database, mailbox: []const u8, day: []const u8, edit: Edit) !Label {
     if (Date.parseCivil(day) == null or edit.revision < 0 or edit.revision == std.math.maxInt(i64))
         return error.InvalidDayLabel;
-    const label = if (edit.label) |value| blk: {
-        const trimmed = std.mem.trim(u8, value, " ");
-        if (trimmed.len == 0 or trimmed.len > max_label_bytes or
-            (std.unicode.utf8CountCodepoints(trimmed) catch return error.InvalidDayLabel) > 80)
-            return error.InvalidDayLabel;
-        for (trimmed) |byte| if (byte < 32 or byte == 127) return error.InvalidDayLabel;
-        break :blk trimmed;
-    } else null;
+    const label = if (edit.label) |value| try validateLabel(value) else null;
     if (label == null and edit.revision == 0) return error.InvalidDayLabel;
 
     var tx = try db.beginTransaction(.write);

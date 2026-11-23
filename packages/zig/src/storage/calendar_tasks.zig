@@ -43,13 +43,18 @@ pub fn list(a: std.mem.Allocator, db: *database.Database, mailbox: []const u8) !
     return rows.toOwnedSlice(a);
 }
 
-pub fn save(db: *database.Database, mailbox: []const u8, id: ?i64, edit: Edit) !Task {
-    const title = std.mem.trim(u8, edit.title, " ");
+pub fn validateContent(input_title: []const u8, day: ?[]const u8) ![]const u8 {
+    const title = std.mem.trim(u8, input_title, " ");
     if (title.len == 0 or title.len > max_title * 4 or
         (std.unicode.utf8CountCodepoints(title) catch return error.InvalidCalendarTask) > max_title)
         return error.InvalidCalendarTask;
     for (title) |byte| if (byte < 32 or byte == 127) return error.InvalidCalendarTask;
-    if (edit.day) |day| if (Date.parseCivil(day) == null) return error.InvalidCalendarTask;
+    if (day) |value| if (Date.parseCivil(value) == null) return error.InvalidCalendarTask;
+    return title;
+}
+
+pub fn save(db: *database.Database, mailbox: []const u8, id: ?i64, edit: Edit) !Task {
+    const title = try validateContent(edit.title, edit.day);
     if ((id == null and edit.revision != 0) or (id != null and !validRevision(edit.revision)))
         return error.InvalidCalendarTask;
 

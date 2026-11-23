@@ -54,9 +54,7 @@ pub fn isCompact(db: *database.Database, mailbox: []const u8) !bool {
 
 pub fn save(a: std.mem.Allocator, db: *database.Database, mailbox: []const u8, change: Snapshot) !Snapshot {
     if (change.revision < 0 or change.revision == std.math.maxInt(i64)) return error.InvalidPersonalTools;
-    try validate(a, change.tools);
-    const payload = try std.json.Stringify.valueAlloc(a, change.tools, .{});
-    if (payload.len > max_bytes) return error.PersonalToolsTooLarge;
+    const payload = try encode(a, change.tools);
 
     var tx = try db.beginTransaction(.write);
     defer tx.deinit();
@@ -78,6 +76,14 @@ pub fn save(a: std.mem.Allocator, db: *database.Database, mailbox: []const u8, c
     };
     try tx.commit();
     return .{ .revision = revision, .tools = change.tools };
+}
+
+pub fn encode(a: std.mem.Allocator, tools: Tools) ![]const u8 {
+    try validate(a, tools);
+    const payload = try std.json.Stringify.valueAlloc(a, tools, .{});
+    errdefer a.free(payload);
+    if (payload.len > max_bytes) return error.PersonalToolsTooLarge;
+    return payload;
 }
 
 fn validate(a: std.mem.Allocator, tools: Tools) !void {

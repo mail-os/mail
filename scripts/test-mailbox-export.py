@@ -2,6 +2,7 @@
 """Export a disabled mailbox and transfer the archive to a fresh Mail instance."""
 
 import argparse
+from copy import deepcopy
 from datetime import datetime
 from email import policy
 from email.message import EmailMessage
@@ -9,16 +10,19 @@ from email.parser import BytesParser
 from imaplib import Time2Internaldate
 import json
 import mailbox
+import os
 from pathlib import Path
 import runpy
+import shlex
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 
 SCRIPTS = Path(__file__).resolve().parent
 tools = runpy.run_path(str(SCRIPTS / "test-webmail-teams.py"))
-Fixture, command = tools["Fixture"], tools["command"]
+Fixture, command, expect = tools["Fixture"], tools["command"], tools["expect"]
 DavClient = runpy.run_path(str(SCRIPTS / "test-dav-https.py"))["DavClient"]
 ATTACHMENT = b"Portable attachment content \x00\xff"
 FILE_TIME = 1741212345
@@ -41,6 +45,24 @@ CARD = (
     b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:portable-contact\r\n"
     b"FN:Casey Portable\r\nEMAIL:casey@example.test\r\nEND:VCARD\r\n"
 )
+DAY = "2028-02-29"
+LABEL_RANGE = f"calendar-day-labels?start={DAY}&end=2028-03-02"
+WORKFLOW = {
+    "version": 1,
+    "tasks": [
+        {"title": "Dated planning task", "day": DAY, "completed": False},
+        {"title": "Completed planning task", "day": "2028-03-01", "completed": True},
+        {"title": "Undated planning task", "day": None, "completed": False},
+    ],
+    "dayLabels": [{"day": DAY, "label": "Research day 🧭"}],
+    "personalTools": {
+        "version": 1, "enabled": True, "appearance": "compact",
+        "habits": [{"id": "a" * 32, "title": "Practice", "days": [DAY]}],
+        "countdowns": [{"id": "b" * 32, "title": "Launch", "day": DAY}],
+        "journal": [{"day": DAY, "text": "Private notes\nSecond line"}],
+        "time": [{"id": "c" * 32, "title": "Planning", "day": DAY, "minutes": 45}],
+    },
+}
 
 
 def put_dav(client, path, content_type, body):
@@ -51,6 +73,28 @@ def put_dav(client, path, content_type, body):
 def internaldate(response):
     value = response.split(b'INTERNALDATE "', 1)[1].split(b'"', 1)[0]
     return datetime.strptime(value.decode(), "%d-%b-%Y %H:%M:%S %z").timestamp()
+
+
+def seed_workflow(source, session):
+    ids = set()
+    for task in WORKFLOW["tasks"]:
+        row = expect(source.api(session, "calendar-tasks", dict(task, completed=False, revision=0), "POST"), 201)
+        ids.add(row["id"])
+        if task["completed"]:
+            edited = expect(source.api(session, f"calendar-tasks/{row['id']}", dict(task, revision=1), "PUT"))
+            assert edited["revision"] == 2 and edited["completed"]
+    path = f"calendar-day-labels/{DAY}"
+    expect(source.api(session, path, {"label": "Draft label", "revision": 0}, "PUT"))
+    updated = expect(source.api(session, path, {"label": WORKFLOW["dayLabels"][0]["label"], "revision": 1}, "PUT"))
+    assert updated["revision"] == 2
+    cleared_path = "calendar-day-labels/2028-03-02"
+    expect(source.api(session, cleared_path, {"label": "Cleared label", "revision": 0}, "PUT"))
+    expect(source.api(session, cleared_path, {"label": None, "revision": 1}, "PUT"))
+    personal = WORKFLOW["personalTools"]
+    expect(source.api(session, "calendar-tools", {"tools": dict(personal, enabled=False), "revision": 0}, "PUT"))
+    updated_tools = expect(source.api(session, "calendar-tools", {"tools": personal, "revision": 1}, "PUT"))
+    assert updated_tools["revision"] == 2
+    return ids
 
 
 def seed(source):
@@ -111,16 +155,32 @@ def seed(source):
     put_dav(other_dav, f"/addressbooks/{foreign}/Private/private.vcf", "text/vcard",
             CARD.replace(b"Casey Portable", b"Foreign contact"))
 
+    owner_session, foreign_session, teammate_session = (source.login(user) for user in (owner, foreign, teammate))
+    source_task_ids = seed_workflow(source, owner_session)
+    expect(source.api(foreign_session, "calendar-tasks",
+                      {"title": "Foreign private task", "day": None, "completed": False, "revision": 0}, "POST"), 201)
     command(source, "team", "create", "archive", "Archive", owner)
+    command(source, "team", "create", "foreign", "Foreign organization", foreign)
     command(source, "team", "member", "archive", teammate, "member")
     command(source, "team", "grant", "archive", owner, teammate, "mailbox")
-    assert source.api(source.login(teammate), "shared-inboxes")[1]
+    assert expect(source.api(teammate_session, "shared-inboxes"))
+    calendar, = expect(source.api(owner_session, "calendars"))["calendars"]
+    grant = {"calendarId": calendar["id"], "grantee": teammate, "access": "viewer"}
+    expect(source.api(owner_session, "teams/archive/calendar-shares", grant, "PUT"))
+    assert len(expect(source.api(teammate_session, "calendar-shares"))["shares"]) == 1
+    for path in ("calendar-tasks", "calendar-tools", LABEL_RANGE):
+        expect(source.api(dict(teammate_session, **{"X-Webmail-Account": owner}), path), 409)
+    expect(source.api(owner_session, "teams/archive/calendar-shares", dict(grant, access=None), "PUT"))
+    assert expect(source.api(teammate_session, "calendar-shares")) == {"shares": []}
     command(source, "team", "revoke", "archive", owner, teammate, "mailbox")
-    assert source.api(source.login(teammate), "shared-inboxes") == (200, [])
-    owner_session = source.login(owner)
+    assert expect(source.api(teammate_session, "shared-inboxes")) == []
+    assert expect(source.api(teammate_session, "calendar-tasks")) == {"tasks": []}
+    assert expect(source.api(teammate_session, LABEL_RANGE)) == {"labels": []}
+    assert expect(source.api(teammate_session, "calendar-tools"))["revision"] == 0
     command(source, "user:local", "disable", owner)
-    assert source.api(owner_session, "folders")[0] == 401
-    return owner, raw
+    for path in ("folders", "calendar-tasks", "calendar-tools", LABEL_RANGE):
+        expect(source.api(owner_session, path), 401)
+    return owner, raw, source_task_ids
 
 
 def inspect(source, owner, archive, extracted, original):
@@ -129,6 +189,7 @@ def inspect(source, owner, archive, extracted, original):
     with tarfile.open(archive) as data:
         assert len(set(data.getnames())) == len(data.getnames())
         assert all(member.isfile() or member.isdir() for member in data.getmembers())
+        assert data.getmember("CalendarWorkflow.json").mode == 0o600
         members_by_subject = {}
         for member in data.getmembers():
             if member.isfile() and ".eml" in member.name:
@@ -147,6 +208,8 @@ def inspect(source, owner, archive, extracted, original):
 
     manifest = json.loads((extracted / "manifest.json").read_bytes())
     assert manifest["version"] == 1 and manifest["mailbox"] == owner
+    assert manifest["calendarWorkflow"] == "CalendarWorkflow.json"
+    assert json.loads((extracted / manifest["calendarWorkflow"]).read_bytes()) == WORKFLOW
     folders = {item["name"]: extracted / item["path"] for item in manifest["folders"]}
     assert set(folders) == {"INBOX", "Projects", "Empty folder", "Sent", LONG_FOLDER}, folders
     assert {item["name"] for item in manifest["calendars"]} == {"Design"}
@@ -187,7 +250,70 @@ def inspect(source, owner, archive, extracted, original):
     return manifest
 
 
-def transfer(destination, extracted, manifest):
+def restore_workflow(destination, owner, path, source_ids):
+    session = destination.login(owner)
+    peer = destination.provision("destination-peer")
+    peer_session = destination.login(peer)
+    for i in range(len(source_ids)):
+        expect(destination.api(peer_session, "calendar-tasks",
+                               {"title": f"Destination-only task {i}", "day": None, "completed": False, "revision": 0}, "POST"), 201)
+
+    # Task inserts happen before labels. A duplicate day exercises rollback
+    # after writes have already begun.
+    conflict = deepcopy(WORKFLOW)
+    conflict["dayLabels"] *= 2
+    duplicate_day = destination.directory / "duplicate-day.json"
+    duplicate_day.write_text(json.dumps(conflict))
+    command(destination, "user:local", "import-calendar-workflow", owner, str(duplicate_day),
+            error="DuplicateCalendarWorkflowDay")
+    assert expect(destination.api(session, "calendar-tasks")) == {"tasks": []}
+    assert expect(destination.api(session, LABEL_RANGE)) == {"labels": []}
+    assert expect(destination.api(session, "calendar-tools"))["revision"] == 0
+
+    command(destination, "user:local", "import-calendar-workflow", owner, str(path))
+    command(destination, "user:local", "import-calendar-workflow", owner, str(path),
+            error="CalendarWorkflowAlreadyExists")
+    rows = expect(destination.api(session, "calendar-tasks"))["tasks"]
+    assert source_ids.isdisjoint(row["id"] for row in rows)
+    assert all(row["revision"] == 1 for row in rows)
+    assert [{field: row[field] for field in ("title", "day", "completed")} for row in rows] == WORKFLOW["tasks"]
+    assert expect(destination.api(session, LABEL_RANGE)) == {
+        "labels": [dict(entry, revision=1) for entry in WORKFLOW["dayLabels"]],
+    }
+    assert expect(destination.api(session, "calendar-tools")) == {"revision": 1, "tools": WORKFLOW["personalTools"]}
+    assert [row["title"] for row in expect(destination.api(peer_session, "calendar-tasks"))["tasks"]] == [
+        f"Destination-only task {i}" for i in range(len(source_ids))
+    ]
+    assert expect(destination.api(peer_session, LABEL_RANGE)) == {"labels": []}
+    assert expect(destination.api(peer_session, "calendar-tools"))["revision"] == 0
+
+
+def verify_client_import(mutt, extracted, manifest, workdir):
+    projects, = (folder["path"] for folder in manifest["folders"] if folder["name"] == "Projects")
+    target = "mutt-import"
+    args = [
+        str(mutt), "-n", "-R", "-F", os.devnull, "-m", "Maildir", "-f", str(extracted / projects),
+        "-e", "unset confirmappend confirmcreate",
+        "-e", f'push "<tag-pattern>.<enter><tag-prefix><copy-message>{target}<enter><exit>"',
+    ]
+    # Mutt's index needs a terminal. Use the system script command to supply one.
+    terminal = ["script", "-q", os.devnull, *args] if sys.platform == "darwin" else [
+        "script", "-qec", shlex.join(args), os.devnull,
+    ]
+    result = subprocess.run(terminal, cwd=workdir, stdin=subprocess.DEVNULL, capture_output=True,
+                            env={"PATH": os.environ["PATH"], "TERM": "xterm", "TMPDIR": str(workdir)}, timeout=15)
+    assert result.returncode == 0 and (workdir / target / "cur").is_dir(), (result.stdout, result.stderr)
+    copied = mailbox.Maildir(workdir / target, create=False)
+    messages = {item["Subject"]: item for item in copied}
+    assert set(messages) == {"Portable project attachment", "Legacy project copy"}
+    for message in messages.values():
+        attachment, = (part for part in message.walk() if part.get_filename() == "fixture.bin")
+        assert attachment.get_payload(decode=True) == ATTACHMENT
+    assert set("FS") <= set(messages["Portable project attachment"].get_flags())
+    print("Verified Mutt's Maildir import with original attachments, seen state, and flagged state.")
+
+
+def transfer(destination, extracted, manifest, source_task_ids):
     owner = destination.provision("restored")
     flag_map = {"D": r"\Draft", "F": r"\Flagged", "R": r"\Answered", "S": r"\Seen", "T": r"\Deleted"}
     with destination.imap(owner) as imap:
@@ -239,12 +365,14 @@ def transfer(destination, extracted, manifest):
     contact_path = f"/addressbooks/{owner}/Restored/export.vcf"
     put_dav(client, contact_path, "text/vcard", card.read_bytes())
     assert client.request("GET", contact_path)[2] == CARD
+    restore_workflow(destination, owner, extracted / manifest["calendarWorkflow"], source_task_ids)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--archive", type=Path, help="Keep a copy of the disposable test archive")
+    parser.add_argument("--mutt", type=Path, help="Verify a standard client import with the given Mutt binary")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="mail-export-") as scratch:
         root = Path(scratch)
@@ -253,13 +381,15 @@ def main():
         binary = args.binary.resolve(strict=True)
         source = Fixture(binary, root / "source", staging=True)
         with source.daemon():
-            owner, raw = seed(source)
+            owner, raw, source_task_ids = seed(source)
         archive = args.archive.resolve() if args.archive else root / "mailbox.tar"
         manifest = inspect(source, owner, archive, root / "extracted", raw)
+        if args.mutt:
+            verify_client_import(args.mutt.resolve(strict=True), root / "extracted", manifest, root)
         destination = Fixture(binary, root / "destination", staging=True)
         with destination.daemon():
-            transfer(destination, root / "extracted", manifest)
-    print("Verified private portable export and transfer of messages, received times, flags, folders, calendar, and contacts.")
+            transfer(destination, root / "extracted", manifest, source_task_ids)
+    print("Verified portable transfer of messages, folders, calendars, contacts, and private Calendar workflow.")
 
 
 if __name__ == "__main__":

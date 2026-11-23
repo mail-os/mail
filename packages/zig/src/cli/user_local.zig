@@ -6,6 +6,7 @@ const auth = @import("../auth/auth.zig");
 const env = @import("../core/env.zig");
 const recovery = @import("../api/webmail_recovery.zig");
 const mailbox_export = @import("../storage/mailbox_export.zig");
+const calendar_workflow = @import("../storage/calendar_workflow_transfer.zig");
 const io_compat = @import("../core/io_compat.zig");
 
 const password_input = @import("password_input.zig");
@@ -88,6 +89,24 @@ fn exportAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Database, _: *
         .require_dav = dav_path != null,
     });
     std.debug.print("Mailbox export saved to {s}\n", .{destination});
+}
+
+fn importCalendarWorkflowAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Database, _: *auth.AuthBackend) !void {
+    const username = ctx.getArgument(0) orelse return error.MissingArgument;
+    const path = ctx.getArgument(1) orelse return error.MissingArgument;
+    const io = io_compat.getIo();
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var buffer: [16 * 1024]u8 = undefined;
+    var input = file.reader(io, &buffer);
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var json = std.json.Reader.init(a, &input.interface);
+    defer json.deinit();
+    const document = try std.json.parseFromTokenSourceLeaky(calendar_workflow.Document, a, &json, .{});
+    try calendar_workflow.restore(a, db, username, document);
+    std.debug.print("Restored Calendar workflow for {s}\n", .{username});
 }
 
 fn verifyAction(ctx: *cli.BaseCommand.ParseContext, _: *database.Database, auth_backend: *auth.AuthBackend) !void {
@@ -223,6 +242,12 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try export_cmd.addArgument(cli.Argument.init("output", "Path for a new private archive", .string));
     _ = export_cmd.setAction(withDb(exportAction));
     _ = try cmd.addCommand(export_cmd);
+
+    const import_workflow_cmd = try cli.BaseCommand.init(allocator, "import-calendar-workflow", "Restore private Calendar data from a mailbox export");
+    _ = try import_workflow_cmd.addArgument(cli.Argument.init("username", "Canonical destination mailbox username", .string));
+    _ = try import_workflow_cmd.addArgument(cli.Argument.init("input", "Path to the extracted CalendarWorkflow.json", .string));
+    _ = import_workflow_cmd.setAction(withDb(importCalendarWorkflowAction));
+    _ = try cmd.addCommand(import_workflow_cmd);
 
     // verify
     const verify_cmd = try cli.BaseCommand.init(allocator, "verify", "Verify user credentials");
