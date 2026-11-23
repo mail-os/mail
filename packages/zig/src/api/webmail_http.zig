@@ -587,6 +587,12 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.eql(u8, p, "/webmail/api/sender-review") and std.mem.eql(u8, req.method, "GET")) return handleSenderReviewList(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/sender-review") and std.mem.eql(u8, req.method, "PUT")) return handleSenderReviewSettings(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/sender-review/decision") and std.mem.eql(u8, req.method, "POST")) return handleSenderReviewDecision(server, conn, arena, req);
+    const invitations = "/webmail/api/sender-review/invitations";
+    if (std.mem.eql(u8, p, invitations) and std.mem.eql(u8, req.method, "POST"))
+        return handleSenderInvitation(server, conn, arena, req, null);
+    if (std.mem.eql(u8, req.method, "DELETE")) {
+        if (pathId(p, invitations ++ "/")) |id| return handleSenderInvitation(server, conn, arena, req, id);
+    }
     if (std.mem.eql(u8, p, "/webmail/api/category-settings") and
         (std.mem.eql(u8, req.method, "GET") or std.mem.eql(u8, req.method, "PUT"))) return handleCategorySettings(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/category-rule") and std.mem.eql(u8, req.method, "PUT")) return handleCategoryRule(server, conn, arena, req);
@@ -1831,12 +1837,34 @@ fn handleSenderReviewDecision(server: *WebmailHttpServer, conn: *webmail_tls.Str
     return sendJson(conn, arena, 200, try service_mod.json(arena, try server.db.senderReviewStatus(sess.username)), null);
 }
 
+fn handleSenderInvitation(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request, id: ?[]const u8) !void {
+    if (!isSameOrigin(req)) return sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    if (id) |ref| {
+        sender_review.revokeInvitation(server.db, sess.username, ref) catch |err|
+            return mapSenderReviewError(conn, arena, err);
+        return sendJson(conn, arena, 200, "{\"revoked\":true}", null);
+    }
+    const payload = std.json.parseFromSlice(sender_review.InvitationRequest, arena, req.body, .{}) catch
+        return sendError(conn, arena, 400, "bad_request", "Invalid sender invitation");
+    defer payload.deinit();
+    const result = sender_review.invite(arena, server.db, sess.username, payload.value) catch |err|
+        return mapSenderReviewError(conn, arena, err);
+    return sendJson(conn, arena, 201, try service_mod.json(arena, result), null);
+}
+
 fn mapSenderReviewError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: anyerror) !void {
     return switch (err) {
         error.InvalidReviewDecision => sendError(conn, arena, 400, "bad_request", "Invalid Sender Review decision"),
         error.UnverifiedSender => sendError(conn, arena, 400, "unverified_sender", "Choose a decision for this message only"),
         error.ReviewChanged, maildir.MaildirError.RevisionMismatch => sendError(conn, arena, 412, "revision_mismatch", "Sender Review changed. Refresh before trying again."),
         error.ReviewInProgress => sendError(conn, arena, 409, "review_in_progress", "A decision is still being applied for this sender"),
+        error.NotFound => sendError(conn, arena, 404, "not_found", "No such item in this mailbox"),
+        error.InvalidSenderInvitation => sendError(conn, arena, 400, "invalid_invitation", "Enter one email address and a supported duration"),
+        error.InvitationRequiresReview => sendError(conn, arena, 409, "review_disabled", "Turn on Sender Review before inviting a sender"),
+        error.InvitationHasDecision => sendError(conn, arena, 409, "saved_decision", "This sender has a saved decision"),
+        error.InvitationUnavailable => sendError(conn, arena, 409, "invitation_unavailable", "This sender already has an invitation or you have reached 50 active invitations"),
         else => mapMaildirError(conn, arena, err),
     };
 }

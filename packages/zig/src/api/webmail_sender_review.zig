@@ -8,6 +8,8 @@ const fs = @import("../core/fs_compat.zig");
 const routing = @import("../delivery/local_routing.zig");
 const time = @import("../core/time_compat.zig");
 const config = @import("../core/config.zig");
+const addressing = @import("../message/submission.zig");
+const link_tokens = @import("webmail_link_tokens.zig");
 
 const Allocator = std.mem.Allocator;
 const Database = database.Database;
@@ -15,7 +17,7 @@ const page_size = 30;
 const owner = "user_id=(SELECT id FROM users WHERE username=?1)";
 const journal_fields = "basename,folder,envelope_from,author,verified_author,recipient,remote_addr,file_stamp,reference,next_folder,operation,forward_release";
 
-pub const View = enum { pending, declined, decisions };
+pub const View = enum { pending, declined, decisions, invitations };
 pub const Request = struct {
     action: Database.SenderDecision,
     reference: ?[]const u8 = null,
@@ -77,6 +79,8 @@ const Item = struct {
 };
 
 const Rule = struct { author: []const u8, action: []const u8, forward: bool, revision: i64 };
+const Invitation = struct { id: []const u8, author: []const u8, expires_at: i64 };
+pub const InvitationRequest = struct { author: []const u8, lifetime: i64 };
 
 fn displayText(value: []const u8) []const u8 {
     return if (std.unicode.utf8ValidateSlice(value)) value else "Invalid text";
@@ -85,6 +89,7 @@ pub const Page = struct {
     status: Database.SenderReviewStatus,
     items: []const Item = &.{},
     rules: []const Rule = &.{},
+    invitations: []const Invitation = &.{},
     page: usize,
     page_size: usize = 30,
     has_more: bool = false,
@@ -94,6 +99,30 @@ pub fn list(a: Allocator, db: *Database, user: []const u8, view: View, page: usi
     const offset = std.math.mul(usize, page -| 1, page_size) catch return error.InvalidReviewDecision;
     if (offset > std.math.maxInt(i64) - page_size) return error.InvalidReviewDecision;
     var response: Page = .{ .status = try db.senderReviewStatus(user), .page = page };
+    if (view == .invitations) {
+        const stmt = try db.prepare(
+            "SELECT id,author,expires_at FROM sender_review_invitations WHERE " ++ owner ++
+                " AND expires_at>unixepoch() ORDER BY expires_at,author LIMIT ?2 OFFSET ?3",
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, page_size + 1);
+        try stmt.bind(3, offset);
+        var invitations: std.ArrayList(Invitation) = .empty;
+        while (try stmt.step()) {
+            if (invitations.items.len == page_size) {
+                response.has_more = true;
+                break;
+            }
+            try invitations.append(a, .{
+                .id = try a.dupe(u8, stmt.columnText(0)),
+                .author = try a.dupe(u8, stmt.columnText(1)),
+                .expires_at = stmt.columnInt64(2),
+            });
+        }
+        response.invitations = invitations.items;
+        return response;
+    }
     if (view == .decisions) {
         const stmt = try db.prepare("SELECT author,action,forward,revision FROM sender_screening_rules WHERE " ++ owner ++ " ORDER BY author LIMIT ?2 OFFSET ?3");
         defer stmt.finalize();
@@ -166,6 +195,62 @@ pub fn list(a: Allocator, db: *Database, user: []const u8, view: View, page: usi
     if (removed) response.status = try db.senderReviewStatus(user);
     response.items = items.items;
     return response;
+}
+
+pub fn invite(a: Allocator, db: *Database, user: []const u8, request: InvitationRequest) !Invitation {
+    const author = std.mem.trim(u8, request.author, " \t");
+    if (author.len > 254 or !std.unicode.utf8ValidateSlice(author) or !addressing.validMailbox(author) or
+        !link_tokens.validLifetime(request.lifetime)) return error.InvalidSenderInvitation;
+    db.lockMailboxes();
+    defer db.unlockMailboxes();
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const now = time.timestamp();
+    const status = try tx.prepare(
+        \\SELECT u.id,s.enabled,r.author IS NOT NULL
+        \\FROM users u LEFT JOIN sender_screening s ON s.user_id=u.id
+        \\LEFT JOIN sender_screening_rules r ON r.user_id=u.id AND r.author=?2
+        \\WHERE u.username=?1 AND u.enabled=1
+    );
+    defer status.finalize();
+    try status.bind(1, user);
+    try status.bind(2, author);
+    if (!try status.step()) return error.NotFound;
+    if (status.columnInt64(1) == 0) return error.InvitationRequiresReview;
+    if (status.columnInt64(2) != 0) return error.InvitationHasDecision;
+    const user_id = status.columnInt64(0);
+    const expired = try tx.prepare("DELETE FROM sender_review_invitations WHERE user_id=?1 AND expires_at<=?2");
+    defer expired.finalize();
+    try expired.bind(1, user_id);
+    try expired.bind(2, now);
+    _ = try expired.step();
+    const expires_at = now + request.lifetime;
+    const insert = try tx.prepare(
+        \\INSERT INTO sender_review_invitations(user_id,author,id,expires_at)
+        \\SELECT ?1,?2,lower(hex(randomblob(16))),?3
+        \\WHERE (SELECT COUNT(*) FROM sender_review_invitations WHERE user_id=?1)<50
+        \\ON CONFLICT(user_id,author) DO NOTHING RETURNING id
+    );
+    defer insert.finalize();
+    try insert.bind(1, user_id);
+    try insert.bind(2, author);
+    try insert.bind(3, expires_at);
+    if (!try insert.step()) return error.InvitationUnavailable;
+    const id = try a.dupe(u8, insert.columnText(0));
+    _ = try insert.step();
+    try tx.commit();
+    return .{ .id = id, .author = author, .expires_at = expires_at };
+}
+
+pub fn revokeInvitation(db: *Database, user: []const u8, id: []const u8) !void {
+    db.lockMailboxes();
+    defer db.unlockMailboxes();
+    const stmt = try db.prepare("DELETE FROM sender_review_invitations WHERE " ++ owner ++ " AND id=?2 RETURNING id");
+    defer stmt.finalize();
+    try stmt.bind(1, user);
+    try stmt.bind(2, id);
+    if (!try stmt.step()) return error.NotFound;
+    _ = try stmt.step();
 }
 
 fn forget(db: *Database, user: []const u8, row: Review) !void {

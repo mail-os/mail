@@ -33,6 +33,12 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   mailboxes enable Sender Review when the user completes inbox setup. Existing
   mailboxes can turn it on in Account settings. Turning it off lets new mail
   reach the inbox while preserving the existing review list and decisions.
+- In **Sender Review** → **Invitations**, allow new mail from one verified
+  sender address for an hour, 24 hours, or seven days. The invitation applies
+  at delivery, skips automatic forwarding, and leaves previously held mail
+  available for review. **Revoke** ends the allowance early. A saved decision
+  takes precedence and ends a previous invitation for that sender. Each
+  mailbox can have up to 50 active invitations.
 - **Mark junk** moves one message or a selection into Junk. **Not junk**
   returns messages to their previous folder when it still exists, or to Inbox.
   **Undo** reverses the move and its feedback. The folder and message changes

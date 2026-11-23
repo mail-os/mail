@@ -1840,6 +1840,46 @@ async function navigationRequestsJourney(page) {
   }
 }
 
+async function senderInvitationJourney(desktop, phone) {
+  const enabled = await desktop.request.put(url + '/webmail/api/sender-review', {
+    headers: { Origin: url }, data: { setting: 'enable' },
+  })
+  assert.equal(enabled.status(), 200)
+  await desktop.goto(url + '/')
+  await button(folders(desktop), 'Sender Review').click()
+  const desktopReview = desktop.getByRole('region', { name: 'Sender Review' })
+  await button(desktopReview, 'Invitations').click()
+  const form = desktopReview.locator('form')
+  await form.getByLabel('Sender email').fill(sender)
+  await form.getByLabel('Allow for').selectOption('3600')
+  const controls = await verifyControlRow(form, 'input, select, button', 36, false)
+  assert(Math.abs(controls[1].bottom - controls[2].bottom) < 0.5, 'The invitation duration and action align')
+  await button(form, 'Allow temporarily').click()
+  await desktopReview.getByText('Invitation added.', { exact: true }).waitFor()
+  const revokeLabel = `Revoke invitation for ${sender}`
+  await button(desktopReview, revokeLabel).waitFor()
+  assert(!await desktop.getByRole('region', { name: 'Message reader' }).isVisible(), 'Invitations use the workspace without a message reader')
+  assert((await desktopReview.boundingBox()).width >= 600, 'Invitations use the expanded desktop workspace')
+  await screenshot(desktop, 'desktop-sender-invitation')
+
+  await phone.setViewportSize({ width: 320, height: 844 })
+  await phone.goto(url + '/')
+  await drawer(phone).click()
+  await button(folders(phone), 'Sender Review').click()
+  const phoneReview = phone.getByRole('region', { name: 'Sender Review' })
+  await button(phoneReview, 'Invitations').click()
+  const revoke = button(phoneReview, revokeLabel)
+  await revoke.waitFor()
+  await verifyControlRow(phoneReview.locator('form'), 'input, select, button', 44, false)
+  await fitsViewport(phone)
+  await screenshot(phone, 'phone-sender-invitation')
+  await revoke.click()
+  await phoneReview.getByText('Invitation revoked.', { exact: true }).waitFor()
+  await phoneReview.getByText('No active invitations.', { exact: true }).waitFor()
+  await button(desktopReview, 'Refresh').click()
+  await desktopReview.getByText('No active invitations.', { exact: true }).waitFor()
+}
+
 try {
   const desktop = await signIn()
   await desktopJourney(desktop)
@@ -1864,6 +1904,7 @@ try {
   await replyBatchJourney(desktop, phone)
   await combinedInboxJourney(desktop)
   await navigationRequestsJourney(desktop)
+  await senderInvitationJourney(desktop, phone)
   assert.deepEqual(errors, [], 'Browser pages raised uncaught errors')
   process.stdout.write(`${engine} passed the desktop and phone webmail journeys.\n`)
 }

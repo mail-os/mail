@@ -749,6 +749,14 @@ pub const Database = struct {
             \\    revision INTEGER NOT NULL DEFAULT 1,
             \\    PRIMARY KEY(user_id,author)
             \\);
+            \\CREATE TABLE IF NOT EXISTS sender_review_invitations (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    author TEXT NOT NULL COLLATE NOCASE,
+            \\    id TEXT NOT NULL,
+            \\    expires_at INTEGER NOT NULL,
+            \\    PRIMARY KEY(user_id,author),
+            \\    UNIQUE(user_id,id)
+            \\);
             \\CREATE TABLE IF NOT EXISTS sender_review_messages (
             \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             \\    basename TEXT NOT NULL,
@@ -1986,6 +1994,13 @@ pub const Database = struct {
                     try rule.bind(4, @intFromBool(forward));
                     _ = try rule.step();
                 }
+                // A saved decision supersedes any previous invitation. A
+                // later reset should return the sender to ordinary review.
+                const invitation = try self.prepareLocked("DELETE FROM sender_review_invitations WHERE user_id=(SELECT id FROM users WHERE username=?1) AND author=?2");
+                defer invitation.finalize();
+                try invitation.bind(1, user);
+                try invitation.bind(2, author.address);
+                _ = try invitation.step();
                 const copies = try self.prepareLocked(
                     \\UPDATE sender_review_messages SET next_folder=?3,operation=lower(hex(randomblob(16))),forward_release=?4,retry_at=0
                     \\WHERE user_id=(SELECT id FROM users WHERE username=?1) AND author=?2 COLLATE NOCASE AND verified_author=1 AND file_stamp<>'' AND folder<>?3
@@ -2028,14 +2043,16 @@ pub const Database = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const stmt = try self.prepareLocked(
-            \\SELECT r.action,r.forward FROM users u JOIN sender_screening s ON s.user_id=u.id AND s.enabled=1
-            \\LEFT JOIN sender_screening_rules r ON r.user_id=u.id AND r.author=?2 WHERE u.username=?1
+            \\SELECT r.action,r.forward,i.id IS NOT NULL FROM users u JOIN sender_screening s ON s.user_id=u.id AND s.enabled=1
+            \\LEFT JOIN sender_screening_rules r ON r.user_id=u.id AND r.author=?2
+            \\LEFT JOIN sender_review_invitations i ON i.user_id=u.id AND i.author=?2 AND i.expires_at>unixepoch()
+            \\WHERE u.username=?1
         );
         defer stmt.finalize();
         try stmt.bind(1, mailbox);
         try stmt.bindOpt(2, verified_author);
         if (!try stmt.step()) return .allow;
-        if (stmt.columnIsNull(0)) return .review;
+        if (stmt.columnIsNull(0)) return if (stmt.columnInt64(2) != 0) .allow_without_forward else .review;
         if (std.mem.eql(u8, stmt.columnText(0), "decline")) return .decline;
         return if (stmt.columnInt64(1) != 0) .allow else .allow_without_forward;
     }

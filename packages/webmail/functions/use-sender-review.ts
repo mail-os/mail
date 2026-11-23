@@ -3,7 +3,7 @@ import { derived, state } from '@stacksjs/stx'
 import { MailApiError } from './mail-api'
 
 export interface ReviewStatus { enabled: boolean, onboarding_pending: boolean, pending: number }
-export type ReviewView = 'pending' | 'declined' | 'decisions'
+export type ReviewView = 'pending' | 'declined' | 'decisions' | 'invitations'
 export type ReviewAction = 'allow' | 'decline' | 'recover' | 'reset'
 export interface ReviewItem extends MessageRef {
   reference: string
@@ -19,7 +19,10 @@ export interface ReviewItem extends MessageRef {
   applying: boolean
 }
 export interface ReviewRule { author: string, action: 'allow' | 'decline', forward: boolean, revision: number }
-interface ReviewPage { status: ReviewStatus, items: ReviewItem[], rules: ReviewRule[], page: number, has_more: boolean }
+interface Invitation { id: string, author: string, expires_at: number }
+interface ReviewPage { status: ReviewStatus, items: ReviewItem[], rules: ReviewRule[], invitations: Invitation[], page: number, has_more: boolean }
+
+const invitationPath = '/webmail/api/sender-review/invitations'
 
 export function useSenderReview(api: <T>(path: string, options?: RequestInit) => Promise<T>) {
   const senderReviewStatus = state<ReviewStatus | null>(null)
@@ -32,6 +35,10 @@ export function useSenderReview(api: <T>(path: string, options?: RequestInit) =>
   const senderReviewError = state('')
   const senderReviewSelection = state<ReviewItem | null>(null)
   const senderReviewRules = state<ReviewRule[]>([])
+  const senderInvitations = state<Invitation[]>([])
+  const invitationAuthor = state('')
+  const invitationLifetime = state('86400')
+  const invitationNotice = state('')
   const items = state<ReviewItem[]>([])
   let request = 0
 
@@ -53,19 +60,27 @@ export function useSenderReview(api: <T>(path: string, options?: RequestInit) =>
 
   async function loadSenderReview(view = senderReviewView(), page = senderReviewPage()): Promise<void> {
     const current = ++request
+    if (view !== senderReviewView()) {
+      items.set([])
+      senderReviewRules.set([])
+      senderInvitations.set([])
+      senderReviewMore.set(false)
+    }
     senderReviewView.set(view)
     senderReviewPage.set(page)
     senderReviewLoading.set(true)
     senderReviewError.set('')
+    invitationNotice.set('')
     try {
       const params = new URLSearchParams({ view, page: String(page) })
       const listing = await api<ReviewPage>(`/webmail/api/sender-review?${params}`)
       if (current !== request) return
       items.set(listing.items)
       senderReviewRules.set(listing.rules)
+      senderInvitations.set(listing.invitations)
       senderReviewStatus.set(listing.status)
       senderReviewMore.set(listing.has_more)
-      if (page > 1 && !listing.items.length && !listing.rules.length && !listing.has_more) await loadSenderReview(view, page - 1)
+      if (page > 1 && !listing.items.length && !listing.rules.length && !listing.invitations.length && !listing.has_more) await loadSenderReview(view, page - 1)
     }
     catch (cause) { if (current === request) senderReviewError.set(message(cause)) }
     finally { if (current === request) senderReviewLoading.set(false) }
@@ -77,6 +92,8 @@ export function useSenderReview(api: <T>(path: string, options?: RequestInit) =>
     senderReviewLoading.set(false)
     senderReviewSelection.set(null)
     senderReviewError.set('')
+    invitationAuthor.set('')
+    invitationNotice.set('')
   }
 
   async function setSenderReview(setting: 'enable' | 'disable' | 'onboard'): Promise<void> {
@@ -113,7 +130,32 @@ export function useSenderReview(api: <T>(path: string, options?: RequestInit) =>
     finally { senderReviewSaving.set(false) }
   }
 
-  return { senderReviewStatus, senderReviewOpen, senderReviewView, senderReviewPage, senderReviewMore, senderReviewLoading, senderReviewSaving, senderReviewError, senderReviewSelection, senderReviewRules, senderReviewGroups, refreshSenderReviewStatus, loadSenderReview, closeSenderReview, setSenderReview, decideSenderReview }
+  async function changeSenderInvitation(id?: string): Promise<void> {
+    if (senderReviewSaving() || senderReviewLoading()) return
+    senderReviewSaving.set(true)
+    senderReviewError.set('')
+    invitationNotice.set('')
+    try {
+      if (id) await api(`${invitationPath}/${encodeURIComponent(id)}`, { method: 'DELETE' })
+      else {
+        await api(invitationPath, { method: 'POST', body: JSON.stringify({ author: invitationAuthor(), lifetime: Number(invitationLifetime()) }) })
+        invitationAuthor.set('')
+      }
+      if (senderReviewOpen() && senderReviewView() === 'invitations') {
+        await loadSenderReview('invitations', id ? senderReviewPage() : 1)
+        invitationNotice.set(id ? 'Invitation revoked.' : 'Invitation added.')
+      }
+    }
+    catch (cause) {
+      if (senderReviewOpen() && senderReviewView() === 'invitations') {
+        if (cause instanceof MailApiError && (cause.status === 409 || cause.status === 404)) await loadSenderReview('invitations')
+        senderReviewError.set(message(cause))
+      }
+    }
+    finally { senderReviewSaving.set(false) }
+  }
+
+  return { senderReviewStatus, senderReviewOpen, senderReviewView, senderReviewPage, senderReviewMore, senderReviewLoading, senderReviewSaving, senderReviewError, senderReviewSelection, senderReviewRules, senderReviewGroups, senderInvitations, invitationAuthor, invitationLifetime, invitationNotice, refreshSenderReviewStatus, loadSenderReview, closeSenderReview, setSenderReview, decideSenderReview, changeSenderInvitation }
 }
 
 function message(cause: unknown): string {

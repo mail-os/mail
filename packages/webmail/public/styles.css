@@ -384,11 +384,28 @@ input[type=checkbox] { accent-color: var(--accent); }
 .wm-review-welcome { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--accent-soft); }
 .wm-review-welcome h2 { margin: 0; font-size: 15px; }
 .wm-review-welcome p { margin: 5px 0 0; color: var(--muted); font-size: 13px; }
-.wm-review-tabs { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+.wm-review { container-type: inline-size; }
+.wm-review-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+.wm-review-tabs .wm-action { justify-content: center; }
+@container (min-width: 360px) {
+  .wm-review-tabs { grid-template-columns: repeat(4, minmax(0, 8rem)); }
+}
 .wm-review-tabs [aria-pressed='true'] { color: var(--accent); background: var(--selected); }
 .wm-review-group { margin: 12px; border: 1px solid var(--border); background: var(--panel); border-radius: 10px; }
 .wm-review-group header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; padding: 10px 12px; }
 .wm-review-group h2 { margin: 0; overflow-wrap: anywhere; font-size: 14px; }
+.wm-columns.wm-columns--invitations { grid-template-columns: minmax(0, 1fr); }
+.wm-columns--invitations > .wm-review { border-inline-end: 0; }
+.wm-columns--invitations > .wm-read { display: none; }
+.wm-invitations { display: grid; gap: 12px; max-inline-size: 38rem; padding: 12px; }
+.wm-invitations > :is(.wm-review-group, .wm-state) { margin: 0; }
+.wm-invitation-notice { margin: 0; padding: 8px 10px; border-radius: var(--control-radius); background: var(--accent-soft); color: var(--accent); font-size: 13px; }
+.wm-invitation-form { display: grid; grid-template-columns: minmax(0, 1fr) max-content; gap: 10px 8px; align-items: end; padding: 12px; }
+.wm-invitation-form p, .wm-invitation-form label:first-of-type { grid-column: 1 / -1; }
+.wm-invitation-form p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
+.wm-invitation-form label { display: grid; gap: 5px; min-width: 0; color: var(--muted); font-size: 13px; }
+.wm-invitation-form :is(input, select) { width: 100%; }
+.wm-invitation-form button { justify-content: center; }
 .wm-review-badge { display: inline-block; padding: 3px 6px; border-radius: 5px; font-size: 11px; color: var(--accent); background: var(--accent-soft); }
 .wm-review-badge--unverified { color: var(--warning); background: var(--warning-soft); }
 .wm-review-message { width: 100%; padding: 9px 12px; border-top: 1px solid var(--border); }

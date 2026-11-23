@@ -108,6 +108,7 @@ const {
   showConfirmation, confirmAction, saveDraftCopy, resume, tick, preventUnload,
   senderReviewStatus, senderReviewOpen, senderReviewView, senderReviewPage, senderReviewMore, senderReviewLoading,
   senderReviewSaving, senderReviewError, senderReviewSelection, senderReviewRules, senderReviewGroups,
+  senderInvitations, invitationAuthor, invitationLifetime, invitationNotice, changeSenderInvitation,
   showSenderReview, openReviewMessage, reviewMessage, setSenderReview, decideSenderReview,
   categoryList, newsletterExpanded, readerExpanded, receiptFull, receiptCompact, receiptPreview, senderLabel, sortingSettings,
   sortingSaving, sortingError, toggleAutomaticSorting, placementText, categoryRule, categoryRuleSaving, saveCategoryRule,
@@ -245,7 +246,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
     <div :if="notice" class="wm-notice" role="status"><span :text="notice"></span><button :if="undoAction && undoRemaining > 0" class="wm-action" @click="undoLastAction()" :disabled="mutating" aria-label="Undo last action" aria-keyshortcuts="Shift+U">Undo <span aria-hidden="true" :text="'(' + undoRemaining + 's)' "></span></button><button :if="pendingSend?.state === 'pending' && sendRemaining > 0" class="wm-action" @click="cancelSend()" :disabled="cancelling" aria-label="Undo send">Undo Send <span aria-hidden="true" :text="'(' + sendRemaining + 's)' "></span></button></div>
     <div :if="dueReminders > 0 && attentionView !== 'reminders'" class="wm-notice" role="status"><span :text="dueReminders === 1 ? 'One no-reply reminder is due.' : dueReminders + ' no-reply reminders are due.'"></span><button type="button" class="wm-action" @click="selectAttention('reminders')">View reminders</button></div>
     <p :if="error && !outboxView" class="login-error wm-workspace-error" role="alert" :text="error"></p>
-    <div class="wm-columns">
+    <div class="wm-columns" :class="{ 'wm-columns--invitations': senderReviewOpen && senderReviewView === 'invitations' }">
     <section :if="!outboxView && !senderReviewOpen" class="wm-list" :class="{ 'wm-list--selecting': selectionMode }" :aria-label="libraryView ? 'Attachment library' : 'Messages'">
       <header class="wm-list-head"><div class="wm-list-heading"><h1 class="wm-list-title" :text="currentFolderName"></h1><span :if="!loading && !indexProgress" class="wm-list-total" :text="matchingTotal + (libraryView ? (matchingTotal === 1 ? ' attachment' : ' attachments') : (matchingTotal === 1 ? ' message' : ' messages'))"></span></div><button :if="attentionView === 'follow_up' && total > 0" type="button" class="wm-action" @click="nextFollowUp()" :disabled="loading || readingLoading || mutating">Next reply</button><button :if="unreadAvailable && !reading" type="button" class="wm-action wm-action--quiet" aria-keyshortcuts="Shift+N" @click="nextUnread()" :disabled="loading || triageBusy || readingLoading || mutating"><span class="mail-icon" data-icon="down" aria-hidden="true"></span>Next unread</button><button type="button" class="wm-refresh" @click="refresh(true)" :disabled="loading || refreshing" :aria-label="libraryView ? 'Refresh attachments' : 'Refresh messages'" :title="libraryView ? 'Refresh attachments' : 'Refresh messages'"><span class="mail-icon" data-icon="refresh" aria-hidden="true"></span></button></header>
       <form class="wm-search-form" role="search" @submit.prevent="search()">
@@ -346,16 +347,17 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       <footer :if="total > messagePageSize" class="wm-pagination"><button @click="turnPage(-1)" :disabled="page <= 1 || loading || mutating"><span class="mail-icon" data-icon="left" aria-hidden="true"></span>Previous</button><span :text="'Page ' + page + ' of ' + Math.max(1, Math.ceil(total / messagePageSize))"></span><button @click="turnPage(1)" :disabled="page * messagePageSize >= total || loading || mutating">Next<span class="mail-icon" data-icon="right" aria-hidden="true"></span></button></footer>
     </section>
     <section :if="senderReviewOpen" class="wm-list wm-review" aria-label="Sender Review">
-      <header class="wm-list-head"><h1 class="wm-list-title">Sender Review</h1><button type="button" class="wm-refresh" @click="refresh()" :disabled="senderReviewLoading || senderReviewSaving">Refresh</button></header>
+      <header class="wm-list-head"><h1 class="wm-list-title">Sender Review</h1><button type="button" class="wm-refresh" @click="refresh()" :disabled="senderReviewLoading || senderReviewSaving" aria-label="Refresh" title="Refresh Sender Review"><span class="mail-icon" data-icon="refresh" aria-hidden="true"></span></button></header>
       <nav class="wm-review-tabs" aria-label="Sender Review views">
         <button type="button" class="wm-action" :aria-pressed="senderReviewView === 'pending'" @click="showSenderReview('pending')" :disabled="senderReviewSaving">Pending</button>
         <button type="button" class="wm-action" :aria-pressed="senderReviewView === 'declined'" @click="showSenderReview('declined')" :disabled="senderReviewSaving">Declined</button>
         <button type="button" class="wm-action" :aria-pressed="senderReviewView === 'decisions'" @click="showSenderReview('decisions')" :disabled="senderReviewSaving">Decisions</button>
+        <button type="button" class="wm-action" :aria-pressed="senderReviewView === 'invitations'" @click="showSenderReview('invitations')" :disabled="senderReviewSaving">Invitations</button>
       </nav>
       <p :if="senderReviewError" class="login-error" role="alert" :text="senderReviewError"></p>
       <div class="wm-list-body" :aria-busy="senderReviewLoading || senderReviewSaving">
         <p :if="senderReviewLoading" class="wm-state" role="status">Loading Sender Review…</p>
-        <p :if="!senderReviewLoading && senderReviewView !== 'decisions' && senderReviewGroups.length === 0" class="wm-state" :text="senderReviewView === 'pending' ? 'No senders are waiting for review.' : 'No declined messages.'"></p>
+        <p :if="!senderReviewLoading && (senderReviewView === 'pending' || senderReviewView === 'declined') && senderReviewGroups.length === 0" class="wm-state" :text="senderReviewView === 'pending' ? 'No senders are waiting for review.' : 'No declined messages.'"></p>
         <p :if="!senderReviewLoading && senderReviewView === 'decisions' && senderReviewRules.length === 0" class="wm-state">No saved sender decisions.</p>
         <article :for="group in senderReviewGroups" class="wm-review-group">
           <header><h2 :text="group.name"></h2><span class="wm-review-badge" :class="{ 'wm-review-badge--unverified': !group.verified }" :text="group.verified ? 'Verified sender' : 'Unverified sender'"></span></header>
@@ -373,6 +375,23 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
             <button type="button" class="wm-action" @click="decideSenderReview('reset', rule)" :disabled="senderReviewLoading || senderReviewSaving">Reset decision</button>
           </div>
         </article>
+        <div :if="senderReviewView === 'invitations'" class="wm-invitations">
+          <form :if="senderReviewStatus?.enabled" class="wm-review-group wm-invitation-form" @submit.prevent="changeSenderInvitation()">
+            <p>Allow verified mail from one address for a limited time. Held mail stays in review. Invited mail skips automatic forwarding.</p>
+            <label>Sender email<input type="email" x-model.trim="invitationAuthor" maxlength="254" required :disabled="senderReviewLoading || senderReviewSaving"></label>
+            <label>Allow for<select x-model="invitationLifetime" :disabled="senderReviewLoading || senderReviewSaving">
+              <option :for="lifetime in linkLifetimes" :key="lifetime.seconds" :value="String(lifetime.seconds)" :text="lifetime.label"></option>
+            </select></label>
+            <button type="submit" class="wm-action calendar-primary" :disabled="senderReviewLoading || senderReviewSaving"><span class="mail-icon" data-icon="clock" aria-hidden="true"></span>Allow temporarily</button>
+          </form>
+          <p :if="!senderReviewStatus?.enabled" class="wm-state">Turn on Sender Review in Account settings to invite a sender.</p>
+          <p :if="invitationNotice" class="wm-invitation-notice" role="status" :text="invitationNotice"></p>
+          <p :if="!senderReviewLoading && senderInvitations.length === 0" class="wm-state">No active invitations.</p>
+          <article :for="invitation in senderInvitations" :key="invitation.id" class="wm-review-group wm-review-rule">
+            <header><h2 :text="invitation.author"></h2><span class="wm-review-badge" :text="'Expires ' + snapshotDate(invitation.expires_at)"></span></header>
+            <div class="wm-review-rule-actions"><button type="button" class="wm-action wm-action--danger" :aria-label="'Revoke invitation for ' + invitation.author" @click="changeSenderInvitation(invitation.id)" :disabled="senderReviewLoading || senderReviewSaving">Revoke</button></div>
+          </article>
+        </div>
       </div>
       <footer :if="senderReviewPage > 1 || senderReviewMore" class="wm-pagination">
         <button type="button" @click="showSenderReview(senderReviewView, senderReviewPage - 1)" :disabled="senderReviewPage <= 1 || senderReviewLoading || senderReviewSaving">Previous</button>
