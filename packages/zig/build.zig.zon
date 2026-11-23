@@ -25,7 +25,7 @@
     .fingerprint = 0x5126ac48155415a8, // Changing this has security and trust implications.
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.17.0-dev",
+    .minimum_zig_version = "0.17.0-dev.1857",
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
@@ -44,6 +44,13 @@
         .zig_cli = .{
             .url = "git+https://github.com/zig-utils/zig-cli.git#d5b6d7cce234514e53073d566696cd2e69ef4836",
             .hash = "zig_cli-0.1.3-18T51LbtAwC1D5ymlw-xAeLSMooNBx2X2gDM4PawGb6c",
+        },
+        .zig_mime = .{
+            // Shared streaming MIME walker, the same parser the scan engine uses.
+            // The registry tarball hashes identically to the git commit
+            // fb6fcb55d8c6ee87f6b620d31f6243d9b545033d (zig-mime v0.1.0).
+            .url = "https://registry.pantry.dev/zig/packages/zig-mime/0.1.0/tarball",
+            .hash = "zig_mime-0.1.0-Hf4nP-Y7AgC8Q-HbcHTUNNDK14bs0dXTxEkeKsRR-AY1",
         },
     },
     .paths = .{
