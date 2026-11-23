@@ -246,7 +246,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     try delivery_retry.start(allocator, &db, cfg.hostname, cfg.extra_local_domains, cfg.delivery_method, cfg.ses_region);
     defer delivery_retry.stop();
     var stop_routing: std.atomic.Value(bool) = .init(false);
-    const recovery_thread = try std.Thread.spawn(.{}, local_routing.runRecovery, .{ allocator, &db, &stop_routing });
+    const recovery_thread = try std.Thread.spawn(.{}, local_routing.runRecovery, .{ allocator, &db, &stop_routing, cfg.junkFolder() });
     defer {
         stop_routing.store(true, .release);
         recovery_thread.join();

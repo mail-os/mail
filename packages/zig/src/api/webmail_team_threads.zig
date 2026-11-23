@@ -82,6 +82,22 @@ pub const schema =
     \\    content_revision TEXT NOT NULL,
     \\    wire_id TEXT NOT NULL
     \\);
+    \\CREATE TABLE IF NOT EXISTS mail_team_smtp_submissions (
+    \\    delivery_id TEXT PRIMARY KEY NOT NULL REFERENCES mail_team_thread_submissions(delivery_id) ON DELETE CASCADE,
+    \\    owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    \\    wire_id TEXT NOT NULL,
+    \\    digest TEXT NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS mail_team_smtp_owner_wire ON mail_team_smtp_submissions(owner_id,wire_id,digest);
+    \\CREATE TABLE IF NOT EXISTS mail_team_smtp_sent_copies (
+    \\    owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    \\    wire_id TEXT NOT NULL,
+    \\    digest TEXT NOT NULL,
+    \\    reference TEXT NOT NULL,
+    \\    observed_at INTEGER NOT NULL,
+    \\    PRIMARY KEY(owner_id,wire_id,digest,reference)
+    \\);
+    \\CREATE INDEX IF NOT EXISTS mail_team_smtp_copy_age ON mail_team_smtp_sent_copies(observed_at);
     \\CREATE TABLE IF NOT EXISTS mail_team_thread_replies (
     \\    share_id TEXT NOT NULL REFERENCES mail_team_thread_follow(share_id) ON DELETE CASCADE,
     \\    reference TEXT NOT NULL,
@@ -178,6 +194,34 @@ pub const check_native_sent_source_sql =
     \\    SELECT 1 FROM json_each(f.authors) WHERE value=d.value COLLATE NOCASE))
     \\AND (SELECT count(*) FROM mail_team_thread_replies p WHERE p.share_id=s.id)<?6
 ++ sent_parent_scope ++ " LIMIT 1";
+
+pub const has_smtp_reply_parent_sql =
+    \\SELECT 1 FROM mail_team_thread_shares s
+    \\JOIN users owner ON owner.id=s.owner_id AND owner.username=?1 AND owner.enabled=1
+    \\JOIN mail_team_thread_follow f ON f.share_id=s.id
+    \\JOIN mail_team_thread_follow_sent opted ON opted.share_id=f.share_id
+    \\JOIN users grantee ON grantee.id=s.grantee_id AND grantee.enabled=1
+    \\WHERE (EXISTS(SELECT 1 FROM json_each(f.anchors) WHERE value=?2)
+    \\    OR EXISTS(SELECT 1 FROM mail_team_thread_replies p WHERE p.share_id=s.id AND p.wire_id=?2))
+    \\AND (SELECT count(*) FROM mail_team_thread_replies p WHERE p.share_id=s.id)<?3 LIMIT 1
+;
+
+// A completed SMTP route may contain unsuccessful recipients. Every primary
+// target must have a durable local file or a confirmed remote delivery.
+pub const smtp_sent_match =
+    \\FROM mail_team_smtp_submissions smtp
+    \\JOIN mail_team_thread_submissions proof ON proof.delivery_id=smtp.delivery_id
+    \\JOIN accepted_mail source ON source.id=proof.delivery_id
+    \\JOIN mail_team_smtp_sent_copies copy ON copy.owner_id=smtp.owner_id
+    \\    AND copy.wire_id=smtp.wire_id AND copy.digest=smtp.digest
+    \\JOIN users owner ON owner.id=smtp.owner_id AND owner.enabled=1
+    \\JOIN mailbox_message_refs r ON r.user_id=owner.id AND r.reference=copy.reference AND r.folder='Sent'
+    \\WHERE source.accepted_at>=?1 AND copy.observed_at>=?1
+    \\AND NOT EXISTS(SELECT 1 FROM mail_team_thread_native_sent n WHERE n.delivery_id=smtp.delivery_id)
+    \\AND EXISTS(SELECT 1 FROM accepted_mail_targets d WHERE d.delivery_id=source.id AND d.is_primary=1)
+    \\AND NOT EXISTS(SELECT 1 FROM accepted_mail_targets d WHERE d.delivery_id=source.id
+    \\    AND d.is_primary=1 AND d.outcome NOT IN ('filed','remote_delivered'))
+;
 
 const authorized =
     \\ FROM mail_team_thread_shares s

@@ -1824,6 +1824,20 @@ pub const Database = struct {
         wire_id: []const u8,
     };
 
+    pub const SmtpSentProof = struct {
+        wire_id: []const u8,
+        digest: [64]u8,
+    };
+
+    pub const SmtpSentMatch = struct {
+        delivery: []const u8,
+        owner: []const u8,
+        digest: []const u8,
+        copy: []const u8,
+        parent: []const u8,
+        parent_revision: []const u8,
+    };
+
     pub const NativeSentReply = struct {
         basename: []const u8,
         stamp: []const u8,
@@ -1962,6 +1976,7 @@ pub const Database = struct {
         ews_draft_send: ?EwsDraftSend = null,
         review_release: ?FiledCopy = null,
         team_reply_submission: ?TeamReplySource = null,
+        smtp_sent_proof: ?SmtpSentProof = null,
         sent_copy_of: ?[]const u8 = null,
         native_sent_reply: ?NativeSentReply = null,
     };
@@ -2046,6 +2061,17 @@ pub const Database = struct {
             try stmt.bind(3, parent.reference);
             try stmt.bind(4, @as([]const u8, &parent.revision));
             try stmt.bind(5, parent.wire_id);
+            _ = try stmt.step();
+        }
+        if (envelope.smtp_sent_proof) |proof| {
+            const stmt = try self.prepareLocked(
+                \\INSERT INTO mail_team_smtp_submissions(delivery_id,owner_id,wire_id,digest)
+                \\SELECT delivery_id,owner_id,?2,?3 FROM mail_team_thread_submissions WHERE delivery_id=?1
+            );
+            defer stmt.finalize();
+            try stmt.bind(1, envelope.id);
+            try stmt.bind(2, proof.wire_id);
+            try stmt.bind(3, @as([]const u8, &proof.digest));
             _ = try stmt.step();
         }
         if (envelope.sent_copy_of) |source| {
@@ -2310,6 +2336,83 @@ pub const Database = struct {
         try stmt.bind(5, recipients);
         try stmt.bind(6, team_threads.max_followed_replies);
         return stmt.step();
+    }
+
+    pub fn hasFollowedSmtpParent(self: *Database, user: []const u8, wire_id: []const u8) !bool {
+        const stmt = try self.prepare(team_threads.has_smtp_reply_parent_sql);
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, wire_id);
+        try stmt.bind(3, team_threads.max_followed_replies);
+        return stmt.step();
+    }
+
+    pub fn recordSmtpSentCopy(self: *Database, user: []const u8, proof: SmtpSentProof, reference: []const u8, observed_at: i64) !void {
+        const stmt = try self.prepare(
+            \\INSERT OR IGNORE INTO mail_team_smtp_sent_copies(owner_id,wire_id,digest,reference,observed_at)
+            \\SELECT id,?2,?3,?4,?5 FROM users WHERE username=?1 AND enabled=1
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, proof.wire_id);
+        try stmt.bind(3, @as([]const u8, &proof.digest));
+        try stmt.bind(4, reference);
+        try stmt.bind(5, observed_at);
+        _ = try stmt.step();
+    }
+
+    pub fn nextSmtpSentMatch(self: *Database, a: std.mem.Allocator, since: i64) !?SmtpSentMatch {
+        const stmt = try self.prepare(
+            \\SELECT smtp.delivery_id,owner.username,smtp.digest,copy.reference,proof.parent_reference,proof.parent_revision
+        ++ " " ++ team_threads.smtp_sent_match ++ " ORDER BY source.accepted_ms,copy.observed_at LIMIT 1");
+        defer stmt.finalize();
+        try stmt.bind(1, since);
+        if (!try stmt.step()) return null;
+        return .{
+            .delivery = try a.dupe(u8, stmt.columnText(0)),
+            .owner = try a.dupe(u8, stmt.columnText(1)),
+            .digest = try a.dupe(u8, stmt.columnText(2)),
+            .copy = try a.dupe(u8, stmt.columnText(3)),
+            .parent = try a.dupe(u8, stmt.columnText(4)),
+            .parent_revision = try a.dupe(u8, stmt.columnText(5)),
+        };
+    }
+
+    pub fn forgetSmtpSentCopy(self: *Database, user: []const u8, reference: []const u8) !void {
+        const stmt = try self.prepare("DELETE FROM mail_team_smtp_sent_copies WHERE owner_id=(SELECT id FROM users WHERE username=?1) AND reference=?2");
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, reference);
+        _ = try stmt.step();
+    }
+
+    pub fn forgetSmtpSentProof(self: *Database, delivery: []const u8) !void {
+        const stmt = try self.prepare("DELETE FROM mail_team_smtp_submissions WHERE delivery_id=?1");
+        defer stmt.finalize();
+        try stmt.bind(1, delivery);
+        _ = try stmt.step();
+    }
+
+    pub fn publishSmtpSentMatch(self: *Database, match: SmtpSentMatch, stamp: []const u8, revision: []const u8, since: i64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.execLocked("BEGIN IMMEDIATE");
+        errdefer self.execLocked("ROLLBACK") catch {};
+        {
+            const stmt = try self.prepareLocked(
+                \\INSERT INTO mail_team_thread_native_sent(delivery_id,reference,content_revision,wire_id)
+                \\SELECT smtp.delivery_id,copy.reference,?5,smtp.wire_id
+            ++ " " ++ team_threads.smtp_sent_match ++ " AND smtp.delivery_id=?2 AND r.reference=?3 AND r.file_stamp=?4");
+            defer stmt.finalize();
+            try stmt.bind(1, since);
+            try stmt.bind(2, match.delivery);
+            try stmt.bind(3, match.copy);
+            try stmt.bind(4, stamp);
+            try stmt.bind(5, revision);
+            _ = try stmt.step();
+        }
+        try self.publishNativeSentReplyLocked(match.delivery);
+        try self.execLocked("COMMIT");
     }
 
     pub fn hasFiledDelivery(self: *Database, id: []const u8) !bool {
@@ -3421,6 +3524,13 @@ pub const Database = struct {
         defer stmt.finalize();
         try stmt.bind(1, before);
         _ = try stmt.step();
+        const copies = try self.prepareLocked(
+            \\DELETE FROM mail_team_smtp_sent_copies WHERE rowid IN (
+            \\    SELECT rowid FROM mail_team_smtp_sent_copies WHERE observed_at<?1 LIMIT 500)
+        );
+        defer copies.finalize();
+        try copies.bind(1, before);
+        _ = try copies.step();
         const ews = try self.prepareLocked(
             \\DELETE FROM mail_ews_draft_finalizations WHERE rowid IN (
             \\ SELECT c.rowid FROM mail_ews_draft_finalizations c WHERE c.retired_at<?1

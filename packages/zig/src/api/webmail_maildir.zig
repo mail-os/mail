@@ -994,13 +994,19 @@ fn matchesStamp(a: std.mem.Allocator, file: FileRef, stamp: []const u8) !bool {
     return std.mem.eql(u8, stamp, actual);
 }
 
-const ReferencedFile = struct {
+pub const ReferencedFile = struct {
     file: FileRef,
     folder: []const u8,
     path: []const u8,
     stamp: []const u8,
     raw: []const u8,
 };
+
+/// Read a tracked file while the caller holds the mailbox lock. This avoids
+/// assigning IMAP UIDs when only the saved content and location are needed.
+pub fn resolveReferenceFileLocked(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8) !ReferencedFile {
+    return resolveReferenceFile(a, db, user, id, null);
+}
 
 fn resolveReferenceFile(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8, history: ?*HistoryFolder) !ReferencedFile {
     if (!message_refs.valid(id)) return MaildirError.MessageNotFound;
@@ -1032,7 +1038,7 @@ fn resolveReferenceFile(a: std.mem.Allocator, db: *database.Database, user: []co
 }
 
 pub fn resolveVersioned(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8) !VersionedFile {
-    const entry = try resolveReferenceFile(a, db, user, id, null);
+    const entry = try resolveReferenceFileLocked(a, db, user, id);
     _ = try db.getOrCreateMailbox(user, entry.folder);
     preassignUids(db, user, entry.folder, try collectFiles(a, user, entry.folder));
     const uid = (try db.getUidForFile(user, entry.folder, entry.file.name)) orelse return MaildirError.MessageNotFound;

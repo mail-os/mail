@@ -689,18 +689,27 @@ Earlier mail, automatic responses, and attachments in later replies stay in
 the owner's mailbox. A teammate with browser notifications enabled can receive
 a generic notice. Mail checks access again when the browser claims the notice.
 
-Enable **Include my sent replies** to share text previews of your webmail and
-ActiveSync SmartReply messages to those verified senders. Reply from a message
-already in the share, address only those senders in To or Cc, and send as usual. A reply appears
-when Mail files its Sent copy after successful submission. Both
-directions count toward the same 40-reply limit. Sent drafts, imported copies,
-and automatic replies stay private. Mail sends a generic notice only to an
-opted-in teammate outside the reply's delivery recipients.
+Enable **Include my sent replies** to share text previews of replies to those
+verified senders. Reply from a message already in the share and address only
+those senders in To or Cc. Both directions count toward the same 40-reply limit.
+Sent drafts, automatic replies, and messages with Bcc stay private. Mail sends
+a generic notice only to an opted-in teammate outside the reply's delivery
+recipients.
 
 In ActiveSync, use SmartReply with a saved Sent copy. Mail checks the source
 item in your mailbox and adds missing message and reply identifiers when the
 reply qualifies for the grant. The share updates once delivery is accepted and
 the Sent copy is recorded. Replays use the original send receipt and keep one copy.
+
+EWS reply actions use the original item ID and require a saved Sent copy.
+For SMTP, sign in as the mailbox and send from its primary address. Your
+client can append the reply to that mailbox's IMAP Sent folder before or after
+submission. Mail matches the submitted MIME to the filed copy, allowing
+transport line-ending differences. The reply appears after every recipient's
+delivery is confirmed and Mail can resolve the parent Message-ID to one
+approved original. Ambiguous parents, rewritten copies, and copies without a
+matching submission stay private. Mail can match the two observations for up
+to seven days.
 
 Shared conversations show the original subject, sender, date, and plain text.
 Private notes and hidden envelope fields stay in the owner's mailbox.

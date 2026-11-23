@@ -7,6 +7,7 @@ const config_mod = @import("../core/config.zig");
 const db_mod = @import("../storage/database.zig");
 const durable = @import("../core/durable_maildir.zig");
 const ews_drafts = @import("ews_drafts.zig");
+const smtp_sent_replies = @import("smtp_sent_replies.zig");
 const forwarding = @import("../message/forwarding.zig");
 const vacation = @import("../message/vacation.zig");
 const fs = @import("../core/fs_compat.zig");
@@ -422,12 +423,14 @@ fn fileTarget(a: Allocator, target: Database.PendingDelivery, filename: []const 
     return file;
 }
 
-pub fn runRecovery(allocator: Allocator, db: *Database, shutdown: *std.atomic.Value(bool)) void {
+pub fn runRecovery(allocator: Allocator, db: *Database, shutdown: *std.atomic.Value(bool), junk_folder: []const u8) void {
     var sweep_at: i64 = 0;
     while (!shutdown.load(.acquire)) {
         drain(allocator, db, null, 100) catch |err| std.log.err("local delivery recovery failed: {}", .{err});
         ews_drafts.finalize(allocator, db, null) catch |err| std.log.warn("EWS draft recovery failed: {}", .{err});
         const now = time.timestamp();
+        smtp_sent_replies.reconcile(allocator, db, now - 7 * 86400, junk_folder) catch |err|
+            std.log.warn("could not reconcile a client-filed SMTP reply: {}", .{err});
         if (now >= sweep_at) {
             db.sweepDeliveryJournal(now - 7 * 86400) catch |err| std.log.warn("could not prune local delivery receipts: {}", .{err});
             sweep_at = now + 60;

@@ -28,7 +28,9 @@ pub const Headers = struct {
     reply_parent: ?[]const u8 = null,
     automatic: bool = false,
     message_id_fields: usize = 0,
+    message_ids: usize = 0,
     reply_fields: usize = 0,
+    direct_reply_parent: ?[]const u8 = null,
 
     pub fn keys(self: Headers, a: std.mem.Allocator) ![]const []const u8 {
         const own = self.own orelse return self.parents;
@@ -51,8 +53,9 @@ pub fn parse(a: std.mem.Allocator, raw: []const u8) !Headers {
     var last_reference: ?[]const u8 = null;
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line| {
+        if (line.len == 0 or std.mem.eql(u8, line, "\r")) break;
         const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len == 0) break;
+        if (trimmed.len == 0) continue;
         var value = trimmed;
         if (line[0] != ' ' and line[0] != '\t') {
             field = .ignore;
@@ -70,11 +73,12 @@ pub fn parse(a: std.mem.Allocator, raw: []const u8) !Headers {
             if (std.ascii.eqlIgnoreCase(name, "References")) field = .reference;
             if (std.ascii.eqlIgnoreCase(name, "Auto-Submitted")) field = .automatic;
         }
-        var ids: Iterator = .{ .text = value };
+        var ids: Iterator = .{ .text = value, .remaining = value.len };
         switch (field) {
             .ignore => {},
-            .own => if (result.own == null) {
-                result.own = ids.next();
+            .own => while (ids.next()) |id| {
+                result.message_ids += 1;
+                if (result.own == null) result.own = id;
             },
             .reply, .reference => while (parents.items.len < 64) {
                 const id = ids.next() orelse break;
@@ -93,8 +97,32 @@ pub fn parse(a: std.mem.Allocator, raw: []const u8) !Headers {
         }
     }
     result.parents = try parents.toOwnedSlice(a);
+    result.direct_reply_parent = if (multiple_parents or result.parents.len == 64) null else direct_parent;
     result.reply_parent = if (multiple_parents or result.parents.len == 64) null else direct_parent orelse last_reference;
     return result;
+}
+
+/// Check all top-level Message-ID fields, including duplicates on malformed
+/// imports that cannot themselves be selected as a reply parent.
+pub fn containsOwnId(raw: []const u8, target: []const u8) bool {
+    var in_id = false;
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 or std.mem.eql(u8, line, "\r")) break;
+        const value = std.mem.trim(u8, line, " \t\r");
+        if (value.len == 0) continue;
+        var ids: Iterator = .{ .text = value, .remaining = value.len };
+        if (line[0] != ' ' and line[0] != '\t') {
+            in_id = false;
+            const colon = std.mem.indexOfScalar(u8, value, ':') orelse continue;
+            in_id = std.ascii.eqlIgnoreCase(value[0..colon], "Message-ID");
+            ids.text = value[colon + 1 ..];
+        }
+        if (in_id) while (ids.next()) |id| {
+            if (std.mem.eql(u8, id, target)) return true;
+        };
+    }
+    return false;
 }
 
 pub fn fromFields(a: std.mem.Allocator, own: []const u8, parent: []const u8, references: []const u8) !Headers {

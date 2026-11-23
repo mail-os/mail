@@ -3,7 +3,7 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from email.message import EmailMessage
 from email import policy
 from email.parser import BytesParser
@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import runpy
 import secrets
+import sqlite3
 import sys
 import tempfile
 import time
@@ -249,19 +250,26 @@ def verify_sent_replies(fixture, call, download, claim, owner, peer, witness, ou
     compose("Outbox sent reply", sendId=queued_id, delaySeconds=0)
     assert fixture.outbox(own, queued_id, "sent")["result"]["sent_saved"]
     assert published(outgoing, "Outbox sent reply")[0]["sentReply"]
-    for start in range(0, 37, 10):
+    for start in range(0, 36, 10):
         with fixture.smtp(witness) as connection:
-            for index in range(start, min(start + 10, 37)):
+            for index in range(start, min(start + 10, 36)):
                 extra = EmailMessage()
                 extra["From"], extra["To"] = witness, owner
                 extra["Subject"], extra["In-Reply-To"] = f"Reply limit fixture {index}", parent
                 extra["Message-ID"] = f"<reply-limit-{index}@threads.example.test>"
                 extra.set_content("A verified incoming reply.")
                 assert connection.send_message(extra) == {}
+    last_reply = smtp_reply(owner, [witness], "smtp-reply-at-limit", parent="reply-to-owner-sent")
+    submit_smtp_reply(fixture, owner, [witness], last_reply)
+    file_smtp_reply(fixture, owner, last_reply)
+    assert wait_for_shared_subject(fixture, other, outgoing, "smtp-reply-at-limit")["sentReply"]
     at_limit = call(other, outgoing)
     assert len(at_limit["messages"]) == 41 and at_limit["grant"]["replyLimitReached"]
+    over_limit = smtp_reply(owner, [witness], "smtp-reply-past-limit", parent="reply-to-owner-sent")
+    submit_smtp_reply(fixture, owner, [witness], over_limit)
+    file_smtp_reply(fixture, owner, over_limit)
     assert compose("Sent past the reply limit")["sent_saved"]
-    assert published(outgoing, "Sent past the reply limit") == []
+    assert len(call(other, outgoing)["messages"]) == 41
     call(own, outgoing, method="DELETE")
     assert claim(other) == 0
     assert compose("Reply after revoke")["sent_saved"]
@@ -285,6 +293,152 @@ def share_smart_reply(fixture, own, teammate, root, follow_sent):
     preview = expect(fixture.api(own, SHARES + "/preview", selection))
     grant = expect(fixture.api(own, SHARES, {**selection, "team": "native", "grantee": teammate, "digest": preview["digest"]}), 201)
     return f"{SHARES}/{grant['id']}"
+
+
+def smtp_reply(owner, recipients, key, *, parent="native-parent", bcc=None, attachment=False):
+    message = EmailMessage(policy=policy.SMTP)
+    message["From"], message["To"] = owner, ", ".join(recipients)
+    message["Subject"] = key
+    message["Message-ID"] = f"<{key}@threads.example.test>"
+    message["In-Reply-To"] = f"<{parent}@threads.example.test>"
+    if bcc:
+        message["Bcc"] = bcc
+    message.set_content(f"Submitted content for {key}.")
+    if attachment:
+        message.add_attachment(FILE, maintype="application", subtype="octet-stream", filename="private.bin")
+    return message.as_bytes()
+
+
+def submit_smtp_reply(fixture, sender, recipients, raw, *, chunked=False):
+    with fixture.smtp(sender) as connection:
+        if not chunked:
+            assert connection.sendmail(sender, recipients, raw) == {}
+            return
+        assert connection.mail(sender)[0] == 250
+        for recipient in recipients:
+            assert connection.rcpt(recipient)[0] == 250
+        for remaining, chunk in enumerate((raw[:len(raw) // 2], raw[len(raw) // 2:])):
+            suffix = " LAST" if remaining else ""
+            connection.send(f"BDAT {len(chunk)}{suffix}\r\n".encode() + chunk)
+            assert connection.getreply()[0] == 250
+
+
+def file_smtp_reply(fixture, owner, raw, *, folder="Sent", flags=r"(\Seen)"):
+    with fixture.imap(owner) as mailbox:
+        if mailbox.select(folder)[0] != "OK":
+            assert mailbox.create(folder)[0] == "OK"
+        assert mailbox.append(folder, flags, None, raw)[0] == "OK"
+
+
+def wait_for_shared_subject(fixture, session, path, subject):
+    deadline = time.monotonic() + 7
+    while time.monotonic() < deadline:
+        messages = expect(fixture.api(session, path))["messages"]
+        for message in messages:
+            if message["subject"] == subject:
+                return message
+        time.sleep(.1)
+    raise AssertionError(f"Shared SMTP reply did not appear: {subject}")
+
+
+def verify_smtp_sent_replies(fixture):
+    with fixture.daemon():
+        owner, teammate, author, outsider = (fixture.provision("smtp-" + name) for name in ("owner", "viewer", "author", "outsider"))
+        own, peer, root = smart_reply_parent(fixture, owner, teammate, author)
+        shared = share_smart_reply(fixture, own, teammate, root, True)
+        inbound_only = share_smart_reply(fixture, own, teammate, root, False)
+
+        # Record the SMTP and IMAP halves in both orders with a real restart.
+        submitted_first = smtp_reply(owner, [author], "smtp-submitted-first", attachment=True)
+        filed_first = smtp_reply(owner, [author], "smtp-filed-first")
+        submit_smtp_reply(fixture, owner, [author], submitted_first)
+        file_smtp_reply(fixture, owner, filed_first)
+        assert [msg["reference"] for msg in expect(fixture.api(peer, shared))["messages"]] == [root["reference"]]
+
+    with fixture.daemon():
+        own, peer, foreign = (fixture.login(address) for address in (owner, teammate, outsider))
+        wrong_body = submitted_first.replace(b"Submitted content", b"Different content", 1)
+        assert wrong_body != submitted_first
+        file_smtp_reply(fixture, owner, wrong_body)
+        submit_smtp_reply(fixture, owner, [author], filed_first)
+        first = wait_for_shared_subject(fixture, peer, shared, "smtp-filed-first")
+        assert first["sentReply"]
+        assert {msg["subject"] for msg in expect(fixture.api(peer, shared))["messages"]} == {
+            "Follow fixture native-parent", "smtp-filed-first",
+        }
+        assert fixture.api(foreign, shared)[0] == 404
+
+        for key, visible, recipients, bcc in (
+            ("smtp-hidden-recipient", [author], [author, outsider], None),
+            ("smtp-bcc-header", [author], [author], outsider),
+            ("smtp-outside-scope", [outsider], [outsider], None),
+        ):
+            raw = smtp_reply(owner, visible, key, bcc=bcc)
+            submit_smtp_reply(fixture, owner, recipients, raw)
+            file_smtp_reply(fixture, owner, raw)
+
+        forged = smtp_reply(owner, [author], "smtp-unauthenticated")
+        with fixture.smtp() as connection:
+            assert connection.sendmail("external@example.test", [author], forged) == {}
+        file_smtp_reply(fixture, owner, forged)
+
+        duplicate = EmailMessage(policy=policy.SMTP)
+        duplicate["From"], duplicate["To"] = author, owner
+        duplicate["Subject"] = "Another original"
+        duplicate["Message-ID"] = "<native-parent@threads.example.test>"
+        duplicate.set_content("This is a different original with the same wire identifier.")
+        file_smtp_reply(fixture, owner, duplicate.as_bytes(), folder="Archive")
+        ambiguous = smtp_reply(owner, [author], "smtp-ambiguous-parent")
+        submit_smtp_reply(fixture, owner, [author], ambiguous)
+        file_smtp_reply(fixture, owner, ambiguous)
+        with fixture.imap(owner) as mailbox:
+            assert mailbox.select("Archive")[0] == "OK"
+            assert mailbox.store("1", "+FLAGS", r"(\Deleted)")[0] == "OK"
+            assert mailbox.expunge()[0] == "OK"
+
+        # An exact copy outside Sent or marked as a draft cannot publish.
+        file_smtp_reply(fixture, owner, submitted_first, folder="Drafts")
+        file_smtp_reply(fixture, owner, submitted_first, flags=r"(\Draft)")
+        chain = smtp_reply(owner, [author], "smtp-chain", parent="smtp-filed-first")
+        submit_smtp_reply(fixture, owner, [author], chain, chunked=True)
+        file_smtp_reply(fixture, owner, chain)
+        assert wait_for_shared_subject(fixture, peer, shared, "smtp-chain")["sentReply"]
+        assert {msg["subject"] for msg in expect(fixture.api(peer, shared))["messages"]} == {
+            "Follow fixture native-parent", "smtp-filed-first", "smtp-chain",
+        }
+        assert expect(fixture.api(peer, "notifications/claim", method="POST"))["teamReplies"] == 2
+
+        file_smtp_reply(fixture, owner, submitted_first)
+        matched = wait_for_shared_subject(fixture, peer, shared, "smtp-submitted-first")
+        assert matched["sentReply"] and matched["attachments"] == []
+        assert fixture.api(peer, f"{shared}/attachments/{matched['reference']}/0")[0] == 404
+
+        # SMTP retransmission and repeat filing cannot duplicate the preview
+        # or notice. A subsequent accepted reply lets the worker drain both.
+        submit_smtp_reply(fixture, owner, [author], submitted_first)
+        file_smtp_reply(fixture, owner, submitted_first)
+        barrier = smtp_reply(owner, [author], "smtp-after-retry")
+        submit_smtp_reply(fixture, owner, [author], barrier)
+        file_smtp_reply(fixture, owner, barrier)
+        wait_for_shared_subject(fixture, peer, shared, "smtp-after-retry")
+        assert [msg["subject"] for msg in expect(fixture.api(peer, shared))["messages"]].count("smtp-submitted-first") == 1
+        assert expect(fixture.api(peer, "notifications/claim", method="POST"))["teamReplies"] == 2
+        assert len(expect(fixture.api(peer, inbound_only))["messages"]) == 1
+
+        revoked = smtp_reply(owner, [author], "smtp-after-revocation")
+        submit_smtp_reply(fixture, owner, [author], revoked)
+        expect(fixture.api(own, shared, method="DELETE"))
+        renewed = share_smart_reply(fixture, own, teammate, root, True)
+        file_smtp_reply(fixture, owner, revoked)
+        current = smtp_reply(owner, [author], "smtp-after-renewal")
+        submit_smtp_reply(fixture, owner, [author], current)
+        file_smtp_reply(fixture, owner, current)
+        wait_for_shared_subject(fixture, peer, renewed, "smtp-after-renewal")
+        assert fixture.api(peer, shared)[0] == 404
+        assert {msg["subject"] for msg in expect(fixture.api(peer, renewed))["messages"]} == {
+            "Follow fixture native-parent", "smtp-after-renewal",
+        }
+        assert expect(fixture.api(peer, "notifications/claim", method="POST"))["teamReplies"] == 1
 
 
 def verify_ews_reply(fixture):
@@ -500,7 +654,9 @@ def verify_remote_client_replies(fixture):
     fixture.env["SMTP_LOCAL_DOMAINS"] += ",remote.example.test"
     command(fixture, "user:local", "create", author, fixture.password, author)
     with fixture.daemon():
-        owner, teammate = (fixture.provision(name) for name in ("remote-reply-owner", "remote-reply-viewer"))
+        owner, teammate, local_author = (fixture.provision(name) for name in (
+            "remote-reply-owner", "remote-reply-viewer", "remote-reply-local-partner",
+        ))
         own, _, root = smart_reply_parent(fixture, owner, teammate, author)
         share = share_smart_reply(fixture, own, teammate, root, True)
 
@@ -518,6 +674,15 @@ assert payload["Destinations"] == ["{author}"]
 mime = base64.b64decode(payload["RawMessage"]["Data"])
 if b"Subject: Remote refused" in mime:
     sys.exit(1)
+if b"Subject: smtp-remote-refused" in mime:
+    sys.exit(1)
+if b"Subject: smtp-remote-confirmed" in mime:
+    Path("smtp-remote-pending").touch()
+    for _ in range(160):
+        if Path("smtp-remote-confirm").exists():
+            sys.exit(0)
+        time.sleep(.05)
+    sys.exit(2)
 if b"Subject: Remote EWS draft" in mime:
     with Path("ews-attempts").open("a") as attempts:
         attempts.write("1\\n")
@@ -633,13 +798,78 @@ sys.exit(2)
         assert expect(fixture.api(peer, "notifications/claim", method="POST"))["teamReplies"] == 1
 
     with fixture.daemon():
-        peer = fixture.login(teammate)
+        own, peer = (fixture.login(address) for address in (owner, teammate))
         restored = expect(fixture.api(peer, share))["messages"]
         assert {msg["subject"] for msg in restored} == {"Follow fixture native-parent", "Remote confirmed", "Remote EWS draft", "Remote EWS edited"}
         ews["check"](fixture, owner, send_ews, "NoError")
         assert fixture.count(owner) == charged + 2 and (directory / "ews-attempts").read_text() == "1\n"
+
+        send(fixture, owner, local_author, "native-local-parent", parent="native-parent")
+        local_root, = expect(fixture.api(own, "messages?conversations=false&q=native-local-parent"))["items"]
+        selection = {
+            "references": [root["reference"], local_root["reference"]],
+            "followReplies": True, "followSentReplies": True,
+        }
+        preview = expect(fixture.api(own, SHARES + "/preview", selection))
+        assert set(preview["followingAuthors"]) == {author, local_author}
+        grant = expect(fixture.api(own, SHARES, {
+            **selection, "team": "native", "grantee": teammate, "digest": preview["digest"],
+        }), 201)
+        share = f"{SHARES}/{grant['id']}"
+        recipients = [author, local_author]
+        remote = smtp_reply(owner, recipients, "smtp-remote-confirmed")
+        file_smtp_reply(fixture, owner, remote)
+        submit_smtp_reply(fixture, owner, recipients, remote)
+        try:
+            deadline = time.monotonic() + 7
+            while not (directory / "smtp-remote-pending").exists() and time.monotonic() < deadline:
+                time.sleep(.05)
+            assert (directory / "smtp-remote-pending").exists()
+            assert "smtp-remote-confirmed" not in {msg["subject"] for msg in expect(fixture.api(peer, share))["messages"]}
+            assert expect(fixture.api(peer, "notifications/claim", method="POST")).get("teamReplies", 0) == 0
+        finally:
+            (directory / "smtp-remote-confirm").touch()
+        assert wait_for_shared_subject(fixture, peer, share, "smtp-remote-confirmed")["sentReply"]
+        assert expect(fixture.api(peer, "notifications/claim", method="POST"))["teamReplies"] == 1
+
+        refused = smtp_reply(owner, recipients, "smtp-remote-refused")
+        file_smtp_reply(fixture, owner, refused)
+        submit_smtp_reply(fixture, owner, recipients, refused)
+        with closing(sqlite3.connect(directory / "smtp.db")) as db:
+            route, = db.execute("SELECT delivery_id FROM mail_team_smtp_submissions WHERE wire_id=?",
+                                ("<smtp-remote-refused@threads.example.test>",)).fetchone()
+            deadline = time.monotonic() + 7
+            retry = None
+            while time.monotonic() < deadline:
+                retry = db.execute("SELECT id FROM message_queue WHERE id LIKE ? AND attempts=1 AND status='retry'",
+                                   (f"route-{route}-%",)).fetchone()
+                if retry:
+                    break
+                time.sleep(.05)
+            assert retry, "The failed provider attempt must remain queued for retry"
+            assert set(db.execute("SELECT recipient,outcome FROM accepted_mail_targets WHERE delivery_id=? AND is_primary=1",
+                                  (route,))) == {(local_author, "filed"), (author, "queued")}
+            assert "smtp-remote-refused" not in {msg["subject"] for msg in expect(fixture.api(peer, share))["messages"]}
+
+    # Advance the persisted deadline while the worker is stopped. On startup
+    # it must restore the retry and record an actual terminal provider failure.
+    with closing(sqlite3.connect(directory / "smtp.db")) as db:
+        db.execute("UPDATE message_queue SET next_retry=0,max_attempts=2 WHERE id=?", retry)
+        db.commit()
+    with fixture.daemon():
+        peer = fixture.login(teammate)
+        with closing(sqlite3.connect(directory / "smtp.db")) as db:
+            deadline = time.monotonic() + 7
+            while time.monotonic() < deadline:
+                outcome, = db.execute("SELECT outcome FROM accepted_mail_targets WHERE delivery_id=? AND is_primary=1 AND recipient=?",
+                                      (route, author)).fetchone()
+                if outcome == "remote_failed":
+                    break
+                time.sleep(.05)
+            assert outcome == "remote_failed"
+        assert "smtp-remote-refused" not in {msg["subject"] for msg in expect(fixture.api(peer, share))["messages"]}
         assert expect(fixture.api(peer, "notifications/claim", method="POST")).get("teamReplies", 0) == 0
-    print("Verified remote SmartReply and EWS delivery confirmation, refusal, replay, and restart.")
+    print("Verified remote SmartReply, EWS, and SMTP delivery confirmation, refusal, replay, and restart.")
 
 
 def verify(fixture):
@@ -819,7 +1049,9 @@ def main():
         verify_remote_client_replies(Fixture(args.binary.resolve(strict=True), Path(directory), staging=True))
     with tempfile.TemporaryDirectory(prefix="mail-team-ews-reply-") as directory:
         verify_ews_reply(Fixture(args.binary.resolve(strict=True), Path(directory), staging=True))
-    print("Verified team conversations, followed incoming, webmail, ActiveSync, and EWS replies, live collections, previews, search, downloads, comments, notices, and revocation.")
+    with tempfile.TemporaryDirectory(prefix="mail-team-smtp-sent-") as directory:
+        verify_smtp_sent_replies(Fixture(args.binary.resolve(strict=True), Path(directory), staging=True))
+    print("Verified team conversations, followed incoming, webmail, ActiveSync, EWS, and SMTP replies, live collections, previews, search, downloads, comments, notices, and revocation.")
 
 
 if __name__ == "__main__":

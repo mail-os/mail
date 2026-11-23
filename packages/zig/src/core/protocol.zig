@@ -23,6 +23,8 @@ const routing = @import("../delivery/local_routing.zig");
 const database = @import("../storage/database.zig");
 const maildir_path = @import("maildir_path.zig");
 const submission_headers = @import("../message/submission.zig");
+const smtp_sent = @import("../message/smtp_sent.zig");
+const sent_replies = @import("../delivery/smtp_sent_replies.zig");
 
 fn shouldRunInboundPipeline(authenticated: bool, antispam_check: bool, spam_filter_enabled: bool) bool {
     return !authenticated and (antispam_check or spam_filter_enabled);
@@ -1878,6 +1880,9 @@ pub const Session = struct {
             self.resetTransactionState();
             return;
         }
+        var sent_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer sent_arena.deinit();
+        const sent = self.captureSentEvidence(sent_arena.allocator(), message_data.items);
         self.stampAcceptedMessage(&message_data);
 
         // === Inbound authentication: SPF/DKIM/DMARC/ARC ===
@@ -1922,7 +1927,7 @@ pub const Session = struct {
 
         // Save the message. Spam that scored into the Junk band is delivered to
         // the recipient's Junk mailbox instead of the inbox.
-        if (!try self.saveScannedMessage(writer, &message_data, to_junk, verified_author)) return;
+        if (!try self.saveScannedMessage(writer, &message_data, to_junk, verified_author, sent)) return;
 
         const sender_str: []const u8 = self.mail_from orelse "unknown";
         const safe_sender = sanitizeForLog(sender_str);
@@ -2206,6 +2211,9 @@ pub const Session = struct {
                     self.resetTransactionState();
                     return;
                 }
+                var sent_arena = std.heap.ArenaAllocator.init(self.allocator);
+                defer sent_arena.deinit();
+                const sent = self.captureSentEvidence(sent_arena.allocator(), msg_buf.items);
                 self.stampAcceptedMessage(&msg_buf);
                 if (shouldRunInboundPipeline(
                     self.authenticated,
@@ -2239,7 +2247,7 @@ pub const Session = struct {
                     }
                 }
 
-                if (!try self.saveScannedMessage(writer, &msg_buf, to_junk, verified_author)) return;
+                if (!try self.saveScannedMessage(writer, &msg_buf, to_junk, verified_author, sent)) return;
 
                 self.logger.logMessageReceived(
                     self.mail_from orelse "unknown",
@@ -2669,9 +2677,16 @@ pub const Session = struct {
         }
     }
 
+    fn captureSentEvidence(self: *Session, a: std.mem.Allocator, raw: []const u8) ?smtp_sent.Evidence {
+        if (!self.authenticated) return null;
+        const db = self.delivery_db orelse return null;
+        const user = self.authenticated_username orelse return null;
+        return sent_replies.capture(a, db, user, raw, self.rcpt_to.items) catch null;
+    }
+
     /// The final intake step shared by DATA and BDAT LAST. A refusal happens
     /// before mail is published, queued, or charged against a hosted allowance.
-    fn saveScannedMessage(self: *Session, writer: anytype, message: *std.ArrayList(u8), to_junk: bool, verified_author: bool) !bool {
+    fn saveScannedMessage(self: *Session, writer: anytype, message: *std.ArrayList(u8), to_junk: bool, verified_author: bool, sent: ?smtp_sent.Evidence) !bool {
         if (self.scanner) |scanner| {
             const accepted = self.scanIncoming(writer, scanner, message) catch |err| switch (err) {
                 error.OutOfMemory => blk: {
@@ -2686,7 +2701,7 @@ pub const Session = struct {
                 return false;
             }
         }
-        self.saveMessage(message.items, to_junk, verified_author) catch |err| {
+        self.saveMessage(message.items, to_junk, verified_author, sent) catch |err| {
             try self.sendSaveError(writer, err);
             self.resetTransactionState();
             return false;
@@ -2725,7 +2740,7 @@ pub const Session = struct {
         return false;
     }
 
-    fn saveMessage(self: *Session, data: []const u8, to_junk: bool, verified_author: bool) !void {
+    fn saveMessage(self: *Session, data: []const u8, to_junk: bool, verified_author: bool, sent: ?smtp_sent.Evidence) !void {
         const db = self.delivery_db orelse return error.DatabaseUnavailable;
         const sender = self.mail_from orelse "";
         const id = routing.newId();
@@ -2762,6 +2777,11 @@ pub const Session = struct {
             }
             const now = time_compat.timestamp();
             try plan.vacationReplies(primary_count, sender, self.config.hostname, &self.config, identity, now);
+            const parent = blk: {
+                const proof = sent orelse break :blk null;
+                const user = self.authenticated_username orelse break :blk null;
+                break :blk sent_replies.source(a, db, user, proof.parent, self.rcpt_to.items, plan.junk_folder) catch null;
+            };
             try db.acceptDelivery(.{
                 .id = &id,
                 .from = sender,
@@ -2774,6 +2794,8 @@ pub const Session = struct {
                 .targets = plan.targets.items,
                 .sender = self.authenticated_username,
                 .charge_recipients = self.rcpt_to.items.len,
+                .team_reply_submission = parent,
+                .smtp_sent_proof = if (parent != null) .{ .wire_id = sent.?.wire_id, .digest = sent.?.digest } else null,
             });
         }
         routing.publish(self.allocator, db, &id);
@@ -3072,7 +3094,7 @@ test "security: Maildir writes reject traversal from recipients and forwards" {
     defer h.destroy();
     h.session.mail_from = try a.dupe(u8, "sender@example.com");
     try h.session.rcpt_to.append(a, try a.dupe(u8, "../escape@test.local"));
-    try std.testing.expectError(error.InvalidMailboxPath, h.session.saveMessage("subject: test\n\nbody", false, false));
+    try std.testing.expectError(error.InvalidMailboxPath, h.session.saveMessage("subject: test\n\nbody", false, false, null));
     var plan: routing.Plan = .{ .allocator = a, .db = h.session.delivery_db.?, .bytes = 4 };
     try std.testing.expectError(error.InvalidMailboxPath, plan.addLocal(.{ .recipient = "../escape@test.local", .mailbox = "../escape", .folder = "new" }));
 }

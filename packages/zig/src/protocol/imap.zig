@@ -16,6 +16,7 @@ const search = @import("imap_search.zig");
 const hosted_limits = @import("../storage/hosted_limits.zig");
 const maildir_keywords = @import("../storage/maildir_keywords.zig");
 const message_refs = @import("../storage/message_refs.zig");
+const sent_replies = @import("../delivery/smtp_sent_replies.zig");
 const durable_maildir = @import("../core/durable_maildir.zig");
 const fs_compat = @import("../core/fs_compat.zig");
 const database = @import("../storage/database.zig");
@@ -2074,7 +2075,7 @@ pub const ImapSession = struct {
             flags.system.seen = true;
         }
         const internal_date = self.append_internal_date orelse time_compat.timestamp();
-        const filepath = self.writeAppend(username, folder_dir, &flags, data[0..size], internal_date) catch |err|
+        const filepath = self.writeAppend(username, mailbox, folder_dir, &flags, data[0..size], internal_date) catch |err|
             return self.sendMaildirWriteError(tag, err);
         defer self.allocator.free(filepath);
 
@@ -2135,7 +2136,7 @@ pub const ImapSession = struct {
         }
     }
 
-    fn writeAppend(self: *ImapSession, user: []const u8, dir: []const u8, flags: *const FlagList, raw: []const u8, date: i64) ![]u8 {
+    fn writeAppend(self: *ImapSession, user: []const u8, mailbox: []const u8, dir: []const u8, flags: *const FlagList, raw: []const u8, date: i64) ![]u8 {
         const db = self.auth_backend.db;
         db.lockMailboxes();
         defer db.unlockMailboxes();
@@ -2154,6 +2155,12 @@ pub const ImapSession = struct {
         const path = try self.allocUniqueMaildirPath(dir, resolved.toSuffix(&suffix), date);
         errdefer self.allocator.free(path);
         try durable_maildir.writeWithMtime(self.allocator, path, raw, date);
+        if (std.mem.eql(u8, mailbox, "Sent") and !resolved.deleted and !resolved.draft) {
+            var scratch = std.heap.ArenaAllocator.init(self.allocator);
+            defer scratch.deinit();
+            sent_replies.observeCopy(scratch.allocator(), db, user, path, raw) catch |err|
+                std.log.warn("could not record a client-filed Sent copy: {}", .{err});
+        }
         return path;
     }
 
