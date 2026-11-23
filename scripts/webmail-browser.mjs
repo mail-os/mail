@@ -1549,6 +1549,7 @@ async function calendarSharingJourney(captain) {
   for (const picker of await shareForm.getByRole('combobox').all()) await verifySelectedOptionFits(picker)
   assert(await button(shareForm, 'Share calendar').evaluate(node => node.scrollWidth <= node.clientWidth),
     'The Share calendar label and icon fit at the start of the tablet layout')
+  await shareForm.screenshot({ path: join(output, 'tablet-701-calendar-sharing-dark.png'), animations: 'disabled' })
   await captain.setViewportSize({ width: 1440, height: 940 })
   await captain.emulateMedia({ colorScheme: 'light' })
   await screenshot(captain, 'desktop-calendar-selects')

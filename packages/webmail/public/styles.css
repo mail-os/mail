@@ -1405,11 +1405,9 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .calendar-share-form > label:has(input) { grid-column: 1 / -1; }
 }
 @media (700px < width <= 960px) {
-  .calendar-share-form { grid-template-columns: repeat(12, minmax(0, 1fr)); }
-  .calendar-share-form > :first-child { grid-column: span 7; }
-  .calendar-share-form > :nth-child(2), .calendar-share-form > label:has(input) { grid-column: span 5; }
-  .calendar-share-form > :nth-child(4) { grid-column: span 4; }
-  .calendar-share-form > button { grid-column: span 3; }
+  .calendar-share-form { grid-template-columns: minmax(0, 5fr) minmax(0, 2fr) minmax(0, 2fr) minmax(max-content, 3fr); }
+  .calendar-share-form > :is(:nth-child(-n+2), :nth-child(4)) { grid-column: span 2; }
+  .calendar-share-form > label:has(input) { grid-column: auto; }
 }
 
 @media (min-width: 861px) {
