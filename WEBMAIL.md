@@ -379,6 +379,26 @@ The reply uses your saved text and links to the original through its threading
 headers. See [RFC 3834](https://www.rfc-editor.org/rfc/rfc3834.html) for the
 automatic-response conventions.
 
+## Automatic cleanup
+
+In **Account → Automatic cleanup**, choose Inbox, Newsletters, Receipts, or
+Archive and an age of 30, 90, or 180 days. Each mailbox starts with cleanup
+off and can have one rule. **Preview cleanup** shows the current match count
+and up to eight example subjects. Enter your current password to enable the
+rule or confirm a change. A preview expires after ten minutes. Preview again
+if the eligible messages change before confirmation.
+
+The rule runs in batches as mail ages. It uses the stored IMAP internal date
+or the server's Maildir arrival timestamp. It skips unread, flagged, draft,
+and deleted messages, as well as mail kept in private tools or workflows
+such as Saved and Follow-up.
+
+Cleanup moves messages to Trash, where they still count toward mailbox storage.
+Use **Recover cleaned-up messages** to move one back to its original folder.
+A restored message is excluded from future cleanup. Recovery is available
+while the message remains in Trash. Turning cleanup off stops future moves
+and keeps the recovery list available.
+
 ## Password recovery
 
 Each mailbox may have one recovery address outside itself. "Forgot password?"
@@ -870,6 +890,15 @@ revokes existing webmail sessions.
   filter values select all eligible mail. Disabling also needs
   `currentPassword`. A stale revision returns 412. See
   [mailbox forwarding](docs/FORWARDING.md#mailbox-forwarding).
+- `GET /webmail/api/retention?page=1` returns the cleanup rule and a page of
+  recoverable messages. `POST /webmail/api/retention/preview` accepts
+  `{folder, days, revision}` and returns a ten-minute preview token, count,
+  and sample. `PUT /webmail/api/retention` accepts a matching `revision` and
+  `action` of `enable` or `disable`. Enabling also needs `preview` and
+  `currentPassword`. A stale revision returns 412 and a stale or expired
+  preview returns 409. `POST /webmail/api/retention/restore` accepts a
+  recoverable message's stable `reference` and returns `{restored}`. These
+  routes use the signed-in mailbox and require same-origin mutations.
 - `GET /webmail/api/vacation` returns `{enabled, subject, body, startsAt,
   endsAt, revision}`. Send those fields in `PUT` to change the rule. The times
   are optional Unix seconds, with an inclusive start and an exclusive end.

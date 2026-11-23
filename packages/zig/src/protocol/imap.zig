@@ -735,7 +735,7 @@ fn parseAppendDate(date: []const u8) !i64 {
 
 /// Keep the persisted date separate from the numeric filename prefix that
 /// determines sequence order. Copy and move can change that prefix.
-fn storedInternalDate(filename: []const u8) ?i64 {
+pub fn storedInternalDate(filename: []const u8) ?i64 {
     const basename = MaildirFlags.baseName(std.fs.path.basename(filename));
     if (!std.mem.endsWith(u8, basename, ".eml")) return null;
     const stem = basename[0 .. basename.len - ".eml".len];

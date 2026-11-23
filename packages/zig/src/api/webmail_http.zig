@@ -51,6 +51,7 @@ const io_compat = @import("../core/io_compat.zig");
 const tls = @import("tls");
 const service_mod = @import("webmail_service.zig");
 const sender_review = @import("webmail_sender_review.zig");
+const retention = @import("webmail_retention.zig");
 const store = @import("webmail_store.zig");
 const threads = @import("webmail_threads.zig");
 const categories = @import("../message/categories.zig");
@@ -309,9 +310,11 @@ const ConnCtx = struct {
 };
 
 fn deliveryWorker(server: *WebmailHttpServer) void {
+    var next_retention_check: i64 = 0;
     while (server.running.load(.monotonic)) {
         var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        const delivered = server.service.dispatchDue(scratch.allocator(), time_compat.timestamp()) catch |err| blk: {
+        const now = time_compat.timestamp();
+        const delivered = server.service.dispatchDue(scratch.allocator(), now) catch |err| blk: {
             logger.err("Webmail outbox dispatch failed: {}", .{err});
             break :blk false;
         };
@@ -323,6 +326,11 @@ fn deliveryWorker(server: *WebmailHttpServer) void {
             logger.err("Calendar history recovery failed: {}", .{err});
             break :blk false;
         };
+        if (now >= next_retention_check) {
+            next_retention_check = now + 5;
+            retention.runDue(scratch.allocator(), server.db, now) catch |err|
+                logger.err("Mailbox retention check failed: {}", .{err});
+        }
         scratch.deinit();
         if (!delivered and !reviewed) time_compat.sleepMs(200);
     }
@@ -706,6 +714,9 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
         return handleRecoveryUpdate(server, conn, arena, req);
     }
     if (std.mem.eql(u8, p, "/webmail/api/forwarding")) return handleForwarding(server, conn, arena, req);
+    if (std.mem.eql(u8, p, "/webmail/api/retention")) return handleRetention(server, conn, arena, req, .rule);
+    if (std.mem.eql(u8, p, "/webmail/api/retention/preview")) return handleRetention(server, conn, arena, req, .preview);
+    if (std.mem.eql(u8, p, "/webmail/api/retention/restore")) return handleRetention(server, conn, arena, req, .restore);
     if (std.mem.eql(u8, p, "/webmail/api/vacation")) return handleVacation(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/compose") and std.mem.eql(u8, req.method, "POST")) {
         return handleCompose(server, conn, arena, req);
@@ -1583,6 +1594,78 @@ fn forwardingError(conn: *webmail_tls.Stream, a: std.mem.Allocator, err: anyerro
         error.PreconditionFailed => sendError(conn, a, 412, "revision_mismatch", "Forwarding changed in another window. Reopen Account settings before continuing."),
         error.ForwardRateLimited => sendError(conn, a, 429, "rate_limited", "Too many forwarding requests. Please wait before trying again."),
         else => err,
+    };
+}
+
+const RetentionEndpoint = enum { rule, preview, restore };
+const RetentionPreviewRequest = struct { folder: retention.Folder, days: i64, revision: i64 };
+const RetentionChange = struct {
+    action: enum { enable, disable },
+    revision: i64,
+    preview: ?[]const u8 = null,
+    currentPassword: ?[]const u8 = null,
+};
+
+fn handleRetention(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request, endpoint: RetentionEndpoint) !void {
+    const get = endpoint == .rule and std.mem.eql(u8, req.method, "GET");
+    if (!get and !std.mem.eql(u8, req.method, if (endpoint == .rule) "PUT" else "POST"))
+        return sendError(conn, a, 405, "method_not_allowed", if (endpoint == .rule) "Use GET or PUT" else "Use POST");
+    if (!get and !isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    var session = (try requireSession(server, conn, a, req)) orelse return;
+    defer session.deinit(server.allocator);
+    if (get) {
+        const page = std.fmt.parseInt(usize, req.queryParam(a, "page") orelse "1", 10) catch 0;
+        if (page == 0) return sendError(conn, a, 400, "invalid_page", "Invalid recovery page");
+        const settings = retention.status(a, server.db, session.username, page) catch |err| return retentionError(conn, a, err);
+        return sendJson(conn, a, 200, try service_mod.json(a, settings), null);
+    }
+    const now = time_compat.timestamp();
+    switch (endpoint) {
+        .preview => {
+            const payload = std.json.parseFromSliceLeaky(RetentionPreviewRequest, a, req.body, .{}) catch
+                return sendError(conn, a, 400, "bad_request", "Choose a folder and age for cleanup");
+            const preview = retention.preview(a, server.db, session.username, .{ .folder = payload.folder, .days = payload.days }, payload.revision, now) catch |err|
+                return retentionError(conn, a, err);
+            return sendJson(conn, a, 200, try service_mod.json(a, preview), null);
+        },
+        .restore => {
+            const payload = std.json.parseFromSliceLeaky(struct { reference: []const u8 }, a, req.body, .{}) catch
+                return sendError(conn, a, 400, "bad_request", "Choose a message to restore");
+            const restored = retention.restore(a, server.db, session.username, payload.reference) catch |err| return retentionError(conn, a, err);
+            return sendJson(conn, a, 200, try service_mod.json(a, .{ .restored = restored }), null);
+        },
+        .rule => {
+            const change = std.json.parseFromSliceLeaky(RetentionChange, a, req.body, .{}) catch
+                return sendError(conn, a, 400, "bad_request", "Invalid cleanup settings");
+            const rule = switch (change.action) {
+                .disable => retention.disable(server.db, session.username, change.revision, now) catch |err| return retentionError(conn, a, err),
+                .enable => blk: {
+                    const token = change.preview orelse "";
+                    if (!message_refs.valid(token)) return retentionError(conn, a, error.RetentionPreviewRequired);
+                    const password = change.currentPassword orelse "";
+                    if (password.len == 0 or password.len > recovery.max_password_len)
+                        return sendError(conn, a, 400, "invalid_credentials", "Enter your current password");
+                    const limit_key = try std.fmt.allocPrint(a, "retention:{s}", .{session.username});
+                    if (!try server.login_limiter.checkAndIncrementUser(limit_key))
+                        return sendError(conn, a, 429, "rate_limited", "Too many attempts. Try again later.");
+                    if (!try server.auth.verifyCredentials(session.username, password))
+                        return sendError(conn, a, 400, "invalid_credentials", "Current password is incorrect");
+                    break :blk retention.enable(a, server.db, session.username, token, change.revision, time_compat.timestamp()) catch |err|
+                        return retentionError(conn, a, err);
+                },
+            };
+            return sendJson(conn, a, 200, try service_mod.json(a, rule), null);
+        },
+    }
+}
+
+fn retentionError(conn: *webmail_tls.Stream, a: std.mem.Allocator, err: anyerror) !void {
+    return switch (err) {
+        error.RetentionChanged => sendError(conn, a, 412, "revision_mismatch", "Cleanup settings changed. Reopen Account settings and try again."),
+        error.RetentionPreviewRequired => sendError(conn, a, 409, "preview_required", "Preview the rule again before enabling cleanup"),
+        error.InvalidRetentionPolicy => sendError(conn, a, 400, "invalid_policy", "Invalid cleanup folder, age, or page"),
+        error.NotFound, error.FileNotFound => sendError(conn, a, 404, "not_found", "Message or mailbox not found"),
+        else => mapMaildirError(conn, a, err),
     };
 }
 

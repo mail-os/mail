@@ -81,6 +81,8 @@ const {
   savingRecovery, saveRecovery,
   forwarding, forwardingAddress, forwardingPassword, forwardingCode, forwardingBusy, forwardingError, forwardingNotice, changeForwarding,
   forwardingMode, forwardingSenderFilter, forwardingRecipientFilter, forwardingScopePassword,
+  retention, retentionFolder, retentionDays, retentionPreview, retentionPassword, retentionBusy, retentionError, retentionNotice,
+  closeAccountSettings, discardRetentionPreview, loadRetention, prepareRetention, changeRetention, restoreRetainedMessage,
   externalAddresses, externalAddress, externalAddressId, externalCode, externalAddressBusy, externalAddressError, externalAddressNotice,
   selectExternalAddress, verifyExternalAddress,
   vacation, vacationEnabled, vacationSubject, vacationBody, vacationStart, vacationEnd, vacationBusy, vacationError, vacationNotice, saveVacationSettings,
@@ -762,12 +764,12 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
     </footer>
   </form>
 </dialog>
-<dialog :if="settings" ref="passwordDialog" class="wm-modal wm-password-dialog" aria-label="Account settings" @cancel.prevent="settings.set(false)"><div class="wm-account-panel">
+<dialog :if="settings" ref="passwordDialog" class="wm-modal wm-password-dialog" aria-label="Account settings" @cancel.prevent="closeAccountSettings()"><div class="wm-account-panel">
 <header class="wm-account-header">
   <div class="wm-account-heading"><span class="wm-avatar" aria-hidden="true" :text="senderInitials(user?.email || '')"></span><div><h1>Account</h1><p :text="user?.email"></p></div></div>
   <div class="wm-account-header-actions">
     <button type="button" class="wm-action wm-action--accent" @click="leaveAccount()" :disabled="leavingAccount || sending || mutating"><span class="mail-icon" data-icon="exit" aria-hidden="true"></span><span :text="leavingAccount ? 'Saving and signing out…' : 'Switch account'"></span></button>
-    <button type="button" class="wm-action" @click="settings.set(false)" :disabled="savingPassword || savingRecovery" autofocus>Close</button>
+    <button type="button" class="wm-action" @click="closeAccountSettings()" :disabled="savingPassword || savingRecovery" autofocus>Close</button>
   </div>
   <p :if="accountChangeError" class="login-error" role="alert" :text="accountChangeError"></p>
 </header>
@@ -893,6 +895,61 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
   <p class="login-sub">File new mail from verified senders in Newsletters or Receipts when the message matches. Sender Review decisions and your sender rules still apply.</p>
   <p :if="sortingError" class="login-error" role="alert" :text="sortingError"></p>
   <button :if="sortingSettings" type="button" class="login-secondary" @click="toggleAutomaticSorting()" :disabled="sortingSaving" :text="sortingSettings?.automatic ? 'Turn off automatic sorting' : 'Turn on automatic sorting'"></button>
+</section>
+<section class="login-recovery wm-retention" aria-labelledby="retentionHeading" :aria-busy="retentionBusy">
+  <h2 id="retentionHeading"><span class="mail-icon" data-icon="trash" aria-hidden="true"></span>Automatic cleanup</h2>
+  <p class="login-sub">Move older read, unflagged mail from one folder to Trash. Saved mail and messages marked for follow-up stay in place.</p>
+  <p :if="retention?.rule?.policy" class="login-sub" role="status">On for <strong :text="folderName(retention.rule.policy.folder)"></strong> after <strong :text="retention.rule.policy.days + ' days'"></strong>.</p>
+  <p :if="retention && !retention.rule.policy" class="login-sub" role="status">Automatic cleanup is off.</p>
+  <p :if="!retention && retentionBusy" class="login-sub" role="status">Loading automatic cleanup…</p>
+  <p :if="retentionError" class="login-error" role="alert" :text="retentionError"></p>
+  <p :if="retentionNotice" class="login-sub" role="status" :text="retentionNotice"></p>
+  <button :if="!retention && !retentionBusy" type="button" class="login-secondary" @click="loadRetention()">Retry</button>
+  <form :if="retention" class="wm-retention-rule" @submit.prevent="prepareRetention()">
+    <div class="wm-retention-fields">
+      <div><label for="retentionFolder">Folder</label>
+        <select id="retentionFolder" x-model="retentionFolder" @change="discardRetentionPreview()" :disabled="retentionBusy">
+          <option value="INBOX">Inbox</option><option value="Newsletters">Newsletters</option><option value="Receipts">Receipts</option><option value="Archive">Archive</option>
+        </select>
+      </div>
+      <div><label for="retentionDays">Older than</label>
+        <select id="retentionDays" x-model="retentionDays" @change="discardRetentionPreview()" :disabled="retentionBusy">
+          <option value="30">30 days</option><option value="90">90 days</option><option value="180">180 days</option>
+        </select>
+      </div>
+    </div>
+    <div class="wm-private-actions">
+      <button type="submit" class="login-secondary" :disabled="retentionBusy">Preview cleanup</button>
+      <button :if="retention.rule.policy" type="button" class="login-secondary" :disabled="retentionBusy" @click="changeRetention('disable')">Turn off cleanup</button>
+    </div>
+  </form>
+  <form :if="retentionPreview" class="wm-retention-preview" aria-label="Cleanup preview" @submit.prevent="changeRetention('enable')">
+    <p role="status" :text="retentionPreview.total === 1 ? '1 message matches now.' : retentionPreview.total + ' messages match now.'"></p>
+    <ul :if="retentionPreview.examples.length" aria-label="Matching message examples">
+      <li :for="message in retentionPreview.examples"><span :text="message.subject || '(No subject)'"></span> <small :text="snapshotDate(message.received_at)"></small></li>
+    </ul>
+    <p :if="retentionPreview.expires_at > now" class="login-sub">This rule will keep running as mail ages. Enter your password to confirm.</p>
+    <p :if="retentionPreview.expires_at <= now" class="login-sub" role="status">This preview expired. Preview the rule again to continue.</p>
+    <label :if="retentionPreview.expires_at > now" for="retentionPassword">Current password for cleanup</label>
+    <input :if="retentionPreview.expires_at > now" id="retentionPassword" type="password" x-model="retentionPassword" autocomplete="current-password" required :disabled="retentionBusy">
+    <button :if="retentionPreview.expires_at > now" type="submit" :disabled="retentionBusy" :text="retention?.rule.policy ? 'Confirm cleanup change' : 'Enable automatic cleanup'"></button>
+  </form>
+  <div :if="retention" class="wm-retention-recovery" role="group" aria-labelledby="retentionRecovery">
+    <h3 id="retentionRecovery">Recover cleaned-up messages</h3>
+    <p class="login-sub">Restore messages here while they are in Trash. Mail in Trash still uses mailbox storage.</p>
+    <p :if="!retention.recoverable.length" class="login-sub">No messages to recover on this page.</p>
+    <ul :if="retention.recoverable.length" class="wm-snapshot-links" aria-label="Recoverable messages">
+      <li :for="message in retention.recoverable" :key="message.reference">
+        <div><strong :text="message.subject || '(No subject)'"></strong><p class="wm-snapshot-muted" :text="'From ' + folderName(message.source_folder) + ' · ' + snapshotDate(message.moved_at)"></p></div>
+        <button class="login-secondary" type="button" :aria-label="'Restore ' + (message.subject || '(No subject)')" :disabled="retentionBusy" @click="restoreRetainedMessage(message.reference)">Restore</button>
+      </li>
+    </ul>
+    <div class="wm-private-actions">
+      <button :if="retention.page > 1" type="button" class="login-secondary" :disabled="retentionBusy" @click="loadRetention(retention.page - 1)">Previous</button>
+      <button :if="retention.has_more" type="button" class="login-secondary" :disabled="retentionBusy" @click="loadRetention(retention.page + 1)">Next</button>
+      <button type="button" class="login-secondary" :disabled="retentionBusy" @click="loadRetention(retention.page)">Refresh recovery list</button>
+    </div>
+  </div>
 </section>
 <section class="login-recovery" aria-labelledby="notificationHeading">
   <h2 id="notificationHeading"><span class="mail-icon" data-icon="bell" aria-hidden="true"></span>Browser notifications</h2>

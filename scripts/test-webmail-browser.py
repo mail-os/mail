@@ -5,6 +5,7 @@ import argparse
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import format_datetime
+from imaplib import Time2Internaldate
 import os
 from pathlib import Path
 import runpy
@@ -200,6 +201,14 @@ def verify(binary, output, engine):
             note.set_content("Here is the handoff for Thursday.")
             with fixture.smtp(sender) as connection:
                 assert connection.send_message(note) == {}
+            archived = EmailMessage()
+            archived["From"], archived["To"], archived["Subject"] = sender, newcomer, "Archived planning notes"
+            archived.set_content("Notes from last quarter.")
+            with fixture.imap(newcomer) as mailbox:
+                if mailbox.select("Archive")[0] != "OK":
+                    assert mailbox.create("Archive")[0] == "OK"
+                received = datetime.now(timezone.utc) - timedelta(days=45)
+                assert mailbox.append("Archive", r"(\Seen)", Time2Internaldate(received), archived.as_bytes())[0] == "OK"
             assert fixture.deliver(sender, identity=owner, subject="Combined source briefing",
                                    body="Please send the design notes from this mailbox.")[0] == 250
             seed_shared_inbox(fixture, owner, sender)

@@ -54,6 +54,18 @@ async function fitsViewport(page) {
     assert(await page.evaluate(() => document.documentElement.scrollHeight <= innerHeight + 1), 'Mail shell exceeds the viewport')
 }
 
+async function waitForMailboxResult(page, endpoint, find, description) {
+  const deadline = Date.now() + 15_000
+  while (Date.now() < deadline) {
+    const response = await page.request.get(url + endpoint)
+    assert.equal(response.status(), 200, endpoint)
+    const result = find(await response.json())
+    if (result) return result
+    await new Promise(resolve => setTimeout(resolve, 300))
+  }
+  assert.fail(description)
+}
+
 async function verifySelect(control, minimumHeight = 36) {
   const appearance = await control.evaluate((select) => {
     const style = getComputedStyle(select)
@@ -1945,13 +1957,9 @@ async function forwardingFilterJourney(desktop, phone) {
   await button(forwarding, 'Send verification code').click()
   await forwarding.getByLabel('Verification code').waitFor()
   const lookup = '/webmail/api/messages?folder=INBOX&conversations=false&q=Confirm+mail+forwarding'
-  const verification = await peer.waitForFunction(async (path) => {
-    const response = await fetch(path)
-    if (!response.ok) return false
-    const { items } = await response.json()
-    return items.find(item => item.subject === 'Confirm mail forwarding')?.reference || false
-  }, lookup, { polling: 300 })
-  const reference = await verification.jsonValue()
+  const reference = await waitForMailboxResult(peer, lookup,
+    ({ items }) => items.find(item => item.subject === 'Confirm mail forwarding')?.reference,
+    'The destination mailbox received a forwarding verification message')
   const message = await peer.request.get(url + '/webmail/api/messages/ref/' + reference)
   assert.equal(message.status(), 200)
   const code = (await message.json()).text.split(/\r?\n/).find(line => /^[a-f0-9]{32}$/.test(line))
@@ -1991,6 +1999,61 @@ async function forwardingFilterJourney(desktop, phone) {
   await mobile.locator('.wm-forwarding-confirm').screenshot({ path: join(output, 'phone-filtered-forwarding.png'), animations: 'disabled' })
 }
 
+async function retentionJourney(phone) {
+  const desktop = await signIn({ account: newcomer, initialSubject: 'Studio launch notes' })
+  await button(desktop, 'Account').click()
+  const cleanup = desktop.getByRole('region', { name: 'Automatic cleanup', exact: true })
+  const scope = cleanup.locator('.wm-retention-fields')
+  const preview = cleanup.getByRole('form', { name: 'Cleanup preview' })
+  await cleanup.getByText('Automatic cleanup is off.', { exact: true }).waitFor()
+  await verifyControlRow(scope, 'select', 36)
+  await cleanup.getByLabel('Folder').selectOption('Archive')
+  await cleanup.getByLabel('Older than').selectOption('30')
+  await button(cleanup, 'Preview cleanup').click()
+  await preview.getByText('Archived planning notes', { exact: true }).waitFor()
+  await preview.getByText('1 message matches now.', { exact: true }).waitFor()
+  await cleanup.getByLabel('Older than').selectOption('90')
+  await preview.waitFor({ state: 'hidden' })
+  await cleanup.getByLabel('Older than').selectOption('30')
+  await button(cleanup, 'Preview cleanup').click()
+  await preview.getByText('Archived planning notes', { exact: true }).waitFor()
+  await preview.screenshot({ path: join(output, 'desktop-cleanup-preview.png'), animations: 'disabled' })
+  await preview.getByLabel('Current password for cleanup').fill(password)
+  await button(preview, 'Enable automatic cleanup').click()
+  await button(cleanup, 'Turn off cleanup').waitFor()
+
+  await phone.setViewportSize({ width: 320, height: 844 })
+  await phone.emulateMedia({ colorScheme: 'dark' })
+  await phone.goto(url + '/')
+  await drawer(phone).click()
+  await button(phone, 'Account').click()
+  const mobile = phone.getByRole('region', { name: 'Automatic cleanup', exact: true })
+  await mobile.getByLabel('Folder').waitFor()
+  assert.equal(await mobile.getByLabel('Folder').inputValue(), 'Archive')
+  assert.equal(await mobile.getByLabel('Older than').inputValue(), '30')
+  await verifyControlRow(mobile.locator('.wm-retention-fields'), 'select', 44)
+  await fitsViewport(phone)
+  const endpoint = '/webmail/api/retention'
+  await waitForMailboxResult(phone, endpoint, ({ recoverable }) => recoverable.some(message => message.subject === 'Archived planning notes'),
+    'The native worker moved the archived message to Trash')
+  const refreshed = phone.waitForResponse(response => response.url() === url + endpoint + '?page=1')
+  await button(mobile, 'Refresh recovery list').click()
+  const recovery = await refreshed
+  assert.equal(recovery.status(), 200)
+  assert.equal((await recovery.json()).recoverable.length, 1)
+  const restore = button(mobile, 'Restore Archived planning notes')
+  await restore.waitFor()
+  await mobile.locator('.wm-retention-recovery').screenshot({ path: join(output, 'phone-cleanup-recovery.png'), animations: 'disabled' })
+  await restore.click()
+  await mobile.getByText('Message restored.', { exact: true }).waitFor()
+  await restore.waitFor({ state: 'hidden' })
+  await button(mobile, 'Turn off cleanup').click()
+  await mobile.getByText('Automatic cleanup is off.', { exact: true }).waitFor()
+  const result = await phone.request.get(url + '/webmail/api/messages?folder=Archive')
+  assert.equal(result.status(), 200)
+  assert((await result.json()).items.some(message => message.subject === 'Archived planning notes'))
+}
+
 try {
   const desktop = await signIn()
   await desktopJourney(desktop)
@@ -2017,6 +2080,7 @@ try {
   await navigationRequestsJourney(desktop)
   await senderInvitationJourney(desktop, phone)
   await forwardingFilterJourney(desktop, phone)
+  await retentionJourney(firstRun)
   assert.deepEqual(errors, [], 'Browser pages raised uncaught errors')
   process.stdout.write(`${engine} passed the desktop and phone webmail journeys.\n`)
 }

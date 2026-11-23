@@ -190,7 +190,7 @@ pub fn flagsFrom(filename: []const u8) Flags {
 }
 
 /// One physical message file: which directory it lives in and its filename.
-const FileRef = struct {
+pub const FileRef = struct {
     dir: []const u8,
     name: []const u8,
 };
@@ -199,7 +199,7 @@ const BodyMode = enum { preview, metadata, full, calendar };
 
 /// Collect the message files for a folder, in stable IMAP order. The returned
 /// slices are arena-allocated.
-fn collectFiles(allocator: std.mem.Allocator, user: []const u8, folder: []const u8) ![]FileRef {
+pub fn collectFiles(allocator: std.mem.Allocator, user: []const u8, folder: []const u8) ![]FileRef {
     return collectFilesAtRoot(allocator, "mail", user, folder);
 }
 
@@ -1345,13 +1345,34 @@ pub fn moveWithFeedbackLocked(allocator: std.mem.Allocator, db: *database.Databa
     _ = db.getOrCreateMailbox(user, dst_folder) catch {};
 
     const ref = (try findByUid(allocator, db, user, src_folder, uid)) orelse return MaildirError.MessageNotFound;
+    return moveFileLocked(allocator, db, user, src_folder, ref, dst_folder, if (junk) |change| .{ .junk = change } else null);
+}
+
+/// Called under the mailbox lock. Register the reference before staging the
+/// move so the same handoff that changes its folder also records recovery.
+pub fn moveForRetentionLocked(a: std.mem.Allocator, db: *database.Database, user: []const u8, source_folder: []const u8, ref: FileRef, now: i64) !void {
     if (!isSafeName(ref.name)) return MaildirError.WriteFailed;
+    const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ ref.dir, ref.name });
+    const at = message_refs.location(source_folder, ref.name);
+    const stamp = try message_refs.fileStamp(a, path);
+    if (try message_refs.pendingAt(a, db, user, at) != null) {
+        const raw = try fs_compat.readFileAlloc(a, path);
+        _ = try observeReference(a, db, user, at, stamp, &message_refs.digest(raw));
+    } else _ = try message_refs.issue(a, db, user, at, stamp);
+    _ = try db.getOrCreateMailbox(user, "Trash");
+    _ = try moveFileLocked(a, db, user, source_folder, ref, "Trash", .{ .retention = now });
+}
+
+fn moveFileLocked(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, src_folder: []const u8, ref: FileRef, dst_folder: []const u8, effect: ?message_refs.MoveEffect) !i64 {
+    if (!isSafeName(ref.name)) return MaildirError.WriteFailed;
+    const source = message_refs.location(src_folder, ref.name);
+    const target = message_refs.location(dst_folder, ref.name);
 
     // Destination dir: INBOX lives in new/, other folders in the folder dir.
-    const dst_dir = if (std.ascii.eqlIgnoreCase(dst_folder, "INBOX"))
+    const dst_dir = if (std.mem.eql(u8, target.folder, "INBOX"))
         try std.fmt.allocPrint(allocator, "mail/{s}/new", .{user})
     else
-        try std.fmt.allocPrint(allocator, "mail/{s}/{s}", .{ user, dst_folder });
+        try std.fmt.allocPrint(allocator, "mail/{s}/{s}", .{ user, target.folder });
     fs_compat.ensureDir(dst_dir) catch {};
 
     const old_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ref.dir, ref.name });
@@ -1365,12 +1386,10 @@ pub fn moveWithFeedbackLocked(allocator: std.mem.Allocator, db: *database.Databa
     // a UID failure aborts cleanly without leaving an orphaned file, and the
     // returned UID is always the real destination UID (never a stale source one).
     // A destination that already contains this name must not be overwritten.
-    const source = message_refs.location(src_folder, ref.name);
-    const target = message_refs.location(dst_folder, ref.name);
     if (try fileAt(allocator, user, target) != null) return MaildirError.Conflict;
     const dst_uid = try db.assignFreshUid(user, dst_folder, ref.name);
-    const transfer = try message_refs.stageMove(allocator, db, user, source, old_path, target, null, junk);
-    if (junk != null and transfer == null) return MaildirError.Conflict;
+    const transfer = try message_refs.stageMove(allocator, db, user, source, old_path, target, null, effect);
+    if (effect != null and transfer == null) return MaildirError.Conflict;
     errdefer if (transfer) |id| message_refs.cancel(db, user, id);
 
     // Prefer an atomic rename; fall back to copy+unlink across filesystems.
@@ -1393,10 +1412,10 @@ pub fn moveWithFeedbackLocked(allocator: std.mem.Allocator, db: *database.Databa
 
     if (transfer) |id| message_refs.finishFile(allocator, db, user, id, target, new_path);
     message_refs.forgetReviewCopy(db, user, source) catch |err| std.log.warn("could not retire a manually moved review copy: {}", .{err});
-    if (typesense.enabled() and (junk != null or categories.isCategory(source_folder) or categories.isCategory(target_folder))) {
+    if (typesense.enabled() and (effect != null or categories.isCategory(source.folder) or categories.isCategory(target.folder))) {
         if (fs_compat.readFileAlloc(allocator, new_path)) |raw| {
             defer allocator.free(raw);
-            typesense.indexMessageAsync(std.heap.page_allocator, user, target_folder, ref.name, raw);
+            typesense.indexMessageAsync(std.heap.page_allocator, user, target.folder, ref.name, raw);
         } else |err| std.log.warn("could not read moved mail for search: {}", .{err});
     }
     return dst_uid;

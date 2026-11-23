@@ -411,6 +411,7 @@ pub const Database = struct {
             \\    next_digest TEXT,
             \\    next_junk_action TEXT,
             \\    next_junk_receipt TEXT,
+            \\    next_retention_at INTEGER,
             \\    intake_folder TEXT NOT NULL DEFAULT '',
             \\    placement_reason TEXT NOT NULL DEFAULT '',
             \\    verified_author TEXT NOT NULL DEFAULT '',
@@ -419,6 +420,36 @@ pub const Database = struct {
             \\    UNIQUE(user_id,folder,basename)
             \\);
             \\CREATE INDEX IF NOT EXISTS mailbox_message_refs_pending ON mailbox_message_refs(user_id,next_folder,next_basename) WHERE next_folder IS NOT NULL;
+            \\CREATE TABLE IF NOT EXISTS mail_retention_rules (
+            \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            \\    folder TEXT,
+            \\    days INTEGER NOT NULL,
+            \\    revision INTEGER NOT NULL,
+            \\    next_run INTEGER NOT NULL,
+            \\    last_run INTEGER,
+            \\    last_moved INTEGER NOT NULL DEFAULT 0
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mail_retention_due ON mail_retention_rules(next_run,user_id) WHERE folder IS NOT NULL;
+            \\CREATE TABLE IF NOT EXISTS mail_retention_previews (
+            \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            \\    token TEXT NOT NULL,
+            \\    folder TEXT NOT NULL,
+            \\    days INTEGER NOT NULL,
+            \\    revision INTEGER NOT NULL,
+            \\    cutoff INTEGER NOT NULL,
+            \\    digest TEXT NOT NULL,
+            \\    expires_at INTEGER NOT NULL
+            \\);
+            \\CREATE TABLE IF NOT EXISTS mail_retention_moves (
+            \\    user_id INTEGER NOT NULL,
+            \\    reference TEXT NOT NULL,
+            \\    source_folder TEXT NOT NULL,
+            \\    moved_at INTEGER NOT NULL,
+            \\    restored INTEGER NOT NULL DEFAULT 0,
+            \\    PRIMARY KEY(user_id,reference),
+            \\    FOREIGN KEY(user_id,reference) REFERENCES mailbox_message_refs(user_id,reference) ON DELETE CASCADE
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mail_retention_recovery ON mail_retention_moves(user_id,moved_at DESC,reference) WHERE restored=0;
             \\CREATE TABLE IF NOT EXISTS mailbox_junk_feedback (
             \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
             \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -827,6 +858,7 @@ pub const Database = struct {
         try self.exec("CREATE INDEX IF NOT EXISTS mailbox_calendar_history ON mailbox_message_refs(user_id,verified_author COLLATE NOCASE,reference) WHERE " ++ pending_calendar_history);
         self.exec("ALTER TABLE mailbox_message_refs ADD COLUMN next_junk_action TEXT") catch {};
         self.exec("ALTER TABLE mailbox_message_refs ADD COLUMN next_junk_receipt TEXT") catch {};
+        self.exec("ALTER TABLE mailbox_message_refs ADD COLUMN next_retention_at INTEGER") catch {};
         // Finalize the feedback with the recorded Maildir handoff. This also
         // runs when a client read recovers a rename after a process restart.
         try self.exec(
@@ -837,6 +869,23 @@ pub const Database = struct {
             \\      SELECT OLD.user_id,OLD.reference,OLD.next_junk_receipt,OLD.verified_author,OLD.next_junk_action,OLD.folder
             \\      WHERE OLD.next_junk_action IN ('junk','not_junk');
             \\    DELETE FROM mailbox_junk_feedback WHERE OLD.next_junk_action='undo' AND user_id=OLD.user_id AND reference=OLD.reference AND receipt=OLD.next_junk_receipt;
+            \\END;
+            \\CREATE TRIGGER IF NOT EXISTS mailbox_retention_handoff AFTER UPDATE OF folder ON mailbox_message_refs
+            \\WHEN OLD.next_retention_at IS NOT NULL AND OLD.folder<>NEW.folder AND NEW.folder='Trash'
+            \\  AND OLD.next_folder=NEW.folder AND OLD.next_basename=NEW.basename
+            \\BEGIN
+            \\    INSERT OR IGNORE INTO mail_retention_moves(user_id,reference,source_folder,moved_at)
+            \\      VALUES(NEW.user_id,NEW.reference,OLD.folder,OLD.next_retention_at);
+            \\END;
+            \\CREATE TRIGGER IF NOT EXISTS mailbox_retention_recovered AFTER UPDATE OF folder ON mailbox_message_refs
+            \\WHEN OLD.folder='Trash' AND NEW.folder<>OLD.folder
+            \\BEGIN
+            \\    UPDATE mail_retention_moves SET restored=1 WHERE user_id=NEW.user_id AND reference=NEW.reference;
+            \\END;
+            \\CREATE TRIGGER IF NOT EXISTS mailbox_retention_replaced_ref BEFORE UPDATE OF reference ON mailbox_message_refs
+            \\WHEN OLD.reference<>NEW.reference
+            \\BEGIN
+            \\    DELETE FROM mail_retention_moves WHERE user_id=OLD.user_id AND reference=OLD.reference;
             \\END;
         );
         try self.exec("UPDATE accepted_mail_targets SET review_copy=(folder IN ('Screening','Declined')) WHERE review_copy IS NULL");

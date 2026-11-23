@@ -17,6 +17,7 @@ pub const JunkChange = struct {
     action: enum { junk, not_junk, undo },
     receipt: []const u8,
 };
+pub const MoveEffect = union(enum) { junk: JunkChange, retention: i64 };
 
 pub fn valid(id: []const u8) bool {
     if (id.len != 32) return false;
@@ -183,7 +184,7 @@ pub fn issue(a: Allocator, db: *database.Database, user: []const u8, target: Loc
         \\SELECT id,?5,?2,?3,?4 FROM users WHERE username=?1
         \\ON CONFLICT(user_id,folder,basename) DO UPDATE SET reference=excluded.reference,
         \\file_stamp=excluded.file_stamp,next_folder=NULL,next_basename=NULL,next_digest=NULL,
-        \\next_junk_action=NULL,next_junk_receipt=NULL,
+        \\next_junk_action=NULL,next_junk_receipt=NULL,next_retention_at=NULL,
         \\intake_folder='',placement_reason='',verified_author=''
         \\RETURNING reference
     );
@@ -204,7 +205,7 @@ pub fn stage(a: Allocator, db: *database.Database, user: []const u8, source: Loc
     return stageMove(a, db, user, source, path, target, bytes, null);
 }
 
-pub fn stageMove(a: Allocator, db: *database.Database, user: []const u8, source: Location, path: []const u8, target: Location, bytes: ?[]const u8, junk: ?JunkChange) !?[]const u8 {
+pub fn stageMove(a: Allocator, db: *database.Database, user: []const u8, source: Location, path: []const u8, target: Location, bytes: ?[]const u8, effect: ?MoveEffect) !?[]const u8 {
     const stamp = try fileStamp(a, path);
     const registered: ?[]const u8 = blk: {
         const get = try db.prepare("SELECT reference,file_stamp FROM mailbox_message_refs WHERE " ++ owner ++ " AND folder=?2 AND basename=?3");
@@ -222,21 +223,23 @@ pub fn stageMove(a: Allocator, db: *database.Database, user: []const u8, source:
     };
     const raw = bytes orelse try fs.readFileAlloc(a, path);
     const checksum = digest(raw);
-    const s = try db.prepare("UPDATE mailbox_message_refs SET next_folder=?3,next_basename=?4,next_digest=?5,next_junk_action=?6,next_junk_receipt=?7 WHERE " ++ owner ++ " AND reference=?2");
+    const s = try db.prepare("UPDATE mailbox_message_refs SET next_folder=?3,next_basename=?4,next_digest=?5,next_junk_action=?6,next_junk_receipt=?7,next_retention_at=?8 WHERE " ++ owner ++ " AND reference=?2");
     defer s.finalize();
     try s.bind(1, user);
     try s.bind(2, id);
     try s.bind(3, target.folder);
     try s.bind(4, target.basename);
     try s.bind(5, @as([]const u8, &checksum));
+    const junk = if (effect != null and effect.? == .junk) effect.?.junk else null;
     try s.bindOpt(6, if (junk) |change| @as(?[]const u8, @tagName(change.action)) else null);
     try s.bindOpt(7, if (junk) |change| change.receipt else null);
+    try s.bindOpt(8, if (effect != null and effect.? == .retention) @as(?i64, effect.?.retention) else null);
     _ = try s.step();
     return id;
 }
 
 pub fn finish(db: *database.Database, user: []const u8, id: []const u8, target: Location, stamp: []const u8) !void {
-    const s = try db.prepare("UPDATE OR REPLACE mailbox_message_refs SET folder=?3,basename=?4,file_stamp=?5,next_folder=NULL,next_basename=NULL,next_digest=NULL,next_junk_action=NULL,next_junk_receipt=NULL WHERE " ++ owner ++ " AND reference=?2");
+    const s = try db.prepare("UPDATE OR REPLACE mailbox_message_refs SET folder=?3,basename=?4,file_stamp=?5,next_folder=NULL,next_basename=NULL,next_digest=NULL,next_junk_action=NULL,next_junk_receipt=NULL,next_retention_at=NULL WHERE " ++ owner ++ " AND reference=?2");
     defer s.finalize();
     try s.bind(1, user);
     try s.bind(2, id);
@@ -256,7 +259,7 @@ pub fn finishFile(a: Allocator, db: *database.Database, user: []const u8, id: []
 }
 
 pub fn cancel(db: *database.Database, user: []const u8, id: []const u8) void {
-    const s = db.prepare("UPDATE mailbox_message_refs SET next_folder=NULL,next_basename=NULL,next_digest=NULL,next_junk_action=NULL,next_junk_receipt=NULL WHERE " ++ owner ++ " AND reference=?2") catch return;
+    const s = db.prepare("UPDATE mailbox_message_refs SET next_folder=NULL,next_basename=NULL,next_digest=NULL,next_junk_action=NULL,next_junk_receipt=NULL,next_retention_at=NULL WHERE " ++ owner ++ " AND reference=?2") catch return;
     defer s.finalize();
     s.bind(1, user) catch return;
     s.bind(2, id) catch return;

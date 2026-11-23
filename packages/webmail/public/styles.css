@@ -1072,6 +1072,15 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-forwarding .wm-forwarding-confirm { padding-inline: 0; border-inline: 0; border-radius: 0; background: transparent; }
 }
 .wm-forwarding .wm-forwarding-disable { color: var(--danger); }
+.wm-retention-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.wm-retention-fields select { width: 100%; }
+.wm-retention-preview { padding: 10px; margin-top: 12px; border: 1px solid var(--border); border-radius: var(--control-radius); background: var(--toolbar); }
+.wm-retention-preview p { margin: 0 0 8px; }
+.wm-retention-preview ul { display: grid; gap: 6px; padding-inline-start: 18px; margin-block: 0 10px; overflow-wrap: anywhere; }
+.wm-retention-preview small { display: block; color: var(--muted); }
+.wm-retention-recovery { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.wm-retention-recovery h3 { margin: 0 0 5px; font-size: 14px; }
+.wm-retention-recovery li button { margin-top: 0; }
 .wm-vacation-heading, .wm-vacation-heading h2 { display: flex; align-items: center; gap: 6px; }
 .wm-vacation-heading { justify-content: space-between; }
 .wm-vacation-heading h2 { margin: 0; }
