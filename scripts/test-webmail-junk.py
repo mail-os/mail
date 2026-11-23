@@ -2,6 +2,7 @@
 """Native HTTPS, SMTP, and IMAP regression for Junk feedback and recovery."""
 
 import argparse
+from base64 import b64encode
 from contextlib import closing
 import json
 from pathlib import Path
@@ -15,6 +16,43 @@ fixtures = runpy.run_path(str(Path(__file__).with_name("test-hosted-limits.py"))
 Fixture, expect_smtp = fixtures["Fixture"], fixtures["expect_smtp"]
 JUNK = "Spam Review"
 PARCEL = "DHL Express Shipment Release Information. A fee must be paid before final delivery. Total amount due $3.35. Status: Awaiting payment at the local facility."
+
+
+def verify_mime_scoring(test, recipient):
+    sender = "campaign@example.org"
+    encoded = b64encode(b"Are you interested in seo services?").decode("ascii")
+    cases = (
+        ("Folded MIME scoring", "Content-Transfer-Encoding:\n\tbase64", "text/html", True, True),
+        ("Mixed-case MIME scoring", "cOnTeNt-TrAnSfEr-EnCoDiNg\t: bAsE64", "text/html", False, True),
+        ("Binary MIME scoring", "Content-Transfer-Encoding: base64", "application/octet-stream", True, False),
+    )
+    for subject, transfer_header, content_type, bdat, _ in cases:
+        message = "\n".join((
+            f"From: {sender}", f"To: {recipient}", f"Subject: {subject}",
+            "Date: Sun, 22 Nov 2026 12:00:00 +0000", "MIME-Version: 1.0",
+            "Content-Type: multipart/mixed; boundary=outer", "", "--outer",
+            f"Content-Type: {content_type}", transfer_header, "", encoded, "--outer--", "",
+        ))
+        with test.smtp() as client:
+            expect_smtp(client.mail(sender), 250)
+            expect_smtp(client.rcpt(recipient), 250)
+            if bdat:
+                raw = message.encode("ascii")
+                client.send(f"BDAT {len(raw)} LAST\r\n".encode("ascii") + raw)
+                expect_smtp(client.getreply(), 250)
+            else:
+                expect_smtp(client.data(message), 250)
+
+    with test.imap(recipient) as client:
+        assert client.select("INBOX", readonly=True)[0] == "OK"
+        for subject, _, _, _, expected_rule in cases:
+            status, matches = client.uid("SEARCH", "SUBJECT", f'"{subject}"')
+            assert status == "OK", matches
+            uid, = matches[0].split()
+            status, data = client.uid("FETCH", uid, "(BODY.PEEK[HEADER.FIELDS (X-Spam-Status)])")
+            assert status == "OK", data
+            header = b"".join(chunk[1] for chunk in data if isinstance(chunk, tuple))
+            assert b"X-Spam-Status:" in header and (b"SEO_SOLICITATION" in header) == expected_rule, (subject, header)
 
 
 def run(candidate, previous=None, verify_inbound_auth=False):
@@ -184,6 +222,11 @@ def run(candidate, previous=None, verify_inbound_auth=False):
             assert sql("SELECT COUNT(*) FROM mailbox_junk_feedback WHERE reference=? AND action='junk'", (untouched["reference"],)) == saved == [(2,)]
             expect_smtp(test.deliver([owner, neighbor], identity=sender, subject="Rule after restart"), 250)
             assert exists(a, JUNK, "Rule after restart") and exists(b, "INBOX", "Rule after restart")
+
+        test.env.update(SMTP_SPAM_FILTER="true", SMTP_SPAM_JUNK_SCORE="99", SMTP_SPAM_REJECT_SCORE="100")
+        with test.daemon():
+            verify_mime_scoring(test, owner)
+        print("Verified MIME scoring through native SMTP DATA, BDAT and IMAP.")
 
         if verify_inbound_auth:
             test.env.update(SMTP_ANTISPAM_CHECK="true", SMTP_SPAM_FILTER="true", SMTP_SPAM_JUNK_SCORE="0.1", SMTP_SPAM_REJECT_SCORE="99")

@@ -24,6 +24,7 @@
 const std = @import("std");
 const stripHtmlText = @import("html_text.zig").extract;
 const ascii_compat = @import("ascii-compat");
+const mime = @import("zig-mime");
 
 /// Generic authentication verdict. Map the protocol-specific SPF/DKIM/DMARC
 /// result enums onto this before calling `evaluate`.
@@ -367,88 +368,92 @@ fn decodeQuotedPrintable(in: []const u8, out: []u8) []const u8 {
     return out[0..o];
 }
 
-/// Find a `Content-Transfer-Encoding: base64` MIME part inside the scan
-/// window and decode its payload (bounded by `out`). Wrapping the pitch in a
-/// base64 text/html part is the oldest filter-evasion trick there is; without
-/// this the phrase scan only ever sees boundary noise.
-fn decodeBase64Parts(window: []const u8, out: []u8) []const u8 {
-    const marker = "content-transfer-encoding:";
-    var search: usize = 0;
-    var out_len: usize = 0;
-    while (search < window.len) {
-        const rel = ascii_compat.indexOfIgnoreCase(window[search..], marker) orelse break;
-        const vstart = search + rel + marker.len;
-        const line_end = std.mem.indexOfScalarPos(u8, window, vstart, '\n') orelse window.len;
-        if (ascii_compat.indexOfIgnoreCase(window[vstart..line_end], "base64") == null) {
-            search = @min(line_end + 1, window.len);
-            continue;
+const decoded_mime_limit = 12288;
+const body_scan_limit = 16384;
+
+const MimeScan = struct {
+    base64_text: []const u8,
+    qp_len: usize,
+    base64_urls: usize,
+    brand_link_mismatch: bool,
+};
+
+/// Scan decoded text leaves within the same body window as the raw rules.
+/// Each part is normalized on its own so HTML in one part cannot affect
+/// phrase matching in a later sibling.
+fn scanMimeText(headers: []const u8, body: []const u8, base64_text: []u8, qp_text: []u8) MimeScan {
+    const TextView = struct {
+        text: []u8,
+        len: usize = 0,
+        remaining: usize,
+        needs_separator: bool = false,
+
+        fn append(self: *@This(), decoded: []const u8) void {
+            if (self.needs_separator and self.len < self.text.len) {
+                self.text[self.len] = 0;
+                self.len += 1;
+            }
+            self.len += stripHtmlText(decoded, self.text[self.len..]).len;
+            self.needs_separator = self.len > 0;
         }
-        // Skip the remaining part headers up to the blank line.
-        var bp = line_end;
-        while (bp < window.len) {
-            const le = std.mem.indexOfScalarPos(u8, window, bp + 1, '\n') orelse window.len;
-            const line = std.mem.trim(u8, window[bp + 1 .. le], " \t\r");
-            bp = le;
-            if (line.len == 0) break;
-        }
-        // Collect base64 payload lines until a boundary ("--...") or garbage.
-        var collected: [8192]u8 = undefined;
-        var n: usize = 0;
-        var p = bp;
-        collect: while (p < window.len and n < collected.len) {
-            const le = std.mem.indexOfScalarPos(u8, window, p + 1, '\n') orelse window.len;
-            const line = std.mem.trim(u8, window[p + 1 .. le], " \t\r");
-            p = le;
-            if (line.len == 0) continue;
-            if (std.mem.startsWith(u8, line, "--")) break;
-            for (line) |ch| {
-                const ok = std.ascii.isAlphanumeric(ch) or ch == '+' or ch == '/' or ch == '=';
-                if (!ok) break :collect;
-                if (n >= collected.len) break :collect;
-                collected[n] = ch;
-                n += 1;
+    };
+    const Collector = struct {
+        base64: TextView,
+        qp: TextView,
+        part: [body_scan_limit]u8 = undefined,
+        part_len: usize = 0,
+        base64_urls: usize = 0,
+        brand_link_mismatch: bool = false,
+
+        pub fn onEvent(self: *@This(), event: mime.Event) mime.Sink.Error!void {
+            switch (event) {
+                .body => |chunk| {
+                    if (chunk.raw or chunk.region != .content or chunk.part.encoding.isIdentity() or
+                        !std.ascii.eqlIgnoreCase(chunk.part.content_type.media_type, "text")) return;
+                    const view = if (chunk.part.encoding == .base64) &self.base64 else &self.qp;
+                    const n = @min(view.remaining, chunk.bytes.len);
+                    @memcpy(self.part[self.part_len..][0..n], chunk.bytes[0..n]);
+                    self.part_len += n;
+                    view.remaining -= n;
+                },
+                .part_end => |end| {
+                    if (self.part_len == 0) return;
+                    const decoded = self.part[0..self.part_len];
+                    // The raw scan already applies QP decoding, so only
+                    // base64 URLs are additional for the link-count rule.
+                    if (end.part.encoding == .base64) self.base64_urls += countUrls(decoded);
+                    self.brand_link_mismatch = self.brand_link_mismatch or hasBrandLinkMismatch(decoded);
+                    const view = if (end.part.encoding == .base64) &self.base64 else &self.qp;
+                    view.append(decoded);
+                    self.part_len = 0;
+                },
+                else => {},
             }
         }
-        search = @min(p + 1, window.len);
-        n -= n % 4; // drop a trailing partial quantum (window cut mid-line)
-        if (n == 0) continue;
-        const dec_len = std.base64.standard.Decoder.calcSizeForSlice(collected[0..n]) catch continue;
-        if (dec_len > out.len - out_len) break;
-        std.base64.standard.Decoder.decode(out[out_len .. out_len + dec_len], collected[0..n]) catch continue;
-        out_len += dec_len;
-        if (out_len < out.len) {
-            out[out_len] = '\n';
-            out_len += 1;
-        }
-    }
-    return out[0..out_len];
+    };
+
+    var collector: Collector = .{
+        .base64 = .{ .text = base64_text, .remaining = base64_text.len },
+        .qp = .{ .text = qp_text, .remaining = qp_text.len, .needs_separator = true },
+    };
+    // The root header allowance plus the entire body window, with room
+    // for the walker's decoded header parameters.
+    var scratch: [96 * 1024]u8 = undefined;
+    var walker = mime.Walker.init(&scratch, mime.Sink.init(&collector), .{});
+    walker.feed(headers) catch unreachable;
+    walker.feed(if (headers.len == 0 or headers[headers.len - 1] == '\n') "\n" else "\n\n") catch unreachable;
+    walker.feed(body) catch unreachable;
+    walker.finish() catch unreachable;
+    return .{
+        .base64_text = base64_text[0..collector.base64.len],
+        .qp_len = collector.qp.len,
+        .base64_urls = collector.base64_urls,
+        .brand_link_mismatch = collector.brand_link_mismatch,
+    };
 }
 
-/// Decode a body that is base64 in its entirety — a single-part message whose
-/// *message-level* `Content-Transfer-Encoding` is base64. `decodeBase64Parts`
-/// only recognises a part header found inside the body, so without this a
-/// sender skips MIME altogether and every body heuristic goes blind: the scan
-/// window holds nothing but an unbroken run of base64.
-fn decodeBase64Blob(window: []const u8, out: []u8) []const u8 {
-    var collected: [12288]u8 = undefined;
-    var n: usize = 0;
-    var it = std.mem.splitScalar(u8, window, '\n');
-    outer: while (it.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
-        if (line.len == 0) continue;
-        for (line) |ch| {
-            const ok = std.ascii.isAlphanumeric(ch) or ch == '+' or ch == '/' or ch == '=';
-            if (!ok or n >= collected.len) break :outer;
-            collected[n] = ch;
-            n += 1;
-        }
-    }
-    n -= n % 4; // drop a trailing partial quantum (window cut mid-line)
-    if (n == 0) return out[0..0];
-    const dec_len = std.base64.standard.Decoder.calcSizeForSlice(collected[0..n]) catch return out[0..0];
-    if (dec_len > out.len) return out[0..0];
-    std.base64.standard.Decoder.decode(out[0..dec_len], collected[0..n]) catch return out[0..0];
-    return out[0..dec_len];
+fn countUrls(text: []const u8) usize {
+    return countOccurrencesIgnoreCase(text, "http://") + countOccurrencesIgnoreCase(text, "https://");
 }
 
 /// Decode RFC 2047 encoded-words ("=?utf-8?B?...?=" / "=?utf-8?Q?...?=") so
@@ -694,48 +699,30 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
         }
     }
 
-    // Phrase + structural body heuristics (scan subject + start of body).
-    // A larger bounded window prevents trivial padding (large comments/style
-    // blocks before the pitch) from pushing content beyond the old 8 KiB scan.
-    const scan_body = body[0..@min(body.len, 16384)];
-
-    // Phrase scans run on a NORMALIZED view of the body, not the raw bytes:
-    // quoted-printable is decoded (soft breaks rejoin split phrases), HTML
-    // markup/entities are stripped, whitespace is collapsed, and a
-    // base64-encoded MIME part is decoded and appended. Raw-byte scans stay
-    // raw where the markup itself is the signal (URLs, hidden-text CSS,
-    // attachment filenames).
-    var qp_buf: [16384]u8 = undefined;
-    var text_buf: [16384]u8 = undefined;
-    var b64_buf: [12288]u8 = undefined;
-    var b64_text_buf: [12288]u8 = undefined;
+    // Keep the raw body window for undeclared QP and for rules that need
+    // the markup itself. Decode declared MIME text for phrase matching.
+    const scan_body = body[0..@min(body.len, body_scan_limit)];
+    var qp_buf: [body_scan_limit]u8 = undefined;
+    var text_buf: [body_scan_limit]u8 = undefined;
+    var mime_text_buf: [decoded_mime_limit]u8 = undefined;
     const scan_qp = decodeQuotedPrintable(scan_body, &qp_buf);
-    const scan_text = stripHtmlText(scan_qp, &text_buf);
-    // A single-part base64 body is decoded whole; anything else is searched for
-    // base64 MIME parts. The blob decoder yields nothing on a multipart body
-    // (it stops at the first `-` of the boundary), so falling through covers a
-    // message that declares base64 at the top level and then nests parts.
-    const cte_base64 = if (headerValue(headers, "Content-Transfer-Encoding")) |cte|
-        ascii_compat.indexOfIgnoreCase(cte, "base64") != null
-    else
-        false;
-    var b64_part: []const u8 = if (cte_base64) decodeBase64Blob(scan_body, &b64_buf) else &.{};
-    if (b64_part.len == 0) b64_part = decodeBase64Parts(scan_body, &b64_buf);
-    const b64_text = if (b64_part.len > 0) stripHtmlText(b64_part, &b64_text_buf) else b64_part;
+    const raw_text_len = stripHtmlText(scan_qp, &text_buf).len;
+    const mime_scan = scanMimeText(headers, scan_body, &mime_text_buf, text_buf[raw_text_len..]);
+    const scan_text = text_buf[0 .. raw_text_len + mime_scan.qp_len];
 
     const Scan = struct {
         subject: ?[]const u8,
         text: []const u8,
-        b64: []const u8,
+        decoded: []const u8,
         fn hit(self: @This(), phrase: []const u8) bool {
             if (self.subject) |s| {
                 if (ascii_compat.indexOfIgnoreCase(s, phrase) != null) return true;
             }
             if (ascii_compat.indexOfIgnoreCase(self.text, phrase) != null) return true;
-            return self.b64.len > 0 and ascii_compat.indexOfIgnoreCase(self.b64, phrase) != null;
+            return ascii_compat.indexOfIgnoreCase(self.decoded, phrase) != null;
         }
     };
-    const scan = Scan{ .subject = subject, .text = scan_text, .b64 = b64_text };
+    const scan = Scan{ .subject = subject, .text = scan_text, .decoded = mime_scan.base64_text };
 
     // Authenticated-domain parcel phishing. DMARC proves only that the sender
     // controls (or compromised) its own domain; it does not make a claim to be
@@ -768,12 +755,8 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
         }
     }
 
-    // Brand impersonation, second angle: the payload link. Scanned on views
-    // that still carry markup (`scan_qp`, and the raw base64-decoded part) —
-    // `scan_text` has had its tags, and therefore its hrefs, stripped.
-    if (hasBrandLinkMismatch(scan_qp) or
-        (b64_part.len > 0 and hasBrandLinkMismatch(b64_part)))
-    {
+    // Brand impersonation also checks payload links before HTML is stripped.
+    if (hasBrandLinkMismatch(scan_qp) or mime_scan.brand_link_mismatch) {
         score += 5.0;
         tl.add("BRAND_LINK_MISMATCH");
     }
@@ -899,10 +882,7 @@ pub fn evaluate(signals: Signals, headers: []const u8, body: []const u8, thresho
     // Link farm: a wall of URLs is a strong bulk-mail signal. Scanned on the
     // QP-decoded view so a soft line break can't split "https://" or a
     // shortener host.
-    const url_count = countOccurrencesIgnoreCase(scan_qp, "http://") +
-        countOccurrencesIgnoreCase(scan_qp, "https://") +
-        countOccurrencesIgnoreCase(b64_part, "http://") +
-        countOccurrencesIgnoreCase(b64_part, "https://");
+    const url_count = countUrls(scan_qp) + mime_scan.base64_urls;
     if (url_count >= 20) {
         score += 1.5;
         tl.add("MANY_URLS");
@@ -1133,7 +1113,7 @@ fn scanHitWord(scan: anytype, word: []const u8) bool {
         if (containsWordIgnoreCase(s, word)) return true;
     }
     return containsWordIgnoreCase(scan.text, word) or
-        (scan.b64.len > 0 and containsWordIgnoreCase(scan.b64, word));
+        containsWordIgnoreCase(scan.decoded, word);
 }
 
 fn isMostlyUppercase(s: []const u8) bool {
@@ -1550,7 +1530,8 @@ test "QP soft line break cannot split a phrase" {
 test "base64-encoded MIME part cannot hide the pitch" {
     // "Are you interested in seo services? I can send you our price list on whatsapp"
     const b64 = "QXJlIHlvdSBpbnRlcmVzdGVkIGluIHNlbyBzZXJ2aWNlcz8gSSBjYW4gc2VuZCB5b3Ugb3VyIHByaWNlIGxpc3Qgb24gd2hhdHNhcHA=";
-    const headers = "From: x@gmail.com\nTo: a@b\nSubject: hello\nDate: d\nMessage-ID: <1@g>";
+    const headers = "From: x@gmail.com\nTo: a@b\nSubject: hello\nDate: d\nMessage-ID: <1@g>" ++
+        "\nMIME-Version: 1.0\nContent-Type: multipart/mixed; boundary=boundary42";
     const body =
         "--boundary42\r\n" ++
         "Content-Type: text/html; charset=utf-8\r\n" ++
@@ -1565,7 +1546,8 @@ test "base64-encoded MIME part cannot hide the pitch" {
 }
 
 test "a benign first base64 part cannot hide spam in a later part" {
-    const headers = "From: x@gmail.com\nTo: a@b\nSubject: hello\nDate: d\nMessage-ID: <1@g>";
+    const headers = "From: x@gmail.com\nTo: a@b\nSubject: hello\nDate: d\nMessage-ID: <1@g>" ++
+        "\nMIME-Version: 1.0\nContent-Type: multipart/mixed; boundary=b";
     const body =
         "--b\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\n" ++
         "SGVsbG8sIHRoaXMgaXMgYSBub3JtYWwgYWx0ZXJuYXRpdmUu\r\n" ++
@@ -1577,12 +1559,90 @@ test "a benign first base64 part cannot hide spam in a later part" {
 }
 
 test "URLs in a base64 MIME part count toward link farm" {
-    const headers = "From: x@y.example\nSubject: links\nDate: d\nMessage-ID: <1@y>";
+    const headers = "From: x@y.example\nSubject: links\nDate: d\nMessage-ID: <1@y>" ++
+        "\nMIME-Version: 1.0\nContent-Type: multipart/mixed; boundary=b";
     const body =
         "--b\r\nContent-Type: text/html\r\nContent-Transfer-Encoding: base64\r\n\r\n" ++
         "aHR0cHM6Ly9hLnRlc3QgaHR0cHM6Ly9iLnRlc3QgaHR0cHM6Ly9jLnRlc3QgaHR0cHM6Ly9kLnRlc3QgaHR0cHM6Ly9lLnRlc3QgaHR0cHM6Ly9mLnRlc3QgaHR0cHM6Ly9nLnRlc3QgaHR0cHM6Ly9oLnRlc3QgaHR0cHM6Ly9pLnRlc3QgaHR0cHM6Ly9qLnRlc3QgaHR0cHM6Ly9rLnRlc3QgaHR0cHM6Ly9sLnRlc3QgaHR0cHM6Ly9tLnRlc3QgaHR0cHM6Ly9uLnRlc3QgaHR0cHM6Ly9vLnRlc3QgaHR0cHM6Ly9wLnRlc3QgaHR0cHM6Ly9xLnRlc3QgaHR0cHM6Ly9yLnRlc3QgaHR0cHM6Ly9zLnRlc3QgaHR0cHM6Ly90LnRlc3Q=\r\n--b--\r\n";
     const r = evaluate(.{ .spf = .pass }, headers, body, .{});
     try std.testing.expect(std.mem.indexOf(u8, r.tests(), "MANY_URLS") != null);
+}
+
+const encoded_mime_test_headers =
+    "From: Example <person@example.org>\nTo: recipient@example.com\nSubject: A note\n" ++
+    "Date: Sun, 22 Nov 2026 12:00:00 +0000\nMessage-ID: <tests@example.org>\n" ++
+    "MIME-Version: 1.0\nContent-Type: multipart/mixed; boundary=outer";
+const encoded_mime_test_pitch = "Are you interested in seo services?";
+const encoded_mime_test_base64 = "QXJlIHlvdSBpbnRlcmVzdGVkIGluIHNlbyBzZXJ2aWNlcz8=";
+
+test "MIME scoring finds a bare LF encoded part beyond the old part cap" {
+    var payload: [6300 + encoded_mime_test_pitch.len]u8 = @splat(' ');
+    @memcpy(payload[6300..], encoded_mime_test_pitch);
+    var encoded_buffer: [std.base64.standard.Encoder.calcSize(payload.len)]u8 = undefined;
+    const encoded = std.base64.standard.Encoder.encode(&encoded_buffer, &payload);
+    var message: std.ArrayList(u8) = .empty;
+    defer message.deinit(std.testing.allocator);
+    try message.appendSlice(std.testing.allocator, "--outer\nContent-Type: text/html\nContent-Transfer-Encoding: base64\n\n");
+    var offset: usize = 0;
+    while (offset < encoded.len) {
+        const end = @min(offset + 76, encoded.len);
+        try message.appendSlice(std.testing.allocator, encoded[offset..end]);
+        try message.append(std.testing.allocator, '\n');
+        offset = end;
+    }
+    try message.appendSlice(std.testing.allocator, "--outer--\n");
+    const report = evaluate(.{ .spf = .pass }, encoded_mime_test_headers, message.items, .{});
+    try std.testing.expect(std.mem.indexOf(u8, report.tests(), "SEO_SOLICITATION") != null);
+}
+
+test "MIME scoring unfolds the transfer encoding of a nested HTML part" {
+    const body = "--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n" ++
+        "--inner\r\nContent-Type: text/html\r\nContent-Transfer-Encoding:\r\n\tbase64\r\n\r\n" ++
+        encoded_mime_test_base64 ++ "\r\n--inner--\r\n--outer--\r\n";
+    const report = evaluate(.{ .spf = .pass }, encoded_mime_test_headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, report.tests(), "SEO_SOLICITATION") != null);
+}
+
+test "MIME scoring accepts a mixed-case transfer field with legacy whitespace before the colon" {
+    const body = "--outer\r\ncOnTeNt-TyPe: TeXt/HtMl\r\ncOnTeNt-TrAnSfEr-EnCoDiNg\t: bAsE64\r\n\r\n" ++
+        encoded_mime_test_base64 ++ "\r\n--outer--\r\n";
+    const report = evaluate(.{ .spf = .pass }, encoded_mime_test_headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, report.tests(), "SEO_SOLICITATION") != null);
+}
+
+test "MIME scoring keeps the base64 budget separate from quoted printable text" {
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(std.testing.allocator);
+    const a = std.testing.allocator;
+    try body.appendSlice(a, "--outer\nContent-Type: text/plain\nContent-Transfer-Encoding: quoted-printable\n\n");
+    for (0..200) |_| try body.appendSlice(a, "A routine and unrelated first part. It continues onto another line.\n");
+    try body.appendSlice(a, "--outer\nContent-Type: text/html\nContent-Transfer-Encoding: base64\n\n" ++
+        encoded_mime_test_base64 ++ "\n--outer--\n");
+    const report = evaluate(.{ .spf = .pass }, encoded_mime_test_headers, body.items, .{});
+    try std.testing.expect(std.mem.indexOf(u8, report.tests(), "SEO_SOLICITATION") != null);
+}
+
+test "MIME scoring projects folded quoted printable text through the walker" {
+    const body = "--outer\nContent-Type: text/html\nContent-Transfer-Encoding:\n\tquoted-printable\n\n" ++
+        "<p>Are you interested in seo ser=\nvices?</p>\n--outer--\n";
+    var b64: [decoded_mime_limit]u8 = undefined;
+    var qp: [body_scan_limit]u8 = undefined;
+    const projection = scanMimeText(encoded_mime_test_headers, body, &b64, &qp);
+    try std.testing.expectEqualStrings("", projection.base64_text);
+    try std.testing.expect(std.mem.indexOf(u8, qp[0..projection.qp_len], encoded_mime_test_pitch) != null);
+}
+
+test "MIME scoring does not decode binary attachments or count quoted printable links twice" {
+    const body = "--outer\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\n" ++
+        encoded_mime_test_base64 ++ "\r\n" ++
+        "--outer\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n" ++
+        "http://example.org/1=20http://example.org/2=20http://example.org/3\r\n" ++
+        "http://example.org/4=20http://example.org/5=20http://example.org/6\r\n" ++
+        "http://example.org/7=20http://example.org/8=20http://example.org/9\r\n" ++
+        "http://example.org/10\r\n--outer--\r\n";
+    const report = evaluate(.{ .spf = .pass }, encoded_mime_test_headers, body, .{});
+    try std.testing.expect(std.mem.indexOf(u8, report.tests(), "SEO_SOLICITATION") == null);
+    try std.testing.expect(std.mem.indexOf(u8, report.tests(), "MANY_URLS") == null);
 }
 
 test "encoded-word subject is decoded before subject heuristics" {
