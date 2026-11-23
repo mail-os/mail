@@ -3,7 +3,10 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from email.message import EmailMessage
+from email import policy
+from email.parser import BytesParser
 import os
 from pathlib import Path
 import runpy
@@ -11,6 +14,7 @@ import secrets
 import sys
 import tempfile
 import time
+from xml.sax.saxutils import escape, quoteattr
 
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -281,6 +285,124 @@ def share_smart_reply(fixture, own, teammate, root, follow_sent):
     preview = expect(fixture.api(own, SHARES + "/preview", selection))
     grant = expect(fixture.api(own, SHARES, {**selection, "team": "native", "grantee": teammate, "digest": preview["digest"]}), 201)
     return f"{SHARES}/{grant['id']}"
+
+
+def verify_ews_reply(fixture):
+    ews = runpy.run_path(str(SCRIPTS / "test-ews-clamav.py"))
+    with ExitStack() as servers:
+        servers.enter_context(fixture.daemon())
+        owner, teammate, author, outsider = (
+            fixture.provision(name) for name in ("ews-owner", "ews-peer", "ews-author", "ews-outsider"))
+        own, peer, root = smart_reply_parent(fixture, owner, teammate, author)
+        sync = ('<m:SyncFolderItems><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape>'
+                '<m:SyncFolderId><t:DistinguishedFolderId Id="inbox"/></m:SyncFolderId>'
+                '<m:MaxChangesReturned>10</m:MaxChangesReturned></m:SyncFolderItems>')
+        source = ews["item_id"](ews["check"](fixture, owner, sync, "NoError"))
+        source, _ = ews["get_mime"](fixture, owner, source)
+
+        def create(kind, disposition, note, *codes, identity=owner, original=source, cc=(), bcc=(), subject=None):
+            fields = "".join(
+                f"<t:{field}Recipients>" + "".join(
+                    f"<t:Mailbox><t:EmailAddress>{escape(address)}</t:EmailAddress></t:Mailbox>" for address in recipients
+                ) + f"</t:{field}Recipients>" for field, recipients in (("Cc", cc), ("Bcc", bcc)) if recipients
+            )
+            if subject is not None:
+                fields = f"<t:Subject>{escape(subject)}</t:Subject>" + fields
+            item = (f"<t:{kind}>{fields}<t:ReferenceItemId Id={quoteattr(original['Id'])} "
+                    f"ChangeKey={quoteattr(original['ChangeKey'])}/>"
+                    f"<t:NewBodyContent BodyType='HTML'>&lt;p&gt;{escape(note)}&lt;/p&gt;</t:NewBodyContent></t:{kind}>")
+            return ews["check"](fixture, identity, ews["create"](disposition, item), *(codes or ("NoError",)))
+
+        def send_draft(item, code="NoError"):
+            request = (f"<m:SendItem SaveItemToFolder='true'><m:ItemIds>"
+                       f"<t:ItemId ChangeKey={quoteattr(item['ChangeKey'])} Id={quoteattr(item['Id'])}/>"
+                       "</m:ItemIds></m:SendItem>")
+            ews["check"](fixture, owner, request, code)
+
+        # The draft starts before the grant. Its server-owned source survives
+        # the normal attachment edit and a later grant against the same parent.
+        draft = ews["item_id"](create("ReplyToItem", "SaveOnly", "Saved EWS reply", subject="Draft with EWS file"))
+        outgoing = share_smart_reply(fixture, own, teammate, root, True)
+        inbound_only = share_smart_reply(fixture, own, teammate, root, False)
+        foreign = fixture.login(outsider)
+
+        def visible(path=outgoing):
+            return expect(fixture.api(peer, path))["messages"]
+
+        create("ReplyToItem", "SendOnly", "EWS without Sent")
+        create("ReplyAllToItem", "SendAndSaveCopy", "Blind EWS reply", bcc=[author])
+        create("ReplyAllToItem", "SendAndSaveCopy", "Outside EWS audience", cc=[outsider])
+        create("ReplyToItem", "SendAndSaveCopy", "Cross-owner source", "ErrorItemNotFound", identity=outsider)
+        create("ReplyToItem", "SendAndSaveCopy", "Stale source", "ErrorIrresolvableConflict",
+               original={**source, "ChangeKey": "stale"})
+        with fixture.imap(owner) as mailbox:
+            duplicate = hosted["eas_mime"](author, owner, subject="Different local item with the same ID",
+                                           extra=f"Message-ID: {root['message_id']}\r\n".encode())
+            assert mailbox.append("Sent", None, None, duplicate)[0] == "OK"
+        sent_sync = ews["check"](fixture, owner, sync.replace('Id="inbox"', 'Id="sentitems"'), "NoError")
+        for candidate in sent_sync.findall(".//{*}ItemId"):
+            copied, raw = ews["get_mime"](fixture, owner, candidate.attrib)
+            if BytesParser(policy=policy.default).parsebytes(raw)["Subject"] == "Different local item with the same ID":
+                break
+        else:
+            raise AssertionError("EWS did not return the imported duplicate")
+        create("ReplyToItem", "SendAndSaveCopy", "Different item reply", original=copied)
+        forged = EmailMessage()
+        forged["From"], forged["To"], forged["Subject"] = owner, author, "Ordinary EWS MIME with a reply header"
+        forged["Message-ID"], forged["In-Reply-To"] = "<forged-ews@threads.example.test>", root["message_id"]
+        forged.set_content("MIME headers alone do not authenticate the source.")
+        unproven = ews["item_id"](ews["check"](fixture, owner, ews["create"]("SaveOnly", ews["mime_message"](forged.as_bytes())), "NoError"))
+        send_draft(unproven)
+        assert [message["reference"] for message in visible()] == [root["reference"]]
+        expect(fixture.api(foreign, outgoing), 404)
+
+        direct = ews["item_id"](create("ReplyAllToItem", "SendAndSaveCopy", "Direct EWS reply"))
+        _, direct_raw = ews["get_mime"](fixture, owner, direct)
+        message = BytesParser(policy=policy.default).parsebytes(direct_raw)
+        assert message["To"] == author and message["In-Reply-To"] == root["message_id"]
+        assert message["Subject"] == "Re: Follow fixture native-parent"
+        rendered = message.get_body(preferencelist=("html",)).get_content()
+        assert "<p>Direct EWS reply</p>" in rendered
+        assert "<blockquote><pre>Reply content for native-parent." in rendered
+
+        attached = ews["check"](fixture, owner, ews["attach"](draft, ews["file_xml"](FILE, "ews-reply.bin")), "NoError")
+        change = attached.find(".//{*}AttachmentId").attrib["RootItemChangeKey"]
+        edited = {**draft, "ChangeKey": change}
+        servers.close()
+        servers.enter_context(fixture.daemon())
+        send_draft(draft, "ErrorIrresolvableConflict")
+        _, draft_raw = ews["get_mime"](fixture, owner, edited)
+        baseline, count = fixture.bytes(owner), fixture.count(owner)
+        fixture.provision("ews-owner", quota=baseline + len(draft_raw) - 1)
+        send_draft(edited, "ErrorQuotaExceeded")
+        assert fixture.bytes(owner) == baseline and fixture.count(owner) == count and len(visible()) == 2
+        fixture.provision("ews-owner", quota=baseline + len(draft_raw))
+        send_draft(edited)
+        assert fixture.bytes(owner) == baseline + len(draft_raw) and fixture.count(owner) == count + 1
+        _, first, second = visible()
+        assert first["sentReply"] and second["sentReply"] and second["subject"] == "Draft with EWS file"
+        assert "Saved EWS reply" in second["text"] and second["attachments"] == []
+        expect(fixture.api(peer, f"{outgoing}/attachments/{second['reference']}/0"), 404)
+        saved = expect(fixture.api(own, "messages/ref/" + second["reference"]))
+        assert saved["in_reply_to"] == root["message_id"] and saved["attachments"][0]["filename"] == "ews-reply.bin"
+        assert not any(message["sentReply"] for message in visible(inbound_only))
+        assert expect(fixture.api(peer, "notifications/claim", method="POST"))["teamReplies"] == 2
+
+        fixture.provision("ews-owner")
+        send_draft(edited)
+        assert [message["reference"] for message in visible()] == [root["reference"], first["reference"], second["reference"]]
+        assert expect(fixture.api(peer, "notifications/claim", method="POST")).get("teamReplies", 0) == 0
+        continuation = ews["item_id"](create("ReplyToItem", "SendAndSaveCopy", "EWS reply to a saved sent reply",
+                                             original=direct, subject="EWS conversation continuation"))
+        _, continuation_raw = ews["get_mime"](fixture, owner, continuation)
+        parsed = BytesParser(policy=policy.default).parsebytes(continuation_raw)
+        assert parsed["To"] == author and parsed["In-Reply-To"] == message["Message-ID"]
+        assert root["message_id"] in parsed["References"] and message["Message-ID"] in parsed["References"]
+        assert visible()[-1]["sentReply"]
+        expect(fixture.api(own, outgoing, method="DELETE"))
+        create("ReplyToItem", "SendAndSaveCopy", "EWS after revocation")
+        expect(fixture.api(peer, outgoing), 404)
+        print("Verified EWS reply and reply-all, exact owner and source, Sent quota, edited drafts, blind copies, and revoked grants.")
 
 
 def verify_smart_reply(fixture, outsider):
@@ -612,7 +734,9 @@ def main():
         verify(Fixture(args.binary.resolve(strict=True), Path(directory), staging=True))
     with tempfile.TemporaryDirectory(prefix="mail-team-smart-remote-") as directory:
         verify_remote_smart_reply(Fixture(args.binary.resolve(strict=True), Path(directory), staging=True))
-    print("Verified team conversations, followed incoming, webmail, and SmartReply replies, live collections, previews, search, downloads, comments, notices, and revocation.")
+    with tempfile.TemporaryDirectory(prefix="mail-team-ews-reply-") as directory:
+        verify_ews_reply(Fixture(args.binary.resolve(strict=True), Path(directory), staging=True))
+    print("Verified team conversations, followed incoming, webmail, ActiveSync, and EWS replies, live collections, previews, search, downloads, comments, notices, and revocation.")
 
 
 if __name__ == "__main__":

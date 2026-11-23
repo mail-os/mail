@@ -202,6 +202,38 @@ pub fn issue(a: Allocator, db: *database.Database, user: []const u8, target: Loc
     return id;
 }
 
+/// Keep EWS reply provenance outside MIME and attach it to the draft's
+/// registry identity, which survives a trusted draft or attachment edit.
+pub fn recordEwsReplyDraft(db: *database.Database, user: []const u8, draft: []const u8, wire_id: []const u8, source: database.Database.TeamReplySource) !void {
+    const s = try db.prepare(
+        \\INSERT INTO mail_ews_reply_drafts(user_id,draft_reference,draft_wire_id,parent_reference,parent_revision,parent_wire_id)
+        \\SELECT id,?2,?3,?4,?5,?6 FROM users WHERE username=?1
+    );
+    defer s.finalize();
+    try s.bind(1, user);
+    try s.bind(2, draft);
+    try s.bind(3, wire_id);
+    try s.bind(4, source.reference);
+    try s.bind(5, @as([]const u8, &source.revision));
+    try s.bind(6, source.wire_id);
+    _ = try s.step();
+}
+
+pub fn ewsReplyDraft(a: Allocator, db: *database.Database, user: []const u8, draft: []const u8, wire_id: []const u8) !?database.Database.TeamReplySource {
+    const s = try db.prepare("SELECT parent_reference,parent_revision,parent_wire_id FROM mail_ews_reply_drafts WHERE " ++ owner ++
+        " AND draft_reference=?2 AND draft_wire_id=?3");
+    defer s.finalize();
+    try s.bind(1, user);
+    try s.bind(2, draft);
+    try s.bind(3, wire_id);
+    if (!try s.step() or s.columnText(1).len != 64) return null;
+    return .{
+        .reference = try a.dupe(u8, s.columnText(0)),
+        .revision = s.columnText(1)[0..64].*,
+        .wire_id = try a.dupe(u8, s.columnText(2)),
+    };
+}
+
 /// Record the destination before changing the filesystem. The caller can
 /// finish immediately, or a later read can recover the handoff by its digest.
 pub fn stage(a: Allocator, db: *database.Database, user: []const u8, source: Location, path: []const u8, target: Location, bytes: ?[]const u8) !?[]const u8 {

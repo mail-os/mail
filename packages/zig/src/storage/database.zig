@@ -421,6 +421,21 @@ pub const Database = struct {
             \\    UNIQUE(user_id,folder,basename)
             \\);
             \\CREATE INDEX IF NOT EXISTS mailbox_message_refs_pending ON mailbox_message_refs(user_id,next_folder,next_basename) WHERE next_folder IS NOT NULL;
+            \\CREATE TABLE IF NOT EXISTS mail_ews_reply_drafts (
+            \\    user_id INTEGER NOT NULL,
+            \\    draft_reference TEXT NOT NULL,
+            \\    draft_wire_id TEXT NOT NULL,
+            \\    parent_reference TEXT NOT NULL,
+            \\    parent_revision TEXT NOT NULL CHECK(length(parent_revision)=64),
+            \\    parent_wire_id TEXT NOT NULL,
+            \\    PRIMARY KEY(user_id,draft_reference),
+            \\    FOREIGN KEY(user_id,draft_reference) REFERENCES mailbox_message_refs(user_id,reference) ON DELETE CASCADE ON UPDATE CASCADE,
+            \\    FOREIGN KEY(user_id,parent_reference) REFERENCES mailbox_message_refs(user_id,reference) ON DELETE CASCADE ON UPDATE CASCADE
+            \\);
+            \\CREATE TRIGGER IF NOT EXISTS mail_ews_reply_replaced_ref BEFORE UPDATE OF reference ON mailbox_message_refs
+            \\WHEN OLD.reference<>NEW.reference BEGIN
+            \\    DELETE FROM mail_ews_reply_drafts WHERE user_id=OLD.user_id AND (draft_reference=OLD.reference OR parent_reference=OLD.reference);
+            \\END;
             \\CREATE TABLE IF NOT EXISTS mail_retention_rules (
             \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
             \\    folder TEXT,
