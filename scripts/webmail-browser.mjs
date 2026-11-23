@@ -98,7 +98,9 @@ async function verifyControlRow(container, selector, height, sameRow = true) {
     const box = node.getBoundingClientRect()
     const borderChannels = style.getPropertyValue('--control-border').trim().slice(1).match(/../g)
     const border = `rgb(${borderChannels.map(channel => Number.parseInt(channel, 16)).join(', ')})`
-    const neutral = !node.matches('.calendar-primary, .wm-snapshot-primary, .wm-list-toggle, .wm-action--quiet, .wm-send-btn, .wm-composer-foot > .wm-action, .mail-auth-page button:not(.login-secondary)')
+    const primary = node.matches('.calendar-primary, .wm-snapshot-primary, .wm-send-btn')
+    const quiet = node.matches('.wm-list-toggle, .wm-action--quiet, .wm-composer-foot > .wm-action:not(.wm-snapshot-primary), .mail-auth-page button:not(.login-secondary)')
+    const neutral = !quiet && (!primary || node.matches(':disabled'))
     return {
       name: node.getAttribute('aria-label') || node.id || node.tagName,
       height: box.height,
@@ -183,6 +185,7 @@ async function verifyCalendarPeriod(page, label, height) {
       assert(Math.abs(control.top - date.top) < 0.5 && Math.abs(control.bottom - date.bottom) < 0.5,
         'The view and time zone controls align with both edges of the date controls')
     }
+    verifyControlGaps([views.at(-1), controls[0]], 16)
   }
   if (stacked) {
     assert(Math.abs(date.top - row[0].bottom - 6) < 0.5, 'Jump to date has the same gap below date navigation')
@@ -402,6 +405,8 @@ async function desktopJourney(page) {
   assert.equal(await button(page, 'Select').evaluate(node => node === document.activeElement), true)
 
   const search = page.getByRole('searchbox', { name: 'Search messages' })
+  const searchRow = page.locator('.wm-search-row')
+  verifyControlGaps(await verifyControlRow(searchRow, '.mail-search-field, .wm-search-filters', 36), 6)
   await search.focus()
   assert.equal(await search.evaluate(input => getComputedStyle(input.parentElement).outlineStyle), 'solid')
   await search.fill(handoff)
@@ -409,6 +414,7 @@ async function desktopJourney(page) {
   await page.getByText('1 message', { exact: true }).waitFor()
   await button(page, 'Filters').press('Enter')
   assert.equal(await button(page, 'Filters').getAttribute('aria-expanded'), 'true')
+  verifyControlGaps(await verifyControlRow(searchRow, '.mail-search-field, .wm-search-filters', 36), 6)
   await page.getByRole('textbox', { name: 'Filter by sender' }).waitFor()
   const statusFilter = page.getByRole('combobox', { name: 'Filter by message status' })
   await verifySelect(statusFilter)
@@ -422,6 +428,10 @@ async function desktopJourney(page) {
   await button(page, 'Filters').press('Enter')
   await button(page, 'Clear search and filters').click()
   await page.getByText('7 messages', { exact: true }).waitFor()
+  await page.emulateMedia({ colorScheme: 'dark' })
+  verifyControlGaps(await verifyControlRow(searchRow, '.mail-search-field, .wm-search-filters', 36), 6)
+  await searchRow.screenshot({ path: join(output, 'desktop-search-controls-dark.png'), animations: 'disabled' })
+  await page.emulateMedia({ colorScheme: 'light' })
 
   await button(page, /Tuesday design handoff/).click()
   await heading(page, handoff).waitFor()
@@ -538,6 +548,8 @@ async function phoneJourney(page) {
   assert.equal(await toggle.getAttribute('aria-controls'), 'mailNavigation')
   assert(!await folders(page).isVisible(), 'Phone starts with the mailbox drawer closed')
   assert((await page.locator('.wm-folders').boundingBox()).height < 64, 'Closed drawer fits in a one-row header')
+  const searchRow = page.locator('.wm-search-row')
+  verifyControlGaps(await verifyControlRow(searchRow, '.mail-search-field, .wm-search-filters', 44), 6)
   await screenshot(page, 'phone-inbox-dark')
   await page.emulateMedia({ colorScheme: 'light' })
   await screenshot(page, 'phone-inbox-light')
@@ -1526,10 +1538,17 @@ async function calendarSharingJourney(captain) {
     'Teammate, access, and submit align on the second row')
   assert(Math.abs(tabletCalendar.left - tabletEmail.left) < 0.5 && Math.abs(tabletTeam.right - tabletSubmit.right) < 0.5,
     'Both share-form rows reach the same left and right edges')
+  assert(tabletTeam.right - tabletTeam.left >= (tabletCalendar.right - tabletCalendar.left) * 0.65,
+    'The team picker gets a substantial share of the first row')
   verifyControlGaps(tabletControls.slice(0, 2), 12)
   verifyControlGaps(tabletControls.slice(2), 12)
   await verifySelectedOptionFits(sharing.getByLabel('Calendar to share'))
   await shareForm.screenshot({ path: join(output, 'tablet-calendar-sharing-dark.png'), animations: 'disabled' })
+  await captain.setViewportSize({ width: 701, height: 940 })
+  await verifyControlRow(shareForm, 'select, input, button', 44, false)
+  for (const picker of await shareForm.getByRole('combobox').all()) await verifySelectedOptionFits(picker)
+  assert(await button(shareForm, 'Share calendar').evaluate(node => node.scrollWidth <= node.clientWidth),
+    'The Share calendar label and icon fit at the start of the tablet layout')
   await captain.setViewportSize({ width: 1440, height: 940 })
   await captain.emulateMedia({ colorScheme: 'light' })
   await screenshot(captain, 'desktop-calendar-selects')
@@ -1544,10 +1563,16 @@ async function calendarSharingJourney(captain) {
       captain.waitForRequest(request => request.url().endsWith('/teams/studio/calendar-shares') && request.method() === 'PUT'),
       button(sharing, 'Share calendar').click(),
     ])
-    for (const field of await shareForm.locator('input, select').all()) assert(await field.isDisabled())
-    const disabledFields = await verifyControlRow(shareForm, 'input, select', 36)
-    assert(disabledFields.every(field => field.opacity === '1'), 'Disabled fields keep the shared border at full opacity')
+    for (const control of await shareForm.locator('input, select, button').all()) assert(await control.isDisabled())
+    const disabledControls = await verifyControlRow(shareForm, 'input, select, button', 36)
+    verifyControlGaps(disabledControls, 12)
+    assert(disabledControls.every(control => control.neutral && control.borderMatches && control.opacity === '1'),
+      'While sharing, every control keeps the same border at full opacity')
     await shareForm.screenshot({ path: join(output, 'desktop-calendar-sharing-pending.png'), animations: 'disabled' })
+    await captain.emulateMedia({ colorScheme: 'dark' })
+    verifyControlGaps(await verifyControlRow(shareForm, 'input, select, button', 36), 12)
+    await shareForm.screenshot({ path: join(output, 'desktop-calendar-sharing-pending-dark.png'), animations: 'disabled' })
+    await captain.emulateMedia({ colorScheme: 'light' })
   }
   finally { resumeShare.resolve() }
   const role = captain.getByRole('combobox', { name: `Access for ${sender} to ${calendarLabel}` })
