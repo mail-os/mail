@@ -15,6 +15,7 @@
   --control-border: #828794;
   --control-height: 36px;
   --control-radius: 8px;
+  --control-font-size: .8125rem;
   --select-chevron: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Cpath d=%22m4 6 4 4 4-4%22 fill=%22none%22 stroke=%22%23515966%22 stroke-width=%221.5%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22/%3E%3C/svg%3E");
   --accent: #0755ad;
   --primary: #0866d4;
@@ -106,20 +107,17 @@ body {
 .login label { display: block; font-weight: 600; font-size: 12px; margin: 12px 0 4px; }
 .login input {
   width: 100%;
-  padding: 10px 12px;
-  border: 1px solid var(--control-border);
-  border-radius: var(--control-radius);
-  font-size: 14px;
+  padding-inline: 12px;
 }
-.login input:focus { outline: 2px solid var(--accent); outline-offset: 2px; border-color: var(--accent); }
 .login button {
   width: 100%;
+  min-block-size: var(--control-height);
   margin-top: 18px;
-  padding: 11px;
+  padding: 6px 12px;
   background: var(--primary);
   color: var(--on-primary);
-  border: 0;
-  border-radius: 8px;
+  border: 1px solid var(--primary);
+  border-radius: var(--control-radius);
   font-size: 14px;
   font-weight: 600;
   cursor: pointer;
@@ -142,19 +140,42 @@ body {
 
 /* Mailbox shell and reusable controls. */
 button, input, textarea, select { font: inherit; }
-input:not([type=checkbox]), textarea { color: var(--text); background-color: var(--panel); }
-select {
-  appearance: none;
+:where(input:not([type=checkbox], [type=radio], [type=hidden], [hidden], .wm-file-input), select, textarea, .wm-action) {
   min-inline-size: 0;
   max-inline-size: 100%;
   min-block-size: var(--control-height);
-  padding-block: 6px;
-  padding-inline: 10px 30px;
+  padding: 6px 10px;
   border: 1px solid var(--control-border);
   border-radius: var(--control-radius);
-  background: var(--panel) var(--select-chevron) right 9px center / 14px no-repeat;
+  background-color: var(--panel);
   color: var(--text);
-  font-size: 13px;
+  font-size: var(--control-font-size);
+  line-height: 1.25;
+}
+:where(input, select, textarea) { font-weight: 400; }
+input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
+:where(input[type=date], input[type=time], input[type=datetime-local]) {
+  block-size: var(--control-height);
+  font-variant-numeric: tabular-nums;
+  text-align: start;
+}
+:where(input[type=file]:not(.wm-file-input)) { padding: 3px; }
+input::file-selector-button {
+  min-block-size: calc(var(--control-height) - 8px);
+  margin-inline-end: 8px;
+  padding-inline: 8px;
+  border: 0;
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+input:not(:disabled)::file-selector-button:hover { background: var(--hover); }
+select {
+  appearance: none;
+  padding-inline-end: 30px;
+  background: var(--panel) var(--select-chevron) right 9px center / 14px no-repeat;
   text-overflow: ellipsis;
   cursor: pointer;
 }
@@ -191,15 +212,15 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus,
 .wm-refresh { border: 0; background: transparent; color: var(--accent); font-size: 13px; }
 .wm-search-form { padding: 12px; border-bottom: 1px solid var(--border); }
 .wm-search-row { display: flex; gap: 6px; }
-.wm-search { min-width: 0; width: 100%; padding: 9px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); }
-.wm-action { display: inline-flex; align-items: center; gap: 4px; min-block-size: var(--control-height); padding: 6px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); background: var(--panel); color: var(--text); font-size: 12px; line-height: 1.25; white-space: nowrap; cursor: pointer; }
-.wm-action:hover { background: var(--bg); }
+.wm-search { width: 100%; }
+.wm-action { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; white-space: nowrap; cursor: pointer; }
+.wm-action:hover:where(:not(:disabled)) { background: var(--toolbar); }
 .wm-action--danger { color: var(--danger); }
 .wm-action--danger:hover { background: var(--danger-soft); }
 .wm-filter-panel { display: flex; flex-direction: column; gap: 10px; padding-top: 12px; }
 .wm-filter-panel label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
 .wm-filter-panel select { width: 100%; }
-.wm-filter-panel input:not([type=checkbox]) { width: 100%; min-width: 0; min-block-size: var(--control-height); border: 1px solid var(--control-border); border-radius: var(--control-radius); padding: 6px 10px; color: var(--text); background: var(--panel); }
+.wm-filter-panel input:not([type=checkbox]) { width: 100%; }
 .wm-filter-dates { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .wm-filter-checks { display: flex; flex-wrap: wrap; gap: 12px; }
 .wm-filter-checks label { flex-direction: row; align-items: center; color: var(--text); }
@@ -226,8 +247,7 @@ input[type=checkbox] { accent-color: var(--accent); }
 .wm-combined-accounts li:last-child { margin-bottom: 8px; }
 .wm-combined-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
 .wm-combined-form label { display: grid; flex: 1 1 12rem; gap: 5px; min-width: 0; font-size: 13px; }
-.wm-combined-form input, .wm-combined-form select { width: 100%; min-height: var(--control-height); }
-.wm-combined-form input { min-width: 0; padding: 6px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); }
+.wm-combined-form :is(input, select) { width: 100%; }
 .wm-combined-search { padding: 12px; border-bottom: 1px solid var(--border); }
 .wm-combined-search label:first-child { flex-grow: 3; }
 .wm-combined-row { display: grid; grid-template-columns: 44px minmax(0, 1fr); align-items: center; border-bottom: 1px solid var(--border); }
@@ -334,7 +354,6 @@ input[type=checkbox] { accent-color: var(--accent); }
 .wm-reader-attention-actions .wm-action:hover { color: var(--text); background: var(--hover); }
 .wm-reader-attention-actions, .wm-attention-schedule > div { display: flex; flex-wrap: wrap; gap: 7px; }
 .wm-attention-schedule { display: grid; gap: 7px; margin-top: 10px; font-size: 13px; }
-.wm-attention-schedule input { min-width: 0; min-block-size: var(--control-height); padding: 6px 10px; color: var(--text); background: var(--panel); border: 1px solid var(--control-border); border-radius: var(--control-radius); }
 .wm-reply-clear { display: flex; align-items: center; gap: 6px; padding: 6px 18px; color: var(--muted); font-size: 13px; }
 
 .wm-receipt-preview { padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); overflow-wrap: anywhere; }
@@ -351,7 +370,7 @@ input[type=checkbox] { accent-color: var(--accent); }
 .wm-outbox { grid-column: 1 / -1; overflow-y: auto; padding-bottom: 24px; }
 .wm-outbox-views { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px 16px; }
 .wm-outbox-views .wm-action { display: inline-flex; align-items: center; gap: 7px; }
-.wm-outbox-views .wm-action[aria-pressed=true] { background: var(--accent-soft); border-color: var(--selection-edge); color: var(--accent); }
+.wm-outbox-views .wm-action[aria-pressed=true] { background: var(--accent-soft); color: var(--accent); }
 .wm-outbox-count { font-variant-numeric: tabular-nums; color: var(--muted); }
 .wm-outbox-pagination { margin: 0 16px; }
 .wm-outbox-item { display: flex; gap: 16px; align-items: center; justify-content: space-between; margin: 16px; padding: 20px; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); }
@@ -366,7 +385,7 @@ input[type=checkbox] { accent-color: var(--accent); }
 .wm-review-welcome h2 { margin: 0; font-size: 15px; }
 .wm-review-welcome p { margin: 5px 0 0; color: var(--muted); font-size: 13px; }
 .wm-review-tabs { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--border); }
-.wm-review-tabs [aria-pressed='true'] { color: var(--accent); border-color: var(--selection-edge); background: var(--selected); }
+.wm-review-tabs [aria-pressed='true'] { color: var(--accent); background: var(--selected); }
 .wm-review-group { margin: 12px; border: 1px solid var(--border); background: var(--panel); border-radius: 10px; }
 .wm-review-group header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; padding: 10px 12px; }
 .wm-review-group h2 { margin: 0; overflow-wrap: anywhere; font-size: 14px; }
@@ -392,7 +411,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-recipient-box { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; position: relative; min-width: 0; padding: 5px; border: 1px solid var(--control-border); border-radius: 8px; }
 .wm-recipient-box:focus-within { border-color: var(--accent); }
 .wm-recipient-box--invalid { border-color: var(--danger); }
-.wm-recipient-box > input { flex: 1; min-width: 160px; max-width: 100%; padding: 5px; border: 0; outline: 0; background: transparent; }
+.wm-recipient-box > input { flex: 1; min-width: min(100%, 10rem); min-block-size: 0; padding: 5px; border: 0; outline: 0; background: transparent; font-size: inherit; }
 .wm-recipient-chip { display: flex; max-width: 100%; border-radius: 5px; background: var(--accent-soft); color: var(--accent); }
 .wm-recipient-chip button { min-width: 0; border: 0; background: transparent; color: inherit; padding: 5px 7px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wm-recipient-chip--invalid { background: var(--danger-soft); color: var(--danger); }
@@ -401,8 +420,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-recipient-suggestions button:hover, .wm-recipient-suggestions button[aria-selected=true] { background: var(--accent-soft); }
 .wm-recipient-suggestions small { color: var(--muted); }
 .wm-cc-controls { display: flex; gap: 14px; padding-inline-start: 56px; font-size: 11px; color: var(--muted); }
-.wm-subject-field input { min-width: 0; width: 100%; padding: 9px 10px; border: 1px solid var(--control-border); border-radius: 8px; font-weight: 550; }
-.wm-composer-body { min-height: clamp(150px, 25dvh, 240px); flex-shrink: 0; resize: vertical; margin: 14px 20px; padding: 12px; border: 1px solid var(--control-border); border-radius: 8px; font: inherit; line-height: 1.6; }
+.wm-subject-field input { width: 100%; font-size: inherit; font-weight: 550; }
+.wm-composer-body { min-height: clamp(150px, 25dvh, 240px); flex-shrink: 0; resize: vertical; margin: 14px 20px; padding: 12px; line-height: 1.6; }
 .wm-dropzone { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; padding: 9px; margin: 0 20px; border: 1px dashed var(--control-border); border-radius: 8px; font-size: 12px; color: var(--muted); }
 .wm-dropzone--active { border-color: var(--accent); background: var(--accent-soft); }
 .wm-dropzone small { margin-inline-start: auto; }
@@ -422,7 +441,6 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-composer-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 14px 20px; border-top: 1px solid var(--border); background: var(--panel); position: sticky; bottom: 0; z-index: 2; }
 .wm-send-schedule { display: flex; flex: 1 0 100%; align-items: center; flex-wrap: wrap; gap: 8px; padding-bottom: 8px; }
 .wm-send-schedule label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 650; }
-.wm-send-schedule input { min-block-size: var(--control-height); max-width: 100%; border: 1px solid var(--control-border); border-radius: var(--control-radius); padding: 6px 10px; color: var(--text); background: var(--panel); font: inherit; }
 .wm-send-schedule small { color: var(--muted); font-size: 12px; }
 .wm-send-delay { display: flex; align-items: center; gap: 5px; margin-left: auto; font-size: 11px; color: var(--muted); }
 .wm-send-delay select { font-size: 12px; }
@@ -484,24 +502,20 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 
 .calendar-controls, .calendar-choices { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
 .calendar-controls { justify-content: space-between; gap: .75rem; margin-block: .75rem; }
-.calendar-choices .wm-action[aria-pressed="true"] { color: var(--accent); background: var(--selected); border-color: var(--selection-edge); }
+.calendar-choices .wm-action[aria-pressed="true"] { color: var(--accent); background: var(--selected); }
 .calendar-range { font-size: 1.125rem; font-weight: 650; margin: 1.15rem 0 .75rem; }
 .calendar-events { list-style: none; padding: 0; margin: .5rem 0; }
-.calendar-events li { display: flex; flex-wrap: wrap; align-items: baseline; gap: .35rem .8rem; padding: .7rem 0; border-bottom: 1px solid currentColor; overflow-wrap: anywhere; }
+.calendar-events li { display: flex; flex-wrap: wrap; align-items: baseline; gap: .35rem .8rem; padding: .7rem 0; border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
 .calendar-events li strong { flex-basis: 100%; }
 .calendar-series { margin-top: 1.65rem; }
 .calendar-series h2 { font-weight: 650; }
 .calendar-import { border: 1px solid var(--border); border-radius: 12px; padding: 1rem; margin-block: 1rem; background: var(--panel); }
 .calendar-import-form { display: flex; flex-wrap: wrap; align-items: end; gap: .75rem; }
-.calendar-import-form label { display: grid; gap: .35rem; min-width: 0; font-size: .875rem; }
+.calendar-import-form label { display: grid; gap: 6px; min-width: 0; color: var(--muted); font-size: 13px; font-weight: 550; }
 .calendar-import-form :is(input, select) { width: 100%; }
-.calendar-import-form input { min-width: 0; max-width: 100%; min-block-size: var(--control-height); padding: 6px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); }
-.calendar-import-form input[type=file] { padding-block: 3px; }
-.calendar-import-form input::file-selector-button { min-block-size: calc(var(--control-height) - 8px); margin-inline-end: 8px; border: 0; border-radius: 5px; background: var(--surface); color: var(--text); font: inherit; }
 .calendar-create-form { display: grid; grid-template-columns: minmax(0, 12.5rem) max-content; justify-content: start; }
-.calendar-share-form { gap: 10px 12px; max-width: 68rem; }
-.calendar-share-form > label { flex: 1 1 9rem; }
-.calendar-share-form > label:has(input) { flex-basis: 14rem; }
+.calendar-share-form { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, .8fr) minmax(0, 1.65fr) minmax(0, 1fr) max-content; gap: 12px; max-inline-size: 68rem; }
+.calendar-share-form > button { justify-content: center; }
 .calendar-import-results { max-height: 18rem; overflow-y: auto; }
 
 .calendar-nav, .calendar-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: .75rem; }
@@ -514,7 +528,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-loading { color: var(--muted); }
 .calendar-colors { display: flex; flex-wrap: wrap; gap: .45rem 1.25rem; margin-top: .75rem; }
 .calendar-colors label { display: flex; align-items: center; gap: .45rem; }
-.calendar-colors input { inline-size: var(--control-height); block-size: var(--control-height); padding: 4px; background: var(--panel); border: 1px solid var(--control-border); border-radius: var(--control-radius); cursor: pointer; }
+.calendar-colors input { inline-size: var(--control-height); block-size: var(--control-height); padding: 4px; cursor: pointer; }
 .calendar-colors label span { overflow-wrap: anywhere; }
 .calendar-sources .wm-action { display: inline-flex; gap: .45rem; align-items: center; min-width: 0; overflow-wrap: anywhere; }
 .calendar-dot { flex: 0 0 .55rem; height: .55rem; border-radius: 50%; }
@@ -523,12 +537,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-period > :is(button, input) { block-size: var(--control-height); }
 .calendar-period .wm-action { justify-content: center; font-size: 13px; }
 .calendar-period .calendar-arrow { inline-size: var(--control-height); padding-inline: 0; }
-.calendar-period input, .calendar-editor-fields input:not([type="checkbox"]), .calendar-editor-fields textarea {
-  min-width: 0; max-width: 100%; color: var(--text); background: var(--panel);
-  padding: 6px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius);
-}
-.calendar-period input, .calendar-editor-fields input:not([type="checkbox"]) { min-block-size: var(--control-height); font-size: 13px; line-height: 1.25; }
-.calendar-period input { inline-size: 9rem; font-variant-numeric: tabular-nums; }
+.calendar-period input { inline-size: 9rem; }
 .calendar-search { flex-wrap: nowrap; }
 .calendar-search input { width: min(14rem, 100%); }
 .calendar-zone { display: flex; align-items: center; gap: .45rem; color: var(--muted); flex-wrap: wrap; font-size: .8rem; }
@@ -542,7 +551,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-task-form { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
 .calendar-task-form label { display: grid; gap: 5px; min-width: 0; font-size: 13px; font-weight: 550; }
 .calendar-task-form > label { flex: 1 1 14rem; }
-.calendar-task-form input { width: 100%; min-width: 0; min-block-size: var(--control-height); padding: 4px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); font-size: 13px; line-height: 1.25; }
+.calendar-task-form input { width: 100%; }
 .calendar-task-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .calendar-task-date { display: grid; gap: 5px; min-width: 0; }
 .calendar-task-date .calendar-task-actions { flex-wrap: nowrap; }
@@ -575,10 +584,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-tools-form { align-items: end; }
 .calendar-tools-form label { display: grid; gap: 5px; min-width: 0; max-width: 100%; font-size: 13px; font-weight: 550; }
 .calendar-tools-form label.calendar-tools-title { flex: 1 1 12rem; }
-.calendar-tools-form :is(input, textarea, select) { width: 100%; min-width: 0; }
-.calendar-tools-form :is(input, textarea) { min-block-size: var(--control-height); padding: 4px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); font-size: 13px; line-height: 1.25; }
-.calendar-tools-form input[type=file] { padding-block: 4px; }
-.calendar-tools-form input::file-selector-button { min-block-size: calc(var(--control-height) - 10px); margin-inline-end: 8px; border: 0; border-radius: 5px; background: var(--surface); color: var(--text); font: inherit; }
+.calendar-tools-form :is(input, textarea, select) { width: 100%; }
 .calendar-tools-form .calendar-tools-minutes { inline-size: 7rem; }
 .calendar-tools-journal label:first-child { flex-basis: 100%; }
 .calendar-tools-journal textarea { padding-block: 8px; resize: vertical; }
@@ -622,7 +628,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-free-time-heading p { margin: 0; color: var(--muted); font-size: 12px; }
 .calendar-free-time-form { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
 .calendar-free-time-form label { display: grid; gap: 5px; min-width: 0; font-size: 13px; font-weight: 550; }
-.calendar-free-time-form input:not([type=checkbox]) { width: 100%; min-width: 0; min-block-size: var(--control-height); padding: 4px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); font-size: 13px; line-height: 1.25; }
+.calendar-free-time-form input:not([type=checkbox]) { width: 100%; }
 .calendar-free-time-form .calendar-free-time-personal { display: flex; align-items: center; gap: 6px; flex-basis: 100%; min-block-size: var(--control-height); }
 .calendar-free-time > .calendar-label-error { margin-block-start: 10px; }
 .calendar-free-time-output { display: grid; gap: 8px; margin-block-start: 12px; padding-block-start: 10px; border-block-start: 1px solid var(--border); }
@@ -689,7 +695,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-day-label-summary:not(:empty), .calendar-label-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .calendar-label-form { display: grid; align-items: end; gap: 8px; max-inline-size: 38rem; padding: 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--toolbar); }
 .calendar-label-form label { display: grid; gap: 5px; color: var(--text); font-size: 13px; font-weight: 550; }
-.calendar-label-form input { inline-size: 100%; min-block-size: var(--control-height); padding-inline: 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); }
+.calendar-label-form input { inline-size: 100%; }
 .calendar-label-form > .wm-action { justify-self: start; }
 .calendar-label-error { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 0; color: var(--danger); font-size: 13px; }
 @media (max-width: 1120px) { .calendar-year { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
@@ -845,14 +851,13 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-search-filters[aria-expanded=true] .mail-icon { color: var(--accent); }
 .mail-search-field { display: flex; align-items: center; flex: 1; min-width: 0; min-block-size: var(--control-height); gap: 6px; padding-inline: 9px; border: 1px solid var(--control-border); border-radius: var(--control-radius); background: var(--surface); color: var(--muted); }
 .mail-search-field:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
-.mail-search-field .wm-search { border: 0; outline: 0; padding: 7px 0; background: transparent; }
+.mail-search-field .wm-search { min-block-size: 0; border: 0; outline: 0; padding: 7px 0; background: transparent; }
 .wm-search-form .mail-search-field { padding-inline-end: 3px; }
 .wm-search-submit { display: inline-grid; place-items: center; flex: 0 0 29px; min-height: 28px; border: 0; border-radius: 5px; padding: 0; background: transparent; color: var(--muted); }
 .wm-search-submit:hover { background: var(--hover); color: var(--accent); }
 .wm-list-options { min-height: 40px; padding: 6px 12px; }
 .wm-list-options .wm-selection-bar { gap: 5px; border: 0; padding: 0; margin-left: auto; }
 .wm-list-body { padding: 5px 7px; }
-.wm-message-row { min-height: 73px; border-radius: 7px; border-bottom-color: color-mix(in srgb, var(--border), transparent 24%); }
 .wm-message-check { margin: 32px 0 0 7px; }
 .wm-msg { gap: 3px; padding: 10px 10px 12px 8px; }
 .wm-msg-from { font-size: 14px; font-weight: 590; }
@@ -922,7 +927,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-snapshot-form, .wm-snapshot-confirm { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
 .wm-snapshot-form label { display: grid; gap: 5px; min-width: 0; font-size: 13px; font-weight: 550; }
 .wm-snapshot-form .wm-snapshot-url { flex: 1 1 16rem; }
-.wm-snapshot-form input { width: 100%; min-width: 0; min-height: var(--control-height); padding: 4px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); font-size: 13px; line-height: 1.25; }
+.wm-snapshot-form input { width: 100%; }
 .wm-snapshot-form .wm-snapshot-primary { color: var(--on-primary); background: var(--primary); border-color: var(--primary); }
 .wm-snapshot-form .wm-snapshot-primary:hover { background: var(--primary-hover); }
 .wm-reply-sender, .wm-reply-recipients { margin: 0; border: 1px solid var(--border); border-radius: var(--control-radius); }
@@ -934,7 +939,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-reply-recipients li { display: grid; gap: 3px; padding: 8px 12px; font-size: 13px; overflow-wrap: anywhere; }
 .wm-reply-recipients li + li { border-block-start: 1px solid var(--border); }
 .wm-reply-text { display: grid; gap: 5px; min-width: 0; font-size: 13px; font-weight: 550; }
-.wm-reply-text textarea { width: 100%; min-height: 88px; padding: 8px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); font: inherit; font-weight: 400; resize: vertical; }
+.wm-reply-text textarea { width: 100%; min-height: 88px; padding-block: 8px; resize: vertical; }
 .wm-reply-actions { justify-content: end; }
 .wm-external-send-review { flex-shrink: 0; max-block-size: min(40dvh, 20rem); overflow: auto; margin: 8px 20px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--control-radius); background: var(--toolbar); }
 .wm-external-send-review h2 { font-size: 15px; }
@@ -959,8 +964,6 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-compose-file-link > p { margin: 0; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
 .wm-compose-file-link > .wm-composer-error { color: var(--danger); }
 .wm-file-link-controls label:first-child { flex: 1 1 11rem; }
-.wm-file-link-controls input[type=file] { padding-block: 4px; }
-.wm-file-link-controls input::file-selector-button { min-block-size: calc(var(--control-height) - 10px); margin-inline-end: 8px; border: 0; border-radius: 5px; background: var(--surface); color: var(--text); font: inherit; }
 .wm-read-file-links { display: flex; flex-wrap: wrap; gap: 6px; margin-block: 8px; }
 .wm-read-file-links a { text-decoration: none; }
 .wm-file-link-settings #account-file-links { display: grid; gap: 8px; }
@@ -976,7 +979,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-original-subject > :first-child { font-weight: 650; }
 .wm-private-panel { display: grid; gap: 12px; padding: 12px; margin-bottom: 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); font-size: 13px; }
 .wm-private-tabs, .wm-private-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-.wm-private-tabs .wm-action[aria-pressed=true] { background: var(--accent-soft); border-color: var(--selection-edge); color: var(--accent); }
+.wm-private-tabs .wm-action[aria-pressed=true] { background: var(--accent-soft); color: var(--accent); }
 .wm-private-entries { display: grid; gap: 8px; }
 .wm-private-entries:empty { display: none; }
 .wm-private-entry { padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
@@ -984,7 +987,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-private-clip-source { display: block; margin-bottom: 4px; color: var(--muted); font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
 .wm-private-form { display: grid; justify-items: start; gap: 8px; min-width: 0; }
 .wm-private-form label { display: grid; gap: 5px; width: 100%; color: var(--muted); font-size: 12px; font-weight: 600; }
-.wm-private-form input, .wm-private-form textarea { width: 100%; min-width: 0; min-block-size: var(--control-height); padding: 6px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); background: var(--panel); color: var(--text); font: inherit; font-weight: 400; }
+.wm-private-form :is(input, textarea) { width: 100%; }
 .wm-private-form textarea { resize: vertical; min-height: 66px; }
 .wm-private-organize { display: grid; gap: 14px; }
 .wm-private-membership { display: grid; justify-items: start; gap: 9px; min-width: 0; padding: 10px; border: 1px solid var(--border); border-radius: 8px; margin: 0; }
@@ -1008,8 +1011,6 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-account-settings h2 .mail-icon { color: var(--accent); }
 .wm-account-settings .login-sub { margin-bottom: 12px; }
 .wm-account-settings button { width: auto; margin-top: 12px; padding: 7px 10px; font-size: 12px; }
-.wm-account-settings input:not([type=checkbox]) { min-block-size: var(--control-height); padding: 6px 10px; }
-.wm-account-settings button { min-block-size: var(--control-height); }
 .wm-writing-settings { grid-column: 1 / -1; }
 .wm-writing-settings h2 { display: flex; gap: 6px; align-items: center; margin-bottom: 10px; }
 .wm-writing-settings h2 .mail-icon { color: var(--accent); }
@@ -1049,7 +1050,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-vacation-status { padding: 3px 8px; border-radius: 12px; background: var(--surface); color: var(--text); font-size: 12px; }
 .wm-vacation .wm-vacation-toggle { display: flex; align-items: center; gap: 6px; }
 .wm-vacation-toggle input { width: auto; }
-.wm-vacation textarea { width: 100%; min-height: 76px; resize: vertical; padding: 8px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); font: inherit; }
+.wm-vacation textarea { width: 100%; min-height: 76px; resize: vertical; padding-block: 8px; }
 .wm-vacation-optional { color: var(--muted); font-weight: 400; }
 .wm-contacts { width: min(100%, 760px); max-height: 90dvh; overflow: auto; border: 1px solid var(--border); border-radius: 15px; background: var(--panel); box-shadow: var(--app-shadow); }
 .wm-contacts-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 14px 18px; border-bottom: 1px solid var(--border); }
@@ -1060,7 +1061,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-contacts-split { display: grid; grid-template-columns: minmax(0, 230px) minmax(0, 1fr); min-height: 420px; }
 .wm-contacts-list { display: flex; flex-direction: column; align-items: flex-start; gap: 9px; padding: 12px; background: var(--surface); border-right: 1px solid var(--border); min-width: 0; }
 .wm-contact-search, .wm-contact-rows { width: 100%; }
-.wm-contact-search { flex: 0 0 auto; min-height: 34px; background: var(--panel); }
+.wm-contact-search { flex: 0 0 auto; background: var(--panel); }
 .wm-contact-rows { display: grid; align-content: start; flex: 1 1 auto; overflow: auto; max-height: 46dvh; }
 .wm-contact-row { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 9px; border: 0; border-radius: 8px; background: transparent; color: var(--text); text-align: left; cursor: pointer; }
 .wm-contact-row:hover { background: var(--hover); }
@@ -1108,13 +1109,12 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-composer-close { display: inline-grid; place-items: center; width: 30px; height: 30px; border: 0; padding: 5px; border-radius: 7px; }
 .wm-composer-close:hover { background: var(--hover); }
 
-.mail-auth-page { display: grid; min-height: 100dvh; place-items: center; padding: 24px 16px; background: radial-gradient(ellipse at 50% 18%, var(--accent-soft), transparent 66%), var(--bg); }
+.mail-auth-page { --control-height: 44px; display: grid; min-height: 100dvh; place-items: center; padding: 24px 16px; background: radial-gradient(ellipse at 50% 18%, var(--accent-soft), transparent 66%), var(--bg); }
 .mail-auth-page .login { width: min(100%, 390px); max-width: none; margin: 0; border-radius: 20px; box-shadow: var(--app-shadow); padding: clamp(24px, 6vw, 36px); }
 .mail-auth-page .mail-app-mark { width: 50px; height: 50px; border-radius: 15px; margin-bottom: 20px; }
 .mail-auth-page .mail-app-mark .mail-icon { width: 30px; height: 30px; }
 .mail-auth-page .login h1 { font-size: 25px; line-height: 1.12; letter-spacing: -.035em; }
 .mail-auth-page .login-sub { margin-top: 7px; line-height: 1.5; }
-.mail-auth-page .login input { min-height: 44px; }
 
 .calendar-nav, .health-nav { min-height: 44px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
 .calendar-nav a, .health-nav a { display: inline-flex; align-items: center; gap: 6px; text-decoration: none; font-weight: 600; }
@@ -1200,7 +1200,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-list--selecting .wm-list-options .wm-select-all { display: inline-flex; }
 .wm-list-body { padding: 6px 9px; }
 .wm-message-row { border: 0; border-radius: 9px; min-height: 73px; }
-.wm-message-row:not(.wm-message-row--active)::after { position: absolute; content: ''; inset: auto 10px 0 26px; border-bottom: 1px solid color-mix(in srgb, var(--border), transparent 32%); pointer-events: none; }
+.wm-message-row:not(.wm-message-row--active)::after { position: absolute; content: ''; inset: auto 10px 0 26px; border-bottom: 1px solid var(--border); pointer-events: none; }
 .wm-message-row--active, .wm-message-row--active:hover { background: var(--message-selection); box-shadow: inset 2px 0 var(--selection-edge); }
 .wm-message-row--active::before { background: var(--selection-edge); }
 .wm-message-row--active .wm-msg,
@@ -1245,15 +1245,10 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-tool:hover { color: var(--text); }
 .wm-tool[aria-pressed=true] { background: var(--warning-soft); color: var(--warning); }
 .wm-tool--danger:hover { color: var(--danger); }
-.wm-tool-move { gap: 2px; padding-inline-end: 0; border-inline-end: 0; }
-.wm-tool-move .wm-tool { min-block-size: var(--control-height); }
-.wm-tool-move select {
-  inline-size: 110px;
-  padding-inline: 8px 25px;
-  background-position: right 6px center;
-  font-size: 12px;
-}
-.wm-tool-move select:dir(rtl) { background-position: left 6px center; }
+.wm-tool-move { gap: 6px; padding-inline-end: 0; border-inline-end: 0; }
+.wm-message-toolbar .wm-tool-move .wm-tool { inline-size: var(--control-height); min-block-size: var(--control-height); border: 1px solid var(--control-border); border-radius: var(--control-radius); background: var(--panel); }
+.wm-message-toolbar .wm-tool-move .wm-tool:hover:not(:disabled) { background: var(--toolbar); }
+.wm-tool-move select { inline-size: 110px; }
 .wm-read-body > :not(.wm-read-toolbar) { max-width: 760px; margin-inline: auto; }
 .wm-message-paper {
   padding: 0 0 16px;
@@ -1307,9 +1302,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 
 .mail-auth-page .login { border-color: var(--border); }
 .mail-auth-page .login form { margin-top: 20px; }
-.mail-auth-page .login input { background: var(--toolbar); }
-.mail-auth-page .login input:focus { background: var(--panel); }
-.mail-auth-page .login button { min-height: 44px; }
+.mail-auth-page .login :is(input, button) { font-size: 1rem; }
 .calendar-header h1 { font-size: clamp(1.65rem, 3vw, 2rem); font-weight: 680; letter-spacing: -.035em; }
 .calendar-workspace, .health-summary, .health-card { border-radius: 12px; box-shadow: none; }
 .calendar-workspace > .calendar-controls:first-child { margin-block-start: 0; }
@@ -1329,6 +1322,15 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-entry-time .mail-icon { width: 12px; height: 12px; }
 .calendar-zone { flex-wrap: nowrap; }
 .calendar-zone select { width: auto; max-width: min(12.5rem, 49vw); }
+@media (min-width: 1160px) {
+  .calendar-view-toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); }
+  .calendar-view-modes { justify-self: start; }
+  .calendar-zone { grid-column: 3; justify-self: end; }
+}
+@media (max-width: 960px) {
+  .calendar-share-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .calendar-share-form > label:has(input) { grid-column: 1 / -1; }
+}
 
 @media (min-width: 861px) {
   .wm-workspace { overflow: hidden; background: var(--panel); }
@@ -1365,7 +1367,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-junk-label { display: none; }
   .wm-message-toolbar::after { content: ''; flex-basis: 100%; height: 0; }
   .wm-message-toolbar > :is(.wm-action, .wm-tool-move) { order: 1; }
-  .wm-message-toolbar .wm-tool-move { border-inline-end: 0; }
+  .wm-message-toolbar .wm-tool-move { gap: 6px; }
   .wm-read :is(h2, button, select, summary, a):focus-visible { scroll-margin-top: 158px; }
   .wm-read-body { --reader-gutter: 16px; padding-bottom: 24px; }
   .wm-back { display: inline-flex; position: sticky; top: 0; z-index: 2; align-self: stretch; flex-shrink: 0; gap: 6px; align-items: center; min-height: 44px; margin: 0; padding-inline: 14px; background: var(--panel); text-align: start; }
@@ -1383,12 +1385,12 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-brand > span:last-child { display: none; }
   .wm-tool-trash { order: 1; margin-inline-start: 0; }
   .wm-next-unread-label { display: none; }
-  .wm-message-toolbar .wm-tool-move select { inline-size: 88px; }
 }
 @media (max-width: 490px) {
-  .calendar-share-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .calendar-share-form > label:has(input) { grid-column: 1 / -1; }
-  .calendar-share-form > .wm-action { justify-content: center; }
+  .calendar-share-form { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .calendar-share-form > :first-child { grid-column: span 4; }
+  .calendar-share-form > :nth-child(2) { grid-column: span 2; }
+  .calendar-share-form > :nth-last-child(-n+2) { grid-column: span 3; }
   dialog.wm-modal:has(> .wm-composer) { align-items: flex-end; padding: 0; }
   .wm-composer { width: 100%; max-height: 96dvh; border-radius: 17px 17px 0 0; }
   .wm-composer-close { width: 44px; height: 44px; }
@@ -1430,6 +1432,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 @media (max-width: 370px) {
   .calendar-period { grid-template-columns: var(--control-height) minmax(0, 1fr) var(--control-height); }
   .calendar-period input { grid-column: 1 / -1; }
+  .calendar-share-form { column-gap: 8px; }
+  .calendar-share-form > :nth-child(2) select { padding-inline-end: 24px; }
 }
 @media (forced-colors: active) {
   .mail-icon { forced-color-adjust: none; background: CanvasText; }

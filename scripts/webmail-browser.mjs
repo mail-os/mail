@@ -65,12 +65,28 @@ async function verifySelect(control, minimumHeight = 36) {
   assert(appearance.height >= minimumHeight, 'The picker meets the minimum control height')
 }
 
+async function verifySelectedOptionFits(control) {
+  const { label, used, available } = await control.evaluate((select) => {
+    const style = getComputedStyle(select)
+    const context = document.createElement('canvas').getContext('2d')
+    context.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`
+    const label = select.selectedOptions[0].text
+    return {
+      label,
+      used: context.measureText(label).width,
+      available: select.clientWidth - Number.parseFloat(style.paddingLeft) - Number.parseFloat(style.paddingRight),
+    }
+  })
+  assert(available >= used, `The picker has ${available}px for “${label}”, which needs ${used}px`)
+}
+
 async function verifyControlRow(container, selector, height, sameRow = true) {
   const controls = await container.evaluate((group, selector) => Array.from(group.querySelectorAll(selector), (node) => {
     const style = getComputedStyle(node)
     const box = node.getBoundingClientRect()
     const borderChannels = style.getPropertyValue('--control-border').trim().slice(1).match(/../g)
     const border = `rgb(${borderChannels.map(channel => Number.parseInt(channel, 16)).join(', ')})`
+    const neutral = !node.matches('.calendar-primary, .wm-snapshot-primary, .wm-list-toggle, .wm-action--quiet, .mail-auth-page button:not(.login-secondary)')
     return {
       name: node.getAttribute('aria-label') || node.id || node.tagName,
       height: box.height,
@@ -78,8 +94,8 @@ async function verifyControlRow(container, selector, height, sameRow = true) {
       bottom: box.bottom,
       left: box.left,
       right: box.right,
-      neutral: !node.matches('.calendar-primary, .wm-snapshot-primary, .wm-list-toggle, .wm-action--quiet'),
-      borderMatches: style.borderColor === border && style.borderWidth === '1px',
+      neutral,
+      borderMatches: style.border === `1px solid ${border}`,
       radius: style.borderRadius,
     }
   }), selector)
@@ -88,9 +104,19 @@ async function verifyControlRow(container, selector, height, sameRow = true) {
     assert(Math.abs(control.height - height) < 0.5, `${control.name} should be ${height}px tall, got ${control.height}px`)
     assert.equal(control.radius, '8px', `${control.name} should use the shared control radius`)
     if (control.neutral) assert(control.borderMatches, `${control.name} should use the shared one-pixel border`)
-    if (sameRow) assert(Math.abs(control.top - controls[0].top) < 0.5, `${control.name} should align with the first control`)
+    if (sameRow) {
+      assert(Math.abs(control.top - controls[0].top) < 0.5, `${control.name} should align with the first control`)
+      assert(Math.abs(control.bottom - controls[0].bottom) < 0.5, `${control.name} should align at the bottom`)
+    }
   }
   return controls
+}
+
+function verifyControlGaps(controls, gap) {
+  for (let index = 1; index < controls.length; index++) {
+    assert(Math.abs(controls[index].left - controls[index - 1].right - gap) < 0.5,
+      `${controls[index].name} should be ${gap}px from the preceding control`)
+  }
 }
 
 async function verifyCalendarPeriod(page, label, height, stacked = false) {
@@ -98,10 +124,10 @@ async function verifyCalendarPeriod(page, label, height, stacked = false) {
   const controls = await verifyControlRow(page.locator('.calendar-view-toolbar'), '.calendar-period > *, .calendar-zone select', height, false)
   assert.equal(controls.length, 5)
   const row = controls.slice(0, stacked ? 3 : 4)
-  for (let index = 1; index < row.length; index++) {
-    assert(Math.abs(row[index].top - row[0].top) < 0.5, 'Date navigation buttons should align')
-    assert(Math.abs(row[index].left - row[index - 1].right - 6) < 0.5, 'Date controls should have matching 6px gaps')
+  for (const control of row) {
+    assert(Math.abs(control.top - row[0].top) < 0.5, 'Date navigation controls should align')
   }
+  verifyControlGaps(row, 6)
   const date = controls[3]
   assert(date.right - date.left >= 136, 'Jump to date leaves room for the native date and picker')
   if (height === 36) assert(Math.abs(controls[4].top - date.top) < 0.5, 'The time zone picker aligns with the desktop date controls')
@@ -241,6 +267,7 @@ async function signIn({ phone = false, account = owner, initialSubject = handoff
   observePage(page)
   await page.goto(url + '/login')
   await heading(page, 'Sign in to Mail').waitFor()
+  await verifyControlRow(page.locator('.mail-auth-page form'), 'input, button', 44, false)
   await screenshot(page, phone ? 'phone-sign-in' : 'desktop-sign-in')
   await page.getByLabel('Email or username').fill(account)
   await page.getByLabel('Password', { exact: true }).fill(password)
@@ -301,6 +328,8 @@ async function desktopJourney(page) {
 
   await button(page, /Tuesday design handoff/).click()
   await heading(page, handoff).waitFor()
+  const move = page.getByRole('group', { name: 'Move message', exact: true })
+  verifyControlGaps(await verifyControlRow(move, 'select, button', 36), 6)
   assert.equal(await button(page, /Tuesday design handoff/).getAttribute('aria-current'), 'true')
   await verifyMessageSelection(button(page, /Tuesday design handoff/), '.wm-msg-from')
   await page.frameLocator('iframe[title="Email content"]').getByText('For Tuesday', { exact: true }).waitFor()
@@ -395,6 +424,7 @@ async function desktopJourney(page) {
   await screenshot(page, 'desktop-service-health')
   await page.goto(url + '/forgot')
   await heading(page, 'Forgot your password?').waitFor()
+  await verifyControlRow(page.locator('.mail-auth-page form:visible'), 'input, button', 44, false)
   await screenshot(page, 'desktop-recovery')
 }
 
@@ -451,8 +481,9 @@ async function phoneJourney(page) {
     const control = await button(actions, name).boundingBox()
     assert(control.width >= 44 && control.height >= 44, `${name} has a full-size touch target`)
   }
-  assert((await actions.getByRole('combobox', { name: 'Move destination' }).boundingBox()).height >= 44,
-    'Move destination has a full-size touch target')
+  const move = actions.getByRole('group', { name: 'Move message', exact: true })
+  const [, destination] = await verifyControlRow(move, 'select, button', 44)
+  assert(destination.right - destination.left >= 108, 'Move destination leaves room for the Archive label')
   await button(actions, 'Mark junk').waitFor()
   await page.setViewportSize({ width: 390, height: 540 })
   const reader = page.getByRole('region', { name: 'Message reader' })
@@ -535,7 +566,22 @@ async function phoneJourney(page) {
   await access.waitFor()
   await verifySelect(access, 44)
   await verifyControlRow(page.locator('.calendar-create-form'), 'input, button', 44)
-  await verifyControlRow(sharing.locator('form'), 'select, input, button', 44, false)
+  const shareForm = sharing.locator('form')
+  const calendarPicker = sharing.getByLabel('Calendar to share')
+  const [calendar, team, teammate, role, submit] = await verifyControlRow(shareForm, 'select, input, button', 44, false)
+  assert.equal(calendar.top, team.top, 'The first two sharing labels and pickers align')
+  assert.equal(role.top, submit.top, 'The access picker and share button align')
+  assert.equal(teammate.left, calendar.left, 'The teammate field starts at the left column')
+  assert.equal(teammate.right, team.right, 'The teammate field spans the grid')
+  verifyControlGaps([calendar, team], 12)
+  verifyControlGaps([role, submit], 12)
+  await verifySelectedOptionFits(calendarPicker)
+  await page.setViewportSize({ width: 320, height: 844 })
+  await fitsViewport(page)
+  await verifyControlRow(shareForm, 'select, input, button', 44, false)
+  await verifySelectedOptionFits(calendarPicker)
+  await shareForm.screenshot({ path: join(output, 'narrow-phone-calendar-sharing-dark.png'), animations: 'disabled' })
+  await page.setViewportSize({ width: 390, height: 844 })
   await page.locator('.calendar-loading').waitFor({ state: 'hidden' })
   await fitsViewport(page)
   await sharing.scrollIntoViewIfNeeded()
@@ -1226,10 +1272,19 @@ async function calendarSharingJourney(captain) {
   await captain.locator('.calendar-loading').waitFor({ state: 'hidden' })
   await verifyControlRow(captain.locator('.calendar-create-form'), 'input, button', 36)
   const shareForm = sharing.locator('form')
-  assert.equal((await verifyControlRow(shareForm, 'select, input, button', 36)).length, 5)
+  const shareControls = await verifyControlRow(shareForm, 'select, input, button', 36)
+  assert.equal(shareControls.length, 5)
+  verifyControlGaps(shareControls, 12)
   await captain.emulateMedia({ colorScheme: 'dark' })
-  await verifyControlRow(shareForm, 'select, input, button', 36)
+  verifyControlGaps(await verifyControlRow(shareForm, 'select, input, button', 36), 12)
+  await shareForm.screenshot({ path: join(output, 'desktop-calendar-sharing-dark.png'), animations: 'disabled' })
   await screenshot(captain, 'desktop-calendar-selects-dark')
+  await captain.setViewportSize({ width: 861, height: 940 })
+  await fitsViewport(captain)
+  await verifyControlRow(shareForm, 'select, input, button', 36, false)
+  await verifySelectedOptionFits(sharing.getByLabel('Calendar to share'))
+  await shareForm.screenshot({ path: join(output, 'tablet-calendar-sharing-dark.png'), animations: 'disabled' })
+  await captain.setViewportSize({ width: 1440, height: 940 })
   await captain.emulateMedia({ colorScheme: 'light' })
   await screenshot(captain, 'desktop-calendar-selects')
   await button(sharing, 'Share calendar').click()
