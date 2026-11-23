@@ -450,6 +450,24 @@ pub const Database = struct {
             \\WHEN OLD.reference<>NEW.reference BEGIN
             \\    DELETE FROM mail_ews_draft_sends WHERE user_id=OLD.user_id AND draft_reference=OLD.reference;
             \\END;
+            \\CREATE TABLE IF NOT EXISTS mail_ews_draft_finalizations (
+            \\    delivery_id TEXT PRIMARY KEY,
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    draft_reference TEXT NOT NULL,
+            \\    basename TEXT NOT NULL,
+            \\    content_revision TEXT NOT NULL,
+            \\    save_copy INTEGER NOT NULL,
+            \\    path TEXT NOT NULL,
+            \\    fingerprint TEXT NOT NULL,
+            \\    draft_id TEXT,
+            \\    draft_revision INTEGER,
+            \\    submitted_at INTEGER NOT NULL,
+            \\    confirmed INTEGER NOT NULL DEFAULT 0,
+            \\    retired_at INTEGER
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mail_ews_draft_finalization_item ON mail_ews_draft_finalizations(user_id,basename,content_revision);
+            \\CREATE INDEX IF NOT EXISTS mail_ews_draft_finalization_pending ON mail_ews_draft_finalizations(confirmed,delivery_id) WHERE retired_at IS NULL;
+            \\CREATE INDEX IF NOT EXISTS mail_ews_draft_finalization_webmail ON mail_ews_draft_finalizations(user_id,draft_id,draft_revision) WHERE retired_at IS NULL AND draft_id IS NOT NULL;
             \\CREATE TABLE IF NOT EXISTS mail_retention_rules (
             \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
             \\    folder TEXT,
@@ -1817,6 +1835,8 @@ pub const Database = struct {
         reference: []const u8,
         revision: [64]u8,
         save_copy: bool,
+        path: []const u8,
+        fingerprint: []const u8,
     };
 
     pub const EwsSendResult = enum { delivered, partial, storage_full, disabled, failed, uncertain };
@@ -1850,6 +1870,75 @@ pub const Database = struct {
         try stmt.bind(1, id);
         try stmt.bind(2, @tagName(result));
         _ = try stmt.step();
+    }
+
+    pub const EwsDraftFinalization = struct {
+        delivery_id: []const u8,
+        user: []const u8,
+        reference: []const u8,
+        basename: []const u8,
+        revision: []const u8,
+        path: []const u8,
+        fingerprint: []const u8,
+        draft_id: ?[]const u8,
+        draft_revision: i64,
+        rowid: i64,
+    };
+
+    /// Recover local admission and confirmed remote delivery even if the EWS
+    /// request stopped before recording its response.
+    pub fn confirmEwsDraftFinalizations(self: *Database, id: ?[]const u8) !void {
+        const stmt = try self.prepare(
+            \\UPDATE mail_ews_draft_finalizations AS c SET confirmed=1
+            \\WHERE retired_at IS NULL AND confirmed=0 AND (?1 IS NULL OR c.delivery_id=?1)
+            \\AND (EXISTS(SELECT 1 FROM mail_ews_draft_sends s WHERE s.delivery_id=c.delivery_id AND s.result='delivered')
+            \\ OR (EXISTS(SELECT 1 FROM accepted_mail_targets t WHERE t.delivery_id=c.delivery_id AND t.is_primary=1)
+            \\ AND NOT EXISTS(SELECT 1 FROM accepted_mail_targets t WHERE t.delivery_id=c.delivery_id AND t.is_primary=1
+            \\     AND t.outcome NOT IN ('pending','filed','remote_delivered'))))
+        );
+        defer stmt.finalize();
+        try stmt.bindOpt(1, id);
+        _ = try stmt.step();
+    }
+
+    pub fn nextEwsDraftFinalization(self: *Database, a: std.mem.Allocator, id: ?[]const u8, after: i64) !?EwsDraftFinalization {
+        const stmt = try self.prepare(
+            \\SELECT c.delivery_id,u.username,c.draft_reference,c.basename,c.content_revision,c.path,c.fingerprint,c.draft_id,c.draft_revision,c.rowid
+            \\FROM mail_ews_draft_finalizations c JOIN users u ON u.id=c.user_id
+            \\WHERE c.confirmed=1 AND c.retired_at IS NULL AND (?1 IS NULL OR c.delivery_id=?1) AND c.rowid>?2
+            \\ORDER BY c.rowid LIMIT 1
+        );
+        defer stmt.finalize();
+        try stmt.bindOpt(1, id);
+        try stmt.bind(2, after);
+        if (!try stmt.step()) return null;
+        return .{
+            .delivery_id = try a.dupe(u8, stmt.columnText(0)),
+            .user = try a.dupe(u8, stmt.columnText(1)),
+            .reference = try a.dupe(u8, stmt.columnText(2)),
+            .basename = try a.dupe(u8, stmt.columnText(3)),
+            .revision = try a.dupe(u8, stmt.columnText(4)),
+            .path = try a.dupe(u8, stmt.columnText(5)),
+            .fingerprint = try a.dupe(u8, stmt.columnText(6)),
+            .draft_id = if (stmt.columnIsNull(7)) null else try a.dupe(u8, stmt.columnText(7)),
+            .draft_revision = stmt.columnInt64(8),
+            .rowid = stmt.columnInt64(9),
+        };
+    }
+
+    pub fn confirmedEwsDraft(self: *Database, user: []const u8, basename: []const u8, revision: ?[]const u8) !?bool {
+        const stmt = try self.prepare(
+            \\SELECT save_copy FROM mail_ews_draft_finalizations
+            \\WHERE user_id=(SELECT id FROM users WHERE username=?1) AND basename=?2
+            \\AND (?3 IS NULL OR content_revision=?3) AND confirmed=1
+            \\ORDER BY rowid DESC LIMIT 1
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, basename);
+        try stmt.bindOpt(3, revision);
+        if (!try stmt.step()) return null;
+        return stmt.columnInt64(0) != 0;
     }
 
     pub const DeliveryEnvelope = struct {
@@ -1942,6 +2031,7 @@ pub const Database = struct {
             try stmt.bind(5, envelope.id);
             if (!try stmt.step()) return error.HostedSenderDisabled;
             _ = try stmt.step();
+            try self.recordEwsDraftFinalizationLocked(envelope, draft);
         }
         if (envelope.team_reply_submission) |parent| {
             const stmt = try self.prepareLocked(
@@ -2033,6 +2123,50 @@ pub const Database = struct {
         }
         if (!has_local) try self.compactDeliveryLocked(envelope.id);
         try self.execLocked("COMMIT");
+    }
+
+    fn recordEwsDraftFinalizationLocked(self: *Database, envelope: DeliveryEnvelope, draft: EwsDraftSend) !void {
+        const user = envelope.sender orelse return error.InvalidMailboxPath;
+        const basename = maildirBaseName(std.fs.path.basename(draft.path));
+        const webmail_enabled = schema: {
+            const stmt = try self.prepareLocked("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='webmail_records'");
+            defer stmt.finalize();
+            break :schema try stmt.step();
+        };
+        const snapshot = if (webmail_enabled) metadata: {
+            const stmt = try self.prepareLocked(
+                \\SELECT w.id,w.revision,w.state,
+                \\EXISTS(SELECT 1 FROM webmail_records e WHERE e.username=w.username AND e.kind='draft-edit' AND e.id=w.id)
+                \\FROM webmail_records w JOIN imap_uids f ON f.username=w.username AND f.mailbox='Drafts' AND f.filename=?2
+                \\WHERE w.username=?1 AND w.kind='draft' AND json_extract(w.payload,'$.folder')='Drafts'
+                \\AND json_extract(w.payload,'$.uid')=f.uid
+            );
+            defer stmt.finalize();
+            try stmt.bind(1, user);
+            try stmt.bind(2, basename);
+            if (!try stmt.step()) break :metadata null;
+            if (!std.mem.eql(u8, stmt.columnText(2), "saved") or stmt.columnInt64(3) != 0) return error.StaleDraft;
+            break :metadata .{ .id = try self.allocator.dupe(u8, stmt.columnText(0)), .revision = stmt.columnInt64(1) };
+        } else null;
+        defer if (snapshot) |row| self.allocator.free(row.id);
+        const stmt = try self.prepareLocked(
+            \\INSERT INTO mail_ews_draft_finalizations(delivery_id,user_id,draft_reference,basename,content_revision,
+            \\save_copy,path,fingerprint,draft_id,draft_revision,submitted_at)
+            \\SELECT ?2,id,?3,?4,?5,?6,?7,?8,?9,?10,?11 FROM users WHERE username=?1
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, envelope.id);
+        try stmt.bind(3, draft.reference);
+        try stmt.bind(4, basename);
+        try stmt.bind(5, @as([]const u8, &draft.revision));
+        try stmt.bind(6, @as(u8, @intFromBool(draft.save_copy)));
+        try stmt.bind(7, draft.path);
+        try stmt.bind(8, draft.fingerprint);
+        try stmt.bindOpt(9, if (snapshot) |row| row.id else null);
+        try stmt.bindOpt(10, if (snapshot) |row| row.revision else null);
+        try stmt.bind(11, envelope.accepted_at);
+        _ = try stmt.step();
     }
 
     fn queueAcceptedRemoteLocked(self: *Database, envelope: DeliveryEnvelope, ordinal: usize, target: DeliveryTarget, owner: i64) !void {
@@ -3287,6 +3421,16 @@ pub const Database = struct {
         defer stmt.finalize();
         try stmt.bind(1, before);
         _ = try stmt.step();
+        const ews = try self.prepareLocked(
+            \\DELETE FROM mail_ews_draft_finalizations WHERE rowid IN (
+            \\ SELECT c.rowid FROM mail_ews_draft_finalizations c WHERE c.retired_at<?1
+            \\ OR (c.confirmed=0 AND c.submitted_at<?1 AND NOT EXISTS(
+            \\     SELECT 1 FROM mailbox_message_refs r WHERE r.user_id=c.user_id AND r.reference=c.draft_reference))
+            \\ LIMIT 500)
+        );
+        defer ews.finalize();
+        try ews.bind(1, before);
+        _ = try ews.step();
         const replies = try self.prepareLocked("DELETE FROM mail_attention_replies WHERE rowid IN (SELECT rowid FROM mail_attention_replies WHERE last_ms<?1 LIMIT 500)");
         defer replies.finalize();
         try replies.bind(1, (before - 90 * 86400) * 1000);

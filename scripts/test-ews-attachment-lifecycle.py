@@ -12,6 +12,7 @@ import secrets
 import sqlite3
 import subprocess
 import tempfile
+import time
 from types import SimpleNamespace
 from urllib.parse import urlencode
 from xml.sax.saxutils import quoteattr
@@ -195,6 +196,9 @@ def verify_shared_draft(test, owner, other):
     send = {**latest_payload, "draftRevision": saved_again["revision"], "sendId": send_id, "delaySeconds": 30}
     status, frozen = test.api(session, "compose", send)
     assert status == 200 and frozen["state"] == "pending", frozen
+    charged = test.count(owner)
+    ews.check(test, owner, ews.hosted.send_ews_items(current["Id"]), CONFLICT)
+    assert test.count(owner) == charged
     ews.check(test, owner, operation("DeleteAttachment", first), CONFLICT)
     ews.check(test, owner, ews.attach(current, second_file), CONFLICT)
     assert draft.read_bytes() == queued_wire
@@ -280,6 +284,66 @@ def verify_self_hosted_draft(test):
     assert loaded["message"]["attachments"][0]["size"] == len(content)
 
 
+def prepare_finalization_recovery(test, owner, other):
+    session = test.login(owner)
+    draft_id = secrets.token_hex(16)
+    status, saved = test.api(session, "drafts", {"draftId": draft_id, "to": [other], "subject": "Finalize EWS draft"})
+    assert status == 200, saved
+    status, rows = test.api(session, "messages?folder=Drafts&q=Finalize+EWS+draft")
+    assert status == 200
+    reference = next(row["reference"] for row in rows["items"] if row["subject"] == "Finalize EWS draft")
+    with closing(sqlite3.connect(test.directory / "smtp.db")) as db:
+        basename, = db.execute("SELECT basename FROM mailbox_message_refs WHERE reference=?", (reference,)).fetchone()
+    path, = (test.directory / "mail" / owner / "Drafts").glob(basename + "*")
+    item, _, _ = list_files(test, owner, {"Id": "drafts:" + basename})
+    ews.check(test, owner, ews.attach(item, ews.file_xml(b"Finalized file", "finalized.bin")), "NoError")
+    item, _, raw = list_files(test, owner, item)
+    status, loaded = test.api(session, f"drafts?uid={saved['uid']}")
+    assert status == 200 and loaded["message"]["attachments"][0]["filename"] == "finalized.bin"
+    file = loaded["message"]["attachments"][0]
+    status, related = test.api(session, "drafts", {"draftId": secrets.token_hex(16), "to": [other],
+                                                  "subject": "Unsent draft shares upload", "attachments": [file]})
+    assert status == 200, related
+    with closing(sqlite3.connect(test.directory / "smtp.db")) as db:
+        identity = db.execute("SELECT user_id,reference,folder,basename,file_stamp FROM mailbox_message_refs WHERE reference=?",
+                              (reference,)).fetchone()
+        document = db.execute("SELECT username,kind,id,payload,state,revision,due_at,expires_at FROM webmail_records WHERE kind='draft' AND id=?",
+                              (draft_id,)).fetchone()
+    send = ews.hosted.send_ews_items(item["Id"])
+    before, count = test.bytes(owner), test.count(owner)
+    ews.check(test, owner, send, "NoError")
+    assert not path.exists() and test.bytes(owner) == before and test.count(owner) == count + 1
+    assert test.api(session, f"drafts?uid={saved['uid']}")[0] == 404
+    status, related_draft = test.api(session, f"drafts?uid={related['uid']}")
+    assert status == 200 and related_draft["message"]["attachments"][0]["uploadId"] == file["uploadId"]
+    with closing(sqlite3.connect(test.directory / "smtp.db")) as db:
+        assert db.execute("SELECT 1 FROM webmail_uploads WHERE username=? AND id=?", (owner, file["uploadId"])).fetchone()
+    sent_path, = [copy for copy in (test.directory / "mail" / owner / "Sent").glob("*.eml*")
+                  if b"Subject: Finalize EWS draft" in copy.read_bytes()]
+    assert sent_path.read_bytes() == raw
+    return identity, document, saved["uid"], send, count + 1, before
+
+
+def verify_finalization_recovery(test, owner, recovery):
+    identity, document, uid, send, count, before = recovery
+    # Restore the metadata from before cleanup while leaving the file absent,
+    # as after a stop between unlink and the cleanup transaction's commit.
+    with closing(sqlite3.connect(test.directory / "smtp.db")) as db, db:
+        db.execute("INSERT INTO mailbox_message_refs(user_id,reference,folder,basename,file_stamp) VALUES (?,?,?,?,?)", identity)
+        db.execute("INSERT INTO webmail_records(username,kind,id,payload,state,revision,due_at,expires_at) VALUES (?,?,?,?,?,?,?,?)", document)
+        result = db.execute("UPDATE mail_ews_draft_finalizations SET retired_at=NULL WHERE user_id=? AND basename=?",
+                            (identity[0], identity[3]))
+        assert result.rowcount == 1
+    with test.daemon():
+        session = test.login(owner)
+        deadline = time.monotonic() + 10
+        while test.api(session, f"drafts?uid={uid}")[0] != 404:
+            assert time.monotonic() < deadline, "The interrupted cleanup did not recover"
+            time.sleep(.1)
+        ews.check(test, owner, send, "NoError")
+        assert test.count(owner) == count and test.bytes(owner) == before
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
@@ -294,8 +358,10 @@ def main():
             verify_shared_draft(test, owner, other)
             verify_self_hosted_draft(test)
             recovery = prepare_recovery(test, owner, other)
+            finalization = prepare_finalization_recovery(test, owner, other)
         verify_recovery(test, owner, recovery)
-    print("Verified EWS attachment IDs, byte retrieval, deletion, concurrency, hosted storage, webmail revisions, Outbox, and interrupted-edit recovery over HTTPS.")
+        verify_finalization_recovery(test, owner, finalization)
+    print("Verified EWS attachment lifecycle, hosted storage, webmail revisions, Outbox, and interrupted draft recovery over HTTPS.")
 
 
 if __name__ == "__main__":

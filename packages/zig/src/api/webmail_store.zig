@@ -394,7 +394,9 @@ pub fn claimDue(allocator: std.mem.Allocator, db: *database.Database, now: i64) 
 const enqueueSql =
     \\INSERT INTO webmail_records(username,kind,id,payload,state,revision,due_at,expires_at)
     \\SELECT ?1,'outbox',?2,?3,'pending',1,?4,0 WHERE ?5 IS NULL OR EXISTS
-    \\(SELECT 1 FROM webmail_records WHERE username=?1 AND kind='draft' AND id=?5 AND state='saved' AND revision=?6)
+    \\(SELECT 1 FROM webmail_records WHERE username=?1 AND kind='draft' AND id=?5 AND state='saved' AND revision=?6
+    \\ AND NOT EXISTS(SELECT 1 FROM mail_ews_draft_finalizations c JOIN users u ON u.id=c.user_id
+    \\     WHERE u.username=?1 AND c.draft_id=?5 AND c.draft_revision=?6 AND c.retired_at IS NULL))
     \\ON CONFLICT(username,kind,id) DO NOTHING RETURNING revision
 ;
 

@@ -6,6 +6,7 @@ pub const categories = @import("../message/categories.zig");
 const config_mod = @import("../core/config.zig");
 const db_mod = @import("../storage/database.zig");
 const durable = @import("../core/durable_maildir.zig");
+const ews_drafts = @import("ews_drafts.zig");
 const forwarding = @import("../message/forwarding.zig");
 const vacation = @import("../message/vacation.zig");
 const fs = @import("../core/fs_compat.zig");
@@ -425,6 +426,7 @@ pub fn runRecovery(allocator: Allocator, db: *Database, shutdown: *std.atomic.Va
     var sweep_at: i64 = 0;
     while (!shutdown.load(.acquire)) {
         drain(allocator, db, null, 100) catch |err| std.log.err("local delivery recovery failed: {}", .{err});
+        ews_drafts.finalize(allocator, db, null) catch |err| std.log.warn("EWS draft recovery failed: {}", .{err});
         const now = time.timestamp();
         if (now >= sweep_at) {
             db.sweepDeliveryJournal(now - 7 * 86400) catch |err| std.log.warn("could not prune local delivery receipts: {}", .{err});

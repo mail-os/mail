@@ -636,6 +636,8 @@ def check_ews(test, sink):
         assert len(received) == 1 and b"Bcc:" not in received[0], received
 
     draft = ews_draft(test, sender, sink, bcc=[blind])
+    draft_file, = (test.directory / "mail" / sender / "Drafts").glob(draft.split(":", 1)[1] + "*")
+    draft_bytes = draft_file.stat().st_size
     before = (test.bytes(sender), test.bytes(sink), test.bytes(blind))
     assert ews_codes(test.ews(sender, send_ews_items(draft))) == ["ErrorSubmissionQuotaExceeded"]
     assert ews_codes(test.ews(sender, request, fragmented=True)) == ["ErrorSubmissionQuotaExceeded"]
@@ -649,7 +651,8 @@ def check_ews(test, sink):
     assert ews_codes(test.ews(sender, send_ews_items(draft, save=False))) == ["ErrorSubmissionQuotaExceeded"]
     test.provision("ews", daily=4)
     assert ews_codes(test.ews(sender, send_ews_items(draft, save=False))) == ["NoError"]
-    assert test.count(sender) == 4 and test.bytes(sender) == before[0]
+    assert test.count(sender) == 4 and test.bytes(sender) == before[0] - draft_bytes
+    assert not draft_file.exists()
     assert ews_codes(test.ews(sender, send_ews_items(draft, save=False))) == ["NoError"]
     assert ews_codes(test.ews(sender, send_ews_items(draft))) == ["ErrorInvalidSendItemSaveSettings"]
     quota_draft = ews_draft(test, sender, sink, bcc=[blind])
@@ -682,6 +685,14 @@ def check_ews(test, sink):
     blocked = ews_draft(test, batch, tiny, subject="Recipient has no storage")
     assert ews_codes(test.ews(batch, send_ews_items(blocked, save=False))) == ["ErrorQuotaExceeded"]
     assert test.count(batch) == 2 and test.bytes(tiny) == 0
+    retained, = (test.directory / "mail" / batch / "Drafts").glob(blocked.split(":", 1)[1] + "*")
+    assert retained.is_file()
+    test.provision("ews-batch", daily=4)
+    partial = ews_draft(test, batch, sink, cc=[tiny], subject="Partial EWS draft")
+    assert ews_codes(test.ews(batch, send_ews_items(partial))) == ["ErrorMessageSubmissionBlocked"]
+    assert ews_codes(test.ews(batch, send_ews_items(partial))) == ["ErrorMessageSubmissionBlocked"]
+    assert len(list((test.directory / "mail" / batch / "Drafts").glob(partial.split(":", 1)[1] + "*"))) == 1
+    assert test.count(batch) == 4
 
     race = test.provision("ews-race", daily=1)
     session = test.login(race)

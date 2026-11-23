@@ -20,6 +20,7 @@ const thread_ids = @import("../../message/thread_ids.zig");
 const message_refs = @import("../../storage/message_refs.zig");
 const snapshots = @import("../../api/webmail_snapshots.zig");
 const durable_maildir = @import("../../core/durable_maildir.zig");
+const ews_drafts = @import("../../delivery/ews_drafts.zig");
 const maildir_path = @import("../../core/maildir_path.zig");
 const config = @import("../../core/config.zig");
 
@@ -1009,7 +1010,7 @@ fn scanMail(ctx: *const Context, message: []const u8) !void {
     try clamav.requireAllowed(ctx.scanner, message);
 }
 
-fn submitMail(a: std.mem.Allocator, ctx: *Context, recipients: []const []const u8, raw: []const u8, sent_path: ?[]const u8, sent_copy: []const u8, reply: ?submission.NativeReply, draft: ?submission.EwsDraftFile) !void {
+fn submitMail(a: std.mem.Allocator, ctx: *Context, recipients: []const []const u8, raw: []const u8, sent_path: ?[]const u8, sent_copy: []const u8, reply: ?submission.NativeReply, draft: ?database.Database.EwsDraftSend) !void {
     try submission.sendRaw(a, .{
         .hostname = ctx.hostname,
         .mail_config = ctx.mail_config,
@@ -1834,29 +1835,40 @@ fn sendSavedItem(a: std.mem.Allocator, ctx: *Context, item: xml.Element, save_co
     const id = try xmlUnescape(a, item.attribute("Id") orelse return error.InvalidXml);
     const colon = std.mem.indexOfScalar(u8, id, ':') orelse return error.ItemNotFound;
     const mailbox = ewsFolderToMailbox(id[0..colon]);
+    const basename = id[colon + 1 ..];
+    const is_draft = std.mem.eql(u8, mailbox, "Drafts");
+    const key = if (item.attribute("ChangeKey")) |value| (if (std.mem.eql(u8, value, "ck0")) null else value) else null;
     const found, const draft, const source = blk: {
         ctx.db.lockMailboxes();
         defer ctx.db.unlockMailboxes();
         try requireReplyMailbox(a, ctx);
-        const found = readMailFile(a, ctx, mailbox, id[colon + 1 ..]) orelse return error.ItemNotFound;
+        const found = readMailFile(a, ctx, mailbox, basename) orelse {
+            if (is_draft and try ews_drafts.replay(ctx.db, ctx.username, basename, key, save_copy)) return;
+            return error.ItemNotFound;
+        };
         const revision = changeKey(found.content);
-        if (item.attribute("ChangeKey")) |key| {
-            if (!std.mem.eql(u8, key, "ck0") and !std.mem.eql(u8, key, &revision)) return error.StaleDraft;
+        if (key) |value| {
+            if (!std.mem.eql(u8, value, &revision)) {
+                if (is_draft and try ews_drafts.replay(ctx.db, ctx.username, basename, value, save_copy)) return;
+                return error.StaleDraft;
+            }
         }
-        if (!std.mem.eql(u8, mailbox, "Drafts")) break :blk .{ found, null, null };
+        if (!is_draft) break :blk .{ found, null, null };
         const identity = try message_refs.fileFingerprint(a, found.path);
         const at = message_refs.location(mailbox, std.fs.path.basename(found.path));
         const reference = (try message_refs.recoverAt(a, ctx.db, ctx.username, at, identity.stamp, &revision)) orelse
             try message_refs.issue(a, ctx.db, ctx.username, at, identity.stamp);
-        const draft: submission.EwsDraftFile = .{
-            .send = .{ .reference = reference, .revision = revision, .save_copy = save_copy },
+        const draft: database.Database.EwsDraftSend = .{
+            .reference = reference,
+            .revision = revision,
+            .save_copy = save_copy,
             .path = found.path,
             .fingerprint = identity.fingerprint,
         };
         const source = if (save_copy) draftReplySource(a, ctx, found, reference) catch null else null;
         break :blk .{ found, draft, source };
     };
-    if (draft) |saved| if (try submission.replayEwsDraft(a, ctx.db, ctx.username, saved.send)) return;
+    if (draft) |saved| if (try submission.replayEwsDraft(a, ctx.db, ctx.username, saved)) return;
     const split = headerBodySplit(found.content);
     const headers = found.content[0..split.header_end];
     var addresses: std.ArrayList([]const u8) = .empty;

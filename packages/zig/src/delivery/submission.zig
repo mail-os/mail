@@ -2,6 +2,7 @@
 const std = @import("std");
 const hosted_limits = @import("../storage/hosted_limits.zig");
 const durable_maildir = @import("../core/durable_maildir.zig");
+const ews_drafts = @import("ews_drafts.zig");
 const database = @import("../storage/database.zig");
 const shared_inbox = @import("../storage/shared_inbox.zig");
 const fs_compat = @import("../core/fs_compat.zig");
@@ -108,12 +109,6 @@ pub const SentCopy = struct {
     bytes: []const u8,
 };
 
-pub const EwsDraftFile = struct {
-    send: database.Database.EwsDraftSend,
-    path: []const u8,
-    fingerprint: []const u8,
-};
-
 const RawSubmission = struct {
     mailbox: []const u8,
     from: []const u8,
@@ -121,7 +116,7 @@ const RawSubmission = struct {
     raw: []const u8,
     sent: ?SentCopy = null,
     receipt: ?database.Database.ActiveSyncReceipt = null,
-    ews_draft: ?EwsDraftFile = null,
+    ews_draft: ?database.Database.EwsDraftSend = null,
     native_reply: ?NativeReply = null,
 };
 
@@ -171,7 +166,7 @@ pub const DispatchOptions = struct {
     sent: ?SentCopy = null,
     interactive_id: ?[]const u8 = null,
     receipt: ?database.Database.ActiveSyncReceipt = null,
-    ews_draft: ?EwsDraftFile = null,
+    ews_draft: ?database.Database.EwsDraftSend = null,
     account_notice: bool = false,
     recipient_id: ?i64 = null,
     team_reply_submission: ?database.Database.TeamReplySource = null,
@@ -288,7 +283,9 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
     const now = time_compat.timestamp();
     if (options.sender) |sender| {
         if (options.ews_draft) |draft| {
-            if (try db.ewsSendReceipt(a, sender, draft.send) != null) return error.EwsDraftAlreadyAccepted;
+            if (try db.ewsSendReceipt(a, sender, draft) != null or
+                try ews_drafts.replay(db, sender, database.maildirBaseName(std.fs.path.basename(draft.path)), &draft.revision, draft.save_copy))
+                return error.EwsDraftAlreadyAccepted;
             const file = message_refs.fileFingerprint(a, draft.path) catch return error.StaleDraft;
             if (!std.mem.eql(u8, file.fingerprint, draft.fingerprint)) return error.StaleDraft;
         }
@@ -378,7 +375,7 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
         .calendar_reply = options.calendar_reply,
         .charge_recipients = recipients.len,
         .receipt = options.receipt,
-        .ews_draft_send = if (options.ews_draft) |draft| draft.send else null,
+        .ews_draft_send = options.ews_draft,
         .team_reply_submission = options.team_reply_submission,
         .native_sent_reply = native_sent_reply,
     });
@@ -397,10 +394,12 @@ fn ewsSendResult(result: database.Database.EwsSendResult) !void {
 /// An admitted draft has an authoritative delivery journal. A lost response
 /// can be recovered from it without dispatching or charging the envelope again.
 pub fn replayEwsDraft(a: std.mem.Allocator, db: *database.Database, user: []const u8, draft: database.Database.EwsDraftSend) !bool {
-    const receipt = (try db.ewsSendReceipt(a, user, draft)) orelse return false;
+    const receipt = (try db.ewsSendReceipt(a, user, draft)) orelse
+        return ews_drafts.replay(db, user, database.maildirBaseName(std.fs.path.basename(draft.path)), &draft.revision, draft.save_copy);
     if (receipt.save_copy != draft.save_copy) return error.EwsSendSettingsChanged;
     if (receipt.result) |result| {
         try ewsSendResult(result);
+        finalizeEwsDraft(a, db, receipt.delivery_id);
         return true;
     }
     const recovery = (try db.interactiveDelivery(a, receipt.delivery_id)) orelse return error.EwsDeliveryUnconfirmed;
@@ -415,7 +414,12 @@ pub fn replayEwsDraft(a: std.mem.Allocator, db: *database.Database, user: []cons
         .failed;
     try db.finishEwsDraftSend(receipt.delivery_id, result);
     try ewsSendResult(result);
+    finalizeEwsDraft(a, db, receipt.delivery_id);
     return true;
+}
+
+fn finalizeEwsDraft(a: std.mem.Allocator, db: *database.Database, id: []const u8) void {
+    ews_drafts.finalize(a, db, id) catch |err| std.log.warn("EWS draft finalization will be retried: {}", .{err});
 }
 
 pub fn sendRaw(a: std.mem.Allocator, cfg: Delivery, message: RawSubmission) !void {
@@ -438,7 +442,7 @@ pub fn sendRaw(a: std.mem.Allocator, cfg: Delivery, message: RawSubmission) !voi
         .team_reply_submission = if (native) |reply| reply.source else null,
         .native_reply_wire_id = if (native) |reply| reply.wire_id else null,
     }) catch |err| {
-        if (err == error.EwsDraftAlreadyAccepted and try replayEwsDraft(a, db, message.mailbox, message.ews_draft.?.send)) return;
+        if (err == error.EwsDraftAlreadyAccepted and try replayEwsDraft(a, db, message.mailbox, message.ews_draft.?)) return;
         return err;
     };
     defer a.free(result.failed);
@@ -454,7 +458,9 @@ pub fn sendRaw(a: std.mem.Allocator, cfg: Delivery, message: RawSubmission) !voi
             else => .failed,
         } else .failed;
         try db.finishEwsDraftSend(&delivery_id, outcome);
-        return ewsSendResult(outcome);
+        try ewsSendResult(outcome);
+        finalizeEwsDraft(a, db, &delivery_id);
+        return;
     }
     if (result.delivered == 0) {
         return result.first_error orelse error.NoRecipients;
