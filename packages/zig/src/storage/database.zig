@@ -734,6 +734,35 @@ pub const Database = struct {
             \\);
             \\CREATE INDEX IF NOT EXISTS mail_snapshot_links_owner ON mail_snapshot_links(user_id,expires_at);
             \\CREATE INDEX IF NOT EXISTS mail_snapshot_links_expiry ON mail_snapshot_links(expires_at);
+            \\CREATE TABLE IF NOT EXISTS mail_assistant_grants (
+            \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    integration TEXT NOT NULL,
+            \\    token_hash TEXT NOT NULL UNIQUE,
+            \\    read_allowed INTEGER NOT NULL,
+            \\    draft_allowed INTEGER NOT NULL,
+            \\    payload TEXT NOT NULL,
+            \\    expires_at INTEGER NOT NULL,
+            \\    revoked_at INTEGER
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mail_assistant_owner ON mail_assistant_grants(user_id,id);
+            \\CREATE INDEX IF NOT EXISTS mail_assistant_expiry ON mail_assistant_grants(expires_at);
+            \\CREATE TABLE IF NOT EXISTS mail_assistant_audit (
+            \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\    grant_id INTEGER NOT NULL REFERENCES mail_assistant_grants(id) ON DELETE CASCADE,
+            \\    actor TEXT NOT NULL,
+            \\    action TEXT NOT NULL,
+            \\    outcome TEXT NOT NULL,
+            \\    occurred_at INTEGER NOT NULL
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mail_assistant_audit_grant ON mail_assistant_audit(grant_id,id);
+            \\CREATE TABLE IF NOT EXISTS mail_assistant_requests (
+            \\    grant_id INTEGER NOT NULL REFERENCES mail_assistant_grants(id) ON DELETE CASCADE,
+            \\    request_id TEXT NOT NULL,
+            \\    digest TEXT NOT NULL,
+            \\    acknowledgement TEXT,
+            \\    PRIMARY KEY(grant_id,request_id)
+            \\);
             \\CREATE TABLE IF NOT EXISTS mail_file_links (
             \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             \\    id TEXT NOT NULL,

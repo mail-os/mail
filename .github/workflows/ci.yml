@@ -130,6 +130,7 @@ jobs:
         python3 ../../scripts/test-imap-index-search.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-forwarding.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-retention.py zig-out/bin/mail
+        python3 ../../scripts/test-webmail-assistant-grants.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-vacation.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-junk.py zig-out/bin/mail
         python3 ../../scripts/test-dav-ownership.py

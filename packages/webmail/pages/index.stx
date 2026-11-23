@@ -25,6 +25,7 @@ const foldersExpanded = state(false)
 const selectingMessages = state(false)
 const foldersToggle = useRef('foldersToggle')
 const snapshotDialog = useRef('snapshotDialog')
+const assistantDialog = useRef('assistantDialog')
 const snapshotUrlField = useRef('snapshotUrlField')
 const replyBatchDialog = useRef('replyBatchDialog')
 const composerFileLink = useRef('composerFileLink')
@@ -101,6 +102,10 @@ const {
   snapshotMode, snapshotBusy, snapshotError, snapshotNotice, snapshotLifetime, snapshotPreview, snapshotIssued, snapshotLinks,
   snapshotRevoke, snapshotCanRefresh, refreshSnapshotPreview, createSnapshot, manageSnapshots, revokeSnapshot, copySnapshotUrl,
   closeSnapshots, canShareSnapshot, shareMessageSnapshot, shareSelectedSnapshot,
+  assistantMode, assistantBusy, assistantError, assistantNotice, assistantName, assistantRead, assistantDraft,
+  assistantLifetime, assistantSelection, assistantPreview, assistantIssued, assistantGrants, assistantAudit, assistantRevocation,
+  beginAssistantGrant, resetAssistantPreview, previewAssistantGrant, approveAssistantGrant, manageAssistantGrants,
+  revokeAssistantGrant, copyAssistantToken, closeAssistant, shareWithAssistant,
   replyBatchOpen, replyBatchBusy, replyBatchReview, replyBatchText, replyBatchError, replyBatchUncertain, replyBatchReceipt,
   replyBatchReferences, replyToSelection, reviewReplyBatch, submitReplyBatch, closeReplyBatch,
   messageFileLinks, fileLinkOpen, fileLinkFile, fileLinkLifetime, fileLinkUploading, fileLinkError, fileLinkNotice,
@@ -141,6 +146,19 @@ function closeSnapshotDialog() {
 async function publishSnapshot() {
   await createSnapshot()
   if (snapshotIssued()) nextTick(() => snapshotUrlField.current?.focus())
+}
+function openAssistantPreview(bulk = false) {
+  shareWithAssistant(bulk)
+  nextTick(() => { if (!assistantDialog.current?.open) assistantDialog.current?.showModal() })
+}
+function openAssistantManager() {
+  manageAssistantGrants()
+  nextTick(() => { if (!assistantDialog.current?.open) assistantDialog.current?.showModal() })
+}
+function closeAssistantDialog() {
+  if (assistantBusy()) return
+  assistantDialog.current?.close()
+  closeAssistant()
 }
 function openReplyBatch() {
   replyToSelection()
@@ -291,6 +309,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         <button type="button" class="wm-action wm-action--accent" @click="readSelection()" :disabled="loading || readingLoading || triageBusy || mutating"><span class="mail-icon" data-icon="layers" aria-hidden="true"></span>Read selected</button>
         <button :if="!linkedView && selectedCount > 1 && folder !== 'Sent' && folder !== 'Drafts' && folder !== 'Trash' && !isJunkFolder(folder)" type="button" class="wm-action" aria-haspopup="dialog" :disabled="loading || mutating" @click="openReplyBatch()"><span class="mail-icon" data-icon="reply" aria-hidden="true"></span>Reply separately</button>
         <button :if="!linkedView && folder !== 'Drafts' && folder !== 'Trash' && !isJunkFolder(folder)" type="button" class="wm-action" aria-haspopup="dialog" :disabled="loading || mutating" @click="openSnapshotPreview(true)"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Share snapshot</button>
+        <button :if="!linkedView && folder !== 'Drafts' && folder !== 'Trash' && !isJunkFolder(folder)" type="button" class="wm-action" aria-haspopup="dialog" :disabled="loading || mutating" @click="openAssistantPreview(true)">Assistant access</button>
         <button :if="!linkedView && selectedCount > 1 && !categoryList && !attentionView && folder !== 'Drafts'" type="button" class="wm-action" @click="groupSelected()" :disabled="loading || readingLoading || triageBusy || mutating">Group selected</button>
         <button class="wm-action" @click="bulkAction('move', 'Archive')" :disabled="mutating"><span class="mail-icon" data-icon="archive" aria-hidden="true"></span>Archive</button>
         <div class="wm-bulk-move" role="group" aria-label="Move selected messages">
@@ -453,6 +472,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
               <span class="wm-folder-badge"><span class="mail-icon" :data-icon="mailFolderIcon(selected?.folder || '')" aria-hidden="true"></span><span :text="folderName(selected?.folder || '')"></span></span>
               <div class="wm-message-sharing">
                 <button :if="canShareSnapshot" type="button" class="wm-action wm-action--quiet" aria-haspopup="dialog" @click="openSnapshotPreview()" :disabled="readingLoading || mutating"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Share snapshot</button>
+                <button :if="canShareSnapshot" type="button" class="wm-action wm-action--quiet" aria-haspopup="dialog" @click="openAssistantPreview()" :disabled="readingLoading || mutating"><span class="mail-icon" data-icon="shield" aria-hidden="true"></span>Assistant access</button>
                 <button :if="canOpenPrivate" type="button" class="wm-action wm-action--quiet" :aria-expanded="privateOpen" @click="privateOpen ? closePrivate() : showPrivate()" :disabled="readingLoading || mutating"><span class="mail-icon" data-icon="bookmark" aria-hidden="true"></span>Private tools</button>
               </div>
             </div>
@@ -960,6 +980,11 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
     <dt>Safari on iPhone or iPad</dt><dd>Choose <strong>Add to Home Screen</strong> from the Share menu and turn on <strong>Open as Web App</strong>.</dd>
   </dl>
 </details>
+<section class="login-recovery" aria-labelledby="assistantSettingsHeading">
+  <h2 id="assistantSettingsHeading"><span class="mail-icon" data-icon="shield" aria-hidden="true"></span>Assistant access</h2>
+  <p class="login-sub">Review active grants, see how they were used, or let an integration prepare drafts.</p>
+  <button type="button" class="login-secondary" aria-haspopup="dialog" @click="openAssistantManager()">Manage assistant access</button>
+</section>
 <section class="login-recovery" aria-labelledby="notificationHeading">
   <h2 id="notificationHeading"><span class="mail-icon" data-icon="bell" aria-hidden="true"></span>Browser notifications</h2>
   <p class="login-sub">Receive a private “You have new mail” alert while webmail is open.</p>
@@ -1151,6 +1176,81 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         <button type="button" class="wm-action wm-action--danger" :disabled="snapshotBusy" @click="revokeSnapshot()">Revoke link</button>
         <button type="button" class="wm-action" :disabled="snapshotBusy" @click="snapshotRevoke.set(null)">Cancel</button>
       </div>
+    </div>
+  </section>
+</dialog>
+<dialog :if="assistantMode" ref="assistantDialog" class="wm-modal wm-snapshot-dialog" aria-labelledby="assistantTitle" @cancel.prevent="closeAssistantDialog()">
+  <section class="wm-snapshot-panel" :aria-busy="assistantBusy">
+    <header class="wm-snapshot-dialog-heading">
+      <h2 id="assistantTitle" :text="assistantMode === 'issued' ? 'Assistant access granted' : 'Assistant access'"></h2>
+      <button type="button" class="wm-action" :disabled="assistantBusy" @click="closeAssistantDialog()" autofocus>Close</button>
+    </header>
+    <p :if="assistantError" class="wm-inline-error" role="alert" :text="assistantError"></p>
+    <p :if="assistantNotice" class="wm-snapshot-muted" role="status" :text="assistantNotice"></p>
+    <div :if="assistantMode === 'edit'" class="wm-snapshot-workflow">
+      <form class="wm-assistant-form" @submit.prevent="previewAssistantGrant()">
+        <label class="wm-snapshot-url">Integration name<input x-model="assistantName" maxlength="80" autocomplete="off" @input="resetAssistantPreview()" required :disabled="assistantBusy"></label>
+        <fieldset :disabled="assistantBusy">
+          <legend>Permissions</legend>
+          <label :if="assistantSelection.length"><input type="checkbox" x-model="assistantRead" @change="resetAssistantPreview()"><span :text="'Read ' + assistantSelection.length + (assistantSelection.length === 1 ? ' selected message' : ' selected messages')"></span></label>
+          <label><input type="checkbox" x-model="assistantDraft" @change="resetAssistantPreview()">Prepare drafts for review</label>
+        </fieldset>
+        <div class="wm-snapshot-form">
+          <label>Access expires in<select x-model="assistantLifetime" :disabled="assistantBusy" @change="resetAssistantPreview()">
+            <option :for="lifetime in linkLifetimes" :key="lifetime.seconds" :value="String(lifetime.seconds)" :text="lifetime.label"></option>
+          </select></label>
+          <button type="submit" class="wm-action" :disabled="assistantBusy || (!assistantRead && !assistantDraft)">Review access</button>
+        </div>
+      </form>
+      <div :if="assistantPreview" class="wm-snapshot-workflow" role="region" aria-label="Assistant access preview">
+        <h3 class="wm-assistant-preview-name" :text="assistantPreview.integration"></h3>
+        <p class="wm-snapshot-muted" :text="'Access expires in ' + (linkLifetimes.find(item => item.seconds === assistantPreview.lifetime)?.label || '') + '.'"></p>
+        <p :if="assistantPreview.draft" class="wm-snapshot-muted">The integration can save drafts in this mailbox. You review the draft and choose when to send it.</p>
+        <p :if="assistantPreview.read" class="wm-snapshot-muted">The integration can read the text shown here, including any quotations. Attachments and private notes stay in Mail.</p>
+        <div :if="assistantPreview.messages.length" class="wm-snapshot-messages" tabindex="0">
+          <article :for="message in assistantPreview.messages" :key="message.reference" class="wm-snapshot-message">
+            <h3 :text="message.subject || '(No subject)'"></h3>
+            <p class="wm-snapshot-body" :text="message.text || 'No readable text in this message.'"></p>
+          </article>
+        </div>
+        <div class="wm-snapshot-form">
+          <button type="button" class="wm-action wm-snapshot-primary" @click="approveAssistantGrant()" :disabled="assistantBusy">Grant access</button>
+        </div>
+      </div>
+    </div>
+    <div :if="assistantMode === 'issued' && assistantIssued" class="wm-snapshot-workflow">
+      <p class="wm-snapshot-muted" :text="assistantIssued.grant.integration + ' · Expires ' + snapshotDate(assistantIssued.grant.expires_at)"></p>
+      <div class="wm-snapshot-form">
+        <label class="wm-snapshot-url">Integration credential<input type="text" spellcheck="false" readonly autocomplete="off" :value="assistantIssued.token" @focus="$event.target.select()"></label>
+        <button type="button" class="wm-action wm-snapshot-primary" @click="copyAssistantToken()">Copy credential</button>
+      </div>
+      <p class="wm-snapshot-muted">Anyone with this credential can use the approved access until expiry or revocation. Copy it into the named integration. Mail shows it once.</p>
+    </div>
+    <div :if="assistantMode === 'manage'" class="wm-snapshot-workflow">
+      <button class="wm-action wm-assistant-new" type="button" :disabled="assistantBusy" @click="beginAssistantGrant()">Allow an integration to prepare drafts</button>
+      <p :if="!assistantBusy && !assistantGrants.length && !assistantError" class="wm-snapshot-muted">You have no active assistant grants.</p>
+      <button :if="assistantError" class="wm-action" type="button" @click="manageAssistantGrants()">Refresh grants</button>
+      <ul :if="assistantGrants.length" class="wm-snapshot-links" aria-label="Active assistant grants">
+        <li :for="grant in assistantGrants" :key="grant.id">
+          <div><strong :text="grant.integration"></strong><p :if="grant.read" class="wm-snapshot-muted" :text="'Can read ' + grant.message_count + (grant.message_count === 1 ? ' message' : ' messages')"></p><p :if="grant.draft" class="wm-snapshot-muted">Can prepare drafts</p><p class="wm-snapshot-muted" :text="'Expires ' + snapshotDate(grant.expires_at)"></p></div>
+          <button type="button" class="wm-action wm-action--danger" :disabled="assistantBusy || assistantRevocation" :aria-label="'Revoke ' + grant.integration" @click="assistantRevocation.set(grant)">Revoke</button>
+          <details :if="grant.subjects.length" class="wm-assistant-subjects">
+            <summary>Approved messages</summary>
+            <ul><li :for="subject in grant.subjects" :text="subject || '(No subject)'"></li></ul>
+          </details>
+        </li>
+      </ul>
+      <div :if="assistantRevocation" class="wm-snapshot-confirm" role="group" aria-label="Confirm assistant revocation">
+        <p :text="'Revoke access for ' + assistantRevocation.integration + '?'"></p>
+        <button type="button" class="wm-action wm-action--danger" :disabled="assistantBusy" @click="revokeAssistantGrant()">Revoke access</button>
+        <button type="button" class="wm-action" :disabled="assistantBusy" @click="assistantRevocation.set(null)">Cancel</button>
+      </div>
+      <details :if="assistantAudit.length" class="wm-assistant-audit">
+        <summary>Recent activity</summary>
+        <ul class="wm-snapshot-links">
+          <li :for="entry in assistantAudit"><div><strong :text="entry.integration"></strong><p class="wm-snapshot-muted" :text="entry.actor + ' · ' + entry.action + ' · ' + entry.outcome + ' · ' + snapshotDate(entry.occurred_at)"></p></div></li>
+        </ul>
+      </details>
     </div>
   </section>
 </dialog>

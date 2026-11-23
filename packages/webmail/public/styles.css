@@ -954,6 +954,17 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-snapshot-form input { width: 100%; }
 .wm-snapshot-form .wm-snapshot-primary { color: var(--on-primary); background: var(--primary); border-color: var(--primary); }
 .wm-snapshot-form .wm-snapshot-primary:hover { background: var(--primary-hover); }
+.wm-assistant-form { display: grid; gap: 10px; }
+.wm-assistant-form > label { display: grid; gap: 5px; font-size: 13px; font-weight: 550; }
+.wm-assistant-form fieldset { display: grid; gap: 5px; min-width: 0; margin: 0; border: 1px solid var(--border); border-radius: var(--control-radius); }
+.wm-assistant-form fieldset label { display: flex; align-items: center; gap: 6px; min-block-size: var(--control-height); }
+.wm-assistant-form legend { padding-inline: 4px; font-size: 13px; font-weight: 550; }
+.wm-assistant-preview-name { margin: 0; font-size: 15px; font-weight: 650; }
+.wm-assistant-new { justify-self: start; white-space: normal; }
+.wm-assistant-audit summary { cursor: pointer; margin-block-end: 8px; }
+.wm-assistant-subjects { flex-basis: 100%; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.wm-assistant-subjects summary { cursor: pointer; }
+.wm-assistant-subjects ul { margin: 6px 0 0; padding-inline-start: 18px; }
 .wm-reply-sender, .wm-reply-recipients { margin: 0; border: 1px solid var(--border); border-radius: var(--control-radius); }
 .wm-reply-sender { display: flex; flex-wrap: wrap; gap: 8px 16px; padding: 10px 12px; background: var(--toolbar); }
 .wm-reply-sender > div { flex: 1 1 12rem; min-width: 0; }

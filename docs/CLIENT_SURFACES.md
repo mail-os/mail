@@ -49,15 +49,15 @@ as other clients.
 
 ## Assistant automation
 
-Build a separate mailbox-owner grant for two operations in the next slice.
-An owner can approve reading selected messages and can separately approve
-preparing drafts. The integration identity, selected messages, permissions,
-and expiry must be visible before approval. The owner can revoke access
-and review its audit history.
+Offer a mailbox-owner grant for two separately selectable actions. An owner
+can approve reading selected messages and preparing drafts. The owner sees
+the integration name, selected text, permissions, and expiry before approval.
+Account settings shows active grants, revocation controls, and audit history.
 
 Drafts use the existing composer and its owner-controlled send action.
 Browser sign-in, linked mailbox access, and hosted provisioning keep their
-existing authorization contracts. [Scoped assistant grant](https://github.com/mail-os/mail/issues/120)
+existing authorization contracts. [Assistant setup](../WEBMAIL.md#assistant-access)
+· [Scoped assistant grant](https://github.com/mail-os/mail/issues/120)
 
 ## Mail-to-web publishing
 

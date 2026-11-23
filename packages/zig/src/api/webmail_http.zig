@@ -65,6 +65,7 @@ const calendar_day_labels = @import("../storage/calendar_day_labels.zig");
 const calendar_tasks = @import("../storage/calendar_tasks.zig");
 const calendar_tools = @import("../storage/calendar_tools.zig");
 const snapshots = @import("webmail_snapshots.zig");
+const assistant = @import("webmail_assistant.zig");
 const reply_batches = @import("webmail_batch_replies.zig");
 const file_links = @import("webmail_file_links.zig");
 const link_tokens = @import("webmail_link_tokens.zig");
@@ -147,6 +148,7 @@ pub const WebmailHttpServer = struct {
     running: std.atomic.Value(bool),
     active_connections: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     file_transfers: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    assistant_mutations: @import("../core/mutex_compat.zig").Mutex = .{},
 
     fn claimFileTransfer(self: *WebmailHttpServer) bool {
         if (self.file_transfers.fetchAdd(1, .acq_rel) < 4) return true;
@@ -240,6 +242,7 @@ pub const WebmailHttpServer = struct {
             try self.service.recoverInterrupted(time_compat.timestamp());
             self.service.sweep(time_compat.timestamp()) catch |err| logger.warn("Webmail state cleanup failed: {}", .{err});
             snapshots.sweep(self.db, time_compat.timestamp()) catch |err| logger.warn("Snapshot link cleanup failed: {}", .{err});
+            assistant.sweep(self.db, time_compat.timestamp()) catch |err| logger.warn("Assistant grant cleanup failed: {}", .{err});
             file_links.sweep(self.db, time_compat.timestamp()) catch |err| logger.warn("File link cleanup failed: {}", .{err});
             break :blk try std.Thread.spawn(.{}, deliveryWorker, .{self});
         } else null;
@@ -261,6 +264,7 @@ pub const WebmailHttpServer = struct {
                 self.sessions.sweep();
                 self.service.sweep(now) catch |err| logger.warn("Webmail state cleanup failed: {}", .{err});
                 snapshots.sweep(self.db, now) catch |err| logger.warn("Snapshot link cleanup failed: {}", .{err});
+                assistant.sweep(self.db, now) catch |err| logger.warn("Assistant grant cleanup failed: {}", .{err});
                 file_links.sweep(self.db, now) catch |err| logger.warn("File link cleanup failed: {}", .{err});
             }
 
@@ -470,6 +474,8 @@ fn readRequest(server: *WebmailHttpServer, conn: *webmail_tls.Stream, allocator:
     var body_limit: usize = if (server.config.provisioning != null) 4096 else max_request_bytes;
     if (std.mem.eql(u8, path, "/webmail/api/combined/accounts")) body_limit = @min(body_limit, 8192);
     if (std.mem.eql(u8, path, "/webmail/api/combined/actions")) body_limit = @min(body_limit, 32 * 1024);
+    if (std.mem.startsWith(u8, path, "/webmail/assistant/")) body_limit = @min(body_limit, 512 * 1024);
+    if (std.mem.startsWith(u8, path, "/webmail/api/assistant-grants")) body_limit = @min(body_limit, 4096);
     const file_upload = std.mem.eql(u8, path, file_links.path);
     errdefer if (request.holds_file_transfer) server.releaseFileTransfer();
     if (server.config.provisioning == null and std.mem.eql(u8, method, "POST") and
@@ -629,6 +635,19 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
         return handlePrivateGroupUndo(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/uploads") and std.mem.eql(u8, req.method, "POST")) return handleUpload(server, conn, arena, req);
     const snapshot_path = "/webmail/api/snapshot-links";
+    const assistant_path = "/webmail/api/assistant-grants";
+    if (std.mem.eql(u8, p, assistant_path)) {
+        if (std.mem.eql(u8, req.method, "GET")) return handleAssistantOwner(server, conn, arena, req, .list, "");
+        if (std.mem.eql(u8, req.method, "POST")) return handleAssistantOwner(server, conn, arena, req, .issue, "");
+    }
+    if (std.mem.eql(u8, p, assistant_path ++ "/preview") and std.mem.eql(u8, req.method, "POST"))
+        return handleAssistantOwner(server, conn, arena, req, .preview, "");
+    if (std.mem.startsWith(u8, p, assistant_path ++ "/") and std.mem.eql(u8, req.method, "DELETE"))
+        return handleAssistantOwner(server, conn, arena, req, .revoke, p[assistant_path.len + 1 ..]);
+    if (std.mem.eql(u8, req.method, "POST")) {
+        if (std.mem.eql(u8, p, "/webmail/assistant/read")) return handleAssistantUse(server, conn, arena, req, .read);
+        if (std.mem.eql(u8, p, "/webmail/assistant/drafts")) return handleAssistantUse(server, conn, arena, req, .draft);
+    }
     if (std.mem.eql(u8, p, snapshot_path) and std.mem.eql(u8, req.method, "GET")) return handleSnapshotList(server, conn, arena, req);
     if (std.mem.eql(u8, p, snapshot_path) and std.mem.eql(u8, req.method, "POST")) return handleSnapshotCreate(server, conn, arena, req, false);
     if (std.mem.eql(u8, p, snapshot_path ++ "/preview") and std.mem.eql(u8, req.method, "POST")) return handleSnapshotCreate(server, conn, arena, req, true);
@@ -3986,6 +4005,106 @@ fn handleSnapshotList(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: 
     defer sess.deinit(server.allocator);
     const links = try snapshots.list(a, server.db, sess.username, time_compat.timestamp());
     return sendJson(conn, a, 200, try service_mod.json(a, .{ .links = links }), null);
+}
+
+const AssistantOwnerAction = enum { list, preview, issue, revoke };
+
+fn secureAssistantRequest(server: *WebmailHttpServer, req: Request) bool {
+    return server.cert_key_pair != null or
+        (req.trust_forwarded_headers and std.ascii.eqlIgnoreCase(req.header("X-Forwarded-Proto") orelse "", "https"));
+}
+
+fn handleAssistantOwner(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request, action: AssistantOwnerAction, id_text: []const u8) !void {
+    if (action != .list and !isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    if (action == .issue and !secureAssistantRequest(server, req))
+        return sendError(conn, a, 403, "https_required", "Use HTTPS to issue an assistant credential.");
+    var session = (try requireSession(server, conn, a, req)) orelse return;
+    defer session.deinit(server.allocator);
+    if (action == .list) return sendJson(conn, a, 200, try service_mod.json(a, try assistant.status(a, server.db, session.username, time_compat.timestamp())), null);
+    if (action == .revoke) {
+        const id = std.fmt.parseInt(i64, id_text, 10) catch return assistantError(conn, a, error.AssistantUnavailable);
+        server.assistant_mutations.lock();
+        const revoked = assistant.revoke(server.db, session.username, id, time_compat.timestamp());
+        server.assistant_mutations.unlock();
+        revoked catch |err| return assistantError(conn, a, err);
+        return sendJson(conn, a, 200, "{\"revoked\":true}", null);
+    }
+    const input = std.json.parseFromSliceLeaky(assistant.Input, a, req.body, .{}) catch
+        return assistantError(conn, a, error.InvalidAssistantGrant);
+    const prepared = assistant.prepare(a, server.db, session.username, input, server.service.junkFolder()) catch |err|
+        return assistantError(conn, a, err);
+    if (action == .preview) {
+        const shown = prepared.preview;
+        return sendJson(conn, a, 200, try service_mod.json(a, .{
+            .integration = shown.integration,
+            .read = shown.read,
+            .draft = shown.draft,
+            .lifetime = shown.lifetime,
+            .messages = shown.messages,
+            .digest = @as([]const u8, &shown.digest),
+        }), null);
+    }
+    if (!std.mem.eql(u8, &prepared.preview.digest, input.digest orelse ""))
+        return sendError(conn, a, 409, "assistant_preview_changed", "Review the current grant preview before approving it.");
+    const issued = assistant.issue(server.db, session.username, prepared, time_compat.timestamp()) catch |err| return assistantError(conn, a, err);
+    return sendJson(conn, a, 201, try service_mod.json(a, .{ .grant = issued.grant, .token = @as([]const u8, &issued.token) }), null);
+}
+
+fn handleAssistantUse(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request, action: assistant.Action) !void {
+    if (!secureAssistantRequest(server, req)) return sendError(conn, a, 403, "https_required", "Use HTTPS for assistant requests.");
+    const prefix = "Bearer ";
+    const header = req.header("Authorization") orelse "";
+    if (!std.mem.startsWith(u8, header, prefix)) return assistantError(conn, a, error.AssistantUnavailable);
+    const body = assistantUseResult(server, a, header[prefix.len..], req.body, action) catch |err| return assistantError(conn, a, err);
+    return sendJson(conn, a, 200, body, null);
+}
+
+fn assistantUseResult(server: *WebmailHttpServer, a: std.mem.Allocator, token: []const u8, json_body: []const u8, action: assistant.Action) ![]const u8 {
+    server.assistant_mutations.lock();
+    defer server.assistant_mutations.unlock();
+    const now = time_compat.timestamp();
+    const access = try assistant.authenticate(a, server.db, token, action, now);
+    const body = switch (action) {
+        .read => blk: {
+            const input = std.json.parseFromSliceLeaky(struct { reference: []const u8 }, a, json_body, .{}) catch {
+                try assistant.audit(server.db, access, action, .denied, now);
+                return error.InvalidAssistantGrant;
+            };
+            const item = assistant.read(a, server.db, access, input.reference, server.service.junkFolder()) catch |err| {
+                try assistant.audit(server.db, access, action, if (err == error.AssistantUnavailable or err == error.MessageNotFound) .denied else .failed, now);
+                return err;
+            };
+            break :blk try service_mod.json(a, item);
+        },
+        .draft => blk: {
+            const input = std.json.parseFromSliceLeaky(assistant.DraftInput, a, json_body, .{}) catch {
+                try assistant.audit(server.db, access, action, .denied, now);
+                return error.InvalidAssistantDraft;
+            };
+            const draft = assistant.prepareDraft(a, &server.service, access, input) catch |err| {
+                try assistant.audit(server.db, access, action, .failed, now);
+                return err;
+            };
+            break :blk try service_mod.json(a, draft);
+        },
+        else => unreachable,
+    };
+    try assistant.audit(server.db, access, action, .ok, now);
+    return body;
+}
+
+fn assistantError(conn: *webmail_tls.Stream, a: std.mem.Allocator, err: anyerror) !void {
+    return switch (err) {
+        error.AssistantUnavailable, error.MessageNotFound => sendError(conn, a, 404, "assistant_unavailable", "The requested assistant grant or message is unavailable."),
+        error.InvalidAssistantGrant => sendError(conn, a, 400, "invalid_assistant_grant", "Choose an integration, permissions, and a supported expiry."),
+        error.InvalidAssistantDraft => sendError(conn, a, 400, "invalid_assistant_draft", "Enter a request ID and plain-text draft within the size limits."),
+        error.InvalidAssistantText => sendError(conn, a, 422, "assistant_text_unavailable", "This message has text that could not be shared."),
+        error.AssistantPreviewTooLarge => sendError(conn, a, 413, "assistant_preview_too_large", "Choose fewer or smaller messages."),
+        error.AssistantGrantLimit => sendError(conn, a, 409, "assistant_grant_limit", "Revoke an active grant before adding another."),
+        error.AssistantDraftLimit => sendError(conn, a, 409, "assistant_draft_limit", "This grant reached its draft limit."),
+        error.AssistantDraftConflict => sendError(conn, a, 409, "assistant_draft_conflict", "Check Drafts before submitting a different request ID."),
+        else => mapServiceError(conn, a, err),
+    };
 }
 
 fn handleSnapshotCreate(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request, preview: bool) !void {

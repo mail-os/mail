@@ -2129,6 +2129,66 @@ async function verifyInstallableWebmail(page) {
   }
 }
 
+async function assistantGrantJourney(phone) {
+  const desktop = await signIn({ account: newcomer, initialSubject: 'Studio launch notes' })
+  await button(desktop, /Studio launch notes/).click()
+  await heading(desktop, 'Studio launch notes').waitFor()
+  await button(desktop, 'Assistant access').click()
+  const consent = desktop.getByRole('dialog', { name: /^Assistant access/ })
+  await consent.getByLabel('Integration name').fill('Studio helper')
+  assert.equal(await consent.getByRole('checkbox', { name: 'Read 1 selected message' }).isChecked(), true)
+  const mayDraft = consent.getByRole('checkbox', { name: 'Prepare drafts for review' })
+  assert.equal(await mayDraft.isChecked(), false)
+  await mayDraft.check()
+  await consent.getByLabel('Access expires in').selectOption('86400')
+  await button(consent, 'Review access').click()
+  const preview = consent.getByRole('region', { name: 'Assistant access preview' })
+  await preview.getByText('Studio launch notes', { exact: true }).waitFor()
+  await preview.getByText('Studio helper', { exact: true }).waitFor()
+  await preview.getByText('Access expires in 24 hours.', { exact: true }).waitFor()
+  await consent.locator('.wm-snapshot-panel').screenshot({ path: join(output, 'desktop-assistant-consent.png'), animations: 'disabled' })
+  await button(preview, 'Grant access').click()
+  const token = await consent.getByLabel('Integration credential').inputValue()
+  assert.match(token, /^[a-f0-9]{64}$/)
+  await button(consent, 'Close').click()
+  const endpoint = url + '/webmail/assistant/drafts'
+  const options = {
+    headers: { Authorization: `Bearer ${token}` },
+    data: { request_id: '854a805e8ff4499296919553a22ac047', to: [sender], subject: 'Assistant draft for review', text: 'Review this before sending.' },
+  }
+  const saved = await desktop.request.post(endpoint, options)
+  assert.equal(saved.status(), 200, await saved.text())
+  await openMailbox(desktop, /^Drafts(?:\s|$)/)
+  await button(desktop, /Assistant draft for review/).click()
+  await button(desktop, 'Edit draft').click()
+  const composer = desktop.getByRole('dialog', { name: 'Compose message' })
+  await composer.getByText('Edit draft', { exact: true }).waitFor()
+  assert.equal(await composer.getByLabel('Subject', { exact: true }).inputValue(), 'Assistant draft for review')
+  assert.equal(await composer.getByLabel('Message body').inputValue(), 'Review this before sending.')
+  await button(composer, 'Close composer').click()
+
+  await phone.setViewportSize({ width: 320, height: 844 })
+  await phone.emulateMedia({ colorScheme: 'dark' })
+  await phone.goto(url + '/')
+  await drawer(phone).click()
+  await button(phone, 'Account').click()
+  await button(phone, 'Manage assistant access').click()
+  const manager = phone.getByRole('dialog', { name: 'Assistant access', exact: true })
+  const grants = manager.getByRole('list', { name: 'Active assistant grants' })
+  await grants.getByText('Studio helper', { exact: true }).waitFor()
+  await grants.getByText('Can prepare drafts', { exact: true }).waitFor()
+  await grants.getByText('Approved messages', { exact: true }).click()
+  await grants.getByText('Studio launch notes', { exact: true }).waitFor()
+  await manager.getByText('Recent activity', { exact: true }).click()
+  await manager.getByText('integration · draft · ok', { exact: false }).waitFor()
+  await fitsViewport(phone)
+  await grants.screenshot({ path: join(output, 'phone-assistant-grant.png'), animations: 'disabled' })
+  await button(grants, 'Revoke Studio helper').click()
+  await button(manager.getByRole('group', { name: 'Confirm assistant revocation' }), 'Revoke access').click()
+  await manager.getByText('Assistant access revoked.', { exact: true }).waitFor()
+  assert.equal((await desktop.request.post(endpoint, options)).status(), 404)
+}
+
 async function installGuideJourney(page, phone = false) {
   const viewport = page.viewportSize()
   if (phone) {
@@ -2180,6 +2240,7 @@ try {
   await senderInvitationJourney(desktop, phone)
   await forwardingFilterJourney(desktop, phone)
   await retentionJourney(firstRun)
+  await assistantGrantJourney(firstRun)
   assert.deepEqual(errors, [], 'Browser pages raised uncaught errors')
   process.stdout.write(`${engine} passed the desktop and phone webmail journeys.\n`)
 }

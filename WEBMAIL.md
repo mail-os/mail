@@ -414,6 +414,46 @@ A restored message is excluded from future cleanup. Recovery is available
 while the message remains in Trash. Turning cleanup off stops future moves
 and keeps the recovery list available.
 
+## Assistant access
+
+Open an eligible message and choose **Assistant access**, or select up to ten
+messages and use the same action on the selected-message toolbar. Enter the
+integration name, choose read access, draft preparation, or both, then review
+the permissions and the exact message text before approving. To allow draft
+preparation by itself, use **Account → Assistant access → Manage assistant
+access**. The confirmation shows the credential once.
+
+Each credential covers one mailbox and expires after one hour, 24 hours, or
+seven days. Read access returns the approved subject and text for each
+selected message. Mail removes recognized link targets from the preview.
+Attachments, addresses from message headers, and private workflow metadata
+stay in the mailbox. A selected message becomes unavailable if its stored
+content changes or Mail can no longer resolve it as an eligible message.
+
+Assistant drafts open from Drafts in the regular composer. Review the
+recipients and content, then use Send when ready. Account settings shows
+active grants and recent activity and lets you revoke access. Each grant
+allows up to 25 draft requests. Activity stays available for up to 30 days.
+
+### Assistant API
+
+Send the issued token in `Authorization: Bearer <token>` over HTTPS.
+The browser session and operator provisioning contract have separate routes.
+
+- `POST /webmail/assistant/read` accepts `{reference}` and returns
+  `{reference, subject, text}` for a selected, approved message.
+- `POST /webmail/assistant/drafts` accepts `{request_id, to, cc, bcc, subject,
+  text}`. Use a unique request ID of 16–64 letters, digits, or hyphens. An identical retry
+  of a completed request returns the original draft acknowledgement.
+  An interrupted request returns a conflict on replay so the owner can check
+  Drafts before the integration submits a new ID.
+- The browser uses `GET /webmail/api/assistant-grants` to list active grants
+  and recent activity. `POST /webmail/api/assistant-grants/preview` accepts
+  `{integration, read, draft, lifetime, references}`. Send the same fields
+  and the preview's `digest` to `POST /webmail/api/assistant-grants` to approve
+  it. `DELETE /webmail/api/assistant-grants/<id>` revokes it. Owner mutations
+  use the same-origin mailbox session.
+
 ## Password recovery
 
 Each mailbox may have one recovery address outside itself. "Forgot password?"
