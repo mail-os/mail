@@ -45,11 +45,10 @@ def estimate(test, mailbox, keys):
     status, _, data = test.eas(mailbox, body + END * 2, command="GetItemEstimate", device=DEVICE, encoded=True)
     assert status == 200, (status, data)
     result = {}
-    for response in data.split(b"\x4d")[1:]:
-        code = int(re.search(rb"\x4e\x03([0-9]+)\x00\x01", response)[1])
-        folder = re.search(rb"\x4a\x03([0-9]+)\x00\x01", response)[1].decode()
-        match = re.search(rb"\x4c\x03([0-9]+)\x00\x01", response)
-        result[folder] = (code, int(match[1]) if match else None)
+    pattern = (rb"\x4d\x4e\x03([0-9]+)\x00\x01\x48\x4a\x03([^\x00]+)\x00\x01"
+               rb"(?:\x4c\x03([0-9]+)\x00\x01)?\x01\x01")
+    for code, folder, count in re.findall(pattern, data):
+        result[folder.decode()] = (int(code), int(count) if count else None)
     assert set(result) == set(keys), data
     return result
 
@@ -63,7 +62,7 @@ def ping(test, mailbox, *, folders=FOLDERS, heartbeat=20):
     status, _, data = test.eas(mailbox, body, command="Ping", device=DEVICE, encoded=True, timeout=33)
     assert status == 200 and data.startswith(WBXML + page + b"\x45"), (status, data)
     code = int(re.search(rb"\x47\x03([0-9]+)\x00\x01", data)[1])
-    found = tuple(item.decode() for item in re.findall(rb"\x4a\x03([0-9]+)\x00\x01", data))
+    found = tuple(item.decode() for item in re.findall(rb"\x4a\x03([A-Za-z0-9_-]+)\x00\x01", data))
     return code, found
 
 

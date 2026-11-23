@@ -3,6 +3,7 @@
 const std = @import("std");
 const database = @import("../storage/database.zig");
 const io_compat = @import("../core/io_compat.zig");
+const time = @import("../core/time_compat.zig");
 
 pub const Items = std.StringHashMapUnmanaged([]const u8);
 pub const Snapshot = struct { key: []const u8, items: Items };
@@ -33,30 +34,76 @@ pub const Account = struct {
     }
 
     pub fn reset(self: Account, collection: []const u8, key: []const u8) !void {
+        return self.replace(collection, key, "[]");
+    }
+
+    pub fn resetSnapshot(self: Account, a: std.mem.Allocator, collection: []const u8, key: []const u8, items: Items) !void {
+        return self.replace(collection, key, try encodeItems(a, items));
+    }
+
+    fn replace(self: Account, collection: []const u8, key: []const u8, items: []const u8) !void {
         const stmt = try self.db.prepare(
             \\INSERT INTO eas_mailbox_state(user_id,device_id,collection_id,sync_key,items)
-            \\VALUES (?1,?2,?3,?4,'[]')
+            \\VALUES (?1,?2,?3,?4,?5)
             \\ON CONFLICT(user_id,device_id,collection_id) DO UPDATE SET sync_key=excluded.sync_key,items=excluded.items
         );
         defer stmt.finalize();
         try self.bind(stmt, collection);
         try stmt.bind(4, key);
+        try stmt.bind(5, items);
         _ = try stmt.step();
     }
 
-    pub fn advance(self: Account, a: std.mem.Allocator, collection: []const u8, previous: []const u8, key: []const u8, items: Items) !void {
+    fn encodeItems(a: std.mem.Allocator, items: Items) ![]const u8 {
         const entries = try a.alloc(Entry, items.count());
         var iterator = items.iterator();
         for (entries) |*entry| {
             const pair = iterator.next().?;
             entry.* = .{ .id = pair.key_ptr.*, .tag = pair.value_ptr.* };
         }
-        const snapshot = try std.json.Stringify.valueAlloc(a, entries, .{});
-        const stmt = try self.db.prepare(
-            \\UPDATE eas_mailbox_state SET sync_key=?4,items=?5
-            \\WHERE user_id=?1 AND device_id=?2 AND collection_id=?3 AND sync_key=?6 RETURNING 1
-        );
+        return std.json.Stringify.valueAlloc(a, entries, .{});
+    }
+
+    const advance_sql =
+        \\UPDATE eas_mailbox_state SET sync_key=?4,items=?5
+        \\WHERE user_id=?1 AND device_id=?2 AND collection_id=?3 AND sync_key=?6 RETURNING 1
+    ;
+
+    pub fn advance(self: Account, a: std.mem.Allocator, collection: []const u8, previous: []const u8, key: []const u8, items: Items) !void {
+        const snapshot = try encodeItems(a, items);
+        const stmt = try self.db.prepare(advance_sql);
         defer stmt.finalize();
+        try self.applyAdvance(stmt, collection, previous, key, snapshot);
+    }
+
+    /// Publish a newly created Maildir for IMAP and webmail in the same
+    /// transaction that advances this device's folder hierarchy.
+    pub fn registerFolder(self: Account, a: std.mem.Allocator, collection: []const u8, previous: []const u8, key: []const u8, items: Items, user: []const u8, folder: []const u8) !void {
+        const snapshot = try encodeItems(a, items);
+        var tx = try self.db.beginTransaction(.write);
+        defer tx.deinit();
+        const record = try tx.prepare(
+            \\INSERT INTO imap_mailboxes(username,mailbox,uidvalidity,uidnext) VALUES(?1,?2,?3,1)
+            \\ON CONFLICT(username,mailbox) DO UPDATE SET uidvalidity=MAX(imap_mailboxes.uidvalidity+1,excluded.uidvalidity),uidnext=1
+        );
+        defer record.finalize();
+        try record.bind(1, user);
+        try record.bind(2, folder);
+        try record.bind(3, time.timestamp());
+        _ = try record.step();
+        const old_uids = try tx.prepare("DELETE FROM imap_uids WHERE username=?1 AND mailbox=?2");
+        defer old_uids.finalize();
+        try old_uids.bind(1, user);
+        try old_uids.bind(2, folder);
+        _ = try old_uids.step();
+
+        const stmt = try tx.prepare(advance_sql);
+        defer stmt.finalize();
+        try self.applyAdvance(stmt, collection, previous, key, snapshot);
+        try tx.commit();
+    }
+
+    fn applyAdvance(self: Account, stmt: database.Statement, collection: []const u8, previous: []const u8, key: []const u8, snapshot: []const u8) !void {
         try self.bind(stmt, collection);
         try stmt.bind(4, key);
         try stmt.bind(5, snapshot);

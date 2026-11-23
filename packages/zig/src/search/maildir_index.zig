@@ -2,6 +2,7 @@
 const std = @import("std");
 const database = @import("../storage/database.zig");
 const message_refs = @import("../storage/message_refs.zig");
+const folders = @import("../storage/maildir_folders.zig");
 const io_compat = @import("../core/io_compat.zig");
 const path_rules = @import("../core/maildir_path.zig");
 const typesense = @import("typesense.zig");
@@ -119,26 +120,22 @@ fn snapshot(a: Allocator, db: *Database, row: Pending) !?[]const u8 {
     if (row.basename.len == 0 or std.mem.indexOfAny(u8, row.basename, "/\x00") != null or
         std.mem.eql(u8, row.basename, ".") or std.mem.eql(u8, row.basename, "..")) return error.InvalidMaildirPath;
     const io = io_compat.getIo();
-    const mail = (try openDir(io, .cwd(), "mail")) orelse return null;
+    const mail = (try folders.open(io, .cwd(), "mail")) orelse return null;
     defer mail.close(io);
-    const mailbox = (try openDir(io, mail, root)) orelse return null;
+    const mailbox = (try folders.open(io, mail, root)) orelse return null;
     defer mailbox.close(io);
     if (std.mem.eql(u8, row.folder, "INBOX")) return readSlots(a, io, mailbox, row.basename);
-    const folder = (try openDir(io, mailbox, row.folder)) orelse return null;
+    const layout = (try folders.layout(io, mailbox, row.folder)) orelse return null;
+    const name = if (layout == .maildir_plus) try std.fmt.allocPrint(a, ".{s}", .{row.folder}) else row.folder;
+    const folder = (try folders.open(io, mailbox, name)) orelse return null;
     defer folder.close(io);
+    if (layout == .maildir_plus) return readSlots(a, io, folder, row.basename);
     return (try readMessage(a, io, folder, row.basename)) orelse try readSlots(a, io, folder, row.basename);
-}
-
-fn openDir(io: std.Io, parent: Dir, path: []const u8) !?Dir {
-    return parent.openDir(io, path, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => null,
-        else => err,
-    };
 }
 
 fn readSlots(a: Allocator, io: std.Io, folder: Dir, basename: []const u8) !?[]const u8 {
     for ([_][]const u8{ "new", "cur" }) |slot| {
-        const dir = (try openDir(io, folder, slot)) orelse continue;
+        const dir = (try folders.open(io, folder, slot)) orelse continue;
         defer dir.close(io);
         if (try readMessage(a, io, dir, basename)) |raw| return raw;
     }

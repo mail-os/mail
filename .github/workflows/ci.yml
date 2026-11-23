@@ -161,6 +161,7 @@ jobs:
         python3 ../../scripts/test-eas-search.py zig-out/bin/mail
         python3 ../../scripts/test-eas-sync-state.py zig-out/bin/mail
         python3 ../../scripts/test-eas-move-items.py zig-out/bin/mail
+        python3 ../../scripts/test-eas-folder-hierarchy.py zig-out/bin/mail
 
     - name: Verify user CLI password input and rotation
       run: |

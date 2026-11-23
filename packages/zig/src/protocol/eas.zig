@@ -13,6 +13,7 @@ const webmail_maildir = @import("../api/webmail_maildir.zig");
 const webmail_store = @import("../api/webmail_store.zig");
 const snapshots = @import("../api/webmail_snapshots.zig");
 const message_refs = @import("../storage/message_refs.zig");
+const maildir_folders = @import("../storage/maildir_folders.zig");
 const thread_ids = @import("../message/thread_ids.zig");
 const fs_compat = @import("../core/fs_compat.zig");
 const io_compat = @import("../core/io_compat.zig");
@@ -92,11 +93,78 @@ const FOLDERS = [_]FolderDef{
     .{ .id = "6", .parent = "0", .name = "Contacts", .kind = 9, .mailbox = null, .is_calendar = false },
 };
 
-fn folderById(id: []const u8) ?FolderDef {
+fn folderById(a: std.mem.Allocator, ctx: *Context, user_id: i64, id: []const u8) !?FolderDef {
     for (FOLDERS) |f| {
         if (std.mem.eql(u8, f.id, id)) return f;
     }
+    if (id.len == custom_folder_id_len) {
+        for (try mailboxFolders(a, ctx, user_id)) |f| {
+            if (std.mem.eql(u8, f.id, id)) return f;
+        }
+    }
     return null;
+}
+
+// Eleven characters leave room for a 64-bit UID and a 128-bit item signature
+// within ActiveSync's 64-character ServerId limit.
+const custom_folder_id_len = 11;
+const folder_encoder = std.base64.url_safe_no_pad.Encoder;
+
+fn folderNameAllowed(name: []const u8) bool {
+    maildir_path.validate(name) catch return false;
+    if (name[0] == '.' or std.mem.indexOf(u8, name, "..") != null or
+        std.mem.indexOfScalar(u8, name, '"') != null or !std.unicode.utf8ValidateSlice(name)) return false;
+    for (FOLDERS) |folder| {
+        if (std.ascii.eqlIgnoreCase(name, folder.name)) return false;
+    }
+    for ([_][]const u8{ "new", "cur", "tmp", "All", "All Mail", "Starred", "Screening", "Declined", "Outbox" }) |reserved| {
+        if (std.ascii.eqlIgnoreCase(name, reserved)) return false;
+    }
+    return true;
+}
+
+fn mailboxFolders(a: std.mem.Allocator, ctx: *Context, user_id: i64) ![]const FolderDef {
+    try requireMailboxOwner(a, ctx);
+    try maildir_path.validate(ctx.local_part);
+    const base = try std.fmt.allocPrint(a, "mail/{s}", .{ctx.local_part});
+    const io = io_compat.getIo();
+    const root = (try maildir_folders.open(io, .cwd(), base)) orelse return &FOLDERS;
+    defer root.close(io);
+
+    var folders: std.ArrayList(FolderDef) = .empty;
+    try folders.appendSlice(a, &FOLDERS);
+    var key: ?SearchKey = null;
+    var entries = root.iterate();
+    while (try entries.next(io)) |entry| {
+        if (!folderNameAllowed(entry.name)) continue;
+        const layout = (try maildir_folders.layout(io, root, entry.name)) orelse continue;
+        const container = try std.fmt.allocPrint(a, "{s}/{s}{s}", .{ base, if (layout == .maildir_plus) "." else "", entry.name });
+        const stamp = message_refs.directoryStamp(a, container) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        if (key == null) key = try mailboxKey(ctx.db, user_id);
+        const name = try a.dupe(u8, entry.name);
+        try folders.append(a, try customFolder(a, key.?, name, stamp));
+    }
+    std.mem.sort(FolderDef, folders.items[FOLDERS.len..], {}, struct {
+        fn lessThan(_: void, lhs: FolderDef, rhs: FolderDef) bool {
+            return std.mem.lessThan(u8, lhs.name, rhs.name);
+        }
+    }.lessThan);
+    return folders.items;
+}
+
+fn customFolder(a: std.mem.Allocator, key: SearchKey, name: []const u8, stamp: []const u8) !FolderDef {
+    const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+    var hmac = Hmac.init(&key);
+    hmac.update("mail/eas-folder/v1\x00");
+    hmac.update(stamp);
+    var digest: [Hmac.mac_length]u8 = undefined;
+    hmac.final(&digest);
+    const id = try a.alloc(u8, custom_folder_id_len);
+    _ = folder_encoder.encode(id, digest[0..8]);
+    return .{ .id = id, .parent = "0", .name = name, .kind = 12, .mailbox = name, .is_calendar = false };
 }
 
 // ============================================================================
@@ -112,8 +180,7 @@ pub fn dispatch(ctx: *Context, cmd: []const u8, body: []const u8) !Response {
     if (std.ascii.eqlIgnoreCase(cmd, "Search")) return handleSearch(ctx, body);
     if (std.ascii.eqlIgnoreCase(cmd, "MoveItems")) return handleMoveItems(ctx, body);
     if (std.mem.eql(u8, cmd, "Provision")) return handleProvision(ctx, body);
-    if (std.mem.eql(u8, cmd, "FolderSync")) return handleFolderSync(ctx, body);
-    const command = std.meta.stringToEnum(enum { Sync, GetItemEstimate, Ping }, cmd) orelse return .{ .status = 501 };
+    const command = std.meta.stringToEnum(enum { Sync, GetItemEstimate, Ping, FolderSync, FolderCreate }, cmd) orelse return .{ .status = 501 };
     if (!validDevice(ctx.device_id)) return .{ .status = 400 };
     var user = ctx.db.getUserByUsername(ctx.username) catch |err| return .{ .status = if (err == error.NotFound) 401 else 503 };
     defer user.deinit(ctx.db.allocator);
@@ -123,6 +190,8 @@ pub fn dispatch(ctx: *Context, cmd: []const u8, body: []const u8) !Response {
         .Sync => handleSync(ctx, account, body),
         .GetItemEstimate => handleGetItemEstimate(ctx, account, body),
         .Ping => handlePing(ctx, account, body),
+        .FolderSync => handleFolderSync(ctx, account, body),
+        .FolderCreate => handleFolderCreate(ctx, account, body),
     };
 }
 
@@ -407,7 +476,7 @@ fn sourceMime(a: std.mem.Allocator, ctx: *Context, user_id: i64, source: Message
     try requireMailboxOwner(a, ctx);
 
     const reference = if (source.long_id) |id| try resolveSearchId(a, ctx, user_id, id) else blk: {
-        const folder = folderById(source.folder_id orelse "1") orelse return error.ItemNotFound;
+        const folder = (try folderById(a, ctx, user_id, source.folder_id orelse "1")) orelse return error.ItemNotFound;
         if (folder.mailbox == null) return error.UnsupportedItem;
         const id = source.item_id orelse return error.InvalidIds;
         const uid = if (std.mem.count(u8, id, ":") == 2)
@@ -511,6 +580,13 @@ fn searchKey(db: *database.Database, user_id: i64, create: bool) !SearchKey {
     return key;
 }
 
+fn mailboxKey(db: *database.Database, user_id: i64) !SearchKey {
+    return searchKey(db, user_id, false) catch |err| switch (err) {
+        error.ItemNotFound => searchKey(db, user_id, true),
+        else => err,
+    };
+}
+
 fn mailIdSignature(key: SearchKey, domain: []const u8, folder_id: []const u8, uid: i64, validity: i64, filename: []const u8) [64]u8 {
     const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
     var mac = Hmac.init(&key);
@@ -558,7 +634,7 @@ fn resolveMailItemId(a: std.mem.Allocator, ctx: *Context, user_id: i64, folder: 
 fn resolveSearchId(a: std.mem.Allocator, ctx: *Context, user_id: i64, id: []const u8) !MailReference {
     var parts = std.mem.splitScalar(u8, id, ':');
     if (!std.mem.eql(u8, parts.first(), "s1")) return error.ItemNotFound;
-    const folder = folderById(parts.next() orelse return error.ItemNotFound) orelse return error.ItemNotFound;
+    const folder = (try folderById(a, ctx, user_id, parts.next() orelse return error.ItemNotFound)) orelse return error.ItemNotFound;
     const mailbox = folder.mailbox orelse return error.ItemNotFound;
     const uid = itemUid(folder.id, parts.next() orelse return error.ItemNotFound) catch return error.ItemNotFound;
     const tag = parts.next() orelse return error.ItemNotFound;
@@ -585,12 +661,13 @@ fn handleSearch(ctx: *Context, body: []const u8) !Response {
     if (root.children.items.len != 1) return .{ .status = 400 };
     const command = root.child(page, S.Search) orelse return .{ .status = 400 };
     const query = search.parse(command.*) catch return searchStatus(ctx, 2);
-    if (query.collection) |id| {
-        const folder = folderById(id) orelse return searchStatus(ctx, 11);
-        if (folder.mailbox == null) return searchStatus(ctx, 2);
-    }
     requireMailboxOwner(a, ctx) catch |err| return searchStatus(ctx, if (err == error.AmbiguousMailbox) 5 else 3);
-    return searchMailbox(ctx, a, query) catch |err| searchStatus(ctx, if (err == error.SearchLimit) 10 else 3);
+    return searchMailbox(ctx, a, query) catch |err| searchStatus(ctx, switch (err) {
+        error.SearchLimit => 10,
+        error.UnknownCollection => 11,
+        error.UnsupportedCollection => 2,
+        else => 3,
+    });
 }
 
 fn searchStatus(ctx: *Context, status: u8) !Response {
@@ -614,11 +691,18 @@ fn startSearchResponse(w: *wbxml.Writer, status: u8) !void {
     try w.elementInt(page, S.Status, status);
 }
 
-fn searchCandidates(ctx: *Context, a: std.mem.Allocator, query: search.Query) ![]SearchItem {
+fn searchCandidates(ctx: *Context, a: std.mem.Allocator, user_id: i64, query: search.Query) ![]SearchItem {
     ctx.db.lockMailboxes();
     defer ctx.db.unlockMailboxes();
     var candidates: std.ArrayList(SearchItem) = .empty;
-    for (FOLDERS) |folder| {
+    const folders: []const FolderDef = if (query.collection) |id| blk: {
+        const folder = (try folderById(a, ctx, user_id, id)) orelse return error.UnknownCollection;
+        if (folder.mailbox == null) return error.UnsupportedCollection;
+        const list = try a.alloc(FolderDef, 1);
+        list[0] = folder;
+        break :blk list;
+    } else try mailboxFolders(a, ctx, user_id);
+    for (folders) |folder| {
         const mailbox = folder.mailbox orelse continue;
         if (query.collection) |id| if (!std.mem.eql(u8, id, folder.id)) continue;
         var items: std.ArrayList(MailItem) = .empty;
@@ -640,7 +724,7 @@ fn searchMailbox(ctx: *Context, a: std.mem.Allocator, query: search.Query) !Resp
     var user = try ctx.db.getUserByUsername(ctx.username);
     defer user.deinit(ctx.db.allocator);
     if (!user.enabled) return searchStatus(ctx, 5);
-    const candidates = try searchCandidates(ctx, a, query);
+    const candidates = try searchCandidates(ctx, a, user.id, query);
     std.mem.sort(SearchItem, candidates, {}, struct {
         fn less(_: void, left: SearchItem, right: SearchItem) bool {
             if (left.mail.epoch != right.mail.epoch) return left.mail.epoch > right.mail.epoch;
@@ -778,45 +862,182 @@ fn handleProvision(ctx: *Context, body: []const u8) !Response {
 // FolderSync (MS-ASCMD §2.2.2.4)
 // ============================================================================
 
-fn handleFolderSync(ctx: *Context, body: []const u8) !Response {
-    var sync_key: []const u8 = "0";
-    if (body.len > 0) {
-        var root = wbxml.decode(ctx.allocator, body) catch wbxml.Node{ .page = 0xFF, .token = 0xFF };
-        defer root.deinit(ctx.allocator);
-        if (root.find(wbxml.Page.folder_hierarchy, wbxml.FolderHierarchy.SyncKey)) |k| {
-            if (k.text) |t| sync_key = t;
-        }
-    }
+const hierarchy_collection = "folder-hierarchy";
+const FH = wbxml.FolderHierarchy;
+const hierarchy_page = wbxml.Page.folder_hierarchy;
+
+fn hierarchyRequest(a: std.mem.Allocator, body: []const u8, token: u8) !wbxml.Node {
+    if (body.len > 4096) return error.InvalidHierarchyRequest;
+    const root = try wbxml.decode(a, body);
+    const command = root.child(hierarchy_page, token) orelse return error.InvalidHierarchyRequest;
+    if (root.children.items.len != 1 or command.text != null) return error.InvalidHierarchyRequest;
+    return command.*;
+}
+
+fn handleFolderSync(ctx: *Context, account: sync_state.Account, body: []const u8) !Response {
+    return syncHierarchy(ctx, account, body) catch |err| hierarchyStatus(ctx, FH.FolderSync, switch (err) {
+        error.InvalidHierarchyRequest => 10,
+        error.InvalidSyncKey => 9,
+        else => 6,
+    });
+}
+
+fn syncHierarchy(ctx: *Context, account: sync_state.Account, body: []const u8) !Response {
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sync_key = if (body.len == 0) "0" else blk: {
+        const req = hierarchyRequest(a, body, FH.FolderSync) catch return error.InvalidHierarchyRequest;
+        if (req.children.items.len != 1) return error.InvalidHierarchyRequest;
+        break :blk hierarchyText(req, FH.SyncKey) orelse return error.InvalidHierarchyRequest;
+    };
+    ctx.db.lockMailboxes();
+    defer ctx.db.unlockMailboxes();
+    if ((try ctx.db.enabledMailboxId(ctx.username)) != account.user_id) return .{ .status = 403 };
+
     const initial = std.mem.eql(u8, sync_key, "0");
+    var previous: sync_state.Items = .empty;
+    if (!initial) previous = try loadHierarchy(a, account, sync_key);
+    var current: sync_state.Items = .empty;
+    const folders = try mailboxFolders(a, ctx, account.user_id);
+    var count: usize = 0;
+    for (folders) |folder| {
+        try current.put(a, folder.id, folder.name);
+        const old_name = previous.get(folder.id);
+        if (old_name == null or !std.mem.eql(u8, old_name.?, folder.name)) count += 1;
+    }
+    var old_ids = previous.keyIterator();
+    while (old_ids.next()) |id| {
+        if (!current.contains(id.*)) count += 1;
+    }
+    const next_key = if (count == 0) sync_key else try sync_state.newKey(a);
 
     var w = wbxml.Writer.init(ctx.allocator);
     errdefer w.deinit();
     try w.writeHeader();
-
-    const F = wbxml.FolderHierarchy;
-    const page = wbxml.Page.folder_hierarchy;
-
-    try w.startTag(page, F.FolderSync);
-    try w.element(page, F.Status, "1");
-    try w.element(page, F.SyncKey, "1");
-    try w.startTag(page, F.Changes);
-    if (initial) {
-        try w.elementInt(page, F.Count, @intCast(FOLDERS.len));
-        for (FOLDERS) |f| {
-            try w.startTag(page, F.Add);
-            try w.element(page, F.ServerEntryId, f.id);
-            try w.element(page, F.ParentId, f.parent);
-            try w.element(page, F.DisplayName, f.name);
-            try w.elementInt(page, F.Type, f.kind);
-            try w.end();
-        }
-    } else {
-        try w.element(page, F.Count, "0");
+    try w.startTag(hierarchy_page, FH.FolderSync);
+    try w.element(hierarchy_page, FH.Status, "1");
+    try w.element(hierarchy_page, FH.SyncKey, next_key);
+    try w.startTag(hierarchy_page, FH.Changes);
+    try w.elementInt(hierarchy_page, FH.Count, @intCast(count));
+    for (folders) |folder| {
+        const old_name = previous.get(folder.id);
+        if (old_name != null and std.mem.eql(u8, old_name.?, folder.name)) continue;
+        try w.startTag(hierarchy_page, if (old_name == null) FH.Add else FH.Update);
+        try w.element(hierarchy_page, FH.ServerEntryId, folder.id);
+        try w.element(hierarchy_page, FH.ParentId, folder.parent);
+        try w.element(hierarchy_page, FH.DisplayName, folder.name);
+        try w.elementInt(hierarchy_page, FH.Type, folder.kind);
+        try w.end();
     }
-    try w.end(); // Changes
-    try w.end(); // FolderSync
+    old_ids = previous.keyIterator();
+    while (old_ids.next()) |id| {
+        if (current.contains(id.*)) continue;
+        try w.startTag(hierarchy_page, FH.Remove);
+        try w.element(hierarchy_page, FH.ServerEntryId, id.*);
+        try w.end();
+    }
+    try w.end();
+    try w.end();
+    const encoded = try w.toOwnedSlice();
+    errdefer ctx.allocator.free(encoded);
+    if (initial) {
+        try account.resetSnapshot(a, hierarchy_collection, next_key, current);
+    } else if (count != 0) {
+        try account.advance(a, hierarchy_collection, sync_key, next_key, current);
+    }
+    return .{ .body = encoded };
+}
 
-    return Response{ .body = try w.toOwnedSlice() };
+fn loadHierarchy(a: std.mem.Allocator, account: sync_state.Account, key: []const u8) !sync_state.Items {
+    const snapshot = (try account.load(a, hierarchy_collection)) orelse return error.InvalidSyncKey;
+    if (!std.mem.eql(u8, snapshot.key, key)) return error.InvalidSyncKey;
+    return snapshot.items;
+}
+
+fn hierarchyText(req: wbxml.Node, token: u8) ?[]const u8 {
+    var text: ?[]const u8 = null;
+    for (req.children.items) |field| {
+        if (field.page != hierarchy_page or field.token != token) continue;
+        if (text != null or field.is_opaque or field.children.items.len != 0) return null;
+        text = field.text orelse return null;
+    }
+    return text;
+}
+
+fn hierarchyStatus(ctx: *Context, token: u8, status: u8) !Response {
+    var w = wbxml.Writer.init(ctx.allocator);
+    errdefer w.deinit();
+    try w.writeHeader();
+    try w.startTag(hierarchy_page, token);
+    try w.elementInt(hierarchy_page, FH.Status, status);
+    try w.end();
+    return .{ .body = try w.toOwnedSlice() };
+}
+
+fn handleFolderCreate(ctx: *Context, account: sync_state.Account, body: []const u8) !Response {
+    return createFolder(ctx, account, body) catch |err| hierarchyStatus(ctx, FH.FolderCreate, switch (err) {
+        error.PathAlreadyExists => 2,
+        error.UnknownParent => 5,
+        error.InvalidSyncKey => 9,
+        error.InvalidHierarchyRequest => 10,
+        else => 6,
+    });
+}
+
+fn createFolder(ctx: *Context, account: sync_state.Account, body: []const u8) !Response {
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const req = hierarchyRequest(a, body, FH.FolderCreate) catch return error.InvalidHierarchyRequest;
+    if (req.children.items.len != 4) return error.InvalidHierarchyRequest;
+    const sync_key = hierarchyText(req, FH.SyncKey) orelse return error.InvalidHierarchyRequest;
+    const parent = hierarchyText(req, FH.ParentId) orelse return error.InvalidHierarchyRequest;
+    const name = hierarchyText(req, FH.DisplayName) orelse return error.InvalidHierarchyRequest;
+    const type_value = hierarchyText(req, FH.Type) orelse return error.InvalidHierarchyRequest;
+    if (!folderNameAllowed(name) or !webmail_maildir.isValidFolderName(name) or
+        !std.mem.eql(u8, type_value, "12")) return error.InvalidHierarchyRequest;
+
+    ctx.db.lockMailboxes();
+    defer ctx.db.unlockMailboxes();
+    if ((try ctx.db.enabledMailboxId(ctx.username)) != account.user_id) return .{ .status = 403 };
+    try requireMailboxOwner(a, ctx);
+    try maildir_path.validate(ctx.local_part);
+    var previous = try loadHierarchy(a, account, sync_key);
+    if (!std.mem.eql(u8, parent, "0")) return error.UnknownParent;
+
+    const io = io_compat.getIo();
+    const base = try std.fmt.allocPrint(a, "mail/{s}", .{ctx.local_part});
+    try std.Io.Dir.cwd().createDirPath(io, base);
+    const root = (try maildir_folders.open(io, .cwd(), base)) orelse return error.FileNotFound;
+    defer root.close(io);
+    if (name.len < 255) {
+        const canonical = try std.fmt.allocPrint(a, ".{s}", .{name});
+        if (root.statFile(io, canonical, .{ .follow_symlinks = false })) |_| {
+            return error.PathAlreadyExists;
+        } else |err| if (err != error.FileNotFound) return err;
+    }
+    try root.createDir(io, name, .default_dir);
+    errdefer root.deleteDir(io, name) catch |err| std.log.warn("could not roll back ActiveSync folder creation: {}", .{err});
+
+    const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ base, name });
+    const folder = try customFolder(a, try mailboxKey(ctx.db, account.user_id), name, try message_refs.directoryStamp(a, path));
+    try previous.put(a, folder.id, folder.name);
+    const next_key = try sync_state.newKey(a);
+
+    var w = wbxml.Writer.init(ctx.allocator);
+    errdefer w.deinit();
+    try w.writeHeader();
+    try w.startTag(hierarchy_page, FH.FolderCreate);
+    try w.element(hierarchy_page, FH.Status, "1");
+    try w.element(hierarchy_page, FH.SyncKey, next_key);
+    try w.element(hierarchy_page, FH.ServerEntryId, folder.id);
+    try w.end();
+    const encoded = try w.toOwnedSlice();
+    errdefer ctx.allocator.free(encoded);
+    try account.registerFolder(a, hierarchy_collection, sync_key, next_key, previous, ctx.username, name);
+
+    return .{ .body = encoded };
 }
 
 const MoveRequest = struct {
@@ -909,11 +1130,11 @@ fn moveCommandStatus(ctx: *Context, status: u8) !Response {
 }
 
 fn moveMailItemLocked(a: std.mem.Allocator, ctx: *Context, user_id: i64, move: MoveRequest, buf: []u8) ![]const u8 {
-    const source = folderById(move.source) orelse return error.ItemNotFound;
+    const source = (try folderById(a, ctx, user_id, move.source)) orelse return error.ItemNotFound;
     const source_mailbox = source.mailbox orelse return error.ItemNotFound;
     const item = try resolveMailItemId(a, ctx, user_id, source, move.id);
     const file = try locateMoveFile(a, ctx, source_mailbox, item.base);
-    const destination = folderById(move.destination) orelse return error.InvalidDestination;
+    const destination = (try folderById(a, ctx, user_id, move.destination)) orelse return error.InvalidDestination;
     const mailbox = destination.mailbox orelse return error.InvalidDestination;
     if (std.mem.eql(u8, source.id, destination.id)) return error.SameFolder;
     if (try webmail_store.managesDraftAt(ctx.db, ctx.username, source_mailbox, item.uid)) return error.ManagedDraft;
@@ -969,7 +1190,6 @@ fn handleSync(ctx: *Context, account: sync_state.Account, body: []const u8) !Res
                 if (coll.token != A.Folder or coll.page != page) continue;
                 const collection_id = coll.childText(page, A.FolderId) orelse continue;
                 const req_key = coll.childText(page, A.SyncKey) orelse "";
-                const folder = folderById(collection_id) orelse continue;
                 if (coll.child(page, A.Perform)) |commands| {
                     if (commands.children.items.len != 0) {
                         try writeSyncStatus(&w, collection_id, req_key, "6");
@@ -978,13 +1198,13 @@ fn handleSync(ctx: *Context, account: sync_state.Account, body: []const u8) !Res
                 }
                 const length = w.buf.items.len;
                 const code_page = w.current_page;
-                writeSyncCollection(ctx, account, &w, folder, req_key) catch |err| {
+                writeSyncCollection(ctx, account, &w, collection_id, req_key) catch |err| {
                     w.buf.shrinkRetainingCapacity(length);
                     w.current_page = code_page;
-                    if (err == error.InvalidSyncKey) {
-                        try writeSyncStatus(&w, collection_id, "0", "3");
-                    } else {
-                        try writeSyncStatus(&w, collection_id, req_key, "5");
+                    switch (err) {
+                        error.InvalidSyncKey => try writeSyncStatus(&w, collection_id, "0", "3"),
+                        error.FolderHierarchyChanged => try writeSyncStatus(&w, collection_id, req_key, "12"),
+                        else => try writeSyncStatus(&w, collection_id, req_key, "5"),
                     }
                 };
             }
@@ -1022,21 +1242,23 @@ const SyncChange = struct {
     item: ?SyncItem = null,
 };
 
-fn collectionChanges(a: std.mem.Allocator, ctx: *Context, user_id: i64, folder: FolderDef, previous: sync_state.Items) ![]SyncChange {
+fn collectionChanges(a: std.mem.Allocator, ctx: *Context, user_id: i64, original: FolderDef, previous: sync_state.Items) ![]SyncChange {
     const A = wbxml.AirSync;
     var current: std.StringHashMapUnmanaged(void) = .empty;
     var changes: std.ArrayList(SyncChange) = .empty;
-    if (folder.mailbox) |mailbox| {
+    if (original.mailbox != null) {
         var mail: std.ArrayList(MailItem) = .empty;
         ctx.db.lockMailboxes();
         defer ctx.db.unlockMailboxes();
         try requireMailboxOwner(a, ctx);
+        const folder = if (original.id.len == custom_folder_id_len)
+            (try folderById(a, ctx, user_id, original.id)) orelse return error.FolderHierarchyChanged
+        else
+            original;
+        const mailbox = folder.mailbox.?;
         try collectMail(a, ctx, mailbox, std.math.maxInt(usize), &mail);
         if (mail.items.len != 0) {
-            const key = searchKey(ctx.db, user_id, false) catch |err| switch (err) {
-                error.ItemNotFound => try searchKey(ctx.db, user_id, true),
-                else => return err,
-            };
+            const key = try mailboxKey(ctx.db, user_id);
             const generation = try ctx.db.getOrCreateMailbox(ctx.username, mailbox);
             for (mail.items) |message| {
                 const base = maildirBaseName(std.fs.path.basename(message.path));
@@ -1048,14 +1270,14 @@ fn collectionChanges(a: std.mem.Allocator, ctx: *Context, user_id: i64, folder: 
             }
         }
     } else {
-        const items = try ctx.store.snapshotActiveSyncResources(a, ctx.username, folder.is_calendar);
+        const items = try ctx.store.snapshotActiveSyncResources(a, ctx.username, original.is_calendar);
         for (items) |item| {
             const id = try std.fmt.allocPrint(a, "{d}", .{item.id});
             try current.put(a, id, {});
             try appendChanged(a, &changes, previous, .{
                 .id = id,
                 .tag = item.etag,
-                .data = if (folder.is_calendar) .{ .event = item.id } else .{ .contact = item.id },
+                .data = if (original.is_calendar) .{ .event = item.id } else .{ .contact = item.id },
             });
         }
     }
@@ -1084,10 +1306,11 @@ fn appendChanged(a: std.mem.Allocator, changes: *std.ArrayList(SyncChange), prev
     try changes.append(a, .{ .kind = if (old == null) A.Add else A.Modify, .id = item.id, .item = item });
 }
 
-fn writeSyncCollection(ctx: *Context, account: sync_state.Account, w: *wbxml.Writer, folder: FolderDef, requested_key: []const u8) !void {
+fn writeSyncCollection(ctx: *Context, account: sync_state.Account, w: *wbxml.Writer, collection: []const u8, requested_key: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
     const a = arena.allocator();
+    const folder = (try folderById(a, ctx, account.user_id, collection)) orelse return error.FolderHierarchyChanged;
     const page = wbxml.Page.air_sync;
     const A = wbxml.AirSync;
 
@@ -1182,7 +1405,7 @@ fn handleGetItemEstimate(ctx: *Context, account: sync_state.Account, body: []con
         const a = arena.allocator();
         var status: u8 = 2;
         var count: usize = 0;
-        if (folderById(id)) |folder| {
+        if (try folderById(a, ctx, account.user_id, id)) |folder| {
             if (try account.load(a, id)) |snapshot| {
                 status = 4;
                 if (std.mem.eql(u8, snapshot.key, key) and !usesLegacyMailIds(folder, snapshot.items)) {
@@ -1205,6 +1428,8 @@ fn handleGetItemEstimate(ctx: *Context, account: sync_state.Account, body: []con
     return .{ .body = try w.toOwnedSlice() };
 }
 
+const max_ping_folders = 32;
+
 fn handlePing(ctx: *Context, account: sync_state.Account, body: []const u8) !Response {
     const Pg = wbxml.Ping;
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -1212,7 +1437,7 @@ fn handlePing(ctx: *Context, account: sync_state.Account, body: []const u8) !Res
     const request_allocator = arena.allocator();
     var page = wbxml.Page.ping;
     var heartbeat: ?u64 = null;
-    var ids: [FOLDERS.len][]const u8 = undefined;
+    var ids: [max_ping_folders][]const u8 = undefined;
     var requested_folders: ?[]const []const u8 = null;
     if (body.len != 0) {
         const root = wbxml.decode(request_allocator, body) catch return pingResponse(ctx, page, 4, &.{});
@@ -1228,7 +1453,7 @@ fn handlePing(ctx: *Context, account: sync_state.Account, body: []const u8) !Res
             for (folders.children.items, 0..) |*node, index| {
                 if (node.page != page or node.token != Pg.Folder) return pingResponse(ctx, page, 4, &.{});
                 const id = node.childText(page, Pg.ServerEntryId) orelse return pingResponse(ctx, page, 4, &.{});
-                const folder = folderById(id) orelse return pingResponse(ctx, page, 7, &.{});
+                const folder = (try folderById(request_allocator, ctx, account.user_id, id)) orelse return pingResponse(ctx, page, 7, &.{});
                 ids[index] = folder.id;
             }
             requested_folders = ids[0..folders.children.items.len];
@@ -1240,18 +1465,19 @@ fn handlePing(ctx: *Context, account: sync_state.Account, body: []const u8) !Res
         return pingResponse(ctx, page, 8, &.{})) orelse return pingResponse(ctx, page, 3, &.{});
     var remaining = settings.heartbeat;
     while (true) {
-        var changed: [FOLDERS.len][]const u8 = undefined;
+        var changed: [max_ping_folders][]const u8 = undefined;
         var count: usize = 0;
         for (settings.folders) |id| {
-            const folder = folderById(id) orelse return pingResponse(ctx, page, 7, &.{});
             var round_arena = std.heap.ArenaAllocator.init(ctx.allocator);
             defer round_arena.deinit();
             const a = round_arena.allocator();
+            const folder = (try folderById(a, ctx, account.user_id, id)) orelse return pingResponse(ctx, page, 7, &.{});
             const snapshot = account.load(a, folder.id) catch return pingResponse(ctx, page, 8, &.{});
             const items: sync_state.Items = if (snapshot) |state| state.items else .empty;
-            const pending = collectionChanges(a, ctx, account.user_id, folder, items) catch return pingResponse(ctx, page, 8, &.{});
+            const pending = collectionChanges(a, ctx, account.user_id, folder, items) catch |err|
+                return pingResponse(ctx, page, if (err == error.FolderHierarchyChanged) 7 else 8, &.{});
             if (pending.len != 0) {
-                changed[count] = folder.id;
+                changed[count] = id;
                 count += 1;
             }
         }
@@ -1275,7 +1501,7 @@ fn pingResponse(ctx: *Context, page: u8, status: u8, changes: []const []const u8
         for (changes) |id| try w.element(page, Pg.Folder, id);
         try w.end();
     }
-    if (status == 6) try w.elementInt(page, Pg.MaxFolders, FOLDERS.len);
+    if (status == 6) try w.elementInt(page, Pg.MaxFolders, max_ping_folders);
     try w.end();
     return .{ .body = try w.toOwnedSlice() };
 }
@@ -1294,10 +1520,17 @@ const MailItem = struct {
 fn mailboxDirs(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8) ![][]const u8 {
     const root = try std.fmt.allocPrint(a, "mail/{s}", .{ctx.local_part});
     const inbox = std.mem.eql(u8, mailbox, "INBOX");
-    const base = if (inbox) root else try std.fmt.allocPrint(a, "{s}/{s}", .{ root, mailbox });
+    const io = io_compat.getIo();
+    const is_maildir_plus = if (inbox) false else blk: {
+        const root_dir = (try maildir_folders.open(io, .cwd(), root)) orelse break :blk false;
+        defer root_dir.close(io);
+        break :blk (try maildir_folders.layout(io, root_dir, mailbox)) == .maildir_plus;
+    };
+    const base = if (inbox) root else try std.fmt.allocPrint(a, "{s}/{s}{s}", .{ root, if (is_maildir_plus) "." else "", mailbox });
     const new = try std.fmt.allocPrint(a, "{s}/new", .{base});
     const cur = try std.fmt.allocPrint(a, "{s}/cur", .{base});
-    return if (inbox) a.dupe([]const u8, &.{ new, cur }) else a.dupe([]const u8, &.{ base, new, cur });
+    if (inbox) return a.dupe([]const u8, &.{ new, cur });
+    return if (is_maildir_plus) a.dupe([]const u8, &.{ cur, new }) else a.dupe([]const u8, &.{ base, new, cur });
 }
 
 fn collectMail(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, limit: usize, out: *std.ArrayList(MailItem)) !void {

@@ -96,8 +96,8 @@ def check_matches(test, owner, other, sink):
 
     status, headers, _ = request(test.eas_url, method="OPTIONS", context=test.tls_context)
     assert status == 200 and "Search" in headers["MS-ASProtocolCommands"].split(",")
-    assert "FolderCreate" not in headers["MS-ASProtocolCommands"].split(",")
-    assert test.eas(owner, b"", command="FolderCreate")[0] == 501
+    assert "FolderDelete" not in headers["MS-ASProtocolCommands"].split(",")
+    assert test.eas(owner, b"", command="FolderDelete")[0] == 501
     first = search(test, owner, "brief", page_range="0-0", encoded=True)
     second = search(test, owner, "brief", page_range="1-1")
     assert string(0x10, "2") in first and string(0x0b, "0-0") in first

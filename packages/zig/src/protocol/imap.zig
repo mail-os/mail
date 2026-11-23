@@ -4326,6 +4326,9 @@ pub const ImapSession = struct {
                 } else {
                     var created = false;
                     if (self.username) |uname| {
+                        const db = self.auth_backend.db;
+                        db.lockMailboxes();
+                        defer db.unlockMailboxes();
                         const local = uname;
                         const visible = std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local, create_name }) catch null;
                         const canonical = std.fmt.allocPrint(self.allocator, "mail/{s}/.{s}", .{ local, create_name }) catch null;
@@ -4334,7 +4337,8 @@ pub const ImapSession = struct {
                             const tmp = std.fmt.allocPrint(self.allocator, "{s}/tmp", .{canonical.?}) catch null;
                             const new = std.fmt.allocPrint(self.allocator, "{s}/new", .{canonical.?}) catch null;
                             const cur = std.fmt.allocPrint(self.allocator, "{s}/cur", .{canonical.?}) catch null;
-                            if (tmp != null and new != null and cur != null) {
+                            const exists = if (fs_compat.cwd().access(visible.?, .{})) |_| true else |_| pathIsSymlink(visible.?);
+                            if (!exists and (try db.enabledMailboxId(uname)) != null and tmp != null and new != null and cur != null) {
                                 fs_compat.cwd().makePath(tmp.?) catch {};
                                 fs_compat.cwd().makePath(new.?) catch {};
                                 fs_compat.cwd().makePath(cur.?) catch {};

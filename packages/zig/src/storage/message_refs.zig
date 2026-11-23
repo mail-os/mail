@@ -50,24 +50,32 @@ pub fn fileFingerprint(a: Allocator, path: []const u8) !FileIdentity {
 }
 
 pub fn openFileFingerprint(a: Allocator, fd: std.c.fd_t) !FileIdentity {
-    return statIdentity(a, fd, null, true);
+    return statIdentity(a, fd, null, true, .file);
 }
 
 fn fileIdentity(a: Allocator, path: []const u8, fingerprint: bool) !FileIdentity {
     const file = try a.dupeSentinel(u8, path, 0);
     defer a.free(file);
-    return statIdentity(a, std.c.AT.FDCWD, file, fingerprint);
+    return statIdentity(a, std.c.AT.FDCWD, file, fingerprint, .file);
 }
 
-fn statIdentity(a: Allocator, fd: std.c.fd_t, path: ?[*:0]const u8, fingerprint: bool) !FileIdentity {
+pub fn directoryStamp(a: Allocator, path: []const u8) ![]const u8 {
+    const name = try a.dupeSentinel(u8, path, 0);
+    defer a.free(name);
+    return (try statIdentity(a, std.c.AT.FDCWD, name, false, .directory)).stamp;
+}
+
+fn statIdentity(a: Allocator, fd: std.c.fd_t, path: ?[*:0]const u8, fingerprint: bool, kind: enum { file, directory }) !FileIdentity {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
         var stat: linux.Statx = std.mem.zeroes(linux.Statx);
         const flags: u32 = if (path == null) linux.AT.EMPTY_PATH else linux.AT.SYMLINK_NOFOLLOW;
         const result = linux.statx(fd, path orelse "", flags, .{ .TYPE = true, .INO = true, .BTIME = true, .MTIME = true, .SIZE = fingerprint }, &stat);
-        if (linux.errno(result) != .SUCCESS or !stat.mask.INO or !stat.mask.TYPE or !std.c.S.ISREG(stat.mode)) return error.FileNotFound;
-        if (!stat.mask.BTIME and !stat.mask.MTIME) return error.FileNotFound;
-        const born = if (stat.mask.BTIME) stat.btime else stat.mtime;
+        if (linux.errno(result) != .SUCCESS or !stat.mask.INO or !stat.mask.TYPE) return error.FileNotFound;
+        if (kind == .directory) {
+            if (!std.c.S.ISDIR(stat.mode)) return error.FileNotFound;
+        } else if (!std.c.S.ISREG(stat.mode) or (!stat.mask.BTIME and !stat.mask.MTIME)) return error.FileNotFound;
+        const born = if (stat.mask.BTIME) stat.btime else if (kind == .file) stat.mtime else std.mem.zeroes(@TypeOf(stat.btime));
         const stamp = try std.fmt.allocPrint(a, "{d}:{d}:{d}:{d}:{d}", .{ stat.dev_major, stat.dev_minor, stat.ino, born.sec, born.nsec });
         return .{
             .stamp = stamp,
@@ -77,7 +85,16 @@ fn statIdentity(a: Allocator, fd: std.c.fd_t, path: ?[*:0]const u8, fingerprint:
     }
     var stat: std.c.Stat = undefined;
     const result = if (path) |name| std.c.fstatat(fd, name, &stat, std.c.AT.SYMLINK_NOFOLLOW) else std.c.fstat(fd, &stat);
-    if (result != 0 or !std.c.S.ISREG(stat.mode)) return error.FileNotFound;
+    if (result != 0) return error.FileNotFound;
+    if (kind == .directory) {
+        if (!std.c.S.ISDIR(stat.mode)) return error.FileNotFound;
+        const stamp = if (@hasDecl(std.c.Stat, "birthtime")) blk: {
+            const born = stat.birthtime();
+            break :blk try std.fmt.allocPrint(a, "{d}:{d}:{d}:{d}", .{ stat.dev, stat.ino, born.sec, born.nsec });
+        } else try std.fmt.allocPrint(a, "{d}:{d}", .{ stat.dev, stat.ino });
+        return .{ .stamp = stamp, .fingerprint = "", .size = 0 };
+    }
+    if (!std.c.S.ISREG(stat.mode)) return error.FileNotFound;
     const born = if (@hasDecl(std.c.Stat, "birthtime")) stat.birthtime() else stat.mtime();
     const timestamp = if (born.sec == 0 and born.nsec == 0) stat.mtime() else born;
     const stamp = try std.fmt.allocPrint(a, "{d}:{d}:{d}:{d}", .{ stat.dev, stat.ino, timestamp.sec, timestamp.nsec });

@@ -1908,10 +1908,15 @@ Operators can inspect one managed mailbox with `mail user:local hosted-status <m
   usable across flag changes and restarts in the same account. After moving
   an item to a different folder, search again for its new ID. See the
   [ActiveSync Search command](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-ascmd/8211179b-14f3-44ab-9de6-b69ca2a48c4e).
+- ActiveSync FolderSync lists the built-in collections and existing top-level
+  mail folders. Each device tracks its own hierarchy. After an upgrade from
+  the older static hierarchy, initialize it again with key `0`. FolderCreate
+  adds a top-level mail folder. Hosted accounts see the same folder in IMAP
+  and webmail.
 - ActiveSync MoveItems moves mail between the built-in Inbox, Drafts, Sent,
-  and Trash collections. It works at the byte limit and keeps the message's
-  flags and bytes. It returns the destination ID, which the next Sync reports
-  as an addition while the source Sync reports a deletion. MoveItems rechecks
+  and Trash collections and custom mail folders. It works at the byte limit
+  and keeps the message's flags and bytes. The next Sync reports the returned
+  destination ID as an addition and the old source ID as a deletion. MoveItems rechecks
   account access before the move. Webmail-managed drafts stay under the
   revisioned composer so the message and its draft record move together.
   [ActiveSync MoveItems command](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-ascmd/92958692-b116-462f-871c-eaab66076da1)

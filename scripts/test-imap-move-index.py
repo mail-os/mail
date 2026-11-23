@@ -154,6 +154,17 @@ def exercise_inflight_search(test, index, owner, peer):
             assert result.result() == expected, condition
 
 
+def exercise_maildir_plus_folder(test, index, owner):
+    with test.imap(owner) as client:
+        assert client.create("Research")[0] == "OK"
+        assert client.select("Sent")[0] == "OK"
+        uid, = search(client, "SUBJECT Compass")
+        assert client.uid("MOVE", uid, "Research")[0] == "OK"
+    wait_for(lambda: not pending(test) and subject_folders(index, owner) == {"Research"},
+             "index reconciliation should read the canonical Maildir++ destination")
+    verify_search(test, index, owner, "Research", 1, indexed=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
@@ -172,6 +183,7 @@ def main():
                 recover_index(test, index, owner, peer)
                 exercise_inflight_retry(test, index, owner)
                 exercise_inflight_search(test, index, owner, peer)
+                exercise_maildir_plus_folder(test, index, owner)
         finally:
             index.shutdown()
             thread.join()
