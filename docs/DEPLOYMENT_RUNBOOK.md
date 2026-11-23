@@ -7,6 +7,34 @@
 
 This runbook provides step-by-step procedures for deploying, upgrading, and maintaining the Mail Server in production environments.
 
+## Native Mail staging on AWS
+
+Use a public Route 53 zone dedicated to the staging mailbox domain. For example, `mail.staging.example.com` is the server hostname and `staging.example.com` is the zone and mailbox domain. The stack manages only the staging hostname's A record. Staging supports delivery between its own mailboxes. Its security group limits internet egress to HTTP and HTTPS.
+
+Build the chosen Linux x86-64 revision with `zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast` in `packages/zig` after installing the repository dependencies. Publish a gzip tar archive under `staging/` in the test artifact bucket. The archive needs four files at its root. Use the built executable as `mail-server` and include `scripts/mail-health.py`, `scripts/mail-health-watch.py`, and `scripts/setup-mail-health.sh` from the same revision. Record the revision and SHA-256 of the archive.
+
+Create `/mail-server/staging/provisioning-token` as an SSM SecureString in the target region with a 32-byte hex-encoded token. `/mail-server/staging/discord-webhook-url` is an optional SecureString for a staging alert receiver. The instance role can read those parameters and the selected artifact.
+
+Run this from `packages/cloud` after setting `STAGING_DOMAIN_NAME` to the hostname, `STAGING_HOSTED_ZONE_ID` to the dedicated zone ID, `STAGING_ARTIFACT_S3_URI` to the published archive, and `STAGING_ARTIFACT_SHA256` to its checksum. `AWS_REGION` defaults to `us-east-1`.
+
+```bash
+bun run generate:staging > mail-staging.cfn.json
+bun run deploy:staging
+bun run status:staging
+```
+
+The deploy command validates the zone and creates `MailServerStagingStack`. An existing stack causes the command to fail. `bun run diff:staging` compares the current template with the deployed stack. After creation, connect via Session Manager and check `sudo cloud-init status --wait`, `sudo systemctl is-active mail`, and `sudo /usr/local/sbin/mail-protocol-health-check --deploy-gate`.
+
+Verify the certificate and protocol endpoints on the staging hostname. Use port 587 for SMTP submission, 993 for IMAPS, 8443 for webmail, and 443 for EWS and ActiveSync. The provisioning listener uses loopback port 8099. Open a Session Manager port forwarding session for the synthetic signup and mailbox checks.
+
+```bash
+aws ssm start-session --target STAGING_INSTANCE_ID \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters 'portNumber=8099,localPortNumber=8099'
+```
+
+For the local Stacks test process, set `MAIL_PROVISIONING_URL` to `http://127.0.0.1:8099`, `MAIL_PROVISIONING_TOKEN` to the staging token, `MAIL_FREE_SIGNUP_DOMAIN` to the staging mailbox domain, and `MAIL_WEBMAIL_ORIGIN` to the webmail URL from the stack output. Use a disposable signup database and configure the free-tier limits for the test. Record the deployed Mail, app, and SDK revisions and test results in #55, #57, and #61.
+
 ---
 
 ## Table of Contents

@@ -78,12 +78,20 @@ const mailConfig = {
   ],
 }
 
-const deploymentEnvironment = process.env.CLOUD_ENV === 'dev' || process.env.CLOUD_ENV === 'staging'
-  ? process.env.CLOUD_ENV
-  : 'production'
+const envFlag = process.argv.findIndex(argument => argument === '--env' || argument.startsWith('--env='))
+const requested = envFlag < 0 ? undefined : process.argv[envFlag].split('=')[1] ?? process.argv[envFlag + 1]
+if (envFlag >= 0 && (!requested || requested.startsWith('--')))
+  throw new Error('Specify production or dev after --env. Use the staging commands for a Mail staging stack.')
+const configured = process.env.CLOUD_ENV || undefined
+if (configured && requested && configured !== requested)
+  throw new Error('CLOUD_ENV must match --env')
+const deploymentEnvironment = requested ?? configured ?? 'production'
+if (deploymentEnvironment === 'staging')
+  throw new Error('Use bun run generate:staging or bun run deploy:staging for a Mail staging stack')
+if (deploymentEnvironment !== 'production' && deploymentEnvironment !== 'dev')
+  throw new Error('Mail cloud environment must be production or dev')
 const deploymentProfile = {
   dev: { instanceType: 't3.small', volumeSize: 30, monitoring: false, backups: false, logRetention: 7 },
-  staging: { instanceType: 't3.medium', volumeSize: 50, monitoring: true, backups: true, logRetention: 14 },
   production: { instanceType: 't3.large', volumeSize: 100, monitoring: true, backups: true, logRetention: 30 },
 }[deploymentEnvironment]
 const mailSecurityGroups = {

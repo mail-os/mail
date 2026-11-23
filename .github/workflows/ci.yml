@@ -36,6 +36,11 @@ jobs:
         bun install --frozen-lockfile
         bun run playwright install --with-deps chromium firefox webkit
 
+    - name: Verify cloud deployment templates
+      if: runner.os == 'Linux'
+      working-directory: .
+      run: bun test packages/cloud/test
+
     - name: Run native HTTPS browser journeys
       if: runner.os == 'Linux'
       working-directory: .
