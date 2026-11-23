@@ -21,6 +21,7 @@
   --control-label-gap: 6px;
   --picker-icon-size: 16px;
   --picker-icon-gap: 8px;
+  --picker-end-padding: calc(var(--control-inline-padding) + var(--picker-icon-size) + var(--picker-icon-gap));
   --select-chevron: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Cpath d=%22m4 6 4 4 4-4%22 fill=%22none%22 stroke=%22%23515966%22 stroke-width=%221.5%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22/%3E%3C/svg%3E");
   --accent: #0755ad;
   --primary: #0866d4;
@@ -145,7 +146,7 @@ body {
 
 /* Mailbox shell and reusable controls. */
 :where(button, input, textarea, select) { font: inherit; }
-:where(input:not([type=checkbox], [type=radio], [type=hidden], [hidden], .wm-file-input), select, textarea, .wm-action) {
+:where(input:not([type=checkbox], [type=radio], [type=hidden], [hidden], .wm-file-input), select, textarea, .wm-action, .mail-search-field) {
   min-inline-size: 0;
   max-inline-size: 100%;
   min-block-size: var(--control-height);
@@ -159,11 +160,11 @@ body {
 }
 :where(input, select, textarea) { font-weight: 400; }
 input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
-:where(input:not([type=checkbox], [type=radio], [type=hidden], [type=file], [hidden], .wm-file-input), select) {
+:where(input:not([type=checkbox], [type=radio], [type=hidden], [hidden], .wm-file-input), select, .mail-search-field) {
   block-size: var(--control-height);
   padding-block: 0;
 }
-:where(input[type=date], input[type=time], input[type=datetime-local], select, button.wm-action) {
+:where(input[type=date], input[type=time], input[type=datetime-local], input[type=search], select, button.wm-action) {
   appearance: none;
 }
 :where(input[type=date], input[type=time], input[type=datetime-local]) {
@@ -190,7 +191,7 @@ input::file-selector-button {
 }
 input:not(:disabled)::file-selector-button:hover { background: var(--hover); }
 select {
-  padding-inline-end: calc(var(--control-inline-padding) + var(--picker-icon-size) + var(--picker-icon-gap));
+  padding-inline-end: var(--picker-end-padding);
   background-image: var(--select-chevron);
   background-position: right var(--control-inline-padding) center;
   background-size: var(--picker-icon-size);
@@ -199,7 +200,7 @@ select {
   cursor: pointer;
 }
 select:dir(rtl) { background-position: left var(--control-inline-padding) center; }
-:is(select, input[type=date], input[type=time], input[type=datetime-local]):hover:not(:disabled) { background-color: var(--toolbar); }
+:is(select, input[type=date], input[type=time], input[type=datetime-local]):hover:not(:disabled) { background-color: var(--surface); }
 :is(input:not([type=checkbox], [type=radio], [type=hidden], .wm-file-input), select, textarea):disabled {
   background-color: var(--surface);
   color: var(--control-disabled-text);
@@ -239,7 +240,7 @@ button:disabled { opacity: .5; cursor: default; }
 .wm-search-row { display: flex; gap: 6px; }
 .wm-search { width: 100%; }
 .wm-action { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; cursor: pointer; }
-.wm-action:hover:where(:not(:disabled)) { background: var(--toolbar); }
+.wm-action:hover:where(:not(:disabled)) { background-color: var(--surface); }
 .wm-action--danger { color: var(--danger); }
 .wm-action--danger:hover:not(:disabled) { background: var(--danger-soft); }
 .wm-filter-panel { display: flex; flex-direction: column; gap: 10px; padding-top: 12px; }
@@ -588,28 +589,14 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-period-buttons { display: flex; align-items: center; }
 .calendar-period .wm-action { block-size: var(--control-height); justify-content: center; }
 .calendar-period .calendar-arrow { inline-size: var(--control-height); padding-inline: 0; }
-.calendar-jump {
-  position: relative;
-  inline-size: 9.5rem;
-  block-size: var(--control-height);
-  border: 1px solid var(--control-border);
-  border-radius: var(--control-radius);
-  background: var(--panel);
-  font-size: var(--control-font-size);
-}
-.calendar-jump:hover { background: var(--toolbar); }
+.calendar-jump { --date-field-fill: var(--panel); position: relative; inline-size: 9.5rem; }
+.calendar-jump:hover { --date-field-fill: var(--surface); }
 .calendar-jump input {
   display: block;
   inline-size: 100%;
-  block-size: 100%;
-  min-block-size: 0;
-  border: 0;
-  background: transparent;
+  background-color: var(--date-field-fill);
 }
-.calendar-jump input:hover { background: transparent; }
-.calendar-jump input::-webkit-datetime-edit { padding-inline-end: var(--picker-icon-gap); }
-.calendar-jump input:focus-visible { outline: none; }
-.calendar-jump:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.calendar-jump input::-webkit-calendar-picker-indicator { display: none; }
 .calendar-jump-picker {
   position: absolute;
   inset-block: 0;
@@ -619,15 +606,20 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   inline-size: var(--control-height);
   padding-block: 0;
   padding-inline: 0 var(--control-inline-padding);
-  border: 0;
-  border-start-end-radius: calc(var(--control-radius) - 1px);
-  border-end-end-radius: calc(var(--control-radius) - 1px);
-  background: inherit;
+  border: 1px solid transparent;
+  border-start-end-radius: var(--control-radius);
+  border-end-end-radius: var(--control-radius);
+  /* Keep the text and outer border visible while covering native picker icons. */
+  background: var(--date-field-fill) padding-box;
   color: var(--muted);
 }
 .calendar-jump-picker:hover { color: var(--accent); }
-.calendar-jump-picker:focus-visible { outline-offset: -3px; }
+.calendar-jump-picker:focus-visible { outline-offset: -2px; }
 .calendar-jump-picker .mail-icon { inline-size: var(--picker-icon-size); block-size: var(--picker-icon-size); }
+@media (forced-colors: active) {
+  .calendar-jump input::-webkit-calendar-picker-indicator { display: revert; }
+  .calendar-jump-picker { display: none; }
+}
 .calendar-search { flex-wrap: nowrap; }
 .calendar-search input { width: min(14rem, 100%); }
 .calendar-zone { display: flex; align-items: center; gap: .45rem; color: var(--muted); flex-wrap: wrap; font-size: .8rem; }
@@ -937,7 +929,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-search-form { padding: 6px 13px 9px; border-bottom: 0; }
 .wm-search-filters[aria-expanded=true] { background: var(--accent-soft); }
 .wm-search-filters[aria-expanded=true] .mail-icon { color: var(--accent); }
-.mail-search-field { display: flex; align-items: center; flex: 1; min-width: 0; block-size: var(--control-height); gap: 6px; padding-inline: 9px; border: 1px solid var(--control-border); border-radius: var(--control-radius); background: var(--panel); color: var(--muted); }
+.mail-search-field { display: flex; align-items: center; flex: 1; gap: 6px; padding-inline: 9px; color: var(--muted); }
 .mail-search-field:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
 .mail-search-field .wm-search { block-size: auto; min-block-size: 0; border: 0; outline: 0; padding: 7px 0; background: transparent; }
 .wm-search-form .mail-search-field { padding-inline-end: 3px; }
@@ -1420,10 +1412,10 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-dropzone--active { border-color: var(--accent); background: var(--accent-soft); }
 .wm-compose-attachments li { background: var(--toolbar); }
 .wm-compose-attachments li > .mail-icon { color: var(--accent); }
-.wm-composer-foot > .wm-action:not(.calendar-primary) { background: transparent; border-color: transparent; }
+.wm-composer-foot > .wm-action:not(.calendar-primary) { padding-inline: 8px; background: transparent; border-color: transparent; }
 .wm-composer-foot > .wm-action:not(.calendar-primary):hover { background: var(--hover); }
 .wm-composer-foot > .wm-action--danger:hover { background: var(--danger-soft); }
-.wm-composer-foot .wm-send-btn { min-block-size: var(--control-height); padding-block: 6px; border: 1px solid var(--primary); border-radius: var(--control-radius); font-size: var(--control-font-size); }
+.wm-composer-foot .wm-send-btn { min-block-size: var(--control-height); padding: 6px 14px; border: 1px solid var(--primary); border-radius: var(--control-radius); font-size: var(--control-font-size); }
 .wm-composer-foot .wm-send-btn:hover:not(:disabled) { border-color: var(--primary-hover); }
 .wm-composer-foot .wm-send-delay .mail-icon { width: 14px; height: 14px; }
 
@@ -1447,6 +1439,13 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-entry-time .mail-icon { width: 12px; height: 12px; }
 .calendar-zone { flex-wrap: nowrap; margin-inline-start: auto; }
 .calendar-zone select { width: auto; max-width: min(12.5rem, 49vw); }
+@media (490px < width <= 1080px) {
+  .calendar-view-modes { flex-basis: 100%; }
+  .calendar-view-toolbar { row-gap: var(--calendar-control-gap); }
+}
+@media (490px < width <= 740px) {
+  .calendar-zone { flex-basis: 100%; justify-content: space-between; }
+}
 
 /* Preserve the outline while disabling a control. Quiet buttons keep their transparent styling. */
 .wm-action:disabled { opacity: 1; color: var(--control-disabled-text); }
@@ -1511,6 +1510,10 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-list-head h1 { font-size: clamp(27px, 8vw, 30px); }
   .wm-message-check { left: 3px; top: 9px; width: 20px; height: 20px; }
   .wm-read-sender { flex-direction: column; }
+  .wm-message-heading-actions { flex-wrap: wrap; gap: 6px; }
+  .wm-message-sharing { display: grid; flex-basis: 100%; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 8px; }
+  .wm-message-sharing:not(:has(> button)) { display: none; }
+  .wm-message-sharing > button { padding: 4px 7px; text-align: start; white-space: normal; }
   .wm-reader-attention-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .wm-reader-attention-actions .wm-action { text-align: start; white-space: normal; }
   :is(.wm-sender-sorting, .wm-notification-rules) summary { min-height: 44px; }

@@ -153,7 +153,7 @@ async function verifyCalendarPeriod(page, label, height) {
   const group = page.getByRole('group', { name: 'Change date range' })
   const toolbar = page.locator('.calendar-view-toolbar')
   await verifySelect(toolbar.getByRole('combobox', { name: 'Display time zone' }), height)
-  const controls = await verifyControlRow(toolbar, '.calendar-period-buttons button, .calendar-jump, .calendar-zone select', height, false)
+  const controls = await verifyControlRow(toolbar, '.calendar-period-buttons button, .calendar-jump input, .calendar-zone select', height, false)
   assert.equal(controls.length, 5)
   const stacked = Math.abs(controls[3].top - controls[0].top) >= 0.5
   const width = page.viewportSize()?.width ?? 0
@@ -170,6 +170,9 @@ async function verifyCalendarPeriod(page, label, height) {
   const date = controls[3]
   assert(date.right - date.left >= (width <= 490 ? 148 : 152), 'Jump to date leaves room for the native date and picker')
   const datePicker = button(group, 'Open date picker')
+  const pickerBox = await datePicker.boundingBox()
+  assert(Math.abs(pickerBox.width - height) < 0.5 && Math.abs(pickerBox.height - height) < 0.5,
+    `The date picker should have a ${height}px square hit area, got ${pickerBox.width} × ${pickerBox.height}px at ${width}px`)
   const pickerIcon = await datePicker.locator('.mail-icon').boundingBox()
   assert.equal(pickerIcon.width, 16)
   assert(Math.abs(pickerIcon.y + pickerIcon.height / 2 - (date.top + date.bottom) / 2) < 0.5,
@@ -200,12 +203,21 @@ async function verifyCalendarPeriod(page, label, height) {
     return text.left - box.left < 5.5 || box.right - text.right < 5.5 ? [button.textContent] : []
   }))
   assert.deepEqual(crampedViews, [], 'View labels have clear space inside each border')
+  const zone = controls[4]
   if (width >= 1160) {
     for (const control of [...views, controls[4]]) {
       assert(Math.abs(control.top - date.top) < 0.5 && Math.abs(control.bottom - date.bottom) < 0.5,
         'The view and time zone controls align with both edges of the date controls')
     }
     verifyControlGaps([views.at(-1), controls[0]], 16)
+  }
+  if (width > 490 && width <= 1080) {
+    assert(Math.abs(controls[0].top - views[0].bottom - 8) < 0.5, 'Tablet navigation starts eight pixels below the views')
+    assert(Math.abs(controls[0].left - views[0].left) < 0.5, 'Tablet navigation and views share a leading edge')
+    if (width > 740)
+      assert(Math.abs(zone.top - date.top) < 0.5, 'The time zone shares the second row on wider tablets')
+    else
+      assert(Math.abs(zone.top - date.bottom - 8) < 0.5, 'The time zone has an eight-pixel gap on narrow tablets')
   }
   if (stacked) {
     assert(Math.abs(date.top - row[0].bottom - 8) < 0.5, 'Jump to date has the same gap below date navigation')
@@ -221,12 +233,50 @@ async function verifyCalendarPeriod(page, label, height) {
     y: date.top - groupBox.y,
     width: date.right - date.left,
     height,
+    iconLeft: pickerIcon.x - groupBox.x,
   })
-  await toolbar.screenshot({ path: join(output, `${label}-calendar-toolbar.png`), animations: 'disabled' })
+  await verifyPaintedControlBorders(toolbar,
+    '.calendar-view-modes button, .calendar-view-picker select, .calendar-period-buttons button, .calendar-jump input, .calendar-zone select',
+    [...views, ...controls], `${label}-calendar-toolbar`)
+}
+
+async function verifyPaintedControlBorders(container, selector, controls, name) {
+  const centers = await container.evaluate((group, selector) => {
+    const box = group.getBoundingClientRect()
+    return Array.from(group.querySelectorAll(selector)).flatMap((control) => {
+      const { left, top, height } = control.getBoundingClientRect()
+      if (height === 0) return []
+      return [{ x: Math.floor(left - box.left), y: Math.floor(top + height / 2 - box.top) }]
+    })
+  }, selector)
+  assert.equal(centers.length, controls.length, 'Every visible control has a position in the screenshot')
+  const neutralEdges = centers.flatMap((center, index) => controls[index].neutral ? [{ ...center, name: controls[index].name }] : [])
+  const capture = await container.screenshot({ path: join(output, `${name}.png`), animations: 'disabled', scale: 'css' })
+  const mismatches = await container.evaluate(async (node, { png, centers }) => {
+    const pixels = Uint8Array.from(atob(png), char => char.charCodeAt(0))
+    const bitmap = await createImageBitmap(new Blob([pixels], { type: 'image/png' }))
+    const canvas = document.createElement('canvas')
+    canvas.width = bitmap.width
+    canvas.height = bitmap.height
+    const context = canvas.getContext('2d')
+    context.drawImage(bitmap, 0, 0)
+    const hex = getComputedStyle(node).getPropertyValue('--control-border').trim()
+    const border = hex.slice(1).match(/../g).map(channel => Number.parseInt(channel, 16))
+    return centers.flatMap(({ name, x, y }) => {
+      // Mobile viewport and screenshot rounding can snap fractional boxes separately.
+      const start = Math.max(0, x - 2)
+      const strip = context.getImageData(start, y, x + 3 - start, 1).data
+      for (let pixel = 0; pixel < strip.length; pixel += 4) {
+        if (border.every((channel, offset) => Math.abs(strip[pixel + offset] - channel) <= 3)) return []
+      }
+      return [{ name, x, y, samples: Array.from(strip) }]
+    })
+  }, { png: capture.toString('base64'), centers: neutralEdges })
+  assert.deepEqual(mismatches, [], 'Visible straight edges should paint the shared border color')
 }
 
 async function verifyDateTextAlignment(page, capture, date) {
-  const centerOffset = await page.evaluate(async ({ image, date }) => {
+  const { centerOffset, iconGapHasInk } = await page.evaluate(async ({ image, date }) => {
     // The browser paints the date value in its native editor. Inspect the
     // screenshot to catch centering errors the input's DOM bounds cannot show.
     const encoded = Uint8Array.from(atob(image), char => char.charCodeAt(0))
@@ -248,10 +298,13 @@ async function verifyDateTextAlignment(page, capture, date) {
         }
       }
     }
-    if (!inkRows.length) return null
-    return (inkRows[0] + inkRows.at(-1) - area.height) / 2
+    const gap = context.getImageData(Math.round(date.iconLeft) - 24, Math.round(date.y) + 5, 24, date.height - 10)
+    const fill = context.getImageData(Math.round(date.iconLeft) - 1, Math.round(date.y) + 5, 1, 1).data
+    const iconGapHasInk = gap.data.some((channel, index) => index % 4 !== 3 && Math.abs(channel - fill[index % 4]) > 6)
+    return { centerOffset: inkRows.length ? (inkRows[0] + inkRows.at(-1) - area.height) / 2 : null, iconGapHasInk }
   }, { image: capture.toString('base64'), date })
   assert(centerOffset !== null && Math.abs(centerOffset) <= 2.5, `The visible date should be centered, got ${centerOffset}px off center`)
+  assert(!iconGapHasInk, 'Only the app calendar icon appears in the reserved trailing area')
 }
 
 async function verifyCalendarPicker(page) {
@@ -307,7 +360,7 @@ async function verifyReaderToolbar(toolbar, height) {
 }
 
 async function verifyComposerControls(composer, height) {
-  const controls = await verifyControlRow(composer.locator('.wm-composer-foot'), 'button, select', height, false)
+  const controls = await verifyControlRow(composer.locator('.wm-composer-foot'), 'button, select', height, height === 36)
   assert.equal(controls.length, 5)
   assert(controls.every(control => control.fontSize === controls[0].fontSize), 'Composer actions and the Undo Send picker share a text size')
   for (const row of await composer.locator('.wm-recipient-field').all()) {
@@ -636,9 +689,9 @@ async function desktopJourney(page) {
   await fitsViewport(page)
   await screenshot(page, 'desktop-calendar')
   await verifyCalendarPeriod(page, 'desktop-light', 36)
-  for (const width of [371, 375, 376, 389, 490, 491, 860, 861, 1159, 1160]) {
+  for (const width of [371, 375, 376, 389, 490, 491, 700, 740, 741, 800, 860, 861, 1080, 1081, 1159, 1160]) {
     await page.setViewportSize({ width, height: 940 })
-    await verifyCalendarPeriod(page, null, width > 860 ? 36 : 44)
+    await verifyCalendarPeriod(page, width === 800 ? 'tablet-light' : null, width > 860 ? 36 : 44)
   }
   await page.setViewportSize({ width: 1440, height: 940 })
   await page.emulateMedia({ colorScheme: 'dark' })
@@ -720,6 +773,10 @@ async function phoneJourney(page) {
   await fitsViewport(page)
   const actions = page.getByRole('group', { name: 'Message actions', exact: true })
   await verifyReaderToolbar(actions, 44)
+  const [snapshot, teamConversation, assistant, privateTools] = await verifyControlRow(page.locator('.wm-message-sharing'), 'button', 44, false)
+  verifyControlGaps([snapshot, teamConversation], 8)
+  verifyControlGaps([assistant, privateTools], 8)
+  assert(Math.abs(assistant.top - snapshot.bottom - 4) < 0.5, 'Reader sharing actions fit in two evenly spaced rows')
   await screenshot(page, 'phone-reader-narrow')
   assert((await actions.boundingBox()).height < 124, 'Reader actions fit into two rows on narrow phones')
   for (const name of ['Reply', 'Reply all', 'Forward', 'Archive message', 'Flag', 'Mark unread', 'Trash', 'Mark junk', 'Next unread', 'Move this message']) {
@@ -1782,10 +1839,11 @@ async function calendarSharingJourney(captain) {
   const shareControls = await verifyControlRow(shareForm, 'select, input, button', 36)
   assert.equal(shareControls.length, 5)
   verifyControlGaps(shareControls, 12)
-  await shareForm.screenshot({ path: join(output, 'desktop-calendar-sharing-light.png'), animations: 'disabled' })
+  await verifyPaintedControlBorders(shareForm, 'select, input, button', shareControls, 'desktop-calendar-sharing-light')
   await captain.emulateMedia({ colorScheme: 'dark' })
-  verifyControlGaps(await verifyControlRow(shareForm, 'select, input, button', 36), 12)
-  await shareForm.screenshot({ path: join(output, 'desktop-calendar-sharing-dark.png'), animations: 'disabled' })
+  const darkShareControls = await verifyControlRow(shareForm, 'select, input, button', 36)
+  verifyControlGaps(darkShareControls, 12)
+  await verifyPaintedControlBorders(shareForm, 'select, input, button', darkShareControls, 'desktop-calendar-sharing-dark')
   await screenshot(captain, 'desktop-calendar-selects-dark')
   await captain.setViewportSize({ width: 861, height: 940 })
   await fitsViewport(captain)
@@ -1827,10 +1885,11 @@ async function calendarSharingJourney(captain) {
     verifyControlGaps(disabledControls, 12)
     assert(disabledControls.every(control => control.neutral && control.borderMatches && control.opacity === '1'),
       'While sharing, every control keeps the same border at full opacity')
-    await shareForm.screenshot({ path: join(output, 'desktop-calendar-sharing-pending.png'), animations: 'disabled' })
+    await verifyPaintedControlBorders(shareForm, 'select, input, button', disabledControls, 'desktop-calendar-sharing-pending')
     await captain.emulateMedia({ colorScheme: 'dark' })
-    verifyControlGaps(await verifyControlRow(shareForm, 'input, select, button', 36), 12)
-    await shareForm.screenshot({ path: join(output, 'desktop-calendar-sharing-pending-dark.png'), animations: 'disabled' })
+    const darkDisabledControls = await verifyControlRow(shareForm, 'input, select, button', 36)
+    verifyControlGaps(darkDisabledControls, 12)
+    await verifyPaintedControlBorders(shareForm, 'select, input, button', darkDisabledControls, 'desktop-calendar-sharing-pending-dark')
     await captain.emulateMedia({ colorScheme: 'light' })
   }
   finally { resumeShare.resolve() }
