@@ -274,24 +274,25 @@ async function verifyCalendarPeriod(page, label, height) {
 async function verifyPaintedControlBorders(container, selector, controls, name) {
   const centers = await container.evaluate((group, selector) => {
     const box = group.getBoundingClientRect()
+    const pixels = devicePixelRatio
     return Array.from(group.querySelectorAll(selector)).flatMap((control) => {
       const { left, top, right, bottom, width, height } = control.getBoundingClientRect()
       if (height === 0) return []
-      const x = Math.floor(left + width / 2 - box.left)
-      const y = Math.floor(top + height / 2 - box.top)
+      const x = Math.floor((left + width / 2 - box.left) * pixels)
+      const y = Math.floor((top + height / 2 - box.top) * pixels)
       return [{
         edges: [
-          { side: 'left', x: Math.floor(left - box.left), y, dx: 1, dy: 0 },
-          { side: 'right', x: Math.ceil(right - box.left) - 1, y, dx: 1, dy: 0 },
-          { side: 'top', x, y: Math.floor(top - box.top), dx: 0, dy: 1 },
-          { side: 'bottom', x, y: Math.ceil(bottom - box.top) - 1, dx: 0, dy: 1 },
+          { side: 'left', x: Math.floor((left - box.left) * pixels), y, dx: 1, dy: 0 },
+          { side: 'right', x: Math.ceil((right - box.left) * pixels) - 1, y, dx: 1, dy: 0 },
+          { side: 'top', x, y: Math.floor((top - box.top) * pixels), dx: 0, dy: 1 },
+          { side: 'bottom', x, y: Math.ceil((bottom - box.top) * pixels) - 1, dx: 0, dy: 1 },
         ],
       }]
     })
   }, selector)
   assert.equal(centers.length, controls.length, 'Every visible control has a position in the screenshot')
   const neutralEdges = centers.flatMap((center, index) => controls[index].neutral ? [{ ...center, name: controls[index].name }] : [])
-  const capture = await container.screenshot({ path: join(output, `${name}.png`), animations: 'disabled', scale: 'css' })
+  const capture = await container.screenshot({ path: join(output, `${name}.png`), animations: 'disabled', scale: 'device' })
   const mismatches = await container.evaluate(async (node, { png, centers }) => {
     const pixels = Uint8Array.from(atob(png), char => char.charCodeAt(0))
     const bitmap = await createImageBitmap(new Blob([pixels], { type: 'image/png' }))
@@ -302,12 +303,13 @@ async function verifyPaintedControlBorders(container, selector, controls, name) 
     context.drawImage(bitmap, 0, 0)
     const hex = getComputedStyle(node).getPropertyValue('--control-border').trim()
     const border = hex.slice(1).match(/../g).map(channel => Number.parseInt(channel, 16))
+    const tolerance = Math.ceil(2 * devicePixelRatio)
     return centers.flatMap(({ name, edges }) => edges.flatMap(({ side, x, y, dx, dy }) => {
-      // Mobile viewport and screenshot rounding can snap fractional boxes separately.
-      const startX = Math.max(0, x - 2 * dx)
-      const startY = Math.max(0, y - 2 * dy)
-      const width = Math.min(canvas.width, x + 1 + 2 * dx) - startX
-      const height = Math.min(canvas.height, y + 1 + 2 * dy) - startY
+      // Fractional viewport and screenshot origins can snap to different pixels.
+      const startX = Math.max(0, x - tolerance * dx)
+      const startY = Math.max(0, y - tolerance * dy)
+      const width = Math.min(canvas.width, x + 1 + tolerance * dx) - startX
+      const height = Math.min(canvas.height, y + 1 + tolerance * dy) - startY
       const strip = context.getImageData(startX, startY, width, height).data
       for (let pixel = 0; pixel < strip.length; pixel += 4) {
         if (border.every((channel, offset) => Math.abs(strip[pixel + offset] - channel) <= 3)) return []
@@ -580,6 +582,7 @@ async function signIn({ phone = false, account = owner, initialSubject = handoff
     viewport: phone ? { width: 390, height: 844 } : { width: 1440, height: 940 },
     colorScheme: phone ? 'dark' : 'light',
     hasTouch: phone,
+    deviceScaleFactor: phone ? 2 : 1,
     // Firefox does not support Playwright's isMobile option.
     isMobile: phone && engine !== 'firefox',
     locale: 'en-US',
