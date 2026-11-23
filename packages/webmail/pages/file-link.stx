@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex, noarchive, nofollow">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval'; connect-src 'self'; style-src 'self' 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'self'">
+  <title>Shared file — Mail</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="icon" href="data:,">
+</head>
+<body>
+<script client>
+import { openPublicLink, reloadPublicLink, linkDate } from '../functions/mail-public-links'
+import { readableBytes } from '../functions/mail-utils'
+import { tokenFromHash } from '../functions/recovery'
+const file = state(null)
+const token = state('')
+const busy = state(true)
+const error = state('')
+let request = null
+async function readFileLink() {
+  request?.abort()
+  const pending = new AbortController()
+  request = pending
+  file.set(null)
+  busy.set(true)
+  error.set('')
+  try {
+    const key = tokenFromHash(useRoute().hash)
+    const result = key ? await openPublicLink('/webmail/public/file-link', key, pending.signal) : null
+    if (request === pending) {
+      token.set(result ? key : '')
+      file.set(result)
+    }
+  }
+  catch {
+    if (request === pending) error.set('Could not open this file link. Try again.')
+  }
+  finally {
+    if (request === pending) busy.set(false)
+  }
+}
+onMount(readFileLink)
+useEventListener('hashchange', reloadPublicLink)
+useEventListener('pageshow', (event) => { if (event.persisted) reloadPublicLink() })
+onUnmounted(() => request?.abort())
+</script>
+<main class="wm-snapshot-page">
+  <header class="wm-snapshot-header">
+    <span class="mail-app-mark"><span class="mail-icon" data-icon="document" aria-hidden="true"></span></span>
+    <h1>Shared file</h1>
+  </header>
+  <p :if="busy" role="status">Opening file link…</p>
+  <div :if="error" class="wm-inline-error" role="alert"><span :text="error"></span><button type="button" class="wm-action" @click="readFileLink()">Try again</button></div>
+  <p :if="!busy && !file && !error" class="wm-snapshot-empty" role="status">This file link is unavailable. It may have expired or been revoked.</p>
+  <article :if="file" class="wm-snapshot-message wm-shared-file">
+    <h2 :text="file.filename"></h2>
+    <div class="wm-snapshot-meta"><span :text="readableBytes(file.size)"></span><span :text="'Available until ' + linkDate(file.expires_at)"></span></div>
+    <form class="wm-snapshot-form" method="post" action="/webmail/public/file-link/download">
+      <input type="hidden" name="token" :value="token">
+      <button type="submit" class="wm-action wm-snapshot-primary"><span class="mail-icon" data-icon="download" aria-hidden="true"></span>Download file</button>
+    </form>
+  </article>
+</main>
+</body>
+</html>

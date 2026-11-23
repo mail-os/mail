@@ -694,6 +694,18 @@ pub const Database = struct {
             \\);
             \\CREATE INDEX IF NOT EXISTS mail_snapshot_links_owner ON mail_snapshot_links(user_id,expires_at);
             \\CREATE INDEX IF NOT EXISTS mail_snapshot_links_expiry ON mail_snapshot_links(expires_at);
+            \\CREATE TABLE IF NOT EXISTS mail_file_links (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    id TEXT NOT NULL,
+            \\    token_hash TEXT NOT NULL UNIQUE,
+            \\    filename TEXT NOT NULL,
+            \\    data BLOB NOT NULL,
+            \\    size INTEGER NOT NULL CHECK(size > 0 AND size = length(data)),
+            \\    expires_at INTEGER NOT NULL,
+            \\    PRIMARY KEY(user_id,id)
+            \\);
+            \\CREATE INDEX IF NOT EXISTS mail_file_links_owner ON mail_file_links(user_id,expires_at);
+            \\CREATE INDEX IF NOT EXISTS mail_file_links_expiry ON mail_file_links(expires_at);
             \\CREATE TABLE IF NOT EXISTS mail_calendar_tools (
             \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
             \\    payload TEXT NOT NULL,
@@ -1756,6 +1768,18 @@ pub const Database = struct {
         const stmt = try self.prepareLocked("SELECT COALESCE(SUM(queued_bytes),0) FROM accepted_mail_targets WHERE mailbox=?1 AND outcome='pending'");
         defer stmt.finalize();
         try stmt.bind(1, mailbox);
+        if (!try stmt.step()) return error.NotFound;
+        return @intCast(stmt.columnInt64(0));
+    }
+
+    pub fn linkedFileBytes(self: *Database, mailbox: []const u8, now: i64) !u64 {
+        const stmt = try self.prepare(
+            \\SELECT COALESCE(SUM(size),0) FROM mail_file_links
+            \\WHERE user_id=(SELECT id FROM users WHERE username=?1) AND expires_at>?2
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, mailbox);
+        try stmt.bind(2, now);
         if (!try stmt.step()) return error.NotFound;
         return @intCast(stmt.columnInt64(0));
     }

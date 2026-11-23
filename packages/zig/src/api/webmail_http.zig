@@ -63,6 +63,8 @@ const calendar_day_labels = @import("../storage/calendar_day_labels.zig");
 const calendar_tasks = @import("../storage/calendar_tasks.zig");
 const calendar_tools = @import("../storage/calendar_tools.zig");
 const snapshots = @import("webmail_snapshots.zig");
+const file_links = @import("webmail_file_links.zig");
+const link_tokens = @import("webmail_link_tokens.zig");
 const caldav = @import("../protocol/caldav.zig");
 const calendar_import = @import("webmail_calendar_import.zig");
 const calendar_invite = @import("webmail_calendar_invite.zig");
@@ -87,6 +89,7 @@ const calendar_html = @embedFile("webmail_dist/calendar.html");
 const shared_html = @embedFile("webmail_dist/shared.html");
 const recover_html = @embedFile("webmail_dist/recover.html");
 const snapshot_html = @embedFile("webmail_dist/snapshot.html");
+const file_link_html = @embedFile("webmail_dist/file-link.html");
 const status_html = @embedFile("webmail_dist/status.html");
 const styles_css = @embedFile("webmail_dist/styles.css");
 const notifications_worker = @embedFile("webmail_dist/mail-notifications.js");
@@ -139,6 +142,17 @@ pub const WebmailHttpServer = struct {
     listener: ?socket.Server = null,
     running: std.atomic.Value(bool),
     active_connections: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    file_transfers: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    fn claimFileTransfer(self: *WebmailHttpServer) bool {
+        if (self.file_transfers.fetchAdd(1, .acq_rel) < 4) return true;
+        self.releaseFileTransfer();
+        return false;
+    }
+
+    fn releaseFileTransfer(self: *WebmailHttpServer) void {
+        _ = self.file_transfers.fetchSub(1, .release);
+    }
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -222,6 +236,7 @@ pub const WebmailHttpServer = struct {
             try self.service.recoverInterrupted(time_compat.timestamp());
             self.service.sweep(time_compat.timestamp()) catch |err| logger.warn("Webmail state cleanup failed: {}", .{err});
             snapshots.sweep(self.db, time_compat.timestamp()) catch |err| logger.warn("Snapshot link cleanup failed: {}", .{err});
+            file_links.sweep(self.db, time_compat.timestamp()) catch |err| logger.warn("File link cleanup failed: {}", .{err});
             break :blk try std.Thread.spawn(.{}, deliveryWorker, .{self});
         } else null;
         defer {
@@ -242,6 +257,7 @@ pub const WebmailHttpServer = struct {
                 self.sessions.sweep();
                 self.service.sweep(now) catch |err| logger.warn("Webmail state cleanup failed: {}", .{err});
                 snapshots.sweep(self.db, now) catch |err| logger.warn("Snapshot link cleanup failed: {}", .{err});
+                file_links.sweep(self.db, now) catch |err| logger.warn("File link cleanup failed: {}", .{err});
             }
 
             const connection = self.listener.?.accept() catch |err| {
@@ -352,6 +368,7 @@ const Request = struct {
     body: []const u8,
     /// Only a plaintext listener bound to loopback may trust gateway headers.
     trust_forwarded_headers: bool = false,
+    holds_file_transfer: bool = false,
 
     fn header(self: Request, name: []const u8) ?[]const u8 {
         var line_start: usize = 0;
@@ -440,12 +457,22 @@ fn readRequest(server: *WebmailHttpServer, conn: *webmail_tls.Stream, allocator:
     var request = Request{ .method = method, .path = path, .query = query, .headers = headers_block, .body = "", .trust_forwarded_headers = trusted };
     if (request.header("Transfer-Encoding") != null) return error.MalformedRequest;
     var body_limit: usize = if (server.config.provisioning != null) 4096 else max_request_bytes;
-    if (server.config.provisioning == null and std.mem.eql(u8, path, "/webmail/api/uploads") and std.mem.eql(u8, method, "POST")) {
+    const file_upload = std.mem.eql(u8, path, file_links.path);
+    errdefer if (request.holds_file_transfer) server.releaseFileTransfer();
+    if (server.config.provisioning == null and std.mem.eql(u8, method, "POST") and
+        (file_upload or std.mem.eql(u8, path, "/webmail/api/uploads")))
+    {
         if (!isSameOrigin(request)) return error.CrossOrigin;
         const token = session_mod.parseSessionCookie(request.header("Cookie") orelse "") orelse return error.Unauthorized;
         var session = server.sessions.validate(token) catch return error.Unauthorized;
         defer session.deinit(server.allocator);
-        body_limit = (try server.service.limits(session.username)).maxFileBytes;
+        if (file_upload) {
+            if (!try expectedAccountMatches(allocator, request, session.username)) return error.AccountChanged;
+            body_limit = try file_links.uploadLimit(server.db, session.username);
+            if (body_limit == 0) return error.Unauthorized;
+            if (!server.claimFileTransfer()) return error.FileTransfersBusy;
+            request.holds_file_transfer = true;
+        } else body_limit = (try server.service.limits(session.username)).maxFileBytes;
     }
 
     // Body, per Content-Length.
@@ -494,11 +521,14 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
         return switch (err) {
             error.RequestTooLarge => sendError(conn, arena, 413, "too_large", "This request exceeds the configured limit"),
             error.Unauthorized => sendError(conn, arena, 401, "unauthorized", "Please sign in"),
+            error.AccountChanged => sendError(conn, arena, 409, "account_changed", "The signed-in account changed. Reload this tab before continuing."),
+            error.FileTransfersBusy => sendError(conn, arena, 503, "file_transfers_busy", "File transfers are busy. Try again shortly."),
             error.CrossOrigin => sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected"),
             error.MalformedRequest, error.HeadersTooLarge => sendError(conn, arena, 400, "bad_request", "Malformed request"),
             else => err,
         };
     }) orelse return;
+    defer if (req.holds_file_transfer) server.releaseFileTransfer();
     const loopback_bind = std.mem.eql(u8, server.config.bind_host, "127.0.0.1") or std.mem.eql(u8, server.config.bind_host, "::1");
     const peer = conn.peerIp();
     const loopback_peer = std.mem.eql(u8, peer, "127.0.0.1") or std.mem.eql(u8, peer, "::1");
@@ -573,6 +603,16 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.startsWith(u8, p, snapshot_path ++ "/") and std.mem.eql(u8, req.method, "DELETE"))
         return handleSnapshotRevoke(server, conn, arena, req, p[(snapshot_path.len + 1)..]);
     if (std.mem.eql(u8, p, "/webmail/public/snapshot") and std.mem.eql(u8, req.method, "POST")) return handleSnapshotView(server, conn, arena, req);
+    if (std.mem.eql(u8, p, file_links.path)) {
+        if (std.mem.eql(u8, req.method, "POST")) return handleFileLinkUpload(server, conn, arena, req);
+        if (std.mem.eql(u8, req.method, "GET")) return handleFileLinkList(server, conn, arena, req);
+    }
+    if (std.mem.startsWith(u8, p, file_links.path ++ "/") and std.mem.eql(u8, req.method, "DELETE"))
+        return handleFileLinkRevoke(server, conn, arena, req, p[(file_links.path.len + 1)..]);
+    if (std.mem.eql(u8, req.method, "POST")) {
+        if (std.mem.eql(u8, p, "/webmail/public/file-link")) return handleFileLinkPublic(server, conn, arena, req, false);
+        if (std.mem.eql(u8, p, "/webmail/public/file-link/download")) return handleFileLinkPublic(server, conn, arena, req, true);
+    }
     if (std.mem.startsWith(u8, p, "/webmail/api/uploads/") and std.mem.eql(u8, req.method, "DELETE")) return handleUploadDelete(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/bulk") and std.mem.eql(u8, req.method, "POST")) return handleBulk(server, conn, arena, req);
     if (std.mem.startsWith(u8, p, "/webmail/api/undo/") and std.mem.eql(u8, req.method, "POST")) return handleUndo(server, conn, arena, req);
@@ -689,6 +729,9 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
         }
         if (std.mem.eql(u8, p, "/snapshot")) {
             return serveAsset(conn, arena, snapshot_html, "text/html; charset=utf-8");
+        }
+        if (std.mem.eql(u8, p, "/file-link")) {
+            return serveAsset(conn, arena, file_link_html, "text/html; charset=utf-8");
         }
         if (std.mem.eql(u8, p, "/login")) {
             return serveAsset(conn, arena, login_html, "text/html; charset=utf-8");
@@ -1557,6 +1600,7 @@ fn handleClientConfig(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
     var limits = try server.service.limits(sess.username);
     limits.calendarAvailable = server.dav_store != null;
     limits.sharedInboxesAvailable = try shared_inbox.available(server.db, sess.username);
+    limits.maxFileLinkBytes = try file_links.uploadLimit(server.db, sess.username);
     if (store.get(arena, server.db, sess.username, "preferences", "settings")) |row| {
         const parsed = try std.json.parseFromSlice(struct { undoSendSeconds: u32 }, arena, row.payload, .{});
         defer parsed.deinit();
@@ -1862,6 +1906,69 @@ fn sharedInboxError(conn: *webmail_tls.Stream, a: std.mem.Allocator, err: anyerr
         error.InvalidSharedChange => sendError(conn, a, 400, "invalid_shared_change", "Check the requested assignment or status."),
         else => mapServiceError(conn, a, err),
     };
+}
+
+fn handleFileLinkUpload(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    if (!isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, a, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const filename = req.queryParam(a, "filename") orelse "";
+    const id = req.queryParam(a, "uploadId") orelse "";
+    const lifetime = std.fmt.parseInt(i64, req.queryParam(a, "lifetime") orelse "", 10) catch 0;
+    if (!file_links.validId(id) or !service_mod.validFilename(filename) or
+        !link_tokens.validLifetime(lifetime) or req.body.len == 0)
+        return sendError(conn, a, 400, "invalid_file_link", "Choose a nonempty file and a supported link expiry.");
+    clamav.requireAllowed(server.config.scanner, req.body) catch |err| return mapServiceError(conn, a, err);
+    const issued = file_links.create(server.db, sess.username, id, filename, req.body, lifetime, time_compat.timestamp()) catch |err| switch (err) {
+        error.InvalidLinkedFile => return sendError(conn, a, 413, "file_link_too_large", "The file exceeds the file-link upload limit."),
+        error.FileLinkStorageLimit => return sendError(conn, a, 507, "file_link_storage_full", "File-link storage is full. Revoke an active file link before uploading another."),
+        error.FileLinkAlreadyCreated => return sendError(conn, a, 409, "file_link_already_created", "Mail already saved this upload. Manage the link from Account settings."),
+        error.FileLinkOwnerUnavailable, error.HostedRecipientDisabled => return sendError(conn, a, 401, "unauthorized", "This mailbox is unavailable."),
+        else => return mapServiceError(conn, a, err),
+    };
+    return sendJson(conn, a, 201, try service_mod.json(a, .{ .file = issued.file, .token = @as([]const u8, &issued.token) }), null);
+}
+
+fn handleFileLinkList(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    var sess = (try requireSession(server, conn, a, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const links = try file_links.list(a, server.db, sess.username, time_compat.timestamp());
+    return sendJson(conn, a, 200, try service_mod.json(a, .{ .links = links }), null);
+}
+
+fn handleFileLinkRevoke(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request, id: []const u8) !void {
+    if (!isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, a, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    if (!file_links.validId(id) or !try file_links.revoke(server.db, sess.username, id))
+        return sendError(conn, a, 404, "file_link_unavailable", "This file link is unavailable.");
+    return sendJson(conn, a, 200, "{\"revoked\":true}", null);
+}
+
+fn handleFileLinkPublic(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request, download: bool) !void {
+    // Browsers can send an opaque Origin for the no-referrer download form.
+    // The download is read-only and still requires the file's bearer token.
+    const opaque_download = download and std.mem.eql(u8, req.header("Origin") orelse "", "null");
+    if (!opaque_download and !isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    const unavailable = "This file link is unavailable.";
+    if (req.body.len > 256) return sendError(conn, a, 404, "file_link_unavailable", unavailable);
+    const token = if (download) blk: {
+        // The native form sends exactly one URL-safe hexadecimal field.
+        const prefix = "token=";
+        if (!std.mem.startsWith(u8, req.body, prefix)) return sendError(conn, a, 404, "file_link_unavailable", unavailable);
+        break :blk req.body[prefix.len..];
+    } else blk: {
+        const body = std.json.parseFromSliceLeaky(struct { token: []const u8 }, a, req.body, .{}) catch
+            return sendError(conn, a, 404, "file_link_unavailable", unavailable);
+        break :blk body.token;
+    };
+    if (download and !server.claimFileTransfer())
+        return sendError(conn, a, 503, "file_transfers_busy", "File transfers are busy. Try again shortly.");
+    defer if (download) server.releaseFileTransfer();
+    const result = (try file_links.read(a, server.db, token, time_compat.timestamp(), download)) orelse
+        return sendError(conn, a, 404, "file_link_unavailable", unavailable);
+    if (!download) return sendJson(conn, a, 200, try service_mod.json(a, result.file), null);
+    return sendAttachment(conn, a, .{ .filename = result.file.filename, .content_type = "application/octet-stream", .size = result.data.len, .data = result.data });
 }
 
 fn handleUpload(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
@@ -3391,7 +3498,7 @@ fn handleSnapshotCreate(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a
     if (req.body.len > 2048) return sendError(conn, a, 400, "invalid_snapshot", "Choose up to ten messages.");
     const input = std.json.parseFromSliceLeaky(RequestBody, a, req.body, .{}) catch
         return sendError(conn, a, 400, "invalid_snapshot", "Choose up to ten messages.");
-    if (!preview and (!snapshots.validDigest(input.digest orelse "") or !snapshots.validLifetime(input.lifetime orelse 0)))
+    if (!preview and (!link_tokens.valid(input.digest orelse "") or !link_tokens.validLifetime(input.lifetime orelse 0)))
         return sendError(conn, a, 400, "invalid_snapshot", "Review the snapshot and choose an expiry before creating the link.");
     const prepared = snapshots.prepare(a, server.db, sess.username, input.references, server.service.junkFolder()) catch |err| switch (err) {
         error.InvalidSnapshotSelection => return sendError(conn, a, 400, "invalid_snapshot", "Choose one to ten distinct messages."),

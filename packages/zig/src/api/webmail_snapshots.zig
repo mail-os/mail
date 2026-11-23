@@ -4,14 +4,13 @@ const std = @import("std");
 const database = @import("../storage/database.zig");
 const message_refs = @import("../storage/message_refs.zig");
 const teams = @import("../storage/team_store.zig");
-const io = @import("../core/io_compat.zig");
+const link_tokens = @import("webmail_link_tokens.zig");
 const html_text = @import("../antispam/html_text.zig");
 const maildir = @import("webmail_maildir.zig");
 
 pub const max_messages = 10;
 pub const max_bytes = 128 * 1024;
 pub const max_links = 20;
-const hour = 3600;
 
 pub const Message = struct {
     subject: []const u8,
@@ -24,22 +23,6 @@ pub const Prepared = struct { messages: []Message, payload: []const u8, digest: 
 pub const Link = struct { id: i64, subject: []const u8, message_count: i64, expires_at: i64 };
 pub const Issued = struct { link: Link, token: [64]u8 };
 pub const View = struct { payload: []const u8, expires_at: i64 };
-
-fn digest(value: []const u8) [64]u8 {
-    var hash: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(value, &hash, .{});
-    return std.fmt.bytesToHex(hash, .lower);
-}
-
-pub fn validDigest(value: []const u8) bool {
-    if (value.len != 64) return false;
-    for (value) |byte| if (!std.ascii.isHex(byte) or std.ascii.isUpper(byte)) return false;
-    return true;
-}
-
-pub fn validLifetime(seconds: i64) bool {
-    return seconds == hour or seconds == 24 * hour or seconds == 7 * 24 * hour;
-}
 
 pub fn prepare(a: std.mem.Allocator, db: *database.Database, owner: []const u8, references: []const []const u8, junk_folder: []const u8) !Prepared {
     if (references.len == 0 or references.len > max_messages) return error.InvalidSnapshotSelection;
@@ -79,15 +62,13 @@ pub fn prepare(a: std.mem.Allocator, db: *database.Database, owner: []const u8, 
     }
     const payload = try std.json.Stringify.valueAlloc(a, messages, .{});
     if (payload.len > max_bytes) return error.SnapshotTooLarge;
-    return .{ .messages = messages, .payload = payload, .digest = digest(payload) };
+    return .{ .messages = messages, .payload = payload, .digest = link_tokens.digest(payload) };
 }
 
 pub fn create(db: *database.Database, owner: []const u8, prepared: Prepared, lifetime: i64, now: i64) !Issued {
-    if (!validLifetime(lifetime)) return error.InvalidSnapshotLifetime;
-    var random: [32]u8 = undefined;
-    io.randomBytes(&random);
-    const token = std.fmt.bytesToHex(random, .lower);
-    const token_hash = digest(&token);
+    if (!link_tokens.validLifetime(lifetime)) return error.InvalidSnapshotLifetime;
+    const token = link_tokens.new();
+    const token_hash = link_tokens.digest(&token);
     const expires_at = now + lifetime;
     var tx = try db.beginTransaction(.write);
     defer tx.deinit();
@@ -139,8 +120,8 @@ pub fn list(a: std.mem.Allocator, db: *database.Database, owner: []const u8, now
 }
 
 pub fn read(a: std.mem.Allocator, db: *database.Database, token: []const u8, now: i64) !?View {
-    if (!validDigest(token)) return null;
-    const hash = digest(token);
+    if (!link_tokens.valid(token)) return null;
+    const hash = link_tokens.digest(token);
     const stmt = try db.prepare(
         \\SELECT link.payload,link.expires_at FROM mail_snapshot_links AS link JOIN users ON users.id=link.user_id
         \\WHERE link.token_hash=?1 AND link.expires_at>?2 AND users.enabled=1

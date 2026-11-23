@@ -11,7 +11,8 @@
 </head>
 <body>
 <script client>
-import { openSnapshot, reloadSnapshot, snapshotDate } from '../functions/mail-snapshot'
+import { openSnapshot } from '../functions/mail-snapshot'
+import { reloadPublicLink, linkDate as snapshotDate } from '../functions/mail-public-links'
 import { tokenFromHash } from '../functions/recovery'
 const snapshot = state(null)
 const busy = state(true)
@@ -37,8 +38,8 @@ async function readSnapshot() {
   }
 }
 onMount(readSnapshot)
-useEventListener('hashchange', reloadSnapshot)
-useEventListener('pageshow', (event) => { if (event.persisted) reloadSnapshot() })
+useEventListener('hashchange', reloadPublicLink)
+useEventListener('pageshow', (event) => { if (event.persisted) reloadPublicLink() })
 onUnmounted(() => request?.abort())
 </script>
 <main class="wm-snapshot-page">

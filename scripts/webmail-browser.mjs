@@ -889,6 +889,96 @@ async function snapshotSharingJourney(desktop, phone) {
   await phone.setViewportSize({ width: 390, height: 844 })
 }
 
+async function fileLinkJourney(desktop, phone) {
+  const filename = 'Workshop proofs.bin'
+  const subject = 'Download the workshop proofs'
+  const contents = Buffer.alloc(128 * 1024, 0x9b)
+  contents.write('Disposable file-link fixture')
+  await desktop.goto(url + '/')
+  await button(desktop, 'Compose').click()
+  const desktopCompose = desktop.getByRole('dialog', { name: 'Compose message' })
+  await button(desktopCompose, 'Add file link').click()
+  const desktopPanel = desktopCompose.getByRole('region', { name: 'Add a file link' })
+  await verifyControlRow(desktopPanel.locator('.wm-file-link-controls'), 'input, select, button', 36)
+  await desktopPanel.screenshot({ path: join(output, 'desktop-compose-file-link.png'), animations: 'disabled' })
+  await button(desktopCompose, 'Close composer').click()
+  await desktopCompose.waitFor({ state: 'hidden' })
+
+  await phone.setViewportSize({ width: 320, height: 844 })
+  await phone.goto(url + '/')
+  await button(phone, 'Compose').click()
+  const compose = phone.getByRole('dialog', { name: 'Compose message' })
+  await button(compose, 'Add file link').click()
+  const panel = compose.getByRole('region', { name: 'Add a file link' })
+  const picker = panel.getByLabel('Choose file')
+  await picker.setInputFiles({ name: filename, mimeType: 'application/octet-stream', buffer: contents })
+  assert.equal(await picker.evaluate(input => input.files[0]?.name), filename)
+  await panel.getByLabel('Link expires in').selectOption('3600')
+  await verifyControlRow(panel.locator('.wm-file-link-controls'), 'input, select, button', 44, false)
+  await fitsViewport(phone)
+  await compose.locator('.wm-composer').evaluate(form => {
+    const panel = form.querySelector('#compose-file-link').getBoundingClientRect()
+    const header = form.querySelector('.wm-composer-head').getBoundingClientRect()
+    const footer = form.querySelector('.wm-composer-foot').getBoundingClientRect()
+    if (panel.top < header.bottom || panel.bottom > footer.top) throw new Error('File link controls should fit between the composer header and footer')
+  })
+  await panel.screenshot({ path: join(output, 'phone-compose-file-link.png'), animations: 'disabled' })
+  const to = compose.getByRole('combobox', { name: 'To', exact: true })
+  await to.fill(sender)
+  await to.press('Enter')
+  await compose.getByLabel('Subject', { exact: true }).fill(subject)
+  await compose.getByLabel('Message body').fill('Here are the proofs for the workshop.')
+  await button(panel, 'Upload and insert link').click()
+  await compose.getByText('File link inserted.', { exact: true }).waitFor()
+  const draftText = await compose.getByLabel('Message body').inputValue()
+  assert(draftText.includes(filename))
+  const href = draftText.split('\n').find(line => line.startsWith(url + '/file-link#token='))
+  assert.match(new URL(href).hash, /^#token=[a-f0-9]{64}$/)
+  assert.equal(await compose.locator('.wm-compose-attachments li').count(), 0)
+  await compose.getByLabel('Undo Send delay').selectOption('0')
+  await button(compose, 'Send').click()
+  await compose.waitFor({ state: 'hidden' })
+
+  const recipient = await signIn({ account: sender, initialSubject: subject })
+  try {
+    await button(recipient, new RegExp(subject)).click()
+    await heading(recipient, subject).waitFor()
+    const delivered = recipient.getByRole('link', { name: 'Open shared file', exact: true })
+    await delivered.waitFor()
+    assert.equal(await delivered.getAttribute('href'), href)
+    assert.equal(await recipient.getByRole('link', { name: filename, exact: true }).count(), 0)
+  }
+  finally { await recipient.context().close() }
+
+  const unauthenticated = await browser.newContext({ viewport: { width: 320, height: 844 }, colorScheme: 'dark', ignoreHTTPSErrors: true })
+  try {
+    const viewer = await unauthenticated.newPage()
+    viewer.setDefaultTimeout(12_000)
+    observePage(viewer)
+    await viewer.goto(href)
+    await heading(viewer, filename).waitFor()
+    await fitsViewport(viewer)
+    await screenshot(viewer, 'phone-file-link-viewer')
+    const [download] = await Promise.all([viewer.waitForEvent('download'), button(viewer, 'Download file').click()])
+    assert.equal(download.suggestedFilename(), filename)
+    assert.deepEqual(await readFile(await download.path()), contents)
+    assert.deepEqual(await unauthenticated.cookies(), [])
+
+    await button(desktop, 'Account').click()
+    const settings = desktop.getByRole('dialog', { name: 'Account settings' })
+    await button(settings, 'Manage file links').click()
+    await button(settings, `Revoke file link for ${filename}`).click()
+    await button(settings.getByRole('group', { name: 'Confirm file link revocation' }), 'Revoke file link').click()
+    await settings.getByText('File link revoked.', { exact: true }).waitFor()
+    await viewer.reload()
+    await viewer.getByText(/This file link is unavailable/).waitFor()
+    assert.equal(await button(viewer, 'Download file').count(), 0)
+    await button(settings, 'Close').click()
+  }
+  finally { await unauthenticated.close() }
+  await phone.setViewportSize({ width: 390, height: 844 })
+}
+
 async function freeTimeJourney(page, phone = false) {
   await page.goto(`${url}/calendar?day=${day}`)
   await button(page, 'Find free time').click()
@@ -1495,6 +1585,7 @@ try {
   await calendarTasksJourney(phone, true)
   await calendarToolsJourney(desktop, phone)
   await snapshotSharingJourney(desktop, phone)
+  await fileLinkJourney(desktop, phone)
   await navigationRequestsJourney(desktop)
   assert.deepEqual(errors, [], 'Browser pages raised uncaught errors')
   process.stdout.write(`${engine} passed the desktop and phone webmail journeys.\n`)

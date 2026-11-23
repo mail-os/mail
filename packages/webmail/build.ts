@@ -10,7 +10,7 @@ export function stylesheetUrl(styles: Uint8Array): string {
   return `/styles.css?v=${hash}`
 }
 
-export const webmailPages = ['index', 'login', 'recover', 'status', 'calendar', 'shared', 'snapshot'] as const
+export const webmailPages = ['index', 'login', 'recover', 'status', 'calendar', 'shared', 'snapshot', 'file-link'] as const
 
 export async function buildWebmail(): Promise<void> {
   const root = import.meta.dir

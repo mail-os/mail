@@ -148,4 +148,4 @@ export interface OutboxPage { items: OutboxSummary[], counts: OutboxCounts, next
 export type BulkAction = 'move' | 'trash' | 'read' | 'unread' | 'flag' | 'unflag' | 'purge' | 'junk' | 'not_junk'
 export interface ActionResult extends MessageRef { ok: boolean, new_uid: number | null, new_folder: string | null, error_code: string | null }
 export interface BulkResult { ok: boolean, results: ActionResult[], undoId: string | null, expiresAt: number | null }
-export interface MailLimits { maxFileBytes: number, maxTotalBytes: number, maxCount: number, maxMessageBytes: number, undoSendSeconds: number, calendarAvailable?: boolean, sharedInboxesAvailable?: boolean, junkFolder?: string }
+export interface MailLimits { maxFileBytes: number, maxTotalBytes: number, maxCount: number, maxMessageBytes: number, maxFileLinkBytes?: number, undoSendSeconds: number, calendarAvailable?: boolean, sharedInboxesAvailable?: boolean, junkFolder?: string }

@@ -126,6 +126,7 @@ pub const Limits = struct {
     maxTotalBytes: usize,
     maxCount: usize,
     maxMessageBytes: usize,
+    maxFileLinkBytes: usize = 0,
     undoSendSeconds: u32,
     calendarAvailable: bool = false,
     sharedInboxesAvailable: bool = false,

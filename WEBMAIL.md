@@ -108,6 +108,13 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
 - Attachments upload as binary data with progress, retry, removal and drag/drop.
   Account-scoped staging IDs survive draft recovery and make upload retries
   idempotent. Downloaded attachments retain their original bytes.
+- In Compose, **Add file link** uploads a file and inserts its download link
+  into the message. Choose one hour, 24 hours, or seven days. The expiry starts
+  when the upload completes. The recipient can download the original bytes
+  without a Mail account. File links use download-only pages. Use **Account →
+  File links** to revoke a link and release its storage. Each file can be up to
+  24 MiB. A mailbox can hold up to 20 active file links totaling 96 MiB, subject
+  to its hosted mailbox quota. A configured scanner checks file-link uploads.
 - Undo Send holds the message on the server for a configurable interval. It works
   even if the browser closes; cancellation is available before dispatch starts.
   Outbox records delivery results. After a restart, the delivery journal restores
@@ -694,6 +701,18 @@ revokes existing webmail sessions.
   to `POST /webmail/public/snapshot`. It sends no session cookie and receives
   `{messages, expires_at}` with caching disabled. A malformed, expired,
   revoked, or suspended mailbox’s token returns the same `404` response.
+- `POST /webmail/api/file-links?filename=…&uploadId=…&lifetime=…` accepts binary
+  bytes from a signed-in owner. `uploadId` is 32 lowercase hex characters and
+  `lifetime` uses the same values as snapshot links. It returns `{file, token}`
+  once. Reusing the same upload ID returns `409` without storing another file.
+  `GET /webmail/api/file-links` lists active metadata without bearer tokens;
+  `DELETE /webmail/api/file-links/{id}` revokes the file. A full hosted mailbox
+  or full file-link budget returns `507`.
+- `/file-link#token=…` reads filename, size, and expiry from
+  `POST /webmail/public/file-link` with JSON `{token}`. The download form submits
+  the token in the body to `POST /webmail/public/file-link/download`. Files
+  always use `Content-Disposition: attachment`, `application/octet-stream`,
+  `nosniff`, and `no-store`. Each token grants access to one active file.
 - The [calendar API](#calendar-api) uses the same store as CalDAV. Recurring
   event summaries include their rules as candidates for occurrence expansion.
   The endpoints report 503 when DAV is disabled and 404 for a missing or

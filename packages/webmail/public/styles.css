@@ -896,10 +896,22 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-snapshot-header { display: flex; align-items: center; gap: 10px; }
 .wm-snapshot-header h1 { margin: 0; font-size: clamp(20px, 4vw, 27px); font-weight: 680; }
 .wm-snapshot-header p { margin: 3px 0 0; color: var(--muted); font-size: 13px; }
+.wm-compose-file-link { display: grid; gap: 8px; margin: 0 14px 8px; padding: 10px; border: 1px solid var(--border); border-radius: var(--control-radius); background: var(--toolbar); }
+.wm-compose-file-link > p { margin: 0; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.wm-compose-file-link > .wm-composer-error { color: var(--danger); }
+.wm-file-link-controls label:first-child { flex: 1 1 11rem; }
+.wm-file-link-controls input[type=file] { padding-block: 4px; }
+.wm-file-link-controls input::file-selector-button { min-block-size: calc(var(--control-height) - 10px); margin-inline-end: 8px; border: 0; border-radius: 5px; background: var(--surface); color: var(--text); font: inherit; }
+.wm-read-file-links { display: flex; flex-wrap: wrap; gap: 6px; margin-block: 8px; }
+.wm-read-file-links a { text-decoration: none; }
+.wm-file-link-settings #account-file-links { display: grid; gap: 8px; }
+.wm-file-link-settings .wm-action { width: auto; margin: 0; background: var(--panel); border: 1px solid var(--control-border); color: var(--text); }
+.wm-file-link-settings .wm-action--danger { color: var(--danger); }
 @media (max-width: 460px) {
   .wm-snapshot-panel { padding: 12px; }
   .wm-snapshot-form label { flex: 1 1 100%; }
   .wm-snapshot-form > button { width: 100%; justify-content: center; }
+  .wm-file-link-controls label:first-child { flex-basis: 100%; }
 }
 .wm-original-subject { display: flex; flex-wrap: wrap; gap: 3px 8px; margin: 4px 0 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .wm-original-subject > :first-child { font-weight: 650; }

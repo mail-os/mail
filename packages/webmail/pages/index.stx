@@ -15,8 +15,7 @@ import { useWebmail } from '../functions/use-webmail'
 import { useServiceHealth } from '../functions/use-service-health'
 import { reminderDayLink, useCalendarReminders } from '../functions/use-calendar-reminders'
 import { vacationStatus } from '../functions/use-vacation-settings'
-import { snapshotDate } from '../functions/mail-snapshot'
-import { snapshotLifetimes } from '../functions/use-message-snapshots'
+import { linkDate as snapshotDate, linkLifetimes } from '../functions/mail-public-links'
 const health = useServiceHealth()
 useInterval(health.refresh, 30000, { whileVisible: true })
 useInterval(health.tick, 1000, { whileVisible: true })
@@ -27,6 +26,7 @@ const selectingMessages = state(false)
 const foldersToggle = useRef('foldersToggle')
 const snapshotDialog = useRef('snapshotDialog')
 const snapshotUrlField = useRef('snapshotUrlField')
+const composerFileLink = useRef('composerFileLink')
 function closeFolders(restoreFocus = false) {
   if (!foldersExpanded()) return
   foldersExpanded.set(false)
@@ -93,6 +93,9 @@ const {
   snapshotMode, snapshotBusy, snapshotError, snapshotNotice, snapshotLifetime, snapshotPreview, snapshotIssued, snapshotLinks,
   snapshotRevoke, snapshotCanRefresh, refreshSnapshotPreview, createSnapshot, manageSnapshots, revokeSnapshot, copySnapshotUrl,
   closeSnapshots, canShareSnapshot, shareMessageSnapshot, shareSelectedSnapshot,
+  messageFileLinks, fileLinkOpen, fileLinkFile, fileLinkLifetime, fileLinkUploading, fileLinkError, fileLinkNotice,
+  toggleFileLink, selectFileLink, insertFileLink, clearFileLinkComposer, fileLinksOpen, fileLinks, fileLinksBusy,
+  fileLinksError, fileLinksNotice, revokingFileLink, manageFileLinks, revokeFileLink, closeFileLinkManager,
   undoLastAction, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments,
   saveSendPreference, send, confirmPendingSend, showOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword,
   showConfirmation, confirmAction, saveDraftCopy, resume, tick, preventUnload,
@@ -127,6 +130,14 @@ function closeSnapshotDialog() {
 async function publishSnapshot() {
   await createSnapshot()
   if (snapshotIssued()) nextTick(() => snapshotUrlField.current?.focus())
+}
+function showComposerFileLink() {
+  toggleFileLink()
+  if (fileLinkOpen()) nextTick(() => composerFileLink.current?.scrollIntoView({ block: 'center' }))
+}
+function chooseComposerFileLink(event) {
+  selectFileLink(event)
+  nextTick(() => composerFileLink.current?.scrollIntoView({ block: 'center' }))
 }
 const categoryNames = ['Newsletters', 'Receipts']
 const selectionMode = derived(() => selectingMessages() || selectedCount() > 0)
@@ -519,6 +530,9 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
             <iframe class="wm-read-html" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer" title="Email content" :srcdoc="formattedReader.source"></iframe>
           </template>
           <pre :if="!receiptCompact && !selected?.calendar_only && (!selected?.html || !showHtml)" class="wm-read-text" :text="selected?.text || 'No plain-text version is available.'"></pre>
+          <div :if="messageFileLinks.length" class="wm-read-file-links" role="group" aria-label="Shared files in this message">
+            <a :for="(url, index) in messageFileLinks" :key="url" class="wm-action" :href="url" target="_blank" rel="noopener noreferrer"><span class="mail-icon" data-icon="download" aria-hidden="true"></span><span :text="messageFileLinks.length === 1 ? 'Open shared file' : 'Open shared file ' + (index + 1)"></span></a>
+          </div>
           <details :if="selected?.calendar_only && selected?.text" class="wm-invitation-source">
             <summary>Show invitation source</summary>
             <pre class="wm-read-text" :text="selected.text"></pre>
@@ -606,7 +620,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
 </div>
 <dialog :if="composing" ref="composerDialog" class="wm-modal" aria-label="Compose message" @cancel="cancelComposer($event)">
   <form class="wm-composer" @submit.prevent="send()">
-    <header class="wm-composer-head"><span class="wm-composer-title"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span><span :text="title"></span></span><button type="button" class="wm-composer-close" @click="closeComposer()" :disabled="sending || savingDraft" aria-label="Close composer" title="Close composer"><span class="mail-icon" data-icon="close" aria-hidden="true"></span></button></header>
+    <header class="wm-composer-head"><span class="wm-composer-title"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span><span :text="title"></span></span><button type="button" class="wm-composer-close" @click="closeComposer()" :disabled="sending || savingDraft || fileLinkUploading" aria-label="Close composer" title="Close composer"><span class="mail-icon" data-icon="close" aria-hidden="true"></span></button></header>
     <div class="wm-composer-fields">
       <div :if="sharedReply || senderIdentities?.length || senderId" class="wm-recipient-field wm-from-field">
         <label for="compose-from">From</label>
@@ -653,7 +667,23 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
     <label :if="replyContext?.reference" class="wm-reply-clear"><input type="checkbox" x-model="clearFollowUp" :disabled="sending || sendUncertain">Clear Follow-up after successful delivery</label>
     <div class="wm-dropzone" :class="{ 'wm-dropzone--active': dragging }" @dragover.prevent="dragging.set(true)" @dragleave="dragging.set(false)" @drop.prevent="dropAttachments($event)">
       <label class="wm-action"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span>Add attachments<input ref="fileInput" class="wm-file-input" type="file" multiple aria-label="Add attachments" @change="attachFiles()" :disabled="sending || attachmentUploading || limits.maxCount === 0"></label><span>or drop files here</span><small :text="readableBytes(attachmentBytes()) + ' used · ' + readableBytes(attachmentRemaining()) + ' remaining'"></small>
+      <button :if="limits.maxFileLinkBytes" type="button" class="wm-action" @click="showComposerFileLink()" :aria-expanded="fileLinkOpen" aria-controls="compose-file-link" :disabled="sending || sendUncertain || fileLinkUploading"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Add file link</button>
     </div>
+    <section :if="fileLinkOpen" id="compose-file-link" ref="composerFileLink" class="wm-compose-file-link" aria-label="Add a file link">
+      <p>Anyone with the link can download the file. The expiry starts when you upload it.</p>
+      <div class="wm-snapshot-form wm-file-link-controls">
+        <label>Choose file<input type="file" @change="chooseComposerFileLink($event)" :disabled="fileLinkUploading"></label>
+        <label>Link expires in<select x-model="fileLinkLifetime" :disabled="fileLinkUploading">
+          <option :for="lifetime in linkLifetimes" :key="lifetime.seconds" :value="String(lifetime.seconds)" :text="lifetime.label"></option>
+        </select></label>
+        <button type="button" class="wm-action wm-snapshot-primary" :disabled="!fileLinkFile || fileLinkUploading || sending || sendUncertain" @click="insertFileLink()" :text="fileLinkUploading ? 'Uploading…' : 'Upload and insert link'"></button>
+        <button :if="fileLinkUploading" type="button" class="wm-action" @click="clearFileLinkComposer()">Cancel upload</button>
+      </div>
+      <p :if="fileLinkFile" :text="readableBytes(fileLinkFile.size) + ' selected'"></p>
+      <p :if="!fileLinkFile" :text="'Up to ' + readableBytes(limits.maxFileLinkBytes) + ' per file.'"></p>
+      <p :if="fileLinkError" class="wm-composer-error" role="alert" :text="fileLinkError"></p>
+    </section>
+    <p :if="fileLinkNotice" class="wm-draft-status" role="status" :text="fileLinkNotice"></p>
     <ul :if="attachments.length" class="wm-compose-attachments"><li :for="attachment in attachments"><span class="mail-icon" data-icon="document" aria-hidden="true"></span><div><span :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></span><progress :if="attachment.status === 'uploading' || attachment.status === 'loading'" max="100" :value="attachment.status === 'loading' ? undefined : attachment.progress" :aria-label="(attachment.status === 'loading' ? 'Loading ' : 'Uploading ') + attachment.filename"></progress><small :if="attachment.status === 'uploading' || attachment.status === 'loading'" aria-hidden="true" :text="attachment.status === 'loading' ? 'Loading…' : attachment.progress === 100 ? 'Processing…' : attachment.progress + '%' "></small><p :if="attachment.error" class="wm-composer-error" :text="attachment.error"></p></div><button :if="attachment.status === 'failed'" type="button" class="wm-action" @click="retryAttachment(attachment.key)" :disabled="sending || sendUncertain">Retry upload</button><button type="button" class="wm-action" @click="removeAttachment(attachment.key)" :disabled="sending || sendUncertain" :aria-label="'Remove attachment ' + attachment.filename" title="Remove attachment"><span class="mail-icon" data-icon="close" aria-hidden="true"></span></button></li></ul>
     <p :if="composeError || draftError" class="wm-composer-error" role="alert" :text="composeError || draftError"></p><div :if="sendUncertain" class="wm-draft-conflict"><button type="button" class="wm-action" @click="confirmPendingSend()" :disabled="sending">Confirm send status</button></div><div :if="draftConflict" class="wm-draft-conflict"><button type="button" class="wm-action" @click="saveDraftCopy()">Save a copy</button><button type="button" class="wm-action" @click="showConfirmation('reload-draft')">Reload saved draft</button></div>
     <div class="wm-draft-status" role="status" aria-live="polite" aria-atomic="true" :text="saveStatus"></div>
@@ -664,10 +694,10 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         <small id="composeTimeZone" :text="scheduleZone"></small>
         <button type="button" class="wm-action" @click="scheduleOpen.set(false)" :disabled="sending || sendUncertain">Send now instead</button>
       </div>
-      <button class="wm-send-btn" type="submit" :disabled="sending || sendUncertain || savingDraft || attachmentPending || draftConflict || authExpired"><span class="mail-icon" :data-icon="scheduleOpen ? 'clock' : 'send'" aria-hidden="true"></span><span :text="sending ? 'Queuing…' : scheduleOpen ? 'Schedule send' : 'Send'"></span></button>
+      <button class="wm-send-btn" type="submit" :disabled="sending || sendUncertain || savingDraft || attachmentPending || fileLinkUploading || draftConflict || authExpired"><span class="mail-icon" :data-icon="scheduleOpen ? 'clock' : 'send'" aria-hidden="true"></span><span :text="sending ? 'Queuing…' : scheduleOpen ? 'Schedule send' : 'Send'"></span></button>
       <button :if="!scheduleOpen" class="wm-action" type="button" @click="chooseSendTime()" :disabled="sending || sendUncertain"><span class="mail-icon" data-icon="clock" aria-hidden="true"></span>Send later</button>
-      <button class="wm-action" type="button" @click="saveDraft()" :disabled="sending || savingDraft || attachmentPending"><span class="mail-icon" data-icon="document" aria-hidden="true"></span><span :text="savingDraft ? 'Saving…' : 'Save draft'"></span></button>
-      <button class="wm-action wm-action--danger" type="button" @click="showConfirmation('discard')" :disabled="sending || savingDraft"><span class="mail-icon" data-icon="trash" aria-hidden="true"></span>Discard</button>
+      <button class="wm-action" type="button" @click="saveDraft()" :disabled="sending || savingDraft || attachmentPending || fileLinkUploading"><span class="mail-icon" data-icon="document" aria-hidden="true"></span><span :text="savingDraft ? 'Saving…' : 'Save draft'"></span></button>
+      <button class="wm-action wm-action--danger" type="button" @click="showConfirmation('discard')" :disabled="sending || savingDraft || fileLinkUploading"><span class="mail-icon" data-icon="trash" aria-hidden="true"></span>Discard</button>
       <label :if="!scheduleOpen" class="wm-send-delay"><span class="mail-icon" data-icon="clock" aria-hidden="true"></span>Undo Send<select aria-label="Undo Send delay" x-model.number="sendDelay" @change="saveSendPreference()" :disabled="sending || sendUncertain"><option :for="value in sendDelayOptions" :value="value" :text="value === 0 ? 'Off' : value + ' seconds'"></option></select></label>
     </footer>
   </form>
@@ -686,6 +716,27 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
   <h2 id="snapshotSettingsHeading"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Shared links</h2>
   <p class="login-sub">Review or revoke the snapshot links you’ve created.</p>
   <button type="button" class="wm-action" aria-haspopup="dialog" @click="openSnapshotManager()">Manage shared links</button>
+</section>
+<section class="login-recovery wm-file-link-settings" aria-labelledby="fileLinkSettingsHeading">
+  <h2 id="fileLinkSettingsHeading"><span class="mail-icon" data-icon="document" aria-hidden="true"></span>File links</h2>
+  <button type="button" class="wm-action" :aria-expanded="fileLinksOpen" aria-controls="account-file-links" @click="fileLinksOpen ? closeFileLinkManager() : manageFileLinks()" :disabled="fileLinksBusy">Manage file links</button>
+  <div :if="fileLinksOpen" id="account-file-links">
+    <p :if="fileLinksBusy && !fileLinks.length" role="status" class="login-sub">Loading file links…</p>
+    <p :if="fileLinksError" class="login-error" role="alert" :text="fileLinksError"></p>
+    <p :if="fileLinksNotice" class="login-sub" role="status" :text="fileLinksNotice"></p>
+    <p :if="!fileLinksBusy && !fileLinks.length && !fileLinksError" class="login-sub">You have no active file links.</p>
+    <ul :if="fileLinks.length" class="wm-snapshot-links" aria-label="Active file links">
+      <li :for="link in fileLinks" :key="link.id">
+        <div><strong :text="link.filename"></strong><p class="wm-snapshot-muted" :text="readableBytes(link.size) + ' · Expires ' + snapshotDate(link.expires_at)"></p></div>
+        <button class="wm-action wm-action--danger" type="button" :disabled="fileLinksBusy || revokingFileLink" @click="revokingFileLink.set(link)" :aria-label="'Revoke file link for ' + link.filename">Revoke</button>
+      </li>
+    </ul>
+    <div :if="revokingFileLink" class="wm-snapshot-confirm" role="group" aria-label="Confirm file link revocation">
+      <p :text="'Revoke the download link for ' + revokingFileLink.filename + '?'"></p>
+      <button type="button" class="wm-action wm-action--danger" @click="revokeFileLink()" :disabled="fileLinksBusy">Revoke file link</button>
+      <button type="button" class="wm-action" @click="revokingFileLink.set(null)" :disabled="fileLinksBusy">Cancel</button>
+    </div>
+  </div>
 </section>
 <form class="login-recovery" @submit.prevent="changePassword()"><h2><span class="mail-icon" data-icon="shield" aria-hidden="true"></span>Change password</h2><p class="login-sub">Updates your webmail, SMTP and IMAP credentials.</p><label for="currentPassword">Current password</label><input id="currentPassword" type="password" x-model="currentPassword" autocomplete="current-password" required><label for="newPassword">New password</label><input id="newPassword" type="password" x-model="newPassword" autocomplete="new-password" minlength="12" required><label for="confirmPassword">Confirm password</label><input id="confirmPassword" type="password" x-model="confirmPassword" autocomplete="new-password" minlength="12" required><p :if="passwordError" role="alert" class="login-error" :text="passwordError"></p><button type="submit" :disabled="savingPassword" :text="savingPassword ? 'Saving…' : 'Change password'"></button></form>
 <form class="login-recovery" aria-labelledby="recoveryHeading" @submit.prevent="saveRecovery()"><h2 id="recoveryHeading"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span>Recovery address</h2><p class="login-sub" :if="recoveryLoading">Loading…</p><p class="login-sub" :if="!recoveryLoading && recoveryAddress">Password reset links go to <strong :text="recoveryAddress"></strong><span :if="recoverySetBy === 'operator'"> (set by your mail administrator)</span>.</p><p class="login-sub" :if="!recoveryLoading && !recoveryAddress">None set. Without one, a forgotten password can only be reset by your mail administrator.</p><label for="recoveryInput">Recovery email</label><input id="recoveryInput" type="email" x-model.trim="recoveryInput" autocomplete="email" placeholder="you@another-provider.com"><label for="recoveryPassword">Current password</label><input id="recoveryPassword" type="password" x-model="recoveryPassword" autocomplete="current-password"><p :if="recoveryError" role="alert" class="login-error" :text="recoveryError"></p><p :if="recoveryNotice" role="status" class="login-sub" :text="recoveryNotice"></p><button type="submit" class="login-secondary" :disabled="savingRecovery || recoveryLoading" :text="savingRecovery ? 'Saving…' : 'Save recovery address'"></button></form>
@@ -874,7 +925,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       </div>
       <form :if="snapshotPreview" class="wm-snapshot-form" @submit.prevent="publishSnapshot()">
         <label>Link expires in<select x-model="snapshotLifetime" :disabled="snapshotBusy">
-          <option :for="lifetime in snapshotLifetimes" :key="lifetime.seconds" :value="String(lifetime.seconds)" :text="lifetime.label"></option>
+          <option :for="lifetime in linkLifetimes" :key="lifetime.seconds" :value="String(lifetime.seconds)" :text="lifetime.label"></option>
         </select></label>
         <button type="submit" class="wm-action wm-snapshot-primary" :disabled="snapshotBusy">Create link</button>
       </form>

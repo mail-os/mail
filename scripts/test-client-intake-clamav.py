@@ -65,6 +65,13 @@ def uploads(test, session, upload_id, data):
     return hosted.request(url, data, {**session, "Content-Type": "application/octet-stream"}, context=test.tls_context)
 
 
+def file_links(test, session, data):
+    url = test.webmail + "/webmail/api/file-links?" + urllib.parse.urlencode({
+        "filename": "intake.txt", "uploadId": secrets.token_hex(16), "lifetime": 3600,
+    })
+    return hosted.request(url, data, {**session, "Content-Type": "application/octet-stream"}, context=test.tls_context)
+
+
 def assert_empty_table(path, query):
     with sqlite3.connect(path) as db:
         assert db.execute(query).fetchone()[0] == 0
@@ -89,6 +96,8 @@ def check_verdicts(test, owner, sink, polluted, clean, upload_id):
     session = test.login(owner)
     assert uploads(test, session, upload_id, clamav.EICAR)[0] == 422
     assert_empty_table(test.directory / "smtp.db", "SELECT count(*) FROM webmail_uploads")
+    assert file_links(test, session, clamav.EICAR)[0] == 422
+    assert_empty_table(test.directory / "smtp.db", "SELECT count(*) FROM mail_file_links")
     attachment = {"filename": "intake.txt", "contentType": "application/octet-stream",
                   "data": base64.b64encode(clamav.EICAR).decode()}
     draft = {"attachments": [attachment], "text": "Suspect inline attachment"}
@@ -135,6 +144,7 @@ def check_outage(test, owner, clean, upload_id):
     assert hosted.eas_result(test.eas(owner, clean, legacy=True)) == 503
     session = test.login(owner)
     assert uploads(test, session, secrets.token_hex(16), CLEAN)[0] == 503
+    assert file_links(test, session, CLEAN)[0] == 503
     assert uploads(test, session, upload_id, CLEAN)[0] == 200
     for path, kind, good, _ in dav_payloads(owner):
         assert dav(test, owner, path, good, content_type=kind)[0] == 503

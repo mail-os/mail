@@ -22,6 +22,8 @@ import { usePrivateMail } from './use-private-mail'
 import { useAddressBook } from './use-address-book'
 import { useComposeLibrary } from './use-compose-library'
 import { useMessageSnapshots } from './use-message-snapshots'
+import { useFileLinks } from './use-file-links'
+import { linkedFilesInText } from './mail-public-links'
 
 interface Ref<T> { current: T | null }
 const categoryFolders = ['Newsletters', 'Receipts']
@@ -233,6 +235,7 @@ export function useWebmail(ports: WebmailPorts) {
     invalidateList()
     closeReader()
     snapshots.closeSnapshots()
+    fileSharing.closeFileLinkManager()
     contactBook.closeContacts()
     forwardingSettings.clearForwarding()
     vacationSettings.clearVacationSettings()
@@ -268,6 +271,8 @@ export function useWebmail(ports: WebmailPorts) {
   }
   const api = createMailApi(() => user()?.username, onAuthError, () => !destroyed)
   const snapshots = useMessageSnapshots(api)
+  const fileSharing = useFileLinks(api, () => limits().maxFileLinkBytes ?? 0)
+  const messageFileLinks = derived(() => linkedFilesInText(selected()?.text ?? ''))
   async function loadSenderIdentities(): Promise<void> {
     const request = ++senderRequest
     try {
@@ -333,8 +338,8 @@ export function useWebmail(ports: WebmailPorts) {
   function content() {
     return { ...recipientEditor.snapshot(), subject: subject(), text: body(), html: body() === initialText() ? draftHtml() : '', inReplyTo: inReplyTo(), references: references(), attachments: attachmentEditor.snapshot(), replyContext: replyContext(), clearFollowUp: clearFollowUp(), scheduleAt: selectedSchedule(), senderId: senderId() || null, sharedReply: sharedReply() }
   }
-  const draft = useDraftAutosave({ snapshot: content, hasContent: hasComposition, active: () => composing() && !sending(), blocked: () => attachmentEditor.attachmentPending() || authExpired(), save: payload => api<DraftAck>('/webmail/api/drafts', { method: 'POST', body: JSON.stringify(payload) }) })
-  const hasUnsavedChanges = derived(() => draft.dirty() || attachmentEditor.attachmentPending())
+  const draft = useDraftAutosave({ snapshot: content, hasContent: hasComposition, active: () => composing() && !sending(), blocked: () => attachmentEditor.attachmentPending() || fileSharing.fileLinkUploading() || authExpired(), save: payload => api<DraftAck>('/webmail/api/drafts', { method: 'POST', body: JSON.stringify(payload) }) })
+  const hasUnsavedChanges = derived(() => draft.dirty() || attachmentEditor.attachmentPending() || fileSharing.fileLinkUploading())
   const saveStatus = derived(() => {
     if (attachmentEditor.attachments().some(item => item.status === 'loading')) return 'Loading forwarded attachments…'
     if (attachmentEditor.attachmentUploading()) return 'Uploading attachments…'
@@ -1284,6 +1289,7 @@ export function useWebmail(ports: WebmailPorts) {
   function resetComposition(): void {
     batch(() => {
       composing.set(false)
+      fileSharing.clearFileLinkComposer()
       sharedReply.set(null)
       senderId.set('')
       senderError.set('')
@@ -1305,7 +1311,7 @@ export function useWebmail(ports: WebmailPorts) {
     ports.nextTick(() => { if (!ports.composer.current?.open) ports.composer.current?.showModal() })
   }
   async function closeComposer(): Promise<void> {
-    if (sending() || sendUncertain()) return
+    if (sending() || sendUncertain() || fileSharing.fileLinkUploading()) return
     try { if (draft.saving()) await draft.flush(); if (hasComposition()) await draft.flushAll(); composing.set(false); if (selected()?.folder === 'Drafts') closeReader(); await refresh(true) }
     catch (cause) { composeError.set(`Keep this window open: ${errorMessage(cause)}`) }
   }
@@ -1435,9 +1441,15 @@ export function useWebmail(ports: WebmailPorts) {
     }
   }
   async function saveDraft(): Promise<void> {
+    if (fileSharing.fileLinkUploading()) return
     composeError.set('')
     try { if (!hasComposition()) throw new Error('Write something before saving a draft.'); await draft.flushAll(); await refresh(true) }
     catch (cause) { composeError.set(errorMessage(cause)) }
+  }
+  async function insertFileLink(): Promise<void> {
+    if (!composing() || sending() || sendUncertain()) return
+    const link = await fileSharing.uploadFileLink()
+    if (link && composing() && !destroyed) body.update(current => current ? `${current}\n\n${link}\n` : `${link}\n`)
   }
   async function reloadSavedDraft(): Promise<void> {
     if (!draft.uid()) return
@@ -1473,7 +1485,7 @@ export function useWebmail(ports: WebmailPorts) {
     ports.nextTick(() => ports.composer.current?.querySelector<HTMLInputElement>('#composeSendTime')?.focus())
   }
   async function send(): Promise<void> {
-    if (sending() || sendUncertain() || attachmentEditor.attachmentPending()) return
+    if (sending() || sendUncertain() || attachmentEditor.attachmentPending() || fileSharing.fileLinkUploading()) return
     composeError.set('')
     senderError.set('')
     recipientEditor.commitAll()
@@ -1842,11 +1854,14 @@ export function useWebmail(ports: WebmailPorts) {
     privateMail.closePrivate()
     contactBook.closeContacts()
     snapshots.closeSnapshots()
+    fileSharing.clearFileLinkComposer()
+    fileSharing.closeFileLinkManager()
     selectionEffect()
   }
   return { user, folders, folder, messages, threads, expandedThreads, selected, loading, refreshing, listError, readerError, readerTarget, reading, readingLoading, mutating, error, notice, query, activeQuery, appliedSearchAll, filterLocation, filterSender, filterRecipient, filterFilename, libraryView, libraryFiles, indexProgress, filterAfter, filterBefore, filterStatus, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, formattedReader, remoteImagesAllowed, checked, checkedKeys, selectedCount, isJunkFolder, readerJunkAction, selectionJunkAction, allChecked, someChecked, undoAction, undoRemaining, readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts, pendingSend, sendRemaining, outbox, outboxCount, outboxCounts, outboxSection, outboxViews, outboxEmpty, outboxPageNumber, outboxNext, outboxLoading, outboxError, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, sharedReply, senderId, senderIdentities, missingSender, senderStatus, chooseSender, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...senderReview, ...notifications, ...privateMail, ...contactBook, showContacts, composeSavedCard, collectionView, collectionId, canOpenPrivate,
     createEventLink, canRespondToInvitation, respondToInvitation, rsvpBusy, rsvpError,
     ...snapshots, canShareSnapshot, shareMessageSnapshot, shareSelectedSnapshot,
+    ...fileSharing, messageFileLinks, insertFileLink,
     invitationCalendar, invitationCalendarBusy, invitationDestination, chooseInvitationCalendar, saveInvitationCalendar,
     showCollectionManager, closeCollectionManager, selectCollection, confirmCollectionDeletion, savePrivateLabel, setPrivateMembership, groupSelected, displaySubject, changeNotificationRule, ...recipientEditor, ...attachmentEditor, ...recoverySettings, ...forwardingSettings, ...vacationSettings, ...writing, snippetChoice, signatureChoice, insertSnippet, insertSignature, attentionViews, attentionView, followUpFocused, attentionSaving, attentionSchedule, attentionDate, attentionZone, dueReminders, replyContext, clearFollowUp, selectAttention, nextFollowUp, changeAttention, startAttentionSchedule, saveAttentionSchedule, deadlineLabel, categoryList, newsletterExpanded, readerExpanded, receiptFull, receiptCompact, receiptPreview, senderLabel, sortingSettings, sortingSaving, sortingError, toggleAutomaticSorting, placementText, categoryRule, categoryRuleSaving, saveCategoryRule, showSenderReview, openReviewMessage, reviewMessage, refresh, loadMessages, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread, toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, openAttachmentMessage, showAttachmentLibrary, retryReader, closeReader, nextUnread, readSelection, advanceBatch, triageAndNext, bulkAction, selectedAction, undoLastAction, showShortcuts, closeShortcuts, handleShortcut, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments, saveSendPreference, send, confirmPendingSend, showOutbox, refreshOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword, showConfirmation, confirmAction, saveDraftCopy: draft.saveCopy, mount, resume, tick, preventUnload, destroy, messageIdentity, messagePageSize, folderName, shortDate, fullDate, readableBytes, attachmentPath }
 }

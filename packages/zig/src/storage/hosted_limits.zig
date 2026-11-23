@@ -5,6 +5,7 @@ const db_mod = @import("database.zig");
 const fs = @import("../core/fs_compat.zig");
 const maildir_path = @import("../core/maildir_path.zig");
 const durable_maildir = @import("../core/durable_maildir.zig");
+const time = @import("../core/time_compat.zig");
 
 /// Call with the mailbox mutation lock held. Credit is the size of a file
 /// replaced in place, so saving a smaller draft works even at the limit.
@@ -17,7 +18,9 @@ pub fn checkStorage(db: *db_mod.Database, user: []const u8, bytes: u64, replaced
     const credit = if (replaced) |path| try fs.getFileSize(path) else 0;
     if (bytes <= credit) return;
     const reserved = try db.reservedDeliveryBytes(user);
-    const growth = std.math.add(u64, bytes - credit, reserved) catch return error.HostedStorageFull;
+    const linked = try db.linkedFileBytes(user, time.timestamp());
+    const committed = std.math.add(u64, reserved, linked) catch return error.HostedStorageFull;
+    const growth = std.math.add(u64, bytes - credit, committed) catch return error.HostedStorageFull;
     if (growth > limits.quota_bytes) return error.HostedStorageFull;
     _ = try countBytes(root, limits.quota_bytes - growth, 0);
 }
