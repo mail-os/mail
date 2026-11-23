@@ -97,6 +97,7 @@ async function verifyControlRow(container, selector, height, sameRow = true) {
       neutral,
       borderMatches: style.border === `1px solid ${border}`,
       radius: style.borderRadius,
+      fontSize: style.fontSize,
     }
   }), selector)
   assert(controls.length > 1, 'A control group must have multiple visible controls')
@@ -121,22 +122,62 @@ function verifyControlGaps(controls, gap) {
 
 async function verifyCalendarPeriod(page, label, height, stacked = false) {
   const group = page.getByRole('group', { name: 'Change date range' })
-  const controls = await verifyControlRow(page.locator('.calendar-view-toolbar'), '.calendar-period > *, .calendar-zone select', height, false)
+  const toolbar = page.locator('.calendar-view-toolbar')
+  const controls = await verifyControlRow(toolbar, '.calendar-period > *, .calendar-zone select', height, false)
   assert.equal(controls.length, 5)
   const row = controls.slice(0, stacked ? 3 : 4)
   for (const control of row) {
     assert(Math.abs(control.top - row[0].top) < 0.5, 'Date navigation controls should align')
   }
   verifyControlGaps(row, 6)
+  for (const arrow of [controls[0], controls[2]]) {
+    assert(Math.abs(arrow.right - arrow.left - height) < 0.5, 'Previous and next have square hit areas')
+  }
   const date = controls[3]
   assert(date.right - date.left >= 136, 'Jump to date leaves room for the native date and picker')
-  if (height === 36) assert(Math.abs(controls[4].top - date.top) < 0.5, 'The time zone picker aligns with the desktop date controls')
+  const views = await verifyControlRow(toolbar.getByRole('group', { name: 'Calendar view' }), 'button', height)
+  verifyControlGaps(views, 6)
+  assert([...controls, ...views].every(control => control.fontSize === date.fontSize), 'Toolbar fields and actions share a text size')
+  const crampedViews = await toolbar.locator('.calendar-view-modes button').evaluateAll(buttons => buttons.flatMap((button) => {
+    const box = button.getBoundingClientRect()
+    const range = document.createRange()
+    range.selectNodeContents(button)
+    const text = range.getBoundingClientRect()
+    return text.left - box.left < 5.5 || box.right - text.right < 5.5 ? [button.textContent] : []
+  }))
+  assert.deepEqual(crampedViews, [], 'View labels have clear space inside each border')
+  if ((page.viewportSize()?.width ?? 0) >= 1160) {
+    for (const control of [...views, controls[4]]) {
+      assert(Math.abs(control.top - date.top) < 0.5 && Math.abs(control.bottom - date.bottom) < 0.5,
+        'The view and time zone controls align with both edges of the date controls')
+    }
+  }
   if (stacked) {
     assert(Math.abs(date.top - row[0].bottom - 6) < 0.5, 'Jump to date has the same gap below date navigation')
     assert(Math.abs(date.left - row[0].left) < 0.5 && Math.abs(date.right - row[2].right) < 0.5, 'Jump to date spans the date navigation row')
   }
+  await fitsViewport(page)
+  if (!label) return
   await mkdir(output, { recursive: true })
   await group.screenshot({ path: join(output, `${label}-date-controls.png`), animations: 'disabled' })
+  await toolbar.screenshot({ path: join(output, `${label}-calendar-toolbar.png`), animations: 'disabled' })
+}
+
+async function verifyReaderToolbar(toolbar, height) {
+  const controls = await toolbar.locator('.wm-tool:visible, .wm-action:visible, select:visible').evaluateAll(elements =>
+    elements.map((element) => {
+      const { top, bottom, height } = element.getBoundingClientRect()
+      return { top, bottom, height, name: element.getAttribute('aria-label') || element.textContent.trim() }
+    }),
+  )
+  assert(controls.length >= 10)
+  for (const control of controls) {
+    assert(Math.abs(control.height - height) < 0.5, `${control.name} should be ${height}px tall`)
+    for (const other of controls) {
+      if (control.top < other.bottom - 0.5 && control.bottom > other.top + 0.5)
+        assert(Math.abs(control.top - other.top) < 0.5, `${control.name} and ${other.name} should align on their row`)
+    }
+  }
 }
 
 async function verifyAppearance(page, scheme) {
@@ -344,6 +385,7 @@ async function desktopJourney(page) {
   await destination.waitFor({ state: 'hidden' })
   await sorting.blur()
   const tools = page.getByRole('group', { name: 'Message actions', exact: true })
+  await verifyReaderToolbar(tools, 36)
   for (const name of ['Reply', 'Reply all', 'Forward', 'Archive message', 'Flag', 'Mark unread', 'Move this message', 'Trash']) {
     const control = button(tools, name)
     await control.waitFor()
@@ -365,7 +407,8 @@ async function desktopJourney(page) {
   await page.mouse.move(1410, 910)
   await screenshot(page, 'desktop-inbox-dark')
   await page.emulateMedia({ colorScheme: 'light' })
-  await button(tools, 'Archive message').press('Enter')
+  await move.getByLabel('Move destination').selectOption('Archive')
+  await button(move, 'Move this message').press('Enter')
   await page.getByText('Message moved to Archive.', { exact: true }).waitFor()
   await button(page, /Tuesday design handoff/).waitFor({ state: 'hidden' })
   await button(page, 'Undo last action').click()
@@ -406,6 +449,11 @@ async function desktopJourney(page) {
   await fitsViewport(page)
   await screenshot(page, 'desktop-calendar')
   await verifyCalendarPeriod(page, 'desktop-light', 36)
+  for (const width of [371, 490, 491, 860, 861, 1159, 1160]) {
+    await page.setViewportSize({ width, height: 940 })
+    await verifyCalendarPeriod(page, null, width > 860 ? 36 : 44)
+  }
+  await page.setViewportSize({ width: 1440, height: 940 })
   await page.emulateMedia({ colorScheme: 'dark' })
   await screenshot(page, 'desktop-calendar-dark')
   await verifyCalendarPeriod(page, 'desktop-dark', 36)
@@ -475,6 +523,7 @@ async function phoneJourney(page) {
   await page.setViewportSize({ width: 320, height: 844 })
   await fitsViewport(page)
   const actions = page.getByRole('group', { name: 'Message actions', exact: true })
+  await verifyReaderToolbar(actions, 44)
   await screenshot(page, 'phone-reader-narrow')
   assert((await actions.boundingBox()).height < 124, 'Reader actions fit into two rows on narrow phones')
   for (const name of ['Reply', 'Reply all', 'Forward', 'Archive message', 'Flag', 'Mark unread', 'Trash', 'Mark junk', 'Next unread', 'Move this message']) {
@@ -482,8 +531,10 @@ async function phoneJourney(page) {
     assert(control.width >= 44 && control.height >= 44, `${name} has a full-size touch target`)
   }
   const move = actions.getByRole('group', { name: 'Move message', exact: true })
-  const [, destination] = await verifyControlRow(move, 'select, button', 44)
+  const [destination, moveButton] = await verifyControlRow(move, 'select, button', 44)
+  verifyControlGaps([destination, moveButton], 6)
   assert(destination.right - destination.left >= 108, 'Move destination leaves room for the Archive label')
+  await verifySelectedOptionFits(move.getByLabel('Move destination'))
   await button(actions, 'Mark junk').waitFor()
   await page.setViewportSize({ width: 390, height: 540 })
   const reader = page.getByRole('region', { name: 'Message reader' })
