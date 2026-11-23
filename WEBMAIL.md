@@ -675,7 +675,7 @@ Review the plain text that will be visible, then select the team and enter the
 teammate's mailbox address. Enable attachment downloads only if you want to
 share the files shown in the preview.
 
-Both mailboxes must be active members of that team. **Shared conversations**
+Both mailboxes must be active members of that team. **Shared mail**
 shows the sender and recipient of each grant. Either participant can search
 its approved messages and add teammate comments. The owner can revoke access,
 and removing a member from the team removes their grants. A shared message
@@ -692,6 +692,19 @@ a generic notice. Mail checks access again when the browser claims the notice.
 Shared conversations show the original subject, sender, date, and plain text.
 Private notes and hidden envelope fields stay in the owner's mailbox.
 Teammate comments belong to the share and are visible to its two participants.
+
+Open one of **My collections** and choose **Share collection** to grant a
+teammate access to the messages explicitly added to that collection. The
+preview shows the latest entries. The grant includes earlier explicit entries
+and supports paging through the collection. In **Private tools → Organize**,
+use **Share this message in…** to add or remove a message. Replies and messages
+linked by your private conversation grouping require an explicit addition.
+
+Teammates can search the shared subject, sender, and plain-text previews,
+comment, and download eligible attachments when the owner enables downloads.
+Removing a message removes access to that message and its attachments.
+Renaming the collection updates its title for the teammate. Deleting it, team
+offboarding, or **View access → Revoke access** ends the grant.
 
 ## Self-hosted team administration
 

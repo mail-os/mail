@@ -2193,7 +2193,8 @@ fn teamError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: anyerror)
 }
 
 const ThreadShareInput = struct {
-    references: []const []const u8,
+    references: []const []const u8 = &.{},
+    collectionId: ?[]const u8 = null,
     downloads: bool = false,
     followReplies: bool = false,
     team: ?[]const u8 = null,
@@ -2220,6 +2221,25 @@ fn handleThreadShares(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: 
         if (!posting or req.body.len > 4096) return threadShareError(conn, a, error.InvalidThreadShare);
         const input = std.json.parseFromSliceLeaky(ThreadShareInput, a, req.body, .{}) catch
             return threadShareError(conn, a, error.InvalidThreadShare);
+        if (input.collectionId) |collection| {
+            if (input.references.len != 0 or input.followReplies) return threadShareError(conn, a, error.InvalidThreadShare);
+            if (preview) {
+                const prepared = team_threads.previewCollection(a, server.db, actor, collection, input.downloads, junk) catch |err|
+                    return threadShareError(conn, a, err);
+                return sendJson(conn, a, 200, try service_mod.json(a, .{
+                    .collection = prepared.collection,
+                    .messages = prepared.page.messages,
+                    .next = prepared.page.next,
+                    .digest = @as([]const u8, &prepared.digest),
+                    .followingAuthors = &[_][]const u8{},
+                }), null);
+            }
+            const team = input.team orelse return threadShareError(conn, a, error.InvalidThreadShare);
+            const grantee = input.grantee orelse return threadShareError(conn, a, error.InvalidThreadShare);
+            const grant = team_threads.createCollection(a, server.db, actor, team, grantee, collection, input.downloads, input.digest orelse "") catch |err|
+                return threadShareError(conn, a, err);
+            return sendJson(conn, a, 201, try service_mod.json(a, grant), null);
+        }
         const prepared = team_threads.prepare(a, server.db, actor, input.references, input.downloads, input.followReplies, junk) catch |err|
             return threadShareError(conn, a, err);
         if (preview)
@@ -2260,7 +2280,9 @@ fn handleThreadShares(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: 
         return threadShareError(conn, a, error.ThreadShareUnavailable);
     }
     if (reading) {
-        const result = team_threads.detail(a, server.db, actor, id, req.queryParam(a, "q") orelse "", junk) catch |err|
+        const before = if (req.queryParam(a, "before")) |cursor| std.fmt.parseInt(i64, cursor, 10) catch
+            return threadShareError(conn, a, error.InvalidThreadShare) else null;
+        const result = team_threads.detail(a, server.db, actor, id, req.queryParam(a, "q") orelse "", before, junk) catch |err|
             return threadShareError(conn, a, err);
         return sendJson(conn, a, 200, try service_mod.json(a, result), null);
     }
@@ -2273,9 +2295,11 @@ fn handleThreadShares(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: 
 
 fn threadShareError(conn: *webmail_tls.Stream, a: std.mem.Allocator, err: anyerror) !void {
     switch (err) {
-        error.ThreadShareUnavailable, maildir.MaildirError.MessageNotFound, error.FileNotFound => return sendError(conn, a, 404, "thread_share_unavailable", "This conversation or message is unavailable."),
+        error.ThreadShareUnavailable, maildir.MaildirError.MessageNotFound, error.FileNotFound => return sendError(conn, a, 404, "thread_share_unavailable", "This share or message is unavailable."),
         error.ThreadShareTooLarge => return sendError(conn, a, 413, "thread_share_too_large", "Share fewer or smaller messages."),
-        error.InvalidThreadShare => return sendError(conn, a, 400, "invalid_thread_share", "Check the selected messages, teammate, or comment."),
+        error.InvalidThreadShare => return sendError(conn, a, 400, "invalid_thread_share", "Check the share, teammate, or comment."),
+        error.ThreadShareChanged => return sendError(conn, a, 409, "thread_share_changed", "Review the current collection preview before sharing."),
+        error.CollectionAlreadyShared => return sendError(conn, a, 409, "collection_already_shared", "This teammate already has access in this team."),
         error.ThreadFollowUnavailable => return sendError(conn, a, 409, "thread_follow_unavailable", "To follow replies, select a conversation with a verified inbound sender and a message ID."),
         error.ThreadShareGrantUnavailable => return sendError(conn, a, 409, "thread_share_grant_unavailable", "Choose an active teammate or revoke a share before creating another."),
         error.ThreadShareCommentLimit => return sendError(conn, a, 409, "thread_share_comment_limit", "This conversation reached its comment limit."),
@@ -3556,6 +3580,7 @@ const PrivateChange = struct {
     label_revision: ?[]const u8 = null,
     collection: ?[]const u8 = null,
     included: ?bool = null,
+    shareCollectionMessage: bool = false,
 };
 
 fn privateError(conn: *webmail_tls.Stream, a: std.mem.Allocator, err: anyerror) !void {
@@ -3563,6 +3588,7 @@ fn privateError(conn: *webmail_tls.Stream, a: std.mem.Allocator, err: anyerror) 
         error.InvalidPrivateChange => sendError(conn, a, 400, "bad_request", "Invalid private conversation change"),
         error.InvalidClip => sendError(conn, a, 400, "bad_request", "Choose an excerpt from the message text"),
         error.CollectionChanged => sendError(conn, a, 409, "conflict", "Collection changed or name already exists"),
+        error.CollectionShareConfirmationRequired => sendError(conn, a, 409, "shared_collection_confirmation", "Reopen Private tools to confirm adding this message to the shared collection."),
         error.NotFound => sendError(conn, a, 404, "not_found", "Private item not found"),
         else => mapMaildirError(conn, a, err),
     };
@@ -3611,7 +3637,7 @@ fn applyPrivateChange(a: std.mem.Allocator, db: *database.Database, user: []cons
             const id = try privateID(change.collection);
             const included = change.included orelse return error.InvalidPrivateChange;
             if (included) try personal.remember(a, db, user, change.reference, current.natural_wire);
-            try personal.setMember(db, user, change.reference, id, included, current);
+            try personal.setMember(db, user, change.reference, id, included, change.shareCollectionMessage, current);
         },
     }
 }
@@ -3630,7 +3656,7 @@ fn privateMessage(a: std.mem.Allocator, db: *database.Database, user: []const u8
     }
     var length = @min(source.len, 12_288);
     while (length < source.len and source[length] & 0xc0 == 0x80) length -= 1;
-    return personal.tools(a, db, user, current, source[0..length]);
+    return personal.tools(a, db, user, reference, current, source[0..length]);
 }
 
 fn handlePrivateMessage(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
@@ -3674,7 +3700,7 @@ fn handlePrivateCollections(server: *WebmailHttpServer, conn: *webmail_tls.Strea
         defer doc.deinit();
         changePrivateCollection(server.db, sess.username, doc.value) catch |err| return privateError(conn, a, err);
     }
-    const items = try personal.listCollections(a, server.db, sess.username, "[]");
+    const items = try personal.listCollections(a, server.db, sess.username, "[]", null);
     return sendJson(conn, a, 200, try service_mod.json(a, .{ .items = items }), null);
 }
 

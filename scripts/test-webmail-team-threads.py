@@ -51,6 +51,107 @@ def send(fixture, mailbox, author, key, *, verified=True, parent=None, reference
         assert connection.send_message(msg, from_addr=identity or "unverified@example.test", to_addrs=[mailbox]) == {}
 
 
+def verify_collection(fixture, call, download, owner, peer, witness, outsider, own, other, third, foreign, rows, root):
+    collections = "private/collections"
+    collection, = call(own, collections, {"action": "create", "name": "Design collection"}, "POST")["items"]
+    collection_id = collection["id"]
+    settings = {"collectionId": collection_id, "downloads": True}
+
+    def change(row, included, *, confirm=False, status=200):
+        return call({**own, "If-Match": row["revision"]}, "private/message", {
+            "reference": row["reference"], "action": "collection", "collection": collection_id,
+            "included": included, "shareCollectionMessage": confirm,
+        }, "POST", status)
+
+    def preview(session=own, **changes):
+        return call(session, SHARES + "/preview", {**settings, **changes}, "POST")
+
+    def issue(review, **changes):
+        return {**settings, "digest": review["digest"], "team": "studio", "grantee": peer, **changes}
+
+    first = call(own, "messages/ref/" + rows["Design review"]["reference"])
+    change(first, True)
+    change(root, True)
+    send(fixture, owner, witness, "collection-unapproved", parent="root", verified=False)
+    private = call(own, "messages?collection=" + collection_id)
+    assert "Follow fixture collection-unapproved" in {msg["subject"] for msg in private["items"]}
+    review = preview()
+    assert {msg["subject"] for msg in review["messages"]} == {"Follow fixture root", "Design review"}
+    assert review["collection"]["name"] == collection["name"]
+    call(other, SHARES + "/preview", settings, "POST", 404)
+    call(own, SHARES + "/preview", {**settings, "followReplies": True}, "POST", 400)
+    call(own, SHARES, issue(review, grantee=outsider), "POST", 409)
+    call(own, SHARES, issue(review, downloads=False), "POST", 409)
+    renamed, = call(own, collections, {
+        "action": "rename", "id": collection_id, "revision": collection["revision"], "name": "Studio notes",
+    }, "POST")["items"]
+    call(own, SHARES, issue(review), "POST", 409)
+    review = preview()
+    grant = call(own, SHARES, issue(review), "POST", 201)
+    path = f"{SHARES}/{grant['id']}"
+    attachment = f"{path}/attachments/{first['reference']}/0"
+    assert grant["collectionId"] == collection_id and grant["subject"] == "Studio notes"
+    assert call(own, SHARES, issue(review), "POST", 409)["error"] == "collection_already_shared"
+    assert call(other, SHARES)["grants"] == [grant]
+    for denied in (third, foreign):
+        call(denied, path + "?q=cobalt", status=404)
+        call(denied, path + "/comments", {"text": "Private"}, "POST", 404)
+        download(denied, attachment, 404)
+    detail = call(other, path)
+    assert len(detail["messages"]) == 2
+    assert all(value not in str(detail) for value in ("hidden-recipient", "owner-only", "nested.eml", "collection-unapproved"))
+    assert call(other, path + "?q=COBALT")["messages"][0]["reference"] == first["reference"]
+    assert call(other, path + "?q=owner-only")["messages"] == []
+    assert download(other, attachment) == FILE
+    call(other, path + "/comments", {"text": "Published review"}, "POST", 201)
+    assert call(own, path)["comments"][0]["author"] == peer
+
+    later, = call(own, "messages?conversations=false&q=collection-unapproved")["items"]
+    change(later, True, status=409)
+    assert call(other, path + "?q=collection-unapproved")["messages"] == []
+    member = change(later, True, confirm=True)["collections"][0]
+    assert member["explicit"] and member["shared"]
+    change(root, False, confirm=True)
+    live = call(other, path)["messages"]
+    assert {msg["subject"] for msg in live} == {later["subject"], first["subject"]}
+    change(first, False, confirm=True)
+    download(other, attachment, 404)
+    change(first, True, confirm=True)
+
+    with fixture.imap(owner) as imap:
+        for index in range(21):
+            append(imap, owner, f"Collection page item {index:02d}", "Owner-curated addition.")
+    added = call(own, "messages?conversations=false&per_page=60&q=Collection+page+item")["items"]
+    for item in added:
+        change(item, True, confirm=True)
+    first_page = call(other, path)
+    assert len(first_page["messages"]) == 20 and first_page["next"]
+    last_page = call(other, path + f"?before={first_page['next']}")
+    assert last_page["next"] is None
+    references = {msg["reference"] for msg in first_page["messages"] + last_page["messages"]}
+    assert references == {first["reference"], later["reference"], *(item["reference"] for item in added)}
+    call(other, path + "?before=bad", status=400)
+
+    renamed_again, = call(own, collections, {
+        "action": "rename", "id": collection_id, "revision": renamed["revision"], "name": "Studio handoff",
+    }, "POST")["items"]
+    assert call(other, path)["grant"]["subject"] == "Studio handoff"
+    call(other, path, method="DELETE", status=404)
+    command(fixture, "team", "member", "studio", peer, "remove")
+    call(other, path, status=401)
+    other = fixture.login(peer)
+    call(other, path, status=404)
+    command(fixture, "team", "member", "studio", peer, "member")
+    call(other, path, status=404)
+    renewed = call(own, SHARES, issue(preview()), "POST", 201)
+    renewed_path = f"{SHARES}/{renewed['id']}"
+    assert call(other, renewed_path)["comments"] == []
+    call(own, collections, {"action": "delete", "id": collection_id, "revision": renamed_again["revision"]}, "POST")
+    assert call(other, SHARES) == {"grants": []}
+    call(other, renewed_path, status=404)
+    download(other, f"{renewed_path}/attachments/{first['reference']}/0", 404)
+
+
 def verify(fixture):
     def call(session, path, payload=None, method=None, status=200):
         return expect(fixture.api(session, path, payload, method), status)
@@ -211,6 +312,8 @@ def verify(fixture):
         assert call(other, fresh_path)["comments"] == []
         call(own, fresh_path, method="DELETE")
         call(other, fresh_path, status=404)
+        root = call(own, "messages/ref/" + root["reference"])
+        verify_collection(fixture, call, download, owner, peer, witness, outsider, own, other, third, foreign, rows, root)
 
 
 def main():
@@ -219,7 +322,7 @@ def main():
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="mail-team-threads-") as directory:
         verify(Fixture(args.binary.resolve(strict=True), Path(directory), staging=True))
-    print("Verified team conversation previews, identity, searching, attachments, comments, reply following, notifications, and revocation.")
+    print("Verified team conversations, followed replies, live collections, previews, searching, attachments, comments, notifications, and revocation.")
 
 
 if __name__ == "__main__":

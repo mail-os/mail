@@ -1121,6 +1121,87 @@ async function snapshotSharingJourney(desktop, phone) {
   await phone.setViewportSize({ width: 390, height: 844 })
 }
 
+async function teamCollectionJourney(desktop) {
+  const name = 'Studio handoff library'
+  await desktop.goto(url + '/')
+  await button(desktop, 'My collections').click()
+  const manager = desktop.getByRole('dialog', { name: 'My collections' })
+  await manager.getByLabel('Collection name').fill(name)
+  await button(manager, 'Create collection').click()
+  await button(manager, name).waitFor()
+  await button(manager, 'Close').click()
+
+  async function setMembership(folder, subject, label) {
+    await openMailbox(desktop, folder)
+    await button(desktop, subject).click()
+    await button(desktop, 'Private tools').click()
+    const tools = desktop.getByRole('region', { name: 'Private conversation tools' })
+    await button(tools, 'Organize').click()
+    const [saved] = await Promise.all([
+      desktop.waitForResponse(response => response.url().endsWith('/private/message') && response.request().method() === 'POST'),
+      tools.getByRole('checkbox', { name: label, exact: true }).check(),
+    ])
+    assert.equal(saved.status(), 200, await saved.text())
+  }
+
+  await setMembership(/^Receipts(?:\s|$)/, /Your receipt #1046/, name)
+  await button(folders(desktop), name).click()
+  await heading(desktop, name).waitFor()
+  await button(desktop, 'Share collection').click()
+  const preview = desktop.getByRole('dialog', { name: 'Share collection' })
+  await preview.getByRole('region', { name: 'Collection preview' }).getByText(/November payment/).waitFor()
+  await preview.getByLabel('Allow attachment downloads').check()
+  await preview.getByText('receipt-1046.txt', { exact: true }).waitFor()
+  assert.equal(await preview.getByLabel('Follow verified replies').count(), 0)
+  await preview.getByLabel('Teammate', { exact: true }).fill(sender)
+  await verifyControlRow(preview.locator('.wm-team-thread-audience'), 'select, input, button', 36)
+  await preview.locator('.wm-snapshot-panel').screenshot({ path: join(output, 'desktop-team-collection-preview.png'), animations: 'disabled' })
+  await button(preview, 'Share collection').click()
+  const ownerView = desktop.getByRole('dialog', { name: 'Shared mail' })
+  await ownerView.getByText('Collection shared.', { exact: true }).waitFor()
+  await button(ownerView, 'Close').click()
+  await button(desktop, 'View access').click()
+  await ownerView.getByText(`Collection · From ${owner} · Shared with ${sender}`, { exact: true }).waitFor()
+  await button(ownerView, 'Close').click()
+
+  const teammate = await signIn({ phone: true, account: sender, initialSubject: 'Combined source briefing' })
+  try {
+    await teammate.setViewportSize({ width: 320, height: 844 })
+    await drawer(teammate).click()
+    await button(teammate, 'Shared mail').click()
+    const incoming = teammate.getByRole('dialog', { name: 'Shared mail' })
+    await button(incoming, `Open ${name}`).click()
+    const file = incoming.getByRole('link', { name: 'receipt-1046.txt' })
+    await file.waitFor()
+    const href = new URL(await file.getAttribute('href'), url).href
+    const download = await teammate.request.get(href)
+    assert.equal(await download.text(), 'Receipt 1046 for Studio Hosting\n')
+    const search = incoming.getByLabel('Search collection')
+    await search.fill('sidebar order')
+    await button(incoming, 'Search').click()
+    await incoming.getByText('No matching messages.', { exact: true }).waitFor()
+    await setMembership(/^Inbox(?:\s|$)/, new RegExp(handoff), `Share this message in ${name}`)
+    await button(incoming, 'Search').click()
+    await incoming.getByText(/confirm the sidebar order/).waitFor()
+    await incoming.getByLabel('Teammate comment').fill('I found the handoff.')
+    await button(incoming, 'Post comment').click()
+    await incoming.getByText('I found the handoff.', { exact: true }).waitFor()
+    const commentControls = await verifyControlRow(incoming.locator('form').filter({ hasText: 'Teammate comment' }), 'input, button', 44, false)
+    assert(commentControls.every(control => control.borderMatches && control.opacity === '1'), 'The comment action and field keep identical outlines')
+    await fitsViewport(teammate)
+    await screenshot(teammate, 'narrow-phone-team-collection')
+
+    await button(desktop, 'My collections').click()
+    await button(manager.locator('.wm-collection-row').filter({ hasText: name }), 'Remove').click()
+    await button(manager, 'Delete collection').click()
+    await button(manager, name).waitFor({ state: 'hidden' })
+    assert.equal((await teammate.request.get(href)).status(), 404)
+    await button(incoming, 'Search').click()
+    await incoming.getByRole('alert').filter({ hasText: /unavailable/ }).waitFor()
+  }
+  finally { await teammate.context().close() }
+}
+
 async function teamThreadJourney(desktop) {
   await desktop.goto(url + '/')
   await openMailbox(desktop, /^Receipts(?:\s|$)/)
@@ -1136,7 +1217,7 @@ async function teamThreadJourney(desktop) {
   await compose.getByLabel('Teammate', { exact: true }).fill(sender)
   await compose.locator('.wm-snapshot-panel').screenshot({ path: join(output, 'desktop-team-thread-preview.png'), animations: 'disabled' })
   await button(compose, 'Share conversation').click()
-  const ownerView = desktop.getByRole('dialog', { name: 'Shared conversations' })
+  const ownerView = desktop.getByRole('dialog', { name: 'Shared mail' })
   const ownerMessages = ownerView.getByRole('region', { name: 'Shared messages' })
   await ownerMessages.getByText(/November payment/).waitFor()
   await ownerView.getByLabel('Teammate comment').fill('Please check the receipt total.')
@@ -1147,8 +1228,8 @@ async function teamThreadJourney(desktop) {
   try {
     await teammate.setViewportSize({ width: 320, height: 844 })
     await drawer(teammate).click()
-    await button(teammate, 'Shared conversations').click()
-    const incoming = teammate.getByRole('dialog', { name: 'Shared conversations' })
+    await button(teammate, 'Shared mail').click()
+    const incoming = teammate.getByRole('dialog', { name: 'Shared mail' })
     await button(incoming, 'Open Your receipt #1046').click()
     await incoming.getByText('Please check the receipt total.', { exact: true }).waitFor()
     await incoming.getByLabel('Search conversation').fill('absent term')
@@ -1174,7 +1255,7 @@ async function teamThreadJourney(desktop) {
     await fitsViewport(teammate)
     await screenshot(teammate, 'phone-team-thread-followed-reply')
     await button(ownerView, 'Revoke access').click()
-    await button(ownerView.getByRole('group', { name: 'Confirm conversation revocation' }), 'Revoke access').click()
+    await button(ownerView.getByRole('group', { name: 'Confirm revocation' }), 'Revoke access').click()
     await ownerView.getByText('Access revoked.', { exact: true }).waitFor()
     assert.equal((await teammate.request.get(href.href)).status(), 404)
     await button(incoming, 'Search').click()
@@ -2369,6 +2450,7 @@ try {
   await calendarTasksJourney(phone, true)
   await calendarToolsJourney(desktop, phone)
   await snapshotSharingJourney(desktop, phone)
+  await teamCollectionJourney(desktop)
   await teamThreadJourney(desktop)
   await fileLinkJourney(desktop, phone)
   await replyBatchJourney(desktop, phone)

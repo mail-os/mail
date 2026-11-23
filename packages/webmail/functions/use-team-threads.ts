@@ -11,6 +11,7 @@ interface Grant {
   downloads: boolean
   followingAuthors: string[]
   replyLimitReached: boolean
+  collectionId: string | null
 }
 interface Attachment { index: number, filename: string, size: number }
 interface Message {
@@ -23,8 +24,8 @@ interface Message {
   verifiedReply?: boolean
   truncated?: boolean
 }
-interface Preview { messages: Message[], digest: string, followingAuthors: string[] }
-interface Detail { grant: Grant, messages: Message[], comments: { author: string, writtenAt: number, text: string }[] }
+interface Preview { messages: Message[], digest: string, followingAuthors: string[], collection?: { name: string }, next?: number | null }
+interface Detail { grant: Grant, messages: Message[], comments: { author: string, writtenAt: number, text: string }[], next: number | null }
 interface Team { id: string, name: string }
 const endpoint = '/webmail/api/thread-shares'
 
@@ -48,6 +49,10 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
   const teamThreadSearch = state('')
   const teamThreadComment = state('')
   const teamThreadRevoking = state<Grant | null>(null)
+  const teamThreadCollection = state('')
+  const teamThreadPages = state<(number | null)[]>([null])
+  let appliedSearch = ''
+  let collectionScope = ''
   let references: string[] = []
   let request: AbortController | null = null
 
@@ -68,6 +73,10 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
     teamThreadFollowReplies.set(false)
     teamThreadSearch.set('')
     teamThreadComment.set('')
+    teamThreadCollection.set('')
+    teamThreadPages.set([null])
+    appliedSearch = ''
+    collectionScope = ''
   }
 
   async function run<T>(work: (signal: AbortSignal) => Promise<T>, apply: (value: T) => void) {
@@ -82,7 +91,7 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
     }
     catch (cause) {
       if (request === pending) {
-        teamThreadError.set(cause instanceof Error ? cause.message : 'Unable to load this conversation.')
+        teamThreadError.set(cause instanceof Error ? cause.message : 'Unable to load this share.')
         if (cause instanceof MailApiError && cause.status === 404) teamThreadDetail.set(null)
       }
     }
@@ -95,23 +104,26 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
   }
 
   function preview(signal: AbortSignal) {
+    const collectionId = teamThreadCollection()
     return api<Preview>(`${endpoint}/preview`, {
       method: 'POST', signal, body: JSON.stringify({
-        references, downloads: teamThreadDownloads(), followReplies: teamThreadFollowReplies(),
+        ...(collectionId ? { collectionId } : { references, followReplies: teamThreadFollowReplies() }),
+        downloads: teamThreadDownloads(),
       }),
     })
   }
 
-  function beginTeamThread(picked: (string | undefined)[]) {
+  function beginTeamThread(picked: (string | undefined)[], collectionId = '') {
     closeTeamThreads()
     teamThreadMode.set('preview')
     teamThreadTeams.set([])
     teamThreadTeam.set('')
-    if (picked.length === 0 || picked.length > 10 || picked.some(reference => !reference)) {
+    if (!collectionId && (picked.length === 0 || picked.length > 10 || picked.some(reference => !reference))) {
       teamThreadError.set('Choose up to ten messages with saved references.')
       return
     }
     references = picked as string[]
+    teamThreadCollection.set(collectionId)
     void run(signal => Promise.all([api<Team[]>('/webmail/api/teams', { signal }), preview(signal)]), ([teams, prepared]) => {
       teamThreadTeams.set(teams)
       teamThreadTeam.set(teams[0]?.id ?? '')
@@ -134,32 +146,43 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
   async function shareTeamThread() {
     const prepared = teamThreadPreview()
     if (!prepared) return
+    const collectionId = teamThreadCollection()
     const body = JSON.stringify({
-      references, digest: prepared.digest, team: teamThreadTeam(), grantee: teamThreadGrantee().trim(),
-      downloads: teamThreadDownloads(), followReplies: teamThreadFollowReplies(),
+      ...(collectionId ? { collectionId } : { references, followReplies: teamThreadFollowReplies() }),
+      digest: prepared.digest, team: teamThreadTeam(), grantee: teamThreadGrantee().trim(), downloads: teamThreadDownloads(),
     })
     let issued: Grant | undefined
     await run(signal => api<Grant>(endpoint, { method: 'POST', body, signal }), grant => { issued = grant })
     if (issued) {
       openTeamThread(issued)
-      teamThreadNotice.set('Conversation shared.')
+      teamThreadNotice.set(collectionId ? 'Collection shared.' : 'Conversation shared.')
     }
   }
 
-  function listTeamThreads() {
+  function listTeamThreads(collectionId = collectionScope) {
     if (teamThreadBusy()) return
+    collectionScope = collectionId
     teamThreadMode.set('list')
     teamThreadNotice.set('')
     teamThreadDetail.set(null)
     teamThreadRevoking.set(null)
     teamThreadGrants.set([])
-    void run(signal => api<{ grants: Grant[] }>(endpoint, { signal }), result => teamThreadGrants.set(result.grants))
+    void run(signal => api<{ grants: Grant[] }>(endpoint, { signal }), ({ grants }) => {
+      teamThreadGrants.set(collectionId ? grants.filter(grant => grant.collectionId === collectionId) : grants)
+    })
   }
 
-  function read(grant: Grant, signal: AbortSignal) {
-    const query = teamThreadSearch().trim()
-    const search = query ? `?q=${encodeURIComponent(query)}` : ''
-    return api<Detail>(`${endpoint}/${grant.id}${search}`, { signal })
+  function read(grant: Grant, query: string, pages: (number | null)[]) {
+    const params = new URLSearchParams()
+    const before = pages.at(-1)
+    if (query) params.set('q', query)
+    if (before != null) params.set('before', String(before))
+    const suffix = params.size ? `?${params}` : ''
+    void run(signal => api<Detail>(`${endpoint}/${grant.id}${suffix}`, { signal }), (result) => {
+      appliedSearch = query
+      teamThreadPages.set(pages)
+      teamThreadDetail.set(result)
+    })
   }
 
   function openTeamThread(grant: Grant, preserveSearch = false) {
@@ -170,7 +193,15 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
       teamThreadSearch.set('')
       teamThreadComment.set('')
     }
-    void run(signal => read(grant, signal), result => teamThreadDetail.set(result))
+    read(grant, teamThreadSearch().trim(), [null])
+  }
+
+  function turnTeamThreadPage(forward: boolean) {
+    const detail = teamThreadDetail()
+    if (!detail) return
+    const pages = teamThreadPages()
+    if (forward && detail.next != null) read(detail.grant, appliedSearch, [...pages, detail.next])
+    if (!forward && pages.length > 1) read(detail.grant, appliedSearch, pages.slice(0, -1))
   }
 
   async function addTeamThreadComment() {
@@ -179,7 +210,7 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
     const body = JSON.stringify({ text: teamThreadComment().trim() })
     await run(signal => api(`${endpoint}/${detail.grant.id}/comments`, { method: 'POST', body, signal }),
       () => teamThreadComment.set(''))
-    if (!teamThreadError() && teamThreadMode() === 'detail') openTeamThread(detail.grant, true)
+    if (!teamThreadError() && teamThreadMode() === 'detail') read(detail.grant, appliedSearch, teamThreadPages())
   }
 
   async function revokeTeamThread() {
@@ -195,8 +226,8 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
 
   return {
     teamThreadMode, teamThreadBusy, teamThreadError, teamThreadNotice, teamThreadPreview, teamThreadGrants, teamThreadDetail,
-    teamThreadTeams, teamThreadTeam, teamThreadGrantee, teamThreadDownloads, teamThreadFollowReplies, teamThreadSearch, teamThreadComment, teamThreadRevoking,
+    teamThreadTeams, teamThreadTeam, teamThreadGrantee, teamThreadDownloads, teamThreadFollowReplies, teamThreadSearch, teamThreadComment, teamThreadRevoking, teamThreadCollection, teamThreadPages,
     beginTeamThread, setTeamThreadDownloads, setTeamThreadFollowReplies, shareTeamThread, listTeamThreads, openTeamThread,
-    addTeamThreadComment, revokeTeamThread, closeTeamThreads,
+    addTeamThreadComment, revokeTeamThread, closeTeamThreads, turnTeamThreadPage,
   }
 }

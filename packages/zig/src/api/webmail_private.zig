@@ -25,7 +25,7 @@ const Anchor = struct {
 };
 
 const Group = struct { id: []const u8, anchors: []const []const u8 };
-pub const Collection = struct { id: []const u8, name: []const u8, revision: i64, included: bool = false };
+pub const Collection = struct { id: []const u8, name: []const u8, revision: i64, included: bool, explicit: bool, shared: bool };
 pub const EntryKind = enum { note, clip };
 pub const Entry = struct {
     id: []const u8,
@@ -263,22 +263,27 @@ pub fn decorate(a: Allocator, db: *Database, user: []const u8, rows: []maildir.M
     return rows[0..kept];
 }
 
-pub fn listCollections(a: Allocator, db: *Database, user: []const u8, anchors: []const u8) ![]Collection {
+pub fn listCollections(a: Allocator, db: *Database, user: []const u8, anchors: []const u8, reference: ?[]const u8) ![]Collection {
     const stmt = try db.prepare(
         \\SELECT c.id,c.name,c.revision,EXISTS(SELECT 1 FROM mail_private_members m WHERE m.user_id=c.user_id
-        \\  AND m.collection=c.id AND m.anchor IN (SELECT value FROM json_each(?2)))
+        \\  AND m.collection=c.id AND m.anchor IN (SELECT value FROM json_each(?2))),
+        \\EXISTS(SELECT 1 FROM mail_private_members m WHERE m.user_id=c.user_id AND m.collection=c.id AND m.anchor=?3),
+        \\EXISTS(SELECT 1 FROM mail_team_collection_shares s WHERE s.owner_id=c.user_id AND s.collection_id=c.id)
         \\FROM mail_private_collections c WHERE c.user_id=(SELECT id FROM users WHERE username=?1)
         \\ORDER BY c.name,c.id
     );
     defer stmt.finalize();
     try stmt.bind(1, user);
     try stmt.bind(2, anchors);
+    try stmt.bindOpt(3, reference);
     var out: std.ArrayList(Collection) = .empty;
     while (try stmt.step()) try out.append(a, .{
         .id = try a.dupe(u8, stmt.columnText(0)),
         .name = try a.dupe(u8, stmt.columnText(1)),
         .revision = stmt.columnInt64(2),
         .included = stmt.columnInt64(3) != 0,
+        .explicit = stmt.columnInt64(4) != 0,
+        .shared = stmt.columnInt64(5) != 0,
     });
     return out.toOwnedSlice(a);
 }
@@ -291,7 +296,7 @@ pub fn hasCollection(db: *Database, user: []const u8, id: []const u8) !bool {
     return stmt.step();
 }
 
-pub fn tools(a: Allocator, db: *Database, user: []const u8, current: Context, clip_source: []const u8) !MessageTools {
+pub fn tools(a: Allocator, db: *Database, user: []const u8, reference: []const u8, current: Context, clip_source: []const u8) !MessageTools {
     var entries: std.ArrayList(Entry) = .empty;
     {
         const stmt = try db.prepare(
@@ -313,7 +318,7 @@ pub fn tools(a: Allocator, db: *Database, user: []const u8, current: Context, cl
     return .{
         .label = current.label,
         .entries = try entries.toOwnedSlice(a),
-        .collections = try listCollections(a, db, user, current.conversation_anchors),
+        .collections = try listCollections(a, db, user, current.conversation_anchors, reference),
         .clip_source = clip_source,
     };
 }
@@ -452,15 +457,32 @@ pub fn changeCollection(db: *Database, user: []const u8, action: CollectionActio
     _ = try stmt.step();
 }
 
-pub fn setMember(db: *Database, user: []const u8, reference: []const u8, collection: []const u8, included: bool, current: Context) !void {
-    if (!try hasCollection(db, user, collection)) return error.NotFound;
-    const stmt = try db.prepare(if (included)
-        "INSERT OR IGNORE INTO mail_private_members(user_id,collection,anchor) SELECT id,?2,?3 FROM users WHERE username=?1"
-    else
-        "DELETE FROM mail_private_members WHERE " ++ owner ++ " AND collection=?2 AND anchor IN (SELECT value FROM json_each(?3))");
-    defer stmt.finalize();
-    try stmt.bind(1, user);
-    try stmt.bind(2, collection);
-    try stmt.bind(3, if (included) reference else current.conversation_anchors);
-    _ = try stmt.step();
+pub fn setMember(db: *Database, user: []const u8, reference: []const u8, collection: []const u8, included: bool, exact: bool, current: Context) !void {
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    {
+        const stmt = try tx.prepare(
+            \\SELECT EXISTS(SELECT 1 FROM mail_team_collection_shares s WHERE s.owner_id=c.user_id AND s.collection_id=c.id)
+            \\FROM mail_private_collections c WHERE c.user_id=(SELECT id FROM users WHERE username=?1) AND c.id=?2
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, collection);
+        if (!try stmt.step()) return error.NotFound;
+        if (included and !exact and stmt.columnInt64(0) != 0) return error.CollectionShareConfirmationRequired;
+    }
+    {
+        const stmt = try tx.prepare(if (included)
+            "INSERT OR IGNORE INTO mail_private_members(user_id,collection,anchor) SELECT id,?2,?3 FROM users WHERE username=?1"
+        else if (exact)
+            "DELETE FROM mail_private_members WHERE " ++ owner ++ " AND collection=?2 AND anchor=?3"
+        else
+            "DELETE FROM mail_private_members WHERE " ++ owner ++ " AND collection=?2 AND anchor IN (SELECT value FROM json_each(?3))");
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, collection);
+        try stmt.bind(3, if (included or exact) reference else current.conversation_anchors);
+        _ = try stmt.step();
+    }
+    try tx.commit();
 }

@@ -69,7 +69,7 @@ export interface Conversation { id: string, count: number, unread: number, match
 export interface IndexProgress { indexed: number, total: number, pending: boolean }
 export interface MessagePage { items: MessageSummary[], threads: Conversation[], page: number, total: number, message_total: number, conversations: boolean, index?: IndexProgress }
 export interface LibraryAttachment { index: number, size: number, filename: string, content_type: string, message: MessageSummary }
-export interface PrivateCollection { id: string, name: string, revision: number, included: boolean }
+export interface PrivateCollection { id: string, name: string, revision: number, included: boolean, explicit: boolean, shared: boolean }
 export interface PrivateEntry {
   id: string
   kind: 'note' | 'clip'

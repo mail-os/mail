@@ -132,8 +132,8 @@ export function usePrivateMail(api: ReturnType<typeof createMailApi>, selected: 
 
   async function changePrivateMembership(collection: PrivateCollection, event: Event): Promise<boolean> {
     const input = event.target as HTMLInputElement
-    if (await saveTools({ action: 'collection', collection: collection.id, included: input.checked })) return true
-    input.checked = collection.included
+    if (await saveTools({ action: 'collection', collection: collection.id, included: input.checked, shareCollectionMessage: collection.shared })) return true
+    input.checked = collection.shared ? collection.explicit : collection.included
     return false
   }
 
@@ -141,8 +141,11 @@ export function usePrivateMail(api: ReturnType<typeof createMailApi>, selected: 
     privateCollections.set(items)
     const tools = privateTools()
     if (!tools) return
-    const included = new Set(tools.collections.filter(item => item.included).map(item => item.id))
-    privateTools.set({ ...tools, collections: items.map(item => ({ ...item, included: included.has(item.id) })) })
+    const membership = new Map(tools.collections.map(item => [item.id, item]))
+    privateTools.set({ ...tools, collections: items.map((item) => {
+      const previous = membership.get(item.id)
+      return { ...item, included: previous?.included ?? false, explicit: previous?.explicit ?? false }
+    }) })
   }
 
   async function loadPrivateCollections(): Promise<void> {

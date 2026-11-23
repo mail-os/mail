@@ -402,6 +402,10 @@ export function useWebmail(ports: WebmailPorts) {
     if (bulk) teamThreads.beginTeamThread(checked().map(item => item.reference))
     else if (canShareSnapshot()) teamThreads.beginTeamThread([selected()?.reference])
   }
+  function shareCollectionWithTeam() {
+    const collection = collectionView()
+    if (!linkedView && limits().teamThreadsAvailable && collection) teamThreads.beginTeamThread([], collection.id)
+  }
   function shareWithAssistant(bulk = false) {
     if (linkedView) return
     if (bulk) assistantGrants.beginAssistantGrant(checked().map(item => item.reference))
@@ -1965,7 +1969,7 @@ export function useWebmail(ports: WebmailPorts) {
   return { linkedView, user, folders, folder, messages, threads, expandedThreads, selected, loading, refreshing, listError, readerError, readerTarget, reading, readingLoading, mutating, error, notice, query, activeQuery, appliedSearchAll, filterLocation, filterSender, filterRecipient, filterFilename, libraryView, libraryFiles, indexProgress, filterAfter, filterBefore, filterStatus, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, formattedReader, remoteImagesAllowed, checked, checkedKeys, selectedCount, isJunkFolder, readerJunkAction, selectionJunkAction, allChecked, someChecked, undoAction, undoRemaining, readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts, pendingSend, sendRemaining, outbox, outboxCount, outboxCounts, outboxSection, outboxViews, outboxEmpty, outboxPageNumber, outboxNext, outboxLoading, outboxError, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, sharedReply, senderId, senderIdentities, missingSender, senderStatus, chooseSender, externalSender, externalSendReview, cancelExternalReview, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...senderReview, ...notifications, ...privateMail, ...contactBook, showContacts, composeSavedCard, collectionView, collectionId, canOpenPrivate,
     createEventLink, canRespondToInvitation, respondToInvitation, rsvpBusy, rsvpError,
     ...snapshots, canShareSnapshot, shareMessageSnapshot, shareSelectedSnapshot,
-    ...teamThreads, shareWithTeam,
+    ...teamThreads, shareWithTeam, shareCollectionWithTeam,
     ...assistantGrants, shareWithAssistant,
     ...fileSharing, messageFileLinks, insertFileLink,
     ...replyBatch, replyToSelection, submitReplyBatch,
