@@ -1,4 +1,5 @@
 const std = @import("std");
+const imap_mime = @import("imap_mime.zig");
 const clamav = @import("../antispam/clamav.zig");
 const builtin = @import("builtin");
 const ascii_compat = @import("ascii-compat");
@@ -1005,54 +1006,26 @@ fn searchHeader(a: std.mem.Allocator, header: []const u8, field: []const u8, ter
     return null;
 }
 
-/// A header section requested by FETCH: `BODY[HEADER]`,
-/// `BODY[HEADER.FIELDS (...)]`, `BODY[HEADER.FIELDS.NOT (...)]` (each also as
-/// `BODY.PEEK[...]`), or `RFC822.HEADER`.
 const HeaderSection = struct {
     const Kind = enum { all, fields, fields_not };
 
     kind: Kind,
-    /// The section text between the brackets, echoed back verbatim in the
-    /// response item name (RFC 3501 7.4.2). Empty for RFC822.HEADER.
-    spec: []const u8,
-    /// The field names inside the parentheses, space separated.
     fields: []const u8 = "",
-    rfc822: bool = false,
 };
 
-fn parseHeaderSection(items: []const u8) ?HeaderSection {
-    var search_from: usize = 0;
-    while (ascii_compat.indexOfIgnoreCasePos(items, search_from, "BODY")) |at| {
-        search_from = at + 4;
-        var open = at + 4;
-        if (open + 5 <= items.len and std.ascii.eqlIgnoreCase(items[open .. open + 5], ".PEEK")) open += 5;
-        if (open >= items.len or items[open] != '[') continue;
-        const close = std.mem.indexOfScalarPos(u8, items, open, ']') orelse return null;
-        const spec = items[open + 1 .. close];
-        if (!(spec.len >= 6 and std.ascii.eqlIgnoreCase(spec[0..6], "HEADER"))) continue;
-
-        const rest = spec[6..];
-        const kind: HeaderSection.Kind = if (rest.len == 0)
-            .all
-        else if (rest.len >= 11 and std.ascii.eqlIgnoreCase(rest[0..11], ".FIELDS.NOT"))
-            .fields_not
-        else if (rest.len >= 7 and std.ascii.eqlIgnoreCase(rest[0..7], ".FIELDS"))
-            .fields
-        else
-            continue;
-
-        var fields: []const u8 = "";
-        if (kind != .all) {
-            const lp = std.mem.indexOfScalar(u8, spec, '(') orelse return null;
-            const rp = std.mem.indexOfScalarPos(u8, spec, lp, ')') orelse return null;
-            fields = spec[lp + 1 .. rp];
-        }
-        return .{ .kind = kind, .spec = spec, .fields = fields };
-    }
-    if (ascii_compat.indexOfIgnoreCase(items, "RFC822.HEADER") != null) {
-        return .{ .kind = .all, .spec = "", .rfc822 = true };
-    }
-    return null;
+fn parseHeaderSpec(spec: []const u8) ?HeaderSection {
+    if (!std.ascii.startsWithIgnoreCase(spec, "HEADER")) return null;
+    const rest = spec[6..];
+    if (rest.len == 0) return .{ .kind = .all };
+    const kind: HeaderSection.Kind = if (std.ascii.startsWithIgnoreCase(rest, ".FIELDS.NOT "))
+        .fields_not
+    else if (std.ascii.startsWithIgnoreCase(rest, ".FIELDS "))
+        .fields
+    else
+        return null;
+    const lp = std.mem.indexOfScalar(u8, rest, '(') orelse return null;
+    const rp = std.mem.indexOfScalarPos(u8, rest, lp + 1, ')') orelse return null;
+    return .{ .kind = kind, .fields = rest[lp + 1 .. rp] };
 }
 
 /// The header fields of `header` whose names are (`keep_listed`) or are not
@@ -1096,19 +1069,107 @@ fn headerFieldListed(fields: []const u8, name: []const u8) bool {
     return false;
 }
 
-/// The section of a numbered body part request (`BODY[1]`, `BODY.PEEK[1.2]`),
-/// echoed back in the response item name.
-fn numberedPartSpec(items: []const u8) ?[]const u8 {
-    var search_from: usize = 0;
-    while (ascii_compat.indexOfIgnoreCasePos(items, search_from, "BODY")) |at| {
-        search_from = at + 4;
-        var open = at + 4;
-        if (open + 5 <= items.len and std.ascii.eqlIgnoreCase(items[open .. open + 5], ".PEEK")) open += 5;
-        if (open + 1 >= items.len or items[open] != '[' or !std.ascii.isDigit(items[open + 1])) continue;
-        const close = std.mem.indexOfScalarPos(u8, items, open, ']') orelse return null;
-        return items[open + 1 .. close];
+const FetchSections = struct {
+    items: []const u8,
+    cursor: usize = 0,
+
+    const Partial = struct { offset: usize, count: usize };
+
+    const Section = struct {
+        spec: []const u8,
+        peek: bool,
+        partial: ?Partial = null,
+
+        fn numbered(self: Section) bool {
+            return self.spec.len != 0 and std.ascii.isDigit(self.spec[0]);
+        }
+
+        fn appendReply(self: Section, a: std.mem.Allocator, reply: *std.ArrayList([]const u8), raw: []const u8, header: []const u8, tree: ?imap_mime.Tree) !void {
+            var data: ?[]const u8 = null;
+            var filter: ?HeaderSection = null;
+            if (self.numbered()) {
+                if (tree.?.section(self.spec)) |section| {
+                    data = section.bytes;
+                    if (section.header_filter) |spec| {
+                        filter = parseHeaderSpec(spec);
+                        if (filter == null) data = null;
+                    }
+                }
+            } else if (self.spec.len == 0) {
+                data = raw;
+            } else if (std.ascii.eqlIgnoreCase(self.spec, "TEXT")) {
+                data = raw[header.len..];
+            } else if (parseHeaderSpec(self.spec)) |parsed| {
+                data = header;
+                filter = parsed;
+            }
+
+            const bytes = data orelse {
+                try reply.append(a, try std.fmt.allocPrint(a, " BODY[{s}] NIL", .{self.spec}));
+                return;
+            };
+            const selected = if (filter) |hs| switch (hs.kind) {
+                .all => bytes,
+                .fields => try filterHeaderFields(a, bytes, hs.fields, true),
+                .fields_not => try filterHeaderFields(a, bytes, hs.fields, false),
+            } else bytes;
+
+            if (self.partial) |partial| {
+                const start = @min(partial.offset, selected.len);
+                const slice = selected[start..][0..@min(partial.count, selected.len - start)];
+                const label = try std.fmt.allocPrint(a, " BODY[{s}]<{d}> {{{d}}}\r\n", .{ self.spec, partial.offset, slice.len });
+                try reply.appendSlice(a, &.{ label, slice });
+            } else {
+                const label = try std.fmt.allocPrint(a, " BODY[{s}] {{{d}}}\r\n", .{ self.spec, selected.len });
+                try reply.appendSlice(a, &.{ label, selected });
+            }
+        }
+    };
+
+    fn next(self: *FetchSections) ?Section {
+        while (ascii_compat.indexOfIgnoreCasePos(self.items, self.cursor, "BODY")) |at| {
+            self.cursor = at + 4;
+            if (at != 0 and self.items[at - 1] != ' ' and self.items[at - 1] != '(') continue;
+            const peek = std.ascii.startsWithIgnoreCase(self.items[self.cursor..], ".PEEK");
+            const open = self.cursor + @as(usize, if (peek) 5 else 0);
+            if (open >= self.items.len or self.items[open] != '[') continue;
+            const close = std.mem.indexOfScalarPos(u8, self.items, open + 1, ']') orelse return null;
+            self.cursor = close + 1;
+
+            var partial: ?Partial = null;
+            if (self.cursor < self.items.len and self.items[self.cursor] == '<') parse: {
+                const stop = std.mem.indexOfScalarPos(u8, self.items, self.cursor + 1, '>') orelse break :parse;
+                const range = self.items[self.cursor + 1 .. stop];
+                const dot = std.mem.indexOfScalar(u8, range, '.') orelse break :parse;
+                const offset = std.fmt.parseInt(usize, range[0..dot], 10) catch break :parse;
+                const count = std.fmt.parseInt(usize, range[dot + 1 ..], 10) catch break :parse;
+                partial = .{ .offset = offset, .count = count };
+                self.cursor = stop + 1;
+            }
+            return .{ .spec = self.items[open + 1 .. close], .peek = peek, .partial = partial };
+        }
+        return null;
     }
-    return null;
+};
+
+/// Look for an item outside BODY brackets, where a HEADER.FIELDS list may
+/// itself contain strings that look like FETCH item names.
+fn fetchHasAtom(items: []const u8, name: []const u8) bool {
+    var at: usize = 0;
+    while (at < items.len) {
+        if (items[at] == '[') {
+            at = (std.mem.indexOfScalarPos(u8, items, at + 1, ']') orelse return false) + 1;
+            continue;
+        }
+        if (items[at] == ' ' or items[at] == '(' or items[at] == ')') {
+            at += 1;
+            continue;
+        }
+        const start = at;
+        while (at < items.len and std.mem.indexOfScalar(u8, " ()[", items[at]) == null) : (at += 1) {}
+        if (std.ascii.eqlIgnoreCase(items[start..at], name) and (at == items.len or items[at] != '[')) return true;
+    }
+    return false;
 }
 
 fn pathIsSymlink(path: []const u8) bool {
@@ -2992,72 +3053,26 @@ pub const ImapSession = struct {
             return;
         };
 
-        // RFC 3501 Section 6.4.5: BODY[] (without .PEEK) implicitly sets \Seen flag
-        const is_peek = std.mem.indexOf(u8, items_raw, "BODY.PEEK") != null;
-        const has_body_fetch = std.mem.indexOf(u8, items_raw, "BODY[") != null or
-            (std.mem.indexOf(u8, items_raw, "RFC822") != null and
-                std.mem.indexOf(u8, items_raw, "RFC822.SIZE") == null and
-                std.mem.indexOf(u8, items_raw, "RFC822.HEADER") == null);
-        const should_set_seen = has_body_fetch and !is_peek and !self.mailbox_read_only;
+        const want_internaldate = fetchHasAtom(items_raw, "INTERNALDATE");
+        const want_rfc822_size = fetchHasAtom(items_raw, "RFC822.SIZE");
+        const want_rfc822_header = fetchHasAtom(items_raw, "RFC822.HEADER");
+        const want_rfc822_body = fetchHasAtom(items_raw, "RFC822") or fetchHasAtom(items_raw, "RFC822.TEXT");
+        const want_bodystructure = fetchHasAtom(items_raw, "BODYSTRUCTURE");
 
-        // Determine what to fetch based on items
-        const want_internaldate = std.mem.indexOf(u8, items_raw, "INTERNALDATE") != null;
-        // BODY[HEADER], BODY[HEADER.FIELDS (...)], BODY[HEADER.FIELDS.NOT (...)]
-        // (or their .PEEK forms), or RFC822.HEADER.
-        const header_section = parseHeaderSection(items_raw);
-        // Detect any BODY[...] request for content (including numbered parts like BODY[1], BODY.PEEK[1.1])
-        const has_body_section = blk: {
-            // Look for BODY[ or BODY.PEEK[ followed by a digit (numbered MIME part)
-            var i: usize = 0;
-            while (i < items_raw.len) {
-                if (std.mem.startsWith(u8, items_raw[i..], "BODY[") or
-                    std.mem.startsWith(u8, items_raw[i..], "BODY.PEEK["))
-                {
-                    const bracket_start = std.mem.indexOfScalarPos(u8, items_raw, i, '[') orelse {
-                        i += 1;
-                        continue;
-                    };
-                    const after_bracket = bracket_start + 1;
-                    if (after_bracket < items_raw.len and items_raw[after_bracket] >= '0' and items_raw[after_bracket] <= '9') {
-                        break :blk true;
-                    }
-                }
-                i += 1;
-            }
-            break :blk false;
-        };
-        // BODY.PEEK[] or BODY[] or BODY[TEXT] or BODY.PEEK[TEXT] or BODY[n] or RFC822 (not RFC822.SIZE) - wants full body
-        const want_full_body = has_body_section or
-            (std.mem.indexOf(u8, items_raw, "BODY.PEEK[]") != null) or
-            (std.mem.indexOf(u8, items_raw, "BODY[]") != null) or
-            (std.mem.indexOf(u8, items_raw, "BODY[TEXT]") != null) or
-            (std.mem.indexOf(u8, items_raw, "BODY.PEEK[TEXT]") != null) or
-            (std.mem.indexOf(u8, items_raw, "RFC822") != null and
-                std.mem.indexOf(u8, items_raw, "RFC822.SIZE") == null and
-                std.mem.indexOf(u8, items_raw, "RFC822.HEADER") == null);
-        const want_bodystructure = std.mem.indexOf(u8, items_raw, "BODYSTRUCTURE") != null;
-        // BODY[TEXT] or BODY.PEEK[TEXT] — return body only (after headers), not full message
-        const want_body_text_only = (std.mem.indexOf(u8, items_raw, "BODY[TEXT]") != null) or
-            (std.mem.indexOf(u8, items_raw, "BODY.PEEK[TEXT]") != null);
-
-        // Parse partial fetch <offset.count> if present
-        var partial_offset: ?usize = null;
-        var partial_count: ?usize = null;
-        if (std.mem.indexOf(u8, items_raw, "<")) |angle_start| {
-            if (std.mem.indexOfScalarPos(u8, items_raw, angle_start, '>')) |angle_end| {
-                const partial_spec = items_raw[angle_start + 1 .. angle_end];
-                if (std.mem.indexOf(u8, partial_spec, ".")) |dot| {
-                    partial_offset = std.fmt.parseInt(usize, partial_spec[0..dot], 10) catch null;
-                    partial_count = std.fmt.parseInt(usize, partial_spec[dot + 1 ..], 10) catch null;
-                }
-            }
+        var sections: FetchSections = .{ .items = items_raw };
+        var has_sections = false;
+        var has_numbered = false;
+        var marks_seen = want_rfc822_body;
+        while (sections.next()) |section| {
+            has_sections = true;
+            has_numbered = has_numbered or section.numbered();
+            marks_seen = marks_seen or !section.peek;
         }
+        const should_set_seen = marks_seen and !self.mailbox_read_only;
 
-        // Detect if we only need metadata (FLAGS, UID, RFC822.SIZE) — no file content read needed.
-        // INTERNALDATE can come from the Date header, so it takes the full path.
-        const want_rfc822_size = std.mem.indexOf(u8, items_raw, "RFC822.SIZE") != null;
-        const metadata_only = !want_full_body and header_section == null and !want_bodystructure and
-            !want_body_text_only and !want_internaldate;
+        // Don't read the message file for a flags, UID or size-only request.
+        const metadata_only = !has_sections and !want_rfc822_header and !want_rfc822_body and
+            !want_bodystructure and !want_internaldate;
 
         var resolver = MaildirNameResolver.init(self.allocator);
         defer resolver.deinit();
@@ -3113,7 +3128,6 @@ pub const ImapSession = struct {
             const header_end = headerEnd(content);
 
             const header = content[0..header_end];
-            const body = content[header_end..];
 
             // Use the recorded internal date. Older messages keep their
             // existing timestamp or Date-header fallback.
@@ -3123,55 +3137,10 @@ pub const ImapSession = struct {
             else
                 legacyInternalDate(header, &date_buf);
 
-            // Determine content type for BODYSTRUCTURE
-            var content_type: []const u8 = "text/plain";
-            var charset: []const u8 = "UTF-8";
-            if (std.mem.indexOf(u8, header, "Content-Type: ")) |ct_pos| {
-                const ct_start = ct_pos + 14;
-                const ct_end = std.mem.indexOfScalarPos(u8, header, ct_start, '\r') orelse
-                    std.mem.indexOfScalarPos(u8, header, ct_start, '\n') orelse header.len;
-                content_type = header[ct_start..ct_end];
-                if (std.mem.indexOf(u8, content_type, "charset=")) |cs_pos| {
-                    charset = std.mem.trim(u8, content_type[cs_pos + 8 ..], " \t\"");
-                    if (std.mem.indexOfScalar(u8, charset, ';')) |semi| {
-                        charset = charset[0..semi];
-                    }
-                }
-            }
-
-            // Determine if multipart
-            const is_multipart = std.mem.indexOf(u8, content_type, "multipart/") != null;
-            const is_html = std.mem.indexOf(u8, content_type, "text/html") != null;
-
-            // Sanitize the charset so it can be safely emitted inside an IMAP
-            // quoted-string. A charset is an atom-like token; if it contains
-            // characters that would need quoting/escaping (quotes, backslash,
-            // control chars, whitespace) we fall back to a safe default rather
-            // than risk producing a malformed BODYSTRUCTURE response.
-            const safe_charset = blk_cs: {
-                if (charset.len == 0 or charset.len > 64) break :blk_cs "UTF-8";
-                for (charset) |c| {
-                    if (c == '"' or c == '\\' or c <= ' ' or c == 0x7f) break :blk_cs "UTF-8";
-                }
-                break :blk_cs charset;
-            };
-
-            // Build BODYSTRUCTURE string into a heap buffer (no fixed-size
-            // truncation). The previous fixed 512-byte buffer with `catch {}`
-            // would silently drop the structure for large values.
-            const bodystructure = if (is_multipart)
-                std.fmt.allocPrint(self.allocator, "((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"{s}\") NIL NIL \"7BIT\" {d} {d} NIL NIL NIL NIL)(\"TEXT\" \"HTML\" (\"CHARSET\" \"{s}\") NIL NIL \"7BIT\" {d} {d} NIL NIL NIL NIL) \"ALTERNATIVE\")", .{
-                    safe_charset, body.len, body.len / 40 + 1, safe_charset, body.len, body.len / 40 + 1,
-                }) catch try self.allocator.dupe(u8, "")
-            else if (is_html)
-                std.fmt.allocPrint(self.allocator, "(\"TEXT\" \"HTML\" (\"CHARSET\" \"{s}\") NIL NIL \"7BIT\" {d} {d} NIL NIL NIL NIL)", .{
-                    safe_charset, body.len, body.len / 40 + 1,
-                }) catch try self.allocator.dupe(u8, "")
+            const tree = if (want_bodystructure or has_numbered)
+                try imap_mime.Tree.parse(flag_scratch.allocator(), content, header_end)
             else
-                std.fmt.allocPrint(self.allocator, "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"{s}\") NIL NIL \"7BIT\" {d} {d} NIL NIL NIL NIL)", .{
-                    safe_charset, body.len, body.len / 40 + 1,
-                }) catch try self.allocator.dupe(u8, "");
-            defer self.allocator.free(bodystructure);
+                null;
 
             // Read actual flags from Maildir filename
             var msg_flags = MaildirFlags.fromFilename(filename);
@@ -3187,14 +3156,6 @@ pub const ImapSession = struct {
             var flag_str_buf: [256]u8 = undefined;
             const flag_str = try self.formatMessageFlags(flag_scratch.allocator(), seq - 1, msg_flags, &flag_str_buf);
 
-            // Build optional parts. Allocate dynamically so a long
-            // BODYSTRUCTURE is not truncated by a fixed-size buffer.
-            const bs_part = if (want_bodystructure)
-                std.fmt.allocPrint(self.allocator, " BODYSTRUCTURE {s}", .{bodystructure}) catch try self.allocator.dupe(u8, "")
-            else
-                try self.allocator.dupe(u8, "");
-            defer self.allocator.free(bs_part);
-
             var id_part_buf: [128]u8 = undefined;
             const id_part = if (want_internaldate) blk: {
                 var ifbs = io_compat.fixedBufferStream(&id_part_buf);
@@ -3202,70 +3163,31 @@ pub const ImapSession = struct {
                 break :blk ifbs.getWritten();
             } else @as([]const u8, "");
 
-            // One response carrying every requested item. The branches this
-            // replaced each emitted a fixed subset: a header section together
-            // with a body section lost the header, and a header section was
-            // always labelled BODY[HEADER] whatever was asked for.
-            var resp: std.ArrayList(u8) = .empty;
-            defer resp.deinit(self.allocator);
-            try resp.print(self.allocator, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d}{s}{s}", .{
-                seq, uid, flag_str, content.len, id_part, bs_part,
-            });
-
-            if (header_section) |hs| {
-                const filtered: ?[]u8 = switch (hs.kind) {
-                    .all => null,
-                    .fields => try filterHeaderFields(self.allocator, header, hs.fields, true),
-                    .fields_not => try filterHeaderFields(self.allocator, header, hs.fields, false),
-                };
-                defer if (filtered) |f| self.allocator.free(f);
-                const data = filtered orelse header;
-                // RFC 3501 7.4.2: the section is echoed as requested, so the
-                // client can match the data to the item it asked for.
-                if (hs.rfc822) {
-                    try resp.print(self.allocator, " RFC822.HEADER {{{d}}}\r\n", .{data.len});
-                } else {
-                    try resp.print(self.allocator, " BODY[{s}] {{{d}}}\r\n", .{ hs.spec, data.len });
-                }
-                try resp.appendSlice(self.allocator, data);
+            const a = flag_scratch.allocator();
+            var reply: std.ArrayList([]const u8) = .empty;
+            try reply.append(a, try std.fmt.allocPrint(a, "* {d} FETCH (UID {d} FLAGS ({s}) RFC822.SIZE {d}{s}", .{
+                seq, uid, flag_str, content.len, id_part,
+            }));
+            if (want_bodystructure) {
+                var structure: std.Io.Writer.Allocating = .init(a);
+                try tree.?.writeStructure(a, &structure.writer);
+                try reply.appendSlice(a, &.{ " BODYSTRUCTURE ", structure.written() });
+            }
+            if (want_rfc822_header) {
+                const label = try std.fmt.allocPrint(a, " RFC822.HEADER {{{d}}}\r\n", .{header.len});
+                try reply.appendSlice(a, &.{ label, header });
+            }
+            sections.cursor = 0;
+            while (sections.next()) |section| try section.appendReply(a, &reply, content, header, tree);
+            if (want_rfc822_body and !has_sections) {
+                const legacy: FetchSections.Section = .{ .spec = "", .peek = false };
+                try legacy.appendReply(a, &reply, content, header, null);
             }
 
-            if (want_body_text_only) {
-                // BODY[TEXT] or BODY.PEEK[TEXT] — just the body (after headers),
-                // with a partial <offset.count> applied if requested.
-                const text_data = if (partial_offset) |off| blk: {
-                    if (off >= body.len) break :blk @as([]const u8, "");
-                    const remaining = body[off..];
-                    if (partial_count) |cnt| break :blk remaining[0..@min(cnt, remaining.len)];
-                    break :blk remaining;
-                } else body;
-                if (partial_offset) |off| {
-                    try resp.print(self.allocator, " BODY[TEXT]<{d}> {{{d}}}\r\n", .{ off, text_data.len });
-                } else {
-                    try resp.print(self.allocator, " BODY[TEXT] {{{d}}}\r\n", .{text_data.len});
-                }
-                try resp.appendSlice(self.allocator, text_data);
-            } else if (has_body_section) {
-                // Numbered MIME part: the body text, under the part it was asked for.
-                try resp.print(self.allocator, " BODY[{s}] {{{d}}}\r\n", .{ numberedPartSpec(items_raw) orelse "1", body.len });
-                try resp.appendSlice(self.allocator, body);
-            } else if (want_full_body) {
-                const fetch_data = if (partial_offset) |off| blk: {
-                    if (off >= content.len) break :blk @as([]const u8, "");
-                    const remaining = content[off..];
-                    if (partial_count) |cnt| break :blk remaining[0..@min(cnt, remaining.len)];
-                    break :blk remaining;
-                } else content;
-                if (partial_offset) |off| {
-                    try resp.print(self.allocator, " BODY[]<{d}> {{{d}}}\r\n", .{ off, fetch_data.len });
-                } else {
-                    try resp.print(self.allocator, " BODY[] {{{d}}}\r\n", .{fetch_data.len});
-                }
-                try resp.appendSlice(self.allocator, fetch_data);
-            }
-
-            try resp.appendSlice(self.allocator, ")\r\n");
-            try self.writeData(resp.items);
+            // Send the literal slices in order without copying attachments
+            // into another message-sized buffer for each requested section.
+            for (reply.items) |bytes| try self.writeData(bytes);
+            try self.writeData(")\r\n");
         }
 
         try self.sendResponse(tag, "OK", "FETCH completed");
@@ -5259,23 +5181,21 @@ test "the header ends at the first blank line, whichever line ending it uses" {
 }
 
 test "header sections are parsed as requested" {
-    const fields = parseHeaderSection("(UID BODY.PEEK[HEADER.FIELDS (SUBJECT FROM DATE)])").?;
+    const fields = parseHeaderSpec("HEADER.FIELDS (SUBJECT FROM DATE)").?;
     try std.testing.expectEqual(HeaderSection.Kind.fields, fields.kind);
-    try std.testing.expectEqualStrings("HEADER.FIELDS (SUBJECT FROM DATE)", fields.spec);
     try std.testing.expectEqualStrings("SUBJECT FROM DATE", fields.fields);
 
-    const not = parseHeaderSection("BODY[HEADER.FIELDS.NOT (Received)]").?;
+    const not = parseHeaderSpec("HEADER.FIELDS.NOT (Received)").?;
     try std.testing.expectEqual(HeaderSection.Kind.fields_not, not.kind);
     try std.testing.expectEqualStrings("Received", not.fields);
 
-    const all = parseHeaderSection("body.peek[header]").?;
+    const all = parseHeaderSpec("header").?;
     try std.testing.expectEqual(HeaderSection.Kind.all, all.kind);
-    try std.testing.expectEqualStrings("header", all.spec);
 
-    try std.testing.expect(parseHeaderSection("RFC822.HEADER").?.rfc822);
-    try std.testing.expect(parseHeaderSection("(FLAGS BODY.PEEK[TEXT])") == null);
-    try std.testing.expect(parseHeaderSection("BODY[1]") == null);
-    try std.testing.expect(parseHeaderSection("RFC822.SIZE") == null);
+    try std.testing.expect(fetchHasAtom("RFC822.HEADER", "RFC822.HEADER"));
+    try std.testing.expect(parseHeaderSpec("TEXT") == null);
+    try std.testing.expect(parseHeaderSpec("1") == null);
+    try std.testing.expect(parseHeaderSpec("RFC822.SIZE") == null);
 }
 
 test "header fields are filtered with their continuation lines, in order" {
@@ -5295,9 +5215,17 @@ test "header fields are filtered with their continuation lines, in order" {
 }
 
 test "numbered body parts are echoed as requested" {
-    try std.testing.expectEqualStrings("1.2", numberedPartSpec("(BODY.PEEK[1.2])").?);
-    try std.testing.expectEqualStrings("1", numberedPartSpec("BODY[1]").?);
-    try std.testing.expect(numberedPartSpec("BODY[TEXT]") == null);
+    var sections: FetchSections = .{ .items = "(BODY.PEEK[1.2]<1.5> body[1] BODY[TEXT])" };
+    const nested = sections.next().?;
+    try std.testing.expectEqualStrings("1.2", nested.spec);
+    try std.testing.expect(nested.peek and nested.numbered());
+    try std.testing.expectEqual(@as(usize, 1), nested.partial.?.offset);
+    try std.testing.expectEqual(@as(usize, 5), nested.partial.?.count);
+    const first = sections.next().?;
+    try std.testing.expectEqualStrings("1", first.spec);
+    try std.testing.expect(!first.peek and first.numbered() and first.partial == null);
+    try std.testing.expect(!sections.next().?.numbered());
+    try std.testing.expect(sections.next() == null);
 }
 
 /// A real ImapSession on one end of a socketpair, in a scratch directory with
