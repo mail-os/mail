@@ -263,6 +263,18 @@ fn observance(a: Allocator, component: icalendar.Component) !Observance {
 pub const Zone = struct {
     rules: []const Observance,
 
+    pub const AnnualTransition = struct {
+        month: u16,
+        weekday: u16,
+        week: u16,
+        seconds: i64,
+    };
+
+    pub const AnnualOffsets = struct {
+        standard: i64,
+        daylight: ?struct { offset: i64, starts: AnnualTransition, ends: AnnualTransition } = null,
+    };
+
     pub fn parse(a: Allocator, component: icalendar.Component) !Zone {
         var rules: std.ArrayList(Observance) = .empty;
         for (try icalendar.childComponents(a, component)) |child| {
@@ -303,6 +315,59 @@ pub const Zone = struct {
             };
         }
         return extreme;
+    }
+
+    /// A zone with either a fixed offset or one repeating pair of transitions
+    /// from the given date forward. Historical or irregular future changes
+    /// cannot be described by this shape.
+    pub fn annualOffsets(self: Zone, from: Date) ?AnnualOffsets {
+        var standard: ?Observance = null;
+        var daylight: ?Observance = null;
+        for (self.rules) |rule| {
+            if (rule.from == rule.to) continue;
+            if (rule.start.epoch() > from.epoch()) return null;
+            for (rule.dates.items) |date| {
+                const wall = date.epoch() + if (date.kind == .utc) rule.from else @as(i64, 0);
+                if (wall > from.epoch()) return null;
+            }
+            const yearly = rule.rule orelse continue;
+            if (yearly.until) |until| {
+                if (until.epoch() + (if (until.kind == .utc) rule.from else @as(i64, 0)) < from.epoch()) continue;
+            }
+            if (yearly.count) |count| if (rule.start.year + (count - 1) * yearly.interval < from.year) continue;
+            const slot = if (rule.to > rule.from) &daylight else &standard;
+            if (slot.* != null) return null;
+            slot.* = rule;
+        }
+        if (standard == null and daylight == null) return .{ .standard = self.offsetAt(from) };
+        const fall = standard orelse return null;
+        const spring = daylight orelse return null;
+        if (fall.from != spring.to or fall.to != spring.from) return null;
+        const begins = annualTransition(spring) orelse return null;
+        const ends = annualTransition(fall) orelse return null;
+        // The current offset must agree with the selected annual pair. This
+        // also excludes periods where a one-off adjustment is still in force.
+        const spring_onset = spring.rule.?.occurrence(spring.start, from.year) orelse return null;
+        const fall_onset = fall.rule.?.occurrence(fall.start, from.year) orelse return null;
+        const in_daylight = if (spring_onset.epoch() < fall_onset.epoch())
+            from.epoch() >= spring_onset.epoch() and from.epoch() < fall_onset.epoch()
+        else
+            from.epoch() >= spring_onset.epoch() or from.epoch() < fall_onset.epoch();
+        if (self.offsetAt(from) != (if (in_daylight) spring.to else fall.to)) return null;
+        return .{ .standard = fall.to, .daylight = .{ .offset = spring.to, .starts = begins, .ends = ends } };
+    }
+
+    fn annualTransition(rule: Observance) ?AnnualTransition {
+        const yearly = rule.rule.?;
+        if (yearly.until != null or yearly.count != null or yearly.interval != 1 or yearly.month_day != null) return null;
+        const weekday = yearly.weekday orelse return null;
+        if (weekday.ordinal != -1 and (weekday.ordinal < 1 or weekday.ordinal > 4)) return null;
+        return .{
+            .month = yearly.month orelse return null,
+            .weekday = @intCast(weekday.day),
+            .week = if (weekday.ordinal == -1) 5 else @intCast(weekday.ordinal),
+            .seconds = rule.start.seconds,
+        };
     }
 
     fn wallOffset(self: Zone, date: Date) struct { offset: i64, gap: bool } {

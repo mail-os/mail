@@ -167,7 +167,12 @@ pub const CalendarEventDetail = struct {
     source_message: ?MessageReference = null,
 };
 
-pub const ActiveSyncResource = struct { id: u64, etag: []const u8 };
+pub const ActiveSyncResource = struct {
+    id: u64,
+    etag: []const u8,
+    timezone: []const u8 = "UTC",
+    recurring: bool = false,
+};
 
 pub const ActiveSyncContact = struct {
     etag: []const u8,
@@ -1321,9 +1326,15 @@ pub const CalDavStore = struct {
         var result: std.ArrayList(ActiveSyncResource) = .empty;
         if (is_calendar) {
             const id = firstOwnedCollection(self.calendars.valueIterator(), owner) orelse return &.{};
+            const timezone = try arena.dupe(u8, self.calendars.get(id).?.timezone);
             var items = self.events.valueIterator();
             while (items.next()) |event| {
-                if (event.calendar_id == id) try result.append(arena, .{ .id = event.id, .etag = try arena.dupe(u8, event.etag) });
+                if (event.calendar_id == id) try result.append(arena, .{
+                    .id = event.id,
+                    .etag = try arena.dupe(u8, event.etag),
+                    .timezone = timezone,
+                    .recurring = event.recurring,
+                });
             }
         } else {
             const id = firstOwnedCollection(self.addressbooks.valueIterator(), owner) orelse return &.{};

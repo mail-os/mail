@@ -117,16 +117,20 @@ def verify(binary):
                                start + "20270315T100000", "DURATION:PT2H")
             cancelled = event(uid, "Cancelled session", recurrence + "20270316T090000",
                               start + "20270316T090000", "STATUS:CANCELLED")
-            path = put(local, "planning", calendar(*master, *moved, *range_edit, *cancelled))
+            path = put(local, "planning", calendar(*master, *moved, *cancelled))
             allday_uid = "planning-day"
-            put(local, "planning-day", calendar(*event(allday_uid, "Planning day",
-                                                       "DTSTART;VALUE=DATE:20270320", "DURATION:P1D",
-                                                       "RDATE;VALUE=DATE:20270322")))
+            allday = event(allday_uid, "Planning day", "DTSTART;VALUE=DATE:20270320", "DURATION:P1D")
+            all_day_path = put(local, "planning-day", calendar(*allday))
             foreign_uid = "foreign-event"
             put(foreign, "study", calendar(*event(foreign_uid, "Foreign study", "DTSTART:20270314T130000Z")))
             own_ids, foreign_ids = ids(test, owner), ids(test, other)
             assert set(own_ids) == {"planning", allday_uid} and set(foreign_ids) == {"study"}, (own_ids, foreign_ids)
             item = own_ids["planning"]
+            # A device can still refer to an owned source it received before the
+            # event gained a range override or an added date.
+            headers = {"Content-Type": "text/calendar"}
+            must(local.request("PUT", path, calendar(*master, *moved, *range_edit, *cancelled), headers), 204)
+            must(local.request("PUT", all_day_path, calendar(*allday[:-1], "RDATE;VALUE=DATE:20270322", allday[-1]), headers), 204)
 
             # Run one authorized occurrence first so this fixture fails on builds that reject all InstanceIds.
             sent_boundaries(test, owner, sink, "SmartReply", item, EXACT, (

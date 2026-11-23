@@ -292,15 +292,29 @@ pub const Calendar = struct {
     pub const BusyStatus: u8 = 0x0d;
     pub const DtStamp: u8 = 0x11;
     pub const EndTime: u8 = 0x12;
+    pub const Exception: u8 = 0x13;
+    pub const Exceptions: u8 = 0x14;
+    pub const Deleted: u8 = 0x15;
+    pub const ExceptionStartTime: u8 = 0x16;
     pub const Location: u8 = 0x17;
     pub const MeetingStatus: u8 = 0x18;
     pub const OrganizerEmail: u8 = 0x19;
     pub const OrganizerName: u8 = 0x1a;
+    pub const Recurrence: u8 = 0x1b;
+    pub const Type: u8 = 0x1c;
+    pub const Until: u8 = 0x1d;
+    pub const Occurrences: u8 = 0x1e;
+    pub const Interval: u8 = 0x1f;
+    pub const DayOfWeek: u8 = 0x20;
+    pub const DayOfMonth: u8 = 0x21;
+    pub const WeekOfMonth: u8 = 0x22;
+    pub const MonthOfYear: u8 = 0x23;
     pub const Reminder: u8 = 0x24;
     pub const Sensitivity: u8 = 0x25;
     pub const Subject: u8 = 0x26;
     pub const StartTime: u8 = 0x27;
     pub const UID: u8 = 0x28;
+    pub const FirstDayOfWeek: u8 = 0x39;
 };
 
 // ============================================================================

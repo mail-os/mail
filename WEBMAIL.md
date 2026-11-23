@@ -1907,9 +1907,17 @@ Operators can inspect one managed mailbox with `mail user:local hosted-status <m
   an informational `event.ics` for the selected occurrence or the whole
   series when `InstanceId` is absent. The attachment carries no scheduling
   `METHOD`. Webmail invitation processing and RSVP are covered in [#47](https://github.com/mail-os/mail/issues/47).
-  Recurrence and exception fields in Calendar Sync are tracked in [#130](https://github.com/mail-os/mail/issues/130).
   See [SmartReply](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-ascmd/419e4fc2-d0cb-419e-a94d-df4b8da0c98f)
   and [SmartForward](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-ascmd/7dd31ff2-7b47-4968-a6ed-79ebbd3cceb8).
+- ActiveSync Calendar Sync publishes representable daily, weekly, monthly,
+  and yearly recurrence patterns with their count or end date. It sends
+  the original UTC slot for a moved or deleted exception and includes the
+  fixed or annually repeating time zone for timed series. All-day dates
+  use civil midnight. Repeat rules that ActiveSync cannot express faithfully,
+  including sub-daily recurrences, added dates, future-range edits, and
+  irregular time-zone changes, stay available in webmail and CalDAV. If a
+  synchronized series changes to an unsupported rule or exception, Calendar
+  Sync removes that series from the device. See [#130](https://github.com/mail-os/mail/issues/130).
 - ActiveSync mailbox Search matches keywords in decoded mail headers and
   plain-text bodies in the synchronized mail folders. It supports a folder
   filter, date bounds and up to 50 results per page. Searches that would

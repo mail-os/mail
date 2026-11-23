@@ -224,7 +224,7 @@ const Moment = struct {
         return .{ .date = date, .zone = zone };
     }
 
-    fn stamp(self: Moment) i64 {
+    pub fn stamp(self: Moment) i64 {
         return self.date.epoch() - (if (self.zone) |zone| zone.offsetAt(self.date) else 0);
     }
 
@@ -258,14 +258,26 @@ pub const RangeProjection = struct {
     };
 
     pub fn init(a: Allocator, master: ical.Component, components: []const ical.Component) !RangeProjection {
+        return initWithTimezone(a, master, components, "UTC");
+    }
+
+    pub fn initWithTimezone(a: Allocator, master: ical.Component, components: []const ical.Component, timezone: []const u8) !RangeProjection {
         var zones: Zones = .{};
         for (components) |component| {
             if (std.ascii.eqlIgnoreCase(component.name, "VTIMEZONE")) try zones.include(a, component);
         }
         const event = try Event.read(a, master);
         const field = event.start orelse return error.InvalidCalendar;
-        const seed = try Moment.read(a, &zones, field.value, field, null);
+        const fallback = if (field.value.len == 15 and field.param("TZID") == null and !std.ascii.eqlIgnoreCase(timezone, "UTC"))
+            try zones.get(a, timezone)
+        else
+            null;
+        const seed = try Moment.read(a, &zones, field.value, field, fallback);
         return .{ .zones = zones, .seed = seed, .seed_field = field, .master = master };
+    }
+
+    pub fn seedEnd(self: *RangeProjection, a: Allocator) !i64 {
+        return (try (try Event.read(a, self.master)).length(a, &self.zones, self.seed)).end(self.seed);
     }
 
     pub fn stamp(self: *RangeProjection, a: Allocator, field: ical.Property) !i64 {
@@ -274,12 +286,16 @@ pub const RangeProjection = struct {
     }
 
     pub fn next(self: *RangeProjection, a: Allocator, after: i64, before: i64, occupied: []const i64, budget: *usize) !?Nominal {
+        return self.nextNominal(a, after, before, occupied, budget, false);
+    }
+
+    pub fn nextNominal(self: *RangeProjection, a: Allocator, after: i64, before: i64, occupied: []const i64, budget: *usize, include_excluded: bool) !?Nominal {
         if (after >= before) return null;
         var excluded: std.AutoHashMapUnmanaged(i64, void) = .empty;
         for (occupied) |key| try excluded.put(a, key, {});
         var fields = ical.Properties.init(self.master);
         while (try fields.next(a)) |field| {
-            if (!field.named("EXDATE")) continue;
+            if (include_excluded or !field.named("EXDATE")) continue;
             var values = std.mem.splitScalar(u8, field.value, ',');
             while (values.next()) |value| {
                 const removed = try Moment.read(a, &self.zones, value, field, self.seed.zone);
@@ -570,7 +586,7 @@ fn appendResource(output: OccurrenceOutput, scratch: Allocator, source: []const 
             if (output.ignores(item.status orelse .confirmed, item.transparent orelse false)) continue;
             if (item.recurrence_id.?.param("RANGE") != null) return error.AvailabilityUnsupported;
             const field = item.start orelse return error.InvalidCalendar;
-            const start = try Moment.read(scratch, &zones, field.value, field, fallback);
+            const start = try Moment.read(scratch, &zones, field.value, field, if (output.instance != null and field.value.len == 8) null else fallback);
             const length = try item.length(scratch, &zones, start);
             const recurrence = if (output.instance != null) blk: {
                 const original = item.recurrence_id.?;
@@ -583,7 +599,7 @@ fn appendResource(output: OccurrenceOutput, scratch: Allocator, source: []const 
     };
     if (output.instance) |selection| selection.master = event.component;
     const start_field = event.start orelse return error.InvalidCalendar;
-    const start = try Moment.read(scratch, &zones, start_field.value, start_field, fallback);
+    const start = try Moment.read(scratch, &zones, start_field.value, start_field, if (output.instance != null and start_field.value.len == 8) null else fallback);
     const length = try event.length(scratch, &zones, start);
     var exclude: std.AutoHashMapUnmanaged(i64, void) = .empty;
     var ranges: std.ArrayList(RangeEdit) = .empty;
@@ -684,7 +700,7 @@ fn appendResource(output: OccurrenceOutput, scratch: Allocator, source: []const 
 const Frequency = enum { secondly, minutely, hourly, daily, weekly, monthly, yearly };
 const Weekday = struct { day_of_week: i64, ordinal: i8 = 0 };
 
-const Rule = struct {
+pub const Rule = struct {
     frequency: Frequency,
     interval: i64 = 1,
     count: ?i64 = null,
@@ -699,7 +715,7 @@ const Rule = struct {
     minutes: u64 = 0,
     seconds: u64 = 0,
 
-    fn parse(a: Allocator, source: []const u8) !Rule {
+    pub fn parse(a: Allocator, source: []const u8) !Rule {
         var result: Rule = .{ .frequency = .daily };
         var frequency: ?Frequency = null;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
@@ -761,7 +777,7 @@ const Rule = struct {
         return result;
     }
 
-    fn matches(self: Rule, seed: Date, date: Date) bool {
+    pub fn matches(self: Rule, seed: Date, date: Date) bool {
         if (self.months != 0 and self.months & (@as(u12, 1) << @intCast(date.month - 1)) == 0) return false;
         if (self.frequency == .yearly and self.months == 0 and self.month_days.len == 0 and
             self.year_days.len == 0 and self.weekdays.len == 0 and date.month != seed.month)

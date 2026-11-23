@@ -9,6 +9,7 @@ const database = @import("../storage/database.zig");
 const caldav_store = @import("../storage/caldav_store.zig");
 const search = @import("eas_search.zig");
 const sync_state = @import("eas_state.zig");
+const calendar_wire = @import("eas_calendar.zig");
 const icalendar = @import("icalendar.zig");
 const recurrence = @import("icalendar_busy.zig");
 const webmail_maildir = @import("../api/webmail_maildir.zig");
@@ -1419,10 +1420,24 @@ fn collectionChanges(a: std.mem.Allocator, ctx: *Context, user_id: i64, original
         const items = try ctx.store.snapshotActiveSyncResources(a, ctx.username, original.is_calendar);
         for (items) |item| {
             const id = try std.fmt.allocPrint(a, "{d}", .{item.id});
+            const tag = if (original.is_calendar) try calendarTag(a, ctx, item.etag, item.timezone) else item.etag;
+            if (original.is_calendar and item.recurring) {
+                const prior = previous.get(id) orelse "";
+                if (!std.mem.eql(u8, prior, tag)) {
+                    var scratch = std.heap.ArenaAllocator.init(a);
+                    defer scratch.deinit();
+                    const local = scratch.allocator();
+                    const snapshot = ctx.store.snapshotActiveSyncEvent(local, ctx.username, item.id) catch |err| switch (err) {
+                        error.EventNotFound => continue,
+                        else => return err,
+                    };
+                    if ((try projectSeries(local, ctx, snapshot.detail, snapshot.timezone)) == null) continue;
+                }
+            }
             try current.put(a, id, {});
             try appendChanged(a, &changes, previous, .{
                 .id = id,
-                .tag = item.etag,
+                .tag = tag,
                 .data = if (original.is_calendar) .{ .event = item.id } else .{ .contact = item.id },
             });
         }
@@ -1432,6 +1447,19 @@ fn collectionChanges(a: std.mem.Allocator, ctx: *Context, user_id: i64, original
         if (!current.contains(id.*)) try changes.append(a, .{ .kind = A.Remove, .id = id.* });
     }
     return changes.items;
+}
+
+fn calendarTag(a: std.mem.Allocator, ctx: *const Context, etag: []const u8, timezone: []const u8) ![]const u8 {
+    // Refresh existing device snapshots once to replace the earlier one-off
+    // representation. A device's negotiated version affects the wire fields.
+    return std.fmt.allocPrint(a, "calendar-1:{d}:{s}:{s}", .{ ctx.protocol_version, timezone, etag });
+}
+
+fn projectSeries(a: std.mem.Allocator, ctx: *const Context, detail: caldav_store.CalendarEventDetail, timezone: []const u8) !?calendar_wire.Series {
+    return calendar_wire.project(a, detail, timezone, ctx.protocol_version) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
 }
 
 fn usesLegacyMailIds(folder: FolderDef, items: sync_state.Items) bool {
@@ -1511,9 +1539,14 @@ fn writeSyncChange(a: std.mem.Allocator, ctx: *Context, w: *wbxml.Writer, change
         switch (item.data) {
             .mail => |mail| try writeMailAppData(a, w, mail),
             .event => |id| {
-                const event = try ctx.store.snapshotMailboxEvent(a, ctx.username, id);
-                if (!std.mem.eql(u8, item.tag, event.event.etag)) return error.RevisionChanged;
-                try writeEventAppData(a, w, event);
+                const event = try ctx.store.snapshotActiveSyncEvent(a, ctx.username, id);
+                if (!std.mem.eql(u8, item.tag, try calendarTag(a, ctx, event.detail.event.etag, event.timezone)))
+                    return error.RevisionChanged;
+                const series = if (event.detail.event.recurring)
+                    (try projectSeries(a, ctx, event.detail, event.timezone)) orelse return error.RevisionChanged
+                else
+                    null;
+                try writeEventAppData(a, w, event.detail, series);
             },
             .contact => |id| {
                 const contact = try ctx.store.snapshotActiveSyncContact(a, ctx.username, id);
@@ -1756,17 +1789,19 @@ fn writeMailAppData(a: std.mem.Allocator, w: *wbxml.Writer, it: MailItem) !void 
     try w.end(); // Body
 }
 
-fn writeEventAppData(a: std.mem.Allocator, w: *wbxml.Writer, detail: caldav_store.CalendarEventDetail) !void {
+fn writeEventAppData(a: std.mem.Allocator, w: *wbxml.Writer, detail: caldav_store.CalendarEventDetail, series: ?calendar_wire.Series) !void {
     const C = wbxml.Calendar;
-    const B = wbxml.AirSyncBase;
     const page = wbxml.Page.calendar;
 
     const ev = detail.event;
+    const start = if (series) |value| value.start else ev.start;
+    const default_duration: i64 = if (ev.all_day) 86400 else 3600;
+    const end = if (series) |value| value.end else ev.end orelse (ev.start + default_duration);
     try w.element(page, C.UID, ev.uid);
-    try w.element(page, C.Subject, ev.summary);
-    if (ev.location) |loc| try w.element(page, C.Location, loc);
-    try w.element(page, C.StartTime, compactFromEpoch(a, ev.start));
-    try w.element(page, C.EndTime, compactFromEpoch(a, ev.end orelse (ev.start + 3600)));
+    try w.element(page, C.Subject, if (series) |value| value.title else ev.summary);
+    if (if (series) |value| value.location else ev.location) |loc| try w.element(page, C.Location, loc);
+    try w.element(page, C.StartTime, compactFromEpoch(a, start));
+    try w.element(page, C.EndTime, compactFromEpoch(a, end));
     try w.element(page, C.DtStamp, compactFromEpoch(a, detail.modified_at));
     try w.element(page, C.AllDayEvent, if (ev.all_day) "1" else "0");
     try w.element(page, C.BusyStatus, "2"); // busy
@@ -1776,16 +1811,58 @@ fn writeEventAppData(a: std.mem.Allocator, w: *wbxml.Writer, detail: caldav_stor
         try w.element(page, C.OrganizerEmail, org);
         try w.element(page, C.OrganizerName, org);
     }
-    if (detail.description) |desc| {
-        try w.startTag(wbxml.Page.air_sync_base, B.Body);
-        try w.element(wbxml.Page.air_sync_base, B.Type, "1");
-        try w.elementInt(wbxml.Page.air_sync_base, B.EstimatedDataSize, @intCast(desc.len));
-        try w.element(wbxml.Page.air_sync_base, B.Truncated, "0");
-        try w.startTag(wbxml.Page.air_sync_base, B.Data);
-        try w.text(desc);
-        try w.end();
+    if (if (series) |value| value.description else detail.description) |desc| try writeCalendarBody(w, desc);
+    if (series) |value| try writeCalendarRecurrence(a, w, value);
+}
+
+fn writeCalendarBody(w: *wbxml.Writer, text: []const u8) !void {
+    const B = wbxml.AirSyncBase;
+    const page = wbxml.Page.air_sync_base;
+    try w.startTag(page, B.Body);
+    try w.element(page, B.Type, "1");
+    try w.elementInt(page, B.EstimatedDataSize, @intCast(text.len));
+    try w.element(page, B.Truncated, "0");
+    try w.startTag(page, B.Data);
+    try w.text(text);
+    try w.end();
+    try w.end();
+}
+
+fn writeCalendarRecurrence(a: std.mem.Allocator, w: *wbxml.Writer, series: calendar_wire.Series) !void {
+    const C = wbxml.Calendar;
+    const page = wbxml.Page.calendar;
+    if (series.timezone) |zone| {
+        var encoded: [232]u8 = undefined;
+        try w.element(page, C.Timezone, std.base64.standard.Encoder.encode(&encoded, &zone));
+    }
+    try w.startTag(page, C.Recurrence);
+    const rule = series.pattern;
+    try w.elementInt(page, C.Type, rule.kind);
+    try w.elementInt(page, C.Interval, rule.interval);
+    if (rule.count) |count| try w.elementInt(page, C.Occurrences, count);
+    if (rule.until) |until| try w.element(page, C.Until, compactFromEpoch(a, until));
+    if (rule.first_day) |first| try w.elementInt(page, C.FirstDayOfWeek, first);
+    if (rule.weekdays) |days| try w.elementInt(page, C.DayOfWeek, days);
+    if (rule.month_day) |date| try w.elementInt(page, C.DayOfMonth, date);
+    if (rule.week) |week| try w.elementInt(page, C.WeekOfMonth, week);
+    if (rule.month) |month| try w.elementInt(page, C.MonthOfYear, month);
+    try w.end();
+    // An empty exceptions element clears any exceptions the device saw before.
+    try w.startTag(page, C.Exceptions);
+    for (series.exceptions) |exception| {
+        try w.startTag(page, C.Exception);
+        try w.element(page, C.ExceptionStartTime, compactFromEpoch(a, exception.original));
+        try w.element(page, C.Deleted, if (exception.moved == null) "1" else "0");
+        if (exception.moved) |moved| {
+            try w.element(page, C.StartTime, compactFromEpoch(a, moved.start));
+            try w.element(page, C.EndTime, compactFromEpoch(a, moved.end));
+            if (moved.summary) |summary| try w.element(page, C.Subject, summary);
+            if (moved.location) |location| try w.element(page, C.Location, location);
+            if (moved.description) |description| try writeCalendarBody(w, description);
+        }
         try w.end();
     }
+    try w.end();
 }
 
 fn writeContactAppData(w: *wbxml.Writer, c: caldav_store.ActiveSyncContact) !void {
