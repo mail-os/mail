@@ -5164,6 +5164,16 @@ pub const Database = struct {
         return uid;
     }
 
+    /// Retire an unpublished destination UID without reusing its number.
+    pub fn discardMoveUid(self: *Database, username: []const u8, mailbox: []const u8, uid: i64) !void {
+        const stmt = try self.prepare("DELETE FROM imap_uids WHERE username=?1 AND mailbox=?2 AND uid=?3");
+        defer stmt.finalize();
+        try stmt.bind(1, username);
+        try stmt.bind(2, mailbox);
+        try stmt.bind(3, uid);
+        _ = try stmt.step();
+    }
+
     fn assignUidInTxn(self: *Database, username: []const u8, mailbox: []const u8, filename: []const u8) !i64 {
         // Key on the flag-suffix-stripped base name (see maildirBaseName).
         const base = maildirBaseName(filename);

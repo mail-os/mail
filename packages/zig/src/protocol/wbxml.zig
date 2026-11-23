@@ -40,6 +40,7 @@ pub const Page = struct {
     pub const contacts: u8 = 1;
     pub const email: u8 = 2;
     pub const calendar: u8 = 4;
+    pub const move: u8 = 5;
     pub const get_item_estimate: u8 = 6;
     pub const folder_hierarchy: u8 = 7;
     pub const ping: u8 = 13;
@@ -150,6 +151,17 @@ pub const FolderHierarchy = struct {
     pub const FolderUpdate: u8 = 0x15;
     pub const FolderSync: u8 = 0x16;
     pub const Count: u8 = 0x17;
+};
+
+pub const Move = struct {
+    pub const MoveItems: u8 = 0x05;
+    pub const Move: u8 = 0x06;
+    pub const SrcMsgId: u8 = 0x07;
+    pub const SrcFldId: u8 = 0x08;
+    pub const DstFldId: u8 = 0x09;
+    pub const Response: u8 = 0x0a;
+    pub const Status: u8 = 0x0b;
+    pub const DstMsgId: u8 = 0x0c;
 };
 
 pub const Provision = struct {

@@ -277,15 +277,20 @@ pub fn nextDraftEdit(a: std.mem.Allocator, db: *database.Database, cursor: *i64)
 /// Other protocols call this while holding the mailbox mutation lock.
 pub fn managesDraftFile(db: *database.Database, user: []const u8, filename: []const u8) !bool {
     const uid = (try db.getUidForFile(user, "Drafts", filename)) orelse return false;
+    return managesDraftAt(db, user, "Drafts", uid);
+}
+
+pub fn managesDraftAt(db: *database.Database, user: []const u8, folder: []const u8, uid: i64) !bool {
     {
         const schema = try db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='webmail_records'");
         defer schema.finalize();
         if (!try schema.step()) return false;
     }
-    const stmt = try db.prepare("SELECT 1 FROM webmail_records WHERE username=?1 AND kind='draft' AND json_extract(payload,'$.folder')='Drafts' AND json_extract(payload,'$.uid')=?2 LIMIT 1");
+    const stmt = try db.prepare("SELECT 1 FROM webmail_records WHERE username=?1 AND kind='draft' AND json_extract(payload,'$.folder')=?2 AND json_extract(payload,'$.uid')=?3 LIMIT 1");
     defer stmt.finalize();
     try stmt.bind(1, user);
-    try stmt.bind(2, uid);
+    try stmt.bind(2, folder);
+    try stmt.bind(3, uid);
     return stmt.step();
 }
 

@@ -1372,16 +1372,32 @@ pub fn moveForRetentionLocked(a: std.mem.Allocator, db: *database.Database, user
 }
 
 fn moveFileLocked(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, src_folder: []const u8, ref: FileRef, dst_folder: []const u8, effect: ?message_refs.MoveEffect) !i64 {
+    const folder = message_refs.location(dst_folder, ref.name).folder;
+    if (std.mem.eql(u8, folder, "INBOX")) return moveResolvedFileLocked(allocator, db, user, src_folder, ref, dst_folder, &.{
+        try std.fmt.allocPrint(allocator, "mail/{s}/new", .{user}),
+        try std.fmt.allocPrint(allocator, "mail/{s}/cur", .{user}),
+    }, effect);
+    const dir = try std.fmt.allocPrint(allocator, "mail/{s}/{s}", .{ user, folder });
+    return moveResolvedFileLocked(allocator, db, user, src_folder, ref, dst_folder, &.{dir}, effect);
+}
+
+/// Move a resolved file within one mailbox under the mutation lock. The
+/// resolver supplies the collection's directories, preferred destination first.
+pub fn moveResolvedFileLocked(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, src_folder: []const u8, ref: FileRef, dst_folder: []const u8, destination_dirs: []const []const u8, effect: ?message_refs.MoveEffect) !i64 {
     if (!isSafeName(ref.name)) return MaildirError.WriteFailed;
     const source = message_refs.location(src_folder, ref.name);
     const target = message_refs.location(dst_folder, ref.name);
-
-    // Destination dir: INBOX lives in new/, other folders in the folder dir.
-    const dst_dir = if (std.mem.eql(u8, target.folder, "INBOX"))
-        try std.fmt.allocPrint(allocator, "mail/{s}/new", .{user})
-    else
-        try std.fmt.allocPrint(allocator, "mail/{s}/{s}", .{ user, target.folder });
-    fs_compat.ensureDir(dst_dir) catch {};
+    const dst_dir = destination_dirs[0];
+    try fs_compat.ensureDir(dst_dir);
+    for (destination_dirs) |dir| {
+        const names = fs_compat.listEmlFiles(allocator, dir) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        for (names) |name| {
+            if (std.mem.eql(u8, database.maildirBaseName(name), target.basename)) return MaildirError.Conflict;
+        }
+    }
 
     const old_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ref.dir, ref.name });
     const source_bits = maildir_keywords.fromFilename(ref.name);
@@ -1393,9 +1409,8 @@ fn moveFileLocked(allocator: std.mem.Allocator, db: *database.Database, user: []
     // is correct regardless of the physical move; doing it before the move means
     // a UID failure aborts cleanly without leaving an orphaned file, and the
     // returned UID is always the real destination UID (never a stale source one).
-    // A destination that already contains this name must not be overwritten.
-    if (try fileAt(allocator, user, target) != null) return MaildirError.Conflict;
     const dst_uid = try db.assignFreshUid(user, dst_folder, ref.name);
+    errdefer db.discardMoveUid(user, dst_folder, dst_uid) catch |err| std.log.warn("could not discard an unpublished move UID: {}", .{err});
     const transfer = try message_refs.stageMove(allocator, db, user, source, old_path, target, null, effect);
     if (effect != null and transfer == null) return MaildirError.Conflict;
     errdefer if (transfer) |id| message_refs.cancel(db, user, id);
@@ -1403,7 +1418,7 @@ fn moveFileLocked(allocator: std.mem.Allocator, db: *database.Database, user: []
     // Prefer an atomic rename; fall back to copy+unlink across filesystems.
     if (!renamePath(old_path, new_path)) {
         const content = fs_compat.readFileAlloc(allocator, old_path) catch return MaildirError.WriteFailed;
-        const f = fs_compat.cwd().createFile(new_path, .{}) catch return MaildirError.WriteFailed;
+        const f = fs_compat.cwd().createFileExclusive(new_path) catch return MaildirError.WriteFailed;
         f.writeAll(content) catch {
             f.close();
             unlinkPath(allocator, new_path) catch {}; // don't leave a partial copy

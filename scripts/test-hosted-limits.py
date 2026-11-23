@@ -150,7 +150,7 @@ class MailClient:
                    "Content-Type": "message/rfc822" if legacy else "application/vnd.ms-sync.wbxml"}
         if encoded:
             commands = {"SendMail": 1, "Sync": 0, "SmartForward": 2, "SmartReply": 3,
-                        "GetItemEstimate": 14, "Search": 16, "Ping": 18}
+                        "MoveItems": 13, "GetItemEstimate": 14, "Search": 16, "Ping": 18}
             packed = bytes([121 if legacy else 141, commands[command], 9, 4, len(device)])
             packed += device.encode() + b"\x00\x0aSmartPhone"
             if save:
@@ -898,7 +898,7 @@ def synced_mail_item(test, mailbox, device, folder="1"):
     status, _, bootstrap = test.eas(mailbox, eas_sync(0, folder), command="Sync", device=device)
     assert status == 200, bootstrap
     status, _, body = test.eas(mailbox, eas_sync(eas_sync_key(bootstrap), folder), command="Sync", device=device)
-    item = re.search(rb"\x4d\x03(" + folder.encode() + rb":[0-9]+)\x00", body)
+    item = re.search(rb"\x4d\x03(" + folder.encode() + rb":[0-9]+(?::[0-9a-f]{32})?)\x00", body)
     assert status == 200 and item, body
     return folder, item.group(1).decode()
 

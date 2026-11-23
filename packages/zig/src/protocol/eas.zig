@@ -10,11 +10,13 @@ const caldav_store = @import("../storage/caldav_store.zig");
 const search = @import("eas_search.zig");
 const sync_state = @import("eas_state.zig");
 const webmail_maildir = @import("../api/webmail_maildir.zig");
+const webmail_store = @import("../api/webmail_store.zig");
 const snapshots = @import("../api/webmail_snapshots.zig");
 const message_refs = @import("../storage/message_refs.zig");
 const thread_ids = @import("../message/thread_ids.zig");
 const fs_compat = @import("../core/fs_compat.zig");
 const io_compat = @import("../core/io_compat.zig");
+const maildir_path = @import("../core/maildir_path.zig");
 const time_compat = @import("../core/time_compat.zig");
 
 /// Exchange ActiveSync command handlers (MS-ASCMD), transport-agnostic.
@@ -108,9 +110,7 @@ pub fn dispatch(ctx: *Context, cmd: []const u8, body: []const u8) !Response {
     if (std.ascii.eqlIgnoreCase(cmd, "SmartReply")) return handleComposeMail(ctx, .smart_reply, body);
     if (std.ascii.eqlIgnoreCase(cmd, "SmartForward")) return handleComposeMail(ctx, .smart_forward, body);
     if (std.ascii.eqlIgnoreCase(cmd, "Search")) return handleSearch(ctx, body);
-    for ([_][]const u8{ "MoveItems", "FolderCreate", "FolderUpdate", "FolderDelete" }) |unsupported| {
-        if (std.ascii.eqlIgnoreCase(cmd, unsupported)) return .{ .status = 501 };
-    }
+    if (std.ascii.eqlIgnoreCase(cmd, "MoveItems")) return handleMoveItems(ctx, body);
     if (std.mem.eql(u8, cmd, "Provision")) return handleProvision(ctx, body);
     if (std.mem.eql(u8, cmd, "FolderSync")) return handleFolderSync(ctx, body);
     const command = std.meta.stringToEnum(enum { Sync, GetItemEstimate, Ping }, cmd) orelse return .{ .status = 501 };
@@ -409,7 +409,12 @@ fn sourceMime(a: std.mem.Allocator, ctx: *Context, user_id: i64, source: Message
     const reference = if (source.long_id) |id| try resolveSearchId(a, ctx, user_id, id) else blk: {
         const folder = folderById(source.folder_id orelse "1") orelse return error.ItemNotFound;
         if (folder.mailbox == null) return error.UnsupportedItem;
-        break :blk MailReference{ .folder = folder, .uid = try itemUid(folder.id, source.item_id orelse return error.InvalidIds) };
+        const id = source.item_id orelse return error.InvalidIds;
+        const uid = if (std.mem.count(u8, id, ":") == 2)
+            (try resolveMailItemId(a, ctx, user_id, folder, id)).uid
+        else
+            try itemUid(folder.id, id);
+        break :blk MailReference{ .folder = folder, .uid = uid };
     };
     const folder = reference.folder;
     const mailbox = folder.mailbox orelse return error.UnsupportedItem;
@@ -506,10 +511,10 @@ fn searchKey(db: *database.Database, user_id: i64, create: bool) !SearchKey {
     return key;
 }
 
-fn searchSignature(key: SearchKey, folder_id: []const u8, uid: i64, validity: i64, filename: []const u8) [64]u8 {
+fn mailIdSignature(key: SearchKey, domain: []const u8, folder_id: []const u8, uid: i64, validity: i64, filename: []const u8) [64]u8 {
     const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
     var mac = Hmac.init(&key);
-    mac.update("mail/eas-search/v1\x00");
+    mac.update(domain);
     var numbers: [16]u8 = undefined;
     std.mem.writeInt(i64, numbers[0..8], uid, .big);
     std.mem.writeInt(i64, numbers[8..16], validity, .big);
@@ -520,6 +525,34 @@ fn searchSignature(key: SearchKey, folder_id: []const u8, uid: i64, validity: i6
     var digest: [Hmac.mac_length]u8 = undefined;
     mac.final(&digest);
     return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn searchSignature(key: SearchKey, folder_id: []const u8, uid: i64, validity: i64, filename: []const u8) [64]u8 {
+    return mailIdSignature(key, "mail/eas-search/v1\x00", folder_id, uid, validity, filename);
+}
+
+const item_tag_len = 32; // 128 bits, to keep Sync and MoveItems IDs within 64 characters.
+const item_id_domain = "mail/eas-item/v1\x00";
+
+fn formatMailItemId(buf: []u8, key: SearchKey, folder: FolderDef, uid: i64, validity: i64, base: []const u8) []const u8 {
+    const tag = mailIdSignature(key, item_id_domain, folder.id, uid, validity, base);
+    return std.fmt.bufPrint(buf, "{s}:{d}:{s}", .{ folder.id, uid, tag[0..item_tag_len] }) catch unreachable;
+}
+
+fn resolveMailItemId(a: std.mem.Allocator, ctx: *Context, user_id: i64, folder: FolderDef, id: []const u8) !struct { uid: i64, base: []const u8 } {
+    if (id.len > 64) return error.ItemNotFound;
+    var parts = std.mem.splitScalar(u8, id, ':');
+    if (!std.mem.eql(u8, parts.first(), folder.id)) return error.InvalidIdCombination;
+    const uid = itemUid(folder.id, parts.next() orelse return error.ItemNotFound) catch return error.ItemNotFound;
+    const tag = parts.next() orelse return error.ItemNotFound;
+    if (tag.len != item_tag_len or parts.next() != null) return error.ItemNotFound;
+    const mailbox = folder.mailbox orelse return error.ItemNotFound;
+    const base = (try ctx.db.getFilenameForUid(a, ctx.username, mailbox, uid)) orelse return error.ItemNotFound;
+    const generation = try ctx.db.getOrCreateMailbox(ctx.username, mailbox);
+    const key = try searchKey(ctx.db, user_id, false);
+    const expected = mailIdSignature(key, item_id_domain, folder.id, uid, generation.uidvalidity, base);
+    if (!std.crypto.timing_safe.eql([item_tag_len]u8, expected[0..item_tag_len].*, tag[0..item_tag_len].*)) return error.ItemNotFound;
+    return .{ .uid = uid, .base = base };
 }
 
 fn resolveSearchId(a: std.mem.Allocator, ctx: *Context, user_id: i64, id: []const u8) !MailReference {
@@ -786,6 +819,128 @@ fn handleFolderSync(ctx: *Context, body: []const u8) !Response {
     return Response{ .body = try w.toOwnedSlice() };
 }
 
+const MoveRequest = struct {
+    id: []const u8,
+    source: []const u8,
+    destination: []const u8,
+};
+
+fn parseMove(node: wbxml.Node) !MoveRequest {
+    const M = wbxml.Move;
+    const page = wbxml.Page.move;
+    if (node.page != page or node.token != M.Move or node.text != null) return error.InvalidMove;
+    var fields: [3]?[]const u8 = .{ null, null, null };
+    for (node.children.items) |field| {
+        if (field.page != page or field.token < M.SrcMsgId or field.token > M.DstFldId or
+            field.is_opaque or field.children.items.len != 0) return error.InvalidMove;
+        const value = field.text orelse return error.InvalidMove;
+        if (value.len == 0 or value.len > 64) return error.InvalidMove;
+        const slot = &fields[field.token - M.SrcMsgId];
+        if (slot.* != null) return if (field.token == M.DstFldId) error.MultipleDestinations else error.InvalidMove;
+        slot.* = value;
+    }
+    return .{
+        .id = fields[0] orelse return error.InvalidMove,
+        .source = fields[1] orelse return error.InvalidMove,
+        .destination = fields[2] orelse return error.InvalidMove,
+    };
+}
+
+fn handleMoveItems(ctx: *Context, body: []const u8) !Response {
+    if (!validDevice(ctx.device_id) or ctx.protocol_version == 0 or body.len > 32 * 1024) return .{ .status = 400 };
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = wbxml.decode(a, body) catch return .{ .status = 400 };
+    const M = wbxml.Move;
+    const page = wbxml.Page.move;
+    const command = root.child(page, M.MoveItems) orelse return .{ .status = 400 };
+    if (root.children.items.len != 1 or command.text != null or command.children.items.len == 0) return .{ .status = 400 };
+    const moves = try a.alloc(MoveRequest, command.children.items.len);
+    for (command.children.items, moves) |node, *move| {
+        move.* = parseMove(node) catch |err| switch (err) {
+            error.MultipleDestinations => return moveCommandStatus(ctx, 5),
+            else => return .{ .status = 400 },
+        };
+    }
+
+    ctx.db.lockMailboxes();
+    defer ctx.db.unlockMailboxes();
+    const user_id = (try ctx.db.enabledMailboxId(ctx.username)) orelse return .{ .status = 403 };
+    maildir_path.validate(ctx.local_part) catch return .{ .status = 403 };
+    requireMailboxOwner(a, ctx) catch |err| return if (err == error.AmbiguousMailbox) .{ .status = 403 } else err;
+
+    var w = wbxml.Writer.init(ctx.allocator);
+    errdefer w.deinit();
+    try w.writeHeader();
+    try w.startTag(page, M.MoveItems);
+    for (moves) |move| {
+        var item_arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer item_arena.deinit();
+        var new_id: [64]u8 = undefined;
+        var status: u8 = 3;
+        const moved: ?[]const u8 = moveMailItemLocked(item_arena.allocator(), ctx, user_id, move, &new_id) catch |err| blk: {
+            status = switch (err) {
+                error.ItemNotFound, error.InvalidIdCombination => 1,
+                error.InvalidDestination => 2,
+                error.SameFolder => 4,
+                else => 7,
+            };
+            break :blk null;
+        };
+        try w.startTag(page, M.Response);
+        try w.element(page, M.SrcMsgId, move.id);
+        try w.elementInt(page, M.Status, status);
+        if (moved) |id| try w.element(page, M.DstMsgId, id);
+        try w.end();
+    }
+    try w.end();
+    return .{ .body = try w.toOwnedSlice() };
+}
+
+fn moveCommandStatus(ctx: *Context, status: u8) !Response {
+    var w = wbxml.Writer.init(ctx.allocator);
+    errdefer w.deinit();
+    try w.writeHeader();
+    try w.startTag(wbxml.Page.move, wbxml.Move.MoveItems);
+    try w.elementInt(wbxml.Page.move, wbxml.Move.Status, status);
+    try w.end();
+    return .{ .body = try w.toOwnedSlice() };
+}
+
+fn moveMailItemLocked(a: std.mem.Allocator, ctx: *Context, user_id: i64, move: MoveRequest, buf: []u8) ![]const u8 {
+    const source = folderById(move.source) orelse return error.ItemNotFound;
+    const source_mailbox = source.mailbox orelse return error.ItemNotFound;
+    const item = try resolveMailItemId(a, ctx, user_id, source, move.id);
+    const file = try locateMoveFile(a, ctx, source_mailbox, item.base);
+    const destination = folderById(move.destination) orelse return error.InvalidDestination;
+    const mailbox = destination.mailbox orelse return error.InvalidDestination;
+    if (std.mem.eql(u8, source.id, destination.id)) return error.SameFolder;
+    if (try webmail_store.managesDraftAt(ctx.db, ctx.username, source_mailbox, item.uid)) return error.ManagedDraft;
+
+    const dirs = try mailboxDirs(a, ctx, mailbox);
+    const generation = try ctx.db.getOrCreateMailbox(ctx.username, mailbox);
+    const key = try searchKey(ctx.db, user_id, false);
+    const uid = try webmail_maildir.moveResolvedFileLocked(a, ctx.db, ctx.username, source_mailbox, file, mailbox, dirs, null);
+    return formatMailItemId(buf, key, destination, uid, generation.uidvalidity, item.base);
+}
+
+fn locateMoveFile(a: std.mem.Allocator, ctx: *Context, folder: []const u8, base: []const u8) !webmail_maildir.FileRef {
+    var result: ?webmail_maildir.FileRef = null;
+    for (try mailboxDirs(a, ctx, folder)) |dir| {
+        const files = fs_compat.listEmlFiles(a, dir) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        for (files) |name| {
+            if (!std.mem.eql(u8, base, maildirBaseName(name))) continue;
+            if (result != null) return error.AmbiguousItem;
+            result = .{ .dir = dir, .name = name };
+        }
+    }
+    return result orelse error.ItemNotFound;
+}
+
 // ============================================================================
 // Sync (MS-ASCMD §2.2.2.20)
 // ============================================================================
@@ -866,23 +1021,30 @@ const SyncChange = struct {
     item: ?SyncItem = null,
 };
 
-fn collectionChanges(a: std.mem.Allocator, ctx: *Context, folder: FolderDef, previous: sync_state.Items) ![]SyncChange {
+fn collectionChanges(a: std.mem.Allocator, ctx: *Context, user_id: i64, folder: FolderDef, previous: sync_state.Items) ![]SyncChange {
     const A = wbxml.AirSync;
     var current: std.StringHashMapUnmanaged(void) = .empty;
     var changes: std.ArrayList(SyncChange) = .empty;
     if (folder.mailbox) |mailbox| {
         var mail: std.ArrayList(MailItem) = .empty;
-        {
-            ctx.db.lockMailboxes();
-            defer ctx.db.unlockMailboxes();
-            try requireMailboxOwner(a, ctx);
-            try collectMail(a, ctx, mailbox, std.math.maxInt(usize), &mail);
-        }
-        for (mail.items) |message| {
-            const id = try std.fmt.allocPrint(a, "{s}:{d}", .{ folder.id, message.uid });
-            if ((try current.getOrPut(a, id)).found_existing) continue;
-            const tag: []const u8 = if (message.seen) "1" else "0";
-            try appendChanged(a, &changes, previous, .{ .id = id, .tag = tag, .data = .{ .mail = message } });
+        ctx.db.lockMailboxes();
+        defer ctx.db.unlockMailboxes();
+        try requireMailboxOwner(a, ctx);
+        try collectMail(a, ctx, mailbox, std.math.maxInt(usize), &mail);
+        if (mail.items.len != 0) {
+            const key = searchKey(ctx.db, user_id, false) catch |err| switch (err) {
+                error.ItemNotFound => try searchKey(ctx.db, user_id, true),
+                else => return err,
+            };
+            const generation = try ctx.db.getOrCreateMailbox(ctx.username, mailbox);
+            for (mail.items) |message| {
+                const base = maildirBaseName(std.fs.path.basename(message.path));
+                var id_buffer: [64]u8 = undefined;
+                const id = try a.dupe(u8, formatMailItemId(&id_buffer, key, folder, message.uid, generation.uidvalidity, base));
+                if ((try current.getOrPut(a, id)).found_existing) continue;
+                const tag: []const u8 = if (message.seen) "1" else "0";
+                try appendChanged(a, &changes, previous, .{ .id = id, .tag = tag, .data = .{ .mail = message } });
+            }
         }
     } else {
         const items = try ctx.store.snapshotActiveSyncResources(a, ctx.username, folder.is_calendar);
@@ -901,6 +1063,15 @@ fn collectionChanges(a: std.mem.Allocator, ctx: *Context, folder: FolderDef, pre
         if (!current.contains(id.*)) try changes.append(a, .{ .kind = A.Remove, .id = id.* });
     }
     return changes.items;
+}
+
+fn usesLegacyMailIds(folder: FolderDef, items: sync_state.Items) bool {
+    if (folder.mailbox == null) return false;
+    var ids = items.keyIterator();
+    while (ids.next()) |id| {
+        if (std.mem.count(u8, id.*, ":") != 2) return true;
+    }
+    return false;
 }
 
 fn appendChanged(a: std.mem.Allocator, changes: *std.ArrayList(SyncChange), previous: sync_state.Items, item: SyncItem) !void {
@@ -926,9 +1097,9 @@ fn writeSyncCollection(ctx: *Context, account: sync_state.Account, w: *wbxml.Wri
         return;
     }
     const snapshot = (try account.load(a, folder.id)) orelse return error.InvalidSyncKey;
-    if (!std.mem.eql(u8, snapshot.key, requested_key)) return error.InvalidSyncKey;
+    if (!std.mem.eql(u8, snapshot.key, requested_key) or usesLegacyMailIds(folder, snapshot.items)) return error.InvalidSyncKey;
     var items = snapshot.items;
-    const pending = try collectionChanges(a, ctx, folder, items);
+    const pending = try collectionChanges(a, ctx, account.user_id, folder, items);
     if (pending.len == 0) return writeSyncStatus(w, folder.id, requested_key, "1");
 
     const key = try sync_state.newKey(a);
@@ -1013,8 +1184,8 @@ fn handleGetItemEstimate(ctx: *Context, account: sync_state.Account, body: []con
         if (folderById(id)) |folder| {
             if (try account.load(a, id)) |snapshot| {
                 status = 4;
-                if (std.mem.eql(u8, snapshot.key, key)) {
-                    count = (try collectionChanges(a, ctx, folder, snapshot.items)).len;
+                if (std.mem.eql(u8, snapshot.key, key) and !usesLegacyMailIds(folder, snapshot.items)) {
+                    count = (try collectionChanges(a, ctx, account.user_id, folder, snapshot.items)).len;
                     status = 1;
                 }
             } else {
@@ -1077,7 +1248,7 @@ fn handlePing(ctx: *Context, account: sync_state.Account, body: []const u8) !Res
             const a = round_arena.allocator();
             const snapshot = account.load(a, folder.id) catch return pingResponse(ctx, page, 8, &.{});
             const items: sync_state.Items = if (snapshot) |state| state.items else .empty;
-            const pending = collectionChanges(a, ctx, folder, items) catch return pingResponse(ctx, page, 8, &.{});
+            const pending = collectionChanges(a, ctx, account.user_id, folder, items) catch return pingResponse(ctx, page, 8, &.{});
             if (pending.len != 0) {
                 changed[count] = folder.id;
                 count += 1;
@@ -1125,8 +1296,7 @@ fn mailboxDirs(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8) ![][]co
     const base = if (inbox) root else try std.fmt.allocPrint(a, "{s}/{s}", .{ root, mailbox });
     const new = try std.fmt.allocPrint(a, "{s}/new", .{base});
     const cur = try std.fmt.allocPrint(a, "{s}/cur", .{base});
-    if (!inbox and (ctx.hosted or std.mem.eql(u8, mailbox, "Sent"))) return a.dupe([]const u8, &.{ base, new, cur });
-    return a.dupe([]const u8, &.{ new, cur });
+    return if (inbox) a.dupe([]const u8, &.{ new, cur }) else a.dupe([]const u8, &.{ base, new, cur });
 }
 
 fn collectMail(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, limit: usize, out: *std.ArrayList(MailItem)) !void {

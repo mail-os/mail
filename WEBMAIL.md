@@ -1908,6 +1908,13 @@ Operators can inspect one managed mailbox with `mail user:local hosted-status <m
   usable across flag changes and restarts in the same account. After moving
   an item to a different folder, search again for its new ID. See the
   [ActiveSync Search command](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-ascmd/8211179b-14f3-44ab-9de6-b69ca2a48c4e).
+- ActiveSync MoveItems moves mail between the built-in Inbox, Drafts, Sent,
+  and Trash collections. It works at the byte limit and keeps the message's
+  flags and bytes. It returns the destination ID, which the next Sync reports
+  as an addition while the source Sync reports a deletion. MoveItems rechecks
+  account access before the move. Webmail-managed drafts stay under the
+  revisioned composer so the message and its draft record move together.
+  [ActiveSync MoveItems command](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-ascmd/92958692-b116-462f-871c-eaab66076da1)
 - ActiveSync Sync, GetItemEstimate, and Ping reconcile each mailbox, device,
   and collection independently. Mail state uses message IDs and read flags.
   Calendar and Contacts state uses resource revisions, so pruning the DAV
@@ -1918,6 +1925,9 @@ Operators can inspect one managed mailbox with `mail user:local hosted-status <m
   Clients upgrading from the older shared state receive an invalid-key
   response and must restart that collection with key `0`. The old tables are
   retained for rollback. Deleting a mailbox removes its new snapshots.
+  Mail collections with older unsigned item IDs also restart with key `0`
+  to obtain mailbox-bound IDs for MoveItems. Calendar and Contacts retain their
+  current Sync keys across that change.
   See the [ActiveSync Sync key reference](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-ascmd/bb649593-c793-415e-912e-e7da9b7319bf).
 - The account is checked again when an SMTP submission is accepted or
   Outbox dispatches. Persisted SMTP retries for suspended accounts are held
