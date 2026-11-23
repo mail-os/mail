@@ -150,7 +150,7 @@ class MailClient:
                    "Content-Type": "message/rfc822" if legacy else "application/vnd.ms-sync.wbxml"}
         if encoded:
             commands = {"SendMail": 1, "Sync": 0, "SmartForward": 2, "SmartReply": 3,
-                        "FolderSync": 9, "FolderCreate": 10, "MoveItems": 13,
+                        "FolderSync": 9, "FolderCreate": 10, "FolderDelete": 11, "FolderUpdate": 12, "MoveItems": 13,
                         "GetItemEstimate": 14, "Search": 16, "Ping": 18}
             packed = bytes([121 if legacy else 141, commands[command], 9, 4, len(device)])
             packed += device.encode() + b"\x00\x0aSmartPhone"

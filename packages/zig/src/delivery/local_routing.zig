@@ -433,6 +433,7 @@ pub fn runRecovery(allocator: Allocator, db: *Database, shutdown: *std.atomic.Va
         smtp_sent_replies.reconcile(allocator, db, now - 7 * 86400, junk_folder) catch |err|
             std.log.warn("could not reconcile a client-filed SMTP reply: {}", .{err});
         if (now >= sweep_at) {
+            @import("../storage/folder_edits.zig").recover(allocator, db) catch |err| std.log.warn("mailbox folder recovery failed: {}", .{err});
             db.sweepDeliveryJournal(now - 7 * 86400) catch |err| std.log.warn("could not prune local delivery receipts: {}", .{err});
             sweep_at = now + 60;
         }

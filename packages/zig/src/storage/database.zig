@@ -1052,6 +1052,30 @@ pub const Database = struct {
             \\);
             \\CREATE INDEX IF NOT EXISTS idx_imap_uids_lookup ON imap_uids(username, mailbox);
             \\CREATE INDEX IF NOT EXISTS idx_imap_mailboxes_lookup ON imap_mailboxes(username, mailbox);
+            \\CREATE TABLE IF NOT EXISTS imap_mailbox_generations (
+            \\    username TEXT NOT NULL,
+            \\    mailbox TEXT NOT NULL,
+            \\    uidvalidity INTEGER NOT NULL,
+            \\    PRIMARY KEY(username, mailbox)
+            \\);
+            \\CREATE TRIGGER IF NOT EXISTS imap_mailbox_deleted_generation AFTER DELETE ON imap_mailboxes BEGIN
+            \\    INSERT INTO imap_mailbox_generations VALUES(OLD.username,OLD.mailbox,OLD.uidvalidity)
+            \\    ON CONFLICT(username,mailbox) DO UPDATE SET uidvalidity=MAX(uidvalidity,excluded.uidvalidity);
+            \\END;
+            \\CREATE TRIGGER IF NOT EXISTS imap_mailbox_renamed_generation AFTER UPDATE OF mailbox ON imap_mailboxes
+            \\WHEN OLD.mailbox<>NEW.mailbox BEGIN
+            \\    INSERT INTO imap_mailbox_generations VALUES(OLD.username,OLD.mailbox,OLD.uidvalidity)
+            \\    ON CONFLICT(username,mailbox) DO UPDATE SET uidvalidity=MAX(uidvalidity,excluded.uidvalidity);
+            \\END;
+            \\CREATE TABLE IF NOT EXISTS eas_folder_edits (
+            \\    id TEXT PRIMARY KEY,
+            \\    mailbox_root TEXT NOT NULL UNIQUE,
+            \\    source TEXT NOT NULL,
+            \\    destination TEXT,
+            \\    stamp TEXT NOT NULL,
+            \\    maildir_plus INTEGER NOT NULL CHECK(maildir_plus IN (0,1)),
+            \\    committed INTEGER NOT NULL DEFAULT 0 CHECK(committed IN (0,1))
+            \\);
         );
 
         // Webmail browser sessions (cookie-based). Distinct from SMTP/IMAP AUTH:
@@ -4869,6 +4893,7 @@ pub const Database = struct {
             "UPDATE users SET email = substr(email, 1, length(email) - ?3) || ?2 WHERE email LIKE ?1 ESCAPE '\\'",
             "UPDATE imap_mailboxes SET username = substr(username, 1, length(username) - ?3) || ?2 WHERE username LIKE ?1 ESCAPE '\\'",
             "UPDATE imap_uids SET username = substr(username, 1, length(username) - ?3) || ?2 WHERE username LIKE ?1 ESCAPE '\\'",
+            "UPDATE OR REPLACE imap_mailbox_generations SET username = substr(username, 1, length(username) - ?3) || ?2 WHERE username LIKE ?1 ESCAPE '\\'",
             "UPDATE provisioned_mailboxes SET mailbox = substr(mailbox, 1, length(mailbox) - ?3) || ?2 WHERE mailbox LIKE ?1 ESCAPE '\\'",
             "UPDATE provisioning_operations SET mailbox = substr(mailbox, 1, length(mailbox) - ?3) || ?2 WHERE mailbox LIKE ?1 ESCAPE '\\'",
             "UPDATE accepted_mail_targets SET mailbox = substr(mailbox, 1, length(mailbox) - ?3) || ?2 WHERE outcome = 'pending' AND mailbox LIKE ?1 ESCAPE '\\'",
@@ -4966,10 +4991,10 @@ pub const Database = struct {
             }
         }
 
-        // Create new mailbox with uidvalidity = current timestamp
-        const uidvalidity = time_compat.timestamp();
+        // A recreated name must outlive the previous UID generation.
         {
-            const sql = "INSERT INTO imap_mailboxes (username, mailbox, uidvalidity, uidnext) VALUES (?1, ?2, ?3, 1)";
+            const sql = "INSERT INTO imap_mailboxes (username, mailbox, uidvalidity, uidnext) VALUES (?1, ?2, " ++
+                "MAX(?3,COALESCE((SELECT uidvalidity+1 FROM imap_mailbox_generations WHERE username=?1 AND mailbox=?2),0)),1) RETURNING uidvalidity";
             const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
             defer self.allocator.free(sql_z);
             var stmt: ?*sqlite.sqlite3_stmt = null;
@@ -4983,13 +5008,15 @@ pub const Database = struct {
             defer self.allocator.free(m_z);
             try checkBind(sqlite.sqlite3_bind_text(stmt, 1, u_z.ptr, -1, null));
             try checkBind(sqlite.sqlite3_bind_text(stmt, 2, m_z.ptr, -1, null));
-            try checkBind(sqlite.sqlite3_bind_int64(stmt, 3, uidvalidity));
+            try checkBind(sqlite.sqlite3_bind_int64(stmt, 3, time_compat.timestamp()));
 
             rc = sqlite.sqlite3_step(stmt);
+            if (rc != sqlite.SQLITE_ROW) return DatabaseError.StepFailed;
+            const uidvalidity = sqlite.sqlite3_column_int64(stmt, 0);
+            rc = sqlite.sqlite3_step(stmt);
             if (rc != sqlite.SQLITE_DONE) return DatabaseError.StepFailed;
+            return .{ .uidvalidity = uidvalidity, .uidnext = 1 };
         }
-
-        return .{ .uidvalidity = uidvalidity, .uidnext = 1 };
     }
 
     /// Look up the UID for a given filename. Returns null if not assigned yet.
@@ -5204,7 +5231,8 @@ pub const Database = struct {
         {
             const sql: [:0]const u8 =
                 \\INSERT INTO imap_mailboxes(username,mailbox,uidvalidity,uidnext)
-                \\VALUES(?1,?2,?3,(SELECT COALESCE(MAX(uid),0)+1 FROM imap_uids WHERE username=?1 AND mailbox=?2))
+                \\VALUES(?1,?2,MAX(?3,COALESCE((SELECT uidvalidity+1 FROM imap_mailbox_generations WHERE username=?1 AND mailbox=?2),0)),
+                \\       (SELECT COALESCE(MAX(uid),0)+1 FROM imap_uids WHERE username=?1 AND mailbox=?2))
                 \\ON CONFLICT(username,mailbox) DO UPDATE SET uidnext=MAX(imap_mailboxes.uidnext,excluded.uidnext)
             ;
             var raw: ?*sqlite.sqlite3_stmt = null;

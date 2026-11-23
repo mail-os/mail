@@ -445,12 +445,17 @@ pub const QueryOptions = struct {
 pub fn folderNames(allocator: std.mem.Allocator, db: *database.Database, user: []const u8) ![]const []const u8 {
     var names: std.ArrayList([]const u8) = .empty;
     try names.appendSlice(allocator, &standard_folders);
-    const s = try db.prepare("SELECT mailbox FROM imap_mailboxes WHERE username=?1 ORDER BY mailbox");
+    const s = try db.prepare(
+        \\SELECT m.mailbox,g.uidvalidity FROM imap_mailboxes m
+        \\LEFT JOIN imap_mailbox_generations g USING(username,mailbox)
+        \\WHERE m.username=?1 ORDER BY m.mailbox
+    );
     defer s.finalize();
     try s.bind(1, user);
     while (try s.step()) {
         const name = s.columnText(0);
         if (!isValidFolderName(name) or std.ascii.eqlIgnoreCase(name, "Screening") or std.ascii.eqlIgnoreCase(name, "Declined")) continue;
+        if (s.columnInt64Opt(1) != null and !try folderExists(allocator, user, name)) continue;
         var exists = false;
         for (names.items) |known| {
             // Existing custom folders may differ from the category only by

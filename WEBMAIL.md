@@ -1911,8 +1911,11 @@ Operators can inspect one managed mailbox with `mail user:local hosted-status <m
 - ActiveSync FolderSync lists the built-in collections and existing top-level
   mail folders. Each device tracks its own hierarchy. After an upgrade from
   the older static hierarchy, initialize it again with key `0`. FolderCreate
-  adds a top-level mail folder. Hosted accounts see the same folder in IMAP
-  and webmail.
+  adds a top-level mail folder. FolderUpdate renames a custom top-level mail
+  folder in place. FolderDelete removes the folder and its messages and frees
+  their storage. Built-in folders are protected. Hosted accounts see the
+  same folder in IMAP and webmail. An interrupted folder edit is reconciled
+  before the server accepts clients again.
 - ActiveSync MoveItems moves mail between the built-in Inbox, Drafts, Sent,
   and Trash collections and custom mail folders. It works at the byte limit
   and keeps the message's flags and bytes. The next Sync reports the returned

@@ -34,6 +34,34 @@ pub fn markLocked(db: *Database, user: []const u8, short_root: bool, locations: 
     try tx.commit();
 }
 
+pub fn markFolderEditLocked(a: Allocator, db: *Database, user: []const u8, short_root: bool, root: Dir, layout: folders.Layout, source: []const u8, destination: ?[]const u8) !void {
+    if (!typesense.enabled()) return;
+    const io = io_compat.getIo();
+    const physical = if (layout == .maildir_plus) try std.fmt.allocPrint(a, ".{s}", .{source}) else source;
+    const folder = (try folders.open(io, root, physical)) orelse return error.FileNotFound;
+    defer folder.close(io);
+    var locations: std.ArrayList(message_refs.Location) = .empty;
+    if (layout == .flat) try markDirectory(a, io, folder, source, destination, &locations);
+    for ([_][]const u8{ "cur", "new" }) |slot| {
+        const dir = (try folders.open(io, folder, slot)) orelse continue;
+        defer dir.close(io);
+        try markDirectory(a, io, dir, source, destination, &locations);
+    }
+    try markLocked(db, user, short_root, locations.items);
+}
+
+fn markDirectory(a: Allocator, io: std.Io, dir: Dir, source: []const u8, destination: ?[]const u8, locations: *std.ArrayList(message_refs.Location)) !void {
+    var entries = dir.iterate();
+    while (try entries.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const base = database.maildirBaseName(entry.name);
+        if (!std.mem.endsWith(u8, base, ".eml")) continue;
+        const basename = try a.dupe(u8, base);
+        try locations.append(a, .{ .folder = source, .basename = basename });
+        if (destination) |name| try locations.append(a, .{ .folder = name, .basename = basename });
+    }
+}
+
 /// A pending write bypasses the external index in the affected search scope.
 /// The scope's revision detects a write that starts and finishes during a query.
 pub fn searchEpoch(db: *Database, user: []const u8, mailbox: ?[]const u8) !?i64 {

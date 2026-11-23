@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify ActiveSync FolderSync and FolderCreate on the native HTTPS listener."""
+"""Verify ActiveSync folder discovery and mutations on the native HTTPS listener."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -10,6 +10,7 @@ import runpy
 import sqlite3
 import tempfile
 from threading import Barrier
+from urllib.parse import urlencode
 
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -61,6 +62,26 @@ def create(test, mailbox, key, name, *, parent="0", kind="12", device=DEVICE, en
     return result
 
 
+def edit(test, mailbox, key, folder, name=None, *, parent="0", device=DEVICE, encoded=False, expected=1):
+    tag = b"\x54" if name is None else b"\x55"
+    command = "FolderDelete" if name is None else "FolderUpdate"
+    fields = element(0x12, key) + element(8, folder)
+    if name is not None:
+        fields += element(9, parent) + element(7, name)
+    status, _, data = test.eas(mailbox, FOLDER + tag + fields + END, command=command, device=device, encoded=encoded)
+    if expected == 401:
+        assert status in (401, 403), (status, data)
+        return None
+    assert status == 200 and data.startswith(FOLDER + tag) and int(field(data, 0x0c)) == expected, (status, data)
+    next_key = field(data, 0x12)
+    if expected == 1:
+        assert next_key and next_key != key
+    else:
+        assert next_key is None
+    assert field(data, 8) is None
+    return next_key
+
+
 def added_folder(changes, name):
     command, folder, parent, label, kind = next(change for change in changes if change[3] == name)
     assert command == 0x4f and parent == "0" and label == name and kind == 12
@@ -70,7 +91,7 @@ def added_folder(changes, name):
 
 def initial_and_create(test, owner, peer):
     code, headers, _ = hosted["request"](test.eas_url, method="OPTIONS", context=test.tls_context)
-    assert code == 200 and "FolderCreate" in headers["MS-ASProtocolCommands"].split(","), headers
+    assert code == 200 and {"FolderCreate", "FolderUpdate", "FolderDelete"} <= set(headers["MS-ASProtocolCommands"].split(",")), headers
     key, folders = hierarchy(test, owner, encoded=True)
     assert {row[1] for row in folders} == {"1", "2", "3", "4", "5", "6"}
     hierarchy(test, owner, "1", expected=9)
@@ -199,6 +220,172 @@ def observe_external_changes(test, owner, key, original):
     return key
 
 
+def visible_folders(test, owner):
+    status, folders = test.api(test.login(owner), "folders")
+    assert status == 200, folders
+    return {folder["name"]: folder["total"] for folder in folders}
+
+
+def verify_native_edits(test, owner, peer, key, original, foreign, size):
+    session = test.login(owner)
+    root = test.directory / "mail" / owner
+    other_key, _ = hierarchy(test, owner, device="OtherDevice")
+    _, data = snapshot(test, owner, original)
+    item, = ids(data)
+    before = test.api(session, "messages?" + urlencode({"folder": EAS_NAME}))[1]["items"][0]
+    edit(test, owner, key, foreign, expected=4)
+    edit(test, peer, key, original, "Foreign folder", expected=9)
+    edit(test, owner, key, original, "Foreign device", device="OtherDevice", expected=9)
+    edit(test, owner, key, "1", "Renamed Inbox", expected=2)
+    edit(test, owner, key, "5", expected=3)
+    edit(test, owner, key, original, "Nested folder", parent="1", expected=5)
+    edit(test, owner, key, original, "../escape", expected=10)
+    edit(test, owner, key, original, IMAP_NAME + " updated", expected=2)
+
+    renamed = "Device planning"
+    key = edit(test, owner, key, original, renamed, encoded=True)
+    assert visible_folders(test, owner)[renamed] == 1 and EAS_NAME not in visible_folders(test, owner)
+    assert test.bytes(owner) == size and not (root / EAS_NAME).exists()
+    assert test.api(session, "messages/ref/" + before["reference"])[1]["folder"] == renamed
+    _, data = snapshot(test, owner, original)
+    assert ids(data) == [item] and b"Folder workflow sample" in data
+    edit(test, owner, other_key, original, "Stale device rename", device="OtherDevice", expected=9)
+    other_key, changes = hierarchy(test, owner, other_key, device="OtherDevice")
+    assert changes == [(0x51, original, "0", renamed, 12)], changes
+    assert hierarchy(test, owner, key) == (key, [])
+
+    canonical = IMAP_NAME + " updated"
+    with test.imap(owner) as client:
+        assert client.create('"Rename contender"')[0] == "OK"
+    key, changes = hierarchy(test, owner, key)
+    contender = added_folder(changes, "Rename contender")
+    canonical_id = next(row[1] for row in hierarchy(test, owner, device="Discovery")[1] if row[3] == canonical)
+    (status, target), = move(test, owner, (item, original, canonical_id))
+    assert status == 3 and test.bytes(owner) == size
+
+    with closing(sqlite3.connect(test.directory / "smtp.db")) as conn, conn:
+        conn.execute("""CREATE TRIGGER fixture_abort_folder_edit BEFORE UPDATE ON eas_mailbox_state
+                     WHEN NEW.collection_id='folder-hierarchy'
+                     BEGIN SELECT RAISE(ABORT,'fixture folder edit failure'); END""")
+    try:
+        edit(test, owner, key, canonical_id, "Uncommitted project", expected=6)
+        edit(test, owner, key, canonical_id, expected=6)
+        assert (root / canonical).is_symlink() and not (root / "Uncommitted project").exists()
+        assert test.bytes(owner) == size
+        assert visible_folders(test, owner)[canonical] == 1
+        assert hierarchy(test, owner, key) == (key, [])
+    finally:
+        with closing(sqlite3.connect(test.directory / "smtp.db")) as conn, conn:
+            conn.execute("DROP TRIGGER fixture_abort_folder_edit")
+
+    case_name = canonical.upper()
+    key = edit(test, owner, key, canonical_id, case_name)
+    assert (root / case_name).readlink().as_posix() == f".{case_name}/cur"
+    _, after = snapshot(test, owner, canonical_id)
+    assert ids(after) == [target] and b"Folder workflow sample" in after
+    with test.imap(owner) as client:
+        assert client.select(f'"{case_name}"') == ("OK", [b"1"])
+        old_validity = int(client.response("UIDVALIDITY")[1][0])
+        assert client.uid("SEARCH", None, "SUBJECT workflow")[1] == [target.split(":")[1].encode()]
+
+    test.provision("owner", quota=size, enabled=False)
+    edit(test, owner, key, canonical_id, expected=401)
+    test.provision("owner", quota=size)
+    assert test.deliver(owner)[0] == 452
+    other_key, _ = hierarchy(test, owner, other_key, device="OtherDevice")
+    key = edit(test, owner, key, canonical_id, encoded=True)
+    assert test.bytes(owner) == 0 and case_name not in visible_folders(test, owner)
+    assert not (root / case_name).is_symlink() and not (root / f".{case_name}").exists()
+    assert test.api(test.login(owner), "messages/ref/" + before["reference"])[0] == 404
+    assert hierarchy(test, owner, other_key, device="OtherDevice")[1] == [(0x50, canonical_id, "", "", 0)]
+    assert sync(test, owner, 0, canonical_id)[0] == 12
+    edit(test, owner, key, canonical_id, expected=4)
+    edit(test, owner, key, contender, case_name, parent="99", expected=5)
+
+    key, replacement = create(test, owner, key, case_name)
+    assert replacement != canonical_id
+    with test.imap(owner) as client:
+        assert client.select(f'"{case_name}"') == ("OK", [b"0"])
+        assert int(client.response("UIDVALIDITY")[1][0]) > old_validity
+        raw = hosted["imap_message"]("Fits after deletion", payload=0)
+        raw = hosted["imap_message"]("Fits after deletion", payload=size - len(raw))
+        assert len(raw) == size
+        assert client.append(f'"{case_name}"', None, None, raw + b"x")[0] == "NO"
+        assert client.append(f'"{case_name}"', None, None, raw)[0] == "OK"
+        assert test.bytes(owner) == size
+    key = edit(test, owner, key, replacement)
+    assert test.bytes(owner) == 0
+    return key, contender
+
+
+def rename_contention(test, owner, key, original):
+    destination = "Shared destination"
+    barrier = Barrier(2)
+
+    def imap_rename():
+        with test.imap(owner) as client:
+            barrier.wait(timeout=5)
+            return client.rename('"Rename contender"', f'"{destination}"')[0]
+
+    def eas_rename():
+        body = FOLDER + b"\x55" + element(0x12, key) + element(8, original) + element(9, "0") + element(7, destination) + END
+        barrier.wait(timeout=5)
+        status, _, data = test.eas(owner, body, command="FolderUpdate", device=DEVICE)
+        assert status == 200, data
+        return int(field(data, 0x0c)), field(data, 0x12)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        imap, eas = workers.submit(imap_rename), workers.submit(eas_rename)
+        code, next_key = eas.result()
+        result = imap.result(), code
+        assert result in (("OK", 2), ("NO", 1)), result
+    root = test.directory / "mail" / owner
+    assert (root / destination).is_dir()
+    assert (root / "Rename contender").is_dir() == (code == 1)
+    assert (root / "Device planning").is_dir() == (code == 2)
+    return hierarchy(test, owner, next_key or key)[0]
+
+
+def retain_fixture_journal(test, mailbox, key, folder, destination):
+    with closing(sqlite3.connect(test.directory / "smtp.db")) as conn, conn:
+        conn.executescript("""
+            CREATE TRIGGER fixture_abort_edit BEFORE UPDATE ON eas_mailbox_state
+            WHEN NEW.collection_id='folder-hierarchy'
+            BEGIN SELECT RAISE(ABORT,'fixture folder edit failure'); END;
+            CREATE TRIGGER fixture_retain_journal BEFORE DELETE ON eas_folder_edits
+            BEGIN SELECT RAISE(ABORT,'fixture retain interrupted edit'); END;
+        """)
+    try:
+        edit(test, mailbox, key, folder, destination, expected=6)
+    finally:
+        with closing(sqlite3.connect(test.directory / "smtp.db")) as conn, conn:
+            conn.executescript("DROP TRIGGER fixture_abort_edit; DROP TRIGGER fixture_retain_journal;")
+
+
+def simulate_interrupted_edits(test):
+    # Recreate the on-disk states at the two commit boundaries from journal
+    # entries written by the actual server. Use the original inode in both.
+    with closing(sqlite3.connect(test.directory / "smtp.db")) as conn, conn:
+        rows = conn.execute(
+            "SELECT id,mailbox_root,source,destination,maildir_plus FROM eas_folder_edits"
+        ).fetchall()
+        assert len(rows) == 2, rows
+        for ident, mailbox, source, destination, plus in rows:
+            root = test.directory / "mail" / mailbox
+            prefix = "." if plus else ""
+            physical = root / (prefix + source)
+            if plus:
+                (root / source).unlink()
+            if destination is not None:
+                physical.rename(root / (prefix + destination))
+                if plus:
+                    (root / destination).symlink_to(f".{destination}/cur")
+            else:
+                physical.rename(root / f".pending-folder-{ident}")
+                conn.execute("UPDATE eas_folder_edits SET committed=1 WHERE id=?", (ident,))
+                conn.execute("DELETE FROM imap_mailboxes WHERE username=? AND mailbox=?", (mailbox, source))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
@@ -217,7 +404,32 @@ def main():
             _, raw = snapshot(test, owner, eas_folder)
             assert len(ids(raw)) == 1 and b"Folder workflow sample" in raw
             assert test.bytes(owner) == size
-    print("Verified per-device FolderSync, FolderCreate at quota, dynamic mail collections, IMAP interoperability, restart, rollback, and concurrent creation.")
+            key, _ = verify_native_edits(test, owner, peer, key, eas_folder, peer_folder, size)
+            key = rename_contention(test, owner, key, eas_folder)
+        with test.daemon():
+            assert hierarchy(test, owner, key) == (key, []) and test.bytes(owner) == 0
+            rollback_owner = test.provision("rollback")
+            purge_owner = test.provision("purge")
+            with test.imap(rollback_owner) as client:
+                assert client.create('"Restart kept"')[0] == "OK"
+                assert client.append('"Restart kept"', None, None, hosted["imap_message"]())[0] == "OK"
+            rollback_key, changes = hierarchy(test, rollback_owner)
+            retained = added_folder(changes, "Restart kept")
+            purge_key, _ = hierarchy(test, purge_owner)
+            purge_key, removed = create(test, purge_owner, purge_key, "Restart purge")
+            with test.imap(purge_owner) as client:
+                assert client.append('"Restart purge"', None, None, hosted["imap_message"]())[0] == "OK"
+            retain_fixture_journal(test, rollback_owner, rollback_key, retained, "Interrupted name")
+            retain_fixture_journal(test, purge_owner, purge_key, removed, None)
+        simulate_interrupted_edits(test)
+        with test.daemon():
+            assert hierarchy(test, rollback_owner, rollback_key) == (rollback_key, [])
+            assert visible_folders(test, rollback_owner)["Restart kept"] == 1
+            assert hierarchy(test, purge_owner, purge_key)[1] == [(0x50, removed, "", "", 0)]
+            assert test.bytes(purge_owner) == 0
+            with closing(sqlite3.connect(test.directory / "smtp.db")) as conn:
+                assert conn.execute("SELECT COUNT(*) FROM eas_folder_edits").fetchone() == (0,)
+    print("Verified native FolderSync, create, rename and delete, quota release, independent devices, IMAP and webmail visibility, rollback, and restart.")
 
 
 if __name__ == "__main__":

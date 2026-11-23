@@ -4,6 +4,7 @@ const std = @import("std");
 const database = @import("../storage/database.zig");
 const io_compat = @import("../core/io_compat.zig");
 const time = @import("../core/time_compat.zig");
+const refs = @import("../storage/message_refs.zig");
 
 pub const Items = std.StringHashMapUnmanaged([]const u8);
 pub const Snapshot = struct { key: []const u8, items: Items };
@@ -83,7 +84,8 @@ pub const Account = struct {
         var tx = try self.db.beginTransaction(.write);
         defer tx.deinit();
         const record = try tx.prepare(
-            \\INSERT INTO imap_mailboxes(username,mailbox,uidvalidity,uidnext) VALUES(?1,?2,?3,1)
+            \\INSERT INTO imap_mailboxes(username,mailbox,uidvalidity,uidnext)
+            \\VALUES(?1,?2,MAX(?3,COALESCE((SELECT uidvalidity+1 FROM imap_mailbox_generations WHERE username=?1 AND mailbox=?2),0)),1)
             \\ON CONFLICT(username,mailbox) DO UPDATE SET uidvalidity=MAX(imap_mailboxes.uidvalidity+1,excluded.uidvalidity),uidnext=1
         );
         defer record.finalize();
@@ -100,6 +102,66 @@ pub const Account = struct {
         const stmt = try tx.prepare(advance_sql);
         defer stmt.finalize();
         try self.applyAdvance(stmt, collection, previous, key, snapshot);
+        try tx.commit();
+    }
+
+    pub fn editFolder(self: Account, a: std.mem.Allocator, collection: []const u8, previous: []const u8, key: []const u8, items: Items, user: []const u8, folder_id: []const u8, source: []const u8, destination: ?[]const u8) !void {
+        const snapshot = try encodeItems(a, items);
+        var tx = try self.db.beginTransaction(.write);
+        defer tx.deinit();
+        const retired = destination orelse source;
+        for ([_][]const u8{
+            "DELETE FROM imap_uids WHERE username=?1 AND mailbox=?2",
+            "DELETE FROM imap_mailboxes WHERE username=?1 AND mailbox=?2",
+            "DELETE FROM mailbox_message_refs WHERE user_id=(SELECT id FROM users WHERE username=?1) AND folder=?2",
+            "UPDATE mailbox_message_refs SET next_folder=NULL,next_basename=NULL,next_digest=NULL,next_junk_action=NULL,next_junk_receipt=NULL,next_retention_at=NULL WHERE user_id=(SELECT id FROM users WHERE username=?1) AND next_folder=?2",
+        }) |sql| {
+            const stmt = try tx.prepare(sql);
+            defer stmt.finalize();
+            try stmt.bind(1, user);
+            try stmt.bind(2, retired);
+            _ = try stmt.step();
+        }
+        if (destination) |name| {
+            const rename = try tx.prepare(
+                \\INSERT INTO imap_mailboxes(username,mailbox,uidvalidity,uidnext)
+                \\VALUES(?1,?2,MAX(?3,COALESCE((SELECT uidvalidity+1 FROM imap_mailbox_generations WHERE username=?1 AND mailbox=?2),0)),1)
+                \\ON CONFLICT(username,mailbox) DO NOTHING
+            );
+            defer rename.finalize();
+            try rename.bind(1, user);
+            try rename.bind(2, source);
+            try rename.bind(3, time.timestamp());
+            _ = try rename.step();
+            for ([_][]const u8{
+                \\UPDATE imap_mailboxes SET mailbox=?3,uidvalidity=MAX(uidvalidity,COALESCE((SELECT uidvalidity+1 FROM imap_mailbox_generations WHERE username=?1 AND mailbox=?3),0))
+                \\WHERE username=?1 AND mailbox=?2
+                ,
+                "UPDATE imap_uids SET mailbox=?3 WHERE username=?1 AND mailbox=?2",
+            }) |sql| {
+                const stmt = try tx.prepare(sql);
+                defer stmt.finalize();
+                try stmt.bind(1, user);
+                try stmt.bind(2, source);
+                try stmt.bind(3, name);
+                _ = try stmt.step();
+            }
+            try refs.renameFolderIn(tx, user, source, name);
+        } else {
+            const stmt = try tx.prepare("DELETE FROM eas_mailbox_state WHERE user_id=?1 AND collection_id=?2");
+            defer stmt.finalize();
+            try stmt.bind(1, self.user_id);
+            try stmt.bind(2, folder_id);
+            _ = try stmt.step();
+        }
+        const stmt = try tx.prepare(advance_sql);
+        defer stmt.finalize();
+        try self.applyAdvance(stmt, collection, previous, key, snapshot);
+        const commit = try tx.prepare("UPDATE eas_folder_edits SET committed=1 WHERE id=?1 RETURNING 1");
+        defer commit.finalize();
+        try commit.bind(1, key);
+        if (!try commit.step()) return error.FolderEditConflict;
+        _ = try commit.step();
         try tx.commit();
     }
 

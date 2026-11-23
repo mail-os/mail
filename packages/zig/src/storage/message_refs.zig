@@ -341,13 +341,20 @@ pub fn forgetReviewCopy(db: *database.Database, user: []const u8, source: Locati
 }
 
 pub fn renameFolder(db: *database.Database, user: []const u8, source: []const u8, destination: []const u8) !void {
-    const s = try db.prepare("UPDATE OR REPLACE mailbox_message_refs SET folder=CASE WHEN folder=?2 THEN ?3 ELSE folder END, next_folder=CASE WHEN next_folder=?2 THEN ?3 ELSE next_folder END WHERE " ++ owner ++ " AND (folder=?2 OR next_folder=?2)");
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    try renameFolderIn(tx, user, source, destination);
+    try tx.commit();
+}
+
+pub fn renameFolderIn(tx: database.Database.Transaction, user: []const u8, source: []const u8, destination: []const u8) !void {
+    const s = try tx.prepare("UPDATE OR REPLACE mailbox_message_refs SET folder=CASE WHEN folder=?2 THEN ?3 ELSE folder END, next_folder=CASE WHEN next_folder=?2 THEN ?3 ELSE next_folder END WHERE " ++ owner ++ " AND (folder=?2 OR next_folder=?2)");
     defer s.finalize();
     try s.bind(1, user);
     try s.bind(2, source);
     try s.bind(3, destination);
     _ = try s.step();
-    const feedback = try db.prepare("UPDATE mailbox_junk_feedback SET source_folder=?3 WHERE " ++ owner ++ " AND source_folder=?2");
+    const feedback = try tx.prepare("UPDATE mailbox_junk_feedback SET source_folder=?3 WHERE " ++ owner ++ " AND source_folder=?2");
     defer feedback.finalize();
     try feedback.bind(1, user);
     try feedback.bind(2, source);

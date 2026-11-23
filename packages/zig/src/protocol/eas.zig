@@ -14,6 +14,8 @@ const webmail_store = @import("../api/webmail_store.zig");
 const snapshots = @import("../api/webmail_snapshots.zig");
 const message_refs = @import("../storage/message_refs.zig");
 const maildir_folders = @import("../storage/maildir_folders.zig");
+const folder_edits = @import("../storage/folder_edits.zig");
+const maildir_index = @import("../search/maildir_index.zig");
 const thread_ids = @import("../message/thread_ids.zig");
 const fs_compat = @import("../core/fs_compat.zig");
 const io_compat = @import("../core/io_compat.zig");
@@ -180,7 +182,7 @@ pub fn dispatch(ctx: *Context, cmd: []const u8, body: []const u8) !Response {
     if (std.ascii.eqlIgnoreCase(cmd, "Search")) return handleSearch(ctx, body);
     if (std.ascii.eqlIgnoreCase(cmd, "MoveItems")) return handleMoveItems(ctx, body);
     if (std.mem.eql(u8, cmd, "Provision")) return handleProvision(ctx, body);
-    const command = std.meta.stringToEnum(enum { Sync, GetItemEstimate, Ping, FolderSync, FolderCreate }, cmd) orelse return .{ .status = 501 };
+    const command = std.meta.stringToEnum(enum { Sync, GetItemEstimate, Ping, FolderSync, FolderCreate, FolderUpdate, FolderDelete }, cmd) orelse return .{ .status = 501 };
     if (!validDevice(ctx.device_id)) return .{ .status = 400 };
     var user = ctx.db.getUserByUsername(ctx.username) catch |err| return .{ .status = if (err == error.NotFound) 401 else 503 };
     defer user.deinit(ctx.db.allocator);
@@ -192,6 +194,8 @@ pub fn dispatch(ctx: *Context, cmd: []const u8, body: []const u8) !Response {
         .Ping => handlePing(ctx, account, body),
         .FolderSync => handleFolderSync(ctx, account, body),
         .FolderCreate => handleFolderCreate(ctx, account, body),
+        .FolderUpdate => handleFolderEdit(ctx, account, body, FH.FolderUpdate),
+        .FolderDelete => handleFolderEdit(ctx, account, body, FH.FolderDelete),
     };
 }
 
@@ -995,7 +999,7 @@ fn createFolder(ctx: *Context, account: sync_state.Account, body: []const u8) !R
     const parent = hierarchyText(req, FH.ParentId) orelse return error.InvalidHierarchyRequest;
     const name = hierarchyText(req, FH.DisplayName) orelse return error.InvalidHierarchyRequest;
     const type_value = hierarchyText(req, FH.Type) orelse return error.InvalidHierarchyRequest;
-    if (!folderNameAllowed(name) or !webmail_maildir.isValidFolderName(name) or
+    if (!folderNameAllowed(name) or specialFolder(ctx, name) or !webmail_maildir.isValidFolderName(name) or
         !std.mem.eql(u8, type_value, "12")) return error.InvalidHierarchyRequest;
 
     ctx.db.lockMailboxes();
@@ -1011,12 +1015,7 @@ fn createFolder(ctx: *Context, account: sync_state.Account, body: []const u8) !R
     try std.Io.Dir.cwd().createDirPath(io, base);
     const root = (try maildir_folders.open(io, .cwd(), base)) orelse return error.FileNotFound;
     defer root.close(io);
-    if (name.len < 255) {
-        const canonical = try std.fmt.allocPrint(a, ".{s}", .{name});
-        if (root.statFile(io, canonical, .{ .follow_symlinks = false })) |_| {
-            return error.PathAlreadyExists;
-        } else |err| if (err != error.FileNotFound) return err;
-    }
+    try folder_edits.requireUnused(a, io, root, name, null);
     try root.createDir(io, name, .default_dir);
     errdefer root.deleteDir(io, name) catch |err| std.log.warn("could not roll back ActiveSync folder creation: {}", .{err});
 
@@ -1025,19 +1024,105 @@ fn createFolder(ctx: *Context, account: sync_state.Account, body: []const u8) !R
     try previous.put(a, folder.id, folder.name);
     const next_key = try sync_state.newKey(a);
 
+    const encoded = try folderEditResponse(ctx, FH.FolderCreate, next_key, folder.id);
+    errdefer ctx.allocator.free(encoded);
+    try account.registerFolder(a, hierarchy_collection, sync_key, next_key, previous, ctx.username, name);
+    return .{ .body = encoded };
+}
+
+fn specialFolder(ctx: *Context, name: []const u8) bool {
+    for (webmail_maildir.standard_folders) |standard| {
+        if (std.ascii.eqlIgnoreCase(name, standard)) return true;
+    }
+    if (ctx.mail_config) |cfg| return std.ascii.eqlIgnoreCase(name, cfg.junkFolder());
+    return false;
+}
+
+fn handleFolderEdit(ctx: *Context, account: sync_state.Account, body: []const u8, token: u8) !Response {
+    return editFolder(ctx, account, body, token) catch |err| hierarchyStatus(ctx, token, switch (err) {
+        error.SpecialFolder => if (token == FH.FolderDelete) 3 else 2,
+        error.PathAlreadyExists => 2,
+        error.UnknownFolder => 4,
+        error.UnknownParent => 5,
+        error.InvalidSyncKey => 9,
+        error.InvalidHierarchyRequest => 10,
+        else => 6,
+    });
+}
+
+fn editFolder(ctx: *Context, account: sync_state.Account, body: []const u8, token: u8) !Response {
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const request = hierarchyRequest(a, body, token) catch return error.InvalidHierarchyRequest;
+    if (request.children.items.len != @as(usize, if (token == FH.FolderUpdate) 4 else 2)) return error.InvalidHierarchyRequest;
+    const key = hierarchyText(request, FH.SyncKey) orelse return error.InvalidHierarchyRequest;
+    const id = hierarchyText(request, FH.ServerEntryId) orelse return error.InvalidHierarchyRequest;
+    const destination = if (token == FH.FolderUpdate) blk: {
+        const parent = hierarchyText(request, FH.ParentId) orelse return error.InvalidHierarchyRequest;
+        if (!std.mem.eql(u8, parent, "0")) return error.UnknownParent;
+        const name = hierarchyText(request, FH.DisplayName) orelse return error.InvalidHierarchyRequest;
+        if (!folderNameAllowed(name) or specialFolder(ctx, name) or !webmail_maildir.isValidFolderName(name)) return error.InvalidHierarchyRequest;
+        break :blk name;
+    } else null;
+
+    ctx.db.lockMailboxes();
+    defer ctx.db.unlockMailboxes();
+    if ((try ctx.db.enabledMailboxId(ctx.username)) != account.user_id) return .{ .status = 403 };
+    try requireMailboxOwner(a, ctx);
+    try maildir_path.validate(ctx.local_part);
+    var snapshot = try loadHierarchy(a, account, key);
+    const folder = (try folderById(a, ctx, account.user_id, id)) orelse return error.UnknownFolder;
+    const name = folder.mailbox orelse return error.SpecialFolder;
+    if (folder.kind != 12 or specialFolder(ctx, name)) return error.SpecialFolder;
+    const known = snapshot.get(id) orelse return error.UnknownFolder;
+    if (!std.mem.eql(u8, known, name)) return error.InvalidSyncKey;
+
+    const next_key = try sync_state.newKey(a);
+    const encoded = try folderEditResponse(ctx, token, next_key, null);
+    errdefer ctx.allocator.free(encoded);
+    if (destination) |new_name| {
+        try snapshot.put(a, id, new_name);
+        if (std.mem.eql(u8, name, new_name)) {
+            try account.advance(a, hierarchy_collection, key, next_key, snapshot);
+            return .{ .body = encoded };
+        }
+    } else _ = snapshot.remove(id);
+
+    const io = io_compat.getIo();
+    const base = try std.fmt.allocPrint(a, "mail/{s}", .{ctx.local_part});
+    const root = (try maildir_folders.open(io, .cwd(), base)) orelse return error.UnknownFolder;
+    defer root.close(io);
+    const layout = (try maildir_folders.layout(io, root, name)) orelse return error.UnknownFolder;
+    const physical = try folder_edits.physicalName(a, name, layout);
+    const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ base, physical });
+    var edit = folder_edits.Edit{
+        .id = next_key,
+        .root_name = ctx.local_part,
+        .source = name,
+        .destination = destination,
+        .stamp = try message_refs.directoryStamp(a, path),
+        .layout = layout,
+    };
+    try maildir_index.markFolderEditLocked(a, ctx.db, ctx.username, !std.mem.eql(u8, ctx.username, ctx.local_part), root, layout, name, destination);
+    try edit.record(ctx.db);
+    defer edit.settle(a, ctx.db, root) catch |err| std.log.warn("could not settle ActiveSync folder edit: {}", .{err});
+    try edit.apply(a, root);
+    try account.editFolder(a, hierarchy_collection, key, next_key, snapshot, ctx.username, id, name, destination);
+    edit.committed = true;
+    return .{ .body = encoded };
+}
+
+fn folderEditResponse(ctx: *Context, token: u8, key: []const u8, id: ?[]const u8) ![]u8 {
     var w = wbxml.Writer.init(ctx.allocator);
     errdefer w.deinit();
     try w.writeHeader();
-    try w.startTag(hierarchy_page, FH.FolderCreate);
+    try w.startTag(hierarchy_page, token);
     try w.element(hierarchy_page, FH.Status, "1");
-    try w.element(hierarchy_page, FH.SyncKey, next_key);
-    try w.element(hierarchy_page, FH.ServerEntryId, folder.id);
+    try w.element(hierarchy_page, FH.SyncKey, key);
+    if (id) |value| try w.element(hierarchy_page, FH.ServerEntryId, value);
     try w.end();
-    const encoded = try w.toOwnedSlice();
-    errdefer ctx.allocator.free(encoded);
-    try account.registerFolder(a, hierarchy_collection, sync_key, next_key, previous, ctx.username, name);
-
-    return .{ .body = encoded };
+    return w.toOwnedSlice();
 }
 
 const MoveRequest = struct {

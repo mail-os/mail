@@ -15,6 +15,8 @@ const tls_mod = @import("../core/tls.zig");
 const tls = @import("tls");
 const search = @import("imap_search.zig");
 const hosted_limits = @import("../storage/hosted_limits.zig");
+const folder_edits = @import("../storage/folder_edits.zig");
+const maildir_folders = @import("../storage/maildir_folders.zig");
 const maildir_keywords = @import("../storage/maildir_keywords.zig");
 const message_refs = @import("../storage/message_refs.zig");
 const sent_replies = @import("../delivery/smtp_sent_replies.zig");
@@ -3680,6 +3682,7 @@ pub const ImapSession = struct {
         const db = self.auth_backend.db;
         db.lockMailboxes();
         defer db.unlockMailboxes();
+        if ((try db.enabledMailboxId(full_username)) == null) return self.sendResponse(tag, "NO", "Mailbox is disabled");
         const dir_path = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local_part, name });
         defer self.allocator.free(dir_path);
 
@@ -3814,6 +3817,15 @@ pub const ImapSession = struct {
         const db = self.auth_backend.db;
         db.lockMailboxes();
         defer db.unlockMailboxes();
+        if ((try db.enabledMailboxId(user)) == null) return error.HostedRecipientDisabled;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const io = io_compat.getIo();
+        const base = try std.fmt.allocPrint(a, "mail/{s}", .{user});
+        const root = (try maildir_folders.open(io, .cwd(), base)) orelse return error.FileNotFound;
+        defer root.close(io);
+        try folder_edits.requireUnused(a, io, root, new, if (std.ascii.eqlIgnoreCase(old, new)) old else null);
         if (!pathIsSymlink(old_path)) {
             if (!renameFile(old_path, new_path)) return error.RenameFailed;
             errdefer _ = renameFile(new_path, old_path);

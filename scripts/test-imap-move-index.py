@@ -15,6 +15,7 @@ import time
 SCRIPTS = Path(__file__).resolve().parent
 imap_suite = runpy.run_path(str(SCRIPTS / "test-imap-index-search.py"))
 eas_suite = runpy.run_path(str(SCRIPTS / "test-eas-move-items.py"))
+folder_suite = runpy.run_path(str(SCRIPTS / "test-eas-folder-hierarchy.py"))
 Fixture, SearchIndex = imap_suite["Fixture"], imap_suite["SearchIndex"]
 search, seed_message = imap_suite["search"], imap_suite["seed_message"]
 snapshot, ids, move = eas_suite["snapshot"], eas_suite["ids"], eas_suite["response"]
@@ -165,6 +166,30 @@ def exercise_maildir_plus_folder(test, index, owner):
     verify_search(test, index, owner, "Research", 1, indexed=True)
 
 
+def exercise_native_folder_edits(test, index, owner):
+    hierarchy, edit = folder_suite["hierarchy"], folder_suite["edit"]
+    key, folders = hierarchy(test, owner)
+    folder = folder_suite["added_folder"](folders, "Research")
+    index.failed_writes = {"DELETE", "POST"}
+    key = edit(test, owner, key, folder, "Planning")
+    assert {name for name, _ in pending(test)} == {"Research", "Planning"}
+    verify_search(test, index, owner, "Planning", 1, indexed=False)
+    verify_search(test, index, owner, '"All Mail"', 1, indexed=False)
+    index.failed_writes = set()
+    wait_for(lambda: not pending(test) and subject_folders(index, owner) == {"Planning"},
+             "index should publish the renamed folder and retire the former location")
+    verify_search(test, index, owner, "Planning", 1, indexed=True)
+
+    index.failed_writes = {"DELETE"}
+    edit(test, owner, key, folder)
+    verify_search(test, index, owner, '"All Mail"', 0, indexed=False)
+    assert {name for name, _ in pending(test)} == {"Planning"}
+    index.failed_writes = set()
+    wait_for(lambda: not pending(test) and not subject_folders(index, owner),
+             "index should retire documents from the deleted folder")
+    verify_search(test, index, owner, '"All Mail"', 0, indexed=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
@@ -184,6 +209,7 @@ def main():
                 exercise_inflight_retry(test, index, owner)
                 exercise_inflight_search(test, index, owner, peer)
                 exercise_maildir_plus_folder(test, index, owner)
+                exercise_native_folder_edits(test, index, owner)
         finally:
             index.shutdown()
             thread.join()

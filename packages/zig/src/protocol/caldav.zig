@@ -2137,6 +2137,8 @@ fn decodeActiveSyncQuery(query: []const u8, buffer: []u8) !ActiveSyncQuery {
         3 => "SmartReply",
         9 => "FolderSync",
         10 => "FolderCreate",
+        11 => "FolderDelete",
+        12 => "FolderUpdate",
         13 => "MoveItems",
         14 => "GetItemEstimate",
         16 => "Search",
@@ -2245,7 +2247,7 @@ const ACTIVESYNC_OPTIONS_RESPONSE =
     "HTTP/1.1 200 OK\r\n" ++
     "MS-Server-ActiveSync: 14.1\r\n" ++
     "MS-ASProtocolVersions: 2.5,12.0,12.1,14.0,14.1\r\n" ++
-    "MS-ASProtocolCommands: Sync,SendMail,SmartForward,SmartReply,FolderSync,FolderCreate,MoveItems,GetItemEstimate,Ping,Provision,Search\r\n" ++
+    "MS-ASProtocolCommands: Sync,SendMail,SmartForward,SmartReply,FolderSync,FolderCreate,FolderDelete,FolderUpdate,MoveItems,GetItemEstimate,Ping,Provision,Search\r\n" ++
     "Public: OPTIONS,POST\r\n" ++
     "Allow: OPTIONS,POST\r\n" ++
     "Content-Length: 0\r\n\r\n";
