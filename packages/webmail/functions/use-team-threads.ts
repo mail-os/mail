@@ -2,7 +2,16 @@ import { state } from '@stacksjs/stx'
 import type { createMailApi } from './mail-api'
 import { MailApiError } from './mail-api'
 
-interface Grant { id: string, team: string, owner: string, grantee: string, subject: string, downloads: boolean }
+interface Grant {
+  id: string
+  team: string
+  owner: string
+  grantee: string
+  subject: string
+  downloads: boolean
+  followingAuthors: string[]
+  replyLimitReached: boolean
+}
 interface Attachment { index: number, filename: string, size: number }
 interface Message {
   reference: string
@@ -11,8 +20,10 @@ interface Message {
   timestamp: number
   text: string
   attachments: Attachment[]
+  verifiedReply?: boolean
+  truncated?: boolean
 }
-interface Preview { messages: Message[], digest: string }
+interface Preview { messages: Message[], digest: string, followingAuthors: string[] }
 interface Detail { grant: Grant, messages: Message[], comments: { author: string, writtenAt: number, text: string }[] }
 interface Team { id: string, name: string }
 const endpoint = '/webmail/api/thread-shares'
@@ -33,6 +44,7 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
   const teamThreadTeam = state('')
   const teamThreadGrantee = state('')
   const teamThreadDownloads = state(false)
+  const teamThreadFollowReplies = state(false)
   const teamThreadSearch = state('')
   const teamThreadComment = state('')
   const teamThreadRevoking = state<Grant | null>(null)
@@ -53,6 +65,7 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
     teamThreadRevoking.set(null)
     teamThreadGrantee.set('')
     teamThreadDownloads.set(false)
+    teamThreadFollowReplies.set(false)
     teamThreadSearch.set('')
     teamThreadComment.set('')
   }
@@ -83,7 +96,9 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
 
   function preview(signal: AbortSignal) {
     return api<Preview>(`${endpoint}/preview`, {
-      method: 'POST', signal, body: JSON.stringify({ references, downloads: teamThreadDownloads() }),
+      method: 'POST', signal, body: JSON.stringify({
+        references, downloads: teamThreadDownloads(), followReplies: teamThreadFollowReplies(),
+      }),
     })
   }
 
@@ -110,11 +125,18 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
     void run(preview, prepared => teamThreadPreview.set(prepared))
   }
 
+  function setTeamThreadFollowReplies(enabled: boolean) {
+    teamThreadFollowReplies.set(enabled)
+    teamThreadPreview.set(null)
+    void run(preview, prepared => teamThreadPreview.set(prepared))
+  }
+
   async function shareTeamThread() {
     const prepared = teamThreadPreview()
     if (!prepared) return
     const body = JSON.stringify({
-      references, digest: prepared.digest, team: teamThreadTeam(), grantee: teamThreadGrantee().trim(), downloads: teamThreadDownloads(),
+      references, digest: prepared.digest, team: teamThreadTeam(), grantee: teamThreadGrantee().trim(),
+      downloads: teamThreadDownloads(), followReplies: teamThreadFollowReplies(),
     })
     let issued: Grant | undefined
     await run(signal => api<Grant>(endpoint, { method: 'POST', body, signal }), grant => { issued = grant })
@@ -173,8 +195,8 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
 
   return {
     teamThreadMode, teamThreadBusy, teamThreadError, teamThreadNotice, teamThreadPreview, teamThreadGrants, teamThreadDetail,
-    teamThreadTeams, teamThreadTeam, teamThreadGrantee, teamThreadDownloads, teamThreadSearch, teamThreadComment, teamThreadRevoking,
-    beginTeamThread, setTeamThreadDownloads, shareTeamThread, listTeamThreads, openTeamThread,
+    teamThreadTeams, teamThreadTeam, teamThreadGrantee, teamThreadDownloads, teamThreadFollowReplies, teamThreadSearch, teamThreadComment, teamThreadRevoking,
+    beginTeamThread, setTeamThreadDownloads, setTeamThreadFollowReplies, shareTeamThread, listTeamThreads, openTeamThread,
     addTeamThreadComment, revokeTeamThread, closeTeamThreads,
   }
 }

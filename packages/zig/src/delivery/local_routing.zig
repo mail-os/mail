@@ -357,6 +357,10 @@ fn drain(allocator: Allocator, db: *Database, id: ?[]const u8, limit: usize) !vo
             .size = target.mime.len,
             .attention = attention,
             .notification_key = notification_key,
+            .thread_reply_digest = if (target.team_reply_candidate and attention != null and attention.?.reply_parent != null)
+                message_refs.digest(target.mime)
+            else
+                null,
             .calendar_revisions = revisions,
         }) catch |err| {
             // Leave the reservation intact. Do not let an active mailbox
@@ -374,6 +378,7 @@ pub fn attentionArrival(a: Allocator, raw: []const u8) !?Database.AttentionArriv
         .own = headers.own,
         .parents_json = try std.json.Stringify.valueAlloc(a, headers.parents, .{}),
         .automatic = headers.automatic,
+        .reply_parent = headers.reply_parent,
     };
 }
 

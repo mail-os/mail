@@ -6,6 +6,7 @@ const categories = @import("../message/categories.zig");
 const forwarding_wire = @import("../message/forwarding.zig");
 const vacation_wire = @import("../message/vacation.zig");
 const team_store = @import("team_store.zig");
+const team_threads = @import("../api/webmail_team_threads.zig");
 const shared_inbox = @import("shared_inbox.zig");
 const calendar_invite = @import("../api/webmail_calendar_invite.zig");
 
@@ -1009,7 +1010,7 @@ pub const Database = struct {
         try self.initAuditTable();
         try self.exec(team_store.schema);
         try self.exec(shared_inbox.schema);
-        try self.exec(@import("../api/webmail_team_threads.zig").schema);
+        try self.exec(team_threads.schema);
     }
 
     pub fn exec(self: *Database, sql: []const u8) !void {
@@ -1878,6 +1879,7 @@ pub const Database = struct {
             try insert.reset();
             if (released) |file| {
                 try self.recordPlacementLocked(envelope.id, @intCast(ordinal), file);
+                try self.recordTeamThreadReplyLocked(envelope.id, @intCast(ordinal), file);
                 try self.recordCalendarRevisionsLocked(envelope.id, @intCast(ordinal), file.calendar_revisions);
                 const muted = try self.attentionArrivalLocked(envelope.id, @intCast(ordinal), file.attention);
                 try self.stageDeliveryEffectsLocked(envelope.id, @intCast(ordinal), file, muted);
@@ -2212,13 +2214,19 @@ pub const Database = struct {
     }
 
     pub const AttentionKind = enum { follow_up, saved, snoozed, muted, reminders };
-    pub const AttentionArrival = struct { own: ?[]const u8, parents_json: []const u8, automatic: bool };
+    pub const AttentionArrival = struct {
+        own: ?[]const u8,
+        parents_json: []const u8,
+        automatic: bool,
+        reply_parent: ?[]const u8 = null,
+    };
     pub const FiledCopy = struct {
         basename: []const u8,
         stamp: []const u8 = "",
         size: ?usize = null,
         attention: ?AttentionArrival = null,
         notification_key: []const u8 = "",
+        thread_reply_digest: ?[64]u8 = null,
         calendar_revisions: []const calendar_invite.Revision = &.{},
     };
 
@@ -2293,6 +2301,7 @@ pub const Database = struct {
         try self.releaseForwardTargetsLocked(id, ordinal, filed != null);
         if (filed) |file| {
             try self.recordPlacementLocked(id, ordinal, file);
+            try self.recordTeamThreadReplyLocked(id, ordinal, file);
             try self.recordCalendarRevisionsLocked(id, ordinal, file.calendar_revisions);
             const muted = try self.attentionArrivalLocked(id, ordinal, file.attention);
             try self.stageDeliveryEffectsLocked(id, ordinal, file, muted);
@@ -2386,6 +2395,25 @@ pub const Database = struct {
         try stmt.bind(2, ordinal);
         try stmt.bind(3, file.basename);
         try stmt.bind(4, file.stamp);
+        _ = try stmt.step();
+    }
+
+    fn recordTeamThreadReplyLocked(self: *Database, id: []const u8, ordinal: i64, file: FiledCopy) !void {
+        const digest = file.thread_reply_digest orelse return;
+        const arrival = file.attention orelse return;
+        if (arrival.automatic or file.stamp.len == 0) return;
+        const own = arrival.own orelse return;
+        const parent = arrival.reply_parent orelse return;
+        const stmt = try self.prepareLocked(team_threads.record_reply_sql);
+        defer stmt.finalize();
+        try stmt.bind(1, id);
+        try stmt.bind(2, ordinal);
+        try stmt.bind(3, file.basename);
+        try stmt.bind(4, @as([]const u8, &digest));
+        try stmt.bind(5, own);
+        try stmt.bind(6, parent);
+        try stmt.bind(7, team_threads.max_followed_replies);
+        try stmt.bind(8, file.stamp);
         _ = try stmt.step();
     }
 
@@ -2583,6 +2611,13 @@ pub const Database = struct {
             defer clear.finalize();
             try clear.bind(1, username);
             _ = try clear.step();
+            const shared = try self.prepareLocked(
+                \\UPDATE mail_team_thread_replies SET notice_at=0 WHERE notice_at<>0 AND share_id IN (
+                \\ SELECT s.id FROM mail_team_thread_shares s JOIN users u ON u.id=s.grantee_id WHERE u.username=?1)
+            );
+            defer shared.finalize();
+            try shared.bind(1, username);
+            _ = try shared.step();
         }
         try self.execLocked("COMMIT");
     }
@@ -2947,6 +2982,7 @@ pub const Database = struct {
         track_placement: bool,
         calendar_author: []const u8,
         calendar_attendee: []const u8,
+        team_reply_candidate: bool = false,
     };
 
     pub fn pendingDelivery(self: *Database, a: std.mem.Allocator, id: ?[]const u8, now: i64) !?PendingDelivery {
@@ -2959,7 +2995,10 @@ pub const Database = struct {
             \\          AND (m.verified_author=1 OR t.placement_reason<>'' OR t.reply_author IS NOT NULL),t.verified_forward,
             \\       IIF(t.is_primary=1 AND t.folder IN ('new','Newsletters','Receipts') AND m.verified_author=1
             \\           AND t.placement_reason NOT IN ('spam_filter','junk_feedback'),m.author,''),
-            \\       COALESCE((SELECT email FROM users WHERE id=t.mailbox_id),'')
+            \\       COALESCE((SELECT email FROM users WHERE id=t.mailbox_id),''),
+            \\       t.is_primary=1 AND m.verified_author=1 AND t.folder IN ('new','Newsletters','Receipts')
+            \\          AND EXISTS(SELECT 1 FROM mail_team_thread_shares s JOIN mail_team_thread_follow f ON f.share_id=s.id
+            \\                     WHERE s.owner_id=t.mailbox_id AND m.accepted_ms>f.since_ms)
             \\FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
             \\WHERE t.outcome='pending' AND t.forward_after IS NULL AND t.retry_at<=?1
         ;
@@ -2984,6 +3023,7 @@ pub const Database = struct {
             .track_placement = stmt.columnInt64(9) != 0,
             .calendar_author = try a.dupe(u8, stmt.columnText(11)),
             .calendar_attendee = try a.dupe(u8, stmt.columnText(12)),
+            .team_reply_candidate = stmt.columnInt64(13) != 0,
         };
     }
 

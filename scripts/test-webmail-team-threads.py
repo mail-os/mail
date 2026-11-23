@@ -2,6 +2,7 @@
 """Exercise identity-bound conversation shares on native HTTPS."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
 from pathlib import Path
 import runpy
@@ -29,6 +30,25 @@ def append(imap, mailbox, subject, body, *, attachment=False, folder="INBOX"):
         hidden.set_content("A nested message stays private.")
         msg.add_attachment(hidden, filename="nested.eml")
     assert imap.append(folder, None, None, msg.as_bytes())[0] == "OK"
+
+
+def send(fixture, mailbox, author, key, *, verified=True, parent=None, references=None, automatic=False, attachment=False):
+    msg = EmailMessage()
+    msg["From"], msg["To"] = author, mailbox
+    msg["Subject"] = f"Follow fixture {key}"
+    msg["Message-ID"] = f"<{key}@threads.example.test>"
+    if parent:
+        msg["In-Reply-To"] = f"<{parent}@threads.example.test>"
+    if references:
+        msg["References"] = " ".join(f"<{ref}@threads.example.test>" for ref in references)
+    if automatic:
+        msg["Auto-Submitted"] = "auto-replied"
+    msg.set_content(f"Reply content for {key}.")
+    if attachment:
+        msg.add_attachment(FILE, maintype="application", subtype="octet-stream", filename="future.bin")
+    identity = author if verified else None
+    with fixture.smtp(identity) as connection:
+        assert connection.send_message(msg, from_addr=identity or "unverified@example.test", to_addrs=[mailbox]) == {}
 
 
 def verify(fixture):
@@ -81,6 +101,7 @@ def verify(fixture):
         plain_path = f"{SHARES}/{plain['id']}"
         download(other, f"{plain_path}/attachments/{chosen[0]}/0", 404)
         call(own, plain_path, method="DELETE")
+        call(own, SHARES + "/preview", {**selection, "followReplies": True}, "POST", 409)
 
         preview = call(own, SHARES + "/preview", {**selection, "downloads": True}, "POST")
         part, = preview["messages"][0]["attachments"]
@@ -117,6 +138,59 @@ def verify(fixture):
 
         move("Archive")
         assert download(other, attachment) == FILE
+
+        call(own, "sender-review", {"setting": "disable"}, "PUT")
+        send(fixture, owner, witness, "root")
+        send(fixture, owner, witness, "before-grant", parent="root")
+        root, = call(own, "messages?conversations=false&q=Follow+fixture+root")["items"]
+        follow = {"references": [root["reference"]], "downloads": True, "followReplies": True}
+        reviewed = call(own, SHARES + "/preview", follow, "POST")
+        assert reviewed["followingAuthors"] == [witness]
+        followed = call(own, SHARES, {**follow, "digest": reviewed["digest"], "team": "studio", "grantee": peer}, "POST", 201)
+        followed_path = f"{SHARES}/{followed['id']}"
+        assert [item["reference"] for item in call(other, followed_path)["messages"]] == [root["reference"]]
+        for session in (other, third, foreign):
+            call(session, "notifications", {"enabled": True}, "PUT")
+        send(fixture, owner, witness, "visible-reply", parent="root", attachment=True)
+        send(fixture, owner, witness, "visible-continuation", references=["root", "visible-reply"])
+        send(fixture, owner, witness, "spoofed", parent="root", verified=False)
+        send(fixture, owner, outsider, "different-sender", parent="root")
+        send(fixture, owner, witness, "reference-only-ancestor", references=["root", "unrelated-parent"])
+        send(fixture, owner, witness, "unrelated-direct-parent", parent="unrelated-parent", references=["root"])
+        send(fixture, owner, witness, "automatic", parent="root", automatic=True)
+        send(fixture, owner, witness, "visible-reply", parent="root")
+        data = call(other, followed_path)
+        assert data["grant"]["followingAuthors"] == [witness]
+        assert [row["subject"] for row in data["messages"]] == [
+            "Follow fixture root", "Follow fixture visible-reply", "Follow fixture visible-continuation",
+        ]
+        reply = data["messages"][1]
+        assert reply["verifiedReply"] and reply["attachments"] == []
+        assert call(other, followed_path + "?q=visible-continuation")["messages"] == data["messages"][2:]
+        assert call(other, followed_path + "?q=before-grant")["messages"] == []
+        download(other, f"{followed_path}/attachments/{reply['reference']}/0", 404)
+        call(third, followed_path, status=404)
+        call(foreign, followed_path, status=404)
+
+        def claim(session):
+            batch = call(session, "notifications/claim", method="POST")
+            assert set(batch) <= {"ids", "teamReplies"}
+            return batch.get("teamReplies", 0)
+
+        assert claim(third) == claim(foreign) == 0
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            assert sum(pool.map(claim, [other, other])) == 2
+        assert claim(other) == 0
+        send(fixture, owner, witness, "disabled-notice", parent="visible-continuation")
+        call(other, "notifications", {"enabled": False}, "PUT")
+        call(other, "notifications", {"enabled": True}, "PUT")
+        assert claim(other) == 0
+        send(fixture, owner, witness, "pending-notice", parent="visible-continuation")
+        assert len(call(other, followed_path + "?q=pending-notice")["messages"]) == 1
+        call(own, followed_path, method="DELETE")
+        assert claim(other) == 0
+        send(fixture, owner, witness, "after-revoke", parent="visible-continuation")
+        call(other, followed_path, status=404)
         move("Trash")
         assert call(other, path + "?q=cobalt")["messages"] == []
         download(other, attachment, 404)
@@ -145,7 +219,7 @@ def main():
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="mail-team-threads-") as directory:
         verify(Fixture(args.binary.resolve(strict=True), Path(directory), staging=True))
-    print("Verified team conversation previews, identity, searching, attachments, comments, and revocation.")
+    print("Verified team conversation previews, identity, searching, attachments, comments, reply following, notifications, and revocation.")
 
 
 if __name__ == "__main__":

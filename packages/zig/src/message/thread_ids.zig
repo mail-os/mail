@@ -25,6 +25,7 @@ pub const Iterator = struct {
 pub const Headers = struct {
     own: ?[]const u8 = null,
     parents: []const []const u8 = &.{},
+    reply_parent: ?[]const u8 = null,
     automatic: bool = false,
 
     pub fn keys(self: Headers, a: std.mem.Allocator) ![]const []const u8 {
@@ -39,10 +40,13 @@ pub const Headers = struct {
 /// Message identifiers cannot fold internally, so an unfolded header can be
 /// read one physical line at a time. Only inspect the top-level MIME headers.
 pub fn parse(a: std.mem.Allocator, raw: []const u8) !Headers {
-    const Field = enum { ignore, own, parent, automatic };
+    const Field = enum { ignore, own, reply, reference, automatic };
     var field: Field = .ignore;
     var result: Headers = .{};
     var parents: std.ArrayList([]const u8) = .empty;
+    var direct_parent: ?[]const u8 = null;
+    var multiple_parents = false;
+    var last_reference: ?[]const u8 = null;
     var lines = std.mem.splitScalar(u8, raw, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -54,7 +58,8 @@ pub fn parse(a: std.mem.Allocator, raw: []const u8) !Headers {
             const name = trimmed[0..colon];
             value = std.mem.trim(u8, trimmed[colon + 1 ..], " \t");
             if (std.ascii.eqlIgnoreCase(name, "Message-ID")) field = .own;
-            if (std.ascii.eqlIgnoreCase(name, "In-Reply-To") or std.ascii.eqlIgnoreCase(name, "References")) field = .parent;
+            if (std.ascii.eqlIgnoreCase(name, "In-Reply-To")) field = .reply;
+            if (std.ascii.eqlIgnoreCase(name, "References")) field = .reference;
             if (std.ascii.eqlIgnoreCase(name, "Auto-Submitted")) field = .automatic;
         }
         var ids: Iterator = .{ .text = value };
@@ -63,9 +68,16 @@ pub fn parse(a: std.mem.Allocator, raw: []const u8) !Headers {
             .own => if (result.own == null) {
                 result.own = ids.next();
             },
-            .parent => while (parents.items.len < 64) {
+            .reply, .reference => while (parents.items.len < 64) {
                 const id = ids.next() orelse break;
                 try parents.append(a, id);
+                if (field == .reference) {
+                    last_reference = id;
+                } else if (direct_parent == null) {
+                    direct_parent = id;
+                } else if (!std.mem.eql(u8, direct_parent.?, id)) {
+                    multiple_parents = true;
+                }
             },
             .automatic => if (value.len > 0 and !std.ascii.eqlIgnoreCase(value, "no")) {
                 result.automatic = true;
@@ -73,6 +85,7 @@ pub fn parse(a: std.mem.Allocator, raw: []const u8) !Headers {
         }
     }
     result.parents = try parents.toOwnedSlice(a);
+    result.reply_parent = if (multiple_parents or result.parents.len == 64) null else direct_parent orelse last_reference;
     return result;
 }
 

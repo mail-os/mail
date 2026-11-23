@@ -1118,6 +1118,8 @@ async function teamThreadJourney(desktop) {
   await compose.getByRole('region', { name: 'Conversation preview' }).getByText(/November payment/).waitFor()
   await compose.getByLabel('Allow attachment downloads').check()
   await compose.getByRole('region', { name: 'Conversation preview' }).getByText('receipt-1046.txt', { exact: true }).waitFor()
+  await compose.getByLabel('Follow verified replies').check()
+  await compose.getByText('Share text previews of up to 40 incoming replies from ' + sender + '.', { exact: true }).waitFor()
   assert.equal(await compose.getByLabel('Team', { exact: true }).inputValue(), 'studio')
   await compose.getByLabel('Teammate', { exact: true }).fill(sender)
   await compose.locator('.wm-snapshot-panel').screenshot({ path: join(output, 'desktop-team-thread-preview.png'), animations: 'disabled' })
@@ -1147,15 +1149,25 @@ async function teamThreadJourney(desktop) {
     const href = new URL(await file.getAttribute('href'), url)
     const response = await teammate.request.get(href.href)
     assert.equal(await response.text(), 'Receipt 1046 for Studio Hosting\n')
+    const receiptId = '<browser-fixture-3@hosted.example.test>'
+    const followup = await teammate.request.post(url + '/webmail/api/compose', {
+      headers: { Origin: url },
+      data: { to: [owner], subject: 'Re: Your receipt #1046', text: 'The updated receipt total is confirmed.', inReplyTo: receiptId, references: receiptId },
+    })
+    assert.equal(followup.status(), 200, await followup.text())
+    await incoming.getByLabel('Search conversation').fill('UPDATED RECEIPT')
+    await button(incoming, 'Search').click()
+    await incoming.getByText('The updated receipt total is confirmed.', { exact: true }).waitFor()
+    await incoming.getByText('Verified reply', { exact: true }).waitFor()
     await fitsViewport(teammate)
-    await screenshot(teammate, 'phone-team-thread')
+    await screenshot(teammate, 'phone-team-thread-followed-reply')
     await button(ownerView, 'Revoke access').click()
     await button(ownerView.getByRole('group', { name: 'Confirm conversation revocation' }), 'Revoke access').click()
     await ownerView.getByText('Access revoked.', { exact: true }).waitFor()
     assert.equal((await teammate.request.get(href.href)).status(), 404)
     await button(incoming, 'Search').click()
     await incoming.getByRole('alert').filter({ hasText: /unavailable/ }).waitFor()
-    await file.waitFor({ state: 'hidden' })
+    await incoming.getByText('The updated receipt total is confirmed.', { exact: true }).waitFor({ state: 'hidden' })
     await button(ownerView, 'Close').click()
   }
   finally { await teammate.context().close() }

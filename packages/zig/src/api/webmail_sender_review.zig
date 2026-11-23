@@ -376,6 +376,7 @@ fn process(a: Allocator, db: *Database, job: Job, hostname: []const u8, mail_con
         .stamp = current.stamp,
         .attention = attention,
         .notification_key = if (try db.browserNotificationsEnabled(job.user)) try routing.browserNotificationKey(a, current.raw, attention) else "",
+        .thread_reply_digest = if (row.verified and attention != null and attention.?.reply_parent != null) current.version.content_revision else null,
     };
     if (!std.mem.eql(u8, destination, "INBOX")) return db.finishReviewPlacement(job.user, operation, placed);
 

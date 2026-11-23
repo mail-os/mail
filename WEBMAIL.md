@@ -682,6 +682,13 @@ and removing a member from the team removes their grants. A shared message
 follows moves between readable folders while its approved MIME content remains
 current.
 
+Choose **Follow verified replies** to share the plain text of up to 40 later
+incoming replies from the verified senders named in the preview. Mail matches
+the direct reply to an approved message or a reply already in the share.
+Earlier mail, automatic responses, and attachments in later replies stay in
+the owner's mailbox. A teammate with browser notifications enabled can receive
+a generic notice. Mail checks access again when the browser claims the notice.
+
 Shared conversations show the original subject, sender, date, and plain text.
 Private notes and hidden envelope fields stay in the owner's mailbox.
 Teammate comments belong to the share and are visible to its two participants.

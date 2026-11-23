@@ -85,9 +85,13 @@ export function useMailNotifications(api: Api, account: () => string | undefined
     try {
       const active = await worker()
       if (account() !== username || notificationBusy() || Notification.permission !== 'granted') return
-      const batch = await api<{ ids: number[] }>(`${settingsPath}/claim`, { method: 'POST' })
-      if (batch.ids.length && account() === username && !notificationBusy() && Notification.permission === 'granted') {
+      const batch = await api<{ ids: number[], teamReplies?: number }>(`${settingsPath}/claim`, { method: 'POST' })
+      if (account() !== username || notificationBusy() || Notification.permission !== 'granted') return
+      if (batch.ids.length) {
         await active.showNotification('Mail', { body: 'You have new mail.', tag: `mail-${batch.ids[batch.ids.length - 1]}` })
+      }
+      if (batch.teamReplies && account() === username && !notificationBusy() && Notification.permission === 'granted') {
+        await active.showNotification('Mail', { body: 'New replies in shared conversations.', tag: 'mail-team-replies' })
       }
     }
     catch { /* A tab can suspend or lose its session between polls. */ }

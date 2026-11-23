@@ -2195,6 +2195,7 @@ fn teamError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: anyerror)
 const ThreadShareInput = struct {
     references: []const []const u8,
     downloads: bool = false,
+    followReplies: bool = false,
     team: ?[]const u8 = null,
     grantee: ?[]const u8 = null,
     digest: ?[]const u8 = null,
@@ -2219,15 +2220,19 @@ fn handleThreadShares(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: 
         if (!posting or req.body.len > 4096) return threadShareError(conn, a, error.InvalidThreadShare);
         const input = std.json.parseFromSliceLeaky(ThreadShareInput, a, req.body, .{}) catch
             return threadShareError(conn, a, error.InvalidThreadShare);
-        const prepared = team_threads.prepare(a, server.db, actor, input.references, input.downloads, junk) catch |err|
+        const prepared = team_threads.prepare(a, server.db, actor, input.references, input.downloads, input.followReplies, junk) catch |err|
             return threadShareError(conn, a, err);
         if (preview)
-            return sendJson(conn, a, 200, try service_mod.json(a, .{ .messages = prepared.messages, .digest = @as([]const u8, &prepared.digest) }), null);
+            return sendJson(conn, a, 200, try service_mod.json(a, .{
+                .messages = prepared.messages,
+                .digest = @as([]const u8, &prepared.digest),
+                .followingAuthors = prepared.authors,
+            }), null);
         const team = input.team orelse return threadShareError(conn, a, error.InvalidThreadShare);
         const grantee = input.grantee orelse return threadShareError(conn, a, error.InvalidThreadShare);
         if (!std.mem.eql(u8, input.digest orelse "", &prepared.digest))
             return sendError(conn, a, 409, "thread_share_changed", "Review the current conversation preview before sharing.");
-        const grant = team_threads.create(a, server.db, actor, team, grantee, prepared) catch |err|
+        const grant = team_threads.create(a, server.db, actor, team, grantee, prepared, time_compat.milliTimestamp()) catch |err|
             return threadShareError(conn, a, err);
         return sendJson(conn, a, 201, try service_mod.json(a, grant), null);
     }
@@ -2268,9 +2273,10 @@ fn handleThreadShares(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: 
 
 fn threadShareError(conn: *webmail_tls.Stream, a: std.mem.Allocator, err: anyerror) !void {
     switch (err) {
-        error.ThreadShareUnavailable, maildir.MaildirError.MessageNotFound => return sendError(conn, a, 404, "thread_share_unavailable", "This conversation or message is unavailable."),
+        error.ThreadShareUnavailable, maildir.MaildirError.MessageNotFound, error.FileNotFound => return sendError(conn, a, 404, "thread_share_unavailable", "This conversation or message is unavailable."),
         error.ThreadShareTooLarge => return sendError(conn, a, 413, "thread_share_too_large", "Share fewer or smaller messages."),
         error.InvalidThreadShare => return sendError(conn, a, 400, "invalid_thread_share", "Check the selected messages, teammate, or comment."),
+        error.ThreadFollowUnavailable => return sendError(conn, a, 409, "thread_follow_unavailable", "To follow replies, select a conversation with a verified inbound sender and a message ID."),
         error.ThreadShareGrantUnavailable => return sendError(conn, a, 409, "thread_share_grant_unavailable", "Choose an active teammate or revoke a share before creating another."),
         error.ThreadShareCommentLimit => return sendError(conn, a, 409, "thread_share_comment_limit", "This conversation reached its comment limit."),
         else => return mapServiceError(conn, a, err),
@@ -3462,7 +3468,12 @@ fn handleBrowserNotificationClaim(server: *WebmailHttpServer, conn: *webmail_tls
     var sess = (try requireSession(server, conn, a, req)) orelse return;
     defer sess.deinit(server.allocator);
     const ids = try server.db.claimBrowserNotifications(a, sess.username);
-    return sendJson(conn, a, 200, try service_mod.json(a, .{ .ids = ids }), null);
+    const replies = team_threads.claimReplyNotices(a, server.db, sess.username, server.service.junkFolder()) catch |err| blk: {
+        logger.warn("Shared reply notification claim failed: {}", .{err});
+        break :blk 0;
+    };
+    if (replies == 0) return sendJson(conn, a, 200, try service_mod.json(a, .{ .ids = ids }), null);
+    return sendJson(conn, a, 200, try service_mod.json(a, .{ .ids = ids, .teamReplies = replies }), null);
 }
 
 const BrowserNotificationChange = struct {
