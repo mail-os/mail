@@ -1,6 +1,7 @@
 //! Project the MIME walker into the body and file views used by webmail.
 const std = @import("std");
 const mime = @import("../message/mime.zig");
+const mime_source = @import("../message/mime_source.zig");
 const calendar = @import("webmail_calendar_invite.zig");
 
 const Allocator = std.mem.Allocator;
@@ -55,14 +56,7 @@ const Output = struct {
     seen: u32 = 0,
 };
 
-const Line = struct {
-    start: usize = 0,
-    end: usize = 0,
-    blank: bool = false,
-};
-
 const Slot = struct {
-    boundaries: []const []const u8 = &.{},
     body_start: usize = 0,
     attached_container: bool = false,
     skipped: bool = false,
@@ -81,11 +75,10 @@ fn walk(a: Allocator, output: *Output, raw: []const u8, headers: ?[]const u8, mo
     const scratch = try temporary.alloc(u8, @min(raw.len, 1024 * 1024) + 64 * 1024);
     const walker = try temporary.create(mime.lib.Walker);
     var collector: Collector = .{ .a = a, .output = output, .raw = raw, .mode = mode, .depth = depth, .root_only = root_only };
-    walker.* = mime.lib.Walker.init(scratch, mime.lib.Sink.init(&collector), .{
+    mime_source.walk(walker, scratch, raw, headers, &collector, .{
         .max_depth = max_depth - depth,
         .max_parts = max_parts - output.seen,
-    });
-    collector.read(walker, headers) catch {
+    }) catch {
         if (collector.failure) |err| return err;
     };
 }
@@ -97,39 +90,14 @@ const Collector = struct {
     mode: Mode,
     depth: u8,
     root_only: bool,
-    line: Line = .{},
-    eof: bool = false,
     slots: [max_depth + 1]Slot = @splat(.{}),
     failure: ?anyerror = null,
 
-    /// Feed physical lines from the original message. The walker decides
-    /// which lines open and close parts. The line positions let us preserve
-    /// opaque containers, whose bytes are not emitted as leaf body events.
-    fn read(self: *Collector, walker: *mime.lib.Walker, headers: ?[]const u8) mime.lib.Sink.Error!void {
-        if (headers) |block| try walker.beginWithHeaders(block);
-        var pos: usize = 0;
-        while (pos < self.raw.len) {
-            const end = if (std.mem.indexOfScalarPos(u8, self.raw, pos, '\n')) |nl| nl + 1 else self.raw.len;
-            const line = self.raw[pos..end];
-            self.line = .{ .start = pos, .end = end, .blank = std.mem.eql(u8, line, "\n") or std.mem.eql(u8, line, "\r\n") };
-            try walker.feed(line);
-            // Resolve a delimiter at EOF even when it has no final newline.
-            // Compare with the open boundaries, whose tolerant prefix match
-            // is also used by the walker. Only a delimiter gets a synthetic
-            // newline, so transfer decoders never see an altered body.
-            if (end == self.raw.len and line[line.len - 1] != '\n' and self.terminalDelimiter(line)) try walker.feed("\n");
-            pos = end;
-        }
-        self.eof = true;
-        self.line = .{ .start = self.raw.len, .end = self.raw.len };
-        try walker.finish();
-    }
-
-    pub fn onEvent(self: *Collector, event: mime.lib.Event) mime.lib.Sink.Error!void {
+    pub fn onEvent(self: *Collector, event: mime.lib.Event, source: mime_source.Location) mime.lib.Sink.Error!void {
         switch (event) {
-            .part_begin => |p| self.beginPart(p) catch |err| return self.abort(err),
+            .part_begin => |p| self.beginPart(p, source) catch |err| return self.abort(err),
             .body => |b| self.body(b) catch |err| return self.abort(err),
-            .part_end => |e| self.finishPart(e) catch |err| return self.abort(err),
+            .part_end => |e| self.finishPart(e, source) catch |err| return self.abort(err),
             .diagnostic => |d| switch (d.kind) {
                 // Stop before incomplete headers can turn an attachment into
                 // display text. Keep the earlier parts and mailbox usable.
@@ -144,15 +112,15 @@ const Collector = struct {
         return error.Aborted;
     }
 
-    fn beginPart(self: *Collector, p: *const Part) !void {
+    fn beginPart(self: *Collector, p: *const Part, source: mime_source.Location) !void {
         self.output.seen += 1;
         const slot = &self.slots[p.depth];
-        slot.* = .{ .boundaries = p.boundaries };
+        slot.* = .{};
         if (p.depth != 0 and (self.root_only or self.slots[p.depth - 1].attached_container or self.slots[p.depth - 1].skipped)) {
             slot.skipped = true;
             return;
         }
-        slot.body_start = if (self.line.blank) self.line.end else self.line.start;
+        slot.body_start = source.bodyStart();
         const filename = fileName(p);
         slot.attached_container = p.content_type.isEmbeddedMessage() or (p.content_type.isMultipart() and filename != null);
         if (self.root_only and filename == null) return error.NoRootAttachment;
@@ -195,13 +163,12 @@ const Collector = struct {
         try slot.bytes.appendSlice(self.a, b.bytes);
     }
 
-    fn finishPart(self: *Collector, e: mime.lib.PartEnd) !void {
+    fn finishPart(self: *Collector, e: mime.lib.PartEnd, source: mime_source.Location) !void {
         const slot = &self.slots[e.part.depth];
-        slot.boundaries = &.{};
         if (slot.skipped) return;
         if (slot.file) |*file| {
             if (slot.attached_container and e.part.kind != .leaf) {
-                const end_pos = if (self.eof) self.raw.len else beforeDelimiter(self.raw, self.line.start);
+                const end_pos = source.bodyEnd(self.raw);
                 const bytes = self.raw[slot.body_start..@max(slot.body_start, end_pos)];
                 file.size = bytes.len;
                 if (self.mode == .full) file.data = bytes;
@@ -213,7 +180,7 @@ const Collector = struct {
         }
         if (slot.method) |method| {
             // Multipart invitation actions require a terminated part.
-            if ((!self.eof or e.part.depth == 0) and !e.decode_flags.invalid_input and !e.decode_flags.padding_inside)
+            if ((!source.eof or e.part.depth == 0) and !e.decode_flags.invalid_input and !e.decode_flags.padding_inside)
                 try self.addCalendar(method, slot.bytes.items);
         }
         switch (slot.display) {
@@ -240,23 +207,7 @@ const Collector = struct {
         }
         try self.output.calendar_parts.append(self.a, .{ .method = method, .body = bytes });
     }
-
-    fn terminalDelimiter(self: *const Collector, line: []const u8) bool {
-        if (!std.mem.startsWith(u8, line, "--")) return false;
-        for (self.slots) |slot| {
-            for (slot.boundaries) |boundary| {
-                if (std.mem.startsWith(u8, line[2..], boundary)) return true;
-            }
-        }
-        return false;
-    }
 };
-
-fn beforeDelimiter(raw: []const u8, offset: usize) usize {
-    if (offset >= 2 and std.mem.eql(u8, raw[offset - 2 .. offset], "\r\n")) return offset - 2;
-    if (offset >= 1 and raw[offset - 1] == '\n') return offset - 1;
-    return offset;
-}
 
 fn fileName(p: *const Part) ?[]const u8 {
     if (p.filename) |name| if (name.len > 0) return name;
