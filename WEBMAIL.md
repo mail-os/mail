@@ -339,6 +339,15 @@ Choose **Account → Switch account** to save your current draft and return to
 sign-in. Drafts and pending sends stay with the originating mailbox. Tabs that
 still show the previous mailbox reload when they detect the new account.
 
+Open **Combined inbox → Linked accounts** and sign in to another Mail mailbox
+to add it to this browser. You can link up to four mailboxes. The list combines
+their inboxes, labels each message with its source, and offers search across
+all folders and actions on selected messages from different mailboxes. Opening
+a message takes you to its source mailbox. Replies, drafts, and Outbox use that
+mailbox’s address and sending allowance. Removing a link closes its reader
+in other tabs and prevents new requests or pending sends through that link.
+Signing out removes all links. Saved drafts stay in their original mailbox.
+
 Mail keeps up to `CALDAV_MAX_SYNC_HISTORY` recent changes in memory for
 incremental DAV reports. The default is 10,000 changes across calendars and
 address books. If history is pruned or the server restarts, clients with an
@@ -733,6 +742,20 @@ before a request may affect another mailbox. Disabling or deleting an account
 revokes existing webmail sessions.
 
 - `GET /webmail/api/config` returns effective limits and preferences.
+- `GET /webmail/api/combined/accounts` lists the owner and this browser’s
+  linked accounts. `POST` accepts `{username,password}` to verify a mailbox
+  and link it to the current session. `DELETE .../accounts/{id}` removes it.
+  `GET /webmail/api/combined/messages` returns an ordered page of `{source,message}`
+  rows. Search uses `q` with `scope=inbox` or `scope=mail`.
+  `POST /webmail/api/combined/actions` accepts `{action,messages}`, with each
+  message carrying an `account` link ID or empty owner ID, `reference`, and
+  `revision`. It reports each mailbox’s updates separately. Supported actions
+  are `read`, `unread`, `archive`, `trash`, `flag`, and `unflag`.
+- Mail reads, drafts, and sends may carry a `linked` query parameter with the
+  server-issued link ID. Keep the original browser cookie and pin the source
+  account with `X-Webmail-Account`. These requests resolve only links owned by
+  that session. Linked sends require an Outbox send ID and recheck the link at
+  delivery admission.
 - `GET /webmail/api/external-sender-verification` returns current verification
   state for operator-approved addresses belonging to the signed-in mailbox.
   `POST` to the same path accepts `{id,action,code?}`. The `request` action

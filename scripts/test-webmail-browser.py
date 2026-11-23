@@ -191,6 +191,8 @@ def verify(binary, output, engine):
             note.set_content("Here is the handoff for Thursday.")
             with fixture.smtp(sender) as connection:
                 assert connection.send_message(note) == {}
+            assert fixture.deliver(sender, identity=owner, subject="Combined source briefing",
+                                   body="Please send the design notes from this mailbox.")[0] == 250
             seed_shared_inbox(fixture, owner, sender)
             day = seed_calendar(fixture, owner)
             env = dict(os.environ, MAIL_BROWSER_URL=fixture.webmail, MAIL_BROWSER_OWNER=owner,

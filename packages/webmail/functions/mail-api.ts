@@ -16,7 +16,12 @@ export function restoreMailReads(event: PageTransitionEvent): void {
   if (event.persisted) pageReads = new AbortController()
 }
 
-export function createMailApi(account: () => string | undefined, onAuthError: (error: MailApiError) => void, isCurrent = () => true) {
+export function scopedMailPath(path: string, linked?: string | null): string {
+  if (linked == null || !path.startsWith('/webmail/')) return path
+  return path + (path.includes('?') ? '&' : '?') + 'linked=' + encodeURIComponent(linked)
+}
+
+export function createMailApi(account: () => string | undefined, onAuthError: (error: MailApiError) => void, isCurrent = () => true, linked?: string | null) {
   let pinnedAccount: string | undefined
   let accountChanged = false
   const changed = () => new MailApiError('The signed-in account changed. Reload this tab before continuing.', 409, 'account_changed')
@@ -38,14 +43,14 @@ export function createMailApi(account: () => string | undefined, onAuthError: (e
     let signal = options.signal
     if (method === 'GET' || method === 'HEAD')
       signal = signal ? AbortSignal.any([pageReads.signal, signal]) : pageReads.signal
-    const response = await fetch(path, { ...options, headers, signal, credentials: 'same-origin', cache: 'no-store' })
+    const response = await fetch(scopedMailPath(path, linked), { ...options, headers, signal, credentials: 'same-origin', cache: 'no-store' })
     const result = await response.json().catch(() => ({}))
     signal?.throwIfAborted()
     if (accountChanged || !isCurrent()) throw changed()
     if (!response.ok) {
       const error = new MailApiError(result.message || 'The request failed. Please try again.', response.status, result.code || result.error || 'request_failed')
-      if (error.code === 'account_changed') accountChanged = true
-      if (error.status === 401 || error.code === 'account_changed') onAuthError(error)
+      if (error.code === 'account_changed' || (linked != null && error.code === 'linked_account_unavailable')) accountChanged = true
+      if (error.status === 401 || accountChanged) onAuthError(error)
       throw error
     }
     return result as T
@@ -53,11 +58,11 @@ export function createMailApi(account: () => string | undefined, onAuthError: (e
 }
 
 /** Upload progress is distinct from the server acknowledgement at completion. */
-export function uploadAttachment(file: File, account: string, progress: (value: number) => void, signal: AbortSignal, uploadId: string): Promise<Upload> {
+export function uploadAttachment(file: File, account: string, progress: (value: number) => void, signal: AbortSignal, uploadId: string, linked?: string | null): Promise<Upload> {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest()
     const params = new URLSearchParams({ filename: file.name, contentType: file.type.split(';')[0].trim() || 'application/octet-stream', uploadId })
-    request.open('POST', `/webmail/api/uploads?${params}`)
+    request.open('POST', scopedMailPath(`/webmail/api/uploads?${params}`, linked))
     request.withCredentials = true
     request.setRequestHeader('Content-Type', 'application/octet-stream')
     request.setRequestHeader('X-Webmail-Account', encodeURIComponent(account))

@@ -37,6 +37,7 @@ const teams = @import("../storage/team_store.zig");
 const shared_inbox = @import("../storage/shared_inbox.zig");
 const auth_mod = @import("../auth/auth.zig");
 const session_mod = @import("webmail_session.zig");
+const account_links = @import("../storage/webmail_account_links.zig");
 const maildir = @import("webmail_maildir.zig");
 const search_index = @import("webmail_index.zig");
 const personal = @import("webmail_private.zig");
@@ -88,6 +89,7 @@ const index_html = @embedFile("webmail_dist/index.html");
 const login_html = @embedFile("webmail_dist/login.html");
 const calendar_html = @embedFile("webmail_dist/calendar.html");
 const shared_html = @embedFile("webmail_dist/shared.html");
+const combined_html = @embedFile("webmail_dist/combined.html");
 const recover_html = @embedFile("webmail_dist/recover.html");
 const snapshot_html = @embedFile("webmail_dist/snapshot.html");
 const file_link_html = @embedFile("webmail_dist/file-link.html");
@@ -458,14 +460,15 @@ fn readRequest(server: *WebmailHttpServer, conn: *webmail_tls.Stream, allocator:
     var request = Request{ .method = method, .path = path, .query = query, .headers = headers_block, .body = "", .trust_forwarded_headers = trusted };
     if (request.header("Transfer-Encoding") != null) return error.MalformedRequest;
     var body_limit: usize = if (server.config.provisioning != null) 4096 else max_request_bytes;
+    if (std.mem.eql(u8, path, "/webmail/api/combined/accounts")) body_limit = @min(body_limit, 8192);
+    if (std.mem.eql(u8, path, "/webmail/api/combined/actions")) body_limit = @min(body_limit, 32 * 1024);
     const file_upload = std.mem.eql(u8, path, file_links.path);
     errdefer if (request.holds_file_transfer) server.releaseFileTransfer();
     if (server.config.provisioning == null and std.mem.eql(u8, method, "POST") and
         (file_upload or std.mem.eql(u8, path, "/webmail/api/uploads")))
     {
         if (!isSameOrigin(request)) return error.CrossOrigin;
-        const token = session_mod.parseSessionCookie(request.header("Cookie") orelse "") orelse return error.Unauthorized;
-        var session = server.sessions.validate(token) catch return error.Unauthorized;
+        var session = try resolveRequestSession(server, allocator, request);
         defer session.deinit(server.allocator);
         if (file_upload) {
             if (!try expectedAccountMatches(allocator, request, session.username)) return error.AccountChanged;
@@ -523,6 +526,7 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
             error.RequestTooLarge => sendError(conn, arena, 413, "too_large", "This request exceeds the configured limit"),
             error.Unauthorized => sendError(conn, arena, 401, "unauthorized", "Please sign in"),
             error.AccountChanged => sendError(conn, arena, 409, "account_changed", "The signed-in account changed. Reload this tab before continuing."),
+            error.LinkedAccountUnavailable => sendError(conn, arena, 403, "linked_account_unavailable", "This linked mailbox is no longer available."),
             error.FileTransfersBusy => sendError(conn, arena, 503, "file_transfers_busy", "File transfers are busy. Try again shortly."),
             error.CrossOrigin => sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected"),
             error.MalformedRequest, error.HeadersTooLarge => sendError(conn, arena, 400, "bad_request", "Malformed request"),
@@ -545,6 +549,9 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     }
 
     const p = req.path;
+    if (req.queryParam(arena, "linked") != null and !linkedRequestAllowed(req) and
+        !(std.mem.eql(u8, p, "/") and std.mem.eql(u8, req.method, "GET")))
+        return sendError(conn, arena, 403, "linked_route_unavailable", "This action is unavailable in a linked mailbox.");
 
     if (std.mem.eql(u8, p, "/health/report") and std.mem.eql(u8, req.method, "GET")) {
         if (!health.authorized(req.header("oh-dear-health-check-secret")))
@@ -558,6 +565,14 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     }
     if (std.mem.eql(u8, p, "/webmail/api/health") and std.mem.eql(u8, req.method, "GET")) return handleHealth(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/config") and std.mem.eql(u8, req.method, "GET")) return handleClientConfig(server, conn, arena, req);
+    const combined_accounts = "/webmail/api/combined/accounts";
+    if (std.mem.eql(u8, p, combined_accounts)) return handleCombinedAccounts(server, conn, arena, req, null);
+    if (std.mem.startsWith(u8, p, combined_accounts ++ "/") and std.mem.eql(u8, req.method, "DELETE"))
+        return handleCombinedAccounts(server, conn, arena, req, p[combined_accounts.len + 1 ..]);
+    if (std.mem.eql(u8, p, "/webmail/api/combined/messages") and std.mem.eql(u8, req.method, "GET"))
+        return handleCombinedMessages(server, conn, arena, req);
+    if (std.mem.eql(u8, p, "/webmail/api/combined/actions") and std.mem.eql(u8, req.method, "POST"))
+        return handleCombinedAction(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/sender-identities") and std.mem.eql(u8, req.method, "GET")) return handleSenderIdentities(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/external-sender-review") and std.mem.eql(u8, req.method, "POST")) return handleExternalSenderReview(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/external-sender-verification")) return handleExternalSenderVerification(server, conn, arena, req);
@@ -735,6 +750,9 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
         if (std.mem.eql(u8, p, "/shared")) {
             return serveAsset(conn, arena, shared_html, "text/html; charset=utf-8");
         }
+        if (std.mem.eql(u8, p, "/combined")) {
+            return serveAsset(conn, arena, combined_html, "text/html; charset=utf-8");
+        }
         if (std.mem.eql(u8, p, "/snapshot")) {
             return serveAsset(conn, arena, snapshot_html, "text/html; charset=utf-8");
         }
@@ -793,24 +811,62 @@ fn uidFromPath(path: []const u8) ?i64 {
 
 /// Resolve the authenticated session for a request, or send 401 and return null.
 fn requireSession(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !?session_mod.Session {
-    const cookie = req.header("Cookie") orelse {
-        try sendError(conn, arena, 401, "unauthorized", "No session");
+    return resolveRequestSession(server, arena, req) catch |err| {
+        switch (err) {
+            error.AccountChanged => try sendError(conn, arena, 409, "account_changed", "The signed-in account changed. Reload this tab before continuing."),
+            error.LinkedAccountUnavailable => try sendError(conn, arena, 403, "linked_account_unavailable", "This linked mailbox is no longer available."),
+            error.Unauthorized => try sendError(conn, arena, 401, "unauthorized", "Invalid or expired session"),
+            else => return err,
+        }
         return null;
     };
-    const token = session_mod.parseSessionCookie(cookie) orelse {
-        try sendError(conn, arena, 401, "unauthorized", "No session cookie");
-        return null;
+}
+
+fn resolveRequestSession(server: *WebmailHttpServer, a: std.mem.Allocator, req: Request) !session_mod.Session {
+    const token = session_mod.parseSessionCookie(req.header("Cookie") orelse "") orelse return error.Unauthorized;
+    var root = server.sessions.validate(token) catch return error.Unauthorized;
+    errdefer root.deinit(server.allocator);
+    const linked = req.queryParam(a, "linked") orelse {
+        if (!try expectedAccountMatches(a, req, root.username)) return error.AccountChanged;
+        return root;
     };
-    var sess = server.sessions.validate(token) catch {
-        try sendError(conn, arena, 401, "unauthorized", "Invalid or expired session");
-        return null;
+    if (!linkedRequestAllowed(req) or !message_refs.valid(linked)) return error.LinkedAccountUnavailable;
+    const source = try account_links.resolve(a, server.db, root.session_id, linked, time_compat.timestamp());
+    var session = server.sessions.validate(source.private_session) catch return error.LinkedAccountUnavailable;
+    errdefer session.deinit(server.allocator);
+    if (!std.mem.eql(u8, session.username, source.account.username)) return error.LinkedAccountUnavailable;
+    if (!try expectedAccountMatches(a, req, session.username)) return error.AccountChanged;
+    session.linked_id = try server.allocator.dupe(u8, linked);
+    root.deinit(server.allocator);
+    return session;
+}
+
+// A linked account permits mail operations. Credential, team, calendar, link,
+// and account-management routes continue to require their own browser login.
+fn linkedRequestAllowed(req: Request) bool {
+    const p = req.path;
+    const get = std.mem.eql(u8, req.method, "GET");
+    if (get) for ([_][]const u8{
+        "/webmail/auth/me",         "/webmail/api/config",   "/webmail/api/folders",
+        "/webmail/api/messages",    "/webmail/api/search",   "/webmail/api/attachment",
+        "/webmail/api/attachments", "/webmail/api/contacts", "/webmail/api/compose-library",
+        "/webmail/api/drafts",      "/webmail/api/outbox",   "/webmail/api/sender-identities",
+    }) |allowed| {
+        if (std.mem.eql(u8, p, allowed)) return true;
     };
-    if (!try expectedAccountMatches(arena, req, sess.username)) {
-        sess.deinit(server.allocator);
-        try sendError(conn, arena, 409, "account_changed", "The signed-in account changed. Reload this tab before continuing.");
-        return null;
+    if (std.mem.eql(u8, req.method, "POST")) for ([_][]const u8{
+        "/webmail/api/compose",                "/webmail/api/drafts", "/webmail/api/uploads", "/webmail/api/bulk",
+        "/webmail/api/external-sender-review",
+    }) |allowed| {
+        if (std.mem.eql(u8, p, allowed)) return true;
+    };
+    if (std.mem.startsWith(u8, p, message_ref_prefix))
+        return message_refs.valid(p[message_ref_prefix.len..]);
+    if (uidFromPath(p) != null) return true;
+    for ([_][]const u8{ "/webmail/api/outbox/", "/webmail/api/undo/", "/webmail/api/uploads/" }) |prefix| {
+        if (std.mem.startsWith(u8, p, prefix)) return store.validId(p[prefix.len..]);
     }
-    return sess;
+    return false;
 }
 
 fn expectedAccountMatches(arena: std.mem.Allocator, req: Request, username: []const u8) !bool {
@@ -819,6 +875,182 @@ fn expectedAccountMatches(arena: std.mem.Allocator, req: Request, username: []co
         if (expected_account) |expected| if (!std.mem.eql(u8, expected, username)) return false;
     }
     return true;
+}
+
+fn combinedError(conn: *webmail_tls.Stream, a: std.mem.Allocator, err: anyerror) !void {
+    return switch (err) {
+        error.LinkedAccountUnavailable => sendError(conn, a, 403, "linked_account_unavailable", "This linked mailbox is no longer available."),
+        error.AccountAlreadyLinked => sendError(conn, a, 409, "account_already_linked", "This mailbox is already in the combined inbox."),
+        error.LinkedAccountLimit => sendError(conn, a, 409, "linked_account_limit", "This browser can link up to four other mailboxes."),
+        else => mapServiceError(conn, a, err),
+    };
+}
+
+fn handleCombinedAccounts(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request, id: ?[]const u8) !void {
+    const get = std.mem.eql(u8, req.method, "GET");
+    if (!get and !isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    var root = (try requireSession(server, conn, a, req)) orelse return;
+    defer root.deinit(server.allocator);
+    if (id) |link| {
+        if (!message_refs.valid(link)) return combinedError(conn, a, error.LinkedAccountUnavailable);
+        account_links.remove(server.db, root.session_id, link) catch |err| return combinedError(conn, a, err);
+    } else if (std.mem.eql(u8, req.method, "POST")) {
+        const Credentials = struct { username: []const u8, password: []const u8 };
+        if (req.body.len > 8192) return combinedError(conn, a, service_mod.ServiceError.InvalidPayload);
+        const credentials = std.json.parseFromSliceLeaky(Credentials, a, req.body, .{}) catch
+            return combinedError(conn, a, service_mod.ServiceError.InvalidPayload);
+        if (credentials.username.len == 0 or credentials.username.len > 320 or credentials.password.len == 0 or credentials.password.len > 1024)
+            return combinedError(conn, a, service_mod.ServiceError.InvalidPayload);
+        const link = try store.newId(a);
+        const ip = if (req.trust_forwarded_headers) req.header("X-Real-IP") orelse conn.peerIp() else conn.peerIp();
+        const attempt = (server.login_limiter.beginAuthAttempt(ip) catch null) orelse
+            return sendError(conn, a, 429, "rate_limited", "Too many sign-in attempts. Try again later.");
+        var source = server.sessions.login(credentials.username, credentials.password, ip, req.header("User-Agent")) catch |err| switch (err) {
+            error.AuthenticationRateLimited => return sendError(conn, a, 429, "rate_limited", "Too many sign-in attempts. Try again later."),
+            session_mod.SessionError.InvalidCredentials => return sendError(conn, a, 403, "invalid_credentials", "The linked mailbox username or password is incorrect."),
+            else => return err,
+        };
+        defer source.deinit(server.allocator);
+        server.login_limiter.finishAuthSuccess(ip, attempt);
+        if (std.mem.eql(u8, root.username, source.username)) {
+            server.sessions.logout(source.session_id);
+            return combinedError(conn, a, error.AccountAlreadyLinked);
+        }
+        account_links.create(server.db, root.session_id, source.session_id, link, time_compat.timestamp()) catch |err| {
+            server.sessions.logout(source.session_id);
+            return combinedError(conn, a, err);
+        };
+    } else if (!get) return sendError(conn, a, 405, "method_not_allowed", "Use GET or POST.");
+    const accounts = try account_links.list(a, server.db, root.session_id, time_compat.timestamp());
+    return sendJson(conn, a, 200, try service_mod.json(a, .{
+        .owner = account_links.Account{ .id = "", .username = root.username, .address = root.email },
+        .accounts = accounts,
+    }), null);
+}
+
+const CombinedRow = struct {
+    source: account_links.Account,
+    message: maildir.MessageSummary,
+
+    fn before(_: void, left: CombinedRow, right: CombinedRow) bool {
+        if (left.message.timestamp == right.message.timestamp) {
+            const order = std.mem.order(u8, left.source.username, right.source.username);
+            if (order != .eq) return order == .lt;
+        }
+        return maildir.messagePosition(left.message).before(maildir.messagePosition(right.message));
+    }
+};
+
+fn handleCombinedMessages(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    var root = (try requireSession(server, conn, a, req)) orelse return;
+    defer root.deinit(server.allocator);
+    const linked = try account_links.list(a, server.db, root.session_id, time_compat.timestamp());
+    const owner: account_links.Account = .{ .id = "", .username = root.username, .address = root.email };
+    const sources = try std.mem.concat(a, account_links.Account, &.{ &.{owner}, linked });
+    const location = req.queryParam(a, "scope") orelse "inbox";
+    const folder = if (std.mem.eql(u8, location, "mail")) "*" else if (std.mem.eql(u8, location, "inbox")) "INBOX" else return sendError(conn, a, 400, "bad_request", "Choose Inbox or All folders.");
+    var options = searchFilters(req, a, folder) catch |err| return searchFilterError(conn, a, err);
+    var rows: std.ArrayList(CombinedRow) = .empty;
+    var progress: search_index.Progress = .{};
+    options.include_versions = true;
+    for (sources) |source| {
+        const workflow = if (attention.isInboxView(folder)) try attention.load(a, server.db, source.username) else null;
+        var current = options;
+        var source_progress: search_index.Progress = .{};
+        current.index_progress = &source_progress;
+        current.attention_snapshot = if (workflow != null and workflow.?.hasHidden()) workflow else null;
+        const messages = try maildir.queryMessages(a, server.db, source.username, current);
+        for (messages) |message| {
+            if (message.flags.deleted or (!maildir.isPersonalFolder(message.folder) and !std.ascii.eqlIgnoreCase(message.folder, "Drafts"))) continue;
+            try rows.append(a, .{ .source = source, .message = message });
+        }
+        progress.indexed += source_progress.indexed;
+        progress.total += source_progress.total;
+    }
+    std.mem.sort(CombinedRow, rows.items, {}, CombinedRow.before);
+    const per_page = std.math.clamp(parseUintParam(req, a, "per_page", server.config.messages_per_page), 1, 100);
+    const page = std.math.clamp(parseUintParam(req, a, "page", 1), 1, @max((rows.items.len + per_page - 1) / per_page, 1));
+    const start = (page - 1) * per_page;
+    const end = @min(start + per_page, rows.items.len);
+    var body: std.ArrayList(u8) = .empty;
+    const w = jw(&body, a);
+    try w.print("{{\"page\":{d},\"total\":{d},\"more\":{},\"index\":", .{ page, rows.items.len, end < rows.items.len });
+    try writeSearchIndex(w, progress);
+    try w.writeAll(",\"items\":[");
+    for (rows.items[start..end], 0..) |row, index| {
+        if (index != 0) try w.writeAll(",");
+        try w.writeAll("{\"source\":");
+        try w.writeAll(try service_mod.json(a, row.source));
+        try w.writeAll(",\"message\":");
+        try writeMessageSummary(w, row.message, try maildir.summaryVersion(a, server.db, row.source.username, row.message));
+        try w.writeAll("}");
+    }
+    try w.writeAll("]}");
+    // A read made while an account was removed cannot publish its old results.
+    for (linked) |source| {
+        _ = account_links.resolve(a, server.db, root.session_id, source.id, time_compat.timestamp()) catch |err|
+            return combinedError(conn, a, err);
+    }
+    return sendJson(conn, a, 200, body.items, null);
+}
+
+fn handleCombinedAction(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    if (!isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    var root = (try requireSession(server, conn, a, req)) orelse return;
+    defer root.deinit(server.allocator);
+    const Selection = struct { account: []const u8, reference: []const u8, revision: []const u8 };
+    const Change = struct { action: enum { read, unread, archive, trash, flag, unflag }, messages: []const Selection };
+    if (req.body.len > 32 * 1024) return combinedError(conn, a, service_mod.ServiceError.InvalidPayload);
+    const change = std.json.parseFromSliceLeaky(Change, a, req.body, .{}) catch
+        return combinedError(conn, a, service_mod.ServiceError.InvalidPayload);
+    if (change.messages.len == 0 or change.messages.len > 100) return combinedError(conn, a, service_mod.ServiceError.InvalidPayload);
+    const Group = struct { username: []const u8, batch: std.ArrayList(service_mod.MessageRef) = .empty };
+    var groups: std.StringArrayHashMapUnmanaged(Group) = .empty;
+    const now = time_compat.timestamp();
+    for (change.messages) |message| {
+        if (!message_refs.valid(message.reference) or message.revision.len != 66)
+            return combinedError(conn, a, service_mod.ServiceError.InvalidPayload);
+        const entry = try groups.getOrPut(a, message.account);
+        if (!entry.found_existing) {
+            const username = if (message.account.len == 0) root.username else blk: {
+                if (!message_refs.valid(message.account)) return combinedError(conn, a, error.LinkedAccountUnavailable);
+                const source = account_links.resolve(a, server.db, root.session_id, message.account, now) catch |err|
+                    return combinedError(conn, a, err);
+                break :blk source.account.username;
+            };
+            entry.value_ptr.* = .{ .username = username };
+        }
+        for (entry.value_ptr.batch.items) |previous| {
+            if (std.mem.eql(u8, previous.reference.?, message.reference)) return combinedError(conn, a, service_mod.ServiceError.InvalidPayload);
+        }
+        try entry.value_ptr.batch.append(a, .{ .uid = 0, .folder = "", .reference = message.reference, .revision = message.revision });
+    }
+    const action: service_mod.BulkAction = switch (change.action) {
+        .read => .read,
+        .unread => .unread,
+        .archive => .move,
+        .trash => .trash,
+        .flag => .flag,
+        .unflag => .unflag,
+    };
+    const Report = struct { account: []const u8, affected: usize, error_code: ?[]const u8 = null };
+    var reports: std.ArrayList(Report) = .empty;
+    for (groups.keys(), groups.values()) |account, group| {
+        if (account.len > 0) {
+            _ = account_links.resolve(a, server.db, root.session_id, account, time_compat.timestamp()) catch {
+                try reports.append(a, .{ .account = account, .affected = 0, .error_code = "linked_account_unavailable" });
+                continue;
+            };
+        }
+        const result = server.service.bulk(a, group.username, .{ .action = action, .messages = group.batch.items }, now) catch |err| {
+            try reports.append(a, .{ .account = account, .affected = 0, .error_code = @errorName(err) });
+            continue;
+        };
+        var affected: usize = 0;
+        for (result.results) |item| affected += @intFromBool(item.ok);
+        try reports.append(a, .{ .account = account, .affected = affected, .error_code = if (result.ok) null else "message_changed" });
+    }
+    return sendJson(conn, a, 200, try service_mod.json(a, .{ .items = reports.items }), null);
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
@@ -1421,9 +1653,10 @@ fn handleCompose(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: s
         return sendError(conn, arena, 400, "invalid_send_schedule", "A scheduled message requires a send ID.");
     server.service.scanInlineAttachments(server.config.scanner, arena, sess.username, parsed.value) catch |err| return mapServiceError(conn, arena, err);
     if (parsed.value.sendId != null) {
-        const row = server.service.queue(arena, sess.username, sess.email, parsed.value, time_compat.timestamp()) catch |err| return mapServiceError(conn, arena, err);
+        const row = server.service.queueFromAccount(arena, sess.username, sess.email, parsed.value, time_compat.timestamp(), sess.linked_id) catch |err| return mapServiceError(conn, arena, err);
         return sendJson(conn, arena, 200, try outboxJson(arena, row), null);
     }
+    if (sess.linked_id != null) return sendError(conn, arena, 400, "linked_send_requires_outbox", "A linked mailbox sends through Outbox.");
     server.service.requireOrdinaryDirectSend(arena, sess.username, parsed.value) catch |err| return mapServiceError(conn, arena, err);
     const delegated_id = parsed.value.delegatedSender() catch |err| return mapServiceError(conn, arena, err);
     const from = server.service.sendAddress(arena, sess.username, sess.email, delegated_id) catch |err| return mapServiceError(conn, arena, err);
@@ -1524,6 +1757,7 @@ fn mapServiceError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: any
         error.ExternalSenderUnavailable => sendError(conn, arena, 403, "external_sender_unavailable", "This external From address is unavailable."),
         error.ExternalReviewRequired => sendError(conn, arena, 409, "external_review_required", "Review the external From address and every recipient before sending."),
         error.ExternalSenderAlreadyVerified => sendError(conn, arena, 409, "external_sender_verified", "This external From address is already verified."),
+        error.LinkedAccountUnavailable => sendError(conn, arena, 403, "linked_account_unavailable", "This linked mailbox is no longer available."),
         error.ExternalSenderRateLimited => sendError(conn, arena, 429, "rate_limited", "Wait one minute before requesting another code."),
         error.InvalidExternalSenderCode => sendError(conn, arena, 400, "invalid_external_sender_code", "This code is incorrect, expired, or already used."),
         error.SharedReplyUnavailable => sendError(conn, arena, 409, "shared_reply_unavailable", "This shared reply is unavailable. Check the original message, assignment, and send access."),

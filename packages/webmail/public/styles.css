@@ -212,6 +212,40 @@ input[type=checkbox] { accent-color: var(--accent); }
 .wm-bulk-toolbar { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 12px; background: var(--accent-soft); border-bottom: 1px solid var(--border); }
 .wm-bulk-move { display: flex; align-items: center; gap: 6px; max-inline-size: 100%; min-inline-size: 0; }
 .wm-bulk-move select { max-inline-size: min(11rem, 50vw); }
+.wm-linked-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 8px; margin: 0; padding: 8px 14px; border-bottom: 1px solid var(--border); background: var(--accent-soft); color: var(--text); font-size: 13px; overflow-wrap: anywhere; }
+.wm-linked-banner > strong { min-width: 0; }
+.wm-combined { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; width: min(100%, 66rem); margin: auto; padding: clamp(12px, 3vw, 28px); }
+.wm-combined .wm-combined-header { position: static; border: 1px solid var(--border); border-radius: 12px; }
+.wm-combined-header h1 { flex: 1 1 auto; min-width: 0; }
+.wm-combined-accounts, .wm-combined-messages { min-width: 0; border: 1px solid var(--border); border-radius: 12px; background: var(--panel); }
+.wm-combined-accounts { padding: 14px; }
+.wm-combined-accounts h2 { margin: 0; font-size: 17px; }
+.wm-combined-accounts p { margin: 6px 0 12px; color: var(--muted); font-size: 13px; }
+.wm-combined-accounts ul, .wm-combined-rows { margin: 0; padding: 0; list-style: none; }
+.wm-combined-accounts li { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 0; overflow-wrap: anywhere; }
+.wm-combined-accounts li:last-child { margin-bottom: 8px; }
+.wm-combined-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 8px; }
+.wm-combined-form label { display: grid; flex: 1 1 12rem; gap: 5px; min-width: 0; font-size: 13px; }
+.wm-combined-form input, .wm-combined-form select { width: 100%; min-height: var(--control-height); }
+.wm-combined-form input { min-width: 0; padding: 6px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); }
+.wm-combined-search { padding: 12px; border-bottom: 1px solid var(--border); }
+.wm-combined-search label:first-child { flex-grow: 3; }
+.wm-combined-row { display: grid; grid-template-columns: 44px minmax(0, 1fr); align-items: center; border-bottom: 1px solid var(--border); }
+.wm-combined-row:last-child { border-bottom: 0; }
+.wm-combined-row input { width: 18px; height: 18px; margin: auto; }
+.wm-combined-row a { grid-template-columns: minmax(0, 1fr); min-width: 0; color: var(--text); text-decoration: none; }
+.wm-combined-row a:focus-visible { outline-offset: -2px; }
+.wm-combined-source { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; margin-top: 5px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.wm-combined-source .mail-icon { color: var(--accent); }
+.wm-combined-selected { align-self: center; color: var(--muted); font-size: 13px; }
+.wm-combined .wm-pagination { padding: 9px 12px; }
+@media (max-width: 480px) {
+  .wm-combined .wm-combined-header { display: grid; grid-template-columns: auto auto minmax(0, 1fr); }
+  .wm-combined .wm-combined-header > button { grid-area: auto / 1 / auto / -1; justify-content: center; }
+  .wm-combined-search { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+  .wm-combined-search label:first-child { grid-column: 1 / -1; }
+  .wm-combined-form label { flex-basis: min(100%, 12rem); }
+}
 .wm-list-body { flex: 1; min-height: 0; overflow-y: auto; }
 .wm-index-status { display: grid; gap: 6px; padding: 10px 14px; background: var(--surface); color: var(--muted); font-size: 12px; }
 .wm-index-status progress { width: 100%; height: 6px; border: 0; border-radius: 4px; appearance: none; background: var(--border); }

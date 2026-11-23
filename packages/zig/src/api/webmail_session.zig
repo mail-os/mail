@@ -40,12 +40,14 @@ pub const Session = struct {
     username: []const u8,
     email: []const u8,
     csrf_secret: []const u8,
+    linked_id: ?[]const u8 = null,
 
     pub fn deinit(self: *Session, allocator: std.mem.Allocator) void {
         allocator.free(self.session_id);
         allocator.free(self.username);
         allocator.free(self.email);
         allocator.free(self.csrf_secret);
+        if (self.linked_id) |id| allocator.free(id);
     }
 };
 

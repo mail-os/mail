@@ -1,6 +1,6 @@
 import type { PrivateCollection, AttachmentPage, IndexProgress, LibraryAttachment, AttentionStatus, AttentionView, BulkAction, BulkResult, CategoryRule, ComposePayload, Contact, Conversation, DraftAck, DraftDocument, Folder, MailLimits, MailNotificationScope, MessageDetail, MessagePage, MessageRef, MessageSummary, OutboxCounts, OutboxItem, OutboxPage, OutboxSummary, OutboxView, SenderIdentity, SharedReplyContext, User } from './mail-types'
 import { batch, derived, effect, state } from '@stacksjs/stx'
-import { createMailApi, MailApiError } from './mail-api'
+import { createMailApi, MailApiError, scopedMailPath } from './mail-api'
 import { mailEventLink, takeMailEventLink } from './mail-event-link'
 import type { InvitationCalendarTarget, InvitationResponse, InvitationRsvp } from './mail-invitations'
 import type { Calendar } from './calendar-types'
@@ -59,6 +59,10 @@ export interface WebmailPorts {
 }
 
 export function useWebmail(ports: WebmailPorts) {
+  const linkedAccount = globalThis.location?.href ? new URL(globalThis.location.href).searchParams.get('linked') : null
+  const linkedView = linkedAccount != null
+  const linkedChannel = linkedView && typeof BroadcastChannel !== 'undefined' ? new BroadcastChannel('mail-combined-accounts') : null
+  let lastLinkCheck = 0
   const user = state<User | null>(null)
   const folders = state<Folder[]>([])
   const folder = state('INBOX')
@@ -270,13 +274,16 @@ export function useWebmail(ports: WebmailPorts) {
   function onAuthError(cause: MailApiError): void {
     if (destroyed) return
     authExpired.set(true)
-    if (cause.code === 'account_changed') {
+    if (cause.code === 'account_changed' || (linkedView && (cause.code === 'linked_account_unavailable' || cause.status === 401))) {
       clearAccountState()
-      ports.navigate('/login', { reload: true })
+      ports.navigate(linkedView ? '/combined?notice=removed' : '/login', { reload: true })
     }
     else if (!user()) ports.navigate('/login', { reload: true })
   }
-  const api = createMailApi(() => user()?.username, onAuthError, () => !destroyed)
+  const api = createMailApi(() => user()?.username, onAuthError, () => !destroyed, linkedAccount)
+  if (linkedChannel) linkedChannel.onmessage = (event) => {
+    if (event.data === linkedAccount) void api('/webmail/auth/me').catch(() => {})
+  }
   const snapshots = useMessageSnapshots(api)
   const fileSharing = useFileLinks(api, () => limits().maxFileLinkBytes ?? 0)
   const replyBatch = useReplyBatch(api, sendDelay)
@@ -328,7 +335,7 @@ export function useWebmail(ports: WebmailPorts) {
   }
 
   const collectionView = derived(() => privateMail.privateCollections().find(item => item.id === collectionId()) || null)
-  const canOpenPrivate = derived(() => Boolean(selected()?.reference && selected()?.folder !== 'Drafts' && !senderReview.senderReviewOpen()))
+  const canOpenPrivate = derived(() => !linkedView && Boolean(selected()?.reference && selected()?.folder !== 'Drafts' && !senderReview.senderReviewOpen()))
 
   const recipientEditor = useRecipientEditor(value => api<Contact[]>(`/webmail/api/contacts?q=${encodeURIComponent(value)}`))
   const recoverySettings = useRecoverySettings(api, () => user()?.username || '')
@@ -336,8 +343,8 @@ export function useWebmail(ports: WebmailPorts) {
   const externalSenderSettings = useExternalSenders(api, () => { void loadSenderIdentities() })
   const vacationSettings = useVacationSettings(api)
   const attachmentEditor = useAttachments(() => user()?.username, limits, cause => {
-    if (cause instanceof MailApiError && (cause.status === 401 || cause.code === 'account_changed')) onAuthError(cause)
-  }, id => api(`/webmail/api/uploads/${id}`, { method: 'DELETE' }))
+    if (cause instanceof MailApiError && (cause.status === 401 || ['account_changed', 'linked_account_unavailable'].includes(cause.code))) onAuthError(cause)
+  }, id => api(`/webmail/api/uploads/${id}`, { method: 'DELETE' }), linkedAccount)
   const hasComposition = derived(() => Boolean(subject() || (body() && body() !== automaticSignature()) || draftHtml() || attachmentEditor.attachments().length || recipientEditor.toRecipients().length || recipientEditor.ccRecipients().length || recipientEditor.bccRecipients().length || recipientEditor.toInput() || recipientEditor.ccInput() || recipientEditor.bccInput()))
   function selectedSchedule(): number | null {
     if (!scheduleOpen()) return null
@@ -372,7 +379,7 @@ export function useWebmail(ports: WebmailPorts) {
   function isJunkFolder(name: string): boolean { return name === 'Junk' || name === limits().junkFolder }
   const canShareSnapshot = derived(() => {
     const item = selected()
-    return !!item?.reference && !['Drafts', 'Trash', 'Screening', 'Declined'].includes(item.folder)
+    return !linkedView && !!item?.reference && !['Drafts', 'Trash', 'Screening', 'Declined'].includes(item.folder)
       && !isJunkFolder(item.folder) && !item.flags.deleted && !item.flags.draft && !senderReview.senderReviewOpen()
   })
   function shareMessageSnapshot() {
@@ -559,7 +566,7 @@ export function useWebmail(ports: WebmailPorts) {
       params.set('uid', String(message?.uid))
       params.set('folder', message?.folder || folder())
     }
-    return `/webmail/api/attachment?${params}`
+    return scopedMailPath(`/webmail/api/attachment?${params}`, linkedAccount)
   }
   function cancelBatch(): void {
     ++triageRequest
@@ -680,8 +687,8 @@ export function useWebmail(ports: WebmailPorts) {
     await Promise.all([
       reviewOpen ? senderReview.loadSenderReview() : loadMessages(quiet),
       loadFolders().catch(cause => error.set(errorMessage(cause))),
-      reviewOpen ? Promise.resolve() : senderReview.refreshSenderReviewStatus().catch(() => {}),
-      refreshAttention().catch(() => {}),
+      reviewOpen || linkedView ? Promise.resolve() : senderReview.refreshSenderReviewStatus().catch(() => {}),
+      linkedView ? Promise.resolve() : refreshAttention().catch(() => {}),
     ])
   }
   async function refreshAttention(): Promise<void> {
@@ -1854,13 +1861,29 @@ export function useWebmail(ports: WebmailPorts) {
       const result = await api<{ user: User }>('/webmail/auth/me')
       user.set(result.user)
       const config = await api<MailLimits>('/webmail/api/config')
-      limits.set(config); sendDelay.set(config.undoSendSeconds)
+      limits.set(linkedView ? { ...config, maxFileLinkBytes: 0, calendarAvailable: false, sharedInboxesAvailable: false } : config)
+      sendDelay.set(config.undoSendSeconds)
       void writing.loadWritingLibrary()
       void loadSenderIdentities()
       await Promise.all([refresh(), refreshOutbox()])
-      void notifications.loadNotificationSettings().catch(() => {})
-      void privateMail.loadPrivateCollections()
-      await openSharedReplyDraft()
+      if (!linkedView) {
+        void notifications.loadNotificationSettings().catch(() => {})
+        void privateMail.loadPrivateCollections()
+        await openSharedReplyDraft()
+      }
+      if (globalThis.location?.href) {
+        const page = new URL(globalThis.location.href)
+        const reference = page.searchParams.get('message')
+        if (reference && /^[a-f0-9]{32}$/i.test(reference)) {
+          if (page.searchParams.get('account') !== result.user.username) throw new Error('Open this message from the mailbox that owns it.')
+          const opened = await openMessage({ uid: 0, folder: '', reference }, false)
+          const message = selected()
+          if (opened === 'opened' && message?.folder && message.folder !== folder()) {
+            folder.set(message.folder)
+            void refresh(true)
+          }
+        }
+      }
       const source = takeMailEventLink('/')
       if (source) {
         if (source.account !== result.user.username) throw new Error('Sign in to the mailbox that owns the source email.')
@@ -1883,6 +1906,10 @@ export function useWebmail(ports: WebmailPorts) {
     now.set(Date.now() / 1000 + clockOffset)
     if (undoAction() && undoRemaining() <= 0) undoAction.set(null)
     if (!user() || authExpired()) return
+    if (linkedView && Date.now() - lastLinkCheck > 10000) {
+      lastLinkCheck = Date.now()
+      void api('/webmail/auth/me').catch(() => {})
+    }
     void pollInvitationReplies()
     const pending = (item: OutboxSummary | null) => item?.state === 'sending' || (item?.state === 'pending' && item.dueAt <= now() + 2)
     const pollDelay = outbox().some(pending) || pending(pendingSend()) ? 1000 : outboxView() ? 10000 : 30000
@@ -1894,6 +1921,7 @@ export function useWebmail(ports: WebmailPorts) {
   function preventUnload(event: BeforeUnloadEvent): void { if (hasUnsavedChanges()) { event.preventDefault(); event.returnValue = '' } }
   function destroy(): void {
     destroyed = true
+    linkedChannel?.close()
     ++listRequest
     ++messageRequest
     recipientEditor.destroy()
@@ -1907,7 +1935,7 @@ export function useWebmail(ports: WebmailPorts) {
     replyBatch.closeReplyBatch()
     selectionEffect()
   }
-  return { user, folders, folder, messages, threads, expandedThreads, selected, loading, refreshing, listError, readerError, readerTarget, reading, readingLoading, mutating, error, notice, query, activeQuery, appliedSearchAll, filterLocation, filterSender, filterRecipient, filterFilename, libraryView, libraryFiles, indexProgress, filterAfter, filterBefore, filterStatus, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, formattedReader, remoteImagesAllowed, checked, checkedKeys, selectedCount, isJunkFolder, readerJunkAction, selectionJunkAction, allChecked, someChecked, undoAction, undoRemaining, readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts, pendingSend, sendRemaining, outbox, outboxCount, outboxCounts, outboxSection, outboxViews, outboxEmpty, outboxPageNumber, outboxNext, outboxLoading, outboxError, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, sharedReply, senderId, senderIdentities, missingSender, senderStatus, chooseSender, externalSender, externalSendReview, cancelExternalReview, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...senderReview, ...notifications, ...privateMail, ...contactBook, showContacts, composeSavedCard, collectionView, collectionId, canOpenPrivate,
+  return { linkedView, user, folders, folder, messages, threads, expandedThreads, selected, loading, refreshing, listError, readerError, readerTarget, reading, readingLoading, mutating, error, notice, query, activeQuery, appliedSearchAll, filterLocation, filterSender, filterRecipient, filterFilename, libraryView, libraryFiles, indexProgress, filterAfter, filterBefore, filterStatus, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, formattedReader, remoteImagesAllowed, checked, checkedKeys, selectedCount, isJunkFolder, readerJunkAction, selectionJunkAction, allChecked, someChecked, undoAction, undoRemaining, readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts, pendingSend, sendRemaining, outbox, outboxCount, outboxCounts, outboxSection, outboxViews, outboxEmpty, outboxPageNumber, outboxNext, outboxLoading, outboxError, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, sharedReply, senderId, senderIdentities, missingSender, senderStatus, chooseSender, externalSender, externalSendReview, cancelExternalReview, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...senderReview, ...notifications, ...privateMail, ...contactBook, showContacts, composeSavedCard, collectionView, collectionId, canOpenPrivate,
     createEventLink, canRespondToInvitation, respondToInvitation, rsvpBusy, rsvpError,
     ...snapshots, canShareSnapshot, shareMessageSnapshot, shareSelectedSnapshot,
     ...fileSharing, messageFileLinks, insertFileLink,

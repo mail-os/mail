@@ -118,6 +118,7 @@ const RawSubmission = struct {
 pub const DispatchOptions = struct {
     sender: ?[]const u8 = null,
     delegated_sender_id: ?i64 = null,
+    linked_account: ?[]const u8 = null,
     shared_reply: ?shared_inbox.ReplyDelivery = null,
     calendar_reply: ?@import("../api/webmail_calendar_invite.zig").Revision = null,
     sent: ?SentCopy = null,
@@ -136,7 +137,7 @@ pub const DispatchResult = struct {
     notice: ?[]const u8 = null,
 };
 
-pub fn dispatchExternal(a: std.mem.Allocator, cfg: Delivery, provider: smtp_provider.Config, from: []const u8, recipients: []const []const u8, raw: []const u8, sender: []const u8, id: []const u8, identity: database.Database.ExternalSenderAdmission) !DispatchResult {
+pub fn dispatchExternal(a: std.mem.Allocator, cfg: Delivery, provider: smtp_provider.Config, from: []const u8, recipients: []const []const u8, raw: []const u8, sender: []const u8, id: []const u8, identity: database.Database.ExternalSenderAdmission, linked_account: ?[]const u8) !DispatchResult {
     const db = cfg.db orelse return error.DatabaseUnavailable;
     if (!isSafeAddress(from) or recipients.len == 0) return error.InvalidAddress;
     const targets = try a.alloc(database.Database.DeliveryTarget, recipients.len);
@@ -155,6 +156,7 @@ pub fn dispatchExternal(a: std.mem.Allocator, cfg: Delivery, provider: smtp_prov
         .targets = targets,
         .sender = sender,
         .external_sender = identity,
+        .linked_account = linked_account,
         .charge_recipients = recipients.len,
     });
     var notice: ?[]const u8 = null;
@@ -306,6 +308,7 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
         .targets = plan.targets.items,
         .sender = options.sender,
         .delegated_sender_id = options.delegated_sender_id,
+        .linked_account = options.linked_account,
         .shared_reply = options.shared_reply,
         .calendar_reply = options.calendar_reply,
         .charge_recipients = recipients.len,

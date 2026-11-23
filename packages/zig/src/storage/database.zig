@@ -910,6 +910,7 @@ pub const Database = struct {
             \\CREATE INDEX IF NOT EXISTS idx_webmail_sessions_sid ON webmail_sessions(session_id);
             \\CREATE INDEX IF NOT EXISTS idx_webmail_sessions_expires ON webmail_sessions(expires_at);
         );
+        try self.exec(@import("webmail_account_links.zig").schema);
         try self.initAuditTable();
         try self.exec(team_store.schema);
         try self.exec(shared_inbox.schema);
@@ -1570,6 +1571,7 @@ pub const Database = struct {
         sender: ?[]const u8 = null,
         delegated_sender_id: ?i64 = null,
         external_sender: ?ExternalSenderAdmission = null,
+        linked_account: ?[]const u8 = null,
         shared_reply: ?shared_inbox.ReplyDelivery = null,
         calendar_reply: ?calendar_invite.Revision = null,
         charge_recipients: usize = 0,
@@ -1584,6 +1586,8 @@ pub const Database = struct {
         defer self.mutex.unlock();
         try self.execLocked("BEGIN IMMEDIATE");
         errdefer self.execLocked("ROLLBACK") catch {};
+        if (envelope.linked_account) |id|
+            try @import("webmail_account_links.zig").requireSource(.{ .db = self }, id, envelope.sender orelse return error.LinkedAccountUnavailable, envelope.accepted_at);
         // Serialize revocation and delivery admission, before debiting the
         // actor or creating any visible recipient copies.
         if (envelope.delegated_sender_id) |identity| {

@@ -3,7 +3,7 @@ import { derived, state } from '@stacksjs/stx'
 import { uploadAttachment } from './mail-api'
 import { readableBytes } from './mail-utils'
 
-export function useAttachments(account: () => string | undefined, limits: () => MailLimits, onError: (cause: unknown) => void, removeUpload: (id: string) => Promise<unknown>) {
+export function useAttachments(account: () => string | undefined, limits: () => MailLimits, onError: (cause: unknown) => void, removeUpload: (id: string) => Promise<unknown>, linked?: string | null) {
   const attachments = state<ComposeAttachment[]>([])
   const dragging = state(false)
   const attachmentBytes = derived(() => attachments().reduce((sum, item) => sum + item.size, 0))
@@ -35,7 +35,7 @@ export function useAttachments(account: () => string | undefined, limits: () => 
         update(key, { size: file.size, status: 'uploading' })
       }
       if (!file) return
-      const result = await uploadAttachment(file, username, value => { if (version === generation) update(key, { progress: value }) }, controller.signal, key)
+      const result = await uploadAttachment(file, username, value => { if (version === generation) update(key, { progress: value }) }, controller.signal, key, linked)
       if (version !== generation || !attachments().some(item => item.key === key)) { void removeUpload(result.uploadId).catch(() => {}); return }
       update(key, { ...result, status: 'ready', progress: 100 })
       files.delete(key)

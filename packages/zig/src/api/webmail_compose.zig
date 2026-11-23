@@ -84,6 +84,7 @@ pub const SendConfig = struct {
     /// Canonical mailbox key of the sender (used for the Sent folder path).
     sender_user: []const u8,
     delegated_sender_id: ?i64 = null,
+    linked_account: ?[]const u8 = null,
     external_provider: ?struct {
         config: @import("../delivery/smtp_provider.zig").Config,
         identity: database.Database.ExternalSenderAdmission,
@@ -429,11 +430,12 @@ pub fn sendWithJournal(allocator: std.mem.Allocator, msg: Message, cfg: SendConf
     defer allocator.free(recipients);
     const delivery = cfg.delivery();
     const result = if (cfg.external_provider) |provider|
-        try submission.dispatchExternal(allocator, delivery, provider.config, msg.from, recipients, raw, cfg.sender_user, (dispatch orelse return error.ExternalReviewRequired).delivery_id, provider.identity)
+        try submission.dispatchExternal(allocator, delivery, provider.config, msg.from, recipients, raw, cfg.sender_user, (dispatch orelse return error.ExternalReviewRequired).delivery_id, provider.identity, cfg.linked_account)
     else
         try submission.dispatch(allocator, delivery, msg.from, recipients, raw, .{
             .sender = cfg.sender_user,
             .delegated_sender_id = cfg.delegated_sender_id,
+            .linked_account = cfg.linked_account,
             .shared_reply = cfg.shared_reply,
             .calendar_reply = cfg.calendar_reply,
             .interactive_id = if (dispatch) |send_record| send_record.delivery_id else null,

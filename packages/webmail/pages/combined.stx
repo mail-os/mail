@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Combined inbox · Mail</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<script client>
+import { cancelMailReads, restoreMailReads } from '../functions/mail-api'
+import { combinedMessageKey, combinedMessagePath, useCombinedInbox } from '../functions/use-combined-inbox'
+import { folderName, senderAddress, shortDate } from '../functions/mail-utils'
+const {
+  user, accounts, linking, manageOpen, username, password, query, searchScope, listing, loading, busy, error, notice, selection, selectedRows,
+  mount, destroy, refresh, runSearch, turnPage, toggleRow, changeAccounts, applyAction,
+} = useCombinedInbox(() => navigate('/login', { reload: true }))
+onMount(mount)
+onUnmounted(destroy)
+useInterval(() => { if (!loading()) void refresh() }, 15000, { whileVisible: true })
+useInterval(() => { if (listing()?.index.pending && !loading()) void refresh() }, 1000, { whileVisible: true })
+useEventListener('focus', refresh)
+useEventListener('online', refresh)
+useEventListener('pagehide', cancelMailReads)
+useEventListener('pageshow', restoreMailReads)
+</script>
+<main class="wm-combined">
+  <header class="wm-shared-header wm-combined-header">
+    <a class="wm-action wm-shared-back" href="/"><span class="mail-icon" data-icon="back" aria-hidden="true"></span>Mail</a>
+    <span class="mail-app-mark" aria-hidden="true"><span class="mail-icon" data-icon="layers"></span></span>
+    <h1>Combined inbox</h1>
+    <button :if="user" type="button" class="wm-action" @click="manageOpen.set(!manageOpen())" :aria-expanded="manageOpen" aria-controls="combined-accounts"><span class="mail-icon" data-icon="people" aria-hidden="true"></span>Linked accounts</button>
+  </header>
+  <p :if="error" class="wm-inline-error" role="alert" :text="error"></p>
+  <p :if="notice" class="wm-notice" role="status" :text="notice"></p>
+  <section :if="manageOpen" id="combined-accounts" class="wm-combined-accounts" aria-labelledby="combinedAccountsTitle">
+    <h2 id="combinedAccountsTitle">Linked accounts</h2>
+    <p>Links belong to this browser session. You can remove them at any time.</p>
+    <ul :if="accounts.length">
+      <li :for="account in accounts" :key="account.id">
+        <span :text="account.address"></span>
+        <button type="button" class="wm-action" @click="changeAccounts(account.id)" :disabled="busy" :aria-label="'Remove ' + account.address">Remove</button>
+      </li>
+    </ul>
+    <button :if="!linking && accounts.length < 4" type="button" class="wm-action wm-action--accent" @click="linking.set(true)">Link a mailbox</button>
+    <form :if="linking && accounts.length < 4" class="wm-combined-form" @submit.prevent="changeAccounts()">
+      <label>Mailbox username<input type="text" x-model.trim="username" autocomplete="off" maxlength="320" required :disabled="busy"></label>
+      <label>Mailbox password<input type="password" x-model="password" autocomplete="off" maxlength="1024" required :disabled="busy"></label>
+      <button class="wm-action wm-action--accent" type="submit" :disabled="busy">Verify and link</button>
+    </form>
+  </section>
+  <section :if="user" class="wm-combined-messages" aria-label="Combined messages" :aria-busy="loading">
+    <form class="wm-combined-form wm-combined-search" role="search" @submit.prevent="runSearch()">
+      <label>Search mail<input type="search" maxlength="256" x-model="query" placeholder="Search linked mailboxes"></label>
+      <label>Search in<select x-model="searchScope"><option value="inbox">Inboxes</option><option value="mail">All folders</option></select></label>
+      <button type="submit" class="wm-action" :disabled="busy"><span class="mail-icon" data-icon="search" aria-hidden="true"></span>Search</button>
+    </form>
+    <div :if="selectedRows.length" class="wm-bulk-toolbar" role="group" aria-label="Selected messages">
+      <span class="wm-combined-selected" :text="selectedRows.length + ' selected'"></span>
+      <button type="button" class="wm-action" @click="applyAction('read')" :disabled="busy">Mark read</button>
+      <button type="button" class="wm-action" @click="applyAction('unread')" :disabled="busy">Mark unread</button>
+      <button type="button" class="wm-action" @click="applyAction('archive')" :disabled="busy"><span class="mail-icon" data-icon="archive" aria-hidden="true"></span>Archive</button>
+      <button type="button" class="wm-action wm-action--danger" @click="applyAction('trash')" :disabled="busy">Trash</button>
+    </div>
+    <p :if="listing?.index.pending" class="wm-shared-empty" role="status" :text="'Indexing mail for search · ' + listing.index.indexed + ' of ' + listing.index.total"></p>
+    <p :if="loading && !listing" class="wm-shared-empty" role="status">Loading messages…</p>
+    <p :if="listing && !listing.items.length && !listing.index.pending" class="wm-shared-empty">No messages match.</p>
+    <ul :if="listing?.items.length" class="wm-combined-rows">
+      <li :for="row in listing?.items || []" :key="combinedMessageKey(row)" class="wm-combined-row">
+        <input type="checkbox" :checked="selection.includes(combinedMessageKey(row))" @change="toggleRow(row)" :disabled="busy || !row.message.reference || !row.message.revision" :aria-label="'Select ' + (row.message.subject || '(No subject)') + ' in ' + row.source.address">
+        <a class="wm-msg wm-shared-row" :href="combinedMessagePath(row)" :aria-label="'Open ' + (row.message.subject || '(No subject)') + ' in ' + row.source.address">
+          <span class="wm-msg-row"><span class="wm-msg-from" :text="senderAddress(row.message.from) || row.message.from"></span><time class="wm-msg-date" :text="shortDate(row.message.date)"></time></span>
+          <span class="wm-msg-subject" :text="row.message.subject || '(No subject)'"></span>
+          <span :if="row.message.snippet" class="wm-msg-snippet" :text="row.message.snippet"></span>
+          <span class="wm-combined-source"><span class="mail-icon" data-icon="inbox" aria-hidden="true"></span><span :text="row.source.address"></span><span :text="folderName(row.message.folder)"></span></span>
+        </a>
+      </li>
+    </ul>
+    <footer :if="listing && (listing.more || listing.page > 1)" class="wm-pagination">
+      <button type="button" @click="turnPage(-1)" :disabled="loading || busy || listing.page === 1">Previous</button>
+      <span :text="'Page ' + listing.page"></span>
+      <button type="button" @click="turnPage(1)" :disabled="loading || busy || !listing.more">Next</button>
+    </footer>
+  </section>
+</main>
+</body>
+</html>

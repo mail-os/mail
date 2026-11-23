@@ -1046,6 +1046,102 @@ async function replyBatchJourney(desktop, phone) {
   }
 }
 
+async function combinedInboxJourney(page) {
+  await page.goto(url + '/')
+  await page.getByRole('link', { name: 'Combined inbox', exact: true }).click()
+  await heading(page, 'Combined inbox').waitFor()
+  await button(page, 'Linked accounts').click()
+  const settings = page.getByRole('region', { name: 'Linked accounts' })
+  await button(settings, 'Link a mailbox').click()
+  await settings.getByLabel('Mailbox username').fill(sender)
+  await settings.getByLabel('Mailbox password').fill(password)
+  await verifyControlRow(settings.locator('form'), 'input, button', 36)
+  await button(settings, 'Verify and link').click()
+  await button(settings, 'Remove ' + sender).waitFor()
+  await screenshot(page, 'desktop-combined-linked-accounts')
+  await button(page, 'Linked accounts').click()
+  const source = page.getByRole('link', { name: 'Open Combined source briefing in ' + sender, exact: true })
+  await source.waitFor()
+  await page.getByRole('checkbox', { name: 'Select Tuesday design handoff in ' + owner, exact: true }).check()
+  await page.getByRole('checkbox', { name: 'Select Combined source briefing in ' + sender, exact: true }).check()
+  await button(page.getByRole('group', { name: 'Selected messages' }), 'Mark read').click()
+  await page.getByText('2 messages updated.', { exact: true }).waitFor()
+  await page.getByRole('searchbox', { name: 'Search mail' }).fill('Combined source briefing')
+  await button(page.getByRole('search'), 'Search').click()
+  await source.waitFor()
+  await page.getByRole('link', { name: 'Open Tuesday design handoff in ' + owner, exact: true }).waitFor({ state: 'hidden' })
+  await verifyControlRow(page.getByRole('search'), 'input, select, button', 36)
+  await screenshot(page, 'desktop-combined-inbox')
+
+  await page.setViewportSize({ width: 320, height: 844 })
+  await page.emulateMedia({ colorScheme: 'dark' })
+  const searchControls = await verifyControlRow(page.getByRole('search'), 'input, select, button', 44, false)
+  assert(Math.abs(searchControls[1].top - searchControls[2].top) < 0.5, 'Search in and Search align on narrow phones')
+  await fitsViewport(page)
+  await screenshot(page, 'phone-combined-inbox')
+  await page.setViewportSize({ width: 1440, height: 940 })
+  await page.emulateMedia({ colorScheme: 'light' })
+
+  const reader = await page.context().newPage()
+  reader.setDefaultTimeout(12_000)
+  observePage(reader)
+  try {
+    const href = await source.getAttribute('href')
+    const scoped = new URL(href, url)
+    assert.equal(scoped.searchParams.get('account'), sender)
+    assert.match(scoped.searchParams.get('linked'), /^[a-f0-9]{32}$/)
+    await reader.goto(scoped.href)
+    await heading(reader, 'Combined source briefing').waitFor()
+    await reader.locator('.wm-linked-banner').getByText(sender, { exact: true }).waitFor()
+    await button(reader, 'Reply').click()
+    const composer = reader.getByRole('dialog', { name: 'Compose message' })
+    assert.equal(await composer.getByLabel('From', { exact: true }).locator('option:checked').innerText(), sender)
+    await composer.locator('.wm-recipient-chip').getByRole('button', { name: 'Remove recipient ' + owner, exact: true }).waitFor()
+    await composer.getByLabel('Message body').fill('Here are the notes from the linked mailbox.')
+    await screenshot(reader, 'desktop-combined-source-reply')
+    await composer.getByLabel('Undo Send delay', { exact: true }).selectOption('0')
+    const acknowledgement = reader.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname === '/webmail/api/compose')
+    await button(composer, 'Send').click()
+    const queued = await acknowledgement
+    assert(queued.ok())
+    assert.equal(new URL(queued.url()).searchParams.get('linked'), scoped.searchParams.get('linked'))
+    assert.deepEqual((await queued.json()).message.to, [owner])
+    await composer.waitFor({ state: 'hidden' })
+
+    await button(page, 'Linked accounts').click()
+    const captured = Promise.withResolvers()
+    const release = Promise.withResolvers()
+    await page.route(/\/webmail\/api\/combined\/messages\?/, async (route) => {
+      const response = await route.fetch()
+      captured.resolve(await response.json())
+      await release.promise
+      await route.fulfill({ response }).catch(() => {})
+    }, { times: 1 })
+    try {
+      await button(page.getByRole('search'), 'Search').click()
+      const stale = await captured.promise
+      assert(stale.items.some(row => row.source.username === sender), 'The pre-revocation search contains linked results')
+      await button(settings, 'Remove ' + sender).click()
+      await page.getByText('Mailbox removed from this browser.', { exact: true }).waitFor()
+      release.resolve()
+      await source.waitFor({ state: 'hidden' })
+      await reader.getByText('The linked mailbox is no longer available.', { exact: true }).waitFor()
+      await heading(reader, 'Combined source briefing').waitFor({ state: 'hidden' })
+    }
+    finally { release.resolve() }
+
+    const combinedList = /\/webmail\/api\/combined\/messages\?/
+    await page.route(combinedList, route => route.fulfill({
+      status: 403, json: { error: 'linked_account_unavailable', message: 'The linked mailbox changed.' },
+    }), { times: 1 })
+    const fresh = page.waitForResponse(response => combinedList.test(response.url()) && response.ok())
+    await button(page.getByRole('search'), 'Search').click()
+    await fresh
+    assert.equal(new URL(page.url()).pathname, '/combined', 'A revoked source does not end the signed-in account session')
+  }
+  finally { await reader.close() }
+}
+
 async function freeTimeJourney(page, phone = false) {
   await page.goto(`${url}/calendar?day=${day}`)
   await button(page, 'Find free time').click()
@@ -1654,6 +1750,7 @@ try {
   await snapshotSharingJourney(desktop, phone)
   await fileLinkJourney(desktop, phone)
   await replyBatchJourney(desktop, phone)
+  await combinedInboxJourney(desktop)
   await navigationRequestsJourney(desktop)
   assert.deepEqual(errors, [], 'Browser pages raised uncaught errors')
   process.stdout.write(`${engine} passed the desktop and phone webmail journeys.\n`)

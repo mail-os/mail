@@ -122,6 +122,7 @@ pub const Outbox = struct {
     request_hash: ?[]const u8 = null,
     expected_from: ?[]const u8 = null,
     external_binding: ?[]const u8 = null,
+    linked_account: ?[]const u8 = null,
     reply_cutoff_ms: i64 = 0,
     dispatch: ?compose.OutboxDispatch = null,
     calendarReply: ?struct {
@@ -528,6 +529,10 @@ pub const Service = struct {
     }
 
     pub fn queue(self: *Service, a: std.mem.Allocator, user: []const u8, email: []const u8, payload: Payload, now: i64) !store.Record {
+        return self.queueFromAccount(a, user, email, payload, now, null);
+    }
+
+    pub fn queueFromAccount(self: *Service, a: std.mem.Allocator, user: []const u8, email: []const u8, payload: Payload, now: i64, linked_account: ?[]const u8) !store.Record {
         self.mutations.lock();
         defer self.mutations.unlock();
         const id = payload.sendId orelse return ServiceError.InvalidPayload;
@@ -553,7 +558,7 @@ pub const Service = struct {
             break :blk now + delay;
         };
         const external_id = try payload.externalSender();
-        var queued: Outbox = .{ .message = payload, .scheduled = payload.scheduleAt != null, .reply_cutoff_ms = time.milliTimestamp() };
+        var queued: Outbox = .{ .message = payload, .scheduled = payload.scheduleAt != null, .reply_cutoff_ms = time.milliTimestamp(), .linked_account = linked_account };
         const from = if (external_id) |sender_id| blk: {
             if (payload.sharedReply != null) return error.ExternalSenderUnavailable;
             const grant = try external_senders.find(a, self.externalSendersFile(), user, sender_id);
@@ -748,6 +753,7 @@ pub const Service = struct {
                 doc.error_message = switch (err) {
                     error.SenderIdentityUnavailable => "This From address is no longer available. Choose another address before sending.",
                     error.ExternalSenderUnavailable => "The external From address or its provider is no longer authorized. Review this message before sending.",
+                    error.LinkedAccountUnavailable => "The linked mailbox was removed or expired before sending. Review the message from its original mailbox.",
                     error.SharedReplyUnavailable => "This shared reply no longer has permission to send. Check the original message and its assignment.",
                     error.CalendarInvitationStale => "The organizer sent an updated invitation before this RSVP could be sent.",
                     error.CalendarInvitationCancelled => "The organizer cancelled this invitation before this RSVP could be sent.",
@@ -922,6 +928,7 @@ pub const Service = struct {
         row.revision = try store.put(self.db, row.*, row.revision);
         var cfg = self.sendConfig(user);
         cfg.delegated_sender_id = delegated_id;
+        cfg.linked_account = doc.linked_account;
         const secret = if (grant) |approved| try external_senders.readFile(a, approved.password_file, 352) else null;
         defer if (secret) |bytes| {
             std.crypto.secureZero(u8, bytes);
