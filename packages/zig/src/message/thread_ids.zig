@@ -27,6 +27,8 @@ pub const Headers = struct {
     parents: []const []const u8 = &.{},
     reply_parent: ?[]const u8 = null,
     automatic: bool = false,
+    message_id_fields: usize = 0,
+    reply_fields: usize = 0,
 
     pub fn keys(self: Headers, a: std.mem.Allocator) ![]const []const u8 {
         const own = self.own orelse return self.parents;
@@ -57,8 +59,14 @@ pub fn parse(a: std.mem.Allocator, raw: []const u8) !Headers {
             const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
             const name = trimmed[0..colon];
             value = std.mem.trim(u8, trimmed[colon + 1 ..], " \t");
-            if (std.ascii.eqlIgnoreCase(name, "Message-ID")) field = .own;
-            if (std.ascii.eqlIgnoreCase(name, "In-Reply-To")) field = .reply;
+            if (std.ascii.eqlIgnoreCase(name, "Message-ID")) {
+                field = .own;
+                result.message_id_fields += 1;
+            }
+            if (std.ascii.eqlIgnoreCase(name, "In-Reply-To")) {
+                field = .reply;
+                result.reply_fields += 1;
+            }
             if (std.ascii.eqlIgnoreCase(name, "References")) field = .reference;
             if (std.ascii.eqlIgnoreCase(name, "Auto-Submitted")) field = .automatic;
         }

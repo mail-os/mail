@@ -10,6 +10,9 @@ const caldav_store = @import("../storage/caldav_store.zig");
 const search = @import("eas_search.zig");
 const sync_state = @import("eas_state.zig");
 const webmail_maildir = @import("../api/webmail_maildir.zig");
+const snapshots = @import("../api/webmail_snapshots.zig");
+const message_refs = @import("../storage/message_refs.zig");
+const thread_ids = @import("../message/thread_ids.zig");
 const fs_compat = @import("../core/fs_compat.zig");
 const io_compat = @import("../core/io_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
@@ -312,12 +315,16 @@ fn handleComposeMail(ctx: *Context, op: ComposeCommand, body: []const u8) !Respo
         if (ctx.db.activeSyncAccepted(ctx.username, accepted, time_compat.timestamp()) catch
             return sendError(ctx, op, .retry_later)) return sendError(ctx, op, .already_accepted);
     }
-    const archive = if (req.source) |source| blk: {
-        const original = sourceMime(a, ctx, user.id, source, !req.replace_mime, limits.max_message_size) catch |err|
+    const capture_reply = op == .smart_reply and req.save_copy and !message.has_bcc and
+        (ctx.db.hasFollowedSentReplies(ctx.username) catch false);
+    var parent: ?database.Database.TeamReplySource = null;
+    var archive = if (req.source) |source| blk: {
+        const original = sourceMime(a, ctx, user.id, source, !req.replace_mime, capture_reply, limits.max_message_size) catch |err|
             return sendError(ctx, op, sourceStatus(err));
+        parent = original.reply_source;
         if (req.replace_mime) break :blk message.archive;
         const mode: smart_mime.Mode = if (op == .smart_reply) .reply else if (ctx.legacy_forward_attachment) .attachment else .forward;
-        break :blk smart_mime.withOriginal(a, message.archive, original, mode, limits.max_message_size) catch |err|
+        break :blk smart_mime.withOriginal(a, message.archive, original.mime, mode, limits.max_message_size) catch |err|
             return sendError(ctx, op, switch (err) {
                 error.MessageTooLarge => .message_too_large,
                 error.OutOfMemory => .retry_later,
@@ -328,6 +335,11 @@ fn handleComposeMail(ctx: *Context, op: ComposeCommand, body: []const u8) !Respo
     const recipients = submission.distinctRecipients(a, &.{message.recipients}) catch |err|
         return sendError(ctx, op, if (err == error.InvalidAddress) .invalid_recipient else .retry_later);
     if (recipients.len == 0) return sendError(ctx, op, .no_recipients);
+    const native_reply = if (parent) |reply_source|
+        submission.prepareNativeReply(a, ctx.db, ctx.username, archive, recipients, reply_source, limits.hostname, limits.max_message_size) catch null
+    else
+        null;
+    if (native_reply) |reply| archive = reply.archive;
     // SmartReply and SmartForward can add content from the original message.
     // Scan the assembled MIME before allocating a receipt or filing a copy.
     clamav.requireAllowed(ctx.scanner, archive) catch |err| return sendError(ctx, op, switch (err) {
@@ -354,6 +366,7 @@ fn handleComposeMail(ctx: *Context, op: ComposeCommand, body: []const u8) !Respo
         .raw = raw,
         .sent = if (sent_path) |path| .{ .path = path, .bytes = archive } else null,
         .receipt = receipt,
+        .native_reply = native_reply,
     }) catch |err| return sendError(ctx, op, switch (err) {
         error.HostedStorageFull => .mailbox_quota,
         error.HostedSendingLimit => .send_quota,
@@ -378,7 +391,12 @@ fn sourceStatus(err: anyerror) SendStatus {
     };
 }
 
-fn sourceMime(a: std.mem.Allocator, ctx: *Context, user_id: i64, source: MessageSource, include_contents: bool, max_bytes: usize) ![]const u8 {
+const ComposeSource = struct {
+    mime: []const u8 = "",
+    reply_source: ?database.Database.TeamReplySource = null,
+};
+
+fn sourceMime(a: std.mem.Allocator, ctx: *Context, user_id: i64, source: MessageSource, include_contents: bool, capture_reply: bool, max_bytes: usize) !ComposeSource {
     if (source.long_id != null and (source.item_id != null or source.folder_id != null)) return error.InvalidIdCombination;
     if (source.instance_id) |instance| {
         if (search.utcMilliseconds(instance) == null) return error.InvalidDateTime;
@@ -408,17 +426,33 @@ fn sourceMime(a: std.mem.Allocator, ctx: *Context, user_id: i64, source: Message
                 error.FileNotFound => continue,
                 else => return err,
             };
-            if (!include_contents) return "";
+            const eligible = capture_reply and snapshots.canShareFile(mailbox, webmail_maildir.flagsFrom(name), if (ctx.mail_config) |cfg| cfg.junkFolder() else "Junk");
+            if (!include_contents and (!eligible or size > max_bytes)) return .{};
             if (size > max_bytes) return error.MessageTooLarge;
             const bytes = fs_compat.readFileAlloc(a, path) catch |err| switch (err) {
                 error.FileNotFound => continue,
-                else => return err,
+                else => if (include_contents) return err else return .{},
             };
-            if (bytes.len > max_bytes) return error.MessageTooLarge;
-            return bytes;
+            if (bytes.len > max_bytes) return if (include_contents) error.MessageTooLarge else .{};
+            return .{
+                .mime = bytes,
+                .reply_source = if (eligible) followedReplySource(a, ctx, mailbox, name, path, bytes) catch null else null,
+            };
         }
     }
     return error.ItemNotFound;
+}
+
+fn followedReplySource(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, name: []const u8, path: []const u8, bytes: []const u8) !?database.Database.TeamReplySource {
+    const stamp = try message_refs.fileStamp(a, path);
+    const reference = (try message_refs.findAt(a, ctx.db, ctx.username, message_refs.location(mailbox, name), stamp)) orelse return null;
+    const ids = try thread_ids.parse(a, bytes);
+    if (ids.message_id_fields != 1) return null;
+    return .{
+        .reference = reference,
+        .revision = message_refs.digest(bytes),
+        .wire_id = ids.own orelse return null,
+    };
 }
 
 fn itemUid(folder_id: []const u8, item: []const u8) !i64 {

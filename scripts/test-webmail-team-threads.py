@@ -4,9 +4,11 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
+import os
 from pathlib import Path
 import runpy
 import secrets
+import sys
 import tempfile
 import time
 
@@ -14,7 +16,8 @@ import time
 SCRIPTS = Path(__file__).resolve().parent
 teams = runpy.run_path(str(SCRIPTS / "test-webmail-teams.py"))
 Fixture, command, expect = teams["Fixture"], teams["command"], teams["expect"]
-request = runpy.run_path(str(SCRIPTS / "test-hosted-limits.py"))["request"]
+hosted = runpy.run_path(str(SCRIPTS / "test-hosted-limits.py"))
+request = hosted["request"]
 SHARES = "thread-shares"
 FILE = b"An explicitly shared file.\x00\xff"
 
@@ -262,6 +265,178 @@ def verify_sent_replies(fixture, call, download, claim, owner, peer, witness, ou
     call(own, direct_recipient_share, method="DELETE")
 
 
+def smart_reply_parent(fixture, owner, teammate, author):
+    own, peer = (fixture.login(address) for address in (owner, teammate))
+    command(fixture, "team", "create", "native", "Native", owner)
+    command(fixture, "team", "member", "native", teammate, "member")
+    expect(fixture.api(own, "sender-review", {"setting": "disable"}, "PUT"))
+    expect(fixture.api(peer, "notifications", {"enabled": True}, "PUT"))
+    send(fixture, owner, author, "native-parent")
+    root, = expect(fixture.api(own, "messages?conversations=false&q=native-parent"))["items"]
+    return own, peer, root
+
+
+def share_smart_reply(fixture, own, teammate, root, follow_sent):
+    selection = {"references": [root["reference"]], "downloads": True, "followReplies": True, "followSentReplies": follow_sent}
+    preview = expect(fixture.api(own, SHARES + "/preview", selection))
+    grant = expect(fixture.api(own, SHARES, {**selection, "team": "native", "grantee": teammate, "digest": preview["digest"]}), 201)
+    return f"{SHARES}/{grant['id']}"
+
+
+def verify_smart_reply(fixture, outsider):
+    owner, teammate, author = (fixture.provision(name) for name in ("smart-owner", "smart-teammate", "smart-author"))
+    own, peer, root = smart_reply_parent(fixture, owner, teammate, author)
+    foreign = fixture.login(outsider)
+    outgoing = share_smart_reply(fixture, own, teammate, root, True)
+    inbound_only = share_smart_reply(fixture, own, teammate, root, False)
+    source = hosted["synced_mail_item"](fixture, owner, "NativeReplyDevice")
+    assert source == ("1", f"1:{root['uid']}")
+
+    def send_on_device(raw, client_id, *, save=True, op="SmartReply", refer=source, replace=True):
+        body = hosted["eas_send"](raw, client_id, command=op, save=save, source=refer, replace=replace)
+        return hosted["eas_result"](fixture.eas(owner, body, command=op, device="NativeReplyDevice"), op)
+
+    def visible(path=outgoing):
+        return expect(fixture.api(peer, path))["messages"]
+
+    def notices():
+        return expect(fixture.api(peer, "notifications/claim", method="POST")).get("teamReplies", 0)
+
+    mime = hosted["eas_mime"]
+    with fixture.imap(owner) as imap:
+        imap.create("Sent")
+        duplicate = mime(author, owner, subject="Imported identical wire ID",
+                         extra=f"Message-ID: {root['message_id']}\r\n".encode())
+        assert imap.append("Sent", None, None, duplicate)[0] == "OK"
+    unrelated = hosted["synced_mail_item"](fixture, owner, "NativeReplyDevice", folder="3")
+
+    assert send_on_device(mime(owner, author, subject="Reply without Sent"), "no-copy", save=False) == 0
+    assert send_on_device(mime(owner, author, subject="Forwarded parent"), "forward", op="SmartForward") == 0
+    assert send_on_device(mime(owner, author, extra=f"Bcc: {author}\r\n".encode(), subject="Blind SmartReply"), "bcc") == 0
+    assert send_on_device(mime(owner, outsider, subject="Unapproved SmartReply recipient"), "out-of-scope") == 0
+    assert send_on_device(mime(owner, author, subject="Conflicting parent",
+                               extra=b"In-Reply-To: <elsewhere@threads.example.test>\r\n"), "other-parent") == 0
+    assert send_on_device(mime(owner, author, subject="Duplicate ID reply"), "duplicate", refer=unrelated) == 0
+    assert [msg["reference"] for msg in visible()] == [root["reference"]]
+    assert notices() == 0
+    expect(fixture.api(foreign, outgoing), 404)
+
+    complete = mime(owner, author, subject="Followed quota reply", extra=(
+        f"Message-ID: <native-quota-reply@threads.example.test>\r\nIn-Reply-To: {root['message_id']}\r\n"
+    ).encode())
+    baseline, charged = fixture.bytes(owner), fixture.count(owner)
+    fixture.provision("smart-owner", quota=baseline + len(complete) - 1)
+    assert send_on_device(complete, "quota") == 113
+    assert fixture.bytes(owner) == baseline and fixture.count(owner) == charged and len(visible()) == 1
+    fixture.provision("smart-owner", quota=baseline + len(complete))
+    assert send_on_device(complete, "quota") == 0
+    assert fixture.bytes(owner) == baseline + len(complete) and fixture.count(owner) == charged + 1
+    assert send_on_device(complete, "quota") == 118
+    assert len(visible()) == 2 and notices() == 1 and notices() == 0
+    fixture.provision("smart-owner")
+
+    generated = mime(owner, author, subject="Followed native reply", payload=b"Approved SmartReply body")
+    assert send_on_device(generated, "thread", replace=False) == 0
+    _, explicit, appended = visible()
+    assert explicit["sentReply"] and appended["sentReply"]
+    assert "Approved SmartReply body" in appended["text"] and not appended["attachments"]
+    assert not any(msg["sentReply"] for msg in visible(inbound_only))
+    saved = expect(fixture.api(own, "messages/ref/" + appended["reference"]))
+    assert saved["in_reply_to"] == root["message_id"] and saved["message_id"].startswith("<")
+    continuation = EmailMessage()
+    continuation["From"], continuation["To"] = author, owner
+    continuation["Subject"], continuation["Message-ID"] = "Reply to generated native ID", "<native-continuation@threads.example.test>"
+    continuation["In-Reply-To"] = saved["message_id"]
+    continuation.set_content("The generated identifier links the next verified reply.")
+    with fixture.smtp(author) as connection:
+        assert connection.send_message(continuation) == {}
+    assert visible()[-1]["verifiedReply"] and len(visible(inbound_only)) == 1
+
+    expect(fixture.api(own, outgoing, method="DELETE"))
+    assert notices() == 0
+    assert send_on_device(mime(owner, author, subject="After revocation"), "revoked") == 0
+    expect(fixture.api(peer, outgoing), 404)
+
+
+def verify_remote_smart_reply(fixture):
+    directory = fixture.directory
+    local_domains = fixture.env["SMTP_LOCAL_DOMAINS"]
+    author = "partner@remote.example.test"
+    fixture.env["SMTP_LOCAL_DOMAINS"] += ",remote.example.test"
+    command(fixture, "user:local", "create", author, fixture.password, author)
+    with fixture.daemon():
+        owner, teammate = (fixture.provision(name) for name in ("remote-reply-owner", "remote-reply-viewer"))
+        own, _, root = smart_reply_parent(fixture, owner, teammate, author)
+        share = share_smart_reply(fixture, own, teammate, root, True)
+
+    aws = directory / "aws"
+    aws.write_text(f'''#!{sys.executable}
+import base64
+import json
+from pathlib import Path
+import sys
+import time
+
+assert sys.argv[1:3] == ["ses", "send-raw-email"]
+payload = json.loads(Path(sys.argv[-1].removeprefix("file://")).read_text())
+assert payload["Destinations"] == ["{author}"]
+mime = base64.b64decode(payload["RawMessage"]["Data"])
+if b"Subject: Remote refused" in mime:
+    sys.exit(1)
+assert b"Subject: Remote confirmed" in mime, mime
+Path("remote-pending").touch()
+for _ in range(160):
+    if Path("remote-confirm").exists():
+        sys.exit(0)
+    time.sleep(.05)
+sys.exit(2)
+''')
+    aws.chmod(0o700)
+    fixture.env.update(SMTP_LOCAL_DOMAINS=local_domains, SMTP_DELIVERY_METHOD="ses",
+                       PATH=str(directory) + os.pathsep + fixture.env["PATH"])
+
+    with fixture.daemon():
+        own, peer = fixture.login(owner), fixture.login(teammate)
+        device = "NativeRemote"
+        source = hosted["synced_mail_item"](fixture, owner, device)
+
+        def send_on_device(subject, client_id):
+            mime = hosted["eas_mime"](owner, author, subject=subject)
+            payload = hosted["eas_send"](mime, client_id, command="SmartReply", source=source, save=True, replace=True)
+            return hosted["eas_result"](fixture.eas(owner, payload, command="SmartReply", device=device), "SmartReply")
+
+        def sent(subject):
+            query = subject.replace(" ", "+")
+            return expect(fixture.api(own, "messages?folder=Sent&q=" + query))["items"]
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            confirming = pool.submit(send_on_device, "Remote confirmed", "confirm")
+            try:
+                deadline = time.monotonic() + 7
+                while not (directory / "remote-pending").exists() and time.monotonic() < deadline:
+                    time.sleep(.05)
+                assert (directory / "remote-pending").exists()
+                assert len(sent("Remote confirmed")) == 1
+                assert len(expect(fixture.api(peer, share))["messages"]) == 1
+                assert expect(fixture.api(peer, "notifications/claim", method="POST")).get("teamReplies", 0) == 0
+            finally:
+                (directory / "remote-confirm").touch()
+            assert confirming.result(timeout=10) == 0
+        published, = [msg for msg in expect(fixture.api(peer, share))["messages"] if msg["sentReply"]]
+        assert published["reference"] == sent("Remote confirmed")[0]["reference"]
+        assert expect(fixture.api(peer, "notifications/claim", method="POST"))["teamReplies"] == 1
+        assert send_on_device("Remote confirmed", "confirm") == 118
+        assert send_on_device("Remote refused", "refuse") == 120
+        assert sent("Remote refused") == []
+
+    with fixture.daemon():
+        peer = fixture.login(teammate)
+        restored = expect(fixture.api(peer, share))["messages"]
+        assert {msg["subject"] for msg in restored} == {"Follow fixture native-parent", "Remote confirmed"}
+        assert expect(fixture.api(peer, "notifications/claim", method="POST")).get("teamReplies", 0) == 0
+    print("Verified that remote SmartReply follows confirmation, rejects failed delivery, and preserves one preview across replay and restart.")
+
+
 def verify(fixture):
     def call(session, path, payload=None, method=None, status=200):
         return expect(fixture.api(session, path, payload, method), status)
@@ -426,6 +601,7 @@ def verify(fixture):
         verify_sent_replies(fixture, call, download, claim, owner, peer, witness, outsider, own, other, third, foreign, root)
         root = call(own, "messages/ref/" + root["reference"])
         verify_collection(fixture, call, download, owner, peer, witness, outsider, own, other, third, foreign, rows, root)
+        verify_smart_reply(fixture, outsider)
 
 
 def main():
@@ -434,7 +610,9 @@ def main():
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="mail-team-threads-") as directory:
         verify(Fixture(args.binary.resolve(strict=True), Path(directory), staging=True))
-    print("Verified team conversations, followed incoming and sent replies, live collections, previews, searching, attachments, comments, notifications, and revocation.")
+    with tempfile.TemporaryDirectory(prefix="mail-team-smart-remote-") as directory:
+        verify_remote_smart_reply(Fixture(args.binary.resolve(strict=True), Path(directory), staging=True))
+    print("Verified team conversations, followed incoming, webmail, and SmartReply replies, live collections, previews, search, downloads, comments, notices, and revocation.")
 
 
 if __name__ == "__main__":

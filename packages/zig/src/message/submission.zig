@@ -77,6 +77,7 @@ pub fn author(allocator: std.mem.Allocator, message: []const u8) !?[]u8 {
 pub const ClientMime = struct {
     archive: []const u8,
     recipients: [][]const u8,
+    has_bcc: bool = false,
 };
 
 /// Read the envelope from the top-level To/Cc/Bcc fields and bind From to
@@ -90,6 +91,7 @@ pub fn prepareClientMime(a: std.mem.Allocator, raw: []const u8, sender: []const 
     try archive.print(a, "From: {s}\r\n", .{sender});
 
     var collecting = false;
+    var has_bcc = false;
     var keep = false;
     var at_start = true;
     var pos: usize = 0;
@@ -103,7 +105,7 @@ pub fn prepareClientMime(a: std.mem.Allocator, raw: []const u8, sender: []const 
             if (collecting) try appendMailboxes(a, address_value.items, &recipients);
             try archive.appendSlice(a, "\r\n");
             try archive.appendSlice(a, raw[pos..]);
-            return .{ .archive = try archive.toOwnedSlice(a), .recipients = try recipients.toOwnedSlice(a) };
+            return .{ .archive = try archive.toOwnedSlice(a), .recipients = try recipients.toOwnedSlice(a), .has_bcc = has_bcc };
         }
         const continuation = line[0] == ' ' or line[0] == '\t';
         if (continuation) {
@@ -123,6 +125,7 @@ pub fn prepareClientMime(a: std.mem.Allocator, raw: []const u8, sender: []const 
                 if (byte < 33 or byte > 126) return error.InvalidMime;
             }
             collecting = std.ascii.eqlIgnoreCase(name, "To") or std.ascii.eqlIgnoreCase(name, "Cc") or std.ascii.eqlIgnoreCase(name, "Bcc");
+            has_bcc = has_bcc or std.ascii.eqlIgnoreCase(name, "Bcc");
             if (collecting) try address_value.appendSlice(a, line[colon + 1 ..]);
             keep = !std.ascii.eqlIgnoreCase(name, "From") and !std.ascii.eqlIgnoreCase(name, "Sender") and
                 !std.ascii.eqlIgnoreCase(name, "Return-Path") and !std.ascii.startsWithIgnoreCase(name, "Resent-");

@@ -1777,6 +1777,13 @@ pub const Database = struct {
         wire_id: []const u8,
     };
 
+    pub const NativeSentReply = struct {
+        basename: []const u8,
+        stamp: []const u8,
+        revision: [64]u8,
+        wire_id: []const u8,
+    };
+
     pub const DeliveryEnvelope = struct {
         id: []const u8,
         from: []const u8,
@@ -1798,6 +1805,7 @@ pub const Database = struct {
         review_release: ?FiledCopy = null,
         team_reply_submission: ?TeamReplySource = null,
         sent_copy_of: ?[]const u8 = null,
+        native_sent_reply: ?NativeSentReply = null,
     };
 
     /// Reserve the hosted envelope and persist its complete routing decision
@@ -1936,6 +1944,10 @@ pub const Database = struct {
             }
             has_local = has_local or pending;
         }
+        if (envelope.native_sent_reply) |sent| {
+            try self.recordNativeSentFileLocked(envelope.id, sent);
+            try self.publishNativeSentReplyLocked(envelope.id);
+        }
         if (!has_local) try self.compactDeliveryLocked(envelope.id);
         try self.execLocked("COMMIT");
     }
@@ -1968,7 +1980,18 @@ pub const Database = struct {
         \\WHERE delivery_id=?1 AND recipient=?2 AND is_primary=1 AND outcome=?4 RETURNING 1
     ;
 
-    pub fn checkpointInteractiveRecipient(self: *Database, id: []const u8, recipient: []const u8, phase: InteractivePhase) !void {
+    pub fn checkpointInteractiveRecipient(self: *Database, id: []const u8, recipient: []const u8, phase: InteractivePhase, native_sent_reply: bool) !void {
+        if (native_sent_reply and phase == .delivered) {
+            var tx = try self.beginTransaction(.write);
+            defer tx.deinit();
+            {
+                const stmt = try tx.prepare(interactive_phase_sql);
+                defer stmt.finalize();
+                try checkpointRecipient(stmt, id, recipient, phase);
+            }
+            try self.publishNativeSentReplyLocked(id);
+            return tx.commit();
+        }
         const stmt = try self.prepare(interactive_phase_sql);
         defer stmt.finalize();
         try checkpointRecipient(stmt, id, recipient, phase);
@@ -2053,6 +2076,18 @@ pub const Database = struct {
         );
         defer stmt.finalize();
         try stmt.bind(1, user);
+        return stmt.step();
+    }
+
+    pub fn canFollowNativeSent(self: *Database, user: []const u8, source: TeamReplySource, recipients: []const u8) !bool {
+        const stmt = try self.prepare(team_threads.check_native_sent_source_sql);
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, source.reference);
+        try stmt.bind(3, @as([]const u8, &source.revision));
+        try stmt.bind(4, source.wire_id);
+        try stmt.bind(5, recipients);
+        try stmt.bind(6, team_threads.max_followed_replies);
         return stmt.step();
     }
 
@@ -2470,6 +2505,44 @@ pub const Database = struct {
         try stmt.bind(6, parent);
         try stmt.bind(7, team_threads.max_followed_replies);
         try stmt.bind(8, file.stamp);
+        _ = try stmt.step();
+    }
+
+    /// Native clients reserve an actual Sent file before acceptance. Register
+    /// that exact file and its delivery in the same transaction as the receipt.
+    fn recordNativeSentFileLocked(self: *Database, id: []const u8, sent: NativeSentReply) !void {
+        {
+            const stmt = try self.prepareLocked(
+                \\INSERT OR IGNORE INTO mailbox_message_refs(user_id,reference,folder,basename,file_stamp,intake_folder,calendar_history_checked)
+                \\SELECT owner_id,lower(hex(randomblob(16))),'Sent',?2,?3,'Sent',1
+                \\FROM mail_team_thread_submissions WHERE delivery_id=?1
+            );
+            defer stmt.finalize();
+            try stmt.bind(1, id);
+            try stmt.bind(2, sent.basename);
+            try stmt.bind(3, sent.stamp);
+            _ = try stmt.step();
+        }
+        const stmt = try self.prepareLocked(
+            \\INSERT INTO mail_team_thread_native_sent(delivery_id,reference,content_revision,wire_id)
+            \\SELECT p.delivery_id,r.reference,?4,?5 FROM mail_team_thread_submissions p
+            \\JOIN mailbox_message_refs r ON r.user_id=p.owner_id AND r.folder='Sent' AND r.basename=?2 AND r.file_stamp=?3
+            \\WHERE p.delivery_id=?1
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, id);
+        try stmt.bind(2, sent.basename);
+        try stmt.bind(3, sent.stamp);
+        try stmt.bind(4, @as([]const u8, &sent.revision));
+        try stmt.bind(5, sent.wire_id);
+        _ = try stmt.step();
+    }
+
+    fn publishNativeSentReplyLocked(self: *Database, id: []const u8) !void {
+        const stmt = try self.prepareLocked(team_threads.record_native_sent_sql);
+        defer stmt.finalize();
+        try stmt.bind(1, id);
+        try stmt.bind(2, team_threads.max_followed_replies);
         _ = try stmt.step();
     }
 

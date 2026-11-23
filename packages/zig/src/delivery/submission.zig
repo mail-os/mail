@@ -10,6 +10,8 @@ const outbound = @import("outbound.zig");
 const core_config = @import("../core/config.zig");
 const routing = @import("local_routing.zig");
 const smtp_provider = @import("smtp_provider.zig");
+const message_refs = @import("../storage/message_refs.zig");
+const thread_ids = @import("../message/thread_ids.zig");
 
 pub const Delivery = struct {
     hostname: []const u8,
@@ -113,7 +115,45 @@ const RawSubmission = struct {
     raw: []const u8,
     sent: ?SentCopy = null,
     receipt: ?database.Database.ActiveSyncReceipt = null,
+    native_reply: ?NativeReply = null,
 };
+
+pub const NativeReply = struct {
+    archive: []const u8,
+    source: database.Database.TeamReplySource,
+    wire_id: []const u8,
+};
+
+/// A source supplied by an authenticated native reply operation can fill in
+/// missing reply metadata. Preserve conflicting client-provided fields and
+/// leave that submission outside the grant.
+pub fn prepareNativeReply(a: std.mem.Allocator, db: *database.Database, user: []const u8, archive: []const u8, recipients: []const []const u8, source: database.Database.TeamReplySource, hostname: []const u8, max_bytes: usize) !?NativeReply {
+    const info = try thread_ids.parse(a, archive);
+    if (info.automatic or info.message_id_fields > 1 or info.reply_fields > 1) return null;
+    if (info.reply_parent) |parent| {
+        if (!std.mem.eql(u8, parent, source.wire_id)) return null;
+    } else if (info.reply_fields != 0 or info.parents.len != 0) return null;
+    if (info.own) |id| {
+        if (std.mem.eql(u8, id, source.wire_id)) return null;
+    } else if (info.message_id_fields != 0) return null;
+    const audience = try std.json.Stringify.valueAlloc(a, recipients, .{});
+    if (!try db.canFollowNativeSent(user, source, audience)) return null;
+    const wire_id = info.own orelse blk: {
+        for (hostname) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '.' and byte != '-') return null;
+        if (hostname.len == 0 or hostname.len > 253) return null;
+        const id = routing.newId();
+        break :blk try std.fmt.allocPrint(a, "<{s}@{s}>", .{ &id, hostname });
+    };
+    var extra: std.ArrayList(u8) = .empty;
+    if (info.own == null) try extra.print(a, "Message-ID: {s}\r\n", .{wire_id});
+    if (info.reply_parent == null) try extra.print(a, "In-Reply-To: {s}\r\n", .{source.wire_id});
+    if (archive.len > max_bytes or extra.items.len > max_bytes - archive.len) return null;
+    return .{
+        .archive = if (extra.items.len == 0) archive else try std.mem.concat(a, u8, &.{ extra.items, archive }),
+        .source = source,
+        .wire_id = wire_id,
+    };
+}
 
 pub const DispatchOptions = struct {
     sender: ?[]const u8 = null,
@@ -127,6 +167,7 @@ pub const DispatchOptions = struct {
     account_notice: bool = false,
     recipient_id: ?i64 = null,
     team_reply_submission: ?database.Database.TeamReplySource = null,
+    native_reply_wire_id: ?[]const u8 = null,
 };
 
 pub const DispatchResult = struct {
@@ -214,12 +255,12 @@ pub fn dispatch(a: std.mem.Allocator, cfg: Delivery, from: []const u8, recipient
     var result: DispatchResult = .{ .failed = undefined };
     for (recipients, remote, errors) |recipient, deliver_remote, local_error| {
         const failure: ?anyerror = if (deliver_remote) blk: {
-            if (options.interactive_id) |id| try cfg.db.?.checkpointInteractiveRecipient(id, recipient, .starting);
+            if (options.interactive_id) |id| try cfg.db.?.checkpointInteractiveRecipient(id, recipient, .starting, false);
             outbound.deliverToRemote(a, from, recipient, raw, cfg.hostname, cfg.delivery_method, cfg.ses_region) catch |err| break :blk err;
             break :blk null;
         } else local_error;
         if (deliver_remote) if (options.interactive_id) |id| {
-            try cfg.db.?.checkpointInteractiveRecipient(id, recipient, if (failure == null) .delivered else .failed);
+            try cfg.db.?.checkpointInteractiveRecipient(id, recipient, if (failure == null) .delivered else .failed, options.native_reply_wire_id != null);
         };
         if (failure) |err| {
             std.log.warn("Message delivery to {s} failed: {}", .{ recipient, err });
@@ -244,11 +285,20 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
         _ = try db.checkHostedSend(sender, recipients.len, now);
     }
     var sent_written = false;
+    var native_sent_reply: ?database.Database.NativeSentReply = null;
     errdefer if (sent_written) fs_compat.cwd().deleteFile(options.sent.?.path) catch {};
     if (options.sent) |copy| {
         try hosted_limits.checkStorage(db, options.sender.?, copy.bytes.len, null);
         try durable_maildir.write(a, copy.path, copy.bytes);
         sent_written = true;
+        if (options.native_reply_wire_id) |wire_id| {
+            if (message_refs.fileStamp(a, copy.path) catch null) |stamp| native_sent_reply = .{
+                .basename = database.maildirBaseName(std.fs.path.basename(copy.path)),
+                .stamp = stamp,
+                .revision = message_refs.digest(copy.bytes),
+                .wire_id = wire_id,
+            };
+        }
     }
 
     const identity = try routing.SenderIdentity.fromHeaders(a, raw, true);
@@ -316,15 +366,27 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
         .charge_recipients = recipients.len,
         .receipt = options.receipt,
         .team_reply_submission = options.team_reply_submission,
+        .native_sent_reply = native_sent_reply,
     });
 }
 
 pub fn sendRaw(a: std.mem.Allocator, cfg: Delivery, message: RawSubmission) !void {
     if (cfg.db == null) return error.DatabaseUnavailable;
+    // Eligibility stays tied to the approved MIME, including absence of a
+    // blind envelope, and to the requested Sent copy.
+    const native = if (message.native_reply) |reply| candidate: {
+        const copy = message.sent orelse break :candidate null;
+        if (!std.mem.eql(u8, copy.bytes, reply.archive) or !std.mem.eql(u8, message.raw, reply.archive)) break :candidate null;
+        break :candidate reply;
+    } else null;
+    const delivery_id = if (native != null) routing.newId() else undefined;
     const result = try dispatch(a, cfg, message.from, message.recipients, message.raw, .{
         .sender = message.mailbox,
         .sent = message.sent,
         .receipt = message.receipt,
+        .interactive_id = if (native != null) &delivery_id else null,
+        .team_reply_submission = if (native) |reply| reply.source else null,
+        .native_reply_wire_id = if (native) |reply| reply.wire_id else null,
     });
     defer a.free(result.failed);
     if (result.delivered == 0) {

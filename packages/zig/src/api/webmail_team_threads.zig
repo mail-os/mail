@@ -76,6 +76,12 @@ pub const schema =
     \\    parent_revision TEXT NOT NULL,
     \\    parent_wire_id TEXT NOT NULL
     \\);
+    \\CREATE TABLE IF NOT EXISTS mail_team_thread_native_sent (
+    \\    delivery_id TEXT PRIMARY KEY NOT NULL REFERENCES mail_team_thread_submissions(delivery_id) ON DELETE CASCADE,
+    \\    reference TEXT NOT NULL,
+    \\    content_revision TEXT NOT NULL,
+    \\    wire_id TEXT NOT NULL
+    \\);
     \\CREATE TABLE IF NOT EXISTS mail_team_thread_replies (
     \\    share_id TEXT NOT NULL REFERENCES mail_team_thread_follow(share_id) ON DELETE CASCADE,
     \\    reference TEXT NOT NULL,
@@ -118,29 +124,60 @@ pub const record_reply_sql =
     \\ AND EXISTS(SELECT 1 FROM json_each(f.authors) WHERE value=m.author COLLATE NOCASE)
 ;
 
-pub const record_sent_reply_sql =
-    \\INSERT OR IGNORE INTO mail_team_thread_replies(share_id,reference,content_revision,wire_id,notice_at,outgoing)
-    \\SELECT s.id,r.reference,?4,?5,
+const sent_reply_insert =
+    "INSERT OR IGNORE INTO mail_team_thread_replies(share_id,reference,content_revision,wire_id,notice_at,outgoing)";
+const sent_reply_notice =
     \\ CASE WHEN EXISTS(SELECT 1 FROM mail_notification_settings WHERE user_id=s.grantee_id AND enabled=1)
     \\       AND NOT EXISTS(SELECT 1 FROM accepted_mail_targets d WHERE d.delivery_id=source.id AND d.is_primary=1
     \\                      AND (d.mailbox_id=s.grantee_id OR d.recipient=grantee.email COLLATE NOCASE))
     \\      THEN unixepoch() ELSE 0 END,1
-++ " " ++ filed_reply_join ++
-    \\ JOIN mail_team_thread_follow_sent opted ON opted.share_id=f.share_id
-    \\ JOIN mail_team_thread_submissions proof ON proof.sent_id=t.delivery_id AND proof.owner_id=t.mailbox_id
-    \\ JOIN accepted_mail source ON source.id=proof.delivery_id
-++ filed_reply_scope ++
-    \\ AND t.folder='Sent' AND source.accepted_ms>f.since_ms
-    \\ AND proof.parent_wire_id=?6
+;
+const sent_parent_scope =
     \\ AND (EXISTS(SELECT 1 FROM mail_team_thread_messages p WHERE p.share_id=s.id
-    \\             AND p.reference=proof.parent_reference AND p.content_revision=proof.parent_revision)
+    \\             AND p.reference=proof.parent_reference AND p.content_revision=proof.parent_revision
+    \\             AND EXISTS(SELECT 1 FROM json_each(f.anchors) WHERE value=proof.parent_wire_id))
     \\      OR EXISTS(SELECT 1 FROM mail_team_thread_replies p WHERE p.share_id=s.id
-    \\                AND p.reference=proof.parent_reference AND p.content_revision=proof.parent_revision AND p.wire_id=?6))
+    \\                AND p.reference=proof.parent_reference AND p.content_revision=proof.parent_revision
+    \\                AND p.wire_id=proof.parent_wire_id))
+;
+const sent_delivery_scope =
+    \\ AND source.accepted_ms>f.since_ms
     \\ AND EXISTS(SELECT 1 FROM accepted_mail_targets d WHERE d.delivery_id=source.id AND d.is_primary=1)
     \\ AND NOT EXISTS(SELECT 1 FROM accepted_mail_targets d WHERE d.delivery_id=source.id AND d.is_primary=1
     \\   AND (d.outcome NOT IN ('filed','pending','remote_delivered')
     \\        OR NOT EXISTS(SELECT 1 FROM json_each(f.authors) WHERE value=d.recipient COLLATE NOCASE)))
 ;
+
+pub const record_sent_reply_sql = sent_reply_insert ++ " SELECT s.id,r.reference,?4,?5," ++ sent_reply_notice ++ " " ++ filed_reply_join ++
+    \\ JOIN mail_team_thread_follow_sent opted ON opted.share_id=f.share_id
+    \\ JOIN mail_team_thread_submissions proof ON proof.sent_id=t.delivery_id AND proof.owner_id=t.mailbox_id
+    \\ JOIN accepted_mail source ON source.id=proof.delivery_id
+++ filed_reply_scope ++ " AND t.folder='Sent' AND proof.parent_wire_id=?6" ++ sent_parent_scope ++ sent_delivery_scope;
+
+pub const record_native_sent_sql = sent_reply_insert ++ " SELECT s.id,r.reference,n.content_revision,n.wire_id," ++ sent_reply_notice ++
+    \\ FROM mail_team_thread_native_sent n JOIN mail_team_thread_submissions proof ON proof.delivery_id=n.delivery_id
+    \\ JOIN accepted_mail source ON source.id=proof.delivery_id
+    \\ JOIN mailbox_message_refs r ON r.user_id=proof.owner_id AND r.reference=n.reference
+    \\ JOIN mail_team_thread_shares s ON s.owner_id=proof.owner_id
+    \\ JOIN mail_team_thread_follow f ON f.share_id=s.id
+    \\ JOIN mail_team_thread_follow_sent opted ON opted.share_id=f.share_id
+    \\ JOIN users owner ON owner.id=s.owner_id AND owner.enabled=1
+    \\ JOIN users grantee ON grantee.id=s.grantee_id AND grantee.enabled=1
+    \\ WHERE source.id=?1 AND NOT EXISTS(SELECT 1 FROM json_each(f.anchors) WHERE value=n.wire_id)
+    \\ AND (SELECT count(*) FROM mail_team_thread_replies p WHERE p.share_id=s.id)<?2
+++ sent_parent_scope ++ sent_delivery_scope;
+
+pub const check_native_sent_source_sql =
+    \\SELECT 1 FROM (SELECT ?2 AS parent_reference,?3 AS parent_revision,?4 AS parent_wire_id) proof
+    \\JOIN users owner ON owner.username=?1 AND owner.enabled=1
+    \\JOIN mail_team_thread_shares s ON s.owner_id=owner.id
+    \\JOIN mail_team_thread_follow f ON f.share_id=s.id
+    \\JOIN mail_team_thread_follow_sent opted ON opted.share_id=f.share_id
+    \\JOIN users grantee ON grantee.id=s.grantee_id AND grantee.enabled=1
+    \\WHERE NOT EXISTS(SELECT 1 FROM json_each(?5) d WHERE NOT EXISTS(
+    \\    SELECT 1 FROM json_each(f.authors) WHERE value=d.value COLLATE NOCASE))
+    \\AND (SELECT count(*) FROM mail_team_thread_replies p WHERE p.share_id=s.id)<?6
+++ sent_parent_scope ++ " LIMIT 1";
 
 const authorized =
     \\ FROM mail_team_thread_shares s

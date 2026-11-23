@@ -25,9 +25,13 @@ pub const Issued = struct { link: Link, token: [64]u8 };
 pub const View = struct { payload: []const u8, expires_at: i64 };
 
 pub fn canShare(msg: maildir.MessageDetail, junk_folder: []const u8) bool {
-    return maildir.isPersonalFolder(msg.folder) and !msg.flags.deleted and !msg.flags.draft and
-        !std.ascii.eqlIgnoreCase(msg.folder, "Trash") and !std.ascii.eqlIgnoreCase(msg.folder, "Junk") and
-        !std.ascii.eqlIgnoreCase(msg.folder, junk_folder);
+    return canShareFile(msg.folder, msg.flags, junk_folder);
+}
+
+pub fn canShareFile(folder: []const u8, flags: maildir.Flags, junk_folder: []const u8) bool {
+    return maildir.isPersonalFolder(folder) and !flags.deleted and !flags.draft and
+        !std.ascii.eqlIgnoreCase(folder, "Trash") and !std.ascii.eqlIgnoreCase(folder, "Junk") and
+        !std.ascii.eqlIgnoreCase(folder, junk_folder);
 }
 
 pub fn plainText(a: std.mem.Allocator, msg: maildir.MessageDetail) ![]const u8 {

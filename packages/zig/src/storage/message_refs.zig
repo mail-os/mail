@@ -166,16 +166,19 @@ pub fn recoverAt(a: Allocator, db: *database.Database, user: []const u8, at: Loc
     return entry.id;
 }
 
+pub fn findAt(a: Allocator, db: *database.Database, user: []const u8, target: Location, stamp: []const u8) !?[]const u8 {
+    const s = try db.prepare("SELECT reference FROM mailbox_message_refs WHERE " ++ owner ++ " AND folder=?2 AND basename=?3 AND file_stamp=?4");
+    defer s.finalize();
+    try s.bind(1, user);
+    try s.bind(2, target.folder);
+    try s.bind(3, target.basename);
+    try s.bind(4, stamp);
+    if (!try s.step()) return null;
+    return try a.dupe(u8, s.columnText(0));
+}
+
 pub fn issue(a: Allocator, db: *database.Database, user: []const u8, target: Location, stamp: []const u8) ![]const u8 {
-    {
-        const s = try db.prepare("SELECT reference FROM mailbox_message_refs WHERE " ++ owner ++ " AND folder=?2 AND basename=?3 AND file_stamp=?4");
-        defer s.finalize();
-        try s.bind(1, user);
-        try s.bind(2, target.folder);
-        try s.bind(3, target.basename);
-        try s.bind(4, stamp);
-        if (try s.step()) return try a.dupe(u8, s.columnText(0));
-    }
+    if (try findAt(a, db, user, target, stamp)) |found| return found;
     var bytes: [16]u8 = undefined;
     io.randomBytes(&bytes);
     const id = try a.dupe(u8, &std.fmt.bytesToHex(bytes, .lower));
