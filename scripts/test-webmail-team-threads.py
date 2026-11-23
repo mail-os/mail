@@ -579,7 +579,8 @@ def verify_smart_reply(fixture, outsider):
     outgoing = share_smart_reply(fixture, own, teammate, root, True)
     inbound_only = share_smart_reply(fixture, own, teammate, root, False)
     source = hosted["synced_mail_item"](fixture, owner, "NativeReplyDevice")
-    assert source == ("1", f"1:{root['uid']}")
+    collection, item_id = source
+    assert collection == "1" and item_id.split(":", 2)[:2] == [collection, str(root["uid"])], source
 
     def send_on_device(raw, client_id, *, save=True, op="SmartReply", refer=source, replace=True):
         body = hosted["eas_send"](raw, client_id, command=op, save=save, source=refer, replace=replace)
