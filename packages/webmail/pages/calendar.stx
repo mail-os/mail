@@ -149,7 +149,10 @@ onUnmounted(() => { destroy(); destroyReminders() })
       <div class="calendar-task-date">
         <label for="calendar-task-day">Date (optional)</label>
         <div class="calendar-task-actions">
-          <input id="calendar-task-day" type="date" :value="taskDay" @input="taskDay.set($event.target.value)" @change="taskDay.set($event.target.value)" :disabled="taskBusy" min="0001-01-01" max="9999-12-31">
+          <div class="calendar-task-date-field" :data-empty="taskDay ? 'false' : 'true'">
+            <input id="calendar-task-day" type="date" :value="taskDay" @input="taskDay.set($event.target.value)" @change="taskDay.set($event.target.value)" :disabled="taskBusy" min="0001-01-01" max="9999-12-31">
+            <span :if="!taskDay" class="calendar-task-date-placeholder" aria-hidden="true">No date</span>
+          </div>
           <button :if="taskDay" type="button" class="wm-action calendar-task-clear" :disabled="taskBusy" aria-label="Clear date" title="Clear date" @click="clearTaskDate()"><span class="mail-icon" data-icon="close" aria-hidden="true"></span></button>
         </div>
       </div>

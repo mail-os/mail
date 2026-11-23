@@ -584,6 +584,8 @@ async function calendarTasksJourney(page, phone = false) {
   const name = phone ? 'Prepare travel documents' : 'Send the quarterly notes'
   await title.waitFor()
   await page.waitForFunction(() => document.activeElement?.getAttribute('data-stx-ref') === 'taskTitleField')
+  assert.equal(await date.inputValue(), '')
+  await editor.getByText('No date', { exact: true }).waitFor()
   await verifyControlRow(editor, 'input, button', phone ? 44 : 36, !phone)
   await title.fill(name)
   await panel.screenshot({ path: join(output, phone ? 'phone-calendar-task-editor.png' : 'desktop-calendar-task-editor.png'), animations: 'disabled' })
@@ -640,6 +642,7 @@ async function calendarTasksJourney(page, phone = false) {
   await clearDate.click()
   assert.equal(await date.inputValue(), '')
   await page.waitForFunction(() => document.activeElement?.getAttribute('data-stx-ref') === 'taskSaveButton')
+  await editor.getByText('No date', { exact: true }).waitFor()
   await button(editor, 'Save task').click()
   await task.getByText('No date', { exact: true }).waitFor()
   await button(task, `Edit ${name}`).click()

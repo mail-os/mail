@@ -510,7 +510,14 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-task-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
 .calendar-task-date { display: grid; gap: 5px; min-width: 0; }
 .calendar-task-date .calendar-task-actions { flex-wrap: nowrap; }
-.calendar-task-date input { flex: 1 1 auto; }
+.calendar-task-date-field { position: relative; flex: 1 1 auto; min-width: 0; }
+.calendar-task-date-field input { display: block; }
+.calendar-task-date-placeholder { display: none; }
+@media (forced-colors: none) {
+  /* Some native date inputs show today's date as their empty placeholder. */
+  .calendar-task-date-field[data-empty=true] input:not(:focus) { color: transparent; -webkit-text-fill-color: transparent; }
+  .calendar-task-date-field:not(:focus-within) .calendar-task-date-placeholder { position: absolute; inset: 0 auto 0 10px; display: flex; align-items: center; color: var(--muted); font-size: 13px; pointer-events: none; }
+}
 .calendar-task-clear { flex: 0 0 var(--control-height); justify-content: center; padding-inline: 0; }
 .calendar-task-list { padding: 0; list-style: none; border: 1px solid var(--border); border-radius: var(--control-radius); background: var(--panel); }
 .calendar-task-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 10px; }
