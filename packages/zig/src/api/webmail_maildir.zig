@@ -32,7 +32,7 @@ const html_text = @import("../antispam/html_text.zig");
 const mime_lib = @import("../message/mime.zig").lib;
 const webmail_mime = @import("webmail_mime.zig");
 const thread_ids = @import("../message/thread_ids.zig");
-const typesense = @import("../search/typesense.zig");
+const maildir_index = @import("../search/maildir_index.zig");
 const ascii_compat = @import("ascii-compat");
 const fs_compat = @import("../core/fs_compat.zig");
 const hosted_limits = @import("../storage/hosted_limits.zig");
@@ -1376,14 +1376,14 @@ fn moveFileLocked(allocator: std.mem.Allocator, db: *database.Database, user: []
     if (std.mem.eql(u8, folder, "INBOX")) return moveResolvedFileLocked(allocator, db, user, src_folder, ref, dst_folder, &.{
         try std.fmt.allocPrint(allocator, "mail/{s}/new", .{user}),
         try std.fmt.allocPrint(allocator, "mail/{s}/cur", .{user}),
-    }, effect);
+    }, effect, false);
     const dir = try std.fmt.allocPrint(allocator, "mail/{s}/{s}", .{ user, folder });
-    return moveResolvedFileLocked(allocator, db, user, src_folder, ref, dst_folder, &.{dir}, effect);
+    return moveResolvedFileLocked(allocator, db, user, src_folder, ref, dst_folder, &.{dir}, effect, false);
 }
 
 /// Move a resolved file within one mailbox under the mutation lock. The
 /// resolver supplies the collection's directories, preferred destination first.
-pub fn moveResolvedFileLocked(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, src_folder: []const u8, ref: FileRef, dst_folder: []const u8, destination_dirs: []const []const u8, effect: ?message_refs.MoveEffect) !i64 {
+pub fn moveResolvedFileLocked(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, src_folder: []const u8, ref: FileRef, dst_folder: []const u8, destination_dirs: []const []const u8, effect: ?message_refs.MoveEffect, short_root: bool) !i64 {
     if (!isSafeName(ref.name)) return MaildirError.WriteFailed;
     const source = message_refs.location(src_folder, ref.name);
     const target = message_refs.location(dst_folder, ref.name);
@@ -1414,6 +1414,7 @@ pub fn moveResolvedFileLocked(allocator: std.mem.Allocator, db: *database.Databa
     const transfer = try message_refs.stageMove(allocator, db, user, source, old_path, target, null, effect);
     if (effect != null and transfer == null) return MaildirError.Conflict;
     errdefer if (transfer) |id| message_refs.cancel(db, user, id);
+    try maildir_index.markLocked(db, user, short_root, &.{ source, target });
 
     // Prefer an atomic rename; fall back to copy+unlink across filesystems.
     if (!renamePath(old_path, new_path)) {
@@ -1435,12 +1436,6 @@ pub fn moveResolvedFileLocked(allocator: std.mem.Allocator, db: *database.Databa
 
     if (transfer) |id| message_refs.finishFile(allocator, db, user, id, target, new_path);
     message_refs.forgetReviewCopy(db, user, source) catch |err| std.log.warn("could not retire a manually moved review copy: {}", .{err});
-    if (typesense.enabled() and (effect != null or categories.isCategory(source.folder) or categories.isCategory(target.folder))) {
-        if (fs_compat.readFileAlloc(allocator, new_path)) |raw| {
-            defer allocator.free(raw);
-            typesense.indexMessageAsync(std.heap.page_allocator, user, target.folder, ref.name, raw);
-        } else |err| std.log.warn("could not read moved mail for search: {}", .{err});
-    }
     return dst_uid;
 }
 
@@ -1533,6 +1528,7 @@ pub fn deleteMessageLocked(allocator: std.mem.Allocator, db: *database.Database,
         const ref = (try findByUid(allocator, db, user, folder, uid)) orelse return MaildirError.MessageNotFound;
         if (!isSafeName(ref.name)) return MaildirError.WriteFailed;
         const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ ref.dir, ref.name });
+        try maildir_index.markLocked(db, user, false, &.{message_refs.location(folder, ref.name)});
         try unlinkPath(allocator, path); // propagate failure — don't report a phantom success
         message_refs.forget(db, user, message_refs.location(folder, ref.name)) catch |err| std.log.warn("could not retire webmail message reference: {}", .{err});
         return;

@@ -17,7 +17,8 @@ const queue_mod = @import("queue.zig");
 const outbound = @import("outbound.zig");
 const bounce_mod = @import("bounce.zig");
 const hosted_limits = @import("../storage/hosted_limits.zig");
-const typesense = @import("../search/typesense.zig");
+const maildir_index = @import("../search/maildir_index.zig");
+const message_refs = @import("../storage/message_refs.zig");
 
 const State = struct {
     allocator: std.mem.Allocator,
@@ -252,11 +253,10 @@ fn deliverBounceLocally(s: *State, from_addr: []const u8, failed_to: []const u8,
 
     std.log.info("DSN delivered to {s} for failed delivery to {s}", .{ from_addr, failed_to });
 
-    // Index the DSN for search like any other delivery
-    var base_buf: [64]u8 = undefined;
-    if (std.fmt.bufPrint(&base_buf, "{d}.{d}.eml", .{ ts, nonce })) |base| {
-        typesense.indexMessageAsync(s.allocator, mailbox, "INBOX", base, dsn);
-    } else |_| {}
+    s.db.lockMailboxes();
+    defer s.db.unlockMailboxes();
+    maildir_index.markLocked(s.db, mailbox, false, &.{message_refs.location("INBOX", std.fs.path.basename(path))}) catch |err|
+        std.log.warn("could not queue a delivery status notice for search: {}", .{err});
 }
 
 test "retry module compiles" {

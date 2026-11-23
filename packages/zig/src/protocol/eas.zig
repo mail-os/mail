@@ -921,7 +921,8 @@ fn moveMailItemLocked(a: std.mem.Allocator, ctx: *Context, user_id: i64, move: M
     const dirs = try mailboxDirs(a, ctx, mailbox);
     const generation = try ctx.db.getOrCreateMailbox(ctx.username, mailbox);
     const key = try searchKey(ctx.db, user_id, false);
-    const uid = try webmail_maildir.moveResolvedFileLocked(a, ctx.db, ctx.username, source_mailbox, file, mailbox, dirs, null);
+    const short_root = !std.mem.eql(u8, ctx.local_part, ctx.username);
+    const uid = try webmail_maildir.moveResolvedFileLocked(a, ctx.db, ctx.username, source_mailbox, file, mailbox, dirs, null, short_root);
     return formatMailItemId(buf, key, destination, uid, generation.uidvalidity, item.base);
 }
 

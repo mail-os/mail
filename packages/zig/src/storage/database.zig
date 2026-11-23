@@ -401,6 +401,26 @@ pub const Database = struct {
             \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
             \\    key BLOB NOT NULL CHECK(length(key)=32)
             \\);
+            \\CREATE TABLE IF NOT EXISTS mail_search_pending (
+            \\    id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    folder TEXT NOT NULL,
+            \\    basename TEXT NOT NULL,
+            \\    short_root INTEGER NOT NULL,
+            \\    retry_at INTEGER NOT NULL DEFAULT 0,
+            \\    UNIQUE(user_id,folder,basename)
+            \\);
+            \\CREATE TABLE IF NOT EXISTS mail_search_checkpoints (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    folder TEXT NOT NULL,
+            \\    revision INTEGER NOT NULL,
+            \\    PRIMARY KEY(user_id,folder)
+            \\);
+            \\CREATE TRIGGER IF NOT EXISTS mail_search_revision AFTER INSERT ON mail_search_pending
+            \\BEGIN
+            \\    INSERT INTO mail_search_checkpoints(user_id,folder,revision) VALUES(NEW.user_id,NEW.folder,NEW.id)
+            \\    ON CONFLICT(user_id,folder) DO UPDATE SET revision=excluded.revision;
+            \\END;
             \\CREATE TABLE IF NOT EXISTS mailbox_message_refs (
             \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             \\    reference TEXT NOT NULL,

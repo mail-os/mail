@@ -8,9 +8,7 @@
 //!
 //!   - lazily ensures the collection exists (so no separate bootstrap step
 //!     is needed on a fresh Typesense)
-//!   - keeps the index in sync as mail is delivered/appended/expunged
-//!     (best-effort, on a detached thread — search must never block or
-//!     fail mail handling)
+//!   - publishes durable Maildir updates from the delivery-effects worker
 //!   - answers IMAP SEARCH text criteria with matching message identities
 //!
 //! Enabled when TYPESENSE_API_KEY is set (host/port default to
@@ -172,77 +170,12 @@ pub fn indexRawMessage(allocator: std.mem.Allocator, username: []const u8, mailb
     try engine.upsertDocument(allocator, collection, json);
 }
 
-const IndexJob = struct {
-    allocator: std.mem.Allocator,
-    username: []u8,
-    mailbox: []u8,
-    filename: []u8,
-    content: []u8,
-
-    fn run(job: *IndexJob) void {
-        defer {
-            const a = job.allocator;
-            a.free(job.username);
-            a.free(job.mailbox);
-            a.free(job.filename);
-            a.free(job.content);
-            a.destroy(job);
-        }
-        indexRawMessage(job.allocator, job.username, job.mailbox, job.filename, job.content) catch |err| {
-            std.log.debug("typesense: index of {s}/{s} failed: {}", .{ job.username, job.filename, err });
-        };
-    }
-};
-
-/// Fire-and-forget indexing for delivery paths: copies its inputs, spawns
-/// a detached thread, and never reports failure to the caller.
-pub fn indexMessageAsync(allocator: std.mem.Allocator, username: []const u8, mailbox: []const u8, filename: []const u8, content: []const u8) void {
-    if (!enabled()) return;
-
-    const job = allocator.create(IndexJob) catch return;
-    job.* = .{
-        .allocator = allocator,
-        .username = allocator.dupe(u8, username) catch {
-            allocator.destroy(job);
-            return;
-        },
-        .mailbox = undefined,
-        .filename = undefined,
-        .content = undefined,
-    };
-    job.mailbox = allocator.dupe(u8, mailbox) catch {
-        allocator.free(job.username);
-        allocator.destroy(job);
-        return;
-    };
-    job.filename = allocator.dupe(u8, filename) catch {
-        allocator.free(job.username);
-        allocator.free(job.mailbox);
-        allocator.destroy(job);
-        return;
-    };
-    job.content = allocator.dupe(u8, content[0..@min(content.len, 256 * 1024)]) catch {
-        allocator.free(job.username);
-        allocator.free(job.mailbox);
-        allocator.free(job.filename);
-        allocator.destroy(job);
-        return;
-    };
-
-    const thread = std.Thread.spawn(.{}, IndexJob.run, .{job}) catch {
-        // Couldn't spawn: index inline (still bounded by the engine timeout)
-        IndexJob.run(job);
-        return;
-    };
-    thread.detach();
-}
-
-/// Remove a message document (e.g. on EXPUNGE). Best-effort.
-pub fn deleteMessage(allocator: std.mem.Allocator, username: []const u8, mailbox: []const u8, filename: []const u8) void {
-    const engine = loadEngine() orelse return;
+/// Delete a message document and report failures to the reconciliation worker.
+pub fn deleteIndexedMessage(allocator: std.mem.Allocator, username: []const u8, mailbox: []const u8, filename: []const u8) !void {
+    const engine = loadEngine() orelse return error.Disabled;
     var id_buf: [32]u8 = undefined;
     const id = docId(&id_buf, username, mailbox, baseName(filename));
-    engine.deleteDocument(allocator, collection, id) catch {};
+    try engine.deleteDocument(allocator, collection, id);
 }
 
 // =============================================================================

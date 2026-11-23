@@ -661,6 +661,15 @@ echo "v=DKIM1; k=rsa; p=$(openssl rsa -in /opt/mail/dkim/example.private -pubout
 
 ---
 
+## Optional IMAP search index
+
+Set `TYPESENSE_API_KEY` to enable the external index for IMAP text search.
+`TYPESENSE_HOST` defaults to `127.0.0.1` and `TYPESENSE_PORT` defaults to `8108`.
+Mail records pending index changes in its SQLite database and publishes them
+from the delivery-effects worker. During a move or an index outage, text
+searches in the affected folder and aggregate mailbox read the current Maildir.
+Pending index updates survive a Mail restart and retry when Typesense recovers.
+
 ## Configuration Files
 
 ### systemd Service with Environment File

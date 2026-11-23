@@ -148,7 +148,8 @@ pub const Typesense = struct {
         var path_buf: [384]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "/collections/{s}/documents/{s}", .{ collection, id }) catch return error.RequestFailed;
         const resp = try self.request(allocator, "DELETE", path, null);
-        resp.deinit(allocator);
+        defer resp.deinit(allocator);
+        if (!resp.ok() and resp.status != 404) return error.RequestFailed;
     }
 
     /// Run a search. The returned SearchResponse owns the parsed JSON;

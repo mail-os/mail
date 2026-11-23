@@ -15,6 +15,7 @@ const hosted = @import("../storage/hosted_limits.zig");
 const hot_reload = @import("../core/hot_reload.zig");
 const io = @import("../core/io_compat.zig");
 const logger = @import("../core/logger.zig");
+const maildir_index = @import("../search/maildir_index.zig");
 const path = @import("../core/maildir_path.zig");
 const message_refs = @import("../storage/message_refs.zig");
 const mailbox_mime = @import("../api/webmail_maildir.zig");
@@ -440,20 +441,32 @@ pub fn runRecovery(allocator: Allocator, db: *Database, shutdown: *std.atomic.Va
 }
 
 pub fn runEffects(allocator: Allocator, db: *Database, shutdown: *std.atomic.Value(bool), reload: *hot_reload.HotReloadManager, log: *logger.Logger) void {
+    const index_enabled = typesense.enabled();
+    var warn_index_at: i64 = 0;
     while (!shutdown.load(.acquire)) {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const a = arena.allocator();
+        const now = time.timestamp();
+        const indexed = index_enabled and (maildir_index.reconcileOne(a, db, now) catch |err| blk: {
+            if (now >= warn_index_at) {
+                std.log.warn("could not reconcile the mail search index: {}", .{err});
+                warn_index_at = now + 60;
+            }
+            break :blk false;
+        });
         const effect = (db.nextDeliveryEffect(a) catch |err| blk: {
             std.log.err("could not read the delivery effects queue: {}", .{err});
             break :blk null;
         }) orelse {
-            time.sleepMs(1000);
+            if (!indexed) time.sleepMs(1000);
             continue;
         };
         if (!effect.mailbox_removed) {
-            if (effect.index_pending and typesense.enabled()) indexDelivery(a, effect) catch |err| {
-                std.log.warn("could not index delivered mail: {}", .{err});
+            if (effect.index_pending and index_enabled) queueDeliveryIndex(db, effect) catch |err| {
+                std.log.warn("could not queue delivered mail for search: {}", .{err});
+                time.sleepMs(1000);
+                continue;
             };
             if (effect.notice_pending) {
                 const cfg = reload.snapshotWebhook(a) catch |err| {
@@ -477,20 +490,9 @@ pub fn runEffects(allocator: Allocator, db: *Database, shutdown: *std.atomic.Val
     }
 }
 
-fn indexDelivery(a: Allocator, effect: Database.DeliveryEffect) !void {
-    const inbox = std.mem.eql(u8, effect.folder, "new");
-    const directories: []const []const u8 = if (inbox) &.{ "new", "cur" } else &.{effect.folder};
-    for (directories) |subdir| {
-        const dir = try std.fmt.allocPrint(a, "mail/{s}/{s}", .{ effect.mailbox, subdir });
-        const names = fs.listEmlFiles(a, dir) catch |err| switch (err) {
-            error.FileNotFound => continue,
-            else => return err,
-        };
-        for (names) |name| {
-            if (!std.mem.eql(u8, db_mod.maildirBaseName(name), effect.filename)) continue;
-            const file = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, name });
-            const raw = try fs.readFileAlloc(a, file);
-            return typesense.indexRawMessage(a, effect.mailbox, if (inbox) "INBOX" else effect.folder, name, raw);
-        }
-    }
+fn queueDeliveryIndex(db: *Database, effect: Database.DeliveryEffect) !void {
+    const folder = if (std.mem.eql(u8, effect.folder, "new")) "INBOX" else effect.folder;
+    db.lockMailboxes();
+    defer db.unlockMailboxes();
+    try maildir_index.markLocked(db, effect.mailbox, false, &.{message_refs.location(folder, effect.filename)});
 }

@@ -22,6 +22,7 @@ const durable_maildir = @import("../core/durable_maildir.zig");
 const fs_compat = @import("../core/fs_compat.zig");
 const database = @import("../storage/database.zig");
 const typesense = @import("../search/typesense.zig");
+const maildir_index = @import("../search/maildir_index.zig");
 
 // std.posix.getpid is not available on this Zig version's std; libc is linked
 // (the binary links sqlite3 + libc), so declare the C symbol directly.
@@ -2146,15 +2147,6 @@ pub const ImapSession = struct {
         // how syncUids/getUidForFile key the imap_uids table).
         const uid_key = std.fs.path.basename(filepath);
 
-        // Index for full-text search (best-effort, detached thread)
-        typesense.indexMessageAsync(
-            self.allocator,
-            local_part,
-            if (std.ascii.eqlIgnoreCase(mailbox, "INBOX")) "INBOX" else mailbox,
-            uid_key,
-            data[0..size],
-        );
-
         // Use the mailbox's real UIDVALIDITY (matching SELECT/STATUS) so clients
         // don't invalidate their UID cache for the folder after an append.
         const append_canon = if (std.ascii.eqlIgnoreCase(mailbox, "All Mail") or std.ascii.eqlIgnoreCase(mailbox, "All"))
@@ -2215,6 +2207,7 @@ pub const ImapSession = struct {
         var suffix: [maildir_keywords.suffix_capacity]u8 = undefined;
         const path = try self.allocUniqueMaildirPath(dir, resolved.toSuffix(&suffix), date);
         errdefer self.allocator.free(path);
+        try maildir_index.markLocked(db, user, false, &.{message_refs.location(mailbox, std.fs.path.basename(path))});
         try durable_maildir.writeWithMtime(self.allocator, path, raw, date);
         if (std.mem.eql(u8, mailbox, "Sent") and !resolved.deleted and !resolved.draft) {
             var scratch = std.heap.ArenaAllocator.init(self.allocator);
@@ -3386,13 +3379,26 @@ pub const ImapSession = struct {
         };
 
         const count = if (self.mailbox_files) |files| files.len else 0;
+        const identity = if (count > 0 and query.text.len > 0 and typesense.enabled()) self.searchIdentity() else null;
+        const db = self.auth_backend.db;
+        const epoch: ?i64 = if (identity) |ident| maildir_index.searchEpoch(db, ident.username, ident.mailbox) catch null else null;
         const indexed = try a.alloc(?typesense.MessageIds, query.text.len);
         for (query.text, indexed) |term, *hits| {
-            hits.* = if (count > 0 and typesense.enabled()) self.searchTextIndex(term) catch null else null;
+            hits.* = if (epoch != null) self.searchTextIndex(term) catch null else null;
         }
         defer {
             for (indexed) |*hits| {
                 if (hits.*) |*set| set.deinit(self.allocator);
+            }
+        }
+        if (epoch != null) {
+            const ident = identity.?;
+            const current = maildir_index.searchEpoch(db, ident.username, ident.mailbox) catch null;
+            if (current != epoch) {
+                for (indexed) |*hits| {
+                    if (hits.*) |*set| set.deinit(self.allocator);
+                    hits.* = null;
+                }
             }
         }
 
@@ -3484,23 +3490,14 @@ pub const ImapSession = struct {
             if (!(try seen.getOrPut(idx)).found_existing) try selected.append(a, idx);
         }
 
-        const copies = self.copyMessages(a, full_username, dest_dir, selected.items) catch |err|
+        const copies = self.copyMessages(a, full_username, dest_name, dest_dir, selected.items) catch |err|
             return self.sendMaildirWriteError(tag, err);
-
-        if (typesense.enabled()) {
-            const indexed_folder = if (std.ascii.eqlIgnoreCase(dest_name, "INBOX")) "INBOX" else dest_name;
-            for (copies) |path| {
-                const content = fs_compat.readFileAlloc(self.allocator, path) catch continue;
-                defer self.allocator.free(content);
-                typesense.indexMessageAsync(self.allocator, full_username, indexed_folder, std.fs.path.basename(path), content);
-            }
-        }
 
         std.log.info("IMAP COPY: Copied {d} messages to {s}", .{ copies.len, dest_name });
         try self.sendResponse(tag, "OK", "COPY completed");
     }
 
-    fn copyMessages(self: *ImapSession, a: std.mem.Allocator, user: []const u8, dir: []const u8, indexes: []const usize) ![][]const u8 {
+    fn copyMessages(self: *ImapSession, a: std.mem.Allocator, user: []const u8, folder: []const u8, dir: []const u8, indexes: []const usize) ![][]const u8 {
         const db = self.auth_backend.db;
         db.lockMailboxes();
         defer db.unlockMailboxes();
@@ -3535,6 +3532,7 @@ pub const ImapSession = struct {
             const path = try self.allocUniqueMaildirPath(dir, flags.toSuffix(&suffix), internal_date);
             defer self.allocator.free(path);
             destination.* = try a.dupe(u8, path);
+            try maildir_index.markLocked(db, user, false, &.{message_refs.location(folder, std.fs.path.basename(path))});
             try durable_maildir.writeWithMtime(self.allocator, path, content, internal_date);
             published += 1;
         }
@@ -3599,20 +3597,10 @@ pub const ImapSession = struct {
             const idx = seq - 1;
             var scratch = std.heap.ArenaAllocator.init(self.allocator);
             defer scratch.deinit();
-            const moved = self.moveMessageOnDisk(scratch.allocator(), &names, idx, local_part, dest_name, dest_dir) catch {
+            self.moveMessageOnDisk(scratch.allocator(), &names, idx, local_part, dest_name, dest_dir) catch {
                 failed = true;
                 continue;
             };
-
-            // Search index: add the destination copy, drop the source doc
-            typesense.indexMessageAsync(
-                self.allocator,
-                local_part,
-                if (std.ascii.eqlIgnoreCase(dest_name, "INBOX")) "INBOX" else dest_name,
-                moved.destination,
-                moved.raw,
-            );
-            typesense.deleteMessage(self.allocator, local_part, self.sourceMailboxForIndex(idx), moved.source);
 
             // Send EXPUNGE notification
             var resp_buf: [32]u8 = undefined;
@@ -3628,9 +3616,7 @@ pub const ImapSession = struct {
         try self.sendResponse(tag, "OK", "MOVE completed");
     }
 
-    const MovedMessage = struct { source: []const u8, destination: []const u8, raw: []const u8 };
-
-    fn moveMessageOnDisk(self: *ImapSession, a: std.mem.Allocator, names: *MaildirNameResolver, idx: usize, user: []const u8, folder: []const u8, dir: []const u8) !MovedMessage {
+    fn moveMessageOnDisk(self: *ImapSession, a: std.mem.Allocator, names: *MaildirNameResolver, idx: usize, user: []const u8, folder: []const u8, dir: []const u8) !void {
         const db = self.auth_backend.db;
         db.lockMailboxes();
         defer db.unlockMailboxes();
@@ -3643,12 +3629,12 @@ pub const ImapSession = struct {
         flags.keywords = try maildir_keywords.transferredBits(a, std.fs.path.dirname(source_path).?, dir, flags.keywords);
         const destination_path = try self.allocUniqueMaildirPath(dir, flags.toSuffix(&suffix), internal_date);
         defer self.allocator.free(destination_path);
-        const destination = try a.dupe(u8, std.fs.path.basename(destination_path));
         const raw = try fs_compat.readFileAlloc(a, source_path);
         const source = message_refs.location(self.sourceMailboxForIndex(idx), name);
-        const target = message_refs.location(folder, destination);
+        const target = message_refs.location(folder, std.fs.path.basename(destination_path));
         const transfer = try message_refs.stage(a, db, user, source, source_path, target, raw);
         errdefer if (transfer) |id| message_refs.cancel(db, user, id);
+        try maildir_index.markLocked(db, user, false, &.{ source, target });
         if (!renameFile(source_path, destination_path)) {
             try durable_maildir.writeWithMtime(self.allocator, destination_path, raw, internal_date);
             errdefer fs_compat.cwd().deleteFile(destination_path) catch {};
@@ -3656,7 +3642,6 @@ pub const ImapSession = struct {
         }
         if (transfer) |id| message_refs.finishFile(a, db, user, id, target, destination_path);
         message_refs.forgetReviewCopy(db, user, source) catch |err| std.log.warn("could not retire an IMAP-moved review copy: {}", .{err});
-        return .{ .source = name, .destination = destination, .raw = raw };
     }
 
     /// Handle EXAMINE command — same as SELECT but read-only.
@@ -3967,11 +3952,6 @@ pub const ImapSession = struct {
         while (seq > 0) : (seq -= 1) {
             const filename = self.expungeDeleted(&names, seq - 1) orelse continue;
 
-            // Drop from the search index (best-effort)
-            if (self.searchIdentity()) |ident| {
-                typesense.deleteMessage(self.allocator, ident.username, self.sourceMailboxForIndex(seq - 1), filename);
-            }
-
             // Send untagged EXPUNGE
             var resp_buf: [32]u8 = undefined;
             var fbs = io_compat.fixedBufferStream(&resp_buf);
@@ -3996,8 +3976,13 @@ pub const ImapSession = struct {
         if (!MaildirFlags.fromFilename(filename).deleted) return null;
         const path = self.allocSelectedMessagePath(idx, filename) catch return null;
         defer self.allocator.free(path);
+        const at = message_refs.location(self.sourceMailboxForIndex(idx), filename);
+        maildir_index.markLocked(db, user, false, &.{at}) catch |err| {
+            std.log.warn("could not queue expunged mail for search: {}", .{err});
+            return null;
+        };
         fs_compat.cwd().deleteFile(path) catch return null;
-        message_refs.forget(db, user, message_refs.location(self.sourceMailboxForIndex(idx), filename)) catch |err| std.log.warn("could not retire expunged message reference: {}", .{err});
+        message_refs.forget(db, user, at) catch |err| std.log.warn("could not retire expunged message reference: {}", .{err});
         return filename;
     }
 

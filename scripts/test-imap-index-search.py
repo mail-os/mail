@@ -3,7 +3,7 @@
 
 import argparse
 import hashlib
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import runpy
@@ -17,12 +17,16 @@ MATCH_COUNT = 251
 PAGE_SIZE = 250
 
 
-class SearchIndex(HTTPServer):
+class SearchIndex(ThreadingHTTPServer):
     def __init__(self):
         super().__init__(("127.0.0.1", 0), SearchHandler)
         self.documents = []
         self.requests = []
         self.failure = None
+        self.failed_writes = set()
+        self.writes = []
+        self.pause_upsert = None
+        self.pause_search = None
 
 
 class SearchHandler(BaseHTTPRequestHandler):
@@ -31,6 +35,9 @@ class SearchHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         url = urlsplit(self.path)
+        if url.path == "/collections/messages":
+            self.send_json(200, {"name": "messages"})
+            return
         params = parse_qs(url.query, keep_blank_values=True)
         assert url.path == "/collections/messages/documents/search", self.path
         assert params["query_by"] == ["subject"], params
@@ -52,6 +59,11 @@ class SearchHandler(BaseHTTPRequestHandler):
         hits = [{"document": {"id": doc["id"]} if fields == "id" else doc}
                 for doc in matches[(page - 1) * size : page * size]]
         response = {"found": len(matches), "hits": hits, "page": page, "search_cutoff": False}
+        pause = self.server.pause_search
+        if pause is not None and condition == pause[0]:
+            self.server.pause_search = None
+            pause[1].set()
+            assert pause[2].wait(15), condition
         if page == 2:
             if self.server.failure == "unavailable":
                 self.send_error(503, "Index temporarily unavailable")
@@ -64,26 +76,57 @@ class SearchHandler(BaseHTTPRequestHandler):
                 response["found"] -= 1
             if self.server.failure == "cutoff":
                 response["search_cutoff"] = True
-        payload = json.dumps(response).encode()
-        self.send_response(200)
+        self.send_json(200, response)
+
+    def do_POST(self):
+        assert self.path == "/collections/messages/documents?action=upsert", self.path
+        doc = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.server.writes.append(("POST", doc["id"]))
+        if "POST" in self.server.failed_writes:
+            self.send_json(503, {"message": "Write unavailable"})
+            return
+        pause = self.server.pause_upsert
+        if pause is not None and doc["mailbox"] == pause[0]:
+            self.server.pause_upsert = None
+            pause[1].set()
+            assert pause[2].wait(15), doc
+        self.server.documents[:] = [old for old in self.server.documents if old["id"] != doc["id"]] + [doc]
+        self.send_json(200, doc)
+
+    def do_DELETE(self):
+        prefix = "/collections/messages/documents/"
+        assert self.path.startswith(prefix), self.path
+        document_id = self.path.removeprefix(prefix)
+        self.server.writes.append(("DELETE", document_id))
+        if "DELETE" in self.server.failed_writes:
+            self.send_json(503, {"message": "Write unavailable"})
+            return
+        present = any(doc["id"] == document_id for doc in self.server.documents)
+        self.server.documents[:] = [doc for doc in self.server.documents if doc["id"] != document_id]
+        self.send_json(200 if present else 404, {"id": document_id})
+
+    def send_json(self, status, document):
+        payload = json.dumps(document).encode()
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
 
 
-def seed_message(index, directory, username, folder, number, subject, reviewed=False):
+def seed_message(index, directory, username, folder, number, subject, reviewed=False, mailbox=None):
     filename = f"{1780000000000 + number}.eml"
     path = (directory / "mail" / username / folder).resolve(strict=True)
     suffix = ":2,a" if reviewed else ""
     (path / (filename + suffix)).write_bytes(f"Subject: {subject}\r\n\r\nTest message.\r\n".encode())
     if reviewed:
         (path.parent / "dovecot-keywords").write_text("0 Reviewed\n", encoding="ascii")
-    key = "\0".join((username, folder, filename)).encode()
+    mailbox = mailbox or folder
+    key = "\0".join((username, mailbox, filename)).encode()
     index.documents.append({
         "id": hashlib.sha256(key).hexdigest()[:32],
         "username": username,
-        "mailbox": folder,
+        "mailbox": mailbox,
         "filename": filename,
         "subject": subject,
     })
