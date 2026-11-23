@@ -969,6 +969,8 @@ fn appendMailResult(a: std.mem.Allocator, buf: *std.ArrayList(u8), comptime op: 
             error.InvalidAddress => .{ "ErrorInvalidRecipients", "Check the recipient addresses." },
             error.ItemNotFound => .{ "ErrorItemNotFound", "The message could not be found." },
             error.PartialDelivery => .{ "ErrorMessageSubmissionBlocked", "Some recipients received the message. Review delivery before retrying." },
+            error.EwsDeliveryUnconfirmed => .{ "ErrorMessageSubmissionBlocked", "The original submission may still be running or could not be confirmed. Review delivery before sending again." },
+            error.EwsSendSettingsChanged => .{ "ErrorInvalidSendItemSaveSettings", "This draft revision was already submitted with different Sent settings." },
             error.InvalidXml, error.InvalidMime => .{ "ErrorInvalidRequest", "The message or attachment is not well formed." },
             error.InvalidBase64 => .{ "ErrorInvalidPropertyValue", "Attachment content must be valid base64." },
             error.InvalidMimeBase64 => .{ "ErrorMimeContentInvalidBase64String", "MIME content must be valid base64." },
@@ -1007,7 +1009,7 @@ fn scanMail(ctx: *const Context, message: []const u8) !void {
     try clamav.requireAllowed(ctx.scanner, message);
 }
 
-fn submitMail(a: std.mem.Allocator, ctx: *Context, recipients: []const []const u8, raw: []const u8, sent_path: ?[]const u8, sent_copy: []const u8, reply: ?submission.NativeReply) !void {
+fn submitMail(a: std.mem.Allocator, ctx: *Context, recipients: []const []const u8, raw: []const u8, sent_path: ?[]const u8, sent_copy: []const u8, reply: ?submission.NativeReply, draft: ?submission.EwsDraftFile) !void {
     try submission.sendRaw(a, .{
         .hostname = ctx.hostname,
         .mail_config = ctx.mail_config,
@@ -1021,6 +1023,7 @@ fn submitMail(a: std.mem.Allocator, ctx: *Context, recipients: []const []const u
         .recipients = recipients,
         .raw = raw,
         .sent = if (sent_path) |path| .{ .path = path, .bytes = sent_copy } else null,
+        .ews_draft = draft,
         .native_reply = reply,
     });
 }
@@ -1232,7 +1235,7 @@ fn createMail(a: std.mem.Allocator, ctx: *Context, item: xml.Element, do_send: b
     const path = if (save_copy) try savedMailPath(a, ctx, target_mailbox, sub, filename) else null;
     if (do_send) {
         const raw = try message_headers.withoutBcc(a, message_data);
-        try submitMail(a, ctx, recipients, raw, path, message_data, native);
+        try submitMail(a, ctx, recipients, raw, path, message_data, native, null);
     } else if (path) |draft| {
         if (source) |parent|
             try saveReplyDraft(a, ctx, draft, message_data, parent, wire_id)
@@ -1815,14 +1818,10 @@ fn sendItem(ctx: *Context, soap: []const u8) !Response {
     return Response{ .body = try envelope(ctx.allocator, buf.items) };
 }
 
-fn draftReplySource(a: std.mem.Allocator, ctx: *Context, found: FoundMail) !?database.Database.TeamReplySource {
+fn draftReplySource(a: std.mem.Allocator, ctx: *Context, found: FoundMail, reference: []const u8) !?database.Database.TeamReplySource {
     const ids = try thread_ids.parse(a, found.content);
     const wire_id = ids.own orelse return null;
     if (ids.message_id_fields != 1 or ids.reply_fields != 1) return null;
-    const at = message_refs.location("Drafts", std.fs.path.basename(found.path));
-    const stamp = try message_refs.fileStamp(a, found.path);
-    const reference = (try message_refs.findAt(a, ctx.db, ctx.username, at, stamp)) orelse
-        (try message_refs.recoverAt(a, ctx.db, ctx.username, at, stamp, &changeKey(found.content))) orelse return null;
     const proof = (try message_refs.ewsReplyDraft(a, ctx.db, ctx.username, reference, wire_id)) orelse return null;
     const parent = try webmail_maildir.resolveVersioned(a, ctx.db, ctx.username, proof.reference);
     if (!shareableReplyParent(ctx, parent.locator.folder, parent.path)) return null;
@@ -1835,17 +1834,29 @@ fn sendSavedItem(a: std.mem.Allocator, ctx: *Context, item: xml.Element, save_co
     const id = try xmlUnescape(a, item.attribute("Id") orelse return error.InvalidXml);
     const colon = std.mem.indexOfScalar(u8, id, ':') orelse return error.ItemNotFound;
     const mailbox = ewsFolderToMailbox(id[0..colon]);
-    const found, const source = blk: {
+    const found, const draft, const source = blk: {
         ctx.db.lockMailboxes();
         defer ctx.db.unlockMailboxes();
         try requireReplyMailbox(a, ctx);
         const found = readMailFile(a, ctx, mailbox, id[colon + 1 ..]) orelse return error.ItemNotFound;
+        const revision = changeKey(found.content);
         if (item.attribute("ChangeKey")) |key| {
-            if (!std.mem.eql(u8, key, "ck0") and !std.mem.eql(u8, key, &changeKey(found.content))) return error.StaleDraft;
+            if (!std.mem.eql(u8, key, "ck0") and !std.mem.eql(u8, key, &revision)) return error.StaleDraft;
         }
-        const source = if (save_copy and std.mem.eql(u8, mailbox, "Drafts")) draftReplySource(a, ctx, found) catch null else null;
-        break :blk .{ found, source };
+        if (!std.mem.eql(u8, mailbox, "Drafts")) break :blk .{ found, null, null };
+        const identity = try message_refs.fileFingerprint(a, found.path);
+        const at = message_refs.location(mailbox, std.fs.path.basename(found.path));
+        const reference = (try message_refs.recoverAt(a, ctx.db, ctx.username, at, identity.stamp, &revision)) orelse
+            try message_refs.issue(a, ctx.db, ctx.username, at, identity.stamp);
+        const draft: submission.EwsDraftFile = .{
+            .send = .{ .reference = reference, .revision = revision, .save_copy = save_copy },
+            .path = found.path,
+            .fingerprint = identity.fingerprint,
+        };
+        const source = if (save_copy) draftReplySource(a, ctx, found, reference) catch null else null;
+        break :blk .{ found, draft, source };
     };
+    if (draft) |saved| if (try submission.replayEwsDraft(a, ctx.db, ctx.username, saved.send)) return;
     const split = headerBodySplit(found.content);
     const headers = found.content[0..split.header_end];
     var addresses: std.ArrayList([]const u8) = .empty;
@@ -1864,7 +1875,7 @@ fn sendSavedItem(a: std.mem.Allocator, ctx: *Context, item: xml.Element, save_co
         const filename = try std.fmt.allocPrint(a, "{d}.{d}.{s}.eml:2,S", .{ time_compat.timestamp(), seq, ctx.hostname });
         break :blk try savedMailPath(a, ctx, "Sent", "cur", filename);
     } else null;
-    try submitMail(a, ctx, recipients, raw, path, archive, native);
+    try submitMail(a, ctx, recipients, raw, path, archive, native, draft);
 }
 
 fn findFolder(ctx: *Context, soap: []const u8) !Response {

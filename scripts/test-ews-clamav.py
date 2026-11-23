@@ -164,13 +164,14 @@ def verify_size(test, owner, sink, limit):
     assert test.bytes(owner) == before and test.count(owner) == used
 
 
-def verify_outage(test, owner, sink, item):
+def verify_outage(test, owner, sink, item, submitted):
     before = test.bytes(owner)
     used = test.count(owner)
     check(test, owner, create("SaveOnly", message(sink)), BUSY)
     check(test, owner, create("SendAndSaveCopy", message(sink, file_xml(CLEAN))), BUSY)
     check(test, owner, attach(item, file_xml(CLEAN)), BUSY)
     check(test, owner, hosted.send_ews_items(item["Id"]), BUSY)
+    check(test, owner, hosted.send_ews_items(submitted["Id"]), "NoError")
     assert test.bytes(owner) == before and test.count(owner) == used
     return used
 
@@ -198,9 +199,10 @@ def main():
         test.env.update(SMTP_CLAMAV_TRANSPORT=f"unix:{endpoint}", SMTP_CLAMAV_FAIL_MODE="closed")
         with test.daemon():
             with clamav.scanner(scanner_dir, executable, signatures):
-                draft = verify_enabled(test, owner, sink, blind, infected)
+                submitted = verify_enabled(test, owner, sink, blind, infected)
+                draft = item_id(check(test, owner, create("SaveOnly", message(sink, bcc=blind)), "NoError"))
             endpoint.unlink(missing_ok=True)
-            used = verify_outage(test, owner, sink, draft)
+            used = verify_outage(test, owner, sink, draft, submitted)
             with clamav.scanner(scanner_dir, executable, signatures):
                 check(test, owner, attach(draft, file_xml(CLEAN, "after-outage.txt")), "NoError")
                 check(test, owner, hosted.send_ews_items(draft["Id"]), "NoError")

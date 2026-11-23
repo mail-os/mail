@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import runpy
 import secrets
+import sqlite3
 import sys
 import tempfile
 import time
@@ -377,8 +378,15 @@ def verify_ews_reply(fixture):
         send_draft(edited, "ErrorQuotaExceeded")
         assert fixture.bytes(owner) == baseline and fixture.count(owner) == count and len(visible()) == 2
         fixture.provision("ews-owner", quota=baseline + len(draft_raw))
-        send_draft(edited)
+        received = fixture.bytes(author)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(send_draft, (edited, edited)))
+        sent_bytes = fixture.bytes(owner)
+        received_bytes = fixture.bytes(author)
         assert fixture.bytes(owner) == baseline + len(draft_raw) and fixture.count(owner) == count + 1
+        assert received_bytes > received
+        received_dir = fixture.directory / "mail" / author / "new"
+        assert sum(b"Subject: Draft with EWS file" in path.read_bytes() for path in received_dir.glob("*.eml*")) == 1
         _, first, second = visible()
         assert first["sentReply"] and second["sentReply"] and second["subject"] == "Draft with EWS file"
         assert "Saved EWS reply" in second["text"] and second["attachments"] == []
@@ -388,10 +396,19 @@ def verify_ews_reply(fixture):
         assert not any(message["sentReply"] for message in visible(inbound_only))
         assert expect(fixture.api(peer, "notifications/claim", method="POST"))["teamReplies"] == 2
 
-        fixture.provision("ews-owner")
+        servers.close()
+        # Simulate a stop after committing the delivery but before recording
+        # its response. The first retry must recover the result from the journal.
+        with sqlite3.connect(fixture.directory / "smtp.db") as database:
+            written = database.execute("UPDATE mail_ews_draft_sends SET result=NULL WHERE content_revision=?", (change,))
+            assert written.rowcount == 1
+        servers.enter_context(fixture.daemon())
         send_draft(edited)
+        assert fixture.bytes(owner) == sent_bytes and fixture.bytes(author) == received_bytes
+        assert fixture.count(owner) == count + 1
         assert [message["reference"] for message in visible()] == [root["reference"], first["reference"], second["reference"]]
         assert expect(fixture.api(peer, "notifications/claim", method="POST")).get("teamReplies", 0) == 0
+        fixture.provision("ews-owner")
         continuation = ews["item_id"](create("ReplyToItem", "SendAndSaveCopy", "EWS reply to a saved sent reply",
                                              original=direct, subject="EWS conversation continuation"))
         _, continuation_raw = ews["get_mime"](fixture, owner, continuation)
@@ -480,7 +497,7 @@ def verify_smart_reply(fixture, outsider):
     expect(fixture.api(peer, outgoing), 404)
 
 
-def verify_remote_smart_reply(fixture):
+def verify_remote_client_replies(fixture):
     directory = fixture.directory
     local_domains = fixture.env["SMTP_LOCAL_DOMAINS"]
     author = "partner@remote.example.test"
@@ -505,6 +522,15 @@ assert payload["Destinations"] == ["{author}"]
 mime = base64.b64decode(payload["RawMessage"]["Data"])
 if b"Subject: Remote refused" in mime:
     sys.exit(1)
+if b"Subject: Remote EWS draft" in mime:
+    with Path("ews-attempts").open("a") as attempts:
+        attempts.write("1\\n")
+    Path("ews-remote-pending").touch()
+    for _ in range(160):
+        if Path("ews-remote-confirm").exists():
+            sys.exit(0)
+        time.sleep(.05)
+    sys.exit(2)
 assert b"Subject: Remote confirmed" in mime, mime
 Path("remote-pending").touch()
 for _ in range(160):
@@ -551,12 +577,41 @@ sys.exit(2)
         assert send_on_device("Remote refused", "refuse") == 120
         assert sent("Remote refused") == []
 
+        ews = runpy.run_path(str(SCRIPTS / "test-ews-clamav.py"))
+        sync = ('<m:SyncFolderItems><m:ItemShape><t:BaseShape>IdOnly</t:BaseShape></m:ItemShape>'
+                '<m:SyncFolderId><t:DistinguishedFolderId Id="inbox"/></m:SyncFolderId></m:SyncFolderItems>')
+        parent = ews["item_id"](ews["check"](fixture, owner, sync, "NoError"))
+        reply = ('<t:ReplyToItem><t:Subject>Remote EWS draft</t:Subject>'
+                 f'<t:ReferenceItemId Id={quoteattr(parent["Id"])} />'
+                 '<t:NewBodyContent BodyType="Text">One remote submission.</t:NewBodyContent></t:ReplyToItem>')
+        draft = ews["item_id"](ews["check"](fixture, owner, ews["create"]("SaveOnly", reply), "NoError"))
+        send_ews = hosted["send_ews_items"](draft["Id"])
+        charged = fixture.count(owner)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            confirming = pool.submit(ews["check"], fixture, owner, send_ews, "NoError")
+            try:
+                deadline = time.monotonic() + 7
+                while not (directory / "ews-remote-pending").exists() and time.monotonic() < deadline:
+                    time.sleep(.05)
+                assert (directory / "ews-remote-pending").exists()
+                ews["check"](fixture, owner, send_ews, "ErrorMessageSubmissionBlocked")
+                assert fixture.count(owner) == charged + 1 and len(sent("Remote EWS draft")) == 1
+                assert not any(msg["subject"] == "Remote EWS draft" for msg in expect(fixture.api(peer, share))["messages"])
+            finally:
+                (directory / "ews-remote-confirm").touch()
+            confirming.result(timeout=10)
+        ews["check"](fixture, owner, send_ews, "NoError")
+        assert fixture.count(owner) == charged + 1 and (directory / "ews-attempts").read_text() == "1\n"
+        assert expect(fixture.api(peer, "notifications/claim", method="POST"))["teamReplies"] == 1
+
     with fixture.daemon():
         peer = fixture.login(teammate)
         restored = expect(fixture.api(peer, share))["messages"]
-        assert {msg["subject"] for msg in restored} == {"Follow fixture native-parent", "Remote confirmed"}
+        assert {msg["subject"] for msg in restored} == {"Follow fixture native-parent", "Remote confirmed", "Remote EWS draft"}
+        ews["check"](fixture, owner, send_ews, "NoError")
+        assert fixture.count(owner) == charged + 1 and (directory / "ews-attempts").read_text() == "1\n"
         assert expect(fixture.api(peer, "notifications/claim", method="POST")).get("teamReplies", 0) == 0
-    print("Verified that remote SmartReply follows confirmation, rejects failed delivery, and preserves one preview across replay and restart.")
+    print("Verified remote SmartReply and EWS delivery confirmation, refusal, replay, and restart.")
 
 
 def verify(fixture):
@@ -733,7 +788,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix="mail-team-threads-") as directory:
         verify(Fixture(args.binary.resolve(strict=True), Path(directory), staging=True))
     with tempfile.TemporaryDirectory(prefix="mail-team-smart-remote-") as directory:
-        verify_remote_smart_reply(Fixture(args.binary.resolve(strict=True), Path(directory), staging=True))
+        verify_remote_client_replies(Fixture(args.binary.resolve(strict=True), Path(directory), staging=True))
     with tempfile.TemporaryDirectory(prefix="mail-team-ews-reply-") as directory:
         verify_ews_reply(Fixture(args.binary.resolve(strict=True), Path(directory), staging=True))
     print("Verified team conversations, followed incoming, webmail, ActiveSync, and EWS replies, live collections, previews, search, downloads, comments, notices, and revocation.")

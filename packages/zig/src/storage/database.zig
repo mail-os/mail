@@ -436,6 +436,20 @@ pub const Database = struct {
             \\WHEN OLD.reference<>NEW.reference BEGIN
             \\    DELETE FROM mail_ews_reply_drafts WHERE user_id=OLD.user_id AND (draft_reference=OLD.reference OR parent_reference=OLD.reference);
             \\END;
+            \\CREATE TABLE IF NOT EXISTS mail_ews_draft_sends (
+            \\    user_id INTEGER NOT NULL,
+            \\    draft_reference TEXT NOT NULL,
+            \\    content_revision TEXT NOT NULL CHECK(length(content_revision)=64),
+            \\    save_copy INTEGER NOT NULL,
+            \\    delivery_id TEXT NOT NULL UNIQUE,
+            \\    result TEXT,
+            \\    PRIMARY KEY(user_id,draft_reference,content_revision),
+            \\    FOREIGN KEY(user_id,draft_reference) REFERENCES mailbox_message_refs(user_id,reference) ON DELETE CASCADE ON UPDATE CASCADE
+            \\);
+            \\CREATE TRIGGER IF NOT EXISTS mail_ews_draft_send_replaced_ref BEFORE UPDATE OF reference ON mailbox_message_refs
+            \\WHEN OLD.reference<>NEW.reference BEGIN
+            \\    DELETE FROM mail_ews_draft_sends WHERE user_id=OLD.user_id AND draft_reference=OLD.reference;
+            \\END;
             \\CREATE TABLE IF NOT EXISTS mail_retention_rules (
             \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
             \\    folder TEXT,
@@ -1799,6 +1813,45 @@ pub const Database = struct {
         wire_id: []const u8,
     };
 
+    pub const EwsDraftSend = struct {
+        reference: []const u8,
+        revision: [64]u8,
+        save_copy: bool,
+    };
+
+    pub const EwsSendResult = enum { delivered, partial, storage_full, disabled, failed, uncertain };
+
+    pub const EwsSendReceipt = struct {
+        delivery_id: []const u8,
+        save_copy: bool,
+        result: ?EwsSendResult,
+    };
+
+    pub fn ewsSendReceipt(self: *Database, a: std.mem.Allocator, user: []const u8, draft: EwsDraftSend) !?EwsSendReceipt {
+        const stmt = try self.prepare(
+            \\SELECT delivery_id,save_copy,result FROM mail_ews_draft_sends
+            \\WHERE user_id=(SELECT id FROM users WHERE username=?1) AND draft_reference=?2 AND content_revision=?3
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
+        try stmt.bind(2, draft.reference);
+        try stmt.bind(3, @as([]const u8, &draft.revision));
+        if (!try stmt.step()) return null;
+        return .{
+            .delivery_id = try a.dupe(u8, stmt.columnText(0)),
+            .save_copy = stmt.columnInt64(1) != 0,
+            .result = if (stmt.columnIsNull(2)) null else std.meta.stringToEnum(EwsSendResult, stmt.columnText(2)) orelse .uncertain,
+        };
+    }
+
+    pub fn finishEwsDraftSend(self: *Database, id: []const u8, result: EwsSendResult) !void {
+        const stmt = try self.prepare("UPDATE mail_ews_draft_sends SET result=?2 WHERE delivery_id=?1 AND result IS NULL");
+        defer stmt.finalize();
+        try stmt.bind(1, id);
+        try stmt.bind(2, @tagName(result));
+        _ = try stmt.step();
+    }
+
     pub const DeliveryEnvelope = struct {
         id: []const u8,
         from: []const u8,
@@ -1817,6 +1870,7 @@ pub const Database = struct {
         calendar_reply: ?calendar_invite.Revision = null,
         charge_recipients: usize = 0,
         receipt: ?ActiveSyncReceipt = null,
+        ews_draft_send: ?EwsDraftSend = null,
         review_release: ?FiledCopy = null,
         team_reply_submission: ?TeamReplySource = null,
         sent_copy_of: ?[]const u8 = null,
@@ -1874,6 +1928,20 @@ pub const Database = struct {
             try insert.bind(7, envelope.notification_origin);
             try insert.bind(8, envelope.accepted_ms);
             _ = try insert.step();
+        }
+        if (envelope.ews_draft_send) |draft| {
+            const stmt = try self.prepareLocked(
+                \\INSERT INTO mail_ews_draft_sends(user_id,draft_reference,content_revision,save_copy,delivery_id)
+                \\SELECT id,?2,?3,?4,?5 FROM users WHERE username=?1 AND enabled=1 RETURNING 1
+            );
+            defer stmt.finalize();
+            try stmt.bind(1, envelope.sender orelse return error.InvalidMailboxPath);
+            try stmt.bind(2, draft.reference);
+            try stmt.bind(3, @as([]const u8, &draft.revision));
+            try stmt.bind(4, @as(u8, @intFromBool(draft.save_copy)));
+            try stmt.bind(5, envelope.id);
+            if (!try stmt.step()) return error.HostedSenderDisabled;
+            _ = try stmt.step();
         }
         if (envelope.team_reply_submission) |parent| {
             const stmt = try self.prepareLocked(
@@ -2045,7 +2113,9 @@ pub const Database = struct {
         delivered: usize = 0,
         failed: []const []const u8 = &.{},
         unknown: []const []const u8 = &.{},
+        unattempted: bool = false,
         refused_for_limit: bool = false,
+        refused_for_disabled: bool = false,
     };
 
     /// Inspect only the original envelope, excluding forwards and vacation replies.
@@ -2068,6 +2138,8 @@ pub const Database = struct {
                 try unknown.append(a, try a.dupe(u8, stmt.columnText(0)));
             } else {
                 try failed.append(a, try a.dupe(u8, stmt.columnText(0)));
+                result.unattempted = result.unattempted or std.mem.eql(u8, outcome, "remote_unattempted");
+                result.refused_for_disabled = result.refused_for_disabled or std.mem.eql(u8, outcome, "recipient_disabled");
                 result.refused_for_limit = result.refused_for_limit or std.mem.eql(u8, outcome, "recipient_storage_full") or std.mem.eql(u8, outcome, "recipient_disabled");
             }
             if (!try stmt.step()) break;

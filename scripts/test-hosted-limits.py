@@ -650,9 +650,12 @@ def check_ews(test, sink):
     test.provision("ews", daily=4)
     assert ews_codes(test.ews(sender, send_ews_items(draft, save=False))) == ["NoError"]
     assert test.count(sender) == 4 and test.bytes(sender) == before[0]
-    test.provision("ews", quota=before[0], daily=6)
+    assert ews_codes(test.ews(sender, send_ews_items(draft, save=False))) == ["NoError"]
+    assert ews_codes(test.ews(sender, send_ews_items(draft))) == ["ErrorInvalidSendItemSaveSettings"]
+    quota_draft = ews_draft(test, sender, sink, bcc=[blind])
+    test.provision("ews", quota=test.bytes(sender), daily=6)
     other_before = (test.bytes(sink), test.bytes(blind))
-    assert ews_codes(test.ews(sender, send_ews_items(draft))) == ["ErrorQuotaExceeded"]
+    assert ews_codes(test.ews(sender, send_ews_items(quota_draft))) == ["ErrorQuotaExceeded"]
     assert test.count(sender) == 4 and other_before == (test.bytes(sink), test.bytes(blind))
 
     # A quota refusal for the requested Sent copy must not deliver or spend

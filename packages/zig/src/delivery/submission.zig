@@ -108,6 +108,12 @@ pub const SentCopy = struct {
     bytes: []const u8,
 };
 
+pub const EwsDraftFile = struct {
+    send: database.Database.EwsDraftSend,
+    path: []const u8,
+    fingerprint: []const u8,
+};
+
 const RawSubmission = struct {
     mailbox: []const u8,
     from: []const u8,
@@ -115,6 +121,7 @@ const RawSubmission = struct {
     raw: []const u8,
     sent: ?SentCopy = null,
     receipt: ?database.Database.ActiveSyncReceipt = null,
+    ews_draft: ?EwsDraftFile = null,
     native_reply: ?NativeReply = null,
 };
 
@@ -164,6 +171,7 @@ pub const DispatchOptions = struct {
     sent: ?SentCopy = null,
     interactive_id: ?[]const u8 = null,
     receipt: ?database.Database.ActiveSyncReceipt = null,
+    ews_draft: ?EwsDraftFile = null,
     account_notice: bool = false,
     recipient_id: ?i64 = null,
     team_reply_submission: ?database.Database.TeamReplySource = null,
@@ -279,6 +287,11 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
     defer db.unlockMailboxes();
     const now = time_compat.timestamp();
     if (options.sender) |sender| {
+        if (options.ews_draft) |draft| {
+            if (try db.ewsSendReceipt(a, sender, draft.send) != null) return error.EwsDraftAlreadyAccepted;
+            const file = message_refs.fileFingerprint(a, draft.path) catch return error.StaleDraft;
+            if (!std.mem.eql(u8, file.fingerprint, draft.fingerprint)) return error.StaleDraft;
+        }
         if (options.receipt) |receipt| {
             if (try db.activeSyncAccepted(sender, receipt, now)) return error.MessagePreviouslySent;
         }
@@ -365,13 +378,48 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
         .calendar_reply = options.calendar_reply,
         .charge_recipients = recipients.len,
         .receipt = options.receipt,
+        .ews_draft_send = if (options.ews_draft) |draft| draft.send else null,
         .team_reply_submission = options.team_reply_submission,
         .native_sent_reply = native_sent_reply,
     });
 }
 
+fn ewsSendResult(result: database.Database.EwsSendResult) !void {
+    return switch (result) {
+        .delivered => {},
+        .partial => error.PartialDelivery,
+        .storage_full => error.HostedStorageFull,
+        .disabled => error.HostedRecipientDisabled,
+        .failed, .uncertain => error.EwsDeliveryUnconfirmed,
+    };
+}
+
+/// An admitted draft has an authoritative delivery journal. A lost response
+/// can be recovered from it without dispatching or charging the envelope again.
+pub fn replayEwsDraft(a: std.mem.Allocator, db: *database.Database, user: []const u8, draft: database.Database.EwsDraftSend) !bool {
+    const receipt = (try db.ewsSendReceipt(a, user, draft)) orelse return false;
+    if (receipt.save_copy != draft.save_copy) return error.EwsSendSettingsChanged;
+    if (receipt.result) |result| {
+        try ewsSendResult(result);
+        return true;
+    }
+    const recovery = (try db.interactiveDelivery(a, receipt.delivery_id)) orelse return error.EwsDeliveryUnconfirmed;
+    if (recovery.unknown.len != 0 or recovery.unattempted) return error.EwsDeliveryUnconfirmed;
+    const result: database.Database.EwsSendResult = if (recovery.delivered != 0)
+        (if (recovery.failed.len == 0) .delivered else .partial)
+    else if (recovery.refused_for_disabled)
+        .disabled
+    else if (recovery.refused_for_limit)
+        .storage_full
+    else
+        .failed;
+    try db.finishEwsDraftSend(receipt.delivery_id, result);
+    try ewsSendResult(result);
+    return true;
+}
+
 pub fn sendRaw(a: std.mem.Allocator, cfg: Delivery, message: RawSubmission) !void {
-    if (cfg.db == null) return error.DatabaseUnavailable;
+    const db = cfg.db orelse return error.DatabaseUnavailable;
     // Eligibility stays tied to the approved MIME, including absence of a
     // blind envelope, and to the requested Sent copy.
     const native = if (message.native_reply) |reply| candidate: {
@@ -379,18 +427,36 @@ pub fn sendRaw(a: std.mem.Allocator, cfg: Delivery, message: RawSubmission) !voi
         if (!std.mem.eql(u8, copy.bytes, reply.archive) or !std.mem.eql(u8, message.raw, reply.archive)) break :candidate null;
         break :candidate reply;
     } else null;
-    const delivery_id = if (native != null) routing.newId() else undefined;
-    const result = try dispatch(a, cfg, message.from, message.recipients, message.raw, .{
+    const journaled = native != null or message.ews_draft != null;
+    const delivery_id = if (journaled) routing.newId() else undefined;
+    const result = dispatch(a, cfg, message.from, message.recipients, message.raw, .{
         .sender = message.mailbox,
         .sent = message.sent,
         .receipt = message.receipt,
-        .interactive_id = if (native != null) &delivery_id else null,
+        .ews_draft = message.ews_draft,
+        .interactive_id = if (journaled) &delivery_id else null,
         .team_reply_submission = if (native) |reply| reply.source else null,
         .native_reply_wire_id = if (native) |reply| reply.wire_id else null,
-    });
+    }) catch |err| {
+        if (err == error.EwsDraftAlreadyAccepted and try replayEwsDraft(a, db, message.mailbox, message.ews_draft.?.send)) return;
+        return err;
+    };
     defer a.free(result.failed);
     if (result.delivered == 0) {
         if (message.sent) |copy| fs_compat.cwd().deleteFile(copy.path) catch {};
+    }
+    if (message.ews_draft != null) {
+        const outcome: database.Database.EwsSendResult = if (result.delivered != 0)
+            (if (result.failed.len == 0) .delivered else .partial)
+        else if (result.first_error) |err| switch (err) {
+            error.HostedStorageFull => .storage_full,
+            error.HostedRecipientDisabled => .disabled,
+            else => .failed,
+        } else .failed;
+        try db.finishEwsDraftSend(&delivery_id, outcome);
+        return ewsSendResult(outcome);
+    }
+    if (result.delivered == 0) {
         return result.first_error orelse error.NoRecipients;
     }
     if (result.failed.len > 0) return error.PartialDelivery;
