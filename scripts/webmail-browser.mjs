@@ -110,17 +110,16 @@ async function verifyControlRow(container, selector, height, sameRow = true) {
     const box = node.getBoundingClientRect()
     const borderChannels = style.getPropertyValue('--control-border').trim().slice(1).match(/../g)
     const border = `rgb(${borderChannels.map(channel => Number.parseInt(channel, 16)).join(', ')})`
-    const primary = node.matches('.calendar-primary, .wm-snapshot-primary, .wm-send-btn')
-    const quiet = node.matches('.wm-list-toggle, .wm-action--quiet, .wm-composer-foot > .wm-action:not(.wm-snapshot-primary), .mail-auth-page button:not(.login-secondary)')
-    const neutral = !quiet && (!primary || node.matches(':disabled'))
+    const quiet = node.matches('.wm-list-toggle, .wm-action--quiet, .wm-composer-foot > .wm-action:not(.wm-snapshot-primary)')
     return {
-      name: node.getAttribute('aria-label') || node.querySelector('input[aria-label]')?.getAttribute('aria-label') || node.id || node.tagName,
+      name: node.getAttribute('aria-label') || node.querySelector('input[aria-label]')?.getAttribute('aria-label') || node.id
+        || (node.tagName === 'BUTTON' ? node.textContent.trim() : node.tagName),
       height: box.height,
       top: box.top,
       bottom: box.bottom,
       left: box.left,
       right: box.right,
-      neutral,
+      neutral: !quiet,
       borderMatches: style.border === `1px solid ${border}`,
       opacity: style.opacity,
       radius: style.borderRadius,
@@ -412,9 +411,11 @@ async function verifyReaderToolbar(toolbar, height) {
 }
 
 async function verifyComposerControls(composer, height) {
-  const controls = await verifyControlRow(composer.locator('.wm-composer-foot'), 'button, select', height, height === 36)
+  const footer = composer.locator('.wm-composer-foot')
+  const controls = await verifyControlRow(footer, 'button, select', height, height === 36)
   assert.equal(controls.length, 5)
   assert(controls.every(control => control.fontSize === controls[0].fontSize), 'Composer actions and the Undo Send picker share a text size')
+  await verifyPaintedControlBorders(footer, 'button, select', controls, height === 36 ? 'desktop-compose-controls' : 'narrow-phone-compose-controls')
   for (const row of await composer.locator('.wm-recipient-field').all()) {
     assert((await row.boundingBox()).height >= height + 0.5, 'Composer fields reserve a full control height above their divider')
   }
@@ -591,7 +592,9 @@ async function signIn({ phone = false, account = owner, initialSubject = handoff
   observePage(page)
   await page.goto(url + '/login')
   await heading(page, 'Sign in to Mail').waitFor()
-  await verifyControlRow(page.locator('.mail-auth-page form'), 'input, button', 44, false)
+  const form = page.locator('.mail-auth-page form')
+  const authControls = await verifyControlRow(form, 'input, button', 44, false)
+  await verifyPaintedControlBorders(form, 'input, button', authControls, phone ? 'phone-sign-in-controls' : 'desktop-sign-in-controls')
   await screenshot(page, phone ? 'phone-sign-in' : 'desktop-sign-in')
   await page.getByLabel('Email or username').fill(account)
   await page.getByLabel('Password', { exact: true }).fill(password)
@@ -1896,6 +1899,10 @@ async function calendarSharingJourney(captain) {
   const darkShareControls = await verifyControlRow(shareForm, 'select, input, button', 36)
   verifyControlGaps(darkShareControls, 12)
   await verifyPaintedControlBorders(shareForm, 'select, input, button', darkShareControls, 'desktop-calendar-sharing-dark')
+  await button(shareForm, 'Share calendar').hover()
+  const hoveredShareControls = await verifyControlRow(shareForm, 'select, input, button', 36)
+  await verifyPaintedControlBorders(shareForm, 'select, input, button', hoveredShareControls, 'desktop-calendar-sharing-hover-dark')
+  await heading(captain, 'Share a calendar').hover()
   await screenshot(captain, 'desktop-calendar-selects-dark')
   await captain.setViewportSize({ width: 861, height: 940 })
   await fitsViewport(captain)
