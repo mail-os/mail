@@ -163,11 +163,18 @@ def verify_delivery(fixture, sender):
     query = urlencode({"folder": "INBOX", "conversations": "false", "q": reply_subject})
     status, listing = fixture.api(session, "messages?" + query)
     assert status == 200, listing
-    row, = [row for row in listing["items"] if row["subject"] == reply_subject]
-    status, detail = fixture.api(session, "messages/ref/" + row["reference"])
-    assert status == 200 and detail["in_reply_to"] == "<browser-fixture-3@hosted.example.test>", detail
-    assert "Please use the updated billing contact" in detail["text"]
-    assert "> Your November payment of $18.00 was received." in detail["text"]
+    replies = []
+    for row in listing["items"]:
+        if row["subject"] != reply_subject:
+            continue
+        status, detail = fixture.api(session, "messages/ref/" + row["reference"])
+        assert status == 200 and detail["in_reply_to"] == "<browser-fixture-3@hosted.example.test>", detail
+        replies.append(detail["text"])
+    assert len(replies) == 2, replies
+    billing, = [text for text in replies if "Please use the updated billing contact" in text]
+    reviewed, = [text for text in replies if "I checked the studio receipt before sending." in text]
+    assert "> Your November payment of $18.00 was received." in billing
+    assert billing != reviewed
     for label, response in (("Accepted", "ACCEPTED"), ("Tentative", "TENTATIVE")):
         subject = f"{label}: Studio reservation"
         status, listing = fixture.api(session, "messages?" + urlencode({"folder": "INBOX", "q": subject}))
