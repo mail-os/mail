@@ -197,8 +197,11 @@ pub const Pop3Session = struct {
             return;
         }
 
-        // Validate credentials against auth backend
-        const valid = self.auth_backend.verifyCredentials(self.username.?, password) catch |err| {
+        const requested = self.username.?;
+        const claimed = try self.auth_backend.canonicalUsername(requested, self.allocator);
+        var owns_claim = true;
+        defer if (owns_claim) self.allocator.free(claimed);
+        const valid = self.auth_backend.verifyCredentials(claimed, password) catch |err| {
             std.log.err("POP3 authentication error: {}", .{err});
             // Clear USER/PASS so the client must re-send both per RFC 1939.
             self.clearCredentials();
@@ -215,7 +218,10 @@ pub const Pop3Session = struct {
             return;
         }
 
-        std.log.info("Successful POP3 login for user: {s}", .{self.username.?});
+        self.allocator.free(requested);
+        self.username = claimed;
+        owns_claim = false;
+        std.log.info("Successful POP3 login for user: {s}", .{claimed});
 
         // Lock maildrop and load messages
         self.lockMaildrop() catch |err| {
@@ -573,29 +579,19 @@ pub const Pop3Session = struct {
     }
 
     /// Load messages from the authenticated user's real maildir.
-    /// Scans both `mail/{local}/new` and `mail/{local}/cur` (Maildir layout),
+    /// Scans both slots of the authenticated account's Maildir root,
     /// recording each message's full path, on-disk size, and a stable UID
     /// (the maildir filename).
     fn loadMessages(self: *Pop3Session) !void {
         const username = self.username orelse return;
 
-        // Extract local part from the email address (chris@stacksjs.com -> chris).
-        const local_part = if (std.mem.indexOfScalar(u8, username, '@')) |at_pos|
-            username[0..at_pos]
-        else
-            username;
-
-        try self.loadMessagesFromDir(local_part, "new");
-        try self.loadMessagesFromDir(local_part, "cur");
-
-        // Fallback to the legacy global mail/new if the user has no per-user dir.
-        if (self.messages.items.len == 0) {
-            try self.loadMessagesFromAbsoluteDir("mail/new");
-        }
+        try @import("../core/maildir_path.zig").validate(username);
+        try self.loadMessagesFromDir(username, "new");
+        try self.loadMessagesFromDir(username, "cur");
     }
 
-    fn loadMessagesFromDir(self: *Pop3Session, local_part: []const u8, sub: []const u8) !void {
-        const dir_path = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ local_part, sub });
+    fn loadMessagesFromDir(self: *Pop3Session, username: []const u8, sub: []const u8) !void {
+        const dir_path = try std.fmt.allocPrint(self.allocator, "mail/{s}/{s}", .{ username, sub });
         defer self.allocator.free(dir_path);
         try self.loadMessagesFromAbsoluteDir(dir_path);
     }

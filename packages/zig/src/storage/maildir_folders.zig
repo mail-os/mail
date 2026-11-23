@@ -29,6 +29,15 @@ pub fn storedName(a: std.mem.Allocator, io: std.Io, root: Dir, name: []const u8)
 
 pub fn open(io: std.Io, parent: Dir, path: []const u8) !?Dir {
     return parent.openDir(io, path, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir, error.SymLinkLoop => null,
+        else => return err,
+    };
+}
+
+/// The operator can link the entire spool to a managed volume. Account and
+/// folder directories below this anchor still use open() without following links.
+pub fn openRoot(io: std.Io) !?Dir {
+    return Dir.cwd().openDir(io, "mail", .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => null,
         else => return err,
     };

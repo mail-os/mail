@@ -143,8 +143,8 @@ class MailClient:
                 return response.status, response.headers, response.read()
 
     def eas(self, mailbox, body, *, command="SendMail", device="QuotaDevice", legacy=False,
-            save=False, encoded=False, source=None, version=None, timeout=10):
-        name = mailbox.split("@")[0]
+            save=False, encoded=False, source=None, version=None, timeout=10, full_login=False):
+        name = mailbox if full_login else mailbox.split("@")[0]
         token = base64.b64encode(f"{name}:{self.password}".encode()).decode()
         headers = {"Authorization": f"Basic {token}",
                    "Content-Type": "message/rfc822" if legacy else "application/vnd.ms-sync.wbxml"}

@@ -2005,11 +2005,10 @@ fn httpBody(request: []const u8) []const u8 {
 fn webEws(allocator: std.mem.Allocator, config: *const CalDavConfig, username: ?[]const u8, store: *caldav_store.CalDavStore, db: *database.Database, request: []const u8) !WebResponse {
     const user = username orelse return error.Unauthenticated;
     const managed = (try db.hostedLimits(user)) != null;
-    const legacy_key = if (std.mem.indexOfScalar(u8, user, '@')) |i| user[0..i] else user;
     var ctx = ews.Context{
         .allocator = allocator,
         .username = user,
-        .local_part = if (managed) user else legacy_key,
+        .local_part = user,
         .hosted = managed,
         .hostname = config.public_hostname,
         .db = db,
@@ -2056,7 +2055,6 @@ fn webActiveSync(allocator: std.mem.Allocator, config: *const CalDavConfig, db: 
     } else decodeActiveSyncQuery(query, &binary_query) catch |err|
         return .{ .status = if (err == error.UnsupportedCommand) 501 else 400 };
     const managed = (try db.hostedLimits(user)) != null;
-    const legacy_key = if (std.mem.indexOfScalar(u8, user, '@')) |i| user[0..i] else user;
     const content_type = requestHeader(request, "Content-Type") orelse "";
     const semi = std.mem.indexOfScalar(u8, content_type, ';') orelse content_type.len;
     const mime = std.ascii.eqlIgnoreCase(std.mem.trim(u8, content_type[0..semi], " \t"), "message/rfc822");
@@ -2065,7 +2063,7 @@ fn webActiveSync(allocator: std.mem.Allocator, config: *const CalDavConfig, db: 
         .db = db,
         .store = store,
         .username = user,
-        .local_part = if (managed) user else legacy_key,
+        .local_part = user,
         .device_id = params.device_id,
         .protocol_version = params.version,
         .hosted = managed,

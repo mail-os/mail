@@ -184,7 +184,7 @@ def protect_managed_drafts(test, owner):
     print("Verified that native drafts can move and webmail-managed drafts keep their file and composer record together.")
 
 
-def exercise_legacy_layout(test):
+def seed_legacy_layout(test):
     user = "legacy"
     mailbox = f"{user}@{hosted['DOMAIN']}"
     subprocess.run([str(test.binary), "user:local", "create", mailbox, "--password-stdin"],
@@ -195,14 +195,18 @@ def exercise_legacy_layout(test):
     source.parent.mkdir(parents=True, exist_ok=True)
     raw = message("Older local mailbox layout")
     source.write_bytes(raw)
+    return mailbox, source, raw
+
+
+def exercise_legacy_layout(test, mailbox, source, raw):
     _, listing = snapshot(test, mailbox, "2")
     item, = ids(listing)
     (code, target), = response(test, mailbox, (item, "2", "4"))
     assert code == 3 and not source.exists()
-    assert (legacy / "Trash" / source.name).read_bytes() == raw
-    assert not (test.directory / "mail" / mailbox / "Trash" / source.name).exists()
+    assert (test.directory / "mail" / mailbox / "Trash" / source.name).read_bytes() == raw
+    assert not (test.directory / "mail" / mailbox / "Drafts" / source.name).exists()
     assert ids(snapshot(test, mailbox, "4")[1]) == [target]
-    print("Verified moves in the legacy short-name Maildir and its nested source folders.")
+    print("Verified moves from a migrated short-name Maildir and its nested source folders.")
 
 
 def upgrade(candidate, previous):
@@ -233,6 +237,7 @@ def main():
     candidate = args.binary.resolve()
     with tempfile.TemporaryDirectory(prefix="mail-eas-move-", dir="/tmp") as directory:
         test = Fixture(candidate, Path(directory), staging=True)
+        legacy = seed_legacy_layout(test)
         with test.daemon():
             owner = test.provision("owner")
             peer = test.provision("peer")
@@ -241,7 +246,7 @@ def main():
         with test.daemon():
             exercise_restart_and_race(test, owner, size, target, stale)
             protect_managed_drafts(test, owner)
-            exercise_legacy_layout(test)
+            exercise_legacy_layout(test, *legacy)
     if args.upgrade_from:
         upgrade(candidate, args.upgrade_from.resolve())
 

@@ -244,6 +244,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     // Recover published copies before clients can move or delete them.
     try @import("storage/folder_edits.zig").recover(allocator, &db);
     try local_routing.recover(allocator, &db);
+    try @import("storage/maildir_upgrade.zig").recover(allocator, &db);
     try delivery_retry.start(allocator, &db, cfg.hostname, cfg.extra_local_domains, cfg.delivery_method, cfg.ses_region);
     defer delivery_retry.stop();
     var stop_routing: std.atomic.Value(bool) = .init(false);

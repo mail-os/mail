@@ -17,6 +17,7 @@ const webmail_store = @import("../api/webmail_store.zig");
 const snapshots = @import("../api/webmail_snapshots.zig");
 const message_refs = @import("../storage/message_refs.zig");
 const maildir_folders = @import("../storage/maildir_folders.zig");
+const maildir_upgrade = @import("../storage/maildir_upgrade.zig");
 const folder_edits = @import("../storage/folder_edits.zig");
 const thread_ids = @import("../message/thread_ids.zig");
 const fs_compat = @import("../core/fs_compat.zig");
@@ -51,7 +52,7 @@ pub const Context = struct {
     store: *caldav_store.CalDavStore,
     /// Login identity (full email address).
     username: []const u8,
-    /// Maildir key. Hosted accounts use their canonical full address.
+    /// Maildir key. Network sessions use the canonical account name.
     local_part: []const u8,
     /// Device identifier from the query string (sync state is keyed on it).
     device_id: []const u8,
@@ -149,7 +150,8 @@ fn mailboxFolders(a: std.mem.Allocator, ctx: *Context, user_id: i64) ![]const Fo
         };
         if (key == null) key = try mailboxKey(ctx.db, user_id);
         const name = try a.dupe(u8, entry.name);
-        try folders.append(a, try customFolder(a, key.?, name, stamp));
+        const identity = try maildir_upgrade.previousFolderStamp(a, ctx.db, user_id, stamp);
+        try folders.append(a, try customFolder(a, key.?, name, identity));
     }
     std.mem.sort(FolderDef, folders.items[FOLDERS.len..], {}, struct {
         fn lessThan(_: void, lhs: FolderDef, rhs: FolderDef) bool {

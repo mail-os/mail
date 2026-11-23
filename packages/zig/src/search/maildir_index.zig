@@ -148,7 +148,7 @@ fn snapshot(a: Allocator, db: *Database, row: Pending) !?[]const u8 {
     if (row.basename.len == 0 or std.mem.indexOfAny(u8, row.basename, "/\x00") != null or
         std.mem.eql(u8, row.basename, ".") or std.mem.eql(u8, row.basename, "..")) return error.InvalidMaildirPath;
     const io = io_compat.getIo();
-    const mail = (try folders.open(io, .cwd(), "mail")) orelse return null;
+    const mail = (try folders.openRoot(io)) orelse return null;
     defer mail.close(io);
     const mailbox = (try folders.open(io, mail, root)) orelse return null;
     defer mailbox.close(io);

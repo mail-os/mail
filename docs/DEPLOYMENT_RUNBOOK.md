@@ -62,6 +62,12 @@ sudo -u mail-server env SMTP_DB_PATH=/var/lib/mail/smtp.db \
 
 The report carries the observation time and an `audit_id`. Each successful report records `hosted.status` in `audit_log` with the effective operator UID and mailbox. The output is restricted to the mailbox identifier, operational state, and aggregate counters. Maildir and reservation counts may change while the daemon is delivering mail.
 
+## Local mailbox directory upgrade
+
+Back up the Maildir and SQLite database together before upgrading a server with older ActiveSync clients. On startup, the server checks for full-address local accounts that still have mail under a short directory name such as `mail/alice`. It moves eligible messages to `mail/alice@example.com` before opening the protocol listeners. It also moves messages in a canonical custom folder's nested slots into the folder path exposed by IMAP and webmail. ActiveSync, IMAP, webmail, and EWS then read from the canonical mailbox. The upgrade retains existing message flags and client identifiers when it can reconcile both directories.
+
+The startup log records the affected mailbox and any residual archive under `mail/.relocated-maildir-*`. If the short name has multiple owners, a folder layout conflicts, or a message filename already exists at the destination, both roots stay on disk and clients use the canonical root. Review the warning and establish ownership and file identity from the backup before resolving the conflict. When rolling back to a version that reads short-name directories, restore the matching pre-upgrade database and Maildir snapshot together.
+
 ---
 
 ## Table of Contents

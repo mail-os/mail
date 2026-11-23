@@ -320,10 +320,10 @@ pub fn ensureDir(path: []const u8) !void {
 }
 
 /// List .eml files in a directory, returning filenames sorted by timestamp (oldest first).
-/// Files with epoch-millis filenames sort by their timestamp; non-timestamp files sort first (key=0)
-/// with alphabetical tiebreaker. This ensures new files always appear at the end, preserving
-/// IMAP UID stability (UIDs are 1-based indices into this sorted list).
-/// Caller owns the returned slice and each filename string (allocated with `allocator`).
+pub fn isEmlFilename(name: []const u8) bool {
+    return name.len > 4 and (std.mem.endsWith(u8, name, ".eml") or std.mem.indexOf(u8, name, ".eml:") != null);
+}
+
 /// Count `.eml` entries in a directory without allocating or sorting.
 /// Cheap change-detection probe for IDLE polling: if the count is unchanged
 /// since the last poll, the full listEmlFiles + UID sync can be skipped.
@@ -339,13 +339,13 @@ pub fn countEmlFiles(dir_path: []const u8) usize {
     while (std.c.readdir(dir)) |entry| {
         const name_ptr: [*:0]const u8 = @ptrCast(&entry.name);
         const name = std.mem.sliceTo(name_ptr, 0);
-        if (name.len > 4 and (std.mem.endsWith(u8, name, ".eml") or std.mem.indexOf(u8, name, ".eml:") != null)) {
-            count += 1;
-        }
+        if (isEmlFilename(name)) count += 1;
     }
     return count;
 }
 
+/// Orders messages by filename timestamp, then by name. The caller owns the
+/// returned slice and each filename string.
 pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]const u8 {
     const path_z = toZ(dir_path) orelse return error.SystemResources;
     defer freeZ(path_z, dir_path.len);
@@ -363,7 +363,7 @@ pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]con
     while (std.c.readdir(dir)) |entry| {
         const name_ptr: [*:0]const u8 = @ptrCast(&entry.name);
         const name = std.mem.sliceTo(name_ptr, 0);
-        if (name.len > 4 and (std.mem.endsWith(u8, name, ".eml") or std.mem.indexOf(u8, name, ".eml:") != null)) {
+        if (isEmlFilename(name)) {
             // Skip symlinks: these names are later fed to rename/unlink, and a
             // symlink could redirect those operations outside the mailbox.
             const full = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ dir_path, name }, 0) catch continue;

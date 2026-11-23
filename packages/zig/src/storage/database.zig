@@ -1067,6 +1067,12 @@ pub const Database = struct {
             \\    INSERT INTO imap_mailbox_generations VALUES(OLD.username,OLD.mailbox,OLD.uidvalidity)
             \\    ON CONFLICT(username,mailbox) DO UPDATE SET uidvalidity=MAX(uidvalidity,excluded.uidvalidity);
             \\END;
+            \\CREATE TABLE IF NOT EXISTS eas_folder_stamp_aliases (
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    stamp TEXT NOT NULL,
+            \\    previous_stamp TEXT NOT NULL,
+            \\    PRIMARY KEY(user_id,stamp)
+            \\);
             \\CREATE TABLE IF NOT EXISTS eas_folder_edits (
             \\    id TEXT PRIMARY KEY,
             \\    mailbox_root TEXT NOT NULL UNIQUE,

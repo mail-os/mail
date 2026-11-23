@@ -637,7 +637,7 @@ fn mailboxDirs(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8) ![][]co
         try std.fmt.allocPrint(a, "{s}/new", .{base}),
         try std.fmt.allocPrint(a, "{s}/cur", .{base}),
     };
-    if (ctx.hosted) return a.dupe([]const u8, &.{ base, nested[0], nested[1] });
+    if (std.mem.eql(u8, ctx.username, ctx.local_part)) return a.dupe([]const u8, &.{ base, nested[0], nested[1] });
     // Webmail drafts use the canonical account even when native EWS still
     // writes its own legacy drafts under the account's local part.
     if (std.mem.eql(u8, mailbox, "Drafts") and !std.mem.eql(u8, ctx.username, ctx.local_part)) {
@@ -952,7 +952,7 @@ fn rfc2822Date(a: std.mem.Allocator, epoch: i64) []const u8 {
 }
 
 fn savedMailPath(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, sub: []const u8, filename: []const u8) ![]const u8 {
-    const dir = if (ctx.hosted)
+    const dir = if (std.mem.eql(u8, ctx.username, ctx.local_part))
         try std.fmt.allocPrint(a, "mail/{s}/{s}", .{ ctx.local_part, mailbox })
     else
         try std.fmt.allocPrint(a, "mail/{s}/{s}/{s}", .{ ctx.local_part, mailbox, sub });
