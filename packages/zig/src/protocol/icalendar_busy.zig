@@ -110,9 +110,37 @@ pub fn overlaps(a: Allocator, source: Source, window: Window, timezone: []const 
     return false;
 }
 
+pub const Instance = struct {
+    start: i64,
+    end: i64,
+    recurrence_id: i64,
+    all_day: bool,
+    tentative: bool,
+    master: ?ical.Component,
+    replacement: ?ical.Component,
+};
+
+/// Resolve a recurrence ID on the original grid, even if an override moved
+/// the occurrence. Return UTC times for timed events and civil dates for DATE.
+pub fn findInstance(arena: Allocator, source: []const u8, timezone: []const u8, stamp: i64) !?Instance {
+    var selection = InstanceSelection{ .stamp = stamp };
+    var budget = expansion_budget;
+    appendResource(.{
+        .window = .{ .start = stamp, .end = stamp + 1 },
+        .instance = &selection,
+    }, arena, source, timezone, null, &budget) catch |err| switch (err) {
+        error.OccurrenceFound => return selection.result,
+        else => return err,
+    };
+    return null;
+}
+
+const InstanceSelection = struct { stamp: i64, master: ?ical.Component = null, result: ?Instance = null };
+
 const OccurrenceOutput = struct {
     window: Window,
     busy: ?struct { allocator: Allocator, items: *std.ArrayList(Period) } = null,
+    instance: ?*InstanceSelection = null,
 
     fn add(self: OccurrenceOutput, start: i64, end: i64, kind: BusyType) !void {
         if (self.busy) |periods| {
@@ -123,6 +151,28 @@ const OccurrenceOutput = struct {
 
     fn ignores(self: OccurrenceOutput, status: Event.Status, transparent: bool) bool {
         return status == .cancelled or (self.busy != null and transparent);
+    }
+
+    fn addEvent(self: OccurrenceOutput, nominal: Moment, start: Moment, end: i64, kind: BusyType, replacement: ?ical.Component) !void {
+        if (self.instance) |selection| {
+            if (nominal.stamp() != selection.stamp) return;
+            const all_day = start.date.kind == .date;
+            const civil_end = if (all_day and start.zone != null)
+                (start.zone.?.dateAt(end, .date) orelse return error.InvalidCalendar).epoch()
+            else
+                end;
+            selection.result = .{
+                .start = if (all_day) start.date.epoch() else start.stamp(),
+                .end = civil_end,
+                .recurrence_id = if (all_day) nominal.date.epoch() else selection.stamp,
+                .all_day = all_day,
+                .tentative = kind == .tentative,
+                .master = selection.master,
+                .replacement = replacement,
+            };
+            return error.OccurrenceFound;
+        }
+        try self.add(start.stamp(), end, kind);
     }
 };
 
@@ -450,6 +500,7 @@ const RangeEdit = struct {
         anchor: Moment,
         length: ?Length,
         kind: BusyType,
+        component: ical.Component,
     };
 
     fn lessThan(_: void, lhs: RangeEdit, rhs: RangeEdit) bool {
@@ -521,10 +572,16 @@ fn appendResource(output: OccurrenceOutput, scratch: Allocator, source: []const 
             const field = item.start orelse return error.InvalidCalendar;
             const start = try Moment.read(scratch, &zones, field.value, field, fallback);
             const length = try item.length(scratch, &zones, start);
-            try output.add(start.stamp(), length.end(start), .busy);
+            const recurrence = if (output.instance != null) blk: {
+                const original = item.recurrence_id.?;
+                break :blk try Moment.read(scratch, &zones, original.value, original, start.zone);
+            } else start;
+            const kind: BusyType = if (item.status == .tentative) .tentative else .busy;
+            try output.addEvent(recurrence, start, length.end(start), kind, item.component);
         }
         return;
     };
+    if (output.instance) |selection| selection.master = event.component;
     const start_field = event.start orelse return error.InvalidCalendar;
     const start = try Moment.read(scratch, &zones, start_field.value, start_field, fallback);
     const length = try event.length(scratch, &zones, start);
@@ -553,9 +610,10 @@ fn appendResource(output: OccurrenceOutput, scratch: Allocator, source: []const 
                 .anchor = moved,
                 .length = modified_length,
                 .kind = kind,
+                .component = item.component,
             },
         });
-        try output.add(moved.stamp(), (modified_length orelse length).end(moved), kind);
+        try output.addEvent(recurrence, moved, (modified_length orelse length).end(moved), kind, item.component);
     }
     const kind = event.busyKind(output, event);
     if (kind == null and ranges.items.len == 0) return;
@@ -852,9 +910,9 @@ const Expansion = struct {
             const replacement = self.ranges[next - 1].replacement orelse return;
             const date = Date.fromEpoch(candidate.date.epoch() + replacement.shift, replacement.anchor.date.kind);
             const moved = replacement.anchor.withDate(date);
-            try self.output.add(moved.stamp(), (replacement.length orelse length).end(moved), replacement.kind);
+            try self.output.addEvent(candidate, moved, (replacement.length orelse length).end(moved), replacement.kind, replacement.component);
         } else if (self.kind) |kind| {
-            try self.output.add(key, length.end(candidate), kind);
+            try self.output.addEvent(candidate, candidate, length.end(candidate), kind, null);
         }
     }
 
@@ -871,9 +929,11 @@ const Expansion = struct {
         // An override can move a later nominal key into the current window.
         // Bound the scan using the largest possible UTC offset for each shift.
         var offset = latestOffset(self.seed.zone);
-        for (self.ranges) |range| {
-            if (range.replacement) |replacement|
-                offset = @max(offset, latestOffset(replacement.anchor.zone) - replacement.shift);
+        if (self.output.instance == null) {
+            for (self.ranges) |range| {
+                if (range.replacement) |replacement|
+                    offset = @max(offset, latestOffset(replacement.anchor.zone) - replacement.shift);
+            }
         }
         const last = self.output.window.end + offset - 1;
         if (until) |date| return @min(last, date.epoch() + if (date.kind == .utc) latestOffset(self.seed.zone) else 0);
@@ -882,9 +942,10 @@ const Expansion = struct {
 
     fn firstPeriod(self: *Expansion, recur: Rule) i64 {
         const first = recur.firstPeriod(self.seed.date);
-        if (self.nominal) |search| {
+        const after = if (self.nominal) |search| search.after else if (self.output.instance) |selection| selection.stamp - 1 else null;
+        if (after) |stamp| {
             if (recur.count != null) return first;
-            const threshold = Date.fromEpoch(search.after + earliestOffset(self.seed.zone), self.seed.date.kind);
+            const threshold = Date.fromEpoch(stamp + earliestOffset(self.seed.zone), self.seed.date.kind);
             const aligned = recur.firstPeriod(threshold);
             const periods = if (recur.fixedPeriod()) |seconds|
                 @divFloor(aligned - first, seconds)

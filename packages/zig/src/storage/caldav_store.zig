@@ -1276,6 +1276,20 @@ pub const CalDavStore = struct {
         return snapshotEventDetail(arena, try self.ownedEventLocked(username, mailbox_id, id), true);
     }
 
+    pub fn snapshotActiveSyncEvent(self: *Self, arena: Allocator, username: []const u8, id: u64) !struct { detail: CalendarEventDetail, timezone: []const u8 } {
+        const mailbox_id = try self.activeMailboxId(username);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const owner = self.findUserIdLocked(username, mailbox_id) orelse return error.EventNotFound;
+        const event = self.events.get(id) orelse return error.EventNotFound;
+        if (firstOwnedCollection(self.calendars.valueIterator(), owner) != event.calendar_id) return error.EventNotFound;
+        const calendar = self.calendars.get(event.calendar_id) orelse return error.EventNotFound;
+        return .{
+            .detail = try snapshotEventDetail(arena, event, false),
+            .timezone = try arena.dupe(u8, calendar.timezone),
+        };
+    }
+
     pub fn snapshotWebCalendarEvent(self: *Self, arena: Allocator, username: []const u8, id: u64, action: CalendarAction) !CalendarEventDetail {
         const access = try self.beginCalendarAccess(username, .read);
         defer access.deinit();

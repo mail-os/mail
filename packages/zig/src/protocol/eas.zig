@@ -9,6 +9,8 @@ const database = @import("../storage/database.zig");
 const caldav_store = @import("../storage/caldav_store.zig");
 const search = @import("eas_search.zig");
 const sync_state = @import("eas_state.zig");
+const icalendar = @import("icalendar.zig");
+const recurrence = @import("icalendar_busy.zig");
 const webmail_maildir = @import("../api/webmail_maildir.zig");
 const webmail_store = @import("../api/webmail_store.zig");
 const snapshots = @import("../api/webmail_snapshots.zig");
@@ -395,7 +397,7 @@ fn handleComposeMail(ctx: *Context, op: ComposeCommand, body: []const u8) !Respo
             return sendError(ctx, op, sourceStatus(err));
         parent = original.reply_source;
         if (req.replace_mime) break :blk message.archive;
-        const mode: smart_mime.Mode = if (op == .smart_reply) .reply else if (ctx.legacy_forward_attachment) .attachment else .forward;
+        const mode: smart_mime.Mode = if (original.calendar) .calendar else if (op == .smart_reply) .reply else if (ctx.legacy_forward_attachment) .attachment else .forward;
         break :blk smart_mime.withOriginal(a, message.archive, original.mime, mode, limits.max_message_size) catch |err|
             return sendError(ctx, op, switch (err) {
                 error.MessageTooLarge => .message_too_large,
@@ -466,22 +468,22 @@ fn sourceStatus(err: anyerror) SendStatus {
 const ComposeSource = struct {
     mime: []const u8 = "",
     reply_source: ?database.Database.TeamReplySource = null,
+    calendar: bool = false,
 };
 
 fn sourceMime(a: std.mem.Allocator, ctx: *Context, user_id: i64, source: MessageSource, include_contents: bool, capture_reply: bool, max_bytes: usize) !ComposeSource {
     if (source.long_id != null and (source.item_id != null or source.folder_id != null)) return error.InvalidIdCombination;
-    if (source.instance_id) |instance| {
-        if (search.utcMilliseconds(instance) == null) return error.InvalidDateTime;
-        return error.UnsupportedItem; // Calendar occurrences need scheduling MIME, not mail quoting.
-    }
+    const instance = if (source.instance_id) |value| search.utcMilliseconds(value) orelse return error.InvalidDateTime else null;
+    if (instance != null and !std.mem.eql(u8, source.folder_id orelse "", "5")) return error.UnsupportedItem;
     ctx.db.lockMailboxes();
     defer ctx.db.unlockMailboxes();
     try requireMailboxOwner(a, ctx);
 
     const reference = if (source.long_id) |id| try resolveSearchId(a, ctx, user_id, id) else blk: {
         const folder = (try folderById(a, ctx, user_id, source.folder_id orelse "1")) orelse return error.ItemNotFound;
-        if (folder.mailbox == null) return error.UnsupportedItem;
         const id = source.item_id orelse return error.InvalidIds;
+        if (folder.is_calendar) return calendarSource(a, ctx, try itemUid(folder.id, id), instance, include_contents);
+        if (folder.mailbox == null) return error.UnsupportedItem;
         const uid = if (std.mem.count(u8, id, ":") == 2)
             (try resolveMailItemId(a, ctx, user_id, folder, id)).uid
         else
@@ -518,6 +520,75 @@ fn sourceMime(a: std.mem.Allocator, ctx: *Context, user_id: i64, source: Message
         }
     }
     return error.ItemNotFound;
+}
+
+fn calendarSource(a: std.mem.Allocator, ctx: *Context, id: i64, instance: ?i64, include_contents: bool) !ComposeSource {
+    const snapshot = ctx.store.snapshotActiveSyncEvent(a, ctx.username, @intCast(id)) catch |err| switch (err) {
+        error.EventNotFound, error.NotFound, error.DavMailboxNotFound => return error.ItemNotFound,
+        else => return err,
+    };
+    const detail = snapshot.detail;
+    const event = detail.event;
+    var export_event: icalendar.Export.Event = .{
+        .uid = event.uid,
+        .modified_at = detail.modified_at,
+        .summary = event.summary,
+        .description = detail.description,
+        .location = event.location,
+        .organizer = detail.organizer,
+        .start = event.start,
+        .end = event.end,
+        .all_day = event.all_day,
+        .recurrence = event.recurrence_rule,
+        .status = switch (event.status) {
+            .confirmed => "CONFIRMED",
+            .tentative => "TENTATIVE",
+            .cancelled => "CANCELLED",
+        },
+    };
+    if (instance == null and !include_contents) return .{ .calendar = true };
+    var document = try icalendar.Export.init(a, "Calendar");
+    if (instance) |milliseconds| {
+        if (!event.recurring or @mod(milliseconds, 1000) != 0) return error.ItemNotFound;
+        // Legacy records can have structured recurrence fields instead of an ICS body.
+        const series = if (detail.ics_data.len != 0) detail.ics_data else blk: {
+            var original = try icalendar.Export.init(a, "Calendar");
+            try original.addEvent(export_event);
+            break :blk try original.finish();
+        };
+        const occurrence = (recurrence.findInstance(a, series, snapshot.timezone, @divExact(milliseconds, 1000)) catch |err| switch (err) {
+            error.AvailabilityLimit, error.AvailabilityUnsupported, error.InvalidCalendar => return error.UnsupportedItem,
+            else => return err,
+        }) orelse return error.ItemNotFound;
+        if (!include_contents) return .{ .calendar = true };
+        export_event.start = occurrence.start;
+        export_event.end = if (occurrence.end > occurrence.start) occurrence.end else null;
+        export_event.all_day = occurrence.all_day;
+        export_event.recurrence_id = occurrence.recurrence_id;
+        export_event.recurrence = null;
+        export_event.status = if (occurrence.tentative) "TENTATIVE" else "CONFIRMED";
+        if (occurrence.master orelse occurrence.replacement) |original| {
+            export_event.uid = (try icalendar.componentText(a, original, "UID")) orelse event.uid;
+            export_event.summary = (try icalendar.componentText(a, original, "SUMMARY")) orelse "";
+            export_event.location = try icalendar.componentText(a, original, "LOCATION");
+            export_event.description = try icalendar.componentText(a, original, "DESCRIPTION");
+            const organizer = (try icalendar.componentText(a, original, "ORGANIZER")) orelse "";
+            export_event.organizer = if (std.ascii.startsWithIgnoreCase(organizer, "mailto:")) organizer[7..] else null;
+        }
+        if (occurrence.replacement) |replacement| {
+            export_event.summary = (try icalendar.componentText(a, replacement, "SUMMARY")) orelse export_event.summary;
+            export_event.location = (try icalendar.componentText(a, replacement, "LOCATION")) orelse export_event.location;
+            export_event.description = (try icalendar.componentText(a, replacement, "DESCRIPTION")) orelse export_event.description;
+        }
+        try document.addEvent(export_event);
+    } else if (detail.ics_data.len != 0) {
+        // Export adds a fresh calendar wrapper. The attachment is informational
+        // and does not carry the original document's scheduling METHOD.
+        try document.addDocument(detail.ics_data);
+    } else {
+        try document.addEvent(export_event);
+    }
+    return .{ .mime = try document.finish(), .calendar = true };
 }
 
 fn followedReplySource(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, name: []const u8, path: []const u8, bytes: []const u8) !?database.Database.TeamReplySource {

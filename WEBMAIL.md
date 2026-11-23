@@ -1898,8 +1898,15 @@ Operators can inspect one managed mailbox with `mail user:local hosted-status <m
   replies and retains its MIME attachments for forwards. WBXML `ReplaceMime`
   uses the complete client content with shared sender and Bcc handling. The
   quota check uses the final stored message after adding any original content.
-  A malformed recurrence `InstanceId` returns `104`. A valid occurrence
-  returns `147` until calendar scheduling MIME is available in [#47](https://github.com/mail-os/mail/issues/47).
+  Calendar sources use the item ID from the authenticated mailbox's first
+  owned Calendar collection. An `InstanceId` identifies the original UTC
+  recurrence slot, so a moved occurrence still uses its original ID. A
+  malformed ID returns `104`, and a missing, excluded, or cancelled
+  occurrence returns `150`. Unsupported source types or recurrence rules
+  return `147`. Without `ReplaceMime`, the server attaches
+  an informational `event.ics` for the selected occurrence or the whole
+  series when `InstanceId` is absent. The attachment carries no scheduling
+  `METHOD`. Webmail invitation processing and RSVP are covered in [#47](https://github.com/mail-os/mail/issues/47).
   See [SmartReply](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-ascmd/419e4fc2-d0cb-419e-a94d-df4b8da0c98f)
   and [SmartForward](https://learn.microsoft.com/en-us/openspecs/exchange_server_protocols/ms-ascmd/7dd31ff2-7b47-4968-a6ed-79ebbd3cceb8).
 - ActiveSync mailbox Search matches keywords in decoded mail headers and

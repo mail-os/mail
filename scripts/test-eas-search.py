@@ -123,7 +123,7 @@ def check_matches(test, owner, other, sink):
     assert compose(test, owner, sink, "SmartReply", "mixed", long_id=long_id, folder="1", item="1:1") == 105
     assert compose(test, owner, sink, "SmartForward", "invalidDate", folder="5", item="1", occurrence="bad") == 104
     assert compose(test, owner, sink, "SmartForward", "calendar", folder="5", item="1",
-                   occurrence="2026-10-03T13:00:00.000Z") == 147
+                   occurrence="2026-10-03T13:00:00.000Z") == 150
     assert test.count(other) == test.count(owner) == test.bytes(sink) == 0
 
     for command in ("SmartReply", "SmartForward"):

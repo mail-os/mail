@@ -412,6 +412,7 @@ pub const Export = struct {
         end: ?i64,
         all_day: bool,
         recurrence: ?[]const u8,
+        recurrence_id: ?i64 = null,
         status: []const u8,
     };
 
@@ -422,6 +423,7 @@ pub const Export = struct {
         try self.dateProperty("DTSTAMP", event.modified_at, false);
         try self.dateProperty("DTSTART", event.start, event.all_day);
         if (event.end) |end| try self.dateProperty("DTEND", end, event.all_day);
+        if (event.recurrence_id) |id| try self.dateProperty("RECURRENCE-ID", id, event.all_day);
         try self.textProperty(&self.events, "SUMMARY", event.summary);
         if (event.description) |value| try self.textProperty(&self.events, "DESCRIPTION", value);
         if (event.location) |value| try self.textProperty(&self.events, "LOCATION", value);

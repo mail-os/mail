@@ -748,12 +748,13 @@ def mb_uint(value):
 COMPOSE_TAGS = {"SendMail": 0x45, "SmartForward": 0x46, "SmartReply": 0x47}
 
 
-def eas_send(mime, client_id="first", *, save=False, command="SendMail", source=None, replace=False):
+def eas_send(mime, client_id="first", *, save=False, command="SendMail", source=None, replace=False, occurrence=None):
     source_xml = b""
     if source:
         folder, item = source
         source_xml = (b"\x4b" + (b"\x4c\x03" + folder.encode() + b"\x00\x01" if folder else b"")
-                      + b"\x4d\x03" + item.encode() + b"\x00\x01\x01")
+                      + b"\x4d\x03" + item.encode() + b"\x00\x01"
+                      + (b"\x4f\x03" + occurrence.encode() + b"\x00\x01" if occurrence else b"") + b"\x01")
     return (b"\x03\x01\x6a\x00\x00\x15" + bytes([COMPOSE_TAGS[command]])
             + b"\x51\x03" + client_id.encode() + b"\x00\x01"
             + (b"\x08" if save else b"") + (b"\x09" if replace else b"") + source_xml

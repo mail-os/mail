@@ -4,7 +4,7 @@ const io_compat = @import("../core/io_compat.zig");
 const mime = @import("mime.zig");
 const submission = @import("submission.zig");
 
-pub const Mode = enum { reply, forward, attachment };
+pub const Mode = enum { reply, forward, attachment, calendar };
 
 const Message = struct {
     headers: []const u8,
@@ -152,8 +152,8 @@ fn replyBody(a: std.mem.Allocator, source: Message) !?Display {
 pub fn withOriginal(a: std.mem.Allocator, client: []const u8, original: []const u8, mode: Mode, max_bytes: usize) ![]const u8 {
     if (client.len > max_bytes or original.len > max_bytes) return error.MessageTooLarge;
     const outgoing = try Message.parse(client);
-    const source = try Message.parse(original);
-    const quote = if (mode == .reply) try replyBody(a, source) else null;
+    const source = if (mode == .calendar) null else try Message.parse(original);
+    const quote = if (mode == .reply) try replyBody(a, source.?) else null;
     if (mode == .reply and quote == null) return client;
 
     var boundary_buffer: [42]u8 = undefined;
@@ -175,10 +175,22 @@ pub fn withOriginal(a: std.mem.Allocator, client: []const u8, original: []const 
                 try writeField(a, &result, try std.fmt.allocPrint(a, "Content-Transfer-Encoding: {s}", .{display.encoding}));
             try result.print(a, "\r\n{s}\r\n", .{display.body});
         },
-        .forward => try writeEntity(a, &result, source, false),
+        .forward => try writeEntity(a, &result, source.?, false),
         .attachment => {
             const attached = try submission.withoutBcc(a, original);
             try result.print(a, "Content-Type: message/rfc822\r\nContent-Disposition: attachment; filename=\"forwarded.eml\"\r\n\r\n{s}\r\n", .{attached});
+        },
+        .calendar => {
+            try result.appendSlice(a, "Content-Type: text/calendar; charset=UTF-8\r\n" ++
+                "Content-Disposition: attachment; filename=\"event.ics\"\r\nContent-Transfer-Encoding: base64\r\n\r\n");
+            var offset: usize = 0;
+            while (offset < original.len) {
+                const end = @min(offset + 57, original.len);
+                var encoded: [76]u8 = undefined;
+                try result.appendSlice(a, std.base64.standard.Encoder.encode(&encoded, original[offset..end]));
+                try result.appendSlice(a, "\r\n");
+                offset = end;
+            }
         },
     }
     try result.print(a, "--{s}--\r\n", .{boundary});
