@@ -298,7 +298,8 @@ async function verifyDateTextAlignment(page, capture, date) {
         }
       }
     }
-    const gap = context.getImageData(Math.round(date.iconLeft) - 24, Math.round(date.y) + 5, 24, date.height - 10)
+    // Sample next to the icon so wider native date glyphs stay outside the test area.
+    const gap = context.getImageData(Math.round(date.iconLeft) - 16, Math.round(date.y) + 5, 16, date.height - 10)
     const fill = context.getImageData(Math.round(date.iconLeft) - 1, Math.round(date.y) + 5, 1, 1).data
     const iconGapHasInk = gap.data.some((channel, index) => index % 4 !== 3 && Math.abs(channel - fill[index % 4]) > 6)
     return { centerOffset: inkRows.length ? (inkRows[0] + inkRows.at(-1) - area.height) / 2 : null, iconGapHasInk }
