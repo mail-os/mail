@@ -5,10 +5,10 @@ import { join } from 'node:path'
 import { chromium, firefox, webkit } from 'playwright'
 
 const { MAIL_BROWSER_URL: url, MAIL_BROWSER_OWNER: owner, MAIL_BROWSER_SENDER: sender, MAIL_BROWSER_PASSWORD: password, MAIL_BROWSER_DAY: day, MAIL_BROWSER_CERT: certificate } = process.env
-const { MAIL_BROWSER_NEWCOMER: newcomer } = process.env
+const { MAIL_BROWSER_NEWCOMER: newcomer, MAIL_BROWSER_LONG_FOLDER: longFolder } = process.env
 const [engine, output] = process.argv.slice(2)
 const engines = { chromium, firefox, webkit }
-assert(Object.hasOwn(engines, engine) && output && url && owner && sender && password && day && certificate && newcomer, 'Run through test-webmail-browser.py')
+assert(Object.hasOwn(engines, engine) && output && url && owner && sender && password && day && certificate && newcomer && longFolder, 'Run through test-webmail-browser.py')
 assert.match(url, /^https:\/\/127\.0\.0\.1:\d+$/, 'Browser tests require a disposable loopback HTTPS server')
 
 const launchOptions = {}
@@ -391,6 +391,41 @@ async function openMailbox(page, name) {
   await button(folders(page), name).click()
 }
 
+async function verifyPhoneMailboxHeading(page, name, long) {
+  const title = heading(page, name)
+  const header = page.locator('.wm-list-head').filter({ has: title })
+  await title.waitFor()
+  if (!long) await button(header, 'Next unread').waitFor()
+  for (const width of [320, 360, 390]) {
+    await page.setViewportSize({ width, height: 844 })
+    const layout = await title.evaluate((node) => {
+      const range = document.createRange()
+      range.selectNodeContents(node)
+      const lines = Array.from(range.getClientRects())
+      const splitWord = Array.from(node.textContent.matchAll(/\S+/g)).some((word) => {
+        range.setStart(node.firstChild, word.index)
+        range.setEnd(node.firstChild, word.index + word[0].length)
+        return range.getClientRects().length !== 1
+      })
+      return { lines: lines.length, right: Math.max(...lines.map(line => line.right)), splitWord }
+    })
+    assert(!layout.splitWord, `The ${name} heading keeps words together at ${width}px`)
+    assert(long ? layout.lines > 1 : layout.lines === 1, `The ${name} heading uses the expected number of lines at ${width}px`)
+    const actions = [button(header, 'Refresh messages')]
+    const nextUnread = button(header, 'Next unread')
+    if (await nextUnread.isVisible()) actions.unshift(nextUnread)
+    const boxes = await Promise.all(actions.map(action => action.boundingBox()))
+    for (const box of boxes) {
+      assert(box.width >= 43.99 && box.height >= 43.99,
+        `Mailbox actions keep 44px touch targets at ${width}px, got ${box.width}×${box.height}`)
+    }
+    assert(layout.right <= boxes[0].x - 6, 'The heading leaves room before the first action')
+    if (boxes.length === 2) assert(Math.abs(boxes[0].y - boxes[1].y) < 0.5, 'Mailbox actions align on the same row')
+    await fitsViewport(page)
+    await screenshot(page, `phone-${width}-${long ? 'long-folder' : 'receipts'}-heading`)
+  }
+}
+
 async function openReceiptAndDownload(page) {
   const messagePath = /\/webmail\/api\/messages\/ref\/[^/?]+$/
   const isMarkRead = request => request.method() === 'PUT' && messagePath.test(request.url())
@@ -669,6 +704,12 @@ async function phoneJourney(page) {
   await openMailbox(page, /^Receipts(?:\s|$)/)
   assert.equal(await toggle.getAttribute('aria-expanded'), 'false')
   await page.waitForFunction(() => document.activeElement?.getAttribute('aria-controls') === 'mailNavigation')
+  await verifyPhoneMailboxHeading(page, 'Receipts', false)
+  await toggle.click()
+  await openMailbox(page, longFolder)
+  await verifyPhoneMailboxHeading(page, longFolder, true)
+  await toggle.click()
+  await openMailbox(page, /^Receipts(?:\s|$)/)
   await openReceiptAndDownload(page)
   await heading(page, 'Your receipt #1046').waitFor()
   await page.locator('.wm-receipt-meta .wm-avatar').waitFor()

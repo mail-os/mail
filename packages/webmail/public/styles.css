@@ -1507,7 +1507,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-back { display: inline-flex; position: sticky; top: 0; z-index: 2; align-self: stretch; flex-shrink: 0; gap: 6px; align-items: center; min-height: 44px; margin: 0; padding-inline: 14px; background: var(--panel); text-align: start; }
   .wm-read:has(> .wm-back) .wm-message-toolbar { top: 44px; }
   .wm-back .mail-icon { width: 17px; height: 17px; }
-  .wm-list-head h1 { font-size: 30px; }
+  .wm-list-head:has(.wm-list-next-unread) { align-items: flex-start; }
+  .wm-list-head h1 { font-size: clamp(27px, 8vw, 30px); }
   .wm-message-check { left: 3px; top: 9px; width: 20px; height: 20px; }
   .wm-read-sender { flex-direction: column; }
   .wm-reader-attention-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1516,6 +1517,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 }
 @media (max-width: 360px) {
   .wm-brand > span:last-child { display: none; }
+  .wm-list-head:has(.wm-list-next-unread) { gap: 8px; }
+  .wm-list-next-unread { flex: 0 0 var(--control-height); justify-content: center; padding-inline: 0; }
   .wm-tool-trash { order: 1; margin-inline-start: 0; }
   .wm-next-unread-label { display: none; }
 }

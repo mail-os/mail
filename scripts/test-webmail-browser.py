@@ -20,6 +20,7 @@ DavClient = runpy.run_path(str(SCRIPTS / "test-dav-https.py"))["DavClient"]
 team_command = runpy.run_path(str(SCRIPTS / "test-webmail-teams.py"))["command"]
 ENGINES = ("chromium", "firefox", "webkit")
 RECEIPT = b"Receipt 1046 for Studio Hosting\n"
+LONG_FOLDER = "Annual research and planning archive"
 
 
 def seed_inbox(fixture, owner, sender):
@@ -200,6 +201,11 @@ def verify(binary, output, engine):
             assert fixture.api(session, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
             assert fixture.api(session, "category-settings", {"automatic": True}, "PUT")[0] == 200
             seed_inbox(fixture, owner, sender)
+            with fixture.imap(owner) as mailbox:
+                assert mailbox.create(f'"{LONG_FOLDER}"')[0] == "OK"
+                assert mailbox.select(f'"{LONG_FOLDER}"')[0] == "OK"
+            status, folders = fixture.api(session, "folders")
+            assert status == 200 and any(folder["name"] == LONG_FOLDER for folder in folders), folders
             seed_invitation_updates(fixture, owner, sender)
             newcomer_session = fixture.login(newcomer)
             assert fixture.api(newcomer_session, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
@@ -222,7 +228,7 @@ def verify(binary, output, engine):
             day = seed_calendar(fixture, owner)
             env = dict(os.environ, MAIL_BROWSER_URL=fixture.webmail, MAIL_BROWSER_OWNER=owner,
                        MAIL_BROWSER_SENDER=sender, MAIL_BROWSER_PASSWORD=fixture.password, MAIL_BROWSER_DAY=day,
-                       MAIL_BROWSER_NEWCOMER=newcomer,
+                       MAIL_BROWSER_NEWCOMER=newcomer, MAIL_BROWSER_LONG_FOLDER=LONG_FOLDER,
                        MAIL_BROWSER_CERT=fixture.env["SMTP_TLS_CERT"])
             subprocess.run(["node", str(SCRIPTS / "webmail-browser.mjs"), engine, str(output / engine)],
                            env=env, check=True)
