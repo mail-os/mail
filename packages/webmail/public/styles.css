@@ -444,7 +444,7 @@ input[type=checkbox] { accent-color: var(--accent); }
 dialog.wm-modal { position: fixed; inset: 0; width: 100vw; height: 100dvh; max-width: none; max-height: none; margin: 0; border: 0; padding: 12px; display: flex; align-items: center; justify-content: center; background: transparent; color: var(--text); }
 dialog.wm-modal:not([open]) { display: none; }
 dialog.wm-modal::backdrop { background: var(--scrim); }
-.wm-composer { display: flex; flex-direction: column; width: min(680px, 94vw); max-height: 92dvh; overflow-y: auto; border-radius: 14px; background: var(--panel); box-shadow: 0 24px 80px rgba(0, 0, 0, .25); }
+.wm-composer { display: flex; flex-direction: column; width: min(720px, 94vw); max-height: 92dvh; overflow-y: auto; border-radius: 14px; background: var(--panel); box-shadow: 0 24px 80px rgba(0, 0, 0, .25); }
 .wm-composer-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 20px; border-bottom: 1px solid var(--border); font-weight: 700; position: sticky; top: 0; z-index: 2; background: var(--panel); }
 .wm-composer-close { border: 0; background: transparent; color: var(--muted); padding: 4px; }
 .wm-composer-fields { display: flex; flex-direction: column; gap: 8px; padding: 16px 20px 0; }
