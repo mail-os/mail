@@ -24,6 +24,7 @@ import { useComposeLibrary } from './use-compose-library'
 import { useMessageSnapshots } from './use-message-snapshots'
 import { useFileLinks } from './use-file-links'
 import { linkedFilesInText } from './mail-public-links'
+import { useReplyBatch } from './use-reply-batch'
 
 interface Ref<T> { current: T | null }
 const categoryFolders = ['Newsletters', 'Receipts']
@@ -236,6 +237,7 @@ export function useWebmail(ports: WebmailPorts) {
     closeReader()
     snapshots.closeSnapshots()
     fileSharing.closeFileLinkManager()
+    replyBatch.closeReplyBatch()
     contactBook.closeContacts()
     forwardingSettings.clearForwarding()
     vacationSettings.clearVacationSettings()
@@ -272,6 +274,7 @@ export function useWebmail(ports: WebmailPorts) {
   const api = createMailApi(() => user()?.username, onAuthError, () => !destroyed)
   const snapshots = useMessageSnapshots(api)
   const fileSharing = useFileLinks(api, () => limits().maxFileLinkBytes ?? 0)
+  const replyBatch = useReplyBatch(api, sendDelay)
   const messageFileLinks = derived(() => linkedFilesInText(selected()?.text ?? ''))
   async function loadSenderIdentities(): Promise<void> {
     const request = ++senderRequest
@@ -364,6 +367,15 @@ export function useWebmail(ports: WebmailPorts) {
   }
   function shareSelectedSnapshot() {
     snapshots.previewSnapshot(checked().map(item => item.reference))
+  }
+  function replyToSelection() {
+    replyBatch.startReplyBatch(checked().map(item => item.reference))
+  }
+  async function submitReplyBatch(check = false) {
+    if (await replyBatch.queueReplyBatch(check)) {
+      clearSelection()
+      await refreshOutbox(true)
+    }
   }
   function junkActionFor(name: string): 'junk' | 'not_junk' | null {
     if (isJunkFolder(name)) return 'not_junk'
@@ -1856,12 +1868,14 @@ export function useWebmail(ports: WebmailPorts) {
     snapshots.closeSnapshots()
     fileSharing.clearFileLinkComposer()
     fileSharing.closeFileLinkManager()
+    replyBatch.closeReplyBatch()
     selectionEffect()
   }
   return { user, folders, folder, messages, threads, expandedThreads, selected, loading, refreshing, listError, readerError, readerTarget, reading, readingLoading, mutating, error, notice, query, activeQuery, appliedSearchAll, filterLocation, filterSender, filterRecipient, filterFilename, libraryView, libraryFiles, indexProgress, filterAfter, filterBefore, filterStatus, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, formattedReader, remoteImagesAllowed, checked, checkedKeys, selectedCount, isJunkFolder, readerJunkAction, selectionJunkAction, allChecked, someChecked, undoAction, undoRemaining, readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts, pendingSend, sendRemaining, outbox, outboxCount, outboxCounts, outboxSection, outboxViews, outboxEmpty, outboxPageNumber, outboxNext, outboxLoading, outboxError, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, sharedReply, senderId, senderIdentities, missingSender, senderStatus, chooseSender, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...senderReview, ...notifications, ...privateMail, ...contactBook, showContacts, composeSavedCard, collectionView, collectionId, canOpenPrivate,
     createEventLink, canRespondToInvitation, respondToInvitation, rsvpBusy, rsvpError,
     ...snapshots, canShareSnapshot, shareMessageSnapshot, shareSelectedSnapshot,
     ...fileSharing, messageFileLinks, insertFileLink,
+    ...replyBatch, replyToSelection, submitReplyBatch,
     invitationCalendar, invitationCalendarBusy, invitationDestination, chooseInvitationCalendar, saveInvitationCalendar,
     showCollectionManager, closeCollectionManager, selectCollection, confirmCollectionDeletion, savePrivateLabel, setPrivateMembership, groupSelected, displaySubject, changeNotificationRule, ...recipientEditor, ...attachmentEditor, ...recoverySettings, ...forwardingSettings, ...vacationSettings, ...writing, snippetChoice, signatureChoice, insertSnippet, insertSignature, attentionViews, attentionView, followUpFocused, attentionSaving, attentionSchedule, attentionDate, attentionZone, dueReminders, replyContext, clearFollowUp, selectAttention, nextFollowUp, changeAttention, startAttentionSchedule, saveAttentionSchedule, deadlineLabel, categoryList, newsletterExpanded, readerExpanded, receiptFull, receiptCompact, receiptPreview, senderLabel, sortingSettings, sortingSaving, sortingError, toggleAutomaticSorting, placementText, categoryRule, categoryRuleSaving, saveCategoryRule, showSenderReview, openReviewMessage, reviewMessage, refresh, loadMessages, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread, toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, openAttachmentMessage, showAttachmentLibrary, retryReader, closeReader, nextUnread, readSelection, advanceBatch, triageAndNext, bulkAction, selectedAction, undoLastAction, showShortcuts, closeShortcuts, handleShortcut, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments, saveSendPreference, send, confirmPendingSend, showOutbox, refreshOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, changePassword, showConfirmation, confirmAction, saveDraftCopy: draft.saveCopy, mount, resume, tick, preventUnload, destroy, messageIdentity, messagePageSize, folderName, shortDate, fullDate, readableBytes, attachmentPath }
 }

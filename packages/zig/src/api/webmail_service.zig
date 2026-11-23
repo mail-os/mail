@@ -95,6 +95,7 @@ pub const Outbox = struct {
     result: ?compose.SendResult = null,
     error_message: ?[]const u8 = null,
     request_hash: ?[]const u8 = null,
+    expected_from: ?[]const u8 = null,
     reply_cutoff_ms: i64 = 0,
     dispatch: ?compose.OutboxDispatch = null,
     calendarReply: ?struct {
@@ -518,13 +519,17 @@ pub const Service = struct {
         return row;
     }
 
+    pub fn hostedOutboxBudget(self: *Service, user: []const u8) !?usize {
+        if ((try self.db.hostedLimits(user)) == null) return null;
+        return @max(1024 * 1024, 2 * self.config.max_message_bytes);
+    }
+
     fn checkOutboxCapacity(self: *Service, row: store.Record, now: i64) !void {
-        if ((try self.db.hostedLimits(row.username)) != null) {
-            const bytes = @max(1024 * 1024, 2 * self.config.max_message_bytes);
-            store.checkRecordCapacity(self.db, row, bytes, 1024) catch |err| switch (err) {
+        if (try self.hostedOutboxBudget(row.username)) |bytes| {
+            store.checkRecordCapacity(self.db, row, bytes, store.hosted_outbox_count) catch |err| switch (err) {
                 store.StoreError.OutboxStorageLimit => {
                     try store.sweep(self.db, now, row.username);
-                    try store.checkRecordCapacity(self.db, row, bytes, 1024);
+                    try store.checkRecordCapacity(self.db, row, bytes, store.hosted_outbox_count);
                 },
                 else => return err,
             };
@@ -816,6 +821,9 @@ pub const Service = struct {
         if (!account.enabled) return error.HostedSenderDisabled;
         const delegated_id = try doc.message.delegatedSender();
         const from = try self.sendAddress(a, user, account.email, delegated_id);
+        if (doc.expected_from) |expected| {
+            if (!std.mem.eql(u8, from, expected)) return error.SenderIdentityUnavailable;
+        }
         try self.checkSharedReply(a, user, from, doc.message);
         if (doc.calendarReply) |*reply| if (reply.revision == null) {
             if (doc.message.to.len != 1) return error.CalendarReplyNeedsReview;

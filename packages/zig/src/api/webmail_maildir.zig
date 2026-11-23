@@ -178,7 +178,7 @@ pub fn isValidFolderName(name: []const u8) bool {
     return true;
 }
 
-fn flagsFrom(filename: []const u8) Flags {
+pub fn flagsFrom(filename: []const u8) Flags {
     const mf = imap.MaildirFlags.fromFilename(filename);
     return .{
         .seen = mf.seen,

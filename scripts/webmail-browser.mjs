@@ -78,7 +78,7 @@ async function verifyControlRow(container, selector, height, sameRow = true) {
       bottom: box.bottom,
       left: box.left,
       right: box.right,
-      neutral: !node.matches('.calendar-primary, .wm-snapshot-primary'),
+      neutral: !node.matches('.calendar-primary, .wm-snapshot-primary, .wm-list-toggle, .wm-action--quiet'),
       borderMatches: style.borderColor === border && style.borderWidth === '1px',
       radius: style.borderRadius,
     }
@@ -960,7 +960,10 @@ async function fileLinkJourney(desktop, phone) {
     await fitsViewport(viewer)
     await screenshot(viewer, 'phone-file-link-viewer')
     const [download] = await Promise.all([viewer.waitForEvent('download'), button(viewer, 'Download file').click()])
-    assert.equal(download.suggestedFilename(), filename)
+    // Linux WebKit sanitizes spaces in download names. The API suite checks
+    // the exact server header, while this journey verifies the saved bytes.
+    const suggested = download.suggestedFilename()
+    assert(suggested === filename || (engine === 'webkit' && process.platform === 'linux' && suggested === 'Workshop_proofs.bin'))
     assert.deepEqual(await readFile(await download.path()), contents)
     assert.deepEqual(await unauthenticated.cookies(), [])
 
@@ -977,6 +980,70 @@ async function fileLinkJourney(desktop, phone) {
   }
   finally { await unauthenticated.close() }
   await phone.setViewportSize({ width: 390, height: 844 })
+}
+
+async function replyBatchJourney(desktop, phone) {
+  const subjects = ['Studio launch notes', 'November research interviews']
+  async function selectReplies(page, height) {
+    await page.goto(url + '/')
+    await button(page, 'Select').click()
+    for (const subject of subjects) {
+      await page.getByRole('checkbox', { name: 'Select conversation: ' + subject, exact: true }).check()
+    }
+    const actions = page.getByLabel('Selected message actions')
+    await verifyControlRow(actions, 'button, select', height, false)
+    await verifyControlRow(actions.getByRole('group', { name: 'Move selected messages' }), 'select, button', height)
+    await verifyControlRow(page.locator('.wm-list-options'), '.wm-list-toggle, .wm-selection-mode', height)
+    await screenshot(page, height === 44 ? 'phone-batch-selection-dark' : 'desktop-batch-selection-light')
+    await button(actions, 'Reply separately').click()
+    const dialog = page.getByRole('dialog', { name: 'Reply separately' })
+    const replies = dialog.getByRole('list', { name: 'Replies to send' })
+    await replies.getByText('Re: ' + subjects[0], { exact: true }).waitFor()
+    assert.equal(await replies.getByRole('listitem').count(), 2)
+    for (const subject of subjects) {
+      const row = replies.getByRole('listitem').filter({ hasText: 'Re: ' + subject })
+      await row.getByText('To: ' + sender, { exact: true }).waitFor()
+    }
+    const from = dialog.locator('.wm-reply-sender')
+    await from.getByText('From your account', { exact: true }).waitFor()
+    await from.getByText(owner, { exact: true }).waitFor()
+    await verifyControlRow(dialog.locator('.wm-reply-batch'), 'header button, form button', height, false)
+    await fitsViewport(page)
+    return dialog
+  }
+
+  await phone.setViewportSize({ width: 320, height: 844 })
+  const mobile = await selectReplies(phone, 44)
+  await mobile.getByLabel('Reply text').fill('Thanks for the update. I will review both items this afternoon.')
+  await mobile.locator('.wm-reply-batch').screenshot({ path: join(output, 'phone-reply-batch-dark.png'), animations: 'disabled' })
+  await button(mobile, 'Close').click()
+  await mobile.waitFor({ state: 'hidden' })
+  await phone.setViewportSize({ width: 390, height: 844 })
+
+  const dialog = await selectReplies(desktop, 36)
+  await dialog.getByLabel('Reply text').fill('Thanks for the update. I will be in touch this afternoon.')
+  await dialog.locator('.wm-reply-batch').screenshot({ path: join(output, 'desktop-reply-batch-light.png'), animations: 'disabled' })
+  const endpoint = url + '/webmail/api/reply-batches'
+  let receipt
+  await desktop.route(endpoint, async (route) => {
+    const response = await route.fetch()
+    receipt = await response.json()
+    await route.abort()
+  }, { times: 1 })
+  await button(dialog, 'Queue 2 replies').click()
+  await dialog.getByRole('alert').getByText(/server did not confirm/).waitFor()
+  assert.equal(receipt?.sends?.length, 2)
+  await button(dialog, 'Check batch status').click()
+  await dialog.getByText('2 separate replies queued.', { exact: true }).waitFor()
+  await button(dialog, 'View Outbox').click()
+  await dialog.waitFor({ state: 'hidden' })
+  for (const id of receipt.sends) {
+    const response = await desktop.request.get(url + '/webmail/api/outbox/' + id)
+    assert(response.ok())
+    const item = await response.json()
+    assert.deepEqual(item.message.to, [sender])
+    assert(subjects.some(subject => item.message.subject === 'Re: ' + subject))
+  }
 }
 
 async function freeTimeJourney(page, phone = false) {
@@ -1586,6 +1653,7 @@ try {
   await calendarToolsJourney(desktop, phone)
   await snapshotSharingJourney(desktop, phone)
   await fileLinkJourney(desktop, phone)
+  await replyBatchJourney(desktop, phone)
   await navigationRequestsJourney(desktop)
   assert.deepEqual(errors, [], 'Browser pages raised uncaught errors')
   process.stdout.write(`${engine} passed the desktop and phone webmail journeys.\n`)

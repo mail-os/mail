@@ -26,6 +26,7 @@ const selectingMessages = state(false)
 const foldersToggle = useRef('foldersToggle')
 const snapshotDialog = useRef('snapshotDialog')
 const snapshotUrlField = useRef('snapshotUrlField')
+const replyBatchDialog = useRef('replyBatchDialog')
 const composerFileLink = useRef('composerFileLink')
 function closeFolders(restoreFocus = false) {
   if (!foldersExpanded()) return
@@ -93,6 +94,8 @@ const {
   snapshotMode, snapshotBusy, snapshotError, snapshotNotice, snapshotLifetime, snapshotPreview, snapshotIssued, snapshotLinks,
   snapshotRevoke, snapshotCanRefresh, refreshSnapshotPreview, createSnapshot, manageSnapshots, revokeSnapshot, copySnapshotUrl,
   closeSnapshots, canShareSnapshot, shareMessageSnapshot, shareSelectedSnapshot,
+  replyBatchOpen, replyBatchBusy, replyBatchReview, replyBatchText, replyBatchError, replyBatchUncertain, replyBatchReceipt,
+  replyBatchReferences, replyToSelection, reviewReplyBatch, submitReplyBatch, closeReplyBatch,
   messageFileLinks, fileLinkOpen, fileLinkFile, fileLinkLifetime, fileLinkUploading, fileLinkError, fileLinkNotice,
   toggleFileLink, selectFileLink, insertFileLink, clearFileLinkComposer, fileLinksOpen, fileLinks, fileLinksBusy,
   fileLinksError, fileLinksNotice, revokingFileLink, manageFileLinks, revokeFileLink, closeFileLinkManager,
@@ -130,6 +133,19 @@ function closeSnapshotDialog() {
 async function publishSnapshot() {
   await createSnapshot()
   if (snapshotIssued()) nextTick(() => snapshotUrlField.current?.focus())
+}
+function openReplyBatch() {
+  replyToSelection()
+  nextTick(() => { if (!replyBatchDialog.current?.open) replyBatchDialog.current?.showModal() })
+}
+function dismissReplyBatch() {
+  if (replyBatchBusy() || replyBatchUncertain()) return
+  replyBatchDialog.current?.close()
+  closeReplyBatch()
+}
+function openReplyBatchOutbox() {
+  dismissReplyBatch()
+  void showOutbox()
 }
 function showComposerFileLink() {
   toggleFileLink()
@@ -263,9 +279,14 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       </div>
       <div :if="selectedCount > 0" class="wm-bulk-toolbar" aria-label="Selected message actions">
         <button type="button" class="wm-action wm-action--accent" @click="readSelection()" :disabled="loading || readingLoading || triageBusy || mutating"><span class="mail-icon" data-icon="layers" aria-hidden="true"></span>Read selected</button>
+        <button :if="selectedCount > 1 && folder !== 'Sent' && folder !== 'Drafts' && folder !== 'Trash' && !isJunkFolder(folder)" type="button" class="wm-action" aria-haspopup="dialog" :disabled="loading || mutating" @click="openReplyBatch()"><span class="mail-icon" data-icon="reply" aria-hidden="true"></span>Reply separately</button>
         <button :if="folder !== 'Drafts' && folder !== 'Trash' && !isJunkFolder(folder)" type="button" class="wm-action" aria-haspopup="dialog" :disabled="loading || mutating" @click="openSnapshotPreview(true)"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Share snapshot</button>
         <button :if="selectedCount > 1 && !categoryList && !attentionView && folder !== 'Drafts'" type="button" class="wm-action" @click="groupSelected()" :disabled="loading || readingLoading || triageBusy || mutating">Group selected</button>
-        <button class="wm-action" @click="bulkAction('move', 'Archive')" :disabled="mutating"><span class="mail-icon" data-icon="archive" aria-hidden="true"></span>Archive</button><button class="wm-action" @click="bulkAction('move')" :disabled="mutating"><span class="mail-icon" data-icon="folder" aria-hidden="true"></span>Move</button><select x-model="moveTo" :disabled="mutating" aria-label="Bulk move destination"><option :for="item in folders" :value="item.name" :text="folderName(item.name)"></option></select>
+        <button class="wm-action" @click="bulkAction('move', 'Archive')" :disabled="mutating"><span class="mail-icon" data-icon="archive" aria-hidden="true"></span>Archive</button>
+        <div class="wm-bulk-move" role="group" aria-label="Move selected messages">
+          <select x-model="moveTo" :disabled="mutating" aria-label="Bulk move destination"><option :for="item in folders" :value="item.name" :text="folderName(item.name)"></option></select>
+          <button class="wm-action" @click="bulkAction('move')" :disabled="mutating"><span class="mail-icon" data-icon="folder" aria-hidden="true"></span>Move</button>
+        </div>
         <button class="wm-action" @click="bulkAction('read')" :disabled="mutating">Mark read</button><button class="wm-action" @click="bulkAction('unread')" :disabled="mutating"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span><span>Mark unread</span></button><button class="wm-action" @click="bulkAction('flag')" :disabled="mutating">Flag</button><button class="wm-action" @click="bulkAction('unflag')" :disabled="mutating">Unflag</button>
         <button :if="selectionJunkAction" class="wm-action" @click="bulkAction(selectionJunkAction())" :disabled="mutating || readingLoading" title="Junk feedback applies to future mail from verified senders"><span class="mail-icon" data-icon="shield" aria-hidden="true"></span><span :text="selectionJunkAction === 'not_junk' ? 'Not junk' : 'Mark junk'"></span></button>
         <button class="wm-action wm-action--danger" @click="bulkAction(folder() === 'Trash' ? 'purge' : 'trash')" :disabled="mutating" :text="folder === 'Trash' ? 'Delete permanently' : 'Trash'"></button>
@@ -901,6 +922,38 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
   <section class="wm-shortcuts">
     <header><h2 id="wm-shortcuts-title">Keyboard shortcuts</h2><button type="button" class="wm-action" @click="closeShortcuts()" autofocus>Close shortcuts</button></header>
     <dl><div :for="item in triageShortcuts" :key="item.key"><dt :text="item.label"></dt><dd><kbd :text="item.key"></kbd></dd></div></dl>
+  </section>
+</dialog>
+<dialog :if="replyBatchOpen" ref="replyBatchDialog" class="wm-modal" aria-labelledby="wm-reply-batch-title" @cancel.prevent="dismissReplyBatch()">
+  <section class="wm-snapshot-panel wm-reply-batch">
+    <header class="wm-snapshot-dialog-heading">
+      <h2 id="wm-reply-batch-title">Reply separately</h2>
+      <button type="button" class="wm-action" :disabled="replyBatchBusy || replyBatchUncertain" @click="dismissReplyBatch()" autofocus>Close</button>
+    </header>
+    <p :if="replyBatchError" class="wm-inline-error" role="alert" :text="replyBatchError"></p>
+    <p :if="replyBatchBusy && !replyBatchReview" class="wm-snapshot-muted" role="status">Reviewing recipients…</p>
+    <button :if="!replyBatchReview && replyBatchError && replyBatchReferences.length" type="button" class="wm-action" @click="reviewReplyBatch()">Review again</button>
+    <div :if="replyBatchReceipt" class="wm-snapshot-workflow">
+      <p class="wm-snapshot-muted" role="status" :text="replyBatchReceipt.sends.length + ' separate replies queued.'"></p>
+      <div class="wm-snapshot-form wm-reply-actions"><button type="button" class="wm-action wm-snapshot-primary" @click="openReplyBatchOutbox()">View Outbox</button></div>
+    </div>
+    <form :if="replyBatchReview && !replyBatchReceipt" class="wm-snapshot-workflow" :aria-busy="replyBatchBusy" @submit.prevent="submitReplyBatch()">
+      <p>Each recipient receives a separate reply with the same text.</p>
+      <dl class="wm-reply-sender">
+        <div><dt :text="replyBatchReview.account === replyBatchReview.from ? 'From your account' : 'From'"></dt><dd :text="replyBatchReview.from"></dd></div>
+        <div :if="replyBatchReview.account !== replyBatchReview.from"><dt>Account</dt><dd :text="replyBatchReview.account"></dd></div>
+      </dl>
+      <ul class="wm-reply-recipients" aria-label="Replies to send" tabindex="0">
+        <li :for="reply in replyBatchReview.replies" :key="reply.reference">
+          <strong :text="reply.subject"></strong><span :text="'To: ' + reply.to"></span>
+        </li>
+      </ul>
+      <label class="wm-reply-text">Reply text<textarea rows="4" x-model="replyBatchText" :disabled="replyBatchBusy || replyBatchUncertain" required></textarea></label>
+      <div class="wm-snapshot-form wm-reply-actions">
+        <button :if="!replyBatchUncertain" type="submit" class="wm-action wm-snapshot-primary" :disabled="replyBatchBusy || !replyBatchText.trim()" :text="'Queue ' + replyBatchReview.replies.length + ' replies'"></button>
+        <button :if="replyBatchUncertain" type="button" class="wm-action wm-snapshot-primary" :disabled="replyBatchBusy" @click="submitReplyBatch(true)">Check batch status</button>
+      </div>
+    </form>
   </section>
 </dialog>
 <dialog :if="snapshotMode" ref="snapshotDialog" class="wm-modal wm-snapshot-dialog" aria-labelledby="wm-snapshot-title" @cancel.prevent="closeSnapshotDialog()">

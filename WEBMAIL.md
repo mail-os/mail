@@ -122,6 +122,11 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   copy and draft. Remote attempts without a recorded outcome appear as Unknown
   and require review before a manual retry. Confirmed recipients are omitted from
   the retry draft.
+- Select two to twenty received messages and choose **Reply separately**. Review
+  the account, From address, and recipient for each reply, then write the text
+  to send to each recipient individually. Each reply keeps its own subject and
+  thread and appears separately in Outbox. The account’s Undo Send delay and
+  sending allowance apply to each reply.
 - When CalDAV is enabled, Calendar offers day, week, month, year, and 30-day agenda
   views across all calendars or one selected calendar. Year marks days with
   events, or busy days for an availability-only share. Select a marked or
@@ -689,6 +694,15 @@ before a request may affect another mailbox. Disabling or deleting an account
 revokes existing webmail sessions.
 
 - `GET /webmail/api/config` returns effective limits and preferences.
+- `POST /webmail/api/reply-batches/preview` accepts up to twenty owned message
+  `references` and returns the sending `account`, `from` address, individual
+  `replies`, and review `digest`. `POST /webmail/api/reply-batches` accepts the
+  reviewed references and digest with a 32-character lowercase hexadecimal
+  `batchId`, plain `text`, and an optional `delaySeconds` from 0 to 30. Queueing
+  all replies and recording the receipt is atomic. An exact retry returns the
+  same receipt, and `GET /webmail/api/reply-batches/{batchId}` retrieves
+  `{id,sends,dueAt}` for seven days after the scheduled dispatch time. Use the
+  `sends` IDs to check each delivery in Outbox.
 - `POST /webmail/api/snapshot-links/preview` accepts `references` for one to ten
   owned messages. Its `messages` array exposes `subject`, `from`, `timestamp`,
   and `text`. Formatted messages without a plain-text body use extracted text.

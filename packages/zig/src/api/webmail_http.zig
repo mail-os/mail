@@ -63,6 +63,7 @@ const calendar_day_labels = @import("../storage/calendar_day_labels.zig");
 const calendar_tasks = @import("../storage/calendar_tasks.zig");
 const calendar_tools = @import("../storage/calendar_tools.zig");
 const snapshots = @import("webmail_snapshots.zig");
+const reply_batches = @import("webmail_batch_replies.zig");
 const file_links = @import("webmail_file_links.zig");
 const link_tokens = @import("webmail_link_tokens.zig");
 const caldav = @import("../protocol/caldav.zig");
@@ -615,6 +616,11 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     }
     if (std.mem.startsWith(u8, p, "/webmail/api/uploads/") and std.mem.eql(u8, req.method, "DELETE")) return handleUploadDelete(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/bulk") and std.mem.eql(u8, req.method, "POST")) return handleBulk(server, conn, arena, req);
+    const replies_path = "/webmail/api/reply-batches";
+    if (std.mem.eql(u8, p, replies_path ++ "/preview") and std.mem.eql(u8, req.method, "POST")) return handleReplyBatchPreview(server, conn, arena, req);
+    if (std.mem.eql(u8, p, replies_path) and std.mem.eql(u8, req.method, "POST")) return handleReplyBatchQueue(server, conn, arena, req);
+    if (std.mem.startsWith(u8, p, replies_path ++ "/") and std.mem.eql(u8, req.method, "GET"))
+        return handleReplyBatchStatus(server, conn, arena, req, p[(replies_path.len + 1)..]);
     if (std.mem.startsWith(u8, p, "/webmail/api/undo/") and std.mem.eql(u8, req.method, "POST")) return handleUndo(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/outbox") and std.mem.eql(u8, req.method, "GET")) return handleOutboxList(server, conn, arena, req);
     if (std.mem.startsWith(u8, p, "/webmail/api/outbox/")) return handleOutboxItem(server, conn, arena, req);
@@ -2040,6 +2046,50 @@ fn handleBulk(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.
     defer parsed.deinit();
     const result = server.service.bulk(arena, sess.username, parsed.value, time_compat.timestamp()) catch |err| return mapServiceError(conn, arena, err);
     return sendJson(conn, arena, 200, try service_mod.json(arena, result), null);
+}
+
+fn handleReplyBatchPreview(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    if (!isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, a, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    if (req.body.len > 2048) return mapReplyBatchError(conn, a, error.InvalidReplyBatchSelection);
+    const input = std.json.parseFromSliceLeaky(struct { references: []const []const u8 }, a, req.body, .{}) catch
+        return mapReplyBatchError(conn, a, error.InvalidReplyBatchSelection);
+    const review = reply_batches.preview(a, &server.service, sess.username, sess.email, input.references) catch |err|
+        return mapReplyBatchError(conn, a, err);
+    return sendJson(conn, a, 200, try service_mod.json(a, review), null);
+}
+
+fn handleReplyBatchQueue(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    if (!isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, a, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const input = std.json.parseFromSliceLeaky(reply_batches.Request, a, req.body, .{}) catch
+        return mapReplyBatchError(conn, a, error.InvalidReplyBatch);
+    const result = reply_batches.queue(a, &server.service, sess.username, sess.email, input, time_compat.timestamp()) catch |err|
+        return mapReplyBatchError(conn, a, err);
+    return sendJson(conn, a, 200, try service_mod.json(a, result), null);
+}
+
+fn handleReplyBatchStatus(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request, id: []const u8) !void {
+    var sess = (try requireSession(server, conn, a, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const result = reply_batches.status(a, server.db, sess.username, id) catch |err| return mapReplyBatchError(conn, a, err);
+    return sendJson(conn, a, 200, try service_mod.json(a, result), null);
+}
+
+fn mapReplyBatchError(conn: *webmail_tls.Stream, a: std.mem.Allocator, err: anyerror) !void {
+    return switch (err) {
+        error.InvalidReplyBatchSelection => sendError(conn, a, 400, "invalid_reply_selection", "Choose one to twenty received messages."),
+        error.DuplicateReplyBatchSource => sendError(conn, a, 400, "duplicate_reply_source", "Choose one copy of each message."),
+        error.InvalidReplyBatch => sendError(conn, a, 400, "invalid_reply_batch", "Review the recipients and enter a reply of up to 256 KiB."),
+        error.ReplyBatchSourceUnavailable => sendError(conn, a, 422, "reply_source_unavailable", "A selected message cannot be included. Open it to reply individually."),
+        error.ReplyBatchRecipientUnavailable => sendError(conn, a, 422, "reply_recipient_unavailable", "A selected message lacks a single reply address. Open it to reply individually."),
+        error.ReplyBatchPreviewChanged => sendError(conn, a, 409, "reply_preview_changed", "A selected message or sending address changed. Review the replies again."),
+        error.ReplyBatchAccountChanged => sendError(conn, a, 409, "account_changed", "The signed-in account changed. Reload this tab before continuing."),
+        error.ReplyBatchConflict, store.StoreError.Conflict => sendError(conn, a, 409, "reply_batch_conflict", "This batch identifier already belongs to a different request. Check Outbox before starting a new batch."),
+        else => mapServiceError(conn, a, err),
+    };
 }
 
 fn handleUndo(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {

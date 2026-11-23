@@ -8,6 +8,7 @@ const io_compat = @import("../core/io_compat.zig");
 
 pub const StoreError = error{ Conflict, NotFound, StorageLimit, DraftStorageLimit, OutboxStorageLimit };
 pub const terminal_retention = 7 * 86400;
+pub const hosted_outbox_count = 1024;
 // Up to 100 bounded envelope addresses may be repeated in the delivery result.
 const outbox_result_reserve = 64 * 1024;
 pub const Record = struct {
@@ -298,15 +299,17 @@ pub fn accountAttachmentLimits(db: *database.Database, user: []const u8) !struct
 
 /// The caller serializes webmail mutations through the service, including the
 /// corresponding Maildir write. Growth is refused without evicting old rows.
+const recordCapacitySql =
+    \\SELECT COALESCE(SUM(bytes),0), COUNT(*), MAX(CASE WHEN id=?3 THEN bytes END)
+    \\FROM (SELECT id,length(CAST(payload AS BLOB)) +
+    \\ CASE WHEN state IN ('pending','sending','unknown') THEN ?4 ELSE 0 END AS bytes
+    \\ FROM webmail_records WHERE username=?1 AND kind=?2)
+;
+
 pub fn checkRecordCapacity(db: *database.Database, row: Record, max_bytes: usize, max_count: usize) !void {
     const outbox = std.mem.eql(u8, row.kind, "outbox");
     const reserve: usize = if (outbox) outbox_result_reserve else 0;
-    const s = try db.prepare(
-        \\SELECT COALESCE(SUM(bytes),0), COUNT(*), MAX(CASE WHEN id=?3 THEN bytes END)
-        \\FROM (SELECT id,length(CAST(payload AS BLOB)) +
-        \\ CASE WHEN state IN ('pending','sending','unknown') THEN ?4 ELSE 0 END AS bytes
-        \\ FROM webmail_records WHERE username=?1 AND kind=?2)
-    );
+    const s = try db.prepare(recordCapacitySql);
     defer s.finalize();
     try s.bind(1, row.username);
     try s.bind(2, row.kind);
@@ -422,6 +425,45 @@ pub fn enqueueCalendarReply(db: *database.Database, row: Record, receipt: Record
     const send = try tx.prepare(enqueueSql);
     defer send.finalize();
     _ = try enqueueWith(send, row, null, 0);
+    try tx.commit();
+}
+
+/// Publish the entire reply batch and its retry receipt in a single write.
+pub fn enqueueReplyBatch(db: *database.Database, from: []const u8, receipt: Record, rows: []const Record, hosted_budget: ?usize) !void {
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    {
+        const account = try tx.prepare("SELECT 1 FROM users WHERE username=?1 AND email=?2 AND enabled=1");
+        defer account.finalize();
+        try account.bind(1, receipt.username);
+        try account.bind(2, from);
+        if (!try account.step()) return error.ReplyBatchAccountChanged;
+    }
+    if (hosted_budget) |budget| {
+        const capacity = try tx.prepare(recordCapacitySql);
+        defer capacity.finalize();
+        try capacity.bind(1, receipt.username);
+        try capacity.bind(2, @as([]const u8, "outbox"));
+        try capacity.bind(3, @as([]const u8, ""));
+        try capacity.bind(4, outbox_result_reserve);
+        if (!try capacity.step()) unreachable;
+        const bytes: usize = @intCast(capacity.columnInt64(0));
+        const count: usize = @intCast(capacity.columnInt64(1));
+        var needed: usize = 0;
+        for (rows) |row| needed += row.payload.len + outbox_result_reserve;
+        if (needed > budget -| bytes or rows.len > hosted_outbox_count -| count) return StoreError.OutboxStorageLimit;
+    }
+    {
+        const ledger = try tx.prepare(putSql);
+        defer ledger.finalize();
+        _ = try putWith(ledger, receipt, 0);
+    }
+    const send = try tx.prepare(enqueueSql);
+    defer send.finalize();
+    for (rows) |row| {
+        _ = try enqueueWith(send, row, null, 0);
+        try send.reset();
+    }
     try tx.commit();
 }
 

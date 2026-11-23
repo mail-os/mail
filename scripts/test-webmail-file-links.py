@@ -12,7 +12,7 @@ import secrets
 import sqlite3
 import tempfile
 import time
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import unquote, urlencode, urlsplit
 
 
 support = runpy.run_path(str(Path(__file__).with_name("test-hosted-limits.py")))
@@ -90,7 +90,9 @@ def verify(fixture):
         assert downloaded == contents
         assert headers["Content-Type"] == "application/octet-stream"
         assert headers["Content-Security-Policy"] == "sandbox" and headers["X-Content-Type-Options"] == "nosniff"
-        assert headers["Content-Disposition"].startswith("attachment;") and "%E2%80%94" in headers["Content-Disposition"]
+        disposition, encoded_name = headers["Content-Disposition"].split("; filename*=UTF-8''", 1)
+        assert disposition == 'attachment; filename="download"'
+        assert unquote(encoded_name, errors="strict") == issued["file"]["filename"] == "Design proofs — final.bin"
         upload(session, b"retry", upload_id=upload_id, status=409)
         assert list_links(session) == {"links": [{"id": upload_id, **issued["file"]}]}
         assert list_links(other) == {"links": []}
