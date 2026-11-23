@@ -114,7 +114,7 @@ async function verifyControlRow(container, selector, height, sameRow = true) {
     const quiet = node.matches('.wm-list-toggle, .wm-action--quiet, .wm-composer-foot > .wm-action:not(.wm-snapshot-primary), .mail-auth-page button:not(.login-secondary)')
     const neutral = !quiet && (!primary || node.matches(':disabled'))
     return {
-      name: node.getAttribute('aria-label') || node.id || node.tagName,
+      name: node.getAttribute('aria-label') || node.querySelector('input[aria-label]')?.getAttribute('aria-label') || node.id || node.tagName,
       height: box.height,
       top: box.top,
       bottom: box.bottom,
@@ -149,11 +149,31 @@ function verifyControlGaps(controls, gap) {
   }
 }
 
+async function verifyControlContrast(toolbar) {
+  const surroundings = await toolbar.evaluate((node) => {
+    const style = getComputedStyle(node)
+    function luminance(property) {
+      const value = style.getPropertyValue(property).trim().slice(1)
+      const channels = value.match(/../g).map(channel => Number.parseInt(channel, 16) / 255)
+      const [red, green, blue] = channels.map(channel => channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4)
+      return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+    }
+    const stroke = luminance('--control-border')
+    return ['--panel', '--toolbar', '--surface', '--sidebar'].map((name) => {
+      const adjacent = luminance(name)
+      return { name, ratio: (Math.max(stroke, adjacent) + 0.05) / (Math.min(stroke, adjacent) + 0.05) }
+    })
+  })
+  for (const { name, ratio } of surroundings)
+    assert(ratio >= 3, `${name} has ${ratio.toFixed(2)}:1 contrast with the shared outline`)
+}
+
 async function verifyCalendarPeriod(page, label, height) {
   const group = page.getByRole('group', { name: 'Change date range' })
   const toolbar = page.locator('.calendar-view-toolbar')
   await verifySelect(toolbar.getByRole('combobox', { name: 'Display time zone' }), height)
-  const controls = await verifyControlRow(toolbar, '.calendar-period-buttons button, .calendar-jump input, .calendar-zone select', height, false)
+  const periodControls = '.calendar-period-buttons button, .calendar-jump, .calendar-zone select'
+  const controls = await verifyControlRow(toolbar, periodControls, height, false)
   assert.equal(controls.length, 5)
   const stacked = Math.abs(controls[3].top - controls[0].top) >= 0.5
   const width = page.viewportSize()?.width ?? 0
@@ -169,6 +189,10 @@ async function verifyCalendarPeriod(page, label, height) {
   }
   const date = controls[3]
   assert(date.right - date.left >= (width <= 490 ? 148 : 152), 'Jump to date leaves room for the native date and picker')
+  const dateInput = group.getByLabel('Jump to date', { exact: true })
+  const editor = await dateInput.boundingBox()
+  assert(Math.abs(editor.y - date.top - 1) < 0.5 && Math.abs(editor.height - date.height + 2) < 0.5,
+    'The native date editor fills the inside of its single outline')
   const datePicker = button(group, 'Open date picker')
   const pickerBox = await datePicker.boundingBox()
   assert(Math.abs(pickerBox.width - height) < 0.5 && Math.abs(pickerBox.height - height) < 0.5,
@@ -194,7 +218,8 @@ async function verifyCalendarPeriod(page, label, height) {
     views = await verifyControlRow(viewGroup, 'button', height)
     verifyControlGaps(views, 8)
   }
-  assert([...controls, ...views].every(control => control.fontSize === date.fontSize), 'Toolbar fields and actions share a text size')
+  const dateFontSize = await dateInput.evaluate(node => getComputedStyle(node).fontSize)
+  assert([...row.slice(0, 3), controls[4], ...views].every(control => control.fontSize === dateFontSize), 'Toolbar fields and actions share a text size')
   const crampedViews = await toolbar.locator('.calendar-view-modes button:visible').evaluateAll(buttons => buttons.flatMap((button) => {
     const box = button.getBoundingClientRect()
     const range = document.createRange()
@@ -210,14 +235,20 @@ async function verifyCalendarPeriod(page, label, height) {
         'The view and time zone controls align with both edges of the date controls')
     }
     verifyControlGaps([views.at(-1), controls[0]], 16)
+    const zoneLabel = await toolbar.locator('.calendar-zone').boundingBox()
+    assert(Math.abs(zoneLabel.x - date.right - 16) < 0.5, 'Time zone stays with the other date controls')
   }
   if (width > 490 && width <= 1080) {
     assert(Math.abs(controls[0].top - views[0].bottom - 8) < 0.5, 'Tablet navigation starts eight pixels below the views')
     assert(Math.abs(controls[0].left - views[0].left) < 0.5, 'Tablet navigation and views share a leading edge')
-    if (width > 740)
+    if (width > 740) {
       assert(Math.abs(zone.top - date.top) < 0.5, 'The time zone shares the second row on wider tablets')
-    else
+      const zoneLabel = await toolbar.locator('.calendar-zone').boundingBox()
+      assert(Math.abs(zoneLabel.x - date.right - 16) < 0.5, 'The time zone keeps its desktop spacing on wider tablets')
+    }
+    else {
       assert(Math.abs(zone.top - date.bottom - 8) < 0.5, 'The time zone has an eight-pixel gap on narrow tablets')
+    }
   }
   if (stacked) {
     assert(Math.abs(date.top - row[0].bottom - 8) < 0.5, 'Jump to date has the same gap below date navigation')
@@ -225,6 +256,7 @@ async function verifyCalendarPeriod(page, label, height) {
   }
   await fitsViewport(page)
   if (!label) return
+  await verifyControlContrast(toolbar)
   await mkdir(output, { recursive: true })
   const groupBox = await group.boundingBox()
   const capture = await group.screenshot({ path: join(output, `${label}-date-controls.png`), animations: 'disabled', scale: 'css' })
@@ -236,7 +268,7 @@ async function verifyCalendarPeriod(page, label, height) {
     iconLeft: pickerIcon.x - groupBox.x,
   })
   await verifyPaintedControlBorders(toolbar,
-    '.calendar-view-modes button, .calendar-view-picker select, .calendar-period-buttons button, .calendar-jump input, .calendar-zone select',
+    `.calendar-view-modes button, .calendar-view-picker select, ${periodControls}`,
     [...views, ...controls], `${label}-calendar-toolbar`)
 }
 
@@ -244,9 +276,18 @@ async function verifyPaintedControlBorders(container, selector, controls, name) 
   const centers = await container.evaluate((group, selector) => {
     const box = group.getBoundingClientRect()
     return Array.from(group.querySelectorAll(selector)).flatMap((control) => {
-      const { left, top, height } = control.getBoundingClientRect()
+      const { left, top, right, bottom, width, height } = control.getBoundingClientRect()
       if (height === 0) return []
-      return [{ x: Math.floor(left - box.left), y: Math.floor(top + height / 2 - box.top) }]
+      const x = Math.floor(left + width / 2 - box.left)
+      const y = Math.floor(top + height / 2 - box.top)
+      return [{
+        edges: [
+          { side: 'left', x: Math.floor(left - box.left), y, dx: 1, dy: 0 },
+          { side: 'right', x: Math.ceil(right - box.left) - 1, y, dx: 1, dy: 0 },
+          { side: 'top', x, y: Math.floor(top - box.top), dx: 0, dy: 1 },
+          { side: 'bottom', x, y: Math.ceil(bottom - box.top) - 1, dx: 0, dy: 1 },
+        ],
+      }]
     })
   }, selector)
   assert.equal(centers.length, controls.length, 'Every visible control has a position in the screenshot')
@@ -262,21 +303,24 @@ async function verifyPaintedControlBorders(container, selector, controls, name) 
     context.drawImage(bitmap, 0, 0)
     const hex = getComputedStyle(node).getPropertyValue('--control-border').trim()
     const border = hex.slice(1).match(/../g).map(channel => Number.parseInt(channel, 16))
-    return centers.flatMap(({ name, x, y }) => {
+    return centers.flatMap(({ name, edges }) => edges.flatMap(({ side, x, y, dx, dy }) => {
       // Mobile viewport and screenshot rounding can snap fractional boxes separately.
-      const start = Math.max(0, x - 2)
-      const strip = context.getImageData(start, y, x + 3 - start, 1).data
+      const startX = Math.max(0, x - 2 * dx)
+      const startY = Math.max(0, y - 2 * dy)
+      const width = Math.min(canvas.width, x + 1 + 2 * dx) - startX
+      const height = Math.min(canvas.height, y + 1 + 2 * dy) - startY
+      const strip = context.getImageData(startX, startY, width, height).data
       for (let pixel = 0; pixel < strip.length; pixel += 4) {
         if (border.every((channel, offset) => Math.abs(strip[pixel + offset] - channel) <= 3)) return []
       }
-      return [{ name, x, y, samples: Array.from(strip) }]
-    })
+      return [{ name, side, x, y, samples: Array.from(strip) }]
+    }))
   }, { png: capture.toString('base64'), centers: neutralEdges })
   assert.deepEqual(mismatches, [], 'Visible straight edges should paint the shared border color')
 }
 
 async function verifyDateTextAlignment(page, capture, date) {
-  const { centerOffset, iconGapHasInk } = await page.evaluate(async ({ image, date }) => {
+  const { centerOffset, iconGapHasInk, iconHasInk } = await page.evaluate(async ({ image, date }) => {
     // The browser paints the date value in its native editor. Inspect the
     // screenshot to catch centering errors the input's DOM bounds cannot show.
     const encoded = Uint8Array.from(atob(image), char => char.charCodeAt(0))
@@ -302,15 +346,22 @@ async function verifyDateTextAlignment(page, capture, date) {
     const gap = context.getImageData(Math.round(date.iconLeft) - 16, Math.round(date.y) + 5, 16, date.height - 10)
     const fill = context.getImageData(Math.round(date.iconLeft) - 1, Math.round(date.y) + 5, 1, 1).data
     const iconGapHasInk = gap.data.some((channel, index) => index % 4 !== 3 && Math.abs(channel - fill[index % 4]) > 6)
-    return { centerOffset: inkRows.length ? (inkRows[0] + inkRows.at(-1) - area.height) / 2 : null, iconGapHasInk }
+    const icon = context.getImageData(Math.round(date.iconLeft), Math.round(date.y + (date.height - 16) / 2), 16, 16)
+    const iconHasInk = icon.data.some((channel, index) => index % 4 !== 3 && Math.abs(channel - fill[index % 4]) > 45)
+    return { centerOffset: inkRows.length ? (inkRows[0] + inkRows.at(-1) - area.height) / 2 : null, iconGapHasInk, iconHasInk }
   }, { image: capture.toString('base64'), date })
   assert(centerOffset !== null && Math.abs(centerOffset) <= 2.5, `The visible date should be centered, got ${centerOffset}px off center`)
   assert(!iconGapHasInk, 'Only the app calendar icon appears in the reserved trailing area')
+  assert(iconHasInk, 'The calendar icon is visible in the captured date field')
 }
 
 async function verifyCalendarPicker(page) {
   const date = page.getByLabel('Jump to date', { exact: true })
   const picker = button(page, 'Open date picker')
+  await button(page, 'Next period').press('Tab')
+  assert(await date.evaluate(input => input.matches(':focus-visible') || input.contains(document.activeElement)), 'The date editor is reachable by keyboard')
+  assert.equal(await page.locator('.calendar-jump').evaluate(field => getComputedStyle(field).outlineWidth), '2px',
+    'Keyboard focus outlines the full date control')
   await date.evaluate((input) => {
     const showPicker = input.showPicker
     input.showPicker = function () {
