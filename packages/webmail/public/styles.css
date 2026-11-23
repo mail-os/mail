@@ -1463,7 +1463,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .calendar-range { margin-block: 12px 7px; }
 }
 @media (max-width: 375px) {
-  .calendar-view-modes { display: none; }
+  .calendar-view-toolbar .calendar-view-modes { display: none; }
   .calendar-view-picker, .calendar-zone { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 60%); align-items: center; gap: 8px; width: 100%; color: var(--muted); font-size: .8rem; white-space: normal; }
   :is(.calendar-view-picker, .calendar-zone) select { width: 100%; max-width: none; }
 }
