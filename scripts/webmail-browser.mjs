@@ -151,10 +151,23 @@ async function verifyCalendarPeriod(page, label, height) {
   }
   const date = controls[3]
   assert(date.right - date.left >= 136, 'Jump to date leaves room for the native date and picker')
-  const views = await verifyControlRow(toolbar.getByRole('group', { name: 'Calendar view' }), 'button', height)
-  verifyControlGaps(views, 6)
+  const viewGroup = toolbar.getByRole('group', { name: 'Calendar view' })
+  const viewPicker = toolbar.getByRole('combobox', { name: 'Calendar view', exact: true })
+  let views
+  if (width <= 375) {
+    assert(!await viewGroup.isVisible())
+    await verifySelect(viewPicker, height)
+    await verifySelectedOptionFits(viewPicker)
+    const [mode, zone] = await verifyControlRow(toolbar, '.calendar-view-picker select, .calendar-zone select', height, false)
+    assert(Math.abs(mode.left - zone.left) < 0.5 && Math.abs(mode.right - zone.right) < 0.5, 'The view and time zone pickers align')
+    views = [mode]
+  }
+  else {
+    views = await verifyControlRow(viewGroup, 'button', height)
+    verifyControlGaps(views, 6)
+  }
   assert([...controls, ...views].every(control => control.fontSize === date.fontSize), 'Toolbar fields and actions share a text size')
-  const crampedViews = await toolbar.locator('.calendar-view-modes button').evaluateAll(buttons => buttons.flatMap((button) => {
+  const crampedViews = await toolbar.locator('.calendar-view-modes button:visible').evaluateAll(buttons => buttons.flatMap((button) => {
     const box = button.getBoundingClientRect()
     const range = document.createRange()
     range.selectNodeContents(button)
@@ -177,6 +190,14 @@ async function verifyCalendarPeriod(page, label, height) {
   await mkdir(output, { recursive: true })
   await group.screenshot({ path: join(output, `${label}-date-controls.png`), animations: 'disabled' })
   await toolbar.screenshot({ path: join(output, `${label}-calendar-toolbar.png`), animations: 'disabled' })
+}
+
+async function chooseCalendarView(page, label) {
+  const toolbar = page.locator('.calendar-view-toolbar')
+  await toolbar.waitFor()
+  const picker = toolbar.getByRole('combobox', { name: 'Calendar view', exact: true })
+  if (await picker.isVisible()) await picker.selectOption({ label })
+  else await button(toolbar, label).click()
 }
 
 async function verifyReaderToolbar(toolbar, height) {
@@ -620,6 +641,13 @@ async function phoneJourney(page) {
   await page.setViewportSize({ width: 320, height: 844 })
   await fitsViewport(page)
   await verifyCalendarPeriod(page, 'narrow-phone-dark', 44)
+  const narrowView = page.getByRole('combobox', { name: 'Calendar view', exact: true })
+  assert.deepEqual(await narrowView.locator('option').allTextContents(), ['Day', 'Week', 'Month', 'Year', 'Agenda'])
+  assert.equal(await narrowView.inputValue(), 'month')
+  await chooseCalendarView(page, 'Week')
+  await page.getByText('Studio review', { exact: true }).waitFor()
+  await chooseCalendarView(page, 'Month')
+  await button(page, /, 2 events$/).waitFor()
   await page.setViewportSize({ width: 390, height: 844 })
   await page.emulateMedia({ colorScheme: 'light' })
   await verifyCalendarPeriod(page, 'phone-light', 44)
@@ -1652,7 +1680,7 @@ async function invitationRangeJourney(desktop, phone) {
   await screenshot(desktop, 'desktop-calendar-range-week')
 
   await phone.goto(url + '/calendar?day=2026-11-28')
-  await button(phone, 'Day').click()
+  await chooseCalendarView(phone, 'Day')
   const later = button(phone, /Studio reservation series/)
   await later.waitFor()
   assert.match(await later.locator('.calendar-entry-time').textContent(), /^6:00(?:\s*PM)?\s*–\s*8:00\s*PM$/)
@@ -1787,7 +1815,7 @@ async function yearCalendarJourney(desktop, phone) {
   assert.equal(await desktop.getByLabel('Jump to date', { exact: true }).inputValue(), '2029-02-28')
 
   await phone.goto(calendarUrl)
-  await button(phone, 'Year').click()
+  await chooseCalendarView(phone, 'Year')
   const phoneYear = phone.getByRole('region', { name: 'Year overview' })
   await phoneYear.getByRole('button', { name: /February 29, 2028, 1 event$/ }).waitFor()
   await phone.setViewportSize({ width: 320, height: 844 })

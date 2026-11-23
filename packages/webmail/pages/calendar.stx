@@ -383,6 +383,12 @@ onUnmounted(() => { destroy(); destroyReminders() })
       <div class="calendar-choices calendar-view-modes" role="group" aria-label="Calendar view">
         <button :for="mode in calendarViews" class="wm-action" @click="showView(mode.id)" :aria-pressed="!searchTerm && view === mode.id" :text="mode.name"></button>
       </div>
+      <label class="calendar-view-picker">View
+        <select aria-label="Calendar view" :value="searchTerm ? '' : view" @change="showView($event.target.value)">
+          <option :if="searchTerm" value="" disabled>Search results</option>
+          <option :for="mode in calendarViews" :value="mode.id" :text="mode.name"></option>
+        </select>
+      </label>
       <div :if="!searchTerm" class="calendar-choices calendar-period" role="group" aria-label="Change date range">
         <div class="calendar-period-buttons">
           <button class="wm-action calendar-arrow" @click="shiftView(-1)" aria-label="Previous period"><span class="mail-icon" data-icon="left" aria-hidden="true"></span></button>
@@ -391,7 +397,7 @@ onUnmounted(() => { destroy(); destroyReminders() })
         </div>
         <input type="date" aria-label="Jump to date" :value="focusDay" @change="changeDate($event)">
       </div>
-      <label class="calendar-zone">Display time zone
+      <label class="calendar-zone">Time zone
         <select aria-label="Display time zone" :value="displayZone" @change="changeZone($event)">
           <option :for="zone in calendarTimeZones" :value="zone" :text="zone"></option>
         </select>
