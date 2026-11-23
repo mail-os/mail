@@ -2762,6 +2762,7 @@ async function calendarImportControlsJourney(page, phone = false) {
         assert(Math.abs(responsive[0].left - responsive[1].left) < 0.5 && Math.abs(responsive[0].right - responsive[3].right) < 0.5,
           'The tablet file field spans the destination, name, and Preview row')
       }
+      if (width === 491) await verifyPaintedControlBorders(form, selector, responsive, 'tablet-491-calendar-import')
     }
     await page.setViewportSize(viewport)
   }
