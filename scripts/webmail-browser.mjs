@@ -251,6 +251,7 @@ async function verifyAppearance(page, scheme) {
     }
     const pairs = [
       ['--text', '--panel'], ['--muted', '--panel'], ['--muted', '--surface'],
+      ['--control-disabled-text', '--panel'], ['--control-disabled-text', '--surface'],
       ['--muted', '--toolbar'], ['--muted', '--selected'], ['--muted', '--sidebar'],
       ['--text', '--list'], ['--muted', '--list'], ['--accent', '--selected'],
       ['--violet', '--sidebar'], ['--teal', '--sidebar'], ['--warning', '--sidebar'],
@@ -418,7 +419,8 @@ async function desktopJourney(page) {
   await page.getByRole('textbox', { name: 'Filter by sender' }).waitFor()
   const statusFilter = page.getByRole('combobox', { name: 'Filter by message status' })
   await verifySelect(statusFilter)
-  await statusFilter.focus()
+  await page.getByRole('checkbox', { name: 'Flagged', exact: true }).press('Shift+Tab')
+  assert(await statusFilter.evaluate(node => node === document.activeElement), 'Keyboard navigation reaches the status picker')
   assert.equal(await statusFilter.evaluate(node => getComputedStyle(node).outlineStyle), 'solid')
   if (engine === 'chromium') {
     await page.emulateMedia({ forcedColors: 'active' })
@@ -766,6 +768,12 @@ async function calendarTasksJourney(page, phone = false) {
   assert.equal(await date.inputValue(), '')
   await editor.getByText('No date', { exact: true }).waitFor()
   await verifyControlRow(editor, 'input, button', phone ? 44 : 36, !phone)
+  const taskStatus = panel.getByRole('group', { name: 'Task status' })
+  assert(await button(taskStatus, 'Open').isDisabled())
+  assert(await button(taskStatus, 'Completed').isDisabled())
+  const statusControls = await verifyControlRow(taskStatus, 'button', phone ? 44 : 36)
+  assert(statusControls.every(control => control.opacity === '1' && control.borderMatches),
+    'Task status buttons keep their borders while editing')
   await title.fill(name)
   await panel.screenshot({ path: join(output, phone ? 'phone-calendar-task-editor.png' : 'desktop-calendar-task-editor.png'), animations: 'disabled' })
   await button(editor, 'Add task').click()
@@ -1545,8 +1553,26 @@ async function freeTimeJourney(page, phone = false) {
   const panel = page.getByRole('region', { name: 'Find free time' })
   await page.waitForFunction(() => document.activeElement?.getAttribute('data-stx-ref') === 'freeTimeDateField')
   if (phone) await page.setViewportSize({ width: 320, height: 844 })
-  await verifyControlRow(panel.locator('form'), 'input, select, button', phone ? 44 : 36, !phone)
+  const form = panel.locator('form')
+  const controls = await verifyControlRow(form, 'input, select, button', phone ? 44 : 36, !phone)
+  const [date, from, to, duration, availability] = controls
+  if (phone) {
+    for (const control of [duration, availability]) {
+      assert(Math.abs(control.left - date.left) < 0.5 && Math.abs(control.right - date.right) < 0.5,
+        'The duration field and Check availability button align with the date field at 320px')
+    }
+    verifyControlGaps([from, to], 8)
+    assert(Math.abs(availability.top - duration.bottom - 8) < 0.5, 'The button has the standard gap below the duration field')
+  }
   const check = button(panel, 'Check availability')
+  const buttonInset = await check.evaluate(node => {
+    const range = document.createRange()
+    range.selectNodeContents(node)
+    const label = range.getBoundingClientRect()
+    const box = node.getBoundingClientRect()
+    return Math.min(label.left - box.left, box.right - label.right)
+  })
+  assert(buttonInset >= 10, 'Check availability has room inside both borders')
   const slots = panel.getByRole('list', { name: 'Open windows' })
   await check.click()
   await panel.getByRole('status').filter({ hasText: '3 open windows' }).waitFor()
@@ -1562,6 +1588,11 @@ async function freeTimeJourney(page, phone = false) {
   await fitsViewport(page)
   await page.mouse.move(0, 0)
   await panel.screenshot({ path: join(output, phone ? 'phone-calendar-free-time.png' : 'desktop-calendar-free-time.png'), animations: 'disabled' })
+  if (phone) {
+    await page.emulateMedia({ colorScheme: 'light' })
+    await panel.screenshot({ path: join(output, 'phone-calendar-free-time-light.png'), animations: 'disabled' })
+    await page.emulateMedia({ colorScheme: 'dark' })
+  }
   await panel.getByLabel('From', { exact: true }).fill('10:40')
   await panel.getByLabel('To', { exact: true }).fill('15:30')
   await panel.getByLabel('Minimum duration').selectOption('120')
@@ -1626,6 +1657,7 @@ async function calendarSharingJourney(captain) {
   const shareControls = await verifyControlRow(shareForm, 'select, input, button', 36)
   assert.equal(shareControls.length, 5)
   verifyControlGaps(shareControls, 12)
+  await shareForm.screenshot({ path: join(output, 'desktop-calendar-sharing-light.png'), animations: 'disabled' })
   await captain.emulateMedia({ colorScheme: 'dark' })
   verifyControlGaps(await verifyControlRow(shareForm, 'select, input, button', 36), 12)
   await shareForm.screenshot({ path: join(output, 'desktop-calendar-sharing-dark.png'), animations: 'disabled' })

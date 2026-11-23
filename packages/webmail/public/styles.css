@@ -12,7 +12,8 @@
   --text: #20232c;
   --muted: #515966;
   --border: #d9dce3;
-  --control-border: #838795;
+  --control-border: #80838b;
+  --control-disabled-text: #646a75;
   --control-height: 36px;
   --control-radius: 8px;
   --control-font-size: .8125rem;
@@ -55,7 +56,8 @@
     --text: #f5f5f8;
     --muted: #b7bcc9;
     --border: #41434b;
-    --control-border: #7c8190;
+    --control-border: #7e818a;
+    --control-disabled-text: #a0a5b0;
     --select-chevron: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Cpath d=%22m4 6 4 4 4-4%22 fill=%22none%22 stroke=%22%23b7bcc9%22 stroke-width=%221.5%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22/%3E%3C/svg%3E");
     --accent: #94c4ff;
     --primary: #2068c4;
@@ -123,7 +125,6 @@ body {
   font-weight: 600;
   cursor: pointer;
 }
-.login button:disabled { opacity: 0.6; cursor: default; }
 .login-link { color: var(--accent); font-weight: 600; text-decoration: none; }
 .login-link:hover, .login-link:focus-visible { text-decoration: underline; }
 .login-forgot { margin: 14px 0 0; text-align: center; font-size: 13px; }
@@ -169,6 +170,9 @@ input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
 /* Keep WebKit's native date editor inside the same box as the other fields. */
 input::-webkit-date-and-time-value { margin: 0; min-height: 0; text-align: start; }
 input::-webkit-datetime-edit { padding: 0; }
+@media (forced-colors: none) {
+  input::-webkit-calendar-picker-indicator { opacity: .72; }
+}
 :where(input[type=file]:not(.wm-file-input)) { padding: 3px; }
 input::file-selector-button {
   min-block-size: calc(var(--control-height) - 8px);
@@ -195,7 +199,7 @@ select:dir(rtl) { background-position: left var(--control-inline-padding) center
 :is(select, input[type=date], input[type=time], input[type=datetime-local]):hover:not(:disabled) { background-color: var(--toolbar); }
 :is(input:not([type=checkbox], [type=radio], [type=hidden], .wm-file-input), select, textarea):disabled {
   background-color: var(--surface);
-  color: var(--muted);
+  color: var(--control-disabled-text);
   -webkit-text-fill-color: currentColor;
   opacity: 1;
   cursor: default;
@@ -207,7 +211,7 @@ select:dir(rtl) { background-position: left var(--control-inline-padding) center
 }
 button { cursor: pointer; }
 button:disabled { opacity: .5; cursor: default; }
-:is(button, input, textarea, a):focus-visible, select:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+:is(button, input, textarea, select, a):focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .wm { display: grid; grid-template-columns: 210px minmax(0, 1fr); height: 100dvh; }
 .wm-folders { display: flex; flex-direction: column; gap: 16px; padding: 20px 12px; background: var(--sidebar); border-right: 1px solid var(--border); min-height: 0; }
 .wm-brand { padding: 0 12px; font-size: 20px; font-weight: 750; letter-spacing: -.5px; }
@@ -235,7 +239,7 @@ button:disabled { opacity: .5; cursor: default; }
 .wm-action { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; cursor: pointer; }
 .wm-action:hover:where(:not(:disabled)) { background: var(--toolbar); }
 .wm-action--danger { color: var(--danger); }
-.wm-action--danger:hover { background: var(--danger-soft); }
+.wm-action--danger:hover:not(:disabled) { background: var(--danger-soft); }
 .wm-filter-panel { display: flex; flex-direction: column; gap: 10px; padding-top: 12px; }
 .wm-filter-panel label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
 .wm-filter-panel select { width: 100%; }
@@ -547,7 +551,15 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-series h2 { font-weight: 650; }
 .calendar-import { border: 1px solid var(--border); border-radius: 12px; padding: 1rem; margin-block: 1rem; background: var(--panel); }
 .calendar-import-form { display: flex; flex-wrap: wrap; align-items: end; gap: .75rem; }
-.calendar-import-form label { display: grid; gap: 6px; min-width: 0; color: var(--muted); font-size: 13px; font-weight: 550; }
+:is(.calendar-import-form, .calendar-task-form, .calendar-tools-form, .calendar-free-time-form, .calendar-editor-fields) label:not(.calendar-all-day) {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 550;
+  line-height: 1.25;
+}
 .calendar-import-form :is(input, select) { width: 100%; }
 .calendar-create-form { display: grid; grid-template-columns: minmax(0, 12.5rem) max-content; justify-content: start; }
 .calendar-share-form { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, .8fr) minmax(0, 1.65fr) minmax(0, 1fr) max-content; gap: 12px; max-inline-size: 68rem; }
@@ -574,7 +586,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-period-buttons { display: flex; align-items: center; gap: 6px; }
 .calendar-period .wm-action { block-size: var(--control-height); justify-content: center; }
 .calendar-period .calendar-arrow { inline-size: var(--control-height); padding-inline: 0; }
-.calendar-period input { inline-size: 9rem; font-weight: 500; }
+.calendar-period input { inline-size: 9rem; }
 .calendar-search { flex-wrap: nowrap; }
 .calendar-search input { width: min(14rem, 100%); }
 .calendar-zone { display: flex; align-items: center; gap: .45rem; color: var(--muted); flex-wrap: wrap; font-size: .8rem; }
@@ -586,11 +598,10 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-tasks-heading h2 { flex: 1 1 auto; margin: 0; font-size: 16px; font-weight: 650; }
 .calendar-tasks-heading .calendar-task-status { flex-wrap: nowrap; width: auto; }
 .calendar-task-form { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
-.calendar-task-form label { display: grid; gap: 5px; min-width: 0; font-size: 13px; font-weight: 550; }
 .calendar-task-form > label { flex: 1 1 14rem; }
 .calendar-task-form input { width: 100%; }
 .calendar-task-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-.calendar-task-date { display: grid; gap: 5px; min-width: 0; }
+.calendar-task-date { display: grid; gap: 6px; min-width: 0; }
 .calendar-task-date .calendar-task-actions { flex-wrap: nowrap; }
 .calendar-task-date-field { position: relative; flex: 1 1 auto; min-width: 0; }
 .calendar-task-date-field input { display: block; }
@@ -598,7 +609,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 @media (forced-colors: none) {
   /* Some native date inputs show today's date as their empty placeholder. */
   .calendar-task-date-field[data-empty=true] input:not(:focus) { color: transparent; -webkit-text-fill-color: transparent; }
-  .calendar-task-date-field:not(:focus-within) .calendar-task-date-placeholder { position: absolute; inset: 0 auto 0 10px; display: flex; align-items: center; color: var(--muted); font-size: 13px; pointer-events: none; }
+  .calendar-task-date-field:not(:focus-within) .calendar-task-date-placeholder { position: absolute; inset-block: 0; inset-inline-start: calc(1px + var(--control-inline-padding)); display: flex; align-items: center; color: var(--muted); font-size: var(--control-font-size); pointer-events: none; }
 }
 .calendar-task-clear { flex: 0 0 var(--control-height); justify-content: center; padding-inline: 0; }
 .calendar-task-list { padding: 0; list-style: none; border: 1px solid var(--border); border-radius: var(--control-radius); background: var(--panel); }
@@ -617,9 +628,9 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-tools-tabs { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px; border-radius: var(--control-radius); background: var(--surface); }
 .calendar-tools-tabs .wm-action { border-color: transparent; background: transparent; }
 .calendar-tools-tabs .wm-action[aria-pressed=true] { border-color: var(--control-border); background: var(--panel); color: var(--accent); }
-.calendar-tools-tabs .wm-action:hover { background: var(--hover); }
+.calendar-tools-tabs .wm-action:hover:not(:disabled) { background: var(--hover); }
 .calendar-tools-form { align-items: end; }
-.calendar-tools-form label { display: grid; gap: 5px; min-width: 0; max-width: 100%; font-size: 13px; font-weight: 550; }
+.calendar-tools-form label { max-width: 100%; }
 .calendar-tools-form label.calendar-tools-title { flex: 1 1 12rem; }
 .calendar-tools-form :is(input, textarea, select) { width: 100%; }
 .calendar-tools-form .calendar-tools-minutes { inline-size: 7rem; }
@@ -664,7 +675,6 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-free-time-heading h2 { margin: 0; font-size: 16px; }
 .calendar-free-time-heading p { margin: 0; color: var(--muted); font-size: 12px; }
 .calendar-free-time-form { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
-.calendar-free-time-form label { display: grid; gap: 5px; min-width: 0; font-size: 13px; font-weight: 550; }
 .calendar-free-time-form :is(input:not([type=checkbox]), select) { width: 100%; }
 .calendar-free-time-form .calendar-free-time-personal { display: flex; align-items: center; gap: 6px; flex-basis: 100%; min-block-size: var(--control-height); }
 .calendar-free-time > .calendar-label-error { margin-block-start: 10px; }
@@ -677,7 +687,10 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .calendar-source-tools { width: 100%; }
   .calendar-free-time-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .calendar-free-time-form > label:first-child, .calendar-free-time-form > .calendar-free-time-personal { grid-column: 1 / -1; }
-  .calendar-free-time-form > button { justify-content: center; padding-inline: 6px; }
+  .calendar-free-time-form > button { justify-content: center; }
+}
+@media (max-width: 375px) {
+  .calendar-free-time-form > :is(label:has(select), button) { grid-column: 1 / -1; }
 }
 
 .calendar-board, .calendar-weekdays { display: grid; }
@@ -750,7 +763,6 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-editor { max-width: 36rem; }
 .calendar-editor h2 { margin: 0; font-size: 1rem; }
 .calendar-editor-fields { display: grid; gap: .8rem; margin: 0; padding: 1rem 1.25rem; min-width: 0; border: 0; }
-.calendar-editor-fields label:not(.calendar-all-day) { display: grid; gap: .3rem; font-weight: 550; min-width: 0; }
 .calendar-editor-fields input, .calendar-editor-fields textarea, .calendar-editor-fields select { font-weight: 400; width: 100%; }
 .calendar-editor-fields textarea { resize: vertical; }
 .calendar-editor-time, .calendar-editor-time > div { display: grid; gap: .65rem; }
@@ -914,7 +926,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-read-subject:focus-visible, .wm-inline-error:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 6px; }
 .wm-inline-error { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 13px; background: var(--danger-soft); color: var(--danger); font-size: 13px; }
 .wm-action--accent { color: var(--accent); border-color: var(--control-border); background: var(--accent-soft); }
-.wm-action--accent:hover, .wm-action--accent:focus-visible { background: var(--selected); }
+.wm-action--accent:hover:not(:disabled), .wm-action--accent:focus-visible { background: var(--selected); }
+.wm-action--accent:disabled { background: var(--surface); }
 .wm-action--accent .mail-icon { color: inherit; }
 .wm-batch-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; padding: 9px 14px; background: var(--surface); border-bottom: 1px solid var(--border); }
 .wm-batch-progress { color: var(--muted); font-size: 12px; margin-inline-end: auto; font-variant-numeric: tabular-nums; }
@@ -1200,7 +1213,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-search .mail-search-field { min-width: min(12rem, 45vw); padding-inline-end: 4px; }
 .calendar-search .wm-search { width: 100%; }
 .calendar-view-modes .wm-action[aria-pressed=true] { background: var(--accent-soft); color: var(--accent); }
-.calendar-view-modes .wm-action[aria-pressed=true]:hover { background: var(--selected); }
+.calendar-view-modes .wm-action[aria-pressed=true]:hover:not(:disabled) { background: var(--selected); }
 .calendar-card-mark { display: flex; align-items: center; gap: 8px; color: var(--accent); }
 .calendar-sharing { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
 .calendar-sharing h2 { margin: 0 0 10px; font-size: 16px; }
@@ -1394,12 +1407,15 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-zone { flex-wrap: nowrap; margin-inline-start: auto; }
 .calendar-zone select { width: auto; max-width: min(12.5rem, 49vw); }
 
-/* Keep outlined actions as legible as disabled fields while requests run. */
-:is(.calendar-primary, .wm-snapshot-primary, .wm-snapshot-panel .wm-action, .wm-composer-foot .wm-send-btn, .wm-message-toolbar .wm-tool-move .wm-tool):disabled {
+/* Preserve the outline while disabling a control. Quiet buttons keep their transparent styling. */
+.wm-action:disabled { opacity: 1; color: var(--control-disabled-text); }
+.wm-action:disabled .mail-icon { color: inherit; }
+:where(.wm-action:disabled) { background-color: var(--surface); }
+:is(.calendar-primary, .wm-snapshot-primary, .wm-snapshot-panel .wm-action, .wm-composer-foot .wm-send-btn, .wm-message-toolbar .wm-tool-move .wm-tool, .login button):disabled {
   opacity: 1;
   background: var(--surface);
   border-color: var(--control-border);
-  color: var(--muted);
+  color: var(--control-disabled-text);
 }
 @media (max-width: 960px) {
   .calendar-share-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
