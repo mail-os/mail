@@ -104,9 +104,9 @@ const {
   snapshotMode, snapshotBusy, snapshotError, snapshotNotice, snapshotLifetime, snapshotPreview, snapshotIssued, snapshotLinks,
   snapshotRevoke, snapshotCanRefresh, refreshSnapshotPreview, createSnapshot, manageSnapshots, revokeSnapshot, copySnapshotUrl,
   teamThreadMode, teamThreadBusy, teamThreadError, teamThreadNotice, teamThreadPreview, teamThreadGrants, teamThreadDetail,
-  teamThreadTeams, teamThreadTeam, teamThreadGrantee, teamThreadDownloads, teamThreadFollowReplies, teamThreadSearch, teamThreadComment, teamThreadRevoking,
+  teamThreadTeams, teamThreadTeam, teamThreadGrantee, teamThreadDownloads, teamThreadFollowReplies, teamThreadFollowSentReplies, teamThreadSearch, teamThreadComment, teamThreadRevoking,
   teamThreadCollection, teamThreadPages, turnTeamThreadPage, shareCollectionWithTeam,
-  setTeamThreadDownloads, setTeamThreadFollowReplies, shareTeamThread, listTeamThreads, openTeamThread, addTeamThreadComment, revokeTeamThread, closeTeamThreads, shareWithTeam,
+  setTeamThreadDownloads, setTeamThreadFollowReplies, setTeamThreadFollowSentReplies, shareTeamThread, listTeamThreads, openTeamThread, addTeamThreadComment, revokeTeamThread, closeTeamThreads, shareWithTeam,
   closeSnapshots, canShareSnapshot, shareMessageSnapshot, shareSelectedSnapshot,
   assistantMode, assistantBusy, assistantError, assistantNotice, assistantName, assistantRead, assistantDraft,
   assistantLifetime, assistantSelection, assistantPreview, assistantIssued, assistantGrants, assistantAudit, assistantRevocation,
@@ -1180,7 +1180,8 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       <form class="wm-snapshot-workflow" @submit.prevent="shareTeamThread()">
         <label class="wm-team-thread-option"><input type="checkbox" :checked="teamThreadDownloads" @change="setTeamThreadDownloads($event.target.checked)" :disabled="teamThreadBusy">Allow attachment downloads</label>
         <label :if="!teamThreadCollection" class="wm-team-thread-option"><input type="checkbox" :checked="teamThreadFollowReplies" @change="setTeamThreadFollowReplies($event.target.checked)" :disabled="teamThreadBusy">Follow verified replies</label>
-        <p :if="teamThreadPreview?.followingAuthors.length" class="wm-snapshot-muted" :text="'Share text previews of up to 40 incoming replies from ' + teamThreadPreview.followingAuthors.join(', ') + '.'"></p>
+        <label :if="!teamThreadCollection && teamThreadFollowReplies" class="wm-team-thread-option"><input type="checkbox" :checked="teamThreadFollowSentReplies" @change="setTeamThreadFollowSentReplies($event.target.checked)" :disabled="teamThreadBusy">Include my sent replies</label>
+        <p :if="teamThreadPreview?.followingAuthors.length" class="wm-snapshot-muted" :text="teamThreadFollowSentReplies ? 'Share up to 40 text previews of incoming replies from ' + teamThreadPreview.followingAuthors.join(', ') + ' and your webmail replies addressed only to them in To or Cc.' : 'Share text previews of up to 40 incoming replies from ' + teamThreadPreview.followingAuthors.join(', ') + '.'"></p>
         <div class="wm-snapshot-form wm-team-thread-audience">
           <label>Team<select x-model="teamThreadTeam" aria-label="Team" :disabled="teamThreadBusy" required>
             <option :for="team in teamThreadTeams" :value="team.id" :text="team.name"></option>
@@ -1207,7 +1208,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       <div :if="teamThreadDetail" class="wm-snapshot-workflow">
         <h3 :text="teamThreadDetail.grant.subject || '(No subject)'"></h3>
         <p class="wm-snapshot-muted" :text="'From ' + teamThreadDetail.grant.owner + ' · Shared with ' + teamThreadDetail.grant.grantee"></p>
-        <p :if="teamThreadDetail.grant.followingAuthors.length" class="wm-snapshot-muted" :text="teamThreadDetail.grant.replyLimitReached ? 'This conversation reached its 40-reply limit.' : 'Following verified replies from ' + teamThreadDetail.grant.followingAuthors.join(', ') + '.'"></p>
+        <p :if="teamThreadDetail.grant.followingAuthors.length" class="wm-snapshot-muted" :text="teamThreadDetail.grant.replyLimitReached ? 'This conversation reached its 40-reply limit.' : 'Following verified replies from ' + teamThreadDetail.grant.followingAuthors.join(', ') + (teamThreadDetail.grant.followingSentReplies ? ' and the owner’s webmail replies to them.' : '.')"></p>
         <form class="wm-snapshot-form" role="search" @submit.prevent="openTeamThread(teamThreadDetail.grant, true)">
           <label><span :text="teamThreadDetail.grant.collectionId ? 'Search collection' : 'Search conversation'"></span><input type="search" x-model="teamThreadSearch" maxlength="128" :disabled="teamThreadBusy"></label>
           <button type="submit" class="wm-action" :disabled="teamThreadBusy">Search</button>
@@ -1216,7 +1217,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         <div :if="teamThreadDetail.messages.length" class="wm-snapshot-messages" role="region" aria-label="Shared messages" tabindex="0">
           <article :for="message in teamThreadDetail.messages" :key="message.reference" class="wm-snapshot-message">
             <h4 :text="message.subject || '(No subject)'"></h4>
-            <div class="wm-snapshot-meta"><span :text="message.from"></span><span :text="snapshotDate(message.timestamp)"></span><span :if="message.verifiedReply">Verified reply</span></div>
+            <div class="wm-snapshot-meta"><span :text="message.from"></span><span :text="snapshotDate(message.timestamp)"></span><span :if="message.verifiedReply">Verified reply</span><span :if="message.sentReply">Sent reply</span></div>
             <p class="wm-snapshot-body" :text="message.text"></p>
             <p :if="message.truncated" class="wm-snapshot-muted">Message preview shortened.</p>
             <div :if="message.attachments.length" class="wm-snapshot-form">

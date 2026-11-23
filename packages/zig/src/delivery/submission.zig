@@ -126,6 +126,7 @@ pub const DispatchOptions = struct {
     receipt: ?database.Database.ActiveSyncReceipt = null,
     account_notice: bool = false,
     recipient_id: ?i64 = null,
+    team_reply_submission: ?database.Database.TeamReplySource = null,
 };
 
 pub const DispatchResult = struct {
@@ -137,7 +138,7 @@ pub const DispatchResult = struct {
     notice: ?[]const u8 = null,
 };
 
-pub fn dispatchExternal(a: std.mem.Allocator, cfg: Delivery, provider: smtp_provider.Config, from: []const u8, recipients: []const []const u8, raw: []const u8, sender: []const u8, id: []const u8, identity: database.Database.ExternalSenderAdmission, linked_account: ?[]const u8) !DispatchResult {
+pub fn dispatchExternal(a: std.mem.Allocator, cfg: Delivery, provider: smtp_provider.Config, from: []const u8, recipients: []const []const u8, raw: []const u8, sender: []const u8, id: []const u8, identity: database.Database.ExternalSenderAdmission, linked_account: ?[]const u8, team_reply_submission: ?database.Database.TeamReplySource) !DispatchResult {
     const db = cfg.db orelse return error.DatabaseUnavailable;
     if (!isSafeAddress(from) or recipients.len == 0) return error.InvalidAddress;
     const targets = try a.alloc(database.Database.DeliveryTarget, recipients.len);
@@ -158,6 +159,7 @@ pub fn dispatchExternal(a: std.mem.Allocator, cfg: Delivery, provider: smtp_prov
         .external_sender = identity,
         .linked_account = linked_account,
         .charge_recipients = recipients.len,
+        .team_reply_submission = team_reply_submission,
     });
     var notice: ?[]const u8 = null;
     smtp_provider.submit(a, provider, .{ .db = db, .delivery_id = id }, cfg.hostname, from, recipients, raw) catch |err| {
@@ -313,6 +315,7 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
         .calendar_reply = options.calendar_reply,
         .charge_recipients = recipients.len,
         .receipt = options.receipt,
+        .team_reply_submission = options.team_reply_submission,
     });
 }
 
@@ -347,7 +350,7 @@ pub fn writeMaildir(allocator: std.mem.Allocator, db: ?*database.Database, user:
 }
 
 /// Reserve and file an Outbox Sent copy under its own durable delivery ID.
-pub fn fileInteractiveSent(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8, raw: []const u8) !bool {
+pub fn fileInteractiveSent(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8, source: []const u8, raw: []const u8) !bool {
     {
         db.lockMailboxes();
         defer db.unlockMailboxes();
@@ -360,6 +363,7 @@ pub fn fileInteractiveSent(a: std.mem.Allocator, db: *database.Database, user: [
                 .accepted_at = time_compat.timestamp(),
                 .accepted_ms = time_compat.milliTimestamp(),
                 .targets = &.{.{ .recipient = user, .mailbox = user, .folder = "Sent" }},
+                .sent_copy_of = source,
             });
         }
     }

@@ -1812,6 +1812,7 @@ fn handleCompose(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: s
         .delegated_sender_id = delegated_id,
         .mail_config = server.config.mail_config,
         .auth = server.auth,
+        .team_reply_source = server.service.followedSentSource(arena, sess.username, parsed.value),
     };
 
     const result = compose.send(arena, msg, cfg) catch |err| {
@@ -2197,6 +2198,7 @@ const ThreadShareInput = struct {
     collectionId: ?[]const u8 = null,
     downloads: bool = false,
     followReplies: bool = false,
+    followSentReplies: bool = false,
     team: ?[]const u8 = null,
     grantee: ?[]const u8 = null,
     digest: ?[]const u8 = null,
@@ -2222,7 +2224,7 @@ fn handleThreadShares(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: 
         const input = std.json.parseFromSliceLeaky(ThreadShareInput, a, req.body, .{}) catch
             return threadShareError(conn, a, error.InvalidThreadShare);
         if (input.collectionId) |collection| {
-            if (input.references.len != 0 or input.followReplies) return threadShareError(conn, a, error.InvalidThreadShare);
+            if (input.references.len != 0 or input.followReplies or input.followSentReplies) return threadShareError(conn, a, error.InvalidThreadShare);
             if (preview) {
                 const prepared = team_threads.previewCollection(a, server.db, actor, collection, input.downloads, junk) catch |err|
                     return threadShareError(conn, a, err);
@@ -2240,13 +2242,14 @@ fn handleThreadShares(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: 
                 return threadShareError(conn, a, err);
             return sendJson(conn, a, 201, try service_mod.json(a, grant), null);
         }
-        const prepared = team_threads.prepare(a, server.db, actor, input.references, input.downloads, input.followReplies, junk) catch |err|
+        const prepared = team_threads.prepare(a, server.db, actor, input.references, input.downloads, input.followReplies, input.followSentReplies, junk) catch |err|
             return threadShareError(conn, a, err);
         if (preview)
             return sendJson(conn, a, 200, try service_mod.json(a, .{
                 .messages = prepared.messages,
                 .digest = @as([]const u8, &prepared.digest),
                 .followingAuthors = prepared.authors,
+                .followingSentReplies = prepared.follow_sent,
             }), null);
         const team = input.team orelse return threadShareError(conn, a, error.InvalidThreadShare);
         const grantee = input.grantee orelse return threadShareError(conn, a, error.InvalidThreadShare);

@@ -65,25 +65,30 @@ pub const schema =
     \\    authors TEXT NOT NULL CHECK(json_valid(authors)),
     \\    anchors TEXT NOT NULL CHECK(json_valid(anchors))
     \\);
+    \\CREATE TABLE IF NOT EXISTS mail_team_thread_follow_sent (
+    \\    share_id TEXT PRIMARY KEY NOT NULL REFERENCES mail_team_thread_follow(share_id) ON DELETE CASCADE
+    \\);
+    \\CREATE TABLE IF NOT EXISTS mail_team_thread_submissions (
+    \\    delivery_id TEXT PRIMARY KEY NOT NULL REFERENCES accepted_mail(id) ON DELETE CASCADE,
+    \\    owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    \\    sent_id TEXT UNIQUE REFERENCES accepted_mail(id) ON DELETE SET NULL,
+    \\    parent_reference TEXT NOT NULL,
+    \\    parent_revision TEXT NOT NULL,
+    \\    parent_wire_id TEXT NOT NULL
+    \\);
     \\CREATE TABLE IF NOT EXISTS mail_team_thread_replies (
     \\    share_id TEXT NOT NULL REFERENCES mail_team_thread_follow(share_id) ON DELETE CASCADE,
     \\    reference TEXT NOT NULL,
     \\    content_revision TEXT NOT NULL,
     \\    wire_id TEXT NOT NULL,
     \\    notice_at INTEGER NOT NULL DEFAULT 0,
+    \\    outgoing INTEGER NOT NULL DEFAULT 0 CHECK(outgoing IN (0,1)),
     \\    PRIMARY KEY(share_id,reference),
     \\    UNIQUE(share_id,wire_id)
     \\);
 ;
 
-// Run after the journal has registered the exact filed copy. Automatic mail
-// follows a direct parent, from one of the senders seen in the owner's preview.
-pub const record_reply_sql =
-    \\INSERT OR IGNORE INTO mail_team_thread_replies(share_id,reference,content_revision,wire_id,notice_at)
-    \\SELECT s.id,r.reference,?4,?5,
-    \\ CASE WHEN m.author<>grantee.username COLLATE NOCASE
-    \\       AND EXISTS(SELECT 1 FROM mail_notification_settings WHERE user_id=s.grantee_id AND enabled=1)
-    \\      THEN unixepoch() ELSE 0 END
+const filed_reply_join =
     \\FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
     \\JOIN mailbox_message_refs r ON r.user_id=t.mailbox_id
     \\ AND r.folder=IIF(t.folder='new','INBOX',t.folder) AND r.basename=?3 AND r.file_stamp=?8
@@ -91,14 +96,50 @@ pub const record_reply_sql =
     \\JOIN mail_team_thread_follow f ON f.share_id=s.id
     \\JOIN users owner ON owner.id=s.owner_id AND owner.enabled=1
     \\JOIN users grantee ON grantee.id=s.grantee_id AND grantee.enabled=1
-    \\WHERE t.delivery_id=?1 AND t.ordinal=?2 AND t.is_primary=1 AND t.verified_forward=0
-    \\ AND t.folder IN ('new','Newsletters','Receipts') AND t.placement_reason NOT IN ('spam_filter','junk_feedback')
-    \\ AND m.verified_author=1 AND m.accepted_ms>f.since_ms AND m.author<>owner.username COLLATE NOCASE
-    \\ AND EXISTS(SELECT 1 FROM json_each(f.authors) WHERE value=m.author COLLATE NOCASE)
+;
+const filed_reply_scope =
+    \\ WHERE t.delivery_id=?1 AND t.ordinal=?2 AND t.is_primary=1 AND t.verified_forward=0
     \\ AND NOT EXISTS(SELECT 1 FROM json_each(f.anchors) WHERE value=?5)
     \\ AND (EXISTS(SELECT 1 FROM json_each(f.anchors) WHERE value=?6)
     \\      OR EXISTS(SELECT 1 FROM mail_team_thread_replies p WHERE p.share_id=s.id AND p.wire_id=?6))
     \\ AND (SELECT count(*) FROM mail_team_thread_replies p WHERE p.share_id=s.id)<?7
+;
+
+// Check the current grant only after the exact received or Sent file has been registered.
+pub const record_reply_sql =
+    \\INSERT OR IGNORE INTO mail_team_thread_replies(share_id,reference,content_revision,wire_id,notice_at)
+    \\SELECT s.id,r.reference,?4,?5,
+    \\ CASE WHEN m.author<>grantee.username COLLATE NOCASE
+    \\       AND EXISTS(SELECT 1 FROM mail_notification_settings WHERE user_id=s.grantee_id AND enabled=1)
+    \\      THEN unixepoch() ELSE 0 END
+++ " " ++ filed_reply_join ++ filed_reply_scope ++
+    \\ AND t.folder IN ('new','Newsletters','Receipts') AND t.placement_reason NOT IN ('spam_filter','junk_feedback')
+    \\ AND m.verified_author=1 AND m.accepted_ms>f.since_ms AND m.author<>owner.username COLLATE NOCASE
+    \\ AND EXISTS(SELECT 1 FROM json_each(f.authors) WHERE value=m.author COLLATE NOCASE)
+;
+
+pub const record_sent_reply_sql =
+    \\INSERT OR IGNORE INTO mail_team_thread_replies(share_id,reference,content_revision,wire_id,notice_at,outgoing)
+    \\SELECT s.id,r.reference,?4,?5,
+    \\ CASE WHEN EXISTS(SELECT 1 FROM mail_notification_settings WHERE user_id=s.grantee_id AND enabled=1)
+    \\       AND NOT EXISTS(SELECT 1 FROM accepted_mail_targets d WHERE d.delivery_id=source.id AND d.is_primary=1
+    \\                      AND (d.mailbox_id=s.grantee_id OR d.recipient=grantee.email COLLATE NOCASE))
+    \\      THEN unixepoch() ELSE 0 END,1
+++ " " ++ filed_reply_join ++
+    \\ JOIN mail_team_thread_follow_sent opted ON opted.share_id=f.share_id
+    \\ JOIN mail_team_thread_submissions proof ON proof.sent_id=t.delivery_id AND proof.owner_id=t.mailbox_id
+    \\ JOIN accepted_mail source ON source.id=proof.delivery_id
+++ filed_reply_scope ++
+    \\ AND t.folder='Sent' AND source.accepted_ms>f.since_ms
+    \\ AND proof.parent_wire_id=?6
+    \\ AND (EXISTS(SELECT 1 FROM mail_team_thread_messages p WHERE p.share_id=s.id
+    \\             AND p.reference=proof.parent_reference AND p.content_revision=proof.parent_revision)
+    \\      OR EXISTS(SELECT 1 FROM mail_team_thread_replies p WHERE p.share_id=s.id
+    \\                AND p.reference=proof.parent_reference AND p.content_revision=proof.parent_revision AND p.wire_id=?6))
+    \\ AND EXISTS(SELECT 1 FROM accepted_mail_targets d WHERE d.delivery_id=source.id AND d.is_primary=1)
+    \\ AND NOT EXISTS(SELECT 1 FROM accepted_mail_targets d WHERE d.delivery_id=source.id AND d.is_primary=1
+    \\   AND (d.outcome NOT IN ('filed','pending','remote_delivered')
+    \\        OR NOT EXISTS(SELECT 1 FROM json_each(f.authors) WHERE value=d.recipient COLLATE NOCASE)))
 ;
 
 const authorized =
@@ -113,7 +154,8 @@ const authorized =
 const share_fields =
     \\SELECT s.id,s.team_id,owner.username,grantee.username,COALESCE(c.name,s.subject),s.downloads,
     \\ COALESCE((SELECT authors FROM mail_team_thread_follow WHERE share_id=s.id),'[]'),
-    \\ (SELECT count(*) FROM mail_team_thread_replies WHERE share_id=s.id),c.id
+    \\ (SELECT count(*) FROM mail_team_thread_replies WHERE share_id=s.id),c.id,
+    \\ EXISTS(SELECT 1 FROM mail_team_thread_follow_sent WHERE share_id=s.id)
 ;
 
 pub const Grant = struct {
@@ -126,8 +168,9 @@ pub const Grant = struct {
     followingAuthors: []const []const u8,
     replyLimitReached: bool,
     collectionId: ?[]const u8 = null,
+    followingSentReplies: bool = false,
 };
-const Selection = struct { reference: []const u8, revision: [64]u8, reply: bool = false };
+const Selection = struct { reference: []const u8, revision: [64]u8, reply: bool = false, outgoing: bool = false };
 const Attachment = struct { index: usize, filename: []const u8, size: usize };
 const Message = struct {
     reference: []const u8,
@@ -137,6 +180,7 @@ const Message = struct {
     text: []const u8,
     attachments: []Attachment,
     verifiedReply: bool = false,
+    sentReply: bool = false,
     truncated: bool = false,
 };
 const Comment = struct { author: []const u8, writtenAt: i64, text: []const u8 };
@@ -147,6 +191,7 @@ pub const Prepared = struct {
     downloads: bool,
     authors: []const []const u8,
     anchors: []const []const u8,
+    follow_sent: bool,
 };
 pub const Detail = struct { grant: Grant, messages: []Message, comments: []Comment, next: ?i64 = null };
 const Collection = struct { id: []const u8, name: []const u8, revision: i64 };
@@ -169,6 +214,7 @@ fn readGrant(a: Allocator, stmt: Statement) !Grant {
         .followingAuthors = try std.json.parseFromSliceLeaky([]const []const u8, a, stmt.columnText(6), .{ .allocate = .alloc_always }),
         .replyLimitReached = stmt.columnInt64(7) >= max_followed_replies,
         .collectionId = if (stmt.columnIsNull(8)) null else try a.dupe(u8, stmt.columnText(8)),
+        .followingSentReplies = stmt.columnInt64(9) != 0,
     };
 }
 
@@ -247,8 +293,8 @@ fn appendUnique(a: Allocator, values: *std.ArrayList([]const u8), value: []const
     try values.append(a, try a.dupe(u8, value));
 }
 
-pub fn prepare(a: Allocator, db: *Database, actor: []const u8, refs: []const []const u8, downloads: bool, follow: bool, junk: []const u8) !Prepared {
-    if (refs.len == 0 or refs.len > snapshots.max_messages) return error.InvalidThreadShare;
+pub fn prepare(a: Allocator, db: *Database, actor: []const u8, refs: []const []const u8, downloads: bool, follow: bool, follow_sent: bool, junk: []const u8) !Prepared {
+    if (refs.len == 0 or refs.len > snapshots.max_messages or (follow_sent and !follow)) return error.InvalidThreadShare;
     const messages = try a.alloc(Message, refs.len);
     const selection = try a.alloc(Selection, refs.len);
     var remaining: usize = snapshots.max_bytes;
@@ -279,6 +325,7 @@ pub fn prepare(a: Allocator, db: *Database, actor: []const u8, refs: []const []c
         .downloads = downloads,
         .authors = authors.items,
         .anchors = anchors.items,
+        .follow_sent = follow_sent,
     }, .{});
     return .{
         .selection = selection,
@@ -287,6 +334,7 @@ pub fn prepare(a: Allocator, db: *Database, actor: []const u8, refs: []const []c
         .downloads = downloads,
         .authors = try authors.toOwnedSlice(a),
         .anchors = try anchors.toOwnedSlice(a),
+        .follow_sent = follow_sent,
     };
 }
 
@@ -328,6 +376,12 @@ pub fn create(a: Allocator, db: *Database, actor: []const u8, team: []const u8, 
         const authors = try std.json.Stringify.valueAlloc(a, prepared.authors, .{});
         const anchors = try std.json.Stringify.valueAlloc(a, prepared.anchors, .{});
         try bind(stmt, .{ id, now_ms, authors, anchors });
+        _ = try stmt.step();
+    }
+    if (prepared.follow_sent) {
+        const stmt = try tx.prepare("INSERT INTO mail_team_thread_follow_sent(share_id) VALUES(?1)");
+        defer stmt.finalize();
+        try stmt.bind(1, id);
         _ = try stmt.step();
     }
     const grant = try lookup(a, tx, actor, id);
@@ -392,10 +446,10 @@ pub fn revoke(db: *Database, actor: []const u8, id: []const u8) !void {
 
 fn selected(a: Allocator, tx: Database.Transaction, id: []const u8, ref: ?[]const u8) ![]Selection {
     const stmt = try tx.prepare(
-        \\SELECT reference,content_revision,0 AS reply,rowid AS arrival FROM mail_team_thread_messages
+        \\SELECT reference,content_revision,0 AS reply,rowid AS arrival,0 AS outgoing FROM mail_team_thread_messages
         \\WHERE share_id=?1 AND (?2 IS NULL OR reference=?2)
         \\UNION ALL
-        \\SELECT reference,content_revision,1 AS reply,rowid AS arrival FROM mail_team_thread_replies
+        \\SELECT reference,content_revision,1 AS reply,rowid AS arrival,outgoing FROM mail_team_thread_replies
         \\WHERE share_id=?1 AND ?2 IS NULL
         \\ORDER BY reply,arrival
     );
@@ -410,6 +464,7 @@ fn selected(a: Allocator, tx: Database.Transaction, id: []const u8, ref: ?[]cons
             .reference = try a.dupe(u8, stmt.columnText(0)),
             .revision = revision[0..64].*,
             .reply = stmt.columnInt64(2) != 0,
+            .outgoing = stmt.columnInt64(4) != 0,
         });
     }
     return out.toOwnedSlice(a);
@@ -602,7 +657,8 @@ pub fn detail(a: Allocator, db: *Database, actor: []const u8, id: []const u8, ne
             else => return err,
         };
         if (item.reply) {
-            const reply = excerpt(msg, try snapshots.plainText(scratch, msg), true);
+            var reply = excerpt(msg, try snapshots.plainText(scratch, msg), !item.outgoing);
+            reply.sentReply = item.outgoing;
             if (matchesSearch(reply.subject, reply.from, reply.text, needle))
                 try messages.append(a, try copyExcerpt(a, reply));
             continue;

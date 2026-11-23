@@ -6,7 +6,9 @@ from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
 from pathlib import Path
 import runpy
+import secrets
 import tempfile
+import time
 
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -152,6 +154,114 @@ def verify_collection(fixture, call, download, owner, peer, witness, outsider, o
     download(other, f"{renewed_path}/attachments/{first['reference']}/0", 404)
 
 
+def verify_sent_replies(fixture, call, download, claim, owner, peer, witness, outsider, own, other, third, foreign, root):
+    parent = "<root@threads.example.test>"
+    selection = {"references": [root["reference"]], "downloads": True, "followReplies": True}
+    sent_selection = {**selection, "followSentReplies": True}
+    reviewed = call(own, SHARES + "/preview", selection, "POST")
+    sent_reviewed = call(own, SHARES + "/preview", sent_selection, "POST")
+    assert sent_reviewed["followingSentReplies"] and sent_reviewed["digest"] != reviewed["digest"]
+    call(own, SHARES + "/preview", {**sent_selection, "followReplies": False}, "POST", 400)
+    audience = {"team": "studio", "grantee": peer}
+    call(own, SHARES, {**sent_selection, **audience, "digest": reviewed["digest"]}, "POST", 409)
+
+    def share(selected, preview, grantee=peer):
+        grant = call(own, SHARES, {**selected, **audience, "grantee": grantee, "digest": preview["digest"]}, "POST", 201)
+        return f"{SHARES}/{grant['id']}"
+
+    incoming_only = share(selection, reviewed)
+    outgoing = share(sent_selection, sent_reviewed)
+    direct_recipient_share = share(sent_selection, sent_reviewed, witness)
+
+    def compose(subject, **changes):
+        return call(own, "compose", {
+            "to": [witness], "subject": subject, "text": subject + " preview text", "inReplyTo": parent,
+            "replyContext": {key: root[key] for key in ("uid", "folder", "reference")}, **changes,
+        }, "POST")
+
+    def published(path, subject):
+        return call(other, path + "?q=" + subject.replace(" ", "+"))["messages"]
+
+    scheduled = secrets.token_hex(16)
+    compose("Future outgoing hold", sendId=scheduled, scheduleAt=int(time.time()) + 600)
+    assert published(outgoing, "Future outgoing hold") == []
+    call(own, "drafts", {"subject": "Unsent reply draft", "text": "Private draft text", "to": [witness], "inReplyTo": parent}, "POST")
+    assert published(outgoing, "Unsent reply draft") == []
+    with fixture.imap(owner) as imap:
+        imap.create("Sent")
+        imported = EmailMessage()
+        imported["From"], imported["To"] = owner, witness
+        imported["Subject"], imported["In-Reply-To"] = "Imported Sent reply", parent
+        imported["Message-ID"] = "<imported-reply@example.test>"
+        imported.set_content("This mail only exists in an imported Sent copy.")
+        assert imap.append("Sent", None, None, imported.as_bytes())[0] == "OK"
+        imported.replace_header("Subject", "Unshared duplicate wire ID")
+        imported.replace_header("Message-ID", parent)
+        assert imap.append("INBOX", None, None, imported.as_bytes())[0] == "OK"
+    assert published(outgoing, "Imported Sent reply") == []
+    collision, = call(own, "messages?conversations=false&q=Unshared+duplicate+wire+ID")["items"]
+
+    for subject, changes in (
+        ("Unapproved CC reply", {"cc": [outsider]}),
+        ("Blind copy reply", {"bcc": [witness]}),
+        ("Wrong parent reply", {"inReplyTo": "<unrelated@example.test>", "references": parent}),
+        ("Header-only reply", {"replyContext": None}),
+        ("Duplicate wire ID reply", {"replyContext": {key: collision[key] for key in ("uid", "folder", "reference")}}),
+    ):
+        assert compose(subject, **changes)["sent_saved"]
+        assert published(outgoing, subject) == []
+    assert claim(other) == 0
+
+    direct = compose("Approved outgoing reply")
+    assert direct["ok"] and direct["sent_saved"]
+    automatic, = published(outgoing, "Approved outgoing reply")
+    assert automatic["sentReply"] and not automatic["verifiedReply"] and automatic["attachments"] == []
+    assert published(incoming_only, "Approved outgoing reply") == []
+    assert call(other, outgoing)["grant"]["followingSentReplies"]
+    call(foreign, outgoing + "?q=Approved", status=404)
+    download(other, f"{outgoing}/attachments/{automatic['reference']}/0", 404)
+    assert claim(other) == 1 and claim(other) == 0
+    assert claim(third) == 0
+    assert any(message["sentReply"] for message in call(third, direct_recipient_share)["messages"])
+
+    # The follow-up uses the original filed Message-ID, including the host.
+    continuation = EmailMessage()
+    continuation["From"], continuation["To"] = witness, owner
+    continuation["Subject"] = "Verified continuation to owner reply"
+    continuation["Message-ID"] = "<reply-to-owner-sent@threads.example.test>"
+    continuation["In-Reply-To"] = direct["message_id"]
+    continuation.set_content("Continuation to a shared owner reply.")
+    with fixture.smtp(witness) as connection:
+        assert connection.send_message(continuation) == {}
+    continuation_row, = published(outgoing, "Verified continuation")
+    assert continuation_row["verifiedReply"] and published(incoming_only, "Verified continuation") == []
+    assert claim(other) == 1
+    call(own, incoming_only, method="DELETE")
+
+    queued_id = secrets.token_hex(16)
+    compose("Outbox sent reply", sendId=queued_id, delaySeconds=0)
+    assert fixture.outbox(own, queued_id, "sent")["result"]["sent_saved"]
+    assert published(outgoing, "Outbox sent reply")[0]["sentReply"]
+    for start in range(0, 37, 10):
+        with fixture.smtp(witness) as connection:
+            for index in range(start, min(start + 10, 37)):
+                extra = EmailMessage()
+                extra["From"], extra["To"] = witness, owner
+                extra["Subject"], extra["In-Reply-To"] = f"Reply limit fixture {index}", parent
+                extra["Message-ID"] = f"<reply-limit-{index}@threads.example.test>"
+                extra.set_content("A verified incoming reply.")
+                assert connection.send_message(extra) == {}
+    at_limit = call(other, outgoing)
+    assert len(at_limit["messages"]) == 41 and at_limit["grant"]["replyLimitReached"]
+    assert compose("Sent past the reply limit")["sent_saved"]
+    assert published(outgoing, "Sent past the reply limit") == []
+    call(own, outgoing, method="DELETE")
+    assert claim(other) == 0
+    assert compose("Reply after revoke")["sent_saved"]
+    call(other, outgoing + "?q=Reply", status=404)
+    call(own, direct_recipient_share, method="DELETE")
+
+
 def verify(fixture):
     def call(session, path, payload=None, method=None, status=200):
         return expect(fixture.api(session, path, payload, method), status)
@@ -166,7 +276,7 @@ def verify(fixture):
         return content
 
     with fixture.daemon():
-        owner, peer, witness, outsider = (fixture.provision(name) for name in (
+        owner, peer, witness, outsider = (fixture.provision(name, daily=100) for name in (
             "thread-owner", "thread-peer", "thread-witness", "thread-outsider",
         ))
         own, other, third, foreign = (fixture.login(address) for address in (owner, peer, witness, outsider))
@@ -313,6 +423,8 @@ def verify(fixture):
         call(own, fresh_path, method="DELETE")
         call(other, fresh_path, status=404)
         root = call(own, "messages/ref/" + root["reference"])
+        verify_sent_replies(fixture, call, download, claim, owner, peer, witness, outsider, own, other, third, foreign, root)
+        root = call(own, "messages/ref/" + root["reference"])
         verify_collection(fixture, call, download, owner, peer, witness, outsider, own, other, third, foreign, rows, root)
 
 
@@ -322,7 +434,7 @@ def main():
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="mail-team-threads-") as directory:
         verify(Fixture(args.binary.resolve(strict=True), Path(directory), staging=True))
-    print("Verified team conversations, followed replies, live collections, previews, searching, attachments, comments, notifications, and revocation.")
+    print("Verified team conversations, followed incoming and sent replies, live collections, previews, searching, attachments, comments, notifications, and revocation.")
 
 
 if __name__ == "__main__":

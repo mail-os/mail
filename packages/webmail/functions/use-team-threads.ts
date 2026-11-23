@@ -10,6 +10,7 @@ interface Grant {
   subject: string
   downloads: boolean
   followingAuthors: string[]
+  followingSentReplies: boolean
   replyLimitReached: boolean
   collectionId: string | null
 }
@@ -22,6 +23,7 @@ interface Message {
   text: string
   attachments: Attachment[]
   verifiedReply?: boolean
+  sentReply?: boolean
   truncated?: boolean
 }
 interface Preview { messages: Message[], digest: string, followingAuthors: string[], collection?: { name: string }, next?: number | null }
@@ -46,6 +48,7 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
   const teamThreadGrantee = state('')
   const teamThreadDownloads = state(false)
   const teamThreadFollowReplies = state(false)
+  const teamThreadFollowSentReplies = state(false)
   const teamThreadSearch = state('')
   const teamThreadComment = state('')
   const teamThreadRevoking = state<Grant | null>(null)
@@ -71,6 +74,7 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
     teamThreadGrantee.set('')
     teamThreadDownloads.set(false)
     teamThreadFollowReplies.set(false)
+    teamThreadFollowSentReplies.set(false)
     teamThreadSearch.set('')
     teamThreadComment.set('')
     teamThreadCollection.set('')
@@ -107,7 +111,7 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
     const collectionId = teamThreadCollection()
     return api<Preview>(`${endpoint}/preview`, {
       method: 'POST', signal, body: JSON.stringify({
-        ...(collectionId ? { collectionId } : { references, followReplies: teamThreadFollowReplies() }),
+        ...(collectionId ? { collectionId } : { references, followReplies: teamThreadFollowReplies(), followSentReplies: teamThreadFollowSentReplies() }),
         downloads: teamThreadDownloads(),
       }),
     })
@@ -139,6 +143,13 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
 
   function setTeamThreadFollowReplies(enabled: boolean) {
     teamThreadFollowReplies.set(enabled)
+    if (!enabled) teamThreadFollowSentReplies.set(false)
+    teamThreadPreview.set(null)
+    void run(preview, prepared => teamThreadPreview.set(prepared))
+  }
+
+  function setTeamThreadFollowSentReplies(enabled: boolean) {
+    teamThreadFollowSentReplies.set(enabled)
     teamThreadPreview.set(null)
     void run(preview, prepared => teamThreadPreview.set(prepared))
   }
@@ -148,7 +159,7 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
     if (!prepared) return
     const collectionId = teamThreadCollection()
     const body = JSON.stringify({
-      ...(collectionId ? { collectionId } : { references, followReplies: teamThreadFollowReplies() }),
+      ...(collectionId ? { collectionId } : { references, followReplies: teamThreadFollowReplies(), followSentReplies: teamThreadFollowSentReplies() }),
       digest: prepared.digest, team: teamThreadTeam(), grantee: teamThreadGrantee().trim(), downloads: teamThreadDownloads(),
     })
     let issued: Grant | undefined
@@ -226,8 +237,8 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
 
   return {
     teamThreadMode, teamThreadBusy, teamThreadError, teamThreadNotice, teamThreadPreview, teamThreadGrants, teamThreadDetail,
-    teamThreadTeams, teamThreadTeam, teamThreadGrantee, teamThreadDownloads, teamThreadFollowReplies, teamThreadSearch, teamThreadComment, teamThreadRevoking, teamThreadCollection, teamThreadPages,
-    beginTeamThread, setTeamThreadDownloads, setTeamThreadFollowReplies, shareTeamThread, listTeamThreads, openTeamThread,
+    teamThreadTeams, teamThreadTeam, teamThreadGrantee, teamThreadDownloads, teamThreadFollowReplies, teamThreadFollowSentReplies, teamThreadSearch, teamThreadComment, teamThreadRevoking, teamThreadCollection, teamThreadPages,
+    beginTeamThread, setTeamThreadDownloads, setTeamThreadFollowReplies, setTeamThreadFollowSentReplies, shareTeamThread, listTeamThreads, openTeamThread,
     addTeamThreadComment, revokeTeamThread, closeTeamThreads, turnTeamThreadPage,
   }
 }

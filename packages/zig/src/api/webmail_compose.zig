@@ -21,6 +21,7 @@ const fs_compat = @import("../core/fs_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const core_config = @import("../core/config.zig");
 const auth_mod = @import("../auth/auth.zig");
+const store = @import("webmail_store.zig");
 
 pub const ComposeError = error{
     NoRecipients,
@@ -91,6 +92,7 @@ pub const SendConfig = struct {
     } = null,
     shared_reply: ?@import("../storage/shared_inbox.zig").ReplyDelivery = null,
     calendar_reply: ?@import("webmail_calendar_invite.zig").Revision = null,
+    team_reply_source: ?database.Database.TeamReplySource = null,
 
     fn delivery(self: SendConfig) submission.Delivery {
         return .{
@@ -429,8 +431,19 @@ pub fn sendWithJournal(allocator: std.mem.Allocator, msg: Message, cfg: SendConf
     const recipients = try submission.distinctRecipients(allocator, &.{ msg.to, msg.cc, msg.bcc });
     defer allocator.free(recipients);
     const delivery = cfg.delivery();
+    // A mailbox's personal share cannot confer access to a delegated, linked,
+    // shared-inbox, calendar, or blind-copy submission.
+    const team_reply_submission = if (delivery.db != null and (msg.in_reply_to.len != 0 or msg.references.len != 0) and
+        msg.bcc.len == 0 and !msg.auto_submitted and cfg.delegated_sender_id == null and
+        cfg.linked_account == null and cfg.shared_reply == null and cfg.calendar_reply == null) cfg.team_reply_source else null;
+    const journal = dispatch orelse if (team_reply_submission != null and cfg.external_provider == null) OutboxDispatch{
+        .delivery_id = try store.newId(allocator),
+        .sent_delivery_id = try store.newId(allocator),
+        .message_id = msgid,
+        .message_date = ts,
+    } else null;
     const result = if (cfg.external_provider) |provider|
-        try submission.dispatchExternal(allocator, delivery, provider.config, msg.from, recipients, raw, cfg.sender_user, (dispatch orelse return error.ExternalReviewRequired).delivery_id, provider.identity, cfg.linked_account)
+        try submission.dispatchExternal(allocator, delivery, provider.config, msg.from, recipients, raw, cfg.sender_user, (dispatch orelse return error.ExternalReviewRequired).delivery_id, provider.identity, cfg.linked_account, team_reply_submission)
     else
         try submission.dispatch(allocator, delivery, msg.from, recipients, raw, .{
             .sender = cfg.sender_user,
@@ -438,7 +451,8 @@ pub fn sendWithJournal(allocator: std.mem.Allocator, msg: Message, cfg: SendConf
             .linked_account = cfg.linked_account,
             .shared_reply = cfg.shared_reply,
             .calendar_reply = cfg.calendar_reply,
-            .interactive_id = if (dispatch) |send_record| send_record.delivery_id else null,
+            .interactive_id = if (journal) |send_record| send_record.delivery_id else null,
+            .team_reply_submission = team_reply_submission,
         });
     errdefer allocator.free(result.failed);
     const first_limit_error = result.first_limit_error;
@@ -449,7 +463,7 @@ pub fn sendWithJournal(allocator: std.mem.Allocator, msg: Message, cfg: SendConf
     var sent_saved = false;
     var limit_notice: ?[]const u8 = if (first_limit_error != null) "Some recipient mailboxes are full or disabled." else result.notice;
     if (result.delivered > 0) {
-        if (fileSent(allocator, cfg, sent_raw, if (dispatch) |send_record| send_record.sent_delivery_id else null)) |saved| {
+        if (fileSent(allocator, cfg, sent_raw, journal)) |saved| {
             sent_saved = saved;
         } else |err| {
             if (err == error.HostedStorageFull and limit_notice == null)
@@ -465,12 +479,12 @@ pub fn recoverSent(a: std.mem.Allocator, msg: Message, cfg: SendConfig, dispatch
     var private_msg = msg;
     private_msg.include_bcc = true;
     const raw = try buildMime(a, private_msg, dispatch.message_date, dispatch.message_id);
-    return fileSent(a, cfg, raw, dispatch.sent_delivery_id);
+    return fileSent(a, cfg, raw, dispatch);
 }
 
-fn fileSent(a: std.mem.Allocator, cfg: SendConfig, raw: []const u8, id: ?[]const u8) !bool {
+fn fileSent(a: std.mem.Allocator, cfg: SendConfig, raw: []const u8, dispatch: ?OutboxDispatch) !bool {
     const db = cfg.delivery().db;
-    if (id) |value| return submission.fileInteractiveSent(a, db orelse return error.DatabaseUnavailable, cfg.sender_user, value, raw);
+    if (dispatch) |record| return submission.fileInteractiveSent(a, db orelse return error.DatabaseUnavailable, cfg.sender_user, record.sent_delivery_id, record.delivery_id, raw);
     try submission.writeMaildir(a, db, cfg.sender_user, "Sent", raw);
     return true;
 }

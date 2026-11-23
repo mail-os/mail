@@ -1011,6 +1011,15 @@ pub const Database = struct {
         try self.exec(team_store.schema);
         try self.exec(shared_inbox.schema);
         try self.exec(team_threads.schema);
+        var tx = try self.beginTransaction(.write);
+        defer tx.deinit();
+        const has_outgoing = blk: {
+            const column = try tx.prepare("SELECT 1 FROM pragma_table_info('mail_team_thread_replies') WHERE name='outgoing'");
+            defer column.finalize();
+            break :blk try column.step();
+        };
+        if (!has_outgoing) try self.execLocked("ALTER TABLE mail_team_thread_replies ADD COLUMN outgoing INTEGER NOT NULL DEFAULT 0 CHECK(outgoing IN (0,1))");
+        try tx.commit();
     }
 
     pub fn exec(self: *Database, sql: []const u8) !void {
@@ -1762,6 +1771,12 @@ pub const Database = struct {
 
     pub const ExternalSenderAdmission = struct { id: []const u8, generation: []const u8 };
 
+    pub const TeamReplySource = struct {
+        reference: []const u8,
+        revision: [64]u8,
+        wire_id: []const u8,
+    };
+
     pub const DeliveryEnvelope = struct {
         id: []const u8,
         from: []const u8,
@@ -1781,6 +1796,8 @@ pub const Database = struct {
         charge_recipients: usize = 0,
         receipt: ?ActiveSyncReceipt = null,
         review_release: ?FiledCopy = null,
+        team_reply_submission: ?TeamReplySource = null,
+        sent_copy_of: ?[]const u8 = null,
     };
 
     /// Reserve the hosted envelope and persist its complete routing decision
@@ -1834,6 +1851,32 @@ pub const Database = struct {
             try insert.bind(7, envelope.notification_origin);
             try insert.bind(8, envelope.accepted_ms);
             _ = try insert.step();
+        }
+        if (envelope.team_reply_submission) |parent| {
+            const stmt = try self.prepareLocked(
+                \\INSERT INTO mail_team_thread_submissions(delivery_id,owner_id,parent_reference,parent_revision,parent_wire_id)
+                \\SELECT ?1,u.id,?3,?4,?5 FROM users u WHERE u.username=?2 AND u.enabled=1
+                \\AND EXISTS(SELECT 1 FROM mail_team_thread_shares s JOIN mail_team_thread_follow_sent opted ON opted.share_id=s.id
+                \\           WHERE s.owner_id=u.id)
+            );
+            defer stmt.finalize();
+            try stmt.bind(1, envelope.id);
+            try stmt.bind(2, envelope.sender orelse return error.InvalidMailboxPath);
+            try stmt.bind(3, parent.reference);
+            try stmt.bind(4, @as([]const u8, &parent.revision));
+            try stmt.bind(5, parent.wire_id);
+            _ = try stmt.step();
+        }
+        if (envelope.sent_copy_of) |source| {
+            const stmt = try self.prepareLocked(
+                \\UPDATE mail_team_thread_submissions SET sent_id=?1 WHERE delivery_id=?2 AND sent_id IS NULL
+                \\AND owner_id=(SELECT id FROM users WHERE username=?3)
+            );
+            defer stmt.finalize();
+            try stmt.bind(1, envelope.id);
+            try stmt.bind(2, source);
+            try stmt.bind(3, envelope.from);
+            _ = try stmt.step();
         }
         const insert = try self.prepareLocked("INSERT INTO accepted_mail_targets(delivery_id,ordinal,recipient,mailbox,folder,outcome,queued_bytes,retry_at,mailbox_id,is_primary,forward_after,review_copy,placement_reason,verified_forward,reply_author,reply_from,reply_mime) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,COALESCE((SELECT id FROM users WHERE username=?4),0),?9,?10,?11,?12,?13,?14,?15,?16)");
         defer insert.finalize();
@@ -2000,6 +2043,16 @@ pub const Database = struct {
         const stmt = try self.prepare("SELECT 1 FROM accepted_mail WHERE id=?1");
         defer stmt.finalize();
         try stmt.bind(1, id);
+        return stmt.step();
+    }
+
+    pub fn hasFollowedSentReplies(self: *Database, user: []const u8) !bool {
+        const stmt = try self.prepare(
+            \\SELECT 1 FROM mail_team_thread_follow_sent opted JOIN mail_team_thread_shares s ON s.id=opted.share_id
+            \\WHERE s.owner_id=(SELECT id FROM users WHERE username=?1 AND enabled=1) LIMIT 1
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, user);
         return stmt.step();
     }
 
@@ -2227,6 +2280,7 @@ pub const Database = struct {
         attention: ?AttentionArrival = null,
         notification_key: []const u8 = "",
         thread_reply_digest: ?[64]u8 = null,
+        thread_reply_outgoing: bool = false,
         calendar_revisions: []const calendar_invite.Revision = &.{},
     };
 
@@ -2384,8 +2438,9 @@ pub const Database = struct {
             \\       IIF(t.folder='new','INBOX',t.folder),t.placement_reason,COALESCE(t.reply_author,IIF(m.verified_author=1,m.author,'')),1
             \\FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
             \\WHERE t.delivery_id=?1 AND t.ordinal=?2 AND t.mailbox_id<>0
-            \\      AND (t.folder IN ('new','Newsletters','Receipts') OR t.placement_reason IN ('junk_feedback','spam_filter'))
-            \\      AND (m.verified_author=1 OR t.placement_reason<>'' OR t.reply_author IS NOT NULL)
+            \\      AND ((t.folder='Sent' AND ?5=1)
+            \\           OR ((t.folder IN ('new','Newsletters','Receipts') OR t.placement_reason IN ('junk_feedback','spam_filter'))
+            \\               AND (m.verified_author=1 OR t.placement_reason<>'' OR t.reply_author IS NOT NULL)))
             \\ON CONFLICT(user_id,folder,basename) DO UPDATE SET intake_folder=excluded.intake_folder,
             \\  placement_reason=excluded.placement_reason,verified_author=excluded.verified_author,calendar_history_checked=1
             \\WHERE mailbox_message_refs.file_stamp=excluded.file_stamp
@@ -2395,6 +2450,7 @@ pub const Database = struct {
         try stmt.bind(2, ordinal);
         try stmt.bind(3, file.basename);
         try stmt.bind(4, file.stamp);
+        try stmt.bind(5, @intFromBool(file.thread_reply_outgoing));
         _ = try stmt.step();
     }
 
@@ -2404,7 +2460,7 @@ pub const Database = struct {
         if (arrival.automatic or file.stamp.len == 0) return;
         const own = arrival.own orelse return;
         const parent = arrival.reply_parent orelse return;
-        const stmt = try self.prepareLocked(team_threads.record_reply_sql);
+        const stmt = try self.prepareLocked(if (file.thread_reply_outgoing) team_threads.record_sent_reply_sql else team_threads.record_reply_sql);
         defer stmt.finalize();
         try stmt.bind(1, id);
         try stmt.bind(2, ordinal);
@@ -2983,6 +3039,7 @@ pub const Database = struct {
         calendar_author: []const u8,
         calendar_attendee: []const u8,
         team_reply_candidate: bool = false,
+        team_sent_reply_candidate: bool = false,
     };
 
     pub fn pendingDelivery(self: *Database, a: std.mem.Allocator, id: ?[]const u8, now: i64) !?PendingDelivery {
@@ -2998,7 +3055,13 @@ pub const Database = struct {
             \\       COALESCE((SELECT email FROM users WHERE id=t.mailbox_id),''),
             \\       t.is_primary=1 AND m.verified_author=1 AND t.folder IN ('new','Newsletters','Receipts')
             \\          AND EXISTS(SELECT 1 FROM mail_team_thread_shares s JOIN mail_team_thread_follow f ON f.share_id=s.id
-            \\                     WHERE s.owner_id=t.mailbox_id AND m.accepted_ms>f.since_ms)
+            \\                     WHERE s.owner_id=t.mailbox_id AND m.accepted_ms>f.since_ms),
+            \\       t.folder='Sent' AND EXISTS(
+            \\          SELECT 1 FROM mail_team_thread_submissions proof JOIN accepted_mail source ON source.id=proof.delivery_id
+            \\          JOIN mail_team_thread_shares s ON s.owner_id=proof.owner_id
+            \\          JOIN mail_team_thread_follow f ON f.share_id=s.id
+            \\          JOIN mail_team_thread_follow_sent opted ON opted.share_id=f.share_id
+            \\          WHERE proof.sent_id=m.id AND proof.owner_id=t.mailbox_id AND source.accepted_ms>f.since_ms)
             \\FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
             \\WHERE t.outcome='pending' AND t.forward_after IS NULL AND t.retry_at<=?1
         ;
@@ -3024,6 +3087,7 @@ pub const Database = struct {
             .calendar_author = try a.dupe(u8, stmt.columnText(11)),
             .calendar_attendee = try a.dupe(u8, stmt.columnText(12)),
             .team_reply_candidate = stmt.columnInt64(13) != 0,
+            .team_sent_reply_candidate = stmt.columnInt64(14) != 0,
         };
     }
 

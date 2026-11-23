@@ -1213,6 +1213,8 @@ async function teamThreadJourney(desktop) {
   await compose.getByRole('region', { name: 'Conversation preview' }).getByText('receipt-1046.txt', { exact: true }).waitFor()
   await compose.getByLabel('Follow verified replies').check()
   await compose.getByText('Share text previews of up to 40 incoming replies from ' + sender + '.', { exact: true }).waitFor()
+  await compose.getByLabel('Include my sent replies').check()
+  await compose.getByText(/and your webmail replies addressed only to them/).waitFor()
   assert.equal(await compose.getByLabel('Team', { exact: true }).inputValue(), 'studio')
   await compose.getByLabel('Teammate', { exact: true }).fill(sender)
   await compose.locator('.wm-snapshot-panel').screenshot({ path: join(output, 'desktop-team-thread-preview.png'), animations: 'disabled' })
@@ -1223,6 +1225,18 @@ async function teamThreadJourney(desktop) {
   await ownerView.getByLabel('Teammate comment').fill('Please check the receipt total.')
   await button(ownerView, 'Post comment').click()
   await ownerView.getByText('Please check the receipt total.', { exact: true }).waitFor()
+  await button(ownerView, 'Close').click()
+  await button(desktop, 'Reply').click()
+  const reply = desktop.getByRole('dialog', { name: 'Compose message' })
+  await reply.getByLabel('Message body').fill('I checked the studio receipt before sending.')
+  await reply.getByLabel('Undo Send delay', { exact: true }).selectOption('0')
+  await button(reply, 'Send').click()
+  await reply.waitFor({ state: 'hidden' })
+  await waitForMailboxResult(desktop, '/webmail/api/messages?folder=Sent&q=checked+the+studio+receipt',
+    result => result.items.find(message => message.subject === 'Re: Your receipt #1046'), 'Outbox reply is filed in Sent')
+  await button(folders(desktop), 'Shared mail').click()
+  await button(ownerView, 'Open Your receipt #1046').click()
+  await ownerMessages.getByText('Sent reply', { exact: true }).waitFor()
 
   const teammate = await signIn({ phone: true, account: sender, initialSubject: 'Combined source briefing' })
   try {
@@ -1242,6 +1256,12 @@ async function teamThreadJourney(desktop) {
     const href = new URL(await file.getAttribute('href'), url)
     const response = await teammate.request.get(href.href)
     assert.equal(await response.text(), 'Receipt 1046 for Studio Hosting\n')
+    await incoming.getByLabel('Search conversation').fill('CHECKED THE STUDIO RECEIPT')
+    await button(incoming, 'Search').click()
+    await incoming.getByText('I checked the studio receipt before sending.', { exact: true }).waitFor()
+    await incoming.getByText('Sent reply', { exact: true }).waitFor()
+    await fitsViewport(teammate)
+    await screenshot(teammate, 'phone-team-thread-sent-reply')
     const receiptId = '<browser-fixture-3@hosted.example.test>'
     const followup = await teammate.request.post(url + '/webmail/api/compose', {
       headers: { Origin: url },

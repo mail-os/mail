@@ -3,6 +3,7 @@
 
 import argparse
 from contextlib import closing
+from email.message import EmailMessage
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ from urllib.parse import urlencode
 
 
 Fixture = runpy.run_path(str(Path(__file__).with_name("test-hosted-limits.py")))["Fixture"]
+team_command = runpy.run_path(str(Path(__file__).with_name("test-webmail-teams.py")))["command"]
 
 
 def ok(response):
@@ -34,10 +36,11 @@ def wait_for(read):
     raise AssertionError("Timed out waiting for the interrupted dispatch")
 
 
-def saved_message(fixture, session, subject, to, bcc=()):
+def saved_message(fixture, session, subject, to, bcc=(), **headers):
     message = {
         "subject": subject, "text": "Durable Outbox recovery fixture",
         "to": to, "bcc": list(bcc), "draftId": secrets.token_hex(16), "saveToken": secrets.token_hex(16),
+        **headers,
     }
     draft = ok(fixture.api(session, "drafts", message))
     return dict(message, draftUid=draft["uid"], draftRevision=draft["revision"],
@@ -56,14 +59,37 @@ def replay(fixture, session, message, expected, mailbox, charged):
     assert fixture.count(mailbox) == charged
 
 
+def follow_recovered_reply(fixture, sender, target, reader, session):
+    team_command(fixture, "team", "create", "studio", "Studio", sender)
+    team_command(fixture, "team", "member", "studio", reader, "member")
+    ok(fixture.api(session, "sender-review", {"setting": "disable"}, "PUT"))
+    ok(fixture.api(fixture.login(reader), "notifications", {"enabled": True}, "PUT"))
+    root = EmailMessage()
+    root["From"], root["To"] = target, sender
+    root["Subject"], root["Message-ID"] = "Start recovered conversation", "<outbox-recovery-root@threads.example.test>"
+    root.set_content("The initial message for the recovery fixture.")
+    with fixture.smtp(target) as connection:
+        assert connection.send_message(root) == {}
+    parent, = messages(fixture, session, "INBOX", root["Subject"])
+    options = {"references": [parent["reference"]], "followReplies": True, "followSentReplies": True}
+    preview = ok(fixture.api(session, "thread-shares/preview", options))
+    status, grant = fixture.api(session, "thread-shares", {**options, "team": "studio", "grantee": reader, "digest": preview["digest"]})
+    assert status == 201, (status, grant)
+    return f"thread-shares/{grant['id']}", parent
+
+
 def all_local(binary, root):
     fixture = Fixture(binary, root, staging=True)
     with fixture.daemon() as daemon, closing(sqlite3.connect(root / "smtp.db")) as db:
         sender = fixture.provision("all-local", daily=1)
         target = fixture.provision("local-target")
+        reader = fixture.provision("recovery-reader")
         session = fixture.login(sender)
         subject = "Local interruption fixture"
-        message = saved_message(fixture, session, subject, [target])
+        share, parent = follow_recovered_reply(fixture, sender, target, reader, session)
+        message = saved_message(fixture, session, subject, [target],
+                                inReplyTo=parent["message_id"], references=parent["message_id"],
+                                replyContext={key: parent[key] for key in ("uid", "folder", "reference")})
         with db:
             # Leave the durable routing write intact. Prevent the worker from
             # filing Sent or acknowledging completion at this crash boundary.
@@ -83,6 +109,7 @@ def all_local(binary, root):
         wait_for(lambda: messages(fixture, session, "Trash", subject))
         assert len(messages(fixture, fixture.login(target), "INBOX", subject)) == 1
         assert not messages(fixture, session, "Sent", subject)
+        assert len(ok(fixture.api(fixture.login(reader), share))["messages"]) == 1
         assert ok(fixture.api(session, "outbox/" + message["sendId"]))["state"] == "sending"
         daemon.kill()
         daemon.wait()
@@ -93,7 +120,7 @@ def all_local(binary, root):
                                     FROM webmail_records WHERE id=?)""", (message["sendId"],))
             db.executescript("DROP TRIGGER fixture_stop_outbox; DROP TRIGGER fixture_stop_sent; DROP TRIGGER fixture_stop_draft;")
 
-    for _ in range(2):
+    for restart in range(2):
         with fixture.daemon():
             session = fixture.login(sender)
             recovered = fixture.outbox(session, message["sendId"], "sent")
@@ -104,10 +131,15 @@ def all_local(binary, root):
             assert len(sent) == len(inbox) == 1
             assert sent[0]["message_id"] == inbox[0]["message_id"] == result["message_id"], (sent, inbox)
             assert sent[0]["date"] == inbox[0]["date"], (sent, inbox)
+            teammate = fixture.login(reader)
+            published, = [row for row in ok(fixture.api(teammate, share))["messages"] if row["sentReply"]]
+            assert published["reference"] == sent[0]["reference"]
+            notices = ok(fixture.api(teammate, "notifications/claim", method="POST"))
+            assert notices.get("teamReplies", 0) == int(restart == 0), notices
             assert len(messages(fixture, session, "Trash", subject)) == 1
             assert fixture.api(session, f'drafts?uid={message["draftUid"]}')[0] == 404
             replay(fixture, session, message, "sent", sender, 1)
-    print("Verified all-local recovery, one Sent copy, one draft cleanup, and unchanged allowance over two restarts.")
+    print("Verified all-local recovery, one Sent copy and shared reply, one draft cleanup, and unchanged allowance over two restarts.")
 
 
 def install_stub(root):

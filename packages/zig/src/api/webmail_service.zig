@@ -13,6 +13,7 @@ const fs = @import("../core/fs_compat.zig");
 const time = @import("../core/time_compat.zig");
 const mutex = @import("../core/mutex_compat.zig");
 const maildir = @import("webmail_maildir.zig");
+const snapshots = @import("webmail_snapshots.zig");
 const calendar_invite = @import("webmail_calendar_invite.zig");
 const compose = @import("webmail_compose.zig");
 const store = @import("webmail_store.zig");
@@ -729,6 +730,26 @@ pub const Service = struct {
         if (doc.message.sharedReply != null) return error.SharedReplyQueueRequired;
     }
 
+    /// Record the exact mailbox message the owner answered. A Message-ID on its
+    /// own can also occur on an unrelated message in the same mailbox.
+    pub fn followedSentSource(self: *Service, a: std.mem.Allocator, user: []const u8, payload: Payload) ?database.Database.TeamReplySource {
+        if (payload.bcc.len != 0 or (payload.inReplyTo.len == 0 and payload.references.len == 0)) return null;
+        const context = payload.replyContext orelse return null;
+        const reference = context.reference orelse return null;
+        if (!message_refs.valid(reference) or !(self.db.hasFollowedSentReplies(user) catch return null)) return null;
+        var work = std.heap.ArenaAllocator.init(a);
+        defer work.deinit();
+        const original = maildir.getByReference(work.allocator(), self.db, user, reference) catch return null;
+        if (!snapshots.canShare(original, self.junkFolder())) return null;
+        var ids: thread_ids.Iterator = .{ .text = original.message_id };
+        const wire_id = ids.next() orelse return null;
+        return .{
+            .reference = reference,
+            .revision = original.version.?.content_revision,
+            .wire_id = a.dupe(u8, wire_id) catch return null,
+        };
+    }
+
     pub fn cancel(self: *Service, a: std.mem.Allocator, user: []const u8, id: []const u8, now: i64) !store.Record {
         self.mutations.lock();
         defer self.mutations.unlock();
@@ -941,6 +962,7 @@ pub const Service = struct {
         };
         if (doc.message.sharedReply) |context| cfg.shared_reply = .{ .context = context, .send_id = row.id };
         if (doc.calendarReply) |reply| cfg.calendar_reply = reply.revision;
+        cfg.team_reply_source = self.followedSentSource(a, user, doc.message);
         doc.result = try compose.sendWithJournal(a, msg, cfg, doc.dispatch);
     }
 

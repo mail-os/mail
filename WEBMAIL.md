@@ -689,6 +689,14 @@ Earlier mail, automatic responses, and attachments in later replies stay in
 the owner's mailbox. A teammate with browser notifications enabled can receive
 a generic notice. Mail checks access again when the browser claims the notice.
 
+Enable **Include my sent replies** to share text previews of your webmail
+replies to those verified senders. Reply from a message already in the share,
+address only those senders in To or Cc, and send as usual. A reply appears
+when Mail files its Sent copy after successful submission. Both
+directions count toward the same 40-reply limit. Sent drafts, imported copies,
+and automatic replies stay private. Mail sends a generic notice only to an
+opted-in teammate outside the reply's delivery recipients.
+
 Shared conversations show the original subject, sender, date, and plain text.
 Private notes and hidden envelope fields stay in the owner's mailbox.
 Teammate comments belong to the share and are visible to its two participants.

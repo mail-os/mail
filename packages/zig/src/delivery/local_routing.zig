@@ -347,7 +347,9 @@ fn drain(allocator: Allocator, db: *Database, id: ?[]const u8, limit: usize) !vo
             _ = db.getOrCreateMailbox(target.mailbox, target.folder) catch |err|
                 std.log.warn("accepted delivery could not register its destination folder: {}", .{err});
         }
-        const stamp = if (target.track_placement or target.review_copy) message_refs.fileStamp(a, file) catch |err| {
+        const is_team_reply = (target.team_reply_candidate or target.team_sent_reply_candidate) and
+            attention != null and attention.?.reply_parent != null;
+        const stamp = if (target.track_placement or target.review_copy or (target.team_sent_reply_candidate and is_team_reply)) message_refs.fileStamp(a, file) catch |err| {
             fs.cwd().deleteFile(file) catch {};
             return err;
         } else "";
@@ -357,10 +359,8 @@ fn drain(allocator: Allocator, db: *Database, id: ?[]const u8, limit: usize) !vo
             .size = target.mime.len,
             .attention = attention,
             .notification_key = notification_key,
-            .thread_reply_digest = if (target.team_reply_candidate and attention != null and attention.?.reply_parent != null)
-                message_refs.digest(target.mime)
-            else
-                null,
+            .thread_reply_digest = if (is_team_reply) message_refs.digest(target.mime) else null,
+            .thread_reply_outgoing = is_team_reply and target.team_sent_reply_candidate,
             .calendar_revisions = revisions,
         }) catch |err| {
             // Leave the reservation intact. Do not let an active mailbox
