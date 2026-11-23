@@ -158,6 +158,7 @@ pub const Limits = struct {
     undoSendSeconds: u32,
     calendarAvailable: bool = false,
     sharedInboxesAvailable: bool = false,
+    teamThreadsAvailable: bool = false,
     junkFolder: []const u8 = "Junk",
 };
 

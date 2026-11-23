@@ -1109,6 +1109,58 @@ async function snapshotSharingJourney(desktop, phone) {
   await phone.setViewportSize({ width: 390, height: 844 })
 }
 
+async function teamThreadJourney(desktop) {
+  await desktop.goto(url + '/')
+  await openMailbox(desktop, /^Receipts(?:\s|$)/)
+  await button(desktop, /Your receipt #1046/).click()
+  await button(desktop, 'Share with teammate').click()
+  const compose = desktop.getByRole('dialog', { name: 'Share with teammate' })
+  await compose.getByRole('region', { name: 'Conversation preview' }).getByText(/November payment/).waitFor()
+  await compose.getByLabel('Allow attachment downloads').check()
+  await compose.getByRole('region', { name: 'Conversation preview' }).getByText('receipt-1046.txt', { exact: true }).waitFor()
+  assert.equal(await compose.getByLabel('Team', { exact: true }).inputValue(), 'studio')
+  await compose.getByLabel('Teammate', { exact: true }).fill(sender)
+  await compose.locator('.wm-snapshot-panel').screenshot({ path: join(output, 'desktop-team-thread-preview.png'), animations: 'disabled' })
+  await button(compose, 'Share conversation').click()
+  const ownerView = desktop.getByRole('dialog', { name: 'Shared conversations' })
+  const ownerMessages = ownerView.getByRole('region', { name: 'Shared messages' })
+  await ownerMessages.getByText(/November payment/).waitFor()
+  await ownerView.getByLabel('Teammate comment').fill('Please check the receipt total.')
+  await button(ownerView, 'Post comment').click()
+  await ownerView.getByText('Please check the receipt total.', { exact: true }).waitFor()
+
+  const teammate = await signIn({ phone: true, account: sender, initialSubject: 'Combined source briefing' })
+  try {
+    await teammate.setViewportSize({ width: 320, height: 844 })
+    await drawer(teammate).click()
+    await button(teammate, 'Shared conversations').click()
+    const incoming = teammate.getByRole('dialog', { name: 'Shared conversations' })
+    await button(incoming, 'Open Your receipt #1046').click()
+    await incoming.getByText('Please check the receipt total.', { exact: true }).waitFor()
+    await incoming.getByLabel('Search conversation').fill('absent term')
+    await button(incoming, 'Search').click()
+    await incoming.getByText('No matching messages.', { exact: true }).waitFor()
+    await incoming.getByLabel('Search conversation').fill('NOVEMBER')
+    await button(incoming, 'Search').click()
+    const file = incoming.getByRole('link', { name: 'receipt-1046.txt' })
+    await file.waitFor()
+    const href = new URL(await file.getAttribute('href'), url)
+    const response = await teammate.request.get(href.href)
+    assert.equal(await response.text(), 'Receipt 1046 for Studio Hosting\n')
+    await fitsViewport(teammate)
+    await screenshot(teammate, 'phone-team-thread')
+    await button(ownerView, 'Revoke access').click()
+    await button(ownerView.getByRole('group', { name: 'Confirm conversation revocation' }), 'Revoke access').click()
+    await ownerView.getByText('Access revoked.', { exact: true }).waitFor()
+    assert.equal((await teammate.request.get(href.href)).status(), 404)
+    await button(incoming, 'Search').click()
+    await incoming.getByRole('alert').filter({ hasText: /unavailable/ }).waitFor()
+    await file.waitFor({ state: 'hidden' })
+    await button(ownerView, 'Close').click()
+  }
+  finally { await teammate.context().close() }
+}
+
 async function fileLinkJourney(desktop, phone) {
   const filename = 'Workshop proofs.bin'
   const subject = 'Download the workshop proofs'
@@ -2279,6 +2331,7 @@ try {
   await calendarTasksJourney(phone, true)
   await calendarToolsJourney(desktop, phone)
   await snapshotSharingJourney(desktop, phone)
+  await teamThreadJourney(desktop)
   await fileLinkJourney(desktop, phone)
   await replyBatchJourney(desktop, phone)
   await combinedInboxJourney(desktop)

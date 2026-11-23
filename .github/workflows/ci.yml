@@ -39,7 +39,7 @@ jobs:
     - name: Run native HTTPS browser journeys
       if: runner.os == 'Linux'
       working-directory: .
-      timeout-minutes: 5
+      timeout-minutes: 8
       run: python3 scripts/test-webmail-browser.py packages/zig/zig-out/bin/mail webmail-browser-screenshots
 
     - name: Verify external From in the browser
@@ -111,6 +111,7 @@ jobs:
         python3 ../../scripts/test-webmail-index.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-private.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-teams.py zig-out/bin/mail
+        python3 ../../scripts/test-webmail-team-threads.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-shared-inbox.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-shared-replies.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-contacts.py zig-out/bin/mail

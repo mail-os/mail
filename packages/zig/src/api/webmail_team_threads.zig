@@ -1,0 +1,329 @@
+//! Identity-bound conversations shared between two mailboxes in the same team.
+const std = @import("std");
+const ascii = @import("ascii-compat");
+const database = @import("../storage/database.zig");
+const message_refs = @import("../storage/message_refs.zig");
+const teams = @import("../storage/team_store.zig");
+const maildir = @import("webmail_maildir.zig");
+const store = @import("webmail_store.zig");
+const snapshots = @import("webmail_snapshots.zig");
+const link_tokens = @import("webmail_link_tokens.zig");
+
+const Allocator = std.mem.Allocator;
+const Database = database.Database;
+const Statement = database.Statement;
+const max_shares = 30;
+const max_comments = 64;
+
+pub const schema =
+    \\CREATE TABLE IF NOT EXISTS mail_team_thread_shares (
+    \\    id TEXT PRIMARY KEY NOT NULL,
+    \\    team_id TEXT NOT NULL,
+    \\    owner_id INTEGER NOT NULL,
+    \\    grantee_id INTEGER NOT NULL,
+    \\    subject TEXT NOT NULL,
+    \\    downloads INTEGER NOT NULL CHECK(downloads IN (0,1)),
+    \\    CHECK(owner_id<>grantee_id),
+    \\    FOREIGN KEY(team_id,owner_id) REFERENCES mail_team_members(team_id,user_id) ON DELETE CASCADE,
+    \\    FOREIGN KEY(team_id,grantee_id) REFERENCES mail_team_members(team_id,user_id) ON DELETE CASCADE
+    \\);
+    \\CREATE INDEX IF NOT EXISTS mail_team_thread_owner ON mail_team_thread_shares(owner_id);
+    \\CREATE INDEX IF NOT EXISTS mail_team_thread_grantee ON mail_team_thread_shares(grantee_id);
+    \\CREATE TABLE IF NOT EXISTS mail_team_thread_messages (
+    \\    share_id TEXT NOT NULL REFERENCES mail_team_thread_shares(id) ON DELETE CASCADE,
+    \\    reference TEXT NOT NULL,
+    \\    content_revision TEXT NOT NULL,
+    \\    PRIMARY KEY(share_id,reference)
+    \\);
+    \\CREATE TABLE IF NOT EXISTS mail_team_thread_comments (
+    \\    id INTEGER PRIMARY KEY,
+    \\    share_id TEXT NOT NULL REFERENCES mail_team_thread_shares(id) ON DELETE CASCADE,
+    \\    author_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    \\    written_at INTEGER NOT NULL,
+    \\    text TEXT NOT NULL
+    \\);
+    \\CREATE INDEX IF NOT EXISTS mail_team_thread_comment_share ON mail_team_thread_comments(share_id);
+;
+
+const authorized =
+    \\ FROM mail_team_thread_shares s
+    \\ JOIN users owner ON owner.id=s.owner_id AND owner.enabled=1
+    \\ JOIN users grantee ON grantee.id=s.grantee_id
+    \\ WHERE (owner.username=?1 OR (grantee.username=?1 AND grantee.enabled=1))
+;
+const share_fields = "SELECT s.id,s.team_id,owner.username,grantee.username,s.subject,s.downloads";
+
+pub const Grant = struct {
+    id: []const u8,
+    team: []const u8,
+    owner: []const u8,
+    grantee: []const u8,
+    subject: []const u8,
+    downloads: bool,
+};
+const Selection = struct { reference: []const u8, revision: [64]u8 };
+const Attachment = struct { index: usize, filename: []const u8, size: usize };
+const Message = struct {
+    reference: []const u8,
+    subject: []const u8,
+    from: []const u8,
+    timestamp: i64,
+    text: []const u8,
+    attachments: []Attachment,
+};
+const Comment = struct { author: []const u8, writtenAt: i64, text: []const u8 };
+pub const Prepared = struct { selection: []Selection, messages: []Message, digest: [64]u8, downloads: bool };
+pub const Detail = struct { grant: Grant, messages: []Message, comments: []Comment };
+
+fn bind(stmt: Statement, args: anytype) !void {
+    inline for (args, 1..) |value, i| try stmt.bind(i, value);
+}
+
+fn readGrant(a: Allocator, stmt: Statement) !Grant {
+    return .{
+        .id = try a.dupe(u8, stmt.columnText(0)),
+        .team = try a.dupe(u8, stmt.columnText(1)),
+        .owner = try a.dupe(u8, stmt.columnText(2)),
+        .grantee = try a.dupe(u8, stmt.columnText(3)),
+        .subject = try a.dupe(u8, stmt.columnText(4)),
+        .downloads = stmt.columnInt64(5) != 0,
+    };
+}
+
+pub fn list(a: Allocator, db: *Database, actor: []const u8) ![]Grant {
+    const stmt = try db.prepare(share_fields ++ authorized ++ " ORDER BY s.rowid DESC");
+    defer stmt.finalize();
+    try stmt.bind(1, actor);
+    var out: std.ArrayList(Grant) = .empty;
+    while (try stmt.step()) try out.append(a, try readGrant(a, stmt));
+    return out.toOwnedSlice(a);
+}
+
+pub fn available(db: *Database, actor: []const u8) !bool {
+    const stmt = try db.prepare(
+        \\SELECT 1 FROM mail_team_members m JOIN users u ON u.id=m.user_id
+        \\WHERE u.username=?1 AND u.enabled=1 LIMIT 1
+    );
+    defer stmt.finalize();
+    try stmt.bind(1, actor);
+    return stmt.step();
+}
+
+fn lookup(a: Allocator, tx: Database.Transaction, actor: []const u8, id: []const u8) !Grant {
+    const stmt = try tx.prepare(share_fields ++ authorized ++ " AND s.id=?2");
+    defer stmt.finalize();
+    try bind(stmt, .{ actor, id });
+    if (!try stmt.step()) return error.ThreadShareUnavailable;
+    return readGrant(a, stmt);
+}
+
+pub fn requireGrant(a: Allocator, db: *Database, actor: []const u8, id: []const u8) !Grant {
+    var tx = try db.beginTransaction(.read);
+    defer tx.deinit();
+    const grant = try lookup(a, tx, actor, id);
+    try tx.commit();
+    return grant;
+}
+
+fn downloadable(part: maildir.AttachmentInfo) bool {
+    // Attached messages can expose their own envelope headers and drafts.
+    return part.content_id.len == 0 and !std.ascii.startsWithIgnoreCase(part.content_type, "message/") and
+        !std.ascii.endsWithIgnoreCase(part.filename, ".eml") and !std.ascii.endsWithIgnoreCase(part.filename, ".msg");
+}
+
+fn project(a: Allocator, scratch: Allocator, item: maildir.MessageDetail, downloads: bool, remaining: *usize) !Message {
+    const text = try snapshots.plainText(scratch, item);
+    for ([_][]const u8{ item.subject, item.from, text }) |field| {
+        if (field.len > remaining.*) return error.ThreadShareTooLarge;
+        if (!std.unicode.utf8ValidateSlice(field)) return error.InvalidThreadShare;
+        remaining.* -= field.len;
+    }
+    var attachments: std.ArrayList(Attachment) = .empty;
+    if (downloads) for (item.attachments, 0..) |part, index| {
+        if (!downloadable(part) or !std.unicode.utf8ValidateSlice(part.filename)) continue;
+        if (part.filename.len > remaining.* or remaining.* - part.filename.len < 64) return error.ThreadShareTooLarge;
+        remaining.* -= part.filename.len + 64;
+        try attachments.append(a, .{ .index = index, .filename = try a.dupe(u8, part.filename), .size = part.size });
+    };
+    return .{
+        .reference = try a.dupe(u8, item.version.?.reference),
+        .subject = try a.dupe(u8, item.subject),
+        .from = try a.dupe(u8, item.from),
+        .timestamp = item.timestamp,
+        .text = try a.dupe(u8, text),
+        .attachments = try attachments.toOwnedSlice(a),
+    };
+}
+
+pub fn prepare(a: Allocator, db: *Database, actor: []const u8, refs: []const []const u8, downloads: bool, junk: []const u8) !Prepared {
+    if (refs.len == 0 or refs.len > snapshots.max_messages) return error.InvalidThreadShare;
+    const messages = try a.alloc(Message, refs.len);
+    const selection = try a.alloc(Selection, refs.len);
+    var remaining: usize = snapshots.max_bytes;
+    for (refs, 0..) |ref, i| {
+        if (!message_refs.valid(ref)) return error.InvalidThreadShare;
+        for (refs[0..i]) |previous| if (std.mem.eql(u8, ref, previous)) return error.InvalidThreadShare;
+        var work = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer work.deinit();
+        const scratch = work.allocator();
+        const item = try maildir.getByReference(scratch, db, actor, ref);
+        if (!snapshots.canShare(item, junk)) return error.ThreadShareUnavailable;
+        messages[i] = try project(a, scratch, item, downloads, &remaining);
+        selection[i] = .{ .reference = ref, .revision = item.version.?.content_revision };
+    }
+    const payload = try std.json.Stringify.valueAlloc(a, .{ .selection = selection, .downloads = downloads }, .{});
+    return .{ .selection = selection, .messages = messages, .digest = link_tokens.digest(payload), .downloads = downloads };
+}
+
+pub fn create(a: Allocator, db: *Database, actor: []const u8, team: []const u8, grantee: []const u8, prepared: Prepared) !Grant {
+    if (!teams.validTeamId(team) or grantee.len == 0 or grantee.len > 320 or std.mem.eql(u8, actor, grantee))
+        return error.InvalidThreadShare;
+    const id = try store.newId(a);
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const subject = prepared.messages[0].subject;
+    {
+        const stmt = try tx.prepare(
+            \\INSERT INTO mail_team_thread_shares(id,team_id,owner_id,grantee_id,subject,downloads)
+            \\SELECT ?1,?2,owner.id,grantee.id,?5,?6
+            \\FROM users owner JOIN mail_team_members own ON own.user_id=owner.id AND own.team_id=?2
+            \\JOIN mail_team_members member ON member.team_id=own.team_id AND member.user_id<>own.user_id
+            \\JOIN users grantee ON grantee.id=member.user_id
+            \\WHERE owner.username=?3 AND owner.enabled=1 AND grantee.username=?4 AND grantee.enabled=1
+            \\AND (SELECT count(*) FROM mail_team_thread_shares WHERE owner_id=owner.id)<?7
+            \\RETURNING id
+        );
+        defer stmt.finalize();
+        try bind(stmt, .{ id, team, actor, grantee, subject, @intFromBool(prepared.downloads), @as(i64, max_shares) });
+        if (!try stmt.step()) return error.ThreadShareGrantUnavailable;
+    }
+    {
+        const stmt = try tx.prepare("INSERT INTO mail_team_thread_messages(share_id,reference,content_revision) VALUES(?1,?2,?3)");
+        defer stmt.finalize();
+        for (prepared.selection) |item| {
+            try bind(stmt, .{ id, item.reference, @as([]const u8, &item.revision) });
+            _ = try stmt.step();
+            try stmt.reset();
+        }
+    }
+    try tx.commit();
+    return .{ .id = id, .team = team, .owner = actor, .grantee = grantee, .subject = subject, .downloads = prepared.downloads };
+}
+
+pub fn revoke(db: *Database, actor: []const u8, id: []const u8) !void {
+    const stmt = try db.prepare(
+        \\DELETE FROM mail_team_thread_shares WHERE id=?2
+        \\AND owner_id=(SELECT id FROM users WHERE username=?1 AND enabled=1) RETURNING id
+    );
+    defer stmt.finalize();
+    try bind(stmt, .{ actor, id });
+    if (!try stmt.step()) return error.ThreadShareUnavailable;
+}
+
+fn selected(a: Allocator, tx: Database.Transaction, id: []const u8, ref: ?[]const u8) ![]Selection {
+    const stmt = try tx.prepare(
+        \\SELECT reference,content_revision FROM mail_team_thread_messages
+        \\WHERE share_id=?1 AND (?2 IS NULL OR reference=?2) ORDER BY rowid
+    );
+    defer stmt.finalize();
+    try stmt.bind(1, id);
+    try stmt.bindOpt(2, ref);
+    var out: std.ArrayList(Selection) = .empty;
+    while (try stmt.step()) {
+        const revision = stmt.columnText(1);
+        if (revision.len != 64) return error.InvalidThreadShare;
+        try out.append(a, .{ .reference = try a.dupe(u8, stmt.columnText(0)), .revision = revision[0..64].* });
+    }
+    return out.toOwnedSlice(a);
+}
+
+fn loadMessage(a: Allocator, db: *Database, owner: []const u8, item: Selection, junk: []const u8) !maildir.MessageDetail {
+    const msg = try maildir.getByReference(a, db, owner, item.reference);
+    if (!snapshots.canShare(msg, junk) or !std.mem.eql(u8, &msg.version.?.content_revision, &item.revision))
+        return error.ThreadShareUnavailable;
+    return msg;
+}
+
+fn comments(a: Allocator, tx: Database.Transaction, id: []const u8) ![]Comment {
+    const stmt = try tx.prepare(
+        \\SELECT users.username,c.written_at,c.text FROM mail_team_thread_comments c
+        \\JOIN users ON users.id=c.author_id WHERE c.share_id=?1 ORDER BY c.id
+    );
+    defer stmt.finalize();
+    try stmt.bind(1, id);
+    var out: std.ArrayList(Comment) = .empty;
+    while (try stmt.step()) try out.append(a, .{
+        .author = try a.dupe(u8, stmt.columnText(0)),
+        .writtenAt = stmt.columnInt64(1),
+        .text = try a.dupe(u8, stmt.columnText(2)),
+    });
+    return out.toOwnedSlice(a);
+}
+
+pub fn detail(a: Allocator, db: *Database, actor: []const u8, id: []const u8, needle: []const u8, junk: []const u8) !Detail {
+    if (needle.len > 256 or !std.unicode.utf8ValidateSlice(needle)) return error.InvalidThreadShare;
+    const result = blk: {
+        var tx = try db.beginTransaction(.read);
+        defer tx.deinit();
+        const grant = try lookup(a, tx, actor, id);
+        const items = try selected(a, tx, id, null);
+        const notes = try comments(a, tx, id);
+        try tx.commit();
+        break :blk .{ .grant = grant, .items = items, .notes = notes };
+    };
+    var messages: std.ArrayList(Message) = .empty;
+    var remaining: usize = snapshots.max_bytes;
+    for (result.items) |item| {
+        var work = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer work.deinit();
+        const scratch = work.allocator();
+        const msg = loadMessage(scratch, db, result.grant.owner, item, junk) catch |err| switch (err) {
+            error.ThreadShareUnavailable, maildir.MaildirError.MessageNotFound => continue,
+            else => return err,
+        };
+        const projected = try project(a, scratch, msg, result.grant.downloads, &remaining);
+        if (needle.len != 0 and ascii.indexOfIgnoreCase(projected.subject, needle) == null and
+            ascii.indexOfIgnoreCase(projected.from, needle) == null and ascii.indexOfIgnoreCase(projected.text, needle) == null) continue;
+        try messages.append(a, projected);
+    }
+    _ = try requireGrant(a, db, actor, id);
+    return .{ .grant = result.grant, .messages = try messages.toOwnedSlice(a), .comments = result.notes };
+}
+
+pub fn attachment(a: Allocator, db: *Database, actor: []const u8, id: []const u8, ref: []const u8, index: usize, junk: []const u8) !maildir.AttachmentInfo {
+    const result = blk: {
+        var tx = try db.beginTransaction(.read);
+        defer tx.deinit();
+        const grant = try lookup(a, tx, actor, id);
+        if (!grant.downloads) return error.ThreadShareUnavailable;
+        const exact = try selected(a, tx, id, ref);
+        if (exact.len != 1) return error.ThreadShareUnavailable;
+        try tx.commit();
+        break :blk .{ .owner = grant.owner, .item = exact[0] };
+    };
+    const msg = try loadMessage(a, db, result.owner, result.item, junk);
+    if (index >= msg.attachments.len or !downloadable(msg.attachments[index])) return error.ThreadShareUnavailable;
+    _ = try requireGrant(a, db, actor, id);
+    return msg.attachments[index];
+}
+
+pub fn addComment(a: Allocator, db: *Database, actor: []const u8, id: []const u8, value: []const u8, now: i64) !void {
+    const text = std.mem.trim(u8, value, " \t\r\n");
+    if (text.len == 0 or text.len > 2000 or !std.unicode.utf8ValidateSlice(text)) return error.InvalidThreadShare;
+    for (text) |byte| if ((byte < 32 and byte != '\n' and byte != '\r' and byte != '\t') or byte == 127) return error.InvalidThreadShare;
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    _ = try lookup(a, tx, actor, id);
+    {
+        const stmt = try tx.prepare(
+            \\INSERT INTO mail_team_thread_comments(share_id,author_id,written_at,text)
+            \\SELECT ?1,id,?3,?4 FROM users WHERE username=?2
+            \\AND (SELECT count(*) FROM mail_team_thread_comments WHERE share_id=?1)<?5
+            \\RETURNING id
+        );
+        defer stmt.finalize();
+        try bind(stmt, .{ id, actor, now, text, @as(i64, max_comments) });
+        if (!try stmt.step()) return error.ThreadShareCommentLimit;
+    }
+    try tx.commit();
+}

@@ -1009,6 +1009,7 @@ pub const Database = struct {
         try self.initAuditTable();
         try self.exec(team_store.schema);
         try self.exec(shared_inbox.schema);
+        try self.exec(@import("../api/webmail_team_threads.zig").schema);
     }
 
     pub fn exec(self: *Database, sql: []const u8) !void {

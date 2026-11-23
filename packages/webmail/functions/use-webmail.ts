@@ -24,6 +24,7 @@ import { usePrivateMail } from './use-private-mail'
 import { useAddressBook } from './use-address-book'
 import { useComposeLibrary } from './use-compose-library'
 import { useMessageSnapshots } from './use-message-snapshots'
+import { useTeamThreads } from './use-team-threads'
 import { useAssistantGrants } from './use-assistant-grants'
 import { useFileLinks } from './use-file-links'
 import { linkedFilesInText } from './mail-public-links'
@@ -246,6 +247,7 @@ export function useWebmail(ports: WebmailPorts) {
     invalidateList()
     closeReader()
     snapshots.closeSnapshots()
+    teamThreads.closeTeamThreads()
     assistantGrants.closeAssistant()
     fileSharing.closeFileLinkManager()
     replyBatch.closeReplyBatch()
@@ -289,6 +291,7 @@ export function useWebmail(ports: WebmailPorts) {
     if (event.data === linkedAccount) void api('/webmail/auth/me').catch(() => {})
   }
   const snapshots = useMessageSnapshots(api)
+  const teamThreads = useTeamThreads(api)
   const assistantGrants = useAssistantGrants(api)
   const fileSharing = useFileLinks(api, () => limits().maxFileLinkBytes ?? 0)
   const replyBatch = useReplyBatch(api, sendDelay)
@@ -393,6 +396,11 @@ export function useWebmail(ports: WebmailPorts) {
   }
   function shareSelectedSnapshot() {
     snapshots.previewSnapshot(checked().map(item => item.reference))
+  }
+  function shareWithTeam(bulk = false) {
+    if (linkedView || !limits().teamThreadsAvailable) return
+    if (bulk) teamThreads.beginTeamThread(checked().map(item => item.reference))
+    else if (canShareSnapshot()) teamThreads.beginTeamThread([selected()?.reference])
   }
   function shareWithAssistant(bulk = false) {
     if (linkedView) return
@@ -1878,7 +1886,7 @@ export function useWebmail(ports: WebmailPorts) {
       const result = await api<{ user: User }>('/webmail/auth/me')
       user.set(result.user)
       const config = await api<MailLimits>('/webmail/api/config')
-      limits.set(linkedView ? { ...config, maxFileLinkBytes: 0, calendarAvailable: false, sharedInboxesAvailable: false } : config)
+      limits.set(linkedView ? { ...config, maxFileLinkBytes: 0, calendarAvailable: false, sharedInboxesAvailable: false, teamThreadsAvailable: false } : config)
       sendDelay.set(config.undoSendSeconds)
       void writing.loadWritingLibrary()
       void loadSenderIdentities()
@@ -1947,6 +1955,7 @@ export function useWebmail(ports: WebmailPorts) {
     privateMail.closePrivate()
     contactBook.closeContacts()
     snapshots.closeSnapshots()
+    teamThreads.closeTeamThreads()
     assistantGrants.closeAssistant()
     fileSharing.clearFileLinkComposer()
     fileSharing.closeFileLinkManager()
@@ -1956,6 +1965,7 @@ export function useWebmail(ports: WebmailPorts) {
   return { linkedView, user, folders, folder, messages, threads, expandedThreads, selected, loading, refreshing, listError, readerError, readerTarget, reading, readingLoading, mutating, error, notice, query, activeQuery, appliedSearchAll, filterLocation, filterSender, filterRecipient, filterFilename, libraryView, libraryFiles, indexProgress, filterAfter, filterBefore, filterStatus, filterFlagged, filterAttachments, filtersOpen, filterActive, conversations, page, total, matchingTotal, moveTo, showHtml, formattedReader, remoteImagesAllowed, checked, checkedKeys, selectedCount, isJunkFolder, readerJunkAction, selectionJunkAction, allChecked, someChecked, undoAction, undoRemaining, readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts, pendingSend, sendRemaining, outbox, outboxCount, outboxCounts, outboxSection, outboxViews, outboxEmpty, outboxPageNumber, outboxNext, outboxLoading, outboxError, outboxView, cancelling, authExpired, currentFolderName, now, composing, title, sharedReply, senderId, senderIdentities, missingSender, senderStatus, chooseSender, externalSender, externalSendReview, cancelExternalReview, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, hasUnsavedChanges, saveStatus, savingDraft: draft.saving, draftError: draft.error, draftConflict: draft.conflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword, confirmPassword, passwordError, savingPassword, confirmation, confirming, limits, ...senderReview, ...notifications, ...privateMail, ...contactBook, showContacts, composeSavedCard, collectionView, collectionId, canOpenPrivate,
     createEventLink, canRespondToInvitation, respondToInvitation, rsvpBusy, rsvpError,
     ...snapshots, canShareSnapshot, shareMessageSnapshot, shareSelectedSnapshot,
+    ...teamThreads, shareWithTeam,
     ...assistantGrants, shareWithAssistant,
     ...fileSharing, messageFileLinks, insertFileLink,
     ...replyBatch, replyToSelection, submitReplyBatch,

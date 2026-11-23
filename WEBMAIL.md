@@ -668,6 +668,24 @@ populated section reports a conflict. Use the exported iCalendar and vCard
 files to restore events and contacts. Use a server backup for same-service
 recovery of account configuration, sharing, and message-linked workflows.
 
+## Share selected mail with a teammate
+
+Open a message or select up to ten messages and choose **Share with teammate**.
+Review the plain text that will be visible, then select the team and enter the
+teammate's mailbox address. Enable attachment downloads only if you want to
+share the files shown in the preview.
+
+Both mailboxes must be active members of that team. **Shared conversations**
+shows the sender and recipient of each grant. Either participant can search
+its approved messages and add teammate comments. The owner can revoke access,
+and removing a member from the team removes their grants. A shared message
+follows moves between readable folders while its approved MIME content remains
+current.
+
+Shared conversations show the original subject, sender, date, and plain text.
+Private notes and hidden envelope fields stay in the owner's mailbox.
+Teammate comments belong to the share and are visible to its two participants.
+
 ## Self-hosted team administration
 
 Run these commands on the Mail host using the service database and a local

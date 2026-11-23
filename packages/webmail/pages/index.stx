@@ -16,6 +16,7 @@ import { useServiceHealth } from '../functions/use-service-health'
 import { reminderDayLink, useCalendarReminders } from '../functions/use-calendar-reminders'
 import { vacationStatus } from '../functions/use-vacation-settings'
 import { linkDate as snapshotDate, linkLifetimes } from '../functions/mail-public-links'
+import { teamThreadAttachment } from '../functions/use-team-threads'
 const health = useServiceHealth()
 useInterval(health.refresh, 30000, { whileVisible: true })
 useInterval(health.tick, 1000, { whileVisible: true })
@@ -25,6 +26,7 @@ const foldersExpanded = state(false)
 const selectingMessages = state(false)
 const foldersToggle = useRef('foldersToggle')
 const snapshotDialog = useRef('snapshotDialog')
+const teamThreadDialog = useRef('teamThreadDialog')
 const assistantDialog = useRef('assistantDialog')
 const snapshotUrlField = useRef('snapshotUrlField')
 const replyBatchDialog = useRef('replyBatchDialog')
@@ -101,6 +103,9 @@ const {
   invitationCalendar, invitationCalendarBusy, invitationDestination, chooseInvitationCalendar, saveInvitationCalendar,
   snapshotMode, snapshotBusy, snapshotError, snapshotNotice, snapshotLifetime, snapshotPreview, snapshotIssued, snapshotLinks,
   snapshotRevoke, snapshotCanRefresh, refreshSnapshotPreview, createSnapshot, manageSnapshots, revokeSnapshot, copySnapshotUrl,
+  teamThreadMode, teamThreadBusy, teamThreadError, teamThreadNotice, teamThreadPreview, teamThreadGrants, teamThreadDetail,
+  teamThreadTeams, teamThreadTeam, teamThreadGrantee, teamThreadDownloads, teamThreadSearch, teamThreadComment, teamThreadRevoking,
+  setTeamThreadDownloads, shareTeamThread, listTeamThreads, openTeamThread, addTeamThreadComment, revokeTeamThread, closeTeamThreads, shareWithTeam,
   closeSnapshots, canShareSnapshot, shareMessageSnapshot, shareSelectedSnapshot,
   assistantMode, assistantBusy, assistantError, assistantNotice, assistantName, assistantRead, assistantDraft,
   assistantLifetime, assistantSelection, assistantPreview, assistantIssued, assistantGrants, assistantAudit, assistantRevocation,
@@ -133,6 +138,16 @@ function openSnapshotPreview(bulk = false) {
   if (bulk) shareSelectedSnapshot()
   else shareMessageSnapshot()
   showSnapshotDialog()
+}
+function openTeamThreadDialog(mode, bulk = false) {
+  if (mode === 'share') shareWithTeam(bulk)
+  else listTeamThreads()
+  nextTick(() => { if (!teamThreadDialog.current?.open) teamThreadDialog.current?.showModal() })
+}
+function closeTeamThreadDialog() {
+  if (teamThreadBusy()) return
+  teamThreadDialog.current?.close()
+  closeTeamThreads()
 }
 function openSnapshotManager() {
   manageSnapshots()
@@ -227,6 +242,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
           <a class="wm-folder" href="/combined"><span class="mail-icon" :data-icon="linkedView ? 'back' : 'layers'" aria-hidden="true"></span><span class="wm-folder-name" :text="linkedView ? 'Back to combined inbox' : 'Combined inbox'"></span></a>
           <button class="wm-folder" :aria-current="outboxView ? 'page' : null" @click="showOutbox()"><span class="mail-icon" data-icon="outbox" aria-hidden="true"></span><span class="wm-folder-name">Outbox</span><span :if="outboxCount > 0" class="wm-folder-count" :text="outboxCount"></span></button>
           <a :if="limits.sharedInboxesAvailable" class="wm-folder" href="/shared"><span class="mail-icon" data-icon="people" aria-hidden="true"></span><span class="wm-folder-name">Shared inboxes</span></a>
+          <button :if="limits.teamThreadsAvailable" type="button" class="wm-folder" aria-haspopup="dialog" @click="openTeamThreadDialog('list')"><span class="mail-icon" data-icon="message-stack" aria-hidden="true"></span><span class="wm-folder-name">Shared conversations</span></button>
         </div>
         <div class="wm-nav-secondary">
           <div class="wm-nav-group">
@@ -309,6 +325,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         <button type="button" class="wm-action wm-action--accent" @click="readSelection()" :disabled="loading || readingLoading || triageBusy || mutating"><span class="mail-icon" data-icon="layers" aria-hidden="true"></span>Read selected</button>
         <button :if="!linkedView && selectedCount > 1 && folder !== 'Sent' && folder !== 'Drafts' && folder !== 'Trash' && !isJunkFolder(folder)" type="button" class="wm-action" aria-haspopup="dialog" :disabled="loading || mutating" @click="openReplyBatch()"><span class="mail-icon" data-icon="reply" aria-hidden="true"></span>Reply separately</button>
         <button :if="!linkedView && folder !== 'Drafts' && folder !== 'Trash' && !isJunkFolder(folder)" type="button" class="wm-action" aria-haspopup="dialog" :disabled="loading || mutating" @click="openSnapshotPreview(true)"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Share snapshot</button>
+        <button :if="limits.teamThreadsAvailable && folder !== 'Drafts' && folder !== 'Trash' && !isJunkFolder(folder)" type="button" class="wm-action" aria-haspopup="dialog" :disabled="loading || mutating" @click="openTeamThreadDialog('share', true)"><span class="mail-icon" data-icon="people" aria-hidden="true"></span>Share with teammate</button>
         <button :if="!linkedView && folder !== 'Drafts' && folder !== 'Trash' && !isJunkFolder(folder)" type="button" class="wm-action" aria-haspopup="dialog" :disabled="loading || mutating" @click="openAssistantPreview(true)">Assistant access</button>
         <button :if="!linkedView && selectedCount > 1 && !categoryList && !attentionView && folder !== 'Drafts'" type="button" class="wm-action" @click="groupSelected()" :disabled="loading || readingLoading || triageBusy || mutating">Group selected</button>
         <button class="wm-action" @click="bulkAction('move', 'Archive')" :disabled="mutating"><span class="mail-icon" data-icon="archive" aria-hidden="true"></span>Archive</button>
@@ -472,6 +489,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
               <span class="wm-folder-badge"><span class="mail-icon" :data-icon="mailFolderIcon(selected?.folder || '')" aria-hidden="true"></span><span :text="folderName(selected?.folder || '')"></span></span>
               <div class="wm-message-sharing">
                 <button :if="canShareSnapshot" type="button" class="wm-action wm-action--quiet" aria-haspopup="dialog" @click="openSnapshotPreview()" :disabled="readingLoading || mutating"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Share snapshot</button>
+                <button :if="canShareSnapshot && limits.teamThreadsAvailable" type="button" class="wm-action wm-action--quiet" aria-haspopup="dialog" @click="openTeamThreadDialog('share')" :disabled="readingLoading || mutating"><span class="mail-icon" data-icon="people" aria-hidden="true"></span>Share with teammate</button>
                 <button :if="canShareSnapshot" type="button" class="wm-action wm-action--quiet" aria-haspopup="dialog" @click="openAssistantPreview()" :disabled="readingLoading || mutating"><span class="mail-icon" data-icon="shield" aria-hidden="true"></span>Assistant access</button>
                 <button :if="canOpenPrivate" type="button" class="wm-action wm-action--quiet" :aria-expanded="privateOpen" @click="privateOpen ? closePrivate() : showPrivate()" :disabled="readingLoading || mutating"><span class="mail-icon" data-icon="bookmark" aria-hidden="true"></span>Private tools</button>
               </div>
@@ -1126,6 +1144,88 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
     </form>
   </section>
 </dialog>
+<dialog :if="teamThreadMode" ref="teamThreadDialog" class="wm-modal wm-snapshot-dialog" aria-labelledby="wm-team-thread-title" @cancel.prevent="closeTeamThreadDialog()">
+  <section class="wm-snapshot-panel" :aria-busy="teamThreadBusy">
+    <header class="wm-snapshot-dialog-heading">
+      <h2 id="wm-team-thread-title" :text="teamThreadMode === 'preview' ? 'Share with teammate' : 'Shared conversations'"></h2>
+      <button type="button" class="wm-action" :disabled="teamThreadBusy" @click="closeTeamThreadDialog()" autofocus>Close</button>
+    </header>
+    <p :if="teamThreadNotice" class="wm-snapshot-muted" role="status" :text="teamThreadNotice"></p>
+    <p :if="teamThreadBusy" class="wm-snapshot-muted" role="status">Loading conversation…</p>
+    <p :if="teamThreadError" class="wm-inline-error" role="alert" :text="teamThreadError"></p>
+
+    <div :if="teamThreadMode === 'preview' && teamThreadTeams.length" class="wm-snapshot-workflow">
+      <div :if="teamThreadPreview" class="wm-snapshot-messages" role="region" aria-label="Conversation preview" tabindex="0">
+        <article :for="message in teamThreadPreview.messages" :key="message.reference" class="wm-snapshot-message">
+          <h3 :text="message.subject || '(No subject)'"></h3>
+          <div class="wm-snapshot-meta"><span :text="message.from"></span><span :text="snapshotDate(message.timestamp)"></span></div>
+          <p class="wm-snapshot-body" :text="message.text"></p>
+          <p :for="part in message.attachments" class="wm-snapshot-muted" :text="part.filename"></p>
+        </article>
+      </div>
+      <form class="wm-snapshot-workflow" @submit.prevent="shareTeamThread()">
+        <label class="wm-team-thread-option"><input type="checkbox" :checked="teamThreadDownloads" @change="setTeamThreadDownloads($event.target.checked)" :disabled="teamThreadBusy">Allow attachment downloads</label>
+        <div class="wm-snapshot-form wm-team-thread-audience">
+          <label>Team<select x-model="teamThreadTeam" aria-label="Team" :disabled="teamThreadBusy" required>
+            <option :for="team in teamThreadTeams" :value="team.id" :text="team.name"></option>
+          </select></label>
+          <label>Teammate<input type="email" x-model="teamThreadGrantee" autocomplete="off" maxlength="320" :disabled="teamThreadBusy" required></label>
+          <button type="submit" class="wm-action wm-snapshot-primary" :disabled="teamThreadBusy || !teamThreadPreview || !teamThreadTeam || !teamThreadGrantee.trim()">Share conversation</button>
+        </div>
+      </form>
+    </div>
+
+    <div :if="teamThreadMode === 'list'" class="wm-snapshot-workflow">
+      <p :if="!teamThreadBusy && !teamThreadGrants.length && !teamThreadError" class="wm-snapshot-muted">You have no shared conversations.</p>
+      <ul :if="teamThreadGrants.length" class="wm-snapshot-links" aria-label="Conversations">
+        <li :for="grant in teamThreadGrants" :key="grant.id">
+          <div><strong :text="grant.subject || '(No subject)'"></strong><p class="wm-snapshot-muted" :text="'From ' + grant.owner + ' · Shared with ' + grant.grantee"></p></div>
+          <button type="button" class="wm-action" :disabled="teamThreadBusy" @click="openTeamThread(grant)" :aria-label="'Open ' + (grant.subject || 'conversation')">Open</button>
+        </li>
+      </ul>
+      <button type="button" class="wm-action" :disabled="teamThreadBusy" @click="listTeamThreads()">Refresh list</button>
+    </div>
+
+    <div :if="teamThreadMode === 'detail'" class="wm-snapshot-workflow">
+      <button type="button" class="wm-action" :disabled="teamThreadBusy" @click="listTeamThreads()">Back to conversations</button>
+      <div :if="teamThreadDetail" class="wm-snapshot-workflow">
+        <h3 :text="teamThreadDetail.grant.subject || '(No subject)'"></h3>
+        <p class="wm-snapshot-muted" :text="'From ' + teamThreadDetail.grant.owner + ' · Shared with ' + teamThreadDetail.grant.grantee"></p>
+        <form class="wm-snapshot-form" role="search" @submit.prevent="openTeamThread(teamThreadDetail.grant, true)">
+          <label>Search conversation<input type="search" x-model="teamThreadSearch" maxlength="128" :disabled="teamThreadBusy"></label>
+          <button type="submit" class="wm-action" :disabled="teamThreadBusy">Search</button>
+        </form>
+        <p :if="!teamThreadDetail.messages.length" class="wm-snapshot-muted">No matching messages.</p>
+        <div :if="teamThreadDetail.messages.length" class="wm-snapshot-messages" role="region" aria-label="Shared messages" tabindex="0">
+          <article :for="message in teamThreadDetail.messages" :key="message.reference" class="wm-snapshot-message">
+            <h4 :text="message.subject || '(No subject)'"></h4>
+            <div class="wm-snapshot-meta"><span :text="message.from"></span><span :text="snapshotDate(message.timestamp)"></span></div>
+            <p class="wm-snapshot-body" :text="message.text"></p>
+            <div :if="message.attachments.length" class="wm-snapshot-form">
+              <a :for="part in message.attachments" class="wm-action" :href="teamThreadAttachment(teamThreadDetail.grant, message, part)" download>
+                <span class="mail-icon" data-icon="download" aria-hidden="true"></span><span :text="part.filename"></span>
+              </a>
+            </div>
+          </article>
+        </div>
+        <ul :if="teamThreadDetail.comments.length" class="wm-snapshot-links" aria-label="Teammate comments">
+          <li :for="comment in teamThreadDetail.comments"><div><strong :text="comment.author"></strong><p class="wm-snapshot-body" :text="comment.text"></p></div></li>
+        </ul>
+        <form class="wm-snapshot-form" @submit.prevent="addTeamThreadComment()">
+          <label>Teammate comment<input x-model="teamThreadComment" maxlength="500" :disabled="teamThreadBusy" required></label>
+          <button type="submit" class="wm-action" :disabled="teamThreadBusy || !teamThreadComment.trim()">Post comment</button>
+        </form>
+        <button :if="teamThreadDetail.grant.owner === user?.username && !teamThreadRevoking" type="button" class="wm-action wm-action--danger" @click="teamThreadRevoking.set(teamThreadDetail.grant)">Revoke access</button>
+        <div :if="teamThreadRevoking" class="wm-snapshot-confirm" role="group" aria-label="Confirm conversation revocation">
+          <p :text="'Revoke access for ' + teamThreadRevoking.grantee + '?'"></p>
+          <button type="button" class="wm-action wm-action--danger" :disabled="teamThreadBusy" @click="revokeTeamThread()">Revoke access</button>
+          <button type="button" class="wm-action" :disabled="teamThreadBusy" @click="teamThreadRevoking.set(null)">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </section>
+</dialog>
+
 <dialog :if="snapshotMode" ref="snapshotDialog" class="wm-modal wm-snapshot-dialog" aria-labelledby="wm-snapshot-title" @cancel.prevent="closeSnapshotDialog()">
   <section class="wm-snapshot-panel">
     <header class="wm-snapshot-dialog-heading">

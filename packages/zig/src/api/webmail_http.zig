@@ -66,6 +66,8 @@ const calendar_tasks = @import("../storage/calendar_tasks.zig");
 const calendar_tools = @import("../storage/calendar_tools.zig");
 const snapshots = @import("webmail_snapshots.zig");
 const assistant = @import("webmail_assistant.zig");
+const team_threads = @import("webmail_team_threads.zig");
+const thread_shares_path = "/webmail/api/thread-shares";
 const reply_batches = @import("webmail_batch_replies.zig");
 const file_links = @import("webmail_file_links.zig");
 const link_tokens = @import("webmail_link_tokens.zig");
@@ -597,6 +599,8 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
         return handleTeams(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/shared-inboxes") or std.mem.startsWith(u8, p, "/webmail/api/shared-inboxes/"))
         return handleSharedInboxes(server, conn, arena, req);
+    if (std.mem.eql(u8, p, thread_shares_path) or std.mem.startsWith(u8, p, thread_shares_path ++ "/"))
+        return handleThreadShares(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/sender-review/status") and std.mem.eql(u8, req.method, "GET")) return handleSenderReviewStatus(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/sender-review") and std.mem.eql(u8, req.method, "GET")) return handleSenderReviewList(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/sender-review") and std.mem.eql(u8, req.method, "PUT")) return handleSenderReviewSettings(server, conn, arena, req);
@@ -2006,6 +2010,7 @@ fn handleClientConfig(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
     var limits = try server.service.limits(sess.username);
     limits.calendarAvailable = server.dav_store != null;
     limits.sharedInboxesAvailable = try shared_inbox.available(server.db, sess.username);
+    limits.teamThreadsAvailable = try team_threads.available(server.db, sess.username);
     limits.maxFileLinkBytes = try file_links.uploadLimit(server.db, sess.username);
     if (store.get(arena, server.db, sess.username, "preferences", "settings")) |row| {
         const parsed = try std.json.parseFromSlice(struct { undoSendSeconds: u32 }, arena, row.payload, .{});
@@ -2185,6 +2190,91 @@ fn teamError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: anyerror)
         error.InvalidTeamData => sendError(conn, arena, 400, "invalid_team_data", "Check the team, mailbox, role, or resource."),
         else => mapServiceError(conn, arena, err),
     };
+}
+
+const ThreadShareInput = struct {
+    references: []const []const u8,
+    downloads: bool = false,
+    team: ?[]const u8 = null,
+    grantee: ?[]const u8 = null,
+    digest: ?[]const u8 = null,
+};
+
+fn handleThreadShares(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    const reading = std.mem.eql(u8, req.method, "GET");
+    const posting = std.mem.eql(u8, req.method, "POST");
+    const deleting = std.mem.eql(u8, req.method, "DELETE");
+    if ((posting or deleting) and !isSameOrigin(req))
+        return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, a, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const actor = sess.username;
+    const junk = server.service.junkFolder();
+    const preview = std.mem.eql(u8, req.path, thread_shares_path ++ "/preview");
+    if (std.mem.eql(u8, req.path, thread_shares_path) or preview) {
+        if (reading and !preview) {
+            const grants = try team_threads.list(a, server.db, actor);
+            return sendJson(conn, a, 200, try service_mod.json(a, .{ .grants = grants }), null);
+        }
+        if (!posting or req.body.len > 4096) return threadShareError(conn, a, error.InvalidThreadShare);
+        const input = std.json.parseFromSliceLeaky(ThreadShareInput, a, req.body, .{}) catch
+            return threadShareError(conn, a, error.InvalidThreadShare);
+        const prepared = team_threads.prepare(a, server.db, actor, input.references, input.downloads, junk) catch |err|
+            return threadShareError(conn, a, err);
+        if (preview)
+            return sendJson(conn, a, 200, try service_mod.json(a, .{ .messages = prepared.messages, .digest = @as([]const u8, &prepared.digest) }), null);
+        const team = input.team orelse return threadShareError(conn, a, error.InvalidThreadShare);
+        const grantee = input.grantee orelse return threadShareError(conn, a, error.InvalidThreadShare);
+        if (!std.mem.eql(u8, input.digest orelse "", &prepared.digest))
+            return sendError(conn, a, 409, "thread_share_changed", "Review the current conversation preview before sharing.");
+        const grant = team_threads.create(a, server.db, actor, team, grantee, prepared) catch |err|
+            return threadShareError(conn, a, err);
+        return sendJson(conn, a, 201, try service_mod.json(a, grant), null);
+    }
+    var parts = std.mem.splitScalar(u8, req.path[thread_shares_path.len + 1 ..], '/');
+    const id = parts.next().?;
+    if (!store.validId(id)) return threadShareError(conn, a, error.ThreadShareUnavailable);
+    if (parts.next()) |section| {
+        if (posting and std.mem.eql(u8, section, "comments") and parts.next() == null) {
+            if (req.body.len > 8192) return threadShareError(conn, a, error.InvalidThreadShare);
+            const body = std.json.parseFromSliceLeaky(struct { text: []const u8 }, a, req.body, .{}) catch
+                return threadShareError(conn, a, error.InvalidThreadShare);
+            team_threads.addComment(a, server.db, actor, id, body.text, time_compat.timestamp()) catch |err|
+                return threadShareError(conn, a, err);
+            return sendJson(conn, a, 201, "{\"ok\":true}", null);
+        }
+        if (reading and std.mem.eql(u8, section, "attachments")) {
+            const ref = parts.next() orelse "";
+            const index = std.fmt.parseInt(usize, parts.next() orelse "", 10) catch
+                return threadShareError(conn, a, error.ThreadShareUnavailable);
+            if (parts.next() != null or !message_refs.valid(ref)) return threadShareError(conn, a, error.ThreadShareUnavailable);
+            const part = team_threads.attachment(a, server.db, actor, id, ref, index, junk) catch |err|
+                return threadShareError(conn, a, err);
+            return sendAttachment(conn, a, part);
+        }
+        return threadShareError(conn, a, error.ThreadShareUnavailable);
+    }
+    if (reading) {
+        const result = team_threads.detail(a, server.db, actor, id, req.queryParam(a, "q") orelse "", junk) catch |err|
+            return threadShareError(conn, a, err);
+        return sendJson(conn, a, 200, try service_mod.json(a, result), null);
+    }
+    if (deleting) {
+        team_threads.revoke(server.db, actor, id) catch |err| return threadShareError(conn, a, err);
+        return sendJson(conn, a, 200, "{\"ok\":true}", null);
+    }
+    return threadShareError(conn, a, error.ThreadShareUnavailable);
+}
+
+fn threadShareError(conn: *webmail_tls.Stream, a: std.mem.Allocator, err: anyerror) !void {
+    switch (err) {
+        error.ThreadShareUnavailable, maildir.MaildirError.MessageNotFound => return sendError(conn, a, 404, "thread_share_unavailable", "This conversation or message is unavailable."),
+        error.ThreadShareTooLarge => return sendError(conn, a, 413, "thread_share_too_large", "Share fewer or smaller messages."),
+        error.InvalidThreadShare => return sendError(conn, a, 400, "invalid_thread_share", "Check the selected messages, teammate, or comment."),
+        error.ThreadShareGrantUnavailable => return sendError(conn, a, 409, "thread_share_grant_unavailable", "Choose an active teammate or revoke a share before creating another."),
+        error.ThreadShareCommentLimit => return sendError(conn, a, 409, "thread_share_comment_limit", "This conversation reached its comment limit."),
+        else => return mapServiceError(conn, a, err),
+    }
 }
 
 fn handleSharedInboxes(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {

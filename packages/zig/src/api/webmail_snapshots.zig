@@ -24,6 +24,18 @@ pub const Link = struct { id: i64, subject: []const u8, message_count: i64, expi
 pub const Issued = struct { link: Link, token: [64]u8 };
 pub const View = struct { payload: []const u8, expires_at: i64 };
 
+pub fn canShare(msg: maildir.MessageDetail, junk_folder: []const u8) bool {
+    return maildir.isPersonalFolder(msg.folder) and !msg.flags.deleted and !msg.flags.draft and
+        !std.ascii.eqlIgnoreCase(msg.folder, "Trash") and !std.ascii.eqlIgnoreCase(msg.folder, "Junk") and
+        !std.ascii.eqlIgnoreCase(msg.folder, junk_folder);
+}
+
+pub fn plainText(a: std.mem.Allocator, msg: maildir.MessageDetail) ![]const u8 {
+    if (msg.text_body.len != 0 or msg.html_body.len == 0) return msg.text_body;
+    const buffer = try a.alloc(u8, @min(msg.html_body.len, max_bytes + 1));
+    return std.mem.trim(u8, html_text.extract(msg.html_body, buffer), " ");
+}
+
 pub fn prepare(a: std.mem.Allocator, db: *database.Database, owner: []const u8, references: []const []const u8, junk_folder: []const u8) !Prepared {
     if (references.len == 0 or references.len > max_messages) return error.InvalidSnapshotSelection;
     for (references, 0..) |reference, index| {
@@ -40,14 +52,8 @@ pub fn prepare(a: std.mem.Allocator, db: *database.Database, owner: []const u8, 
         var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer scratch.deinit();
         const msg = try maildir.getByReference(scratch.allocator(), db, owner, reference);
-        if (!maildir.isPersonalFolder(msg.folder) or msg.flags.deleted or msg.flags.draft or
-            std.ascii.eqlIgnoreCase(msg.folder, "Trash") or std.ascii.eqlIgnoreCase(msg.folder, "Junk") or
-            std.ascii.eqlIgnoreCase(msg.folder, junk_folder))
-            return error.MessageNotFound;
-        const text = if (msg.text_body.len == 0 and msg.html_body.len > 0) blk: {
-            const buffer = try scratch.allocator().alloc(u8, @min(msg.html_body.len, max_bytes + 1));
-            break :blk std.mem.trim(u8, html_text.extract(msg.html_body, buffer), " ");
-        } else msg.text_body;
+        if (!canShare(msg, junk_folder)) return error.MessageNotFound;
+        const text = try plainText(scratch.allocator(), msg);
         for ([_][]const u8{ msg.subject, msg.from, text }) |field| {
             if (field.len > max_bytes - source_bytes) return error.SnapshotTooLarge;
             if (!std.unicode.utf8ValidateSlice(field)) return error.SnapshotTextUnavailable;
