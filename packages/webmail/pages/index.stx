@@ -80,6 +80,7 @@ const {
   recoveryAddress, recoverySetBy, recoveryInput, recoveryPassword, recoveryError, recoveryNotice, recoveryLoading,
   savingRecovery, saveRecovery,
   forwarding, forwardingAddress, forwardingPassword, forwardingCode, forwardingBusy, forwardingError, forwardingNotice, changeForwarding,
+  forwardingMode, forwardingSenderFilter, forwardingRecipientFilter, forwardingScopePassword,
   externalAddresses, externalAddress, externalAddressId, externalCode, externalAddressBusy, externalAddressError, externalAddressNotice,
   selectExternalAddress, verifyExternalAddress,
   vacation, vacationEnabled, vacationSubject, vacationBody, vacationStart, vacationEnd, vacationBusy, vacationError, vacationNotice, saveVacationSettings,
@@ -801,19 +802,41 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
 <form class="login-recovery" aria-labelledby="recoveryHeading" @submit.prevent="saveRecovery()"><h2 id="recoveryHeading"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span>Recovery address</h2><p class="login-sub" :if="recoveryLoading">Loading…</p><p class="login-sub" :if="!recoveryLoading && recoveryAddress">Password reset links go to <strong :text="recoveryAddress"></strong><span :if="recoverySetBy === 'operator'"> (set by your mail administrator)</span>.</p><p class="login-sub" :if="!recoveryLoading && !recoveryAddress">None set. Without one, a forgotten password can only be reset by your mail administrator.</p><label for="recoveryInput">Recovery email</label><input id="recoveryInput" type="email" x-model.trim="recoveryInput" autocomplete="email" placeholder="you@another-provider.com"><label for="recoveryPassword">Current password</label><input id="recoveryPassword" type="password" x-model="recoveryPassword" autocomplete="current-password"><p :if="recoveryError" role="alert" class="login-error" :text="recoveryError"></p><p :if="recoveryNotice" role="status" class="login-sub" :text="recoveryNotice"></p><button type="submit" class="login-secondary" :disabled="savingRecovery || recoveryLoading" :text="savingRecovery ? 'Saving…' : 'Save recovery address'"></button></form>
 <section class="login-recovery wm-forwarding" aria-labelledby="forwardingHeading">
   <h2 id="forwardingHeading"><span class="mail-icon" data-icon="forward" aria-hidden="true"></span>Forwarding</h2>
-  <p :if="forwarding?.address" class="login-sub">New mail is copied to <strong :text="forwarding?.address"></strong>.</p>
+  <div :if="forwarding?.address" class="login-sub">
+    <p>Forwarding to <strong :text="forwarding?.address"></strong>.</p>
+    <p :if="forwarding?.scope?.sender">Verified sender <strong :text="forwarding?.scope?.sender"></strong></p>
+    <p :if="forwarding?.scope?.recipient">Delivered to <strong :text="forwarding?.scope?.recipient"></strong></p>
+  </div>
   <p :if="forwarding && !forwarding.address" class="login-sub">Forward new mail to a verified address and keep a copy in this mailbox.</p>
   <p :if="!forwarding && forwardingBusy" class="login-sub" role="status">Loading forwarding…</p>
   <p :if="forwardingError" class="login-error" role="alert" :text="forwardingError"></p>
   <p :if="forwardingNotice" class="login-sub" role="status" :text="forwardingNotice"></p>
-  <form :if="forwarding?.pendingAddress" class="wm-forwarding-confirm" @submit.prevent="changeForwarding('confirm')">
-    <p :if="forwarding?.expiresAt > now" class="login-sub" role="status">Enter the code sent to <strong :text="forwarding?.pendingAddress"></strong>.</p>
-    <p :if="forwarding?.expiresAt <= now" class="login-sub" role="status">This code expired. Send a new code below.</p>
-    <label :if="forwarding?.expiresAt > now" for="forwardingCode">Verification code</label>
-    <input :if="forwarding?.expiresAt > now" id="forwardingCode" x-model.trim="forwardingCode" type="text" autocomplete="one-time-code" autocapitalize="off" spellcheck="false" maxlength="32" minlength="32" required :disabled="forwardingBusy">
+  <form :if="forwarding?.pendingAddress || forwarding?.address" class="wm-forwarding-confirm" @submit.prevent="changeForwarding(forwarding?.pendingAddress ? 'confirm' : 'scope')">
+    <div :if="forwarding?.pendingAddress">
+      <p :if="forwarding?.expiresAt > now" class="login-sub" role="status">Enter the code sent to <strong :text="forwarding?.pendingAddress"></strong> and choose which mail to forward.</p>
+      <p :if="forwarding?.expiresAt <= now" class="login-sub" role="status">This code expired. Send a new code below.</p>
+      <label :if="forwarding?.expiresAt > now" for="forwardingCode">Verification code</label>
+      <input :if="forwarding?.expiresAt > now" id="forwardingCode" x-model.trim="forwardingCode" type="text" autocomplete="one-time-code" autocapitalize="off" spellcheck="false" maxlength="32" minlength="32" required :disabled="forwardingBusy">
+    </div>
+    <div :if="!forwarding?.pendingAddress || forwarding?.expiresAt > now" class="wm-forwarding-scope">
+      <label for="forwardingMode">Messages to forward</label>
+      <select id="forwardingMode" x-model="forwardingMode" :disabled="forwardingBusy">
+        <option value="all">All eligible mail</option>
+        <option value="matching">Only matching mail</option>
+      </select>
+      <div :if="forwardingMode === 'matching'">
+        <p class="login-sub">Enter one or both addresses. Mail must match every address you enter.</p>
+        <label for="forwardingSenderFilter">Verified sender</label>
+        <input id="forwardingSenderFilter" type="email" x-model.trim="forwardingSenderFilter" autocomplete="off" maxlength="254" :disabled="forwardingBusy">
+        <label for="forwardingRecipientFilter">Delivered to</label>
+        <input id="forwardingRecipientFilter" type="email" x-model.trim="forwardingRecipientFilter" autocomplete="off" maxlength="254" :disabled="forwardingBusy">
+      </div>
+      <label :if="!forwarding?.pendingAddress" for="forwardingScopePassword">Current password for filters</label>
+      <input :if="!forwarding?.pendingAddress" id="forwardingScopePassword" type="password" x-model="forwardingScopePassword" autocomplete="current-password" required :disabled="forwardingBusy">
+    </div>
     <div class="wm-private-actions">
-      <button :if="forwarding?.expiresAt > now" type="submit" :disabled="forwardingBusy">Confirm forwarding</button>
-      <button type="button" class="login-secondary" @click="changeForwarding('cancel')" :disabled="forwardingBusy">Cancel request</button>
+      <button :if="!forwarding?.pendingAddress || forwarding?.expiresAt > now" type="submit" :disabled="forwardingBusy" :text="forwarding?.pendingAddress ? 'Confirm forwarding' : 'Save forwarding filters'"></button>
+      <button :if="forwarding?.pendingAddress" type="button" class="login-secondary" @click="changeForwarding('cancel')" :disabled="forwardingBusy">Cancel request</button>
     </div>
   </form>
   <form :if="forwarding" @submit.prevent="changeForwarding('request')">

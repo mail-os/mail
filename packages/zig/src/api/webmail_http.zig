@@ -1455,12 +1455,29 @@ fn handleRecoveryUpdate(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a
 }
 
 const ForwardingChange = struct {
-    action: enum { request, confirm, cancel, disable },
+    action: enum { request, confirm, cancel, disable, scope },
     revision: i64,
     address: ?[]const u8 = null,
     currentPassword: ?[]const u8 = null,
     code: ?[]const u8 = null,
+    scope: ?database.Database.ForwardScope = null,
 };
+
+fn forwardScopeAddress(opt: ?[]const u8) !?[]const u8 {
+    const address = std.mem.trim(u8, opt orelse return null, " \t");
+    if (address.len > 254 or !std.unicode.utf8ValidateSlice(address) or !message_submission.validMailbox(address))
+        return error.InvalidForwardScope;
+    return address;
+}
+
+fn forwardingScope(change: ForwardingChange) !?database.Database.ForwardScope {
+    const scope = change.scope orelse return if (change.action == .scope) error.InvalidForwardScope else null;
+    if (change.action != .scope and change.action != .confirm) return error.InvalidForwardScope;
+    return .{
+        .sender = try forwardScopeAddress(scope.sender),
+        .recipient = try forwardScopeAddress(scope.recipient),
+    };
+}
 
 fn handleForwarding(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
     const get = std.mem.eql(u8, req.method, "GET");
@@ -1472,7 +1489,8 @@ fn handleForwarding(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: st
         const change = std.json.parseFromSliceLeaky(ForwardingChange, a, req.body, .{}) catch
             return sendError(conn, a, 400, "bad_request", "Invalid forwarding settings");
         if (change.revision < 0) return sendError(conn, a, 400, "bad_request", "Invalid forwarding revision");
-        if (change.action == .request or change.action == .disable) {
+        const scope = forwardingScope(change) catch |err| return forwardingError(conn, a, err);
+        if (change.action == .request or change.action == .disable or change.action == .scope) {
             const password = change.currentPassword orelse "";
             if (password.len == 0 or password.len > recovery.max_password_len)
                 return sendError(conn, a, 400, "invalid_credentials", "Enter your current password");
@@ -1495,11 +1513,13 @@ fn handleForwarding(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: st
                 if (code.len != 32) return forwardingError(conn, a, error.InvalidForwardCode);
                 for (code) |byte| if (!std.ascii.isHex(byte)) return forwardingError(conn, a, error.InvalidForwardCode);
                 const normalized = try std.ascii.allocLowerString(a, code);
-                const confirmed = server.db.confirmForwardRequest(session.username, change.revision, hashForwardCode(normalized), time_compat.timestamp()) catch |err|
+                const confirmed = server.db.confirmForwardRequest(a, session.username, change.revision, hashForwardCode(normalized), time_compat.timestamp(), scope) catch |err|
                     return forwardingError(conn, a, err);
                 if (!confirmed) return forwardingError(conn, a, error.InvalidForwardCode);
             },
             .cancel, .disable => server.db.clearForwarding(session.username, change.revision, change.action == .cancel) catch |err|
+                return forwardingError(conn, a, err),
+            .scope => server.db.setForwardingScope(session.username, change.revision, scope.?) catch |err|
                 return forwardingError(conn, a, err),
         }
     }
@@ -1557,6 +1577,8 @@ fn forwardingError(conn: *webmail_tls.Stream, a: std.mem.Allocator, err: anyerro
     return switch (err) {
         error.InvalidForwardCode => sendError(conn, a, 400, "invalid_code", "This code is incorrect, expired, or already used. Request another code if needed."),
         error.InvalidForwardDestination => sendError(conn, a, 400, "invalid_address", "Choose a different active mailbox"),
+        error.InvalidForwardScope => sendError(conn, a, 400, "invalid_scope", "Enter one email address per forwarding field"),
+        error.NoVerifiedForward => sendError(conn, a, 409, "no_verified_destination", "Verify a forwarding destination first"),
         error.ForwardAlreadyActive => sendError(conn, a, 409, "already_forwarding", "This address is already verified"),
         error.PreconditionFailed => sendError(conn, a, 412, "revision_mismatch", "Forwarding changed in another window. Reopen Account settings before continuing."),
         error.ForwardRateLimited => sendError(conn, a, 429, "rate_limited", "Too many forwarding requests. Please wait before trying again."),

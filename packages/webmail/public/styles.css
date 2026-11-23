@@ -1059,6 +1059,12 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-forwarding h2 .mail-icon { color: var(--accent); }
 .wm-forwarding strong { overflow-wrap: anywhere; }
 .wm-forwarding-confirm { padding: 10px; margin-bottom: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.wm-forwarding .login-sub > p { margin: 0 0 4px; }
+.wm-forwarding-scope select { width: 100%; }
+.wm-forwarding-scope .login-sub { margin: 8px 0 0; }
+@media (max-width: 490px) {
+  .wm-forwarding .wm-forwarding-confirm { padding-inline: 0; border-inline: 0; border-radius: 0; background: transparent; }
+}
 .wm-forwarding .wm-forwarding-disable { color: var(--danger); }
 .wm-vacation-heading, .wm-vacation-heading h2 { display: flex; align-items: center; gap: 6px; }
 .wm-vacation-heading { justify-content: space-between; }

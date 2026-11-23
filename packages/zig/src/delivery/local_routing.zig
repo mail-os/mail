@@ -205,7 +205,7 @@ pub const Plan = struct {
 
     /// Redirect one hop. Keep the primary copy and checkpoint per-target
     /// refusals so a full forwarding destination cannot lose the original.
-    pub fn forward(self: *Plan, primary: usize, from: []const u8, hostname: []const u8, config: ?*const config_mod.Config, sender: SenderIdentity) !void {
+    pub fn forward(self: *Plan, primary: usize, from: []const u8, hostname: []const u8, config: ?*const config_mod.Config, sender: SenderIdentity, delivered_to: []const u8) !void {
         const a = self.allocator;
         const user = self.targets.items[primary].mailbox;
         const headers = forwarding.Headers.read(self.raw);
@@ -216,6 +216,12 @@ pub const Plan = struct {
         }
         if (from.len == 0 or headers.automatic) return;
         const verified = (try self.db.verifiedForward(a, user)) orelse return;
+        if (verified.scope.sender) |author| {
+            if (!sender.verified or !std.ascii.eqlIgnoreCase(author, sender.author)) return;
+        }
+        if (verified.scope.recipient) |recipient| {
+            if (!std.ascii.eqlIgnoreCase(recipient, delivered_to)) return;
+        }
         if (std.ascii.eqlIgnoreCase(verified.address, from)) return;
         const local = isLocal(verified.address, hostname, config);
         const mailbox = if (local) try resolveMailbox(a, self.db, config, verified.address) else "";

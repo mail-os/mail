@@ -293,7 +293,7 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
     if (!options.account_notice) {
         for (0..primary_count) |i| {
             const target = plan.targets.items[i];
-            if (target.refusal == null and !target.interactive_remote and target.forward_allowed) try plan.forward(i, from, cfg.hostname, cfg.mail_config, identity);
+            if (target.refusal == null and !target.interactive_remote and target.forward_allowed) try plan.forward(i, from, cfg.hostname, cfg.mail_config, identity, target.recipient);
         }
         try plan.vacationReplies(primary_count, from, cfg.hostname, cfg.mail_config, identity, now);
     }

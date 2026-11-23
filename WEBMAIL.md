@@ -861,9 +861,13 @@ revokes existing webmail sessions.
   `PUT /webmail/auth/recovery` `{currentPassword, recovery}` changes it, and an
   empty `recovery` removes it.
 - `GET /webmail/api/forwarding` returns `{address, pendingAddress, expiresAt,
-  revision}`. `POST` accepts the current `revision` and an `action` of
-  `request`, `confirm`, `cancel`, or `disable`. A request needs `address`
-  and `currentPassword`, confirmation needs `code`, and disabling needs
+  revision, scope}`. `POST` accepts the current `revision` and an `action` of
+  `request`, `confirm`, `cancel`, `disable`, or `scope`. A request needs
+  `address` and `currentPassword`. Set `scope: {sender, recipient}` to
+  limit copies to a verified sender, an SMTP recipient, or both. Confirmation
+  needs `code` and accepts an optional scope. Use the `scope` action and
+  `currentPassword` to edit the filters after confirmation. Two null
+  filter values select all eligible mail. Disabling also needs
   `currentPassword`. A stale revision returns 412. See
   [mailbox forwarding](docs/FORWARDING.md#mailbox-forwarding).
 - `GET /webmail/api/vacation` returns `{enabled, subject, body, startsAt,

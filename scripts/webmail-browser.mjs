@@ -1880,6 +1880,62 @@ async function senderInvitationJourney(desktop, phone) {
   await desktopReview.getByText('No active invitations.', { exact: true }).waitFor()
 }
 
+async function forwardingFilterJourney(desktop, phone) {
+  const peer = await signIn({ account: sender, initialSubject: 'Combined source briefing' })
+  await desktop.goto(url + '/')
+  await button(desktop, 'Account').click()
+  const forwarding = desktop.getByRole('region', { name: 'Forwarding', exact: true })
+  await forwarding.getByLabel('Destination email').fill(sender)
+  await forwarding.getByLabel('Current password', { exact: true }).fill(password)
+  await button(forwarding, 'Send verification code').click()
+  await forwarding.getByLabel('Verification code').waitFor()
+  const lookup = '/webmail/api/messages?folder=INBOX&conversations=false&q=Confirm+mail+forwarding'
+  const verification = await peer.waitForFunction(async (path) => {
+    const response = await fetch(path)
+    if (!response.ok) return false
+    const { items } = await response.json()
+    return items.find(item => item.subject === 'Confirm mail forwarding')?.reference || false
+  }, lookup, { polling: 300 })
+  const reference = await verification.jsonValue()
+  const message = await peer.request.get(url + '/webmail/api/messages/ref/' + reference)
+  assert.equal(message.status(), 200)
+  const code = (await message.json()).text.split(/\r?\n/).find(line => /^[a-f0-9]{32}$/.test(line))
+  assert(code, 'The destination mailbox received a forwarding verification code')
+  await forwarding.getByLabel('Messages to forward').selectOption('matching')
+  await forwarding.getByLabel('Verification code').fill(code)
+  await button(forwarding, 'Confirm forwarding').click()
+  await forwarding.getByRole('alert').filter({ hasText: 'Enter a sender or a delivered-to address.' }).waitFor()
+  await forwarding.getByLabel('Verified sender').fill(newcomer)
+  await forwarding.getByLabel('Delivered to').fill(owner)
+  await button(forwarding, 'Confirm forwarding').click()
+  await forwarding.getByText('Forwarding is on.', { exact: true }).waitFor()
+  const endpoint = url + '/webmail/api/forwarding'
+  const verified = await desktop.request.get(endpoint)
+  assert.equal(verified.status(), 200)
+  const active = await verified.json()
+  assert.equal(active.address, sender)
+  assert.deepEqual(active.scope, { sender: newcomer, recipient: owner })
+  await forwarding.screenshot({ path: join(output, 'desktop-filtered-forwarding.png'), animations: 'disabled' })
+
+  await phone.setViewportSize({ width: 320, height: 844 })
+  await phone.goto(url + '/')
+  await drawer(phone).click()
+  await button(phone, 'Account').click()
+  const mobile = phone.getByRole('region', { name: 'Forwarding', exact: true })
+  const mode = mobile.getByLabel('Messages to forward')
+  await verifySelect(mode, 44)
+  assert.equal(await mode.inputValue(), 'matching')
+  assert.equal(await mobile.getByLabel('Verified sender').inputValue(), newcomer)
+  await mobile.getByLabel('Verified sender').fill('')
+  await mobile.getByLabel('Current password for filters').fill(password)
+  await fitsViewport(phone)
+  await button(mobile, 'Save forwarding filters').click()
+  await mobile.getByText('Forwarding filters saved.', { exact: true }).waitFor()
+  const updated = await desktop.request.get(endpoint)
+  assert.deepEqual((await updated.json()).scope, { sender: null, recipient: owner })
+  await mobile.locator('.wm-forwarding-confirm').screenshot({ path: join(output, 'phone-filtered-forwarding.png'), animations: 'disabled' })
+}
+
 try {
   const desktop = await signIn()
   await desktopJourney(desktop)
@@ -1905,6 +1961,7 @@ try {
   await combinedInboxJourney(desktop)
   await navigationRequestsJourney(desktop)
   await senderInvitationJourney(desktop, phone)
+  await forwardingFilterJourney(desktop, phone)
   assert.deepEqual(errors, [], 'Browser pages raised uncaught errors')
   process.stdout.write(`${engine} passed the desktop and phone webmail journeys.\n`)
 }

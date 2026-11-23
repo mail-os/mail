@@ -394,7 +394,7 @@ fn process(a: Allocator, db: *Database, job: Job, hostname: []const u8, mail_con
         .automatic_category = if (identity.verified) routing.categories.classify(current.raw) else null,
     };
     try plan.add(.{ .recipient = if (row.recipient.len > 0) row.recipient else job.user, .mailbox = job.user, .folder = "new", .placement_reason = .sender_review });
-    if (row.forward) try plan.forward(0, row.envelope_from, hostname, mail_config, identity);
+    if (row.forward) try plan.forward(0, row.envelope_from, hostname, mail_config, identity, row.recipient);
     try db.acceptDelivery(.{
         .id = operation,
         .from = row.envelope_from,

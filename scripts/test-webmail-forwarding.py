@@ -62,6 +62,10 @@ def run(binary, previous):
         fake_ses(root)
         fixture = Fixture(previous or binary, root, staging=True)
         fixture.env.update(SMTP_DELIVERY_METHOD="ses", PATH=f"{root}:{fixture.env['PATH']}")
+        domain = fixture.env["SMTP_PROVISIONING_DOMAIN"]
+        alias = f"billing@{domain}"
+        (root / "aliases").write_text(f"billing: filtered@{domain}\n")
+        fixture.env["SMTP_ALIASES_PATH"] = str(root / "aliases")
 
         def sql(query, values=()):
             with closing(sqlite3.connect(root / "smtp.db")) as db, db:
@@ -86,11 +90,11 @@ def run(binary, previous):
         def lookup(user, subject):
             return [parser.parsebytes(raw) for raw in copies(user, subject)]
 
-        def smtp(subject, recipients, *, sender="outside@sender.example.test", extra="", chunked=False):
+        def smtp(subject, recipients, *, sender="outside@sender.example.test", identity=None, extra="", chunked=False):
             raw = (f"From: {sender or 'mailer-daemon@sender.example.test'}\r\nSubject: {subject}\r\n"
                    f"Message-ID: <{subject.replace(' ', '-')}@sender.example.test>\r\n{extra}\r\n"
                    "Keep this exact original, including its UTF-8: café.\r\n").encode()
-            with fixture.smtp() as client:
+            with fixture.smtp(identity) as client:
                 assert client.mail(sender)[0] == 250
                 for recipient in recipients:
                     assert client.rcpt(recipient)[0] == 250
@@ -152,7 +156,8 @@ def run(binary, previous):
             (root / "forwards.json").write_text(json.dumps({local: [prior]}))
             owner, destination, other = map(fixture.login, (source, local, observer))
             api(owner, "sender-review", {"setting": "disable"}, "PUT")
-            initial = {"address": None, "pendingAddress": None, "expiresAt": None, "revision": 0}
+            empty_scope = {"sender": None, "recipient": None}
+            initial = {"address": None, "pendingAddress": None, "expiresAt": None, "revision": 0, "scope": empty_scope}
             assert settings(owner) == initial == settings(other)
             api({}, "forwarding", expected=401)
             change({**owner, "Origin": "https://outside.example.test"}, "request", 0, expected=403)
@@ -219,6 +224,48 @@ def run(binary, previous):
             assert lookup(local, "Old destination still active") and not lookup(observer, "Old destination still active")
             assert change(owner, "cancel", 3)["pendingAddress"] is None
 
+            filtered = fixture.provision("filtered", daily=1)
+            filter_destination = fixture.provision("filter-destination")
+            filtered_session = fixture.login(filtered)
+            api(filtered_session, "sender-review", {"setting": "disable"}, "PUT")
+            scope = {"sender": sender.upper(), "recipient": alias}
+            change(filtered_session, "scope", 0, expected=412, currentPassword=fixture.password, scope=scope)
+            change(filtered_session, "request", 0, currentPassword=fixture.password, address=filter_destination)
+            code = verification_code(eventually(lambda: lookup(filter_destination, "Confirm mail forwarding"))[0])
+            change(filtered_session, "confirm", 1, expected=400, code=code, scope={"sender": "@example.test"})
+            scoped = change(filtered_session, "confirm", 1, code=code, scope=scope)
+            assert scoped["address"] == filter_destination and scoped["scope"] == scope
+            assert sql("SELECT address FROM mailbox_forwarding WHERE user_id=(SELECT id FROM users WHERE username=?)", (filtered,)) == [(None,)]
+            change(filtered_session, "scope", 2, expected=400, currentPassword="wrong", scope=empty_scope)
+            change(filtered_session, "scope", 1, expected=412, currentPassword=fixture.password, scope=empty_scope)
+            change({**filtered_session, "Origin": "https://outside.example.test"}, "scope", 2, expected=403)
+            assert settings(other) == initial
+
+            smtp("Verified match on alias", [alias], sender=sender, identity=sender, chunked=True)
+            assert lookup(filtered, "Verified match on alias") and lookup(filter_destination, "Verified match on alias")
+            smtp("Wrong envelope with matching header", [filtered], sender=sender, identity=sender, extra=f"To: {alias}\r\n")
+            smtp("Unverified matching From", [alias], sender=sender)
+            smtp("Different verified From", [alias], sender=observer, identity=observer)
+            for subject in ("Wrong envelope with matching header", "Unverified matching From", "Different verified From"):
+                assert lookup(filtered, subject) and not lookup(filter_destination, subject)
+            smtp("Do not duplicate direct copy", [alias, filter_destination], sender=sender, identity=sender)
+            assert len(lookup(filter_destination, "Do not duplicate direct copy")) == 1
+
+            api(filtered_session, "sender-review", {"setting": "enable"}, "PUT")
+            smtp("Held matching message", [alias], sender=sender, identity=sender)
+            assert not lookup(filter_destination, "Held matching message")
+            held, = api(filtered_session, "sender-review")["items"]
+            api({**filtered_session, "If-Match": held["revision"]}, "sender-review/decision", {
+                "reference": held["reference"], "action": "allow", "rule_revision": held["rule_revision"],
+            }, "POST")
+            eventually(lambda: lookup(filter_destination, "Held matching message"))
+            api(filtered_session, "sender-review", {"setting": "disable"}, "PUT")
+            allow_another_request(filtered)
+            filter_pending = change(filtered_session, "request", 2, currentPassword=fixture.password, address=observer)
+            assert filter_pending["scope"] == scope
+            cancelled = change(filtered_session, "cancel", filter_pending["revision"])
+            assert cancelled["scope"] == scope and cancelled["address"] == filter_destination
+
         with fixture.daemon():
             owner = fixture.login(source)
             assert settings(owner)["address"] == local
@@ -252,6 +299,31 @@ def run(binary, previous):
             assert lookup(source, "After disabling forwarding")
             assert sql("SELECT COUNT(*) FROM accepted_mail_targets WHERE recipient=?", (external,)) == [(2,)]
 
+            filtered_session = fixture.login(filtered)
+            filtered_state = settings(filtered_session)
+            assert filtered_state["scope"] == scope
+            allow_another_request(filtered)
+            filtered_external = "filtered@external.example.test"
+            started = change(filtered_session, "request", filtered_state["revision"], currentPassword=fixture.password, address=filtered_external)
+            assert started["address"] == filter_destination and started["scope"] == scope
+            code = verification_code(eventually(lambda: remote(filtered_external, "Confirm mail forwarding"))[0][1])
+            replaced = change(filtered_session, "confirm", started["revision"], code=code)
+            assert replaced["address"] == filtered_external and replaced["scope"] == scope
+            smtp("Unmatched remote mail", [filtered], sender=sender, identity=sender)
+            assert not remote(filtered_external, "Fwd: Unmatched remote mail") and fixture.count(filtered) == 0
+            smtp("Matched remote mail", [alias], sender=sender, identity=sender)
+            eventually(lambda: remote(filtered_external, "Fwd: Matched remote mail"))
+            assert fixture.count(filtered) == 1
+            limited = change(filtered_session, "scope", replaced["revision"], currentPassword=fixture.password, scope={"recipient": alias})
+            assert limited["scope"] == {"sender": None, "recipient": alias}
+            smtp("Recipient-only match over limit", [alias])
+            assert lookup(filtered, "Recipient-only match over limit") and not remote(filtered_external, "Fwd: Recipient-only match over limit")
+            assert sql("SELECT COUNT(*) FROM accepted_mail_targets WHERE recipient=? AND outcome='forward_allowance'", (filtered_external,)) == [(1,)]
+            changed = change(filtered_session, "scope", limited["revision"], currentPassword=fixture.password, scope=empty_scope)
+            assert changed["scope"] == empty_scope
+            assert sql("SELECT address FROM mailbox_forwarding WHERE user_id=(SELECT id FROM users WHERE username=?)", (filtered,)) == [(filtered_external,)]
+            assert change(filtered_session, "disable", changed["revision"], currentPassword=fixture.password)["address"] is None
+
             guard = fixture.provision("guard")
             guard_session = fixture.login(guard)
             api(guard_session, "sender-review", {"setting": "disable"}, "PUT")
@@ -276,7 +348,7 @@ def run(binary, previous):
             local_user("create", reusable)
             smtp("Reassigned local address", [guard])
             assert lookup(guard, "Reassigned local address") and not lookup(reusable, "Reassigned local address")
-    print("Verified webmail forwarding proof, local and SES delivery, request limits, routing, restart, and account isolation.")
+    print("Verified forwarding proof and filters, local and SES delivery, request limits, routing, restart, and account isolation.")
 
 
 if __name__ == "__main__":

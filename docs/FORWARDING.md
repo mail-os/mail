@@ -4,11 +4,21 @@
 
 In webmail, open **Account → Forwarding**. Enter the destination and your
 current password, then enter the code from the destination inbox. The code
-expires after 30 minutes and works once. A replacement takes effect when its
-address is verified. **Cancel request** clears a pending verification.
+expires after 30 minutes and works once. Before confirming, choose **All
+eligible mail** or **Only matching mail**. You can change the filters later
+with your current password. A replacement takes effect when its address is
+verified. **Cancel request** clears a pending verification.
 **Turn off forwarding** stops forwarding mail accepted after that change.
 Copies already accepted by the delivery queue keep the recipient they had
 when the server accepted the mail.
+
+**Verified sender** matches the authenticated author’s full address.
+**Delivered to** matches the original SMTP recipient, including an alias,
+and can differ from the visible To header. If you enter both addresses,
+mail must match both. These filters apply to mailbox forwarding, including
+copies released from Sender Review. Administrator-managed forwarding has
+its own rules. Older Mail builds suspend filtered mailbox forwarding during
+a rollback.
 
 Mailbox forwarding always keeps the local original. Junk, held or declined
 senders, delivery-status messages, automated notices, and already forwarded

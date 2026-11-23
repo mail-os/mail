@@ -2758,7 +2758,7 @@ pub const Session = struct {
             const primary_count = plan.targets.items.len;
             for (0..primary_count) |index| {
                 const target = plan.targets.items[index];
-                if (target.mailbox.len > 0 and target.forward_allowed) try plan.forward(index, sender, self.config.hostname, &self.config, identity);
+                if (target.mailbox.len > 0 and target.forward_allowed) try plan.forward(index, sender, self.config.hostname, &self.config, identity, target.recipient);
             }
             const now = time_compat.timestamp();
             try plan.vacationReplies(primary_count, sender, self.config.hostname, &self.config, identity, now);

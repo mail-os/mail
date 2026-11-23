@@ -596,6 +596,15 @@ pub const Database = struct {
             \\    attempts INTEGER NOT NULL DEFAULT 0,
             \\    revision INTEGER NOT NULL DEFAULT 1
             \\);
+            \\CREATE TABLE IF NOT EXISTS mailbox_forwarding_scopes (
+            \\    user_id INTEGER PRIMARY KEY REFERENCES mailbox_forwarding(user_id) ON DELETE CASCADE,
+            \\    revision INTEGER NOT NULL,
+            \\    address TEXT NOT NULL,
+            \\    destination_id INTEGER,
+            \\    sender TEXT,
+            \\    recipient TEXT,
+            \\    CHECK(sender IS NOT NULL OR recipient IS NOT NULL)
+            \\);
             \\CREATE TABLE IF NOT EXISTS mailbox_forwarding_requests (
             \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             \\    address TEXT NOT NULL COLLATE NOCASE,
@@ -1304,12 +1313,30 @@ pub const Database = struct {
         pendingAddress: ?[]const u8 = null,
         expiresAt: ?i64 = null,
         revision: i64 = 0,
+        scope: ForwardScope = .{},
+    };
+
+    pub const ForwardScope = struct {
+        sender: ?[]const u8 = null,
+        recipient: ?[]const u8 = null,
+
+        fn restricted(self: ForwardScope) bool {
+            return self.sender != null or self.recipient != null;
+        }
     };
 
     pub const ForwardDestination = struct {
         address: []const u8,
         mailbox_id: ?i64,
+        scope: ForwardScope = .{},
     };
+
+    // A filtered destination lives outside the old address columns. Older
+    // binaries suspend it, and edits made there invalidate its revision.
+    const active_forward_scope =
+        " LEFT JOIN mailbox_forwarding_scopes s ON s.user_id=f.user_id AND s.revision=f.revision AND f.address IS NULL ";
+    const forward_address = "COALESCE(f.address,s.address)";
+    const forward_destination_id = "CASE WHEN s.address IS NOT NULL THEN s.destination_id ELSE f.destination_id END";
 
     pub const ForwardRequest = struct {
         destination: ForwardDestination,
@@ -1326,7 +1353,7 @@ pub const Database = struct {
     }
 
     pub fn forwardingSettings(self: *Database, a: std.mem.Allocator, user: []const u8) !ForwardingSettings {
-        const stmt = try self.prepare("SELECT f.address,f.pending_address,f.expires_at,f.revision FROM mailbox_forwarding f JOIN users u ON u.id=f.user_id WHERE u.username=?1");
+        const stmt = try self.prepare("SELECT " ++ forward_address ++ ",f.pending_address,f.expires_at,f.revision,s.sender,s.recipient FROM mailbox_forwarding f JOIN users u ON u.id=f.user_id" ++ active_forward_scope ++ "WHERE u.username=?1");
         defer stmt.finalize();
         try stmt.bind(1, user);
         if (!try stmt.step()) return .{};
@@ -1335,15 +1362,68 @@ pub const Database = struct {
             .pendingAddress = if (stmt.columnTextOpt(1)) |address| try a.dupe(u8, address) else null,
             .expiresAt = stmt.columnInt64Opt(2),
             .revision = stmt.columnInt64(3),
+            .scope = try readForwardScope(a, stmt, 4),
         };
     }
 
     pub fn verifiedForward(self: *Database, a: std.mem.Allocator, user: []const u8) !?ForwardDestination {
-        const stmt = try self.prepare("SELECT f.address,f.destination_id FROM mailbox_forwarding f JOIN users u ON u.id=f.user_id WHERE u.username=?1 AND u.enabled=1 AND f.address IS NOT NULL");
+        const stmt = try self.prepare("SELECT " ++ forward_address ++ "," ++ forward_destination_id ++ ",s.sender,s.recipient FROM mailbox_forwarding f JOIN users u ON u.id=f.user_id" ++ active_forward_scope ++ "WHERE u.username=?1 AND u.enabled=1 AND " ++ forward_address ++ " IS NOT NULL");
         defer stmt.finalize();
         try stmt.bind(1, user);
         if (!try stmt.step()) return null;
-        return .{ .address = try a.dupe(u8, stmt.columnText(0)), .mailbox_id = stmt.columnInt64Opt(1) };
+        return .{ .address = try a.dupe(u8, stmt.columnText(0)), .mailbox_id = stmt.columnInt64Opt(1), .scope = try readForwardScope(a, stmt, 2) };
+    }
+
+    fn readForwardScope(a: std.mem.Allocator, stmt: Statement, column: usize) !ForwardScope {
+        return .{
+            .sender = if (stmt.columnTextOpt(column)) |value| try a.dupe(u8, value) else null,
+            .recipient = if (stmt.columnTextOpt(column + 1)) |value| try a.dupe(u8, value) else null,
+        };
+    }
+
+    fn advanceForwardScopeLocked(self: *Database, user_id: i64, revision: i64) !void {
+        const stmt = try self.prepareLocked("UPDATE mailbox_forwarding_scopes SET revision=revision+1 WHERE user_id=?1 AND revision=?2");
+        defer stmt.finalize();
+        try stmt.bind(1, user_id);
+        try stmt.bind(2, revision);
+        _ = try stmt.step();
+    }
+
+    fn removeForwardScopeLocked(self: *Database, user_id: i64) !void {
+        const stmt = try self.prepareLocked("DELETE FROM mailbox_forwarding_scopes WHERE user_id=?1");
+        defer stmt.finalize();
+        try stmt.bind(1, user_id);
+        _ = try stmt.step();
+    }
+
+    fn writeForwardDestinationLocked(self: *Database, user_id: i64, revision: i64, destination: ForwardDestination, confirmed: bool) !void {
+        const restricted = destination.scope.restricted();
+        const update = try self.prepareLocked(if (confirmed)
+            \\UPDATE mailbox_forwarding SET address=?2,destination_id=?3,revision=revision+1,
+            \\pending_address=NULL,pending_destination_id=NULL,code_hash=NULL,expires_at=NULL,attempts=0 WHERE user_id=?1
+        else
+            "UPDATE mailbox_forwarding SET address=?2,destination_id=?3,revision=revision+1 WHERE user_id=?1");
+        defer update.finalize();
+        try update.bind(1, user_id);
+        try update.bindOpt(2, if (restricted) null else destination.address);
+        try update.bindOpt(3, if (restricted) null else destination.mailbox_id);
+        _ = try update.step();
+
+        if (!restricted) return self.removeForwardScopeLocked(user_id);
+        const scoped = try self.prepareLocked(
+            \\INSERT INTO mailbox_forwarding_scopes(user_id,revision,address,destination_id,sender,recipient)
+            \\VALUES (?1,?2,?3,?4,?5,?6)
+            \\ON CONFLICT(user_id) DO UPDATE SET revision=excluded.revision,address=excluded.address,
+            \\destination_id=excluded.destination_id,sender=excluded.sender,recipient=excluded.recipient
+        );
+        defer scoped.finalize();
+        try scoped.bind(1, user_id);
+        try scoped.bind(2, revision + 1);
+        try scoped.bind(3, destination.address);
+        try scoped.bindOpt(4, destination.mailbox_id);
+        try scoped.bindOpt(5, destination.scope.sender);
+        try scoped.bindOpt(6, destination.scope.recipient);
+        _ = try scoped.step();
     }
 
     pub fn startForwardRequest(self: *Database, user: []const u8, revision: i64, request: ForwardRequest) !void {
@@ -1358,12 +1438,14 @@ pub const Database = struct {
             _ = try prune.step();
         }
         const owner = try self.prepareLocked(
-            \\SELECT u.id,COALESCE(f.revision,0),f.address,f.destination_id,
+            \\SELECT u.id,COALESCE(f.revision,0),
+        ++ forward_address ++ "," ++ forward_destination_id ++
+            \\,
             \\       (SELECT COUNT(*) FROM mailbox_forwarding_requests WHERE user_id=u.id),
             \\       (SELECT MAX(requested_at) FROM mailbox_forwarding_requests WHERE user_id=u.id),
             \\       (SELECT COUNT(*) FROM mailbox_forwarding_requests WHERE address=?2)
-            \\FROM users u LEFT JOIN mailbox_forwarding f ON f.user_id=u.id WHERE u.username=?1 AND u.enabled=1
-        );
+            \\FROM users u LEFT JOIN mailbox_forwarding f ON f.user_id=u.id
+        ++ active_forward_scope ++ "WHERE u.username=?1 AND u.enabled=1");
         defer owner.finalize();
         try owner.bind(1, user);
         try owner.bind(2, request.destination.address);
@@ -1388,6 +1470,7 @@ pub const Database = struct {
         try update.bindBlob(4, &request.hash);
         try update.bind(5, request.expires);
         _ = try update.step();
+        try self.advanceForwardScopeLocked(user_id, revision);
         const log = try self.prepareLocked("INSERT INTO mailbox_forwarding_requests(user_id,address,requested_at) VALUES (?1,?2,?3)");
         defer log.finalize();
         try log.bind(1, user_id);
@@ -1397,7 +1480,7 @@ pub const Database = struct {
         try self.execLocked("COMMIT");
     }
 
-    pub fn confirmForwardRequest(self: *Database, user: []const u8, revision: i64, hash: [32]u8, now: i64) !bool {
+    pub fn confirmForwardRequest(self: *Database, a: std.mem.Allocator, user: []const u8, revision: i64, hash: [32]u8, now: i64, scope: ?ForwardScope) !bool {
         self.lockMailboxes();
         defer self.unlockMailboxes();
         self.mutex.lock();
@@ -1406,9 +1489,10 @@ pub const Database = struct {
         defer self.execLocked("ROLLBACK") catch {};
         const state = try self.prepareLocked(
             \\SELECT f.user_id,f.revision,f.code_hash,f.expires_at,f.attempts,
-            \\       f.pending_destination_id IS NULL OR EXISTS(SELECT 1 FROM users v WHERE v.id=f.pending_destination_id AND v.enabled=1)
-            \\FROM mailbox_forwarding f JOIN users u ON u.id=f.user_id WHERE u.username=?1 AND u.enabled=1
-        );
+            \\       f.pending_destination_id IS NULL OR EXISTS(SELECT 1 FROM users v WHERE v.id=f.pending_destination_id AND v.enabled=1),
+            \\       f.pending_address,f.pending_destination_id,s.sender,s.recipient
+            \\FROM mailbox_forwarding f JOIN users u ON u.id=f.user_id
+        ++ active_forward_scope ++ "WHERE u.username=?1 AND u.enabled=1");
         defer state.finalize();
         try state.bind(1, user);
         if (!try state.step()) return false;
@@ -1416,32 +1500,64 @@ pub const Database = struct {
         const stored = state.columnBlob(2);
         if (stored.len != hash.len or state.columnInt64(3) <= now or state.columnInt64(4) <= 0 or state.columnInt64(5) == 0) return false;
         const matched = std.crypto.timing_safe.eql([32]u8, stored[0..32].*, hash);
-        const update = try self.prepareLocked(if (matched)
-            \\UPDATE mailbox_forwarding SET address=pending_address,destination_id=pending_destination_id,
-            \\pending_address=NULL,pending_destination_id=NULL,code_hash=NULL,expires_at=NULL,attempts=0,revision=revision+1 WHERE user_id=?1
-        else
-            "UPDATE mailbox_forwarding SET attempts=attempts-1 WHERE user_id=?1");
-        defer update.finalize();
-        try update.bind(1, state.columnInt64(0));
-        _ = try update.step();
+        const user_id = state.columnInt64(0);
+        if (matched) {
+            const destination = state.columnTextOpt(6) orelse return false;
+            try self.writeForwardDestinationLocked(user_id, revision, .{
+                .address = destination,
+                .mailbox_id = state.columnInt64Opt(7),
+                .scope = scope orelse try readForwardScope(a, state, 8),
+            }, true);
+        } else {
+            const update = try self.prepareLocked("UPDATE mailbox_forwarding SET attempts=attempts-1 WHERE user_id=?1");
+            defer update.finalize();
+            try update.bind(1, user_id);
+            _ = try update.step();
+        }
         try self.execLocked("COMMIT");
         return matched;
+    }
+
+    pub fn setForwardingScope(self: *Database, user: []const u8, revision: i64, scope: ForwardScope) !void {
+        self.lockMailboxes();
+        defer self.unlockMailboxes();
+        var tx = try self.beginTransaction(.write);
+        defer tx.deinit();
+        const state = try tx.prepare("SELECT f.user_id,f.revision," ++ forward_address ++ "," ++ forward_destination_id ++
+            " FROM mailbox_forwarding f JOIN users u ON u.id=f.user_id" ++ active_forward_scope ++
+            "WHERE u.username=?1 AND u.enabled=1");
+        defer state.finalize();
+        try state.bind(1, user);
+        if (!try state.step() or state.columnInt64(1) != revision) return error.PreconditionFailed;
+        const address = state.columnTextOpt(2) orelse return error.NoVerifiedForward;
+        try self.writeForwardDestinationLocked(state.columnInt64(0), revision, .{
+            .address = address,
+            .mailbox_id = state.columnInt64Opt(3),
+            .scope = scope,
+        }, false);
+        try tx.commit();
     }
 
     pub fn clearForwarding(self: *Database, user: []const u8, revision: i64, pending_only: bool) !void {
         self.lockMailboxes();
         defer self.unlockMailboxes();
-        const stmt = try self.prepare(if (pending_only)
+        var tx = try self.beginTransaction(.write);
+        defer tx.deinit();
+        const stmt = try tx.prepare(if (pending_only)
             \\UPDATE mailbox_forwarding SET pending_address=NULL,pending_destination_id=NULL,code_hash=NULL,expires_at=NULL,attempts=0,revision=revision+1
-            \\WHERE user_id=(SELECT id FROM users WHERE username=?1 AND enabled=1) AND revision=?2 RETURNING revision
+            \\WHERE user_id=(SELECT id FROM users WHERE username=?1 AND enabled=1) AND revision=?2 RETURNING user_id
         else
             \\UPDATE mailbox_forwarding SET address=NULL,destination_id=NULL,pending_address=NULL,pending_destination_id=NULL,code_hash=NULL,expires_at=NULL,attempts=0,revision=revision+1
-            \\WHERE user_id=(SELECT id FROM users WHERE username=?1 AND enabled=1) AND revision=?2 RETURNING revision
+            \\WHERE user_id=(SELECT id FROM users WHERE username=?1 AND enabled=1) AND revision=?2 RETURNING user_id
         );
         defer stmt.finalize();
         try stmt.bind(1, user);
         try stmt.bind(2, revision);
         if (!try stmt.step()) return error.PreconditionFailed;
+        const user_id = stmt.columnInt64(0);
+        _ = try stmt.step();
+        if (pending_only) try self.advanceForwardScopeLocked(user_id, revision) else try self.removeForwardScopeLocked(user_id);
+        try tx.commit();
     }
 
     pub const VacationSettings = struct {
