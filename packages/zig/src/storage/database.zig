@@ -683,6 +683,11 @@ pub const Database = struct {
             \\    revision INTEGER NOT NULL CHECK(revision > 0)
             \\);
             \\CREATE INDEX IF NOT EXISTS mail_calendar_tasks_owner ON mail_calendar_tasks(user_id);
+            \\CREATE TABLE IF NOT EXISTS mail_calendar_tools (
+            \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            \\    payload TEXT NOT NULL,
+            \\    revision INTEGER NOT NULL CHECK(revision > 0)
+            \\);
             \\CREATE TABLE IF NOT EXISTS mail_calendar_revisions (
             \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             \\    component TEXT NOT NULL,

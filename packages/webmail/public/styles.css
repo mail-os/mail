@@ -526,6 +526,56 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-task-summary span, .calendar-task-empty { color: var(--muted); font-size: 12px; }
 .calendar-task-summary a { justify-self: start; color: var(--accent); font-size: 12px; }
 .calendar-task-summary a:hover { text-decoration: underline; }
+.calendar-tools { max-inline-size: 52rem; margin-block: 12px; padding: 14px; border: 1px solid var(--border); border-radius: 9px; background: var(--toolbar); }
+.calendar-tools > * + * { margin-block-start: 12px; }
+.calendar-tools-heading, .calendar-tools-form, .calendar-tools-confirm, .calendar-tools-settings-row { display: flex; flex-wrap: wrap; gap: 8px; }
+.calendar-tools-heading, .calendar-tools-confirm, .calendar-tools-settings-row { align-items: center; }
+.calendar-tools-heading { justify-content: space-between; }
+.calendar-tools-heading h2 { margin: 0; font-size: 16px; font-weight: 650; }
+.calendar-tools-tabs { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px; border-radius: var(--control-radius); background: var(--surface); }
+.calendar-tools-tabs .wm-action { border-color: transparent; background: transparent; }
+.calendar-tools-tabs .wm-action[aria-pressed=true] { border-color: var(--control-border); background: var(--panel); color: var(--accent); }
+.calendar-tools-tabs .wm-action:hover { background: var(--hover); }
+.calendar-tools-form { align-items: end; }
+.calendar-tools-form label { display: grid; gap: 5px; min-width: 0; max-width: 100%; font-size: 13px; font-weight: 550; }
+.calendar-tools-form label.calendar-tools-title { flex: 1 1 12rem; }
+.calendar-tools-form :is(input, textarea, select) { width: 100%; min-width: 0; }
+.calendar-tools-form :is(input, textarea) { min-block-size: var(--control-height); padding: 4px 10px; border: 1px solid var(--control-border); border-radius: var(--control-radius); font-size: 13px; line-height: 1.25; }
+.calendar-tools-form input[type=file] { padding-block: 4px; }
+.calendar-tools-form input::file-selector-button { min-block-size: calc(var(--control-height) - 10px); margin-inline-end: 8px; border: 0; border-radius: 5px; background: var(--surface); color: var(--text); font: inherit; }
+.calendar-tools-form .calendar-tools-minutes { inline-size: 7rem; }
+.calendar-tools-journal label:first-child { flex-basis: 100%; }
+.calendar-tools-journal textarea { padding-block: 8px; resize: vertical; }
+.calendar-tools-muted, .calendar-tools-confirm p, .calendar-tools-settings-row strong { margin: 0; font-size: 13px; }
+.calendar-tools-muted, .calendar-tools-item span { color: var(--muted); }
+.calendar-tools-confirm { margin-block-start: 12px; padding: 10px; border: 1px solid var(--border); border-radius: var(--control-radius); background: var(--panel); }
+.calendar-tools-confirm p { flex: 1 1 15rem; overflow-wrap: anywhere; }
+.calendar-tools-settings { display: grid; gap: 12px; }
+.calendar-tools-settings-row .wm-action[aria-pressed=true] { background: var(--accent-soft); color: var(--accent); }
+.calendar-tools-list { margin-block-end: 0; padding: 0; list-style: none; border: 1px solid var(--border); border-radius: var(--control-radius); background: var(--panel); }
+.calendar-tools-list li { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 10px; }
+.calendar-tools-list li + li { border-block-start: 1px solid var(--border); }
+.calendar-tools-item { display: grid; flex: 1 1 11rem; min-width: 0; gap: 3px; overflow-wrap: anywhere; font-size: 13px; }
+.calendar-tools-item span { font-size: 12px; }
+.calendar-tools-time .calendar-tools-list { margin-block-start: 8px; }
+.calendar-workspace-compact .calendar-board-month .calendar-day { min-height: 6rem; padding-block: .35rem; }
+.calendar-workspace-compact .calendar-board-week .calendar-day { padding-block: .35rem; }
+@media (min-width: 761px) {
+  .calendar-workspace-compact .calendar-board-week .calendar-day { min-height: 6rem; }
+}
+.calendar-workspace-compact .calendar-year { gap: 8px; }
+.calendar-workspace-compact .calendar-year-month { padding: 8px; }
+@media (max-width: 540px) {
+  .calendar-tools-form > label { flex: 1 1 100%; }
+  .calendar-tools-settings-row > strong { flex-basis: 100%; }
+  .calendar-tools-settings-row > button { flex: 1; justify-content: center; }
+  .calendar-tools-data > button { width: 100%; justify-content: center; }
+  .calendar-tools-list li { gap: 6px; }
+  .calendar-tools-item { flex-basis: 100%; }
+}
+@media (max-width: 490px) {
+  .calendar-workspace-compact .calendar-board-month .calendar-day { min-height: var(--control-height); padding-block: .1rem; }
+}
 @media (max-width: 540px) {
   .calendar-tasks-heading h2 { flex-basis: 100%; }
   .calendar-task-form > label, .calendar-task-date { flex: 1 1 100%; }

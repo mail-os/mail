@@ -21,6 +21,12 @@ const {
   startDayLabel, cancelDayLabel, saveDayLabel,
   taskPanelOpen, tasksReady, taskBusy, taskError, taskConflict, taskNotice, showCompletedTasks, taskEditor, taskTitle, taskDay,
   confirmTaskRemoval, visibleTasks, closeTasks, loadTasks, startTaskEdit, cancelTaskEdit, showTasks, saveTask, setTaskCompleted, taskDateLabel,
+  tools, toolsOpen, toolsBusy, toolsError, toolsNotice, toolsConflict, toolsCompact, toolsSections, toolSection,
+  toolDate, toolTitle, toolTarget, toolMinutes, editingItem, journalText, journalDates, toolTimeRows, toolTimeTotal, countdownRows,
+  selectedImport, removal, loadToolsDisplay, loadTools, closeTools, tickTools, selectToolsSection, selectToolDate, changeToolDate,
+  resetItemForm, editToolItem, saveToolItem, toggleHabit, writeJournal, saveJournal, confirmToolRemoval,
+  prepareToolsImport, discardToolsImport, importTools, exportTools,
+  setToolsEnabled, setToolsAppearance, countdownStatus, toolDateLabel,
   freeTimeOpen, freeTimeDate, freeTimeStart, freeTimeEnd, freeTimeMinutes, freeTimeIncludeOwned, freeTimeBusy,
   freeTimeDurations, freeTimeCanIncludeOwned, freeTimeScope, freeTimeResults, freeTimeError, toggleFreeTime, findFreeTime,
   refresh, selectCalendar, showView, shiftView, goToToday, showDay, changeDate, changeZone, calendarEventDate,
@@ -48,12 +54,35 @@ const taskHeading = useRef('taskHeading')
 const taskTitleField = useRef('taskTitleField')
 const taskDeleteButton = useRef('taskDeleteButton')
 const taskSaveButton = useRef('taskSaveButton')
-function changeTaskPanel() {
+const toolsHeading = useRef('toolsHeading')
+const toolTitleField = useRef('toolTitleField')
+const toolRemovalButton = useRef('toolRemovalButton')
+function changeToolsPanel() {
+  if (toolsOpen()) closeTools()
+  else {
+    closeTasks()
+    void loadTools()
+    nextTick(() => toolsHeading.current?.focus())
+  }
+}
+function changeTasksPanel() {
   if (taskPanelOpen()) closeTasks()
   else {
+    closeTools()
     void loadTasks()
     nextTick(() => taskHeading.current?.focus())
   }
+}
+function editPersonalTool(item) {
+  editToolItem(item)
+  nextTick(() => toolTitleField.current?.focus())
+}
+function askToRemoveTool(section, key, title) {
+  removal.set({ section, key, title })
+  nextTick(() => toolRemovalButton.current?.focus())
+}
+async function removePersonalTool() {
+  if (await confirmToolRemoval()) nextTick(() => toolsHeading.current?.focus())
 }
 async function reloadTasks() {
   await loadTasks()
@@ -108,9 +137,11 @@ function openYearDay(day) {
 }
 async function bootCalendar() { await refresh(); await openMailEvent(); void pollReminders() }
 useInterval(tickReminders, 1000, { whileVisible: true })
+useInterval(tickTools, 30000, { whileVisible: true })
 useInterval(pollReminders, 30000, { whileVisible: true })
 useInterval(recheckShares, 30000, { whileVisible: true })
 useEventListener('focus', pollReminders)
+useEventListener('focus', tickTools)
 useEventListener('focus', recheckShares)
 useEventListener('online', pollReminders)
 useEventListener('online', recheckShares)
@@ -125,7 +156,8 @@ onUnmounted(() => { destroy(); destroyReminders() })
   <header class="calendar-header">
     <div class="calendar-heading"><span class="mail-app-mark"><span class="mail-icon" data-icon="calendar" aria-hidden="true"></span></span><h1>Calendar</h1></div>
     <div :if="account" class="calendar-choices">
-      <button :if="!selectedShare" type="button" class="wm-action" :aria-expanded="taskPanelOpen" aria-controls="calendar-tasks" :disabled="taskBusy" @click="changeTaskPanel()"><span class="mail-icon" data-icon="checklist" aria-hidden="true"></span>Tasks</button>
+      <button :if="!selectedShare" type="button" class="wm-action" :aria-expanded="taskPanelOpen" aria-controls="calendar-tasks" :disabled="taskBusy || toolsBusy" @click="changeTasksPanel()"><span class="mail-icon" data-icon="checklist" aria-hidden="true"></span>Tasks</button>
+      <button :if="!selectedShare" type="button" class="wm-action" :aria-expanded="toolsOpen" aria-controls="calendar-tools" :disabled="toolsBusy || taskBusy" @click="changeToolsPanel()"><span class="mail-icon" data-icon="bookmark" aria-hidden="true"></span>Personal tools</button>
       <button class="wm-action" @click="toggleCalendarSettings()" :disabled="loading && !calendarSettings" :aria-expanded="calendarSettings" aria-controls="calendar-settings"><span class="mail-icon" data-icon="settings" aria-hidden="true"></span>Manage calendars</button>
       <button class="wm-action" @click="toggleImport()" :disabled="importBusy" :aria-expanded="importOpen" aria-controls="calendar-import"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Import .ics</button>
       <a :if="calendarExport" class="wm-action" :href="calendarExport"><span class="mail-icon" data-icon="download" aria-hidden="true"></span>Download .ics</a>
@@ -178,6 +210,90 @@ onUnmounted(() => { destroy(); destroyReminders() })
     </ul>
     <p :if="tasksReady && !visibleTasks.length && !taskEditor" class="calendar-task-empty" :text="showCompletedTasks ? 'No completed tasks.' : 'No open tasks.'"></p>
     <p class="wm-a11y-text" role="status" :text="taskNotice"></p>
+  </section>
+  <section :if="toolsOpen && !selectedShare" id="calendar-tools" class="calendar-tools" aria-labelledby="calendar-tools-heading">
+    <div class="calendar-tools-heading">
+      <h2 id="calendar-tools-heading" tabindex="-1" ref="toolsHeading">Personal tools</h2>
+      <button :if="tools && !tools.enabled" type="button" class="wm-action calendar-primary" :disabled="toolsBusy || toolsConflict" @click="setToolsEnabled(true)">Enable personal tools</button>
+    </div>
+    <p :if="toolsBusy && !tools" role="status">Loading personal tools…</p>
+    <p :if="toolsError" class="calendar-label-error" role="alert" :text="toolsError"></p>
+    <button :if="toolsConflict || (!tools && toolsError)" type="button" class="wm-action" :disabled="toolsBusy" @click="loadTools()">Load latest personal tools</button>
+    <p :if="tools && !tools.enabled" class="calendar-tools-muted">Keep countdowns, check off habits, write journal notes, and log time. Your tools stay private to this mailbox.</p>
+    <div :if="tools && tools.enabled" class="calendar-tools-tabs" role="group" aria-label="Choose a personal tool">
+      <button :for="section in toolsSections" :key="section.id" type="button" class="wm-action" :aria-pressed="toolSection === section.id" :disabled="toolsBusy" @click="selectToolsSection(section.id)" :text="section.label"></button>
+    </div>
+    <div :if="tools && tools.enabled && (toolSection === 'habits' || toolSection === 'journal' || toolSection === 'time')" class="calendar-tools-date calendar-tools-form">
+      <label>Entry date<input type="date" :value="toolDate" min="0001-01-01" max="9999-12-31" :disabled="toolsBusy" required @change="changeToolDate($event)"></label>
+    </div>
+    <form :if="tools && tools.enabled && (toolSection === 'countdowns' || toolSection === 'habits' || toolSection === 'time')" class="calendar-tools-form" aria-label="Personal tool entry" @submit.prevent="saveToolItem(toolSection)">
+      <label class="calendar-tools-title"><span :text="toolSection === 'habits' ? 'Habit name' : toolSection === 'time' ? 'Activity' : 'Countdown name'"></span>
+        <input ref="toolTitleField" type="text" x-model="toolTitle" :disabled="toolsBusy" maxlength="200" autocomplete="off" required>
+      </label>
+      <label :if="toolSection === 'countdowns'">Target date<input type="date" x-model="toolTarget" :disabled="toolsBusy" min="0001-01-01" max="9999-12-31" required></label>
+      <label :if="toolSection === 'time'">Minutes<input class="calendar-tools-minutes" type="number" x-model="toolMinutes" :disabled="toolsBusy" min="1" max="1440" step="1" required></label>
+      <button type="submit" class="wm-action calendar-primary" :disabled="toolsBusy || toolsConflict" :text="editingItem ? 'Save entry' : toolSection === 'time' ? 'Log time' : toolSection === 'habits' ? 'Add habit' : 'Add countdown'"></button>
+      <button :if="editingItem" type="button" class="wm-action" :disabled="toolsBusy" @click="resetItemForm()">Cancel edit</button>
+    </form>
+    <ul :if="tools && tools.enabled && toolSection === 'countdowns' && countdownRows.length" class="calendar-tools-list" aria-label="Countdowns">
+      <li :for="item in countdownRows" :key="item.id">
+        <div class="calendar-tools-item"><strong :text="item.title"></strong><span :text="toolDateLabel(item.day) + ' · ' + countdownStatus(item.day)"></span></div>
+        <button type="button" class="wm-action" :aria-label="'Edit ' + item.title" :disabled="toolsBusy" @click="editPersonalTool(item)">Edit</button>
+        <button type="button" class="wm-action wm-action--danger" :aria-label="'Remove ' + item.title" :disabled="toolsBusy || toolsConflict" @click="askToRemoveTool('countdowns', item.id, item.title)">Remove</button>
+      </li>
+    </ul>
+    <ul :if="tools && tools.enabled && toolSection === 'habits' && tools.habits.length" class="calendar-tools-list" aria-label="Habits">
+      <li :for="item in tools.habits" :key="item.id">
+        <div class="calendar-tools-item"><strong :text="item.title"></strong><span :text="item.days.length + (item.days.length === 1 ? ' check-in' : ' check-ins')"></span></div>
+        <button type="button" class="wm-action" :aria-label="'Check in for ' + item.title" :aria-pressed="item.days.includes(toolDate)" :disabled="toolsBusy || toolsConflict" @click="toggleHabit(item)">
+          <span :if="item.days.includes(toolDate)" class="mail-icon" data-icon="check" aria-hidden="true"></span><span :text="item.days.includes(toolDate) ? 'Checked in' : 'Check in'"></span>
+        </button>
+        <button type="button" class="wm-action" :aria-label="'Edit ' + item.title" :disabled="toolsBusy" @click="editPersonalTool(item)">Edit</button>
+        <button type="button" class="wm-action wm-action--danger" :aria-label="'Remove ' + item.title" :disabled="toolsBusy || toolsConflict" @click="askToRemoveTool('habits', item.id, item.title)">Remove</button>
+      </li>
+    </ul>
+    <form :if="tools && tools.enabled && toolSection === 'journal'" class="calendar-tools-form calendar-tools-journal" @submit.prevent="saveJournal()">
+      <label>Journal note<textarea :value="journalText" @input="writeJournal($event.target.value)" :disabled="toolsBusy" maxlength="4000" rows="4" required></textarea></label>
+      <button type="submit" class="wm-action calendar-primary" :disabled="toolsBusy || toolsConflict">Save note</button>
+      <button :if="tools.journal.some(entry => entry.day === toolDate)" type="button" class="wm-action wm-action--danger" :disabled="toolsBusy || toolsConflict" @click="askToRemoveTool('journal', toolDate, 'Journal note for ' + toolDateLabel(toolDate))">Remove note</button>
+      <label :if="journalDates.length" class="calendar-tools-saved-notes">Saved notes<select :value="toolDate" :disabled="toolsBusy" @change="selectToolDate($event.target.value)">
+        <option :if="!journalDates.includes(toolDate)" value="">Choose a date</option>
+        <option :for="date in journalDates" :key="date" :value="date" :text="toolDateLabel(date)"></option>
+      </select></label>
+    </form>
+    <div :if="tools && tools.enabled && toolSection === 'time' && toolTimeRows.length" class="calendar-tools-time">
+      <p class="calendar-tools-muted" :text="toolTimeTotal + ' min logged'" role="status"></p>
+      <ul class="calendar-tools-list" aria-label="Time entries">
+        <li :for="item in toolTimeRows" :key="item.id">
+          <div class="calendar-tools-item"><strong :text="item.title"></strong><span :text="item.minutes + ' min'"></span></div>
+          <button type="button" class="wm-action" :aria-label="'Edit ' + item.title" :disabled="toolsBusy" @click="editPersonalTool(item)">Edit</button>
+          <button type="button" class="wm-action wm-action--danger" :aria-label="'Remove ' + item.title" :disabled="toolsBusy || toolsConflict" @click="askToRemoveTool('time', item.id, item.title)">Remove</button>
+        </li>
+      </ul>
+    </div>
+    <div :if="removal" class="calendar-tools-confirm" role="group" aria-label="Confirm removal">
+      <p :text="'Remove ' + removal.title + '?'"></p>
+      <button ref="toolRemovalButton" type="button" class="wm-action wm-action--danger" :disabled="toolsBusy || toolsConflict" @click="removePersonalTool()">Confirm removal</button>
+      <button type="button" class="wm-action" :disabled="toolsBusy" @click="removal.set(null)">Cancel removal</button>
+    </div>
+    <div :if="tools && (!tools.enabled || toolSection === 'display')" class="calendar-tools-settings">
+      <div :if="tools.enabled" class="calendar-tools-settings-row" role="group" aria-label="Calendar density">
+        <strong>Calendar density</strong>
+        <button type="button" class="wm-action" :aria-pressed="tools.appearance === 'standard'" :disabled="toolsBusy || toolsConflict" @click="setToolsAppearance('standard')">Standard</button>
+        <button type="button" class="wm-action" :aria-pressed="tools.appearance === 'compact'" :disabled="toolsBusy || toolsConflict" @click="setToolsAppearance('compact')">Compact</button>
+      </div>
+      <div class="calendar-tools-form calendar-tools-data">
+        <label>Import personal tools<input type="file" accept=".json,application/json" :disabled="toolsBusy || toolsConflict" @change="prepareToolsImport($event)"></label>
+        <button type="button" class="wm-action" :disabled="toolsBusy" @click="exportTools()"><span class="mail-icon" data-icon="download" aria-hidden="true"></span>Export JSON</button>
+        <button :if="tools.enabled" type="button" class="wm-action" :disabled="toolsBusy || toolsConflict" @click="setToolsEnabled(false)">Turn off personal tools</button>
+      </div>
+      <div :if="selectedImport" class="calendar-tools-confirm" role="group" aria-label="Confirm personal tools import">
+        <p :text="'Replace your personal tools with ' + selectedImport.filename + '?'"></p>
+        <button type="button" class="wm-action calendar-primary" :disabled="toolsBusy || toolsConflict" @click="importTools()">Replace personal tools</button>
+        <button type="button" class="wm-action" :disabled="toolsBusy" @click="discardToolsImport()">Cancel import</button>
+      </div>
+    </div>
+    <p class="wm-a11y-text" role="status" :text="toolsNotice"></p>
   </section>
   <div :if="error" class="login-error" role="alert"><span :text="error"></span> <button class="wm-action" @click="refresh()">Retry</button></div>
   <p :if="shareNotice" class="calendar-share-notice" role="status" :text="shareNotice"></p>
@@ -242,7 +358,7 @@ onUnmounted(() => { destroy(); destroyReminders() })
     </ul>
     <button :if="readyCount && !importFinished" class="wm-action" @click="submitImport('import')" :disabled="importBusy">Import events</button>
   </section>
-  <section :if="account && (calendars.length || sharedCalendars.length)" class="calendar-workspace" aria-label="Calendar workspace" :aria-busy="loading">
+  <section :if="account && (calendars.length || sharedCalendars.length)" class="calendar-workspace" :class="{ 'calendar-workspace-compact': toolsCompact && !selectedShare }" aria-label="Calendar workspace" :aria-busy="loading">
     <div class="calendar-controls">
       <div class="calendar-choices calendar-sources" role="group" aria-label="Calendars">
         <button :if="calendars.length" class="wm-action" @click="selectCalendar(null)" :aria-pressed="activeCalendar === null" :text="sharedCalendars.length ? 'My calendars' : 'All calendars'"></button>

@@ -61,6 +61,7 @@ const ascii_compat = @import("ascii-compat");
 const caldav_store = @import("../storage/caldav_store.zig");
 const calendar_day_labels = @import("../storage/calendar_day_labels.zig");
 const calendar_tasks = @import("../storage/calendar_tasks.zig");
+const calendar_tools = @import("../storage/calendar_tools.zig");
 const caldav = @import("../protocol/caldav.zig");
 const calendar_import = @import("webmail_calendar_import.zig");
 const calendar_invite = @import("webmail_calendar_invite.zig");
@@ -582,6 +583,8 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
         return handleCalendarTasks(server, conn, arena, req, null);
     if (std.mem.startsWith(u8, p, task_path ++ "/") and (std.mem.eql(u8, req.method, "PUT") or std.mem.eql(u8, req.method, "DELETE")))
         return handleCalendarTasks(server, conn, arena, req, p[(task_path.len + 1)..]);
+    if (std.mem.eql(u8, p, "/webmail/api/calendar-tools") and (std.mem.eql(u8, req.method, "GET") or std.mem.eql(u8, req.method, "PUT")))
+        return handleCalendarTools(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-timezone") and std.mem.eql(u8, req.method, "GET")) return handleCalendarTimezone(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-free-busy") and std.mem.eql(u8, req.method, "GET")) return handleCalendarFreeBusy(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-reminders") and std.mem.eql(u8, req.method, "GET")) return handleCalendarReminders(server, conn, arena, req);
@@ -2032,6 +2035,33 @@ fn writeCalendarTask(db: *database.Database, conn: *webmail_tls.Stream, arena: s
     const edit = std.json.parseFromSliceLeaky(calendar_tasks.Edit, arena, req.body, .{}) catch return error.InvalidCalendarTask;
     const task = try calendar_tasks.save(db, mailbox, id, edit);
     return sendJson(conn, arena, if (id == null) 201 else 200, try service_mod.json(arena, task), null);
+}
+
+fn handleCalendarTools(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
+    const reading = std.mem.eql(u8, req.method, "GET");
+    if (!reading and !isSameOrigin(req)) return sendError(conn, arena, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, arena, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    if (server.dav_store == null) return sendError(conn, arena, 503, "calendar_unavailable", "Calendar is unavailable on this server");
+    if (reading) {
+        if (std.mem.eql(u8, req.queryParam(arena, "display") orelse "", "1")) {
+            const compact = try calendar_tools.isCompact(server.db, sess.username);
+            return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .compact = compact }), null);
+        }
+        return sendJson(conn, arena, 200, try service_mod.json(arena, try calendar_tools.load(arena, server.db, sess.username)), null);
+    }
+    if (req.body.len > calendar_tools.max_bytes + 128)
+        return sendError(conn, arena, 413, "personal_tools_too_large", "Personal tools can store up to 512 KiB.");
+    const change = std.json.parseFromSliceLeaky(calendar_tools.Snapshot, arena, req.body, .{}) catch
+        return sendError(conn, arena, 400, "invalid_personal_tools", "Check the personal tools file or entry.");
+    const saved = calendar_tools.save(arena, server.db, sess.username, change) catch |err| switch (err) {
+        error.InvalidPersonalTools => return sendError(conn, arena, 400, "invalid_personal_tools", "Check the personal tools entries, dates and limits."),
+        error.PersonalToolsChanged => return sendError(conn, arena, 409, "personal_tools_changed", "Personal tools changed in another window. Load the latest data before saving."),
+        error.PersonalToolsTooLarge => return sendError(conn, arena, 413, "personal_tools_too_large", "Personal tools can store up to 512 KiB."),
+        error.PersonalToolsUnavailable => return sendError(conn, arena, 401, "unauthorized", "This mailbox is unavailable."),
+        else => return err,
+    };
+    return sendJson(conn, arena, 200, try service_mod.json(arena, saved), null);
 }
 
 const reminder_history = 86_400;

@@ -17,6 +17,7 @@ import type { CalendarOccurrence } from './calendar-recurrence'
 import { useCalendarEditor } from './use-calendar-editor'
 import { useCalendarDayLabels } from './use-calendar-day-labels'
 import { useCalendarTasks } from './use-calendar-tasks'
+import { useCalendarTools } from './use-calendar-tools'
 import { useCalendarFreeTime } from './use-calendar-free-time'
 import { useCalendarReminders } from './use-calendar-reminders'
 import type { CalendarDialog } from './use-calendar-editor'
@@ -232,6 +233,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     busyPeriods.set([])
     dayLabels.clearDayLabels()
     calendarTasks.closeTasks()
+    calendarTools.clearTools()
     freeTime.clearFreeTimeResults()
     onAuthError()
   })
@@ -239,6 +241,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
   const showDayLabelEditor = derived(() => showDayLabels() && view() === 'day')
   const dayLabels = useCalendarDayLabels(api, focusDay, showDayLabels, showDayLabelEditor)
   const calendarTasks = useCalendarTasks(api, () => !!account() && !selectedShare())
+  const calendarTools = useCalendarTools(api, () => !!account() && !selectedShare(), focusDay, displayZone)
   const freeTime = useCalendarFreeTime(api, focusDay, displayZone, () => ({
     id: activeCalendar(),
     name: activeCalendar() === null ? 'My calendars' : activeCalendarName(),
@@ -285,6 +288,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
         const { user } = await api<{ user: User }>('/webmail/auth/me', { signal })
         if (pending.signal.aborted) return
         account.set(user.username)
+        void calendarTools.loadToolsDisplay()
       }
       const [{ calendars: visible }, { shares: currentShares }, roster] = await Promise.all([
         api<{ calendars: Calendar[] }>('/webmail/api/calendars', { signal }),
@@ -402,7 +406,10 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     freeTime.clearFreeTimeResults()
     shareNotice.set('')
     activeCalendar.set(id)
-    if (selectedShare()) calendarTasks.closeTasks()
+    if (selectedShare()) {
+      calendarTasks.closeTasks()
+      calendarTools.closeTools()
+    }
     if (availabilityOnly()) {
       searchTerm.set('')
       searchInput.set('')
@@ -692,6 +699,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     ...editor,
     ...dayLabels,
     ...calendarTasks,
+    ...calendarTools,
     ...freeTime,
     showDayLabels, showDayLabelEditor,
     ...reminders,
@@ -707,6 +715,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
       editor.clearEditor()
       dayLabels.clearDayLabels()
       calendarTasks.closeTasks()
+      calendarTools.clearTools()
       freeTime.clearFreeTimeResults()
     },
   }

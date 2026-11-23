@@ -128,6 +128,14 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   where you can reopen it. Dates stay the same across display time zones. Tasks
   are private to the mailbox, do not reserve time, and stay outside CalDAV and
   calendar exports.
+- Enable **Personal tools** in Calendar to track countdowns, check in to habits,
+  write a journal note for a date, or log minutes spent on an activity. Countdown
+  totals follow the current civil day in the display time zone. **Display & data**
+  lets you choose a compact calendar layout, export the tools as JSON, or replace
+  the current data with a previously exported file. Turning the tools off hides
+  the workflows and restores standard spacing while preserving their data.
+  These tools are private to the mailbox and stay outside shared calendars,
+  CalDAV, and .ics exports.
 - Create, edit, and delete events in the browser. The view and editor each have
   a time zone selector. For all-day events, **Last day** includes that date.
 - Recurring dates appear in the calendar using the stored rule, additional
@@ -235,6 +243,16 @@ webmail provisioning, aliases, certificate issuance and renewal live in ts-cloud
   or `null`. `PUT /webmail/api/calendar-tasks/{id}` replaces those fields using
   the current revision, and `DELETE` at that path takes `{ "revision": … }`.
   A stale edit or deletion returns `409`. The mailbox can hold up to 500 tasks.
+- `GET /webmail/api/calendar-tools` returns `{revision, tools}`. `PUT` accepts
+  the same shape with the current revision, or `0` before the first write.
+  A stale write returns `409`. `GET ?display=1` returns the effective compact
+  preference alone. The portable `tools` document uses `version: 1`, `enabled`,
+  `appearance` (`standard` or `compact`), and the `habits`, `countdowns`,
+  `journal`, and `time` arrays. Dates use `YYYY-MM-DD`. Habit `days` are sorted
+  and unique. The file is limited to 512 KiB, with up to 24 habits, 64 countdowns,
+  366 journal notes, and 1,000 time entries. Export contains the document without
+  a mailbox ID or revision. Import applies it to the authenticated mailbox using
+  that mailbox's revision after explicit confirmation.
 - `GET /webmail/api/calendar-events?start=…&end=…` lists events in a half-open
   range of up to 366 days. The timestamps are Unix seconds. Pass `calendarId`
   to select one calendar or `q` to search stored event text. A nonempty
