@@ -1432,8 +1432,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 @media (max-width: 370px) {
   .calendar-period { grid-template-columns: var(--control-height) minmax(0, 1fr) var(--control-height); }
   .calendar-period input { grid-column: 1 / -1; }
-  .calendar-share-form { column-gap: 8px; }
-  .calendar-share-form > :nth-child(2) select { padding-inline-end: 24px; }
+  .calendar-share-form > :nth-child(-n+2) { grid-column: 1 / -1; }
 }
 @media (forced-colors: active) {
   .mail-icon { forced-color-adjust: none; background: CanvasText; }
