@@ -570,11 +570,11 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   gap: 12px;
   max-inline-size: 56rem;
 }
-.calendar-ics-form:where(:has(.calendar-ics-name)) { grid-template-columns: minmax(0, 1.4fr) repeat(2, minmax(0, 1fr)) max-content; }
+.calendar-ics-form:where(:has(.calendar-ics-name)) { grid-template-columns: minmax(0, 1.4fr) minmax(10.5rem, 1fr) minmax(0, 1fr) max-content; }
 .calendar-ics-form button { justify-content: center; }
 @media (490px < width <= 740px) {
   .calendar-ics-form { grid-template-columns: minmax(0, 1fr) max-content; }
-  .calendar-ics-form:where(:has(.calendar-ics-name)) { grid-template-columns: repeat(2, minmax(0, 1fr)) max-content; }
+  .calendar-ics-form:where(:has(.calendar-ics-name)) { grid-template-columns: minmax(10.5rem, 1fr) minmax(0, 1fr) max-content; }
   .calendar-ics-form > label:first-child { grid-column: 1 / -1; }
 }
 @media (max-width: 490px) {

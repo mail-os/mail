@@ -90,7 +90,7 @@ async function verifySelect(control, minimumHeight = 36) {
 }
 
 async function verifySelectedOptionFits(control) {
-  const { label, used, available } = await control.evaluate((select) => {
+  const { label, used, available, viewport } = await control.evaluate((select) => {
     const style = getComputedStyle(select)
     const context = document.createElement('canvas').getContext('2d')
     context.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`
@@ -99,9 +99,10 @@ async function verifySelectedOptionFits(control) {
       label,
       used: context.measureText(label).width,
       available: select.clientWidth - Number.parseFloat(style.paddingLeft) - Number.parseFloat(style.paddingRight),
+      viewport: innerWidth,
     }
   })
-  assert(available >= used, `The picker has ${available}px for “${label}”, which needs ${used}px`)
+  assert(available >= used, `At ${viewport}px, the picker has ${available}px for “${label}”, which needs ${used}px`)
 }
 
 async function verifyControlRow(container, selector, height, sameRow = true) {
