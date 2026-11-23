@@ -1324,6 +1324,76 @@ pub const Database = struct {
         };
     }
 
+    pub const HostedAccountStatus = struct {
+        revision: i64,
+        enabled: bool,
+        requested_enabled: bool,
+        quota_bytes: u64,
+        requested_quota_bytes: u64,
+        send_recipients_per_day: u64,
+        utc_day: i64,
+        counter_utc_day: ?i64,
+        recipients_used_today: u64,
+        recipients_remaining: ?u64,
+        outbound_queue: ?struct { pending: u64, retry: u64, processing: u64 } = null,
+    };
+
+    /// Observe provisioning, recipient usage, and the active outbound queue in
+    /// one read transaction. Queue counters are unavailable on pre-queue schemas.
+    pub fn hostedAccountStatus(self: *Database, mailbox: []const u8, now: i64) !?HostedAccountStatus {
+        var tx = try self.beginTransaction(.read);
+        defer tx.deinit();
+        const account = try tx.prepare(
+            \\SELECT p.revision, u.enabled, p.requested_enabled, u.quota_limit, p.requested_quota,
+            \\       p.send_recipients_per_day, usage.utc_day, usage.recipients, u.id
+            \\FROM provisioned_mailboxes p
+            \\JOIN users u ON u.id = p.user_id AND u.username = p.mailbox
+            \\LEFT JOIN hosted_sending_usage usage ON usage.user_id = u.id
+            \\WHERE p.mailbox = ?1
+        );
+        defer account.finalize();
+        try account.bind(1, mailbox);
+        if (!try account.step()) return null;
+
+        const day = @divFloor(now, 86400);
+        const counter_day = if (account.columnIsNull(6)) null else account.columnInt64(6);
+        const allowance: u64 = @intCast(@max(0, account.columnInt64(5)));
+        const used: u64 = if (counter_day == day) @intCast(@max(0, account.columnInt64(7))) else 0;
+        const counter_in_future = if (counter_day) |counter| counter > day else false;
+        var status: HostedAccountStatus = .{
+            .revision = account.columnInt64(0),
+            .enabled = account.columnInt64(1) != 0,
+            .requested_enabled = account.columnInt64(2) != 0,
+            .quota_bytes = @intCast(@max(0, account.columnInt64(3))),
+            .requested_quota_bytes = @intCast(@max(0, account.columnInt64(4))),
+            .send_recipients_per_day = allowance,
+            .utc_day = day,
+            .counter_utc_day = counter_day,
+            .recipients_used_today = used,
+            .recipients_remaining = if (allowance == 0) null else if (counter_in_future) 0 else allowance -| used,
+        };
+        const schema = try tx.prepare("SELECT 1 FROM pragma_table_info('message_queue') WHERE name = 'hosted_user_id'");
+        defer schema.finalize();
+        if (try schema.step()) {
+            const queue = try tx.prepare(
+                \\SELECT COUNT(CASE WHEN status = 'pending' THEN 1 END),
+                \\       COUNT(CASE WHEN status = 'retry' THEN 1 END),
+                \\       COUNT(CASE WHEN status = 'processing' THEN 1 END)
+                \\FROM message_queue WHERE hosted_user_id = ?1 AND status IN ('pending', 'retry', 'processing')
+            );
+            defer queue.finalize();
+            try queue.bind(1, account.columnInt64(8));
+            if (!try queue.step()) return DatabaseError.StepFailed;
+            status.outbound_queue = .{
+                .pending = @intCast(queue.columnInt64(0)),
+                .retry = @intCast(queue.columnInt64(1)),
+                .processing = @intCast(queue.columnInt64(2)),
+            };
+        }
+        try tx.commit();
+        return status;
+    }
+
     pub fn hostedSenderActive(self: *Database, user_id: i64) !bool {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -4268,71 +4338,20 @@ pub const Database = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const sql =
+        const stmt = try self.prepareLocked(
             \\INSERT INTO audit_log (timestamp, action, actor, target, target_type, ip_address, details, severity)
             \\VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-        ;
-
-        const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
-        defer self.allocator.free(sql_z);
-
-        var stmt: ?*sqlite.sqlite3_stmt = null;
-        var rc = sqlite.sqlite3_prepare_v2(self.db, sql_z.ptr, -1, &stmt, null);
-        if (rc != sqlite.SQLITE_OK) {
-            return DatabaseError.PrepareFailed;
-        }
-        defer _ = sqlite.sqlite3_finalize(stmt);
-
-        try checkBind(sqlite.sqlite3_bind_int64(stmt, 1, timestamp));
-
-        const action_z = try self.allocator.dupeSentinel(u8, action, 0);
-        defer self.allocator.free(action_z);
-        try checkBind(sqlite.sqlite3_bind_text(stmt, 2, action_z.ptr, -1, null));
-
-        const actor_z = try self.allocator.dupeSentinel(u8, actor, 0);
-        defer self.allocator.free(actor_z);
-        try checkBind(sqlite.sqlite3_bind_text(stmt, 3, actor_z.ptr, -1, null));
-
-        if (target) |t| {
-            const target_z = try self.allocator.dupeSentinel(u8, t, 0);
-            defer self.allocator.free(target_z);
-            try checkBind(sqlite.sqlite3_bind_text(stmt, 4, target_z.ptr, -1, null));
-        } else {
-            try checkBind(sqlite.sqlite3_bind_null(stmt, 4));
-        }
-
-        if (target_type) |tt| {
-            const tt_z = try self.allocator.dupeSentinel(u8, tt, 0);
-            defer self.allocator.free(tt_z);
-            try checkBind(sqlite.sqlite3_bind_text(stmt, 5, tt_z.ptr, -1, null));
-        } else {
-            try checkBind(sqlite.sqlite3_bind_null(stmt, 5));
-        }
-
-        if (ip_address) |ip| {
-            const ip_z = try self.allocator.dupeSentinel(u8, ip, 0);
-            defer self.allocator.free(ip_z);
-            try checkBind(sqlite.sqlite3_bind_text(stmt, 6, ip_z.ptr, -1, null));
-        } else {
-            try checkBind(sqlite.sqlite3_bind_null(stmt, 6));
-        }
-
-        if (details) |d| {
-            const details_z = try self.allocator.dupeSentinel(u8, d, 0);
-            defer self.allocator.free(details_z);
-            try checkBind(sqlite.sqlite3_bind_text(stmt, 7, details_z.ptr, -1, null));
-        } else {
-            try checkBind(sqlite.sqlite3_bind_null(stmt, 7));
-        }
-
-        const severity_z = try self.allocator.dupeSentinel(u8, severity, 0);
-        defer self.allocator.free(severity_z);
-        try checkBind(sqlite.sqlite3_bind_text(stmt, 8, severity_z.ptr, -1, null));
-
-        rc = sqlite.sqlite3_step(stmt);
-        if (rc != sqlite.SQLITE_DONE) {
-            return DatabaseError.StepFailed;
-        }
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, timestamp);
+        try stmt.bind(2, action);
+        try stmt.bind(3, actor);
+        try stmt.bindOpt(4, target);
+        try stmt.bindOpt(5, target_type);
+        try stmt.bindOpt(6, ip_address);
+        try stmt.bindOpt(7, details);
+        try stmt.bind(8, severity);
+        _ = try stmt.step();
 
         return sqlite.sqlite3_last_insert_rowid(self.db);
     }

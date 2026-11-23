@@ -1842,6 +1842,8 @@ The actor is a stable opaque ID for the app's verified signup, and an actor
 can own one mailbox. Suspension disables mailbox authentication and revokes
 webmail sessions and password reset tokens.
 
+Operators can inspect one managed mailbox with `mail user:local hosted-status <mailbox>` on the Mail host. The JSON report includes provisioning state, byte usage, the current UTC sending allowance, and outbound queue counts. Each successful report records a local audit entry. [Hosted mailbox diagnostics](docs/DEPLOYMENT_RUNBOOK.md#hosted-mailbox-diagnostics)
+
 ### Limits across mail clients
 
 - Storage counts stored message bytes in the mailbox's Maildir, including

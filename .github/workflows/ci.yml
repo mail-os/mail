@@ -149,6 +149,7 @@ jobs:
         python3 ../../scripts/test-hosted-limits.py zig-out/bin/mail
         python3 ../../scripts/test-hosted-limits.py --staging zig-out/bin/mail
         python3 ../../scripts/test-hosted-staging.py --fixture zig-out/bin/mail
+        python3 ../../scripts/test-hosted-operator.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-storage.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-outbox-recovery.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-scheduled-send.py zig-out/bin/mail

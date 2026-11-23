@@ -7,7 +7,9 @@ const env = @import("../core/env.zig");
 const recovery = @import("../api/webmail_recovery.zig");
 const mailbox_export = @import("../storage/mailbox_export.zig");
 const calendar_workflow = @import("../storage/calendar_workflow_transfer.zig");
+const hosted_limits = @import("../storage/hosted_limits.zig");
 const io_compat = @import("../core/io_compat.zig");
+const time = @import("../core/time_compat.zig");
 
 const password_input = @import("password_input.zig");
 
@@ -76,6 +78,36 @@ fn infoAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Database, _: *au
         return;
     };
     try user_cli.userInfo(db, allocator, username);
+}
+
+fn hostedStatusAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const mailbox = ctx.getArgument(0) orelse return error.MissingArgument;
+    const allocator = ctx.allocator;
+    const io = io_compat.getIo();
+    const path = env.get("SMTP_DB_PATH") orelse "./smtp.db";
+    try std.Io.Dir.cwd().access(io, path, .{});
+    var db = try database.Database.init(allocator, path);
+    defer db.deinit();
+
+    const now = time.timestamp();
+    const account = (try db.hostedAccountStatus(mailbox, now)) orelse return error.ManagedMailboxNotFound;
+    const storage = try hosted_limits.observeStorage(&db, mailbox, account.quota_bytes, now);
+    var actor_buffer: [64]u8 = undefined;
+    const actor = try std.fmt.bufPrint(&actor_buffer, "local-operator:{d}", .{std.c.geteuid()});
+    const audit_id = try db.insertAuditEntry(now, "hosted.status", actor, mailbox, "hosted_mailbox", null, null, "info");
+
+    var buffer: [4096]u8 = undefined;
+    var output = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try std.json.Stringify.value(.{
+        .version = @as(u8, 1),
+        .mailbox = mailbox,
+        .observed_at = now,
+        .account = account,
+        .storage = storage,
+        .audit_id = audit_id,
+    }, .{ .whitespace = .indent_2 }, &output.interface);
+    try output.interface.writeByte('\n');
+    try output.interface.flush();
 }
 
 fn exportAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Database, _: *auth.AuthBackend) !void {
@@ -236,6 +268,11 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try info_cmd.addArgument(cli.Argument.init("username", "Username to query", .string));
     _ = info_cmd.setAction(withDb(infoAction));
     _ = try cmd.addCommand(info_cmd);
+
+    const hosted_status_cmd = try cli.BaseCommand.init(allocator, "hosted-status", "Audit and report a hosted mailbox's current usage and provisioning state");
+    _ = try hosted_status_cmd.addArgument(cli.Argument.init("username", "Canonical hosted mailbox username", .string));
+    _ = hosted_status_cmd.setAction(hostedStatusAction);
+    _ = try cmd.addCommand(hosted_status_cmd);
 
     const export_cmd = try cli.BaseCommand.init(allocator, "export", "Export a mailbox to a portable TAR archive");
     _ = try export_cmd.addArgument(cli.Argument.init("username", "Canonical mailbox username", .string));

@@ -45,6 +45,23 @@ Use `--fixture /path/to/mail` to exercise the same client against a disposable T
 
 For the local Stacks test process, set `MAIL_PROVISIONING_URL` to `http://127.0.0.1:8099`, `MAIL_PROVISIONING_TOKEN` to the staging token, `MAIL_FREE_SIGNUP_DOMAIN` to the staging mailbox domain, and `MAIL_WEBMAIL_ORIGIN` to the webmail URL from the stack output. Use a disposable signup database and configure the free-tier limits for the test. Record the deployed Mail, app, and SDK revisions and test results in #55, #57, and #61.
 
+## Hosted mailbox diagnostics
+
+Run the local report on the mailbox's Mail host. Use the daemon's working directory and database path. The staging stack uses `/var/lib/mail` for both.
+
+```bash
+cd /var/lib/mail
+sudo -u mail-server env SMTP_DB_PATH=/var/lib/mail/smtp.db \
+  /opt/mail/mail-server user:local hosted-status alice@staging.example.com
+```
+
+- Compare the observed enabled flag and byte quota with the requested values and recorded provisioning revision. If they differ, correlate the revision with the Stacks entitlement operation before making another provisioning change.
+- For a full mailbox, check stored Maildir bytes, pending delivery reservations, and active file links. These share the byte budget. Moving messages to Trash keeps their bytes allocated.
+- For a sending refusal, check recipients used today and the remaining allowance. The bucket uses UTC days. A counter dated in the future holds a metered allowance at zero. A legacy unlimited sending allowance appears as `recipients_remaining: null`.
+- Pending, retry, and processing counts cover outbound queue rows attributed to this hosted mailbox. A suspended mailbox can still have queued deliveries. `outbound_queue: null` means the database has no hosted queue schema to inspect.
+
+The report carries the observation time and an `audit_id`. Each successful report records `hosted.status` in `audit_log` with the effective operator UID and mailbox. The output is restricted to the mailbox identifier, operational state, and aggregate counters. Maildir and reservation counts may change while the daemon is delivering mail.
+
 ---
 
 ## Table of Contents

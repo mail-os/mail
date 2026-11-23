@@ -7,19 +7,55 @@ const maildir_path = @import("../core/maildir_path.zig");
 const durable_maildir = @import("../core/durable_maildir.zig");
 const time = @import("../core/time_compat.zig");
 
+const StorageReservations = struct {
+    pending_delivery_bytes: u64,
+    linked_file_bytes: u64,
+};
+
+fn storageReservations(db: *db_mod.Database, mailbox: []const u8, now: i64) !StorageReservations {
+    return .{
+        .pending_delivery_bytes = try db.reservedDeliveryBytes(mailbox),
+        .linked_file_bytes = try db.linkedFileBytes(mailbox, now),
+    };
+}
+
+fn mailboxRoot(mailbox: []const u8, buffer: []u8) ![:0]u8 {
+    try maildir_path.validate(mailbox);
+    return std.fmt.bufPrintSentinel(buffer, "mail/{s}", .{mailbox}, 0);
+}
+
+pub const ObservedStorage = struct {
+    maildir_bytes: u64,
+    pending_delivery_bytes: u64,
+    linked_file_bytes: u64,
+    remaining_bytes: u64,
+};
+
+/// A host-local observation using the same byte accounting as admission.
+pub fn observeStorage(db: *db_mod.Database, mailbox: []const u8, quota: u64, now: i64) !ObservedStorage {
+    var buffer: [4096]u8 = undefined;
+    const root = try mailboxRoot(mailbox, &buffer);
+    const stored = try countBytes(root, std.math.maxInt(u64), 0);
+    const reserved = try storageReservations(db, mailbox, now);
+    return .{
+        .maildir_bytes = stored,
+        .pending_delivery_bytes = reserved.pending_delivery_bytes,
+        .linked_file_bytes = reserved.linked_file_bytes,
+        .remaining_bytes = quota -| stored -| reserved.pending_delivery_bytes -| reserved.linked_file_bytes,
+    };
+}
+
 /// Call with the mailbox mutation lock held. Credit is the size of a file
 /// replaced in place, so saving a smaller draft works even at the limit.
 pub fn checkStorage(db: *db_mod.Database, user: []const u8, bytes: u64, replaced: ?[]const u8) !void {
     const limits = (try db.hostedLimits(user)) orelse return;
     if (!limits.enabled) return error.HostedRecipientDisabled;
-    try maildir_path.validate(user);
     var root_buf: [4096]u8 = undefined;
-    const root = try std.fmt.bufPrintSentinel(&root_buf, "mail/{s}", .{user}, 0);
+    const root = try mailboxRoot(user, &root_buf);
     const credit = if (replaced) |path| try fs.getFileSize(path) else 0;
     if (bytes <= credit) return;
-    const reserved = try db.reservedDeliveryBytes(user);
-    const linked = try db.linkedFileBytes(user, time.timestamp());
-    const committed = std.math.add(u64, reserved, linked) catch return error.HostedStorageFull;
+    const reserved = try storageReservations(db, user, time.timestamp());
+    const committed = std.math.add(u64, reserved.pending_delivery_bytes, reserved.linked_file_bytes) catch return error.HostedStorageFull;
     const growth = std.math.add(u64, bytes - credit, committed) catch return error.HostedStorageFull;
     if (growth > limits.quota_bytes) return error.HostedStorageFull;
     _ = try countBytes(root, limits.quota_bytes - growth, 0);
