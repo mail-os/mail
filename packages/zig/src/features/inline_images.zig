@@ -8,7 +8,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 //
 // ## Overview
 // Handles inline images embedded in emails using Content-ID (CID) references.
-// Supports parsing, storage, and resolution of inline attachments.
+// Stores and resolves inline attachments. Webmail reads MIME with zig-mime.
 //
 // ## How Inline Images Work
 // 1. Email contains multipart MIME with inline attachments
@@ -315,114 +315,6 @@ pub const InlineImageStats = struct {
     message_count: usize,
 };
 
-/// Parse MIME multipart to extract inline attachments
-pub const MimeInlineParser = struct {
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator) MimeInlineParser {
-        return .{ .allocator = allocator };
-    }
-
-    /// Parse inline attachments from MIME content
-    pub fn parseInlineAttachments(
-        self: *MimeInlineParser,
-        mime_content: []const u8,
-        store: *InlineImageStore,
-        message_id: ?[]const u8,
-    ) !usize {
-        var count: usize = 0;
-
-        // Find boundary
-        const boundary = findBoundary(mime_content) orelse return 0;
-
-        // Split by boundary
-        var parts = std.mem.splitSequence(u8, mime_content, boundary);
-        while (parts.next()) |part| {
-            if (part.len < 10) continue;
-
-            // Check for Content-Disposition: inline or Content-ID
-            const has_inline = std.mem.indexOf(u8, part, "Content-Disposition: inline") != null or
-                std.mem.indexOf(u8, part, "Content-Disposition:inline") != null;
-            const cid_start = std.mem.indexOf(u8, part, "Content-ID:");
-
-            if (has_inline or cid_start != null) {
-                // Extract Content-ID
-                var content_id: ?[]const u8 = null;
-                if (cid_start) |start| {
-                    var end = start + 11;
-                    // Skip whitespace
-                    while (end < part.len and (part[end] == ' ' or part[end] == '\t')) {
-                        end += 1;
-                    }
-                    const cid_end = std.mem.indexOfAnyPos(u8, part, end, "\r\n") orelse part.len;
-                    content_id = std.mem.trim(u8, part[end..cid_end], " \t<>");
-                }
-
-                if (content_id) |cid| {
-                    // Extract Content-Type
-                    var mime_type: []const u8 = "application/octet-stream";
-                    if (std.mem.indexOf(u8, part, "Content-Type:")) |ct_start| {
-                        var ct_end = ct_start + 13;
-                        while (ct_end < part.len and (part[ct_end] == ' ' or part[ct_end] == '\t')) {
-                            ct_end += 1;
-                        }
-                        const ct_line_end = std.mem.indexOfAnyPos(u8, part, ct_end, ";\r\n") orelse part.len;
-                        mime_type = std.mem.trim(u8, part[ct_end..ct_line_end], " \t");
-                    }
-
-                    // Find filename
-                    var filename: []const u8 = "inline_image";
-                    if (std.mem.indexOf(u8, part, "filename=")) |fn_start| {
-                        var fn_end = fn_start + 9;
-                        if (fn_end < part.len and part[fn_end] == '"') {
-                            fn_end += 1;
-                            const fn_close = std.mem.indexOfPos(u8, part, fn_end, "\"") orelse part.len;
-                            filename = part[fn_end..fn_close];
-                        }
-                    }
-
-                    // Find body (after double CRLF)
-                    if (std.mem.indexOf(u8, part, "\r\n\r\n")) |body_start| {
-                        var body = part[body_start + 4 ..];
-                        // Trim trailing boundary markers
-                        if (std.mem.lastIndexOf(u8, body, "\r\n--")) |trim_end| {
-                            body = body[0..trim_end];
-                        }
-
-                        // Check if base64 encoded
-                        const is_base64 = std.mem.indexOf(u8, part[0..body_start], "base64") != null;
-
-                        if (is_base64) {
-                            // Decode base64
-                            const clean_body = removeWhitespace(self.allocator, body) catch continue;
-                            defer self.allocator.free(clean_body);
-
-                            const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(clean_body) catch continue;
-                            const decoded = self.allocator.alloc(u8, decoded_size) catch continue;
-                            defer self.allocator.free(decoded);
-
-                            const actual_len = std.base64.standard.Decoder.decode(decoded, clean_body) catch continue;
-
-                            store.store(cid, filename, mime_type, decoded[0..actual_len], message_id) catch continue;
-                        } else {
-                            // Store raw
-                            store.store(cid, filename, mime_type, body, message_id) catch continue;
-                        }
-
-                        count += 1;
-                    }
-                }
-            }
-        }
-
-        return count;
-    }
-};
-
-// =============================================================================
-// Helper Functions
-// =============================================================================
-
 /// Parse Content-ID, removing angle brackets
 pub fn parseContentId(raw: []const u8) []const u8 {
     var result = raw;
@@ -433,38 +325,6 @@ pub fn parseContentId(raw: []const u8) []const u8 {
         result = result[0 .. result.len - 1];
     }
     return std.mem.trim(u8, result, " \t");
-}
-
-/// Find MIME boundary from Content-Type header
-fn findBoundary(content: []const u8) ?[]const u8 {
-    const boundary_start = std.mem.indexOf(u8, content, "boundary=") orelse return null;
-    var start = boundary_start + 9;
-
-    // Skip quotes if present
-    if (start < content.len and content[start] == '"') {
-        start += 1;
-        const end = std.mem.indexOfPos(u8, content, start, "\"") orelse return null;
-        return content[start..end];
-    }
-
-    // Find end (semicolon, space, or newline)
-    const end = std.mem.indexOfAnyPos(u8, content, start, "; \r\n") orelse content.len;
-    return content[start..end];
-}
-
-/// Remove whitespace from base64 content
-fn removeWhitespace(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var result = try allocator.alloc(u8, input.len);
-    var len: usize = 0;
-
-    for (input) |c| {
-        if (c != ' ' and c != '\t' and c != '\r' and c != '\n') {
-            result[len] = c;
-            len += 1;
-        }
-    }
-
-    return allocator.realloc(result, len);
 }
 
 /// Generate a Content-ID for a new inline image

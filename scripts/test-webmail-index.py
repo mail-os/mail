@@ -68,10 +68,15 @@ def run(binary, previous):
                 custom = message(owner, 12, body='Quoted term "field notes" and an asterisk *')
                 custom.set_content("<p>Quoted term &quot;field notes&quot; and an asterisk *</p>", subtype="html")
                 custom.add_attachment(PAYLOAD, maintype="application", subtype="octet-stream", filename="résumé.txt")
-                assert imap.append("Research", None, None, custom.as_bytes(policy=SMTP))[0] == "OK"
+                source = custom.as_bytes(policy=SMTP).replace(
+                    b"Subject: Research note 12\r\n", b"Subject: =?ISO-8859-1?Q?Caf=E9_note?=\r\n",
+                )
+                assert imap.append("Research", None, None, source)[0] == "OK"
             with test.imap(foreign) as imap:
                 secret = message(foreign, 1, subject="Bob private research", body="Needle point for March analysis.", files=("bob-private.csv",))
                 assert imap.append("INBOX", None, None, secret.as_bytes(policy=SMTP))[0] == "OK"
+            # Persist a real index row before the upgrade, while the raw message stays unchanged.
+            assert items(test.login(owner), q="field notes", folder="Research")["index"]["indexed"] == 1
         test.binary = binary
 
         with test.daemon():
@@ -93,6 +98,7 @@ def run(binary, previous):
             oldest = filtered["items"][0]
             assert items(alice, **dict(params, conversations="true"))["threads"][0]["matching"] == 1
             assert items(alice, q='"field notes"', folder="Research")["total"] == 1
+            assert items(alice, q="field notes", folder="Research")["items"][0]["subject"] == "Café note"
             direct = items(alice, "search", q='"field notes"', folder="Research")
             assert direct["total"] == 1 and isinstance(direct["items"][0]["date"], int), direct
             unicode_file = items(alice, "attachments", folder="Research", filename="résumé")["items"][0]
@@ -181,7 +187,7 @@ def run(binary, previous):
             assert download(alice, last_download)[1] == PAYLOAD
             test.provision("alice", enabled=False)
             download(alice, last_download, 401)
-            print("Verified index persistence, in-place Maildir changes, pruning, and revocation of stale downloads.")
+            print("Verified index persistence, MIME metadata refresh, in-place Maildir changes, pruning, and revocation of stale downloads.")
 
 
 if __name__ == "__main__":

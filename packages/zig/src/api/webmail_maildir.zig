@@ -29,6 +29,8 @@ const attention = @import("webmail_attention.zig");
 const calendar_invite = @import("webmail_calendar_invite.zig");
 const search_index = @import("webmail_index.zig");
 const html_text = @import("../antispam/html_text.zig");
+const mime_lib = @import("../message/mime.zig").lib;
+const webmail_mime = @import("webmail_mime.zig");
 const thread_ids = @import("../message/thread_ids.zig");
 const typesense = @import("../search/typesense.zig");
 const ascii_compat = @import("ascii-compat");
@@ -152,13 +154,7 @@ pub fn isPersonalFolder(folder: []const u8) bool {
     return true;
 }
 
-pub const AttachmentInfo = struct {
-    filename: []const u8,
-    content_type: []const u8,
-    size: usize,
-    data: []const u8 = "",
-    content_id: []const u8 = "",
-};
+pub const AttachmentInfo = webmail_mime.AttachmentInfo;
 
 /// Validate a folder name against path traversal and separators. We only allow
 /// the standard set plus simple alphanumeric user folders.
@@ -195,7 +191,9 @@ pub const FileRef = struct {
     name: []const u8,
 };
 
-const BodyMode = enum { preview, metadata, full, calendar };
+const extractBody = webmail_mime.extract;
+const BodyParts = webmail_mime.BodyParts;
+pub const inspectAttachment = webmail_mime.inspectAttachment;
 
 /// Collect the message files for a folder, in stable IMAP order. The returned
 /// slices are arena-allocated.
@@ -648,7 +646,8 @@ fn queryIndexed(a: std.mem.Allocator, db: *database.Database, user: []const u8, 
             };
             const doc = document: {
                 if (cached.get(basename)) |item| {
-                    if (std.mem.eql(u8, item.fingerprint, identity.fingerprint)) break :document item;
+                    if (std.mem.startsWith(u8, item.fingerprint, index_fingerprint_prefix) and
+                        std.mem.eql(u8, item.fingerprint[index_fingerprint_prefix.len..], identity.fingerprint)) break :document item;
                 }
                 if (remaining == 0) {
                     progress.total += 1;
@@ -762,6 +761,9 @@ fn contains(value: []const u8, needle: []const u8) bool {
     return needle.len == 0 or ascii_compat.indexOfIgnoreCase(value, needle) != null;
 }
 
+// Reconcile cached headers, text and attachment indexes after the MIME parser changes.
+const index_fingerprint_prefix = "mime-v2:";
+
 fn indexFile(a: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, basename: []const u8, path: []const u8, fingerprint: []const u8, query: []const u8) !?search_index.Document {
     const raw = fs_compat.readFileAlloc(a, path) catch |err| switch (err) {
         error.FileNotFound => return null,
@@ -780,7 +782,7 @@ fn indexFile(a: std.mem.Allocator, db: *database.Database, user: []const u8, fol
         });
     }
     const doc: search_index.Document = .{
-        .fingerprint = fingerprint,
+        .fingerprint = try std.mem.concat(a, u8, &.{ index_fingerprint_prefix, fingerprint }),
         .digest = message_refs.digest(raw),
         .sender = headers.from,
         .recipient = headers.to,
@@ -1544,98 +1546,52 @@ const HeaderSet = struct {
     content_type: []const u8 = "",
 };
 
-const BodyParts = struct {
-    text: []const u8 = "",
-    html: []const u8 = "",
-    has_attachments: bool = false,
-    attachments: []const AttachmentInfo = &[_]AttachmentInfo{},
-    calendar_parts: []const calendar_invite.Part = &.{},
-};
-
-/// Find the end of the header block (the blank line). Returns the index just
-/// past the CRLF CRLF (or LF LF), or raw.len if no body.
-fn headerEnd(raw: []const u8) usize {
-    if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |i| return i + 4;
-    if (std.mem.indexOf(u8, raw, "\n\n")) |i| return i + 2;
-    return raw.len;
+fn mimeHeaders(a: std.mem.Allocator, raw: []const u8) !mime_lib.Headers {
+    var pos: usize = 0;
+    var end = raw.len;
+    while (std.mem.indexOfScalarPos(u8, raw, pos, '\n')) |nl| {
+        if (nl == pos or (nl == pos + 1 and raw[pos] == '\r')) {
+            end = pos;
+            break;
+        }
+        pos = nl + 1;
+    }
+    return .{ .block = mime_lib.headers.unfold(try a.dupe(u8, raw[0..end])) };
 }
 
-/// Unfold a header value (RFC 5322 folding: a CRLF followed by WSP is a single
-/// space) and trim. Arena-allocated.
-fn unfold(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    while (i < value.len) : (i += 1) {
-        const c = value[i];
-        if (c == '\r') continue;
-        if (c == '\n') {
-            // Folded continuation if next is WSP; collapse to a space.
-            if (i + 1 < value.len and (value[i + 1] == ' ' or value[i + 1] == '\t')) {
-                try out.append(allocator, ' ');
-                // Skip the following run of WSP.
-                while (i + 1 < value.len and (value[i + 1] == ' ' or value[i + 1] == '\t')) : (i += 1) {}
-                continue;
-            }
-            break; // unfolded end of value
-        }
-        try out.append(allocator, c);
-    }
-    return std.mem.trim(u8, try out.toOwnedSlice(allocator), " \t");
-}
-
-/// Case-insensitive header lookup over the header block. Returns the unfolded,
-/// decoded value, or "".
-fn getHeader(allocator: std.mem.Allocator, header_block: []const u8, name: []const u8) ![]const u8 {
-    var line_start: usize = 0;
-    while (line_start < header_block.len) {
-        // Find end of this logical line (account for folding).
-        var line_end = std.mem.indexOfScalarPos(u8, header_block, line_start, '\n') orelse header_block.len;
-        // Extend over folded continuations.
-        while (line_end + 1 < header_block.len and (header_block[line_end + 1] == ' ' or header_block[line_end + 1] == '\t')) {
-            line_end = std.mem.indexOfScalarPos(u8, header_block, line_end + 1, '\n') orelse header_block.len;
-        }
-        const line = header_block[line_start..line_end];
-        if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
-            const key = std.mem.trim(u8, line[0..colon], " \t");
-            if (std.ascii.eqlIgnoreCase(key, name)) {
-                const raw_val = line[colon + 1 ..];
-                const unfolded = try unfold(allocator, raw_val);
-                return decodeMimeWords(allocator, unfolded) catch unfolded;
-            }
-        }
-        line_start = line_end + 1;
-    }
-    return "";
+fn decodeMimeWords(a: std.mem.Allocator, value: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, value, "=?") == null) return value;
+    const buffer = try a.alloc(u8, value.len * 3);
+    return mime_lib.decodeWords(value, buffer).text;
 }
 
 pub fn mimeHeader(a: std.mem.Allocator, raw: []const u8, name: []const u8) ![]const u8 {
-    return getHeader(a, raw[0..headerEnd(raw)], name);
+    const headers = try mimeHeaders(a, raw);
+    const value = headers.get(name) orelse "";
+    if (std.ascii.eqlIgnoreCase(name, "Subject") or std.ascii.eqlIgnoreCase(name, "From") or std.ascii.eqlIgnoreCase(name, "Reply-To"))
+        return decodeMimeWords(a, value);
+    return value;
 }
 
-fn parseHeaders(allocator: std.mem.Allocator, raw: []const u8) !HeaderSet {
-    const he = headerEnd(raw);
-    const block = raw[0..he];
-    return HeaderSet{
-        .from = try getHeader(allocator, block, "From"),
-        .to = try getHeader(allocator, block, "To"),
-        .cc = try getHeader(allocator, block, "Cc"),
-        .bcc = try getHeader(allocator, block, "Bcc"),
-        .reply_to = try getHeader(allocator, block, "Reply-To"),
-        .in_reply_to = try getHeader(allocator, block, "In-Reply-To"),
-        .references = try getHeader(allocator, block, "References"),
-        .subject = try getHeader(allocator, block, "Subject"),
-        .date = try getHeader(allocator, block, "Date"),
-        .message_id = try getHeader(allocator, block, "Message-ID"),
-        .content_type = try getHeader(allocator, block, "Content-Type"),
+fn parseHeaders(a: std.mem.Allocator, raw: []const u8) !HeaderSet {
+    const block = try mimeHeaders(a, raw);
+    return .{
+        .from = try decodeMimeWords(a, block.get("From") orelse ""),
+        .to = try decodeMimeWords(a, block.get("To") orelse ""),
+        .cc = try decodeMimeWords(a, block.get("Cc") orelse ""),
+        .bcc = try decodeMimeWords(a, block.get("Bcc") orelse ""),
+        .reply_to = try decodeMimeWords(a, block.get("Reply-To") orelse ""),
+        .in_reply_to = block.get("In-Reply-To") orelse "",
+        .references = block.get("References") orelse "",
+        .subject = try decodeMimeWords(a, block.get("Subject") orelse ""),
+        .date = block.get("Date") orelse "",
+        .message_id = block.get("Message-ID") orelse "",
+        .content_type = block.get("Content-Type") orelse "",
     };
 }
 
-/// Extract the best text and html body parts. Handles:
-///   - single-part text/plain or text/html
-///   - simple multipart/* (splits on boundary, picks text + html parts)
-/// Quoted-printable and base64 transfer encodings are decoded for text parts.
-fn extractBestBody(allocator: std.mem.Allocator, raw: []const u8) !BodyParts {
-    return extractBody(allocator, raw, .full);
+fn extractBestBody(a: std.mem.Allocator, raw: []const u8) !BodyParts {
+    return extractBody(a, raw, .full);
 }
 
 /// Use the same MIME boundaries and transfer rules as the message reader
@@ -1650,198 +1606,6 @@ pub fn calendarRevisions(a: std.mem.Allocator, raw: []const u8, attendee: []cons
     return revisions.items;
 }
 
-fn extractBody(allocator: std.mem.Allocator, raw: []const u8, mode: BodyMode) !BodyParts {
-    const he = headerEnd(raw);
-    const header_block = raw[0..he];
-    const body = if (he < raw.len) raw[he..] else "";
-
-    const ctype = try getHeader(allocator, header_block, "Content-Type");
-    var parts: std.ArrayList(calendar_invite.Part) = .empty;
-
-    if (std.ascii.startsWithIgnoreCase(ctype, "multipart/")) {
-        var parsed = try parseMultipartMode(allocator, ctype, body, 0, mode, &parts);
-        parsed.calendar_parts = parts.items;
-        return parsed;
-    }
-
-    const cte = try getHeader(allocator, header_block, "Content-Transfer-Encoding");
-    if (mode == .full or mode == .calendar) try captureCalendarPart(allocator, &parts, ctype, cte, body);
-    if (mode == .calendar) return .{ .calendar_parts = parts.items };
-    if (try attachmentName(allocator, header_block, ctype)) |name| {
-        if (mode == .preview) return .{ .has_attachments = true };
-        const files = try allocator.alloc(AttachmentInfo, 1);
-        files[0] = try readAttachment(allocator, body, ctype, cte, name, mode);
-        return .{ .has_attachments = true, .attachments = files, .calendar_parts = parts.items };
-    }
-    const decoded = decodeBody(allocator, body, cte) catch body;
-    if (ascii_compat.indexOfIgnoreCase(ctype, "text/html") != null) {
-        return BodyParts{ .html = decoded, .text = "" };
-    }
-    return .{ .text = decoded, .calendar_parts = parts.items };
-}
-
-/// Cap on nested multipart depth. A crafted message with deeply nested
-/// multipart/* parts would otherwise recurse until the handler thread's stack
-/// overflows. Real mail nests 2-3 levels; 10 is generous.
-const max_multipart_depth = 10;
-
-const MultipartBoundary = struct { start: usize, after: usize, closes: bool };
-
-fn nextMultipartBoundary(body: []const u8, delimiter: []const u8, from: usize) ?MultipartBoundary {
-    var offset = from;
-    while (std.mem.indexOfPos(u8, body, offset, delimiter)) |start| {
-        offset = start + delimiter.len;
-        if (start != 0 and body[start - 1] != '\n') continue;
-        const end = std.mem.indexOfScalarPos(u8, body, offset, '\n') orelse body.len;
-        const tail = std.mem.trimEnd(u8, body[offset..end], " \t\r");
-        if (tail.len == 0 or std.mem.eql(u8, tail, "--"))
-            return .{ .start = start, .after = @min(end + 1, body.len), .closes = tail.len != 0 };
-    }
-    return null;
-}
-
-fn parseMultipartMode(allocator: std.mem.Allocator, ctype: []const u8, body: []const u8, depth: u32, mode: BodyMode, calendar_parts: *std.ArrayList(calendar_invite.Part)) !BodyParts {
-    // Bound recursion: beyond the cap, treat the remainder as opaque text.
-    if (depth >= max_multipart_depth) return BodyParts{ .text = body };
-
-    const boundary = extractBoundary(ctype) orelse return BodyParts{ .text = body };
-    // A null/empty boundary would make delim "--", splitting on every "--" run
-    // and spawning spurious parts. Treat as single-part.
-    if (boundary.len == 0) return BodyParts{ .text = body };
-    const delim = try std.fmt.allocPrint(allocator, "--{s}", .{boundary});
-
-    var result = BodyParts{};
-    var attachments: std.ArrayList(AttachmentInfo) = .empty;
-
-    var marker = nextMultipartBoundary(body, delim, 0) orelse return .{ .text = body };
-    while (!marker.closes) {
-        const next = nextMultipartBoundary(body, delim, marker.after);
-        const part = std.mem.trim(u8, body[marker.after..if (next) |boundary_line| boundary_line.start else body.len], "\r\n");
-        marker = next orelse .{ .start = body.len, .after = body.len, .closes = true };
-        if (part.len == 0) continue;
-
-        const phe = headerEnd(part);
-        const part_headers = part[0..phe];
-        const part_body = if (phe < part.len) part[phe..] else "";
-
-        const pct = try getHeader(allocator, part_headers, "Content-Type");
-        const pcte = try getHeader(allocator, part_headers, "Content-Transfer-Encoding");
-        if ((mode == .full or mode == .calendar) and next != null)
-            try captureCalendarPart(allocator, calendar_parts, pct, pcte, part_body);
-        const name = try attachmentName(allocator, part_headers, pct);
-        if (mode == .calendar) {
-            if (name == null and std.ascii.startsWithIgnoreCase(pct, "multipart/"))
-                _ = try parseMultipartMode(allocator, pct, part_body, depth + 1, mode, calendar_parts);
-            continue;
-        }
-        if (name) |attachment_name| {
-            result.has_attachments = true;
-            if (mode != .preview) try attachments.append(allocator, try readAttachment(allocator, part_body, pct, pcte, attachment_name, mode));
-            continue;
-        }
-
-        if (ascii_compat.indexOfIgnoreCase(pct, "text/html") != null and result.html.len == 0) {
-            result.html = decodeBody(allocator, part_body, pcte) catch part_body;
-        } else if (ascii_compat.indexOfIgnoreCase(pct, "text/plain") != null and result.text.len == 0) {
-            result.text = decodeBody(allocator, part_body, pcte) catch part_body;
-        } else if (std.ascii.startsWithIgnoreCase(pct, "multipart/")) {
-            // Nested multipart (e.g. multipart/alternative inside multipart/mixed).
-            const nested = parseMultipartMode(allocator, pct, part_body, depth + 1, mode, calendar_parts) catch BodyParts{};
-            if (result.text.len == 0) result.text = nested.text;
-            if (result.html.len == 0) result.html = nested.html;
-            if (nested.has_attachments) result.has_attachments = true;
-            try attachments.appendSlice(allocator, nested.attachments);
-        }
-    }
-
-    result.attachments = try attachments.toOwnedSlice(allocator);
-    return result;
-}
-
-fn captureCalendarPart(a: std.mem.Allocator, parts: *std.ArrayList(calendar_invite.Part), mime: []const u8, encoding: []const u8, raw: []const u8) !void {
-    if (parts.items.len >= calendar_invite.max_parts or raw.len > calendar_invite.max_part_bytes * 4) return;
-    const method = calendar_invite.mimeMethod(mime) orelse return;
-    const decoded = if (std.ascii.eqlIgnoreCase(encoding, "base64")) decodeBase64(a, raw) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return,
-    } else if (std.ascii.eqlIgnoreCase(encoding, "quoted-printable"))
-        try decodeQuotedPrintable(a, raw)
-    else if (encoding.len == 0 or std.ascii.eqlIgnoreCase(encoding, "7bit") or std.ascii.eqlIgnoreCase(encoding, "8bit") or std.ascii.eqlIgnoreCase(encoding, "binary"))
-        raw
-    else
-        return;
-    const body = std.mem.trimEnd(u8, decoded, "\r\n");
-    if (body.len == 0 or body.len > calendar_invite.max_part_bytes) return;
-    for (parts.items) |part| {
-        if (part.method == method and std.mem.eql(u8, part.body, body)) return;
-    }
-    try parts.append(a, .{ .method = method, .body = body });
-}
-
-const AttachmentName = struct { filename: []const u8, id: []const u8 };
-
-/// Read one already-framed MIME entity using the same file conventions as webmail.
-pub fn inspectAttachment(a: std.mem.Allocator, raw: []const u8, include_data: bool) !?AttachmentInfo {
-    const end = headerEnd(raw);
-    const headers = raw[0..end];
-    const mime = try getHeader(a, headers, "Content-Type");
-    const name = (try attachmentName(a, headers, mime)) orelse return null;
-    const encoding = try getHeader(a, headers, "Content-Transfer-Encoding");
-    var info = try readAttachment(a, raw[end..], mime, encoding, name, if (include_data) .full else .metadata);
-    info.content_id = contentId(try getHeader(a, headers, "Content-ID"));
-    return info;
-}
-
-fn attachmentName(a: std.mem.Allocator, headers: []const u8, mime: []const u8) !?AttachmentName {
-    const disposition = try getHeader(a, headers, "Content-Disposition");
-    const id = if (std.ascii.startsWithIgnoreCase(mime, "image/"))
-        contentId(try getHeader(a, headers, "Content-ID"))
-    else
-        "";
-    const extended = try extractParam(a, disposition, "filename*");
-    if (extended.len > 0) {
-        if (std.mem.indexOfScalar(u8, extended, '\'')) |charset_end| {
-            if (std.mem.indexOfScalarPos(u8, extended, charset_end + 1, '\'')) |lang_end| {
-                const encoded = extended[lang_end + 1 ..];
-                const decoded = std.Uri.percentDecodeBackwards(try a.alloc(u8, encoded.len), encoded);
-                if (decoded.len > 0 and std.unicode.utf8ValidateSlice(decoded)) return .{ .filename = decoded, .id = id };
-            }
-        }
-    }
-    const filename = try extractParam(a, disposition, "filename");
-    if (filename.len > 0) return .{ .filename = filename, .id = id };
-    if (!std.ascii.startsWithIgnoreCase(mime, "multipart/")) {
-        const name = try extractParam(a, mime, "name");
-        if (name.len > 0) return .{ .filename = name, .id = id };
-    }
-    if (id.len > 0) return .{ .filename = "inline-image", .id = id };
-    const separator = std.mem.indexOfScalar(u8, disposition, ';') orelse disposition.len;
-    const kind = std.mem.trim(u8, disposition[0..separator], " \t");
-    if (std.ascii.eqlIgnoreCase(kind, "attachment")) return .{ .filename = "attachment", .id = "" };
-    return null;
-}
-
-fn readAttachment(a: std.mem.Allocator, raw: []const u8, mime: []const u8, encoding: []const u8, name: AttachmentName, mode: BodyMode) !AttachmentInfo {
-    const data = if (mode == .full) try decodeBody(a, raw, encoding) else "";
-    return .{
-        .filename = name.filename,
-        .content_type = if (mime.len > 0) mime else "application/octet-stream",
-        .size = if (mode == .full) data.len else try attachmentSize(a, raw, encoding),
-        .data = data,
-        .content_id = name.id,
-    };
-}
-
-fn contentId(s: []const u8) []const u8 {
-    const trimmed = std.mem.trim(u8, s, " \t\r\n");
-    const id = if (trimmed.len >= 2 and trimmed[0] == '<' and trimmed[trimmed.len - 1] == '>') trimmed[1 .. trimmed.len - 1] else trimmed;
-    if (id.len > 320) return "";
-    for (id) |byte| {
-        if (!std.ascii.isPrint(byte) or byte == ' ' or byte == '<' or byte == '>') return "";
-    }
-    return id;
-}
-
 pub fn embeddedImageType(att: AttachmentInfo) ?[]const u8 {
     if (att.content_id.len == 0 or att.data.len == 0 or att.data.len > 2 * 1024 * 1024) return null;
     const end = std.mem.indexOfScalar(u8, att.content_type, ';') orelse att.content_type.len;
@@ -1853,206 +1617,6 @@ pub fn embeddedImageType(att: AttachmentInfo) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(mime, "image/webp") and data.len >= 12 and std.mem.eql(u8, data[0..4], "RIFF") and std.mem.eql(u8, data[8..12], "WEBP")) return "image/webp";
     if (std.ascii.eqlIgnoreCase(mime, "image/avif") and data.len >= 12 and std.mem.eql(u8, data[4..12], "ftypavif")) return "image/avif";
     return null;
-}
-
-// RFC 2046: a boundary is at most 70 characters. Capping it prevents a crafted
-// unterminated quoted boundary from becoming a huge delimiter, which would make
-// splitSequence O(body.len * boundary.len) — a quadratic-CPU DoS on one email.
-const max_boundary_len = 70;
-
-fn extractBoundary(ctype: []const u8) ?[]const u8 {
-    const idx = ascii_compat.indexOfIgnoreCase(ctype, "boundary=") orelse return null;
-    var v = ctype[idx + "boundary=".len ..];
-    if (v.len > 0 and v[0] == '"') {
-        v = v[1..];
-        if (std.mem.indexOfScalar(u8, v, '"')) |end| {
-            if (end > max_boundary_len) return null;
-            return v[0..end];
-        }
-        // Unterminated quoted boundary — reject rather than swallow the rest.
-        return null;
-    }
-    // Unquoted: ends at ; or whitespace.
-    var end: usize = 0;
-    while (end < v.len and v[end] != ';' and v[end] != ' ' and v[end] != '\t' and v[end] != '\r' and v[end] != '\n') : (end += 1) {}
-    if (end == 0 or end > max_boundary_len) return null;
-    return v[0..end];
-}
-
-/// Extract a parameter value like filename="x" from a header value.
-fn extractParam(allocator: std.mem.Allocator, header_val: []const u8, param: []const u8) ![]const u8 {
-    const needle = try std.fmt.allocPrint(allocator, "{s}=", .{param});
-    const idx = ascii_compat.indexOfIgnoreCase(header_val, needle) orelse return "";
-    var v = header_val[idx + needle.len ..];
-    if (v.len > 0 and v[0] == '"') {
-        var decoded: std.ArrayList(u8) = .empty;
-        var i: usize = 1;
-        while (i < v.len) : (i += 1) {
-            if (v[i] == '"') break;
-            if (v[i] == '\\' and i + 1 < v.len) i += 1;
-            try decoded.append(allocator, v[i]);
-        }
-        return decoded.toOwnedSlice(allocator);
-    }
-    var end: usize = 0;
-    while (end < v.len and v[end] != ';' and v[end] != ' ' and v[end] != '\r' and v[end] != '\n') : (end += 1) {}
-    return v[0..end];
-}
-
-/// Decode a body per Content-Transfer-Encoding. Falls back to the raw bytes.
-fn decodeBody(allocator: std.mem.Allocator, body: []const u8, cte: []const u8) ![]const u8 {
-    if (ascii_compat.indexOfIgnoreCase(cte, "base64") != null) {
-        return decodeBase64(allocator, body) catch body;
-    }
-    if (ascii_compat.indexOfIgnoreCase(cte, "quoted-printable") != null) {
-        return decodeQuotedPrintable(allocator, body) catch body;
-    }
-    return body;
-}
-
-fn attachmentSize(a: std.mem.Allocator, body: []const u8, cte: []const u8) !usize {
-    if (ascii_compat.indexOfIgnoreCase(cte, "base64") == null) return (try decodeBody(a, body, cte)).len;
-    var length: usize = 0;
-    var padding: usize = 0;
-    var last: u8 = 0;
-    for (body) |c| switch (c) {
-        ' ', '\t', '\r', '\n' => continue,
-        '=' => padding += 1,
-        else => {
-            if (padding != 0) return body.len;
-            last = @intCast(std.mem.indexOfScalar(u8, &std.base64.standard_alphabet_chars, c) orelse return body.len);
-            length += 1;
-        },
-    };
-    if (padding > 2 or (length + padding) % 4 != 0 or (padding == 1 and last % 4 != 0) or
-        (padding == 2 and last % 16 != 0)) return body.len;
-    return length * 6 / 8;
-}
-
-fn decodeBase64(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
-    // Strip whitespace/newlines before decoding.
-    var clean: std.ArrayList(u8) = .empty;
-    for (body) |c| {
-        if (c == '\r' or c == '\n' or c == ' ' or c == '\t') continue;
-        try clean.append(allocator, c);
-    }
-    const cleaned = try clean.toOwnedSlice(allocator);
-    const decoder = std.base64.standard.Decoder;
-    const len = decoder.calcSizeForSlice(cleaned) catch return body;
-    const out = try allocator.alloc(u8, len);
-    decoder.decode(out, cleaned) catch return body;
-    return out;
-}
-
-fn decodeQuotedPrintable(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    while (i < body.len) : (i += 1) {
-        const c = body[i];
-        if (c == '=' and i + 2 < body.len) {
-            // Soft line break "=\r\n" or "=\n"
-            if (body[i + 1] == '\r' and body[i + 2] == '\n') {
-                i += 2;
-                continue;
-            }
-            if (body[i + 1] == '\n') {
-                i += 1;
-                continue;
-            }
-            const hi = hexVal(body[i + 1]);
-            const lo = hexVal(body[i + 2]);
-            if (hi != null and lo != null) {
-                try out.append(allocator, hi.? * 16 + lo.?);
-                i += 2;
-                continue;
-            }
-        }
-        try out.append(allocator, c);
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-fn hexVal(c: u8) ?u8 {
-    return switch (c) {
-        '0'...'9' => c - '0',
-        'A'...'F' => c - 'A' + 10,
-        'a'...'f' => c - 'a' + 10,
-        else => null,
-    };
-}
-
-/// Decode RFC 2047 encoded-words in a header (=?charset?B?...?= / ?Q?...?=).
-/// Best-effort: only the encoded-word payloads are decoded; charset is ignored
-/// (assumed UTF-8/Latin-1 compatible for display).
-fn decodeMimeWords(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
-    if (std.mem.indexOf(u8, value, "=?") == null) return value;
-
-    var out: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    while (i < value.len) {
-        if (i + 1 < value.len and value[i] == '=' and value[i + 1] == '?') {
-            // Parse =?charset?enc?text?=
-            const start = i + 2;
-            const q1 = std.mem.indexOfScalarPos(u8, value, start, '?') orelse {
-                try out.append(allocator, value[i]);
-                i += 1;
-                continue;
-            };
-            if (q1 + 2 >= value.len or value[q1 + 2] != '?') {
-                try out.append(allocator, value[i]);
-                i += 1;
-                continue;
-            }
-            const enc = value[q1 + 1];
-            const text_start = q1 + 3;
-            const end = std.mem.indexOfPos(u8, value, text_start, "?=") orelse {
-                try out.append(allocator, value[i]);
-                i += 1;
-                continue;
-            };
-            const encoded = value[text_start..end];
-            const decoded = switch (enc) {
-                'B', 'b' => decodeBase64(allocator, encoded) catch encoded,
-                'Q', 'q' => decodeEncodedWordQ(allocator, encoded) catch encoded,
-                else => encoded,
-            };
-            try out.appendSlice(allocator, decoded);
-            i = end + 2;
-            // RFC 2047: whitespace between adjacent encoded-words is folding,
-            // not part of the decoded header value.
-            var next = i;
-            while (next < value.len and std.ascii.isWhitespace(value[next])) next += 1;
-            if (std.mem.startsWith(u8, value[next..], "=?")) i = next;
-        } else {
-            try out.append(allocator, value[i]);
-            i += 1;
-        }
-    }
-    return out.toOwnedSlice(allocator);
-}
-
-/// RFC 2047 "Q" encoding: like quoted-printable but '_' means space.
-fn decodeEncodedWordQ(allocator: std.mem.Allocator, encoded: []const u8) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    var i: usize = 0;
-    while (i < encoded.len) : (i += 1) {
-        const c = encoded[i];
-        if (c == '_') {
-            try out.append(allocator, ' ');
-        } else if (c == '=' and i + 2 < encoded.len) {
-            const hi = hexVal(encoded[i + 1]);
-            const lo = hexVal(encoded[i + 2]);
-            if (hi != null and lo != null) {
-                try out.append(allocator, hi.? * 16 + lo.?);
-                i += 2;
-            } else {
-                try out.append(allocator, c);
-            }
-        } else {
-            try out.append(allocator, c);
-        }
-    }
-    return out.toOwnedSlice(allocator);
 }
 
 /// Build a short plain-text snippet from a body, collapsing whitespace.
@@ -2092,7 +1656,7 @@ test "isValidFolderName accepts standard and simple, rejects traversal" {
 test "parseHeaders extracts and unfolds" {
     const t = std.testing;
     // Arena: this module is designed for arena allocation (the HTTP layer frees
-    // wholesale). unfold()/trim return sub-slices, so individual frees are unsafe
+    // wholesale). Header lookup returns sub-slices, so individual frees are unsafe
     // by design — the arena owns everything.
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
@@ -2143,15 +1707,6 @@ test "extractBestBody multipart alternative picks text and html" {
     try t.expect(std.mem.indexOf(u8, b.html, "html version") != null);
 }
 
-test "quoted-printable decode" {
-    const t = std.testing;
-    var arena = std.heap.ArenaAllocator.init(t.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const decoded = try decodeQuotedPrintable(a, "Hi=20there=3D");
-    try t.expectEqualStrings("Hi there=", decoded);
-}
-
 test "mime encoded-word Q and B decode" {
     const t = std.testing;
     var arena = std.heap.ArenaAllocator.init(t.allocator);
@@ -2168,21 +1723,6 @@ test "snippet collapses whitespace and caps length" {
     const a = arena.allocator();
     const s = try makeSnippet(a, "  hello\r\n\r\n   world  ");
     try t.expectEqualStrings("hello world", s);
-}
-
-test "extractBoundary rejects oversized and unterminated boundaries" {
-    const t = std.testing;
-    // Normal quoted boundary.
-    try t.expectEqualStrings("XYZ", extractBoundary("multipart/mixed; boundary=\"XYZ\"").?);
-    // Unquoted boundary.
-    try t.expectEqualStrings("abc", extractBoundary("multipart/mixed; boundary=abc").?);
-    // Unterminated quoted boundary -> rejected (would otherwise become a huge delimiter).
-    try t.expect(extractBoundary("multipart/mixed; boundary=\"aaaaaaaaaa") == null);
-    // Over 70 chars -> rejected.
-    const long = "multipart/mixed; boundary=" ++ @as([80]u8, @splat('a'));
-    try t.expect(extractBoundary(long) == null);
-    // Missing boundary -> null.
-    try t.expect(extractBoundary("multipart/mixed") == null);
 }
 
 test "parseMultipart bounds recursion on deeply nested input" {
