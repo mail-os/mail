@@ -384,9 +384,11 @@ onUnmounted(() => { destroy(); destroyReminders() })
         <button :for="mode in calendarViews" class="wm-action" @click="showView(mode.id)" :aria-pressed="!searchTerm && view === mode.id" :text="mode.name"></button>
       </div>
       <div :if="!searchTerm" class="calendar-choices calendar-period" role="group" aria-label="Change date range">
-        <button class="wm-action calendar-arrow" @click="shiftView(-1)" aria-label="Previous period"><span class="mail-icon" data-icon="left" aria-hidden="true"></span></button>
-        <button class="wm-action" @click="goToToday()">Today</button>
-        <button class="wm-action calendar-arrow" @click="shiftView(1)" aria-label="Next period"><span class="mail-icon" data-icon="right" aria-hidden="true"></span></button>
+        <div class="calendar-period-buttons">
+          <button class="wm-action calendar-arrow" @click="shiftView(-1)" aria-label="Previous period"><span class="mail-icon" data-icon="left" aria-hidden="true"></span></button>
+          <button class="wm-action calendar-today" @click="goToToday()">Today</button>
+          <button class="wm-action calendar-arrow" @click="shiftView(1)" aria-label="Next period"><span class="mail-icon" data-icon="right" aria-hidden="true"></span></button>
+        </div>
         <input type="date" aria-label="Jump to date" :value="focusDay" @change="changeDate($event)">
       </div>
       <label class="calendar-zone">Display time zone

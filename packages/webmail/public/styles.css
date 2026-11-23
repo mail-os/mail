@@ -557,6 +557,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-dot { flex: 0 0 .55rem; height: .55rem; border-radius: 50%; }
 .calendar-view-toolbar { padding: 8px; background: var(--toolbar); border: 1px solid var(--border); border-radius: var(--control-radius); }
 .calendar-period, .calendar-view-modes { gap: 6px; }
+.calendar-period-buttons { display: flex; align-items: center; gap: 6px; }
 .calendar-period .wm-action { justify-content: center; }
 .calendar-period .calendar-arrow { inline-size: var(--control-height); padding-inline: 0; }
 .calendar-period input { inline-size: 9rem; }
@@ -1433,8 +1434,9 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .calendar-view-toolbar { gap: 8px; }
   .calendar-view-modes, .calendar-period, .calendar-zone { width: 100%; }
   .calendar-view-modes .wm-action { flex: 1 1 auto; justify-content: center; padding-inline: 5px; }
-  .calendar-period { display: grid; grid-template-columns: var(--control-height) auto var(--control-height) minmax(0, 1fr); }
-  .calendar-period input { inline-size: 100%; }
+  .calendar-period-buttons { flex: 1 0 auto; }
+  .calendar-today { flex: 1; }
+  .calendar-period input { flex: 1 0 max(136px, 10.5em); }
   .calendar-zone { justify-content: space-between; white-space: nowrap; }
   .calendar-zone select { flex: 1 1 0; max-width: 60%; }
   .calendar-range { margin-block: 12px 7px; }
@@ -1454,8 +1456,6 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-list-options .wm-selection-mode { padding-inline: 8px; }
 }
 @media (max-width: 370px) {
-  .calendar-period { grid-template-columns: var(--control-height) minmax(0, 1fr) var(--control-height); }
-  .calendar-period input { grid-column: 1 / -1; }
   .calendar-share-form { grid-template-columns: minmax(0, 1fr); }
 }
 @media (forced-colors: active) {

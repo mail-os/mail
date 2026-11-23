@@ -120,11 +120,15 @@ function verifyControlGaps(controls, gap) {
   }
 }
 
-async function verifyCalendarPeriod(page, label, height, stacked = false) {
+async function verifyCalendarPeriod(page, label, height) {
   const group = page.getByRole('group', { name: 'Change date range' })
   const toolbar = page.locator('.calendar-view-toolbar')
-  const controls = await verifyControlRow(toolbar, '.calendar-period > *, .calendar-zone select', height, false)
+  const controls = await verifyControlRow(toolbar, '.calendar-period :is(button, input), .calendar-zone select', height, false)
   assert.equal(controls.length, 5)
+  const stacked = Math.abs(controls[3].top - controls[0].top) >= 0.5
+  const width = page.viewportSize()?.width ?? 0
+  if (width <= 320) assert(stacked, 'The date field wraps at 320px')
+  if (width >= 390) assert(!stacked, 'Date navigation fits on one row at this width')
   const row = controls.slice(0, stacked ? 3 : 4)
   for (const control of row) {
     assert(Math.abs(control.top - row[0].top) < 0.5, 'Date navigation controls should align')
@@ -146,7 +150,7 @@ async function verifyCalendarPeriod(page, label, height, stacked = false) {
     return text.left - box.left < 5.5 || box.right - text.right < 5.5 ? [button.textContent] : []
   }))
   assert.deepEqual(crampedViews, [], 'View labels have clear space inside each border')
-  if ((page.viewportSize()?.width ?? 0) >= 1160) {
+  if (width >= 1160) {
     for (const control of [...views, controls[4]]) {
       assert(Math.abs(control.top - date.top) < 0.5 && Math.abs(control.bottom - date.bottom) < 0.5,
         'The view and time zone controls align with both edges of the date controls')
@@ -603,7 +607,7 @@ async function phoneJourney(page) {
   await verifyCalendarPeriod(page, 'phone-dark', 44)
   await page.setViewportSize({ width: 320, height: 844 })
   await fitsViewport(page)
-  await verifyCalendarPeriod(page, 'narrow-phone-dark', 44, true)
+  await verifyCalendarPeriod(page, 'narrow-phone-dark', 44)
   await page.setViewportSize({ width: 390, height: 844 })
   await page.emulateMedia({ colorScheme: 'light' })
   await verifyCalendarPeriod(page, 'phone-light', 44)
