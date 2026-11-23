@@ -69,11 +69,23 @@ async function waitForMailboxResult(page, endpoint, find, description) {
 async function verifySelect(control, minimumHeight = 36) {
   const appearance = await control.evaluate((select) => {
     const style = getComputedStyle(select)
-    return { tag: select.tagName, appearance: style.appearance, icon: style.backgroundImage, height: select.getBoundingClientRect().height }
+    const iconSize = Number.parseFloat(style.backgroundSize)
+    return {
+      tag: select.tagName,
+      appearance: style.appearance,
+      icon: style.backgroundImage,
+      iconSize,
+      iconGap: Number.parseFloat(style.paddingInlineEnd) - Number.parseFloat(style.paddingInlineStart) - iconSize,
+      height: select.getBoundingClientRect().height,
+      expectedHeight: Number.parseFloat(style.getPropertyValue('--control-height')),
+    }
   })
   assert.equal(appearance.tag, 'SELECT', 'The picker retains native keyboard and touch behavior')
   assert.equal(appearance.appearance, 'none')
   assert.match(appearance.icon, /data:image\/svg\+xml/)
+  assert.equal(appearance.iconSize, 16)
+  assert.equal(appearance.iconGap, 8, 'The selection label clears the chevron')
+  assert.equal(appearance.height, appearance.expectedHeight, 'The picker has the shared control height')
   assert(appearance.height >= minimumHeight, 'The picker meets the minimum control height')
 }
 
@@ -140,7 +152,8 @@ function verifyControlGaps(controls, gap) {
 async function verifyCalendarPeriod(page, label, height) {
   const group = page.getByRole('group', { name: 'Change date range' })
   const toolbar = page.locator('.calendar-view-toolbar')
-  const controls = await verifyControlRow(toolbar, '.calendar-period :is(button, input), .calendar-zone select', height, false)
+  await verifySelect(toolbar.getByRole('combobox', { name: 'Display time zone' }), height)
+  const controls = await verifyControlRow(toolbar, '.calendar-period-buttons button, .calendar-jump, .calendar-zone select', height, false)
   assert.equal(controls.length, 5)
   const stacked = Math.abs(controls[3].top - controls[0].top) >= 0.5
   const width = page.viewportSize()?.width ?? 0
@@ -150,12 +163,19 @@ async function verifyCalendarPeriod(page, label, height) {
   for (const control of row) {
     assert(Math.abs(control.top - row[0].top) < 0.5, 'Date navigation controls should align')
   }
-  verifyControlGaps(row, 6)
+  verifyControlGaps(row, 8)
   for (const arrow of [controls[0], controls[2]]) {
     assert(Math.abs(arrow.right - arrow.left - height) < 0.5, 'Previous and next have square hit areas')
   }
   const date = controls[3]
-  assert(date.right - date.left >= 136, 'Jump to date leaves room for the native date and picker')
+  assert(date.right - date.left >= 152, 'Jump to date leaves room for the native date and picker')
+  const datePicker = button(group, 'Open date picker')
+  const pickerIcon = await datePicker.locator('.mail-icon').boundingBox()
+  assert.equal(pickerIcon.width, 16)
+  assert(Math.abs(pickerIcon.y + pickerIcon.height / 2 - (date.top + date.bottom) / 2) < 0.5,
+    'The calendar icon is vertically centered in the date field')
+  assert(Math.abs(date.right - (pickerIcon.x + pickerIcon.width) - 11) < 0.5,
+    'The calendar icon follows the select icon inset')
   const viewGroup = toolbar.getByRole('group', { name: 'Calendar view' })
   const viewPicker = toolbar.getByRole('combobox', { name: 'Calendar view', exact: true })
   let views
@@ -169,7 +189,7 @@ async function verifyCalendarPeriod(page, label, height) {
   }
   else {
     views = await verifyControlRow(viewGroup, 'button', height)
-    verifyControlGaps(views, 6)
+    verifyControlGaps(views, 8)
   }
   assert([...controls, ...views].every(control => control.fontSize === date.fontSize), 'Toolbar fields and actions share a text size')
   const crampedViews = await toolbar.locator('.calendar-view-modes button:visible').evaluateAll(buttons => buttons.flatMap((button) => {
@@ -188,14 +208,77 @@ async function verifyCalendarPeriod(page, label, height) {
     verifyControlGaps([views.at(-1), controls[0]], 16)
   }
   if (stacked) {
-    assert(Math.abs(date.top - row[0].bottom - 6) < 0.5, 'Jump to date has the same gap below date navigation')
+    assert(Math.abs(date.top - row[0].bottom - 8) < 0.5, 'Jump to date has the same gap below date navigation')
     assert(Math.abs(date.left - row[0].left) < 0.5 && Math.abs(date.right - row[2].right) < 0.5, 'Jump to date spans the date navigation row')
   }
   await fitsViewport(page)
   if (!label) return
   await mkdir(output, { recursive: true })
-  await group.screenshot({ path: join(output, `${label}-date-controls.png`), animations: 'disabled' })
+  const groupBox = await group.boundingBox()
+  const capture = await group.screenshot({ path: join(output, `${label}-date-controls.png`), animations: 'disabled', scale: 'css' })
+  await verifyDateTextAlignment(page, capture, {
+    x: date.left - groupBox.x,
+    y: date.top - groupBox.y,
+    width: date.right - date.left,
+    height,
+  })
   await toolbar.screenshot({ path: join(output, `${label}-calendar-toolbar.png`), animations: 'disabled' })
+}
+
+async function verifyDateTextAlignment(page, capture, date) {
+  const centerOffset = await page.evaluate(async ({ image, date }) => {
+    // The browser paints the date value in its native editor. Inspect the
+    // screenshot to catch centering errors the input's DOM bounds cannot show.
+    const encoded = Uint8Array.from(atob(image), char => char.charCodeAt(0))
+    const bitmap = await createImageBitmap(new Blob([encoded], { type: 'image/png' }))
+    const canvas = document.createElement('canvas')
+    canvas.width = bitmap.width
+    canvas.height = bitmap.height
+    const context = canvas.getContext('2d')
+    context.drawImage(bitmap, 0, 0)
+    const area = context.getImageData(Math.round(date.x) + 8, Math.round(date.y), Math.floor(date.width - date.height - 8), date.height)
+    const text = getComputedStyle(document.querySelector('.calendar-jump input')).color.match(/\d+/g).map(Number)
+    const inkRows = []
+    for (let y = 3; y < area.height - 3; y++) {
+      for (let x = 0; x < area.width; x++) {
+        const start = (y * area.width + x) * 4
+        if (text.every((channel, offset) => Math.abs(area.data[start + offset] - channel) <= 36)) {
+          inkRows.push(y + 0.5)
+          break
+        }
+      }
+    }
+    if (!inkRows.length) return null
+    return (inkRows[0] + inkRows.at(-1) - area.height) / 2
+  }, { image: capture.toString('base64'), date })
+  assert(centerOffset !== null && Math.abs(centerOffset) <= 2.5, `The visible date should be centered, got ${centerOffset}px off center`)
+}
+
+async function verifyCalendarPicker(page) {
+  const date = page.getByLabel('Jump to date', { exact: true })
+  const picker = button(page, 'Open date picker')
+  await date.evaluate((input) => {
+    const showPicker = input.showPicker
+    input.showPicker = function () {
+      const activated = navigator.userActivation.isActive
+      showPicker.call(this)
+      this.dataset.pickerOpened = String(activated)
+    }
+  })
+  await picker.press('Enter')
+  assert.equal(await date.getAttribute('data-picker-opened'), 'true', 'Keyboard activation invokes the native date picker')
+  await page.keyboard.press('Escape')
+  await date.evaluate(input => delete input.dataset.pickerOpened)
+  await picker.click()
+  assert.equal(await date.getAttribute('data-picker-opened'), 'true', 'Clicking the calendar icon invokes the native date picker')
+  await page.keyboard.press('Escape')
+  await date.evaluate((input) => { delete input.showPicker; delete input.dataset.pickerOpened })
+
+  await date.fill('2026-02-02')
+  await button(page, 'Next period').click()
+  await page.waitForFunction(() => document.querySelector('.calendar-jump input').value === '2026-02-09')
+  await date.fill(day)
+  await page.getByText('Studio review', { exact: true }).waitFor()
 }
 
 async function chooseCalendarView(page, label) {
@@ -518,7 +601,7 @@ async function desktopJourney(page) {
   await fitsViewport(page)
   await screenshot(page, 'desktop-calendar')
   await verifyCalendarPeriod(page, 'desktop-light', 36)
-  for (const width of [371, 490, 491, 860, 861, 1159, 1160]) {
+  for (const width of [371, 375, 376, 389, 490, 491, 860, 861, 1159, 1160]) {
     await page.setViewportSize({ width, height: 940 })
     await verifyCalendarPeriod(page, null, width > 860 ? 36 : 44)
   }
@@ -527,6 +610,7 @@ async function desktopJourney(page) {
   await screenshot(page, 'desktop-calendar-dark')
   await verifyCalendarPeriod(page, 'desktop-dark', 36)
   await page.emulateMedia({ colorScheme: 'light' })
+  await verifyCalendarPicker(page)
   await page.getByRole('searchbox', { name: 'Search events' }).fill('Studio review')
   await button(page, 'Search').click()
   await page.getByRole('heading', { name: /^Search results/ }).waitFor()

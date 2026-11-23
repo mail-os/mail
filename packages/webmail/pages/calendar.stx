@@ -50,6 +50,7 @@ const dayHeading = useRef('dayHeading')
 const labelField = useRef('labelField')
 const labelTrigger = useRef('labelTrigger')
 const freeTimeDateField = useRef('freeTimeDateField')
+const jumpDateField = useRef('jumpDateField')
 const taskHeading = useRef('taskHeading')
 const taskTitleField = useRef('taskTitleField')
 const taskDeleteButton = useRef('taskDeleteButton')
@@ -113,6 +114,12 @@ async function toggleTaskCompletion(task) {
 function changeFreeTimePanel() {
   toggleFreeTime()
   if (freeTimeOpen()) nextTick(() => freeTimeDateField.current?.focus())
+}
+function openJumpDatePicker() {
+  const input = jumpDateField.current as HTMLInputElement | null
+  if (!input) return
+  input.focus({ preventScroll: true })
+  input.showPicker?.()
 }
 function editLabel() {
   startDayLabel()
@@ -395,7 +402,10 @@ onUnmounted(() => { destroy(); destroyReminders() })
           <button class="wm-action calendar-today" @click="goToToday()">Today</button>
           <button class="wm-action calendar-arrow" @click="shiftView(1)" aria-label="Next period"><span class="mail-icon" data-icon="right" aria-hidden="true"></span></button>
         </div>
-        <input type="date" aria-label="Jump to date" :value="focusDay" @change="changeDate($event)">
+        <div class="calendar-jump">
+          <input ref="jumpDateField" type="date" aria-label="Jump to date" min="0001-01-01" max="9999-12-31" :value="focusDay" @change="changeDate($event)">
+          <button type="button" class="calendar-jump-picker" aria-label="Open date picker" @click="openJumpDatePicker()"><span class="mail-icon" data-icon="calendar" aria-hidden="true"></span></button>
+        </div>
       </div>
       <label class="calendar-zone">Time zone
         <select aria-label="Display time zone" :value="displayZone" @change="changeZone($event)">
