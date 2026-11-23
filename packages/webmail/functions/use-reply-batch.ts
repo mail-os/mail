@@ -66,8 +66,8 @@ export function useReplyBatch(api: ReturnType<typeof createMailApi>, undoSeconds
     if (replyBatchBusy() || replyBatchUncertain()) return
     closeReplyBatch()
     replyBatchOpen.set(true)
-    if (selected.length < 1 || selected.length > 20) {
-      replyBatchError.set('Choose one to twenty received messages.')
+    if (selected.length < 2 || selected.length > 20) {
+      replyBatchError.set('Choose two to twenty received messages.')
       return
     }
     if (!selected.every((reference): reference is string => !!reference)) {

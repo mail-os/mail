@@ -1375,7 +1375,11 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-brand { font-size: 16px; }
   .wm-folders-toggle .mail-icon { display: none; }
   .wm-brand > span:last-child { overflow: hidden; text-overflow: ellipsis; }
-  .wm-list-options { flex-wrap: wrap; }
+  .wm-list-options { padding-inline: 10px; }
+  .wm-list-options > .wm-list-toggle { min-inline-size: 0; }
+  .wm-list-options .wm-list-toggle { gap: 4px; padding-inline: 5px; }
+  .wm-list-options > .wm-list-toggle > span:last-child { overflow: hidden; text-overflow: ellipsis; }
+  .wm-list-options .wm-selection-mode { padding-inline: 8px; }
 }
 @media (max-width: 370px) {
   .calendar-period { grid-template-columns: var(--control-height) minmax(0, 1fr) var(--control-height); }

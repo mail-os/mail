@@ -1661,10 +1661,10 @@ try {
 catch (error) {
   if (errors.length) process.stderr.write(`Uncaught browser errors:\n${errors.join('\n')}\n`)
   if (diagnostics.length) process.stderr.write(`Browser diagnostics:\n${diagnostics.slice(-20).join('\n')}\n`)
-  for (const context of browser.contexts()) {
+  for (const [contextIndex, context] of browser.contexts().entries()) {
     for (const [index, page] of context.pages().entries()) {
       const appearance = (page.viewportSize()?.width ?? 0) <= 860 ? 'phone' : 'desktop'
-      await screenshot(page, `failure-${appearance}-${index}`).catch(() => {})
+      await screenshot(page, `failure-${appearance}-${contextIndex}-${index}`).catch(() => {})
     }
   }
   throw error
