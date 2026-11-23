@@ -806,8 +806,8 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       <div :if="scheduleOpen" id="composeSchedule" class="wm-send-schedule">
         <label for="composeSendTime"><span class="mail-icon" data-icon="clock" aria-hidden="true"></span>Send at</label>
         <input id="composeSendTime" type="datetime-local" x-model="scheduleDate" aria-describedby="composeTimeZone" :disabled="sending || sendUncertain">
-        <small id="composeTimeZone" :text="scheduleZone"></small>
         <button type="button" class="wm-action" @click="scheduleOpen.set(false)" :disabled="sending || sendUncertain">Send now instead</button>
+        <small id="composeTimeZone" :text="scheduleZone"></small>
       </div>
       <button class="wm-send-btn" type="submit" :disabled="sending || sendUncertain || savingDraft || attachmentPending || fileLinkUploading || draftConflict || authExpired"><span class="mail-icon" :data-icon="scheduleOpen ? 'clock' : 'send'" aria-hidden="true"></span><span :text="sending ? (externalSender && !externalSendReview ? 'Loading review…' : 'Queuing…') : externalSender && !externalSendReview ? 'Review send' : scheduleOpen ? 'Schedule send' : 'Send'"></span></button>
       <button :if="!scheduleOpen" class="wm-action" type="button" @click="chooseSendTime()" :disabled="sending || sendUncertain"><span class="mail-icon" data-icon="clock" aria-hidden="true"></span>Send later</button>

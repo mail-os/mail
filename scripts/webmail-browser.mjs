@@ -111,11 +111,11 @@ async function verifyControlRow(container, selector, height, sameRow = true) {
     const box = node.getBoundingClientRect()
     const borderChannels = style.getPropertyValue('--control-border').trim().slice(1).match(/../g)
     const border = `rgb(${borderChannels.map(channel => Number.parseInt(channel, 16)).join(', ')})`
-    const quiet = node.matches('.wm-list-toggle, .wm-action--quiet, .wm-composer-foot > .wm-action:not(.wm-snapshot-primary)')
+    const quiet = node.matches('.wm-list-toggle, .wm-action--quiet')
     return {
       name: node.getAttribute('aria-label') || node.querySelector('input[aria-label]')?.getAttribute('aria-label') || node.id
         || node.labels?.[0]?.firstChild?.textContent?.trim()
-        || (node.tagName === 'BUTTON' ? node.textContent.trim() : node.tagName),
+        || (node.matches('button, a') ? node.textContent.trim() : node.tagName),
       height: box.height,
       top: box.top,
       bottom: box.bottom,
@@ -187,6 +187,11 @@ async function verifyCalendarPeriod(page, label, height) {
   verifyControlGaps(row, 8)
   for (const arrow of [controls[0], controls[2]]) {
     assert(Math.abs(arrow.right - arrow.left - height) < 0.5, 'Previous and next have square hit areas')
+  }
+  for (const label of ['Previous period', 'Next period']) {
+    const icon = await button(group, label).locator('.mail-icon').boundingBox()
+    assert(Math.abs(icon.width - 16) < 0.25 && Math.abs(icon.height - 16) < 0.25,
+      `${label} uses the 16px picker icon size, got ${icon.width} × ${icon.height}px`)
   }
   const date = controls[3]
   assert(date.right - date.left >= (width <= 490 ? 148 : 152), 'Jump to date leaves room for the native date and picker')
@@ -271,6 +276,29 @@ async function verifyCalendarPeriod(page, label, height) {
   await verifyPaintedControlBorders(toolbar,
     `.calendar-view-modes button, .calendar-view-picker select, ${periodControls}`,
     [...views, ...controls], `${label}-calendar-toolbar`)
+  await verifyCalendarActions(page, height, label)
+  const sourceRow = page.locator('.calendar-workspace > .calendar-controls').first()
+  const sourceControls = '.calendar-sources button, .mail-search-field, .calendar-source-tools > button'
+  const sources = await verifyControlRow(sourceRow, sourceControls, height, height === 36)
+  const sourceName = button(sourceRow, calendarLabel).locator('span:last-child')
+  assert(await sourceName.evaluate(node => node.scrollWidth <= node.clientWidth), 'The calendar color dot leaves room for the full calendar name')
+  if (width <= 320) {
+    const [search, availability] = sources.slice(-2)
+    assert(Math.abs(search.left - availability.left) < 0.5 && Math.abs(search.right - availability.right) < 0.5,
+      'Search and availability reach the same edges when stacked')
+    assert(Math.abs(availability.top - search.bottom - 8) < 0.5, 'Calendar tools use an eight-pixel row gap')
+  }
+  await verifyPaintedControlBorders(sourceRow, sourceControls, sources, `${label}-calendar-sources`)
+}
+
+async function verifyCalendarActions(page, height, label) {
+  const actions = page.locator('.calendar-header .calendar-choices')
+  const controls = await verifyControlRow(actions, '.wm-action', height, height === 36)
+  assert.equal(controls.length, 6)
+  if (page.viewportSize().width <= 490) {
+    for (let index = 0; index < controls.length; index += 2) verifyControlGaps(controls.slice(index, index + 2), 6)
+  }
+  await verifyPaintedControlBorders(actions, '.wm-action', controls, `${label}-calendar-actions`)
 }
 
 async function verifyPaintedControlBorders(container, selector, controls, name, checkDisabledText = false) {
@@ -443,6 +471,29 @@ async function verifyComposerControls(composer, height) {
     verifyControlGaps([send, later], 6)
     verifyControlGaps([draft, discard], 6)
   }
+}
+
+async function verifyScheduleControls(composer, height, label) {
+  await button(composer, 'Send later').click()
+  const schedule = composer.locator('.wm-send-schedule')
+  const date = schedule.getByLabel('Send at')
+  const cancel = button(schedule, 'Send now instead')
+  assert.match(await date.inputValue(), /^\d{4}-\d\d-\d\dT\d\d:\d\d/)
+  assert.equal(await date.getAttribute('aria-describedby'), 'composeTimeZone')
+  const stacked = composer.page().viewportSize().width <= 375
+  const controls = await verifyControlRow(schedule, 'input, button', height, !stacked)
+  if (stacked) {
+    const [field, action] = controls
+    const zone = await schedule.locator('small').boundingBox()
+    assert(Math.abs(field.left - action.left) < 0.5 && Math.abs(field.right - action.right) < 0.5,
+      'The schedule field and action share both edges on narrow phones')
+    assert(Math.abs(zone.y - field.bottom - 6) < 0.5 && Math.abs(action.top - zone.y - zone.height - 6) < 0.5,
+      'Narrow schedule rows use even gaps above and below the time zone')
+  }
+  else verifyControlGaps(controls, 8)
+  await verifyPaintedControlBorders(schedule, 'input, button', controls, `${label}-compose-schedule`)
+  await cancel.click()
+  await schedule.waitFor({ state: 'hidden' })
 }
 
 async function verifyAppearance(page, scheme) {
@@ -744,8 +795,10 @@ async function desktopJourney(page) {
   await composer.getByText(/handoff-checklist.txt/).waitFor()
   await composer.getByRole('progressbar').waitFor({ state: 'hidden' })
   await verifyComposerControls(composer, 36)
+  await verifyScheduleControls(composer, 36, 'desktop-light')
   await screenshot(page, 'desktop-compose')
   await page.emulateMedia({ colorScheme: 'dark' })
+  await verifyScheduleControls(composer, 36, 'desktop-dark')
   await screenshot(page, 'desktop-compose-dark')
   await page.emulateMedia({ colorScheme: 'light' })
   await composer.getByLabel('Undo Send delay', { exact: true }).selectOption('0')
@@ -899,6 +952,7 @@ async function phoneJourney(page) {
     const sheet = await composer.locator('.wm-composer').boundingBox()
     assert(sheet && sheet.width === width && Math.abs(sheet.y + sheet.height - 844) < 1, 'Composer is a full-width bottom sheet on phones')
     await verifyComposerControls(composer, 44)
+    await verifyScheduleControls(composer, 44, `phone-${width}-dark`)
     await fitsViewport(page)
     if (width === 320) await screenshot(page, 'narrow-phone-compose-dark')
   }
@@ -947,6 +1001,7 @@ async function phoneJourney(page) {
   await page.getByText('Studio review', { exact: true }).waitFor()
   await screenshot(page, 'phone-calendar-day')
   await button(page, 'Manage calendars').click()
+  await verifyCalendarActions(page, 44, 'phone-active-dark')
   const sharing = page.getByRole('region', { name: 'Share a calendar' })
   const access = sharing.getByRole('combobox', { name: /^Access\b/ })
   await access.waitFor()
