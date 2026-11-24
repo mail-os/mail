@@ -4,15 +4,18 @@
   --app-font: -apple-system, BlinkMacSystemFont, system-ui, "Segoe UI", sans-serif;
   --bg: #f1f2f5;
   --panel: #ffffff;
-  --sidebar: #ebedf1;
+  --sidebar: #f0f2f6;
   --list: #fafbfc;
-  --surface: #eef0f3;
+  --surface: #f0f2f5;
   --toolbar: #f6f7f9;
   --hover: #e5e9f0;
   --text: #20232c;
   --muted: #515966;
-  --border: #d9dce3;
-  --control-border: #828895;
+  --border: #e0e3e9;
+  --control-border: #878b94;
+  --control-fill: #f7f8fa;
+  --control-hover: #edf0f5;
+  --control-pressed: #e3e8f0;
   --control-disabled-text: #646a75;
   --control-height: 36px;
   --control-radius: 8px;
@@ -51,7 +54,7 @@
   :root {
     color-scheme: dark;
     --bg: #191a1e;
-    --panel: #1f2025;
+    --panel: #23252b;
     --sidebar: #282a30;
     --list: #24252b;
     --surface: #30323a;
@@ -59,8 +62,11 @@
     --hover: #363943;
     --text: #f5f5f8;
     --muted: #b7bcc9;
-    --border: #41434b;
-    --control-border: #777d89;
+    --border: #393c44;
+    --control-border: #787b84;
+    --control-fill: #2e3037;
+    --control-hover: #353841;
+    --control-pressed: #3d414b;
     --control-disabled-text: #a0a5b0;
     --select-chevron: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Cpath d=%22m4 6 4 4 4-4%22 fill=%22none%22 stroke=%22%23b7bcc9%22 stroke-width=%221.5%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22/%3E%3C/svg%3E");
     --accent: #94c4ff;
@@ -85,6 +91,13 @@
     --app-shadow: 0 12px 40px rgb(0 0 0 / .32), var(--shadow);
     --scrim: rgb(7 7 11 / .64);
   }
+}
+
+@media (prefers-contrast: more) {
+  :root { --border: #a4aab4; --control-border: #616975; }
+}
+@media (prefers-contrast: more) and (prefers-color-scheme: dark) {
+  :root { --border: #666b77; --control-border: #a5aab6; }
 }
 
 * { box-sizing: border-box; }
@@ -153,7 +166,7 @@ body {
   padding: 6px var(--control-inline-padding);
   border: 1px solid var(--control-border);
   border-radius: var(--control-radius);
-  background-color: var(--panel);
+  background-color: var(--control-fill);
   color: var(--text);
   font-size: var(--control-font-size);
   line-height: 1.25;
@@ -202,7 +215,7 @@ select {
   cursor: pointer;
 }
 select:dir(rtl) { background-position: left var(--control-inline-padding) center; }
-:where(:is(input:not([type=checkbox], [type=radio], [type=hidden], [hidden], .wm-file-input), select, textarea):hover:not(:disabled)) { background-color: var(--surface); }
+:where(:is(input:not([type=checkbox], [type=radio], [type=hidden], [hidden], .wm-file-input), select, textarea):hover:not(:disabled)) { background-color: var(--control-hover); }
 :is(input:not([type=checkbox], [type=radio], [type=hidden], .wm-file-input), select, textarea):disabled {
   background-color: var(--surface);
   color: var(--control-disabled-text);
@@ -243,7 +256,8 @@ input:is([type=date], [type=time], [type=datetime-local]):focus-within { outline
 .wm-search-row { display: flex; gap: 6px; }
 .wm-search { width: 100%; }
 .wm-action { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; cursor: pointer; }
-.wm-action:hover:where(:not(:disabled)) { background-color: var(--surface); }
+.wm-action:hover:where(:not(:disabled)) { background-color: var(--control-hover); }
+.wm-action:active:where(:not(:disabled)) { background-color: var(--control-pressed); }
 .wm-action--danger { color: var(--danger); }
 .wm-action--danger:hover:not(:disabled) { background: var(--danger-soft); }
 .wm-filter-panel { display: flex; flex-direction: column; gap: 10px; padding-top: 12px; }
@@ -600,7 +614,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-header :is(.calendar-actions-toggle, .calendar-header-create-phone), .calendar-free-time-short, .calendar-manage-short { display: none; }
 .calendar-header h1 { margin: 0; font-size: clamp(1.8rem, 4vw, 2.5rem); letter-spacing: -.04em; }
 .calendar-primary, .wm-snapshot-primary { background: var(--primary); color: var(--on-primary); }
-:is(.calendar-primary, .wm-snapshot-primary):hover:not(:disabled) { background: var(--primary-hover); }
+:is(.calendar-primary, .wm-snapshot-primary):is(:hover, :active):not(:disabled) { background: var(--primary-hover); }
 .calendar-loading { color: var(--muted); }
 .calendar-colors { display: flex; flex-wrap: wrap; gap: .45rem 1.25rem; margin-top: .75rem; }
 .calendar-colors label { display: flex; align-items: center; gap: .45rem; }
@@ -619,12 +633,13 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-period .calendar-arrow .mail-icon { inline-size: var(--picker-icon-size); block-size: var(--picker-icon-size); }
 .calendar-jump { inline-size: 9.5rem; }
 .calendar-picker-field {
-  --picker-background: var(--panel);
+  --picker-background: var(--control-fill);
   position: relative;
   padding-inline: 0;
   background-color: var(--picker-background);
 }
-.calendar-picker-field:hover, .calendar-picker-field:has(input:disabled) { --picker-background: var(--surface); }
+.calendar-picker-field:hover { --picker-background: var(--control-hover); }
+.calendar-picker-field:has(input:disabled) { --picker-background: var(--surface); }
 .calendar-picker-field:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
 .calendar-picker-field input {
   display: block;
@@ -1038,6 +1053,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-search-filters[aria-expanded=true] { background: var(--accent-soft); }
 .wm-search-filters[aria-expanded=true] .mail-icon { color: var(--accent); }
 .mail-search-field { display: flex; align-items: center; flex: 1; gap: 6px; padding-inline: 9px; color: var(--muted); }
+.mail-search-field:hover { background-color: var(--control-hover); }
 .mail-search-field:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
 .mail-search-field .wm-search { block-size: auto; min-block-size: 0; border: 0; outline: 0; padding: 7px 0; background: transparent; }
 .wm-search-form .mail-search-field { padding-inline-end: 3px; }
@@ -1201,7 +1217,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-read-file-links { display: flex; flex-wrap: wrap; gap: 6px; margin-block: 8px; }
 .wm-read-file-links a { text-decoration: none; }
 .wm-file-link-settings #account-file-links { display: grid; gap: 8px; }
-.wm-file-link-settings .wm-action { width: auto; margin: 0; background: var(--panel); border: 1px solid var(--control-border); color: var(--text); }
+.wm-file-link-settings .wm-action { width: auto; margin: 0; background: var(--control-fill); border: 1px solid var(--control-border); color: var(--text); }
 .wm-file-link-settings .wm-action--danger { color: var(--danger); }
 @media (max-width: 460px) {
   .wm-snapshot-panel { padding: 12px; }
@@ -1257,7 +1273,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-writing-settings h2 { display: flex; gap: 6px; align-items: center; margin-bottom: 10px; }
 .wm-writing-settings h2 .mail-icon { color: var(--accent); }
 .wm-writing-settings .wm-private-tabs { width: fit-content; padding: 3px; gap: 2px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg); }
-.wm-writing-settings .wm-action { margin: 0; background: var(--panel); border: 1px solid var(--control-border); color: var(--text); font-size: var(--control-font-size); }
+.wm-writing-settings .wm-action { margin: 0; background: var(--control-fill); border: 1px solid var(--control-border); color: var(--text); font-size: var(--control-font-size); }
 .wm-writing-settings .wm-action:hover:where(:not(:disabled)) { background: var(--bg); }
 .wm-writing-settings .wm-private-tabs .wm-action { border-color: transparent; background: transparent; }
 .wm-writing-settings .wm-private-tabs .wm-action[aria-pressed=true] { border-color: var(--control-border); background: var(--panel); color: var(--accent); }
@@ -1545,8 +1561,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-tool[aria-pressed=true] { background: var(--warning-soft); color: var(--warning); }
 .wm-tool--danger:hover { color: var(--danger); }
 .wm-tool-move { gap: 6px; padding-inline-end: 0; border-inline-end: 0; }
-.wm-message-toolbar .wm-tool-move .wm-tool { border: 1px solid var(--control-border); background: var(--panel); }
-.wm-message-toolbar .wm-tool-move .wm-tool:hover:not(:disabled) { background: var(--surface); }
+.wm-message-toolbar .wm-tool-move .wm-tool { border: 1px solid var(--control-border); background: var(--control-fill); }
+.wm-message-toolbar .wm-tool-move .wm-tool:hover:not(:disabled) { background: var(--control-hover); }
 .wm-tool-move select { min-inline-size: 110px; max-inline-size: 10rem; }
 .wm-read-body > :not(.wm-read-toolbar) { max-width: 760px; margin-inline: auto; }
 .wm-message-paper {
@@ -1715,6 +1731,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .calendar-nav > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .calendar-header { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px; margin-block: 10px; }
   .calendar-heading { grid-column: 1; grid-row: 1; gap: 7px; }
+  .calendar-heading h1 { font-size: clamp(1.35rem, 6vw, 1.55rem); }
   .calendar-header > .calendar-header-actions { display: contents; }
   .calendar-header :is(.calendar-actions-toggle, .calendar-header-create-phone) { display: inline-flex; grid-row: 1; padding-inline: 8px; }
   .calendar-header-create-phone { grid-column: 2; }
@@ -1757,6 +1774,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 @media (max-width: 360px) {
   .calendar-header .calendar-header-create-phone { justify-content: center; inline-size: var(--control-height); padding-inline: 0; }
   .calendar-phone-create-label, .calendar-search .mail-search-field > .mail-icon { display: none; }
+  .calendar-search .mail-search-field { gap: 3px; padding-inline: 8px 2px; }
+  .calendar-search .wm-search-submit { flex-basis: 24px; min-block-size: calc(var(--control-height) - 2px); }
   .wm-composer-foot { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .wm-composer-foot > :is(.wm-send-delay, .wm-send-schedule) { grid-column: 1 / -1; }
   .wm-composer-foot .wm-send-delay { justify-content: start; }

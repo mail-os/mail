@@ -169,7 +169,7 @@ async function verifyControlContrast(toolbar) {
       return 0.2126 * red + 0.7152 * green + 0.0722 * blue
     }
     const stroke = luminance('--control-border')
-    return ['--panel', '--toolbar', '--surface', '--sidebar'].map((name) => {
+    return ['--panel', '--toolbar', '--surface', '--sidebar', '--control-fill'].map((name) => {
       const adjacent = luminance(name)
       return { name, ratio: (Math.max(stroke, adjacent) + 0.05) / (Math.min(stroke, adjacent) + 0.05) }
     })
@@ -573,8 +573,8 @@ async function verifyScheduleControls(composer, height, label) {
   await schedule.waitFor({ state: 'hidden' })
 }
 
-async function verifyAppearance(page, scheme) {
-  await page.emulateMedia({ colorScheme: scheme })
+async function verifyAppearance(page, scheme, contrast = 'no-preference') {
+  await page.emulateMedia({ colorScheme: scheme, contrast })
   const theme = await page.evaluate(() => {
     const style = getComputedStyle(document.documentElement)
     const luminance = token => {
@@ -586,6 +586,8 @@ async function verifyAppearance(page, scheme) {
     const pairs = [
       ['--text', '--panel'], ['--muted', '--panel'], ['--muted', '--surface'],
       ['--control-disabled-text', '--panel'], ['--control-disabled-text', '--surface'],
+      ['--text', '--control-fill'], ['--muted', '--control-fill'], ['--text', '--control-hover'],
+      ['--text', '--control-pressed'],
       ['--muted', '--toolbar'], ['--muted', '--selected'], ['--muted', '--sidebar'],
       ['--text', '--list'], ['--muted', '--list'], ['--accent', '--selected'],
       ['--violet', '--sidebar'], ['--teal', '--sidebar'], ['--warning', '--sidebar'],
@@ -593,7 +595,7 @@ async function verifyAppearance(page, scheme) {
       ['--on-primary', '--primary'], ['--message-selection-text', '--message-selection'],
       ['--message-selection-muted', '--message-selection'],
     ]
-    const borders = ['--panel', '--toolbar', '--surface', '--sidebar'].map(background => {
+    const borders = ['--panel', '--toolbar', '--surface', '--sidebar', '--control-fill'].map(background => {
       const a = luminance('--control-border')
       const b = luminance(background)
       return [(Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05), background]
@@ -615,8 +617,9 @@ async function verifyAppearance(page, scheme) {
   assert.match(theme.font, /^-apple-system,/i)
   for (const [ratio, foreground, background] of theme.ratios)
     assert(ratio >= 4.5, `${scheme} ${foreground} on ${background} must reach 4.5:1, got ${ratio.toFixed(2)}`)
+  const minimumBorderContrast = contrast === 'more' ? 4.5 : 3
   for (const [ratio, background] of theme.borders)
-    assert(ratio >= 3, `${scheme} control borders on ${background} must reach 3:1, got ${ratio.toFixed(2)}`)
+    assert(ratio >= minimumBorderContrast, `${scheme} control borders on ${background} must reach ${minimumBorderContrast}:1, got ${ratio.toFixed(2)}`)
 }
 
 async function verifyMessageSelection(message, child) {
@@ -778,6 +781,10 @@ async function signIn({ phone = false, account = owner, initialSubject = handoff
 }
 
 async function desktopJourney(page) {
+  if (engine === 'chromium') {
+    await verifyAppearance(page, 'dark', 'more')
+    await verifyAppearance(page, 'light', 'more')
+  }
   await verifyAppearance(page, 'light')
   await page.locator('.wm-reader-empty').waitFor()
   assert.equal(await button(page, /Tuesday design handoff/).getAttribute('aria-description'), 'Unread')

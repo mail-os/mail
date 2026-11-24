@@ -49,6 +49,14 @@ async function phoneSchedule(page) {
   const workspace = page.getByRole('region', { name: 'Calendar workspace', exact: true })
   const allDay = timeline(page).getByRole('region', { name: 'All-day events' })
   const firstWeekDay = page.locator('.calendar-board-week .calendar-day').first()
+  const searchBox = page.getByRole('searchbox', { name: 'Search events' })
+  const searchLabelFits = () => searchBox.evaluate((input) => {
+    const style = getComputedStyle(input)
+    const canvas = document.createElement('canvas').getContext('2d')
+    canvas.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`
+    const inlinePadding = Number.parseFloat(style.paddingInlineStart) + Number.parseFloat(style.paddingInlineEnd)
+    return canvas.measureText(input.placeholder).width + 6 <= input.clientWidth - inlinePadding
+  })
   const fullyOnScreen = control => control.evaluate((node) => {
     const box = node.getBoundingClientRect()
     return scrollY === 0 && box.y >= 0 && box.bottom <= innerHeight
@@ -77,14 +85,11 @@ async function phoneSchedule(page) {
       assert([search, freeTime, menu, add].every(control => control.height === 44))
       assert(Math.abs(search.y - freeTime.y) < .5)
       assert(Math.abs(freeTime.x - search.x - search.width - 8) < .5)
-      assert(await tools.getByRole('searchbox', { name: 'Search events' }).evaluate((input) => {
-        const style = getComputedStyle(input)
-        const canvas = document.createElement('canvas').getContext('2d')
-        canvas.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`
-        return canvas.measureText(input.placeholder).width <= input.clientWidth
-      }), 'The full search placeholder fits')
-      assert.deepEqual(await header.locator('.calendar-actions-toggle').evaluateAll(nodes =>
-        nodes.map(node => getComputedStyle(node).borderColor)), [scheme === 'dark' ? 'rgb(119, 125, 137)' : 'rgb(130, 136, 149)'])
+      assert(await searchLabelFits(), 'The full search placeholder fits in Day')
+      const borders = await page.locator('.calendar-actions-toggle, .calendar-period-buttons .calendar-arrow').evaluateAll(nodes =>
+        nodes.map(node => getComputedStyle(node).border))
+      assert.equal(borders.length, 3)
+      assert(borders.every(border => border === borders[0]), 'Calendar actions and arrows share one outline')
       await capture(page, `phone-${width}-day-${scheme}-first-viewport`)
 
       const view = workspace.getByRole('combobox', { name: 'Calendar view', exact: true })
@@ -94,6 +99,7 @@ async function phoneSchedule(page) {
       await workspace.and(page.locator('[aria-busy="false"]')).waitFor()
       assert(await fullyOnScreen(firstWeekDay), `The first weekday is on screen initially at ${width}px`)
       assert(await fullyOnScreen(newEvent))
+      assert(await searchLabelFits(), 'The full search placeholder fits in Week')
       const [title, create] = await Promise.all([
         header.getByRole('heading', { name: 'Calendar', exact: true }).boundingBox(),
         newEvent.boundingBox(),
