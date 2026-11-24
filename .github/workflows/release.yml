@@ -2,7 +2,7 @@ name: Publish Mail SDK staging prerelease
 
 on:
   push:
-    tags: ['mail-sdk-staging-0.3.27-staging.1-r2']
+    tags: ['mail-sdk-staging-0.3.27-staging.1-r3']
 
 permissions:
   contents: read
@@ -19,22 +19,38 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
-          fetch-depth: 3
+          fetch-depth: 0
 
       - name: Verify the staging tag and exact PR source
         shell: bash
         run: |
-          test "$GITHUB_REF" = "refs/tags/mail-sdk-staging-$PACKAGE_VERSION-r2"
+          test "$GITHUB_REF" = "refs/tags/mail-sdk-staging-$PACKAGE_VERSION-r3"
           git merge-base --is-ancestor "$SOURCE_REVISION" HEAD
           test "$(git diff --name-only "$SOURCE_REVISION" HEAD)" = ".github/workflows/release.yml"
 
-      - uses: pantry-pm/pantry/packages/action@v0.11.28
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.4'
+
+      - name: Install the pinned Zig compiler
+        shell: bash
+        run: |
+          zig_home="$RUNNER_TEMP/zig-0.17.0"
+          mkdir -p "$zig_home"
+          curl --fail --silent --show-error --location --retry 2 --max-time 300 \
+            https://ziglang.org/download/0.17.0/zig-x86_64-linux-0.17.0.tar.xz \
+            -o "$zig_home/zig.tar.xz"
+          printf '%s  %s\n' 1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026 "$zig_home/zig.tar.xz" | sha256sum -c -
+          tar -xJf "$zig_home/zig.tar.xz" --strip-components=1 -C "$zig_home"
+          test "$("$zig_home/zig" version)" = '0.17.0'
+          printf '%s\n' "$zig_home" >> "$GITHUB_PATH"
+
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
 
       - name: Install pinned workspace dependencies
-        run: bun install --frozen-lockfile
+        run: bun install --frozen-lockfile --ignore-scripts
 
       - name: Build and test the SDK
         working-directory: packages/ts
@@ -55,8 +71,8 @@ jobs:
           (cd packages/webmail && bun run build)
           (cd packages/zig && zig build -Dall-targets -Doptimize=ReleaseFast)
           install -d packages/ts/bin
-          for target in x86_64-linux-gnu aarch64-linux-gnu x86_64-macos aarch64-macos; do
-            install -m 0755 "packages/zig/zig-out/cross/$target/mail-$target" "packages/ts/bin/mail-${target%-gnu}"
+          for target in x86_64-linux aarch64-linux x86_64-macos aarch64-macos; do
+            install -m 0755 "packages/zig/zig-out/cross/$target/mail-$target" "packages/ts/bin/mail-$target"
           done
 
       - name: Publish only to the staging dist-tag
