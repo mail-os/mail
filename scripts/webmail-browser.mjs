@@ -269,7 +269,6 @@ async function verifyCalendarPeriod(page, label, height) {
   await verifyDateTextAlignment(page, capture, {
     x: date.left - groupBox.x,
     y: date.top - groupBox.y,
-    width: date.right - date.left,
     height,
     iconLeft: pickerIcon.x - groupBox.x,
   })
@@ -374,8 +373,12 @@ async function verifyDateTextAlignment(page, capture, date) {
     canvas.height = bitmap.height
     const context = canvas.getContext('2d')
     context.drawImage(bitmap, 0, 0)
-    const area = context.getImageData(Math.round(date.x) + 8, Math.round(date.y), Math.floor(date.width - date.height - 8), date.height)
-    const text = getComputedStyle(document.querySelector('.calendar-jump input')).color.match(/\d+/g).map(Number)
+    const style = getComputedStyle(document.querySelector('.calendar-jump input'))
+    const gapWidth = Number.parseFloat(style.getPropertyValue('--picker-icon-gap'))
+    const iconLeft = Math.round(date.iconLeft)
+    const textLeft = Math.round(date.x) + 8
+    const area = context.getImageData(textLeft, Math.round(date.y), iconLeft - gapWidth - textLeft, date.height)
+    const text = style.color.match(/\d+/g).map(Number)
     const inkRows = []
     for (let y = 3; y < area.height - 3; y++) {
       for (let x = 0; x < area.width; x++) {
@@ -386,11 +389,10 @@ async function verifyDateTextAlignment(page, capture, date) {
         }
       }
     }
-    // Sample next to the icon so wider native date glyphs stay outside the test area.
-    const gap = context.getImageData(Math.round(date.iconLeft) - 16, Math.round(date.y) + 5, 16, date.height - 10)
-    const fill = context.getImageData(Math.round(date.iconLeft) - 1, Math.round(date.y) + 5, 1, 1).data
+    const gap = context.getImageData(iconLeft - gapWidth, Math.round(date.y) + 5, gapWidth, date.height - 10)
+    const fill = context.getImageData(iconLeft - 1, Math.round(date.y) + 5, 1, 1).data
     const iconGapHasInk = gap.data.some((channel, index) => index % 4 !== 3 && Math.abs(channel - fill[index % 4]) > 6)
-    const icon = context.getImageData(Math.round(date.iconLeft), Math.round(date.y + (date.height - 16) / 2), 16, 16)
+    const icon = context.getImageData(iconLeft, Math.round(date.y + (date.height - 16) / 2), 16, 16)
     const iconHasInk = icon.data.some((channel, index) => index % 4 !== 3 && Math.abs(channel - fill[index % 4]) > 45)
     return { centerOffset: inkRows.length ? (inkRows[0] + inkRows.at(-1) - area.height) / 2 : null, iconGapHasInk, iconHasInk }
   }, { image: capture.toString('base64'), date })
