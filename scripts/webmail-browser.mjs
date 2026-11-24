@@ -2412,6 +2412,34 @@ async function calendarSharingJourney(captain) {
   await button(teammate, 'Day').click()
   await button(teammate, 'My planning').waitFor()
   await busy.waitFor()
+  const sourceRow = teammate.locator('.calendar-workspace > .calendar-controls').first()
+  const sourceControls = '.calendar-sources button, .mail-search-field, .calendar-source-tools > button'
+  const sharedSource = button(teammate, /^Design & Research.*Free\/busy only/)
+  const coarsePointer = await teammate.evaluate(() => matchMedia('(pointer: coarse)').matches)
+  for (const width of [1440, 390, 320]) {
+    await teammate.setViewportSize({ width, height: 940 })
+    await teammate.emulateMedia({ colorScheme: width === 1440 ? 'light' : 'dark' })
+    await fitsViewport(teammate)
+    const height = width <= 860 || coarsePointer ? 44 : 36
+    const controls = await verifyControlRow(sourceRow, sourceControls, height, width === 1440)
+    const row = await sourceRow.boundingBox()
+    assert(controls.every(control => control.left >= row.x - 0.5 && control.right <= row.x + row.width + 0.5),
+      'Every calendar source and its border stay inside the row')
+    const labels = await sharedSource.locator('.calendar-shared-label').evaluate((label) => {
+      const access = label.querySelector('small > span:last-child')
+      const control = label.closest('button').getBoundingClientRect()
+      const text = label.getBoundingClientRect()
+      const accessBox = access.getBoundingClientRect()
+      return {
+        verticalOffset: (text.top + text.bottom - control.top - control.bottom) / 2,
+        accessFits: accessBox.right <= text.right + 0.5 && access.scrollWidth <= access.clientWidth,
+      }
+    })
+    assert(Math.abs(labels.verticalOffset) < 0.5, 'The two lines of shared calendar text are centered')
+    assert(labels.accessFits, 'The access level stays visible alongside a clipped owner address')
+    await verifyPaintedControlBorders(sourceRow, sourceControls, controls, `shared-calendar-source-${width}`)
+  }
+  await teammate.setViewportSize({ width: 390, height: 844 })
   await button(teammate, 'Find free time').click()
   const availability = teammate.getByRole('region', { name: 'Find free time' })
   const include = availability.getByRole('checkbox', { name: 'Include my calendars' })

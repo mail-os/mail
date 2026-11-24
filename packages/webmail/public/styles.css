@@ -600,6 +600,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-colors label { display: flex; align-items: center; gap: .45rem; }
 .calendar-colors input { inline-size: var(--control-height); block-size: var(--control-height); padding: 4px; cursor: pointer; }
 .calendar-colors label span { overflow-wrap: anywhere; }
+.calendar-sources { min-inline-size: 0; }
 .calendar-sources .wm-action { gap: .45rem; }
 .calendar-sources .wm-action:not(.calendar-shared-choice) > span:last-child { overflow: hidden; text-overflow: ellipsis; }
 .calendar-dot { flex: none; width: .55rem; height: .55rem; border-radius: 50%; }
@@ -1297,8 +1298,12 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-card-mark { display: flex; align-items: center; gap: 8px; color: var(--accent); }
 .calendar-sharing { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
 .calendar-sharing h2 { margin: 0 0 10px; font-size: 16px; }
-.calendar-shared-choice { justify-content: flex-start; text-align: left; white-space: normal; }
-.calendar-shared-choice > span:last-child, .calendar-share-details { display: grid; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
+.calendar-shared-choice { block-size: var(--control-height); justify-content: flex-start; padding-block: 2px; text-align: start; }
+.calendar-shared-label { display: grid; gap: 2px; min-inline-size: 0; line-height: 1.15; }
+.calendar-shared-label > strong, .calendar-shared-owner { overflow: hidden; text-overflow: ellipsis; }
+.calendar-shared-label small { display: flex; align-items: baseline; gap: 4px; min-inline-size: 0; }
+.calendar-shared-label small > span:last-child { flex: none; }
+.calendar-share-details { display: grid; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
 .calendar-shared-choice small, .calendar-share-list small { color: var(--muted); font-size: 11px; }
 .calendar-share-list { display: grid; gap: 6px; margin-block: 10px 0; padding: 0; list-style: none; }
 .calendar-share-list li { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 9px 11px; border-radius: 8px; background: var(--surface); }

@@ -377,7 +377,10 @@ onUnmounted(() => { destroy(); destroyReminders() })
         </button>
         <button :for="share in sharedCalendars" :key="share.calendarId" class="wm-action calendar-shared-choice" @click="selectCalendar(share.calendarId)" :aria-pressed="share.calendarId === activeCalendar">
           <span class="mail-icon" data-icon="people" aria-hidden="true"></span>
-          <span><strong :text="share.calendarName"></strong><small :text="share.source + ' · ' + calendarAccessLabels[share.access]"></small></span>
+          <span class="calendar-shared-label">
+            <strong :text="share.calendarName"></strong>
+            <small><span class="calendar-shared-owner" :text="share.source"></span><span aria-hidden="true">·</span><span :text="calendarAccessLabels[share.access]"></span></small>
+          </span>
         </button>
       </div>
       <div :if="calendars.length || selectedShare" class="calendar-source-tools">
