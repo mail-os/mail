@@ -1438,6 +1438,67 @@ async function calendarToolsJourney(desktop, phone) {
   await phone.setViewportSize({ width: 390, height: 844 })
 }
 
+async function verifyCalendarActionsDuringLoading(page, phone = false) {
+  const viewport = page.viewportSize()
+  if (phone) await page.setViewportSize({ width: 320, height: viewport.height })
+  const lists = ['calendars', 'calendar-shares'].map(path => url + '/webmail/api/' + path)
+  const release = Promise.withResolvers()
+  const holdList = async (route) => {
+    await release.promise
+    await route.continue()
+  }
+  for (const path of lists) await page.route(path, holdList, { times: 1 })
+  try {
+    await Promise.all([
+      ...lists.map(path => page.waitForRequest(path)),
+      page.goto(url + '/calendar?day=' + day),
+    ])
+    const actions = page.locator('.calendar-header .calendar-choices')
+    const labels = ['Manage calendars', 'Import .ics', 'Tasks', 'Personal tools']
+    const tools = button(actions, 'Personal tools')
+    const enabledTools = tools.and(page.locator(':enabled'))
+    const panel = page.getByRole('region', { name: 'Personal tools' })
+    const positions = () => Promise.all(labels.map(label => button(actions, label).boundingBox()))
+    await actions.waitFor()
+    assert(!await button(actions, 'New event').isVisible(), 'Event authority is still loading')
+    assert(!await actions.getByRole('link', { name: 'Download .ics' }).isVisible())
+    await enabledTools.press('Enter')
+    await heading(panel, 'Personal tools').waitFor()
+    await enabledTools.press('Enter')
+    await panel.waitFor({ state: 'hidden' })
+
+    const before = await positions()
+    const bounds = before[labels.indexOf('Personal tools')]
+    const x = bounds.x + bounds.width / 2
+    const y = bounds.y + bounds.height / 2
+    if (!phone) await page.mouse.move(x, y)
+    const label = phone ? 'phone-dark' : 'desktop-light'
+    await actions.screenshot({ path: join(output, `${label}-calendar-actions-loading.png`), animations: 'disabled' })
+    release.resolve()
+    await button(actions, 'New event').waitFor()
+    await actions.getByRole('link', { name: 'Download .ics' }).waitFor()
+    const after = await positions()
+    for (const [index, box] of after.entries()) {
+      for (const edge of ['x', 'y', 'width', 'height'])
+        assert(Math.abs(box[edge] - before[index][edge]) < 0.5, `${labels[index]} moved while Calendar loaded (${edge})`)
+    }
+    assert(await tools.evaluate((control, { x, y }) => control.contains(document.elementFromPoint(x, y)), { x, y }),
+      'The original pointer position still hits Personal tools')
+    await verifyCalendarActions(page, phone ? 44 : 36, `${label}-loaded`)
+    if (phone) await page.touchscreen.tap(x, y)
+    else await page.mouse.click(x, y)
+    await heading(panel, 'Personal tools').waitFor()
+    await enabledTools.press('Enter')
+    await panel.waitFor({ state: 'hidden' })
+    await fitsViewport(page)
+  }
+  finally {
+    release.resolve()
+    for (const path of lists) await page.unroute(path, holdList)
+    if (phone) await page.setViewportSize(viewport)
+  }
+}
+
 async function shareLaterReply(desktop, viewer, originalUrl, originalSubject) {
   const replyText = 'Please use the updated billing contact for the next payment.'
   const replySubject = `Re: ${originalSubject}`
@@ -2488,6 +2549,12 @@ async function calendarSharingJourney(captain) {
   await slots.getByText('12:00 PM – 2:00 PM', { exact: true }).waitFor()
   assert.equal(await availability.getByText('Private budget check', { exact: true }).count(), 0)
 
+  const commonActions = ['Manage calendars', 'Import .ics'].map(label => button(teammate, label))
+  const actionPositions = () => Promise.all(commonActions.map(control => control.evaluate((node) => {
+    const { left, top, width, height } = node.getBoundingClientRect()
+    return { x: left + scrollX, y: top + scrollY, width, height }
+  })))
+  const beforeRevocation = await actionPositions()
   await screenshot(captain, 'desktop-calendar-sharing')
   await button(sharing, `Revoke access for ${sender} to ${calendarLabel}`).click()
   await role.waitFor({ state: 'hidden' })
@@ -2496,6 +2563,9 @@ async function calendarSharingJourney(captain) {
   await busy.waitFor({ state: 'hidden' })
   await slots.waitFor({ state: 'hidden' })
   await button(teammate, /^Design & Research/).waitFor({ state: 'hidden' })
+  await button(teammate, 'Personal tools').waitFor()
+  const afterRevocation = await actionPositions()
+  assert.deepEqual(afterRevocation, beforeRevocation, 'Returning to personal calendars keeps the common toolbar targets in place')
   await context.close()
 }
 
@@ -3218,6 +3288,8 @@ try {
   await dayLabelJourney(desktop, phone)
   await calendarTasksJourney(desktop)
   await calendarTasksJourney(phone, true)
+  await verifyCalendarActionsDuringLoading(desktop)
+  await verifyCalendarActionsDuringLoading(phone, true)
   await calendarToolsJourney(desktop, phone)
   await snapshotSharingJourney(desktop, phone)
   await teamCollectionJourney(desktop)

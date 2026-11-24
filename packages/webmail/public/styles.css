@@ -594,7 +594,9 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-nav, .calendar-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: .75rem; }
 .calendar-nav { color: var(--muted); font-size: .875rem; overflow-wrap: anywhere; }
 .calendar-nav a { color: var(--accent); }
-.calendar-header { margin: 1.25rem 0; }
+.calendar-header { align-items: flex-start; margin: 1.25rem 0; }
+/* Keep the action row anchored as calendar-specific controls appear. */
+.calendar-header > .calendar-choices { flex: 0 1 55rem; min-inline-size: 0; }
 .calendar-header h1 { margin: 0; font-size: clamp(1.8rem, 4vw, 2.5rem); letter-spacing: -.04em; }
 .calendar-primary, .wm-snapshot-primary { background: var(--primary); color: var(--on-primary); }
 :is(.calendar-primary, .wm-snapshot-primary):hover:not(:disabled) { background: var(--primary-hover); }
@@ -877,7 +879,6 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 }
 @media (max-width: 490px) {
   .calendar-page { padding-inline: .8rem; }
-  .calendar-header .calendar-choices { width: 100%; }
   .calendar-search input { flex: 1; }
   .calendar-search { width: 100%; }
   .calendar-board-month .calendar-day { padding: .15rem; min-height: 3.125rem; }
@@ -1304,7 +1305,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 
 .calendar-nav, .health-nav { min-height: 44px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
 .calendar-nav a, .health-nav a { display: inline-flex; align-items: center; gap: 6px; text-decoration: none; font-weight: 600; }
-.calendar-heading { display: inline-flex; align-items: center; gap: 11px; }
+.calendar-heading { display: inline-flex; align-items: center; min-block-size: var(--control-height); gap: 11px; }
 .calendar-heading h1 { color: var(--text); }
 .calendar-workspace { border: 1px solid var(--border); border-radius: 14px; padding: clamp(10px, 2vw, 18px); background: var(--panel); box-shadow: var(--shadow); }
 .calendar-search .mail-search-field { min-width: min(12rem, 45vw); padding-inline-end: 4px; }

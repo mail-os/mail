@@ -163,12 +163,12 @@ onUnmounted(() => { destroy(); destroyReminders() })
   <header class="calendar-header">
     <div class="calendar-heading"><span class="mail-app-mark"><span class="mail-icon" data-icon="calendar" aria-hidden="true"></span></span><h1>Calendar</h1></div>
     <div :if="account" class="calendar-choices">
-      <button :if="!selectedShare" type="button" class="wm-action" :aria-expanded="taskPanelOpen" aria-controls="calendar-tasks" :disabled="taskBusy || toolsBusy" @click="changeTasksPanel()"><span class="mail-icon" data-icon="checklist" aria-hidden="true"></span>Tasks</button>
-      <button :if="!selectedShare" type="button" class="wm-action" :aria-expanded="toolsOpen" aria-controls="calendar-tools" :disabled="toolsBusy || taskBusy" @click="changeToolsPanel()"><span class="mail-icon" data-icon="bookmark" aria-hidden="true"></span>Personal tools</button>
       <button class="wm-action" @click="toggleCalendarSettings()" :disabled="loading && !calendarSettings" :aria-expanded="calendarSettings" aria-controls="calendar-settings"><span class="mail-icon" data-icon="settings" aria-hidden="true"></span>Manage calendars</button>
       <button class="wm-action" @click="toggleImport()" :disabled="importBusy" :aria-expanded="importOpen" aria-controls="calendar-import"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Import .ics</button>
-      <a :if="calendarExport" class="wm-action" :href="calendarExport"><span class="mail-icon" data-icon="download" aria-hidden="true"></span>Download .ics</a>
+      <button :if="!selectedShare" type="button" class="wm-action" :aria-expanded="taskPanelOpen" aria-controls="calendar-tasks" :disabled="taskBusy || toolsBusy" @click="changeTasksPanel()"><span class="mail-icon" data-icon="checklist" aria-hidden="true"></span>Tasks</button>
+      <button :if="!selectedShare" type="button" class="wm-action" :aria-expanded="toolsOpen" aria-controls="calendar-tools" :disabled="toolsBusy || taskBusy" @click="changeToolsPanel()"><span class="mail-icon" data-icon="bookmark" aria-hidden="true"></span>Personal tools</button>
       <button :if="canCreateEvent" class="wm-action calendar-primary" @click="openNewEvent()"><span class="mail-icon" data-icon="plus" aria-hidden="true"></span>New event</button>
+      <a :if="calendarExport" class="wm-action" :href="calendarExport"><span class="mail-icon" data-icon="download" aria-hidden="true"></span>Download .ics</a>
     </div>
   </header>
   <section :if="taskPanelOpen && !selectedShare" id="calendar-tasks" class="calendar-tasks" aria-labelledby="calendar-tasks-heading">
