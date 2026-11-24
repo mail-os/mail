@@ -10,15 +10,37 @@
 <script client>
 import { cancelMailReads, restoreMailReads } from '../functions/mail-api'
 import { inboxKey, inboxLabel, replyActivity, useSharedInbox, workflowActivity } from '../functions/use-shared-inbox'
+import { mailboxAccessLabel } from '../functions/use-team-mailbox-access'
 import { fullDate, readableBytes, senderAddress, senderInitials, shortDate } from '../functions/mail-utils'
 const {
   inboxes, selectedInbox, mailbox, listing, detail, reference, loading, opening, saving, error, ready, formatted,
   stageSettings, managingStages, editingStage, stageName, stageSender, toggleStages, editStage, moveRow, saveStage, retireStage,
   mount, refresh, selectInbox, turnPage, readMessage, closeMessage, attachmentPath, change, startReply, destroy,
   invitationPanel, invitationLabel, inviteTeam, inviteAddress, inviteBusy, inviteError, inviteNotice, sendInvite, decideInvite,
+  accessSource, accessTeams, accessTeam, accessAddress, accessScope, accessLoading, accessBusy, accessLoadError, accessError,
+  accessNotice, inviteForAddress, mailboxGrants, canGrantAccess, refreshMailboxAccess, selectAccessTeam, setAccessOpen,
+  grantMailboxAccess, revokeMailboxAccess,
 } = useSharedInbox(() => navigate('/login', { reload: true }), (uid, id) => navigate('/?sharedReplyDraft=' + uid + '.' + encodeURIComponent(id), { reload: true }))
 const readerHeading = useRef('sharedTitle')
 const listHeading = useRef('sharedListTitle')
+const invitationDetails = useRef('invitationDetails')
+const invitationField = useRef('invitationField')
+const accessDetails = useRef('accessDetails')
+const accessField = useRef('accessField')
+const canInviteForAccess = derived(() => invitationPanel().teams.some(team => team.id === accessTeam()))
+function openInvitationForAccess() {
+  if (!canInviteForAccess() || inviteBusy()) return
+  inviteTeam.set(accessTeam())
+  inviteAddress.set(inviteForAddress())
+  const panel = invitationDetails.current as HTMLDetailsElement | null
+  if (panel) panel.open = true
+  nextTick(() => invitationField.current?.focus())
+}
+async function removeMailboxAccess(grant: Parameters<typeof revokeMailboxAccess>[0]) {
+  await revokeMailboxAccess(grant)
+  const panel = accessDetails.current as HTMLDetailsElement | null
+  if (panel?.open && accessNotice()) nextTick(() => accessField.current?.focus())
+}
 async function openSharedMessage(id) {
   await readMessage(id)
   nextTick(() => readerHeading.current?.focus())
@@ -47,17 +69,17 @@ useEventListener('online', refresh)
     </select></div>
     <button type="button" class="wm-action" @click="refresh()" :disabled="saving || loading" aria-label="Refresh shared inbox" title="Refresh shared inbox"><span class="mail-icon" data-icon="refresh" aria-hidden="true"></span></button>
   </header>
-  <details :if="invitationPanel.teams.length || invitationPanel.incoming.length || invitationPanel.sent.length || inviteNotice || inviteError" class="wm-team-invitations">
+  <details :if="invitationPanel.teams.length || invitationPanel.incoming.length || invitationPanel.sent.length || inviteNotice || inviteError" class="wm-team-panel wm-team-invitations" name="shared-inbox-tools" ref="invitationDetails">
     <summary :text="invitationLabel"></summary>
-    <div class="wm-team-invitations-body">
+    <div class="wm-team-panel-body wm-team-invitations-body">
       <form :if="invitationPanel.teams.length" @submit.prevent="sendInvite()">
-        <div class="wm-team-invite-field">
+        <div class="wm-team-field">
           <label for="team-invitation-team">Team</label>
           <select id="team-invitation-team" :value="inviteTeam" @change="inviteTeam.set($event.target.value)" :disabled="inviteBusy">
             <option :for="team in invitationPanel.teams" :key="team.id" :value="team.id" :text="team.name"></option>
           </select>
         </div>
-        <label>Teammate<input type="email" x-model="inviteAddress" required maxlength="254" autocomplete="off" :disabled="inviteBusy"></label>
+        <label>Teammate<input type="email" ref="invitationField" x-model="inviteAddress" required maxlength="254" autocomplete="off" :disabled="inviteBusy"></label>
         <button type="submit" class="wm-action wm-action--accent" :disabled="inviteBusy">Invite to team</button>
       </form>
       <ul :if="invitationPanel.incoming.length" aria-label="Invitations to join">
@@ -77,6 +99,47 @@ useEventListener('online', refresh)
       </ul>
       <p :if="inviteNotice" role="status" :text="inviteNotice"></p>
       <p :if="inviteError" class="wm-inline-error" role="alert" :text="inviteError"></p>
+    </div>
+  </details>
+  <details :if="accessTeams.length" class="wm-team-panel wm-team-access" name="shared-inbox-tools" ref="accessDetails" @toggle="setAccessOpen($event.currentTarget.open)">
+    <summary>Share mailbox</summary>
+    <div class="wm-team-panel-body wm-team-access-body">
+      <p class="wm-team-access-description wm-team-access-source"><strong :text="accessSource"></strong><span>Sharing an existing mailbox uses no extra seats.</span></p>
+      <form @submit.prevent="grantMailboxAccess()">
+        <div class="wm-team-field">
+          <label for="mailbox-access-team">Team</label>
+          <select id="mailbox-access-team" :value="accessTeam" @change="selectAccessTeam($event.target.value)" :disabled="accessBusy">
+            <option :for="team in accessTeams" :key="team.id" :value="team.id" :text="team.name"></option>
+          </select>
+        </div>
+        <label>Teammate<input ref="accessField" type="email" x-model="accessAddress" required maxlength="254" autocomplete="off" placeholder="name@example.com" :disabled="accessBusy"></label>
+        <div class="wm-team-field">
+          <label for="mailbox-access-scope">Access</label>
+          <select id="mailbox-access-scope" x-model="accessScope" :disabled="accessBusy">
+            <option value="mailbox">Read and manage Inbox</option>
+            <option value="sender">Send from this address</option>
+          </select>
+        </div>
+        <button type="submit" class="wm-action wm-action--accent" :disabled="!canGrantAccess"><span class="mail-icon" data-icon="people" aria-hidden="true"></span>Grant access</button>
+      </form>
+      <div :if="accessLoadError" class="wm-team-access-feedback">
+        <p class="wm-inline-error" role="alert" :text="accessLoadError"></p>
+        <button type="button" class="wm-action" :disabled="accessLoading || accessBusy" @click="refreshMailboxAccess()">Try again</button>
+      </div>
+      <div :if="accessError" class="wm-team-access-feedback">
+        <p class="wm-inline-error" role="alert" :text="accessError"></p>
+        <button :if="inviteForAddress && canInviteForAccess" type="button" class="wm-action" :disabled="inviteBusy" @click="openInvitationForAccess()"><span class="mail-icon" data-icon="people" aria-hidden="true"></span>Invite teammate</button>
+        <p :if="inviteForAddress && !canInviteForAccess">Ask a team owner to invite them.</p>
+      </div>
+      <p :if="accessNotice" role="status" :text="accessNotice"></p>
+      <p :if="accessLoading && !mailboxGrants.length" role="status">Loading mailbox access…</p>
+      <p :if="!accessLoading && !accessLoadError && !mailboxGrants.length" class="wm-team-access-description">No teammates have access to this mailbox on this team.</p>
+      <ul :if="mailboxGrants.length" aria-label="Current mailbox access" :aria-busy="accessLoading">
+        <li :for="grant in mailboxGrants" :key="grant.grantee + ':' + grant.scope">
+          <div><strong :text="grant.grantee"></strong><span :text="mailboxAccessLabel(grant.scope)"></span></div>
+          <button type="button" class="wm-action wm-action--danger" :disabled="accessBusy || accessLoading || !!accessLoadError" :aria-label="'Revoke ' + mailboxAccessLabel(grant.scope) + ' for ' + grant.grantee" @click="removeMailboxAccess(grant)">Revoke</button>
+        </li>
+      </ul>
     </div>
   </details>
   <p :if="error" class="wm-inline-error wm-shared-error" role="alert" :text="error"></p>

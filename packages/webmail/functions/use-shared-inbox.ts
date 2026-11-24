@@ -3,6 +3,7 @@ import { derived, state } from '@stacksjs/stx'
 import { createMailApi, MailApiError } from './mail-api'
 import { renderMailReader } from './mail-reader'
 import { useTeamInvitations } from './use-team-invitations'
+import { useTeamMailboxAccess } from './use-team-mailbox-access'
 
 interface Inbox { team: string, name: string, id: string, address: string }
 interface Teammate { id: string, address: string }
@@ -97,12 +98,14 @@ export function useSharedInbox(signIn: () => void, openReplyDraft: (uid: number,
     clearStages()
     closeMessage()
     invitations.clearInvitations()
+    access.clearMailboxAccess()
   }
   const api = createMailApi(() => account() || undefined, () => {
     clear()
     signIn()
   }, () => active)
   const invitations = useTeamInvitations(api, refresh)
+  const access = useTeamMailboxAccess(api, account)
 
   function messagePath(inbox: string, id: string) { return endpoint + '/' + inbox + '/messages/' + encodeURIComponent(id) }
   function stagesPath(inbox: string) { return endpoint + '/' + inbox + '/stages' }
@@ -198,6 +201,7 @@ export function useSharedInbox(signIn: () => void, openReplyDraft: (uid: number,
     const request = ++listRequest
     loading.set(true)
     try {
+      void access.refreshMailboxAccess()
       const [available] = await Promise.all([api<Inbox[]>(endpoint), invitations.refreshInvitations()])
       if (request !== listRequest || !active) return
       inboxes.set(available)
@@ -333,7 +337,7 @@ export function useSharedInbox(signIn: () => void, openReplyDraft: (uid: number,
   return { inboxes, selectedInbox, mailbox, listing, detail, reference, loading, opening, saving, error, ready, formatted,
     stageSettings, managingStages, editingStage, stageName, stageSender, toggleStages, editStage, moveRow, saveStage, retireStage,
     mount, refresh, selectInbox, turnPage, readMessage, closeMessage, attachmentPath, change, startReply,
-    ...invitations,
+    ...invitations, ...access, accessSource: account,
     destroy() {
       active = false
       clear()

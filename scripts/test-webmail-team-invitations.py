@@ -352,11 +352,25 @@ def main():
             replaced_team, successor, departed, action = verify_offboarding(test, db)
             if args.browser:
                 assert args.screenshots is not None
+                command(test, "team", "create", "second-studio", "Second Studio", owner)
+                for mailbox, subject in ((owner, "A message in the shared Inbox"),
+                                         (recipient, "A message in the personal Inbox")):
+                    expect(test.api(test.login(mailbox), "sender-review", {"setting": "disable"}, "PUT"))
+                    assert test.deliver(mailbox, subject=subject)[0] == 250
+                assignments = db.execute("SELECT mailbox,revision FROM provisioned_mailboxes ORDER BY mailbox").fetchall()
                 env = dict(os.environ, MAIL_INVITE_TEST_URL=test.webmail, MAIL_INVITE_TEST_CERT=test.env["SMTP_TLS_CERT"],
                            MAIL_INVITE_TEST_OWNER=owner, MAIL_INVITE_TEST_RECIPIENT=recipient,
                            MAIL_INVITE_TEST_PASSWORD=test.password)
                 subprocess.run(["node", str(HERE / "webmail-team-invitations-browser.mjs"), args.browser,
                                 str(args.screenshots.resolve())], env=env, check=True)
+                assert assignments == db.execute("SELECT mailbox,revision FROM provisioned_mailboxes ORDER BY mailbox").fetchall()
+                events = db.execute("""SELECT action,details FROM audit_log
+                                       WHERE target='studio' AND actor=? AND action IN ('team.grant','team.revoke')
+                                       ORDER BY id""", (owner,)).fetchall()
+                assert [(action, json.loads(detail)["scope"]) for action, detail in events][-4:] == [
+                    ("team.grant", "mailbox"), ("team.grant", "sender"),
+                    ("team.revoke", "mailbox"), ("team.revoke", "sender"),
+                ]
         renamed = "renamed.example.test"
         command(test, "domain", "migrate", hosted, renamed, "--yes")
         for key in ("SMTP_LOCAL_DOMAINS", "SMTP_EXACT_MAILBOX_DOMAINS", "SMTP_PROVISIONING_ADDITIONAL_DOMAINS"):

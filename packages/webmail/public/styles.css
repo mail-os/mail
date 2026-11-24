@@ -1716,20 +1716,32 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-shared-sender div span, .wm-shared-sender time { color: var(--muted); font-size: 12px; }
 .wm-shared-sender time { margin-inline-start: auto; }
 .wm-shared-empty { padding: 18px; color: var(--muted); font-size: 14px; }
-.wm-team-invitations { border-block-end: 1px solid var(--border); background: var(--panel); flex-shrink: 0; max-block-size: min(55dvh, 26rem); overflow: auto; }
-.wm-team-invitations summary { padding: 8px 20px; min-block-size: var(--control-height); font-weight: 600; cursor: pointer; }
-.wm-team-invitations summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
-.wm-team-invitations-body { display: grid; gap: 12px; max-inline-size: 52rem; padding: 4px 20px 16px; }
-.wm-team-invitations-body form { display: grid; align-items: end; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) max-content; gap: 12px; }
-.wm-team-invitations-body :is(form > label, .wm-team-invite-field) { display: grid; gap: var(--control-label-gap); min-inline-size: 0; }
-.wm-team-invitations-body label { color: var(--muted); font-size: 13px; font-weight: 550; }
-.wm-team-invitations-body :is(p, ul) { margin: 0; }
-.wm-team-invitations-body ul { display: grid; gap: 6px; padding: 0; list-style: none; }
-.wm-team-invitations-body li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; border-radius: var(--control-radius); background: var(--surface); overflow-wrap: anywhere; }
-.wm-team-invitations-body li span { display: block; margin-block-start: 3px; color: var(--muted); }
+.wm-team-panel { border-block-end: 1px solid var(--border); background: var(--panel); flex-shrink: 0; max-block-size: min(55dvh, 26rem); overflow: auto; }
+.wm-team-panel summary { padding: 8px 20px; min-block-size: var(--control-height); font-weight: 600; cursor: pointer; }
+.wm-team-panel summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+.wm-team-panel-body { display: grid; gap: 12px; max-inline-size: 52rem; padding: 4px 20px 16px; }
+.wm-team-panel-body form { display: grid; align-items: end; gap: 12px; }
+.wm-team-invitations-body form { grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) max-content; }
+.wm-team-access-body form { grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr) minmax(12rem, 1.1fr) max-content; }
+.wm-team-panel-body :is(form > label, .wm-team-field) { display: grid; gap: var(--control-label-gap); min-inline-size: 0; }
+.wm-team-panel-body label { color: var(--muted); font-size: 13px; font-weight: 550; }
+.wm-team-panel-body :is(p, ul) { margin: 0; }
+.wm-team-panel-body ul { display: grid; gap: 6px; padding: 0; list-style: none; }
+.wm-team-panel-body li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; border-radius: var(--control-radius); background: var(--surface); overflow-wrap: anywhere; }
+.wm-team-panel-body li span { display: block; margin-block-start: 3px; color: var(--muted); }
 .wm-team-invitation-actions { display: flex; gap: 8px; }
+.wm-team-access-description { color: var(--muted); overflow-wrap: anywhere; }
+.wm-team-access-description strong { color: var(--text); }
+.wm-team-access-source { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.wm-team-access-feedback { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.wm-team-access-feedback p { flex: 1 1 16rem; }
+.wm-team-access-body button[type=submit] { justify-content: center; }
+@media (580px < width <= 740px) {
+  .wm-team-access-body form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 @media (max-width: 580px) {
-  .wm-team-invitations-body form { grid-template-columns: minmax(0, 1fr); }
+  .wm-team-panel-body form { grid-template-columns: minmax(0, 1fr); }
+  .wm-team-access { max-block-size: min(64dvh, 32rem); }
 }
 .wm-shared-text { white-space: pre-wrap; font: inherit; line-height: 1.55; }
 .wm-shared-html { width: 100%; min-height: 420px; }

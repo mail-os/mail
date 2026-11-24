@@ -791,10 +791,11 @@ paid seat and creates the mailbox and team membership together. Open
 invitations expire after seven days. The domain owner can revoke one before
 mailbox setup starts.
 
-Accepting adds the recipient as a member. Share inboxes, senders, or
-calendars using the team's explicit grants. Invite, acceptance, decline,
-and revocation events appear in the team audit log. The service domain
-continues to use the operator enrollment workflow above.
+Accepting adds the recipient as a member. In the source mailbox, open
+**Shared inboxes → Share mailbox** to grant Inbox or send-as access.
+Use **Manage calendars** in Calendar for calendar access. Invitations,
+membership and access changes appear in the team audit log. The service
+domain continues to use the operator enrollment workflow above.
 
 ### Calendar shares
 
@@ -902,11 +903,16 @@ personal account. Grant `sender` separately to allow sending from the address.
 
 On a hosted paid domain, a dedicated shared address uses one paid mailbox
 seat. Each new personal mailbox also uses one seat on the subscription that
-provisions it, including mailboxes created through invitations. Grant an
-existing teammate Inbox or sender access through
-`PUT /webmail/api/teams/:id/grants` while signed in as the source mailbox.
-Grants use no additional seats. Revoking a grant removes that access and
-keeps both mailboxes and their seat assignments active.
+provisions it, including mailboxes created through invitations. Grants to
+existing teammates use no additional seats.
+
+Sign in to the mailbox you want to share and open **Shared inboxes →
+Share mailbox**. Choose the team, enter your teammate's mailbox address, and
+choose **Read and manage Inbox** or **Send from this address**. Grant both
+permissions separately if the teammate needs both. An eligible hosted team
+owner can open a prefilled invitation when the teammate has yet to join.
+Current grants appear below the form. Revoke either permission there while
+keeping both mailboxes and their seat assignments active.
 
 Open **Shared inboxes** in webmail to read incoming messages, assign a teammate,
 resolve or reopen work, and see who changed it. The view covers the Inbox,
