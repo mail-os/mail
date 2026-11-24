@@ -900,6 +900,14 @@ other mailboxes, and catch-all routing handles otherwise-unmatched addresses.
 The mailbox grant shares work on a mailbox. A teammate still signs in to their
 personal account. Grant `sender` separately to allow sending from the address.
 
+On a hosted paid domain, a dedicated shared address uses one paid mailbox
+seat. Each new personal mailbox also uses one seat on the subscription that
+provisions it, including mailboxes created through invitations. Grant an
+existing teammate Inbox or sender access through
+`PUT /webmail/api/teams/:id/grants` while signed in as the source mailbox.
+Grants use no additional seats. Revoking a grant removes that access and
+keeps both mailboxes and their seat assignments active.
+
 Open **Shared inboxes** in webmail to read incoming messages, assign a teammate,
 resolve or reopen work, and see who changed it. The view covers the Inbox,
 while the source mailbox keeps its own folders, sessions, and personal
