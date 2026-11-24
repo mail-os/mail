@@ -77,7 +77,9 @@ async function signIn() {
       <input id="signInFactor" ref="factorField" type="text" x-model.trim="factor" autocomplete="one-time-code" autocapitalize="off" spellcheck="false" maxlength="32" required :disabled="busy">
     </div>
     <p :if="error" :text="error" class="login-error" role="alert"></p>
-    <button type="submit" :disabled="busy" :text="busy ? 'Signing in…' : needsFactor ? 'Verify and sign in' : 'Sign in'"></button>
+    <PrimaryButton type="submit" :disabled="busy">
+      <span :text="busy ? 'Signing in…' : needsFactor ? 'Verify and sign in' : 'Sign in'"></span>
+    </PrimaryButton>
     <button :if="needsFactor && !hosted" type="button" class="login-secondary" :disabled="busy" @click="editCredentials()">Change sign-in details</button>
   </form>
   <p :if="hosted" class="login-forgot"><a class="login-link" href="/login">Use mailbox password</a></p>

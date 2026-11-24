@@ -111,8 +111,9 @@ async function verifyControlRow(container, selector, height, sameRow = true, min
     const style = getComputedStyle(node)
     const box = node.getBoundingClientRect()
     const quiet = node.matches('.wm-list-toggle, .wm-action--quiet')
-    const primary = node.matches('.calendar-primary, .wm-snapshot-primary, .wm-compose-btn, .wm-send-btn, .login button:not(.login-secondary), .wm-writing-settings .wm-writing-save') && !node.matches(':disabled')
-    const borderToken = primary ? '--primary-button-border' : '--control-border'
+    const primary = node.matches('.mail-primary-button, .calendar-primary, .wm-snapshot-primary, .wm-compose-btn, .wm-send-btn, .login button:not(.login-secondary, .wm-action), .wm-writing-settings .wm-writing-save')
+    const enabledPrimary = primary && node.matches(':enabled')
+    const borderToken = enabledPrimary ? '--primary-button-border' : '--control-border'
     const borderChannels = style.getPropertyValue(borderToken).trim().slice(1).match(/../g)
     const border = `rgb(${borderChannels?.map(channel => Number.parseInt(channel, 16)).join(', ')})`
     return {
@@ -126,6 +127,9 @@ async function verifyControlRow(container, selector, height, sameRow = true, min
       right: box.right,
       borderToken: quiet ? null : borderToken,
       borderMatches: style.border === `1px solid ${border}`,
+      primary,
+      enabledPrimary,
+      gradient: style.backgroundImage.startsWith('linear-gradient('),
       opacity: style.opacity,
       radius: style.borderRadius,
       fontSize: style.fontSize,
@@ -136,6 +140,7 @@ async function verifyControlRow(container, selector, height, sameRow = true, min
     assert(Math.abs(control.height - height) < 0.5, `${control.name} should be ${height}px tall, got ${control.height}px`)
     assert.equal(control.radius, '8px', `${control.name} should use the shared control radius`)
     if (control.borderToken) assert(control.borderMatches, `${control.name} should use a one-pixel ${control.borderToken} border`)
+    if (control.primary) assert.equal(control.gradient, control.enabledPrimary, `${control.name} should show the gradient only while enabled`)
     for (const other of controls) {
       if (sameRow || (control.top < other.bottom - 0.5 && control.bottom > other.top + 0.5)) {
         assert(Math.abs(control.top - other.top) < 0.5, `${control.name} and ${other.name} should align at the top`)
@@ -598,6 +603,8 @@ async function verifyAppearance(page, scheme, contrast = 'no-preference') {
       ['--violet', '--sidebar'], ['--teal', '--sidebar'], ['--warning', '--sidebar'],
       ['--accent', '--accent-soft'], ['--warning', '--warning-soft'],
       ['--on-primary', '--primary'], ['--on-primary', '--primary-hover'], ['--message-selection-text', '--message-selection'],
+      ['--on-primary', '--primary-button-top'], ['--on-primary', '--primary-button-bottom'],
+      ['--on-primary', '--primary-button-hover-top'], ['--on-primary', '--primary-button-hover-bottom'],
       ['--message-selection-muted', '--message-selection'],
     ]
     const surfaces = ['--panel', '--toolbar', '--surface', '--sidebar', '--control-fill']

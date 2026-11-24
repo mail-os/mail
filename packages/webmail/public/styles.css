@@ -30,6 +30,10 @@
   --primary: #0866d4;
   --primary-hover: #0756b4;
   --primary-button-border: var(--primary);
+  --primary-button-top: #2872d5;
+  --primary-button-bottom: var(--primary);
+  --primary-button-hover-top: #1b6bd1;
+  --primary-button-hover-bottom: var(--primary-hover);
   --on-primary: #ffffff;
   --accent-soft: #ebf3ff;
   --selected: #d9e7fc;
@@ -74,6 +78,10 @@
     --primary: #2068c4;
     --primary-hover: #2d75d0;
     --primary-button-border: #347cda;
+    --primary-button-top: #2e74d1;
+    --primary-button-bottom: #1a5bb8;
+    --primary-button-hover-top: var(--primary-hover);
+    --primary-button-hover-bottom: #2466c5;
     --accent-soft: #2b3d59;
     --selected: #304463;
     --selection-edge: #79baff;
@@ -161,7 +169,7 @@ body {
 
 /* Mailbox shell and reusable controls. */
 :where(button, input, textarea, select) { font: inherit; }
-:where(input:not([type=checkbox], [type=radio], [type=hidden], [hidden], .wm-file-input), select, textarea, .wm-action, .mail-search-field, .calendar-picker-field) {
+:where(input:not([type=checkbox], [type=radio], [type=hidden], [hidden], .wm-file-input), select, textarea, .wm-action, .mail-primary-button, .mail-search-field, .calendar-picker-field) {
   min-inline-size: 0;
   max-inline-size: 100%;
   min-block-size: var(--control-height);
@@ -238,7 +246,6 @@ input:is([type=date], [type=time], [type=datetime-local]):focus-within { outline
 .wm-folders { display: flex; flex-direction: column; gap: 16px; padding: 20px 12px; background: var(--sidebar); border-right: 1px solid var(--border); min-height: 0; }
 .wm-brand { padding: 0 12px; font-size: 20px; font-weight: 750; letter-spacing: -.5px; }
 .wm-compose-btn, .wm-send-btn { padding: 10px 19px; border: 1px solid var(--control-border); border-radius: var(--control-radius); background: var(--primary); color: var(--on-primary); font-weight: 650; }
-.wm-compose-btn:hover:not(:disabled), .wm-send-btn:hover:not(:disabled), .login button:hover:not(:disabled):not(.login-secondary, .wm-writing-settings button) { background: var(--primary-hover); }
 .wm-folder-list { display: flex; flex-direction: column; gap: 3px; flex: 1; overflow-y: auto; }
 .wm-folder { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 12px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); text-align: left; white-space: nowrap; }
 .wm-folder:hover { background: var(--hover); }
@@ -615,8 +622,6 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-secondary-actions { display: contents; }
 .calendar-header :is(.calendar-actions-toggle, .calendar-header-create-phone), .calendar-free-time-short, .calendar-manage-short { display: none; }
 .calendar-header h1 { margin: 0; font-size: clamp(1.8rem, 4vw, 2.5rem); letter-spacing: -.04em; }
-.calendar-primary, .wm-snapshot-primary { background: var(--primary); color: var(--on-primary); }
-:is(.calendar-primary, .wm-snapshot-primary):is(:hover, :active):not(:disabled) { background: var(--primary-hover); }
 .calendar-loading { color: var(--muted); }
 .calendar-colors { display: flex; flex-wrap: wrap; gap: .45rem 1.25rem; margin-top: .75rem; }
 .calendar-colors label { display: flex; align-items: center; gap: .45rem; }
@@ -1293,8 +1298,6 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-writing-settings .wm-writing-remove:hover .mail-icon { color: inherit; }
 .wm-writing-settings .wm-private-form { gap: 12px; }
 .wm-writing-settings .wm-private-form label { margin: 0; }
-.wm-writing-settings .wm-writing-save { background: var(--primary); color: var(--on-primary); }
-.wm-writing-settings .wm-writing-save:hover:not(:disabled) { background: var(--primary-hover); }
 .wm-writing-insert { margin: 0 20px 10px; font-size: 13px; }
 .wm-writing-insert summary { width: fit-content; font-weight: 550; color: var(--accent); cursor: pointer; }
 .wm-writing-control { display: grid; grid-template-columns: 60px minmax(0, 220px) auto; align-items: center; justify-content: start; gap: 8px; margin-top: 8px; }
@@ -1636,15 +1639,26 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .calendar-view-toolbar .calendar-view-modes { flex-basis: 100%; }
 }
 
-/* Enabled blue buttons keep a blue edge. Disabled controls use the shared neutral outline. */
-:is(.calendar-primary, .wm-snapshot-primary, .wm-compose-btn, .wm-send-btn):not(:disabled),
-.login button:not(.login-secondary, :disabled),
-.wm-writing-settings .wm-writing-save:not(:disabled) { border-color: var(--primary-button-border); }
+/* The highlight stays inside the blue outline, away from the label. */
+:is(.mail-primary-button, .calendar-primary, .wm-snapshot-primary, .wm-compose-btn, .wm-send-btn,
+    .login button:not(.login-secondary, .wm-action), .wm-writing-settings .wm-writing-save):enabled {
+  border-color: var(--primary-button-border);
+  background-color: var(--primary);
+  background-image: linear-gradient(180deg, var(--primary-button-top), var(--primary-button-bottom));
+  color: var(--on-primary);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / .18);
+
+  &:hover {
+    background-image: linear-gradient(180deg, var(--primary-button-hover-top), var(--primary-button-hover-bottom));
+  }
+
+  &:active { box-shadow: inset 0 1px 2px rgb(0 0 0 / .22); }
+}
 
 .wm-action:disabled { opacity: 1; color: var(--control-disabled-text); }
 .wm-action:disabled .mail-icon { color: inherit; }
 :where(.wm-action:disabled) { background-color: var(--surface); }
-:is(.calendar-primary, .wm-snapshot-primary, .wm-snapshot-panel .wm-action, .wm-compose-btn, .wm-send-btn, .wm-message-toolbar .wm-tool-move .wm-tool, .login button, .wm-writing-settings .wm-writing-save):disabled {
+:is(.mail-primary-button, .calendar-primary, .wm-snapshot-primary, .wm-snapshot-panel .wm-action, .wm-compose-btn, .wm-send-btn, .wm-message-toolbar .wm-tool-move .wm-tool, .login button, .wm-writing-settings .wm-writing-save):disabled {
   opacity: 1;
   background: var(--surface);
   color: var(--control-disabled-text);

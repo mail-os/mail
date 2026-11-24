@@ -270,7 +270,9 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
   <aside class="wm-folders" aria-label="Mail navigation" :class="{ 'wm-folders--expanded': foldersExpanded }" @keydown.escape="closeFolders(true)">
     <div class="wm-brand"><span class="mail-app-mark" role="img" aria-label="Mail"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span></span><span aria-hidden="true">Mail</span></div>
     <button ref="foldersToggle" type="button" class="wm-folders-toggle wm-action" :aria-expanded="foldersExpanded" aria-controls="mailNavigation" @click="foldersExpanded.set(!foldersExpanded())"><span class="mail-icon" data-icon="sidebar" aria-hidden="true"></span>Mailboxes<span class="mail-icon wm-mailboxes-indicator" data-icon="down" aria-hidden="true"></span></button>
-    <button type="button" class="wm-compose-btn" @click="startComposition()" :disabled="sending || sendUncertain"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span><span :text="hasComposition ? 'Resume draft' : 'Compose'"></span></button>
+    <PrimaryButton type="button" button-class="wm-compose-btn" @click="startComposition()" :disabled="sending || sendUncertain">
+      <span class="mail-icon" data-icon="compose" aria-hidden="true"></span><span :text="hasComposition ? 'Resume draft' : 'Compose'"></span>
+    </PrimaryButton>
     <div id="mailNavigation" class="wm-navigation">
       <nav class="wm-folder-list" aria-label="Mail folders" @click="activateMailbox($event)">
         <div class="wm-nav-group">
@@ -906,7 +908,9 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         <button type="button" class="wm-action" @click="scheduleOpen.set(false)" :disabled="sending || sendUncertain">Send now instead</button>
         <small id="composeTimeZone" :text="scheduleZone"></small>
       </div>
-      <button class="wm-send-btn" type="submit" :disabled="sending || sendUncertain || savingDraft || attachmentPending || fileLinkUploading || draftConflict || authExpired"><span class="mail-icon" :data-icon="scheduleOpen ? 'clock' : 'send'" aria-hidden="true"></span><span :text="sending ? (externalSender && !externalSendReview ? 'Loading review…' : 'Queuing…') : externalSender && !externalSendReview ? 'Review send' : scheduleOpen ? 'Schedule send' : 'Send'"></span></button>
+      <PrimaryButton type="submit" button-class="wm-send-btn" :disabled="sending || sendUncertain || savingDraft || attachmentPending || fileLinkUploading || draftConflict || authExpired">
+        <span class="mail-icon" :data-icon="scheduleOpen ? 'clock' : 'send'" aria-hidden="true"></span><span :text="sending ? (externalSender && !externalSendReview ? 'Loading review…' : 'Queuing…') : externalSender && !externalSendReview ? 'Review send' : scheduleOpen ? 'Schedule send' : 'Send'"></span>
+      </PrimaryButton>
       <button :if="!scheduleOpen" class="wm-action" type="button" @click="chooseSendTime()" :disabled="sending || sendUncertain"><span class="mail-icon" data-icon="clock" aria-hidden="true"></span>Send later</button>
       <button class="wm-action" type="button" @click="saveDraft()" :disabled="sending || savingDraft || attachmentPending || fileLinkUploading"><span class="mail-icon" data-icon="document" aria-hidden="true"></span><span :text="savingDraft ? 'Saving…' : 'Save draft'"></span></button>
       <button class="wm-action wm-action--danger" type="button" @click="showConfirmation('discard')" :disabled="sending || savingDraft || fileLinkUploading"><span class="mail-icon" data-icon="trash" aria-hidden="true"></span>Discard</button>
@@ -963,7 +967,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
     <form :if="mfaStatus?.available && !mfaStatus.enabled && !mfaSecret" @submit.prevent="submitMfaSetup()">
       <label for="mfaPassword">Current mailbox password</label>
       <input id="mfaPassword" ref="mfaPasswordField" type="password" x-model="mfaPassword" autocomplete="current-password" maxlength="1024" required :disabled="mfaBusy">
-      <button type="submit" :disabled="mfaBusy">Set up authenticator</button>
+      <PrimaryButton type="submit" :disabled="mfaBusy">Set up authenticator</PrimaryButton>
     </form>
     <form :if="mfaSecret" @submit.prevent="submitMfaConfirmation()">
       <p id="mfaSetupInstructions" class="login-sub">Add a time-based account in your authenticator with this setup key, then enter the six-digit code.</p>
@@ -1031,7 +1035,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       </select>
       <label for="clientMailboxPassword">Mailbox password</label>
       <input id="clientMailboxPassword" type="password" x-model="clientMailboxPassword" autocomplete="current-password" required>
-      <button type="submit" :disabled="clientPasswordsBusy">Create app password</button>
+      <PrimaryButton type="submit" :disabled="clientPasswordsBusy">Create app password</PrimaryButton>
     </form>
   </div>
 </section>

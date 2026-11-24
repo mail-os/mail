@@ -357,7 +357,9 @@ onUnmounted(() => { destroy(); destroyReminders() })
         <label>Access<select x-model="shareAccessInput" :disabled="calendarSettingsBusy">
           <option value="viewer">View events</option><option value="editor">Edit events</option><option value="free_busy">Free/busy only</option>
         </select></label>
-        <button type="submit" class="wm-action calendar-primary" :disabled="calendarSettingsBusy"><span class="mail-icon" data-icon="people" aria-hidden="true"></span>Share calendar</button>
+        <PrimaryButton type="submit" button-class="wm-action calendar-primary" :disabled="calendarSettingsBusy">
+          <span class="mail-icon" data-icon="people" aria-hidden="true"></span>Share calendar
+        </PrimaryButton>
       </form>
       <ul :if="outgoingShares.length" class="calendar-share-list" aria-label="Calendar access you granted">
         <li :for="share in outgoingShares" :key="share.team + ':' + share.calendarId + ':' + share.grantee">
