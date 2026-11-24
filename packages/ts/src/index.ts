@@ -398,6 +398,17 @@ export interface MailProvisioningAccessChange {
   access_window: MailboxAccessWindow
 }
 
+export interface MailProvisioningTeamChange {
+  mailbox: string
+  actor: string
+  name: string
+}
+
+export interface MailProvisioningTeamResult {
+  team: { id: string, name: string, domain: string } | null
+  created: boolean
+}
+
 export class MailProvisioningError extends Error {
   constructor(public status: number, public code: string, message: string) {
     super(message)
@@ -420,7 +431,7 @@ export class MailProvisioningClient {
     this.origin = url.origin
   }
 
-  private async request<T>(path: string, data?: MailProvisioningChange | MailProvisioningAccessChange): Promise<T> {
+  private async request<T>(path: string, data?: MailProvisioningChange | MailProvisioningAccessChange | MailProvisioningTeamChange): Promise<T> {
     const response = await (this.options.fetch ?? fetch)(`${this.origin}/provisioning/v1/${path}`, {
       method: data ? 'POST' : 'GET',
       headers: {
@@ -463,6 +474,14 @@ export class MailProvisioningClient {
   /** Update service and export deadlines while preserving operator settings. */
   applyAccess(change: MailProvisioningAccessChange): Promise<ProvisionedMailbox> {
     return this.request('mailbox/access', change)
+  }
+
+  team(mailbox: string, actor: string): Promise<MailProvisioningTeamResult> {
+    return this.request(`team?${new URLSearchParams({ mailbox, actor })}`)
+  }
+
+  createTeam(change: MailProvisioningTeamChange): Promise<MailProvisioningTeamResult> {
+    return this.request('team', change)
   }
 }
 

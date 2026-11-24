@@ -62,6 +62,14 @@ endpoint before creating customer mailboxes. The daemon reports eligibility
 from its configuration. Verify the account's DNS ownership claim in Stacks
 before offering customer setup.
 
+For team setup, the private `GET /provisioning/v1/team` takes the full
+`mailbox` and provisioning `actor`. `POST /provisioning/v1/team` takes
+those fields and the team `name`. The selected mailbox needs an active paid
+service window on the additional domain. The first successful request
+creates the team and appoints that mailbox as owner. Retries return the
+existing team for the domain. The native domain rename moves that binding
+with the mailbox addresses.
+
 Run `python3 scripts/test-hosted-domains.py /path/to/mail` to exercise this
 configuration with two disposable domains over native SMTP, IMAP, webmail,
 EWS, and ActiveSync. Rehearse DNS, import, and roll back with a staging domain

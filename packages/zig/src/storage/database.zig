@@ -5093,6 +5093,12 @@ pub const Database = struct {
             if (i == 0) moved = @intCast(sqlite.sqlite3_changes(self.db));
         }
 
+        const move_team = try self.prepareLocked("UPDATE mail_hosted_teams SET domain=?2 WHERE domain=?1");
+        defer move_team.finalize();
+        try move_team.bind(1, old_domain);
+        try move_team.bind(2, new_domain);
+        _ = try move_team.step();
+
         for ([_][]const u8{ "webmail_records", "webmail_uploads" }) |table| {
             if (!try self.schemaHasTableLocked(table)) continue;
             const sql = try std.fmt.allocPrint(self.allocator, "UPDATE {s} SET username=substr(username,1,length(username)-?3)||?2 WHERE username LIKE ?1 ESCAPE '\\'", .{table});

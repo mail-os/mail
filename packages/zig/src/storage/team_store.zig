@@ -12,6 +12,10 @@ pub const schema =
     \\    id TEXT PRIMARY KEY NOT NULL,
     \\    name TEXT NOT NULL
     \\);
+    \\CREATE TABLE IF NOT EXISTS mail_hosted_teams (
+    \\    domain TEXT PRIMARY KEY NOT NULL,
+    \\    team_id TEXT NOT NULL UNIQUE REFERENCES mail_teams(id) ON DELETE CASCADE
+    \\);
     \\CREATE TABLE IF NOT EXISTS mail_team_members (
     \\    team_id TEXT NOT NULL REFERENCES mail_teams(id) ON DELETE CASCADE,
     \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -347,10 +351,57 @@ pub fn create(db: *database.Database, a: Allocator, operator: []const u8, team: 
     if (access(tx, team, actor)) |_| return error.TeamAlreadyExists else |err| {
         if (err != error.TeamNotFound) return err;
     }
-    try execute(tx, "INSERT INTO mail_teams(id,name) VALUES(?1,?2)", .{ team, name });
-    try execute(tx, "INSERT INTO mail_team_members(team_id,user_id,role) VALUES(?1,?2,'owner')", .{ team, member.id });
-    try audit(tx, a, actor, team, "team.create", .{ .name = name, .owner = owner });
+    try insertTeam(tx, a, actor, team, name, owner, member.id);
     try tx.commit();
+}
+
+fn insertTeam(tx: Tx, a: Allocator, actor: Actor, team: []const u8, name: []const u8, owner: []const u8, owner_id: i64) !void {
+    try execute(tx, "INSERT INTO mail_teams(id,name) VALUES(?1,?2)", .{ team, name });
+    try execute(tx, "INSERT INTO mail_team_members(team_id,user_id,role) VALUES(?1,?2,'owner')", .{ team, owner_id });
+    try audit(tx, a, actor, team, "team.create", .{ .name = name, .owner = owner });
+}
+
+pub const HostedTeam = struct { id: []const u8, name: []const u8, domain: []const u8 };
+pub const HostedTeamResult = struct { team: ?HostedTeam, created: bool = false };
+
+/// Authorize against the provisioning assignment and current service window
+/// inside the same transaction that reads or creates the domain's team.
+pub fn hostedTeam(db: *database.Database, a: Allocator, mailbox: []const u8, actor_id: []const u8, requested_name: ?[]const u8) !HostedTeamResult {
+    const domain = mailbox_domains.addressDomain(mailbox) orelse return error.InvalidTeamData;
+    const name = if (requested_name) |value| std.mem.trim(u8, value, " ") else null;
+    if (name) |value| if (!validText(value, 100) or value.len == 0) return error.InvalidTeamData;
+
+    var tx = try db.beginTransaction(if (name == null) .read else .write);
+    defer tx.deinit();
+    const owner_id = blk: {
+        const stmt = try tx.prepare(
+            \\SELECT u.id FROM provisioned_mailboxes p JOIN users u ON u.id=p.user_id AND u.username=p.mailbox
+            \\WHERE p.mailbox=?1 AND p.actor=?2 AND u.enabled=1 AND p.service_until>unixepoch()
+        );
+        defer stmt.finalize();
+        try bind(stmt, .{ mailbox, actor_id });
+        if (!try stmt.step()) return error.MailboxNotFound;
+        break :blk stmt.columnInt64(0);
+    };
+    const existing: ?HostedTeam = blk: {
+        const stmt = try tx.prepare("SELECT t.id,t.name FROM mail_hosted_teams h JOIN mail_teams t ON t.id=h.team_id WHERE h.domain=?1");
+        defer stmt.finalize();
+        try stmt.bind(1, domain);
+        if (!try stmt.step()) break :blk null;
+        break :blk .{ .id = try a.dupe(u8, stmt.columnText(0)), .name = try a.dupe(u8, stmt.columnText(1)), .domain = domain };
+    };
+    if (existing != null or name == null) {
+        try tx.commit();
+        return .{ .team = existing };
+    }
+
+    var nonce: [16]u8 = undefined;
+    @import("../core/io_compat.zig").randomBytes(&nonce);
+    const id = try std.fmt.allocPrint(a, "hosted-{s}", .{&std.fmt.bytesToHex(nonce, .lower)});
+    try insertTeam(tx, a, .{ .operator = "hosted-provisioning" }, id, name.?, mailbox, owner_id);
+    try execute(tx, "INSERT INTO mail_hosted_teams(domain,team_id) VALUES(?1,?2)", .{ domain, id });
+    try tx.commit();
+    return .{ .team = .{ .id = id, .name = name.?, .domain = domain }, .created = true };
 }
 
 fn requireOtherOwner(tx: Tx, team: []const u8, user_id: i64) !void {

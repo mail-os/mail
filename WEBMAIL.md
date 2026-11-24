@@ -766,9 +766,13 @@ membership and grant changes in `audit_log` in the same transaction.
 
 ### Hosted team invitations
 
-After an operator creates a team with its first owner, that owner can open
-**Shared inboxes → Team invitations** and invite a paid mailbox on the same
-additional hosted domain. Both mailboxes need current paid service. The
+In hosted domain setup, verify the domain and provision a paid mailbox. Open
+**Team setup**, enter a team name, and choose the first owner from the active
+mailboxes on that domain. Each additional hosted domain has one team created
+through this flow. Existing self-hosted teams keep their operator workflow.
+
+The owner can open **Shared inboxes → Team invitations** and invite a paid
+mailbox on the same additional hosted domain. Both mailboxes need current paid service. The
 recipient opens the same panel in their own webmail and chooses **Accept**
 or **Decline**. Invitations expire after seven days. The sender can revoke a
 pending invitation in the panel. A pending invitation also stops being

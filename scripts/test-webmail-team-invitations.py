@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 from threading import Barrier
 import time
+from urllib.parse import urlencode
 
 HERE = Path(__file__).resolve().parent
 support = runpy.run_path(str(HERE / "test-webmail-teams.py"))
@@ -25,14 +26,75 @@ endpoint = "team-invitations"
 def paid_mailbox(test, name, domain=hosted, *, read_only=False):
     mailbox = f"{name}@{domain}"
     now = int(time.time())
-    status, _, raw = test.http(test.private + "/provisioning/v1/mailbox", {
+    assignment = {
         "mailbox": mailbox, "actor": secrets.token_hex(16), "operation_id": secrets.token_hex(16),
         "revision": 1, "quota_bytes": 1024 * 1024, "enabled": True,
         "initial_password": test.password, "initial_recovery": f"{name}@recovery.example.test",
         "access_window": {"service_until": now + (-30 if read_only else 3600), "read_until": now + 7200},
-    }, test.auth)
+    }
+    status, _, raw = test.http(test.private + "/provisioning/v1/mailbox", assignment, test.auth)
     assert status == 200 and json.loads(raw)["mailbox"] == mailbox, (status, raw)
+    test.specs[mailbox] = assignment
     return mailbox
+
+
+def verify_hosted_teams(test, db):
+    address = paid_mailbox(test, "new-studio")
+    other_domain = paid_mailbox(test, "new-studio", foreign)
+    service = paid_mailbox(test, "native-service", primary)
+    paused = paid_mailbox(test, "retired-owner", read_only=True)
+    url = test.private + "/provisioning/v1/team"
+
+    def request(mailbox, name=None, *, actor=None, headers=None):
+        query = {"mailbox": mailbox, "actor": actor or test.specs[mailbox]["actor"]}
+        if name is None:
+            response = test.http(url + "?" + urlencode(query), headers=test.auth if headers is None else headers)
+        else:
+            response = test.http(url, dict(query, name=name), test.auth if headers is None else headers)
+        return response[0], json.loads(response[2])
+
+    expect(request(address, headers={}), 401, "unauthorized")
+    expect(request(address, "Studio", headers=dict(test.auth, Origin=test.webmail)), 401, "unauthorized")
+    expect(request(address, "Studio", actor=test.specs[other_domain]["actor"]), 404, "mailbox_not_found")
+    expect(request(service, "Service"), 409, "team_domain_unavailable")
+    expect(request(paused, "Retired"), 404, "mailbox_not_found")
+    expect(request(address, "界" * 34), 400, "invalid_request")
+    assert expect(request(address)) == {"team": None, "created": False}
+    assert expect(request(other_domain)) == {"team": None, "created": False}
+
+    db.execute("""CREATE TRIGGER reject_hosted_team_audit BEFORE INSERT ON audit_log
+                  WHEN NEW.action='team.create' BEGIN SELECT RAISE(ABORT,'fixture failure'); END""")
+    expect(request(address, "Studio"), 503, "provisioning_unavailable")
+    assert expect(request(address))["team"] is None
+    db.execute("DROP TRIGGER reject_hosted_team_audit")
+
+    gate = Barrier(2)
+
+    def create(name):
+        gate.wait(timeout=3)
+        return request(address, name)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        rows = sorted(pool.map(create, ("Studio East", "Studio West")), key=lambda row: row[0])
+    assert [row[0] for row in rows] == [200, 201]
+    authority = rows[1][1]["team"]
+    assert rows[0][1]["team"] == authority and authority["domain"] == hosted
+    assert expect(request(address))["team"] == authority
+    assert expect(request(other_domain))["team"] is None
+    owner, = expect(test.api(test.login(address), "teams"))
+    assert owner == {"id": authority["id"], "name": authority["name"], "role": "owner"}
+    assert expect(test.api(test.login(other_domain), "teams")) == []
+    other_team = expect(request(other_domain, "Other Team"), 201)["team"]
+    assert other_team["id"] != authority["id"] and other_team["domain"] == foreign
+    assert expect(request(address))["team"] == authority
+    assert db.execute("SELECT count(*) FROM mail_hosted_teams").fetchone()[0] == 2
+    assert db.execute("SELECT count(*) FROM audit_log WHERE action='team.create' AND target=?", (authority["id"],)).fetchone()[0] == 1
+    colleague = test.login(paid_mailbox(test, "new-studio-peer"))
+    expect(send(test, test.login(address), f"new-studio-peer@{hosted}", authority["id"]))
+    invitation, = incoming(test, colleague)
+    expect(decide(test, colleague, invitation["id"], "accept"))
+    assert expect(test.api(colleague, "teams")) == [{"id": authority["id"], "name": authority["name"], "role": "member"}]
+    return address, authority
 
 
 def send(test, session, recipient, team="studio"):
@@ -125,7 +187,7 @@ def verify(test, db):
         assert incoming(test, member) == []
         expect(decide(test, member, invitation, "accept"), 404, "team_invitation_not_found")
     assert expect(test.api(member, "teams")) == []
-    assert db.execute("SELECT count(*) FROM audit_log WHERE action='team.invitation_decided'").fetchone()[0] == 3
+    assert db.execute("SELECT count(*) FROM audit_log WHERE action='team.invitation_decided' AND target='studio'").fetchone()[0] == 3
 
     captain = test.login(owner)
     replacement_owner = test.login(alternative)
@@ -158,6 +220,7 @@ def main():
                         SMTP_EXACT_MAILBOX_DOMAINS=",".join((primary, hosted, foreign)),
                         SMTP_PROVISIONING_ADDITIONAL_DOMAINS=",".join((hosted, foreign)))
         with test.daemon(), closing(sqlite3.connect(root / "smtp.db")) as db:
+            address, team = verify_hosted_teams(test, db)
             owner, recipient = verify(test, db)
             if args.browser:
                 assert args.screenshots is not None
@@ -166,7 +229,18 @@ def main():
                            MAIL_INVITE_TEST_PASSWORD=test.password)
                 subprocess.run(["node", str(HERE / "webmail-team-invitations-browser.mjs"), args.browser,
                                 str(args.screenshots.resolve())], env=env, check=True)
-    print("Verified paid-domain invitations, recipient consent, expiry, concurrent acceptance, and explicit inbox grants over native HTTPS.")
+        renamed = "renamed.example.test"
+        command(test, "domain", "migrate", hosted, renamed, "--yes")
+        for key in ("SMTP_LOCAL_DOMAINS", "SMTP_EXACT_MAILBOX_DOMAINS", "SMTP_PROVISIONING_ADDITIONAL_DOMAINS"):
+            test.env[key] = test.env[key].replace(hosted, renamed)
+        with test.daemon():
+            mailbox = address.split("@", 1)[0] + "@" + renamed
+            query = urlencode({"mailbox": mailbox, "actor": test.specs[address]["actor"]})
+            status, _, raw = test.http(test.private + "/provisioning/v1/team?" + query, headers=test.auth)
+            assert status == 200 and json.loads(raw)["team"] == dict(team, domain=renamed), (status, raw)
+            owner_team, = expect(test.api(test.login(mailbox), "teams"))
+            assert owner_team == {"id": team["id"], "name": team["name"], "role": "owner"}
+    print("Verified paid-domain team setup, domain rename, invitation consent, expiry, concurrent acceptance, and explicit inbox grants over native HTTPS.")
 
 
 if __name__ == "__main__":

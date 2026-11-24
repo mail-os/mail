@@ -4803,6 +4803,7 @@ fn provisioningError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: a
         error.StaleRevision => sendError(conn, arena, 409, "stale_revision", "Mailbox revision does not match"),
         error.IncompleteCreate => sendError(conn, arena, 400, "invalid_request", "Initial password and recovery address are required"),
         error.InvalidAccessWindow => sendError(conn, arena, 400, "invalid_request", "Set a positive service deadline and an export deadline at or after it"),
+        error.InvalidTeamData => sendError(conn, arena, 400, "invalid_request", "Enter a team name of 1 to 100 bytes"),
         else => blk: {
             logger.warn("Provisioning operation failed: {}", .{err});
             break :blk sendError(conn, arena, 503, "provisioning_unavailable", "Provisioning is temporarily unavailable");
@@ -4830,6 +4831,8 @@ fn handleProvisioning(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
         if (!cfg.servesDomain(name)) return sendError(conn, arena, 404, "domain_not_found", "Provisioning domain is not configured");
         return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .name = name, .configured = true }), null);
     }
+    if (std.mem.eql(u8, req.path, "/provisioning/v1/team"))
+        return handleProvisioningTeam(server, conn, arena, req, cfg);
     if (get and std.mem.eql(u8, req.path, "/provisioning/v1/mailbox")) {
         const mailbox = req.queryParam(arena, "mailbox") orelse "";
         const actor = req.queryParam(arena, "actor") orelse "";
@@ -4890,6 +4893,27 @@ fn handleProvisioning(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
         .initial_password_hash = password_hash,
     }) catch |err| return provisioningError(conn, arena, err);
     return sendProvisioningState(conn, arena, state);
+}
+
+fn handleProvisioningTeam(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request, cfg: ProvisioningConfig) !void {
+    const Body = struct { mailbox: []const u8, actor: []const u8, name: ?[]const u8 = null };
+    const input: Body = if (std.mem.eql(u8, req.method, "GET")) .{
+        .mailbox = req.queryParam(a, "mailbox") orelse "",
+        .actor = req.queryParam(a, "actor") orelse "",
+    } else if (std.mem.eql(u8, req.method, "POST")) blk: {
+        if (req.body.len > 2048) return sendError(conn, a, 400, "invalid_request", "Invalid team setup request");
+        const parsed = std.json.parseFromSliceLeaky(Body, a, req.body, .{}) catch
+            return sendError(conn, a, 400, "invalid_request", "Invalid team setup request");
+        if (parsed.name == null) return sendError(conn, a, 400, "invalid_request", "Enter a team name");
+        break :blk parsed;
+    } else return sendError(conn, a, 405, "method_not_allowed", "Method not allowed");
+    if (!validProvisioningMailbox(input.mailbox, cfg) or !validProvisioningId(input.actor))
+        return sendError(conn, a, 400, "invalid_request", "Invalid mailbox or actor");
+    const domain = mailbox_domains.addressDomain(input.mailbox).?;
+    if (std.mem.eql(u8, domain, cfg.domain)) return sendError(conn, a, 409, "team_domain_unavailable", "Team setup requires an additional hosted domain");
+    const result = teams.hostedTeam(server.db, a, input.mailbox, input.actor, input.name) catch |err|
+        return provisioningError(conn, a, err);
+    return sendJson(conn, a, if (result.created) 201 else 200, try service_mod.json(a, result), null);
 }
 
 fn sendJson(conn: *webmail_tls.Stream, arena: std.mem.Allocator, status: u16, json_body: []const u8, set_cookie: ?[]const u8) !void {

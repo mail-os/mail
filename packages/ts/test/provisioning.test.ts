@@ -16,6 +16,8 @@ test('provisioning uses the dedicated versioned API and never follows a redirect
         return Response.json({ version: 1, domain: 'mailboxes.example.test' })
       if (new URL(request.url).pathname.endsWith('/mailbox/access'))
         return Response.json({ revision: 2, mailbox: 'reader@mailboxes.example.test', enabled: true, access: 'read_only' })
+      if (new URL(request.url).pathname.endsWith('/team'))
+        return Response.json({ created: request.method === 'POST', team: { id: 'hosted-studio', name: 'Studio', domain: 'studio.example.test' } })
       return Response.json({ revision: 1, mailbox: 'reader@mailboxes.example.test', enabled: true })
     }, { preconnect: fetch.preconnect }),
   })
@@ -41,16 +43,24 @@ test('provisioning uses the dedicated versioned API and never follows a redirect
     access_window: { service_until: 1795485600, read_until: 1795492800 },
   }
   expect((await client.applyAccess(renewal)).access).toBe('read_only')
+  const team = { mailbox: 'owner@studio.example.test', actor: change.actor, name: 'Studio' }
+  expect((await client.team(team.mailbox, team.actor)).team?.id).toBe('hosted-studio')
+  expect((await client.createTeam(team)).created).toBe(true)
   expect(requests.map(request => new URL(request.url).pathname)).toEqual([
     '/provisioning/v1/status',
     '/provisioning/v1/mailbox',
     '/provisioning/v1/mailbox',
     '/provisioning/v1/mailbox/access',
+    '/provisioning/v1/team',
+    '/provisioning/v1/team',
   ])
   expect(requests.every(request => request.headers.get('Authorization') === `Bearer ${token}` && request.redirect === 'error')).toBe(true)
   expect(await requests[1].json()).toEqual(change)
   expect(new URL(requests[2].url).searchParams.get('actor')).toBe(change.actor)
   expect(await requests[3].json()).toEqual(renewal)
+  expect(Object.fromEntries(new URL(requests[4].url).searchParams)).toEqual({ mailbox: team.mailbox, actor: team.actor })
+  expect(requests[4].method).toBe('GET')
+  expect(await requests[5].json()).toEqual(team)
 })
 
 test('provisioning rejects plaintext non-loopback origins and incompatible API revisions', async () => {
