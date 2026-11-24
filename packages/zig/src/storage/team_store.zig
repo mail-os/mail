@@ -4,6 +4,8 @@ const std = @import("std");
 const database = @import("database.zig");
 const Tx = database.Database.Transaction;
 const Allocator = std.mem.Allocator;
+const mailbox_domains = @import("../core/mailbox_domains.zig");
+const time = @import("../core/time_compat.zig");
 
 pub const schema =
     \\CREATE TABLE IF NOT EXISTS mail_teams (
@@ -17,6 +19,22 @@ pub const schema =
     \\    PRIMARY KEY(team_id,user_id)
     \\);
     \\CREATE INDEX IF NOT EXISTS mail_team_members_user ON mail_team_members(user_id);
+    \\CREATE TABLE IF NOT EXISTS mail_team_invitations (
+    \\    id TEXT PRIMARY KEY NOT NULL DEFAULT(lower(hex(randomblob(16)))),
+    \\    team_id TEXT NOT NULL,
+    \\    inviter_id INTEGER NOT NULL,
+    \\    recipient_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    \\    expires_at INTEGER NOT NULL,
+    \\    UNIQUE(team_id,recipient_id),
+    \\    FOREIGN KEY(team_id,inviter_id) REFERENCES mail_team_members(team_id,user_id) ON DELETE CASCADE
+    \\);
+    \\CREATE INDEX IF NOT EXISTS mail_team_invites_recipient ON mail_team_invitations(recipient_id);
+    \\CREATE INDEX IF NOT EXISTS mail_team_invites_inviter ON mail_team_invitations(inviter_id);
+    \\CREATE TRIGGER IF NOT EXISTS mail_team_invites_owner_change AFTER UPDATE OF role ON mail_team_members
+    \\WHEN OLD.role='owner' AND NEW.role<>'owner'
+    \\BEGIN DELETE FROM mail_team_invitations WHERE team_id=OLD.team_id AND inviter_id=OLD.user_id; END;
+    \\CREATE TRIGGER IF NOT EXISTS mail_team_invites_member_added AFTER INSERT ON mail_team_members
+    \\BEGIN DELETE FROM mail_team_invitations WHERE team_id=NEW.team_id AND recipient_id=NEW.user_id; END;
     \\CREATE TABLE IF NOT EXISTS mail_team_grants (
     \\    team_id TEXT NOT NULL,
     \\    source_id INTEGER NOT NULL,
@@ -182,6 +200,141 @@ fn audit(tx: Tx, a: Allocator, actor: Actor, team: []const u8, action: []const u
         "INSERT INTO audit_log(timestamp,action,actor,target,target_type,details,severity) VALUES(unixepoch(),?1,?2,?3,'team',?4,'info')",
         .{ action, actor_id, team, payload },
     );
+}
+
+pub const InvitationDecision = enum { accept, decline, revoke };
+pub const Invitation = struct {
+    id: []const u8,
+    team: []const u8,
+    team_name: []const u8,
+    inviter: []const u8,
+    recipient: []const u8,
+    expires_at: i64,
+};
+pub const InvitationPanel = struct { teams: []const Team = &.{}, incoming: []const Invitation = &.{}, sent: []const Invitation = &.{} };
+
+fn paidIdentity(tx: Tx, mailbox: []const u8, now: i64) !?i64 {
+    const stmt = try tx.prepare(
+        \\SELECT u.id FROM users u JOIN provisioned_mailboxes p ON p.user_id=u.id AND p.mailbox=u.username
+        \\WHERE u.username=?1 AND u.enabled=1 AND p.service_until>?2
+    );
+    defer stmt.finalize();
+    try bind(stmt, .{ mailbox, now });
+    return if (try stmt.step()) stmt.columnInt64(0) else null;
+}
+
+fn sameMailboxDomain(first: []const u8, second: []const u8) bool {
+    const domain = mailbox_domains.addressDomain(first) orelse return false;
+    const other = mailbox_domains.addressDomain(second) orelse return false;
+    return domain.len > 0 and std.ascii.eqlIgnoreCase(domain, other);
+}
+
+const invitationsQuery =
+    \\SELECT i.id,i.team_id,t.name,s.username,u.username,i.expires_at,i.inviter_id,i.recipient_id
+    \\FROM mail_team_invitations i JOIN mail_teams t ON t.id=i.team_id
+    \\JOIN mail_team_members m ON m.team_id=i.team_id AND m.user_id=i.inviter_id AND m.role='owner'
+    \\JOIN users s ON s.id=i.inviter_id AND s.enabled=1
+    \\JOIN provisioned_mailboxes p ON p.user_id=s.id AND p.mailbox=s.username AND p.service_until>?2
+    \\JOIN users u ON u.id=i.recipient_id AND u.enabled=1
+    \\WHERE i.expires_at>?2
+;
+
+pub fn invitations(db: *database.Database, a: Allocator, mailbox: []const u8) !InvitationPanel {
+    var tx = try db.beginTransaction(.read);
+    defer tx.deinit();
+    const now = time.timestamp();
+    const user_id = (try paidIdentity(tx, mailbox, now)) orelse return .{};
+    const owner_teams = try tx.prepare(
+        \\SELECT t.id,t.name FROM mail_team_members m JOIN mail_teams t ON t.id=m.team_id
+        \\WHERE m.user_id=?1 AND m.role='owner' ORDER BY t.name,t.id
+    );
+    defer owner_teams.finalize();
+    try owner_teams.bind(1, user_id);
+    var owned: std.ArrayList(Team) = .empty;
+    while (try owner_teams.step()) try owned.append(a, .{
+        .id = try a.dupe(u8, owner_teams.columnText(0)),
+        .name = try a.dupe(u8, owner_teams.columnText(1)),
+    });
+    const rows = try tx.prepare(invitationsQuery ++ " AND (i.inviter_id=?1 OR i.recipient_id=?1) ORDER BY i.expires_at,i.id");
+    defer rows.finalize();
+    try bind(rows, .{ user_id, now });
+    var incoming: std.ArrayList(Invitation) = .empty;
+    var sent: std.ArrayList(Invitation) = .empty;
+    while (try rows.step()) {
+        const inviter = rows.columnText(3);
+        const recipient = rows.columnText(4);
+        if (!sameMailboxDomain(inviter, recipient)) continue;
+        const target = if (user_id == rows.columnInt64(6)) &sent else &incoming;
+        try target.append(a, .{
+            .id = try a.dupe(u8, rows.columnText(0)),
+            .team = try a.dupe(u8, rows.columnText(1)),
+            .team_name = try a.dupe(u8, rows.columnText(2)),
+            .inviter = try a.dupe(u8, inviter),
+            .recipient = try a.dupe(u8, recipient),
+            .expires_at = rows.columnInt64(5),
+        });
+    }
+    try tx.commit();
+    return .{ .teams = try owned.toOwnedSlice(a), .incoming = try incoming.toOwnedSlice(a), .sent = try sent.toOwnedSlice(a) };
+}
+
+pub fn invite(db: *database.Database, a: Allocator, mailbox: []const u8, team: []const u8, recipient: []const u8) !void {
+    if (!validTeamId(team) or !validText(recipient, 254)) return error.InvalidTeamData;
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const actor: Actor = .{ .mailbox = mailbox };
+    const owner = try access(tx, team, actor);
+    const now = time.timestamp();
+    if (owner.role != .owner or try paidIdentity(tx, mailbox, now) == null) return error.TeamForbidden;
+    if (!sameMailboxDomain(mailbox, recipient)) return error.TeamInviteeUnavailable;
+    const person = (try paidIdentity(tx, recipient, now)) orelse return error.TeamInviteeUnavailable;
+    if (try memberRole(tx, team, person) != null) return error.TeamAlreadyJoined;
+    try execute(tx,
+        \\DELETE FROM mail_team_invitations WHERE team_id=?1 AND (expires_at<=?2 OR (recipient_id=?3 AND NOT EXISTS (
+        \\    SELECT 1 FROM users u JOIN provisioned_mailboxes p ON p.user_id=u.id AND p.mailbox=u.username
+        \\    WHERE u.id=mail_team_invitations.inviter_id AND u.enabled=1 AND p.service_until>?2
+        \\)))
+    , .{ team, now, person });
+
+    const insert = try tx.prepare(
+        \\INSERT INTO mail_team_invitations(team_id,inviter_id,recipient_id,expires_at) VALUES(?1,?2,?3,?4)
+        \\ON CONFLICT(team_id,recipient_id) DO NOTHING RETURNING id
+    );
+    defer insert.finalize();
+    try bind(insert, .{ team, owner.id, person, now + 7 * 86400 });
+    if (try insert.step()) {
+        const id = try a.dupe(u8, insert.columnText(0));
+        _ = try insert.step();
+        try audit(tx, a, actor, team, "team.invitation_created", .{ .invitation = id, .mailbox = recipient });
+    }
+    try tx.commit();
+}
+
+pub fn decideInvitation(db: *database.Database, a: Allocator, mailbox: []const u8, id: []const u8, decision: InvitationDecision) !void {
+    if (id.len != 32) return error.TeamInvitationNotFound;
+    for (id) |ch| if (!std.ascii.isHex(ch)) return error.TeamInvitationNotFound;
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const now = time.timestamp();
+    const actor_id = (try paidIdentity(tx, mailbox, now)) orelse return error.TeamInvitationNotFound;
+    const lookup = try tx.prepare(invitationsQuery ++ " AND i.id=?1 AND CASE WHEN ?3 THEN i.inviter_id ELSE i.recipient_id END=?4");
+    defer lookup.finalize();
+    try bind(lookup, .{ id, now, @as(i64, @intFromBool(decision == .revoke)), actor_id });
+    if (!try lookup.step()) return error.TeamInvitationNotFound;
+    const team = try a.dupe(u8, lookup.columnText(1));
+    const inviter = lookup.columnText(3);
+    const recipient = try a.dupe(u8, lookup.columnText(4));
+    if (!sameMailboxDomain(inviter, recipient)) return error.TeamInvitationNotFound;
+    _ = try lookup.step();
+    const actor: Actor = .{ .mailbox = mailbox };
+    if (decision == .accept) {
+        try execute(tx, "INSERT INTO mail_team_members(team_id,user_id,role) VALUES(?1,?2,'member')", .{ team, actor_id });
+        try audit(tx, a, actor, team, "team.membership", .{ .mailbox = mailbox, .previous = @as(?Role, null), .role = Role.member });
+    } else {
+        try execute(tx, "DELETE FROM mail_team_invitations WHERE id=?1", .{id});
+    }
+    try audit(tx, a, actor, team, "team.invitation_decided", .{ .invitation = id, .mailbox = recipient, .decision = decision });
+    try tx.commit();
 }
 
 pub fn create(db: *database.Database, a: Allocator, operator: []const u8, team: []const u8, name: []const u8, owner: []const u8) !void {

@@ -553,6 +553,8 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
                 // delivered + DKIM-signed identically to SMTP submission.
                 .hostname = cfg.hostname,
                 .mail_config = &cfg,
+                .hosted_team_domains = if (provisioning_port != null) env.get("SMTP_PROVISIONING_ADDITIONAL_DOMAINS") else null,
+                .primary_provisioning_domain = env.get("SMTP_PROVISIONING_DOMAIN"),
                 .delivery_method = cfg.delivery_method,
                 .ses_region = cfg.ses_region,
                 .enable_tls = wm_tls,

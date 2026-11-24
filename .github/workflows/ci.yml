@@ -53,6 +53,12 @@ jobs:
       timeout-minutes: 2
       run: python3 scripts/test-webmail-external-senders.py packages/zig/zig-out/bin/mail --browser chromium --screenshots webmail-browser-screenshots
 
+    - name: Verify paid team invitations in the browser
+      if: runner.os == 'Linux'
+      working-directory: .
+      timeout-minutes: 2
+      run: python3 scripts/test-webmail-team-invitations.py packages/zig/zig-out/bin/mail --browser chromium --screenshots webmail-browser-screenshots
+
     - name: Upload browser screenshots
       if: ${{ !cancelled() && runner.os == 'Linux' }}
       uses: actions/upload-artifact@v4
@@ -116,6 +122,7 @@ jobs:
         python3 ../../scripts/test-webmail-index.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-private.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-teams.py zig-out/bin/mail
+        python3 ../../scripts/test-webmail-team-invitations.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-team-threads.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-shared-inbox.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-shared-replies.py zig-out/bin/mail

@@ -764,6 +764,21 @@ revokes existing webmail sessions and deletes grants in both directions.
 Role changes revoke the affected user's webmail sessions. The server records
 membership and grant changes in `audit_log` in the same transaction.
 
+### Hosted team invitations
+
+After an operator creates a team with its first owner, that owner can open
+**Shared inboxes → Team invitations** and invite a paid mailbox on the same
+additional hosted domain. Both mailboxes need current paid service. The
+recipient opens the same panel in their own webmail and chooses **Accept**
+or **Decline**. Invitations expire after seven days. The sender can revoke a
+pending invitation in the panel. A pending invitation also stops being
+usable when the sender loses ownership or paid service.
+
+Accepting adds the recipient as a member. Share inboxes, senders, or
+calendars using the team's explicit grants. Invite, acceptance, decline,
+and revocation events appear in the team audit log. The service domain
+continues to use the operator enrollment workflow above.
+
 ### Calendar shares
 
 In webmail Calendar, use **Manage calendars** to share an owned calendar

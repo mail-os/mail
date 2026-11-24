@@ -2,6 +2,7 @@ import type { EmbeddedImage } from './mail-reader'
 import { derived, state } from '@stacksjs/stx'
 import { createMailApi, MailApiError } from './mail-api'
 import { renderMailReader } from './mail-reader'
+import { useTeamInvitations } from './use-team-invitations'
 
 interface Inbox { team: string, name: string, id: string, address: string }
 interface Teammate { id: string, address: string }
@@ -95,11 +96,13 @@ export function useSharedInbox(signIn: () => void, openReplyDraft: (uid: number,
     listing.set(null)
     clearStages()
     closeMessage()
+    invitations.clearInvitations()
   }
   const api = createMailApi(() => account() || undefined, () => {
     clear()
     signIn()
   }, () => active)
+  const invitations = useTeamInvitations(api, refresh)
 
   function messagePath(inbox: string, id: string) { return endpoint + '/' + inbox + '/messages/' + encodeURIComponent(id) }
   function stagesPath(inbox: string) { return endpoint + '/' + inbox + '/stages' }
@@ -195,7 +198,7 @@ export function useSharedInbox(signIn: () => void, openReplyDraft: (uid: number,
     const request = ++listRequest
     loading.set(true)
     try {
-      const available = await api<Inbox[]>(endpoint)
+      const [available] = await Promise.all([api<Inbox[]>(endpoint), invitations.refreshInvitations()])
       if (request !== listRequest || !active) return
       inboxes.set(available)
       const retained = available.some(inbox => inboxKey(inbox) === current)
@@ -330,5 +333,10 @@ export function useSharedInbox(signIn: () => void, openReplyDraft: (uid: number,
   return { inboxes, selectedInbox, mailbox, listing, detail, reference, loading, opening, saving, error, ready, formatted,
     stageSettings, managingStages, editingStage, stageName, stageSender, toggleStages, editStage, moveRow, saveStage, retireStage,
     mount, refresh, selectInbox, turnPage, readMessage, closeMessage, attachmentPath, change, startReply,
-    destroy() { active = false; clear() } }
+    ...invitations,
+    destroy() {
+      active = false
+      clear()
+    },
+  }
 }

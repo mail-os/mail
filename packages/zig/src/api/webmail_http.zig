@@ -134,6 +134,8 @@ pub const WebmailHttpConfig = struct {
     scanner: ?*clamav.ClamAVScanner = null,
     undo_send_seconds: u32 = 10,
     provisioning: ?ProvisioningConfig = null,
+    hosted_team_domains: ?[]const u8 = null,
+    primary_provisioning_domain: ?[]const u8 = null,
 };
 
 pub const WebmailHttpServer = struct {
@@ -612,6 +614,7 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.eql(u8, p, "/webmail/api/preferences") and std.mem.eql(u8, req.method, "PUT")) return handlePreferences(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/compose-library") and
         (std.mem.eql(u8, req.method, "GET") or std.mem.eql(u8, req.method, "PUT"))) return handleComposeLibrary(server, conn, arena, req);
+    if (std.mem.eql(u8, p, "/webmail/api/team-invitations")) return handleTeamInvitations(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/teams") or std.mem.startsWith(u8, p, "/webmail/api/teams/"))
         return handleTeams(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/shared-inboxes") or std.mem.startsWith(u8, p, "/webmail/api/shared-inboxes/"))
@@ -2221,9 +2224,52 @@ fn teamError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: anyerror)
         error.TeamForbidden => sendError(conn, arena, 403, "team_forbidden", "You do not have permission to change this team or grant."),
         error.LastTeamOwner => sendError(conn, arena, 409, "last_team_owner", "Assign another owner before changing this membership."),
         error.DisabledTeamAccount => sendError(conn, arena, 409, "team_account_disabled", "Activate the mailbox before granting team access."),
+        error.TeamInviteeUnavailable => sendError(conn, arena, 404, "team_invitee_unavailable", "Choose an active paid mailbox on your hosted domain."),
+        error.TeamInvitationNotFound => sendError(conn, arena, 404, "team_invitation_not_found", "This invitation is no longer available."),
+        error.TeamAlreadyJoined => sendError(conn, arena, 409, "team_already_joined", "This mailbox is already on the team."),
         error.InvalidTeamData => sendError(conn, arena, 400, "invalid_team_data", "Check the team, mailbox, role, or resource."),
         else => mapServiceError(conn, arena, err),
     };
+}
+
+fn hostedTeamMailbox(cfg: WebmailHttpConfig, mailbox: []const u8) bool {
+    const mail = cfg.mail_config orelse return false;
+    const domain = mailbox_domains.addressDomain(mailbox) orelse return false;
+    const primary = cfg.primary_provisioning_domain orelse return false;
+    return !std.ascii.eqlIgnoreCase(domain, primary) and mail.requiresFullMailbox(mailbox) and mailbox_domains.contains(cfg.hosted_team_domains, domain);
+}
+
+fn handleTeamInvitations(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    const reading = std.mem.eql(u8, req.method, "GET");
+    if (!reading and !std.mem.eql(u8, req.method, "POST")) return sendError(conn, a, 405, "method_not_allowed", "Method not allowed.");
+    if (!reading and !isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    var sess = (try requireSession(server, conn, a, req)) orelse return;
+    defer sess.deinit(server.allocator);
+    const enabled = hostedTeamMailbox(server.config, sess.username);
+    if (reading) {
+        const panel = if (enabled) teams.invitations(server.db, a, sess.username) catch |err| return teamError(conn, a, err) else teams.InvitationPanel{};
+        return sendJson(conn, a, 200, try service_mod.json(a, panel), null);
+    }
+    if (!enabled) return sendError(conn, a, 409, "team_invites_unavailable", "Team invitations are unavailable for this mailbox.");
+    if (req.body.len > 2048) return teamError(conn, a, error.InvalidTeamData);
+    const Body = struct { action: enum { invite, accept, decline, revoke }, team: ?[]const u8 = null, recipient: ?[]const u8 = null, id: ?[]const u8 = null };
+    const body = std.json.parseFromSliceLeaky(Body, a, req.body, .{}) catch return teamError(conn, a, error.InvalidTeamData);
+    if (body.action == .invite) {
+        const team = body.team orelse return teamError(conn, a, error.InvalidTeamData);
+        const recipient = body.recipient orelse return teamError(conn, a, error.InvalidTeamData);
+        const canonical = try std.ascii.allocLowerString(a, std.mem.trim(u8, recipient, " \t"));
+        teams.invite(server.db, a, sess.username, team, canonical) catch |err| return teamError(conn, a, err);
+    } else {
+        const id = body.id orelse return teamError(conn, a, error.InvalidTeamData);
+        const decision: teams.InvitationDecision = switch (body.action) {
+            .invite => unreachable,
+            .accept => .accept,
+            .decline => .decline,
+            .revoke => .revoke,
+        };
+        teams.decideInvitation(server.db, a, sess.username, id, decision) catch |err| return teamError(conn, a, err);
+    }
+    return sendJson(conn, a, 200, "{\"ok\":true}", null);
 }
 
 const ThreadShareInput = struct {

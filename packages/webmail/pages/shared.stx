@@ -15,6 +15,7 @@ const {
   inboxes, selectedInbox, mailbox, listing, detail, reference, loading, opening, saving, error, ready, formatted,
   stageSettings, managingStages, editingStage, stageName, stageSender, toggleStages, editStage, moveRow, saveStage, retireStage,
   mount, refresh, selectInbox, turnPage, readMessage, closeMessage, attachmentPath, change, startReply, destroy,
+  invitationPanel, invitationLabel, inviteTeam, inviteAddress, inviteBusy, inviteError, inviteNotice, sendInvite, decideInvite,
 } = useSharedInbox(() => navigate('/login', { reload: true }), (uid, id) => navigate('/?sharedReplyDraft=' + uid + '.' + encodeURIComponent(id), { reload: true }))
 const readerHeading = useRef('sharedTitle')
 const listHeading = useRef('sharedListTitle')
@@ -46,6 +47,38 @@ useEventListener('online', refresh)
     </select></div>
     <button type="button" class="wm-action" @click="refresh()" :disabled="saving || loading" aria-label="Refresh shared inbox" title="Refresh shared inbox"><span class="mail-icon" data-icon="refresh" aria-hidden="true"></span></button>
   </header>
+  <details :if="invitationPanel.teams.length || invitationPanel.incoming.length || invitationPanel.sent.length || inviteNotice || inviteError" class="wm-team-invitations">
+    <summary :text="invitationLabel"></summary>
+    <div class="wm-team-invitations-body">
+      <form :if="invitationPanel.teams.length" @submit.prevent="sendInvite()">
+        <div class="wm-team-invite-field">
+          <label for="team-invitation-team">Team</label>
+          <select id="team-invitation-team" :value="inviteTeam" @change="inviteTeam.set($event.target.value)" :disabled="inviteBusy">
+            <option :for="team in invitationPanel.teams" :key="team.id" :value="team.id" :text="team.name"></option>
+          </select>
+        </div>
+        <label>Teammate<input type="email" x-model="inviteAddress" required maxlength="254" autocomplete="off" :disabled="inviteBusy"></label>
+        <button type="submit" class="wm-action wm-action--accent" :disabled="inviteBusy">Invite to team</button>
+      </form>
+      <ul :if="invitationPanel.incoming.length" aria-label="Invitations to join">
+        <li :for="entry in invitationPanel.incoming" :key="entry.id">
+          <div><strong :text="entry.team_name"></strong><span :text="'Invited by ' + entry.inviter"></span></div>
+          <div class="wm-team-invitation-actions">
+            <button class="wm-action wm-action--accent" type="button" :disabled="inviteBusy" @click="decideInvite(entry.id, 'accept')">Accept</button>
+            <button class="wm-action" type="button" :disabled="inviteBusy" @click="decideInvite(entry.id, 'decline')">Decline</button>
+          </div>
+        </li>
+      </ul>
+      <ul :if="invitationPanel.sent.length" aria-label="Invitations you sent">
+        <li :for="entry in invitationPanel.sent" :key="entry.id">
+          <div><strong :text="entry.recipient"></strong><span :text="entry.team_name"></span></div>
+          <button class="wm-action wm-action--danger" type="button" :disabled="inviteBusy" @click="decideInvite(entry.id, 'revoke')">Revoke invitation</button>
+        </li>
+      </ul>
+      <p :if="inviteNotice" role="status" :text="inviteNotice"></p>
+      <p :if="inviteError" class="wm-inline-error" role="alert" :text="inviteError"></p>
+    </div>
+  </details>
   <p :if="error" class="wm-inline-error wm-shared-error" role="alert" :text="error"></p>
   <p :if="!ready" class="wm-shared-empty" role="status">Opening shared inboxes…</p>
   <p :if="ready && !inboxes.length && !error" class="wm-shared-empty">You have no shared inboxes.</p>
