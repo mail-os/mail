@@ -2,7 +2,7 @@ name: Publish Mail SDK staging prerelease
 
 on:
   push:
-    tags: ['mail-sdk-staging-0.3.27-staging.1-r4']
+    tags: ['mail-sdk-staging-0.3.27-staging.1-r5']
 
 permissions:
   contents: read
@@ -24,7 +24,7 @@ jobs:
       - name: Verify the staging tag and exact PR source
         shell: bash
         run: |
-          test "$GITHUB_REF" = "refs/tags/mail-sdk-staging-$PACKAGE_VERSION-r4"
+          test "$GITHUB_REF" = "refs/tags/mail-sdk-staging-$PACKAGE_VERSION-r5"
           git merge-base --is-ancestor "$SOURCE_REVISION" HEAD
           test "$(git diff --name-only "$SOURCE_REVISION" HEAD)" = ".github/workflows/release.yml"
 
@@ -66,11 +66,36 @@ jobs:
             test -x "packages/ts/bin/mail-$target"
           done
 
-      - name: Publish only to the staging dist-tag
+      - name: Preserve the exact package tarball for staging verification
         working-directory: packages/ts
         shell: bash
         run: |
-          test "$(npm view @stacksjs/mail@latest version --registry https://registry.npmjs.org)" = "0.3.26"
-          npm pack --dry-run --ignore-scripts
-          npm publish --access public --tag staging --provenance --ignore-scripts --registry https://registry.npmjs.org
-          test "$(npm view @stacksjs/mail@latest version --registry https://registry.npmjs.org)" = "0.3.26"
+          mkdir -p "$RUNNER_TEMP/mail-staging-package"
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP/mail-staging-package" --json > "$RUNNER_TEMP/mail-staging-package/package.json"
+          jq -c '.[0] | {name,version,filename,shasum,integrity}' "$RUNNER_TEMP/mail-staging-package/package.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mail-sdk-staging-package
+          path: ${{ runner.temp }}/mail-staging-package
+          retention-days: 1
+          compression-level: 0
+
+      - name: Confirm the staging dist-tag and package are publicly available
+        working-directory: packages/ts
+        shell: bash
+        run: |
+          registry=https://registry.npmjs.org
+          test "$(npm view @stacksjs/mail@latest version --registry "$registry" --prefer-online)" = '0.3.26'
+          if ! npm view "@stacksjs/mail@$PACKAGE_VERSION" version --registry "$registry" --prefer-online | grep -Fx "$PACKAGE_VERSION"; then
+            package="$RUNNER_TEMP/mail-staging-package/stacksjs-mail-$PACKAGE_VERSION.tgz"
+            npm publish "$package" --access public --tag staging --provenance --ignore-scripts --registry "$registry" --loglevel http
+          fi
+          for attempt in $(seq 1 30); do
+            if curl -fsS --max-time 10 -H 'Cache-Control: no-cache' "$registry/-/package/@stacksjs%2fmail/dist-tags" | jq -e --arg version "$PACKAGE_VERSION" '.staging==$version and .latest=="0.3.26"' >/dev/null; then
+              npm view "@stacksjs/mail@$PACKAGE_VERSION" version dist.integrity --json --registry "$registry" --prefer-online
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
