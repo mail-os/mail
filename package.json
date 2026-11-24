@@ -41,6 +41,7 @@
     "release:dry": "bun scripts/release.ts patch --dry-run"
   },
   "devDependencies": {
+    "axe-core": "4.11.1",
     "better-dx": "^0.2.23",
     "playwright": "1.65.1"
   },

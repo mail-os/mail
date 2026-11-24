@@ -339,7 +339,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
           </button>
         </div>
       </div>
-      <div :if="selectedCount > 0" class="wm-bulk-toolbar" aria-label="Selected message actions">
+      <div :if="selectedCount > 0" class="wm-bulk-toolbar" role="group" aria-label="Selected message actions">
         <button type="button" class="wm-action wm-action--accent" @click="readSelection()" :disabled="loading || readingLoading || triageBusy || mutating"><span class="mail-icon" data-icon="layers" aria-hidden="true"></span>Read selected</button>
         <button :if="!linkedView && selectedCount > 1 && folder !== 'Sent' && folder !== 'Drafts' && folder !== 'Trash' && !isJunkFolder(folder)" type="button" class="wm-action" aria-haspopup="dialog" :disabled="loading || mutating" @click="openReplyBatch()"><span class="mail-icon" data-icon="reply" aria-hidden="true"></span>Reply separately</button>
         <button :if="!linkedView && folder !== 'Drafts' && folder !== 'Trash' && !isJunkFolder(folder)" type="button" class="wm-action" aria-haspopup="dialog" :disabled="loading || mutating" @click="openSnapshotPreview(true)"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Share snapshot</button>

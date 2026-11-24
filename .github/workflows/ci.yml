@@ -59,6 +59,12 @@ jobs:
       timeout-minutes: 2
       run: python3 scripts/test-webmail-external-senders.py packages/zig/zig-out/bin/mail --browser chromium --screenshots webmail-browser-screenshots
 
+    - name: Audit native webmail accessibility
+      if: runner.os == 'Linux'
+      working-directory: .
+      timeout-minutes: 6
+      run: python3 scripts/test-webmail-browser.py packages/zig/zig-out/bin/mail webmail-browser-screenshots/accessibility --accessibility
+
     - name: Verify paid team invitations in the browser
       if: runner.os == 'Linux'
       working-directory: .

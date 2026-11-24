@@ -321,18 +321,17 @@ input[type=checkbox] { accent-color: var(--accent); }
 .wm-notification-fields select { width: 100%; }
 .wm-message-row { display: flex; align-items: flex-start; border-bottom: 1px solid var(--border); position: relative; }
 .wm-message-row:hover { background: var(--hover); }
-.wm-message-check { flex-shrink: 0; margin: 17px 0 0 12px; }
-.wm-msg { display: flex; flex: 1; flex-direction: column; min-width: 0; gap: 4px; border: 0; padding: 14px 12px; text-align: left; background: transparent; color: var(--text); }
+.wm-msg { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: inherit; gap: 3px; border: 0; padding-block: 10px; padding-inline: 32px 10px; text-align: start; background: transparent; color: var(--text); }
 .wm-msg-row { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
 .wm-msg-from { font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wm-msg-date { font-size: 11px; color: var(--muted); white-space: nowrap; }
 .wm-msg-subject { display: flex; align-items: center; gap: 6px; min-width: 0; max-width: 100%; font-size: 13px; }
 .wm-msg-subject > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wm-message-row--unread .wm-msg-from, .wm-message-row--unread .wm-msg-subject { font-weight: 700; }
-.wm-message-row--unread::before { content: ''; position: absolute; top: 17px; left: 10px; height: 6px; width: 6px; border-radius: 50%; background: var(--selection-edge); }
+.wm-message-row--unread::before { content: ''; position: absolute; inset-block-start: 16px; inset-inline-start: 11px; height: 6px; width: 6px; border-radius: 50%; background: var(--selection-edge); }
 .wm-msg-snippet { max-width: 100%; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wm-thread-members { margin-left: 18px; border-left: 2px solid var(--accent-soft); }
-.wm-thread-members .wm-msg { padding: 11px 10px; }
+.wm-thread-members .wm-msg { padding-block: 11px; }
 .wm-folder-badge { display: inline-block; align-self: flex-start; padding: 2px 6px; border-radius: 4px; color: var(--muted); background: var(--bg); font-size: 10px; }
 .wm-pagination { display: flex; justify-content: space-between; align-items: center; padding: 12px; gap: 8px; border-top: 1px solid var(--border); font-size: 12px; }
 .wm-pagination button { display: inline-flex; align-items: center; gap: 4px; border: 0; background: transparent; color: var(--accent); padding: 5px; }
@@ -999,8 +998,6 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-list-options { min-height: 40px; padding: 6px 12px; }
 .wm-list-options .wm-selection-bar { gap: 5px; border: 0; padding: 0; margin-left: auto; }
 .wm-list-body { padding: 5px 7px; }
-.wm-message-check { margin: 32px 0 0 7px; }
-.wm-msg { gap: 3px; padding: 10px 10px 12px 8px; }
 .wm-msg-from { font-size: 14px; font-weight: 590; }
 .wm-message-row--unread .wm-msg-subject { font-weight: 600; }
 .wm-msg-subject { font-size: 13px; }
@@ -1387,7 +1384,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-list--selecting .wm-list-options .wm-select-all { display: inline-flex; }
 .wm-list-body { padding: 6px 9px; }
 .wm-message-row { border: 0; border-radius: 9px; min-height: 73px; }
-.wm-message-row:not(.wm-message-row--active)::after { position: absolute; content: ''; inset: auto 10px 0 26px; border-bottom: 1px solid var(--border); pointer-events: none; }
+.wm-message-row:not(.wm-message-row--active)::after { position: absolute; content: ''; inset-block-end: 0; inset-inline: 32px 10px; border-bottom: 1px solid var(--border); pointer-events: none; }
 .wm-message-row--active, .wm-message-row--active:hover { background: var(--message-selection); box-shadow: inset 2px 0 var(--selection-edge); }
 .wm-message-row--active::before { background: var(--selection-edge); }
 .wm-message-row--active .wm-msg,
@@ -1396,12 +1393,40 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-message-row--active :is(.wm-msg-date, .wm-msg-snippet, .wm-msg-subject .mail-icon, .wm-library-info span, .wm-library-info small) { color: var(--message-selection-muted); }
 .wm-message-row--active :is(.wm-thread-count, .wm-folder-badge, .wm-library-icon) { background: color-mix(in srgb, var(--message-selection-text) 12%, var(--message-selection)); color: var(--message-selection-text); }
 .wm-message-row--active .wm-msg:focus-visible { outline-color: var(--accent); }
-.wm-message-row--unread::before { top: 17px; }
 .wm-list--selecting .wm-message-row::before, .wm-message-row:has(.wm-message-check:focus-visible)::before { opacity: 0; }
-.wm-message-check { position: absolute; top: 12px; left: 6px; width: 14px; height: 14px; margin: 0; z-index: 1; }
+.wm-message-check {
+  position: absolute;
+  inset-block-start: 7px;
+  inset-inline-start: 2px;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  appearance: none;
+  inline-size: 24px;
+  block-size: 24px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+}
+.wm-message-check::before {
+  content: '';
+  grid-area: 1 / 1;
+  box-sizing: border-box;
+  inline-size: 16px;
+  block-size: 16px;
+  border: 1px solid var(--control-border);
+  border-radius: 4px;
+  background: var(--panel);
+}
+.wm-message-check:is(:checked, :indeterminate)::before { background: var(--primary); }
+.wm-message-check:is(:checked, :indeterminate)::after { content: ''; grid-area: 1 / 1; box-sizing: border-box; border-color: var(--on-primary); border-style: solid; }
+.wm-message-check:checked:not(:indeterminate)::after { inline-size: 5px; block-size: 9px; border-width: 0 2px 2px 0; transform: translateY(-1px) rotate(45deg); }
+.wm-message-check:indeterminate::after { inline-size: 8px; border-width: 2px 0 0; }
+.wm-message-check:disabled { cursor: default; }
 .wm-list--selecting .wm-message-check { opacity: 1; }
-.wm-msg { min-height: inherit; padding: 10px 10px 10px 26px; gap: 3px; }
-.wm-thread-members .wm-msg { padding-inline-start: 26px; }
 .wm-msg-from { font-weight: 560; }
 .wm-message-row--unread .wm-msg-from { font-weight: 670; }
 .wm-message-row--unread .wm-msg-subject { font-weight: 600; }
@@ -1569,7 +1594,6 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-back .mail-icon { width: 17px; height: 17px; }
   .wm-list-head:has(.wm-list-next-unread) { align-items: flex-start; }
   .wm-list-head h1 { font-size: clamp(27px, 8vw, 30px); }
-  .wm-message-check { left: 3px; top: 9px; width: 20px; height: 20px; }
   .wm-read-sender { flex-direction: column; }
   .wm-message-heading-actions { flex-wrap: wrap; gap: 6px; }
   .wm-message-sharing { display: grid; flex-basis: 100%; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 8px; }
@@ -1663,6 +1687,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 }
 @media (forced-colors: active) {
   .mail-icon { forced-color-adjust: none; background: CanvasText; }
+  .wm-message-check { appearance: auto; }
+  .wm-message-check::before, .wm-message-check::after { content: none; }
   .wm-folder[aria-current=page], .wm-message-row--active, .wm-shared-row[aria-current=true], .wm-tool[aria-pressed=true], .wm-list-toggle:has(input:checked, input[aria-checked=mixed]) { outline: 1px solid Highlight; outline-offset: -1px; }
 }
 

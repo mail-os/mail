@@ -191,7 +191,7 @@ def verify_delivery(fixture, sender):
         assert status == 200 and b"UID:studio-reservation@example.test" in body and f"PARTSTAT={response}".encode() in body, (status, body)
 
 
-def verify(binary, output, engine):
+def verify(binary, output, engine, accessibility=False):
     with tempfile.TemporaryDirectory(prefix="mail-browser-") as directory:
         fixture = Fixture(binary, Path(directory), staging=True)
         with fixture.daemon():
@@ -233,9 +233,11 @@ def verify(binary, output, engine):
                        MAIL_BROWSER_NEWCOMER=newcomer, MAIL_BROWSER_LONG_FOLDER=LONG_FOLDER,
                        MAIL_BROWSER_REVIEW_FOLDER=REVIEW_FOLDER,
                        MAIL_BROWSER_CERT=fixture.env["SMTP_TLS_CERT"])
-            subprocess.run(["node", str(SCRIPTS / "webmail-browser.mjs"), engine, str(output / engine)],
+            script = "webmail-accessibility.mjs" if accessibility else "webmail-browser.mjs"
+            subprocess.run(["node", str(SCRIPTS / script), engine, str(output / engine)],
                            env=env, check=True)
-            verify_delivery(fixture, sender)
+            if not accessibility:
+                verify_delivery(fixture, sender)
 
 
 def main():
@@ -243,10 +245,11 @@ def main():
     parser.add_argument("binary", type=Path)
     parser.add_argument("screenshots", type=Path)
     parser.add_argument("--engine", choices=ENGINES, action="append")
+    parser.add_argument("--accessibility", action="store_true", help="Audit native pages with axe-core and browser accessibility snapshots")
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     for engine in args.engine or ENGINES:
-        verify(binary, args.screenshots.resolve(), engine)
+        verify(binary, args.screenshots.resolve(), engine, args.accessibility)
 
 
 if __name__ == "__main__":

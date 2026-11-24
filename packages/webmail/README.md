@@ -73,3 +73,15 @@ fresh loopback HTTPS server and creates its own mailboxes, SMTP messages, and
 CalDAV event. The suite checks desktop and phone workflows, including keyboard
 navigation, message search and reading, attachments, delivery, and Calendar.
 The Ubuntu CI job uploads the screenshots for each engine.
+
+Run the accessibility audit against the same HTTPS fixtures.
+
+```sh
+python3 scripts/test-webmail-browser.py packages/zig/zig-out/bin/mail /tmp/mail-accessibility --accessibility
+```
+
+The audit scans light and dark layouts at 320 px and 1440 px and records
+WCAG-tagged violations, items for manual review, computed picker contrast, and
+browser accessibility snapshots in each engine's `wcag.json`. Full WCAG
+verification also requires manual review and hands-on assistive technology
+testing.
