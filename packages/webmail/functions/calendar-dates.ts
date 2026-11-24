@@ -8,6 +8,11 @@ const localTime = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?$/
 export const browserTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone
 export const calendarTimeZones = [...new Set([browserTimeZone, 'UTC', ...(Intl.supportedValuesOf?.('timeZone') ?? [])])].sort()
 
+export function calendarTimeZoneLabel(zone: string): string {
+  const location = zone.startsWith('Etc/') ? zone : zone.slice(zone.lastIndexOf('/') + 1)
+  return location.replaceAll('_', ' ')
+}
+
 export function allDayInstant(day: string): number | null {
   if (!dateOnly.test(day)) return null
   const stamp = Date.parse(`${day}T00:00:00Z`)

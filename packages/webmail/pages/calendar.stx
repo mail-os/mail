@@ -8,6 +8,7 @@
 </head>
 <body>
 <script client>
+import { calendarTimeZoneLabel } from '../functions/calendar-dates'
 import { cancelMailReads, restoreMailReads } from '../functions/mail-api'
 import { useMailCalendar } from '../functions/use-mail-calendar'
 import { reminderDayLink } from '../functions/use-calendar-reminders'
@@ -409,7 +410,7 @@ onUnmounted(() => { destroy(); destroyReminders() })
       </div>
       <label class="calendar-zone">Time zone
         <select aria-label="Display time zone" :value="displayZone" @change="changeZone($event)">
-          <option :for="zone in calendarTimeZones" :value="zone" :text="zone"></option>
+          <option :for="zone in calendarTimeZones" :value="zone" :text="calendarTimeZoneLabel(zone)"></option>
         </select>
       </label>
     </div>
@@ -609,7 +610,7 @@ onUnmounted(() => { destroy(); destroyReminders() })
             <label>Ends<input type="datetime-local" step="1" :value="editorEnd" @input="setEventBoundary('end', $event)"></label>
           </div>
           <label>Event time zone<select aria-label="Event time zone" :value="editorZone" @change="editorZone.set($event.target.value)">
-            <option :for="zone in editorTimeZones" :value="zone" :text="zone"></option>
+            <option :for="zone in editorTimeZones" :value="zone" :text="calendarTimeZoneLabel(zone)"></option>
           </select></label>
         </div>
       </div>

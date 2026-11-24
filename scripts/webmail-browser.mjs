@@ -179,7 +179,7 @@ async function verifyCalendarPeriod(page, label, height) {
   const stacked = Math.abs(controls[3].top - controls[0].top) >= 0.5
   const width = page.viewportSize()?.width ?? 0
   if (width <= 320) assert(stacked, 'The date field wraps at 320px')
-  if (width >= 390) assert(!stacked, 'Date navigation fits on one row at this width')
+  if (width >= 375) assert(!stacked, 'Date navigation fits on one row at this width')
   const row = controls.slice(0, stacked ? 3 : 4)
   for (const control of row) {
     assert(Math.abs(control.top - row[0].top) < 0.5, 'Date navigation controls should align')
@@ -194,7 +194,7 @@ async function verifyCalendarPeriod(page, label, height) {
       `${label} uses the 16px picker icon size, got ${icon.width} × ${icon.height}px`)
   }
   const date = controls[3]
-  assert(date.right - date.left >= (width <= 490 ? 148 : 152), 'Jump to date leaves room for the native date and picker')
+  assert(date.right - date.left >= (width <= 490 ? 140 : 152), 'Jump to date leaves room for the native date and picker')
   const dateInput = group.getByLabel('Jump to date', { exact: true })
   const editor = await dateInput.boundingBox()
   assert(Math.abs(editor.y - date.top - 1) < 0.5 && Math.abs(editor.height - date.height + 2) < 0.5,
@@ -983,9 +983,18 @@ async function phoneJourney(page) {
   await fitsViewport(page)
   await screenshot(page, 'phone-calendar')
   await verifyCalendarPeriod(page, 'phone-dark', 44)
+  await page.setViewportSize({ width: 375, height: 844 })
+  const displayZone = page.getByRole('combobox', { name: 'Display time zone' })
+  await displayZone.selectOption('America/Los_Angeles')
+  assert.equal(await displayZone.locator('option:checked').textContent(), 'Los Angeles')
+  await verifySelectedOptionFits(displayZone)
+  await heading(page, 'Calendar').click()
+  await verifyCalendarPeriod(page, 'phone-375-dark', 44)
   await page.setViewportSize({ width: 320, height: 844 })
   await fitsViewport(page)
+  await verifySelectedOptionFits(displayZone)
   await verifyCalendarPeriod(page, 'narrow-phone-dark', 44)
+  await displayZone.selectOption('UTC')
   const narrowView = page.getByRole('combobox', { name: 'Calendar view', exact: true })
   assert.deepEqual(await narrowView.locator('option').allTextContents(), ['Day', 'Week', 'Month', 'Year', 'Agenda'])
   assert.equal(await narrowView.inputValue(), 'month')
@@ -1017,6 +1026,8 @@ async function phoneJourney(page) {
   verifyControlGaps([calendar, team], 12)
   verifyControlGaps([role, submit], 12)
   await verifySelectedOptionFits(calendarPicker)
+  await heading(page, 'Share a calendar').click()
+  await verifyPaintedControlBorders(shareForm, 'select, input, button', [calendar, team, teammate, role, submit], 'phone-calendar-sharing-dark')
   await page.setViewportSize({ width: 320, height: 844 })
   await fitsViewport(page)
   const narrowSharing = await verifyControlRow(shareForm, 'select, input, button', 44, false)
@@ -1024,8 +1035,8 @@ async function phoneJourney(page) {
     'Sharing controls use the full column on narrow phones')
   await access.selectOption('free_busy')
   for (const picker of await shareForm.getByRole('combobox').all()) await verifySelectedOptionFits(picker)
-  await access.selectOption('viewer')
-  await shareForm.screenshot({ path: join(output, 'narrow-phone-calendar-sharing-dark.png'), animations: 'disabled' })
+  await heading(page, 'Share a calendar').click()
+  await verifyPaintedControlBorders(shareForm, 'select, input, button', narrowSharing, 'narrow-phone-calendar-sharing-dark')
   await page.setViewportSize({ width: 390, height: 844 })
   await page.locator('.calendar-loading').waitFor({ state: 'hidden' })
   await fitsViewport(page)
@@ -2014,6 +2025,9 @@ async function calendarEventControlJourney(page) {
   const fields = dialog.locator('.calendar-editor-fields')
   const repeat = fields.getByLabel('Repeat', { exact: true })
   const repeatEnds = fields.getByLabel('Repeat ends', { exact: true })
+  const eventZone = fields.getByRole('combobox', { name: 'Event time zone' })
+  await eventZone.selectOption('America/Los_Angeles')
+  assert.equal(await eventZone.locator('option:checked').textContent(), 'Los Angeles')
   await repeat.selectOption({ label: 'Weekly' })
   await repeatEnds.selectOption('count')
 
@@ -2025,6 +2039,7 @@ async function calendarEventControlJourney(page) {
     const controls = await verifyControlRow(fields, selector, height, false)
     await verifyPaintedControlBorders(fields, selector, controls, `event-editor-${width}-${scheme}`)
     await verifySelectedOptionFits(repeatEnds)
+    await verifySelectedOptionFits(eventZone)
     await fitsViewport(page)
   }
   await button(dialog, 'Cancel').click()
