@@ -37,8 +37,9 @@ def ready(smtp, webmail, caldav, process):
         try:
             with socket.create_connection(("127.0.0.1", int(smtp)), timeout=0.2):
                 pass
-            with socket.create_connection(("127.0.0.1", int(caldav)), timeout=0.2):
-                pass
+            if caldav is not None:
+                with socket.create_connection(("127.0.0.1", int(caldav)), timeout=0.2):
+                    pass
             with urllib.request.urlopen(f"{webmail}/login", timeout=0.2) as response:
                 if response.status == 200:
                     return

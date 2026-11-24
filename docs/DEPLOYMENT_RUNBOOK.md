@@ -633,9 +633,15 @@ zig build -Doptimize=ReleaseSafe
 
 ### Step 3: Deploy New Binary
 
+After stopping Mail and its other writers, capture and verify the complete
+recovery point before installing the new executable. Include both databases,
+Maildir, and the matching configuration using the [backup procedure](#backup-and-restore).
+
 ```bash
 # Stop service
 sudo systemctl stop mail
+
+# Capture and verify the complete recovery point here.
 
 # Backup old binary
 sudo cp /opt/mail/mail /opt/mail/mail.v0.28.0
@@ -718,31 +724,41 @@ sudo -u smtp sqlite3 /var/lib/mail/smtp.db "SELECT version, name FROM schema_mig
 
 ### Rollback Steps
 
+1. Pause intake or allow the upstream relay to queue mail. Stop Mail and any
+   other writers, then capture a new recovery point with both databases,
+   Maildir, and the matching configuration. Keep the pre-upgrade checkpoint
+   and the current recovery point available throughout the rollback.
+2. Reopen the current data with the previous executable on an isolated copy.
+   Verify the readers and workers you intend to run, including every pending
+   Outbox format. A binary-only rollback keeps the data together. Pause any
+   listener or worker whose compatibility remains unproven.
+3. For a checkpoint rollback, restore the matching pre-upgrade databases,
+   Maildir, and configuration together into a separate directory. Review the
+   messages, drafts, DAV changes, and send receipts accepted since that
+   checkpoint before reopening intake. Use the saved current recovery point
+   and the candidate binary to recover those writes, reconciling delivery
+   receipts before retrying sends.
+4. Verify healthy listeners, real inbound delivery, IMAP UID and UIDVALIDITY,
+   a draft, and representative DAV resources before resuming the affected
+   services. Keep both recovery points through the verification window.
+
+### Rehearse a published-version rollback
+
+Use the published executable for the version being replaced. Verify the
+download against its release manifest and run this fixture on an isolated
+host with throwaway accounts. The v0.3.26 rehearsal ran on Ubuntu 24.04 arm64.
+
 ```bash
-# Step 1: Stop current service
-sudo systemctl stop mail
-
-# Step 2: Restore old binary
-sudo cp /opt/mail/mail.v0.28.0 /opt/mail/mail
-
-# Step 3: Rollback database (if migrations ran)
-sudo -u smtp cp /var/lib/mail/smtp-backup-*.db /var/lib/mail/smtp.db
-
-# Step 4: Verify configuration
-sudo -u smtp /opt/mail/mail --validate-only
-
-# Step 5: Start service
-sudo systemctl start mail
-
-# Step 6: Verify health
-curl -s http://localhost:8081/health | jq .status
-# Expected: "healthy"
-
-# Step 7: Monitor logs
-sudo journalctl -u mail -f
+python3 scripts/test-mail-release-upgrade.py /path/to/candidate --previous /path/to/released-mail
 ```
 
-**Rollback Time:** ~5 minutes
+The fixture upgrades real mail, draft, and DAV data. For verified legacy DAV
+collections, apply the [offline ownership assignment](../WEBMAIL.md#upgrading-persisted-dav-data).
+Keep DAV paused when temporarily running v0.3.26 over a store that has those
+assignments. Its mail worker is exercised against a simple compatible queued
+send. The fixture then rolls the full store forward and checks the writes
+from both versions, followed by a domain rename and a separate checkpoint
+restore.
 
 ---
 
