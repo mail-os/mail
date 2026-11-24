@@ -180,6 +180,14 @@ fn customFolder(a: std.mem.Allocator, key: SearchKey, name: []const u8, stamp: [
 /// Route an EAS command to its handler. `cmd` is the `Cmd` query value; `body`
 /// is the raw WBXML request body (possibly empty).
 pub fn dispatch(ctx: *Context, cmd: []const u8, body: []const u8) !Response {
+    if (ctx.hosted) {
+        const access = try ctx.db.mailboxAccess(ctx.username);
+        if (!access.readable()) return .{ .status = 403 };
+        if (access == .read_only) for ([_][]const u8{ "MoveItems", "FolderCreate", "FolderUpdate", "FolderDelete" }) |mutation| {
+            if (std.ascii.eqlIgnoreCase(cmd, mutation)) return .{ .status = 403 };
+        };
+    }
+
     if (std.ascii.eqlIgnoreCase(cmd, "SendMail")) return handleComposeMail(ctx, .send_mail, body);
     if (std.ascii.eqlIgnoreCase(cmd, "SmartReply")) return handleComposeMail(ctx, .smart_reply, body);
     if (std.ascii.eqlIgnoreCase(cmd, "SmartForward")) return handleComposeMail(ctx, .smart_forward, body);
@@ -447,7 +455,8 @@ fn handleComposeMail(ctx: *Context, op: ComposeCommand, body: []const u8) !Respo
     }) catch |err| return sendError(ctx, op, switch (err) {
         error.HostedStorageFull => .mailbox_quota,
         error.HostedSendingLimit => .send_quota,
-        error.HostedSenderDisabled, error.HostedRecipientDisabled => .access_denied,
+        error.HostedSenderDisabled, error.HostedSenderReadOnly, error.HostedRecipientDisabled, error.HostedRecipientExpired => .access_denied,
+        error.HostedRecipientReadOnly => .retry_later,
         error.MessagePreviouslySent => .already_accepted,
         error.InvalidAddress => .invalid_recipient,
         else => .submission_failed,

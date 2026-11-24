@@ -379,7 +379,7 @@ pub const AuthBackend = struct {
 
         // Check if user is enabled. Same timing concern as not-found: equalize
         // the cost before returning so disabled accounts aren't distinguishable.
-        if (!user.enabled) {
+        if (!user.enabled or !(try self.db.mailboxAccess(user.username)).readable()) {
             self.dummyVerify(password);
             return false;
         }
@@ -514,7 +514,7 @@ pub const AuthBackend = struct {
         };
         defer user.deinit(self.allocator);
 
-        if (!user.enabled) {
+        if (!user.enabled or !(try self.db.mailboxAccess(user.username)).readable()) {
             log.warn("Digest auth: user disabled", .{});
             return null;
         }

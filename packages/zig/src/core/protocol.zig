@@ -1646,9 +1646,14 @@ pub const Session = struct {
                 try self.sendResponse(writer, 451, "4.3.0 Recipient lookup temporarily unavailable", null);
                 return;
             };
-            if (limits != null and !limits.?.enabled) {
-                try self.sendResponse(writer, 550, "5.2.1 Recipient mailbox is disabled", null);
-                return;
+            if (limits) |hosted| {
+                const refusal: ?anyerror = switch (hosted.accessAt(time_compat.timestamp())) {
+                    .full => null,
+                    .read_only => error.HostedRecipientReadOnly,
+                    .expired => error.HostedRecipientExpired,
+                    .disabled => error.HostedRecipientDisabled,
+                };
+                if (refusal) |err| return self.sendSaveError(writer, err);
             }
         }
 
@@ -2671,7 +2676,10 @@ pub const Session = struct {
         switch (err) {
             error.HostedStorageFull => try self.sendResponse(writer, 452, "4.2.2 Recipient mailbox storage is full", null),
             error.HostedRecipientDisabled => try self.sendResponse(writer, 550, "5.2.1 Recipient mailbox is disabled", null),
+            error.HostedRecipientReadOnly => try self.sendResponse(writer, 450, "4.2.1 Recipient mailbox is temporarily read-only", null),
+            error.HostedRecipientExpired => try self.sendResponse(writer, 550, "5.2.1 Recipient mailbox service ended", null),
             error.HostedSenderDisabled => try self.sendResponse(writer, 550, "5.7.1 Sender mailbox is disabled", null),
+            error.HostedSenderReadOnly => try self.sendResponse(writer, 550, "5.7.1 Sender mailbox is read-only", null),
             error.HostedSendingLimit => try self.sendResponse(writer, 452, "4.7.0 Daily recipient allowance exhausted; retry after midnight UTC", null),
             else => try self.sendResponse(writer, 451, "4.3.0 Temporary storage failure; please retry", null),
         }

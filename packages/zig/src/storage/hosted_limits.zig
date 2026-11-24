@@ -49,12 +49,18 @@ pub fn observeStorage(db: *db_mod.Database, mailbox: []const u8, quota: u64, now
 /// replaced in place, so saving a smaller draft works even at the limit.
 pub fn checkStorage(db: *db_mod.Database, user: []const u8, bytes: u64, replaced: ?[]const u8) !void {
     const limits = (try db.hostedLimits(user)) orelse return;
-    if (!limits.enabled) return error.HostedRecipientDisabled;
+    const now = time.timestamp();
+    switch (limits.accessAt(now)) {
+        .full => {},
+        .disabled => return error.HostedRecipientDisabled,
+        .read_only => return error.HostedRecipientReadOnly,
+        .expired => return error.HostedRecipientExpired,
+    }
     var root_buf: [4096]u8 = undefined;
     const root = try mailboxRoot(user, &root_buf);
     const credit = if (replaced) |path| try fs.getFileSize(path) else 0;
     if (bytes <= credit) return;
-    const reserved = try storageReservations(db, user, time.timestamp());
+    const reserved = try storageReservations(db, user, now);
     const committed = std.math.add(u64, reserved.pending_delivery_bytes, reserved.linked_file_bytes) catch return error.HostedStorageFull;
     const growth = std.math.add(u64, bytes - credit, committed) catch return error.HostedStorageFull;
     if (growth > limits.quota_bytes) return error.HostedStorageFull;

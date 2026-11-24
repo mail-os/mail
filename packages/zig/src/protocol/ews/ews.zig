@@ -131,6 +131,12 @@ pub fn handleSoap(ctx: *Context, soap: []const u8) !Response {
     const op = extractOperation(soap);
     logger.info("EWS: op={s} user={s} bytes={d}", .{ op, ctx.username, soap.len });
 
+    if (ctx.hosted) {
+        const access = try ctx.db.mailboxAccess(ctx.username);
+        if (!access.readable()) return .{ .status = 403, .body = "" };
+        if (access == .read_only and !readOnlyOperation(op)) return .{ .status = 403, .body = "" };
+    }
+
     if (std.mem.eql(u8, op, "GetFolder")) return getFolder(ctx, soap);
     if (std.mem.eql(u8, op, "SyncFolderHierarchy")) return syncFolderHierarchy(ctx, soap);
     if (std.mem.eql(u8, op, "SyncFolderItems")) return syncFolderItems(ctx, soap);
@@ -150,6 +156,17 @@ pub fn handleSoap(ctx: *Context, soap: []const u8) !Response {
     // Unknown/unimplemented: a soft success keeps setup probing rather than
     // erroring the account, while the request log tells us what to implement.
     return softFault(ctx, op);
+}
+
+fn readOnlyOperation(op: []const u8) bool {
+    for ([_][]const u8{
+        "GetFolder",          "SyncFolderHierarchy", "SyncFolderItems", "GetItem",
+        "GetAttachment",      "FindFolder",          "FindItem",        "GetUserConfiguration",
+        "GetUserOofSettings", "Subscribe",
+    }) |allowed| {
+        if (std.mem.eql(u8, op, allowed)) return true;
+    }
+    return false;
 }
 
 /// The EWS operation is the first element inside <s:Body>. Find it by scanning
@@ -966,6 +983,8 @@ fn appendMailResult(a: std.mem.Allocator, buf: *std.ArrayList(u8), comptime op: 
             error.HostedSendingLimit => .{ "ErrorSubmissionQuotaExceeded", "Daily recipient allowance exhausted. Try again after midnight UTC." },
             error.HostedStorageFull, error.StorageLimit, error.DraftStorageLimit => .{ "ErrorQuotaExceeded", "Mailbox storage is full." },
             error.HostedRecipientDisabled, error.HostedSenderDisabled => .{ "ErrorAccessDenied", "Mailbox is disabled." },
+            error.HostedSenderReadOnly, error.HostedRecipientReadOnly => .{ "ErrorAccessDenied", "Mailbox is read-only." },
+            error.HostedRecipientExpired => .{ "ErrorAccessDenied", "Recipient mailbox service ended." },
             error.NoRecipients => .{ "ErrorMissingRecipients", "At least one recipient is required." },
             error.InvalidAddress => .{ "ErrorInvalidRecipients", "Check the recipient addresses." },
             error.ItemNotFound => .{ "ErrorItemNotFound", "The message could not be found." },

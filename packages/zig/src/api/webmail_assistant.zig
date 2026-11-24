@@ -252,7 +252,10 @@ pub fn authenticate(a: Allocator, db: *Database, token: []const u8, action: Acti
             .data = if (active) try std.json.parseFromSliceLeaky(Policy, a, try a.dupe(u8, stmt.columnText(6)), .{}) else null,
         };
     };
-    if (access.data == null or (action == .read and !access.data.?.read) or (action == .draft and !access.data.?.draft)) {
+    const mailbox_access = try db.mailboxAccess(access.username);
+    if (!mailbox_access.readable() or access.data == null or (action == .read and !access.data.?.read) or
+        (action == .draft and (mailbox_access != .full or !access.data.?.draft)))
+    {
         try audit(db, access, action, .denied, now);
         return error.AssistantUnavailable;
     }

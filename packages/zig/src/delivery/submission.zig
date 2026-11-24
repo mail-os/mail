@@ -268,7 +268,10 @@ pub fn dispatch(a: std.mem.Allocator, cfg: Delivery, from: []const u8, recipient
         if (failure) |err| {
             std.log.warn("Message delivery to {s} failed: {}", .{ recipient, err });
             if (result.first_error == null) result.first_error = err;
-            if (result.first_limit_error == null and (err == error.HostedStorageFull or err == error.HostedRecipientDisabled)) result.first_limit_error = err;
+            if (result.first_limit_error == null) switch (err) {
+                error.HostedStorageFull, error.HostedRecipientDisabled, error.HostedRecipientReadOnly, error.HostedRecipientExpired => result.first_limit_error = err,
+                else => {},
+            };
             failed[count] = recipient;
             count += 1;
         } else result.delivered += 1;
@@ -340,6 +343,8 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
                 target.refusal = switch (err) {
                     error.HostedStorageFull => "recipient_storage_full",
                     error.HostedRecipientDisabled => "recipient_disabled",
+                    error.HostedRecipientReadOnly => "recipient_read_only",
+                    error.HostedRecipientExpired => "recipient_expired",
                     error.InvalidMailboxPath => "invalid_recipient",
                     else => return err,
                 };
@@ -454,7 +459,7 @@ pub fn sendRaw(a: std.mem.Allocator, cfg: Delivery, message: RawSubmission) !voi
             (if (result.failed.len == 0) .delivered else .partial)
         else if (result.first_error) |err| switch (err) {
             error.HostedStorageFull => .storage_full,
-            error.HostedRecipientDisabled => .disabled,
+            error.HostedRecipientDisabled, error.HostedRecipientExpired => .disabled,
             else => .failed,
         } else .failed;
         try db.finishEwsDraftSend(&delivery_id, outcome);

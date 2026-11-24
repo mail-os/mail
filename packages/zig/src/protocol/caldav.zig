@@ -789,6 +789,14 @@ pub const CalDavSession = struct {
         request: []const u8,
         config: *const CalDavConfig,
     ) !void {
+        const username = self.username orelse return self.sendError(401, "Unauthorized");
+        const access = try self.auth_backend.db.mailboxAccess(username);
+        if (!access.readable()) return self.sendError(403, "Forbidden");
+        if (access == .read_only) switch (method) {
+            .get, .options, .propfind, .report => {},
+            else => return self.sendError(403, "Mailbox is read-only"),
+        };
+
         const parsed = parsePath(path);
         // Free/busy also works with a grant that allows no event access.
         if (method == .report and config.enable_caldav) {

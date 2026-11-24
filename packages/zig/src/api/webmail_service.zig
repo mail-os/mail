@@ -782,8 +782,11 @@ pub const Service = struct {
                     error.CalendarReplyNeedsReview => "Open the invitation and retry this RSVP after the upgrade.",
                     error.HostedSendingLimit => "Daily recipient allowance exhausted. Try again after midnight UTC.",
                     error.HostedSenderDisabled => "This mailbox is disabled. The message was not sent.",
+                    error.HostedSenderReadOnly => "This mailbox is available for reading and export.",
                     error.HostedStorageFull => "A recipient mailbox is full. Review the recipients before retrying.",
                     error.HostedRecipientDisabled => "A recipient mailbox is disabled. Review the recipients before retrying.",
+                    error.HostedRecipientReadOnly => "A recipient mailbox is temporarily read-only. Try again later.",
+                    error.HostedRecipientExpired => "A recipient mailbox's service ended. Review the recipients before retrying.",
                     else => "Delivery failed. Review this message before retrying.",
                 };
             }
@@ -1061,6 +1064,9 @@ pub const Service = struct {
         const gives_feedback = payload.action == .junk or payload.action == .not_junk;
         self.db.lockMailboxes();
         defer self.db.unlockMailboxes();
+        const access = try self.db.mailboxAccess(user);
+        if (!access.readable()) return error.HostedRecipientDisabled;
+        if (access == .read_only) return error.HostedReadOnly;
         const selection = try a.dupe(MessageRef, payload.messages);
         // Preflight the complete selection, without retaining decoded attachments.
         for (selection, 0..) |*ref, index| {

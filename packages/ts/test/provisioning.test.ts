@@ -14,6 +14,8 @@ test('provisioning uses the dedicated versioned API and never follows a redirect
       requests.push(request)
       if (new URL(request.url).pathname.endsWith('/status'))
         return Response.json({ version: 1, domain: 'mailboxes.example.test' })
+      if (new URL(request.url).pathname.endsWith('/mailbox/access'))
+        return Response.json({ revision: 2, mailbox: 'reader@mailboxes.example.test', enabled: true, access: 'read_only' })
       return Response.json({ revision: 1, mailbox: 'reader@mailboxes.example.test', enabled: true })
     }, { preconnect: fetch.preconnect }),
   })
@@ -31,14 +33,24 @@ test('provisioning uses the dedicated versioned API and never follows a redirect
   }
   expect((await client.apply(change)).mailbox).toBe(change.mailbox)
   await client.mailbox(change.mailbox, change.actor)
+  const renewal = {
+    actor: change.actor,
+    mailbox: change.mailbox,
+    operation_id: 'access-revision-00002',
+    revision: 2,
+    access_window: { service_until: 1795485600, read_until: 1795492800 },
+  }
+  expect((await client.applyAccess(renewal)).access).toBe('read_only')
   expect(requests.map(request => new URL(request.url).pathname)).toEqual([
     '/provisioning/v1/status',
     '/provisioning/v1/mailbox',
     '/provisioning/v1/mailbox',
+    '/provisioning/v1/mailbox/access',
   ])
   expect(requests.every(request => request.headers.get('Authorization') === `Bearer ${token}` && request.redirect === 'error')).toBe(true)
   expect(await requests[1].json()).toEqual(change)
   expect(new URL(requests[2].url).searchParams.get('actor')).toBe(change.actor)
+  expect(await requests[3].json()).toEqual(renewal)
 })
 
 test('provisioning rejects plaintext non-loopback origins and incompatible API revisions', async () => {

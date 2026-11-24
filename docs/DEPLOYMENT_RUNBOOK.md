@@ -62,6 +62,28 @@ sudo -u mail-server env SMTP_DB_PATH=/var/lib/mail/smtp.db \
 
 The report carries the observation time and an `audit_id`. Each successful report records `hosted.status` in `audit_log` with the effective operator UID and mailbox. The output is restricted to the mailbox identifier, operational state, and aggregate counters. Maildir and reservation counts may change while the daemon is delivering mail.
 
+### Hosted service and export deadlines
+
+The private v1 provisioning API accepts an optional `access_window` with
+`service_until` and `read_until` as Unix seconds. Send the end of the verified
+paid term plus grace as `service_until`, and the end of the export period as
+`read_until`. The daemon applies both deadlines on access, including after
+restart. It reports `full`, `read_only`, `expired`, or `disabled` for a
+mailbox with a window. A missing window keeps the mailbox on its existing
+operator-managed policy.
+
+During export, SMTP temporarily defers new inbound mail, blocks outbound
+submission, and holds queued outbound retries. Clients can read or download
+existing data. After the export deadline SMTP refuses the recipient permanently
+and authenticated access ends. An operator suspension takes precedence over
+either deadline.
+
+For renewals, post `mailbox`, `actor`, `operation_id`, the next `revision`, and
+`access_window` to `/provisioning/v1/mailbox/access`. The SDK calls this
+`applyAccess`. It changes the deadlines and revision while preserving the
+account's enabled flag, storage quota, and sending allowance. An older
+provisioning client that omits the window on an update preserves the deadlines.
+
 ## Local mailbox directory upgrade
 
 Back up the Maildir and SQLite database together before upgrading a server with older ActiveSync clients. On startup, the server checks for full-address local accounts that still have mail under a short directory name such as `mail/alice`. It moves eligible messages to `mail/alice@example.com` before opening the protocol listeners. It also moves messages in a canonical custom folder's nested slots into the folder path exposed by IMAP and webmail. ActiveSync, IMAP, webmail, and EWS then read from the canonical mailbox. The upgrade retains existing message flags and client identifiers when it can reconcile both directories.

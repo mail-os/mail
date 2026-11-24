@@ -529,7 +529,7 @@ pub const Pop3Session = struct {
         if (self.state == .transaction) {
             self.state = .update;
 
-            if (config.delete_on_quit) {
+            if (config.delete_on_quit and try self.auth_backend.db.mailboxAccess(self.username.?) == .full) {
                 var deleted_count: usize = 0;
                 for (self.messages.items) |msg| {
                     if (msg.deleted) {
@@ -637,6 +637,18 @@ pub const Pop3Session = struct {
         const cmd_upper = try self.allocator.alloc(u8, cmd_str.len);
         defer self.allocator.free(cmd_upper);
         _ = std.ascii.upperString(cmd_upper, cmd_str);
+
+        if (self.state == .transaction) {
+            const access = try self.auth_backend.db.mailboxAccess(self.username.?);
+            if (!access.readable()) {
+                try self.sendErr("Mailbox is unavailable");
+                return false;
+            }
+            if (access == .read_only and std.mem.eql(u8, cmd_upper, "DELE")) {
+                try self.sendErr("Mailbox is read-only");
+                return true;
+            }
+        }
 
         if (std.mem.eql(u8, cmd_upper, "USER")) {
             if (args.len == 0) {

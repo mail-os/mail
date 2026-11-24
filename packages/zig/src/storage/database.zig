@@ -390,7 +390,9 @@ pub const Database = struct {
             \\    requested_quota INTEGER NOT NULL,
             \\    requested_enabled INTEGER NOT NULL,
             \\    initial_recovery TEXT NOT NULL,
-            \\    send_recipients_per_day INTEGER NOT NULL DEFAULT 0
+            \\    send_recipients_per_day INTEGER NOT NULL DEFAULT 0,
+            \\    service_until INTEGER,
+            \\    read_until INTEGER
             \\);
             \\CREATE TABLE IF NOT EXISTS provisioning_operations (
             \\    operation_id TEXT PRIMARY KEY,
@@ -1008,6 +1010,8 @@ pub const Database = struct {
             \\CREATE INDEX IF NOT EXISTS sender_review_work ON sender_review_messages(retry_at,operation) WHERE operation IS NOT NULL;
         );
         self.exec("ALTER TABLE provisioned_mailboxes ADD COLUMN send_recipients_per_day INTEGER NOT NULL DEFAULT 0") catch {};
+        self.exec("ALTER TABLE provisioned_mailboxes ADD COLUMN service_until INTEGER") catch {};
+        self.exec("ALTER TABLE provisioned_mailboxes ADD COLUMN read_until INTEGER") catch {};
         self.exec("ALTER TABLE users ADD COLUMN recovery_updated_at INTEGER;") catch {};
 
         // Single-use password reset tokens (see src/api/webmail_recovery.zig).
@@ -1194,6 +1198,39 @@ pub const Database = struct {
         return .{ .db = self };
     }
 
+    pub const AccessWindow = struct {
+        service_until: i64,
+        read_until: i64,
+
+        pub fn valid(self: AccessWindow) bool {
+            return self.service_until > 0 and self.read_until >= self.service_until;
+        }
+    };
+
+    pub const MailboxAccess = enum {
+        full,
+        read_only,
+        expired,
+        disabled,
+
+        pub fn readable(self: MailboxAccess) bool {
+            return self == .full or self == .read_only;
+        }
+    };
+
+    fn mailboxAccessAt(enabled: bool, window: ?AccessWindow, now: i64) MailboxAccess {
+        if (!enabled) return .disabled;
+        const limits = window orelse return .full;
+        if (now < limits.service_until) return .full;
+        if (now < limits.read_until) return .read_only;
+        return .expired;
+    }
+
+    fn scanAccessWindow(stmt: Statement, start: usize) ?AccessWindow {
+        if (stmt.columnIsNull(start)) return null;
+        return .{ .service_until = stmt.columnInt64(start), .read_until = stmt.columnInt64(start + 1) };
+    }
+
     pub const ProvisioningChange = struct {
         mailbox: []const u8,
         actor: []const u8,
@@ -1202,6 +1239,7 @@ pub const Database = struct {
         quota_bytes: i64,
         send_recipients_per_day: i64 = 0,
         enabled: bool,
+        access_window: ?AccessWindow = null,
         initial_recovery: ?[]const u8 = null,
         initial_password_hash: ?[]const u8 = null,
     };
@@ -1212,17 +1250,54 @@ pub const Database = struct {
         quota_bytes: i64,
         send_recipients_per_day: i64 = 0,
         enabled: bool,
+        access_window: ?AccessWindow = null,
+        access: ?MailboxAccess = null,
     };
+
+    pub const ProvisioningAccessChange = struct {
+        mailbox: []const u8,
+        actor: []const u8,
+        operation_id: []const u8,
+        revision: i64,
+        access_window: AccessWindow,
+    };
+
+    fn verifyProvisioningOperationLocked(self: *Database, id: []const u8, mailbox: []const u8, revision: i64) !void {
+        const operation = try self.prepareLocked("SELECT mailbox, revision FROM provisioning_operations WHERE operation_id = ?");
+        defer operation.finalize();
+        try operation.bind(1, id);
+        if (try operation.step() and (!std.mem.eql(u8, operation.columnText(0), mailbox) or operation.columnInt64(1) != revision))
+            return error.OperationConflict;
+    }
+
+    fn rememberProvisioningOperationLocked(self: *Database, id: []const u8, mailbox: []const u8, revision: i64) !void {
+        const operation = try self.prepareLocked("INSERT OR IGNORE INTO provisioning_operations VALUES (?, ?, ?)");
+        defer operation.finalize();
+        try operation.bind(1, id);
+        try operation.bind(2, mailbox);
+        try operation.bind(3, revision);
+        _ = try operation.step();
+    }
 
     fn provisioningStateLocked(self: *Database, mailbox: []const u8, actor: []const u8) !ProvisioningState {
         const stmt = try self.prepareLocked(
-            "SELECT p.revision, u.quota_limit, u.enabled, p.send_recipients_per_day FROM provisioned_mailboxes p JOIN users u ON u.id = p.user_id AND u.username = p.mailbox WHERE p.mailbox = ? AND p.actor = ?",
+            "SELECT p.revision, u.quota_limit, u.enabled, p.send_recipients_per_day, p.service_until, p.read_until FROM provisioned_mailboxes p JOIN users u ON u.id = p.user_id AND u.username = p.mailbox WHERE p.mailbox = ? AND p.actor = ?",
         );
         defer stmt.finalize();
         try stmt.bind(1, mailbox);
         try stmt.bind(2, actor);
         if (!try stmt.step()) return error.MailboxNotFound;
-        return .{ .mailbox = mailbox, .revision = stmt.columnInt64(0), .quota_bytes = stmt.columnInt64(1), .enabled = stmt.columnInt64(2) != 0, .send_recipients_per_day = stmt.columnInt64(3) };
+        const enabled = stmt.columnInt64(2) != 0;
+        const window = scanAccessWindow(stmt, 4);
+        return .{
+            .mailbox = mailbox,
+            .revision = stmt.columnInt64(0),
+            .quota_bytes = stmt.columnInt64(1),
+            .enabled = enabled,
+            .send_recipients_per_day = stmt.columnInt64(3),
+            .access_window = window,
+            .access = if (window != null) mailboxAccessAt(enabled, window, time_compat.timestamp()) else null,
+        };
     }
 
     pub fn provisioningState(self: *Database, mailbox: []const u8, actor: []const u8) !ProvisioningState {
@@ -1234,21 +1309,16 @@ pub const Database = struct {
     /// Commit account creation and its operation record together. Existing
     /// operator-managed accounts are never adopted by provisioning.
     pub fn applyProvisioning(self: *Database, change: ProvisioningChange) !ProvisioningState {
+        if (change.access_window) |window| if (!window.valid()) return error.InvalidAccessWindow;
         self.lockMailboxes();
         defer self.unlockMailboxes();
         self.mutex.lock();
         defer self.mutex.unlock();
         try self.execLocked("BEGIN IMMEDIATE");
         errdefer self.execLocked("ROLLBACK") catch {};
-        {
-            const operation = try self.prepareLocked("SELECT mailbox, revision FROM provisioning_operations WHERE operation_id = ?");
-            defer operation.finalize();
-            try operation.bind(1, change.operation_id);
-            if (try operation.step() and (!std.mem.eql(u8, operation.columnText(0), change.mailbox) or operation.columnInt64(1) != change.revision))
-                return error.OperationConflict;
-        }
+        try self.verifyProvisioningOperationLocked(change.operation_id, change.mailbox, change.revision);
         const record = try self.prepareLocked(
-            "SELECT actor, operation_id, revision, requested_quota, requested_enabled, initial_recovery, user_id, send_recipients_per_day FROM provisioned_mailboxes WHERE mailbox = ?",
+            "SELECT actor, operation_id, revision, requested_quota, requested_enabled, initial_recovery, user_id, send_recipients_per_day, service_until, read_until FROM provisioned_mailboxes WHERE mailbox = ?",
         );
         defer record.finalize();
         try record.bind(1, change.mailbox);
@@ -1262,6 +1332,11 @@ pub const Database = struct {
                     (record.columnInt64(4) != 0) != change.enabled or
                     (change.initial_recovery != null and !std.mem.eql(u8, record.columnText(5), change.initial_recovery.?)))
                     return error.OperationConflict;
+                if (change.access_window) |window| {
+                    const recorded = scanAccessWindow(record, 8) orelse return error.OperationConflict;
+                    if (recorded.service_until != window.service_until or recorded.read_until != window.read_until)
+                        return error.OperationConflict;
+                }
             } else {
                 if (change.revision - 1 != previous) return error.StaleRevision;
                 const update = try self.prepareLocked("UPDATE users SET quota_limit = ?, enabled = ?, updated_at = ? WHERE id = ? AND username = ?");
@@ -1277,14 +1352,18 @@ pub const Database = struct {
                     try self.deleteUserSessionsLocked(change.mailbox);
                     try self.deleteUserResetTokensLocked(change.mailbox);
                 }
-                const next = try self.prepareLocked("UPDATE provisioned_mailboxes SET operation_id = ?, revision = ?, requested_quota = ?, requested_enabled = ?, send_recipients_per_day = ? WHERE mailbox = ?");
+                const next = try self.prepareLocked(
+                    "UPDATE provisioned_mailboxes SET operation_id = ?, revision = ?, requested_quota = ?, requested_enabled = ?, send_recipients_per_day = ?, service_until = COALESCE(?, service_until), read_until = COALESCE(?, read_until) WHERE mailbox = ?",
+                );
                 defer next.finalize();
                 try next.bind(1, change.operation_id);
                 try next.bind(2, change.revision);
                 try next.bind(3, change.quota_bytes);
                 try next.bind(4, @as(i64, @intFromBool(change.enabled)));
                 try next.bind(5, change.send_recipients_per_day);
-                try next.bind(6, change.mailbox);
+                try next.bindOpt(6, if (change.access_window) |window| window.service_until else @as(?i64, null));
+                try next.bindOpt(7, if (change.access_window) |window| window.read_until else @as(?i64, null));
+                try next.bind(8, change.mailbox);
                 _ = try next.step();
             }
         } else {
@@ -1319,7 +1398,7 @@ pub const Database = struct {
                 try onboarding.bind(1, id);
                 _ = try onboarding.step();
             }
-            const insert = try self.prepareLocked("INSERT INTO provisioned_mailboxes (mailbox, user_id, actor, operation_id, revision, requested_quota, requested_enabled, initial_recovery, send_recipients_per_day) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            const insert = try self.prepareLocked("INSERT INTO provisioned_mailboxes (mailbox, user_id, actor, operation_id, revision, requested_quota, requested_enabled, initial_recovery, send_recipients_per_day, service_until, read_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
             defer insert.finalize();
             try insert.bind(1, change.mailbox);
             try insert.bind(2, id);
@@ -1330,16 +1409,54 @@ pub const Database = struct {
             try insert.bind(7, @as(i64, @intFromBool(change.enabled)));
             try insert.bind(8, recovery_address);
             try insert.bind(9, change.send_recipients_per_day);
+            try insert.bindOpt(10, if (change.access_window) |window| window.service_until else @as(?i64, null));
+            try insert.bindOpt(11, if (change.access_window) |window| window.read_until else @as(?i64, null));
             _ = try insert.step();
         }
-        const operation = try self.prepareLocked("INSERT OR IGNORE INTO provisioning_operations VALUES (?, ?, ?)");
-        defer operation.finalize();
-        try operation.bind(1, change.operation_id);
-        try operation.bind(2, change.mailbox);
-        try operation.bind(3, change.revision);
-        _ = try operation.step();
+        try self.rememberProvisioningOperationLocked(change.operation_id, change.mailbox, change.revision);
         const state = try self.provisioningStateLocked(change.mailbox, change.actor);
         try self.execLocked("COMMIT");
+        return state;
+    }
+
+    /// A billing renewal changes deadlines without overwriting an operator's suspension or limits.
+    pub fn applyProvisioningAccess(self: *Database, change: ProvisioningAccessChange) !ProvisioningState {
+        if (!change.access_window.valid()) return error.InvalidAccessWindow;
+        self.lockMailboxes();
+        defer self.unlockMailboxes();
+        var tx = try self.beginTransaction(.write);
+        defer tx.deinit();
+        try self.verifyProvisioningOperationLocked(change.operation_id, change.mailbox, change.revision);
+
+        const previous = try self.provisioningStateLocked(change.mailbox, change.actor);
+        const record = try tx.prepare("SELECT operation_id FROM provisioned_mailboxes WHERE mailbox = ? AND actor = ?");
+        defer record.finalize();
+        try record.bind(1, change.mailbox);
+        try record.bind(2, change.actor);
+        if (!try record.step()) return error.MailboxNotFound;
+        if (std.mem.eql(u8, record.columnText(0), change.operation_id)) {
+            const window = previous.access_window orelse return error.OperationConflict;
+            if (previous.revision != change.revision or window.service_until != change.access_window.service_until or
+                window.read_until != change.access_window.read_until) return error.OperationConflict;
+            try tx.commit();
+            return previous;
+        }
+        if (change.revision <= 1 or change.revision - 1 != previous.revision) return error.StaleRevision;
+
+        const update = try tx.prepare(
+            "UPDATE provisioned_mailboxes SET operation_id = ?, revision = ?, service_until = ?, read_until = ? WHERE mailbox = ? AND actor = ?",
+        );
+        defer update.finalize();
+        try update.bind(1, change.operation_id);
+        try update.bind(2, change.revision);
+        try update.bind(3, change.access_window.service_until);
+        try update.bind(4, change.access_window.read_until);
+        try update.bind(5, change.mailbox);
+        try update.bind(6, change.actor);
+        _ = try update.step();
+        try self.rememberProvisioningOperationLocked(change.operation_id, change.mailbox, change.revision);
+        const state = try self.provisioningStateLocked(change.mailbox, change.actor);
+        try tx.commit();
         return state;
     }
 
@@ -1358,6 +1475,19 @@ pub const Database = struct {
         enabled: bool,
         quota_bytes: u64,
         send_recipients_per_day: i64,
+        access_window: ?AccessWindow,
+
+        pub fn accessAt(self: HostedLimits, now: i64) MailboxAccess {
+            return mailboxAccessAt(self.enabled, self.access_window, now);
+        }
+
+        fn requireSending(self: HostedLimits, now: i64) !void {
+            switch (self.accessAt(now)) {
+                .full => {},
+                .read_only => return error.HostedSenderReadOnly,
+                .expired, .disabled => return error.HostedSenderDisabled,
+            }
+        }
     };
 
     pub fn hostedLimits(self: *Database, mailbox: []const u8) !?HostedLimits {
@@ -1368,7 +1498,7 @@ pub const Database = struct {
 
     fn hostedLimitsLocked(self: *Database, mailbox: []const u8) !?HostedLimits {
         const stmt = try self.prepareLocked(
-            "SELECT u.id, u.enabled, u.quota_limit, p.send_recipients_per_day FROM provisioned_mailboxes p JOIN users u ON u.id = p.user_id AND u.username = p.mailbox WHERE p.mailbox = ?",
+            "SELECT u.id, u.enabled, u.quota_limit, p.send_recipients_per_day, p.service_until, p.read_until FROM provisioned_mailboxes p JOIN users u ON u.id = p.user_id AND u.username = p.mailbox WHERE p.mailbox = ?",
         );
         defer stmt.finalize();
         try stmt.bind(1, mailbox);
@@ -1378,13 +1508,21 @@ pub const Database = struct {
             .enabled = stmt.columnInt64(1) != 0,
             .quota_bytes = @intCast(@max(0, stmt.columnInt64(2))),
             .send_recipients_per_day = stmt.columnInt64(3),
+            .access_window = scanAccessWindow(stmt, 4),
         };
+    }
+
+    pub fn mailboxAccess(self: *Database, mailbox: []const u8) !MailboxAccess {
+        const limits = (try self.hostedLimits(mailbox)) orelse return .full;
+        return limits.accessAt(time_compat.timestamp());
     }
 
     pub const HostedAccountStatus = struct {
         revision: i64,
         enabled: bool,
         requested_enabled: bool,
+        access: MailboxAccess,
+        access_window: ?AccessWindow,
         quota_bytes: u64,
         requested_quota_bytes: u64,
         send_recipients_per_day: u64,
@@ -1402,7 +1540,7 @@ pub const Database = struct {
         defer tx.deinit();
         const account = try tx.prepare(
             \\SELECT p.revision, u.enabled, p.requested_enabled, u.quota_limit, p.requested_quota,
-            \\       p.send_recipients_per_day, usage.utc_day, usage.recipients, u.id
+            \\       p.send_recipients_per_day, usage.utc_day, usage.recipients, u.id, p.service_until, p.read_until
             \\FROM provisioned_mailboxes p
             \\JOIN users u ON u.id = p.user_id AND u.username = p.mailbox
             \\LEFT JOIN hosted_sending_usage usage ON usage.user_id = u.id
@@ -1417,10 +1555,13 @@ pub const Database = struct {
         const allowance: u64 = @intCast(@max(0, account.columnInt64(5)));
         const used: u64 = if (counter_day == day) @intCast(@max(0, account.columnInt64(7))) else 0;
         const counter_in_future = if (counter_day) |counter| counter > day else false;
+        const window = scanAccessWindow(account, 9);
         var status: HostedAccountStatus = .{
             .revision = account.columnInt64(0),
             .enabled = account.columnInt64(1) != 0,
             .requested_enabled = account.columnInt64(2) != 0,
+            .access = mailboxAccessAt(account.columnInt64(1) != 0, window, now),
+            .access_window = window,
             .quota_bytes = @intCast(@max(0, account.columnInt64(3))),
             .requested_quota_bytes = @intCast(@max(0, account.columnInt64(4))),
             .send_recipients_per_day = allowance,
@@ -1456,10 +1597,11 @@ pub const Database = struct {
         defer self.mutex.unlock();
 
         const stmt = try self.prepareLocked(
-            "SELECT 1 FROM provisioned_mailboxes p JOIN users u ON u.id = p.user_id AND u.username = p.mailbox WHERE u.id = ? AND u.enabled = 1",
+            "SELECT 1 FROM provisioned_mailboxes p JOIN users u ON u.id = p.user_id AND u.username = p.mailbox WHERE u.id = ? AND u.enabled = 1 AND (p.service_until IS NULL OR p.service_until > ?)",
         );
         defer stmt.finalize();
         try stmt.bind(1, user_id);
+        try stmt.bind(2, time_compat.timestamp());
         return stmt.step();
     }
 
@@ -1522,7 +1664,7 @@ pub const Database = struct {
         defer self.mutex.unlock();
 
         const limits = (try self.hostedLimitsLocked(mailbox)) orelse return null;
-        if (!limits.enabled) return error.HostedSenderDisabled;
+        try limits.requireSending(now);
         const limit = limits.send_recipients_per_day;
         if (limit == 0) return limits.user_id;
         if (recipients > @as(u64, @intCast(limit))) return error.HostedSendingLimit;
@@ -1549,7 +1691,7 @@ pub const Database = struct {
 
     fn chargeHostedSendLocked(self: *Database, mailbox: []const u8, recipients: usize, now: i64) !void {
         const limits = (try self.hostedLimitsLocked(mailbox)) orelse return;
-        if (!limits.enabled) return error.HostedSenderDisabled;
+        try limits.requireSending(now);
         const limit = limits.send_recipients_per_day;
         if (limit == 0) return; // Older provisioning clients omitted a sending allowance.
         if (recipients > @as(u64, @intCast(limit))) return error.HostedSendingLimit;
@@ -1891,7 +2033,7 @@ pub const Database = struct {
         if (check.columnInt64(2) >= vacation_wire.daily_limit) return "vacation_daily_limit";
         self.chargeHostedSendLocked(user, 1, now) catch |err| switch (err) {
             error.HostedSendingLimit => return "vacation_allowance",
-            error.HostedSenderDisabled => return "vacation_inactive",
+            error.HostedSenderDisabled, error.HostedSenderReadOnly => return "vacation_inactive",
             else => return err,
         };
         const receipt = try self.prepareLocked(
@@ -2229,7 +2371,7 @@ pub const Database = struct {
                     owner = if (try self.hostedLimitsLocked(user)) |limits| limits.user_id else 0;
                     if (target.reply == null) self.chargeHostedSendLocked(user, 1, envelope.accepted_at) catch |err| switch (err) {
                         error.HostedSendingLimit => outcome = "forward_allowance",
-                        error.HostedSenderDisabled => outcome = "forward_disabled",
+                        error.HostedSenderDisabled, error.HostedSenderReadOnly => outcome = "forward_disabled",
                         else => return err,
                     };
                 }
@@ -5489,6 +5631,18 @@ pub const Database = struct {
         return 1;
     }
 };
+
+test "hosted access windows use exclusive UTC deadlines and preserve operator suspension" {
+    const t = std.testing;
+    const window: Database.AccessWindow = .{ .service_until = 60, .read_until = 120 };
+    try t.expectEqual(.full, Database.mailboxAccessAt(true, window, 59));
+    try t.expectEqual(.read_only, Database.mailboxAccessAt(true, window, 60));
+    try t.expectEqual(.read_only, Database.mailboxAccessAt(true, window, 119));
+    try t.expectEqual(.expired, Database.mailboxAccessAt(true, window, 120));
+    try t.expectEqual(.disabled, Database.mailboxAccessAt(false, window, 59));
+    try t.expectEqual(.full, Database.mailboxAccessAt(true, null, 121));
+    try t.expectEqual(.expired, Database.mailboxAccessAt(true, .{ .service_until = 60, .read_until = 60 }, 60));
+}
 
 test "hosted sending allowance rolls over at midnight UTC and survives provisioning revisions" {
     const t = std.testing;

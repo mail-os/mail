@@ -541,6 +541,7 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
         return switch (err) {
             error.RequestTooLarge => sendError(conn, arena, 413, "too_large", "This request exceeds the configured limit"),
             error.Unauthorized => sendError(conn, arena, 401, "unauthorized", "Please sign in"),
+            error.HostedReadOnly => sendError(conn, arena, 403, "mailbox_read_only", "This mailbox is available for reading and export."),
             error.AccountChanged => sendError(conn, arena, 409, "account_changed", "The signed-in account changed. Reload this tab before continuing."),
             error.LinkedAccountUnavailable => sendError(conn, arena, 403, "linked_account_unavailable", "This linked mailbox is no longer available."),
             error.FileTransfersBusy => sendError(conn, arena, 503, "file_transfers_busy", "File transfers are busy. Try again shortly."),
@@ -863,6 +864,7 @@ fn requireSession(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: 
             error.AccountChanged => try sendError(conn, arena, 409, "account_changed", "The signed-in account changed. Reload this tab before continuing."),
             error.LinkedAccountUnavailable => try sendError(conn, arena, 403, "linked_account_unavailable", "This linked mailbox is no longer available."),
             error.Unauthorized => try sendError(conn, arena, 401, "unauthorized", "Invalid or expired session"),
+            error.HostedReadOnly => try sendError(conn, arena, 403, "mailbox_read_only", "This mailbox is available for reading and export."),
             else => return err,
         }
         return null;
@@ -875,6 +877,7 @@ fn resolveRequestSession(server: *WebmailHttpServer, a: std.mem.Allocator, req: 
     errdefer root.deinit(server.allocator);
     const linked = req.queryParam(a, "linked") orelse {
         if (!try expectedAccountMatches(a, req, root.username)) return error.AccountChanged;
+        try checkSessionWrite(server.db, req, root.username);
         return root;
     };
     if (!linkedRequestAllowed(req) or !message_refs.valid(linked)) return error.LinkedAccountUnavailable;
@@ -883,9 +886,17 @@ fn resolveRequestSession(server: *WebmailHttpServer, a: std.mem.Allocator, req: 
     errdefer session.deinit(server.allocator);
     if (!std.mem.eql(u8, session.username, source.account.username)) return error.LinkedAccountUnavailable;
     if (!try expectedAccountMatches(a, req, session.username)) return error.AccountChanged;
+    try checkSessionWrite(server.db, req, session.username);
     session.linked_id = try server.allocator.dupe(u8, linked);
     root.deinit(server.allocator);
     return session;
+}
+
+fn checkSessionWrite(db: *database.Database, req: Request, user: []const u8) !void {
+    if (std.mem.eql(u8, req.method, "GET") or std.mem.eql(u8, req.method, "HEAD")) return;
+    const access = try db.mailboxAccess(user);
+    if (!access.readable()) return error.Unauthorized;
+    if (access == .read_only) return error.HostedReadOnly;
 }
 
 // A linked account permits mail operations. Credential, team, calendar, link,
@@ -1906,7 +1917,10 @@ fn mapServiceError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: any
         error.SharedReplyConflict => sendError(conn, arena, 409, "shared_reply_conflict", "A reply is already queued, sent, or awaiting delivery review for this message."),
         error.SharedReplyQueueRequired => sendError(conn, arena, 400, "shared_reply_queue_required", "A shared reply requires an Outbox send ID."),
         error.HostedStorageFull => sendError(conn, arena, 507, "mailbox_full", "Mailbox storage is full. Free space before retrying."),
+        error.HostedReadOnly => sendError(conn, arena, 403, "mailbox_read_only", "This mailbox is available for reading and export."),
         error.HostedRecipientDisabled => sendError(conn, arena, 409, "recipient_disabled", "A recipient mailbox is disabled."),
+        error.HostedRecipientReadOnly => sendError(conn, arena, 503, "recipient_read_only", "A recipient mailbox is temporarily read-only."),
+        error.HostedRecipientExpired => sendError(conn, arena, 409, "recipient_expired", "A recipient mailbox's service ended."),
         store.StoreError.NotFound => sendError(conn, arena, 404, "not_found", "No such item in this account"),
         else => mapMaildirError(conn, arena, err),
     };
@@ -4711,6 +4725,7 @@ const ProvisioningRequest = struct {
     quota_bytes: i64,
     send_recipients_per_day: i64 = 0,
     enabled: bool,
+    access_window: ?database.Database.AccessWindow = null,
     initial_recovery: ?[]const u8 = null,
     initial_password: ?[]const u8 = null,
 };
@@ -4722,11 +4737,16 @@ fn provisioningError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: a
         error.OperationConflict => sendError(conn, arena, 409, "operation_conflict", "Operation ID already has a different request"),
         error.StaleRevision => sendError(conn, arena, 409, "stale_revision", "Mailbox revision does not match"),
         error.IncompleteCreate => sendError(conn, arena, 400, "invalid_request", "Initial password and recovery address are required"),
+        error.InvalidAccessWindow => sendError(conn, arena, 400, "invalid_request", "Set a positive service deadline and an export deadline at or after it"),
         else => blk: {
             logger.warn("Provisioning operation failed: {}", .{err});
             break :blk sendError(conn, arena, 503, "provisioning_unavailable", "Provisioning is temporarily unavailable");
         },
     };
+}
+
+fn sendProvisioningState(conn: *webmail_tls.Stream, arena: std.mem.Allocator, state: database.Database.ProvisioningState) !void {
+    return sendJson(conn, arena, 200, try std.json.Stringify.valueAlloc(arena, state, .{ .emit_null_optional_fields = false }), null);
 }
 
 fn handleProvisioning(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request, cfg: ProvisioningConfig) !void {
@@ -4751,7 +4771,17 @@ fn handleProvisioning(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
         if (!validProvisioningMailbox(mailbox, cfg.domain) or !validProvisioningId(actor))
             return sendError(conn, arena, 400, "invalid_request", "Invalid mailbox or actor");
         const state = server.db.provisioningState(mailbox, actor) catch |err| return provisioningError(conn, arena, err);
-        return sendJson(conn, arena, 200, try service_mod.json(arena, state), null);
+        return sendProvisioningState(conn, arena, state);
+    }
+    if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/provisioning/v1/mailbox/access")) {
+        const body = std.json.parseFromSlice(database.Database.ProvisioningAccessChange, arena, req.body, .{}) catch
+            return sendError(conn, arena, 400, "invalid_request", "Invalid access window request");
+        const change = body.value;
+        if (!validProvisioningMailbox(change.mailbox, cfg.domain) or !validProvisioningId(change.actor) or
+            !validProvisioningId(change.operation_id) or change.revision < 1)
+            return sendError(conn, arena, 400, "invalid_request", "Invalid mailbox, actor, operation or revision");
+        const state = server.db.applyProvisioningAccess(change) catch |err| return provisioningError(conn, arena, err);
+        return sendProvisioningState(conn, arena, state);
     }
     if (!std.mem.eql(u8, req.method, "POST") or !std.mem.eql(u8, req.path, "/provisioning/v1/mailbox"))
         return sendError(conn, arena, 404, "not_found", "No such provisioning endpoint");
@@ -4759,6 +4789,8 @@ fn handleProvisioning(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
     const body = std.json.parseFromSlice(ProvisioningRequest, arena, req.body, .{}) catch
         return sendError(conn, arena, 400, "invalid_request", "Invalid provisioning request");
     const change = body.value;
+    if (change.access_window) |window| if (!window.valid())
+        return provisioningError(conn, arena, error.InvalidAccessWindow);
     if (!validProvisioningMailbox(change.mailbox, cfg.domain) or !validProvisioningId(change.actor) or
         !validProvisioningId(change.operation_id) or change.revision < 1 or change.quota_bytes < 1 or change.quota_bytes > 1 << 40 or
         change.send_recipients_per_day < 0 or change.send_recipients_per_day > 1_000_000)
@@ -4788,10 +4820,11 @@ fn handleProvisioning(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
         .quota_bytes = change.quota_bytes,
         .send_recipients_per_day = change.send_recipients_per_day,
         .enabled = change.enabled,
+        .access_window = change.access_window,
         .initial_recovery = initial_recovery,
         .initial_password_hash = password_hash,
     }) catch |err| return provisioningError(conn, arena, err);
-    return sendJson(conn, arena, 200, try service_mod.json(arena, state), null);
+    return sendProvisioningState(conn, arena, state);
 }
 
 fn sendJson(conn: *webmail_tls.Stream, arena: std.mem.Allocator, status: u16, json_body: []const u8, set_cookie: ?[]const u8) !void {

@@ -1395,6 +1395,8 @@ pub const ImapSession = struct {
         const detail = switch (err) {
             error.HostedStorageFull => "[OVERQUOTA] Mailbox storage is full",
             error.HostedRecipientDisabled => "[NOPERM] Mailbox is disabled",
+            error.HostedRecipientReadOnly => "[READ-ONLY] Mailbox is available for export",
+            error.HostedRecipientExpired => "[NOPERM] Mailbox service ended",
             error.KeywordLimit => "[LIMIT] Mailbox keyword limit reached",
             else => "[SERVERBUG] Mailbox write failed",
         };
@@ -3945,6 +3947,16 @@ pub const ImapSession = struct {
 
     /// Process a single command
     pub fn processCommand(self: *ImapSession, line: []const u8) !void {
+        const hosted = if (self.username) |user| try self.auth_backend.db.hostedLimits(user) else null;
+        const access = if (hosted) |limits| limits.accessAt(time_compat.timestamp()) else .full;
+        if (hosted != null and hosted.?.access_window != null and !access.readable()) {
+            try self.sendUntagged("BYE Mailbox is unavailable");
+            self.state = .logout;
+            return;
+        }
+        const hosted_read_only = access == .read_only;
+        if (hosted_read_only) self.mailbox_read_only = true;
+
         // Handle DONE (ends IDLE mode) - DONE has no tag
         if (self.idle_mode) {
             const trimmed = std.mem.trim(u8, line, " \t\r\n");
@@ -3983,6 +3995,18 @@ pub const ImapSession = struct {
             try self.sendResponse(tag, "BAD", "Unknown command");
             return;
         };
+        if (hosted_read_only) {
+            switch (command) {
+                .create, .delete, .rename, .subscribe, .unsubscribe, .append, .expunge, .store, .copy, .move => return self.sendResponse(tag, "NO", "[READ-ONLY] Mailbox is available for export"),
+                .uid => {
+                    var args = parts;
+                    const sub = args.next() orelse "";
+                    if (!std.ascii.eqlIgnoreCase(sub, "FETCH") and !std.ascii.eqlIgnoreCase(sub, "SEARCH"))
+                        return self.sendResponse(tag, "NO", "[READ-ONLY] Mailbox is available for export");
+                },
+                else => {},
+            }
+        }
 
         // Log only the command verb, never arguments. LOGIN and AUTHENTICATE
         // arguments can contain clear or base64-encoded credentials; SEARCH
@@ -4042,7 +4066,7 @@ pub const ImapSession = struct {
                 try self.handleLogin(tag, username, password);
             },
             .select => {
-                self.mailbox_read_only = false;
+                self.mailbox_read_only = hosted_read_only;
                 const cmd_end = @intFromPtr(cmd_str.ptr) + cmd_str.len - @intFromPtr(line.ptr);
                 const rest = if (cmd_end < line.len) line[cmd_end..] else "";
                 const mailbox = if (parseImapArg(rest)) |arg| arg.value else "INBOX";

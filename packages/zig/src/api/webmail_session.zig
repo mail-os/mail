@@ -150,7 +150,7 @@ pub const SessionManager = struct {
             return SessionError.SessionNotFound;
         };
         defer user.deinit(self.allocator);
-        if (!user.enabled) {
+        if (!user.enabled or !(try self.db.mailboxAccess(row.username)).readable()) {
             self.logout(session_id);
             return SessionError.SessionNotFound;
         }

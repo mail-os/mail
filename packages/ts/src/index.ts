@@ -368,19 +368,34 @@ export interface MailProvisioningOptions {
   fetch?: typeof fetch
 }
 
+export interface MailboxAccessWindow {
+  service_until: number
+  read_until: number
+}
+
 export interface ProvisionedMailbox {
   mailbox: string
   revision: number
   quota_bytes: number
   send_recipients_per_day?: number
   enabled: boolean
+  access_window?: MailboxAccessWindow
+  access?: 'full' | 'read_only' | 'expired' | 'disabled'
 }
 
-export interface MailProvisioningChange extends ProvisionedMailbox {
+export interface MailProvisioningChange extends Omit<ProvisionedMailbox, 'access'> {
   actor: string
   operation_id: string
   initial_recovery?: string
   initial_password?: string
+}
+
+export interface MailProvisioningAccessChange {
+  mailbox: string
+  actor: string
+  operation_id: string
+  revision: number
+  access_window: MailboxAccessWindow
 }
 
 export class MailProvisioningError extends Error {
@@ -405,7 +420,7 @@ export class MailProvisioningClient {
     this.origin = url.origin
   }
 
-  private async request<T>(path: string, data?: MailProvisioningChange): Promise<T> {
+  private async request<T>(path: string, data?: MailProvisioningChange | MailProvisioningAccessChange): Promise<T> {
     const response = await (this.options.fetch ?? fetch)(`${this.origin}/provisioning/v1/${path}`, {
       method: data ? 'POST' : 'GET',
       headers: {
@@ -443,6 +458,11 @@ export class MailProvisioningClient {
 
   apply(change: MailProvisioningChange): Promise<ProvisionedMailbox> {
     return this.request('mailbox', change)
+  }
+
+  /** Update service and export deadlines while preserving operator settings. */
+  applyAccess(change: MailProvisioningAccessChange): Promise<ProvisionedMailbox> {
+    return this.request('mailbox/access', change)
   }
 }
 

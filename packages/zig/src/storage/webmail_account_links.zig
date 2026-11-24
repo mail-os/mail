@@ -35,6 +35,8 @@ const available =
     \\JOIN webmail_sessions source ON source.session_id=l.source_session
     \\JOIN users u ON u.id=l.source_user_id AND u.username=source.username AND u.enabled=1
     \\WHERE root.expires_at>?1 AND source.expires_at>?1
+    \\AND NOT EXISTS (SELECT 1 FROM provisioned_mailboxes p WHERE p.user_id=owner.id AND p.mailbox=owner.username AND p.read_until<=?1)
+    \\AND NOT EXISTS (SELECT 1 FROM provisioned_mailboxes p WHERE p.user_id=u.id AND p.mailbox=u.username AND p.read_until<=?1)
 ;
 
 fn readAccount(a: std.mem.Allocator, stmt: database.Statement) !Account {
