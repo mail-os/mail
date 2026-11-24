@@ -555,8 +555,12 @@ def check_imap(test):
         imap.send(raw + b"\r\n")
         reply = imap.readline()
         assert reply.startswith(b"QUOTA NO [NOPERM]"), reply
-        assert_imap(imap.copy("1", "Renamed"), "NO", b"[NOPERM]")
-        assert_imap(imap.noop())
+        imap.send(b"SUSPENDED COPY 1 Renamed\r\n")
+        reply = imap.readline()
+        assert reply.startswith(b"* BYE Mailbox is unavailable"), reply
+        assert imap.readline() == b""
+        imap.state = "LOGOUT"
+        imap.shutdown()
         assert test.bytes(mailbox) == 4 * size
 
     # A single byte budget covers IMAP APPEND and EWS SaveOnly concurrently.
