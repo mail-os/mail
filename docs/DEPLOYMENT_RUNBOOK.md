@@ -99,6 +99,24 @@ inventory to find reservations without a confirmed native result and mailbox
 assignments without a matching billing record. Use both reports to plan the
 transfer or retirement of the domain in #131.
 
+### Retire the reviewed hosted mailboxes
+
+Use the native operation ID issued by the Stacks billing lock and the exact
+reviewed `domain inventory` file. Run against a daemon using the matching
+Mail build and configuration. Drain pending delivery and resolve scheduled or
+uncertain sends for those mailboxes before applying.
+
+```bash
+/opt/mail/mail-server domain retire native-operation-id native-inventory.json --yes
+```
+
+Mail verifies the current assignment roster and provisioning revisions, then
+disables mailbox access and records the retirement as one SQLite transaction.
+It preserves stored mail for operator recovery and reserves the retired
+addresses. Keep the inventory file for retrying the same operation. Stacks can
+read the receipt from the private `GET /provisioning/v1/retirement?id=…`
+endpoint before releasing the billing seats and domain claim.
+
 ## Hosted mailbox diagnostics
 
 Run the local report on the mailbox's Mail host. Use the daemon's working directory and database path. The staging stack uses `/var/lib/mail` for both.

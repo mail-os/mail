@@ -81,6 +81,7 @@ const recovery = @import("webmail_recovery.zig");
 const health = @import("webmail_health.zig");
 const password_hasher = @import("../auth/password.zig");
 const mailbox_domains = @import("../core/mailbox_domains.zig");
+const hosted_retirement = @import("../storage/hosted_domain_retirement.zig");
 
 pub const ProvisioningConfig = struct {
     token: []const u8,
@@ -4832,6 +4833,13 @@ fn handleProvisioning(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
         const name = req.queryParam(arena, "name") orelse "";
         if (!cfg.servesDomain(name)) return sendError(conn, arena, 404, "domain_not_found", "Provisioning domain is not configured");
         return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .name = name, .configured = true }), null);
+    }
+    if (get and std.mem.eql(u8, req.path, "/provisioning/v1/retirement")) {
+        const id = req.queryParam(arena, "id") orelse "";
+        if (!validProvisioningId(id)) return sendError(conn, arena, 400, "invalid_request", "Invalid retirement operation ID");
+        const result = (hosted_retirement.receipt(arena, server.db, id) catch |err| return provisioningError(conn, arena, err)) orelse
+            return sendError(conn, arena, 404, "retirement_not_found", "Hosted domain retirement not found");
+        return sendJson(conn, arena, 200, try service_mod.json(arena, result), null);
     }
     if (std.mem.eql(u8, req.path, "/provisioning/v1/team"))
         return handleProvisioningTeam(server, conn, arena, req, cfg);

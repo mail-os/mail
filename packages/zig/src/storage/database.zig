@@ -407,6 +407,22 @@ pub const Database = struct {
             \\    mailbox TEXT NOT NULL,
             \\    revision INTEGER NOT NULL
             \\);
+            \\CREATE TABLE IF NOT EXISTS hosted_domain_retirements (
+            \\    id TEXT PRIMARY KEY, domain TEXT NOT NULL, inventory_sha256 TEXT NOT NULL,
+            \\    operator TEXT NOT NULL, retired_at INTEGER NOT NULL, mailbox_count INTEGER NOT NULL
+            \\);
+            \\CREATE TABLE IF NOT EXISTS hosted_retired_mailboxes (
+            \\    mailbox TEXT PRIMARY KEY COLLATE NOCASE, user_id INTEGER NOT NULL UNIQUE,
+            \\    retirement_id TEXT NOT NULL REFERENCES hosted_domain_retirements(id)
+            \\);
+            \\CREATE TRIGGER IF NOT EXISTS hosted_retired_account_insert BEFORE INSERT ON users
+            \\WHEN EXISTS(SELECT 1 FROM hosted_retired_mailboxes WHERE mailbox=NEW.username OR mailbox=NEW.email)
+            \\BEGIN SELECT RAISE(ABORT,'retired mailbox address'); END;
+            \\CREATE TRIGGER IF NOT EXISTS hosted_retired_account_update BEFORE UPDATE OF enabled,username,email ON users
+            \\WHEN EXISTS(SELECT 1 FROM hosted_retired_mailboxes WHERE
+            \\    (user_id=OLD.id AND NEW.enabled=1) OR
+            \\    (user_id<>OLD.id AND (mailbox=NEW.username OR mailbox=NEW.email)))
+            \\BEGIN SELECT RAISE(ABORT,'retired mailbox address'); END;
             \\CREATE TABLE IF NOT EXISTS eas_search_keys (
             \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
             \\    key BLOB NOT NULL CHECK(length(key)=32)
@@ -1261,6 +1277,7 @@ pub const Database = struct {
         enabled: bool,
         access_window: ?AccessWindow = null,
         access: ?MailboxAccess = null,
+        retired: ?bool = null,
     };
 
     pub const ProvisioningAccessChange = struct {
@@ -1290,7 +1307,9 @@ pub const Database = struct {
 
     fn provisioningStateLocked(self: *Database, mailbox: []const u8, actor: []const u8) !ProvisioningState {
         const stmt = try self.prepareLocked(
-            "SELECT p.revision, u.quota_limit, u.enabled, p.send_recipients_per_day, p.service_until, p.read_until FROM provisioned_mailboxes p JOIN users u ON u.id = p.user_id AND u.username = p.mailbox WHERE p.mailbox = ? AND p.actor = ?",
+            "SELECT p.revision, u.quota_limit, u.enabled, p.send_recipients_per_day, p.service_until, p.read_until, " ++
+                "EXISTS(SELECT 1 FROM hosted_retired_mailboxes WHERE mailbox=p.mailbox OR user_id=u.id) " ++
+                "FROM provisioned_mailboxes p JOIN users u ON u.id = p.user_id AND u.username = p.mailbox WHERE p.mailbox = ? AND p.actor = ?",
         );
         defer stmt.finalize();
         try stmt.bind(1, mailbox);
@@ -1306,6 +1325,7 @@ pub const Database = struct {
             .send_recipients_per_day = stmt.columnInt64(3),
             .access_window = window,
             .access = if (window != null) mailboxAccessAt(enabled, window, time_compat.timestamp()) else null,
+            .retired = if (stmt.columnInt64(6) != 0) true else null,
         };
     }
 
@@ -1325,6 +1345,10 @@ pub const Database = struct {
         defer self.mutex.unlock();
         try self.execLocked("BEGIN IMMEDIATE");
         errdefer self.execLocked("ROLLBACK") catch {};
+        const retired = try self.prepareLocked("SELECT 1 FROM hosted_retired_mailboxes WHERE mailbox = ?");
+        defer retired.finalize();
+        try retired.bind(1, change.mailbox);
+        if (try retired.step()) return error.MailboxUnavailable;
         try self.verifyProvisioningOperationLocked(change.operation_id, change.mailbox, change.revision);
         const record = try self.prepareLocked(
             "SELECT actor, operation_id, revision, requested_quota, requested_enabled, initial_recovery, user_id, send_recipients_per_day, service_until, read_until FROM provisioned_mailboxes WHERE mailbox = ?",
@@ -1443,6 +1467,7 @@ pub const Database = struct {
         try self.verifyProvisioningOperationLocked(change.operation_id, change.mailbox, change.revision);
 
         const previous = try self.provisioningStateLocked(change.mailbox, change.actor);
+        if (previous.retired == true) return error.MailboxUnavailable;
         const record = try tx.prepare("SELECT operation_id FROM provisioned_mailboxes WHERE mailbox = ? AND actor = ?");
         defer record.finalize();
         try record.bind(1, change.mailbox);

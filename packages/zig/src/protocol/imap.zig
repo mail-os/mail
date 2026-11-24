@@ -3949,7 +3949,7 @@ pub const ImapSession = struct {
     pub fn processCommand(self: *ImapSession, line: []const u8) !void {
         const hosted = if (self.username) |user| try self.auth_backend.db.hostedLimits(user) else null;
         const access = if (hosted) |limits| limits.accessAt(time_compat.timestamp()) else .full;
-        if (hosted != null and hosted.?.access_window != null and !access.readable()) {
+        if (!access.readable()) {
             try self.sendUntagged("BYE Mailbox is unavailable");
             self.state = .logout;
             return;

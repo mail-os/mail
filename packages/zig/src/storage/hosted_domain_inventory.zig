@@ -21,9 +21,10 @@ const sections = [_]struct { key: []const u8, query: []const u8 }{
     \\ 'service_until',p.service_until,'read_until',p.read_until,'actor',p.actor,'revision',p.revision,
     \\ 'operation_id',(SELECT operation_id FROM provisioning_operations
     \\                 WHERE mailbox=p.mailbox AND revision=p.revision ORDER BY operation_id LIMIT 1),
-    \\ 'quota_bytes',u.quota_limit)
+    \\ 'quota_bytes',u.quota_limit,'retirement_id',r.retirement_id)
     \\FROM domain_users d JOIN users u ON u.id=d.id
     \\LEFT JOIN provisioned_mailboxes p ON p.user_id=u.id AND p.mailbox=u.username
+    \\LEFT JOIN hosted_retired_mailboxes r ON r.user_id=u.id
     \\ORDER BY u.username
     },
     .{ .key = "hosted_teams", .query =

@@ -5,6 +5,7 @@ const env = @import("../core/env.zig");
 const config = @import("../core/config.zig");
 const mailbox_domains = @import("../core/mailbox_domains.zig");
 const inventory = @import("../storage/hosted_domain_inventory.zig");
+const retirement = @import("../storage/hosted_domain_retirement.zig");
 const io_compat = @import("../core/io_compat.zig");
 const time = @import("../core/time_compat.zig");
 const dm = @import("../domain_migrate.zig");
@@ -60,6 +61,45 @@ fn inventoryAction(ctx: *cli.BaseCommand.ParseContext) !void {
     var buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writerStreaming(io, &buffer);
     try inventory.write(allocator, &db, domain, time.timestamp(), routing, io, &output.interface);
+}
+
+fn retireAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const id = ctx.getArgument(0) orelse return error.MissingArgument;
+    const path = ctx.getArgument(1) orelse return error.MissingArgument;
+    if (id.len < 16 or id.len > 64) return error.InvalidOperationId;
+    for (id) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return error.InvalidOperationId;
+    if (ctx.getOption("yes") == null) return error.ExplicitApprovalRequired;
+
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = io_compat.getIo();
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024));
+    const report = try std.json.parseFromSliceLeaky(struct {
+        version: u8,
+        domain: []const u8,
+        mailboxes: []const retirement.Mailbox,
+    }, allocator, source, .{ .ignore_unknown_fields = true });
+    if (report.version != 1 or !dm.isValidDomain(report.domain)) return error.InvalidInventory;
+    const domain = try std.ascii.allocLowerString(allocator, report.domain);
+    const cfg = try config.loadConfig(allocator, .{});
+    if (!cfg.isLocalDomain(domain) or cfg.catch_all or !mailbox_domains.contains(cfg.exact_mailbox_domains, domain) or
+        !mailbox_domains.contains(env.get("SMTP_PROVISIONING_ADDITIONAL_DOMAINS"), domain) or
+        std.ascii.eqlIgnoreCase(env.get("SMTP_PROVISIONING_DOMAIN") orelse "", domain)) return error.NotAdditionalHostedDomain;
+
+    var bytes: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source, &bytes, .{});
+    const hash = std.fmt.bytesToHex(bytes, .lower);
+    const operator = try std.fmt.allocPrint(allocator, "local-operator:{d}", .{std.c.geteuid()});
+    try std.Io.Dir.cwd().access(io, env.get("SMTP_DB_PATH") orelse "./smtp.db", .{});
+    var db = try openDb(allocator);
+    defer db.deinit();
+    const receipt = try retirement.retire(allocator, &db, id, domain, &hash, operator, time.timestamp(), report.mailboxes);
+    var buffer: [1024]u8 = undefined;
+    var output = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try std.json.Stringify.value(receipt, .{ .whitespace = .indent_2 }, &output.interface);
+    try output.interface.writeByte('\n');
+    try output.interface.flush();
 }
 
 fn migrateAction(ctx: *cli.BaseCommand.ParseContext) !void {
@@ -166,6 +206,13 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try inventory_cmd.addArgument(cli.Argument.init("domain", "Domain to inspect", .string));
     _ = inventory_cmd.setAction(inventoryAction);
     _ = try cmd.addCommand(inventory_cmd);
+
+    const retire_cmd = try cli.BaseCommand.init(allocator, "retire", "Disable reviewed hosted mailboxes and reserve their retained addresses");
+    _ = try retire_cmd.addArgument(cli.Argument.init("operation-id", "Retirement operation ID for safe retries", .string));
+    _ = try retire_cmd.addArgument(cli.Argument.init("inventory", "Reviewed JSON from mail domain inventory", .string));
+    _ = try retire_cmd.addOption(cli.Option.init("yes", "yes", "Apply the reviewed retirement", .bool));
+    _ = retire_cmd.setAction(retireAction);
+    _ = try cmd.addCommand(retire_cmd);
 
     const migrate_cmd = try cli.BaseCommand.init(
         allocator,

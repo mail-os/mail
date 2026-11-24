@@ -381,9 +381,10 @@ export interface ProvisionedMailbox {
   enabled: boolean
   access_window?: MailboxAccessWindow
   access?: 'full' | 'read_only' | 'expired' | 'disabled'
+  retired?: true
 }
 
-export interface MailProvisioningChange extends Omit<ProvisionedMailbox, 'access'> {
+export interface MailProvisioningChange extends Omit<ProvisionedMailbox, 'access' | 'retired'> {
   actor: string
   operation_id: string
   initial_recovery?: string
@@ -409,6 +410,16 @@ export interface MailProvisioningTeamResult {
   team: { id: string, name: string, domain: string } | null
   created: boolean
   can_invite: boolean
+}
+
+export interface MailDomainRetirementReceipt {
+  version: 1
+  id: string
+  domain: string
+  inventory_sha256: string
+  operator: string
+  retired_at: number
+  mailbox_count: number
 }
 
 export class MailProvisioningError extends Error {
@@ -463,6 +474,10 @@ export class MailProvisioningClient {
 
   domain(name: string): Promise<{ name: string, configured: boolean }> {
     return this.request(`domain?${new URLSearchParams({ name })}`)
+  }
+
+  retirement(id: string): Promise<MailDomainRetirementReceipt> {
+    return this.request(`retirement?${new URLSearchParams({ id })}`)
   }
 
   mailbox(mailbox: string, actor: string): Promise<ProvisionedMailbox> {
