@@ -603,7 +603,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-sources .wm-action { gap: .45rem; }
 .calendar-sources .wm-action:not(.calendar-shared-choice) > span:last-child { overflow: hidden; text-overflow: ellipsis; }
 .calendar-dot { flex: none; width: .55rem; height: .55rem; border-radius: 50%; }
-.calendar-view-toolbar { --calendar-control-gap: 8px; justify-content: flex-start; gap: 10px 16px; padding: 8px; background: var(--toolbar); border: 1px solid var(--border); border-radius: var(--control-radius); }
+.calendar-view-toolbar { --calendar-control-gap: 8px; justify-content: flex-start; gap: var(--calendar-control-gap) 16px; padding: 8px; background: var(--toolbar); border: 1px solid var(--border); border-radius: var(--control-radius); }
 .calendar-period, .calendar-period-buttons, .calendar-view-toolbar .calendar-view-modes, .calendar-zone { gap: var(--calendar-control-gap); }
 .calendar-view-picker { display: none; }
 .calendar-period-buttons { display: flex; align-items: center; }
@@ -1294,13 +1294,20 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-sharing { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
 .calendar-sharing h2 { margin: 0 0 10px; font-size: 16px; }
 .calendar-shared-choice { justify-content: flex-start; text-align: left; white-space: normal; }
-.calendar-shared-choice > span:last-child, .calendar-share-list li > div { display: grid; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
+.calendar-shared-choice > span:last-child, .calendar-share-details { display: grid; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
 .calendar-shared-choice small, .calendar-share-list small { color: var(--muted); font-size: 11px; }
 .calendar-share-list { display: grid; gap: 6px; margin-block: 10px 0; padding: 0; list-style: none; }
 .calendar-share-list li { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 9px 11px; border-radius: 8px; background: var(--surface); }
-.calendar-share-list li > div { flex: 1 1 180px; }
+.calendar-share-details { flex: 1 1 180px; }
 .calendar-share-list li > .mail-icon { color: var(--accent); }
-.calendar-share-list label { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.calendar-share-actions { display: grid; grid-template-columns: minmax(0, 1fr) max-content; align-items: end; gap: 8px; min-width: 0; }
+.calendar-share-actions label { display: flex; align-items: center; gap: var(--control-label-gap); color: var(--muted); font-size: 13px; font-weight: 550; line-height: 1.25; }
+.calendar-share-actions select { inline-size: 9rem; }
+@media (max-width: 540px) {
+  .calendar-share-actions { flex: 1 1 100%; }
+  .calendar-share-actions label { display: grid; min-width: 0; }
+  .calendar-share-actions select { inline-size: 100%; }
+}
 
 .calendar-share-notice { margin-block: 0 10px; padding: 9px 12px; border-radius: 8px; background: var(--accent-soft); color: var(--accent); }
 
@@ -1471,7 +1478,6 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-zone select { inline-size: 10.5rem; max-inline-size: 100%; }
 @media (490px < width <= 1080px) {
   .calendar-view-toolbar .calendar-view-modes { flex-basis: 100%; }
-  .calendar-view-toolbar { row-gap: var(--calendar-control-gap); }
 }
 @media (490px < width <= 740px) {
   .calendar-zone { flex-basis: 100%; justify-content: space-between; }

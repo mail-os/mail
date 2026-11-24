@@ -237,6 +237,12 @@ async function verifyCalendarPeriod(page, label, height) {
   }))
   assert.deepEqual(crampedViews, [], 'View labels have clear space inside each border')
   const zone = controls[4]
+  if (width <= 490) {
+    assert(Math.abs(row[0].top - views[0].bottom - 8) < 0.5, 'Phone navigation starts eight pixels below the view controls')
+  }
+  if (zone.top > date.bottom) {
+    assert(Math.abs(zone.top - date.bottom - 8) < 0.5, 'The wrapped time zone leaves the same eight-pixel gap')
+  }
   if (width >= 1160) {
     for (const control of [...views, controls[4]]) {
       assert(Math.abs(control.top - date.top) < 0.5 && Math.abs(control.bottom - date.bottom) < 0.5,
@@ -2234,7 +2240,32 @@ async function calendarSharingJourney(captain) {
   finally { resumeShare.resolve() }
   const role = captain.getByRole('combobox', { name: `Access for ${sender} to ${calendarLabel}` })
   await role.waitFor()
-  await verifyControlRow(sharing.getByRole('listitem').filter({ has: role }), 'select, button', 36)
+  const grant = sharing.getByRole('listitem').filter({ has: role })
+  const grantActions = grant.locator('.calendar-share-actions')
+  for (const [width, scheme] of [[1440, 'light'], [701, 'dark'], [540, 'light'], [320, 'dark']]) {
+    await captain.setViewportSize({ width, height: 940 })
+    await captain.emulateMedia({ colorScheme: scheme })
+    await fitsViewport(captain)
+    const height = width <= 860 ? 44 : 36
+    const grantControls = await verifyControlRow(grantActions, 'select, button', height)
+    verifyControlGaps(grantControls, 8)
+    await verifySelect(role, height)
+    await verifySelectedOptionFits(role, 6)
+    const details = await grant.locator('.calendar-share-details').boundingBox()
+    if (width <= 540) {
+      const actions = await grantActions.boundingBox()
+      assert(Math.abs(actions.x - details.x) < 0.5 && Math.abs(actions.width - details.width) < 0.5,
+        'The narrow grant controls and identity share both column edges')
+      assert(Math.abs(actions.y - details.y - details.height - 8) < 0.5,
+        'The grant controls sit eight pixels below the recipient')
+      assert(Math.abs(grantControls[0].left - actions.x) < 0.5 && Math.abs(grantControls[1].right - actions.x - actions.width) < 0.5,
+        'The access picker and revoke button fill the action row')
+    }
+    await verifyPaintedControlBorders(grantActions, 'select, button', grantControls, `calendar-grant-${width}-${scheme}`)
+    await grant.screenshot({ path: join(output, `calendar-grant-row-${width}-${scheme}.png`), animations: 'disabled' })
+  }
+  await captain.setViewportSize({ width: 1440, height: 940 })
+  await captain.emulateMedia({ colorScheme: 'light' })
 
   const context = await browser.newContext({
     viewport: { width: 390, height: 844 }, colorScheme: 'dark', hasTouch: true,
@@ -2281,6 +2312,7 @@ async function calendarSharingJourney(captain) {
     const response = captain.waitForResponse(result => result.url().endsWith('/teams/studio/calendar-shares') && result.request().method() === 'PUT')
     await role.selectOption(access)
     assert.equal((await response).status(), 200)
+    await role.locator(`option[value="${access}"]:checked`).waitFor({ state: 'attached' })
     await checkAccess()
   }
 
@@ -2333,6 +2365,13 @@ async function calendarSharingJourney(captain) {
   await updated.click()
   await editor.getByRole('textbox', { name: 'Title' }).waitFor()
   await changeRole('free_busy')
+  await captain.setViewportSize({ width: 320, height: 940 })
+  await captain.emulateMedia({ colorScheme: 'dark' })
+  assert.equal(await role.inputValue(), 'free_busy')
+  await verifySelectedOptionFits(role, 6)
+  await grant.screenshot({ path: join(output, 'calendar-grant-row-320-free-busy-dark.png'), animations: 'disabled' })
+  await captain.setViewportSize({ width: 1440, height: 940 })
+  await captain.emulateMedia({ colorScheme: 'light' })
   await editor.waitFor({ state: 'hidden' })
   const busy = teammate.getByRole('list', { name: 'Busy periods' })
   await busy.waitFor()

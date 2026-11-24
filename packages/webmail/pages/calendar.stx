@@ -334,11 +334,13 @@ onUnmounted(() => { destroy(); destroyReminders() })
       </form>
       <ul :if="outgoingShares.length" class="calendar-share-list" aria-label="Calendar access you granted">
         <li :for="share in outgoingShares" :key="share.team + ':' + share.calendarId + ':' + share.grantee">
-          <div><strong :text="share.calendarName"></strong><small :text="share.grantee + ' · ' + teamName(share.team)"></small></div>
-          <label>Access<select :value="share.access" :disabled="calendarSettingsBusy" :aria-label="'Access for ' + share.grantee + ' to ' + share.calendarName" @change="selectGrantAccess(share, $event)">
-            <option value="viewer">View events</option><option value="editor">Edit events</option><option value="free_busy">Free/busy only</option>
-          </select></label>
-          <button type="button" class="wm-action wm-action--danger" :disabled="calendarSettingsBusy" :aria-label="'Revoke access for ' + share.grantee + ' to ' + share.calendarName" @click="revokeCalendarGrant(share)">Revoke access</button>
+          <div class="calendar-share-details"><strong :text="share.calendarName"></strong><small :text="share.grantee + ' · ' + teamName(share.team)"></small></div>
+          <div class="calendar-share-actions">
+            <label>Access<select :value="share.access" :disabled="calendarSettingsBusy" :aria-label="'Access for ' + share.grantee + ' to ' + share.calendarName" @change="selectGrantAccess(share, $event)">
+              <option value="viewer">View events</option><option value="editor">Edit events</option><option value="free_busy">Free/busy only</option>
+            </select></label>
+            <button type="button" class="wm-action wm-action--danger" :disabled="calendarSettingsBusy" :aria-label="'Revoke access for ' + share.grantee + ' to ' + share.calendarName" @click="revokeCalendarGrant(share)">Revoke</button>
+          </div>
         </li>
       </ul>
     </section>
