@@ -59,8 +59,8 @@ def verify_hosted_teams(test, db):
     expect(request(service, "Service"), 409, "team_domain_unavailable")
     expect(request(paused, "Retired"), 404, "mailbox_not_found")
     expect(request(address, "界" * 34), 400, "invalid_request")
-    assert expect(request(address)) == {"team": None, "created": False}
-    assert expect(request(other_domain)) == {"team": None, "created": False}
+    assert expect(request(address)) == {"team": None, "created": False, "can_invite": False}
+    assert expect(request(other_domain)) == {"team": None, "created": False, "can_invite": False}
 
     db.execute("""CREATE TRIGGER reject_hosted_team_audit BEFORE INSERT ON audit_log
                   WHEN NEW.action='team.create' BEGIN SELECT RAISE(ABORT,'fixture failure'); END""")
@@ -94,6 +94,36 @@ def verify_hosted_teams(test, db):
     invitation, = incoming(test, colleague)
     expect(decide(test, colleague, invitation["id"], "accept"))
     assert expect(test.api(colleague, "teams")) == [{"id": authority["id"], "name": authority["name"], "role": "member"}]
+
+    mailbox = f"invite-bootstrap@{hosted}"
+    instant = int(time.time())
+    joint = {
+        "mailbox": mailbox, "actor": secrets.token_hex(16), "operation_id": secrets.token_hex(16),
+        "revision": 1, "quota_bytes": 1024 * 1024, "enabled": True,
+        "initial_password": test.password, "initial_recovery": "invite-bootstrap@recovery.example.test",
+        "access_window": {"service_until": instant + 3600, "read_until": instant + 7200},
+        "team_invitation": {"team": authority["id"], "owner": address, "owner_actor": test.specs[address]["actor"]},
+    }
+
+    def provision_invitee(change, status, code=None):
+        response = test.http(test.private + "/provisioning/v1/mailbox", change, test.auth)
+        return expect((response[0], json.loads(response[2])), status, code)
+
+    wrong = dict(joint, team_invitation=dict(joint["team_invitation"], owner_actor=test.specs[other_domain]["actor"]))
+    provision_invitee(wrong, 409, "team_invitation_unavailable")
+    db.execute("""CREATE TRIGGER reject_invited_membership BEFORE INSERT ON audit_log
+                  WHEN NEW.action='team.membership' BEGIN SELECT RAISE(ABORT,'fixture failure'); END""")
+    provision_invitee(joint, 503, "provisioning_unavailable")
+    assert db.execute("SELECT count(*) FROM users WHERE username=?", (mailbox,)).fetchone()[0] == 0
+    assert db.execute("SELECT count(*) FROM provisioned_mailboxes WHERE mailbox=?", (mailbox,)).fetchone()[0] == 0
+    db.execute("DROP TRIGGER reject_invited_membership")
+    assert provision_invitee(joint, 200)["mailbox"] == mailbox
+    invited = test.login(mailbox)
+    assert expect(test.api(invited, "teams")) == [{"id": authority["id"], "name": authority["name"], "role": "member"}]
+    assert expect(test.api(invited, "shared-inboxes")) == []
+    command(test, "team", "member", authority["id"], mailbox, "remove")
+    assert provision_invitee(joint, 200)["mailbox"] == mailbox
+    assert expect(test.api(test.login(mailbox), "teams")) == []
     return address, authority
 
 
@@ -240,7 +270,7 @@ def main():
             assert status == 200 and json.loads(raw)["team"] == dict(team, domain=renamed), (status, raw)
             owner_team, = expect(test.api(test.login(mailbox), "teams"))
             assert owner_team == {"id": team["id"], "name": team["name"], "role": "owner"}
-    print("Verified paid-domain team setup, domain rename, invitation consent, expiry, concurrent acceptance, and explicit inbox grants over native HTTPS.")
+    print("Verified hosted team setup, atomic invited mailbox provisioning, domain rename, invitation consent, and explicit inbox grants over native HTTPS.")
 
 
 if __name__ == "__main__":

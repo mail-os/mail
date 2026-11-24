@@ -362,7 +362,8 @@ fn insertTeam(tx: Tx, a: Allocator, actor: Actor, team: []const u8, name: []cons
 }
 
 pub const HostedTeam = struct { id: []const u8, name: []const u8, domain: []const u8 };
-pub const HostedTeamResult = struct { team: ?HostedTeam, created: bool = false };
+pub const HostedTeamResult = struct { team: ?HostedTeam, created: bool = false, can_invite: bool = false };
+pub const HostedMailboxInvitation = struct { team: []const u8, owner: []const u8, owner_actor: []const u8 };
 
 /// Authorize against the provisioning assignment and current service window
 /// inside the same transaction that reads or creates the domain's team.
@@ -391,8 +392,9 @@ pub fn hostedTeam(db: *database.Database, a: Allocator, mailbox: []const u8, act
         break :blk .{ .id = try a.dupe(u8, stmt.columnText(0)), .name = try a.dupe(u8, stmt.columnText(1)), .domain = domain };
     };
     if (existing != null or name == null) {
+        const can_invite = if (existing) |team| try memberRole(tx, team.id, owner_id) == .owner else false;
         try tx.commit();
-        return .{ .team = existing };
+        return .{ .team = existing, .can_invite = can_invite };
     }
 
     var nonce: [16]u8 = undefined;
@@ -401,7 +403,25 @@ pub fn hostedTeam(db: *database.Database, a: Allocator, mailbox: []const u8, act
     try insertTeam(tx, a, .{ .operator = "hosted-provisioning" }, id, name.?, mailbox, owner_id);
     try execute(tx, "INSERT INTO mail_hosted_teams(domain,team_id) VALUES(?1,?2)", .{ domain, id });
     try tx.commit();
-    return .{ .team = .{ .id = id, .name = name.?, .domain = domain }, .created = true };
+    return .{ .team = .{ .id = id, .name = name.?, .domain = domain }, .created = true, .can_invite = true };
+}
+
+/// Called inside the initial mailbox provisioning transaction so an obsolete
+/// invitation cannot leave a mailbox or a partial membership behind.
+pub fn enrollProvisionedMailbox(tx: Tx, a: Allocator, invitation: HostedMailboxInvitation, mailbox: []const u8, member_id: i64) !void {
+    const domain = mailbox_domains.addressDomain(mailbox) orelse return error.TeamInvitationNotFound;
+    if (!sameMailboxDomain(mailbox, invitation.owner)) return error.TeamInvitationNotFound;
+    const owner = try tx.prepare(
+        \\SELECT 1 FROM mail_hosted_teams h JOIN mail_team_members m ON m.team_id=h.team_id AND m.role='owner'
+        \\JOIN users u ON u.id=m.user_id AND u.enabled=1
+        \\JOIN provisioned_mailboxes p ON p.user_id=u.id AND p.mailbox=u.username AND p.service_until>unixepoch()
+        \\WHERE h.domain=?1 AND h.team_id=?2 AND p.mailbox=?3 AND p.actor=?4
+    );
+    defer owner.finalize();
+    try bind(owner, .{ domain, invitation.team, invitation.owner, invitation.owner_actor });
+    if (!try owner.step()) return error.TeamInvitationNotFound;
+    try execute(tx, "INSERT INTO mail_team_members(team_id,user_id,role) VALUES(?1,?2,'member')", .{ invitation.team, member_id });
+    try audit(tx, a, .{ .mailbox = mailbox }, invitation.team, "team.membership", .{ .mailbox = mailbox, .previous = @as(?Role, null), .role = Role.member, .invited_by = invitation.owner });
 }
 
 fn requireOtherOwner(tx: Tx, team: []const u8, user_id: i64) !void {

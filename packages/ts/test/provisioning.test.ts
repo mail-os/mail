@@ -17,7 +17,7 @@ test('provisioning uses the dedicated versioned API and never follows a redirect
       if (new URL(request.url).pathname.endsWith('/mailbox/access'))
         return Response.json({ revision: 2, mailbox: 'reader@mailboxes.example.test', enabled: true, access: 'read_only' })
       if (new URL(request.url).pathname.endsWith('/team'))
-        return Response.json({ created: request.method === 'POST', team: { id: 'hosted-studio', name: 'Studio', domain: 'studio.example.test' } })
+        return Response.json({ created: request.method === 'POST', can_invite: true, team: { id: 'hosted-studio', name: 'Studio', domain: 'studio.example.test' } })
       return Response.json({ revision: 1, mailbox: 'reader@mailboxes.example.test', enabled: true })
     }, { preconnect: fetch.preconnect }),
   })
@@ -44,7 +44,7 @@ test('provisioning uses the dedicated versioned API and never follows a redirect
   }
   expect((await client.applyAccess(renewal)).access).toBe('read_only')
   const team = { mailbox: 'owner@studio.example.test', actor: change.actor, name: 'Studio' }
-  expect((await client.team(team.mailbox, team.actor)).team?.id).toBe('hosted-studio')
+  expect(await client.team(team.mailbox, team.actor)).toMatchObject({ can_invite: true, team: { id: 'hosted-studio' } })
   expect((await client.createTeam(team)).created).toBe(true)
   expect(requests.map(request => new URL(request.url).pathname)).toEqual([
     '/provisioning/v1/status',

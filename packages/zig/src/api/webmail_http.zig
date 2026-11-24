@@ -4793,6 +4793,7 @@ const ProvisioningRequest = struct {
     access_window: ?database.Database.AccessWindow = null,
     initial_recovery: ?[]const u8 = null,
     initial_password: ?[]const u8 = null,
+    team_invitation: ?teams.HostedMailboxInvitation = null,
 };
 
 fn provisioningError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: anyerror) !void {
@@ -4804,6 +4805,7 @@ fn provisioningError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: a
         error.IncompleteCreate => sendError(conn, arena, 400, "invalid_request", "Initial password and recovery address are required"),
         error.InvalidAccessWindow => sendError(conn, arena, 400, "invalid_request", "Set a positive service deadline and an export deadline at or after it"),
         error.InvalidTeamData => sendError(conn, arena, 400, "invalid_request", "Enter a team name of 1 to 100 bytes"),
+        error.TeamInvitationNotFound => sendError(conn, arena, 409, "team_invitation_unavailable", "The team invitation is no longer available."),
         else => blk: {
             logger.warn("Provisioning operation failed: {}", .{err});
             break :blk sendError(conn, arena, 503, "provisioning_unavailable", "Provisioning is temporarily unavailable");
@@ -4863,6 +4865,12 @@ fn handleProvisioning(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
         !validProvisioningId(change.operation_id) or change.revision < 1 or change.quota_bytes < 1 or change.quota_bytes > 1 << 40 or
         change.send_recipients_per_day < 0 or change.send_recipients_per_day > 1_000_000)
         return sendError(conn, arena, 400, "invalid_request", "Invalid mailbox, actor, operation, revision, storage quota, or sending allowance");
+    if (change.team_invitation) |invitation| {
+        const domain = mailbox_domains.addressDomain(change.mailbox).?;
+        if (change.revision != 1 or std.mem.eql(u8, domain, cfg.domain) or !teams.validTeamId(invitation.team) or
+            !validProvisioningMailbox(invitation.owner, cfg) or !validProvisioningId(invitation.owner_actor))
+            return sendError(conn, arena, 400, "invalid_request", "Invalid team invitation");
+    }
     var password_hash: ?[]const u8 = null;
     var initial_recovery: ?[]const u8 = null;
     if (change.revision == 1) {
@@ -4891,6 +4899,7 @@ fn handleProvisioning(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
         .access_window = change.access_window,
         .initial_recovery = initial_recovery,
         .initial_password_hash = password_hash,
+        .team_invitation = change.team_invitation,
     }) catch |err| return provisioningError(conn, arena, err);
     return sendProvisioningState(conn, arena, state);
 }

@@ -388,6 +388,7 @@ export interface MailProvisioningChange extends Omit<ProvisionedMailbox, 'access
   operation_id: string
   initial_recovery?: string
   initial_password?: string
+  team_invitation?: { team: string, owner: string, owner_actor: string }
 }
 
 export interface MailProvisioningAccessChange {
@@ -407,6 +408,7 @@ export interface MailProvisioningTeamChange {
 export interface MailProvisioningTeamResult {
   team: { id: string, name: string, domain: string } | null
   created: boolean
+  can_invite: boolean
 }
 
 export class MailProvisioningError extends Error {

@@ -778,6 +778,15 @@ or **Decline**. Invitations expire after seven days. The sender can revoke a
 pending invitation in the panel. A pending invitation also stops being
 usable when the sender loses ownership or paid service.
 
+To invite someone who needs a mailbox, open **Team setup → Mailbox
+invitations** in hosted domain setup. Choose a team owner mailbox, the new
+mailbox name, and the teammate’s existing email address. Share the mailbox
+invitations page with the teammate. They sign in with that verified email
+address and set their own mailbox password. Acceptance uses an available
+paid seat and creates the mailbox and team membership together. Open
+invitations expire after seven days. The domain owner can revoke one before
+mailbox setup starts.
+
 Accepting adds the recipient as a member. Share inboxes, senders, or
 calendars using the team's explicit grants. Invite, acceptance, decline,
 and revocation events appear in the team audit log. The service domain

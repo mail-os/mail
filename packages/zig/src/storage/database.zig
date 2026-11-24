@@ -1242,6 +1242,7 @@ pub const Database = struct {
         access_window: ?AccessWindow = null,
         initial_recovery: ?[]const u8 = null,
         initial_password_hash: ?[]const u8 = null,
+        team_invitation: ?team_store.HostedMailboxInvitation = null,
     };
 
     pub const ProvisioningState = struct {
@@ -1412,6 +1413,11 @@ pub const Database = struct {
             try insert.bindOpt(10, if (change.access_window) |window| window.service_until else @as(?i64, null));
             try insert.bindOpt(11, if (change.access_window) |window| window.read_until else @as(?i64, null));
             _ = try insert.step();
+            if (change.team_invitation) |invitation| {
+                const window = change.access_window orelse return error.TeamInvitationNotFound;
+                if (!change.enabled or window.service_until <= now) return error.TeamInvitationNotFound;
+                try team_store.enrollProvisionedMailbox(.{ .db = self }, self.allocator, invitation, change.mailbox, id);
+            }
         }
         try self.rememberProvisioningOperationLocked(change.operation_id, change.mailbox, change.revision);
         const state = try self.provisioningStateLocked(change.mailbox, change.actor);
