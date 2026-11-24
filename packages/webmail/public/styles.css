@@ -146,7 +146,7 @@ body {
 
 /* Mailbox shell and reusable controls. */
 :where(button, input, textarea, select) { font: inherit; }
-:where(input:not([type=checkbox], [type=radio], [type=hidden], [hidden], .wm-file-input), select, textarea, .wm-action, .mail-search-field, .calendar-jump) {
+:where(input:not([type=checkbox], [type=radio], [type=hidden], [hidden], .wm-file-input), select, textarea, .wm-action, .mail-search-field, .calendar-picker-field) {
   min-inline-size: 0;
   max-inline-size: 100%;
   min-block-size: var(--control-height);
@@ -160,7 +160,7 @@ body {
 }
 :where(input, select, textarea) { font-weight: 400; }
 input::placeholder, textarea::placeholder { color: var(--muted); opacity: 1; }
-:where(input:not([type=checkbox], [type=radio], [type=hidden], [hidden], .wm-file-input), select, .mail-search-field, .calendar-jump) {
+:where(input:not([type=checkbox], [type=radio], [type=hidden], [hidden], .wm-file-input), select, .mail-search-field, .calendar-picker-field) {
   block-size: var(--control-height);
   padding-block: 0;
 }
@@ -217,7 +217,8 @@ select:dir(rtl) { background-position: left var(--control-inline-padding) center
 }
 button { cursor: pointer; }
 button:disabled { opacity: .5; cursor: default; }
-:is(button, input, textarea, select, a):focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+:is(button, input, textarea, select, a):focus-visible,
+input:is([type=date], [type=time], [type=datetime-local]):focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
 .wm { display: grid; grid-template-columns: 210px minmax(0, 1fr); height: 100dvh; }
 .wm-folders { display: flex; flex-direction: column; gap: 16px; padding: 20px 12px; background: var(--sidebar); border-right: 1px solid var(--border); min-height: 0; }
 .wm-brand { padding: 0 12px; font-size: 20px; font-weight: 750; letter-spacing: -.5px; }
@@ -613,14 +614,16 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-period .wm-action { block-size: var(--control-height); justify-content: center; }
 .calendar-period .calendar-arrow { inline-size: var(--control-height); padding-inline: 0; }
 .calendar-period .calendar-arrow .mail-icon { inline-size: var(--picker-icon-size); block-size: var(--picker-icon-size); }
-.calendar-jump {
+.calendar-jump { inline-size: 9.5rem; }
+.calendar-picker-field {
+  --picker-background: var(--panel);
   position: relative;
-  inline-size: 9.5rem;
   padding-inline: 0;
+  background-color: var(--picker-background);
 }
-.calendar-jump:hover { background-color: var(--surface); }
-.calendar-jump:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
-.calendar-jump input {
+.calendar-picker-field:hover, .calendar-picker-field:has(input:disabled) { --picker-background: var(--surface); }
+.calendar-picker-field:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+.calendar-picker-field input {
   display: block;
   inline-size: 100%;
   block-size: 100%;
@@ -629,12 +632,13 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   border-radius: inherit;
   background: transparent;
 }
-.calendar-jump input:focus { outline: 0; }
+.calendar-picker-field input:focus-within { outline: 0; }
+.calendar-picker-field input:disabled { background-color: transparent; }
 @supports selector(input::-webkit-calendar-picker-indicator) {
-  .calendar-jump input { padding-inline-end: var(--picker-end-padding); }
+  .calendar-picker-field input { padding-inline-end: var(--picker-end-padding); }
 }
-.calendar-jump input::-webkit-calendar-picker-indicator { display: none; }
-.calendar-jump-picker {
+.calendar-picker-field input::-webkit-calendar-picker-indicator { display: none; }
+.calendar-picker-trigger {
   position: absolute;
   inset-block: 0;
   inset-inline-end: 0;
@@ -651,16 +655,25 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   color: var(--muted);
 }
 @supports not selector(input::-webkit-calendar-picker-indicator) {
-  /* Cover the native affordance in engines without a picker pseudo-element. */
-  .calendar-jump-picker { background-color: inherit; }
+  /* Mask the native icon without covering text beneath the wider hit area. */
+  .calendar-picker-trigger::before {
+    content: '';
+    position: absolute;
+    inset-block: 0;
+    inset-inline-end: 0;
+    inline-size: calc(var(--control-inline-padding) + var(--picker-icon-size) + 2px);
+    border-radius: inherit;
+    background: var(--picker-background);
+  }
 }
-.calendar-jump-picker:hover, .calendar-jump-picker:focus-visible { color: var(--accent); }
-.calendar-jump-picker:focus-visible { outline: 0; }
-.calendar-jump-picker .mail-icon { inline-size: var(--picker-icon-size); block-size: var(--picker-icon-size); }
+.calendar-picker-trigger:hover:not(:disabled), .calendar-picker-trigger:focus-visible { color: var(--accent); }
+.calendar-picker-trigger:focus-visible { outline: 0; }
+.calendar-picker-trigger:disabled { opacity: 1; color: var(--control-disabled-text); }
+.calendar-picker-trigger .mail-icon { position: relative; inline-size: var(--picker-icon-size); block-size: var(--picker-icon-size); }
 @media (forced-colors: active) {
-  .calendar-jump input { padding-inline-end: var(--control-inline-padding); }
-  .calendar-jump input::-webkit-calendar-picker-indicator { display: revert; }
-  .calendar-jump-picker { display: none; }
+  .calendar-picker-field input { padding-inline-end: var(--control-inline-padding); }
+  .calendar-picker-field input::-webkit-calendar-picker-indicator { display: revert; }
+  .calendar-picker-trigger { display: none; }
 }
 .calendar-search { flex-wrap: nowrap; }
 .calendar-search input { width: min(14rem, 100%); }
@@ -750,6 +763,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-free-time-heading h2 { margin: 0; font-size: 16px; }
 .calendar-free-time-heading p { margin: 0; color: var(--muted); font-size: 12px; }
 .calendar-free-time-form { display: grid; grid-template-columns: 9.5rem repeat(3, 8rem) minmax(9rem, max-content); align-items: end; gap: 8px; }
+.calendar-picker-label { display: grid; gap: var(--control-label-gap); min-width: 0; }
 .calendar-free-time-form :is(input:not([type=checkbox]), select) { width: 100%; }
 .calendar-free-time-form > button { display: grid; place-items: center; }
 .calendar-free-time-form > button > span { grid-area: 1 / 1; }
@@ -768,7 +782,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 @media (max-width: 600px) {
   .calendar-source-tools { width: 100%; }
   .calendar-free-time-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .calendar-free-time-form > label:first-child { grid-column: 1 / -1; }
+  .calendar-free-time-form > :first-child { grid-column: 1 / -1; }
 }
 @media (max-width: 375px) {
   .calendar-free-time-form > :is(label:has(select), button) { grid-column: 1 / -1; }

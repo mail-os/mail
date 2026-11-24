@@ -2006,8 +2006,41 @@ async function freeTimeJourney(page, phone = false) {
   await page.waitForFunction(() => document.activeElement?.getAttribute('data-stx-ref') === 'freeTimeDateField')
   if (phone) await page.setViewportSize({ width: 320, height: 844 })
   const form = panel.locator('form')
-  const controls = await verifyControlRow(form, 'input, select, button', phone ? 44 : 36, !phone)
+  const selector = '.calendar-picker-field, select, button.wm-action'
+  const controls = await verifyControlRow(form, selector, phone ? 44 : 36, !phone)
   const [date, from, to, duration, availability] = controls
+  for (const [name, fieldName, icon] of [
+    ['Open availability date picker', 'Date', 'calendar'],
+    ['Open start time picker', 'From', 'clock'],
+    ['Open end time picker', 'To', 'clock'],
+  ]) {
+    const input = form.getByLabel(fieldName, { exact: true })
+    const trigger = button(form, name)
+    const iconBox = await trigger.locator('[data-icon="' + icon + '"]').boundingBox()
+    const box = await input.boundingBox()
+    assert(Math.abs(iconBox.width - 16) < 0.25 && Math.abs(iconBox.height - 16) < 0.25,
+      `${fieldName} uses the shared picker icon size`)
+    assert(Math.abs(iconBox.y + iconBox.height / 2 - (box.y + box.height / 2)) < 0.5,
+      `${fieldName} uses a centered 16px picker icon`)
+    assert(Math.abs(box.x + box.width - iconBox.x - iconBox.width - 10) < 0.5,
+      `${fieldName} has the same icon inset as the other pickers`)
+    await input.evaluate((node) => {
+      const native = node.showPicker
+      node.showPicker = function () {
+        const active = navigator.userActivation.isActive
+        native.call(this)
+        this.dataset.pickerOpened = String(active)
+      }
+    })
+    if (phone) await trigger.tap()
+    else await trigger.press('Enter')
+    assert.equal(await input.getAttribute('data-picker-opened'), 'true', `${name} activates the native picker`)
+    assert(await input.evaluate(node => node.matches(':focus')), `${fieldName} takes focus`)
+    assert.equal(await input.evaluate(node => getComputedStyle(node.parentElement).outlineWidth), '2px',
+      `${fieldName} has a focus outline around the full field`)
+    await page.keyboard.press('Escape')
+    await input.evaluate((node) => { delete node.showPicker; delete node.dataset.pickerOpened })
+  }
   if (!phone) {
     verifyControlGaps(controls, 8)
     assert(Math.abs(from.right - from.left - 128) < 0.5 && Math.abs(to.right - to.left - 128) < 0.5,
@@ -2015,7 +2048,7 @@ async function freeTimeJourney(page, phone = false) {
     const viewport = page.viewportSize()
     for (const width of [375, 376, 600, 601, 860, 861]) {
       await page.setViewportSize({ width, height: viewport.height })
-      const responsive = await verifyControlRow(form, 'input, select, button', width > 860 ? 36 : 44, width > 860)
+      const responsive = await verifyControlRow(form, selector, width > 860 ? 36 : 44, width > 860)
       const [startDate, startTime, endTime, minimum, submit] = responsive
       verifyControlGaps([startTime, endTime], 8)
       assert(Math.abs((startTime.right - startTime.left) - (endTime.right - endTime.left)) < 0.5,
@@ -2026,7 +2059,7 @@ async function freeTimeJourney(page, phone = false) {
         assert(minimum.top > startDate.bottom && Math.abs(minimum.left - startDate.left) < 0.5 && Math.abs(submit.right - endTime.right) < 0.5,
           'Availability fields and the submit action share their column edges across rows')
       }
-      if (width === 601) await verifyPaintedControlBorders(form, 'input, select, button', responsive, 'tablet-601-availability-controls')
+      if (width === 601) await verifyPaintedControlBorders(form, selector, responsive, 'tablet-601-availability-controls')
       await fitsViewport(page)
     }
     await page.setViewportSize(viewport)
@@ -2060,11 +2093,12 @@ async function freeTimeJourney(page, phone = false) {
     const checking = button(panel, 'Checking…')
     await checking.waitFor()
     assert(await checking.isDisabled())
-    const pending = await verifyControlRow(form, 'input, select, button', phone ? 44 : 36, !phone)
+    const pending = await verifyControlRow(form, selector, phone ? 44 : 36, !phone)
     assert(pending.every((control, index) => control.opacity === '1'
       && Math.abs((control.right - control.left) - (controls[index].right - controls[index].left)) < 0.5),
       'The availability form keeps control widths and full-opacity borders while checking')
-    await verifyPaintedControlBorders(form, 'input, select, button', pending, phone ? 'phone-availability-pending' : 'desktop-availability-pending', true)
+    for (const trigger of await form.locator('.calendar-picker-trigger').all()) assert(await trigger.isDisabled())
+    await verifyPaintedControlBorders(form, selector, pending, phone ? 'phone-availability-pending' : 'desktop-availability-pending', true)
   }
   finally { resumeAvailability.resolve() }
   await panel.getByRole('status').filter({ hasText: '3 open windows' }).waitFor()
@@ -2079,7 +2113,7 @@ async function freeTimeJourney(page, phone = false) {
   ])
   await fitsViewport(page)
   await page.mouse.move(0, 0)
-  await verifyPaintedControlBorders(form, 'input, select, button', controls, phone ? 'phone-availability-controls' : 'desktop-availability-controls')
+  await verifyPaintedControlBorders(form, selector, controls, phone ? 'phone-availability-controls' : 'desktop-availability-controls')
   await panel.screenshot({ path: join(output, phone ? 'phone-calendar-free-time.png' : 'desktop-calendar-free-time.png'), animations: 'disabled' })
   if (phone) {
     await page.emulateMedia({ colorScheme: 'light' })
