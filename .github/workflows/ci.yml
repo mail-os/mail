@@ -77,6 +77,12 @@ jobs:
       timeout-minutes: 2
       run: python3 scripts/test-client-passwords.py packages/zig/zig-out/bin/mail --browser chromium --screenshots webmail-browser-screenshots
 
+    - name: Verify self-hosted mailbox management in the browser
+      if: runner.os == 'Linux'
+      working-directory: .
+      timeout-minutes: 3
+      run: python3 scripts/test-webmail-mailbox-operator.py packages/zig/zig-out/bin/mail --browser chromium --browser firefox --browser webkit --screenshots webmail-browser-screenshots
+
     - name: Upload browser screenshots
       if: ${{ !cancelled() && runner.os == 'Linux' }}
       uses: actions/upload-artifact@v4

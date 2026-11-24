@@ -1784,3 +1784,22 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-shared-message { width: calc(100% - 24px); }
   .wm-shared-activity time, .wm-shared-sender time { margin-inline-start: 0; }
 }
+
+.mailbox-operator-page .mail-app-mark { inline-size: 40px; block-size: 40px; margin: 0; flex: none; }
+.mailbox-operator-page .mail-app-mark .mail-icon { inline-size: 20px; block-size: 20px; color: var(--on-primary); }
+.mailbox-operator-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); align-items: start; gap: 16px; }
+.mailbox-operator-grid .health-card { min-inline-size: 0; margin: 0; }
+.mailbox-operator-help { margin: 0 0 16px; }
+.mailbox-operator-form { display: grid; gap: 14px; }
+.mailbox-operator-form label { display: grid; gap: var(--control-label-gap); font-size: .8125rem; font-weight: 600; }
+.mailbox-operator-form input { inline-size: 100%; }
+.mailbox-operator-form button { justify-content: center; }
+.mailbox-operator-directory { margin: 0; padding: 0; list-style: none; }
+.mailbox-operator-directory li { grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; }
+.mailbox-operator-directory li:last-child { border: 0; }
+.mailbox-operator-directory li > span:last-child { color: var(--muted); font-size: .8125rem; }
+.mailbox-operator-directory strong { display: block; overflow-wrap: anywhere; font-weight: 600; }
+.mailbox-operator-directory small { color: var(--muted); overflow-wrap: anywhere; }
+.mailbox-operator-pages { display: flex; gap: 8px; margin-block-end: 6px; }
+.mailbox-operator-grid .mailbox-operator-notice { margin-block-end: 0; color: var(--success); overflow-wrap: anywhere; }
+@media (max-width: 680px) { .mailbox-operator-grid { grid-template-columns: minmax(0, 1fr); } }

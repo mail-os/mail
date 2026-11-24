@@ -34,6 +34,7 @@ const time_compat = @import("../core/time_compat.zig");
 const logger = @import("../core/logger.zig");
 const database = @import("../storage/database.zig");
 const client_passwords = @import("../storage/client_passwords.zig");
+const mailbox_operator = @import("../storage/mailbox_operator.zig");
 const teams = @import("../storage/team_store.zig");
 const shared_inbox = @import("../storage/shared_inbox.zig");
 const auth_mod = @import("../auth/auth.zig");
@@ -122,6 +123,8 @@ const recover_html = @embedFile("webmail_dist/recover.html");
 const snapshot_html = @embedFile("webmail_dist/snapshot.html");
 const file_link_html = @embedFile("webmail_dist/file-link.html");
 const status_html = @embedFile("webmail_dist/status.html");
+const mailbox_admin_html = @embedFile("webmail_dist/mailboxes.html");
+const mailbox_admin_path = "/webmail/api/operator/mailboxes";
 const styles_css = @embedFile("webmail_dist/styles.css");
 const notifications_worker = @embedFile("webmail_dist/mail-notifications.js");
 
@@ -151,6 +154,7 @@ pub const WebmailHttpConfig = struct {
     scanner: ?*clamav.ClamAVScanner = null,
     undo_send_seconds: u32 = 10,
     provisioning: ?ProvisioningConfig = null,
+    operator_id: ?i64 = null,
     hosted_sign_in_origin: ?[]const u8 = null,
     hosted_team_domains: ?[]const u8 = null,
     primary_provisioning_domain: ?[]const u8 = null,
@@ -515,6 +519,7 @@ fn readRequest(server: *WebmailHttpServer, conn: *webmail_tls.Stream, allocator:
     if (std.mem.startsWith(u8, path, "/webmail/assistant/")) body_limit = @min(body_limit, 512 * 1024);
     if (std.mem.startsWith(u8, path, "/webmail/api/assistant-grants")) body_limit = @min(body_limit, 4096);
     if (std.mem.eql(u8, path, client_password_path)) body_limit = @min(body_limit, 8192);
+    if (std.mem.eql(u8, path, mailbox_admin_path)) body_limit = @min(body_limit, 8192);
     if (std.mem.eql(u8, path, "/webmail/auth/hosted")) body_limit = session_mod.token_hex_len + "proof=".len;
     const file_upload = std.mem.eql(u8, path, file_links.path);
     errdefer if (request.holds_file_transfer) server.releaseFileTransfer();
@@ -819,6 +824,9 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.eql(u8, p, "/webmail/api/search") and std.mem.eql(u8, req.method, "GET")) {
         return handleSearch(server, conn, arena, req);
     }
+    if (std.mem.eql(u8, p, mailbox_admin_path) and
+        (std.mem.eql(u8, req.method, "GET") or std.mem.eql(u8, req.method, "POST")))
+        return handleOperatorMailboxes(server, conn, arena, req);
 
     // ── SPA static assets (embedded) ─────────────────────────────────────────
     // The pages call /webmail/* on the same origin (no proxy in prod). The page
@@ -831,6 +839,11 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
         }
         if (std.mem.eql(u8, p, "/status")) {
             return serveAsset(conn, arena, status_html, "text/html; charset=utf-8");
+        }
+        if (std.mem.eql(u8, p, "/mailboxes") and server.config.operator_id != null) {
+            if (!isSecureBrowserRequest(server, req))
+                return sendError(conn, arena, 403, "https_required", "Use HTTPS to manage server mailboxes");
+            return serveAsset(conn, arena, mailbox_admin_html, "text/html; charset=utf-8");
         }
         if (std.mem.eql(u8, p, "/calendar")) {
             return serveAsset(conn, arena, calendar_html, "text/html; charset=utf-8");
@@ -1323,6 +1336,10 @@ fn handleMe(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.me
     try writeJsonString(w, sess.username);
     try w.writeAll(",\"email\":");
     try writeJsonString(w, sess.email);
+    if (operatorSession(server, req, sess)) |operator| {
+        if (mailbox_operator.canManage(server.db, operator) catch false)
+            try w.writeAll(",\"can_manage_mailboxes\":true");
+    }
     try w.writeAll("}}");
     try sendJson(conn, arena, 200, body.items, null);
 }
@@ -4354,6 +4371,75 @@ const AssistantOwnerAction = enum { list, preview, issue, revoke };
 fn isSecureBrowserRequest(server: *WebmailHttpServer, req: Request) bool {
     return server.cert_key_pair != null or
         (req.trust_forwarded_headers and std.ascii.eqlIgnoreCase(req.header("X-Forwarded-Proto") orelse "", "https"));
+}
+
+fn operatorSession(server: *WebmailHttpServer, req: Request, session: session_mod.Session) ?mailbox_operator.Operator {
+    const id = server.config.operator_id orelse return null;
+    if (session.linked_id != null or !isSecureBrowserRequest(server, req)) return null;
+    return .{ .id = id, .username = session.username, .session = session.session_id };
+}
+
+fn operatorError(conn: *webmail_tls.Stream, a: std.mem.Allocator, err: anyerror) !void {
+    return switch (err) {
+        error.OperatorUnavailable, error.NotFound => sendError(conn, a, 403, "operator_required", "This account cannot manage server mailboxes"),
+        error.MailboxExists => sendError(conn, a, 409, "mailbox_exists", "That mailbox address is already in use"),
+        else => blk: {
+            logger.err("Mailbox operator request failed: {}", .{err});
+            break :blk sendError(conn, a, 500, "server_error", "Could not complete the mailbox request. Try again.");
+        },
+    };
+}
+
+fn validOperatorAddress(mail: core_config.Config, address: []const u8) bool {
+    const domain = mailbox_domains.addressDomain(address) orelse return false;
+    if (address.len > 254 or !validProvisioningDomain(domain) or !mail.isLocalDomain(domain)) return false;
+    const name = address[0 .. address.len - domain.len - 1];
+    if (name.len == 0 or name.len > 64 or !std.ascii.isAlphanumeric(name[0]) or !std.ascii.isAlphanumeric(name[name.len - 1]) or
+        std.mem.indexOf(u8, name, "..") != null) return false;
+    for (name) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_' and byte != '.') return false;
+    return true;
+}
+
+fn handleOperatorMailboxes(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    const mail = server.config.mail_config orelse return sendError(conn, a, 404, "not_found", "No such endpoint");
+    if (server.config.operator_id == null) return sendError(conn, a, 404, "not_found", "No such endpoint");
+    var session = (try requireSession(server, conn, a, req)) orelse return;
+    defer session.deinit(server.allocator);
+    const operator = operatorSession(server, req, session) orelse return operatorError(conn, a, error.OperatorUnavailable);
+    if (std.mem.eql(u8, req.method, "GET")) {
+        const after = if (req.queryParam(a, "after")) |value| std.fmt.parseInt(i64, value, 10) catch -1 else 0;
+        if (after < 0) return sendError(conn, a, 400, "bad_request", "Invalid mailbox page");
+        const page = mailbox_operator.list(a, server.db, operator, after) catch |err| return operatorError(conn, a, err);
+        return sendJson(conn, a, 200, try service_mod.json(a, page), null);
+    }
+    const origin = req.header("Origin") orelse return sendError(conn, a, 403, "forbidden", "Create mailboxes from this webmail site");
+    if (!std.mem.startsWith(u8, origin, "https://") or !isSameOrigin(req))
+        return sendError(conn, a, 403, "forbidden", "Create mailboxes from this webmail site");
+    if (!(mailbox_operator.canManage(server.db, operator) catch |err| return operatorError(conn, a, err)))
+        return operatorError(conn, a, error.OperatorUnavailable);
+    const Form = struct { address: []const u8, password: []const u8, current_password: []const u8 };
+    const input = std.json.parseFromSliceLeaky(Form, a, req.body, .{}) catch
+        return sendError(conn, a, 400, "bad_request", "Enter a mailbox address and both passwords");
+    const address = try std.ascii.allocLowerString(a, std.mem.trim(u8, input.address, " \t"));
+    if (!validOperatorAddress(mail.*, address))
+        return sendError(conn, a, 400, "invalid_address", "Use a mailbox address on a domain served by this Mail server");
+    if (input.password.len < 12 or input.password.len > 1024 or std.mem.indexOfScalar(u8, input.password, 0) != null)
+        return sendError(conn, a, 400, "invalid_password", "Use a mailbox password between 12 and 1024 bytes");
+    if (input.current_password.len == 0 or input.current_password.len > 1024)
+        return sendError(conn, a, 400, "bad_request", "Enter your operator mailbox password");
+    var user = server.db.getUserByUsername(session.username) catch |err| return operatorError(conn, a, err);
+    defer user.deinit(server.db.allocator);
+    const valid = server.auth.verifyCredentialsForPeer(clientIp(req, conn), session.username, input.current_password) catch |err| {
+        if (err == error.AuthenticationRateLimited)
+            return sendError(conn, a, 429, "rate_limited", "Too many attempts. Try again in five minutes");
+        return operatorError(conn, a, err);
+    };
+    if (!valid) return sendError(conn, a, 403, "invalid_credentials", "Your operator mailbox password is incorrect");
+    var hasher = password_hasher.PasswordHasher.init(a);
+    const hash = hasher.hashPassword(input.password) catch |err| return operatorError(conn, a, err);
+    const id = mailbox_operator.create(server.db, operator, user.password_hash, address, hash) catch |err|
+        return operatorError(conn, a, err);
+    return sendJson(conn, a, 201, try service_mod.json(a, .{ .id = id, .address = address }), null);
 }
 
 fn handleAssistantOwner(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request, action: AssistantOwnerAction, id_text: []const u8) !void {

@@ -12,7 +12,8 @@ const username = state('')
 const password = state('')
 const busy = state(false)
 const error = state('')
-const returnPath = useRoute().hash === '#status' ? '/status' : '/'
+const returnDestinations = new Map([['#status', '/status'], ['#mailboxes', '/mailboxes']])
+const returnPath = returnDestinations.get(useRoute().hash) ?? '/'
 async function signIn() {
   if (busy()) return
   error.set('')

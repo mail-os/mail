@@ -270,6 +270,10 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
             <span class="wm-nav-label">Workflows</span>
             <button :for="item in attentionViews" :key="item.name" class="wm-folder" :aria-current="attentionView === item.name ? 'page' : null" @click="selectAttention(item.name)" :disabled="mutating"><span class="mail-icon" :data-icon="mailFolderIcon(item.name)" aria-hidden="true"></span><span class="wm-folder-name" :text="item.label"></span><span :if="item.name === 'reminders' && dueReminders > 0" class="wm-folder-count" :text="dueReminders"></span></button>
           </div>
+          <div :if="!linkedView && user?.can_manage_mailboxes" class="wm-nav-group">
+            <span class="wm-nav-label">Server</span>
+            <a class="wm-folder" href="/mailboxes"><span class="mail-icon" data-icon="shield" aria-hidden="true"></span><span class="wm-folder-name">Manage mailboxes</span></a>
+          </div>
         </div>
       </nav>
       <div class="wm-user">

@@ -185,10 +185,11 @@ class MailClient:
 
 
 class Fixture(MailClient):
-    def __init__(self, binary, directory, *, tls=False, staging=False):
+    def __init__(self, binary, directory, *, tls=False, staging=False, provisioning=True):
         self.binary = binary
         self.directory = directory
         self.staging = staging
+        self.provisioning = provisioning
         ports = available_ports(9 if tls or staging else 6)
         self.smtp_port, web_port, private_port, self.submission_port, self.imap_port, dav_port = ports[:6]
         self.webmail = f"http://127.0.0.1:{web_port}"
@@ -210,6 +211,9 @@ class Fixture(MailClient):
             SUBMISSION_PORT=str(self.submission_port), SMTP_PROVISIONING_DOMAIN=DOMAIN,
             SMTP_PROVISIONING_PORT=str(private_port), SMTP_PROVISIONING_TOKEN=token,
         )
+        if not provisioning:
+            for key in ("SMTP_PROVISIONING_DOMAIN", "SMTP_PROVISIONING_PORT", "SMTP_PROVISIONING_TOKEN"):
+                del self.env[key]
         self.tls_context = None
         if tls or staging:
             dav_tls, self.imaps_port, self.smtps_port = ports[6:]
@@ -245,7 +249,9 @@ class Fixture(MailClient):
                     if daemon.poll() is not None:
                         raise RuntimeError("Mail stopped during startup")
                     try:
-                        if request(self.private + "/provisioning/v1/status", headers=self.auth)[0] == 200:
+                        status = (request(self.private + "/provisioning/v1/status", headers=self.auth) if self.provisioning else
+                                  request(self.webmail + "/login", context=self.tls_context))[0]
+                        if status == 200:
                             with socket.create_connection(("127.0.0.1", self.imap_port), timeout=0.2):
                                 pass
                             if request(self.ews_url, b"<probe/>", context=self.tls_context)[0] == 401:
@@ -255,7 +261,7 @@ class Fixture(MailClient):
                         pass
                     time.sleep(0.1)
                 else:
-                    raise RuntimeError("Mail did not start the private listener")
+                    raise RuntimeError("Mail did not start its fixture listeners")
                 yield daemon
             except Exception:
                 print(log_path.read_text(errors="replace")[-8000:])

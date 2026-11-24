@@ -531,6 +531,12 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     }
 
     // Initialize Webmail HTTP server (browser client API). Requires auth+DB.
+    const operator_id: ?i64 = if (env.get("SMTP_WEBMAIL_OPERATOR_ID")) |value| blk: {
+        const id = std.fmt.parseInt(i64, value, 10) catch return error.InvalidWebmailOperatorConfiguration;
+        if (id < 1 or provisioning_port != null or cfg.catch_all or !cfg.enable_webmail or !cfg.webmail_secure_cookies)
+            return error.InvalidWebmailOperatorConfiguration;
+        break :blk id;
+    } else null;
     const hosted_sign_in_origin = env.get("SMTP_HOSTED_SIGN_IN_ORIGIN");
     if (hosted_sign_in_origin) |origin| {
         if (provisioning_port == null or !cfg.enable_webmail or !cfg.webmail_secure_cookies or
@@ -556,6 +562,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
                 .max_attachment_count = cfg.webmail_attachment_max_count,
                 .undo_send_seconds = cfg.webmail_undo_send_seconds,
                 .scanner = scanner,
+                .operator_id = operator_id,
                 // Outbound send settings: mirror the server's so webmail mail is
                 // delivered + DKIM-signed identically to SMTP submission.
                 .hostname = cfg.hostname,

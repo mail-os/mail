@@ -20,6 +20,28 @@ The installed app opens your inbox through the same account sign-in. It
 requires a connection to your Mail server. Browser notifications remain an
 opt-in under Account settings. See the [client and automation decisions](docs/CLIENT_SURFACES.md).
 
+## Manage mailboxes on a self-hosted server
+
+Create the operator's own mailbox first, using `mail user:local create`
+as the Mail service user against the service database. The command prints the
+account's numeric `ID`. `mail user:local info operator@example.com` also
+prints the ID of an existing local mailbox.
+
+Set `SMTP_WEBMAIL_OPERATOR_ID` to that ID in the daemon's environment and
+restart Mail. Enable webmail with secure cookies. Serve it through native HTTPS
+or a local HTTPS proxy that passes the original host and HTTPS scheme to Mail's
+loopback listener. The operator can sign in and open **Server → Manage mailboxes**
+from the sidebar, or visit `/mailboxes` directly.
+
+The operator can browse the mailbox directory and create an account on a domain
+served by this Mail installation. Creation requires the operator's current
+password and records an audit entry. Give the new mailbox owner the initial
+password over a private channel. The mailbox owner can sign in right away and
+change the password in Account. Removing the setting and restarting Mail turns
+off browser management. The feature is intended for self-hosted installations
+with local mailboxes and is unavailable with hosted provisioning or catch-all
+routing.
+
 ## Mailbox experience
 
 - Drafts autosave while the composer remains open. Server acknowledgements drive

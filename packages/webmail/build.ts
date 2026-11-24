@@ -10,7 +10,7 @@ export function stylesheetUrl(styles: Uint8Array): string {
   return `/styles.css?v=${hash}`
 }
 
-export const webmailPages = ['index', 'login', 'recover', 'status', 'calendar', 'shared', 'combined', 'snapshot', 'file-link'] as const
+export const webmailPages = ['index', 'login', 'recover', 'status', 'calendar', 'shared', 'combined', 'snapshot', 'file-link', 'mailboxes'] as const
 export const webmailAppPages = new Set(['index', 'login', 'calendar', 'shared', 'combined'])
 export const webmailAppAssets: Record<string, string> = {
   'mail.webmanifest': 'application/manifest+json; charset=utf-8',

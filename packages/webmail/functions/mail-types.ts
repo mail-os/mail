@@ -86,7 +86,7 @@ export interface PrivateMessageTools {
 }
 export interface AttachmentPage { items: LibraryAttachment[], page: number, total: number, index: IndexProgress }
 export interface Folder { name: string, unread: number, total: number }
-export interface User { username: string, email: string }
+export interface User { username: string, email: string, can_manage_mailboxes?: boolean }
 export interface Contact { name: string, address: string }
 export interface AddressBookCard {
   uid: string

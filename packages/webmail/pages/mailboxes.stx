@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Manage mailboxes — Mail</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<script client>
+import { cancelMailReads, createMailApi, MailApiError } from '../functions/mail-api'
+import type { User } from '../functions/mail-types'
+
+interface DirectoryPage {
+  mailboxes: { id: number, email: string, username: string, enabled: boolean }[]
+  next: number | null
+}
+
+const account = state<User | null>(null)
+const directory = state<DirectoryPage | null>(null)
+const cursors = state([0])
+const address = state('')
+const password = state('')
+const currentPassword = state('')
+const loading = state(false)
+const saving = state(false)
+const error = state('')
+const notice = state('')
+
+function clearPrivateState() {
+  account.set(null)
+  directory.set(null)
+  cursors.set([0])
+  address.set('')
+  password.set('')
+  currentPassword.set('')
+  notice.set('')
+}
+
+const api = createMailApi(() => account()?.username, (failure) => {
+  clearPrivateState()
+  if (failure.status === 401) navigate('/login#mailboxes', { reload: true })
+})
+
+function showError(failure: unknown) {
+  if (failure instanceof MailApiError && failure.code === 'operator_required') clearPrivateState()
+  error.set(failure instanceof MailApiError ? failure.message : 'Could not reach Mail. Please try again.')
+}
+
+async function readPage(history: number[]) {
+  if (!account() || loading()) return
+  error.set('')
+  loading.set(true)
+  try {
+    const page = await api<DirectoryPage>(`/webmail/api/operator/mailboxes?after=${history[history.length - 1]}`)
+    directory.set(page)
+    cursors.set(history)
+  }
+  catch (failure) { showError(failure) }
+  finally { loading.set(false) }
+}
+
+function nextPage() {
+  const cursor = directory()?.next
+  if (cursor != null) return readPage([...cursors(), cursor])
+}
+
+async function refresh() {
+  try {
+    const { user } = await api<{ user: User }>('/webmail/auth/me')
+    if (!user.can_manage_mailboxes) {
+      clearPrivateState()
+      error.set('This account cannot manage server mailboxes.')
+      return
+    }
+    account.set(user)
+    await readPage([0])
+  }
+  catch (failure) { showError(failure) }
+}
+
+async function createMailbox() {
+  if (!account() || saving() || loading()) return
+  error.set('')
+  notice.set('')
+  saving.set(true)
+  try {
+    const created = await api<{ address: string }>('/webmail/api/operator/mailboxes', {
+      method: 'POST',
+      body: JSON.stringify({ address: address(), password: password(), current_password: currentPassword() }),
+    })
+    address.set('')
+    notice.set(`${created.address} is ready to sign in and receive mail.`)
+    await readPage([0])
+  }
+  catch (failure) { showError(failure) }
+  finally {
+    password.set('')
+    currentPassword.set('')
+    saving.set(false)
+  }
+}
+
+onMount(refresh)
+useEventListener('pagehide', (event) => { cancelMailReads(event); clearPrivateState() })
+useEventListener('pageshow', (event) => { if (event.persisted) navigate('/mailboxes', { reload: true }) })
+</script>
+<main class="health-page mailbox-operator-page">
+  <nav class="health-nav" aria-label="Mail navigation">
+    <a href="/"><span class="mail-icon" data-icon="back" aria-hidden="true"></span>Mail</a>
+  </nav>
+  <header class="health-header">
+    <h1><span class="mail-app-mark"><span class="mail-icon" data-icon="shield" aria-hidden="true"></span></span>Manage mailboxes</h1>
+  </header>
+  <p :if="error" class="login-error" role="alert" :text="error"></p>
+  <div :if="account" class="mailbox-operator-grid">
+    <section class="health-card" aria-labelledby="newMailboxTitle">
+      <h2 id="newMailboxTitle">Create mailbox</h2>
+      <p class="mailbox-operator-help">Use an address on a domain served by this Mail installation.</p>
+      <form class="mailbox-operator-form" @submit.prevent="createMailbox()">
+        <label>Mailbox address
+          <input type="email" x-model.trim="address" autocapitalize="none" autocomplete="off" maxlength="254" required :disabled="saving">
+        </label>
+        <label>Initial password
+          <input type="password" x-model="password" autocomplete="new-password" minlength="12" maxlength="1024" required :disabled="saving">
+        </label>
+        <label>Your mailbox password
+          <input type="password" x-model="currentPassword" autocomplete="current-password" maxlength="1024" required :disabled="saving">
+        </label>
+        <button type="submit" class="wm-action wm-action--accent" :disabled="saving || loading">
+          <span class="mail-icon" data-icon="plus" aria-hidden="true"></span><span :text="saving ? 'Creating…' : 'Create mailbox'"></span>
+        </button>
+      </form>
+      <p :if="notice" class="mailbox-operator-notice" role="status" :text="notice"></p>
+    </section>
+    <section class="health-card" aria-labelledby="mailboxDirectoryTitle" :aria-busy="loading">
+      <h2 id="mailboxDirectoryTitle">Existing mailboxes</h2>
+      <p :if="loading && !directory" role="status">Loading mailboxes…</p>
+      <nav :if="directory?.next || cursors.length > 1" class="mailbox-operator-pages" aria-label="Mailbox pages">
+        <button class="wm-action" type="button" @click="readPage(cursors.slice(0, -1))" :disabled="loading || saving || cursors.length <= 1">Previous</button>
+        <button class="wm-action" type="button" @click="nextPage()" :disabled="loading || saving || !directory?.next">Next</button>
+      </nav>
+      <ul :if="directory?.mailboxes.length" class="mailbox-operator-directory" role="list">
+        <li :for="mailbox in (directory?.mailboxes || [])" :key="mailbox.id" class="health-check">
+          <span><strong :text="mailbox.email"></strong><small :if="mailbox.username !== mailbox.email" :text="'Sign-in name: ' + mailbox.username"></small></span>
+          <span :text="mailbox.enabled ? 'Active' : 'Disabled'"></span>
+        </li>
+      </ul>
+      <p :if="!loading && directory && !directory.mailboxes.length">No mailboxes on this page.</p>
+    </section>
+  </div>
+</main>
+</body>
+</html>
