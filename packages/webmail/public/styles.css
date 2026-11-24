@@ -1828,7 +1828,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-shared-reader-back { margin: 12px 16px 0; }
 .wm-shared-message { max-width: 780px; margin: 14px auto 24px; width: calc(100% - 32px); overflow-wrap: anywhere; }
 .wm-shared-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--border); border-radius: 9px; background: var(--toolbar); }
-.wm-shared-assignee { display: flex; flex: 1 1 18rem; align-items: center; gap: 8px; min-inline-size: 0; max-inline-size: 22rem; color: var(--muted); font-size: 13px; font-weight: 550; }
+.wm-shared-assignee { display: flex; flex: 1 1 18rem; align-items: center; gap: 8px; min-inline-size: 0; max-inline-size: 24rem; color: var(--muted); font-size: 13px; font-weight: 550; }
 .wm-shared-assignee label { white-space: nowrap; }
 .wm-shared-assignee select { flex: 1; inline-size: 100%; }
 .wm-shared-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
