@@ -78,6 +78,27 @@ final IMAP delta, and recovery using a separate reverse checkpoint. Use a
 public staging DNS zone to verify propagation and aligned authentication
 before changing customer MX records.
 
+### Inventory a hosted domain before transfer or retirement
+
+Run the command from the daemon's working directory with the daemon's
+configuration and `SMTP_DB_PATH`. Protect the output because it contains
+mailbox and recovery addresses and sharing relationships.
+
+```bash
+umask 077
+/opt/mail/mail-server domain inventory customer.example.com > native-inventory.json
+```
+
+The report reads one SQLite snapshot. It includes full mailbox addresses on
+the exact domain, native assignment and operation IDs, access windows and
+recovery settings, team membership and grants, forwards, and pending inbound
+delivery. It identifies forwarding rules configured as Sieve so an operator
+can review them before touching delivery. Local routing flags reflect the
+configuration loaded by the command. Compare this with the Stacks billing
+inventory to find reservations without a confirmed native result and mailbox
+assignments without a matching billing record. Use both reports to plan the
+transfer or retirement of the domain in #131.
+
 ## Hosted mailbox diagnostics
 
 Run the local report on the mailbox's Mail host. Use the daemon's working directory and database path. The staging stack uses `/var/lib/mail` for both.

@@ -2,6 +2,11 @@ const std = @import("std");
 const cli = @import("zig-cli");
 const database = @import("../storage/database.zig");
 const env = @import("../core/env.zig");
+const config = @import("../core/config.zig");
+const mailbox_domains = @import("../core/mailbox_domains.zig");
+const inventory = @import("../storage/hosted_domain_inventory.zig");
+const io_compat = @import("../core/io_compat.zig");
+const time = @import("../core/time_compat.zig");
 const dm = @import("../domain_migrate.zig");
 
 fn openDb(allocator: std.mem.Allocator) !database.Database {
@@ -33,6 +38,28 @@ fn listAction(ctx: *cli.BaseCommand.ParseContext) !void {
     std.debug.print("{s: <40} {s: >9}\n", .{ "DOMAIN", "MAILBOXES" });
     for (counts) |c|
         std.debug.print("{s: <40} {d: >9}\n", .{ c.domain, c.mailboxes });
+}
+
+fn inventoryAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const input = ctx.getArgument(0) orelse return error.MissingArgument;
+    if (!dm.isValidDomain(input)) return error.InvalidDomain;
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const domain = try std.ascii.allocLowerString(allocator, input);
+    var db = try database.Database.openReadOnly(allocator, env.get("SMTP_DB_PATH") orelse "./smtp.db");
+    defer db.deinit();
+    const cfg = try config.loadConfig(allocator, .{});
+    const routing: inventory.Routing = .{
+        .local = cfg.isLocalDomain(domain),
+        .exact_mailboxes = mailbox_domains.contains(cfg.exact_mailbox_domains, domain),
+        .additional_provisioning = mailbox_domains.contains(env.get("SMTP_PROVISIONING_ADDITIONAL_DOMAINS"), domain),
+        .catch_all = cfg.catch_all,
+    };
+    const io = io_compat.getIo();
+    var buffer: [4096]u8 = undefined;
+    var output = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try inventory.write(allocator, &db, domain, time.timestamp(), routing, io, &output.interface);
 }
 
 fn migrateAction(ctx: *cli.BaseCommand.ParseContext) !void {
@@ -134,6 +161,11 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     const list_cmd = try cli.BaseCommand.init(allocator, "list", "List domains with mailboxes on this server");
     _ = list_cmd.setAction(listAction);
     _ = try cmd.addCommand(list_cmd);
+
+    const inventory_cmd = try cli.BaseCommand.init(allocator, "inventory", "Print a read-only JSON inventory of a hosted domain");
+    _ = try inventory_cmd.addArgument(cli.Argument.init("domain", "Domain to inspect", .string));
+    _ = inventory_cmd.setAction(inventoryAction);
+    _ = try cmd.addCommand(inventory_cmd);
 
     const migrate_cmd = try cli.BaseCommand.init(
         allocator,

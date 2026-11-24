@@ -262,13 +262,29 @@ pub const Database = struct {
     mailbox_mutations: std.c.pthread_mutex_t = .{},
 
     pub fn init(allocator: std.mem.Allocator, db_path: []const u8) !Database {
+        var database = try open(allocator, db_path, sqlite.SQLITE_OPEN_READWRITE | sqlite.SQLITE_OPEN_CREATE);
+        errdefer database.deinit();
+
+        try database.enableWALMode();
+        try database.initSchema();
+        return database;
+    }
+
+    pub fn openReadOnly(allocator: std.mem.Allocator, db_path: []const u8) !Database {
+        var database = try open(allocator, db_path, sqlite.SQLITE_OPEN_READONLY);
+        errdefer database.deinit();
+        try database.exec("PRAGMA busy_timeout=5000;");
+        return database;
+    }
+
+    fn open(allocator: std.mem.Allocator, db_path: []const u8, flags: c_int) !Database {
         var db: ?*sqlite.sqlite3 = null;
 
         // Add null terminator for C string
         const path_z = try allocator.dupeSentinel(u8, db_path, 0);
         defer allocator.free(path_z);
 
-        const rc = sqlite.sqlite3_open(path_z.ptr, &db);
+        const rc = sqlite.sqlite3_open_v2(path_z.ptr, &db, flags, null);
         if (rc != sqlite.SQLITE_OK) {
             if (db) |d| {
                 _ = sqlite.sqlite3_close(d);
@@ -276,19 +292,11 @@ pub const Database = struct {
             return DatabaseError.OpenFailed;
         }
 
-        var database = Database{
+        return .{
             .db = db,
             .allocator = allocator,
             .mutex = mutex_compat.Mutex{},
         };
-
-        // Enable WAL mode for better concurrent read performance
-        try database.enableWALMode();
-
-        // Initialize schema
-        try database.initSchema();
-
-        return database;
     }
 
     pub fn deinit(self: *Database) void {
