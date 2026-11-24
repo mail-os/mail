@@ -1613,9 +1613,6 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 @media (490px < width <= 1080px) {
   .calendar-view-toolbar .calendar-view-modes { flex-basis: 100%; }
 }
-@media (490px < width <= 740px) {
-  .calendar-zone { flex-basis: 100%; justify-content: space-between; }
-}
 
 /* Preserve the outline while disabling a control. Quiet buttons keep their transparent styling. */
 .wm-action:disabled { opacity: 1; color: var(--control-disabled-text); }
@@ -1831,9 +1828,12 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-shared-reader-back { margin: 12px 16px 0; }
 .wm-shared-message { max-width: 780px; margin: 14px auto 24px; width: calc(100% - 32px); overflow-wrap: anywhere; }
 .wm-shared-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--border); border-radius: 9px; background: var(--toolbar); }
-.wm-shared-assignee { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--muted); font-size: 13px; }
+.wm-shared-assignee { display: flex; flex: 1 1 18rem; align-items: center; gap: 8px; min-inline-size: 0; max-inline-size: 22rem; color: var(--muted); font-size: 13px; font-weight: 550; }
+.wm-shared-assignee label { white-space: nowrap; }
+.wm-shared-assignee select { flex: 1; inline-size: 100%; }
+.wm-shared-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
 
-.wm-shared-activity { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; color: var(--muted); font-size: 12px; }
+.wm-shared-activity { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; margin: 8px 0 0; color: var(--muted); font-size: 12px; }
 .wm-shared-activity time { margin-inline-start: auto; }
 .wm-shared-message-head { margin-block: 16px 12px; padding-block: 14px; border-block: 1px solid var(--border); }
 .wm-shared-message-head h2 { margin: 0 0 12px; font-size: 22px; letter-spacing: -.02em; }
@@ -1882,6 +1882,11 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-shared-reading .wm-shared-reader { display: block; }
   .wm-shared-message { width: calc(100% - 24px); }
   .wm-shared-activity time, .wm-shared-sender time { margin-inline-start: 0; }
+}
+@media (max-width: 540px) {
+  .wm-shared-assignee { display: grid; flex-basis: 100%; gap: var(--control-label-gap); max-inline-size: none; }
+  .wm-shared-buttons { flex: 1 1 100%; }
+  .wm-shared-buttons .wm-action { flex: 1; justify-content: center; }
 }
 
 .mailbox-operator-page .mail-app-mark { inline-size: 40px; block-size: 40px; margin: 0; flex: none; }

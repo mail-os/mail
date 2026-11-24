@@ -227,7 +227,8 @@ def verify(binary, output, engine, accessibility=False):
                 assert mailbox.append("Archive", r"(\Seen)", Time2Internaldate(received), archived.as_bytes())[0] == "OK"
             assert fixture.deliver(sender, identity=owner, subject="Combined source briefing",
                                    body="Please send the design notes from this mailbox.")[0] == 250
-            seed_shared_inbox(fixture, owner, sender)
+            studio = seed_shared_inbox(fixture, owner, sender)
+            team_command(fixture, "team", "grant", "studio", studio, sender, "mailbox")
             day = seed_calendar(fixture, owner)
             env = dict(os.environ, MAIL_BROWSER_URL=fixture.webmail, MAIL_BROWSER_OWNER=owner,
                        MAIL_BROWSER_SENDER=sender, MAIL_BROWSER_PASSWORD=fixture.password, MAIL_BROWSER_DAY=day,

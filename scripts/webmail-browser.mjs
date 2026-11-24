@@ -263,14 +263,24 @@ async function verifyCalendarPeriod(page, label, height) {
   if (width > 490 && width <= 1080) {
     assert(Math.abs(controls[0].top - views[0].bottom - 8) < 0.5, 'Tablet navigation starts eight pixels below the views')
     assert(Math.abs(controls[0].left - views[0].left) < 0.5, 'Tablet navigation and views share a leading edge')
-    if (width > 740) {
+    const zoneLabel = await toolbar.locator('.calendar-zone').boundingBox()
+    const toolbarBox = await toolbar.boundingBox()
+    const trailingRoom = toolbarBox.x + toolbarBox.width - 9 - date.right
+    if (trailingRoom >= 16 + zoneLabel.width) {
       assert(Math.abs(zone.top - date.top) < 0.5, 'The time zone shares the second row on wider tablets')
-      const zoneLabel = await toolbar.locator('.calendar-zone').boundingBox()
       assert(Math.abs(zoneLabel.x - date.right - 16) < 0.5, 'The time zone keeps its desktop spacing on wider tablets')
     }
     else {
       assert(Math.abs(zone.top - date.bottom - 8) < 0.5, 'The time zone has an eight-pixel gap on narrow tablets')
+      assert(Math.abs(zoneLabel.x - controls[0].left) < 0.5, 'The wrapped time zone label starts at the leading edge')
     }
+    const labelTextRight = await toolbar.locator('.calendar-zone').evaluate((node) => {
+      const range = document.createRange()
+      range.selectNodeContents(node.firstChild)
+      return range.getBoundingClientRect().right
+    })
+    assert(Math.abs(zone.left - labelTextRight - 8) < 0.5, `At ${width}px the time zone picker stays eight pixels from its label`)
+    if (width >= 700) assert(Math.abs(zone.top - date.top) < 0.5, 'Date and zone fit together from 700px in the fixture')
   }
   if (stacked) {
     assert(Math.abs(date.top - row[0].bottom - 8) < 0.5, 'Jump to date has the same gap below date navigation')
@@ -924,9 +934,10 @@ async function desktopJourney(page) {
   await fitsViewport(page)
   await screenshot(page, 'desktop-calendar')
   await verifyCalendarPeriod(page, 'desktop-light', 36)
-  for (const width of [371, 375, 376, 389, 490, 491, 700, 740, 741, 800, 860, 861, 1080, 1081, 1159, 1160]) {
+  for (const width of [371, 375, 376, 389, 490, 491, 600, 700, 740, 741, 800, 860, 861, 1080, 1081, 1159, 1160]) {
     await page.setViewportSize({ width, height: 940 })
-    await verifyCalendarPeriod(page, width === 800 ? 'tablet-light' : null, width > 860 ? 36 : 44)
+    const captureLabel = [600, 700, 800].includes(width) ? `tablet-${width}-light` : null
+    await verifyCalendarPeriod(page, captureLabel, width > 860 ? 36 : 44)
   }
   await page.setViewportSize({ width: 1440, height: 940 })
   await page.emulateMedia({ colorScheme: 'dark' })
@@ -1169,6 +1180,8 @@ async function sharedJourney(page, phone = false) {
   const studio = picker.locator('option', { hasText: /studio@hosted\.example\.test/ })
   await studio.waitFor({ state: 'attached' })
   await verifySelect(picker, phone ? 44 : 36)
+  const refresh = await button(page, 'Refresh shared inbox').boundingBox()
+  assert(Math.abs(refresh.width - refresh.height) < 0.5, 'Shared inbox refresh has a square hit area')
   await picker.selectOption(await studio.getAttribute('value'))
   const message = button(page, /Studio proof approval/)
   const manage = button(page, 'Manage stages')
@@ -1207,6 +1220,34 @@ async function sharedJourney(page, phone = false) {
   await page.getByRole('region', { name: 'Shared message reader' })
     .getByText('The revised proof is ready for approval.', { exact: true }).waitFor()
   await page.getByRole('region', { name: 'Shared message reader' }).getByText('Proof review', { exact: true }).waitFor()
+  const actions = page.locator('.wm-shared-actions')
+  const assignment = actions.getByLabel('Assigned to', { exact: true })
+  const height = phone ? 44 : 36
+  await verifySelect(assignment, height)
+  const assigned = page.waitForResponse(response => response.request().method() === 'PUT'
+    && new URL(response.url()).pathname.endsWith('/workflow'))
+  await assignment.selectOption({ label: sender })
+  assert((await assigned).ok(), 'The assignee picker saves a real change')
+  await page.getByRole('status').filter({ hasText: `Assigned by ${owner}` }).waitFor()
+  await verifySelectedOptionFits(assignment)
+  const sharedControls = await verifyControlRow(actions, 'select, button', height, !phone)
+  const [assignee, resolve] = sharedControls
+  if (phone) {
+    const field = await actions.locator('.wm-shared-assignee').boundingBox()
+    const label = await actions.locator('label[for=sharedAssignee]').boundingBox()
+    assert(Math.abs(assignee.left - field.x) < 0.5 && Math.abs(assignee.right - field.x - field.width) < 0.5,
+      'The mobile picker fills its row below the assignment label')
+    assert(Math.abs(assignee.top - label.y - label.height - 6) < 0.5, 'The assignment label sits six pixels above the picker')
+    assert(Math.abs(assignee.left - resolve.left) < 0.5 && Math.abs(assignee.right - resolve.right) < 0.5,
+      'The mobile assignee and resolve controls share both edges')
+    assert(Math.abs(resolve.top - assignee.bottom - 8) < 0.5, 'Message actions sit eight pixels below the assignment picker')
+  }
+  await verifyPaintedControlBorders(actions, 'select, button', sharedControls, phone ? 'phone-shared-controls-dark' : 'desktop-shared-controls-light')
+  const unassigned = page.waitForResponse(response => response.request().method() === 'PUT'
+    && new URL(response.url()).pathname.endsWith('/workflow'))
+  await assignment.selectOption('')
+  assert((await unassigned).ok(), 'The assignee picker can clear the assignment')
+  await page.getByRole('status').filter({ hasText: `Unassigned by ${owner}` }).waitFor()
   await button(page, 'Resolve').click()
   await button(page, 'Reopen').waitFor()
   await fitsViewport(page)

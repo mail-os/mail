@@ -67,7 +67,7 @@ useEventListener('online', refresh)
       <option :if="!selectedInbox" value="">Choose an inbox</option>
       <option :for="inbox in inboxes" :key="inboxKey(inbox)" :value="inboxKey(inbox)" :selected="inboxKey(inbox) === selectedInbox" :text="inboxLabel(inbox)"></option>
     </select></div>
-    <button type="button" class="wm-action" @click="refresh()" :disabled="saving || loading" aria-label="Refresh shared inbox" title="Refresh shared inbox"><span class="mail-icon" data-icon="refresh" aria-hidden="true"></span></button>
+    <button type="button" class="wm-action mail-icon-button" @click="refresh()" :disabled="saving || loading" aria-label="Refresh shared inbox" title="Refresh shared inbox"><span class="mail-icon" data-icon="refresh" aria-hidden="true"></span></button>
   </header>
   <details :if="invitationPanel.teams.length || invitationPanel.incoming.length || invitationPanel.sent.length || inviteNotice || inviteError" class="wm-team-panel wm-team-invitations" name="shared-inbox-tools" ref="invitationDetails">
     <summary :text="invitationLabel"></summary>
@@ -203,7 +203,6 @@ useEventListener('online', refresh)
       <p :if="!reference" class="wm-shared-empty">Select a message to read.</p>
       <article :if="detail" class="wm-shared-message wm-message-paper">
         <div class="wm-shared-actions">
-          <button :if="detail.canReply" type="button" class="wm-action wm-action--accent" @click="startReply()" :disabled="saving || loading"><span class="mail-icon" data-icon="reply" aria-hidden="true"></span>Reply</button>
           <div class="wm-shared-assignee"><label for="sharedAssignee">Assigned to</label>
             <select id="sharedAssignee" :disabled="saving || loading" @change="$event.target.value ? change('assign', $event.target.value) : change('unassign')">
               <option value="" :selected="!detail.workflow.assignee">Unassigned</option>
@@ -211,7 +210,10 @@ useEventListener('online', refresh)
               <option :if="detail.workflow.assignee && !detail.assignable.some(person => person.id === detail.workflow.assignee.id)" :value="detail.workflow.assignee.id" :selected="true" :text="detail.workflow.assignee.address + ' (unavailable)'"></option>
             </select>
           </div>
-          <button type="button" class="wm-action wm-action--accent" @click="change(detail.workflow.resolved ? 'reopen' : 'resolve')" :disabled="saving || loading"><span class="mail-icon" data-icon="check" aria-hidden="true"></span><span :text="detail.workflow.resolved ? 'Reopen' : 'Resolve'"></span></button>
+          <div class="wm-shared-buttons">
+            <button :if="detail.canReply" type="button" class="wm-action wm-action--accent" @click="startReply()" :disabled="saving || loading"><span class="mail-icon" data-icon="reply" aria-hidden="true"></span>Reply</button>
+            <button type="button" class="wm-action wm-action--accent" @click="change(detail.workflow.resolved ? 'reopen' : 'resolve')" :disabled="saving || loading"><span class="mail-icon" data-icon="check" aria-hidden="true"></span><span :text="detail.workflow.resolved ? 'Reopen' : 'Resolve'"></span></button>
+          </div>
         </div>
         <p class="wm-shared-activity" role="status"><span class="wm-shared-status" :class="{ 'wm-shared-status--resolved': detail.workflow.resolved }" :text="detail.workflow.resolved ? 'Resolved' : 'Open'"></span><span :if="detail.workflow.stage" :text="detail.workflow.stage.name"></span><span :if="workflowActivity(detail.workflow)" :text="workflowActivity(detail.workflow)"></span><time :if="detail.workflow.changedAt" :text="new Date(detail.workflow.changedAt * 1000).toLocaleString()"></time></p>
         <p :if="detail.reply" class="wm-shared-activity" role="status"><span class="mail-icon" data-icon="reply" aria-hidden="true"></span><span :text="replyActivity(detail.reply)"></span></p>
