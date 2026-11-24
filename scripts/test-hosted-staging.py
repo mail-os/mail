@@ -480,6 +480,18 @@ def verify(test):
         test.clean_up()
 
 
+def verify_fixture(binary):
+    with TemporaryDirectory(prefix="mail-staging-protocols-") as directory:
+        fixture = Fixture(binary, Path(directory), staging=True)
+        ports = (fixture.smtp_port, fixture.submission_port, fixture.smtps_port, fixture.imap_port,
+                 fixture.imaps_port, urllib.parse.urlsplit(fixture.webmail).port,
+                 urllib.parse.urlsplit(fixture.ews_url).port)
+        with fixture.daemon():
+            verify(StagingClient(host="127.0.0.1", domain=suite["DOMAIN"], private=fixture.private,
+                                 token=fixture.auth["Authorization"].removeprefix("Bearer "),
+                                 tls_context=fixture.tls_context, ports=ports))
+
+
 def main():
     if not __debug__:
         raise RuntimeError("Run the staging verifier with assertions enabled")
@@ -497,15 +509,8 @@ def main():
     args = parser.parse_args()
     if args.fixture:
         print("Disposable loopback fixture with a temporary TLS certificate.")
-        with TemporaryDirectory(prefix="mail-staging-protocols-") as directory:
-            fixture = Fixture(args.fixture.resolve(strict=True), Path(directory), staging=True)
-            ports = (fixture.smtp_port, fixture.submission_port, fixture.smtps_port, fixture.imap_port,
-                     fixture.imaps_port, urllib.parse.urlsplit(fixture.webmail).port,
-                     urllib.parse.urlsplit(fixture.ews_url).port)
-            with fixture.daemon():
-                verify(StagingClient(host="127.0.0.1", domain=suite["DOMAIN"], private=fixture.private,
-                                     token=fixture.auth["Authorization"].removeprefix("Bearer "),
-                                     tls_context=fixture.tls_context, ports=ports))
+        binary = args.fixture.resolve(strict=True)
+        suite["run_disposable_quota_check"](lambda: verify_fixture(binary))
     else:
         if not args.domain:
             parser.error("--domain is required with --host")

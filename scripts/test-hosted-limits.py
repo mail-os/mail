@@ -300,13 +300,16 @@ class Fixture(MailClient):
             time.sleep(0.125)
         raise AssertionError(f"Outbox send {send_id} did not reach {expected}")
 
-    def count(self, mailbox):
+    def sending_usage(self, mailbox):
         with closing(sqlite3.connect(self.directory / "smtp.db")) as db:
             row = db.execute(
-                "SELECT recipients FROM hosted_sending_usage JOIN users ON users.id=user_id WHERE username=?",
+                "SELECT utc_day, recipients FROM hosted_sending_usage JOIN users ON users.id=user_id WHERE username=?",
                 (mailbox,),
             ).fetchone()
-            return row[0] if row else 0
+            return row if row else (None, 0)
+
+    def count(self, mailbox):
+        return self.sending_usage(mailbox)[1]
 
 
 def smtp_message(client, sender, recipients, subject="Boundary", body=None, chunked=False):
@@ -1109,10 +1112,26 @@ def check_suspended_retry(test, previous_retry):
     raise AssertionError("SMTP retry worker did not hold the suspended sender's delivery")
 
 
+def utc_day():
+    return int(time.time()) // 86400
+
+
+def run_disposable_quota_check(check):
+    """Recreate a same-day fixture once if its assertions span a UTC rollover."""
+    started_on = utc_day()
+    try:
+        check()
+    except AssertionError:
+        if utc_day() <= started_on:
+            raise
+        print("UTC midnight passed during quota verification. Repeating with a fresh fixture.", flush=True)
+        check()
+
+
 def check_previous_day_usage(test, sender, sink):
     # Model a daemon carrying yesterday's exhausted allowance into today.
-    today = int(time.time()) // 86400
-    with sqlite3.connect(test.directory / "smtp.db") as db:
+    today = utc_day()
+    with closing(sqlite3.connect(test.directory / "smtp.db")) as db, db:
         changed = db.execute(
             "UPDATE hosted_sending_usage SET utc_day=? WHERE user_id=(SELECT id FROM users WHERE username=?)",
             (today - 1, sender),
@@ -1123,11 +1142,7 @@ def check_previous_day_usage(test, sender, sink):
     assert test.count(sender) == 1
     assert ews_codes(test.ews(sender, create_ews_item("SendOnly", to=[sink]))) == ["NoError"]
     assert test.count(sender) == 2
-    with sqlite3.connect(test.directory / "smtp.db") as db:
-        row = db.execute(
-            "SELECT utc_day FROM hosted_sending_usage JOIN users ON users.id=user_id WHERE username=?", (sender,),
-        ).fetchone()
-        assert row == (today,)
+    assert test.sending_usage(sender) == (today, 2)
 
     status, result = test.api(test.login(sender), "compose", {"to": [sink], "text": "Over the new allowance"})
     assert status == 429 and result["error"] == "sending_limit", (status, result)
@@ -1260,20 +1275,15 @@ def check_shared_storage_race(test):
     print(f"Verified one winner for the final storage across five simultaneous writers ({winners[0]}).")
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("binary", type=Path)
-    parser.add_argument("--staging", action="store_true",
-                        help="Use the staging profile, STARTTLS, implicit TLS, and HTTPS with a temporary certificate.")
-    args = parser.parse_args()
+def verify(binary, staging):
     with tempfile.TemporaryDirectory(prefix="mail-hosted-limits-") as directory:
-        test = Fixture(args.binary.resolve(), Path(directory), staging=args.staging)
+        test = Fixture(binary, Path(directory), staging=staging)
         with test.daemon():
-            if args.staging:
+            if staging:
                 test.check_staging_smtp()
                 print("Staging profile with certificate-verified TLS on SMTP, webmail, IMAP, EWS, and ActiveSync.")
             sink = test.provision("sink")
-            if args.staging:
+            if staging:
                 check_implicit_tls(test, sink)
             sender = test.provision("storage-sender")
             check_storage(test, sink, test.login(sender))
@@ -1291,24 +1301,40 @@ def main():
             check_shared_mailbox(test, sink)
             check_shared_storage_race(test)
             previous_retry = stage_suspended_retry(test)
+            exhausted = (sender, ews_sender, eas_sender, smart_sender)
+            usage = {mailbox: test.sending_usage(mailbox) for mailbox in exhausted}
+            assert (usage[sender][1], usage[eas_sender][1], usage[smart_sender][1]) == (2, 4, 7), usage
             print("Verified the shared recipient allowance, duplicate recipients, concurrent dispatch, suspension and Sent copy failure.")
         with test.daemon():
             check_suspended_retry(test, previous_retry)
+            assert {mailbox: test.sending_usage(mailbox) for mailbox in exhausted} == usage
+            assert eas_result(test.eas(eas_sender, eas_request)) == 118
+            assert eas_result(test.eas(smart_sender, smart_request, command="SmartForward", device=smart_device), "SmartForward") == 118
+            assert {mailbox: test.sending_usage(mailbox) for mailbox in exhausted} == usage
+            today = utc_day()
+            assert all(day == today for day, _ in usage.values()), (today, usage)
             expect_smtp(test.deliver(sink, identity=sender), 452, "4.7.0")
             status, result = test.api(test.login(sender), "compose", {"to": [sink], "text": "After restart"})
             assert status == 429 and result["error"] == "sending_limit", (status, result)
             assert test.count(sender) == 2
             assert ews_codes(test.ews(ews_sender, create_ews_item("SendOnly", to=[sink]))) == ["ErrorSubmissionQuotaExceeded"]
-            assert eas_result(test.eas(eas_sender, eas_request)) == 118
             assert eas_result(test.eas(eas_sender, eas_send(eas_mime(eas_sender, sink), "afterrestart"))) == 115
-            assert test.count(eas_sender) == 4
-            assert eas_result(test.eas(smart_sender, smart_request, command="SmartForward", device=smart_device), "SmartForward") == 118
-            assert test.count(smart_sender) == 7
+            assert {mailbox: test.sending_usage(mailbox) for mailbox in exhausted} == usage
             print("Verified allowance persistence, the ActiveSync receipt and suspension of a persisted SMTP retry after daemon restart.")
-            if args.staging:
+            if staging:
                 check_previous_day_usage(test, sender, sink)
-    check_eas_tls(args.binary.resolve())
+    check_eas_tls(binary)
     print("Verified SendMail and SmartReply across TLS records, and SmartForward and shared quotas over HTTPS.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", type=Path)
+    parser.add_argument("--staging", action="store_true",
+                        help="Use the staging profile, STARTTLS, implicit TLS, and HTTPS with a temporary certificate.")
+    args = parser.parse_args()
+    binary = args.binary.resolve(strict=True)
+    run_disposable_quota_check(lambda: verify(binary, args.staging))
 
 
 if __name__ == "__main__":
