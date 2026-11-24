@@ -53,7 +53,7 @@ def verify(test):
         now = int(time.time())
         with db:
             uid = db.execute("SELECT id FROM users WHERE username=?", (owner,)).fetchone()[0]
-            db.execute("INSERT INTO accepted_mail VALUES (?,?,?,?,?,?,?,?,?)",
+            db.execute("INSERT INTO accepted_mail(id,accepted_at,accepted_ms,envelope_from,author,verified_author,remote_addr,mime,complete) VALUES (?,?,?,?,?,?,?,?,?)",
                        ("pending-retirement", now, now * 1000, "origin@example.test", "origin@example.test", 0, "127.0.0.1", b"fixture", 0))
             db.execute("INSERT INTO accepted_mail_targets(delivery_id,ordinal,recipient,mailbox,mailbox_id,folder,outcome,queued_bytes,retry_at,is_primary) VALUES (?,?,?,?,?,?,?,?,?,?)",
                        ("pending-retirement", 0, owner, owner, uid, "new", "pending", 7, now + 3600, 1))

@@ -53,7 +53,7 @@ def verify(test):
                    (ids[owner], "route@example.test", "next@example.test", now + 3600))
         db.execute("INSERT INTO mailbox_forwarding(user_id,address,destination_id) VALUES (?,?,?)",
                    (ids[foreign], owner, ids[owner]))
-        db.execute("INSERT INTO accepted_mail VALUES (?,?,?,?,?,?,?,?,?)",
+        db.execute("INSERT INTO accepted_mail(id,accepted_at,accepted_ms,envelope_from,author,verified_author,remote_addr,mime,complete) VALUES (?,?,?,?,?,?,?,?,?)",
                    ("pending-fixture", now, now * 1000, "testing@example.test", "testing@example.test", 0, "127.0.0.1", b"fixture body", 0))
         db.execute("INSERT INTO accepted_mail_targets(delivery_id,ordinal,recipient,mailbox,mailbox_id,folder,outcome,queued_bytes,retry_at,is_primary) VALUES (?,?,?,?,?,?,?,?,?,?)",
                    ("pending-fixture", 0, owner, owner, ids[owner], "new", "pending", 12, now + 3600, 1))
