@@ -633,20 +633,23 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-jump input::-webkit-calendar-picker-indicator { display: none; }
 .calendar-jump-picker {
   position: absolute;
-  inset-block: -1px;
-  inset-inline-end: -1px;
+  inset-block: 0;
+  inset-inline-end: 0;
   display: grid;
   place-items: center end;
   inline-size: var(--control-height);
   padding-block: 0;
   padding-inline: 0 var(--control-inline-padding);
-  border: 1px solid transparent;
-  border-start-end-radius: var(--control-radius);
-  border-end-end-radius: var(--control-radius);
-  /* Cover the native affordance in engines without a picker pseudo-element. */
-  background: inherit;
-  background-clip: padding-box;
+  appearance: none;
+  border: 0;
+  border-start-end-radius: calc(var(--control-radius) - 1px);
+  border-end-end-radius: calc(var(--control-radius) - 1px);
+  background: transparent;
   color: var(--muted);
+}
+@supports not selector(input::-webkit-calendar-picker-indicator) {
+  /* Cover the native affordance in engines without a picker pseudo-element. */
+  .calendar-jump-picker { background-color: inherit; }
 }
 .calendar-jump-picker:hover { color: var(--accent); }
 .calendar-jump-picker:focus-visible { outline-offset: -2px; }
@@ -943,11 +946,11 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-folders { padding: 17px 12px 11px; gap: 16px; background: var(--sidebar); }
 .wm-folders .wm-folders-toggle { display: none; }
 .wm-brand { display: flex; align-items: center; padding: 2px 8px; gap: 9px; color: var(--text); font-size: 19px; font-weight: 700; letter-spacing: -.04em; }
-.wm-compose-btn { display: inline-flex; justify-content: center; align-items: center; gap: 7px; margin-inline: 4px; min-height: 38px; padding: 8px 12px; border-radius: 9px; box-shadow: var(--shadow); }
+.wm-compose-btn { display: inline-flex; justify-content: flex-start; align-items: center; gap: 9px; min-block-size: var(--control-height); padding: 0 12px; font-size: var(--control-font-size); }
 .wm-navigation { display: flex; flex-direction: column; flex: 1; gap: 8px; min-height: 0; }
 .wm-folder-list { gap: 11px; scrollbar-width: thin; }
 .wm-nav-secondary { display: grid; align-content: start; gap: 11px; min-width: 0; }
-.wm-nav-group { display: grid; gap: 2px; }
+.wm-nav-group { display: grid; grid-template-columns: minmax(0, 1fr); gap: 2px; }
 .wm-nav-label { margin: 3px 10px 4px; font-size: 11px; font-weight: 650; color: var(--muted); }
 .wm-folder { justify-content: flex-start; min-height: 29px; padding: 4px 9px; gap: 9px; font-size: 13px; color: var(--text); text-decoration: none; border-radius: 7px; }
 .wm-folder .mail-icon { width: 16px; height: 16px; color: var(--accent); }
@@ -1313,13 +1316,6 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-brand { letter-spacing: -.028em; font-size: 19px; }
 .wm-brand .mail-app-mark { width: 32px; height: 32px; border-radius: 9px; }
 .wm-brand .mail-app-mark .mail-icon { width: 20px; height: 20px; }
-.wm-compose-btn {
-  justify-content: flex-start;
-  gap: 9px;
-  min-height: 39px;
-  padding-inline: 12px;
-  font-size: 13px;
-}
 .wm-compose-btn > .mail-icon { width: 18px; height: 18px; }
 .wm-folder-list, .wm-nav-secondary { gap: 11px; }
 .wm-nav-group { gap: 1px; }
@@ -1502,7 +1498,6 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 
 @media (min-width: 861px) {
   .wm-workspace { overflow: hidden; background: var(--panel); }
-  .wm-compose-btn { margin-inline: 0; }
 }
 @media (min-width: 1081px) {
   .wm { grid-template-columns: 218px minmax(0, 1fr); }
@@ -1516,7 +1511,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-folders .wm-folders-toggle { display: inline-flex; min-height: 44px; padding-inline: 7px; border-color: transparent; background: transparent; }
   .wm-folders-toggle[aria-expanded=true] { background: var(--selected); color: var(--accent); }
   .wm-folders-toggle[aria-expanded=true] .wm-mailboxes-indicator { transform: rotate(180deg); }
-  .wm-compose-btn { justify-content: center; margin: 0; min-height: 44px; padding-inline: 9px; }
+  .wm-compose-btn { justify-content: center; padding-inline: 9px; }
   .wm-navigation { display: none; grid-column: 1 / -1; }
   .wm-folders--expanded .wm-navigation { display: flex; }
   .wm-folder-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; align-items: start; max-height: 48dvh; overflow: auto; overscroll-behavior: contain; }

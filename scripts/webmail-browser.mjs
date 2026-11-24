@@ -201,8 +201,9 @@ async function verifyCalendarPeriod(page, label, height) {
     'The native date editor fills the inside of its single outline')
   const datePicker = button(group, 'Open date picker')
   const pickerBox = await datePicker.boundingBox()
-  assert(Math.abs(pickerBox.width - height) < 0.5 && Math.abs(pickerBox.height - height) < 0.5,
-    `The date picker should have a ${height}px square hit area, got ${pickerBox.width} × ${pickerBox.height}px at ${width}px`)
+  assert(Math.abs(pickerBox.width - height) < 0.5 && Math.abs(pickerBox.height - height + 2) < 0.5
+    && Math.abs(pickerBox.y - date.top - 1) < 0.5 && Math.abs(pickerBox.x + pickerBox.width - date.right + 1) < 0.5,
+    'The date picker hit area reaches the inside of the field without overlapping its painted outline')
   const pickerIcon = await datePicker.locator('.mail-icon').boundingBox()
   assert.equal(pickerIcon.width, 16)
   assert(Math.abs(pickerIcon.y + pickerIcon.height / 2 - (date.top + date.bottom) / 2) < 0.5,
@@ -275,6 +276,16 @@ async function verifyCalendarPeriod(page, label, height) {
   await verifyPaintedControlBorders(toolbar,
     `.calendar-view-modes button, .calendar-view-picker select, ${periodControls}`,
     [...views, ...controls], `${label}-calendar-toolbar`)
+  if (label === 'desktop-light') {
+    const periodSelector = '.calendar-period-buttons button, .calendar-jump'
+    await datePicker.hover()
+    await verifyPaintedControlBorders(toolbar, periodSelector, row, 'desktop-calendar-date-hover')
+    await dateInput.focus()
+    assert.equal(await dateInput.evaluate(input => getComputedStyle(input.parentElement).outlineWidth), '2px')
+    await verifyPaintedControlBorders(toolbar, periodSelector, row, 'desktop-calendar-date-focus')
+    await dateInput.blur()
+    await toolbar.hover({ position: { x: 2, y: 2 } })
+  }
   await verifyCalendarActions(page, height, label)
   const sourceRow = page.locator('.calendar-workspace > .calendar-controls').first()
   const sourceControls = '.calendar-sources button, .mail-search-field, .calendar-source-tools > button'
@@ -307,16 +318,19 @@ async function verifyPaintedControlBorders(container, selector, controls, name, 
     return Array.from(group.querySelectorAll(selector)).flatMap((control) => {
       const { left, top, right, bottom, width, height } = control.getBoundingClientRect()
       if (height === 0) return []
-      const x = Math.floor((left + width / 2 - box.left) * pixels)
-      const y = Math.floor((top + height / 2 - box.top) * pixels)
+      const style = getComputedStyle(control)
+      const inset = Number.parseFloat(style.borderTopLeftRadius) + 2
+      const xAt = fraction => Math.floor((left + inset + (width - 2 * inset) * fraction - box.left) * pixels)
+      const yAt = fraction => Math.floor((top + inset + (height - 2 * inset) * fraction - box.top) * pixels)
+      const fractions = [0, .25, .5, .75, 1]
       return [{
-        textArea: { x: Math.ceil((left - box.left + 8) * pixels), y: y - 8 * pixels, width: Math.floor((width - 44) * pixels), height: 16 * pixels },
-        edges: [
-          { side: 'left', x: Math.floor((left - box.left) * pixels), y, dx: 1, dy: 0 },
-          { side: 'right', x: Math.ceil((right - box.left) * pixels) - 1, y, dx: 1, dy: 0 },
-          { side: 'top', x, y: Math.floor((top - box.top) * pixels), dx: 0, dy: 1 },
-          { side: 'bottom', x, y: Math.ceil((bottom - box.top) * pixels) - 1, dx: 0, dy: 1 },
-        ],
+        textArea: { x: Math.ceil((left - box.left + 8) * pixels), y: yAt(.5) - 8 * pixels, width: Math.floor((width - 44) * pixels), height: 16 * pixels },
+        edges: fractions.flatMap(fraction => [
+          { side: 'left', x: Math.floor((left - box.left) * pixels), y: yAt(fraction), dx: 1, dy: 0 },
+          { side: 'right', x: Math.ceil((right - box.left) * pixels) - 1, y: yAt(fraction), dx: 1, dy: 0 },
+          { side: 'top', x: xAt(fraction), y: Math.floor((top - box.top) * pixels), dx: 0, dy: 1 },
+          { side: 'bottom', x: xAt(fraction), y: Math.ceil((bottom - box.top) * pixels) - 1, dx: 0, dy: 1 },
+        ]),
       }]
     })
   }, selector)
@@ -675,7 +689,28 @@ async function signIn({ phone = false, account = owner, initialSubject = handoff
   const activeFolder = folders(page).locator('[aria-current=page]')
   assert.match(await activeFolder.innerText(), /^Inbox/)
   assert.match(await activeFolder.locator('.mail-icon').evaluate(node => getComputedStyle(node).maskImage), /data:image/)
-  assert.match(await button(page, 'Compose').locator('.mail-icon').evaluate(node => getComputedStyle(node).maskImage), /data:image/)
+  if (account === owner) {
+    const longLabel = button(folders(page), longFolder).locator('.wm-folder-name')
+    const { labelOverflows, textOverflow, rowFits } = await longLabel.evaluate((label) => {
+      const row = label.closest('.wm-folder')
+      const group = row.closest('.wm-nav-group')
+      return {
+        labelOverflows: label.scrollWidth > label.clientWidth,
+        textOverflow: getComputedStyle(label).textOverflow,
+        rowFits: row.getBoundingClientRect().right <= group.getBoundingClientRect().right + 0.5,
+      }
+    })
+    assert(rowFits && labelOverflows && textOverflow === 'ellipsis',
+      'Long folder names use an ellipsis within the sidebar so the full row outline stays visible')
+  }
+  const compose = button(page, 'Compose')
+  assert.match(await compose.locator('.mail-icon').evaluate(node => getComputedStyle(node).maskImage), /data:image/)
+  assert.equal((await compose.boundingBox()).height, phone ? 44 : 36)
+  assert.deepEqual(await compose.evaluate((node) => {
+    const style = getComputedStyle(node)
+    const field = getComputedStyle(document.querySelector('.mail-search-field'))
+    return [style.border === field.border, style.borderRadius === field.borderRadius]
+  }), [true, true], 'The Compose button and Mail search field use the same stroke and corners')
   assert.match(await page.evaluate(() => getComputedStyle(document.body).fontFamily), /-apple-system/)
   if (phone) await drawer(page).click()
   return page
