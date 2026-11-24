@@ -1171,6 +1171,7 @@ async function phoneJourney(page) {
   verifyControlGaps([calendar, team], 12)
   verifyControlGaps([role, submit], 12)
   await verifySelectedOptionFits(calendarPicker)
+  await verifySelectedOptionFits(shareForm.getByRole('combobox', { name: /^Team\b/ }), 20)
   await heading(page, 'Share a calendar').click()
   await verifyPaintedControlBorders(shareForm, 'select, input, button', [calendar, team, teammate, role, submit], 'phone-calendar-sharing-dark')
   await page.setViewportSize({ width: 320, height: 844 })

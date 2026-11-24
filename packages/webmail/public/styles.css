@@ -1718,10 +1718,10 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-next-unread-label { display: none; }
 }
 @media (370px < width <= 490px) {
-  .calendar-share-form { grid-template-columns: repeat(6, minmax(0, 1fr)); }
-  .calendar-share-form > :first-child { grid-column: span 4; }
-  .calendar-share-form > :nth-child(2) { grid-column: span 2; }
-  .calendar-share-form > :nth-last-child(-n+2) { grid-column: span 3; }
+  .calendar-share-form { grid-template-columns: repeat(12, minmax(0, 1fr)); }
+  .calendar-share-form > :first-child { grid-column: span 7; }
+  .calendar-share-form > :nth-child(2) { grid-column: span 5; }
+  .calendar-share-form > :nth-last-child(-n+2) { grid-column: span 6; }
 }
 @media (max-width: 490px) {
   dialog.wm-modal:has(> .wm-composer) { align-items: flex-end; padding: 0; }

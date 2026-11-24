@@ -53,13 +53,20 @@ try {
     assert(await account.evaluate(dialog => dialog.scrollWidth <= dialog.clientWidth + 1))
     const controls = await passwords.locator('form').evaluate(form => Array.from(form.querySelectorAll('input, select, button')).map((control) => {
       const style = getComputedStyle(control)
-      return { height: control.getBoundingClientRect().height, color: style.borderTopColor, radius: style.borderTopLeftRadius }
+      const token = control.matches('button[type=submit]:enabled') ? '--primary-button-border' : '--control-border'
+      const color = style.getPropertyValue(token).trim().slice(1).match(/../g)
+      const channels = color.map(channel => Number.parseInt(channel, 16)).join(', ')
+      return {
+        height: control.getBoundingClientRect().height,
+        radius: style.borderRadius,
+        borderMatches: style.border === `1px solid rgb(${channels})`,
+      }
     }))
     assert.equal(controls.length, 4)
     for (const control of controls) {
       assert(Math.abs(control.height - (phone ? 44 : 36)) < 0.05)
-      assert.equal(control.color, controls[0].color)
-      assert.equal(control.radius, controls[0].radius)
+      assert.equal(control.radius, '8px')
+      assert(control.borderMatches, 'Fields use a neutral outline and the enabled Create app password action uses a blue outline')
     }
     await passwords.screenshot({ path: join(output, `app-passwords-${name}-${width}.png`), animations: 'disabled' })
     const label = phone ? 'Phone calendar' : 'Office client'
