@@ -596,6 +596,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-header { align-items: flex-start; margin: 1.25rem 0; }
 /* Keep the action row anchored as calendar-specific controls appear. */
 .calendar-header > .calendar-choices { flex: 0 1 55rem; min-inline-size: 0; }
+.calendar-secondary-actions { display: contents; }
+.calendar-header :is(.calendar-actions-toggle, .calendar-header-create-phone), .calendar-free-time-short, .calendar-manage-short { display: none; }
 .calendar-header h1 { margin: 0; font-size: clamp(1.8rem, 4vw, 2.5rem); letter-spacing: -.04em; }
 .calendar-primary, .wm-snapshot-primary { background: var(--primary); color: var(--on-primary); }
 :is(.calendar-primary, .wm-snapshot-primary):hover:not(:disabled) { background: var(--primary-hover); }
@@ -1675,9 +1677,24 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .calendar-nav { flex-wrap: nowrap; min-height: 36px; gap: 10px; }
   .calendar-nav a { flex-shrink: 0; }
   .calendar-nav > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .calendar-header { margin-block: 12px; }
-  .calendar-header .calendar-choices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
-  .calendar-header .calendar-choices .wm-action { justify-content: center; padding: 4px 7px; white-space: normal; text-align: center; }
+  .calendar-header { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px; margin-block: 10px; }
+  .calendar-heading { grid-column: 1; grid-row: 1; gap: 7px; }
+  .calendar-header > .calendar-header-actions { display: contents; }
+  .calendar-header :is(.calendar-actions-toggle, .calendar-header-create-phone) { display: inline-flex; grid-row: 1; padding-inline: 8px; }
+  .calendar-header-create-phone { grid-column: 2; }
+  .calendar-actions-toggle { grid-column: 3; }
+  .calendar-actions-toggle[aria-expanded=true] .mail-icon { transform: rotate(180deg); }
+  .calendar-header .calendar-header-create-desktop, .calendar-secondary-actions { display: none; }
+  .calendar-secondary-actions--open { display: grid; grid-column: 1 / -1; grid-row: 2; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+  .calendar-secondary-actions .wm-action { justify-content: start; padding: 4px 8px; text-align: start; white-space: normal; }
+  .calendar-manage-label { display: none; }
+  .calendar-manage-short { display: inline; }
+  .calendar-sources .wm-action { padding-inline: 8px; }
+  .calendar-source-tools .calendar-search, .calendar-search .mail-search-field { min-inline-size: 0; }
+  .calendar-search .mail-search-field { flex: 1; }
+  .calendar-free-time-toggle { flex: 0 0 auto; justify-content: center; }
+  .calendar-free-time-short { display: inline; }
+  .calendar-free-time-label { display: none; }
   .calendar-header .mail-app-mark { width: 31px; height: 31px; }
   .calendar-header .mail-app-mark .mail-icon { width: 21px; height: 21px; }
   .calendar-controls { margin-block: 6px; }
@@ -1702,7 +1719,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   :is(.calendar-view-picker, .calendar-zone) select { width: 100%; max-width: none; }
 }
 @media (max-width: 360px) {
-  .calendar-source-tools > .wm-action { flex: 1 0 auto; justify-content: center; }
+  .calendar-header .calendar-header-create-phone { justify-content: center; inline-size: var(--control-height); padding-inline: 0; }
+  .calendar-phone-create-label, .calendar-search .mail-search-field > .mail-icon { display: none; }
   .wm-composer-foot { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .wm-composer-foot > :is(.wm-send-delay, .wm-send-schedule) { grid-column: 1 / -1; }
   .wm-composer-foot .wm-send-delay { justify-content: start; }

@@ -173,9 +173,10 @@ async function journey(browser, width, colorScheme) {
 
     await page.goto(`${url}/calendar?day=${day}`)
     await page.getByRole('region', { name: 'Calendar workspace' }).waitFor()
-    const newEvent = button(page, 'New event')
+    const newEvent = button(page, phone ? 'Add event' : 'New event')
     await newEvent.waitFor()
     await scan('calendar')
+    if (phone) await button(page, 'Calendar actions').click()
     await button(page, 'Manage calendars').click()
     const sharing = page.getByRole('region', { name: 'Manage calendars' })
     await sharing.getByRole('combobox', { name: 'Calendar to share' }).waitFor()

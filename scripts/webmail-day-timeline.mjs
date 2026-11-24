@@ -40,6 +40,100 @@ async function capture(page, name) {
   await page.screenshot({ path: join(output, `${name}.png`), animations: 'disabled' })
 }
 
+async function phoneSchedule(page) {
+  const header = page.locator('.calendar-header')
+  const actions = button(header, 'Calendar actions')
+  const manage = button(header, 'Manage calendars')
+  const dayCommand = button(page, 'Add event')
+  const newEvent = button(header, 'New event')
+  const workspace = page.getByRole('region', { name: 'Calendar workspace', exact: true })
+  const allDay = timeline(page).getByRole('region', { name: 'All-day events' })
+  const firstWeekDay = page.locator('.calendar-board-week .calendar-day').first()
+  const fullyOnScreen = control => control.evaluate((node) => {
+    const box = node.getBoundingClientRect()
+    return scrollY === 0 && box.y >= 0 && box.bottom <= innerHeight
+  })
+
+  for (const width of [320, 390]) {
+    await page.setViewportSize({ width, height: 844 })
+    for (const scheme of ['light', 'dark']) {
+      await page.emulateMedia({ colorScheme: scheme })
+      await page.goto(`${url}/calendar?day=${day}`)
+      await workspace.and(page.locator('[aria-busy="false"]')).waitFor()
+      await allDay.waitFor()
+      assert(await fullyOnScreen(allDay), `All-day events are on screen initially at ${width}px`)
+      assert(await fullyOnScreen(dayCommand))
+      assert.equal(await newEvent.count(), 0, 'The timeline has one visible event creation action')
+      assert.equal(await actions.getAttribute('aria-expanded'), 'false')
+      assert.equal(await manage.count(), 0)
+
+      const tools = page.locator('.calendar-source-tools')
+      const [search, freeTime, menu, add] = await Promise.all([
+        tools.locator('.mail-search-field').boundingBox(),
+        button(tools, 'Find free time').boundingBox(),
+        actions.boundingBox(),
+        dayCommand.boundingBox(),
+      ])
+      assert([search, freeTime, menu, add].every(control => control.height === 44))
+      assert(Math.abs(search.y - freeTime.y) < .5)
+      assert(Math.abs(freeTime.x - search.x - search.width - 8) < .5)
+      assert(await tools.getByRole('searchbox', { name: 'Search events' }).evaluate((input) => {
+        const style = getComputedStyle(input)
+        const canvas = document.createElement('canvas').getContext('2d')
+        canvas.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`
+        return canvas.measureText(input.placeholder).width <= input.clientWidth
+      }), 'The full search placeholder fits')
+      assert.deepEqual(await header.locator('.calendar-actions-toggle').evaluateAll(nodes =>
+        nodes.map(node => getComputedStyle(node).borderColor)), [scheme === 'dark' ? 'rgb(119, 125, 137)' : 'rgb(130, 136, 149)'])
+      await capture(page, `phone-${width}-day-${scheme}-first-viewport`)
+
+      const view = workspace.getByRole('combobox', { name: 'Calendar view', exact: true })
+      if (await view.isVisible()) await view.selectOption({ label: 'Week' })
+      else await button(workspace, 'Week').tap()
+      await firstWeekDay.waitFor()
+      await workspace.and(page.locator('[aria-busy="false"]')).waitFor()
+      assert(await fullyOnScreen(firstWeekDay), `The first weekday is on screen initially at ${width}px`)
+      assert(await fullyOnScreen(newEvent))
+      const [title, create] = await Promise.all([
+        header.getByRole('heading', { name: 'Calendar', exact: true }).boundingBox(),
+        newEvent.boundingBox(),
+      ])
+      assert(title.x + title.width <= create.x - 6, 'The new event control leaves room for the title')
+      assert.equal(await dayCommand.count(), 0)
+      await capture(page, `phone-${width}-week-${scheme}-first-viewport`)
+    }
+  }
+
+  await page.setViewportSize({ width: 320, height: 844 })
+  await page.goto(`${url}/calendar?day=${day}`)
+  await workspace.and(page.locator('[aria-busy="false"]')).waitFor()
+  await actions.press('Enter')
+  assert.equal(await actions.getAttribute('aria-expanded'), 'true')
+  await page.keyboard.press('Tab')
+  assert(await manage.evaluate(node => node.matches(':focus-visible')))
+  assert.equal(await manage.evaluate(node => getComputedStyle(node).outlineWidth), '2px')
+  await capture(page, 'phone-320-calendar-actions-dark')
+  await page.keyboard.press('Escape')
+  assert.equal(await actions.getAttribute('aria-expanded'), 'false')
+  await actions.and(page.locator(':focus')).waitFor()
+
+  await actions.tap()
+  await manage.tap()
+  const settings = page.getByRole('region', { name: 'Manage calendars' })
+  await settings.getByRole('combobox', { name: 'Calendar to share' }).waitFor()
+  await manage.tap()
+  await settings.waitFor({ state: 'hidden' })
+  await actions.tap()
+
+  const search = page.getByRole('searchbox', { name: 'Search events' })
+  await search.fill('Design review')
+  await search.press('Enter')
+  await page.getByRole('region', { name: /Search results/ }).getByRole('button', { name: /Design review/ }).waitFor()
+  await button(page, 'Clear').tap()
+  await allDay.waitFor()
+  await page.evaluate(() => scrollTo(0, 0))
+}
+
 async function eventGeometry(event) {
   return event.evaluate((node) => {
     const box = node.getBoundingClientRect()
@@ -237,6 +331,7 @@ async function main() {
     await desktop.context().close()
 
     const phone = await openCalendar(browser, owner, true)
+    await phoneSchedule(phone)
     await renderDay(phone, true)
     await button(phone, 'Studio schedule').tap()
     await createAt(phone, '2026-11-24T14:15Z', 'Touch timeline event', '2026-11-24T14:15', '2026-11-24T15:15', true)

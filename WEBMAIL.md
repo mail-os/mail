@@ -189,6 +189,8 @@ for the released mailbox check, candidate walkthrough, and follow-up issues.
   unmarked date to open its day view. With a date focused, the arrow keys move
   between days and weeks. Search matches titles, locations, and descriptions
   across dates. Use **Manage calendars** to create a calendar or change its color.
+  On a narrow screen, open **Actions** for calendar management, import and
+  download, tasks, and personal tools available to your account.
 - **Day** opens a timeline in the display time zone. All-day events have their
   own row, overlapping timed events appear side by side, and **List** opens a
   chronological view. Choose a **Start time** and **Add event** to open the

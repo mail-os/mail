@@ -106,7 +106,7 @@ async function verifySelectedOptionFits(control, clearance = 0) {
     `At ${viewport}px, the picker has ${available}px for “${label}”, which needs ${used}px plus ${clearance}px clearance`)
 }
 
-async function verifyControlRow(container, selector, height, sameRow = true) {
+async function verifyControlRow(container, selector, height, sameRow = true, minimumCount = 2) {
   const controls = await container.evaluate((group, selector) => Array.from(group.querySelectorAll(selector), (node) => {
     const style = getComputedStyle(node)
     const box = node.getBoundingClientRect()
@@ -128,8 +128,8 @@ async function verifyControlRow(container, selector, height, sameRow = true) {
       radius: style.borderRadius,
       fontSize: style.fontSize,
     }
-  }), selector)
-  assert(controls.length > 1, 'A control group must have multiple visible controls')
+  }).filter(control => control.height > 0), selector)
+  assert(controls.length >= minimumCount, `Expected at least ${minimumCount} visible controls`)
   for (const control of controls) {
     assert(Math.abs(control.height - height) < 0.5, `${control.name} should be ${height}px tall, got ${control.height}px`)
     assert.equal(control.radius, '8px', `${control.name} should use the shared control radius`)
@@ -307,22 +307,42 @@ async function verifyCalendarPeriod(page, label, height) {
   const sources = await verifyControlRow(sourceRow, sourceControls, height, height === 36)
   const sourceName = button(sourceRow, calendarLabel).locator('span:last-child')
   assert(await sourceName.evaluate(node => node.scrollWidth <= node.clientWidth), 'The calendar color dot leaves room for the full calendar name')
-  if (width <= 320) {
+  if (width <= 490) {
     const [search, availability] = sources.slice(-2)
-    assert(Math.abs(search.left - availability.left) < 0.5 && Math.abs(search.right - availability.right) < 0.5,
-      'Search and availability reach the same edges when stacked')
-    assert(Math.abs(availability.top - search.bottom - 8) < 0.5, 'Calendar tools use an eight-pixel row gap')
+    assert(Math.abs(search.top - availability.top) < 0.5, 'Search and availability share a row')
+    verifyControlGaps([search, availability], 8)
   }
   await verifyPaintedControlBorders(sourceRow, sourceControls, sources, `${label}-calendar-sources`)
 }
 
+async function revealCalendarActions(page) {
+  if (page.viewportSize().width > 490) return
+  const disclosure = button(page, 'Calendar actions')
+  await disclosure.waitFor()
+  if (await disclosure.getAttribute('aria-expanded') === 'false') await disclosure.click()
+}
+
 async function verifyCalendarActions(page, height, label) {
+  if (page.viewportSize().width <= 490) {
+    const header = page.locator('.calendar-header')
+    const disclosure = button(header, 'Calendar actions')
+    const selector = '.calendar-actions-toggle, .calendar-header-create-phone'
+    const controls = await verifyControlRow(header, selector, height, true, 1)
+    assert(controls.length >= 1 && controls.length <= 2)
+    await verifyPaintedControlBorders(header, selector, controls, `${label}-calendar-actions`)
+    const wasOpen = await disclosure.getAttribute('aria-expanded') === 'true'
+    await revealCalendarActions(page)
+    const secondary = header.locator('.calendar-secondary-actions')
+    const choices = await verifyControlRow(secondary, '.wm-action', height, false)
+    assert(choices.length >= 4)
+    for (let index = 0; index < choices.length; index += 2) verifyControlGaps(choices.slice(index, index + 2), 6)
+    await verifyPaintedControlBorders(secondary, '.wm-action', choices, `${label}-calendar-secondary-actions`)
+    if (!wasOpen) await disclosure.click()
+    return
+  }
   const actions = page.locator('.calendar-header .calendar-choices')
   const controls = await verifyControlRow(actions, '.wm-action', height, height === 36)
   assert.equal(controls.length, 6)
-  if (page.viewportSize().width <= 490) {
-    for (let index = 0; index < controls.length; index += 2) verifyControlGaps(controls.slice(index, index + 2), 6)
-  }
   await verifyPaintedControlBorders(actions, '.wm-action', controls, `${label}-calendar-actions`)
 }
 
@@ -1103,6 +1123,7 @@ async function phoneJourney(page) {
   await button(page, /, 2 events$/).click()
   await page.getByText('Studio review', { exact: true }).waitFor()
   await screenshot(page, 'phone-calendar-day')
+  await revealCalendarActions(page)
   await button(page, 'Manage calendars').click()
   await verifyCalendarActions(page, 44, 'phone-active-dark')
   const sharing = page.getByRole('region', { name: 'Share a calendar' })
@@ -1210,6 +1231,7 @@ async function sharedJourney(page, phone = false) {
 async function calendarTasksJourney(page, phone = false) {
   if (phone) await page.setViewportSize({ width: 320, height: 844 })
   await page.goto(`${url}/calendar?day=${day}`)
+  await revealCalendarActions(page)
   const trigger = button(page, 'Tasks')
   await trigger.click()
   const panel = page.getByRole('region', { name: 'Personal tasks' })
@@ -1256,6 +1278,7 @@ async function calendarTasksJourney(page, phone = false) {
   await scheduled.click()
   await page.waitForURL(`${url}/calendar?day=2028-03-12`)
   await heading(page, 'Sunday, March 12, 2028').waitFor()
+  await revealCalendarActions(page)
   await trigger.click()
   await scheduled.waitFor()
   await button(task, `Complete ${name}`).click()
@@ -1400,6 +1423,7 @@ async function calendarToolsJourney(desktop, phone) {
   await phone.setViewportSize({ width: 320, height: 844 })
   await phone.goto(calendarUrl)
   await phone.locator('.calendar-workspace-compact').waitFor()
+  await revealCalendarActions(phone)
   await button(phone, 'Personal tools').click()
   const mobile = phone.getByRole('region', { name: 'Personal tools' })
   await button(mobile, 'Habits').click()
@@ -1461,14 +1485,16 @@ async function verifyCalendarActionsDuringLoading(page, phone = false) {
       ...lists.map(path => page.waitForRequest(path)),
       page.goto(url + '/calendar?day=' + day),
     ])
-    const actions = page.locator('.calendar-header .calendar-choices')
+    const actions = page.locator('.calendar-header')
     const labels = ['Manage calendars', 'Import .ics', 'Tasks', 'Personal tools']
+    if (phone) labels.push('Calendar actions')
     const tools = button(actions, 'Personal tools')
     const enabledTools = tools.and(page.locator(':enabled'))
     const panel = page.getByRole('region', { name: 'Personal tools' })
     const positions = () => Promise.all(labels.map(label => button(actions, label).boundingBox()))
-    await actions.waitFor()
-    assert(!await button(actions, 'New event').isVisible(), 'Event authority is still loading')
+    await revealCalendarActions(page)
+    await button(actions, 'Import .ics').waitFor()
+    assert(!await button(page, phone ? 'Add event' : 'New event').isVisible(), 'Event authority is still loading')
     assert(!await actions.getByRole('link', { name: 'Download .ics' }).isVisible())
     await enabledTools.press('Enter')
     await heading(panel, 'Personal tools').waitFor()
@@ -1483,7 +1509,7 @@ async function verifyCalendarActionsDuringLoading(page, phone = false) {
     const label = phone ? 'phone-dark' : 'desktop-light'
     await actions.screenshot({ path: join(output, `${label}-calendar-actions-loading.png`), animations: 'disabled' })
     release.resolve()
-    await button(actions, 'New event').waitFor()
+    await button(page, phone ? 'Add event' : 'New event').waitFor()
     await actions.getByRole('link', { name: 'Download .ics' }).waitFor()
     verifyControlPositions(before, await positions(), labels)
     assert(await tools.evaluate((control, { x, y }) => control.contains(document.elementFromPoint(x, y)), { x, y }),
@@ -2379,6 +2405,7 @@ async function calendarSharingJourney(captain) {
   await button(teammate, 'Sign in').click()
   await teammate.waitForURL(url + '/')
   await teammate.goto(calendarUrl)
+  await revealCalendarActions(teammate)
   await button(teammate, 'Tasks').click()
   const teammateTasks = teammate.getByRole('region', { name: 'Personal tasks' })
   await teammateTasks.getByText('No open tasks.').waitFor()
@@ -2424,7 +2451,7 @@ async function calendarSharingJourney(captain) {
   await editor.getByRole('textbox', { name: 'Title' }).fill('Studio review updated')
   await button(editor, 'Save event').click()
   await editor.waitFor({ state: 'hidden' })
-  await button(teammate, 'New event').click()
+  await button(teammate, 'Add event').click()
   const creation = teammate.getByRole('dialog', { name: 'New event' })
   assert.match(await creation.getByRole('combobox', { name: 'Calendar', exact: true }).locator('option:checked').innerText(), /^Design & Research/)
   await creation.getByRole('textbox', { name: 'Title' }).fill('Shared draft review')
@@ -2473,8 +2500,9 @@ async function calendarSharingJourney(captain) {
   await captain.emulateMedia({ colorScheme: 'light' })
   await editor.waitFor({ state: 'hidden' })
   const busy = teammate.getByRole('list', { name: 'Busy periods' })
-  await busy.waitFor()
-  assert.equal(await busy.getByRole('listitem').count(), 2)
+  const busyRows = busy.getByRole('listitem')
+  await busyRows.nth(1).waitFor()
+  assert.equal(await busyRows.count(), 2)
   assert.equal(await privateTitle.count(), 0)
   assert.equal(await button(teammate, /Studio review updated/).count(), 0)
   await teammate.setViewportSize({ width: 320, height: 844 })
@@ -2492,7 +2520,7 @@ async function calendarSharingJourney(captain) {
   assert.equal(await privateTitle.count(), 0)
   await fitsViewport(teammate)
   await busyDay.click()
-  await busy.waitFor()
+  await busyRows.nth(1).waitFor()
 
   const ownCalendar = await teammate.request.post(url + '/webmail/api/calendars', {
     headers: { Origin: url },
@@ -3184,6 +3212,7 @@ async function calendarImportControlsJourney(page, phone = false) {
   await verifyAppearance(page, phone ? 'dark' : 'light')
   await page.goto(`${url}/calendar?day=${day}`)
   await button(page, 'Today').waitFor()
+  await revealCalendarActions(page)
   await button(page, 'Import .ics').click()
   const panel = page.getByRole('region', { name: 'Import calendar' })
   const form = panel.locator('form')
