@@ -26,15 +26,17 @@ jobs:
     - name: Setup project dependencies with Pantry
       uses: pantry-pm/pantry/packages/action@v0.11.28
 
+    - name: Install workspace dependencies
+      working-directory: .
+      run: bun install --frozen-lockfile
+
     - name: Build
       run: zig build -Doptimize=ReleaseSafe
 
-    - name: Install browser test dependencies
+    - name: Install browser engines
       if: runner.os == 'Linux'
       working-directory: .
-      run: |
-        bun install --frozen-lockfile
-        bun run playwright install --with-deps chromium firefox webkit
+      run: bun run playwright install --with-deps chromium firefox webkit
 
     - name: Verify cloud deployment templates
       if: runner.os == 'Linux'
@@ -402,6 +404,10 @@ jobs:
         sudo cp usr/local/bin/kcov /usr/local/bin/
         rm -rf usr kcov-amd64.tar.gz
 
+    - name: Install workspace dependencies
+      working-directory: .
+      run: bun install --frozen-lockfile
+
     - name: Build with debug info
       run: zig build -Doptimize=Debug
 
@@ -440,6 +446,10 @@ jobs:
 
     - name: Setup project dependencies with Pantry
       uses: pantry-pm/pantry/packages/action@v0.11.28
+
+    - name: Install workspace dependencies
+      working-directory: .
+      run: bun install --frozen-lockfile
 
     - name: Build release
       run: zig build -Doptimize=ReleaseFast
