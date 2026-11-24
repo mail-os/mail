@@ -95,6 +95,12 @@ jobs:
       timeout-minutes: 7
       run: python3 scripts/test-webmail-day-timeline.py packages/zig/zig-out/bin/mail webmail-browser-screenshots/day-timeline
 
+    - name: Verify continuous reading in the browser
+      if: runner.os == 'Linux'
+      working-directory: .
+      timeout-minutes: 6
+      run: python3 scripts/test-webmail-reading-view.py packages/zig/zig-out/bin/mail webmail-browser-screenshots/reading-view
+
     - name: Upload browser screenshots
       if: ${{ !cancelled() && runner.os == 'Linux' }}
       uses: actions/upload-artifact@v4

@@ -4026,7 +4026,9 @@ fn handleMessageList(server: *WebmailHttpServer, conn: *webmail_tls.Stream, aren
     const last_page = @max(total / per_page + @intFromBool(total % per_page > 0), 1);
     const page = if (unread_queue) 1 else @min(requested_page, last_page);
     const start = if (unread_queue) nextUnreadIndex(rows, queue_cursor) else (page - 1) * per_page;
-    const end = @min(start + (if (unread_queue) @as(usize, 1) else per_page), total);
+    const unread_batch = unread_queue and std.mem.eql(u8, req.queryParam(arena, "batch") orelse "", "true");
+    const count = if (unread_batch) @min(per_page, 12) else if (unread_queue) 1 else per_page;
+    const end = @min(start + count, total);
     var matching: usize = 0;
     for (rows) |row| if (row.matches_filters) {
         matching += 1;

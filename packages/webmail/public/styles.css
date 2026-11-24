@@ -1068,6 +1068,41 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-action--accent:hover:not(:disabled), .wm-action--accent:focus-visible { background: var(--selected); }
 .wm-action--accent:disabled { background: var(--surface); }
 .wm-action--accent .mail-icon { color: inherit; }
+.wm-read-unread-together { align-self: start; margin: 0 12px 4px; }
+.wm--reading-together .wm-read-together-entry, .wm-reading-back-short { display: none; }
+.wm--reading-together .wm-read { scroll-padding-block: 72px; }
+.wm--reading-together .wm-read :is(h2, h3, button, a):focus-visible { scroll-margin-block: 8px; }
+.wm-reading-view { display: flex; flex: 1 0 auto; flex-direction: column; min-inline-size: 0; }
+.wm-reading-view-header, .wm-reading-view-nav { position: sticky; z-index: 2; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 14px; background: var(--toolbar); }
+.wm-reading-view-header { inset-block-start: 0; border-block-end: 1px solid var(--border); }
+.wm-reading-view-header h2 { margin: 0; font-size: 1rem; font-weight: 650; line-height: 1.2; }
+.wm-reading-view-header p { margin: 2px 0 0; color: var(--muted); font-size: .75rem; }
+.wm-reading-view-nav { inset-block-end: 0; margin-block-start: auto; justify-content: end; border-block-start: 1px solid var(--border); }
+.wm-reading-view-nav > button:first-of-type { margin-inline-end: auto; min-inline-size: var(--control-height); justify-content: center; }
+.wm-reading-cards { display: grid; gap: 12px; padding: 12px 14px; }
+.wm-reading-card { min-inline-size: 0; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); }
+.wm-reading-card-header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: start; gap: 8px 12px; padding: 11px 12px; }
+.wm-reading-card-title { flex: 1 1 13rem; min-inline-size: 0; }
+.wm-reading-card-title h3 { margin: 0; font-size: 1rem; font-weight: 650; line-height: 1.25; overflow-wrap: anywhere; scroll-margin-block: 8px; }
+.wm-reading-card-title :is(p, time) { display: block; margin: 2px 0 0; color: var(--muted); font-size: .8125rem; overflow-wrap: anywhere; }
+.wm-reading-card-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.wm-reading-card-actions > span { color: var(--muted); font-size: .8125rem; }
+.wm-reading-card-content { border-block-start: 1px solid var(--border); padding: 10px 12px 12px; }
+.wm-reading-message { display: grid; justify-items: start; gap: 8px; min-inline-size: 0; }
+.wm-reading-message :is(.wm-read-text, .wm-read-html) { box-sizing: border-box; inline-size: 100%; max-inline-size: 100%; min-block-size: unset; margin: 0; }
+.wm-reading-message .wm-read-html { block-size: clamp(185px, 24dvh, 228px); }
+.wm-reading-message .wm-read-attach { max-inline-size: 100%; }
+.wm-reading-message .wm-attach-chip { min-block-size: var(--control-height); border-color: var(--control-border); }
+.wm-reading-image-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; color: var(--muted); font-size: .8125rem; }
+@media (max-width: 760px) {
+  .wm-reading-view-header, .wm-reading-view-nav { padding-inline: 10px; }
+  .wm-reading-back-full { display: none; }
+  .wm-reading-back-short { display: inline; }
+  .wm-reading-cards { padding-inline: 10px; }
+  .wm-reading-card-title { flex-basis: 100%; }
+  .wm-reading-card-header, .wm-reading-card-content { padding-inline: 9px; }
+  .wm-reading-view-nav { padding-block-end: max(8px, env(safe-area-inset-bottom)); }
+}
 .wm-batch-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; padding: 9px 14px; background: var(--surface); border-bottom: 1px solid var(--border); }
 .wm-batch-progress { color: var(--muted); font-size: 12px; margin-inline-end: auto; font-variant-numeric: tabular-nums; }
 .wm-shortcuts { width: min(100%, 440px); max-height: 90dvh; overflow: auto; padding: 20px; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 15px; box-shadow: var(--app-shadow); }

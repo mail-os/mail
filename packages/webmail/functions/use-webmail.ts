@@ -30,6 +30,8 @@ import { useAssistantGrants } from './use-assistant-grants'
 import { useFileLinks } from './use-file-links'
 import { linkedFilesInText } from './mail-public-links'
 import { useReplyBatch } from './use-reply-batch'
+import { readingViewLimit, useReadingView } from './use-reading-view'
+import type { ReadingReference } from './use-reading-view'
 
 interface Ref<T> { current: T | null }
 interface ExternalSendReview { account: string, from: string, to: string[], cc: string[], bcc: string[], token: string }
@@ -157,7 +159,7 @@ export function useWebmail(ports: WebmailPorts) {
     const item = selected()
     return renderMailReader(item?.html || '', item?.embedded_images, remoteImagesAllowed())
   })
-  const checked = state<MessageRef[]>([])
+  const checked = state<ReadingReference[]>([])
   const readingBatch = state<ReadingBatch | null>(null)
   const triageBusy = state(false)
   const shortcutsOpen = state(false)
@@ -289,6 +291,27 @@ export function useWebmail(ports: WebmailPorts) {
     else if (!user()) ports.navigate('/login', { reload: true })
   }
   const api = createMailApi(() => user()?.username, onAuthError, () => !destroyed, linkedAccount)
+  let readingViewTrigger: HTMLElement | null = null
+  const continuous = useReadingView({
+    reader: ports.messageReader,
+    nextTick: ports.nextTick,
+    load: (message, signal) => {
+      if (!message.reference) throw new Error('Refresh the mailbox and select this message again.')
+      return api<MessageDetail>(messagePath(message), { signal })
+    },
+    markRead: async (message, active, update) => {
+      await markMessageRead(message, active, update)
+      if (active()) void refresh(true)
+    },
+    archive: async (message) => {
+      if (message.folder === 'Archive' || message.folder === 'Drafts' || message.folder === 'Trash' || isJunkFolder(message.folder)) return false
+      const before = undoAction()?.id
+      if (!await performBulk('move', [messageRef(message)], 'Archive')) return false
+      const receipt = undoAction()?.id
+      return receipt && receipt !== before ? receipt : null
+    },
+    canChange: () => !mutating() && !authExpired(),
+  })
   if (linkedChannel) linkedChannel.onmessage = (event) => {
     if (event.data === linkedAccount) void api('/webmail/auth/me').catch(() => {})
   }
@@ -461,6 +484,9 @@ export function useWebmail(ports: WebmailPorts) {
   function messageRef(message: MessageRef): MessageRef {
     return { uid: message.uid, folder: message.folder, reference: message.reference, revision: message.revision }
   }
+  function readingReference(message: MessageSummary): ReadingReference {
+    return { ...messageRef(message), from: message.from, subject: message.subject, personal_subject: message.personal_subject, date: message.date }
+  }
   function createEventLink(): string | null {
     const message = selected()
     const account = user()?.username
@@ -596,12 +622,16 @@ export function useWebmail(ports: WebmailPorts) {
   }
   function cancelBatch(): void {
     ++triageRequest
+    if (continuous.readingView()) reading.set(false)
+    continuous.closeReadingView()
     readingBatch.set(null)
     triageBusy.set(false)
   }
   function closeReader(restoreFocus = false): void {
     cancelBatch()
     const saved = readingViewport
+    const trigger = readingViewTrigger
+    readingViewTrigger = null
     readingViewport = null
     ++messageRequest
     selected.set(null)
@@ -620,6 +650,7 @@ export function useWebmail(ports: WebmailPorts) {
     if (restoreFocus) ports.nextTick(() => {
       if (saved) restoreListViewport(saved, true)
       else ports.messageList.current?.focus({ preventScroll: true })
+      if (trigger?.isConnected && trigger.getClientRects().length) trigger.focus({ preventScroll: true })
     })
   }
   async function loadFolders(): Promise<void> { folders.set(await api<Folder[]>('/webmail/api/folders')) }
@@ -841,7 +872,7 @@ export function useWebmail(ports: WebmailPorts) {
     const wanted = !checkedKeys().includes(messageIdentity(message))
     const rows = event?.shiftKey ? rangeSelection(visibleMessages(), selectionAnchor, message, messageIdentity) : [message]
     const result = new Map(checked().map(ref => [messageIdentity(ref), ref]))
-    for (const row of rows) { if (wanted) result.set(messageIdentity(row), messageRef(row)); else result.delete(messageIdentity(row)) }
+    for (const row of rows) { if (wanted) result.set(messageIdentity(row), readingReference(row)); else result.delete(messageIdentity(row)) }
     if (result.size > 100) {
       event?.preventDefault()
       notice.set('Select up to 100 messages at a time.')
@@ -858,7 +889,7 @@ export function useWebmail(ports: WebmailPorts) {
       return
     }
     const result = new Map(checked().map(ref => [messageIdentity(ref), ref]))
-    for (const message of visibleMessages()) { if (result.size >= 100) break; result.set(messageIdentity(message), messageRef(message)) }
+    for (const message of visibleMessages()) { if (result.size >= 100) break; result.set(messageIdentity(message), readingReference(message)) }
     checked.set([...result.values()])
     if (visibleMessages().length > 100) notice.set('Selected the first 100 matching messages. Process these before selecting more.')
   }
@@ -867,7 +898,7 @@ export function useWebmail(ports: WebmailPorts) {
     const members = thread.members.filter(message => message.matches_filters !== false)
     const wanted = !members.every(message => checkedKeys().includes(messageIdentity(message)))
     const result = new Map(checked().map(ref => [messageIdentity(ref), ref]))
-    for (const message of members) { if (wanted) result.set(messageIdentity(message), messageRef(message)); else result.delete(messageIdentity(message)) }
+    for (const message of members) { if (wanted) result.set(messageIdentity(message), readingReference(message)); else result.delete(messageIdentity(message)) }
     if (result.size > 100) {
       event.preventDefault()
       notice.set('This conversation exceeds the selection limit. Expand it and select up to 100 messages.')
@@ -889,7 +920,7 @@ export function useWebmail(ports: WebmailPorts) {
   }
   function updateOwnSelection(before: MessageRef, after: MessageRef): void {
     const key = messageIdentity(before)
-    checked.update(items => items.map(item => messageIdentity(item) === key && item.revision === before.revision ? messageRef(after) : item))
+    checked.update(items => items.map(item => messageIdentity(item) === key && item.revision === before.revision ? { ...item, ...messageRef(after) } : item))
   }
   async function openMessage(message: MessageRef & { personal_subject?: string }, autoRead = true, skipSeen = false, skipMissing = false, requireRevision = false): Promise<OpenResult> {
     if (mutating()) return 'cancelled'
@@ -922,7 +953,7 @@ export function useWebmail(ports: WebmailPorts) {
       })
       focusReader(request)
       if (autoRead && detail.folder !== 'Drafts' && !detail.flags.seen) {
-        await markOpenedMessageRead(detail, request)
+        await markMessageRead(detail, () => request === messageRequest, message => selected.set(message))
         if (request === messageRequest) void refresh(true)
       }
       return 'opened'
@@ -938,9 +969,9 @@ export function useWebmail(ports: WebmailPorts) {
     }
     finally { if (request === messageRequest) readingLoading.set(false) }
   }
-  async function markOpenedMessageRead(detail: MessageDetail, request: number): Promise<void> {
+  async function markMessageRead(detail: MessageDetail, active: () => boolean, update: (message: MessageDetail) => void): Promise<void> {
     let current = detail
-    for (let attempt = 0; attempt < 2 && !current.flags.seen && request === messageRequest; attempt++) {
+    for (let attempt = 0; attempt < 2 && !current.flags.seen && active(); attempt++) {
       try {
         const result = await api<MessageRef>(messagePath(current), {
           method: 'PUT',
@@ -948,14 +979,17 @@ export function useWebmail(ports: WebmailPorts) {
           body: JSON.stringify({ flags: { ...current.flags, seen: true } }),
         })
         const updated = { ...current, ...result, flags: { ...current.flags, seen: true } }
+        if (destroyed || authExpired()) return
         updateOwnSelection(current, updated)
-        if (request === messageRequest) selected.set(updated)
+        if (active()) update(updated)
         return
       }
       catch (cause) {
         if (!(cause instanceof MailApiError) || cause.status !== 412 || attempt > 0) throw cause
-        current = await api<MessageDetail>(messagePath(current))
-        if (request === messageRequest) selected.set(current)
+        if (!active()) return
+        const fresh = await api<MessageDetail>(messagePath(current))
+        current = { ...fresh, personal_subject: current.personal_subject }
+        if (active()) update(current)
       }
     }
   }
@@ -1008,6 +1042,7 @@ export function useWebmail(ports: WebmailPorts) {
         const result = await openMessage(next, true, true, true)
         if (request !== triageRequest || result === 'cancelled') return
         if (result === 'opened') {
+          continuous.closeReadingView()
           const current = readingBatch()
           readingBatch.set({ kind: 'unread', read: (current?.kind === 'unread' ? current.read : 0) + 1 })
           return
@@ -1020,10 +1055,9 @@ export function useWebmail(ports: WebmailPorts) {
       notice.set('Unread messages changed while loading. Try Next unread again.')
     })
   }
-  async function readSelection(): Promise<void> {
+  function orderedSelection(): ReadingReference[] {
     const items = new Map(checked().map(item => [messageIdentity(item), item]))
-    if (!items.size) return
-    const ordered: MessageRef[] = []
+    const ordered: ReadingReference[] = []
     for (const message of visibleMessages()) {
       const key = messageIdentity(message)
       const item = items.get(key)
@@ -1032,9 +1066,55 @@ export function useWebmail(ports: WebmailPorts) {
         items.delete(key)
       }
     }
-    ordered.push(...items.values())
-    await openSelectedBatch({ kind: 'selected', items: ordered, index: -1 }, 1)
+    return [...ordered, ...items.values()]
   }
+
+  async function readSelection(): Promise<void> {
+    const items = orderedSelection()
+    if (items.length) await openSelectedBatch({ kind: 'selected', items, index: -1 }, 1)
+  }
+
+  async function startReadingView(kind: 'unread' | 'selected', event: Event): Promise<void> {
+    if (kind === 'unread' && !unreadAvailable()) return
+    const trigger = event.currentTarget
+    const viewport = captureListViewport(ports.messageList.current)
+    await runTriage(async (request) => {
+      let items = kind === 'selected' ? orderedSelection() : []
+      let total = items.length
+      if (kind === 'unread') {
+        const params = listParams()
+        params.set('queue', 'unread')
+        params.set('batch', 'true')
+        params.set('per_page', String(readingViewLimit))
+        const result = await api<MessagePage>(`/webmail/api/messages?${params}`)
+        items = result.items
+        total = result.total
+      }
+      if (request !== triageRequest || destroyed) return
+      if (!items.length) {
+        notice.set(kind === 'unread' ? 'No unread messages match this view.' : 'Choose messages to read together.')
+        return
+      }
+      readingViewport ??= viewport
+      readingViewTrigger = trigger instanceof HTMLElement ? trigger : null
+      batch(() => {
+        selected.set(null)
+        invitationCalendar.set(null)
+        privateMail.closePrivate()
+        remoteImagesAllowed.set(false)
+        followUpFocused.set(false)
+        readingBatch.set(null)
+        reading.set(true)
+        continuous.showReadingView(kind, items, total)
+      })
+    })
+  }
+
+  async function openReadingMessage(message: MessageRef): Promise<void> {
+    continuous.closeReadingView()
+    await openMessage(message)
+  }
+
   async function openSelectedBatch(mode: Extract<ReadingBatch, { kind: 'selected' }>, delta: number): Promise<void> {
     await runTriage(async (request) => {
       for (let index = mode.index + delta; index >= 0 && index < mode.items.length; index += delta) {
@@ -1045,6 +1125,7 @@ export function useWebmail(ports: WebmailPorts) {
           return
         }
         if (result === 'opened') {
+          continuous.closeReadingView()
           readingBatch.set({ ...mode, index })
           return
         }
@@ -1190,7 +1271,7 @@ export function useWebmail(ports: WebmailPorts) {
     if (action === 'purge' && !confirmed) { showConfirmation('purge', refs); return false }
     mutating.set(true); error.set('')
     try {
-      const result = await api<BulkResult>('/webmail/api/bulk', { method: 'POST', body: JSON.stringify({ action, messages: refs, folder: destination }) })
+      const result = await api<BulkResult>('/webmail/api/bulk', { method: 'POST', body: JSON.stringify({ action, messages: refs.map(messageRef), folder: destination }) })
       const succeeded = result.results.filter(item => item.ok)
       const failed = result.results.filter(item => !item.ok)
       const completed = new Set(refs.filter(ref => succeeded.some(item => messageKey(item) === messageKey(ref))).map(messageIdentity))
@@ -1287,6 +1368,7 @@ export function useWebmail(ports: WebmailPorts) {
         }
       }
       await refresh(true)
+      if (result.ok) continuous.undoReadingArchive(receipt.id)
     }
     catch (cause) { error.set(errorMessage(cause)); undoAction.set(null) }
     finally { mutating.set(false) }
@@ -1322,6 +1404,15 @@ export function useWebmail(ports: WebmailPorts) {
     if (key === 'n' && unreadAvailable()) {
       event.preventDefault()
       void nextUnread()
+    }
+    else if (key === 'j' && continuous.readingView()) {
+      event.preventDefault()
+      continuous.nextReadingCard()
+    }
+    else if (key === 'e' && continuous.readingView()) {
+      event.preventDefault()
+      const key = continuous.readingViewActiveCard()
+      if (key) void continuous.archiveReadingCard(key)
     }
     else if (key === 'j' && readingBatch()) {
       event.preventDefault()
@@ -1960,6 +2051,7 @@ export function useWebmail(ports: WebmailPorts) {
     recipientEditor.destroy()
     attachmentEditor.destroy()
     draft.destroy()
+    continuous.closeReadingView()
     privateMail.closePrivate()
     contactBook.closeContacts()
     snapshots.closeSnapshots()
@@ -1979,6 +2071,10 @@ export function useWebmail(ports: WebmailPorts) {
     ...fileSharing, messageFileLinks, insertFileLink,
     ...replyBatch, replyToSelection, submitReplyBatch,
     invitationCalendar, invitationCalendarBusy, invitationDestination, chooseInvitationCalendar, saveInvitationCalendar,
+    readingView: continuous.readingView, readingViewNext: continuous.readingViewNext, readingViewActiveCard: continuous.readingViewActiveCard,
+    toggleReadingCard: continuous.toggleReadingCard, openReadingCard: continuous.openReadingCard, nextReadingCard: continuous.nextReadingCard,
+    toggleReadingImages: continuous.toggleReadingImages, archiveReadingCard: continuous.archiveReadingCard,
+    startReadingView, openReadingMessage, readingViewLimit,
     showCollectionManager, closeCollectionManager, selectCollection, confirmCollectionDeletion, savePrivateLabel, setPrivateMembership, groupSelected, displaySubject, changeNotificationRule, ...recipientEditor, ...attachmentEditor, ...recoverySettings, ...clientCredentials, ...forwardingSettings, ...retentionSettings, ...externalSenderSettings, ...vacationSettings, ...writing, snippetChoice, signatureChoice, insertSnippet, insertSignature, attentionViews, attentionView, followUpFocused, attentionSaving, attentionSchedule, attentionDate, attentionZone, dueReminders, replyContext, clearFollowUp, selectAttention, nextFollowUp, changeAttention, startAttentionSchedule, saveAttentionSchedule, deadlineLabel, categoryList, newsletterExpanded, readerExpanded, receiptFull, receiptCompact, receiptPreview, senderLabel, sortingSettings, sortingSaving, sortingError, toggleAutomaticSorting, placementText, categoryRule, categoryRuleSaving, saveCategoryRule, showSenderReview, openReviewMessage, reviewMessage, refresh, loadMessages, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread, toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, openAttachmentMessage, showAttachmentLibrary, retryReader, closeReader, nextUnread, readSelection, advanceBatch, triageAndNext, bulkAction, selectedAction, undoLastAction, showShortcuts, closeShortcuts, handleShortcut, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments, saveSendPreference, send, confirmPendingSend, showOutbox, refreshOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, closeAccountSettings, changePassword, showConfirmation, confirmAction, saveDraftCopy: draft.saveCopy, mount, resume, tick, preventUnload, destroy, messageIdentity, messagePageSize, folderName, shortDate, fullDate, readableBytes, attachmentPath }
 }
 

@@ -74,6 +74,8 @@ const {
   moveTo, showHtml, formattedReader, remoteImagesAllowed, checkedKeys, selectedCount, allChecked, someChecked, undoAction, undoRemaining,
   isJunkFolder, readerJunkAction, selectionJunkAction,
   readingBatch, triageBusy, unreadAvailable, shortcutsOpen, triageShortcuts,
+  readingView, readingViewActiveCard, readingViewNext, readingViewLimit, startReadingView, openReadingMessage,
+  toggleReadingCard, openReadingCard, nextReadingCard, toggleReadingImages, archiveReadingCard,
   pendingSend, sendRemaining, outbox, outboxCount, outboxCounts, outboxSection, outboxViews, outboxEmpty,
   outboxPageNumber, outboxNext, outboxLoading, outboxError, outboxView, cancelling, authExpired, currentFolderName, now,
   composing, title, sharedReply, senderId, senderIdentities, missingSender, senderStatus, chooseSender, subject, body, showCc, showBcc, sending, sendUncertain, composeError, hasComposition, saveStatus,
@@ -232,7 +234,7 @@ onMount(boot)
 onUnmounted(() => { mail.destroy(); destroyReminders() })
 </script>
 <main :if="!ready || !user" class="wm-boot"><p role="status" :text="error || 'Opening your inbox…'"></p><button :if="error" @click="boot()">Retry connection</button></main>
-<div :if="ready && user" class="wm" :class="{ 'wm--reading': reading, 'wm--newsletter-expanded': readerExpanded, 'wm--reply-focused': followUpFocused }">
+<div :if="ready && user" class="wm" :class="{ 'wm--reading': reading, 'wm--newsletter-expanded': readerExpanded, 'wm--reply-focused': followUpFocused, 'wm--reading-together': readingView }">
   <aside class="wm-folders" aria-label="Mail navigation" :class="{ 'wm-folders--expanded': foldersExpanded }" @keydown.escape="closeFolders(true)">
     <div class="wm-brand"><span class="mail-app-mark" role="img" aria-label="Mail"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span></span><span aria-hidden="true">Mail</span></div>
     <button ref="foldersToggle" type="button" class="wm-folders-toggle wm-action" :aria-expanded="foldersExpanded" aria-controls="mailNavigation" @click="foldersExpanded.set(!foldersExpanded())"><span class="mail-icon" data-icon="sidebar" aria-hidden="true"></span>Mailboxes<span class="mail-icon wm-mailboxes-indicator" data-icon="down" aria-hidden="true"></span></button>
@@ -290,7 +292,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
     </section>
     <div :if="health.status() === 'degraded'" class="wm-health-banner" role="status"><span class="mail-icon" data-icon="pulse" aria-hidden="true"></span><span :text="health.label()"></span><a href="/status">View service health</a></div>
     <div :if="authExpired" class="wm-session" role="alert">Your session expired. <a href="/login" target="_blank" rel="noopener">Sign in again</a>, then return here to save your changes.</div>
-    <div :if="notice" class="wm-notice" role="status"><span :text="notice"></span><button :if="undoAction && undoRemaining > 0" class="wm-action" @click="undoLastAction()" :disabled="mutating" aria-label="Undo last action" aria-keyshortcuts="Shift+U">Undo <span aria-hidden="true" :text="'(' + undoRemaining + 's)' "></span></button><button :if="pendingSend?.state === 'pending' && sendRemaining > 0" class="wm-action" @click="cancelSend()" :disabled="cancelling" aria-label="Undo send">Undo Send <span aria-hidden="true" :text="'(' + sendRemaining + 's)' "></span></button></div>
+    <div :if="notice && (!readingView || pendingSend?.state === 'pending')" class="wm-notice" role="status"><span :text="notice"></span><button :if="!readingView && undoAction && undoRemaining > 0" class="wm-action" @click="undoLastAction()" :disabled="mutating" aria-label="Undo last action" aria-keyshortcuts="Shift+U">Undo <span aria-hidden="true" :text="'(' + undoRemaining + 's)' "></span></button><button :if="pendingSend?.state === 'pending' && sendRemaining > 0" class="wm-action" @click="cancelSend()" :disabled="cancelling" aria-label="Undo send">Undo Send <span aria-hidden="true" :text="'(' + sendRemaining + 's)' "></span></button></div>
     <div :if="dueReminders > 0 && attentionView !== 'reminders'" class="wm-notice" role="status"><span :text="dueReminders === 1 ? 'One no-reply reminder is due.' : dueReminders + ' no-reply reminders are due.'"></span><button type="button" class="wm-action" @click="selectAttention('reminders')">View reminders</button></div>
     <p :if="error && !outboxView" class="login-error wm-workspace-error" role="alert" :text="error"></p>
     <div class="wm-columns" :class="{ 'wm-columns--invitations': senderReviewOpen && senderReviewView === 'invitations' }">
@@ -326,6 +328,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         </div>
         <button :if="filterActive" class="wm-clear-search" type="button" @click="clearSearch()">Clear search and filters</button>
       </form>
+      <button :if="unreadAvailable" type="button" class="wm-action wm-read-together-entry wm-read-unread-together" @click="startReadingView('unread', $event)" :disabled="loading || readingLoading || triageBusy || mutating"><span class="mail-icon" data-icon="layers" aria-hidden="true"></span>Read unread together</button>
       <div :if="!libraryView" class="wm-list-options">
         <span :if="categoryList">Grouped by sender</span>
         <label :if="!attentionView && !categoryList && folder !== 'Drafts'" class="wm-list-toggle">
@@ -345,6 +348,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       </div>
       <div :if="selectedCount > 0" class="wm-bulk-toolbar" role="group" aria-label="Selected message actions">
         <button type="button" class="wm-action wm-action--accent" @click="readSelection()" :disabled="loading || readingLoading || triageBusy || mutating"><span class="mail-icon" data-icon="layers" aria-hidden="true"></span>Read selected</button>
+        <button :if="selectedCount > 1" type="button" class="wm-action wm-read-together-entry" @click="startReadingView('selected', $event)" :disabled="loading || readingLoading || triageBusy || mutating"><span class="mail-icon" data-icon="layers" aria-hidden="true"></span>Read together</button>
         <button :if="!linkedView && selectedCount > 1 && folder !== 'Sent' && folder !== 'Drafts' && folder !== 'Trash' && !isJunkFolder(folder)" type="button" class="wm-action" aria-haspopup="dialog" :disabled="loading || mutating" @click="openReplyBatch()"><span class="mail-icon" data-icon="reply" aria-hidden="true"></span>Reply separately</button>
         <button :if="!linkedView && folder !== 'Drafts' && folder !== 'Trash' && !isJunkFolder(folder)" type="button" class="wm-action" aria-haspopup="dialog" :disabled="loading || mutating" @click="openSnapshotPreview(true)"><span class="mail-icon" data-icon="upload" aria-hidden="true"></span>Share snapshot</button>
         <button :if="limits.teamThreadsAvailable && folder !== 'Drafts' && folder !== 'Trash' && !isJunkFolder(folder)" type="button" class="wm-action" aria-haspopup="dialog" :disabled="loading || mutating" @click="openTeamThreadDialog('share', true)"><span class="mail-icon" data-icon="people" aria-hidden="true"></span>Share with teammate</button>
@@ -461,7 +465,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       </footer>
     </section>
     <section :if="!outboxView" class="wm-read" ref="messageReader" aria-label="Message reader" :aria-busy="readingLoading">
-      <button :if="!followUpFocused && !readingBatch" class="wm-back" @click="closeReader(true)" :disabled="mutating"><span class="mail-icon" data-icon="back" aria-hidden="true"></span>Back to messages</button>
+      <button :if="!followUpFocused && !readingBatch && !readingView" class="wm-back" @click="closeReader(true)" :disabled="mutating"><span class="mail-icon" data-icon="back" aria-hidden="true"></span>Back to messages</button>
       <div :if="followUpFocused" class="wm-follow-up-nav"><button type="button" class="wm-action" @click="closeReader(true)" :disabled="mutating">Back to reply queue</button><button type="button" class="wm-action" @click="nextFollowUp()" :disabled="loading || readingLoading || mutating">Next reply</button></div>
       <nav :if="readingBatch" class="wm-batch-nav" aria-label="Reading batch">
         <button type="button" class="wm-action" @click="closeReader(true)" :disabled="mutating"><span class="mail-icon" data-icon="back" aria-hidden="true"></span>Back to messages</button>
@@ -471,7 +475,61 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       </nav>
       <div :if="readerError" class="wm-inline-error" tabindex="-1" data-reader-focus role="alert"><span :text="readerError"></span><button :if="readerTarget" type="button" class="wm-action" @click="retryReader()" :disabled="readingLoading || triageBusy">Retry message</button></div>
       <p :if="readingLoading" class="wm-a11y-text" role="status">Opening message…</p>
-      <div :if="!selected && !readerError" class="wm-reader-empty" role="status"><span class="wm-empty-mark"><span class="mail-icon" :data-icon="libraryView ? 'attach' : 'mail'" aria-hidden="true"></span></span><span :text="readingLoading ? 'Opening message…' : (libraryView ? 'Select an attachment to open its message.' : 'Select a message to read.')"></span></div>
+      <div :if="!selected && !readerError && !readingView" class="wm-reader-empty" role="status"><span class="wm-empty-mark"><span class="mail-icon" :data-icon="libraryView ? 'attach' : 'mail'" aria-hidden="true"></span></span><span :text="readingLoading ? 'Opening message…' : (libraryView ? 'Select an attachment to open its message.' : 'Select a message to read.')"></span></div>
+      <section :if="readingView" class="wm-reading-view" aria-label="Read together">
+        <header class="wm-reading-view-header">
+          <button type="button" class="wm-action" aria-label="Back to messages" @click="closeReader(true)" :disabled="mutating"><span class="mail-icon" data-icon="back" aria-hidden="true"></span><span class="wm-reading-back-full">Back to messages</span><span class="wm-reading-back-short">Messages</span></button>
+          <div>
+            <h2 :text="readingView.kind === 'unread' ? 'Unread messages' : 'Selected messages'"></h2>
+            <p :text="readingView.cards.length + (readingView.total > readingViewLimit ? ' of ' + readingView.total : '') + (readingView.cards.length === 1 && readingView.total <= readingViewLimit ? ' message' : ' messages')"></p>
+          </div>
+        </header>
+        <div class="wm-reading-cards">
+          <article :for="card in (readingView?.cards || [])" :key="card.key" class="wm-reading-card" :data-reading-card="card.key"
+            :aria-label="displaySubject(card.message)" @focusin="readingViewActiveCard.set(card.key)">
+            <header class="wm-reading-card-header">
+              <div class="wm-reading-card-title">
+                <h3 data-reading-heading tabindex="-1" :text="displaySubject(card.message)"></h3>
+                <p :text="card.message.from && senderLabel(card.message.from)"></p>
+                <time :if="card.message.date" :text="fullDate(card.message.date)"></time>
+              </div>
+              <div class="wm-reading-card-actions">
+                <span :if="card.archived" role="status">Archived</span>
+                <button :if="!card.archived" type="button" class="wm-action" :aria-expanded="card.open" :aria-controls="'read-together-' + card.key"
+                  :disabled="mutating || authExpired" :aria-disabled="card.busy ? 'true' : null" @click="toggleReadingCard(card.key)" :text="card.open ? 'Collapse' : 'Read message'"></button>
+                <button :if="card.detail && card.detail.folder !== 'Archive' && card.detail.folder !== 'Drafts' && card.detail.folder !== 'Trash' && !isJunkFolder(card.detail.folder)" type="button" class="wm-action"
+                  @click="archiveReadingCard(card.key)" :disabled="card.busy || mutating || authExpired" aria-label="Archive message" title="Archive message"><span class="mail-icon" data-icon="archive" aria-hidden="true"></span><span>Archive</span></button>
+              </div>
+            </header>
+            <div :id="'read-together-' + card.key" :hidden="!card.open" class="wm-reading-card-content" :aria-busy="card.busy">
+              <p :if="card.busy && !card.detail" role="status" class="wm-state">Opening message…</p>
+              <div :if="card.error" class="wm-inline-error" role="alert">
+                <span :text="card.error"></span><button type="button" class="wm-action" @click="openReadingCard(card.key, true)" :disabled="card.busy || mutating || authExpired">Retry message</button>
+              </div>
+              <div :if="card.detail" class="wm-reading-message">
+                <div :if="card.detail.attachments.length" class="wm-read-attach">
+                  <a :for="(attachment, index) in card.detail.attachments" class="wm-attach-chip" :href="attachmentPath(index, card.detail)" :download="attachment.filename"><span class="mail-icon" data-icon="attach" aria-hidden="true"></span><span :text="attachment.filename + ' · ' + readableBytes(attachment.size)"></span><span class="mail-icon wm-attachment-download" data-icon="download" aria-hidden="true"></span></a>
+                </div>
+                <div :if="!card.detail.calendar_only && card.html?.remoteImages" class="wm-reading-image-controls">
+                  <span :text="card.imagesAllowed ? 'Remote images allowed for this message.' : 'Remote images are blocked.'"></span>
+                  <button type="button" class="wm-action" @click="toggleReadingImages(card.key)" :disabled="card.busy" :text="card.imagesAllowed ? 'Block remote images' : 'Load remote images'"></button>
+                </div>
+                <iframe :if="card.detail.html && !card.detail.calendar_only" class="wm-read-html" sandbox="allow-popups allow-popups-to-escape-sandbox" referrerpolicy="no-referrer"
+                  :title="'Email content: ' + displaySubject(card.detail)" :srcdoc="card.html?.source"></iframe>
+                <pre :if="!card.detail.html && !card.detail.calendar_only && card.detail.text" class="wm-read-text" :text="card.detail.text"></pre>
+                <p :if="card.detail.calendar_only">This message contains a calendar invitation.</p>
+                <button type="button" class="wm-action" @click="openReadingMessage(card.detail)" :disabled="mutating || card.busy || authExpired">Open in message reader</button>
+              </div>
+            </div>
+          </article>
+        </div>
+        <nav class="wm-reading-view-nav" aria-label="Reading controls">
+          <span class="wm-a11y-text" role="status" :text="notice"></span>
+          <button type="button" class="wm-action" aria-label="Refresh mailbox" title="Refresh mailbox" @click="refresh(true)" :disabled="loading || refreshing || mutating"><span class="mail-icon" data-icon="refresh" aria-hidden="true"></span></button>
+          <button :if="undoAction && undoRemaining > 0" type="button" class="wm-action" @click="undoLastAction()" :disabled="mutating || triageBusy" aria-label="Undo last action" aria-keyshortcuts="Shift+U">Undo</button>
+          <button type="button" class="wm-action wm-action--accent" @click="nextReadingCard()" :disabled="!readingViewNext || mutating || authExpired" aria-keyshortcuts="Shift+J">Read next<span class="mail-icon" data-icon="down" aria-hidden="true"></span></button>
+        </nav>
+      </section>
       <article :if="selected" class="wm-read-body">
         <div :if="senderReviewOpen && senderReviewSelection" class="wm-read-toolbar wm-review-toolbar" :aria-busy="senderReviewSaving">
           <button :if="senderReviewSelection?.folder === 'Declined'" type="button" class="wm-action" @click="reviewMessage('recover')" :disabled="senderReviewSelection?.applying || senderReviewSaving">Recover this message</button>

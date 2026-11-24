@@ -60,6 +60,12 @@ for the released mailbox check, candidate walkthrough, and follow-up issues.
   it reaches the end. Choose **Read selected** to work through a batch in order.
   Use **Archive & next** or **Trash & next** to continue after filing a message.
   **Keyboard shortcuts** lists the keys for reading, selection, and Undo.
+- Choose **Read unread together** or select messages and choose **Read
+  together** to open up to 12 messages in the same reader. The first message
+  opens immediately. **Read next** or Shift+J opens another without closing
+  the earlier messages. Opening a message marks it read and leaves later
+  messages unread. Each message has its own attachment links and remote-image
+  setting. Use **Archive** on a message and **Undo** in the reader to put it back.
 - Local sends are acknowledged after the server records their recipient
   outcomes and reserves storage. If a Maildir write is interrupted, recovery
   finishes the accepted copy. Inbox counts, search indexing, and arrival
