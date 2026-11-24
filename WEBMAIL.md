@@ -1898,6 +1898,12 @@ posts one URL-encoded `proof` field to `/webmail/auth/hosted` on the webmail
 host. Mail checks the Origin, consumes the proof, sets a host-only session
 cookie, and redirects to Inbox. Keep proofs out of URLs and logs.
 
+When finishing free signup, the app also supplies the submitted mailbox
+`password` through the private listener. Mail verifies it against the current
+password before answering with `password_verified: true`. This lets the app
+recover a lost provisioning reply without treating a different retry password
+as a sign-in credential.
+
 Proofs expire after two minutes and are invalidated on daemon restart,
 mailbox password rotation, disablement, removal, and assignment changes.
 The exchange enforces the managed mailbox's current access window. Sign-out

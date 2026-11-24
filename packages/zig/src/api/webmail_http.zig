@@ -4883,14 +4883,21 @@ fn handleProvisioning(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
     if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/provisioning/v1/webmail/sign-in")) {
         if (server.config.hosted_sign_in_origin == null)
             return sendError(conn, arena, 404, "sign_in_unavailable", "Hosted sign-in is unavailable");
-        const input = std.json.parseFromSliceLeaky(struct { mailbox: []const u8, actor: []const u8 }, arena, req.body, .{}) catch
+        const input = std.json.parseFromSliceLeaky(hosted_sign_in.IssueRequest, arena, req.body, .{}) catch
             return sendError(conn, arena, 400, "invalid_request", "Invalid sign-in request");
         if (!validProvisioningMailbox(input.mailbox, cfg) or !validProvisioningId(input.actor))
             return sendError(conn, arena, 400, "invalid_request", "Invalid sign-in request");
         const proof = try session_mod.generateToken(arena);
-        const expires_at = hosted_sign_in.issue(server.db, proof, input.mailbox, input.actor, time_compat.timestamp()) catch |err|
+        const expires_at = hosted_sign_in.issue(server.db, arena, proof, input) catch |err| {
+            if (err == error.InvalidActivationPassword)
+                return sendError(conn, arena, 401, "invalid_credentials", "Use the mailbox password");
             return provisioningError(conn, arena, err);
-        return sendJson(conn, arena, 201, try service_mod.json(arena, .{ .proof = proof, .expires_at = expires_at }), null);
+        };
+        return sendJson(conn, arena, 201, try service_mod.json(arena, .{
+            .proof = proof,
+            .expires_at = expires_at,
+            .password_verified = input.password != null,
+        }), null);
     }
     if (get and std.mem.eql(u8, req.path, "/provisioning/v1/domain")) {
         const name = req.queryParam(arena, "name") orelse "";

@@ -1,6 +1,8 @@
 //! Single-use browser sign-in proofs issued by the private hosted control plane.
 const std = @import("std");
 const database = @import("database.zig");
+const PasswordHasher = @import("../auth/password.zig").PasswordHasher;
+const time = @import("../core/time_compat.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const ttl_seconds = 120;
@@ -32,9 +34,43 @@ pub const schema =
     \\END;
 ;
 
-pub fn issue(db: *database.Database, proof: []const u8, mailbox: []const u8, actor: []const u8, now: i64) !i64 {
+pub const IssueRequest = struct {
+    mailbox: []const u8,
+    actor: []const u8,
+    password: ?[]const u8 = null,
+};
+
+fn verifyActivationPassword(db: *database.Database, a: std.mem.Allocator, input: IssueRequest, password: []const u8) ![]const u8 {
+    if (password.len < 12 or password.len > 1024) return error.InvalidActivationPassword;
+    const hash = blk: {
+        var tx = try db.beginTransaction(.read);
+        defer tx.deinit();
+        const lookup = try tx.prepare(
+            \\SELECT u.password_hash FROM provisioned_mailboxes p
+            \\JOIN users u ON u.id = p.user_id AND u.username = p.mailbox
+            \\WHERE p.mailbox = ?1 AND p.actor = ?2 AND u.enabled = 1
+            \\  AND (p.read_until IS NULL OR p.read_until > unixepoch())
+        );
+        defer lookup.finalize();
+        try lookup.bind(1, input.mailbox);
+        try lookup.bind(2, input.actor);
+        if (!try lookup.step()) return error.MailboxNotFound;
+        break :blk try a.dupe(u8, lookup.columnText(0));
+    };
+    errdefer a.free(hash);
+    // Argon2 runs outside the database lock. Issuance rechecks the verified
+    // hash inside the write so a concurrent password reset fences this proof.
+    var hasher = PasswordHasher.init(a);
+    if (!try hasher.verifyPassword(password, hash)) return error.InvalidActivationPassword;
+    return hash;
+}
+
+pub fn issue(db: *database.Database, a: std.mem.Allocator, proof: []const u8, input: IssueRequest) !i64 {
+    const password_hash = if (input.password) |password| try verifyActivationPassword(db, a, input, password) else null;
+    defer if (password_hash) |hash| a.free(hash);
     var hash: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(proof, &hash, .{});
+    const now = time.timestamp();
     const expires = now + ttl_seconds;
     var tx = try db.beginTransaction(.write);
     defer tx.deinit();
@@ -51,14 +87,16 @@ pub fn issue(db: *database.Database, proof: []const u8, mailbox: []const u8, act
             \\JOIN users u ON u.id = p.user_id AND u.username = p.mailbox
             \\WHERE p.mailbox = ?3 AND p.actor = ?4 AND u.enabled = 1
             \\  AND (p.read_until IS NULL OR p.read_until > ?5)
+            \\  AND (?6 IS NULL OR u.password_hash = ?6)
             \\RETURNING user_id
         );
         defer proof_row.finalize();
         try proof_row.bindBlob(1, &hash);
         try proof_row.bind(2, expires);
-        try proof_row.bind(3, mailbox);
-        try proof_row.bind(4, actor);
+        try proof_row.bind(3, input.mailbox);
+        try proof_row.bind(4, input.actor);
         try proof_row.bind(5, now);
+        try proof_row.bindOpt(6, password_hash);
         if (!try proof_row.step()) return error.MailboxNotFound;
     }
     try tx.commit();

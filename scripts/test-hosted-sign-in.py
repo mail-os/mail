@@ -24,15 +24,19 @@ def verify(mail):
     mail.env["SMTP_HOSTED_SIGN_IN_ORIGIN"] = origin
     host = urlsplit(mail.webmail)
 
-    def issue(mailbox, actor=None, authorization=True, expected=201):
+    def issue(mailbox, actor=None, authorization=True, expected=201, password=None):
         actor = actor or mail.specs[mailbox]["actor"]
-        status, headers, raw = mail.http(mail.private + issue_path, {"mailbox": mailbox, "actor": actor},
+        payload = {"mailbox": mailbox, "actor": actor}
+        if password is not None:
+            payload["password"] = password
+        status, headers, raw = mail.http(mail.private + issue_path, payload,
                                          mail.auth if authorization else {})
         assert status == expected, (status, raw)
         assert headers["Cache-Control"] == "no-store"
         if status == 201:
             result = json.loads(raw)
             assert result["expires_at"] in range(int(time.time()) + 117, int(time.time()) + 121)
+            assert result["password_verified"] is (password is not None)
             return result["proof"]
 
     def exchange(proof, source=origin, cookie=None, path=exchange_path):
@@ -87,7 +91,9 @@ def verify(mail):
         assert me(cookie)["user"]["username"] == first
         assert db.execute("SELECT COUNT(*) FROM hosted_sign_in_proofs WHERE digest=?", (proof_hash(proof),)).fetchone() == (0,)
 
-        replacement = checked_cookie(exchange(issue(second), cookie=cookie))
+        issue(second, password="wrong-activation-password", expected=401)
+        issue(second, actor=mail.specs[first]["actor"], password=mail.password, expected=404)
+        replacement = checked_cookie(exchange(issue(second, password=mail.password), cookie=cookie))
         assert me(replacement)["user"]["username"] == second
         me(cookie, 401)
         headers = {"Cookie": replacement, "Origin": mail.webmail}

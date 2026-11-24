@@ -507,9 +507,19 @@ export class MailProvisioningClient {
   }
 
   /** Issue a short-lived proof for a browser POST from the configured app origin. */
-  async webmailSignIn(mailbox: string, actor: string): Promise<MailWebmailSignInProof> {
-    const result = await this.request<MailWebmailSignInProof>('webmail/sign-in', { mailbox, actor })
-    if (typeof result.proof !== 'string' || !/^[a-f0-9]{64}$/.test(result.proof) || !Number.isSafeInteger(result.expires_at))
+  webmailSignIn(mailbox: string, actor: string): Promise<MailWebmailSignInProof> {
+    return this.requestWebmailProof({ mailbox, actor })
+  }
+
+  /** Verify the actual mailbox password before issuing a signup handoff proof. */
+  webmailSignInWithPassword(mailbox: string, actor: string, password: string): Promise<MailWebmailSignInProof> {
+    return this.requestWebmailProof({ mailbox, actor, password })
+  }
+
+  private async requestWebmailProof(input: { mailbox: string, actor: string, password?: string }): Promise<MailWebmailSignInProof> {
+    const result = await this.request<MailWebmailSignInProof & { password_verified?: boolean }>('webmail/sign-in', input)
+    if (typeof result.proof !== 'string' || !/^[a-f0-9]{64}$/.test(result.proof) || !Number.isSafeInteger(result.expires_at)
+      || (input.password !== undefined && result.password_verified !== true))
       throw new MailProvisioningError(502, 'invalid_sign_in_response', 'Mail returned an invalid sign-in proof.')
     return { proof: result.proof, expires_at: result.expires_at }
   }
