@@ -151,6 +151,14 @@ function verifyControlGaps(controls, gap) {
   }
 }
 
+function verifyControlPositions(before, after, labels) {
+  assert.equal(before.length, after.length)
+  for (const [index, box] of after.entries()) {
+    for (const edge of ['x', 'y', 'width', 'height'])
+      assert(Math.abs(box[edge] - before[index][edge]) < 0.5, `${labels[index]} moved (${edge})`)
+  }
+}
+
 async function verifyControlContrast(toolbar) {
   const surroundings = await toolbar.evaluate((node) => {
     const style = getComputedStyle(node)
@@ -1477,11 +1485,7 @@ async function verifyCalendarActionsDuringLoading(page, phone = false) {
     release.resolve()
     await button(actions, 'New event').waitFor()
     await actions.getByRole('link', { name: 'Download .ics' }).waitFor()
-    const after = await positions()
-    for (const [index, box] of after.entries()) {
-      for (const edge of ['x', 'y', 'width', 'height'])
-        assert(Math.abs(box[edge] - before[index][edge]) < 0.5, `${labels[index]} moved while Calendar loaded (${edge})`)
-    }
+    verifyControlPositions(before, await positions(), labels)
     assert(await tools.evaluate((control, { x, y }) => control.contains(document.elementFromPoint(x, y)), { x, y }),
       'The original pointer position still hits Personal tools')
     await verifyCalendarActions(page, phone ? 44 : 36, `${label}-loaded`)
@@ -2549,7 +2553,8 @@ async function calendarSharingJourney(captain) {
   await slots.getByText('12:00 PM – 2:00 PM', { exact: true }).waitFor()
   assert.equal(await availability.getByText('Private budget check', { exact: true }).count(), 0)
 
-  const commonActions = ['Manage calendars', 'Import .ics'].map(label => button(teammate, label))
+  const commonLabels = ['Manage calendars', 'Import .ics']
+  const commonActions = commonLabels.map(label => button(teammate, label))
   const actionPositions = () => Promise.all(commonActions.map(control => control.evaluate((node) => {
     const { left, top, width, height } = node.getBoundingClientRect()
     return { x: left + scrollX, y: top + scrollY, width, height }
@@ -2564,8 +2569,7 @@ async function calendarSharingJourney(captain) {
   await slots.waitFor({ state: 'hidden' })
   await button(teammate, /^Design & Research/).waitFor({ state: 'hidden' })
   await button(teammate, 'Personal tools').waitFor()
-  const afterRevocation = await actionPositions()
-  assert.deepEqual(afterRevocation, beforeRevocation, 'Returning to personal calendars keeps the common toolbar targets in place')
+  verifyControlPositions(beforeRevocation, await actionPositions(), commonLabels)
   await context.close()
 }
 
