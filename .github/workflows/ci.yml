@@ -41,6 +41,12 @@ jobs:
       working-directory: .
       run: bun test packages/cloud/test
 
+    - name: Verify Mail delivery status in the browser
+      if: runner.os == 'Linux'
+      working-directory: .
+      timeout-minutes: 2
+      run: python3 scripts/test-webmail-status.py packages/zig/zig-out/bin/mail webmail-browser-screenshots/mail-delivery
+
     - name: Run native HTTPS browser journeys
       if: runner.os == 'Linux'
       working-directory: .

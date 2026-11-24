@@ -29,7 +29,33 @@ test('a failed refresh clears the old green report and uses uncached authenticat
     await health.refresh()
     expect(health.status()).toBe('unknown')
     expect(health.snapshot()).toBeNull()
+    expect(health.needsSignIn()).toBe(false)
     expect(health.error()).toContain('unavailable')
+  }
+  finally { globalThis.fetch = previous }
+})
+
+test('an unauthorized refresh clears the report and a successful refresh clears the sign-in prompt', async () => {
+  const previous = globalThis.fetch
+  const health = useServiceHealth()
+  const report = { ...fresh, report: { ...fresh.report, checked_at: Math.floor(Date.now() / 1000) } }
+  let unauthorized = false
+  globalThis.fetch = (async () => unauthorized
+    ? Response.json({ code: 'unauthorized', message: 'Invalid or expired session' }, { status: 401 })
+    : Response.json(report)) as typeof fetch
+  try {
+    await health.refresh()
+    expect(health.status()).toBe('healthy')
+    unauthorized = true
+    await health.refresh()
+    expect(health.needsSignIn()).toBe(true)
+    expect(health.status()).toBe('unknown')
+    expect(health.snapshot()).toBeNull()
+    expect(health.error()).toBe('')
+    unauthorized = false
+    await health.refresh()
+    expect(health.needsSignIn()).toBe(false)
+    expect(health.status()).toBe('healthy')
   }
   finally { globalThis.fetch = previous }
 })

@@ -1,5 +1,5 @@
 import { derived, state } from '@stacksjs/stx'
-import { createMailApi } from './mail-api'
+import { createMailApi, MailApiError } from './mail-api'
 
 export interface HealthReport {
   available: boolean
@@ -23,6 +23,7 @@ export function useServiceHealth() {
   const snapshot = state<HealthReport | null>(null)
   const now = state(Math.floor(Date.now() / 1000))
   const busy = state(false)
+  const needsSignIn = state(false)
   const error = state('')
   const api = createMailApi(() => undefined, () => {})
   const status = derived(() => healthState(snapshot(), now()))
@@ -35,12 +36,15 @@ export function useServiceHealth() {
     try {
       snapshot.set(await api<HealthReport>('/webmail/api/health', { signal: AbortSignal.timeout(10000) }))
       error.set('')
+      needsSignIn.set(false)
     }
-    catch {
+    catch (cause) {
+      const unauthorized = cause instanceof MailApiError && cause.status === 401
       snapshot.set(null)
-      error.set('Health monitoring is unavailable. Retry or contact your administrator.')
+      needsSignIn.set(unauthorized)
+      error.set(unauthorized ? '' : 'Health monitoring is unavailable. Retry or contact your administrator.')
     }
     finally { busy.set(false) }
   }
-  return { snapshot, status, label, checkedAt, busy, error, refresh, tick: () => now.set(Math.floor(Date.now() / 1000)) }
+  return { snapshot, status, label, checkedAt, busy, needsSignIn, error, refresh, tick: () => now.set(Math.floor(Date.now() / 1000)) }
 }

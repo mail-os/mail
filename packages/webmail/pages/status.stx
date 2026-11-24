@@ -5,26 +5,46 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Mail health</title>
   <link rel="stylesheet" href="/styles.css">
+  <link rel="icon" href="/mail-icon-192.png" sizes="192x192" type="image/png">
 </head>
 <body>
 <script client>
 import { cancelMailReads, restoreMailReads } from '../functions/mail-api'
 import { useServiceHealth } from '../functions/use-service-health'
-const { snapshot, status, label, checkedAt, busy, error, refresh, tick } = useServiceHealth()
+const { snapshot, status, label, checkedAt, busy, needsSignIn, error, refresh, tick } = useServiceHealth()
 useEventListener('beforeunload', cancelMailReads)
 onMount(refresh)
 useEventListener('pagehide', cancelMailReads)
 useEventListener('pageshow', restoreMailReads)
-useInterval(refresh, 30000, { whileVisible: true })
+useInterval(() => { if (!needsSignIn()) refresh() }, 30000, { whileVisible: true })
 useInterval(tick, 1000, { whileVisible: true })
 </script>
 <main class="health-page">
-  <nav class="health-nav" aria-label="Mail navigation"><a href="/"><span class="mail-icon" data-icon="back" aria-hidden="true"></span>Mail</a><a href="/login"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span>Account sign in</a></nav>
-  <header class="health-header"><div><p class="health-eyebrow calendar-card-mark"><span class="mail-icon" data-icon="pulse" aria-hidden="true"></span>Service health</p><h1>Mail delivery</h1><p>Live protocol checks and recent incidents.</p></div><button class="wm-action" @click="refresh()" :disabled="busy" :text="busy ? 'Checking…' : 'Refresh'"></button></header>
-  <section class="health-summary" :class="{ 'health-summary--ok': status === 'healthy', 'health-summary--warn': status !== 'healthy' }" aria-live="polite"><h2 :text="label"></h2><p :text="'Last checked: ' + checkedAt"></p><p :if="status === 'unknown'">A missing or outdated report cannot confirm that mail is working.</p><p :if="error" :text="error" role="alert"></p><p :if="status === 'degraded'">Some mail may be delayed. Administrators can review the failing checks below.</p></section>
+  <nav class="health-nav" aria-label="Mail navigation">
+    <a href="/"><span class="mail-icon" data-icon="back" aria-hidden="true"></span>Mail</a>
+  </nav>
+  <header class="health-header">
+    <h1><span class="mail-icon" data-icon="pulse" aria-hidden="true"></span>Mail delivery</h1>
+    <button :if="!needsSignIn && (snapshot || error)" class="wm-action" @click="refresh()" :disabled="busy" :text="busy ? 'Checking…' : 'Refresh'"></button>
+  </header>
+  <section class="health-summary" :class="{ 'health-summary--ok': status === 'healthy', 'health-summary--warn': !needsSignIn && (snapshot || error) && status !== 'healthy' }" aria-live="polite">
+    <div :if="needsSignIn" class="health-sign-in">
+      <h2>Sign in to check Mail delivery</h2>
+      <p>Use your mailbox account to view service checks and recent incidents.</p>
+      <a class="wm-action wm-action--accent" href="/login#status"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span>Sign in to Mail</a>
+    </div>
+    <div :if="!needsSignIn && (snapshot || error)">
+      <h2 :text="label"></h2>
+      <p :if="snapshot?.report" :text="'Last checked: ' + checkedAt"></p>
+      <p :if="status === 'unknown' && !error">A missing or outdated report cannot confirm that mail is working.</p>
+      <p :if="error" :text="error" role="alert"></p>
+      <p :if="status === 'degraded'">Some mail may be delayed. Administrators can review the failing checks below.</p>
+    </div>
+    <h2 :if="!needsSignIn && !snapshot && !error">Checking Mail delivery…</h2>
+  </section>
   <section :if="snapshot?.available" class="health-card"><h2>Current checks</h2><p>Tests run every minute. Delivery error counts cover the last five minutes. Passing checks confirm the tested paths; they do not prove that a particular email has arrived.</p><div class="health-check" :for="check in (snapshot?.report?.checks || [])"><span :text="check.name"></span><span class="health-result" :class="{ 'health-result--bad': !check.ok || status === 'unknown' }" :text="status === 'unknown' ? 'Outdated' : check.ok ? 'Passing' : 'Needs attention'"></span><small :if="check.count > 0" :text="check.count + ' errors in 5 minutes'"></small><small :if="check.pending > 0" :text="check.pending + ' alerts awaiting delivery'"></small></div></section>
   <section :if="snapshot?.available" class="health-card"><h2>Incident history</h2><p :if="!(snapshot?.report?.events?.length)">No incidents recorded since monitoring started.</p><article :for="event in (snapshot?.report?.events || [])" class="health-event"><time :text="new Date(event.at * 1000).toLocaleString()"></time><p :text="event.summary"></p></article></section>
-  <p class="health-footnote">Health data contains no message contents or mailbox addresses. Administrator alerts use a separate transport from mail.</p>
+  <p :if="snapshot?.available" class="health-footnote">Health data contains no message contents or mailbox addresses. Administrator alerts use a separate transport from mail.</p>
 </main>
 </body>
 </html>

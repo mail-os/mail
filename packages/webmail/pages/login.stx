@@ -12,6 +12,7 @@ const username = state('')
 const password = state('')
 const busy = state(false)
 const error = state('')
+const returnPath = useRoute().hash === '#status' ? '/status' : '/'
 async function signIn() {
   if (busy()) return
   error.set('')
@@ -23,7 +24,7 @@ async function signIn() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username: username().trim(), password: password() }),
     })
-    if (response.ok) { password.set(''); navigate('/', { reload: true }); return }
+    if (response.ok) { password.set(''); navigate(returnPath, { reload: true }); return }
     error.set(response.status === 429 ? 'Too many attempts. Please wait five minutes.' : response.status === 401 ? 'Invalid email or password.' : 'Sign in failed. Please try again.')
   }
   catch { error.set('Could not reach the server. Please try again.') }
