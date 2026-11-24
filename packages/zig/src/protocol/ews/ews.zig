@@ -1,6 +1,7 @@
 const std = @import("std");
 const clamav = @import("../../antispam/clamav.zig");
 const xml = @import("xml.zig");
+const item_sync = @import("item_sync.zig");
 const file_attachments = @import("attachments.zig");
 const metadata = @import("../../message/attachment_metadata.zig");
 const webmail_maildir = @import("../../api/webmail_maildir.zig");
@@ -309,112 +310,133 @@ fn extractScopedFolderId(soap: []const u8, scope: []const u8) ?[]const u8 {
     return soap[vstart..vend];
 }
 
-/// SyncFolderItems: return the folder's items as IdOnly Adds, WINDOWED to the
-/// client's MaxChangesReturned. macOS Mail rejects a response that returns more
-/// items than it asked for (and then never issues GetItem — so nothing appears);
-/// it pages by echoing our SyncState. We encode the offset as "off:N" and set
-/// IncludesLastItemInRange=false until the window reaches the end, so macOS keeps
-/// paging until it has the whole folder.
+/// Advance a mailbox- and folder-scoped cursor by one page of changes.
 fn syncFolderItems(ctx: *Context, soap: []const u8) !Response {
-    const folder_id = extractScopedFolderId(soap, "SyncFolderId") orelse "inbox";
-    const max_changes = blk: {
-        const v = elementText(soap, "MaxChangesReturned") orelse break :blk 512;
-        break :blk std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t\r\n"), 10) catch 512;
-    };
-    const offset = syncOffset(soap);
+    const request = xml.operation(soap, "SyncFolderItems") catch return itemSyncError(ctx, "ErrorInvalidRequest", "Invalid sync request");
+    const folder_id = if (try request.child("SyncFolderId")) |scope| blk: {
+        const id = (try scope.child("FolderId")) orelse (try scope.child("DistinguishedFolderId")) orelse
+            return itemSyncError(ctx, "ErrorFolderNotFound", "Unknown sync folder");
+        break :blk id.attribute("Id") orelse "";
+    } else "inbox";
+    const folder = folderById(folder_id) orelse return itemSyncError(ctx, "ErrorFolderNotFound", "Unknown sync folder");
+    const max_changes = if (try childText(request, "MaxChangesReturned")) |value|
+        std.fmt.parseInt(usize, std.mem.trim(u8, value, " \t\r\n"), 10) catch 0
+    else
+        512;
+    if (max_changes == 0 or max_changes > 512)
+        return itemSyncError(ctx, "ErrorInvalidRequest", "MaxChangesReturned must be between 1 and 512");
 
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(ctx.allocator);
-    const a = ctx.allocator;
-
-    var arena = std.heap.ArenaAllocator.init(a);
+    const previous = std.mem.trim(u8, (try childText(request, "SyncState")) orelse "", " \t\r\n");
+    const user_id = (try ctx.db.enabledMailboxId(ctx.username)) orelse return .{ .status = 403 };
+    const cursor: item_sync.Cursor = .{ .db = ctx.db, .user_id = user_id, .folder = folder.id };
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
-    const aa = arena.allocator();
+    const a = arena.allocator();
+    const saved = if (previous.len == 0) null else (try cursor.load(a, previous, max_changes)) orelse return invalidItemSyncState(ctx);
+    if (saved) |value| switch (value) {
+        .replay => |body| return .{ .body = try ctx.allocator.dupe(u8, body) },
+        .current => {},
+    };
 
-    // Collect all item ids for this folder, in a stable order.
-    var ids = std.ArrayList([]const u8).empty;
-    var item_tag: []const u8 = "Message";
-    if (folderById(folder_id)) |folder| {
-        switch (folder.kind) {
-            .mail => if (folder.mailbox) |mailbox| {
-                var items = std.ArrayList(MailItem).empty;
-                collectMail(aa, ctx, mailbox, &items) catch {};
-                for (items.items) |it| {
-                    const id = std.fmt.allocPrint(aa, "{s}:{s}", .{ folder_id, it.basename }) catch continue;
-                    ids.append(aa, id) catch {};
-                }
-            },
-            .calendar => {
-                item_tag = "CalendarItem";
-                collectCalendarIds(aa, ctx, &ids) catch {};
-            },
-            .contacts => {
-                item_tag = "Contact";
-                collectContactIds(aa, ctx, &ids) catch {};
-            },
+    const current = folderSyncItems(a, ctx, folder) catch |err| {
+        logger.warn("EWS SyncFolderItems: could not read {s}: {s}", .{ folder.id, @errorName(err) });
+        return itemSyncError(ctx, "ErrorInternalServerError", "Could not read the sync folder");
+    };
+    const known = if (saved) |value| value.current.items else &.{};
+    const page = try item_sync.page(a, known, current, max_changes);
+    const advances = saved == null or page.changes.len > 0;
+    const key = if (advances) try item_sync.newKey(a) else previous;
+    const response = try itemSyncResponse(a, folder, key, page);
+    if (advances) {
+        const items = try std.json.Stringify.valueAlloc(a, page.items, .{});
+        if (saved == null) {
+            try cursor.create(key, items);
+        } else if (!try cursor.advance(previous, key, items, response, page.changes.len)) {
+            if (try cursor.load(a, previous, max_changes)) |retry| {
+                if (retry == .replay) return .{ .body = try ctx.allocator.dupe(u8, retry.replay) };
+            }
+            return invalidItemSyncState(ctx);
         }
+    } else {
+        try cursor.touch(key, saved.?.current.touched_at);
     }
+    logger.info("EWS SyncFolderItems: folder={s} changes={d} last={any}", .{ folder.id, page.changes.len, page.last });
+    return .{ .body = try ctx.allocator.dupe(u8, response) };
+}
 
-    const total = ids.items.len;
-    const start = @min(offset, total);
-    const end = @min(start + max_changes, total);
-    const includes_last = end >= total;
+fn itemSyncError(ctx: *Context, code: []const u8, message: []const u8) !Response {
+    const a = ctx.allocator;
+    const inner = try std.fmt.allocPrint(a,
+        \\<m:SyncFolderItemsResponse><m:ResponseMessages><m:SyncFolderItemsResponseMessage ResponseClass="Error"><m:MessageText>{s}</m:MessageText><m:ResponseCode>{s}</m:ResponseCode><m:SyncState/><m:IncludesLastItemInRange>true</m:IncludesLastItemInRange></m:SyncFolderItemsResponseMessage></m:ResponseMessages></m:SyncFolderItemsResponse>
+    , .{ message, code });
+    defer a.free(inner);
+    return .{ .body = try envelope(a, inner) };
+}
 
+fn invalidItemSyncState(ctx: *Context) !Response {
+    return itemSyncError(ctx, "ErrorInvalidSyncStateData", "Start a new folder sync without SyncState");
+}
+
+fn itemSyncResponse(a: std.mem.Allocator, folder: FolderDef, key: []const u8, page: item_sync.Page) ![]const u8 {
+    const tag = switch (folder.kind) {
+        .mail => "Message",
+        .calendar => "CalendarItem",
+        .contacts => "Contact",
+    };
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
     try buf.print(a,
-        \\<m:SyncFolderItemsResponse><m:ResponseMessages><m:SyncFolderItemsResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:SyncState>off:{d}</m:SyncState><m:IncludesLastItemInRange>{s}</m:IncludesLastItemInRange><m:Changes>
-    , .{ end, if (includes_last) "true" else "false" });
-
-    for (ids.items[start..end]) |id| {
-        try buf.print(a,
-            \\<t:Create><t:{s}><t:ItemId Id="{s}" ChangeKey="ck0"/></t:{s}></t:Create>
-        , .{ item_tag, id, item_tag });
+        \\<m:SyncFolderItemsResponse><m:ResponseMessages><m:SyncFolderItemsResponseMessage ResponseClass="Success"><m:ResponseCode>NoError</m:ResponseCode><m:SyncState>{s}</m:SyncState><m:IncludesLastItemInRange>{s}</m:IncludesLastItemInRange><m:Changes>
+    , .{ key, if (page.last) "true" else "false" });
+    for (page.changes) |change| {
+        const id = xmlEscape(a, change.item.id);
+        switch (change.kind) {
+            .create => try buf.print(a,
+                \\<t:Create><t:{s}><t:ItemId Id="{s}" ChangeKey="ck0"/></t:{s}></t:Create>
+            , .{ tag, id, tag }),
+            .delete => try buf.print(a,
+                \\<t:Delete><t:ItemId Id="{s}"/></t:Delete>
+            , .{id}),
+            .read_flag => try buf.print(a,
+                \\<t:ReadFlagChange><t:ItemId Id="{s}"/><t:IsRead>{s}</t:IsRead></t:ReadFlagChange>
+            , .{ id, if (change.item.seen.?) "true" else "false" }),
+        }
     }
-
     try buf.appendSlice(a, "</m:Changes></m:SyncFolderItemsResponseMessage></m:ResponseMessages></m:SyncFolderItemsResponse>");
-    logger.info("EWS SyncFolderItems: folder={s} total={d} window={d}..{d} last={any}", .{ folder_id, total, start, end, includes_last });
-    return Response{ .body = try envelope(ctx.allocator, buf.items) };
+    return envelope(a, buf.items);
 }
 
-/// Decode our offset-encoded SyncState ("off:N"); absent/empty/other → 0.
-fn syncOffset(soap: []const u8) usize {
-    const ss = elementText(soap, "SyncState") orelse return 0;
-    const p = std.mem.indexOf(u8, ss, "off:") orelse return 0;
-    var i = p + 4;
-    var n: usize = 0;
-    while (i < ss.len and ss[i] >= '0' and ss[i] <= '9') : (i += 1) n = n * 10 + (ss[i] - '0');
-    return n;
-}
-
-/// Append `calendar:<event-id>` for every event across the user's calendars.
-fn collectCalendarIds(aa: std.mem.Allocator, ctx: *Context, ids: *std.ArrayList([]const u8)) !void {
-    const store = ctx.store orelse return;
-    const uid = store.getOrCreateUserId(ctx.username) catch return;
-    const cals = store.getUserCalendars(uid) catch return;
-    defer store.allocator.free(cals);
-    for (cals) |cal| {
-        const events = store.getCalendarEvents(cal.id) catch continue;
-        defer store.allocator.free(events);
-        for (events) |ev| {
-            const id = std.fmt.allocPrint(aa, "calendar:{d}", .{ev.id}) catch continue;
-            ids.append(aa, id) catch {};
-        }
+fn folderSyncItems(a: std.mem.Allocator, ctx: *Context, folder: FolderDef) ![]item_sync.Item {
+    var items: std.ArrayList(item_sync.Item) = .empty;
+    switch (folder.kind) {
+        .mail => try collectSyncMail(a, ctx, folder, &items),
+        .calendar => if (ctx.store) |store| {
+            const uid = try store.getOrCreateUserId(ctx.username);
+            const calendars = try store.getUserCalendars(uid);
+            defer store.allocator.free(calendars);
+            for (calendars) |calendar| {
+                const events = try store.getCalendarEvents(calendar.id);
+                defer store.allocator.free(events);
+                for (events) |event| {
+                    try items.append(a, .{ .id = try std.fmt.allocPrint(a, "calendar:{d}", .{event.id}) });
+                }
+            }
+        },
+        .contacts => if (ctx.store) |store| {
+            const uid = try store.getOrCreateUserId(ctx.username);
+            const books = try store.getUserAddressBooks(uid);
+            defer store.allocator.free(books);
+            for (books) |book| {
+                const contacts = try store.getAddressBookContacts(book.id);
+                defer store.allocator.free(contacts);
+                for (contacts) |contact| {
+                    try items.append(a, .{ .id = try std.fmt.allocPrint(a, "contacts:{d}", .{contact.id}) });
+                }
+            }
+        },
     }
-}
-
-/// Append `contacts:<contact-id>` for every contact across the user's books.
-fn collectContactIds(aa: std.mem.Allocator, ctx: *Context, ids: *std.ArrayList([]const u8)) !void {
-    const store = ctx.store orelse return;
-    const uid = store.getOrCreateUserId(ctx.username) catch return;
-    const abs = store.getUserAddressBooks(uid) catch return;
-    defer store.allocator.free(abs);
-    for (abs) |ab| {
-        const contacts = store.getAddressBookContacts(ab.id) catch continue;
-        defer store.allocator.free(contacts);
-        for (contacts) |c| {
-            const id = std.fmt.allocPrint(aa, "contacts:{d}", .{c.id}) catch continue;
-            ids.append(aa, id) catch {};
-        }
-    }
+    std.mem.sort(item_sync.Item, items.items, {}, item_sync.Item.lessThan);
+    return items.items;
 }
 
 /// GetItem: return the message content for each requested ItemId.
@@ -433,7 +455,7 @@ fn getItem(ctx: *Context, soap: []const u8) !Response {
         const vstart = p + needle.len;
         const vend = std.mem.indexOfScalarPos(u8, soap, vstart, '"') orelse break;
         const id = soap[vstart..vend];
-        appendItemMessage(&buf, aa, ctx, id) catch {
+        appendItemMessage(&buf, aa, ctx, try xmlUnescape(aa, id)) catch {
             try buf.appendSlice(a, "<m:GetItemResponseMessage ResponseClass=\"Error\"><m:ResponseCode>ErrorItemNotFound</m:ResponseCode><m:Items/></m:GetItemResponseMessage>");
         };
         idx = vend + 1;
@@ -632,13 +654,6 @@ fn appendContactItem(buf: *std.ArrayList(u8), aa: std.mem.Allocator, ctx: *Conte
 // Maildir access + helpers
 // ---------------------------------------------------------------------------
 
-const MailItem = struct {
-    basename: []const u8,
-    path: []const u8,
-    seen: bool,
-    epoch: i64,
-};
-
 const FoundMail = struct { path: []const u8, content: []const u8, seen: bool, epoch: i64 };
 
 fn mailboxDirs(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8) ![][]const u8 {
@@ -665,16 +680,24 @@ fn mailboxDirs(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8) ![][]co
     return a.dupe([]const u8, &nested);
 }
 
-fn collectMail(a: std.mem.Allocator, ctx: *Context, mailbox: []const u8, out: *std.ArrayList(MailItem)) !void {
-    const dirs = try mailboxDirs(a, ctx, mailbox);
+fn collectSyncMail(a: std.mem.Allocator, ctx: *Context, folder: FolderDef, out: *std.ArrayList(item_sync.Item)) !void {
+    const dirs = try mailboxDirs(a, ctx, folder.mailbox.?);
+    var visited: std.StringHashMapUnmanaged(void) = .empty;
+    ctx.db.lockMailboxes();
+    defer ctx.db.unlockMailboxes();
     for (dirs) |dir| {
-        const files = fs_compat.listEmlFiles(a, dir) catch continue;
-        for (files) |fname| {
+        const files = fs_compat.listEmlFiles(a, dir) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        for (files) |name| {
+            const basename = maildirBaseName(name);
+            // GetItem resolves a duplicated basename from the first directory.
+            const entry = try visited.getOrPut(a, basename);
+            if (entry.found_existing) continue;
             try out.append(a, .{
-                .basename = maildirBaseName(fname),
-                .path = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, fname }),
-                .seen = maildirSeen(fname),
-                .epoch = maildirEpoch(maildirBaseName(fname)),
+                .id = try std.fmt.allocPrint(a, "{s}:{s}", .{ folder.id, basename }),
+                .seen = maildirSeen(name),
             });
         }
     }

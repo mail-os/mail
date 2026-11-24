@@ -951,6 +951,19 @@ pub const Database = struct {
             \\    items TEXT NOT NULL,
             \\    PRIMARY KEY (user_id, device_id, collection_id)
             \\);
+            \\CREATE TABLE IF NOT EXISTS ews_item_sync (
+            \\    id INTEGER PRIMARY KEY,
+            \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            \\    folder TEXT NOT NULL,
+            \\    sync_key TEXT NOT NULL UNIQUE,
+            \\    items TEXT NOT NULL,
+            \\    previous_key TEXT,
+            \\    previous_response TEXT,
+            \\    previous_count INTEGER,
+            \\    touched_at INTEGER NOT NULL
+            \\);
+            \\CREATE INDEX IF NOT EXISTS idx_ews_item_sync_folder ON ews_item_sync(user_id,folder,touched_at DESC,id DESC);
+            \\CREATE INDEX IF NOT EXISTS idx_ews_item_sync_expiry ON ews_item_sync(touched_at);
             \\CREATE TABLE IF NOT EXISTS eas_mailbox_ping (
             \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             \\    device_id TEXT NOT NULL,

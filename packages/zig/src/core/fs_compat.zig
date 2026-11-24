@@ -350,7 +350,10 @@ pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]con
     const path_z = toZ(dir_path) orelse return error.SystemResources;
     defer freeZ(path_z, dir_path.len);
 
-    const dir = std.c.opendir(path_z) orelse return error.FileNotFound;
+    const dir = std.c.opendir(path_z) orelse {
+        const code: std.c.E = @fromBackingInt(@intCast(std.c._errno().*));
+        return if (code == .NOENT) error.FileNotFound else error.DirectoryReadFailed;
+    };
     defer _ = std.c.closedir(dir);
 
     var entries: std.ArrayList(EmlEntry) = .empty;
@@ -360,7 +363,12 @@ pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]con
     }
 
     var path_buf: [4097]u8 = undefined;
-    while (std.c.readdir(dir)) |entry| {
+    while (true) {
+        std.c._errno().* = 0;
+        const entry = std.c.readdir(dir) orelse {
+            if (std.c._errno().* != 0) return error.DirectoryReadFailed;
+            break;
+        };
         const name_ptr: [*:0]const u8 = @ptrCast(&entry.name);
         const name = std.mem.sliceTo(name_ptr, 0);
         if (isEmlFilename(name)) {
@@ -368,9 +376,9 @@ pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]con
             // symlink could redirect those operations outside the mailbox.
             const full = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}", .{ dir_path, name }, 0) catch continue;
             if (isSymlink(full)) continue;
-            const owned = try allocator.dupe(u8, name);
-            try entries.append(allocator, .{
-                .name = owned,
+            try entries.ensureUnusedCapacity(allocator, 1);
+            entries.appendAssumeCapacity(.{
+                .name = try allocator.dupe(u8, name),
                 .sort_key = parseFilenameTimestamp(name),
             });
         }
