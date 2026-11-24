@@ -2,7 +2,7 @@ name: Publish Mail SDK staging prerelease
 
 on:
   push:
-    tags: ['mail-sdk-staging-0.3.27-staging.1']
+    tags: ['mail-sdk-staging-0.3.27-staging.1-r2']
 
 permissions:
   contents: read
@@ -19,13 +19,13 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
-          fetch-depth: 2
+          fetch-depth: 3
 
       - name: Verify the staging tag and exact PR source
         shell: bash
         run: |
-          test "$GITHUB_REF" = "refs/tags/mail-sdk-staging-$PACKAGE_VERSION"
-          test "$(git rev-parse HEAD^)" = "$SOURCE_REVISION"
+          test "$GITHUB_REF" = "refs/tags/mail-sdk-staging-$PACKAGE_VERSION-r2"
+          git merge-base --is-ancestor "$SOURCE_REVISION" HEAD
           test "$(git diff --name-only "$SOURCE_REVISION" HEAD)" = ".github/workflows/release.yml"
 
       - uses: pantry-pm/pantry/packages/action@v0.11.28
@@ -42,7 +42,7 @@ jobs:
           bun test test/provisioning.test.ts
           bun run build:sdk
           npm pkg set "version=$PACKAGE_VERSION" publishConfig.tag=staging
-          node --input-type=module <<'JS'
+          bun - <<'JS'
           import { createMailProvisioningClient } from './dist/index.js';
           const client = createMailProvisioningClient({ baseUrl: 'http://127.0.0.1:8099', token: 'a'.repeat(64) });
           for (const field of ['status', 'mailbox', 'apply', 'webmailSignInWithPassword']) {
