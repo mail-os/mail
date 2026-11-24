@@ -1,92 +1,69 @@
-name: Release
+name: Publish Mail SDK staging prerelease
 
 on:
   push:
-    tags:
-      - 'v*.*.*'
+    tags: ['mail-sdk-staging-0.3.27-staging.1']
 
 permissions:
-  contents: write
-  # npm mints the publish credential from this token, so the job needs it even
-  # though nothing in the workflow reads it directly.
+  contents: read
   id-token: write
 
 jobs:
-  release:
-    name: Build & Release (all platforms)
+  publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SOURCE_REVISION: fe645c3cbeaba47a49fe0d8c2eb166aa767bd31f
+      PACKAGE_VERSION: 0.3.27-staging.1
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v6
-      with:
-        submodules: recursive
-        fetch-depth: 0
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 2
 
-    - name: Setup project dependencies with Pantry
-      uses: pantry-pm/pantry/packages/action@v0.11.28
+      - name: Verify the staging tag and exact PR source
+        shell: bash
+        run: |
+          test "$GITHUB_REF" = "refs/tags/mail-sdk-staging-$PACKAGE_VERSION"
+          test "$(git rev-parse HEAD^)" = "$SOURCE_REVISION"
+          test "$(git diff --name-only "$SOURCE_REVISION" HEAD)" = ".github/workflows/release.yml"
 
-    # Pantry provides the pinned native toolchain. The hoisted Bun install
-    # provides each workspace's JavaScript dependencies and release builders.
-    - name: Install workspace dependencies
-      run: bun install --frozen-lockfile
+      - uses: pantry-pm/pantry/packages/action@v0.11.28
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
 
-    - name: Build webmail frontend
-      # The zig binaries @embedFile packages/zig/src/api/webmail_dist/* (generated,
-      # not committed), so render it before compiling or every target fails FileNotFound.
-      run: |
-        cd packages/webmail
-        bun run build
+      - name: Install pinned workspace dependencies
+        run: bun install --frozen-lockfile
 
-    - name: Cross-compile every platform
-      # build.zig vendors sqlite3.c + links only libc when cross-compiling, so one
-      # Linux box produces linux & macOS (x86_64 + arm64) binaries into
-      # packages/zig/zig-out/cross/<triple>/ — no macOS/ARM runners needed.
-      run: |
-        cd packages/zig
-        zig build -Dall-targets -Doptimize=ReleaseFast
+      - name: Build and test the SDK
+        working-directory: packages/ts
+        run: |
+          bun test test/provisioning.test.ts
+          bun run build:sdk
+          npm pkg set "version=$PACKAGE_VERSION" publishConfig.tag=staging
+          node --input-type=module <<'JS'
+          import { createMailProvisioningClient } from './dist/index.js';
+          const client = createMailProvisioningClient({ baseUrl: 'http://127.0.0.1:8099', token: 'a'.repeat(64) });
+          for (const field of ['status', 'mailbox', 'apply', 'webmailSignInWithPassword']) {
+            if (typeof client[field] !== 'function') throw new Error('Missing SDK export: ' + field);
+          }
+          JS
 
-    - name: Release via Pantry action
-      # The Pantry action auto-discovers packages/zig/zig-out/cross/<triple>/,
-      # packages each platform, extracts the changelog, and creates the GitHub
-      # release — the whole release flow lives in the action.
-      uses: pantry-pm/pantry/packages/action@v0.11.28
-      with:
-        install: 'false'
-        release: 'true'
-        release-files: 'auto'
-        release-tag: ${{ github.ref_name }}
-        release-token: ${{ secrets.GITHUB_TOKEN }}
-        # "auto" runs logsmith over previous-tag → this-tag rather than trying to
-        # find this tag's heading inside CHANGELOG.md. The changelog logsmith
-        # writes during the version bump has no per-version heading to extract,
-        # so section extraction would come up empty and silently fall through to
-        # the generic notes below.
-        release-changelog: auto
-        release-notes: |
-          ## mail ${{ github.ref_name }}
+      - name: Build the published package's native binaries
+        run: |
+          (cd packages/webmail && bun run build)
+          (cd packages/zig && zig build -Dall-targets -Doptimize=ReleaseFast)
+          install -d packages/ts/bin
+          for target in x86_64-linux-gnu aarch64-linux-gnu x86_64-macos aarch64-macos; do
+            install -m 0755 "packages/zig/zig-out/cross/$target/mail-$target" "packages/ts/bin/mail-${target%-gnu}"
+          done
 
-          Prebuilt binaries for linux & macOS (x86_64 + arm64) are attached below.
-
-          Install via pantry:
-
-          ```sh
-          pantry install github.com/mail-os/mail
-          ```
-
-    - name: Publish the typed management client
-      # Trusted publishing (OIDC), which is how every other @stacksjs package
-      # ships. A personal token published 0.3.5 and then stopped working: npm
-      # answers an unauthorized publish with `E404 ... PUT /@stacksjs%2fmail`,
-      # masking auth as "not found", so v0.3.7 cross-compiled for 21 minutes
-      # twice before dying on an error that never named its own cause. The
-      # credential now comes from the job's OIDC identity: nothing to expire,
-      # no secret to keep in sync, and no token to leak.
-      #
-      # NPM_TOKEN is deliberately NOT passed. pantry prefers the OIDC identity
-      # when id-token is available, and leaving the token out means a stale one
-      # can never quietly take the failing path again.
-      #
-      # The npm-side trusted publisher names THIS workflow's filename, so
-      # renaming this file breaks publishing until npm is updated to match.
-      working-directory: packages/ts
-      run: pantry publish --npm --access public
+      - name: Publish only to the staging dist-tag
+        working-directory: packages/ts
+        shell: bash
+        run: |
+          test "$(npm view @stacksjs/mail@latest version --registry https://registry.npmjs.org)" = "0.3.26"
+          npm pack --dry-run --ignore-scripts
+          npm publish --access public --tag staging --provenance --ignore-scripts --registry https://registry.npmjs.org
+          test "$(npm view @stacksjs/mail@latest version --registry https://registry.npmjs.org)" = "0.3.26"
