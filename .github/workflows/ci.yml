@@ -77,6 +77,12 @@ jobs:
       timeout-minutes: 2
       run: python3 scripts/test-client-passwords.py packages/zig/zig-out/bin/mail --browser chromium --screenshots webmail-browser-screenshots
 
+    - name: Verify webmail two-step verification in the browser
+      if: runner.os == 'Linux'
+      working-directory: .
+      timeout-minutes: 5
+      run: python3 scripts/test-webmail-mfa.py packages/zig/zig-out/bin/mail --browser chromium --browser webkit
+
     - name: Verify self-hosted mailbox management in the browser
       if: runner.os == 'Linux'
       working-directory: .
@@ -166,6 +172,7 @@ jobs:
         python3 ../../scripts/test-webmail-teams.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-team-invitations.py zig-out/bin/mail
         python3 ../../scripts/test-hosted-sign-in.py zig-out/bin/mail
+        python3 ../../scripts/test-webmail-mfa.py zig-out/bin/mail
         python3 ../../scripts/test-client-passwords.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-team-threads.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-shared-inbox.py zig-out/bin/mail

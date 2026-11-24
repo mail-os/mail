@@ -16,6 +16,15 @@ const io_compat = @import("../core/io_compat.zig");
 const time_compat = @import("../core/time_compat.zig");
 const database = @import("../storage/database.zig");
 const auth_mod = @import("../auth/auth.zig");
+const mfa = @import("../storage/webmail_mfa.zig");
+const security = @import("../auth/security.zig");
+const account_links = @import("../storage/webmail_account_links.zig");
+
+pub const FactorOptions = struct {
+    code: ?[]const u8 = null,
+    limiter: ?*security.RateLimiter = null,
+    link: ?struct { owner: []const u8, username: []const u8, id: []const u8 } = null,
+};
 
 /// 32 random bytes -> 64 hex chars. Plenty of entropy for an opaque token.
 pub const token_bytes_len = 32;
@@ -59,6 +68,7 @@ pub const SessionManager = struct {
     /// When true, the Secure attribute is added to cookies (HTTPS only). For
     /// local dev over plain HTTP this is false so the cookie is still set.
     secure_cookies: bool = true,
+    mfa_key: ?mfa.Key = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -79,46 +89,61 @@ pub const SessionManager = struct {
         ip_address: ?[]const u8,
         user_agent: ?[]const u8,
     ) !Session {
-        const ok = try self.auth.verifyCredentialsForPeer(ip_address orelse "", username, password);
-        if (!ok) return SessionError.InvalidCredentials;
+        return self.loginWithFactor(username, password, ip_address, user_agent, .{});
+    }
 
-        // Use the same canonical key as IMAP and SMTP. Domains distinguish
-        // hosted accounts and must never be discarded from a session identity.
-        const local = try self.auth.canonicalUsername(username, self.allocator);
-        defer self.allocator.free(local);
+    pub fn loginWithFactor(
+        self: *SessionManager,
+        username: []const u8,
+        password: []const u8,
+        ip_address: ?[]const u8,
+        user_agent: ?[]const u8,
+        factor: FactorOptions,
+    ) !Session {
+        var primary = (try self.auth.verifyWebmailPrimary(ip_address orelse "", username, password)) orelse
+            return SessionError.InvalidCredentials;
+        defer primary.deinit(self.auth.allocator);
+        if (factor.link) |link| if (std.mem.eql(u8, primary.username, link.username)) return error.AccountAlreadyLinked;
 
-        // Resolve the canonical email from the user record; fall back to the
-        // raw username if the lookup fails for any reason.
-        const email_buf = blk: {
-            if (self.db.getUserByUsername(local)) |user_val| {
-                var user = user_val;
-                defer user.deinit(self.allocator);
-                break :blk try self.allocator.dupe(u8, user.email);
-            } else |_| {
-                break :blk try self.allocator.dupe(u8, username);
-            }
-        };
+        const email_buf = try self.allocator.dupe(u8, primary.email);
         errdefer self.allocator.free(email_buf);
-
         const session_id = try generateToken(self.allocator);
         errdefer self.allocator.free(session_id);
         const csrf_secret = try generateToken(self.allocator);
         errdefer self.allocator.free(csrf_secret);
-
-        const username_dup = try self.allocator.dupe(u8, local);
+        const username_dup = try self.allocator.dupe(u8, primary.username);
         errdefer self.allocator.free(username_dup);
+        const now = time_compat.timestamp();
 
-        const expires_at = time_compat.timestamp() + self.idle_ttl_seconds;
-
-        try self.db.createWebmailSession(
-            session_id,
-            username_dup,
-            email_buf,
-            csrf_secret,
-            expires_at,
-            ip_address,
-            user_agent,
-        );
+        var tx = try self.db.beginTransaction(.write);
+        defer tx.deinit();
+        mfa.requireCurrentPassword(tx, primary) catch |err| {
+            if (err == error.InvalidEnrollment) return SessionError.InvalidCredentials;
+            return err;
+        };
+        if (factor.code != null and try mfa.enabled(tx, primary.id)) {
+            if (factor.limiter) |limiter| try mfa.limitAttempt(limiter, primary.id);
+        }
+        try mfa.consume(tx, if (self.mfa_key) |*key| key else null, primary.id, factor.code, now);
+        {
+            const stmt = try tx.prepare(
+                \\INSERT INTO webmail_sessions
+                \\    (session_id, username, email, csrf_secret, created_at, last_activity, expires_at, ip_address, user_agent)
+                \\VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7, ?8)
+            );
+            defer stmt.finalize();
+            try stmt.bind(1, session_id);
+            try stmt.bind(2, username_dup);
+            try stmt.bind(3, email_buf);
+            try stmt.bind(4, csrf_secret);
+            try stmt.bind(5, now);
+            try stmt.bind(6, now + self.idle_ttl_seconds);
+            try stmt.bindOpt(7, ip_address);
+            try stmt.bindOpt(8, user_agent);
+            _ = try stmt.step();
+        }
+        if (factor.link) |link| try account_links.createInTransaction(tx, link.owner, session_id, link.id, now);
+        try tx.commit();
 
         return Session{
             .session_id = session_id,
@@ -201,12 +226,16 @@ pub const SessionManager = struct {
 /// Parse the session token from a Cookie header value, or null if absent.
 /// Handles multiple cookies: "a=1; webmail_session=abc; b=2".
 pub fn parseSessionCookie(cookie_header: []const u8) ?[]const u8 {
+    return parseCookie(cookie_header, cookie_name);
+}
+
+pub fn parseCookie(cookie_header: []const u8, wanted: []const u8) ?[]const u8 {
     var it = std.mem.splitScalar(u8, cookie_header, ';');
     while (it.next()) |pair_raw| {
         const pair = std.mem.trim(u8, pair_raw, " \t");
         if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
             const name = pair[0..eq];
-            if (std.mem.eql(u8, name, cookie_name)) {
+            if (std.mem.eql(u8, name, wanted)) {
                 return pair[eq + 1 ..];
             }
         }

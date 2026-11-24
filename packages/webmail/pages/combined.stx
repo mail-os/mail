@@ -12,9 +12,19 @@ import { cancelMailReads, restoreMailReads } from '../functions/mail-api'
 import { combinedMessageKey, combinedMessagePath, useCombinedInbox } from '../functions/use-combined-inbox'
 import { folderName, senderAddress, shortDate } from '../functions/mail-utils'
 const {
-  user, accounts, linking, manageOpen, username, password, query, searchScope, listing, loading, busy, error, notice, selection, selectedRows,
-  mount, destroy, refresh, runSearch, turnPage, toggleRow, changeAccounts, applyAction,
+  user, accounts, linking, manageOpen, username, password, linkFactor, linkNeedsFactor, query, searchScope, listing, loading, busy, error, notice, selection, selectedRows,
+  mount, destroy, refresh, runSearch, turnPage, toggleRow, changeAccounts, applyAction, cancelLink, toggleAccountManagement,
 } = useCombinedInbox(() => navigate('/login', { reload: true }))
+const linkFactorField = useRef('linkFactorField')
+const addLinkButton = useRef('addLinkButton')
+async function submitLink() {
+  await changeAccounts()
+  if (linkNeedsFactor()) nextTick(() => linkFactorField.current?.focus())
+}
+function closeLink() {
+  cancelLink()
+  nextTick(() => addLinkButton.current?.focus())
+}
 onMount(mount)
 onUnmounted(destroy)
 useInterval(() => { if (!loading()) void refresh() }, 15000, { whileVisible: true })
@@ -22,6 +32,7 @@ useInterval(() => { if (listing()?.index.pending && !loading()) void refresh() }
 useEventListener('focus', refresh)
 useEventListener('online', refresh)
 useEventListener('pagehide', cancelMailReads)
+useEventListener('pagehide', cancelLink)
 useEventListener('pageshow', restoreMailReads)
 </script>
 <main class="wm-combined">
@@ -29,7 +40,7 @@ useEventListener('pageshow', restoreMailReads)
     <a class="wm-action wm-shared-back" href="/"><span class="mail-icon" data-icon="back" aria-hidden="true"></span>Mail</a>
     <span class="mail-app-mark" aria-hidden="true"><span class="mail-icon" data-icon="layers"></span></span>
     <h1>Combined inbox</h1>
-    <button :if="user" type="button" class="wm-action" @click="manageOpen.set(!manageOpen())" :aria-expanded="manageOpen" aria-controls="combined-accounts"><span class="mail-icon" data-icon="people" aria-hidden="true"></span>Linked accounts</button>
+    <button :if="user" type="button" class="wm-action" @click="toggleAccountManagement()" :aria-expanded="manageOpen" aria-controls="combined-accounts" :disabled="busy"><span class="mail-icon" data-icon="people" aria-hidden="true"></span>Linked accounts</button>
   </header>
   <p :if="error" class="wm-inline-error" role="alert" :text="error"></p>
   <p :if="notice" class="wm-notice" role="status" :text="notice"></p>
@@ -42,11 +53,13 @@ useEventListener('pageshow', restoreMailReads)
         <button type="button" class="wm-action" @click="changeAccounts(account.id)" :disabled="busy" :aria-label="'Remove ' + account.address">Remove</button>
       </li>
     </ul>
-    <button :if="!linking && accounts.length < 4" type="button" class="wm-action wm-action--accent" @click="linking.set(true)">Link a mailbox</button>
-    <form :if="linking && accounts.length < 4" class="wm-combined-form" @submit.prevent="changeAccounts()">
-      <label>Mailbox username<input type="text" x-model.trim="username" autocomplete="off" maxlength="320" required :disabled="busy"></label>
-      <label>Mailbox password<input type="password" x-model="password" autocomplete="off" maxlength="1024" required :disabled="busy"></label>
+    <button :if="!linking && accounts.length < 4" ref="addLinkButton" type="button" class="wm-action wm-action--accent" @click="linking.set(true)">Link a mailbox</button>
+    <form :if="linking && accounts.length < 4" class="wm-combined-form" @submit.prevent="submitLink()">
+      <label>Mailbox username<input type="text" x-model.trim="username" autocomplete="off" maxlength="320" required :disabled="busy || linkNeedsFactor"></label>
+      <label>Mailbox password<input type="password" x-model="password" autocomplete="off" maxlength="1024" required :disabled="busy || linkNeedsFactor"></label>
+      <label :if="linkNeedsFactor">Authenticator or recovery code<input ref="linkFactorField" type="text" x-model.trim="linkFactor" autocomplete="one-time-code" autocapitalize="off" spellcheck="false" maxlength="32" required :disabled="busy"></label>
       <button class="wm-action wm-action--accent" type="submit" :disabled="busy">Verify and link</button>
+      <button :if="linkNeedsFactor" class="wm-action" type="button" :disabled="busy" @click="closeLink()">Cancel</button>
     </form>
   </section>
   <section :if="user" class="wm-combined-messages" aria-label="Combined messages" :aria-busy="loading">

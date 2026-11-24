@@ -85,6 +85,8 @@ const {
   clientPasswordsOpen, canCreateClientPassword, clientPasswords, clientPasswordName, clientPasswordType, clientMailboxPassword,
   createdClientPassword, revokingClientPassword, clientPasswordsBusy, clientPasswordsError, clientPasswordsNotice,
   clientPasswordTypes, clientPasswordTypeLabel, toggleClientPasswords, createClientPassword, revokeClientPassword, copyClientPassword,
+  mfaOpen, mfaStatus, mfaPassword, mfaCode, mfaSecret, mfaRecoveryCodes, mfaRemoving, mfaBusy, mfaError, mfaNotice,
+  toggleMfaSettings, closeMfaSettings, beginMfaSetup, confirmMfaSetup, cancelMfaSetup, disableMfa, copyMfaCodes,
   recoveryAddress, recoverySetBy, recoveryInput, recoveryPassword, recoveryError, recoveryNotice, recoveryLoading,
   savingRecovery, saveRecovery,
   forwarding, forwardingAddress, forwardingPassword, forwardingCode, forwardingBusy, forwardingError, forwardingNotice, changeForwarding,
@@ -137,6 +139,36 @@ const {
   notificationsAvailable, notificationEnabled, notificationHere, notificationBusy, notificationError,
   notificationRuleBusy, notificationRuleError, changeNotificationSettings, changeNotificationRule, pollNotifications,
 } = mail
+const mfaPasswordField = useRef('mfaPasswordField')
+const mfaSetupCodeField = useRef('mfaSetupCodeField')
+const mfaRecoveryHeading = useRef('mfaRecoveryHeading')
+const mfaRemoveButton = useRef('mfaRemoveButton')
+const mfaRemoveCodeField = useRef('mfaRemoveCodeField')
+useEventListener('pagehide', closeMfaSettings)
+async function submitMfaSetup() {
+  await beginMfaSetup()
+  nextTick(() => (mfaSecret() ? mfaSetupCodeField.current : mfaPasswordField.current)?.focus())
+}
+async function submitMfaConfirmation() {
+  await confirmMfaSetup()
+  nextTick(() => (mfaRecoveryCodes().length ? mfaRecoveryHeading.current : mfaSetupCodeField.current)?.focus())
+}
+function finishMfaSetup() {
+  mfaRecoveryCodes.set([])
+  nextTick(() => mfaRemoveButton.current?.focus())
+}
+function startMfaRemoval() {
+  mfaRemoving.set(true)
+  nextTick(() => mfaRemoveCodeField.current?.focus())
+}
+function resetMfaSetup() {
+  cancelMfaSetup()
+  nextTick(() => (mfaStatus()?.enabled ? mfaRemoveButton.current : mfaPasswordField.current)?.focus())
+}
+async function submitMfaRemoval() {
+  await disableMfa()
+  nextTick(() => (mfaRemoving() ? mfaRemoveCodeField.current : mfaPasswordField.current)?.focus())
+}
 function showSnapshotDialog() {
   nextTick(() => { if (!snapshotDialog.current?.open) snapshotDialog.current?.showModal() })
 }
@@ -919,6 +951,51 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
   </div>
 </section>
 <form class="login-recovery" @submit.prevent="changePassword()"><h2><span class="mail-icon" data-icon="shield" aria-hidden="true"></span>Change password</h2><p class="login-sub">Changing your mailbox password also revokes app passwords.</p><label for="currentPassword">Current password</label><input id="currentPassword" type="password" x-model="currentPassword" autocomplete="current-password" required><label for="newPassword">New password</label><input id="newPassword" type="password" x-model="newPassword" autocomplete="new-password" minlength="12" required><label for="confirmPassword">Confirm password</label><input id="confirmPassword" type="password" x-model="confirmPassword" autocomplete="new-password" minlength="12" required><p :if="passwordError" role="alert" class="login-error" :text="passwordError"></p><button type="submit" :disabled="savingPassword" :text="savingPassword ? 'Saving…' : 'Change password'"></button></form>
+<section class="login-recovery wm-mfa-settings" aria-labelledby="mfaHeading">
+  <h2 id="mfaHeading"><span class="mail-icon" data-icon="shield" aria-hidden="true"></span>Two-step verification</h2>
+  <button type="button" class="wm-action login-secondary" :aria-expanded="mfaOpen" aria-controls="mfa-settings" :disabled="mfaBusy" @click="toggleMfaSettings()" :text="mfaOpen ? 'Hide two-step settings' : 'Manage two-step verification'"></button>
+  <div id="mfa-settings" :if="mfaOpen" :aria-busy="mfaBusy">
+    <p :if="mfaError" class="login-error" role="alert" :text="mfaError"></p>
+    <p :if="mfaNotice" class="login-sub" role="status" :text="mfaNotice"></p>
+    <p :if="mfaBusy && !mfaStatus" class="login-sub" role="status">Loading…</p>
+    <p :if="mfaStatus?.enabled && !mfaRecoveryCodes.length" class="login-sub">Two-step verification is on. Use your authenticator or a saved recovery code when signing in.</p>
+    <p :if="mfaStatus && !mfaStatus.enabled && !mfaStatus.available" class="login-sub">Two-step setup is unavailable on this server.</p>
+    <form :if="mfaStatus?.available && !mfaStatus.enabled && !mfaSecret" @submit.prevent="submitMfaSetup()">
+      <label for="mfaPassword">Current mailbox password</label>
+      <input id="mfaPassword" ref="mfaPasswordField" type="password" x-model="mfaPassword" autocomplete="current-password" maxlength="1024" required :disabled="mfaBusy">
+      <button type="submit" :disabled="mfaBusy">Set up authenticator</button>
+    </form>
+    <form :if="mfaSecret" @submit.prevent="submitMfaConfirmation()">
+      <p id="mfaSetupInstructions" class="login-sub">Add a time-based account in your authenticator with this setup key, then enter the six-digit code.</p>
+      <label for="mfaSetupKey">Setup key</label>
+      <input id="mfaSetupKey" type="text" :value="mfaSecret" readonly autocomplete="off" spellcheck="false" aria-describedby="mfaSetupInstructions">
+      <label for="mfaSetupCode">Authenticator code</label>
+      <input id="mfaSetupCode" ref="mfaSetupCodeField" type="text" x-model.trim="mfaCode" inputmode="numeric" pattern="[0-9]{6}" autocomplete="one-time-code" maxlength="6" required :disabled="mfaBusy">
+      <div class="wm-mfa-actions">
+        <button type="submit" class="wm-action" :disabled="mfaBusy">Turn on verification</button>
+        <button type="button" class="wm-action login-secondary" @click="resetMfaSetup()" :disabled="mfaBusy">Cancel</button>
+      </div>
+    </form>
+    <div :if="mfaRecoveryCodes.length" class="wm-mfa-recovery">
+      <h3 ref="mfaRecoveryHeading" tabindex="-1">Save your recovery codes</h3>
+      <p class="login-sub">Keep these codes away from this device. Each works once, and this is the only time they are shown.</p>
+      <textarea class="wm-mfa-codes" aria-label="Recovery codes" :value="mfaRecoveryCodes.join('\n')" rows="10" readonly autocomplete="off" spellcheck="false"></textarea>
+      <div class="wm-mfa-actions">
+        <button type="button" class="wm-action login-secondary" @click="copyMfaCodes()">Copy recovery codes</button>
+        <button type="button" class="wm-action" @click="finishMfaSetup()">Done</button>
+      </div>
+    </div>
+    <button :if="mfaStatus?.enabled && !mfaRemoving && !mfaRecoveryCodes.length" ref="mfaRemoveButton" type="button" class="wm-action login-secondary" @click="startMfaRemoval()">Turn off two-step verification</button>
+    <form :if="mfaRemoving" @submit.prevent="submitMfaRemoval()">
+      <label for="mfaRemoveCode">Authenticator or recovery code</label>
+      <input id="mfaRemoveCode" ref="mfaRemoveCodeField" type="text" x-model.trim="mfaCode" autocomplete="one-time-code" autocapitalize="off" spellcheck="false" maxlength="32" required :disabled="mfaBusy">
+      <div class="wm-mfa-actions">
+        <button type="submit" class="wm-action" :disabled="mfaBusy">Turn off verification</button>
+        <button type="button" class="wm-action login-secondary" @click="resetMfaSetup()" :disabled="mfaBusy">Cancel</button>
+      </div>
+    </form>
+  </div>
+</section>
 <section class="login-recovery wm-client-passwords" aria-labelledby="clientPasswordsHeading">
   <h2 id="clientPasswordsHeading"><span class="mail-icon" data-icon="shield" aria-hidden="true"></span>App passwords</h2>
   <button type="button" class="wm-action login-secondary" :aria-expanded="clientPasswordsOpen" aria-controls="client-passwords" @click="toggleClientPasswords()" :text="clientPasswordsOpen ? 'Hide app passwords' : 'Manage app passwords'"></button>

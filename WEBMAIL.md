@@ -494,6 +494,34 @@ The browser session and operator provisioning contract have separate routes.
   it. `DELETE /webmail/api/assistant-grants/<id>` revokes it. Owner mutations
   use the same-origin mailbox session.
 
+## Two-step verification
+
+Open **Account → Manage two-step verification**, enter your mailbox password,
+and add the setup key to a time-based authenticator. Enter its six-digit code
+to finish setup. Save the ten recovery codes somewhere you can reach after
+losing the authenticator. Mail shows the codes once, and each code works once.
+Turning verification on or off signs out the mailbox's other browser sessions.
+
+Mail verifies the factor for direct webmail sign-in, hosted sign-in from the
+Mail website, and links to this mailbox from Combined inbox. A hosted sign-in
+proof gives an enrolled mailbox two minutes to verify in the same browser.
+The existing signed-in account stays active until the switch succeeds. Mail,
+calendar and contacts, and Exchange clients keep their existing app password
+scopes.
+
+If you lose the authenticator, sign in with a saved recovery code. Use another
+unused code to turn verification off, then set up your replacement and save the
+new set of codes. A password reset signs out browser sessions and keeps the
+second factor in place.
+
+Operators enable enrollment with `SMTP_WEBMAIL_MFA_KEY`, a 32-byte deployment
+secret written as 64 hexadecimal characters. Generate one with `openssl rand -hex 32`,
+keep it in the server's secret store, and keep a protected backup
+separate from the database. Setup requires secure cookies and a public HTTPS
+listener or trusted local TLS gateway. Keep the same key when restoring the
+database or restarting the service. An enrolled mailbox still requires a factor
+when the key is missing. A saved recovery code works without that key.
+
 ## Password recovery
 
 Each mailbox may have one recovery address outside itself. "Forgot password?"

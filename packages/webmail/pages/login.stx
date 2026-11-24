@@ -10,40 +10,78 @@
 <script client>
 const username = state('')
 const password = state('')
+const factor = state('')
 const busy = state(false)
 const error = state('')
+const hosted = useRoute().hash === '#hosted-factor'
+const needsFactor = state(hosted)
+const factorField = useRef('factorField')
+const passwordField = useRef('passwordField')
 const returnDestinations = new Map([['#status', '/status'], ['#mailboxes', '/mailboxes']])
 const returnPath = returnDestinations.get(useRoute().hash) ?? '/'
+onMount(() => { if (hosted) nextTick(() => factorField.current?.focus()) })
+useEventListener('pagehide', () => { password.set(''); factor.set('') })
+function editCredentials() {
+  needsFactor.set(false)
+  factor.set('')
+  password.set('')
+  error.set('')
+  nextTick(() => passwordField.current?.focus())
+}
 async function signIn() {
   if (busy()) return
   error.set('')
-  if (!username().trim() || !password()) { error.set('Enter your email and password.'); return }
+  if (!hosted && (!username().trim() || !password())) { error.set('Enter your email and password.'); return }
+  if (needsFactor() && !factor().trim()) { error.set('Enter an authenticator or recovery code.'); return }
   busy.set(true)
   try {
-    const response = await fetch('/webmail/auth/login', {
+    const code = factor().trim()
+    factor.set('')
+    const response = await fetch(hosted ? '/webmail/auth/hosted/verify' : '/webmail/auth/login', {
       method: 'POST', credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: username().trim(), password: password() }),
+      body: JSON.stringify(hosted ? { factor: code } : { username: username().trim(), password: password(), ...(needsFactor() ? { factor: code } : {}) }),
     })
     if (response.ok) { password.set(''); navigate(returnPath, { reload: true }); return }
-    error.set(response.status === 429 ? 'Too many attempts. Please wait five minutes.' : response.status === 401 ? 'Invalid email or password.' : 'Sign in failed. Please try again.')
+    const result = await response.json().catch(() => ({}))
+    if (result.error === 'factor_required') {
+      needsFactor.set(true)
+      return
+    }
+    error.set(result.error === 'invalid_credentials' ? 'Invalid email or password.' : result.message || 'Sign in failed. Please try again.')
+    if (result.error === 'invalid_credentials' && needsFactor()) {
+      const message = error()
+      editCredentials()
+      error.set(message)
+    }
   }
   catch { error.set('Could not reach the server. Please try again.') }
-  finally { busy.set(false) }
+  finally {
+    busy.set(false)
+    if (needsFactor()) nextTick(() => factorField.current?.focus())
+  }
 }
 </script>
 <main class="login">
   <div class="mail-app-mark"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span></div>
   <h1>Sign in to Mail</h1>
   <form @submit.prevent="signIn()">
-    <label for="email">Email or username</label>
-    <input id="email" type="text" x-model.trim="username" autocomplete="username" placeholder="you@example.com" required autofocus>
-    <label for="password">Password</label>
-    <input id="password" type="password" x-model="password" autocomplete="current-password" required>
+    <div :if="!hosted">
+      <label for="email">Email or username</label>
+      <input id="email" type="text" x-model.trim="username" autocomplete="username" placeholder="you@example.com" required :disabled="busy || needsFactor" autofocus>
+      <label for="password">Password</label>
+      <input id="password" ref="passwordField" type="password" x-model="password" autocomplete="current-password" required :disabled="busy || needsFactor">
+    </div>
+    <div :if="needsFactor">
+      <label for="signInFactor">Authenticator or recovery code</label>
+      <input id="signInFactor" ref="factorField" type="text" x-model.trim="factor" autocomplete="one-time-code" autocapitalize="off" spellcheck="false" maxlength="32" required :disabled="busy">
+    </div>
     <p :if="error" :text="error" class="login-error" role="alert"></p>
-    <button type="submit" :disabled="busy" :text="busy ? 'Signing in…' : 'Sign in'"></button>
+    <button type="submit" :disabled="busy" :text="busy ? 'Signing in…' : needsFactor ? 'Verify and sign in' : 'Sign in'"></button>
+    <button :if="needsFactor && !hosted" type="button" class="login-secondary" :disabled="busy" @click="editCredentials()">Change sign-in details</button>
   </form>
-  <p class="login-forgot"><a class="login-link" href="/forgot">Forgot password?</a></p>
+  <p :if="hosted" class="login-forgot"><a class="login-link" href="/login">Use mailbox password</a></p>
+  <p :if="!hosted && !needsFactor" class="login-forgot"><a class="login-link" href="/forgot">Forgot password?</a></p>
   <noscript>JavaScript is required to use webmail.</noscript>
 </main>
 </body>

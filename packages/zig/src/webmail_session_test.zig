@@ -7,6 +7,7 @@ const std = @import("std");
 
 test {
     std.testing.refAllDecls(@import("api/webmail_session.zig"));
+    std.testing.refAllDecls(@import("storage/webmail_mfa.zig"));
     std.testing.refAllDecls(@import("api/webmail_maildir.zig"));
     std.testing.refAllDecls(@import("api/webmail_http.zig"));
     std.testing.refAllDecls(@import("api/webmail_compose.zig"));

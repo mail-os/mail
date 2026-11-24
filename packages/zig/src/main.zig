@@ -538,6 +538,13 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         break :blk id;
     } else null;
     const hosted_sign_in_origin = env.get("SMTP_HOSTED_SIGN_IN_ORIGIN");
+    const mfa_key = if (env.get("SMTP_WEBMAIL_MFA_KEY")) |value| blk: {
+        var bytes: @import("storage/webmail_mfa.zig").Key = undefined;
+        if (value.len != bytes.len * 2 or !cfg.enable_webmail or !cfg.webmail_secure_cookies or cfg.catch_all)
+            return error.InvalidWebmailMfaConfiguration;
+        _ = std.fmt.hexToBytes(&bytes, value) catch return error.InvalidWebmailMfaConfiguration;
+        break :blk bytes;
+    } else null;
     if (hosted_sign_in_origin) |origin| {
         if (provisioning_port == null or !cfg.enable_webmail or !cfg.webmail_secure_cookies or
             !webmail_http.validHostedSignInOrigin(origin)) return error.InvalidHostedSignInConfiguration;
@@ -568,6 +575,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
                 .hostname = cfg.hostname,
                 .mail_config = &cfg,
                 .hosted_sign_in_origin = hosted_sign_in_origin,
+                .mfa_key = mfa_key,
                 .hosted_team_domains = if (provisioning_port != null) env.get("SMTP_PROVISIONING_ADDITIONAL_DOMAINS") else null,
                 .primary_provisioning_domain = env.get("SMTP_PROVISIONING_DOMAIN"),
                 .delivery_method = cfg.delivery_method,

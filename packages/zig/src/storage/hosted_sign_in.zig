@@ -3,6 +3,9 @@ const std = @import("std");
 const database = @import("database.zig");
 const PasswordHasher = @import("../auth/password.zig").PasswordHasher;
 const time = @import("../core/time_compat.zig");
+const mfa = @import("webmail_mfa.zig");
+const security = @import("../auth/security.zig");
+const Tx = database.Database.Transaction;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const ttl_seconds = 120;
@@ -12,6 +15,10 @@ pub const schema =
     \\    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     \\    actor TEXT NOT NULL,
     \\    expires_at INTEGER NOT NULL
+    \\);
+    \\CREATE TABLE IF NOT EXISTS hosted_sign_in_factors (
+    \\    digest BLOB PRIMARY KEY REFERENCES hosted_sign_in_proofs(digest) ON DELETE CASCADE,
+    \\    previous_session TEXT
     \\);
     \\CREATE INDEX IF NOT EXISTS hosted_sign_in_expiry ON hosted_sign_in_proofs(expires_at);
     \\CREATE INDEX IF NOT EXISTS hosted_sign_in_user ON hosted_sign_in_proofs(user_id);
@@ -103,40 +110,117 @@ pub fn issue(db: *database.Database, a: std.mem.Allocator, proof: []const u8, in
     return expires;
 }
 
-pub fn exchange(db: *database.Database, proof: []const u8, session: []const u8, csrf: []const u8, previous: ?[]const u8, now: i64, session_expires: i64) !void {
-    var hash: [Sha256.digest_length]u8 = undefined;
+const Digest = [Sha256.digest_length]u8;
+
+fn factorDigest(token: []const u8) Digest {
+    var hash = Sha256.init(.{});
+    hash.update("hosted-webmail-factor:");
+    hash.update(token);
+    return hash.finalResult();
+}
+
+const eligible =
+    \\ FROM hosted_sign_in_proofs h
+    \\JOIN provisioned_mailboxes p ON p.user_id = h.user_id AND p.actor = h.actor
+    \\JOIN users u ON u.id = h.user_id AND u.username = p.mailbox
+    \\WHERE h.digest = ?1 AND h.expires_at > ?2 AND u.enabled = 1
+    \\  AND (p.read_until IS NULL OR p.read_until > ?2)
+;
+
+fn consume(tx: Tx, digest: *const Digest) !void {
+    const stmt = try tx.prepare("DELETE FROM hosted_sign_in_proofs WHERE digest = ?1");
+    defer stmt.finalize();
+    try stmt.bindBlob(1, digest);
+    _ = try stmt.step();
+}
+
+pub const SessionRequest = struct {
+    session: []const u8,
+    csrf: []const u8,
+    previous: ?[]const u8,
+    now: i64,
+    expires: i64,
+};
+
+fn startSession(tx: Tx, digest: *const Digest, input: SessionRequest, previous: ?[]const u8) !void {
+    {
+        const stmt = try tx.prepare(
+            \\INSERT INTO webmail_sessions(session_id, username, email, csrf_secret, created_at, last_activity, expires_at)
+            \\SELECT ?3, u.username, u.email, ?4, ?2, ?2, ?5
+        ++ eligible ++ " RETURNING session_id");
+        defer stmt.finalize();
+        try stmt.bindBlob(1, digest);
+        try stmt.bind(2, input.now);
+        try stmt.bind(3, input.session);
+        try stmt.bind(4, input.csrf);
+        try stmt.bind(5, input.expires);
+        if (!try stmt.step()) return error.InvalidProof;
+    }
+    const retire = try tx.prepare("DELETE FROM webmail_sessions WHERE session_id = ?1 OR session_id = ?2");
+    defer retire.finalize();
+    try retire.bindOpt(1, input.previous);
+    try retire.bindOpt(2, previous);
+    _ = try retire.step();
+}
+
+/// Spend the website proof on a session or a distinct, short-lived factor challenge.
+pub fn exchange(db: *database.Database, proof: []const u8, challenge: []const u8, input: SessionRequest) !enum { session, factor } {
+    var hash: Digest = undefined;
     Sha256.hash(proof, &hash, .{});
     var tx = try db.beginTransaction(.write);
     defer tx.deinit();
-    {
-        const add = try tx.prepare(
-            \\INSERT INTO webmail_sessions(session_id, username, email, csrf_secret, created_at, last_activity, expires_at)
-            \\SELECT ?1, u.username, u.email, ?2, ?3, ?3, ?4 FROM hosted_sign_in_proofs h
-            \\JOIN provisioned_mailboxes p ON p.user_id = h.user_id AND p.actor = h.actor
-            \\JOIN users u ON u.id = h.user_id AND u.username = p.mailbox
-            \\WHERE h.digest = ?5 AND h.expires_at > ?3 AND u.enabled = 1
-            \\  AND (p.read_until IS NULL OR p.read_until > ?3)
-            \\RETURNING session_id
-        );
-        defer add.finalize();
-        try add.bind(1, session);
-        try add.bind(2, csrf);
-        try add.bind(3, now);
-        try add.bind(4, session_expires);
-        try add.bindBlob(5, &hash);
-        if (!try add.step()) return error.InvalidProof;
+    const user_id = blk: {
+        const stmt = try tx.prepare("SELECT u.id" ++ eligible);
+        defer stmt.finalize();
+        try stmt.bindBlob(1, &hash);
+        try stmt.bind(2, input.now);
+        if (!try stmt.step()) return error.InvalidProof;
+        break :blk stmt.columnInt64(0);
+    };
+    const factor = try mfa.enabled(tx, user_id);
+    if (factor) {
+        const pending = factorDigest(challenge);
+        {
+            const stmt = try tx.prepare("UPDATE hosted_sign_in_proofs SET digest = ?1, expires_at = ?2 WHERE digest = ?3");
+            defer stmt.finalize();
+            try stmt.bindBlob(1, &pending);
+            try stmt.bind(2, input.now + ttl_seconds);
+            try stmt.bindBlob(3, &hash);
+            _ = try stmt.step();
+        }
+        {
+            const stmt = try tx.prepare("INSERT INTO hosted_sign_in_factors(digest, previous_session) VALUES (?1, ?2)");
+            defer stmt.finalize();
+            try stmt.bindBlob(1, &pending);
+            try stmt.bindOpt(2, input.previous);
+            _ = try stmt.step();
+        }
+    } else {
+        try startSession(tx, &hash, input, null);
+        try consume(tx, &hash);
     }
-    {
-        const consume = try tx.prepare("DELETE FROM hosted_sign_in_proofs WHERE digest = ?1");
-        defer consume.finalize();
-        try consume.bindBlob(1, &hash);
-        _ = try consume.step();
-    }
-    if (previous) |old| {
-        const retire = try tx.prepare("DELETE FROM webmail_sessions WHERE session_id = ?1");
-        defer retire.finalize();
-        try retire.bind(1, old);
-        _ = try retire.step();
-    }
+    try tx.commit();
+    return if (factor) .factor else .session;
+}
+
+pub fn finishFactor(db: *database.Database, a: std.mem.Allocator, challenge: []const u8, code: []const u8, input: SessionRequest, key: ?*const mfa.Key, limiter: *security.RateLimiter) !void {
+    const digest = factorDigest(challenge);
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const pending = blk: {
+        const stmt = try tx.prepare("SELECT u.id, (SELECT f.previous_session FROM hosted_sign_in_factors f WHERE f.digest = h.digest)" ++ eligible ++
+            " AND EXISTS (SELECT 1 FROM hosted_sign_in_factors f WHERE f.digest = h.digest)");
+        defer stmt.finalize();
+        try stmt.bindBlob(1, &digest);
+        try stmt.bind(2, input.now);
+        if (!try stmt.step()) return error.InvalidProof;
+        break :blk .{ stmt.columnInt64(0), if (stmt.columnTextOpt(1)) |value| try a.dupe(u8, value) else null };
+    };
+    defer if (pending[1]) |old| a.free(old);
+    if (!try mfa.enabled(tx, pending[0])) return error.InvalidProof;
+    try mfa.limitAttempt(limiter, pending[0]);
+    try mfa.consume(tx, key, pending[0], code, input.now);
+    try startSession(tx, &digest, input, pending[1]);
+    try consume(tx, &digest);
     try tx.commit();
 }

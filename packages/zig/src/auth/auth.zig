@@ -416,6 +416,23 @@ pub const AuthBackend = struct {
     }
 
     fn verifyMailboxPassword(self: *AuthBackend, normalized_username: []const u8, password: []const u8) !bool {
+        var user = (try self.verifiedMailbox(normalized_username, password)) orelse return false;
+        user.deinit(self.allocator);
+        return true;
+    }
+
+    /// Return the exact row verified by the primary credential so webmail can
+    /// fence session issuance against concurrent password and account changes.
+    pub fn verifyWebmailPrimary(self: *AuthBackend, peer: []const u8, username: []const u8, password: []const u8) !?database.User {
+        const attempt = try self.reserveLogin(peer);
+        const local = try self.canonicalUsername(username, self.allocator);
+        defer self.allocator.free(local);
+        const user = (try self.verifiedMailbox(local, password)) orelse return null;
+        self.login_limiter.finishAuthSuccess(peer, attempt);
+        return user;
+    }
+
+    fn verifiedMailbox(self: *AuthBackend, normalized_username: []const u8, password: []const u8) !?database.User {
         // Get user from database
         var user = self.db.getUserByUsername(normalized_username) catch |err| {
             if (err == database.DatabaseError.NotFound) {
@@ -425,17 +442,18 @@ pub const AuthBackend = struct {
                 // equivalent Argon2 KDF against the supplied password so both
                 // paths cost roughly the same, then report failure.
                 self.dummyVerify(password);
-                return false;
+                return null;
             }
             return err;
         };
-        defer user.deinit(self.allocator);
+        var owned = true;
+        defer if (owned) user.deinit(self.allocator);
 
         // Check if user is enabled. Same timing concern as not-found: equalize
         // the cost before returning so disabled accounts aren't distinguishable.
         if (!user.enabled or !(try self.db.mailboxAccess(user.username)).readable()) {
             self.dummyVerify(password);
-            return false;
+            return null;
         }
 
         // Serve repeat logins from the verification cache (skips the
@@ -443,12 +461,12 @@ pub const AuthBackend = struct {
         // still fetched above, so disabled accounts never hit this path, and
         // the key binds user.password_hash so a changed password misses.
         const cache_key = self.verify_cache.key(normalized_username, password, user.password_hash);
-        if (self.verify_cache.check(cache_key)) return true;
-
-        // Verify password
-        const ok = try self.password_hasher.verifyPassword(password, user.password_hash);
-        if (ok) self.verify_cache.insert(cache_key);
-        return ok;
+        if (!self.verify_cache.check(cache_key)) {
+            if (!try self.password_hasher.verifyPassword(password, user.password_hash)) return null;
+            self.verify_cache.insert(cache_key);
+        }
+        owned = false;
+        return user;
     }
 
     /// Run a throwaway Argon2 KDF to match the timing of a real password verify.

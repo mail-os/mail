@@ -79,6 +79,11 @@ pub fn requireSource(tx: database.Database.Transaction, id: []const u8, user: []
 pub fn create(db: *database.Database, owner: []const u8, source: []const u8, id: []const u8, now: i64) !void {
     var tx = try db.beginTransaction(.write);
     defer tx.deinit();
+    try createInTransaction(tx, owner, source, id, now);
+    try tx.commit();
+}
+
+pub fn createInTransaction(tx: database.Database.Transaction, owner: []const u8, source: []const u8, id: []const u8, now: i64) !void {
     {
         const clean = try tx.prepare(
             \\DELETE FROM webmail_account_links
@@ -122,7 +127,6 @@ pub fn create(db: *database.Database, owner: []const u8, source: []const u8, id:
         if (!try add.step()) return error.LinkedAccountUnavailable;
         _ = try add.step();
     }
-    try tx.commit();
 }
 
 pub fn remove(db: *database.Database, owner: []const u8, id: []const u8) !void {

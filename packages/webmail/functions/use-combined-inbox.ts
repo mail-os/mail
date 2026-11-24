@@ -27,6 +27,8 @@ export function useCombinedInbox(signIn: () => void) {
   const manageOpen = state(false)
   const username = state('')
   const password = state('')
+  const linkFactor = state('')
+  const linkNeedsFactor = state(false)
   const query = state('')
   const searchScope = state('inbox')
   const listing = state<Listing | null>(null)
@@ -121,13 +123,26 @@ export function useCombinedInbox(signIn: () => void) {
     selection.update(keys => keys.includes(key) ? keys.filter(value => value !== key) : [...keys, key])
   }
 
+  function cancelLink() {
+    password.set('')
+    linkFactor.set('')
+    linkNeedsFactor.set(false)
+    linking.set(false)
+  }
+
+  function toggleAccountManagement() {
+    if (busy()) return
+    if (manageOpen()) cancelLink()
+    manageOpen.set(!manageOpen())
+  }
+
   async function changeAccounts(id: string | null = null) {
     if (busy()) return
     busy.set(true)
     error.set('')
     notice.set('')
-    const credentials = { username: username().trim(), password: password() }
-    password.set('')
+    const credentials = { username: username().trim(), password: password(), ...(linkNeedsFactor() ? { factor: linkFactor().trim() } : {}) }
+    linkFactor.set('')
     if (id) hideStaleResults()
     try {
       const response = await api<Accounts>(`${endpoint}/accounts${id ? '/' + encodeURIComponent(id) : ''}`,
@@ -135,18 +150,27 @@ export function useCombinedInbox(signIn: () => void) {
       if (!active) return
       accounts.set(response.accounts)
       username.set('')
-      linking.set(false)
+      cancelLink()
       notice.set(id ? 'Mailbox removed from this browser.' : 'Mailbox added to this browser.')
       channel?.postMessage(id ?? '')
       pageNumber = 1
     }
     catch (cause) {
-      if (active) error.set(cause instanceof Error ? cause.message : 'Could not change the linked mailboxes.')
+      if (!active) return
+      if (!id && cause instanceof MailApiError && cause.code === 'factor_required') {
+        linkNeedsFactor.set(true)
+        return
+      }
+      if (!id && (!linkNeedsFactor() || (cause instanceof MailApiError && cause.code === 'invalid_credentials'))) {
+        password.set('')
+        linkNeedsFactor.set(false)
+      }
+      error.set(cause instanceof Error ? cause.message : 'Could not change the linked mailboxes.')
     }
     finally {
       if (active) {
         busy.set(false)
-        await refresh()
+        if (!linkNeedsFactor()) await refresh()
       }
     }
   }
@@ -199,11 +223,11 @@ export function useCombinedInbox(signIn: () => void) {
     active = false
     hideStaleResults()
     channel?.close()
-    password.set('')
+    cancelLink()
   }
 
   return {
-    user, accounts, linking, manageOpen, username, password, query, searchScope, listing, loading, busy, error, notice, selection, selectedRows,
-    mount, destroy, refresh, runSearch, turnPage, toggleRow, changeAccounts, applyAction,
+    user, accounts, linking, manageOpen, username, password, linkFactor, linkNeedsFactor, query, searchScope, listing, loading, busy, error, notice, selection, selectedRows,
+    mount, destroy, refresh, runSearch, turnPage, toggleRow, changeAccounts, applyAction, cancelLink, toggleAccountManagement,
   }
 }

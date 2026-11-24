@@ -63,6 +63,7 @@ const thread_ids = @import("../message/thread_ids.zig");
 const message_refs = @import("../storage/message_refs.zig");
 const ascii_compat = @import("ascii-compat");
 const caldav_store = @import("../storage/caldav_store.zig");
+const mfa = @import("../storage/webmail_mfa.zig");
 const hosted_sign_in = @import("../storage/hosted_sign_in.zig");
 const calendar_day_labels = @import("../storage/calendar_day_labels.zig");
 const calendar_tasks = @import("../storage/calendar_tasks.zig");
@@ -156,6 +157,7 @@ pub const WebmailHttpConfig = struct {
     provisioning: ?ProvisioningConfig = null,
     operator_id: ?i64 = null,
     hosted_sign_in_origin: ?[]const u8 = null,
+    mfa_key: ?mfa.Key = null,
     hosted_team_domains: ?[]const u8 = null,
     primary_provisioning_domain: ?[]const u8 = null,
 };
@@ -216,6 +218,7 @@ pub const WebmailHttpServer = struct {
         if (config.max_attachment_total_bytes > 100 * 1024 * 1024 or config.max_attachment_file_bytes > 100 * 1024 * 1024 or config.max_attachment_count > 100 or config.undo_send_seconds > 30) return error.InvalidWebmailConfiguration;
         var sessions = session_mod.SessionManager.init(allocator, db, auth);
         sessions.secure_cookies = config.secure_cookies;
+        sessions.mfa_key = config.mfa_key;
         var server: WebmailHttpServer = .{
             .allocator = allocator,
             .config = config,
@@ -521,6 +524,7 @@ fn readRequest(server: *WebmailHttpServer, conn: *webmail_tls.Stream, allocator:
     if (std.mem.eql(u8, path, client_password_path)) body_limit = @min(body_limit, 8192);
     if (std.mem.eql(u8, path, mailbox_admin_path)) body_limit = @min(body_limit, 8192);
     if (std.mem.eql(u8, path, "/webmail/auth/hosted")) body_limit = session_mod.token_hex_len + "proof=".len;
+    if (std.mem.eql(u8, path, mfa_path) or std.mem.eql(u8, path, hosted_factor_path)) body_limit = @min(body_limit, 4096);
     const file_upload = std.mem.eql(u8, path, file_links.path);
     errdefer if (request.holds_file_transfer) server.releaseFileTransfer();
     if (server.config.provisioning == null and std.mem.eql(u8, method, "POST") and
@@ -762,6 +766,9 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
     if (std.mem.eql(u8, p, "/webmail/api/calendar-export") and std.mem.eql(u8, req.method, "GET")) return handleCalendarExport(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/api/calendar-import") and std.mem.eql(u8, req.method, "POST")) return handleCalendarImport(server, conn, arena, req);
 
+    if (std.mem.eql(u8, p, mfa_path)) return handleMfaSettings(server, conn, arena, req);
+    if (std.mem.eql(u8, p, hosted_factor_path) and std.mem.eql(u8, req.method, "POST"))
+        return handleHostedFactor(server, conn, arena, req);
     if (std.mem.eql(u8, p, "/webmail/auth/login") and std.mem.eql(u8, req.method, "POST")) {
         return handleLogin(server, conn, arena, req);
     }
@@ -1014,31 +1021,36 @@ fn handleCombinedAccounts(server: *WebmailHttpServer, conn: *webmail_tls.Stream,
         if (!message_refs.valid(link)) return combinedError(conn, a, error.LinkedAccountUnavailable);
         account_links.remove(server.db, root.session_id, link) catch |err| return combinedError(conn, a, err);
     } else if (std.mem.eql(u8, req.method, "POST")) {
-        const Credentials = struct { username: []const u8, password: []const u8 };
+        const Credentials = struct { username: []const u8, password: []const u8, factor: ?[]const u8 = null };
         if (req.body.len > 8192) return combinedError(conn, a, service_mod.ServiceError.InvalidPayload);
         const credentials = std.json.parseFromSliceLeaky(Credentials, a, req.body, .{}) catch
             return combinedError(conn, a, service_mod.ServiceError.InvalidPayload);
         if (credentials.username.len == 0 or credentials.username.len > 320 or credentials.password.len == 0 or credentials.password.len > 1024)
             return combinedError(conn, a, service_mod.ServiceError.InvalidPayload);
+        if (credentials.factor != null and !publicHttps(server)) return mfaError(conn, a, error.MfaUnavailable);
         const link = try store.newId(a);
         const ip = if (req.trust_forwarded_headers) req.header("X-Real-IP") orelse conn.peerIp() else conn.peerIp();
         const attempt = (server.login_limiter.beginAuthAttempt(ip) catch null) orelse
             return sendError(conn, a, 429, "rate_limited", "Too many sign-in attempts. Try again later.");
-        var source = server.sessions.login(credentials.username, credentials.password, ip, req.header("User-Agent")) catch |err| switch (err) {
+        var source = server.sessions.loginWithFactor(credentials.username, credentials.password, ip, req.header("User-Agent"), .{
+            .code = credentials.factor,
+            .limiter = &server.login_limiter,
+            .link = .{ .owner = root.session_id, .username = root.username, .id = link },
+        }) catch |err| switch (err) {
             error.AuthenticationRateLimited => return sendError(conn, a, 429, "rate_limited", "Too many sign-in attempts. Try again later."),
             session_mod.SessionError.InvalidCredentials => return sendError(conn, a, 403, "invalid_credentials", "The linked mailbox username or password is incorrect."),
-            else => return err,
+            error.FactorRequired => {
+                if (credentials.factor == null) server.login_limiter.finishAuthSuccess(ip, attempt);
+                return mfaError(conn, a, err);
+            },
+            error.AccountAlreadyLinked, error.LinkedAccountLimit, error.LinkedAccountUnavailable => {
+                server.login_limiter.finishAuthSuccess(ip, attempt);
+                return combinedError(conn, a, err);
+            },
+            else => return mfaError(conn, a, err),
         };
         defer source.deinit(server.allocator);
         server.login_limiter.finishAuthSuccess(ip, attempt);
-        if (std.mem.eql(u8, root.username, source.username)) {
-            server.sessions.logout(source.session_id);
-            return combinedError(conn, a, error.AccountAlreadyLinked);
-        }
-        account_links.create(server.db, root.session_id, source.session_id, link, time_compat.timestamp()) catch |err| {
-            server.sessions.logout(source.session_id);
-            return combinedError(conn, a, err);
-        };
     } else if (!get) return sendError(conn, a, 405, "method_not_allowed", "Use GET or POST.");
     const accounts = try account_links.list(a, server.db, root.session_id, time_compat.timestamp());
     return sendJson(conn, a, 200, try service_mod.json(a, .{
@@ -1188,23 +1200,134 @@ fn handleHostedSignIn(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
     for (proof) |byte| if (!std.ascii.isHex(byte))
         return sendError(conn, arena, 400, "bad_request", "Invalid sign-in form");
 
-    const session = try session_mod.generateToken(arena);
-    const csrf = try session_mod.generateToken(arena);
-    const previous = if (req.header("Cookie")) |cookie| session_mod.parseSessionCookie(cookie) else null;
-    const now = time_compat.timestamp();
-    const cookie = try server.sessions.buildSetCookie(session);
-    defer server.allocator.free(cookie);
-    const redirect = try std.fmt.allocPrint(arena, "HTTP/1.1 303 See Other\r\nLocation: /\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nSet-Cookie: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{cookie});
-    const ip = if (req.trust_forwarded_headers) req.header("X-Real-IP") orelse conn.peerIp() else conn.peerIp();
+    const input = try hostedSessionRequest(server, arena, req);
+    const challenge = try session_mod.generateToken(arena);
+    const ip = clientIp(req, conn);
     const attempt = (server.login_limiter.beginAuthAttempt(ip) catch null) orelse
-        return sendError(conn, arena, 429, "rate_limited", "Too many login attempts; try again later");
-    hosted_sign_in.exchange(server.db, proof, session, csrf, previous, now, now + server.sessions.idle_ttl_seconds) catch |err| {
-        if (err == error.InvalidProof) return sendError(conn, arena, 401, "invalid_proof", "This sign-in has expired or was already used. Start again from the Mail website.");
+        return mfaError(conn, arena, error.AuthenticationRateLimited);
+    const result = hosted_sign_in.exchange(server.db, proof, challenge, input) catch |err| {
+        if (err == error.InvalidProof) return invalidHostedProof(conn, arena);
         logger.err("Hosted webmail sign-in failed: {}", .{err});
         return sendError(conn, arena, 503, "sign_in_unavailable", "Sign-in is temporarily unavailable");
     };
     server.login_limiter.finishAuthSuccess(ip, attempt);
+    const cookie = switch (result) {
+        .session => try server.sessions.buildSetCookie(input.session),
+        .factor => try hostedFactorCookie(server.allocator, challenge),
+    };
+    defer server.allocator.free(cookie);
+    const location = if (result == .factor) "/login#hosted-factor" else "/";
+    const redirect = try std.fmt.allocPrint(arena, "HTTP/1.1 303 See Other\r\nLocation: {s}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nSet-Cookie: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{ location, cookie });
     try writeAll(conn, redirect);
+}
+
+const hosted_factor_path = "/webmail/auth/hosted/verify";
+const hosted_factor_cookie = "__Secure-mail_hosted_factor";
+const mfa_path = "/webmail/auth/mfa";
+
+fn hostedFactorCookie(a: std.mem.Allocator, token: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}={s}; Path=" ++ hosted_factor_path ++ "; Secure; HttpOnly; SameSite=Strict; Max-Age={d}", .{
+        hosted_factor_cookie, token, if (token.len == 0) @as(u32, 0) else hosted_sign_in.ttl_seconds,
+    });
+}
+
+fn hostedSessionRequest(server: *WebmailHttpServer, a: std.mem.Allocator, req: Request) !hosted_sign_in.SessionRequest {
+    const now = time_compat.timestamp();
+    return .{
+        .session = try session_mod.generateToken(a),
+        .csrf = try session_mod.generateToken(a),
+        .previous = session_mod.parseSessionCookie(req.header("Cookie") orelse ""),
+        .now = now,
+        .expires = now + server.sessions.idle_ttl_seconds,
+    };
+}
+
+fn invalidHostedProof(conn: *webmail_tls.Stream, a: std.mem.Allocator) !void {
+    return sendError(conn, a, 401, "invalid_proof", "This sign-in has expired or was already used. Start again from the Mail website.");
+}
+
+fn handleHostedFactor(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    if (server.config.hosted_sign_in_origin == null) return invalidHostedProof(conn, a);
+    if (!isSameOrigin(req)) return sendError(conn, a, 403, "forbidden", "Cross-origin request rejected");
+    const challenge = session_mod.parseCookie(req.header("Cookie") orelse "", hosted_factor_cookie) orelse
+        return invalidHostedProof(conn, a);
+    if (challenge.len != session_mod.token_hex_len) return invalidHostedProof(conn, a);
+    const code = (try jsonStringFieldAlloc(a, req.body, "factor")) orelse return mfaError(conn, a, error.FactorRequired);
+    const ip = clientIp(req, conn);
+    const attempt = (server.login_limiter.beginAuthAttempt(ip) catch null) orelse return mfaError(conn, a, error.AuthenticationRateLimited);
+    const input = try hostedSessionRequest(server, a, req);
+    hosted_sign_in.finishFactor(server.db, a, challenge, code, input, if (server.sessions.mfa_key) |*key| key else null, &server.login_limiter) catch |err| {
+        if (err == error.InvalidProof) return invalidHostedProof(conn, a);
+        return mfaError(conn, a, err);
+    };
+    server.login_limiter.finishAuthSuccess(ip, attempt);
+    const cookie = try server.sessions.buildSetCookie(input.session);
+    defer server.allocator.free(cookie);
+    try sendJsonWithHeaders(conn, a, 200, "{\"ok\":true}", .{ .set_cookie = cookie, .extra_cookie = try hostedFactorCookie(a, "") });
+}
+
+fn mfaError(conn: *webmail_tls.Stream, a: std.mem.Allocator, err: anyerror) !void {
+    return switch (err) {
+        error.FactorRequired => sendError(conn, a, 403, "factor_required", "Enter an authenticator or recovery code."),
+        error.InvalidFactor => sendError(conn, a, 403, "invalid_factor", "That code is invalid or was already used."),
+        error.MfaUnavailable => sendError(conn, a, 503, "mfa_unavailable", "Authenticator verification is unavailable. You can use a recovery code."),
+        error.AuthenticationRateLimited => sendError(conn, a, 429, "rate_limited", "Too many attempts. Try again in five minutes."),
+        error.InvalidEnrollment => sendError(conn, a, 409, "invalid_enrollment", "The setup expired or changed. Start again."),
+        error.AlreadyEnrolled => sendError(conn, a, 409, "already_enrolled", "Two-step verification is already on."),
+        else => err,
+    };
+}
+
+fn handleMfaSettings(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: std.mem.Allocator, req: Request) !void {
+    const Operation = enum { status, begin, confirm, disable };
+    const op: Operation = if (std.mem.eql(u8, req.method, "GET")) .status else if (std.mem.eql(u8, req.method, "POST")) .begin else if (std.mem.eql(u8, req.method, "PUT")) .confirm else if (std.mem.eql(u8, req.method, "DELETE")) .disable else return sendError(conn, a, 405, "method_not_allowed", "Use GET, POST, PUT, or DELETE.");
+    if (op != .status and (!publicHttps(server) or !isSameOrigin(req)))
+        return sendError(conn, a, 403, "forbidden", "Use a secure, same-origin session.");
+    var session = (try requireSession(server, conn, a, req)) orelse return;
+    defer session.deinit(server.allocator);
+    const key: ?*const mfa.Key = if (server.sessions.mfa_key) |*value| value else null;
+    const available = key != null and publicHttps(server) and server.config.secure_cookies;
+    if ((op == .begin or op == .confirm) and !available)
+        return sendError(conn, a, 503, "mfa_unavailable", "Two-step setup is unavailable on this server.");
+    var user = if (op == .begin) blk: {
+        const password = (try jsonStringFieldAlloc(a, req.body, "currentPassword")) orelse "";
+        if (password.len == 0 or password.len > 1024) return sendError(conn, a, 400, "bad_request", "Enter your current password.");
+        const verified = server.auth.verifyWebmailPrimary(clientIp(req, conn), session.username, password) catch |err| return mfaError(conn, a, err);
+        break :blk verified orelse return sendError(conn, a, 400, "invalid_credentials", "Current password is incorrect.");
+    } else try server.db.getUserByUsername(session.username);
+    defer user.deinit(if (op == .begin) server.auth.allocator else server.db.allocator);
+    const code = switch (op) {
+        .confirm, .disable => (try jsonStringFieldAlloc(a, req.body, "factor")) orelse return mfaError(conn, a, error.FactorRequired),
+        else => "",
+    };
+    const now = time_compat.timestamp();
+    var tx = try server.db.beginTransaction(if (op == .status) .read else .write);
+    defer tx.deinit();
+    const response = switch (op) {
+        .status => try service_mod.json(a, .{ .available = available, .enabled = try mfa.enabled(tx, user.id) }),
+        .begin => blk: {
+            mfa.requireCurrentPassword(tx, user) catch |err| return mfaError(conn, a, err);
+            var secret = mfa.beginEnrollment(tx, key.?, user.id, session.session_id, now) catch |err| return mfaError(conn, a, err);
+            defer std.crypto.secureZero(u8, &secret);
+            break :blk try service_mod.json(a, .{ .secret = @as([]const u8, &secret) });
+        },
+        .confirm => blk: {
+            mfa.limitAttempt(&server.login_limiter, user.id) catch |err| return mfaError(conn, a, err);
+            var codes = mfa.confirmEnrollment(tx, key.?, user.id, session.session_id, code, now) catch |err| return mfaError(conn, a, err);
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&codes));
+            var entries: [mfa.recovery_count][]const u8 = undefined;
+            for (&codes, &entries) |*entry, *slice| slice.* = entry;
+            break :blk try service_mod.json(a, .{ .recoveryCodes = entries });
+        },
+        .disable => blk: {
+            mfa.limitAttempt(&server.login_limiter, user.id) catch |err| return mfaError(conn, a, err);
+            mfa.disable(tx, key, user.id, session.session_id, code, now) catch |err| return mfaError(conn, a, err);
+            break :blk "{\"ok\":true}";
+        },
+    };
+    try tx.commit();
+    defer if (op == .begin or op == .confirm) std.crypto.secureZero(u8, @constCast(response));
+    try sendJson(conn, a, 200, response, null);
 }
 
 fn handleLogin(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std.mem.Allocator, req: Request) !void {
@@ -1218,20 +1341,24 @@ fn handleLogin(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std
         return sendError(conn, arena, 400, "bad_request", "Missing password");
     };
 
+    const factor = try jsonStringFieldAlloc(arena, req.body, "factor");
+    if (factor != null and !publicHttps(server)) return mfaError(conn, arena, error.MfaUnavailable);
+
     // Retain the configured webmail cap as well as the shared backend cap.
     // Both reserve before verification and refund a successful login.
     const attempt = (server.login_limiter.beginAuthAttempt(ip) catch null) orelse
         return sendError(conn, arena, 429, "rate_limited", "Too many login attempts; try again later");
     const ua = req.header("User-Agent");
 
-    var sess = server.sessions.login(username, password, if (ip.len > 0) ip else null, ua) catch |err| {
+    var sess = server.sessions.loginWithFactor(username, password, if (ip.len > 0) ip else null, ua, .{ .code = factor, .limiter = &server.login_limiter }) catch |err| {
         if (err == error.AuthenticationRateLimited)
             return sendError(conn, arena, 429, "rate_limited", "Too many login attempts; try again later");
         if (err == session_mod.SessionError.InvalidCredentials) {
             logger.warn("Webmail login failed for {s} from {s}", .{ username, ip });
             return sendError(conn, arena, 401, "invalid_credentials", "Invalid username or password");
         }
-        return sendError(conn, arena, 500, "server_error", "Login failed");
+        if (err == error.FactorRequired and factor == null) server.login_limiter.finishAuthSuccess(ip, attempt);
+        return mfaError(conn, arena, err);
     };
     defer sess.deinit(server.allocator);
     server.login_limiter.finishAuthSuccess(ip, attempt);
@@ -5171,6 +5298,7 @@ fn sendRevisionJson(conn: *webmail_tls.Stream, arena: std.mem.Allocator, status:
 
 const JsonHeaders = struct {
     set_cookie: ?[]const u8 = null,
+    extra_cookie: ?[]const u8 = null,
     etag: ?[]const u8 = null,
     list_duration_ms: ?f64 = null,
 };
@@ -5185,9 +5313,8 @@ fn sendJsonWithHeaders(conn: *webmail_tls.Stream, arena: std.mem.Allocator, stat
     try w.writeAll("X-Content-Type-Options: nosniff\r\n");
     if (headers.etag) |tag| try w.print("ETag: {s}\r\n", .{tag});
     if (headers.list_duration_ms) |ms| try w.print("Server-Timing: mail-list;dur={d:.2}\r\n", .{ms});
-    if (headers.set_cookie) |c| {
-        try w.print("Set-Cookie: {s}\r\n", .{c});
-    }
+    if (headers.set_cookie) |c| try w.print("Set-Cookie: {s}\r\n", .{c});
+    if (headers.extra_cookie) |c| try w.print("Set-Cookie: {s}\r\n", .{c});
     try w.writeAll("Connection: close\r\n\r\n");
     try w.writeAll(json_body);
     try writeAll(conn, resp.items);
