@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Exercise durable incident deduplication, recovery, alert retries and privacy."""
 import importlib.util
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import pathlib
 import sqlite3
 import subprocess
 import tempfile
+from threading import Thread
 import types
 import unittest
 from unittest.mock import patch
@@ -16,6 +18,85 @@ spec.loader.exec_module(watch)
 
 
 class HealthTests(unittest.TestCase):
+    def test_hosted_report_drives_incidents_and_survives_lost_observation(self):
+        now = 2000
+        started = {'schema': 1, 'checked_at': now, 'checks': {
+            key: {'status': 'healthy'} for key in watch.HOSTED_CHECKS
+        }}
+        billing = 'billing_webhook_backlog'
+        started['checks'][billing] = {'status': 'degraded', 'count': 1, 'customer': 'private@example.test'}
+        with tempfile.TemporaryDirectory() as directory:
+            env = pathlib.Path(directory) / 'env'
+            env.write_text('MAIL_APP_OPERATIONS_URL=http://127.0.0.1:8080/api/operations/health\n'
+                           + 'MAIL_OPERATIONS_TOKEN=' + 'a' * 64 + '\n')
+            state = {'checked_at': 1, 'active': [], 'events': [], 'pending': []}
+            name = watch.HOSTED_CHECKS[billing]
+            with patch.object(watch, 'read_hosted_report', return_value=started):
+                checks = watch.hosted_checks(env, state, now)
+            self.assertIn({'name': name, 'ok': False}, checks)
+            self.assertNotIn('private@example.test', json.dumps(checks))
+            self.assertEqual(watch.deploy_gate_failures(checks), [])
+            watch.reconcile(state, checks, now)
+            watch.reconcile(state, checks, now + 1)
+            self.assertEqual(len(state['pending']), 1)
+
+            with patch.object(watch, 'read_hosted_report', return_value=started):
+                stale = watch.hosted_checks(env, state, now + 121)
+            self.assertIn({'name': name, 'ok': False}, stale)
+            self.assertIn({'name': watch.HOSTED_MONITOR_CHECK, 'ok': False}, stale)
+            watch.reconcile(state, stale, now + 121)
+            self.assertEqual(state['pending'][-1]['status'], 'degraded')
+
+            started['checked_at'] = now + 122
+            started['checks'][billing] = {'status': 'healthy', 'count': 0}
+            with patch.object(watch, 'read_hosted_report', return_value=started):
+                checks = watch.hosted_checks(env, state, now + 122)
+            watch.reconcile(state, checks, now + 122)
+            self.assertEqual(state['active'], [])
+            self.assertEqual(state['pending'][-1]['status'], 'healthy')
+
+    def test_hosted_bearer_stays_with_the_configured_endpoint(self):
+        requests = []
+        token = 'a' * 64
+
+        class Redirector(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                requests.append((self.path, self.headers.get('Authorization')))
+                self.send_response(307)
+                self.send_header('Location', '/redirected')
+                self.end_headers()
+
+        with ThreadingHTTPServer(('127.0.0.1', 0), Redirector) as server:
+            thread = Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = 'http://127.0.0.1:' + str(server.server_port) + '/api/operations/health'
+                with self.assertRaises(OSError):
+                    watch.read_hosted_report(url, token)
+                with self.assertRaises(ValueError):
+                    watch.read_hosted_report(url.replace('127.0.0.1', 'mail.example.test'), token)
+            finally:
+                server.shutdown()
+                thread.join()
+        self.assertEqual(requests, [('/api/operations/health', 'Bearer ' + token)])
+
+    def test_restic_freshness_handles_boundary_and_missing_or_invalid_receipts(self):
+        now = 100000
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            env = root / 'env'
+            stamp = root / 'last-success'
+            env.write_text(f'MAIL_RESTIC_STATUS_FILE={stamp}\n')
+            self.assertEqual(watch.backup_checks(env, now), [{'name': watch.BACKUP_CHECK, 'ok': False}])
+            for value, expected in [(10000, True), (9999, False), (100001, False), ('bad', False)]:
+                stamp.write_text(f'timestamp={value}\nrepository=private-repository\n')
+                checks = watch.backup_checks(env, now)
+                self.assertEqual(checks, [{'name': watch.BACKUP_CHECK, 'ok': expected}])
+                self.assertEqual(watch.deploy_gate_failures(checks), [])
+
     def test_delivery_minute_window_and_depth_at_threshold(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / 'smtp db.sqlite'

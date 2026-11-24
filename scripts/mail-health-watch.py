@@ -9,10 +9,12 @@ from contextlib import closing
 import json
 import os
 import pathlib
+import re
 import shutil
 import sqlite3
 import subprocess
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -25,6 +27,18 @@ PATTERNS = {
 QUEUE_CHECK = 'Outbound queue depth'
 BOUNCE_CHECK = 'Queued delivery failure rate'
 DELIVERY_STATS_CHECK = 'Outbound delivery statistics'
+HOSTED_MONITOR_CHECK = 'Hosted operations monitor'
+BACKUP_CHECK = 'Verified off-host backup freshness'
+HOSTED_CHECKS = {
+    'provisioning_listener': 'Hosted provisioning listener',
+    'free_provisioning_backlog': 'Free mailbox provisioning backlog',
+    'paid_provisioning_backlog': 'Paid mailbox provisioning backlog',
+    'billing_webhook_backlog': 'Hosted billing webhook backlog',
+    'billing_reconciliation': 'Hosted billing reconciliation',
+    'billing_mailbox_access': 'Hosted billing mailbox access updates',
+}
+BACKUP_STATUS = pathlib.Path('/var/lib/mail-storage/data/restic/last-success')
+BACKUP_TIMER = pathlib.Path('/etc/systemd/system/mail-restic-backup.timer')
 
 
 def atomic_json(path, value, mode):
@@ -83,7 +97,8 @@ def send_alert(webhook, content):
 # whether a deploy succeeded.
 OUTSIDE_DEPLOY_GATE = frozenset(PATTERNS) | {
     'Delivery error monitoring', 'Admin alert transport', QUEUE_CHECK, BOUNCE_CHECK, DELIVERY_STATS_CHECK,
-}
+    HOSTED_MONITOR_CHECK, BACKUP_CHECK,
+} | frozenset(HOSTED_CHECKS.values())
 
 
 def deploy_gate_failures(checks):
@@ -171,6 +186,86 @@ def delivery_checks(path, state, now):
     ]
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def read_hosted_report(url, token):
+    parsed = urllib.parse.urlsplit(url)
+    loopback_http = parsed.scheme == 'http' and parsed.hostname == '127.0.0.1'
+    if (not (parsed.scheme == 'https' or loopback_http) or not parsed.hostname
+            or parsed.username or parsed.password or parsed.query or parsed.fragment
+            or parsed.path != '/api/operations/health' or not re.fullmatch(r'[0-9a-f]{64}', token)):
+        raise ValueError('Invalid hosted health configuration')
+    request = urllib.request.Request(url, headers={
+        'Authorization': 'Bearer ' + token,
+        'Accept': 'application/json',
+        'Cache-Control': 'no-store',
+    })
+    opener = urllib.request.build_opener(NoRedirect())
+    try:
+        with opener.open(request, timeout=12) as response:
+            payload = response.read(4097)
+            if response.status != 200 or len(payload) > 4096:
+                raise ValueError('Invalid hosted health response')
+    except urllib.error.HTTPError as error:
+        error.close()
+        raise
+    return json.loads(payload)
+
+
+def hosted_checks(env_file, state, now):
+    previous = set(state.get('active', [])) & set(HOSTED_CHECKS.values())
+    try:
+        url = env_setting(env_file, 'MAIL_APP_OPERATIONS_URL')
+        token = env_setting(env_file, 'MAIL_OPERATIONS_TOKEN')
+        state['hosted_monitor_configured'] = bool(url or token)
+        if not state['hosted_monitor_configured']:
+            return []
+        report = read_hosted_report(url, token)
+        checked_at = report.get('checked_at')
+        checks = report.get('checks')
+        if (report.get('schema') != 1 or type(checked_at) is not int
+                or not (now - 120 <= checked_at <= now + 30)
+                or not isinstance(checks, dict) or set(checks) != set(HOSTED_CHECKS)):
+            raise ValueError('Stale or incompatible hosted health report')
+        results = [{'name': HOSTED_MONITOR_CHECK, 'ok': True}]
+        for key, name in HOSTED_CHECKS.items():
+            observation = checks[key]
+            status = observation.get('status')
+            if status not in ('healthy', 'degraded', 'disabled', 'unavailable'):
+                raise ValueError('Invalid hosted health check')
+            if status != 'disabled':
+                # Backlog counts stay on the authenticated operator endpoint.
+                results.append({'name': name, 'ok': status == 'healthy'})
+        return results
+    except (OSError, ValueError, AttributeError, TypeError):
+        if not previous and not state.get('hosted_monitor_configured'):
+            return []
+        # Loss of the reader cannot recover an incident in the service it watches.
+        return [{'name': HOSTED_MONITOR_CHECK, 'ok': False}] + [
+            {'name': name, 'ok': False} for name in sorted(previous)
+        ]
+
+
+def backup_checks(env_file, now):
+    try:
+        override = env_setting(env_file, 'MAIL_RESTIC_STATUS_FILE')
+    except OSError:
+        override = ''
+    if not override and not BACKUP_TIMER.is_file():
+        return []
+    try:
+        with pathlib.Path(override or BACKUP_STATUS).open() as stream:
+            lines = stream.read(4096).splitlines()
+        stamp, = [line.removeprefix('timestamp=') for line in lines if line.startswith('timestamp=')]
+        age = now - int(stamp)
+        return [{'name': BACKUP_CHECK, 'ok': 0 <= age <= 90000}]
+    except (OSError, ValueError):
+        return [{'name': BACKUP_CHECK, 'ok': False}]
+
+
 def reconcile(state, checks, now):
     active = sorted(check['name'] for check in checks if not check['ok'])
     previous = state.get('active', [])
@@ -208,6 +303,8 @@ def run(args):
         configured_database = ''
     database = args.database_path or pathlib.Path(args.storage_path) / (configured_database or 'smtp.db')
     checks += delivery_checks(database, state, now)
+    checks += hosted_checks(args.env_file, state, now)
+    checks += backup_checks(args.env_file, now)
     disk = shutil.disk_usage(args.storage_path)
     checks.append({'name': 'Mail storage free space', 'ok': disk.free > max(512 * 1024 * 1024, disk.total // 20)})
     storage_probe = "import os,sys,tempfile; f=tempfile.NamedTemporaryFile(dir=sys.argv[1],prefix='.health-',delete=True); f.write(b'mail health'); f.flush(); os.fsync(f.fileno()); f.close()"

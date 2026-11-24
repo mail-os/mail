@@ -1034,6 +1034,29 @@ Discord outbox. A database read failure retains any active incident and
 reports the monitoring failure. A slow notification receiver leaves SMTP
 processing independent of alert delivery.
 
+**Hosted operations and backup alerts**
+
+Set `MAIL_OPERATIONS_TOKEN` in the Stacks app and add the same dedicated
+credential to the root-managed Mail environment file. Set
+`MAIL_APP_OPERATIONS_URL` there to the Stacks HTTPS origin followed by
+`/api/operations/health`. The watchdog rejects redirects and stale reports.
+The operator endpoint includes aggregate counts. Webmail health and alerts
+use only fixed check labels and outcomes. The monitor retains active hosted
+incidents while it cannot fetch a fresh report.
+
+Hosted provisioning alerts on an unavailable private listener or a free or
+paid mailbox still awaiting confirmation after 15 minutes. Billing alerts on
+unprocessed signed webhook events older than 15 minutes, an absent or stale
+reconciliation run, and mailbox access-update failures that persist for 15
+minutes. Keep the Stacks billing scheduler running every five minutes.
+
+When the Restic backup timer is installed, the watchdog checks the timestamp in
+`/var/lib/mail-storage/data/restic/last-success`. A missing, invalid, future,
+or more than 25-hour-old success marker opens an incident. Set
+`MAIL_RESTIC_STATUS_FILE` in the Mail environment file when the configured
+backup writes its success marker elsewhere. The marker is written after
+Restic verifies the off-host backup.
+
 ```bash
 systemctl status mail-health.timer
 journalctl -u mail-health.service -n 30 --no-pager

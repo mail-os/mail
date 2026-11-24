@@ -69,7 +69,7 @@ After=mail.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/mail-health-check
-TimeoutStartSec=150
+TimeoutStartSec=180
 UNIT
 # Older tenant tools can rewrite the base unit and legacy wrapper. A drop-in
 # keeps the release's protocol monitor authoritative across those deploys.
@@ -78,7 +78,7 @@ cat > /etc/systemd/system/mail-health.service.d/protocol.conf <<'UNIT'
 [Service]
 ExecStart=
 ExecStart=/usr/local/sbin/mail-protocol-health-check
-TimeoutStartSec=150
+TimeoutStartSec=180
 UNIT
 cat > /etc/systemd/system/mail-health.timer <<'UNIT'
 [Unit]
