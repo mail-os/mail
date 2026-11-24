@@ -13,6 +13,7 @@ import { inboxKey, inboxLabel, replyActivity, useSharedInbox, workflowActivity }
 import { fullDate, readableBytes, senderAddress, senderInitials, shortDate } from '../functions/mail-utils'
 const {
   inboxes, selectedInbox, mailbox, listing, detail, reference, loading, opening, saving, error, ready, formatted,
+  stageSettings, managingStages, editingStage, stageName, stageSender, toggleStages, editStage, moveRow, saveStage, retireStage,
   mount, refresh, selectInbox, turnPage, readMessage, closeMessage, attachmentPath, change, startReply, destroy,
 } = useSharedInbox(() => navigate('/login', { reload: true }), (uid, id) => navigate('/?sharedReplyDraft=' + uid + '.' + encodeURIComponent(id), { reload: true }))
 const readerHeading = useRef('sharedTitle')
@@ -50,14 +51,50 @@ useEventListener('online', refresh)
   <p :if="ready && !inboxes.length && !error" class="wm-shared-empty">You have no shared inboxes.</p>
   <div :if="mailbox" class="wm-shared-workspace">
     <section class="wm-shared-list" aria-label="Shared messages" :aria-busy="loading">
-      <header class="wm-shared-list-head"><span class="mail-icon" data-icon="inbox" aria-hidden="true"></span><div><h2 ref="sharedListTitle" tabindex="-1" :text="mailbox?.address"></h2><p :if="listing" :text="listing.total + (listing.total === 1 ? ' message' : ' messages')"></p></div></header>
+      <header class="wm-shared-list-head"><span class="mail-icon" data-icon="inbox" aria-hidden="true"></span>
+        <div class="wm-shared-list-heading">
+          <h2 ref="sharedListTitle" tabindex="-1" :text="mailbox?.address"></h2>
+          <div class="wm-shared-list-meta">
+            <p :if="listing" :text="listing.total + (listing.total === 1 ? ' message' : ' messages')"></p>
+            <button :if="stageSettings?.canManage" type="button" class="wm-action wm-shared-stage-toggle" aria-controls="inbox-stages" :aria-expanded="managingStages" @click="toggleStages()"><span class="mail-icon" data-icon="settings" aria-hidden="true"></span>Manage stages</button>
+          </div>
+        </div>
+      </header>
+      <section :if="managingStages && stageSettings?.canManage" class="wm-shared-stages" id="inbox-stages" aria-label="Inbox stages">
+        <form class="wm-shared-stage-form" @submit.prevent="saveStage()">
+          <label>Stage name<input x-model="stageName" maxlength="96" required :disabled="saving"></label>
+          <label>Route mail from (optional)<input x-model="stageSender" type="email" maxlength="254" placeholder="name@example.com" :disabled="saving"></label>
+          <div class="wm-shared-stage-actions">
+            <button type="submit" class="wm-action wm-action--accent" :disabled="saving || loading" :text="editingStage ? 'Save stage' : 'Add stage'"></button>
+            <button :if="editingStage" type="button" class="wm-action" :disabled="saving" @click="editStage(null)">Cancel edit</button>
+          </div>
+        </form>
+        <ul :if="stageSettings.items.length" class="wm-shared-stage-list">
+          <li :for="stage in stageSettings.items" :key="stage.id">
+            <strong :text="stage.name"></strong>
+            <span :if="stage.sender" :text="stage.sender"></span>
+            <div class="wm-shared-stage-actions">
+              <button type="button" class="wm-action" :aria-label="'Edit ' + stage.name" :disabled="saving" @click="editStage(stage)">Edit</button>
+              <button type="button" class="wm-action wm-action--danger" :aria-label="'Retire ' + stage.name" :disabled="saving || loading" @click="retireStage(stage)">Retire</button>
+            </div>
+          </li>
+        </ul>
+      </section>
       <p :if="listing && !listing.items.length" class="wm-shared-empty">No messages in this inbox.</p>
-      <button :for="row in (listing?.items || [])" :key="row.message.reference" type="button" class="wm-msg wm-shared-row" @click="openSharedMessage(row.message.reference)" :disabled="saving" :aria-current="row.message.reference === reference ? 'true' : null">
-        <span class="wm-msg-row"><span class="wm-msg-from" :text="senderAddress(row.message.from) || row.message.from || '(unknown sender)'"></span><time class="wm-msg-date" :text="shortDate(row.message.date)"></time></span>
-        <span class="wm-msg-subject" :text="row.message.subject || '(no subject)'"></span>
-        <span :if="row.message.snippet" class="wm-msg-snippet" :text="row.message.snippet"></span>
-        <span class="wm-shared-labels"><span class="wm-shared-status" :class="{ 'wm-shared-status--resolved': row.workflow.resolved }" :text="row.workflow.resolved ? 'Resolved' : 'Open'"></span><span :text="row.workflow.assignee?.address || 'Unassigned'"></span></span>
-      </button>
+      <div :for="row in (listing?.items || [])" :key="row.message.reference">
+        <button type="button" class="wm-msg wm-shared-row" @click="openSharedMessage(row.message.reference)" :disabled="saving" :aria-current="row.message.reference === reference ? 'true' : null">
+          <span class="wm-msg-row"><span class="wm-msg-from" :text="senderAddress(row.message.from) || row.message.from || '(unknown sender)'"></span><time class="wm-msg-date" :text="shortDate(row.message.date)"></time></span>
+          <span class="wm-msg-subject" :text="row.message.subject || '(no subject)'"></span>
+          <span :if="row.message.snippet" class="wm-msg-snippet" :text="row.message.snippet"></span>
+          <span class="wm-shared-labels"><span class="wm-shared-status" :class="{ 'wm-shared-status--resolved': row.workflow.resolved }" :text="row.workflow.resolved ? 'Resolved' : 'Open'"></span><span :text="row.workflow.assignee?.address || 'Unassigned'"></span></span>
+        </button>
+        <label :if="stageSettings?.items.length" class="wm-shared-row-stage">Stage
+          <select :key="row.message.reference + ':' + row.workflow.revision" :aria-label="'Stage for ' + (row.message.subject || '(no subject)')" :disabled="saving || loading || opening" @change="moveRow(row, $event.target.value)">
+            <option value="" :selected="!row.workflow.stage">No stage</option>
+            <option :for="stage in stageSettings.items" :key="stage.id" :value="stage.id" :selected="stage.id === row.workflow.stage?.id" :text="stage.name"></option>
+          </select>
+        </label>
+      </div>
       <footer :if="listing && (listing.more || listing.page > 1)" class="wm-pagination">
         <button type="button" @click="turnPage(-1)" :disabled="loading || saving || listing.page === 1">Previous</button>
         <span :text="'Page ' + listing.page"></span>
@@ -80,7 +117,7 @@ useEventListener('online', refresh)
           </div>
           <button type="button" class="wm-action wm-action--accent" @click="change(detail.workflow.resolved ? 'reopen' : 'resolve')" :disabled="saving || loading"><span class="mail-icon" data-icon="check" aria-hidden="true"></span><span :text="detail.workflow.resolved ? 'Reopen' : 'Resolve'"></span></button>
         </div>
-        <p class="wm-shared-activity" role="status"><span class="wm-shared-status" :class="{ 'wm-shared-status--resolved': detail.workflow.resolved }" :text="detail.workflow.resolved ? 'Resolved' : 'Open'"></span><span :if="workflowActivity(detail.workflow)" :text="workflowActivity(detail.workflow)"></span><time :if="detail.workflow.changedAt" :text="new Date(detail.workflow.changedAt * 1000).toLocaleString()"></time></p>
+        <p class="wm-shared-activity" role="status"><span class="wm-shared-status" :class="{ 'wm-shared-status--resolved': detail.workflow.resolved }" :text="detail.workflow.resolved ? 'Resolved' : 'Open'"></span><span :if="detail.workflow.stage" :text="detail.workflow.stage.name"></span><span :if="workflowActivity(detail.workflow)" :text="workflowActivity(detail.workflow)"></span><time :if="detail.workflow.changedAt" :text="new Date(detail.workflow.changedAt * 1000).toLocaleString()"></time></p>
         <p :if="detail.reply" class="wm-shared-activity" role="status"><span class="mail-icon" data-icon="reply" aria-hidden="true"></span><span :text="replyActivity(detail.reply)"></span></p>
         <header class="wm-shared-message-head">
           <h2 ref="sharedTitle" tabindex="-1" :text="detail.subject || '(no subject)'"></h2>

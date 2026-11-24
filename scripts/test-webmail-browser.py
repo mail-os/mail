@@ -136,7 +136,7 @@ def seed_shared_inbox(fixture, owner, sender):
     session = fixture.login(studio)
     assert fixture.api(session, "sender-review", {"setting": "disable"}, "PUT")[0] == 200
     team_command(fixture, "team", "create", "studio", "Studio", studio)
-    team_command(fixture, "team", "member", "studio", owner, "member")
+    team_command(fixture, "team", "member", "studio", owner, "admin")
     team_command(fixture, "team", "member", "studio", sender, "member")
     team_command(fixture, "team", "grant", "studio", studio, owner, "mailbox")
     message = EmailMessage()

@@ -1116,6 +1116,13 @@ pub const Database = struct {
             break :blk try column.step();
         };
         if (!has_outgoing) try self.execLocked("ALTER TABLE mail_team_thread_replies ADD COLUMN outgoing INTEGER NOT NULL DEFAULT 0 CHECK(outgoing IN (0,1))");
+        const has_stage = blk: {
+            const column = try tx.prepare("SELECT 1 FROM pragma_table_info('mail_shared_inbox_state') WHERE name='stage_id'");
+            defer column.finalize();
+            break :blk try column.step();
+        };
+        if (!has_stage) try self.execLocked("ALTER TABLE mail_shared_inbox_state ADD COLUMN stage_id INTEGER REFERENCES mail_shared_inbox_stages(id) ON DELETE SET NULL");
+        try self.execLocked("CREATE INDEX IF NOT EXISTS mail_shared_inbox_message_stage ON mail_shared_inbox_state(stage_id) WHERE stage_id IS NOT NULL");
         try tx.commit();
     }
 
@@ -2834,6 +2841,7 @@ pub const Database = struct {
         try self.releaseForwardTargetsLocked(id, ordinal, filed != null);
         if (filed) |file| {
             try self.recordPlacementLocked(id, ordinal, file);
+            try self.routeSharedStageLocked(id, ordinal, file);
             try self.recordTeamThreadReplyLocked(id, ordinal, file);
             try self.recordCalendarRevisionsLocked(id, ordinal, file.calendar_revisions);
             const muted = try self.attentionArrivalLocked(id, ordinal, file.attention);
@@ -2931,6 +2939,28 @@ pub const Database = struct {
         try stmt.bind(4, file.stamp);
         try stmt.bind(5, @intFromBool(file.thread_reply_outgoing));
         _ = try stmt.step();
+    }
+
+    fn routeSharedStageLocked(self: *Database, id: []const u8, ordinal: i64, file: FiledCopy) !void {
+        if (file.stamp.len == 0) return;
+        const route = try self.prepareLocked(shared_inbox.route_delivery_sql);
+        defer route.finalize();
+        try route.bind(1, id);
+        try route.bind(2, ordinal);
+        try route.bind(3, file.basename);
+        try route.bind(4, file.stamp);
+        if (!try route.step()) return;
+        const audit = try self.prepareLocked(shared_inbox.audit_route_sql);
+        defer audit.finalize();
+        while (true) {
+            try audit.bind(1, route.columnText(0));
+            try audit.bind(2, route.columnInt64(1));
+            try audit.bind(3, route.columnText(2));
+            try audit.bind(4, route.columnInt64(3));
+            _ = try audit.step();
+            if (!try route.step()) break;
+            try audit.reset();
+        }
     }
 
     fn recordTeamThreadReplyLocked(self: *Database, id: []const u8, ordinal: i64, file: FiledCopy) !void {

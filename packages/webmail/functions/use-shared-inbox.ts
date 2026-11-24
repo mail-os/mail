@@ -5,13 +5,17 @@ import { renderMailReader } from './mail-reader'
 
 interface Inbox { team: string, name: string, id: string, address: string }
 interface Teammate { id: string, address: string }
+interface StageLabel { id: string, name: string }
+interface Stage extends StageLabel { sender: string | null, revision: number }
+interface StageSettings { canManage: boolean, items: Stage[] }
 interface Workflow {
   assignee: Teammate | null
+  stage: StageLabel | null
   resolved: boolean
   revision: number
   changedBy: string | null
   changedAt: number | null
-  action: Action | 'access_removed' | null
+  action: Action | 'access_removed' | 'route' | 'stage_retired' | null
 }
 interface InboxMessage { reference: string, revision: string, from: string, subject: string, snippet: string, date: string }
 interface Row { message: InboxMessage, workflow: Workflow }
@@ -29,19 +33,22 @@ interface Detail extends Pick<InboxMessage, 'reference' | 'revision' | 'from' | 
   reply: ReplyStatus | null
 }
 interface ReplyStatus { state: 'queued' | 'sending' | 'review' | 'replied', actor: string | null, dueAt: number | null }
-type Action = 'assign' | 'unassign' | 'resolve' | 'reopen'
+type Action = 'assign' | 'unassign' | 'resolve' | 'reopen' | 'move'
 
 const endpoint = '/webmail/api/shared-inboxes'
 export function inboxKey(inbox: Inbox) { return inbox.team + '/' + inbox.id }
 export function inboxLabel(inbox: Inbox) { return inbox.name + ' · ' + inbox.address }
 export function workflowActivity(workflow: Workflow): string {
   if (workflow.action === 'access_removed') return 'Assignment cleared after access changed'
+  if (workflow.action === 'route') return 'Routed when mail arrived'
+  if (workflow.action === 'stage_retired') return 'Stage retired by ' + workflow.changedBy
   if (!workflow.changedBy || !workflow.action) return ''
   const label = {
     assign: 'Assigned by',
     unassign: 'Unassigned by',
     resolve: 'Resolved by',
     reopen: 'Reopened by',
+    move: 'Moved by',
   }[workflow.action]
   return label ? label + ' ' + workflow.changedBy : ''
 }
@@ -59,6 +66,11 @@ export function useSharedInbox(signIn: () => void, openReplyDraft: (uid: number,
   const listing = state<MessagePage | null>(null)
   const detail = state<Detail | null>(null)
   const reference = state('')
+  const stageSettings = state<StageSettings | null>(null)
+  const managingStages = state(false)
+  const editingStage = state<Stage | null>(null)
+  const stageName = state('')
+  const stageSender = state('')
   const loading = state(false)
   const opening = state(false)
   const saving = state(false)
@@ -81,6 +93,7 @@ export function useSharedInbox(signIn: () => void, openReplyDraft: (uid: number,
     inboxes.set([])
     selectedInbox.set('')
     listing.set(null)
+    clearStages()
     closeMessage()
   }
   const api = createMailApi(() => account() || undefined, () => {
@@ -89,6 +102,20 @@ export function useSharedInbox(signIn: () => void, openReplyDraft: (uid: number,
   }, () => active)
 
   function messagePath(inbox: string, id: string) { return endpoint + '/' + inbox + '/messages/' + encodeURIComponent(id) }
+  function stagesPath(inbox: string) { return endpoint + '/' + inbox + '/stages' }
+  function clearStages(): void {
+    stageSettings.set(null)
+    managingStages.set(false)
+    editStage(null)
+  }
+  function toggleStages(): void {
+    managingStages.set(!managingStages())
+  }
+  function editStage(stage: Stage | null): void {
+    editingStage.set(stage)
+    stageName.set(stage?.name ?? '')
+    stageSender.set(stage?.sender ?? '')
+  }
   function attachmentPath(index: number): string {
     const opened = detail()
     if (!opened) return ''
@@ -102,8 +129,15 @@ export function useSharedInbox(signIn: () => void, openReplyDraft: (uid: number,
     const request = ++listRequest
     loading.set(true)
     try {
-      const result = await api<MessagePage>(endpoint + '/' + current + '?page=' + page)
-      if (request === listRequest && active) listing.set(result)
+      const [result, stages] = await Promise.all([
+        api<MessagePage>(endpoint + '/' + current + '?page=' + page),
+        api<StageSettings>(stagesPath(current)),
+      ])
+      if (request === listRequest && active) {
+        listing.set(result)
+        stageSettings.set(stages)
+        if (!stages.canManage) managingStages.set(false)
+      }
     }
     catch (cause) {
       if (request !== listRequest || !active) return
@@ -111,6 +145,7 @@ export function useSharedInbox(signIn: () => void, openReplyDraft: (uid: number,
         inboxes.set(inboxes().filter(inbox => inboxKey(inbox) !== current))
         selectedInbox.set('')
         listing.set(null)
+        clearStages()
         closeMessage()
       }
       error.set(cause instanceof Error ? cause.message : 'Could not open the shared inbox.')
@@ -150,6 +185,7 @@ export function useSharedInbox(signIn: () => void, openReplyDraft: (uid: number,
     closeMessage()
     selectedInbox.set(key)
     listing.set(null)
+    clearStages()
     await loadPage(1)
   }
 
@@ -166,6 +202,7 @@ export function useSharedInbox(signIn: () => void, openReplyDraft: (uid: number,
       if (!retained) {
         closeMessage()
         listing.set(null)
+        clearStages()
         selectedInbox.set(available.length ? inboxKey(available[0]) : '')
         if (current) error.set('Access to this shared inbox changed.')
       }
@@ -187,25 +224,67 @@ export function useSharedInbox(signIn: () => void, openReplyDraft: (uid: number,
 
   async function change(action: Action, assignee?: string): Promise<void> {
     const opened = detail()
-    if (!opened || saving() || loading()) return
+    if (opened) await updateWorkflow(opened, opened.workflow, action, { assignee })
+  }
+
+  async function moveRow(row: Row, stageId: string): Promise<void> {
+    await updateWorkflow(row.message, row.workflow, 'move', { stageId: stageId || undefined })
+  }
+
+  async function updateWorkflow(message: InboxMessage | Detail, before: Workflow, action: Action, fields: { assignee?: string, stageId?: string }): Promise<void> {
+    if (saving() || loading() || opening()) return
     const current = selectedInbox()
-    const claimed = ++detailRequest
     saving.set(true)
     error.set('')
     try {
-      const workflow = await api<Workflow>(messagePath(current, opened.reference) + '/workflow', {
-        method: 'PUT', body: JSON.stringify({ action, assignee, revision: opened.workflow.revision, messageRevision: opened.revision }),
+      const workflow = await api<Workflow>(messagePath(current, message.reference) + '/workflow', {
+        method: 'PUT', body: JSON.stringify({ action, ...fields, revision: before.revision, messageRevision: message.revision }),
       })
-      if (!active || selectedInbox() !== current || detailRequest !== claimed) return
-      detail.set({ ...opened, workflow })
+      if (!active || selectedInbox() !== current) return
+      const opened = detail()
+      if (opened?.reference === message.reference) detail.set({ ...opened, workflow })
       const page = listing()
-      if (page) listing.set({ ...page, items: page.items.map(row => row.message.reference === opened.reference ? { ...row, workflow } : row) })
+      if (page) listing.set({ ...page, items: page.items.map(row => row.message.reference === message.reference ? { ...row, workflow } : row) })
     }
     catch (cause) {
       if (!active || selectedInbox() !== current) return
       error.set(cause instanceof Error ? cause.message : 'Could not update the shared message.')
-      if (cause instanceof MailApiError && cause.status === 404) closeMessage()
-      else if (detailRequest === claimed) await readMessage(opened.reference, false)
+      if (reference() === message.reference) {
+        if (cause instanceof MailApiError && cause.status === 404) closeMessage()
+        else await readMessage(message.reference, false)
+      }
+      await loadPage(listing()?.page ?? 1)
+    }
+    finally { saving.set(false) }
+  }
+
+  async function saveStage(): Promise<void> {
+    const stage = editingStage()
+    await updateStage(stage ? 'update' : 'create', stage, stageName().trim(), stageSender().trim() || undefined)
+  }
+
+  async function retireStage(stage: Stage): Promise<void> {
+    await updateStage('retire', stage)
+  }
+
+  async function updateStage(action: 'create' | 'update' | 'retire', stage: Stage | null, name?: string, sender?: string): Promise<void> {
+    if (saving() || loading() || !stageSettings()?.canManage) return
+    const current = selectedInbox()
+    saving.set(true)
+    error.set('')
+    try {
+      const settings = await api<StageSettings>(stagesPath(current), {
+        method: 'PUT', body: JSON.stringify({ action, id: stage?.id, revision: stage?.revision, name, sender }),
+      })
+      if (!active || selectedInbox() !== current) return
+      stageSettings.set(settings)
+      if (action !== 'retire' || editingStage()?.id === stage?.id) editStage(null)
+      await loadPage(listing()?.page ?? 1)
+      if (reference()) await readMessage(reference(), false)
+    }
+    catch (cause) {
+      if (!active || selectedInbox() !== current) return
+      error.set(cause instanceof Error ? cause.message : 'Could not update the inbox stage.')
       await loadPage(listing()?.page ?? 1)
     }
     finally { saving.set(false) }
@@ -249,6 +328,7 @@ export function useSharedInbox(signIn: () => void, openReplyDraft: (uid: number,
   }
 
   return { inboxes, selectedInbox, mailbox, listing, detail, reference, loading, opening, saving, error, ready, formatted,
+    stageSettings, managingStages, editingStage, stageName, stageSender, toggleStages, editStage, moveRow, saveStage, retireStage,
     mount, refresh, selectInbox, turnPage, readMessage, closeMessage, attachmentPath, change, startReply,
     destroy() { active = false; clear() } }
 }

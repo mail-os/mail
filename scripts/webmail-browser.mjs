@@ -1036,6 +1036,8 @@ async function phoneJourney(page) {
 }
 
 async function sharedJourney(page, phone = false) {
+  const viewport = page.viewportSize()
+  if (phone) await page.setViewportSize({ width: 320, height: viewport.height })
   await heading(page, 'Shared inboxes').waitFor()
   const picker = page.getByLabel('Shared inbox', { exact: true })
   const studio = picker.locator('option', { hasText: /studio@hosted\.example\.test/ })
@@ -1043,11 +1045,42 @@ async function sharedJourney(page, phone = false) {
   await verifySelect(picker, phone ? 44 : 36)
   await picker.selectOption(await studio.getAttribute('value'))
   const message = button(page, /Studio proof approval/)
+  const manage = button(page, 'Manage stages')
+  const settings = page.getByRole('region', { name: 'Inbox stages' })
+  if (!phone) {
+    await manage.click()
+    await settings.getByLabel('Stage name').fill('Proof review')
+    await settings.getByLabel('Route mail from (optional)').fill(sender)
+    await verifyControlRow(settings.locator('form'), 'input, button', 36, false)
+    await button(settings, 'Add stage').click()
+    await button(settings, 'Edit Proof review').waitFor()
+    await settings.screenshot({ path: join(output, 'desktop-shared-stage-settings.png'), animations: 'disabled' })
+    await manage.click()
+  }
+  const stage = page.getByRole('combobox', { name: 'Stage for Studio proof approval' })
+  await verifySelect(stage, phone ? 44 : 36)
+  async function moveToStage(label) {
+    const saved = page.waitForResponse(response => response.request().method() === 'PUT' && new URL(response.url()).pathname.endsWith('/workflow'))
+    await stage.selectOption({ label })
+    assert((await saved).ok(), `The inbox saved the move to ${label}`)
+  }
+  if (phone) {
+    assert.equal(await stage.locator('option:checked').textContent(), 'Proof review')
+    await moveToStage('No stage')
+    await moveToStage('Proof review')
+    await page.emulateMedia({ colorScheme: 'dark' })
+    await page.locator('.wm-shared-list').screenshot({ path: join(output, 'phone-shared-stage-list.png'), animations: 'disabled' })
+  }
+  else {
+    assert.equal(await stage.inputValue(), '')
+    await moveToStage('Proof review')
+  }
   await message.click()
   await heading(page, 'Studio proof approval').waitFor()
   if (!phone) await verifyMessageSelection(message, '.wm-msg-from')
   await page.getByRole('region', { name: 'Shared message reader' })
     .getByText('The revised proof is ready for approval.', { exact: true }).waitFor()
+  await page.getByRole('region', { name: 'Shared message reader' }).getByText('Proof review', { exact: true }).waitFor()
   await button(page, 'Resolve').click()
   await button(page, 'Reopen').waitFor()
   await fitsViewport(page)
@@ -1056,6 +1089,17 @@ async function sharedJourney(page, phone = false) {
   await button(page, 'Resolve').waitFor()
   await button(page, 'Back to messages').click()
   await message.waitFor()
+  if (phone) {
+    await manage.click()
+    await button(settings, 'Edit Proof review').click()
+    await settings.getByLabel('Stage name').fill('Proof approved')
+    await button(settings, 'Save stage').click()
+    await button(settings, 'Retire Proof approved').click()
+    await stage.waitFor({ state: 'hidden' })
+    await message.waitFor()
+    await fitsViewport(page)
+    await page.setViewportSize(viewport)
+  }
 }
 
 async function calendarTasksJourney(page, phone = false) {

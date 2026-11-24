@@ -1656,6 +1656,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-shared-list { border-inline-end: 1px solid var(--border); background: var(--list); }
 .wm-shared-reader { background: var(--panel); }
 .wm-shared-list-head { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; gap: 10px; padding: 16px; border-bottom: 1px solid var(--border); background: var(--toolbar); }
+.wm-shared-list-heading { flex: 1; min-inline-size: 0; }
+.wm-shared-list-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
 .wm-shared-list-head > .mail-icon { flex: none; color: var(--accent); }
 .wm-shared-list-head h2 { overflow-wrap: anywhere; margin: 0; font-size: 16px; }
 .wm-shared-list-head p { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
@@ -1668,6 +1670,16 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-shared-labels { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .wm-shared-status { padding: 3px 7px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); font-size: 11px; font-weight: 650; }
 .wm-shared-status--resolved { background: var(--success-soft); color: var(--success); }
+.wm-shared-stage-toggle { margin-inline-start: auto; }
+.wm-shared-stages { padding: 12px 16px; background: var(--toolbar); border-block-end: 1px solid var(--border); }
+.wm-shared-stage-form, .wm-shared-stage-list li { display: grid; gap: 8px; }
+.wm-shared-stage-form label { display: grid; gap: var(--control-label-gap); color: var(--muted); font-size: 12px; font-weight: 600; }
+.wm-shared-stage-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.wm-shared-stage-list { list-style: none; margin: 12px 0 0; padding: 0; }
+.wm-shared-stage-list li { padding-block: 10px; border-block-start: 1px solid var(--border); overflow-wrap: anywhere; }
+.wm-shared-stage-list li span { color: var(--muted); font-size: 12px; }
+.wm-shared-row-stage { display: flex; align-items: center; gap: 8px; margin: 0 18px 8px; color: var(--muted); font-size: 12px; }
+.wm-shared-row-stage select { flex: 1; }
 .wm-shared-reader-back { margin: 12px 16px 0; }
 .wm-shared-message { max-width: 780px; margin: 14px auto 24px; width: calc(100% - 32px); overflow-wrap: anywhere; }
 .wm-shared-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px; border: 1px solid var(--border); border-radius: 9px; background: var(--toolbar); }

@@ -2333,6 +2333,21 @@ fn handleSharedInboxes(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a:
         if (!reading) return sharedInboxError(conn, a, error.SharedInboxNotFound);
         return sharedInboxPage(server, conn, a, req, session.username, team, id, source.username);
     };
+    if (std.mem.eql(u8, section, "stages") and parts.next() == null) {
+        if (writing) {
+            if (req.body.len > 8192) return sharedInboxError(conn, a, error.InvalidSharedChange);
+            const patch = std.json.parseFromSliceLeaky(shared_inbox.StageChange, a, req.body, .{}) catch return sharedInboxError(conn, a, error.InvalidSharedChange);
+            shared_inbox.changeStage(a, server.db, session.username, team, id, patch) catch |err| return sharedInboxError(conn, a, err);
+        } else if (!reading) return sharedInboxError(conn, a, error.SharedInboxNotFound);
+        const current = shared_inbox.source(a, server.db, session.username, team, id) catch |err| return sharedInboxError(conn, a, err);
+        const rows = try shared_inbox.stages(a, server.db, team, id, current.can_manage);
+        const checked = shared_inbox.source(a, server.db, session.username, team, id) catch |err| return sharedInboxError(conn, a, err);
+        const can_manage = current.can_manage and checked.can_manage;
+        if (!can_manage) for (rows) |*row| {
+            row.sender = null;
+        };
+        return sendJson(conn, a, 200, try service_mod.json(a, .{ .canManage = can_manage, .items = rows }), null);
+    }
     const reference = parts.next() orelse "";
     if (!std.mem.eql(u8, section, "messages") or !message_refs.valid(reference))
         return sharedInboxError(conn, a, error.SharedInboxNotFound);
@@ -2498,8 +2513,12 @@ fn sharedInboxError(conn: *webmail_tls.Stream, a: std.mem.Allocator, err: anyerr
         error.SharedInboxNotFound, maildir.MaildirError.MessageNotFound => sendError(conn, a, 404, "shared_inbox_not_found", "This shared inbox or message is unavailable."),
         error.SharedInboxConflict => sendError(conn, a, 409, "shared_inbox_conflict", "A teammate changed this message. Review the latest assignment and status."),
         error.AssigneeUnavailable => sendError(conn, a, 409, "assignee_unavailable", "That teammate no longer has access to this inbox."),
+        error.StageUnavailable => sendError(conn, a, 409, "stage_unavailable", "That stage is no longer available in this inbox."),
+        error.StageConfigConflict => sendError(conn, a, 409, "stage_changed", "A teammate changed this stage. Review the latest settings."),
+        error.StageNameOrSenderConflict => sendError(conn, a, 409, "stage_duplicate", "That stage name or routing address is already in use."),
+        error.StageAdminRequired => sendError(conn, a, 403, "stage_admin_required", "Only an inbox team owner or admin can configure stages."),
         error.SharedAttachmentForbidden => sendError(conn, a, 403, "shared_attachment_forbidden", "You do not have access to this message’s attachments."),
-        error.InvalidSharedChange => sendError(conn, a, 400, "invalid_shared_change", "Check the requested assignment or status."),
+        error.InvalidSharedChange => sendError(conn, a, 400, "invalid_shared_change", "Check the requested assignment, status, or stage."),
         else => mapServiceError(conn, a, err),
     };
 }

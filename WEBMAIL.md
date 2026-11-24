@@ -874,6 +874,14 @@ while the source mailbox keeps its own folders, sessions, and personal
 metadata. To share attachment downloads, grant `attachments` for the specific
 message reference in that team.
 
+With Inbox access, team owners and admins can open **Manage stages** to add,
+rename, or retire stages for this inbox. Teammates can use the **Stage** picker
+on each message in the list. A move keeps the current assignment and resolution.
+An optional routing address moves new direct mail into a stage when the verified
+author and SMTP envelope sender match that address. The message stays in Inbox.
+Retiring a stage stops its route and clears it from existing messages. These
+changes are recorded in the team audit log.
+
 Use **Reply** on an open shared message to prepare a private draft with the
 shared From address and the original reply headers. It requires Inbox access
 and the sender grant in the same team, or ownership of the shared mailbox.
@@ -891,8 +899,13 @@ delivery stays marked on the original message to prevent a repeat.
   grant and the per-message attachment grant for teammates.
 - `PUT .../messages/:reference/workflow` accepts `action`, `revision`, and
   `messageRevision`. Use `assign` with an `assignee` ID or use `unassign`,
-  `resolve`, or `reopen`. A competing edit returns 409. Revoking the mailbox
+  `resolve`, or `reopen`. Use `move` with `stageId` to choose a stage or omit
+  `stageId` to clear it. A competing edit returns 409. Revoking the mailbox
   grant clears that teammate’s assignments and prevents further access.
+- `GET .../stages` lists the active stages. Owners and admins with Inbox access
+  can use `PUT .../stages` to `create`, `update`, or `retire` a stage. Updates
+  and retirements require the stage `id` and its current `revision`. Creating
+  or updating accepts a `name` and an optional `sender` routing address.
 - `POST .../messages/:reference/reply` accepts the current `messageRevision`
   and a client-generated `draftId` to prepare the linked draft. Submit it
   using the Outbox send ID. The server checks the reservation, team access,

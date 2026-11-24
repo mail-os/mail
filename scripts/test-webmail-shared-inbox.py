@@ -55,19 +55,23 @@ def open_message(test, session, path):
     return expect(test.api(session, path))
 
 
-def patch(test, session, path, detail, action, assignee=None):
+def patch(test, session, path, detail, action, assignee=None, stage=None):
     body = {"action": action, "revision": detail["workflow"]["revision"], "messageRevision": detail["revision"]}
     if assignee is not None:
         body["assignee"] = assignee
+    if stage is not None:
+        body["stageId"] = stage
     return test.api(session, path + "/workflow", body, method="PUT")
 
 
-def verify(test, db, studio, first, second, observer, outsider):
+def verify(test, db, studio, first, second, observer, outsider, legacy=False):
     owner, alex, taylor, read_only, foreign = (test.login(mailbox) for mailbox in (studio, first, second, observer, outsider))
     studio_id = user_id(db, studio)
     root = f"shared-inboxes/studio/{studio_id}"
     separate = f"shared-inboxes/second-team/{studio_id}"
-    empty = {"assignee": None, "resolved": False, "revision": 0, "changedBy": None, "changedAt": None, "action": None}
+    empty = {"assignee": None, "stage": None, "resolved": False, "revision": 0, "changedBy": None, "changedAt": None, "action": None}
+    if legacy:
+        del empty["stage"]
     expect(test.api({}, "shared-inboxes"), 401)
     assert expect(test.api(alex, "config"))["sharedInboxesAvailable"]
     assert not expect(test.api(read_only, "config"))["sharedInboxesAvailable"]
@@ -167,13 +171,107 @@ def verify(test, db, studio, first, second, observer, outsider):
     return path, ref, second if winner == first else first
 
 
+def verify_stages(test, db, studio, retained, observer, outsider, sender):
+    owner, teammate, colleague, foreign = (test.login(who) for who in (studio, retained, observer, outsider))
+    studio_id = user_id(db, studio)
+    root = f"shared-inboxes/studio/{studio_id}"
+    settings = root + "/stages"
+    separate = f"shared-inboxes/second-team/{studio_id}/stages"
+
+    def configure(session, action, *, path=settings, **fields):
+        return test.api(session, path, {"action": action, **fields}, method="PUT")
+
+    def target(title):
+        page = expect(test.api(owner, root))
+        row, = [row for row in page["items"] if row["message"]["subject"] == title]
+        return root + "/messages/" + row["message"]["reference"], row["workflow"]
+
+    grant(test, "grant", "studio", studio, observer)
+    assert expect(test.api(owner, settings)) == {"canManage": True, "items": []}
+    assert expect(test.api(teammate, settings)) == {"canManage": False, "items": []}
+    expect(test.api(foreign, settings), 404)
+    expect(configure(teammate, "create", name="Cannot configure"), 403, "stage_admin_required")
+    expect(configure({**owner, "Origin": "https://foreign.example.test"}, "create", name="Wrong origin"), 403)
+    expect(configure(owner, "create", name="Invalid route", sender="Display name <billing@example.test>"), 400)
+    expect(configure(owner, "create", name="Open\nReview"), 400)
+
+    review, = expect(configure(owner, "create", name="Needs review", sender=sender))["items"]
+    priority = expect(configure(owner, "create", name="Priority"))["items"][1]
+    unverified = expect(configure(owner, "create", name="Verified only", sender=limits["EXTERNAL"]))["items"][2]
+    other, = expect(configure(owner, "create", path=separate, name="Needs review"))["items"]
+    assert other["id"] != review["id"]
+    assert [row["sender"] for row in expect(test.api(teammate, settings))["items"]] == [None, None, None]
+    expect(configure(owner, "create", name=" needs review "), 409, "stage_duplicate")
+    expect(configure(owner, "create", name="Duplicate route", sender=sender.upper()), 409, "stage_duplicate")
+
+    assert test.deliver(studio, identity=sender, subject="Routed project")[0] == 250
+    assert test.deliver(studio, subject="Unverified outside mail")[0] == 250
+    path, initial = target("Routed project")
+    assert initial["stage"] == {"id": review["id"], "name": review["name"]} and initial["action"] == "route"
+    assert target("Unverified outside mail")[1]["stage"] is None
+    with test.imap(studio) as imap:
+        assert imap.select("INBOX")[0] == "OK"
+        assert imap.uid("SEARCH", None, "HEADER", "Subject", '"Routed project"')[1][0]
+    ref = path.rsplit("/", 1)[1]
+    assert open_message(test, owner, separate.removesuffix("/stages") + "/messages/" + ref)["workflow"]["stage"] is None
+    message = open_message(test, teammate, path)
+    expect(patch(test, teammate, path, message, "move", stage=other["id"]), 409, "stage_unavailable")
+    barrier = Barrier(2)
+
+    def move(session, stage):
+        barrier.wait(timeout=5)
+        return patch(test, session, path, message, "move", stage=stage)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(move, teammate, priority["id"]), pool.submit(move, colleague, None)]
+        assert sorted(result.result()[0] for result in futures) == [200, 409]
+    detail = open_message(test, owner, path)
+    assert detail["workflow"]["revision"] == 2
+    expect(patch(test, owner, path, detail, "move", stage=priority["id"]))
+    detail = open_message(test, owner, path)
+    expect(patch(test, owner, path, detail, "assign", user_id(db, retained)))
+    detail = open_message(test, owner, path)
+    assert detail["workflow"]["stage"]["id"] == priority["id"]
+    with db:
+        db.execute("""CREATE TRIGGER fixture_stage_audit_failure BEFORE INSERT ON audit_log
+                      WHEN NEW.action='team.inbox.stage.retire' BEGIN SELECT RAISE(ABORT,'fixture audit failure'); END""")
+    expect(configure(owner, "retire", id=priority["id"], revision=priority["revision"]), 500)
+    assert open_message(test, owner, path)["workflow"] == detail["workflow"]
+    with db:
+        db.execute("DROP TRIGGER fixture_stage_audit_failure")
+    expect(configure(owner, "retire", id=priority["id"], revision=priority["revision"]))
+    expect(patch(test, teammate, path, detail, "move", stage=review["id"]), 409, "shared_inbox_conflict")
+    after = open_message(test, owner, path)
+    assert after["workflow"]["stage"] is None and after["workflow"]["assignee"]["address"] == retained
+    assert after["workflow"]["action"] == "stage_retired"
+    expect(patch(test, teammate, path, after, "move", stage=priority["id"]), 409, "stage_unavailable")
+    expect(patch(test, teammate, path, after, "move", stage=review["id"]))
+    grant(test, "revoke", "studio", studio, retained)
+    expect(test.api(teammate, settings), 404)
+    expect(patch(test, teammate, path, after, "move"), 404)
+    latest = open_message(test, colleague, path)["workflow"]
+    assert latest["assignee"] is None and latest["stage"]["id"] == review["id"] and latest["action"] == "access_removed"
+
+    expect(configure(owner, "update", id=review["id"], revision=review["revision"], name="Editorial review"))
+    expect(configure(owner, "retire", id=review["id"], revision=review["revision"]), 409, "stage_changed")
+    assert test.deliver(studio, identity=sender, subject="Routing switched off")[0] == 250
+    assert target("Routing switched off")[1]["stage"] is None
+    assert open_message(test, colleague, path)["workflow"]["stage"]["name"] == "Editorial review"
+    expect(configure(owner, "retire", id=unverified["id"], revision=unverified["revision"]))
+    events = [action for action, in db.execute("SELECT action FROM audit_log WHERE action LIKE 'team.inbox.%'")]
+    assert all(event in events for event in ("team.inbox.route", "team.inbox.move", "team.inbox.stage.create", "team.inbox.stage.update", "team.inbox.stage.retire"))
+    return path
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
+    parser.add_argument("--upgrade-from", type=Path)
     options = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="mail-shared-inbox-", dir="/tmp") as directory:
         root = Path(directory)
-        test = Fixture(options.binary.resolve(strict=True), root, staging=True)
+        candidate = options.binary.resolve(strict=True)
+        test = Fixture(options.upgrade_from.resolve(strict=True) if options.upgrade_from else candidate, root, staging=True)
         with test.daemon(), closing(sqlite3.connect(root / "smtp.db")) as db:
             studio, alex, taylor, observer, outsider = (test.provision(name) for name in ("studio", "alex", "taylor", "observer", "outside"))
             sender = test.provision("sender", daily=100)
@@ -186,8 +284,9 @@ def main():
             command(test, "team", "member", "second-team", alex, "member")
             grant(test, "grant", "second-team", studio, alex)
             seed(test, sender, studio, outsider)
-            path, reference, retained = verify(test, db, studio, alex, taylor, observer, outsider)
-        with test.daemon():
+            path, reference, retained = verify(test, db, studio, alex, taylor, observer, outsider, legacy=bool(options.upgrade_from))
+        test.binary = candidate
+        with test.daemon(), closing(sqlite3.connect(root / "smtp.db")) as db:
             owner, teammate = test.login(studio), test.login(retained)
             latest = open_message(test, teammate, path)
             assert latest["workflow"]["resolved"] and latest["workflow"]["revision"] == 5
@@ -196,7 +295,12 @@ def main():
             expect(test.api({**owner, "If-Match": current["revision"]}, own_path, {"folder": "Archive"}, method="PUT"))
             expect(test.api(teammate, path), 404)
             expect(patch(test, teammate, path, latest, "reopen"), 404)
+            staged = verify_stages(test, db, studio, retained, observer, outsider, sender)
+        with test.daemon():
+            latest = open_message(test, test.login(observer), staged)["workflow"]
+            assert latest["stage"]["name"] == "Editorial review" and latest["assignee"] is None
     print("Verified shared SMTP intake, paging, attachment gates, isolation, concurrent assignment, offboarding, audit rollback, restart, and folder scope over native HTTPS.")
+    print("Verified stage configuration, routed SMTP, concurrent moves, retirement, and audit history.")
 
 
 if __name__ == "__main__":
