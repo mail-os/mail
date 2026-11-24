@@ -2,6 +2,7 @@ import { derived, state } from '@stacksjs/stx'
 import type { createMailApi } from './mail-api'
 import { MailApiError } from './mail-api'
 import { addCalendarDays, allDayInstant, calendarTimeZones, instantForLocal, utcDay, zonedDateTime } from './calendar-dates'
+import type { TimeWindow } from './calendar-free-time'
 import type { CalendarEvent, CalendarEventDetail } from './calendar-types'
 import { createSeriesSource, editEventReminder, editOccurrence, editSeriesSource, readEventReminder, readOccurrence, readSeriesSchedule } from './calendar-recurrence'
 import type { CalendarOccurrence, OccurrenceRef } from './calendar-recurrence'
@@ -38,6 +39,7 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
   const editorStart = state('')
   const editorEnd = state('')
   const editorZone = state('UTC')
+  const editorRepeatedHour = state(false)
   const editorScheduleEditable = state(true)
   const editorReminderEditable = state(true)
   const editorReminder = state<ReminderChoice>('none')
@@ -73,7 +75,7 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
     if (wasStale) void refresh()
   }
 
-  function createEvent(day: string, calendarId: number, zone: string, source?: { reference: string, subject: string }) {
+  function createEvent(day: string, calendarId: number, zone: string, source?: { reference: string, subject: string }, slot?: TimeWindow) {
     if (editorBusy()) return
     initial = undefined
     occurrence = undefined
@@ -95,10 +97,15 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
     editorSourceMessage.set(source?.reference ?? null)
     editorLocation.set('')
     editorDescription.set('')
-    editorZone.set(zone)
+    // A TZID local time resolves to the first occurrence of a repeated hour.
+    // Use explicit UTC fields when the selected slot requires the later one.
+    const repeatedHour = slot ? [slot.start, slot.end].some(stamp => instantForLocal(zonedDateTime(stamp, zone), zone) !== stamp) : false
+    const timeZone = repeatedHour ? 'UTC' : zone
+    editorRepeatedHour.set(repeatedHour)
+    editorZone.set(timeZone)
     editorAllDay.set(false)
-    editorStart.set(`${day}T09:00`)
-    editorEnd.set(`${day}T10:00`)
+    editorStart.set(slot ? dateTimeInput(slot.start, timeZone) : `${day}T09:00`)
+    editorEnd.set(slot ? dateTimeInput(slot.end, timeZone) : `${day}T10:00`)
     editorLoaded.set(true)
     showEditor()
   }
@@ -172,6 +179,7 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
   function editEvent(event: CalendarEvent | CalendarOccurrence, zone: string, readOnly: boolean) {
     if (editorBusy()) return
     initial = undefined
+    editorRepeatedHour.set(false)
     displayZone = zone
     editingId.set(event.id)
     editorCalendar.set(String(event.calendar_id))
@@ -425,7 +433,7 @@ export function useCalendarEditor(api: ReturnType<typeof createMailApi>, dialog:
     editorOpen, editorBusy, editorLoaded, editorError, editorConflict, editingId, editorLabel,
     editorRecurring, editorOccurrence, editorHasOccurrence, editorReadOnly, editorViewer, editorProtectedOccurrence, editorCalendar, editorTitle, editorLocation, editorDescription,
     editorSourceMessage,
-    editorAllDay, editorStart, editorEnd, editorZone, editorScheduleEditable, editorTimeZones,
+    editorAllDay, editorStart, editorEnd, editorZone, editorRepeatedHour, editorScheduleEditable, editorTimeZones,
     editorReminder, editorReminderEditable, otherReminders, reminderOptions,
     repeatFrequency, repeatEvery, repeatEnd, repeatCount, repeatUntil, repeatOptions, changeRepeatEnd,
     confirmDelete, toggleAllDay, setEventBoundary,

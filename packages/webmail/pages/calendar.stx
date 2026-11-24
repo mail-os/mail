@@ -16,6 +16,7 @@ const {
   account, calendars, activeCalendar, activeCalendarName, calendarExport, calendarColor, eventColor, nameFor,
   sharedCalendars, selectedShare, availabilityOnly, canCreateEvent, writableCalendars, busyPeriods, busyPeriodLabel, shareNotice, recheckShares,
   view, calendarViews, calendarDays, monthWeekdays, yearMonths, yearTabDay, moveYearFocus, recurringSeries, rangeLabel, loading, error,
+  dayPresentation, dayTimelineOpen, dayTimeline, timelineStart, timelineSlot, openTimelineEvent,
   searchInput, searchTerm, events, search, clearSearch, focusDay, displayZone, calendarTimeZones,
   showDayLabels, showDayLabelEditor, hasDayLabels, labelOnDate, currentDayLabel, canEditDayLabel, editingDayLabel,
   dayLabelDraft, dayLabelSaving, dayLabelConflict, dayLabelError, dayLabelNotice, dayLabelsUnavailable,
@@ -37,7 +38,7 @@ const {
   openEvent, openNewEvent, editorOpen, editorBusy, editorLoaded, editorError, editorConflict, editingId, editorLabel,
   openMailEvent, sourceEmailLink, waitingMailEvent, editorSourceMessage,
   editorRecurring, editorOccurrence, editorHasOccurrence, editorReadOnly, editorViewer, editorProtectedOccurrence, editorCalendar, editorTitle, editorLocation, editorDescription,
-  editorAllDay, editorStart, editorEnd, editorZone, editorScheduleEditable, editorTimeZones,
+  editorAllDay, editorStart, editorEnd, editorZone, editorRepeatedHour, editorScheduleEditable, editorTimeZones,
   editorReminder, editorReminderEditable, otherReminders, reminderOptions,
   repeatFrequency, repeatEvery, repeatEnd, repeatCount, repeatUntil, repeatOptions, changeRepeatEnd,
   confirmDelete, toggleAllDay, setEventBoundary,
@@ -48,6 +49,22 @@ const {
   visibleReminders, reminderError, dismissingReminder, tickReminders, pollReminders, dismissReminder, destroyReminders,
 } = useMailCalendar(() => navigate('/login', { reload: true }), { ref: useRef('eventDialog'), nextTick })
 const dayHeading = useRef('dayHeading')
+const timelineViewport = useRef('timelineViewport')
+let anchoredTimeline = ''
+effect(() => {
+  const timeline = dayTimeline()
+  if (!timeline) { anchoredTimeline = ''; return }
+  const key = `${focusDay()}:${displayZone()}:${activeCalendar()}`
+  if (loading() || !timeline.minutes || key === anchoredTimeline) return
+  nextTick(() => {
+    const viewport = timelineViewport.current
+    const grid = viewport?.firstElementChild
+    if (viewport && grid) {
+      viewport.scrollTop = timeline.anchor * grid.clientHeight / timeline.minutes
+      anchoredTimeline = key
+    }
+  })
+})
 const labelField = useRef('labelField')
 const labelTrigger = useRef('labelTrigger')
 const freeTimeDateField = useRef('freeTimeDateField')
@@ -510,7 +527,54 @@ onUnmounted(() => { destroy(); destroyReminders() })
       <p :if="dayLabelNotice" class="wm-a11y-text" role="status" :text="dayLabelNotice"></p>
     </section>
 
-    <section :if="availabilityOnly && view !== 'year'" aria-labelledby="calendar-range">
+    <div :if="!searchTerm && view === 'day' && (calendars.length || selectedShare)" class="calendar-day-presentation">
+      <div class="calendar-choices" role="group" aria-label="Day layout">
+        <button type="button" class="wm-action" :aria-pressed="dayPresentation === 'timeline'" @click="dayPresentation.set('timeline')">Timeline</button>
+        <button type="button" class="wm-action" :aria-pressed="dayPresentation === 'list'" @click="dayPresentation.set('list')">List</button>
+      </div>
+      <form :if="dayTimelineOpen && canCreateEvent && dayTimeline?.slots.length" class="calendar-timeline-create" @submit.prevent="openTimelineEvent()">
+        <label for="calendar-timeline-start">Start time</label>
+        <select id="calendar-timeline-start" :value="timelineSlot?.value" :disabled="loading" @change="timelineStart.set($event.target.value)">
+          <option :for="slot in (dayTimeline?.slots || [])" :key="slot.value" :value="slot.value" :text="slot.label"></option>
+        </select>
+        <button type="submit" class="wm-action calendar-primary" :disabled="loading"><span class="mail-icon" data-icon="plus" aria-hidden="true"></span>Add event</button>
+      </form>
+    </div>
+    <section :if="dayTimelineOpen && dayTimeline && (calendars.length || selectedShare)" class="calendar-timeline" aria-label="Day timeline">
+      <section :if="dayTimeline?.allDay.length" class="calendar-timeline-all-day" aria-label="All-day events">
+        <h3>All day</h3>
+        <ul class="calendar-day-entries" role="list">
+          <li :for="event in (dayTimeline?.allDay || [])">
+            <button type="button" class="calendar-entry calendar-entry-all-day" :style="'--calendar-color:' + eventColor(event)" @click="openEvent(event)">
+              <strong :text="event.summary || 'Untitled event'"></strong><span class="calendar-entry-meta" :text="nameFor(event)"></span>
+            </button>
+          </li>
+        </ul>
+      </section>
+      <p :if="!loading && !error && !dayTimeline?.minutes" class="calendar-day-empty">This time zone has no local hours on this date.</p>
+      <p :if="!loading && !error && dayTimeline?.minutes && availabilityOnly && !dayTimeline?.busy.length" class="calendar-day-empty">No busy times on this day.</p>
+      <div :if="dayTimeline?.minutes" ref="timelineViewport" class="calendar-timeline-scroll" role="region" aria-label="Hours of the day" tabindex="0">
+        <div class="calendar-timeline-grid" :style="'--day-minutes:' + dayTimeline.minutes + ';--day-lanes:' + dayTimeline.lanes">
+          <div :for="tick in dayTimeline.ticks" :key="tick.minute" class="calendar-timeline-tick" :class="{ 'calendar-timeline-tick--repeated': tick.repeated }" :style="'--minute:' + tick.minute" aria-hidden="true"><span :text="tick.label"></span></div>
+          <ul :if="!availabilityOnly" class="calendar-timeline-track" role="list" aria-label="Timed events">
+            <li :for="item in dayTimeline.timed" class="calendar-timeline-item" :class="{ 'calendar-timeline-item--detailed': item.duration >= 30, 'calendar-timeline-item--overlap': item.lanes > 1 }" :style="'--minute:' + item.startMinute + ';--duration:' + item.duration + ';--lane:' + item.lane + ';--lanes:' + item.lanes + ';--calendar-color:' + eventColor(item.event)">
+              <button type="button" class="calendar-timeline-event" :title="(item.event.summary || 'Untitled event') + ' · ' + item.label" :aria-label="(item.event.summary || 'Untitled event') + ', ' + item.label + ', ' + nameFor(item.event)" @click="openEvent(item.event)">
+                <strong :text="item.event.summary || 'Untitled event'"></strong>
+                <span class="calendar-timeline-range" :text="item.label"></span>
+                <span class="calendar-timeline-start" :text="item.startLabel"></span>
+              </button>
+            </li>
+          </ul>
+          <ul :if="availabilityOnly" class="calendar-timeline-track" role="list" aria-label="Busy periods">
+            <li :for="block in dayTimeline.busy" :key="block.startMinute" class="calendar-timeline-busy" :style="'--minute:' + block.startMinute + ';--duration:' + block.duration">
+              <strong>Busy</strong><span :text="block.label"></span>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section :if="availabilityOnly && view !== 'year' && !dayTimelineOpen" aria-labelledby="calendar-range">
       <p :text="rangeLabel"></p>
       <p :if="!loading && !error && !busyPeriods.length">No busy times in this period.</p>
       <ul :if="busyPeriods.length" class="calendar-share-list" aria-label="Busy periods">
@@ -548,7 +612,7 @@ onUnmounted(() => { destroy(); destroyReminders() })
       </div>
     </section>
 
-    <section :if="!searchTerm && !availabilityOnly && view !== 'year' && (calendars.length || selectedShare)" aria-labelledby="calendar-range">
+    <section :if="!searchTerm && !availabilityOnly && view !== 'year' && !dayTimelineOpen && (calendars.length || selectedShare)" aria-labelledby="calendar-range">
       <p :if="!loading && !error && view === 'agenda' && !calendarDays.length">No events in this period.</p>
       <div :if="view === 'month'" class="calendar-weekdays" aria-hidden="true">
         <span :for="label in monthWeekdays" :text="label"></span>
@@ -581,19 +645,19 @@ onUnmounted(() => { destroy(); destroyReminders() })
           <p :if="view === 'day' && !day.entries.length && !loading && !error" class="calendar-day-empty">No events on this day.</p>
         </section>
       </div>
-      <section :if="recurringSeries.length" class="calendar-series" aria-labelledby="series-heading">
-        <h2 id="series-heading">Recurring dates unavailable</h2>
-        <p>Use CalDAV to view individual dates for these series.</p>
-        <ul class="calendar-result-list">
-          <li :for="event in recurringSeries">
-            <button class="calendar-result" @click="openEvent(event)" :style="'--calendar-color:' + eventColor(event)">
-              <strong :text="event.summary || 'Untitled series'"></strong>
-              <span :text="'Series start · ' + calendarEventDate(event)"></span>
-              <span :text="nameFor(event)"></span>
-            </button>
-          </li>
-        </ul>
-      </section>
+    </section>
+    <section :if="!searchTerm && !availabilityOnly && view !== 'year' && recurringSeries.length" class="calendar-series" aria-labelledby="series-heading">
+      <h2 id="series-heading">Recurring dates unavailable</h2>
+      <p>Use CalDAV to view individual dates for these series.</p>
+      <ul class="calendar-result-list">
+        <li :for="event in recurringSeries">
+          <button class="calendar-result" @click="openEvent(event)" :style="'--calendar-color:' + eventColor(event)">
+            <strong :text="event.summary || 'Untitled series'"></strong>
+            <span :text="'Series start · ' + calendarEventDate(event)"></span>
+            <span :text="nameFor(event)"></span>
+          </button>
+        </li>
+      </ul>
     </section>
   </section>
 </main>
@@ -627,6 +691,7 @@ onUnmounted(() => { destroy(); destroyReminders() })
           <label>Last day<input type="date" :value="editorEnd" @input="setEventBoundary('end', $event)"></label>
         </div>
         <div :if="!editorAllDay">
+          <p :if="editorRepeatedHour && editorZone === 'UTC'" class="calendar-editor-hint">Times are in UTC to preserve the selected occurrence during the repeated hour.</p>
           <div class="calendar-editor-pair">
             <label>Starts<input type="datetime-local" step="1" :value="editorStart" @input="setEventBoundary('start', $event)" required></label>
             <label>Ends<input type="datetime-local" step="1" :value="editorEnd" @input="setEventBoundary('end', $event)"></label>

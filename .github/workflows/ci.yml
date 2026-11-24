@@ -89,6 +89,12 @@ jobs:
       timeout-minutes: 5
       run: python3 scripts/test-webmail-navigation.py packages/zig/zig-out/bin/mail webmail-browser-screenshots/navigation --revision "$(git rev-parse HEAD)"
 
+    - name: Verify native Calendar day timeline
+      if: runner.os == 'Linux'
+      working-directory: .
+      timeout-minutes: 7
+      run: python3 scripts/test-webmail-day-timeline.py packages/zig/zig-out/bin/mail webmail-browser-screenshots/day-timeline
+
     - name: Upload browser screenshots
       if: ${{ !cancelled() && runner.os == 'Linux' }}
       uses: actions/upload-artifact@v4

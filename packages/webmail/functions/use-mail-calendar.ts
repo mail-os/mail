@@ -8,6 +8,8 @@ import {
   formatCalendarDay, shiftCalendarDay, startOfZonedDay, zonedDay,
 } from './calendar-dates'
 import type { CalendarView } from './calendar-dates'
+import { calendarDayTimeline } from './calendar-day-timeline'
+import type { TimeWindow } from './calendar-free-time'
 import { calendarAccessLabels, calendarColor } from './calendar-types'
 import type { Calendar, CalendarAccess, CalendarEvent, CalendarShare } from './calendar-types'
 import { calendarYear, calendarYearWindows, nextYearDate } from './calendar-year'
@@ -184,6 +186,15 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
       })
     }
     return days
+  })
+  const dayPresentation = state<'timeline' | 'list'>('timeline')
+  const dayTimelineOpen = derived(() => view() === 'day' && !searchTerm() && dayPresentation() === 'timeline')
+  const dayTimeline = derived(() => dayTimelineOpen() ? calendarDayTimeline(focusDay(), displayZone(),
+    availabilityOnly() ? [] : calendarDays()[0]?.entries ?? [], availabilityOnly() ? busyPeriods() : []) : null)
+  const timelineStart = state('')
+  const timelineSlot = derived(() => {
+    const timeline = dayTimeline()
+    return timeline?.slots.find(slot => slot.value === timelineStart()) ?? timeline?.defaultSlot
   })
   const yearMonths = derived(() => view() === 'year' && !searchTerm()
     ? calendarYear(focusDay(), displayZone(), today(), availabilityOnly() ? [] : occurrences().rows, busyPeriods())
@@ -477,10 +488,15 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
     return search()
   }
 
-  function openNewEvent(day = focusDay()) {
+  function openNewEvent(day = focusDay(), slot?: TimeWindow) {
     if (!canCreateEvent()) return
     const id = activeCalendar() ?? calendars()[0]?.id
-    if (id !== undefined) editor.createEvent(day, id, displayZone())
+    if (id !== undefined) editor.createEvent(day, id, displayZone(), undefined, slot)
+  }
+
+  function openTimelineEvent() {
+    const slot = timelineSlot()
+    if (slot && !loading()) openNewEvent(focusDay(), { start: slot.stamp, end: slot.stamp + 3600 })
   }
 
   async function openMailEvent() {
@@ -688,6 +704,7 @@ export function useMailCalendar(onAuthError: () => void, dialog: CalendarDialog)
       dateStyle: 'medium', timeStyle: 'short', timeZone: displayZone(),
     }).formatRange(new Date(period.start * 1000), new Date(period.end * 1000)),
     view, calendarViews, calendarDays, monthWeekdays, yearMonths, yearTabDay, moveYearFocus, recurringSeries, rangeLabel, loading, error,
+    dayPresentation, dayTimelineOpen, dayTimeline, timelineStart, timelineSlot, openTimelineEvent,
     searchInput, searchTerm, events, search, clearSearch, focusDay, displayZone, calendarTimeZones,
     refresh, selectCalendar, showView, shiftView, goToToday, showDay, changeDate, changeZone,
     calendarSettings, calendarSettingsError, calendarSettingsBusy, calendarNameInput, createCalendar, setCalendarColor, toggleCalendarSettings,

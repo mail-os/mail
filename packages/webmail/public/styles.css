@@ -853,6 +853,52 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 }
 .calendar-board-day .calendar-day, .calendar-board-agenda .calendar-day { padding: .75rem; min-height: 0; }
 .calendar-board-day .calendar-entry, .calendar-board-agenda .calendar-entry { padding: .55rem .7rem; }
+.calendar-day-presentation { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 8px 16px; margin-block: 0 12px; }
+.calendar-timeline-create { display: grid; grid-template-columns: auto minmax(0, 12rem) auto; align-items: center; gap: 8px; }
+.calendar-timeline-create label, .calendar-timeline-all-day h3 { font-size: .8125rem; font-weight: 650; color: var(--muted); }
+.calendar-timeline-create select { inline-size: 100%; }
+.calendar-timeline { --minute-height: 1.4px; --time-gutter: 90px; --lane-width: 76px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); }
+.calendar-timeline-all-day { display: grid; grid-template-columns: var(--time-gutter) minmax(0, 1fr); align-items: center; padding: 8px 10px 8px 0; border-block-end: 1px solid var(--border); background: var(--toolbar); border-radius: 10px 10px 0 0; }
+.calendar-timeline-all-day h3 { margin: 0; padding-inline: 8px; text-align: end; }
+.calendar-timeline-all-day ul { grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr)); }
+.calendar-timeline-all-day .calendar-entry { position: relative; min-block-size: var(--control-height); border: 1px solid var(--control-border); padding-inline-start: 10px; overflow: hidden; }
+.calendar-timeline-all-day .calendar-entry::before, .calendar-timeline-event::before { content: ''; position: absolute; inset-block-start: 0; inset-inline-start: 0; inline-size: 3px; background: var(--calendar-color); }
+.calendar-timeline-all-day .calendar-entry::before { inset-block-end: 0; }
+.calendar-timeline > p { margin: 12px; }
+.calendar-timeline-scroll { max-block-size: min(36rem, 60dvh); overflow: auto; border-radius: inherit; padding-block: 18px 32px; }
+.calendar-timeline-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.calendar-timeline-grid { position: relative; block-size: calc(var(--day-minutes) * var(--minute-height)); min-inline-size: max(100%, calc(var(--time-gutter) + var(--day-lanes) * var(--lane-width) + 8px)); }
+.calendar-timeline-tick { position: absolute; inset-block-start: calc(var(--minute) * var(--minute-height)); inset-inline: 0; display: grid; grid-template-columns: var(--time-gutter) minmax(0, 1fr); pointer-events: none; }
+.calendar-timeline-tick span { padding-inline: 4px 10px; color: var(--muted); font-size: .75rem; line-height: 1.2; text-align: end; font-variant-numeric: tabular-nums; transform: translateY(-50%); }
+.calendar-timeline-tick::after { content: ''; border-block-start: 1px solid var(--border); }
+.calendar-timeline-track { position: absolute; inset-block: 0; inset-inline: calc(var(--time-gutter) + 4px) 6px; margin: 0; padding: 0; list-style: none; }
+.calendar-timeline-item, .calendar-timeline-busy { position: absolute; inset-block-start: calc(var(--minute) * var(--minute-height)); min-inline-size: 0; }
+.calendar-timeline-item { inset-inline-start: calc(var(--lane) * 100% / var(--lanes)); inline-size: calc(100% / var(--lanes) - 4px); block-size: max(28px, calc(var(--duration) * var(--minute-height))); }
+.calendar-timeline-item:focus-within { z-index: 1; }
+.calendar-timeline-event, .calendar-timeline-busy { display: flex; flex-direction: column; align-items: start; justify-content: start; border: 1px solid var(--control-border); border-radius: 6px; padding: 4px 7px; overflow: hidden; color: var(--text); text-align: start; }
+.calendar-timeline-event { position: relative; inline-size: 100%; block-size: 100%; background: color-mix(in srgb, var(--calendar-color) 12%, var(--panel)); padding-inline-start: 10px; }
+.calendar-timeline-event::before { block-size: max(3px, calc(var(--duration) * var(--minute-height))); }
+.calendar-timeline-event:hover { background: color-mix(in srgb, var(--calendar-color) 20%, var(--panel)); }
+.calendar-timeline-event :is(strong, span), .calendar-timeline-busy span { max-inline-size: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: none; }
+.calendar-timeline-event strong, .calendar-timeline-busy strong { font-size: .8125rem; font-weight: 650; }
+.calendar-timeline-event span, .calendar-timeline-busy span { font-size: .75rem; color: var(--muted); }
+.calendar-timeline-event .calendar-timeline-start { display: none; }
+.calendar-timeline-busy { inset-inline: 0; block-size: calc(var(--duration) * var(--minute-height)); background: var(--surface); }
+@media (max-width: 550px) {
+  .calendar-day-presentation { align-items: stretch; }
+  .calendar-timeline-create { inline-size: 100%; grid-template-columns: minmax(0, 1fr) auto; }
+  .calendar-timeline-create label { grid-column: 1 / -1; }
+  .calendar-timeline { --time-gutter: 59px; --lane-width: 64px; }
+  .calendar-timeline-all-day h3 { padding-inline: 3px 7px; white-space: nowrap; }
+  .calendar-timeline-tick span { padding-inline: 0 4px; font-size: .6875rem; }
+  .calendar-timeline-tick:not(.calendar-timeline-tick--repeated) span { white-space: nowrap; }
+  .calendar-timeline-event { padding-inline: 6px 4px; }
+  .calendar-timeline-event strong { font-size: .75rem; }
+  .calendar-timeline-item--detailed .calendar-timeline-event strong { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; white-space: normal; line-height: 1.2; }
+  .calendar-timeline-item--detailed .calendar-timeline-event span { white-space: normal; font-size: .6875rem; line-height: 1.25; }
+  .calendar-timeline-item--overlap .calendar-timeline-range { display: none; }
+  .calendar-timeline-item--overlap.calendar-timeline-item--detailed .calendar-timeline-start { display: block; }
+}
 .calendar-result { padding: .65rem .75rem; background: var(--panel); grid-template-columns: minmax(10rem, 1.2fr) repeat(3, minmax(0, 1fr)); align-items: baseline; }
 .calendar-series h2 { font-size: 1rem; margin-bottom: .35rem; }
 .calendar-series p { color: var(--muted); margin-top: 0; font-size: .875rem; }

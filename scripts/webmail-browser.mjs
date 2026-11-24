@@ -2648,9 +2648,10 @@ async function invitationRangeJourney(desktop, phone) {
 
   await phone.goto(url + '/calendar?day=2026-11-28')
   await chooseCalendarView(phone, 'Day')
-  const later = button(phone, /Studio reservation series/)
+  const phoneTimeline = phone.getByRole('region', { name: 'Day timeline', exact: true })
+  const later = button(phoneTimeline, /^Studio reservation series, 6:00 PM – 8:00 PM,/)
   await later.waitFor()
-  assert.match(await later.locator('.calendar-entry-time').textContent(), /^6:00(?:\s*PM)?\s*–\s*8:00\s*PM$/)
+  await later.scrollIntoViewIfNeeded()
   assert.equal(await button(phone, /Friday studio reservation/).count(), 0)
   await fitsViewport(phone)
   await screenshot(phone, 'phone-calendar-range-day')

@@ -189,6 +189,13 @@ for the released mailbox check, candidate walkthrough, and follow-up issues.
   unmarked date to open its day view. With a date focused, the arrow keys move
   between days and weeks. Search matches titles, locations, and descriptions
   across dates. Use **Manage calendars** to create a calendar or change its color.
+- **Day** opens a timeline in the display time zone. All-day events have their
+  own row, overlapping timed events appear side by side, and **List** opens a
+  chronological view. Choose a **Start time** and **Add event** to open the
+  editor at that time. Repeated daylight-saving times include their UTC
+  offsets. The editor opens in UTC if the selected time needs it to preserve
+  the exact occurrence. Availability-only shares display anonymous busy
+  blocks and keep the list view available.
 - **Find free time** checks a date, time range, and minimum duration in the
   display time zone. It uses your personal calendars or the selected calendar.
   When checking a shared calendar, you can include your own calendars to find
