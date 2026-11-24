@@ -3,11 +3,20 @@ umask 077
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y awscli certbot dnsutils openssl python3
+apt-get install -y certbot curl dnsutils nodejs openssl python3 unzip
 
-# The published bundle is specific to the candidate, including the health scripts.
 workdir=$(mktemp -d)
 trap 'rm -rf "$workdir"' EXIT
+
+# Ubuntu Noble has no awscli apt candidate. Use the official AWS CLI v2 installer.
+if ! command -v aws >/dev/null 2>&1; then
+  curl --fail --silent --show-error --location --retry 3 \
+    https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o "$workdir/awscli.zip"
+  unzip -q "$workdir/awscli.zip" -d "$workdir"
+  "$workdir/aws/install"
+fi
+
+# The published bundle is specific to the candidate, including the health scripts.
 export AWS_DEFAULT_REGION="$region"
 export AWS_MAX_ATTEMPTS=10
 aws s3 cp "$artifact" "$workdir/mail.tar.gz" --only-show-errors

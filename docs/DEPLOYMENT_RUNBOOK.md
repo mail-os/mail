@@ -9,7 +9,7 @@ This runbook provides step-by-step procedures for deploying, upgrading, and main
 
 ## Native Mail staging on AWS
 
-Use a public Route 53 zone dedicated to the staging mailbox domain. For example, `mail.staging.example.com` is the server hostname and `staging.example.com` is the zone and mailbox domain. The stack manages only the staging hostname's A record. Staging supports delivery between its own mailboxes. Its security group limits internet egress to HTTP and HTTPS.
+Use a public Route 53 zone dedicated to the staging mailbox domain. For example, `mail.staging.example.com` is the server hostname and `staging.example.com` is the zone and mailbox domain. Delegate the zone from its authoritative parent and verify that a public NS lookup returns the Route 53 nameservers before creating the stack. The stack manages only the staging hostname's A record. Staging supports delivery between its own mailboxes. Its security group limits internet egress to HTTP and HTTPS.
 
 Build the chosen Linux x86-64 revision with `zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast` in `packages/zig` after installing the repository dependencies. Publish a gzip tar archive under `staging/` in the test artifact bucket. Use the built executable as `mail-server` and include `scripts/mail-health.py`, `scripts/mail-health-watch.py`, `scripts/mail-sync-health.py`, and `scripts/setup-mail-health.sh` from the same revision at the archive root. Record the revision and SHA-256 of the archive.
 
