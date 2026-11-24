@@ -124,7 +124,7 @@ pub const SessionManager = struct {
         if (factor.code != null and try mfa.enabled(tx, primary.id)) {
             if (factor.limiter) |limiter| try mfa.limitAttempt(limiter, primary.id);
         }
-        try mfa.consume(tx, if (self.mfa_key) |*key| key else null, primary.id, factor.code, now);
+        try mfa.authorizeSession(tx, if (self.mfa_key) |*key| key else null, primary.id, factor.code, session_id, now);
         {
             const stmt = try tx.prepare(
                 \\INSERT INTO webmail_sessions

@@ -34,6 +34,23 @@ pub const schema =
     \\    digest BLOB NOT NULL,
     \\    PRIMARY KEY (user_id, digest)
     \\);
+    \\CREATE TABLE IF NOT EXISTS webmail_mfa_session_tickets (
+    \\    session_id TEXT PRIMARY KEY NOT NULL,
+    \\    user_id INTEGER NOT NULL REFERENCES webmail_mfa_factors(user_id) ON DELETE CASCADE
+    \\);
+    \\CREATE TRIGGER IF NOT EXISTS enforce_webmail_mfa_session_insert
+    \\BEFORE INSERT ON webmail_sessions
+    \\WHEN EXISTS (
+    \\    SELECT 1 FROM webmail_mfa_factors f JOIN users u ON u.id = f.user_id
+    \\    WHERE u.username = NEW.username
+    \\)
+    \\BEGIN
+    \\    SELECT RAISE(ABORT, 'webmail session requires verified second factor') WHERE NOT EXISTS (
+    \\        SELECT 1 FROM webmail_mfa_session_tickets t JOIN users u ON u.id = t.user_id
+    \\        WHERE t.session_id = NEW.session_id AND u.username = NEW.username
+    \\    );
+    \\    DELETE FROM webmail_mfa_session_tickets WHERE session_id = NEW.session_id;
+    \\END;
 ;
 
 fn associatedData(user_id: i64) [23]u8 {
@@ -255,6 +272,20 @@ pub fn consume(tx: Tx, key: ?*const Key, user_id: i64, credential: ?[]const u8, 
     if (!try stmt.step()) return error.InvalidFactor;
 }
 
+/// The insert trigger also runs when a previous binary opens this database.
+/// It spends this ticket on exactly one insert in the factor transaction.
+pub fn authorizeSession(tx: Tx, key: ?*const Key, user_id: i64, credential: ?[]const u8, session_id: []const u8, now: i64) !void {
+    try consume(tx, key, user_id, credential, now);
+    const stmt = try tx.prepare(
+        \\INSERT INTO webmail_mfa_session_tickets (session_id, user_id)
+        \\SELECT ?1, user_id FROM webmail_mfa_factors WHERE user_id = ?2
+    );
+    defer stmt.finalize();
+    try stmt.bind(1, session_id);
+    try stmt.bind(2, user_id);
+    _ = try stmt.step();
+}
+
 fn retireOtherSessions(tx: Tx, user_id: i64, keep: []const u8) !void {
     const stmt = try tx.prepare("DELETE FROM webmail_sessions WHERE username = (SELECT username FROM users WHERE id = ?1) AND session_id <> ?2");
     defer stmt.finalize();
@@ -312,21 +343,29 @@ test "webmail MFA enrollment is session-bound and expires" {
     const key: Key = @splat(7);
     const now = 12_000;
 
-    var tx = try db.beginTransaction(.write);
-    defer tx.deinit();
-    _ = try beginEnrollment(tx, &key, user_id, "owner", now);
-    const secret = try pendingSecret(tx, &key, user_id);
-    const code = totp(&secret, now / step_seconds);
-    try std.testing.expectError(error.InvalidEnrollment, confirmEnrollment(tx, &key, user_id, "other", &code, now));
-    try std.testing.expectError(error.InvalidEnrollment, confirmEnrollment(tx, &key, user_id, "owner", &code, now + enrollment_ttl));
-    try std.testing.expect(!try enabled(tx, user_id));
-    const codes = try confirmEnrollment(tx, &key, user_id, "owner", &code, now);
-    try std.testing.expectEqual(recovery_count, codes.len);
-    try std.testing.expect(try enabled(tx, user_id));
-    try std.testing.expectError(error.AlreadyEnrolled, beginEnrollment(tx, &key, user_id, "owner", now));
-    try std.testing.expectError(error.InvalidEnrollment, requireOwnerSession(tx, user_id, "other", now));
-    try requireOwnerSession(tx, user_id, "owner", now);
-    try tx.commit();
+    {
+        var tx = try db.beginTransaction(.write);
+        defer tx.deinit();
+        _ = try beginEnrollment(tx, &key, user_id, "owner", now);
+        const secret = try pendingSecret(tx, &key, user_id);
+        const code = totp(&secret, now / step_seconds);
+        try std.testing.expectError(error.InvalidEnrollment, confirmEnrollment(tx, &key, user_id, "other", &code, now));
+        try std.testing.expectError(error.InvalidEnrollment, confirmEnrollment(tx, &key, user_id, "owner", &code, now + enrollment_ttl));
+        try std.testing.expect(!try enabled(tx, user_id));
+        const codes = try confirmEnrollment(tx, &key, user_id, "owner", &code, now);
+        try std.testing.expectEqual(recovery_count, codes.len);
+        try std.testing.expect(try enabled(tx, user_id));
+        try std.testing.expectError(error.AlreadyEnrolled, beginEnrollment(tx, &key, user_id, "owner", now));
+        try std.testing.expectError(error.InvalidEnrollment, requireOwnerSession(tx, user_id, "other", now));
+        try requireOwnerSession(tx, user_id, "owner", now);
+        try tx.commit();
+    }
+    // The legacy insert reports SQLite's trigger constraint as AlreadyExists.
+    try std.testing.expectError(error.AlreadyExists, db.createWebmailSession("legacy", name, name, "csrf3", 20_000, null, null));
+    try std.testing.expectError(error.NotFound, db.getWebmailSession("legacy"));
+    const unrelated = "unprotected@example.test";
+    _ = try db.createUser(unrelated, "unused", unrelated);
+    try db.createWebmailSession("unprotected", unrelated, unrelated, "csrf4", 20_000, null, null);
 }
 
 test "webmail MFA consumes OTP and recovery codes transactionally and restores access after device loss" {

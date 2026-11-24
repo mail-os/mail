@@ -3,7 +3,7 @@
 import argparse
 from base64 import b32decode
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import closing, suppress
 from hashlib import sha256
 import hmac
 import http.client
@@ -35,31 +35,42 @@ def totp(secret, step):
     return f"{value % 1_000_000:06d}"
 
 
-def verify(mail):
+def https(mail, path, body=None, *, method="POST", cookie=None, origin=None, status=200, error=None):
     host = urlsplit(mail.webmail)
+    with closing(http.client.HTTPSConnection(host.hostname, host.port, timeout=10, context=mail.tls_context)) as client:
+        headers = {"Origin": origin or mail.webmail}
+        if cookie:
+            headers["Cookie"] = cookie
+        if path == HOSTED:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            body = f"proof={body}"
+        elif body is not None:
+            headers["Content-Type"] = "application/json"
+            body = json.dumps(body)
+        client.request(method, path, body, headers)
+        response = client.getresponse()
+        result = response.read()
+        assert response.status == status, (path, response.status, result)
+        data = json.loads(result) if result else None
+        if error:
+            assert data["error"] == error, (path, data)
+        return response.headers, data
 
-    def call(path, body=None, *, method="POST", cookie=None, origin=mail.webmail, status=200, error=None):
-        with closing(http.client.HTTPSConnection(host.hostname, host.port, timeout=10, context=mail.tls_context)) as client:
-            headers = {"Origin": origin}
-            if cookie:
-                headers["Cookie"] = cookie
-            if path == HOSTED:
-                headers["Content-Type"] = "application/x-www-form-urlencoded"
-                body = f"proof={body}"
-            elif body is not None:
-                headers["Content-Type"] = "application/json"
-                body = json.dumps(body)
-            client.request(method, path, body, headers)
-            response = client.getresponse()
-            result = response.read()
-            assert response.status == status, (path, response.status, result)
-            data = json.loads(result) if result else None
-            if error:
-                assert data["error"] == error, (path, data)
-            return response.headers, data
 
-    def cookies(headers):
-        return [value.split(";", 1)[0] for value in headers.get_all("Set-Cookie", [])]
+def cookies(headers):
+    return [value.split(";", 1)[0] for value in headers.get_all("Set-Cookie", [])]
+
+
+def issue_proof(mail, mailbox):
+    status, _, body = mail.http(mail.private + "/provisioning/v1/webmail/sign-in",
+                                 {"mailbox": mailbox, "actor": mail.specs[mailbox]["actor"]}, mail.auth)
+    assert status == 201, (status, body)
+    return json.loads(body)["proof"]
+
+
+def verify(mail):
+    def call(path, *args, **options):
+        return https(mail, path, *args, **options)
 
     def login(mailbox, factor=None, **options):
         return call(AUTH + "/login", credentials(mailbox, factor), **options)[0]
@@ -75,14 +86,8 @@ def verify(mail):
         if expected:
             assert result["user"]["username"] == expected
 
-    def proof(mailbox):
-        status, _, body = mail.http(mail.private + "/provisioning/v1/webmail/sign-in",
-                                     {"mailbox": mailbox, "actor": mail.specs[mailbox]["actor"]}, mail.auth)
-        assert status == 201, (status, body)
-        return json.loads(body)["proof"]
-
     def challenge(mailbox, old=None):
-        token = proof(mailbox)
+        token = issue_proof(mail, mailbox)
         headers, _ = call(HOSTED, token, cookie=old, origin=ORIGIN, status=303)
         assert headers["Location"] == "/login#hosted-factor"
         cookie, = cookies(headers)
@@ -180,6 +185,63 @@ def verify(mail):
         assert cookies(login(owner))
 
 
+def verify_rollback(mail, previous):
+    candidate = mail.binary
+    with mail.daemon():
+        protected = mail.provision("enrolled")
+        ordinary = mail.provision("ordinary")
+        owner = mail.login(protected)["Cookie"]
+        _, setup = https(mail, MFA, {"currentPassword": mail.password}, cookie=owner)
+        code = totp(setup["secret"], int(time.time()) // 30)
+        _, activation = https(mail, MFA, {"factor": code}, method="PUT", cookie=owner)
+        recovery = activation["recoveryCodes"][0]
+        credentials = {"username": protected, "password": mail.password}
+
+    mail.binary = previous
+    try:
+        with mail.daemon():
+            _, identity = https(mail, AUTH + "/me", method="GET", cookie=owner)
+            assert identity["user"]["username"] == protected
+            refused, _ = https(mail, AUTH + "/login", credentials, status=500)
+            assert not cookies(refused)
+
+            ordinary_session = mail.login(ordinary)["Cookie"]
+            # This predecessor closes failed Combined inbox writes without an HTTP error body.
+            with suppress(http.client.RemoteDisconnected):
+                refused, _ = https(mail, LINKS, credentials, cookie=ordinary_session, status=500)
+                assert not cookies(refused)
+            _, result = https(mail, LINKS, method="GET", cookie=ordinary_session)
+            assert result["accounts"] == []
+
+            accepted, _ = https(mail, HOSTED, issue_proof(mail, ordinary), origin=ORIGIN, status=303)
+            assert cookies(accepted)
+            refused, _ = https(mail, HOSTED, issue_proof(mail, protected), origin=ORIGIN, status=503)
+            assert not cookies(refused)
+            assert refused.get("Location") is None
+            with closing(sqlite3.connect(mail.directory / "smtp.db")) as db:
+                assert db.execute("SELECT session_id FROM webmail_sessions WHERE username=?", (protected,)).fetchall() == [(owner.split("=", 1)[1],)]
+                assert db.execute("SELECT count(*) FROM webmail_mfa_session_tickets").fetchone() == (0,)
+
+            subject = "Mail received during rollback"
+            assert mail.deliver(protected, identity=ordinary, subject=subject, body="Still accepting SMTP.")[0] == 250
+            with mail.imap(protected) as reader:
+                assert reader.select("INBOX")[0] == "OK"
+                assert reader.search(None, "SUBJECT", f'"{subject}"')[1] == [b"1"]
+    finally:
+        mail.binary = candidate
+
+    with mail.daemon():
+        signed_in, _ = https(mail, AUTH + "/login", dict(credentials, factor=recovery))
+        restored, = cookies(signed_in)
+        assert restored != owner
+        _, identity = https(mail, AUTH + "/me", method="GET", cookie=restored)
+        assert identity["user"]["username"] == protected
+        https(mail, AUTH + "/login", dict(credentials, factor=recovery), status=403, error="invalid_factor")
+        with closing(sqlite3.connect(mail.directory / "smtp.db")) as db:
+            assert db.execute("SELECT count(*) FROM webmail_mfa_session_tickets").fetchone() == (0,)
+    print("Verified second-factor enforcement across rollback and roll-forward with mail flowing.")
+
+
 def make_fixture(binary, directory):
     mail = Fixture(binary, directory, staging=True)
     mail.env.update(SMTP_WEBMAIL_MFA_KEY=secrets.token_hex(32), SMTP_HOSTED_SIGN_IN_ORIGIN=ORIGIN)
@@ -199,12 +261,19 @@ def browser_test(mail, engine, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
+    parser.add_argument("--previous", type=Path, help="Rehearse rollback to a pre-MFA candidate with hosted sign-in and Combined inbox")
     parser.add_argument("--browser", choices=("chromium", "firefox", "webkit"), action="append")
     parser.add_argument("--screenshots", type=Path, default=Path("webmail-browser-screenshots/mfa"))
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="mail-mfa-") as directory:
         verify(make_fixture(binary, Path(directory)))
+    if args.previous:
+        previous = args.previous.resolve(strict=True)
+        if previous == binary:
+            parser.error("--previous must be a different executable")
+        with tempfile.TemporaryDirectory(prefix="mail-mfa-rollback-") as directory:
+            verify_rollback(make_fixture(binary, Path(directory)), previous)
     for engine in args.browser or ():
         with tempfile.TemporaryDirectory(prefix="mail-mfa-browser-") as directory:
             browser_test(make_fixture(binary, Path(directory)), engine, args.screenshots.resolve())

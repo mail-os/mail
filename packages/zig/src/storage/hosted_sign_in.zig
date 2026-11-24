@@ -219,7 +219,7 @@ pub fn finishFactor(db: *database.Database, a: std.mem.Allocator, challenge: []c
     defer if (pending[1]) |old| a.free(old);
     if (!try mfa.enabled(tx, pending[0])) return error.InvalidProof;
     try mfa.limitAttempt(limiter, pending[0]);
-    try mfa.consume(tx, key, pending[0], code, input.now);
+    try mfa.authorizeSession(tx, key, pending[0], code, input.session, input.now);
     try startSession(tx, &digest, input, pending[1]);
     try consume(tx, &digest);
     try tx.commit();

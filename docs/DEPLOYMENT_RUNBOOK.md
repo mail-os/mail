@@ -742,6 +742,31 @@ sudo -u smtp sqlite3 /var/lib/mail/smtp.db "SELECT version, name FROM schema_mig
    a draft, and representative DAV resources before resuming the affected
    services. Keep both recovery points through the verification window.
 
+### Preserve two-step verification during rollback
+
+The current Mail database enforces two-step verification when a browser session
+is created. During a binary-only rollback on that database, previously verified
+sessions still work. A previous binary without the current verifier rejects new
+sign-ins and Combined inbox links for enrolled mailboxes. Unenrolled webmail
+and mail protocol access remain available. Restore the current binary to resume
+interactive sign-in for enrolled mailboxes.
+
+A database checkpoint may predate an enrollment or the consumption of a
+recovery code. Run the restored daemon with `SMTP_ENABLE_WEBMAIL=false`. In
+that temporary configuration, unset `SMTP_HOSTED_SIGN_IN_ORIGIN`,
+`SMTP_WEBMAIL_MFA_KEY`, and `SMTP_WEBMAIL_OPERATOR_ID` if set. Keep a protected
+copy of the normal configuration and key. Reconcile the current factor state
+using the saved recovery point and the current verifier before reopening webmail.
+
+Rehearse a binary-only rollback with a pre-MFA candidate that already supports
+hosted sign-in and Combined inbox. The fixture enrolls a disposable mailbox,
+checks all three session paths on the older binary, delivers SMTP mail and reads
+it over IMAP, then rolls forward and spends a recovery code once.
+
+```bash
+python3 scripts/test-webmail-mfa.py /path/to/candidate --previous /path/to/previous-mail
+```
+
 ### Rehearse a published-version rollback
 
 Use the published executable for the version being replaced. Verify the

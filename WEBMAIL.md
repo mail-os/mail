@@ -522,6 +522,10 @@ listener or trusted local TLS gateway. Keep the same key when restoring the
 database or restarting the service. An enrolled mailbox still requires a factor
 when the key is missing. A saved recovery code works without that key.
 
+The database preserves the factor requirement during a binary-only rollback.
+See [Preserve two-step verification during rollback](docs/DEPLOYMENT_RUNBOOK.md#preserve-two-step-verification-during-rollback)
+for the behavior of older executables and checkpoint restores.
+
 ## Password recovery
 
 Each mailbox may have one recovery address outside itself. "Forgot password?"
