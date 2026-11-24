@@ -1172,8 +1172,9 @@ records. SQLite reuses freed pages for future writes.
 
 ## Validation and release
 
-Run `bun test`, the strict TypeScript check for webmail composables, Pickier, and
-`zig build test` with the repository's pinned Zig toolchain. `bun run build` in
+Run `bun test`, `bun run --filter mail-webmail typecheck`, Pickier, and
+`zig build test` with the repository's pinned Zig toolchain. The typecheck covers
+webmail TypeScript sources and tests. `bun run build` in
 `packages/webmail` compiles the embedded stx pages. The Zig build also does this.
 Live API suites in `packages/webmail/{e2e,ux-e2e}.test.ts` run with
 `MAIL_WEBMAIL_E2E_URL`, `MAIL_WEBMAIL_E2E_USER` and `MAIL_WEBMAIL_E2E_PASSWORD`.

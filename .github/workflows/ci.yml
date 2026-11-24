@@ -259,6 +259,9 @@ jobs:
     - name: Install workspace dependencies
       run: bun install --frozen-lockfile
 
+    - name: Typecheck webmail
+      run: bun run --filter mail-webmail typecheck
+
     # Covers the MIME parser: its own behaviour suite plus the parity suites that
     # compare it against postal-mime on well formed, malformed and mutated messages.
     - name: Run SDK tests

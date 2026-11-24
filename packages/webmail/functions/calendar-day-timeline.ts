@@ -75,7 +75,7 @@ export function calendarDayTimeline<T extends CalendarEvent>(day: string, zone: 
   const offsetClock = new Intl.DateTimeFormat(undefined, { ...options, timeZoneName: 'shortOffset' })
   const offset = (stamp: number, wall: string) => Date.parse(`${wall}Z`) / 1000 - stamp
 
-  const quarters = []
+  const quarters: { stamp: number, wallTime: string, offset: number }[] = []
   const wallCounts = new Map<string, number>()
   for (let stamp = start; stamp < end; stamp += quarterHour) {
     const wall = zonedDateTime(stamp, zone)

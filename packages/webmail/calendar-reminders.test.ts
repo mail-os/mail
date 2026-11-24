@@ -6,7 +6,7 @@ import { defaultRepeat } from './functions/calendar-repeat'
 const stamp = (value: string) => Date.parse(value) / 1000
 const zone = 'America/New_York'
 const event: CalendarEvent = {
-  id: 41, calendar_id: 2, uid: 'reminders', summary: 'Calendar work', location: null,
+  id: 41, calendar_id: 2, summary: 'Calendar work', location: null,
   start: stamp('2026-03-08T17:00Z'), end: stamp('2026-03-08T18:00Z'),
   all_day: false, recurring: false, recurrence_rule: null, status: 'confirmed', etag: '"reminder"',
 }

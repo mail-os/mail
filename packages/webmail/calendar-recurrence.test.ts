@@ -8,7 +8,7 @@ import { calendarTimeZoneSource } from './build-calendar-timezones'
 const stamp = (date: string) => Date.parse(date) / 1000
 const zone = 'America/New_York'
 const row: CalendarEvent = {
-  id: 1, calendar_id: 2, uid: 'fixture', summary: 'Office hours', location: null,
+  id: 1, calendar_id: 2, summary: 'Office hours', location: null,
   start: stamp('2026-03-01T14:00Z'), end: stamp('2026-03-01T15:00Z'),
   all_day: false, recurring: true, recurrence_rule: 'FREQ=WEEKLY;COUNT=5',
   status: 'confirmed', etag: '"fixture"',

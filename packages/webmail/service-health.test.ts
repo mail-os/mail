@@ -40,9 +40,9 @@ test('an unauthorized refresh clears the report and a successful refresh clears 
   const health = useServiceHealth()
   const report = { ...fresh, report: { ...fresh.report, checked_at: Math.floor(Date.now() / 1000) } }
   let unauthorized = false
-  globalThis.fetch = (async () => unauthorized
+  globalThis.fetch = Object.assign(async () => unauthorized
     ? Response.json({ code: 'unauthorized', message: 'Invalid or expired session' }, { status: 401 })
-    : Response.json(report)) as typeof fetch
+    : Response.json(report), { preconnect: previous.preconnect })
   try {
     await health.refresh()
     expect(health.status()).toBe('healthy')

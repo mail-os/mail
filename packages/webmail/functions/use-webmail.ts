@@ -417,16 +417,20 @@ export function useWebmail(ports: WebmailPorts) {
     return !linkedView && !!item?.reference && !['Drafts', 'Trash', 'Screening', 'Declined'].includes(item.folder)
       && !isJunkFolder(item.folder) && !item.flags.deleted && !item.flags.draft && !senderReview.senderReviewOpen()
   })
+  // Retain missing entries so action previews can reject an incomplete selection.
+  function checkedReferences(): (string | undefined)[] {
+    return checked().map(item => item.reference ?? undefined)
+  }
   function shareMessageSnapshot() {
-    if (canShareSnapshot()) snapshots.previewSnapshot([selected()?.reference])
+    if (canShareSnapshot()) snapshots.previewSnapshot([selected()?.reference ?? undefined])
   }
   function shareSelectedSnapshot() {
-    snapshots.previewSnapshot(checked().map(item => item.reference))
+    snapshots.previewSnapshot(checkedReferences())
   }
   function shareWithTeam(bulk = false) {
     if (linkedView || !limits().teamThreadsAvailable) return
-    if (bulk) teamThreads.beginTeamThread(checked().map(item => item.reference))
-    else if (canShareSnapshot()) teamThreads.beginTeamThread([selected()?.reference])
+    if (bulk) teamThreads.beginTeamThread(checkedReferences())
+    else if (canShareSnapshot()) teamThreads.beginTeamThread([selected()?.reference ?? undefined])
   }
   function shareCollectionWithTeam() {
     const collection = collectionView()
@@ -434,11 +438,11 @@ export function useWebmail(ports: WebmailPorts) {
   }
   function shareWithAssistant(bulk = false) {
     if (linkedView) return
-    if (bulk) assistantGrants.beginAssistantGrant(checked().map(item => item.reference))
-    else if (canShareSnapshot()) assistantGrants.beginAssistantGrant([selected()?.reference])
+    if (bulk) assistantGrants.beginAssistantGrant(checkedReferences())
+    else if (canShareSnapshot()) assistantGrants.beginAssistantGrant([selected()?.reference ?? undefined])
   }
   function replyToSelection() {
-    replyBatch.startReplyBatch(checked().map(item => item.reference))
+    replyBatch.startReplyBatch(checkedReferences())
   }
   async function submitReplyBatch(check = false) {
     if (await replyBatch.queueReplyBatch(check)) {

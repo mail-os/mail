@@ -1572,6 +1572,52 @@ async function shareLaterReply(desktop, viewer, originalUrl, originalSubject) {
   return replySubject
 }
 
+async function rejectSelectionWithMissingReference(page) {
+  const missingSubject = 'November research interviews'
+  const messageLists = /\/webmail\/api\/messages\?/
+  const hideReference = async (route) => {
+    const response = await route.fetch()
+    const listing = await response.json()
+    const rows = [...listing.items, ...listing.threads.flatMap(thread => [thread.latest, ...thread.members])]
+    for (const row of rows) {
+      if (row.subject === missingSubject) row.reference = null
+    }
+    await route.fulfill({ response, json: listing })
+  }
+  const attempted = []
+  const recordAction = (request) => {
+    const path = new URL(request.url()).pathname
+    if (request.method() === 'POST' && /^\/webmail\/api\/(snapshot-links|thread-shares|assistant-grants|reply-batches)(\/|$)/.test(path))
+      attempted.push(path)
+  }
+  await page.route(messageLists, hideReference)
+  page.on('request', recordAction)
+  try {
+    await page.goto(url + '/')
+    await button(page, 'Select').click()
+    for (const subject of ['Studio launch notes', missingSubject])
+      await page.getByRole('checkbox', { name: 'Select conversation: ' + subject, exact: true }).check()
+    const actions = page.getByLabel('Selected message actions')
+    for (const [action, error] of [
+      ['Share snapshot', /without a saved reference/],
+      ['Share with teammate', /with saved references/],
+      ['Assistant access', /have stable references/],
+      ['Reply separately', /refresh its reference/],
+    ]) {
+      await button(actions, action).click()
+      const dialog = page.getByRole('dialog')
+      await dialog.getByRole('alert').filter({ hasText: error }).waitFor()
+      await button(dialog, 'Close').click()
+      await dialog.waitFor({ state: 'hidden' })
+    }
+    assert.deepEqual(attempted, [], 'Actions reject incomplete selections before contacting a preview endpoint')
+  }
+  finally {
+    page.off('request', recordAction)
+    await page.unroute(messageLists, hideReference)
+  }
+}
+
 async function snapshotSharingJourney(desktop, phone) {
   const subject = 'Your receipt #1046'
   await desktop.goto(url + '/')
@@ -3325,6 +3371,7 @@ try {
   await verifyCalendarActionsDuringLoading(desktop)
   await verifyCalendarActionsDuringLoading(phone, true)
   await calendarToolsJourney(desktop, phone)
+  await rejectSelectionWithMissingReference(desktop)
   await snapshotSharingJourney(desktop, phone)
   await teamCollectionJourney(desktop)
   await teamThreadJourney(desktop)
