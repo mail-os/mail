@@ -1889,6 +1889,20 @@ The actor is a stable opaque ID for the app's verified signup, and an actor
 can own one mailbox. Suspension disables mailbox authentication and revokes
 webmail sessions and password reset tokens.
 
+For a browser sign-in from the hosted app, set `SMTP_HOSTED_SIGN_IN_ORIGIN` to
+the app's exact HTTPS origin and serve webmail over HTTPS with Secure cookies.
+After authorizing the selected mailbox for the signed-in app account, the app
+calls `POST /provisioning/v1/webmail/sign-in` with `mailbox` and `actor`.
+The private response contains `proof` and its Unix `expires_at`. The browser
+posts one URL-encoded `proof` field to `/webmail/auth/hosted` on the webmail
+host. Mail checks the Origin, consumes the proof, sets a host-only session
+cookie, and redirects to Inbox. Keep proofs out of URLs and logs.
+
+Proofs expire after two minutes and are invalidated on daemon restart,
+mailbox password rotation, disablement, removal, and assignment changes.
+The exchange enforces the managed mailbox's current access window. Sign-out
+uses the same webmail session revocation path as password sign-in.
+
 Operators can inspect one managed mailbox with `mail user:local hosted-status <mailbox>` on the Mail host. The JSON report includes provisioning state, byte usage, the current UTC sending allowance, and outbound queue counts. Each successful report records a local audit entry. [Hosted mailbox diagnostics](docs/DEPLOYMENT_RUNBOOK.md#hosted-mailbox-diagnostics)
 
 ### Limits across mail clients

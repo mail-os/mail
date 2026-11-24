@@ -406,6 +406,11 @@ export interface MailProvisioningTeamChange {
   name: string
 }
 
+export interface MailWebmailSignInProof {
+  proof: string
+  expires_at: number
+}
+
 export interface MailProvisioningTeamResult {
   team: { id: string, name: string, domain: string } | null
   created: boolean
@@ -444,7 +449,7 @@ export class MailProvisioningClient {
     this.origin = url.origin
   }
 
-  private async request<T>(path: string, data?: MailProvisioningChange | MailProvisioningAccessChange | MailProvisioningTeamChange): Promise<T> {
+  private async request<T>(path: string, data?: Pick<MailProvisioningChange, 'mailbox' | 'actor'>): Promise<T> {
     const response = await (this.options.fetch ?? fetch)(`${this.origin}/provisioning/v1/${path}`, {
       method: data ? 'POST' : 'GET',
       headers: {
@@ -499,6 +504,14 @@ export class MailProvisioningClient {
 
   createTeam(change: MailProvisioningTeamChange): Promise<MailProvisioningTeamResult> {
     return this.request('team', change)
+  }
+
+  /** Issue a short-lived proof for a browser POST from the configured app origin. */
+  async webmailSignIn(mailbox: string, actor: string): Promise<MailWebmailSignInProof> {
+    const result = await this.request<MailWebmailSignInProof>('webmail/sign-in', { mailbox, actor })
+    if (typeof result.proof !== 'string' || !/^[a-f0-9]{64}$/.test(result.proof) || !Number.isSafeInteger(result.expires_at))
+      throw new MailProvisioningError(502, 'invalid_sign_in_response', 'Mail returned an invalid sign-in proof.')
+    return { proof: result.proof, expires_at: result.expires_at }
   }
 }
 

@@ -20,6 +20,8 @@ test('provisioning uses the dedicated versioned API and never follows a redirect
         return Response.json({ created: request.method === 'POST', can_invite: true, team: { id: 'hosted-studio', name: 'Studio', domain: 'studio.example.test' } })
       if (new URL(request.url).pathname.endsWith('/retirement'))
         return Response.json({ version: 1, id: 'retirement-00001', domain: 'studio.example.test', mailbox_count: 2 })
+      if (new URL(request.url).pathname.endsWith('/webmail/sign-in'))
+        return Response.json({ proof: 'b'.repeat(64), expires_at: 1795496580 })
       return Response.json({ revision: 1, mailbox: 'reader@mailboxes.example.test', enabled: true })
     }, { preconnect: fetch.preconnect }),
   })
@@ -49,6 +51,7 @@ test('provisioning uses the dedicated versioned API and never follows a redirect
   expect(await client.team(team.mailbox, team.actor)).toMatchObject({ can_invite: true, team: { id: 'hosted-studio' } })
   expect((await client.createTeam(team)).created).toBe(true)
   expect(await client.retirement('retirement-00001')).toMatchObject({ domain: team.mailbox.split('@')[1], mailbox_count: 2 })
+  expect(await client.webmailSignIn(change.mailbox, change.actor)).toEqual({ proof: 'b'.repeat(64), expires_at: 1795496580 })
   expect(requests.map(request => new URL(request.url).pathname)).toEqual([
     '/provisioning/v1/status',
     '/provisioning/v1/mailbox',
@@ -57,6 +60,7 @@ test('provisioning uses the dedicated versioned API and never follows a redirect
     '/provisioning/v1/team',
     '/provisioning/v1/team',
     '/provisioning/v1/retirement',
+    '/provisioning/v1/webmail/sign-in',
   ])
   expect(requests.every(request => request.headers.get('Authorization') === `Bearer ${token}` && request.redirect === 'error')).toBe(true)
   expect(await requests[1].json()).toEqual(change)
@@ -67,6 +71,8 @@ test('provisioning uses the dedicated versioned API and never follows a redirect
   expect(await requests[5].json()).toEqual(team)
   expect(new URL(requests[6].url).searchParams.get('id')).toBe('retirement-00001')
   expect(requests[6].method).toBe('GET')
+  expect(await requests[7].json()).toEqual({ mailbox: change.mailbox, actor: change.actor })
+  expect(requests[7].cache).toBe('no-store')
 })
 
 test('provisioning rejects plaintext non-loopback origins and incompatible API revisions', async () => {
@@ -77,4 +83,5 @@ test('provisioning rejects plaintext non-loopback origins and incompatible API r
     fetch: Object.assign(async () => Response.json({ version: 2, domain: 'mailboxes.example.test' }), { preconnect: fetch.preconnect }),
   })
   await expect(client.status()).rejects.toHaveProperty('code', 'incompatible_version')
+  await expect(client.webmailSignIn('reader@hosted.example.test', 'actor-123456789012')).rejects.toHaveProperty('code', 'invalid_sign_in_response')
 })

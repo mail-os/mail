@@ -531,6 +531,13 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     }
 
     // Initialize Webmail HTTP server (browser client API). Requires auth+DB.
+    const hosted_sign_in_origin = env.get("SMTP_HOSTED_SIGN_IN_ORIGIN");
+    if (hosted_sign_in_origin) |origin| {
+        if (provisioning_port == null or !cfg.enable_webmail or !cfg.webmail_secure_cookies or
+            !webmail_http.validHostedSignInOrigin(origin)) return error.InvalidHostedSignInConfiguration;
+        // A restored database can predate a successful exchange.
+        try db_ptr.?.exec("DELETE FROM hosted_sign_in_proofs");
+    }
     var webmail_server: ?webmail_http.WebmailHttpServer = null;
     var webmail_thread: ?std.Thread = null;
     if (cfg.enable_webmail) {
@@ -553,6 +560,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
                 // delivered + DKIM-signed identically to SMTP submission.
                 .hostname = cfg.hostname,
                 .mail_config = &cfg,
+                .hosted_sign_in_origin = hosted_sign_in_origin,
                 .hosted_team_domains = if (provisioning_port != null) env.get("SMTP_PROVISIONING_ADDITIONAL_DOMAINS") else null,
                 .primary_provisioning_domain = env.get("SMTP_PROVISIONING_DOMAIN"),
                 .delivery_method = cfg.delivery_method,
@@ -584,6 +592,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         provisioning_server = try webmail_http.WebmailHttpServer.init(allocator, .{
             .port = port,
             .mail_config = &cfg,
+            .hosted_sign_in_origin = hosted_sign_in_origin,
             .provisioning = .{
                 .token = token,
                 .domain = domain,

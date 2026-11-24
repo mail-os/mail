@@ -1132,6 +1132,7 @@ pub const Database = struct {
             \\CREATE INDEX IF NOT EXISTS idx_webmail_sessions_expires ON webmail_sessions(expires_at);
         );
         try self.exec(@import("webmail_account_links.zig").schema);
+        try self.exec(@import("hosted_sign_in.zig").schema);
         try self.initAuditTable();
         try self.exec(team_store.schema);
         try self.exec(shared_inbox.schema);

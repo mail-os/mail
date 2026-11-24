@@ -215,7 +215,7 @@ pub fn parseSessionCookie(cookie_header: []const u8) ?[]const u8 {
 }
 
 /// Generate a random hex token. Caller owns the returned slice.
-fn generateToken(allocator: std.mem.Allocator) ![]u8 {
+pub fn generateToken(allocator: std.mem.Allocator) ![]u8 {
     var raw: [token_bytes_len]u8 = undefined;
     io_compat.randomBytes(&raw);
     const out = try allocator.alloc(u8, token_hex_len);

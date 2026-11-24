@@ -123,6 +123,7 @@ jobs:
         python3 ../../scripts/test-webmail-private.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-teams.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-team-invitations.py zig-out/bin/mail
+        python3 ../../scripts/test-hosted-sign-in.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-team-threads.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-shared-inbox.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-shared-replies.py zig-out/bin/mail
