@@ -194,6 +194,7 @@ pub fn dispatchExternal(a: std.mem.Allocator, cfg: Delivery, provider: smtp_prov
         if (!isSafeAddress(recipient)) return error.InvalidAddress;
         target.* = .{ .recipient = recipient, .interactive_remote = true };
     }
+    const hosted_sender = db.hostedLimits(sender) catch null;
     try db.acceptDelivery(.{
         .id = id,
         .from = from,
@@ -221,7 +222,13 @@ pub fn dispatchExternal(a: std.mem.Allocator, cfg: Delivery, provider: smtp_prov
         };
     };
     const outcome = (try db.interactiveDelivery(a, id)) orelse return error.ProviderUnavailable;
+    if (outcome.delivered > 0) if (hosted_sender) |limits| recordRemoteSend(db, sender, limits.user_id);
     return .{ .delivered = outcome.delivered, .failed = outcome.failed, .unknown = outcome.unknown, .notice = notice };
+}
+
+fn recordRemoteSend(db: *database.Database, sender: []const u8, user_id: i64) void {
+    db.recordHostedRemoteSend(sender, user_id, time_compat.timestamp()) catch |err|
+        std.log.warn("could not record first confirmed remote submission: {}", .{err});
 }
 
 /// Check and admit all local recipients as one journaled operation. Remote
@@ -239,6 +246,7 @@ pub fn dispatch(a: std.mem.Allocator, cfg: Delivery, from: []const u8, recipient
     const temp = scratch.allocator();
     const remote = try temp.alloc(bool, recipients.len);
     @memset(remote, false);
+    const hosted_sender = if (cfg.db != null and options.sender != null) cfg.db.?.hostedLimits(options.sender.?) catch null else null;
     if (cfg.db) |db| {
         const generated_id = routing.newId();
         const id = options.interactive_id orelse &generated_id;
@@ -259,10 +267,15 @@ pub fn dispatch(a: std.mem.Allocator, cfg: Delivery, from: []const u8, recipient
     }
     var count: usize = 0;
     var result: DispatchResult = .{ .failed = undefined };
+    var recorded_remote = false;
     for (recipients, remote, errors) |recipient, deliver_remote, local_error| {
         const failure: ?anyerror = if (deliver_remote) blk: {
             if (options.interactive_id) |id| try cfg.db.?.checkpointInteractiveRecipient(id, recipient, .starting, false);
             outbound.deliverToRemote(a, from, recipient, raw, cfg.hostname, cfg.delivery_method, cfg.ses_region) catch |err| break :blk err;
+            if (!recorded_remote) if (hosted_sender) |limits| {
+                recordRemoteSend(cfg.db.?, options.sender.?, limits.user_id);
+                recorded_remote = true;
+            };
             break :blk null;
         } else local_error;
         if (deliver_remote) if (options.interactive_id) |id| {
@@ -377,6 +390,7 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
         .accepted_ms = time_compat.milliTimestamp(),
         .targets = plan.targets.items,
         .sender = options.sender,
+        .counts_as_incoming = !options.account_notice and from.len > 0,
         .delegated_sender_id = options.delegated_sender_id,
         .linked_account = options.linked_account,
         .shared_reply = options.shared_reply,

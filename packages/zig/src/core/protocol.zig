@@ -2820,6 +2820,7 @@ pub const Session = struct {
                 .accepted_ms = time_compat.milliTimestamp(),
                 .targets = plan.targets.items,
                 .sender = self.authenticated_username,
+                .counts_as_incoming = sender.len > 0,
                 .charge_recipients = self.rcpt_to.items.len,
                 .team_reply_submission = parent,
                 .smtp_sent_proof = if (parent != null) .{ .wire_id = sent.?.wire_id, .digest = sent.?.digest } else null,

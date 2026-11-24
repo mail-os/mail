@@ -402,6 +402,11 @@ pub const Database = struct {
             \\    service_until INTEGER,
             \\    read_until INTEGER
             \\);
+            \\CREATE TABLE IF NOT EXISTS hosted_mailbox_activity (
+            \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            \\    first_sent_at INTEGER,
+            \\    first_received_at INTEGER
+            \\);
             \\CREATE TABLE IF NOT EXISTS provisioning_operations (
             \\    operation_id TEXT PRIMARY KEY,
             \\    mailbox TEXT NOT NULL,
@@ -770,6 +775,7 @@ pub const Database = struct {
             \\    verified_author INTEGER NOT NULL,
             \\    remote_addr TEXT NOT NULL,
             \\    mime BLOB NOT NULL,
+            \\    counts_as_incoming INTEGER NOT NULL DEFAULT 0,
             \\    complete INTEGER NOT NULL DEFAULT 0
             \\);
             \\CREATE TABLE IF NOT EXISTS accepted_mail_targets (
@@ -1036,6 +1042,7 @@ pub const Database = struct {
         self.exec("ALTER TABLE provisioned_mailboxes ADD COLUMN send_recipients_per_day INTEGER NOT NULL DEFAULT 0") catch {};
         self.exec("ALTER TABLE provisioned_mailboxes ADD COLUMN service_until INTEGER") catch {};
         self.exec("ALTER TABLE provisioned_mailboxes ADD COLUMN read_until INTEGER") catch {};
+        self.exec("ALTER TABLE accepted_mail ADD COLUMN counts_as_incoming INTEGER NOT NULL DEFAULT 0") catch {};
         self.exec("ALTER TABLE users ADD COLUMN recovery_updated_at INTEGER;") catch {};
 
         // Single-use password reset tokens (see src/api/webmail_recovery.zig).
@@ -1335,6 +1342,46 @@ pub const Database = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.provisioningStateLocked(mailbox, actor);
+    }
+
+    pub const HostedMailboxActivity = struct { first_sent_at: ?i64, first_received_at: ?i64 };
+
+    pub fn hostedMailboxActivity(self: *Database, mailbox: []const u8, actor: []const u8) !HostedMailboxActivity {
+        const stmt = try self.prepare(
+            \\SELECT a.first_sent_at,a.first_received_at FROM provisioned_mailboxes p
+            \\JOIN users u ON u.id=p.user_id AND u.username=p.mailbox
+            \\LEFT JOIN hosted_mailbox_activity a ON a.user_id=u.id
+            \\WHERE p.mailbox=?1 AND p.actor=?2
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, mailbox);
+        try stmt.bind(2, actor);
+        if (!try stmt.step()) return error.MailboxNotFound;
+        return .{
+            .first_sent_at = if (stmt.columnIsNull(0)) null else stmt.columnInt64(0),
+            .first_received_at = if (stmt.columnIsNull(1)) null else stmt.columnInt64(1),
+        };
+    }
+
+    const record_first_send_sql =
+        \\INSERT INTO hosted_mailbox_activity(user_id,first_sent_at)
+        \\SELECT p.user_id,?2 FROM provisioned_mailboxes p JOIN users u ON u.id=p.user_id AND u.username=p.mailbox
+        \\WHERE p.mailbox=?1 AND p.user_id=?3
+        \\ON CONFLICT(user_id) DO UPDATE SET first_sent_at=excluded.first_sent_at
+        \\WHERE hosted_mailbox_activity.first_sent_at IS NULL
+    ;
+
+    pub fn recordHostedRemoteSend(self: *Database, sender: []const u8, user_id: i64, now: i64) !void {
+        const stmt = try self.prepare(record_first_send_sql);
+        defer stmt.finalize();
+        try recordFirstSend(stmt, sender, user_id, now);
+    }
+
+    fn recordFirstSend(stmt: Statement, sender: []const u8, user_id: i64, now: i64) !void {
+        try stmt.bind(1, sender);
+        try stmt.bind(2, now);
+        try stmt.bind(3, user_id);
+        _ = try stmt.step();
     }
 
     /// Commit account creation and its operation record together. Existing
@@ -2289,6 +2336,7 @@ pub const Database = struct {
         smtp_sent_proof: ?SmtpSentProof = null,
         sent_copy_of: ?[]const u8 = null,
         native_sent_reply: ?NativeSentReply = null,
+        counts_as_incoming: bool = false,
     };
 
     /// Reserve the hosted envelope and persist its complete routing decision
@@ -2331,7 +2379,7 @@ pub const Database = struct {
             if (try self.hostedLimitsLocked(sender)) |limits| hosted_sender = limits.user_id;
         }
         {
-            const insert = try self.prepareLocked("INSERT INTO accepted_mail(id,accepted_at,mime,envelope_from,author,verified_author,remote_addr,accepted_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)");
+            const insert = try self.prepareLocked("INSERT INTO accepted_mail(id,accepted_at,mime,envelope_from,author,verified_author,remote_addr,accepted_ms,counts_as_incoming) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)");
             defer insert.finalize();
             try insert.bind(1, envelope.id);
             try insert.bind(2, envelope.accepted_at);
@@ -2341,6 +2389,7 @@ pub const Database = struct {
             try insert.bind(6, @as(u8, @intFromBool(envelope.verified_author)));
             try insert.bind(7, envelope.notification_origin);
             try insert.bind(8, envelope.accepted_ms);
+            try insert.bind(9, @intFromBool(envelope.counts_as_incoming));
             _ = try insert.step();
         }
         if (envelope.ews_draft_send) |draft| {
@@ -2398,6 +2447,7 @@ pub const Database = struct {
         const insert = try self.prepareLocked("INSERT INTO accepted_mail_targets(delivery_id,ordinal,recipient,mailbox,folder,outcome,queued_bytes,retry_at,mailbox_id,is_primary,forward_after,review_copy,placement_reason,verified_forward,reply_author,reply_from,reply_mime) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,COALESCE((SELECT id FROM users WHERE username=?4),0),?9,?10,?11,?12,?13,?14,?15,?16)");
         defer insert.finalize();
         var has_local = false;
+        var accepted_primary = false;
         for (envelope.targets, 0..) |planned, ordinal| {
             const released = if (ordinal == 0) envelope.review_release else null;
             var target = planned;
@@ -2452,6 +2502,12 @@ pub const Database = struct {
                 if (sqlite.sqlite3_changes(self.db) != 1) return error.ReviewChanged;
             }
             has_local = has_local or pending;
+            accepted_primary = accepted_primary or (target.forward_owner == null and (pending or std.mem.eql(u8, outcome, "queued")));
+        }
+        if (hosted_sender != 0 and accepted_primary) {
+            const stmt = try self.prepareLocked(record_first_send_sql);
+            defer stmt.finalize();
+            try recordFirstSend(stmt, envelope.sender.?, hosted_sender, envelope.accepted_at);
         }
         if (envelope.native_sent_reply) |sent| {
             try self.recordNativeSentFileLocked(envelope.id, sent);
@@ -3023,6 +3079,7 @@ pub const Database = struct {
         if (sqlite.sqlite3_changes(self.db) == 0) return error.NotFound;
         try self.releaseForwardTargetsLocked(id, ordinal, filed != null);
         if (filed) |file| {
+            try self.recordFirstReceiveLocked(id, ordinal);
             try self.recordPlacementLocked(id, ordinal, file);
             try self.routeSharedStageLocked(id, ordinal, file);
             try self.recordTeamThreadReplyLocked(id, ordinal, file);
@@ -3053,6 +3110,22 @@ pub const Database = struct {
         }
         try self.compactDeliveryLocked(id);
         try self.execLocked("COMMIT");
+    }
+
+    fn recordFirstReceiveLocked(self: *Database, id: []const u8, ordinal: i64) !void {
+        const stmt = try self.prepareLocked(
+            \\INSERT INTO hosted_mailbox_activity(user_id,first_received_at)
+            \\SELECT p.user_id,?3 FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
+            \\JOIN provisioned_mailboxes p ON p.mailbox=t.mailbox AND p.user_id=t.mailbox_id
+            \\WHERE t.delivery_id=?1 AND t.ordinal=?2 AND t.is_primary=1 AND m.counts_as_incoming=1
+            \\ON CONFLICT(user_id) DO UPDATE SET first_received_at=excluded.first_received_at
+            \\WHERE hosted_mailbox_activity.first_received_at IS NULL
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, id);
+        try stmt.bind(2, ordinal);
+        try stmt.bind(3, time_compat.timestamp());
+        _ = try stmt.step();
     }
 
     pub const CategoryPolicy = struct { automatic: bool = false, destination: ?categories.Destination = null };

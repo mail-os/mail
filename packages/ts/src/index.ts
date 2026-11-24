@@ -489,6 +489,15 @@ export class MailProvisioningClient {
     return this.request(`mailbox?${new URLSearchParams({ mailbox, actor })}`)
   }
 
+  async mailboxActivity(mailbox: string, actor: string): Promise<{ first_sent_at: number | null, first_received_at: number | null }> {
+    const result = await this.request<{ first_sent_at: number | null, first_received_at: number | null }>(`mailbox/activity?${new URLSearchParams({ mailbox, actor })}`)
+    for (const value of [result.first_sent_at, result.first_received_at]) {
+      if (value !== null && (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0))
+        throw new MailProvisioningError(502, 'invalid_activity_response', 'Mail returned an invalid activity timestamp.')
+    }
+    return { first_sent_at: result.first_sent_at, first_received_at: result.first_received_at }
+  }
+
   apply(change: MailProvisioningChange): Promise<ProvisionedMailbox> {
     return this.request('mailbox', change)
   }

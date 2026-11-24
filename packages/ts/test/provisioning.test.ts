@@ -16,6 +16,8 @@ test('provisioning uses the dedicated versioned API and never follows a redirect
         return Response.json({ version: 1, domain: 'mailboxes.example.test' })
       if (new URL(request.url).pathname.endsWith('/mailbox/access'))
         return Response.json({ revision: 2, mailbox: 'reader@mailboxes.example.test', enabled: true, access: 'read_only' })
+      if (new URL(request.url).pathname.endsWith('/mailbox/activity'))
+        return Response.json({ first_sent_at: null, first_received_at: 1795496580 })
       if (new URL(request.url).pathname.endsWith('/team'))
         return Response.json({ created: request.method === 'POST', can_invite: true, team: { id: 'hosted-studio', name: 'Studio', domain: 'studio.example.test' } })
       if (new URL(request.url).pathname.endsWith('/retirement'))
@@ -55,6 +57,7 @@ test('provisioning uses the dedicated versioned API and never follows a redirect
   expect(await client.retirement('retirement-00001')).toMatchObject({ domain: team.mailbox.split('@')[1], mailbox_count: 2 })
   expect(await client.webmailSignIn(change.mailbox, change.actor)).toEqual({ proof: 'b'.repeat(64), expires_at: 1795496580 })
   expect(await client.webmailSignInWithPassword(change.mailbox, change.actor, change.initial_password)).toEqual({ proof: 'b'.repeat(64), expires_at: 1795496580 })
+  expect(await client.mailboxActivity(change.mailbox, change.actor)).toEqual({ first_sent_at: null, first_received_at: 1795496580 })
   expect(requests.map(request => new URL(request.url).pathname)).toEqual([
     '/provisioning/v1/status',
     '/provisioning/v1/mailbox',
@@ -65,6 +68,7 @@ test('provisioning uses the dedicated versioned API and never follows a redirect
     '/provisioning/v1/retirement',
     '/provisioning/v1/webmail/sign-in',
     '/provisioning/v1/webmail/sign-in',
+    '/provisioning/v1/mailbox/activity',
   ])
   expect(requests.every(request => request.headers.get('Authorization') === `Bearer ${token}` && request.redirect === 'error')).toBe(true)
   expect(await requests[1].json()).toEqual(change)
@@ -78,6 +82,8 @@ test('provisioning uses the dedicated versioned API and never follows a redirect
   expect(await requests[7].json()).toEqual({ mailbox: change.mailbox, actor: change.actor })
   expect(requests[7].cache).toBe('no-store')
   expect(await requests[8].json()).toEqual({ mailbox: change.mailbox, actor: change.actor, password: change.initial_password })
+  expect(Object.fromEntries(new URL(requests[9].url).searchParams)).toEqual({ mailbox: change.mailbox, actor: change.actor })
+  expect(requests[9].method).toBe('GET')
 })
 
 test('provisioning rejects plaintext non-loopback origins and incompatible API revisions', async () => {
@@ -89,6 +95,7 @@ test('provisioning rejects plaintext non-loopback origins and incompatible API r
   })
   await expect(client.status()).rejects.toHaveProperty('code', 'incompatible_version')
   await expect(client.webmailSignIn('reader@hosted.example.test', 'actor-123456789012')).rejects.toHaveProperty('code', 'invalid_sign_in_response')
+  await expect(client.mailboxActivity('reader@hosted.example.test', 'actor-123456789012')).rejects.toHaveProperty('code', 'invalid_activity_response')
 })
 
 test('activation rejects a proof from a listener that did not confirm the password', async () => {

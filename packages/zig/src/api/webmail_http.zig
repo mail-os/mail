@@ -4975,6 +4975,14 @@ fn handleProvisioning(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
     }
     if (std.mem.eql(u8, req.path, "/provisioning/v1/team"))
         return handleProvisioningTeam(server, conn, arena, req, cfg);
+    if (get and std.mem.eql(u8, req.path, "/provisioning/v1/mailbox/activity")) {
+        const mailbox = req.queryParam(arena, "mailbox") orelse "";
+        const actor = req.queryParam(arena, "actor") orelse "";
+        if (!validProvisioningMailbox(mailbox, cfg) or !validProvisioningId(actor))
+            return sendError(conn, arena, 400, "invalid_request", "Invalid mailbox or actor");
+        const activity = server.db.hostedMailboxActivity(mailbox, actor) catch |err| return provisioningError(conn, arena, err);
+        return sendJson(conn, arena, 200, try service_mod.json(arena, activity), null);
+    }
     if (get and std.mem.eql(u8, req.path, "/provisioning/v1/mailbox")) {
         const mailbox = req.queryParam(arena, "mailbox") orelse "";
         const actor = req.queryParam(arena, "actor") orelse "";

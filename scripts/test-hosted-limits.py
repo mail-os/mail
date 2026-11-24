@@ -1279,6 +1279,54 @@ def check_shared_storage_race(test):
     print(f"Verified one winner for the final storage across five simultaneous writers ({winners[0]}).")
 
 
+def mailbox_activity(test, mailbox):
+    query = urllib.parse.urlencode({"mailbox": mailbox, "actor": test.specs[mailbox]["actor"]})
+    url = test.private + "/provisioning/v1/mailbox/activity?" + query
+    status, _, raw = request(url, headers=test.auth)
+    assert status == 200, (status, raw)
+    activity = json.loads(raw)
+    assert set(activity) == {"first_sent_at", "first_received_at"}, activity
+    return activity
+
+
+def check_mailbox_activity(test):
+    reader = test.provision("activity-reader", daily=1)
+    sender = test.provision("activity-sender")
+    empty = {"first_sent_at": None, "first_received_at": None}
+    assert mailbox_activity(test, reader) == mailbox_activity(test, sender) == empty
+    path = "/provisioning/v1/mailbox/activity?" + urllib.parse.urlencode({
+        "mailbox": reader, "actor": test.specs[sender]["actor"],
+    })
+    assert request(test.private + path, headers=test.auth)[0] == 404
+    assert request(test.private + path)[0] == 401
+    assert request(test.webmail + path, headers=test.auth, context=test.tls_context)[0] == 404
+
+    with test.imap(reader) as connection:
+        assert connection.append("INBOX", None, None, b"Subject: Imported\r\n\r\nAn old message")[0] == "OK"
+    expect_smtp(test.deliver([sender, reader], identity=reader), 452, "4.7.0")
+    assert mailbox_activity(test, reader) == mailbox_activity(test, sender) == empty
+
+    with test.smtp() as connection:
+        expect_smtp(smtp_message(connection, "", [reader], "Delivery status"), 250)
+    assert mailbox_activity(test, reader) == empty, "A null reverse-path notification is not activation"
+    expect_smtp(test.deliver(reader, subject="Received independently"), 250)
+    received = mailbox_activity(test, reader)
+    assert received["first_sent_at"] is None and received["first_received_at"] is not None, received
+
+    status, result = test.api(test.login(reader), "compose", {"to": [sender], "text": "First webmail send"})
+    assert status == 200 and result["delivered"] == 1, (status, result)
+    complete = mailbox_activity(test, reader)
+    assert complete["first_received_at"] == received["first_received_at"] and complete["first_sent_at"] is not None, complete
+    received = mailbox_activity(test, sender)
+    assert received["first_received_at"] is not None and received["first_sent_at"] is None, received
+
+    expect_smtp(test.deliver(reader, identity=sender, chunked=True, subject="First SMTP submission"), 250)
+    assert mailbox_activity(test, reader) == complete
+    assert mailbox_activity(test, sender)["first_sent_at"] is not None
+    print("Verified actor-scoped first actual send and receive, including IMAP import, null sender, and rejection exclusions.")
+    return reader, complete
+
+
 def verify(binary, staging):
     with tempfile.TemporaryDirectory(prefix="mail-hosted-limits-") as directory:
         test = Fixture(binary, Path(directory), staging=staging)
@@ -1286,6 +1334,7 @@ def verify(binary, staging):
             if staging:
                 test.check_staging_smtp()
                 print("Staging profile with certificate-verified TLS on SMTP, webmail, IMAP, EWS, and ActiveSync.")
+            activity_mailbox, activity = check_mailbox_activity(test)
             sink = test.provision("sink")
             if staging:
                 check_implicit_tls(test, sink)
@@ -1310,6 +1359,7 @@ def verify(binary, staging):
             assert (usage[sender][1], usage[eas_sender][1], usage[smart_sender][1]) == (2, 4, 7), usage
             print("Verified the shared recipient allowance, duplicate recipients, concurrent dispatch, suspension and Sent copy failure.")
         with test.daemon():
+            assert mailbox_activity(test, activity_mailbox) == activity
             check_suspended_retry(test, previous_retry)
             assert {mailbox: test.sending_usage(mailbox) for mailbox in exhausted} == usage
             assert eas_result(test.eas(eas_sender, eas_request)) == 118

@@ -1869,6 +1869,11 @@ provisioning bearer token. Requests with a browser Origin or Cookie are
 rejected.
 
 - `GET /provisioning/v1/status` returns `version` and the allowed `domain`.
+- `GET /provisioning/v1/mailbox/activity?mailbox=...&actor=...` returns the
+  Unix seconds of the first accepted submission and first filed incoming
+  delivery, or `null` for each unobserved timestamp. These are first observations
+  after upgrading, with no backfill from existing mailbox files. The response
+  contains no message content or correspondent addresses.
 - `GET /provisioning/v1/domain?name=...` confirms the configured provisionable
   domain.
 - `GET /provisioning/v1/mailbox?mailbox=...&actor=...` observes a managed
