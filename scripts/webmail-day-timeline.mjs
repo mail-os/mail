@@ -178,9 +178,23 @@ async function renderDay(page, phone) {
   assert(short.height >= 28)
   assert(await timeline(page).locator('.calendar-timeline-tick').count() === 24)
   const controls = await page.locator('.calendar-timeline-create').locator('select, button').evaluateAll(nodes =>
-    nodes.map(node => [node.getBoundingClientRect().height, getComputedStyle(node).border, getComputedStyle(node).borderRadius]))
-  assert(controls.length === 2 && controls[0][0] === (phone ? 44 : 36))
-  assert.deepEqual(controls[0], controls[1], 'Time selection and creation use the shared controls')
+    nodes.map((node) => {
+      const style = getComputedStyle(node)
+      const token = node.matches('button:enabled') ? '--primary-button-border' : '--control-border'
+      const color = style.getPropertyValue(token).trim().slice(1).match(/../g)
+      const channels = color.map(channel => Number.parseInt(channel, 16)).join(', ')
+      return {
+        height: node.getBoundingClientRect().height,
+        radius: style.borderRadius,
+        borderMatches: style.border === `1px solid rgb(${channels})`,
+      }
+    }))
+  assert.equal(controls.length, 2)
+  for (const control of controls) {
+    assert.equal(control.height, phone ? 44 : 36, 'Time selection and creation use the shared height')
+    assert.equal(control.radius, '8px')
+    assert(control.borderMatches, 'The time picker uses a neutral edge and the enabled Add event button uses a blue edge')
+  }
 
   const scroller = area.getByRole('region', { name: 'Hours of the day', exact: true })
   if (phone) {

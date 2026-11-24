@@ -29,6 +29,7 @@
   --accent: #0755ad;
   --primary: #0866d4;
   --primary-hover: #0756b4;
+  --primary-button-border: var(--primary);
   --on-primary: #ffffff;
   --accent-soft: #ebf3ff;
   --selected: #d9e7fc;
@@ -71,7 +72,8 @@
     --select-chevron: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Cpath d=%22m4 6 4 4 4-4%22 fill=%22none%22 stroke=%22%23b7bcc9%22 stroke-width=%221.5%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22/%3E%3C/svg%3E");
     --accent: #94c4ff;
     --primary: #2068c4;
-    --primary-hover: #1959ac;
+    --primary-hover: #2d75d0;
+    --primary-button-border: #347cda;
     --accent-soft: #2b3d59;
     --selected: #304463;
     --selection-edge: #79baff;
@@ -1634,11 +1636,15 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .calendar-view-toolbar .calendar-view-modes { flex-basis: 100%; }
 }
 
-/* Preserve the outline while disabling a control. Quiet buttons keep their transparent styling. */
+/* Enabled blue buttons keep a blue edge. Disabled controls use the shared neutral outline. */
+:is(.calendar-primary, .wm-snapshot-primary, .wm-compose-btn, .wm-send-btn):not(:disabled),
+.login button:not(.login-secondary, :disabled),
+.wm-writing-settings .wm-writing-save:not(:disabled) { border-color: var(--primary-button-border); }
+
 .wm-action:disabled { opacity: 1; color: var(--control-disabled-text); }
 .wm-action:disabled .mail-icon { color: inherit; }
 :where(.wm-action:disabled) { background-color: var(--surface); }
-:is(.calendar-primary, .wm-snapshot-primary, .wm-snapshot-panel .wm-action, .wm-compose-btn, .wm-send-btn, .wm-message-toolbar .wm-tool-move .wm-tool, .login button):disabled {
+:is(.calendar-primary, .wm-snapshot-primary, .wm-snapshot-panel .wm-action, .wm-compose-btn, .wm-send-btn, .wm-message-toolbar .wm-tool-move .wm-tool, .login button, .wm-writing-settings .wm-writing-save):disabled {
   opacity: 1;
   background: var(--surface);
   color: var(--control-disabled-text);

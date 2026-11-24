@@ -110,9 +110,11 @@ async function verifyControlRow(container, selector, height, sameRow = true, min
   const controls = await container.evaluate((group, selector) => Array.from(group.querySelectorAll(selector), (node) => {
     const style = getComputedStyle(node)
     const box = node.getBoundingClientRect()
-    const borderChannels = style.getPropertyValue('--control-border').trim().slice(1).match(/../g)
-    const border = `rgb(${borderChannels.map(channel => Number.parseInt(channel, 16)).join(', ')})`
     const quiet = node.matches('.wm-list-toggle, .wm-action--quiet')
+    const primary = node.matches('.calendar-primary, .wm-snapshot-primary, .wm-compose-btn, .wm-send-btn, .login button:not(.login-secondary), .wm-writing-settings .wm-writing-save') && !node.matches(':disabled')
+    const borderToken = primary ? '--primary-button-border' : '--control-border'
+    const borderChannels = style.getPropertyValue(borderToken).trim().slice(1).match(/../g)
+    const border = `rgb(${borderChannels?.map(channel => Number.parseInt(channel, 16)).join(', ')})`
     return {
       name: node.getAttribute('aria-label') || node.querySelector('input[aria-label]')?.getAttribute('aria-label') || node.id
         || node.labels?.[0]?.firstChild?.textContent?.trim()
@@ -122,7 +124,7 @@ async function verifyControlRow(container, selector, height, sameRow = true, min
       bottom: box.bottom,
       left: box.left,
       right: box.right,
-      neutral: !quiet,
+      borderToken: quiet ? null : borderToken,
       borderMatches: style.border === `1px solid ${border}`,
       opacity: style.opacity,
       radius: style.borderRadius,
@@ -133,7 +135,7 @@ async function verifyControlRow(container, selector, height, sameRow = true, min
   for (const control of controls) {
     assert(Math.abs(control.height - height) < 0.5, `${control.name} should be ${height}px tall, got ${control.height}px`)
     assert.equal(control.radius, '8px', `${control.name} should use the shared control radius`)
-    if (control.neutral) assert(control.borderMatches, `${control.name} should use the shared one-pixel border`)
+    if (control.borderToken) assert(control.borderMatches, `${control.name} should use a one-pixel ${control.borderToken} border`)
     for (const other of controls) {
       if (sameRow || (control.top < other.bottom - 0.5 && control.bottom > other.top + 0.5)) {
         assert(Math.abs(control.top - other.top) < 0.5, `${control.name} and ${other.name} should align at the top`)
@@ -383,7 +385,10 @@ async function verifyPaintedControlBorders(container, selector, controls, name, 
     })
   }, selector)
   assert.equal(centers.length, controls.length, 'Every visible control has a position in the screenshot')
-  const neutralEdges = centers.flatMap((center, index) => controls[index].neutral ? [{ ...center, name: controls[index].name }] : [])
+  const controlEdges = centers.flatMap((center, index) => {
+    const { name, borderToken } = controls[index]
+    return borderToken ? [{ ...center, name, borderToken }] : []
+  })
   const capture = await container.screenshot({ path: join(output, `${name}.png`), animations: 'disabled', scale: 'device' })
   const mismatches = await container.evaluate(async (node, { png, centers, checkDisabledText }) => {
     const pixels = Uint8Array.from(atob(png), char => char.charCodeAt(0))
@@ -395,19 +400,19 @@ async function verifyPaintedControlBorders(container, selector, controls, name, 
     context.drawImage(bitmap, 0, 0)
     const style = getComputedStyle(node)
     const channels = property => style.getPropertyValue(property).trim().slice(1).match(/../g).map(channel => Number.parseInt(channel, 16))
-    const border = channels('--control-border')
     const tolerance = Math.ceil(2 * devicePixelRatio)
-    const borders = centers.flatMap(({ name, edges }) => edges.flatMap(({ side, x, y, dx, dy }) => {
+    const borders = centers.flatMap(({ name, edges, borderToken }) => edges.flatMap(({ side, x, y, dx, dy }) => {
       // Fractional viewport and screenshot origins can snap to different pixels.
       const startX = Math.max(0, x - tolerance * dx)
       const startY = Math.max(0, y - tolerance * dy)
       const width = Math.min(canvas.width, x + 1 + tolerance * dx) - startX
       const height = Math.min(canvas.height, y + 1 + tolerance * dy) - startY
       const strip = context.getImageData(startX, startY, width, height).data
+      const border = channels(borderToken)
       for (let pixel = 0; pixel < strip.length; pixel += 4) {
         if (border.every((channel, offset) => Math.abs(strip[pixel + offset] - channel) <= 3)) return []
       }
-      return [{ name, side, x, y, samples: Array.from(strip) }]
+      return [{ name, borderToken, side, x, y, samples: Array.from(strip) }]
     }))
     const disabledText = channels('--control-disabled-text')
     const text = checkDisabledText ? centers.flatMap(({ name, textArea }) => {
@@ -419,8 +424,8 @@ async function verifyPaintedControlBorders(container, selector, controls, name, 
       return [name]
     }) : []
     return { borders, text }
-  }, { png: capture.toString('base64'), centers: neutralEdges, checkDisabledText })
-  assert.deepEqual(mismatches.borders, [], 'Visible straight edges should paint the shared border color')
+  }, { png: capture.toString('base64'), centers: controlEdges, checkDisabledText })
+  assert.deepEqual(mismatches.borders, [], 'Visible straight edges should paint their neutral or blue border color')
   assert.deepEqual(mismatches.text, [], 'Disabled controls should paint their text in the shared disabled color')
 }
 
@@ -592,11 +597,12 @@ async function verifyAppearance(page, scheme, contrast = 'no-preference') {
       ['--text', '--list'], ['--muted', '--list'], ['--accent', '--selected'],
       ['--violet', '--sidebar'], ['--teal', '--sidebar'], ['--warning', '--sidebar'],
       ['--accent', '--accent-soft'], ['--warning', '--warning-soft'],
-      ['--on-primary', '--primary'], ['--message-selection-text', '--message-selection'],
+      ['--on-primary', '--primary'], ['--on-primary', '--primary-hover'], ['--message-selection-text', '--message-selection'],
       ['--message-selection-muted', '--message-selection'],
     ]
-    const borders = ['--panel', '--toolbar', '--surface', '--sidebar', '--control-fill'].map(background => {
-      const a = luminance('--control-border')
+    const surfaces = ['--panel', '--toolbar', '--surface', '--sidebar', '--control-fill']
+    const borderRatios = token => surfaces.map(background => {
+      const a = luminance(token)
       const b = luminance(background)
       return [(Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05), background]
     })
@@ -604,7 +610,9 @@ async function verifyAppearance(page, scheme, contrast = 'no-preference') {
       scheme: style.colorScheme,
       font: getComputedStyle(document.body).fontFamily,
       fontStack: style.getPropertyValue('--app-font').trim(),
-      borders,
+      borders: borderRatios('--control-border'),
+      primaryBorders: borderRatios('--primary-button-border'),
+      primaryBorder: style.getPropertyValue('--primary-button-border').trim(),
       ratios: pairs.map(([foreground, background]) => {
         const a = luminance(foreground)
         const b = luminance(background)
@@ -620,6 +628,10 @@ async function verifyAppearance(page, scheme, contrast = 'no-preference') {
   const minimumBorderContrast = contrast === 'more' ? 4.5 : 3
   for (const [ratio, background] of theme.borders)
     assert(ratio >= minimumBorderContrast, `${scheme} control borders on ${background} must reach ${minimumBorderContrast}:1, got ${ratio.toFixed(2)}`)
+  const [red, green, blue] = theme.primaryBorder.slice(1).match(/../g).map(byte => Number.parseInt(byte, 16))
+  assert(blue > green && green > red, 'The enabled primary border is blue')
+  for (const [ratio, background] of theme.primaryBorders)
+    assert(ratio >= 3, `${scheme} primary borders on ${background} must reach 3:1, got ${ratio.toFixed(2)}`)
 }
 
 async function verifyMessageSelection(message, child) {
@@ -769,12 +781,12 @@ async function signIn({ phone = false, account = owner, initialSubject = handoff
   }
   const compose = button(page, 'Compose')
   assert.match(await compose.locator('.mail-icon').evaluate(node => getComputedStyle(node).maskImage), /data:image/)
-  assert.equal((await compose.boundingBox()).height, phone ? 44 : 36)
+  await verifyControlRow(page.locator('.wm'), '.wm-compose-btn', phone ? 44 : 36, false, 1)
   assert.deepEqual(await compose.evaluate((node) => {
     const style = getComputedStyle(node)
     const field = getComputedStyle(document.querySelector('.mail-search-field'))
-    return [style.border === field.border, style.borderRadius === field.borderRadius]
-  }), [true, true], 'The Compose button and Mail search field use the same stroke and corners')
+    return [style.borderWidth === field.borderWidth, style.borderRadius === field.borderRadius]
+  }), [true, true], 'The Compose button and Mail search field use the same border width and corners')
   assert.match(await page.evaluate(() => getComputedStyle(document.body).fontFamily), /-apple-system/)
   if (phone) await drawer(page).click()
   return page
@@ -1170,6 +1182,13 @@ async function phoneJourney(page) {
   for (const picker of await shareForm.getByRole('combobox').all()) await verifySelectedOptionFits(picker)
   await heading(page, 'Share a calendar').click()
   await verifyPaintedControlBorders(shareForm, 'select, input, button', narrowSharing, 'narrow-phone-calendar-sharing-dark')
+  for (const width of [320, 390]) {
+    await page.setViewportSize({ width, height: 844 })
+    await page.emulateMedia({ colorScheme: 'light' })
+    const lightSharing = await verifyControlRow(shareForm, 'select, input, button', 44, false)
+    await verifyPaintedControlBorders(shareForm, 'select, input, button', lightSharing, `phone-${width}-calendar-sharing-light`)
+  }
+  await page.emulateMedia({ colorScheme: 'dark' })
   await page.setViewportSize({ width: 390, height: 844 })
   await page.locator('.calendar-loading').waitFor({ state: 'hidden' })
   await fitsViewport(page)
@@ -2447,7 +2466,7 @@ async function calendarSharingJourney(captain) {
     for (const control of await shareForm.locator('input, select, button').all()) assert(await control.isDisabled())
     const disabledControls = await verifyControlRow(shareForm, 'input, select, button', 36)
     verifyControlGaps(disabledControls, 12)
-    assert(disabledControls.every(control => control.neutral && control.borderMatches && control.opacity === '1'),
+    assert(disabledControls.every(control => control.borderToken === '--control-border' && control.borderMatches && control.opacity === '1'),
       'While sharing, every control keeps the same border at full opacity')
     await verifyPaintedControlBorders(shareForm, 'select, input, button', disabledControls, 'desktop-calendar-sharing-pending')
     await captain.emulateMedia({ colorScheme: 'dark' })
