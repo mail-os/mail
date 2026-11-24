@@ -72,7 +72,10 @@ with the mailbox addresses.
 
 Run `python3 scripts/test-hosted-domains.py /path/to/mail` to exercise this
 configuration with two disposable domains over native SMTP, IMAP, webmail,
-EWS, and ActiveSync. Rehearse DNS, import, and roll back with a staging domain
+EWS, and ActiveSync. Run `python3 scripts/test-hosted-cutover.py /path/to/mail`
+to exercise local DNS MX changes, delivery through both cached routes, the
+final IMAP delta, and recovery using a separate reverse checkpoint. Use a
+public staging DNS zone to verify propagation and aligned authentication
 before changing customer MX records.
 
 ## Hosted mailbox diagnostics

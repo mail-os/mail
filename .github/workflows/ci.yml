@@ -138,6 +138,7 @@ jobs:
         python3 ../../scripts/test-webmail-combined.py zig-out/bin/mail
         python3 ../../scripts/test-mailbox-export.py zig-out/bin/mail
         python3 ../../scripts/test-mail-import.py zig-out/bin/mail
+        python3 ../../scripts/test-hosted-cutover.py zig-out/bin/mail
         python3 ../../scripts/test-imap-internaldate.py zig-out/bin/mail
         python3 ../../scripts/test-imap-bodystructure.py zig-out/bin/mail
         python3 ../../scripts/test-imap-keywords.py zig-out/bin/mail
