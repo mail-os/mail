@@ -64,6 +64,7 @@ pub fn isLocal(address: []const u8, hostname: []const u8, config: ?*const config
 
 pub fn resolveMailbox(a: Allocator, db: ?*Database, config: ?*const config_mod.Config, address: []const u8) ![]const u8 {
     if (config) |cfg| if (cfg.catch_all) return a.dupe(u8, cfg.catch_all_mailbox);
+    const require_full = if (config) |cfg| cfg.requiresFullMailbox(address) else false;
     if (db) |database| {
         if (try database.userExists(address)) return a.dupe(u8, address);
         const lower = try std.ascii.allocLowerString(a, address);
@@ -71,6 +72,7 @@ pub fn resolveMailbox(a: Allocator, db: ?*Database, config: ?*const config_mod.C
         if (try database.userExists(lower)) return lower;
         a.free(lower);
     }
+    if (require_full) return if (db == null) error.DatabaseUnavailable else error.UnknownLocalMailbox;
     const at = std.mem.indexOfScalar(u8, address, '@') orelse address.len;
     return aliases.resolve(a, address[0..at]);
 }
@@ -174,7 +176,10 @@ pub const Plan = struct {
             const author = if (headers.?.namesMailbox(target.recipient)) target.recipient else target.mailbox;
             if (!vacation.safeCorrespondent(author) or !headers.?.namesMailbox(author)) continue;
             try seen.put(a, target.mailbox, {});
-            const mailbox = if (isLocal(from, hostname, config)) try resolveMailbox(a, self.db, config, from) else "";
+            const mailbox = if (isLocal(from, hostname, config)) resolveMailbox(a, self.db, config, from) catch |err| switch (err) {
+                error.UnknownLocalMailbox => continue,
+                else => return err,
+            } else "";
             if (mailbox.len > 0) {
                 if (std.mem.eql(u8, mailbox, target.mailbox) or (try self.db.enabledMailboxId(mailbox)) == null) continue;
             }
@@ -214,8 +219,12 @@ pub const Plan = struct {
         const user = self.targets.items[primary].mailbox;
         const headers = forwarding.Headers.read(self.raw);
         if (headers.forwarded) return;
+        const forward_config = if (config != null and !config.?.catch_all) config else null;
         for (try forwardDestinations(a, user, from)) |recipient| {
-            const mailbox = if (isLocal(recipient, hostname, config)) try resolveMailbox(a, self.db, null, recipient) else "";
+            const mailbox = if (isLocal(recipient, hostname, config)) resolveMailbox(a, self.db, forward_config, recipient) catch |err| switch (err) {
+                error.UnknownLocalMailbox => continue,
+                else => return err,
+            } else "";
             if (!std.mem.eql(u8, mailbox, user)) try self.addForward(primary, recipient, mailbox, sender, false);
         }
         if (from.len == 0 or headers.automatic) return;
@@ -228,7 +237,10 @@ pub const Plan = struct {
         }
         if (std.ascii.eqlIgnoreCase(verified.address, from)) return;
         const local = isLocal(verified.address, hostname, config);
-        const mailbox = if (local) try resolveMailbox(a, self.db, config, verified.address) else "";
+        const mailbox = if (local) resolveMailbox(a, self.db, config, verified.address) catch |err| switch (err) {
+            error.UnknownLocalMailbox => return,
+            else => return err,
+        } else "";
         if (local) {
             if (std.mem.eql(u8, mailbox, user)) return;
             const current_id = (try self.db.enabledMailboxId(mailbox)) orelse return;

@@ -204,6 +204,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         null;
     if (cfg.enable_auth or cfg.enable_webmail or provisioning_port != null) {
         auth_backend = auth.AuthBackend.init(allocator, &db);
+        auth_backend.?.exact_mailbox_domains = cfg.exact_mailbox_domains;
         const auth_default_domain = cfg.auth_default_domain orelse if (std.mem.indexOfScalar(u8, cfg.hostname, '.')) |dot|
             cfg.hostname[dot + 1 ..]
         else
@@ -581,7 +582,11 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         provisioning_server = try webmail_http.WebmailHttpServer.init(allocator, .{
             .port = port,
             .mail_config = &cfg,
-            .provisioning = .{ .token = token, .domain = domain },
+            .provisioning = .{
+                .token = token,
+                .domain = domain,
+                .additional_domains = env.get("SMTP_PROVISIONING_ADDITIONAL_DOMAINS"),
+            },
         }, db_ptr.?, auth_ptr.?);
         try provisioning_server.?.bind();
         provisioning_thread = try std.Thread.spawn(.{}, struct {

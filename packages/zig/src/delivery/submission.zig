@@ -84,7 +84,10 @@ pub fn distinctRecipients(a: std.mem.Allocator, groups: []const []const []const 
 fn localMailbox(a: std.mem.Allocator, cfg: Delivery, recipient: []const u8) !?[]const u8 {
     if (!isSafeAddress(recipient)) return error.InvalidAddress;
     if (!routing.isLocal(recipient, cfg.hostname, cfg.mail_config)) return null;
-    const user = try routing.resolveMailbox(a, cfg.db, cfg.mail_config, recipient);
+    const user = routing.resolveMailbox(a, cfg.db, cfg.mail_config, recipient) catch |err| switch (err) {
+        error.UnknownLocalMailbox => return error.InvalidAddress,
+        else => return err,
+    };
     errdefer a.free(user);
     if (!isSafeLocalPart(user)) return error.InvalidAddress;
     if (cfg.local_hosted_only) {

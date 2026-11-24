@@ -5,6 +5,7 @@ const toml = @import("toml.zig");
 const env = @import("env.zig");
 const io_compat = @import("io_compat.zig");
 const clamav = @import("../antispam/clamav.zig");
+const mailbox_domains = @import("mailbox_domains.zig");
 
 pub const ValidationError = error{
     InvalidPort,
@@ -22,6 +23,7 @@ pub const ValidationError = error{
     TLSKeyNotFound,
     InvalidHostnameFormat,
     CatchAllNotLoopback,
+    InvalidExactMailboxDomains,
 };
 
 pub const DeliveryMethod = enum {
@@ -54,6 +56,9 @@ pub const Config = struct {
     /// beyond `hostname` and its parent domain. Lets one mail server host
     /// mailboxes for multiple domains (e.g. "example.org, another.com").
     extra_local_domains: ?[]const u8 = null,
+    /// Hosted namespaces that require full addresses during delivery and login.
+    /// Borrows the process environment so the policy stays fixed until restart.
+    exact_mailbox_domains: ?[]const u8 = null,
     /// Comma-separated accounts that send on behalf of other domains: a
     /// sending service whose customers have each proved their domain to it.
     /// Such an account may author a message for an address that is not its
@@ -177,14 +182,11 @@ pub const Config = struct {
         if (std.mem.indexOf(u8, self.hostname, ".")) |dot_pos| {
             if (std.ascii.eqlIgnoreCase(domain, self.hostname[dot_pos + 1 ..])) return true;
         }
-        if (self.extra_local_domains) |list| {
-            var it = std.mem.splitScalar(u8, list, ',');
-            while (it.next()) |raw| {
-                const d = std.mem.trim(u8, raw, " \t");
-                if (d.len > 0 and std.ascii.eqlIgnoreCase(domain, d)) return true;
-            }
-        }
-        return false;
+        return mailbox_domains.contains(self.extra_local_domains, domain);
+    }
+
+    pub fn requiresFullMailbox(self: Config, address: []const u8) bool {
+        return mailbox_domains.contains(self.exact_mailbox_domains, mailbox_domains.addressDomain(address) orelse return false);
     }
 
     /// Whether `account` is named in `relay_accounts`. Case-insensitive, and
@@ -280,6 +282,17 @@ pub const Config = struct {
                 .{self.host},
             );
             return ValidationError.CatchAllNotLoopback;
+        }
+
+        if (self.exact_mailbox_domains) |list| {
+            var domains = std.mem.splitScalar(u8, list, ',');
+            while (domains.next()) |entry| {
+                const domain = std.mem.trim(u8, entry, " \t");
+                if (self.catch_all or !self.isLocalDomain(domain)) {
+                    std.debug.print("Configuration Error: SMTP_EXACT_MAILBOX_DOMAINS requires local domains and catch-all mode off\n", .{});
+                    return ValidationError.InvalidExactMailboxDomains;
+                }
+            }
         }
 
         // Basic hostname format validation (no spaces, basic characters)
@@ -561,6 +574,11 @@ fn applyEnvironmentVariables(allocator: std.mem.Allocator, cfg: *Config) !void {
     if (env.get("SMTP_LOCAL_DOMAINS")) |value| {
         if (cfg.extra_local_domains) |old| allocator.free(old);
         cfg.extra_local_domains = try allocator.dupe(u8, value);
+    }
+
+    if (env.get("SMTP_EXACT_MAILBOX_DOMAINS")) |value| {
+        const entries = std.mem.trim(u8, value, " \t");
+        cfg.exact_mailbox_domains = if (entries.len == 0) null else entries;
     }
 
     // SMTP_RELAY_ACCOUNTS — comma-separated accounts that may send for a

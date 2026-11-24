@@ -45,6 +45,28 @@ Use `--fixture /path/to/mail` to exercise the same client against a disposable T
 
 For the local Stacks test process, set `MAIL_PROVISIONING_URL` to `http://127.0.0.1:8099`, `MAIL_PROVISIONING_TOKEN` to the staging token, `MAIL_FREE_SIGNUP_DOMAIN` to the staging mailbox domain, and `MAIL_WEBMAIL_ORIGIN` to the webmail URL from the stack output. Use a disposable signup database and configure the free-tier limits for the test. Record the deployed Mail, app, and SDK revisions and test results in #55, #57, and #61.
 
+### Rehearse an additional hosted domain
+
+Add each approved staging domain to `SMTP_LOCAL_DOMAINS`, then list it in
+`SMTP_EXACT_MAILBOX_DOMAINS` and `SMTP_PROVISIONING_ADDITIONAL_DOMAINS`. These
+settings take comma-separated domain names. Keep `SMTP_PROVISIONING_DOMAIN`
+set to the primary domain and disable catch-all delivery. Restart Mail to
+load the routing and provisioning settings.
+
+Provision users with their full mailbox addresses. SMTP delivery and account
+sign-in use the address's domain even when the same local part exists in
+another domain. Create `postmaster@domain` through the operator CLI, since
+the private provisioning API reserves that address. Check the additional
+domain with the private `GET /provisioning/v1/domain?name=example.com`
+endpoint before creating customer mailboxes. The daemon reports eligibility
+from its configuration. Verify the account's DNS ownership claim in Stacks
+before offering customer setup.
+
+Run `python3 scripts/test-hosted-domains.py /path/to/mail` to exercise this
+configuration with two disposable domains over native SMTP, IMAP, webmail,
+EWS, and ActiveSync. Rehearse DNS, import, and roll back with a staging domain
+before changing customer MX records.
+
 ## Hosted mailbox diagnostics
 
 Run the local report on the mailbox's Mail host. Use the daemon's working directory and database path. The staging stack uses `/var/lib/mail` for both.

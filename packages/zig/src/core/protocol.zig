@@ -1418,6 +1418,7 @@ pub const Session = struct {
     fn maySendAs(self: *Session, address: []const u8) !bool {
         const identity = self.authenticated_username orelse return false;
         if (std.ascii.eqlIgnoreCase(identity, address)) return true;
+        if (self.config.requiresFullMailbox(address)) return false;
         const backend = self.auth_backend orelse return false;
         var user = backend.db.getUserByUsername(identity) catch return false;
         defer user.deinit(backend.db.allocator);
@@ -1617,7 +1618,8 @@ pub const Session = struct {
         // A trap (`catch_all`) takes every address, and without a user
         // database there is nothing to check against.
         var lower_buf: [320]u8 = undefined;
-        if (is_local and !self.config.catch_all) {
+        const require_full = self.config.requiresFullMailbox(addr);
+        if (is_local and !self.config.catch_all and !require_full) {
             if (self.auth_backend) |ab| {
                 if (!localRecipientKnown(ab.db, addr, aliases.hasAlias)) {
                     // Mailboxes are stored lowercase, but senders do not always
@@ -1639,10 +1641,12 @@ pub const Session = struct {
             }
         }
 
-        if (is_local and self.auth_backend != null) {
-            const key = try self.mailboxKey(addr);
+        const recipient_db = if (self.auth_backend) |ab| ab.db else if (require_full) self.delivery_db else null;
+        if (is_local and recipient_db != null) {
+            const key = routing.resolveMailbox(self.allocator, recipient_db, &self.config, addr) catch |err|
+                return self.sendSaveError(writer, err);
             defer self.allocator.free(key);
-            const limits = self.auth_backend.?.db.hostedLimits(key) catch {
+            const limits = recipient_db.?.hostedLimits(key) catch {
                 try self.sendResponse(writer, 451, "4.3.0 Recipient lookup temporarily unavailable", null);
                 return;
             };
@@ -1656,6 +1660,7 @@ pub const Session = struct {
                 if (refusal) |err| return self.sendSaveError(writer, err);
             }
         }
+        if (is_local and require_full and recipient_db == null) return self.sendSaveError(writer, error.DatabaseUnavailable);
 
         // Check greylisting if enabled (skip for authenticated users)
         if (self.greylist != null and !self.authenticated) {
@@ -2666,14 +2671,10 @@ pub const Session = struct {
         _ = writer;
     }
 
-    fn mailboxKey(self: *Session, rcpt: []const u8) ![]const u8 {
-        const db = if (self.auth_backend) |ab| ab.db else null;
-        return routing.resolveMailbox(self.allocator, db, &self.config, rcpt);
-    }
-
     fn sendSaveError(self: *Session, writer: anytype, err: anyerror) !void {
         self.logger.err("Failed to save message: {}", .{err});
         switch (err) {
+            error.UnknownLocalMailbox => try self.sendResponse(writer, 550, "5.1.1 Recipient address rejected: user unknown", null),
             error.HostedStorageFull => try self.sendResponse(writer, 452, "4.2.2 Recipient mailbox storage is full", null),
             error.HostedRecipientDisabled => try self.sendResponse(writer, 550, "5.2.1 Recipient mailbox is disabled", null),
             error.HostedRecipientReadOnly => try self.sendResponse(writer, 450, "4.2.1 Recipient mailbox is temporarily read-only", null),

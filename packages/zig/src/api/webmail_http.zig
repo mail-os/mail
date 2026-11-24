@@ -80,10 +80,17 @@ const calendar_clock = @import("../protocol/icalendar_time.zig");
 const recovery = @import("webmail_recovery.zig");
 const health = @import("webmail_health.zig");
 const password_hasher = @import("../auth/password.zig");
+const mailbox_domains = @import("../core/mailbox_domains.zig");
 
 pub const ProvisioningConfig = struct {
     token: []const u8,
     domain: []const u8,
+    additional_domains: ?[]const u8 = null,
+
+    fn servesDomain(self: ProvisioningConfig, domain: []const u8) bool {
+        return std.mem.eql(u8, domain, self.domain) or
+            (validProvisioningDomain(domain) and mailbox_domains.contains(self.additional_domains, domain));
+    }
 };
 
 // SPA static assets, rendered by packages/webmail/build.ts into webmail_dist/
@@ -172,6 +179,15 @@ pub const WebmailHttpServer = struct {
             if (!std.mem.eql(u8, config.bind_host, "127.0.0.1") or config.enable_tls or provision.token.len != 64 or
                 config.mail_config == null or !validProvisioningDomain(provision.domain)) return error.InvalidProvisioningConfiguration;
             for (provision.token) |byte| if (!std.ascii.isHex(byte)) return error.InvalidProvisioningConfiguration;
+            if (provision.additional_domains) |list| {
+                const mail = config.mail_config.?;
+                var domains = std.mem.splitScalar(u8, list, ',');
+                while (domains.next()) |entry| {
+                    const domain = std.mem.trim(u8, entry, " \t");
+                    if (!validProvisioningDomain(domain) or !mail.isLocalDomain(domain) or
+                        !mailbox_domains.contains(mail.exact_mailbox_domains, domain)) return error.InvalidProvisioningConfiguration;
+                }
+            }
         }
         if (config.max_attachment_total_bytes > 100 * 1024 * 1024 or config.max_attachment_file_bytes > 100 * 1024 * 1024 or config.max_attachment_count > 100 or config.undo_send_seconds > 30) return error.InvalidWebmailConfiguration;
         var sessions = session_mod.SessionManager.init(allocator, db, auth);
@@ -1582,7 +1598,10 @@ fn handleForwarding(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: st
 fn resolveForwardDestination(server: *WebmailHttpServer, a: std.mem.Allocator, user: []const u8, address: []const u8) !database.Database.ForwardDestination {
     const cfg = server.config;
     if (!local_routing.isLocal(address, cfg.hostname, cfg.mail_config)) return .{ .address = address, .mailbox_id = null };
-    const mailbox = try local_routing.resolveMailbox(a, server.db, cfg.mail_config, address);
+    const mailbox = local_routing.resolveMailbox(a, server.db, cfg.mail_config, address) catch |err| switch (err) {
+        error.UnknownLocalMailbox => return error.InvalidForwardDestination,
+        else => return err,
+    };
     if (std.mem.eql(u8, mailbox, user)) return error.InvalidForwardDestination;
     const id = (try server.db.enabledMailboxId(mailbox)) orelse return error.InvalidForwardDestination;
     return .{ .address = address, .mailbox_id = id };
@@ -4704,9 +4723,9 @@ fn validProvisioningId(id: []const u8) bool {
     return true;
 }
 
-fn validProvisioningMailbox(mailbox: []const u8, domain: []const u8) bool {
+fn validProvisioningMailbox(mailbox: []const u8, config: ProvisioningConfig) bool {
     const at = std.mem.indexOfScalar(u8, mailbox, '@') orelse return false;
-    if (!std.mem.eql(u8, mailbox[at + 1 ..], domain)) return false;
+    if (!config.servesDomain(mailbox[at + 1 ..])) return false;
     const name = mailbox[0..at];
     if (name.len < 2 or name.len > 32 or !std.ascii.isAlphanumeric(name[0]) or !std.ascii.isAlphanumeric(name[name.len - 1]) or
         std.mem.indexOf(u8, name, "..") != null) return false;
@@ -4762,13 +4781,13 @@ fn handleProvisioning(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
     }
     if (get and std.mem.eql(u8, req.path, "/provisioning/v1/domain")) {
         const name = req.queryParam(arena, "name") orelse "";
-        if (!std.mem.eql(u8, name, cfg.domain)) return sendError(conn, arena, 404, "domain_not_found", "Provisioning domain is not configured");
-        return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .name = cfg.domain, .configured = true }), null);
+        if (!cfg.servesDomain(name)) return sendError(conn, arena, 404, "domain_not_found", "Provisioning domain is not configured");
+        return sendJson(conn, arena, 200, try service_mod.json(arena, .{ .name = name, .configured = true }), null);
     }
     if (get and std.mem.eql(u8, req.path, "/provisioning/v1/mailbox")) {
         const mailbox = req.queryParam(arena, "mailbox") orelse "";
         const actor = req.queryParam(arena, "actor") orelse "";
-        if (!validProvisioningMailbox(mailbox, cfg.domain) or !validProvisioningId(actor))
+        if (!validProvisioningMailbox(mailbox, cfg) or !validProvisioningId(actor))
             return sendError(conn, arena, 400, "invalid_request", "Invalid mailbox or actor");
         const state = server.db.provisioningState(mailbox, actor) catch |err| return provisioningError(conn, arena, err);
         return sendProvisioningState(conn, arena, state);
@@ -4777,7 +4796,7 @@ fn handleProvisioning(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
         const body = std.json.parseFromSlice(database.Database.ProvisioningAccessChange, arena, req.body, .{}) catch
             return sendError(conn, arena, 400, "invalid_request", "Invalid access window request");
         const change = body.value;
-        if (!validProvisioningMailbox(change.mailbox, cfg.domain) or !validProvisioningId(change.actor) or
+        if (!validProvisioningMailbox(change.mailbox, cfg) or !validProvisioningId(change.actor) or
             !validProvisioningId(change.operation_id) or change.revision < 1)
             return sendError(conn, arena, 400, "invalid_request", "Invalid mailbox, actor, operation or revision");
         const state = server.db.applyProvisioningAccess(change) catch |err| return provisioningError(conn, arena, err);
@@ -4791,7 +4810,7 @@ fn handleProvisioning(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
     const change = body.value;
     if (change.access_window) |window| if (!window.valid())
         return provisioningError(conn, arena, error.InvalidAccessWindow);
-    if (!validProvisioningMailbox(change.mailbox, cfg.domain) or !validProvisioningId(change.actor) or
+    if (!validProvisioningMailbox(change.mailbox, cfg) or !validProvisioningId(change.actor) or
         !validProvisioningId(change.operation_id) or change.revision < 1 or change.quota_bytes < 1 or change.quota_bytes > 1 << 40 or
         change.send_recipients_per_day < 0 or change.send_recipients_per_day > 1_000_000)
         return sendError(conn, arena, 400, "invalid_request", "Invalid mailbox, actor, operation, revision, storage quota, or sending allowance");

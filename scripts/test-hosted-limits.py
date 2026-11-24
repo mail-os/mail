@@ -111,9 +111,9 @@ class MailClient:
             assert client.login(mailbox, self.password)[0] == "OK"
             yield client
 
-    def ews(self, mailbox, operation, *, fragmented=False):
-        # Use the bare login to check that EWS charges the canonical account.
-        name = mailbox.split("@")[0]
+    def ews(self, mailbox, operation, *, fragmented=False, full_login=False):
+        # The original quota fixtures exercise legacy bare logins.
+        name = mailbox if full_login else mailbox.split("@")[0]
         token = base64.b64encode(f"{name}:{self.password}".encode()).decode()
         soap = (
             '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '

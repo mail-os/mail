@@ -6,6 +6,7 @@ const password_mod = @import("password.zig");
 const security = @import("security.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const mutex_compat = @import("../core/mutex_compat.zig");
+const mailbox_domains = @import("../core/mailbox_domains.zig");
 
 /// Get current unix timestamp in seconds
 fn getCurrentTimestamp() i64 {
@@ -209,6 +210,7 @@ pub const AuthBackend = struct {
     verify_cache: VerifyCache,
     login_limiter: security.RateLimiter,
     default_domain: ?[]u8 = null,
+    exact_mailbox_domains: ?[]const u8 = null,
 
     /// Cache of recent successful password verifications. Mail clients
     /// reconnect constantly (IMAP polling, IDLE drops, per-message SMTP
@@ -316,13 +318,22 @@ pub const AuthBackend = struct {
     pub fn canonicalUsername(self: *AuthBackend, address: []const u8, allocator: std.mem.Allocator) ![]const u8 {
         if (self.db.userExists(address) catch false)
             return allocator.dupe(u8, address);
-        if (std.mem.indexOfScalar(u8, address, '@') == null) {
+        if (mailbox_domains.addressDomain(address)) |domain| {
+            if (mailbox_domains.contains(self.exact_mailbox_domains, domain))
+                return std.ascii.allocLowerString(allocator, address);
+        } else {
             if (self.default_domain) |domain| {
-                const qualified = try std.fmt.allocPrint(allocator, "{s}@{s}", .{ address, domain });
-                if (self.db.userExists(qualified) catch false) return qualified;
+                if (!mailbox_domains.contains(self.exact_mailbox_domains, domain)) {
+                    const qualified = try std.fmt.allocPrint(allocator, "{s}@{s}", .{ address, domain });
+                    if (self.db.userExists(qualified) catch false) return qualified;
+                    allocator.free(qualified);
+                }
+            }
+            if (try self.db.uniqueUsernameForLocalPart(address, allocator)) |qualified| {
+                const domain = mailbox_domains.addressDomain(qualified) orelse unreachable;
+                if (!mailbox_domains.contains(self.exact_mailbox_domains, domain)) return qualified;
                 allocator.free(qualified);
             }
-            return (try self.db.uniqueUsernameForLocalPart(address, allocator)) orelse allocator.dupe(u8, address);
         }
         return allocator.dupe(u8, address);
     }
