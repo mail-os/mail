@@ -83,6 +83,12 @@ jobs:
       timeout-minutes: 3
       run: python3 scripts/test-webmail-mailbox-operator.py packages/zig/zig-out/bin/mail --browser chromium --browser firefox --browser webkit --screenshots webmail-browser-screenshots
 
+    - name: Record native webmail navigation baseline
+      if: runner.os == 'Linux'
+      working-directory: .
+      timeout-minutes: 5
+      run: python3 scripts/test-webmail-navigation.py packages/zig/zig-out/bin/mail webmail-browser-screenshots/navigation --revision "$(git rev-parse HEAD)"
+
     - name: Upload browser screenshots
       if: ${{ !cancelled() && runner.os == 'Linux' }}
       uses: actions/upload-artifact@v4

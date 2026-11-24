@@ -44,6 +44,9 @@ routing.
 
 ## Mailbox experience
 
+See the [navigation and capability baseline](docs/WEBMAIL_NAVIGATION_BASELINE.md)
+for the released mailbox check, candidate walkthrough, and follow-up issues.
+
 - Drafts autosave while the composer remains open. Server acknowledgements drive
   Saving/Saved status; saved recipients, unfinished input, names and attachment
   references survive refresh. Conditional revisions prevent a stale browser tab

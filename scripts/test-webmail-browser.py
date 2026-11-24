@@ -147,6 +147,7 @@ def seed_shared_inbox(fixture, owner, sender):
     message.set_content("The revised proof is ready for approval.")
     with fixture.smtp(sender) as connection:
         assert connection.send_message(message) == {}
+    return studio
 
 
 def verify_delivery(fixture, sender):
