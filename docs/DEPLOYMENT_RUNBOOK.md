@@ -134,6 +134,29 @@ sudo -u mail-server env SMTP_DB_PATH=/var/lib/mail/smtp.db \
 
 The report carries the observation time and an `audit_id`. Each successful report records `hosted.status` in `audit_log` with the effective operator UID and mailbox. The output is restricted to the mailbox identifier, operational state, and aggregate counters. Maildir and reservation counts may change while the daemon is delivering mail.
 
+### Offboard a departed team owner
+
+Use `mail team show` to confirm the departing owner and choose an existing
+teammate. For a hosted team, the successor needs active paid service on the
+team's domain. Run the handoff from the Mail host with the daemon's database.
+
+```bash
+/opt/mail/mail-server team offboard-owner studio alice@example.com bob@example.com operator-handoff-001
+```
+
+The handoff commits the replacement, membership removal, grant cleanup, and
+`team.owner_handoff` audit entry together. Keep the operation ID with the ticket
+and reuse it if the command's outcome is unclear. Confirm the successor can
+manage the team, the departing mailbox has lost access to shared mail and
+calendars, and outstanding invitations from the departing owner are gone.
+Use the occupied-domain retirement workflow when the customer's mailbox itself
+needs permanent retirement.
+
+When a restore uses a snapshot from before an offboarding, repeat the recorded
+command with its original operation ID on the restored database before opening
+the listeners. Verify the successor's role and the former owner's shared
+access on the restored host before returning it to service.
+
 ### Hosted service and export deadlines
 
 The private v1 provisioning API accepts an optional `access_window` with
@@ -812,6 +835,8 @@ echo "Certificate expires: $EXPIRY"
 ---
 
 ## Backup and Restore
+
+See the [authenticated Restic backup and recovery procedure](ENCRYPTION_AT_REST.md#backup-operations) for a full-service restore that includes Maildir and preserves verified message links.
 
 ### Full Backup Script
 

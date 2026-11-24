@@ -169,6 +169,8 @@ daily / 5 weekly / 12 monthly retention, prunes, and checks the repository.
 The archive takes online snapshots of the SQLite databases and captures Maildir
 separately. Quiesce writers when a restore must represent the same point in
 time across all three stores.
+The archive includes dot-prefixed Maildir++ folders and omits macOS metadata
+sidecars that portable extractors can expose as extra messages.
 
 The backup records a SHA-256 digest for each webmail or Sender Review message
 whose file still matches its recorded Maildir identity. The restore check
@@ -184,6 +186,10 @@ message identities before starting Mail:
 ```bash
 mail backup rebind-local /path/to/extracted/smtp.db /path/to/extracted/mail
 ```
+
+If the backup predates a team owner's departure, replay the
+[recorded offboarding operation](DEPLOYMENT_RUNBOOK.md#offboard-a-departed-team-owner)
+before opening listeners on the restored service.
 
 Rebinding verifies the archived bytes before updating any identity and rolls
 back the transaction when a recorded file is missing or changed. It preserves

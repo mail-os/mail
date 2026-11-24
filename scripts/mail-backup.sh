@@ -53,7 +53,9 @@ for path in mail dkim forwards.json forwards.sieve cert-backups; do
   [[ -e "${MAIL_DIR}/${path}" ]] && persistent+=("${path}")
 done
 
-tar --dereference --exclude='mail/*/.*' -czf "${partial}" \
+# BSD tar otherwise writes AppleDouble entries for extended attributes. A
+# portable extractor can restore those entries as extra Maildir messages.
+COPYFILE_DISABLE=1 tar --dereference --exclude='mail/*/._*' --exclude='mail/*/.DS_Store' -czf "${partial}" \
   -C "${MAIL_DIR}" "${persistent[@]}" \
   -C "${work_dir}" "${snapshots[@]}"
 tar tzf "${partial}" >/dev/null
@@ -62,7 +64,7 @@ mv "${partial}" "${output}"
 
 if [[ -f "${MAIL_BACKUP_ENV_FILE}" ]]; then
   env_output="${output%.tgz}.env.tar"
-  tar cf "${env_output}.partial" -C "$(dirname "${MAIL_BACKUP_ENV_FILE}")" "$(basename "${MAIL_BACKUP_ENV_FILE}")"
+  COPYFILE_DISABLE=1 tar cf "${env_output}.partial" -C "$(dirname "${MAIL_BACKUP_ENV_FILE}")" "$(basename "${MAIL_BACKUP_ENV_FILE}")"
   tar tf "${env_output}.partial" >/dev/null
   chmod 0600 "${env_output}.partial"
   mv "${env_output}.partial" "${env_output}"

@@ -740,6 +740,7 @@ mail team grant studio owner@example.com colleague@example.com sender
 mail team show studio
 mail team revoke studio owner@example.com colleague@example.com sender
 mail team member studio colleague@example.com remove
+mail team offboard-owner studio owner@example.com replacement@example.com operator-handoff-001
 ```
 
 The API exposes roster and grant records through `GET /webmail/api/teams`
@@ -757,12 +758,15 @@ and `search` take an empty resource. The scopes `calendar`, `attachments`, and
 `comments` take a specific resource ID. See the team workflow issues for
 the rollout of these permissions to mail and calendar clients.
 
-Assign a replacement before deleting, removing, or demoting the final owner.
-A suspended mailbox retains its assigned role and cannot use its credentials.
-The local operator can appoint an enabled replacement. Membership removal
-revokes existing webmail sessions and deletes grants in both directions.
-Role changes revoke the affected user's webmail sessions. The server records
-membership and grant changes in `audit_log` in the same transaction.
+Use `offboard-owner` to appoint an existing teammate and remove the departing
+owner in one transaction. The successor needs an enabled mailbox. Teams set up
+through hosted provisioning require the successor to have current paid service
+on the team's domain. Save the operation ID and use the same command to retry.
+
+Membership removal deletes team grants in both directions. Role changes and
+membership removal revoke the affected webmail sessions. The departing user
+keeps their personal mailbox and memberships in other teams. The server records
+each change in `audit_log` in the same transaction.
 
 ### Hosted team invitations
 

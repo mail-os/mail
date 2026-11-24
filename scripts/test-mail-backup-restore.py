@@ -9,6 +9,7 @@ import runpy
 import secrets
 import sqlite3
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -19,6 +20,7 @@ SCRIPTS = Path(__file__).resolve().parent
 fixture_module = runpy.run_path(str(SCRIPTS / "test-hosted-limits.py"))
 Fixture = fixture_module["Fixture"]
 DavClient = runpy.run_path(str(SCRIPTS / "test-dav-https.py"))["DavClient"]
+team_command = runpy.run_path(str(SCRIPTS / "test-webmail-teams.py"))["command"]
 
 
 def response(result, expected=200):
@@ -70,6 +72,8 @@ def archive_and_restore(binary, root, live):
     for destination in (restored, altered):
         destination.mkdir()
         with tarfile.open(restored_archive) as contents:
+            assert all(not any(part.startswith("._") for part in Path(member.name).parts)
+                       for member in contents.getmembers() if member.name.startswith("mail/"))
             contents.extractall(destination, filter="data")
     return restored, altered
 
@@ -117,6 +121,10 @@ def verify(binary, root, previous=None):
         owner = source.provision("backup-owner")
         sender = source.provision("backup-sender")
         reviewer = source.provision("backup-review-sender")
+        team = "restored-team"
+        team_command(source, "team", "create", team, "Restored team", sender)
+        team_command(source, "team", "member", team, owner, "member")
+        team_command(source, "team", "grant", team, owner, sender, "mailbox")
         session = source.login(owner)
         response(source.api(session, "sender-review", {"setting": "disable"}, "PUT"))
         assert source.deliver(owner, identity=sender, subject=subject, body=text)[0] == 250
@@ -124,6 +132,10 @@ def verify(binary, root, previous=None):
         mail, = response(source.api(session, "messages?" + query))["items"]
         endpoint = "messages/ref/" + mail["reference"]
         original = response(source.api(session, endpoint))
+        with closing(sqlite3.connect(live / "smtp.db")) as db:
+            owner_id, = db.execute("SELECT id FROM users WHERE username=?", (owner,)).fetchone()
+        shared_path = f"shared-inboxes/{team}/{owner_id}/messages/{mail['reference']}"
+        assert response(source.api(source.login(sender), shared_path))["reference"] == mail["reference"]
         original_uid = mailbox_identity(source, owner, mail["uid"])
         calendar = response(source.api(session, "calendars", {"name": "Backup Calendar"}), 201)
         fields = dict(session, **{"X-Webmail-Source-Message": mail["reference"]})
@@ -149,8 +161,26 @@ def verify(binary, root, previous=None):
         response(source.api(session, "sender-review", {"setting": "enable"}, "PUT"))
         assert source.deliver(owner, identity=reviewer, subject="Sender Review backup marker", body="Unchanged screening content")[0] == 250
         held = pending_message(source, session)
+        if sys.platform == "darwin":
+            stored, = [file for file in (live / "mail" / owner).rglob("*.eml*")
+                       if b"Subject: Back up this message" in file.read_bytes()]
+            subprocess.run(["xattr", "-w", "com.example.mail-test", "portable-backup", str(stored)], check=True)
+        previous_projects = live / "mail" / owner / ".PreviousProjects"
+        for slot in ("cur", "new", "tmp"):
+            (previous_projects / slot).mkdir(parents=True)
+        archive_message = b"Subject: Maildir++ archive marker\r\n\r\nArchived folder body.\r\n"
+        archived_path = previous_projects / "cur" / "archive.eml:2,S"
+        archived_path.write_bytes(archive_message)
+        previous_projects.with_name("PreviousProjects").symlink_to(".PreviousProjects/cur", target_is_directory=True)
+        archived, = response(source.api(session, "messages?folder=PreviousProjects"))["items"]
+        assert archived["subject"] == "Maildir++ archive marker"
         (live / "forwards.json").write_text("{}\n")
         restored, altered = archive_and_restore(binary, root, live)
+        assert (restored / archived_path.relative_to(live)).read_bytes() == archive_message
+        offboard = ("team", "offboard-owner", team, sender, owner, "restore-fixture-" + secrets.token_hex(8))
+        team_command(source, *offboard)
+        response(source.api(source.login(sender), shared_path), 404)
+        session = source.login(owner)
         assert response(source.api(session, endpoint))["reference"] == mail["reference"]
         assert source.deliver(owner, identity=sender, subject="Mail sent after the backup")[0] == 250
 
@@ -162,7 +192,10 @@ def verify(binary, root, previous=None):
             )
 
     before = stamps(altered)
-    screened, = (altered / "mail" / owner / "Screening").glob("*.eml")
+    with closing(sqlite3.connect(altered / "smtp.db")) as db:
+        folder, basename = db.execute("SELECT folder,basename FROM mailbox_message_refs WHERE user_id=? AND reference=?",
+                                      (owner_id, held["reference"])).fetchone()
+    screened, = (altered / "mail" / owner / folder).glob(basename + "*")
     content = screened.read_bytes()
     assert b"Unchanged screening content" in content
     screened.write_bytes(content.replace(b"Unchanged screening content", b"Modified screening content!"))
@@ -175,12 +208,21 @@ def verify(binary, root, previous=None):
     assert (restored / "forwards.json").read_text() == (live / "forwards.json").read_text()
     restored_server = Fixture(binary, restored, staging=True)
     restored_server.password = source.password
+    with closing(sqlite3.connect(restored / "smtp.db")) as db:
+        assert db.execute("SELECT COUNT(*) FROM mail_team_owner_handoffs WHERE operation_id=?", (offboard[-1],)).fetchone()[0] == 0
+    team_command(restored_server, *offboard)
+    team_command(restored_server, *offboard)
     with restored_server.daemon():
+        response(restored_server.api(restored_server.login(sender), shared_path), 404)
         session = restored_server.login(owner)
+        assert response(restored_server.api(session, f"teams/{team}"))["team"]["role"] == "owner"
+        archived, = response(restored_server.api(session, "messages?folder=PreviousProjects"))["items"]
+        assert archived["subject"] == "Maildir++ archive marker"
         recovered = response(restored_server.api(session, endpoint))
         assert recovered["reference"] == original["reference"] and recovered["placement"]["verified_author"] == sender
         assert text in recovered["text"]
-        assert mailbox_identity(restored_server, owner, mail["uid"]) == original_uid
+        restored_uid = mailbox_identity(restored_server, owner, mail["uid"])
+        assert restored_uid == original_uid, (restored_uid[0], original_uid[0], restored_uid[1][0], original_uid[1][0])
         assert response(restored_server.api(session, event_path))["source_message"] == mail["reference"]
         reopened = DavClient(restored_server, owner).request("GET", resource)
         assert reopened[0] == 200 and reopened[1]["ETag"] == dav[1]["ETag"] and reopened[2] == dav[2], reopened
@@ -196,7 +238,7 @@ def verify(binary, root, previous=None):
         assert response(restored_server.api(session, "messages?" + urlencode({
             "folder": "INBOX", "q": "Mail sent to the restored server",
         })))["total"] == 1
-    print("Verified the local Restic round trip, IMAP identity, verified mail links, Calendar source and ETag, drafts, scheduled sends, and Sender Review. Tampering failed atomically.")
+    print("Verified the local Restic round trip, IMAP identity, verified mail links, Calendar source and ETag, drafts, scheduled sends, and Sender Review. Replayed a post-backup owner offboarding before opening the restored listeners. Tampering failed atomically.")
     if previous is not None:
         verify_worker_rollback(restored_server, previous, owner, sender, endpoint)
 

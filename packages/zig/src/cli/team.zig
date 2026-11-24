@@ -55,6 +55,19 @@ fn member(ctx: *cli.BaseCommand.ParseContext) !void {
     try teams.setMember(&db, a, .{ .operator = actor }, id, mailbox, next);
 }
 
+fn offboardOwner(ctx: *cli.BaseCommand.ParseContext) !void {
+    const a = ctx.allocator;
+    const team = ctx.getArgument(0) orelse return error.TeamIdRequired;
+    const departing = ctx.getArgument(1) orelse return error.MailboxRequired;
+    const successor = ctx.getArgument(2) orelse return error.MailboxRequired;
+    const operation = ctx.getArgument(3) orelse return error.MissingOperationId;
+    var db = try openDb(a);
+    defer db.deinit();
+    const actor = try operator(a);
+    defer a.free(actor);
+    try teams.offboardOwner(&db, a, actor, operation, team, departing, successor);
+}
+
 fn grantAction(ctx: *cli.BaseCommand.ParseContext, allowed: bool) !void {
     const a = ctx.allocator;
     const id = ctx.getArgument(0) orelse return error.TeamIdRequired;
@@ -87,6 +100,7 @@ pub fn setup(a: std.mem.Allocator) !*cli.BaseCommand {
         .{ "create", "Create a team with an existing mailbox as owner", create, .{ "team-id", "display-name", "owner" } },
         .{ "show", "Show team members and grants", show, .{"team-id"} },
         .{ "member", "Set a role (owner, admin, member) or remove a member", member, .{ "team-id", "mailbox", "role-or-remove" } },
+        .{ "offboard-owner", "Appoint an existing teammate and remove the departing owner atomically", offboardOwner, .{ "team-id", "departing-mailbox", "successor-mailbox", "operation-id" } },
         .{ "grant", "Grant a specific resource to another team member", grant, .{ "team-id", "source", "grantee", "scope", "resource" } },
         .{ "revoke", "Revoke a resource grant", revoke, .{ "team-id", "source", "grantee", "scope", "resource" } },
     };

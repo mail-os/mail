@@ -20,6 +20,7 @@ HERE = Path(__file__).resolve().parent
 support = runpy.run_path(str(HERE / "test-webmail-teams.py"))
 Fixture, command, expect = support["Fixture"], support["command"], support["expect"]
 primary, hosted, foreign = "hosted.example.test", "studio.example.test", "other.example.test"
+offboard_domain = "offboarding.example.test"
 endpoint = "team-invitations"
 
 
@@ -139,6 +140,100 @@ def incoming(test, session):
     return expect(test.api(session, endpoint))["incoming"]
 
 
+def verify_offboarding(test, db):
+    departing = paid_mailbox(test, "desk", offboard_domain)
+    first = paid_mailbox(test, "first", offboard_domain)
+    second = paid_mailbox(test, "second", offboard_domain)
+    expired = paid_mailbox(test, "export-only", offboard_domain, read_only=True)
+    invitee = paid_mailbox(test, "invitee", offboard_domain)
+    unrelated = paid_mailbox(test, "desk", foreign)
+    request = {"mailbox": departing, "actor": test.specs[departing]["actor"], "name": "Offboarding"}
+    status, _, raw = test.http(test.private + "/provisioning/v1/team", request, test.auth)
+    assert status == 201, raw
+    team = json.loads(raw)["team"]["id"]
+    other_team = "independent-offboarding"
+    command(test, "team", "create", other_team, "Other team", unrelated)
+    command(test, "team", "member", other_team, departing, "member")
+    for candidate in (first, second, expired):
+        command(test, "team", "member", team, candidate, "member")
+    command(test, "team", "grant", team, departing, first, "mailbox")
+    command(test, "team", "grant", team, first, departing, "mailbox")
+    command(test, "team", "grant", team, first, departing, "sender")
+    command(test, "team", "grant", team, first, second, "mailbox")
+
+    owner, candidate, other = (test.login(name) for name in (departing, first, second))
+    assert test.deliver(departing, subject="Departing mailbox stays private")[0] == 250
+    assert test.deliver(first, subject="Team mailbox stays available")[0] == 250
+    user_ids = dict(db.execute("SELECT username,id FROM users"))
+    departed_root = f"shared-inboxes/{team}/{user_ids[departing]}"
+    active_root = f"shared-inboxes/{team}/{user_ids[first]}"
+    personal = expect(test.api(candidate, departed_root))["items"]
+    assert personal[0]["message"]["subject"] == "Departing mailbox stays private"
+    assert expect(test.api(owner, active_root))["items"][0]["message"]["subject"] == "Team mailbox stays available"
+    assert expect(test.api(other, active_root))["items"]
+    message_path = departed_root + "/messages/" + personal[0]["message"]["reference"]
+    expect(test.api(candidate, message_path))
+
+    calendar = expect(test.api(candidate, "calendars", {"name": "Handover Calendar"}), 201)["id"]
+    expect(test.api(candidate, f"teams/{team}/calendar-shares", {"calendarId": calendar, "grantee": departing, "access": "viewer"}, "PUT"))
+    assert expect(test.api(owner, "calendar-shares"))["shares"]
+    expect(send(test, owner, invitee, team))
+    assert incoming(test, test.login(invitee))
+
+    options = ("team", "offboard-owner", team, departing)
+    command(test, *options, unrelated, "offboard-unrelated-0001", error="TeamMemberNotFound")
+    command(test, *options, expired, "offboard-expired-0001", error="DisabledTeamAccount")
+    operation = "offboard-operator-test-01"
+    with db:
+        db.execute("""CREATE TRIGGER reject_owner_handoff_audit BEFORE INSERT ON audit_log
+                      WHEN NEW.action='team.owner_handoff' BEGIN SELECT RAISE(ABORT,'fixture failure'); END""")
+    command(test, *options, first, operation, error="StepFailed")
+    assert expect(test.api(owner, f"teams/{team}"))["team"]["role"] == "owner"
+    assert expect(test.api(candidate, f"teams/{team}"))["team"]["role"] == "member"
+    assert expect(test.api(candidate, message_path))
+    assert expect(test.api(owner, "calendar-shares"))["shares"]
+    assert incoming(test, test.login(invitee))
+    with db:
+        db.execute("DROP TRIGGER reject_owner_handoff_audit")
+
+    gate = Barrier(2)
+
+    def compete(entry):
+        successor, op = entry
+        gate.wait(timeout=5)
+        check = subprocess.run([str(test.binary), *options, successor, op], env=test.env, cwd=test.directory,
+                               text=True, capture_output=True, timeout=15)
+        return successor, op, check
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        attempts = list(pool.map(compete, [(first, operation), (second, "offboard-operator-test-02")]))
+    assert sum(result.returncode == 0 for _, _, result in attempts) == 1, [(r.returncode, r.stderr) for _, _, r in attempts]
+    (winner, receipt_id, _), = [item for item in attempts if item[2].returncode == 0]
+    (loser, _, failed), = [item for item in attempts if item[2].returncode]
+    assert "DepartingOwnerChanged" in failed.stderr, failed.stderr
+    command(test, *options, winner, receipt_id)
+    command(test, *options, loser, receipt_id, error="OperationConflict")
+    expect(test.api(owner, "teams"), 401)
+    expect(test.api(candidate if winner == first else other, "teams"), 401)
+    new_owner = test.login(winner)
+    old_owner = test.login(departing)
+    assert expect(test.api(new_owner, f"teams/{team}"))["team"]["role"] == "owner"
+    assert expect(test.api(test.login(loser), f"teams/{team}"))["team"]["role"] == "member"
+    assert [row["id"] for row in expect(test.api(old_owner, "teams"))] == [other_team]
+    expect(test.api(old_owner, active_root), 404)
+    expect(test.api(test.login(first), message_path), 404)
+    assert expect(test.api(old_owner, "calendar-shares"))["shares"] == []
+    assert incoming(test, test.login(invitee)) == []
+    assert expect(test.api(old_owner, "messages?folder=INBOX"))["items"][0]["subject"] == "Departing mailbox stays private"
+    assert expect(test.api(test.login(second), active_root))["items"]
+    assert expect(test.api(test.login(unrelated), "teams/" + other_team))["team"]["role"] == "owner"
+    audit = db.execute("SELECT actor,details FROM audit_log WHERE action='team.owner_handoff' AND target=?", (team,)).fetchall()
+    assert len(audit) == 1
+    assert audit[0][0] == f"local-operator:{os.geteuid()}"
+    assert json.loads(audit[0][1]) == {"operation_id": receipt_id, "departing": departing, "successor": winner, "successor_previous_role": "member"}
+    return team, winner, departing, receipt_id
+
+
 def verify(test, db):
     owner = paid_mailbox(test, "owner")
     admin = paid_mailbox(test, "admin-user")
@@ -249,9 +344,12 @@ def main():
         test.env.update(SMTP_LOCAL_DOMAINS=",".join((primary, hosted, foreign)),
                         SMTP_EXACT_MAILBOX_DOMAINS=",".join((primary, hosted, foreign)),
                         SMTP_PROVISIONING_ADDITIONAL_DOMAINS=",".join((hosted, foreign)))
+        for key in ("SMTP_LOCAL_DOMAINS", "SMTP_EXACT_MAILBOX_DOMAINS", "SMTP_PROVISIONING_ADDITIONAL_DOMAINS"):
+            test.env[key] += "," + offboard_domain
         with test.daemon(), closing(sqlite3.connect(root / "smtp.db")) as db:
             address, team = verify_hosted_teams(test, db)
             owner, recipient = verify(test, db)
+            replaced_team, successor, departed, action = verify_offboarding(test, db)
             if args.browser:
                 assert args.screenshots is not None
                 env = dict(os.environ, MAIL_INVITE_TEST_URL=test.webmail, MAIL_INVITE_TEST_CERT=test.env["SMTP_TLS_CERT"],
@@ -270,7 +368,10 @@ def main():
             assert status == 200 and json.loads(raw)["team"] == dict(team, domain=renamed), (status, raw)
             owner_team, = expect(test.api(test.login(mailbox), "teams"))
             assert owner_team == {"id": team["id"], "name": team["name"], "role": "owner"}
-    print("Verified hosted team setup, atomic invited mailbox provisioning, domain rename, invitation consent, and explicit inbox grants over native HTTPS.")
+            command(test, "team", "offboard-owner", replaced_team, departed, successor, action)
+            assert expect(test.api(test.login(successor), f"teams/{replaced_team}"))["team"]["role"] == "owner"
+            expect(test.api(test.login(departed), f"teams/{replaced_team}"), 404)
+    print("Verified hosted team setup, invitation consent, atomic owner offboarding, grant revocation, audit rollback, restart, and domain rename over native HTTPS.")
 
 
 if __name__ == "__main__":

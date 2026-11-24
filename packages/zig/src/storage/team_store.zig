@@ -23,6 +23,9 @@ pub const schema =
     \\    PRIMARY KEY(team_id,user_id)
     \\);
     \\CREATE INDEX IF NOT EXISTS mail_team_members_user ON mail_team_members(user_id);
+    \\CREATE TABLE IF NOT EXISTS mail_team_owner_handoffs (
+    \\    operation_id TEXT PRIMARY KEY, team_id TEXT NOT NULL, departing TEXT NOT NULL, successor TEXT NOT NULL
+    \\);
     \\CREATE TABLE IF NOT EXISTS mail_team_invitations (
     \\    id TEXT PRIMARY KEY NOT NULL DEFAULT(lower(hex(randomblob(16)))),
     \\    team_id TEXT NOT NULL,
@@ -445,16 +448,76 @@ pub fn setMember(db: *database.Database, a: Allocator, actor: Actor, team: []con
     if (previous == .owner) try requireOtherOwner(tx, team, subject.id);
     if (next) |role| {
         if ((previous == null or role == .owner) and !subject.enabled) return error.DisabledTeamAccount;
+    }
+    try writeMembership(tx, team, mailbox, subject.id, previous, next);
+    try audit(tx, a, actor, team, "team.membership", .{ .mailbox = mailbox, .previous = previous, .role = next });
+    try tx.commit();
+}
+
+fn writeMembership(tx: Tx, team: []const u8, mailbox: []const u8, user_id: i64, previous: ?Role, next: ?Role) !void {
+    if (next) |role| {
         try execute(
             tx,
             "INSERT INTO mail_team_members(team_id,user_id,role) VALUES(?1,?2,?3) ON CONFLICT(team_id,user_id) DO UPDATE SET role=excluded.role",
-            .{ team, subject.id, @tagName(role) },
+            .{ team, user_id, @tagName(role) },
         );
     } else {
-        try execute(tx, "DELETE FROM mail_team_members WHERE team_id=?1 AND user_id=?2", .{ team, subject.id });
+        try execute(tx, "DELETE FROM mail_team_members WHERE team_id=?1 AND user_id=?2", .{ team, user_id });
     }
     if (previous != null) try execute(tx, "DELETE FROM webmail_sessions WHERE username=?1", .{mailbox});
-    try audit(tx, a, actor, team, "team.membership", .{ .mailbox = mailbox, .previous = previous, .role = next });
+}
+
+pub fn offboardOwner(db: *database.Database, a: Allocator, operator: []const u8, operation: []const u8, team: []const u8, departing: []const u8, successor: []const u8) !void {
+    if (operation.len < 16 or operation.len > 64 or std.mem.eql(u8, departing, successor)) return error.InvalidTeamData;
+    for (operation) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return error.InvalidTeamData;
+
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    {
+        const receipt = try tx.prepare("SELECT team_id,departing,successor FROM mail_team_owner_handoffs WHERE operation_id=?1");
+        defer receipt.finalize();
+        try receipt.bind(1, operation);
+        if (try receipt.step()) {
+            if (!std.mem.eql(u8, receipt.columnText(0), team) or !std.mem.eql(u8, receipt.columnText(1), departing) or
+                !std.mem.eql(u8, receipt.columnText(2), successor)) return error.OperationConflict;
+            return;
+        }
+    }
+
+    const actor: Actor = .{ .operator = operator };
+    _ = try access(tx, team, actor);
+    const previous = (try identity(tx, departing)) orelse return error.TeamMemberNotFound;
+    const replacement = (try identity(tx, successor)) orelse return error.TeamMemberNotFound;
+    if (try memberRole(tx, team, previous.id) != .owner) return error.DepartingOwnerChanged;
+    const successor_role = (try memberRole(tx, team, replacement.id)) orelse return error.TeamMemberNotFound;
+    if (!replacement.enabled) return error.DisabledTeamAccount;
+    {
+        const eligibility = try tx.prepare(
+            \\SELECT h.domain, p.service_until, unixepoch()
+            \\FROM users u LEFT JOIN mail_hosted_teams h ON h.team_id=?1
+            \\LEFT JOIN provisioned_mailboxes p ON p.user_id=u.id AND p.mailbox=u.username
+            \\WHERE u.id=?2
+        );
+        defer eligibility.finalize();
+        try bind(eligibility, .{ team, replacement.id });
+        if (!try eligibility.step()) return error.TeamMemberNotFound;
+        const service_until = eligibility.columnInt64Opt(1);
+        if (service_until) |deadline| if (deadline <= eligibility.columnInt64(2)) return error.DisabledTeamAccount;
+        if (eligibility.columnTextOpt(0)) |team_domain| {
+            const domain = mailbox_domains.addressDomain(successor) orelse return error.DisabledTeamAccount;
+            if (!std.ascii.eqlIgnoreCase(team_domain, domain) or service_until == null) return error.DisabledTeamAccount;
+        }
+    }
+
+    if (successor_role != .owner) try writeMembership(tx, team, successor, replacement.id, successor_role, .owner);
+    try writeMembership(tx, team, departing, previous.id, .owner, null);
+    try execute(tx, "INSERT INTO mail_team_owner_handoffs VALUES(?1,?2,?3,?4)", .{ operation, team, departing, successor });
+    try audit(tx, a, actor, team, "team.owner_handoff", .{
+        .operation_id = operation,
+        .departing = departing,
+        .successor = successor,
+        .successor_previous_role = successor_role,
+    });
     try tx.commit();
 }
 
