@@ -74,26 +74,15 @@ pub fn fixedBufferStream(buffer: []u8) FixedBufferStream {
     return FixedBufferStream.init(buffer);
 }
 
-/// Fill buffer with random bytes (cross-platform).
-/// Uses the global Io instance when available, otherwise falls back to
-/// a timestamp-seeded PRNG (sufficient for test environments where the
-/// global Io hasn't been initialised via main()).
+/// Fill the buffer with random bytes. Before startup, use Zig's synchronous
+/// operating-system entropy path, which is safe to call from multiple threads.
 pub fn randomBytes(buf: []u8) void {
     if (io_initialized) {
         global_io.random(buf);
         return;
     }
-    // Fallback: simple PRNG seeded from high-resolution clock.
-    // Only used in test binaries that never call initIo().
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts);
-    const sec_bits: u64 = @as(u64, @bitCast(@as(i64, ts.sec)));
-    const nsec_bits: u64 = @intCast(@as(u32, @bitCast(@as(i32, @truncate(ts.nsec)))));
-    var state: u64 = sec_bits *% 6364136223846793005 +% nsec_bits;
-    for (buf) |*b| {
-        state = state *% 6364136223846793005 +% 1442695040888963407;
-        b.* = @truncate(state >> 33);
-    }
+    std.Io.Threaded.global_single_threaded.io().randomSecure(buf) catch
+        @panic("Operating-system entropy is unavailable");
 }
 
 /// Get current timestamp in nanoseconds (compatibility for std.time.nanoTimestamp)
@@ -105,4 +94,37 @@ pub fn nanoTimestamp() i128 {
 pub fn milliTimestamp() i64 {
     const ns = nanoTimestamp();
     return @intCast(@divFloor(ns, 1_000_000));
+}
+
+test "randomBytes produces distinct samples in rapid and concurrent calls before startup" {
+    const Sample = [32]u8;
+    const Worker = struct {
+        fn fill(samples: []Sample, start: *const std.atomic.Value(bool)) void {
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            for (samples) |*sample| randomBytes(sample);
+        }
+    };
+
+    var samples: [5][256]Sample = undefined;
+    for (&samples[0]) |*sample| randomBytes(sample);
+
+    var start = std.atomic.Value(bool).init(false);
+    var workers: [4]std.Thread = undefined;
+    var spawned: usize = 0;
+    {
+        defer {
+            start.store(true, .release);
+            for (workers[0..spawned]) |worker| worker.join();
+        }
+        for (&workers, samples[1..]) |*worker, *batch| {
+            worker.* = try std.Thread.spawn(.{}, Worker.fill, .{ batch, &start });
+            spawned += 1;
+        }
+    }
+
+    var seen = std.AutoHashMap(Sample, void).init(std.testing.allocator);
+    defer seen.deinit();
+    for (&samples) |*batch| {
+        for (batch) |sample| try std.testing.expect(!(try seen.getOrPut(sample)).found_existing);
+    }
 }
