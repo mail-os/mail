@@ -89,7 +89,7 @@ async function verifySelect(control, minimumHeight = 36) {
   assert(appearance.height >= minimumHeight, 'The picker meets the minimum control height')
 }
 
-async function verifySelectedOptionFits(control) {
+async function verifySelectedOptionFits(control, clearance = 0) {
   const { label, used, available, viewport } = await control.evaluate((select) => {
     const style = getComputedStyle(select)
     const context = document.createElement('canvas').getContext('2d')
@@ -102,7 +102,8 @@ async function verifySelectedOptionFits(control) {
       viewport: innerWidth,
     }
   })
-  assert(available >= used, `At ${viewport}px, the picker has ${available}px for “${label}”, which needs ${used}px`)
+  assert(available >= used + clearance,
+    `At ${viewport}px, the picker has ${available}px for “${label}”, which needs ${used}px plus ${clearance}px clearance`)
 }
 
 async function verifyControlRow(container, selector, height, sameRow = true) {
@@ -791,7 +792,7 @@ async function desktopJourney(page) {
   const moveDestination = move.getByLabel('Move destination')
   const defaultFolder = await moveDestination.inputValue()
   await moveDestination.selectOption(reviewFolder)
-  await verifySelectedOptionFits(moveDestination)
+  await verifySelectedOptionFits(moveDestination, 6)
   await verifyPaintedControlBorders(move, 'select, button', moveControls, 'desktop-move-picker-light')
   await moveDestination.selectOption(defaultFolder)
   assert.equal(await button(page, /Tuesday design handoff/).getAttribute('aria-current'), 'true')
@@ -990,7 +991,7 @@ async function phoneJourney(page) {
   const moveDestination = move.getByLabel('Move destination')
   const defaultFolder = await moveDestination.inputValue()
   await moveDestination.selectOption(reviewFolder)
-  await verifySelectedOptionFits(moveDestination)
+  await verifySelectedOptionFits(moveDestination, 6)
   await verifyPaintedControlBorders(move, 'select, button', [destination, moveButton], 'narrow-phone-move-picker-dark')
   await moveDestination.selectOption(defaultFolder)
   await button(actions, 'Mark junk').waitFor()
