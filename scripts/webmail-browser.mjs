@@ -312,6 +312,9 @@ async function verifyCalendarActions(page, height, label) {
 }
 
 async function verifyPaintedControlBorders(container, selector, controls, name, checkDisabledText = false) {
+  // Resolve any scrolling from a viewport change before sampling screenshot coordinates.
+  await container.scrollIntoViewIfNeeded()
+  await container.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
   const centers = await container.evaluate((group, selector) => {
     const box = group.getBoundingClientRect()
     const pixels = devicePixelRatio
