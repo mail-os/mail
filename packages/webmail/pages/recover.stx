@@ -106,7 +106,7 @@ onMount(checkLink)
 
   <section :if="mode === 'reset'">
     <h1>Choose a new password</h1>
-    <p class="login-sub">For <strong :text="account"></strong>. It replaces the password in webmail and in your mail apps, and signs out every session.</p>
+    <p class="login-sub">For <strong :text="account"></strong>. A password reset signs out your browsers and revokes your app passwords.</p>
     <form @submit.prevent="choosePassword()">
       <input type="text" :value="account" autocomplete="username" hidden readonly>
       <label for="newPassword">New password</label>

@@ -376,9 +376,11 @@ fn localIdentityAction(ctx: *cli.BaseCommand.ParseContext, comptime restore: boo
     defer db.deinit();
     if (restore) {
         const rebound = try identity.rebind(&db, ctx.allocator, mail_root);
+        try db.exec("DELETE FROM mail_client_passwords");
         printStdout("Rebound {d} verified message identities in the restored database.\n", .{rebound});
     } else {
         const result = try identity.capture(&db, ctx.allocator, mail_root);
+        try db.exec("DELETE FROM mail_client_passwords");
         printStdout("Recorded {d} message identities in the backup database ({d} unavailable).\n", .{ result.recorded, result.unavailable });
     }
 }

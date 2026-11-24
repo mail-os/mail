@@ -1911,6 +1911,29 @@ uses the same webmail session revocation path as password sign-in.
 
 Operators can inspect one managed mailbox with `mail user:local hosted-status <mailbox>` on the Mail host. The JSON report includes provisioning state, byte usage, the current UTC sending allowance, and outbound queue counts. Each successful report records a local audit entry. [Hosted mailbox diagnostics](docs/DEPLOYMENT_RUNBOOK.md#hosted-mailbox-diagnostics)
 
+### App passwords
+
+Open **Account → App passwords** in HTTPS webmail. Enter the app's name, choose
+the client type, and confirm your mailbox password. Copy the generated password
+when it appears, then use it with your mailbox address in that app.
+
+| Client type | Connections |
+| --- | --- |
+| Mail | IMAP and SMTP submission over TLS |
+| Calendars and contacts | CalDAV and CardDAV over HTTPS using Basic authentication |
+| Exchange | EWS and ActiveSync over HTTPS using Basic authentication |
+
+Revoke an app password from the same panel. Other app passwords remain
+usable. Changing the mailbox password or address, disabling the mailbox,
+or removing it revokes all its app passwords. App passwords carry the same
+hosted storage and sending limits as normal client authentication. They
+cannot sign in to webmail or verify account changes.
+
+The store keeps a digest and a label for each app password. Creation and
+revocation write to the account audit log. Local backup capture and restore
+clear app passwords from the database copy, so an older backup cannot restore
+a revoked credential. Create new app passwords after restoring a host.
+
 ### Limits across mail clients
 
 - Storage counts stored message bytes in the mailbox's Maildir, including

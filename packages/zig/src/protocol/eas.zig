@@ -24,6 +24,7 @@ const fs_compat = @import("../core/fs_compat.zig");
 const io_compat = @import("../core/io_compat.zig");
 const maildir_path = @import("../core/maildir_path.zig");
 const time_compat = @import("../core/time_compat.zig");
+const client_passwords = @import("../storage/client_passwords.zig");
 
 /// Exchange ActiveSync command handlers (MS-ASCMD), transport-agnostic.
 ///
@@ -58,6 +59,7 @@ pub const Context = struct {
     device_id: []const u8,
     protocol_version: u8 = 141,
     hosted: bool = false,
+    client_password_id: ?i64 = null,
     mail_config: ?*const config.Config = null,
     scanner: ?*clamav.ClamAVScanner = null,
     send_format: SendFormat = .wbxml,
@@ -1655,6 +1657,9 @@ fn handlePing(ctx: *Context, account: sync_state.Account, body: []const u8) !Res
         return pingResponse(ctx, page, 8, &.{})) orelse return pingResponse(ctx, page, 3, &.{});
     var remaining = settings.heartbeat;
     while (true) {
+        if (ctx.client_password_id) |id| {
+            if (!(client_passwords.active(ctx.db, id) catch false)) return .{ .status = 401 };
+        }
         var changed: [max_ping_folders][]const u8 = undefined;
         var count: usize = 0;
         for (settings.folders) |id| {
@@ -1674,7 +1679,12 @@ fn handlePing(ctx: *Context, account: sync_state.Account, body: []const u8) !Res
         if (count != 0) return pingResponse(ctx, page, 2, changed[0..count]);
         if (remaining == 0) return pingResponse(ctx, page, 1, &.{});
         const delay: u64 = @min(remaining, PING_INTERVAL_S);
-        time_compat.sleep(delay * std.time.ns_per_s);
+        if (ctx.client_password_id) |id| {
+            for (0..delay) |_| {
+                time_compat.sleep(std.time.ns_per_s);
+                if (!(client_passwords.active(ctx.db, id) catch false)) return .{ .status = 401 };
+            }
+        } else time_compat.sleep(delay * std.time.ns_per_s);
         remaining -= delay;
     }
 }

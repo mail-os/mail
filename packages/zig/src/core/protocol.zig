@@ -21,6 +21,7 @@ const tls = @import("tls");
 const aliases = @import("../delivery/aliases.zig");
 const routing = @import("../delivery/local_routing.zig");
 const database = @import("../storage/database.zig");
+const client_passwords = @import("../storage/client_passwords.zig");
 const maildir_path = @import("maildir_path.zig");
 const submission_headers = @import("../message/submission.zig");
 const smtp_sent = @import("../message/smtp_sent.zig");
@@ -1061,6 +1062,7 @@ pub const Session = struct {
     rcpt_to: std.ArrayList([]u8),
     authenticated: bool,
     authenticated_username: ?[]const u8 = null,
+    client_password_id: ?i64 = null,
     submission: bool = false,
     message_quota_charged: bool = false,
     client_hostname: ?[]u8,
@@ -1293,6 +1295,10 @@ pub const Session = struct {
     }
 
     fn processCommand(self: *Session, writer: anytype, line: []const u8) !bool {
+        if (!self.clientPasswordActive()) {
+            try self.sendResponse(writer, 421, "4.7.0 App password is no longer available", null);
+            return true;
+        }
         // Per-connection command rate limiting (max 50 commands per 10 seconds)
         const now = time_compat.timestamp();
         if (now - self.command_window_start >= 10) {
@@ -1332,6 +1338,12 @@ pub const Session = struct {
         }
 
         return false;
+    }
+
+    fn clientPasswordActive(self: *Session) bool {
+        const id = self.client_password_id orelse return true;
+        const backend = self.auth_backend orelse return false;
+        return client_passwords.active(backend.db, id) catch false;
     }
 
     fn parseCommand(self: *Session, line: []const u8) SMTPCommand {
@@ -2480,20 +2492,21 @@ pub const Session = struct {
             return;
         };
 
-        const valid = backend.verifyCredentialsForPeer(self.remote_addr, username, password) catch {
+        const authenticated = backend.authenticateClient(self.allocator, self.remote_addr, username, password, if (self.conn_wrapper.using_tls) .mail else null) catch {
             try self.sendResponse(writer, 454, "Temporary authentication failure", null);
             return;
         };
 
         const safe_user = sanitizeForLog(username);
-        if (valid) {
-            const identity = try backend.canonicalUsername(username, self.allocator);
+        if (authenticated) |account| {
+            const identity = account.username;
             maildir_path.validate(identity) catch |err| {
                 self.allocator.free(identity);
                 return err;
             };
             if (self.authenticated_username) |old| self.allocator.free(old);
             self.authenticated_username = identity;
+            self.client_password_id = account.credential_id;
             self.rate_limiter.finishAuthSuccess(self.remote_addr, attempt);
             self.authenticated = true;
             self.state = .Authenticated;
@@ -2540,6 +2553,7 @@ pub const Session = struct {
         self.authenticated = false;
         if (self.authenticated_username) |identity| self.allocator.free(identity);
         self.authenticated_username = null;
+        self.client_password_id = null;
         if (self.client_hostname) |hostname| self.allocator.free(hostname);
         self.client_hostname = null;
         self.conn_wrapper.read_buf_start = 0;
@@ -2709,6 +2723,10 @@ pub const Session = struct {
                 self.resetTransactionState();
                 return false;
             }
+        }
+        if (!self.clientPasswordActive()) {
+            try self.sendResponse(writer, 421, "4.7.0 App password is no longer available", null);
+            return error.ClientPasswordRevoked;
         }
         self.saveMessage(message.items, to_junk, verified_author, sent) catch |err| {
             try self.sendSaveError(writer, err);

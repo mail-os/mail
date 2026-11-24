@@ -13,6 +13,7 @@ import { useAttachments } from './use-attachments'
 import { useDraftAutosave } from './use-draft-autosave'
 import { useRecipientEditor } from './use-recipient-editor'
 import { useRecoverySettings } from './use-recovery-settings'
+import { useClientPasswords } from './use-client-passwords'
 import { useForwarding } from './use-forwarding'
 import { useRetention } from './use-retention'
 import { useExternalSenders } from './use-external-senders'
@@ -249,6 +250,7 @@ export function useWebmail(ports: WebmailPorts) {
     snapshots.closeSnapshots()
     teamThreads.closeTeamThreads()
     assistantGrants.closeAssistant()
+    clientCredentials.closeClientPasswords()
     fileSharing.closeFileLinkManager()
     replyBatch.closeReplyBatch()
     contactBook.closeContacts()
@@ -346,6 +348,7 @@ export function useWebmail(ports: WebmailPorts) {
   const canOpenPrivate = derived(() => !linkedView && Boolean(selected()?.reference && selected()?.folder !== 'Drafts' && !senderReview.senderReviewOpen()))
 
   const recipientEditor = useRecipientEditor(value => api<Contact[]>(`/webmail/api/contacts?q=${encodeURIComponent(value)}`))
+  const clientCredentials = useClientPasswords(api)
   const recoverySettings = useRecoverySettings(api, () => user()?.username || '')
   const forwardingSettings = useForwarding(api)
   const retentionSettings = useRetention(api)
@@ -1836,6 +1839,7 @@ export function useWebmail(ports: WebmailPorts) {
     ports.nextTick(() => { if (!ports.password.current?.open) ports.password.current?.showModal() })
   }
   function closeAccountSettings(): void {
+    clientCredentials.closeClientPasswords()
     retentionSettings.clearRetention()
     settings.set(false)
   }
@@ -1961,6 +1965,7 @@ export function useWebmail(ports: WebmailPorts) {
     snapshots.closeSnapshots()
     teamThreads.closeTeamThreads()
     assistantGrants.closeAssistant()
+    clientCredentials.closeClientPasswords()
     fileSharing.clearFileLinkComposer()
     fileSharing.closeFileLinkManager()
     replyBatch.closeReplyBatch()
@@ -1974,7 +1979,7 @@ export function useWebmail(ports: WebmailPorts) {
     ...fileSharing, messageFileLinks, insertFileLink,
     ...replyBatch, replyToSelection, submitReplyBatch,
     invitationCalendar, invitationCalendarBusy, invitationDestination, chooseInvitationCalendar, saveInvitationCalendar,
-    showCollectionManager, closeCollectionManager, selectCollection, confirmCollectionDeletion, savePrivateLabel, setPrivateMembership, groupSelected, displaySubject, changeNotificationRule, ...recipientEditor, ...attachmentEditor, ...recoverySettings, ...forwardingSettings, ...retentionSettings, ...externalSenderSettings, ...vacationSettings, ...writing, snippetChoice, signatureChoice, insertSnippet, insertSignature, attentionViews, attentionView, followUpFocused, attentionSaving, attentionSchedule, attentionDate, attentionZone, dueReminders, replyContext, clearFollowUp, selectAttention, nextFollowUp, changeAttention, startAttentionSchedule, saveAttentionSchedule, deadlineLabel, categoryList, newsletterExpanded, readerExpanded, receiptFull, receiptCompact, receiptPreview, senderLabel, sortingSettings, sortingSaving, sortingError, toggleAutomaticSorting, placementText, categoryRule, categoryRuleSaving, saveCategoryRule, showSenderReview, openReviewMessage, reviewMessage, refresh, loadMessages, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread, toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, openAttachmentMessage, showAttachmentLibrary, retryReader, closeReader, nextUnread, readSelection, advanceBatch, triageAndNext, bulkAction, selectedAction, undoLastAction, showShortcuts, closeShortcuts, handleShortcut, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments, saveSendPreference, send, confirmPendingSend, showOutbox, refreshOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, closeAccountSettings, changePassword, showConfirmation, confirmAction, saveDraftCopy: draft.saveCopy, mount, resume, tick, preventUnload, destroy, messageIdentity, messagePageSize, folderName, shortDate, fullDate, readableBytes, attachmentPath }
+    showCollectionManager, closeCollectionManager, selectCollection, confirmCollectionDeletion, savePrivateLabel, setPrivateMembership, groupSelected, displaySubject, changeNotificationRule, ...recipientEditor, ...attachmentEditor, ...recoverySettings, ...clientCredentials, ...forwardingSettings, ...retentionSettings, ...externalSenderSettings, ...vacationSettings, ...writing, snippetChoice, signatureChoice, insertSnippet, insertSignature, attentionViews, attentionView, followUpFocused, attentionSaving, attentionSchedule, attentionDate, attentionZone, dueReminders, replyContext, clearFollowUp, selectAttention, nextFollowUp, changeAttention, startAttentionSchedule, saveAttentionSchedule, deadlineLabel, categoryList, newsletterExpanded, readerExpanded, receiptFull, receiptCompact, receiptPreview, senderLabel, sortingSettings, sortingSaving, sortingError, toggleAutomaticSorting, placementText, categoryRule, categoryRuleSaving, saveCategoryRule, showSenderReview, openReviewMessage, reviewMessage, refresh, loadMessages, selectFolder, search, clearSearch, changeConversationView, turnPage, toggleThread, toggleSelection, toggleAll, toggleThreadSelection, threadChecked, threadPartial, clearSelection, openListMessage, openAttachmentMessage, showAttachmentLibrary, retryReader, closeReader, nextUnread, readSelection, advanceBatch, triageAndNext, bulkAction, selectedAction, undoLastAction, showShortcuts, closeShortcuts, handleShortcut, compose, closeComposer, editDraft, saveDraft, attachFiles, dropAttachments, saveSendPreference, send, confirmPendingSend, showOutbox, refreshOutbox, selectOutboxView, turnOutboxPage, cancelSend, retryOutbox, leaveAccount, leavingAccount, accountChangeError, showSettings, closeAccountSettings, changePassword, showConfirmation, confirmAction, saveDraftCopy: draft.saveCopy, mount, resume, tick, preventUnload, destroy, messageIdentity, messagePageSize, folderName, shortDate, fullDate, readableBytes, attachmentPath }
 }
 
 function errorMessage(cause: unknown): string { return cause instanceof Error ? cause.message : 'Something went wrong. Please try again.' }

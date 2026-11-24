@@ -23,6 +23,7 @@ const sent_replies = @import("../delivery/smtp_sent_replies.zig");
 const durable_maildir = @import("../core/durable_maildir.zig");
 const fs_compat = @import("../core/fs_compat.zig");
 const database = @import("../storage/database.zig");
+const client_passwords = @import("../storage/client_passwords.zig");
 const typesense = @import("../search/typesense.zig");
 const maildir_index = @import("../search/maildir_index.zig");
 
@@ -1212,6 +1213,7 @@ pub const ImapSession = struct {
     idle_tag: ?[]const u8 = null,
     mailbox_read_only: bool = false,
     auth_backend: *auth.AuthBackend,
+    client_password_id: ?i64 = null,
     db: ?*database.Database = null,
     // TLS support for encrypted responses
     tls_connection: ?*tls.nonblock.Connection = null,
@@ -1942,7 +1944,8 @@ pub const ImapSession = struct {
             .{ .fd = sock_fd, .events = std.c.POLL.IN, .revents = 0 },
             .{ .fd = wfd, .events = std.c.POLL.IN, .revents = 0 },
         };
-        const n = std.c.poll(&fds, 2, 60_000);
+        const timeout: c_int = if (self.client_password_id != null) 2_000 else 60_000;
+        const n = std.c.poll(&fds, 2, timeout);
         if (n <= 0) {
             // Timeout/EINTR: safety-net rescan in case an event was missed
             if (self.state == .selected) self.idlePollRescan();
@@ -1960,6 +1963,7 @@ pub const ImapSession = struct {
     /// rescan also only reports on count changes, so this is equivalent —
     /// minus the per-poll allocations and database traffic.
     fn idlePollRescan(self: *ImapSession) void {
+        if (!(self.checkClientPassword() catch false)) return;
         const count = self.currentMailboxEntryCount();
         if (self.idle_scan_count) |last| {
             if (count == last) return;
@@ -2126,6 +2130,7 @@ pub const ImapSession = struct {
             };
             return self.sendResponse(tag, "NO", response);
         };
+        if (!try self.checkClientPassword()) return;
 
         const local_part = username;
 
@@ -2698,7 +2703,7 @@ pub const ImapSession = struct {
         }
 
         // Validate credentials against auth backend
-        const valid = self.auth_backend.verifyCredentialsForPeer(self.connection.peerIp(), username, password) catch |err| {
+        const valid = self.authenticateClient(username, password) catch |err| {
             if (err == error.AuthenticationRateLimited)
                 std.log.warn("IMAP authentication rate-limited for {s}", .{self.connection.peerIp()})
             else
@@ -2713,12 +2718,6 @@ pub const ImapSession = struct {
             try self.sendResponse(tag, "NO", "LOGIN failed");
             return;
         }
-
-        // Store the canonical mailbox key (a registered full address stays a
-        // full address — a per-domain isolated mailbox; otherwise the local-part,
-        // keeping legacy single-namespace behaviour). The maildir is keyed by this.
-        self.username = try self.auth_backend.canonicalUsername(username, self.allocator);
-        self.state = .authenticated;
 
         std.log.info("Successful IMAP login for user: {s}", .{log_safe.account(&name_buf, username)});
         try self.sendResponse(tag, "OK", "LOGIN completed");
@@ -2774,7 +2773,7 @@ pub const ImapSession = struct {
             };
             defer @memset(password_buf[0..password.len], 0);
 
-            const valid = self.auth_backend.verifyCredentialsForPeer(self.connection.peerIp(), username, password) catch {
+            const valid = self.authenticateClient(username, password) catch {
                 try self.sendResponse(tag, "NO", "Authentication failed");
                 return;
             };
@@ -2785,11 +2784,6 @@ pub const ImapSession = struct {
                 return;
             }
 
-            self.username = self.auth_backend.canonicalUsername(username, self.allocator) catch {
-                try self.sendResponse(tag, "NO", "Internal error");
-                return;
-            };
-            self.state = .authenticated;
             std.log.info("Successful IMAP AUTH LOGIN for user: {s}", .{log_safe.account(&name_buf, username)});
             try self.sendResponse(tag, "OK", "AUTHENTICATE completed");
             return;
@@ -2828,7 +2822,7 @@ pub const ImapSession = struct {
         }
 
         // Verify credentials
-        const valid = self.auth_backend.verifyCredentialsForPeer(self.connection.peerIp(), credentials.username, credentials.password) catch {
+        const valid = self.authenticateClient(credentials.username, credentials.password) catch {
             try self.sendResponse(tag, "NO", "Authentication failed");
             return;
         };
@@ -2840,14 +2834,24 @@ pub const ImapSession = struct {
             return;
         }
 
-        self.username = self.auth_backend.canonicalUsername(credentials.username, self.allocator) catch {
-            try self.sendResponse(tag, "NO", "Internal error");
-            return;
-        };
-        self.state = .authenticated;
-
         std.log.info("Successful IMAP AUTHENTICATE for user: {s}", .{log_safe.account(&name_buf, credentials.username)});
         try self.sendResponse(tag, "OK", "AUTHENTICATE completed");
+    }
+
+    fn authenticateClient(self: *ImapSession, username: []const u8, password: []const u8) !bool {
+        const account = (try self.auth_backend.authenticateClient(self.allocator, self.connection.peerIp(), username, password, if (self.tls_connection != null) .mail else null)) orelse return false;
+        self.username = account.username;
+        self.client_password_id = account.credential_id;
+        self.state = .authenticated;
+        return true;
+    }
+
+    fn checkClientPassword(self: *ImapSession) !bool {
+        const id = self.client_password_id orelse return true;
+        if (client_passwords.active(self.auth_backend.db, id) catch false) return true;
+        self.state = .logout;
+        try self.sendUntagged("BYE App password is no longer available");
+        return false;
     }
 
     /// Handle SELECT command
@@ -3947,6 +3951,7 @@ pub const ImapSession = struct {
 
     /// Process a single command
     pub fn processCommand(self: *ImapSession, line: []const u8) !void {
+        if (!try self.checkClientPassword()) return;
         const hosted = if (self.username) |user| try self.auth_backend.db.hostedLimits(user) else null;
         const access = if (hosted) |limits| limits.accessAt(time_compat.timestamp()) else .full;
         if (!access.readable()) {
@@ -4677,6 +4682,7 @@ pub const ImapServer = struct {
                     session.finalizeAppend() catch |err| {
                         logger.err("IMAP APPEND finalize error: {}", .{err});
                     };
+                    if (session.state == .logout) break;
                     // Skip trailing \r\n after literal data
                     if (processed + 2 <= input.len and input[processed] == '\r' and input[processed + 1] == '\n') {
                         processed += 2;
@@ -4811,6 +4817,7 @@ pub const ImapServer = struct {
         var buffered = ciphertext_len > 0;
 
         while (session.state != .logout) {
+            if (session.idle_mode and !(session.checkClientPassword() catch false)) break;
             if (!buffered) {
                 // During IDLE: set a short socket timeout so we can poll for new mail
                 if (session.idle_mode) {

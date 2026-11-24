@@ -80,6 +80,9 @@ const {
   externalSender, externalSendReview, cancelExternalReview,
   savingDraft, draftError, draftConflict, sendDelay, sendDelayOptions, scheduleOpen, scheduleDate, scheduleZone, chooseSendTime, settings, currentPassword, newPassword,
   confirmPassword, passwordError, savingPassword, confirmation, confirming, limits,
+  clientPasswordsOpen, canCreateClientPassword, clientPasswords, clientPasswordName, clientPasswordType, clientMailboxPassword,
+  createdClientPassword, revokingClientPassword, clientPasswordsBusy, clientPasswordsError, clientPasswordsNotice,
+  clientPasswordTypes, clientPasswordTypeLabel, toggleClientPasswords, createClientPassword, revokeClientPassword, copyClientPassword,
   recoveryAddress, recoverySetBy, recoveryInput, recoveryPassword, recoveryError, recoveryNotice, recoveryLoading,
   savingRecovery, saveRecovery,
   forwarding, forwardingAddress, forwardingPassword, forwardingCode, forwardingBusy, forwardingError, forwardingNotice, changeForwarding,
@@ -853,7 +856,46 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
     </div>
   </div>
 </section>
-<form class="login-recovery" @submit.prevent="changePassword()"><h2><span class="mail-icon" data-icon="shield" aria-hidden="true"></span>Change password</h2><p class="login-sub">Updates your webmail, SMTP and IMAP credentials.</p><label for="currentPassword">Current password</label><input id="currentPassword" type="password" x-model="currentPassword" autocomplete="current-password" required><label for="newPassword">New password</label><input id="newPassword" type="password" x-model="newPassword" autocomplete="new-password" minlength="12" required><label for="confirmPassword">Confirm password</label><input id="confirmPassword" type="password" x-model="confirmPassword" autocomplete="new-password" minlength="12" required><p :if="passwordError" role="alert" class="login-error" :text="passwordError"></p><button type="submit" :disabled="savingPassword" :text="savingPassword ? 'Saving…' : 'Change password'"></button></form>
+<form class="login-recovery" @submit.prevent="changePassword()"><h2><span class="mail-icon" data-icon="shield" aria-hidden="true"></span>Change password</h2><p class="login-sub">Changing your mailbox password also revokes app passwords.</p><label for="currentPassword">Current password</label><input id="currentPassword" type="password" x-model="currentPassword" autocomplete="current-password" required><label for="newPassword">New password</label><input id="newPassword" type="password" x-model="newPassword" autocomplete="new-password" minlength="12" required><label for="confirmPassword">Confirm password</label><input id="confirmPassword" type="password" x-model="confirmPassword" autocomplete="new-password" minlength="12" required><p :if="passwordError" role="alert" class="login-error" :text="passwordError"></p><button type="submit" :disabled="savingPassword" :text="savingPassword ? 'Saving…' : 'Change password'"></button></form>
+<section class="login-recovery wm-client-passwords" aria-labelledby="clientPasswordsHeading">
+  <h2 id="clientPasswordsHeading"><span class="mail-icon" data-icon="shield" aria-hidden="true"></span>App passwords</h2>
+  <button type="button" class="wm-action login-secondary" :aria-expanded="clientPasswordsOpen" aria-controls="client-passwords" @click="toggleClientPasswords()" :text="clientPasswordsOpen ? 'Hide app passwords' : 'Manage app passwords'"></button>
+  <div id="client-passwords" :if="clientPasswordsOpen">
+    <p :if="clientPasswordsError" class="login-error" role="alert" :text="clientPasswordsError"></p>
+    <p :if="clientPasswordsNotice" class="login-sub" role="status" :text="clientPasswordsNotice"></p>
+    <p :if="clientPasswordsBusy && !clientPasswords.length" class="login-sub" role="status">Loading…</p>
+    <ul :if="clientPasswords.length" class="wm-snapshot-links" aria-label="Active app passwords">
+      <li :for="entry in clientPasswords" :key="entry.id">
+        <div><strong :text="entry.label"></strong><p class="wm-snapshot-muted" :text="clientPasswordTypeLabel(entry.scope)"></p></div>
+        <button type="button" class="wm-action wm-action--danger" @click="revokingClientPassword.set(entry)" :disabled="clientPasswordsBusy || revokingClientPassword" :aria-label="'Revoke ' + entry.label">Revoke</button>
+      </li>
+    </ul>
+    <div :if="revokingClientPassword" class="wm-snapshot-confirm" role="group" aria-label="Confirm app password revocation">
+      <p :text="'Revoke the app password for ' + revokingClientPassword.label + '?'"></p>
+      <button type="button" class="wm-action wm-action--danger" @click="revokeClientPassword()" :disabled="clientPasswordsBusy">Revoke app password</button>
+      <button type="button" class="wm-action" @click="revokingClientPassword.set(null)" :disabled="clientPasswordsBusy">Cancel</button>
+    </div>
+    <div :if="createdClientPassword" class="wm-client-password-result">
+      <label for="issuedClientPassword">Your app password</label>
+      <p id="clientPasswordInstructions" class="login-sub">Use this password in your app. It’s shown only once.</p>
+      <input id="issuedClientPassword" type="text" :value="createdClientPassword.password" readonly autocomplete="off" spellcheck="false" aria-describedby="clientPasswordInstructions">
+      <button type="button" class="wm-action" @click="copyClientPassword()">Copy app password</button>
+      <button type="button" class="wm-action" @click="createdClientPassword.set(null)">Done</button>
+    </div>
+    <p :if="!canCreateClientPassword && !clientPasswordsBusy && !clientPasswordsError" class="login-sub">Creating app passwords requires HTTPS and full mailbox access.</p>
+    <form :if="canCreateClientPassword && !createdClientPassword && !revokingClientPassword" @submit.prevent="createClientPassword()">
+      <label for="clientPasswordName">App name</label>
+      <input id="clientPasswordName" x-model.trim="clientPasswordName" autocomplete="off" maxlength="80" required>
+      <label for="clientPasswordType">Client type</label>
+      <select id="clientPasswordType" :value="clientPasswordType" @change="clientPasswordType.set($event.target.value)">
+        <option :for="type in clientPasswordTypes" :value="type.id" :text="type.label"></option>
+      </select>
+      <label for="clientMailboxPassword">Mailbox password</label>
+      <input id="clientMailboxPassword" type="password" x-model="clientMailboxPassword" autocomplete="current-password" required>
+      <button type="submit" :disabled="clientPasswordsBusy">Create app password</button>
+    </form>
+  </div>
+</section>
 <form class="login-recovery" aria-labelledby="recoveryHeading" @submit.prevent="saveRecovery()"><h2 id="recoveryHeading"><span class="mail-icon" data-icon="mail" aria-hidden="true"></span>Recovery address</h2><p class="login-sub" :if="recoveryLoading">Loading…</p><p class="login-sub" :if="!recoveryLoading && recoveryAddress">Password reset links go to <strong :text="recoveryAddress"></strong><span :if="recoverySetBy === 'operator'"> (set by your mail administrator)</span>.</p><p class="login-sub" :if="!recoveryLoading && !recoveryAddress">None set. Without one, a forgotten password can only be reset by your mail administrator.</p><label for="recoveryInput">Recovery email</label><input id="recoveryInput" type="email" x-model.trim="recoveryInput" autocomplete="email" placeholder="you@another-provider.com"><label for="recoveryPassword">Current password</label><input id="recoveryPassword" type="password" x-model="recoveryPassword" autocomplete="current-password"><p :if="recoveryError" role="alert" class="login-error" :text="recoveryError"></p><p :if="recoveryNotice" role="status" class="login-sub" :text="recoveryNotice"></p><button type="submit" class="login-secondary" :disabled="savingRecovery || recoveryLoading" :text="savingRecovery ? 'Saving…' : 'Save recovery address'"></button></form>
 <section class="login-recovery wm-forwarding" aria-labelledby="forwardingHeading">
   <h2 id="forwardingHeading"><span class="mail-icon" data-icon="forward" aria-hidden="true"></span>Forwarding</h2>

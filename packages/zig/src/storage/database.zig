@@ -1133,6 +1133,7 @@ pub const Database = struct {
         );
         try self.exec(@import("webmail_account_links.zig").schema);
         try self.exec(@import("hosted_sign_in.zig").schema);
+        try self.exec(@import("client_passwords.zig").schema);
         try self.initAuditTable();
         try self.exec(team_store.schema);
         try self.exec(shared_inbox.schema);

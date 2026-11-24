@@ -2,6 +2,7 @@ const std = @import("std");
 const io_compat = @import("../core/io_compat.zig");
 const posix = std.posix;
 const database = @import("../storage/database.zig");
+const client_passwords = @import("../storage/client_passwords.zig");
 const password_mod = @import("password.zig");
 const security = @import("security.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -39,6 +40,11 @@ pub fn constantTimeEql(a: []const u8, b: []const u8) bool {
 pub const Credentials = struct {
     username: []const u8,
     password: []const u8,
+};
+
+pub const ClientIdentity = struct {
+    username: []const u8,
+    credential_id: ?i64 = null,
 };
 
 /// HTTP Digest Authentication parameters (RFC 7616)
@@ -351,6 +357,40 @@ pub const AuthBackend = struct {
         return valid;
     }
 
+    /// The transport supplies a client scope only on a TLS connection.
+    pub fn authenticateClient(self: *AuthBackend, allocator: std.mem.Allocator, peer: []const u8, username: []const u8, password: []const u8, scope: ?client_passwords.Scope) !?ClientIdentity {
+        const attempt = try self.reserveLogin(peer);
+        const result = try self.authenticateClientIdentity(allocator, username, password, scope);
+        if (result != null) self.login_limiter.finishAuthSuccess(peer, attempt);
+        return result;
+    }
+
+    fn authenticateClientIdentity(self: *AuthBackend, allocator: std.mem.Allocator, username: []const u8, password: []const u8, scope: ?client_passwords.Scope) !?ClientIdentity {
+        const identity = try self.canonicalUsername(username, allocator);
+        errdefer allocator.free(identity);
+        const credential_id = if (scope) |allowed| try client_passwords.authenticate(self.db, identity, password, allowed) else null;
+        if (credential_id == null and !try self.verifyMailboxPassword(identity, password)) {
+            allocator.free(identity);
+            return null;
+        }
+        return .{ .username = identity, .credential_id = credential_id };
+    }
+
+    pub fn verifyClientBasicAuth(self: *AuthBackend, peer: []const u8, header: []const u8, scope: client_passwords.Scope) !?ClientIdentity {
+        const attempt = try self.reserveLogin(peer);
+        if (!std.mem.startsWith(u8, header, "Basic ")) return null;
+        const encoded = std.mem.trimStart(u8, header["Basic ".len..], " ");
+        const credentials = try decodeBasicAuthCredentials(self.allocator, encoded);
+        defer self.allocator.free(credentials.username);
+        defer {
+            std.crypto.secureZero(u8, @constCast(credentials.password));
+            self.allocator.free(credentials.password);
+        }
+        const result = try self.authenticateClientIdentity(self.allocator, credentials.username, credentials.password, scope);
+        if (result != null) self.login_limiter.finishAuthSuccess(peer, attempt);
+        return result;
+    }
+
     pub fn verifyBasicAuthForPeer(self: *AuthBackend, peer: []const u8, header: []const u8) !?[]const u8 {
         const attempt = try self.reserveLogin(peer);
         const username = try self.verifyBasicAuth(header);
@@ -372,7 +412,10 @@ pub const AuthBackend = struct {
     pub fn verifyCredentials(self: *AuthBackend, username: []const u8, password: []const u8) !bool {
         const normalized_username = try self.canonicalUsername(username, self.allocator);
         defer self.allocator.free(normalized_username);
+        return self.verifyMailboxPassword(normalized_username, password);
+    }
 
+    fn verifyMailboxPassword(self: *AuthBackend, normalized_username: []const u8, password: []const u8) !bool {
         // Get user from database
         var user = self.db.getUserByUsername(normalized_username) catch |err| {
             if (err == database.DatabaseError.NotFound) {

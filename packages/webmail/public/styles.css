@@ -1147,6 +1147,10 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-account-settings h2 .mail-icon { color: var(--accent); }
 .wm-account-settings .login-sub { margin-bottom: 12px; }
 .wm-account-settings button { width: auto; margin-top: 12px; padding: 7px 10px; font-size: 12px; }
+.wm-client-passwords #client-passwords { display: grid; gap: 10px; margin-top: 12px; }
+.wm-client-passwords select { width: 100%; }
+.wm-client-passwords :is(.wm-snapshot-links, .wm-snapshot-confirm) button { margin-top: 0; }
+.wm-client-password-result input { font-family: ui-monospace, monospace; }
 .wm-writing-settings { grid-column: 1 / -1; }
 .wm-writing-settings h2 { display: flex; gap: 6px; align-items: center; margin-bottom: 10px; }
 .wm-writing-settings h2 .mail-icon { color: var(--accent); }

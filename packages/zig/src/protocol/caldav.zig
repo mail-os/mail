@@ -19,6 +19,7 @@ const eas = @import("eas.zig");
 const ews = @import("ews/ews.zig");
 const core_config = @import("../core/config.zig");
 const database = @import("../storage/database.zig");
+const client_passwords = @import("../storage/client_passwords.zig");
 
 /// Get the current epoch timestamp in seconds.
 fn currentTimestamp() i64 {
@@ -582,6 +583,8 @@ pub const CalDavSession = struct {
     request_buf: std.ArrayList(u8) = .empty,
     username: ?[]const u8 = null,
     authenticated: bool = false,
+    client_password_id: ?i64 = null,
+    client_password_scope: client_passwords.Scope = .dav,
     auth_backend: *auth.AuthBackend,
     store: *caldav_store.CalDavStore,
 
@@ -691,6 +694,17 @@ pub const CalDavSession = struct {
             return true;
         }
 
+        const active_sync = std.mem.startsWith(u8, path, "/Microsoft-Server-ActiveSync");
+        const autodiscover = std.mem.startsWith(u8, path, "/autodiscover/") or std.mem.startsWith(u8, path, "/Autodiscover/");
+        const exchange_web_services = std.mem.startsWith(u8, path, "/EWS/") or std.mem.startsWith(u8, path, "/ews/");
+        const scope: client_passwords.Scope = if (active_sync or autodiscover or exchange_web_services) .exchange else .dav;
+        if (self.client_password_id) |id| {
+            if (self.client_password_scope != scope or !(client_passwords.active(self.auth_backend.db, id) catch false)) {
+                try self.sendAuthRequired(false);
+                return true;
+            }
+        }
+
         // Check authentication (Digest or Basic Auth)
         if (!self.authenticated) {
             var auth_header: ?[]const u8 = null;
@@ -732,10 +746,22 @@ pub const CalDavSession = struct {
 
             // Fall back to Basic auth if Digest didn't work
             if (validated_username == null and std.mem.startsWith(u8, auth_header.?, "Basic ")) {
-                validated_username = self.auth_backend.verifyBasicAuthForPeer(self.connection.peerIp(), auth_header.?) catch |err| blk: {
-                    logger.err("CalDAV Basic authentication error: {}", .{err});
-                    break :blk null;
-                };
+                if (self.tls_conn != null) {
+                    const identity = self.auth_backend.verifyClientBasicAuth(self.connection.peerIp(), auth_header.?, scope) catch |err| blk: {
+                        logger.err("CalDAV Basic authentication error: {}", .{err});
+                        break :blk null;
+                    };
+                    if (identity) |account| {
+                        validated_username = account.username;
+                        self.client_password_id = account.credential_id;
+                        self.client_password_scope = scope;
+                    }
+                } else {
+                    validated_username = self.auth_backend.verifyBasicAuthForPeer(self.connection.peerIp(), auth_header.?) catch |err| blk: {
+                        logger.err("CalDAV Basic authentication error: {}", .{err});
+                        break :blk null;
+                    };
+                }
             }
 
             if (validated_username) |username| {
@@ -750,19 +776,19 @@ pub const CalDavSession = struct {
         }
 
         // Authenticated Exchange web services.
-        if (method == .post and std.mem.startsWith(u8, path, "/Microsoft-Server-ActiveSync")) {
-            const wr = try webActiveSync(self.allocator, config, self.auth_backend.db, self.store, self.username, path, request);
+        if (method == .post and active_sync) {
+            const wr = try webActiveSync(self.allocator, config, self.auth_backend.db, self.store, self.username, self.client_password_id, path, request);
             defer if (wr.body.len > 0) self.allocator.free(wr.body);
             try self.sendWeb(wr);
             return true;
         }
-        if (method == .post and (std.mem.startsWith(u8, path, "/autodiscover/") or std.mem.startsWith(u8, path, "/Autodiscover/"))) {
+        if (method == .post and autodiscover) {
             const wr = try webAutodiscover(self.allocator, config, self.username, request);
             defer if (wr.body.len > 0) self.allocator.free(wr.body);
             try self.sendWeb(wr);
             return true;
         }
-        if (method == .post and (std.mem.startsWith(u8, path, "/EWS/") or std.mem.startsWith(u8, path, "/ews/"))) {
+        if (method == .post and exchange_web_services) {
             const wr = try webEws(self.allocator, config, self.username, self.store, self.auth_backend.db, request);
             defer if (wr.body.len > 0) self.allocator.free(wr.body);
             try self.sendWeb(wr);
@@ -2032,7 +2058,7 @@ fn webEws(allocator: std.mem.Allocator, config: *const CalDavConfig, username: ?
 }
 
 /// Exchange ActiveSync dispatch shared by HTTP and HTTPS.
-fn webActiveSync(allocator: std.mem.Allocator, config: *const CalDavConfig, db: *database.Database, store: *caldav_store.CalDavStore, username: ?[]const u8, path: []const u8, request: []const u8) !WebResponse {
+fn webActiveSync(allocator: std.mem.Allocator, config: *const CalDavConfig, db: *database.Database, store: *caldav_store.CalDavStore, username: ?[]const u8, client_password_id: ?i64, path: []const u8, request: []const u8) !WebResponse {
     const user = username orelse return .{ .status = 401 };
     const query_start = std.mem.indexOfScalar(u8, path, '?') orelse return .{ .status = 400 };
     const query = path[query_start + 1 ..];
@@ -2075,6 +2101,7 @@ fn webActiveSync(allocator: std.mem.Allocator, config: *const CalDavConfig, db: 
         .device_id = params.device_id,
         .protocol_version = params.version,
         .hosted = managed,
+        .client_password_id = client_password_id,
         .mail_config = config.mail_config,
         .scanner = config.scanner,
         .send_format = switch (params.version) {
