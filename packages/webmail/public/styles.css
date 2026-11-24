@@ -616,7 +616,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   padding-inline: 0;
 }
 .calendar-jump:hover { background-color: var(--surface); }
-.calendar-jump:focus-within:not(:has(.calendar-jump-picker:focus)) { outline: 2px solid var(--accent); outline-offset: 2px; }
+.calendar-jump:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
 .calendar-jump input {
   display: block;
   inline-size: 100%;
@@ -651,8 +651,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   /* Cover the native affordance in engines without a picker pseudo-element. */
   .calendar-jump-picker { background-color: inherit; }
 }
-.calendar-jump-picker:hover { color: var(--accent); }
-.calendar-jump-picker:focus-visible { outline-offset: -2px; }
+.calendar-jump-picker:hover, .calendar-jump-picker:focus-visible { color: var(--accent); }
+.calendar-jump-picker:focus-visible { outline: 0; }
 .calendar-jump-picker .mail-icon { inline-size: var(--picker-icon-size); block-size: var(--picker-icon-size); }
 @media (forced-colors: active) {
   .calendar-jump input { padding-inline-end: var(--control-inline-padding); }
@@ -1401,8 +1401,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-tool--danger:hover { color: var(--danger); }
 .wm-tool-move { gap: 6px; padding-inline-end: 0; border-inline-end: 0; }
 .wm-message-toolbar .wm-tool-move .wm-tool { border: 1px solid var(--control-border); background: var(--panel); }
-.wm-message-toolbar .wm-tool-move .wm-tool:hover:not(:disabled) { background: var(--toolbar); }
-.wm-tool-move select { inline-size: 110px; }
+.wm-message-toolbar .wm-tool-move .wm-tool:hover:not(:disabled) { background: var(--surface); }
+.wm-tool-move select { min-inline-size: 110px; max-inline-size: 10rem; }
 .wm-read-body > :not(.wm-read-toolbar) { max-width: 760px; margin-inline: auto; }
 .wm-message-paper {
   padding: 0 0 16px;
@@ -1529,6 +1529,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-message-toolbar::after { content: ''; flex-basis: 100%; height: 0; }
   .wm-message-toolbar > :is(.wm-action, .wm-tool-move) { order: 1; }
   .wm-message-toolbar .wm-tool-move { gap: 6px; }
+  .wm-tool-move select { max-inline-size: 9rem; }
   .wm-read :is(h2, button, select, summary, a):focus-visible { scroll-margin-top: 158px; }
   .wm-read-body { --reader-gutter: 16px; padding-bottom: 24px; }
   .wm-back { display: inline-flex; position: sticky; top: 0; z-index: 2; align-self: stretch; flex-shrink: 0; gap: 6px; align-items: center; min-height: 44px; margin: 0; padding-inline: 14px; background: var(--panel); text-align: start; }
@@ -1550,7 +1551,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-brand > span:last-child { display: none; }
   .wm-list-head:has(.wm-list-next-unread) { gap: 8px; }
   .wm-list-next-unread { flex: 0 0 var(--control-height); justify-content: center; padding-inline: 0; }
-  .wm-tool-trash { order: 1; margin-inline-start: 0; }
+  .wm-message-toolbar { column-gap: 2px; }
+  .wm-tool-trash { margin-inline-start: 0; }
   .wm-next-unread-label { display: none; }
 }
 @media (370px < width <= 490px) {

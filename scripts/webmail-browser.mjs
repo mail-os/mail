@@ -5,10 +5,10 @@ import { join } from 'node:path'
 import { chromium, firefox, webkit } from 'playwright'
 
 const { MAIL_BROWSER_URL: url, MAIL_BROWSER_OWNER: owner, MAIL_BROWSER_SENDER: sender, MAIL_BROWSER_PASSWORD: password, MAIL_BROWSER_DAY: day, MAIL_BROWSER_CERT: certificate } = process.env
-const { MAIL_BROWSER_NEWCOMER: newcomer, MAIL_BROWSER_LONG_FOLDER: longFolder } = process.env
+const { MAIL_BROWSER_NEWCOMER: newcomer, MAIL_BROWSER_LONG_FOLDER: longFolder, MAIL_BROWSER_REVIEW_FOLDER: reviewFolder } = process.env
 const [engine, output] = process.argv.slice(2)
 const engines = { chromium, firefox, webkit }
-assert(Object.hasOwn(engines, engine) && output && url && owner && sender && password && day && certificate && newcomer && longFolder, 'Run through test-webmail-browser.py')
+assert(Object.hasOwn(engines, engine) && output && url && owner && sender && password && day && certificate && newcomer && longFolder && reviewFolder, 'Run through test-webmail-browser.py')
 assert.match(url, /^https:\/\/127\.0\.0\.1:\d+$/, 'Browser tests require a disposable loopback HTTPS server')
 
 const launchOptions = {}
@@ -421,10 +421,23 @@ async function verifyDateTextAlignment(page, capture, date) {
 async function verifyCalendarPicker(page) {
   const date = page.getByLabel('Jump to date', { exact: true })
   const picker = button(page, 'Open date picker')
+  const shell = page.locator('.calendar-jump')
+  const focusRing = (field) => {
+    const style = getComputedStyle(field)
+    return { color: style.outlineColor, style: style.outlineStyle, width: style.outlineWidth, offset: style.outlineOffset }
+  }
   await button(page, 'Next period').press('Tab')
   assert(await date.evaluate(input => input.matches(':focus-visible') || input.contains(document.activeElement)), 'The date editor is reachable by keyboard')
-  assert.equal(await page.locator('.calendar-jump').evaluate(field => getComputedStyle(field).outlineWidth), '2px',
-    'Keyboard focus outlines the full date control')
+  const dateFocusRing = await shell.evaluate(focusRing)
+  assert.equal(dateFocusRing.style, 'solid')
+  assert.equal(dateFocusRing.width, '2px', 'Keyboard focus outlines the full date control')
+  await picker.focus()
+  assert.deepEqual(await shell.evaluate(focusRing), dateFocusRing, 'The picker uses the same outline as the date editor')
+  assert.equal(await picker.evaluate(node => getComputedStyle(node).outlineWidth), '0px', 'The picker has no second outline inside the field')
+  const period = page.getByRole('group', { name: 'Change date range' })
+  const selector = '.calendar-period-buttons button, .calendar-jump'
+  await verifyPaintedControlBorders(page.locator('.calendar-view-toolbar'), selector,
+    await verifyControlRow(period, selector, 36), 'desktop-calendar-picker-focus')
   await date.evaluate((input) => {
     const showPicker = input.showPicker
     input.showPicker = function () {
@@ -773,7 +786,14 @@ async function desktopJourney(page) {
   await button(page, /Tuesday design handoff/).click()
   await heading(page, handoff).waitFor()
   const move = page.getByRole('group', { name: 'Move message', exact: true })
-  verifyControlGaps(await verifyControlRow(move, 'select, button', 36), 6)
+  const moveControls = await verifyControlRow(move, 'select, button', 36)
+  verifyControlGaps(moveControls, 6)
+  const moveDestination = move.getByLabel('Move destination')
+  const defaultFolder = await moveDestination.inputValue()
+  await moveDestination.selectOption(reviewFolder)
+  await verifySelectedOptionFits(moveDestination)
+  await verifyPaintedControlBorders(move, 'select, button', moveControls, 'desktop-move-picker-light')
+  await moveDestination.selectOption(defaultFolder)
   assert.equal(await button(page, /Tuesday design handoff/).getAttribute('aria-current'), 'true')
   await verifyMessageSelection(button(page, /Tuesday design handoff/), '.wm-msg-from')
   await page.frameLocator('iframe[title="Email content"]').getByText('For Tuesday', { exact: true }).waitFor()
@@ -810,8 +830,22 @@ async function desktopJourney(page) {
   await page.mouse.move(1410, 910)
   await screenshot(page, 'desktop-inbox-dark')
   await page.emulateMedia({ colorScheme: 'light' })
-  await move.getByLabel('Move destination').selectOption('Archive')
-  await button(move, 'Move this message').press('Enter')
+  await moveDestination.selectOption('Archive')
+  const moveAction = button(move, 'Move this message')
+  const resumeMove = Promise.withResolvers()
+  await page.route(`${url}/webmail/api/bulk`, async (route) => {
+    await resumeMove.promise
+    await route.continue()
+  }, { times: 1 })
+  try {
+    await moveAction.press('Enter')
+    await move.locator('select:disabled').waitFor()
+    assert(await moveAction.isDisabled())
+    const pending = await verifyControlRow(move, 'select, button', 36)
+    assert(pending.every(control => control.opacity === '1'), 'Move keeps both borders at full opacity while pending')
+    await verifyPaintedControlBorders(move, 'select, button', pending, 'desktop-move-picker-pending')
+  }
+  finally { resumeMove.resolve() }
   await page.getByText('Message moved to Archive.', { exact: true }).waitFor()
   await button(page, /Tuesday design handoff/).waitFor({ state: 'hidden' })
   await button(page, 'Undo last action').click()
@@ -953,7 +987,12 @@ async function phoneJourney(page) {
   const [destination, moveButton] = await verifyControlRow(move, 'select, button', 44)
   verifyControlGaps([destination, moveButton], 6)
   assert(destination.right - destination.left >= 108, 'Move destination leaves room for the Archive label')
-  await verifySelectedOptionFits(move.getByLabel('Move destination'))
+  const moveDestination = move.getByLabel('Move destination')
+  const defaultFolder = await moveDestination.inputValue()
+  await moveDestination.selectOption(reviewFolder)
+  await verifySelectedOptionFits(moveDestination)
+  await verifyPaintedControlBorders(move, 'select, button', [destination, moveButton], 'narrow-phone-move-picker-dark')
+  await moveDestination.selectOption(defaultFolder)
   await button(actions, 'Mark junk').waitFor()
   await page.setViewportSize({ width: 390, height: 540 })
   const reader = page.getByRole('region', { name: 'Message reader' })
