@@ -12,7 +12,7 @@ export AWS_DEFAULT_REGION="$region"
 export AWS_MAX_ATTEMPTS=10
 aws s3 cp "$artifact" "$workdir/mail.tar.gz" --only-show-errors
 printf '%s  %s\n' "$artifact_sha" "$workdir/mail.tar.gz" | sha256sum -c -
-for file in mail-server mail-health.py mail-health-watch.py setup-mail-health.sh; do
+for file in mail-server mail-health.py mail-health-watch.py mail-sync-health.py setup-mail-health.sh; do
   tar -xOzf "$workdir/mail.tar.gz" "$file" > "$workdir/$file"
   test -s "$workdir/$file"
 done

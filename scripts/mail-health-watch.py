@@ -39,6 +39,8 @@ HOSTED_CHECKS = {
 }
 BACKUP_STATUS = pathlib.Path('/var/lib/mail-storage/data/restic/last-success')
 BACKUP_TIMER = pathlib.Path('/etc/systemd/system/mail-restic-backup.timer')
+SYNC_MONITOR_CHECK = 'Client synchronization monitor'
+SYNC_CHECKS = {protocol + ' client synchronization' for protocol in ('IMAP', 'CalDAV', 'CardDAV', 'ActiveSync', 'EWS')}
 
 
 def atomic_json(path, value, mode):
@@ -97,8 +99,8 @@ def send_alert(webhook, content):
 # whether a deploy succeeded.
 OUTSIDE_DEPLOY_GATE = frozenset(PATTERNS) | {
     'Delivery error monitoring', 'Admin alert transport', QUEUE_CHECK, BOUNCE_CHECK, DELIVERY_STATS_CHECK,
-    HOSTED_MONITOR_CHECK, BACKUP_CHECK,
-} | frozenset(HOSTED_CHECKS.values())
+    HOSTED_MONITOR_CHECK, BACKUP_CHECK, SYNC_MONITOR_CHECK,
+} | frozenset(HOSTED_CHECKS.values()) | SYNC_CHECKS
 
 
 def deploy_gate_failures(checks):
@@ -266,6 +268,40 @@ def backup_checks(env_file, now):
         return [{'name': BACKUP_CHECK, 'ok': False}]
 
 
+def sync_checks(env_file, host, state):
+    previous = set(state.get('active', [])) & SYNC_CHECKS
+    try:
+        config = env_setting(env_file, 'MAIL_SYNC_HEALTH_CONFIG')
+        state['sync_monitor_configured'] = bool(config)
+        if not config:
+            return []
+        runner = pathlib.Path(__file__).with_name('mail-sync-health.py')
+        process = subprocess.run(['python3', str(runner), '--host', host, '--connect-host', '127.0.0.1',
+                                  '--config', config], capture_output=True, timeout=35)
+        checks = json.loads(process.stdout)['checks']
+        if not isinstance(checks, list) or not checks or len(checks) > len(SYNC_CHECKS):
+            raise ValueError('Invalid sync checks')
+        normalized = []
+        seen = set()
+        for check in checks:
+            name, ok, error = check['name'], check['ok'], check.get('error')
+            if name not in SYNC_CHECKS or name in seen or type(ok) is not bool:
+                raise ValueError('Invalid sync check')
+            if not ok and error not in ('transport', 'authentication', 'invalid_sync'):
+                raise ValueError('Invalid sync failure')
+            seen.add(name)
+            normalized.append({'name': name, 'ok': ok} if ok else {'name': name, 'ok': ok, 'error': error})
+        if process.returncode != int(not all(check['ok'] for check in normalized)):
+            raise ValueError('Inconsistent sync checks')
+        return normalized
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.TimeoutExpired):
+        if not previous and not state.get('sync_monitor_configured'):
+            return []
+        return [{'name': SYNC_MONITOR_CHECK, 'ok': False}] + [
+            {'name': name, 'ok': False} for name in sorted(previous)
+        ]
+
+
 def reconcile(state, checks, now):
     active = sorted(check['name'] for check in checks if not check['ok'])
     previous = state.get('active', [])
@@ -305,6 +341,7 @@ def run(args):
     checks += delivery_checks(database, state, now)
     checks += hosted_checks(args.env_file, state, now)
     checks += backup_checks(args.env_file, now)
+    checks += sync_checks(args.env_file, args.host, state)
     disk = shutil.disk_usage(args.storage_path)
     checks.append({'name': 'Mail storage free space', 'ok': disk.free > max(512 * 1024 * 1024, disk.total // 20)})
     storage_probe = "import os,sys,tempfile; f=tempfile.NamedTemporaryFile(dir=sys.argv[1],prefix='.health-',delete=True); f.write(b'mail health'); f.flush(); os.fsync(f.fileno()); f.close()"

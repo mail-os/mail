@@ -198,10 +198,11 @@ jobs:
         python3 ../../scripts/test-client-intake-clamav.py zig-out/bin/mail
         python3 ../../scripts/test-ews-clamav.py zig-out/bin/mail
 
-    - name: Verify encrypted SMTP receipt, padding and DNSBL policy
+    - name: Verify health alerts, authenticated sync, and encrypted SMTP receipt
       run: |
         python3 ../../scripts/test-mail-health-watch.py
         python3 ../../scripts/test-mail-delivery-alerts.py zig-out/bin/mail
+        python3 ../../scripts/test-mail-sync-health.py zig-out/bin/mail
         python3 ../../scripts/test-mail-tls.py zig-out/bin/mail
 
     - name: Check formatting

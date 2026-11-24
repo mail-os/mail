@@ -11,7 +11,7 @@ This runbook provides step-by-step procedures for deploying, upgrading, and main
 
 Use a public Route 53 zone dedicated to the staging mailbox domain. For example, `mail.staging.example.com` is the server hostname and `staging.example.com` is the zone and mailbox domain. The stack manages only the staging hostname's A record. Staging supports delivery between its own mailboxes. Its security group limits internet egress to HTTP and HTTPS.
 
-Build the chosen Linux x86-64 revision with `zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast` in `packages/zig` after installing the repository dependencies. Publish a gzip tar archive under `staging/` in the test artifact bucket. The archive needs four files at its root. Use the built executable as `mail-server` and include `scripts/mail-health.py`, `scripts/mail-health-watch.py`, and `scripts/setup-mail-health.sh` from the same revision. Record the revision and SHA-256 of the archive.
+Build the chosen Linux x86-64 revision with `zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseFast` in `packages/zig` after installing the repository dependencies. Publish a gzip tar archive under `staging/` in the test artifact bucket. Use the built executable as `mail-server` and include `scripts/mail-health.py`, `scripts/mail-health-watch.py`, `scripts/mail-sync-health.py`, and `scripts/setup-mail-health.sh` from the same revision at the archive root. Record the revision and SHA-256 of the archive.
 
 Create `/mail-server/staging/provisioning-token` as an SSM SecureString in the target region with a 32-byte hex-encoded token. `/mail-server/staging/discord-webhook-url` is an optional SecureString for a staging alert receiver. The instance role can read those parameters and the selected artifact.
 
@@ -1056,6 +1056,48 @@ or more than 25-hour-old success marker opens an incident. Set
 `MAIL_RESTIC_STATUS_FILE` in the Mail environment file when the configured
 backup writes its success marker elsewhere. The marker is written after
 Restic verifies the off-host backup.
+
+**Authenticated client sync alerts**
+
+Create a dedicated mailbox, such as `sync-canary@staging.example.com`, and
+leave its Inbox empty. Create the `Mail-Health` calendar and
+`Mail-Health-Contacts` address book for that mailbox using authenticated
+`MKCALENDAR` and `MKCOL` requests on `/calendars/<mailbox>/Mail-Health/` and
+`/addressbooks/<mailbox>/Mail-Health-Contacts/`. Keep the canary separate from customer
+mailboxes and routes. Save the canary configuration to a root-owned file with
+mode 0600 and put its path in `MAIL_SYNC_HEALTH_CONFIG` in the Mail
+environment file.
+
+```json
+{
+  "mailbox": "sync-canary@staging.example.com",
+  "password": "<canary mailbox password>",
+  "canary_id": "<32 lowercase hex characters from openssl rand -hex 16>",
+  "imaps_port": 993,
+  "dav_port": 443,
+  "protocols": ["imap", "caldav", "carddav", "activesync", "ews"]
+}
+```
+
+Set the ports to the actual local TLS listeners. A private CA can be
+specified with `ca_file`. The monitor verifies the host certificate. It
+appends one synthetic message over IMAPS, verifies its UID and reads the
+new item using an ActiveSync SyncKey and EWS SyncState. The CalDAV and
+CardDAV checks verify creation and deletion through successive sync
+tokens. The monitor removes its own synthetic items and reports a failure
+when the Inbox contains unrelated mail or a probe path holds unexpected
+data. ActiveSync and EWS checks use IMAPS as the canary message writer.
+Only the selected protocol checks appear in the status report. Probe
+traffic, credentials and returned item identifiers stay out of alerts.
+
+The EWS canary starts with an empty Inbox and consumes the state from its
+first item. Same-size replacement tracking is covered by
+[the separate EWS sync issue](https://github.com/mail-os/mail/issues/133).
+
+Run `python3 scripts/test-mail-sync-health.py /path/to/mail` for the
+disposable native rehearsal. On staging, confirm a clean result with the
+configured timer, induce a failure in the canary, and record the incident
+and recovery at the staging receiver in #71.
 
 ```bash
 systemctl status mail-health.timer

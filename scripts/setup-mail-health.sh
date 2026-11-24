@@ -6,6 +6,7 @@ source_dir="$(dirname "$source_file")"
 install -d -m 0700 /opt/mail/maintenance
 install -m 0700 "$source_file" /opt/mail/maintenance/mail-health.py
 install -m 0700 "$source_dir/mail-health-watch.py" /opt/mail/maintenance/mail-health-watch.py
+install -m 0700 "$source_dir/mail-sync-health.py" /opt/mail/maintenance/mail-sync-health.py
 install -d -m 0750 -o root -g mail-server /var/lib/mail-health /var/lib/mail-health/public
 install -d -m 0700 /var/lib/mail-health/private
 # Future atomic snapshots inherit the public directory's mail-server group.
@@ -27,7 +28,7 @@ if [ "${1:-}" = --deploy-gate ]; then gate=1; fi
 exec 9>/run/mail-health-check.lock
 if [ "$gate" = 1 ]; then
   # A deploy needs a verdict, not a skip because the timer holds the lock.
-  flock -w 120 9 || { echo 'mail-health: timed out waiting for the health lock' >&2; exit 1; }
+  flock -w 220 9 || { echo 'mail-health: timed out waiting for the health lock' >&2; exit 1; }
 else
   flock -n 9 || exit 0
 fi
@@ -69,7 +70,7 @@ After=mail.service
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/mail-health-check
-TimeoutStartSec=180
+TimeoutStartSec=220
 UNIT
 # Older tenant tools can rewrite the base unit and legacy wrapper. A drop-in
 # keeps the release's protocol monitor authoritative across those deploys.
@@ -78,7 +79,7 @@ cat > /etc/systemd/system/mail-health.service.d/protocol.conf <<'UNIT'
 [Service]
 ExecStart=
 ExecStart=/usr/local/sbin/mail-protocol-health-check
-TimeoutStartSec=180
+TimeoutStartSec=220
 UNIT
 cat > /etc/systemd/system/mail-health.timer <<'UNIT'
 [Unit]

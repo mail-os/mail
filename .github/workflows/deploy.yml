@@ -14,6 +14,7 @@ on:
       - 'scripts/test-mail-tls.py'
       - 'scripts/setup-mail-health.sh'
       - 'scripts/mail-health-watch.py'
+      - 'scripts/mail-sync-health.py'
       - 'bun.lock'
   workflow_dispatch: {}
 
@@ -69,7 +70,7 @@ jobs:
         scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=yes \
           packages/zig/zig-out/bin/mail "root@$HOST:/tmp/mail-new"
 
-        scp -i ~/.ssh/deploy_key scripts/mail-health.py scripts/mail-health-watch.py scripts/setup-mail-health.sh "root@$HOST:/tmp/"
+        scp -i ~/.ssh/deploy_key scripts/mail-health.py scripts/mail-health-watch.py scripts/mail-sync-health.py scripts/setup-mail-health.sh "root@$HOST:/tmp/"
 
         # Swap only a tested candidate, and roll back if protocol checks fail.
         ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o StrictHostKeyChecking=yes "root@$HOST" '

@@ -43,6 +43,7 @@ it('emits the actual authenticated Mail bootstrap and isolates its resource acce
   expect(userdata).toContain('SMTP_WEBMAIL_TLS=true')
   expect(userdata).toContain('CALDAV_ENABLED=true')
   expect(userdata).toContain('setup-mail-health.sh')
+  expect(userdata).toContain('mail-sync-health.py')
   expect(userdata).not.toContain('mail-upgrade.timer')
   const securityGroup = resources.find(resource => resource.Type === 'AWS::EC2::SecurityGroup')!.Properties
   expect(securityGroup.SecurityGroupIngress.map((rule: { FromPort: number }) => rule.FromPort)).toEqual([25, 80, 143, 443, 465, 587, 993, 8443])

@@ -36,7 +36,7 @@ echo "==> shipping source to $TARGET:$REMOTE_DIR"
 ssh "$TARGET" "if [ -d $REMOTE_DIR/packages/zig/.zig-cache ] && [ ! -d /root/mail-build-cache ]; then mv $REMOTE_DIR/packages/zig/.zig-cache /root/mail-build-cache; fi; rm -rf $REMOTE_DIR && mkdir -p $REMOTE_DIR"
 tar --no-xattrs -czf - --exclude='.zig-cache' --exclude='zig-out' --exclude='*.log' \
   packages/zig pantry.jsonc pantry.lock scripts/cleanup-clamav-downloads.sh \
-  scripts/setup-clamav-cleanup.sh scripts/mail-health.py scripts/mail-health-watch.py \
+  scripts/setup-clamav-cleanup.sh scripts/mail-health.py scripts/mail-health-watch.py scripts/mail-sync-health.py \
   scripts/setup-mail-health.sh scripts/test-mail-tls.py | ssh "$TARGET" "tar xzf - -C $REMOTE_DIR"
 
 echo "==> building on host (zig $ZIG_VER, native linux)"

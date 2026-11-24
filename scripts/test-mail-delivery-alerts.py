@@ -114,15 +114,16 @@ def wait_for(check, db_path, expected, *, field="count"):
 
 
 @contextmanager
-def monitor(root, db_path, sink):
+def monitor(root, db_path, sink, host="mail.example.test"):
     status = root / "public/status.json"
     env = root / "mail.env"
     env.write_text(f"DISCORD_WEBHOOK_URL={WEBHOOK}\nSMTP_DB_PATH={db_path}\n")
     args = SimpleNamespace(state_path=root / "private/state.json", status_path=status,
-                           env_file=env, storage_path=root, probe="probe.py", host="mail.example.test",
+                           env_file=env, storage_path=root, probe="probe.py", host=host,
                            database_path=None)
     run = watch["run"]
     probe = subprocess.CompletedProcess([], 0, b'{"ok":true,"checks":[{"name":"SMTP","ok":true}]}')
+    run_command = subprocess.run
     open_url = urllib.request.urlopen
 
     def post_to_fixture(req, *positional, **options):
@@ -131,8 +132,13 @@ def monitor(root, db_path, sink):
                                          req.data, headers=dict(req.header_items()), method=req.get_method())
         return open_url(req, *positional, **options)
 
+    def check_command(command, *positional, **options):
+        if command[:2] == ["python3", "probe.py"] or command[0] == "runuser":
+            return probe
+        return run_command(command, *positional, **options)
+
     def check_health():
-        with patch.object(watch["subprocess"], "run", return_value=probe), \
+        with patch.object(watch["subprocess"], "run", side_effect=check_command), \
             patch.dict(run.__globals__, {"journal_checks": lambda state, now: []}), \
             patch.object(watch["shutil"], "disk_usage", return_value=SimpleNamespace(total=10**10, free=5 * 10**9)):
             run(args)
