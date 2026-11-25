@@ -6,8 +6,11 @@ import json
 import os
 import pathlib
 import shutil
+import socket
 import sqlite3
+import struct
 import subprocess
+import sys
 import tempfile
 from threading import Thread
 import types
@@ -20,6 +23,71 @@ spec.loader.exec_module(watch)
 
 
 class HealthTests(unittest.TestCase):
+    def test_scanner_uses_the_running_daemon_identity_and_reports_recovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            process = root / '202'
+            process.mkdir()
+            environment = process / 'environ'
+            environment.write_bytes(b'UNRELATED_SECRET=private\0')
+            (process / 'status').write_text('Uid:\t100\t101\t101\t101\nGid:\t200\t201\t201\t201\nGroups:\t201 203 \n')
+            with patch.object(watch.subprocess, 'check_output', return_value=b'202\n'), \
+                    patch.object(watch.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0)) as scan:
+                self.assertEqual(watch.scanner_checks(root), [])
+                scan.assert_not_called()
+                endpoint = b'unix:/run/fixture-private/scanner.sock'
+                environment.write_bytes(b'UNRELATED_SECRET=private\0SMTP_CLAMAV_TRANSPORT=' + endpoint + b'\0')
+                self.assertEqual(watch.scanner_checks(root), [{'name': watch.SCANNER_CHECK, 'ok': True}])
+                self.assertEqual(scan.call_args.kwargs['input'], endpoint)
+                self.assertEqual(scan.call_args.kwargs['user'], 101)
+                self.assertEqual(scan.call_args.kwargs['group'], 201)
+                self.assertEqual(scan.call_args.kwargs['extra_groups'], [201, 203])
+                self.assertEqual(scan.call_args.kwargs['env'], {})
+                state = {'checked_at': 20, 'active': []}
+                scan.return_value = types.SimpleNamespace(returncode=1, stderr=b'private scanner response')
+                degraded = watch.scanner_checks(root)
+                self.assertEqual(watch.deploy_gate_failures(degraded), [watch.SCANNER_CHECK])
+                watch.reconcile(state, degraded, 21)
+                watch.reconcile(state, degraded, 22)
+                self.assertEqual(len(state['pending']), 1)
+                scan.return_value = types.SimpleNamespace(returncode=0)
+                watch.reconcile(state, watch.scanner_checks(root), 23)
+                self.assertEqual([event['status'] for event in state['pending']], ['degraded', 'healthy'])
+                packed = json.dumps(state)
+                self.assertNotIn('private', packed)
+
+    def test_scanner_probe_checks_actual_streaming_over_unix_and_tcp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for family, address, response, expected in (
+                (socket.AF_UNIX, str(pathlib.Path(directory) / 'scanner.sock'), b'stream: OK\0', 0),
+                (socket.AF_INET, ('127.0.0.1', 0), b'stream: scanner fixture failure ERROR\0', 1),
+            ):
+                received = []
+                with socket.socket(family) as server:
+                    server.bind(address)
+                    server.listen(1)
+                    server.settimeout(5)
+                    target = (f'unix:{address}' if family == socket.AF_UNIX else
+                              f'tcp:127.0.0.1:{server.getsockname()[1]}')
+
+                    def serve():
+                        with server.accept()[0] as peer, peer.makefile('rb') as stream:
+                            peer.settimeout(4)
+                            received.append(stream.read(len(b'zINSTREAM\0')))
+                            size = struct.unpack('!I', stream.read(4))[0]
+                            received.append(stream.read(size))
+                            received.append(stream.read(4))
+                            peer.sendall(response[:7])
+                            peer.sendall(response[7:])
+
+                    thread = Thread(target=serve, daemon=True)
+                    thread.start()
+                    result = subprocess.run([sys.executable, '-c', watch.SCANNER_PROBE],
+                                            input=target.encode(), capture_output=True, timeout=6)
+                    thread.join(5)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertEqual(received, [b'zINSTREAM\0', b'Clean Mail scanner health probe\r\n', bytes(4)])
+
     def test_hosted_report_drives_incidents_and_survives_lost_observation(self):
         now = 2000
         started = {'schema': 1, 'checked_at': now, 'checks': {

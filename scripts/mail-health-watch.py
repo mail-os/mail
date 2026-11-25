@@ -13,6 +13,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -29,6 +30,7 @@ BOUNCE_CHECK = 'Queued delivery failure rate'
 DELIVERY_STATS_CHECK = 'Outbound delivery statistics'
 HOSTED_MONITOR_CHECK = 'Hosted operations monitor'
 BACKUP_CHECK = 'Verified off-host backup freshness'
+SCANNER_CHECK = 'Mail malware scanner'
 HOSTED_CHECKS = {
     'provisioning_listener': 'Hosted provisioning listener',
     'free_provisioning_backlog': 'Free mailbox provisioning backlog',
@@ -78,6 +80,70 @@ def env_setting(path, key):
         if line.startswith(prefix):
             return line[len(prefix):].strip().strip('\"\'')
     return ''
+
+
+# Run with Mail's effective identity. A clean INSTREAM checks the scan pipeline
+# as well as the socket. A PING alone can succeed when signature loading fails.
+SCANNER_PROBE = r'''
+import ipaddress
+import socket
+import struct
+import sys
+
+target = sys.stdin.read()
+if target.startswith(('unix:', '/')):
+    client = socket.socket(socket.AF_UNIX)
+    client.settimeout(3)
+    client.connect(target.removeprefix('unix:'))
+else:
+    host, _, port = target.removeprefix('tcp:').rpartition(':')
+    address = ipaddress.ip_address(host.removeprefix('[').removesuffix(']'))
+    client = socket.create_connection((str(address), int(port)), timeout=3)
+
+with client:
+    payload = b'Clean Mail scanner health probe\r\n'
+    client.sendall(b'zINSTREAM\0' + struct.pack('!I', len(payload)) + payload + bytes(4))
+    reply = bytearray()
+    while b'\0' not in reply and len(reply) < 1024:
+        chunk = client.recv(1024 - len(reply))
+        if not chunk:
+            break
+        reply.extend(chunk)
+    sys.exit(reply != b'stream: OK\0')
+'''
+
+
+def scanner_checks(proc_root=pathlib.Path('/proc')):
+    try:
+        pid = int(subprocess.check_output(
+            ['systemctl', 'show', 'mail.service', '-p', 'MainPID', '--value'],
+            timeout=3, stderr=subprocess.DEVNULL,
+        ))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    if pid <= 1:
+        return []  # Listener checks already report a stopped daemon.
+
+    try:
+        process = proc_root / str(pid)
+        variables = process.joinpath('environ').read_bytes().split(b'\0')
+        prefix = b'SMTP_CLAMAV_TRANSPORT='
+        endpoint = next((value[len(prefix):] for value in variables if value.startswith(prefix)), b'')
+        if not endpoint:
+            return []
+        credentials = dict(line.split(':', 1) for line in process.joinpath('status').read_text().splitlines() if ':' in line)
+        uid = int(credentials['Uid'].split()[1])
+        gid = int(credentials['Gid'].split()[1])
+        groups = [int(group) for group in credentials['Groups'].split()]
+        result = subprocess.run(
+            [sys.executable, '-c', SCANNER_PROBE], input=endpoint,
+            user=uid, group=gid, extra_groups=groups, env={},
+            capture_output=True, timeout=7,
+        )
+        ok = result.returncode == 0
+    except (OSError, ValueError, KeyError, IndexError, subprocess.SubprocessError):
+        ok = False
+    return [{'name': SCANNER_CHECK, 'ok': ok}]
 
 
 def send_alert(webhook, content):
@@ -370,6 +436,7 @@ def run(args):
     checks += hosted_checks(args.env_file, state, now)
     checks += backup_checks(args.env_file, now)
     checks += sync_checks(args.env_file, args.host, state)
+    checks += scanner_checks()
     checks += storage_capacity_checks(runtime, mailbox, database)
     storage_probe = "import os,sys,tempfile; f=tempfile.NamedTemporaryFile(dir=sys.argv[1],prefix='.health-',delete=True); f.write(b'mail health'); f.flush(); os.fsync(f.fileno()); f.close()"
     try:
@@ -424,7 +491,7 @@ def main(argv=None):
                         help='Override SMTP_DB_PATH from the mail environment file')
     parser.add_argument('--env-file', default='/etc/mail/mail.env')
     parser.add_argument('--deploy-gate', action='store_true',
-                        help='Exit by the protocol and storage checks only; status and alerts are unchanged')
+                        help='Exit by the protocol, scanner and storage checks; status and alerts are unchanged')
     return run(parser.parse_args(argv))
 
 

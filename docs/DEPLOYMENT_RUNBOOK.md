@@ -25,7 +25,7 @@ bun run status:staging
 
 The deploy command validates the zone and creates `MailServerStagingStack`. An existing stack causes the command to fail. `bun run diff:staging` compares the current template with the deployed stack. After creation, connect via Session Manager and check `sudo cloud-init status --wait`, `sudo systemctl is-active mail`, and `sudo /usr/local/sbin/mail-protocol-health-check --deploy-gate`.
 
-The staging bootstrap installs ClamAV and waits for its initial signature databases before starting Mail. Mail connects through the local `/run/clamav/clamd.ctl` socket via its `clamav` supplementary group. Staging defers scannable writes when the scanner is unavailable. Check `systemctl is-active clamav-daemon clamav-freshclam` and the updater journal when diagnosing scanner readiness or signature age.
+The staging bootstrap installs ClamAV and waits for its initial signature databases before starting Mail. Mail connects through the local `/run/clamav/clamd.ctl` socket via its `clamav` supplementary group. Staging defers scannable writes when the scanner is unavailable. The watchdog submits a clean probe to the configured scanner using the Mail service identity. A failed probe appears as **Mail malware scanner** in service health. Check `systemctl is-active clamav-daemon clamav-freshclam` and the updater journal when diagnosing scanner readiness or signature age.
 
 Verify the certificate and protocol endpoints on the staging hostname. Use port 587 for SMTP submission, 993 for IMAPS, 8443 for webmail, and 443 for EWS and ActiveSync. The provisioning listener uses loopback port 8099. Open a Session Manager port forwarding session for the synthetic signup and mailbox checks.
 
