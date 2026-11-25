@@ -428,6 +428,8 @@ pub const QueryOptions = struct {
     answered: bool = false,
     flagged: bool = false,
     attachments: bool = false,
+    /// Include conversation context in scan order. Grouping sorts the members
+    /// of retained conversations after determining which components match.
     include_context: bool = false,
     attention_snapshot: ?attention.Snapshot = null,
     attention_view: ?attention.Kind = null,
@@ -601,11 +603,11 @@ pub fn queryMessages(allocator: std.mem.Allocator, db: *database.Database, user:
             });
         }
     }
-    sortSummaries(rows.items);
+    if (!options.include_context) sortSummaries(rows.items);
     return rows.toOwnedSlice(allocator);
 }
 
-fn sortSummaries(rows: []MessageSummary) void {
+pub fn sortSummaries(rows: []MessageSummary) void {
     std.mem.sort(MessageSummary, rows, {}, struct {
         fn lessThan(_: void, left: MessageSummary, right: MessageSummary) bool {
             if (left.attention_deadline != right.attention_deadline) return left.attention_deadline < right.attention_deadline;
@@ -755,7 +757,7 @@ fn queryIndexed(a: std.mem.Allocator, db: *database.Database, user: []const u8, 
     }
     if (options.index_progress) |report| report.* = progress;
     if (!progress.complete()) return rows.items[0..0];
-    sortSummaries(rows.items);
+    if (!options.include_context) sortSummaries(rows.items);
     return rows.toOwnedSlice(a);
 }
 

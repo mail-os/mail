@@ -146,7 +146,8 @@ pub fn group(allocator: std.mem.Allocator, rows: []const maildir.MessageSummary)
     var output: std.ArrayList(Thread) = .empty;
     var entries = roots.iterator();
     while (entries.next()) |entry| {
-        const list = members.items[entry.value_ptr.*].items;
+        const list = try members.items[entry.value_ptr.*].toOwnedSlice(allocator);
+        maildir.sortSummaries(list);
         var unread: usize = 0;
         var matching: usize = 0;
         for (list) |row| {
@@ -161,8 +162,7 @@ pub fn group(allocator: std.mem.Allocator, rows: []const maildir.MessageSummary)
             id[index * 2] = hex[byte >> 4];
             id[index * 2 + 1] = hex[byte & 15];
         }
-        // queryMessages supplies newest-first rows; preserve that order.
-        try output.append(allocator, .{ .id = id, .latest = list[0], .members = try allocator.dupe(maildir.MessageSummary, list), .unread = unread, .matching = matching });
+        try output.append(allocator, .{ .id = id, .latest = list[0], .members = list, .unread = unread, .matching = matching });
     }
     std.mem.sort(Thread, output.items, {}, struct {
         fn lessThan(_: void, left: Thread, right: Thread) bool {
@@ -182,9 +182,9 @@ test "conversations link missing parents and cycles without merging identical su
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
     const rows = [_]maildir.MessageSummary{
-        sample(5, "<b@example.com>", "<a@example.com>", "<missing@example.com>"),
         sample(4, "<a@example.com>", "<b@example.com>", "<missing@example.com>"),
         sample(3, "<unrelated@example.com>", "", ""),
+        sample(5, "<b@example.com>", "<a@example.com>", "<missing@example.com>"),
         sample(2, "", "", ""),
     };
     const threads = try group(arena.allocator(), &rows);
@@ -192,7 +192,7 @@ test "conversations link missing parents and cycles without merging identical su
     try t.expectEqual(@as(usize, 2), threads[0].members.len);
     try t.expectEqual(@as(i64, 5), threads[0].latest.uid);
     var filtered = rows;
-    filtered[0].matches_filters = false;
+    filtered[1].matches_filters = false;
     filtered[2].matches_filters = false;
     filtered[3].matches_filters = false;
     const matches = try group(arena.allocator(), &filtered);
@@ -201,6 +201,8 @@ test "conversations link missing parents and cycles without merging identical su
     try t.expectEqual(@as(usize, 1), matches[0].matching);
     try t.expectEqual(@as(usize, 2), matches[0].members.len);
     try t.expectEqual(@as(i64, 5), matches[0].latest.uid);
+    try t.expectEqual(@as(i64, 5), matches[0].members[0].uid);
+    try t.expectEqual(@as(i64, 4), matches[0].members[1].uid);
 }
 
 test "folder UIDs and malformed identifiers do not create accidental conversations" {
