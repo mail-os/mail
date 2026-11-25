@@ -94,11 +94,14 @@ def verify(binary, directory):
     openssl('genpkey', '-algorithm', 'RSA', '-pkeyopt', 'rsa_keygen_bits:2048', '-out', primary)
     extra_pkcs8 = directory / 'extra-pkcs8.pem'
     openssl('genpkey', '-algorithm', 'RSA', '-pkeyopt', 'rsa_keygen_bits:2048', '-out', extra_pkcs8)
-    # LibreSSL's rsa command writes PKCS#1 by default.
-    traditional = ['-traditional'] if openssl('version').startswith(b'OpenSSL 3.') else []
-    additional.write_bytes(openssl('rsa', '-in', extra_pkcs8, *traditional))
+    try:
+        traditional = openssl('rsa', '-in', extra_pkcs8, '-traditional')
+    except subprocess.CalledProcessError:
+        # LibreSSL's rsa command writes PKCS#1 without the option.
+        traditional = openssl('rsa', '-in', extra_pkcs8)
+    additional.write_bytes(traditional)
     assert primary.read_bytes().startswith(b'-----BEGIN PRIVATE KEY-----')
-    assert additional.read_bytes().startswith(b'-----BEGIN RSA PRIVATE KEY-----')
+    assert traditional.startswith(b'-----BEGIN RSA PRIVATE KEY-----'), 'The RSA conversion did not produce PKCS#1 PEM'
     openssl('genpkey', '-algorithm', 'EC', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-out', ec)
     public_keys = [directory / f'{domain}.pub' for domain in (PRIMARY, ADDITIONAL)]
     for key, public in zip((primary, additional), public_keys):
