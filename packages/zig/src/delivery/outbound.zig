@@ -315,12 +315,7 @@ fn deliverOnce(
     }
     defer std.c.freeaddrinfo(result.?);
 
-    // Create socket and connect (use libc API like socket_compat.zig)
-    const family: c_uint = @intCast(std.posix.AF.INET);
-    const sock_type: c_uint = @intCast(@as(u32, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC));
-    const raw_fd = std.c.socket(family, sock_type, 0);
-    if (raw_fd < 0) return error.SocketCreateFailed;
-    const sock: std.posix.socket_t = @intCast(raw_fd);
+    const sock = try socket_compat.openOutboundIpv4();
     defer _ = std.c.close(sock);
 
     // Set socket timeout (30 seconds)

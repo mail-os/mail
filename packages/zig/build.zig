@@ -147,6 +147,7 @@ pub fn build(b: *std.Build) void {
         "src/config_test.zig",
         "src/fs_compat_test.zig",
         "src/core/io_compat.zig",
+        "src/core/socket_compat.zig",
         "src/mail_health_test.zig",
         "src/imap_test.zig",
         "src/connection_wrapper_test.zig",

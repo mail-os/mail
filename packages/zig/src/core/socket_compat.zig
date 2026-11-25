@@ -4,6 +4,25 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 
+/// Open an outbound IPv4 stream socket with close-on-exec enabled.
+pub fn openOutboundIpv4() !posix.socket_t {
+    // Linux can set the flag atomically. Darwin's libc rejects the shim bit.
+    const flags = if (builtin.os.tag == .linux) posix.SOCK.CLOEXEC else 0;
+    const fd = std.c.socket(posix.AF.INET, posix.SOCK.STREAM | flags, 0);
+    if (fd < 0) return error.SocketCreateFailed;
+    errdefer _ = std.c.close(fd);
+    if (builtin.os.tag != .linux and std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC)) < 0)
+        return error.SocketSetupFailed;
+    return fd;
+}
+
+test "outbound IPv4 socket is close-on-exec" {
+    const fd = try openOutboundIpv4();
+    defer _ = std.c.close(fd);
+    const flags = std.c.fcntl(fd, std.c.F.GETFD, @as(c_int, 0));
+    try std.testing.expect(flags >= 0 and (flags & std.c.FD_CLOEXEC) != 0);
+}
+
 pub const AddressFamily = enum { ipv4, ipv6 };
 
 pub const Address = struct {
