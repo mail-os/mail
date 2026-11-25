@@ -15,6 +15,7 @@ import time
 
 suite = runpy.run_path(str(Path(__file__).with_name("test-hosted-limits.py")))
 Fixture, expect_smtp = suite["Fixture"], suite["expect_smtp"]
+request = suite["request"]
 
 
 def cli(test, *args, env=None, input=None):
@@ -162,6 +163,7 @@ def main():
             with db:
                 db.execute("DELETE FROM message_queue WHERE id='hosted-retry-fixture'")
             verify_sending_release(test, db, mailbox, peer, held_since)
+            verify_hold_access_windows(test, peer)
     print("Verified audited hosted quota, provisioning drift, UTC usage, queue counts and redaction.")
     print("Verified audited sending holds across SMTP, webmail, EWS, ActiveSync, provisioning and restart.")
 
@@ -246,6 +248,58 @@ def verify_sending_release(test, db, mailbox, peer, held_since):
         ("hosted.sending_hold", actor, {"reason": "case-17"}),
         ("hosted.sending_release", actor, {"reason": "case-17-reviewed"}),
     ], records
+
+
+def verify_hold_access_windows(test, peer):
+    mailbox = test.provision("held-paid")
+    revision = 1
+    now = int(time.time())
+    url = test.private + "/provisioning/v1/mailbox/access"
+
+    def change_window(service_until, read_until, expected_access):
+        nonlocal revision
+        revision += 1
+        window = {"service_until": service_until, "read_until": read_until}
+        change = {
+            "mailbox": mailbox, "actor": test.specs[mailbox]["actor"],
+            "operation_id": secrets.token_hex(16), "revision": revision, "access_window": window,
+        }
+        status, _, raw = request(url, change, test.auth)
+        assert status == 200, (status, raw)
+        state = json.loads(raw)
+        assert state["access"] == expected_access and state["access_window"] == window, state
+        replay_status, _, replay = request(url, change, test.auth)
+        assert replay_status == 200 and json.loads(replay) == state, (replay_status, replay)
+
+    def hold(action, case):
+        result = cli(test, "hosted-sending-hold", mailbox, action, case)
+        assert result.returncode == 0, result.stderr
+        return report(test, mailbox)["account"]
+
+    change_window(now + 3600, now + 7200, "full")
+    expect_smtp(test.deliver(mailbox, identity=peer, subject="Kept for export"), 250)
+    held = hold("place", "paid-read-only")
+    change_window(now + 7200, now + 10_800, "full")
+    renewed = report(test, mailbox)["account"]
+    assert renewed["sending_held_since"] == held["sending_held_since"] is not None
+    expect_smtp(test.deliver(peer, identity=mailbox), 550, "5.7.1 Sending is on hold")
+
+    session = test.login(mailbox)
+    change_window(now - 30, now + 3600, "read_only")
+    released = hold("release", "paid-read-only-reviewed")
+    assert released["access"] == "read_only" and released["sending_held_since"] is None
+    expect_smtp(test.deliver(peer, identity=mailbox), 550, "5.7.1 Sender mailbox is read-only")
+    status, page = test.api(session, "messages?folder=INBOX")
+    assert status == 200 and [item["subject"] for item in page["items"]] == ["Kept for export"]
+
+    change_window(now + 3600, now + 7200, "full")
+    hold("place", "paid-expired")
+    change_window(now - 60, now - 30, "expired")
+    released = hold("release", "paid-expired-reviewed")
+    assert released["access"] == "expired" and released["sending_held_since"] is None
+    assert test.api(session, "folders")[0] == 401
+    change_window(now + 7200, now + 10_800, "full")
+    expect_smtp(test.deliver(peer, identity=mailbox), 250)
 
 
 if __name__ == "__main__":
