@@ -194,10 +194,42 @@ def verify(index, fixture, directory):
         expect_index_search(index, client, f"username:=`{owner}`", "SUBJECT alpha", "alpha", expected)
 
 
+def verify_encoded_headers(binary):
+    with tempfile.TemporaryDirectory(prefix="mail-imap-encoded-headers-") as scratch:
+        fixture = Fixture(binary, Path(scratch), staging=True)
+        with fixture.daemon():
+            owner = fixture.provision("encoded-search")
+            with fixture.imap(owner) as client:
+                subjects = (
+                    b"Staged receipt plain",
+                    b"=?UTF-8?Q?Staged_receipt?=\r\n =?UTF-8?B?IGNhZsOp?=",
+                    b"Different message",
+                )
+                for subject in subjects:
+                    raw = b"Subject: " + subject + b"\r\nX-Test: ordinary\r\n\r\nTest message.\r\n"
+                    assert client.append("INBOX", None, None, raw)[0] == "OK"
+                assert client.select("INBOX", readonly=True)[0] == "OK"
+                plain, encoded, unrelated = search(client, "ALL")
+                assert search(client, 'CHARSET UTF-8 HEADER Subject "staged receipt"') == [plain, encoded]
+                assert search(client, 'CHARSET UTF-8 SUBJECT "staged receipt"') == [plain, encoded]
+                assert search(client, 'HEADER subject "receipt caf"') == [encoded]
+                assert search(client, 'HEADER Subject ""') == [plain, encoded, unrelated]
+                assert search(client, 'HEADER X-Test "ORDINARY"') == [plain, encoded, unrelated]
+                assert search(client, 'HEADER X-Missing ""') == []
+                assert search(client, 'HEADER Subject "IGNhZsOp"') == []
+                status, rows = client.uid("SEARCH", None, "CHARSET", "UTF-8", "HEADER", "Subject", b'"caf\xc3\xa9"')
+                assert status == "OK" and rows[0].split() == [encoded]
+                status, rows = client.uid("FETCH", encoded, "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+                assert status == "OK"
+                wire = b"".join(row[1] for row in rows if isinstance(row, tuple))
+                assert subjects[1] in wire, wire
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     args = parser.parse_args()
+    verify_encoded_headers(args.binary.resolve(strict=True))
     with tempfile.TemporaryDirectory(prefix="mail-index-search-") as scratch, SearchIndex() as index:
         thread = Thread(target=index.serve_forever, daemon=True)
         thread.start()
@@ -211,7 +243,7 @@ def main():
         finally:
             index.shutdown()
             thread.join()
-    print("Verified two-page IMAP and UID SEARCH, keyword conjunction, negation, mailbox scope, and complete fallback over IMAPS.")
+    print("Verified two-page IMAP and UID SEARCH, keyword conjunction, negation, mailbox scope, encoded headers, and complete fallback over IMAPS.")
 
 
 if __name__ == "__main__":

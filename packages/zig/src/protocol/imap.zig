@@ -1,5 +1,6 @@
 const std = @import("std");
 const imap_mime = @import("imap_mime.zig");
+const mime = @import("../message/mime.zig").lib;
 const clamav = @import("../antispam/clamav.zig");
 const builtin = @import("builtin");
 const ascii_compat = @import("ascii-compat");
@@ -986,7 +987,7 @@ fn headerEnd(content: []const u8) usize {
     return content.len;
 }
 
-/// Match an exact field name and search its unfolded value. An empty term
+/// Match an exact field name and search its unfolded, MIME-decoded value. An empty term
 /// checks for the presence of the named field.
 fn searchHeader(a: std.mem.Allocator, header: []const u8, field: []const u8, term: []const u8) !?[]const u8 {
     var lines = std.mem.splitScalar(u8, header, '\n');
@@ -1006,7 +1007,13 @@ fn searchHeader(a: std.mem.Allocator, header: []const u8, field: []const u8, ter
             try unfolded.appendSlice(a, std.mem.trimEnd(u8, continuation, "\r"));
         }
         if (unfolded.items.len != 0) value = unfolded.items;
-        if (ascii_compat.indexOfIgnoreCase(value, term) != null) return value;
+        if (term.len == 0) return value;
+        if (std.mem.indexOf(u8, value, "=?") != null) {
+            const buffer = try a.alloc(u8, value.len * 3);
+            defer a.free(buffer);
+            const decoded = mime.decodeWords(value, buffer).text;
+            if (ascii_compat.indexOfIgnoreCase(decoded, term) != null) return value;
+        } else if (ascii_compat.indexOfIgnoreCase(value, term) != null) return value;
     }
     return null;
 }
