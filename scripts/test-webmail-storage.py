@@ -4,6 +4,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import argparse
+import imaplib
 import json
 from pathlib import Path
 import runpy
@@ -251,6 +252,46 @@ def check_outbox_budget(test, db, sink):
     assert test.bytes(user) > 0 and test.count(user) == 0
 
 
+def check_selective_expunge(test, db):
+    user = test.provision("selective-expunge", quota=8 * MIB)
+    session = test.login(user)
+    records = [ok(test.api(session, "drafts", {"text": f"Draft {number}"})) for number in range(5)]
+    uids = [str(record["uid"]) for record in records]
+    with test.imap(user) as client:
+        def present():
+            status, values = client.uid("SEARCH", None, "ALL")
+            assert status == "OK"
+            return values[0].decode().split()
+
+        assert client.select("Drafts")[0] == "OK"
+        for index in (0, 2, 3, 4):
+            assert client.uid("STORE", uids[index], "+FLAGS.SILENT", r"(\Deleted)")[0] == "OK"
+        for arguments in ((), ("0",), (f"{uids[0]},",), (uids[0], "extra")):
+            try:
+                client.uid("EXPUNGE", *arguments)
+            except imaplib.IMAP4.error as error:
+                assert "BAD" in str(error)
+            else:
+                raise AssertionError("An invalid UID selection was accepted")
+        assert client.uid("EXPUNGE", "4294967295")[0] == "OK"
+        assert present() == uids
+        assert client.select("Drafts", readonly=True)[0] == "OK"
+        assert client.uid("EXPUNGE", uids[0])[0] == "NO"
+        assert client.expunge()[0] == "NO"
+        assert present() == uids
+        assert client.select("Drafts")[0] == "OK"
+        reverse_range_and_list = f"{uids[2]}:{uids[1]},{uids[4]}"
+        assert client.uid("EXPUNGE", reverse_range_and_list)[0] == "OK"
+        assert present() == [uids[index] for index in (0, 1, 3)]
+        assert client.uid("EXPUNGE", "*")[0] == "OK"
+        assert present() == uids[:2]
+        assert client.expunge()[0] == "OK"
+        assert present() == [uids[1]]
+    rows = db.execute("SELECT id FROM webmail_records WHERE username=? AND kind='draft'", (user,)).fetchall()
+    assert rows == [(records[1]["draftId"],)]
+    print("Verified exact UID EXPUNGE selection, invalid requests, and read-only protection.")
+
+
 def seed_legacy_drafts(test, db):
     user = test.provision("legacy-drafts", quota=8 * MIB)
     session = test.login(user)
@@ -349,6 +390,7 @@ def main():
             staged_user, referenced_id = check_uploads(test, db)
             check_draft_budget(test, db)
             expunged_user, expunged_id = check_imap_draft_expunges(test, db, sink)
+            check_selective_expunge(test, db)
             legacy_drafts = seed_legacy_drafts(test, db)
             empty_legacy = seed_empty_legacy_mailbox(test)
             check_outbox_budget(test, db, sink)

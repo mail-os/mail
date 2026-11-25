@@ -3892,21 +3892,41 @@ pub const ImapSession = struct {
     /// Handle EXPUNGE command — remove messages marked with \Deleted flag.
     /// Reads \Deleted from Maildir filename suffix. Sends untagged EXPUNGE
     /// responses in descending order per RFC 3501 Section 6.4.3.
-    fn handleExpunge(self: *ImapSession, tag: []const u8) !void {
+    fn handleExpunge(self: *ImapSession, tag: []const u8, uid_set: ?[]const u8) !void {
         if (self.state != .selected) {
             try self.sendResponse(tag, "NO", "Must select mailbox first");
             return;
         }
+        if (self.mailbox_read_only) return self.sendResponse(tag, "NO", "Mailbox is read-only");
+
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const selection = if (uid_set) |raw|
+            search.parseSet(scratch.allocator(), raw, true) catch |err| switch (err) {
+                error.InvalidSearch => return self.sendResponse(tag, "BAD", "Invalid UID set"),
+                else => return err,
+            }
+        else
+            null;
+        const completed = if (uid_set == null) "EXPUNGE completed" else "UID EXPUNGE completed";
 
         const files = self.mailbox_files orelse {
-            try self.sendResponse(tag, "OK", "EXPUNGE completed");
+            try self.sendResponse(tag, "OK", completed);
             return;
         };
+        if (files.len == 0) return self.sendResponse(tag, "OK", completed);
+        const uids: []const i64 = if (selection == null) &.{} else self.mailbox_uids orelse return self.sendResponse(tag, "NO", "Mailbox UIDs unavailable");
+        if (selection != null and uids.len != files.len)
+            return self.sendResponse(tag, "NO", "Mailbox UIDs unavailable");
+        const max_uid = if (uids.len > 0) std.mem.max(i64, uids) else 0;
 
         var names = MaildirNameResolver.init(self.allocator);
         defer names.deinit();
         var seq = files.len;
         while (seq > 0) : (seq -= 1) {
+            if (selection) |set| {
+                if (!set.contains(uids[seq - 1], max_uid)) continue;
+            }
             const filename = self.expungeDeleted(&names, seq - 1) orelse continue;
 
             // Send untagged EXPUNGE
@@ -3921,7 +3941,7 @@ pub const ImapSession = struct {
         // Refresh mailbox file list after deletions
         _ = self.rescanMailbox() catch {};
 
-        try self.sendResponse(tag, "OK", "EXPUNGE completed");
+        try self.sendResponse(tag, "OK", completed);
     }
 
     fn expungeDeleted(self: *ImapSession, names: *MaildirNameResolver, idx: usize) ?[]const u8 {
@@ -4129,7 +4149,7 @@ pub const ImapSession = struct {
                 const search_criteria = if (cmd_end_s < line.len) std.mem.trim(u8, line[cmd_end_s..], " \t") else "";
                 try self.handleSearch(tag, search_criteria);
             },
-            .expunge => try self.handleExpunge(tag),
+            .expunge => try self.handleExpunge(tag, null),
             .close => {
                 // RFC 3501 Section 6.4.2: CLOSE implicitly expunges \Deleted messages
                 // (without sending untagged EXPUNGE responses)
@@ -4200,8 +4220,8 @@ pub const ImapSession = struct {
                     defer if (seq_set.ptr != uid_set.ptr) self.allocator.free(seq_set);
                     try self.handleStore(tag, seq_set, flags_action);
                 } else if (std.ascii.eqlIgnoreCase(sub_cmd, "EXPUNGE")) {
-                    // UID EXPUNGE (RFC 4315)
-                    try self.handleExpunge(tag);
+                    const end = @intFromPtr(sub_cmd.ptr) + sub_cmd.len - @intFromPtr(line.ptr);
+                    try self.handleExpunge(tag, std.mem.trim(u8, line[end..], " \t"));
                 } else {
                     try self.sendResponse(tag, "OK", "UID command completed");
                 }

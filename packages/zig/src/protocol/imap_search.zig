@@ -29,6 +29,20 @@ pub const Set = struct {
     }
 };
 
+/// Parse a sequence-set operand in full using the request's arena.
+pub fn parseSet(a: Allocator, raw: []const u8, uid: bool) ParseError!Set {
+    var ranges: std.ArrayList(Range) = .empty;
+    var parts = std.mem.splitScalar(u8, raw, ',');
+    while (parts.next()) |part| {
+        var bounds = std.mem.splitScalar(u8, part, ':');
+        const first = try endpoint(bounds.next() orelse return error.InvalidSearch);
+        const last = if (bounds.next()) |raw_last| try endpoint(raw_last) else first;
+        if (bounds.next() != null) return error.InvalidSearch;
+        try ranges.append(a, .{ .first = first, .last = last });
+    }
+    return .{ .uid = uid, .ranges = ranges.items };
+}
+
 const TextField = enum { header, body, message };
 pub const Text = struct {
     field: TextField,
@@ -209,16 +223,7 @@ const Parser = struct {
     }
 
     fn sequence(self: *Parser, raw: []const u8, uid: bool) ParseError!*const Node {
-        var ranges: std.ArrayList(Range) = .empty;
-        var parts = std.mem.splitScalar(u8, raw, ',');
-        while (parts.next()) |part| {
-            var bounds = std.mem.splitScalar(u8, part, ':');
-            const first = try endpoint(bounds.next() orelse return error.InvalidSearch);
-            const last = if (bounds.next()) |raw_last| try endpoint(raw_last) else first;
-            if (bounds.next() != null) return error.InvalidSearch;
-            try ranges.append(self.a, .{ .first = first, .last = last });
-        }
-        return self.node(.{ .set = .{ .uid = uid, .ranges = ranges.items } });
+        return self.node(.{ .set = try parseSet(self.a, raw, uid) });
     }
 
     fn textKey(self: *Parser, name: []const u8) ParseError!*const Node {
