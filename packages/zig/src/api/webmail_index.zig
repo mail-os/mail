@@ -25,6 +25,8 @@ pub const Document = struct {
     snippet: []const u8 = "",
     attachment_metadata: []const u8 = "[]",
     matches: bool = true,
+    uid: ?i64 = null,
+    observed: bool = false,
 };
 
 pub const Progress = struct {
@@ -52,8 +54,10 @@ pub fn load(a: std.mem.Allocator, db: *database.Database, user: []const u8, fold
         \\      ELSE instr(lower(sender),lower(?3))>0 OR instr(lower(recipient),lower(?3))>0
         \\        OR instr(lower(cc),lower(?3))>0 OR instr(lower(bcc),lower(?3))>0
         \\        OR instr(lower(subject),lower(?3))>0 OR instr(lower(body_text),lower(?3))>0
-        \\ END
-        \\FROM webmail_search_docs d WHERE user_id=(SELECT id FROM users WHERE username=?1) AND folder=?2
+        \\ END, u.uid
+        \\FROM webmail_search_docs d
+        \\LEFT JOIN imap_uids u ON u.username=?1 AND u.mailbox=d.folder AND u.filename=d.basename
+        \\WHERE d.user_id=(SELECT id FROM users WHERE username=?1) AND d.folder=?2
     );
     defer stmt.finalize();
     try stmt.bind(1, user);
@@ -67,9 +71,10 @@ pub fn load(a: std.mem.Allocator, db: *database.Database, user: []const u8, fold
         const basename = try a.dupe(u8, stmt.columnText(0));
         const fingerprint = try a.dupe(u8, stmt.columnText(1));
         const matches = stmt.columnInt64(14) != 0;
+        const uid = stmt.columnInt64Opt(15);
         if (!matches and !include_unmatched) {
             // Keep the identity for validation, progress and stale-row pruning.
-            try docs.put(basename, .{ .fingerprint = fingerprint, .digest = digest[0..64].*, .matches = false });
+            try docs.put(basename, .{ .fingerprint = fingerprint, .digest = digest[0..64].*, .matches = false, .uid = uid });
             continue;
         }
         try docs.put(basename, .{
@@ -87,6 +92,7 @@ pub fn load(a: std.mem.Allocator, db: *database.Database, user: []const u8, fold
             .snippet = try a.dupe(u8, stmt.columnText(12)),
             .attachment_metadata = try a.dupe(u8, stmt.columnText(13)),
             .matches = matches,
+            .uid = uid,
         });
     }
     return docs;

@@ -630,14 +630,23 @@ fn queryIndexed(a: std.mem.Allocator, db: *database.Database, user: []const u8, 
         // File names and their UIDs must be assigned in IMAP order. The
         // catalogue uses the same folder and Maildir basename as webmail.
         const refs = try collectFiles(a, user, folder);
-        const uids = try syncFolderUids(temporary, db, user, folder, refs);
         var cached = try search_index.load(temporary, db, user, folder, options.query, include_unmatched);
-        var live = std.StringHashMap(void).init(temporary);
+        var needs_uid_sync = false;
+        for (refs) |ref| {
+            if (cached.getPtr(database.maildirBaseName(ref.name))) |item| {
+                item.observed = true;
+                if (item.uid != null) continue;
+            }
+            needs_uid_sync = true;
+        }
+        // A warm catalogue can read the existing UID mappings in the same
+        // snapshot. New files still use the ordered, transactional assignment.
+        const uids = if (needs_uid_sync) try syncFolderUids(temporary, db, user, folder, refs) else null;
         var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer scratch.deinit();
         for (refs, 0..) |ref, index| {
             const basename = database.maildirBaseName(ref.name);
-            try live.put(basename, {});
+            const cached_doc = cached.getPtr(basename);
             if (options.attention_view) |kind| {
                 if (!options.attention_snapshot.?.mayContain(kind, folder, basename)) continue;
             }
@@ -649,9 +658,9 @@ fn queryIndexed(a: std.mem.Allocator, db: *database.Database, user: []const u8, 
                 else => return err,
             };
             const doc = document: {
-                if (cached.get(basename)) |item| {
+                if (cached_doc) |item| {
                     if (std.mem.startsWith(u8, item.fingerprint, index_fingerprint_prefix) and
-                        std.mem.eql(u8, item.fingerprint[index_fingerprint_prefix.len..], identity.fingerprint)) break :document item;
+                        std.mem.eql(u8, item.fingerprint[index_fingerprint_prefix.len..], identity.fingerprint)) break :document item.*;
                 }
                 if (remaining == 0) {
                     progress.total += 1;
@@ -703,7 +712,10 @@ fn queryIndexed(a: std.mem.Allocator, db: *database.Database, user: []const u8, 
                 file.content_type = try a.dupe(u8, file.content_type);
             }
             try rows.append(a, .{
-                .uid = if (uids) |assigned| assigned[index] else uidFor(db, user, folder, ref.name, @intCast(index + 1)),
+                .uid = if (uids) |assigned| assigned[index] else if (needs_uid_sync)
+                    uidFor(db, user, folder, ref.name, @intCast(index + 1))
+                else
+                    cached_doc.?.uid.?,
                 .folder = folder,
                 .from = try a.dupe(u8, doc.sender),
                 .to = try a.dupe(u8, doc.recipient),
@@ -728,13 +740,11 @@ fn queryIndexed(a: std.mem.Allocator, db: *database.Database, user: []const u8, 
                 } else null,
             });
         }
-        if (cached.count() > 0) {
-            var keys = cached.keyIterator();
-            while (keys.next()) |name| {
-                if (live.contains(name.*)) continue;
-                try pruneSearchFolder(temporary, db, user, folder, &cached, &live);
-                break;
-            }
+        var documents = cached.valueIterator();
+        while (documents.next()) |doc| {
+            if (doc.observed) continue;
+            try pruneSearchFolder(temporary, db, user, folder, &cached);
+            break;
         }
     }
     if (std.mem.eql(u8, options.folder, "*")) {
@@ -749,15 +759,17 @@ fn queryIndexed(a: std.mem.Allocator, db: *database.Database, user: []const u8, 
     return rows.toOwnedSlice(a);
 }
 
-fn pruneSearchFolder(a: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, cached: *std.StringHashMap(search_index.Document), live: *std.StringHashMap(void)) !void {
+fn pruneSearchFolder(a: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, cached: *std.StringHashMap(search_index.Document)) !void {
     db.lockMailboxes();
     defer db.unlockMailboxes();
     // A folder may have changed since enumeration. Recheck before
     // removing a document another request could need.
-    for (try collectFiles(a, user, folder)) |file| try live.put(database.maildirBaseName(file.name), {});
+    for (try collectFiles(a, user, folder)) |file| {
+        if (cached.getPtr(database.maildirBaseName(file.name))) |item| item.observed = true;
+    }
     var previous = cached.iterator();
     while (previous.next()) |record| {
-        if (!live.contains(record.key_ptr.*))
+        if (!record.value_ptr.observed)
             try search_index.prune(db, user, folder, record.key_ptr.*, record.value_ptr.fingerprint);
     }
 }

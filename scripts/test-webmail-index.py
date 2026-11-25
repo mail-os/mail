@@ -155,6 +155,18 @@ def run(binary, previous):
             alice = test.login(owner)
             ready = items(alice, "attachments", folder="Research", index_budget=1)
             assert ready["index"] == {"indexed": 2, "total": 2, "pending": False}, ready
+            known = items(alice, folder="Research", q="field notes")["items"][0]
+            with closing(sqlite3.connect(directory / "smtp.db")) as sql:
+                deleted = sql.execute(
+                    "DELETE FROM imap_uids WHERE username=? AND mailbox=? AND uid=?",
+                    (owner, "Research", known["uid"]),
+                )
+                assert deleted.rowcount == 1
+                sql.commit()
+            restored = items(alice, folder="Research", q="field notes")["items"][0]
+            assert restored["uid"] > known["uid"]
+            assert restored["reference"] == known["reference"]
+            assert items(alice, folder="Research", q="field notes")["items"][0]["uid"] == restored["uid"]
             doc_path = next(path for path in (directory / "mail" / owner / "Research").iterdir()
                             if b"<index-2@example.test>" in path.read_bytes())
             replacement = message(owner, 2, subject="Updated local file", body="Revised spreadsheet",
