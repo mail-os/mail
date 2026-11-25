@@ -118,10 +118,10 @@ def monitor(root, db_path, sink, host="mail.example.test"):
     status = root / "public/status.json"
     env = root / "mail.env"
     env.write_text(f"DISCORD_WEBHOOK_URL={WEBHOOK}\nSMTP_DB_PATH={db_path}\n")
-    args = SimpleNamespace(state_path=root / "private/state.json", status_path=status,
-                           env_file=env, storage_path=root, probe="probe.py", host=host,
-                           database_path=None)
-    run = watch["run"]
+    (root / "mail").mkdir(exist_ok=True)
+    args = ["--state-path", str(root / "private/state.json"), "--status-path", str(status),
+            "--env-file", str(env), "--storage-path", str(root), "--probe", "probe.py", "--host", host]
+    watchdog = watch["main"]
     probe = subprocess.CompletedProcess([], 0, b'{"ok":true,"checks":[{"name":"SMTP","ok":true}]}')
     run_command = subprocess.run
     open_url = urllib.request.urlopen
@@ -139,9 +139,9 @@ def monitor(root, db_path, sink, host="mail.example.test"):
 
     def check_health():
         with patch.object(watch["subprocess"], "run", side_effect=check_command), \
-            patch.dict(run.__globals__, {"journal_checks": lambda state, now: []}), \
+            patch.dict(watchdog.__globals__, {"journal_checks": lambda state, now: []}), \
             patch.object(watch["shutil"], "disk_usage", return_value=SimpleNamespace(total=10**10, free=5 * 10**9)):
-            run(args)
+            watchdog(args)
         return {check["name"]: check for check in json.loads(status.read_text())["checks"]}
 
     with patch.object(urllib.request, "urlopen", post_to_fixture):
@@ -168,7 +168,9 @@ def verify(binary):
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     check = executor.submit(check_health)
                     try:
-                        assert sink.entered.wait(5), "Expected the webhook receiver to be contacted"
+                        if not sink.entered.wait(5):
+                            check.result(timeout=5)
+                            raise AssertionError("Expected the webhook receiver to be contacted")
                         # Keep the receiver blocked while a real SMTP message is accepted.
                         assert test.deliver(owner, identity=owner, subject="Local while alerts wait")[0] == 250
                     finally:

@@ -404,7 +404,7 @@ def run(args):
     return int(status['status'] != 'healthy')
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--probe', default='/opt/mail/maintenance/mail-health.py')
     parser.add_argument('--host', default='mail.stacksjs.com')
@@ -418,7 +418,7 @@ def main():
     parser.add_argument('--env-file', default='/etc/mail/mail.env')
     parser.add_argument('--deploy-gate', action='store_true',
                         help='Exit by the protocol and storage checks only; status and alerts are unchanged')
-    return run(parser.parse_args())
+    return run(parser.parse_args(argv))
 
 
 if __name__ == '__main__':
