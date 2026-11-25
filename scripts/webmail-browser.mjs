@@ -1102,9 +1102,16 @@ async function phoneJourney(page) {
   await body.fill('Save this draft when Escape closes the composer.')
   await body.press('Escape')
   await composer.waitFor({ state: 'hidden' })
-  await button(page, 'Resume draft').click()
-  assert.equal(await subject.inputValue(), 'Keyboard draft', 'Escape saved the draft subject')
-  assert.equal(await body.inputValue(), 'Save this draft when Escape closes the composer.', 'Escape saved the draft body')
+  for (let reopen = 0; reopen < 2; reopen++) {
+    await button(page, 'Resume draft').click()
+    await composer.and(page.locator('dialog:modal')).waitFor()
+    assert.equal(await subject.inputValue(), 'Keyboard draft', 'Escape saved the draft subject')
+    assert.equal(await body.inputValue(), 'Save this draft when Escape closes the composer.', 'Escape saved the draft body')
+    if (reopen === 0) {
+      await body.press('Escape')
+      await composer.waitFor({ state: 'hidden' })
+    }
+  }
   for (const width of [320, 390]) {
     await page.setViewportSize({ width, height: 844 })
     const sheet = await composer.locator('.wm-composer').boundingBox()

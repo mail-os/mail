@@ -1444,7 +1444,7 @@ export function useWebmail(ports: WebmailPorts) {
 
   function resetComposition(): void {
     batch(() => {
-      composing.set(false)
+      hideComposer()
       fileSharing.clearFileLinkComposer()
       sharedReply.set(null)
       senderId.set('')
@@ -1467,9 +1467,21 @@ export function useWebmail(ports: WebmailPorts) {
     composing.set(true)
     ports.nextTick(() => { if (!ports.composer.current?.open) ports.composer.current?.showModal() })
   }
+  function hideComposer(): void {
+    // stx can reuse the dialog after hiding it. Clear its native open state
+    // before removing it from the page so it can return to the top layer.
+    ports.composer.current?.close()
+    composing.set(false)
+  }
   async function closeComposer(): Promise<void> {
     if (sending() || sendUncertain() || fileSharing.fileLinkUploading()) return
-    try { if (draft.saving()) await draft.flush(); if (hasComposition()) await draft.flushAll(); composing.set(false); if (selected()?.folder === 'Drafts') closeReader(); await refresh(true) }
+    try {
+      if (draft.saving()) await draft.flush()
+      if (hasComposition()) await draft.flushAll()
+      hideComposer()
+      if (selected()?.folder === 'Drafts') closeReader()
+      await refresh(true)
+    }
     catch (cause) { composeError.set(`Keep this window open: ${errorMessage(cause)}`) }
   }
   async function compose(mode = 'new'): Promise<void> {
