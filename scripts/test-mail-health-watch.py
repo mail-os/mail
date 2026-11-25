@@ -143,7 +143,9 @@ class HealthTests(unittest.TestCase):
             env.write_text('DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/private-secret\n')
             args = types.SimpleNamespace(state_path=root/'private/state.json', status_path=root/'public/status.json',
                                          env_file=env, storage_path=root, probe='probe.py', host='mail.example.com',
-                                         database_path=None)
+                                         database_path=None, mailbox_path=None)
+            (root/'mail').mkdir()
+            (root/'smtp.db').touch()
             probe = subprocess.CompletedProcess([], 0, json.dumps({'ok': True, 'checks': [{'name': 'SMTP', 'ok': True}]}).encode())
             with patch.object(watch.subprocess, 'run', return_value=probe), patch.object(watch, 'journal_checks', return_value=[]), patch.object(watch, 'delivery_checks', return_value=[]), patch.object(watch.shutil, 'disk_usage', return_value=types.SimpleNamespace(total=10000000000, free=5000000000)):
                 with patch.object(watch, 'send_alert', side_effect=RuntimeError('secret')):
@@ -162,13 +164,55 @@ class HealthTests(unittest.TestCase):
     def run_gate(self, root, probe_checks, journal):
         args = types.SimpleNamespace(state_path=root/'private/state.json', status_path=root/'public/status.json',
                                      env_file=root/'env', storage_path=root, probe='probe.py', host='mail.example.com',
-                                     deploy_gate=True, database_path=None)
+                                     deploy_gate=True, database_path=None, mailbox_path=None)
         args.env_file.write_text('')
+        (root/'mail').mkdir()
+        (root/'smtp.db').touch()
         ok = all(check['ok'] for check in probe_checks)
         probe = subprocess.CompletedProcess([], 0 if ok else 1, json.dumps({'ok': ok, 'checks': probe_checks}).encode())
         with patch.object(watch.subprocess, 'run', return_value=probe), patch.object(watch, 'journal_checks', return_value=journal), patch.object(watch, 'delivery_checks', return_value=[]), patch.object(watch.shutil, 'disk_usage', return_value=types.SimpleNamespace(total=10000000000, free=5000000000)):
             code = watch.run(args)
         return code, json.loads(args.status_path.read_text()), watch.load_state(args.state_path)
+
+    def test_storage_capacity_checks_follow_mounts_without_duplicate_probes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = pathlib.Path(directory)
+            encrypted = runtime / 'encrypted'
+            encrypted.mkdir()
+            (encrypted/'mail').mkdir()
+            (encrypted/'smtp.db').touch()
+            mailbox = runtime/'mail'
+            database = runtime/'smtp.db'
+            mailbox.symlink_to(encrypted/'mail', target_is_directory=True)
+            database.symlink_to(encrypted/'smtp.db')
+            paths = {runtime: 1, mailbox: 2, database: 2}
+            allocated = {1: 100 * 1024**3, 2: 16 * 1024**3}
+
+            def disk_stat(path):
+                return types.SimpleNamespace(st_dev=paths[path])
+
+            for free in ({1: 1 * 1024**3, 2: 6 * 1024**3}, {1: 6 * 1024**3, 2: 1}):
+                def disk_usage(path):
+                    device = paths[path]
+                    return types.SimpleNamespace(total=allocated[device], free=free[device])
+
+                with patch.object(pathlib.Path, 'stat', autospec=True, side_effect=disk_stat), \
+                        patch.object(watch.shutil, 'disk_usage', side_effect=disk_usage) as usage:
+                    checks = watch.storage_capacity_checks(runtime, mailbox, database)
+                self.assertEqual([call.args[0] for call in usage.call_args_list], [runtime, mailbox])
+                self.assertEqual(checks, [
+                    {'name': 'Mail runtime filesystem free space', 'ok': free[1] > allocated[1] // 20},
+                    {'name': 'Mail mailbox filesystem free space', 'ok': free[2] > allocated[2] // 20},
+                ])
+
+            with patch.object(watch.shutil, 'disk_usage', return_value=types.SimpleNamespace(total=allocated[1], free=free[1])) as usage:
+                self.assertEqual(len(watch.storage_capacity_checks(runtime, mailbox, database)), 1)
+            self.assertEqual(usage.call_count, 1)
+
+            (encrypted/'smtp.db').unlink()
+            with patch.object(watch.shutil, 'disk_usage', return_value=types.SimpleNamespace(total=allocated[1], free=free[1])):
+                checks = watch.storage_capacity_checks(runtime, mailbox, database)
+            self.assertIn({'name': 'Mail database filesystem free space', 'ok': False}, checks)
 
     def test_deploy_gate_passes_a_client_tls_error_but_still_alerts_on_it(self):
         # One client's TLS error seconds after the restart failed a deploy

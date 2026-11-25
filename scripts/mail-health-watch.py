@@ -107,6 +107,25 @@ def deploy_gate_failures(checks):
     return [c['name'] for c in checks if not c['ok'] and c['name'] not in OUTSIDE_DEPLOY_GATE]
 
 
+def storage_capacity_checks(runtime, mailbox, database):
+    checks = []
+    seen = set()
+    for name, path in [('Mail runtime filesystem free space', runtime),
+                       ('Mail mailbox filesystem free space', mailbox),
+                       ('Mail database filesystem free space', database)]:
+        try:
+            device = path.stat().st_dev  # Follow deployment symlinks to the data mount.
+            if device in seen:
+                continue
+            seen.add(device)
+            disk = shutil.disk_usage(path)
+            ok = disk.free > max(512 * 1024 * 1024, disk.total // 20)
+        except OSError:
+            ok = False
+        checks.append({'name': name, 'ok': ok})
+    return checks
+
+
 JOURNAL_PAGE_SIZE = 10000
 JOURNAL_MAX_PAGES = 8
 
@@ -337,16 +356,17 @@ def run(args):
         configured_database = env_setting(args.env_file, 'SMTP_DB_PATH')
     except OSError:
         configured_database = ''
-    database = args.database_path or pathlib.Path(args.storage_path) / (configured_database or 'smtp.db')
+    runtime = pathlib.Path(args.storage_path)
+    database = args.database_path or runtime / (configured_database or 'smtp.db')
+    mailbox = args.mailbox_path or runtime / 'mail'
     checks += delivery_checks(database, state, now)
     checks += hosted_checks(args.env_file, state, now)
     checks += backup_checks(args.env_file, now)
     checks += sync_checks(args.env_file, args.host, state)
-    disk = shutil.disk_usage(args.storage_path)
-    checks.append({'name': 'Mail storage free space', 'ok': disk.free > max(512 * 1024 * 1024, disk.total // 20)})
+    checks += storage_capacity_checks(runtime, mailbox, database)
     storage_probe = "import os,sys,tempfile; f=tempfile.NamedTemporaryFile(dir=sys.argv[1],prefix='.health-',delete=True); f.write(b'mail health'); f.flush(); os.fsync(f.fileno()); f.close()"
     try:
-        subprocess.run(['runuser', '-u', 'mail-server', '--', 'python3', '-c', storage_probe, str(pathlib.Path(args.storage_path) / 'mail')], capture_output=True, timeout=10, check=True)
+        subprocess.run(['runuser', '-u', 'mail-server', '--', 'python3', '-c', storage_probe, str(mailbox)], capture_output=True, timeout=10, check=True)
         checks.append({'name': 'Mail storage write and sync', 'ok': True})
     except Exception:
         checks.append({'name': 'Mail storage write and sync', 'ok': False})
@@ -390,7 +410,9 @@ def main():
     parser.add_argument('--host', default='mail.stacksjs.com')
     parser.add_argument('--state-path', default='/var/lib/mail-health/private/state.json')
     parser.add_argument('--status-path', default='/var/lib/mail-health/public/status.json')
-    parser.add_argument('--storage-path', default='/opt/mail')
+    parser.add_argument('--storage-path', default='/opt/mail', help='Mail runtime directory')
+    parser.add_argument('--mailbox-path', type=pathlib.Path,
+                        help='Override the mailbox directory (defaults to mail under the runtime directory)')
     parser.add_argument('--database-path', type=pathlib.Path,
                         help='Override SMTP_DB_PATH from the mail environment file')
     parser.add_argument('--env-file', default='/etc/mail/mail.env')

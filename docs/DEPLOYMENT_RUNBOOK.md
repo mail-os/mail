@@ -1062,6 +1062,14 @@ sudo systemctl restart mail
 
 **Outbound queue and delivery alerts**
 
+The watchdog checks free space on the runtime filesystem, the Maildir filesystem,
+and the filesystem containing the configured `SMTP_DB_PATH`. It follows symlinks
+and checks each filesystem once. It reports an unavailable path as a failed check.
+The runtime defaults to `/opt/mail` and the Maildir to `/opt/mail/mail`. For a
+different layout, set `--storage-path` and `--mailbox-path` when invoking
+`mail-health-watch.py`. The runtime keeps a capacity check when the mailboxes and
+database use a separate volume.
+
 On hosts with the Mail health timer installed, the watchdog reads the SMTP
 database configured by `SMTP_DB_PATH` in `/etc/mail/mail.env`. It raises an
 incident when queued outbound deliveries in pending, processing, or retry
