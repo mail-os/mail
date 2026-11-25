@@ -13,7 +13,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 
 SCRIPTS = Path(__file__).resolve().parent
@@ -45,7 +45,7 @@ def pending_message(fixture, session):
     return held
 
 
-def archive_and_restore(binary, root, live):
+def archive_and_restore(binary, root, live, restic_s3_root):
     archive_dir, restic_dir, downloaded, restored, altered = (root / name for name in (
         "archives", "repository", "downloaded", "restored", "altered",
     ))
@@ -59,10 +59,15 @@ def archive_and_restore(binary, root, live):
     key = root / "restic-password"
     key.touch(mode=0o600)
     key.write_text(secrets.token_hex(32) + "\n")
-    restic = ["restic", "--repo", str(restic_dir), "--password-file", str(key)]
+    repository = str(restic_dir)
+    if restic_s3_root is not None:
+        repository = f"{restic_s3_root}/fixture-{secrets.token_hex(12)}"
+    restic = ["restic", "--no-cache", "--repo", repository, "--password-file", str(key)]
     subprocess.run([*restic, "init"], check=True)
     subprocess.run([*restic, "backup", "--tag", "mail", str(archive), str(env_archive)], check=True)
     subprocess.run([*restic, "check", "--read-data"], check=True)
+    archive.unlink()
+    env_archive.unlink()
     subprocess.run([*restic, "restore", "latest", "--tag", "mail", "--target", str(downloaded)], check=True)
 
     restored_archive, = downloaded.rglob(archive.name)
@@ -111,7 +116,7 @@ def verify_worker_rollback(server, previous, owner, sender, endpoint):
     print("The previous worker dispatched the newer binary's scheduled send while accepting SMTP. The upgraded worker retained the send result and exactly one recipient copy.")
 
 
-def verify(binary, root, previous=None):
+def verify(binary, root, previous=None, restic_s3_root=None):
     live = root / "live"
     live.mkdir()
     source = Fixture(binary, live, staging=True)
@@ -175,7 +180,7 @@ def verify(binary, root, previous=None):
         archived, = response(source.api(session, "messages?folder=PreviousProjects"))["items"]
         assert archived["subject"] == "Maildir++ archive marker"
         (live / "forwards.json").write_text("{}\n")
-        restored, altered = archive_and_restore(binary, root, live)
+        restored, altered = archive_and_restore(binary, root, live, restic_s3_root)
         assert (restored / archived_path.relative_to(live)).read_bytes() == archive_message
         offboard = ("team", "offboard-owner", team, sender, owner, "restore-fixture-" + secrets.token_hex(8))
         team_command(source, *offboard)
@@ -238,7 +243,10 @@ def verify(binary, root, previous=None):
         assert response(restored_server.api(session, "messages?" + urlencode({
             "folder": "INBOX", "q": "Mail sent to the restored server",
         })))["total"] == 1
-    print("Verified the local Restic round trip, IMAP identity, verified mail links, Calendar source and ETag, drafts, scheduled sends, and Sender Review. Replayed a post-backup owner offboarding before opening the restored listeners. Tampering failed atomically.")
+    backend = "off-host S3" if restic_s3_root is not None else "local"
+    print(f"Verified the {backend} Restic round trip after removing the local archives, along with IMAP identity, "
+          "verified mail links, Calendar source and ETag, drafts, scheduled sends, and Sender Review. "
+          "Replayed a post-backup owner offboarding before opening the restored listeners. Tampering failed atomically.")
     if previous is not None:
         verify_worker_rollback(restored_server, previous, owner, sender, endpoint)
 
@@ -266,11 +274,24 @@ def verify(binary, root, previous=None):
     print("The offline domain migration preserved the restored IMAP identifiers, webmail links, and CalDAV resource under the new address.")
 
 
+def restic_s3_test_root(value):
+    if not value.startswith("s3:https://"):
+        raise argparse.ArgumentTypeError("expected an HTTPS S3 repository prefix")
+    endpoint = urlsplit(value.removeprefix("s3:"))
+    parts = endpoint.path.strip("/").split("/")
+    if (not endpoint.hostname or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment
+            or len(parts) < 2 or any(part in ("", ".", "..") for part in parts)):
+        raise argparse.ArgumentTypeError("provide an S3 bucket and a dedicated fixture prefix")
+    return value.rstrip("/")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--previous", type=Path, help="Previous binary for the SMTP and scheduled worker rollback rehearsal")
+    parser.add_argument("--restic-s3-root", type=restic_s3_test_root,
+                        help="Create a fresh Restic repository below this HTTPS S3 fixture prefix")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="mail-backup-restore-") as tmp:
         previous = args.previous.resolve(strict=True) if args.previous else None
-        verify(args.binary.resolve(strict=True), Path(tmp), previous)
+        verify(args.binary.resolve(strict=True), Path(tmp), previous, args.restic_s3_root)

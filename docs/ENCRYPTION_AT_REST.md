@@ -208,6 +208,21 @@ against the restored mailbox before the current binary reopens it.
 python3 scripts/test-mail-backup-restore.py /path/to/mail --previous /path/to/previous-mail
 ```
 
+For an off-host rehearsal, give the test process S3 session credentials scoped
+to a dedicated test prefix. The fixture creates a fresh encrypted repository
+below that prefix, reads every stored pack, removes its source archives, and
+restores with the cache disabled.
+
+```bash
+python3 scripts/test-mail-backup-restore.py /path/to/mail \
+  --previous /path/to/previous-mail \
+  --restic-s3-root s3:https://s3.us-east-1.amazonaws.com/test-bucket/mail-restore-rehearsals
+```
+
+Record the test result and remove the fixture's S3 prefix after the rehearsal.
+The test uses disposable mailboxes and generates its repository password for
+that run.
+
 ## Recovery order
 
 1. Attach and mount the Hetzner data volume.
