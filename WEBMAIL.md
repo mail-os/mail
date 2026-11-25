@@ -1203,6 +1203,13 @@ for seven days. An interrupted send keeps its complete payload and attachments
 until the mailbox owner reviews it. Account removal cascades to these SQLite
 records. SQLite reuses freed pages for future writes.
 
+IMAP EXPUNGE and CLOSE release the compose record for a permanently deleted
+managed draft. Scheduled sends keep their separate Outbox data and attachment
+references. For draft records orphaned by older releases, run
+`scripts/recover-orphaned-webmail-drafts.py` with the SQLite path, Maildir root,
+and full hosted mailbox address. The default mode reports verified candidates.
+Stop Mail and other writers to that Maildir before using `--apply`.
+
 ## Validation and release
 
 Run `bun test`, `bun run --filter mail-webmail typecheck`, Pickier, and

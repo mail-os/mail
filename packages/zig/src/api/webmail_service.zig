@@ -17,6 +17,7 @@ const snapshots = @import("webmail_snapshots.zig");
 const calendar_invite = @import("webmail_calendar_invite.zig");
 const compose = @import("webmail_compose.zig");
 const store = @import("webmail_store.zig");
+const draft_expunge = @import("webmail_draft_expunge.zig");
 const message_refs = @import("../storage/message_refs.zig");
 const shared_inbox = @import("../storage/shared_inbox.zig");
 const thread_ids = @import("../message/thread_ids.zig");
@@ -186,6 +187,7 @@ pub const Service = struct {
         try store.initSchema(db);
         var service: Service = .{ .db = db, .auth = auth, .config = config };
         io_compat.randomBytes(&service.external_review_key);
+        try draft_expunge.recover(db);
         try service.recoverDraftEdits();
         return service;
     }
@@ -424,7 +426,7 @@ pub const Service = struct {
             var arena = std.heap.ArenaAllocator.init(self.db.allocator);
             defer arena.deinit();
             const a = arena.allocator();
-            const pending = (try store.nextDraftEdit(a, self.db, &cursor)) orelse break;
+            const pending = (try store.nextDraftIntent(a, self.db, "draft-edit", &cursor)) orelse break;
             try self.finishDraftEdit(a, pending);
         }
     }

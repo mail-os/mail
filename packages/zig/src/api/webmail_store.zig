@@ -264,10 +264,11 @@ pub fn findDraft(allocator: std.mem.Allocator, db: *database.Database, user: []c
     return readRecord(allocator, s);
 }
 
-pub fn nextDraftEdit(a: std.mem.Allocator, db: *database.Database, cursor: *i64) !?Record {
-    const s = try db.prepare("SELECT username,kind,id,payload,state,revision,due_at,expires_at,rowid FROM webmail_records WHERE kind='draft-edit' AND rowid>?1 ORDER BY rowid LIMIT 1");
+pub fn nextDraftIntent(a: std.mem.Allocator, db: *database.Database, kind: []const u8, cursor: *i64) !?Record {
+    const s = try db.prepare("SELECT username,kind,id,payload,state,revision,due_at,expires_at,rowid FROM webmail_records WHERE kind=?1 AND rowid>?2 ORDER BY rowid LIMIT 1");
     defer s.finalize();
-    try s.bind(1, cursor.*);
+    try s.bind(1, kind);
+    try s.bind(2, cursor.*);
     if (!try s.step()) return null;
     cursor.* = s.columnInt64(8);
     return try readRecord(a, s);
@@ -286,7 +287,11 @@ pub fn managesDraftAt(db: *database.Database, user: []const u8, folder: []const 
         defer schema.finalize();
         if (!try schema.step()) return false;
     }
-    const stmt = try db.prepare("SELECT 1 FROM webmail_records WHERE username=?1 AND kind='draft' AND json_extract(payload,'$.folder')=?2 AND json_extract(payload,'$.uid')=?3 LIMIT 1");
+    const stmt = try db.prepare(
+        \\SELECT 1 FROM webmail_records WHERE username=?1 AND kind='draft'
+        \\ AND json_extract(CASE WHEN json_valid(payload) THEN payload END,'$.folder')=?2
+        \\ AND json_extract(CASE WHEN json_valid(payload) THEN payload END,'$.uid')=?3 LIMIT 1
+    );
     defer stmt.finalize();
     try stmt.bind(1, user);
     try stmt.bind(2, folder);

@@ -26,6 +26,7 @@ const database = @import("../storage/database.zig");
 const client_passwords = @import("../storage/client_passwords.zig");
 const typesense = @import("../search/typesense.zig");
 const maildir_index = @import("../search/maildir_index.zig");
+const draft_expunge = @import("../api/webmail_draft_expunge.zig");
 
 // std.posix.getpid is not available on this Zig version's std; libc is linked
 // (the binary links sqlite3 + libc), so declare the C symbol directly.
@@ -3937,7 +3938,12 @@ pub const ImapSession = struct {
             std.log.warn("could not queue expunged mail for search: {}", .{err});
             return null;
         };
-        fs_compat.cwd().deleteFile(path) catch return null;
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        draft_expunge.remove(scratch.allocator(), db, user, at, path) catch |err| {
+            std.log.warn("could not expunge mail: {}", .{err});
+            return null;
+        };
         message_refs.forget(db, user, at) catch |err| std.log.warn("could not retire expunged message reference: {}", .{err});
         return filename;
     }
