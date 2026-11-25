@@ -97,6 +97,21 @@ def verify(binary, directory):
             assert len(sink.messages) == initial_alerts + 2
             hidden_config.rename(config_path)
 
+            settings = directory / 'mail.env'
+            configured = settings.read_text()
+            settings.write_text(configured.removesuffix(f'MAIL_SYNC_HEALTH_CONFIG={config_path}\n'))
+            unconfigured = monitor()
+            assert not unconfigured[name]['ok'] and not unconfigured['Client synchronization monitor']['ok']
+            assert len(sink.messages) == initial_alerts + 2
+            settings.write_text(configured)
+
+            config_path.write_text(json.dumps({**config, 'protocols': ['imap']}))
+            partial = monitor()
+            assert partial[CHECKS['imap']]['ok']
+            assert not partial[name]['ok'] and not partial['Client synchronization monitor']['ok']
+            assert len(sink.messages) == initial_alerts + 2
+            config_path.write_text(json.dumps(config))
+
             canary.request('DELETE', contact_path, expected=(204,))
             assert monitor()[name]['ok']
             assert len(sink.messages) == initial_alerts + 3 and 'checks recovered' in sink.messages[-1]['content']

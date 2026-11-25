@@ -288,11 +288,15 @@ def backup_checks(env_file, now):
 
 
 def sync_checks(env_file, host, state):
-    previous = set(state.get('active', [])) & SYNC_CHECKS
+    active = set(state.get('active', []))
+    previous = active & SYNC_CHECKS
+    monitor_failed = SYNC_MONITOR_CHECK in active
     try:
         config = env_setting(env_file, 'MAIL_SYNC_HEALTH_CONFIG')
         state['sync_monitor_configured'] = bool(config)
         if not config:
+            if previous or monitor_failed:
+                raise ValueError('Missing client sync configuration during an incident')
             return []
         runner = pathlib.Path(__file__).with_name('mail-sync-health.py')
         process = subprocess.run(['python3', str(runner), '--host', host, '--connect-host', '127.0.0.1',
@@ -312,13 +316,16 @@ def sync_checks(env_file, host, state):
             normalized.append({'name': name, 'ok': ok} if ok else {'name': name, 'ok': ok, 'error': error})
         if process.returncode != int(not all(check['ok'] for check in normalized)):
             raise ValueError('Inconsistent sync checks')
-        return normalized
     except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.TimeoutExpired):
-        if not previous and not state.get('sync_monitor_configured'):
+        if not previous and not monitor_failed and not state.get('sync_monitor_configured'):
             return []
-        return [{'name': SYNC_MONITOR_CHECK, 'ok': False}] + [
-            {'name': name, 'ok': False} for name in sorted(previous)
-        ]
+        normalized, seen = [], set()
+
+    missing = previous - seen
+    if missing or not normalized:
+        normalized.append({'name': SYNC_MONITOR_CHECK, 'ok': False})
+        normalized.extend({'name': name, 'ok': False} for name in sorted(missing))
+    return normalized
 
 
 def reconcile(state, checks, now):

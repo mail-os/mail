@@ -1136,8 +1136,10 @@ CardDAV checks verify creation and deletion through successive sync
 tokens. The monitor removes its own synthetic items and reports a failure
 when the Inbox contains unrelated mail or a probe path holds unexpected
 data. ActiveSync and EWS checks use IMAPS as the canary message writer.
-Only the selected protocol checks appear in the status report. Probe
-traffic, credentials and returned item identifiers stay out of alerts.
+The status report lists the selected protocols. If the canary configuration
+is removed or omits a failing protocol, any existing incident stays open
+until a fresh probe confirms recovery. Probe traffic, credentials and
+returned item identifiers stay out of alerts.
 
 The EWS canary starts with an empty Inbox and consumes the state from its
 first item. Same-size replacement tracking is covered by
