@@ -131,13 +131,16 @@ pub fn group(allocator: std.mem.Allocator, rows: []const maildir.MessageSummary)
         members.deinit(allocator);
     }
     for (rows, 0..) |row, index| {
+        if (!row.matches_filters) continue;
         const root = graph.root(row_nodes[index]);
-        const position = roots.get(root) orelse blk: {
-            const next = members.items.len;
+        const slot = try roots.getOrPut(root);
+        if (!slot.found_existing) {
+            slot.value_ptr.* = members.items.len;
             try members.append(allocator, .empty);
-            try roots.put(root, next);
-            break :blk next;
-        };
+        }
+    }
+    for (rows, row_nodes) |row, node| {
+        const position = roots.get(graph.root(node)) orelse continue;
         try members.items[position].append(allocator, row);
     }
     var output: std.ArrayList(Thread) = .empty;
@@ -150,7 +153,6 @@ pub fn group(allocator: std.mem.Allocator, rows: []const maildir.MessageSummary)
             if (!row.flags.seen) unread += 1;
             if (row.matches_filters) matching += 1;
         }
-        if (matching == 0) continue;
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(graph.names.items[entry.key_ptr.*], &digest, .{});
         const id = try allocator.alloc(u8, 64);
@@ -191,10 +193,14 @@ test "conversations link missing parents and cycles without merging identical su
     try t.expectEqual(@as(i64, 5), threads[0].latest.uid);
     var filtered = rows;
     filtered[0].matches_filters = false;
+    filtered[2].matches_filters = false;
+    filtered[3].matches_filters = false;
     const matches = try group(arena.allocator(), &filtered);
+    try t.expectEqual(@as(usize, 1), matches.len);
     try t.expectEqualStrings(threads[0].id, matches[0].id);
     try t.expectEqual(@as(usize, 1), matches[0].matching);
     try t.expectEqual(@as(usize, 2), matches[0].members.len);
+    try t.expectEqual(@as(i64, 5), matches[0].latest.uid);
 }
 
 test "folder UIDs and malformed identifiers do not create accidental conversations" {

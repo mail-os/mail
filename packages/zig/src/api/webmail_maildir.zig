@@ -189,6 +189,7 @@ pub fn flagsFrom(filename: []const u8) Flags {
 pub const FileRef = struct {
     dir: []const u8,
     name: []const u8,
+    sort_key: i64 = 0,
 };
 
 const extractBody = webmail_mime.extract;
@@ -218,9 +219,7 @@ fn collectFilesAtRoot(allocator: std.mem.Allocator, root: []const u8, user: []co
     // assigning UIDs. Concatenating directory lists changes identity/order.
     std.mem.sort(FileRef, refs.items, {}, struct {
         fn lessThan(_: void, left: FileRef, right: FileRef) bool {
-            const a = imap.parseMessageSortKey(left.name);
-            const b = imap.parseMessageSortKey(right.name);
-            if (a != b) return a < b;
+            if (left.sort_key != right.sort_key) return left.sort_key < right.sort_key;
             return std.mem.order(u8, left.name, right.name) == .lt;
         }
     }.lessThan);
@@ -228,10 +227,9 @@ fn collectFilesAtRoot(allocator: std.mem.Allocator, root: []const u8, user: []co
 }
 
 fn appendDir(allocator: std.mem.Allocator, refs: *std.ArrayList(FileRef), dir: []const u8) !void {
-    const files = fs_compat.listEmlFiles(allocator, dir) catch return;
-    // listEmlFiles already returns oldest-first stable order.
+    const files = fs_compat.listEmlFilesUnsorted(allocator, dir) catch return;
     for (files) |name| {
-        try refs.append(allocator, .{ .dir = dir, .name = name });
+        try refs.append(allocator, .{ .dir = dir, .name = name, .sort_key = imap.parseMessageSortKey(name) });
     }
 }
 
@@ -620,6 +618,7 @@ fn queryIndexed(a: std.mem.Allocator, db: *database.Database, user: []const u8, 
     var rows: std.ArrayList(MessageSummary) = .empty;
     var progress: search_index.Progress = .{};
     var remaining = options.index_budget;
+    const include_unmatched = options.include_context or options.attention_snapshot != null;
     for (folders) |folder| {
         // Review copies appear only in the explicit Sender Review workspace.
         if (std.ascii.eqlIgnoreCase(folder, "Screening") or std.ascii.eqlIgnoreCase(folder, "Declined")) continue;
@@ -632,7 +631,7 @@ fn queryIndexed(a: std.mem.Allocator, db: *database.Database, user: []const u8, 
         // catalogue uses the same folder and Maildir basename as webmail.
         const refs = try collectFiles(a, user, folder);
         const uids = try syncFolderUids(temporary, db, user, folder, refs);
-        var cached = try search_index.load(temporary, db, user, folder, options.query);
+        var cached = try search_index.load(temporary, db, user, folder, options.query, include_unmatched);
         var live = std.StringHashMap(void).init(temporary);
         var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer scratch.deinit();
@@ -664,6 +663,7 @@ fn queryIndexed(a: std.mem.Allocator, db: *database.Database, user: []const u8, 
             };
             progress.total += 1;
             progress.indexed += 1;
+            if (!doc.matches and !include_unmatched) continue;
             const flags = flagsFrom(ref.name);
             if (options.unread_queue and flags.deleted) continue;
             const deadline = if (options.attention_view) |kind|

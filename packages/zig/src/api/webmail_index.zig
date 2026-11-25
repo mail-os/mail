@@ -13,16 +13,16 @@ pub const Attachment = struct {
 pub const Document = struct {
     fingerprint: []const u8 = "",
     digest: [64]u8 = undefined,
-    sender: []const u8,
-    recipient: []const u8,
-    cc: []const u8,
-    bcc: []const u8,
-    subject: []const u8,
-    date: []const u8,
-    message_id: []const u8,
-    in_reply_to: []const u8,
-    references: []const u8,
-    snippet: []const u8,
+    sender: []const u8 = "",
+    recipient: []const u8 = "",
+    cc: []const u8 = "",
+    bcc: []const u8 = "",
+    subject: []const u8 = "",
+    date: []const u8 = "",
+    message_id: []const u8 = "",
+    in_reply_to: []const u8 = "",
+    references: []const u8 = "",
+    snippet: []const u8 = "",
     attachment_metadata: []const u8 = "[]",
     matches: bool = true,
 };
@@ -36,7 +36,7 @@ pub const Progress = struct {
     }
 };
 
-pub fn load(a: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, query: []const u8) !std.StringHashMap(Document) {
+pub fn load(a: std.mem.Allocator, db: *database.Database, user: []const u8, folder: []const u8, query: []const u8, include_unmatched: bool) !std.StringHashMap(Document) {
     // Collect the folder's FTS candidates once. Filtering the FTS cursor
     // by every document rowid repeats the same trigram search per message.
     const literal = try ftsLiteral(a, query);
@@ -64,8 +64,16 @@ pub fn load(a: std.mem.Allocator, db: *database.Database, user: []const u8, fold
     while (try stmt.step()) {
         const digest = stmt.columnText(2);
         if (digest.len != 64) continue;
-        try docs.put(try a.dupe(u8, stmt.columnText(0)), .{
-            .fingerprint = try a.dupe(u8, stmt.columnText(1)),
+        const basename = try a.dupe(u8, stmt.columnText(0));
+        const fingerprint = try a.dupe(u8, stmt.columnText(1));
+        const matches = stmt.columnInt64(14) != 0;
+        if (!matches and !include_unmatched) {
+            // Keep the identity for validation, progress and stale-row pruning.
+            try docs.put(basename, .{ .fingerprint = fingerprint, .digest = digest[0..64].*, .matches = false });
+            continue;
+        }
+        try docs.put(basename, .{
+            .fingerprint = fingerprint,
             .digest = digest[0..64].*,
             .sender = try a.dupe(u8, stmt.columnText(3)),
             .recipient = try a.dupe(u8, stmt.columnText(4)),
@@ -78,7 +86,7 @@ pub fn load(a: std.mem.Allocator, db: *database.Database, user: []const u8, fold
             .references = try a.dupe(u8, stmt.columnText(11)),
             .snippet = try a.dupe(u8, stmt.columnText(12)),
             .attachment_metadata = try a.dupe(u8, stmt.columnText(13)),
-            .matches = stmt.columnInt64(14) != 0,
+            .matches = matches,
         });
     }
     return docs;

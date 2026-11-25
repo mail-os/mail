@@ -347,6 +347,16 @@ pub fn countEmlFiles(dir_path: []const u8) usize {
 /// Orders messages by filename timestamp, then by name. The caller owns the
 /// returned slice and each filename string.
 pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]const u8 {
+    return listEmlFilesInternal(allocator, dir_path, true);
+}
+
+/// Collect the filenames without sorting for callers that merge directories
+/// and order the combined results themselves. Symlink checks are identical.
+pub fn listEmlFilesUnsorted(allocator: std.mem.Allocator, dir_path: []const u8) ![][]const u8 {
+    return listEmlFilesInternal(allocator, dir_path, false);
+}
+
+fn listEmlFilesInternal(allocator: std.mem.Allocator, dir_path: []const u8, comptime sorted: bool) ![][]const u8 {
     const path_z = toZ(dir_path) orelse return error.SystemResources;
     defer freeZ(path_z, dir_path.len);
 
@@ -379,7 +389,7 @@ pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]con
             try entries.ensureUnusedCapacity(allocator, 1);
             entries.appendAssumeCapacity(.{
                 .name = try allocator.dupe(u8, name),
-                .sort_key = parseFilenameTimestamp(name),
+                .sort_key = if (sorted) parseFilenameTimestamp(name) else 0,
             });
         }
     }
@@ -388,7 +398,7 @@ pub fn listEmlFiles(allocator: std.mem.Allocator, dir_path: []const u8) ![][]con
     // Non-timestamp files (sort_key=0) sort before all timestamp files.
     // This ensures new files (highest timestamp) always sort to the end,
     // so existing IMAP UIDs (which are 1-based indices) remain stable.
-    std.mem.sort(EmlEntry, entries.items, {}, struct {
+    if (sorted) std.mem.sort(EmlEntry, entries.items, {}, struct {
         fn lessThan(_: void, a: EmlEntry, b: EmlEntry) bool {
             if (a.sort_key != b.sort_key) return a.sort_key < b.sort_key;
             return std.mem.order(u8, a.name, b.name) == .lt;
