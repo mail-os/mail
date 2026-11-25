@@ -113,7 +113,8 @@ async function verifyControlRow(container, selector, height, sameRow = true, min
     const quiet = node.matches('.wm-list-toggle, .wm-action--quiet')
     const primary = node.matches('.mail-primary-button, .calendar-primary, .wm-snapshot-primary, .wm-compose-btn, .wm-send-btn, .login button:not(.login-secondary, .wm-action), .wm-writing-settings .wm-writing-save')
     const enabledPrimary = primary && node.matches(':enabled')
-    const borderToken = enabledPrimary ? '--primary-button-border' : '--control-border'
+    const enabledAccent = node.matches('.wm-action--accent:not(:disabled)')
+    const borderToken = enabledPrimary ? '--primary-button-border' : enabledAccent ? '--accent-button-border' : '--control-border'
     const borderChannels = style.getPropertyValue(borderToken).trim().slice(1).match(/../g)
     const border = `rgb(${borderChannels?.map(channel => Number.parseInt(channel, 16)).join(', ')})`
     return {
@@ -608,7 +609,7 @@ async function verifyAppearance(page, scheme, contrast = 'no-preference') {
       ['--message-selection-muted', '--message-selection'],
     ]
     const surfaces = ['--panel', '--toolbar', '--surface', '--sidebar', '--control-fill']
-    const borderRatios = token => surfaces.map(background => {
+    const borderRatios = (token, backgrounds = surfaces) => backgrounds.map(background => {
       const a = luminance(token)
       const b = luminance(background)
       return [(Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05), background]
@@ -620,6 +621,8 @@ async function verifyAppearance(page, scheme, contrast = 'no-preference') {
       borders: borderRatios('--control-border'),
       primaryBorders: borderRatios('--primary-button-border'),
       primaryBorder: style.getPropertyValue('--primary-button-border').trim(),
+      accentBorders: borderRatios('--accent-button-border', [...surfaces, '--accent-soft', '--selected']),
+      accentBorder: style.getPropertyValue('--accent-button-border').trim(),
       ratios: pairs.map(([foreground, background]) => {
         const a = luminance(foreground)
         const b = luminance(background)
@@ -635,8 +638,12 @@ async function verifyAppearance(page, scheme, contrast = 'no-preference') {
   const minimumBorderContrast = contrast === 'more' ? 4.5 : 3
   for (const [ratio, background] of theme.borders)
     assert(ratio >= minimumBorderContrast, `${scheme} control borders on ${background} must reach ${minimumBorderContrast}:1, got ${ratio.toFixed(2)}`)
-  const [red, green, blue] = theme.primaryBorder.slice(1).match(/../g).map(byte => Number.parseInt(byte, 16))
-  assert(blue > green && green > red, 'The enabled primary border is blue')
+  for (const [role, color] of [['primary', theme.primaryBorder], ['accent', theme.accentBorder]]) {
+    const [red, green, blue] = color.slice(1).match(/../g).map(byte => Number.parseInt(byte, 16))
+    assert(blue > green && green > red, `The enabled ${role} border is blue`)
+  }
+  for (const [ratio, background] of theme.accentBorders)
+    assert(ratio >= minimumBorderContrast, `${scheme} accent borders on ${background} must reach ${minimumBorderContrast}:1, got ${ratio.toFixed(2)}`)
   for (const [ratio, background] of theme.primaryBorders)
     assert(ratio >= 3, `${scheme} primary borders on ${background} must reach 3:1, got ${ratio.toFixed(2)}`)
 }

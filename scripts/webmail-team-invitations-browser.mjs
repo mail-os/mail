@@ -42,13 +42,14 @@ async function alignedControls(group, selector, height, sameRow) {
   const controls = await group.locator(selector).evaluateAll(nodes => nodes.map((node) => {
     const { top, bottom, height } = node.getBoundingClientRect()
     const style = getComputedStyle(node)
-    const color = style.getPropertyValue('--control-border').trim().slice(1).match(/../g)
+    const token = node.matches('.wm-action--accent:not(:disabled)') ? '--accent-button-border' : '--control-border'
+    const color = style.getPropertyValue(token).trim().slice(1).match(/../g)
     const channels = color.map(channel => Number.parseInt(channel, 16)).join(', ')
-    return { top, bottom, height, sharesOutline: style.border === `1px solid rgb(${channels})`, radius: style.borderRadius }
+    return { top, bottom, height, matchesOutline: style.border === `1px solid rgb(${channels})`, radius: style.borderRadius }
   }))
   assert(controls.length >= 2)
   for (const control of controls) {
-    assert(control.sharesOutline)
+    assert(control.matchesOutline)
     assert.equal(control.height, height)
     assert.equal(control.radius, '8px')
     if (sameRow) assert.deepEqual([control.top, control.bottom], [controls[0].top, controls[0].bottom])

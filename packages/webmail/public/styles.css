@@ -27,6 +27,7 @@
   --picker-end-padding: calc(var(--control-inline-padding) + var(--picker-icon-size) + var(--picker-icon-gap));
   --select-chevron: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Cpath d=%22m4 6 4 4 4-4%22 fill=%22none%22 stroke=%22%23515966%22 stroke-width=%221.5%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22/%3E%3C/svg%3E");
   --accent: #0755ad;
+  --accent-button-border: #407dc2;
   --primary: #0866d4;
   --primary-hover: #0756b4;
   --primary-button-border: var(--primary);
@@ -75,6 +76,7 @@
     --control-disabled-text: #a0a5b0;
     --select-chevron: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Cpath d=%22m4 6 4 4 4-4%22 fill=%22none%22 stroke=%22%23b7bcc9%22 stroke-width=%221.5%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22/%3E%3C/svg%3E");
     --accent: #94c4ff;
+    --accent-button-border: #7aa2d6;
     --primary: #2068c4;
     --primary-hover: #2d75d0;
     --primary-button-border: #347cda;
@@ -104,7 +106,7 @@
 }
 
 @media (prefers-contrast: more) {
-  :root { --border: #a4aab4; --control-border: #616975; }
+  :root { --border: #a4aab4; --control-border: #616975; --accent-button-border: var(--accent); }
 }
 @media (prefers-contrast: more) and (prefers-color-scheme: dark) {
   :root { --border: #666b77; --control-border: #a5aab6; }
@@ -1087,9 +1089,13 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-list-body:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .wm-read-subject:focus-visible, .wm-inline-error:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 6px; }
 .wm-inline-error { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 13px; background: var(--danger-soft); color: var(--danger); font-size: 13px; }
-.wm-action--accent { color: var(--accent); border-color: var(--control-border); background: var(--accent-soft); }
+.wm-action--accent {
+  color: var(--accent);
+  border-color: var(--accent-button-border);
+  background: var(--accent-soft);
+}
 .wm-action--accent:hover:not(:disabled), .wm-action--accent:focus-visible { background: var(--selected); }
-.wm-action--accent:disabled { background: var(--surface); }
+.wm-action--accent:disabled { border-color: var(--control-border); background: var(--surface); }
 .wm-action--accent .mail-icon { color: inherit; }
 .wm-read-unread-together { align-self: start; margin: 0 12px 4px; }
 .wm--reading-together .wm-read-together-entry, .wm-reading-back-short { display: none; }
