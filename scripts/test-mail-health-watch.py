@@ -3,7 +3,9 @@
 import importlib.util
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 import pathlib
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -96,6 +98,59 @@ class HealthTests(unittest.TestCase):
                 checks = watch.backup_checks(env, now)
                 self.assertEqual(checks, [{'name': watch.BACKUP_CHECK, 'ok': expected}])
                 self.assertEqual(watch.deploy_gate_failures(checks), [])
+
+    def test_staging_backup_preserves_receipt_when_restic_verification_fails(self):
+        if subprocess.run(["mv", "--version"], capture_output=True).returncode != 0:
+            self.skipTest("The Linux staging script uses GNU mv")
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            worker = root / 'mail-staging-restic-backup.sh'
+            shutil.copyfile(pathlib.Path(__file__).with_name(worker.name), worker)
+            source = root / 'source'
+            state = root / 'state'
+            credentials = root / 'credentials'
+            for path in (source / 'mail', state, credentials):
+                path.mkdir(parents=True)
+            (source / 'smtp.db').touch()
+            (credentials / 'restic-password').write_text('fixture-password')
+            config = root / 'mail.env'
+            receipt = state / 'last-success'
+            config.write_text(f'SMTP_PROFILE=staging\nMAIL_RESTIC_STATUS_FILE={receipt}\n')
+            receipt.write_text('timestamp=1\narchive=previous-backup.tgz\n')
+
+            archiver = root / 'mail-backup.sh'
+            archiver.write_text(
+                'set -eu\n'
+                'test -z "$MAIL_BACKUP_ENV_FILE"\n'
+                'touch "$BACKUP_DIR/mail-backup-fixture.tgz"\n'
+            )
+            restic = root / 'restic'
+            restic.write_text(
+                '#!/bin/sh\n'
+                'test -s "$RESTIC_PASSWORD_FILE" || exit 2\n'
+                'printf "%s\\n" "$2" >> "$STATE_DIRECTORY/operations"\n'
+                'if [ "$2" = check ]; then exit "$FIXTURE_CHECK_STATUS"; fi\n'
+            )
+            restic.chmod(0o700)
+            environment = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", STATE_DIRECTORY=str(state),
+                               CREDENTIALS_DIRECTORY=str(credentials), FIXTURE_CHECK_STATUS='12',
+                               RESTIC_REPOSITORY='s3:https://s3.us-east-1.amazonaws.com/test-bucket/staging/backups/mail')
+            command = ['bash', str(worker), str(source), str(config), '/bin/sh']
+
+            failed = subprocess.run(command, env=environment, capture_output=True)
+            self.assertEqual(failed.returncode, 12, failed.stderr)
+            self.assertEqual(receipt.read_text(), 'timestamp=1\narchive=previous-backup.tgz\n')
+            self.assertEqual((state / 'operations').read_text().splitlines(), ['backup', 'forget', 'check'])
+            self.assertFalse(list(state.glob('backup.*')))
+
+            environment['FIXTURE_CHECK_STATUS'] = '0'
+            succeeded = subprocess.run(command, env=environment, capture_output=True)
+            self.assertEqual(succeeded.returncode, 0, succeeded.stderr)
+            timestamp = int(receipt.read_text().splitlines()[0].split('=', 1)[1])
+            self.assertGreater(timestamp, 1)
+            self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(watch.backup_checks(config, timestamp), [{'name': watch.BACKUP_CHECK, 'ok': True}])
+            self.assertFalse(list(state.glob('backup.*')))
 
     def test_delivery_minute_window_and_depth_at_threshold(self):
         with tempfile.TemporaryDirectory() as directory:

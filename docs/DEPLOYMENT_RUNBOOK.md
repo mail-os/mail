@@ -1106,6 +1106,41 @@ or more than 25-hour-old success marker opens an incident. Set
 backup writes its success marker elsewhere. The marker is written after
 Restic verifies the off-host backup.
 
+**Scheduled backups on shared AWS staging**
+
+Use the encrypted staging EBS volume for Mail data and backup working files.
+Reserve a repository under `staging/backups/<name>` in a staging S3 bucket.
+Grant the staging instance role bucket location and listing for that prefix,
+and GetObject, PutObject, and DeleteObject on its objects. Use the instance
+role for Restic authentication. Keep the repository password in a dedicated
+staging recovery secret and install its copy as
+`/etc/mail/staging-restic-password` (root-owned, mode 0600).
+
+Set `RESTIC_REPOSITORY=s3:https://s3.<region>.amazonaws.com/<bucket>/staging/backups/<name>`
+and `AWS_DEFAULT_REGION` in root-owned `/etc/mail/staging-restic.env` (mode 0600).
+Install Restic and the SQLite CLI in the service PATH. Initialize the new
+repository with `restic init` using the same repository, password file, and
+instance role. Then run `sudo bash scripts/setup-staging-restic-backup.sh`
+from a checkout or artifact that includes both backup scripts.
+
+The timer runs shortly after installation and daily thereafter. The backup
+reads the active Maildir and SQLite data, excludes the live environment file,
+and verifies the remote packs before replacing
+`/var/lib/mail-staging-backup/last-success`. Retention groups snapshots by
+host and tag. Check the timer, service journal, and the watchdog's
+`Verified off-host backup freshness` entry.
+
+Restore a `mail-staging` snapshot into disposable storage using the staging
+repository password. Extract the Mail archive, run `mail backup rebind-local`
+on its SMTP database and Maildir, and verify SQLite and mailbox identities
+before starting isolated listeners. Supply a separate test environment file.
+
+To stop scheduling, run `systemctl disable --now mail-staging-restic.timer`
+and `systemctl stop mail-staging-restic.service`. Remove the staging
+`MAIL_RESTIC_STATUS_FILE` assignment from the Mail environment when retiring
+the watchdog check. Retain the repository and its recovery password for the
+staging retention window.
+
 **Authenticated client sync alerts**
 
 Create a dedicated mailbox, such as `sync-canary@staging.example.com`, and

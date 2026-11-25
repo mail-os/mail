@@ -37,7 +37,7 @@ trap cleanup EXIT
 declare -a snapshots=()
 for database in smtp.db caldav.db; do
   if [[ -f "${MAIL_DIR}/${database}" ]]; then
-    sqlite3 "${MAIL_DIR}/${database}" ".backup '${work_dir}/${database}'"
+    sqlite3 -readonly "${MAIL_DIR}/${database}" ".backup '${work_dir}/${database}'"
     sqlite3 -readonly "${work_dir}/${database}" "PRAGMA quick_check;" \
       | grep -qx ok
     snapshots+=("${database}")
