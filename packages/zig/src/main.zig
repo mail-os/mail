@@ -734,6 +734,18 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         if (env.get("CALDAV_MAX_SYNC_HISTORY")) |value| {
             store_config.max_sync_history = std.fmt.parseInt(u32, value, 10) catch store_config.max_sync_history;
         }
+        if (env.get("CALDAV_SYNC_CANARY_MAILBOX")) |mailbox| {
+            if (mailbox.len != 0) {
+                if (db_ptr.?.getUserByUsername(mailbox)) |found| {
+                    var account = found;
+                    defer account.deinit(db_ptr.?.allocator);
+                    store_config.sync_canary_mailbox_id = account.id;
+                } else |err| {
+                    if (err != error.NotFound) return err;
+                    log.warn("CALDAV_SYNC_CANARY_MAILBOX did not resolve to a provisioned mailbox", .{});
+                }
+            }
+        }
         caldav_store_inst = try caldav_store_mod.CalDavStore.init(allocator, store_config);
         log.info("CalDAV/CardDAV store persisting to: {s}", .{caldav_db_path});
 

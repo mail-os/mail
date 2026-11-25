@@ -414,8 +414,9 @@ Signing out removes all links. Saved drafts stay in their original mailbox.
 
 Mail keeps up to `CALDAV_MAX_SYNC_HISTORY` recent changes in memory for
 incremental DAV reports. The default is 10,000 changes across calendars and
-address books. If history is pruned or the server restarts, clients with an
-expired sync token can request the current collection with an empty token.
+address books. A configured sync canary keeps a separate history. If history
+is pruned or the server restarts, clients with an expired sync token can
+request the current collection with an empty token.
 
 ## Vacation replies
 

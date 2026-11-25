@@ -1113,9 +1113,19 @@ leave its Inbox empty. Create the `Mail-Health` calendar and
 `Mail-Health-Contacts` address book for that mailbox using authenticated
 `MKCALENDAR` and `MKCOL` requests on `/calendars/<mailbox>/Mail-Health/` and
 `/addressbooks/<mailbox>/Mail-Health-Contacts/`. Keep the canary separate from customer
-mailboxes and routes. Save the canary configuration to a root-owned file with
-mode 0600 and put its path in `MAIL_SYNC_HEALTH_CONFIG` in the Mail
-environment file.
+mailboxes and routes.
+
+Set `CALDAV_SYNC_CANARY_MAILBOX` in the Mail service environment to the
+exact address of this already provisioned mailbox. The daemon resolves the
+address at startup. On staging, verify the address and restart Mail first,
+then enable the scheduled probe. The canary's calendar and address book
+changes share a separate 16-entry history. Ordinary clients keep their
+existing `CALDAV_MAX_SYNC_HISTORY` budget. The DAV token format stays the
+same, including the usual fresh sync after a Mail restart.
+
+Save the canary configuration to a root-owned file with mode 0600 and put its
+path in `MAIL_SYNC_HEALTH_CONFIG` in the Mail environment file. Set its
+`mailbox` to the same address.
 
 ```json
 {

@@ -27,10 +27,42 @@ def run_canary(path):
     return {check['name']: check for check in json.loads(process.stdout)['checks']}
 
 
+def verify_history_isolation(canary, ordinary):
+    snapshots = []
+    marker = 'ordinary-client-' + secrets.token_hex(8)
+    for protocol, (parent, name, suffix, mime) in SYNC['DAV_COLLECTIONS'].items():
+        ordinary_collection = f'/{parent}/{ordinary.mailbox}/{name}/'
+        canary_collection = f'/{parent}/{canary.mailbox}/{name}/'
+        old_ordinary, _ = ordinary.dav_report(ordinary_collection, '')
+        old_canary, _ = canary.dav_report(canary_collection, '')
+        resource = ordinary_collection + f'{marker}.{suffix}'
+        _, headers, _ = ordinary.request(
+            'PUT', resource, ordinary.dav_document(protocol, marker),
+            {'Content-Type': mime}, expected=(201,),
+        )
+        snapshots.append((ordinary_collection, old_ordinary, resource, headers['ETag'],
+                          canary_collection, old_canary))
+
+    for _ in range(6):
+        for protocol in SYNC['DAV_COLLECTIONS']:
+            canary.dav_sync(protocol)
+
+    for collection, token, resource, etag, canary_collection, canary_token in snapshots:
+        _, members = ordinary.dav_report(collection, token)
+        assert len(members) == 1 and ordinary.dav_change(members, resource, etag=etag)
+        body = (f'<d:sync-collection xmlns:d="DAV:"><d:sync-token>{canary_token}</d:sync-token>'
+                '<d:sync-level>1</d:sync-level><d:prop><d:getetag/></d:prop></d:sync-collection>')
+        canary.request('REPORT', canary_collection, body, {'Content-Type': 'application/xml'}, expected=(403,))
+
+
 def verify(binary, directory):
     test = Fixture(binary, directory, staging=True)
     with test.daemon():
         mailbox = test.provision('sync-canary')
+        ordinary_mailbox = test.provision('ordinary-sync-client')
+
+    test.env.update(CALDAV_MAX_SYNC_HISTORY='4', CALDAV_SYNC_CANARY_MAILBOX=mailbox)
+    with test.daemon():
         config = {
             'mailbox': mailbox, 'password': test.password, 'canary_id': secrets.token_hex(16),
             'imaps_port': test.imaps_port, 'dav_port': int(test.env['CALDAV_SSL_PORT']),
@@ -40,6 +72,12 @@ def verify(binary, directory):
         config_path.write_text(json.dumps(config))
         config_path.chmod(0o600)
         canary = Probe('127.0.0.1', None, config)
+        ordinary = Probe('127.0.0.1', None, {**config, 'mailbox': ordinary_mailbox})
+        for client in (canary, ordinary):
+            for protocol, (parent, name, _, _) in SYNC['DAV_COLLECTIONS'].items():
+                method = 'MKCALENDAR' if protocol == 'caldav' else 'MKCOL'
+                client.request(method, f'/{parent}/{client.mailbox}/{name}/', expected=(201,))
+        verify_history_isolation(canary, ordinary)
         address = quote(mailbox, safe='@')
         collection = f'/addressbooks/{address}/Mail-Health-Contacts/'
         previous_marker = canary.marker + '-0000000000000000'
@@ -129,6 +167,10 @@ def verify(binary, directory):
 
         print('Verified IMAP UID state, both DAV change tokens, ActiveSync SyncKey and EWS SyncState over native TLS.')
         print('Verified scoped cleanup, authentication classification, a CardDAV incident, deduplication and recovery.')
+
+    with test.daemon():
+        verify_history_isolation(canary, ordinary)
+    print('Verified independent canary history bounds and ordinary client tokens with new and reopened DAV data.')
 
 
 if __name__ == '__main__':

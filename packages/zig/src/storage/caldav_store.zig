@@ -61,6 +61,9 @@ pub const StoreConfig = struct {
     /// Maximum sync history entries
     max_sync_history: u32 = 10000,
 
+    /// Stable account ID of the disposable client synchronization canary.
+    sync_canary_mailbox_id: ?i64 = null,
+
     /// Default calendar timezone
     default_timezone: []const u8 = "UTC",
 
@@ -299,6 +302,11 @@ pub const SyncChange = struct {
     pub const ChangeType = enum { created, modified, deleted };
 };
 
+const SyncHistory = struct {
+    changes: std.ArrayList(SyncChange) = .empty,
+    limit: usize,
+};
+
 pub const SyncReport = struct {
     changes: []SyncChange,
     new_sync_token: u64,
@@ -420,8 +428,10 @@ pub const CalDavStore = struct {
     user_ids: std.ArrayList(UserEntry),
     next_user_id: u64,
 
-    // Sync history
-    sync_changes: std.ArrayList(SyncChange),
+    sync_history: SyncHistory,
+    // Keep several complete CalDAV and CardDAV create/delete probe cycles.
+    canary_sync_history: SyncHistory = .{ .limit = 16 },
+    sync_canary_user_id: ?u64 = null,
     current_sync_token: u64,
     // This changes whenever the in-memory journal is rebuilt. Persisted
     // resources can be enumerated again using an empty DAV token.
@@ -543,7 +553,7 @@ pub const CalDavStore = struct {
             .addresses = .empty,
             .user_ids = .empty,
             .next_user_id = 1,
-            .sync_changes = .empty,
+            .sync_history = .{ .limit = config.max_sync_history },
             .current_sync_token = 1,
             .dav_sync_epoch = undefined,
             .shared_dav_sync = shared_sync.Store.init(allocator),
@@ -563,6 +573,10 @@ pub const CalDavStore = struct {
                 try ensureSchema(conn);
                 try self.loadFromDb();
             }
+        }
+
+        if (config.sync_canary_mailbox_id) |mailbox_id| {
+            self.sync_canary_user_id = self.findUserIdLocked("", mailbox_id);
         }
 
         return self;
@@ -586,10 +600,9 @@ pub const CalDavStore = struct {
         while (contact_iter.next()) |entry| {
             self.freeContact(entry.value_ptr.*);
         }
-        // Free allocated etag/href strings in sync changes (both owned by the store)
-        for (self.sync_changes.items) |change| {
-            self.allocator.free(change.etag);
-            self.allocator.free(change.uid);
+        for ([_]*SyncHistory{ &self.sync_history, &self.canary_sync_history }) |history| {
+            for (history.changes.items) |change| self.freeChange(change);
+            history.changes.deinit(self.allocator);
         }
         self.calendars.deinit();
         self.events.deinit();
@@ -602,7 +615,6 @@ pub const CalDavStore = struct {
         self.addresses.deinit(self.allocator);
         for (self.user_ids.items) |entry| self.allocator.free(entry.username);
         self.user_ids.deinit(self.allocator);
-        self.sync_changes.deinit(self.allocator);
         self.shared_dav_sync.deinit();
     }
 
@@ -1015,6 +1027,9 @@ pub const CalDavStore = struct {
             _ = try stmt.step();
         }
         self.user_ids.appendAssumeCapacity(.{ .username = name, .user_id = id, .mailbox_id = mailbox_id });
+        if (mailbox_id != null and mailbox_id == self.config.sync_canary_mailbox_id) {
+            self.sync_canary_user_id = id;
+        }
         self.next_user_id += 1;
         return id;
     }
@@ -3221,12 +3236,14 @@ pub const CalDavStore = struct {
 
         const expected_type: SyncChange.ResourceType = if (is_calendar) .event else .contact;
 
-        for (self.sync_changes.items) |change| {
-            if (change.resource_type == expected_type and
-                change.collection_id == collection_id and
-                change.token > since_token)
-            {
-                try changes.append(self.allocator, change);
+        for ([_][]const SyncChange{ self.sync_history.changes.items, self.canary_sync_history.changes.items }) |history| {
+            for (history) |change| {
+                if (change.resource_type == expected_type and
+                    change.collection_id == collection_id and
+                    change.token > since_token)
+                {
+                    try changes.append(self.allocator, change);
+                }
             }
         }
 
@@ -3354,10 +3371,11 @@ pub const CalDavStore = struct {
                 // The newest change determines whether each URL is live or
                 // removed, including after a delete and recreate at that URL.
                 var seen: std.StringHashMapUnmanaged(void) = .empty;
-                var index = self.sync_changes.items.len;
+                const history = self.syncHistory(kind, version.id).changes.items;
+                var index = history.len;
                 while (index > 0) {
                     index -= 1;
-                    const change = self.sync_changes.items[index];
+                    const change = history[index];
                     if (change.token <= since) break;
                     if (change.resource_type != kind or change.collection_id != version.id) continue;
                     if ((try seen.getOrPut(arena, change.uid)).found_existing) continue;
@@ -3370,6 +3388,18 @@ pub const CalDavStore = struct {
             },
         }
         return .{ .token = try std.fmt.allocPrint(arena, "{s}{d}", .{ prefix, version.revision }), .members = members.items };
+    }
+
+    /// Select by the persisted collection owner, including writes through a share.
+    fn syncHistory(self: *Self, kind: SyncChange.ResourceType, collection_id: u64) *SyncHistory {
+        if (self.sync_canary_user_id) |canary| {
+            const owner: ?u64 = switch (kind) {
+                .event => if (self.calendars.getPtr(collection_id)) |calendar| calendar.user_id else null,
+                .contact => if (self.addressbooks.getPtr(collection_id)) |book| book.user_id else null,
+            };
+            if (owner == canary) return &self.canary_sync_history;
+        }
+        return &self.sync_history;
     }
 
     /// The journal owns independent copies, including the UID of deleted items.
@@ -3400,7 +3430,8 @@ pub const CalDavStore = struct {
         errdefer self.allocator.free(owned_etag);
         const token = self.current_sync_token + 1;
 
-        try self.sync_changes.ensureUnusedCapacity(self.allocator, 1);
+        const history = self.syncHistory(resource_type, collection_id);
+        try history.changes.ensureUnusedCapacity(self.allocator, 1);
         return .{
             .resource_id = resource_id,
             .collection_id = collection_id,
@@ -3419,13 +3450,13 @@ pub const CalDavStore = struct {
     }
 
     fn publishChange(self: *Self, change: SyncChange) void {
-        self.sync_changes.appendAssumeCapacity(change);
+        const history = self.syncHistory(change.resource_type, change.collection_id);
+        history.changes.appendAssumeCapacity(change);
         self.current_sync_token = change.token;
 
-        // Prune old history, bounding retained changes. Free owned strings of
-        // any pruned entries to avoid leaks.
-        while (self.sync_changes.items.len > self.config.max_sync_history) {
-            const removed = self.sync_changes.orderedRemove(0);
+        // Pruning only advances history floors from the selected journal.
+        while (history.changes.items.len > history.limit) {
+            const removed = history.changes.orderedRemove(0);
             self.freeChange(removed);
             switch (removed.resource_type) {
                 .event => if (self.calendars.getPtr(removed.collection_id)) |cal| {
