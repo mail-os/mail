@@ -2686,18 +2686,22 @@ pub const Session = struct {
     }
 
     fn sendSaveError(self: *Session, writer: anytype, err: anyerror) !void {
-        self.logger.err("Failed to save message: {}", .{err});
-        switch (err) {
-            error.UnknownLocalMailbox => try self.sendResponse(writer, 550, "5.1.1 Recipient address rejected: user unknown", null),
-            error.HostedStorageFull => try self.sendResponse(writer, 452, "4.2.2 Recipient mailbox storage is full", null),
-            error.HostedRecipientDisabled => try self.sendResponse(writer, 550, "5.2.1 Recipient mailbox is disabled", null),
-            error.HostedRecipientReadOnly => try self.sendResponse(writer, 450, "4.2.1 Recipient mailbox is temporarily read-only", null),
-            error.HostedRecipientExpired => try self.sendResponse(writer, 550, "5.2.1 Recipient mailbox service ended", null),
-            error.HostedSenderDisabled => try self.sendResponse(writer, 550, "5.7.1 Sender mailbox is disabled", null),
-            error.HostedSenderReadOnly => try self.sendResponse(writer, 550, "5.7.1 Sender mailbox is read-only", null),
-            error.HostedSendingLimit => try self.sendResponse(writer, 452, "4.7.0 Daily recipient allowance exhausted; retry after midnight UTC", null),
-            else => try self.sendResponse(writer, 451, "4.3.0 Temporary storage failure; please retry", null),
-        }
+        const refusal: struct { code: u16, message: []const u8 } = switch (err) {
+            error.UnknownLocalMailbox => .{ .code = 550, .message = "5.1.1 Recipient address rejected: user unknown" },
+            error.HostedStorageFull => .{ .code = 452, .message = "4.2.2 Recipient mailbox storage is full" },
+            error.HostedRecipientDisabled => .{ .code = 550, .message = "5.2.1 Recipient mailbox is disabled" },
+            error.HostedRecipientReadOnly => .{ .code = 450, .message = "4.2.1 Recipient mailbox is temporarily read-only" },
+            error.HostedRecipientExpired => .{ .code = 550, .message = "5.2.1 Recipient mailbox service ended" },
+            error.HostedSenderDisabled => .{ .code = 550, .message = "5.7.1 Sender mailbox is disabled" },
+            error.HostedSenderReadOnly => .{ .code = 550, .message = "5.7.1 Sender mailbox is read-only" },
+            error.HostedSendingLimit => .{ .code = 452, .message = "4.7.0 Daily recipient allowance exhausted; retry after midnight UTC" },
+            else => {
+                self.logger.err("Failed to save message: {}", .{err});
+                return self.sendResponse(writer, 451, "4.3.0 Temporary storage failure; please retry", null);
+            },
+        };
+        self.logger.info("SMTP message refused by mailbox policy: {}", .{err});
+        return self.sendResponse(writer, refusal.code, refusal.message, null);
     }
 
     fn captureSentEvidence(self: *Session, a: std.mem.Allocator, raw: []const u8) ?smtp_sent.Evidence {

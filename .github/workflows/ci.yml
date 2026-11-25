@@ -214,6 +214,7 @@ jobs:
       run: |
         python3 ../../scripts/test-hosted-limits.py zig-out/bin/mail
         python3 ../../scripts/test-hosted-limits.py --staging zig-out/bin/mail
+        python3 ../../scripts/test-hosted-storage-alerts.py zig-out/bin/mail
         python3 ../../scripts/test-hosted-access.py zig-out/bin/mail
         python3 ../../scripts/test-hosted-domains.py zig-out/bin/mail
         python3 ../../scripts/test-hosted-staging.py --fixture zig-out/bin/mail
