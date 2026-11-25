@@ -1902,8 +1902,12 @@ retry queue. The daemon can read only the sanitized status artifact at
 instead of silently discarding pending notifications. Investigate and preserve it
 before repairing it. Do not erase it as routine cleanup.
 
-The public `/healthz` endpoint returns only healthy/unavailable, with HTTP 503 for
-failed or stale monitoring. The five-minute Public Mail Health workflow checks
+The public `/healthz` endpoint returns only healthy/unavailable. A single TLS
+receive error in the five-minute journal window leaves this endpoint healthy
+when every other check passes. The authenticated report and incident alert
+still record the error. Multiple receive errors in the same window, an
+independent failed check, or stale monitoring return HTTP 503. The five-minute
+Public Mail Health workflow checks
 this endpoint and the public mail protocols from outside the host. Configure the
 repository secret `MAIL_HEALTH_WEBHOOK` with the administrator's Discord webhook.
 Its first failure opens a GitHub incident and alerts the administrator; repeated

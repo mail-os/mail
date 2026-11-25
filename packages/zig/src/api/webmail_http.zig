@@ -623,10 +623,10 @@ fn handleConnection(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena
         if (!health.authorized(req.header("oh-dear-health-check-secret")))
             return sendError(conn, arena, 401, "unauthorized", "Monitoring credential required");
         const report = try health.response(arena, time_compat.timestamp());
-        return sendJson(conn, arena, if (health.isHealthy(arena, report)) 200 else 503, report, null);
+        return sendJson(conn, arena, if (health.isHealthy(arena, report, .monitoring)) 200 else 503, report, null);
     }
     if (std.mem.eql(u8, p, "/healthz") and std.mem.eql(u8, req.method, "GET")) {
-        const ok = health.isHealthy(arena, try health.response(arena, time_compat.timestamp()));
+        const ok = health.isHealthy(arena, try health.response(arena, time_compat.timestamp()), .availability);
         return sendJson(conn, arena, if (ok) 200 else 503, if (ok) "{\"status\":\"healthy\"}" else "{\"status\":\"unavailable\"}", null);
     }
     if (std.mem.eql(u8, p, "/webmail/api/health") and std.mem.eql(u8, req.method, "GET")) return handleHealth(server, conn, arena, req);
