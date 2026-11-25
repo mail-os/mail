@@ -1,5 +1,6 @@
 //! IMAP's view of a message, with offsets into its transfer-encoded source.
 const std = @import("std");
+const address_header = @import("../message/address_header.zig");
 const mime = @import("../message/mime.zig");
 const source = @import("../message/mime_source.zig");
 
@@ -378,61 +379,25 @@ fn writeEnvelope(out: *Writer, headers: mime.lib.Headers) Writer.Error!void {
 }
 
 fn writeAddresses(out: *Writer, value: []const u8) Writer.Error!void {
-    var start: usize = 0;
-    var quoted = false;
-    var escaped = false;
-    var comments: usize = 0;
-    var angled = false;
-    var domain_literal = false;
+    var list: address_header.Iterator = .{ .value = value };
     var opened = false;
     var group = false;
-    for (value, 0..) |byte, index| {
-        if (escaped) {
-            escaped = false;
+    while (list.next()) |part| {
+        if (part.separator == ':') {
+            const name = std.mem.trim(u8, part.text, " \t");
+            if (!group and name.len != 0) {
+                try beginAddressList(out, &opened);
+                try writeAddress(out, null, null, name, null);
+                group = true;
+            }
             continue;
         }
-        if (byte == '\\' and (quoted or comments != 0 or domain_literal)) {
-            escaped = true;
-            continue;
-        }
-        if (!quoted and !domain_literal and byte == '(') {
-            comments += 1;
-            continue;
-        }
-        if (comments != 0) {
-            if (byte == ')') comments -= 1;
-            continue;
-        }
-        if (!domain_literal and byte == '"') quoted = !quoted;
-        if (quoted) continue;
-        if (byte == '[') domain_literal = true;
-        if (byte == ']') domain_literal = false;
-        if (domain_literal) continue;
-        if (byte == '<') angled = true;
-        if (byte == '>') angled = false;
-        if (angled) continue;
-        switch (byte) {
-            ':' => {
-                const name = std.mem.trim(u8, value[start..index], " \t");
-                if (!group and name.len != 0) {
-                    try beginAddressList(out, &opened);
-                    try writeAddress(out, null, null, name, null);
-                    group = true;
-                }
-                start = index + 1;
-            },
-            ',', ';' => {
-                try writeMailbox(out, &opened, value[start..index]);
-                if (byte == ';' and group) {
-                    try writeAddress(out, null, null, null, null);
-                    group = false;
-                }
-                start = index + 1;
-            },
-            else => {},
+        try writeMailbox(out, &opened, part.text);
+        if (part.separator == ';' and group) {
+            try writeAddress(out, null, null, null, null);
+            group = false;
         }
     }
-    try writeMailbox(out, &opened, value[start..]);
     if (group) try writeAddress(out, null, null, null, null);
     try out.writeAll(if (opened) ")" else "NIL");
 }

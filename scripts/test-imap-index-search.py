@@ -17,13 +17,15 @@ from urllib.parse import parse_qs, urlsplit
 Fixture = runpy.run_path(str(Path(__file__).with_name("test-hosted-limits.py")))["Fixture"]
 MATCH_COUNT = 251
 PAGE_SIZE = 250
+COLLECTION = "messages_v3"
 
 
 class SearchIndex(ThreadingHTTPServer):
     def __init__(self):
         super().__init__(("127.0.0.1", 0), SearchHandler)
-        self.documents = []
-        self.legacy_documents = []
+        self.collections = {name: [] for name in ("messages", "messages_v2", COLLECTION)}
+        self.documents = self.collections[COLLECTION]
+        self.legacy_documents = self.collections["messages"]
         self.requests = []
         self.coverage_requests = []
         self.failure = None
@@ -39,7 +41,7 @@ class SearchHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         url = urlsplit(self.path)
-        for name in ("messages", "messages_v2"):
+        for name in self.server.collections:
             if url.path == f"/collections/{name}":
                 self.send_json(200, {"name": name})
                 return
@@ -47,10 +49,11 @@ class SearchHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         params = parse_qs(url.query, keep_blank_values=True)
-        documents = (self.server.legacy_documents if url.path == "/collections/messages/documents/search"
-                     else self.server.documents)
-        assert url.path in ("/collections/messages/documents/search", "/collections/messages_v2/documents/search"), self.path
-        assert params["query_by"] == ["subject"], params
+        collection = url.path.split("/")[2]
+        assert url.path == f"/collections/{collection}/documents/search", self.path
+        documents = self.server.collections[collection]
+        query_by, = params["query_by"]
+        assert query_by in ("subject", "sender", "recipients"), params
         query, = params["q"]
         page, = map(int, params["page"])
         size, = map(int, params["per_page"])
@@ -65,7 +68,7 @@ class SearchHandler(BaseHTTPRequestHandler):
                 f'username:=`{doc["username"]}`',
                 f'username:=`{doc["username"]}` && mailbox:=`{doc["mailbox"]}`',
             )
-            and (query == "*" or all(word in doc["subject"].lower().split() for word in query.lower().split()))
+            and (query == "*" or all(word in doc[query_by].lower().split() for word in query.lower().split()))
         ]
         hits = [{"document": {"id": doc["id"]} if fields == "id" else doc}
                 for doc in matches[(page - 1) * size : page * size]]
@@ -90,7 +93,7 @@ class SearchHandler(BaseHTTPRequestHandler):
         self.send_json(200, response)
 
     def do_POST(self):
-        assert self.path == "/collections/messages_v2/documents?action=upsert", self.path
+        assert self.path == f"/collections/{COLLECTION}/documents?action=upsert", self.path
         doc = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.writes.append(("POST", doc["id"]))
         if "POST" in self.server.failed_writes:
@@ -105,7 +108,7 @@ class SearchHandler(BaseHTTPRequestHandler):
         self.send_json(200, doc)
 
     def do_DELETE(self):
-        prefix = "/collections/messages_v2/documents/"
+        prefix = f"/collections/{COLLECTION}/documents/"
         assert self.path.startswith(prefix), self.path
         document_id = self.path.removeprefix(prefix)
         self.server.writes.append(("DELETE", document_id))
@@ -248,6 +251,69 @@ def wait_for(condition, message):
     raise AssertionError(message)
 
 
+def verify_address_reindex(index, fixture, directory):
+    owner = fixture.provision("address-reindex")
+    peer = fixture.provision("address-peer")
+    plain = ("Plain café <sender@example.test>", "Plain café <first@example.test>, Second <second@example.test>")
+    decoded = ("Staged café <sender@example.test>", "Staged café <first@example.test>,\tSecond <second@example.test>")
+    encoded_name = "=?UTF-8?Q?Staged?=\r\n =?UTF-8?B?IGNhZsOp?="
+    folded = (encoded_name + " <sender@example.test>", encoded_name + " <first@example.test>,\r\n\tSecond <second@example.test>")
+
+    inbox = directory / "mail" / owner / "new"
+    inbox.mkdir(parents=True, exist_ok=True)
+
+    def wire(sender, recipients):
+        return f"From: {sender}\r\nTo: {recipients}\r\nSubject: Existing subject\r\n\r\nTest message.\r\n".encode()
+
+    subject_only = index.collections["messages_v2"]
+    for i, headers in enumerate((plain, folded)):
+        filename = f"{1780000000100 + i}.eml"
+        (inbox / filename).write_bytes(wire(*headers))
+        key = "\0".join((owner, "INBOX", filename)).encode()
+        subject_only.append({"id": hashlib.sha256(key).hexdigest()[:32], "username": owner, "mailbox": "INBOX",
+                             "filename": filename, "subject": "Existing subject",
+                             "sender": headers[0].splitlines()[0], "recipients": headers[1].splitlines()[0]})
+
+    def matches(client, predicate):
+        status, rows = client.uid("SEARCH", None, "CHARSET", "UTF-8", f'{predicate} "café"'.encode())
+        assert status == "OK", (predicate, status, rows)
+        return rows[0].split()
+
+    # A matching message owned by another user must stay outside the scope.
+    with fixture.imap(peer) as client:
+        assert client.append("INBOX", None, None, wire(*plain))[0] == "OK"
+    with fixture.imap(owner) as client:
+        assert client.select("INBOX", readonly=True)[0] == "OK"
+        uids = search(client, "ALL")
+        assert len(uids) == 2
+        index.requests.clear()
+        assert matches(client, "FROM") == matches(client, "TO") == uids
+        assert not index.requests
+        subprocess.run([str(fixture.binary), "search", "reindex", "--queue"], cwd=directory, env=fixture.env,
+                       capture_output=True, timeout=15, check=True)
+
+        scope = f"username:=`{owner}` && mailbox:=`INBOX`"
+
+        def indexed_matches(expected):
+            index.requests.clear()
+            assert matches(client, "FROM") == matches(client, "TO") == expected
+            return index.requests == [("café", 1, PAGE_SIZE, scope, "id")] * 2
+
+        wait_for(lambda: indexed_matches(uids), "FROM and TO did not resume indexed search")
+        assert subject_only[1]["sender"] == subject_only[1]["recipients"] == encoded_name.splitlines()[0]
+        assert client.append("INBOX", None, None, wire(*folded))[0] == "OK"
+        assert client.select("INBOX", readonly=True)[0] == "OK"
+        new_uids = search(client, "ALL")
+        assert len(new_uids) == 3
+        wait_for(lambda: indexed_matches(new_uids), "new folded addresses did not become searchable")
+
+    indexed_headers = [(doc["sender"], doc["recipients"]) for doc in index.documents if doc["username"] == owner]
+    assert sorted(indexed_headers) == sorted([plain, decoded, decoded]), indexed_headers
+    with fixture.imap(peer) as client:
+        assert client.select("INBOX", readonly=True)[0] == "OK"
+        assert matches(client, "FROM") == matches(client, "TO") == [b"1"]
+
+
 def verify(index, fixture, directory):
     owner = fixture.provision("index-owner")
     other = fixture.provision("other-index-owner")
@@ -330,7 +396,7 @@ def main():
     parser.add_argument("binary", type=Path)
     args = parser.parse_args()
     verify_encoded_headers(args.binary.resolve(strict=True))
-    for check in (verify, verify_subject_reindex):
+    for check in (verify, verify_subject_reindex, verify_address_reindex):
         with tempfile.TemporaryDirectory(prefix="mail-index-search-") as scratch, SearchIndex() as index:
             thread = Thread(target=index.serve_forever, daemon=True)
             thread.start()
@@ -344,7 +410,7 @@ def main():
             finally:
                 index.shutdown()
                 thread.join()
-    print("Verified indexed IMAP pagination, encoded headers, live and offline backfill, and complete fallback over IMAPS.")
+    print("Verified indexed IMAP pagination, encoded subjects and addresses, live and offline backfill, and complete fallback over IMAPS.")
 
 
 if __name__ == "__main__":

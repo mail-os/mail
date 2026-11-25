@@ -17,11 +17,11 @@
 const std = @import("std");
 const se = @import("search-engine");
 const mime = @import("../message/mime.zig").lib;
+const address_header = @import("../message/address_header.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-// The original collection contains raw, sometimes truncated Subject values.
-// Keep it available for the previous binary during rollback.
-pub const collection = "messages_v2";
+// Earlier collections contain raw, sometimes truncated header values.
+pub const collection = "messages_v3";
 
 /// The Message search model: which attributes are full-text searchable,
 /// filterable (facets), and sortable. This is the single source of truth
@@ -155,10 +155,6 @@ pub fn indexRawMessage(allocator: std.mem.Allocator, username: []const u8, mailb
     const header_copy = try allocator.dupe(u8, headers);
     defer allocator.free(header_copy);
     const unfolded: mime.Headers = .{ .block = mime.headers.unfold(header_copy) };
-    const subject = unfolded.get("Subject") orelse "";
-    const encoded = std.mem.indexOf(u8, subject, "=?") != null;
-    const decoded = try allocator.alloc(u8, if (encoded) subject.len * 3 else 0);
-    defer allocator.free(decoded);
 
     var id_buf: [32]u8 = undefined;
     const id = docId(&id_buf, username, mailbox, base);
@@ -169,9 +165,9 @@ pub fn indexRawMessage(allocator: std.mem.Allocator, username: []const u8, mailb
     try doc.putString("username", username);
     try doc.putString("mailbox", mailbox);
     try doc.putString("filename", base);
-    try doc.putString("sender", headerValue(headers, "from") orelse "");
-    try doc.putString("recipients", headerValue(headers, "to") orelse "");
-    try doc.putString("subject", if (encoded) mime.decodeWords(subject, decoded).text else subject);
+    try putHeader(&doc, "sender", unfolded.get("From") orelse "", .addresses);
+    try putHeader(&doc, "recipients", unfolded.get("To") orelse "", .addresses);
+    try putHeader(&doc, "subject", unfolded.get("Subject") orelse "", .text);
     try doc.putString("body", body[0..@min(body.len, max_indexed_body)]);
     try doc.putInt("date", filenameTimestampSecs(base));
     const json = try doc.toOwned();
@@ -358,18 +354,65 @@ fn baseName(filename: []const u8) []const u8 {
     return filename;
 }
 
-fn headerValue(headers: []const u8, name_lower: []const u8) ?[]const u8 {
-    var it = std.mem.splitScalar(u8, headers, '\n');
-    while (it.next()) |raw| {
-        const line = std.mem.trimEnd(u8, raw, "\r");
-        if (line.len == 0) break;
-        if (line.len > name_lower.len and line[name_lower.len] == ':' and
-            std.ascii.eqlIgnoreCase(line[0..name_lower.len], name_lower))
-        {
-            return std.mem.trim(u8, line[name_lower.len + 1 ..], " \t");
+fn putHeader(doc: *se.DocBuilder, name: []const u8, unfolded_value: []const u8, kind: enum { text, addresses }) !void {
+    if (std.mem.indexOf(u8, unfolded_value, "=?") == null) return doc.putString(name, unfolded_value);
+    const decoded = try doc.allocator.alloc(u8, unfolded_value.len * 3);
+    defer doc.allocator.free(decoded);
+    const value = switch (kind) {
+        .text => mime.decodeWords(unfolded_value, decoded).text,
+        .addresses => decodeAddressNames(unfolded_value, decoded),
+    };
+    try doc.putString(name, value);
+}
+
+fn decodeAddressNames(value: []const u8, out: []u8) []const u8 {
+    var list: address_header.Iterator = .{ .value = value };
+    var written: usize = 0;
+    while (list.next()) |part| {
+        // RFC 2047 applies to the display phrase, never the addr-spec.
+        const name_end = if (part.separator == ':') part.text.len else part.angle_start orelse 0;
+        written += decodeDisplayPhrase(part.text[0..name_end], out[written..]);
+        const address = part.text[name_end..];
+        @memcpy(out[written..][0..address.len], address);
+        written += address.len;
+        if (part.separator) |separator| {
+            out[written] = separator;
+            written += 1;
         }
     }
-    return null;
+    return out[0..written];
+}
+
+fn decodeDisplayPhrase(value: []const u8, out: []u8) usize {
+    var written: usize = 0;
+    var start: usize = 0;
+    var quoted = false;
+    var escaped = false;
+    for (value, 0..) |byte, index| {
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (quoted and byte == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (byte != '"') continue;
+        if (quoted) {
+            const literal = value[start .. index + 1];
+            @memcpy(out[written..][0..literal.len], literal);
+            written += literal.len;
+            start = index + 1;
+        } else {
+            written += mime.decodeWords(value[start..index], out[written..]).text.len;
+            start = index;
+        }
+        quoted = !quoted;
+    }
+    if (!quoted) return written + mime.decodeWords(value[start..], out[written..]).text.len;
+    const literal = value[start..];
+    @memcpy(out[written..][0..literal.len], literal);
+    return written + literal.len;
 }
 
 fn filenameTimestampSecs(base: []const u8) i64 {
@@ -396,14 +439,25 @@ test "docId is stable and differs across mailboxes" {
 }
 
 test "message schema declares the search model" {
-    try std.testing.expectEqualStrings("messages_v2", message_schema.name);
+    try std.testing.expectEqualStrings("messages_v3", message_schema.name);
     try std.testing.expect(message_schema.searchable.len == 4);
     try std.testing.expect(message_schema.filterable.len == 2);
 }
 
-test "header parsing helpers" {
-    const msg = "From: a@b.c\r\nSubject: hi\r\n\r\nbody";
-    try std.testing.expectEqualStrings("a@b.c", headerValue(msg, "from").?);
-    try std.testing.expectEqualStrings("hi", headerValue(msg, "subject").?);
+test "search documents decode display names without losing addresses" {
+    var doc = se.DocBuilder.init(std.testing.allocator);
+    defer doc.deinit();
+    try putHeader(&doc, "sender", "=?UTF-8?Q?Caf=C3=A9?= <=?UTF-8?Q?literal?=@example.test>", .addresses);
+    try putHeader(&doc, "recipients", "=?UTF-8?Q?Team?=: =?UTF-8?Q?Caf=C3=A9?= <two@example.test>, =?UTF-8?Q?literal?=@example.test;", .addresses);
+    try putHeader(&doc, "subject", "Plain subject", .text);
+    const json = try doc.toOwned();
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings("{\"sender\":\"Café <=?UTF-8?Q?literal?=@example.test>\",\"recipients\":\"Team: Café <two@example.test>, =?UTF-8?Q?literal?=@example.test;\",\"subject\":\"Plain subject\"}", json);
     try std.testing.expectEqual(@as(i64, 1781094), filenameTimestampSecs("1781094896.eml"));
+}
+
+test "encoded-looking text in quoted address phrases stays literal" {
+    const value = "\"=?UTF-8?Q?literal?=\" =?UTF-8?Q?Caf=C3=A9?= <first@example.test>";
+    var buffer: [value.len * 3]u8 = undefined;
+    try std.testing.expectEqualStrings("\"=?UTF-8?Q?literal?=\" Café <first@example.test>", decodeAddressNames(value, &buffer));
 }
