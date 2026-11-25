@@ -2,6 +2,7 @@ const std = @import("std");
 const cli = @import("zig-cli");
 const search_cli = @import("../search_cli.zig");
 const typesense = @import("../search/typesense.zig");
+const maildir_index = @import("../search/maildir_index.zig");
 const fs_compat = @import("../core/fs_compat.zig");
 
 fn withSearchEngine(comptime action: fn (*cli.BaseCommand.ParseContext, *search_cli.search.MessageSearch) anyerror!void) cli.BaseCommand.CommandAction {
@@ -103,6 +104,16 @@ fn typesenseReindexAction(ctx: *cli.BaseCommand.ParseContext) anyerror!void {
 
     if (!typesense.enabled()) {
         std.debug.print("Error: TYPESENSE_API_KEY is not set (TYPESENSE_HOST/TYPESENSE_PORT optional)\n", .{});
+        return error.Disabled;
+    }
+
+    if (ctx.hasOption("queue")) {
+        if (ctx.getOption("root") != null) return error.ConflictingOptions;
+        const db_path = search_cli.env.get("SMTP_DB_PATH") orelse "smtp.db";
+        var db = try search_cli.database.Database.init(allocator, db_path);
+        defer db.deinit();
+        const queued = try maildir_index.queueReindex(allocator, &db);
+        std.debug.print("Queued Typesense reindex for {d} mailboxes\n", .{queued});
         return;
     }
 
@@ -169,6 +180,7 @@ fn typesenseReindexAction(ctx: *cli.BaseCommand.ParseContext) anyerror!void {
     }
 
     std.debug.print("Typesense reindex complete: {d} indexed, {d} failed\n", .{ indexed, failed });
+    if (failed != 0) return error.PartialReindex;
 }
 
 fn addSearchOptions(cmd: *cli.BaseCommand) !void {
@@ -225,6 +237,7 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     // search reindex — backfill the Typesense index from the Maildir
     const reindex_cmd = try cli.BaseCommand.init(allocator, "reindex", "Backfill the Typesense index from the Maildir");
     _ = try reindex_cmd.addOption(cli.Option.init("root", "root", "Maildir root (default: mail)", .string));
+    _ = try reindex_cmd.addOption(cli.Option.init("queue", "queue", "Queue a live rebuild of the server's Maildir", .bool));
     _ = reindex_cmd.setAction(typesenseReindexAction);
     _ = try cmd.addCommand(reindex_cmd);
 

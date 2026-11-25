@@ -3185,21 +3185,29 @@ pub const ImapSession = struct {
         return if (std.ascii.eqlIgnoreCase(name, "INBOX")) "INBOX" else name;
     }
 
-    /// Identity for search-index operations: the local-part username and
+    /// Identity for search-index operations: the canonical username and
     /// the selected mailbox (null for virtual/aggregate mailboxes, which
     /// span folders and therefore search the whole account).
     fn searchIdentity(self: *ImapSession) ?SearchIdentity {
-        const full_username = self.username orelse return null;
-        const username = full_username;
+        const username = self.username orelse return null;
         if (self.mailbox_is_virtual) return .{ .username = username, .mailbox = null };
-        return .{ .username = username, .mailbox = self.mailbox_name orelse "INBOX" };
+        return .{ .username = username, .mailbox = self.sourceMailboxForIndex(0) };
     }
 
-    fn searchTextIndex(self: *ImapSession, term: search.Text) !?typesense.MessageIds {
-        const ident = self.searchIdentity() orelse return null;
-        const field = term.index_field orelse return null;
-        if (term.term.len == 0) return null;
-        return try typesense.searchMessageIds(self.allocator, ident.username, ident.mailbox, term.term, field);
+    /// A freshly created or partially rebuilt collection can answer queries
+    /// successfully while omitting live messages. Verify coverage by identity
+    /// so a stale document cannot stand in for a missing message.
+    fn searchIndexCoversSelection(self: *ImapSession, a: std.mem.Allocator, ident: SearchIdentity) !bool {
+        const files = self.mailbox_files orelse return false;
+        var coverage = try typesense.searchMessageIds(a, ident.username, ident.mailbox, "*", "subject");
+        defer coverage.deinit(a);
+        if (coverage.count() < files.len) return false;
+        for (files, 0..) |filename, i| {
+            var id: typesense.MessageId = undefined;
+            _ = typesense.docId(&id, ident.username, self.sourceMailboxForIndex(i), MaildirFlags.baseName(filename));
+            if (!coverage.contains(id)) return false;
+        }
+        return true;
     }
 
     const SearchMessage = struct {
@@ -3353,20 +3361,30 @@ pub const ImapSession = struct {
         };
 
         const count = if (self.mailbox_files) |files| files.len else 0;
-        const identity = if (count > 0 and query.text.len > 0 and typesense.enabled()) self.searchIdentity() else null;
+        var has_index_terms = false;
+        for (query.text) |term| {
+            if (term.index_field != null and term.term.len != 0) {
+                has_index_terms = true;
+                break;
+            }
+        }
+        const identity = if (count > 0 and has_index_terms and typesense.enabled()) self.searchIdentity() else null;
         const db = self.auth_backend.db;
         const epoch: ?i64 = if (identity) |ident| maildir_index.searchEpoch(db, ident.username, ident.mailbox) catch null else null;
         const indexed = try a.alloc(?typesense.MessageIds, query.text.len);
-        for (query.text, indexed) |term, *hits| {
-            hits.* = if (epoch != null) self.searchTextIndex(term) catch null else null;
-        }
+        @memset(indexed, null);
         defer {
             for (indexed) |*hits| {
                 if (hits.*) |*set| set.deinit(self.allocator);
             }
         }
-        if (epoch != null) {
+        if (epoch != null and (self.searchIndexCoversSelection(a, identity.?) catch false)) {
             const ident = identity.?;
+            for (query.text, indexed) |term, *hits| {
+                const field = term.index_field orelse continue;
+                if (term.term.len == 0) continue;
+                hits.* = typesense.searchMessageIds(self.allocator, ident.username, ident.mailbox, term.term, field) catch null;
+            }
             const current = maildir_index.searchEpoch(db, ident.username, ident.mailbox) catch null;
             if (current != epoch) {
                 for (indexed) |*hits| {

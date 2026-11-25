@@ -7,8 +7,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import runpy
+import subprocess
 import tempfile
 from threading import Thread
+import time
 from urllib.parse import parse_qs, urlsplit
 
 
@@ -21,7 +23,9 @@ class SearchIndex(ThreadingHTTPServer):
     def __init__(self):
         super().__init__(("127.0.0.1", 0), SearchHandler)
         self.documents = []
+        self.legacy_documents = []
         self.requests = []
+        self.coverage_requests = []
         self.failure = None
         self.failed_writes = set()
         self.writes = []
@@ -35,36 +39,43 @@ class SearchHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         url = urlsplit(self.path)
-        if url.path == "/collections/messages":
-            self.send_json(200, {"name": "messages"})
+        for name in ("messages", "messages_v2"):
+            if url.path == f"/collections/{name}":
+                self.send_json(200, {"name": name})
+                return
+        if not url.path.endswith("/documents/search"):
+            self.send_error(404)
             return
         params = parse_qs(url.query, keep_blank_values=True)
-        assert url.path == "/collections/messages/documents/search", self.path
+        documents = (self.server.legacy_documents if url.path == "/collections/messages/documents/search"
+                     else self.server.documents)
+        assert url.path in ("/collections/messages/documents/search", "/collections/messages_v2/documents/search"), self.path
         assert params["query_by"] == ["subject"], params
         query, = params["q"]
         page, = map(int, params["page"])
         size, = map(int, params["per_page"])
         condition, = params["filter_by"]
         fields, = params.get("include_fields", [""])
-        self.server.requests.append((query, page, size, condition, fields))
+        requests = self.server.coverage_requests if query == "*" else self.server.requests
+        requests.append((query, page, size, condition, fields))
 
         matches = [
-            doc for doc in self.server.documents
+            doc for doc in documents
             if condition in (
                 f'username:=`{doc["username"]}`',
                 f'username:=`{doc["username"]}` && mailbox:=`{doc["mailbox"]}`',
             )
-            and all(word in doc["subject"].lower().split() for word in query.lower().split())
+            and (query == "*" or all(word in doc["subject"].lower().split() for word in query.lower().split()))
         ]
         hits = [{"document": {"id": doc["id"]} if fields == "id" else doc}
                 for doc in matches[(page - 1) * size : page * size]]
         response = {"found": len(matches), "hits": hits, "page": page, "search_cutoff": False}
         pause = self.server.pause_search
-        if pause is not None and condition == pause[0]:
+        if query != "*" and pause is not None and condition == pause[0]:
             self.server.pause_search = None
             pause[1].set()
             assert pause[2].wait(15), condition
-        if page == 2:
+        if query != "*" and page == 2:
             if self.server.failure == "unavailable":
                 self.send_error(503, "Index temporarily unavailable")
                 return
@@ -79,7 +90,7 @@ class SearchHandler(BaseHTTPRequestHandler):
         self.send_json(200, response)
 
     def do_POST(self):
-        assert self.path == "/collections/messages/documents?action=upsert", self.path
+        assert self.path == "/collections/messages_v2/documents?action=upsert", self.path
         doc = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.writes.append(("POST", doc["id"]))
         if "POST" in self.server.failed_writes:
@@ -94,7 +105,7 @@ class SearchHandler(BaseHTTPRequestHandler):
         self.send_json(200, doc)
 
     def do_DELETE(self):
-        prefix = "/collections/messages/documents/"
+        prefix = "/collections/messages_v2/documents/"
         assert self.path.startswith(prefix), self.path
         document_id = self.path.removeprefix(prefix)
         self.server.writes.append(("DELETE", document_id))
@@ -114,7 +125,7 @@ class SearchHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-def seed_message(index, directory, username, folder, number, subject, reviewed=False, mailbox=None):
+def seed_message(index, directory, username, folder, number, subject, reviewed=False, mailbox=None, legacy=False):
     filename = f"{1780000000000 + number}.eml"
     path = (directory / "mail" / username / folder).resolve(strict=True)
     suffix = ":2,a" if reviewed else ""
@@ -123,12 +134,13 @@ def seed_message(index, directory, username, folder, number, subject, reviewed=F
         (path.parent / "dovecot-keywords").write_text("0 Reviewed\n", encoding="ascii")
     mailbox = mailbox or folder
     key = "\0".join((username, mailbox, filename)).encode()
-    index.documents.append({
+    documents = index.legacy_documents if legacy else index.documents
+    documents.append({
         "id": hashlib.sha256(key).hexdigest()[:32],
         "username": username,
         "mailbox": mailbox,
         "filename": filename,
-        "subject": subject,
+        "subject": subject.splitlines()[0] if legacy else subject,
     })
 
 
@@ -146,6 +158,94 @@ def expect_index_search(index, client, filter_by, query, term, expected, *, uid=
         (term, 1, PAGE_SIZE, filter_by, "id"),
         (term, 2, PAGE_SIZE, filter_by, "id"),
     ], index.requests
+
+
+def verify_subject_reindex(index, fixture, directory):
+    owner = fixture.provision("reindex-owner")
+    peer = fixture.provision("reindex-peer")
+    plain = "Staged receipt plain"
+    encoded = "=?UTF-8?Q?Staged_receipt?=\r\n =?UTF-8?B?IGNhZsOp?="
+    decoded = "Staged receipt café"
+    for user in (owner, peer):
+        (directory / "mail" / user / "new").mkdir(parents=True, exist_ok=True)
+    seed_message(index, directory, owner, "new", 0, plain, mailbox="INBOX")
+    seed_message(index, directory, owner, "new", 1, encoded, mailbox="INBOX", legacy=True)
+    seed_message(index, directory, peer, "new", 0, plain, mailbox="INBOX")
+    # A stale document keeps the count equal even though an actual ID is missing.
+    stale = dict(index.documents[0], id="0" * 32)
+    index.documents.append(stale)
+
+    with fixture.imap(owner) as client:
+        assert client.create("Planning")[0] == "OK"
+        seed_message(index, directory, owner, ".Planning/cur", 2, encoded, mailbox="Planning", legacy=True)
+        assert client.select("INBOX", readonly=True)[0] == "OK"
+        uids = search(client, "ALL")
+        assert len(uids) == 2
+        scope = f"username:=`{owner}` && mailbox:=`INBOX`"
+        query = 'SUBJECT "Staged receipt"'
+        index.requests.clear()
+        index.coverage_requests.clear()
+        assert search(client, query) == uids
+        assert not index.requests
+        assert index.coverage_requests == [("*", 1, PAGE_SIZE, scope, "id")]
+
+        index.failed_writes = {"POST"}
+        try:
+            command = [str(fixture.binary), "search", "reindex", "--queue"]
+            result = subprocess.run(command, cwd=directory, env=fixture.env, capture_output=True, timeout=15, check=True)
+            assert b"Queued Typesense reindex for 2 mailboxes" in result.stderr, result
+            wait_for(lambda: any(method == "POST" for method, _ in index.writes), "the worker did not attempt the rebuild")
+            index.coverage_requests.clear()
+            assert search(client, query) == uids
+            assert search(client, 'NOT SUBJECT "Staged receipt"') == []
+            assert not index.requests and not index.coverage_requests
+        finally:
+            index.failed_writes = set()
+
+        def uses_index(expected, scope):
+            index.requests.clear()
+            return search(client, query) == expected and index.requests == [("Staged receipt", 1, PAGE_SIZE, scope, "id")]
+
+        wait_for(lambda: uses_index(uids, scope), "the rebuilt Inbox did not resume indexed search")
+        wait_for(lambda: any(doc["username"] == owner and doc["mailbox"] == "Planning" and doc["subject"] == decoded
+                             for doc in index.documents), "the worker did not rebuild the Maildir++ folder")
+        assert all(doc["subject"] == encoded.splitlines()[0] for doc in index.legacy_documents)
+
+        for folder, count, scope in (("Planning", 1, f"username:=`{owner}` && mailbox:=`Planning`"),
+                                    ('"All Mail"', 3, f"username:=`{owner}`")):
+            assert client.select(folder, readonly=True)[0] == "OK"
+            expected = search(client, "ALL")
+            assert len(expected) == count
+            wait_for(lambda: uses_index(expected, scope), f"the rebuilt {folder} did not resume indexed search")
+
+        # Reconcile a new APPEND without relying on the rebuild command.
+        assert client.append("Planning", None, None, f"Subject: {encoded}\r\n\r\nNew fixture.\r\n".encode())[0] == "OK"
+        assert client.select("Planning", readonly=True)[0] == "OK"
+        assert len(search(client, query)) == 2
+        wait_for(lambda: sum(doc["username"] == owner and doc["mailbox"] == "Planning" and doc["subject"] == decoded
+                             for doc in index.documents) == 2, "the worker did not index the new encoded message")
+
+    with fixture.imap(peer) as client:
+        assert client.select("INBOX", readonly=True)[0] == "OK"
+        assert search(client, query) == [b"1"]
+
+    with tempfile.TemporaryDirectory(prefix="mail-index-quiescent-") as root:
+        new = Path(root) / "offline@example.test" / "new"
+        new.mkdir(parents=True)
+        (new / "1780000000000.eml").write_bytes(f"Subject: {encoded}\r\n\r\nOffline fixture.\r\n".encode())
+        result = subprocess.run([str(fixture.binary), "search", "reindex", "--root", root], cwd=directory,
+                                env=fixture.env, capture_output=True, timeout=15, check=True)
+        assert b"1 indexed, 0 failed" in result.stderr, result
+        assert any(doc["username"] == "offline@example.test" and doc["subject"] == decoded for doc in index.documents)
+
+
+def wait_for(condition, message):
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if condition():
+            return
+        time.sleep(0.1)
+    raise AssertionError(message)
 
 
 def verify(index, fixture, directory):
@@ -230,20 +330,21 @@ def main():
     parser.add_argument("binary", type=Path)
     args = parser.parse_args()
     verify_encoded_headers(args.binary.resolve(strict=True))
-    with tempfile.TemporaryDirectory(prefix="mail-index-search-") as scratch, SearchIndex() as index:
-        thread = Thread(target=index.serve_forever, daemon=True)
-        thread.start()
-        try:
-            directory = Path(scratch)
-            fixture = Fixture(args.binary.resolve(strict=True), directory, staging=True)
-            fixture.env.update(TYPESENSE_API_KEY="disposable-search-index",
-                               TYPESENSE_HOST="127.0.0.1", TYPESENSE_PORT=str(index.server_port))
-            with fixture.daemon():
-                verify(index, fixture, directory)
-        finally:
-            index.shutdown()
-            thread.join()
-    print("Verified two-page IMAP and UID SEARCH, keyword conjunction, negation, mailbox scope, encoded headers, and complete fallback over IMAPS.")
+    for check in (verify, verify_subject_reindex):
+        with tempfile.TemporaryDirectory(prefix="mail-index-search-") as scratch, SearchIndex() as index:
+            thread = Thread(target=index.serve_forever, daemon=True)
+            thread.start()
+            try:
+                directory = Path(scratch)
+                fixture = Fixture(args.binary.resolve(strict=True), directory, staging=True)
+                fixture.env.update(TYPESENSE_API_KEY="disposable-search-index",
+                                   TYPESENSE_HOST="127.0.0.1", TYPESENSE_PORT=str(index.server_port))
+                with fixture.daemon():
+                    check(index, fixture, directory)
+            finally:
+                index.shutdown()
+                thread.join()
+    print("Verified indexed IMAP pagination, encoded headers, live and offline backfill, and complete fallback over IMAPS.")
 
 
 if __name__ == "__main__":

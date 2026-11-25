@@ -679,6 +679,18 @@ from the delivery-effects worker. During a move or an index outage, text
 searches in the affected folder and aggregate mailbox read the current Maildir.
 Pending index updates survive a Mail restart and retry when Typesense recovers.
 
+Mail writes decoded Subjects to the `messages_v2` collection. The Typesense
+key must allow Mail to create this collection and read and write its documents.
+From the Mail service working directory, with its database and Typesense
+environment, run `mail search reindex --queue` to backfill existing mail while
+the service is running. The queued work is processed by the same worker as
+ordinary mailbox changes. Until every selected message is covered, IMAP
+searches read Maildir. Mail leaves the old `messages` collection in place.
+If rolling back the binary, disable Typesense on the previous binary until
+its index has been rebuilt from the current spool.
+
+Use `mail search reindex` without `--queue` for a separate, quiescent spool.
+
 ## Configuration Files
 
 ### systemd Service with Environment File

@@ -16,9 +16,12 @@
 
 const std = @import("std");
 const se = @import("search-engine");
+const mime = @import("../message/mime.zig").lib;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-pub const collection = "messages";
+// The original collection contains raw, sometimes truncated Subject values.
+// Keep it available for the previous binary during rollback.
+pub const collection = "messages_v2";
 
 /// The Message search model: which attributes are full-text searchable,
 /// filterable (facets), and sortable. This is the single source of truth
@@ -149,6 +152,13 @@ pub fn indexRawMessage(allocator: std.mem.Allocator, username: []const u8, mailb
     const headers = content[0..hdr_end];
     const body_start = @min(content.len, hdr_end + 2);
     const body = content[body_start..];
+    const header_copy = try allocator.dupe(u8, headers);
+    defer allocator.free(header_copy);
+    const unfolded: mime.Headers = .{ .block = mime.headers.unfold(header_copy) };
+    const subject = unfolded.get("Subject") orelse "";
+    const encoded = std.mem.indexOf(u8, subject, "=?") != null;
+    const decoded = try allocator.alloc(u8, if (encoded) subject.len * 3 else 0);
+    defer allocator.free(decoded);
 
     var id_buf: [32]u8 = undefined;
     const id = docId(&id_buf, username, mailbox, base);
@@ -161,7 +171,7 @@ pub fn indexRawMessage(allocator: std.mem.Allocator, username: []const u8, mailb
     try doc.putString("filename", base);
     try doc.putString("sender", headerValue(headers, "from") orelse "");
     try doc.putString("recipients", headerValue(headers, "to") orelse "");
-    try doc.putString("subject", headerValue(headers, "subject") orelse "");
+    try doc.putString("subject", if (encoded) mime.decodeWords(subject, decoded).text else subject);
     try doc.putString("body", body[0..@min(body.len, max_indexed_body)]);
     try doc.putInt("date", filenameTimestampSecs(base));
     const json = try doc.toOwned();
@@ -386,7 +396,7 @@ test "docId is stable and differs across mailboxes" {
 }
 
 test "message schema declares the search model" {
-    try std.testing.expectEqualStrings("messages", message_schema.name);
+    try std.testing.expectEqualStrings("messages_v2", message_schema.name);
     try std.testing.expect(message_schema.searchable.len == 4);
     try std.testing.expect(message_schema.filterable.len == 2);
 }

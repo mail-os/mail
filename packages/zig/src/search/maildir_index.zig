@@ -62,6 +62,54 @@ fn markDirectory(a: Allocator, io: std.Io, dir: Dir, source: []const u8, destina
     }
 }
 
+/// Queue a live rebuild. Only the delivery-effects worker publishes documents,
+/// so rebuild work and ordinary mailbox mutations share the same checkpoints.
+pub fn queueReindex(allocator: Allocator, db: *Database) !usize {
+    if (!typesense.enabled()) return error.Disabled;
+    const io = io_compat.getIo();
+    const mail = (try folders.openRoot(io)) orelse return error.FileNotFound;
+    defer mail.close(io);
+    const users = try db.getAllUsers();
+    defer {
+        for (users) |*user| user.deinit(db.allocator);
+        db.allocator.free(users);
+    }
+    var queued: usize = 0;
+    for (users) |user| {
+        try path_rules.validate(user.username);
+        const root = (try folders.open(io, mail, user.username)) orelse continue;
+        defer root.close(io);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var inbox: std.ArrayList(message_refs.Location) = .empty;
+        for ([_][]const u8{ "new", "cur" }) |slot| {
+            const dir = (try folders.open(io, root, slot)) orelse continue;
+            defer dir.close(io);
+            try markDirectory(a, io, dir, "INBOX", null, &inbox);
+        }
+        try markLocked(db, user.username, false, inbox.items);
+        var entries = root.iterate();
+        while (try entries.next(io)) |entry| {
+            const name = entry.name;
+            if (std.ascii.eqlIgnoreCase(name, "INBOX") or std.mem.eql(u8, name, "new") or
+                std.mem.eql(u8, name, "cur") or std.mem.eql(u8, name, "tmp")) continue;
+            folders.validateName(name) catch continue;
+            const layout = (try folders.layout(io, root, name)) orelse continue;
+            var folder_arena = std.heap.ArenaAllocator.init(allocator);
+            defer folder_arena.deinit();
+            // Another writer can rename the folder between layout and open.
+            // That writer already queues the affected message locations.
+            markFolderEditLocked(folder_arena.allocator(), db, user.username, false, root, layout, name, null) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+        }
+        queued += 1;
+    }
+    return queued;
+}
+
 /// A pending write bypasses the external index in the affected search scope.
 /// The scope's revision detects a write that starts and finishes during a query.
 pub fn searchEpoch(db: *Database, user: []const u8, mailbox: ?[]const u8) !?i64 {
