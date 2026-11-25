@@ -89,6 +89,53 @@ fn reloadHandler(sig: std.posix.SIG) callconv(.c) void {
     reload_requested.store(true, .release);
 }
 
+fn loadOutboundDkim(allocator: std.mem.Allocator, log: *logger.Logger) !void {
+    const domain = env.get("DKIM_DOMAIN") orelse "";
+    const selector = env.get("DKIM_SELECTOR") orelse "";
+    const path = env.get("DKIM_PRIVATE_KEY_PATH") orelse "";
+    if (domain.len != 0 or selector.len != 0 or path.len != 0) {
+        if (domain.len == 0 or selector.len == 0 or path.len == 0) {
+            log.err("Set DKIM_DOMAIN, DKIM_SELECTOR and DKIM_PRIVATE_KEY_PATH together", .{});
+            return error.InvalidDkimConfiguration;
+        }
+        try loadDkimSigner(allocator, log, domain, selector, path);
+    }
+
+    // Environment-backed slices outlive the registry.
+    if (env.get("DKIM_EXTRA_KEYS")) |spec| {
+        var entries = std.mem.splitScalar(u8, spec, ',');
+        while (entries.next()) |raw| {
+            const entry = std.mem.trim(u8, raw, " \t");
+            if (entry.len == 0) continue;
+            var parts = std.mem.splitScalar(u8, entry, ':');
+            const extra_domain = parts.next().?;
+            const extra_selector = parts.next() orelse "";
+            const extra_path = parts.rest();
+            if (extra_domain.len == 0 or extra_selector.len == 0 or extra_path.len == 0) {
+                log.err("Invalid DKIM_EXTRA_KEYS entry; expected domain:selector:/path/to/key.pem", .{});
+                return error.InvalidDkimConfiguration;
+            }
+            try loadDkimSigner(allocator, log, extra_domain, extra_selector, extra_path);
+        }
+    }
+}
+
+fn loadDkimSigner(allocator: std.mem.Allocator, log: *logger.Logger, domain: []const u8, selector: []const u8, path: []const u8) !void {
+    const pem = fs_compat.readFileAlloc(allocator, path) catch |err| {
+        log.err("Outbound DKIM key read failed (d={s} s={s}, {s}): {s}", .{ domain, selector, path, @errorName(err) });
+        return err;
+    };
+    defer {
+        std.crypto.secureZero(u8, pem);
+        allocator.free(pem);
+    }
+    outbound.configureDkim(domain, selector, pem) catch |err| {
+        log.err("Outbound DKIM signer failed (d={s} s={s}): {s}. Use an unencrypted RSA PKCS#1 or PKCS#8 PEM key", .{ domain, selector, @errorName(err) });
+        return err;
+    };
+    log.info("Outbound DKIM signing enabled (d={s} s={s})", .{ domain, selector });
+}
+
 pub fn main(init: std.process.Init) !void {
     const io_compat = @import("core/io_compat.zig");
     io_compat.initIo(init.io);
@@ -136,6 +183,9 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     logger.setGlobalLogger(&log);
 
     log.info("=== SMTP Server Starting ===", .{});
+
+    // Validate signers before claiming readiness or opening any listeners.
+    try loadOutboundDkim(allocator, &log);
 
     log.info("Configuration loaded and validated successfully:", .{});
     log.info("  Host: {s}:{d}", .{ cfg.host, cfg.port });
@@ -399,41 +449,6 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     }
     defer if (rotation_scheduler) |*rs| rs.deinit();
     defer if (dkim_key_manager) |*km| km.deinit();
-
-    // Outbound DKIM signing (RFC 6376, rsa-sha256/relaxed). Enabled when a key
-    // is configured: DKIM_DOMAIN + DKIM_SELECTOR + DKIM_PRIVATE_KEY_PATH (PEM).
-    if (env.get("DKIM_DOMAIN")) |dd| if (env.get("DKIM_SELECTOR")) |ds| if (env.get("DKIM_PRIVATE_KEY_PATH")) |kp| {
-        if (fs_compat.readFileAlloc(allocator, kp)) |pem| {
-            defer allocator.free(pem);
-            if (outbound.configureDkim(dd, ds, pem)) {
-                log.info("Outbound DKIM signing enabled (d={s} s={s})", .{ dd, ds });
-            } else |err| log.err("DKIM key parse failed: {s}", .{@errorName(err)});
-        } else |err| log.err("DKIM key read failed ({s}): {s}", .{ kp, @errorName(err) });
-    };
-
-    // Additional per-domain DKIM keys for other hosted domains, so each signs
-    // with its own d= for DMARC alignment. DKIM_EXTRA_KEYS is a comma-separated
-    // list of "domain:selector:/path/to/key.pem" entries (PEM PKCS#1). The env
-    // value lives for the process, so its sub-slices can back the signers.
-    if (env.get("DKIM_EXTRA_KEYS")) |spec| {
-        var it = std.mem.splitScalar(u8, spec, ',');
-        while (it.next()) |entry_raw| {
-            const entry = std.mem.trim(u8, entry_raw, " \t");
-            if (entry.len == 0) continue;
-            const c1 = std.mem.indexOfScalar(u8, entry, ':') orelse continue;
-            const rest = entry[c1 + 1 ..];
-            const c2 = std.mem.indexOfScalar(u8, rest, ':') orelse continue;
-            const dd = entry[0..c1];
-            const ds = rest[0..c2];
-            const kp = rest[c2 + 1 ..];
-            if (fs_compat.readFileAlloc(allocator, kp)) |pem| {
-                defer allocator.free(pem);
-                if (outbound.configureDkim(dd, ds, pem)) {
-                    log.info("Outbound DKIM signing enabled (d={s} s={s})", .{ dd, ds });
-                } else |err| log.err("DKIM extra key parse failed (d={s}): {s}", .{ dd, @errorName(err) });
-            } else |err| log.err("DKIM extra key read failed ({s}): {s}", .{ kp, @errorName(err) });
-        }
-    }
 
     // Initialize Sieve filtering
     var sieve_manager: ?sieve.SieveScriptManager = null;

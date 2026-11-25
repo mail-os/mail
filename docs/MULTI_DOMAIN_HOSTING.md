@@ -170,7 +170,9 @@ key, preserving legacy behaviour.
    DKIM_EXTRA_KEYS=example.com:mail:/opt/mail/dkim/example.private
    ```
 
-3. Restart. The startup log confirms each signer:
+3. Run `mail serve --validate-only` as the service account with the new
+   environment, then restart. An invalid signer prevents the daemon from
+   starting. The startup log confirms each registered signer:
 
    ```
    Outbound DKIM signing enabled (d=example.com s=mail)

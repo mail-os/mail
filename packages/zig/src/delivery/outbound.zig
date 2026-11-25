@@ -81,12 +81,12 @@ var g_dkim_signers: [max_dkim_signers]dkim_sign.Signer = undefined;
 var g_dkim_count: usize = 0;
 
 /// Register an outbound DKIM signer for `domain`. `domain`/`selector` must
-/// outlive the process (pass env-backed slices). `pem` is a PKCS#1 RSA private
-/// key; it is parsed and not retained. A duplicate domain or a full table is
-/// silently ignored. Returns an error only if the key can't be parsed.
+/// outlive the process (pass env-backed slices). The RSA PEM is parsed and not
+/// retained. A duplicate domain or a full table is a configuration error.
 pub fn configureDkim(domain: []const u8, selector: []const u8, pem: []const u8) !void {
-    if (g_dkim_count >= max_dkim_signers) return;
-    if (dkimSignerFor(domain) != null) return;
+    if (!isSafeHostname(domain) or !isSafeHostname(selector)) return error.InvalidDkimIdentity;
+    if (dkimSignerFor(domain) != null) return error.DuplicateDkimDomain;
+    if (g_dkim_count >= max_dkim_signers) return error.TooManyDkimSigners;
     g_dkim_signers[g_dkim_count] = try dkim_sign.Signer.initFromPem(domain, selector, pem);
     g_dkim_count += 1;
 }

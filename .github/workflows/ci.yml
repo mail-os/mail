@@ -234,6 +234,9 @@ jobs:
         python3 ../../scripts/test-eas-folder-hierarchy.py zig-out/bin/mail
         python3 ../../scripts/test-local-maildir-upgrade.py zig-out/bin/mail
 
+    - name: Verify outbound DKIM configuration and signing
+      run: python3 ../../scripts/test-outbound-dkim.py zig-out/bin/mail
+
     - name: Verify user CLI password input and rotation
       run: |
         python3 ../../scripts/test-user-cli.py zig-out/bin/mail

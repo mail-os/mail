@@ -3,22 +3,39 @@
 //! Real signing (not the stub in dkim.zig): reuses zig-tls's RSA PKCS#1 v1.5
 //! signer so we don't reimplement modexp. Library feature — any deployment that
 //! sets a DKIM key gets signed outbound mail. Configure via env (see main.zig):
-//!   DKIM_DOMAIN, DKIM_SELECTOR, DKIM_PRIVATE_KEY (PEM, PKCS#1 "RSA PRIVATE KEY").
+//!   DKIM_DOMAIN, DKIM_SELECTOR, DKIM_PRIVATE_KEY_PATH (RSA PKCS#1 or PKCS#8 PEM).
 //! Publish the public key at `<selector>._domainkey.<domain>` TXT
 //!   `v=DKIM1; k=rsa; p=<base64 SPKI/PKCS1 public key>`.
 const std = @import("std");
 const tls = @import("tls");
-const PrivateKey = tls.config.PrivateKey;
+const asn1 = std.crypto.codecs.asn1;
+const RsaKeyPair = tls.rsa.KeyPair;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Encoder = std.base64.standard.Encoder;
 
 pub const Signer = struct {
     domain: []const u8,
     selector: []const u8,
-    key: PrivateKey,
+    key: RsaKeyPair,
 
     pub fn initFromPem(domain: []const u8, selector: []const u8, pem: []const u8) !Signer {
-        return .{ .domain = domain, .selector = selector, .key = try PrivateKey.parsePem(pem) };
+        const pkcs8 = pemBody(pem, "-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----");
+        const encoded = pkcs8 orelse
+            pemBody(pem, "-----BEGIN RSA PRIVATE KEY-----", "-----END RSA PRIVATE KEY-----") orelse
+            return error.UnsupportedDkimKeyFormat;
+
+        const decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
+        var buffer: [4096]u8 = undefined;
+        defer std.crypto.secureZero(u8, &buffer);
+        const length = try decoder.decode(&buffer, encoded);
+        const der = buffer[0..length];
+        const rsa_der = if (pkcs8 != null) try unwrapPkcs8(der) else der;
+
+        // Validate the version before handing the RSA fields to zig-tls.
+        var rsa = asn1.der.Decoder{ .bytes = rsa_der };
+        const sequence = try rsa.sequence();
+        if (sequence.slice.end != rsa_der.len or try rsa.any(u8) > 1) return error.InvalidDkimKey;
+        return .{ .domain = domain, .selector = selector, .key = try RsaKeyPair.fromDer(rsa_der) };
     }
 
     /// Build a `DKIM-Signature: …\r\n` header for `message` (raw RFC822 headers
@@ -72,7 +89,7 @@ pub const Signer = struct {
 
         // --- RSA-PKCS1-SHA256 sign (zig-tls) ---
         var out: [544]u8 = undefined; // >= 4096-bit modulus byte length
-        const sig = try self.key.key.rsa.signPkcsv1_5(Sha256, input.items, &out);
+        const sig = try self.key.signPkcsv1_5(Sha256, input.items, &out);
         const sb_len = Encoder.calcSize(sig.bytes.len);
         const sb = try allocator.alloc(u8, sb_len);
         defer allocator.free(sb);
@@ -81,6 +98,33 @@ pub const Signer = struct {
         return std.fmt.allocPrint(allocator, "DKIM-Signature: {s}{s}\r\n", .{ sig_val.items, sb });
     }
 };
+
+fn pemBody(pem: []const u8, begin: []const u8, end: []const u8) ?[]const u8 {
+    const start = (std.mem.indexOf(u8, pem, begin) orelse return null) + begin.len;
+    const finish = std.mem.indexOfPos(u8, pem, start, end) orelse return null;
+    return pem[start..finish];
+}
+
+/// Read the RSA key inside a PKCS#8 PrivateKeyInfo using the bounded DER
+/// decoder. The RSA parser handles the common PKCS#1 payload for both formats.
+fn unwrapPkcs8(der: []const u8) ![]const u8 {
+    var decoder = asn1.der.Decoder{ .bytes = der };
+    const sequence = try decoder.sequence();
+    if (sequence.slice.end != der.len or try decoder.any(u8) > 1) return error.InvalidDkimKey;
+    const algorithm = try decoder.sequence();
+    var identifier = asn1.der.Decoder{ .bytes = decoder.view(algorithm) };
+    const oid = try identifier.any(asn1.Oid);
+    const rsa_oid = comptime asn1.Oid.fromDotComptime("1.2.840.113549.1.1.1");
+    if (!std.mem.eql(u8, oid.encoded, rsa_oid.encoded)) return error.UnsupportedDkimKeyAlgorithm;
+    if (identifier.index < identifier.bytes.len) {
+        const params = try identifier.element(asn1.ExpectedTag.init(.null, false, .universal));
+        if (identifier.view(params).len != 0 or identifier.index != identifier.bytes.len)
+            return error.InvalidDkimKey;
+    }
+    decoder.index = algorithm.slice.end;
+    const key = try decoder.element(asn1.ExpectedTag.init(.octetstring, false, .universal));
+    return decoder.view(key);
+}
 
 const Split = struct { header_end: usize, body_start: usize };
 fn splitHeaderBody(msg: []const u8) Split {

@@ -631,7 +631,9 @@ Entries are whole account names, matched case-insensitively. A domain or a patte
 #### DKIM_DOMAIN / DKIM_SELECTOR / DKIM_PRIVATE_KEY_PATH
 - **Description:** The **primary** DKIM signer. Also the fallback signer for any
   sender domain that has no dedicated key.
-- **Type:** String / String / Path (PEM, PKCS#1 or PKCS#8 RSA private key)
+- **Type:** String / String / Path. Set all three together. The key file must
+  contain an unencrypted RSA PEM in PKCS#1 (`BEGIN RSA PRIVATE KEY`) or PKCS#8
+  (`BEGIN PRIVATE KEY`) format.
 - **Publish:** the public key at `<selector>._domainkey.<domain>` TXT as
   `v=DKIM1; k=rsa; p=<base64 SPKI>`.
 - **Examples:**
@@ -645,12 +647,19 @@ Entries are whole account names, matched case-insensitively. A domain or a patte
 - **Description:** Additional per-domain DKIM signers for other hosted domains.
   Each registers a signer selected at send time by the envelope sender's domain.
 - **Type:** String — comma-separated `domain:selector:/path/to/key.pem` entries
+- **Keys:** Same RSA PEM formats as the primary key. The registry supports up
+  to 32 distinct signing domains including the primary.
 - **Default:** *(empty)*
 - **Examples:**
   ```bash
   DKIM_EXTRA_KEYS=example.com:mail:/opt/mail/dkim/example.private
   DKIM_EXTRA_KEYS=a.com:mail:/opt/mail/dkim/a.private,b.com:s1:/opt/mail/dkim/b.private
   ```
+
+Validate the effective environment with `mail serve --validate-only` as the
+service account before restarting. A configured signer with an unreadable or
+invalid key, an incomplete entry, or a duplicate domain fails validation and
+prevents the daemon from opening its listeners.
 
 **Generate a domain key + DNS record:**
 ```bash
