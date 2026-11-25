@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the audited hosted-mailbox status command against a disposable daemon."""
+"""Exercise audited hosted-mailbox diagnostics and sending holds on a disposable daemon."""
 
 import argparse
 from contextlib import closing
@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import secrets
 import sqlite3
 import subprocess
 from tempfile import TemporaryDirectory
@@ -131,6 +132,8 @@ def verify(test, db):
                       WHEN NEW.action='hosted.status' BEGIN SELECT RAISE(ABORT,'audit failure'); END""")
     blocked = cli(test, "hosted-status", mailbox)
     assert blocked.returncode and not blocked.stdout, blocked
+    with db:
+        db.execute("DROP TRIGGER deny_status_audit")
 
 
 def main():
@@ -145,7 +148,104 @@ def main():
         assert missing.returncode and not missing_path.exists(), missing
         with test.daemon(), closing(sqlite3.connect(root / "smtp.db")) as db:
             verify(test, db)
+            mailbox, peer, held_since = verify_sending_hold(test, db)
+        with closing(sqlite3.connect(root / "smtp.db")) as db, db:
+            now = int(time.time())
+            db.execute(
+                """INSERT INTO message_queue
+                (id,from_addr,to_addr,message_data,status,attempts,next_retry,created_at,updated_at,hosted_user_id)
+                SELECT 'hosted-retry-fixture', ?, 'nobody@external.invalid', 'fixture', 'retry', 2, ?, ?, ?, id
+                FROM users WHERE username=?""", (mailbox, now, now, now, mailbox),
+            )
+        with test.daemon(), closing(sqlite3.connect(root / "smtp.db")) as db:
+            suite["check_suspended_retry"](test, now)
+            with db:
+                db.execute("DELETE FROM message_queue WHERE id='hosted-retry-fixture'")
+            verify_sending_release(test, db, mailbox, peer, held_since)
     print("Verified audited hosted quota, provisioning drift, UTC usage, queue counts and redaction.")
+    print("Verified audited sending holds across SMTP, webmail, EWS, ActiveSync, provisioning and restart.")
+
+
+def verify_sending_hold(test, db):
+    mailbox = test.provision("held-sender", daily=3)
+    peer = test.provision("hold-recipient")
+    session = test.login(mailbox)
+    send_id = secrets.token_hex(16)
+    payload = {
+        "sendId": send_id, "subject": "Scheduled before hold",
+        "to": [peer], "text": "Keep the scheduled message for review.", "delaySeconds": 30,
+    }
+    assert test.api(session, "compose", payload)[0] == 200
+    with test.smtp(mailbox) as client:
+        expect_smtp(client.mail(mailbox), 250)
+        expect_smtp(client.rcpt(peer), 250)
+        result = cli(test, "hosted-sending-hold", mailbox, "place", "case-17")
+        assert result.returncode == 0, result.stderr
+        raw = f"From: {mailbox}\r\nTo: {peer}\r\nSubject: Held SMTP\r\n\r\nHeld body.\r\n"
+        expect_smtp(client.data(raw), 550, "5.7.1 Sending is on hold")
+
+    duplicate = cli(test, "hosted-sending-hold", mailbox, "place", "case-17")
+    assert duplicate.returncode == 0 and "already in place" in duplicate.stderr
+    status = report(test, mailbox)["account"]
+    held_since = status["sending_held_since"]
+    assert status["access"] == "full" and held_since is not None
+
+    # A newer enabled entitlement still applies its quota while leaving the hold.
+    test.provision("held-sender", quota=65_536, daily=4)
+    status = report(test, mailbox)["account"]
+    assert status["revision"] == 2 and status["quota_bytes"] == 65_536
+    assert status["sending_held_since"] == held_since
+    expect_smtp(test.deliver(peer, identity=mailbox), 550, "5.7.1 Sending is on hold")
+    expect_smtp(test.deliver(mailbox, identity=peer, subject="Inbound while held"), 250)
+    with test.imap(mailbox) as client:
+        assert client.select("INBOX") == ("OK", [b"1"])
+    assert test.api(session, "folders")[0] == 200
+
+    code, rejected = test.api(session, "compose", {**payload, "sendId": secrets.token_hex(16)})
+    assert code == 403 and rejected["error"] == "sending_on_hold", rejected
+    with db:
+        db.execute("UPDATE webmail_records SET due_at=unixepoch() WHERE kind='outbox' AND id=?", (send_id,))
+    failed = test.outbox(session, send_id, "failed")
+    assert "Sending is on hold" in failed["error"], failed
+    ews = suite["create_ews_item"]("SendOnly", to=[peer], subject="Held EWS")
+    assert suite["ews_codes"](test.ews(mailbox, ews)) == ["ErrorMessageSubmissionBlocked"]
+    eas = suite["eas_send"](suite["eas_mime"](mailbox, peer, subject="Held ActiveSync"), "hold-retry")
+    assert suite["eas_result"](test.eas(mailbox, eas)) == 130
+    with test.imap(peer) as client:
+        assert client.select("INBOX") == ("OK", [b"0"])
+    assert test.count(mailbox) == 0
+    return mailbox, peer, held_since
+
+
+def verify_sending_release(test, db, mailbox, peer, held_since):
+    assert report(test, mailbox)["account"]["sending_held_since"] == held_since
+    expect_smtp(test.deliver(peer, identity=mailbox), 550, "5.7.1 Sending is on hold")
+    with db:
+        db.execute("""CREATE TRIGGER deny_hold_release BEFORE INSERT ON audit_log
+                    WHEN NEW.action='hosted.sending_release' BEGIN SELECT RAISE(ABORT,'fixture audit failure'); END""")
+    refused = cli(test, "hosted-sending-hold", mailbox, "release", "case-17-reviewed")
+    assert refused.returncode != 0
+    assert report(test, mailbox)["account"]["sending_held_since"] == held_since
+    with db:
+        db.execute("DROP TRIGGER deny_hold_release")
+    test.provision("held-sender", quota=65_536, daily=4, enabled=False)
+    result = cli(test, "hosted-sending-hold", mailbox, "release", "case-17-reviewed")
+    assert result.returncode == 0, result.stderr
+    status = report(test, mailbox)["account"]
+    assert status["access"] == "disabled" and status["sending_held_since"] is None
+    test.provision("held-sender", quota=65_536, daily=4)
+    eas = suite["eas_send"](suite["eas_mime"](mailbox, peer, subject="Held ActiveSync"), "hold-retry")
+    assert suite["eas_result"](test.eas(mailbox, eas)) == 0
+    assert test.count(mailbox) == 1
+    records = db.execute(
+        "SELECT action,actor,details FROM audit_log WHERE target=? AND action IN ('hosted.sending_hold','hosted.sending_release') ORDER BY id",
+        (mailbox,),
+    ).fetchall()
+    actor = f"local-operator:{os.geteuid()}"
+    assert [(action, who, json.loads(details)) for action, who, details in records] == [
+        ("hosted.sending_hold", actor, {"reason": "case-17"}),
+        ("hosted.sending_release", actor, {"reason": "case-17-reviewed"}),
+    ], records
 
 
 if __name__ == "__main__":

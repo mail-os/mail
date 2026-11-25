@@ -134,6 +134,29 @@ sudo -u mail-server env SMTP_DB_PATH=/var/lib/mail/smtp.db \
 
 The report carries the observation time and an `audit_id`. Each successful report records `hosted.status` in `audit_log` with the effective operator UID and mailbox. The output is restricted to the mailbox identifier, operational state, and aggregate counters. Maildir and reservation counts may change while the daemon is delivering mail.
 
+### Hold outbound mail during a hosted abuse review
+
+Run the following on the mailbox's Mail host with the same working directory
+and database path as the status report. Supply only a non-sensitive case reference.
+
+```bash
+/opt/mail/mail-server user:local hosted-sending-hold alice@staging.example.com place case-1234
+/opt/mail/mail-server user:local hosted-status alice@staging.example.com
+/opt/mail/mail-server user:local hosted-sending-hold alice@staging.example.com release case-1234-reviewed
+```
+
+The report's `sending_held_since` field contains the placement time in Unix
+seconds or `null` when no hold is active. The hold preserves access to existing
+mail and inbound delivery under the current entitlement. New outbound admissions
+fail. Previously accepted outbound retries pause. A scheduled webmail message
+that comes due during the hold moves to Outbox review. Check both queues before
+releasing the hold.
+
+Quota and provisioning changes preserve the hold. Release leaves any suspension
+or expired access in effect. Placement and release each commit an audit entry
+with the effective operator UID and case reference. Resolve active holds with
+the operator before rolling back to a binary that predates this command.
+
 ### Offboard a departed team owner
 
 Use `mail team show` to confirm the departing owner and choose an existing

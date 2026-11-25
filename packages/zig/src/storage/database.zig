@@ -407,6 +407,10 @@ pub const Database = struct {
             \\    first_sent_at INTEGER,
             \\    first_received_at INTEGER
             \\);
+            \\CREATE TABLE IF NOT EXISTS hosted_sending_holds (
+            \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            \\    placed_at INTEGER NOT NULL
+            \\);
             \\CREATE TABLE IF NOT EXISTS provisioning_operations (
             \\    operation_id TEXT PRIMARY KEY,
             \\    mailbox TEXT NOT NULL,
@@ -1578,6 +1582,7 @@ pub const Database = struct {
         quota_bytes: u64,
         send_recipients_per_day: i64,
         access_window: ?AccessWindow,
+        sending_hold: bool,
 
         pub fn accessAt(self: HostedLimits, now: i64) MailboxAccess {
             return mailboxAccessAt(self.enabled, self.access_window, now);
@@ -1589,6 +1594,7 @@ pub const Database = struct {
                 .read_only => return error.HostedSenderReadOnly,
                 .expired, .disabled => return error.HostedSenderDisabled,
             }
+            if (self.sending_hold) return error.HostedSendingHeld;
         }
     };
 
@@ -1600,7 +1606,11 @@ pub const Database = struct {
 
     fn hostedLimitsLocked(self: *Database, mailbox: []const u8) !?HostedLimits {
         const stmt = try self.prepareLocked(
-            "SELECT u.id, u.enabled, u.quota_limit, p.send_recipients_per_day, p.service_until, p.read_until FROM provisioned_mailboxes p JOIN users u ON u.id = p.user_id AND u.username = p.mailbox WHERE p.mailbox = ?",
+            \\SELECT u.id, u.enabled, u.quota_limit, p.send_recipients_per_day, p.service_until, p.read_until, h.user_id IS NOT NULL
+            \\FROM provisioned_mailboxes p
+            \\JOIN users u ON u.id = p.user_id AND u.username = p.mailbox
+            \\LEFT JOIN hosted_sending_holds h ON h.user_id = u.id
+            \\WHERE p.mailbox = ?
         );
         defer stmt.finalize();
         try stmt.bind(1, mailbox);
@@ -1611,6 +1621,7 @@ pub const Database = struct {
             .quota_bytes = @intCast(@max(0, stmt.columnInt64(2))),
             .send_recipients_per_day = stmt.columnInt64(3),
             .access_window = scanAccessWindow(stmt, 4),
+            .sending_hold = stmt.columnInt64(6) != 0,
         };
     }
 
@@ -1625,6 +1636,7 @@ pub const Database = struct {
         requested_enabled: bool,
         access: MailboxAccess,
         access_window: ?AccessWindow,
+        sending_held_since: ?i64,
         quota_bytes: u64,
         requested_quota_bytes: u64,
         send_recipients_per_day: u64,
@@ -1642,10 +1654,11 @@ pub const Database = struct {
         defer tx.deinit();
         const account = try tx.prepare(
             \\SELECT p.revision, u.enabled, p.requested_enabled, u.quota_limit, p.requested_quota,
-            \\       p.send_recipients_per_day, usage.utc_day, usage.recipients, u.id, p.service_until, p.read_until
+            \\       p.send_recipients_per_day, usage.utc_day, usage.recipients, u.id, p.service_until, p.read_until, h.placed_at
             \\FROM provisioned_mailboxes p
             \\JOIN users u ON u.id = p.user_id AND u.username = p.mailbox
             \\LEFT JOIN hosted_sending_usage usage ON usage.user_id = u.id
+            \\LEFT JOIN hosted_sending_holds h ON h.user_id = u.id
             \\WHERE p.mailbox = ?1
         );
         defer account.finalize();
@@ -1664,6 +1677,7 @@ pub const Database = struct {
             .requested_enabled = account.columnInt64(2) != 0,
             .access = mailboxAccessAt(account.columnInt64(1) != 0, window, now),
             .access_window = window,
+            .sending_held_since = if (account.columnIsNull(11)) null else account.columnInt64(11),
             .quota_bytes = @intCast(@max(0, account.columnInt64(3))),
             .requested_quota_bytes = @intCast(@max(0, account.columnInt64(4))),
             .send_recipients_per_day = allowance,
@@ -1699,12 +1713,61 @@ pub const Database = struct {
         defer self.mutex.unlock();
 
         const stmt = try self.prepareLocked(
-            "SELECT 1 FROM provisioned_mailboxes p JOIN users u ON u.id = p.user_id AND u.username = p.mailbox WHERE u.id = ? AND u.enabled = 1 AND (p.service_until IS NULL OR p.service_until > ?)",
+            \\SELECT 1 FROM provisioned_mailboxes p JOIN users u ON u.id = p.user_id AND u.username = p.mailbox
+            \\WHERE u.id = ? AND u.enabled = 1 AND (p.service_until IS NULL OR p.service_until > ?)
+            \\AND NOT EXISTS (SELECT 1 FROM hosted_sending_holds WHERE user_id = u.id)
         );
         defer stmt.finalize();
         try stmt.bind(1, user_id);
         try stmt.bind(2, time_compat.timestamp());
         return stmt.step();
+    }
+
+    pub fn setHostedSendingHold(self: *Database, mailbox: []const u8, held: bool, actor: []const u8, reason: []const u8) !bool {
+        if (reason.len == 0 or reason.len > 512 or !std.unicode.utf8ValidateSlice(reason))
+            return error.InvalidReason;
+        for (reason) |byte| {
+            if (byte < 0x20 or byte == 0x7f) return error.InvalidReason;
+        }
+        const note = std.mem.trim(u8, reason, " ");
+        if (note.len == 0) return error.InvalidReason;
+        const details = try std.json.Stringify.valueAlloc(self.allocator, .{ .reason = note }, .{});
+        defer self.allocator.free(details);
+
+        var tx = try self.beginTransaction(.write);
+        defer tx.deinit();
+        const target = try tx.prepare(
+            \\SELECT u.id FROM provisioned_mailboxes p JOIN users u ON u.id = p.user_id AND u.username = p.mailbox
+            \\WHERE p.mailbox = ?
+        );
+        defer target.finalize();
+        try target.bind(1, mailbox);
+        if (!try target.step()) return error.ManagedMailboxNotFound;
+        const now = time_compat.timestamp();
+        const change = try tx.prepare(if (held)
+            "INSERT INTO hosted_sending_holds(user_id,placed_at) VALUES (?1,?2) ON CONFLICT(user_id) DO NOTHING RETURNING user_id"
+        else
+            "DELETE FROM hosted_sending_holds WHERE user_id = ?1 RETURNING user_id");
+        defer change.finalize();
+        try change.bind(1, target.columnInt64(0));
+        if (held) try change.bind(2, now);
+        const changed = try change.step();
+        if (changed) {
+            _ = try change.step();
+            const audit = try tx.prepare(
+                \\INSERT INTO audit_log(timestamp,action,actor,target,target_type,details,severity)
+                \\VALUES (?,?,?,?,'hosted_mailbox',?,'info')
+            );
+            defer audit.finalize();
+            try audit.bind(1, now);
+            try audit.bind(2, if (held) "hosted.sending_hold" else "hosted.sending_release");
+            try audit.bind(3, actor);
+            try audit.bind(4, mailbox);
+            try audit.bind(5, details);
+            _ = try audit.step();
+        }
+        try tx.commit();
+        return changed;
     }
 
     pub const ActiveSyncReceipt = struct {
@@ -2135,7 +2198,7 @@ pub const Database = struct {
         if (check.columnInt64(2) >= vacation_wire.daily_limit) return "vacation_daily_limit";
         self.chargeHostedSendLocked(user, 1, now) catch |err| switch (err) {
             error.HostedSendingLimit => return "vacation_allowance",
-            error.HostedSenderDisabled, error.HostedSenderReadOnly => return "vacation_inactive",
+            error.HostedSenderDisabled, error.HostedSenderReadOnly, error.HostedSendingHeld => return "vacation_inactive",
             else => return err,
         };
         const receipt = try self.prepareLocked(
@@ -2476,7 +2539,7 @@ pub const Database = struct {
                     owner = if (try self.hostedLimitsLocked(user)) |limits| limits.user_id else 0;
                     if (target.reply == null) self.chargeHostedSendLocked(user, 1, envelope.accepted_at) catch |err| switch (err) {
                         error.HostedSendingLimit => outcome = "forward_allowance",
-                        error.HostedSenderDisabled, error.HostedSenderReadOnly => outcome = "forward_disabled",
+                        error.HostedSenderDisabled, error.HostedSenderReadOnly, error.HostedSendingHeld => outcome = "forward_disabled",
                         else => return err,
                     };
                 }

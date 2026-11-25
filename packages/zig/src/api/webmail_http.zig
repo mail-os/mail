@@ -2134,6 +2134,7 @@ fn mapServiceError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: any
         service_mod.ServiceError.InvalidPayload, service_mod.ServiceError.InvalidAction, service_mod.ServiceError.InvalidAttachment, compose.ComposeError.InvalidAddress, compose.ComposeError.InvalidHeader, compose.ComposeError.NoRecipients => sendError(conn, arena, 400, "bad_request", "Check the recipients, headers and attachment limits"),
         error.HostedSendingLimit => sendError(conn, arena, 429, "sending_limit", "Daily recipient allowance exhausted. Try again after midnight UTC."),
         error.HostedSenderDisabled => sendError(conn, arena, 403, "mailbox_disabled", "This mailbox is disabled."),
+        error.HostedSendingHeld => sendError(conn, arena, 403, "sending_on_hold", "Sending is on hold for this mailbox."),
         error.SenderIdentityUnavailable => sendError(conn, arena, 403, "sender_identity_unavailable", "This From address is no longer available. Choose another address before sending."),
         error.ExternalSenderUnavailable => sendError(conn, arena, 403, "external_sender_unavailable", "This external From address is unavailable."),
         error.ExternalReviewRequired => sendError(conn, arena, 409, "external_review_required", "Review the external From address and every recipient before sending."),

@@ -1007,6 +1007,7 @@ fn appendMailResult(a: std.mem.Allocator, buf: *std.ArrayList(u8), comptime op: 
             error.HostedStorageFull, error.StorageLimit, error.DraftStorageLimit => .{ "ErrorQuotaExceeded", "Mailbox storage is full." },
             error.HostedRecipientDisabled, error.HostedSenderDisabled => .{ "ErrorAccessDenied", "Mailbox is disabled." },
             error.HostedSenderReadOnly, error.HostedRecipientReadOnly => .{ "ErrorAccessDenied", "Mailbox is read-only." },
+            error.HostedSendingHeld => .{ "ErrorMessageSubmissionBlocked", "Sending is on hold for this mailbox." },
             error.HostedRecipientExpired => .{ "ErrorAccessDenied", "Recipient mailbox service ended." },
             error.NoRecipients => .{ "ErrorMissingRecipients", "At least one recipient is required." },
             error.InvalidAddress => .{ "ErrorInvalidRecipients", "Check the recipient addresses." },

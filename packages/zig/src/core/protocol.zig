@@ -2694,6 +2694,7 @@ pub const Session = struct {
             error.HostedRecipientExpired => .{ .code = 550, .message = "5.2.1 Recipient mailbox service ended" },
             error.HostedSenderDisabled => .{ .code = 550, .message = "5.7.1 Sender mailbox is disabled" },
             error.HostedSenderReadOnly => .{ .code = 550, .message = "5.7.1 Sender mailbox is read-only" },
+            error.HostedSendingHeld => .{ .code = 550, .message = "5.7.1 Sending is on hold for this mailbox" },
             error.HostedSendingLimit => .{ .code = 452, .message = "4.7.0 Daily recipient allowance exhausted; retry after midnight UTC" },
             else => {
                 self.logger.err("Failed to save message: {}", .{err});

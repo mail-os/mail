@@ -110,6 +110,30 @@ fn hostedStatusAction(ctx: *cli.BaseCommand.ParseContext) !void {
     try output.interface.flush();
 }
 
+fn hostedSendingHoldAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const mailbox = ctx.getArgument(0) orelse return error.MissingArgument;
+    const action = ctx.getArgument(1) orelse return error.MissingArgument;
+    const reference = ctx.getArgument(2) orelse return error.MissingArgument;
+    const held = if (std.mem.eql(u8, action, "place"))
+        true
+    else if (std.mem.eql(u8, action, "release"))
+        false
+    else
+        return error.InvalidHoldAction;
+    var actor_buffer: [64]u8 = undefined;
+    const actor = try std.fmt.bufPrint(&actor_buffer, "local-operator:{d}", .{std.c.geteuid()});
+    const path = env.get("SMTP_DB_PATH") orelse "./smtp.db";
+    try std.Io.Dir.cwd().access(io_compat.getIo(), path, .{});
+    var db = try database.Database.init(ctx.allocator, path);
+    defer db.deinit();
+    const changed = try db.setHostedSendingHold(mailbox, held, actor, reference);
+    const output = if (changed)
+        (if (held) "Sending hold placed.\n" else "Sending hold released.\n")
+    else
+        (if (held) "Sending hold is already in place.\n" else "No sending hold is in place.\n");
+    std.debug.print("{s}", .{output});
+}
+
 fn exportAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Database, _: *auth.AuthBackend) !void {
     const username = ctx.getArgument(0) orelse return error.MissingArgument;
     const destination = ctx.getArgument(1) orelse return error.MissingArgument;
@@ -273,6 +297,13 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try hosted_status_cmd.addArgument(cli.Argument.init("username", "Canonical hosted mailbox username", .string));
     _ = hosted_status_cmd.setAction(hostedStatusAction);
     _ = try cmd.addCommand(hosted_status_cmd);
+
+    const sending_hold_cmd = try cli.BaseCommand.init(allocator, "hosted-sending-hold", "Place or release an audited sending hold on a hosted mailbox");
+    _ = try sending_hold_cmd.addArgument(cli.Argument.init("username", "Canonical hosted mailbox username", .string).withRequired(true));
+    _ = try sending_hold_cmd.addArgument(cli.Argument.init("action", "place or release", .string).withRequired(true));
+    _ = try sending_hold_cmd.addArgument(cli.Argument.init("case-reference", "Non-sensitive case reference for the audit log", .string).withRequired(true));
+    _ = sending_hold_cmd.setAction(hostedSendingHoldAction);
+    _ = try cmd.addCommand(sending_hold_cmd);
 
     const export_cmd = try cli.BaseCommand.init(allocator, "export", "Export a mailbox to a portable TAR archive");
     _ = try export_cmd.addArgument(cli.Argument.init("username", "Canonical mailbox username", .string));

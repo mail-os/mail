@@ -457,7 +457,7 @@ fn handleComposeMail(ctx: *Context, op: ComposeCommand, body: []const u8) !Respo
     }) catch |err| return sendError(ctx, op, switch (err) {
         error.HostedStorageFull => .mailbox_quota,
         error.HostedSendingLimit => .send_quota,
-        error.HostedSenderDisabled, error.HostedSenderReadOnly, error.HostedRecipientDisabled, error.HostedRecipientExpired => .access_denied,
+        error.HostedSenderDisabled, error.HostedSenderReadOnly, error.HostedSendingHeld, error.HostedRecipientDisabled, error.HostedRecipientExpired => .access_denied,
         error.HostedRecipientReadOnly => .retry_later,
         error.MessagePreviouslySent => .already_accepted,
         error.InvalidAddress => .invalid_recipient,

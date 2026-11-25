@@ -552,6 +552,9 @@ pub const Service = struct {
             if (!matches) return ServiceError.Conflict;
             return known;
         } else |err| if (err != store.StoreError.NotFound) return err;
+        if (try self.db.hostedLimits(user)) |hosted| {
+            if (hosted.sending_hold) return error.HostedSendingHeld;
+        }
         const due_at = if (payload.scheduleAt) |schedule_at| blk: {
             if (payload.delaySeconds != null or schedule_at <= now or schedule_at > now + max_schedule_seconds)
                 return error.InvalidSendSchedule;
@@ -785,6 +788,7 @@ pub const Service = struct {
                     error.HostedSendingLimit => "Daily recipient allowance exhausted. Try again after midnight UTC.",
                     error.HostedSenderDisabled => "This mailbox is disabled. The message was not sent.",
                     error.HostedSenderReadOnly => "This mailbox is available for reading and export.",
+                    error.HostedSendingHeld => "Sending is on hold for this mailbox. The message was not sent.",
                     error.HostedStorageFull => "A recipient mailbox is full. Review the recipients before retrying.",
                     error.HostedRecipientDisabled => "A recipient mailbox is disabled. Review the recipients before retrying.",
                     error.HostedRecipientReadOnly => "A recipient mailbox is temporarily read-only. Try again later.",
