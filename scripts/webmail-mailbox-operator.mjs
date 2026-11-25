@@ -18,13 +18,21 @@ async function verifyForm(page, height) {
   const form = page.locator('.mailbox-operator-form')
   const controls = await form.locator('input, button').evaluateAll(elements => elements.map((element) => {
     const style = getComputedStyle(element)
-    return [element.getBoundingClientRect().height, style.border, style.borderRadius]
+    const token = element.matches('.wm-action--accent:not(:disabled)') ? '--accent-button-border' : '--control-border'
+    const channels = style.getPropertyValue(token).trim().slice(1).match(/../g)
+      .map(channel => Number.parseInt(channel, 16)).join(', ')
+    return {
+      height: element.getBoundingClientRect().height,
+      border: style.border,
+      expectedBorder: `1px solid rgb(${channels})`,
+      radius: style.borderRadius,
+    }
   }))
   assert.equal(controls.length, 4)
-  for (const [size, border, radius] of controls) {
-    assert.equal(size, height)
-    assert.equal(border, controls[0][1])
-    assert.equal(radius, '8px')
+  for (const control of controls) {
+    assert.equal(control.height, height)
+    assert.equal(control.border, control.expectedBorder)
+    assert.equal(control.radius, '8px')
   }
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Mailbox management fits the viewport')
 
