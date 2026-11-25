@@ -1891,7 +1891,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-team-panel-body { display: grid; gap: 12px; max-inline-size: 52rem; padding: 4px 20px 16px; }
 .wm-team-panel-body form { display: grid; align-items: end; gap: 12px; }
 .wm-team-invitations-body form { grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) max-content; }
-.wm-team-access-body form { grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr) minmax(12rem, 1.1fr) max-content; }
+.wm-team-access-body { max-inline-size: 56rem; }
+.wm-team-access-body form { grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr) minmax(13.5rem, 1.1fr) max-content; }
 .wm-team-panel-body :is(form > label, .wm-team-field) { display: grid; gap: var(--control-label-gap); min-inline-size: 0; }
 .wm-team-panel-body label { color: var(--muted); font-size: 13px; font-weight: 550; }
 .wm-team-panel-body :is(p, ul) { margin: 0; }

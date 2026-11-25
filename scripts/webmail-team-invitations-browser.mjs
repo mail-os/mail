@@ -64,6 +64,18 @@ async function readMailboxApi(page, path) {
   return result.body
 }
 
+async function selectedLabelFits(select) {
+  const fits = await select.evaluate((control) => {
+    const style = getComputedStyle(control)
+    const canvas = document.createElement('canvas')
+    const context = canvas.getContext('2d')
+    context.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`
+    const available = control.clientWidth - Number.parseFloat(style.paddingLeft) - Number.parseFloat(style.paddingRight)
+    return context.measureText(control.selectedOptions[0].label).width <= available
+  })
+  assert(fits, 'The selected access label fits beside the select arrow')
+}
+
 try {
   const captain = await signIn(owner)
   const captainPanel = captain.locator('.wm-team-invitations')
@@ -82,6 +94,7 @@ try {
   await teammate.fill(recipient)
   assert.equal(await scope.inputValue(), 'mailbox')
   await alignedControls(accessForm, 'select, input, button', 36, true)
+  await selectedLabelFits(scope)
   await grant.press('Enter')
   await access.getByRole('alert').filter({ hasText: 'Your teammate needs to join this team' }).waitFor()
   await access.getByRole('button', { name: 'Invite teammate', exact: true }).press('Enter')
@@ -115,9 +128,16 @@ try {
   await captain.getByRole('button', { name: 'Refresh shared inbox', exact: true }).click()
   await sent.waitFor({ state: 'hidden' })
 
+  const loadedAccess = captain.waitForResponse(response => response.url() === url + '/webmail/api/teams/studio'
+    && response.request().method() === 'GET')
   await accessSummary.press('Enter')
+  assert.equal((await loadedAccess).status(), 200)
+  await access.getByText('No teammates have access to this mailbox on this team.').waitFor()
   await teammate.fill(recipient)
+  const grantedAccess = captain.waitForResponse(response => response.url() === url + '/webmail/api/teams/studio/grants'
+    && response.request().method() === 'PUT')
   await grant.press('Enter')
+  assert.equal((await grantedAccess).status(), 200)
   const inboxRevoke = accessList.getByRole('button', { name: `Revoke Inbox access for ${recipient}`, exact: true })
   await inboxRevoke.waitFor()
   assert.deepEqual(await readMailboxApi(member, 'sender-identities'), [])
@@ -147,6 +167,7 @@ try {
   await alignedControls(accessForm, 'select, input, button', 44, false)
   await captain.setViewportSize({ width: 390, height: 844 })
   await alignedControls(accessForm, 'select, input, button', 44, false)
+  await selectedLabelFits(scope)
   assert(await captain.evaluate(() => document.documentElement.scrollWidth <= innerWidth))
   await accessForm.screenshot({ path: join(output, 'mailbox-access-phone-dark.png'), animations: 'disabled' })
   await captain.setViewportSize({ width: 1440, height: 920 })
