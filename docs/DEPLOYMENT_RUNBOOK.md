@@ -523,6 +523,40 @@ Run `python3 scripts/test-hosted-erasure-export.py /path/to/mail` on disposable
 data to verify the start, concurrent retry, failure rollback, old snapshot, and
 provisioning refusal.
 
+### Remove the reserved mailbox's canonical Maildir
+
+This step permanently removes the canonical Maildir for one reserved mailbox.
+Confirm that the approved case and its required export and backup dispositions
+still apply. Stop all writers serving this working directory, including any
+older Mail processes. Use the daemon's working directory and SMTP and DAV
+database paths, and cross-check the start audit against the private case.
+
+```bash
+umask 077
+/opt/mail/mail-server user:local hosted-erasure-maildir \
+  /private/exit-case-19/review.json 816 > /private/exit-case-19/maildir-receipt.json
+```
+
+The command takes the daemon's exclusive Maildir lock. It refuses a different
+root, a changed reviewed inventory, an unresolved legacy directory, crossed
+mounts, symbolic links, and files shared through hard links. It journals the
+directory identity, renames that directory under a private staging name, and
+syncs the parent before it starts removing files.
+
+Retry with the same review and start audit ID after an interruption. Preserve
+the journal and any staged directory while resolving an error. If the original
+or staged directory appeared again or changed identity, stop and reconcile the
+working directory and backup pair. The completion receipt reports
+`maildir_removed_other_stores_pending`. SQLite mailbox content, DAV, externally
+derived data, and backup disposition still need their own reconciliation.
+Removal of these active directory entries does not sanitize filesystem blocks
+or historical snapshots.
+
+Reproduce with `python3 scripts/test-hosted-erasure-maildir.py /path/to/mail`.
+The disposable fixture covers daemon activity, a backup without the start
+receipt, another tenant, changed paths, shared files, and interruption on both
+sides of deletion.
+
 ## Local mailbox directory upgrade
 
 Back up the Maildir and SQLite database together before upgrading a server with older ActiveSync clients. On startup, the server checks for full-address local accounts that still have mail under a short directory name such as `mail/alice`. It moves eligible messages to `mail/alice@example.com` before opening the protocol listeners. It also moves messages in a canonical custom folder's nested slots into the folder path exposed by IMAP and webmail. ActiveSync, IMAP, webmail, and EWS then read from the canonical mailbox. The upgrade retains existing message flags and client identifiers when it can reconcile both directories.

@@ -28,7 +28,7 @@ pub const Review = struct {
     export_handoff_audit_id: ?i64 = null,
     evidence: Evidence,
 
-    fn validate(self: Review) !void {
+    pub fn validate(self: Review) !void {
         if (self.version != 1 or self.inventory_audit_id < 1) return error.InvalidErasureReview;
         if (!preflight.validCaseReference(self.request_id) or !preflight.validCaseReference(self.case_reference))
             return error.InvalidCaseReference;
@@ -89,7 +89,7 @@ fn validateInventory(a: Allocator, reviewed: inventory.Inventory, current: inven
     if (!std.mem.eql(u8, earlier, later)) return error.InventoryChanged;
 }
 
-fn verifyDeliveryDrained(observation: preflight.Observation) !void {
+pub fn verifyDeliveryDrained(observation: preflight.Observation) !void {
     const delivery = observation.delivery;
     if (delivery.pending_local_targets != 0 or delivery.remote_unattempted_targets != 0 or
         delivery.remote_unconfirmed_targets != 0 or delivery.legacy_remote_envelope_matches != 0 or
@@ -127,7 +127,7 @@ fn recordReceipt(tx: Database.Transaction, review: Review, operator: []const u8,
     return writeAudit(tx, "hosted.erasure.review.accepted", review.mailbox, operator, now, details);
 }
 
-fn writeAudit(tx: Database.Transaction, action: []const u8, mailbox: []const u8, operator: []const u8, now: i64, details: []const u8) !i64 {
+pub fn writeAudit(tx: Database.Transaction, action: []const u8, mailbox: []const u8, operator: []const u8, now: i64, details: []const u8) !i64 {
     const row = try tx.prepare(
         \\INSERT INTO audit_log(timestamp,action,actor,target,target_type,details,severity)
         \\VALUES(?1,?2,?3,?4,'hosted_mailbox',?5,'info') RETURNING id
@@ -160,7 +160,7 @@ pub fn record(a: Allocator, io: std.Io, db: *Database, review: Review, operator:
     return .{ .mailbox = review.mailbox, .request_id = review.request_id, .audit_id = id };
 }
 
-fn verifyCurrent(a: Allocator, tx: Database.Transaction, review: Review, observation: preflight.Observation, sampled: inventory.Inventory) !void {
+pub fn verifyCurrent(a: Allocator, tx: Database.Transaction, review: Review, observation: preflight.Observation, sampled: inventory.Inventory) !void {
     var current = sampled;
     if (observation.access.state.readable()) return error.MailboxStillReadable;
     if (observation.identity.initial_provisioning_operation == null or !current.identity.eql(observation.identity))
@@ -226,6 +226,25 @@ fn existingStart(tx: Database.Transaction, review: Review, user: i64, review_id:
         row.columnInt64(2) != user or row.columnInt64(3) != review_id or try row.step())
         return error.ErasureAlreadyStarted;
     return id;
+}
+
+pub fn requireStarted(a: Allocator, tx: Database.Transaction, review: Review, start_id: i64, now: i64) !preflight.Observation {
+    const observation = try preflight.observeInTransaction(a, tx, review.mailbox, review.assignment_actor, now);
+    if (observation.access.state != .disabled) return error.MailboxStillReadable;
+    const row = try tx.prepare(
+        \\SELECT o.review_audit_id FROM hosted_erasure_operations o JOIN audit_log a ON a.id=o.start_audit_id
+        \\WHERE o.start_audit_id=?1 AND o.request_id=?2 AND o.mailbox=?3 AND o.native_user_id=?4
+        \\AND a.action='hosted.erasure.started' AND a.target=o.mailbox AND a.target_type='hosted_mailbox'
+    );
+    defer row.finalize();
+    try row.bind(1, start_id);
+    try row.bind(2, review.request_id);
+    try row.bind(3, review.mailbox);
+    try row.bind(4, observation.identity.native_user_id);
+    if (!try row.step()) return error.ErasureStartNotFound;
+    try requireAcceptedReview(tx, review.mailbox, row.columnInt64(0), try reviewDetails(a, review, observation.identity));
+    try verifyDeliveryDrained(observation);
+    return observation;
 }
 
 /// Reserve the mailbox identity for the reviewed erasure and preserve its data.
