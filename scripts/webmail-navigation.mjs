@@ -74,8 +74,15 @@ async function triage(page) {
   })
   await capture(page, 'triage')
   await measure('undo-archive', async () => {
-    await act(button(page, 'Undo last action'))
-    await button(page, 'Undo last action').waitFor({ state: 'hidden' })
+    const undo = button(page, 'Undo last action')
+    const [response] = await Promise.all([
+      page.waitForResponse(result => result.request().method() === 'POST'
+        && new URL(result.url()).pathname.startsWith('/webmail/api/undo/')),
+      act(undo),
+    ])
+    assert(response.ok(), 'The undo request succeeded')
+    assert((await response.json()).ok, 'Undo restored the archived message')
+    await undo.waitFor({ state: 'hidden' })
   })
   await act(button(reader(page), 'Back to messages'))
   await button(page, new RegExp(handoff)).waitFor()
