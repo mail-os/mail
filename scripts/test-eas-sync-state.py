@@ -176,7 +176,7 @@ def main():
         db_path = Path(directory) / "smtp.db"
         with test.daemon():
             alice = test.provision("alice")
-            bob = test.provision("bob")
+            bob = test.create_local("bob")
             add_mail(test, alice, "Alice Inbox")
             add_mail(test, bob, "Bob Inbox")
             alice_dav, event_path, event, card_path = fixtures(test, alice, "Alice")

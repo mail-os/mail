@@ -1126,20 +1126,11 @@ sudo sqlite3 /var/lib/smtp/smtp.db \
   "SELECT COUNT(*) FROM messages WHERE sender='user@example.com';"
 ```
 
-**Solution:**
-```bash
-# Delete related records first
-sudo sqlite3 /var/lib/smtp/smtp.db << 'EOF'
-BEGIN TRANSACTION;
-DELETE FROM messages WHERE sender='user@example.com';
-DELETE FROM messages WHERE recipient='user@example.com';
-DELETE FROM users WHERE email='user@example.com';
-COMMIT;
-EOF
-
-# Or use GDPR deletion tool (handles cascading)
-sudo -u smtp /usr/local/bin/gdpr-cli delete user@example.com
-```
+**Solution:** Review the mailbox's membership, grants, and provisioning
+state before removing the account. For hosted accounts, follow the
+[hosted exit runbook](DEPLOYMENT_RUNBOOK.md#hosted-service-and-export-deadlines).
+The supported [portable mailbox export](../WEBMAIL.md#portable-mailbox-export)
+works after sign-in has been disabled.
 
 ---
 

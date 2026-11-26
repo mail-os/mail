@@ -4312,6 +4312,17 @@ pub const Database = struct {
     pub fn deleteUser(self: *Database, username: []const u8) !void {
         var tx = try self.beginTransaction(.write);
         defer tx.deinit();
+
+        {
+            const hosted = try tx.prepare(
+                \\SELECT 1 FROM provisioned_mailboxes
+                \\WHERE user_id = (SELECT id FROM users WHERE username = ?1)
+            );
+            defer hosted.finalize();
+            try hosted.bind(1, username);
+            if (try hosted.step()) return error.HostedMailboxRequiresManagedRemoval;
+        }
+
         try team_store.beforeAccountDeletion(tx, username);
 
         try self.deleteUserSessionsLocked(username);

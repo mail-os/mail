@@ -62,7 +62,7 @@ def verify(test, db, owner, admin, member, outsider):
     expect(change(test, captain, "studio", owner, None), 409, "last_team_owner")
     expect(change(test, captain, "studio", owner, "member"), 409, "last_team_owner")
     expect(test.api(captain, "teams/studio/members", {"mailbox": member}, method="PUT"), 400, "invalid_team_data")
-    command(test, "user:local", "delete", owner, error="LastTeamOwner")
+    command(test, "user:local", "delete", outsider, error="LastTeamOwner")
     expect(test.api(captain, "teams/studio"))
 
     sender = {"source": owner, "grantee": member, "scope": "sender", "allowed": True}
@@ -143,7 +143,8 @@ def main():
         root = Path(directory)
         test = Fixture(args.binary.resolve(strict=True), root, staging=True)
         with test.daemon(), closing(sqlite3.connect(root / "smtp.db")) as db:
-            accounts = [test.provision(name) for name in ("owner", "manager", "member", "outsider")]
+            accounts = [test.provision("owner"), test.provision("manager"),
+                        test.create_local("member"), test.create_local("outsider")]
             survivor = verify(test, db, *accounts)
             command(test, "team", "member", "studio", accounts[2], "member")
             command(test, "team", "grant", "studio", survivor, accounts[2], "attachments", "message-reference")
