@@ -655,6 +655,36 @@ disposable TLS fixtures. It covers transaction rollback, an audit interruption
 after the DAV commit, peer resource preservation, and ID allocation after
 restart.
 
+### Remove mailbox-private SMTP SQLite records
+
+After completing Maildir removal, keep the daemon stopped and run the
+following command as the service account with the same configured SMTP
+database and mail root used for the reservation.
+
+```bash
+/opt/mail/mail-server user:local hosted-erasure-sqlite \
+  /private/case/erasure-review.json START_AUDIT_ID
+```
+
+The command removes the reserved mailbox's private reset and sign-in data,
+MFA records, client passwords, unlinked browser sessions, published file
+and message snapshot links, personal attention and notification data,
+category rules, calendar workflow preferences and tasks, IMAP UID and
+generation data, and ActiveSync and EWS sync metadata. The deletion and
+receipt are committed together. A retry checks the same live scopes and
+returns the original audit ID. The deletion count includes any generation
+tombstones that the IMAP delete trigger creates and the command then removes.
+
+The receipt state is `private_sqlite_removed_other_data_pending`. The
+disabled account and its reservation remain in place. Reconcile linked
+accounts, private collections and their shared references, drafts and
+uploads, assistant permissions and audit records, routing and accepted
+delivery records, SQLite recovery history, and backups separately.
+
+Run `python3 scripts/test-hosted-erasure-sqlite.py /path/to/mail` with the
+disposable TLS fixture. It checks transaction rollback, tombstone cleanup,
+receipt retry, and peer preservation through a daemon restart.
+
 ## Local mailbox directory upgrade
 
 Back up the Maildir and SQLite database together before upgrading a server with older ActiveSync clients. On startup, the server checks for full-address local accounts that still have mail under a short directory name such as `mail/alice`. It moves eligible messages to `mail/alice@example.com` before opening the protocol listeners. It also moves messages in a canonical custom folder's nested slots into the folder path exposed by IMAP and webmail. ActiveSync, IMAP, webmail, and EWS then read from the canonical mailbox. The upgrade retains existing message flags and client identifiers when it can reconcile both directories.
