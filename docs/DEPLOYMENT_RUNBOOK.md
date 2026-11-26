@@ -136,6 +136,50 @@ sudo -u mail-server env SMTP_DB_PATH=/var/lib/mail/smtp.db \
 
 The report carries the observation time and an `audit_id`. Each successful report records `hosted.status` in `audit_log` with the effective operator UID and mailbox. The output is restricted to the mailbox identifier, operational state, and aggregate counters. Maildir and reservation counts may change while the daemon is delivering mail.
 
+### Hosted mailbox write authority
+
+Shared staging serves each hosted mailbox from one active Mail daemon. Keep
+SMTP, webmail, IMAP, EWS, ActiveSync, and private provisioning on that authority.
+It consists of the daemon's writable data directory, its SQLite database, and
+the workers that claim and replay that database's work.
+
+| State | Authority in the current deployment |
+| --- | --- |
+| Provisioning, service access, and operator sending holds | Mail's SQLite database holds the mailbox identity, provisioning revision, operation IDs, entitlement, and holds. The Stacks app sends revisioned changes to the private listener. |
+| Storage quota | Admission accounts for committed Maildir bytes, pending local deliveries and active file links. A process-local mailbox mutation lock covers checks that span SQLite and the filesystem. |
+| Recipient allowance | The canonical SQLite row records the recipient count by mailbox and UTC day. Admission and retry use this data and the original submission receipt. |
+| Accepted delivery and replay | The daemon records delivery intent and replay state in SQLite before publishing accepted Maildir files. Webmail Outbox, outbound queue, and protocol receipts also belong to the active writer's state. |
+
+A copied working directory has independent counters and receipts. A shared
+Maildir path alone cannot share the mailbox mutation lock. Treat either
+configuration as unverified for concurrent writers.
+
+Before adding a listener or worker that could write the same hosted mailbox
+from another daemon, complete [#179](https://github.com/mail-os/mail/issues/179).
+A topology with one writer per mailbox can have additional listeners only if
+every mutation, queue claim, and provisioning change reaches the same writer,
+including sends through delegates and linked accounts. Use one stable mailbox
+identity for routing. If the writer cannot be reached or ownership cannot be
+confirmed, defer the operation without accepting or reserving it locally.
+Promotion must fence the old writer before the replacement admits work.
+
+Rehearse the intended routing, failover and recovery in a disposable topology
+before changing shared staging. Race writes via different listeners for the last
+byte and last recipient. Cut off the writer between reservation and commit,
+then verify exactly one accepted delivery and receipt after failover. Check
+that a suspension or sending hold applies to deferred work and that another
+mailbox's allowance is independent. Record writer identity and state ownership
+as well as responses across the protocols.
+
+During a routing failure, compare the writer assigned to the mailbox, its
+actual service instance, and the observed provisioning revision, reservations
+and receipts. A missing writer, simultaneous writers, or inconsistent
+observations blocks new writes to the affected mailbox. Stop routing admissions
+and worker claims to the competing writers. Preserve their data and receipts
+for reconciliation. Restore single-writer routing only after establishing
+which state is authoritative. Then compare provisioning state and queue
+receipts and rerun the [staging quota verifier](#native-mail-staging-on-aws).
+
 ### Hold outbound mail during a hosted abuse review
 
 Run the following on the mailbox's Mail host with the same working directory
