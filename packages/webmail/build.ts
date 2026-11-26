@@ -19,9 +19,9 @@ export const webmailAppAssets: Record<string, string> = {
   'mail-icon-maskable.png': 'image/png',
 }
 
+const webmailIcon = '<link rel="icon" href="/mail-icon-192.png" sizes="192x192" type="image/png">'
 const webmailAppHead = [
   '<link rel="manifest" href="/mail.webmanifest">',
-  '<link rel="icon" href="/mail-icon-192.png" sizes="192x192" type="image/png">',
   '<link rel="apple-touch-icon" href="/mail-icon-maskable.png">',
   '<meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">',
   '<meta name="theme-color" content="#191a1e" media="(prefers-color-scheme: dark)">',
@@ -43,7 +43,11 @@ export async function buildWebmail(): Promise<void> {
       new Script(registry[1], { filename: `${page}.html (stx module registry)` })
     }
     const styled = html.replace('href="/styles.css"', `href="${stylesheetUrl(styles)}"`)
-    const compiled = webmailAppPages.has(page) ? styled.replace('</head>', `  ${webmailAppHead}\n</head>`) : styled
+    const compiled = styled.replace(/<head>[^]*?<\/head>/i, (head) => {
+      const icon = /<link\b[^>]*\brel="icon"/.test(head) ? '' : `  ${webmailIcon}\n`
+      const appHead = webmailAppPages.has(page) ? `  ${webmailAppHead}\n` : ''
+      return head.replace('</head>', `${icon}${appHead}</head>`)
+    })
     await writeFile(join(dist, `${page}.html`), compiled)
   }
   await writeFile(join(dist, 'styles.css'), styles)

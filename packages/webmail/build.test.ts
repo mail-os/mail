@@ -29,6 +29,11 @@ test('deployments fingerprint styles so existing browsers fetch updated controls
   for (const page of webmailPages) {
     const html = await Bun.file(join(import.meta.dir, `../zig/src/api/webmail_dist/${page}.html`)).text()
     expect(html).toMatch(/href="\/styles\.css\?v=[0-9a-f]{16}"/)
+    expect(html.match(/<link\b[^>]*\brel="icon"[^>]*>/g)).toEqual([
+      page === 'file-link'
+        ? '<link rel="icon" href="data:,">'
+        : '<link rel="icon" href="/mail-icon-192.png" sizes="192x192" type="image/png">',
+    ])
     expect(html.includes('rel="manifest" href="/mail.webmanifest"')).toBe(webmailAppPages.has(page))
     expect(html.includes('rel="apple-touch-icon" href="/mail-icon-maskable.png"')).toBe(webmailAppPages.has(page))
   }
