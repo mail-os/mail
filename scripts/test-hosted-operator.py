@@ -108,6 +108,9 @@ def verify(test, db):
 
     deletion = cli(test, "delete", mailbox)
     assert deletion.returncode != 0 and "managed retirement workflow" in deletion.stderr
+    legacy = subprocess.run([str(test.binary), "gdpr", "delete", mailbox], env=test.env,
+                            cwd=test.directory, text=True, capture_output=True, timeout=15)
+    assert legacy.returncode != 0 and "managed retirement workflow" in legacy.stderr, legacy.stderr
     after_refusal = report(test, mailbox)
     assert after_refusal["account"] == account and after_refusal["storage"] == storage
 
@@ -118,6 +121,9 @@ def verify(test, db):
     assert suspended["account"]["outbound_queue"] == account["outbound_queue"]
     deletion = cli(test, "delete", mailbox)
     assert deletion.returncode != 0 and "managed retirement workflow" in deletion.stderr
+    legacy = subprocess.run([str(test.binary), "gdpr", "delete", mailbox], env=test.env,
+                            cwd=test.directory, text=True, capture_output=True, timeout=15)
+    assert legacy.returncode != 0 and "managed retirement workflow" in legacy.stderr, legacy.stderr
     assert report(test, mailbox)["storage"] == storage
 
     deleted = cli(test, "delete", "unmanaged@example.test")

@@ -50,9 +50,13 @@ pub fn exportCommand(manager: *gdpr.GDPRManager, allocator: std.mem.Allocator, u
 }
 
 pub fn deleteCommand(manager: *gdpr.GDPRManager, username: []const u8) !void {
-    std.debug.print("WARNING: Deleting ALL data for user: {s}\n", .{username});
-    std.debug.print("This action cannot be undone!\n", .{});
-    std.debug.print("\nDeleting user data...\n", .{});
+    manager.requireUnmanagedMailbox(username) catch |err| {
+        if (err == error.HostedMailboxRequiresManagedRemoval)
+            std.debug.print("Error: This mailbox uses the managed retirement workflow.\n", .{});
+        return err;
+    };
+
+    std.debug.print("Deleting legacy SQLite records for user: {s}\n", .{username});
 
     // Log the data deletion
     try manager.logDataAccess(username, "GDPR_DATA_DELETION", "127.0.0.1");
@@ -63,8 +67,7 @@ pub fn deleteCommand(manager: *gdpr.GDPRManager, username: []const u8) !void {
         return err;
     };
 
-    std.debug.print("\nUser data deleted successfully\n", .{});
-    std.debug.print("All personal data has been permanently removed as required by GDPR Article 17.\n", .{});
+    std.debug.print("\nLegacy SQLite records deleted successfully\n", .{});
 }
 
 pub fn logCommand(manager: *gdpr.GDPRManager, username: []const u8, action: []const u8, ip_address: []const u8) !void {
