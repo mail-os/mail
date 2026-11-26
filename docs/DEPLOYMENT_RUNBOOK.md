@@ -562,8 +562,15 @@ from that report and the case's approval reference.
 Run the same command with the decision file as its last argument. The
 command records approval and returns its audit ID on a retry with the same
 decision. Keep the record with the private case. Changes to the outgoing
-grant scope require a fresh decision. Maildir and DAV removals check the
-approval for their own store before deleting content. The approval records
+grant scope require a fresh decision. For Maildir, the report also includes
+digests of outgoing thread and collection records. Changes to the recorded
+discussion, membership, message references, or reader permissions require a
+fresh decision. Reconcile queued, uncertain, or partial shared replies before
+approving the removal. The report includes each affected Outbox send ID,
+actor ID, and delivery state, including replies queued by another mailbox for
+this source.
+
+Maildir and DAV removals check the approval for their own store before deleting content. The approval records
 the operator's decision and leaves grants, discussion, and delivery records
 in place for their own disposition.
 

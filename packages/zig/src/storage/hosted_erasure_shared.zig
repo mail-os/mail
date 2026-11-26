@@ -1,6 +1,7 @@
 //! Require case approval for removing data used by another mailbox's grant.
 const std = @import("std");
 const Database = @import("database.zig").Database;
+const thread_evidence = @import("hosted_erasure_thread_evidence.zig");
 const calendar_copy = @import("hosted_erasure_calendar_copy.zig");
 const inventory = @import("hosted_erasure_inventory.zig");
 const preflight = @import("hosted_erasure_preflight.zig");
@@ -35,14 +36,19 @@ const Scope = struct {
     fn requiresDecision(self: Scope) bool {
         return self.reviewed.len != 0 or self.current.len != 0 or self.source_delegations.len != 0;
     }
-
-    fn digest(self: Scope, a: Allocator) ![64]u8 {
-        const content = try std.json.Stringify.valueAlloc(a, self, .{});
-        var hash: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(content, &hash, .{});
-        return std.fmt.bytesToHex(hash, .lower);
-    }
 };
+
+fn digestForScope(a: Allocator, scope: Scope, threads: []const thread_evidence.Thread) ![64]u8 {
+    // Preserve legacy digests for Calendar and for Maildir without a live
+    // thread or collection. Only the scope with new evidence needs approval.
+    const content = if (threads.len == 0)
+        try std.json.Stringify.valueAlloc(a, scope, .{})
+    else
+        try std.json.Stringify.valueAlloc(a, .{ .scope = scope, .thread_records = threads }, .{});
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(content, &hash, .{});
+    return std.fmt.bytesToHex(hash, .lower);
+}
 
 fn sourceShares(a: Allocator, shares: []const inventory.SharedBacking, store: Store) ![]const inventory.SharedBacking {
     var source: std.ArrayList(inventory.SharedBacking) = .empty;
@@ -90,6 +96,9 @@ pub const Report = struct {
     requires_approval: bool,
     scope_sha256: []const u8,
     scope: Scope,
+    thread_records: []const thread_evidence.Thread,
+    unresolved_shared_replies: usize,
+    shared_reply_dependencies: []const thread_evidence.UnresolvedReply,
     audit_id: ?i64 = null,
 };
 
@@ -122,7 +131,9 @@ pub fn inspect(a: Allocator, db: *Database, review: review_store.Review, start_i
     const now = time.timestamp();
     const active = try review_store.requireStarted(a, tx, review, start_id, now);
     const scope = try collect(a, tx, review, active.identity.native_user_id, store);
-    const digest = try scope.digest(a);
+    const threads = if (store == .maildir) try thread_evidence.collect(a, tx, active.identity.native_user_id, scope.current) else &.{};
+    const pending = if (store == .maildir) try thread_evidence.unresolvedReplies(a, tx, active.identity.native_user_id) else &.{};
+    const digest = try digestForScope(a, scope, threads);
     var result: Report = .{
         .mailbox = review.mailbox,
         .request_id = review.request_id,
@@ -130,8 +141,12 @@ pub fn inspect(a: Allocator, db: *Database, review: review_store.Review, start_i
         .requires_approval = scope.requiresDecision(),
         .scope_sha256 = try a.dupe(u8, &digest),
         .scope = scope,
+        .thread_records = threads,
+        .unresolved_shared_replies = pending.len,
+        .shared_reply_dependencies = pending,
     };
     if (decision) |approved| {
+        if (pending.len != 0) return error.ErasureSharedRepliesUnresolved;
         if (approved.version != 1 or !preflight.validCaseReference(approved.approval_reference) or !result.requires_approval)
             return error.InvalidErasureSharedDecision;
         if (!std.mem.eql(u8, approved.scope_sha256, &digest)) return error.ErasureSharedScopeChanged;
@@ -146,14 +161,17 @@ pub fn inspect(a: Allocator, db: *Database, review: review_store.Review, start_i
             .disposition = approved.disposition,
             .approval_reference = approved.approval_reference,
             .scope = scope,
+            .thread_records = if (threads.len != 0) threads else null,
             .retained_calendar_copies = if (approved.retained_calendar_copies.len != 0) approved.retained_calendar_copies else null,
         }, .{});
         const existing = try tx.prepare(
             \\SELECT id FROM audit_log WHERE action='hosted.erasure.shared.source_release'
             \\AND target=?1 AND target_type='hosted_mailbox'
-            \\AND json_remove(details,'$.retained_calendar_copies')=json_remove(?2,'$.retained_calendar_copies')
+            \\AND json_remove(details,'$.retained_calendar_copies','$.thread_records')=
+            \\    json_remove(?2,'$.retained_calendar_copies','$.thread_records')
             \\AND coalesce(json_extract(details,'$.retained_calendar_copies'),'[]')=
             \\    coalesce(json_extract(?2,'$.retained_calendar_copies'),'[]')
+            \\AND coalesce(json_extract(details,'$.thread_records'),'[]')=coalesce(json_extract(?2,'$.thread_records'),'[]')
             \\ORDER BY id LIMIT 1
         );
         defer existing.finalize();
@@ -172,8 +190,10 @@ pub const Release = struct {
 
 pub fn requireRelease(a: Allocator, tx: Database.Transaction, review: review_store.Review, start_id: i64, owner: i64, store: Store) !?Release {
     const scope = try collect(a, tx, review, owner, store);
+    if (store == .maildir and (try thread_evidence.unresolvedReplies(a, tx, owner)).len != 0) return error.ErasureSharedRepliesUnresolved;
     if (!scope.requiresDecision()) return null;
-    const digest = try scope.digest(a);
+    const threads = if (store == .maildir) try thread_evidence.collect(a, tx, owner, scope.current) else &.{};
+    const digest = try digestForScope(a, scope, threads);
     const approved = try tx.prepare(
         \\SELECT id,json_extract(details,'$.disposition'),coalesce(json_extract(details,'$.retained_calendar_copies'),'[]')
         \\FROM audit_log WHERE action='hosted.erasure.shared.source_release'
