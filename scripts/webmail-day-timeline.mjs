@@ -10,6 +10,7 @@ const { MAIL_TIMELINE_URL: url, MAIL_TIMELINE_OWNER: owner, MAIL_TIMELINE_VIEWER
 const [engine, output] = process.argv.slice(2)
 const engines = { chromium, firefox, webkit }
 const button = (scope, name) => scope.getByRole('button', { name, exact: typeof name === 'string' })
+const studioCalendar = page => button(page.getByRole('group', { name: 'Calendars', exact: true }), /^Studio schedule(?: |$)/)
 const timeline = page => page.getByRole('region', { name: 'Day timeline', exact: true })
 const grid = page => timeline(page).locator('.calendar-timeline-grid')
 const slot = page => page.getByRole('combobox', { name: 'Start time', exact: true })
@@ -31,7 +32,7 @@ async function openCalendar(browser, account, phone = false) {
   await button(page, 'Sign in').click()
   await page.waitForURL(`${url}/`)
   await page.goto(`${url}/calendar?day=${day}`)
-  await button(page, /Studio schedule/).waitFor()
+  await studioCalendar(page).waitFor()
   return page
 }
 
@@ -299,7 +300,7 @@ async function clocks(page) {
 async function shares(browser) {
   const reader = await openCalendar(browser, viewer)
   try {
-    await button(reader, /Studio schedule/).click()
+    await studioCalendar(reader).click()
     const shared = timeline(reader)
     await button(shared, /^Design review,/).waitFor()
     assert.equal(await slot(reader).count(), 0)
@@ -314,7 +315,7 @@ async function shares(browser) {
 
   const busy = await openCalendar(browser, availability, true)
   try {
-    await button(busy, /Studio schedule/).tap()
+    await studioCalendar(busy).tap()
     const blocks = timeline(busy).getByRole('list', { name: 'Busy periods' }).locator('li')
     await blocks.nth(2).waitFor()
     const positions = await blocks.evaluateAll(nodes => nodes.map(node =>
@@ -345,7 +346,7 @@ async function main() {
   try {
     const desktop = await openCalendar(browser, owner)
     await renderDay(desktop, false)
-    await button(desktop, 'Studio schedule').click()
+    await studioCalendar(desktop).click()
     await createAt(desktop, '2026-11-24T11:15Z', 'Keyboard timeline event', '2026-11-24T11:15', '2026-11-24T12:15')
     await clocks(desktop)
     await desktop.context().close()
@@ -353,7 +354,7 @@ async function main() {
     const phone = await openCalendar(browser, owner, true)
     await phoneSchedule(phone)
     await renderDay(phone, true)
-    await button(phone, 'Studio schedule').tap()
+    await studioCalendar(phone).tap()
     await createAt(phone, '2026-11-24T14:15Z', 'Touch timeline event', '2026-11-24T14:15', '2026-11-24T15:15', true)
     await phone.context().close()
     await shares(browser)
