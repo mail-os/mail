@@ -350,9 +350,13 @@ const putSql =
 
 /// expected=0 creates; an existing record needs its last acknowledged revision.
 pub fn put(db: *database.Database, row: Record, expected: i64) !i64 {
-    const s = try db.prepare(putSql);
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const s = try tx.prepare(putSql);
     defer s.finalize();
-    return putWith(s, row, expected);
+    const revision = try putWith(s, row, expected);
+    try tx.commit();
+    return revision;
 }
 
 fn putWith(s: database.Statement, row: Record, expected: i64) !i64 {
@@ -418,9 +422,13 @@ const enqueueSql =
 ;
 
 pub fn enqueue(db: *database.Database, row: Record, draft_id: ?[]const u8, draft_revision: i64) !i64 {
-    const s = try db.prepare(enqueueSql);
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const s = try tx.prepare(enqueueSql);
     defer s.finalize();
-    return enqueueWith(s, row, draft_id, draft_revision);
+    const revision = try enqueueWith(s, row, draft_id, draft_revision);
+    try tx.commit();
+    return revision;
 }
 
 pub fn enqueueShared(db: *database.Database, row: Record, draft_id: []const u8, draft_revision: i64, context: shared_inbox.ReplyContext) !i64 {
@@ -500,7 +508,9 @@ fn enqueueWith(s: database.Statement, row: Record, draft_id: ?[]const u8, draft_
 }
 
 pub fn cancelSend(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8, now: i64) !Record {
-    const s = try db.prepare(
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const s = try tx.prepare(
         \\UPDATE webmail_records SET state='cancelled',revision=revision+1,expires_at=?4
         \\WHERE username=?1 AND kind='outbox' AND id=?2 AND state='pending' AND due_at>?3
         \\RETURNING username,kind,id,payload,state,revision,due_at,expires_at
@@ -513,6 +523,7 @@ pub fn cancelSend(allocator: std.mem.Allocator, db: *database.Database, user: []
     if (!try s.step()) return StoreError.Conflict;
     const row = try readRecord(allocator, s);
     _ = try s.step();
+    try tx.commit();
     return row;
 }
 
@@ -538,7 +549,9 @@ pub fn nextInterruptedDelivery(a: std.mem.Allocator, db: *database.Database, cur
 }
 
 pub fn addUpload(db: *database.Database, user: []const u8, upload: Upload, now: i64, max_staged_bytes: usize, max_count: usize) !void {
-    const s = try db.prepare(
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const s = try tx.prepare(
         \\INSERT INTO webmail_uploads(username,id,filename,content_type,data,size,expires_at,mime)
         \\SELECT ?1,?2,?3,?4,?5,?6,?7,json_object('contentId',?10,'inline',?11) WHERE
         \\(SELECT COALESCE(SUM(size),0)+?6<=?8 AND COUNT(*)<?9 FROM webmail_uploads WHERE username=?1)
@@ -558,6 +571,7 @@ pub fn addUpload(db: *database.Database, user: []const u8, upload: Upload, now: 
     try s.bind(11, @as(i64, @intFromBool(upload.inline_part)));
     if (!try s.step()) return StoreError.StorageLimit;
     _ = try s.step();
+    try tx.commit();
 }
 
 pub fn getUpload(allocator: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8) !Upload {
@@ -640,6 +654,11 @@ test "draft revisions, queued-send claims and cancellation are account-scoped" {
     _ = try put(&db, send, 0);
     try t.expectError(StoreError.Conflict, cancelSend(a, &db, "two@example.com", send.id, 100));
     try t.expect(try claimDue(a, &db, 109) == null);
+    var failed_cancel = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try t.expectError(error.OutOfMemory, cancelSend(failed_cancel.allocator(), &db, send.username, send.id, 109));
+    const active = try get(a, &db, send.username, "outbox", send.id);
+    try t.expectEqualStrings("pending", active.state);
+    try t.expectEqual(@as(i64, 1), active.revision);
     _ = try cancelSend(a, &db, send.username, send.id, 109);
     try t.expect(try claimDue(a, &db, 120) == null);
     send.id = "2234567890123456";
