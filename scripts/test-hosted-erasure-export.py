@@ -104,7 +104,83 @@ def verify(test, db):
         assert copies == [raw]
     assert original.read_bytes() == raw
     expect_smtp(test.deliver(peer, subject='Unrelated mailbox remained available'), 250)
-    print('Verified audited hosted export, digest, exact archive bytes, recipient, expiry, rejection, and retry.')
+    handoff = {key: request[key] for key in (
+        'version', 'mailbox', 'assignment_actor', 'case_reference', 'recipient_verification_reference', 'recipient',
+    )}
+    handoff['export_audit_id'] = receipt['audit_id']
+    handoff_input = test.directory / 'handoff.json'
+    delivered = test.directory / 'approved-channel.tar'
+
+    def pass_archive(overrides=None, source=archive, output=delivered, env=None, mode=0o600):
+        handoff_input.write_text(json.dumps({**handoff, **(overrides or {})}))
+        handoff_input.chmod(mode)
+        return cli(test, 'hosted-erasure-handoff', str(handoff_input), str(source), str(output), env=env)
+
+    def refused_handoff(error, overrides=None, **kwargs):
+        result = pass_archive(overrides, **kwargs)
+        assert result.returncode != 0 and not result.stdout and error in result.stderr, result
+        assert not delivered.exists()
+
+    def handoff_audits():
+        return db.execute("SELECT id,details FROM audit_log WHERE action='hosted.erasure.export.handoff_authorized'").fetchall()
+
+    refused_handoff('ExportHandoffReviewNotPrivate', mode=0o644)
+    refused_handoff('ExportRecipientChanged', {'recipient': 'another-recipient@example.test'})
+    refused_handoff('ExportRecipientChanged', {'recipient_verification_reference': 'unverified-approval'})
+    refused_handoff('ExportRecipientChanged', {'case_reference': 'unrelated-case'})
+    refused_handoff('ExportAuditNotFound', {'mailbox': peer})
+    refused_handoff('ManagedMailboxNotFound', {'assignment_actor': test.specs[peer]['actor']})
+    refused_handoff('ExportAuditNotFound', env=dict(test.env, SMTP_DB_PATH=str(older)))
+    tampered = test.directory / 'tampered.tar'
+    tampered.write_bytes(bytes([archive_bytes[0] ^ 1]) + archive_bytes[1:])
+    tampered.chmod(0o600)
+    refused_handoff('ExportArchiveChanged', source=tampered)
+    tampered.write_bytes(archive_bytes)
+    tampered.chmod(0o644)
+    refused_handoff('ExportArchiveNotPrivate', source=tampered)
+    assert not handoff_audits()
+
+    with db:
+        db.execute("""CREATE TRIGGER deny_handoff_audit BEFORE INSERT ON audit_log
+                       WHEN NEW.action='hosted.erasure.export.handoff_authorized'
+                       BEGIN SELECT RAISE(ABORT,'fixture handoff audit failure'); END""")
+    refused_handoff('StepFailed')
+    with db:
+        db.execute('DROP TRIGGER deny_handoff_audit')
+    assert not handoff_audits()
+
+    result = pass_archive()
+    assert result.returncode == 0, result.stderr
+    ready = json.loads(result.stdout)
+    assert ready['state'] == 'private_handoff_ready' and ready['export_audit_id'] == receipt['audit_id']
+    assert ready['prepared'] == record and delivered.read_bytes() == archive_bytes
+    assert S_IMODE(delivered.stat().st_mode) == 0o600
+    retry = pass_archive()
+    assert retry.returncode == 0 and json.loads(retry.stdout) == ready, retry
+    audit, = handoff_audits()
+    assert audit[0] == ready['audit_id']
+    assert json.loads(audit[1])['recipient'] == record['recipient']
+    assert json.loads(audit[1])['expires_at'] == record['expires_at']
+
+    output_conflict = test.directory / 'some-other-handoff.tar'
+    output_conflict.write_bytes(b'existing private operator data')
+    output_conflict.chmod(0o600)
+    conflict = pass_archive(output=output_conflict)
+    assert conflict.returncode != 0 and 'ExportArchiveChanged' in conflict.stderr
+    assert output_conflict.read_bytes() == b'existing private operator data'
+    assert handoff_audits() == [audit]
+
+    expires = test.directory / 'after-deadline.db'
+    with closing(sqlite3.connect(expires)) as snapshot:
+        db.backup(snapshot)
+        with snapshot:
+            snapshot.execute("UPDATE audit_log SET details=json_set(details,'$.expires_at',?) WHERE id=?",
+                             (int(time.time()) - 1, receipt['audit_id']))
+    expired = pass_archive(output=test.directory / 'after-expiration.tar', env=dict(test.env, SMTP_DB_PATH=str(expires)))
+    assert expired.returncode != 0 and 'InvalidExportExpiry' in expired.stderr
+    assert not (test.directory / 'after-expiration.tar').exists()
+    assert delivered.read_bytes() == archive_bytes and handoff_audits() == [audit]
+    print('Verified audited export and recipient-bound private handoff, exact archive bytes, expiry, refusal, and audited retry.')
 
 
 if __name__ == '__main__':

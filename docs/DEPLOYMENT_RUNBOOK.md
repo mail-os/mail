@@ -361,6 +361,31 @@ review its digest and audit entry before retrying with a new path. The command
 preserves an existing destination. Keep the source mailbox and backup evidence
 available for the retention and erasure review in [#188](https://github.com/mail-os/mail/issues/188).
 
+### Verify a private export handoff
+
+Create a private mode-0600 JSON file with `version: 1`, the `export_audit_id`
+from the prepared export receipt, and the reviewed `mailbox`,
+`assignment_actor`, `case_reference`, `recipient` and
+`recipient_verification_reference`. Use the original recipient and case
+evidence. Review a new export if either changes.
+
+```sh
+/opt/mail/mail-server user:local hosted-erasure-handoff \
+  private-handoff-review.json private-export.tar approved-channel-staging.tar
+```
+
+The command checks the current mailbox assignment, the recorded recipient,
+the original deadline and the archive byte count and digest. It stages a
+mode-0600 copy only after writing the authorization audit. Retrying the same
+export reuses its authorization and accepts an existing copy only when it
+matches the audited bytes. The command refuses another tenant, changed input,
+an expired export, or a destination containing other data.
+
+The handoff receipt means the private copy is ready for the approved delivery
+channel. Set that channel's expiration to the deadline in the receipt and
+record delivery separately. Keep both private copies under the approved
+retention policy. The handoff does not authorize erasure.
+
 ### Inventory retained stores before an erasure decision
 
 Run the inventory from the daemon’s working directory using the same

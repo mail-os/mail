@@ -244,6 +244,40 @@ fn hostedErasureExportAction(ctx: *cli.BaseCommand.ParseContext) !void {
     try output.interface.flush();
 }
 
+fn hostedErasureHandoffAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const review_path = ctx.getArgument(0) orelse return error.MissingArgument;
+    const source = ctx.getArgument(1) orelse return error.MissingArgument;
+    const destination = ctx.getArgument(2) orelse return error.MissingArgument;
+    const io = io_compat.getIo();
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const review_file = try std.Io.Dir.cwd().openFile(io, review_path, .{ .follow_symlinks = false });
+    defer review_file.close(io);
+    const stat = try review_file.stat(io);
+    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0 or stat.size > 8192)
+        return error.ExportHandoffReviewNotPrivate;
+    var input_buffer: [4096]u8 = undefined;
+    var input = review_file.reader(io, &input_buffer);
+    const raw = try a.alloc(u8, @intCast(stat.size));
+    try input.interface.readSliceAll(raw);
+    const review = try std.json.parseFromSliceLeaky(erasure_export.Handoff, a, raw, .{});
+
+    const path = env.get("SMTP_DB_PATH") orelse "./smtp.db";
+    try std.Io.Dir.cwd().access(io, path, .{});
+    var db = try database.Database.init(ctx.allocator, path);
+    defer db.deinit();
+    var actor_buffer: [64]u8 = undefined;
+    const operator = try std.fmt.bufPrint(&actor_buffer, "local-operator:{d}", .{std.c.geteuid()});
+    const receipt = try erasure_export.handoffArchive(a, io, &db, review, operator, source, destination);
+
+    var buffer: [4096]u8 = undefined;
+    var output = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try std.json.Stringify.value(receipt, .{ .whitespace = .indent_2 }, &output.interface);
+    try output.interface.writeByte('\n');
+    try output.interface.flush();
+}
+
 fn importCalendarWorkflowAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Database, _: *auth.AuthBackend) !void {
     const username = ctx.getArgument(0) orelse return error.MissingArgument;
     const path = ctx.getArgument(1) orelse return error.MissingArgument;
@@ -421,6 +455,13 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try hosted_export_cmd.addArgument(cli.Argument.init("output", "Path for a new private archive", .string).withRequired(true));
     _ = hosted_export_cmd.setAction(hostedErasureExportAction);
     _ = try cmd.addCommand(hosted_export_cmd);
+
+    const hosted_handoff_cmd = try cli.BaseCommand.init(allocator, "hosted-erasure-handoff", "Verify the approved recipient and expiry before staging a private export");
+    _ = try hosted_handoff_cmd.addArgument(cli.Argument.init("handoff", "Private reviewed handoff JSON file", .string).withRequired(true));
+    _ = try hosted_handoff_cmd.addArgument(cli.Argument.init("archive", "Prepared private mailbox archive", .string).withRequired(true));
+    _ = try hosted_handoff_cmd.addArgument(cli.Argument.init("output", "Path for the verified private handoff", .string).withRequired(true));
+    _ = hosted_handoff_cmd.setAction(hostedErasureHandoffAction);
+    _ = try cmd.addCommand(hosted_handoff_cmd);
 
     const export_cmd = try cli.BaseCommand.init(allocator, "export", "Export a mailbox to a portable TAR archive");
     _ = try export_cmd.addArgument(cli.Argument.init("username", "Canonical mailbox username", .string));
