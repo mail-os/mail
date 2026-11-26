@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import runpy
 import sqlite3
+import subprocess
 import tempfile
 from threading import Lock, Thread
 import time
@@ -69,9 +70,10 @@ def run(candidate, previous, webhook_ip):
     with tempfile.TemporaryDirectory(prefix="mail-local-route-") as tmp, listener("127.0.0.1") as search, listener(webhook_ip or "127.0.0.1") as webhooks:
         root = Path(tmp)
         test = Fixture(previous or candidate, root, staging=True)
-        test.env.update(TYPESENSE_API_KEY="routing-test", TYPESENSE_HOST="127.0.0.1", TYPESENSE_PORT=str(search.server_port),
-                        SMTP_WEBHOOK_URL=f"http://{webhook_ip or '127.0.0.1'}:{webhooks.server_port}/hook",
-                        SMTP_WEBHOOK_ENABLED="true")
+        routing_env = dict(TYPESENSE_API_KEY="routing-test", TYPESENSE_HOST="127.0.0.1", TYPESENSE_PORT=str(search.server_port),
+                           SMTP_WEBHOOK_URL=f"http://{webhook_ip or '127.0.0.1'}:{webhooks.server_port}/hook",
+                           SMTP_WEBHOOK_ENABLED="true")
+        test.env.update(routing_env)
 
         def query(sql, args=()):
             with closing(sqlite3.connect(root / "smtp.db")) as db:
@@ -156,6 +158,20 @@ def run(candidate, previous, webhook_ip):
             assert status == 200, response
             assert query("SELECT outcome FROM accepted_mail_targets WHERE mailbox=?", (app_inbox,)) == [("pending",)]
             assert messages(app_inbox) == []
+
+            # Distinct listener ports and a different working directory still
+            # converge on the same Maildir inode and acceptance journal.
+            standby_dir = root / "standby"
+            standby_dir.mkdir()
+            (standby_dir / "mail").symlink_to(root / "mail", target_is_directory=True)
+            standby = Fixture(candidate, standby_dir, staging=True)
+            standby.env.update(SMTP_DB_PATH=test.env["SMTP_DB_PATH"], CALDAV_DB_PATH=test.env["CALDAV_DB_PATH"])
+            blocked = subprocess.run(standby.daemon_command(), cwd=standby.directory, env=standby.env,
+                                     capture_output=True, text=True, timeout=8)
+            log = blocked.stdout + blocked.stderr
+            assert blocked.returncode != 0 and "MaildirWriterActive" in log, log
+            assert process.poll() is None
+            assert query("SELECT outcome FROM accepted_mail_targets WHERE mailbox=?", (app_inbox,)) == [("pending",)]
             process.kill()
             process.wait(timeout=5)
 
@@ -173,6 +189,12 @@ def run(candidate, previous, webhook_ip):
                 (directory / name).hardlink_to(temporary)
         bad_dirs[app_inbox].unlink()
 
+        # Promote the standby on its own ports using the established data and
+        # routing configuration now that the old PID has exited.
+        standby.directory = root
+        standby.env.update(routing_env)
+        standby.password, standby.specs = test.password, test.specs
+        test = standby
         with test.daemon():
             for user in (first, second, third, forwarded):
                 assert messages(user) == ["Recovered DATA envelope"], user
@@ -189,7 +211,7 @@ def run(candidate, previous, webhook_ip):
                         return [payload["recipients"][0] for _, payload in webhooks.events]
                 eventually(notified, lambda users: all(user in users for user in (first, second, third, app_inbox)))
                 assert forwarded not in notified()
-            print("Verified atomic acceptance, quota reservations, process death, exactly-once local recovery, and committed counts and indexing.")
+            print("Verified atomic acceptance, quota reservations, writer exclusion, process death, exactly-once local recovery, and committed counts and indexing.")
 
             reviewer = test.provision("reviewer")
             no_forward = test.provision("no-forward")

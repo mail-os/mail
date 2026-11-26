@@ -154,6 +154,21 @@ A copied working directory has independent counters and receipts. A shared
 Maildir path alone cannot share the mailbox mutation lock. Treat either
 configuration as unverified for concurrent writers.
 
+On one host, `mail serve` takes an exclusive nonblocking lock on the local
+`mail/` directory before it opens SQLite, starts listeners, or replays work.
+A second daemon sees `MaildirWriterActive` and exits. This applies when two
+working directories refer to the same Maildir through a symlink or bind
+mount. Stop a daemon from before this guard before introducing a fenced build.
+Keep the Maildir and its database together, and stop the active daemon
+before replacing the directory itself or restoring the data. After a stop or
+crash releases the lock, the replacement can recover the existing journal.
+Check the service log and configured data paths if the daemon cannot acquire
+the lock. Use a local filesystem and keep the same Maildir and SQLite pairing
+through promotion. The Docker image uses `/var/mail` as its working directory
+so its relative Maildir lives on the same volume as the database. Preserve any
+explicit working-directory override used by an existing installation. Two hosts
+or independently copied directories require separate writer fencing.
+
 Before adding a listener or worker that could write the same hosted mailbox
 from another daemon, complete [#179](https://github.com/mail-os/mail/issues/179).
 A topology with one writer per mailbox can have additional listeners only if
