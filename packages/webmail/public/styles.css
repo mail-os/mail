@@ -1308,9 +1308,13 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-writing-settings .wm-private-form label { margin: 0; }
 .wm-writing-insert { margin: 0 20px 10px; font-size: 13px; }
 .wm-writing-insert summary { width: fit-content; font-weight: 550; color: var(--accent); cursor: pointer; }
-.wm-writing-control { display: grid; grid-template-columns: 60px minmax(0, 220px) auto; align-items: center; justify-content: start; gap: 8px; margin-top: 8px; }
-.wm-writing-control select { width: 100%; }
+.wm-writing-controls { grid-template-columns: max-content minmax(0, 220px) max-content; }
+.wm-writing-control select { min-width: 0; width: 100%; }
 @media (max-width: 540px) { .wm-writing-grid { grid-template-columns: minmax(0, 1fr); } .wm-writing-insert { margin-inline: 14px; } }
+@media (max-width: 360px) {
+  .wm-writing-controls { grid-template-columns: minmax(0, 1fr) max-content; }
+  .wm-writing-control label { grid-column: 1 / -1; }
+}
 .wm-forwarding h2 { display: flex; align-items: center; gap: 6px; }
 .wm-forwarding h2 .mail-icon { color: var(--accent); }
 .wm-forwarding strong { overflow-wrap: anywhere; }

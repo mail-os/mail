@@ -854,15 +854,17 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
     <textarea class="wm-composer-body" x-model="body" :disabled="sending || sendUncertain" aria-label="Message body" placeholder="Write your message…"></textarea>
     <details :if="writingLibrary?.snippets.length || writingLibrary?.signatures.length" class="wm-writing-insert">
       <summary>Writing tools</summary>
-      <div :if="writingLibrary?.snippets.length" class="wm-writing-control">
-        <label for="composeSnippet">Snippet</label>
-        <select id="composeSnippet" x-model="snippetChoice" :disabled="sending || sendUncertain"><option value="">Choose…</option><option :for="entry in writingLibrary.snippets" :key="entry.id" :value="entry.id" :text="entry.name"></option></select>
-        <button type="button" class="wm-action" @click="insertSnippet()" :disabled="!snippetChoice || sending || sendUncertain"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span>Insert snippet</button>
-      </div>
-      <div :if="writingLibrary?.signatures.length" class="wm-writing-control">
-        <label for="composeSignature">Signature</label>
-        <select id="composeSignature" x-model="signatureChoice" :disabled="sending || sendUncertain"><option value="">Choose…</option><option :for="entry in writingLibrary.signatures" :key="entry.id" :value="entry.id" :text="entry.name"></option></select>
-        <button type="button" class="wm-action" @click="insertSignature()" :disabled="!signatureChoice || sending || sendUncertain"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span>Insert signature</button>
+      <div class="grid gap-2 items-center justify-start mt-2 wm-writing-controls">
+        <div :if="writingLibrary?.snippets.length" class="contents wm-writing-control">
+          <label for="composeSnippet">Snippet</label>
+          <select id="composeSnippet" x-model="snippetChoice" :disabled="sending || sendUncertain"><option value="">Choose…</option><option :for="entry in writingLibrary.snippets" :key="entry.id" :value="entry.id" :text="entry.name"></option></select>
+          <button type="button" class="wm-action" @click="insertSnippet()" :disabled="!snippetChoice || sending || sendUncertain"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span>Insert snippet</button>
+        </div>
+        <div :if="writingLibrary?.signatures.length" class="contents wm-writing-control">
+          <label for="composeSignature">Signature</label>
+          <select id="composeSignature" x-model="signatureChoice" :disabled="sending || sendUncertain"><option value="">Choose…</option><option :for="entry in writingLibrary.signatures" :key="entry.id" :value="entry.id" :text="entry.name"></option></select>
+          <button type="button" class="wm-action" @click="insertSignature()" :disabled="!signatureChoice || sending || sendUncertain"><span class="mail-icon" data-icon="compose" aria-hidden="true"></span>Insert signature</button>
+        </div>
       </div>
     </details>
     <label :if="replyContext?.reference" class="wm-reply-clear"><input type="checkbox" x-model="clearFollowUp" :disabled="sending || sendUncertain">Clear Follow-up after successful delivery</label>

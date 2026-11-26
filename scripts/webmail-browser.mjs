@@ -3481,6 +3481,55 @@ async function writingControlJourney(page) {
   await save.click()
   await button(settings, 'Review handoff').waitFor()
   await button(settings, 'Close').click()
+
+  const composer = page.getByRole('dialog', { name: 'Compose message' })
+  const tools = composer.locator('.wm-writing-insert')
+  const snippetChoice = composer.getByLabel('Snippet', { exact: true })
+  const signatureChoice = composer.getByLabel('Signature', { exact: true })
+  await page.locator('.wm-compose-btn').click()
+  await tools.locator('summary').click()
+  await snippetChoice.selectOption({ label: 'Review handoff' })
+  await verifySelect(snippetChoice)
+  assert.equal(await signatureChoice.count(), 0)
+  await button(composer, 'Close composer').click()
+  await composer.waitFor({ state: 'hidden' })
+
+  await button(page, 'Account').click()
+  await button(settings, 'Signatures').click()
+  await name.fill('Studio')
+  await form.getByLabel('Signature text').fill('Studio team')
+  await button(form, 'Save signature').click()
+  await button(settings, 'Studio').waitFor()
+  await button(settings, 'Close').click()
+  await page.locator('.wm-compose-btn').click()
+  await tools.locator('summary').click()
+  await snippetChoice.selectOption({ label: 'Review handoff' })
+  await signatureChoice.selectOption({ label: 'Studio' })
+
+  const viewport = page.viewportSize()
+  for (const width of [1440, 390, 320]) {
+    await page.setViewportSize({ width, height: viewport.height })
+    const height = width <= 860 ? 44 : 36
+    const rows = await verifyControlRow(tools, 'select, button', height, false, 4)
+    for (const [upper, lower] of [[rows[0], rows[2]], [rows[1], rows[3]]]) {
+      assert(Math.abs(upper.left - lower.left) < .5 && Math.abs(upper.right - lower.right) < .5,
+        `Both writing tool rows share column edges at ${width}px`)
+    }
+    for (const select of [snippetChoice, signatureChoice]) {
+      await verifySelect(select, height)
+      await verifySelectedOptionFits(select)
+      if (width <= 360) {
+        const field = await select.boundingBox()
+        const label = await tools.locator(`label[for="${await select.getAttribute('id')}"]`).boundingBox()
+        assert(label.y + label.height <= field.y && Math.abs(label.x - field.x) < .5,
+          'Writing tool labels sit above the corresponding phone controls')
+      }
+    }
+    await fitsViewport(page)
+  }
+  await page.setViewportSize(viewport)
+  await button(composer, 'Close composer').click()
+  await composer.waitFor({ state: 'hidden' })
 }
 
 try {
