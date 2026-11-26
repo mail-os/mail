@@ -114,7 +114,16 @@ async function verifyControlRow(container, selector, height, sameRow = true, min
     const primary = node.matches('.mail-primary-button, .calendar-primary, .wm-snapshot-primary, .wm-compose-btn, .wm-send-btn, .login button:not(.login-secondary, .wm-action), .wm-writing-settings .wm-writing-save')
     const enabledPrimary = primary && node.matches(':enabled')
     const enabledAccent = node.matches('.wm-action--accent:not(:disabled)')
-    const borderToken = enabledPrimary ? '--primary-button-border' : enabledAccent ? '--accent-button-border' : '--control-border'
+    const isCalendarAction = !primary && node.matches('.wm-action')
+      && node.closest('.calendar-header-actions, .calendar-sources, .calendar-source-tools, .calendar-view-modes, .calendar-period-buttons, .calendar-day-label-summary, .calendar-create-form, .calendar-day-presentation > .calendar-choices')
+      && matchMedia('(prefers-contrast: no-preference) and (forced-colors: none)').matches
+    const isCalendarSelection = isCalendarAction && node.matches(
+      '.calendar-header-actions [aria-expanded=true], :is(.calendar-sources, .calendar-view-modes, .calendar-day-presentation > .calendar-choices) [aria-pressed=true]',
+    )
+    let borderToken = '--control-border'
+    if (enabledPrimary) borderToken = '--primary-button-border'
+    else if (enabledAccent || isCalendarSelection) borderToken = '--accent-button-border'
+    else if (isCalendarAction) borderToken = '--border'
     const borderChannels = style.getPropertyValue(borderToken).trim().slice(1).match(/../g)
     const border = `rgb(${borderChannels?.map(channel => Number.parseInt(channel, 16)).join(', ')})`
     return {
