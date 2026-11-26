@@ -557,6 +557,35 @@ The disposable fixture covers daemon activity, a backup without the start
 receipt, another tenant, changed paths, shared files, and interruption on both
 sides of deletion.
 
+### Remove active local search records
+
+Keep the approved case and its Maildir removal receipt together. With the
+same daemon stopped, run from its working directory with the same
+`SMTP_DB_PATH` and `MAIL_ROOT` used for Maildir removal.
+
+```bash
+umask 077
+/opt/mail/mail-server user:local hosted-erasure-search \
+  /private/exit-case-19/review.json 816 > /private/exit-case-19/local-search-receipt.json
+```
+
+The command verifies the Maildir receipt and checks for a restored directory
+under the same writer lock. One SQLite transaction removes the reserved
+native account's Webmail search documents and its ActiveSync search key,
+checks the full-text index against its content table, and commits counts
+and an audit receipt. A failed check rolls back the transaction. Retry with
+the same review and start ID to retrieve the same receipt.
+
+Record `local_search_removed_other_stores_pending` as completion of the
+active SQLite search step. Reconcile Typesense documents and their retained
+pending work and revisions separately. The remaining review includes
+SQLite WAL and older index segments, backups, and the other active stores.
+
+Run `python3 scripts/test-hosted-erasure-search.py /path/to/mail` on a
+disposable installation. The fixture searches genuine SMTP-delivered mail
+in both accounts, forces rollback on a stale full-text index and an audit
+failure, then checks the peer's search and retry receipt after removal.
+
 ## Local mailbox directory upgrade
 
 Back up the Maildir and SQLite database together before upgrading a server with older ActiveSync clients. On startup, the server checks for full-address local accounts that still have mail under a short directory name such as `mail/alice`. It moves eligible messages to `mail/alice@example.com` before opening the protocol listeners. It also moves messages in a canonical custom folder's nested slots into the folder path exposed by IMAP and webmail. ActiveSync, IMAP, webmail, and EWS then read from the canonical mailbox. The upgrade retains existing message flags and client identifiers when it can reconcile both directories.
