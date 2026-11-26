@@ -648,6 +648,21 @@ sudo journalctl -u mail | grep "Message received"
 
 ## Upgrade Procedures
 
+### Start a production release from GitHub
+
+Changes merged to `main` run CI. Start a production deployment separately
+after verifying the selected commit on staging and checking that the release
+and rollback prerequisites are met. For a release that migrates legacy CalDAV
+or CardDAV ownership, verify the collection owners and take a paired Mail and
+DAV checkpoint before deployment. [Legacy DAV ownership checklist](https://github.com/mail-os/mail-app/issues/2)
+
+```bash
+gh workflow run deploy.yml --repo mail-os/mail --ref main -f revision=FULL_VERIFIED_COMMIT_SHA
+```
+
+The selected ref must point to the verified commit when you start the workflow.
+If the ref has advanced, verify the new revision before starting its deployment.
+
 ### Standard Upgrade (Rolling Update)
 
 **Pre-requisites:**
