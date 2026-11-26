@@ -72,9 +72,12 @@ pub const Account = struct {
 
     pub fn advance(self: Account, a: std.mem.Allocator, collection: []const u8, previous: []const u8, key: []const u8, items: Items) !void {
         const snapshot = try encodeItems(a, items);
-        const stmt = try self.db.prepare(advance_sql);
+        var tx = try self.db.beginTransaction(.write);
+        defer tx.deinit();
+        const stmt = try tx.prepare(advance_sql);
         defer stmt.finalize();
         try self.applyAdvance(stmt, collection, previous, key, snapshot);
+        try tx.commit();
     }
 
     /// Publish a newly created Maildir for IMAP and webmail in the same
@@ -144,7 +147,9 @@ pub const Account = struct {
             \\UPDATE eas_mailbox_ping SET heartbeat=COALESCE(?3,heartbeat),folders=COALESCE(?4,folders)
             \\WHERE user_id=?1 AND device_id=?2 RETURNING heartbeat,folders
         ;
-        const stmt = try self.db.prepare(sql);
+        var tx = if (updating) try self.db.beginTransaction(.write) else null;
+        defer if (tx) |transaction| transaction.deinit();
+        const stmt = if (tx) |transaction| try transaction.prepare(sql) else try self.db.prepare(sql);
         defer stmt.finalize();
         try stmt.bind(1, self.user_id);
         try stmt.bind(2, self.device_id);
@@ -159,7 +164,10 @@ pub const Account = struct {
             .heartbeat = @intCast(stmt.columnInt64(0)),
             .folders = try std.json.parseFromSliceLeaky([]const []const u8, a, stmt.columnText(1), .{ .allocate = .alloc_always }),
         };
-        if (updating) _ = try stmt.step();
+        if (tx) |*transaction| {
+            _ = try stmt.step();
+            try transaction.commit();
+        }
         return settings;
     }
 };

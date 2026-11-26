@@ -339,8 +339,8 @@ pub fn wireKeys(a: Allocator, file: maildir.VersionedFile) ![]const []const u8 {
     return headers.keys(a);
 }
 
-pub fn remember(a: Allocator, db: *Database, user: []const u8, reference: []const u8, wire: []const []const u8) !void {
-    const stmt = try db.prepare(
+pub fn remember(a: Allocator, connection: anytype, user: []const u8, reference: []const u8, wire: []const []const u8) !void {
+    const stmt = try connection.prepare(
         \\INSERT INTO mail_private_anchors(user_id,reference,wire_ids)
         \\SELECT id,?2,?3 FROM users WHERE username=?1
         \\ON CONFLICT(user_id,reference) DO UPDATE SET wire_ids=excluded.wire_ids WHERE wire_ids<>excluded.wire_ids
@@ -364,7 +364,9 @@ pub fn addEntry(db: *Database, user: []const u8, reference: []const u8, kind: En
 
 pub fn changeEntry(db: *Database, user: []const u8, current: Context, id: []const u8, revision: i64, body: ?[]const u8) !void {
     const filter = " WHERE " ++ owner ++ " AND id=?2 AND revision=?3 AND anchor IN (SELECT value FROM json_each(?4))";
-    const stmt = try db.prepare(if (body != null)
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const stmt = try tx.prepare(if (body != null)
         "UPDATE mail_private_entries SET body=?5,revision=revision+1" ++ filter ++ " AND kind='note' RETURNING id"
     else
         "DELETE FROM mail_private_entries" ++ filter ++ " RETURNING id");
@@ -376,6 +378,7 @@ pub fn changeEntry(db: *Database, user: []const u8, current: Context, id: []cons
     if (body) |text| try stmt.bind(5, text);
     if (!try stmt.step()) return error.RevisionMismatch;
     _ = try stmt.step();
+    try tx.commit();
 }
 
 pub fn setLabel(db: *Database, user: []const u8, reference: []const u8, current: Context, label: []const u8, expected: []const u8) !void {
@@ -408,13 +411,15 @@ pub fn createGroup(a: Allocator, db: *Database, user: []const u8, refs: []const 
     for (refs, wire) |reference, keys| try connectKeys(&graph, try graph.node(reference), keys);
     var captured = std.AutoHashMap(usize, []const []const u8).init(a);
     defer captured.deinit();
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
     for (refs) |reference| {
         const root = graph.root(graph.ids.get(reference).?);
         const slot = try captured.getOrPut(root);
         if (!slot.found_existing) slot.value_ptr.* = try naturalWire(a, &graph, root);
-        try remember(a, db, user, reference, slot.value_ptr.*);
+        try remember(a, tx, user, reference, slot.value_ptr.*);
     }
-    const stmt = try db.prepare(
+    const stmt = try tx.prepare(
         \\INSERT INTO mail_private_groups(user_id,anchors,undo_until)
         \\SELECT id,?2,unixepoch()+30 FROM users WHERE username=?1 RETURNING id,undo_until
     );
@@ -423,24 +428,31 @@ pub fn createGroup(a: Allocator, db: *Database, user: []const u8, refs: []const 
     try stmt.bind(2, try std.json.Stringify.valueAlloc(a, refs, .{}));
     if (!try stmt.step()) return error.NotFound;
     const result: GroupReceipt = .{ .undoId = try a.dupe(u8, stmt.columnText(0)), .expiresAt = stmt.columnInt64(1) };
+    errdefer a.free(result.undoId);
     _ = try stmt.step();
+    try tx.commit();
     return result;
 }
 
 pub fn undoGroup(db: *Database, user: []const u8, id: []const u8) !void {
-    const stmt = try db.prepare("DELETE FROM mail_private_groups WHERE " ++ owner ++ " AND id=?2 AND undo_until>unixepoch() RETURNING id");
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const stmt = try tx.prepare("DELETE FROM mail_private_groups WHERE " ++ owner ++ " AND id=?2 AND undo_until>unixepoch() RETURNING id");
     defer stmt.finalize();
     try stmt.bind(1, user);
     try stmt.bind(2, id);
     if (!try stmt.step()) return error.NotFound;
     _ = try stmt.step();
+    try tx.commit();
 }
 
 pub const CollectionAction = enum { create, rename, delete };
 
 pub fn changeCollection(db: *Database, user: []const u8, action: CollectionAction, id: ?[]const u8, revision: ?i64, name: ?[]const u8) !void {
     const filter = " WHERE " ++ owner ++ " AND id=?2 AND revision=?3";
-    const stmt = try db.prepare(switch (action) {
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const stmt = try tx.prepare(switch (action) {
         .create => "INSERT INTO mail_private_collections(user_id,name) SELECT id,?2 FROM users WHERE username=?1 ON CONFLICT(user_id,name) DO NOTHING RETURNING id",
         .rename => "UPDATE mail_private_collections SET name=?4,revision=revision+1" ++ filter ++
             " AND NOT EXISTS(SELECT 1 FROM mail_private_collections c WHERE c.user_id=mail_private_collections.user_id AND c.name=?4 AND c.id<>?2) RETURNING id",
@@ -455,6 +467,7 @@ pub fn changeCollection(db: *Database, user: []const u8, action: CollectionActio
     }
     if (!try stmt.step()) return error.CollectionChanged;
     _ = try stmt.step();
+    try tx.commit();
 }
 
 pub fn setMember(db: *Database, user: []const u8, reference: []const u8, collection: []const u8, included: bool, exact: bool, current: Context) !void {

@@ -158,7 +158,8 @@ On one host, `mail serve` takes an exclusive nonblocking lock on the local
 `mail/` directory before it opens SQLite, starts listeners, or replays work.
 A second daemon sees `MaildirWriterActive` and exits. This applies when two
 working directories refer to the same Maildir through a symlink or bind
-mount. Keep the Maildir and its database together, and stop the active daemon
+mount. Stop a daemon from before this guard before introducing a fenced build.
+Keep the Maildir and its database together, and stop the active daemon
 before replacing the directory itself or restoring the data. After a stop or
 crash releases the lock, the replacement can recover the existing journal.
 Check the service log and configured data paths if the daemon cannot acquire

@@ -301,12 +301,16 @@ pub fn prepareDraft(a: Allocator, svc: *service.Service, access: Access, input: 
         }
     }
     {
-        const stmt = try svc.db.prepare("INSERT INTO mail_assistant_requests(grant_id,request_id,digest) SELECT ?1,?2,?3 WHERE (SELECT count(*) FROM mail_assistant_requests WHERE grant_id=?1)<25 RETURNING grant_id");
+        var tx = try svc.db.beginTransaction(.write);
+        defer tx.deinit();
+        const stmt = try tx.prepare("INSERT INTO mail_assistant_requests(grant_id,request_id,digest) SELECT ?1,?2,?3 WHERE (SELECT count(*) FROM mail_assistant_requests WHERE grant_id=?1)<25 RETURNING grant_id");
         defer stmt.finalize();
         try stmt.bind(1, access.grant_id);
         try stmt.bind(2, input.request_id);
         try stmt.bind(3, @as([]const u8, &digest));
         if (!try stmt.step()) return error.AssistantDraftLimit;
+        _ = try stmt.step();
+        try tx.commit();
     }
     const ack = try svc.saveDraft(a, access.username, access.email, payload);
     const stmt = try svc.db.prepare("UPDATE mail_assistant_requests SET acknowledgement=?3 WHERE grant_id=?1 AND request_id=?2");

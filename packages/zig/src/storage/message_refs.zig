@@ -199,7 +199,10 @@ pub fn issue(a: Allocator, db: *database.Database, user: []const u8, target: Loc
     var bytes: [16]u8 = undefined;
     io.randomBytes(&bytes);
     const id = try a.dupe(u8, &std.fmt.bytesToHex(bytes, .lower));
-    const s = try db.prepare(
+    errdefer a.free(id);
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const s = try tx.prepare(
         \\INSERT INTO mailbox_message_refs(user_id,reference,folder,basename,file_stamp)
         \\SELECT id,?5,?2,?3,?4 FROM users WHERE username=?1
         \\ON CONFLICT(user_id,folder,basename) DO UPDATE SET reference=excluded.reference,
@@ -216,6 +219,7 @@ pub fn issue(a: Allocator, db: *database.Database, user: []const u8, target: Loc
     try s.bind(5, id);
     if (!try s.step()) return error.NotFound;
     _ = try s.step();
+    try tx.commit();
     return id;
 }
 
