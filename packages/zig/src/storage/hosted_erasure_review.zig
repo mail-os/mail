@@ -102,7 +102,9 @@ fn validateInventory(a: Allocator, reviewed: inventory.Inventory, current: inven
     if (reviewed.shared_backing == null) {
         // Older inventories did not capture the individual share grants.
         // Refresh the evidence if they would affect a second mailbox.
-        if ((current.shared_backing orelse &.{}).len != 0) return error.ErasureSharedInventoryRequired;
+        if (current.shared_backing) |shares| {
+            if (shares.len != 0) return error.ErasureSharedInventoryRequired;
+        }
         comparison.shared_backing = null;
     }
     const earlier = try std.json.Stringify.valueAlloc(a, reviewed, .{});
