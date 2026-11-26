@@ -39,6 +39,7 @@ const autoconfig_mod = @import("api/autoconfig.zig");
 const managesieve = @import("protocol/managesieve.zig");
 const milter = @import("protocol/milter.zig");
 const webmail_http = @import("api/webmail_http.zig");
+const smtp_monitoring = @import("api/smtp_monitoring.zig");
 
 // Global shutdown flag
 var shutdown_requested = std.atomic.Value(bool).init(false);
@@ -223,6 +224,16 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         std.debug.print("All configuration values are within acceptable ranges.\n", .{});
         return;
     }
+
+    var smtp_monitor: ?smtp_monitoring.Listener = null;
+    if (env.get("SMTP_MONITORING_PORT")) |value| {
+        const port = std.fmt.parseInt(u16, value, 10) catch return error.InvalidSmtpMonitoringPort;
+        if (port == 0) return error.InvalidSmtpMonitoringPort;
+        const host = env.get("SMTP_MONITORING_HOST") orelse "127.0.0.1";
+        smtp_monitor = try smtp_monitoring.Listener.bind(host, port);
+        log.info("SMTP monitoring listening on {s}:{d}", .{ host, port });
+    }
+    defer if (smtp_monitor) |*listener| listener.deinit();
 
     // Setup signal handlers for graceful shutdown and hot reload
     const empty_set = std.posix.sigemptyset();
@@ -675,6 +686,16 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     // Create and start SMTP server
     var server = try smtp.Server.init(allocator, cfg, &log, db_ptr, auth_ptr, greylist_ptr);
     defer server.deinit();
+
+    const monitor_thread = if (smtp_monitor) |*listener|
+        try std.Thread.spawn(.{}, smtp_monitoring.Listener.run, .{ listener, &server, &shutdown_requested })
+    else
+        null;
+    defer if (monitor_thread) |thread| {
+        smtp_monitor.?.stopped.store(true, .release);
+        thread.join();
+    };
+
     server.scanner = scanner;
 
     // Start SMTPS (port 465) if TLS is enabled

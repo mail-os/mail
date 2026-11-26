@@ -1,14 +1,12 @@
-version: '3.8'
-
 services:
   mail:
+    image: ${MAIL_IMAGE:-mail:local}
     build:
       context: .
       dockerfile: Dockerfile
     container_name: mail
     ports:
       - "2525:2525"  # SMTP port
-      - "8025:8025"  # Health check / metrics port
     volumes:
       - smtp-mail:/var/mail
       - smtp-logs:/var/log/smtp
@@ -25,31 +23,17 @@ services:
       - SMTP_ENABLE_DNSBL=true
       - SMTP_ENABLE_GREYLIST=true
       - SMTP_DB_PATH=/var/mail/users.db
+      - SMTP_MONITORING_HOST=0.0.0.0
+      - SMTP_MONITORING_PORT=8025
     restart: unless-stopped
     networks:
       - smtp-network
     healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "2525"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8025/healthz"]
       interval: 30s
       timeout: 3s
       retries: 3
       start_period: 5s
-
-  # Health check / metrics server (optional separate service)
-  health-server:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: smtp-health
-    ports:
-      - "9090:9090"  # Health check API
-    environment:
-      - HEALTH_PORT=9090
-    restart: unless-stopped
-    networks:
-      - smtp-network
-    depends_on:
-      - mail
 
   # Prometheus for metrics collection (optional)
   prometheus:

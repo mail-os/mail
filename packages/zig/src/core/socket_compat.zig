@@ -139,8 +139,8 @@ pub const Server = struct {
         if (options.reuse_address) {
             const one: c_int = 1;
             try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
-            // Also set SO_REUSEPORT to allow binding even when port is in TIME_WAIT
-            posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&one)) catch {};
+            if (options.reuse_port)
+                posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, std.mem.asBytes(&one)) catch {};
         }
 
         if (address.family == .ipv4) {
@@ -278,6 +278,7 @@ pub const Server = struct {
 
 pub const ListenOptions = struct {
     reuse_address: bool = false,
+    reuse_port: bool = true,
     kernel_backlog: u31 = 128,
 };
 
