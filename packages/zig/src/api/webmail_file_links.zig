@@ -108,13 +108,18 @@ pub fn read(a: std.mem.Allocator, db: *database.Database, token: []const u8, now
 }
 
 pub fn revoke(db: *database.Database, user: []const u8, id: []const u8) !bool {
-    const stmt = try db.prepare(
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const stmt = try tx.prepare(
         \\DELETE FROM mail_file_links WHERE id=?2 AND user_id=(SELECT id FROM users WHERE username=?1 AND enabled=1) RETURNING id
     );
     defer stmt.finalize();
     try stmt.bind(1, user);
     try stmt.bind(2, id);
-    return stmt.step();
+    if (!try stmt.step()) return false;
+    _ = try stmt.step();
+    try tx.commit();
+    return true;
 }
 
 pub fn sweep(db: *database.Database, now: i64) !void {
