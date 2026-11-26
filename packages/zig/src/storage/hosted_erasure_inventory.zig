@@ -1,4 +1,5 @@
 //! Mailbox-scoped inventory for hosted erasure review. Counts only, no cleanup.
+const builtin = @import("builtin");
 const std = @import("std");
 const Database = @import("database.zig").Database;
 const preflight = @import("hosted_erasure_preflight.zig");
@@ -177,10 +178,21 @@ pub const contact_owner = "contact_id IN (SELECT id FROM dav_contacts WHERE " ++
 pub fn davStoreStamp(a: Allocator, io: std.Io, path: []const u8) ![]const u8 {
     const file = try Dir.cwd().openFile(io, path, .{ .follow_symlinks = false, .allow_directory = false });
     defer file.close(io);
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var stat: linux.Statx = std.mem.zeroes(linux.Statx);
+        const result = linux.statx(file.handle, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .INO = true, .NLINK = true, .BTIME = true }, &stat);
+        if (linux.errno(result) != .SUCCESS or !stat.mask.TYPE or !stat.mask.INO or
+            !stat.mask.NLINK or !std.c.S.ISREG(stat.mode) or stat.nlink != 1)
+            return error.ErasureDavFileUnverified;
+        const born = if (stat.mask.BTIME) stat.btime else std.mem.zeroes(@TypeOf(stat.btime));
+        return std.fmt.allocPrint(a, "{d}:{d}:{d}:{d}:{d}", .{ stat.dev_major, stat.dev_minor, stat.ino, born.sec, born.nsec });
+    }
     var stat: std.c.Stat = undefined;
     if (std.c.fstat(file.handle, &stat) != 0 or !std.c.S.ISREG(stat.mode) or stat.nlink != 1)
         return error.ErasureDavFileUnverified;
-    return std.fmt.allocPrint(a, "{d}:{d}", .{ stat.dev, stat.ino });
+    const born = if (@hasDecl(std.c.Stat, "birthtime")) stat.birthtime() else std.mem.zeroes(@TypeOf(stat.mtime()));
+    return std.fmt.allocPrint(a, "{d}:{d}:{d}:{d}", .{ stat.dev, stat.ino, born.sec, born.nsec });
 }
 
 fn observeDav(a: Allocator, io: std.Io, explicit_path: ?[]const u8, names: Names, short: []const u8) !Dav {
