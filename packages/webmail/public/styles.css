@@ -1026,7 +1026,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-refresh:hover { background: var(--hover); color: var(--accent); }
 .wm-action { font-weight: 550; }
 .wm-action .mail-icon { width: 15px; height: 15px; color: var(--muted); }
-.wm-action--danger .mail-icon, .calendar-primary .mail-icon { color: inherit; }
+:is(.wm-action--danger, .calendar-primary, .wm-snapshot-primary) .mail-icon { color: inherit; }
 .wm-action--quiet { border-color: transparent; background: transparent; color: var(--muted); }
 .wm-action--quiet:hover, .wm-action--quiet[aria-expanded=true] { background: var(--hover); color: var(--text); }
 
