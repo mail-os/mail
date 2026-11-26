@@ -20,7 +20,7 @@ chown root:mail-server /var/lib/mail-health/public/read-token
 chmod 0640 /var/lib/mail-health/public/read-token
 cat > /usr/local/sbin/mail-protocol-health-check <<'CHECK'
 #!/bin/sh
-# --deploy-gate: judge a deploy by its listeners and protocol probes. Status
+# --deploy-gate: judge a deploy by its listeners, storage and scanner. Status
 # and alerts are recorded exactly as on a timer run.
 set -eu
 gate=0

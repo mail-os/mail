@@ -3,7 +3,7 @@ umask 077
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y certbot curl dnsutils nodejs openssl python3 unzip
+apt-get install -y certbot clamav-daemon clamav-freshclam curl dnsutils nodejs openssl python3 unzip
 
 workdir=$(mktemp -d)
 trap 'rm -rf "$workdir"' EXIT
@@ -34,6 +34,46 @@ install -d -m 0755 -o root -g root /opt/mail
 install -d -m 0750 -o mail-server -g mail-server /var/lib/mail /var/lib/mail/mail
 ln -sTfn /var/lib/mail/mail /opt/mail/mail
 install -m 0755 -o root -g root "$workdir/mail-server" /opt/mail/mail-server
+
+# Keep the staging scanner private and limit memory during signature reloads.
+systemctl stop clamav-daemon.service clamav-daemon.socket
+sed -i -E '/^(LocalSocketMode|ConcurrentDatabaseReload|SelfCheck) /d' /etc/clamav/clamd.conf
+printf '%s\n' 'LocalSocketMode 660' 'ConcurrentDatabaseReload false' 'SelfCheck 600' >> /etc/clamav/clamd.conf
+# The scanner watches its signature files without enabling the socket's RELOAD command.
+sed -i -E '/^NotifyClamd /d' /etc/clamav/freshclam.conf
+systemctl daemon-reload
+systemctl enable clamav-freshclam.service
+systemctl restart clamav-freshclam.service
+for attempt in $(seq 1 60); do
+  if { [ -s /var/lib/clamav/main.cvd ] || [ -s /var/lib/clamav/main.cld ]; } &&
+     { [ -s /var/lib/clamav/daily.cvd ] || [ -s /var/lib/clamav/daily.cld ]; }; then
+    break
+  fi
+  if [ "$attempt" -eq 60 ]; then
+    echo 'ClamAV signature databases did not become ready' >&2
+    exit 1
+  fi
+  sleep 3
+done
+systemctl enable --now clamav-daemon.service
+runuser -u mail-server -g mail-server -G clamav -- python3 - <<'CLAMD'
+import socket
+import time
+
+for _ in range(90):
+    try:
+        with socket.socket(socket.AF_UNIX) as client:
+            client.settimeout(2)
+            client.connect("/run/clamav/clamd.ctl")
+            client.sendall(b"zPING\0")
+            if client.recv(128).rstrip(b"\0\n") == b"PONG":
+                break
+    except OSError:
+        pass
+    time.sleep(1)
+else:
+    raise SystemExit("The Mail service account cannot reach ClamAV")
+CLAMD
 
 # Wait for CloudFormation's A record and use a certificate trusted by test clients.
 for attempt in $(seq 1 18); do
@@ -98,6 +138,8 @@ SMTP_WEBMAIL_SECURE_COOKIES=true
 SMTP_PROVISIONING_PORT=8099
 SMTP_PROVISIONING_DOMAIN=$mail_domain
 SMTP_PROVISIONING_TOKEN=$provisioning_token
+SMTP_CLAMAV_TRANSPORT=unix:/run/clamav/clamd.ctl
+SMTP_CLAMAV_FAIL_MODE=closed
 IMAP_ENABLED=true
 CALDAV_ENABLED=true
 CALDAV_DB_PATH=/var/lib/mail/caldav.db
@@ -111,12 +153,13 @@ fi
 cat > /etc/systemd/system/mail.service <<'UNIT'
 [Unit]
 Description=Mail staging server
-After=network-online.target
-Wants=network-online.target
+After=network-online.target clamav-daemon.service
+Wants=network-online.target clamav-daemon.service
 
 [Service]
 User=mail-server
 Group=mail-server
+SupplementaryGroups=clamav
 WorkingDirectory=/var/lib/mail
 EnvironmentFile=/etc/mail/mail.env
 ExecStart=/opt/mail/mail-server serve
