@@ -50,14 +50,42 @@ async function signedOut() {
   await page.getByRole('alert').waitFor({ state: 'hidden' })
 }
 
-async function authenticate() {
+async function authenticate(phase) {
   await signIn.focus()
   await signIn.press('Enter')
+  await page.waitForURL(url + '/login#status')
   await heading('Sign in to Mail').waitFor()
   await page.getByLabel('Email or username').fill(owner)
   await page.getByLabel('Password', { exact: true }).fill(password)
-  await page.getByRole('button', { name: 'Sign in', exact: true }).click()
-  await page.waitForURL(url + '/status')
+
+  const isLogin = request => request.method() === 'POST' && request.url() === url + '/webmail/auth/login'
+  let requestState = 'no login POST observed'
+  const started = (request) => {
+    if (isLogin(request)) requestState = 'login POST sent'
+  }
+  const failed = (request) => {
+    if (isLogin(request)) requestState = 'login POST failed at the transport'
+  }
+
+  page.on('request', started)
+  page.on('requestfailed', failed)
+  try {
+    const [response] = await Promise.all([
+      page.waitForResponse(response => isLogin(response.request())),
+      page.getByRole('button', { name: 'Sign in', exact: true }).click(),
+    ])
+    requestState = `login POST returned HTTP ${response.status()}`
+    assert(response.ok(), requestState)
+    await page.waitForURL(url + '/status', { waitUntil: 'commit' })
+  }
+  catch (cause) {
+    const { pathname } = new URL(page.url())
+    throw new Error(`${engine} ${phase} sign-in stopped at ${pathname}: ${requestState}`, { cause })
+  }
+  finally {
+    page.off('request', started)
+    page.off('requestfailed', failed)
+  }
 }
 
 async function refreshAs(reply, summary) {
@@ -89,7 +117,7 @@ try {
     else await route.fulfill({ response, ...fixtureReply })
   })
 
-  await authenticate()
+  await authenticate('initial')
   await heading('Mail checks are passing').waitFor()
   await page.getByText(check.name, { exact: true }).waitFor()
   await page.getByText(incident, { exact: true }).waitFor()
@@ -131,7 +159,7 @@ try {
   await signedOut()
   await page.getByText(incident, { exact: true }).waitFor({ state: 'hidden' })
   await snapshot('delivery-session-expired')
-  await authenticate()
+  await authenticate('expired session')
   await heading('Mail checks are passing').waitFor()
   assert.deepEqual(errors, [])
   console.log(`${engine} passed Mail delivery sign-in, actual session expiry, and signed-in report states.`)
