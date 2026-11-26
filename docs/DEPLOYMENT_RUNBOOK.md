@@ -257,6 +257,45 @@ For renewals, post `mailbox`, `actor`, `operation_id`, the next `revision`, and
 account's enabled flag, storage quota, and sending allowance. An older
 provisioning client that omits the window on an update preserves the deadlines.
 
+### Prepare a hosted mailbox erasure review
+
+Use the daemon's working directory and database path. Copy the expected
+assignment actor from the independently checked provisioning or billing
+record. Use the canonical mailbox address and a case identifier containing
+letters, numbers, periods, hyphens, or underscores. Keep the report private.
+
+```bash
+umask 077
+sudo -u mail-server env SMTP_DB_PATH=/var/lib/mail/smtp.db \
+  /opt/mail/mail-server user:local hosted-erasure-preflight \
+  alice@customer.example.com mailbox-assignment-actor exit-case-19 > native-erasure-review.json
+```
+
+The command matches the mailbox and assignment actor. The report includes the
+native user ID, initial provisioning operation when uniquely recorded, and
+current provisioning revision. Compare the ID and initial operation with any
+restored copy before using it. Investigate missing or ambiguous initial
+operations with the provisioning ledger. The audit records the effective
+operator UID, case, and observed identity.
+
+The observation includes access and export deadlines, the retirement receipt
+ID, sending hold, and counts for pending local delivery, interactive remote
+delivery, the delivery queue, and webmail outbox. New delivery records carry
+the authenticated hosted sender ID even when their envelope uses an external
+sender address. For older records, an envelope or queue address match is only
+a lead. Check any unresolved deliveries involving older external sender
+identities against the available provider and submission records. A `null`
+queue or outbox indicates that its schema is unavailable.
+
+Use the report with the approved case, independently verified export recipient
+and expiry, applicable retention and preservation holds, Stacks billing
+assignment, Maildir and DAV inventory, and the backup and restore plan. A
+sending hold controls sending. Review retention and preservation holds with
+their owning system. Repeat the preflight after relevant state changes and
+reconcile all evidence before an erasure operation. The supported actions are
+portable export and managed retirement while [#188](https://github.com/mail-os/mail/issues/188)
+tracks permanent erasure.
+
 ## Local mailbox directory upgrade
 
 Back up the Maildir and SQLite database together before upgrading a server with older ActiveSync clients. On startup, the server checks for full-address local accounts that still have mail under a short directory name such as `mail/alice`. It moves eligible messages to `mail/alice@example.com` before opening the protocol listeners. It also moves messages in a canonical custom folder's nested slots into the folder path exposed by IMAP and webmail. ActiveSync, IMAP, webmail, and EWS then read from the canonical mailbox. The upgrade retains existing message flags and client identifiers when it can reconcile both directories.

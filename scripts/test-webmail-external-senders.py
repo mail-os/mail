@@ -257,6 +257,12 @@ def verify(fixture, server, root, wrong_host, wrong_issuer):
         assert outcome["result"]["failed"] == ["unavailable@destination.example"]
         count = len(server.transactions)
         assert call(session, "compose", uncertain)["state"] == "unknown" and len(server.transactions) == count
+        review = subprocess.run([str(fixture.binary), "user:local", "hosted-erasure-preflight",
+                                 actor, fixture.specs[actor]["actor"], "provider-exit-case"],
+                                cwd=fixture.directory, env=fixture.env, text=True, capture_output=True, timeout=12, check=True)
+        evidence = json.loads(review.stdout)["observation"]
+        assert evidence["delivery"]["remote_unconfirmed_targets"] == 2, evidence
+        assert evidence["webmail_outbox"]["needs_review"] >= 1, evidence
 
         server.mode = "normal"
         charged = fixture.count(actor)

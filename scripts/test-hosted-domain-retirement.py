@@ -117,6 +117,10 @@ def verify(test):
     assert {row["retirement_id"] for row in json.loads(command(test, "domain", "inventory", DOMAIN))["mailboxes"]} == {operation}
 
     spec = test.specs[owner]
+    preflight = json.loads(command(test, "user:local", "hosted-erasure-preflight", owner, spec["actor"], "retired-exit-case"))
+    assert preflight["observation"]["access"]["state"] == "disabled"
+    assert preflight["observation"]["access"]["retirement_id"] == operation
+    assert preflight["observation"]["identity"]["initial_provisioning_operation"] == spec["operation_id"]
     endpoint = test.private + "/provisioning/v1/mailbox"
     status, _, raw = test.http(endpoint + "?" + urlencode({"mailbox": owner, "actor": spec["actor"]}), headers=test.auth)
     assert status == 200 and json.loads(raw)["retired"] is True

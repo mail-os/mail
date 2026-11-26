@@ -780,6 +780,7 @@ pub const Database = struct {
             \\    remote_addr TEXT NOT NULL,
             \\    mime BLOB NOT NULL,
             \\    counts_as_incoming INTEGER NOT NULL DEFAULT 0,
+            \\    hosted_sender_id INTEGER,
             \\    complete INTEGER NOT NULL DEFAULT 0
             \\);
             \\CREATE TABLE IF NOT EXISTS accepted_mail_targets (
@@ -1060,6 +1061,9 @@ pub const Database = struct {
         self.exec("ALTER TABLE provisioned_mailboxes ADD COLUMN service_until INTEGER") catch {};
         self.exec("ALTER TABLE provisioned_mailboxes ADD COLUMN read_until INTEGER") catch {};
         self.exec("ALTER TABLE accepted_mail ADD COLUMN counts_as_incoming INTEGER NOT NULL DEFAULT 0") catch {};
+        // Old delivery records did not identify the authenticated mailbox.
+        // Leave their sender attribution absent instead of inferring from From.
+        self.exec("ALTER TABLE accepted_mail ADD COLUMN hosted_sender_id INTEGER") catch {};
         self.exec("ALTER TABLE users ADD COLUMN recovery_updated_at INTEGER;") catch {};
 
         // Single-use password reset tokens (see src/api/webmail_recovery.zig).
@@ -1269,7 +1273,7 @@ pub const Database = struct {
         }
     };
 
-    fn mailboxAccessAt(enabled: bool, window: ?AccessWindow, now: i64) MailboxAccess {
+    pub fn mailboxAccessAt(enabled: bool, window: ?AccessWindow, now: i64) MailboxAccess {
         if (!enabled) return .disabled;
         const limits = window orelse return .full;
         if (now < limits.service_until) return .full;
@@ -1277,7 +1281,7 @@ pub const Database = struct {
         return .expired;
     }
 
-    fn scanAccessWindow(stmt: Statement, start: usize) ?AccessWindow {
+    pub fn scanAccessWindow(stmt: Statement, start: usize) ?AccessWindow {
         if (stmt.columnIsNull(start)) return null;
         return .{ .service_until = stmt.columnInt64(start), .read_until = stmt.columnInt64(start + 1) };
     }
@@ -2456,7 +2460,7 @@ pub const Database = struct {
             if (try self.hostedLimitsLocked(sender)) |limits| hosted_sender = limits.user_id;
         }
         {
-            const insert = try self.prepareLocked("INSERT INTO accepted_mail(id,accepted_at,mime,envelope_from,author,verified_author,remote_addr,accepted_ms,counts_as_incoming) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)");
+            const insert = try self.prepareLocked("INSERT INTO accepted_mail(id,accepted_at,mime,envelope_from,author,verified_author,remote_addr,accepted_ms,counts_as_incoming,hosted_sender_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)");
             defer insert.finalize();
             try insert.bind(1, envelope.id);
             try insert.bind(2, envelope.accepted_at);
@@ -2467,6 +2471,7 @@ pub const Database = struct {
             try insert.bind(7, envelope.notification_origin);
             try insert.bind(8, envelope.accepted_ms);
             try insert.bind(9, @intFromBool(envelope.counts_as_incoming));
+            try insert.bind(10, hosted_sender);
             _ = try insert.step();
         }
         if (envelope.ews_draft_send) |draft| {

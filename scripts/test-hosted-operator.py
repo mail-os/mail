@@ -156,9 +156,122 @@ def verify(test, db):
         db.execute("DROP TRIGGER deny_status_audit")
 
 
+def verify_erasure_preflight(test, db):
+    mailbox = test.provision("erasure-review")
+    peer = test.provision("erasure-unrelated")
+    spec = dict(test.specs[mailbox])
+    actor = spec["actor"]
+    case = "exit-case-19"
+
+    def preflight(name=mailbox, owner=actor, *, env=None):
+        return cli(test, "hosted-erasure-preflight", name, owner, case, env=env)
+
+    initial = preflight()
+    assert initial.returncode == 0, initial.stderr
+    active = json.loads(initial.stdout)
+    identity = active["observation"]["identity"]
+    user_id = db.execute("SELECT id FROM users WHERE username=?", (mailbox,)).fetchone()[0]
+    assert active["version"] == 1 and active["mailbox"] == mailbox and active["case_reference"] == case
+    assert identity == {"native_user_id": user_id, "initial_provisioning_operation": spec["operation_id"], "provisioning_revision": 1}, identity
+    assert active["observation"]["access"]["state"] == "full"
+    for result in (preflight(peer), preflight(owner=test.specs[peer]["actor"]), preflight("unknown@example.test")):
+        assert result.returncode and not result.stdout, result
+    invalid = cli(test, "hosted-erasure-preflight", mailbox, actor, "bad\nreference")
+    assert invalid.returncode and not invalid.stdout, invalid
+
+    expect_smtp(test.deliver(peer, identity=mailbox, subject="private-erasure-subject"), 250)
+    assert db.execute("SELECT hosted_sender_id FROM accepted_mail WHERE envelope_from=?", (mailbox,)).fetchall() == [(user_id,)]
+    expect_smtp(test.deliver(mailbox, identity=peer, subject="retained-erasure-message"), 250)
+    stored = test.bytes(mailbox)
+    assert stored > 0
+
+    older_path = test.directory / "before-erasure-review.db"
+    with closing(sqlite3.connect(older_path)) as older:
+        db.backup(older)
+    older_env = dict(test.env, SMTP_DB_PATH=str(older_path))
+
+    session = test.login(mailbox)
+    scheduled = {"sendId": secrets.token_hex(16), "subject": "Private scheduled message", "to": [peer],
+                 "text": "Private scheduled body", "delaySeconds": 30}
+    assert test.api(session, "compose", scheduled)[0] == 200
+    hold = cli(test, "hosted-sending-hold", mailbox, "place", case)
+    assert hold.returncode == 0, hold.stderr
+    test.provision("erasure-review", enabled=False)
+    now = int(time.time())
+    with db:
+        peer_id = db.execute("SELECT id FROM users WHERE username=?", (peer,)).fetchone()[0]
+        db.executemany("""INSERT INTO accepted_mail(id,accepted_at,accepted_ms,envelope_from,author,verified_author,remote_addr,mime,hosted_sender_id)
+            VALUES(?,?,?,'private-provider@example.test','private-provider@example.test',1,'127.0.0.1','private-message',?)""",
+            [("erasure-own-remote", now, now * 1000, user_id), ("erasure-peer-remote", now, now * 1000, peer_id)])
+        db.executemany("""INSERT INTO accepted_mail_targets(delivery_id,ordinal,recipient,mailbox,mailbox_id,folder,outcome,queued_bytes,retry_at,is_primary)
+            VALUES(?,0,'private-destination@example.test','',0,'','remote_unknown',0,?,1)""",
+            [("erasure-own-remote", now), ("erasure-peer-remote", now)])
+        db.executemany("""INSERT INTO message_queue(id,from_addr,to_addr,message_data,status,next_retry,created_at,updated_at,hosted_user_id)
+            VALUES(?,?,'private-receiver@example.test','private-message','awaiting_local',?,?,?,?)""",
+            [("erasure-own-queue", "private-provider@example.test", now + 3600, now, now, user_id),
+             ("erasure-peer-queue", mailbox, now + 3600, now, now, peer_id),
+             ("erasure-legacy-queue", mailbox, now + 3600, now, now, 0)])
+    result = preflight()
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    observed = report["observation"]
+    assert observed["identity"] == {**identity, "provisioning_revision": 2}
+    assert observed["access"]["state"] == "disabled" and observed["access"]["sending_held_since"] is not None
+    assert observed["delivery"]["remote_unconfirmed_targets"] == 1
+    assert observed["outbound_queue"] == {"active_owned": 1, "unattributed_address_matches": 1}
+    assert observed["webmail_outbox"]["in_progress"] == 1
+    assert test.bytes(mailbox) == stored
+    for private in (test.password, actor, "private-provider", "private-destination", "private-receiver", "Private scheduled"):
+        assert private not in result.stdout
+    action, who, target, details = db.execute("SELECT action,actor,target,details FROM audit_log WHERE id=?", (report["audit_id"],)).fetchone()
+    assert (action, who, target) == ("hosted.erasure.preflight", f"local-operator:{os.geteuid()}", mailbox)
+    assert json.loads(details) == {"case_reference": case, "identity": observed["identity"]}
+
+    restored = preflight(env=older_env)
+    assert restored.returncode == 0, restored.stderr
+    assert json.loads(restored.stdout)["observation"]["identity"] == identity
+
+    with db:
+        db.execute("""CREATE TRIGGER deny_erasure_preflight BEFORE INSERT ON audit_log
+                    WHEN NEW.action='hosted.erasure.preflight' BEGIN SELECT RAISE(ABORT,'fixture audit failure'); END""")
+    unaudited = preflight()
+    assert unaudited.returncode and not unaudited.stdout, unaudited
+    with db:
+        db.execute("DROP TRIGGER deny_erasure_preflight")
+    assert test.bytes(mailbox) == stored
+
+
+def verify_preflight_upgrade(previous, candidate):
+    with TemporaryDirectory(prefix="mail-erasure-preflight-upgrade-") as directory:
+        root = Path(directory)
+        test = Fixture(previous, root, staging=True)
+        with test.daemon(), closing(sqlite3.connect(root / "smtp.db")) as db:
+            mailbox = test.provision("older-erasure-mailbox")
+            spec = test.specs[mailbox]
+            owner = db.execute("SELECT id FROM users WHERE username=?", (mailbox,)).fetchone()[0]
+            assert not db.execute("SELECT 1 FROM pragma_table_info('accepted_mail') WHERE name='hosted_sender_id'").fetchone()
+            now = int(time.time())
+            with db:
+                db.execute("""INSERT INTO accepted_mail(id,accepted_at,accepted_ms,envelope_from,author,verified_author,remote_addr,mime)
+                    VALUES('older-remote-receipt',?,?,?,?,1,'127.0.0.1','legacy fixture')""", (now, now * 1000, mailbox, mailbox))
+                db.execute("""INSERT INTO accepted_mail_targets(delivery_id,ordinal,recipient,mailbox,mailbox_id,folder,outcome,queued_bytes,retry_at,is_primary)
+                    VALUES('older-remote-receipt',0,'old-destination@example.test','',0,'','remote_unknown',0,?,1)""", (now,))
+        test.binary = candidate
+        result = cli(test, "hosted-erasure-preflight", mailbox, spec["actor"], "older-exit-case")
+        assert result.returncode == 0, result.stderr
+        evidence = json.loads(result.stdout)["observation"]
+        assert evidence["identity"] == {"native_user_id": owner, "initial_provisioning_operation": spec["operation_id"], "provisioning_revision": 1}
+        assert evidence["delivery"]["remote_unconfirmed_targets"] == 0
+        assert evidence["delivery"]["legacy_remote_envelope_matches"] == 1
+        with closing(sqlite3.connect(root / "smtp.db")) as db:
+            assert db.execute("SELECT hosted_sender_id FROM accepted_mail WHERE id='older-remote-receipt'").fetchone() == (None,)
+    print("Verified preflight against the previous binary's schema and distinguished legacy envelope matches from attributed work.")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
+    parser.add_argument("--upgrade-from", type=Path, help="Mail binary from before hosted sender attribution")
     args = parser.parse_args()
     with TemporaryDirectory(prefix="mail-hosted-operator-") as directory:
         root = Path(directory)
@@ -168,6 +281,7 @@ def main():
         assert missing.returncode and not missing_path.exists(), missing
         with test.daemon(), closing(sqlite3.connect(root / "smtp.db")) as db:
             verify(test, db)
+            verify_erasure_preflight(test, db)
             mailbox, peer, held_since = verify_sending_hold(test, db)
         with closing(sqlite3.connect(root / "smtp.db")) as db, db:
             now = int(time.time())
@@ -184,6 +298,9 @@ def main():
             verify_sending_release(test, db, mailbox, peer, held_since)
             verify_hold_access_windows(test, peer)
     print("Verified audited hosted quota, provisioning drift, UTC usage, queue counts and redaction.")
+    print("Verified audited erasure preflight, mailbox attribution, redaction and older snapshot identity.")
+    if args.upgrade_from:
+        verify_preflight_upgrade(args.upgrade_from.resolve(strict=True), args.binary.resolve(strict=True))
     print("Verified audited sending holds across SMTP, webmail, EWS, ActiveSync, provisioning and restart.")
 
 
