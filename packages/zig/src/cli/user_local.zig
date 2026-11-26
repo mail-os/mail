@@ -12,6 +12,8 @@ const erasure_preflight = @import("../storage/hosted_erasure_preflight.zig");
 const erasure_export = @import("../storage/hosted_erasure_export.zig");
 const erasure_inventory = @import("../storage/hosted_erasure_inventory.zig");
 const erasure_review = @import("../storage/hosted_erasure_review.zig");
+const erasure_maildir = @import("../storage/hosted_erasure_maildir.zig");
+const erasure_search = @import("../storage/hosted_erasure_search.zig");
 const io_compat = @import("../core/io_compat.zig");
 const time = @import("../core/time_compat.zig");
 
@@ -285,6 +287,30 @@ fn hostedErasureHandoffAction(ctx: *cli.BaseCommand.ParseContext) !void {
 }
 
 fn hostedErasureReviewAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    try hostedErasureApproval(ctx, .review);
+}
+
+fn hostedErasureBeginAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const audit = ctx.getArgument(1) orelse return error.MissingArgument;
+    const audit_id = std.fmt.parseInt(i64, audit, 10) catch return error.InvalidErasureReviewAuditId;
+    try hostedErasureApproval(ctx, .{ .begin = audit_id });
+}
+
+fn hostedErasureMaildirAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const audit = ctx.getArgument(1) orelse return error.MissingArgument;
+    const audit_id = std.fmt.parseInt(i64, audit, 10) catch return error.InvalidErasureStartAuditId;
+    try hostedErasureApproval(ctx, .{ .maildir = audit_id });
+}
+
+fn hostedErasureSearchAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const audit = ctx.getArgument(1) orelse return error.MissingArgument;
+    const audit_id = std.fmt.parseInt(i64, audit, 10) catch return error.InvalidErasureStartAuditId;
+    try hostedErasureApproval(ctx, .{ .search = audit_id });
+}
+
+const ErasureOperation = union(enum) { review, begin: i64, maildir: i64, search: i64 };
+
+fn hostedErasureApproval(ctx: *cli.BaseCommand.ParseContext, operation: ErasureOperation) !void {
     const review_path = ctx.getArgument(0) orelse return error.MissingArgument;
     const io = io_compat.getIo();
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -297,11 +323,17 @@ fn hostedErasureReviewAction(ctx: *cli.BaseCommand.ParseContext) !void {
     defer db.deinit();
     var actor_buffer: [64]u8 = undefined;
     const operator = try std.fmt.bufPrint(&actor_buffer, "local-operator:{d}", .{std.c.geteuid()});
-    const receipt = try erasure_review.record(a, io, &db, review, operator, env.get("MAIL_ROOT") orelse "mail", env.get("CALDAV_DB_PATH"));
-
+    const mail_root = env.get("MAIL_ROOT") orelse "mail";
+    const dav_path = env.get("CALDAV_DB_PATH");
     var buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writerStreaming(io, &buffer);
-    try std.json.Stringify.value(receipt, .{ .whitespace = .indent_2 }, &output.interface);
+    const format: std.json.Stringify.Options = .{ .whitespace = .indent_2 };
+    switch (operation) {
+        .review => try std.json.Stringify.value(try erasure_review.record(a, io, &db, review, operator, mail_root, dav_path), format, &output.interface),
+        .begin => |id| try std.json.Stringify.value(try erasure_review.begin(a, io, &db, review, id, operator, mail_root, dav_path), format, &output.interface),
+        .maildir => |id| try std.json.Stringify.value(try erasure_maildir.erase(a, io, &db, review, id, operator, mail_root, dav_path), format, &output.interface),
+        .search => |id| try std.json.Stringify.value(try erasure_search.erase(a, io, &db, review, id, operator, mail_root), format, &output.interface),
+    }
     try output.interface.writeByte('\n');
     try output.interface.flush();
 }
@@ -495,6 +527,24 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try erasure_review_cmd.addArgument(cli.Argument.init("review", "Private erasure review JSON file", .string).withRequired(true));
     _ = erasure_review_cmd.setAction(hostedErasureReviewAction);
     _ = try cmd.addCommand(erasure_review_cmd);
+
+    const erasure_begin_cmd = try cli.BaseCommand.init(allocator, "hosted-erasure-begin", "Reserve a reviewed mailbox for erasure with its data retained");
+    _ = try erasure_begin_cmd.addArgument(cli.Argument.init("review", "Private erasure review JSON file", .string).withRequired(true));
+    _ = try erasure_begin_cmd.addArgument(cli.Argument.init("review-audit-id", "Audit ID of the accepted erasure review", .string).withRequired(true));
+    _ = erasure_begin_cmd.setAction(hostedErasureBeginAction);
+    _ = try cmd.addCommand(erasure_begin_cmd);
+
+    const erasure_maildir_cmd = try cli.BaseCommand.init(allocator, "hosted-erasure-maildir", "Erase the reserved mailbox's canonical Maildir with its daemon stopped");
+    _ = try erasure_maildir_cmd.addArgument(cli.Argument.init("review", "Private erasure review JSON file", .string).withRequired(true));
+    _ = try erasure_maildir_cmd.addArgument(cli.Argument.init("start-audit-id", "Audit ID of the reserved erasure", .string).withRequired(true));
+    _ = erasure_maildir_cmd.setAction(hostedErasureMaildirAction);
+    _ = try cmd.addCommand(erasure_maildir_cmd);
+
+    const erasure_search_cmd = try cli.BaseCommand.init(allocator, "hosted-erasure-search", "Erase the reserved mailbox's local search data after Maildir removal");
+    _ = try erasure_search_cmd.addArgument(cli.Argument.init("review", "Private erasure review JSON file", .string).withRequired(true));
+    _ = try erasure_search_cmd.addArgument(cli.Argument.init("start-audit-id", "Audit ID of the reserved erasure", .string).withRequired(true));
+    _ = erasure_search_cmd.setAction(hostedErasureSearchAction);
+    _ = try cmd.addCommand(erasure_search_cmd);
 
     const export_cmd = try cli.BaseCommand.init(allocator, "export", "Export a mailbox to a portable TAR archive");
     _ = try export_cmd.addArgument(cli.Argument.init("username", "Canonical mailbox username", .string));

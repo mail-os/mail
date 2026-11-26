@@ -7,7 +7,7 @@ extern "c" fn fsync(fd: std.c.fd_t) c_int;
 extern "c" fn link(old: [*:0]const u8, new: [*:0]const u8) c_int;
 extern "c" fn mkdtemp(template: [*:0]u8) ?[*:0]u8;
 
-fn syncFd(fd: std.c.fd_t) !void {
+pub fn syncFd(fd: std.c.fd_t) !void {
     while (fsync(fd) != 0) {
         const err: std.c.E = @fromBackingInt(@intCast(std.c._errno().*));
         if (err != .INTR) return error.MaildirSyncFailed;

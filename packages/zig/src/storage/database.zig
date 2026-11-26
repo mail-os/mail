@@ -441,6 +441,34 @@ pub const Database = struct {
             \\    (user_id=OLD.id AND NEW.enabled=1) OR
             \\    (user_id<>OLD.id AND (mailbox=NEW.username OR mailbox=NEW.email)))
             \\BEGIN SELECT RAISE(ABORT,'retired mailbox address'); END;
+            \\CREATE TABLE IF NOT EXISTS hosted_erasure_operations (
+            \\    request_id TEXT PRIMARY KEY, mailbox TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            \\    native_user_id INTEGER NOT NULL UNIQUE, review_audit_id INTEGER NOT NULL UNIQUE,
+            \\    start_audit_id INTEGER NOT NULL UNIQUE
+            \\);
+            \\CREATE TABLE IF NOT EXISTS hosted_erasure_maildir_steps (
+            \\    start_audit_id INTEGER PRIMARY KEY,
+            \\    nonce TEXT NOT NULL, root_stamp TEXT NOT NULL, mailbox_stamp TEXT,
+            \\    phase TEXT NOT NULL CHECK(phase IN ('planned','removing','complete')),
+            \\    completion_audit_id INTEGER
+            \\);
+            \\CREATE TABLE IF NOT EXISTS hosted_erasure_search_steps (
+            \\    start_audit_id INTEGER PRIMARY KEY,
+            \\    completion_audit_id INTEGER NOT NULL UNIQUE,
+            \\    search_documents INTEGER NOT NULL CHECK(search_documents>=0),
+            \\    eas_search_keys INTEGER NOT NULL CHECK(eas_search_keys IN (0,1))
+            \\);
+            \\CREATE TRIGGER IF NOT EXISTS hosted_erasure_account_insert BEFORE INSERT ON users
+            \\WHEN EXISTS(SELECT 1 FROM hosted_erasure_operations WHERE mailbox=NEW.username OR mailbox=NEW.email)
+            \\BEGIN SELECT RAISE(ABORT,'mailbox erasure started'); END;
+            \\CREATE TRIGGER IF NOT EXISTS hosted_erasure_account_update BEFORE UPDATE OF enabled,username,email ON users
+            \\WHEN EXISTS(SELECT 1 FROM hosted_erasure_operations WHERE
+            \\    (native_user_id=OLD.id AND (NEW.enabled<>0 OR NEW.username<>OLD.username OR NEW.email<>OLD.email)) OR
+            \\    (native_user_id<>OLD.id AND (mailbox=NEW.username OR mailbox=NEW.email)))
+            \\BEGIN SELECT RAISE(ABORT,'mailbox erasure started'); END;
+            \\CREATE TRIGGER IF NOT EXISTS hosted_erasure_provisioning_update BEFORE UPDATE ON provisioned_mailboxes
+            \\WHEN EXISTS(SELECT 1 FROM hosted_erasure_operations WHERE native_user_id=OLD.user_id OR mailbox=OLD.mailbox OR mailbox=NEW.mailbox)
+            \\BEGIN SELECT RAISE(ABORT,'mailbox erasure started'); END;
             \\CREATE TABLE IF NOT EXISTS eas_search_keys (
             \\    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
             \\    key BLOB NOT NULL CHECK(length(key)=32)
@@ -1425,6 +1453,15 @@ pub const Database = struct {
         _ = try stmt.step();
     }
 
+    fn hostedMailboxReservedLocked(self: *Database, mailbox: []const u8) !bool {
+        const row = try self.prepareLocked(
+            "SELECT 1 FROM hosted_retired_mailboxes WHERE mailbox=?1 UNION ALL SELECT 1 FROM hosted_erasure_operations WHERE mailbox=?1",
+        );
+        defer row.finalize();
+        try row.bind(1, mailbox);
+        return row.step();
+    }
+
     /// Commit account creation and its operation record together. Existing
     /// operator-managed accounts are never adopted by provisioning.
     pub fn applyProvisioning(self: *Database, change: ProvisioningChange) !ProvisioningState {
@@ -1435,10 +1472,7 @@ pub const Database = struct {
         defer self.mutex.unlock();
         try self.execLocked("BEGIN IMMEDIATE");
         errdefer self.execLocked("ROLLBACK") catch {};
-        const retired = try self.prepareLocked("SELECT 1 FROM hosted_retired_mailboxes WHERE mailbox = ?");
-        defer retired.finalize();
-        try retired.bind(1, change.mailbox);
-        if (try retired.step()) return error.MailboxUnavailable;
+        if (try self.hostedMailboxReservedLocked(change.mailbox)) return error.MailboxUnavailable;
         try self.verifyProvisioningOperationLocked(change.operation_id, change.mailbox, change.revision);
         const record = try self.prepareLocked(
             "SELECT actor, operation_id, revision, requested_quota, requested_enabled, initial_recovery, user_id, send_recipients_per_day, service_until, read_until FROM provisioned_mailboxes WHERE mailbox = ?",
@@ -1557,7 +1591,7 @@ pub const Database = struct {
         try self.verifyProvisioningOperationLocked(change.operation_id, change.mailbox, change.revision);
 
         const previous = try self.provisioningStateLocked(change.mailbox, change.actor);
-        if (previous.retired == true) return error.MailboxUnavailable;
+        if (previous.retired == true or try self.hostedMailboxReservedLocked(change.mailbox)) return error.MailboxUnavailable;
         const record = try tx.prepare("SELECT operation_id FROM provisioned_mailboxes WHERE mailbox = ? AND actor = ?");
         defer record.finalize();
         try record.bind(1, change.mailbox);

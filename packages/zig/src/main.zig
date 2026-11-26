@@ -137,29 +137,6 @@ fn loadDkimSigner(allocator: std.mem.Allocator, log: *logger.Logger, domain: []c
     log.info("Outbound DKIM signing enabled (d={s} s={s})", .{ domain, selector });
 }
 
-extern "c" fn flock(fd: std.c.fd_t, operation: c_int) c_int;
-
-/// Keep the Maildir's inode locked until every listener and worker has stopped.
-/// The lock follows directory aliases and the kernel drops it on process exit.
-fn lockMaildirWriter() !std.c.fd_t {
-    switch (std.posix.errno(std.c.mkdir("mail", 0o755))) {
-        .SUCCESS, .EXIST => {},
-        else => return error.MaildirWriterDirectoryUnavailable,
-    }
-    const fd = std.c.open("mail", .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true });
-    if (fd < 0) return error.MaildirWriterDirectoryUnavailable;
-    errdefer _ = std.c.close(fd);
-
-    while (true) {
-        switch (std.posix.errno(flock(fd, std.posix.LOCK.EX | std.posix.LOCK.NB))) {
-            .SUCCESS => return fd,
-            .INTR => continue,
-            .AGAIN => return error.MaildirWriterActive,
-            else => return error.MaildirWriterLockFailed,
-        }
-    }
-}
-
 pub fn main(init: std.process.Init) !void {
     const io_compat = @import("core/io_compat.zig");
     io_compat.initIo(init.io);
@@ -263,7 +240,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     defer global_reload_manager = null;
     log.info("Hot reload manager initialized (send SIGHUP to reload configuration)", .{});
 
-    const writer = lockMaildirWriter() catch |err| {
+    const writer = @import("core/maildir_writer.zig").openForDaemon() catch |err| {
         log.err("Could not acquire Maildir write authority: {s}", .{@errorName(err)});
         return err;
     };

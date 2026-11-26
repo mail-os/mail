@@ -65,6 +65,10 @@ pub fn directoryStamp(a: Allocator, path: []const u8) ![]const u8 {
     return (try statIdentity(a, std.c.AT.FDCWD, name, false, .directory)).stamp;
 }
 
+pub fn directoryHandleStamp(a: Allocator, fd: std.c.fd_t) ![]const u8 {
+    return (try statIdentity(a, fd, null, false, .directory)).stamp;
+}
+
 fn statIdentity(a: Allocator, fd: std.c.fd_t, path: ?[*:0]const u8, fingerprint: bool, kind: enum { file, directory }) !FileIdentity {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;

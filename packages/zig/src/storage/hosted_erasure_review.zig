@@ -28,7 +28,7 @@ pub const Review = struct {
     export_handoff_audit_id: ?i64 = null,
     evidence: Evidence,
 
-    fn validate(self: Review) !void {
+    pub fn validate(self: Review) !void {
         if (self.version != 1 or self.inventory_audit_id < 1) return error.InvalidErasureReview;
         if (!preflight.validCaseReference(self.request_id) or !preflight.validCaseReference(self.case_reference))
             return error.InvalidCaseReference;
@@ -89,7 +89,7 @@ fn validateInventory(a: Allocator, reviewed: inventory.Inventory, current: inven
     if (!std.mem.eql(u8, earlier, later)) return error.InventoryChanged;
 }
 
-fn verifyDeliveryDrained(observation: preflight.Observation) !void {
+pub fn verifyDeliveryDrained(observation: preflight.Observation) !void {
     const delivery = observation.delivery;
     if (delivery.pending_local_targets != 0 or delivery.remote_unattempted_targets != 0 or
         delivery.remote_unconfirmed_targets != 0 or delivery.legacy_remote_envelope_matches != 0 or
@@ -124,15 +124,20 @@ fn recordReceipt(tx: Database.Transaction, review: Review, operator: []const u8,
         return id;
     }
 
+    return writeAudit(tx, "hosted.erasure.review.accepted", review.mailbox, operator, now, details);
+}
+
+pub fn writeAudit(tx: Database.Transaction, action: []const u8, mailbox: []const u8, operator: []const u8, now: i64, details: []const u8) !i64 {
     const row = try tx.prepare(
         \\INSERT INTO audit_log(timestamp,action,actor,target,target_type,details,severity)
-        \\VALUES(?1,'hosted.erasure.review.accepted',?2,?3,'hosted_mailbox',?4,'info') RETURNING id
+        \\VALUES(?1,?2,?3,?4,'hosted_mailbox',?5,'info') RETURNING id
     );
     defer row.finalize();
     try row.bind(1, now);
-    try row.bind(2, operator);
-    try row.bind(3, review.mailbox);
-    try row.bind(4, details);
+    try row.bind(2, action);
+    try row.bind(3, operator);
+    try row.bind(4, mailbox);
+    try row.bind(5, details);
     if (!try row.step()) return error.StepFailed;
     const id = row.columnInt64(0);
     if (try row.step()) return error.StepFailed;
@@ -143,11 +148,20 @@ pub fn record(a: Allocator, io: std.Io, db: *Database, review: Review, operator:
     try review.validate();
     // Maildir and DAV are observed separately. A future removal must quiesce
     // those stores and verify the scope again before writing to any of them.
-    var current = try inventory.collect(a, io, db, review.mailbox, review.assignment_actor, mail_root, dav_path);
+    const current = try inventory.collect(a, io, db, review.mailbox, review.assignment_actor, mail_root, dav_path);
     var tx = try db.beginTransaction(.write);
     defer tx.deinit();
     const now = time.timestamp();
     const observation = try preflight.observeInTransaction(a, tx, review.mailbox, review.assignment_actor, now);
+    try verifyCurrent(a, tx, review, observation, current);
+    const details = try reviewDetails(a, review, observation.identity);
+    const id = try recordReceipt(tx, review, operator, now, details);
+    try tx.commit();
+    return .{ .mailbox = review.mailbox, .request_id = review.request_id, .audit_id = id };
+}
+
+pub fn verifyCurrent(a: Allocator, tx: Database.Transaction, review: Review, observation: preflight.Observation, sampled: inventory.Inventory) !void {
+    var current = sampled;
     if (observation.access.state.readable()) return error.MailboxStillReadable;
     if (observation.identity.initial_provisioning_operation == null or !current.identity.eql(observation.identity))
         return error.AssignmentChanged;
@@ -160,19 +174,134 @@ pub fn record(a: Allocator, io: std.Io, db: *Database, review: Review, operator:
     } else if (try mailbox_export.hasPreparedAudit(tx, review.mailbox, review.case_reference)) {
         return error.ExportResolutionRequired;
     }
+}
 
-    const details = try std.json.Stringify.valueAlloc(a, .{
+fn reviewDetails(a: Allocator, review: Review, identity: preflight.Identity) ![]const u8 {
+    return std.json.Stringify.valueAlloc(a, .{
         .version = review.version,
         .request_id = review.request_id,
         .case_reference = review.case_reference,
-        .identity = observation.identity,
+        .identity = identity,
         .inventory_audit_id = review.inventory_audit_id,
         .retention_disposition = review.retention_disposition,
         .export_disposition = review.export_disposition,
         .export_handoff_audit_id = review.export_handoff_audit_id,
         .evidence = review.evidence,
     }, .{});
-    const id = try recordReceipt(tx, review, operator, now, details);
+}
+
+const BeginReceipt = struct {
+    version: u8 = 1,
+    state: []const u8 = "erasure_started_data_retained",
+    mailbox: []const u8,
+    request_id: []const u8,
+    review_audit_id: i64,
+    audit_id: i64,
+};
+
+fn requireAcceptedReview(tx: Database.Transaction, mailbox: []const u8, audit_id: i64, details: []const u8) !void {
+    const row = try tx.prepare(
+        \\SELECT details FROM audit_log WHERE id=?1 AND action='hosted.erasure.review.accepted'
+        \\AND target=?2 AND target_type='hosted_mailbox'
+    );
+    defer row.finalize();
+    try row.bind(1, audit_id);
+    try row.bind(2, mailbox);
+    if (!try row.step()) return error.ErasureReviewAuditNotFound;
+    if (!std.mem.eql(u8, details, row.columnText(0))) return error.ErasureReviewConflict;
+}
+
+fn existingStart(tx: Database.Transaction, review: Review, user: i64, review_id: i64) !?i64 {
+    const row = try tx.prepare(
+        \\SELECT request_id,mailbox,native_user_id,review_audit_id,start_audit_id FROM hosted_erasure_operations
+        \\WHERE request_id=?1 OR mailbox=?2 OR native_user_id=?3
+    );
+    defer row.finalize();
+    try row.bind(1, review.request_id);
+    try row.bind(2, review.mailbox);
+    try row.bind(3, user);
+    if (!try row.step()) return null;
+    const id = row.columnInt64(4);
+    if (!std.mem.eql(u8, review.request_id, row.columnText(0)) or !std.mem.eql(u8, review.mailbox, row.columnText(1)) or
+        row.columnInt64(2) != user or row.columnInt64(3) != review_id or try row.step())
+        return error.ErasureAlreadyStarted;
+    return id;
+}
+
+pub fn requireStarted(a: Allocator, tx: Database.Transaction, review: Review, start_id: i64, now: i64) !preflight.Observation {
+    const observation = try preflight.observeInTransaction(a, tx, review.mailbox, review.assignment_actor, now);
+    if (observation.access.state != .disabled) return error.MailboxStillReadable;
+    const row = try tx.prepare(
+        \\SELECT o.review_audit_id FROM hosted_erasure_operations o JOIN audit_log a ON a.id=o.start_audit_id
+        \\WHERE o.start_audit_id=?1 AND o.request_id=?2 AND o.mailbox=?3 AND o.native_user_id=?4
+        \\AND a.action='hosted.erasure.started' AND a.target=o.mailbox AND a.target_type='hosted_mailbox'
+    );
+    defer row.finalize();
+    try row.bind(1, start_id);
+    try row.bind(2, review.request_id);
+    try row.bind(3, review.mailbox);
+    try row.bind(4, observation.identity.native_user_id);
+    if (!try row.step()) return error.ErasureStartNotFound;
+    try requireAcceptedReview(tx, review.mailbox, row.columnInt64(0), try reviewDetails(a, review, observation.identity));
+    try verifyDeliveryDrained(observation);
+    return observation;
+}
+
+/// Reserve the mailbox identity for the reviewed erasure and preserve its data.
+pub fn begin(a: Allocator, io: std.Io, db: *Database, review: Review, review_audit_id: i64, operator: []const u8, mail_root: []const u8, dav_path: ?[]const u8) !BeginReceipt {
+    try review.validate();
+    if (review_audit_id < 1) return error.InvalidErasureReviewAuditId;
+    const current = try inventory.collect(a, io, db, review.mailbox, review.assignment_actor, mail_root, dav_path);
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const now = time.timestamp();
+    const observation = try preflight.observeInTransaction(a, tx, review.mailbox, review.assignment_actor, now);
+    if (observation.access.state.readable()) return error.MailboxStillReadable;
+    const details = try reviewDetails(a, review, observation.identity);
+    try requireAcceptedReview(tx, review.mailbox, review_audit_id, details);
+
+    const user = observation.identity.native_user_id;
+    var receipt = BeginReceipt{
+        .mailbox = review.mailbox,
+        .request_id = review.request_id,
+        .review_audit_id = review_audit_id,
+        .audit_id = undefined,
+    };
+    if (try existingStart(tx, review, user, review_audit_id)) |id| {
+        receipt.audit_id = id;
+        try tx.commit();
+        return receipt;
+    }
+
+    try verifyCurrent(a, tx, review, observation, current);
+    const audit_details = try std.json.Stringify.valueAlloc(a, .{
+        .request_id = review.request_id,
+        .case_reference = review.case_reference,
+        .identity = observation.identity,
+        .review_audit_id = review_audit_id,
+    }, .{});
+    const id = try writeAudit(tx, "hosted.erasure.started", review.mailbox, operator, now, audit_details);
+    {
+        const disable = try tx.prepare("UPDATE users SET enabled=0,updated_at=?1 WHERE id=?2 AND enabled<>0");
+        defer disable.finalize();
+        try disable.bind(1, now);
+        try disable.bind(2, user);
+        if (try disable.step()) return error.StepFailed;
+    }
+    {
+        const reserve = try tx.prepare(
+            \\INSERT INTO hosted_erasure_operations(request_id,mailbox,native_user_id,review_audit_id,start_audit_id)
+            \\VALUES(?1,?2,?3,?4,?5)
+        );
+        defer reserve.finalize();
+        try reserve.bind(1, review.request_id);
+        try reserve.bind(2, review.mailbox);
+        try reserve.bind(3, user);
+        try reserve.bind(4, review_audit_id);
+        try reserve.bind(5, id);
+        if (try reserve.step()) return error.StepFailed;
+    }
     try tx.commit();
-    return .{ .mailbox = review.mailbox, .request_id = review.request_id, .audit_id = id };
+    receipt.audit_id = id;
+    return receipt;
 }

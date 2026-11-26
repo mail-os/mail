@@ -492,6 +492,100 @@ Reproduce export, handoff, and review acceptance on a disposable fixture with
 retention holds, old snapshots, a separate tenant, stale inventories, queued
 delivery, failed audit writes, and an identical retry.
 
+### Reserve the reviewed mailbox for erasure
+
+Before starting an erasure, confirm the private support case remains approved.
+Use the original private review file and the audit ID from its accepted review
+receipt. Use the same working directory and store paths as the inventory.
+
+```bash
+umask 077
+/opt/mail/mail-server user:local hosted-erasure-begin \
+  /private/exit-case-19/review.json 815 > /private/exit-case-19/start-receipt.json
+```
+
+The command rechecks the mailbox assignment, current store inventory, outstanding
+delivery, and the accepted review. It disables the assignment, reserves its
+address against reactivation and reassignment, and writes a
+`hosted.erasure.started` audit record in one SQLite transaction. An identical
+retry returns the same start receipt. A different request cannot take over the
+reservation.
+
+The receipt state is `erasure_started_data_retained`. Keep the receipt, its
+review evidence, and the reservation with the paired restore records. A restore
+from a snapshot containing the reservation preserves it. An older snapshot can
+lack the reservation or the review. Reconcile it with the authoritative case
+before making restored accounts accessible. The start command leaves the
+Maildir, SQLite mailbox content, DAV, and external data in place for managed
+removal after each store and backup disposition is verified.
+
+Run `python3 scripts/test-hosted-erasure-export.py /path/to/mail` on disposable
+data to verify the start, concurrent retry, failure rollback, old snapshot, and
+provisioning refusal.
+
+### Remove the reserved mailbox's canonical Maildir
+
+This step permanently removes the canonical Maildir for one reserved mailbox.
+Confirm that the approved case and its required export and backup dispositions
+still apply. Stop all writers serving this working directory, including any
+older Mail processes. Use the daemon's working directory and SMTP and DAV
+database paths, and cross-check the start audit against the private case.
+
+```bash
+umask 077
+/opt/mail/mail-server user:local hosted-erasure-maildir \
+  /private/exit-case-19/review.json 816 > /private/exit-case-19/maildir-receipt.json
+```
+
+The command takes the daemon's exclusive Maildir lock. It refuses a different
+root, a changed reviewed inventory, an unresolved legacy directory, crossed
+mounts, symbolic links, and files shared through hard links. It journals the
+directory identity, renames that directory under a private staging name, and
+syncs the parent before it starts removing files.
+
+Retry with the same review and start audit ID after an interruption. Preserve
+the journal and any staged directory while resolving an error. If the original
+or staged directory appeared again or changed identity, stop and reconcile the
+working directory and backup pair. The completion receipt reports
+`maildir_removed_other_stores_pending`. SQLite mailbox content, DAV, externally
+derived data, and backup disposition still need their own reconciliation.
+Removal of these active directory entries does not sanitize filesystem blocks
+or historical snapshots.
+
+Reproduce with `python3 scripts/test-hosted-erasure-maildir.py /path/to/mail`.
+The disposable fixture covers daemon activity, a backup without the start
+receipt, another tenant, changed paths, shared files, and interruption on both
+sides of deletion.
+
+### Remove active local search records
+
+Keep the approved case and its Maildir removal receipt together. With the
+same daemon stopped, run from its working directory with the same
+`SMTP_DB_PATH` and `MAIL_ROOT` used for Maildir removal.
+
+```bash
+umask 077
+/opt/mail/mail-server user:local hosted-erasure-search \
+  /private/exit-case-19/review.json 816 > /private/exit-case-19/local-search-receipt.json
+```
+
+The command verifies the Maildir receipt and checks for a restored directory
+under the same writer lock. One SQLite transaction removes the reserved
+native account's Webmail search documents and its ActiveSync search key,
+checks the full-text index against its content table, and commits counts
+and an audit receipt. A failed check rolls back the transaction. Retry with
+the same review and start ID to retrieve the same receipt.
+
+Record `local_search_removed_other_stores_pending` as completion of the
+active SQLite search step. Reconcile Typesense documents and their retained
+pending work and revisions separately. The remaining review includes
+SQLite WAL and older index segments, backups, and the other active stores.
+
+Run `python3 scripts/test-hosted-erasure-search.py /path/to/mail` on a
+disposable installation. The fixture searches genuine SMTP-delivered mail
+in both accounts, forces rollback on a stale full-text index and an audit
+failure, then checks the peer's search and retry receipt after removal.
+
 ## Local mailbox directory upgrade
 
 Back up the Maildir and SQLite database together before upgrading a server with older ActiveSync clients. On startup, the server checks for full-address local accounts that still have mail under a short directory name such as `mail/alice`. It moves eligible messages to `mail/alice@example.com` before opening the protocol listeners. It also moves messages in a canonical custom folder's nested slots into the folder path exposed by IMAP and webmail. ActiveSync, IMAP, webmail, and EWS then read from the canonical mailbox. The upgrade retains existing message flags and client identifiers when it can reconcile both directories.

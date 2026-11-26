@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import secrets
 import sqlite3
 from stat import S_IMODE
 import tarfile
@@ -305,6 +306,12 @@ def verify_review(test, db, export, export_audit, handoff_audit, peer, original)
     refuse('ErasureReviewConflict', {'evidence': {**request['evidence'], 'backup_reference': 'other-backup'}})
     assert reviews() == [audit] and original.read_bytes() == msg
 
+    other_request = {**request, 'request_id': 'erase-fixture-other-request'}
+    alternate = run_review({'request_id': other_request['request_id']})
+    assert alternate.returncode == 0, alternate.stderr
+    other_audit = json.loads(alternate.stdout)['audit_id']
+    verify_begin(test, db, request, receipt['audit_id'], other_request, other_audit, old, peer, original, msg)
+
     peer_actor = test.specs[peer]['actor']
     peer_review = {'mailbox': peer, 'assignment_actor': peer_actor, 'export_disposition': 'not_requested',
                    'export_handoff_audit_id': None}
@@ -316,9 +323,157 @@ def verify_review(test, db, export, export_audit, handoff_audit, peer, original)
     no_export = run_review({**peer_review, 'request_id': 'erase-fixture-no-export'})
     assert no_export.returncode == 0, no_export.stderr
     assert json.loads(no_export.stdout)['mailbox'] == peer
-    assert len(reviews()) == 2 and original.read_bytes() == msg
+    assert len(reviews()) == 3 and original.read_bytes() == msg
     assert db.execute("SELECT count(*) FROM users WHERE username IN (?,?)", (mailbox, peer)).fetchone() == (2,)
     print('Verified hosted erasure review receipt, held and readable refusal, scoped inventory, queued work, audit rollback, and retry.')
+
+
+def verify_begin(test, db, review, review_id, other_review, other_id, old, peer, original, message):
+    path = test.directory / 'begin-review.json'
+    mailbox = review['mailbox']
+
+    def begin(input=review, audit_id=review_id, env=None):
+        path.write_text(json.dumps(input))
+        path.chmod(0o600)
+        return cli(test, 'hosted-erasure-begin', str(path), str(audit_id), env=env)
+
+    def refuse(reason, **kwargs):
+        reply = begin(**kwargs)
+        assert reply.returncode and not reply.stdout and reason in reply.stderr, reply
+
+    def queries():
+        rows = db.execute("SELECT request_id, mailbox, native_user_id, review_audit_id, start_audit_id FROM hosted_erasure_operations").fetchall()
+        audits = db.execute("SELECT id,actor,target,details FROM audit_log WHERE action='hosted.erasure.started'").fetchall()
+        return rows, audits
+
+    refuse('InvalidErasureReviewAuditId', audit_id=0)
+    refuse('RetentionHold', input={**review, 'retention_disposition': 'held'})
+    refuse('ManagedMailboxNotFound', input={**review, 'assignment_actor': test.specs[peer]['actor']})
+    refuse('ErasureReviewAuditNotFound', audit_id=review['inventory_audit_id'])
+    refuse('ErasureReviewAuditNotFound', env=dict(test.env, SMTP_DB_PATH=str(old)))
+    refuse('ErasureReviewConflict', input={**review, 'evidence': {**review['evidence'], 'retention_reference': 'changed'}})
+    refuse('ErasureReviewConflict', input=other_review)
+
+    stray = original.with_name('unreviewed-file')
+    stray.write_bytes(b'added after review')
+    try:
+        refuse('InventoryChanged')
+    finally:
+        stray.unlink()
+    with db:
+        db.execute("""INSERT INTO webmail_records(username,kind,id,payload,state,revision)
+                      VALUES(?,'outbox','pending-erasure-start','{}','unknown',1)""", (mailbox,))
+    refuse('DeliveryUnresolved')
+    with db:
+        db.execute("DELETE FROM webmail_records WHERE id='pending-erasure-start'")
+        db.execute("""CREATE TRIGGER deny_erasure_reservation BEFORE INSERT ON hosted_erasure_operations
+                      BEGIN SELECT RAISE(ABORT,'fixture reservation failure'); END""")
+    refuse('StepFailed')
+    assert queries() == ([], [])
+    with db:
+        db.execute('DROP TRIGGER deny_erasure_reservation')
+
+    # Concurrent retries share the exact same private review.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        one, two = pool.map(lambda _: cli(test, 'hosted-erasure-begin', str(path), str(review_id)), range(2))
+    assert one.returncode == two.returncode == 0, (one, two)
+    started = json.loads(one.stdout)
+    assert json.loads(two.stdout) == started
+    assert started == {
+        'version': 1, 'state': 'erasure_started_data_retained', 'mailbox': mailbox,
+        'request_id': review['request_id'], 'review_audit_id': review_id, 'audit_id': started['audit_id'],
+    }, started
+    identity = db.execute("SELECT id FROM users WHERE username=?", (mailbox,)).fetchone()[0]
+    reservation, reservation_audits = queries()
+    assert reservation == [(review['request_id'], mailbox, identity, review_id, started['audit_id'])], reservation
+    row, = reservation_audits
+    assert row[:3] == (started['audit_id'], f'local-operator:{os.geteuid()}', mailbox)
+    audit_details = json.loads(row[3])
+    assert audit_details['identity']['native_user_id'] == identity and audit_details['review_audit_id'] == review_id
+    assert audit_details['case_reference'] == review['case_reference']
+
+    refuse('ErasureAlreadyStarted', input=other_review, audit_id=other_id)
+    assert cli(test, 'enable', mailbox).returncode != 0
+    spec = test.specs[mailbox]
+    endpoint = test.private + "/provisioning/v1/mailbox"
+    update = dict(spec, operation_id=secrets.token_hex(16), revision=spec['revision'] + 1, enabled=True)
+    reply = test.http(endpoint, update, test.auth)
+    assert reply[0] == 409 and json.loads(reply[2])['error'] == 'mailbox_unavailable', reply
+    recreate = dict(spec, actor=secrets.token_hex(16), operation_id=secrets.token_hex(16), revision=1,
+                    initial_password=test.password, initial_recovery='other@recovery.example.test', enabled=True)
+    reply = test.http(endpoint, recreate, test.auth)
+    assert reply[0] == 409 and json.loads(reply[2])['error'] == 'mailbox_unavailable', reply
+    renew = {key: update[key] for key in ('mailbox', 'actor', 'operation_id', 'revision')}
+    now = int(time.time())
+    renew['access_window'] = {'service_until': now + 900, 'read_until': now + 1800}
+    reply = test.http(endpoint + '/access', renew, test.auth)
+    assert reply[0] == 409 and json.loads(reply[2])['error'] == 'mailbox_unavailable', reply
+    expect_smtp(test.deliver(mailbox, subject='Erasure mailbox remains closed'), 550)
+    expect_smtp(test.deliver(peer, subject='Separate mailbox still receives'), 250)
+    assert original.read_bytes() == message and queries() == (reservation, reservation_audits)
+
+    after = test.directory / 'after-erasure-start.db'
+    with closing(sqlite3.connect(after)) as snapshot:
+        db.backup(snapshot)
+    repeated = begin(env=dict(test.env, SMTP_DB_PATH=str(after)))
+    assert repeated.returncode == 0 and json.loads(repeated.stdout) == started, repeated
+
+    with closing(sqlite3.connect(after)) as restored:
+        for statement in (
+            "UPDATE provisioned_mailboxes SET revision=revision+1 WHERE mailbox=?",
+            "UPDATE users SET enabled=1 WHERE username=?",
+        ):
+            try:
+                restored.execute(statement, (mailbox,))
+            except sqlite3.IntegrityError as error:
+                assert 'mailbox erasure started' in str(error), error
+            else:
+                raise AssertionError("A restored reservation allowed a SQL update")
+        restored.rollback()
+    print('Verified audited erasure start, retained data, pending-delivery and stale-review refusal, rollback, concurrency, and preserved reservation after backup.')
+
+
+def verify_expired_begin(test, db):
+    mailbox = test.provision('expired-erasure')
+    spec = test.specs[mailbox]
+    now = int(time.time())
+    change = {**spec, 'operation_id': secrets.token_hex(16), 'revision': 2,
+              'access_window': {'service_until': now - 120, 'read_until': now - 60}}
+    del change['initial_recovery'], change['initial_password']
+    result = test.http(test.private + '/provisioning/v1/mailbox', change, test.auth)
+    assert result[0] == 200, result
+    user, enabled = db.execute("SELECT id,enabled FROM users WHERE username=?", (mailbox,)).fetchone()
+    assert enabled == 1
+    case = 'expired-exit-case'
+    snapshot = cli(test, 'hosted-erasure-inventory', mailbox, spec['actor'], case)
+    assert snapshot.returncode == 0, snapshot.stderr
+    review = {
+        'version': 1, 'request_id': 'expired-erasure-request', 'mailbox': mailbox,
+        'assignment_actor': spec['actor'], 'case_reference': case,
+        'inventory_audit_id': json.loads(snapshot.stdout)['audit_id'],
+        'retention_disposition': 'cleared', 'export_disposition': 'not_requested',
+        'evidence': dict.fromkeys(('authorization_reference', 'retention_reference', 'backup_reference',
+                                   'billing_reference', 'search_reference', 'export_resolution_reference'), 'expired-case-evidence'),
+    }
+    path = test.directory / 'expired-erasure-review.json'
+    path.write_text(json.dumps(review))
+    path.chmod(0o600)
+    accepted = cli(test, 'hosted-erasure-review', str(path))
+    assert accepted.returncode == 0, accepted.stderr
+    audit_id = str(json.loads(accepted.stdout)['audit_id'])
+    with db:
+        db.execute("""CREATE TRIGGER deny_expired_reservation BEFORE INSERT ON hosted_erasure_operations
+                      BEGIN SELECT RAISE(ABORT, 'fixture reservation failure'); END""")
+    attempt = cli(test, 'hosted-erasure-begin', str(path), audit_id)
+    assert attempt.returncode and 'StepFailed' in attempt.stderr, attempt
+    assert db.execute("SELECT enabled FROM users WHERE id=?", (user,)).fetchone() == (1,)
+    assert db.execute("SELECT count(*) FROM audit_log WHERE action='hosted.erasure.started' AND target=?", (mailbox,)).fetchone() == (0,)
+    with db:
+        db.execute('DROP TRIGGER deny_expired_reservation')
+    attempt = cli(test, 'hosted-erasure-begin', str(path), audit_id)
+    assert attempt.returncode == 0, attempt.stderr
+    assert db.execute("SELECT enabled FROM users WHERE id=?", (user,)).fetchone() == (0,)
+    print('Verified erasure start disables an expired mailbox and rolls back that change if reservation fails.')
 
 
 if __name__ == '__main__':
@@ -330,3 +485,4 @@ if __name__ == '__main__':
         test = Fixture(args.binary.resolve(strict=True), root, staging=True)
         with test.daemon(), closing(sqlite3.connect(root / 'smtp.db')) as db:
             verify(test, db)
+            verify_expired_begin(test, db)
