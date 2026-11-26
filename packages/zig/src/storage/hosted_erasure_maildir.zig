@@ -124,21 +124,52 @@ fn markRemoving(tx: Database.Transaction, start_id: i64) !void {
     if (try row.step()) return error.StepFailed;
 }
 
+pub fn openLockedRoot(a: Allocator, io: std.Io, mail_root: []const u8) !Dir {
+    // A Linux path-only descriptor cannot take flock or sync directory entries.
+    var root = try Dir.cwd().openDir(io, "mail", .{ .iterate = true });
+    errdefer root.close(io);
+    try writer.lock(root.handle);
+    var configured = try Dir.cwd().openDir(io, mail_root, .{});
+    defer configured.close(io);
+    const root_stamp = try message_refs.directoryHandleStamp(a, root.handle);
+    if (!std.mem.eql(u8, root_stamp, try message_refs.directoryHandleStamp(a, configured.handle)))
+        return error.ErasureDirectoryChanged;
+    return root;
+}
+
+/// Recheck the recorded removal while the caller holds the same writer lock.
+pub fn requireRemoved(a: Allocator, io: std.Io, tx: Database.Transaction, root: Dir, mailbox: []const u8, start_id: i64) !void {
+    const step = (try loadStep(a, tx, start_id)) orelse return error.ErasureMaildirPending;
+    const completion = step.completion orelse return error.ErasureMaildirPending;
+    const audit = try tx.prepare(
+        \\SELECT id FROM audit_log WHERE id=?1 AND action='hosted.erasure.maildir.removed'
+        \\AND target=?2 AND target_type='hosted_mailbox' AND json_extract(details,'$.start_audit_id')=?3
+    );
+    defer audit.finalize();
+    try audit.bind(1, completion);
+    try audit.bind(2, mailbox);
+    try audit.bind(3, start_id);
+    if (!try audit.step()) return error.InvalidErasureJournal;
+    const root_stamp = try message_refs.directoryHandleStamp(a, root.handle);
+    if (!std.mem.eql(u8, root_stamp, step.root_stamp)) return error.ErasureDirectoryChanged;
+    const staged = try std.fmt.allocPrint(a, ".hosted-erasure-{d}-{s}", .{ start_id, step.nonce });
+    const short = mailbox[0 .. std.mem.indexOfScalar(u8, mailbox, '@') orelse return error.InvalidErasureMailbox];
+    for ([_][]const u8{ mailbox, staged, short }) |name| {
+        _ = root.statFile(io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        return error.ErasureDirectoryChanged;
+    }
+}
+
 pub fn erase(a: Allocator, io: std.Io, db: *Database, review: review_store.Review, start_id: i64, operator: []const u8, mail_root: []const u8, dav_path: ?[]const u8) !Receipt {
     try review.validate();
     if (start_id < 1) return error.InvalidErasureStartAuditId;
-    // A Linux path-only descriptor cannot take flock or sync directory entries.
-    var root = try Dir.cwd().openDir(io, "mail", .{ .iterate = true });
+    var root = try openLockedRoot(a, io, mail_root);
     defer root.close(io);
-    try writer.lock(root.handle);
     const mount = try mountId(root.handle, null);
     const root_stamp = try message_refs.directoryHandleStamp(a, root.handle);
-    {
-        var configured = try Dir.cwd().openDir(io, mail_root, .{});
-        defer configured.close(io);
-        if (!std.mem.eql(u8, root_stamp, try message_refs.directoryHandleStamp(a, configured.handle)))
-            return error.ErasureDirectoryChanged;
-    }
     const sampled = try inventory.collect(a, io, db, review.mailbox, review.assignment_actor, "mail", dav_path);
 
     var resumed_plan = false;
