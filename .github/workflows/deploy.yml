@@ -1,21 +1,12 @@
 name: Deploy
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'packages/zig/**'
-      - 'packages/webmail/**'
-      - 'packages/cloud/webmail.config.ts'
-      - 'packages/cloud/package.json'
-      - 'scripts/deploy*.sh'
-      - 'scripts/deploy-webmail.ts'
-      - 'scripts/mail-health.py'
-      - 'scripts/test-mail-tls.py'
-      - 'scripts/setup-mail-health.sh'
-      - 'scripts/mail-health-watch.py'
-      - 'bun.lock'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Full commit SHA verified for this production release
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -27,12 +18,24 @@ concurrency:
 jobs:
   deploy:
     name: Build & Deploy (Hetzner)
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     steps:
+    - name: Verify the selected production revision
+      shell: bash
+      env:
+        SELECTED_RELEASE_REVISION: ${{ inputs.revision }}
+      run: |
+        if [[ ! "$SELECTED_RELEASE_REVISION" =~ ^[0-9a-f]{40}$ || "$SELECTED_RELEASE_REVISION" != "$GITHUB_SHA" ]]; then
+          echo "Select the ref that points to the full commit SHA verified for this production release." >&2
+          exit 1
+        fi
+
     - name: Checkout code
       uses: actions/checkout@v6
       with:
+        ref: ${{ github.sha }}
         submodules: recursive
 
     - name: Setup project dependencies with Pantry
