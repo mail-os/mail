@@ -18,6 +18,7 @@ eas_suite = runpy.run_path(str(SCRIPTS / "test-eas-move-items.py"))
 folder_suite = runpy.run_path(str(SCRIPTS / "test-eas-folder-hierarchy.py"))
 Fixture, SearchIndex = imap_suite["Fixture"], imap_suite["SearchIndex"]
 search, seed_message = imap_suite["search"], imap_suite["seed_message"]
+IDENTITY_FIELDS = imap_suite["IDENTITY_FIELDS"]
 snapshot, ids, move = eas_suite["snapshot"], eas_suite["ids"], eas_suite["response"]
 
 
@@ -52,7 +53,7 @@ def verify_search(test, index, owner, folder, count, *, indexed):
             qualifier = f"username:=`{owner}`"
             if folder != '"All Mail"':
                 qualifier += f" && mailbox:=`{folder}`"
-            assert index.requests == [("Compass", 1, 250, qualifier, "id")] * 2, index.requests
+            assert index.requests == [("Compass", 1, 250, qualifier, IDENTITY_FIELDS)] * 2, index.requests
         else:
             assert not index.requests, index.requests
 
