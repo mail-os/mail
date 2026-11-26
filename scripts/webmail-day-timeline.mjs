@@ -337,6 +337,9 @@ async function desktopDark(browser) {
 
       await page.emulateMedia({ forcedColors: 'active', contrast: 'no-preference' })
       assert.equal(await slot(page).evaluate(node => getComputedStyle(node).appearance), 'auto')
+      const layout = dayLayout(page)
+      assert.equal(await button(layout, 'Timeline').evaluate(node => getComputedStyle(node).outlineOffset), '-3px')
+      assert.equal(await button(layout, 'List').evaluate(node => getComputedStyle(node).outlineStyle), 'none')
       await capture(page, 'desktop-day-forced-colors')
     }
   }

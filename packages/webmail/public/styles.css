@@ -1862,6 +1862,11 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-message-check { appearance: auto; }
   .wm-message-check::before, .wm-message-check::after { content: none; }
   .wm-folder[aria-current=page], .wm-message-row--active, .wm-shared-row[aria-current=true], .wm-tool[aria-pressed=true], .wm-list-toggle:has(input:checked, input[aria-checked=mixed]) { outline: 1px solid Highlight; outline-offset: -1px; }
+  :is(.calendar-sources, .calendar-view-modes, .calendar-day-presentation > .calendar-choices) .wm-action[aria-pressed=true]:not(:focus-visible),
+  .calendar-header-actions .wm-action[aria-expanded=true]:not(:focus-visible) {
+    outline: 1px solid Highlight;
+    outline-offset: -3px;
+  }
 }
 
 [data-icon=check] { --mail-symbol: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22black%22 stroke-width=%221.75%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cpath d=%22m5 12 4 4L19 6%22/%3E%3C/svg%3E"); }
