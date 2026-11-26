@@ -81,6 +81,86 @@ async function snapshot(locator, name, expected) {
   tree[name] = value
 }
 
+async function verifyRecipientSuggestions(composer, phone, variant) {
+  const popup = composer.getByRole('listbox', { name: 'Recent contacts' })
+  const choices = popup.getByRole('option')
+  const remove = letter => button(composer, `Remove recipient harland-${letter}@example.test`)
+  for (const field of ['To', 'Cc', 'Bcc']) {
+    if (field !== 'To') await button(composer, `Add ${field}`).click()
+    const input = composer.getByRole('combobox', { name: field, exact: true })
+    await input.fill('Harland')
+    await choices.last().waitFor()
+    assert.equal(await choices.count(), 3)
+    const first = await choices.first().getAttribute('id')
+    const last = await choices.last().getAttribute('id')
+    assert.equal(await input.getAttribute('aria-controls'), await popup.getAttribute('id'))
+    await input.press('ArrowUp')
+    assert.equal(await input.getAttribute('aria-activedescendant'), last, `${field} starts at the last suggestion on Arrow Up`)
+    assert(await input.evaluate(element => element === element.ownerDocument.activeElement))
+    await input.press('ArrowDown')
+    assert.equal(await input.getAttribute('aria-activedescendant'), first, `${field} wraps to the first suggestion on Arrow Down`)
+    await snapshot(popup, `${variant}-${field}-selected-suggestion`, /option "Harland A harland-a@example\.test" \[selected\]/)
+    await input.press('Enter')
+    await remove('a').waitFor()
+    await remove('a').click()
+
+    await input.fill('harland-a@example.test')
+    await choices.first().waitFor()
+    await input.press('ArrowDown')
+    await input.press('Escape')
+    await popup.waitFor({ state: 'hidden' })
+    assert.equal(await input.inputValue(), 'harland-a@example.test')
+    assert.equal(await input.getAttribute('aria-activedescendant'), null)
+    assert.equal(await input.getAttribute('aria-controls'), null)
+    await input.press('Enter')
+    await remove('a').waitFor()
+    await remove('a').click()
+
+    await input.fill('harland-b@example.test')
+    await choices.first().waitFor()
+    await input.press('Tab')
+    assert(await composer.evaluate((dialog) => {
+      const focused = dialog.ownerDocument.activeElement
+      return dialog.contains(focused) && !focused.matches('input[role=combobox], [role=option]')
+    }), `${field} advances to the next form control`)
+    await popup.waitFor({ state: 'hidden' })
+    await remove('b').waitFor()
+    await remove('b').click()
+
+    await input.fill('harland-c@example.test')
+    const suggestion = choices.first()
+    if (phone) await suggestion.tap()
+    else await suggestion.click()
+    await remove('c').waitFor()
+    await remove('c').click()
+  }
+}
+
+async function verifyDismissedRecipientLookup(page, composer) {
+  const to = composer.getByRole('combobox', { name: 'To', exact: true })
+  const lookup = url => url.pathname === '/webmail/api/contacts' && url.searchParams.get('q') === 'Harland B'
+  const release = Promise.withResolvers()
+  await page.route(lookup, async (route) => {
+    await release.promise
+    await route.continue()
+  }, { times: 1 })
+  const requested = page.waitForRequest(request => lookup(new URL(request.url())))
+  const responded = page.waitForResponse(response => lookup(new URL(response.url())))
+  try {
+    await to.fill('Harland B')
+    await requested
+    await to.press('Escape')
+    assert.equal(await to.inputValue(), 'Harland B')
+  }
+  finally { release.resolve() }
+  const response = await responded
+  assert(response.ok())
+  assert.equal((await response.json())[0].address, 'harland-b@example.test')
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+  assert.equal(await to.getAttribute('aria-expanded'), 'false', 'A late response cannot reopen dismissed suggestions')
+  await to.fill('')
+}
+
 async function journey(browser, width, colorScheme) {
   const phone = width === 320
   const variant = `${phone ? 'phone' : 'desktop'}-${colorScheme}`
@@ -162,6 +242,8 @@ async function journey(browser, width, colorScheme) {
     await composer.waitFor()
     await snapshot(composer, `${variant}-composer`, /combobox "To"/)
     await scan('compose')
+    await verifyRecipientSuggestions(composer, phone, variant)
+    if (variant === 'desktop-light') await verifyDismissedRecipientLookup(page, composer)
     await button(composer, 'Close composer').click()
     await composer.waitFor({ state: 'hidden' })
 
