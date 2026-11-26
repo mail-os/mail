@@ -1184,6 +1184,43 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-snapshot-form label { display: grid; gap: var(--control-label-gap); min-width: 0; font-size: 13px; font-weight: 550; }
 .wm-snapshot-form .wm-snapshot-url { flex: 1 1 16rem; }
 .wm-snapshot-form input { width: 100%; }
+.wm-team-thread-header { padding-block-end: 4px; border-block-end: 1px solid var(--border); }
+.wm-team-thread-header-title { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.wm-team-thread-header .mail-icon-button[aria-disabled=true] { color: var(--control-disabled-text); cursor: default; }
+.wm-team-thread-header .mail-icon-button[aria-disabled=true]:hover { background: transparent; }
+.wm-team-thread-summary { display: grid; gap: 4px; overflow-wrap: anywhere; }
+.wm-team-thread-subject { margin: 0; font-size: 17px; font-weight: 650; line-height: 1.25; overflow-wrap: anywhere; }
+:is(.wm-team-thread-search, .wm-team-thread-comment) { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 8px; align-items: end; }
+.wm-team-thread-comment label { grid-column: 1 / -1; font-size: 13px; font-weight: 550; }
+:is(.wm-team-thread-search, .wm-team-thread-comment) .wm-action { block-size: var(--control-height); justify-content: center; }
+.wm-team-thread-dialog .wm-snapshot-message,
+.wm-team-thread-dialog .wm-snapshot-links li { border-color: transparent; background: var(--toolbar); }
+.wm-team-thread-dialog .wm-snapshot-message h4 { margin: 0; font-size: 14px; font-weight: 650; }
+.wm-team-thread-attachments, .wm-team-thread-pagination { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.wm-team-thread-attachments { margin-block-start: 6px; }
+.wm-team-thread-download {
+  color: var(--accent);
+  border-color: transparent;
+  background: var(--accent-soft);
+  line-height: 1.25;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-decoration: none;
+}
+.wm-team-thread-download > .mail-icon { flex: none; }
+.wm-team-thread-download:hover { text-decoration: underline; }
+.wm-team-thread-refresh { justify-self: start; }
+.wm-team-thread-pagination { justify-content: space-between; }
+@media (prefers-contrast: more) {
+  .wm-team-thread-dialog :is(.wm-snapshot-message, .wm-snapshot-links li) { border-color: var(--border); }
+  .wm-team-thread-dialog :is(.wm-action--quiet, .wm-team-thread-download) { border-color: var(--control-border); }
+}
+@media (forced-colors: active) {
+  .wm-team-thread-dialog :is(.wm-action--quiet, .wm-team-thread-download) { border-color: ButtonText; }
+  .wm-team-thread-dialog .mail-icon-button[aria-disabled=true] { color: GrayText; border-color: GrayText; }
+  .wm-team-thread-dialog :is(.wm-snapshot-message, .wm-snapshot-links li) { border-color: CanvasText; }
+  .wm-team-thread-dialog :is(.wm-action, .mail-search-field):is(:focus-visible, :focus-within) { outline-color: Highlight; }
+}
 .wm-assistant-form { display: grid; gap: 10px; }
 .wm-assistant-form > label { display: grid; gap: var(--control-label-gap); font-size: 13px; font-weight: 550; }
 .wm-assistant-form fieldset { display: grid; gap: 5px; min-width: 0; margin: 0; border: 1px solid var(--border); border-radius: var(--control-radius); }

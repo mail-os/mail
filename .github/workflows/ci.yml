@@ -114,6 +114,12 @@ jobs:
       timeout-minutes: 6
       run: python3 scripts/test-webmail-reading-view.py packages/zig/zig-out/bin/mail webmail-browser-screenshots/reading-view
 
+    - name: Verify Shared Mail on desktop and mobile
+      if: runner.os == 'Linux'
+      working-directory: .
+      timeout-minutes: 5
+      run: python3 scripts/test-hosted-erasure-retained-threads.py packages/zig/zig-out/bin/mail --screenshots webmail-browser-screenshots/shared-mail
+
     - name: Upload browser screenshots
       if: ${{ !cancelled() && runner.os == 'Linux' }}
       uses: actions/upload-artifact@v4

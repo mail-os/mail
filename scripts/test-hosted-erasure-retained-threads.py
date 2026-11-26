@@ -7,10 +7,12 @@ from hashlib import sha256
 from contextlib import closing
 from email.message import EmailMessage
 import json
+import os
 from pathlib import Path
 import runpy
 import sqlite3
 from stat import S_IMODE
+import subprocess
 import tarfile
 import time
 from tempfile import TemporaryDirectory
@@ -24,7 +26,15 @@ PUBLIC_BYTES = b"Approved bytes\x00\xff\r\n"
 PRIVATE_BYTES = b"Never retain this attachment"
 
 
-def verify(test):
+def browser_journey(test, peer, mode, output):
+    env = dict(os.environ, MAIL_THREAD_TEST_URL=test.webmail, MAIL_THREAD_TEST_CERT=test.env["SMTP_TLS_CERT"],
+               MAIL_THREAD_TEST_PEER=peer, MAIL_THREAD_TEST_PASSWORD=test.password,
+               MAIL_THREAD_TEST_ATTACHMENT=base64.b64encode(PUBLIC_BYTES).decode("ascii"))
+    subprocess.run(["node", str(scripts / "webmail-team-threads-browser.mjs"), mode, str(output / mode)],
+                   env=env, check=True, timeout=110)
+
+
+def verify(test, *, screenshots=None):
     db_path = test.directory / "smtp.db"
     review, decision = (test.directory / name for name in ("review.json", "decision.json"))
     team = "retained-mail-fixture"
@@ -155,6 +165,8 @@ def verify(test):
         assert before_collection["next"] and len(before_collection["messages"]) == 20
         last_page = api(other, f"{collection_path}?before={before_collection['next']}")
         assert len(last_page["messages"]) == 1 and last_page["next"] is None
+        if screenshots:
+            browser_journey(test, peer, "live", screenshots)
         with closing(sqlite3.connect(db_path)) as db:
             peer_id, outsider_id = (
                 db.execute("SELECT id FROM users WHERE username=?", (mailbox,)).fetchone()[0]
@@ -267,6 +279,8 @@ def verify(test):
         download(foreign, allowed_path, status=404)
         assert api(foreign, "thread-shares") == {"grants": []}
         api(own, thread_path, status=401)
+        if screenshots:
+            browser_journey(test, peer, "retained", screenshots)
         export_review, hosted_export = (test.directory / name for name in ("export-review.json", "hosted.tar"))
         actor = test.specs[peer]["actor"]
         case = "retained-peer-portable-export"
@@ -306,7 +320,8 @@ def verify(test):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
+    parser.add_argument("--screenshots", type=Path, help="Run the Chromium journey and save screenshots")
     args = parser.parse_args()
     with TemporaryDirectory(prefix="mail-retained-threads-") as directory:
-        verify(Fixture(args.binary.resolve(), Path(directory), staging=True))
+        verify(Fixture(args.binary.resolve(), Path(directory), staging=True), screenshots=args.screenshots)
     print("Verified authorized peer-owned Mail archives, pagination, reply and file scope, audited portable export, rollback, and retry.")
