@@ -56,7 +56,7 @@ async function verifyAppearance({ width, height, colorScheme, contrast, forcedCo
     await page.getByRole('button', { name: 'Sign in', exact: true }).click()
     await page.waitForURL(url + '/')
     const trigger = page.getByRole('button', { name: 'Shared mail', exact: true })
-    const triggerSelector = '#mailNavigation button:has([data-icon="message-stack"])'
+    const triggerSelector = '#mailNavigation button[aria-haspopup=dialog]:has([data-icon="message-stack"])'
     const menu = page.getByRole('button', { name: 'Mailboxes', exact: true })
     const menuSelector = '.wm-folders-toggle'
     const closeSelector = '.wm-team-thread-header button[aria-label=Close]'
