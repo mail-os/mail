@@ -529,6 +529,44 @@ Run `python3 scripts/test-hosted-erasure-export.py /path/to/mail` on disposable
 data to verify the start, concurrent retry, failure rollback, old snapshot, and
 provisioning refusal.
 
+### Approve removal of shared source data
+
+When a reserved mailbox is the source of shared threads, collections, a
+shared inbox, or a shared calendar, inspect the affected grants before
+deleting the underlying Maildir or DAV data. Use the same private case
+review and start audit ID.
+
+```bash
+/opt/mail/mail-server user:local hosted-erasure-shared-release \
+  /private/case/erasure-review.json START_AUDIT_ID maildir
+```
+
+Use `dav` for Calendar grants. The private report includes the scope digest
+and whether approval is required. Compare outgoing grants in the reviewed
+inventory and the current store. Resolve the remaining parties' retention
+rights in the approved case. When a copy is required, retain it in
+independently owned storage and verify access before approving source removal.
+
+If approval is required, save a JSON file with mode `0600` using the digest
+from that report and the case's approval reference.
+
+```json
+{
+  "version": 1,
+  "scope_sha256": "the-scope-sha256-from-the-report",
+  "disposition": "release_source",
+  "approval_reference": "approved-case-decision-id"
+}
+```
+
+Run the same command with the decision file as its last argument. The
+command records approval and returns its audit ID on a retry with the same
+decision. Keep the record with the private case. Changes to the outgoing
+grant scope require a fresh decision. Maildir and DAV removals check the
+approval for their own store before deleting content. The approval records
+the operator's decision and leaves grants, discussion, and delivery records
+in place for their own disposition.
+
 ### Remove the reserved mailbox's canonical Maildir
 
 This step permanently removes the canonical Maildir for one reserved mailbox.

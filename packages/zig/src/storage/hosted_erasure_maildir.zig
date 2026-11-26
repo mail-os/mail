@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const Database = @import("database.zig").Database;
 const inventory = @import("hosted_erasure_inventory.zig");
+const shared = @import("hosted_erasure_shared.zig");
 const review_store = @import("hosted_erasure_review.zig");
 const message_refs = @import("message_refs.zig");
 const durable = @import("../core/durable_maildir.zig");
@@ -179,6 +180,8 @@ pub fn erase(a: Allocator, io: std.Io, db: *Database, review: review_store.Revie
         const observation = try review_store.requireStarted(a, tx, review, start_id, time.timestamp());
         if (try loadStep(a, tx, start_id)) |existing| {
             resumed_plan = existing.phase == .planned;
+            if (resumed_plan and existing.mailbox_stamp != null)
+                try shared.requireRelease(a, tx, review, start_id, observation.identity.native_user_id, .maildir);
             try tx.commit();
             break :blk existing;
         }
@@ -186,7 +189,10 @@ pub fn erase(a: Allocator, io: std.Io, db: *Database, review: review_store.Revie
         try review_store.verifyCurrent(a, tx, review, observation, sampled);
         const stamp = try stampDirectory(a, io, root, review.mailbox, mount);
         if ((stamp != null) != (sampled.maildir.state == .observed)) return error.ErasureDirectoryChanged;
-        if (stamp) |value| try walkMailbox(a, io, root, review.mailbox, value, mount, false);
+        if (stamp) |value| {
+            try shared.requireRelease(a, tx, review, start_id, observation.identity.native_user_id, .maildir);
+            try walkMailbox(a, io, root, review.mailbox, value, mount, false);
+        }
         var bytes: [16]u8 = undefined;
         io_compat.randomBytes(&bytes);
         const nonce = try a.dupe(u8, &std.fmt.bytesToHex(bytes, .lower));
@@ -236,8 +242,13 @@ pub fn erase(a: Allocator, io: std.Io, db: *Database, review: review_store.Revie
     } else if (live != null) return error.ErasureDirectoryChanged;
 
     if (step.phase == .removing) {
+        var tx = try db.beginTransaction(.write);
+        defer tx.deinit();
+        const now = time.timestamp();
+        const observation = try review_store.requireStarted(a, tx, review, start_id, now);
         if (staged) |stamp| {
             if (!sameStamp(staged, step.mailbox_stamp)) return error.ErasureDirectoryChanged;
+            try shared.requireRelease(a, tx, review, start_id, observation.identity.native_user_id, .maildir);
             try walkMailbox(a, io, root, staged_name, stamp, mount, false);
             try walkMailbox(a, io, root, staged_name, stamp, mount, true);
             try root.deleteDir(io, staged_name);
@@ -246,10 +257,6 @@ pub fn erase(a: Allocator, io: std.Io, db: *Database, review: review_store.Revie
         if (try stampDirectory(a, io, root, review.mailbox, mount) != null or
             try stampDirectory(a, io, root, staged_name, mount) != null) return error.ErasureDirectoryChanged;
 
-        var tx = try db.beginTransaction(.write);
-        defer tx.deinit();
-        const now = time.timestamp();
-        const observation = try review_store.requireStarted(a, tx, review, start_id, now);
         const details = try std.json.Stringify.valueAlloc(a, .{
             .start_audit_id = start_id,
             .request_id = review.request_id,

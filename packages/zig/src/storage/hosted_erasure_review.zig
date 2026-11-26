@@ -70,6 +70,10 @@ fn loadInventory(a: Allocator, tx: Database.Transaction, review: Review) !Invent
     return reviewed;
 }
 
+pub fn reviewedSharedBacking(a: Allocator, tx: Database.Transaction, review: Review) !?[]const inventory.SharedBacking {
+    return (try loadInventory(a, tx, review)).inventory.shared_backing;
+}
+
 pub fn reviewedDav(a: Allocator, tx: Database.Transaction, review: Review) !inventory.Dav {
     return (try loadInventory(a, tx, review)).inventory.dav;
 }

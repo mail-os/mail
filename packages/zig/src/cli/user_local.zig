@@ -16,6 +16,7 @@ const erasure_maildir = @import("../storage/hosted_erasure_maildir.zig");
 const erasure_search = @import("../storage/hosted_erasure_search.zig");
 const erasure_typesense = @import("../storage/hosted_erasure_typesense.zig");
 const erasure_dav = @import("../storage/hosted_erasure_dav.zig");
+const erasure_shared = @import("../storage/hosted_erasure_shared.zig");
 const erasure_links = @import("../storage/hosted_erasure_links.zig");
 const erasure_sqlite = @import("../storage/hosted_erasure_sqlite.zig");
 const io_compat = @import("../core/io_compat.zig");
@@ -340,6 +341,14 @@ fn hostedErasureLinksAction(ctx: *cli.BaseCommand.ParseContext) !void {
     try hostedErasureApproval(ctx, .{ .links = audit_id });
 }
 
+fn hostedErasureSharedAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const audit = ctx.getArgument(1) orelse return error.MissingArgument;
+    const audit_id = std.fmt.parseInt(i64, audit, 10) catch return error.InvalidErasureStartAuditId;
+    const store_name = ctx.getArgument(2) orelse return error.MissingArgument;
+    const store = std.meta.stringToEnum(erasure_shared.Store, store_name) orelse return error.InvalidErasureSharedStore;
+    try hostedErasureApproval(ctx, .{ .shared = .{ .start_id = audit_id, .store = store, .decision_path = ctx.getArgument(3) } });
+}
+
 const ErasureOperation = union(enum) {
     review,
     begin: i64,
@@ -347,6 +356,7 @@ const ErasureOperation = union(enum) {
     search: i64,
     sqlite: i64,
     links: i64,
+    shared: struct { start_id: i64, store: erasure_shared.Store, decision_path: ?[]const u8 },
     typesense: struct { start_id: i64, endpoint: erasure_typesense.Endpoint },
     dav: struct { start_id: i64, confirmed_path: []const u8 },
 };
@@ -376,6 +386,16 @@ fn hostedErasureApproval(ctx: *cli.BaseCommand.ParseContext, operation: ErasureO
         .sqlite => |id| try std.json.Stringify.value(try erasure_sqlite.erase(a, io, &db, review, id, operator, mail_root), format, &output.interface),
         .links => |id| try std.json.Stringify.value(try erasure_links.erase(a, io, &db, review, id, operator, mail_root), format, &output.interface),
         .search => |id| try std.json.Stringify.value(try erasure_search.erase(a, io, &db, review, id, operator, mail_root), format, &output.interface),
+        .shared => |step| {
+            const decision = if (step.decision_path) |path| try std.json.parseFromSliceLeaky(
+                erasure_shared.Decision,
+                a,
+                try readPrivateReview(a, io, path, error.ErasureSharedDecisionNotPrivate),
+                .{},
+            ) else null;
+            const report = try erasure_shared.inspect(a, &db, review, step.start_id, step.store, operator, decision);
+            try std.json.Stringify.value(report, format, &output.interface);
+        },
         .typesense => |step| try std.json.Stringify.value(try erasure_typesense.erase(a, io, &db, review, step.start_id, operator, mail_root, step.endpoint), format, &output.interface),
         .dav => |step| try std.json.Stringify.value(try erasure_dav.erase(a, io, &db, review, step.start_id, operator, mail_root, dav_path orelse "./caldav.db", step.confirmed_path), format, &output.interface),
     }
@@ -578,6 +598,14 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try erasure_begin_cmd.addArgument(cli.Argument.init("review-audit-id", "Audit ID of the accepted erasure review", .string).withRequired(true));
     _ = erasure_begin_cmd.setAction(hostedErasureBeginAction);
     _ = try cmd.addCommand(erasure_begin_cmd);
+
+    const erasure_shared_cmd = try cli.BaseCommand.init(allocator, "hosted-erasure-shared-release", "Review and approve source removal for shared mailbox or calendar grants");
+    _ = try erasure_shared_cmd.addArgument(cli.Argument.init("review", "Private erasure review JSON file", .string).withRequired(true));
+    _ = try erasure_shared_cmd.addArgument(cli.Argument.init("start-audit-id", "Audit ID of the reserved erasure", .string).withRequired(true));
+    _ = try erasure_shared_cmd.addArgument(cli.Argument.init("store", "Source store, maildir or dav", .string).withRequired(true));
+    _ = try erasure_shared_cmd.addArgument(cli.Argument.init("decision", "Private JSON containing the scope digest and approval reference", .string).withRequired(false));
+    _ = erasure_shared_cmd.setAction(hostedErasureSharedAction);
+    _ = try cmd.addCommand(erasure_shared_cmd);
 
     const erasure_maildir_cmd = try cli.BaseCommand.init(allocator, "hosted-erasure-maildir", "Erase the reserved mailbox's canonical Maildir with its daemon stopped");
     _ = try erasure_maildir_cmd.addArgument(cli.Argument.init("review", "Private erasure review JSON file", .string).withRequired(true));

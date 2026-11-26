@@ -246,7 +246,7 @@ pub fn observeDavOwner(a: Allocator, tx: Database.Transaction, mailbox: []const 
     return .{ .state = .mapped, .legacy_name_candidates = legacy, .tables = tables, .owner_id = owner.user_id };
 }
 
-const SharedBacking = struct {
+pub const SharedBacking = struct {
     kind: enum { thread, collection, calendar },
     role: enum { source, recipient },
     team_id: []const u8,

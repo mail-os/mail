@@ -4,6 +4,7 @@ const Database = @import("database.zig").Database;
 const state = @import("dav_erasure_state.zig");
 const inventory = @import("hosted_erasure_inventory.zig");
 const maildir = @import("hosted_erasure_maildir.zig");
+const shared = @import("hosted_erasure_shared.zig");
 const review_store = @import("hosted_erasure_review.zig");
 const io_compat = @import("../core/io_compat.zig");
 const time = @import("../core/time_compat.zig");
@@ -211,15 +212,22 @@ pub fn erase(a: Allocator, io: std.Io, db: *Database, review: review_store.Revie
             break :plan created;
         };
 
+        // Keep the SMTP grant scope locked until the DAV transaction commits.
+        var authority = try db.beginTransaction(.write);
+        defer authority.deinit();
+        const active = try review_store.requireStarted(a, authority, review, start_id, time.timestamp());
+        if (active.identity.native_user_id != scope.owner) return error.AssignmentChanged;
         if (!try hasMarker(tx, scope.owner, plan)) {
             if (plan.completion != null) return error.ErasureDavReceiptMissing;
             if (current.owner_id != plan.owner_id) return error.ErasureDavOwnerUnresolved;
             try review_store.compareDav(a, scope.dav, current);
+            if (plan.owner_id != null) try shared.requireRelease(a, authority, review, start_id, scope.owner, .dav);
             try storeMarker(tx, scope.owner, plan);
             if (plan.owner_id) |id| try deleteRows(tx, id);
         }
         try verifyRemoved(a, tx, review.mailbox, scope.owner, short, plan.owner_id);
         try tx.commit();
+        try authority.commit();
         break :blk plan;
     };
     try verifyStamp(a, io, configured_path, stamp);
