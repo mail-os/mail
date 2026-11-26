@@ -3502,7 +3502,8 @@ async function writingControlJourney(page) {
   await button(settings, 'Studio').waitFor()
   await button(settings, 'Close').click()
   await page.locator('.wm-compose-btn').click()
-  await tools.locator('summary').click()
+  await tools.waitFor()
+  if (await tools.getAttribute('open') === null) await tools.locator('summary').click()
   await snippetChoice.selectOption({ label: 'Review handoff' })
   await signatureChoice.selectOption({ label: 'Studio' })
 
