@@ -2,6 +2,7 @@
 const std = @import("std");
 const Database = @import("database.zig").Database;
 const thread_evidence = @import("hosted_erasure_thread_evidence.zig");
+const retained = @import("retained_thread_store.zig");
 const calendar_copy = @import("hosted_erasure_calendar_copy.zig");
 const inventory = @import("hosted_erasure_inventory.zig");
 const preflight = @import("hosted_erasure_preflight.zig");
@@ -11,7 +12,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Store = enum { maildir, dav };
 
-const Disposition = enum { release_source, release_source_with_calendar_copies };
+const Disposition = enum { release_source, release_source_with_calendar_copies, release_source_with_thread_archives };
 
 pub const Decision = struct {
     version: u8,
@@ -19,6 +20,7 @@ pub const Decision = struct {
     disposition: Disposition,
     approval_reference: []const u8,
     retained_calendar_copies: []const calendar_copy.Copy = &.{},
+    retained_thread_archives: []const retained.Selection = &.{},
 };
 
 const Delegation = struct {
@@ -103,7 +105,7 @@ pub const Report = struct {
 };
 
 fn validateCopies(scope: Scope, disposition: Disposition, copies: []const calendar_copy.Copy) !void {
-    if (disposition == .release_source) {
+    if (disposition != .release_source_with_calendar_copies) {
         if (copies.len != 0) return error.InvalidErasureSharedDecision;
         return;
     }
@@ -118,6 +120,26 @@ fn validateCopies(scope: Scope, disposition: Disposition, copies: []const calend
         for (copies[0..index]) |previous| {
             if (previous.destination_calendar_id == copy.destination_calendar_id or
                 (previous.peer_user_id == copy.peer_user_id and std.mem.eql(u8, previous.source_share_id, copy.source_share_id)))
+                return error.InvalidErasureSharedDecision;
+        }
+    }
+}
+
+fn validateArchives(scope: Scope, disposition: Disposition, archives: []const retained.Selection) !void {
+    if (disposition != .release_source_with_thread_archives) {
+        if (archives.len != 0) return error.InvalidErasureSharedDecision;
+        return;
+    }
+    if (scope.store != .maildir or archives.len == 0 or archives.len > scope.current.len)
+        return error.InvalidErasureSharedDecision;
+    for (archives, 0..) |archive, index| {
+        const authorized = for (scope.current) |grant| {
+            if (grant.peer_user_id == archive.peer_user_id and std.mem.eql(u8, grant.share_id, archive.source_share_id))
+                break true;
+        } else false;
+        if (!authorized) return error.ErasureThreadArchiveNotAuthorized;
+        for (archives[0..index]) |previous| {
+            if (std.mem.eql(u8, previous.source_share_id, archive.source_share_id))
                 return error.InvalidErasureSharedDecision;
         }
     }
@@ -151,6 +173,7 @@ pub fn inspect(a: Allocator, db: *Database, review: review_store.Review, start_i
             return error.InvalidErasureSharedDecision;
         if (!std.mem.eql(u8, approved.scope_sha256, &digest)) return error.ErasureSharedScopeChanged;
         try validateCopies(scope, approved.disposition, approved.retained_calendar_copies);
+        try validateArchives(scope, approved.disposition, approved.retained_thread_archives);
         const details = try std.json.Stringify.valueAlloc(a, .{
             .start_audit_id = start_id,
             .request_id = review.request_id,
@@ -163,15 +186,17 @@ pub fn inspect(a: Allocator, db: *Database, review: review_store.Review, start_i
             .scope = scope,
             .thread_records = if (threads.len != 0) threads else null,
             .retained_calendar_copies = if (approved.retained_calendar_copies.len != 0) approved.retained_calendar_copies else null,
+            .retained_thread_archives = if (approved.retained_thread_archives.len != 0) approved.retained_thread_archives else null,
         }, .{});
         const existing = try tx.prepare(
             \\SELECT id FROM audit_log WHERE action='hosted.erasure.shared.source_release'
             \\AND target=?1 AND target_type='hosted_mailbox'
-            \\AND json_remove(details,'$.retained_calendar_copies','$.thread_records')=
-            \\    json_remove(?2,'$.retained_calendar_copies','$.thread_records')
+            \\AND json_remove(details,'$.retained_calendar_copies','$.thread_records','$.retained_thread_archives')=
+            \\    json_remove(?2,'$.retained_calendar_copies','$.thread_records','$.retained_thread_archives')
             \\AND coalesce(json_extract(details,'$.retained_calendar_copies'),'[]')=
             \\    coalesce(json_extract(?2,'$.retained_calendar_copies'),'[]')
             \\AND coalesce(json_extract(details,'$.thread_records'),'[]')=coalesce(json_extract(?2,'$.thread_records'),'[]')
+            \\AND coalesce(json_extract(details,'$.retained_thread_archives'),'[]')=coalesce(json_extract(?2,'$.retained_thread_archives'),'[]')
             \\ORDER BY id LIMIT 1
         );
         defer existing.finalize();
@@ -186,6 +211,7 @@ pub fn inspect(a: Allocator, db: *Database, review: review_store.Review, start_i
 pub const Release = struct {
     audit_id: i64,
     copies: []const calendar_copy.Copy,
+    archives: []const retained.Selection,
 };
 
 pub fn requireRelease(a: Allocator, tx: Database.Transaction, review: review_store.Review, start_id: i64, owner: i64, store: Store) !?Release {
@@ -195,7 +221,8 @@ pub fn requireRelease(a: Allocator, tx: Database.Transaction, review: review_sto
     const threads = if (store == .maildir) try thread_evidence.collect(a, tx, owner, scope.current) else &.{};
     const digest = try digestForScope(a, scope, threads);
     const approved = try tx.prepare(
-        \\SELECT id,json_extract(details,'$.disposition'),coalesce(json_extract(details,'$.retained_calendar_copies'),'[]')
+        \\SELECT id,json_extract(details,'$.disposition'),coalesce(json_extract(details,'$.retained_calendar_copies'),'[]'),
+        \\ coalesce(json_extract(details,'$.retained_thread_archives'),'[]')
         \\FROM audit_log WHERE action='hosted.erasure.shared.source_release'
         \\AND target=?1 AND target_type='hosted_mailbox'
         \\AND json_extract(details,'$.start_audit_id')=?2 AND json_extract(details,'$.request_id')=?3
@@ -215,7 +242,9 @@ pub fn requireRelease(a: Allocator, tx: Database.Transaction, review: review_sto
     const disposition = std.meta.stringToEnum(Disposition, approved.columnText(1)) orelse return error.InvalidErasureSharedDecision;
     const copies = try std.json.parseFromSliceLeaky([]const calendar_copy.Copy, a, approved.columnText(2), .{ .allocate = .alloc_always });
     try validateCopies(scope, disposition, copies);
-    return .{ .audit_id = approved.columnInt64(0), .copies = copies };
+    const archives = try std.json.parseFromSliceLeaky([]const retained.Selection, a, approved.columnText(3), .{ .allocate = .alloc_always });
+    try validateArchives(scope, disposition, archives);
+    return .{ .audit_id = approved.columnInt64(0), .copies = copies, .archives = archives };
 }
 
 pub fn requireRecordedCalendarProof(a: Allocator, tx: Database.Transaction, review: review_store.Review, start_id: i64, owner: i64, proof: calendar_copy.Proof) !void {

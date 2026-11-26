@@ -228,15 +228,20 @@ pub const smtp_sent_match =
     \\    AND d.is_primary=1 AND d.outcome NOT IN ('filed','remote_delivered'))
 ;
 
-const authorized =
+const share_joins =
     \\ FROM mail_team_thread_shares s
-    \\ JOIN users owner ON owner.id=s.owner_id AND owner.enabled=1
+    \\ JOIN users owner ON owner.id=s.owner_id
     \\ JOIN users grantee ON grantee.id=s.grantee_id
     \\ LEFT JOIN mail_team_collection_shares link ON link.share_id=s.id
     \\ LEFT JOIN mail_private_collections c ON c.user_id=s.owner_id AND c.id=link.collection_id
-    \\ WHERE (owner.username=?1 OR (grantee.username=?1 AND grantee.enabled=1))
-    \\ AND (link.share_id IS NULL OR c.id IS NOT NULL)
 ;
+const active_reader =
+    \\ WHERE owner.enabled=1 AND (owner.username=?1 OR (grantee.username=?1 AND grantee.enabled=1))
+;
+const retention_reader =
+    \\ WHERE owner.enabled=0 AND owner.id=?3 AND grantee.username=?1 AND grantee.enabled=1
+;
+const authorized = share_joins ++ active_reader ++ " AND (link.share_id IS NULL OR c.id IS NOT NULL)";
 const share_fields =
     \\SELECT s.id,s.team_id,owner.username,grantee.username,COALESCE(c.name,s.subject),s.downloads,
     \\ COALESCE((SELECT authors FROM mail_team_thread_follow WHERE share_id=s.id),'[]'),
@@ -259,6 +264,7 @@ pub const Grant = struct {
     followingSentReplies: bool = false,
     searchAllowed: bool = true,
     commentsAllowed: bool = true,
+    retained: bool = false,
 };
 const Selection = struct { reference: []const u8, revision: [64]u8, reply: bool = false, outgoing: bool = false };
 const Attachment = struct { index: usize, filename: []const u8, size: usize };
@@ -330,17 +336,29 @@ pub fn available(db: *Database, actor: []const u8) !bool {
 }
 
 fn lookup(a: Allocator, tx: Database.Transaction, actor: []const u8, id: []const u8) !Grant {
-    const stmt = try tx.prepare(share_fields ++ authorized ++ " AND s.id=?2");
+    return lookupFor(a, tx, actor, id, null);
+}
+
+fn lookupFor(a: Allocator, tx: Database.Transaction, actor: []const u8, id: []const u8, source: ?i64) !Grant {
+    const stmt = try tx.prepare(if (source != null)
+        share_fields ++ share_joins ++ retention_reader ++ " AND (link.share_id IS NULL OR c.id IS NOT NULL) AND s.id=?2"
+    else
+        share_fields ++ authorized ++ " AND s.id=?2");
     defer stmt.finalize();
     try bind(stmt, .{ actor, id });
+    if (source) |owner| try stmt.bind(3, owner);
     if (!try stmt.step()) return error.ThreadShareUnavailable;
     return readGrant(a, stmt);
 }
 
 pub fn requireGrant(a: Allocator, db: *Database, actor: []const u8, id: []const u8) !Grant {
+    return requireGrantFor(a, db, actor, id, null);
+}
+
+fn requireGrantFor(a: Allocator, db: *Database, actor: []const u8, id: []const u8, source: ?i64) !Grant {
     var tx = try db.beginTransaction(.read);
     defer tx.deinit();
-    const grant = try lookup(a, tx, actor, id);
+    const grant = try lookupFor(a, tx, actor, id, source);
     try tx.commit();
     return grant;
 }
@@ -566,7 +584,7 @@ fn selected(a: Allocator, tx: Database.Transaction, id: []const u8, ref: ?[]cons
     return out.toOwnedSlice(a);
 }
 
-fn matchesSearch(subject: []const u8, from: []const u8, text: []const u8, needle: []const u8) bool {
+pub fn matchesSearch(subject: []const u8, from: []const u8, text: []const u8, needle: []const u8) bool {
     return needle.len == 0 or ascii.indexOfIgnoreCase(subject, needle) != null or
         ascii.indexOfIgnoreCase(from, needle) != null or ascii.indexOfIgnoreCase(text, needle) != null;
 }
@@ -620,20 +638,24 @@ fn collectionEntries(a: Allocator, tx: Database.Transaction, owner: []const u8, 
     return entries.toOwnedSlice(a);
 }
 
-fn collectionMessage(a: Allocator, db: *Database, owner: []const u8, reference: []const u8, junk: []const u8) !maildir.MessageDetail {
-    const msg = try maildir.getByReference(a, db, owner, reference);
+fn sharedMessage(a: Allocator, db: *Database, owner: []const u8, ref: []const u8, retaining: bool) !maildir.MessageDetail {
+    return if (retaining) maildir.readForRetention(a, db, owner, ref) else maildir.getByReference(a, db, owner, ref);
+}
+
+fn collectionMessage(a: Allocator, db: *Database, owner: []const u8, reference: []const u8, junk: []const u8, retaining: bool) !maildir.MessageDetail {
+    const msg = try sharedMessage(a, db, owner, reference, retaining);
     if (!snapshots.canShare(msg, junk)) return error.ThreadShareUnavailable;
     return msg;
 }
 
-fn collectionPage(a: Allocator, db: *Database, owner: []const u8, entries: []const CollectionEntry, downloads: bool, needle: []const u8, junk: []const u8) !CollectionPage {
+fn collectionPage(a: Allocator, db: *Database, owner: []const u8, entries: []const CollectionEntry, downloads: bool, needle: []const u8, junk: []const u8, retaining: bool) !CollectionPage {
     var messages: std.ArrayList(Message) = .empty;
     const count = @min(entries.len, collection_page_size);
     for (entries[0..count]) |entry| {
         var work = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer work.deinit();
         const scratch = work.allocator();
-        const msg = collectionMessage(scratch, db, owner, entry.reference, junk) catch |err| switch (err) {
+        const msg = collectionMessage(scratch, db, owner, entry.reference, junk, retaining) catch |err| switch (err) {
             error.ThreadShareUnavailable, maildir.MaildirError.MessageNotFound, error.FileNotFound => continue,
             else => return err,
         };
@@ -670,7 +692,7 @@ pub fn previewCollection(a: Allocator, db: *Database, actor: []const u8, id: []c
     return .{
         .collection = result.collection,
         .digest = try collectionDigest(a, result.collection, downloads),
-        .page = try collectionPage(a, db, actor, result.entries, downloads, "", junk),
+        .page = try collectionPage(a, db, actor, result.entries, downloads, "", junk, false),
     };
 }
 
@@ -688,8 +710,8 @@ fn collectionPermission(tx: Database.Transaction) !Statement {
     );
 }
 
-fn loadMessage(a: Allocator, db: *Database, owner: []const u8, item: Selection, junk: []const u8) !maildir.MessageDetail {
-    const msg = try maildir.getByReference(a, db, owner, item.reference);
+fn loadMessage(a: Allocator, db: *Database, owner: []const u8, item: Selection, junk: []const u8, retaining: bool) !maildir.MessageDetail {
+    const msg = try sharedMessage(a, db, owner, item.reference, retaining);
     if (!snapshots.canShare(msg, junk) or !std.mem.eql(u8, &msg.version.?.content_revision, &item.revision))
         return error.ThreadShareUnavailable;
     return msg;
@@ -717,11 +739,15 @@ fn requireSearch(grant: Grant, actor: []const u8, needle: []const u8) !void {
 }
 
 pub fn detail(a: Allocator, db: *Database, actor: []const u8, id: []const u8, needle: []const u8, before: ?i64, junk: []const u8) !Detail {
+    return detailFor(a, db, actor, id, needle, before, junk, null);
+}
+
+fn detailFor(a: Allocator, db: *Database, actor: []const u8, id: []const u8, needle: []const u8, before: ?i64, junk: []const u8, source: ?i64) !Detail {
     if (needle.len > 256 or !std.unicode.utf8ValidateSlice(needle) or (before != null and before.? < 1)) return error.InvalidThreadShare;
     const result = blk: {
         var tx = try db.beginTransaction(.read);
         defer tx.deinit();
-        const grant = try lookup(a, tx, actor, id);
+        const grant = try lookupFor(a, tx, actor, id, source);
         try requireSearch(grant, actor, needle);
         if (grant.collectionId == null and before != null) return error.InvalidThreadShare;
         const items = if (grant.collectionId == null) try selected(a, tx, id, null) else &.{};
@@ -731,10 +757,10 @@ pub fn detail(a: Allocator, db: *Database, actor: []const u8, id: []const u8, ne
         break :blk .{ .grant = grant, .items = items, .entries = entries, .notes = notes };
     };
     if (result.grant.collectionId) |collection| {
-        const page = try collectionPage(a, db, result.grant.owner, result.entries, result.grant.downloads, needle, junk);
+        const page = try collectionPage(a, db, result.grant.owner, result.entries, result.grant.downloads, needle, junk, source != null);
         var tx = try db.beginTransaction(.read);
         defer tx.deinit();
-        const grant = try lookup(a, tx, actor, id);
+        const grant = try lookupFor(a, tx, actor, id, source);
         try requireSearch(grant, actor, needle);
         var kept: usize = 0;
         {
@@ -755,7 +781,7 @@ pub fn detail(a: Allocator, db: *Database, actor: []const u8, id: []const u8, ne
         var work = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer work.deinit();
         const scratch = work.allocator();
-        const msg = loadMessage(scratch, db, result.grant.owner, item, junk) catch |err| switch (err) {
+        const msg = loadMessage(scratch, db, result.grant.owner, item, junk, source != null) catch |err| switch (err) {
             error.ThreadShareUnavailable, maildir.MaildirError.MessageNotFound, error.FileNotFound => continue,
             else => return err,
         };
@@ -770,7 +796,7 @@ pub fn detail(a: Allocator, db: *Database, actor: []const u8, id: []const u8, ne
         if (!matchesSearch(projected.subject, projected.from, projected.text, needle)) continue;
         try messages.append(a, projected);
     }
-    const grant = try requireGrant(a, db, actor, id);
+    const grant = try requireGrantFor(a, db, actor, id, source);
     try requireSearch(grant, actor, needle);
     return .{ .grant = grant, .messages = try messages.toOwnedSlice(a), .comments = result.notes };
 }
@@ -812,7 +838,7 @@ pub fn claimReplyNotices(a: Allocator, db: *Database, actor: []const u8, junk: [
     for (pending) |notice| {
         var work = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer work.deinit();
-        const item = loadMessage(work.allocator(), db, notice.owner, notice.item, junk);
+        const item = loadMessage(work.allocator(), db, notice.owner, notice.item, junk, false);
         const visible = if (item) |_| true else |err| switch (err) {
             error.ThreadShareUnavailable, maildir.MaildirError.MessageNotFound, error.FileNotFound => false,
             else => return err,
@@ -834,10 +860,14 @@ pub fn claimReplyNotices(a: Allocator, db: *Database, actor: []const u8, junk: [
 }
 
 pub fn attachment(a: Allocator, db: *Database, actor: []const u8, id: []const u8, ref: []const u8, index: usize, junk: []const u8) !maildir.AttachmentInfo {
+    return attachmentFor(a, db, actor, id, ref, index, junk, null);
+}
+
+fn attachmentFor(a: Allocator, db: *Database, actor: []const u8, id: []const u8, ref: []const u8, index: usize, junk: []const u8, source: ?i64) !maildir.AttachmentInfo {
     const result = blk: {
         var tx = try db.beginTransaction(.read);
         defer tx.deinit();
-        const grant = try lookup(a, tx, actor, id);
+        const grant = try lookupFor(a, tx, actor, id, source);
         if (!grant.downloads) return error.ThreadShareUnavailable;
         const item = if (grant.collectionId) |collection| item: {
             const membership = try collectionPermission(tx);
@@ -853,16 +883,16 @@ pub fn attachment(a: Allocator, db: *Database, actor: []const u8, id: []const u8
         break :blk .{ .grant = grant, .item = item };
     };
     if (result.item) |item| {
-        const msg = try loadMessage(a, db, result.grant.owner, item, junk);
+        const msg = try loadMessage(a, db, result.grant.owner, item, junk, source != null);
         if (index >= msg.attachments.len or !downloadable(msg.attachments[index])) return error.ThreadShareUnavailable;
-        _ = try requireGrant(a, db, actor, id);
+        _ = try requireGrantFor(a, db, actor, id, source);
         return msg.attachments[index];
     }
-    const msg = try collectionMessage(a, db, result.grant.owner, ref, junk);
+    const msg = try collectionMessage(a, db, result.grant.owner, ref, junk, source != null);
     if (index >= msg.attachments.len or !collectionDownloadable(msg.attachments[index], index)) return error.ThreadShareUnavailable;
     var tx = try db.beginTransaction(.read);
     defer tx.deinit();
-    const grant = try lookup(a, tx, actor, id);
+    const grant = try lookupFor(a, tx, actor, id, source);
     const collection = grant.collectionId orelse return error.ThreadShareUnavailable;
     if (!grant.downloads) return error.ThreadShareUnavailable;
     {
@@ -894,4 +924,96 @@ pub fn addComment(a: Allocator, db: *Database, actor: []const u8, id: []const u8
         if (!try stmt.step()) return error.ThreadShareCommentLimit;
     }
     try tx.commit();
+}
+
+const RetainedPage = struct {
+    before: i64,
+    next: ?i64,
+    messages: []Message,
+};
+
+pub const RetainedPart = struct {
+    reference: []const u8,
+    index: usize,
+    filename: []const u8,
+    content_type: []const u8,
+    encoded: []const u8,
+};
+
+const Retained = struct {
+    grant: Grant,
+    pages: []RetainedPage,
+    comments: []Comment,
+    parts: []RetainedPart,
+};
+
+/// Capture exactly what one approved peer can read. Only the offline erasure
+/// path may call this, under the Maildir writer lock.
+pub fn capture(a: Allocator, db: *Database, peer: []const u8, id: []const u8, source: i64, junk: []const u8, limit: usize) ![]const u8 {
+    var before: ?i64 = null;
+    var pages: std.ArrayList(RetainedPage) = .empty;
+    var parts: std.ArrayList(RetainedPart) = .empty;
+    var grant: Grant = undefined;
+    var discussion: []Comment = &.{};
+    var remaining = limit;
+    while (true) {
+        const page = try detailFor(a, db, peer, id, "", before, junk, source);
+        if (before == null) {
+            grant = page.grant;
+            grant.retained = true;
+            grant.commentsAllowed = false;
+            grant.followingAuthors = &.{};
+            grant.followingSentReplies = false;
+            grant.replyLimitReached = false;
+            discussion = page.comments;
+        }
+        const view = RetainedPage{ .before = before orelse 0, .next = page.next, .messages = page.messages };
+        const bytes = try std.json.Stringify.valueAlloc(a, view, .{});
+        if (bytes.len > remaining) return error.ErasureThreadArchiveTooLarge;
+        remaining -= bytes.len;
+        try pages.append(a, view);
+        for (page.messages) |message| for (message.attachments) |descriptor| {
+            var work = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer work.deinit();
+            const part = try attachmentFor(work.allocator(), db, peer, id, message.reference, descriptor.index, junk, source);
+            if (part.data.len != descriptor.size or !std.mem.eql(u8, part.filename, descriptor.filename))
+                return error.ThreadShareChanged;
+            const encoder = std.base64.standard.Encoder;
+            const size = encoder.calcSize(part.data.len);
+            if (size > remaining) return error.ErasureThreadArchiveTooLarge;
+            remaining -= size;
+            try parts.append(a, .{
+                .reference = message.reference,
+                .index = descriptor.index,
+                .filename = descriptor.filename,
+                .content_type = try a.dupe(u8, part.content_type),
+                .encoded = encoder.encode(try a.alloc(u8, size), part.data),
+            });
+        };
+        const next = page.next orelse break;
+        if (next < 1 or (before != null and next >= before.?)) return error.InvalidThreadShare;
+        before = next;
+    }
+    const encoded = try std.json.Stringify.valueAlloc(a, Retained{
+        .grant = grant,
+        .pages = pages.items,
+        .comments = discussion,
+        .parts = parts.items,
+    }, .{});
+    if (encoded.len > limit) return error.ErasureThreadArchiveTooLarge;
+    return encoded;
+}
+
+pub fn retainedDetail(a: Allocator, grant: Grant, notes: []const u8, view: []const u8, actor: []const u8, needle: []const u8) !Detail {
+    if (needle.len > 256 or !std.unicode.utf8ValidateSlice(needle)) return error.InvalidThreadShare;
+    try requireSearch(grant, actor, needle);
+    const page = try std.json.parseFromSliceLeaky(RetainedPage, a, view, .{ .allocate = .alloc_always });
+    const discussion = try std.json.parseFromSliceLeaky([]Comment, a, notes, .{ .allocate = .alloc_always });
+    var kept: usize = 0;
+    for (page.messages) |msg| {
+        if (!matchesSearch(msg.subject, msg.from, msg.text, needle)) continue;
+        page.messages[kept] = msg;
+        kept += 1;
+    }
+    return .{ .grant = grant, .messages = page.messages[0..kept], .comments = discussion, .next = page.next };
 }

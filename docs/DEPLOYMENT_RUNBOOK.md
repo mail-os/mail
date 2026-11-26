@@ -574,6 +574,34 @@ Maildir and DAV removals check the approval for their own store before deleting 
 the operator's decision and leaves grants, discussion, and delivery records
 in place for their own disposition.
 
+For a Maildir case that requires a retained copy, use
+`release_source_with_thread_archives` and a nonempty
+`retained_thread_archives` list in the decision. Each entry includes
+`source_share_id` and `peer_user_id` from the current Maildir scope report.
+Only a peer with the original grant can receive a copy.
+
+Stop the Maildir writers and use the running service's working directory
+and configuration, including its Junk folder setting. Run the archive
+command and preserve its receipt before removing the source.
+
+```bash
+umask 077
+/opt/mail/mail-server user:local hosted-erasure-retain-threads \
+  /private/case/erasure-review.json START_AUDIT_ID > /private/case/thread-archive-receipt.json
+```
+
+The command saves the shared view, followed reply excerpts, discussion,
+and permitted attachment bytes in the recipient's own record. It returns
+the same receipt on a retry for the same approval. Maildir removal verifies
+each receipt checksum before deleting the source. After a successful removal,
+the recipient can open each read-only copy from Shared Mail. The copy survives
+deletion of the original grant. Recheck access as the recipient.
+
+The command fails before committing any copy if the JSON and encoded
+attachments exceed 32 MiB per approval or 64 MiB of retained archives per
+recipient. Resolve those cases through the approved retention process before
+removing the source.
+
 For a DAV case that requires a retained copy, use the recipient's shared
 CalDAV connection to copy the visible resources into a dedicated calendar
 they own. Keep the source timezone and resource bytes. Use

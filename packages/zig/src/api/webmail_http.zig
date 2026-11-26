@@ -71,6 +71,7 @@ const calendar_tools = @import("../storage/calendar_tools.zig");
 const snapshots = @import("webmail_snapshots.zig");
 const assistant = @import("webmail_assistant.zig");
 const team_threads = @import("webmail_team_threads.zig");
+const retained_threads = @import("../storage/retained_thread_store.zig");
 const thread_shares_path = "/webmail/api/thread-shares";
 const reply_batches = @import("webmail_batch_replies.zig");
 const file_links = @import("webmail_file_links.zig");
@@ -2254,7 +2255,7 @@ fn handleClientConfig(server: *WebmailHttpServer, conn: *webmail_tls.Stream, are
     var limits = try server.service.limits(sess.username);
     limits.calendarAvailable = server.dav_store != null;
     limits.sharedInboxesAvailable = try shared_inbox.available(server.db, sess.username);
-    limits.teamThreadsAvailable = try team_threads.available(server.db, sess.username);
+    limits.teamThreadsAvailable = try team_threads.available(server.db, sess.username) or try retained_threads.available(server.db, sess.username);
     limits.maxFileLinkBytes = try file_links.uploadLimit(server.db, sess.username);
     if (store.get(arena, server.db, sess.username, "preferences", "settings")) |row| {
         const parsed = try std.json.parseFromSlice(struct { undoSendSeconds: u32 }, arena, row.payload, .{});
@@ -2504,7 +2505,7 @@ fn handleThreadShares(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: 
     const preview = std.mem.eql(u8, req.path, thread_shares_path ++ "/preview");
     if (std.mem.eql(u8, req.path, thread_shares_path) or preview) {
         if (reading and !preview) {
-            const grants = try team_threads.list(a, server.db, actor);
+            const grants = try retained_threads.appendGrants(a, server.db, actor, try team_threads.list(a, server.db, actor));
             return sendJson(conn, a, 200, try service_mod.json(a, .{ .grants = grants }), null);
         }
         if (!posting or req.body.len > 4096) return threadShareError(conn, a, error.InvalidThreadShare);
@@ -2563,8 +2564,11 @@ fn handleThreadShares(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: 
             const index = std.fmt.parseInt(usize, parts.next() orelse "", 10) catch
                 return threadShareError(conn, a, error.ThreadShareUnavailable);
             if (parts.next() != null or !message_refs.valid(ref)) return threadShareError(conn, a, error.ThreadShareUnavailable);
-            const part = team_threads.attachment(a, server.db, actor, id, ref, index, junk) catch |err|
-                return threadShareError(conn, a, err);
+            const part = team_threads.attachment(a, server.db, actor, id, ref, index, junk) catch |err| switch (err) {
+                error.ThreadShareUnavailable => retained_threads.attachment(a, server.db, actor, id, ref, index) catch |cause|
+                    return threadShareError(conn, a, cause),
+                else => return threadShareError(conn, a, err),
+            };
             return sendAttachment(conn, a, part);
         }
         return threadShareError(conn, a, error.ThreadShareUnavailable);
@@ -2572,8 +2576,12 @@ fn handleThreadShares(server: *WebmailHttpServer, conn: *webmail_tls.Stream, a: 
     if (reading) {
         const before = if (req.queryParam(a, "before")) |cursor| std.fmt.parseInt(i64, cursor, 10) catch
             return threadShareError(conn, a, error.InvalidThreadShare) else null;
-        const result = team_threads.detail(a, server.db, actor, id, req.queryParam(a, "q") orelse "", before, junk) catch |err|
-            return threadShareError(conn, a, err);
+        const needle = req.queryParam(a, "q") orelse "";
+        const result = team_threads.detail(a, server.db, actor, id, needle, before, junk) catch |err| switch (err) {
+            error.ThreadShareUnavailable => retained_threads.detail(a, server.db, actor, id, needle, before) catch |cause|
+                return threadShareError(conn, a, cause),
+            else => return threadShareError(conn, a, err),
+        };
         return sendJson(conn, a, 200, try service_mod.json(a, result), null);
     }
     if (deleting) {

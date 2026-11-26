@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""Test recipient-owned shared Mail retention through the native TLS API."""
+
+import argparse
+from contextlib import closing
+from email.message import EmailMessage
+import json
+from pathlib import Path
+import runpy
+import sqlite3
+from tempfile import TemporaryDirectory
+
+scripts = Path(__file__).resolve().parent
+dav = runpy.run_path(str(scripts / "test-hosted-erasure-dav.py"))
+portable = runpy.run_path(str(scripts / "test-mailbox-export.py"))
+Fixture, cli, prepare, success = (dav[name] for name in ("Fixture", "cli", "prepare", "success"))
+command = portable["command"]
+PUBLIC_BYTES = b"Approved bytes\x00\xff\r\n"
+PRIVATE_BYTES = b"Never retain this attachment"
+
+
+def verify(test):
+    db_path = test.directory / "smtp.db"
+    review, decision = (test.directory / name for name in ("review.json", "decision.json"))
+    team = "retained-mail-fixture"
+
+    def api(session, path, data=None, *, method=None, status=200):
+        actual, value = test.api(session, path, data, method)
+        assert actual == status, (path, actual, value)
+        return value
+
+    def download(session, path, status=200):
+        actual, headers, raw = test.http(test.webmail + "/webmail/api/" + path, headers=session,
+                                         context=test.tls_context)
+        assert actual == status, (path, actual, raw)
+        if status == 200:
+            assert headers["Cache-Control"] == "no-store"
+            assert headers["Content-Disposition"].startswith("attachment")
+        return raw
+
+    def step(name, *args):
+        return cli(test, name, str(review), str(start), *map(str, args))
+
+    def refuse(result, cause=None):
+        assert result.returncode and not result.stdout and (cause is None or cause in result.stderr), result
+
+    def state(db):
+        return db.execute("SELECT count(*) FROM mail_retained_thread_archives").fetchone()[0]
+
+    def approve(plan, archive_items):
+        decision.write_text(json.dumps({
+            "version": 1, "scope_sha256": plan["scope_sha256"],
+            "disposition": "release_source_with_thread_archives",
+            "approval_reference": "fixture-archive-approval", "retained_thread_archives": archive_items,
+        }))
+        decision.chmod(0o600)
+        return step("hosted-erasure-shared-release", "maildir", decision)
+
+    with test.daemon():
+        owner, peer, outsider = (test.provision(name, daily=100) for name in (
+            "retained-source", "retained-peer", "retained-outsider",
+        ))
+        command(test, "team", "create", team, "Retention fixture", owner)
+        command(test, "team", "member", team, peer, "member")
+        command(test, "team", "member", team, outsider, "member")
+        own, other, foreign = (test.login(mailbox) for mailbox in (owner, peer, outsider))
+
+        def send(subject, body, *, reply=False, attachments=False):
+            msg = EmailMessage()
+            msg["From"], msg["To"], msg["Subject"] = peer, owner, subject
+            if subject == "Approved source":
+                msg["Message-ID"] = "<approved-source@hosted.example.test>"
+            if reply:
+                msg["In-Reply-To"] = "<approved-source@hosted.example.test>"
+                msg["References"] = "<approved-source@hosted.example.test>"
+            msg.set_content(body)
+            if attachments:
+                msg.add_attachment(PUBLIC_BYTES, maintype="application", subtype="octet-stream", filename="allowed.bin")
+                msg.add_attachment(PRIVATE_BYTES, maintype="application", subtype="octet-stream", filename="blocked.eml")
+            with test.smtp(peer) as smtp:
+                assert smtp.send_message(msg) == {}
+
+        def share(selection):
+            preview = api(own, "thread-shares/preview", selection)
+            grant = api(own, "thread-shares", {
+                **selection, "team": team, "grantee": peer, "digest": preview["digest"],
+            }, status=201)
+            return grant["id"]
+
+        send("Approved source", "Approved original body", attachments=True)
+        send("Private sibling", "Mailbox private sibling text")
+        for page in range(20):
+            send(f"Collection member {page:02}", f"Approved collection body {page:02}")
+        messages = {row["subject"]: row["reference"] for row in api(own, "messages?conversations=false&per_page=100")["items"]}
+        original, unrelated = (messages.pop(name) for name in ("Approved source", "Private sibling"))
+        thread = share({"references": [original], "downloads": True, "followReplies": True})
+        hidden = share({"references": [unrelated], "downloads": False})
+        thread_path, hidden_path = (f"thread-shares/{grant}" for grant in (thread, hidden))
+        send("Verified reply", "Verified reply excerpt", reply=True, attachments=True)
+        discussion = "Approved teammate discussion"
+        api(other, thread_path + "/comments", {"text": discussion}, status=201)
+        before_thread = api(other, thread_path)
+        assert [(row["subject"], row["verifiedReply"]) for row in before_thread["messages"]] == [
+            ("Approved source", False), ("Verified reply", True),
+        ], before_thread["messages"]
+        assert before_thread["messages"][1]["attachments"] == []
+        allowed, = before_thread["messages"][0]["attachments"]
+        allowed_path = f"{thread_path}/attachments/{original}/{allowed['index']}"
+        assert download(other, allowed_path) == PUBLIC_BYTES
+        download(other, f"{thread_path}/attachments/{original}/1", status=404)
+
+        collection, = api(own, "private/collections", {"action": "create", "name": "Approved collection"})["items"]
+        for reference in [original, *messages.values()]:
+            message = api(own, f"messages/ref/{reference}")
+            api({**own, "If-Match": message["revision"]}, "private/message", {
+                "reference": reference, "action": "collection", "collection": collection["id"], "included": True,
+            })
+        collection_share = share({"collectionId": collection["id"], "downloads": False})
+        collection_path = f"thread-shares/{collection_share}"
+        # Use the native permission API to preserve the original search restriction.
+        api(own, f"teams/{team}/grants", {
+            "source": owner, "grantee": peer, "scope": "search", "resource": collection_share, "allowed": False,
+        }, method="PUT")
+        before_collection = api(other, collection_path)
+        assert before_collection["next"] and len(before_collection["messages"]) == 20
+        last_page = api(other, f"{collection_path}?before={before_collection['next']}")
+        assert len(last_page["messages"]) == 1 and last_page["next"] is None
+        with closing(sqlite3.connect(db_path)) as db:
+            peer_id, outsider_id = (
+                db.execute("SELECT id FROM users WHERE username=?", (mailbox,)).fetchone()[0]
+                for mailbox in (peer, outsider)
+            )
+        _, _, start = prepare(test, "retained-source", review)
+        plan = success(step("hosted-erasure-shared-release", "maildir"))
+        selections = [{"source_share_id": share_id, "peer_user_id": peer_id}
+                      for share_id in (thread, collection_share)]
+        refuse(approve(plan, [{**selections[0], "peer_user_id": outsider_id}]),
+               "ErasureThreadArchiveNotAuthorized")
+        refuse(approve(plan, [selections[0], selections[0]]), "InvalidErasureSharedDecision")
+        approved = success(approve(plan, selections))
+        refuse(step("hosted-erasure-retain-threads"), "MaildirWriterActive")
+        api(other, thread_path, status=404)
+
+    maildir = test.directory / "mail" / owner
+    refuse(step("hosted-erasure-maildir"), "ErasureThreadArchivePending")
+    assert maildir.is_dir()
+    with closing(sqlite3.connect(db_path)) as db:
+        with db:
+            db.execute(f"""CREATE TRIGGER abort_second_archive BEFORE INSERT ON mail_retained_thread_archives
+                           WHEN NEW.share_id='{collection_share}'
+                           BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END""")
+        refuse(step("hosted-erasure-retain-threads"))
+        assert state(db) == 0 and maildir.is_dir()
+        with db:
+            db.execute("DROP TRIGGER abort_second_archive")
+            db.execute("UPDATE users SET enabled=0 WHERE id=?", (peer_id,))
+        refuse(step("hosted-erasure-retain-threads"), "ErasureThreadArchivePeerUnavailable")
+        assert state(db) == 0
+        with db:
+            db.execute("UPDATE users SET enabled=1 WHERE id=?", (peer_id,))
+            db.execute("UPDATE mail_team_thread_comments SET text='Changed since approval' WHERE share_id=?", (thread,))
+        refuse(step("hosted-erasure-retain-threads"), "ErasureSharedReleaseRequired")
+        with db:
+            db.execute("UPDATE mail_team_thread_comments SET text=? WHERE share_id=?", (discussion, thread))
+
+        receipt = success(step("hosted-erasure-retain-threads"))
+        assert receipt["approval_audit_id"] == approved["audit_id"]
+        assert {entry["share_id"] for entry in receipt["archives"]} == {thread, collection_share}
+        assert state(db) == 2 and maildir.is_dir()
+        assert success(step("hosted-erasure-retain-threads")) == receipt
+        docs = db.execute("SELECT share_id,document FROM mail_retained_thread_archives").fetchall()
+        assert all("Mailbox private sibling text" not in value and "blocked.eml" not in value for _, value in docs)
+        # The native command verifies each stored payload against the audit.
+        document, = [value for key, value in docs if key == thread]
+        with db:
+            db.execute("UPDATE mail_retained_thread_archives SET document=json_set(document,'$.grant.subject','altered') WHERE share_id=?", (thread,))
+        refuse(step("hosted-erasure-maildir"), "ErasureThreadArchiveInvalid")
+        assert maildir.is_dir()
+        with db:
+            db.execute("UPDATE mail_retained_thread_archives SET document=? WHERE share_id=?", (document, thread))
+
+    with test.daemon():
+        api(other, thread_path, status=404)
+        assert api(other, "thread-shares") == {"grants": []}
+
+    erased = success(step("hosted-erasure-maildir"))
+    assert not maildir.exists() and success(step("hosted-erasure-maildir")) == erased
+    assert success(step("hosted-erasure-retain-threads")) == receipt
+    with closing(sqlite3.connect(db_path)) as db:
+        db.execute("PRAGMA foreign_keys=ON")
+        with db:
+            # Emulate downstream removal of live grants and all discussion.
+            db.execute("DELETE FROM mail_team_members WHERE team_id=? AND user_id=?", (team, peer_id))
+        assert db.execute("SELECT count(*) FROM mail_team_thread_shares").fetchone()[0] == 0
+
+    with test.daemon():
+        other, foreign = (test.login(mailbox) for mailbox in (peer, outsider))
+        grants = api(other, "thread-shares")["grants"]
+        assert {grant["id"] for grant in grants} == {thread, collection_share}
+        assert all(grant["retained"] and not grant["commentsAllowed"] for grant in grants)
+        after = api(other, thread_path)
+        for key in ("messages", "comments"):
+            assert after[key] == before_thread[key]
+        assert after["comments"][0]["text"] == discussion
+        assert len(api(other, thread_path + "?q=verified")["messages"]) == 1
+        api(other, thread_path + "/comments", {"text": "No new comments"}, status=404)
+        api(other, thread_path, method="DELETE", status=404)
+        assert download(other, allowed_path) == PUBLIC_BYTES
+        download(other, f"{thread_path}/attachments/{original}/1", status=404)
+        download(other, f"{collection_path}/attachments/{original}/0", status=404)
+        assert api(other, collection_path)["messages"] == before_collection["messages"]
+        assert api(other, f"{collection_path}?before={before_collection['next']}")["messages"] == last_page["messages"]
+        api(other, collection_path + "?q=collection", status=403)
+        api(other, hidden_path, status=404)
+        api(foreign, thread_path, status=404)
+        download(foreign, allowed_path, status=404)
+        assert api(foreign, "thread-shares") == {"grants": []}
+        api(own, thread_path, status=401)
+        _, _, start = prepare(test, "retained-peer", review)
+
+    success(step("hosted-erasure-maildir"))
+    private = success(step("hosted-erasure-sqlite"))
+    assert success(step("hosted-erasure-sqlite")) == private
+    with closing(sqlite3.connect(db_path)) as db:
+        assert state(db) == 0
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", type=Path)
+    args = parser.parse_args()
+    with TemporaryDirectory(prefix="mail-retained-threads-") as directory:
+        verify(Fixture(args.binary.resolve(), Path(directory), staging=True))
+    print("Verified authorized peer-owned Mail archives, pagination, reply and file scope, rollback, and retry.")

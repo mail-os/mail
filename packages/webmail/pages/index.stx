@@ -1391,7 +1391,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       <p :if="!teamThreadBusy && !teamThreadGrants.length && !teamThreadError" class="wm-snapshot-muted">You have no shared mail.</p>
       <ul :if="teamThreadGrants.length" class="wm-snapshot-links" aria-label="Shared conversations and collections">
         <li :for="grant in teamThreadGrants" :key="grant.id">
-          <div><strong :text="grant.subject || '(No subject)'"></strong><p class="wm-snapshot-muted" :text="(grant.collectionId ? 'Collection · ' : '') + 'From ' + grant.owner + ' · Shared with ' + grant.grantee"></p></div>
+          <div><strong :text="grant.subject || '(No subject)'"></strong><p class="wm-snapshot-muted" :text="(grant.retained ? 'Retained copy · ' : '') + (grant.collectionId ? 'Collection · ' : '') + 'From ' + grant.owner + ' · Shared with ' + grant.grantee"></p></div>
           <button type="button" class="wm-action" :disabled="teamThreadBusy" @click="openTeamThread(grant)" :aria-label="'Open ' + (grant.subject || 'conversation')">Open</button>
         </li>
       </ul>
@@ -1402,7 +1402,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
       <button type="button" class="wm-action" :disabled="teamThreadBusy" @click="listTeamThreads()">Back to shared mail</button>
       <div :if="teamThreadDetail" class="wm-snapshot-workflow">
         <h3 :text="teamThreadDetail.grant.subject || '(No subject)'"></h3>
-        <p class="wm-snapshot-muted" :text="'From ' + teamThreadDetail.grant.owner + ' · Shared with ' + teamThreadDetail.grant.grantee"></p>
+        <p class="wm-snapshot-muted" :text="(teamThreadDetail.grant.retained ? 'Retained copy · ' : '') + 'From ' + teamThreadDetail.grant.owner + ' · Shared with ' + teamThreadDetail.grant.grantee"></p>
         <p :if="teamThreadDetail.grant.followingAuthors.length" class="wm-snapshot-muted" :text="teamThreadDetail.grant.replyLimitReached ? 'This conversation reached its 40-reply limit.' : 'Following verified replies from ' + teamThreadDetail.grant.followingAuthors.join(', ') + (teamThreadDetail.grant.followingSentReplies ? ' and the owner’s webmail replies to them.' : '.')"></p>
         <div :if="teamThreadDetail.grant.owner === user?.username" class="wm-team-thread-permissions" role="group" aria-label="Teammate permissions">
           <label class="wm-team-thread-option"><input type="checkbox" :checked="teamThreadDetail.grant.searchAllowed" :disabled="teamThreadBusy" @change="setTeamThreadPermission('search', $event.target.checked)">Allow teammate to search</label>

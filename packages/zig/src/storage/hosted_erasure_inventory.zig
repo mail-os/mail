@@ -92,6 +92,11 @@ pub fn observeSqlite(a: Allocator, tx: Database.Transaction, mailbox: []const u8
     inline for (by_username) |table| try tables.append(a, try count(tx, table, "username=?1", .mailbox, names));
     inline for (scopes) |scope| try tables.append(a, try count(tx, scope.table, scope.predicate, scope.key, names));
 
+    // Older reviews predate the archive store. A new nonempty archive owned
+    // by this mailbox must still appear in the inventory and require review.
+    const archives = try count(tx, "mail_retained_thread_archives", "user_id=?1", .user_id, names);
+    if ((archives.matching_rows orelse 0) > 0) try tables.append(a, archives);
+
     const rows = try tx.prepare(
         "SELECT name FROM pragma_table_list WHERE schema='main' AND type IN ('table','virtual') AND substr(name,1,7)<>'sqlite_' ORDER BY name",
     );
@@ -106,7 +111,9 @@ pub fn observeSqlite(a: Allocator, tx: Database.Transaction, mailbox: []const u8
             std.mem.eql(u8, name, "hosted_erasure_typesense_steps") or
             std.mem.eql(u8, name, "hosted_erasure_dav_steps") or
             std.mem.eql(u8, name, "hosted_erasure_sqlite_steps") or
-            std.mem.eql(u8, name, "hosted_erasure_link_steps")) continue;
+            std.mem.eql(u8, name, "hosted_erasure_link_steps") or
+            std.mem.eql(u8, name, "hosted_erasure_thread_archive_steps") or
+            std.mem.eql(u8, name, "mail_retained_thread_archives")) continue;
         for (tables.items) |entry| {
             if (std.mem.eql(u8, entry.table, name)) break;
         } else try remaining.append(a, try a.dupe(u8, name));

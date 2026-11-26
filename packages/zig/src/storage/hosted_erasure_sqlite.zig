@@ -43,6 +43,7 @@ const scopes = [_]Scope{
         " WHERE e.session_id=webmail_sessions.session_id AND e.user_id<>?2)" },
     .{ .table = "mail_snapshot_links" },
     .{ .table = "mail_file_links" },
+    .{ .table = "mail_retained_thread_archives", .optional = true },
     .{ .table = "mail_attention" },
     .{ .table = "mail_attention_replies" },
     .{ .table = "mail_notification_settings" },

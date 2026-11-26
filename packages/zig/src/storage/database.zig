@@ -1228,6 +1228,7 @@ pub const Database = struct {
         try self.exec(team_store.schema);
         try self.exec(shared_inbox.schema);
         try self.exec(team_threads.schema);
+        try self.exec(@import("retained_thread_store.zig").schema);
         var tx = try self.beginTransaction(.write);
         defer tx.deinit();
         const has_outgoing = blk: {

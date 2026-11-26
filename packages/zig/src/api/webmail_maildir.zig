@@ -1026,10 +1026,10 @@ pub const ReferencedFile = struct {
 /// Read a tracked file while the caller holds the mailbox lock. This avoids
 /// assigning IMAP UIDs when only the saved content and location are needed.
 pub fn resolveReferenceFileLocked(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8) !ReferencedFile {
-    return resolveReferenceFile(a, db, user, id, null);
+    return resolveReferenceFile(a, db, user, id, null, true);
 }
 
-fn resolveReferenceFile(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8, history: ?*HistoryFolder) !ReferencedFile {
+fn resolveReferenceFile(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8, history: ?*HistoryFolder, repair: bool) !ReferencedFile {
     if (!message_refs.valid(id)) return MaildirError.MessageNotFound;
     const entry = (try message_refs.lookup(a, db, user, id)) orelse return MaildirError.MessageNotFound;
     var at = entry.location;
@@ -1043,6 +1043,7 @@ fn resolveReferenceFile(a: std.mem.Allocator, db: *database.Database, user: []co
     const recovering = current == null or !try matchesStamp(a, current.?, entry.stamp);
     if (recovering) {
         const pending = entry.pending orelse return MaildirError.MessageNotFound;
+        if (!repair) return error.ErasureReferenceNeedsRepair;
         at = pending.location;
         current = try fileAt(a, user, at);
     }
@@ -1089,7 +1090,7 @@ pub fn indexCalendarHistory(db: *database.Database, scope: ?database.Database.Ca
         db.lockMailboxes();
         defer db.unlockMailboxes();
         const source = (try db.nextCalendarHistory(a, scope)) orelse return true;
-        const file = resolveReferenceFile(a, db, source.username, source.reference, &history) catch |err| switch (err) {
+        const file = resolveReferenceFile(a, db, source.username, source.reference, &history, true) catch |err| switch (err) {
             error.MessageNotFound, error.FileNotFound => {
                 try db.finishCalendarHistory(source, &.{});
                 continue;
@@ -1122,6 +1123,16 @@ pub fn getByReference(a: std.mem.Allocator, db: *database.Database, user: []cons
     db.unlockMailboxes();
     const file = try entry;
     return parseDetail(a, file.locator.folder, file.locator.uid, file.name, file.raw, file.version);
+}
+
+/// Read the same tracked bytes offline without assigning UIDs or recovering a
+/// pending rename. The operator must hold the canonical Maildir writer lock.
+pub fn readForRetention(a: std.mem.Allocator, db: *database.Database, user: []const u8, id: []const u8) !MessageDetail {
+    const entry = try resolveReferenceFile(a, db, user, id, null, false);
+    const locator: MessageLocator = .{ .folder = entry.folder, .uid = 0 };
+    const digest = message_refs.digest(entry.raw);
+    const version = try makeVersion(a, id, locator, entry.file.name, &digest);
+    return parseDetail(a, entry.folder, locator.uid, entry.file.name, entry.raw, version);
 }
 
 /// Resolve the user's own message and read only the header needed to seed

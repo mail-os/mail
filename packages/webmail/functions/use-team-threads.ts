@@ -9,6 +9,7 @@ interface Grant {
   grantee: string
   searchAllowed: boolean
   commentsAllowed: boolean
+  retained?: boolean
   subject: string
   downloads: boolean
   followingAuthors: string[]
