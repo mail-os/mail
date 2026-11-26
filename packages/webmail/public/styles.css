@@ -1311,9 +1311,10 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-writing-controls { grid-template-columns: max-content minmax(0, 220px) max-content; }
 .wm-writing-control select { min-width: 0; width: 100%; }
 @media (max-width: 540px) { .wm-writing-grid { grid-template-columns: minmax(0, 1fr); } .wm-writing-insert { margin-inline: 14px; } }
-@media (max-width: 360px) {
+@media (max-width: 440px) {
   .wm-writing-controls { grid-template-columns: minmax(0, 1fr) max-content; }
   .wm-writing-control label { grid-column: 1 / -1; }
+  .wm-writing-action-kind { display: none; }
 }
 .wm-forwarding h2 { display: flex; align-items: center; gap: 6px; }
 .wm-forwarding h2 .mail-icon { color: var(--accent); }

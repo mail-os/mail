@@ -3519,7 +3519,7 @@ async function writingControlJourney(page) {
     for (const select of [snippetChoice, signatureChoice]) {
       await verifySelect(select, height)
       await verifySelectedOptionFits(select)
-      if (width <= 360) {
+      if (width <= 440) {
         const field = await select.boundingBox()
         const label = await tools.locator(`label[for="${await select.getAttribute('id')}"]`).boundingBox()
         assert(label.y + label.height <= field.y && Math.abs(label.x - field.x) < .5,
