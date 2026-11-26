@@ -33,6 +33,10 @@ jobs:
     - name: Build
       run: zig build -Doptimize=ReleaseSafe
 
+    - name: Verify native SMTP readiness and exposition
+      timeout-minutes: 2
+      run: python3 ../../scripts/test-smtp-monitoring.py zig-out/bin/mail
+
     - name: Install browser engines
       if: runner.os == 'Linux'
       working-directory: .
@@ -340,9 +344,16 @@ jobs:
       with:
         context: ./packages/zig
         push: false
+        load: true
         tags: mail:test
         cache-from: type=gha
         cache-to: type=gha,mode=max
+
+    - name: Verify Compose monitoring follows the active Mail daemon
+      timeout-minutes: 5
+      env:
+        MAIL_IMAGE: mail:test
+      run: python3 scripts/test-compose-monitoring.py
 
   lint:
     name: Lint

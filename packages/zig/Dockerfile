@@ -53,6 +53,9 @@ COPY --from=builder /build/zig-out/bin/mail /usr/local/bin/
 # Copy TLS certificates directory (if needed)
 RUN mkdir -p /etc/smtp/tls
 
+# Keep the relative Maildir under the persistent data volume.
+WORKDIR /var/mail
+
 # Switch to non-root user
 USER smtp
 

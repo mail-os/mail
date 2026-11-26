@@ -19,6 +19,8 @@ pub const Server = struct {
     running: bool,
     logger: *logger.Logger,
     active_connections: std.atomic.Value(u32),
+    connections_admitted: std.atomic.Value(u64) = .init(0),
+    ready: std.atomic.Value(bool) = .init(false),
     rate_limiter: security.RateLimiter,
     tls_context: ?tls_mod.TlsContext,
     db: ?*database.Database,
@@ -31,8 +33,10 @@ pub const Server = struct {
         while (true) {
             const current = self.active_connections.load(.monotonic);
             if (current >= self.config.max_connections) return false;
-            if (self.active_connections.cmpxchgWeak(current, current + 1, .monotonic, .monotonic) == null)
+            if (self.active_connections.cmpxchgWeak(current, current + 1, .monotonic, .monotonic) == null) {
+                _ = self.connections_admitted.fetchAdd(1, .monotonic);
                 return true;
+            }
         }
     }
 
@@ -120,6 +124,8 @@ pub const Server = struct {
 
         self.running = true;
 
+        self.ready.store(true, .release);
+        defer self.ready.store(false, .release);
         self.logger.info("SMTP Server listening on {s}:{d}", .{ self.config.host, self.config.port });
 
         while (self.running and !shutdown_flag.load(.acquire)) {
@@ -398,6 +404,7 @@ pub const Server = struct {
 test "security: every SMTP listener shares an atomic connection budget" {
     var server: Server = undefined;
     server.active_connections = std.atomic.Value(u32).init(0);
+    server.connections_admitted = .init(0);
     server.config.max_connections = 1;
     try std.testing.expect(server.tryReserveConnection());
     try std.testing.expect(!server.tryReserveConnection());
