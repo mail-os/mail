@@ -20,6 +20,16 @@ test('stx keeps dollar signs in minified runtime import aliases', () => {
   expect(transformed.stxImports).toEqual(['derived', 'state'])
 })
 
+test('the shared snapshot icon fits its data-only image policy', async () => {
+  await buildWebmail()
+  const snapshot = await Bun.file(join(import.meta.dir, '../zig/src/api/webmail_dist/snapshot.html')).text()
+  const icon = snapshot.match(/<link rel="icon" href="data:image\/png;base64,([^"]+)"/)?.[1]
+  expect(snapshot).toContain("img-src data:;")
+  expect(icon).toBeDefined()
+  const expected = await Bun.file(join(import.meta.dir, 'public/mail-icon-192.png')).bytes()
+  expect(new Uint8Array(Buffer.from(icon!, 'base64'))).toEqual(expected)
+})
+
 test('deployments fingerprint styles so existing browsers fetch updated controls', async () => {
   const first = new TextEncoder().encode('.wm-folders { display: none; }')
   const second = new TextEncoder().encode('.wm-folders { display: grid; }')
@@ -29,6 +39,14 @@ test('deployments fingerprint styles so existing browsers fetch updated controls
   for (const page of webmailPages) {
     const html = await Bun.file(join(import.meta.dir, `../zig/src/api/webmail_dist/${page}.html`)).text()
     expect(html).toMatch(/href="\/styles\.css\?v=[0-9a-f]{16}"/)
+    const icons = html.match(/<link\b[^>]*\brel="icon"[^>]*>/g)
+    expect(icons).toHaveLength(1)
+    if (page === 'file-link')
+      expect(icons?.[0]).toBe('<link rel="icon" href="data:,">')
+    else if (page === 'snapshot')
+      expect(icons?.[0]).toMatch(/^<link rel="icon" href="data:image\/png;base64,/)
+    else
+      expect(icons?.[0]).toBe('<link rel="icon" href="/mail-icon-192.png" sizes="192x192" type="image/png">')
     expect(html.includes('rel="manifest" href="/mail.webmanifest"')).toBe(webmailAppPages.has(page))
     expect(html.includes('rel="apple-touch-icon" href="/mail-icon-maskable.png"')).toBe(webmailAppPages.has(page))
   }
