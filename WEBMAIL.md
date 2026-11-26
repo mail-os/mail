@@ -681,6 +681,9 @@ Run the export as a local Mail operator with the same database paths and working
 directory as the server. The command accepts the canonical mailbox username and
 works while that mailbox's sign-in is disabled.
 
+For a hosted exit handled through a reviewed support case, use the
+[audited hosted export command](docs/DEPLOYMENT_RUNBOOK.md#prepare-a-private-archive-for-a-reviewed-hosted-exit).
+
 ```sh
 mail user:local export person@example.com /private/path/person.tar
 tar -xf /private/path/person.tar -C /private/path/extracted

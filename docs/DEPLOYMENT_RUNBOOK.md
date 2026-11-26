@@ -296,6 +296,56 @@ reconcile all evidence before an erasure operation. The supported actions are
 portable export and managed retirement while [#188](https://github.com/mail-os/mail/issues/188)
 tracks permanent erasure.
 
+### Prepare a private archive for a reviewed hosted exit
+
+Confirm the case and the recipient through the approved support channel. Run
+preflight against the assignment after mail access has ended. Confirm that
+its actor, native user ID, initial operation, and current revision match the
+case. Use the approved handoff expiration as Unix seconds. The recipient
+verification reference points to the support evidence without copying it into
+Mail. Keep the reviewed JSON, archive, and receipt in a private directory.
+
+```json
+{
+  "version": 1,
+  "mailbox": "alice@customer.example.com",
+  "assignment_actor": "mailbox-assignment-actor",
+  "identity": {
+    "native_user_id": 42,
+    "initial_provisioning_operation": "initial-operation-id",
+    "provisioning_revision": 3
+  },
+  "case_reference": "exit-case-19",
+  "recipient_verification_reference": "support-verification-42",
+  "recipient": "verified-recipient@example.net",
+  "expires_at": 1800000000
+}
+```
+
+Use the case values in place of the examples. Run the command against the same
+Maildir, SQLite, and DAV data used for preflight. Use a quiesced set of stores
+when the case requires a point-in-time archive across all three.
+
+```bash
+umask 077
+/opt/mail/mail-server user:local hosted-erasure-export \
+  /private/exit-case-19/review.json /private/exit-case-19/mailbox.tar \
+  > /private/exit-case-19/receipt.json
+```
+
+The command checks the assignment and access before building the archive and
+again before writing `hosted.erasure.export.prepared`. That audit entry preserves
+the effective operator, stable assignment, case, verified recipient as supplied
+by the operator, expiry, byte count, and SHA-256 of the archive. It records
+preparation. The command links the private file only after the audit commits.
+A successful receipt reports `private_archive_published` and the audit ID.
+
+Use the approved delivery channel to enforce the expiry and record delivery
+separately. If the command fails or is interrupted, keep the file private and
+review its digest and audit entry before retrying with a new path. The command
+preserves an existing destination. Keep the source mailbox and backup evidence
+available for the retention and erasure review in [#188](https://github.com/mail-os/mail/issues/188).
+
 ## Local mailbox directory upgrade
 
 Back up the Maildir and SQLite database together before upgrading a server with older ActiveSync clients. On startup, the server checks for full-address local accounts that still have mail under a short directory name such as `mail/alice`. It moves eligible messages to `mail/alice@example.com` before opening the protocol listeners. It also moves messages in a canonical custom folder's nested slots into the folder path exposed by IMAP and webmail. ActiveSync, IMAP, webmail, and EWS then read from the canonical mailbox. The upgrade retains existing message flags and client identifiers when it can reconcile both directories.

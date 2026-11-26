@@ -27,15 +27,33 @@ pub const Options = struct {
 };
 
 pub fn write(gpa: Allocator, io: std.Io, db: *database.Database, username: []const u8, destination: []const u8, options: Options) !void {
+    var pending = try prepare(gpa, io, db, username, destination, options, null);
+    defer pending.deinit(io);
+    try pending.link(io);
+}
+
+/// Build and sync a private file. The caller links the destination after any
+/// required audit is durable. Hash exactly the bytes written to the archive.
+pub fn prepare(
+    gpa: Allocator,
+    io: std.Io,
+    db: *database.Database,
+    username: []const u8,
+    destination: []const u8,
+    options: Options,
+    digest: ?*[32]u8,
+) !std.Io.File.Atomic {
     var user = try db.getUserByUsername(username);
     defer user.deinit(db.allocator);
     if (!submission.isSafeLocalPart(user.username)) return error.InvalidMailbox;
 
     var private_file = try Dir.cwd().createFileAtomic(io, destination, .{ .permissions = .fromMode(0o600) });
-    defer private_file.deinit(io);
+    errdefer private_file.deinit(io);
     var output_buffer: [64 * 1024]u8 = undefined;
     var output = private_file.file.writer(io, &output_buffer);
-    var archive: Tar = .{ .underlying_writer = &output.interface };
+    var hash_buffer: [4096]u8 = undefined;
+    var hashed = output.interface.hashed(std.crypto.hash.sha2.Sha256.init(.{}), &hash_buffer);
+    var archive: Tar = .{ .underlying_writer = if (digest != null) &hashed.writer else &output.interface };
 
     var metadata = std.heap.ArenaAllocator.init(gpa);
     defer metadata.deinit();
@@ -57,9 +75,13 @@ pub fn write(gpa: Allocator, io: std.Io, db: *database.Database, username: []con
     }, .{ .whitespace = .indent_2 });
     try archive.writeFileBytes("manifest.json", json, .{ .mode = 0o600 });
     try archive.finishPedantically();
+    if (digest) |sha| {
+        try hashed.writer.flush();
+        sha.* = hashed.hasher.finalResult();
+    }
     try output.interface.flush();
     try private_file.file.sync(io);
-    try private_file.link(io);
+    return private_file;
 }
 
 fn openOptionalDir(dir: Dir, io: std.Io, path: []const u8) !?Dir {

@@ -2,18 +2,24 @@
 const std = @import("std");
 const Database = @import("database.zig").Database;
 
+pub const Identity = struct {
+    native_user_id: i64,
+    initial_provisioning_operation: ?[]const u8,
+    provisioning_revision: i64,
+};
+
+const Access = struct {
+    state: Database.MailboxAccess,
+    window: ?Database.AccessWindow,
+    sending_held_since: ?i64,
+    retirement_id: ?[]const u8,
+};
+
+const Assignment = struct { identity: Identity, access: Access };
+
 pub const Observation = struct {
-    identity: struct {
-        native_user_id: i64,
-        initial_provisioning_operation: ?[]const u8,
-        provisioning_revision: i64,
-    },
-    access: struct {
-        state: Database.MailboxAccess,
-        window: ?Database.AccessWindow,
-        sending_held_since: ?i64,
-        retirement_id: ?[]const u8,
-    },
+    identity: Identity,
+    access: Access,
     delivery: struct {
         pending_local_targets: u64,
         remote_unattempted_targets: u64,
@@ -27,9 +33,15 @@ pub const Observation = struct {
 const OutboundQueue = struct { active_owned: ?u64, unattributed_address_matches: u64 };
 const WebmailOutbox = struct { in_progress: u64, needs_review: u64 };
 
-pub fn observe(a: std.mem.Allocator, db: *Database, mailbox: []const u8, expected_actor: []const u8, now: i64) !Observation {
-    var tx = try db.beginTransaction(.read);
-    defer tx.deinit();
+pub fn validCaseReference(reference: []const u8) bool {
+    if (reference.len == 0 or reference.len > 128) return false;
+    for (reference) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_' and byte != '.') return false;
+    }
+    return true;
+}
+
+pub fn identify(a: std.mem.Allocator, tx: Database.Transaction, mailbox: []const u8, expected_actor: []const u8, now: i64) !Assignment {
     const account = try tx.prepare(
         \\SELECT u.id,p.revision,u.enabled,p.service_until,p.read_until,h.placed_at,r.retirement_id,
         \\ (SELECT CASE WHEN count(*)=1 THEN min(operation_id) END FROM provisioning_operations
@@ -45,7 +57,26 @@ pub fn observe(a: std.mem.Allocator, db: *Database, mailbox: []const u8, expecte
     if (!try account.step()) return error.ManagedMailboxNotFound;
     const user = account.columnInt64(0);
     const window = Database.scanAccessWindow(account, 3);
+    return .{
+        .identity = .{
+            .native_user_id = user,
+            .provisioning_revision = account.columnInt64(1),
+            .initial_provisioning_operation = if (account.columnTextOpt(7)) |id| try a.dupe(u8, id) else null,
+        },
+        .access = .{
+            .state = Database.mailboxAccessAt(account.columnInt64(2) != 0, window, now),
+            .window = window,
+            .sending_held_since = if (account.columnIsNull(5)) null else account.columnInt64(5),
+            .retirement_id = if (account.columnTextOpt(6)) |id| try a.dupe(u8, id) else null,
+        },
+    };
+}
 
+pub fn observe(a: std.mem.Allocator, db: *Database, mailbox: []const u8, expected_actor: []const u8, now: i64) !Observation {
+    var tx = try db.beginTransaction(.read);
+    defer tx.deinit();
+    const assignment = try identify(a, tx, mailbox, expected_actor, now);
+    const user = assignment.identity.native_user_id;
     const work = try tx.prepare(
         \\SELECT count(CASE WHEN t.outcome='pending' AND (t.mailbox_id=?1 OR d.hosted_sender_id=?1) THEN 1 END),
         \\       count(CASE WHEN t.outcome='remote_unattempted' AND d.hosted_sender_id=?1 THEN 1 END),
@@ -60,17 +91,8 @@ pub fn observe(a: std.mem.Allocator, db: *Database, mailbox: []const u8, expecte
     if (!try work.step()) return error.StepFailed;
 
     const result: Observation = .{
-        .identity = .{
-            .native_user_id = user,
-            .provisioning_revision = account.columnInt64(1),
-            .initial_provisioning_operation = if (account.columnTextOpt(7)) |id| try a.dupe(u8, id) else null,
-        },
-        .access = .{
-            .state = Database.mailboxAccessAt(account.columnInt64(2) != 0, window, now),
-            .window = window,
-            .sending_held_since = if (account.columnIsNull(5)) null else account.columnInt64(5),
-            .retirement_id = if (account.columnTextOpt(6)) |id| try a.dupe(u8, id) else null,
-        },
+        .identity = assignment.identity,
+        .access = assignment.access,
         .delivery = .{
             .pending_local_targets = @intCast(work.columnInt64(0)),
             .remote_unattempted_targets = @intCast(work.columnInt64(1)),

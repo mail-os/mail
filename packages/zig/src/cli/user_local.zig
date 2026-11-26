@@ -9,6 +9,7 @@ const mailbox_export = @import("../storage/mailbox_export.zig");
 const calendar_workflow = @import("../storage/calendar_workflow_transfer.zig");
 const hosted_limits = @import("../storage/hosted_limits.zig");
 const erasure_preflight = @import("../storage/hosted_erasure_preflight.zig");
+const erasure_export = @import("../storage/hosted_erasure_export.zig");
 const io_compat = @import("../core/io_compat.zig");
 const time = @import("../core/time_compat.zig");
 
@@ -115,11 +116,7 @@ fn hostedErasurePreflightAction(ctx: *cli.BaseCommand.ParseContext) !void {
     const mailbox = ctx.getArgument(0) orelse return error.MissingArgument;
     const expected_actor = ctx.getArgument(1) orelse return error.MissingArgument;
     const case_reference = ctx.getArgument(2) orelse return error.MissingArgument;
-    if (case_reference.len == 0 or case_reference.len > 128) return error.InvalidCaseReference;
-    for (case_reference) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '_' and byte != '.')
-            return error.InvalidCaseReference;
-    }
+    if (!erasure_preflight.validCaseReference(case_reference)) return error.InvalidCaseReference;
 
     const io = io_compat.getIo();
     const path = env.get("SMTP_DB_PATH") orelse "./smtp.db";
@@ -175,17 +172,45 @@ fn hostedSendingHoldAction(ctx: *cli.BaseCommand.ParseContext) !void {
     std.debug.print("{s}", .{output});
 }
 
-fn exportAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Database, _: *auth.AuthBackend) !void {
-    const username = ctx.getArgument(0) orelse return error.MissingArgument;
-    const destination = ctx.getArgument(1) orelse return error.MissingArgument;
-    const io = io_compat.getIo();
+fn exportOptions() mailbox_export.Options {
     const dav_path = env.get("CALDAV_DB_PATH");
-    try mailbox_export.write(ctx.allocator, io, db, username, destination, .{
+    return .{
         .mail_root = env.get("MAIL_ROOT") orelse "mail",
         .dav_path = dav_path orelse "./caldav.db",
         .require_dav = dav_path != null,
-    });
+    };
+}
+
+fn exportAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Database, _: *auth.AuthBackend) !void {
+    const username = ctx.getArgument(0) orelse return error.MissingArgument;
+    const destination = ctx.getArgument(1) orelse return error.MissingArgument;
+    try mailbox_export.write(ctx.allocator, io_compat.getIo(), db, username, destination, exportOptions());
     std.debug.print("Mailbox export saved to {s}\n", .{destination});
+}
+
+fn hostedErasureExportAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const review_path = ctx.getArgument(0) orelse return error.MissingArgument;
+    const destination = ctx.getArgument(1) orelse return error.MissingArgument;
+    const io = io_compat.getIo();
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, review_path, a, .limited(8192));
+    const review = try std.json.parseFromSliceLeaky(erasure_export.Review, a, raw, .{});
+
+    const path = env.get("SMTP_DB_PATH") orelse "./smtp.db";
+    try std.Io.Dir.cwd().access(io, path, .{});
+    var db = try database.Database.init(ctx.allocator, path);
+    defer db.deinit();
+    var actor_buffer: [64]u8 = undefined;
+    const operator = try std.fmt.bufPrint(&actor_buffer, "local-operator:{d}", .{std.c.geteuid()});
+    const receipt = try erasure_export.write(a, io, &db, review, operator, destination, exportOptions());
+
+    var buffer: [4096]u8 = undefined;
+    var output = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try std.json.Stringify.value(receipt, .{ .whitespace = .indent_2 }, &output.interface);
+    try output.interface.writeByte('\n');
+    try output.interface.flush();
 }
 
 fn importCalendarWorkflowAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Database, _: *auth.AuthBackend) !void {
@@ -352,6 +377,12 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try sending_hold_cmd.addArgument(cli.Argument.init("case-reference", "Non-sensitive case reference for the audit log", .string).withRequired(true));
     _ = sending_hold_cmd.setAction(hostedSendingHoldAction);
     _ = try cmd.addCommand(sending_hold_cmd);
+
+    const hosted_export_cmd = try cli.BaseCommand.init(allocator, "hosted-erasure-export", "Prepare an audited private archive for a reviewed hosted exit");
+    _ = try hosted_export_cmd.addArgument(cli.Argument.init("review", "Private reviewed hosted export JSON file", .string).withRequired(true));
+    _ = try hosted_export_cmd.addArgument(cli.Argument.init("output", "Path for a new private archive", .string).withRequired(true));
+    _ = hosted_export_cmd.setAction(hostedErasureExportAction);
+    _ = try cmd.addCommand(hosted_export_cmd);
 
     const export_cmd = try cli.BaseCommand.init(allocator, "export", "Export a mailbox to a portable TAR archive");
     _ = try export_cmd.addArgument(cli.Argument.init("username", "Canonical mailbox username", .string));
