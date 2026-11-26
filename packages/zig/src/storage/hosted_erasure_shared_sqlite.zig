@@ -299,6 +299,14 @@ fn priorResult(a: Allocator, tx: Tx, review: review_store.Review, start: i64, ow
     return result;
 }
 
+pub fn requireRemoved(a: Allocator, tx: Tx, review: review_store.Review, start: i64, owner: i64) !i64 {
+    const prior = (try priorResult(a, tx, review, start, owner)) orelse return error.ErasureSharedSqlitePending;
+    try verifyRemoved(tx, owner);
+    if ((try evidence.unresolvedReplies(a, tx, owner)).len != 0 or (try collectReplies(a, tx, owner)).unresolved_outbox)
+        return error.ErasureSharedRepliesUnresolved;
+    return prior.audit_id.?;
+}
+
 pub fn reconcile(a: Allocator, io: std.Io, db: *Database, review: review_store.Review, start: i64, operator: []const u8, mail_root: []const u8, decision: ?Decision) !Result {
     try review.validate();
     if (start < 1) return error.InvalidErasureStartAuditId;

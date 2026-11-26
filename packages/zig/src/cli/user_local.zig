@@ -18,6 +18,7 @@ const erasure_typesense = @import("../storage/hosted_erasure_typesense.zig");
 const erasure_dav = @import("../storage/hosted_erasure_dav.zig");
 const erasure_shared_sqlite = @import("../storage/hosted_erasure_shared_sqlite.zig");
 const erasure_shared = @import("../storage/hosted_erasure_shared.zig");
+const erasure_content = @import("../storage/hosted_erasure_content.zig");
 const erasure_links = @import("../storage/hosted_erasure_links.zig");
 const erasure_sqlite = @import("../storage/hosted_erasure_sqlite.zig");
 const io_compat = @import("../core/io_compat.zig");
@@ -343,6 +344,12 @@ fn hostedErasureLinksAction(ctx: *cli.BaseCommand.ParseContext) !void {
     try hostedErasureApproval(ctx, .{ .links = audit_id });
 }
 
+fn hostedErasureContentAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const argument = ctx.getArgument(1) orelse return error.MissingArgument;
+    const audit_id = try std.fmt.parseInt(i64, argument, 10);
+    try hostedErasureApproval(ctx, .{ .content = audit_id });
+}
+
 fn hostedErasureSharedAction(ctx: *cli.BaseCommand.ParseContext) !void {
     const audit = ctx.getArgument(1) orelse return error.MissingArgument;
     const audit_id = std.fmt.parseInt(i64, audit, 10) catch return error.InvalidErasureStartAuditId;
@@ -371,6 +378,7 @@ const ErasureOperation = union(enum) {
     search: i64,
     sqlite: i64,
     links: i64,
+    content: i64,
     shared_sqlite: struct { start_id: i64, decision_path: ?[]const u8 },
     shared: struct { start_id: i64, store: erasure_shared.Store, decision_path: ?[]const u8 },
     typesense: struct { start_id: i64, endpoint: erasure_typesense.Endpoint },
@@ -406,6 +414,7 @@ fn hostedErasureApproval(ctx: *cli.BaseCommand.ParseContext, operation: ErasureO
         .sqlite => |id| try std.json.Stringify.value(try erasure_sqlite.erase(a, io, &db, review, id, operator, mail_root), format, &output.interface),
         .links => |id| try std.json.Stringify.value(try erasure_links.erase(a, io, &db, review, id, operator, mail_root), format, &output.interface),
         .search => |id| try std.json.Stringify.value(try erasure_search.erase(a, io, &db, review, id, operator, mail_root), format, &output.interface),
+        .content => |id| try std.json.Stringify.value(try erasure_content.erase(a, io, &db, review, id, operator, mail_root), format, &output.interface),
         .shared_sqlite => |step| {
             const decision = if (step.decision_path) |path| try std.json.parseFromSliceLeaky(
                 erasure_shared_sqlite.Decision,
@@ -688,6 +697,12 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try erasure_links_cmd.addArgument(cli.Argument.init("start-audit-id", "Audit ID of the reserved erasure", .string).withRequired(true));
     _ = erasure_links_cmd.setAction(hostedErasureLinksAction);
     _ = try cmd.addCommand(erasure_links_cmd);
+
+    const erasure_content_cmd = try cli.BaseCommand.init(allocator, "hosted-erasure-private-content", "Remove private mailbox content and report retained data with Mail stopped");
+    _ = try erasure_content_cmd.addArgument(cli.Argument.init("review", "Private erasure review JSON file", .string).withRequired(true));
+    _ = try erasure_content_cmd.addArgument(cli.Argument.init("start-audit-id", "Audit ID of the reserved erasure", .string).withRequired(true));
+    _ = erasure_content_cmd.setAction(hostedErasureContentAction);
+    _ = try cmd.addCommand(erasure_content_cmd);
 
     const export_cmd = try cli.BaseCommand.init(allocator, "export", "Export a mailbox to a portable TAR archive");
     _ = try export_cmd.addArgument(cli.Argument.init("username", "Canonical mailbox username", .string));

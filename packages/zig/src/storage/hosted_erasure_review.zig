@@ -129,6 +129,18 @@ pub fn verifyDeliveryDrained(observation: preflight.Observation) !void {
     }
 }
 
+pub fn verifyLocalOperationsDrained(tx: Database.Transaction, owner: i64) !void {
+    const row = try tx.prepare(
+        \\SELECT 1 FROM mail_ews_draft_finalizations WHERE user_id=?1 AND confirmed=0 AND retired_at IS NULL
+        \\UNION ALL SELECT 1 FROM mail_ews_draft_sends WHERE user_id=?1 AND result IS NULL
+        \\UNION ALL SELECT 1 FROM sender_review_messages WHERE user_id=?1 AND operation IS NOT NULL
+        \\LIMIT 1
+    );
+    defer row.finalize();
+    try row.bind(1, owner);
+    if (try row.step()) return error.ErasureLocalOperationsUnresolved;
+}
+
 const Receipt = struct {
     version: u8 = 1,
     state: []const u8 = "review_recorded_data_retained",

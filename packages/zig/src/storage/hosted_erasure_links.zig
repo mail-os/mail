@@ -135,6 +135,12 @@ fn existingReceipt(tx: Database.Transaction, review: review_store.Review, start_
     };
 }
 
+pub fn requireRemoved(tx: Database.Transaction, review: review_store.Review, start_id: i64, owner: i64) !i64 {
+    const receipt = (try existingReceipt(tx, review, start_id)) orelse return error.ErasureLinkedSessionsPending;
+    try verifyRemoved(tx, owner, review.mailbox);
+    return receipt.audit_id;
+}
+
 pub fn erase(a: std.mem.Allocator, io: std.Io, db: *Database, review: review_store.Review, start_id: i64, operator: []const u8, mail_root: []const u8) !Receipt {
     try review.validate();
     if (start_id < 1) return error.InvalidErasureStartAuditId;

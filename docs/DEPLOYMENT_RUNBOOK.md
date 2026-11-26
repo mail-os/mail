@@ -833,6 +833,36 @@ Run `python3 scripts/test-hosted-erasure-links.py /path/to/mail` with the
 disposable TLS fixture to verify both link directions, refusal, rollback,
 and peer access after restart.
 
+### Remove live private mailbox content
+
+After the Maildir, local search, private SQLite, shared SQLite, and linked
+session steps are verified, keep Mail stopped and run the following command
+with the same private review file and start audit ID.
+
+```sh
+/opt/mail/mail-server user:local hosted-erasure-private-content \
+  /root/cases/erasure-review.json START_AUDIT_ID
+```
+
+This transaction deletes private drafts and unreferenced uploads, notes,
+labels, groups, per-mailbox routing and retention settings, and message
+references with no retained delivery dependency. Resolve unfinished EWS
+sends and sender-review moves before removing the Maildir. Shared and
+delegated drafts, terminal Outbox and delivery records, and references
+or uploads they still use remain available for their separate disposition.
+Unknown webmail record kinds remain in place.
+
+Save the resulting `private_content_removed_retention_pending` receipt
+with the case. It includes the verified step audit IDs and counts of
+removed and retained rows. A retry returns the original audit ID and
+counts after rechecking the live store. A partial restore that reintroduces
+private rows blocks confirmation. Check the outstanding case evidence
+separately for DAV, external search, retained active records, SQLite WAL
+and historical pages, backups and restoration, billing, and support.
+
+Run `python3 scripts/test-hosted-erasure-private-content.py /path/to/mail`
+to verify the disposable TLS case, including audit rollback and peer access.
+
 ## Local mailbox directory upgrade
 
 Back up the Maildir and SQLite database together before upgrading a server with older ActiveSync clients. On startup, the server checks for full-address local accounts that still have mail under a short directory name such as `mail/alice`. It moves eligible messages to `mail/alice@example.com` before opening the protocol listeners. It also moves messages in a canonical custom folder's nested slots into the folder path exposed by IMAP and webmail. ActiveSync, IMAP, webmail, and EWS then read from the canonical mailbox. The upgrade retains existing message flags and client identifiers when it can reconcile both directories.

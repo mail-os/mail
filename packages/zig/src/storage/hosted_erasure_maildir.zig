@@ -321,6 +321,7 @@ pub fn erase(a: Allocator, io: std.Io, db: *Database, review: review_store.Revie
         var tx = try db.beginTransaction(.write);
         defer tx.deinit();
         const observation = try review_store.requireStarted(a, tx, review, start_id, time.timestamp());
+        try review_store.verifyLocalOperationsDrained(tx, observation.identity.native_user_id);
         if (try loadStep(a, tx, start_id)) |existing| {
             resumed_plan = existing.phase == .planned;
             if (resumed_plan and existing.mailbox_stamp != null)
