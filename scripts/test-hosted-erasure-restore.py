@@ -96,7 +96,7 @@ def verify(binary, work):
         refuse(interrupted, "RestoreErasureAuthorityIncomplete")
 
     success(step("hosted-erasure-maildir"))
-    refuse(interrupted, "RestoreErasureAuthorityIncomplete")
+    refuse(interrupted, "RestoreErasureReconciliationRequired")
     success(step("hosted-erasure-search"))
     success(step("hosted-erasure-sqlite"))
     shared = "hosted-erasure-shared-sqlite"

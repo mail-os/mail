@@ -497,7 +497,7 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try verify_cmd.addArgument(cli.Argument.init("authority-db", "Current SMTP database from outside the restore", .string).withRequired(true));
     _ = try verify_cmd.addArgument(cli.Argument.init("restored-db", "SMTP database from isolated restore", .string).withRequired(true));
     _ = try verify_cmd.addArgument(cli.Argument.init("restored-maildir", "Maildir from isolated restore", .string).withRequired(true));
-    _ = try verify_cmd.addArgument(cli.Argument.init("restored-dav", "DAV database from isolated restore", .string));
+    _ = try verify_cmd.addArgument(cli.Argument.init("restored-dav", "DAV database from isolated restore", .string).withRequired(false));
     _ = try verify_cmd.addOption(cli.Option.init("legacy", "legacy", "Refuse legacy restores when the current database has an erasure reservation", .bool));
     _ = verify_cmd.setAction(verifyErasureRestoreAction);
     _ = try backup_cmd.addCommand(verify_cmd);
