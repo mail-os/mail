@@ -187,6 +187,10 @@ message identities before starting Mail:
 mail backup rebind-local /path/to/extracted/smtp.db /path/to/extracted/mail
 ```
 
+Before opening listeners, run the [hosted erasure restore check](DEPLOYMENT_RUNBOOK.md#check-hosted-erasure-before-restoring-mail)
+against the current SMTP database from outside the backup. The automated
+Restic restore check includes this comparison.
+
 If the backup predates a team owner's departure, replay the
 [recorded offboarding operation](DEPLOYMENT_RUNBOOK.md#offboard-a-departed-team-owner)
 before opening listeners on the restored service.

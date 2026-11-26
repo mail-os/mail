@@ -863,6 +863,41 @@ and historical pages, backups and restoration, billing, and support.
 Run `python3 scripts/test-hosted-erasure-private-content.py /path/to/mail`
 to verify the disposable TLS case, including audit rollback and peer access.
 
+### Check hosted erasure before restoring Mail
+
+Extract the backup into isolated storage. Run the portable message identity
+check and then compare the recovered SMTP, Maildir, and DAV data with the
+current lifecycle database. Use the protected SMTP database from the original
+server as the authority. Its path must come from the trusted recovery
+environment, outside the extracted archive. For hosted backups, the two
+databases must have a shared immutable provisioning identity.
+
+```sh
+mail backup rebind-local /restore/smtp.db /restore/mail
+mail backup verify-erasure-restore /opt/mail/smtp.db /restore/smtp.db \
+  /restore/mail /restore/caldav.db
+```
+
+Supply the DAV database whenever the reviewed case had a DAV store. The check
+compares exact mailbox identities and audit receipts, confirms the reservation
+still blocks access, and inspects the restored stores for erasure regressions.
+The result records the authority digest, latest verified reservation, number
+of reservations, and time of the check. Keep that result with the recovery
+record. Repeat the check immediately before promotion while the authoritative
+lifecycle state is frozen.
+
+Recoveries with missing authority, an unfinished case, an older reservation
+snapshot, or returned mailbox data need operator reconciliation. Keep the
+extracted instance offline in those cases and retain it for the authorized
+recovery workflow. The legacy S3 restore can only promote a compatible
+installation with a current lifecycle database and no erasure reservations.
+
+The Restic restore check uses `/opt/mail/smtp.db` by default, or the
+`MAIL_RESTORE_AUTHORITATIVE_DB` path from the protected restore environment.
+Where the deployment uses a different database path, configure the canonical
+live database. Backup expiry and off-host lifecycle recovery are tracked
+separately in the hosted erasure case.
+
 ## Local mailbox directory upgrade
 
 Back up the Maildir and SQLite database together before upgrading a server with older ActiveSync clients. On startup, the server checks for full-address local accounts that still have mail under a short directory name such as `mail/alice`. It moves eligible messages to `mail/alice@example.com` before opening the protocol listeners. It also moves messages in a canonical custom folder's nested slots into the folder path exposed by IMAP and webmail. ActiveSync, IMAP, webmail, and EWS then read from the canonical mailbox. The upgrade retains existing message flags and client identifiers when it can reconcile both directories.

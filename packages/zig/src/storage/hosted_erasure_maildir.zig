@@ -142,6 +142,16 @@ pub fn openLockedRoot(a: Allocator, io: std.Io, mail_root: []const u8) !Dir {
 
 /// Recheck the recorded removal while the caller holds the same writer lock.
 pub fn requireRemoved(a: Allocator, io: std.Io, tx: Database.Transaction, root: Dir, mailbox: []const u8, start_id: i64) !void {
+    try requireAbsent(a, io, tx, root, mailbox, start_id, true);
+}
+
+/// A restored tree has new filesystem identities. Verify its recorded step and
+/// actual absence while the recovery caller holds the isolated tree's lock.
+pub fn requireRestoredAbsent(a: Allocator, io: std.Io, tx: Database.Transaction, root: Dir, mailbox: []const u8, start_id: i64) !void {
+    try requireAbsent(a, io, tx, root, mailbox, start_id, false);
+}
+
+fn requireAbsent(a: Allocator, io: std.Io, tx: Database.Transaction, root: Dir, mailbox: []const u8, start_id: i64, original_root: bool) !void {
     const step = (try loadStep(a, tx, start_id)) orelse return error.ErasureMaildirPending;
     const completion = step.completion orelse return error.ErasureMaildirPending;
     const audit = try tx.prepare(
@@ -153,8 +163,8 @@ pub fn requireRemoved(a: Allocator, io: std.Io, tx: Database.Transaction, root: 
     try audit.bind(2, mailbox);
     try audit.bind(3, start_id);
     if (!try audit.step()) return error.InvalidErasureJournal;
-    const root_stamp = try message_refs.directoryHandleStamp(a, root.handle);
-    if (!std.mem.eql(u8, root_stamp, step.root_stamp)) return error.ErasureDirectoryChanged;
+    if (original_root and !std.mem.eql(u8, try message_refs.directoryHandleStamp(a, root.handle), step.root_stamp))
+        return error.ErasureDirectoryChanged;
     const staged = try std.fmt.allocPrint(a, ".hosted-erasure-{d}-{s}", .{ start_id, step.nonce });
     const short = mailbox[0 .. std.mem.indexOfScalar(u8, mailbox, '@') orelse return error.InvalidErasureMailbox];
     for ([_][]const u8{ mailbox, staged, short }) |name| {

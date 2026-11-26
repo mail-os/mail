@@ -4,6 +4,7 @@ const io_compat = @import("../core/io_compat.zig");
 const fs = @import("../core/fs_compat.zig");
 const database = @import("../storage/database.zig");
 const identity = @import("../storage/backup_identity.zig");
+const erasure_restore = @import("../storage/hosted_erasure_restore.zig");
 
 const MAIL_CLI_PATH = "/opt/mail/packages/zig/zig-out/bin/mail";
 
@@ -268,34 +269,72 @@ fn createAction(ctx: *cli.BaseCommand.ParseContext) !void {
 
 fn restoreAction(ctx: *cli.BaseCommand.ParseContext) !void {
     const allocator = ctx.allocator;
-    const backup_id = ctx.getArgument(0) orelse {
-        std.debug.print("Error: backup-id is required\nUsage: mail backup restore <backup-id> [--instance-id <id>] [--env <env>]\n", .{});
-        return;
-    };
+    const backup_id = ctx.getArgument(0) orelse return error.MissingBackupId;
+    if (!std.mem.startsWith(u8, backup_id, "mail-backup-") or backup_id.len > 80) return error.InvalidBackupId;
+    for (backup_id) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '-') return error.InvalidBackupId;
     const env = ctx.getOption("env") orelse "production";
     const instance_id = try getInstanceId(ctx, allocator);
     const bucket = if (ctx.getOption("bucket")) |b| b else try getBucketName(allocator, env);
+    if (bucket.len == 0 or bucket.len > 63) return error.InvalidBackupBucket;
+    for (bucket) |byte| if (!std.ascii.isAlphanumeric(byte) and byte != '-' and byte != '.') return error.InvalidBackupBucket;
 
-    printStdout("Restoring backup {s} on instance {s}...\n", .{ backup_id, instance_id });
-    printStdout("  Source bucket: {s}\n", .{bucket});
-
-    const restore_script = try std.fmt.allocPrint(allocator,
-        \\commands=["set -e; BACKUP_ID={0s}; echo 'Downloading backup from S3...'; aws s3 cp s3://{1s}/backups/$BACKUP_ID.tar.gz /tmp/$BACKUP_ID.tar.gz; echo 'Stopping mail service...'; systemctl stop mail 2>/dev/null || true; sleep 2; echo 'Extracting backup...'; cd /tmp && tar xzf $BACKUP_ID.tar.gz; BACKUP_DIR=/tmp/$BACKUP_ID; echo 'Restoring database...'; if [ -f $BACKUP_DIR/mail.db ]; then cp -a $BACKUP_DIR/mail.db {2s}/mail.db; chown mail-server:mail-server {2s}/mail.db 2>/dev/null || true; echo 'Database restored (mail.db)'; elif [ -f $BACKUP_DIR/smtp.db ]; then cp -a $BACKUP_DIR/smtp.db {2s}/mail.db; chown mail-server:mail-server {2s}/mail.db 2>/dev/null || true; echo 'Database restored (smtp.db -> mail.db)'; else echo 'No database in backup'; fi; echo 'Restoring mailboxes...'; if [ -f $BACKUP_DIR/mailboxes.tar.gz ]; then tar xzf $BACKUP_DIR/mailboxes.tar.gz -C {3s}; chown -R mail-server:mail-server {3s} 2>/dev/null || true; echo 'Mailboxes restored'; else echo 'No mailboxes in backup'; fi; echo 'Restoring config...'; if [ -f $BACKUP_DIR/config.tar.gz ]; then tar xzf $BACKUP_DIR/config.tar.gz -C {4s}; chown -R mail-server:mail-server {4s} 2>/dev/null || true; echo 'Config restored'; else echo 'No config in backup'; fi; echo 'Starting mail service...'; systemctl start mail 2>/dev/null || true; sleep 3; systemctl is-active mail && echo 'Mail service is running' || echo 'WARNING: Mail service failed to start'; rm -rf /tmp/$BACKUP_ID /tmp/$BACKUP_ID.tar.gz; echo 'Restore complete!'"]
-    , .{ backup_id, bucket, DATA_DIR, MAIL_DIR, CONFIG_DIR });
-    defer allocator.free(restore_script);
-
-    const result = try runRemoteCommandWithTimeout(allocator, instance_id, restore_script, 150);
+    printStdout("Preparing backup {s} on instance {s} for verification.\n", .{ backup_id, instance_id });
+    const script = try std.fmt.allocPrint(allocator,
+        \\set -eu
+        \\umask 077
+        \\work=$(mktemp -d /tmp/mail-restore.XXXXXXXX)
+        \\trap 'rm -rf "$work"' EXIT
+        \\aws s3 cp 's3://{1s}/backups/{0s}.tar.gz' "$work/archive.tgz"
+        \\tar -xzf "$work/archive.tgz" -C "$work"
+        \\backup="$work/{0s}"
+        \\test -d "$backup" && test ! -L "$backup"
+        \\snapshot="$backup/mail.db"
+        \\if [ ! -f "$snapshot" ]; then snapshot="$backup/smtp.db"; fi
+        \\test -f "$snapshot" && test ! -L "$snapshot"
+        \\mkdir "$work/mail"
+        \\if [ -f "$backup/mailboxes.tar.gz" ]; then tar -xzf "$backup/mailboxes.tar.gz" -C "$work/mail"; fi
+        \\binary=/opt/mail/mail-server
+        \\if [ ! -x "$binary" ]; then binary='{5s}'; fi
+        \\test -x "$binary"
+        \\if [ -e /opt/mail/smtp.db ]; then
+        \\    echo 'Use the isolated Restic recovery procedure for this Mail installation.' >&2
+        \\    exit 1
+        \\fi
+        \\current=$(realpath -e '{2s}/mail.db')
+        \\test -f "$current"
+        \\was_active=no
+        \\if systemctl is-active --quiet mail; then was_active=yes; fi
+        \\systemctl stop mail
+        \\if ! "$binary" backup verify-erasure-restore "$current" "$snapshot" "$work/mail" --legacy; then
+        \\    if [ "$was_active" = yes ]; then systemctl start mail; fi
+        \\    exit 1
+        \\fi
+        \\cp -a "$snapshot" '{2s}/mail.db'
+        \\chown mail-server:mail-server '{2s}/mail.db'
+        \\if [ -f "$backup/mailboxes.tar.gz" ]; then
+        \\    cp -a "$work/mail/." '{3s}/'
+        \\    chown -R mail-server:mail-server '{3s}'
+        \\fi
+        \\if [ -f "$backup/config.tar.gz" ]; then
+        \\    tar -xzf "$backup/config.tar.gz" -C '{4s}'
+        \\    chown -R mail-server:mail-server '{4s}'
+        \\fi
+        \\systemctl start mail
+        \\systemctl is-active --quiet mail
+    , .{ backup_id, bucket, DATA_DIR, MAIL_DIR, CONFIG_DIR, MAIL_CLI_PATH });
+    defer allocator.free(script);
+    const parameters = try std.json.Stringify.valueAlloc(allocator, .{ .commands = .{script} }, .{});
+    defer allocator.free(parameters);
+    const result = try runRemoteCommandWithTimeout(allocator, instance_id, parameters, 150);
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
 
-    if (result.success) {
-        printStdout("\nRestore completed successfully!\n", .{});
-        if (result.stdout.len > 0) writeStdout(result.stdout);
-    } else {
-        std.debug.print("Restore failed!\n", .{});
-        if (result.stderr.len > 0) std.debug.print("{s}", .{result.stderr});
-        if (result.stdout.len > 0) writeStdout(result.stdout);
+    if (result.stdout.len != 0) writeStdout(result.stdout);
+    if (!result.success) {
+        if (result.stderr.len != 0) std.debug.print("{s}", .{result.stderr});
+        return error.BackupRestoreRejected;
     }
+    printStdout("Backup restored and Mail service is active.\n", .{});
 }
 
 fn listAction(ctx: *cli.BaseCommand.ParseContext) !void {
@@ -393,6 +432,21 @@ fn rebindLocalAction(ctx: *cli.BaseCommand.ParseContext) !void {
     try localIdentityAction(ctx, true);
 }
 
+fn verifyErasureRestoreAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const authority = ctx.getArgument(0) orelse return error.MissingRestoreErasureAuthority;
+    const restored = ctx.getArgument(1) orelse return error.MissingBackupDatabase;
+    const root = ctx.getArgument(2) orelse return error.MissingBackupMaildir;
+    const io = io_compat.getIo();
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const receipt = try erasure_restore.verify(arena.allocator(), io, authority, restored, root, ctx.getArgument(3), ctx.hasOption("legacy"));
+    var buffer: [4096]u8 = undefined;
+    var output = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try std.json.Stringify.value(receipt, .{ .whitespace = .indent_2 }, &output.interface);
+    try output.interface.writeByte('\n');
+    try output.interface.flush();
+}
+
 pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     const backup_cmd = try cli.BaseCommand.init(allocator, "backup", "Backup and restore mail server data");
 
@@ -438,6 +492,15 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try rebind_cmd.addArgument(cli.Argument.init("restored-maildir", "Path to the extracted mail directory", .string));
     _ = rebind_cmd.setAction(rebindLocalAction);
     _ = try backup_cmd.addCommand(rebind_cmd);
+
+    const verify_cmd = try cli.BaseCommand.init(allocator, "verify-erasure-restore", "Verify restored Mail data against a separate current lifecycle database");
+    _ = try verify_cmd.addArgument(cli.Argument.init("authority-db", "Current SMTP database from outside the restore", .string).withRequired(true));
+    _ = try verify_cmd.addArgument(cli.Argument.init("restored-db", "SMTP database from isolated restore", .string).withRequired(true));
+    _ = try verify_cmd.addArgument(cli.Argument.init("restored-maildir", "Maildir from isolated restore", .string).withRequired(true));
+    _ = try verify_cmd.addArgument(cli.Argument.init("restored-dav", "DAV database from isolated restore", .string));
+    _ = try verify_cmd.addOption(cli.Option.init("legacy", "legacy", "Refuse legacy restores when the current database has an erasure reservation", .bool));
+    _ = verify_cmd.setAction(verifyErasureRestoreAction);
+    _ = try backup_cmd.addCommand(verify_cmd);
 
     return backup_cmd;
 }

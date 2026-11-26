@@ -10,6 +10,7 @@ RESTIC_ENV="${MAIL_RESTIC_ENV:-${RESTIC_CONFIG_DIR}/restic.env}"
 RESTORE_PARENT="${MAIL_RESTORE_CHECK_PARENT:-/var/lib/mail-storage}"
 MAIL_ROOT="${MAIL_ROOT:-/opt/mail}"
 MAIL_BACKUP_BIN="${MAIL_BACKUP_BIN:-${MAIL_ROOT}/mail-server}"
+MAIL_RESTORE_AUTHORITATIVE_DB="${MAIL_RESTORE_AUTHORITATIVE_DB:-${MAIL_ROOT}/smtp.db}"
 
 die() {
   echo "mail-restic-restore-check: $*" >&2
@@ -65,6 +66,15 @@ for database in smtp.db caldav.db; do
       || die "${database} failed quick_check"
   fi
 done
+
+# The authority is the configured live database on protected storage. It is
+# resolved outside the downloaded archive and must exist even for old backups.
+authority="$(realpath -e -- "${MAIL_RESTORE_AUTHORITATIVE_DB}")" || die "current erasure authority is unavailable"
+erasure_args=("${authority}" "${unpack_dir}/smtp.db" "${unpack_dir}/mail")
+if [[ -f "${unpack_dir}/caldav.db" ]]; then
+  erasure_args+=("${unpack_dir}/caldav.db")
+fi
+"${MAIL_BACKUP_BIN}" backup verify-erasure-restore "${erasure_args[@]}"
 
 message_count="$(find "${unpack_dir}/mail" -type f 2>/dev/null | wc -l)"
 [[ "${message_count}" -gt 0 ]] || die "restored archive contains no messages"

@@ -191,7 +191,7 @@ fn prior(a: Allocator, tx: Tx, review: review_store.Review, start: i64, owner: i
     };
 }
 
-fn verifyRemoved(tx: Tx, owner: i64, mailbox: []const u8) !void {
+pub fn verifyRemoved(tx: Tx, owner: i64, mailbox: []const u8) !void {
     inline for (removable) |scope| {
         if (try count(tx, scope, owner, mailbox) != 0) return error.ErasurePrivateContentRemains;
     }

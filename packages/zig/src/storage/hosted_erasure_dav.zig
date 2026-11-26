@@ -157,7 +157,7 @@ fn deleteRows(tx: Database.Transaction, owner: i64) !void {
     }
 }
 
-fn verifyRemoved(a: Allocator, tx: Database.Transaction, mailbox: []const u8, native_id: i64, short: []const u8, previous_owner: ?i64) !void {
+pub fn verifyRemoved(a: Allocator, tx: Database.Transaction, mailbox: []const u8, native_id: i64, short: []const u8, previous_owner: ?i64) !void {
     const observed = try inventory.observeDavOwner(a, tx, mailbox, native_id, short);
     if (observed.state != .no_owner or observed.legacy_name_candidates != 0) return error.ErasureDavRecordsRemain;
     const owner = previous_owner orelse return;
