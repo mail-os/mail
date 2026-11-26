@@ -285,6 +285,16 @@ fn hostedErasureHandoffAction(ctx: *cli.BaseCommand.ParseContext) !void {
 }
 
 fn hostedErasureReviewAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    try hostedErasureApproval(ctx, null);
+}
+
+fn hostedErasureBeginAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const audit = ctx.getArgument(1) orelse return error.MissingArgument;
+    const audit_id = std.fmt.parseInt(i64, audit, 10) catch return error.InvalidErasureReviewAuditId;
+    try hostedErasureApproval(ctx, audit_id);
+}
+
+fn hostedErasureApproval(ctx: *cli.BaseCommand.ParseContext, review_audit_id: ?i64) !void {
     const review_path = ctx.getArgument(0) orelse return error.MissingArgument;
     const io = io_compat.getIo();
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -297,11 +307,17 @@ fn hostedErasureReviewAction(ctx: *cli.BaseCommand.ParseContext) !void {
     defer db.deinit();
     var actor_buffer: [64]u8 = undefined;
     const operator = try std.fmt.bufPrint(&actor_buffer, "local-operator:{d}", .{std.c.geteuid()});
-    const receipt = try erasure_review.record(a, io, &db, review, operator, env.get("MAIL_ROOT") orelse "mail", env.get("CALDAV_DB_PATH"));
-
+    const mail_root = env.get("MAIL_ROOT") orelse "mail";
+    const dav_path = env.get("CALDAV_DB_PATH");
     var buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writerStreaming(io, &buffer);
-    try std.json.Stringify.value(receipt, .{ .whitespace = .indent_2 }, &output.interface);
+    if (review_audit_id) |id| {
+        const receipt = try erasure_review.begin(a, io, &db, review, id, operator, mail_root, dav_path);
+        try std.json.Stringify.value(receipt, .{ .whitespace = .indent_2 }, &output.interface);
+    } else {
+        const receipt = try erasure_review.record(a, io, &db, review, operator, mail_root, dav_path);
+        try std.json.Stringify.value(receipt, .{ .whitespace = .indent_2 }, &output.interface);
+    }
     try output.interface.writeByte('\n');
     try output.interface.flush();
 }
@@ -495,6 +511,12 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try erasure_review_cmd.addArgument(cli.Argument.init("review", "Private erasure review JSON file", .string).withRequired(true));
     _ = erasure_review_cmd.setAction(hostedErasureReviewAction);
     _ = try cmd.addCommand(erasure_review_cmd);
+
+    const erasure_begin_cmd = try cli.BaseCommand.init(allocator, "hosted-erasure-begin", "Reserve a reviewed mailbox for erasure with its data retained");
+    _ = try erasure_begin_cmd.addArgument(cli.Argument.init("review", "Private erasure review JSON file", .string).withRequired(true));
+    _ = try erasure_begin_cmd.addArgument(cli.Argument.init("review-audit-id", "Audit ID of the accepted erasure review", .string).withRequired(true));
+    _ = erasure_begin_cmd.setAction(hostedErasureBeginAction);
+    _ = try cmd.addCommand(erasure_begin_cmd);
 
     const export_cmd = try cli.BaseCommand.init(allocator, "export", "Export a mailbox to a portable TAR archive");
     _ = try export_cmd.addArgument(cli.Argument.init("username", "Canonical mailbox username", .string));

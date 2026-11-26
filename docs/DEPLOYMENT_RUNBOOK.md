@@ -492,6 +492,37 @@ Reproduce export, handoff, and review acceptance on a disposable fixture with
 retention holds, old snapshots, a separate tenant, stale inventories, queued
 delivery, failed audit writes, and an identical retry.
 
+### Reserve the reviewed mailbox for erasure
+
+Before starting an erasure, confirm the private support case remains approved.
+Use the original private review file and the audit ID from its accepted review
+receipt. Use the same working directory and store paths as the inventory.
+
+```bash
+umask 077
+/opt/mail/mail-server user:local hosted-erasure-begin \
+  /private/exit-case-19/review.json 815 > /private/exit-case-19/start-receipt.json
+```
+
+The command rechecks the mailbox assignment, current store inventory, outstanding
+delivery, and the accepted review. It disables the assignment, reserves its
+address against reactivation and reassignment, and writes a
+`hosted.erasure.started` audit record in one SQLite transaction. An identical
+retry returns the same start receipt. A different request cannot take over the
+reservation.
+
+The receipt state is `erasure_started_data_retained`. Keep the receipt, its
+review evidence, and the reservation with the paired restore records. A restore
+from a snapshot containing the reservation preserves it. An older snapshot can
+lack the reservation or the review. Reconcile it with the authoritative case
+before making restored accounts accessible. The start command leaves the
+Maildir, SQLite mailbox content, DAV, and external data in place for managed
+removal after each store and backup disposition is verified.
+
+Run `python3 scripts/test-hosted-erasure-export.py /path/to/mail` on disposable
+data to verify the start, concurrent retry, failure rollback, old snapshot, and
+provisioning refusal.
+
 ## Local mailbox directory upgrade
 
 Back up the Maildir and SQLite database together before upgrading a server with older ActiveSync clients. On startup, the server checks for full-address local accounts that still have mail under a short directory name such as `mail/alice`. It moves eligible messages to `mail/alice@example.com` before opening the protocol listeners. It also moves messages in a canonical custom folder's nested slots into the folder path exposed by IMAP and webmail. ActiveSync, IMAP, webmail, and EWS then read from the canonical mailbox. The upgrade retains existing message flags and client identifiers when it can reconcile both directories.
