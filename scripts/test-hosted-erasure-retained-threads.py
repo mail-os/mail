@@ -2,12 +2,17 @@
 """Test recipient-owned shared Mail retention through the native TLS API."""
 
 import argparse
+import base64
+from hashlib import sha256
 from contextlib import closing
 from email.message import EmailMessage
 import json
 from pathlib import Path
 import runpy
 import sqlite3
+from stat import S_IMODE
+import tarfile
+import time
 from tempfile import TemporaryDirectory
 
 scripts = Path(__file__).resolve().parent
@@ -55,6 +60,31 @@ def verify(test):
         }))
         decision.chmod(0o600)
         return step("hosted-erasure-shared-release", "maildir", decision)
+
+    def ordinary_export(mailbox, archive_path):
+        result = cli(test, "export", mailbox, str(archive_path))
+        assert result.returncode == 0, result.stderr
+        return archive_path
+
+    def exported(archive_path, mailbox, expected):
+        assert S_IMODE(archive_path.stat().st_mode) == 0o600
+        with tarfile.open(archive_path) as bundle:
+            manifest = json.load(bundle.extractfile("manifest.json"))
+            assert manifest["mailbox"] == mailbox and manifest["version"] == 1
+            if not expected:
+                assert "retainedMail" not in manifest
+                assert not any(name.startswith("RetainedMail/") for name in bundle.getnames())
+                return {}
+            retained = manifest["retainedMail"]
+            assert retained["version"] == 1
+            copies = retained["copies"]
+            assert {item["id"] for item in copies} == expected and len(copies) == len(expected)
+            docs = {}
+            for copy in copies:
+                member = bundle.getmember(copy["path"])
+                assert member.name == f"RetainedMail/{copy['id']}.json" and member.mode == 0o600
+                docs[copy["id"]] = json.load(bundle.extractfile(member))
+            return docs
 
     with test.daemon():
         owner, peer, outsider = (test.provision(name, daily=100) for name in (
@@ -179,6 +209,8 @@ def verify(test):
         with db:
             db.execute("UPDATE mail_retained_thread_archives SET document=? WHERE share_id=?", (document, thread))
 
+    staged_export = ordinary_export(peer, test.directory / "staged.tar")
+    exported(staged_export, peer, set())
     with test.daemon():
         api(other, thread_path, status=404)
         assert api(other, "thread-shares") == {"grants": []}
@@ -192,6 +224,25 @@ def verify(test):
             # Emulate downstream removal of live grants and all discussion.
             db.execute("DELETE FROM mail_team_members WHERE team_id=? AND user_id=?", (team, peer_id))
         assert db.execute("SELECT count(*) FROM mail_team_thread_shares").fetchone()[0] == 0
+        with db:
+            db.execute("UPDATE mail_retained_thread_archives SET document=json_set(document,'$.grant.subject','altered') WHERE share_id=?", (thread,))
+        corrupt = test.directory / "corrupt.tar"
+        refuse(cli(test, "export", peer, str(corrupt)), "ErasureThreadArchiveInvalid")
+        assert not corrupt.exists()
+        with db:
+            db.execute("UPDATE mail_retained_thread_archives SET document=? WHERE share_id=?", (document, thread))
+
+    personal = exported(ordinary_export(peer, test.directory / "personal.tar"), peer, {thread, collection_share})
+    exported(ordinary_export(outsider, test.directory / "outsider.tar"), outsider, set())
+    retained_thread, retained_collection = personal[thread], personal[collection_share]
+    assert retained_thread["comments"] == before_thread["comments"]
+    assert retained_thread["pages"][0]["messages"] == before_thread["messages"]
+    assert [page["messages"] for page in retained_collection["pages"]] == [
+        before_collection["messages"], last_page["messages"],
+    ]
+    attachment, = retained_thread["parts"]
+    assert attachment["filename"] == allowed["filename"] and base64.b64decode(attachment["encoded"]) == PUBLIC_BYTES
+    assert retained_collection["parts"] == []
 
     with test.daemon():
         other, foreign = (test.login(mailbox) for mailbox in (peer, outsider))
@@ -216,6 +267,33 @@ def verify(test):
         download(foreign, allowed_path, status=404)
         assert api(foreign, "thread-shares") == {"grants": []}
         api(own, thread_path, status=401)
+        export_review, hosted_export = (test.directory / name for name in ("export-review.json", "hosted.tar"))
+        actor = test.specs[peer]["actor"]
+        case = "retained-peer-portable-export"
+        test.provision("retained-peer", enabled=False)
+        identity = success(cli(test, "hosted-erasure-preflight", peer, actor, case))["observation"]["identity"]
+        handoff = {
+            "version": 1, "mailbox": peer, "assignment_actor": actor, "case_reference": case,
+            "recipient_verification_reference": "fixture-verified-recipient", "recipient": "retained-recipient@example.test",
+        }
+        export_review.write_text(json.dumps(dict(handoff, identity=identity, expires_at=int(time.time()) + 3600)))
+        export_review.chmod(0o600)
+        args = ("hosted-erasure-export", str(export_review), str(hosted_export))
+        prepared = success(cli(test, *args))
+        content = hosted_export.read_bytes()
+        assert prepared["prepared"]["archive_sha256"] == sha256(content).hexdigest()
+        assert exported(hosted_export, peer, {thread, collection_share}) == personal
+        refuse(cli(test, *args), "PathAlreadyExists")
+        assert hosted_export.read_bytes() == content
+        handoff_review, delivered = (test.directory / name for name in ("handoff.json", "delivered.tar"))
+        handoff_review.write_text(json.dumps(dict(handoff, export_audit_id=prepared["audit_id"])))
+        handoff_review.chmod(0o600)
+        handoff_args = ("hosted-erasure-handoff", str(handoff_review), str(hosted_export), str(delivered))
+        ready = success(cli(test, *handoff_args))
+        assert ready["prepared"] == prepared["prepared"]
+        assert success(cli(test, *handoff_args)) == ready
+        assert delivered.read_bytes() == content
+        assert exported(delivered, peer, {thread, collection_share}) == personal
         _, _, start = prepare(test, "retained-peer", review)
 
     success(step("hosted-erasure-maildir"))
@@ -231,4 +309,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     with TemporaryDirectory(prefix="mail-retained-threads-") as directory:
         verify(Fixture(args.binary.resolve(), Path(directory), staging=True))
-    print("Verified authorized peer-owned Mail archives, pagination, reply and file scope, rollback, and retry.")
+    print("Verified authorized peer-owned Mail archives, pagination, reply and file scope, audited portable export, rollback, and retry.")

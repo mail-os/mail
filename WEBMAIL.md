@@ -711,6 +711,13 @@ stores for a point-in-time export across mail and DAV.
   workflow. It includes task titles, optional civil dates and completion state,
   current day labels, and the same Personal tools document available from
   Calendar. An account without saved Personal tools has `personalTools: null`.
+- The optional `retainedMail` manifest entry has version 1 and lists each
+  completed recipient-owned copy by its share ID and path. Each JSON file
+  under `RetainedMail/` includes the retained grant, ordered message pages,
+  comments, and attachment data. The `parts` entries include the message
+  reference, attachment index, filename, media type, and standard Base64
+  content. These files are readable independently of the source mailbox and
+  its team membership.
 - `manifest.json` maps source folder, calendar, and address-book names to their
   archive paths. The `calendarWorkflow` entry points to the workflow document.
   Earlier archives contain the mail and DAV paths. Use the manifest when

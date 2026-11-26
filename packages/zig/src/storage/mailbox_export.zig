@@ -3,6 +3,8 @@ const std = @import("std");
 const calendar_workflow = @import("calendar_workflow_transfer.zig");
 const database = @import("database.zig");
 const dav_store = @import("caldav_store.zig");
+const retained_threads = @import("retained_thread_store.zig");
+const webmail_store = @import("../api/webmail_store.zig");
 const maildir_keywords = @import("maildir_keywords.zig");
 const submission = @import("../delivery/submission.zig");
 const time_compat = @import("../core/time_compat.zig");
@@ -12,6 +14,12 @@ const Dir = std.Io.Dir;
 const Tar = std.tar.Writer;
 const archive_path_capacity = 1024;
 const Collection = struct { name: []const u8, path: []const u8 };
+const RetainedMail = struct {
+    version: u8 = 1,
+    copies: []const Copy,
+
+    const Copy = struct { id: []const u8, path: []const u8 };
+};
 const Manifest = struct {
     mailbox: []const u8,
     folders: std.ArrayList(Collection) = .empty,
@@ -65,6 +73,7 @@ pub fn prepare(
     const portable_workflow = try std.json.Stringify.valueAlloc(a, workflow, .{});
     try archive.writeFileBytes(calendar_workflow.archive_path, portable_workflow, .{ .mode = 0o600 });
 
+    const retained_mail = try writeRetainedMail(a, db, &archive, user.id);
     const json = try std.json.Stringify.valueAlloc(a, .{
         .version = 1,
         .mailbox = manifest.mailbox,
@@ -72,7 +81,8 @@ pub fn prepare(
         .calendars = manifest.calendars.items,
         .addressBooks = manifest.addressBooks.items,
         .calendarWorkflow = calendar_workflow.archive_path,
-    }, .{ .whitespace = .indent_2 });
+        .retainedMail = retained_mail,
+    }, .{ .whitespace = .indent_2, .emit_null_optional_fields = false });
     try archive.writeFileBytes("manifest.json", json, .{ .mode = 0o600 });
     try archive.finishPedantically();
     if (digest) |sha| {
@@ -82,6 +92,19 @@ pub fn prepare(
     try output.interface.flush();
     try private_file.file.sync(io);
     return private_file;
+}
+
+fn writeRetainedMail(a: Allocator, db: *database.Database, archive: *Tar, owner: i64) !?RetainedMail {
+    const rows = try retained_threads.portableRows(db, owner);
+    defer rows.close();
+    var copies: std.ArrayList(RetainedMail.Copy) = .empty;
+    while (try rows.next()) |entry| {
+        if (!webmail_store.validId(entry.id)) return error.InvalidRetainedMailId;
+        const path = try std.fmt.allocPrint(a, "RetainedMail/{s}.json", .{entry.id});
+        try archive.writeFileBytes(path, entry.document, .{ .mode = 0o600 });
+        try copies.append(a, .{ .id = try a.dupe(u8, entry.id), .path = path });
+    }
+    return if (copies.items.len != 0) .{ .copies = copies.items } else null;
 }
 
 fn openOptionalDir(dir: Dir, io: std.Io, path: []const u8) !?Dir {

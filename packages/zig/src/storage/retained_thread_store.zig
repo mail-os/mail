@@ -33,6 +33,12 @@ fn checksum(bytes: []const u8) [64]u8 {
     return std.fmt.bytesToHex(hash, .lower);
 }
 
+fn verifiedChecksum(document: []const u8, expected: []const u8) ![64]u8 {
+    const hash = checksum(document);
+    if (!std.mem.eql(u8, &hash, expected)) return error.ErasureThreadArchiveInvalid;
+    return hash;
+}
+
 fn bindSelection(row: database.Statement, selection: Selection, approval: i64) !void {
     try row.bind(1, selection.peer_user_id);
     try row.bind(2, selection.source_share_id);
@@ -59,9 +65,7 @@ pub fn existing(tx: Transaction, selection: Selection, approval: i64) !?[64]u8 {
     defer row.finalize();
     try bindSelection(row, selection, approval);
     if (!try row.step()) return null;
-    const actual = checksum(row.columnText(0));
-    if (!std.mem.eql(u8, &actual, row.columnText(1))) return error.ErasureThreadArchiveInvalid;
-    return actual;
+    return try verifiedChecksum(row.columnText(0), row.columnText(1));
 }
 
 pub fn save(tx: Transaction, selection: Selection, approval: i64, document: []const u8) ![64]u8 {
@@ -116,12 +120,40 @@ pub fn choose(tx: Transaction, start: i64, approval: i64) !void {
     if (try row.step()) return error.InvalidErasureJournal;
 }
 
-const authorized =
-    \\ FROM mail_retained_thread_archives r JOIN users u ON u.id=r.user_id
+const completed =
+    \\ FROM mail_retained_thread_archives r
     \\ JOIN hosted_erasure_thread_archive_steps t ON t.approval_id=r.approval_id
     \\ JOIN hosted_erasure_maildir_steps m ON m.start_audit_id=t.start_audit_id AND m.phase='complete'
-    \\ WHERE u.username=?1 AND u.enabled=1
 ;
+
+const authorized = completed ++ " JOIN users u ON u.id=r.user_id WHERE u.username=?1 AND u.enabled=1";
+
+pub const PortableRows = struct {
+    row: database.Statement,
+
+    pub const Entry = struct { id: []const u8, document: []const u8 };
+
+    pub fn close(self: PortableRows) void {
+        self.row.finalize();
+    }
+
+    /// The strings are valid until the next read or until the cursor closes.
+    pub fn next(self: PortableRows) !?Entry {
+        if (!try self.row.step()) return null;
+        const document = self.row.columnText(1);
+        _ = try verifiedChecksum(document, self.row.columnText(2));
+        return .{ .id = self.row.columnText(0), .document = document };
+    }
+};
+
+/// Authorized operator export can read the recipient's completed copies even
+/// when that recipient's own browser sessions have been suspended.
+pub fn portableRows(db: *Database, owner: i64) !PortableRows {
+    const row = try db.prepare("SELECT r.share_id,r.document,r.sha256" ++ completed ++ " WHERE r.user_id=?1 ORDER BY r.share_id");
+    errdefer row.finalize();
+    try row.bind(1, owner);
+    return .{ .row = row };
+}
 
 pub fn available(db: *Database, actor: []const u8) !bool {
     const row = try db.prepare("SELECT 1" ++ authorized ++ " LIMIT 1");
