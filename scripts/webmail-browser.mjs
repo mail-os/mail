@@ -2081,8 +2081,16 @@ async function fileLinkJourney(desktop, phone) {
     await viewer.goto(href)
     await heading(viewer, filename).waitFor()
     await fitsViewport(viewer)
+    const downloadButton = button(viewer, 'Download file')
+    for (const colorScheme of ['light', 'dark']) {
+      await viewer.emulateMedia({ colorScheme })
+      const foreground = await downloadButton.evaluate((button) => {
+        return { text: getComputedStyle(button).color, icon: getComputedStyle(button.querySelector('.mail-icon')).color }
+      })
+      assert.equal(foreground.icon, foreground.text, `The download icon inherits the primary button foreground in ${colorScheme} mode`)
+    }
     await screenshot(viewer, 'phone-file-link-viewer')
-    const [download] = await Promise.all([viewer.waitForEvent('download'), button(viewer, 'Download file').click()])
+    const [download] = await Promise.all([viewer.waitForEvent('download'), downloadButton.click()])
     // Linux WebKit sanitizes spaces in download names. The API suite checks
     // the exact server header, while this journey verifies the saved bytes.
     const suggested = download.suggestedFilename()
