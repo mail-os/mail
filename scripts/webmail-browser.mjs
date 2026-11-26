@@ -1773,6 +1773,13 @@ async function snapshotSharingJourney(desktop, phone) {
     assert.equal(await viewer.locator('.wm-snapshot-message').count(), 2)
     assert.equal(await viewer.getByRole('alert').count(), 0)
     assert.deepEqual(await viewerContext.cookies(), [])
+    const iconSize = await viewer.locator('link[rel="icon"]').evaluate(async (icon) => {
+      const image = new Image()
+      image.src = icon.href
+      await image.decode()
+      return image.naturalWidth
+    })
+    assert.equal(iconSize, 192, 'The tab icon loads under the snapshot image policy')
     assert.deepEqual(externalRequests, [], 'Snapshot viewing never requests remote content')
     await fitsViewport(viewer)
     await screenshot(viewer, 'phone-snapshot-viewer')

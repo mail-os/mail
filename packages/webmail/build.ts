@@ -31,6 +31,8 @@ export async function buildWebmail(): Promise<void> {
   const root = import.meta.dir
   const dist = join(root, '../zig/src/api/webmail_dist')
   const styles = await readFile(join(root, 'public/styles.css'))
+  const snapshotIconData = await readFile(join(root, 'public/mail-icon-192.png'), 'base64')
+  const snapshotIcon = webmailIcon.replace('/mail-icon-192.png', `data:image/png;base64,${snapshotIconData}`)
   await mkdir(dist, { recursive: true })
   for (const page of webmailPages) {
     const html = await renderTemplate(join(root, `pages/${page}.stx`), { injectCSS: true })
@@ -44,7 +46,9 @@ export async function buildWebmail(): Promise<void> {
     }
     const styled = html.replace('href="/styles.css"', `href="${stylesheetUrl(styles)}"`)
     const compiled = styled.replace(/<head>[^]*?<\/head>/i, (head) => {
-      const icon = /<link\b[^>]*\brel="icon"/.test(head) ? '' : `  ${webmailIcon}\n`
+      // The public snapshot only permits data images, including its tab icon.
+      const defaultIcon = page === 'snapshot' ? snapshotIcon : webmailIcon
+      const icon = /<link\b[^>]*\brel="icon"/.test(head) ? '' : `  ${defaultIcon}\n`
       const appHead = webmailAppPages.has(page) ? `  ${webmailAppHead}\n` : ''
       return head.replace('</head>', `${icon}${appHead}</head>`)
     })
