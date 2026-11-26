@@ -2222,7 +2222,7 @@ pub const CalDavStore = struct {
         return result.toOwnedSlice(arena);
     }
 
-    fn publicCalendarResource(allocator: Allocator, source: []const u8) bool {
+    pub fn publicCalendarResource(allocator: Allocator, source: []const u8) bool {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const a = arena.allocator();

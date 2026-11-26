@@ -9,7 +9,8 @@ pub const schema =
     \\    max_calendar INTEGER NOT NULL,
     \\    max_event INTEGER NOT NULL,
     \\    max_book INTEGER NOT NULL,
-    \\    max_contact INTEGER NOT NULL
+    \\    max_contact INTEGER NOT NULL,
+    \\    retained_copy_proof TEXT
     \\)
 ;
 

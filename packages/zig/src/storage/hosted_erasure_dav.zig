@@ -1,6 +1,7 @@
 //! Erase one reserved mailbox from the live DAV store while Mail is offline.
 const std = @import("std");
 const Database = @import("database.zig").Database;
+const calendar_copy = @import("hosted_erasure_calendar_copy.zig");
 const state = @import("dav_erasure_state.zig");
 const inventory = @import("hosted_erasure_inventory.zig");
 const maildir = @import("hosted_erasure_maildir.zig");
@@ -94,27 +95,42 @@ fn recordPlan(a: Allocator, tx: Database.Transaction, start_id: i64, stamp: []co
     return .{ .owner_id = owner_id, .nonce = nonce };
 }
 
-fn storeMarker(tx: Database.Transaction, native_id: i64, plan: Plan) !void {
+fn ensureCopyProofColumn(tx: Database.Transaction) !void {
+    const column = try tx.prepare("SELECT 1 FROM pragma_table_info('dav_erasure_receipts') WHERE name='retained_copy_proof'");
+    defer column.finalize();
+    if (try column.step()) return;
+    const alter = try tx.prepare("ALTER TABLE dav_erasure_receipts ADD COLUMN retained_copy_proof TEXT");
+    defer alter.finalize();
+    if (try alter.step()) return error.StepFailed;
+}
+
+fn storeMarker(tx: Database.Transaction, native_id: i64, plan: Plan, proof_json: ?[]const u8) !void {
     const insert = try tx.prepare(
-        \\INSERT INTO dav_erasure_receipts(nonce,native_user_id,dav_owner_id,max_owner,max_calendar,max_event,max_book,max_contact)
+        \\INSERT INTO dav_erasure_receipts(nonce,native_user_id,dav_owner_id,max_owner,max_calendar,max_event,max_book,max_contact,retained_copy_proof)
         \\SELECT ?1,?2,?3,coalesce((SELECT max(id) FROM dav_users),0),
         \\ coalesce((SELECT max(id) FROM dav_calendars),0),coalesce((SELECT max(id) FROM dav_events),0),
-        \\ coalesce((SELECT max(id) FROM dav_addressbooks),0),coalesce((SELECT max(id) FROM dav_contacts),0)
+        \\ coalesce((SELECT max(id) FROM dav_addressbooks),0),coalesce((SELECT max(id) FROM dav_contacts),0),?4
     );
     defer insert.finalize();
     try insert.bind(1, plan.nonce);
     try insert.bind(2, native_id);
     try insert.bindOpt(3, plan.owner_id);
+    try insert.bindOpt(4, proof_json);
     if (try insert.step()) return error.StepFailed;
 }
 
-fn hasMarker(tx: Database.Transaction, native_id: i64, plan: Plan) !bool {
-    const row = try tx.prepare("SELECT native_user_id,dav_owner_id FROM dav_erasure_receipts WHERE nonce=?1");
+const Marker = struct { copy_proof: ?calendar_copy.Proof = null };
+
+fn loadMarker(a: Allocator, tx: Database.Transaction, native_id: i64, plan: Plan) !?Marker {
+    const row = try tx.prepare("SELECT native_user_id,dav_owner_id,retained_copy_proof FROM dav_erasure_receipts WHERE nonce=?1");
     defer row.finalize();
     try row.bind(1, plan.nonce);
-    if (!try row.step()) return false;
+    if (!try row.step()) return null;
     if (row.columnInt64(0) != native_id or row.columnInt64Opt(1) != plan.owner_id) return error.InvalidErasureJournal;
-    return true;
+    return .{ .copy_proof = if (row.columnTextOpt(2)) |proof|
+        try std.json.parseFromSliceLeaky(calendar_copy.Proof, a, proof, .{ .allocate = .alloc_always })
+    else
+        null };
 }
 
 fn deleteRows(tx: Database.Transaction, owner: i64) !void {
@@ -184,7 +200,7 @@ pub fn erase(a: Allocator, io: std.Io, db: *Database, review: review_store.Revie
     defer dav.deinit();
     // Overwrite deleted live cells and reconcile historical pages separately.
     try dav.exec("PRAGMA synchronous=FULL; PRAGMA secure_delete=ON");
-    const plan = blk: {
+    const outcome = blk: {
         var tx = try dav.beginTransaction(.write);
         defer tx.deinit();
         try verifyStamp(a, io, configured_path, stamp);
@@ -195,6 +211,7 @@ pub fn erase(a: Allocator, io: std.Io, db: *Database, review: review_store.Revie
         const marker_table = try tx.prepare(state.schema);
         defer marker_table.finalize();
         if (try marker_table.step()) return error.StepFailed;
+        try ensureCopyProofColumn(tx);
 
         const plan = plan: {
             var main_tx = try db.beginTransaction(.write);
@@ -217,21 +234,33 @@ pub fn erase(a: Allocator, io: std.Io, db: *Database, review: review_store.Revie
         defer authority.deinit();
         const active = try review_store.requireStarted(a, authority, review, start_id, time.timestamp());
         if (active.identity.native_user_id != scope.owner) return error.AssignmentChanged;
-        if (!try hasMarker(tx, scope.owner, plan)) {
+        const marker = try loadMarker(a, tx, scope.owner, plan);
+        var copy_proof: ?calendar_copy.Proof = if (marker) |stored| stored.copy_proof else null;
+        if (copy_proof) |proof| try shared.requireRecordedCalendarProof(a, authority, review, start_id, scope.owner, proof);
+        if (marker == null) {
             if (plan.completion != null) return error.ErasureDavReceiptMissing;
             if (current.owner_id != plan.owner_id) return error.ErasureDavOwnerUnresolved;
             try review_store.compareDav(a, scope.dav, current);
-            if (plan.owner_id != null) try shared.requireRelease(a, authority, review, start_id, scope.owner, .dav);
-            try storeMarker(tx, scope.owner, plan);
+            if (plan.owner_id != null) {
+                if (try shared.requireRelease(a, authority, review, start_id, scope.owner, .dav)) |release| {
+                    if (release.copies.len != 0) copy_proof = .{
+                        .approval_audit_id = release.audit_id,
+                        .copies = try calendar_copy.verify(a, authority, tx, scope.owner, release.copies, time.timestamp()),
+                    };
+                }
+            }
+            const proof_json = if (copy_proof) |proof| try std.json.Stringify.valueAlloc(a, proof, .{}) else null;
+            try storeMarker(tx, scope.owner, plan, proof_json);
             if (plan.owner_id) |id| try deleteRows(tx, id);
         }
         try verifyRemoved(a, tx, review.mailbox, scope.owner, short, plan.owner_id);
         try tx.commit();
         try authority.commit();
-        break :blk plan;
+        break :blk .{ .plan = plan, .copy_proof = copy_proof };
     };
     try verifyStamp(a, io, configured_path, stamp);
 
+    const plan = outcome.plan;
     var receipt: Receipt = .{
         .mailbox = review.mailbox,
         .request_id = review.request_id,
@@ -253,6 +282,7 @@ pub fn erase(a: Allocator, io: std.Io, db: *Database, review: review_store.Revie
         .native_user_id = scope.owner,
         .dav_owner_id = plan.owner_id,
         .nonce = plan.nonce,
+        .retained_calendar_copy_proof = outcome.copy_proof,
     }, .{});
     receipt.audit_id = try review_store.writeAudit(tx, "hosted.erasure.dav.removed", review.mailbox, operator, now, details);
     const finish = try tx.prepare(

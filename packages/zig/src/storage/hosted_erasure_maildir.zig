@@ -181,7 +181,7 @@ pub fn erase(a: Allocator, io: std.Io, db: *Database, review: review_store.Revie
         if (try loadStep(a, tx, start_id)) |existing| {
             resumed_plan = existing.phase == .planned;
             if (resumed_plan and existing.mailbox_stamp != null)
-                try shared.requireRelease(a, tx, review, start_id, observation.identity.native_user_id, .maildir);
+                _ = try shared.requireRelease(a, tx, review, start_id, observation.identity.native_user_id, .maildir);
             try tx.commit();
             break :blk existing;
         }
@@ -190,7 +190,7 @@ pub fn erase(a: Allocator, io: std.Io, db: *Database, review: review_store.Revie
         const stamp = try stampDirectory(a, io, root, review.mailbox, mount);
         if ((stamp != null) != (sampled.maildir.state == .observed)) return error.ErasureDirectoryChanged;
         if (stamp) |value| {
-            try shared.requireRelease(a, tx, review, start_id, observation.identity.native_user_id, .maildir);
+            _ = try shared.requireRelease(a, tx, review, start_id, observation.identity.native_user_id, .maildir);
             try walkMailbox(a, io, root, review.mailbox, value, mount, false);
         }
         var bytes: [16]u8 = undefined;
@@ -248,7 +248,7 @@ pub fn erase(a: Allocator, io: std.Io, db: *Database, review: review_store.Revie
         const observation = try review_store.requireStarted(a, tx, review, start_id, now);
         if (staged) |stamp| {
             if (!sameStamp(staged, step.mailbox_stamp)) return error.ErasureDirectoryChanged;
-            try shared.requireRelease(a, tx, review, start_id, observation.identity.native_user_id, .maildir);
+            _ = try shared.requireRelease(a, tx, review, start_id, observation.identity.native_user_id, .maildir);
             try walkMailbox(a, io, root, staged_name, stamp, mount, false);
             try walkMailbox(a, io, root, staged_name, stamp, mount, true);
             try root.deleteDir(io, staged_name);

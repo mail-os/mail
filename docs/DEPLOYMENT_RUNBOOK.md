@@ -567,6 +567,21 @@ approval for their own store before deleting content. The approval records
 the operator's decision and leaves grants, discussion, and delivery records
 in place for their own disposition.
 
+For a DAV case that requires a retained copy, use the recipient's shared
+CalDAV connection to copy the visible resources into a dedicated calendar
+they own. Keep the source timezone and resource bytes. Use
+`release_source_with_calendar_copies` in the decision and add a nonempty
+`retained_calendar_copies` list. Each entry includes `source_share_id` and
+`peer_user_id` from the private scope report and the numeric
+`destination_calendar_id` from the peer's own calendar list.
+
+DAV removal verifies the recipient can still read their mailbox, owns the
+destination, and has the exact public resource bytes and timezone. A free/busy
+grant does not authorize a retained event copy. The dedicated calendar may
+contain only the resources visible through the source grant. If proof fails,
+the source remains in place. The DAV transaction saves the verification evidence
+with removal, so an interrupted audit can recover the same proof.
+
 ### Remove the reserved mailbox's canonical Maildir
 
 This step permanently removes the canonical Maildir for one reserved mailbox.
