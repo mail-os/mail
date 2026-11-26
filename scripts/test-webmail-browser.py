@@ -230,6 +230,10 @@ def verify(binary, output, engine, accessibility=False):
             studio = seed_shared_inbox(fixture, owner, sender)
             team_command(fixture, "team", "grant", "studio", studio, sender, "mailbox")
             day = seed_calendar(fixture, owner)
+            if accessibility:
+                for letter in "abc":
+                    contact = {"kind": "contact", "name": f"Harland {letter.upper()}", "emails": [f"harland-{letter}@example.test"]}
+                    assert fixture.api(session, "address-book", contact, "POST")[0] == 201
             env = dict(os.environ, MAIL_BROWSER_URL=fixture.webmail, MAIL_BROWSER_OWNER=owner,
                        MAIL_BROWSER_SENDER=sender, MAIL_BROWSER_PASSWORD=fixture.password, MAIL_BROWSER_DAY=day,
                        MAIL_BROWSER_NEWCOMER=newcomer, MAIL_BROWSER_LONG_FOLDER=LONG_FOLDER,

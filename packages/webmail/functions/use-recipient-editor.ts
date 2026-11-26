@@ -19,14 +19,19 @@ export function useRecipientEditor(search: (query: string) => Promise<Contact[]>
   let request = 0
   let timer: ReturnType<typeof setTimeout> | undefined
 
+  function dismissSuggestions(): void {
+    clearTimeout(timer)
+    ++request
+    suggestions.set([])
+    suggestionIndex.set(-1)
+    recipientSearching.set(false)
+  }
+
   function commit(field: RecipientField): void {
     const input = inputs[field]()
     if (input.trim()) fields[field].set(mergeRecipients(fields[field](), recipients(input)))
     inputs[field].set('')
-    suggestions.set([])
-    suggestionIndex.set(-1)
-    recipientSearching.set(false)
-    ++request
+    dismissSuggestions()
   }
   function commitAll(): void { batch(() => { commit('to'); commit('cc'); commit('bcc') }) }
   function removeRecipient(field: RecipientField, index: number): void {
@@ -46,18 +51,16 @@ export function useRecipientEditor(search: (query: string) => Promise<Contact[]>
     item.raw = contact.name ? `${contact.name} <${contact.address}>` : contact.address
     fields[field].set(mergeRecipients(fields[field](), [item]))
     inputs[field].set('')
-    suggestions.set([])
-    suggestionIndex.set(-1)
-    recipientSearching.set(false)
-    ++request
+    dismissSuggestions()
   }
   function lookup(field: RecipientField): void {
     recipientFocus.set(field)
     clearTimeout(timer)
     const query = inputs[field]().trim()
     const version = ++request
+    suggestions.set([])
     suggestionIndex.set(-1)
-    if (query.length < 2) { suggestions.set([]); recipientSearching.set(false); return }
+    if (query.length < 2) { recipientSearching.set(false); return }
     recipientSearching.set(true)
     timer = setTimeout(async () => {
       try {
@@ -71,14 +74,29 @@ export function useRecipientEditor(search: (query: string) => Promise<Contact[]>
     }, 180)
   }
   function recipientKeydown(event: KeyboardEvent, field: RecipientField): void {
-    if (event.key === 'ArrowDown' && suggestions().length) { event.preventDefault(); suggestionIndex.update(index => (index + 1) % suggestions().length); return }
-    if (event.key === 'ArrowUp' && suggestions().length) { event.preventDefault(); suggestionIndex.update(index => (index + suggestions().length - 1) % suggestions().length); return }
-    if (event.key === 'Escape' && suggestions().length) { event.preventDefault(); event.stopPropagation(); suggestions.set([]); return }
+    const options = suggestions()
+    if (event.key === 'ArrowDown' && options.length) {
+      event.preventDefault()
+      suggestionIndex.update(index => (index + 1) % options.length)
+      return
+    }
+    if (event.key === 'ArrowUp' && options.length) {
+      event.preventDefault()
+      suggestionIndex.update(index => index <= 0 ? options.length - 1 : index - 1)
+      return
+    }
+    if (event.key === 'Escape' && (options.length || recipientSearching())) {
+      event.preventDefault()
+      event.stopPropagation()
+      dismissSuggestions()
+      return
+    }
     if (event.key === 'Enter' || event.key === ';' || event.key === ',') {
       // A comma inside an unfinished quoted display name is ordinary text.
       if (event.key === ',' && (inputs[field]().match(/(?<!\\)"/g)?.length ?? 0) % 2) return
       event.preventDefault()
-      if (event.key === 'Enter' && suggestionIndex() >= 0) chooseContact(field, suggestions()[suggestionIndex()])
+      const option = options[suggestionIndex()]
+      if (event.key === 'Enter' && option) chooseContact(field, option)
       else commit(field)
     }
     else if (event.key === 'Backspace' && !inputs[field]() && fields[field]().length) {
