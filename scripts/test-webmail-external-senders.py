@@ -346,16 +346,17 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory(prefix="mail-external-smtp-") as directory:
         root = Path(directory)
         trust, trusted_context = make_tls(root, "trusted", "localhost")
-        fixture = Fixture(args.binary.resolve(strict=True), root, staging=True)
-        if args.browser:
-            with provider_server(trusted_context) as server:
-                verify_browser(fixture, server, trust, args.browser, args.screenshots.resolve())
-            raise SystemExit(0)
-        wrong_host_ca, wrong_host = make_tls(root, "wrong-name", "wrong.example")
-        _, wrong_issuer = make_tls(root, "untrusted", "localhost")
-        # Trust both roots to isolate hostname verification from trust-chain failure.
-        roots = root / "approved-roots.pem"
-        roots.write_bytes(trust.read_bytes() + wrong_host_ca.read_bytes())
+        # Let the provider claim its port before the daemon fixture selects its
+        # ports. The daemon cannot bind them until its subprocess starts.
         with provider_server(trusted_context) as server:
+            fixture = Fixture(args.binary.resolve(strict=True), root, staging=True)
+            if args.browser:
+                verify_browser(fixture, server, trust, args.browser, args.screenshots.resolve())
+                raise SystemExit(0)
+            wrong_host_ca, wrong_host = make_tls(root, "wrong-name", "wrong.example")
+            _, wrong_issuer = make_tls(root, "untrusted", "localhost")
+            # Trust both roots to isolate hostname verification from trust-chain failure.
+            roots = root / "approved-roots.pem"
+            roots.write_bytes(trust.read_bytes() + wrong_host_ca.read_bytes())
             verify(fixture, server, roots, wrong_host, wrong_issuer)
     print("External From verification, strict TLS SMTP, envelope review, Outbox recovery, and revocation passed.")
