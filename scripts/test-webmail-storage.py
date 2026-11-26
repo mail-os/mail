@@ -388,6 +388,11 @@ def main():
         with test.daemon(), closing(sqlite3.connect(Path(root) / "smtp.db")) as db:
             sink = test.provision("sink", quota=8 * MIB)
             staged_user, referenced_id = check_uploads(test, db)
+            local_user = test.create_local("local-drafts")
+            local_session = test.login(local_user)
+            local_upload = secrets.token_hex(16)
+            ok(upload(test, local_session, local_upload, b"local draft attachment"))
+            ok(test.api(local_session, "drafts", {"text": "Local draft", "attachments": [{"uploadId": local_upload}]}))
             check_draft_budget(test, db)
             expunged_user, expunged_id = check_imap_draft_expunges(test, db, sink)
             check_selective_expunge(test, db)
@@ -416,13 +421,20 @@ def main():
             with db:
                 db.execute("UPDATE webmail_records SET expires_at=1 WHERE id=?", (interrupted,))
 
-        subprocess.run([str(test.binary), "user:local", "delete", staged_user], env=test.env, cwd=root, check=True)
+        refused = subprocess.run([str(test.binary), "user:local", "delete", staged_user],
+                                 env=test.env, cwd=root, capture_output=True, text=True)
+        assert refused.returncode != 0 and "managed retirement workflow" in refused.stderr, refused.stderr
+        subprocess.run([str(test.binary), "user:local", "delete", local_user], env=test.env, cwd=root, check=True)
         with test.daemon(), closing(sqlite3.connect(Path(root) / "smtp.db")) as db:
             assert db.execute("SELECT COUNT(*) FROM webmail_records WHERE id=? OR username=?",
-                              (interrupted, staged_user)).fetchone() == (0,)
+                              (interrupted, local_user)).fetchone() == (0,)
             assert db.execute("SELECT COUNT(*) FROM webmail_uploads WHERE id IN (?,?)",
-                              (upload_id, referenced_id)).fetchone() == (0,)
-            print("Verified retained Unknown payloads, expiry after review, attachment reference release, and account removal across restart.")
+                              (upload_id, local_upload)).fetchone() == (0,)
+            assert db.execute("SELECT COUNT(*) FROM webmail_records WHERE username=? AND kind='draft'",
+                              (staged_user,)).fetchone() == (1,)
+            assert db.execute("SELECT COUNT(*) FROM webmail_uploads WHERE username=? AND id=?",
+                              (staged_user, referenced_id)).fetchone() == (1,)
+            print("Verified retained Unknown payloads, expiry after review, attachment cleanup for local deletion, and preservation of hosted drafts across restart.")
 
 
 if __name__ == "__main__":

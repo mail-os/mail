@@ -274,6 +274,12 @@ class Fixture(MailClient):
                     daemon.kill()
                     daemon.wait()
 
+    def create_local(self, user):
+        mailbox = f"{user}@{DOMAIN}"
+        subprocess.run([str(self.binary), "user:local", "create", mailbox, self.password, mailbox],
+                       env=self.env, cwd=self.directory, check=True, capture_output=True, timeout=15)
+        return mailbox
+
     def provision(self, user, *, quota=LARGE, daily=20, enabled=True):
         mailbox = f"{user}@{DOMAIN}"
         previous = self.specs.get(mailbox)
