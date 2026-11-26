@@ -18,6 +18,7 @@ Fixture = runpy.run_path(str(Path(__file__).with_name("test-hosted-limits.py")))
 MATCH_COUNT = 251
 PAGE_SIZE = 250
 COLLECTION = "messages_v3"
+IDENTITY_FIELDS = "id,username,mailbox,filename"
 
 
 class SearchIndex(ThreadingHTTPServer):
@@ -33,6 +34,7 @@ class SearchIndex(ThreadingHTTPServer):
         self.writes = []
         self.pause_upsert = None
         self.pause_search = None
+        self.normalize_filters = False
 
 
 class SearchHandler(BaseHTTPRequestHandler):
@@ -62,16 +64,23 @@ class SearchHandler(BaseHTTPRequestHandler):
         requests = self.server.coverage_requests if query == "*" else self.server.requests
         requests.append((query, page, size, condition, fields))
 
+        def scope(value):
+            if not self.server.normalize_filters:
+                return value
+            return "".join(char for char in value.lower() if char.isalnum())
+
+        def hit(doc):
+            return {"document": {field: doc[field] for field in fields.split(",")} if fields else doc}
+
         matches = [
             doc for doc in documents
-            if condition in (
-                f'username:=`{doc["username"]}`',
-                f'username:=`{doc["username"]}` && mailbox:=`{doc["mailbox"]}`',
+            if scope(condition) in (
+                scope(f'username:=`{doc["username"]}`'),
+                scope(f'username:=`{doc["username"]}` && mailbox:=`{doc["mailbox"]}`'),
             )
             and (query == "*" or all(word in doc[query_by].lower().split() for word in query.lower().split()))
         ]
-        hits = [{"document": {"id": doc["id"]} if fields == "id" else doc}
-                for doc in matches[(page - 1) * size : page * size]]
+        hits = [hit(doc) for doc in matches[(page - 1) * size : page * size]]
         response = {"found": len(matches), "hits": hits, "page": page, "search_cutoff": False}
         pause = self.server.pause_search
         if query != "*" and pause is not None and condition == pause[0]:
@@ -85,7 +94,9 @@ class SearchHandler(BaseHTTPRequestHandler):
             if self.server.failure == "empty":
                 response["hits"] = []
             if self.server.failure == "duplicate":
-                response["hits"] = [{"document": {"id": matches[0]["id"]}}]
+                response["hits"] = [hit(matches[0])]
+            if self.server.failure == "invalid_identity":
+                response["hits"][0]["document"]["id"] = "f" * 32
             if self.server.failure == "changed":
                 response["found"] -= 1
             if self.server.failure == "cutoff":
@@ -158,8 +169,8 @@ def expect_index_search(index, client, filter_by, query, term, expected, *, uid=
     matches = search(client, query, uid)
     assert matches == expected, (query, index.failure, len(matches), len(expected), matches[-3:])
     assert index.requests == [
-        (term, 1, PAGE_SIZE, filter_by, "id"),
-        (term, 2, PAGE_SIZE, filter_by, "id"),
+        (term, 1, PAGE_SIZE, filter_by, IDENTITY_FIELDS),
+        (term, 2, PAGE_SIZE, filter_by, IDENTITY_FIELDS),
     ], index.requests
 
 
@@ -175,7 +186,8 @@ def verify_subject_reindex(index, fixture, directory):
     seed_message(index, directory, owner, "new", 1, encoded, mailbox="INBOX", legacy=True)
     seed_message(index, directory, peer, "new", 0, plain, mailbox="INBOX")
     # A stale document keeps the count equal even though an actual ID is missing.
-    stale = dict(index.documents[0], id="0" * 32)
+    stale = dict(index.documents[0], filename="stale.eml")
+    stale["id"] = hashlib.sha256("\0".join((owner, "INBOX", stale["filename"])).encode()).hexdigest()[:32]
     index.documents.append(stale)
 
     with fixture.imap(owner) as client:
@@ -190,7 +202,7 @@ def verify_subject_reindex(index, fixture, directory):
         index.coverage_requests.clear()
         assert search(client, query) == uids
         assert not index.requests
-        assert index.coverage_requests == [("*", 1, PAGE_SIZE, scope, "id")]
+        assert index.coverage_requests == [("*", 1, PAGE_SIZE, scope, IDENTITY_FIELDS)]
 
         index.failed_writes = {"POST"}
         try:
@@ -207,7 +219,7 @@ def verify_subject_reindex(index, fixture, directory):
 
         def uses_index(expected, scope):
             index.requests.clear()
-            return search(client, query) == expected and index.requests == [("Staged receipt", 1, PAGE_SIZE, scope, "id")]
+            return search(client, query) == expected and index.requests == [("Staged receipt", 1, PAGE_SIZE, scope, IDENTITY_FIELDS)]
 
         wait_for(lambda: uses_index(uids, scope), "the rebuilt Inbox did not resume indexed search")
         wait_for(lambda: any(doc["username"] == owner and doc["mailbox"] == "Planning" and doc["subject"] == decoded
@@ -297,7 +309,7 @@ def verify_address_reindex(index, fixture, directory):
         def indexed_matches(expected):
             index.requests.clear()
             assert matches(client, "FROM") == matches(client, "TO") == expected
-            return index.requests == [("café", 1, PAGE_SIZE, scope, "id")] * 2
+            return index.requests == [("café", 1, PAGE_SIZE, scope, IDENTITY_FIELDS)] * 2
 
         wait_for(lambda: indexed_matches(uids), "FROM and TO did not resume indexed search")
         assert subject_only[1]["sender"] == subject_only[1]["recipients"] == encoded_name.splitlines()[0]
@@ -315,14 +327,15 @@ def verify_address_reindex(index, fixture, directory):
 
 
 def verify(index, fixture, directory):
-    owner = fixture.provision("index-owner")
-    other = fixture.provision("other-index-owner")
+    owner = fixture.provision("index.owner")
+    other = fixture.provision("index-owner")
+    index.normalize_filters = True
     with fixture.imap(other) as client:
         assert client.create("Indexed")[0] == "OK"
         seed_message(index, directory, other, "Indexed", MATCH_COUNT, "Alpha project")
 
     with fixture.imap(owner) as client:
-        for folder in ("Indexed", "Other"):
+        for folder in ("Indexed", "Index.ed"):
             assert client.create(folder)[0] == "OK"
         for number in range(MATCH_COUNT):
             reviewed = number == MATCH_COUNT - 1
@@ -330,7 +343,7 @@ def verify(index, fixture, directory):
             seed_message(index, directory, owner, "Indexed", number, subject, reviewed=reviewed)
         seed_message(index, directory, owner, "Indexed", MATCH_COUNT, "Beta")
         # A matching filename in the aggregate view belongs to two folders.
-        seed_message(index, directory, owner, "Other", 0, "Beta outside Indexed")
+        seed_message(index, directory, owner, "Index.ed", 0, "Beta outside Indexed")
 
         assert client.select("Indexed") == ("OK", [str(MATCH_COUNT + 1).encode()])
         all_uids = search(client, "ALL")
@@ -343,7 +356,7 @@ def verify(index, fixture, directory):
         for term, expected in (("older", matching[:-1]), ("absent", [])):
             index.requests.clear()
             assert search(client, "SUBJECT " + term) == expected
-            assert index.requests == [(term, 1, PAGE_SIZE, folder_filter, "id")]
+            assert index.requests == [(term, 1, PAGE_SIZE, folder_filter, IDENTITY_FIELDS)]
         # The index uses token matching. A local substring scan of "project alpha"
         # would find no matches, so this also proves we used both successful pages.
         expect_index_search(index, client, folder_filter, 'NOT SUBJECT "project alpha"', "project alpha", nonmatching)
@@ -352,6 +365,8 @@ def verify(index, fixture, directory):
             index.failure = failure
             expect_index_search(index, client, folder_filter, "SUBJECT alpha", "alpha", matching)
             expect_index_search(index, client, folder_filter, "NOT SUBJECT alpha", "alpha", nonmatching)
+        index.failure = "invalid_identity"
+        expect_index_search(index, client, folder_filter, 'NOT SUBJECT "project alpha"', "project alpha", all_uids)
         index.failure = None
 
         assert client.select('"All Mail"')[0] == "OK"

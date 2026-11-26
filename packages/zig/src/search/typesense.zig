@@ -190,6 +190,30 @@ pub fn deleteIndexedMessage(allocator: std.mem.Allocator, username: []const u8, 
 
 pub const MessageIds = std.AutoHashMapUnmanaged(MessageId, void);
 
+const IndexedIdentity = struct {
+    username: []const u8,
+    folder: []const u8,
+    filename: []const u8,
+    id: MessageId,
+
+    fn fromDocument(doc: std.json.ObjectMap) !IndexedIdentity {
+        const username = se.SearchResponse.docString(doc, "username");
+        const folder = se.SearchResponse.docString(doc, "mailbox");
+        const filename = se.SearchResponse.docString(doc, "filename");
+        const id = se.SearchResponse.docString(doc, "id");
+        var expected: MessageId = undefined;
+        if (username.len == 0 or folder.len == 0 or filename.len == 0 or
+            !std.mem.eql(u8, id, docId(&expected, username, folder, filename)))
+            return error.IncompleteSearch;
+        return .{ .username = username, .folder = folder, .filename = filename, .id = expected };
+    }
+
+    fn matches(self: IndexedIdentity, username: []const u8, folder: ?[]const u8) bool {
+        return std.mem.eql(u8, self.username, username) and
+            (folder == null or std.mem.eql(u8, self.folder, folder.?));
+    }
+};
+
 /// Return a complete set of index hits scoped to the user and optional mailbox.
 /// The caller owns the set. An incomplete result must fall back to a file scan.
 pub fn searchMessageIds(
@@ -216,11 +240,13 @@ pub fn searchMessageIds(
         .query = query,
         .query_by = query_by,
         .filter_by = filter.items,
-        .include_fields = "id",
+        .include_fields = "id,username,mailbox,filename",
         .per_page = 250,
     };
     var ids: MessageIds = .empty;
     errdefer ids.deinit(allocator);
+    var seen: MessageIds = .empty;
+    defer seen.deinit(allocator);
     var expected_total: ?u64 = null;
     while (true) {
         var result = try engine.search(allocator, collection, params);
@@ -232,20 +258,19 @@ pub fn searchMessageIds(
         }
         expected_total = total;
 
-        const before = ids.count();
+        // Typesense compares normalized strings. Track the raw hits for paging,
+        // then enforce the exact owner and folder when building the caller's set.
+        const before = seen.count();
         var hits = result.hits();
         while (hits.next()) |doc| {
-            const id = se.SearchResponse.docString(doc, "id");
-            if (id.len != @sizeOf(MessageId)) return error.IncompleteSearch;
-            for (id) |byte| {
-                if (!std.ascii.isHex(byte) or std.ascii.isUpper(byte)) return error.IncompleteSearch;
-            }
-            const entry = try ids.getOrPut(allocator, id[0..@sizeOf(MessageId)].*);
+            const identity = try IndexedIdentity.fromDocument(doc);
+            const entry = try seen.getOrPut(allocator, identity.id);
             if (entry.found_existing) return error.IncompleteSearch;
+            if (identity.matches(username, mailbox)) try ids.put(allocator, identity.id, {});
         }
-        if (ids.count() - before != @min(params.per_page, total - before))
+        if (seen.count() - before != @min(params.per_page, total - before))
             return error.IncompleteSearch;
-        if (ids.count() == total) return ids;
+        if (seen.count() == total) return ids;
         if (params.page == std.math.maxInt(u32)) return error.IncompleteSearch;
         params.page += 1;
     }
@@ -319,11 +344,11 @@ pub fn searchDocs(
 
     var it = result.hits();
     while (it.next()) |doc| {
-        const fname = se.SearchResponse.docString(doc, "filename");
-        if (fname.len == 0) continue;
+        const identity = try IndexedIdentity.fromDocument(doc);
+        if (!identity.matches(username, mailbox)) continue;
 
         var hit = MessageHit{
-            .mailbox = try allocator.dupe(u8, se.SearchResponse.docString(doc, "mailbox")),
+            .mailbox = try allocator.dupe(u8, identity.folder),
             .filename = undefined,
             .subject = undefined,
             .sender = undefined,
@@ -331,7 +356,7 @@ pub fn searchDocs(
             .date = std.fmt.parseInt(i64, se.SearchResponse.docString(doc, "date"), 10) catch 0,
         };
         errdefer allocator.free(hit.mailbox);
-        hit.filename = try allocator.dupe(u8, fname);
+        hit.filename = try allocator.dupe(u8, identity.filename);
         errdefer allocator.free(hit.filename);
         hit.subject = try allocator.dupe(u8, se.SearchResponse.docString(doc, "subject"));
         errdefer allocator.free(hit.subject);
@@ -436,6 +461,31 @@ test "docId is stable and differs across mailboxes" {
     var c: [32]u8 = undefined;
     const id3 = docId(&c, "chris", "Archive", "1781094896.eml");
     try std.testing.expect(!std.mem.eql(u8, id1, id3));
+}
+
+test "search identity checks exact mailbox and folder and rejects a forged ID" {
+    const a = std.testing.allocator;
+    const owner = "index.owner@example.test";
+    const folder = "Index.ed";
+    const filename = "1781094896.eml";
+    var id: MessageId = undefined;
+    var builder = se.DocBuilder.init(a);
+    defer builder.deinit();
+    try builder.putString("id", docId(&id, owner, folder, filename));
+    try builder.putString("username", owner);
+    try builder.putString("mailbox", folder);
+    try builder.putString("filename", filename);
+    const json = try builder.toOwned();
+    defer a.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    const identity = try IndexedIdentity.fromDocument(parsed.value.object);
+    try std.testing.expect(identity.matches(owner, folder));
+    try std.testing.expect(identity.matches(owner, null));
+    try std.testing.expect(!identity.matches("index-owner@example.test", folder));
+    try std.testing.expect(!identity.matches(owner, "Indexed"));
+    parsed.value.object.getPtr("username").?.* = .{ .string = "index-owner@example.test" };
+    try std.testing.expectError(error.IncompleteSearch, IndexedIdentity.fromDocument(parsed.value.object));
 }
 
 test "message schema declares the search model" {
