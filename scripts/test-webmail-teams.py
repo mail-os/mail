@@ -78,7 +78,7 @@ def verify(test, db, owner, admin, member, outsider):
     summary = expect(test.api(colleague, "teams/studio"))
     assert summary["members"] == [{"mailbox": member, "role": "member", "enabled": True}]
     assert {grant["scope"] for grant in summary["grants"]} == {"calendar", "sender"}
-    command(test, "team", "grant", "studio", admin, owner, "comments", "thread-reference")
+    command(test, "team", "grant", "studio", admin, owner, "attachments", "message-reference")
     assert len(expect(test.api(colleague, "teams/studio"))["grants"]) == 2
     expect(put(helper, dict(sender, allowed=False)))
     expect(put(captain, sender))
@@ -146,13 +146,13 @@ def main():
             accounts = [test.provision(name) for name in ("owner", "manager", "member", "outsider")]
             survivor = verify(test, db, *accounts)
             command(test, "team", "member", "studio", accounts[2], "member")
-            command(test, "team", "grant", "studio", survivor, accounts[2], "search")
+            command(test, "team", "grant", "studio", survivor, accounts[2], "attachments", "message-reference")
         command(test, "domain", "migrate", survivor.split("@")[1], "renamed.example.test", "--yes")
         with test.daemon():
             renamed = survivor.split("@")[0] + "@renamed.example.test"
             info = expect(test.api(test.login(renamed), "teams/studio"))
             assert info["team"]["role"] == "owner"
-            assert info["grants"] == [{"source": renamed, "grantee": "member@renamed.example.test", "scope": "search", "resource": ""}]
+            assert info["grants"] == [{"source": renamed, "grantee": "member@renamed.example.test", "scope": "attachments", "resource": "message-reference"}]
     print("Verified team roles, last-owner races, grant isolation and cleanup, audit rollback, session revocation, and domain migration over native HTTPS.")
 
 

@@ -796,8 +796,11 @@ use **Share this message in…** to add or remove a message. Replies and message
 linked by your private conversation grouping require an explicit addition.
 
 Teammates can search the shared subject, sender, and plain-text previews,
-comment, and download eligible attachments when the owner enables downloads.
-Removing a message removes access to that message and its attachments.
+post comments, and download eligible attachments when the owner enables downloads.
+Open the share to change its search and comment permissions for that teammate.
+The teammate can still read the shared messages and past comments after either
+permission is turned off. Removing a message removes access to that message and
+its attachments.
 Renaming the collection updates its title for the teammate. Deleting it, team
 offboarding, or **View access → Revoke access** ends the grant.
 
@@ -826,10 +829,18 @@ the membership. Admins may remove ordinary members.
 `PUT /webmail/api/teams/:id/grants` accepts
 `{source, grantee, scope, resource, allowed}`. Both mailboxes must be on the
 team. A member can grant or revoke access to their own resources. Owners and
-admins can also revoke grants within the team. The scopes `mailbox`, `sender`,
-and `search` take an empty resource. The scopes `calendar`, `attachments`, and
-`comments` take a specific resource ID. See the team workflow issues for
-the rollout of these permissions to mail and calendar clients.
+admins can also revoke grants within the team. The scopes `mailbox` and `sender`
+take an empty resource. The scopes `calendar` and `attachments` take a specific
+resource ID. For `search` and `comments`, use the ID returned by the conversation
+or collection share endpoint. The share must name the same team, source, and
+teammate. These scopes control searching the shared messages and posting new
+comments. They cannot issue a share or authorize access to a private mailbox.
+
+Existing shares start with both permissions enabled. Standalone search and
+comment records created by older versions stay inactive. The team directory
+reports the effective permissions on current shares. Older binaries cannot read
+the new restrictions. Revoke affected shares before rolling back to a version
+that predates this feature.
 
 Use `offboard-owner` to appoint an existing teammate and remove the departing
 owner in one transaction. The successor needs an enabled mailbox. Teams set up

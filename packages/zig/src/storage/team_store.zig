@@ -524,8 +524,8 @@ pub fn offboardOwner(db: *database.Database, a: Allocator, operator: []const u8,
 fn validGrant(grant: Grant) bool {
     if (!validText(grant.resource, 255)) return false;
     return switch (grant.scope) {
-        .mailbox, .sender, .search => grant.resource.len == 0,
-        .calendar, .attachments, .comments => grant.resource.len > 0,
+        .mailbox, .sender => grant.resource.len == 0,
+        .calendar, .attachments, .search, .comments => grant.resource.len > 0,
     };
 }
 
@@ -535,6 +535,12 @@ pub fn setGrant(db: *database.Database, a: Allocator, actor: Actor, team: []cons
     const principal = try access(tx, team, actor);
     if (!validGrant(grant)) return error.InvalidTeamData;
     const source_id, const grantee_id = try authorizeGrant(tx, principal, actor, team, grant.source, grant.grantee, allowed);
+    if (grant.scope == .search or grant.scope == .comments) {
+        if (try setThreadPermission(tx, team, source_id, grantee_id, grant, allowed))
+            try audit(tx, a, actor, team, if (allowed) "team.grant" else "team.revoke", grant);
+        try tx.commit();
+        return;
+    }
     const sql = if (allowed)
         "INSERT INTO mail_team_grants(team_id,source_id,grantee_id,scope,resource) VALUES(?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING RETURNING 1"
     else
@@ -548,6 +554,24 @@ pub fn setGrant(db: *database.Database, a: Allocator, actor: Actor, team: []cons
     if (!changed) return;
     try audit(tx, a, actor, team, if (allowed) "team.grant" else "team.revoke", grant);
     try tx.commit();
+}
+
+// Historical directory records never grant access to a share. A permission
+// change names an existing share owned by the exact source/grantee pair.
+fn setThreadPermission(tx: Tx, team: []const u8, source_id: i64, grantee_id: i64, grant: Grant, allowed: bool) !bool {
+    {
+        const share = try tx.prepare("SELECT 1 FROM mail_team_thread_shares WHERE id=?1 AND team_id=?2 AND owner_id=?3 AND grantee_id=?4");
+        defer share.finalize();
+        try bind(share, .{ grant.resource, team, source_id, grantee_id });
+        if (!try share.step()) return error.TeamShareNotFound;
+    }
+    const stmt = try tx.prepare(if (allowed)
+        "DELETE FROM mail_team_thread_restrictions WHERE share_id=?1 AND scope=?2 RETURNING 1"
+    else
+        "INSERT INTO mail_team_thread_restrictions(share_id,scope) VALUES(?1,?2) ON CONFLICT DO NOTHING RETURNING 1");
+    defer stmt.finalize();
+    try bind(stmt, .{ grant.resource, @tagName(grant.scope) });
+    return stmt.step();
 }
 
 fn authorizeGrant(tx: Tx, principal: Access, actor: Actor, team: []const u8, source_name: []const u8, grantee_name: []const u8, allowed: bool) !struct { i64, i64 } {
@@ -717,7 +741,15 @@ pub fn details(db: *database.Database, a: Allocator, actor: Actor, team: []const
         \\SELECT s.username,g.username,p.scope,p.resource FROM mail_team_grants p
         \\JOIN users s ON s.id=p.source_id JOIN users g ON g.id=p.grantee_id
         \\WHERE p.team_id=?1 AND (?2 OR p.source_id=?3 OR p.grantee_id=?3)
-        \\ORDER BY s.username,g.username,p.scope,p.resource
+        \\AND p.scope NOT IN ('search','comments')
+        \\UNION ALL
+        \\SELECT s.username,g.username,capability.scope,h.id FROM mail_team_thread_shares h
+        \\JOIN users s ON s.id=h.owner_id AND s.enabled=1
+        \\JOIN users g ON g.id=h.grantee_id AND g.enabled=1
+        \\CROSS JOIN (SELECT 'search' AS scope UNION ALL SELECT 'comments') capability
+        \\WHERE h.team_id=?1 AND (?2 OR h.owner_id=?3 OR h.grantee_id=?3)
+        \\AND NOT EXISTS(SELECT 1 FROM mail_team_thread_restrictions r WHERE r.share_id=h.id AND r.scope=capability.scope)
+        \\ORDER BY 1,2,3,4
     );
     defer grants.finalize();
     try bind(grants, .{ team, @as(i64, @intFromBool(full)), principal.id });

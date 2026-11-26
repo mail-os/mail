@@ -2428,6 +2428,7 @@ fn teamError(conn: *webmail_tls.Stream, arena: std.mem.Allocator, err: anyerror)
     return switch (err) {
         error.TeamNotFound => sendError(conn, arena, 404, "team_not_found", "Team not found."),
         error.TeamMemberNotFound => sendError(conn, arena, 404, "team_member_not_found", "Mailbox or team member not found."),
+        error.TeamShareNotFound => sendError(conn, arena, 404, "team_share_not_found", "Choose a share between these mailboxes in this team."),
         error.TeamForbidden => sendError(conn, arena, 403, "team_forbidden", "You do not have permission to change this team or grant."),
         error.LastTeamOwner => sendError(conn, arena, 409, "last_team_owner", "Assign another owner before changing this membership."),
         error.DisabledTeamAccount => sendError(conn, arena, 409, "team_account_disabled", "Activate the mailbox before granting team access."),
@@ -2592,6 +2593,8 @@ fn threadShareError(conn: *webmail_tls.Stream, a: std.mem.Allocator, err: anyerr
         error.ThreadFollowUnavailable => return sendError(conn, a, 409, "thread_follow_unavailable", "To follow replies, select a conversation with a verified inbound sender and a message ID."),
         error.ThreadShareGrantUnavailable => return sendError(conn, a, 409, "thread_share_grant_unavailable", "Choose an active teammate or revoke a share before creating another."),
         error.ThreadShareCommentLimit => return sendError(conn, a, 409, "thread_share_comment_limit", "This conversation reached its comment limit."),
+        error.ThreadShareSearchDisabled => return sendError(conn, a, 403, "thread_share_search_disabled", "The share owner turned off search for this share."),
+        error.ThreadShareCommentsDisabled => return sendError(conn, a, 403, "thread_share_comments_disabled", "The share owner turned off new comments for this share."),
         else => return mapServiceError(conn, a, err),
     }
 }

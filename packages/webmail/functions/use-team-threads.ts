@@ -7,6 +7,8 @@ interface Grant {
   team: string
   owner: string
   grantee: string
+  searchAllowed: boolean
+  commentsAllowed: boolean
   subject: string
   downloads: boolean
   followingAuthors: string[]
@@ -224,6 +226,16 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
     if (!teamThreadError() && teamThreadMode() === 'detail') read(detail.grant, appliedSearch, teamThreadPages())
   }
 
+  async function setTeamThreadPermission(scope: 'search' | 'comments', allowed: boolean) {
+    const grant = teamThreadDetail()?.grant
+    if (!grant || teamThreadBusy()) return
+    const body = JSON.stringify({ source: grant.owner, grantee: grant.grantee, scope, resource: grant.id, allowed })
+    let saved = false
+    await run(signal => api(`/webmail/api/teams/${encodeURIComponent(grant.team)}/grants`, { method: 'PUT', body, signal }),
+      () => { saved = true })
+    if (saved && teamThreadDetail()?.grant.id === grant.id) read(grant, appliedSearch, teamThreadPages())
+  }
+
   async function revokeTeamThread() {
     const grant = teamThreadRevoking()
     if (!grant) return
@@ -239,6 +251,6 @@ export function useTeamThreads(api: ReturnType<typeof createMailApi>) {
     teamThreadMode, teamThreadBusy, teamThreadError, teamThreadNotice, teamThreadPreview, teamThreadGrants, teamThreadDetail,
     teamThreadTeams, teamThreadTeam, teamThreadGrantee, teamThreadDownloads, teamThreadFollowReplies, teamThreadFollowSentReplies, teamThreadSearch, teamThreadComment, teamThreadRevoking, teamThreadCollection, teamThreadPages,
     beginTeamThread, setTeamThreadDownloads, setTeamThreadFollowReplies, setTeamThreadFollowSentReplies, shareTeamThread, listTeamThreads, openTeamThread,
-    addTeamThreadComment, revokeTeamThread, closeTeamThreads, turnTeamThreadPage,
+    addTeamThreadComment, setTeamThreadPermission, revokeTeamThread, closeTeamThreads, turnTeamThreadPage,
   }
 }

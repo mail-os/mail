@@ -115,6 +115,15 @@ def verify_collection(fixture, call, download, owner, peer, witness, outsider, o
     assert download(other, attachment) == FILE
     call(other, path + "/comments", {"text": "Published review"}, "POST", 201)
     assert call(own, path)["comments"][0]["author"] == peer
+    for scope in ("search", "comments"):
+        call(own, "teams/studio/grants", {"source": owner, "grantee": peer, "scope": scope,
+             "resource": grant["id"], "allowed": False}, "PUT")
+    assert call(other, path + "?q=cobalt", status=403)["error"] == "thread_share_search_disabled"
+    assert call(other, path + "/comments", {"text": "Revoked"}, "POST", 403)["error"] == "thread_share_comments_disabled"
+    assert call(other, path)["comments"][0]["text"] == "Published review"
+    for scope in ("search", "comments"):
+        call(own, "teams/studio/grants", {"source": owner, "grantee": peer, "scope": scope,
+             "resource": grant["id"], "allowed": True}, "PUT")
 
     later, = call(own, "messages?conversations=false&q=collection-unapproved")["items"]
     change(later, True, status=409)
@@ -940,6 +949,39 @@ def verify(fixture):
         assert [item["reference"] for item in call(other, path + "?q=TURQUOISE")["messages"]] == [chosen[1]]
         assert call(other, path + "?q=confidential")["messages"] == []
         assert download(other, attachment) == FILE
+        def set_permission(scope, allowed, *, session=own, grantee=peer, status=200):
+            return call(session, "teams/studio/grants", {
+                "source": owner, "grantee": grantee, "scope": scope, "resource": grant["id"], "allowed": allowed,
+            }, "PUT", status)
+
+        with closing(sqlite3.connect(fixture.directory / "smtp.db")) as legacy_db, legacy_db:
+            for grantee, scope, resource in ((peer, "search", ""), (witness, "comments", grant["id"])):
+                legacy_db.execute("""INSERT INTO mail_team_grants(team_id,source_id,grantee_id,scope,resource)
+                                     SELECT 'studio',source.id,grantee.id,?,? FROM users source,users grantee
+                                     WHERE source.username=? AND grantee.username=?""", (scope, resource, owner, grantee))
+        initial_grants = call(own, "teams/studio")["grants"]
+        assert {(rule["grantee"], rule["scope"], rule["resource"]) for rule in initial_grants} == {
+            (peer, "search", grant["id"]), (peer, "comments", grant["id"]),
+        }, initial_grants
+        set_permission("search", False, session=other, status=403)
+        set_permission("comments", True, grantee=witness, status=404)
+        assert call(own, "teams/studio/grants", {
+            "source": owner, "grantee": peer, "scope": "search", "allowed": True,
+        }, "PUT", 400)["error"] == "invalid_team_data"
+        set_permission("search", False)
+        set_permission("comments", False)
+        permissions = call(other, path)["grant"]
+        assert not permissions["searchAllowed"] and not permissions["commentsAllowed"], permissions
+        assert call(other, "teams/studio")["grants"] == []
+        assert len(call(other, path)["messages"]) == 2
+        assert call(other, path + "?q=cobalt", status=403)["error"] == "thread_share_search_disabled"
+        assert call(other, path + "/comments", {"text": "Revoked"}, "POST", 403)["error"] == "thread_share_comments_disabled"
+        assert call(other, path)["comments"] == []
+        assert [item["reference"] for item in call(own, path + "?q=cobalt")["messages"]] == [chosen[0]]
+        set_permission("search", True)
+        set_permission("comments", True)
+        assert [item["reference"] for item in call(other, path + "?q=cobalt")["messages"]] == [chosen[0]]
+        assert call(other, path)["grant"]["commentsAllowed"]
         download(other, f"{path}/attachments/{outside}/0", 404)
         for session in (third, foreign):
             assert call(session, SHARES) == {"grants": []}
@@ -951,6 +993,9 @@ def verify(fixture):
         call(other, path + "/comments", {"text": "Looks good to me."}, "POST", 201)
         comments = call(own, path)["comments"]
         assert len(comments) == 1 and comments[0]["author"] == peer and comments[0]["text"] == "Looks good to me."
+        set_permission("comments", False)
+        assert call(other, path)["comments"] == comments
+        set_permission("comments", True)
 
         def move(folder):
             current = call(own, f"messages/ref/{chosen[0]}")

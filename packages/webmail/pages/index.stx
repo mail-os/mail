@@ -113,7 +113,7 @@ const {
   teamThreadMode, teamThreadBusy, teamThreadError, teamThreadNotice, teamThreadPreview, teamThreadGrants, teamThreadDetail,
   teamThreadTeams, teamThreadTeam, teamThreadGrantee, teamThreadDownloads, teamThreadFollowReplies, teamThreadFollowSentReplies, teamThreadSearch, teamThreadComment, teamThreadRevoking,
   teamThreadCollection, teamThreadPages, turnTeamThreadPage, shareCollectionWithTeam,
-  setTeamThreadDownloads, setTeamThreadFollowReplies, setTeamThreadFollowSentReplies, shareTeamThread, listTeamThreads, openTeamThread, addTeamThreadComment, revokeTeamThread, closeTeamThreads, shareWithTeam,
+  setTeamThreadDownloads, setTeamThreadFollowReplies, setTeamThreadFollowSentReplies, shareTeamThread, listTeamThreads, openTeamThread, addTeamThreadComment, setTeamThreadPermission, revokeTeamThread, closeTeamThreads, shareWithTeam,
   closeSnapshots, canShareSnapshot, shareMessageSnapshot, shareSelectedSnapshot,
   assistantMode, assistantBusy, assistantError, assistantNotice, assistantName, assistantRead, assistantDraft,
   assistantLifetime, assistantSelection, assistantPreview, assistantIssued, assistantGrants, assistantAudit, assistantRevocation,
@@ -1402,7 +1402,11 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         <h3 :text="teamThreadDetail.grant.subject || '(No subject)'"></h3>
         <p class="wm-snapshot-muted" :text="'From ' + teamThreadDetail.grant.owner + ' · Shared with ' + teamThreadDetail.grant.grantee"></p>
         <p :if="teamThreadDetail.grant.followingAuthors.length" class="wm-snapshot-muted" :text="teamThreadDetail.grant.replyLimitReached ? 'This conversation reached its 40-reply limit.' : 'Following verified replies from ' + teamThreadDetail.grant.followingAuthors.join(', ') + (teamThreadDetail.grant.followingSentReplies ? ' and the owner’s webmail replies to them.' : '.')"></p>
-        <form class="wm-snapshot-form" role="search" @submit.prevent="openTeamThread(teamThreadDetail.grant, true)">
+        <div :if="teamThreadDetail.grant.owner === user?.username" class="wm-team-thread-permissions" role="group" aria-label="Teammate permissions">
+          <label class="wm-team-thread-option"><input type="checkbox" :checked="teamThreadDetail.grant.searchAllowed" :disabled="teamThreadBusy" @change="setTeamThreadPermission('search', $event.target.checked)">Allow teammate to search</label>
+          <label class="wm-team-thread-option"><input type="checkbox" :checked="teamThreadDetail.grant.commentsAllowed" :disabled="teamThreadBusy" @change="setTeamThreadPermission('comments', $event.target.checked)">Allow teammate to post comments</label>
+        </div>
+        <form :if="teamThreadDetail.grant.searchAllowed || teamThreadDetail.grant.owner === user?.username" class="wm-snapshot-form" role="search" @submit.prevent="openTeamThread(teamThreadDetail.grant, true)">
           <label><span :text="teamThreadDetail.grant.collectionId ? 'Search collection' : 'Search conversation'"></span><input type="search" x-model="teamThreadSearch" maxlength="128" :disabled="teamThreadBusy"></label>
           <button type="submit" class="wm-action" :disabled="teamThreadBusy">Search</button>
         </form>
@@ -1428,7 +1432,7 @@ onUnmounted(() => { mail.destroy(); destroyReminders() })
         <ul :if="teamThreadDetail.comments.length" class="wm-snapshot-links" aria-label="Teammate comments">
           <li :for="comment in teamThreadDetail.comments"><div><strong :text="comment.author"></strong><p class="wm-snapshot-body" :text="comment.text"></p></div></li>
         </ul>
-        <form class="wm-snapshot-form" @submit.prevent="addTeamThreadComment()">
+        <form :if="teamThreadDetail.grant.commentsAllowed || teamThreadDetail.grant.owner === user?.username" class="wm-snapshot-form" @submit.prevent="addTeamThreadComment()">
           <label>Teammate comment<input x-model="teamThreadComment" maxlength="500" :disabled="teamThreadBusy" required></label>
           <button type="submit" class="wm-action" :disabled="teamThreadBusy || !teamThreadComment.trim()">Post comment</button>
         </form>

@@ -1165,6 +1165,8 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .wm-message-sharing { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 4px; min-width: 0; }
 .wm-snapshot-panel { display: grid; gap: 12px; width: min(100%, 640px); max-height: 90dvh; overflow: auto; padding: 16px; border: 1px solid var(--border); border-radius: 14px; background: var(--panel); box-shadow: var(--app-shadow); }
 .wm-team-thread-option { display: flex; align-items: center; gap: 8px; min-block-size: var(--control-height); }
+.wm-team-thread-permissions { display: flex; flex-wrap: wrap; column-gap: 16px; }
+.wm-team-thread-permissions input { flex: none; inline-size: 16px; block-size: 16px; margin: 0; accent-color: var(--accent); }
 .wm-team-thread-audience > label:has(input) { flex: 1 1 13rem; }
 .wm-collection-sharing { display: flex; flex-wrap: wrap; gap: 6px; padding: 2px 14px 6px; }
 .wm-snapshot-dialog-heading { display: flex; justify-content: space-between; align-items: center; gap: 8px; }

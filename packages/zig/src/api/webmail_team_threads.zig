@@ -34,6 +34,11 @@ pub const schema =
     \\);
     \\CREATE INDEX IF NOT EXISTS mail_team_thread_owner ON mail_team_thread_shares(owner_id);
     \\CREATE INDEX IF NOT EXISTS mail_team_thread_grantee ON mail_team_thread_shares(grantee_id);
+    \\CREATE TABLE IF NOT EXISTS mail_team_thread_restrictions (
+    \\    share_id TEXT NOT NULL REFERENCES mail_team_thread_shares(id) ON DELETE CASCADE,
+    \\    scope TEXT NOT NULL CHECK(scope IN ('search','comments')),
+    \\    PRIMARY KEY(share_id,scope)
+    \\);
     \\CREATE TABLE IF NOT EXISTS mail_team_collection_shares (
     \\    share_id TEXT PRIMARY KEY NOT NULL REFERENCES mail_team_thread_shares(id) ON DELETE CASCADE,
     \\    owner_id INTEGER NOT NULL,
@@ -236,7 +241,9 @@ const share_fields =
     \\SELECT s.id,s.team_id,owner.username,grantee.username,COALESCE(c.name,s.subject),s.downloads,
     \\ COALESCE((SELECT authors FROM mail_team_thread_follow WHERE share_id=s.id),'[]'),
     \\ (SELECT count(*) FROM mail_team_thread_replies WHERE share_id=s.id),c.id,
-    \\ EXISTS(SELECT 1 FROM mail_team_thread_follow_sent WHERE share_id=s.id)
+    \\ EXISTS(SELECT 1 FROM mail_team_thread_follow_sent WHERE share_id=s.id),
+    \\ NOT EXISTS(SELECT 1 FROM mail_team_thread_restrictions WHERE share_id=s.id AND scope='search'),
+    \\ NOT EXISTS(SELECT 1 FROM mail_team_thread_restrictions WHERE share_id=s.id AND scope='comments')
 ;
 
 pub const Grant = struct {
@@ -250,6 +257,8 @@ pub const Grant = struct {
     replyLimitReached: bool,
     collectionId: ?[]const u8 = null,
     followingSentReplies: bool = false,
+    searchAllowed: bool = true,
+    commentsAllowed: bool = true,
 };
 const Selection = struct { reference: []const u8, revision: [64]u8, reply: bool = false, outgoing: bool = false };
 const Attachment = struct { index: usize, filename: []const u8, size: usize };
@@ -296,6 +305,8 @@ fn readGrant(a: Allocator, stmt: Statement) !Grant {
         .replyLimitReached = stmt.columnInt64(7) >= max_followed_replies,
         .collectionId = if (stmt.columnIsNull(8)) null else try a.dupe(u8, stmt.columnText(8)),
         .followingSentReplies = stmt.columnInt64(9) != 0,
+        .searchAllowed = stmt.columnInt64(10) != 0,
+        .commentsAllowed = stmt.columnInt64(11) != 0,
     };
 }
 
@@ -696,12 +707,18 @@ fn comments(a: Allocator, tx: Database.Transaction, id: []const u8) ![]Comment {
     return out.toOwnedSlice(a);
 }
 
+fn requireSearch(grant: Grant, actor: []const u8, needle: []const u8) !void {
+    if (needle.len > 0 and !grant.searchAllowed and !std.mem.eql(u8, grant.owner, actor))
+        return error.ThreadShareSearchDisabled;
+}
+
 pub fn detail(a: Allocator, db: *Database, actor: []const u8, id: []const u8, needle: []const u8, before: ?i64, junk: []const u8) !Detail {
     if (needle.len > 256 or !std.unicode.utf8ValidateSlice(needle) or (before != null and before.? < 1)) return error.InvalidThreadShare;
     const result = blk: {
         var tx = try db.beginTransaction(.read);
         defer tx.deinit();
         const grant = try lookup(a, tx, actor, id);
+        try requireSearch(grant, actor, needle);
         if (grant.collectionId == null and before != null) return error.InvalidThreadShare;
         const items = if (grant.collectionId == null) try selected(a, tx, id, null) else &.{};
         const entries = if (grant.collectionId) |collection| try collectionEntries(a, tx, grant.owner, collection, before) else &.{};
@@ -714,6 +731,7 @@ pub fn detail(a: Allocator, db: *Database, actor: []const u8, id: []const u8, ne
         var tx = try db.beginTransaction(.read);
         defer tx.deinit();
         const grant = try lookup(a, tx, actor, id);
+        try requireSearch(grant, actor, needle);
         var kept: usize = 0;
         {
             const membership = try collectionPermission(tx);
@@ -748,8 +766,9 @@ pub fn detail(a: Allocator, db: *Database, actor: []const u8, id: []const u8, ne
         if (!matchesSearch(projected.subject, projected.from, projected.text, needle)) continue;
         try messages.append(a, projected);
     }
-    _ = try requireGrant(a, db, actor, id);
-    return .{ .grant = result.grant, .messages = try messages.toOwnedSlice(a), .comments = result.notes };
+    const grant = try requireGrant(a, db, actor, id);
+    try requireSearch(grant, actor, needle);
+    return .{ .grant = grant, .messages = try messages.toOwnedSlice(a), .comments = result.notes };
 }
 
 const notice_access =
@@ -852,7 +871,8 @@ pub fn addComment(a: Allocator, db: *Database, actor: []const u8, id: []const u8
     for (text) |byte| if ((byte < 32 and byte != '\n' and byte != '\r' and byte != '\t') or byte == 127) return error.InvalidThreadShare;
     var tx = try db.beginTransaction(.write);
     defer tx.deinit();
-    _ = try lookup(a, tx, actor, id);
+    const grant = try lookup(a, tx, actor, id);
+    if (!grant.commentsAllowed and !std.mem.eql(u8, grant.owner, actor)) return error.ThreadShareCommentsDisabled;
     {
         const stmt = try tx.prepare(
             \\INSERT INTO mail_team_thread_comments(share_id,author_id,written_at,text)
