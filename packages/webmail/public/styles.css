@@ -882,6 +882,7 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-day-presentation { display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between; gap: 8px 16px; margin-block: 0 12px; }
 .calendar-timeline-create { display: grid; grid-template-columns: auto minmax(0, 12rem) auto; align-items: center; gap: 8px; }
 .calendar-timeline-create label, .calendar-timeline-all-day h3 { font-size: .8125rem; font-weight: 650; color: var(--muted); }
+.calendar-timeline-create :is(select, .calendar-primary) { block-size: var(--control-height); }
 .calendar-timeline-create select { inline-size: 100%; }
 .calendar-timeline { --minute-height: 1.4px; --time-gutter: 90px; --lane-width: 76px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); }
 .calendar-timeline-all-day { display: grid; grid-template-columns: var(--time-gutter) minmax(0, 1fr); align-items: center; padding: 8px 10px 8px 0; border-block-end: 1px solid var(--border); background: var(--toolbar); border-radius: 10px 10px 0 0; }
@@ -1648,6 +1649,25 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
 .calendar-entry-time { display: flex; align-items: center; gap: 5px; font-variant-numeric: tabular-nums; }
 .calendar-entry-time .mail-icon { width: 12px; height: 12px; }
 .calendar-zone select { inline-size: 10.5rem; max-inline-size: 100%; }
+
+@media (prefers-contrast: no-preference) and (forced-colors: none) {
+  /* Labeled actions and event cards already have visible fills and labels.
+     Keep the shared control outline on editable fields and native pickers. */
+  :is(.calendar-header-actions, .calendar-sources, .calendar-source-tools, .calendar-view-modes,
+      .calendar-period-buttons, .calendar-day-label-summary, .calendar-create-form,
+      .calendar-day-presentation > .calendar-choices) .wm-action:where(:not(.calendar-primary)) {
+    border-color: var(--border);
+  }
+  .calendar-header-actions .wm-action[aria-expanded=true],
+  :is(.calendar-sources, .calendar-view-modes, .calendar-day-presentation > .calendar-choices) .wm-action[aria-pressed=true] {
+    border-color: var(--accent-button-border);
+  }
+  .calendar-view-toolbar { border-color: transparent; }
+  :is(.calendar-timeline-all-day .calendar-entry, .calendar-timeline-event) {
+    border-color: color-mix(in srgb, var(--calendar-color) 16%, var(--border));
+  }
+  .calendar-timeline-busy { border-color: var(--border); }
+}
 @media (490px < width <= 1080px) {
   .calendar-view-toolbar .calendar-view-modes { flex-basis: 100%; }
 }
@@ -1842,6 +1862,11 @@ dialog.wm-modal::backdrop { background: var(--scrim); }
   .wm-message-check { appearance: auto; }
   .wm-message-check::before, .wm-message-check::after { content: none; }
   .wm-folder[aria-current=page], .wm-message-row--active, .wm-shared-row[aria-current=true], .wm-tool[aria-pressed=true], .wm-list-toggle:has(input:checked, input[aria-checked=mixed]) { outline: 1px solid Highlight; outline-offset: -1px; }
+  :is(.calendar-sources, .calendar-view-modes, .calendar-day-presentation > .calendar-choices) .wm-action[aria-pressed=true]:not(:focus-visible),
+  .calendar-header-actions .wm-action[aria-expanded=true]:not(:focus-visible) {
+    outline: 1px solid Highlight;
+    outline-offset: -3px;
+  }
 }
 
 [data-icon=check] { --mail-symbol: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22 fill=%22none%22 stroke=%22black%22 stroke-width=%221.75%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22%3E%3Cpath d=%22m5 12 4 4L19 6%22/%3E%3C/svg%3E"); }

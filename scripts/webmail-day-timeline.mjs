@@ -17,10 +17,10 @@ const slot = page => page.getByRole('combobox', { name: 'Start time', exact: tru
 const dayLayout = page => page.getByRole('group', { name: 'Day layout', exact: true })
 const slotValue = time => String(Date.parse(time) / 1000)
 
-async function openCalendar(browser, account, phone = false) {
+async function openCalendar(browser, account, phone = false, colorScheme = phone ? 'dark' : 'light') {
   const context = await browser.newContext({
     viewport: phone ? { width: 320, height: 844 } : { width: 1440, height: 940 },
-    colorScheme: phone ? 'dark' : 'light', deviceScaleFactor: phone ? 2 : 1,
+    colorScheme, deviceScaleFactor: phone ? 2 : 1,
     isMobile: phone && engine !== 'firefox', hasTouch: phone,
     timezoneId: 'UTC', locale: 'en-US', ignoreHTTPSErrors: true,
   })
@@ -39,6 +39,31 @@ async function openCalendar(browser, account, phone = false) {
 async function capture(page, name) {
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), name)
   await page.screenshot({ path: join(output, `${name}.png`), animations: 'disabled' })
+}
+
+async function captureShareForm(page, name, height) {
+  const settings = page.getByRole('region', { name: 'Manage calendars' })
+  const share = settings.getByRole('region', { name: 'Share a calendar' })
+  await settings.and(page.locator('[aria-busy="false"]')).waitFor()
+  const fields = [
+    share.getByRole('combobox', { name: 'Calendar to share', exact: true }),
+    share.getByRole('combobox', { name: 'Team', exact: true }),
+    share.getByRole('textbox', { name: 'Teammate', exact: true }),
+    share.getByRole('combobox', { name: 'Access', exact: true }),
+    button(share, 'Share calendar'),
+  ]
+  const values = await Promise.all(fields.map(control => control.evaluate(node => {
+    const { height, top } = node.getBoundingClientRect()
+    return { height, top, edge: getComputedStyle(node).borderColor }
+  })))
+  assert(values.every(control => control.height === height), 'Sharing inputs, selects, and action have the same height')
+  if (height === 36) {
+    assert(values.every(control => Math.abs(control.top - values[0].top) < .5), 'Sharing controls align on desktop')
+  }
+  assert(values.slice(0, 4).every(control => control.edge === values[0].edge), 'Sharing fields use one neutral outline')
+  assert.notEqual(values[4].edge, values[0].edge, 'Share calendar has its own blue outline')
+  await share.locator('form').scrollIntoViewIfNeeded()
+  await capture(page, name)
 }
 
 async function phoneSchedule(page) {
@@ -127,7 +152,7 @@ async function phoneSchedule(page) {
   await actions.tap()
   await manage.tap()
   const settings = page.getByRole('region', { name: 'Manage calendars' })
-  await settings.getByRole('combobox', { name: 'Calendar to share' }).waitFor()
+  await captureShareForm(page, 'phone-320-share-calendar-dark', 44)
   await manage.tap()
   await settings.waitFor({ state: 'hidden' })
   await actions.tap()
@@ -162,8 +187,21 @@ async function renderDay(page, phone) {
   await review.waitFor()
   const allDay = area.getByRole('region', { name: 'All-day events' }).getByRole('button', { name: /Offsite planning/ })
   await allDay.waitFor()
-  const borders = await Promise.all([allDay, review, slot(page)].map(control => control.evaluate(node => getComputedStyle(node).border)))
-  assert(borders.every(border => border === borders[0]), 'All-day and timed event buttons use the shared control border')
+  const [allDayEdge, quickEdge, reviewEdge, inputEdge] = await Promise.all(
+    [allDay, quick, review, slot(page)].map(control => control.evaluate(node => getComputedStyle(node).borderColor)),
+  )
+  assert.equal(allDayEdge, quickEdge, 'Events in the same calendar use a matching outline')
+  assert.notEqual(reviewEdge, quickEdge, 'The event outline follows its calendar color')
+  assert.notEqual(reviewEdge, inputEdge, 'Event cards and editable fields have distinct outlines')
+  if (!phone) {
+    const navigation = await page.locator('.calendar-period .wm-action, .calendar-jump').evaluateAll(nodes => nodes.map(node => {
+      const { height, top } = node.getBoundingClientRect()
+      return { height, top }
+    }))
+    assert.equal(navigation.length, 4)
+    assert(navigation.every(({ height, top }) => height === 36 && Math.abs(top - navigation[0].top) < .5),
+      'The date picker, arrows, and Today align in one desktop row')
+  }
   const accents = await Promise.all([allDay, quick, review].map(event =>
     event.evaluate(node => getComputedStyle(node, '::before').backgroundColor)))
   assert.equal(accents[0], accents[1], 'All-day and timed events use their calendar color')
@@ -186,11 +224,13 @@ async function renderDay(page, phone) {
       const channels = color.map(channel => Number.parseInt(channel, 16)).join(', ')
       return {
         height: node.getBoundingClientRect().height,
+        top: node.getBoundingClientRect().top,
         radius: style.borderRadius,
         borderMatches: style.border === `1px solid rgb(${channels})`,
       }
     }))
   assert.equal(controls.length, 2)
+  assert(Math.abs(controls[0].top - controls[1].top) < .5, 'The time picker and Add event align on one row')
   for (const control of controls) {
     assert.equal(control.height, phone ? 44 : 36, 'Time selection and creation use the shared height')
     assert.equal(control.radius, '8px')
@@ -271,6 +311,41 @@ async function createAt(page, slotTime, title, start, end, phone = false, repeat
   await button(timeline(page), new RegExp(`^${title},`)).waitFor()
 }
 
+async function desktopSharing(page, scheme) {
+  const manage = button(page.locator('.calendar-header'), 'Manage calendars')
+  await manage.click()
+  await captureShareForm(page, `desktop-share-calendar-${scheme}`, 36)
+  await manage.click()
+  await page.getByRole('region', { name: 'Manage calendars' }).waitFor({ state: 'hidden' })
+}
+
+async function desktopDark(browser) {
+  const page = await openCalendar(browser, owner, false, 'dark')
+  try {
+    const review = button(timeline(page), /^Design review,/)
+    await review.waitFor()
+    const viewport = timeline(page).getByRole('region', { name: 'Hours of the day', exact: true })
+    await viewport.evaluate(element => { element.scrollTop = 470 * 1.4 })
+    await capture(page, 'desktop-day-timeline-dark')
+    await desktopSharing(page, 'dark')
+    if (engine === 'chromium') {
+      await page.emulateMedia({ contrast: 'more' })
+      const [eventEdge, inputEdge] = await Promise.all([review, slot(page)].map(control =>
+        control.evaluate(node => getComputedStyle(node).borderColor)))
+      assert.equal(eventEdge, inputEdge, 'Increased contrast retains the shared strong event and field outline')
+      await capture(page, 'desktop-day-increased-contrast')
+
+      await page.emulateMedia({ forcedColors: 'active', contrast: 'no-preference' })
+      assert.equal(await slot(page).evaluate(node => getComputedStyle(node).appearance), 'auto')
+      const layout = dayLayout(page)
+      assert.equal(await button(layout, 'Timeline').evaluate(node => getComputedStyle(node).outlineOffset), '-3px')
+      assert.equal(await button(layout, 'List').evaluate(node => getComputedStyle(node).outlineStyle), 'none')
+      await capture(page, 'desktop-day-forced-colors')
+    }
+  }
+  finally { await page.context().close() }
+}
+
 async function clocks(page) {
   await page.getByLabel('Display time zone').selectOption('America/New_York')
   await page.getByLabel('Jump to date').fill('2026-03-08')
@@ -346,10 +421,12 @@ async function main() {
   try {
     const desktop = await openCalendar(browser, owner)
     await renderDay(desktop, false)
+    await desktopSharing(desktop, 'light')
     await studioCalendar(desktop).click()
     await createAt(desktop, '2026-11-24T11:15Z', 'Keyboard timeline event', '2026-11-24T11:15', '2026-11-24T12:15')
     await clocks(desktop)
     await desktop.context().close()
+    await desktopDark(browser)
 
     const phone = await openCalendar(browser, owner, true)
     await phoneSchedule(phone)
