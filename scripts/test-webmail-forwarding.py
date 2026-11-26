@@ -84,8 +84,19 @@ def run(binary, previous):
             return api(session, "forwarding", dict(action=action, revision=revision, **fields), "POST", expected)
 
         def copies(user, subject):
-            return [raw for folder in ("cur", "new") for path in (root / "mail" / user / folder).glob("*")
-                    if path.is_file() and parser.parsebytes(raw := path.read_bytes())["Subject"] == subject]
+            messages = []
+            for folder in ("cur", "new"):
+                for path in (root / "mail" / user / folder).glob("*"):
+                    if path.name.startswith(".") or not path.is_file():
+                        continue
+                    try:
+                        raw = path.read_bytes()
+                    except FileNotFoundError:
+                        # A published message may move from new to cur between reads.
+                        continue
+                    if parser.parsebytes(raw)["Subject"] == subject:
+                        messages.append(raw)
+            return messages
 
         def lookup(user, subject):
             return [parser.parsebytes(raw) for raw in copies(user, subject)]
