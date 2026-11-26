@@ -1863,7 +1863,7 @@ async function teamCollectionJourney(desktop) {
   await ownerView.getByText('Collection shared.', { exact: true }).waitFor()
   await button(ownerView, 'Close').click()
   await button(desktop, 'View access').click()
-  await ownerView.getByText(`Collection · From ${owner} · Shared with ${sender}`, { exact: true }).waitFor()
+  await ownerView.getByText(`Collection · Shared with ${sender}`, { exact: true }).waitFor()
   await button(ownerView, 'Close').click()
 
   const teammate = await signIn({ phone: true, account: sender, initialSubject: 'Combined source briefing' })
@@ -1873,6 +1873,7 @@ async function teamCollectionJourney(desktop) {
     await button(teammate, 'Shared mail').click()
     const incoming = teammate.getByRole('dialog', { name: 'Shared mail' })
     await button(incoming, `Open ${name}`).click()
+    await incoming.getByText(`From ${owner}`, { exact: true }).waitFor()
     const file = incoming.getByRole('link', { name: 'receipt-1046.txt' })
     await file.waitFor()
     const href = new URL(await file.getAttribute('href'), url).href
@@ -1888,7 +1889,7 @@ async function teamCollectionJourney(desktop) {
     await incoming.getByLabel('Teammate comment').fill('I found the handoff.')
     await button(incoming, 'Post comment').click()
     await incoming.getByText('I found the handoff.', { exact: true }).waitFor()
-    const commentControls = await verifyControlRow(incoming.locator('form').filter({ hasText: 'Teammate comment' }), 'input, button', 44, false)
+    const commentControls = await verifyControlRow(incoming.locator('form').filter({ hasText: 'Teammate comment' }), 'input, button', 44)
     assert(commentControls.every(control => control.borderMatches && control.opacity === '1'), 'The comment action and field keep identical outlines')
     await fitsViewport(teammate)
     await screenshot(teammate, 'narrow-phone-team-collection')
