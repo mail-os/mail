@@ -152,6 +152,7 @@ pub fn build(b: *std.Build) void {
         "src/imap_test.zig",
         "src/connection_wrapper_test.zig",
         "src/webmail_session_test.zig",
+        "src/eas_state_test.zig",
         "src/uid_consistency_test.zig",
         "src/antispam/spam_filter.zig",
         "src/dkim_verify_test.zig",

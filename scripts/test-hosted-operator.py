@@ -106,11 +106,30 @@ def verify(test, db):
                     "private-inbound-subject", "private-outbound-subject", "diagnostic-only.txt"):
         assert private not in filtered
 
+    deletion = cli(test, "delete", mailbox)
+    assert deletion.returncode != 0 and "managed retirement workflow" in deletion.stderr
+    legacy = subprocess.run([str(test.binary), "gdpr", "delete", mailbox], env=test.env,
+                            cwd=test.directory, text=True, capture_output=True, timeout=15)
+    assert legacy.returncode != 0 and "managed retirement workflow" in legacy.stderr, legacy.stderr
+    after_refusal = report(test, mailbox)
+    assert after_refusal["account"] == account and after_refusal["storage"] == storage
+
     disabled = cli(test, "disable", mailbox)
     assert disabled.returncode == 0, disabled.stderr
     suspended = report(test, mailbox)
     assert not suspended["account"]["enabled"] and suspended["account"]["requested_enabled"], suspended
     assert suspended["account"]["outbound_queue"] == account["outbound_queue"]
+    deletion = cli(test, "delete", mailbox)
+    assert deletion.returncode != 0 and "managed retirement workflow" in deletion.stderr
+    legacy = subprocess.run([str(test.binary), "gdpr", "delete", mailbox], env=test.env,
+                            cwd=test.directory, text=True, capture_output=True, timeout=15)
+    assert legacy.returncode != 0 and "managed retirement workflow" in legacy.stderr, legacy.stderr
+    assert report(test, mailbox)["storage"] == storage
+
+    deleted = cli(test, "delete", "unmanaged@example.test")
+    assert deleted.returncode == 0, deleted.stderr
+    assert db.execute("SELECT 1 FROM users WHERE username=?", ("unmanaged@example.test",)).fetchone() is None
+
     test.provision("operator-check", quota=1, daily=1)
     capped = report(test, mailbox)
     assert capped["account"]["revision"] == 2 and capped["account"]["enabled"]

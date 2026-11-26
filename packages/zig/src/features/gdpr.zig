@@ -23,6 +23,7 @@ pub const GDPRError = error{
     DatabaseError,
     ExportFailed,
     DeletionFailed,
+    HostedMailboxRequiresManagedRemoval,
     AuditLogFailed,
     InvalidUser,
     NoDataFound,
@@ -577,9 +578,33 @@ pub const GDPRManager = struct {
     ///
     /// This ensures data is immediately invisible to the user, then fully removed.
     /// For non-GDPR admin deletion, use soft-delete only (without purge).
+    pub fn requireUnmanagedMailbox(self: *GDPRManager, username: []const u8) !void {
+        if (!try self.queryExists("SELECT 1 FROM sqlite_master WHERE type='table' AND name='provisioned_mailboxes'", null)) return;
+        if (try self.queryExists(
+            \\SELECT 1 FROM provisioned_mailboxes
+            \\WHERE user_id = (SELECT id FROM users WHERE username = ?1)
+        , username)) return GDPRError.HostedMailboxRequiresManagedRemoval;
+    }
+
+    fn queryExists(self: *GDPRManager, query: [:0]const u8, username: ?[]const u8) !bool {
+        var stmt: ?*sqlite.sqlite3_stmt = null;
+        if (sqlite.sqlite3_prepare_v2(self.db, query.ptr, -1, &stmt, null) != sqlite.SQLITE_OK)
+            return GDPRError.DatabaseError;
+        defer _ = sqlite.sqlite3_finalize(stmt);
+        if (username) |name| {
+            if (sqlite.sqlite3_bind_text(stmt, 1, name.ptr, @intCast(name.len), null) != sqlite.SQLITE_OK)
+                return GDPRError.DatabaseError;
+        }
+        return switch (sqlite.sqlite3_step(stmt)) {
+            sqlite.SQLITE_ROW => true,
+            sqlite.SQLITE_DONE => false,
+            else => GDPRError.DatabaseError,
+        };
+    }
+
     pub fn deleteUserData(self: *GDPRManager, username: []const u8) !void {
         // Start transaction for atomic deletion
-        const begin_query = "BEGIN TRANSACTION";
+        const begin_query = "BEGIN IMMEDIATE";
         var rc = sqlite.sqlite3_exec(self.db, begin_query, null, null, null);
         if (rc != sqlite.SQLITE_OK) {
             return GDPRError.DatabaseError;
@@ -588,6 +613,8 @@ pub const GDPRManager = struct {
         errdefer {
             _ = sqlite.sqlite3_exec(self.db, "ROLLBACK", null, null, null);
         }
+
+        try self.requireUnmanagedMailbox(username);
 
         // Step 1: Soft-delete all messages (marks them with deleted_at timestamp)
         const soft_delete_messages = "UPDATE messages SET deleted_at = strftime('%s','now'), deleted_by = 'gdpr-erasure' WHERE user = ? AND deleted_at IS NULL";

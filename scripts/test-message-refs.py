@@ -62,6 +62,7 @@ def main(candidate, previous):
         with test.daemon():
             alice = test.provision("alice")
             bob = test.provision("bob")
+            local = test.create_local("local")
             with test.imap(alice) as imap:
                 inbox_validity = validity(imap, "INBOX")
                 assert imap.create("Archive")[0] == "OK"
@@ -71,6 +72,8 @@ def main(candidate, previous):
                 third_uid = append(imap, "Duplicate B", "same@example.test")
             with test.imap(bob) as imap:
                 append(imap, "Duplicate A", "same@example.test")
+            with test.imap(local) as imap:
+                append(imap, "Local message")
         with closing(sqlite3.connect(db)) as conn:
             if previous:
                 assert conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='mailbox_message_refs'").fetchone() == (0,)
@@ -82,6 +85,7 @@ def main(candidate, previous):
             alice_session = test.login(alice)
             bob_session = test.login(bob)
             bob_ref = call("messages?folder=INBOX", session=bob_session)[1]["items"][0]["reference"]
+            local_ref = call("messages?folder=INBOX", session=test.login(local))[1]["items"][0]["reference"]
             first, second, third = ({row["uid"]: row for row in rows()}[uid] for uid in (first_uid, second_uid, third_uid))
             assert len({first["reference"], second["reference"], third["reference"], bob_ref}) == 4
             assert not first["message_id"] and second["message_id"] == third["message_id"]
@@ -206,6 +210,7 @@ def main(candidate, previous):
                        cwd=directory, env=test.env, check=True)
         alice = f"alice@{new_domain}"
         bob = f"bob@{new_domain}"
+        local = f"local@{new_domain}"
         with closing(sqlite3.connect(db)) as conn:
             assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
             assert conn.execute("SELECT mailbox FROM provisioned_mailboxes ORDER BY mailbox").fetchall() == [(alice,), (bob,)]
@@ -221,10 +226,11 @@ def main(candidate, previous):
             assert last["folder"] == "Trash"
             detail(last, method="DELETE", revision=last["revision"])
             detail(first, expected=404)
-        subprocess.run([str(candidate), "user:local", "delete", bob], cwd=directory, env=test.env, check=True)
+        subprocess.run([str(candidate), "user:local", "delete", local], cwd=directory, env=test.env, check=True)
         with closing(sqlite3.connect(db)) as conn:
             assert not conn.execute("SELECT 1 FROM mailbox_message_refs WHERE reference IN (?,?,?)",
-                                    (bob_ref, first["reference"], second["reference"])).fetchone()
+                                    (local_ref, first["reference"], second["reference"])).fetchone()
+            assert conn.execute("SELECT 1 FROM mailbox_message_refs WHERE reference=?", (bob_ref,)).fetchone() == (1,)
             assert not conn.execute("SELECT 1 FROM mailbox_message_refs WHERE next_folder IS NOT NULL").fetchone()
         print("Verified pending moves recover on restart, account references survive domain rename, and permanent deletion retires references.")
 

@@ -242,6 +242,15 @@ existing data. After the export deadline SMTP refuses the recipient permanently
 and authenticated access ends. An operator suspension takes precedence over
 either deadline.
 
+For an authorized export after suspension, use the
+[portable mailbox export](../WEBMAIL.md#portable-mailbox-export). It preserves
+Maildir messages, calendars, and contacts. Use managed retirement for a
+hosted domain being released. Retirement disables access and retains data for
+recovery. Hosted mailboxes are refused by `user:local delete` and the legacy
+`gdpr delete` command. The legacy command only removes records from its SQLite
+schema. The separate hosted erasure workflow is tracked in
+[#188](https://github.com/mail-os/mail/issues/188).
+
 For renewals, post `mailbox`, `actor`, `operation_id`, the next `revision`, and
 `access_window` to `/provisioning/v1/mailbox/access`. The SDK calls this
 `applyAccess`. It changes the deadlines and revision while preserving the

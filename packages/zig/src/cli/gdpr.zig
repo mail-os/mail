@@ -62,7 +62,7 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = export_cmd.setAction(exportAction);
     _ = try cmd.addCommand(export_cmd);
 
-    const delete_cmd = try cli.BaseCommand.init(allocator, "delete", "Delete all user data permanently");
+    const delete_cmd = try cli.BaseCommand.init(allocator, "delete", "Delete legacy SQLite records for a local user");
     _ = try delete_cmd.addArgument(cli.Argument.init("username", "Username to delete", .string));
     _ = delete_cmd.setAction(deleteAction);
     _ = try cmd.addCommand(delete_cmd);

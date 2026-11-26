@@ -38,7 +38,12 @@ pub fn changePassword(auth_backend: *auth.AuthBackend, username: []const u8, new
 }
 
 pub fn deleteUser(db: *database.Database, username: []const u8) !void {
-    try db.deleteUser(username);
+    db.deleteUser(username) catch |err| {
+        if (err == error.HostedMailboxRequiresManagedRemoval) {
+            std.debug.print("Hosted mailbox removal requires the managed retirement workflow. See the deployment runbook.\n", .{});
+        }
+        return err;
+    };
     std.debug.print("User '{s}' deleted successfully\n", .{username});
 }
 
