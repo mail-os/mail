@@ -107,7 +107,9 @@ pub fn get(allocator: std.mem.Allocator, db: *database.Database, username: []con
 /// links are voided: they were sent to the previous address.
 pub fn set(db: *database.Database, username: []const u8, address: ?[]const u8, source: Source, now: i64) !void {
     const value: ?[]const u8 = if (address) |a| try validateAddress(username, a) else null;
-    const s = try db.prepare(
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const s = try tx.prepare(
         \\UPDATE users SET recovery_email = ?2, recovery_source = ?3, recovery_updated_at = ?4
         \\WHERE username = ?1 RETURNING username
     );
@@ -117,7 +119,9 @@ pub fn set(db: *database.Database, username: []const u8, address: ?[]const u8, s
     try s.bind(3, @tagName(source));
     try s.bind(4, now);
     if (!try s.step()) return RecoveryError.UserNotFound;
-    try db.deleteUserResetTokens(username);
+    _ = try s.step();
+    try tx.deleteUserResetTokens(username);
+    try tx.commit();
 }
 
 pub const ApplyResult = enum {
@@ -278,10 +282,10 @@ pub const Completed = struct {
 pub fn complete(allocator: std.mem.Allocator, db: *database.Database, auth: *auth_mod.AuthBackend, token: []const u8, new_password: []const u8, now: i64) !?Completed {
     if (!wellFormedToken(token)) return null;
     const hash = hashToken(token);
-    var username: []const u8 = undefined;
-    var recovery: []const u8 = undefined;
-    {
-        const s = try db.prepare(
+    const claimed: Completed = claim: {
+        var tx = try db.beginTransaction(.write);
+        defer tx.deinit();
+        const s = try tx.prepare(
             \\UPDATE mailbox_reset_tokens SET used_at = ?2
             \\WHERE token_hash = ?1 AND used_at IS NULL AND expires_at > ?2
             \\RETURNING username, recovery_email
@@ -290,9 +294,16 @@ pub fn complete(allocator: std.mem.Allocator, db: *database.Database, auth: *aut
         try s.bind(1, @as([]const u8, &hash));
         try s.bind(2, now);
         if (!try s.step()) return null;
-        username = try allocator.dupe(u8, s.columnText(0));
-        recovery = try allocator.dupe(u8, s.columnText(1));
-    }
+        const username = try allocator.dupe(u8, s.columnText(0));
+        errdefer allocator.free(username);
+        const recovery = try allocator.dupe(u8, s.columnText(1));
+        errdefer allocator.free(recovery);
+        _ = try s.step();
+        try tx.commit();
+        break :claim .{ .username = username, .recovery = recovery };
+    };
+    const username = claimed.username;
+    const recovery = claimed.recovery;
     errdefer {
         allocator.free(username);
         allocator.free(recovery);
@@ -310,7 +321,7 @@ pub fn complete(allocator: std.mem.Allocator, db: *database.Database, auth: *aut
     // Hashes the password, signs out every browser session, and voids the
     // mailbox's other reset links.
     try auth.changePassword(username, new_password);
-    return .{ .username = username, .recovery = recovery };
+    return claimed;
 }
 
 // ── Messages ─────────────────────────────────────────────────────────────────
@@ -547,6 +558,12 @@ test "a reset link works once, expires, and the newest one voids the older" {
     const t2 = second.issued.token;
     try testing.expect(!std.mem.eql(u8, &t1, &t2));
     try testing.expect((try lookup(a, &db, &t1, 1070)) == null);
+
+    // If either returned field cannot be copied, the owner can still retry.
+    for (0..2) |fail_index| {
+        var failing = testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        try testing.expectError(error.OutOfMemory, complete(failing.allocator(), &db, &auth, &t2, "new-password-456", 1070));
+    }
 
     const done = (try complete(a, &db, &auth, &t2, "new-password-456", 1070)).?;
     defer {
