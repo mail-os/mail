@@ -464,6 +464,13 @@ pub const Database = struct {
             \\    collection_stamps TEXT NOT NULL,
             \\    completion_audit_id INTEGER UNIQUE
             \\);
+            \\CREATE TABLE IF NOT EXISTS hosted_erasure_dav_steps (
+            \\    start_audit_id INTEGER PRIMARY KEY,
+            \\    store_stamp TEXT NOT NULL,
+            \\    owner_id INTEGER,
+            \\    nonce TEXT NOT NULL UNIQUE,
+            \\    completion_audit_id INTEGER UNIQUE
+            \\);
             \\CREATE TRIGGER IF NOT EXISTS hosted_erasure_account_insert BEFORE INSERT ON users
             \\WHEN EXISTS(SELECT 1 FROM hosted_erasure_operations WHERE mailbox=NEW.username OR mailbox=NEW.email)
             \\BEGIN SELECT RAISE(ABORT,'mailbox erasure started'); END;

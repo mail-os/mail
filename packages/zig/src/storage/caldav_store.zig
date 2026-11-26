@@ -32,6 +32,7 @@ const io_compat = @import("../core/io_compat.zig");
 const Allocator = std.mem.Allocator;
 const mutex_compat = @import("../core/mutex_compat.zig");
 const database = @import("db_sqlite.zig");
+const dav_erasure_state = @import("dav_erasure_state.zig");
 const accounts = @import("database.zig");
 const teams = @import("team_store.zig");
 const icalendar = @import("../protocol/icalendar.zig");
@@ -639,6 +640,7 @@ pub const CalDavStore = struct {
             \\CREATE INDEX IF NOT EXISTS idx_dav_emails_c ON dav_emails(contact_id);
             \\CREATE INDEX IF NOT EXISTS idx_dav_phones_c ON dav_phones(contact_id);
         );
+        try conn.exec(dav_erasure_state.schema);
         try ensureTextColumn(conn, "dav_calendars", "share_id");
         try ensureTextColumn(conn, "dav_calendars", "display_name");
         try ensureTextColumn(conn, "dav_addressbooks", "display_name");
@@ -818,6 +820,21 @@ pub const CalDavStore = struct {
     /// store's lifetime, matching the in-session ownership model).
     fn loadFromDb(self: *Self) !void {
         const conn = if (self.conn) |*c| c else return;
+
+        {
+            var marks = try conn.prepare(dav_erasure_state.watermarks);
+            defer marks.finalize();
+            if (!try marks.step()) return error.DavErasureWatermarksUnavailable;
+            for (0..5) |column| {
+                const mark = marks.columnInt(@intCast(column));
+                if (mark < 0 or mark == std.math.maxInt(i64)) return error.DavErasureWatermarksUnavailable;
+            }
+            self.next_user_id = @intCast(marks.columnInt(0) + 1);
+            self.next_calendar_id = @intCast(marks.columnInt(1) + 1);
+            self.next_event_id = @intCast(marks.columnInt(2) + 1);
+            self.next_addressbook_id = @intCast(marks.columnInt(3) + 1);
+            self.next_contact_id = @intCast(marks.columnInt(4) + 1);
+        }
 
         {
             var stmt = try conn.prepare("SELECT id, username, mailbox_id FROM dav_users");

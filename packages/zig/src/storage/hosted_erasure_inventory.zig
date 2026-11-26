@@ -102,7 +102,8 @@ pub fn observeSqlite(a: Allocator, tx: Database.Transaction, mailbox: []const u8
         if (std.mem.eql(u8, name, "hosted_erasure_operations") or
             std.mem.eql(u8, name, "hosted_erasure_maildir_steps") or
             std.mem.eql(u8, name, "hosted_erasure_search_steps") or
-            std.mem.eql(u8, name, "hosted_erasure_typesense_steps")) continue;
+            std.mem.eql(u8, name, "hosted_erasure_typesense_steps") or
+            std.mem.eql(u8, name, "hosted_erasure_dav_steps")) continue;
         for (tables.items) |entry| {
             if (std.mem.eql(u8, entry.table, name)) break;
         } else try remaining.append(a, try a.dupe(u8, name));
@@ -162,18 +163,29 @@ fn observeMaildir(io: std.Io, root_path: []const u8, mailbox: []const u8, short:
     return .{ .state = .observed, .counts = totals, .legacy_short_name_present = legacy };
 }
 
-const Dav = struct {
+pub const Dav = struct {
     state: enum { mapped, no_owner, legacy_owner_unresolved, not_configured, missing, unavailable },
     legacy_name_candidates: ?u64 = null,
     tables: []const TableCount = &.{},
+    store_stamp: ?[]const u8 = null,
+    owner_id: ?i64 = null,
 };
-const calendar_owner = "calendar_id IN (SELECT id FROM dav_calendars WHERE user_id=?1)";
-const book_owner = "addressbook_id IN (SELECT id FROM dav_addressbooks WHERE user_id=?1)";
-const contact_owner = "contact_id IN (SELECT id FROM dav_contacts WHERE " ++ book_owner ++ ")";
+pub const calendar_owner = "calendar_id IN (SELECT id FROM dav_calendars WHERE user_id=?1)";
+pub const book_owner = "addressbook_id IN (SELECT id FROM dav_addressbooks WHERE user_id=?1)";
+pub const contact_owner = "contact_id IN (SELECT id FROM dav_contacts WHERE " ++ book_owner ++ ")";
+
+pub fn davStoreStamp(a: Allocator, io: std.Io, path: []const u8) ![]const u8 {
+    const file = try Dir.cwd().openFile(io, path, .{ .follow_symlinks = false, .allow_directory = false });
+    defer file.close(io);
+    var stat: std.c.Stat = undefined;
+    if (std.c.fstat(file.handle, &stat) != 0 or !std.c.S.ISREG(stat.mode) or stat.nlink != 1)
+        return error.ErasureDavFileUnverified;
+    return std.fmt.allocPrint(a, "{d}:{d}", .{ stat.dev, stat.ino });
+}
 
 fn observeDav(a: Allocator, io: std.Io, explicit_path: ?[]const u8, names: Names, short: []const u8) !Dav {
     const path = explicit_path orelse "./caldav.db";
-    Dir.cwd().access(io, path, .{}) catch |err| switch (err) {
+    const stamp = davStoreStamp(a, io, path) catch |err| switch (err) {
         error.FileNotFound => return .{ .state = if (explicit_path != null) .missing else .not_configured },
         else => return err,
     };
@@ -181,6 +193,14 @@ fn observeDav(a: Allocator, io: std.Io, explicit_path: ?[]const u8, names: Names
     defer db.deinit();
     var tx = try db.beginTransaction(.read);
     defer tx.deinit();
+    var observed = try observeDavOwner(a, tx, names.mailbox, names.user_id, short);
+    if (!std.mem.eql(u8, stamp, try davStoreStamp(a, io, path))) return error.ErasureDavFileChanged;
+    if (observed.state == .mapped or observed.state == .no_owner) observed.store_stamp = stamp;
+    try tx.commit();
+    return observed;
+}
+
+pub fn observeDavOwner(a: Allocator, tx: Database.Transaction, mailbox: []const u8, user_id: i64, short: []const u8) !Dav {
     const schema = try tx.prepare("SELECT 1 FROM pragma_table_info('dav_users') WHERE name='mailbox_id'");
     defer schema.finalize();
     const has_mapping = try schema.step();
@@ -189,16 +209,16 @@ fn observeDav(a: Allocator, io: std.Io, explicit_path: ?[]const u8, names: Names
     else
         "SELECT count(*) FROM dav_users WHERE username=?1 OR username=?2");
     defer matches.finalize();
-    try matches.bind(1, names.mailbox);
+    try matches.bind(1, mailbox);
     try matches.bind(2, short);
     if (!try matches.step()) return error.StepFailed;
     const legacy: u64 = @intCast(matches.columnInt64(0));
     if (!has_mapping) return .{ .state = .legacy_owner_unresolved, .legacy_name_candidates = legacy };
     const mapped = try tx.prepare("SELECT id FROM dav_users WHERE mailbox_id=?1");
     defer mapped.finalize();
-    try mapped.bind(1, names.user_id);
+    try mapped.bind(1, user_id);
     if (!try mapped.step()) return .{ .state = if (legacy != 0) .legacy_owner_unresolved else .no_owner, .legacy_name_candidates = legacy };
-    const owner: Names = .{ .user_id = mapped.columnInt64(0), .mailbox = names.mailbox };
+    const owner: Names = .{ .user_id = mapped.columnInt64(0), .mailbox = mailbox };
     if (try mapped.step()) return error.AmbiguousDavOwner;
     const tables = try a.dupe(TableCount, &.{
         try count(tx, "dav_calendars", "user_id=?1", .user_id, owner),
@@ -209,7 +229,7 @@ fn observeDav(a: Allocator, io: std.Io, explicit_path: ?[]const u8, names: Names
         try count(tx, "dav_phones", contact_owner, .user_id, owner),
         try count(tx, "dav_reminder_dismissals", "user_id=?1", .user_id, owner),
     });
-    return .{ .state = .mapped, .legacy_name_candidates = legacy, .tables = tables };
+    return .{ .state = .mapped, .legacy_name_candidates = legacy, .tables = tables, .owner_id = owner.user_id };
 }
 
 pub const Inventory = struct {

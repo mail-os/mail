@@ -621,6 +621,40 @@ under the same approved retention and backup policy.
 Run `python3 scripts/test-hosted-erasure-typesense.py /path/to/mail --typesense-server /path/to/typesense-server`
 against disposable fixtures to reproduce the real Typesense 30.2 rehearsal.
 
+### Remove active Calendar and Contacts data
+
+Use the approved review and the completed Maildir receipt. Stop Mail and any
+other writers using the same DAV database. Supply the exact path configured
+in `CALDAV_DB_PATH`, or `./caldav.db` when the daemon uses its default.
+Confirm this path and its paired SMTP database against the approved case.
+
+```bash
+umask 077
+/opt/mail/mail-server user:local hosted-erasure-dav \
+  /private/exit-case-19/review.json 816 /opt/mail/caldav.db \
+  > /private/exit-case-19/dav-receipt.json
+```
+
+The command verifies the reviewed database identity and scope, then removes
+the mapped owner's CalDAV calendars and events, CardDAV address books and
+contacts, contact addresses and numbers, reminder dismissals, and DAV owner
+record. A known empty scope receives its own receipt. It refuses an unresolved
+legacy owner, an unexpected DAV table, and a replacement or linked file.
+Historical inventories without a database stamp use the recorded counts and
+explicitly confirmed configured path before the first attempt.
+
+Keep both databases together while retrying. The DAV transaction verifies
+child removal before deleting each parent, then commits a receipt marker and
+ID high-water marks with the deletion. A failed SMTP audit can be retried
+with the same review and start ID. The completed receipt reports
+`dav_owned_data_removed_other_stores_pending`. Continue reconciliation of
+SQLite history, shared-calendar records in the SMTP database, and backups.
+
+Run `python3 scripts/test-hosted-erasure-dav.py /path/to/mail` with the
+disposable TLS fixtures. It covers transaction rollback, an audit interruption
+after the DAV commit, peer resource preservation, and ID allocation after
+restart.
+
 ## Local mailbox directory upgrade
 
 Back up the Maildir and SQLite database together before upgrading a server with older ActiveSync clients. On startup, the server checks for full-address local accounts that still have mail under a short directory name such as `mail/alice`. It moves eligible messages to `mail/alice@example.com` before opening the protocol listeners. It also moves messages in a canonical custom folder's nested slots into the folder path exposed by IMAP and webmail. ActiveSync, IMAP, webmail, and EWS then read from the canonical mailbox. The upgrade retains existing message flags and client identifiers when it can reconcile both directories.

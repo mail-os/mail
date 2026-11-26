@@ -70,6 +70,19 @@ fn loadInventory(a: Allocator, tx: Database.Transaction, review: Review) !Invent
     return reviewed;
 }
 
+pub fn reviewedDav(a: Allocator, tx: Database.Transaction, review: Review) !inventory.Dav {
+    return (try loadInventory(a, tx, review)).inventory.dav;
+}
+
+pub fn compareDav(a: Allocator, reviewed: inventory.Dav, current: inventory.Dav) !void {
+    var comparison = current;
+    if (reviewed.store_stamp == null) comparison.store_stamp = null;
+    if (reviewed.owner_id == null) comparison.owner_id = null;
+    const earlier = try std.json.Stringify.valueAlloc(a, reviewed, .{});
+    const later = try std.json.Stringify.valueAlloc(a, comparison, .{});
+    if (!std.mem.eql(u8, earlier, later)) return error.InventoryChanged;
+}
+
 fn validateInventory(a: Allocator, reviewed: inventory.Inventory, current: inventory.Inventory) !void {
     if (!reviewed.identity.eql(current.identity)) return error.AssignmentChanged;
     if (current.maildir.state == .unavailable or current.maildir.legacy_short_name_present != false)
@@ -84,6 +97,8 @@ fn validateInventory(a: Allocator, reviewed: inventory.Inventory, current: inven
     }
     var comparison = current;
     comparison.observed_at = reviewed.observed_at;
+    if (reviewed.dav.store_stamp == null) comparison.dav.store_stamp = null;
+    if (reviewed.dav.owner_id == null) comparison.dav.owner_id = null;
     const earlier = try std.json.Stringify.valueAlloc(a, reviewed, .{});
     const later = try std.json.Stringify.valueAlloc(a, comparison, .{});
     if (!std.mem.eql(u8, earlier, later)) return error.InventoryChanged;

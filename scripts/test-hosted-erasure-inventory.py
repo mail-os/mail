@@ -95,7 +95,8 @@ def verify(test, db):
         old.execute('CREATE TABLE dav_users(id INTEGER PRIMARY KEY, username TEXT NOT NULL)')
         old.execute('INSERT INTO dav_users(username) VALUES (?)', (mailbox.split('@')[0],))
     legacy = report(CALDAV_DB_PATH=str(old_dav))['inventory']['dav']
-    assert legacy == {'state': 'legacy_owner_unresolved', 'legacy_name_candidates': 1, 'tables': []}
+    assert legacy == {'state': 'legacy_owner_unresolved', 'legacy_name_candidates': 1, 'tables': [],
+                      'store_stamp': None, 'owner_id': None}
     with closing(sqlite3.connect(old_dav)) as old:
         assert 'mailbox_id' not in [col[1] for col in old.execute('PRAGMA table_info(dav_users)')]
 
