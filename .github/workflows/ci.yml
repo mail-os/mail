@@ -243,6 +243,19 @@ jobs:
         python3 ../../scripts/test-eas-folder-hierarchy.py zig-out/bin/mail
         python3 ../../scripts/test-local-maildir-upgrade.py zig-out/bin/mail
 
+    - name: Verify hosted erasure against real Typesense
+      if: runner.os == 'Linux'
+      working-directory: .
+      timeout-minutes: 4
+      run: |
+        archive="$RUNNER_TEMP/typesense-30.2.tar.gz"
+        fixture="$RUNNER_TEMP/mail-typesense"
+        mkdir -p "$fixture"
+        curl --fail --silent --show-error --retry 3 --location --output "$archive" https://dl.typesense.org/releases/30.2/typesense-server-30.2-linux-amd64.tar.gz
+        printf '%s  %s\n' cd791605e7c6cc7be457794f534cd4b9f9d361781adb10e40020efc22840ebc3 "$archive" | sha256sum --check
+        tar -xzf "$archive" -C "$fixture" typesense-server
+        python3 scripts/test-hosted-erasure-typesense.py packages/zig/zig-out/bin/mail --typesense-server "$fixture/typesense-server"
+
     - name: Verify outbound DKIM configuration and signing
       run: python3 ../../scripts/test-outbound-dkim.py zig-out/bin/mail
 

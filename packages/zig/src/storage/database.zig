@@ -458,6 +458,12 @@ pub const Database = struct {
             \\    search_documents INTEGER NOT NULL CHECK(search_documents>=0),
             \\    eas_search_keys INTEGER NOT NULL CHECK(eas_search_keys IN (0,1))
             \\);
+            \\CREATE TABLE IF NOT EXISTS hosted_erasure_typesense_steps (
+            \\    start_audit_id INTEGER PRIMARY KEY,
+            \\    endpoint TEXT NOT NULL,
+            \\    collection_stamps TEXT NOT NULL,
+            \\    completion_audit_id INTEGER UNIQUE
+            \\);
             \\CREATE TRIGGER IF NOT EXISTS hosted_erasure_account_insert BEFORE INSERT ON users
             \\WHEN EXISTS(SELECT 1 FROM hosted_erasure_operations WHERE mailbox=NEW.username OR mailbox=NEW.email)
             \\BEGIN SELECT RAISE(ABORT,'mailbox erasure started'); END;

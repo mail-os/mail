@@ -586,6 +586,41 @@ disposable installation. The fixture searches genuine SMTP-delivered mail
 in both accounts, forces rollback on a stale full-text index and an audit
 failure, then checks the peer's search and retry receipt after removal.
 
+### Reconcile active Typesense documents
+
+When the mailbox was indexed in Typesense, confirm the approved case identifies
+the live Typesense service and each separately operated copy. Keep every Mail
+writer connected to that service stopped. Run from the same working directory
+and SQLite database used by the earlier steps. Use the service's Typesense
+host and port and an operator credential with collection metadata, document
+export, and document deletion access. Supply the reviewed host and port from
+the private case to compare against the command environment.
+
+```bash
+umask 077
+/opt/mail/mail-server user:local hosted-erasure-typesense \
+  /private/exit-case-19/review.json 816 127.0.0.1 8108 \
+  > /private/exit-case-19/typesense-receipt.json
+```
+
+The command checks `messages`, `messages_v2`, and `messages_v3`. It records the
+approved endpoint and collection creation times before mutating the index.
+A filtered metadata export finds candidate documents. Each deletion uses a
+verified native document ID whose stored owner exactly matches the reserved
+mailbox. This preserves neighboring addresses even when Typesense normalizes
+their punctuation or case to the same search value.
+
+Retry with the same review, start audit, and endpoint after interruption. Keep
+the recorded intent and investigate collection identity changes before resuming
+the case. The command verifies the target is absent from the selected active
+collections before committing removal of that owner's pending index work and
+checkpoints. Keep the `typesense_removed_other_stores_pending` receipt with the
+case. Reconcile index snapshots, retained database history, and other services
+under the same approved retention and backup policy.
+
+Run `python3 scripts/test-hosted-erasure-typesense.py /path/to/mail --typesense-server /path/to/typesense-server`
+against disposable fixtures to reproduce the real Typesense 30.2 rehearsal.
+
 ## Local mailbox directory upgrade
 
 Back up the Maildir and SQLite database together before upgrading a server with older ActiveSync clients. On startup, the server checks for full-address local accounts that still have mail under a short directory name such as `mail/alice`. It moves eligible messages to `mail/alice@example.com` before opening the protocol listeners. It also moves messages in a canonical custom folder's nested slots into the folder path exposed by IMAP and webmail. ActiveSync, IMAP, webmail, and EWS then read from the canonical mailbox. The upgrade retains existing message flags and client identifiers when it can reconcile both directories.

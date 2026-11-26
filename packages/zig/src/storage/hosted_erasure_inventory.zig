@@ -101,7 +101,8 @@ pub fn observeSqlite(a: Allocator, tx: Database.Transaction, mailbox: []const u8
         // The reservation is operational evidence that outlives mailbox content.
         if (std.mem.eql(u8, name, "hosted_erasure_operations") or
             std.mem.eql(u8, name, "hosted_erasure_maildir_steps") or
-            std.mem.eql(u8, name, "hosted_erasure_search_steps")) continue;
+            std.mem.eql(u8, name, "hosted_erasure_search_steps") or
+            std.mem.eql(u8, name, "hosted_erasure_typesense_steps")) continue;
         for (tables.items) |entry| {
             if (std.mem.eql(u8, entry.table, name)) break;
         } else try remaining.append(a, try a.dupe(u8, name));

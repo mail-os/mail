@@ -14,6 +14,7 @@ const erasure_inventory = @import("../storage/hosted_erasure_inventory.zig");
 const erasure_review = @import("../storage/hosted_erasure_review.zig");
 const erasure_maildir = @import("../storage/hosted_erasure_maildir.zig");
 const erasure_search = @import("../storage/hosted_erasure_search.zig");
+const erasure_typesense = @import("../storage/hosted_erasure_typesense.zig");
 const io_compat = @import("../core/io_compat.zig");
 const time = @import("../core/time_compat.zig");
 
@@ -308,7 +309,22 @@ fn hostedErasureSearchAction(ctx: *cli.BaseCommand.ParseContext) !void {
     try hostedErasureApproval(ctx, .{ .search = audit_id });
 }
 
-const ErasureOperation = union(enum) { review, begin: i64, maildir: i64, search: i64 };
+fn hostedErasureTypesenseAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const audit = ctx.getArgument(1) orelse return error.MissingArgument;
+    const audit_id = std.fmt.parseInt(i64, audit, 10) catch return error.InvalidErasureStartAuditId;
+    const host = ctx.getArgument(2) orelse return error.MissingArgument;
+    const port_text = ctx.getArgument(3) orelse return error.MissingArgument;
+    const port = std.fmt.parseInt(u16, port_text, 10) catch return error.ErasureTypesenseEndpointMismatch;
+    try hostedErasureApproval(ctx, .{ .typesense = .{ .start_id = audit_id, .endpoint = .{ .host = host, .port = port } } });
+}
+
+const ErasureOperation = union(enum) {
+    review,
+    begin: i64,
+    maildir: i64,
+    search: i64,
+    typesense: struct { start_id: i64, endpoint: erasure_typesense.Endpoint },
+};
 
 fn hostedErasureApproval(ctx: *cli.BaseCommand.ParseContext, operation: ErasureOperation) !void {
     const review_path = ctx.getArgument(0) orelse return error.MissingArgument;
@@ -333,6 +349,7 @@ fn hostedErasureApproval(ctx: *cli.BaseCommand.ParseContext, operation: ErasureO
         .begin => |id| try std.json.Stringify.value(try erasure_review.begin(a, io, &db, review, id, operator, mail_root, dav_path), format, &output.interface),
         .maildir => |id| try std.json.Stringify.value(try erasure_maildir.erase(a, io, &db, review, id, operator, mail_root, dav_path), format, &output.interface),
         .search => |id| try std.json.Stringify.value(try erasure_search.erase(a, io, &db, review, id, operator, mail_root), format, &output.interface),
+        .typesense => |step| try std.json.Stringify.value(try erasure_typesense.erase(a, io, &db, review, step.start_id, operator, mail_root, step.endpoint), format, &output.interface),
     }
     try output.interface.writeByte('\n');
     try output.interface.flush();
@@ -545,6 +562,14 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try erasure_search_cmd.addArgument(cli.Argument.init("start-audit-id", "Audit ID of the reserved erasure", .string).withRequired(true));
     _ = erasure_search_cmd.setAction(hostedErasureSearchAction);
     _ = try cmd.addCommand(erasure_search_cmd);
+
+    const erasure_typesense_cmd = try cli.BaseCommand.init(allocator, "hosted-erasure-typesense", "Erase verified Typesense documents after local search removal");
+    _ = try erasure_typesense_cmd.addArgument(cli.Argument.init("review", "Private erasure review JSON file", .string).withRequired(true));
+    _ = try erasure_typesense_cmd.addArgument(cli.Argument.init("start-audit-id", "Audit ID of the reserved erasure", .string).withRequired(true));
+    _ = try erasure_typesense_cmd.addArgument(cli.Argument.init("host", "Reviewed Typesense host", .string).withRequired(true));
+    _ = try erasure_typesense_cmd.addArgument(cli.Argument.init("port", "Reviewed Typesense port", .string).withRequired(true));
+    _ = erasure_typesense_cmd.setAction(hostedErasureTypesenseAction);
+    _ = try cmd.addCommand(erasure_typesense_cmd);
 
     const export_cmd = try cli.BaseCommand.init(allocator, "export", "Export a mailbox to a portable TAR archive");
     _ = try export_cmd.addArgument(cli.Argument.init("username", "Canonical mailbox username", .string));
