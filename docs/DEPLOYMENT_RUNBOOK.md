@@ -949,6 +949,60 @@ automated Restic check, set `MAIL_RESTORE_ERASURE_CHECKPOINT`,
 in the protected recovery environment. The signed check uses the same
 SMTP, Maildir and DAV verification as the live-database check.
 
+### Replay an approved erasure into an older backup
+
+Keep the original archive and extract a working copy on the isolated
+recovery host. Keep listeners stopped throughout the replay. Obtain a new
+review of the restored data through the same authorization and retention
+process as the original case. Keep the original mailbox, assignment actor,
+request ID and case reference in the private review. The expected
+publisher key, scope, source checkpoint digest and observation floor come
+from the independent recovery record.
+
+From the extracted directory, use the review to match and disable the
+original assignment. The command locks the restored Maildir and preserves
+linked sessions for the reviewed linked-session step.
+
+```sh
+cd /restore
+mail backup rebind-local smtp.db mail
+mail backup check-erasure-replay-target /secure/original-authority.json smtp.db \
+  /secure/recovery-review.json --isolate-maildir mail \
+  --scope production-mail --public-key "$TRUSTED_PUBLISHER_PUBLIC_KEY" \
+  --expected-sha256 "$TRUSTED_CURRENT_CHECKPOINT_SHA256" \
+  --not-before "$TRUSTED_EARLIEST_OBSERVATION_SECONDS"
+```
+
+Run the inventory, approval, reservation, and removal steps against the
+isolated SMTP, Maildir and DAV stores. Record the fresh inventory audit ID
+and approval evidence in the review before recording it. Use the local start
+audit ID for the removal steps. Complete every case in the signed source
+checkpoint. Preserve the approved peer-owned Mail and Calendar copies and
+reconcile pending deliveries before removal. An extra case, changed
+assignment, incomplete step or changed peer copy blocks certification.
+
+With the recovery record approved, certify the replay in the trusted
+publishing environment. Use the signing seed corresponding to the pinned
+public key. Keep the replayed backup offline until verification succeeds.
+
+```sh
+umask 077
+mail backup seal-erasure-replay /secure/original-authority.json /restore/smtp.db \
+  /restore/mail /secure/mail-erasure.seed /restore/caldav.db \
+  --scope production-mail --public-key "$TRUSTED_PUBLISHER_PUBLIC_KEY" \
+  --expected-sha256 "$TRUSTED_CURRENT_CHECKPOINT_SHA256" \
+  --not-before "$TRUSTED_EARLIEST_OBSERVATION_SECONDS" \
+  --approval-reference recovery-case-123 > /secure/replay-authority.json
+```
+
+Publish the replay checkpoint and its exact digest through the independent
+recovery record. Run `verify-erasure-checkpoint` against the prepared backup
+with that new pin. The receipt identifies the original checkpoint and the
+recovery approval. It checks the resulting stored state and the retained
+peer copies again. Keep the original and replay receipts with the recovery
+case. Earlier signed checkpoint versions remain usable for verification.
+Issue a current checkpoint with replay evidence before starting a replay.
+
 ## Local mailbox directory upgrade
 
 Back up the Maildir and SQLite database together before upgrading a server with older ActiveSync clients. On startup, the server checks for full-address local accounts that still have mail under a short directory name such as `mail/alice`. It moves eligible messages to `mail/alice@example.com` before opening the protocol listeners. It also moves messages in a canonical custom folder's nested slots into the folder path exposed by IMAP and webmail. ActiveSync, IMAP, webmail, and EWS then read from the canonical mailbox. The upgrade retains existing message flags and client identifiers when it can reconcile both directories.

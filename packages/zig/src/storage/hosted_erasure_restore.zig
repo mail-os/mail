@@ -7,6 +7,7 @@ const preflight = @import("hosted_erasure_preflight.zig");
 const links = @import("hosted_erasure_links.zig");
 const maildir = @import("hosted_erasure_maildir.zig");
 const refs = @import("message_refs.zig");
+const replay_evidence = @import("hosted_erasure_replay_evidence.zig");
 const review_store = @import("hosted_erasure_review.zig");
 const search = @import("hosted_erasure_search.zig");
 const shared = @import("hosted_erasure_shared_sqlite.zig");
@@ -27,7 +28,7 @@ const steps = [_][]const u8{
     "hosted.erasure.links.revoked",
     "hosted.erasure.sqlite.content.removed",
 };
-const Case = struct {
+pub const Case = struct {
     start_audit_id: i64,
     identity_sha256: Digest,
     review_sha256: Digest,
@@ -35,6 +36,7 @@ const Case = struct {
     dav_configured: bool,
     dav_owner_id: ?i64,
     dav_sha256: ?Digest,
+    replay: ?replay_evidence.Fingerprints = null,
 };
 pub const Snapshot = struct {
     observed_at: i64,
@@ -48,6 +50,8 @@ pub const Receipt = struct {
     checked_at: i64,
     authority_observed_at: i64,
     checkpoint_sha256: ?Digest = null,
+    replayed_from_sha256: ?Digest = null,
+    recovery_approval_reference: ?[]const u8 = null,
     reservations_checked: usize,
     authority_sha256: [64]u8,
     newest_reservation_audit_id: ?i64,
@@ -143,14 +147,17 @@ fn matchAudit(restored: Tx, mailbox: []const u8, start: i64, action: []const u8,
     hashValue(hash, &recorded);
 }
 
-fn matchReservation(a: Allocator, tx: Tx, review: review_store.Review, start: i64, owner: i64, now: i64) !preflight.Identity {
-    // Check all matching rows, including an ID reassigned to another address
-    // and duplicate username/email attribution that could revive the address.
+pub fn requireSingleAddress(tx: Tx, mailbox: []const u8, owner: i64) !void {
+    // Duplicate username/email attribution can revive a reserved address.
     const users = try tx.prepare("SELECT 1 FROM users WHERE id<>?1 AND (username=?2 COLLATE NOCASE OR email=?2 COLLATE NOCASE)");
     defer users.finalize();
     try users.bind(1, owner);
-    try users.bind(2, review.mailbox);
+    try users.bind(2, mailbox);
     if (try users.step()) return error.RestoreErasureIdentityChanged;
+}
+
+fn matchReservation(a: Allocator, tx: Tx, review: review_store.Review, start: i64, owner: i64, now: i64) !preflight.Identity {
+    try requireSingleAddress(tx, review.mailbox, owner);
     const observation = try review_store.requireStarted(a, tx, review, start, now);
     if (observation.identity.native_user_id != owner) return error.RestoreErasureIdentityChanged;
     return observation.identity;
@@ -218,12 +225,18 @@ pub fn capture(a: Allocator, path: []const u8) !Snapshot {
                 .dav_sha256 = try audit(tx, review.mailbox, start, "hosted.erasure.dav.removed"),
             };
             for (steps, &proof.steps_sha256) |step, *value| value.* = try audit(tx, review.mailbox, start, step);
+            if (caseComplete(proof.*)) proof.replay = try replay_evidence.capture(a, tx, null, review, start, identity, false);
         }
         if (try row.step()) return error.RestoreErasureAuthorityInvalid;
     }
     const anchors = try lineage(a, tx);
     if (!std.mem.eql(u8, stamp, try refs.fileStamp(a, path))) return error.RestoreErasureDatabaseChanged;
     return .{ .observed_at = time, .assignments = anchors, .cases = proofs };
+}
+
+pub fn caseComplete(proof: Case) bool {
+    for (proof.steps_sha256) |digest| if (digest == null) return false;
+    return !proof.dav_configured or proof.dav_sha256 != null;
 }
 
 pub fn verify(a: Allocator, io: std.Io, authority_path: []const u8, restored_path: []const u8, restored_maildir: []const u8, dav_path: ?[]const u8, legacy: bool) !Receipt {
@@ -241,6 +254,14 @@ pub fn verify(a: Allocator, io: std.Io, authority_path: []const u8, restored_pat
 }
 
 pub fn verifySnapshot(a: Allocator, io: std.Io, snapshot: Snapshot, restored_path: []const u8, restored_maildir: []const u8, dav_path: ?[]const u8) !Receipt {
+    return verifyCandidate(a, io, snapshot, restored_path, restored_maildir, dav_path, false);
+}
+
+pub fn verifyReplaySnapshot(a: Allocator, io: std.Io, snapshot: Snapshot, restored_path: []const u8, restored_maildir: []const u8, dav_path: ?[]const u8) !Receipt {
+    return verifyCandidate(a, io, snapshot, restored_path, restored_maildir, dav_path, true);
+}
+
+fn verifyCandidate(a: Allocator, io: std.Io, snapshot: Snapshot, restored_path: []const u8, restored_maildir: []const u8, dav_path: ?[]const u8, replay: bool) !Receipt {
     const restore_stamp = try refs.fileStamp(a, restored_path);
     var root = try Dir.cwd().openDir(io, restored_maildir, .{ .iterate = true, .follow_symlinks = false });
     defer root.close(io);
@@ -302,6 +323,11 @@ pub fn verifySnapshot(a: Allocator, io: std.Io, snapshot: Snapshot, restored_pat
             _ = try links.requireRemoved(restored, review, start, owner);
             try content.verifyRemoved(restored, owner, review.mailbox);
             try verifyDav(a, proof, restored, restored_dav, review, start, owner, &hash);
+            if (replay) {
+                const expected = proof.replay orelse return error.RestoreErasureReplayEvidenceMissing;
+                const observed = try replay_evidence.capture(a, restored, restored_dav, review, start, identity, true);
+                if (!std.meta.eql(expected, observed)) return error.RestoreErasurePeerCopyChanged;
+            }
             newest = start;
         }
         if (try cases.step()) return error.RestoreErasureReconciliationRequired;

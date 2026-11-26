@@ -238,6 +238,7 @@ jobs:
         python3 ../../scripts/test-hosted-erasure-links.py zig-out/bin/mail
         python3 ../../scripts/test-hosted-erasure-private-content.py zig-out/bin/mail
         python3 ../../scripts/test-hosted-erasure-restore.py zig-out/bin/mail
+        python3 ../../scripts/test-hosted-erasure-replay.py zig-out/bin/mail
         python3 ../../scripts/test-hosted-erasure-shared-release.py zig-out/bin/mail
         python3 ../../scripts/test-hosted-erasure-calendar-copy.py zig-out/bin/mail
         python3 ../../scripts/test-hosted-erasure-retained-threads.py zig-out/bin/mail

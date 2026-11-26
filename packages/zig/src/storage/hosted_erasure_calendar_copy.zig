@@ -93,6 +93,30 @@ fn verifyCopy(a: Allocator, dav: Database.Transaction, source_id: i64, copy: Cop
     return .{ .copy = copy, .resources = resources, .resources_sha256 = std.fmt.bytesToHex(hash.finalResult(), .lower) };
 }
 
+pub fn verifyRetained(dav: Database.Transaction, proof: VerifiedCopy) !void {
+    const row = try dav.prepare(
+        \\SELECT c.timezone FROM dav_calendars c JOIN dav_users u ON u.id=c.user_id
+        \\WHERE c.id=?1 AND u.mailbox_id=?2
+    );
+    defer row.finalize();
+    try row.bind(1, proof.copy.destination_calendar_id);
+    try row.bind(2, proof.copy.peer_user_id);
+    if (!try row.step()) return error.RestoreErasurePeerCopyMissing;
+    var hash = Sha256.init(.{});
+    appendHash(&hash, row.columnText(0));
+    const resources = try events(dav, proof.copy.destination_calendar_id);
+    defer resources.finalize();
+    var count: usize = 0;
+    while (try resources.step()) {
+        appendHash(&hash, resources.columnBlob(0));
+        appendHash(&hash, resources.columnBlob(1));
+        count += 1;
+    }
+    const actual = std.fmt.bytesToHex(hash.finalResult(), .lower);
+    if (count != proof.resources or !std.mem.eql(u8, &actual, &proof.resources_sha256))
+        return error.RestoreErasurePeerCopyChanged;
+}
+
 pub fn verify(a: Allocator, authority: Database.Transaction, dav: Database.Transaction, source_id: i64, copies: []const Copy, now: i64) ![]const VerifiedCopy {
     const verified = try a.alloc(VerifiedCopy, copies.len);
     for (copies, verified) |copy, *result| {

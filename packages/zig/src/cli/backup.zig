@@ -466,17 +466,53 @@ fn verifyErasureCheckpointAction(ctx: *cli.BaseCommand.ParseContext) !void {
     const checkpoint = ctx.getArgument(0) orelse return error.MissingRestoreErasureAuthority;
     const restored = ctx.getArgument(1) orelse return error.MissingBackupDatabase;
     const root = ctx.getArgument(2) orelse return error.MissingBackupMaildir;
+    const pin = try checkpointPin(ctx);
+    const io = io_compat.getIo();
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const receipt = try erasure_checkpoint.verify(arena.allocator(), io, checkpoint, pin, restored, root, ctx.getArgument(3));
+    try writeErasureJson(io, receipt);
+}
+
+fn checkpointPin(ctx: *cli.BaseCommand.ParseContext) !erasure_checkpoint.Pin {
     const pin: erasure_checkpoint.Pin = .{
         .scope = ctx.getOption("scope") orelse return error.InvalidErasureCheckpointPin,
         .public_key = ctx.getOption("public-key") orelse return error.InvalidErasureCheckpointPin,
         .sha256 = ctx.getOption("expected-sha256") orelse return error.InvalidErasureCheckpointPin,
         .not_before = try std.fmt.parseInt(i64, ctx.getOption("not-before") orelse return error.InvalidErasureCheckpointPin, 10),
     };
+    return pin;
+}
+
+fn checkErasureReplayTargetAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const checkpoint = ctx.getArgument(0) orelse return error.MissingRestoreErasureAuthority;
+    const restored = ctx.getArgument(1) orelse return error.MissingBackupDatabase;
+    const review = ctx.getArgument(2) orelse return error.MissingErasureReview;
     const io = io_compat.getIo();
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
-    const receipt = try erasure_checkpoint.verify(arena.allocator(), io, checkpoint, pin, restored, root, ctx.getArgument(3));
+    const receipt = try erasure_checkpoint.checkReplayTarget(arena.allocator(), io, checkpoint, try checkpointPin(ctx), restored, review, ctx.getOption("isolate-maildir"));
     try writeErasureJson(io, receipt);
+}
+
+fn sealErasureReplayAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const checkpoint = ctx.getArgument(0) orelse return error.MissingRestoreErasureAuthority;
+    const restored = ctx.getArgument(1) orelse return error.MissingBackupDatabase;
+    const root = ctx.getArgument(2) orelse return error.MissingBackupMaildir;
+    const seed = ctx.getArgument(3) orelse return error.MissingErasureCheckpointSigningKey;
+    const approval = ctx.getOption("approval-reference") orelse return error.InvalidErasureReplayApproval;
+    const io = io_compat.getIo();
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const document = try erasure_checkpoint.sealReplay(arena.allocator(), io, checkpoint, try checkpointPin(ctx), restored, root, ctx.getArgument(4), seed, approval);
+    try writeErasureJson(io, document);
+}
+
+fn addCheckpointPinOptions(command: *cli.BaseCommand) !void {
+    _ = try command.addOption(cli.Option.init("scope", "scope", "Expected scope from a trusted recovery record", .string).withRequired(true));
+    _ = try command.addOption(cli.Option.init("public-key", "public-key", "Pinned hexadecimal Ed25519 public key", .string).withRequired(true));
+    _ = try command.addOption(cli.Option.init("expected-sha256", "expected-sha256", "Pinned SHA-256 of the current checkpoint file", .string).withRequired(true));
+    _ = try command.addOption(cli.Option.init("not-before", "not-before", "Earliest acceptable observation as Unix seconds", .string).withRequired(true));
 }
 
 pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
@@ -546,12 +582,29 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try checkpoint_cmd.addArgument(cli.Argument.init("restored-db", "SMTP database from isolated restore", .string));
     _ = try checkpoint_cmd.addArgument(cli.Argument.init("restored-maildir", "Maildir from isolated restore", .string));
     _ = try checkpoint_cmd.addArgument(cli.Argument.init("restored-dav", "DAV database from isolated restore", .string).withRequired(false));
-    _ = try checkpoint_cmd.addOption(cli.Option.init("scope", "scope", "Expected scope from a trusted recovery record", .string).withRequired(true));
-    _ = try checkpoint_cmd.addOption(cli.Option.init("public-key", "public-key", "Pinned hexadecimal Ed25519 public key", .string).withRequired(true));
-    _ = try checkpoint_cmd.addOption(cli.Option.init("expected-sha256", "expected-sha256", "Pinned SHA-256 of the current checkpoint file", .string).withRequired(true));
-    _ = try checkpoint_cmd.addOption(cli.Option.init("not-before", "not-before", "Earliest acceptable observation as Unix seconds", .string).withRequired(true));
+    try addCheckpointPinOptions(checkpoint_cmd);
     _ = checkpoint_cmd.setAction(verifyErasureCheckpointAction);
     _ = try backup_cmd.addCommand(checkpoint_cmd);
+
+    const check_replay_cmd = try cli.BaseCommand.init(allocator, "check-erasure-replay-target", "Match an isolated restore case to its original signed lifecycle identity");
+    _ = try check_replay_cmd.addArgument(cli.Argument.init("checkpoint", "Current signed checkpoint from independent storage", .string));
+    _ = try check_replay_cmd.addArgument(cli.Argument.init("restored-db", "SMTP database from isolated restore", .string));
+    _ = try check_replay_cmd.addArgument(cli.Argument.init("review", "Private erasure review for the recovered mailbox", .string));
+    try addCheckpointPinOptions(check_replay_cmd);
+    _ = try check_replay_cmd.addOption(cli.Option.init("isolate-maildir", "isolate-maildir", "Lock the restored Maildir and disable the matched mailbox while preserving linked sessions", .string));
+    _ = check_replay_cmd.setAction(checkErasureReplayTargetAction);
+    _ = try backup_cmd.addCommand(check_replay_cmd);
+
+    const seal_replay_cmd = try cli.BaseCommand.init(allocator, "seal-erasure-replay", "Certify a fully reconciled backup against its original signed checkpoint");
+    _ = try seal_replay_cmd.addArgument(cli.Argument.init("checkpoint", "Current signed checkpoint from independent storage", .string));
+    _ = try seal_replay_cmd.addArgument(cli.Argument.init("restored-db", "SMTP database from isolated restore", .string));
+    _ = try seal_replay_cmd.addArgument(cli.Argument.init("restored-maildir", "Maildir from isolated restore", .string));
+    _ = try seal_replay_cmd.addArgument(cli.Argument.init("private-seed", "Private file containing the trusted publisher Ed25519 seed", .string));
+    _ = try seal_replay_cmd.addArgument(cli.Argument.init("restored-dav", "DAV database from isolated restore", .string).withRequired(false));
+    try addCheckpointPinOptions(seal_replay_cmd);
+    _ = try seal_replay_cmd.addOption(cli.Option.init("approval-reference", "approval-reference", "Independent operator approval for the reconciled backup", .string).withRequired(true));
+    _ = seal_replay_cmd.setAction(sealErasureReplayAction);
+    _ = try backup_cmd.addCommand(seal_replay_cmd);
 
     return backup_cmd;
 }
