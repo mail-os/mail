@@ -1975,14 +1975,15 @@ async function teamThreadJourney(desktop) {
     }
     await setPermission('Allow teammate to search', false)
     await setPermission('Allow teammate to post comments', false)
-    const labels = await ownerView.getByRole('group', { name: 'Teammate permissions' }).locator('label').evaluateAll(elements => elements.map((label) => {
-      const row = label.getBoundingClientRect()
-      const checkbox = label.querySelector('input').getBoundingClientRect()
-      return { height: row.height, centered: Math.abs(row.top + row.height / 2 - checkbox.top - checkbox.height / 2) <= 1 }
-    }))
-    assert.equal(labels.length, 2)
-    assert(labels.every(label => label.height >= 36 && label.centered), 'Permission labels align with their checkboxes')
     await screenshot(desktop, 'desktop-team-thread-permissions')
+    const labels = ownerView.getByRole('group', { name: 'Teammate permissions' }).locator('label')
+    assert.equal(await labels.count(), 2)
+    for (const label of await labels.all()) {
+      const row = await label.boundingBox()
+      const checkbox = await label.getByRole('checkbox').boundingBox()
+      assert(row && checkbox && row.height >= 36, 'Permission labels have a full-height target')
+      assert(Math.abs(row.y + row.height / 2 - checkbox.y - checkbox.height / 2) <= 1, 'Permission labels align with their checkboxes')
+    }
     await button(incoming, 'Search').click()
     await incoming.getByRole('alert').filter({ hasText: /turned off search/ }).waitFor()
     await button(incoming, 'Back to shared mail').click()
