@@ -3436,12 +3436,14 @@ try {
   const phone = await signIn({ phone: true })
   await installGuideJourney(phone, true)
   await phoneJourney(phone)
-  await invitationJourney(desktop)
-  await invitationJourney(phone, true)
   await calendarEventControlJourney(desktop)
+  // Availability and calendar sharing assert the original seed events. An
+  // accepted invitation can overlap that day when CI runs on the fixture date.
   await freeTimeJourney(desktop)
   await freeTimeJourney(phone, true)
   await calendarSharingJourney(desktop)
+  await invitationJourney(desktop)
+  await invitationJourney(phone, true)
   await mailEventJourney(desktop)
   const firstRun = await signIn({ phone: true, account: newcomer, initialSubject: 'Studio launch notes' })
   await mailEventJourney(firstRun, { phone: true, firstCalendar: true })
