@@ -245,12 +245,15 @@ pub fn invite(a: Allocator, db: *Database, user: []const u8, request: Invitation
 pub fn revokeInvitation(db: *Database, user: []const u8, id: []const u8) !void {
     db.lockMailboxes();
     defer db.unlockMailboxes();
-    const stmt = try db.prepare("DELETE FROM sender_review_invitations WHERE " ++ owner ++ " AND id=?2 RETURNING id");
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const stmt = try tx.prepare("DELETE FROM sender_review_invitations WHERE " ++ owner ++ " AND id=?2 RETURNING id");
     defer stmt.finalize();
     try stmt.bind(1, user);
     try stmt.bind(2, id);
     if (!try stmt.step()) return error.NotFound;
     _ = try stmt.step();
+    try tx.commit();
 }
 
 fn forget(db: *Database, user: []const u8, row: Review) !void {

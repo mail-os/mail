@@ -41,6 +41,7 @@ pub const DatabaseError = error{
     OpenFailed,
     ExecFailed,
     PrepareFailed,
+    WriteResultRequiresTransaction,
     StepFailed,
     BindFailed,
     ColumnFailed,
@@ -1207,6 +1208,12 @@ pub const Database = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         var stmt = try self.prepareLocked(sql);
+        // Standalone statements release the connection lock after each step.
+        // Keep write results inside a transaction until the cursor is done.
+        if (sqlite.sqlite3_column_count(stmt.stmt) > 0 and sqlite.sqlite3_stmt_readonly(stmt.stmt) == 0 and sqlite.sqlite3_stmt_isexplain(stmt.stmt) == 0) {
+            stmt.finalize();
+            return DatabaseError.WriteResultRequiresTransaction;
+        }
         stmt.mutex = &self.mutex;
         return stmt;
     }
@@ -1233,6 +1240,10 @@ pub const Database = struct {
 
         pub fn prepare(self: Transaction, sql: []const u8) !Statement {
             return self.db.prepareLocked(sql);
+        }
+
+        pub fn deleteUserResetTokens(self: Transaction, username: []const u8) !void {
+            try self.db.deleteUserResetTokensLocked(username);
         }
 
         pub fn commit(self: *Transaction) !void {
@@ -2161,7 +2172,9 @@ pub const Database = struct {
     pub fn setVacationSettings(self: *Database, user: []const u8, settings: VacationSettings) !i64 {
         self.lockMailboxes();
         defer self.unlockMailboxes();
-        const stmt = try self.prepare(
+        var tx = try self.beginTransaction(.write);
+        defer tx.deinit();
+        const stmt = try tx.prepare(
             \\INSERT INTO mailbox_vacation(user_id,enabled,subject,body,starts_at,ends_at)
             \\SELECT id,?2,?3,?4,?5,?6 FROM users
             \\WHERE username=?1 AND enabled=1 AND (?7=0 OR EXISTS(SELECT 1 FROM mailbox_vacation WHERE user_id=users.id))
@@ -2178,7 +2191,10 @@ pub const Database = struct {
         try stmt.bindOpt(6, settings.endsAt);
         try stmt.bind(7, settings.revision);
         if (!try stmt.step()) return error.PreconditionFailed;
-        return stmt.columnInt64(0);
+        const revision = stmt.columnInt64(0);
+        _ = try stmt.step();
+        try tx.commit();
+        return revision;
     }
 
     /// Reserve a reply and its hosted debit in the delivery transaction. A
@@ -2672,20 +2688,15 @@ pub const Database = struct {
     ;
 
     pub fn checkpointInteractiveRecipient(self: *Database, id: []const u8, recipient: []const u8, phase: InteractivePhase, native_sent_reply: bool) !void {
-        if (native_sent_reply and phase == .delivered) {
-            var tx = try self.beginTransaction(.write);
-            defer tx.deinit();
-            {
-                const stmt = try tx.prepare(interactive_phase_sql);
-                defer stmt.finalize();
-                try checkpointRecipient(stmt, id, recipient, phase);
-            }
-            try self.publishNativeSentReplyLocked(id);
-            return tx.commit();
+        var tx = try self.beginTransaction(.write);
+        defer tx.deinit();
+        {
+            const stmt = try tx.prepare(interactive_phase_sql);
+            defer stmt.finalize();
+            try checkpointRecipient(stmt, id, recipient, phase);
         }
-        const stmt = try self.prepare(interactive_phase_sql);
-        defer stmt.finalize();
-        try checkpointRecipient(stmt, id, recipient, phase);
+        if (native_sent_reply and phase == .delivered) try self.publishNativeSentReplyLocked(id);
+        try tx.commit();
     }
 
     /// The confirmed result of one remote DATA transaction applies to every
@@ -5844,6 +5855,35 @@ pub const Database = struct {
         return 1;
     }
 };
+
+test "write results require a transaction on the shared connection" {
+    const t = std.testing;
+    var db = try Database.init(t.allocator, ":memory:");
+    defer db.deinit();
+    try db.exec("CREATE TABLE write_results (id INTEGER PRIMARY KEY)");
+
+    const returning = "INSERT INTO write_results VALUES (2) RETURNING id";
+    try t.expectError(DatabaseError.WriteResultRequiresTransaction, db.prepare(returning));
+    {
+        const stmt = try db.prepare("INSERT INTO write_results VALUES (1)");
+        defer stmt.finalize();
+        try t.expect(!try stmt.step());
+    }
+    {
+        var tx = try db.beginTransaction(.write);
+        defer tx.deinit();
+        const stmt = try tx.prepare(returning);
+        defer stmt.finalize();
+        try t.expect(try stmt.step());
+        try t.expectEqual(@as(i64, 2), stmt.columnInt64(0));
+        try t.expect(!try stmt.step());
+        try tx.commit();
+    }
+    const read = try db.prepare("SELECT count(*) FROM write_results");
+    defer read.finalize();
+    try t.expect(try read.step());
+    try t.expectEqual(@as(i64, 2), read.columnInt64(0));
+}
 
 test "hosted access windows use exclusive UTC deadlines and preserve operator suspension" {
     const t = std.testing;

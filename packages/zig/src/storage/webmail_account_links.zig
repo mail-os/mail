@@ -130,10 +130,13 @@ pub fn createInTransaction(tx: database.Database.Transaction, owner: []const u8,
 }
 
 pub fn remove(db: *database.Database, owner: []const u8, id: []const u8) !void {
-    const stmt = try db.prepare("DELETE FROM webmail_account_links WHERE owner_session=?1 AND id=?2 RETURNING id");
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const stmt = try tx.prepare("DELETE FROM webmail_account_links WHERE owner_session=?1 AND id=?2 RETURNING id");
     defer stmt.finalize();
     try stmt.bind(1, owner);
     try stmt.bind(2, id);
     if (!try stmt.step()) return error.LinkedAccountUnavailable;
     _ = try stmt.step();
+    try tx.commit();
 }

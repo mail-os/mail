@@ -527,13 +527,17 @@ pub fn createCollection(a: Allocator, db: *Database, actor: []const u8, team: []
 }
 
 pub fn revoke(db: *Database, actor: []const u8, id: []const u8) !void {
-    const stmt = try db.prepare(
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const stmt = try tx.prepare(
         \\DELETE FROM mail_team_thread_shares WHERE id=?2
         \\AND owner_id=(SELECT id FROM users WHERE username=?1 AND enabled=1) RETURNING id
     );
     defer stmt.finalize();
     try bind(stmt, .{ actor, id });
     if (!try stmt.step()) return error.ThreadShareUnavailable;
+    _ = try stmt.step();
+    try tx.commit();
 }
 
 fn selected(a: Allocator, tx: Database.Transaction, id: []const u8, ref: ?[]const u8) ![]Selection {
@@ -813,13 +817,18 @@ pub fn claimReplyNotices(a: Allocator, db: *Database, actor: []const u8, junk: [
             error.ThreadShareUnavailable, maildir.MaildirError.MessageNotFound, error.FileNotFound => false,
             else => return err,
         };
-        const stmt = try db.prepare(
+        var tx = try db.beginTransaction(.write);
+        defer tx.deinit();
+        const stmt = try tx.prepare(
             "UPDATE mail_team_thread_replies SET notice_at=0 WHERE rowid IN (SELECT r.rowid" ++ notice_access ++
                 " AND r.rowid=?2 AND r.share_id=?3 AND r.reference=?4 AND r.content_revision=?5) RETURNING rowid",
         );
         defer stmt.finalize();
         try bind(stmt, .{ actor, notice.id, notice.grant, notice.item.reference, @as([]const u8, &notice.item.revision) });
-        if (try stmt.step() and visible) count += 1;
+        if (!try stmt.step()) continue;
+        _ = try stmt.step();
+        try tx.commit();
+        if (visible) count += 1;
     }
     return count;
 }

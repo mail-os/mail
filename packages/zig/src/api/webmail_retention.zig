@@ -148,7 +148,9 @@ pub fn preview(a: Allocator, db: *Database, user: []const u8, policy: Policy, re
     }
     const token = try store.newId(a);
     const expires = now + 600;
-    const stmt = try db.prepare(
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const stmt = try tx.prepare(
         \\INSERT INTO mail_retention_previews(user_id,token,folder,days,revision,cutoff,digest,expires_at)
         \\ SELECT id,?2,?3,?4,?5,?6,?7,?8 FROM users WHERE username=?1 AND enabled=1
         \\ON CONFLICT(user_id) DO UPDATE SET token=excluded.token,folder=excluded.folder,days=excluded.days,
@@ -166,6 +168,7 @@ pub fn preview(a: Allocator, db: *Database, user: []const u8, policy: Policy, re
     try stmt.bind(8, expires);
     if (!try stmt.step()) return error.NotFound;
     _ = try stmt.step();
+    try tx.commit();
     return .{ .token = token, .policy = policy, .total = selected.total, .examples = examples, .expires_at = expires };
 }
 
