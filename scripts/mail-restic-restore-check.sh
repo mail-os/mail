@@ -67,14 +67,22 @@ for database in smtp.db caldav.db; do
   fi
 done
 
-# The authority is the configured live database on protected storage. It is
-# resolved outside the downloaded archive and must exist even for old backups.
-authority="$(realpath -e -- "${MAIL_RESTORE_AUTHORITATIVE_DB}")" || die "current erasure authority is unavailable"
-erasure_args=("${authority}" "${unpack_dir}/smtp.db" "${unpack_dir}/mail")
+erasure_args=("${unpack_dir}/smtp.db" "${unpack_dir}/mail")
 if [[ -f "${unpack_dir}/caldav.db" ]]; then
   erasure_args+=("${unpack_dir}/caldav.db")
 fi
-"${MAIL_BACKUP_BIN}" backup verify-erasure-restore "${erasure_args[@]}"
+if [[ -n "${MAIL_RESTORE_ERASURE_CHECKPOINT:-}" ]]; then
+  : "${MAIL_RESTORE_ERASURE_SCOPE:?trusted erasure checkpoint scope required}"
+  : "${MAIL_RESTORE_ERASURE_PUBLIC_KEY:?trusted erasure checkpoint public key required}"
+  : "${MAIL_RESTORE_ERASURE_SHA256:?current erasure checkpoint SHA-256 required}"
+  : "${MAIL_RESTORE_ERASURE_NOT_BEFORE:?erasure checkpoint freshness floor required}"
+  "${MAIL_BACKUP_BIN}" backup verify-erasure-checkpoint "${MAIL_RESTORE_ERASURE_CHECKPOINT}" "${erasure_args[@]}" \
+    --scope "${MAIL_RESTORE_ERASURE_SCOPE}" --public-key "${MAIL_RESTORE_ERASURE_PUBLIC_KEY}" \
+    --expected-sha256 "${MAIL_RESTORE_ERASURE_SHA256}" --not-before "${MAIL_RESTORE_ERASURE_NOT_BEFORE}"
+else
+  authority="$(realpath -e -- "${MAIL_RESTORE_AUTHORITATIVE_DB}")" || die "current erasure authority is unavailable"
+  "${MAIL_BACKUP_BIN}" backup verify-erasure-restore "${authority}" "${erasure_args[@]}"
+fi
 
 message_count="$(find "${unpack_dir}/mail" -type f 2>/dev/null | wc -l)"
 [[ "${message_count}" -gt 0 ]] || die "restored archive contains no messages"

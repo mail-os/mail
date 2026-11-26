@@ -4,6 +4,7 @@ const io_compat = @import("../core/io_compat.zig");
 const fs = @import("../core/fs_compat.zig");
 const database = @import("../storage/database.zig");
 const identity = @import("../storage/backup_identity.zig");
+const erasure_checkpoint = @import("../storage/hosted_erasure_checkpoint.zig");
 const erasure_restore = @import("../storage/hosted_erasure_restore.zig");
 
 const MAIL_CLI_PATH = "/opt/mail/packages/zig/zig-out/bin/mail";
@@ -440,11 +441,42 @@ fn verifyErasureRestoreAction(ctx: *cli.BaseCommand.ParseContext) !void {
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
     const receipt = try erasure_restore.verify(arena.allocator(), io, authority, restored, root, ctx.getArgument(3), ctx.hasOption("legacy"));
+    try writeErasureJson(io, receipt);
+}
+
+fn writeErasureJson(io: std.Io, value: anytype) !void {
     var buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writerStreaming(io, &buffer);
-    try std.json.Stringify.value(receipt, .{ .whitespace = .indent_2 }, &output.interface);
+    try std.json.Stringify.value(value, .{ .whitespace = .indent_2 }, &output.interface);
     try output.interface.writeByte('\n');
     try output.interface.flush();
+}
+
+fn sealErasureAuthorityAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const authority = ctx.getArgument(0) orelse return error.MissingRestoreErasureAuthority;
+    const scope = ctx.getArgument(1) orelse return error.InvalidErasureCheckpointScope;
+    const seed_path = ctx.getArgument(2) orelse return error.MissingErasureCheckpointSigningKey;
+    const io = io_compat.getIo();
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    try writeErasureJson(io, try erasure_checkpoint.seal(arena.allocator(), io, authority, scope, seed_path));
+}
+
+fn verifyErasureCheckpointAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const checkpoint = ctx.getArgument(0) orelse return error.MissingRestoreErasureAuthority;
+    const restored = ctx.getArgument(1) orelse return error.MissingBackupDatabase;
+    const root = ctx.getArgument(2) orelse return error.MissingBackupMaildir;
+    const pin: erasure_checkpoint.Pin = .{
+        .scope = ctx.getOption("scope") orelse return error.InvalidErasureCheckpointPin,
+        .public_key = ctx.getOption("public-key") orelse return error.InvalidErasureCheckpointPin,
+        .sha256 = ctx.getOption("expected-sha256") orelse return error.InvalidErasureCheckpointPin,
+        .not_before = try std.fmt.parseInt(i64, ctx.getOption("not-before") orelse return error.InvalidErasureCheckpointPin, 10),
+    };
+    const io = io_compat.getIo();
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const receipt = try erasure_checkpoint.verify(arena.allocator(), io, checkpoint, pin, restored, root, ctx.getArgument(3));
+    try writeErasureJson(io, receipt);
 }
 
 pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
@@ -501,6 +533,25 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try verify_cmd.addOption(cli.Option.init("legacy", "legacy", "Refuse legacy restores when the current database has an erasure reservation", .bool));
     _ = verify_cmd.setAction(verifyErasureRestoreAction);
     _ = try backup_cmd.addCommand(verify_cmd);
+
+    const seal_cmd = try cli.BaseCommand.init(allocator, "seal-erasure-authority", "Sign a redacted checkpoint of the current Mail lifecycle database");
+    _ = try seal_cmd.addArgument(cli.Argument.init("authority-db", "Current SMTP database from outside the restore", .string));
+    _ = try seal_cmd.addArgument(cli.Argument.init("scope", "Trusted identifier of this Mail deployment", .string));
+    _ = try seal_cmd.addArgument(cli.Argument.init("private-seed", "Private file containing a 32-byte hex Ed25519 seed", .string));
+    _ = seal_cmd.setAction(sealErasureAuthorityAction);
+    _ = try backup_cmd.addCommand(seal_cmd);
+
+    const checkpoint_cmd = try cli.BaseCommand.init(allocator, "verify-erasure-checkpoint", "Check an isolated Mail restore against pinned signed erasure evidence");
+    _ = try checkpoint_cmd.addArgument(cli.Argument.init("checkpoint", "Signed checkpoint restored from independent storage", .string));
+    _ = try checkpoint_cmd.addArgument(cli.Argument.init("restored-db", "SMTP database from isolated restore", .string));
+    _ = try checkpoint_cmd.addArgument(cli.Argument.init("restored-maildir", "Maildir from isolated restore", .string));
+    _ = try checkpoint_cmd.addArgument(cli.Argument.init("restored-dav", "DAV database from isolated restore", .string).withRequired(false));
+    _ = try checkpoint_cmd.addOption(cli.Option.init("scope", "scope", "Expected scope from a trusted recovery record", .string).withRequired(true));
+    _ = try checkpoint_cmd.addOption(cli.Option.init("public-key", "public-key", "Pinned hexadecimal Ed25519 public key", .string).withRequired(true));
+    _ = try checkpoint_cmd.addOption(cli.Option.init("expected-sha256", "expected-sha256", "Pinned SHA-256 of the current checkpoint file", .string).withRequired(true));
+    _ = try checkpoint_cmd.addOption(cli.Option.init("not-before", "not-before", "Earliest acceptable observation as Unix seconds", .string).withRequired(true));
+    _ = checkpoint_cmd.setAction(verifyErasureCheckpointAction);
+    _ = try backup_cmd.addCommand(checkpoint_cmd);
 
     return backup_cmd;
 }

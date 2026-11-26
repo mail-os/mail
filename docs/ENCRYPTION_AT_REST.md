@@ -190,6 +190,8 @@ mail backup rebind-local /path/to/extracted/smtp.db /path/to/extracted/mail
 Before opening listeners, run the [hosted erasure restore check](DEPLOYMENT_RUNBOOK.md#check-hosted-erasure-before-restoring-mail)
 against the current SMTP database from outside the backup. The automated
 Restic restore check includes this comparison.
+Use the [signed authority checkpoint](DEPLOYMENT_RUNBOOK.md#recover-the-erasure-authority-from-off-host-storage)
+when the original lifecycle database is unavailable.
 
 If the backup predates a team owner's departure, replay the
 [recorded offboarding operation](DEPLOYMENT_RUNBOOK.md#offboard-a-departed-team-owner)

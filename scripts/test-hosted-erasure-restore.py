@@ -3,6 +3,7 @@
 
 import argparse
 from contextlib import closing
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -43,6 +44,13 @@ def verify(binary, work):
     review = source.directory / "review.json"
     approval = source.directory / "shared-sqlite-approval.json"
 
+    authority_store = work / "independent-authority"
+    authority_store.mkdir()
+    seed = work / "publisher-key"
+    seed.touch(mode=0o600)
+    seed.write_text(os.urandom(32).hex() + "\n")
+    scope = "fixture-hosted-mail"
+
     def api(server, session, path, payload=None, *, expected=200):
         status, body = server.api(session, path, payload)
         assert status == expected, (path, status, body)
@@ -61,6 +69,29 @@ def verify(binary, work):
         result = check(candidate, **kwargs)
         assert result.returncode != 0 and not result.stdout and error in result.stderr, result
 
+    def seal(name):
+        result = subprocess.run([str(binary), "backup", "seal-erasure-authority", str(authority), scope, str(seed)],
+                                capture_output=True, text=True)
+        document = success(result)
+        path = authority_store / name
+        path.write_text(result.stdout)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        return path, digest, document["public_key"], document["payload"]["state"]["observed_at"]
+
+    def check_checkpoint(candidate, pin, *, checkpoint=None, expected=0, error=None, **overrides):
+        path, digest, public, observed_at = pin
+        controls = {"scope": scope, "public-key": public, "expected-sha256": digest, "not-before": str(observed_at)}
+        controls.update(overrides)
+        args = [str(binary), "backup", "verify-erasure-checkpoint", str(checkpoint or path),
+                str(candidate / "smtp.db"), str(candidate / "mail"), str(candidate / "caldav.db")]
+        for name, value in controls.items():
+            args += ["--" + name, value]
+        result = subprocess.run(args, capture_output=True, text=True)
+        if expected != 0:
+            assert result.returncode != 0 and not result.stdout and error in result.stderr, result
+            return None
+        return success(result)
+
     def step(name, *args):
         return cli(source, name, str(review), str(start), *map(str, args))
 
@@ -74,6 +105,13 @@ def verify(binary, work):
         _, event, _ = create_resources(source, target)
         peer_dav, peer_event, _ = create_resources(source, peer)
         older = snapshot(source, work / "older")
+        baseline = seal("before-erasure.json")
+        assert check_checkpoint(older, baseline)["reservations_checked"] == 0
+        seed.chmod(0o644)
+        bad_key = subprocess.run([str(binary), "backup", "seal-erasure-authority", str(authority), scope, str(seed)],
+                                 capture_output=True, text=True)
+        assert bad_key.returncode and not bad_key.stdout and "ErasureCheckpointKeyNotPrivate" in bad_key.stderr
+        seed.chmod(0o600)
         assert (older / "mail" / target).is_dir()
         before = success(check(older))
         assert before["state"] == "erasure_restore_verified"
@@ -93,6 +131,8 @@ def verify(binary, work):
         refuse(older, "RestoreErasureReconciliationRequired")
         refuse(older, "RestoreErasureRequiresIsolatedPromotion", legacy=True)
         interrupted = snapshot(source, work / "interrupted")
+        in_flight = seal("interrupted-erasure.json")
+        check_checkpoint(interrupted, in_flight, expected=1, error="RestoreErasureAuthorityIncomplete")
         refuse(interrupted, "RestoreErasureAuthorityIncomplete")
 
     success(step("hosted-erasure-maildir"))
@@ -155,6 +195,32 @@ def verify(binary, work):
                    (before_operation,))
     assert success(check(restored))["authority_sha256"] == receipt["authority_sha256"]
 
+    complete = seal("after-erasure.json")
+    for artifact in (baseline[0], in_flight[0], complete[0]):
+        data = artifact.read_text()
+        assert MARKER not in data and target not in data and peer not in data and seed.read_text().strip() not in data
+    seed.unlink()
+    authority.rename(source.directory / "smtp.db.unavailable")
+    check_checkpoint(older, complete, expected=1, error="RestoreErasureReconciliationRequired")
+    check_checkpoint(interrupted, complete, expected=1, error="RestoreErasureReconciliationRequired")
+    checked = check_checkpoint(restored, complete)
+    assert checked["source"] == "signed_erasure_checkpoint" and checked["checkpoint_sha256"] == complete[1]
+    assert checked["authority_observed_at"] == complete[3]
+    assert checked["authority_sha256"] == receipt["authority_sha256"]
+    check_checkpoint(restored, complete, checkpoint=baseline[0], expected=1, error="ErasureCheckpointPinMismatch")
+    check_checkpoint(restored, complete, scope="other-deployment", expected=1, error="InvalidErasureCheckpointScope")
+    check_checkpoint(restored, complete, expected=1, error="ErasureCheckpointKeyMismatch", **{"public-key": "00" * 32})
+    check_checkpoint(restored, complete, expected=1, error="ErasureCheckpointStale",
+                     **{"not-before": str(complete[3] + 1)})
+
+    altered = authority_store / "tampered.json"
+    payload = json.loads(complete[0].read_text())
+    signature = payload["signature"]
+    payload["signature"] = ("0" if signature[0] != "0" else "1") + signature[1:]
+    altered.write_text(json.dumps(payload))
+    check_checkpoint(restored, complete, checkpoint=altered, expected=1, error="InvalidErasureCheckpointSignature",
+                     **{"expected-sha256": hashlib.sha256(altered.read_bytes()).hexdigest()})
+
     recovery = Fixture(binary, restored, staging=True)
     recovery.password = source.password
     with recovery.daemon():
@@ -179,4 +245,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     with TemporaryDirectory(prefix="mail-erasure-restore-") as directory:
         verify(args.binary.resolve(strict=True), Path(directory))
-    print("Verified actual old and reconciled Mail archives, lifecycle refusal, repeatable verification, and peer access over TLS.")
+    print("Verified old and reconciled Mail archives, signed off-host erasure authority, tamper and replay refusal, and peer access over TLS.")

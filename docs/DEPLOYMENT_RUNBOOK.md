@@ -898,6 +898,57 @@ Where the deployment uses a different database path, configure the canonical
 live database. Backup expiry and off-host lifecycle recovery are tracked
 separately in the hosted erasure case.
 
+### Recover the erasure authority from off-host storage
+
+A signed checkpoint lets a recovery host verify a backup after losing
+access to the original SMTP database. The checkpoint contains digests of
+the current provisioning identities, reservation reviews and receipts,
+plus the audit sequence and observation time. Keep its signing seed in
+the publisher's secret store, outside the Mail backups and off the
+recovery host. For an initial seed, use `openssl rand -hex 32` and store
+the result in a private file with mode 0600. Record the publisher's
+public key in the trusted recovery configuration.
+
+Freeze lifecycle writes before recording the recovery checkpoint. Use the
+protected current database, a deployment-specific scope and a private
+output directory.
+
+```sh
+umask 077
+mail backup seal-erasure-authority /opt/mail/smtp.db production-mail \
+  /secure/mail-erasure.seed > /secure/mail-erasure-authority.json
+```
+
+Copy the JSON to authenticated off-host storage with an independent
+retention policy. Verify the digest of the retrieved copy before
+publishing its SHA-256 and earliest accepted observation time to the
+trusted recovery record. Keep that control record separate from the
+snapshot under review. Advance the pinned digest only after the new
+checkpoint is durable. Use the current recovery record for every
+verification. If it predates later lifecycle changes, reconcile those
+changes from authoritative support records before promoting the backup.
+
+On the recovery host, use the pinned public key, scope, digest and
+freshness floor from the independent control record. The checkpoint
+itself supplies the signed evidence.
+
+```sh
+mail backup verify-erasure-checkpoint /secure/mail-erasure-authority.json \
+  /restore/smtp.db /restore/mail /restore/caldav.db \
+  --scope production-mail --public-key "$TRUSTED_PUBLISHER_PUBLIC_KEY" \
+  --expected-sha256 "$TRUSTED_CURRENT_CHECKPOINT_SHA256" \
+  --not-before "$TRUSTED_EARLIEST_OBSERVATION_SECONDS"
+```
+
+The restore receipt reports the verified checkpoint digest and
+observation time. A missing pin, mismatched deployment, older checkpoint,
+unfinished case or returned mailbox data blocks verification. For the
+automated Restic check, set `MAIL_RESTORE_ERASURE_CHECKPOINT`,
+`MAIL_RESTORE_ERASURE_SCOPE`, `MAIL_RESTORE_ERASURE_PUBLIC_KEY`,
+`MAIL_RESTORE_ERASURE_SHA256` and `MAIL_RESTORE_ERASURE_NOT_BEFORE`
+in the protected recovery environment. The signed check uses the same
+SMTP, Maildir and DAV verification as the live-database check.
+
 ## Local mailbox directory upgrade
 
 Back up the Maildir and SQLite database together before upgrading a server with older ActiveSync clients. On startup, the server checks for full-address local accounts that still have mail under a short directory name such as `mail/alice`. It moves eligible messages to `mail/alice@example.com` before opening the protocol listeners. It also moves messages in a canonical custom folder's nested slots into the folder path exposed by IMAP and webmail. ActiveSync, IMAP, webmail, and EWS then read from the canonical mailbox. The upgrade retains existing message flags and client identifiers when it can reconcile both directories.
