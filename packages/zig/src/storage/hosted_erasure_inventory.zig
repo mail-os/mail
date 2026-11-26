@@ -246,12 +246,74 @@ pub fn observeDavOwner(a: Allocator, tx: Database.Transaction, mailbox: []const 
     return .{ .state = .mapped, .legacy_name_candidates = legacy, .tables = tables, .owner_id = owner.user_id };
 }
 
+const SharedBacking = struct {
+    kind: enum { thread, collection, calendar },
+    role: enum { source, recipient },
+    team_id: []const u8,
+    share_id: []const u8,
+    peer_user_id: i64,
+    access: []const u8,
+    collection_id: ?[]const u8,
+};
+
+pub fn observeSharedBacking(a: Allocator, tx: Database.Transaction, owner: i64) ![]const SharedBacking {
+    {
+        // A mismatched collection owner could affect a share even when this
+        // mailbox is absent from the share's source and recipient columns.
+        const ambiguous = try tx.prepare(
+            \\SELECT 1 FROM mail_team_collection_shares c
+            \\LEFT JOIN mail_team_thread_shares s ON s.id=c.share_id
+            \\WHERE (c.owner_id=?1 OR s.owner_id=?1 OR s.grantee_id=?1)
+            \\  AND (s.id IS NULL OR c.owner_id<>s.owner_id)
+            \\LIMIT 1
+        );
+        defer ambiguous.finalize();
+        try ambiguous.bind(1, owner);
+        if (try ambiguous.step()) return error.ErasureShareOwnershipUnresolved;
+    }
+    const rows = try tx.prepare(
+        \\SELECT CASE WHEN c.share_id IS NULL THEN 'thread' ELSE 'collection' END AS kind,
+        \\    CASE WHEN s.owner_id=?1 THEN 'source' ELSE 'recipient' END AS role,
+        \\    s.team_id AS team_id, s.id AS share_id,
+        \\    CASE WHEN s.owner_id=?1 THEN s.grantee_id ELSE s.owner_id END AS peer_user_id,
+        \\    CASE WHEN s.downloads=1 THEN 'read_and_download' ELSE 'read' END AS access,
+        \\    c.collection_id AS collection_id
+        \\FROM mail_team_thread_shares s LEFT JOIN mail_team_collection_shares c ON c.share_id=s.id
+        \\WHERE s.owner_id=?1 OR s.grantee_id=?1
+        \\UNION ALL
+        \\SELECT 'calendar', CASE WHEN source_id=?1 THEN 'source' ELSE 'recipient' END,
+        \\    team_id, calendar_share_id,
+        \\    CASE WHEN source_id=?1 THEN grantee_id ELSE source_id END,
+        \\    access, NULL
+        \\FROM mail_team_calendar_shares WHERE source_id=?1 OR grantee_id=?1
+        \\ORDER BY kind, role, team_id, share_id, peer_user_id
+    );
+    defer rows.finalize();
+    try rows.bind(1, owner);
+    var shares: std.ArrayList(SharedBacking) = .empty;
+    while (try rows.step()) {
+        const Kind = @FieldType(SharedBacking, "kind");
+        const Role = @FieldType(SharedBacking, "role");
+        try shares.append(a, .{
+            .kind = std.meta.stringToEnum(Kind, rows.columnText(0)) orelse return error.InvalidShareKind,
+            .role = std.meta.stringToEnum(Role, rows.columnText(1)) orelse return error.InvalidShareRole,
+            .team_id = try a.dupe(u8, rows.columnText(2)),
+            .share_id = try a.dupe(u8, rows.columnText(3)),
+            .peer_user_id = rows.columnInt64(4),
+            .access = try a.dupe(u8, rows.columnText(5)),
+            .collection_id = if (rows.columnTextOpt(6)) |collection| try a.dupe(u8, collection) else null,
+        });
+    }
+    return shares.toOwnedSlice(a);
+}
+
 pub const Inventory = struct {
     identity: preflight.Identity,
     observed_at: i64,
     maildir: Maildir,
     sqlite: Sqlite,
     dav: Dav,
+    shared_backing: ?[]const SharedBacking = null,
     external_evidence_required: []const []const u8 = &.{ "search_provider", "backup_catalog", "hosted_billing", "support_and_retention" },
 };
 
@@ -264,13 +326,15 @@ pub fn collect(a: Allocator, io: std.Io, db: *Database, mailbox: []const u8, act
         defer tx.deinit();
         const assignment = try preflight.identify(a, tx, mailbox, actor, now);
         const rows = try observeSqlite(a, tx, mailbox, assignment.identity.native_user_id);
+        const shared = try observeSharedBacking(a, tx, assignment.identity.native_user_id);
         try tx.commit();
-        break :blk .{ .identity = assignment.identity, .rows = rows };
+        break :blk .{ .identity = assignment.identity, .rows = rows, .shared = shared };
     };
     return .{
         .identity = native.identity,
         .observed_at = now,
         .sqlite = native.rows,
+        .shared_backing = native.shared,
         .maildir = observeMaildir(io, mail_root, mailbox, short) catch .{ .state = .unavailable },
         .dav = observeDav(a, io, dav_path, .{ .mailbox = mailbox, .user_id = native.identity.native_user_id }, short) catch |err| switch (err) {
             error.OutOfMemory => return err,

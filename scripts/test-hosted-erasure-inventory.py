@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import secrets
 import sqlite3
 from tempfile import TemporaryDirectory
 import time
@@ -32,10 +33,22 @@ def verify(test, db):
     command(test, 'team', 'create', 'inventory-share', 'Fixture team', mailbox)
     command(test, 'team', 'member', 'inventory-share', peer, 'member')
     command(test, 'team', 'grant', 'inventory-share', mailbox, peer, 'mailbox')
+    stranger = test.provision('inventory-stranger')
     command(test, 'team', 'create', 'inventory-peer-only', 'Unrelated team', peer)
+    command(test, 'team', 'member', 'inventory-peer-only', stranger, 'member')
     owner_id, peer_id = (db.execute('SELECT id FROM users WHERE username=?', (user,)).fetchone()[0]
                          for user in (mailbox, peer))
+    stranger_id = db.execute('SELECT id FROM users WHERE username=?', (stranger,)).fetchone()[0]
+    calendar = "a" * 32
     with db:
+        db.executemany("INSERT INTO mail_team_thread_shares VALUES (?,?,?,?,?,?)", [
+            ('incoming-thread', 'inventory-share', peer_id, owner_id, 'Private shared subject', 1),
+            ('outgoing-collection', 'inventory-share', owner_id, peer_id, 'Private shared collection', 0),
+            ('peer-only', 'inventory-peer-only', peer_id, stranger_id, 'Unrelated subject', 0),
+        ])
+        db.execute("INSERT INTO mail_private_collections(user_id,id,name) VALUES (?,'source-collection','Private collection')", (owner_id,))
+        db.execute("INSERT INTO mail_team_collection_shares VALUES ('outgoing-collection',?,'source-collection')", (owner_id,))
+        db.execute("INSERT INTO mail_team_calendar_shares VALUES ('inventory-share',?,?,?,'viewer')", (owner_id, peer_id, calendar))
         db.execute('CREATE TABLE retained_unreviewed_fixture(user_id INTEGER NOT NULL)')
         db.execute('INSERT INTO retained_unreviewed_fixture VALUES(?)', (owner_id,))
         db.executemany("""INSERT INTO mail_file_links(user_id,id,token_hash,filename,data,size,expires_at)
@@ -59,19 +72,34 @@ def verify(test, db):
     def report(**env_overrides):
         result = run(env=dict(test.env, **env_overrides))
         assert result.returncode == 0, result.stderr
-        assert all(value not in result.stdout for value in (peer, assignment, 'private-link.bin', 'Private fixture'))
+        assert all(value not in result.stdout for value in (peer, stranger, assignment, 'private-link.bin',
+                                                            'Private fixture', 'Private shared subject', 'Unrelated subject'))
         return json.loads(result.stdout)
 
     wrong = run(mailbox, test.specs[peer]['actor'])
     assert wrong.returncode and not wrong.stdout and 'ManagedMailboxNotFound' in wrong.stderr, wrong
     wrong = run(peer, assignment)
     assert wrong.returncode and not wrong.stdout and 'ManagedMailboxNotFound' in wrong.stderr, wrong
+    with db:
+        db.execute("INSERT INTO mail_team_collection_shares VALUES ('peer-only',?,'source-collection')", (owner_id,))
+    ambiguous = run()
+    assert ambiguous.returncode and not ambiguous.stdout and 'ErasureShareOwnershipUnresolved' in ambiguous.stderr
+    with db:
+        db.execute("DELETE FROM mail_team_collection_shares WHERE share_id='peer-only'")
     current = report()
     inventory = current['inventory']
     assert current['mailbox'] == mailbox and current['case_reference'] == case
     assert inventory['identity']['native_user_id'] == owner_id
     assert inventory['maildir'] == {'state': 'observed', 'legacy_short_name_present': True,
                                   'counts': {'files': fixture_files, 'bytes': fixture_bytes, 'symbolic_links': 1, 'other_entries': 0}}
+    assert inventory['shared_backing'] == [
+        {'kind': 'calendar', 'role': 'source', 'team_id': 'inventory-share', 'share_id': calendar,
+         'peer_user_id': peer_id, 'access': 'viewer', 'collection_id': None},
+        {'kind': 'collection', 'role': 'source', 'team_id': 'inventory-share', 'share_id': 'outgoing-collection',
+         'peer_user_id': peer_id, 'access': 'read', 'collection_id': 'source-collection'},
+        {'kind': 'thread', 'role': 'recipient', 'team_id': 'inventory-share', 'share_id': 'incoming-thread',
+         'peer_user_id': peer_id, 'access': 'read_and_download', 'collection_id': None},
+    ]
     counts = {row['table']: row['matching_rows'] for row in inventory['sqlite']['tables']}
     present = {name for (name,) in db.execute("SELECT name FROM sqlite_schema WHERE type='table'")}
     assert not {table for table, count in counts.items() if table in present and count is None}, counts
@@ -117,7 +145,48 @@ def verify(test, db):
     denied = run()
     assert denied.returncode and not denied.stdout, denied
     assert peer_file.exists() and owner_root.exists()
-    print('Verified mailbox-scoped filesystem, SQLite and DAV inventory, unresolved stores, old snapshots, and audit refusal.')
+    with db:
+        db.execute('DROP TRIGGER deny_inventory')
+    (owner_root / 'linked-peer.eml').unlink()
+    (maildir / mailbox.split('@')[0]).rmdir()
+    test.provision('inventory-owner', enabled=False)
+    approved_inventory = report()
+    audit_id = approved_inventory['audit_id']
+    path = test.directory / 'share-review.json'
+    review = {
+        'version': 1, 'request_id': secrets.token_hex(16), 'mailbox': mailbox,
+        'assignment_actor': assignment, 'case_reference': case, 'inventory_audit_id': audit_id,
+        'retention_disposition': 'cleared', 'export_disposition': 'not_requested',
+        'evidence': dict.fromkeys(('authorization_reference', 'retention_reference', 'backup_reference',
+                                   'billing_reference', 'search_reference', 'export_resolution_reference'), 'fixture-evidence'),
+    }
+    path.write_text(json.dumps(review))
+    path.chmod(0o600)
+    with db:
+        db.execute("UPDATE audit_log SET details=json_remove(details,'$.inventory.shared_backing') WHERE id=?", (audit_id,))
+    legacy_grants = cli(test, 'hosted-erasure-review', str(path))
+    assert legacy_grants.returncode and not legacy_grants.stdout and 'ErasureSharedInventoryRequired' in legacy_grants.stderr
+    with db:
+        db.execute("UPDATE audit_log SET details=? WHERE id=?", (
+            json.dumps({'case_reference': case, 'inventory': approved_inventory['inventory']}), audit_id,
+        ))
+    approved = cli(test, 'hosted-erasure-review', str(path))
+    assert approved.returncode == 0, approved.stderr
+    review_id = json.loads(approved.stdout)['audit_id']
+
+    with db:
+        db.execute("UPDATE mail_team_calendar_shares SET access='editor' WHERE source_id=? AND calendar_share_id=?", (owner_id, calendar))
+    changed = report()['inventory']
+    assert changed['sqlite'] == approved_inventory['inventory']['sqlite']
+    assert changed['shared_backing'][0]['access'] == 'editor'
+    stale = cli(test, 'hosted-erasure-begin', str(path), str(review_id))
+    assert stale.returncode and not stale.stdout and 'InventoryChanged' in stale.stderr
+    assert db.execute("SELECT 1 FROM hosted_erasure_operations WHERE mailbox=?", (mailbox,)).fetchone() is None
+    with db:
+        db.execute("UPDATE mail_team_calendar_shares SET access='viewer' WHERE source_id=? AND calendar_share_id=?", (owner_id, calendar))
+    started = cli(test, 'hosted-erasure-begin', str(path), str(review_id))
+    assert started.returncode == 0, started.stderr
+    print('Verified mailbox-scoped filesystem, SQLite and DAV inventory, share ownership and stale grants, unresolved stores, old snapshots, and audit refusal.')
 
 
 if __name__ == '__main__':

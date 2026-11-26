@@ -415,6 +415,12 @@ umask 077
   ownership verification. `legacy_owner_unresolved`, `missing`, and
   `unavailable` require review. `not_configured` means the command received no
   explicit DAV path and found no file at the default path.
+- `shared_backing` lists each Calendar, thread, and collection grant that
+  involves the reviewed mailbox. It identifies the source or recipient role,
+  peer by native ID, grant access, and backing collection when applicable.
+  Use the report in the private case review before removing source data.
+  Refresh older inventories that involve these grants. Review and reservation
+  also reject changes in grant access when the row counts stay the same.
 - `external_evidence_required` lists support and retention, external search,
   backup inventory, and hosted billing evidence to collect from their owning
   systems. The command also leaves these sources in the review when it finds

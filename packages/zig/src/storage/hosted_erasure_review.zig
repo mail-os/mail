@@ -99,6 +99,12 @@ fn validateInventory(a: Allocator, reviewed: inventory.Inventory, current: inven
     comparison.observed_at = reviewed.observed_at;
     if (reviewed.dav.store_stamp == null) comparison.dav.store_stamp = null;
     if (reviewed.dav.owner_id == null) comparison.dav.owner_id = null;
+    if (reviewed.shared_backing == null) {
+        // Older inventories did not capture the individual share grants.
+        // Refresh the evidence if they would affect a second mailbox.
+        if ((current.shared_backing orelse &.{}).len != 0) return error.ErasureSharedInventoryRequired;
+        comparison.shared_backing = null;
+    }
     const earlier = try std.json.Stringify.valueAlloc(a, reviewed, .{});
     const later = try std.json.Stringify.valueAlloc(a, comparison, .{});
     if (!std.mem.eql(u8, earlier, later)) return error.InventoryChanged;
@@ -183,6 +189,7 @@ pub fn verifyCurrent(a: Allocator, tx: Database.Transaction, review: Review, obs
     const reviewed = try loadInventory(a, tx, review);
     try verifyDeliveryDrained(observation);
     current.sqlite = try inventory.observeSqlite(a, tx, review.mailbox, observation.identity.native_user_id);
+    current.shared_backing = try inventory.observeSharedBacking(a, tx, observation.identity.native_user_id);
     try validateInventory(a, reviewed.inventory, current);
     if (review.export_handoff_audit_id) |id| {
         try mailbox_export.validateHandoffAudit(a, tx, id, review.mailbox, review.case_reference, observation.identity);
