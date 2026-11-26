@@ -676,14 +676,40 @@ returns the original audit ID. The deletion count includes any generation
 tombstones that the IMAP delete trigger creates and the command then removes.
 
 The receipt state is `private_sqlite_removed_other_data_pending`. The
-disabled account and its reservation remain in place. Reconcile linked
-accounts, private collections and their shared references, drafts and
-uploads, assistant permissions and audit records, routing and accepted
-delivery records, SQLite recovery history, and backups separately.
+disabled account and its reservation remain in place. Reconcile private
+collections and their shared references, drafts and uploads, assistant
+permissions and audit records, routing and accepted delivery records,
+SQLite recovery history, and backups separately.
 
 Run `python3 scripts/test-hosted-erasure-sqlite.py /path/to/mail` with the
 disposable TLS fixture. It checks transaction rollback, tombstone cleanup,
 receipt retry, and peer preservation through a daemon restart.
+
+### Revoke remaining linked browser sessions
+
+After the private SQLite step, keep Mail stopped and use the same review
+and start audit ID to revoke the mailbox's combined-inbox links.
+
+```bash
+/opt/mail/mail-server user:local hosted-erasure-links \
+  /private/case/erasure-review.json START_AUDIT_ID
+```
+
+The command detaches the mailbox in both directions. It revokes the
+credentials minted for each removed link and clears any residual sessions
+of the departing mailbox. The peer's own sign-ins and unrelated saved
+links keep working. Resolve unsettled Outbox records tied to an affected
+link and investigate unexpected session ownership before retrying.
+
+The receipt reports `linked_sessions_revoked_other_data_pending` and
+keeps a stable audit ID on retry. The counts cover revoked links and
+departing mailbox sessions that remain after the link credentials are
+revoked. Other shared records and older SQLite copies require separate
+reconciliation.
+
+Run `python3 scripts/test-hosted-erasure-links.py /path/to/mail` with the
+disposable TLS fixture to verify both link directions, refusal, rollback,
+and peer access after restart.
 
 ## Local mailbox directory upgrade
 

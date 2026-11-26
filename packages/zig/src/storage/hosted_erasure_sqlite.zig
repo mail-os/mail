@@ -131,6 +131,11 @@ fn existingReceipt(tx: Database.Transaction, review: review_store.Review, start_
     };
 }
 
+pub fn requireRemoved(tx: Database.Transaction, review: review_store.Review, start_id: i64, owner: i64) !void {
+    if (try existingReceipt(tx, review, start_id) == null) return error.ErasurePrivateSqlitePending;
+    try verifyRemoved(tx, owner, review.mailbox);
+}
+
 pub fn erase(a: std.mem.Allocator, io: std.Io, db: *Database, review: review_store.Review, start_id: i64, operator: []const u8, mail_root: []const u8) !Receipt {
     try review.validate();
     if (start_id < 1) return error.InvalidErasureStartAuditId;
