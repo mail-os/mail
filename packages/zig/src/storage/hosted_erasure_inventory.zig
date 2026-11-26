@@ -84,7 +84,8 @@ fn count(tx: Database.Transaction, comptime table: []const u8, comptime predicat
     return .{ .table = table, .matching_rows = @intCast(stmt.columnInt64(0)) };
 }
 
-fn sqlite(a: Allocator, tx: Database.Transaction, names: Names) !Sqlite {
+pub fn observeSqlite(a: Allocator, tx: Database.Transaction, mailbox: []const u8, user_id: i64) !Sqlite {
+    const names: Names = .{ .mailbox = mailbox, .user_id = user_id };
     var tables: std.ArrayList(TableCount) = .empty;
     inline for (by_user_id) |table| try tables.append(a, try count(tx, table, "user_id=?1", .user_id, names));
     inline for (by_username) |table| try tables.append(a, try count(tx, table, "username=?1", .mailbox, names));
@@ -223,7 +224,7 @@ pub fn collect(a: Allocator, io: std.Io, db: *Database, mailbox: []const u8, act
         var tx = try db.beginTransaction(.read);
         defer tx.deinit();
         const assignment = try preflight.identify(a, tx, mailbox, actor, now);
-        const rows = try sqlite(a, tx, .{ .mailbox = mailbox, .user_id = assignment.identity.native_user_id });
+        const rows = try observeSqlite(a, tx, mailbox, assignment.identity.native_user_id);
         try tx.commit();
         break :blk .{ .identity = assignment.identity, .rows = rows };
     };

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Verify the audited export command against disposable hosted mailboxes."""
+"""Verify hosted erasure exports, handoffs, and review receipts on disposable mailboxes."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 import hashlib
 import json
@@ -181,6 +182,143 @@ def verify(test, db):
     assert not (test.directory / 'after-expiration.tar').exists()
     assert delivered.read_bytes() == archive_bytes and handoff_audits() == [audit]
     print('Verified audited export and recipient-bound private handoff, exact archive bytes, expiry, refusal, and audited retry.')
+
+    verify_review(test, db, request, receipt['audit_id'], ready['audit_id'], peer, original)
+
+
+def verify_review(test, db, export, export_audit, handoff_audit, peer, original):
+    mailbox, actor, case = (export[key] for key in ('mailbox', 'assignment_actor', 'case_reference'))
+    old = test.directory / 'before-inventory.db'
+    with closing(sqlite3.connect(old)) as snapshot:
+        db.backup(snapshot)
+
+    def inspect(owner, assignment, reference):
+        result = cli(test, 'hosted-erasure-inventory', owner, assignment, reference)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout)['audit_id']
+
+    request = {
+        'version': 1,
+        'request_id': 'erase-fixture-17',
+        'mailbox': mailbox,
+        'assignment_actor': actor,
+        'case_reference': case,
+        'inventory_audit_id': inspect(mailbox, actor, case),
+        'retention_disposition': 'cleared',
+        'export_disposition': 'resolved',
+        'export_handoff_audit_id': handoff_audit,
+        'evidence': {
+            'authorization_reference': 'support-authorization-17',
+            'retention_reference': 'retention-reviewed-17',
+            'backup_reference': 'backup-disposition-17',
+            'billing_reference': 'billing-disposition-17',
+            'search_reference': 'search-disposition-17',
+            'export_resolution_reference': 'export-delivery-and-expiry-17',
+        },
+    }
+    path = test.directory / 'erasure-review.json'
+
+    def run_review(overrides=None, *, mode=0o600, env=None):
+        path.write_text(json.dumps({**request, **(overrides or {})}))
+        path.chmod(mode)
+        return cli(test, 'hosted-erasure-review', str(path), env=env)
+
+    def refuse(error, overrides=None, **kwargs):
+        result = run_review(overrides, **kwargs)
+        assert result.returncode != 0 and not result.stdout and error in result.stderr, result
+
+    def reviews():
+        return db.execute("""SELECT id,actor,target,details FROM audit_log
+                             WHERE action='hosted.erasure.review.accepted' ORDER BY id""").fetchall()
+
+    refuse('ErasureReviewNotPrivate', mode=0o644)
+    path.chmod(0o600)
+    link = test.directory / 'linked-review.json'
+    link.symlink_to(path)
+    result = cli(test, 'hosted-erasure-review', str(link))
+    assert result.returncode != 0 and not result.stdout, result
+    refuse('RetentionHold', {'retention_disposition': 'held'})
+    refuse('InvalidCaseReference', {'evidence': {**request['evidence'], 'backup_reference': ''}})
+    refuse('InvalidExportDisposition', {'export_handoff_audit_id': None})
+    refuse('ExportHandoffAuditNotFound', {'export_handoff_audit_id': export_audit})
+    refuse('ExportResolutionRequired', {'export_disposition': 'not_requested', 'export_handoff_audit_id': None})
+    refuse('ManagedMailboxNotFound', {'assignment_actor': test.specs[peer]['actor']})
+    refuse('InventoryCaseChanged', {'case_reference': 'another-case'})
+    refuse('InventoryAuditNotFound', env=dict(test.env, SMTP_DB_PATH=str(old)))
+    wrong_case = inspect(mailbox, actor, 'another-case')
+    refuse('ExportHandoffAssignmentChanged', {'case_reference': 'another-case', 'inventory_audit_id': wrong_case})
+    refuse('InventoryUnresolved', env=dict(test.env, CALDAV_DB_PATH=str(test.directory / 'missing-dav.db')))
+
+    msg = original.read_bytes()
+    extra = original.with_name('review-contents-changed')
+    extra.write_bytes(b'fixture changed since inventory')
+    try:
+        refuse('InventoryChanged')
+    finally:
+        extra.unlink()
+
+    with db:
+        db.execute("""INSERT INTO webmail_records(username,kind,id,payload,state,revision)
+                      VALUES(?,'outbox','erasure-unconfirmed','{}','unknown',1)""", (mailbox,))
+    refuse('DeliveryUnresolved')
+    with db:
+        db.execute("DELETE FROM webmail_records WHERE id='erasure-unconfirmed'")
+        now = int(time.time())
+        db.execute("""INSERT INTO message_queue(id,from_addr,to_addr,message_data,status,next_retry,created_at,updated_at)
+                      VALUES('erasure-legacy-queue',?,'external@example.test','fixture','retry',?,?,?)""",
+                   (mailbox, now + 3600, now, now))
+    refuse('DeliveryUnresolved')
+    with db:
+        db.execute("DELETE FROM message_queue WHERE id='erasure-legacy-queue'")
+        peer_id = db.execute("SELECT id FROM users WHERE username=?", (peer,)).fetchone()[0]
+        db.execute("""INSERT INTO accepted_mail(id,accepted_at,accepted_ms,envelope_from,author,verified_author,remote_addr,mime)
+                      VALUES('erasure-legacy-pending',?,?,?,?,1,'127.0.0.1','fixture')""",
+                   (now, now * 1000, mailbox, mailbox))
+        db.execute("""INSERT INTO accepted_mail_targets
+                      (delivery_id,ordinal,recipient,mailbox,mailbox_id,folder,outcome,queued_bytes,retry_at,is_primary)
+                      VALUES('erasure-legacy-pending',0,?,?,?,'INBOX','pending',7,?,1)""",
+                   (peer, peer, peer_id, now + 3600))
+    refuse('DeliveryUnresolved')
+    with db:
+        db.execute("DELETE FROM accepted_mail_targets WHERE delivery_id='erasure-legacy-pending'")
+        db.execute("DELETE FROM accepted_mail WHERE id='erasure-legacy-pending'")
+        db.execute("""CREATE TRIGGER deny_review_audit BEFORE INSERT ON audit_log
+                      WHEN NEW.action='hosted.erasure.review.accepted' BEGIN SELECT RAISE(ABORT,'fixture audit failure'); END""")
+    refuse('StepFailed')
+    assert not reviews()
+    with db:
+        db.execute('DROP TRIGGER deny_review_audit')
+
+    # Both operators submit the same already-written input.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, retry = pool.map(lambda _: cli(test, 'hosted-erasure-review', str(path)), range(2))
+    assert first.returncode == retry.returncode == 0, (first, retry)
+    receipt = json.loads(first.stdout)
+    assert receipt == {'version': 1, 'state': 'review_recorded_data_retained', 'mailbox': mailbox,
+                       'request_id': request['request_id'], 'audit_id': receipt['audit_id']}, receipt
+    assert json.loads(retry.stdout) == receipt, retry
+    audit, = reviews()
+    assert audit[:3] == (receipt['audit_id'], f'local-operator:{os.geteuid()}', mailbox)
+    assert json.loads(audit[3]) == {**{key: value for key, value in request.items()
+                                      if key not in ('mailbox', 'assignment_actor')}, 'identity': export['identity']}
+    assert actor not in audit[3] and export['recipient'] not in audit[3]
+    refuse('ErasureReviewConflict', {'evidence': {**request['evidence'], 'backup_reference': 'other-backup'}})
+    assert reviews() == [audit] and original.read_bytes() == msg
+
+    peer_actor = test.specs[peer]['actor']
+    peer_review = {'mailbox': peer, 'assignment_actor': peer_actor, 'export_disposition': 'not_requested',
+                   'export_handoff_audit_id': None}
+    refuse('MailboxStillReadable', {**peer_review, 'inventory_audit_id': inspect(peer, peer_actor, case)})
+    test.provision('exit-archive-unrelated', enabled=False)
+    refuse('InventoryAuditNotFound', peer_review)
+    peer_review['inventory_audit_id'] = inspect(peer, peer_actor, case)
+    refuse('ErasureReviewConflict', peer_review)
+    no_export = run_review({**peer_review, 'request_id': 'erase-fixture-no-export'})
+    assert no_export.returncode == 0, no_export.stderr
+    assert json.loads(no_export.stdout)['mailbox'] == peer
+    assert len(reviews()) == 2 and original.read_bytes() == msg
+    assert db.execute("SELECT count(*) FROM users WHERE username IN (?,?)", (mailbox, peer)).fetchone() == (2,)
+    print('Verified hosted erasure review receipt, held and readable refusal, scoped inventory, queued work, audit rollback, and retry.')
 
 
 if __name__ == '__main__':

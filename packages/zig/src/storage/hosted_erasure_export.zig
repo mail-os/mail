@@ -119,16 +119,41 @@ pub const HandoffReceipt = struct {
     prepared: Prepared,
 };
 
-fn loadPrepared(a: std.mem.Allocator, tx: Database.Transaction, handoff: Handoff) !Prepared {
+fn loadPrepared(a: std.mem.Allocator, tx: Database.Transaction, export_audit_id: i64, mailbox: []const u8) !Prepared {
     const row = try tx.prepare(
         \\SELECT details FROM audit_log
         \\WHERE id=?1 AND action='hosted.erasure.export.prepared' AND target=?2 AND target_type='hosted_mailbox'
     );
     defer row.finalize();
-    try row.bind(1, handoff.export_audit_id);
-    try row.bind(2, handoff.mailbox);
+    try row.bind(1, export_audit_id);
+    try row.bind(2, mailbox);
     if (!try row.step()) return error.ExportAuditNotFound;
     return std.json.parseFromSliceLeaky(Prepared, a, row.columnText(0), .{ .allocate = .alloc_always });
+}
+
+pub fn hasPreparedAudit(tx: Database.Transaction, mailbox: []const u8, case_reference: []const u8) !bool {
+    const row = try tx.prepare(
+        \\SELECT 1 FROM audit_log WHERE action='hosted.erasure.export.prepared' AND target=?1
+        \\AND target_type='hosted_mailbox' AND json_extract(details,'$.case_reference')=?2 LIMIT 1
+    );
+    defer row.finalize();
+    try row.bind(1, mailbox);
+    try row.bind(2, case_reference);
+    return row.step();
+}
+
+pub fn validateHandoffAudit(a: std.mem.Allocator, tx: Database.Transaction, handoff_audit_id: i64, mailbox: []const u8, case_reference: []const u8, identity: preflight.Identity) !void {
+    const row = try tx.prepare(
+        \\SELECT json_extract(details,'$.export_audit_id') FROM audit_log
+        \\WHERE id=?1 AND action='hosted.erasure.export.handoff_authorized' AND target=?2 AND target_type='hosted_mailbox'
+    );
+    defer row.finalize();
+    try row.bind(1, handoff_audit_id);
+    try row.bind(2, mailbox);
+    if (!try row.step() or row.columnIsNull(0)) return error.ExportHandoffAuditNotFound;
+    const prepared = try loadPrepared(a, tx, row.columnInt64(0), mailbox);
+    if (!identity.eql(prepared.identity) or !std.mem.eql(u8, case_reference, prepared.case_reference))
+        return error.ExportHandoffAssignmentChanged;
 }
 
 fn matchHandoff(a: std.mem.Allocator, tx: Database.Transaction, handoff: Handoff, prepared: Prepared, now: i64) !void {
@@ -209,7 +234,7 @@ pub fn handoffArchive(a: std.mem.Allocator, io: std.Io, db: *Database, handoff: 
     const prepared = blk: {
         var tx = try db.beginTransaction(.read);
         defer tx.deinit();
-        const prepared = try loadPrepared(a, tx, handoff);
+        const prepared = try loadPrepared(a, tx, handoff.export_audit_id, handoff.mailbox);
         try matchHandoff(a, tx, handoff, prepared, time.timestamp());
         try tx.commit();
         break :blk prepared;
@@ -230,7 +255,7 @@ pub fn handoffArchive(a: std.mem.Allocator, io: std.Io, db: *Database, handoff: 
         var tx = try db.beginTransaction(.write);
         defer tx.deinit();
         const now = time.timestamp();
-        const current = try loadPrepared(a, tx, handoff);
+        const current = try loadPrepared(a, tx, handoff.export_audit_id, handoff.mailbox);
         if (!prepared.identity.eql(current.identity) or
             !std.mem.eql(u8, prepared.archive_sha256, current.archive_sha256) or
             prepared.archive_bytes != current.archive_bytes or prepared.expires_at != current.expires_at)

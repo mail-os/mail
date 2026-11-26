@@ -32,6 +32,7 @@ pub const Observation = struct {
         remote_unattempted_targets: u64,
         remote_unconfirmed_targets: u64,
         legacy_remote_envelope_matches: u64,
+        legacy_pending_envelope_matches: u64,
     },
     outbound_queue: ?OutboundQueue,
     webmail_outbox: ?WebmailOutbox,
@@ -82,13 +83,20 @@ pub fn identify(a: std.mem.Allocator, tx: Database.Transaction, mailbox: []const
 pub fn observe(a: std.mem.Allocator, db: *Database, mailbox: []const u8, expected_actor: []const u8, now: i64) !Observation {
     var tx = try db.beginTransaction(.read);
     defer tx.deinit();
+    const result = try observeInTransaction(a, tx, mailbox, expected_actor, now);
+    try tx.commit();
+    return result;
+}
+
+pub fn observeInTransaction(a: std.mem.Allocator, tx: Database.Transaction, mailbox: []const u8, expected_actor: []const u8, now: i64) !Observation {
     const assignment = try identify(a, tx, mailbox, expected_actor, now);
     const user = assignment.identity.native_user_id;
     const work = try tx.prepare(
         \\SELECT count(CASE WHEN t.outcome='pending' AND (t.mailbox_id=?1 OR d.hosted_sender_id=?1) THEN 1 END),
         \\       count(CASE WHEN t.outcome='remote_unattempted' AND d.hosted_sender_id=?1 THEN 1 END),
         \\       count(CASE WHEN t.outcome='remote_unknown' AND d.hosted_sender_id=?1 THEN 1 END),
-        \\       count(CASE WHEN t.outcome<>'pending' AND d.hosted_sender_id IS NULL AND d.envelope_from=?2 COLLATE NOCASE THEN 1 END)
+        \\       count(CASE WHEN t.outcome<>'pending' AND d.hosted_sender_id IS NULL AND d.envelope_from=?2 COLLATE NOCASE THEN 1 END),
+        \\       count(CASE WHEN t.outcome='pending' AND d.hosted_sender_id IS NULL AND d.envelope_from=?2 COLLATE NOCASE THEN 1 END)
         \\FROM accepted_mail_targets t JOIN accepted_mail d ON d.id=t.delivery_id
         \\WHERE t.outcome IN ('pending','remote_unattempted','remote_unknown')
     );
@@ -97,7 +105,7 @@ pub fn observe(a: std.mem.Allocator, db: *Database, mailbox: []const u8, expecte
     try work.bind(2, mailbox);
     if (!try work.step()) return error.StepFailed;
 
-    const result: Observation = .{
+    return .{
         .identity = assignment.identity,
         .access = assignment.access,
         .delivery = .{
@@ -105,12 +113,11 @@ pub fn observe(a: std.mem.Allocator, db: *Database, mailbox: []const u8, expecte
             .remote_unattempted_targets = @intCast(work.columnInt64(1)),
             .remote_unconfirmed_targets = @intCast(work.columnInt64(2)),
             .legacy_remote_envelope_matches = @intCast(work.columnInt64(3)),
+            .legacy_pending_envelope_matches = @intCast(work.columnInt64(4)),
         },
         .outbound_queue = try observeQueue(tx, user, mailbox),
         .webmail_outbox = try observeOutbox(tx, mailbox),
     };
-    try tx.commit();
-    return result;
 }
 
 fn hasSchema(tx: Database.Transaction, query: []const u8) !bool {

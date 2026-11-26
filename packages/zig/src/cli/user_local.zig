@@ -11,6 +11,7 @@ const hosted_limits = @import("../storage/hosted_limits.zig");
 const erasure_preflight = @import("../storage/hosted_erasure_preflight.zig");
 const erasure_export = @import("../storage/hosted_erasure_export.zig");
 const erasure_inventory = @import("../storage/hosted_erasure_inventory.zig");
+const erasure_review = @import("../storage/hosted_erasure_review.zig");
 const io_compat = @import("../core/io_compat.zig");
 const time = @import("../core/time_compat.zig");
 
@@ -244,6 +245,19 @@ fn hostedErasureExportAction(ctx: *cli.BaseCommand.ParseContext) !void {
     try output.interface.flush();
 }
 
+fn readPrivateReview(a: std.mem.Allocator, io: std.Io, review_path: []const u8, privacy_error: anyerror) ![]const u8 {
+    const review_file = try std.Io.Dir.cwd().openFile(io, review_path, .{ .follow_symlinks = false });
+    defer review_file.close(io);
+    const stat = try review_file.stat(io);
+    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0 or stat.size > 8192)
+        return privacy_error;
+    var input_buffer: [4096]u8 = undefined;
+    var input = review_file.reader(io, &input_buffer);
+    const raw = try a.alloc(u8, @intCast(stat.size));
+    try input.interface.readSliceAll(raw);
+    return raw;
+}
+
 fn hostedErasureHandoffAction(ctx: *cli.BaseCommand.ParseContext) !void {
     const review_path = ctx.getArgument(0) orelse return error.MissingArgument;
     const source = ctx.getArgument(1) orelse return error.MissingArgument;
@@ -252,15 +266,7 @@ fn hostedErasureHandoffAction(ctx: *cli.BaseCommand.ParseContext) !void {
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const review_file = try std.Io.Dir.cwd().openFile(io, review_path, .{ .follow_symlinks = false });
-    defer review_file.close(io);
-    const stat = try review_file.stat(io);
-    if (stat.kind != .file or stat.permissions.toMode() & 0o077 != 0 or stat.size > 8192)
-        return error.ExportHandoffReviewNotPrivate;
-    var input_buffer: [4096]u8 = undefined;
-    var input = review_file.reader(io, &input_buffer);
-    const raw = try a.alloc(u8, @intCast(stat.size));
-    try input.interface.readSliceAll(raw);
+    const raw = try readPrivateReview(a, io, review_path, error.ExportHandoffReviewNotPrivate);
     const review = try std.json.parseFromSliceLeaky(erasure_export.Handoff, a, raw, .{});
 
     const path = env.get("SMTP_DB_PATH") orelse "./smtp.db";
@@ -270,6 +276,28 @@ fn hostedErasureHandoffAction(ctx: *cli.BaseCommand.ParseContext) !void {
     var actor_buffer: [64]u8 = undefined;
     const operator = try std.fmt.bufPrint(&actor_buffer, "local-operator:{d}", .{std.c.geteuid()});
     const receipt = try erasure_export.handoffArchive(a, io, &db, review, operator, source, destination);
+
+    var buffer: [4096]u8 = undefined;
+    var output = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try std.json.Stringify.value(receipt, .{ .whitespace = .indent_2 }, &output.interface);
+    try output.interface.writeByte('\n');
+    try output.interface.flush();
+}
+
+fn hostedErasureReviewAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const review_path = ctx.getArgument(0) orelse return error.MissingArgument;
+    const io = io_compat.getIo();
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = try readPrivateReview(a, io, review_path, error.ErasureReviewNotPrivate);
+    const review = try std.json.parseFromSliceLeaky(erasure_review.Review, a, raw, .{});
+
+    var db = try database.Database.openReadWriteExisting(ctx.allocator, env.get("SMTP_DB_PATH") orelse "./smtp.db");
+    defer db.deinit();
+    var actor_buffer: [64]u8 = undefined;
+    const operator = try std.fmt.bufPrint(&actor_buffer, "local-operator:{d}", .{std.c.geteuid()});
+    const receipt = try erasure_review.record(a, io, &db, review, operator, env.get("MAIL_ROOT") orelse "mail", env.get("CALDAV_DB_PATH"));
 
     var buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writerStreaming(io, &buffer);
@@ -462,6 +490,11 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try hosted_handoff_cmd.addArgument(cli.Argument.init("output", "Path for the verified private handoff", .string).withRequired(true));
     _ = hosted_handoff_cmd.setAction(hostedErasureHandoffAction);
     _ = try cmd.addCommand(hosted_handoff_cmd);
+
+    const erasure_review_cmd = try cli.BaseCommand.init(allocator, "hosted-erasure-review", "Record approved erasure evidence with the mailbox data retained");
+    _ = try erasure_review_cmd.addArgument(cli.Argument.init("review", "Private erasure review JSON file", .string).withRequired(true));
+    _ = erasure_review_cmd.setAction(hostedErasureReviewAction);
+    _ = try cmd.addCommand(erasure_review_cmd);
 
     const export_cmd = try cli.BaseCommand.init(allocator, "export", "Export a mailbox to a portable TAR archive");
     _ = try export_cmd.addArgument(cli.Argument.init("username", "Canonical mailbox username", .string));

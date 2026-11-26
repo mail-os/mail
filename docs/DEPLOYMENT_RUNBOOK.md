@@ -427,6 +427,71 @@ from quiesced stores before relying on cross-store totals. Compare restored
 copies with the current provisioning assignment and reconcile each outstanding
 store under [#188](https://github.com/mail-os/mail/issues/188).
 
+### Record the approved erasure review
+
+After the mailbox has become unreadable, verify the requester and the approved
+retention, backup, billing, search, and export decisions in the private support
+case. Review any unscoped SQLite tables and unavailable ownership counts before
+recording approval. Resolve outstanding delivery work before proceeding. Keep a
+legal hold in force and leave the case pending if retention has not been cleared.
+
+Save the reviewed inputs in a mode-0600 file. Use the current mailbox assignment,
+the audit ID from its retained-store inventory, and a stable request ID unique
+across mailboxes. Evidence references must be opaque identifiers resolvable from
+the private case. Keep customer details and credentials out of these references.
+
+```json
+{
+  "version": 1,
+  "request_id": "erasure-request-19",
+  "mailbox": "alice@customer.example.com",
+  "assignment_actor": "mailbox-assignment-actor",
+  "case_reference": "exit-case-19",
+  "inventory_audit_id": 813,
+  "retention_disposition": "cleared",
+  "export_disposition": "resolved",
+  "export_handoff_audit_id": 814,
+  "evidence": {
+    "authorization_reference": "support-authorization-19",
+    "retention_reference": "retention-review-19",
+    "backup_reference": "backup-disposition-19",
+    "billing_reference": "billing-disposition-19",
+    "search_reference": "search-disposition-19",
+    "export_resolution_reference": "delivery-and-expiry-19"
+  }
+}
+```
+
+Use `resolved` when the private case records the approved channel's delivery
+and access-expiry resolution. Use `not_requested` with a null handoff audit ID
+and evidence of that decision when the case has no prepared export. A
+`retention_disposition` of `held` prevents approval.
+
+```bash
+umask 077
+/opt/mail/mail-server user:local hosted-erasure-review \
+  /private/exit-case-19/review.json > /private/exit-case-19/review-receipt.json
+```
+
+The command compares the current Maildir, DAV and SQLite inventory with the
+referenced audit and checks pending delivery in the SQLite transaction that records
+`hosted.erasure.review.accepted`. It refuses an unresolved Maildir or DAV
+owner, a stale inventory, unfinished or ambiguous delivery, and an export
+handoff from another case or assignment. When retrying an identical eligible
+request, use the same inputs to recover its audit ID. If the evidence or
+inventory changes, review the new evidence and use a new request ID.
+
+The receipt state is `review_recorded_data_retained`. The effective local
+operator and evidence references accompany the stable assignment in the audit.
+The native mailbox data and external stores remain in place. A future managed
+removal must revalidate the approval, reconcile every retained store, and verify
+scope again from quiesced Maildir and DAV data before making changes.
+
+Reproduce export, handoff, and review acceptance on a disposable fixture with
+`python3 scripts/test-hosted-erasure-export.py /path/to/mail`. The suite checks
+retention holds, old snapshots, a separate tenant, stale inventories, queued
+delivery, failed audit writes, and an identical retry.
+
 ## Local mailbox directory upgrade
 
 Back up the Maildir and SQLite database together before upgrading a server with older ActiveSync clients. On startup, the server checks for full-address local accounts that still have mail under a short directory name such as `mail/alice`. It moves eligible messages to `mail/alice@example.com` before opening the protocol listeners. It also moves messages in a canonical custom folder's nested slots into the folder path exposed by IMAP and webmail. ActiveSync, IMAP, webmail, and EWS then read from the canonical mailbox. The upgrade retains existing message flags and client identifiers when it can reconcile both directories.
