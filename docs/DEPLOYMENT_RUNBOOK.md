@@ -749,6 +749,34 @@ disposable TLS fixtures. It covers transaction rollback, an audit interruption
 after the DAV commit, peer resource preservation, and ID allocation after
 restart.
 
+### Reconcile live shared SQLite records
+
+After Maildir removal and any outgoing shared Calendar removal, inspect the
+live shared records for the same reserved mailbox. Stop the Mail daemon and
+use its working directory and SQLite configuration.
+
+```bash
+umask 077
+/opt/mail/mail-server user:local hosted-erasure-shared-sqlite \
+  /private/case/erasure-review.json START_AUDIT_ID
+```
+
+The plan lists live share and delegation edges, owner collection and workflow
+counts, and the drafts, Outbox IDs, and reply claims that remain as delivery
+evidence. For an erased delegate, it also counts assignments to be cleared
+in the peer's inbox. The plan keeps message and draft bodies private.
+Resolve pending, partial, or uncertain shared replies before proceeding.
+
+Approve the exact plan using `version` 1, its `scope_sha256`, and the case's
+`approval_reference` in a private JSON file. Pass that file as the final
+argument to the same command. The operation verifies the source-release
+receipts and archived copies, removes the approved live records, and saves
+one audited receipt in the same transaction. A retry with the same approval
+returns that receipt. Draft and delivery records remain in their own
+mailboxes with their original payloads. Revoking the grants prevents their
+shared reply contexts from being used for new sends. Team membership and
+ownership remain available for the team's separate handoff.
+
 ### Remove mailbox-private SMTP SQLite records
 
 After completing Maildir removal, keep the daemon stopped and run the

@@ -247,6 +247,28 @@ pub fn requireRelease(a: Allocator, tx: Database.Transaction, review: review_sto
     return .{ .audit_id = approved.columnInt64(0), .copies = copies, .archives = archives };
 }
 
+/// Load the committed archive selection for the completed Maildir operation.
+pub fn recordedArchiveRelease(a: Allocator, tx: Database.Transaction, review: review_store.Review, start_id: i64, owner: i64, audit_id: i64) !Release {
+    const row = try tx.prepare(
+        \\SELECT json_extract(details,'$.retained_thread_archives')
+        \\FROM audit_log WHERE id=?1 AND action='hosted.erasure.shared.source_release'
+        \\AND target=?2 AND target_type='hosted_mailbox'
+        \\AND json_extract(details,'$.start_audit_id')=?3 AND json_extract(details,'$.request_id')=?4
+        \\AND json_extract(details,'$.native_user_id')=?5 AND json_extract(details,'$.store')='maildir'
+        \\AND json_extract(details,'$.disposition')='release_source_with_thread_archives'
+    );
+    defer row.finalize();
+    try row.bind(1, audit_id);
+    try row.bind(2, review.mailbox);
+    try row.bind(3, start_id);
+    try row.bind(4, review.request_id);
+    try row.bind(5, owner);
+    if (!try row.step() or row.columnIsNull(0)) return error.InvalidErasureJournal;
+    const archives = try std.json.parseFromSliceLeaky([]const retained.Selection, a, row.columnText(0), .{ .allocate = .alloc_always });
+    if (archives.len == 0) return error.InvalidErasureJournal;
+    return .{ .audit_id = audit_id, .copies = &.{}, .archives = archives };
+}
+
 pub fn requireRecordedCalendarProof(a: Allocator, tx: Database.Transaction, review: review_store.Review, start_id: i64, owner: i64, proof: calendar_copy.Proof) !void {
     const row = try tx.prepare(
         \\SELECT json_extract(details,'$.retained_calendar_copies')

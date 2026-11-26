@@ -47,6 +47,15 @@ def verify(test):
     def inspect(store, *args):
         return step("hosted-erasure-shared-release", store, *args)
 
+    def shared_sqlite(*args):
+        return step("hosted-erasure-shared-sqlite", *args)
+
+    def sqlite_approval(plan, *, mode=0o600, reference="fixture-shared-records-approval"):
+        decision.write_text(json.dumps({"version": 1, "scope_sha256": plan["scope_sha256"],
+                                        "approval_reference": reference}))
+        decision.chmod(mode)
+        return shared_sqlite(decision)
+
     def refuse(result, error):
         assert result.returncode and not result.stdout and error in result.stderr, result
 
@@ -59,12 +68,15 @@ def verify(test):
         return inspect(plan["scope"]["store"], decision)
 
     with test.daemon():
-        owner, peer = [test.provision(name) for name in ("shared-source", "shared-peer")]
+        owner, peer, witness = [test.provision(name) for name in ("shared-source", "shared-peer", "other-peer")]
         command(test, "team", "create", team, "Shared erasure test", owner)
         command(test, "team", "member", team, peer, "member")
+        command(test, "team", "member", team, witness, "member")
         command(test, "team", "grant", team, owner, peer, "mailbox")
         command(test, "team", "grant", team, owner, peer, "sender")
-        owner_session, peer_session = test.login(owner), test.login(peer)
+        command(test, "team", "grant", team, peer, owner, "mailbox")
+        command(test, "team", "grant", team, peer, witness, "mailbox")
+        owner_session, peer_session, witness_session = (test.login(account) for account in (owner, peer, witness))
         message = EmailMessage()
         message["From"], message["To"] = peer, owner
         message["Subject"] = "Source thread"
@@ -76,6 +88,9 @@ def verify(test):
         expect_smtp(test.deliver(peer, subject="Peer thread"), 250)
         outgoing = share(owner_session, peer, "Source thread")
         incoming = share(peer_session, owner, "Peer thread")
+        unrelated = share(peer_session, witness, "Peer thread")
+        peer_anchor, = [row["reference"] for row in api(peer_session, "messages?conversations=false")["items"] if row["subject"] == "Peer thread"]
+        assert api(witness_session, f"thread-shares/{unrelated}")["messages"]
         assert api(peer_session, f"thread-shares/{outgoing}")["messages"]
         api(peer_session, f"thread-shares/{outgoing}/comments", {"text": "Peer decision record"}, expected=201)
         messages = {item["subject"]: item["reference"] for item in api(owner_session, "messages?conversations=false")["items"]}
@@ -94,6 +109,10 @@ def verify(test):
         with closing(sqlite3.connect(db_path)) as db:
             owner_id, = db.execute("SELECT id FROM users WHERE username=?", (owner,)).fetchone()
             peer_id, = db.execute("SELECT id FROM users WHERE username=?", (peer,)).fetchone()
+        with closing(sqlite3.connect(db_path)) as db, db:
+            db.execute("""INSERT INTO mail_shared_inbox_state(team_id,source_id,reference,assignee_id,
+                          resolved,revision,changed_at,action) VALUES(?,?,?,?,1,1,0,'assign')""",
+                       (team, peer_id, peer_anchor, owner_id))
         shared_path = f"shared-inboxes/{team}/{owner_id}/messages/{messages['Source thread']}"
         shared = api(peer_session, shared_path)
         assert shared["canReply"]
@@ -116,6 +135,7 @@ def verify(test):
         put_dav(DavClient(test, peer), peer_event, "text/calendar", EVENT)
 
         _, _, start = prepare(test, "shared-source", review)
+        refuse(shared_sqlite(), "MaildirWriterActive")
         mail = success(inspect("maildir"))
         dav = success(inspect("dav"))
         assert mail["requires_approval"] and dav["requires_approval"]
@@ -140,6 +160,7 @@ def verify(test):
 
     same_bytes = mail_bytes()
     assert same_bytes
+    refuse(shared_sqlite(), "ErasureMaildirPending")
     refuse(step("hosted-erasure-maildir"), "ErasureSharedRepliesUnresolved")
     refuse(choose(mail), "ErasureSharedRepliesUnresolved")
     assert mail_bytes() == same_bytes
@@ -222,7 +243,8 @@ def verify(test):
     refuse(step("hosted-erasure-maildir"), "ErasureSharedReleaseRequired")
     changed_mail = success(inspect("maildir"))
     assert any(row["share_id"] == outgoing and row["access"] == "read_and_download" for row in changed_mail["scope"]["current"])
-    assert success(choose(changed_mail))["audit_id"] != approved["audit_id"]
+    approved_mail = success(choose(changed_mail))["audit_id"]
+    assert approved_mail != approved["audit_id"]
     receipt = success(step("hosted-erasure-maildir"))
     assert success(step("hosted-erasure-maildir")) == receipt and not staged.exists()
 
@@ -245,12 +267,14 @@ def verify(test):
     changed = success(inspect("dav"))
     assert changed["scope"]["reviewed"][0]["access"] == "viewer"
     assert changed["scope"]["current"][0]["access"] == "editor"
-    assert success(choose(changed))["audit_id"]
+    approved_dav = success(choose(changed))["audit_id"]
+    assert approved_dav
+    refuse(shared_sqlite(), "ErasureDavPending")
     receipt = success(step("hosted-erasure-dav", dav_path))
     assert success(step("hosted-erasure-dav", dav_path)) == receipt
 
     with closing(sqlite3.connect(db_path)) as db:
-        assert {row[0] for row in db.execute("SELECT id FROM mail_team_thread_shares")} == {incoming, outgoing, outgoing_collection}
+        assert {row[0] for row in db.execute("SELECT id FROM mail_team_thread_shares")} == {incoming, outgoing, outgoing_collection, unrelated}
         assert db.execute("SELECT text FROM mail_team_thread_comments WHERE share_id=?", (outgoing,)).fetchone() == ("Updated peer decision",)
         assert db.execute("SELECT count(*) FROM mail_team_calendar_shares").fetchone() == (1,)
         assert db.execute("SELECT count(*) FROM audit_log WHERE action='hosted.erasure.shared.source_release'").fetchone() == (6,)
@@ -259,8 +283,91 @@ def verify(test):
         assert "Peer decision record" not in details and "Verified shared parent" not in details
         assert len(json.loads(details)["thread_records"]) == 2
 
+    orphan_id = secrets.token_hex(16)
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("""INSERT INTO webmail_records(username,kind,id,payload,state,revision)
+                      VALUES(?,'outbox',?,?,'pending',1)""",
+                   (peer, orphan_id, json.dumps({"message": {"sharedReply": {"sourceId": str(owner_id), "team": team}}})))
+    unsettled = success(shared_sqlite())["plan"]
+    assert unsettled["unresolved_outbox"] and unsettled["unresolved_claims"] == []
+    assert orphan_id in {row["id"] for row in unsettled["retained_drafts_and_outbox"]}
+    refuse(sqlite_approval(unsettled), "ErasureSharedRepliesUnresolved")
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("DELETE FROM webmail_records WHERE username=? AND kind='outbox' AND id=?", (peer, orphan_id))
+
+    compact_id = secrets.token_hex(16)
+    delivery_id = secrets.token_hex(16)
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("""INSERT INTO mail_shared_reply_claims
+                      (source_id,reference,team_id,actor_id,actor,send_id,state,due_at)
+                      VALUES(?,?,?,?,?,?,'replied',0)""",
+                   (owner_id, messages["Alternate source"], team, peer_id, peer, compact_id))
+        db.execute("""INSERT INTO webmail_records(username,kind,id,payload,state,revision)
+                      VALUES(?,'outbox',?,?,'sent',1)""",
+                   (peer, compact_id, json.dumps({"dispatch": {"delivery_id": delivery_id}})))
+    plan = success(shared_sqlite())["plan"]
+    assert plan["releases"] == {"maildir": approved_mail, "calendar": approved_dav}
+    assert {edge["share_id"] for edge in plan["shared_edges"]} == {incoming, outgoing, outgoing_collection, calendar_grant_id}
+    assert plan["removed"] == {"threads": 3, "calendars": 1, "grants": 3, "collections": 1, "collection_members": 1,
+                               "inbox_stages": 0, "inbox_workflow": 0, "peer_assignments": 1}
+    assert {row["id"] for row in plan["retained_reply_claims"]} == {payload["sendId"], compact_id}
+    assert {row["kind"] for row in plan["retained_drafts_and_outbox"]} == {"draft", "outbox"}
+    archived_send, = [row for row in plan["retained_drafts_and_outbox"] if row["id"] == compact_id]
+    assert archived_send["source_user_id"] == str(owner_id) and archived_send["delivery_id"] == delivery_id
+    assert "Updated peer decision" not in json.dumps(plan)
+
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE mail_team_thread_shares SET subject='Stale incoming share' WHERE id=?", (incoming,))
+    refuse(sqlite_approval(plan), "ErasureSharedScopeChanged")
+    refuse(sqlite_approval(plan, mode=0o644), "ErasureSharedDecisionNotPrivate")
+    plan = success(shared_sqlite())["plan"]
+
+    def snapshot(db):
+        tables = ("mail_team_thread_shares", "mail_team_calendar_shares", "mail_team_grants", "mail_private_members",
+                  "mail_shared_inbox_state", "mail_shared_reply_claims", "webmail_records", "mail_team_members",
+                  "accepted_mail", "accepted_mail_targets")
+        return {table: db.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall() for table in tables}
+
+    with closing(sqlite3.connect(db_path)) as db:
+        unchanged = snapshot(db)
+        with db:
+            db.execute("""CREATE TRIGGER stop_shared_cleanup BEFORE INSERT ON audit_log
+                          WHEN NEW.action='hosted.erasure.shared.sqlite'
+                          BEGIN SELECT RAISE(ABORT,'interrupt shared cleanup audit'); END""")
+        refuse(sqlite_approval(plan), "StepFailed")
+        assert snapshot(db) == unchanged
+        with db:
+            db.execute("DROP TRIGGER stop_shared_cleanup")
+
+    cleanup = success(sqlite_approval(plan))
+    assert success(sqlite_approval(plan)) == cleanup and success(shared_sqlite()) == cleanup
+    assert cleanup["receipt"]["removed_shared_edges"] == plan["shared_edges"]
+    assert cleanup["receipt"]["retained_reply_claims"] == plan["retained_reply_claims"]
+    refuse(sqlite_approval(plan, reference="different-approval"), "ErasureSharedScopeChanged")
+    with closing(sqlite3.connect(db_path)) as db:
+        after = snapshot(db)
+        for table in ("mail_shared_reply_claims", "webmail_records", "mail_team_members", "accepted_mail", "accepted_mail_targets"):
+            assert after[table] == unchanged[table]
+        assert {row[0] for row in db.execute("SELECT id FROM mail_team_thread_shares")} == {unrelated}
+        assert db.execute("SELECT source_id,grantee_id FROM mail_team_grants").fetchall() == [
+            (peer_id, db.execute("SELECT id FROM users WHERE username=?", (witness,)).fetchone()[0]),
+        ]
+        assert db.execute("SELECT assignee_id,resolved,revision,action FROM mail_shared_inbox_state").fetchall() == [
+            (None, 1, 2, "access_removed"),
+        ]
+        assert not after["mail_team_calendar_shares"] and not after["mail_private_members"]
+        assert db.execute("SELECT count(*) FROM audit_log WHERE action='hosted.erasure.shared.sqlite'").fetchone() == (1,)
+
     with test.daemon():
         api(owner_session, "messages", expected=401)
+        api(peer_session, f"thread-shares/{outgoing}", expected=404)
+        assert api(witness_session, f"thread-shares/{unrelated}")["messages"]
+        assert api(peer_session, "outbox/" + payload["sendId"])["state"] == "sent"
+        surviving_draft = api(peer_session, f'drafts?uid={draft["uid"]}')
+        assert surviving_draft["message"] == saved["message"]
+        resend = dict(payload, sendId=secrets.token_hex(16), draftRevision=surviving_draft["revision"])
+        status, _ = test.api(peer_session, "compose", resend)
+        assert status in (403, 409), status
         assert api(peer_session, "messages")["items"][0]["subject"] == "Peer thread"
         result = DavClient(test, peer).request("GET", peer_event)
         assert result[0] == 200 and b"BEGIN:VEVENT" in result[2], result

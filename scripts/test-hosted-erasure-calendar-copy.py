@@ -162,6 +162,24 @@ def verify(test):
     with closing(sqlite3.connect(db_path)) as db:
         details, = db.execute("SELECT details FROM audit_log WHERE id=?", (receipt["audit_id"],)).fetchone()
         assert json.loads(details)["retained_calendar_copy_proof"] == proof
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("""UPDATE audit_log SET details=json_set(details,'$.retained_calendar_copy_proof.approval_audit_id',?)
+                      WHERE id=?""", (legacy["audit_id"], receipt["audit_id"]))
+    refuse(step("hosted-erasure-shared-sqlite"), "ErasureSharedScopeChanged")
+    with closing(sqlite3.connect(db_path)) as db, db:
+        db.execute("UPDATE audit_log SET details=? WHERE id=?", (details, receipt["audit_id"]))
+    sqlite_plan = success(step("hosted-erasure-shared-sqlite"))["plan"]
+    assert sqlite_plan["releases"]["calendar"] == approval["audit_id"]
+    assert sqlite_plan["removed"]["calendars"] == 2
+    decision.write_text(json.dumps({"version": 1, "scope_sha256": sqlite_plan["scope_sha256"],
+                                    "approval_reference": "fixture-retained-calendar-release"}))
+    sqlite_receipt = success(step("hosted-erasure-shared-sqlite", decision))
+    assert success(step("hosted-erasure-shared-sqlite", decision)) == sqlite_receipt
+    assert sqlite_receipt["receipt"]["calendar_release_audit_id"] == approval["audit_id"]
+    assert success(erase()) == receipt
+    with closing(sqlite3.connect(db_path)) as db:
+        assert not db.execute("SELECT 1 FROM mail_team_calendar_shares").fetchone()
+        assert not db.execute("SELECT 1 FROM mail_team_calendar_share_epochs").fetchone()
     with test.daemon():
         status, _, restored = peer_dav.request("GET", retained)
         assert status == 200 and restored == public_copy

@@ -16,6 +16,7 @@ const erasure_maildir = @import("../storage/hosted_erasure_maildir.zig");
 const erasure_search = @import("../storage/hosted_erasure_search.zig");
 const erasure_typesense = @import("../storage/hosted_erasure_typesense.zig");
 const erasure_dav = @import("../storage/hosted_erasure_dav.zig");
+const erasure_shared_sqlite = @import("../storage/hosted_erasure_shared_sqlite.zig");
 const erasure_shared = @import("../storage/hosted_erasure_shared.zig");
 const erasure_links = @import("../storage/hosted_erasure_links.zig");
 const erasure_sqlite = @import("../storage/hosted_erasure_sqlite.zig");
@@ -350,6 +351,12 @@ fn hostedErasureSharedAction(ctx: *cli.BaseCommand.ParseContext) !void {
     try hostedErasureApproval(ctx, .{ .shared = .{ .start_id = audit_id, .store = store, .decision_path = ctx.getArgument(3) } });
 }
 
+fn hostedErasureSharedSqliteAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const audit = ctx.getArgument(1) orelse return error.MissingArgument;
+    const audit_id = std.fmt.parseInt(i64, audit, 10) catch return error.InvalidErasureStartAuditId;
+    try hostedErasureApproval(ctx, .{ .shared_sqlite = .{ .start_id = audit_id, .decision_path = ctx.getArgument(2) } });
+}
+
 fn hostedErasureRetainThreadsAction(ctx: *cli.BaseCommand.ParseContext) !void {
     const audit = ctx.getArgument(1) orelse return error.MissingArgument;
     const audit_id = std.fmt.parseInt(i64, audit, 10) catch return error.InvalidErasureStartAuditId;
@@ -364,6 +371,7 @@ const ErasureOperation = union(enum) {
     search: i64,
     sqlite: i64,
     links: i64,
+    shared_sqlite: struct { start_id: i64, decision_path: ?[]const u8 },
     shared: struct { start_id: i64, store: erasure_shared.Store, decision_path: ?[]const u8 },
     typesense: struct { start_id: i64, endpoint: erasure_typesense.Endpoint },
     dav: struct { start_id: i64, confirmed_path: []const u8 },
@@ -398,6 +406,16 @@ fn hostedErasureApproval(ctx: *cli.BaseCommand.ParseContext, operation: ErasureO
         .sqlite => |id| try std.json.Stringify.value(try erasure_sqlite.erase(a, io, &db, review, id, operator, mail_root), format, &output.interface),
         .links => |id| try std.json.Stringify.value(try erasure_links.erase(a, io, &db, review, id, operator, mail_root), format, &output.interface),
         .search => |id| try std.json.Stringify.value(try erasure_search.erase(a, io, &db, review, id, operator, mail_root), format, &output.interface),
+        .shared_sqlite => |step| {
+            const decision = if (step.decision_path) |path| try std.json.parseFromSliceLeaky(
+                erasure_shared_sqlite.Decision,
+                a,
+                try readPrivateReview(a, io, path, error.ErasureSharedDecisionNotPrivate),
+                .{},
+            ) else null;
+            const result = try erasure_shared_sqlite.reconcile(a, io, &db, review, step.start_id, operator, mail_root, decision);
+            try std.json.Stringify.value(result, format, &output.interface);
+        },
         .shared => |step| {
             const decision = if (step.decision_path) |path| try std.json.parseFromSliceLeaky(
                 erasure_shared.Decision,
@@ -618,6 +636,13 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try erasure_shared_cmd.addArgument(cli.Argument.init("decision", "Private JSON containing the scope digest and approval reference", .string).withRequired(false));
     _ = erasure_shared_cmd.setAction(hostedErasureSharedAction);
     _ = try cmd.addCommand(erasure_shared_cmd);
+
+    const erasure_shared_sqlite_cmd = try cli.BaseCommand.init(allocator, "hosted-erasure-shared-sqlite", "Review and remove authorized live shared SQLite records after source removal");
+    _ = try erasure_shared_sqlite_cmd.addArgument(cli.Argument.init("review", "Private erasure review JSON file", .string).withRequired(true));
+    _ = try erasure_shared_sqlite_cmd.addArgument(cli.Argument.init("start-audit-id", "Audit ID of the reserved erasure", .string).withRequired(true));
+    _ = try erasure_shared_sqlite_cmd.addArgument(cli.Argument.init("decision", "Private JSON containing the scope digest and approval reference", .string).withRequired(false));
+    _ = erasure_shared_sqlite_cmd.setAction(hostedErasureSharedSqliteAction);
+    _ = try cmd.addCommand(erasure_shared_sqlite_cmd);
 
     const retain_threads_cmd = try cli.BaseCommand.init(allocator, "hosted-erasure-retain-threads", "Preserve approved peer-owned shared Mail before removing its source");
     _ = try retain_threads_cmd.addArgument(cli.Argument.init("review", "Private erasure review JSON file", .string).withRequired(true));

@@ -230,12 +230,20 @@ def verify(test, *, screenshots=None):
     erased = success(step("hosted-erasure-maildir"))
     assert not maildir.exists() and success(step("hosted-erasure-maildir")) == erased
     assert success(step("hosted-erasure-retain-threads")) == receipt
+    plan = success(step("hosted-erasure-shared-sqlite"))["plan"]
+    assert {entry["share_id"] for entry in plan["shared_edges"]} == {thread, collection_share, hidden}
+    assert plan["releases"]["maildir"] == approved["audit_id"]
+    assert plan["removed"]["threads"] == 3 and plan["removed"]["collections"] == 1
+    decision.write_text(json.dumps({"version": 1, "scope_sha256": plan["scope_sha256"],
+                                    "approval_reference": "fixture-live-shared-release"}))
+    removed = success(step("hosted-erasure-shared-sqlite", decision))
+    assert removed["receipt"]["maildir_release_audit_id"] == approved["audit_id"]
+    assert success(step("hosted-erasure-shared-sqlite", decision)) == removed
+    assert success(step("hosted-erasure-retain-threads")) == receipt
     with closing(sqlite3.connect(db_path)) as db:
-        db.execute("PRAGMA foreign_keys=ON")
-        with db:
-            # Emulate downstream removal of live grants and all discussion.
-            db.execute("DELETE FROM mail_team_members WHERE team_id=? AND user_id=?", (team, peer_id))
         assert db.execute("SELECT count(*) FROM mail_team_thread_shares").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM mail_private_members").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM mail_team_members WHERE team_id=?", (team,)).fetchone()[0] == 3
         with db:
             db.execute("UPDATE mail_retained_thread_archives SET document=json_set(document,'$.grant.subject','altered') WHERE share_id=?", (thread,))
         corrupt = test.directory / "corrupt.tar"

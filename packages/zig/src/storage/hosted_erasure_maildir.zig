@@ -192,6 +192,21 @@ fn requireRelease(a: Allocator, tx: Database.Transaction, review: review_store.R
     return release.audit_id;
 }
 
+/// Recheck authorization before removing live SQLite parents that used
+/// the completed Maildir. The archived copies have independent ownership.
+pub fn requireSharedRecordsRelease(a: Allocator, tx: Database.Transaction, review: review_store.Review, start_id: i64, owner: i64) !?i64 {
+    const chosen = try retained.chosen(tx, start_id);
+    const release = (try shared.requireRelease(a, tx, review, start_id, owner, .maildir)) orelse {
+        if (chosen != null) return error.ErasureSharedScopeChanged;
+        return null;
+    };
+    if (release.archives.len != 0) {
+        if (chosen != release.audit_id) return error.ErasureSharedScopeChanged;
+        _ = (try archiveReceipt(a, tx, review.mailbox, start_id, release)) orelse return error.ErasureThreadArchivePending;
+    } else if (chosen != null) return error.ErasureSharedScopeChanged;
+    return release.audit_id;
+}
+
 /// Stage immutable copies while the approved source is still available. The
 /// reader can discover them only after the audited Maildir removal succeeds.
 pub fn retainThreads(a: Allocator, io: std.Io, db: *Database, review: review_store.Review, start_id: i64, operator: []const u8, mail_root: []const u8, dav_path: ?[]const u8, junk: []const u8) !ArchiveReceipt {
@@ -206,6 +221,16 @@ pub fn retainThreads(a: Allocator, io: std.Io, db: *Database, review: review_sto
         const now = time.timestamp();
         const observation = try review_store.requireStarted(a, tx, review, start_id, now);
         const owner = observation.identity.native_user_id;
+        if (try loadStep(a, tx, start_id)) |completed| {
+            if (completed.phase == .complete) {
+                try requireRemoved(a, io, tx, root, review.mailbox, start_id);
+                const chosen = (try retained.chosen(tx, start_id)) orelse return error.ErasureThreadArchiveNotAuthorized;
+                const release = try shared.recordedArchiveRelease(a, tx, review, start_id, owner, chosen);
+                const receipt = (try archiveReceipt(a, tx, review.mailbox, start_id, release)) orelse return error.InvalidErasureJournal;
+                try tx.commit();
+                return receipt;
+            }
+        }
         const release = (try shared.requireRelease(a, tx, review, start_id, owner, .maildir)) orelse
             return error.ErasureThreadArchiveNotAuthorized;
         if (release.archives.len == 0) return error.ErasureThreadArchiveNotAuthorized;
