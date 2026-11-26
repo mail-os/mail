@@ -508,6 +508,19 @@ fn sealErasureReplayAction(ctx: *cli.BaseCommand.ParseContext) !void {
     try writeErasureJson(io, document);
 }
 
+fn verifyErasureReplayChainAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const source = ctx.getArgument(0) orelse return error.MissingRestoreErasureAuthority;
+    const replay = ctx.getArgument(1) orelse return error.MissingErasureReplayEvidence;
+    const authority = ctx.getArgument(2) orelse return error.MissingBackupDatabase;
+    const review = ctx.getArgument(3) orelse return error.MissingErasureReview;
+    const replay_digest = ctx.getOption("replay-sha256") orelse return error.InvalidErasureCheckpointPin;
+    const io = io_compat.getIo();
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const receipt = try erasure_checkpoint.verifyReplayChain(arena.allocator(), io, source, try checkpointPin(ctx), replay, replay_digest, authority, review);
+    try writeErasureJson(io, receipt);
+}
+
 fn addCheckpointPinOptions(command: *cli.BaseCommand) !void {
     _ = try command.addOption(cli.Option.init("scope", "scope", "Expected scope from a trusted recovery record", .string).withRequired(true));
     _ = try command.addOption(cli.Option.init("public-key", "public-key", "Pinned hexadecimal Ed25519 public key", .string).withRequired(true));
@@ -605,6 +618,16 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try seal_replay_cmd.addOption(cli.Option.init("approval-reference", "approval-reference", "Independent operator approval for the reconciled backup", .string).withRequired(true));
     _ = seal_replay_cmd.setAction(sealErasureReplayAction);
     _ = try backup_cmd.addCommand(seal_replay_cmd);
+
+    const chain_cmd = try cli.BaseCommand.init(allocator, "verify-erasure-replay-chain", "Verify a signed recovery record for an original erasure case");
+    _ = try chain_cmd.addArgument(cli.Argument.init("checkpoint", "Original signed checkpoint from independent storage", .string));
+    _ = try chain_cmd.addArgument(cli.Argument.init("replay-checkpoint", "Signed checkpoint from the isolated replay", .string));
+    _ = try chain_cmd.addArgument(cli.Argument.init("authority-db", "Current SMTP database from outside the restore", .string));
+    _ = try chain_cmd.addArgument(cli.Argument.init("review", "Private erasure review from the original case", .string));
+    try addCheckpointPinOptions(chain_cmd);
+    _ = try chain_cmd.addOption(cli.Option.init("replay-sha256", "replay-sha256", "Pinned SHA-256 of the replay checkpoint", .string).withRequired(true));
+    _ = chain_cmd.setAction(verifyErasureReplayChainAction);
+    _ = try backup_cmd.addCommand(chain_cmd);
 
     return backup_cmd;
 }

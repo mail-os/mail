@@ -893,7 +893,25 @@ future `retain_until` timestamp in Unix seconds.
 
 Include `backups.retained_snapshots` and, when any snapshots remain, a
 `backups.restore_verification_reference` to the older-snapshot verification
-record. In `retained_records`, list each table from the verified scope once
+record. After verifying the recovered stores with `verify-erasure-checkpoint`,
+bind the signed source and replay checkpoints to the original case. Obtain
+the scope, signing key, both file digests and earliest observation from
+the independently retained recovery record.
+
+```sh
+mail backup verify-erasure-replay-chain /secure/source-checkpoint.json \
+  /secure/replay-checkpoint.json /secure/original-smtp.db /secure/review.json \
+  --scope TRUSTED_SCOPE --public-key TRUSTED_ED25519_PUBLIC_KEY \
+  --expected-sha256 SOURCE_SHA256 --replay-sha256 REPLAY_SHA256 \
+  --not-before EARLIEST_UNIX_TIME > /secure/replay-evidence.json
+```
+
+The verifier reads the original case and confirms that both signed checkpoints
+cover its assignment and the approved peer copies. Keep the report and both
+checkpoints in the private case record. Use the report's `evidence_sha256`
+as `backups.restore_verification_reference`.
+
+In `retained_records`, list each table from the verified scope once
 with its `table` and retention `disposition`. Use the approved evidence for
 required audit records and remaining delivery, team or reservation data.
 Match the recorded scope to decisions from the operators responsible for

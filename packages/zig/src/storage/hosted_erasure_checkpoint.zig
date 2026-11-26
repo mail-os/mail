@@ -39,6 +39,23 @@ const TargetReceipt = struct {
     checkpoint_sha256: restore.Digest,
     source_start_audit_id: i64,
 };
+const ReplayChain = struct {
+    version: u8 = 1,
+    state: []const u8 = "erasure_replay_chain_verified",
+    scope: []const u8,
+    source_checkpoint_sha256: restore.Digest,
+    replay_checkpoint_sha256: restore.Digest,
+    source_observed_at: i64,
+    replay_observed_at: i64,
+    case_sha256: restore.Digest,
+    source_start_audit_id: i64,
+    replay_start_audit_id: i64,
+    recovery_approval_reference: []const u8,
+};
+const ReplayChainReceipt = struct {
+    evidence: ReplayChain,
+    evidence_sha256: restore.Digest,
+};
 pub const Pin = struct {
     scope: []const u8,
     public_key: []const u8,
@@ -221,4 +238,55 @@ pub fn sealReplay(a: Allocator, io: std.Io, path: []const u8, pin: Pin, restored
         .state = snapshot,
         .replay = .{ .original_checkpoint_sha256 = original.digest, .approval_reference = approval_reference },
     }, seed_path, pin.public_key);
+}
+
+pub fn verifyReplayChain(a: Allocator, io: std.Io, path: []const u8, pin: Pin, replay_path: []const u8, replay_sha256: []const u8, authority_db: []const u8, review_path: []const u8) !ReplayChainReceipt {
+    const original = try authenticate(a, io, path, pin);
+    const recovered = try authenticate(a, io, replay_path, .{
+        .scope = pin.scope,
+        .public_key = pin.public_key,
+        .sha256 = replay_sha256,
+        .not_before = original.payload.state.observed_at,
+    });
+    const replay = recovered.payload.replay orelse return error.MissingErasureReplayEvidence;
+    if (!std.mem.eql(u8, &original.digest, &replay.original_checkpoint_sha256))
+        return error.RestoreErasureReplaySourceMismatch;
+    if (!preflight.validCaseReference(replay.approval_reference)) return error.InvalidErasureReplayApproval;
+    try requireReplayCoverage(a, original.payload.state, recovered.payload.state);
+
+    const raw = try read(a, io, review_path, 8192, true);
+    const review = try std.json.parseFromSliceLeaky(review_store.Review, a, raw, .{});
+    try review.validate();
+    var db = try database.Database.openReadOnly(a, authority_db);
+    defer db.deinit();
+    var tx = try db.beginTransaction(.read);
+    defer tx.deinit();
+    const now = clock.timestamp();
+    const assignment = try preflight.identify(a, tx, review.mailbox, review.assignment_actor, now);
+    try restore.requireSingleAddress(tx, review.mailbox, assignment.identity.native_user_id);
+    const identity = try replay_evidence.caseIdentity(a, review, assignment.identity);
+
+    const source_case = for (original.payload.state.cases) |record| {
+        if (std.mem.eql(u8, &record.replay.?.identity, &identity)) break record;
+    } else return error.RestoreErasureReplayCaseMismatch;
+    const replay_case = for (recovered.payload.state.cases) |record| {
+        if (std.mem.eql(u8, &record.replay.?.identity, &identity)) break record;
+    } else return error.RestoreErasureReplayCaseMismatch;
+    _ = try review_store.requireStarted(a, tx, review, source_case.start_audit_id, now);
+
+    const evidence: ReplayChain = .{
+        .scope = pin.scope,
+        .source_checkpoint_sha256 = original.digest,
+        .replay_checkpoint_sha256 = recovered.digest,
+        .source_observed_at = original.payload.state.observed_at,
+        .replay_observed_at = recovered.payload.state.observed_at,
+        .case_sha256 = identity,
+        .source_start_audit_id = source_case.start_audit_id,
+        .replay_start_audit_id = replay_case.start_audit_id,
+        .recovery_approval_reference = replay.approval_reference,
+    };
+    return .{
+        .evidence = evidence,
+        .evidence_sha256 = refs.digest(try std.json.Stringify.valueAlloc(a, evidence, .{})),
+    };
 }

@@ -130,6 +130,8 @@ def verify(binary, work):
     finish(source, review_path, source_start)
     source_checkpoint = verified_document(work / "original-checkpoint.json",
                                           backup("seal-erasure-authority", original / "smtp.db", SCOPE, key))
+    other_source = verified_document(work / "other-source-checkpoint.json",
+                                      backup("seal-erasure-authority", original / "smtp.db", SCOPE, key))
     (original / "smtp.db").rename(original / "smtp.db.unavailable")
     refuse(check(older, source_checkpoint), "RestoreErasureReconciliationRequired")
     rebind = backup("rebind-local", older / "smtp.db", older / "mail")
@@ -207,6 +209,59 @@ def verify(binary, work):
     assert receipt["newest_reservation_audit_id"] == begin and receipt["recovery_approval_reference"] == APPROVAL
     assert target not in certified[0].read_text() and "Original shared body" not in certified[0].read_text()
 
+    original_db = original / "smtp.db"
+    (original / "smtp.db.unavailable").rename(original_db)
+    original_bytes = original_db.read_bytes()
+
+    def chain(review_file=review_path, replay_digest=receipt["checkpoint_sha256"]):
+        return backup("verify-erasure-replay-chain", source_checkpoint[0], certified[0], original_db,
+                      review_file, *pin, "--replay-sha256", replay_digest)
+
+    evidence = success(chain())
+    assert evidence["evidence"] == {
+        "version": 1, "state": "erasure_replay_chain_verified", "scope": SCOPE,
+        "source_checkpoint_sha256": receipt["replayed_from_sha256"],
+        "replay_checkpoint_sha256": receipt["checkpoint_sha256"],
+        "source_observed_at": json.loads(checkpoint.read_text())["payload"]["state"]["observed_at"],
+        "replay_observed_at": receipt["authority_observed_at"],
+        "case_sha256": json.loads(checkpoint.read_text())["payload"]["state"]["cases"][0]["replay"]["identity"],
+        "source_start_audit_id": source_start, "replay_start_audit_id": begin, "recovery_approval_reference": APPROVAL,
+    }
+    assert success(chain()) == evidence and original_db.read_bytes() == original_bytes
+    assert target not in json.dumps(evidence)
+    refuse(chain(replay_digest="0" * 64), "ErasureCheckpointPinMismatch")
+    refuse(backup("verify-erasure-replay-chain", other_source[0], certified[0], original_db,
+                  review_path, *other_source[1], "--replay-sha256", receipt["checkpoint_sha256"]),
+           "RestoreErasureReplaySourceMismatch")
+    unknown_review = work / "wrong-case.json"
+    private_json(unknown_review, {**review, "case_reference": "different-private-case"})
+    refuse(chain(unknown_review), "RestoreErasureReplayCaseMismatch")
+    unknown_review.chmod(0o644)
+    refuse(chain(unknown_review), "ErasureCheckpointKeyNotPrivate")
+
+    def closeout(*args):
+        return cli(source, "hosted-erasure-closeout", str(review_path), str(source_start), *map(str, args))
+
+    plan = success(closeout())
+    required = {"state": "retention_required", "reference": "fixture-retention"}
+    decision_file = work / "closeout.json"
+    decision = {
+        "version": 1, "scope_sha256": plan["scope_sha256"], "approval_reference": "fixture-linked-replay",
+        "external_search_reference": "fixture-search", "sqlite_scope_reference": "fixture-sqlite",
+        "sqlite_history": required, "hosted_billing": required, "support_records": required,
+        "backups": {"disposition": required, "retained_snapshots": 1},
+        "retained_records": [
+            {"table": entry["table"], "disposition": required} for entry in plan["scope"]["retained_records"]
+        ],
+    }
+    private_json(decision_file, decision)
+    refuse(closeout(decision_file), "ErasureCloseoutRestoreProofRequired")
+    decision["backups"]["restore_verification_reference"] = evidence["evidence_sha256"]
+    private_json(decision_file, decision)
+    recorded = success(closeout(decision_file))
+    assert recorded["decision"]["backups"]["restore_verification_reference"] == evidence["evidence_sha256"]
+    assert recorded["audit_id"] is not None and success(closeout(decision_file)) == recorded
+
     with closing(sqlite3.connect(replay_db)) as db, db:
         copy_hash, = db.execute("SELECT sha256 FROM mail_retained_thread_archives WHERE share_id=?", (thread_id,)).fetchone()
         db.execute("UPDATE mail_retained_thread_archives SET sha256=? WHERE share_id=?", ("0" * 64, thread_id))
@@ -243,4 +298,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
     with TemporaryDirectory(prefix="mail-erasure-replay-") as directory:
         verify(args.binary.resolve(strict=True), Path(directory))
-    print("Verified authorized erasure replay of a pre-erasure archive, signed recovery, tamper refusal, and retained peer Mail and Calendar over TLS.")
+    print("Verified authorized erasure replay of a pre-erasure archive, linked closeout evidence, tamper refusal, and retained peer Mail and Calendar over TLS.")
