@@ -1,5 +1,6 @@
 //! Reconcile one reserved mailbox's external search before draining its index work.
 const std = @import("std");
+const env = @import("../core/env.zig");
 const Database = @import("database.zig").Database;
 const local = @import("hosted_erasure_search.zig");
 const maildir = @import("hosted_erasure_maildir.zig");
@@ -9,6 +10,7 @@ const typesense = @import("../search/typesense_erasure.zig");
 
 pub const Endpoint = typesense.Endpoint;
 const Allocator = std.mem.Allocator;
+const CollectionReceipt = [typesense.names.len]struct { name: []const u8, created_at: ?i64 };
 const Collections = [typesense.names.len]?typesense.Collection;
 
 const Receipt = struct {
@@ -19,7 +21,7 @@ const Receipt = struct {
     start_audit_id: i64,
     audit_id: i64,
     endpoint: []const u8,
-    collections: [typesense.names.len]struct { name: []const u8, created_at: ?i64 },
+    collections: CollectionReceipt,
 };
 
 fn requireScope(a: Allocator, io: std.Io, tx: Database.Transaction, root: std.Io.Dir, review: review_store.Review, start_id: i64) !i64 {
@@ -79,6 +81,53 @@ fn verifyEmpty(collections: Collections, selected: typesense.Stamps) !void {
         if (current_stamp != stamp) return error.ErasureTypesenseCollectionChanged;
         if (current) |present| if (present.ids.items.len != 0) return error.ErasureTypesenseDocumentsRemain;
     }
+}
+
+pub fn requireVerified(a: Allocator, io: std.Io, tx: Database.Transaction, review: review_store.Review, start: i64, owner: i64) !?i64 {
+    const row = try tx.prepare(
+        \\SELECT s.endpoint,s.collection_stamps,a.id
+        \\FROM hosted_erasure_typesense_steps s LEFT JOIN audit_log a ON a.id=s.completion_audit_id
+        \\AND a.action='hosted.erasure.typesense.removed' AND a.target=?2 AND a.target_type='hosted_mailbox'
+        \\AND json_extract(a.details,'$.start_audit_id')=s.start_audit_id
+        \\AND json_extract(a.details,'$.request_id')=?3 AND json_extract(a.details,'$.endpoint')=s.endpoint
+        \\AND json_extract(a.details,'$.collections')=s.collection_stamps
+        \\WHERE s.start_audit_id=?1
+    );
+    defer row.finalize();
+    try row.bind(1, start);
+    try row.bind(2, review.mailbox);
+    try row.bind(3, review.request_id);
+    const recent = try row.step();
+    const active = env.get("TYPESENSE_API_KEY") orelse "";
+    const has_config = active.len != 0 or env.get("TYPESENSE_HOST") != null or env.get("TYPESENSE_PORT") != null;
+    if (!recent and !has_config) {
+        try verifyWorkRemoved(tx, owner);
+        return null;
+    }
+    if (!recent or row.columnIsNull(2)) return error.ErasureTypesensePending;
+    if (active.len == 0) return error.ErasureTypesenseUnavailable;
+    const endpoint: Endpoint = .{
+        .host = env.get("TYPESENSE_HOST") orelse "127.0.0.1",
+        .port = std.fmt.parseInt(u16, env.get("TYPESENSE_PORT") orelse "8108", 10) catch return error.ErasureTypesenseEndpointMismatch,
+    };
+    const origin = try std.fmt.allocPrint(a, "{s}:{d}", .{ endpoint.host, endpoint.port });
+    if (!std.mem.eql(u8, origin, row.columnText(0))) return error.ErasureTypesenseEndpointMismatch;
+    const service = try typesense.Service.reviewed(endpoint);
+    try typesense.validateMailbox(review.mailbox);
+    const recorded = try std.json.parseFromSliceLeaky(CollectionReceipt, a, row.columnText(1), .{});
+    var client: std.http.Client = .{ .allocator = a, .io = io };
+    defer client.deinit();
+    try service.verifyService(a, &client);
+    var current: Collections = undefined;
+    var expected: typesense.Stamps = undefined;
+    for (typesense.names, recorded, 0..) |name, proof, index| {
+        if (!std.mem.eql(u8, name, proof.name)) return error.InvalidErasureJournal;
+        current[index] = try service.inspect(a, &client, name, review.mailbox);
+        expected[index] = proof.created_at;
+    }
+    try verifyEmpty(current, expected);
+    try verifyWorkRemoved(tx, owner);
+    return row.columnInt64(2);
 }
 
 pub fn erase(a: Allocator, io: std.Io, db: *Database, review: review_store.Review, start_id: i64, operator: []const u8, mail_root: []const u8, endpoint: Endpoint) !Receipt {

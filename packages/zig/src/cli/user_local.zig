@@ -18,6 +18,7 @@ const erasure_typesense = @import("../storage/hosted_erasure_typesense.zig");
 const erasure_dav = @import("../storage/hosted_erasure_dav.zig");
 const erasure_shared_sqlite = @import("../storage/hosted_erasure_shared_sqlite.zig");
 const erasure_shared = @import("../storage/hosted_erasure_shared.zig");
+const erasure_closeout = @import("../storage/hosted_erasure_closeout.zig");
 const erasure_content = @import("../storage/hosted_erasure_content.zig");
 const erasure_links = @import("../storage/hosted_erasure_links.zig");
 const erasure_sqlite = @import("../storage/hosted_erasure_sqlite.zig");
@@ -350,6 +351,12 @@ fn hostedErasureContentAction(ctx: *cli.BaseCommand.ParseContext) !void {
     try hostedErasureApproval(ctx, .{ .content = audit_id });
 }
 
+fn hostedErasureCloseoutAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const start = ctx.getArgument(1) orelse return error.MissingArgument;
+    const id = std.fmt.parseInt(i64, start, 10) catch return error.InvalidErasureStartAuditId;
+    try hostedErasureApproval(ctx, .{ .closeout = .{ .start_id = id, .decision_path = ctx.getArgument(2) } });
+}
+
 fn hostedErasureSharedAction(ctx: *cli.BaseCommand.ParseContext) !void {
     const audit = ctx.getArgument(1) orelse return error.MissingArgument;
     const audit_id = std.fmt.parseInt(i64, audit, 10) catch return error.InvalidErasureStartAuditId;
@@ -379,6 +386,7 @@ const ErasureOperation = union(enum) {
     sqlite: i64,
     links: i64,
     content: i64,
+    closeout: struct { start_id: i64, decision_path: ?[]const u8 },
     shared_sqlite: struct { start_id: i64, decision_path: ?[]const u8 },
     shared: struct { start_id: i64, store: erasure_shared.Store, decision_path: ?[]const u8 },
     typesense: struct { start_id: i64, endpoint: erasure_typesense.Endpoint },
@@ -415,6 +423,16 @@ fn hostedErasureApproval(ctx: *cli.BaseCommand.ParseContext, operation: ErasureO
         .links => |id| try std.json.Stringify.value(try erasure_links.erase(a, io, &db, review, id, operator, mail_root), format, &output.interface),
         .search => |id| try std.json.Stringify.value(try erasure_search.erase(a, io, &db, review, id, operator, mail_root), format, &output.interface),
         .content => |id| try std.json.Stringify.value(try erasure_content.erase(a, io, &db, review, id, operator, mail_root), format, &output.interface),
+        .closeout => |step| {
+            const decision = if (step.decision_path) |path| try std.json.parseFromSliceLeaky(
+                erasure_closeout.Decision,
+                a,
+                try readPrivateReview(a, io, path, error.ErasureCloseoutDecisionNotPrivate),
+                .{},
+            ) else null;
+            const result = try erasure_closeout.reconcile(a, io, &db, review, step.start_id, operator, mail_root, dav_path, decision);
+            try std.json.Stringify.value(result, format, &output.interface);
+        },
         .shared_sqlite => |step| {
             const decision = if (step.decision_path) |path| try std.json.parseFromSliceLeaky(
                 erasure_shared_sqlite.Decision,
@@ -703,6 +721,13 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try erasure_content_cmd.addArgument(cli.Argument.init("start-audit-id", "Audit ID of the reserved erasure", .string).withRequired(true));
     _ = erasure_content_cmd.setAction(hostedErasureContentAction);
     _ = try cmd.addCommand(erasure_content_cmd);
+
+    const closeout_cmd = try cli.BaseCommand.init(allocator, "hosted-erasure-closeout", "Verify the case and record approved dispositions for remaining evidence");
+    _ = try closeout_cmd.addArgument(cli.Argument.init("review", "Private erasure review", .string));
+    _ = try closeout_cmd.addArgument(cli.Argument.init("start-id", "Audit ID of the erasure reservation", .string));
+    _ = try closeout_cmd.addArgument(cli.Argument.init("decision", "Private approved closeout decision", .string).withRequired(false));
+    _ = closeout_cmd.setAction(hostedErasureCloseoutAction);
+    _ = try cmd.addCommand(closeout_cmd);
 
     const export_cmd = try cli.BaseCommand.init(allocator, "export", "Export a mailbox to a portable TAR archive");
     _ = try export_cmd.addArgument(cli.Argument.init("username", "Canonical mailbox username", .string));

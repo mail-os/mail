@@ -237,6 +237,7 @@ jobs:
         python3 ../../scripts/test-hosted-erasure-sqlite.py zig-out/bin/mail
         python3 ../../scripts/test-hosted-erasure-links.py zig-out/bin/mail
         python3 ../../scripts/test-hosted-erasure-private-content.py zig-out/bin/mail
+        python3 ../../scripts/test-hosted-erasure-closeout.py zig-out/bin/mail
         python3 ../../scripts/test-hosted-erasure-restore.py zig-out/bin/mail
         python3 ../../scripts/test-hosted-erasure-replay.py zig-out/bin/mail
         python3 ../../scripts/test-hosted-erasure-shared-release.py zig-out/bin/mail
@@ -270,6 +271,7 @@ jobs:
         printf '%s  %s\n' cd791605e7c6cc7be457794f534cd4b9f9d361781adb10e40020efc22840ebc3 "$archive" | sha256sum --check
         tar -xzf "$archive" -C "$fixture" typesense-server
         python3 scripts/test-hosted-erasure-typesense.py packages/zig/zig-out/bin/mail --typesense-server "$fixture/typesense-server"
+        python3 scripts/test-hosted-erasure-closeout.py packages/zig/zig-out/bin/mail --typesense-server "$fixture/typesense-server"
 
     - name: Verify outbound DKIM configuration and signing
       run: python3 ../../scripts/test-outbound-dkim.py zig-out/bin/mail

@@ -172,6 +172,33 @@ pub fn verifyRemoved(a: Allocator, tx: Database.Transaction, mailbox: []const u8
     if (!try orphans.step() or orphans.columnInt64(0) != 0) return error.ErasureDavRecordsRemain;
 }
 
+pub fn requireVerified(a: Allocator, io: std.Io, authority: Database.Transaction, review: review_store.Review, start: i64, owner: i64, configured: ?[]const u8) !?i64 {
+    const path = configured orelse "./caldav.db";
+    const reviewed = try review_store.reviewedDav(a, authority, review);
+    const stamp = inventory.davStoreStamp(a, io, path) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (configured == null and reviewed.state == .not_configured) return null;
+            return error.ErasureDavPending;
+        },
+        else => return err,
+    };
+    const plan = (try loadPlan(a, authority, review, start, stamp)) orelse return error.ErasureDavPending;
+    if (reviewed.owner_id != null and reviewed.owner_id != plan.owner_id) return error.ErasureDavOwnerUnresolved;
+    const complete = plan.completion orelse return error.ErasureDavPending;
+    var db = try Database.openReadOnly(a, path);
+    defer db.deinit();
+    var tx = try db.beginTransaction(.read);
+    defer tx.deinit();
+    try verifyStamp(a, io, path, stamp);
+    try requireKnownTables(tx);
+    const marker = (try loadMarker(a, tx, owner, plan)) orelse return error.ErasureDavReceiptMissing;
+    if (marker.copy_proof) |proof| try shared.requireRecordedCalendarProof(a, authority, review, start, owner, proof);
+    const at = std.mem.indexOfScalar(u8, review.mailbox, '@') orelse return error.InvalidErasureMailbox;
+    try verifyRemoved(a, tx, review.mailbox, owner, review.mailbox[0..at], plan.owner_id);
+    try verifyStamp(a, io, path, stamp);
+    return complete;
+}
+
 pub fn erase(a: Allocator, io: std.Io, db: *Database, review: review_store.Review, start_id: i64, operator: []const u8, mail_root: []const u8, configured_path: []const u8, confirmed_path: []const u8) !Receipt {
     try review.validate();
     if (start_id < 1) return error.InvalidErasureStartAuditId;

@@ -1,5 +1,6 @@
 //! Remove live mailbox-private content and record the data that still needs disposition.
 const std = @import("std");
+const native_sqlite = @import("sqlite");
 const database = @import("database.zig");
 const links = @import("hosted_erasure_links.zig");
 const maildir = @import("hosted_erasure_maildir.zig");
@@ -13,7 +14,7 @@ const Allocator = std.mem.Allocator;
 const Tx = database.Database.Transaction;
 const action = "hosted.erasure.sqlite.content.removed";
 const Count = struct { table: []const u8, rows: i64 };
-const Proofs = struct {
+pub const Proofs = struct {
     maildir: i64,
     local_search: i64,
     private_sqlite: i64,
@@ -25,7 +26,7 @@ const Record = struct {
     removed: []const Count,
     retained_at_commit: []const Count,
 };
-const Receipt = struct {
+pub const Receipt = struct {
     version: u8 = 1,
     state: []const u8 = "private_content_removed_retention_pending",
     mailbox: []const u8,
@@ -121,6 +122,63 @@ const retained = [_]Scope{
     .{ .table = "users", .where = "id=?1" },
 };
 
+// Additional identified records that can outlive live message removal.
+const closeout_retained = [_]Scope{
+    .{ .table = "provisioning_operations", .where = "mailbox=?1", .key = .mailbox },
+    .{ .table = "audit_log", .where = "target=?1 AND target_type='hosted_mailbox' AND action<>'hosted.erasure.closeout.recorded'", .key = .mailbox },
+    .{ .table = "hosted_mailbox_activity" },
+    .{ .table = "hosted_sending_holds" },
+    .{ .table = "hosted_retired_mailboxes" },
+    .{ .table = "mail_calendar_revisions" },
+    .{ .table = "mail_team_owner_handoffs", .where = "departing=?1 OR successor=?1", .key = .mailbox },
+    .{ .table = "mail_team_invitations", .where = "inviter_id=?1 OR recipient_id=?1" },
+    .{ .table = "mail_team_calendar_share_epochs", .where = "source_id=?1 OR grantee_id=?1" },
+    .{ .table = "mail_team_thread_comments", .where = "author_id=?1" },
+    .{ .table = "mail_team_thread_submissions", .where = "owner_id=?1" },
+    .{ .table = "mail_team_thread_native_sent", .where = "delivery_id IN (SELECT delivery_id FROM mail_team_thread_submissions WHERE owner_id=?1)" },
+    .{ .table = "mail_team_smtp_submissions", .where = "owner_id=?1" },
+    .{ .table = "mail_team_smtp_sent_copies", .where = "owner_id=?1" },
+};
+
+pub const Retained = struct {
+    table: []const u8,
+    rows: usize,
+    sha256: [64]u8,
+};
+
+pub fn snapshotRetained(a: Allocator, tx: Tx, owner: i64, mailbox: []const u8) ![]const Retained {
+    var remaining: std.ArrayList(Retained) = .empty;
+    inline for (retained ++ closeout_retained) |scope| {
+        if (!scope.optional or try hasTable(tx, scope.table)) {
+            const row = try tx.prepare("SELECT * FROM " ++ scope.table ++ " WHERE " ++ scope.where ++ " ORDER BY rowid");
+            defer row.finalize();
+            try bind(row, scope, owner, mailbox);
+            const columns: usize = @intCast(native_sqlite.sqlite3_column_count(row.stmt));
+            var count_rows: usize = 0;
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            hash.update(scope.table);
+            while (try row.step()) {
+                count_rows += 1;
+                for (0..columns) |column| {
+                    const kind: u8 = @intCast(native_sqlite.sqlite3_column_type(row.stmt, @intCast(column)));
+                    const value = row.columnBlob(column);
+                    var size: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &size, value.len, .big);
+                    hash.update(&.{kind});
+                    hash.update(&size);
+                    hash.update(value);
+                }
+            }
+            if (count_rows != 0) try remaining.append(a, .{
+                .table = scope.table,
+                .rows = count_rows,
+                .sha256 = std.fmt.bytesToHex(hash.finalResult(), .lower),
+            });
+        }
+    }
+    return remaining.toOwnedSlice(a);
+}
+
 fn bind(row: database.Statement, comptime scope: Scope, owner: i64, mailbox: []const u8) !void {
     switch (scope.key) {
         .owner => try row.bind(1, owner),
@@ -197,18 +255,7 @@ pub fn verifyRemoved(tx: Tx, owner: i64, mailbox: []const u8) !void {
     }
 }
 
-pub fn erase(a: Allocator, io: std.Io, db: *database.Database, review: review_store.Review, start: i64, operator: []const u8, mail_root: []const u8) !Receipt {
-    try review.validate();
-    if (start < 1) return error.InvalidErasureStartAuditId;
-    var root = try maildir.openLockedRoot(a, io, mail_root);
-    defer root.close(io);
-
-    try db.exec("PRAGMA secure_delete=ON; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON");
-    var tx = try db.beginTransaction(.write);
-    defer tx.deinit();
-    const now = time.timestamp();
-    const observation = try review_store.requireStarted(a, tx, review, start, now);
-    const owner = observation.identity.native_user_id;
+fn prerequisites(a: Allocator, io: std.Io, tx: Tx, root: std.Io.Dir, review: review_store.Review, start: i64, owner: i64) !Proofs {
     try review_store.verifyLocalOperationsDrained(tx, owner);
     try maildir.requireRemoved(a, io, tx, root, review.mailbox, start);
     try search.requireRemoved(tx, review, start, owner);
@@ -223,6 +270,29 @@ pub fn erase(a: Allocator, io: std.Io, db: *database.Database, review: review_st
     if (try hasTable(tx, "webmail_uploads") and !try hasTable(tx, "webmail_records"))
         return error.ErasureWebmailSchemaIncomplete;
 
+    return proofs;
+}
+
+pub fn requireVerified(a: Allocator, io: std.Io, tx: Tx, root: std.Io.Dir, review: review_store.Review, start: i64, owner: i64) !Receipt {
+    const proofs = try prerequisites(a, io, tx, root, review, start, owner);
+    const receipt = (try prior(a, tx, review, start, owner, proofs)) orelse return error.ErasurePrivateContentPending;
+    try verifyRemoved(tx, owner, review.mailbox);
+    return receipt;
+}
+
+pub fn erase(a: Allocator, io: std.Io, db: *database.Database, review: review_store.Review, start: i64, operator: []const u8, mail_root: []const u8) !Receipt {
+    try review.validate();
+    if (start < 1) return error.InvalidErasureStartAuditId;
+    var root = try maildir.openLockedRoot(a, io, mail_root);
+    defer root.close(io);
+
+    try db.exec("PRAGMA secure_delete=ON; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON");
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const now = time.timestamp();
+    const observation = try review_store.requireStarted(a, tx, review, start, now);
+    const owner = observation.identity.native_user_id;
+    const proofs = try prerequisites(a, io, tx, root, review, start, owner);
     if (try prior(a, tx, review, start, owner, proofs)) |receipt| {
         try verifyRemoved(tx, owner, review.mailbox);
         try tx.commit();

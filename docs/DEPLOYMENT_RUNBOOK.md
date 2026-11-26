@@ -863,6 +863,58 @@ and historical pages, backups and restoration, billing, and support.
 Run `python3 scripts/test-hosted-erasure-private-content.py /path/to/mail`
 to verify the disposable TLS case, including audit rollback and peer access.
 
+### Record the hosted erasure closeout
+
+Keep Mail stopped and use the same working directory, database paths,
+search configuration, private review and start audit ID. Run the
+closeout without a decision to verify the recorded Maildir, search,
+SQLite, shared-record, linked-session and private-content steps. It
+also checks the current DAV and Typesense stores when configured.
+
+```sh
+umask 077
+mail user:local hosted-erasure-closeout /secure/review.json START_AUDIT_ID \
+  > /secure/closeout-scope.json
+```
+
+The scope lists the native audit IDs, retained SQLite tables with scoped
+counts and digests, and tables that require a separate ownership review.
+It includes only fingerprints of retained rows. Inspect the local and
+external stores listed in the approved case before recording a decision.
+
+Use a private JSON file with version 1, the reported `scope_sha256` and a
+unique `approval_reference`. Include `external_search_reference` and
+`sqlite_scope_reference` for the evidence covering independently operated
+search and unmapped SQLite tables. Record dispositions for `sqlite_history`,
+`hosted_billing`, `support_records` and `backups.disposition`.
+Each disposition has a `state` and evidence `reference`. Use `removed`,
+`retention_required` or `retained_until`. An expiring disposition requires a
+future `retain_until` timestamp in Unix seconds.
+
+Include `backups.retained_snapshots` and, when any snapshots remain, a
+`backups.restore_verification_reference` to the older-snapshot verification
+record. In `retained_records`, list each table from the verified scope once
+with its `table` and retention `disposition`. Use the approved evidence for
+required audit records and remaining delivery, team or reservation data.
+Match the recorded scope to decisions from the operators responsible for
+the backup catalog, storage history, billing and support.
+
+```sh
+mail user:local hosted-erasure-closeout /secure/review.json START_AUDIT_ID \
+  /secure/closeout-decision.json > /secure/closeout-receipt.json
+```
+
+The final transaction rechecks the scope, records one audit entry and issues
+a receipt with the native verification and external evidence references.
+An identical retry returns the same receipt on the same scope. A changed
+retained row, missing deletion proof or returned live data blocks that
+approval. The recorded retention dates apply to the named evidence. Recheck
+the affected stores and obtain a current decision when a scope changes.
+
+Run `python3 scripts/test-hosted-erasure-closeout.py /path/to/mail` with
+disposable TLS mailboxes and an actual backup archive. Add
+`--typesense-server /path/to/typesense-server` for the external search case.
+
 ### Check hosted erasure before restoring Mail
 
 Extract the backup into isolated storage. Run the portable message identity
