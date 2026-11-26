@@ -340,9 +340,25 @@ jobs:
       with:
         context: ./packages/zig
         push: false
+        load: true
         tags: mail:test
         cache-from: type=gha
         cache-to: type=gha,mode=max
+
+    - name: Verify the container starts with its persistent data directory
+      timeout-minutes: 2
+      run: |
+        set -euo pipefail
+        docker run --detach --name mail-writer-ci --network none mail:test
+        trap 'docker logs mail-writer-ci; docker rm -f mail-writer-ci' EXIT
+        for _ in $(seq 1 30); do
+          if docker exec mail-writer-ci nc -z 127.0.0.1 2525; then
+            docker exec mail-writer-ci sh -ec 'test -d /var/mail/mail && test -s /var/mail/users.db'
+            exit 0
+          fi
+          sleep 1
+        done
+        exit 1
 
   lint:
     name: Lint

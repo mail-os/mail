@@ -235,15 +235,18 @@ class Fixture(MailClient):
             self.ews_url = f"https://127.0.0.1:{dav_tls}/EWS/Exchange.asmx"
         self.specs = {}
 
+    def daemon_command(self):
+        command = [str(self.binary), "serve", "--host", "127.0.0.1", "--port",
+                   str(self.smtp_port), "--enable-auth"]
+        if self.tls_context is None:
+            command.append("--disable-tls")
+        return command
+
     @contextmanager
     def daemon(self):
         log_path = self.directory / f"mail-{secrets.token_hex(4)}.log"
         with log_path.open("w") as log:
-            daemon = subprocess.Popen(
-                [str(self.binary), "serve", "--host", "127.0.0.1", "--port",
-                 str(self.smtp_port), "--enable-auth"] + (["--disable-tls"] if self.tls_context is None else []),
-                cwd=self.directory, env=self.env, stdout=log, stderr=log,
-            )
+            daemon = subprocess.Popen(self.daemon_command(), cwd=self.directory, env=self.env, stdout=log, stderr=log)
             try:
                 for _ in range(100):
                     if daemon.poll() is not None:
