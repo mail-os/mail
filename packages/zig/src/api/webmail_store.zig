@@ -381,7 +381,11 @@ pub fn remove(db: *database.Database, user: []const u8, kind: []const u8, id: []
 
 /// Atomic claim also works when two HTTP listeners share the database.
 pub fn claimDue(allocator: std.mem.Allocator, db: *database.Database, now: i64) !?Record {
-    const s = try db.prepare(
+    // Keep the RETURNING cursor inside the transaction so other requests
+    // cannot start a write transaction on this connection before it finishes.
+    var tx = try db.beginTransaction(.write);
+    defer tx.deinit();
+    const s = try tx.prepare(
         \\UPDATE webmail_records SET state='sending',revision=revision+1
         \\WHERE rowid=(SELECT r.rowid FROM webmail_records r WHERE kind='outbox' AND state='pending' AND due_at<=?1
         \\AND NOT EXISTS (SELECT 1 FROM mailbox_message_refs m JOIN users u ON u.id=m.user_id
@@ -394,9 +398,12 @@ pub fn claimDue(allocator: std.mem.Allocator, db: *database.Database, now: i64) 
     );
     defer s.finalize();
     try s.bind(1, now);
-    if (!try s.step()) return null;
-    const row = try readRecord(allocator, s);
-    _ = try s.step();
+    const row: ?Record = if (try s.step()) claimed: {
+        const record = try readRecord(allocator, s);
+        _ = try s.step();
+        break :claimed record;
+    } else null;
+    try tx.commit();
     return row;
 }
 
@@ -638,6 +645,9 @@ test "draft revisions, queued-send claims and cancellation are account-scoped" {
     send.id = "2234567890123456";
     _ = try put(&db, send, 0);
     try t.expectError(StoreError.Conflict, cancelSend(a, &db, send.username, send.id, 110));
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try t.expectError(error.OutOfMemory, claimDue(failing.allocator(), &db, 110));
+    try t.expectEqualStrings("pending", (try get(a, &db, send.username, "outbox", send.id)).state);
     try t.expectEqualStrings("sending", (try claimDue(a, &db, 110)).?.state);
     try t.expect(try claimDue(a, &db, 110) == null);
     try recoverInterrupted(&db);
