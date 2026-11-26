@@ -10,6 +10,7 @@ const calendar_workflow = @import("../storage/calendar_workflow_transfer.zig");
 const hosted_limits = @import("../storage/hosted_limits.zig");
 const erasure_preflight = @import("../storage/hosted_erasure_preflight.zig");
 const erasure_export = @import("../storage/hosted_erasure_export.zig");
+const erasure_inventory = @import("../storage/hosted_erasure_inventory.zig");
 const io_compat = @import("../core/io_compat.zig");
 const time = @import("../core/time_compat.zig");
 
@@ -142,6 +143,36 @@ fn hostedErasurePreflightAction(ctx: *cli.BaseCommand.ParseContext) !void {
         .case_reference = case_reference,
         .observed_at = now,
         .observation = observation,
+        .audit_id = audit_id,
+    }, .{ .whitespace = .indent_2 }, &output.interface);
+    try output.interface.writeByte('\n');
+    try output.interface.flush();
+}
+
+fn hostedErasureInventoryAction(ctx: *cli.BaseCommand.ParseContext) !void {
+    const mailbox = ctx.getArgument(0) orelse return error.MissingArgument;
+    const expected_actor = ctx.getArgument(1) orelse return error.MissingArgument;
+    const case_reference = ctx.getArgument(2) orelse return error.MissingArgument;
+    if (!erasure_preflight.validCaseReference(case_reference)) return error.InvalidCaseReference;
+
+    const io = io_compat.getIo();
+    var db = try database.Database.openReadWriteExisting(ctx.allocator, env.get("SMTP_DB_PATH") orelse "./smtp.db");
+    defer db.deinit();
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const inventory = try erasure_inventory.collect(a, io, &db, mailbox, expected_actor, env.get("MAIL_ROOT") orelse "mail", env.get("CALDAV_DB_PATH"));
+    var actor_buffer: [64]u8 = undefined;
+    const operator = try std.fmt.bufPrint(&actor_buffer, "local-operator:{d}", .{std.c.geteuid()});
+    const audit_id = try erasure_inventory.record(a, &db, inventory, mailbox, expected_actor, operator, case_reference);
+
+    var buffer: [4096]u8 = undefined;
+    var output = std.Io.File.stdout().writerStreaming(io, &buffer);
+    try std.json.Stringify.value(.{
+        .version = @as(u8, 1),
+        .mailbox = mailbox,
+        .case_reference = case_reference,
+        .inventory = inventory,
         .audit_id = audit_id,
     }, .{ .whitespace = .indent_2 }, &output.interface);
     try output.interface.writeByte('\n');
@@ -370,6 +401,13 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try preflight_cmd.addArgument(cli.Argument.init("case-reference", "Non-sensitive erasure case identifier", .string).withRequired(true));
     _ = preflight_cmd.setAction(hostedErasurePreflightAction);
     _ = try cmd.addCommand(preflight_cmd);
+
+    const inventory_cmd = try cli.BaseCommand.init(allocator, "hosted-erasure-inventory", "Audit retained Mail stores for a hosted erasure review");
+    _ = try inventory_cmd.addArgument(cli.Argument.init("username", "Canonical hosted mailbox username", .string).withRequired(true));
+    _ = try inventory_cmd.addArgument(cli.Argument.init("actor", "Expected provisioning assignment", .string).withRequired(true));
+    _ = try inventory_cmd.addArgument(cli.Argument.init("case", "Private support case reference", .string).withRequired(true));
+    _ = inventory_cmd.setAction(hostedErasureInventoryAction);
+    _ = try cmd.addCommand(inventory_cmd);
 
     const sending_hold_cmd = try cli.BaseCommand.init(allocator, "hosted-sending-hold", "Place or release an audited sending hold on a hosted mailbox");
     _ = try sending_hold_cmd.addArgument(cli.Argument.init("username", "Canonical hosted mailbox username", .string).withRequired(true));

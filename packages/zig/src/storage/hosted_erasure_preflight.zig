@@ -6,6 +6,13 @@ pub const Identity = struct {
     native_user_id: i64,
     initial_provisioning_operation: ?[]const u8,
     provisioning_revision: i64,
+
+    pub fn eql(self: Identity, other: Identity) bool {
+        if (self.native_user_id != other.native_user_id or self.provisioning_revision != other.provisioning_revision) return false;
+        const first = self.initial_provisioning_operation orelse return other.initial_provisioning_operation == null;
+        const second = other.initial_provisioning_operation orelse return false;
+        return std.mem.eql(u8, first, second);
+    }
 };
 
 const Access = struct {

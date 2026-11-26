@@ -346,6 +346,47 @@ review its digest and audit entry before retrying with a new path. The command
 preserves an existing destination. Keep the source mailbox and backup evidence
 available for the retention and erasure review in [#188](https://github.com/mail-os/mail/issues/188).
 
+### Inventory retained stores before an erasure decision
+
+Run the inventory from the daemon’s working directory using the same
+`SMTP_DB_PATH`, `MAIL_ROOT`, and `CALDAV_DB_PATH`. Supply the same assignment
+actor and case as preflight. Keep the report in the private case directory.
+
+```bash
+umask 077
+/opt/mail/mail-server user:local hosted-erasure-inventory \
+  alice@customer.example.com mailbox-assignment-actor exit-case-19 \
+  > /private/exit-case-19/inventory.json
+```
+
+- `maildir` reports the canonical directory’s regular files and logical file
+  bytes, including temporary files and hidden entries. It counts symbolic
+  links without following them and flags a surviving short-name path for
+  ownership review. `absent` refers to the configured location. `unavailable`
+  means a full count could not be made.
+- `sqlite.tables` counts owner rows and rows matched through known shared-store
+  relationships. A `null` count marks an unavailable schema or ownership key.
+  Zero means the query found no matching rows. `unscoped_tables` lists tables
+  without an attribution query. Review those tables, derived search state,
+  old delivery records, and all cross-mailbox dependencies before removal.
+  A shared match may include records that another mailbox still needs.
+- `dav` maps calendars, contacts, and related rows by durable native mailbox ID.
+  `legacy_name_candidates` lists a count of possible name matches for manual
+  ownership verification. `legacy_owner_unresolved`, `missing`, and
+  `unavailable` require review. `not_configured` means the command received no
+  explicit DAV path and found no file at the default path.
+- `external_evidence_required` lists support and retention, external search,
+  backup inventory, and hosted billing evidence to collect from their owning
+  systems. The command also leaves these sources in the review when it finds
+  no related native records.
+
+The command opens the existing SQLite files without migrating them. It commits
+an audit record with the observed counts and assignment before printing the
+report. Counts reflect separate store observations, so take another inventory
+from quiesced stores before relying on cross-store totals. Compare restored
+copies with the current provisioning assignment and reconcile each outstanding
+store under [#188](https://github.com/mail-os/mail/issues/188).
+
 ## Local mailbox directory upgrade
 
 Back up the Maildir and SQLite database together before upgrading a server with older ActiveSync clients. On startup, the server checks for full-address local accounts that still have mail under a short directory name such as `mail/alice`. It moves eligible messages to `mail/alice@example.com` before opening the protocol listeners. It also moves messages in a canonical custom folder's nested slots into the folder path exposed by IMAP and webmail. ActiveSync, IMAP, webmail, and EWS then read from the canonical mailbox. The upgrade retains existing message flags and client identifiers when it can reconcile both directories.

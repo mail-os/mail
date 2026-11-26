@@ -40,11 +40,7 @@ fn validateAssignment(a: std.mem.Allocator, tx: Database.Transaction, review: Re
     if (review.expires_at <= now) return error.InvalidExportExpiry;
     const assignment = try preflight.identify(a, tx, review.mailbox, review.assignment_actor, now);
     const actual = assignment.identity;
-    const initial = actual.initial_provisioning_operation orelse return error.AssignmentChanged;
-    const expected = review.identity.initial_provisioning_operation orelse return error.AssignmentChanged;
-    if (actual.native_user_id != review.identity.native_user_id or
-        actual.provisioning_revision != review.identity.provisioning_revision or
-        !std.mem.eql(u8, initial, expected)) return error.AssignmentChanged;
+    if (actual.initial_provisioning_operation == null or !actual.eql(review.identity)) return error.AssignmentChanged;
     if (assignment.access.state.readable()) return error.MailboxStillReadable;
 }
 

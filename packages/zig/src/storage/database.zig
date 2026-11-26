@@ -271,6 +271,14 @@ pub const Database = struct {
         return database;
     }
 
+    /// Open an existing database for operator audit without migrating its schema.
+    pub fn openReadWriteExisting(allocator: std.mem.Allocator, db_path: []const u8) !Database {
+        var database = try open(allocator, db_path, sqlite.SQLITE_OPEN_READWRITE);
+        errdefer database.deinit();
+        try database.exec("PRAGMA busy_timeout=5000;");
+        return database;
+    }
+
     pub fn openReadOnly(allocator: std.mem.Allocator, db_path: []const u8) !Database {
         var database = try open(allocator, db_path, sqlite.SQLITE_OPEN_READONLY);
         errdefer database.deinit();
