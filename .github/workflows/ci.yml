@@ -349,6 +349,23 @@ jobs:
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
+    - name: Verify the Alpine Mail daemon and its SMTP health check
+      timeout-minutes: 2
+      shell: bash
+      run: |
+        set -euo pipefail
+        container=$(docker run --detach --network none mail:test)
+        trap 'docker logs "$container"; docker rm -f "$container"' EXIT
+        for _ in $(seq 1 50); do
+          [[ $(docker inspect --format '{{.State.Running}}' "$container") == true ]] || exit 1
+          if [[ $(docker inspect --format '{{.State.Health.Status}}' "$container") == healthy ]]; then
+            docker exec "$container" sh -ec 'test "$PWD" = /var/mail && test -s /var/mail/users.db'
+            exit 0
+          fi
+          sleep 1
+        done
+        exit 1
+
     - name: Verify Compose monitoring follows the active Mail daemon
       timeout-minutes: 5
       env:

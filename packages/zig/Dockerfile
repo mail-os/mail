@@ -27,8 +27,8 @@ WORKDIR /build
 # Copy source code
 COPY . .
 
-# Build the application in release mode
-RUN zig build -Doptimize=ReleaseSafe
+# Use Zig's bundled musl so newer toolchain symbols are available at runtime.
+RUN zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
 
 # Stage 2: Create minimal runtime image
 FROM alpine:3.19
@@ -77,7 +77,7 @@ ENV SMTP_HOST=0.0.0.0 \
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD nc -z localhost ${SMTP_PORT} || exit 1
+    CMD printf 'QUIT\r\n' | nc -w 2 127.0.0.1 "$SMTP_PORT" | grep -q '^220 '
 
 # Run the mail server
 CMD ["/usr/local/bin/mail", "serve"]
