@@ -127,6 +127,39 @@ class HealthTests(unittest.TestCase):
             self.assertEqual(state['active'], [])
             self.assertEqual(state['pending'][-1]['status'], 'healthy')
 
+    def test_hosted_monitor_loses_configuration_without_recovering_incidents(self):
+        now = 2000
+        name = watch.HOSTED_CHECKS['billing_reconciliation']
+        monitor = {'name': watch.HOSTED_MONITOR_CHECK, 'ok': False}
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            env = root / 'env'
+            env.write_text('')
+            self.assertEqual(watch.hosted_checks(env, {}, now), [])
+
+            report = {'schema': 1, 'checked_at': now, 'checks': {
+                key: {'status': 'healthy'} for key in watch.HOSTED_CHECKS
+            }}
+            state_path = root / 'state.json'
+            for prior in ([], [name], [watch.HOSTED_MONITOR_CHECK]):
+                with self.subTest(prior=prior):
+                    watch.atomic_json(state_path, {'hosted_monitor_configured': True, 'active': prior}, 0o600)
+                    state = watch.load_state(state_path)
+                    checks = watch.hosted_checks(env, state, now)
+                    self.assertEqual(checks, [monitor] + ([{'name': name, 'ok': False}] if name in prior else []))
+                    self.assertTrue(state['hosted_monitor_configured'])
+
+            env.write_text('MAIL_APP_OPERATIONS_URL=http://127.0.0.1:8080/api/operations/health\n'
+                           + 'MAIL_OPERATIONS_TOKEN=' + 'a' * 64 + '\n')
+            report['checks']['billing_reconciliation'] = {'status': 'disabled'}
+            with patch.object(watch, 'read_hosted_report', return_value=report):
+                disabled = watch.hosted_checks(env, {'active': [name]}, now)
+                never_opened = watch.hosted_checks(env, {'active': []}, now)
+            self.assertIn(monitor, disabled)
+            self.assertIn({'name': name, 'ok': False}, disabled)
+            self.assertIn({'name': watch.HOSTED_MONITOR_CHECK, 'ok': True}, never_opened)
+            self.assertNotIn(name, {check['name'] for check in never_opened})
+
     def test_hosted_bearer_stays_with_the_configured_endpoint(self):
         requests = []
         token = 'a' * 64

@@ -24,12 +24,24 @@ fixtures = runpy.run_path(str(scripts / "test-hosted-limits.py"))
 watch = runpy.run_path(str(scripts / "mail-health-watch.py"))
 Fixture, smtp_message = fixtures["Fixture"], fixtures["smtp_message"]
 WEBHOOK = "https://discord.com/api/webhooks/disposable"
+OPERATIONS_PATH = "/api/operations/health"
+OPERATIONS_TOKEN = "a" * 64
 GOOD = "recipient@success.example.test"
 WAITING = "recipient@delayed.example.test"
 FAILED = "recipient@refusal.example.test"
 
 
 class Receiver(BaseHTTPRequestHandler):
+    def do_GET(self):
+        assert self.path == OPERATIONS_PATH
+        assert self.headers.get("Authorization") == f"Bearer {OPERATIONS_TOKEN}"
+        payload = json.dumps(self.server.operations).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_POST(self):
         assert self.path == "/incident"
         payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -155,6 +167,55 @@ def monitor(root, db_path, sink, host="mail.example.test"):
         yield check_health
 
 
+def verify_hosted_incidents(root, sink, check_health):
+    env = root / "mail.env"
+    unconfigured = env.read_text()
+    configured = unconfigured + (
+        f"MAIL_APP_OPERATIONS_URL=http://127.0.0.1:{sink.server_port}{OPERATIONS_PATH}\n"
+        f"MAIL_OPERATIONS_TOKEN={OPERATIONS_TOKEN}\n"
+    )
+    env.write_text(configured)
+    base = int(time.time())
+    billing_key = "billing_reconciliation"
+    billing = watch["HOSTED_CHECKS"][billing_key]
+    operations = watch["HOSTED_MONITOR_CHECK"]
+    private_detail = "private-billing-reference"
+    sink.operations = {"schema": 1, "checked_at": base, "checks": {
+        key: {"status": "healthy"} for key in watch["HOSTED_CHECKS"]
+    }}
+    incident_checks = sink.operations["checks"]
+    incident_checks[billing_key] = {"status": "degraded", "detail": private_detail}
+    start = len(sink.messages)
+    failed = check_health(base)
+    assert not failed[billing]["ok"] and failed[operations]["ok"], failed
+    assert billing in sink.messages[-1]["content"]
+
+    env.write_text(unconfigured)
+    lost = check_health(base + 1)
+    assert not lost[billing]["ok"] and not lost[operations]["ok"], lost
+    assert len(sink.messages) == start + 2
+    assert operations in sink.messages[-1]["content"] and billing in sink.messages[-1]["content"]
+
+    env.write_text(configured)
+    sink.operations["checked_at"] = base + 2
+    incident_checks[billing_key] = {"status": "disabled"}
+    disabled = check_health(base + 2)
+    assert not disabled[billing]["ok"] and not disabled[operations]["ok"], disabled
+    assert len(sink.messages) == start + 2, sink.messages
+
+    sink.operations["checked_at"] = base + 3
+    incident_checks[billing_key] = {"status": "healthy"}
+    recovered = check_health(base + 3)
+    assert recovered[billing]["ok"] and recovered[operations]["ok"], recovered
+    assert len(sink.messages) == start + 3
+    assert "checks recovered" in sink.messages[-1]["content"]
+    check_health(base + 4)
+    assert len(sink.messages) == start + 3
+    for sensitive in (private_detail, OPERATIONS_TOKEN):
+        assert sensitive not in (root / "public/status.json").read_text()
+        assert not any(sensitive in msg["content"] for msg in sink.messages)
+
+
 def verify(binary):
     with tempfile.TemporaryDirectory(prefix="mail-delivery-alerts-") as directory:
         root = Path(directory)
@@ -223,9 +284,10 @@ def verify(binary):
                 count = len(sink.messages)
                 check_health()
                 assert len(sink.messages) == count
-        assert len(sink.messages) == 6, sink.messages
+            assert len(sink.messages) == 6, sink.messages
+            verify_hosted_incidents(root, sink, check_health)
         assert not any(owner in msg["content"] for msg in sink.messages)
-        print("Verified live queue and delivery thresholds, failed webhook retry, rate-limit backoff, deduplication, and recovery over a disposable receiver.")
+        print("Verified live queue and delivery thresholds, hosted monitoring coverage, failed webhook retry, rate-limit backoff, deduplication, and recovery over a disposable receiver.")
 
 
 if __name__ == "__main__":
