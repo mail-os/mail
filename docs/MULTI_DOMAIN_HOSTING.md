@@ -82,7 +82,10 @@ credential only to the mailbox owner. Webmail asks them to choose a different
 password before a browser session is created. SMTP and IMAP reject the
 initial credential, while the mailbox continues receiving mail. Later sign-ins
 and mail clients use the new password. Buddy can set this on new mailboxes
-with `passwordPolicy: 'initial-change'`.
+with `passwordPolicy: 'initial-change'`. To issue another temporary password
+for an active mailbox, use `user:local change-password <address>
+--password-stdin --force --require-password-change`. This ends existing
+webmail sessions and revokes app passwords.
 
 ### Migrating an existing local-part mailbox to an isolated one
 

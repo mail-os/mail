@@ -4383,6 +4383,26 @@ pub const Database = struct {
         return true;
     }
 
+    pub fn issueTemporaryPassword(self: *Database, username: []const u8, password_hash: []const u8) !void {
+        var tx = try self.beginTransaction(.write);
+        defer tx.deinit();
+        {
+            const update = try tx.prepare(
+                \\UPDATE users SET password_hash = ?1, password_change_required = 1, digest_ha1 = NULL, updated_at = ?2
+                \\WHERE username = ?3 AND enabled = 1 RETURNING id
+            );
+            defer update.finalize();
+            try update.bind(1, password_hash);
+            try update.bind(2, time_compat.timestamp());
+            try update.bind(3, username);
+            if (!try update.step()) return error.MailboxNotFoundOrDisabled;
+            _ = try update.step();
+        }
+        try self.deleteUserSessionsLocked(username);
+        try tx.deleteUserResetTokens(username);
+        try tx.commit();
+    }
+
     pub fn updateUserPassword(self: *Database, username: []const u8, new_password_hash: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();

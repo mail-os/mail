@@ -74,10 +74,25 @@ def verify(mail):
             assert database.execute("SELECT COUNT(*) FROM webmail_sessions WHERE username = ?", (mailbox,)).fetchone() == (0,)
         status, headers, _ = login(winning_password)
         assert status == 200 and "Secure" in headers["Set-Cookie"]
+        cookie = {"Cookie": headers["Set-Cookie"].split(";", 1)[0]}
+        session_url = mail.webmail + "/webmail/auth/me"
+        assert mail.http(session_url, headers=cookie, context=mail.tls_context)[0] == 200
         check_protocols(winning_password, True)
         assert login(mail.password)[0] == 401
         assert login(winning_password, secrets.token_urlsafe())[0] == 401
         check_protocols(mail.password, False)
+
+        temporary = secrets.token_urlsafe()
+        reset = [str(mail.binary), "user:local", "change-password", mailbox, "--password-stdin", "--require-password-change"]
+        refused = subprocess.run(reset, input=temporary + "\n", text=True, cwd=mail.directory,
+                                 env=mail.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        assert refused.returncode != 0
+        subprocess.run(reset + ["--force"], input=temporary + "\n", text=True, cwd=mail.directory,
+                       env=mail.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+        assert mail.http(session_url, headers=cookie, context=mail.tls_context)[0] == 401
+        assert login(winning_password)[0] == 401
+        assert login(temporary)[0] == 409
+        check_protocols(temporary, False)
 
 
 def verify_browser(mail):

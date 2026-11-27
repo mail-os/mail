@@ -498,6 +498,12 @@ pub const AuthBackend = struct {
         return self.db.replaceInitialPassword(user, password_hash);
     }
 
+    pub fn issueTemporaryPassword(self: *AuthBackend, username: []const u8, password: []const u8) !void {
+        const hash = try self.password_hasher.hashPassword(password);
+        defer self.allocator.free(hash);
+        try self.db.issueTemporaryPassword(username, hash);
+    }
+
     pub fn changePassword(self: *AuthBackend, username: []const u8, new_password: []const u8) !void {
         // Hash the new password
         const password_hash = try self.password_hasher.hashPassword(new_password);

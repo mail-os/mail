@@ -514,7 +514,7 @@ pub fn replacePassword(auth_backend: *auth.AuthBackend, username: []const u8, pa
     try user_cli.changePassword(auth_backend, username, password);
 }
 
-pub const change_password_usage = "Usage: mail user:local change-password <username> [<password> | --password-stdin] --force\n";
+pub const change_password_usage = "Usage: mail user:local change-password <username> [<password> | --password-stdin] --force [--require-password-change]\n";
 
 fn changePasswordAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Database, auth_backend: *auth.AuthBackend) !void {
     const username = ctx.getArgument(0) orelse {
@@ -536,7 +536,12 @@ fn changePasswordAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Databa
         return err;
     };
     defer user.deinit(ctx.allocator);
-    try replacePassword(auth_backend, username, password, force);
+    if (ctx.hasOption("require-password-change")) {
+        try auth_backend.issueTemporaryPassword(username, password);
+        std.debug.print("Temporary password set for '{s}'\n", .{username});
+    } else {
+        try replacePassword(auth_backend, username, password, force);
+    }
 }
 
 fn recoveryAction(ctx: *cli.BaseCommand.ParseContext, db: *database.Database, _: *auth.AuthBackend) !void {
@@ -758,6 +763,7 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try change_pw_cmd.addOption(
         cli.Option.init("force", "force", "Replace the existing password (required: without it the command refuses)", .bool),
     );
+    _ = try change_pw_cmd.addOption(cli.Option.init("require-password-change", "require-password-change", "Set a temporary password and require the owner to choose a new one in webmail", .bool));
     _ = change_pw_cmd.setAction(withDb(changePasswordAction));
     _ = try cmd.addCommand(change_pw_cmd);
 
