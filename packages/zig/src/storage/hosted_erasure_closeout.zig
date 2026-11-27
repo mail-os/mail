@@ -1,6 +1,7 @@
 //! Verify native removal and record approved dispositions for the remaining evidence.
 const std = @import("std");
 const database = @import("database.zig");
+const checkpoint = @import("hosted_erasure_checkpoint.zig");
 const content = @import("hosted_erasure_content.zig");
 const dav = @import("hosted_erasure_dav.zig");
 const inventory = @import("hosted_erasure_inventory.zig");
@@ -14,6 +15,7 @@ const time = @import("../core/time_compat.zig");
 const Allocator = std.mem.Allocator;
 const Tx = database.Database.Transaction;
 const action = "hosted.erasure.closeout.recorded";
+const replay_action: []const u8 = "hosted.erasure.closeout.replay.verified";
 const Disposition = struct {
     state: enum { removed, retention_required, retained_until },
     reference: []const u8,
@@ -68,6 +70,7 @@ const Report = struct {
     audit_id: ?i64 = null,
     recorded_at: ?i64 = null,
     decision: ?Decision = null,
+    verified_replay: ?checkpoint.ReplayChainReceipt = null,
 };
 
 fn inspect(a: Allocator, io: std.Io, tx: Tx, root: std.Io.Dir, review: review_store.Review, start: i64, dav_path: ?[]const u8, now: i64) !Scope {
@@ -149,6 +152,40 @@ fn validateDecision(decision: Decision, scope: Scope, now: i64) !void {
     }
 }
 
+// Keep the closeout record readable on a binary rollback. Both audit entries
+// commit together, and the evidence row is addressed by the closeout audit ID.
+fn recordReplay(tx: Tx, closeout_id: i64, actor: []const u8, now: i64, details: []const u8) !void {
+    const row = try tx.prepare(
+        \\INSERT INTO audit_log(timestamp,action,actor,target,target_type,details,severity)
+        \\VALUES(?1,?2,?3,CAST(?4 AS TEXT),'hosted_erasure_closeout',?5,'info')
+    );
+    defer row.finalize();
+    try row.bind(1, now);
+    try row.bind(2, replay_action);
+    try row.bind(3, actor);
+    try row.bind(4, closeout_id);
+    try row.bind(5, details);
+    if (try row.step()) return error.InvalidErasureJournal;
+}
+
+fn recordedReplay(a: Allocator, tx: Tx, closeout_id: i64, start: i64, reference: ?[]const u8) !?checkpoint.ReplayChainReceipt {
+    const row = try tx.prepare(
+        \\SELECT details FROM audit_log WHERE action=?1 AND target_type='hosted_erasure_closeout'
+        \\AND target=CAST(?2 AS TEXT) ORDER BY id LIMIT 2
+    );
+    defer row.finalize();
+    try row.bind(1, replay_action);
+    try row.bind(2, closeout_id);
+    if (!try row.step()) return null;
+    const verification = try std.json.parseFromSliceLeaky(checkpoint.ReplayChainReceipt, a, row.columnText(0), .{ .allocate = .alloc_always });
+    const digest = try checkpoint.replayEvidenceDigest(a, verification.evidence);
+    if (try row.step() or verification.evidence.source_start_audit_id != start or
+        !std.mem.eql(u8, reference orelse return error.InvalidErasureJournal, &verification.evidence_sha256) or
+        !std.mem.eql(u8, &verification.evidence_sha256, &digest))
+        return error.InvalidErasureJournal;
+    return verification;
+}
+
 fn existing(a: Allocator, tx: Tx, report: Report, decision: Decision) !?Report {
     const row = try tx.prepare(
         \\SELECT id,details FROM audit_log WHERE action='hosted.erasure.closeout.recorded'
@@ -180,10 +217,11 @@ fn existing(a: Allocator, tx: Tx, report: Report, decision: Decision) !?Report {
     result.audit_id = id;
     result.recorded_at = record.recorded_at;
     result.decision = record.decision;
+    result.verified_replay = try recordedReplay(a, tx, id, report.scope.start_audit_id, record.decision.backups.restore_verification_reference);
     return result;
 }
 
-pub fn reconcile(a: Allocator, io: std.Io, db: *database.Database, review: review_store.Review, start: i64, actor: []const u8, mail_root: []const u8, dav_path: ?[]const u8, decision: ?Decision) !Report {
+pub fn reconcile(a: Allocator, io: std.Io, db: *database.Database, review: review_store.Review, start: i64, actor: []const u8, mail_root: []const u8, dav_path: ?[]const u8, decision: ?Decision, replay: ?checkpoint.ReplayChainInput) !Report {
     try review.validate();
     if (start < 1) return error.InvalidErasureStartAuditId;
     var root = try maildir.openLockedRoot(a, io, mail_root);
@@ -205,15 +243,27 @@ pub fn reconcile(a: Allocator, io: std.Io, db: *database.Database, review: revie
     if (!std.mem.eql(u8, &approved.scope_sha256, &report.scope_sha256)) return error.ErasureCloseoutScopeChanged;
     if (try existing(a, tx, report, approved)) |prior| return prior;
     try validateDecision(approved, scope, now);
+    const verified_replay = if (approved.backups.retained_snapshots == 0) null else proof: {
+        const input = replay orelse return error.ErasureCloseoutReplayProofRequired;
+        const evidence = try checkpoint.verifyReplayChainInTransaction(a, io, tx, review, now, input);
+        if (evidence.evidence.source_start_audit_id != start or
+            !std.mem.eql(u8, approved.backups.restore_verification_reference.?, &evidence.evidence_sha256))
+            return error.ErasureCloseoutReplayEvidenceMismatch;
+        break :proof evidence;
+    };
     const details = try std.json.Stringify.valueAlloc(a, Record{
         .scope = scope,
         .decision = approved,
         .recorded_at = now,
     }, .{});
-    report.audit_id = try review_store.writeAudit(tx, action, review.mailbox, actor, now, details);
+    const audit_id = try review_store.writeAudit(tx, action, review.mailbox, actor, now, details);
+    if (verified_replay) |verification|
+        try recordReplay(tx, audit_id, actor, now, try std.json.Stringify.valueAlloc(a, verification, .{}));
     try tx.commit();
+    report.audit_id = audit_id;
     report.state = "hosted_erasure_disposition_recorded";
     report.recorded_at = now;
     report.decision = approved;
+    report.verified_replay = verified_replay;
     return report;
 }

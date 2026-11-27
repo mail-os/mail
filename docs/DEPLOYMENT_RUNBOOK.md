@@ -919,7 +919,26 @@ mail backup verify-erasure-replay-chain /secure/source-checkpoint.json \
 The verifier reads the original case and confirms that both signed checkpoints
 cover its assignment and the approved peer copies. Keep the report and both
 checkpoints in the private case record. Use the report's `evidence_sha256`
-as `backups.restore_verification_reference`.
+as `backups.restore_verification_reference`. For a new decision with retained
+snapshots, save the same paths and trusted pins in a private file such as
+`/secure/closeout-replay.json`.
+
+```json
+{
+  "source_checkpoint_path": "/secure/source-checkpoint.json",
+  "replay_checkpoint_path": "/secure/replay-checkpoint.json",
+  "replay_sha256": "REPLAY_SHA256",
+  "pin": {
+    "scope": "TRUSTED_SCOPE",
+    "public_key": "TRUSTED_ED25519_PUBLIC_KEY",
+    "sha256": "SOURCE_SHA256",
+    "not_before": 1790000000
+  }
+}
+```
+
+Replace the example timestamp with the earliest trusted observation in Unix
+seconds from the recovery record.
 
 In `retained_records`, list each table from the verified scope once
 with its `table` and retention `disposition`. Use the approved evidence for
@@ -929,15 +948,21 @@ the backup catalog, storage history, billing and support.
 
 ```sh
 mail user:local hosted-erasure-closeout /secure/review.json START_AUDIT_ID \
-  /secure/closeout-decision.json > /secure/closeout-receipt.json
+  /secure/closeout-decision.json --replay-chain /secure/closeout-replay.json \
+  > /secure/closeout-receipt.json
 ```
 
-The final transaction rechecks the scope, records one audit entry and issues
-a receipt with the native verification and external evidence references.
-An identical retry returns the same receipt on the same scope. A changed
-retained row, missing deletion proof or returned live data blocks that
-approval. The recorded retention dates apply to the named evidence. Recheck
-the affected stores and obtain a current decision when a scope changes.
+For a decision with zero retained snapshots, omit `--replay-chain`. The final
+transaction rechecks the scope and verifies any required signed checkpoints
+against the original reservation and the approved evidence digest. The receipt
+and its linked replay audit record include the verified checkpoint hashes,
+case digest and recovery approval reference. Both audit entries commit together.
+An identical retry returns the recorded receipt for the same scope, including
+older receipts that stored the digest alone. The closeout entry remains readable
+by the previous binary after rollback. A changed retained row, missing deletion
+proof or returned live data blocks that approval. The recorded retention dates
+apply to the named evidence. Recheck the affected stores and obtain a current
+decision when a scope changes.
 
 Run `python3 scripts/test-hosted-erasure-closeout.py /path/to/mail` with
 disposable TLS mailboxes and an actual backup archive. Add

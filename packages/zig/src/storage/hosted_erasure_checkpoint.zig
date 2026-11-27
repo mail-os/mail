@@ -52,7 +52,7 @@ const ReplayChain = struct {
     replay_start_audit_id: i64,
     recovery_approval_reference: []const u8,
 };
-const ReplayChainReceipt = struct {
+pub const ReplayChainReceipt = struct {
     evidence: ReplayChain,
     evidence_sha256: restore.Digest,
 };
@@ -61,6 +61,12 @@ pub const Pin = struct {
     public_key: []const u8,
     sha256: []const u8,
     not_before: i64,
+};
+pub const ReplayChainInput = struct {
+    source_checkpoint_path: []const u8,
+    replay_checkpoint_path: []const u8,
+    pin: Pin,
+    replay_sha256: []const u8,
 };
 
 fn read(a: Allocator, io: std.Io, path: []const u8, limit: u64, comptime private: bool) ![]u8 {
@@ -241,11 +247,27 @@ pub fn sealReplay(a: Allocator, io: std.Io, path: []const u8, pin: Pin, restored
 }
 
 pub fn verifyReplayChain(a: Allocator, io: std.Io, path: []const u8, pin: Pin, replay_path: []const u8, replay_sha256: []const u8, authority_db: []const u8, review_path: []const u8) !ReplayChainReceipt {
-    const original = try authenticate(a, io, path, pin);
-    const recovered = try authenticate(a, io, replay_path, .{
-        .scope = pin.scope,
-        .public_key = pin.public_key,
-        .sha256 = replay_sha256,
+    const raw = try read(a, io, review_path, 8192, true);
+    const review = try std.json.parseFromSliceLeaky(review_store.Review, a, raw, .{});
+    try review.validate();
+    var db = try database.Database.openReadOnly(a, authority_db);
+    defer db.deinit();
+    var tx = try db.beginTransaction(.read);
+    defer tx.deinit();
+    return verifyReplayChainInTransaction(a, io, tx, review, clock.timestamp(), .{
+        .source_checkpoint_path = path,
+        .replay_checkpoint_path = replay_path,
+        .pin = pin,
+        .replay_sha256 = replay_sha256,
+    });
+}
+
+pub fn verifyReplayChainInTransaction(a: Allocator, io: std.Io, tx: database.Database.Transaction, review: review_store.Review, now: i64, input: ReplayChainInput) !ReplayChainReceipt {
+    const original = try authenticate(a, io, input.source_checkpoint_path, input.pin);
+    const recovered = try authenticate(a, io, input.replay_checkpoint_path, .{
+        .scope = input.pin.scope,
+        .public_key = input.pin.public_key,
+        .sha256 = input.replay_sha256,
         .not_before = original.payload.state.observed_at,
     });
     const replay = recovered.payload.replay orelse return error.MissingErasureReplayEvidence;
@@ -254,14 +276,6 @@ pub fn verifyReplayChain(a: Allocator, io: std.Io, path: []const u8, pin: Pin, r
     if (!preflight.validCaseReference(replay.approval_reference)) return error.InvalidErasureReplayApproval;
     try requireReplayCoverage(a, original.payload.state, recovered.payload.state);
 
-    const raw = try read(a, io, review_path, 8192, true);
-    const review = try std.json.parseFromSliceLeaky(review_store.Review, a, raw, .{});
-    try review.validate();
-    var db = try database.Database.openReadOnly(a, authority_db);
-    defer db.deinit();
-    var tx = try db.beginTransaction(.read);
-    defer tx.deinit();
-    const now = clock.timestamp();
     const assignment = try preflight.identify(a, tx, review.mailbox, review.assignment_actor, now);
     try restore.requireSingleAddress(tx, review.mailbox, assignment.identity.native_user_id);
     const identity = try replay_evidence.caseIdentity(a, review, assignment.identity);
@@ -275,7 +289,7 @@ pub fn verifyReplayChain(a: Allocator, io: std.Io, path: []const u8, pin: Pin, r
     _ = try review_store.requireStarted(a, tx, review, source_case.start_audit_id, now);
 
     const evidence: ReplayChain = .{
-        .scope = pin.scope,
+        .scope = input.pin.scope,
         .source_checkpoint_sha256 = original.digest,
         .replay_checkpoint_sha256 = recovered.digest,
         .source_observed_at = original.payload.state.observed_at,
@@ -287,6 +301,10 @@ pub fn verifyReplayChain(a: Allocator, io: std.Io, path: []const u8, pin: Pin, r
     };
     return .{
         .evidence = evidence,
-        .evidence_sha256 = refs.digest(try std.json.Stringify.valueAlloc(a, evidence, .{})),
+        .evidence_sha256 = try replayEvidenceDigest(a, evidence),
     };
+}
+
+pub fn replayEvidenceDigest(a: Allocator, evidence: ReplayChain) !restore.Digest {
+    return refs.digest(try std.json.Stringify.valueAlloc(a, evidence, .{}));
 }

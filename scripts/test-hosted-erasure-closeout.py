@@ -125,13 +125,14 @@ def verify(binary, work, engine=None):
     assert counts["audit_log"] > 0 and scope["sqlite_tables_requiring_scope_review"]
     assert success(record()) == plan
 
-    # Use real verified backup evidence as the reference in the synthetic case.
-    recovered = snapshot(test, work / "recovered")
-    verified = subprocess.run([str(binary), "backup", "verify-erasure-restore", str(smtp_db),
-                               str(recovered / "smtp.db"), str(recovered / "mail"),
-                               str(recovered / "caldav.db")], capture_output=True, text=True)
-    assert success(verified)["reservations_checked"] == 1
-    restore_reference = "restore-" + sha256(verified.stdout.encode()).hexdigest()
+    # This case verifies a disposable backup and removes it before closeout.
+    with TemporaryDirectory(prefix="discarded-backup-", dir=work) as backup_dir:
+        recovered = snapshot(test, Path(backup_dir))
+        verified = subprocess.run([str(binary), "backup", "verify-erasure-restore", str(smtp_db),
+                                   str(recovered / "smtp.db"), str(recovered / "mail"),
+                                   str(recovered / "caldav.db")], capture_output=True, text=True)
+        assert success(verified)["reservations_checked"] == 1
+        restore_reference = "restore-" + sha256(verified.stdout.encode()).hexdigest()
 
     expiry = int(time.time()) + 86400
     required = disposition("retention_required", "approved-audit-scope")
@@ -140,8 +141,7 @@ def verify(binary, work, engine=None):
         "external_search_reference": "search-inventory-reviewed", "sqlite_scope_reference": "schema-scope-reviewed",
         "sqlite_history": disposition("retained_until", "storage-history-review", expiry=expiry),
         "backups": {
-            "disposition": disposition("retained_until", "backup-catalog-review", expiry=expiry),
-            "retained_snapshots": 1, "restore_verification_reference": restore_reference,
+            "disposition": disposition("removed", restore_reference), "retained_snapshots": 0,
         },
         "hosted_billing": disposition("retention_required", "billing-ledger-review"),
         "support_records": disposition("removed", "support-case-review"),
@@ -152,8 +152,6 @@ def verify(binary, work, engine=None):
     refuse(record({**decision, "retained_records": [
         {**item, "disposition": disposition("removed", "contradicts-live-scope")} for item in decision["retained_records"]
     ]}), "InvalidErasureCloseoutDisposition")
-    refuse(record({**decision, "backups": {**decision["backups"], "restore_verification_reference": None}}),
-           "ErasureCloseoutRestoreProofRequired")
     refuse(record({**decision, "sqlite_history": disposition("retained_until", "expired-approval", expiry=1)}),
            "ErasureCloseoutRetentionExpired")
 
@@ -180,7 +178,8 @@ def verify(binary, work, engine=None):
         receipt = success(record(decision))
         assert receipt["state"] == "hosted_erasure_disposition_recorded"
         assert receipt["scope"] == scope and receipt["recorded_at"] > 0
-        assert receipt["decision"]["backups"]["restore_verification_reference"] == restore_reference
+        assert receipt["decision"]["backups"]["disposition"]["reference"] == restore_reference
+        assert receipt["verified_replay"] is None
         assert success(record(decision)) == receipt
         assert db.execute("SELECT id FROM audit_log WHERE action=?", (ACTION,)).fetchall() == [(receipt["audit_id"],)]
         refuse(record({**decision, "external_search_reference": "changed-evidence"}), "ErasureCloseoutApprovalConflict")

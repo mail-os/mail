@@ -41,7 +41,7 @@ def verified_document(path, result):
                   "--not-before", str(document["payload"]["state"]["observed_at"])]
 
 
-def verify(binary, work):
+def verify(binary, work, previous_binary=None):
     original = work / "live"
     original.mkdir()
     source = Fixture(binary, original, staging=True)
@@ -258,9 +258,65 @@ def verify(binary, work):
     refuse(closeout(decision_file), "ErasureCloseoutRestoreProofRequired")
     decision["backups"]["restore_verification_reference"] = evidence["evidence_sha256"]
     private_json(decision_file, decision)
-    recorded = success(closeout(decision_file))
+    refuse(closeout(decision_file), "ErasureCloseoutReplayProofRequired")
+    proof_file = work / "closeout-replay.json"
+    source_pin = dict(zip(pin[::2], pin[1::2]))
+    proof = {
+        "source_checkpoint_path": str(checkpoint), "replay_checkpoint_path": str(certified[0]),
+        "replay_sha256": receipt["checkpoint_sha256"],
+        "pin": {"scope": SCOPE, "public_key": source_pin["--public-key"],
+                "sha256": receipt["replayed_from_sha256"], "not_before": int(source_pin["--not-before"])},
+    }
+    private_json(proof_file, proof)
+    proof_file.chmod(0o644)
+    refuse(closeout(decision_file, "--replay-chain", proof_file), "ErasureCloseoutReplayInputNotPrivate")
+    proof_file.chmod(0o600)
+    private_json(proof_file, {**proof, "replay_sha256": "0" * 64})
+    refuse(closeout(decision_file, "--replay-chain", proof_file), "ErasureCheckpointPinMismatch")
+    wrong_source = {**proof, "source_checkpoint_path": str(other_source[0]),
+                    "pin": {**proof["pin"], "sha256": sha256(other_source[0].read_bytes()).hexdigest()}}
+    private_json(proof_file, wrong_source)
+    refuse(closeout(decision_file, "--replay-chain", proof_file), "RestoreErasureReplaySourceMismatch")
+    private_json(proof_file, proof)
+    private_json(decision_file, {**decision, "backups": {**decision["backups"], "restore_verification_reference": "0" * 64}})
+    refuse(closeout(decision_file, "--replay-chain", proof_file), "ErasureCloseoutReplayEvidenceMismatch")
+    private_json(decision_file, decision)
+    with closing(sqlite3.connect(original_db)) as db:
+        assert db.execute("SELECT count(*) FROM audit_log WHERE action='hosted.erasure.closeout.recorded'").fetchone() == (0,)
+        with db:
+            db.execute("""CREATE TRIGGER reject_replay_proof BEFORE INSERT ON audit_log
+                          WHEN NEW.action='hosted.erasure.closeout.replay.verified'
+                          BEGIN SELECT RAISE(ABORT,'fixture rollback'); END""")
+        refuse(closeout(decision_file, "--replay-chain", proof_file), "StepFailed")
+        assert db.execute("SELECT count(*) FROM audit_log WHERE action LIKE 'hosted.erasure.closeout.%'").fetchone() == (0,)
+        with db:
+            db.execute("DROP TRIGGER reject_replay_proof")
+    recorded = success(closeout(decision_file, "--replay-chain", proof_file))
     assert recorded["decision"]["backups"]["restore_verification_reference"] == evidence["evidence_sha256"]
+    assert recorded["verified_replay"] == evidence
+    assert str(checkpoint) not in json.dumps(recorded) and proof["pin"]["public_key"] not in json.dumps(recorded)
     assert recorded["audit_id"] is not None and success(closeout(decision_file)) == recorded
+    with closing(sqlite3.connect(original_db)) as db:
+        audit, = db.execute("""SELECT details FROM audit_log WHERE action='hosted.erasure.closeout.replay.verified'
+                              AND target_type='hosted_erasure_closeout' AND target=?""", (str(recorded["audit_id"]),)).fetchone()
+        assert json.loads(audit) == evidence
+        with db:
+            db.execute("""UPDATE audit_log SET details=json_set(details, '$.evidence.replay_observed_at', 1)
+                          WHERE action='hosted.erasure.closeout.replay.verified'""")
+        refuse(closeout(decision_file), "InvalidErasureJournal")
+        with db:
+            db.execute("UPDATE audit_log SET details=? WHERE action='hosted.erasure.closeout.replay.verified'", (audit,))
+    if previous_binary:
+        def previous_closeout():
+            return success(subprocess.run(
+                [str(previous_binary), "user:local", "hosted-erasure-closeout", str(review_path), str(source_start), str(decision_file)],
+                cwd=source.directory, env=source.env, capture_output=True, text=True, timeout=12,
+            ))
+
+        assert previous_closeout() == {key: value for key, value in recorded.items() if key != "verified_replay"}
+        private_json(decision_file, {**decision, "approval_reference": "previous-binary-fixture"})
+        prior = previous_closeout()
+        assert success(closeout(decision_file)) == {**prior, "verified_replay": None}
 
     with closing(sqlite3.connect(replay_db)) as db, db:
         copy_hash, = db.execute("SELECT sha256 FROM mail_retained_thread_archives WHERE share_id=?", (thread_id,)).fetchone()
@@ -295,7 +351,9 @@ def verify(binary, work):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
+    parser.add_argument("--previous-binary", type=Path)
     args = parser.parse_args()
     with TemporaryDirectory(prefix="mail-erasure-replay-") as directory:
-        verify(args.binary.resolve(strict=True), Path(directory))
+        verify(args.binary.resolve(strict=True), Path(directory),
+               args.previous_binary.resolve(strict=True) if args.previous_binary else None)
     print("Verified authorized erasure replay of a pre-erasure archive, linked closeout evidence, tamper refusal, and retained peer Mail and Calendar over TLS.")

@@ -19,6 +19,7 @@ const erasure_dav = @import("../storage/hosted_erasure_dav.zig");
 const erasure_shared_sqlite = @import("../storage/hosted_erasure_shared_sqlite.zig");
 const erasure_shared = @import("../storage/hosted_erasure_shared.zig");
 const erasure_closeout = @import("../storage/hosted_erasure_closeout.zig");
+const erasure_checkpoint = @import("../storage/hosted_erasure_checkpoint.zig");
 const erasure_content = @import("../storage/hosted_erasure_content.zig");
 const erasure_links = @import("../storage/hosted_erasure_links.zig");
 const erasure_sqlite = @import("../storage/hosted_erasure_sqlite.zig");
@@ -354,7 +355,11 @@ fn hostedErasureContentAction(ctx: *cli.BaseCommand.ParseContext) !void {
 fn hostedErasureCloseoutAction(ctx: *cli.BaseCommand.ParseContext) !void {
     const start = ctx.getArgument(1) orelse return error.MissingArgument;
     const id = std.fmt.parseInt(i64, start, 10) catch return error.InvalidErasureStartAuditId;
-    try hostedErasureApproval(ctx, .{ .closeout = .{ .start_id = id, .decision_path = ctx.getArgument(2) } });
+    try hostedErasureApproval(ctx, .{ .closeout = .{
+        .start_id = id,
+        .decision_path = ctx.getArgument(2),
+        .replay_path = ctx.getOption("replay-chain"),
+    } });
 }
 
 fn hostedErasureSharedAction(ctx: *cli.BaseCommand.ParseContext) !void {
@@ -386,7 +391,7 @@ const ErasureOperation = union(enum) {
     sqlite: i64,
     links: i64,
     content: i64,
-    closeout: struct { start_id: i64, decision_path: ?[]const u8 },
+    closeout: struct { start_id: i64, decision_path: ?[]const u8, replay_path: ?[]const u8 },
     shared_sqlite: struct { start_id: i64, decision_path: ?[]const u8 },
     shared: struct { start_id: i64, store: erasure_shared.Store, decision_path: ?[]const u8 },
     typesense: struct { start_id: i64, endpoint: erasure_typesense.Endpoint },
@@ -430,7 +435,13 @@ fn hostedErasureApproval(ctx: *cli.BaseCommand.ParseContext, operation: ErasureO
                 try readPrivateReview(a, io, path, error.ErasureCloseoutDecisionNotPrivate),
                 .{},
             ) else null;
-            const result = try erasure_closeout.reconcile(a, io, &db, review, step.start_id, operator, mail_root, dav_path, decision);
+            const replay = if (step.replay_path) |path| try std.json.parseFromSliceLeaky(
+                erasure_checkpoint.ReplayChainInput,
+                a,
+                try readPrivateReview(a, io, path, error.ErasureCloseoutReplayInputNotPrivate),
+                .{},
+            ) else null;
+            const result = try erasure_closeout.reconcile(a, io, &db, review, step.start_id, operator, mail_root, dav_path, decision, replay);
             try std.json.Stringify.value(result, format, &output.interface);
         },
         .shared_sqlite => |step| {
@@ -732,6 +743,7 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
     _ = try closeout_cmd.addArgument(cli.Argument.init("review", "Private erasure review", .string));
     _ = try closeout_cmd.addArgument(cli.Argument.init("start-id", "Audit ID of the erasure reservation", .string));
     _ = try closeout_cmd.addArgument(cli.Argument.init("decision", "Private approved closeout decision", .string).withRequired(false));
+    _ = try closeout_cmd.addOption(cli.Option.init("replay-chain", "replay-chain", "Private signed replay inputs for a retained backup decision", .string));
     _ = closeout_cmd.setAction(hostedErasureCloseoutAction);
     _ = try cmd.addCommand(closeout_cmd);
 
