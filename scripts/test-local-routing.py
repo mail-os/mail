@@ -170,6 +170,46 @@ def run(candidate, previous, webhook_ip):
                                      capture_output=True, text=True, timeout=8)
             log = blocked.stdout + blocked.stderr
             assert blocked.returncode != 0 and "MaildirWriterActive" in log, log
+
+            # A separate Maildir must not split deliveries from the same
+            # mailbox database. Both spellings resolve to the same writer lock.
+            separate_dir = root / "separate-writer"
+            separate_dir.mkdir()
+            separate = Fixture(candidate, separate_dir, staging=True)
+            database = root / "smtp.db"
+            database_alias = separate_dir / "shared-smtp.db"
+            database_alias.symlink_to(database)
+            separate.env["SMTP_MONITORING_PORT"] = str(fixture["available_ports"](1)[0])
+            for path in (database, database_alias):
+                separate.env["SMTP_DB_PATH"] = str(path)
+                try:
+                    blocked = subprocess.run(separate.daemon_command(), cwd=separate.directory, env=separate.env,
+                                             capture_output=True, text=True, timeout=8)
+                except subprocess.TimeoutExpired as error:
+                    raise AssertionError("A second daemon started against the occupied SMTP database") from error
+                log = blocked.stdout + blocked.stderr
+                assert blocked.returncode != 0 and "DatabaseWriterActive" in log, log
+                assert "Initializing database" not in log and "SMTP monitoring listening" not in log, log
+            assert not (separate_dir / "mail" / app_inbox).exists()
+
+            hardlink = separate_dir / "hardlinked-smtp.db"
+            hardlink.hardlink_to(database)
+            try:
+                separate.env["SMTP_DB_PATH"] = str(hardlink)
+                blocked = subprocess.run(separate.daemon_command(), cwd=separate.directory, env=separate.env,
+                                         capture_output=True, text=True, timeout=8)
+                log = blocked.stdout + blocked.stderr
+                assert blocked.returncode != 0 and "DatabaseWriterPathNotUnique" in log, log
+                assert "Initializing database" not in log, log
+            finally:
+                hardlink.unlink()
+
+            separate.env["SMTP_DB_PATH"] = str(separate_dir / "smtp.db")
+            with separate.daemon():
+                independent = separate.provision("independent-writer")
+                expect_smtp(separate.deliver(independent, subject="Independent writer"), 250)
+                assert separate.bytes(independent) > 0
+
             assert process.poll() is None
             assert query("SELECT outcome FROM accepted_mail_targets WHERE mailbox=?", (app_inbox,)) == [("pending",)]
             process.kill()

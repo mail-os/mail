@@ -4,6 +4,7 @@ const config = @import("core/config.zig");
 const logger = @import("core/logger.zig");
 const args_parser = @import("core/args.zig");
 const env = @import("core/env.zig");
+const writer = @import("core/maildir_writer.zig");
 const database = @import("storage/database.zig");
 const auth = @import("auth/auth.zig");
 const greylist_mod = @import("antispam/greylist.zig");
@@ -202,6 +203,21 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         return;
     }
 
+    const maildir_writer = writer.openForDaemon() catch |err| {
+        log.err("Could not acquire Maildir write authority: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer _ = std.c.close(maildir_writer);
+
+    const db_path = env.get("SMTP_DB_PATH") orelse "./smtp.db";
+    const database_writer = writer.openDatabaseForDaemon(allocator, db_path) catch |err| {
+        log.err("Could not acquire SMTP database write authority: {s}", .{@errorName(err)});
+        return err;
+    };
+    defer if (database_writer) |fd| {
+        _ = std.c.close(fd);
+    };
+
     var smtp_monitor: ?smtp_monitoring.Listener = null;
     if (env.get("SMTP_MONITORING_PORT")) |value| {
         const port = std.fmt.parseInt(u16, value, 10) catch return error.InvalidSmtpMonitoringPort;
@@ -240,14 +256,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     defer global_reload_manager = null;
     log.info("Hot reload manager initialized (send SIGHUP to reload configuration)", .{});
 
-    const writer = @import("core/maildir_writer.zig").openForDaemon() catch |err| {
-        log.err("Could not acquire Maildir write authority: {s}", .{@errorName(err)});
-        return err;
-    };
-    defer _ = std.c.close(writer);
-
     // The acceptance journal is needed on SMTP-only installations, too.
-    const db_path = env.get("SMTP_DB_PATH") orelse "./smtp.db";
     log.info("Initializing database at: {s}", .{db_path});
     var db = try database.Database.init(allocator, db_path);
     defer db.deinit();
