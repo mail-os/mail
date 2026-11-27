@@ -1328,6 +1328,25 @@ pub const Database = struct {
         return .{ .db = self };
     }
 
+    /// Recognize hosted authority history without migrating an existing store.
+    pub fn pathHasHostedAuthority(allocator: std.mem.Allocator, db_path: []const u8) !bool {
+        var existing = try openReadOnly(allocator, db_path);
+        defer existing.deinit();
+        const tx = try existing.beginTransaction(.read);
+        defer tx.deinit();
+        inline for (.{ "provisioned_mailboxes", "provisioning_operations", "hosted_retired_mailboxes", "hosted_erasure_operations" }) |table| {
+            const schema = try tx.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 COLLATE NOCASE");
+            defer schema.finalize();
+            try schema.bind(1, @as([]const u8, table));
+            if (try schema.step()) {
+                const row = try tx.prepare("SELECT 1 FROM " ++ table ++ " LIMIT 1");
+                defer row.finalize();
+                if (try row.step()) return true;
+            }
+        }
+        return false;
+    }
+
     pub const AccessWindow = struct {
         service_until: i64,
         read_until: i64,

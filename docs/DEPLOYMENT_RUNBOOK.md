@@ -179,6 +179,12 @@ so its relative Maildir lives on the same volume as the database. Preserve any
 explicit working-directory override used by an existing installation. Two hosts
 or independently copied directories require separate writer fencing.
 
+Leave `SMTP_CLUSTER_ENABLED` unset or set it to `false` for hosted Mail.
+Startup returns `HostedClusterUnsupported` when cluster mode is enabled
+alongside the provisioning listener or when the SMTP database contains
+hosted mailbox, provisioning, retirement, or erasure records. This check
+also applies to a restored database with its provisioning listener off.
+
 Before adding a listener or worker that could write the same hosted mailbox
 from another daemon, complete [#179](https://github.com/mail-os/mail/issues/179).
 A topology with one writer per mailbox can have additional listeners only if

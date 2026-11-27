@@ -66,6 +66,74 @@ def eventually(read, predicate, timeout=10):
     raise AssertionError(value)
 
 
+def verify_cluster_authority(binary):
+    def refuse(test, reason, *flags):
+        try:
+            result = subprocess.run(test.daemon_command() + list(flags), cwd=test.directory, env=test.env,
+                                    capture_output=True, text=True, timeout=8)
+        except subprocess.TimeoutExpired as error:
+            raise AssertionError("Cluster mode started before confirming hosted write authority") from error
+        log = result.stdout + result.stderr
+        assert result.returncode != 0 and reason in log, log
+        assert "Initializing database" not in log and "SMTP monitoring listening" not in log, log
+
+    with tempfile.TemporaryDirectory(prefix="mail-cluster-authority-") as tmp:
+        root = Path(tmp)
+        fresh, copy, unmetered, unreadable = [root / name for name in ("hosted", "copy", "legacy", "unreadable")]
+        for directory in (fresh, copy, unmetered, unreadable):
+            directory.mkdir()
+        ports = iter(fixture["available_ports"](8))
+
+        def set_cluster(test, value="true"):
+            test.env.update(SMTP_CLUSTER_ENABLED=value, SMTP_CLUSTER_PORT=str(next(ports)),
+                            SMTP_MONITORING_PORT=str(next(ports)))
+
+        hosted = Fixture(binary, fresh)
+        set_cluster(hosted)
+        refuse(hosted, "HostedClusterUnsupported", "--validate-only")
+        refuse(hosted, "HostedClusterUnsupported")
+        assert not (fresh / "smtp.db").exists() and not (fresh / "mail").exists()
+
+        hosted.env["SMTP_CLUSTER_ENABLED"] = "false"
+        restored = Fixture(binary, copy, provisioning=False)
+        set_cluster(restored)
+        restored.password = hosted.password
+        with hosted.daemon():
+            mailbox = hosted.provision("cluster-authority")
+            assert "Cluster mode: false" in next(fresh.glob("mail-*.log")).read_text()
+            with closing(sqlite3.connect(fresh / "smtp.db")) as source, closing(sqlite3.connect(copy / "smtp.db")) as target:
+                source.backup(target)
+            before = (copy / "smtp.db").read_bytes()
+            refuse(restored, "HostedClusterUnsupported")
+            assert (copy / "smtp.db").read_bytes() == before
+            expect_smtp(hosted.deliver(mailbox, subject="Incumbent remains the writer"), 250)
+
+        # A stopped authority can still be served again without enabling clustering.
+        restored.env["SMTP_CLUSTER_ENABLED"] = "off"
+        with restored.daemon():
+            expect_smtp(restored.deliver(mailbox, subject="Read-only inspection preserved the restore"), 250)
+        restored.env["SMTP_CLUSTER_ENABLED"] = "true"
+        with closing(sqlite3.connect(copy / "smtp.db")) as database, database:
+            database.execute("DELETE FROM provisioned_mailboxes")
+            assert database.execute("SELECT 1 FROM provisioning_operations LIMIT 1").fetchone()
+        refuse(restored, "HostedClusterUnsupported")
+
+        corrupt = Fixture(binary, unreadable, provisioning=False)
+        set_cluster(corrupt)
+        bad_db = unreadable / "smtp.db"
+        bad_db.write_bytes(b"unreadable fixture database")
+        refuse(corrupt, "Could not verify hosted mailbox state")
+        assert bad_db.read_bytes() == b"unreadable fixture database"
+
+        legacy = Fixture(binary, unmetered, provisioning=False)
+        set_cluster(legacy)
+        with legacy.daemon():
+            user = legacy.create_local("standalone")
+            expect_smtp(legacy.deliver(user, subject="Non-hosted cluster configuration"), 250)
+            assert "Cluster mode: true" in next(unmetered.glob("mail-*.log")).read_text()
+    print("Verified hosted cluster refusal before listeners, separate restore inspection, retained operation history, and single-writer recovery.")
+
+
 def run(candidate, previous, webhook_ip):
     with tempfile.TemporaryDirectory(prefix="mail-local-route-") as tmp, listener("127.0.0.1") as search, listener(webhook_ip or "127.0.0.1") as webhooks:
         root = Path(tmp)
@@ -336,4 +404,5 @@ if __name__ == "__main__":
     parser.add_argument("--previous", type=Path)
     parser.add_argument("--webhook-ip", help="a documentation IP assigned to a loopback alias in an isolated network namespace")
     args = parser.parse_args()
+    verify_cluster_authority(args.binary.resolve())
     run(args.binary.resolve(), args.previous.resolve() if args.previous else None, args.webhook_ip)
