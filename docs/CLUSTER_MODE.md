@@ -1,6 +1,15 @@
 # Cluster Mode Guide
 
-This guide explains how to configure and use cluster mode for high availability SMTP deployments.
+The native cluster manager starts separately from mailbox storage. Each daemon
+keeps its SQLite database and Maildir locally. For hosted quotas, provisioning,
+queued work, and delivery receipts, use the
+[hosted single-writer deployment](DEPLOYMENT_RUNBOOK.md#hosted-mailbox-write-authority).
+Mail refuses cluster mode when hosted provisioning is configured or when the
+SMTP database contains hosted mailbox or operational history.
+
+The `mail serve` entry point currently supplies an empty peer list. The
+multi-node examples below describe the subsystem's intended topology. Keep
+active mailboxes on the single writer documented in the deployment runbook.
 
 ## Overview
 

@@ -186,6 +186,16 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
 
     log.info("=== SMTP Server Starting ===", .{});
 
+    const enable_cluster = envFlag("SMTP_CLUSTER_ENABLED") orelse false;
+    const provisioning_port: ?u16 = if (env.get("SMTP_PROVISIONING_PORT")) |value|
+        std.fmt.parseInt(u16, value, 10) catch return error.InvalidProvisioningPort
+    else
+        null;
+    if (enable_cluster and provisioning_port != null) {
+        log.err("Hosted provisioning requires one Mail writer. Disable SMTP_CLUSTER_ENABLED before starting.", .{});
+        return error.HostedClusterUnsupported;
+    }
+
     // Validate signers before claiming readiness or opening any listeners.
     try loadOutboundDkim(allocator, &log);
 
@@ -216,10 +226,17 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     };
     defer if (database_writer) |lock| lock.close(allocator);
 
-    const provisioning_port: ?u16 = if (env.get("SMTP_PROVISIONING_PORT")) |value|
-        std.fmt.parseInt(u16, value, 10) catch return error.InvalidProvisioningPort
-    else
-        null;
+    if (enable_cluster and database_writer != null) {
+        const hosted = database.Database.pathHasHostedAuthority(allocator, db_path) catch |err| {
+            log.err("Could not verify hosted mailbox state before cluster startup: {s}", .{@errorName(err)});
+            return err;
+        };
+        if (hosted) {
+            log.err("This database contains hosted mailbox state. Disable SMTP_CLUSTER_ENABLED before starting.", .{});
+            return error.HostedClusterUnsupported;
+        }
+    }
+
     const use_auth_backend = cfg.enable_auth or cfg.enable_webmail or provisioning_port != null;
     const enable_caldav = use_auth_backend and (envFlag("CALDAV_ENABLED") orelse cfg.enable_auth);
     const caldav_db_path = env.get("CALDAV_DB_PATH") orelse "./caldav.db";
@@ -434,7 +451,6 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
 
     // Initialize cluster mode if enabled
     var cluster_manager: ?*cluster.ClusterManager = null;
-    const enable_cluster = env.get("SMTP_CLUSTER_ENABLED") != null;
 
     if (enable_cluster) {
         const node_id = env.get("SMTP_NODE_ID") orelse "node-1";
