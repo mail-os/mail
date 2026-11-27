@@ -161,19 +161,20 @@ Maildir path alone cannot share the mailbox mutation lock. Treat either
 configuration as unverified for concurrent writers.
 
 On one host, `mail serve` takes exclusive nonblocking locks on the local
-`mail/` directory and a `.mail-writer.lock` file beside the resolved SMTP
-database. Both locks are held before SQLite opens, listeners start, or work
-replays. A second daemon exits with `MaildirWriterActive` or
-`DatabaseWriterActive` if either lock is held. A database symlink resolves
-to the same lock file. Keep the lock file between runs and mount the
-database directory as a unit. Hard-linked SMTP database files are refused.
-Stop the active daemon when upgrading from a version without both guards.
-Keep the Maildir and its database together, and stop the active daemon
-before replacing the directory itself or restoring the data. After a stop or
-crash releases the lock, the replacement can recover the existing journal.
-Check the service log and configured data paths if the daemon cannot acquire
-both locks. Use a local filesystem and keep the same Maildir and SQLite pairing
-through promotion. The Docker image uses `/var/mail` as its working directory
+`mail/` directory and on a `.mail-writer.lock` file beside each resolved
+SQLite database it opens. The enabled Calendar and Contacts store
+(`CALDAV_DB_PATH`) is covered alongside the SMTP database. One lock protects
+both schemas when one daemon stores them in a single SQLite file. The daemon
+holds its locks before SQLite opens, listeners start, or work replays. The
+startup log identifies which store refused a second writer. Database symlinks
+resolve to the same lock file. Mount each database directory as a unit and
+keep the lock files between runs. Hard-linked database files are refused.
+Stop the active daemon before upgrading from a version that lacks a guard,
+replacing a data directory, or restoring the data. After a stop or crash
+releases the locks, the replacement can reopen the stores and replay the
+existing acceptance journal. Check the service log and configured data paths
+if acquisition fails. Use a local filesystem and keep the same Maildir and
+database pairing through promotion. The Docker image uses `/var/mail` as its working directory
 so its relative Maildir lives on the same volume as the database. Preserve any
 explicit working-directory override used by an existing installation. Two hosts
 or independently copied directories require separate writer fencing.

@@ -114,6 +114,9 @@ def run(candidate, previous, webhook_ip):
             third = test.provision("third")
             forwarded = test.provision("forwarded")
             app_inbox = test.provision("app-pending")
+            status, calendar = test.api(test.login(first), "calendars", {"name": "Writer recovery calendar"})
+            assert status == 201, calendar
+            calendar_id = calendar["id"]
             bad_dirs = {user: block(user) for user in (second, third, app_inbox)}
 
             # A failure late inside admission rolls back the entire envelope
@@ -205,10 +208,47 @@ def run(candidate, previous, webhook_ip):
                 hardlink.unlink()
 
             separate.env["SMTP_DB_PATH"] = str(separate_dir / "smtp.db")
+            dav_database = Path(test.env["CALDAV_DB_PATH"])
+            dav_alias = separate_dir / "shared-caldav.db"
+            dav_alias.symlink_to(dav_database)
+            for path in (dav_database, dav_alias):
+                separate.env["CALDAV_DB_PATH"] = str(path)
+                try:
+                    blocked = subprocess.run(separate.daemon_command(), cwd=separate.directory, env=separate.env,
+                                             capture_output=True, text=True, timeout=8)
+                except subprocess.TimeoutExpired as error:
+                    raise AssertionError("A second daemon started against the occupied DAV database") from error
+                log = blocked.stdout + blocked.stderr
+                assert blocked.returncode != 0 and "Could not acquire DAV database write authority: DatabaseWriterActive" in log, log
+                assert "Initializing database" not in log and "SMTP monitoring listening" not in log, log
+
+            hardlink = separate_dir / "hardlinked-caldav.db"
+            hardlink.hardlink_to(dav_database)
+            try:
+                separate.env["CALDAV_DB_PATH"] = str(hardlink)
+                blocked = subprocess.run(separate.daemon_command(), cwd=separate.directory, env=separate.env,
+                                         capture_output=True, text=True, timeout=8)
+                log = blocked.stdout + blocked.stderr
+                assert blocked.returncode != 0 and "Could not acquire DAV database write authority: DatabaseWriterPathNotUnique" in log, log
+                assert "Initializing database" not in log and "SMTP monitoring listening" not in log, log
+            finally:
+                hardlink.unlink()
+
+            separate.env["CALDAV_DB_PATH"] = str(separate_dir / "caldav.db")
             with separate.daemon():
                 independent = separate.provision("independent-writer")
                 expect_smtp(separate.deliver(independent, subject="Independent writer"), 250)
                 assert separate.bytes(independent) > 0
+
+            # An installation can keep both schemas in one file. A symlink
+            # must reuse the same held lock without blocking its own daemon.
+            dav_alias.unlink()
+            dav_alias.symlink_to(Path(separate.env["SMTP_DB_PATH"]))
+            separate.env["CALDAV_DB_PATH"] = str(dav_alias)
+            with separate.daemon():
+                expect_smtp(separate.deliver(independent, subject="Combined SQLite writer"), 250)
+                status, calendar = separate.api(separate.login(independent), "calendars", {"name": "Combined SQLite calendar"})
+                assert status == 201, calendar
 
             assert process.poll() is None
             assert query("SELECT outcome FROM accepted_mail_targets WHERE mailbox=?", (app_inbox,)) == [("pending",)]
@@ -236,6 +276,8 @@ def run(candidate, previous, webhook_ip):
         standby.password, standby.specs = test.password, test.specs
         test = standby
         with test.daemon():
+            status, calendars = test.api(test.login(first), "calendars")
+            assert status == 200 and any(item["id"] == calendar_id for item in calendars["calendars"]), calendars
             for user in (first, second, third, forwarded):
                 assert messages(user) == ["Recovered DATA envelope"], user
                 visible, = list((root / "mail" / user / "new").iterdir())
@@ -251,7 +293,7 @@ def run(candidate, previous, webhook_ip):
                         return [payload["recipients"][0] for _, payload in webhooks.events]
                 eventually(notified, lambda users: all(user in users for user in (first, second, third, app_inbox)))
                 assert forwarded not in notified()
-            print("Verified atomic acceptance, quota reservations, writer exclusion, process death, exactly-once local recovery, and committed counts and indexing.")
+            print("Verified atomic acceptance, quota reservations, Maildir, SMTP and DAV writer exclusion, exactly-once recovery after process death, and committed counts and indexing.")
 
             reviewer = test.provision("reviewer")
             no_forward = test.provision("no-forward")

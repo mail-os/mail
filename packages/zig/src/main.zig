@@ -210,13 +210,27 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     defer _ = std.c.close(maildir_writer);
 
     const db_path = env.get("SMTP_DB_PATH") orelse "./smtp.db";
-    const database_writer = writer.openDatabaseForDaemon(allocator, db_path) catch |err| {
+    const database_writer = writer.openDatabaseForDaemon(allocator, db_path, null) catch |err| {
         log.err("Could not acquire SMTP database write authority: {s}", .{@errorName(err)});
         return err;
     };
-    defer if (database_writer) |fd| {
-        _ = std.c.close(fd);
-    };
+    defer if (database_writer) |lock| lock.close(allocator);
+
+    const provisioning_port: ?u16 = if (env.get("SMTP_PROVISIONING_PORT")) |value|
+        std.fmt.parseInt(u16, value, 10) catch return error.InvalidProvisioningPort
+    else
+        null;
+    const use_auth_backend = cfg.enable_auth or cfg.enable_webmail or provisioning_port != null;
+    const enable_caldav = use_auth_backend and (envFlag("CALDAV_ENABLED") orelse cfg.enable_auth);
+    const caldav_db_path = env.get("CALDAV_DB_PATH") orelse "./caldav.db";
+    const caldav_writer = if (enable_caldav)
+        writer.openDatabaseForDaemon(allocator, caldav_db_path, database_writer) catch |err| {
+            log.err("Could not acquire DAV database write authority: {s}", .{@errorName(err)});
+            return err;
+        }
+    else
+        null;
+    defer if (caldav_writer) |lock| lock.close(allocator);
 
     var smtp_monitor: ?smtp_monitoring.Listener = null;
     if (env.get("SMTP_MONITORING_PORT")) |value| {
@@ -274,11 +288,7 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     // That combination is not exotic. It is exactly a development mail catcher:
     // no SMTP AUTH, because there are no accounts to authenticate, and a
     // webmail UI, because reading the caught mail is the entire point.
-    const provisioning_port: ?u16 = if (env.get("SMTP_PROVISIONING_PORT")) |value|
-        std.fmt.parseInt(u16, value, 10) catch return error.InvalidProvisioningPort
-    else
-        null;
-    if (cfg.enable_auth or cfg.enable_webmail or provisioning_port != null) {
+    if (use_auth_backend) {
         auth_backend = auth.AuthBackend.init(allocator, &db);
         auth_backend.?.exact_mailbox_domains = cfg.exact_mailbox_domains;
         const auth_default_domain = cfg.auth_default_domain orelse if (std.mem.indexOfScalar(u8, cfg.hostname, '.')) |dot|
@@ -743,8 +753,6 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
     var caldav_store_inst: ?caldav_store_mod.CalDavStore = null;
     var caldav_server: ?caldav.CalDavServer = null;
     var caldav_thread: ?std.Thread = null;
-    // Same defect, same fix. See `enable_imap` above.
-    const enable_caldav = envFlag("CALDAV_ENABLED") orelse cfg.enable_auth;
     const caldav_port: u16 = blk: {
         const port_str = env.get("CALDAV_PORT") orelse "80";
         break :blk std.fmt.parseInt(u16, port_str, 10) catch 80;
@@ -762,10 +770,9 @@ pub fn run(allocator: std.mem.Allocator, cli_args: args_parser.Args) !void {
         break :blk std.fmt.parseInt(u16, port_str, 10) catch 443;
     };
 
-    if (enable_caldav and auth_ptr != null) {
+    if (enable_caldav) {
         // Persist CalDAV/CardDAV data to SQLite so calendars/contacts survive
         // restarts (and so the ActiveSync server has real data to sync).
-        const caldav_db_path = env.get("CALDAV_DB_PATH") orelse "./caldav.db";
         var store_config = caldav_store_mod.StoreConfig{ .db_path = caldav_db_path, .account_db = db_ptr.? };
         if (env.get("CALDAV_MAX_SYNC_HISTORY")) |value| {
             store_config.max_sync_history = std.fmt.parseInt(u32, value, 10) catch store_config.max_sync_history;

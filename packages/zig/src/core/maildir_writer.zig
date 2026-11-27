@@ -1,4 +1,4 @@
-//! Hold writer locks on the Maildir and canonical SMTP database path.
+//! Hold writer locks on the Maildir and canonical SQLite paths.
 const std = @import("std");
 const fs = @import("fs_compat.zig");
 const io_compat = @import("io_compat.zig");
@@ -29,7 +29,17 @@ pub fn openForDaemon() !std.c.fd_t {
     return fd;
 }
 
-pub fn openDatabaseForDaemon(allocator: std.mem.Allocator, path: []const u8) !?std.c.fd_t {
+pub const DatabaseWriter = struct {
+    fd: std.c.fd_t,
+    path: []const u8,
+
+    pub fn close(self: DatabaseWriter, allocator: std.mem.Allocator) void {
+        _ = std.c.close(self.fd);
+        allocator.free(self.path);
+    }
+};
+
+pub fn openDatabaseForDaemon(allocator: std.mem.Allocator, path: []const u8, held: ?DatabaseWriter) !?DatabaseWriter {
     // SQLite uses private state for these special filenames.
     if (path.len == 0 or std.mem.eql(u8, path, ":memory:")) return null;
     const path_z = try allocator.dupeSentinel(u8, path, 0);
@@ -46,7 +56,13 @@ pub fn openDatabaseForDaemon(allocator: std.mem.Allocator, path: []const u8) !?s
     if (database_stat.nlink != 1) return error.DatabaseWriterPathNotUnique;
 
     const resolved = fs.cwd().realpathAlloc(allocator, path) catch return error.DatabaseWriterFileUnavailable;
-    defer allocator.free(resolved);
+    errdefer allocator.free(resolved);
+    if (held) |existing| {
+        if (std.mem.eql(u8, resolved, existing.path)) {
+            allocator.free(resolved);
+            return null;
+        }
+    }
     const lock_path = try std.fmt.allocPrintSentinel(allocator, "{s}.mail-writer.lock", .{resolved}, 0);
     defer allocator.free(lock_path);
 
@@ -62,5 +78,5 @@ pub fn openDatabaseForDaemon(allocator: std.mem.Allocator, path: []const u8) !?s
         error.MaildirWriterActive => return error.DatabaseWriterActive,
         else => return error.DatabaseWriterLockFailed,
     };
-    return fd;
+    return .{ .fd = fd, .path = resolved };
 }
