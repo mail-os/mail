@@ -2035,7 +2035,10 @@ credential to the root-managed Mail environment file. Set
 `/api/operations/health`. The watchdog rejects redirects and stale reports.
 The operator endpoint includes aggregate counts. Webmail health and alerts
 use only fixed check labels and outcomes. The monitor retains active hosted
-incidents while it cannot fetch a fresh report.
+incidents while it cannot fetch a fresh report. After configuration has been
+detected, removing the URL and token raises a hosted monitoring incident. A
+disabled check also keeps an existing incident open. Restore the monitoring
+configuration and confirm a fresh healthy result before treating it as recovered.
 
 Hosted provisioning alerts on an unavailable private listener or a free or
 paid mailbox still awaiting confirmation after 15 minutes. Billing alerts on

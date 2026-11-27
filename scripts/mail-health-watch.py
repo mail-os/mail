@@ -336,13 +336,13 @@ def read_hosted_report(url, token):
 
 
 def hosted_checks(env_file, state, now):
-    previous = set(state.get('active', [])) & set(HOSTED_CHECKS.values())
+    active = set(state.get('active', []))
+    previous = active.intersection(HOSTED_CHECKS.values())
     try:
         url = env_setting(env_file, 'MAIL_APP_OPERATIONS_URL')
         token = env_setting(env_file, 'MAIL_OPERATIONS_TOKEN')
-        state['hosted_monitor_configured'] = bool(url or token)
-        if not state['hosted_monitor_configured']:
-            return []
+        if url or token:
+            state['hosted_monitor_configured'] = True
         report = read_hosted_report(url, token)
         checked_at = report.get('checked_at')
         checks = report.get('checks')
@@ -350,18 +350,23 @@ def hosted_checks(env_file, state, now):
                 or not (now - 120 <= checked_at <= now + 30)
                 or not isinstance(checks, dict) or set(checks) != set(HOSTED_CHECKS)):
             raise ValueError('Stale or incompatible hosted health report')
-        results = [{'name': HOSTED_MONITOR_CHECK, 'ok': True}]
+        results = []
+        monitor_ok = True
         for key, name in HOSTED_CHECKS.items():
             observation = checks[key]
             status = observation.get('status')
             if status not in ('healthy', 'degraded', 'disabled', 'unavailable'):
                 raise ValueError('Invalid hosted health check')
-            if status != 'disabled':
-                # Backlog counts stay on the authenticated operator endpoint.
-                results.append({'name': name, 'ok': status == 'healthy'})
-        return results
+            if status == 'disabled':
+                if name not in previous:
+                    continue
+                # A disabled check cannot confirm recovery of an open incident.
+                monitor_ok = False
+            # Backlog counts stay on the authenticated operator endpoint.
+            results.append({'name': name, 'ok': status == 'healthy'})
+        return [{'name': HOSTED_MONITOR_CHECK, 'ok': monitor_ok}, *results]
     except (OSError, ValueError, AttributeError, TypeError):
-        if not previous and not state.get('hosted_monitor_configured'):
+        if not previous and HOSTED_MONITOR_CHECK not in active and not state.get('hosted_monitor_configured'):
             return []
         # Loss of the reader cannot recover an incident in the service it watches.
         return [{'name': HOSTED_MONITOR_CHECK, 'ok': False}] + [
