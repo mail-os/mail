@@ -2,6 +2,7 @@
 """Measure native HTTPS first-page search against a seeded mailbox."""
 
 import argparse
+from contextlib import ExitStack
 from email.utils import formatdate
 import hashlib
 import json
@@ -13,6 +14,7 @@ import random
 import runpy
 import tempfile
 import time
+from typing import NamedTuple
 from urllib.parse import urlencode
 
 
@@ -80,44 +82,74 @@ def measure(test, session, **params):
     return json.loads(data), elapsed, server_ms
 
 
-def run(binary, count, seed_value, samples):
-    with tempfile.TemporaryDirectory(prefix="mail-search-performance-") as temporary:
-        directory = Path(temporary)
-        test = Fixture(binary, directory, staging=True)
-        with test.daemon():
-            address = test.provision("search-performance", quota=1024 * 1024 * 1024)
-            hits = seed(directory, address, count, seed_value)
-            with test.imap(address) as imap:
-                for folder in ("INBOX", "Archive"):
-                    assert imap.select(folder)[0] == "OK"
-            session = test.login(address)
-            indexed, cold_ms, _ = measure(test, session, q="seed warmup with no matches")
-            assert indexed["index"] == {"total": count, "indexed": count, "pending": False}, indexed
-            print(f"Indexed {count} messages in {cold_ms / 1000:.2f} s", flush=True)
-            result = {}
-            for name, params in CASES.items():
-                latencies, timings = [], []
-                for sample in range(samples + 2):
-                    body, elapsed, server_ms = measure(test, session, **params)
-                    assert body["index"] == indexed["index"], body["index"]
-                    assert body["page"] == 1 and body["message_total"] == hits[name], (name, body["message_total"], hits[name])
-                    key = "threads" if params.get("conversations") == "true" else "items"
-                    assert len(body[key]) == min(body["total"], PAGE_SIZE) and body["total"] == hits[name]
+class SearchMailbox(NamedTuple):
+    daemon: Fixture
+    session: dict[str, str]
+    hits: dict[str, int]
+    cold_index_ms: float
+
+
+def open_mailbox(stack, binary, count, seed_value):
+    directory = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="mail-search-performance-")))
+    test = Fixture(binary, directory, staging=True)
+    stack.enter_context(test.daemon())
+    address = test.provision("search-performance", quota=1024 * 1024 * 1024)
+    hits = seed(directory, address, count, seed_value)
+    with test.imap(address) as imap:
+        for folder in ("INBOX", "Archive"):
+            assert imap.select(folder)[0] == "OK"
+    session = test.login(address)
+    indexed, cold_ms, _ = measure(test, session, q="seed warmup with no matches")
+    assert indexed["index"] == {"total": count, "indexed": count, "pending": False}, indexed
+    return SearchMailbox(test, session, hits, cold_ms)
+
+
+def run(binaries, count, seed_value, samples):
+    with ExitStack() as stack:
+        mailboxes, reports = {}, {}
+        for side, binary in binaries.items():
+            mailbox = open_mailbox(stack, binary, count, seed_value)
+            print(f"{side}: indexed {count} messages in {mailbox.cold_index_ms / 1000:.2f} s", flush=True)
+            mailboxes[side] = mailbox
+            reports[side] = {"cold_index_ms": round(mailbox.cold_index_ms, 2), "cases": {}}
+        expected_index = {"total": count, "indexed": count, "pending": False}
+        for name, params in CASES.items():
+            latencies = {side: [] for side in mailboxes}
+            timings = {side: [] for side in mailboxes}
+            key = "threads" if params.get("conversations") == "true" else "items"
+            for sample in range(samples + 2):
+                # Alternate which daemon answers first, including the warmups.
+                order = mailboxes if sample % 2 == 0 else reversed(mailboxes)
+                for side in order:
+                    mailbox = mailboxes[side]
+                    body, elapsed, server_ms = measure(mailbox.daemon, mailbox.session, **params)
+                    hits = mailbox.hits[name]
+                    assert body["index"] == expected_index, (side, body["index"])
+                    assert body["page"] == 1 and body["message_total"] == hits, (side, name, body["message_total"], hits)
+                    assert len(body[key]) == min(body["total"], PAGE_SIZE) and body["total"] == hits
                     if sample >= 2:
-                        latencies.append(elapsed)
+                        latencies[side].append(elapsed)
                         if server_ms is not None:
-                            timings.append(server_ms)
-                result[name] = {
-                    "matches": hits[name],
-                    "https_p95_ms": percentile(latencies),
-                    "server_p95_ms": percentile(timings) if len(timings) == samples else None,
+                            timings[side].append(server_ms)
+            for side, mailbox in mailboxes.items():
+                result = {
+                    "matches": mailbox.hits[name],
+                    "https_p95_ms": percentile(latencies[side]),
+                    "server_p95_ms": percentile(timings[side]) if len(timings[side]) == samples else None,
                 }
-                print(f"{name}: {result[name]}", flush=True)
-            return {"cold_index_ms": round(cold_ms, 2), "cases": result}
+                reports[side]["cases"][name] = result
+                print(f"{side} {name}: {result}", flush=True)
+        return reports
 
 
 def percentile(values):
     return round(sorted(values)[math.ceil(0.95 * len(values)) - 1], 2)
+
+
+def binary_identity(binary, revision):
+    with binary.open("rb") as executable:
+        digest = hashlib.file_digest(executable, "sha256").hexdigest()
+    return {"revision": revision, "binary_sha256": digest}
 
 
 def main():
@@ -128,13 +160,18 @@ def main():
     parser.add_argument("--seed", type=int, default=71)
     parser.add_argument("--revision", default="unspecified")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--baseline-report", type=Path)
+    comparison = parser.add_mutually_exclusive_group()
+    comparison.add_argument("--baseline-report", type=Path, help="Compare with a separate report from the same environment")
+    comparison.add_argument("--baseline-binary", type=Path, help="Alternate requests between this baseline and the candidate")
+    parser.add_argument("--baseline-revision", help="Source revision of the paired baseline binary")
     parser.add_argument("--enforce", action="store_true", help="Fail if a warm case exceeds its latency gate")
     args = parser.parse_args()
     if args.messages < 10 or args.samples < 1:
         parser.error("provide at least 10 messages and one sample")
     if args.enforce and (args.messages != 50_000 or args.samples < 20):
         parser.error("the latency gate requires 50,000 messages and at least 20 samples")
+    if (args.baseline_binary is None) != (args.baseline_revision is None):
+        parser.error("--baseline-binary and --baseline-revision must be used together")
 
     binary = args.binary.resolve(strict=True)
     environment = {"os": platform.platform(), "cpu_count": os.cpu_count(), "python": platform.python_version()}
@@ -143,10 +180,17 @@ def main():
     baseline = json.loads(args.baseline_report.read_text()) if args.baseline_report else None
     if baseline and (baseline["fixture"] != configuration or baseline["environment"] != environment):
         parser.error("the baseline must come from the same fixture and environment")
-    with binary.open("rb") as executable:
-        digest = hashlib.file_digest(executable, "sha256").hexdigest()
-    report = {"revision": args.revision, "binary_sha256": digest, "environment": environment, "fixture": configuration}
-    report.update(run(binary, args.messages, args.seed, args.samples))
+    scope = {"environment": environment, "fixture": configuration}
+    report = {**binary_identity(binary, args.revision), **scope}
+    binaries = {"candidate": binary}
+    if args.baseline_binary:
+        binaries["baseline"] = args.baseline_binary.resolve(strict=True)
+        baseline = {**binary_identity(binaries["baseline"], args.baseline_revision), **scope}
+    runs = run(binaries, args.messages, args.seed, args.samples)
+    report.update(runs["candidate"])
+    if args.baseline_binary:
+        baseline.update(runs["baseline"])
+        report["paired_baseline"] = baseline
     report["baseline_revision"] = baseline["revision"] if baseline else None
     for name, result in report["cases"].items():
         server_p95 = result["server_p95_ms"]

@@ -1768,6 +1768,19 @@ Build the Mail binary in ReleaseSafe or ReleaseFast and use the same build
 mode, machine, and filesystem for both sides of a comparison.
 
 ```bash
+python3 scripts/benchmark-webmail-search.py /path/to/candidate-mail \
+  --revision <candidate-commit> --baseline-binary /path/to/baseline-mail \
+  --baseline-revision <baseline-commit> --output /tmp/mail-search-paired.json --enforce
+```
+
+The paired run starts each binary against its own disposable mailbox and
+alternates which one answers first for each warm HTTPS request pair. Its
+`paired_baseline` field records the baseline executable hash, fixture, and
+measurements alongside the candidate.
+
+Use a separate baseline report when the two binaries need to run separately.
+
+```bash
 python3 scripts/benchmark-webmail-search.py /path/to/baseline-mail \
   --revision <baseline-commit> --output /tmp/mail-search-baseline.json
 python3 scripts/benchmark-webmail-search.py /path/to/candidate-mail \
@@ -1784,11 +1797,11 @@ samples. The `mail-list` Server-Timing duration measures the server handler
 through JSON serialization, including authentication work. HTTPS duration
 also includes transport and provides an upper bound for older binaries.
 
-`--enforce` requires warm server p95 at or below 1,000 ms in each case. With a
-baseline report it also requires HTTPS p95 within 10% of that report for the
-same fixture and environment. Main-branch CI publishes the results alongside
-the native benchmark artifact. Use a disposable host with an idle workload to
-record release-to-release baselines.
+`--enforce` requires warm server p95 at or below 1,000 ms in each case. With
+either baseline option it also requires HTTPS p95 within 10% of the baseline
+for the same fixture and environment. Main-branch CI publishes single-build
+results alongside the native benchmark artifact. Use a disposable host with
+an idle workload to record release-to-release baselines.
 
 ---
 
