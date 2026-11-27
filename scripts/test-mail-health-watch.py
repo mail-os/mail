@@ -195,10 +195,10 @@ class HealthTests(unittest.TestCase):
             env = root / 'env'
             stamp = root / 'last-success'
             env.write_text(f'MAIL_RESTIC_STATUS_FILE={stamp}\n')
-            self.assertEqual(watch.backup_checks(env, now), [{'name': watch.BACKUP_CHECK, 'ok': False}])
+            self.assertEqual(watch.backup_checks(env, {}, now), [{'name': watch.BACKUP_CHECK, 'ok': False}])
             for value, expected in [(10000, True), (9999, False), (100001, False), ('bad', False)]:
                 stamp.write_text(f'timestamp={value}\nrepository=private-repository\n')
-                checks = watch.backup_checks(env, now)
+                checks = watch.backup_checks(env, {}, now)
                 self.assertEqual(checks, [{'name': watch.BACKUP_CHECK, 'ok': expected}])
                 self.assertEqual(watch.deploy_gate_failures(checks), [])
 
@@ -252,7 +252,7 @@ class HealthTests(unittest.TestCase):
             timestamp = int(receipt.read_text().splitlines()[0].split('=', 1)[1])
             self.assertGreater(timestamp, 1)
             self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
-            self.assertEqual(watch.backup_checks(config, timestamp), [{'name': watch.BACKUP_CHECK, 'ok': True}])
+            self.assertEqual(watch.backup_checks(config, {}, timestamp), [{'name': watch.BACKUP_CHECK, 'ok': True}])
             self.assertFalse(list(state.glob('backup.*')))
 
     def test_delivery_minute_window_and_depth_at_threshold(self):

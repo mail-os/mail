@@ -2057,7 +2057,9 @@ When the Restic backup timer is installed, the watchdog checks the timestamp in
 or more than 25-hour-old success marker opens an incident. Set
 `MAIL_RESTIC_STATUS_FILE` in the Mail environment file when the configured
 backup writes its success marker elsewhere. The marker is written after
-Restic verifies the off-host backup.
+Restic verifies the off-host backup. An open freshness incident stays open
+if the receipt path and default timer disappear. Restore the monitoring
+configuration and verify a fresh receipt to confirm recovery.
 
 **Scheduled backups on shared AWS staging**
 

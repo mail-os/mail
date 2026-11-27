@@ -374,12 +374,15 @@ def hosted_checks(env_file, state, now):
         ]
 
 
-def backup_checks(env_file, now):
+def backup_checks(env_file, state, now):
     try:
         override = env_setting(env_file, 'MAIL_RESTIC_STATUS_FILE')
     except OSError:
         override = ''
     if not override and not BACKUP_TIMER.is_file():
+        # Losing the source of an observation cannot confirm recovery.
+        if BACKUP_CHECK in state.get('active', []):
+            return [{'name': BACKUP_CHECK, 'ok': False}]
         return []
     try:
         with pathlib.Path(override or BACKUP_STATUS).open() as stream:
@@ -472,7 +475,7 @@ def run(args):
     mailbox = args.mailbox_path or runtime / 'mail'
     checks += delivery_checks(database, state, now)
     checks += hosted_checks(args.env_file, state, now)
-    checks += backup_checks(args.env_file, now)
+    checks += backup_checks(args.env_file, state, now)
     checks += sync_checks(args.env_file, args.host, state)
     checks += scanner_checks()
     checks += storage_capacity_checks(runtime, mailbox, database)
