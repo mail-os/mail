@@ -216,6 +216,51 @@ def verify_hosted_incidents(root, sink, check_health):
         assert not any(sensitive in msg["content"] for msg in sink.messages)
 
 
+def verify_backup_incidents(root, sink, check_health):
+    env = root / "mail.env"
+    unconfigured = env.read_text()
+    stamp = root / "last-success"
+    timer = root / "backup.timer"
+    name = watch["BACKUP_CHECK"]
+    base = int(time.time())
+    with patch.dict(watch["main"].__globals__, {"BACKUP_TIMER": timer, "BACKUP_STATUS": stamp}):
+        assert name not in check_health(base)
+        for offset, source in enumerate(("override", "timer")):
+            now = base + offset * 6
+            configured = unconfigured + f"MAIL_RESTIC_STATUS_FILE={stamp}\n" if source == "override" else unconfigured
+            env.write_text(configured)
+            if source == "timer":
+                timer.touch()
+            stamp.write_text(f"timestamp={now - 90001}\nrepository=private-backup-reference\n")
+            start = len(sink.messages)
+            assert check_health(now)[name] == {"name": name, "ok": False}
+            assert len(sink.messages) == start + 1 and name in sink.messages[-1]["content"]
+
+            # Each run reads the durable incident state as a fresh timer invocation.
+            env.write_text(unconfigured)
+            timer.unlink(missing_ok=True)
+            assert not check_health(now + 1)[name]["ok"]
+            assert not check_health(now + 2)[name]["ok"]
+            assert len(sink.messages) == start + 1
+
+            env.write_text(configured)
+            if source == "timer":
+                timer.touch()
+            assert not check_health(now + 3)[name]["ok"]
+            assert len(sink.messages) == start + 1
+            stamp.write_text(f"timestamp={now + 4}\nrepository=private-backup-reference\n")
+            assert check_health(now + 4)[name]["ok"]
+            assert len(sink.messages) == start + 2 and "checks recovered" in sink.messages[-1]["content"]
+
+            env.write_text(unconfigured)
+            timer.unlink(missing_ok=True)
+            assert name not in check_health(now + 5)
+            assert len(sink.messages) == start + 2
+    for sensitive in (str(stamp), "private-backup-reference"):
+        assert sensitive not in (root / "public/status.json").read_text()
+        assert not any(sensitive in msg["content"] for msg in sink.messages)
+
+
 def verify(binary):
     with tempfile.TemporaryDirectory(prefix="mail-delivery-alerts-") as directory:
         root = Path(directory)
@@ -285,9 +330,10 @@ def verify(binary):
                 check_health()
                 assert len(sink.messages) == count
             assert len(sink.messages) == 6, sink.messages
+            verify_backup_incidents(root, sink, check_health)
             verify_hosted_incidents(root, sink, check_health)
         assert not any(owner in msg["content"] for msg in sink.messages)
-        print("Verified live queue and delivery thresholds, hosted monitoring coverage, failed webhook retry, rate-limit backoff, deduplication, and recovery over a disposable receiver.")
+        print("Verified live queue and delivery thresholds, hosted and backup monitoring, failed webhook retry, rate-limit backoff, deduplication, and recovery over a disposable receiver.")
 
 
 if __name__ == "__main__":
