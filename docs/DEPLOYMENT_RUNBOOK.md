@@ -15,6 +15,12 @@ Build the chosen Linux x86-64 revision with `zig build -Dtarget=x86_64-linux-gnu
 
 Create `/mail-server/staging/provisioning-token` as an SSM SecureString in the target region with a 32-byte hex-encoded token. `/mail-server/staging/discord-webhook-url` is an optional SecureString for a staging alert receiver. The instance role can read those parameters and the selected artifact.
 
+If Discord rate limits the watchdog, pending alerts stay in the private
+outbox until the `Retry-After` or `retry_after` deadline. When the response
+omits a usable delay, the watchdog waits one minute. It continues publishing health
+results during the wait. The `Admin alert transport` entry in its status
+file exposes the pending count and a `retry_at` UTC epoch second when present.
+
 Run this from `packages/cloud` after setting `STAGING_DOMAIN_NAME` to the hostname, `STAGING_HOSTED_ZONE_ID` to the dedicated zone ID, `STAGING_ARTIFACT_S3_URI` to the published archive, and `STAGING_ARTIFACT_SHA256` to its checksum. `AWS_REGION` defaults to `us-east-1`.
 
 ```bash

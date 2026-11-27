@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise durable incident deduplication, recovery, alert retries and privacy."""
 import importlib.util
+import io
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -16,6 +17,7 @@ from threading import Thread
 import types
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 spec = importlib.util.spec_from_file_location('watch', pathlib.Path(__file__).with_name('mail-health-watch.py'))
 watch = importlib.util.module_from_spec(spec)
@@ -283,6 +285,19 @@ class HealthTests(unittest.TestCase):
                     self.assertEqual(sent.call_count, 1)
                 self.assertEqual(args.state_path.stat().st_mode & 0o777, 0o600)
                 self.assertEqual(args.status_path.stat().st_mode & 0o777, 0o640)
+
+    def test_discord_retry_delay_supports_header_and_fractional_json(self):
+        for header, body, expected in [
+            ('90', b'{"retry_after": 64.57}', 90),
+            (None, b'{"retry_after": 64.57}', 64.57),
+            ('nan', b'{"retry_after": 3.25}', 3.25),
+            ('-1', b'{"retry_after": true}', 60),
+            (None, b'not JSON', 60),
+        ]:
+            with self.subTest(header=header, body=body):
+                headers = {} if header is None else {'Retry-After': header}
+                with HTTPError('https://discord.com/api/webhooks/test', 429, '', headers, io.BytesIO(body)) as response:
+                    self.assertEqual(watch.discord_retry_delay(response), expected)
 
     def run_gate(self, root, probe_checks, journal):
         args = types.SimpleNamespace(state_path=root/'private/state.json', status_path=root/'public/status.json',

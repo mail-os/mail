@@ -2,7 +2,7 @@
 """Exercise live outbound queue incidents and recovery on disposable services."""
 
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -37,7 +37,12 @@ class Receiver(BaseHTTPRequestHandler):
         self.server.entered.set()
         if self.server.failing:
             self.server.unblock.wait(timeout=15)
-        self.send_response(503 if self.server.failing else 204)
+            self.send_response(503)
+        elif self.server.retry_after is not None:
+            self.send_response(429)
+            self.send_header("Retry-After", str(self.server.retry_after))
+        else:
+            self.send_response(204)
         self.end_headers()
 
     def log_message(self, *_):
@@ -51,6 +56,7 @@ def receiver():
         server.entered = Event()
         server.unblock = Event()
         server.failing = True
+        server.retry_after = None
         worker = Thread(target=server.serve_forever, daemon=True)
         worker.start()
         try:
@@ -137,8 +143,9 @@ def monitor(root, db_path, sink, host="mail.example.test"):
             return probe
         return run_command(command, *positional, **options)
 
-    def check_health():
-        with patch.object(watch["subprocess"], "run", side_effect=check_command), \
+    def check_health(observed_at=None):
+        clock = nullcontext() if observed_at is None else patch.object(watch["time"], "time", return_value=observed_at)
+        with clock, patch.object(watch["subprocess"], "run", side_effect=check_command), \
             patch.dict(watchdog.__globals__, {"journal_checks": lambda state, now: []}), \
             patch.object(watch["shutil"], "disk_usage", return_value=SimpleNamespace(total=10**10, free=5 * 10**9)):
             watchdog(args)
@@ -178,10 +185,22 @@ def verify(binary):
                     assert not check.result(timeout=15)["Admin alert transport"]["ok"]
                 assert len(watch["load_state"](root / "private/state.json")["pending"]) == 1
                 sink.failing = False
-                assert check_health()["Admin alert transport"]["ok"]
-                check_health()
-                assert len(sink.messages) == 2, sink.messages
-                assert sink.messages[0] == sink.messages[1], sink.messages
+                sink.retry_after = 90
+                stamp = int(time.time())
+                assert not check_health(stamp)["Admin alert transport"]["ok"]
+                assert len(sink.messages) == 2
+                assert watch["load_state"](root / "private/state.json")["alert_retry_at"] == stamp + 90
+                sink.retry_after = None
+                deferred = check_health(stamp + 60)["Admin alert transport"]
+                assert len(sink.messages) == 2, "Webhook was retried before Retry-After elapsed"
+                assert not deferred["ok"] and deferred["pending"] == 1 and deferred["retry_at"] == stamp + 90
+                assert not check_health(stamp + 89)["Admin alert transport"]["ok"]
+                assert len(sink.messages) == 2
+                assert check_health(stamp + 90)["Admin alert transport"]["ok"]
+                assert "alert_retry_at" not in watch["load_state"](root / "private/state.json")
+                check_health(stamp + 91)
+                assert len(sink.messages) == 3, sink.messages
+                assert sink.messages[0] == sink.messages[1] == sink.messages[2], sink.messages
                 (root / "release-delivery").touch()
                 assert wait_for(queue, db, 1000)["ok"]
                 assert check_health()[queue]["ok"]
@@ -204,9 +223,9 @@ def verify(binary):
                 count = len(sink.messages)
                 check_health()
                 assert len(sink.messages) == count
-        assert len(sink.messages) == 5, sink.messages
+        assert len(sink.messages) == 6, sink.messages
         assert not any(owner in msg["content"] for msg in sink.messages)
-        print("Verified live queue and delivery thresholds, failed webhook retry, deduplication, and recovery over a disposable receiver.")
+        print("Verified live queue and delivery thresholds, failed webhook retry, rate-limit backoff, deduplication, and recovery over a disposable receiver.")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ webhook credentials, journal cursors and the retry queue remain root-private.
 import argparse
 from contextlib import closing
 import json
+import math
 import os
 import pathlib
 import re
@@ -146,6 +147,32 @@ def scanner_checks(proc_root=pathlib.Path('/proc')):
     return [{'name': SCANNER_CHECK, 'ok': ok}]
 
 
+class AlertRateLimited(Exception):
+    def __init__(self, retry_after):
+        super().__init__('Alert transport is rate limited')
+        self.retry_after = retry_after
+
+
+def retry_after_seconds(value):
+    try:
+        seconds = float(str(value))
+    except ValueError:
+        return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+
+def discord_retry_delay(error):
+    delay = retry_after_seconds(error.headers.get('Retry-After'))
+    if delay is not None:
+        return delay
+    try:
+        body = json.loads(error.read(4096))
+    except (OSError, ValueError):
+        body = None
+    delay = retry_after_seconds(body.get('retry_after')) if isinstance(body, dict) else None
+    return 60 if delay is None else delay
+
+
 def send_alert(webhook, content):
     parsed = urllib.parse.urlsplit(webhook)
     if parsed.scheme != 'https' or parsed.hostname not in ('discord.com', 'discordapp.com') or not parsed.path.startswith('/api/webhooks/'):
@@ -153,9 +180,15 @@ def send_alert(webhook, content):
     request = urllib.request.Request(webhook, data=json.dumps({
         'content': content, 'allowed_mentions': {'parse': []},
     }).encode(), headers={'Content-Type': 'application/json', 'User-Agent': 'Stacks-Mail-Health/1.0'}, method='POST')
-    with urllib.request.urlopen(request, timeout=10) as response:
-        if response.status not in (200, 204):
-            raise RuntimeError('Alert transport rejected the notification')
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            if response.status not in (200, 204):
+                raise RuntimeError('Alert transport rejected the notification')
+    except urllib.error.HTTPError as error:
+        with error:
+            if error.code == 429:
+                raise AlertRateLimited(discord_retry_delay(error)) from None
+            raise
 
 
 # What a deploy cannot vouch for. Journal patterns record what clients and
@@ -448,9 +481,13 @@ def run(args):
     # Commit the notification before attempting delivery, so a crash cannot lose it.
     atomic_json(args.state_path, state, 0o600)
     notification_ok = False
+    webhook = ''
+    retry_at = state.get('alert_retry_at')
     try:
         webhook = env_setting(args.env_file, 'DISCORD_WEBHOOK_URL')
-        if webhook:
+        if webhook and (retry_at is None or time.time() >= retry_at):
+            retry_at = None
+            state.pop('alert_retry_at', None)
             for event in list(state['pending'])[:4]:
                 stamp = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(event['at']))
                 send_alert(webhook, f"{args.host}: {event['summary']} ({stamp}). Open /status in webmail for checks and incident history.")
@@ -458,10 +495,20 @@ def run(args):
                 state['last_alert_at'] = now
                 atomic_json(args.state_path, state, 0o600)
             notification_ok = True
+    except AlertRateLimited as error:
+        # Measure from the receiver response after the health checks, and
+        # round up so fractional seconds cannot cause an early retry.
+        retry_at = math.ceil(time.time() + error.retry_after)
+        state['alert_retry_at'] = retry_at
+        atomic_json(args.state_path, state, 0o600)
+        print('Admin notification rate limited; queued alerts will retry after the receiver window', flush=True)
     except Exception:
         # Never log the exception: transport exceptions can contain the webhook URL.
         print('Admin notification delivery failed; queued alerts will retry', flush=True)
-    checks.append({'name': 'Admin alert transport', 'ok': notification_ok, 'pending': len(state['pending'])})
+    transport = {'name': 'Admin alert transport', 'ok': notification_ok, 'pending': len(state['pending'])}
+    if webhook and retry_at is not None:
+        transport['retry_at'] = retry_at
+    checks.append(transport)
     status = {'schema': 1, 'checked_at': now, 'stale_after': 180,
               'status': 'healthy' if all(c['ok'] for c in checks) else 'degraded',
               'checks': checks, 'events': state.get('events', []),
