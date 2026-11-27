@@ -139,7 +139,7 @@ pub fn authenticate(db: *database.Database, username: []const u8, password: []co
         \\SELECT p.id FROM mail_client_passwords p
         \\JOIN users u ON u.id = p.user_id
         \\LEFT JOIN provisioned_mailboxes m ON m.user_id = u.id AND m.mailbox = u.username
-        \\WHERE p.digest = ?1 AND p.scope = ?2 AND u.username = ?3 AND u.enabled = 1
+        \\WHERE p.digest = ?1 AND p.scope = ?2 AND u.username = ?3 AND u.enabled = 1 AND u.password_change_required = 0
         \\ AND (m.read_until IS NULL OR m.read_until > unixepoch())
     );
     defer key.finalize();
@@ -154,7 +154,7 @@ pub fn active(db: *database.Database, id: i64) !bool {
     defer tx.deinit();
     const check = try tx.prepare(
         \\SELECT 1 FROM mail_client_passwords p
-        \\JOIN users u ON u.id = p.user_id AND u.enabled = 1
+        \\JOIN users u ON u.id = p.user_id AND u.enabled = 1 AND u.password_change_required = 0
         \\LEFT JOIN provisioned_mailboxes m ON m.user_id = u.id AND m.mailbox = u.username
         \\WHERE p.id = ?1 AND (m.read_until IS NULL OR m.read_until > unixepoch())
     );

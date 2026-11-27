@@ -44,7 +44,7 @@ fn withDb(comptime action: fn (*cli.BaseCommand.ParseContext, *database.Database
 
 fn createAction(ctx: *cli.BaseCommand.ParseContext, _: *database.Database, auth_backend: *auth.AuthBackend) !void {
     const username = ctx.getArgument(0) orelse {
-        std.debug.print("Error: username is required\nUsage: mail user:local create <username> [<password> [<email>]] [--password <pw> | --password-stdin] [--email <email>]\n", .{});
+        std.debug.print("Error: username is required\nUsage: mail user:local create <username> [<password> [<email>]] [--password <pw> | --password-stdin] [--email <email>] [--require-password-change]\n", .{});
         return error.MissingArgument;
     };
 
@@ -58,7 +58,7 @@ fn createAction(ctx: *cli.BaseCommand.ParseContext, _: *database.Database, auth_
     else
         null;
     defer if (derived) |address| ctx.allocator.free(address);
-    const created = try user_cli.createUser(auth_backend, username, password, email orelse derived orelse username);
+    const created = try user_cli.createUser(auth_backend, username, password, email orelse derived orelse username, ctx.hasOption("require-password-change"));
     if (!created and ctx.hasOption("remote-stdin")) return error.UserAlreadyExists;
 }
 
@@ -578,6 +578,7 @@ pub fn setup(allocator: std.mem.Allocator) !*cli.BaseCommand {
         cli.Option.init("email", "email", "Email address (defaults to the username or username@DOMAIN)", .string)
             .withShort('e'),
     );
+    _ = try create_cmd.addOption(cli.Option.init("require-password-change", "require-password-change", "Require a new password in webmail before the mailbox can be used", .bool));
     try password_input.addRemoteOption(create_cmd);
     _ = create_cmd.setAction(withDb(createAction));
     _ = try cmd.addCommand(create_cmd);

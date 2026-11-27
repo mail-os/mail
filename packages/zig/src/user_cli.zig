@@ -5,8 +5,8 @@ const auth = @import("auth/auth.zig");
 const recovery = @import("api/webmail_recovery.zig");
 const time_compat = @import("core/time_compat.zig");
 
-pub fn createUser(auth_backend: *auth.AuthBackend, username: []const u8, password: []const u8, email: []const u8) !bool {
-    const user_id = auth_backend.createUser(username, password, email) catch |err| {
+pub fn createUser(auth_backend: *auth.AuthBackend, username: []const u8, password: []const u8, email: []const u8, password_change_required: bool) !bool {
+    const user_id = auth_backend.createUserWithPasswordPolicy(username, password, email, password_change_required) catch |err| {
         if (err == database.DatabaseError.AlreadyExists) {
             std.debug.print("Error: User '{s}' already exists\n", .{username});
             return false;
@@ -68,6 +68,7 @@ pub fn userInfo(db: *database.Database, allocator: std.mem.Allocator, username: 
     std.debug.print("  Username: {s}\n", .{user.username});
     std.debug.print("  Email: {s}\n", .{user.email});
     std.debug.print("  Enabled: {}\n", .{user.enabled});
+    if (user.password_change_required) std.debug.print("  Password change required on first sign-in\n", .{});
     std.debug.print("  Created: {d}\n", .{user.created_at});
     std.debug.print("  Updated: {d}\n", .{user.updated_at});
     if (try recovery.get(allocator, db, username)) |r| {

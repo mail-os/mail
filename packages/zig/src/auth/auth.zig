@@ -417,8 +417,8 @@ pub const AuthBackend = struct {
 
     fn verifyMailboxPassword(self: *AuthBackend, normalized_username: []const u8, password: []const u8) !bool {
         var user = (try self.verifiedMailbox(normalized_username, password)) orelse return false;
-        user.deinit(self.allocator);
-        return true;
+        defer user.deinit(self.allocator);
+        return !user.password_change_required;
     }
 
     /// Return the exact row verified by the primary credential so webmail can
@@ -478,12 +478,24 @@ pub const AuthBackend = struct {
     }
 
     pub fn createUser(self: *AuthBackend, username: []const u8, password: []const u8, email: []const u8) !i64 {
-        // Hash the password
+        return self.createUserWithPasswordPolicy(username, password, email, false);
+    }
+
+    pub fn createUserWithPasswordPolicy(self: *AuthBackend, username: []const u8, password: []const u8, email: []const u8, password_change_required: bool) !i64 {
         const password_hash = try self.password_hasher.hashPassword(password);
         defer self.allocator.free(password_hash);
 
         // Create user in database
-        return try self.db.createUser(username, password_hash, email);
+        return self.db.createUserWithPasswordPolicy(username, password_hash, email, password_change_required);
+    }
+
+    pub fn replaceInitialPassword(self: *AuthBackend, peer: []const u8, username: []const u8, current: []const u8, next: []const u8) !bool {
+        var user = (try self.verifyWebmailPrimary(peer, username, current)) orelse return false;
+        defer user.deinit(self.allocator);
+        if (!user.password_change_required) return false;
+        const password_hash = try self.password_hasher.hashPassword(next);
+        defer self.allocator.free(password_hash);
+        return self.db.replaceInitialPassword(user, password_hash);
     }
 
     pub fn changePassword(self: *AuthBackend, username: []const u8, new_password: []const u8) !void {
@@ -586,7 +598,7 @@ pub const AuthBackend = struct {
         };
         defer user.deinit(self.allocator);
 
-        if (!user.enabled or !(try self.db.mailboxAccess(user.username)).readable()) {
+        if (!user.enabled or user.password_change_required or !(try self.db.mailboxAccess(user.username)).readable()) {
             log.warn("Digest auth: user disabled", .{});
             return null;
         }

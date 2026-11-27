@@ -55,7 +55,7 @@ fn verifyActivationPassword(db: *database.Database, a: std.mem.Allocator, input:
         const lookup = try tx.prepare(
             \\SELECT u.password_hash FROM provisioned_mailboxes p
             \\JOIN users u ON u.id = p.user_id AND u.username = p.mailbox
-            \\WHERE p.mailbox = ?1 AND p.actor = ?2 AND u.enabled = 1
+            \\WHERE p.mailbox = ?1 AND p.actor = ?2 AND u.enabled = 1 AND u.password_change_required = 0
             \\  AND (p.read_until IS NULL OR p.read_until > unixepoch())
         );
         defer lookup.finalize();
@@ -92,7 +92,7 @@ pub fn issue(db: *database.Database, a: std.mem.Allocator, proof: []const u8, in
             \\INSERT INTO hosted_sign_in_proofs(digest, user_id, actor, expires_at)
             \\SELECT ?1, u.id, p.actor, ?2 FROM provisioned_mailboxes p
             \\JOIN users u ON u.id = p.user_id AND u.username = p.mailbox
-            \\WHERE p.mailbox = ?3 AND p.actor = ?4 AND u.enabled = 1
+            \\WHERE p.mailbox = ?3 AND p.actor = ?4 AND u.enabled = 1 AND u.password_change_required = 0
             \\  AND (p.read_until IS NULL OR p.read_until > ?5)
             \\  AND (?6 IS NULL OR u.password_hash = ?6)
             \\RETURNING user_id
@@ -123,7 +123,7 @@ const eligible =
     \\ FROM hosted_sign_in_proofs h
     \\JOIN provisioned_mailboxes p ON p.user_id = h.user_id AND p.actor = h.actor
     \\JOIN users u ON u.id = h.user_id AND u.username = p.mailbox
-    \\WHERE h.digest = ?1 AND h.expires_at > ?2 AND u.enabled = 1
+    \\WHERE h.digest = ?1 AND h.expires_at > ?2 AND u.enabled = 1 AND u.password_change_required = 0
     \\  AND (p.read_until IS NULL OR p.read_until > ?2)
 ;
 

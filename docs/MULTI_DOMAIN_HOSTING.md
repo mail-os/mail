@@ -73,6 +73,17 @@ global flag. Existing local-part accounts are unaffected by hosting new domains.
    systemctl restart mail.service
    ```
 
+### Require owners to set their first password
+
+Create a human mailbox with `user:local create <address> --password-stdin
+--require-password-change`, passing the temporary password through standard
+input. Use the shared server’s trusted HTTPS webmail login and give the
+credential only to the mailbox owner. Webmail asks them to choose a different
+password before a browser session is created. SMTP and IMAP reject the
+initial credential, while the mailbox continues receiving mail. Later sign-ins
+and mail clients use the new password. Buddy can set this on new mailboxes
+with `passwordPolicy: 'initial-change'`.
+
 ### Migrating an existing local-part mailbox to an isolated one
 
 If a mailbox already exists as a local-part (`info`) and you want to make it

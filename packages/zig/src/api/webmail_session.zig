@@ -39,6 +39,7 @@ pub const cookie_name = "webmail_session";
 
 pub const SessionError = error{
     InvalidCredentials,
+    PasswordChangeRequired,
     SessionNotFound,
     SessionExpired,
 };
@@ -103,6 +104,7 @@ pub const SessionManager = struct {
         var primary = (try self.auth.verifyWebmailPrimary(ip_address orelse "", username, password)) orelse
             return SessionError.InvalidCredentials;
         defer primary.deinit(self.auth.allocator);
+        if (primary.password_change_required) return SessionError.PasswordChangeRequired;
         if (factor.link) |link| if (std.mem.eql(u8, primary.username, link.username)) return error.AccountAlreadyLinked;
 
         const email_buf = try self.allocator.dupe(u8, primary.email);
@@ -175,7 +177,7 @@ pub const SessionManager = struct {
             return SessionError.SessionNotFound;
         };
         defer user.deinit(self.allocator);
-        if (!user.enabled or !(try self.db.mailboxAccess(row.username)).readable()) {
+        if (!user.enabled or user.password_change_required or !(try self.db.mailboxAccess(row.username)).readable()) {
             self.logout(session_id);
             return SessionError.SessionNotFound;
         }

@@ -11,27 +11,37 @@
 const username = state('')
 const password = state('')
 const factor = state('')
+const nextPassword = state('')
+const confirmPassword = state('')
+const needsPasswordChange = state(false)
+const status = state('')
 const busy = state(false)
 const error = state('')
 const hosted = useRoute().hash === '#hosted-factor'
 const needsFactor = state(hosted)
 const factorField = useRef('factorField')
 const passwordField = useRef('passwordField')
+const nextPasswordField = useRef('nextPasswordField')
 const returnDestinations = new Map([['#status', '/status'], ['#mailboxes', '/mailboxes']])
 const returnPath = returnDestinations.get(useRoute().hash) ?? '/'
 onMount(() => { if (hosted) nextTick(() => factorField.current?.focus()) })
-useEventListener('pagehide', () => { password.set(''); factor.set('') })
+useEventListener('pagehide', () => { password.set(''); factor.set(''); nextPassword.set(''); confirmPassword.set('') })
 function editCredentials() {
   needsFactor.set(false)
+  needsPasswordChange.set(false)
+  nextPassword.set('')
+  confirmPassword.set('')
   factor.set('')
   password.set('')
   error.set('')
+  status.set('')
   nextTick(() => passwordField.current?.focus())
 }
 async function signIn() {
   if (busy()) return
   error.set('')
   if (!hosted && (!username().trim() || !password())) { error.set('Enter your email and password.'); return }
+  if (needsPasswordChange() && nextPassword() !== confirmPassword()) { error.set('The new passwords do not match.'); return }
   if (needsFactor() && !factor().trim()) { error.set('Enter an authenticator or recovery code.'); return }
   busy.set(true)
   try {
@@ -40,16 +50,31 @@ async function signIn() {
     const response = await fetch(hosted ? '/webmail/auth/hosted/verify' : '/webmail/auth/login', {
       method: 'POST', credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(hosted ? { factor: code } : { username: username().trim(), password: password(), ...(needsFactor() ? { factor: code } : {}) }),
+      body: JSON.stringify(hosted ? { factor: code } : { username: username().trim(), password: password(), ...(needsFactor() ? { factor: code } : {}), ...(needsPasswordChange() ? { newPassword: nextPassword() } : {}) }),
     })
-    if (response.ok) { password.set(''); navigate(returnPath, { reload: true }); return }
     const result = await response.json().catch(() => ({}))
+    if (response.ok) {
+      if (result.password_changed) {
+        editCredentials()
+        status.set('Password updated. Sign in with your new password.')
+        return
+      }
+      password.set('')
+      navigate(returnPath, { reload: true })
+      return
+    }
+    if (result.error === 'password_change_required') {
+      needsPasswordChange.set(true)
+      status.set('Set a new password before opening your mailbox.')
+      nextTick(() => nextPasswordField.current?.focus())
+      return
+    }
     if (result.error === 'factor_required') {
       needsFactor.set(true)
       return
     }
     error.set(result.error === 'invalid_credentials' ? 'Invalid email or password.' : result.message || 'Sign in failed. Please try again.')
-    if (result.error === 'invalid_credentials' && needsFactor()) {
+    if (result.error === 'invalid_credentials' && (needsFactor() || needsPasswordChange())) {
       const message = error()
       editCredentials()
       error.set(message)
@@ -68,22 +93,29 @@ async function signIn() {
   <form @submit.prevent="signIn()">
     <div :if="!hosted">
       <label for="email">Email or username</label>
-      <input id="email" type="text" x-model.trim="username" autocomplete="username" placeholder="you@example.com" required :disabled="busy || needsFactor" autofocus>
+      <input id="email" type="text" x-model.trim="username" autocomplete="username" placeholder="you@example.com" required :disabled="busy || needsFactor || needsPasswordChange" autofocus>
       <label for="password">Password</label>
-      <input id="password" ref="passwordField" type="password" x-model="password" autocomplete="current-password" required :disabled="busy || needsFactor">
+      <input id="password" ref="passwordField" type="password" x-model="password" autocomplete="current-password" required :disabled="busy || needsFactor || needsPasswordChange">
+    </div>
+    <div :if="needsPasswordChange">
+      <label for="firstNewPassword">New password</label>
+      <input id="firstNewPassword" ref="nextPasswordField" type="password" x-model="nextPassword" autocomplete="new-password" minlength="12" maxlength="1024" required :disabled="busy">
+      <label for="repeatNewPassword">Confirm new password</label>
+      <input id="repeatNewPassword" type="password" x-model="confirmPassword" autocomplete="new-password" minlength="12" maxlength="1024" required :disabled="busy">
     </div>
     <div :if="needsFactor">
       <label for="signInFactor">Authenticator or recovery code</label>
       <input id="signInFactor" ref="factorField" type="text" x-model.trim="factor" autocomplete="one-time-code" autocapitalize="off" spellcheck="false" maxlength="32" required :disabled="busy">
     </div>
+    <p role="status" :text="status"></p>
     <p :if="error" :text="error" class="login-error" role="alert"></p>
     <PrimaryButton type="submit" :disabled="busy">
-      <span :text="busy ? 'Signing in…' : needsFactor ? 'Verify and sign in' : 'Sign in'"></span>
+      <span :text="busy ? 'Signing in…' : needsFactor ? 'Verify and sign in' : needsPasswordChange ? 'Set new password' : 'Sign in'"></span>
     </PrimaryButton>
-    <button :if="needsFactor && !hosted" type="button" class="login-secondary" :disabled="busy" @click="editCredentials()">Change sign-in details</button>
+    <button :if="(needsFactor || needsPasswordChange) && !hosted" type="button" class="login-secondary" :disabled="busy" @click="editCredentials()">Change sign-in details</button>
   </form>
   <p :if="hosted" class="login-forgot"><a class="login-link" href="/login">Use mailbox password</a></p>
-  <p :if="!hosted && !needsFactor" class="login-forgot"><a class="login-link" href="/forgot">Forgot password?</a></p>
+  <p :if="!hosted && !needsFactor && !needsPasswordChange" class="login-forgot"><a class="login-link" href="/forgot">Forgot password?</a></p>
   <noscript>JavaScript is required to use webmail.</noscript>
 </main>
 </body>

@@ -90,6 +90,10 @@ jobs:
       timeout-minutes: 5
       run: python3 scripts/test-webmail-mfa.py packages/zig/zig-out/bin/mail --browser chromium --browser webkit
 
+    - name: Require first-time password setup in the browser
+      working-directory: .
+      run: python3 scripts/test-first-mailbox-password.py packages/zig/zig-out/bin/mail --browser
+
     - name: Verify self-hosted mailbox management in the browser
       if: runner.os == 'Linux'
       working-directory: .
@@ -186,6 +190,7 @@ jobs:
         python3 ../../scripts/test-webmail-team-invitations.py zig-out/bin/mail
         python3 ../../scripts/test-hosted-sign-in.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-mfa.py zig-out/bin/mail
+        python3 ../../scripts/test-first-mailbox-password.py zig-out/bin/mail
         python3 ../../scripts/test-client-passwords.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-team-threads.py zig-out/bin/mail
         python3 ../../scripts/test-webmail-shared-inbox.py zig-out/bin/mail

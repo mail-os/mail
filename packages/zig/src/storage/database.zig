@@ -213,6 +213,7 @@ pub const User = struct {
     enabled: bool,
     created_at: i64,
     updated_at: i64,
+    password_change_required: bool = false,
     digest_ha1: ?[]const u8 = null, // MD5(username:realm:password) for Digest auth
 
     pub fn deinit(self: *User, allocator: std.mem.Allocator) void {
@@ -387,6 +388,8 @@ pub const Database = struct {
         // its own statement (sqlite3_exec stops at the first error, so it must
         // not be bundled with the quota migration above).
         self.exec("ALTER TABLE users ADD COLUMN digest_ha1 TEXT;") catch {};
+        self.exec("ALTER TABLE users ADD COLUMN password_change_required INTEGER NOT NULL DEFAULT 0;") catch {};
+        try self.exec("SELECT password_change_required FROM users LIMIT 0;");
 
         // Migration: a mailbox's recovery address, where a password reset link
         // is sent. `recovery_source` records who set it ('operator' for the CLI
@@ -4204,12 +4207,22 @@ pub const Database = struct {
         password_hash: []const u8,
         email: []const u8,
     ) !i64 {
+        return self.createUserWithPasswordPolicy(username, password_hash, email, false);
+    }
+
+    pub fn createUserWithPasswordPolicy(
+        self: *Database,
+        username: []const u8,
+        password_hash: []const u8,
+        email: []const u8,
+        password_change_required: bool,
+    ) !i64 {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         const sql =
-            \\INSERT INTO users (username, password_hash, email, created_at, updated_at)
-            \\VALUES (?1, ?2, ?3, ?4, ?5)
+            \\INSERT INTO users (username, password_hash, email, created_at, updated_at, password_change_required)
+            \\VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         ;
 
         const sql_z = try self.allocator.dupeSentinel(u8, sql, 0);
@@ -4236,6 +4249,7 @@ pub const Database = struct {
         try checkBind(sqlite.sqlite3_bind_text(stmt, 3, email_z.ptr, -1, null));
         try checkBind(sqlite.sqlite3_bind_int64(stmt, 4, now));
         try checkBind(sqlite.sqlite3_bind_int64(stmt, 5, now));
+        try checkBind(sqlite.sqlite3_bind_int64(stmt, 6, @intFromBool(password_change_required)));
 
         rc = sqlite.sqlite3_step(stmt);
         if (rc != sqlite.SQLITE_DONE) {
@@ -4253,7 +4267,7 @@ pub const Database = struct {
         defer self.mutex.unlock();
 
         const sql =
-            \\SELECT id, username, password_hash, email, enabled, created_at, updated_at, digest_ha1
+            \\SELECT id, username, password_hash, email, enabled, created_at, updated_at, digest_ha1, password_change_required
             \\FROM users
             \\WHERE username = ?1
         ;
@@ -4302,6 +4316,7 @@ pub const Database = struct {
             .created_at = created_at,
             .updated_at = updated_at,
             .digest_ha1 = digest_ha1,
+            .password_change_required = sqlite.sqlite3_column_int(stmt, 8) != 0,
         };
     }
 
@@ -4342,6 +4357,30 @@ pub const Database = struct {
             return null;
         }
         return first;
+    }
+
+    pub fn replaceInitialPassword(self: *Database, user: User, new_password_hash: []const u8) !bool {
+        var tx = try self.beginTransaction(.write);
+        defer tx.deinit();
+        {
+            const update = try tx.prepare(
+                \\UPDATE users SET password_hash = ?1, password_change_required = 0, digest_ha1 = NULL, updated_at = ?2
+                \\WHERE id = ?3 AND username = ?4 AND password_hash = ?5 AND enabled = 1 AND password_change_required = 1
+                \\RETURNING id
+            );
+            defer update.finalize();
+            try update.bind(1, new_password_hash);
+            try update.bind(2, time_compat.timestamp());
+            try update.bind(3, user.id);
+            try update.bind(4, user.username);
+            try update.bind(5, user.password_hash);
+            if (!try update.step()) return false;
+            _ = try update.step();
+        }
+        try self.deleteUserSessionsLocked(user.username);
+        try tx.deleteUserResetTokens(user.username);
+        try tx.commit();
+        return true;
     }
 
     pub fn updateUserPassword(self: *Database, username: []const u8, new_password_hash: []const u8) !void {

@@ -1342,13 +1342,29 @@ fn handleLogin(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std
         return sendError(conn, arena, 400, "bad_request", "Missing password");
     };
 
+    defer std.crypto.secureZero(u8, @constCast(password));
     const factor = try jsonStringFieldAlloc(arena, req.body, "factor");
+    const next = try jsonStringFieldAlloc(arena, req.body, "newPassword");
     if (factor != null and !publicHttps(server)) return mfaError(conn, arena, error.MfaUnavailable);
+    if (next != null and !publicHttps(server)) return sendError(conn, arena, 403, "https_required", "Use HTTPS to set your password");
 
     // Retain the configured webmail cap as well as the shared backend cap.
     // Both reserve before verification and refund a successful login.
     const attempt = (server.login_limiter.beginAuthAttempt(ip) catch null) orelse
         return sendError(conn, arena, 429, "rate_limited", "Too many login attempts; try again later");
+    if (next) |new_password| {
+        defer std.crypto.secureZero(u8, @constCast(new_password));
+        if (new_password.len < 12 or new_password.len > 1024 or std.mem.eql(u8, password, new_password))
+            return sendError(conn, arena, 400, "invalid_new_password", "Choose a different password between 12 and 1024 characters");
+        const changed = server.auth.replaceInitialPassword(ip, username, password, new_password) catch |err| {
+            if (err == error.AuthenticationRateLimited)
+                return sendError(conn, arena, 429, "rate_limited", "Too many login attempts; try again later");
+            return err;
+        };
+        if (!changed) return sendError(conn, arena, 401, "invalid_credentials", "Invalid username or temporary password");
+        server.login_limiter.finishAuthSuccess(ip, attempt);
+        return sendJson(conn, arena, 200, "{\"password_changed\":true}", null);
+    }
     const ua = req.header("User-Agent");
 
     var sess = server.sessions.loginWithFactor(username, password, if (ip.len > 0) ip else null, ua, .{ .code = factor, .limiter = &server.login_limiter }) catch |err| {
@@ -1357,6 +1373,11 @@ fn handleLogin(server: *WebmailHttpServer, conn: *webmail_tls.Stream, arena: std
         if (err == session_mod.SessionError.InvalidCredentials) {
             logger.warn("Webmail login failed for {s} from {s}", .{ username, ip });
             return sendError(conn, arena, 401, "invalid_credentials", "Invalid username or password");
+        }
+        if (err == session_mod.SessionError.PasswordChangeRequired) {
+            server.login_limiter.finishAuthSuccess(ip, attempt);
+            if (!publicHttps(server)) return sendError(conn, arena, 403, "https_required", "Use HTTPS to set your password");
+            return sendError(conn, arena, 409, "password_change_required", "Set a new password before opening your mailbox");
         }
         if (err == error.FactorRequired and factor == null) server.login_limiter.finishAuthSuccess(ip, attempt);
         return mfaError(conn, arena, err);
