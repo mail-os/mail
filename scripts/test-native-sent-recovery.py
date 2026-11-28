@@ -185,7 +185,8 @@ def check_remote_refusal_recovery(binary, hook):
         sender = f"crash-sender@{FIXTURE['DOMAIN']}"
         sent = root / "mail" / sender / "Sent"
         aws = root / "aws"
-        aws.write_text("#!/bin/sh\ntouch remote-refused\nexit 1\n")
+        # Keep this in the shell so an OS binary never inherits the crash hook.
+        aws.write_text("#!/bin/sh\n: > remote-refused\nexit 1\n")
         aws.chmod(0o700)
         writer.env.update(SMTP_DELIVERY_METHOD="ses", PATH=str(root) + os.pathsep + writer.env["PATH"])
         stop_writer_at(writer, hook, sender, "after-discard")
