@@ -87,6 +87,20 @@ pub fn syncDirectory(allocator: std.mem.Allocator, directory: []const u8) !void 
     try syncParents(allocator, directory, directory);
 }
 
+/// Checkpoint a journaled removal only after its directory is durable.
+pub fn remove(allocator: std.mem.Allocator, path: []const u8) !void {
+    const directory = std.fs.path.dirname(path) orelse return error.InvalidMaildirPath;
+    const file = try allocator.dupeSentinel(u8, path, 0);
+    defer allocator.free(file);
+    const removed = std.c.unlink(file);
+    if (removed != 0 and std.c.errno(removed) != .NOENT) return error.MaildirRemoveFailed;
+    const parent = try allocator.dupeSentinel(u8, directory, 0);
+    defer allocator.free(parent);
+    const exists = std.c.access(parent, 0);
+    if (exists != 0 and std.c.errno(exists) == .NOENT) return;
+    try syncDirectory(allocator, directory);
+}
+
 test "durable publication preserves an existing message and cleans failed temporary writes" {
     const allocator = std.testing.allocator;
     var template = "/tmp/mail-durable-XXXXXX".*;

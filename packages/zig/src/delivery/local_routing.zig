@@ -414,17 +414,7 @@ fn discardNativeSent(a: Allocator, db: *Database, target: Database.PendingDelive
     if (!target.mailbox_removed) {
         try path.validate(target.mailbox);
         const file = try std.fmt.allocPrint(a, "mail/{s}/{s}", .{ target.mailbox, target.native_sent_path.? });
-        fs.cwd().deleteFile(file) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        };
-        const directory = std.fs.path.dirname(file).?;
-        if (fs.cwd().access(directory, .{})) {
-            try durable.syncDirectory(a, directory);
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        }
+        try durable.remove(a, file);
     }
     try db.finishNativeSentTarget(target, null);
 }
