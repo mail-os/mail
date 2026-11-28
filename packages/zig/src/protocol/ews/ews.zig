@@ -1927,7 +1927,7 @@ fn sendSavedItem(a: std.mem.Allocator, ctx: *Context, item: xml.Element, save_co
     const raw = if (has_bcc) try message_headers.withoutBcc(a, archive) else archive;
     const path = if (save_copy) blk: {
         const seq = send_seq.fetchAdd(1, .monotonic);
-        const filename = try std.fmt.allocPrint(a, "{d}.{d}.{s}.eml:2,S", .{ time_compat.timestamp(), seq, ctx.hostname });
+        const filename = try std.fmt.allocPrint(a, "{d}.{d}{d}.{s}.eml:2,S", .{ time_compat.timestamp(), time_compat.nanoTimestamp(), seq, ctx.hostname });
         break :blk try savedMailPath(a, ctx, "Sent", "cur", filename);
     } else null;
     try submitMail(a, ctx, recipients, raw, path, archive, native, draft);

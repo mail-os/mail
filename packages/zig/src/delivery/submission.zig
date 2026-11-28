@@ -368,8 +368,8 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
     const sent_path = if (options.sent) |copy| path: {
         const root = try std.fmt.allocPrint(a, "mail/{s}/", .{options.sender.?});
         if (!std.mem.startsWith(u8, copy.path, root)) return error.InvalidMaildirPath;
-        const folder = std.fs.path.dirname(copy.path[root.len..]) orelse return error.InvalidMaildirPath;
-        break :path try std.fmt.allocPrint(a, "{s}/{d}.{s}.submission.eml:2,S", .{ folder, accepted_ms, id });
+        // EWS can return an ItemId derived from this exact basename.
+        break :path copy.path[root.len..];
     } else null;
     try db.acceptDelivery(.{
         .id = id,
@@ -488,7 +488,7 @@ pub fn maildirPath(a: std.mem.Allocator, user: []const u8, subdir: []const u8, s
     defer a.free(dir);
     try fs_compat.cwd().makePath(dir);
     const seq = nameSeq.fetchAdd(1, .monotonic);
-    return std.fmt.allocPrint(a, "{s}/{d}.{d}.submission.eml{s}", .{ dir, time_compat.milliTimestamp(), seq, suffix });
+    return std.fmt.allocPrint(a, "{s}/{d}.{d}.submission.eml{s}", .{ dir, time_compat.nanoTimestamp(), seq, suffix });
 }
 
 pub fn writeMaildir(allocator: std.mem.Allocator, db: ?*database.Database, user: []const u8, subdir: []const u8, raw: []const u8) !void {
