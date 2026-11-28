@@ -488,7 +488,10 @@ pub fn maildirPath(a: std.mem.Allocator, user: []const u8, subdir: []const u8, s
     defer a.free(dir);
     try fs_compat.cwd().makePath(dir);
     const seq = nameSeq.fetchAdd(1, .monotonic);
-    return std.fmt.allocPrint(a, "{s}/{d}.{d}.submission.eml{s}", .{ dir, time_compat.nanoTimestamp(), seq, suffix });
+    const nanos = time_compat.nanoTimestamp();
+    return std.fmt.allocPrint(a, "{s}/{d}.{d}.{d}.submission.eml{s}", .{
+        dir, @divFloor(nanos, std.time.ns_per_ms), nanos, seq, suffix,
+    });
 }
 
 pub fn writeMaildir(allocator: std.mem.Allocator, db: ?*database.Database, user: []const u8, subdir: []const u8, raw: []const u8) !void {
