@@ -866,10 +866,13 @@ pub const Database = struct {
             \\    reply_author TEXT,
             \\    reply_from TEXT,
             \\    reply_mime BLOB,
+            \\    native_sent_path TEXT,
+            \\    native_sent_wire_id TEXT,
             \\    PRIMARY KEY(delivery_id,ordinal)
             \\);
             \\CREATE INDEX IF NOT EXISTS accepted_mail_retry ON accepted_mail_targets(retry_at,delivery_id) WHERE outcome='pending';
             \\CREATE INDEX IF NOT EXISTS accepted_mail_reservations ON accepted_mail_targets(mailbox) WHERE outcome='pending';
+            \\CREATE INDEX IF NOT EXISTS accepted_mail_sent_discard ON accepted_mail_targets(retry_at,delivery_id) WHERE outcome='sent_discard';
             \\CREATE INDEX IF NOT EXISTS accepted_mail_retention ON accepted_mail(accepted_at) WHERE complete=1;
             \\CREATE TABLE IF NOT EXISTS outbound_delivery_minutes (
             \\    minute INTEGER PRIMARY KEY,
@@ -1062,6 +1065,8 @@ pub const Database = struct {
         self.exec("ALTER TABLE accepted_mail_targets ADD COLUMN reply_author TEXT") catch {};
         self.exec("ALTER TABLE accepted_mail_targets ADD COLUMN reply_from TEXT") catch {};
         self.exec("ALTER TABLE accepted_mail_targets ADD COLUMN reply_mime BLOB") catch {};
+        self.exec("ALTER TABLE accepted_mail_targets ADD COLUMN native_sent_path TEXT") catch {};
+        self.exec("ALTER TABLE accepted_mail_targets ADD COLUMN native_sent_wire_id TEXT") catch {};
         self.exec("ALTER TABLE mailbox_message_refs ADD COLUMN intake_folder TEXT NOT NULL DEFAULT ''") catch {};
         self.exec("ALTER TABLE mailbox_message_refs ADD COLUMN placement_reason TEXT NOT NULL DEFAULT ''") catch {};
         self.exec("ALTER TABLE mailbox_message_refs ADD COLUMN verified_author TEXT NOT NULL DEFAULT ''") catch {};
@@ -2521,7 +2526,11 @@ pub const Database = struct {
         team_reply_submission: ?TeamReplySource = null,
         smtp_sent_proof: ?SmtpSentProof = null,
         sent_copy_of: ?[]const u8 = null,
-        native_sent_reply: ?NativeSentReply = null,
+        native_sent_copy: ?struct {
+            path: []const u8,
+            mime: []const u8,
+            wire_id: ?[]const u8,
+        } = null,
         counts_as_incoming: bool = false,
     };
 
@@ -2634,6 +2643,8 @@ pub const Database = struct {
         const insert = try self.prepareLocked("INSERT INTO accepted_mail_targets(delivery_id,ordinal,recipient,mailbox,folder,outcome,queued_bytes,retry_at,mailbox_id,is_primary,forward_after,review_copy,placement_reason,verified_forward,reply_author,reply_from,reply_mime) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,COALESCE((SELECT id FROM users WHERE username=?4),0),?9,?10,?11,?12,?13,?14,?15,?16)");
         defer insert.finalize();
         var has_local = false;
+        var has_local_primary = false;
+        var has_remote_primary = false;
         var accepted_primary = false;
         for (envelope.targets, 0..) |planned, ordinal| {
             const released = if (ordinal == 0) envelope.review_release else null;
@@ -2689,6 +2700,8 @@ pub const Database = struct {
                 if (sqlite.sqlite3_changes(self.db) != 1) return error.ReviewChanged;
             }
             has_local = has_local or pending;
+            has_local_primary = has_local_primary or (pending and target.forward_owner == null);
+            has_remote_primary = has_remote_primary or target.interactive_remote;
             accepted_primary = accepted_primary or (target.forward_owner == null and (pending or std.mem.eql(u8, outcome, "queued")));
         }
         if (hosted_sender != 0 and accepted_primary) {
@@ -2696,12 +2709,32 @@ pub const Database = struct {
             defer stmt.finalize();
             try recordFirstSend(stmt, envelope.sender.?, hosted_sender, envelope.accepted_at);
         }
-        if (envelope.native_sent_reply) |sent| {
-            try self.recordNativeSentFileLocked(envelope.id, sent);
-            try self.publishNativeSentReplyLocked(envelope.id);
-        }
+        if (envelope.native_sent_copy != null and (has_local_primary or has_remote_primary))
+            try self.recordNativeSentTargetLocked(envelope);
         if (!has_local) try self.compactDeliveryLocked(envelope.id);
         try self.execLocked("COMMIT");
+    }
+
+    /// The private archive can retain Bcc. Store its MIME separately from the
+    /// recipient payload, with a reservation but no additional recipient debit.
+    fn recordNativeSentTargetLocked(self: *Database, envelope: DeliveryEnvelope) !void {
+        const sent = envelope.native_sent_copy.?;
+        const stmt = try self.prepareLocked(
+            \\INSERT INTO accepted_mail_targets(delivery_id,ordinal,recipient,mailbox,folder,outcome,queued_bytes,retry_at,
+            \\ mailbox_id,is_primary,reply_mime,native_sent_path,native_sent_wire_id)
+            \\SELECT ?1,?2,username,username,'Sent','pending',?4,?5,id,0,?6,?7,?8 FROM users WHERE username=?3 AND enabled=1
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, envelope.id);
+        try stmt.bind(2, envelope.targets.len);
+        try stmt.bind(3, envelope.sender orelse return error.InvalidMailboxPath);
+        try stmt.bind(4, sent.mime.len);
+        try stmt.bind(5, envelope.accepted_at);
+        try stmt.bindBlob(6, sent.mime);
+        try stmt.bind(7, sent.path);
+        try stmt.bindOpt(8, sent.wire_id);
+        _ = try stmt.step();
+        if (sqlite.sqlite3_changes(self.db) != 1) return error.HostedSenderDisabled;
     }
 
     fn recordEwsDraftFinalizationLocked(self: *Database, envelope: DeliveryEnvelope, draft: EwsDraftSend) !void {
@@ -2784,8 +2817,26 @@ pub const Database = struct {
             defer stmt.finalize();
             try checkpointRecipient(stmt, id, recipient, phase);
         }
+        if (phase == .failed) try self.discardRefusedNativeSentLocked(id);
         if (native_sent_reply and phase == .delivered) try self.publishNativeSentReplyLocked(id);
         try tx.commit();
+    }
+
+    fn discardRefusedNativeSentLocked(self: *Database, id: []const u8) !void {
+        const stmt = try self.prepareLocked(
+            \\UPDATE accepted_mail_targets SET outcome='sent_discard',queued_bytes=0,reply_mime=NULL,retry_at=0
+            \\WHERE delivery_id=?1 AND native_sent_path IS NOT NULL AND outcome IN ('filed','pending')
+            \\  AND NOT EXISTS(SELECT 1 FROM accepted_mail_targets WHERE delivery_id=?1 AND is_primary=1
+            \\    AND outcome IN ('pending','filed','mailbox_removed','remote_unattempted','remote_unknown','remote_delivered'))
+        );
+        defer stmt.finalize();
+        try stmt.bind(1, id);
+        _ = try stmt.step();
+        if (sqlite.sqlite3_changes(self.db) == 0) return;
+        const retain = try self.prepareLocked("UPDATE accepted_mail SET complete=0 WHERE id=?1");
+        defer retain.finalize();
+        try retain.bind(1, id);
+        _ = try retain.step();
     }
 
     /// The confirmed result of one remote DATA transaction applies to every
@@ -3252,7 +3303,11 @@ pub const Database = struct {
         defer self.mutex.unlock();
         try self.execLocked("BEGIN IMMEDIATE");
         errdefer self.execLocked("ROLLBACK") catch {};
-        const update = try self.prepareLocked("UPDATE accepted_mail_targets SET outcome=?3,queued_bytes=0,reply_mime=NULL WHERE delivery_id=?1 AND ordinal=?2 AND outcome='pending'");
+        const update = try self.prepareLocked(
+            \\UPDATE accepted_mail_targets
+            \\SET outcome=?3,queued_bytes=0,reply_mime=NULL,native_sent_path=NULL,native_sent_wire_id=NULL
+            \\WHERE delivery_id=?1 AND ordinal=?2 AND outcome='pending'
+        );
         defer update.finalize();
         try update.bind(1, id);
         try update.bind(2, ordinal);
@@ -3292,6 +3347,30 @@ pub const Database = struct {
         }
         try self.compactDeliveryLocked(id);
         try self.execLocked("COMMIT");
+    }
+
+    pub fn finishNativeSentTarget(self: *Database, target: PendingDelivery, reply: ?NativeSentReply) !void {
+        var tx = try self.beginTransaction(.write);
+        defer tx.deinit();
+        {
+            const stmt = try tx.prepare(if (target.discard_native_sent)
+                "DELETE FROM accepted_mail_targets WHERE delivery_id=?1 AND ordinal=?2 AND outcome='sent_discard' RETURNING 1"
+            else
+                \\UPDATE accepted_mail_targets SET outcome='filed',queued_bytes=0,reply_mime=NULL,native_sent_wire_id=NULL
+                \\WHERE delivery_id=?1 AND ordinal=?2 AND outcome='pending' RETURNING 1
+            );
+            defer stmt.finalize();
+            try stmt.bind(1, target.id);
+            try stmt.bind(2, target.ordinal);
+            if (!try stmt.step()) return error.NotFound;
+            _ = try stmt.step();
+        }
+        if (reply) |proof| {
+            try self.recordNativeSentFileLocked(target.id, proof);
+            try self.publishNativeSentReplyLocked(target.id);
+        }
+        try self.compactDeliveryLocked(target.id);
+        try tx.commit();
     }
 
     fn recordFirstReceiveLocked(self: *Database, id: []const u8, ordinal: i64) !void {
@@ -3420,8 +3499,8 @@ pub const Database = struct {
         _ = try stmt.step();
     }
 
-    /// Native clients reserve an actual Sent file before acceptance. Register
-    /// that exact file and its delivery in the same transaction as the receipt.
+    /// Register the stamped Sent file after publication, together with the
+    /// journal checkpoint that releases the reservation.
     fn recordNativeSentFileLocked(self: *Database, id: []const u8, sent: NativeSentReply) !void {
         {
             const stmt = try self.prepareLocked(
@@ -4004,7 +4083,10 @@ pub const Database = struct {
     }
 
     fn compactDeliveryLocked(self: *Database, id: []const u8) !void {
-        const stmt = try self.prepareLocked("UPDATE accepted_mail SET complete=1,mime=x'' WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM accepted_mail_targets WHERE delivery_id=?1 AND outcome='pending')");
+        const stmt = try self.prepareLocked(
+            \\UPDATE accepted_mail SET complete=1,mime=x'' WHERE id=?1
+            \\AND NOT EXISTS(SELECT 1 FROM accepted_mail_targets WHERE delivery_id=?1 AND outcome IN ('pending','sent_discard'))
+        );
         defer stmt.finalize();
         try stmt.bind(1, id);
         _ = try stmt.step();
@@ -4025,6 +4107,9 @@ pub const Database = struct {
         calendar_attendee: []const u8,
         team_reply_candidate: bool = false,
         team_sent_reply_candidate: bool = false,
+        native_sent_path: ?[]const u8 = null,
+        native_sent_wire_id: ?[]const u8 = null,
+        discard_native_sent: bool = false,
     };
 
     pub fn pendingDelivery(self: *Database, a: std.mem.Allocator, id: ?[]const u8, now: i64) !?PendingDelivery {
@@ -4046,9 +4131,10 @@ pub const Database = struct {
             \\          JOIN mail_team_thread_shares s ON s.owner_id=proof.owner_id
             \\          JOIN mail_team_thread_follow f ON f.share_id=s.id
             \\          JOIN mail_team_thread_follow_sent opted ON opted.share_id=f.share_id
-            \\          WHERE proof.sent_id=m.id AND proof.owner_id=t.mailbox_id AND source.accepted_ms>f.since_ms)
+            \\          WHERE proof.sent_id=m.id AND proof.owner_id=t.mailbox_id AND source.accepted_ms>f.since_ms),
+            \\       t.native_sent_path,t.native_sent_wire_id,t.outcome='sent_discard'
             \\FROM accepted_mail_targets t JOIN accepted_mail m ON m.id=t.delivery_id
-            \\WHERE t.outcome='pending' AND t.forward_after IS NULL AND t.retry_at<=?1
+            \\WHERE (t.outcome='pending' OR t.outcome='sent_discard') AND t.forward_after IS NULL AND t.retry_at<=?1
         ;
         const stmt = try self.prepareLocked(if (id != null)
             selection ++ " AND t.delivery_id=?2 ORDER BY t.ordinal LIMIT 1"
@@ -4073,13 +4159,16 @@ pub const Database = struct {
             .calendar_attendee = try a.dupe(u8, stmt.columnText(12)),
             .team_reply_candidate = stmt.columnInt64(13) != 0,
             .team_sent_reply_candidate = stmt.columnInt64(14) != 0,
+            .native_sent_path = if (stmt.columnTextOpt(15)) |file| try a.dupe(u8, file) else null,
+            .native_sent_wire_id = if (stmt.columnTextOpt(16)) |wire_id| try a.dupe(u8, wire_id) else null,
+            .discard_native_sent = stmt.columnInt64(17) != 0,
         };
     }
 
     pub fn delayDeliveryTarget(self: *Database, target: PendingDelivery, retry_at: i64) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const stmt = try self.prepareLocked("UPDATE accepted_mail_targets SET retry_at=?3,attempts=MIN(attempts+1,8) WHERE delivery_id=?1 AND ordinal=?2 AND outcome='pending'");
+        const stmt = try self.prepareLocked("UPDATE accepted_mail_targets SET retry_at=?3,attempts=MIN(attempts+1,8) WHERE delivery_id=?1 AND ordinal=?2 AND outcome IN ('pending','sent_discard')");
         defer stmt.finalize();
         try stmt.bind(1, target.id);
         try stmt.bind(2, target.ordinal);
@@ -4214,7 +4303,7 @@ pub const Database = struct {
     pub fn retryAcceptedDeliveriesOnStartup(self: *Database, now: i64) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const stmt = try self.prepareLocked("UPDATE accepted_mail_targets SET retry_at=?1 WHERE outcome='pending' AND retry_at>?1");
+        const stmt = try self.prepareLocked("UPDATE accepted_mail_targets SET retry_at=?1 WHERE outcome IN ('pending','sent_discard') AND retry_at>?1");
         defer stmt.finalize();
         try stmt.bind(1, now);
         _ = try stmt.step();
@@ -6028,6 +6117,55 @@ test "write results require a transaction on the shared connection" {
     defer read.finalize();
     try t.expect(try read.step());
     try t.expectEqual(@as(i64, 2), read.columnInt64(0));
+}
+
+test "remote native Sent cleanup requires a definite refusal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var db = try Database.init(std.testing.allocator, ":memory:");
+    defer db.deinit();
+    const sender = "sender@example.test";
+    const recipient = "recipient@external.example.test";
+    const archive = "Bcc: recipient@external.example.test\r\n\r\nprivate archive";
+    _ = try db.createUser(sender, "hash", sender);
+
+    for ([_][]const u8{ "confirmed", "refused", "interrupted" }) |id| {
+        try db.acceptDelivery(.{
+            .id = id,
+            .from = sender,
+            .sender = sender,
+            .mime = "\r\nrecipient payload",
+            .accepted_at = 5,
+            .accepted_ms = 5000,
+            .targets = &.{.{ .recipient = recipient, .interactive_remote = true }},
+            .native_sent_copy = .{ .path = "Sent/example.eml:2,S", .mime = archive, .wire_id = null },
+        });
+        try std.testing.expectEqual(@as(u64, archive.len), try db.reservedDeliveryBytes(sender));
+        const target = (try db.pendingDelivery(a, id, 5)).?;
+        try std.testing.expectEqualStrings(archive, target.mime);
+        try db.finishNativeSentTarget(target, null);
+        try db.checkpointInteractiveRecipient(id, recipient, .starting, false);
+        if (std.mem.eql(u8, id, "confirmed")) {
+            try db.checkpointInteractiveRecipient(id, recipient, .delivered, false);
+            try std.testing.expectEqual(@as(usize, 1), (try db.interactiveDelivery(a, id)).?.delivered);
+            try std.testing.expect(try db.hasFiledDelivery(id));
+        } else if (std.mem.eql(u8, id, "refused")) {
+            try db.checkpointInteractiveRecipient(id, recipient, .failed, false);
+            try db.retryAcceptedDeliveriesOnStartup(5);
+            const discard = (try db.pendingDelivery(a, id, 5)).?;
+            try std.testing.expect(discard.discard_native_sent);
+            try db.finishNativeSentTarget(discard, null);
+            try std.testing.expect(!try db.hasFiledDelivery(id));
+        } else {
+            try db.retryAcceptedDeliveriesOnStartup(5);
+            const recovery = (try db.interactiveDelivery(a, id)).?;
+            try std.testing.expectEqualStrings(recipient, recovery.unknown[0]);
+            try std.testing.expect(try db.hasFiledDelivery(id));
+        }
+        try std.testing.expect(try db.pendingDelivery(a, id, 5) == null);
+        try std.testing.expectEqual(@as(u64, 0), try db.reservedDeliveryBytes(sender));
+    }
 }
 
 test "hosted access windows use exclusive UTC deadlines and preserve operator suspension" {

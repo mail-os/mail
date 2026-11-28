@@ -1,7 +1,6 @@
 //! Shared recipient validation and local delivery for interactive submissions.
 const std = @import("std");
 const hosted_limits = @import("../storage/hosted_limits.zig");
-const durable_maildir = @import("../core/durable_maildir.zig");
 const ews_drafts = @import("ews_drafts.zig");
 const database = @import("../storage/database.zig");
 const shared_inbox = @import("../storage/shared_inbox.zig");
@@ -280,6 +279,7 @@ pub fn dispatch(a: std.mem.Allocator, cfg: Delivery, from: []const u8, recipient
         } else local_error;
         if (deliver_remote) if (options.interactive_id) |id| {
             try cfg.db.?.checkpointInteractiveRecipient(id, recipient, if (failure == null) .delivered else .failed, options.native_reply_wire_id != null);
+            if (failure != null and options.sent != null) routing.publish(a, cfg.db.?, id);
         };
         if (failure) |err| {
             std.log.warn("Message delivery to {s} failed: {}", .{ recipient, err });
@@ -313,23 +313,6 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
         }
         _ = try db.checkHostedSend(sender, recipients.len, now);
     }
-    var sent_written = false;
-    var native_sent_reply: ?database.Database.NativeSentReply = null;
-    errdefer if (sent_written) fs_compat.cwd().deleteFile(options.sent.?.path) catch {};
-    if (options.sent) |copy| {
-        try hosted_limits.checkStorage(db, options.sender.?, copy.bytes.len, null);
-        try durable_maildir.write(a, copy.path, copy.bytes);
-        sent_written = true;
-        if (options.native_reply_wire_id) |wire_id| {
-            if (message_refs.fileStamp(a, copy.path) catch null) |stamp| native_sent_reply = .{
-                .basename = database.maildirBaseName(std.fs.path.basename(copy.path)),
-                .stamp = stamp,
-                .revision = message_refs.digest(copy.bytes),
-                .wire_id = wire_id,
-            };
-        }
-    }
-
     const identity = try routing.SenderIdentity.fromHeaders(a, raw, true);
     var plan: routing.Plan = .{
         .allocator = a,
@@ -339,6 +322,7 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
         .junk_folder = if (cfg.mail_config) |config| config.junkFolder() else "Junk",
         .automatic_category = if (identity.verified) routing.categories.classify(raw) else null,
     };
+    if (options.sent) |copy| try plan.reserveLocal(options.sender.?, copy.bytes.len);
     for (recipients, 0..) |recipient, i| {
         const user = localMailbox(a, cfg, recipient) catch |err| switch (err) {
             error.InvalidAddress => {
@@ -380,6 +364,13 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
         }
         try plan.vacationReplies(primary_count, from, cfg.hostname, cfg.mail_config, identity, now);
     }
+    const accepted_ms = time_compat.milliTimestamp();
+    const sent_path = if (options.sent) |copy| path: {
+        const root = try std.fmt.allocPrint(a, "mail/{s}/", .{options.sender.?});
+        if (!std.mem.startsWith(u8, copy.path, root)) return error.InvalidMaildirPath;
+        const folder = std.fs.path.dirname(copy.path[root.len..]) orelse return error.InvalidMaildirPath;
+        break :path try std.fmt.allocPrint(a, "{s}/{d}.{s}.submission.eml:2,S", .{ folder, accepted_ms, id });
+    } else null;
     try db.acceptDelivery(.{
         .id = id,
         .from = from,
@@ -387,7 +378,7 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
         .verified_author = identity.verified,
         .mime = raw,
         .accepted_at = now,
-        .accepted_ms = time_compat.milliTimestamp(),
+        .accepted_ms = accepted_ms,
         .targets = plan.targets.items,
         .sender = options.sender,
         .counts_as_incoming = !options.account_notice and from.len > 0,
@@ -399,7 +390,11 @@ fn acceptLocal(a: std.mem.Allocator, cfg: Delivery, db: *database.Database, from
         .receipt = options.receipt,
         .ews_draft_send = options.ews_draft,
         .team_reply_submission = options.team_reply_submission,
-        .native_sent_reply = native_sent_reply,
+        .native_sent_copy = if (options.sent) |copy| .{
+            .path = sent_path.?,
+            .mime = copy.bytes,
+            .wire_id = options.native_reply_wire_id,
+        } else null,
     });
 }
 
@@ -453,7 +448,7 @@ pub fn sendRaw(a: std.mem.Allocator, cfg: Delivery, message: RawSubmission) !voi
         if (!std.mem.eql(u8, copy.bytes, reply.archive) or !std.mem.eql(u8, message.raw, reply.archive)) break :candidate null;
         break :candidate reply;
     } else null;
-    const journaled = native != null or message.ews_draft != null;
+    const journaled = message.sent != null or message.ews_draft != null;
     const delivery_id = if (journaled) routing.newId() else undefined;
     const result = dispatch(a, cfg, message.from, message.recipients, message.raw, .{
         .sender = message.mailbox,
@@ -468,9 +463,6 @@ pub fn sendRaw(a: std.mem.Allocator, cfg: Delivery, message: RawSubmission) !voi
         return err;
     };
     defer a.free(result.failed);
-    if (result.delivered == 0) {
-        if (message.sent) |copy| fs_compat.cwd().deleteFile(copy.path) catch {};
-    }
     if (message.ews_draft != null) {
         const outcome: database.Database.EwsSendResult = if (result.delivered != 0)
             (if (result.failed.len == 0) .delivered else .partial)

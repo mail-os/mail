@@ -142,13 +142,17 @@ pub const Plan = struct {
     pub fn addLocal(self: *Plan, target: Target) !void {
         try path.validate(target.mailbox);
         try path.validate(target.folder);
-        const already = self.reservations.get(target.mailbox) orelse 0;
         const extra = if (target.verified_forward) forwarding.loop_header.len else 0;
         const copy_bytes = if (target.reply) |reply| reply.mime.len else std.math.add(u64, self.bytes, extra) catch return error.HostedStorageFull;
-        const requested = std.math.add(u64, already, copy_bytes) catch return error.HostedStorageFull;
-        try hosted.checkStorage(self.db, target.mailbox, requested, null);
-        try self.reservations.put(self.allocator, target.mailbox, requested);
+        try self.reserveLocal(target.mailbox, copy_bytes);
         try self.add(target);
+    }
+
+    pub fn reserveLocal(self: *Plan, mailbox: []const u8, copy_bytes: u64) !void {
+        const already = self.reservations.get(mailbox) orelse 0;
+        const requested = std.math.add(u64, already, copy_bytes) catch return error.HostedStorageFull;
+        try hosted.checkStorage(self.db, mailbox, requested, null);
+        try self.reservations.put(self.allocator, mailbox, requested);
     }
 
     pub fn add(self: *Plan, target: Target) !void {
@@ -343,8 +347,22 @@ fn drain(allocator: Allocator, db: *Database, id: ?[]const u8, limit: usize) !vo
         defer db.unlockMailboxes();
         const now = time.timestamp();
         const target = (try db.pendingDelivery(a, id, now)) orelse return;
+        if (target.discard_native_sent) {
+            discardNativeSent(a, db, target) catch |err| {
+                std.log.warn("accepted delivery {s} is awaiting Sent removal: {}", .{ target.id, err });
+                try delayLocalTarget(db, target, now);
+            };
+            continue;
+        }
         if (target.mailbox_removed) {
             try db.finishDeliveryTarget(target.id, target.ordinal, "mailbox_removed", null);
+            continue;
+        }
+        if (target.native_sent_path) |file| {
+            fileNativeSent(a, db, target, file) catch |err| {
+                std.log.warn("accepted delivery {s} is awaiting Sent storage: {}", .{ target.id, err });
+                try delayLocalTarget(db, target, now);
+            };
             continue;
         }
         const filename = try std.fmt.allocPrint(a, "{d}.{s}.{d}.route.eml", .{ target.accepted_ms, target.id, target.ordinal });
@@ -356,8 +374,7 @@ fn drain(allocator: Allocator, db: *Database, id: ?[]const u8, limit: usize) !vo
         const revisions = try mailbox_mime.calendarRevisions(a, target.mime, target.calendar_attendee, target.calendar_author);
         const file = fileTarget(a, target, filename) catch |err| {
             std.log.warn("accepted delivery {s}/{d} is awaiting local storage: {}", .{ target.id, target.ordinal, err });
-            const wait_seconds = @as(i64, 2) << @as(u6, @intCast(target.attempts));
-            try db.delayDeliveryTarget(target, now + wait_seconds);
+            try delayLocalTarget(db, target, now);
             continue;
         };
         if (!std.mem.eql(u8, target.folder, "new")) {
@@ -386,6 +403,51 @@ fn drain(allocator: Allocator, db: *Database, id: ?[]const u8, limit: usize) !vo
             return err;
         };
     }
+}
+
+fn delayLocalTarget(db: *Database, target: Database.PendingDelivery, now: i64) !void {
+    const wait_seconds = @as(i64, 2) << @as(u6, @intCast(target.attempts));
+    try db.delayDeliveryTarget(target, now + wait_seconds);
+}
+
+fn discardNativeSent(a: Allocator, db: *Database, target: Database.PendingDelivery) !void {
+    if (!target.mailbox_removed) {
+        try path.validate(target.mailbox);
+        const file = try std.fmt.allocPrint(a, "mail/{s}/{s}", .{ target.mailbox, target.native_sent_path.? });
+        fs.cwd().deleteFile(file) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        const directory = std.fs.path.dirname(file).?;
+        if (fs.cwd().access(directory, .{})) {
+            try durable.syncDirectory(a, directory);
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+    }
+    try db.finishNativeSentTarget(target, null);
+}
+
+fn fileNativeSent(a: Allocator, db: *Database, target: Database.PendingDelivery, relative_path: []const u8) !void {
+    try path.validate(target.mailbox);
+    const file = try std.fmt.allocPrint(a, "mail/{s}/{s}", .{ target.mailbox, relative_path });
+    try fs.cwd().makePath(std.fs.path.dirname(file) orelse return error.InvalidMaildirPath);
+    durable.resumeWrite(a, file, target.mime) catch |err| {
+        if (err == error.MaildirSyncFailed) fs.cwd().deleteFile(file) catch {};
+        return err;
+    };
+    // Keep the reservation authoritative if a running session can move the
+    // file before its checkpoint. Startup can resume from the archived MIME.
+    errdefer fs.cwd().deleteFile(file) catch |err| std.log.err("could not hide uncheckpointed Sent copy: {}", .{err});
+    const basename = db_mod.maildirBaseName(std.fs.path.basename(file));
+    const reply: ?Database.NativeSentReply = if (target.native_sent_wire_id) |wire_id| .{
+        .basename = basename,
+        .stamp = try message_refs.fileStamp(a, file),
+        .revision = message_refs.digest(target.mime),
+        .wire_id = wire_id,
+    } else null;
+    try db.finishNativeSentTarget(target, reply);
 }
 
 pub fn attentionArrival(a: Allocator, raw: []const u8) !?Database.AttentionArrival {

@@ -179,6 +179,15 @@ so its relative Maildir lives on the same volume as the database. Preserve any
 explicit working-directory override used by an existing installation. Two hosts
 or independently copied directories require separate writer fencing.
 
+ActiveSync and EWS reserve the private Sent archive in the same SQLite
+transaction as recipient admission and any protocol retry receipt. The
+replacement writer can finish a committed archive even if the old writer
+stopped during Maildir publication. The archive retains Bcc. Recipient
+copies use separate MIME with Bcc removed. A remote send can show in Sent
+while the provider responds. When Mail records failure for every recipient,
+it journals removal of the archive. A replacement preserves an accepted
+archive and any unconfirmed remote outcome for investigation.
+
 Leave `SMTP_CLUSTER_ENABLED` unset or set it to `false` for hosted Mail.
 Startup returns `HostedClusterUnsupported` when cluster mode is enabled
 alongside the provisioning listener or when the SMTP database contains
